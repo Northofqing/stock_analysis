@@ -1,7 +1,8 @@
 # A股自选股智能分析系统 - Rust 版本
 
 完整的股票分析系统，包含新闻搜索、趋势分析和 AI 分析功能。
-
+参考项目: https://github.com/ZhuLinsen/daily_stock_analysis 
+感谢原项目作者
 ## ✨ 核心功能
 
 1. **📰 新闻搜索服务** - 多引擎搜索（Bocha/Tavily/SerpAPI）+ 自动负载均衡
