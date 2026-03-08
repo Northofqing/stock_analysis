@@ -293,7 +293,8 @@ impl GeminiAnalyzer {
     /// 创建新的分析器
     pub fn new(config: GeminiConfig) -> Self {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(60))
             .build()
             .expect("Failed to create HTTP client");
 

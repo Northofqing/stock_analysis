@@ -29,13 +29,13 @@ impl RustdxProvider {
     pub fn new() -> Result<Self> {
         info!("[通达信] 初始化 RustDX 数据提供者");
         let gtimg_provider = GtimgProvider::new()?;
-        Ok(Self { gtimg_provider })
+        Ok(Self {
+            gtimg_provider,
+        })
     }
 
-    /// 获取或创建TCP连接
-    fn get_connection(&self) -> Result<Tcp> {
-        // 每次都创建新连接，避免连接复用问题
-        // rustdx-complete的连接是轻量级的，创建成本不高
+    /// 创建新的 TCP 连接
+    fn new_connection() -> Result<Tcp> {
         debug!("[通达信] 创建新的TCP连接");
         Tcp::new().context("无法连接到通达信服务器")
     }
@@ -83,7 +83,7 @@ impl RustdxProvider {
         // 规范化股票代码
         let code = self.normalize_code(code)?;
         
-        let mut tcp = self.get_connection()?;
+        let mut tcp = Self::new_connection()?;
         
         let market = self.parse_market(&code) as u16;
         
@@ -161,7 +161,7 @@ impl RustdxProvider {
         // 规范化股票代码
         let code = self.normalize_code(code)?;
         
-        let mut tcp = self.get_connection()?;
+        let mut tcp = Self::new_connection()?;
         
         let market = self.parse_market(&code) as u16;
         
@@ -237,16 +237,10 @@ impl DataProvider for RustdxProvider {
         if !kline_data.is_empty() {
             use crate::sharpe_calculator;
             
-            // 由于数据是降序的（最新在前），需要反转来计算
-            let mut reversed_data = kline_data.clone();
-            reversed_data.reverse();
-            
-            // 计算夏普比率
-            sharpe_calculator::update_sharpe_ratios(&mut reversed_data, Some(60), Some(0.03));
-            
-            // 反转回降序
-            reversed_data.reverse();
-            kline_data = reversed_data;
+            // 数据是降序的（最新在前），反转来计算，原地反转避免 clone
+            kline_data.reverse();
+            sharpe_calculator::update_sharpe_ratios(&mut kline_data, Some(60), Some(0.03));
+            kline_data.reverse();
             
             if let Some(latest) = kline_data.first() {
                 if let Some(sharpe) = latest.sharpe_ratio {
@@ -321,8 +315,8 @@ mod tests {
 
     #[test]
     fn test_rustdx_connection() {
-        let provider = RustdxProvider::new().unwrap();
-        assert!(provider.get_connection().is_ok());
+        let _provider = RustdxProvider::new().unwrap();
+        assert!(RustdxProvider::new_connection().is_ok());
     }
 
     #[test]

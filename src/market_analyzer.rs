@@ -226,15 +226,14 @@ impl MarketAnalyzer {
         let mut limit_down = 0;
         let mut total_amount = 0.0;
         let mut total_stocks = 0;
-        let mut all_stocks: Vec<(String, String, f64, f64)> = Vec::new(); // (code, name, change_pct, price)
+        let mut all_stocks: Vec<(String, String, f64, f64)> = Vec::with_capacity(5500); // (code, name, change_pct, price)
 
-        // 新浪API每次最多返回100条，需要分页获取
-        // A股约5000只，分50页获取
-        for page in 1..=50 {
+        // 新浪API每次最多返回500条，A股约5000只，分页获取
+        for page in 1..=20 {
             let page_str = page.to_string();
             let params = [
                 ("page", page_str.as_str()),
-                ("num", "100"),
+                ("num", "500"),
                 ("sort", "symbol"),
                 ("asc", "1"),
                 ("node", "hs_a"),

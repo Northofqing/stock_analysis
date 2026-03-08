@@ -1,78 +1,94 @@
-# A股自选股智能分析系统 - Rust 版本
+# A股自选股智能分析系统
 
-完整的股票分析系统，包含新闻搜索、趋势分析和 AI 分析功能。
-参考项目: https://github.com/ZhuLinsen/daily_stock_analysis 
-感谢原项目作者
-## ✨ 核心功能
+基于 Rust 构建的全自动 A 股分析系统，覆盖数据采集、技术分析、AI 研判、量化回测、多渠道推送的完整闭环。
 
-1. **📰 新闻搜索服务** - 多引擎搜索（Bocha/Tavily/SerpAPI）+ 自动负载均衡
-2. **📊 趋势交易分析** - 基于 MA 均线的技术分析 + 买点识别
-3. **🤖 AI 智能分析** - Gemini/OpenAI/豆包 驱动的决策面板生成 ⭐ 新增豆包支持
-4. **💾 数据库存储层** - SQLite + Diesel ORM + 断点续传
-5. **📈 大盘复盘分析** - 市场指数监控 + 板块分析 + 复盘报告
-6. **🔄 多因子回测** - 量化选股 + 回测模拟 + 性能指标 ⭐ 新增
-7. **📢 多渠道通知** - 企业微信/飞书/邮件推送 + 日报生成 ⭐ 新增
+参考项目: https://github.com/ZhuLinsen/daily_stock_analysis — 感谢原项目作者
 
-> 📬 **邮件通知新功能**: 支持 SMTP 邮件发送，自动转换 HTML 格式！  
-> 快速配置: [EMAIL_QUICKSTART.md](EMAIL_QUICKSTART.md) | 详细文档: [EMAIL_CONFIG.md](EMAIL_CONFIG.md)
+## 系统架构
 
-> 📊 **多因子回测新功能**: 自动化量化选股和回测，结果自动推送！  
-> 详细文档: [MULTI_FACTOR_BACKTEST.md](MULTI_FACTOR_BACKTEST.md) | 实现总结: [IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md)
+```
+股票代码 / 宏观 AI 推荐
+        │
+        ▼
+  ┌─────────────────────────────────┐
+  │       数据采集层                │
+  │  RustDX(通达信) / Gtimg(腾讯)  │
+  │  EastMoney(东方财富) / Tushare  │
+  │       自动故障切换              │
+  └─────────┬───────────────────────┘
+            │  30日K线 + 实时行情 + 财务指标
+            ▼
+  ┌─────────────────────────────────┐
+  │       分析引擎层                │
+  │  • 趋势分析：MA排列 / 支撑压力 │
+  │  • AI研判：豆包 / OpenAI / Gemini│
+  │  • 多因子选股 + 回测引擎       │
+  │  • 大盘复盘 + 龙虎榜分析       │
+  └─────────┬───────────────────────┘
+            │  评分 / 操作建议 / 回测指标
+            ▼
+  ┌─────────────────────────────────┐
+  │       输出层                    │
+  │  SQLite 入库 / Markdown 报告   │
+  │  PNG 图表 / 邮件 / 企业微信    │
+  │  飞书 / Telegram / Pushover    │
+  └─────────────────────────────────┘
+```
+
+## 核心功能
+
+| 模块 | 说明 |
+|------|------|
+| **多源数据采集** | 通达信 TCP 直连 → 腾讯财经 → 东方财富 → Tushare，按优先级自动切换 |
+| **趋势技术分析** | MA5/10/20/60 多头排列、乖离率、量能分析、支撑压力位识别、买点信号评分 |
+| **AI 智能研判** | 豆包(Doubao) → OpenAI → Gemini 三级备选，输出情绪评分(0-100)与操作建议 |
+| **新闻搜索** | Bocha / Tavily / SerpAPI 多引擎 + 多 Key 负载均衡，自动提取情绪与关键词 |
+| **大盘复盘** | 上证/深证/创业板/科创50/沪深300 指数跟踪 + 板块分析 + AI 生成复盘报告 |
+| **龙虎榜分析** | 抓取每日龙虎榜数据，评估机构/游资参与度，综合评分筛选优质标的 |
+| **多因子选股** | 市值/ROE/PE/PB/换手率加权评分，自动排名并选出 Top N |
+| **量化回测** | 模拟交易引擎，计算总收益率、年化收益率、最大回撤、夏普比率、胜率 |
+| **多渠道通知** | 邮件(SMTP) / 企业微信 / 飞书 / 钉钉 / Telegram / Pushover / 自定义 Webhook |
+| **定时调度** | 支持固定时间点 / 间隔执行 / 仅工作日模式，可通过环境变量或命令行配置 |
+| **数据持久化** | SQLite + Diesel ORM，自动建表迁移，股票日线 / 分析结果 / 龙虎榜三表存储 |
 
 ## 项目结构
 
 ```
 stock_analysis/
 ├── src/
-│   ├── lib.rs                    # 库入口
-│   ├── main.rs                   # 主程序
-│   ├── search_service.rs         # 搜索服务（Bocha/Tavily/SerpAPI）
-│   ├── ai_analyzer.rs            # AI 分析器（Gemini/OpenAI）
-│   ├── trend_analyzer.rs         # 趋势交易分析器
-│   ├── database.rs               # 数据库管理器
-│   ├── models.rs                 # 数据模型定义
-│   ├── schema.rs                 # 数据库schema
-│   ├── market_data.rs            # 市场数据结构
-│   ├── market_analyzer.rs        # 大盘复盘分析器
-│   ├── multi_factor_strategy.rs  # 多因子选股策略 ⭐ 新增
-│   ├── backtest.rs               # 回测引擎 ⭐ 新增
-│   └── notification.rs           # 通知服务 ⭐ 新增
-├── examples/
-│   ├── search_example.rs           # 搜索服务示例
-│   ├── ai_example.rs               # AI 分析器示例
-│   ├── trend_analysis_example.rs   # 趋势分析示例
-│   ├── database_example.rs         # 数据库使用示例
-│   ├── comprehensive_analysis.rs   # 综合分析流程
-│   ├── full_analysis.rs            # 完整分析流程
-│   ├── market_review.rs            # 大盘复盘示例
-│   └── notification_example.rs     # 通知服务示例 ⭐ 新增
-├── migrations/                      # 数据库迁移 ⭐ 新增
-│   └── 2026-01-22-000000_create_stock_daily/
-│       ├── up.sql
-│       └── down.sql
-├── tests/
-│   └── search_test.rs      # 单元测试
-├── .env.example            # 配置模板
-├── diesel.toml             # Diesel 配置 ⭐ 新增
-├── SEARCH_SERVICE.md       # 搜索服务文档
-├── AI_ANALYZER.md          # AI 分析器文档
-├── DOUBAO_CONFIG.md        # 豆包AI配置指南 ⭐ 新增
-├── TREND_ANALYZER.md       # 趋势分析器文档
-├── DATABASE.md             # 数据库文档
-├── MARKET_ANALYZER.md      # 大盘分析器文档
-├── MULTI_FACTOR_BACKTEST.md    # 多因子回测文档 ⭐ 新增
-├── IMPLEMENTATION_SUMMARY.md   # 回测实现总结 ⭐ 新增
-├── NOTIFICATION.md         # 通知服务文档 ⭐ 新增
-├── EMAIL_CONFIG.md         # 邮件配置详细文档 ⭐ 新增
-├── EMAIL_QUICKSTART.md     # 邮件快速配置指南 ⭐ 新增
-├── SCHEDULE_GUIDE.md       # 定时任务完整指南 ⭐ 新增
-├── SCHEDULE_QUICKSTART.md  # 定时任务5分钟上手 ⭐ 新增
-├── SCHEDULE_SUMMARY.md     # 定时任务技术总结 ⭐ 新增
-├── ENV_CONFIG.md           # 环境变量配置指南 ⭐ 新增
-├── CHANGELOG.md            # 版本更新日志 ⭐ 新增
-├── test_schedule.sh        # 定时任务测试脚本 ⭐ 新增
-├── verify_backtest.sh      # 回测功能验证脚本 ⭐ 新增
-└── README.md               # 本文件
+│   ├── main.rs                   # 主程序入口（4种运行模式 + CLI参数）
+│   ├── lib.rs                    # 库入口，导出所有模块
+│   ├── pipeline.rs               # 分析流程调度器（数据→分析→回测→通知）
+│   ├── data_provider/
+│   │   ├── mod.rs                # 统一数据接口 + DataFetcherManager
+│   │   ├── rustdx_provider.rs    # 通达信 TCP 直连（最快）
+│   │   ├── gtimg_provider.rs     # 腾讯财经 HTTP API
+│   │   ├── eastmoney_provider.rs # 东方财富 HTTP API
+│   │   └── tushare_provider.rs   # Tushare Pro API
+│   ├── analyzer.rs               # AI 分析器（豆包/OpenAI/Gemini）
+│   ├── trend_analyzer.rs         # 均线趋势分析 + 买点信号
+│   ├── search_service.rs         # 新闻搜索（Bocha/Tavily/SerpAPI）
+│   ├── market_analyzer.rs        # 大盘复盘分析
+│   ├── market_data.rs            # 市场指数与板块数据结构
+│   ├── lhb_analyzer.rs          # 龙虎榜数据抓取与分析
+│   ├── multi_factor_strategy.rs  # 多因子量化选股引擎
+│   ├── backtest.rs               # 回测引擎（模拟交易 + 绩效指标）
+│   ├── sharpe_calculator.rs      # 夏普比率计算
+│   ├── chart_generator.rs        # PNG 图表生成（Plotters）
+│   ├── notification.rs           # 多渠道通知服务
+│   ├── database.rs               # SQLite 连接池管理
+│   ├── models.rs                 # ORM 数据模型
+│   ├── schema.rs                 # Diesel 表结构定义
+│   ├── enums.rs                  # 枚举类型
+│   └── bin/
+│       └── lhb_query.rs          # 龙虎榜独立查询工具
+├── migrations/                   # Diesel 数据库迁移
+├── reports/                      # 生成的分析报告（Markdown）
+├── data/                         # SQLite 数据库文件
+├── .env.example                  # 环境变量配置模板
+├── diesel.toml                   # Diesel ORM 配置
+├── Cargo.toml                    # 依赖管理
+└── CHANGELOG.md                  # 版本更新日志
 ```
 
 ## 快速开始
@@ -87,117 +103,43 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 ```bash
 cp .env.example .env
-# 编辑 .env 文件，填入你的 API Keys
+# 编辑 .env 文件，填入 API Keys
 ```
 
-### 3. 运行示例
-
+最小配置只需设置：
 ```bash
-# 新闻搜索示例
-cargo run --example search_example
-
-# 趋势技术分析示例 ⭐ 新增
-cargo run --example trend_analysis_example
-
-# AI 分析器示例
-cargo run --example ai_example
-
-# 综合分析流程（搜索+技术+AI）⭐ 新增
-cargo run --example comprehensive_analysis
-
-# 数据库使用示例 ⭐ 新增
-cargo run --example database_example
-
-# 大盘复盘分析示例 ⭐ 新增
-cargo run --example market_review
-
-# 通知服务示例 ⭐ 新增
-cargo run --example notification_example
-
-# 带日志输出
-RUST_LOG=info cargo run --example market_review
+STOCK_LIST=601179,000876,002182        # 自选股代码
+GEMINI_API_KEY=your_key                # 至少配置一个 AI（豆包/OpenAI/Gemini）
+SERPAPI_KEY=your_key                   # 新闻搜索
 ```
 
-## 命令行使用
-
-### 基本用法
+### 3. 编译运行
 
 ```bash
-# 1. 立即执行一次分析（默认模式）
+# 首次编译（自动下载依赖）
+cargo build --release
+
+# 运行分析
+cargo run --release
+```
+
+## 命令行用法
+
+### 四种运行模式
+
+```bash
+# 模式1: 单次分析（默认）- 自选股技术分析 + AI研判 + 通知
 cargo run --release
 
-# 2. 仅大盘复盘
+# 模式2: 仅大盘复盘
 cargo run --release -- --market-review
 
-# 3. 指定自选股代码
-cargo run --release -- --stocks "000001,600519,300750"
+# 模式3: 龙虎榜选股分析
+cargo run --release -- --lhb-mode
+cargo run --release -- --lhb-mode --lhb-date 20260128 --lhb-min-score 70
 
-# 4. 调整并发数
-cargo run --release -- --workers 10
-
-# 5. 干跑模式（不发送通知）
-cargo run --release -- --dry-run
-
-# 6. 单条汇总邮件
-cargo run --release -- --single-notify
-```
-
-### ⏰ 定时任务模式 ⭐ 新增
-
-强大的定时任务功能，支持多种执行策略。详细文档: [SCHEDULE_GUIDE.md](SCHEDULE_GUIDE.md)
-**配置方式1: 使用环境变量（推荐日常使用）**
-
-编辑 `.env` 文件：
-```bash
-SCHEDULE_ENABLED=true
-SCHEDULE_TIME=09:30,15:30
-```
-
-然后直接运行：
-```bash
-cargo run --release
-```
-
-**配置方式2: 使用命令行参数（更灵活）**
-#### 1️⃣ 间隔执行模式
-
-按固定时间间隔重复执行：
-
-```bash
-# 每30分钟执行一次
-cargo run --release -- --schedule --interval 30
-
-# 每2小时执行一次
-cargo run --release -- --schedule --interval 120
-
-# 立即执行一次，然后每小时执行
-cargo run --release -- --schedule --interval 60 --run-now
-```
-
-#### 2️⃣ 指定时间点模式
-
-每天在固定时间执行：
-
-```bash
-# 每天早上9:30执行
-cargo run --release -- --schedule --schedule-time "09:30"
-
-# 每天两次：开盘前和收盘后
-cargo run --release -- --schedule --schedule-time "09:15,15:30"
-
-# 三个时间点：开盘前、午盘、收盘后
-cargo run --release -- --schedule --schedule-time "09:15,12:00,15:30"
-```
-
-#### 3️⃣ 工作日执行模式（推荐）
-
-只在交易日执行，跳过周末：
-
-```bash
-# 每周一到周五的9:30执行
-cargo run --release -- --schedule \
-  --schedule-time "09:30" \
-  --weekdays 1,2,3,4,5
+# 模式4: 定时任务
+cargo run --release -- --schedule --schedule-time "09:30,15:00" --weekdays 1,2,3,4,5
 
 # 工作日两次执行：开盘和收盘
 cargo run --release -- --schedule \
@@ -765,5 +707,5 @@ MIT
 
 ## 联系方式
 
-- Issues: [GitHub Issues](https://github.com/your-repo/issues)
-- Discussions: [GitHub Discussions](https://github.com/your-repo/discussions)
+- Issues: [GitHub Issues](https://github.com/Northofqing/stock_analysis/issues)
+- Discussions: [GitHub Discussions](https://github.com/Northofqing/stock_analysis/discussions)

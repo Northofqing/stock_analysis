@@ -159,10 +159,13 @@ impl AnalysisPipeline {
         info!("[{}] 开始获取数据...", code);
 
         // 从数据源获取数据
-        let (data, source) = self
-            .data_manager
-            .get_daily_data(code, 30)
-            .context("获取数据失败")?;
+        // 使用 spawn_blocking 将同步 TCP/HTTP 调用放到独立的阻塞线程池，
+        // 不占用 tokio worker 线程，避免饿死异步任务（timeout/新闻搜索/AI 调用）。
+        let dm = self.data_manager.clone();
+        let code_owned = code.to_string();
+        let (data, source) = tokio::task::spawn_blocking(move || {
+            dm.get_daily_data(&code_owned, 30)
+        }).await.context("spawn_blocking panicked")?.context("获取数据失败")?;
 
         if data.is_empty() {
             warn!("[{}] 获取到的数据为空", code);
@@ -440,11 +443,12 @@ impl AnalysisPipeline {
             analysis_content.push_str("- 严格执行止损，避免深套\n");
         }
         
-        // 获取真实股票名称
-        let stock_name = self
-            .data_manager
-            .get_stock_name(code)
-            .unwrap_or_else(|| format!("股票{}", code));
+        // 获取真实股票名称（同步 HTTP 调用，放到 blocking 线程池）
+        let dm = self.data_manager.clone();
+        let code_owned = code.to_string();
+        let stock_name = tokio::task::spawn_blocking(move || {
+            dm.get_stock_name(&code_owned)
+        }).await.ok().flatten().unwrap_or_else(|| format!("股票{}", code));
         info!("[{}] 搜索最新新闻...", code);
         // 新闻搜索（如果启用）
         let news_context = if self.use_news_search {
@@ -606,6 +610,20 @@ impl AnalysisPipeline {
     async fn process_stock(&self, code: String, macro_context: Arc<String>) -> Option<AnalysisResult> {
         info!("========== 开始处理 {} ==========", code);
 
+        // 整体超时保护：单只股票最多处理 120 秒，避免任何环节卡死拖垮全局
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            self.process_stock_inner(code.clone(), macro_context),
+        ).await {
+            Ok(result) => result,
+            Err(_) => {
+                error!("[{}] 处理超时（120s），跳过", code);
+                None
+            }
+        }
+    }
+
+    async fn process_stock_inner(&self, code: String, macro_context: Arc<String>) -> Option<AnalysisResult> {
         // 1. 获取数据
         let data = match self.fetch_and_save_data(&code).await {
             Ok(d) => d,
@@ -680,7 +698,7 @@ impl AnalysisPipeline {
     }
 
     /// 运行完整分析流程
-    pub async fn run(&self, stock_codes: &[String]) -> Result<Vec<AnalysisResult>> {
+    pub async fn run(&self, stock_codes: &[String], prefetched_macro: Option<String>) -> Result<Vec<AnalysisResult>> {
         if stock_codes.is_empty() {
             warn!("股票列表为空");
             return Ok(Vec::new());
@@ -705,21 +723,27 @@ impl AnalysisPipeline {
 
         // 并发处理股票（使用配置的最大并发数）
         info!("使用 {} 个并发任务处理股票", self.config.max_workers);
-        // 在并发分析前，提前搜索一次宏观新闻，所有股票共享（仅作为 AI 分析上下文）
-        let macro_context: Arc<String> = if self.use_news_search {
+        // 优先使用已获取的宏观新闻（避免重复搜索），否则在线搜索
+        let macro_context: Arc<String> = if let Some(mc) = prefetched_macro {
+            if !mc.is_empty() {
+                info!("✓ 复用已获取的宏观新闻（{} 字符），跳过重复搜索", mc.len());
+                Arc::new(mc)
+            } else {
+                Arc::new(String::new())
+            }
+        } else if self.use_news_search {
             info!("📡 搜索今日宏观/市场最新新闻（所有股票共享）...");
             let search_service = get_search_service();
             let mc = match tokio::time::timeout(
-                std::time::Duration::from_secs(20),
+                std::time::Duration::from_secs(15),
                 search_service.search_macro_news(3),
             ).await {
                 Ok(text) if !text.is_empty() => {
                     info!("✓ 宏观新闻获取成功，共 {} 字符", text.len());
-                    info!("========== 今日宏观新闻 ==========\n{}\n==================================", text);
                     text
                 }
                 Ok(_) => { warn!("宏观新闻搜索返回为空"); String::new() }
-                Err(_) => { warn!("宏观新闻搜索超时"); String::new() }
+                Err(_) => { warn!("宏观新闻搜索超时(15s)"); String::new() }
             };
             Arc::new(mc)
         } else {
@@ -799,15 +823,16 @@ impl AnalysisPipeline {
 
         let date_str = chrono::Local::now().format("%Y%m%d").to_string();
         
-        // 按评分排序
-        let mut sorted = results.to_vec();
-        sorted.sort_by(|a, b| b.sentiment_score.cmp(&a.sentiment_score));
+        // 按评分排序（索引排序，避免深拷贝整个结果集）
+        let mut indices: Vec<usize> = (0..results.len()).collect();
+        indices.sort_by(|&a, &b| results[b].sentiment_score.cmp(&results[a].sentiment_score));
+        let sorted: Vec<&AnalysisResult> = indices.iter().map(|&i| &results[i]).collect();
 
         // 生成图表
         let chart_filename = format!("reports/stock_chart_{}.png", date_str);
         info!("生成分析图表: {}", chart_filename);
         
-        let chart_path = match ChartGenerator::generate_summary_chart(&sorted, &chart_filename) {
+        let _chart_path = match ChartGenerator::generate_summary_chart(results, &chart_filename) {
             Ok(path) => {
                 info!("✓ 图表生成成功: {:?}", path);
                 Some(path)
@@ -821,55 +846,7 @@ impl AnalysisPipeline {
         // 转换为 notification 模块的 AnalysisResult
         let notification_results: Vec<notification::AnalysisResult> = sorted
             .iter()
-            .map(|r| notification::AnalysisResult {
-                code: r.code.clone(),
-                name: r.name.clone(),
-                sentiment_score: r.sentiment_score,
-                trend_prediction: r.trend_prediction.clone(),
-                operation_advice: r.operation_advice.clone(),
-                analysis_summary: r.analysis_content.clone(),
-                technical_analysis: None,
-                news_summary: None,
-                buy_reason: None,
-                risk_warning: None,
-                ma_analysis: r.ma_alignment.clone(),
-                volume_analysis: None,
-                // 估值指标
-                pe_ratio: r.pe_ratio,
-                pb_ratio: r.pb_ratio,
-                turnover_rate: r.turnover_rate,
-                market_cap: r.market_cap,
-                circulating_cap: r.circulating_cap,
-                // 均线与乖离率
-                current_price: r.current_price,
-                ma5: r.ma5,
-                ma10: r.ma10,
-                ma20: r.ma20,
-                ma60: r.ma60,
-                ma_alignment: r.ma_alignment.clone(),
-                bias_ma5: r.bias_ma5,
-                // 量能
-                volume_ratio_5d: r.volume_ratio_5d,
-                // 价格区间
-                high_52w: r.high_52w,
-                low_52w: r.low_52w,
-                pos_52w: r.pos_52w,
-                high_quarter: r.high_quarter,
-                low_quarter: r.low_quarter,
-                pos_quarter: r.pos_quarter,
-                // 近期走势
-                chg_5d: r.chg_5d,
-                chg_10d: r.chg_10d,
-                volatility: r.volatility,
-                // 财务指标
-                eps: r.eps,
-                roe: r.roe,
-                gross_margin: r.gross_margin,
-                net_margin: r.net_margin,
-                revenue_yoy: r.revenue_yoy,
-                net_profit_yoy: r.net_profit_yoy,
-                sharpe_ratio: r.sharpe_ratio,
-            })
+            .map(|r| notification::AnalysisResult::from(*r))
             .collect();
 
         // 使用 notification 模块的报告生成方法（股票分析报告）

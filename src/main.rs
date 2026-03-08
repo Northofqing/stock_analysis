@@ -133,9 +133,11 @@ fn main() -> Result<()> {
     };
 
     // 通过宏观新闻 AI 分析，追加推荐股票到自选股列表
+    let macro_news_context;
     {
         let runtime = tokio::runtime::Runtime::new()?;
-        let extra_codes = runtime.block_on(fetch_macro_recommended_codes());
+        let (extra_codes, macro_text) = runtime.block_on(fetch_macro_recommended_codes());
+        macro_news_context = macro_text;
         if !extra_codes.is_empty() {
             let before = stock_codes.len();
             for code in &extra_codes {
@@ -189,7 +191,7 @@ fn main() -> Result<()> {
     }
 
     // 模式4: 正常分析流程（单次执行）
-    run_analysis(&stock_codes, &args)?;
+    run_analysis(&stock_codes, &args, &macro_news_context)?;
 
     info!("程序执行完成");
     Ok(())
@@ -203,7 +205,7 @@ fn get_max_workers(args: &Args) -> usize {
 }
 
 /// 运行分析流程
-fn run_analysis(stock_codes: &[String], args: &Args) -> Result<()> {
+fn run_analysis(stock_codes: &[String], args: &Args, macro_context: &str) -> Result<()> {
     info!("模式: 单次分析");
     
     let config = PipelineConfig {
@@ -215,9 +217,10 @@ fn run_analysis(stock_codes: &[String], args: &Args) -> Result<()> {
     
     let pipeline = AnalysisPipeline::new(config)?;
     
-    // 使用tokio运行异步任务
+    // 使用tokio运行异步任务，传入已获取的宏观新闻避免重复搜索
     let runtime = tokio::runtime::Runtime::new()?;
-    let results = runtime.block_on(pipeline.run(stock_codes))?;
+    let mc = if macro_context.is_empty() { None } else { Some(macro_context.to_string()) };
+    let results = runtime.block_on(pipeline.run(stock_codes, mc))?;
     
     // 输出摘要（按评分从高到低排序）
     if !results.is_empty() {
@@ -453,7 +456,7 @@ async fn execute_analysis_with_mode(stock_codes: &[String], config: &PipelineCon
 async fn execute_analysis(stock_codes: &[String], config: &PipelineConfig) {
     match AnalysisPipeline::new(config.clone()) {
         Ok(pipeline) => {
-            match pipeline.run(stock_codes).await {
+            match pipeline.run(stock_codes, None).await {
                 Ok(results) => {
                     info!("分析完成，成功 {} 只股票", results.len());
                     
@@ -479,23 +482,24 @@ async fn execute_analysis(stock_codes: &[String], config: &PipelineConfig) {
     }
 }
 
-/// 通过宏观新闻 AI 分析，返回推荐的 A 股代码列表
-async fn fetch_macro_recommended_codes() -> Vec<String> {
+/// 通过宏观新闻 AI 分析，返回 (推荐的 A 股代码列表, 宏观新闻全文)
+/// 宏观新闻全文会传递给 pipeline 避免重复搜索
+async fn fetch_macro_recommended_codes() -> (Vec<String>, String) {
     use stock_analysis::search_service::get_search_service;
     use stock_analysis::analyzer::get_analyzer;
 
     info!("📡 正在获取宏观新闻并由 AI 分析推荐 A 股...");
     let search_service = get_search_service();
     let mc = match tokio::time::timeout(
-        std::time::Duration::from_secs(25),
+        std::time::Duration::from_secs(15),
         search_service.search_macro_news(3),
     ).await {
         Ok(text) if !text.is_empty() => {
             info!("✓ 宏观新闻获取成功，共 {} 字符", text.len());
             text
         }
-        Ok(_) => { log::warn!("宏观新闻为空，跳过AI推荐"); return vec![]; }
-        Err(_) => { log::warn!("宏观新闻获取超时，跳过AI推荐"); return vec![]; }
+        Ok(_) => { log::warn!("宏观新闻为空，跳过AI推荐"); return (vec![], String::new()); }
+        Err(_) => { log::warn!("宏观新闻获取超时(15s)，跳过AI推荐"); return (vec![], String::new()); }
     };
 
     let analyzer_clone = {
@@ -504,12 +508,12 @@ async fn fetch_macro_recommended_codes() -> Vec<String> {
     };
     let Some(analyzer) = analyzer_clone else {
         log::warn!("AI 模型未配置，跳过宏观推荐");
-        return vec![];
+        return (vec![], mc);
     };
 
-    // 提示：deepseek-reasoner 等推理模型思考耗时较长，建议使用 deepseek-chat 等快速模型以避免超时
+    info!("🤖 正在调用 AI 分析宏观推荐（最多等待 60s）...");
     match tokio::time::timeout(
-        std::time::Duration::from_secs(180),
+        std::time::Duration::from_secs(60),
         analyzer.analyze_macro_recommendations(&mc),
     ).await {
         Ok(Ok(rec_text)) => {
@@ -550,10 +554,10 @@ async fn fetch_macro_recommended_codes() -> Vec<String> {
             }
             codes.sort();
             info!("✅ 从宏观推荐中提取到 {} 只股票代码: {:?}", codes.len(), codes);
-            codes
+            (codes, mc)
         }
-        Ok(Err(e)) => { log::warn!("宏观推荐生成失败: {}", e); vec![] }
-        Err(_) => { log::warn!("宏观推荐 AI 调用超时（180s），建议在 .env 中将 OPENAI_MODEL 改为 deepseek-chat 等快速模型"); vec![] }
+        Ok(Err(e)) => { log::warn!("宏观推荐生成失败: {}", e); (vec![], mc) }
+        Err(_) => { log::warn!("宏观推荐 AI 调用超时(60s)，跳过"); (vec![], mc) }
     }
 }
 
@@ -726,7 +730,7 @@ fn run_lhb_analysis(args: &Args) -> Result<()> {
     };
     
     let pipeline = AnalysisPipeline::new(config)?;
-    let results = runtime.block_on(pipeline.run(&stock_codes))?;
+    let results = runtime.block_on(pipeline.run(&stock_codes, None))?;
         
         // 5. 生成综合报告
         info!("\n===== 龙虎榜选股分析结果 =====");

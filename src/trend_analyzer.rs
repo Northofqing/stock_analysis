@@ -264,9 +264,11 @@ impl StockTrendAnalyzer {
         code: &str,
     ) -> TrendAnalysisResult {
         // 转换为StockData
-        // 注意：K线数据从API返回时是降序（最新在前），但trend_analyzer需要升序（最旧在前）
-        let mut stock_data: Vec<StockData> = kline_data
+        // 注意：K线数据从 API 返回时是降序（最新在前），但 trend_analyzer 需要升序（最旧在前）
+        // 使用 rev() 迭代器直接生成升序数据，避免先 collect 再 reverse
+        let stock_data: Vec<StockData> = kline_data
             .iter()
+            .rev()
             .map(|k| StockData {
                 date: k.date.format("%Y-%m-%d").to_string(),
                 open: k.open,
@@ -280,9 +282,6 @@ impl StockTrendAnalyzer {
                 ma60: None,
             })
             .collect();
-
-        // 反转为升序（最旧在前，最新在后），以便正确计算移动平均线
-        stock_data.reverse();
 
         self.analyze(&stock_data, code)
     }

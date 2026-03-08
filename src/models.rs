@@ -106,7 +106,7 @@ pub struct UpdateStockDaily {
 impl StockDaily {
     /// 转换为字典（HashMap）
     pub fn to_dict(&self) -> HashMap<String, serde_json::Value> {
-        let mut map = HashMap::new();
+        let mut map = HashMap::with_capacity(16);
         map.insert("code".to_string(), serde_json::json!(self.code));
         map.insert("date".to_string(), serde_json::json!(self.date.to_string()));
         

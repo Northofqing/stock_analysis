@@ -14,10 +14,11 @@ impl ChartGenerator {
         let path_buf = PathBuf::from(output_path);
         let path_str = path_buf.to_str().ok_or_else(|| anyhow::anyhow!("Invalid path"))?;
         
-        // 按评分排序，取前15只
-        let mut sorted_results = results.to_vec();
-        sorted_results.sort_by(|a, b| b.sentiment_score.cmp(&a.sentiment_score));
-        let display_results: Vec<_> = sorted_results.iter().take(15).cloned().collect();
+        // 按评分排序（索引排序），取前15只
+        let mut indices: Vec<usize> = (0..results.len()).collect();
+        indices.sort_by(|&a, &b| results[b].sentiment_score.cmp(&results[a].sentiment_score));
+        indices.truncate(15);
+        let display_results: Vec<&AnalysisResult> = indices.iter().map(|&i| &results[i]).collect();
         
         {
             let root = BitMapBackend::new(path_str, (1400, 900)).into_drawing_area();
@@ -40,7 +41,7 @@ impl ChartGenerator {
     /// 绘制评分柱状图（简化版）
     fn draw_score_bar_chart(
         area: &DrawingArea<BitMapBackend, plotters::coord::Shift>,
-        results: &[AnalysisResult],
+        results: &[&AnalysisResult],
     ) -> Result<()> {
         if results.is_empty() {
             return Ok(());

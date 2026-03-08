@@ -16,7 +16,7 @@ use once_cell::sync::OnceCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::models::{MaStatus, NewStockDaily, StockDaily, UpdateStockDaily, NewLhbDaily, LhbDaily, NewAnalysisResult, AnalysisResultRecord};
+use crate::models::{MaStatus, NewStockDaily, StockDaily, NewLhbDaily, LhbDaily, NewAnalysisResult, AnalysisResultRecord};
 use crate::schema::{stock_daily, lhb_daily, analysis_result};
 
 type DbPool = Pool<ConnectionManager<SqliteConnection>>;
@@ -275,7 +275,7 @@ impl DatabaseManager {
 
     /// 保存单条日线数据
     ///
-    /// 策略：使用 UPSERT 逻辑（存在则更新，不存在则插入）
+    /// 策略：使用 ON CONFLICT DO UPDATE（单条 SQL 完成 UPSERT）
     pub fn save_daily_record(
         &self,
         code: &str,
@@ -294,90 +294,104 @@ impl DatabaseManager {
         data_source: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut conn = self.get_conn()?;
+        Self::upsert_daily_record(&mut conn, code, date, open, high, low, close, volume, amount, pct_chg, ma5, ma10, ma20, volume_ratio, data_source)
+    }
 
-        // 检查是否已存在
-        let existing: Option<StockDaily> = stock_daily::table
-            .filter(stock_daily::code.eq(code))
-            .filter(stock_daily::date.eq(date))
-            .first(&mut conn)
-            .optional()?;
+    /// 内部 UPSERT 方法，接受已有连接（避免批量操作时重复获取连接）
+    fn upsert_daily_record(
+        conn: &mut DbConnection,
+        code: &str,
+        date: NaiveDate,
+        open: Option<f64>,
+        high: Option<f64>,
+        low: Option<f64>,
+        close: Option<f64>,
+        volume: Option<f64>,
+        amount: Option<f64>,
+        pct_chg: Option<f64>,
+        ma5: Option<f64>,
+        ma10: Option<f64>,
+        ma20: Option<f64>,
+        volume_ratio: Option<f64>,
+        data_source: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use diesel::upsert::excluded;
 
-        if let Some(existing_record) = existing {
-            // 更新现有记录
-            let update = UpdateStockDaily {
-                open,
-                high,
-                low,
-                close,
-                volume,
-                amount,
-                pct_chg,
-                ma5,
-                ma10,
-                ma20,
-                volume_ratio,
-                data_source: data_source.map(|s| s.to_string()),
-                updated_at: Local::now().naive_local(),
-            };
+        let new_record = NewStockDaily {
+            code: code.to_string(),
+            date,
+            open,
+            high,
+            low,
+            close,
+            volume,
+            amount,
+            pct_chg,
+            ma5,
+            ma10,
+            ma20,
+            volume_ratio,
+            data_source: data_source.map(|s| s.to_string()),
+        };
 
-            diesel::update(stock_daily::table.find(existing_record.id))
-                .set(&update)
-                .execute(&mut conn)?;
-        } else {
-            // 插入新记录
-            let new_record = NewStockDaily {
-                code: code.to_string(),
-                date,
-                open,
-                high,
-                low,
-                close,
-                volume,
-                amount,
-                pct_chg,
-                ma5,
-                ma10,
-                ma20,
-                volume_ratio,
-                data_source: data_source.map(|s| s.to_string()),
-            };
-
-            diesel::insert_into(stock_daily::table)
-                .values(&new_record)
-                .execute(&mut conn)?;
-        }
+        diesel::insert_into(stock_daily::table)
+            .values(&new_record)
+            .on_conflict((stock_daily::code, stock_daily::date))
+            .do_update()
+            .set((
+                stock_daily::open.eq(excluded(stock_daily::open)),
+                stock_daily::high.eq(excluded(stock_daily::high)),
+                stock_daily::low.eq(excluded(stock_daily::low)),
+                stock_daily::close.eq(excluded(stock_daily::close)),
+                stock_daily::volume.eq(excluded(stock_daily::volume)),
+                stock_daily::amount.eq(excluded(stock_daily::amount)),
+                stock_daily::pct_chg.eq(excluded(stock_daily::pct_chg)),
+                stock_daily::ma5.eq(excluded(stock_daily::ma5)),
+                stock_daily::ma10.eq(excluded(stock_daily::ma10)),
+                stock_daily::ma20.eq(excluded(stock_daily::ma20)),
+                stock_daily::volume_ratio.eq(excluded(stock_daily::volume_ratio)),
+                stock_daily::data_source.eq(excluded(stock_daily::data_source)),
+                stock_daily::updated_at.eq(Local::now().naive_local()),
+            ))
+            .execute(conn)?;
 
         Ok(())
     }
 
     /// 批量保存日线数据
     ///
-    /// 返回新增的记录数
+    /// 使用单连接 + 事务，返回新增/更新的记录数
     pub fn save_daily_batch(
         &self,
         records: &[StockDailyRecord],
     ) -> Result<usize, Box<dyn std::error::Error>> {
-        let mut saved_count = 0;
-
-        for record in records {
-            self.save_daily_record(
-                &record.code,
-                record.date,
-                record.open,
-                record.high,
-                record.low,
-                record.close,
-                record.volume,
-                record.amount,
-                record.pct_chg,
-                record.ma5,
-                record.ma10,
-                record.ma20,
-                record.volume_ratio,
-                record.data_source.as_deref(),
-            )?;
-            saved_count += 1;
+        if records.is_empty() {
+            return Ok(0);
         }
+
+        let mut conn = self.get_conn()?;
+        let saved_count = conn.transaction::<usize, Box<dyn std::error::Error>, _>(|conn| {
+            for record in records {
+                Self::upsert_daily_record(
+                    conn,
+                    &record.code,
+                    record.date,
+                    record.open,
+                    record.high,
+                    record.low,
+                    record.close,
+                    record.volume,
+                    record.amount,
+                    record.pct_chg,
+                    record.ma5,
+                    record.ma10,
+                    record.ma20,
+                    record.volume_ratio,
+                    record.data_source.as_deref(),
+                )?;
+            }
+            Ok(records.len())
+        })?;
 
         info!("批量保存完成，新增/更新 {} 条记录", saved_count);
         Ok(saved_count)
@@ -442,7 +456,7 @@ impl DatabaseManager {
 
     /// 保存 KlineData 列表到数据库
     ///
-    /// 将从数据源获取的K线数据批量保存，使用 UPSERT 逻辑
+    /// 使用单连接 + 事务批量 UPSERT
     pub fn save_kline_data(
         &self,
         code: &str,
@@ -453,72 +467,64 @@ impl DatabaseManager {
             return Ok(0);
         }
 
-        let mut saved = 0;
-        for kline in data {
-            self.save_daily_record(
-                code,
-                kline.date,
-                Some(kline.open),
-                Some(kline.high),
-                Some(kline.low),
-                Some(kline.close),
-                Some(kline.volume),
-                Some(kline.amount),
-                Some(kline.pct_chg),
-                None, // ma5 由趋势分析模块计算
-                None, // ma10
-                None, // ma20
-                None, // volume_ratio
-                Some(source),
-            )?;
-            saved += 1;
-        }
+        let mut conn = self.get_conn()?;
+        let saved = conn.transaction::<usize, Box<dyn std::error::Error>, _>(|conn| {
+            for kline in data {
+                Self::upsert_daily_record(
+                    conn,
+                    code,
+                    kline.date,
+                    Some(kline.open),
+                    Some(kline.high),
+                    Some(kline.low),
+                    Some(kline.close),
+                    Some(kline.volume),
+                    Some(kline.amount),
+                    Some(kline.pct_chg),
+                    None, // ma5 由趋势分析模块计算
+                    None, // ma10
+                    None, // ma20
+                    None, // volume_ratio
+                    Some(source),
+                )?;
+            }
+            Ok(data.len())
+        })?;
 
         info!("[{}] 已保存 {} 条K线数据到数据库（数据源: {}）", code, saved, source);
         Ok(saved)
     }
 
-    /// 保存分析结果到数据库
+    /// 保存分析结果到数据库（使用 ON CONFLICT DO UPDATE，单条 SQL）
     pub fn save_analysis_result(
         &self,
         result: &NewAnalysisResult,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        use diesel::upsert::excluded;
+
         let mut conn = self.get_conn()?;
 
-        // 使用 UPSERT：如果同一股票同一天已有记录则更新
-        let existing: Option<AnalysisResultRecord> = analysis_result::table
-            .filter(analysis_result::code.eq(&result.code))
-            .filter(analysis_result::date.eq(result.date))
-            .first(&mut conn)
-            .optional()?;
+        diesel::insert_into(analysis_result::table)
+            .values(result)
+            .on_conflict((analysis_result::code, analysis_result::date))
+            .do_update()
+            .set((
+                analysis_result::name.eq(excluded(analysis_result::name)),
+                analysis_result::sentiment_score.eq(excluded(analysis_result::sentiment_score)),
+                analysis_result::operation_advice.eq(excluded(analysis_result::operation_advice)),
+                analysis_result::trend_prediction.eq(excluded(analysis_result::trend_prediction)),
+                analysis_result::pe_ratio.eq(excluded(analysis_result::pe_ratio)),
+                analysis_result::pb_ratio.eq(excluded(analysis_result::pb_ratio)),
+                analysis_result::turnover_rate.eq(excluded(analysis_result::turnover_rate)),
+                analysis_result::market_cap.eq(excluded(analysis_result::market_cap)),
+                analysis_result::circulating_cap.eq(excluded(analysis_result::circulating_cap)),
+                analysis_result::close_price.eq(excluded(analysis_result::close_price)),
+                analysis_result::pct_chg.eq(excluded(analysis_result::pct_chg)),
+                analysis_result::data_source.eq(excluded(analysis_result::data_source)),
+            ))
+            .execute(&mut conn)?;
 
-        if let Some(existing_record) = existing {
-            // 更新现有记录
-            diesel::update(analysis_result::table.find(existing_record.id))
-                .set((
-                    analysis_result::name.eq(&result.name),
-                    analysis_result::sentiment_score.eq(result.sentiment_score),
-                    analysis_result::operation_advice.eq(&result.operation_advice),
-                    analysis_result::trend_prediction.eq(&result.trend_prediction),
-                    analysis_result::pe_ratio.eq(result.pe_ratio),
-                    analysis_result::pb_ratio.eq(result.pb_ratio),
-                    analysis_result::turnover_rate.eq(result.turnover_rate),
-                    analysis_result::market_cap.eq(result.market_cap),
-                    analysis_result::circulating_cap.eq(result.circulating_cap),
-                    analysis_result::close_price.eq(result.close_price),
-                    analysis_result::pct_chg.eq(result.pct_chg),
-                    analysis_result::data_source.eq(&result.data_source),
-                ))
-                .execute(&mut conn)?;
-            info!("[{}] 更新分析结果（评分: {}）", result.code, result.sentiment_score);
-        } else {
-            // 插入新记录
-            diesel::insert_into(analysis_result::table)
-                .values(result)
-                .execute(&mut conn)?;
-            info!("[{}] 保存分析结果（评分: {}）", result.code, result.sentiment_score);
-        }
-
+        info!("[{}] 保存/更新分析结果（评分: {}）", result.code, result.sentiment_score);
         Ok(())
     }
 
@@ -608,33 +614,29 @@ pub struct AnalysisContext {
 // ============================================================================
 
 impl DatabaseManager {
-    /// 保存龙虎榜数据到数据库
+    /// 保存龙虎榜数据到数据库（事务 + ON CONFLICT DO NOTHING）
     pub fn save_lhb_records(&self, records: &[NewLhbDaily]) -> Result<usize, Box<dyn std::error::Error>> {
         if records.is_empty() {
             return Ok(0);
         }
 
         let mut conn = self.get_conn()?;
-        
-        let mut saved = 0;
-        for record in records {
-            // 使用 INSERT OR REPLACE 避免重复
-            let result = diesel::insert_into(lhb_daily::table)
-                .values(record)
-                .execute(&mut conn);
-            
-            match result {
-                Ok(_) => saved += 1,
-                Err(diesel::result::Error::DatabaseError(
-                    diesel::result::DatabaseErrorKind::UniqueViolation,
-                    _,
-                )) => {
-                    // 如果已存在，则忽略
-                    continue;
+        let saved = conn.transaction::<usize, Box<dyn std::error::Error>, _>(|conn| {
+            let mut count = 0;
+            for record in records {
+                let result = diesel::insert_into(lhb_daily::table)
+                    .values(record)
+                    .on_conflict((lhb_daily::code, lhb_daily::trade_date))
+                    .do_nothing()
+                    .execute(conn);
+
+                match result {
+                    Ok(n) => count += n,
+                    Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error>),
                 }
-                Err(e) => return Err(Box::new(e)),
             }
-        }
+            Ok(count)
+        })?;
 
         Ok(saved)
     }

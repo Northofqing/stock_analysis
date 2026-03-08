@@ -209,6 +209,54 @@ impl AnalysisResult {
     }
 }
 
+impl From<&crate::pipeline::AnalysisResult> for AnalysisResult {
+    fn from(r: &crate::pipeline::AnalysisResult) -> Self {
+        Self {
+            code: r.code.clone(),
+            name: r.name.clone(),
+            sentiment_score: r.sentiment_score,
+            trend_prediction: r.trend_prediction.clone(),
+            operation_advice: r.operation_advice.clone(),
+            analysis_summary: r.analysis_content.clone(),
+            technical_analysis: None,
+            news_summary: None,
+            buy_reason: None,
+            risk_warning: None,
+            ma_analysis: r.ma_alignment.clone(),
+            volume_analysis: None,
+            pe_ratio: r.pe_ratio,
+            pb_ratio: r.pb_ratio,
+            turnover_rate: r.turnover_rate,
+            market_cap: r.market_cap,
+            circulating_cap: r.circulating_cap,
+            current_price: r.current_price,
+            ma5: r.ma5,
+            ma10: r.ma10,
+            ma20: r.ma20,
+            ma60: r.ma60,
+            ma_alignment: r.ma_alignment.clone(),
+            bias_ma5: r.bias_ma5,
+            volume_ratio_5d: r.volume_ratio_5d,
+            high_52w: r.high_52w,
+            low_52w: r.low_52w,
+            pos_52w: r.pos_52w,
+            high_quarter: r.high_quarter,
+            low_quarter: r.low_quarter,
+            pos_quarter: r.pos_quarter,
+            chg_5d: r.chg_5d,
+            chg_10d: r.chg_10d,
+            volatility: r.volatility,
+            eps: r.eps,
+            roe: r.roe,
+            gross_margin: r.gross_margin,
+            net_margin: r.net_margin,
+            revenue_yoy: r.revenue_yoy,
+            net_profit_yoy: r.net_profit_yoy,
+            sharpe_ratio: r.sharpe_ratio,
+        }
+    }
+}
+
 /// 通知服务
 pub struct NotificationService {
     config: NotificationConfig,

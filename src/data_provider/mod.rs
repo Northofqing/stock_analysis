@@ -59,7 +59,7 @@ pub struct KlineData {
 }
 
 /// 数据提供者接口
-pub trait DataProvider {
+pub trait DataProvider: Send + Sync {
     /// 获取股票日线数据
     ///
     /// # 参数
