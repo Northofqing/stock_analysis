@@ -90,6 +90,124 @@ impl MarketAnalyzer {
         Ok(overview)
     }
 
+    /// 获取当日涨停股票列表
+    /// 优先使用东方财富涨停板API（覆盖沪深两市），失败时回退到新浪API
+    pub fn get_limit_up_stocks(&self) -> Result<Vec<crate::market_data::TopStock>> {
+        info!("[大盘] 获取当日涨停股票列表...");
+
+        // 优先使用东方财富涨停板API
+        match self.get_limit_up_from_eastmoney() {
+            Ok(stocks) if !stocks.is_empty() => {
+                info!("[大盘] 东方财富API发现 {} 只涨停股票", stocks.len());
+                return Ok(stocks);
+            }
+            Ok(_) => {
+                info!("[大盘] 东方财富API返回空，回退到新浪API");
+            }
+            Err(e) => {
+                warn!("[大盘] 东方财富API失败: {}，回退到新浪API", e);
+            }
+        }
+
+        // 回退：从新浪API统计
+        let mut overview = MarketOverview::new(String::new());
+        self.get_market_statistics(&mut overview)?;
+        // 过滤ST
+        overview.limit_up_stocks.retain(|s| !s.name.contains("ST") && !s.name.contains("st"));
+        info!("[大盘] 新浪API发现 {} 只涨停股票（已排除ST）", overview.limit_up_stocks.len());
+        Ok(overview.limit_up_stocks)
+    }
+
+    /// 通过东方财富push2 API获取当日涨停股票
+    /// 按涨幅降序获取前100只股票，再按涨跌停阈值筛选真正涨停的
+    fn get_limit_up_from_eastmoney(&self) -> Result<Vec<crate::market_data::TopStock>> {
+        use crate::market_data::TopStock;
+
+        // 东方财富push2 API：获取A股按涨幅排序前100
+        // fs参数: m:0+t:6(深主板) m:0+t:80(创业板) m:1+t:2(沪主板) m:1+t:23(科创板) m:0+t:81+s:2048(中小板)
+        let url = "https://push2.eastmoney.com/api/qt/clist/get";
+        let params = [
+            ("pn", "1"),
+            ("pz", "100"),
+            ("po", "1"),       // 降序
+            ("np", "1"),
+            ("ut", "bd1d9ddb04089700cf9c27f6f7426281"),
+            ("fltt", "2"),
+            ("invt", "2"),
+            ("fid", "f3"),     // 按涨幅排序
+            ("fs", "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048"),
+            ("fields", "f2,f3,f12,f14"),  // f2:价格 f3:涨幅 f12:代码 f14:名称
+        ];
+
+        let response = self.client
+            .get(url)
+            .query(&params)
+            .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+            .timeout(Duration::from_secs(10))
+            .send()
+            .context("东方财富push2 API请求失败")?;
+
+        let text = response.text().context("读取响应失败")?;
+        let json: Value = serde_json::from_str(&text).context("解析JSON失败")?;
+
+        let mut stocks = Vec::new();
+        if let Some(diff) = json.get("data").and_then(|d| d.get("diff")).and_then(|d| d.as_array()) {
+            for item in diff {
+                let code = item.get("f12").and_then(|v| v.as_str()).unwrap_or("");
+                let name = item.get("f14").and_then(|v| v.as_str()).unwrap_or("");
+                let change_pct = item.get("f3").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let price = item.get("f2").and_then(|v| v.as_f64()).unwrap_or(0.0);
+
+                // 排除ST后，最低涨停阈值为主板10%，低于9.9%的不可能涨停
+                if change_pct < 9.9 {
+                    break;
+                }
+
+                // 过滤ST股票
+                if name.contains("ST") || name.contains("st") {
+                    continue;
+                }
+                // 过滤北交所 (8xxxx/4xxxx/9xxxx开头)
+                if code.starts_with("8") || code.starts_with("4") || code.starts_with("9") {
+                    continue;
+                }
+
+                // 根据板块判断涨跌停阈值，不满足则跳过（不break，因为不同板块阈值不同）
+                let limit_pct = Self::get_limit_pct(code, name);
+                if change_pct < limit_pct - 0.1 {
+                    continue;
+                }
+
+                stocks.push(TopStock {
+                    code: code.to_string(),
+                    name: name.to_string(),
+                    change_pct,
+                    price,
+                });
+            }
+        }
+
+        Ok(stocks)
+    }
+
+    /// 根据股票代码和名称获取涨跌停幅度限制
+    /// - ST 股票: 5%
+    /// - 创业板 (30xxxx): 20%
+    /// - 科创板 (688xxx): 20%
+    /// - 北交所 (8xxxxx/4xxxxx): 30%
+    /// - 主板 (60xxxx/00xxxx): 10%
+    fn get_limit_pct(code: &str, name: &str) -> f64 {
+        if name.contains("ST") || name.contains("st") {
+            5.0
+        } else if code.starts_with("30") || code.starts_with("688") {
+            20.0
+        } else if code.starts_with("8") || code.starts_with("4") {
+            30.0
+        } else {
+            10.0
+        }
+    }
+
     /// 带重试的API调用
     fn call_api_with_retry<F>(&self, name: &str, attempts: u32, f: F) -> Option<Value>
     where
@@ -227,6 +345,7 @@ impl MarketAnalyzer {
         let mut total_amount = 0.0;
         let mut total_stocks = 0;
         let mut all_stocks: Vec<(String, String, f64, f64)> = Vec::with_capacity(5500); // (code, name, change_pct, price)
+        let mut limit_up_stocks: Vec<(String, String, f64, f64)> = Vec::new(); // 涨停股票列表
 
         // 新浪API每次最多返回500条，A股约5000只，分页获取
         for page in 1..=20 {
@@ -266,14 +385,22 @@ impl MarketAnalyzer {
                         total_stocks += 1;
                         
                         if let Some(change_pct) = item.get("changepercent").and_then(|v| v.as_f64()) {
+                            // 提取股票代码和名称，用于判断涨跌停阈值
+                            let stock_name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                            let raw_code = item.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
+                            let code = raw_code.trim_start_matches("sh")
+                                .trim_start_matches("sz")
+                                .trim_start_matches("bj");
+                            let limit_pct = Self::get_limit_pct(code, stock_name);
+
                             if change_pct > 0.0 {
                                 up += 1;
-                                if change_pct >= 9.9 {
+                                if change_pct >= limit_pct - 0.1 {
                                     limit_up += 1;
                                 }
                             } else if change_pct < 0.0 {
                                 down += 1;
-                                if change_pct <= -9.9 {
+                                if change_pct <= -(limit_pct - 0.1) {
                                     limit_down += 1;
                                 }
                             } else {
@@ -281,12 +408,12 @@ impl MarketAnalyzer {
                             }
 
                             // 收集股票信息用于排序
-                            if let (Some(code), Some(name), Some(price)) = (
-                                item.get("symbol").and_then(|v| v.as_str()),
-                                item.get("name").and_then(|v| v.as_str()),
-                                item.get("trade").and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok())
-                            ) {
-                                all_stocks.push((code.to_string(), name.to_string(), change_pct, price));
+                            if let Some(price) = item.get("trade").and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()) {
+                                // 收集涨停股票
+                                if change_pct >= limit_pct - 0.1 {
+                                    limit_up_stocks.push((code.to_string(), stock_name.to_string(), change_pct, price));
+                                }
+                                all_stocks.push((code.to_string(), stock_name.to_string(), change_pct, price));
                             }
                         }
 
@@ -311,6 +438,17 @@ impl MarketAnalyzer {
         // 按涨跌幅排序并取前10
         all_stocks.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
         overview.top_stocks = all_stocks.iter().take(10).map(|(code, name, change_pct, price)| {
+            use crate::market_data::TopStock;
+            TopStock {
+                code: code.clone(),
+                name: name.clone(),
+                change_pct: *change_pct,
+                price: *price,
+            }
+        }).collect();
+
+        // 收集涨停股票列表
+        overview.limit_up_stocks = limit_up_stocks.iter().map(|(code, name, change_pct, price)| {
             use crate::market_data::TopStock;
             TopStock {
                 code: code.clone(),

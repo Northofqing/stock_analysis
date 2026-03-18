@@ -67,6 +67,16 @@ pub struct AnalysisResult {
     pub revenue_yoy: Option<f64>,
     pub net_profit_yoy: Option<f64>,
     pub sharpe_ratio: Option<f64>,
+    /// 是否当日涨停
+    pub is_limit_up: bool,
+    /// 模拟持仓买入价格
+    pub position_buy_price: Option<f64>,
+    /// 模拟持仓买入日期
+    pub position_buy_date: Option<String>,
+    /// 模拟持仓收益率（%）
+    pub position_return: Option<f64>,
+    /// 模拟持仓数量（股）
+    pub position_quantity: Option<i32>,
 }
 
 impl AnalysisResult {
@@ -114,6 +124,8 @@ pub struct AnalysisPipeline {
     use_news_search: bool, // 是否使用新闻搜索
     notifier: Arc<NotificationService>,
     config: PipelineConfig,
+    /// 当日涨停股票代码集合
+    limit_up_codes: Arc<std::collections::HashSet<String>>,
 }
 
 impl AnalysisPipeline {
@@ -151,7 +163,14 @@ impl AnalysisPipeline {
             use_news_search,
             notifier,
             config,
+            limit_up_codes: Arc::new(std::collections::HashSet::new()),
         })
+    }
+
+    /// 设置当日涨停股票代码集合
+    pub fn with_limit_up_codes(mut self, codes: std::collections::HashSet<String>) -> Self {
+        self.limit_up_codes = Arc::new(codes);
+        self
     }
 
     /// 获取并保存单只股票数据
@@ -601,6 +620,11 @@ impl AnalysisPipeline {
             revenue_yoy: data[0].revenue_yoy,
             net_profit_yoy: data[0].net_profit_yoy,
             sharpe_ratio: trend_result.sharpe_ratio,
+            is_limit_up: self.limit_up_codes.contains(code),
+            position_buy_price: None,
+            position_buy_date: None,
+            position_return: None,
+            position_quantity: None,
         };
 
         Ok(result)
@@ -646,7 +670,7 @@ impl AnalysisPipeline {
 
         // 3. 分析
         let mc = if macro_context.is_empty() { None } else { Some(macro_context.as_str()) };
-        let result = match self.analyze_stock(&code, &data, mc).await {
+        let mut result = match self.analyze_stock(&code, &data, mc).await {
             Ok(r) => r,
             Err(e) => {
                 error!("[{}] 分析失败: {}", code, e);
@@ -659,7 +683,60 @@ impl AnalysisPipeline {
             code, result.operation_advice, result.sentiment_score
         );
 
-        // 4. 保存分析结果到数据库
+        // 4. 模拟持仓跟踪
+        if let Ok(db) = std::panic::catch_unwind(|| DatabaseManager::get()) {
+            let current_price = result.current_price.unwrap_or(data[0].close);
+
+            // 检查是否有持仓中的记录
+            match db.get_open_position(&code) {
+                Ok(Some(pos)) => {
+                    // 有持仓：计算收益率
+                    let return_rate = (current_price / pos.buy_price - 1.0) * 100.0;
+                    result.position_buy_price = Some(pos.buy_price);
+                    result.position_buy_date = Some(pos.buy_date.clone());
+                    result.position_return = Some(return_rate);
+                    result.position_quantity = Some(pos.quantity);
+                    info!("[{}] 持仓收益率: {:.2}%（买入价 {:.2}）", code, return_rate, pos.buy_price);
+
+                    // 更新数据库中的收益率
+                    if let Err(e) = db.update_position_return(pos.id, current_price, return_rate) {
+                        warn!("[{}] 更新持仓收益率失败: {}", code, e);
+                    }
+
+                    // 如果建议卖出，自动平仓
+                    if result.operation_advice.contains("卖出") {
+                        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+                        match db.close_position(pos.id, current_price, &today) {
+                            Ok(_) => info!("[{}] 持仓已平仓，收益率: {:.2}%", code, return_rate),
+                            Err(e) => warn!("[{}] 平仓失败: {}", code, e),
+                        }
+                    }
+                }
+                Ok(None) => {
+                    // 无持仓：如果建议买入，记录模拟买入（10手=1000股）
+                    if result.operation_advice.contains("买入") {
+                        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+                        let new_position = crate::models::NewStockPosition {
+                            code: code.clone(),
+                            name: result.name.clone(),
+                            buy_date: today,
+                            buy_price: current_price,
+                            quantity: 1000,
+                            status: "open".to_string(),
+                        };
+                        match db.save_position(&new_position) {
+                            Ok(_) => info!("[{}] 模拟买入 1000 股 @ {:.2}", code, current_price),
+                            Err(e) => warn!("[{}] 记录模拟买入失败: {}", code, e),
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("[{}] 查询持仓失败: {}", code, e);
+                }
+            }
+        }
+
+        // 5. 保存分析结果到数据库
         if let Ok(db) = std::panic::catch_unwind(|| DatabaseManager::get()) {
             let latest_kline = &data[0];
             let new_result = crate::models::NewAnalysisResult {
@@ -684,7 +761,7 @@ impl AnalysisPipeline {
             }
         }
 
-        // 5. 单股推送（如果启用）
+        // 6. 单股推送（如果启用）
         if self.config.single_notify && self.config.send_notification {
             let report = self.generate_single_report(&result);
             let code_clone = code.clone();
@@ -806,11 +883,13 @@ impl AnalysisPipeline {
 
     /// 生成单股报告
     fn generate_single_report(&self, result: &AnalysisResult) -> String {
+        let limit_up_tag = if result.is_limit_up { " 🔥涨停" } else { "" };
         format!(
-            "{} {}({})\n\n操作建议: {}\n评分: {}\n\n{}",
+            "{} {}({}){}\n\n操作建议: {}\n评分: {}\n\n{}",
             result.get_emoji(),
             result.name,
             result.code,
+            limit_up_tag,
             result.operation_advice,
             result.sentiment_score,
             result.analysis_content

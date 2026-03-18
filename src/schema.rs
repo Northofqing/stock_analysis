@@ -62,8 +62,26 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    stock_position (id) {
+        id -> Integer,
+        code -> Text,
+        name -> Text,
+        buy_date -> Text,
+        buy_price -> Double,
+        quantity -> Integer,
+        status -> Text,
+        sell_date -> Nullable<Text>,
+        sell_price -> Nullable<Double>,
+        return_rate -> Nullable<Double>,
+        created_at -> Timestamp,
+        updated_at -> Timestamp,
+    }
+}
+
 diesel::allow_tables_to_appear_in_same_query!(
     stock_daily,
     lhb_daily,
     analysis_result,
+    stock_position,
 );

@@ -193,6 +193,16 @@ pub struct AnalysisResult {
     pub revenue_yoy: Option<f64>,
     pub net_profit_yoy: Option<f64>,
     pub sharpe_ratio: Option<f64>,
+    /// 是否当日涨停
+    pub is_limit_up: bool,
+    /// 模拟持仓买入价格
+    pub position_buy_price: Option<f64>,
+    /// 模拟持仓买入日期
+    pub position_buy_date: Option<String>,
+    /// 模拟持仓收益率（%）
+    pub position_return: Option<f64>,
+    /// 模拟持仓数量（股）
+    pub position_quantity: Option<i32>,
 }
 
 impl AnalysisResult {
@@ -253,6 +263,11 @@ impl From<&crate::pipeline::AnalysisResult> for AnalysisResult {
             revenue_yoy: r.revenue_yoy,
             net_profit_yoy: r.net_profit_yoy,
             sharpe_ratio: r.sharpe_ratio,
+            is_limit_up: r.is_limit_up,
+            position_buy_price: r.position_buy_price,
+            position_buy_date: r.position_buy_date.clone(),
+            position_return: r.position_return,
+            position_quantity: r.position_quantity,
         }
     }
 }
@@ -387,6 +402,66 @@ impl NotificationService {
             format!("| 🔴 建议减仓/卖出 | **{}** 只 |", sell_count),
             format!("| 📈 平均看多评分 | **{:.1}** 分 |", avg_score),
             String::new(),
+        ]);
+
+        // 当日涨停股票汇总
+        let limit_up_results: Vec<&AnalysisResult> = sorted_results.iter().filter(|r| r.is_limit_up).collect();
+        if !limit_up_results.is_empty() {
+            lines.extend(vec![
+                "---".to_string(),
+                String::new(),
+                format!("## 🔥 当日涨停股票（{} 只）", limit_up_results.len()),
+                String::new(),
+                "| 股票 | 代码 | 评分 | 操作建议 | 趋势 |".to_string(),
+                "|------|------|------|---------|------|".to_string(),
+            ]);
+            for r in &limit_up_results {
+                lines.push(format!(
+                    "| {} {} | {} | {}分 | {} | {} |",
+                    r.get_emoji(), r.name, r.code, r.sentiment_score, r.operation_advice, r.trend_prediction
+                ));
+            }
+            lines.push(String::new());
+        }
+
+        // 模拟持仓汇总
+        let position_results: Vec<&AnalysisResult> = sorted_results.iter().filter(|r| r.position_return.is_some()).collect();
+        if !position_results.is_empty() {
+            let total_profit: f64 = position_results.iter().map(|r| {
+                let buy_price = r.position_buy_price.unwrap_or(0.0);
+                let qty = r.position_quantity.unwrap_or(0) as f64;
+                let ret = r.position_return.unwrap_or(0.0);
+                buy_price * qty * ret / 100.0
+            }).sum();
+
+            lines.extend(vec![
+                "---".to_string(),
+                String::new(),
+                format!("## 💰 模拟持仓跟踪（{} 只）", position_results.len()),
+                String::new(),
+                "| 股票 | 代码 | 买入价 | 现价 | 收益率 | 浮动盈亏 | 买入日期 |".to_string(),
+                "|------|------|--------|------|--------|---------|---------|".to_string(),
+            ]);
+            for r in &position_results {
+                let buy_price = r.position_buy_price.unwrap_or(0.0);
+                let ret = r.position_return.unwrap_or(0.0);
+                let qty = r.position_quantity.unwrap_or(0) as f64;
+                let profit = buy_price * qty * ret / 100.0;
+                let cur_price = r.current_price.unwrap_or(0.0);
+                let date = r.position_buy_date.as_deref().unwrap_or("-");
+                let ret_str = if ret >= 0.0 { format!("🟢 {:+.2}%", ret) } else { format!("🔴 {:+.2}%", ret) };
+                lines.push(format!(
+                    "| {} | {} | {:.2} | {:.2} | {} | {:+.2} | {} |",
+                    r.name, r.code, buy_price, cur_price, ret_str, profit, date
+                ));
+            }
+            lines.push(String::new());
+            let total_emoji = if total_profit >= 0.0 { "📈" } else { "📉" };
+            lines.push(format!("**{} 持仓总浮动盈亏：{:+.2} 元**", total_emoji, total_profit));
+            lines.push(String::new());
+        }
+
+        lines.extend(vec![
             "---".to_string(),
             String::new(),
             "## 📈 个股详细分析".to_string(),
@@ -396,14 +471,27 @@ impl NotificationService {
         // 逐个股票的详细分析
         for result in &sorted_results {
             let emoji = result.get_emoji();
+            let limit_up_tag = if result.is_limit_up { " 🔥涨停" } else { "" };
 
-            lines.push(format!("### {} {} ({})", emoji, result.name, result.code));
+            lines.push(format!("### {} {} ({}){}", emoji, result.name, result.code, limit_up_tag));
             lines.push(String::new());
             lines.push(format!(
                 "**操作建议：{}** | **综合评分：{}分** | **趋势预测：{}**",
                 result.operation_advice, result.sentiment_score, result.trend_prediction
             ));
             lines.push(String::new());
+
+            // 模拟持仓收益展示
+            if let (Some(buy_price), Some(return_rate), Some(quantity)) = (result.position_buy_price, result.position_return, result.position_quantity) {
+                let return_emoji = if return_rate > 0.0 { "📈" } else { "📉" };
+                let buy_date_str = result.position_buy_date.as_deref().unwrap_or("未知");
+                let profit = buy_price * quantity as f64 * return_rate / 100.0;
+                lines.push(format!(
+                    "**{} 模拟持仓**：买入价 {:.2} | 持仓 {} 股 | 收益率 **{:+.2}%** | 浮动盈亏 **{:+.2}** 元 | 买入日期 {}",
+                    return_emoji, buy_price, quantity, return_rate, profit, buy_date_str
+                ));
+                lines.push(String::new());
+            }
 
             // 操作理由
             if let Some(buy_reason) = &result.buy_reason {

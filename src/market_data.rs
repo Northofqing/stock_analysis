@@ -115,6 +115,8 @@ pub struct MarketOverview {
     pub bottom_sectors: Vec<SectorInfo>,
     /// 涨幅前10个股
     pub top_stocks: Vec<TopStock>,
+    /// 当日涨停股票列表
+    pub limit_up_stocks: Vec<TopStock>,
 }
 
 /// 表现突出的个股
@@ -146,6 +148,7 @@ impl MarketOverview {
             top_sectors: Vec::new(),
             bottom_sectors: Vec::new(),
             top_stocks: Vec::new(),
+            limit_up_stocks: Vec::new(),
         }
     }
 

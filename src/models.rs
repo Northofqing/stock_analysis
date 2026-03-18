@@ -10,7 +10,7 @@ use diesel::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::schema::{stock_daily, lhb_daily, analysis_result};
+use crate::schema::{stock_daily, lhb_daily, analysis_result, stock_position};
 
 // ============================================================================
 // 数据模型
@@ -293,4 +293,39 @@ pub struct NewLhbDaily {
     pub net_amount: f64,
     pub total_amount: f64,
     pub lhb_ratio: f64,
+}
+
+// ============================================================================
+// 模拟持仓数据模型
+// ============================================================================
+
+/// 模拟持仓记录查询模型
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, Deserialize)]
+#[diesel(table_name = stock_position)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct StockPosition {
+    pub id: i32,
+    pub code: String,
+    pub name: String,
+    pub buy_date: String,
+    pub buy_price: f64,
+    pub quantity: i32,
+    pub status: String,
+    pub sell_date: Option<String>,
+    pub sell_price: Option<f64>,
+    pub return_rate: Option<f64>,
+    pub created_at: NaiveDateTime,
+    pub updated_at: NaiveDateTime,
+}
+
+/// 插入新的模拟持仓记录
+#[derive(Debug, Clone, Insertable)]
+#[diesel(table_name = stock_position)]
+pub struct NewStockPosition {
+    pub code: String,
+    pub name: String,
+    pub buy_date: String,
+    pub buy_price: f64,
+    pub quantity: i32,
+    pub status: String,
 }
