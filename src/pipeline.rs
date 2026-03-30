@@ -1,33 +1,48 @@
 //! 股票分析流程调度器
 //!
-//! 负责协调各模块完成完整的分析流程
+//! 负责协调各模块完成完整的分析流程：
+//! 数据获取 → 趋势分析 → AI分析 → 通知推送
 
 use anyhow::{Context, Result};
 use futures::stream::{self, StreamExt};
 use log::{error, info, warn};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::path::PathBuf;
 
 use crate::analyzer::GeminiAnalyzer;
 use crate::data_provider::{DataFetcherManager, KlineData};
 use crate::search_service::get_search_service;
 use crate::database::DatabaseManager;
-use crate::notification::{self, NotificationService};
+use crate::notification::NotificationService;
 use crate::trend_analyzer::StockTrendAnalyzer;
+use crate::traits::ScoreDisplay;
 use crate::chart_generator::ChartGenerator;
-use crate::multi_factor_strategy::{MultiFactorEngine, MultiFactorConfig, StockFactors};
-use crate::backtest::{BacktestEngine, BacktestConfig, BacktestSummary};
+use crate::strategy::multi_factor::{MultiFactorEngine, MultiFactorConfig, StockFactors};
+use crate::strategy::core::{BacktestEngine, BacktestConfig, BacktestSummary};
+use crate::strategy::bollinger_zscore::{BollingerZScoreBacktest, BollingerZScoreConfig};
+use crate::strategy::rsi::{RsiBacktest, RsiConfig};
 
-/// 分析结果
-#[derive(Debug, Clone)]
+/// 股票综合分析结果
+///
+/// 由 `AnalysisPipeline` 生成，贯穿整个通知与报告流程。
+/// `notification` 模块直接使用此类型，无需额外的转换结构体。
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalysisResult {
     pub code: String,
     pub name: String,
     pub sentiment_score: i32,
     pub operation_advice: String,
     pub trend_prediction: String,
-    pub analysis_content: String,
-    // 盈利指标
+    /// 技术分析正文（Markdown 格式），对应通知报告中的「综合分析」章节。
+    pub analysis_summary: String,
+    // ========== 扩展分析段（来自 AI / 外部数据，可为空）==========
+    pub technical_analysis: Option<String>,
+    pub news_summary: Option<String>,
+    pub buy_reason: Option<String>,
+    pub risk_warning: Option<String>,
+    pub ma_analysis: Option<String>,
+    pub volume_analysis: Option<String>,
+    // ========== 估值指标 ==========
     pub pe_ratio: Option<f64>,
     pub pb_ratio: Option<f64>,
     pub turnover_rate: Option<f64>,
@@ -77,18 +92,26 @@ pub struct AnalysisResult {
     pub position_return: Option<f64>,
     /// 模拟持仓数量（股）
     pub position_quantity: Option<i32>,
+    /// 持仓状态："open" 持有中 / "closed" 已卖出 / "new" 本次新买入
+    pub position_status: Option<String>,
+    /// 卖出价格（仅 closed 时有值）
+    pub position_sell_price: Option<f64>,
+    /// 卖出日期（仅 closed 时有值）
+    pub position_sell_date: Option<String>,
+}
+
+impl ScoreDisplay for AnalysisResult {
+    fn sentiment_score(&self) -> i32 { self.sentiment_score }
+    fn operation_advice(&self) -> &str { &self.operation_advice }
 }
 
 impl AnalysisResult {
-    /// 获取情绪emoji
-    pub fn get_emoji(&self) -> &str {
-        match self.sentiment_score {
-            90..=100 => "🚀",
-            70..=89 => "📈",
-            50..=69 => "➡️",
-            30..=49 => "⚠️",
-            _ => "📉",
-        }
+    /// 获取情绪 emoji（委托给 `ScoreDisplay::score_emoji`）。
+    ///
+    /// 保留此方法以兼容所有调用点（`result.get_emoji()`），
+    /// 内部实现统一由 `traits::ScoreDisplay` 维护。
+    pub fn get_emoji(&self) -> &'static str {
+        self.score_emoji()
     }
 }
 
@@ -267,26 +290,7 @@ impl AnalysisPipeline {
             ));
         }
         
-        // 价格与均线数据表格
-        analysis_content.push_str("\n## 📈 价格与均线数据\n\n");
-        analysis_content.push_str("| 项目 | 价格(元) | 乖离率 | 状态 |\n");
-        analysis_content.push_str("|------|---------|--------|------|\n");
-        analysis_content.push_str(&format!("| 当前价 | {:.2} | - | - |\n", trend_result.current_price));
-        analysis_content.push_str(&format!("| MA5 | {:.2} | {:.2}% | {} |\n", 
-            trend_result.ma5, 
-            trend_result.bias_ma5,
-            if trend_result.support_ma5 { "✅ 支撑有效" } else { "⚠️ 无支撑" }
-        ));
-        analysis_content.push_str(&format!("| MA10 | {:.2} | {:.2}% | {} |\n", 
-            trend_result.ma10, 
-            trend_result.bias_ma10,
-            if trend_result.support_ma10 { "✅ 支撑有效" } else { "⚠️ 无支撑" }
-        ));
-        analysis_content.push_str(&format!("| MA20 | {:.2} | {:.2}% | - |\n", 
-            trend_result.ma20, trend_result.bias_ma20));
-        analysis_content.push_str(&format!("| MA60 | {:.2} | - | 中期趋势 |\n", trend_result.ma60));
-        
-        // 支撑位与压力位
+        // 支撑位与压力位（均线与价格数据已在通知模块的结构化表格中展示，此处不再重复）
         if !trend_result.support_levels.is_empty() || !trend_result.resistance_levels.is_empty() {
             analysis_content.push_str("\n## 🎯 关键价位\n\n");
             analysis_content.push_str("| 类型 | 价位(元) | 说明 |\n");
@@ -303,66 +307,11 @@ impl AnalysisPipeline {
             }
         }
         
-        // 量能分析
-        analysis_content.push_str("\n## 📊 量能分析\n\n");
-        analysis_content.push_str(&format!("- **量能状态**: {}\n", trend_result.volume_status));
-        analysis_content.push_str(&format!("- **量比(5日)**: {:.2}倍 {}\n", 
-            trend_result.volume_ratio_5d,
-            if trend_result.volume_ratio_5d > 2.0 { "(显著放量)" }
-            else if trend_result.volume_ratio_5d > 1.2 { "(温和放量)" }
-            else if trend_result.volume_ratio_5d > 0.8 { "(量能正常)" }
-            else { "(缩量)" }
-        ));
-        analysis_content.push_str(&format!("- **量能趋势**: {}\n", trend_result.volume_trend));
-        
+        // 量能数据已在通知模块的结构化表格中展示，此处不再重复
+
         // 添加盈利指标（如果有）
+        // 盈利水平指标已在通知模块的结构化表格中展示，此处不再重复
         let latest = &data[0];
-        if latest.pe_ratio.is_some() || latest.pb_ratio.is_some() {
-            analysis_content.push_str("\n## 盈利水平指标\n\n");
-            
-            if let Some(pe) = latest.pe_ratio {
-                let pe_assessment = if pe < 0.0 {
-                    "⚠️ 亏损状态"
-                } else if pe < 15.0 {
-                    "✅ 估值合理"
-                } else if pe < 30.0 {
-                    "⚠️ 估值适中"
-                } else {
-                    "🔴 估值偏高"
-                };
-                analysis_content.push_str(&format!("- **市盈率(PE)**: {:.2} {}\n", pe, pe_assessment));
-            }
-            
-            if let Some(pb) = latest.pb_ratio {
-                let pb_assessment = if pb < 1.0 {
-                    "✅ 可能被低估"
-                } else if pb < 3.0 {
-                    "✅ 市净率正常"
-                } else {
-                    "🔴 市净率较高"
-                };
-                analysis_content.push_str(&format!("- **市净率(PB)**: {:.2} {}\n", pb, pb_assessment));
-            }
-            
-            if let Some(turnover) = latest.turnover_rate {
-                let turnover_assessment = if turnover < 3.0 {
-                    "交投清淡"
-                } else if turnover < 10.0 {
-                    "正常换手"
-                } else {
-                    "活跃交易"
-                };
-                analysis_content.push_str(&format!("- **换手率**: {:.2}% ({})\n", turnover, turnover_assessment));
-            }
-            
-            if let Some(market_cap) = latest.market_cap {
-                analysis_content.push_str(&format!("- **总市值**: {:.2}亿元\n", market_cap));
-            }
-            
-            if let Some(circ_cap) = latest.circulating_cap {
-                analysis_content.push_str(&format!("- **流通市值**: {:.2}亿元\n", circ_cap));
-            }
-        }
 
         if !trend_result.signal_reasons.is_empty() {
             analysis_content.push_str("\n## 信号原因\n");
@@ -590,7 +539,15 @@ impl AnalysisPipeline {
             sentiment_score: trend_result.signal_score,
             operation_advice,
             trend_prediction: format!("{}", trend_result.trend_status),
-            analysis_content,
+            // 投入技术分析正文（与展示层共享同一字段）
+            analysis_summary: analysis_content,
+            // 扩展分析段（目前流程未填充，保留供未来扩展）
+            technical_analysis: None,
+            news_summary: None,
+            buy_reason: None,
+            risk_warning: None,
+            ma_analysis: Some(trend_result.ma_alignment.clone()),
+            volume_analysis: None,
             // 从最新K线获取盈利指标
             pe_ratio: data[0].pe_ratio,
             pb_ratio: data[0].pb_ratio,
@@ -625,26 +582,37 @@ impl AnalysisPipeline {
             position_buy_date: None,
             position_return: None,
             position_quantity: None,
+            position_status: None,
+            position_sell_price: None,
+            position_sell_date: None,
         };
 
         Ok(result)
     }
 
-    /// 处理单只股票的完整流程
+    /// 处理单只股票的完整流程（含 120s 超时保护）
     async fn process_stock(&self, code: String, macro_context: Arc<String>) -> Option<AnalysisResult> {
-        info!("========== 开始处理 {} ==========", code);
+        let start = std::time::Instant::now();
+        info!("========== [{}] 开始处理 ==========", code);
 
         // 整体超时保护：单只股票最多处理 120 秒，避免任何环节卡死拖垮全局
-        match tokio::time::timeout(
+        let result = match tokio::time::timeout(
             std::time::Duration::from_secs(120),
             self.process_stock_inner(code.clone(), macro_context),
         ).await {
-            Ok(result) => result,
+            Ok(r) => r,
             Err(_) => {
                 error!("[{}] 处理超时（120s），跳过", code);
                 None
             }
+        };
+
+        let elapsed = start.elapsed();
+        match &result {
+            Some(r) => info!("[{}] ✓ 处理完成 ({:.1}s)：{} 评分 {}", code, elapsed.as_secs_f32(), r.operation_advice, r.sentiment_score),
+            None    => warn!("[{}] ✗ 处理失败或超时 ({:.1}s)", code, elapsed.as_secs_f32()),
         }
+        result
     }
 
     async fn process_stock_inner(&self, code: String, macro_context: Arc<String>) -> Option<AnalysisResult> {
@@ -696,19 +664,30 @@ impl AnalysisPipeline {
                     result.position_buy_date = Some(pos.buy_date.clone());
                     result.position_return = Some(return_rate);
                     result.position_quantity = Some(pos.quantity);
-                    info!("[{}] 持仓收益率: {:.2}%（买入价 {:.2}）", code, return_rate, pos.buy_price);
 
-                    // 更新数据库中的收益率
-                    if let Err(e) = db.update_position_return(pos.id, current_price, return_rate) {
-                        warn!("[{}] 更新持仓收益率失败: {}", code, e);
-                    }
-
-                    // 如果建议卖出，自动平仓
-                    if result.operation_advice.contains("卖出") {
+                    // 判断是否触发卖出
+                    let should_sell = result.operation_advice.contains("卖出");
+                    if should_sell {
                         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
                         match db.close_position(pos.id, current_price, &today) {
-                            Ok(_) => info!("[{}] 持仓已平仓，收益率: {:.2}%", code, return_rate),
-                            Err(e) => warn!("[{}] 平仓失败: {}", code, e),
+                            Ok(_) => {
+                                info!("[{}] 触发卖出信号，模拟平仓 @ {:.2}，收益率: {:+.2}%", code, current_price, return_rate);
+                                result.position_status = Some("closed".to_string());
+                                result.position_sell_price = Some(current_price);
+                                result.position_sell_date = Some(today);
+                            }
+                            Err(e) => {
+                                warn!("[{}] 平仓失败: {}", code, e);
+                                result.position_status = Some("open".to_string());
+                            }
+                        }
+                    } else {
+                        result.position_status = Some("open".to_string());
+                        info!("[{}] 持仓中，收益率: {:+.2}%（买入价 {:.2} → 现价 {:.2}）",
+                            code, return_rate, pos.buy_price, current_price);
+                        // 更新数据库中的浮动收益率
+                        if let Err(e) = db.update_position_return(pos.id, current_price, return_rate) {
+                            warn!("[{}] 更新持仓收益率失败: {}", code, e);
                         }
                     }
                 }
@@ -719,13 +698,20 @@ impl AnalysisPipeline {
                         let new_position = crate::models::NewStockPosition {
                             code: code.clone(),
                             name: result.name.clone(),
-                            buy_date: today,
+                            buy_date: today.clone(),
                             buy_price: current_price,
                             quantity: 1000,
                             status: "open".to_string(),
                         };
                         match db.save_position(&new_position) {
-                            Ok(_) => info!("[{}] 模拟买入 1000 股 @ {:.2}", code, current_price),
+                            Ok(_) => {
+                                info!("[{}] 触发买入信号，模拟买入 1000 股 @ {:.2}", code, current_price);
+                                result.position_buy_price = Some(current_price);
+                                result.position_buy_date = Some(today);
+                                result.position_return = Some(0.0);
+                                result.position_quantity = Some(1000);
+                                result.position_status = Some("new".to_string());
+                            }
                             Err(e) => warn!("[{}] 记录模拟买入失败: {}", code, e),
                         }
                     }
@@ -869,6 +855,42 @@ impl AnalysisPipeline {
             None
         };
 
+        // 运行布林带+Z-Score 均值回归回测
+        if !results.is_empty() && !self.config.dry_run {
+            info!("===== 开始布林带+Z-Score 均值回归回测 =====");
+            match self.run_bollinger_zscore_backtest(&results).await {
+                Ok(summary) => {
+                    info!("布林带回测完成: 总收益 {:.2}%, 年化收益 {:.2}%, 最大回撤 {:.2}%, 夏普比率 {:.2}",
+                        summary.total_return * 100.0,
+                        summary.annual_return * 100.0,
+                        summary.max_drawdown * 100.0,
+                        summary.sharpe_ratio
+                    );
+                }
+                Err(e) => {
+                    error!("布林带回测失败: {}", e);
+                }
+            }
+        }
+
+        // 运行 RSI 超买超卖策略回测
+        if !results.is_empty() && !self.config.dry_run {
+            info!("===== 开始 RSI 超买超卖策略回测 =====");
+            match self.run_rsi_backtest(&results).await {
+                Ok(summary) => {
+                    info!("RSI 回测完成: 总收益 {:.2}%, 年化收益 {:.2}%, 最大回撤 {:.2}%, 夏普比率 {:.2}",
+                        summary.total_return * 100.0,
+                        summary.annual_return * 100.0,
+                        summary.max_drawdown * 100.0,
+                        summary.sharpe_ratio
+                    );
+                }
+                Err(e) => {
+                    error!("RSI 回测失败: {}", e);
+                }
+            }
+        }
+
         // 发送汇总通知
         if !results.is_empty()
             && self.config.send_notification
@@ -892,7 +914,7 @@ impl AnalysisPipeline {
             limit_up_tag,
             result.operation_advice,
             result.sentiment_score,
-            result.analysis_content
+            result.analysis_summary
         )
     }
 
@@ -901,11 +923,6 @@ impl AnalysisPipeline {
         info!("生成分析汇总报告...");
 
         let date_str = chrono::Local::now().format("%Y%m%d").to_string();
-        
-        // 按评分排序（索引排序，避免深拷贝整个结果集）
-        let mut indices: Vec<usize> = (0..results.len()).collect();
-        indices.sort_by(|&a, &b| results[b].sentiment_score.cmp(&results[a].sentiment_score));
-        let sorted: Vec<&AnalysisResult> = indices.iter().map(|&i| &results[i]).collect();
 
         // 生成图表
         let chart_filename = format!("reports/stock_chart_{}.png", date_str);
@@ -922,14 +939,8 @@ impl AnalysisPipeline {
             }
         };
 
-        // 转换为 notification 模块的 AnalysisResult
-        let notification_results: Vec<notification::AnalysisResult> = sorted
-            .iter()
-            .map(|r| notification::AnalysisResult::from(*r))
-            .collect();
-
-        // 使用 notification 模块的报告生成方法（股票分析报告）
-        let report = self.notifier.generate_daily_report(&notification_results);
+        // 直接使用 pipeline AnalysisResult 生成日报（notification 模块共用同一类型，无需转换）
+        let report = self.notifier.generate_daily_report(results);
 
         // 如果有回测结果，单独保存回测报告到本地（不发送邮件）
         if let Some(summary) = backtest_summary {
@@ -1084,5 +1095,107 @@ impl AnalysisPipeline {
         }
 
         Ok(summary)
+    }
+
+    /// 运行布林带+Z-Score 均值回归策略回测
+    async fn run_bollinger_zscore_backtest(&self, results: &[AnalysisResult]) -> Result<BacktestSummary> {
+        let config = BollingerZScoreConfig::default();
+        let engine = BollingerZScoreBacktest::new(config);
+
+        // 为评分前 20 的股票拉取较长历史数据（250 日）
+        let mut sorted = results.to_vec();
+        sorted.sort_by(|a, b| b.sentiment_score.cmp(&a.sentiment_score));
+
+        let top_codes: Vec<_> = sorted.iter().take(20).collect();
+        let mut stocks_data: Vec<(String, String, Vec<crate::data_provider::KlineData>)> = Vec::new();
+
+        for r in &top_codes {
+            match self.data_manager.get_daily_data(&r.code, 250) {
+                Ok((data, _)) if data.len() >= 30 => {
+                    stocks_data.push((r.code.clone(), r.name.clone(), data));
+                }
+                Ok(_) => {
+                    warn!("[{}] K线数据不足30条，跳过布林带回测", r.code);
+                }
+                Err(e) => {
+                    warn!("[{}] 拉取历史数据失败: {}", r.code, e);
+                }
+            }
+        }
+
+        if stocks_data.is_empty() {
+            anyhow::bail!("无有效股票数据用于布林带回测");
+        }
+
+        info!("布林带回测：共 {} 只股票参与", stocks_data.len());
+        let result = engine.run_portfolio(&stocks_data)?;
+
+        // 生成并保存报告
+        let date_str = chrono::Local::now().format("%Y%m%d").to_string();
+        let report = result.generate_report();
+        let report_filename = format!("bollinger_zscore_backtest_{}.md", date_str);
+        self.notifier.save_report_to_file(&report, Some(&report_filename))?;
+        info!("✓ 布林带+Z-Score回测报告已保存: reports/{}", report_filename);
+
+        // 生成图表
+        let chart_path = format!("reports/bollinger_zscore_chart_{}.png", date_str);
+        match result.generate_chart(&chart_path) {
+            Ok(path) => info!("✓ 布林带回测图表已生成: {}", path.display()),
+            Err(e) => warn!("布林带回测图表生成失败: {}", e),
+        }
+
+        Ok(result.to_summary())
+    }
+
+    /// 运行 RSI 超买超卖策略回测
+    async fn run_rsi_backtest(&self, results: &[AnalysisResult]) -> Result<BacktestSummary> {
+        let config = RsiConfig::default();
+        let engine = RsiBacktest::new(config);
+
+        // 取评分前 20 的股票拉取历史K线（250日）
+        let mut sorted = results.to_vec();
+        sorted.sort_by(|a, b| b.sentiment_score.cmp(&a.sentiment_score));
+
+        let top_codes: Vec<_> = sorted.iter().take(20).collect();
+        let mut stocks_data: Vec<(String, String, Vec<crate::data_provider::KlineData>)> =
+            Vec::new();
+
+        for r in &top_codes {
+            match self.data_manager.get_daily_data(&r.code, 250) {
+                Ok((data, _)) if data.len() >= 20 => {
+                    stocks_data.push((r.code.clone(), r.name.clone(), data));
+                }
+                Ok(_) => {
+                    warn!("[{}] K线数据不足20条，跳过RSI回测", r.code);
+                }
+                Err(e) => {
+                    warn!("[{}] 拉取历史数据失败: {}", r.code, e);
+                }
+            }
+        }
+
+        if stocks_data.is_empty() {
+            anyhow::bail!("无有效股票数据用于RSI回测");
+        }
+
+        info!("RSI 回测：共 {} 只股票参与", stocks_data.len());
+        let result = engine.run_portfolio(&stocks_data)?;
+
+        // 保存报告
+        let date_str = chrono::Local::now().format("%Y%m%d").to_string();
+        let report = result.generate_report();
+        let report_filename = format!("rsi_strategy_backtest_{}.md", date_str);
+        self.notifier
+            .save_report_to_file(&report, Some(&report_filename))?;
+        info!("✓ RSI策略回测报告已保存: reports/{}", report_filename);
+
+        // 生成图表
+        let chart_path = format!("reports/rsi_strategy_chart_{}.png", date_str);
+        match result.generate_chart(&chart_path) {
+            Ok(path) => info!("✓ RSI回测图表已生成: {}", path.display()),
+            Err(e) => warn!("RSI回测图表生成失败: {}", e),
+        }
+
+        Ok(result.to_summary())
     }
 }

@@ -137,140 +137,8 @@ impl NotificationConfig {
     }
 }
 
-/// 简化的分析结果结构（用于通知）
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AnalysisResult {
-    pub code: String,
-    pub name: String,
-    pub sentiment_score: i32,
-    pub trend_prediction: String,
-    pub operation_advice: String,
-    pub analysis_summary: String,
-    pub technical_analysis: Option<String>,
-    pub news_summary: Option<String>,
-    pub buy_reason: Option<String>,
-    pub risk_warning: Option<String>,
-    pub ma_analysis: Option<String>,
-    pub volume_analysis: Option<String>,
-
-    // ========== 估值指标 ==========
-    pub pe_ratio: Option<f64>,
-    pub pb_ratio: Option<f64>,
-    pub turnover_rate: Option<f64>,
-    pub market_cap: Option<f64>,
-    pub circulating_cap: Option<f64>,
-
-    // ========== 均线与乖离率 ==========
-    pub current_price: Option<f64>,
-    pub ma5: Option<f64>,
-    pub ma10: Option<f64>,
-    pub ma20: Option<f64>,
-    pub ma60: Option<f64>,
-    pub ma_alignment: Option<String>,
-    pub bias_ma5: Option<f64>,
-
-    // ========== 量能 ==========
-    pub volume_ratio_5d: Option<f64>,
-
-    // ========== 52周/季度价格区间 ==========
-    pub high_52w: Option<f64>,
-    pub low_52w: Option<f64>,
-    pub pos_52w: Option<f64>,
-    pub high_quarter: Option<f64>,
-    pub low_quarter: Option<f64>,
-    pub pos_quarter: Option<f64>,
-
-    // ========== 近期走势 ==========
-    pub chg_5d: Option<f64>,
-    pub chg_10d: Option<f64>,
-    pub volatility: Option<f64>,
-
-    // ========== 财务指标 ==========
-    pub eps: Option<f64>,
-    pub roe: Option<f64>,
-    pub gross_margin: Option<f64>,
-    pub net_margin: Option<f64>,
-    pub revenue_yoy: Option<f64>,
-    pub net_profit_yoy: Option<f64>,
-    pub sharpe_ratio: Option<f64>,
-    /// 是否当日涨停
-    pub is_limit_up: bool,
-    /// 模拟持仓买入价格
-    pub position_buy_price: Option<f64>,
-    /// 模拟持仓买入日期
-    pub position_buy_date: Option<String>,
-    /// 模拟持仓收益率（%）
-    pub position_return: Option<f64>,
-    /// 模拟持仓数量（股）
-    pub position_quantity: Option<i32>,
-}
-
-impl AnalysisResult {
-    /// 获取emoji表情
-    pub fn get_emoji(&self) -> &'static str {
-        match self.sentiment_score {
-            80.. => "💚",
-            65..=79 => "🟢",
-            55..=64 => "🟡",
-            45..=54 => "⚪",
-            35..=44 => "🟠",
-            _ => "🔴",
-        }
-    }
-}
-
-impl From<&crate::pipeline::AnalysisResult> for AnalysisResult {
-    fn from(r: &crate::pipeline::AnalysisResult) -> Self {
-        Self {
-            code: r.code.clone(),
-            name: r.name.clone(),
-            sentiment_score: r.sentiment_score,
-            trend_prediction: r.trend_prediction.clone(),
-            operation_advice: r.operation_advice.clone(),
-            analysis_summary: r.analysis_content.clone(),
-            technical_analysis: None,
-            news_summary: None,
-            buy_reason: None,
-            risk_warning: None,
-            ma_analysis: r.ma_alignment.clone(),
-            volume_analysis: None,
-            pe_ratio: r.pe_ratio,
-            pb_ratio: r.pb_ratio,
-            turnover_rate: r.turnover_rate,
-            market_cap: r.market_cap,
-            circulating_cap: r.circulating_cap,
-            current_price: r.current_price,
-            ma5: r.ma5,
-            ma10: r.ma10,
-            ma20: r.ma20,
-            ma60: r.ma60,
-            ma_alignment: r.ma_alignment.clone(),
-            bias_ma5: r.bias_ma5,
-            volume_ratio_5d: r.volume_ratio_5d,
-            high_52w: r.high_52w,
-            low_52w: r.low_52w,
-            pos_52w: r.pos_52w,
-            high_quarter: r.high_quarter,
-            low_quarter: r.low_quarter,
-            pos_quarter: r.pos_quarter,
-            chg_5d: r.chg_5d,
-            chg_10d: r.chg_10d,
-            volatility: r.volatility,
-            eps: r.eps,
-            roe: r.roe,
-            gross_margin: r.gross_margin,
-            net_margin: r.net_margin,
-            revenue_yoy: r.revenue_yoy,
-            net_profit_yoy: r.net_profit_yoy,
-            sharpe_ratio: r.sharpe_ratio,
-            is_limit_up: r.is_limit_up,
-            position_buy_price: r.position_buy_price,
-            position_buy_date: r.position_buy_date.clone(),
-            position_return: r.position_return,
-            position_quantity: r.position_quantity,
-        }
-    }
-}
+/// 股票分析结果（与 `pipeline::AnalysisResult` 共用同一类型，避免重复定义）。
+pub use crate::pipeline::AnalysisResult;
 
 /// 通知服务
 pub struct NotificationService {
@@ -486,10 +354,22 @@ impl NotificationService {
                 let return_emoji = if return_rate > 0.0 { "📈" } else { "📉" };
                 let buy_date_str = result.position_buy_date.as_deref().unwrap_or("未知");
                 let profit = buy_price * quantity as f64 * return_rate / 100.0;
-                lines.push(format!(
-                    "**{} 模拟持仓**：买入价 {:.2} | 持仓 {} 股 | 收益率 **{:+.2}%** | 浮动盈亏 **{:+.2}** 元 | 买入日期 {}",
-                    return_emoji, buy_price, quantity, return_rate, profit, buy_date_str
-                ));
+
+                if result.position_status.as_deref() == Some("closed") {
+                    // 本次触发卖出，显示实现盈亏
+                    let sell_price = result.position_sell_price.unwrap_or(0.0);
+                    let sell_date = result.position_sell_date.as_deref().unwrap_or("-");
+                    lines.push(format!(
+                        "**✅ 模拟持仓（已卖出）**：买入 {:.2} → 卖出 {:.2} | {} 股 | 收益率 **{:+.2}%** | 实现盈亏 **{:+.2} 元** | 买入 {} / 卖出 {}",
+                        buy_price, sell_price, quantity, return_rate, profit, buy_date_str, sell_date
+                    ));
+                } else {
+                    let status_tag = if result.position_status.as_deref() == Some("new") { "🟢 新建仓" } else { "📊 持仓中" };
+                    lines.push(format!(
+                        "**{} 模拟持仓（{}）**：买入价 {:.2} | {} 股 | 收益率 **{:+.2}%** | 浮动盈亏 **{:+.2} 元** | 买入日期 {}",
+                        return_emoji, status_tag, buy_price, quantity, return_rate, profit, buy_date_str
+                    ));
+                }
                 lines.push(String::new());
             }
 
@@ -499,63 +379,63 @@ impl NotificationService {
                 lines.push(String::new());
             }
 
-            // ========== 均线与价格位置 ==========
-            let has_ma_data = result.current_price.is_some() && result.ma5.is_some();
-            if has_ma_data {
-                lines.push("#### 📈 均线与价格位置".to_string());
-                lines.push(String::new());
-                lines.push("| 项目 | 价格 | 说明 |".to_string());
-                lines.push("|------|------|------|".to_string());
+            // // ========== 均线与价格位置 ==========
+            // let has_ma_data = result.current_price.is_some() && result.ma5.is_some();
+            // if has_ma_data {
+            //     lines.push("#### 📈 均线与价格位置".to_string());
+            //     lines.push(String::new());
+            //     lines.push("| 项目 | 价格 | 说明 |".to_string());
+            //     lines.push("|------|------|------|".to_string());
 
-                if let Some(price) = result.current_price {
-                    lines.push(format!("| 当前价 | {:.2} | - |", price));
-                }
-                if let Some(ma5) = result.ma5 {
-                    let bias_str = result.bias_ma5
-                        .map(|b| {
-                            let warn = if b.abs() > 5.0 { " ⚠️偏离过大" } else { "" };
-                            format!("乖离率: {:.2}%{}", b, warn)
-                        })
-                        .unwrap_or_default();
-                    lines.push(format!("| MA5 | {:.2} | {} |", ma5, bias_str));
-                }
-                if let Some(ma10) = result.ma10 {
-                    lines.push(format!("| MA10 | {:.2} | - |", ma10));
-                }
-                if let Some(ma20) = result.ma20 {
-                    lines.push(format!("| MA20 | {:.2} | - |", ma20));
-                }
-                if let Some(ma60) = result.ma60 {
-                    lines.push(format!("| MA60 | {:.2} | 中期趋势 |", ma60));
-                }
+            //     if let Some(price) = result.current_price {
+            //         lines.push(format!("| 当前价 | {:.2} | - |", price));
+            //     }
+            //     if let Some(ma5) = result.ma5 {
+            //         let bias_str = result.bias_ma5
+            //             .map(|b| {
+            //                 let warn = if b.abs() > 5.0 { " ⚠️偏离过大" } else { "" };
+            //                 format!("乖离率: {:.2}%{}", b, warn)
+            //             })
+            //             .unwrap_or_default();
+            //         lines.push(format!("| MA5 | {:.2} | {} |", ma5, bias_str));
+            //     }
+            //     if let Some(ma10) = result.ma10 {
+            //         lines.push(format!("| MA10 | {:.2} | - |", ma10));
+            //     }
+            //     if let Some(ma20) = result.ma20 {
+            //         lines.push(format!("| MA20 | {:.2} | - |", ma20));
+            //     }
+            //     if let Some(ma60) = result.ma60 {
+            //         lines.push(format!("| MA60 | {:.2} | 中期趋势 |", ma60));
+            //     }
 
-                if let Some(ref alignment) = result.ma_alignment {
-                    lines.push(format!("| 排列状态 | {} | - |", alignment));
-                }
+            //     if let Some(ref alignment) = result.ma_alignment {
+            //         lines.push(format!("| 排列状态 | {} | - |", alignment));
+            //     }
 
-                lines.push(String::new());
-            }
+            //     lines.push(String::new());
+            // }
 
-            // ========== 52周/季度价格区间 ==========
-            let has_range = result.high_52w.is_some() || result.high_quarter.is_some();
-            if has_range {
-                lines.push("#### 📏 价格区间".to_string());
-                lines.push(String::new());
-                lines.push("| 区间 | 最高 | 最低 | 当前位置 |".to_string());
-                lines.push("|------|------|------|---------|".to_string());
+            // // ========== 52周/季度价格区间 ==========
+            // let has_range = result.high_52w.is_some() || result.high_quarter.is_some();
+            // if has_range {
+            //     lines.push("#### 📏 价格区间".to_string());
+            //     lines.push(String::new());
+            //     lines.push("| 区间 | 最高 | 最低 | 当前位置 |".to_string());
+            //     lines.push("|------|------|------|---------|".to_string());
 
-                if let (Some(h), Some(l), Some(p)) = (result.high_52w, result.low_52w, result.pos_52w) {
-                    let pos_desc = if p > 80.0 { "接近高点 ⚠️" }
-                        else if p < 20.0 { "接近低点 ✅" }
-                        else { "" };
-                    lines.push(format!("| 52周 | {:.2} | {:.2} | {:.1}% {} |", h, l, p, pos_desc));
-                }
-                if let (Some(h), Some(l), Some(p)) = (result.high_quarter, result.low_quarter, result.pos_quarter) {
-                    lines.push(format!("| 近一季 | {:.2} | {:.2} | {:.1}% |", h, l, p));
-                }
+            //     if let (Some(h), Some(l), Some(p)) = (result.high_52w, result.low_52w, result.pos_52w) {
+            //         let pos_desc = if p > 80.0 { "接近高点 ⚠️" }
+            //             else if p < 20.0 { "接近低点 ✅" }
+            //             else { "" };
+            //         lines.push(format!("| 52周 | {:.2} | {:.2} | {:.1}% {} |", h, l, p, pos_desc));
+            //     }
+            //     if let (Some(h), Some(l), Some(p)) = (result.high_quarter, result.low_quarter, result.pos_quarter) {
+            //         lines.push(format!("| 近一季 | {:.2} | {:.2} | {:.1}% |", h, l, p));
+            //     }
 
-                lines.push(String::new());
-            }
+            //     lines.push(String::new());
+            // }
 
             // ========== 量能与近期走势 ==========
             let has_momentum = result.volume_ratio_5d.is_some() || result.chg_5d.is_some();

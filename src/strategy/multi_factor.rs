@@ -282,3 +282,41 @@ mod tests {
         assert_eq!(selected.len(), 1);
     }
 }
+
+// ────────────────────────────── FundamentalStrategy 绑定 ──────────────────────────────
+
+/// `MultiFactorEngine` 实现 `FundamentalStrategy`，可统一接入策略框架
+pub struct MultiFactorStrategy {
+    engine: MultiFactorEngine,
+}
+
+impl MultiFactorStrategy {
+    pub fn new(config: MultiFactorConfig) -> Self {
+        Self {
+            engine: MultiFactorEngine::new(config),
+        }
+    }
+}
+
+impl Default for MultiFactorStrategy {
+    fn default() -> Self {
+        Self::new(MultiFactorConfig::default())
+    }
+}
+
+impl super::FundamentalStrategy for MultiFactorStrategy {
+    fn name(&self) -> &'static str {
+        "多因子选股"
+    }
+
+    fn description(&self) -> &'static str {
+        "基于市值、ROE、PE、PB等因子排名，综合评分选出得分最优的股票组合"
+    }
+
+    fn select_stocks(
+        &self,
+        stocks: &[StockFactors],
+    ) -> Result<Vec<StockScore>> {
+        self.engine.calculate_scores(stocks)
+    }
+}

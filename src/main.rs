@@ -94,12 +94,12 @@ fn main() -> Result<()> {
     // 解析命令行参数
     let args = Args::parse();
 
-    // 配置日志
-    if args.debug {
-        env_logger::Builder::from_env(Env::default().default_filter_or("debug")).init();
-    } else {
-        env_logger::Builder::from_env(Env::default().default_filter_or("info")).init();
+    // 配置日志（如果 RUST_LOG 为空则忽略，使用默认级别）
+    let default_level = if args.debug { "debug" } else { "info" };
+    if std::env::var("RUST_LOG").unwrap_or_default().is_empty() {
+        std::env::set_var("RUST_LOG", default_level);
     }
+    env_logger::Builder::from_env(Env::default().default_filter_or(default_level)).init();
 
     info!("============================================================");
     info!("A股自选股智能分析系统 启动");

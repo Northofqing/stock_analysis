@@ -1456,13 +1456,21 @@ impl SearchService {
         let mut providers: Vec<Box<dyn SearchProvider>> = Vec::new();
 
         // 按优先级添加搜索引擎
-        // 1. 东方财富优先（免费，A股专业，无需API Key）
+        // 1. SerpAPI 最优先（Google搜索结果，质量高）
+        if let Some(keys) = serpapi_keys {
+            if !keys.is_empty() {
+                info!("已配置 SerpAPI 搜索，共 {} 个 API Key", keys.len());
+                providers.push(Box::new(SerpAPISearchProvider::new(keys)));
+            }
+        }
+
+        // 2. 东方财富（免费，A股专业，无需API Key）
         if enable_eastmoney {
             info!("已启用 东方财富 新闻搜索（免费，无限制）");
             providers.push(Box::new(EastmoneyNewsProvider::new()));
         }
 
-        // 2. Bocha（中文搜索优化，AI摘要）
+        // 3. Bocha（中文搜索优化，AI摘要）
         if let Some(keys) = bocha_keys {
             if !keys.is_empty() {
                 info!("已配置 Bocha 搜索，共 {} 个 API Key", keys.len());
@@ -1470,19 +1478,11 @@ impl SearchService {
             }
         }
 
-        // 3. Tavily（免费额度更多，每月 1000 次）
+        // 4. Tavily（免费额度更多，每月 1000 次）
         if let Some(keys) = tavily_keys {
             if !keys.is_empty() {
                 info!("已配置 Tavily 搜索，共 {} 个 API Key", keys.len());
                 providers.push(Box::new(TavilySearchProvider::new(keys)));
-            }
-        }
-
-        // 4. SerpAPI 作为备选（每月 100 次）
-        if let Some(keys) = serpapi_keys {
-            if !keys.is_empty() {
-                info!("已配置 SerpAPI 搜索，共 {} 个 API Key", keys.len());
-                providers.push(Box::new(SerpAPISearchProvider::new(keys)));
             }
         }
 

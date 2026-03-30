@@ -18,11 +18,10 @@ use std::time::Duration;
 use crate::market_data::{MarketIndex, MarketOverview, SectorInfo};
 use crate::search_service::{SearchResponse, SearchService};
 
-// AI分析器类型（用于生成复盘报告）
-pub trait AiAnalyzer: Send + Sync {
-    fn is_available(&self) -> bool;
-    fn generate_content(&self, prompt: &str, temperature: f32, max_tokens: usize) -> Result<String>;
-}
+/// AI 分析器接口（委托给 `traits::AiContentGenerator`）
+///
+/// 保留此类型别名供本模块内部及现有调用方使用，避免修改调用处签名。
+pub use crate::traits::AiContentGenerator as AiAnalyzer;
 
 /// 大盘复盘分析器
 pub struct MarketAnalyzer {
@@ -91,11 +90,11 @@ impl MarketAnalyzer {
     }
 
     /// 获取当日涨停股票列表
-    /// 优先使用东方财富涨停板API（覆盖沪深两市），失败时回退到新浪API
+    /// 优先使用东方财富行情API（覆盖沪深两市），失败时回退到新浪API
     pub fn get_limit_up_stocks(&self) -> Result<Vec<crate::market_data::TopStock>> {
         info!("[大盘] 获取当日涨停股票列表...");
 
-        // 优先使用东方财富涨停板API
+        // 优先使用东方财富行情API
         match self.get_limit_up_from_eastmoney() {
             Ok(stocks) if !stocks.is_empty() => {
                 info!("[大盘] 东方财富API发现 {} 只涨停股票", stocks.len());
@@ -109,58 +108,169 @@ impl MarketAnalyzer {
             }
         }
 
-        // 回退：从新浪API统计
-        let mut overview = MarketOverview::new(String::new());
-        self.get_market_statistics(&mut overview)?;
-        // 过滤ST
-        overview.limit_up_stocks.retain(|s| !s.name.contains("ST") && !s.name.contains("st"));
-        info!("[大盘] 新浪API发现 {} 只涨停股票（已排除ST）", overview.limit_up_stocks.len());
-        Ok(overview.limit_up_stocks)
+        // 回退：从新浪API按涨幅倒序获取涨停股票
+        self.get_limit_up_from_sina()
+    }
+
+    /// 通过新浪API按涨幅排序获取涨停股票（作为东方财富API的备用）
+    fn get_limit_up_from_sina(&self) -> Result<Vec<crate::market_data::TopStock>> {
+        use crate::market_data::TopStock;
+
+        let url = "http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData";
+        let mut stocks = Vec::new();
+
+        // 按涨幅倒序，每页200条，翻页到涨幅低于4.85%（ST涨停阈值下限）为止
+        for page in 1..=5 {
+            let page_str = page.to_string();
+            let params = [
+                ("page", page_str.as_str()),
+                ("num", "200"),
+                ("sort", "changepercent"),
+                ("asc", "0"),        // 降序
+                ("node", "hs_a"),
+                ("symbol", ""),
+                ("_s_r_a", "page"),
+            ];
+
+            let response = self.client
+                .get(url)
+                .query(&params)
+                .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+                .timeout(Duration::from_secs(15))
+                .send();
+
+            let response = match response {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("[大盘] 新浪API第{}页请求失败: {}", page, e);
+                    break;
+                }
+            };
+
+            let text = match response.text() {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!("[大盘] 新浪API第{}页读取失败: {}", page, e);
+                    break;
+                }
+            };
+
+            let json: Value = match serde_json::from_str(&text) {
+                Ok(j) => j,
+                Err(e) => {
+                    warn!("[大盘] 新浪API第{}页解析失败: {}", page, e);
+                    break;
+                }
+            };
+
+            let items = match json.as_array() {
+                Some(arr) if !arr.is_empty() => arr,
+                _ => break,
+            };
+
+            let mut min_pct = f64::MAX;
+
+            for item in items {
+                let change_pct = item.get("changepercent").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let stock_name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let raw_code = item.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
+                let code = raw_code.trim_start_matches("sh")
+                    .trim_start_matches("sz")
+                    .trim_start_matches("bj");
+                let price = item.get("trade")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+
+                if change_pct < min_pct {
+                    min_pct = change_pct;
+                }
+
+                // 过滤ST股票
+                if stock_name.contains("ST") || stock_name.contains("st") {
+                    continue;
+                }
+                // 过滤北交所
+                if code.starts_with("8") || code.starts_with("4") || code.starts_with("9") {
+                    continue;
+                }
+
+                let limit_pct = Self::get_limit_pct(code, stock_name);
+                if change_pct >= limit_pct - 0.15 {
+                    stocks.push(TopStock {
+                        code: code.to_string(),
+                        name: stock_name.to_string(),
+                        change_pct,
+                        price,
+                    });
+                }
+            }
+
+            // 本页最低涨幅低于ST涨停阈值(5%)，不用继续翻页
+            if min_pct < 4.85 {
+                break;
+            }
+        }
+
+        info!("[大盘] 新浪API发现 {} 只涨停股票（已排除ST/北交所）", stocks.len());
+        Ok(stocks)
     }
 
     /// 通过东方财富push2 API获取当日涨停股票
-    /// 按涨幅降序获取前100只股票，再按涨跌停阈值筛选真正涨停的
+    /// 按涨幅降序分页获取，根据各板块涨跌停阈值筛选真正涨停的
+    /// - 主板(10%) / 创业板+科创板(20%) / ST(5%) / 北交所(30%)
     fn get_limit_up_from_eastmoney(&self) -> Result<Vec<crate::market_data::TopStock>> {
         use crate::market_data::TopStock;
 
-        // 东方财富push2 API：获取A股按涨幅排序前100
-        // fs参数: m:0+t:6(深主板) m:0+t:80(创业板) m:1+t:2(沪主板) m:1+t:23(科创板) m:0+t:81+s:2048(中小板)
         let url = "https://push2.eastmoney.com/api/qt/clist/get";
-        let params = [
-            ("pn", "1"),
-            ("pz", "100"),
-            ("po", "1"),       // 降序
-            ("np", "1"),
-            ("ut", "bd1d9ddb04089700cf9c27f6f7426281"),
-            ("fltt", "2"),
-            ("invt", "2"),
-            ("fid", "f3"),     // 按涨幅排序
-            ("fs", "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048"),
-            ("fields", "f2,f3,f12,f14"),  // f2:价格 f3:涨幅 f12:代码 f14:名称
-        ];
-
-        let response = self.client
-            .get(url)
-            .query(&params)
-            .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
-            .timeout(Duration::from_secs(10))
-            .send()
-            .context("东方财富push2 API请求失败")?;
-
-        let text = response.text().context("读取响应失败")?;
-        let json: Value = serde_json::from_str(&text).context("解析JSON失败")?;
-
         let mut stocks = Vec::new();
-        if let Some(diff) = json.get("data").and_then(|d| d.get("diff")).and_then(|d| d.as_array()) {
+        let mut seen = std::collections::HashSet::new();
+
+        // 分页获取，ST涨停阈值5%排名靠后需翻页，最多取5页兜底
+        for page in 1..=5 {
+            let page_str = page.to_string();
+            let params = [
+                ("pn", page_str.as_str()),
+                ("pz", "100"),
+                ("po", "1"),       // 降序
+                ("np", "1"),
+                ("ut", "bd1d9ddb04089700cf9c27f6f7426281"),
+                ("fltt", "2"),
+                ("invt", "2"),
+                ("fid", "f3"),     // 按涨幅排序
+                ("fs", "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048"),
+                ("fields", "f2,f3,f12,f14"),
+            ];
+
+            let response = self.client
+                .get(url)
+                .query(&params)
+                .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+                .timeout(Duration::from_secs(10))
+                .send()
+                .context("东方财富push2 API请求失败")?;
+
+            let text = response.text().context("读取响应失败")?;
+            let json: Value = serde_json::from_str(&text).context("解析JSON失败")?;
+
+            let diff = match json.get("data").and_then(|d| d.get("diff")).and_then(|d| d.as_array()) {
+                Some(arr) if !arr.is_empty() => arr,
+                _ => break,
+            };
+
+            let mut min_pct = f64::MAX;
             for item in diff {
                 let code = item.get("f12").and_then(|v| v.as_str()).unwrap_or("");
                 let name = item.get("f14").and_then(|v| v.as_str()).unwrap_or("");
                 let change_pct = item.get("f3").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let price = item.get("f2").and_then(|v| v.as_f64()).unwrap_or(0.0);
 
-                // 排除ST后，最低涨停阈值为主板10%，低于9.9%的不可能涨停
-                if change_pct < 9.9 {
-                    break;
+                if change_pct < min_pct {
+                    min_pct = change_pct;
+                }
+
+                if seen.contains(code) {
+                    continue;
                 }
 
                 // 过滤ST股票
@@ -172,18 +282,23 @@ impl MarketAnalyzer {
                     continue;
                 }
 
-                // 根据板块判断涨跌停阈值，不满足则跳过（不break，因为不同板块阈值不同）
                 let limit_pct = Self::get_limit_pct(code, name);
-                if change_pct < limit_pct - 0.1 {
+                if change_pct < limit_pct - 0.15 {
                     continue;
                 }
 
+                seen.insert(code.to_string());
                 stocks.push(TopStock {
                     code: code.to_string(),
                     name: name.to_string(),
                     change_pct,
                     price,
                 });
+            }
+
+            // 本页最低涨幅已低于ST涨停阈值(5%)，无需继续翻页
+            if min_pct < 4.85 {
+                break;
             }
         }
 

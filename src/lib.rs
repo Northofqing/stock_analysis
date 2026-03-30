@@ -1,5 +1,7 @@
 // A股自选股智能分析系统 - 库入口
 
+pub mod traits;
+pub mod strategy;
 pub mod search_service;
 pub mod analyzer;
 pub mod trend_analyzer;
@@ -15,8 +17,11 @@ pub mod pipeline;
 pub mod lhb_analyzer;
 pub mod sharpe_calculator;
 pub mod chart_generator;
-pub mod multi_factor_strategy;
-pub mod backtest;
+
+// 向外兼容：旧模块路径指向新的 strategy 子模块
+pub use strategy::core as backtest;
+pub use strategy::bollinger_zscore as bollinger_zscore_strategy;
+pub use strategy::multi_factor as multi_factor_strategy;
 
 pub use search_service::{
     get_search_service, 
