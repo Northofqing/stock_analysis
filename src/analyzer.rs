@@ -256,8 +256,8 @@ impl GeminiAnalyzer {
 
 ## 核心交易理念（必须严格遵守）
 
-### 1. 严进策略
-- **乖离率公式**：(现价 - MA5) / MA5 × 100%
+### 1. 严进策略（乖离率）
+- **公式**：(现价 - MA5) / MA5 × 100%
 - 乖离率 < 2%：最佳买点区间
 - 乖离率 2-5%：可小仓介入
 - 乖离率 > 8%：严禁追高！直接判定为"观望"
@@ -266,19 +266,33 @@ impl GeminiAnalyzer {
 - **多头排列必须条件**：MA5 > MA10 > MA20
 - 只做多头排列的股票，空头排列坚决不碰
 - 均线发散上行优于均线粘合
-- 趋势强度判断：看均线间距是否在扩大
+- MACD 辅助判断：DIFF 上穿 DEA 金叉为买点，死叉为卖点
+- RSI 辅助判断：<30 超卖可能反弹，>70 超买警惕回调，>80 严禁追高
 
-### 3. 效率优先（筹码结构）
-- 关注筹码集中度：90%集中度 < 15% 表示筹码集中
-- 获利比例分析：70-90% 获利盘时需警惕获利回吐
-- 平均成本与现价关系：现价高于平均成本 5-15% 为健康
+### 3. 主力资金动向（代理指标）
+由于无直接资金流数据，使用以下代理指标推断主力动向：
+- **放量上涨（量比>1.5 + pct_chg>0）**：主力介入迹象
+- **放量下跌（量比>1.5 + pct_chg<0）**：主力出货迹象
+- **缩量上涨**：惜售，但需警惕乏力
+- **高换手 + 横盘**：主力筹码交换，关注突破方向
 
 ### 4. 买点偏好（回踩支撑）
 - **最佳买点**：缩量回踩 MA5 获得支撑
 - **次优买点**：回踩 MA10 获得支撑
 - **观望情况**：跌破 MA20 时观望
 
-### 5. 风险排查重点
+### 5. 涨停板特殊处理
+- **首板涨停（涨幅 9.8-10%）**：判定为"强势"但非追高时机，次日低开可关注
+- **大涨（>5% 但非涨停）**：短期强势但警惕乖离率扩大
+- **连板/N板**：情绪推动，风险陡增，operation_advice 倾向"观望"
+- **创业板/科创板涨停 20%**：波动剧烈，仓位控制更严
+
+### 6. 板块联动分析
+- 如宏观消息面提及本股所属板块，权重应提升（trend_prediction 加强）
+- 如消息面仅提及其他板块而本股板块缺席，警惕跟涨乏力
+- 消息面无相关信息时，单纯技术面研判即可
+
+### 7. 风险排查重点
 - 减持公告（股东、高管减持）
 - 业绩预亏/大幅下滑
 - 监管处罚/立案调查
@@ -288,7 +302,93 @@ impl GeminiAnalyzer {
 
 ## 输出格式：决策仪表盘 JSON
 
-请严格按照以下 JSON 格式输出完整的【决策仪表盘】，包含所有必要字段。"#;
+请严格按照以下结构输出 JSON，**所有字段必须存在**，不要添加额外字段：
+
+{
+  "sentiment_score": 65,
+  "trend_prediction": "看多",
+  "operation_advice": "买入",
+  "confidence_level": "高",
+  "trend_analysis": "趋势分析文本",
+  "short_term_outlook": "短期展望文本",
+  "medium_term_outlook": "中期展望文本",
+  "technical_analysis": "技术面综合分析文本",
+  "ma_analysis": "均线分析文本",
+  "volume_analysis": "量能分析文本（包含主力资金代理判断）",
+  "pattern_analysis": "K线形态/MACD/RSI/KDJ 分析",
+  "fundamental_analysis": "基本面分析文本",
+  "sector_position": "行业地位及板块联动判断",
+  "company_highlights": "公司亮点描述",
+  "news_summary": "相关新闻摘要",
+  "market_sentiment": "市场情绪判断",
+  "hot_topics": "相关热点话题",
+  "analysis_summary": "分析总结",
+  "key_points": "核心要点",
+  "risk_warning": "风险提示（必须包含止损位：¥XX.XX元，依据 MA20 或前低）",
+  "buy_reason": "买入/不买入理由（若建议买入须包含目标价：¥XX.XX元，依据 52 周高点或压力位）"
+}
+
+### 字段约束
+- sentiment_score：整数 0-100（>70强烈看多, 60-70看多, 40-60震荡, <40看空）
+- trend_prediction：仅限 强烈看多/看多/震荡/看空/强烈看空
+- operation_advice：仅限 买入/加仓/持有/减仓/卖出/观望
+- confidence_level：仅限 高/中/低
+- 其他字段均为字符串，每项 1-3 句话
+- **止损位和目标价必须基于数据锚点**：止损位参考 MA20/前低/-8% 三者较高者；目标价参考 52周高点/季度高点/+15% 三者较低者
+
+### sentiment_score 量化评分标准（满分100，按因子加权，不可凭感觉随意给分）
+- 均线排列（25分）：多头排列满分，空头排列0分，粘合12分
+- 乖离率（20分）：<2%满分，2-5%得12分，>5%得5分，>8%得0分
+- 量价配合（15分）：放量上涨或缩量回调满分，放量下跌或缩量上涨5分
+- MACD/RSI（10分）：MACD金叉+RSI 40-70满分，死叉/超买超卖0-3分
+- 价格位置（10分）：52周低位区满分，中位区6分，高位区2分
+- 基本面（10分）：PE<15且PB<2满分，PE<30得7分，PE>30或亏损2分
+- 消息面/板块联动（10分）：明确利好+板块共振满分，中性5分，利空0分"#;
+
+    /// 文本分析专用系统提示词（analyze_stock 使用，输出自然语言而非 JSON）
+    const TEXT_SYSTEM_PROMPT: &'static str = r#"你是一位专注于趋势交易的 A 股投资分析师，擅长结合技术面、基本面、主力资金动向和宏观消息面进行综合研判。
+
+## 核心交易理念（必须严格遵守）
+
+### 1. 严进策略（乖离率）
+- 乖离率 < 2%：最佳买点区间
+- 乖离率 2-5%：可小仓介入
+- 乖离率 > 8%：严禁追高！直接判定为"观望"
+
+### 2. 趋势交易（顺势而为）
+- 多头排列必须条件：MA5 > MA10 > MA20
+- 只做多头排列的股票，空头排列坚决不碰
+- MACD 金叉+RSI 40-70 为健康区间，MACD 死叉或 RSI>80 警惕
+
+### 3. 主力资金动向（代理指标）
+- 放量上涨（量比>1.5 + 涨幅为正）→ 主力介入
+- 放量下跌 → 主力出货
+- 高换手 + 横盘 → 筹码交换，关注突破
+
+### 4. 涨停板特殊策略
+- 首板涨停：强势但非追高点，次日低开可关注
+- 连板/N板：情绪推动，仓位严控，倾向观望
+- 大涨但未涨停（>5%）：警惕乖离率扩大
+
+### 5. 板块联动
+- 如宏观消息涉及本股板块 → 做多倾向加强
+- 板块缺席但个股异动 → 警惕跟涨乏力
+
+### 6. 买点偏好（回踩支撑）
+- 最佳买点：缩量回踩 MA5 获得支撑
+- 次优买点：回踩 MA10 获得支撑
+- 观望情况：跌破 MA20 时观望
+
+### 7. 风险排查重点
+- 减持公告、业绩预亏、监管处罚、行业政策利空、大额解禁、地缘政治风险
+
+## 输出要求
+- 使用中文，结构清晰，分段输出
+- 每个部分不超过 3 句话，重点突出
+- **必须给出止损位（¥X.XX 元）和目标价（¥X.XX 元）**
+- 止损位参考 MA20/前低/-8% 三者较高者
+- 目标价参考 52周高点/季度高点/+15% 三者较低者
+- 不要输出 JSON，直接输出分析文本"#;
 
     /// 创建新的分析器
     pub fn new(config: GeminiConfig) -> Self {
@@ -493,6 +593,150 @@ impl GeminiAnalyzer {
                 let volume_ratio_10 = latest.volume / vol_10d_avg;
                 context.push_str(&format!("10日量比: {:.2}\n", volume_ratio_10));
             }
+        }
+
+        // ========== 主力资金动向（代理指标） ==========
+        context.push_str("\n【主力资金动向（代理）】\n");
+        if data_len >= 5 {
+            let vol_5d_avg = kline_data[..5].iter().map(|k| k.volume).sum::<f64>() / 5.0;
+            let vol_ratio = if vol_5d_avg > 0.0 { latest.volume / vol_5d_avg } else { 1.0 };
+            let money_flow = if vol_ratio > 1.5 && latest.pct_chg > 1.0 {
+                "🔥 放量上涨 — 主力介入迹象"
+            } else if vol_ratio > 1.5 && latest.pct_chg < -1.0 {
+                "⚠️ 放量下跌 — 主力出货迹象"
+            } else if vol_ratio < 0.7 && latest.pct_chg > 0.5 {
+                "缩量上涨 — 惜售但动能不足"
+            } else if vol_ratio < 0.7 && latest.pct_chg < -0.5 {
+                "缩量下跌 — 抛压减弱"
+            } else if vol_ratio > 1.3 && latest.pct_chg.abs() < 1.0 {
+                "高换手+横盘 — 筹码交换，关注突破方向"
+            } else {
+                "量价关系平稳，无明显主力动向"
+            };
+            context.push_str(&format!("代理判断: {}\n", money_flow));
+            if let Some(turnover) = latest.turnover_rate {
+                context.push_str(&format!("换手率: {:.2}%（>7%活跃，>15%火热）\n", turnover));
+            }
+        }
+
+        // ========== 涨跌停识别 ==========
+        let is_gem = code.starts_with("300") || code.starts_with("301"); // 创业板
+        let is_star = code.starts_with("688"); // 科创板
+        let is_bj = code.starts_with("8") || code.starts_with("9") || code.starts_with("4"); // 北交所
+        // ST 股通过股票名称判断（若可用），此处保守不考虑 ST
+        let limit_pct = if is_gem || is_star { 20.0 }
+            else if is_bj { 30.0 }
+            else { 10.0 };
+        if latest.pct_chg >= limit_pct - 0.3 {
+            context.push_str(&format!("\n【涨跌停】🚀 今日涨停（涨幅 {:.2}% / 涨停阈值 {}%）— ", latest.pct_chg, limit_pct));
+            // 检查连板数
+            let mut consec = 1;
+            for k in kline_data[1..].iter().take(10) {
+                if k.pct_chg >= limit_pct - 0.3 { consec += 1; } else { break; }
+            }
+            if consec >= 2 {
+                context.push_str(&format!("连续 {} 板！情绪推动风险陡增，建议观望\n", consec));
+            } else {
+                context.push_str("首板，非追高时机，次日低开可关注\n");
+            }
+        } else if latest.pct_chg <= -(limit_pct - 0.3) {
+            context.push_str(&format!("\n【涨跌停】📉 今日跌停（跌幅 {:.2}%）— 承压严重，规避\n", latest.pct_chg));
+        } else if latest.pct_chg >= 5.0 {
+            context.push_str(&format!("\n【涨跌停】📈 大涨 {:.2}%（未涨停）— 短期强势，警惕乖离扩大\n", latest.pct_chg));
+        }
+
+        // ========== MACD (12,26,9) ==========
+        if data_len >= 26 {
+            // 注意：kline_data[0] 是最新，计算 EMA 需要按时间顺序（旧→新）
+            let mut chron: Vec<f64> = closes.iter().rev().copied().collect();
+            // 仅取最近 60 根以提升效率（足够让 EMA 收敛）
+            if chron.len() > 120 { chron = chron[chron.len()-120..].to_vec(); }
+            let ema = |period: usize, src: &[f64]| -> Vec<f64> {
+                let alpha = 2.0 / (period as f64 + 1.0);
+                let mut out = Vec::with_capacity(src.len());
+                let mut prev = src[0];
+                out.push(prev);
+                for &v in &src[1..] {
+                    prev = alpha * v + (1.0 - alpha) * prev;
+                    out.push(prev);
+                }
+                out
+            };
+            let ema12 = ema(12, &chron);
+            let ema26 = ema(26, &chron);
+            let diff: Vec<f64> = ema12.iter().zip(ema26.iter()).map(|(a,b)| a-b).collect();
+            let dea = ema(9, &diff);
+            let n = diff.len();
+            let macd = 2.0 * (diff[n-1] - dea[n-1]);
+            let macd_signal = if diff[n-1] > dea[n-1] && n >= 2 && diff[n-2] <= dea[n-2] {
+                "金叉 ✅"
+            } else if diff[n-1] < dea[n-1] && n >= 2 && diff[n-2] >= dea[n-2] {
+                "死叉 ❌"
+            } else if diff[n-1] > dea[n-1] {
+                "多头区间"
+            } else {
+                "空头区间"
+            };
+            context.push_str(&format!(
+                "\n【MACD】DIFF: {:.3}, DEA: {:.3}, MACD柱: {:.3} ({})\n",
+                diff[n-1], dea[n-1], macd, macd_signal
+            ));
+        }
+
+        // ========== RSI(14) - Wilder 平滑 ==========
+        if data_len >= 15 {
+            let chron: Vec<f64> = closes.iter().rev().copied().collect();
+            let mut gains = 0.0;
+            let mut losses = 0.0;
+            for i in 1..=14 {
+                let diff = chron[i] - chron[i-1];
+                if diff > 0.0 { gains += diff; } else { losses -= diff; }
+            }
+            let mut avg_gain = gains / 14.0;
+            let mut avg_loss = losses / 14.0;
+            for i in 15..chron.len() {
+                let diff = chron[i] - chron[i-1];
+                let (g, l) = if diff > 0.0 { (diff, 0.0) } else { (0.0, -diff) };
+                avg_gain = (avg_gain * 13.0 + g) / 14.0;
+                avg_loss = (avg_loss * 13.0 + l) / 14.0;
+            }
+            let rsi = if avg_loss.abs() < 1e-9 { 100.0 } else {
+                100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
+            };
+            let rsi_signal = if rsi > 80.0 { "严重超买 🔴" }
+                else if rsi > 70.0 { "超买" }
+                else if rsi < 20.0 { "严重超卖 🟢" }
+                else if rsi < 30.0 { "超卖" }
+                else { "正常" };
+            context.push_str(&format!("【RSI(14)】{:.2} ({})\n", rsi, rsi_signal));
+        }
+
+        // ========== KDJ(9,3,3) ==========
+        if data_len >= 9 {
+            let chron: Vec<&crate::data_provider::KlineData> = kline_data.iter().rev().collect();
+            let mut k_val = 50.0;
+            let mut d_val = 50.0;
+            let n = chron.len();
+            let start = n.saturating_sub(30).max(8); // 让 KDJ 迭代收敛
+            for i in start..n {
+                let window_start = i.saturating_sub(8);
+                let window = &chron[window_start..=i];
+                let hh = window.iter().map(|k| k.high).fold(f64::NEG_INFINITY, f64::max);
+                let ll = window.iter().map(|k| k.low).fold(f64::INFINITY, f64::min);
+                let rsv = if (hh - ll).abs() < 1e-9 { 50.0 }
+                    else { (chron[i].close - ll) / (hh - ll) * 100.0 };
+                k_val = 2.0 / 3.0 * k_val + 1.0 / 3.0 * rsv;
+                d_val = 2.0 / 3.0 * d_val + 1.0 / 3.0 * k_val;
+            }
+            let j_val = 3.0 * k_val - 2.0 * d_val;
+            let kdj_signal = if k_val > 80.0 && d_val > 80.0 { "超买区" }
+                else if k_val < 20.0 && d_val < 20.0 { "超卖区" }
+                else if k_val > d_val { "多头" }
+                else { "空头" };
+            context.push_str(&format!(
+                "【KDJ】K: {:.2}, D: {:.2}, J: {:.2} ({})\n",
+                k_val, d_val, j_val, kdj_signal
+            ));
         }
 
         // ========== 52周（约250个交易日）高低价 ==========
@@ -706,36 +950,44 @@ impl GeminiAnalyzer {
                - 当前大盘交易环境：牛市/熊市/震荡\n\
                - 情绪面：投资者情绪是偏乐观还是悲观，是否存在恐慌性抛售或过度追高\n\
                - 行业动态：所属行业是否处于景气周期，是否有利好/利空消息\n\
+               - 板块联动：若宏观信息提及本股所属板块，强化看多逻辑；若仅提及其他板块，警惕跟涨乏力\n\
+               - 地缘政治风险：是否处于敏感时期（如选举、战争、国际冲突等）\n\
             2. 【技术面】分析以下维度：\n\
                - 均线系统：MA5/MA10/MA20排列状态，是否多头/空头排列\n\
                - 乖离率：当前价格偏离MA5的程度，>5%警惕追高风险\n\
+               - MACD/RSI/KDJ：金叉死叉、超买超卖信号的综合研判（数据见上下文）\n\
                - 价格位置：当前价位于52周和季度区间的位置，是否接近高点/低点\n\
                - 量价关系：量比变化，放量/缩量配合涨跌的含义\n\
                - 近期走势：近5-10日涨跌趋势和波动率\n\
-               - 地缘政治风险：是否处于敏感时期（如选举、战争、国际冲突等）\n\
-            2. 【基本面】如果有盈利指标，请重点分析：\n\
+               - 涨跌停研判：若触及涨跌停或大涨超 5%，按首板/连板/ST/创业板规则区别对待\n\
+            3. 【主力资金动向（代理）】基于量价+换手率组合判断：\n\
+               - 放量上涨 + 高换手 → 主力介入，看多倾向\n\
+               - 放量下跌 → 主力出货，警戒\n\
+               - 缩量回踩 MA5/MA10 → 理想买点\n\
+               - 高换手 + 横盘 → 筹码交换，关注突破方向\n\
+            4. 【基本面】如果有盈利指标，请重点分析：\n\
                - 估值水平：PE、PB是否合理（PE<15优秀，15-30正常，>30偏高；PB<1低估，1-3正常，>3偏高）\n\
                - 盈利能力：EPS、ROE、毛利率、净利率反映的公司竞争力\n\
                - 成长性：营收和净利润同比增长率判断成长阶段\n\
                - 市值规模：小盘股成长性强但风险高，大盘股稳定但弹性小\n\
                - 公司业务亮点：是否有核心竞争力、行业地位、创新能力等\n\
-               - 持股结构：大股东和机构持股比例，是否存在减持风险\n\
-               - 行业地位：在所属行业中的竞争位置和市场份额\n\
-               - 流通性：流通比例高的股票交易自由度高，低流通可能存在控盘\n\
-               - 交易活跃度：换手率反映资金关注度和投机程度\n\
+               - 行业地位：在所属行业中的竞争位置\n\
+               - 流通性与换手率：流通比例+换手率反映交易活跃度和可能的控盘情况\n\
                - 估值综合：结合PE、PB、EPS判断当前价格是否合理\n\
                - 夏普比率：风险调整后收益水平\n\
-            3. 【操作建议】基于技术面和基本面给出明确的买入/持有/卖出建议。\
-               特别注意：乖离率>5%不追高，空头排列不做多\n\
-            4. 【风险提示】指出主要风险因素（估值风险、技术风险、流动性风险、\
-               52周高点压力、波动率异常、宏观风险等）\n\
+            5. 【操作建议与价位】基于技术面+资金面+基本面+消息面给出明确的操作建议：\n\
+               - 操作：买入/加仓/持有/减仓/卖出/观望（乖离率>5%不追高，空头排列不做多，连板观望）\n\
+               - **必须给出具体数字**：建议买入价 ¥X.XX 元，目标价（止盈）¥X.XX 元，止损位 ¥X.XX 元\n\
+               - 止损位参考：MA20/近期前低/-8% 三者较高者；目标价参考：52周高点/季度高点/+15% 三者较低者\n\
+            6. 【风险提示】指出主要风险因素（估值风险、技术风险、流动性风险、\
+               52周高点压力、波动率异常、宏观风险、板块轮动风险等）\n\
             \n请简明扼要，重点突出，每个部分不超过3句话。",
             context,
             macro_section
         );
 
-        // 调用API
-        self.call_api_with_retry(&prompt).await
+        // 调用API（使用文本分析专用系统提示词）
+        self.call_api_with_retry_ex(&prompt, Self::TEXT_SYSTEM_PROMPT).await
     }
 
     /// 分析单只股票
@@ -1355,9 +1607,24 @@ impl GeminiAnalyzer {
 
 ## ✅ 分析任务
 
-请为 **{}({})** 生成【决策仪表盘】，严格按照 JSON 格式输出。
+请为 **{}({})** 生成【决策仪表盘】。请输出完整的 JSON，必须包含以下所有字段：
+sentiment_score(0-100整数), trend_prediction, operation_advice, confidence_level,
+trend_analysis, short_term_outlook, medium_term_outlook,
+technical_analysis, ma_analysis, volume_analysis, pattern_analysis,
+fundamental_analysis, sector_position, company_highlights,
+news_summary, market_sentiment, hot_topics,
+analysis_summary, key_points, risk_warning, buy_reason
 
-请输出完整的 JSON 格式决策仪表盘。
+**关键要求**：
+1. sentiment_score 按因子加权评分：均线排列(25)+乖离率(20)+量价配合(15)+MACD/RSI(10)+价格位置(10)+基本面(10)+消息面/板块联动(10)，满分100。
+2. volume_analysis 必须包含主力资金动向代理判断（放量上涨/放量下跌/缩量/高换手横盘）。
+3. pattern_analysis 必须结合 MACD/RSI/KDJ 信号研判金叉死叉与超买超卖。
+4. sector_position 须评估板块联动：如消息面提及本股所属板块则加强看多，否则警惕跟涨乏力。
+5. risk_warning 必须包含具体止损位（格式：止损位：¥XX.XX元），参考 MA20/前低/-8% 三者较高者。
+6. buy_reason 若建议买入，必须包含具体目标价（格式：目标价：¥XX.XX元），参考 52周高点/季度高点/+15% 三者较低者。
+7. 若本股今日涨停或连板，operation_advice 应倾向"观望"；若乖离率>5%，严禁"买入"。
+
+只输出 JSON，不要包含其他文字。
 "#,
             name, code
         ));
@@ -1565,6 +1832,7 @@ r#"今天是 {today}。
 
 **核心要求——产业链思考链路（Chain-of-Thought）**：
 不要只看新闻表面提到的行业，必须沿着产业链做**上下游推演**，覆盖直接受益和间接受益板块。
+
 典型推演示例（请举一反三）：
 - AI大模型/算力需求爆发 → 算力基础设施(服务器/GPU) → **电力需求激增** → 电力运营(火电/水电/核电) → **特高压/输变电设备** → 电力设备制造商
 - 新能源汽车销量增长 → 动力电池 → 上游锂矿/钴矿 → 充电桩/换电站 → 电网改造
@@ -1572,6 +1840,11 @@ r#"今天是 {today}。
 - 房地产政策放松 → 地产股 → 建材/家居 → 银行(信贷) → 物业管理
 - 半导体国产替代 → 设备/材料 → EDA软件 → 封测 → 下游消费电子
 每条推荐必须标注属于产业链的哪个环节（上游/中游/下游/配套）。
+
+**宏观规律和市场情绪**：
+- 选股第一驱动力是资金追捧的热点题材、连板股方向、龙头股带动效应；真实的订单/产能/出口/政策落地数据作为辅助验证放在情绪之后考虑，有业务支撑的热点更可持续，纯情绪炒作需提示风险
+- 国际需求（如全球AI资本开支、欧美碳中和、供应链重构）和国内需求（如东数西算、新型电力系统、国产替代）可作为验证热点持续性的参考框架
+- 市场情绪的变化可能对短期股价波动产生显著影响，需结合宏观新闻和产业链分析进行综合判断。
 
 请务必：
 1. 代码格式统一用 6 位数字（如 000001、600519），0/3/6 开头
@@ -1581,8 +1854,13 @@ r#"今天是 {today}。
 5. 【推荐代码】行必须包含所有推荐和提及的股票代码，不要遗漏
 6. AI/算力相关新闻必须同时推荐：AI应用层 + 算力硬件 + **电力运营** + **特高压/输变电** + 数据中心/IDC
 7. 每个板块推荐要标注产业链位置（如"上游原材料"、"中游制造"、"下游应用"、"配套基建"）
-8. **优先关注当前市场热点情绪**：选股第一驱动力是资金追捧的热点题材、连板股方向、龙头股带动效应；真实的订单/产能/出口/政策落地数据作为辅助验证放在情绪之后考虑，有业务支撑的热点更可持续，纯情绪炒作需提示风险
-9. 国际需求（如全球AI资本开支、欧美碳中和、供应链重构）和国内需求（如东数西算、新型电力系统、国产替代）可作为验证热点持续性的参考框架
+8. **新兴产业链补充**：若新闻涉及模板未覆盖的新兴领域（如低空经济/eVTOL、人形机器人、商业航天/卫星互联网、脑机接口、固态电池、可控核聚变、量子计算、创新药CXO、合成生物），请按同样的上下游推演框架补充
+9. **过滤规则（防止追高推荐）**：推荐个股时尽量排除以下情况：
+   (a) 近 5 个交易日累计涨幅 > 25% 的品种（已兑现预期，回撤风险大）
+   (b) PE > 80 倍且非高速成长（营收/净利润同比 < 30%）的品种
+   (c) 已连续 3 个涨停或 5 天内涨停 2 次以上的纯情绪股
+   若新闻里的核心龙头已满足以上条件，需在推荐逻辑中主动提示"已兑现预期，关注补涨品种"并给出替代标的
+10. **轮动思维**：避免所有推荐集中在同一板块，3-5 个板块推荐应覆盖成长+价值+防御至少 2 类风格
 "#,
             today = today,
             macro_news = macro_news
@@ -1590,7 +1868,7 @@ r#"今天是 {today}。
 
         // 使用宏观推荐专用系统提示词（而非个股决策仪表盘提示词）
         const MACRO_SYSTEM_PROMPT: &str = "\
-你是一位资深 A 股宏观策略分析师，专精于自上而下 (Top-Down) 宏观驱动选股。\
+你是一位资深 A 股宏观策略分析师，专精于自上而下 (Top-Down) 宏观驱动选股，深度理解A股票市场，从业20年，经历过多轮牛熊市，同时持续盈利。\
 你的核心能力有四个：\
 1. 产业链推演：从一条新闻出发，沿上下游推导出所有受益环节（如 AI/算力爆发→电力需求→特高压→IDC）；\
 2. 实际业务需求验证：推荐必须有国内外真实业务需求支撑（全球AI资本开支增长、东数西算工程、新型电力系统建设、欧美碳中和出口需求、国产替代订单等），\

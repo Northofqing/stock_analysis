@@ -13,6 +13,7 @@ pub mod market_analyzer;
 pub mod notification;
 pub mod enums;
 pub mod data_provider;
+pub mod indicators;
 pub mod pipeline;
 pub mod lhb_analyzer;
 pub mod sharpe_calculator;

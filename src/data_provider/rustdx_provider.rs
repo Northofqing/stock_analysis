@@ -83,32 +83,69 @@ impl RustdxProvider {
         // 规范化股票代码
         let code = self.normalize_code(code)?;
         
-        let mut tcp = Self::new_connection()?;
-        
         let market = self.parse_market(&code) as u16;
         
-        // rustdx-complete 内部在返回数量与请求数量不一致时会 panic（assert），
-        // 用 catch_unwind 兜底，避免因单只股票数据异常导致整个程序崩溃
-        let recv_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<Vec<_>> {
-            let mut kline = Kline::new(market, &code, 9, 0, days as u16);
-            kline.recv_parsed(&mut tcp)
-                .map_err(|e| anyhow!("{}", e))?;
-            Ok(kline.result().to_vec())
-        }));
-        let result = match recv_result {
-            Ok(Ok(data)) => data,
-            Ok(Err(e)) => return Err(anyhow!("获取股票 {} K线数据失败: {}", code, e)),
-            Err(_) => return Err(anyhow!(
-                "获取股票 {} K线数据时底层库 panic（可能该股票已停牌/退市或代码无效）", code
-            )),
-        };
+        // 通达信每次请求最多返回约 800 条K线，需要分页获取
+        const BATCH_SIZE: u16 = 800;
+        let mut all_bars = Vec::new();
+        let mut offset: u16 = 0;
+        let remaining = days;
+
+        loop {
+            let count = BATCH_SIZE.min((remaining - all_bars.len()) as u16);
+            if count == 0 {
+                break;
+            }
+
+            let mut tcp = Self::new_connection()?;
+            let recv_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<Vec<_>> {
+                let mut kline = Kline::new(market, &code, 9, offset, count);
+                kline.recv_parsed(&mut tcp)
+                    .map_err(|e| anyhow!("{}", e))?;
+                Ok(kline.result().to_vec())
+            }));
+
+            match recv_result {
+                Ok(Ok(data)) => {
+                    let fetched = data.len();
+                    if fetched == 0 {
+                        break; // 服务器无更多数据
+                    }
+                    all_bars.extend(data);
+                    offset += fetched as u16;
+                    debug!("[通达信] {} 分页获取: offset={}, 本次={}, 累计={}", code, offset, fetched, all_bars.len());
+                    if fetched < count as usize {
+                        break; // 已获取全部可用数据
+                    }
+                    if all_bars.len() >= remaining {
+                        break;
+                    }
+                }
+                Ok(Err(e)) => {
+                    if all_bars.is_empty() {
+                        return Err(anyhow!("获取股票 {} K线数据失败: {}", code, e));
+                    }
+                    warn!("[通达信] {} 分页获取中断: {}, 已获取 {} 条", code, e, all_bars.len());
+                    break;
+                }
+                Err(_) => {
+                    if all_bars.is_empty() {
+                        return Err(anyhow!(
+                            "获取股票 {} K线数据时底层库 panic（可能该股票已停牌/退市或代码无效）", code
+                        ));
+                    }
+                    warn!("[通达信] {} 分页获取中断(panic), 已获取 {} 条", code, all_bars.len());
+                    break;
+                }
+            }
+        }
         
-        if result.is_empty() {
+        if all_bars.is_empty() {
             return Err(anyhow!("股票 {} 没有返回K线数据", code));
         }
         
         // 转换为标准化的KlineData格式
-        let mut kline_data: Vec<KlineData> = result.iter().map(|bar| {
+        let mut kline_data: Vec<KlineData> = all_bars.iter().map(|bar| {
             // DateTime 转换为 NaiveDate
             let date = NaiveDate::from_ymd_opt(
                 bar.dt.year as i32,

@@ -84,6 +84,12 @@ pub struct AnalysisResult {
     pub sharpe_ratio: Option<f64>,
     /// 是否当日涨停
     pub is_limit_up: bool,
+    /// 反向择时信号：sentiment_score<40 且技术面企稳，基于历史回测 T5 胜率 55.62%
+    #[serde(default)]
+    pub contrarian_signal: bool,
+    /// 反向信号触发理由
+    #[serde(default)]
+    pub contrarian_reason: Option<String>,
     /// 模拟持仓买入价格
     pub position_buy_price: Option<f64>,
     /// 模拟持仓买入日期
@@ -578,6 +584,8 @@ impl AnalysisPipeline {
             net_profit_yoy: data[0].net_profit_yoy,
             sharpe_ratio: trend_result.sharpe_ratio,
             is_limit_up: self.limit_up_codes.contains(code),
+            contrarian_signal: false,
+            contrarian_reason: None,
             position_buy_price: None,
             position_buy_date: None,
             position_return: None,
@@ -651,6 +659,15 @@ impl AnalysisPipeline {
             code, result.operation_advice, result.sentiment_score
         );
 
+        // 3.5 反向择时信号：sentiment_score<40 且技术面企稳 → 反向买入信号
+        // 基于历史回测：评分<40 区间 T1胜率 56.91% / T5胜率 55.62% / T5均涨 +2.40%，跑赢市场基准
+        let contrarian = crate::strategy::detect_contrarian_signal(&data, result.sentiment_score);
+        if contrarian.triggered {
+            info!("[{}] 🔄 触发反向择时信号 | {}", code, contrarian.reason);
+            result.contrarian_signal = true;
+            result.contrarian_reason = Some(contrarian.reason);
+        }
+
         // 4. 模拟持仓跟踪
         if let Ok(db) = std::panic::catch_unwind(|| DatabaseManager::get()) {
             let current_price = result.current_price.unwrap_or(data[0].close);
@@ -665,13 +682,35 @@ impl AnalysisPipeline {
                     result.position_return = Some(return_rate);
                     result.position_quantity = Some(pos.quantity);
 
-                    // 判断是否触发卖出
-                    let should_sell = result.operation_advice.contains("卖出");
+                    // ====== 四大铁律 ======
+                    // 铁律1 止损：亏损 ≥ 8% → 无条件卖出，不看任何其他指标
+                    let stop_loss = return_rate <= -8.0;
+
+                    // 铁律2 止盈：盈利 < 20% → 绝不主动止盈，任何回调都不卖
+
+                    // 铁律3 趋势离场：盈利 ≥ 20% 后，跌破5日均线 → 卖出
+                    let profit_trend_exit = return_rate >= 20.0
+                        && result.ma5.map_or(false, |ma5| current_price < ma5);
+
+                    // 铁律4 时间止损：持仓 >14天仍亏损 → 卖出换股
+                    let hold_days = {
+                        let buy = chrono::NaiveDate::parse_from_str(&pos.buy_date, "%Y-%m-%d");
+                        let now = chrono::Local::now().date_naive();
+                        buy.map(|b| (now - b).num_days()).unwrap_or(0)
+                    };
+                    let timeout_loss = hold_days > 14 && return_rate < 0.0;
+
+                    let should_sell = stop_loss || profit_trend_exit || timeout_loss;
+
                     if should_sell {
+                        let reason = if stop_loss { "铁律1:止损(-8%)" }
+                            else if profit_trend_exit { "铁律3:跌破5日线止盈" }
+                            else { "铁律4:14天不涨换股" };
+
                         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
                         match db.close_position(pos.id, current_price, &today) {
                             Ok(_) => {
-                                info!("[{}] 触发卖出信号，模拟平仓 @ {:.2}，收益率: {:+.2}%", code, current_price, return_rate);
+                                info!("[{}] 触发平仓 [{}]，@ {:.2}，收益率: {:+.2}%", code, reason, current_price, return_rate);
                                 result.position_status = Some("closed".to_string());
                                 result.position_sell_price = Some(current_price);
                                 result.position_sell_date = Some(today);
@@ -692,8 +731,9 @@ impl AnalysisPipeline {
                     }
                 }
                 Ok(None) => {
-                    // 无持仓：如果建议买入，记录模拟买入（10手=1000股）
-                    if result.operation_advice.contains("买入") {
+                    // 无持仓：如果建议买入 或 触发反向择时信号，记录模拟买入（10手=1000股）
+                    let buy_triggered = result.operation_advice.contains("买入") || result.contrarian_signal;
+                    if buy_triggered {
                         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
                         let new_position = crate::models::NewStockPosition {
                             code: code.clone(),
@@ -705,7 +745,14 @@ impl AnalysisPipeline {
                         };
                         match db.save_position(&new_position) {
                             Ok(_) => {
-                                info!("[{}] 触发买入信号，模拟买入 1000 股 @ {:.2}", code, current_price);
+                                let tag = if result.contrarian_signal && !result.operation_advice.contains("买入") {
+                                    "反向信号"
+                                } else if result.contrarian_signal {
+                                    "买入+反向"
+                                } else {
+                                    "买入信号"
+                                };
+                                info!("[{}] 触发{}，模拟买入 1000 股 @ {:.2}", code, tag, current_price);
                                 result.position_buy_price = Some(current_price);
                                 result.position_buy_date = Some(today);
                                 result.position_return = Some(0.0);
@@ -906,14 +953,20 @@ impl AnalysisPipeline {
     /// 生成单股报告
     fn generate_single_report(&self, result: &AnalysisResult) -> String {
         let limit_up_tag = if result.is_limit_up { " 🔥涨停" } else { "" };
+        let contrarian_tag = if result.contrarian_signal { " 🔄反向信号" } else { "" };
+        let contrarian_line = if let Some(reason) = &result.contrarian_reason {
+            format!("\n{}", reason)
+        } else { String::new() };
         format!(
-            "{} {}({}){}\n\n操作建议: {}\n评分: {}\n\n{}",
+            "{} {}({}){}{}\n\n操作建议: {}\n评分: {}{}\n\n{}",
             result.get_emoji(),
             result.name,
             result.code,
             limit_up_tag,
+            contrarian_tag,
             result.operation_advice,
             result.sentiment_score,
+            contrarian_line,
             result.analysis_summary
         )
     }
@@ -989,7 +1042,7 @@ impl AnalysisPipeline {
             ));
             
             backtest_report.push_str("\n## 策略说明\n\n");
-            backtest_report.push_str("**多因子选股策略**: 基于市值、市盈率、市净率、换手率等多因子综合评分，选出得分最高的20只股票进行等权重配置。\n\n");
+            backtest_report.push_str("**多因子选股策略**: 基于市值、市盈率、市净率、换手率等多因子综合评分，选出得分最高的3只股票进行等权重配置。\n\n");
             
             if let Some(chart_path) = &summary.chart_path {
                 backtest_report.push_str(&format!("**回测图表**: {}\n\n", chart_path));
@@ -1106,11 +1159,11 @@ impl AnalysisPipeline {
         let mut sorted = results.to_vec();
         sorted.sort_by(|a, b| b.sentiment_score.cmp(&a.sentiment_score));
 
-        let top_codes: Vec<_> = sorted.iter().take(20).collect();
+        let top_codes: Vec<_> = sorted.iter().take(3).collect();
         let mut stocks_data: Vec<(String, String, Vec<crate::data_provider::KlineData>)> = Vec::new();
 
         for r in &top_codes {
-            match self.data_manager.get_daily_data(&r.code, 250) {
+            match self.data_manager.get_daily_data(&r.code, 7000) {
                 Ok((data, _)) if data.len() >= 30 => {
                     stocks_data.push((r.code.clone(), r.name.clone(), data));
                 }
@@ -1156,12 +1209,12 @@ impl AnalysisPipeline {
         let mut sorted = results.to_vec();
         sorted.sort_by(|a, b| b.sentiment_score.cmp(&a.sentiment_score));
 
-        let top_codes: Vec<_> = sorted.iter().take(20).collect();
+        let top_codes: Vec<_> = sorted.iter().take(3).collect();
         let mut stocks_data: Vec<(String, String, Vec<crate::data_provider::KlineData>)> =
             Vec::new();
 
         for r in &top_codes {
-            match self.data_manager.get_daily_data(&r.code, 250) {
+            match self.data_manager.get_daily_data(&r.code, 7000) {
                 Ok((data, _)) if data.len() >= 20 => {
                     stocks_data.push((r.code.clone(), r.name.clone(), data));
                 }

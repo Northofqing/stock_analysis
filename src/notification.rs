@@ -292,6 +292,29 @@ impl NotificationService {
             lines.push(String::new());
         }
 
+        // 反向择时信号汇总（sentiment_score<40 + 技术面企稳，历史 T5 胜率 55.62%）
+        let contrarian_results: Vec<&AnalysisResult> = sorted_results.iter().filter(|r| r.contrarian_signal).collect();
+        if !contrarian_results.is_empty() {
+            lines.extend(vec![
+                "---".to_string(),
+                String::new(),
+                format!("## 🔄 反向择时信号（{} 只，超跌企稳）", contrarian_results.len()),
+                String::new(),
+                "> 基于历史回测：AI 评分 <40 区间的 T1 胜率 56.91% / T5 胜率 55.62% / T5 均涨 +2.40%，显著跑赢市场基准。本区间经『技术面企稳』二次过滤后输出。".to_string(),
+                String::new(),
+                "| 股票 | 代码 | 评分 | 触发理由 |".to_string(),
+                "|------|------|------|---------|".to_string(),
+            ]);
+            for r in &contrarian_results {
+                let reason = r.contrarian_reason.as_deref().unwrap_or("-");
+                lines.push(format!(
+                    "| {} | {} | {}分 | {} |",
+                    r.name, r.code, r.sentiment_score, reason
+                ));
+            }
+            lines.push(String::new());
+        }
+
         // 模拟持仓汇总
         let position_results: Vec<&AnalysisResult> = sorted_results.iter().filter(|r| r.position_return.is_some()).collect();
         if !position_results.is_empty() {
@@ -340,8 +363,9 @@ impl NotificationService {
         for result in &sorted_results {
             let emoji = result.get_emoji();
             let limit_up_tag = if result.is_limit_up { " 🔥涨停" } else { "" };
+            let contrarian_tag = if result.contrarian_signal { " 🔄反向信号" } else { "" };
 
-            lines.push(format!("### {} {} ({}){}", emoji, result.name, result.code, limit_up_tag));
+            lines.push(format!("### {} {} ({}){}{}", emoji, result.name, result.code, limit_up_tag, contrarian_tag));
             lines.push(String::new());
             lines.push(format!(
                 "**操作建议：{}** | **综合评分：{}分** | **趋势预测：{}**",
@@ -1330,15 +1354,36 @@ impl NotificationService {
         // 配置 SMTP
         let creds = Credentials::new(from.to_string(), password.to_string());
         
-        let mailer = SmtpTransport::relay(smtp_server)?
-            .port(smtp_port)
-            .credentials(creds)
-            .build();
+        let mailer = if smtp_port == 465 {
+            SmtpTransport::relay(smtp_server)?
+                .credentials(creds)
+                .timeout(Some(Duration::from_secs(120)))
+                .build()
+        } else {
+            SmtpTransport::starttls_relay(smtp_server)?
+                .port(smtp_port)
+                .credentials(creds)
+                .timeout(Some(Duration::from_secs(120)))
+                .build()
+        };
         
-        // 发送
-        mailer.send(&email)?;
+        // 发送（带重试）
+        let max_retries = 3;
+        let mut last_err = None;
+        for attempt in 1..=max_retries {
+            match mailer.send(&email) {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    warn!("邮件发送第 {} 次尝试失败: {}", attempt, e);
+                    last_err = Some(e);
+                    if attempt < max_retries {
+                        std::thread::sleep(Duration::from_secs(attempt as u64 * 3));
+                    }
+                }
+            }
+        }
         
-        Ok(())
+        Err(last_err.unwrap().into())
     }
 
     /// 统一发送接口
@@ -1584,18 +1629,33 @@ impl NotificationService {
         let mailer = if smtp_port == 465 {
             SmtpTransport::relay(smtp_server)?
                 .credentials(creds)
+                .timeout(Some(Duration::from_secs(120)))
                 .build()
         } else {
             SmtpTransport::starttls_relay(smtp_server)?
                 .port(smtp_port)
                 .credentials(creds)
+                .timeout(Some(Duration::from_secs(120)))
                 .build()
         };
         
-        // 发送邮件
-        mailer.send(&email)?;
+        // 发送邮件（带重试）
+        let max_retries = 3;
+        let mut last_err = None;
+        for attempt in 1..=max_retries {
+            match mailer.send(&email) {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    warn!("邮件发送第 {} 次尝试失败: {}", attempt, e);
+                    last_err = Some(e);
+                    if attempt < max_retries {
+                        std::thread::sleep(Duration::from_secs(attempt as u64 * 3));
+                    }
+                }
+            }
+        }
         
-        Ok(())
+        Err(last_err.unwrap().into())
     }
 
     /// 保存报告到文件

@@ -14,6 +14,7 @@
 //! - 乖离率：(Close - MA5) / MA5 < 5%（不追高）
 //! - 量能形态：缩量回调优先
 
+use crate::indicators::{self, IndicatorAnalysis};
 use log::warn;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -160,6 +161,9 @@ pub struct TrendAnalysisResult {
     
     // 风险调整后收益指标
     pub sharpe_ratio: Option<f64>,
+
+    // MACD / KDJ / RSI 技术指标分析
+    pub indicator_analysis: Option<IndicatorAnalysis>,
 }
 
 impl Default for TrendAnalysisResult {
@@ -189,6 +193,7 @@ impl Default for TrendAnalysisResult {
             signal_reasons: Vec::new(),
             risk_factors: Vec::new(),
             sharpe_ratio: None,
+            indicator_analysis: None,
         }
     }
 }
@@ -319,7 +324,13 @@ impl StockTrendAnalyzer {
         // 4. 支撑压力分析
         self.analyze_support_resistance(&data_with_ma, &mut result);
 
-        // 5. 生成买入信号
+        // 5. MACD / KDJ / RSI 技术指标分析
+        let highs: Vec<f64> = data_with_ma.iter().map(|d| d.high).collect();
+        let lows: Vec<f64> = data_with_ma.iter().map(|d| d.low).collect();
+        let closes: Vec<f64> = data_with_ma.iter().map(|d| d.close).collect();
+        result.indicator_analysis = Some(indicators::analyze_indicators(&highs, &lows, &closes));
+
+        // 6. 生成买入信号
         self.generate_signal(&mut result);
 
         result
@@ -665,6 +676,36 @@ impl StockTrendAnalyzer {
             reasons.push("✅ MA10支撑有效".to_string());
         }
 
+        // === 技术指标评分加成 ===
+        // indicator_score 范围 0-100，中性为 50
+        // 偏离 50 的部分 × 0.2 作为加/减分（最大 ±10 分）
+        if let Some(ref ind) = result.indicator_analysis {
+            let ind_delta = ((ind.indicator_score as f64 - 50.0) * 0.2) as i32;
+            score += ind_delta;
+
+            // 把指标关键信号也加入理由/风险
+            for sig in &ind.signals {
+                if sig.contains('🚀') || sig.contains('🔥') {
+                    reasons.push(sig.clone());
+                } else if sig.contains('💀') || sig.contains('⚠') {
+                    risks.push(sig.clone());
+                }
+            }
+
+            if ind.golden_cross_resonance {
+                reasons.push("🚀 MACD/KDJ/RSI多指标金叉共振".to_string());
+            }
+            if ind.death_cross_resonance {
+                risks.push("💀 MACD/KDJ/RSI多指标死叉共振".to_string());
+            }
+            if ind.bottom_divergence_resonance {
+                reasons.push("🔥 多指标底背离共振，强烈看涨".to_string());
+            }
+            if ind.top_divergence_resonance {
+                risks.push("💀 多指标顶背离共振，强烈看跌".to_string());
+            }
+        }
+
         // === 综合判断 ===
         result.signal_score = score;
         result.signal_reasons = reasons;
@@ -733,6 +774,12 @@ impl StockTrendAnalyzer {
             for risk in &result.risk_factors {
                 lines.push(format!("   {}", risk));
             }
+        }
+
+        // 技术指标详情
+        if let Some(ref ind) = result.indicator_analysis {
+            lines.push(String::new());
+            lines.push(indicators::format_indicator_analysis(ind));
         }
 
         lines.join("\n")

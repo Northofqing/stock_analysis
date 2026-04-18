@@ -71,7 +71,7 @@ impl Default for BacktestConfig {
         Self {
             initial_capital: 100_000.0,    // 10万初始资金
             rebalance_days: 15,             // 15天调仓一次
-            position_count: 2,              // 持仓2只
+            position_count: 3,              // 持仓3只
             commission_rate: 0.0003,        // 万三手续费
             slippage_rate: 0.001,           // 千一滑点
         }

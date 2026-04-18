@@ -40,6 +40,10 @@ pub struct BollingerZScoreConfig {
     pub commission_rate: f64,
     /// 滑点率
     pub slippage_rate: f64,
+    /// 回测起始日期（None 表示不限制）
+    pub start_date: Option<NaiveDate>,
+    /// 回测结束日期（None 表示不限制）
+    pub end_date: Option<NaiveDate>,
 }
 
 impl Default for BollingerZScoreConfig {
@@ -54,6 +58,8 @@ impl Default for BollingerZScoreConfig {
             max_position_pct: 0.25,
             commission_rate: 0.0003,
             slippage_rate: 0.001,
+            start_date: Some(NaiveDate::from_ymd_opt(2000, 1, 1).unwrap()),
+            end_date: None,
         }
     }
 }
@@ -205,7 +211,19 @@ impl BollingerZScoreBacktest {
             let dt = Local.from_local_datetime(&naive.and_hms_opt(15, 0, 0).unwrap())
                 .single()
                 .unwrap_or_else(|| Local::now());
-            daily_values.push((dt, total_value));
+
+            // 日期范围过滤：仅在范围内记录净值和交易
+            let in_date_range = self.config.start_date.map_or(true, |s| naive >= s)
+                && self.config.end_date.map_or(true, |e| naive <= e);
+
+            if in_date_range {
+                daily_values.push((dt, total_value));
+            }
+
+            if !in_date_range {
+                signals.push(Signal::Hold);
+                continue;
+            }
 
             // 指标还没生效（NaN），跳过
             if z.is_none() || upper.is_none() || lower.is_none() || mid.is_none() {
@@ -457,6 +475,10 @@ impl BollingerZScoreResult {
         report.push_str("## ⚙️ 策略参数\n\n");
         report.push_str("| 参数 | 值 |\n");
         report.push_str("|------|----|\n");
+        report.push_str(&format!("| 回测区间 | {} ~ {} |\n",
+            self.config.start_date.map_or("不限".to_string(), |d| d.format("%Y-%m-%d").to_string()),
+            self.config.end_date.map_or("不限".to_string(), |d| d.format("%Y-%m-%d").to_string()),
+        ));
         report.push_str(&format!("| 布林带窗口 | {} 日 |\n", self.config.bb_window));
         report.push_str(&format!("| 布林带倍数 | {:.1}σ |\n", self.config.bb_std_mult));
         report.push_str(&format!("| Z-Score 买入阈值 | {:.1} |\n", self.config.zscore_buy));

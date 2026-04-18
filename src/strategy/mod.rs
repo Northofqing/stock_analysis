@@ -27,12 +27,14 @@ pub mod core;
 pub mod bollinger_zscore;
 pub mod multi_factor;
 pub mod rsi;
+pub mod contrarian;
 
 pub use rsi::{RsiStrategy, RsiConfig, RsiBacktest, RsiResult, SingleRsiResult};
 pub use rsi::{PrecisionRsiStrategy, PrecisionRsiConfig, PrecisionRsiBacktest, PrecisionRsiResult, SinglePrecisionRsiResult};
 pub use bollinger_zscore::{BollingerZScoreStrategy, BollingerZScoreConfig, BollingerZScoreBacktest, BollingerZScoreResult, SingleBacktestResult};
 pub use multi_factor::{MultiFactorStrategy, MultiFactorEngine, MultiFactorConfig, StockFactors, StockScore, Factor, FactorDirection};
 pub use core::{BacktestSummary, BacktestState, BacktestEngine, BacktestConfig, Trade, TradeAction, Position};
+pub use contrarian::{detect_contrarian_signal, ContrarianSignal};
 
 // ────────────────────────────── 通用信号类型 ──────────────────────────────
 
