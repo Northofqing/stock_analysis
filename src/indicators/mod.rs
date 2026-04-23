@@ -20,361 +20,18 @@
 //!            SMA(abs(close−prev_close), N) × 100
 
 use serde::{Deserialize, Serialize};
-use std::fmt;
 
-// ============================================================================
-// MACD
-// ============================================================================
+mod cross;
+mod divergence;
+mod kdj;
+mod macd;
+mod rsi;
 
-/// 单条 MACD 数据点
-#[derive(Debug, Clone, Default)]
-pub struct MacdPoint {
-    pub dif: f64,
-    pub dea: f64,
-    pub histogram: f64, // MACD 柱 = 2*(DIF-DEA)
-}
-
-/// 计算 MACD 序列
-///
-/// `closes` 按时间升序排列（最旧在前）。
-pub fn calc_macd(closes: &[f64], fast: usize, slow: usize, signal: usize) -> Vec<MacdPoint> {
-    if closes.len() < slow {
-        return vec![MacdPoint::default(); closes.len()];
-    }
-
-    let ema_fast = ema(closes, fast);
-    let ema_slow = ema(closes, slow);
-
-    let dif: Vec<f64> = ema_fast
-        .iter()
-        .zip(ema_slow.iter())
-        .map(|(f, s)| f - s)
-        .collect();
-
-    let dea = ema(&dif, signal);
-
-    dif.iter()
-        .zip(dea.iter())
-        .map(|(&d, &e)| MacdPoint {
-            dif: d,
-            dea: e,
-            histogram: 2.0 * (d - e),
-        })
-        .collect()
-}
-
-// ============================================================================
-// KDJ
-// ============================================================================
-
-/// 单条 KDJ 数据点
-#[derive(Debug, Clone, Default)]
-pub struct KdjPoint {
-    pub k: f64,
-    pub d: f64,
-    pub j: f64,
-}
-
-/// 计算 KDJ 序列
-///
-/// `highs`, `lows`, `closes` 按时间升序排列，长度必须一致。
-pub fn calc_kdj(
-    highs: &[f64],
-    lows: &[f64],
-    closes: &[f64],
-    n: usize,   // RSV 周期，默认 9
-    m1: usize,  // K 平滑周期，默认 3
-    m2: usize,  // D 平滑周期，默认 3
-) -> Vec<KdjPoint> {
-    let len = closes.len();
-    if len == 0 {
-        return Vec::new();
-    }
-
-    // 计算 RSV
-    let mut rsv = vec![50.0_f64; len];
-    for i in 0..len {
-        let start = if i + 1 >= n { i + 1 - n } else { 0 };
-        let hh = highs[start..=i]
-            .iter()
-            .cloned()
-            .fold(f64::NEG_INFINITY, f64::max);
-        let ll = lows[start..=i]
-            .iter()
-            .cloned()
-            .fold(f64::INFINITY, f64::min);
-        if (hh - ll).abs() > 1e-10 {
-            rsv[i] = (closes[i] - ll) / (hh - ll) * 100.0;
-        }
-    }
-
-    // SMA 平滑：K_i = K_{i-1} * (m-1)/m + RSV_i * 1/m
-    let mut k_vals = vec![50.0_f64; len];
-    let mut d_vals = vec![50.0_f64; len];
-    let mut j_vals = vec![50.0_f64; len];
-
-    for i in 0..len {
-        if i == 0 {
-            k_vals[i] = rsv[i];
-        } else {
-            k_vals[i] = k_vals[i - 1] * (m1 as f64 - 1.0) / m1 as f64
-                + rsv[i] / m1 as f64;
-        }
-    }
-
-    for i in 0..len {
-        if i == 0 {
-            d_vals[i] = k_vals[i];
-        } else {
-            d_vals[i] = d_vals[i - 1] * (m2 as f64 - 1.0) / m2 as f64
-                + k_vals[i] / m2 as f64;
-        }
-    }
-
-    for i in 0..len {
-        j_vals[i] = 3.0 * k_vals[i] - 2.0 * d_vals[i];
-    }
-
-    (0..len)
-        .map(|i| KdjPoint {
-            k: k_vals[i],
-            d: d_vals[i],
-            j: j_vals[i],
-        })
-        .collect()
-}
-
-// ============================================================================
-// RSI
-// ============================================================================
-
-/// 单条 RSI 数据点
-#[derive(Debug, Clone, Default)]
-pub struct RsiPoint {
-    pub rsi6: f64,
-    pub rsi12: f64,
-    pub rsi24: f64,
-}
-
-/// 计算 RSI 序列
-///
-/// `closes` 按时间升序排列。返回同等长度的序列，前期数据可能不准确。
-pub fn calc_rsi(closes: &[f64]) -> Vec<RsiPoint> {
-    let len = closes.len();
-    if len < 2 {
-        return vec![RsiPoint { rsi6: 50.0, rsi12: 50.0, rsi24: 50.0 }; len];
-    }
-
-    let rsi6 = rsi_single(closes, 6);
-    let rsi12 = rsi_single(closes, 12);
-    let rsi24 = rsi_single(closes, 24);
-
-    (0..len)
-        .map(|i| RsiPoint {
-            rsi6: rsi6[i],
-            rsi12: rsi12[i],
-            rsi24: rsi24[i],
-        })
-        .collect()
-}
-
-/// 计算单一周期的 RSI
-fn rsi_single(closes: &[f64], period: usize) -> Vec<f64> {
-    let len = closes.len();
-    let mut result = vec![50.0; len];
-    if len < 2 {
-        return result;
-    }
-
-    let mut avg_gain = 0.0;
-    let mut avg_loss = 0.0;
-
-    // 第一个窗口
-    let first_window = period.min(len - 1);
-    for i in 1..=first_window {
-        let change = closes[i] - closes[i - 1];
-        if change > 0.0 {
-            avg_gain += change;
-        } else {
-            avg_loss += change.abs();
-        }
-    }
-    avg_gain /= period as f64;
-    avg_loss /= period as f64;
-
-    if avg_gain + avg_loss > 1e-10 {
-        result[first_window] = avg_gain / (avg_gain + avg_loss) * 100.0;
-    }
-
-    // 后续使用指数平滑
-    for i in (first_window + 1)..len {
-        let change = closes[i] - closes[i - 1];
-        let gain = if change > 0.0 { change } else { 0.0 };
-        let loss = if change < 0.0 { change.abs() } else { 0.0 };
-
-        avg_gain = (avg_gain * (period as f64 - 1.0) + gain) / period as f64;
-        avg_loss = (avg_loss * (period as f64 - 1.0) + loss) / period as f64;
-
-        if avg_gain + avg_loss > 1e-10 {
-            result[i] = avg_gain / (avg_gain + avg_loss) * 100.0;
-        }
-    }
-
-    result
-}
-
-// ============================================================================
-// 背离检测
-// ============================================================================
-
-/// 背离类型
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DivergenceType {
-    /// 顶背离（价格创新高，指标未创新高）—— 看跌信号
-    BearishTop,
-    /// 底背离（价格创新低，指标未创新低）—— 看涨信号
-    BullishBottom,
-    /// 无背离
-    None,
-}
-
-impl fmt::Display for DivergenceType {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Self::BearishTop => write!(f, "顶背离(看跌)"),
-            Self::BullishBottom => write!(f, "底背离(看涨)"),
-            Self::None => write!(f, "无"),
-        }
-    }
-}
-
-/// 单项指标背离结果
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DivergenceResult {
-    pub indicator: String,
-    pub divergence: DivergenceType,
-    pub description: String,
-}
-
-/// 在价格序列和指标序列中检测顶底背离
-///
-/// `prices` 和 `indicator` 等长、升序。
-/// `lookback` 是回溯窗口（默认 30）。
-pub fn detect_divergence(
-    prices: &[f64],
-    indicator: &[f64],
-    lookback: usize,
-    indicator_name: &str,
-) -> DivergenceResult {
-    let len = prices.len();
-    if len < lookback || len < 10 {
-        return DivergenceResult {
-            indicator: indicator_name.to_string(),
-            divergence: DivergenceType::None,
-            description: "数据不足".to_string(),
-        };
-    }
-
-    let start = len - lookback;
-    let mid = start + lookback / 2;
-
-    // 在回溯窗口中找前半段和后半段的极值
-    let (prev_high_price, prev_high_idx) = max_with_index(&prices[start..mid]);
-    let (curr_high_price, curr_high_idx) = max_with_index(&prices[mid..len]);
-    let curr_high_idx = curr_high_idx + mid;
-    let prev_high_idx = prev_high_idx + start;
-
-    let (prev_low_price, prev_low_idx) = min_with_index(&prices[start..mid]);
-    let (curr_low_price, curr_low_idx) = min_with_index(&prices[mid..len]);
-    let curr_low_idx = curr_low_idx + mid;
-    let prev_low_idx = prev_low_idx + start;
-
-    // 顶背离：价格创新高，但指标没有创新高
-    if curr_high_price > prev_high_price * 0.998 {
-        let prev_ind = indicator[prev_high_idx];
-        let curr_ind = indicator[curr_high_idx];
-        if curr_ind < prev_ind * 0.97 {
-            return DivergenceResult {
-                indicator: indicator_name.to_string(),
-                divergence: DivergenceType::BearishTop,
-                description: format!(
-                    "{}顶背离：价格高点 {:.2}->{:.2}(↑)，指标 {:.2}->{:.2}(↓)",
-                    indicator_name, prev_high_price, curr_high_price, prev_ind, curr_ind
-                ),
-            };
-        }
-    }
-
-    // 底背离：价格创新低，但指标没有创新低
-    if curr_low_price < prev_low_price * 1.002 {
-        let prev_ind = indicator[prev_low_idx];
-        let curr_ind = indicator[curr_low_idx];
-        if curr_ind > prev_ind * 1.03 {
-            return DivergenceResult {
-                indicator: indicator_name.to_string(),
-                divergence: DivergenceType::BullishBottom,
-                description: format!(
-                    "{}底背离：价格低点 {:.2}->{:.2}(↓)，指标 {:.2}->{:.2}(↑)",
-                    indicator_name, prev_low_price, curr_low_price, prev_ind, curr_ind
-                ),
-            };
-        }
-    }
-
-    DivergenceResult {
-        indicator: indicator_name.to_string(),
-        divergence: DivergenceType::None,
-        description: format!("{}未发现背离", indicator_name),
-    }
-}
-
-// ============================================================================
-// 金叉/死叉检测
-// ============================================================================
-
-/// 交叉类型
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CrossType {
-    /// 金叉（快线上穿慢线）
-    GoldenCross,
-    /// 死叉（快线下穿慢线）
-    DeathCross,
-    /// 无交叉
-    None,
-}
-
-impl fmt::Display for CrossType {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Self::GoldenCross => write!(f, "金叉"),
-            Self::DeathCross => write!(f, "死叉"),
-            Self::None => write!(f, "无"),
-        }
-    }
-}
-
-/// 检测最近 N 根K线内快线是否上穿/下穿慢线
-///
-/// `fast` 和 `slow` 等长且升序。`lookback` 默认 5。
-fn detect_cross(fast: &[f64], slow: &[f64], lookback: usize) -> CrossType {
-    let len = fast.len();
-    if len < 2 {
-        return CrossType::None;
-    }
-    let start = if len > lookback { len - lookback } else { 0 };
-
-    for i in (start + 1..len).rev() {
-        let prev_diff = fast[i - 1] - slow[i - 1];
-        let curr_diff = fast[i] - slow[i];
-        if prev_diff <= 0.0 && curr_diff > 0.0 {
-            return CrossType::GoldenCross;
-        }
-        if prev_diff >= 0.0 && curr_diff < 0.0 {
-            return CrossType::DeathCross;
-        }
-    }
-    CrossType::None
-}
+pub use cross::{detect_cross, CrossType};
+pub use divergence::{detect_divergence, DivergenceResult, DivergenceType};
+pub use kdj::{calc_kdj, KdjPoint};
+pub use macd::{calc_macd, MacdPoint};
+pub use rsi::{calc_rsi, RsiPoint};
 
 // ============================================================================
 // 综合指标分析结果
@@ -721,7 +378,7 @@ pub fn format_indicator_analysis(a: &IndicatorAnalysis) -> String {
 // ============================================================================
 
 /// EMA 指数移动平均
-fn ema(data: &[f64], period: usize) -> Vec<f64> {
+pub(super) fn ema(data: &[f64], period: usize) -> Vec<f64> {
     let len = data.len();
     let mut result = vec![0.0; len];
     if len == 0 || period == 0 {
@@ -737,7 +394,7 @@ fn ema(data: &[f64], period: usize) -> Vec<f64> {
 }
 
 /// 返回切片中的最大值和索引
-fn max_with_index(data: &[f64]) -> (f64, usize) {
+pub(super) fn max_with_index(data: &[f64]) -> (f64, usize) {
     let mut max_val = f64::NEG_INFINITY;
     let mut max_idx = 0;
     for (i, &v) in data.iter().enumerate() {
@@ -750,7 +407,7 @@ fn max_with_index(data: &[f64]) -> (f64, usize) {
 }
 
 /// 返回切片中的最小值和索引
-fn min_with_index(data: &[f64]) -> (f64, usize) {
+pub(super) fn min_with_index(data: &[f64]) -> (f64, usize) {
     let mut min_val = f64::INFINITY;
     let mut min_idx = 0;
     for (i, &v) in data.iter().enumerate() {

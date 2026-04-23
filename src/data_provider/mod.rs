@@ -2,13 +2,24 @@
 //!
 //! 提供多种数据源的统一接口
 
+pub mod chip_distribution;
 pub mod eastmoney_provider;
+pub mod financials;
 pub mod gtimg_provider;
+pub mod money_flow;
 pub mod rustdx_provider;
 pub mod tushare_provider;
 
+pub use chip_distribution::{
+    compute_chip_distribution, format_for_prompt as format_chip_prompt, ChipDistribution,
+};
 pub use eastmoney_provider::HttpProvider;
+pub use financials::{fetch_with_fallback_blocking as fetch_financials, Financials};
 pub use gtimg_provider::GtimgProvider;
+pub use money_flow::{
+    fetch_intraday_shape_blocking, fetch_money_flow_blocking, format_for_prompt as format_flow_prompt,
+    IntradayShape, MoneyFlowSummary,
+};
 pub use rustdx_provider::RustdxProvider;
 pub use tushare_provider::TushareProvider;
 
@@ -74,7 +85,7 @@ pub trait DataProvider: Send + Sync {
     fn get_stock_name(&self, code: &str) -> Option<String>;
     
     /// 获取实时行情（包含盈利指标）
-    fn get_realtime_quote(&self, code: &str) -> Result<Option<RealtimeQuote>> {
+    fn get_realtime_quote(&self, _code: &str) -> Result<Option<RealtimeQuote>> {
         // 默认实现返回 None
         Ok(None)
     }
@@ -88,6 +99,7 @@ pub trait DataProvider: Send + Sync {
 /// 支持多数据源自动切换
 pub struct DataFetcherManager {
     providers: Vec<Box<dyn DataProvider>>,
+    financials_client: reqwest::Client,
 }
 
 impl DataFetcherManager {
@@ -114,8 +126,21 @@ impl DataFetcherManager {
         if let Ok(http_provider) = HttpProvider::new() {
             providers.push(Box::new(http_provider));
         }
-        
-        Ok(Self { providers })
+
+        let financials_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .user_agent(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+                 AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            )
+            .build()
+            .unwrap_or_default();
+
+        Ok(Self {
+            providers,
+            financials_client,
+        })
     }
     // 获取股票名称
     pub fn get_stock_name(&self, code: &str) -> Option<String> {
@@ -137,8 +162,27 @@ impl DataFetcherManager {
             log::info!("尝试使用数据源: {}", provider.name());
 
             match provider.get_daily_data(code, days) {
-                Ok(data) if !data.is_empty() => {
+                Ok(mut data) if !data.is_empty() => {
                     log::info!("成功从 {} 获取到 {} 条数据", provider.name(), data.len());
+
+                    // 补充财报数据（独立于行情数据源，来自东方财富财报接口）
+                    let fin = financials::fetch_with_fallback_blocking(
+                        &self.financials_client,
+                        code,
+                    );
+                    if fin.any() {
+                        if let Some(latest) = data.first_mut() {
+                            // 仅填充行情数据源没给出的字段（Option::or），避免覆盖
+                            latest.eps = latest.eps.or(fin.eps);
+                            latest.roe = latest.roe.or(fin.roe);
+                            latest.revenue_yoy = latest.revenue_yoy.or(fin.revenue_yoy);
+                            latest.net_profit_yoy =
+                                latest.net_profit_yoy.or(fin.net_profit_yoy);
+                            latest.gross_margin = latest.gross_margin.or(fin.gross_margin);
+                            latest.net_margin = latest.net_margin.or(fin.net_margin);
+                        }
+                    }
+
                     return Ok((data, provider.name()));
                 }
                 Ok(_) => {

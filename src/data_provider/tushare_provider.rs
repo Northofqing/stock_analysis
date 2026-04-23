@@ -172,7 +172,7 @@ impl TushareProvider {
         }
         
         // 解析每一行数据
-        for (idx, item) in items.iter().enumerate() {
+        for (_idx, item) in items.iter().enumerate() {
             let date_str = item[field_indices["trade_date"]]
                 .as_str()
                 .ok_or_else(|| anyhow!("日期格式错误"))?;

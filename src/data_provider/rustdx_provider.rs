@@ -247,21 +247,6 @@ impl RustdxProvider {
         
         Ok(Some(realtime_quote))
     }
-
-    /// 获取股票名称（内部方法）
-    fn fetch_stock_name_internal(&self, code: &str) -> Option<String> {
-        match self.fetch_realtime_internal(code) {
-            Ok(Some(quote)) => Some(quote.name),
-            Ok(None) => {
-                debug!("[通达信] {} 无法获取股票名称", code);
-                None
-            }
-            Err(e) => {
-                debug!("[通达信] {} 获取股票名称失败: {}", code, e);
-                None
-            }
-        }
-    }
 }
 
 impl DataProvider for RustdxProvider {
@@ -321,7 +306,7 @@ impl DataProvider for RustdxProvider {
         Ok(kline_data)
     }
 
-    fn get_stock_name(&self, code: &str) -> Option<String> {
+    fn get_stock_name(&self, _code: &str) -> Option<String> {
         // 通达信返回的股票名称经常为空，所以这里返回None
         // 让系统使用腾讯财经等其他数据源获取名称
         debug!("[通达信] 股票名称功能已禁用，请使用其他数据源");

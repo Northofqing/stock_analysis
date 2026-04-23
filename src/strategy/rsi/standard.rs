@@ -1,35 +1,18 @@
-//! RSI（相对强弱指数）策略集
+//! RSI 通用超买超卖策略（增强版：Wilder + 过滤器 + 冷却期 + 分档加仓）
 //!
-//! # 策略一：通用 RSI 超买超卖 v2（`RsiBacktest`）
-//!
-//! 1. 用 Wilder 指数平滑计算 N 日 RSI（比 SMA 更灵敏精准）
-//! 2. RSI < 超卖阈值（默认 30）+ 跌势减缓过滤 + 冷却期 → **买入**
-//! 3. RSI > 超买阈值（默认 70）时 → **卖出**（止盈）
-//! 4. RSI 回升至均衡区（默认 65）且持仓盈利 → **平仓**（锁利）
-//! 5. RSI 分档加仓：RSI 越低仓位越重（<20: 70%, <15: 100%）
-//! 6. 可选 60 日均线趋势过滤，只在上升趋势中做多
-//!
-//! # 策略二：精准 RSI 深度超卖均值回归（`PrecisionRsiBacktest`）
-//!
-//! **买入条件（全部满足）**
-//! 1. 5 日 RSI < 30 — 深度超卖
-//! 2. 5 日 RSI 连续第三天走低（`rsi[i] < rsi[i-1] < rsi[i-2]`）— 超卖动能充分释放
-//! 3. 三个交易日前 5 日 RSI < 60（`rsi[i-3] < 60`）— 前期压力已消化，排除假性超卖
-//! 4. 收盘价 > 200 日均线 — 长期上升趋势，避免下跌通道诱多
-//!
-//! **卖出条件**
-//! - 5 日 RSI 向上突破 50（前一日 < 50，当日 >= 50）— 超卖格局修复，均值回归完成
+//! 详见 `super` 模块文档。
 
 use anyhow::Result;
-use chrono::{Datelike, Local, NaiveDate, TimeZone};
+use chrono::{Local, NaiveDate, TimeZone};
 use log::{info, warn};
 use polars::prelude::*;
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 
-use super::core::{BacktestState, BacktestSummary, Trade, TradeAction};
+use super::super::core::{BacktestState, BacktestSummary, Trade, TradeAction};
+use super::super::{KlineStrategy, Signal, StrategyResult};
+use super::common::{compute_ema_vec, compute_macd_vec, compute_rsi_wilder, compute_sma_vec, compute_vwap_monthly_vec};
 use crate::data_provider::KlineData;
-use super::{KlineStrategy, Signal, StrategyResult};
 
 // ────────────────────────────── 策略参数 ──────────────────────────────
 
@@ -44,8 +27,10 @@ pub struct RsiConfig {
     pub overbought: f64,
     /// 均衡平仓阈值：RSI 回到此值且持仓盈利时平仓（默认 50）
     pub exit_level: f64,
-    /// 是否启用 60 日均线趋势过滤（开启后只在价格 > MA60 时买入）
+    /// 是否启用均线趋势过滤（开启后只在价格 > `trend_ma_period` 日均线时买入）
     pub use_trend_filter: bool,
+    /// 趋势过滤使用的均线周期（默认 60，可设 120/200 与深度超卖并存）
+    pub trend_ma_period: usize,
     /// 是否启用月度 VWAP 过滤（买入时价格须 > VWAP）
     pub use_vwap_filter: bool,
     /// 是否启用 MACD 过滤（买入要求 MACD 柱 > 0，持仓中柱转负卖出）
@@ -65,8 +50,22 @@ pub struct RsiConfig {
     /// 增强过滤器最少通过数量（评分制：启用的过滤器中至少通过几个才允许买入，默认 1）
     /// 设为 0 表示不需要任何增强过滤器通过，仅依赖 RSI 超卖信号
     pub min_buy_filters: usize,
+    /// 若为 true 则要求所有启用的过滤器全部通过（覆盖 `min_buy_filters`）
+    pub require_all_filters: bool,
     /// 卖出后冷却期（至少间隔多少根 K 线才允许再次买入，默认 10）
     pub cooldown_bars: usize,
+    /// 持仓最少持有 K 线数（低于此值不允许非止损/止盈的卖出，0=关闭）
+    pub min_hold_bars: usize,
+    /// 固定止损百分比（例如 0.05 表示 -5% 止损；0 表示不启用）
+    pub stop_loss_pct: f64,
+    /// 固定止盈百分比（例如 0.08 表示 +8% 止盈；0 表示不启用）
+    pub take_profit_pct: f64,
+    /// 持仓中若 RSI 继续下探 `add_on_rsi_delta`（如 5.0）且仓位未满，触发加仓（0=关闭）
+    pub add_on_rsi_delta: f64,
+    /// 单次加仓最大仓位比例（相对初始资金）
+    pub add_on_position_pct: f64,
+    /// 买入前要求 RSI 连续 N 根 K 线回升（0=不要求）
+    pub rsi_rising_confirm_bars: usize,
     /// 时间周期标注（如 "1h"、"1d"，不影响计算逻辑，仅用于报告标注）
     pub timeframe: String,
     /// 回测起始日期（None 表示不限制）
@@ -91,6 +90,7 @@ impl Default for RsiConfig {
             overbought: 70.0,
             exit_level: 65.0,
             use_trend_filter: true,
+            trend_ma_period: 60,
             use_vwap_filter: true,
             use_macd_filter: true,
             use_ema_sma_filter: true,
@@ -100,7 +100,14 @@ impl Default for RsiConfig {
             macd_slow: 26,
             macd_signal: 9,
             min_buy_filters: 1,
+            require_all_filters: false,
             cooldown_bars: 10,
+            min_hold_bars: 0,
+            stop_loss_pct: 0.0,
+            take_profit_pct: 0.0,
+            add_on_rsi_delta: 0.0,
+            add_on_position_pct: 0.0,
+            rsi_rising_confirm_bars: 0,
             timeframe: "1h".to_string(),
             start_date: Some(NaiveDate::from_ymd_opt(2000, 1, 1).unwrap()),
             end_date: None,
@@ -112,211 +119,180 @@ impl Default for RsiConfig {
     }
 }
 
+impl RsiConfig {
+    /// 基线（现行默认 1h 配置）——作为对照组
+    pub fn preset_baseline() -> Self {
+        Self::default()
+    }
+
+    /// v1: 修正为日K + 取消 MA60 趋势过滤冲突 + 冷却期缩短
+    pub fn preset_daily_v1() -> Self {
+        Self {
+            rsi_period: 14,
+            oversold: 30.0,
+            overbought: 70.0,
+            exit_level: 55.0,
+            use_trend_filter: false, // 解除 RSI<30 与 close>MA60 的互斥
+            trend_ma_period: 60,
+            cooldown_bars: 3,
+            min_buy_filters: 1,
+            require_all_filters: false,
+            min_hold_bars: 0,
+            stop_loss_pct: 0.0,
+            take_profit_pct: 0.0,
+            add_on_rsi_delta: 0.0,
+            add_on_position_pct: 0.0,
+            timeframe: "1d".to_string(),
+            ..Self::default()
+        }
+    }
+
+    /// v2: 趋势过滤换到 MA200（长期过滤，不会夹死超卖信号）
+    pub fn preset_daily_v2() -> Self {
+        Self {
+            use_trend_filter: true,
+            trend_ma_period: 200,
+            ..Self::preset_daily_v1()
+        }
+    }
+
+    /// v3: 所有过滤器全部通过 + 超卖收紧到 25（精选信号）
+    pub fn preset_daily_v3_strict() -> Self {
+        Self {
+            oversold: 25.0,
+            require_all_filters: true,
+            ..Self::preset_daily_v2()
+        }
+    }
+
+    /// v4: 加入止盈 +8% / 止损 -5%（不对称：期望胜率上升）
+    pub fn preset_daily_v4_stop_take() -> Self {
+        Self {
+            stop_loss_pct: 0.05,
+            take_profit_pct: 0.08,
+            min_hold_bars: 2,
+            ..Self::preset_daily_v3_strict()
+        }
+    }
+
+    /// v5: 宽止盈 +12% / 紧止损 -3%（高胜率偏向）
+    pub fn preset_daily_v5_high_winrate() -> Self {
+        Self {
+            oversold: 22.0,
+            exit_level: 60.0,
+            stop_loss_pct: 0.03,
+            take_profit_pct: 0.12,
+            // 禁用 MACD/EMA-SMA 的"趋势破位"卖出，避免过早止损
+            use_macd_filter: false,
+            use_ema_sma_filter: false,
+            min_hold_bars: 3,
+            ..Self::preset_daily_v4_stop_take()
+        }
+    }
+
+    /// v6: 干净的"RSI+MA200 趋势+止盈止损"，不使用额外买入过滤器
+    pub fn preset_daily_v6_clean() -> Self {
+        Self {
+            rsi_period: 14,
+            oversold: 30.0,
+            overbought: 70.0,
+            exit_level: 55.0,
+            use_trend_filter: true,
+            trend_ma_period: 200,
+            use_vwap_filter: false,
+            use_macd_filter: false,
+            use_ema_sma_filter: false,
+            min_buy_filters: 0,
+            require_all_filters: false,
+            cooldown_bars: 3,
+            min_hold_bars: 2,
+            stop_loss_pct: 0.03,
+            take_profit_pct: 0.05,
+            add_on_rsi_delta: 0.0,
+            add_on_position_pct: 0.0,
+            timeframe: "1d".to_string(),
+            ..Self::default()
+        }
+    }
+
+    /// v7: v6 + 更深超卖 + 更宽止盈（更稀有但更高盈亏比）
+    pub fn preset_daily_v7_deeper() -> Self {
+        Self {
+            oversold: 25.0,
+            stop_loss_pct: 0.04,
+            take_profit_pct: 0.08,
+            ..Self::preset_daily_v6_clean()
+        }
+    }
+
+    /// v8: v6 + VWAP/MACD/EMA 三过滤（评分≥2）进一步精选
+    pub fn preset_daily_v8_score2() -> Self {
+        Self {
+            use_vwap_filter: true,
+            use_macd_filter: true,
+            use_ema_sma_filter: true,
+            min_buy_filters: 2,
+            require_all_filters: false,
+            stop_loss_pct: 0.04,
+            take_profit_pct: 0.06,
+            ..Self::preset_daily_v6_clean()
+        }
+    }
+
+    /// v9: v7 + 仅在"RSI 连续 2 日回升"时买入（通过在 run_single 中判定，实际以 rsi_rising_required 开关启用）
+    /// 暂沿用 v7，改为在胜率验证环节用筛选过滤器实现
+    pub fn preset_daily_v9_reversal() -> Self {
+        Self {
+            oversold: 28.0,
+            stop_loss_pct: 0.03,
+            take_profit_pct: 0.06,
+            min_hold_bars: 3,
+            // 要求 RSI 回升确认：在 buy 分支加判定
+            rsi_rising_confirm_bars: 1,
+            ..Self::preset_daily_v7_deeper()
+        }
+    }
+
+    /// v10: v7 但取消止损（"拿到盈利才卖"），胜率为王
+    pub fn preset_daily_v10_no_stop() -> Self {
+        Self {
+            stop_loss_pct: 0.0, // 关闭硬止损
+            take_profit_pct: 0.08,
+            oversold: 25.0,
+            exit_level: 55.0,
+            ..Self::preset_daily_v7_deeper()
+        }
+    }
+
+    /// v11: v10 + 回升 1 根确认（过滤"接飞刀"）
+    pub fn preset_daily_v11_no_stop_rising() -> Self {
+        Self {
+            rsi_rising_confirm_bars: 1,
+            ..Self::preset_daily_v10_no_stop()
+        }
+    }
+
+    /// v12: v10 + 超卖更深（22）+ 仅 MA200 上方
+    pub fn preset_daily_v12_deep_no_stop() -> Self {
+        Self {
+            oversold: 22.0,
+            take_profit_pct: 0.10,
+            ..Self::preset_daily_v10_no_stop()
+        }
+    }
+
+    /// v13: v11 + 超卖 22 + 回升 2 根（最严格）
+    pub fn preset_daily_v13_strict_rising() -> Self {
+        Self {
+            oversold: 22.0,
+            rsi_rising_confirm_bars: 2,
+            take_profit_pct: 0.10,
+            ..Self::preset_daily_v11_no_stop_rising()
+        }
+    }
+}
+
 // ────────────────────────────── Polars 指标计算 ──────────────────────────────
-
-/// 使用 Wilder 指数平滑计算 RSI（比 SMA 更灵敏精准）
-/// 返回与 closes 等长的 Vec，前 period 个点为 50.0（预热期）
-fn compute_rsi_wilder(closes: &[f64], period: usize) -> Vec<f64> {
-    let len = closes.len();
-    let mut result = vec![50.0; len];
-    if len < 2 || period == 0 {
-        return result;
-    }
-
-    let mut avg_gain = 0.0;
-    let mut avg_loss = 0.0;
-
-    // 第一个窗口：简单平均作为种子
-    let first_window = period.min(len - 1);
-    for i in 1..=first_window {
-        let change = closes[i] - closes[i - 1];
-        if change > 0.0 {
-            avg_gain += change;
-        } else {
-            avg_loss += change.abs();
-        }
-    }
-    avg_gain /= period as f64;
-    avg_loss /= period as f64;
-
-    if avg_gain + avg_loss > 1e-10 {
-        result[first_window] = avg_gain / (avg_gain + avg_loss) * 100.0;
-    }
-
-    // 后续使用 Wilder 指数平滑
-    for i in (first_window + 1)..len {
-        let change = closes[i] - closes[i - 1];
-        let gain = if change > 0.0 { change } else { 0.0 };
-        let loss = if change < 0.0 { change.abs() } else { 0.0 };
-        avg_gain = (avg_gain * (period as f64 - 1.0) + gain) / period as f64;
-        avg_loss = (avg_loss * (period as f64 - 1.0) + loss) / period as f64;
-        if avg_gain + avg_loss > 1e-10 {
-            result[i] = avg_gain / (avg_gain + avg_loss) * 100.0;
-        }
-    }
-    result
-}
-
-/// 计算指定周期的 RSI 列（Polars LazyFrame 版本，用于精准策略的 5 日 RSI）
-/// 注意：此函数使用 rolling_mean（SMA 版），仅供 PrecisionRsiBacktest 使用
-fn build_rsi_lazy(lf: LazyFrame, period: usize, close_col: &str) -> LazyFrame {
-    let alias = format!("rsi_{}", period);
-    lf.with_columns([
-        (col(close_col) - col(close_col).shift(lit(1))).alias("_delta")
-    ])
-    .with_columns([
-        when(col("_delta").gt(lit(0.0f64)))
-            .then(col("_delta"))
-            .otherwise(lit(0.0f64))
-            .alias("_gain"),
-        when(col("_delta").lt(lit(0.0f64)))
-            .then(lit(0.0f64) - col("_delta"))
-            .otherwise(lit(0.0f64))
-            .alias("_loss"),
-    ])
-    .with_columns([
-        col("_gain")
-            .rolling_mean(RollingOptionsFixedWindow {
-                window_size: period,
-                min_periods: period,
-                ..Default::default()
-            })
-            .alias("_avg_gain"),
-        col("_loss")
-            .rolling_mean(RollingOptionsFixedWindow {
-                window_size: period,
-                min_periods: period,
-                ..Default::default()
-            })
-            .alias("_avg_loss"),
-    ])
-    .with_columns([
-        when(col("_avg_loss").eq(lit(0.0f64)))
-            .then(lit(100.0f64))
-            .otherwise(
-                lit(100.0f64)
-                    - lit(100.0f64) / (lit(1.0f64) + col("_avg_gain") / col("_avg_loss")),
-            )
-            .alias(alias),
-    ])
-    .drop(["_delta", "_gain", "_loss", "_avg_gain", "_avg_loss"])
-}
-
-// ────────────────────────────── 辅助指标计算（Vec 版） ──────────────────────────────
-
-/// 计算指数移动平均线 (EMA)
-fn compute_ema_vec(close: &[f64], period: usize) -> Vec<Option<f64>> {
-    let n = close.len();
-    let mut ema: Vec<Option<f64>> = vec![None; n];
-    if n < period || period == 0 {
-        return ema;
-    }
-    let initial: f64 = close[..period].iter().sum::<f64>() / period as f64;
-    ema[period - 1] = Some(initial);
-    let k = 2.0 / (period as f64 + 1.0);
-    for i in period..n {
-        if let Some(prev) = ema[i - 1] {
-            ema[i] = Some(close[i] * k + prev * (1.0 - k));
-        }
-    }
-    ema
-}
-
-/// 计算简单移动平均线 (SMA)
-fn compute_sma_vec(close: &[f64], period: usize) -> Vec<Option<f64>> {
-    let n = close.len();
-    let mut sma: Vec<Option<f64>> = vec![None; n];
-    if n < period || period == 0 {
-        return sma;
-    }
-    let mut sum: f64 = close[..period].iter().sum();
-    sma[period - 1] = Some(sum / period as f64);
-    for i in period..n {
-        sum += close[i] - close[i - period];
-        sma[i] = Some(sum / period as f64);
-    }
-    sma
-}
-
-/// 计算 MACD (返回 macd_line, signal_line, histogram)
-fn compute_macd_vec(
-    close: &[f64],
-    fast: usize,
-    slow: usize,
-    signal_period: usize,
-) -> (Vec<Option<f64>>, Vec<Option<f64>>, Vec<Option<f64>>) {
-    let n = close.len();
-    let ema_fast = compute_ema_vec(close, fast);
-    let ema_slow = compute_ema_vec(close, slow);
-
-    // MACD line = EMA_fast - EMA_slow
-    let mut macd_line: Vec<Option<f64>> = vec![None; n];
-    for i in 0..n {
-        if let (Some(f), Some(s)) = (ema_fast[i], ema_slow[i]) {
-            macd_line[i] = Some(f - s);
-        }
-    }
-
-    // Signal line = EMA(signal_period) of MACD line (仅对有值的部分计算)
-    let macd_values: Vec<f64> = macd_line.iter().filter_map(|&v| v).collect();
-    let signal_raw = compute_ema_vec(&macd_values, signal_period);
-
-    // 将信号线映射回原始索引
-    let mut signal_line: Vec<Option<f64>> = vec![None; n];
-    let mut j = 0;
-    for i in 0..n {
-        if macd_line[i].is_some() {
-            if j < signal_raw.len() {
-                signal_line[i] = signal_raw[j];
-            }
-            j += 1;
-        }
-    }
-
-    // Histogram = MACD line - Signal line
-    let mut histogram: Vec<Option<f64>> = vec![None; n];
-    for i in 0..n {
-        if let (Some(m), Some(s)) = (macd_line[i], signal_line[i]) {
-            histogram[i] = Some(m - s);
-        }
-    }
-
-    (macd_line, signal_line, histogram)
-}
-
-/// 计算月度 VWAP (Volume Weighted Average Price)，每月重置
-fn compute_vwap_monthly_vec(klines: &[KlineData]) -> Vec<Option<f64>> {
-    let n = klines.len();
-    let mut vwap: Vec<Option<f64>> = vec![None; n];
-    if n == 0 {
-        return vwap;
-    }
-
-    let mut cum_pv: f64 = 0.0;
-    let mut cum_vol: f64 = 0.0;
-    let mut current_month = (klines[0].date.year(), klines[0].date.month());
-
-    for i in 0..n {
-        let month = (klines[i].date.year(), klines[i].date.month());
-
-        // 月份切换时重置累计值
-        if month != current_month {
-            cum_pv = 0.0;
-            cum_vol = 0.0;
-            current_month = month;
-        }
-
-        let typical_price = (klines[i].high + klines[i].low + klines[i].close) / 3.0;
-        cum_pv += typical_price * klines[i].volume;
-        cum_vol += klines[i].volume;
-
-        if cum_vol > 0.0 {
-            vwap[i] = Some(cum_pv / cum_vol);
-        }
-    }
-
-    vwap
-}
 
 /// 使用 Wilder 指数平滑计算 RSI 及可选趋势过滤指标（通用策略用）
 pub fn compute_rsi_indicators(klines: &[KlineData], config: &RsiConfig) -> Result<DataFrame> {
@@ -350,12 +326,13 @@ pub fn compute_rsi_indicators(klines: &[KlineData], config: &RsiConfig) -> Resul
 
     // 可选：追加趋势过滤列
     if config.use_trend_filter {
+        let trend_window = config.trend_ma_period.max(2);
         let df = df
             .lazy()
             .with_columns([col("close")
                 .rolling_mean(RollingOptionsFixedWindow {
-                    window_size: 60,
-                    min_periods: 60,
+                    window_size: trend_window,
+                    min_periods: trend_window,
                     ..Default::default()
                 })
                 .alias("trend_ma")])
@@ -365,72 +342,6 @@ pub fn compute_rsi_indicators(klines: &[KlineData], config: &RsiConfig) -> Resul
     }
 
     Ok(df)
-}
-
-/// 计算精准策略所需全部指标：5日RSI + 200日均线
-pub fn compute_precision_indicators(klines: &[KlineData]) -> Result<DataFrame> {
-    let n = klines.len();
-    if n < 205 {
-        anyhow::bail!("K线数据不足 205 条，无法计算 200 日均线（当前 {} 条）", n);
-    }
-
-    let dates: Vec<String> = klines
-        .iter()
-        .map(|k| k.date.format("%Y-%m-%d").to_string())
-        .collect();
-    let close: Vec<f64> = klines.iter().map(|k| k.close).collect();
-
-    let df = df![
-        "date"  => &dates,
-        "close" => &close,
-    ]?;
-
-    // 5日RSI
-    let lf = build_rsi_lazy(df.lazy(), 5, "close");
-    // 200日均线
-    let df = lf
-        .with_columns([col("close")
-            .rolling_mean(RollingOptionsFixedWindow {
-                window_size: 200,
-                min_periods: 200,
-                ..Default::default()
-            })
-            .alias("ma200")])
-        .collect()?;
-
-    Ok(df)
-}
-
-// ────────────────────────────── 精准RSI配置 ──────────────────────────────
-
-/// 精准 RSI 深度超卖均值回归策略配置
-#[derive(Debug, Clone)]
-pub struct PrecisionRsiConfig {
-    /// 初始资金（元）
-    pub initial_capital: f64,
-    /// 单只股票最大仓位比例（0–1）
-    pub max_position_pct: f64,
-    /// 手续费率
-    pub commission_rate: f64,
-    /// 滑点率
-    pub slippage_rate: f64,
-    /// 回测起始日期（None 表示不限制）
-    pub start_date: Option<NaiveDate>,
-    /// 回测结束日期（None 表示不限制）
-    pub end_date: Option<NaiveDate>,
-}
-
-impl Default for PrecisionRsiConfig {
-    fn default() -> Self {
-        Self {
-            initial_capital: 100_000.0,
-            max_position_pct: 0.25,
-            commission_rate: 0.0003,
-            slippage_rate: 0.001,
-            start_date: Some(NaiveDate::from_ymd_opt(2000, 1, 1).unwrap()),
-            end_date: None,
-        }
-    }
 }
 
 // ────────────────────────────── 单股回测结果 ──────────────────────────────
@@ -648,375 +559,6 @@ impl RsiResult {
     }
 }
 
-// ────────────────────────────── 精准RSI单股结果 ──────────────────────────────
-
-/// 精准RSI策略单只股票回测结果
-pub struct SinglePrecisionRsiResult {
-    pub code: String,
-    pub name: String,
-    pub initial_capital: f64,
-    pub final_value: f64,
-    pub trades: Vec<Trade>,
-    pub daily_values: Vec<(chrono::DateTime<Local>, f64)>,
-    pub signals: Vec<Signal>,
-    /// 每日 5日RSI 值
-    pub rsi5_values: Vec<Option<f64>>,
-}
-
-// ────────────────────────────── 精准RSI组合结果 ──────────────────────────────
-
-/// 精准 RSI 策略组合回测结果
-pub struct PrecisionRsiResult {
-    pub config: PrecisionRsiConfig,
-    pub single_results: Vec<SinglePrecisionRsiResult>,
-    pub portfolio_daily_values: Vec<(chrono::DateTime<Local>, f64)>,
-    pub portfolio_trades: Vec<Trade>,
-}
-
-impl PrecisionRsiResult {
-    pub fn to_summary(&self) -> BacktestSummary {
-        let total_initial = self.config.initial_capital * self.single_results.len() as f64;
-        let mut state = BacktestState::new(total_initial);
-        state.daily_values = self.portfolio_daily_values.clone();
-        state.trades = self.portfolio_trades.clone();
-        BacktestSummary::from_state(&state, total_initial)
-    }
-
-    pub fn generate_chart(&self, output_path: &str) -> Result<PathBuf> {
-        let total_initial = self.config.initial_capital * self.single_results.len() as f64;
-        let mut state = BacktestState::new(total_initial);
-        state.daily_values = self.portfolio_daily_values.clone();
-        state.trades = self.portfolio_trades.clone();
-        let summary = BacktestSummary::from_state(&state, total_initial);
-        summary.generate_chart(&state, output_path)
-    }
-
-    pub fn generate_report(&self) -> String {
-        let summary = self.to_summary();
-        let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-
-        let mut report = String::new();
-        report.push_str("# 📊 精准RSI深度超卖均值回归策略回测报告\n\n");
-        report.push_str(&format!("**生成时间**: {}\n\n", now));
-        report.push_str("---\n\n");
-
-        report.push_str("## ⚙️ 策略规则\n\n");
-        report.push_str("### 买入条件（需同时满足全部）\n\n");
-        report.push_str("| # | 条件 | 说明 |\n|---|------|------|\n");
-        report.push_str("| 1 | 5日RSI < 30 | 深度超卖区域 |\n");
-        report.push_str("| 2 | 5日RSI连续第三天走低 | 超卖动能充分释放，蓄积反弹力量 |\n");
-        report.push_str("| 3 | 三交易日前 5日RSI < 60 | 前期压力已消化，排除假性超卖 |\n");
-        report.push_str("| 4 | 收盘价 > 200日均线 | 长期上升趋势，规避下跌通道诱多 |\n\n");
-        report.push_str("### 卖出条件\n\n");
-        report.push_str("| 条件 | 说明 |\n|------|------|\n");
-        report.push_str("| 5日RSI 向上突破 50（前日 < 50，当日 ≥ 50） | 超卖格局彻底修复，均值回归第一阶段完成 |\n\n");
-
-        report.push_str("## ⚙️ 策略参数\n\n");
-        report.push_str("| 参数 | 值 |\n|------|----|\n");
-        report.push_str(&format!("| 回测区间 | {} ~ {} |\n",
-            self.config.start_date.map_or("不限".to_string(), |d| d.format("%Y-%m-%d").to_string()),
-            self.config.end_date.map_or("不限".to_string(), |d| d.format("%Y-%m-%d").to_string()),
-        ));
-        report.push_str("| RSI 周期 | 5 日 |\n");
-        report.push_str("| 超卖阈值 | 30 |\n");
-        report.push_str("| 离场阈值（RSI突破） | 50 |\n");
-        report.push_str("| 趋势均线 | MA200 |\n");
-        report.push_str(&format!("| 单股最大仓位 | {:.0}% |\n", self.config.max_position_pct * 100.0));
-        report.push_str(&format!("| 手续费率 | {:.2}‰ |\n", self.config.commission_rate * 1000.0));
-        report.push_str(&format!("| 滑点率 | {:.1}‰ |\n\n", self.config.slippage_rate * 1000.0));
-
-        report.push_str("## 📈 组合回测结果\n\n");
-        report.push_str("| 指标 | 数值 | 说明 |\n|------|------|------|\n");
-        report.push_str(&format!(
-            "| 初始资金 | ¥{:.2}万 | {} 只股票 × {:.0}万/只 |\n",
-            summary.initial_capital / 10000.0,
-            self.single_results.len(),
-            self.config.initial_capital / 10000.0
-        ));
-        report.push_str(&format!("| 期末资产 | ¥{:.2}万 | - |\n", summary.final_value / 10000.0));
-        let ret_emoji = if summary.total_return > 0.0 { "📈" } else { "📉" };
-        report.push_str(&format!("| 总收益率 | {:.2}% | {} |\n", summary.total_return * 100.0, ret_emoji));
-        report.push_str(&format!("| 年化收益率 | {:.2}% | - |\n", summary.annual_return * 100.0));
-        let dd_label = if summary.max_drawdown < 0.1 { "🛡️ 风险较低" } else if summary.max_drawdown < 0.2 { "⚠️ 风险适中" } else { "🚨 风险较高" };
-        report.push_str(&format!("| 最大回撤 | {:.2}% | {} |\n", summary.max_drawdown * 100.0, dd_label));
-        let sr_label = if summary.sharpe_ratio > 1.0 { "⭐ 优秀" } else if summary.sharpe_ratio > 0.5 { "✅ 良好" } else { "⚠️ 一般" };
-        report.push_str(&format!("| 夏普比率 | {:.2} | {} |\n", summary.sharpe_ratio, sr_label));
-        report.push_str(&format!("| 总交易次数 | {} 次 | - |\n", summary.total_trades));
-        report.push_str(&format!("| 胜率 | {:.1}% | - |\n\n", summary.win_rate * 100.0));
-
-        report.push_str("## 📋 个股回测明细\n\n");
-        report.push_str("| 股票 | 代码 | 初始资金 | 期末市值 | 收益率 | 交易次数 |\n");
-        report.push_str("|------|------|---------|---------|--------|----------|\n");
-        for r in &self.single_results {
-            let ret = (r.final_value / r.initial_capital - 1.0) * 100.0;
-            let emoji = if ret > 0.0 { "🟢" } else { "🔴" };
-            report.push_str(&format!(
-                "| {} {} | {} | {:.0} | {:.0} | {} {:.2}% | {} |\n",
-                emoji, r.name, r.code, r.initial_capital, r.final_value, emoji, ret, r.trades.len()
-            ));
-        }
-        report.push_str("\n");
-
-        report.push_str("> ⚠️ 本策略要求至少 205 日K线（200日均线预热），适合中长期持仓的均值回归波段操作。\n\n");
-        report
-    }
-}
-
-impl StrategyResult for PrecisionRsiResult {
-    fn to_summary(&self) -> BacktestSummary { self.to_summary() }
-    fn generate_report(&self) -> String { self.generate_report() }
-    fn generate_chart(&self, path: &str) -> Result<PathBuf> { self.generate_chart(path) }
-}
-
-// ────────────────────────────── 精准RSI回测引擎 ──────────────────────────────
-
-/// 精准 RSI 深度超卖均值回归回测引擎
-pub struct PrecisionRsiBacktest {
-    config: PrecisionRsiConfig,
-}
-
-impl PrecisionRsiBacktest {
-    pub fn new(config: PrecisionRsiConfig) -> Self {
-        Self { config }
-    }
-
-    /// 对单只股票运行历史回测（klines 须按日期升序排列）
-    pub fn run_single(
-        &self,
-        code: &str,
-        name: &str,
-        klines: &[KlineData],
-    ) -> Result<SinglePrecisionRsiResult> {
-        let df = compute_precision_indicators(klines)?;
-        let n = df.height();
-
-        let dates = df.column("date")?.str()?.clone();
-        let close_col = df.column("close")?.f64()?.clone();
-        let rsi5_col = df.column("rsi_5")?.f64()?.clone();
-        let ma200_col = df.column("ma200")?.f64()?.clone();
-
-        // 预先收集 rsi_5 为 Vec<Option<f64>> 方便回望
-        let rsi5_vec: Vec<Option<f64>> = (0..n).map(|i| rsi5_col.get(i)).collect();
-
-        let mut cash = self.config.initial_capital;
-        let mut shares: f64 = 0.0;
-        let mut avg_cost: f64 = 0.0;
-        let mut trades: Vec<Trade> = Vec::new();
-        let mut daily_values: Vec<(chrono::DateTime<Local>, f64)> = Vec::new();
-        let mut signals: Vec<Signal> = Vec::with_capacity(n);
-
-        for i in 0..n {
-            let close = match close_col.get(i) {
-                Some(v) => v,
-                None => { signals.push(Signal::Hold); continue; }
-            };
-
-            let date_str = dates.get(i).unwrap_or("1970-01-01");
-            let naive = NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
-                .unwrap_or_else(|_| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
-            let dt = Local
-                .from_local_datetime(&naive.and_hms_opt(15, 0, 0).unwrap())
-                .single()
-                .unwrap_or_else(|| Local::now());
-
-            // 日期范围过滤：仅在范围内记录净值和交易
-            let in_date_range = self.config.start_date.map_or(true, |s| naive >= s)
-                && self.config.end_date.map_or(true, |e| naive <= e);
-
-            if in_date_range {
-                daily_values.push((dt, cash + shares * close));
-            }
-
-            if !in_date_range {
-                signals.push(Signal::Hold);
-                continue;
-            }
-
-            // 需要足够的历史才能判断
-            if i < 3 {
-                signals.push(Signal::Hold);
-                continue;
-            }
-
-            let rsi_now = match rsi5_vec[i] { Some(v) => v, None => { signals.push(Signal::Hold); continue; } };
-            let rsi_1  = match rsi5_vec[i - 1] { Some(v) => v, None => { signals.push(Signal::Hold); continue; } };
-            let rsi_2  = match rsi5_vec[i - 2] { Some(v) => v, None => { signals.push(Signal::Hold); continue; } };
-            let rsi_3  = match rsi5_vec[i - 3] { Some(v) => v, None => { signals.push(Signal::Hold); continue; } };
-            let ma200  = match ma200_col.get(i) { Some(v) => v, None => { signals.push(Signal::Hold); continue; } };
-
-            // ──── 买入：四条件全部满足 ────
-            if shares < 1.0 {
-                let cond1 = rsi_now < 30.0;                          // 深度超卖
-                let cond2 = rsi_now < rsi_1 && rsi_1 < rsi_2;       // 连续第三天走低
-                let cond3 = rsi_3 < 60.0;                            // 三日前RSI < 60
-                let cond4 = close > ma200;                            // 站稳200日均线
-
-                if cond1 && cond2 && cond3 && cond4 {
-                    let buy_price = close * (1.0 + self.config.slippage_rate);
-                    let invest = cash.min(self.config.initial_capital * self.config.max_position_pct);
-                    let buy_shares = (invest / buy_price).floor();
-                    if buy_shares > 0.0 {
-                        let amount = buy_shares * buy_price;
-                        let comm = amount * self.config.commission_rate;
-                        cash -= amount + comm;
-                        avg_cost = (avg_cost * shares + amount) / (shares + buy_shares);
-                        shares += buy_shares;
-                        trades.push(Trade {
-                            date: dt, code: code.to_string(), name: name.to_string(),
-                            action: TradeAction::Buy, shares: buy_shares,
-                            price: buy_price, amount, commission: comm,
-                        });
-                        signals.push(Signal::Buy);
-                        continue;
-                    }
-                }
-            }
-
-            // ──── 卖出：5日RSI向上突破50 ────
-            if shares > 0.0 {
-                // 突破：前一日 < 50，当日 >= 50
-                let cross_above_50 = rsi_1 < 50.0 && rsi_now >= 50.0;
-                if cross_above_50 {
-                    let sell_price = close * (1.0 - self.config.slippage_rate);
-                    let amount = shares * sell_price;
-                    let comm = amount * self.config.commission_rate;
-                    cash += amount - comm;
-                    trades.push(Trade {
-                        date: dt, code: code.to_string(), name: name.to_string(),
-                        action: TradeAction::Sell, shares,
-                        price: sell_price, amount, commission: comm,
-                    });
-                    shares = 0.0;
-                    avg_cost = 0.0;
-                    signals.push(Signal::Sell);
-                    continue;
-                }
-            }
-
-            signals.push(Signal::Hold);
-        }
-
-        let final_close = close_col.get(n.saturating_sub(1)).unwrap_or(0.0);
-        let final_value = cash + shares * final_close;
-
-        Ok(SinglePrecisionRsiResult {
-            code: code.to_string(),
-            name: name.to_string(),
-            initial_capital: self.config.initial_capital,
-            final_value,
-            trades,
-            daily_values,
-            signals,
-            rsi5_values: rsi5_vec,
-        })
-    }
-
-    /// 对多只股票批量回测，汇总为组合结果
-    pub fn run_portfolio(
-        &self,
-        stocks: &[(String, String, Vec<KlineData>)],
-    ) -> Result<PrecisionRsiResult> {
-        if stocks.is_empty() {
-            anyhow::bail!("股票列表为空");
-        }
-
-        let mut all_single: Vec<SinglePrecisionRsiResult> = Vec::new();
-        for (code, name, klines) in stocks {
-            let mut sorted = klines.clone();
-            sorted.sort_by(|a, b| a.date.cmp(&b.date));
-
-            if sorted.len() < 205 {
-                warn!("[{}] K线不足205条，跳过精准RSI回测（当前{}条）", code, sorted.len());
-                continue;
-            }
-
-            match self.run_single(code, name, &sorted) {
-                Ok(r) => {
-                    info!(
-                        "[{}] 精准RSI回测完成: 收益 {:.2}%, 交易 {} 次",
-                        code,
-                        (r.final_value / r.initial_capital - 1.0) * 100.0,
-                        r.trades.len()
-                    );
-                    all_single.push(r);
-                }
-                Err(e) => warn!("[{}] 精准RSI回测失败: {}", code, e),
-            }
-        }
-
-        if all_single.is_empty() {
-            anyhow::bail!("无有效精准RSI回测结果");
-        }
-
-        let (portfolio_daily_values, portfolio_trades) = {
-            let mut date_set: BTreeSet<String> = BTreeSet::new();
-            for r in &all_single {
-                for (dt, _) in &r.daily_values {
-                    date_set.insert(dt.format("%Y-%m-%d").to_string());
-                }
-            }
-            let maps: Vec<HashMap<String, f64>> = all_single.iter()
-                .map(|r| r.daily_values.iter().map(|(dt, v)| (dt.format("%Y-%m-%d").to_string(), *v)).collect())
-                .collect();
-            let total_initial = self.config.initial_capital * all_single.len() as f64;
-            let mut pv: Vec<(chrono::DateTime<Local>, f64)> = date_set.iter().map(|ds| {
-                let naive = NaiveDate::parse_from_str(ds, "%Y-%m-%d")
-                    .unwrap_or_else(|_| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
-                let dt = Local.from_local_datetime(&naive.and_hms_opt(15, 0, 0).unwrap())
-                    .single().unwrap_or_else(|| Local::now());
-                let sum: f64 = maps.iter().map(|m| m.get(ds).copied().unwrap_or(self.config.initial_capital)).sum();
-                (dt, sum)
-            }).collect();
-            if let Some(&(_, first_val)) = pv.first() {
-                if first_val > 0.0 {
-                    let scale = total_initial / first_val;
-                    for (_, v) in pv.iter_mut() { *v *= scale; }
-                }
-            }
-            let mut all_trades: Vec<Trade> = all_single.iter().flat_map(|r| r.trades.clone()).collect();
-            all_trades.sort_by_key(|t| t.date);
-            (pv, all_trades)
-        };
-
-        Ok(PrecisionRsiResult {
-            config: self.config.clone(),
-            single_results: all_single,
-            portfolio_daily_values,
-            portfolio_trades,
-        })
-    }
-}
-
-/// `KlineStrategy` 包装，使精准RSI策略可注入 `HybridStrategy`
-pub struct PrecisionRsiStrategy {
-    backtest: PrecisionRsiBacktest,
-}
-
-impl PrecisionRsiStrategy {
-    pub fn new(config: PrecisionRsiConfig) -> Self {
-        Self { backtest: PrecisionRsiBacktest::new(config) }
-    }
-}
-
-impl Default for PrecisionRsiStrategy {
-    fn default() -> Self { Self::new(PrecisionRsiConfig::default()) }
-}
-
-impl KlineStrategy for PrecisionRsiStrategy {
-    fn name(&self) -> &'static str { "精准RSI深度超卖均值回归" }
-
-    fn description(&self) -> &'static str {
-        "5日RSI<30+连续三日走低+三日前RSI<60+价格>MA200 买入；5日RSI上穿50 卖出"
-    }
-
-    fn run_portfolio_boxed(
-        &self,
-        stocks: &[(String, String, Vec<KlineData>)],
-    ) -> Result<Box<dyn StrategyResult>> {
-        let result = self.backtest.run_portfolio(stocks)?;
-        Ok(Box::new(result))
-    }
-}
 
 // ────────────────────────────── 回测引擎 ──────────────────────────────
 
@@ -1082,6 +624,8 @@ impl RsiBacktest {
         let mut signals: Vec<Signal> = Vec::with_capacity(n);
         let mut rsi_values: Vec<Option<f64>> = Vec::with_capacity(n);
         let mut bars_since_sell: usize = usize::MAX; // 卖出后冷却计数
+        let mut bars_held: usize = 0; // 当前持仓 K 线数
+        let mut min_rsi_in_pos: f64 = f64::MAX; // 持仓期间的最低 RSI（用于分档加仓判定）
 
         for i in 0..n {
             let close = match close_col.get(i) {
@@ -1183,14 +727,86 @@ impl RsiBacktest {
                 }
             }
 
-            // 评分通过条件：至少满足 min_buy_filters 个（若无启用过滤器则自动通过）
-            let filters_ok = buy_filter_total == 0 || buy_filter_score >= self.config.min_buy_filters;
+            // 评分通过条件：
+            //   - require_all_filters=true：所有启用的过滤器都必须通过
+            //   - 否则：至少满足 min_buy_filters 个（若无启用过滤器则自动通过）
+            let filters_ok = if buy_filter_total == 0 {
+                true
+            } else if self.config.require_all_filters {
+                buy_filter_score >= buy_filter_total
+            } else {
+                buy_filter_score >= self.config.min_buy_filters
+            };
 
             // 冷却期检查
             let cooldown_ok = bars_since_sell >= self.config.cooldown_bars;
 
-            // ──── 买入：RSI 超卖 + 趋势 + 过滤器 + 冷却期 + RSI 分档加仓 ────
-            if rsi < self.config.oversold && shares < 1.0 && uptrend && filters_ok && cooldown_ok {
+            // RSI 回升确认：要求最近 N 根 K 线 RSI 递增（过滤"接飞刀"）
+            let rsi_rising_ok = if self.config.rsi_rising_confirm_bars == 0 {
+                true
+            } else {
+                let bars = self.config.rsi_rising_confirm_bars;
+                if i < bars {
+                    false
+                } else {
+                    let mut rising = true;
+                    for k in 0..bars {
+                        let cur = rsi_col.get(i - k);
+                        let prev = rsi_col.get(i - k - 1);
+                        match (cur, prev) {
+                            (Some(c), Some(p)) if c > p => continue,
+                            _ => {
+                                rising = false;
+                                break;
+                            }
+                        }
+                    }
+                    rising
+                }
+            };
+
+            // 更新持仓追踪字段
+            if shares > 0.0 {
+                bars_held += 1;
+                if rsi < min_rsi_in_pos {
+                    min_rsi_in_pos = rsi;
+                }
+            }
+
+            // ──── 止损 / 止盈（最高优先级，绕过 min_hold 与其他过滤） ────
+            if shares > 0.0 && avg_cost > 0.0 {
+                let pnl_pct = (close - avg_cost) / avg_cost;
+                let hit_stop = self.config.stop_loss_pct > 0.0
+                    && pnl_pct <= -self.config.stop_loss_pct;
+                let hit_tp = self.config.take_profit_pct > 0.0
+                    && pnl_pct >= self.config.take_profit_pct;
+                if hit_stop || hit_tp {
+                    let sell_price = close * (1.0 - self.config.slippage_rate);
+                    let amount = shares * sell_price;
+                    let comm = amount * self.config.commission_rate;
+                    cash += amount - comm;
+                    trades.push(Trade {
+                        date: dt,
+                        code: code.to_string(),
+                        name: name.to_string(),
+                        action: TradeAction::Sell,
+                        shares,
+                        price: sell_price,
+                        amount,
+                        commission: comm,
+                    });
+                    shares = 0.0;
+                    avg_cost = 0.0;
+                    bars_since_sell = 0;
+                    bars_held = 0;
+                    min_rsi_in_pos = f64::MAX;
+                    signals.push(Signal::Sell);
+                    continue;
+                }
+            }
+
+            // ──── 买入：RSI 超卖 + 趋势 + 过滤器 + 冷却期（空仓首次建仓） ────
+            if rsi < self.config.oversold && shares < 1.0 && uptrend && filters_ok && cooldown_ok && rsi_rising_ok {
                 // P2: RSI 分档决定仓位比例 — RSI 越低仓位越重
                 let position_pct = if rsi < 15.0 {
                     0.70_f64.min(self.config.max_position_pct * 2.0)
@@ -1208,6 +824,8 @@ impl RsiBacktest {
                     cash -= amount + comm;
                     avg_cost = (avg_cost * shares + amount) / (shares + buy_shares);
                     shares += buy_shares;
+                    bars_held = 0;
+                    min_rsi_in_pos = rsi;
                     trades.push(Trade {
                         date: dt,
                         code: code.to_string(),
@@ -1223,8 +841,40 @@ impl RsiBacktest {
                 }
             }
 
+            // ──── 分档加仓：持仓中 RSI 继续下探到新低 `add_on_rsi_delta` 以上 ────
+            if self.config.add_on_rsi_delta > 0.0
+                && self.config.add_on_position_pct > 0.0
+                && shares > 0.0
+                && rsi < min_rsi_in_pos - self.config.add_on_rsi_delta
+                && cash > self.config.initial_capital * 0.05
+            {
+                let buy_price = close * (1.0 + self.config.slippage_rate);
+                let invest = cash.min(self.config.initial_capital * self.config.add_on_position_pct);
+                let add_shares = (invest / buy_price).floor();
+                if add_shares > 0.0 {
+                    let amount = add_shares * buy_price;
+                    let comm = amount * self.config.commission_rate;
+                    cash -= amount + comm;
+                    avg_cost = (avg_cost * shares + amount) / (shares + add_shares);
+                    shares += add_shares;
+                    min_rsi_in_pos = rsi;
+                    trades.push(Trade {
+                        date: dt,
+                        code: code.to_string(),
+                        name: name.to_string(),
+                        action: TradeAction::Buy,
+                        shares: add_shares,
+                        price: buy_price,
+                        amount,
+                        commission: comm,
+                    });
+                    signals.push(Signal::Buy);
+                    continue;
+                }
+            }
+
             // ──── 卖出：超买 / 均衡平仓 / MACD连续转空 / 跌破EMA+SMA ────
-            if shares > 0.0 {
+            if shares > 0.0 && bars_held >= self.config.min_hold_bars {
                 let mut should_sell = rsi > self.config.overbought
                     || (rsi >= self.config.exit_level && avg_cost > 0.0 && close > avg_cost);
 
@@ -1266,6 +916,8 @@ impl RsiBacktest {
                     shares = 0.0;
                     avg_cost = 0.0;
                     bars_since_sell = 0; // 重置冷却计数
+                    bars_held = 0;
+                    min_rsi_in_pos = f64::MAX;
                     signals.push(Signal::Sell);
                     continue;
                 }

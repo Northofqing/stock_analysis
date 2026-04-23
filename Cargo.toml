@@ -16,6 +16,10 @@ path = "src/main.rs"
 name = "lhb_query"
 path = "src/bin/lhb_query.rs"
 
+[[bin]]
+name = "rsi_optimize"
+path = "src/bin/rsi_optimize.rs"
+
 [dependencies]
 tokio = { version = "1.49.0", features = ["full", "rt"] }
 anyhow = "1.0.100"
