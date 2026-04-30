@@ -1,28 +1,125 @@
 //! AI 模型 HTTP 调用层（从 analyzer.rs 拆分）。
 //!
 //! 封装 Gemini / OpenAI 兼容 / 豆包 三家 API 的重试与故障转移逻辑。
+//! 支持 AgentMode（Quick / Deep）按 mode 路由到不同模型。
 
 use anyhow::{anyhow, Context, Result};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+use super::types::AgentMode;
 use super::GeminiAnalyzer;
 
 impl GeminiAnalyzer {
-    /// 调用 API（带重试和故障转移，使用默认系统提示词）
+    // ========== 模型选择 ==========
+
+    pub(super) fn gemini_model_for(&self, mode: AgentMode) -> String {
+        match mode {
+            AgentMode::Quick => self
+                .config
+                .gemini_quick_model
+                .clone()
+                .unwrap_or_else(|| self.current_model.borrow().clone()),
+            AgentMode::Deep => self
+                .config
+                .gemini_deep_model
+                .clone()
+                .unwrap_or_else(|| self.current_model.borrow().clone()),
+        }
+    }
+
+    pub(super) fn doubao_model_for(&self, mode: AgentMode) -> String {
+        match mode {
+            AgentMode::Quick => self
+                .config
+                .doubao_quick_model
+                .clone()
+                .unwrap_or_else(|| self.config.doubao_model.clone()),
+            AgentMode::Deep => self
+                .config
+                .doubao_deep_model
+                .clone()
+                .unwrap_or_else(|| self.config.doubao_model.clone()),
+        }
+    }
+
+    pub(super) fn openai_model_for(&self, mode: AgentMode) -> String {
+        match mode {
+            AgentMode::Quick => self
+                .config
+                .openai_quick_model
+                .clone()
+                .unwrap_or_else(|| self.config.openai_model.clone()),
+            AgentMode::Deep => self
+                .config
+                .openai_deep_model
+                .clone()
+                .unwrap_or_else(|| self.config.openai_model.clone()),
+        }
+    }
+
+    /// 是否在该 mode 下启用 thinking
+    pub(super) fn thinking_for(&self, mode: AgentMode) -> bool {
+        match mode {
+            AgentMode::Quick => false,
+            AgentMode::Deep => self.config.enable_thinking,
+        }
+    }
+
+    // ========== 调用入口 ==========
+
+    /// 调用 API（带重试和故障转移，使用默认系统提示词，Quick 模式）
     pub(super) async fn call_api_with_retry(&self, prompt: &str) -> Result<String> {
         self.call_api_with_retry_ex(prompt, Self::SYSTEM_PROMPT).await
     }
 
-    /// 调用 API（带重试和故障转移，自定义系统提示词）
-    pub(super) async fn call_api_with_retry_ex(&self, prompt: &str, system_prompt: &str) -> Result<String> {
+    /// 调用 API（带重试和故障转移，自定义系统提示词，Quick 模式 + 全局 thinking 配置）
+    ///
+    /// 兼容旧调用方：保持原有行为（按 enable_thinking 全局开关决定是否思考）。
+    pub(super) async fn call_api_with_retry_ex(
+        &self,
+        prompt: &str,
+        system_prompt: &str,
+    ) -> Result<String> {
+        // 兼容：旧入口默认 Quick 模式但 thinking 跟随全局配置
+        let thinking = self.config.enable_thinking;
+        self.call_api_internal(prompt, system_prompt, AgentMode::Quick, thinking)
+            .await
+    }
+
+    /// 调用 API（按 AgentMode 路由模型与 thinking 开关）
+    pub(super) async fn call_api_mode(
+        &self,
+        prompt: &str,
+        system_prompt: &str,
+        mode: AgentMode,
+    ) -> Result<String> {
+        let thinking = self.thinking_for(mode);
+        self.call_api_internal(prompt, system_prompt, mode, thinking)
+            .await
+    }
+
+    /// 内部统一调用：按 mode 选模型，按 thinking 开关推理。
+    async fn call_api_internal(
+        &self,
+        prompt: &str,
+        system_prompt: &str,
+        mode: AgentMode,
+        thinking: bool,
+    ) -> Result<String> {
         if self.use_doubao {
-            return self.call_doubao_api(prompt, system_prompt).await;
+            let model = self.doubao_model_for(mode);
+            return self
+                .call_doubao_api(prompt, system_prompt, &model, thinking)
+                .await;
         }
-        
+
         if self.use_openai {
-            return self.call_openai_api(prompt, system_prompt).await;
+            let model = self.openai_model_for(mode);
+            return self
+                .call_openai_api(prompt, system_prompt, &model, thinking)
+                .await;
         }
 
         let mut last_error = None;
@@ -35,13 +132,17 @@ impl GeminiAnalyzer {
                 tokio::time::sleep(Duration::from_secs_f64(delay)).await;
             }
 
-            match self.call_gemini_api(prompt, system_prompt).await {
+            let model = self.gemini_model_for(mode);
+            match self
+                .call_gemini_api(prompt, system_prompt, &model, thinking)
+                .await
+            {
                 Ok(response) => return Ok(response),
                 Err(e) => {
                     last_error = Some(e);
                     let error_str = last_error.as_ref().unwrap().to_string();
-                    
-                    let is_rate_limit = error_str.contains("429") 
+
+                    let is_rate_limit = error_str.contains("429")
                         || error_str.to_lowercase().contains("quota")
                         || error_str.to_lowercase().contains("rate");
 
@@ -52,7 +153,6 @@ impl GeminiAnalyzer {
                             self.config.max_retries
                         );
 
-                        // 切换到备选模型
                         if attempt >= self.config.max_retries / 2 && !*self.using_fallback.borrow() {
                             self.switch_to_fallback();
                         }
@@ -71,7 +171,11 @@ impl GeminiAnalyzer {
         // 尝试豆包作为第一备选
         if self.config.doubao_api_key.is_some() {
             warn!("[Gemini] 所有重试失败，切换到豆包 API");
-            match self.call_doubao_api(prompt, system_prompt).await {
+            let model = self.doubao_model_for(mode);
+            match self
+                .call_doubao_api(prompt, system_prompt, &model, thinking)
+                .await
+            {
                 Ok(response) => return Ok(response),
                 Err(doubao_error) => {
                     error!("[豆包] 备选 API 也失败: {}", doubao_error);
@@ -82,7 +186,11 @@ impl GeminiAnalyzer {
         // 尝试 OpenAI 作为最后的备选
         if self.config.openai_api_key.is_some() {
             warn!("[Gemini] 切换到 OpenAI 兼容 API");
-            match self.call_openai_api(prompt, system_prompt).await {
+            let model = self.openai_model_for(mode);
+            match self
+                .call_openai_api(prompt, system_prompt, &model, thinking)
+                .await
+            {
                 Ok(response) => return Ok(response),
                 Err(openai_error) => {
                     error!("[OpenAI] 备选 API 也失败: {}", openai_error);
@@ -94,7 +202,13 @@ impl GeminiAnalyzer {
     }
 
     /// 调用 Gemini API
-    async fn call_gemini_api(&self, prompt: &str, system_prompt: &str) -> Result<String> {
+    async fn call_gemini_api(
+        &self,
+        prompt: &str,
+        system_prompt: &str,
+        model: &str,
+        thinking: bool,
+    ) -> Result<String> {
         #[derive(Serialize)]
         struct GeminiRequest {
             contents: Vec<Content>,
@@ -122,6 +236,16 @@ impl GeminiAnalyzer {
         struct GenerationConfig {
             temperature: f32,
             max_output_tokens: u32,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            thinking_config: Option<ThinkingConfig>,
+        }
+
+        #[derive(Serialize)]
+        struct ThinkingConfig {
+            #[serde(rename = "thinkingBudget")]
+            thinking_budget: i32,
+            #[serde(rename = "includeThoughts")]
+            include_thoughts: bool,
         }
 
         #[derive(Deserialize)]
@@ -144,11 +268,15 @@ impl GeminiAnalyzer {
             text: String,
         }
 
-        let api_key = self.config.api_key.as_ref().ok_or_else(|| anyhow!("Gemini API Key 未配置"))?;
-        
+        let api_key = self
+            .config
+            .api_key
+            .as_ref()
+            .ok_or_else(|| anyhow!("Gemini API Key 未配置"))?;
+
         let url = format!(
             "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-            self.current_model.borrow(), api_key
+            model, api_key
         );
 
         let request = GeminiRequest {
@@ -165,6 +293,14 @@ impl GeminiAnalyzer {
             generation_config: GenerationConfig {
                 temperature: 0.7,
                 max_output_tokens: 8192,
+                thinking_config: if thinking {
+                    Some(ThinkingConfig {
+                        thinking_budget: -1,
+                        include_thoughts: false,
+                    })
+                } else {
+                    None
+                },
             },
         };
 
@@ -182,7 +318,8 @@ impl GeminiAnalyzer {
             return Err(anyhow!("HTTP {}: {}", status, error_text));
         }
 
-        let gemini_response: GeminiResponse = response.json().await.context("解析 Gemini 响应失败")?;
+        let gemini_response: GeminiResponse =
+            response.json().await.context("解析 Gemini 响应失败")?;
 
         gemini_response
             .candidates
@@ -193,13 +330,21 @@ impl GeminiAnalyzer {
     }
 
     /// 调用 OpenAI 兼容 API
-    async fn call_openai_api(&self, prompt: &str, system_prompt: &str) -> Result<String> {
+    async fn call_openai_api(
+        &self,
+        prompt: &str,
+        system_prompt: &str,
+        model: &str,
+        thinking: bool,
+    ) -> Result<String> {
         #[derive(Serialize)]
         struct OpenAIRequest {
             model: String,
             messages: Vec<Message>,
             temperature: f32,
             max_tokens: u32,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            reasoning_effort: Option<String>,
         }
 
         #[derive(Serialize)]
@@ -223,13 +368,21 @@ impl GeminiAnalyzer {
             content: String,
         }
 
-        let api_key = self.config.openai_api_key.as_ref().ok_or_else(|| anyhow!("OpenAI API Key 未配置"))?;
-        
-        let base_url = self.config.openai_base_url.as_deref().unwrap_or("https://api.openai.com/v1");
+        let api_key = self
+            .config
+            .openai_api_key
+            .as_ref()
+            .ok_or_else(|| anyhow!("OpenAI API Key 未配置"))?;
+
+        let base_url = self
+            .config
+            .openai_base_url
+            .as_deref()
+            .unwrap_or("https://api.openai.com/v1");
         let url = format!("{}/chat/completions", base_url);
 
         let request = OpenAIRequest {
-            model: self.config.openai_model.clone(),
+            model: model.to_string(),
             messages: vec![
                 Message {
                     role: "system".to_string(),
@@ -242,6 +395,11 @@ impl GeminiAnalyzer {
             ],
             temperature: 0.7,
             max_tokens: 8192,
+            reasoning_effort: if thinking {
+                Some("high".to_string())
+            } else {
+                None
+            },
         };
 
         let response = self
@@ -259,7 +417,8 @@ impl GeminiAnalyzer {
             return Err(anyhow!("HTTP {}: {}", status, error_text));
         }
 
-        let openai_response: OpenAIResponse = response.json().await.context("解析 OpenAI 响应失败")?;
+        let openai_response: OpenAIResponse =
+            response.json().await.context("解析 OpenAI 响应失败")?;
 
         openai_response
             .choices
@@ -269,13 +428,27 @@ impl GeminiAnalyzer {
     }
 
     /// 调用豆包 (Doubao) API
-    async fn call_doubao_api(&self, prompt: &str, system_prompt: &str) -> Result<String> {
+    async fn call_doubao_api(
+        &self,
+        prompt: &str,
+        system_prompt: &str,
+        model: &str,
+        thinking: bool,
+    ) -> Result<String> {
         #[derive(Serialize)]
         struct DoubaoRequest {
             model: String,
             messages: Vec<Message>,
             temperature: f32,
             max_tokens: u32,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            thinking: Option<DoubaoThinking>,
+        }
+
+        #[derive(Serialize)]
+        struct DoubaoThinking {
+            #[serde(rename = "type")]
+            kind: String,
         }
 
         #[derive(Serialize)]
@@ -299,14 +472,21 @@ impl GeminiAnalyzer {
             content: String,
         }
 
-        let api_key = self.config.doubao_api_key.as_ref().ok_or_else(|| anyhow!("豆包 API Key 未配置"))?;
-        
-        let base_url = self.config.doubao_base_url.as_deref()
+        let api_key = self
+            .config
+            .doubao_api_key
+            .as_ref()
+            .ok_or_else(|| anyhow!("豆包 API Key 未配置"))?;
+
+        let base_url = self
+            .config
+            .doubao_base_url
+            .as_deref()
             .unwrap_or("https://ark.cn-beijing.volces.com/api/v3");
         let url = format!("{}/chat/completions", base_url);
 
         let request = DoubaoRequest {
-            model: self.config.doubao_model.clone(),
+            model: model.to_string(),
             messages: vec![
                 Message {
                     role: "system".to_string(),
@@ -319,9 +499,19 @@ impl GeminiAnalyzer {
             ],
             temperature: 0.7,
             max_tokens: 8192,
+            thinking: if thinking {
+                Some(DoubaoThinking {
+                    kind: "enabled".to_string(),
+                })
+            } else {
+                None
+            },
         };
 
-        info!("[豆包] 调用 API: {} (model: {})", url, self.config.doubao_model);
+        info!(
+            "[豆包] 调用 API: {} (model: {}, thinking: {})",
+            url, model, thinking
+        );
 
         let response = self
             .client
@@ -339,7 +529,8 @@ impl GeminiAnalyzer {
             return Err(anyhow!("HTTP {}: {}", status, error_text));
         }
 
-        let doubao_response: DoubaoResponse = response.json().await.context("解析豆包响应失败")?;
+        let doubao_response: DoubaoResponse =
+            response.json().await.context("解析豆包响应失败")?;
 
         doubao_response
             .choices
@@ -347,5 +538,4 @@ impl GeminiAnalyzer {
             .map(|c| c.message.content.clone())
             .ok_or_else(|| anyhow!("豆包返回空响应"))
     }
-
 }

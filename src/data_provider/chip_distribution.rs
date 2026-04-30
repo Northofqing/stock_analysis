@@ -294,25 +294,35 @@ pub fn format_for_prompt(chip: &ChipDistribution) -> String {
         "\n【筹码分布（近{}日，CYQ 衰减模型）{}】\n",
         chip.days_used, est_tag
     ));
+    // 以表格形式输出，方便 Markdown 渲染时统一为表格
+    s.push_str("指标 | 数值 | 解读\n");
     s.push_str(&format!(
-        "平均成本: ¥{:.2} | 主力成本(峰值): ¥{:.2} | 当前价: ¥{:.2}\n",
-        chip.avg_cost, chip.main_cost, chip.current_price
+        "平均成本 | ¥{:.2} | -\n",
+        chip.avg_cost
     ));
     s.push_str(&format!(
-        "获利盘比例: {:.1}% — {}\n",
+        "主力成本(峰值) | ¥{:.2} | -\n",
+        chip.main_cost
+    ));
+    s.push_str(&format!(
+        "当前价 | ¥{:.2} | -\n",
+        chip.current_price
+    ));
+    s.push_str(&format!(
+        "获利盘比例 | {:.1}% | {}\n",
         chip.profit_ratio * 100.0,
         profit_label
     ));
     s.push_str(&format!(
-        "90%成本区间: ¥{:.2} ~ ¥{:.2}（宽度 {:.1}%）\n",
+        "90%成本区间 | ¥{:.2} ~ ¥{:.2} | 宽度 {:.1}%\n",
         chip.p90_low, chip.p90_high, chip.concentration_90
     ));
     s.push_str(&format!(
-        "70%成本区间: ¥{:.2} ~ ¥{:.2}（宽度 {:.1}%）— {}\n",
+        "70%成本区间 | ¥{:.2} ~ ¥{:.2} | 宽度 {:.1}%，{}\n",
         chip.p70_low, chip.p70_high, chip.concentration_70, conc_label
     ));
     s.push_str(&format!(
-        "当前价相对主力成本: {:+.2}% — {}\n",
+        "现价/主力成本偏离 | {:+.2}% | {}\n",
         chip.price_vs_main_pct, pos_label
     ));
 

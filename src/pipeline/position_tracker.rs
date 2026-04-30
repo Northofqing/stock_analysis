@@ -8,6 +8,7 @@ use log::{info, warn};
 
 use crate::database::DatabaseManager;
 use crate::data_provider::KlineData;
+use crate::strategy::BollMacdAction;
 
 use super::AnalysisResult;
 
@@ -27,7 +28,7 @@ pub(super) fn track_position(code: &str, data: &[KlineData], result: &mut Analys
             result.position_return = Some(return_rate);
             result.position_quantity = Some(pos.quantity);
 
-            // ====== 四大铁律 ======
+            // ====== 四大铁律 + 布林上轨减仓 ======
             // 铁律1 止损：亏损 ≥ 8%
             let stop_loss = return_rate <= -8.0;
             // 铁律2 盈利<20% 绝不主动止盈（不触发卖出）
@@ -41,13 +42,22 @@ pub(super) fn track_position(code: &str, data: &[KlineData], result: &mut Analys
                 buy.map(|b| (now - b).num_days()).unwrap_or(0)
             };
             let timeout_loss = hold_days > 14 && return_rate < 0.0;
+            // 铁律5（新）布林上轨减仓：触上轨 + MACD 顶背离/红柱缩短/死叉
+            //   仅在已有浮盈（≥ 5%）且非首日时触发，避免短期假信号洗票
+            let bm_top_sell = matches!(
+                result.boll_macd.as_ref().map(|s| s.action),
+                Some(BollMacdAction::TopSell)
+            ) && return_rate >= 5.0
+                && hold_days >= 2;
 
-            let should_sell = stop_loss || profit_trend_exit || timeout_loss;
+            let should_sell = stop_loss || profit_trend_exit || timeout_loss || bm_top_sell;
             if should_sell {
                 let reason = if stop_loss {
                     "铁律1:止损(-8%)"
                 } else if profit_trend_exit {
                     "铁律3:跌破5日线止盈"
+                } else if bm_top_sell {
+                    "铁律5:布林上轨+MACD顶背离/红柱衰竭"
                 } else {
                     "铁律4:14天不涨换股"
                 };
@@ -79,9 +89,39 @@ pub(super) fn track_position(code: &str, data: &[KlineData], result: &mut Analys
             }
         }
         Ok(None) => {
-            let buy_triggered =
-                result.operation_advice.contains("买入") || result.contrarian_signal;
+            // ====== 买入触发逻辑（B 方案：布林+MACD 共振 + 反向信号）======
+            //
+            // 历史数据复盘（136 笔已平仓）显示 AI 评分严重反向：
+            //   - 评分 ≥ 80：胜率 0%；评分 70-79：胜率 13.9%；评分 60-69：胜率 19.2%
+            //   - 评分 < 40：胜率 50%（小样本），平均 +14.68%
+            // 因此放弃用 AI 评分作为买入触发，改用技术面共振：
+            //   1) 布林+MACD `BottomBuy` （触下轨 + 底背离 / 0 轴下绿柱缩短）
+            //   2) 布林+MACD `UptrendStart`（布林张口 + 0 轴上方金叉，主升浪）
+            //   3) Contrarian 反向信号（评分 < 40 + 超跌企稳）
+            // 误区拦截已下沉到 detect_boll_macd_signal —— 单纯触轨不会买。
+            let bm_action = result
+                .boll_macd
+                .as_ref()
+                .map(|s| s.action)
+                .unwrap_or(BollMacdAction::None);
+            let bm_reason = result
+                .boll_macd
+                .as_ref()
+                .map(|s| s.reason.clone())
+                .unwrap_or_default();
+
+            let bm_buy = bm_action.is_buy();
+            let buy_triggered = bm_buy || result.contrarian_signal;
+
             if !buy_triggered {
+                if result.operation_advice.contains("买入") {
+                    info!(
+                        "[{}] 跳过买入：AI 建议买入但布林+MACD 无共振信号（动作={}，评分={}）",
+                        code,
+                        bm_action.name(),
+                        result.sentiment_score
+                    );
+                }
                 return;
             }
             let today = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -95,18 +135,22 @@ pub(super) fn track_position(code: &str, data: &[KlineData], result: &mut Analys
             };
             match db.save_position(&new_position) {
                 Ok(_) => {
-                    let tag = if result.contrarian_signal
-                        && !result.operation_advice.contains("买入")
-                    {
-                        "反向信号"
-                    } else if result.contrarian_signal {
-                        "买入+反向"
+                    let tag = match (bm_action, result.contrarian_signal) {
+                        (BollMacdAction::UptrendStart, _) => "主升浪启动",
+                        (BollMacdAction::BottomBuy, _) => "下轨抄底",
+                        (_, true) => "反向信号",
+                        _ => "其他",
+                    };
+                    let extra = if !bm_reason.is_empty() {
+                        format!(" | {}", bm_reason)
+                    } else if let Some(r) = result.contrarian_reason.as_ref() {
+                        format!(" | {}", r)
                     } else {
-                        "买入信号"
+                        String::new()
                     };
                     info!(
-                        "[{}] 触发{}，模拟买入 1000 股 @ {:.2}",
-                        code, tag, current_price
+                        "[{}] 触发{}（AI 评分 {}），模拟买入 1000 股 @ {:.2}{}",
+                        code, tag, result.sentiment_score, current_price, extra
                     );
                     result.position_buy_price = Some(current_price);
                     result.position_buy_date = Some(today);

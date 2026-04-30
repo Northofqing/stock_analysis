@@ -94,6 +94,9 @@ pub struct AnalysisResult {
     /// 反向信号触发理由
     #[serde(default)]
     pub contrarian_reason: Option<String>,
+    /// 布林带 + MACD 共振信号（4 条规则：变盘/抄底/减仓/主升浪）
+    #[serde(default)]
+    pub boll_macd: Option<crate::strategy::BollMacdSignal>,
     /// 模拟持仓买入价格
     pub position_buy_price: Option<f64>,
     /// 模拟持仓买入日期
@@ -252,6 +255,36 @@ impl AnalysisPipeline {
         let sharpe_ratio = data.first().and_then(|d| d.sharpe_ratio);
         let mut trend_result = self.trend_analyzer.analyze_with_kline(data, code);
         trend_result.sharpe_ratio = sharpe_ratio;
+
+        // 1.5 布林带 + MACD 共振信号（4 条核心规则 + 反误区过滤）
+        // 把信号加成纳入 signal_score，并在评分理由/风险因素里记一笔
+        let bm = crate::strategy::detect_boll_macd_signal(data);
+        if bm.action != crate::strategy::BollMacdAction::None {
+            use crate::strategy::BollMacdAction;
+            let (delta, is_reason) = match bm.action {
+                BollMacdAction::UptrendStart => (12, true),  // 主升浪启动：强买
+                BollMacdAction::BottomBuy => (10, true),     // 下轨抄底：反转
+                BollMacdAction::PreReversal => (3, true),    // 准备变盘：中性提示
+                BollMacdAction::TopSell => (-15, false),     // 顶部减仓：强压评分
+                BollMacdAction::None => (0, true),
+            };
+            trend_result.signal_score = (trend_result.signal_score + delta).clamp(0, 100);
+            let line = format!("📊 BB+MACD: {} | {} ({:+})", bm.action.name(), bm.reason, delta);
+            if is_reason {
+                trend_result.signal_reasons.push(line);
+            } else {
+                trend_result.risk_factors.push(line);
+            }
+            // 评分跌破 65 分时降级买入信号（避免顶部 TopSell 仍报"买入"）
+            if matches!(bm.action, BollMacdAction::TopSell) {
+                use crate::trend_analyzer::BuySignal;
+                if matches!(trend_result.buy_signal, BuySignal::StrongBuy | BuySignal::Buy) {
+                    trend_result.buy_signal = BuySignal::Hold;
+                }
+            }
+            info!("[{}] 📊 布林+MACD 信号: {} | {} | 评分调整 {:+}", code, bm.action.name(), bm.reason, delta);
+        }
+
         info!(
             "[{}] 趋势: {}, 买入信号: {}, 评分: {}",
             code, trend_result.trend_status, trend_result.buy_signal, trend_result.signal_score
@@ -273,7 +306,7 @@ impl AnalysisPipeline {
         let news_context = if self.use_news_search {
             let search_service = get_search_service();
             match tokio::time::timeout(
-                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(3),
                 search_service.search_stock_news(code, &stock_name, 3),
             )
             .await
@@ -302,7 +335,14 @@ impl AnalysisPipeline {
         // 5. AI 增强分析
         if let Some(ref ai) = self.ai_analyzer {
             match ai
-                .analyze_stock_with_extras(code, data, macro_context, extra_context.as_deref())
+                .analyze_stock_with_extras(
+                    code,
+                    Some(stock_name.as_str()),
+                    data,
+                    macro_context,
+                    extra_context.as_deref(),
+                    news_context.as_deref(),
+                )
                 .await
             {
                 Ok(ai_result) => {
@@ -378,6 +418,7 @@ impl AnalysisPipeline {
             is_limit_up: self.limit_up_codes.contains(code),
             contrarian_signal: false,
             contrarian_reason: None,
+            boll_macd: Some(bm),
             position_buy_price: None,
             position_buy_date: None,
             position_return: None,
@@ -460,9 +501,15 @@ impl AnalysisPipeline {
             result.contrarian_signal = true;
             result.contrarian_reason = Some(contrarian.reason);
         }
+        // 注：布林+MACD 共振信号已在 analyze_stock 中提前检测并影响 signal_score
 
-        // 4. 模拟持仓跟踪 & 四大铁律
-        position_tracker::track_position(&code, &data, &mut result);
+        // 4. 模拟持仓跟踪 & 四大铁律（受 POSITION_TRACKING_ENABLED 控制，默认开启）
+        let position_tracking_enabled = std::env::var("POSITION_TRACKING_ENABLED")
+            .map(|v| v.to_lowercase() != "false")
+            .unwrap_or(true);
+        if position_tracking_enabled {
+            position_tracker::track_position(&code, &data, &mut result);
+        }
 
         // 5. 保存分析结果到数据库
         position_tracker::save_analysis_result(&code, &data, &result);

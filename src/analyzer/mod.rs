@@ -14,12 +14,13 @@
 //! - Gemini - Google AI模型
 
 mod analyze;
+mod agents;
 mod client;
 mod macro_rec;
 mod prompts;
 mod types;
 
-pub use types::{AnalysisResult, GeminiConfig};
+pub use types::{AgentMode, AnalysisResult, GeminiConfig};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -68,7 +69,7 @@ pub struct GeminiAnalyzer {
 
 impl GeminiAnalyzer {
     /// 系统提示词 - 决策仪表盘 v2.0
-    pub(super) const SYSTEM_PROMPT: &'static str = r#"你是一位专注于趋势交易的 A 股投资分析师，负责生成专业的【决策仪表盘】分析报告。
+    pub(super) const SYSTEM_PROMPT: &'static str = r#"你现在是一位有着20年A股经验的资深技术分析师，同时结合宏观分析研究员的政策解读，负责生成专业的【决策仪表盘】分析报告。
 
 ## 核心交易理念（必须严格遵守）
 
@@ -172,7 +173,7 @@ impl GeminiAnalyzer {
 - 消息面/板块联动（10分）：明确利好+板块共振满分，中性5分，利空0分"#;
 
     /// 文本分析专用系统提示词（analyze_stock 使用，输出自然语言而非 JSON）
-    pub(super) const TEXT_SYSTEM_PROMPT: &'static str = r#"你是一位专注于趋势交易的 A 股投资分析师，擅长结合技术面、基本面、主力资金动向和宏观消息面进行综合研判。
+    pub(super) const TEXT_SYSTEM_PROMPT: &'static str = r#"你现在是一位有着20年A股经验的资深技术分析师，同时结合宏观分析研究员的政策解读，擅长结合技术面、基本面、主力资金动向和宏观消息面进行综合研判。
 
 ## 核心交易理念（必须严格遵守）
 
@@ -301,6 +302,39 @@ impl GeminiAnalyzer {
         let doubao_model = std::env::var("DOUBAO_MODEL")
             .unwrap_or_else(|_| "ep-20241230184254-j6pvd".to_string());
 
+        // AI 深度思考（reasoning / thinking）开关
+        let enable_thinking = std::env::var("AI_DEEP_THINKING")
+            .ok()
+            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+
+        // 多 Agent 流水线总开关（默认开启）
+        let agent_pipeline = std::env::var("AI_AGENT_PIPELINE")
+            .ok()
+            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(true);
+
+        // quick / deep 模型覆盖（不设则使用主模型）
+        let gemini_quick_model = std::env::var("AI_QUICK_MODEL").ok();
+        let gemini_deep_model = std::env::var("AI_DEEP_MODEL").ok();
+        let doubao_quick_model = std::env::var("DOUBAO_QUICK_MODEL").ok();
+        let doubao_deep_model = std::env::var("DOUBAO_DEEP_MODEL").ok();
+        let openai_quick_model = std::env::var("OPENAI_QUICK_MODEL").ok();
+        let openai_deep_model = std::env::var("OPENAI_DEEP_MODEL").ok();
+
+        // 多空辩论轮数（1-3，默认 2）
+        let debate_rounds = std::env::var("AI_DEBATE_ROUNDS")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(2)
+            .clamp(1, 3);
+
+        // Agent 追踪日志开关
+        let agent_trace = std::env::var("AI_AGENT_TRACE")
+            .ok()
+            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+
         let config = GeminiConfig {
             api_key,
             model_name,
@@ -314,6 +348,16 @@ impl GeminiAnalyzer {
             doubao_api_key,
             doubao_base_url,
             doubao_model,
+            enable_thinking,
+            agent_pipeline,
+            gemini_quick_model,
+            gemini_deep_model,
+            doubao_quick_model,
+            doubao_deep_model,
+            openai_quick_model,
+            openai_deep_model,
+            debate_rounds,
+            agent_trace,
         };
 
         Self::new(config)

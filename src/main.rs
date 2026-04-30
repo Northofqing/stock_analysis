@@ -19,17 +19,29 @@ use chrono::Local;
 use clap::Parser;
 use env_logger::Env;
 use log::{error, info};
+use std::io::Write;
 
 fn main() -> Result<()> {
     dotenv::dotenv().ok();
     let args = cli::Args::parse();
 
-    // 日志初始化
+    // 日志初始化（时间戳使用本地时区）
     let default_level = if args.debug { "debug" } else { "info" };
     if std::env::var("RUST_LOG").unwrap_or_default().is_empty() {
         std::env::set_var("RUST_LOG", default_level);
     }
-    env_logger::Builder::from_env(Env::default().default_filter_or(default_level)).init();
+    env_logger::Builder::from_env(Env::default().default_filter_or(default_level))
+        .format(|buf, record| {
+            writeln!(
+                buf,
+                "[{} {} {}] {}",
+                Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+                record.level(),
+                record.target(),
+                record.args()
+            )
+        })
+        .init();
 
     info!("============================================================");
     info!("A股自选股智能分析系统 启动");

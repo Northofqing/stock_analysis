@@ -77,8 +77,11 @@ pub fn build_stock_list(args: &Args) -> Result<(Vec<String>, HashSet<String>, St
             .collect()
     };
 
-    // 2. 宏观 AI 推荐
-    let macro_news_context = {
+    // 2. 宏观 AI 推荐（受 MACRO_AI_ENABLED 控制，默认开启）
+    let macro_ai_enabled = std::env::var("MACRO_AI_ENABLED")
+        .map(|v| v.to_lowercase() != "false")
+        .unwrap_or(true);
+    let macro_news_context = if macro_ai_enabled {
         let runtime = tokio::runtime::Runtime::new()?;
         let (extra_codes, macro_text) = runtime.block_on(fetch_macro_recommended_codes());
         if !extra_codes.is_empty() {
@@ -95,16 +98,41 @@ pub fn build_stock_list(args: &Args) -> Result<(Vec<String>, HashSet<String>, St
             );
         }
         macro_text
+    } else {
+        info!("⚙️ MACRO_AI_ENABLED=false：跳过宏观 AI 新闻分析与推荐");
+        String::new()
     };
 
-    // 3. 龙虎榜 Top 10
-    append_lhb_top10(&mut stock_codes)?;
+    // 3. 龙虎榜 Top 10（受 LHB_APPEND_ENABLED 控制，默认开启）
+    let lhb_append_enabled = std::env::var("LHB_APPEND_ENABLED")
+        .map(|v| v.to_lowercase() != "false")
+        .unwrap_or(true);
+    if lhb_append_enabled {
+        append_lhb_top10(&mut stock_codes)?;
+    } else {
+        info!("⚙️ LHB_APPEND_ENABLED=false：跳过龙虎榜 Top10 追加");
+    }
 
-    // 4. 涨停股票
-    let limit_up_codes = append_limit_up(&mut stock_codes);
+    // 4. 涨停股票（受 LIMIT_UP_APPEND_ENABLED 控制，默认开启）
+    let limit_up_append_enabled = std::env::var("LIMIT_UP_APPEND_ENABLED")
+        .map(|v| v.to_lowercase() != "false")
+        .unwrap_or(true);
+    let limit_up_codes = if limit_up_append_enabled {
+        append_limit_up(&mut stock_codes)
+    } else {
+        info!("⚙️ LIMIT_UP_APPEND_ENABLED=false：跳过当日涨停追加");
+        HashSet::new()
+    };
 
-    // 5. 持仓股票
-    append_open_positions(&mut stock_codes);
+    // 5. 持仓股票（受 POSITION_TRACKING_ENABLED 控制，默认开启）
+    let position_tracking_enabled = std::env::var("POSITION_TRACKING_ENABLED")
+        .map(|v| v.to_lowercase() != "false")
+        .unwrap_or(true);
+    if position_tracking_enabled {
+        append_open_positions(&mut stock_codes);
+    } else {
+        info!("⚙️ POSITION_TRACKING_ENABLED=false：跳过持仓追加与持仓跟踪");
+    }
 
     if stock_codes.is_empty() {
         info!("⚠️ 未配置自选股列表且宏观AI未推荐股票，将仅执行大盘复盘");

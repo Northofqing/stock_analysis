@@ -395,9 +395,42 @@ impl NotificationService {
             if let Some(mf) = &result.money_flow_section {
                 if !mf.trim().is_empty() {
                     lines.push("#### 💰 资金面（真实口径）".to_string());
-                    lines.push("```".to_string());
-                    lines.push(mf.trim().to_string());
-                    lines.push("```".to_string());
+                    lines.push(String::new());
+                    lines.extend(format_money_flow_section(mf));
+                    lines.push(String::new());
+                }
+            }
+
+            // 布林+MACD 共振信号（4 条核心规则）
+            if let Some(bm) = &result.boll_macd {
+                if bm.action != crate::strategy::BollMacdAction::None {
+                    lines.push("#### 📊 布林+MACD 共振信号".to_string());
+                    lines.push(String::new());
+                    lines.push("| 项目 | 数值 | 说明 |".to_string());
+                    lines.push("|------|------|------|".to_string());
+                    let icon = if bm.action.is_buy() {
+                        "🟢"
+                    } else if bm.action.is_sell() {
+                        "🔴"
+                    } else {
+                        "🟡"
+                    };
+                    lines.push(format!(
+                        "| 信号动作 | {} {} | {} |",
+                        icon, bm.action.name(), bm.reason
+                    ));
+                    lines.push(format!(
+                        "| 布林轨道 | 上 ¥{:.2} / 中 ¥{:.2} / 下 ¥{:.2} | 收 ¥{:.2} |",
+                        bm.upper, bm.middle, bm.lower, bm.close
+                    ));
+                    lines.push(format!(
+                        "| 带宽 | {:.2}% | 5日变化 {:+.2}%（>0张口/<0收口） |",
+                        bm.band_width_pct, bm.band_change_pct
+                    ));
+                    lines.push(format!(
+                        "| MACD | DIF {:.3} / DEA {:.3} / HIST {:.3} | 背离: {:?} |",
+                        bm.macd_dif, bm.macd_dea, bm.macd_hist, bm.macd_div
+                    ));
                     lines.push(String::new());
                 }
             }
@@ -547,4 +580,82 @@ impl NotificationService {
         lines.join("\n")
     }
 
+}
+
+/// 将 `extra_context` 输出的 `【段落】+ 文本` 片段格式化为与日报其它部分一致的 Markdown
+/// （子标题 + 表格 / 列表），避免使用代码块包裹原始文本。
+fn format_money_flow_section(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut blocks: Vec<(String, Vec<String>)> = Vec::new();
+    let mut cur_title: Option<String> = None;
+    let mut cur_body: Vec<String> = Vec::new();
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let (Some(start), Some(end)) = (trimmed.find('【'), trimmed.rfind('】')) {
+            if start == 0 && end + '】'.len_utf8() == trimmed.len() {
+                if let Some(title) = cur_title.take() {
+                    blocks.push((title, std::mem::take(&mut cur_body)));
+                }
+                let title = trimmed[start + '【'.len_utf8()..end].to_string();
+                cur_title = Some(title);
+                continue;
+            }
+        }
+        cur_body.push(trimmed.to_string());
+    }
+    if let Some(title) = cur_title.take() {
+        blocks.push((title, cur_body));
+    }
+
+    for (title, body) in blocks {
+        if body.is_empty() {
+            continue;
+        }
+        // 用加粗代替 H5，避免与 AI 综合分析正文里的 H1/H2 嵌套打架
+        out.push(format!("**{}**", title));
+        out.push(String::new());
+
+        // 通用表格识别：首行含 `|` 即视作表头，连续含 `|` 且列数一致的后续行视作数据行
+        let mut idx = 0;
+        if let Some(header) = body.first() {
+            if header.contains('|') {
+                let cols: Vec<&str> = header.split('|').map(|s| s.trim()).collect();
+                if cols.len() >= 2 && cols.iter().all(|c| !c.is_empty()) {
+                    out.push(format!("| {} |", cols.join(" | ")));
+                    out.push(format!(
+                        "|{}|",
+                        cols.iter().map(|_| "------").collect::<Vec<_>>().join("|")
+                    ));
+                    idx = 1;
+                    while idx < body.len() {
+                        let row = &body[idx];
+                        if !row.contains('|') {
+                            break;
+                        }
+                        let cells: Vec<&str> = row.split('|').map(|s| s.trim()).collect();
+                        if cells.len() != cols.len() {
+                            break;
+                        }
+                        out.push(format!("| {} |", cells.join(" | ")));
+                        idx += 1;
+                    }
+                    out.push(String::new());
+                }
+            }
+        }
+        for line in &body[idx..] {
+            out.push(format!("- {}", line));
+        }
+        out.push(String::new());
+    }
+
+    // 末尾留白由调用方控制，去掉尾部空行
+    while out.last().map(|s| s.is_empty()).unwrap_or(false) {
+        out.pop();
+    }
+    out
 }

@@ -652,67 +652,6 @@ RUST_LOG=error cargo run
 RUST_LOG=stock_analysis::search_service=debug cargo run
 ```
 
-## Python vs Rust 迁移指南
-
-### 主要差异
-
-| Python | Rust |
-|--------|------|
-| `dict` | `HashMap` |
-| `list` | `Vec` |
-| `None` | `Option<T>` |
-| `try/except` | `Result<T, E>` |
-| `async def` | `async fn` |
-| `self` | `&self` / `&mut self` |
-
-### 异步代码
-
-Python:
-```python
-async def search():
-    result = await api.call()
-    return result
-```
-
-Rust:
-```rust
-async fn search() -> Result<Response> {
-    let result = api.call().await?;
-    Ok(result)
-}
-```
-
-### 错误处理
-
-Python:
-```python
-try:
-    result = risky_operation()
-except Exception as e:
-    handle_error(e)
-```
-
-Rust:
-```rust
-match risky_operation() {
-    Ok(result) => use_result(result),
-    Err(e) => handle_error(e),
-}
-
-// 或使用 ?
-let result = risky_operation()?;
-```
-
-## 贡献指南
-
-欢迎贡献代码！请遵循以下步骤：
-
-1. Fork 本仓库
-2. 创建特性分支 (`git checkout -b feature/AmazingFeature`)
-3. 提交更改 (`git commit -m 'Add some AmazingFeature'`)
-4. 推送到分支 (`git push origin feature/AmazingFeature`)
-5. 开启 Pull Request
-
 ## License
 
 MIT

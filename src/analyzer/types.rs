@@ -164,6 +164,37 @@ pub struct GeminiConfig {
     pub doubao_api_key: Option<String>,
     pub doubao_base_url: Option<String>,
     pub doubao_model: String,
+    /// 是否启用 AI 深度思考（reasoning / thinking 模式）
+    pub enable_thinking: bool,
+
+    // ========== 多 Agent 流水线配置 ==========
+    /// 多 Agent 流水线总开关（AI_AGENT_PIPELINE）
+    pub agent_pipeline: bool,
+    /// quick 模式下 Gemini 模型名（不设则用 model_name）
+    pub gemini_quick_model: Option<String>,
+    /// deep 模式下 Gemini 模型名（不设则用 model_name）
+    pub gemini_deep_model: Option<String>,
+    /// quick 模式下豆包模型名（不设则用 doubao_model）
+    pub doubao_quick_model: Option<String>,
+    /// deep 模式下豆包模型名（不设则用 doubao_model）
+    pub doubao_deep_model: Option<String>,
+    /// quick 模式下 OpenAI 模型名（不设则用 openai_model）
+    pub openai_quick_model: Option<String>,
+    /// deep 模式下 OpenAI 模型名（不设则用 openai_model）
+    pub openai_deep_model: Option<String>,
+    /// 多空辩论轮数（AI_DEBATE_ROUNDS, 1-3, 默认 2）
+    pub debate_rounds: u32,
+    /// Agent 追踪日志开关（AI_AGENT_TRACE）
+    pub agent_trace: bool,
+}
+
+/// Agent 调用模式：决定使用哪个模型以及是否启用深度思考。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentMode {
+    /// 快速任务：单项分析、汇总子项。低延迟、不启用思考。
+    Quick,
+    /// 深度任务：多空辩论、仲裁决策。启用思考（如配置）。
+    Deep,
 }
 
 impl Default for GeminiConfig {
@@ -181,6 +212,16 @@ impl Default for GeminiConfig {
             doubao_api_key: None,
             doubao_base_url: Some("https://ark.cn-beijing.volces.com/api/v3".to_string()),
             doubao_model: "ep-20241230184254-j6pvd".to_string(),
+            enable_thinking: false,
+            agent_pipeline: true,
+            gemini_quick_model: None,
+            gemini_deep_model: None,
+            doubao_quick_model: None,
+            doubao_deep_model: None,
+            openai_quick_model: None,
+            openai_deep_model: None,
+            debate_rounds: 2,
+            agent_trace: false,
         }
     }
 }
