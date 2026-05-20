@@ -15,7 +15,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::data_provider::KlineData;
-use crate::indicators::{calc_macd, detect_divergence, DivergenceType};
+use crate::indicators::{calc_macd, detect_divergence, DivergenceType, MACD_FAST, MACD_SIGNAL, MACD_SLOW};
 
 /// 布林+MACD 综合信号建议动作
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +66,8 @@ pub struct BollMacdSignal {
     pub macd_dea: f64,
     pub macd_hist: f64,
     pub macd_div: DivergenceType,
+    /// 当日成交量 / 近 5 日（不含当日）均量。>1 为放量，<1 为缩量。
+    pub vol_ratio: f64,
 }
 
 impl BollMacdSignal {
@@ -83,6 +85,7 @@ impl BollMacdSignal {
             macd_dea: 0.0,
             macd_hist: 0.0,
             macd_div: DivergenceType::None,
+            vol_ratio: 0.0,
         }
     }
 }
@@ -97,6 +100,7 @@ pub fn detect_boll_macd_signal(data: &[KlineData]) -> BollMacdSignal {
 
     // 转为时间正序（最旧 → 最新）
     let closes: Vec<f64> = data.iter().rev().map(|k| k.close).collect();
+    let volumes: Vec<f64> = data.iter().rev().map(|k| k.volume).collect();
     let n = closes.len();
 
     // ============ 布林带 (20, 2σ) ============
@@ -127,8 +131,8 @@ pub fn detect_boll_macd_signal(data: &[KlineData]) -> BollMacdSignal {
         0.0
     };
 
-    // ============ MACD (12, 26, 9) ============
-    let macd = calc_macd(&closes, 12, 26, 9);
+    // ============ MACD (6, 13, 5) ============
+    let macd = calc_macd(&closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL);
     if macd.len() < 3 {
         return BollMacdSignal::empty();
     }
@@ -158,6 +162,18 @@ pub fn detect_boll_macd_signal(data: &[KlineData]) -> BollMacdSignal {
     let touch_lower = close <= lower * 1.01;
     let touch_upper = close >= upper * 0.99;
 
+    // 量价配合：当日成交量 vs 前 5 日均量（不含当日）
+    // >1 为放量，<1 为缩量。主升浪启动必须放量。
+    let vol_ratio = if n >= 6 {
+        let prev5: f64 = volumes[n - 6..n - 1].iter().sum::<f64>() / 5.0;
+        let today_vol = volumes[n - 1];
+        if prev5 > 0.0 { today_vol / prev5 } else { 0.0 }
+    } else {
+        0.0
+    };
+    /// 主升浪启动的放量阈值（1.2× 5 日均量）
+    const UPTREND_VOL_RATIO: f64 = 1.2;
+
     // 红柱缩短（连续 2 根减小，hist > 0）→ 顶部动能衰竭
     let hist_shrinking_red = m_pp.histogram > m_prev.histogram
         && m_prev.histogram > m.histogram
@@ -169,16 +185,17 @@ pub fn detect_boll_macd_signal(data: &[KlineData]) -> BollMacdSignal {
 
     // ============ 应用规则（优先级：强买 > 抄底 > 卖出 > 变盘提示）============
 
-    // 规则 4：主升浪启动（最强买点）
-    if expanding && above_zero && golden_cross {
+    // 规则 4：主升浪启动（最强买点，要求放量确认）
+    if expanding && above_zero && golden_cross && vol_ratio >= UPTREND_VOL_RATIO {
         return BollMacdSignal {
             action: BollMacdAction::UptrendStart,
             reason: format!(
-                "主升浪：布林张口({:+.1}%) + MACD 0 轴上方金叉 (DIF={:.3} DEA={:.3})",
-                band_change_pct, m.dif, m.dea
+                "主升浪：布林张口({:+.1}%) + MACD 0 轴上方金叉 (DIF={:.3} DEA={:.3}) + 放量({:.2}×)",
+                band_change_pct, m.dif, m.dea, vol_ratio
             ),
             close, upper, middle: mid, lower, band_width_pct, band_change_pct,
             macd_dif: m.dif, macd_dea: m.dea, macd_hist: m.histogram, macd_div: div,
+            vol_ratio,
         };
     }
 
@@ -199,6 +216,7 @@ pub fn detect_boll_macd_signal(data: &[KlineData]) -> BollMacdSignal {
             reason,
             close, upper, middle: mid, lower, band_width_pct, band_change_pct,
             macd_dif: m.dif, macd_dea: m.dea, macd_hist: m.histogram, macd_div: div,
+            vol_ratio,
         };
     }
 
@@ -224,6 +242,7 @@ pub fn detect_boll_macd_signal(data: &[KlineData]) -> BollMacdSignal {
             reason,
             close, upper, middle: mid, lower, band_width_pct, band_change_pct,
             macd_dif: m.dif, macd_dea: m.dea, macd_hist: m.histogram, macd_div: div,
+            vol_ratio,
         };
     }
 
@@ -237,6 +256,7 @@ pub fn detect_boll_macd_signal(data: &[KlineData]) -> BollMacdSignal {
             ),
             close, upper, middle: mid, lower, band_width_pct, band_change_pct,
             macd_dif: m.dif, macd_dea: m.dea, macd_hist: m.histogram, macd_div: div,
+            vol_ratio,
         };
     }
 
@@ -245,5 +265,6 @@ pub fn detect_boll_macd_signal(data: &[KlineData]) -> BollMacdSignal {
         reason: String::new(),
         close, upper, middle: mid, lower, band_width_pct, band_change_pct,
         macd_dif: m.dif, macd_dea: m.dea, macd_hist: m.histogram, macd_div: div,
+        vol_ratio,
     }
 }

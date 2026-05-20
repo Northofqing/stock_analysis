@@ -6,6 +6,7 @@
 mod backtest_runner;
 mod extra_context;
 mod macro_news;
+mod multi_timeframe;
 mod position_tracker;
 mod price_stats;
 mod reporting;
@@ -167,6 +168,17 @@ pub struct AnalysisPipeline {
     limit_up_codes: Arc<std::collections::HashSet<String>>,
 }
 
+/// 评分 → 操作建议（系统与 AI 共用同一档位表，避免两套标准）
+fn score_to_advice(score: i32) -> &'static str {
+    match score {
+        80..=100 => "强烈建议买入",
+        60..=79 => "建议买入",
+        40..=59 => "观望",
+        20..=39 => "建议减仓",
+        _ => "建议卖出",
+    }
+}
+
 impl AnalysisPipeline {
     /// 创建新的分析流程
     pub fn new(config: PipelineConfig) -> Result<Self> {
@@ -281,6 +293,10 @@ impl AnalysisPipeline {
                 if matches!(trend_result.buy_signal, BuySignal::StrongBuy | BuySignal::Buy) {
                     trend_result.buy_signal = BuySignal::Hold;
                 }
+                // 【核心修正】强制压低总评分，确保 score_to_advice 不会映射为"建议买入"
+                if trend_result.signal_score >= 60 {
+                    trend_result.signal_score = 55; // 压至“观望”及以下
+                }
             }
             info!("[{}] 📊 布林+MACD 信号: {} | {} | 评分调整 {:+}", code, bm.action.name(), bm.reason, delta);
         }
@@ -330,9 +346,42 @@ impl AnalysisPipeline {
         };
 
         // 4. 真实资金/分时/龙虎榜 + 筹码分布上下文（不管 AI 是否启用，都抓一次给通知展示）
-        let extra_context = extra_context::fetch_extra_context(code, data).await;
+        let mut extra_context = extra_context::fetch_extra_context(code, data).await;
 
-        // 5. AI 增强分析
+        // 4.5 多周期下钻（Multi-timeframe）：日线买入信号触发时，去 60min/15min 找精准入场点
+        let mtf_trigger = {
+            use crate::strategy::BollMacdAction;
+            use crate::trend_analyzer::BuySignal;
+            trend_result.signal_score >= 60
+                || matches!(
+                    bm.action,
+                    BollMacdAction::BottomBuy | BollMacdAction::UptrendStart
+                )
+                || matches!(trend_result.buy_signal, BuySignal::StrongBuy | BuySignal::Buy)
+        };
+        if mtf_trigger {
+            info!("[{}] 触发多周期下钻（60min/15min 寻找精准入场点）", code);
+            if let Some(mtf_section) = multi_timeframe::fetch_multi_timeframe_section(code).await {
+                extra_context = match extra_context {
+                    Some(mut s) => {
+                        s.push_str(&mtf_section);
+                        Some(s)
+                    }
+                    None => Some(mtf_section),
+                };
+            }
+        }
+
+        // 5. 评分→操作建议（与 AI 共用同一档位表）
+        let operation_advice = score_to_advice(trend_result.signal_score).to_string();
+        let tech_assessment = crate::analyzer::TechAssessment {
+            score: trend_result.signal_score,
+            advice: &operation_advice,
+            reasons: &trend_result.signal_reasons,
+            risks: &trend_result.risk_factors,
+        };
+
+        // 6. AI 增强分析（AI 与评分同一把尺子：评分明细 + 档位规则注入 prompt）
         if let Some(ref ai) = self.ai_analyzer {
             match ai
                 .analyze_stock_with_extras(
@@ -341,7 +390,8 @@ impl AnalysisPipeline {
                     data,
                     macro_context,
                     extra_context.as_deref(),
-                    news_context.as_deref(),
+                    news_context.as_deref(), 
+                    Some(&tech_assessment),
                 )
                 .await
             {
@@ -359,16 +409,6 @@ impl AnalysisPipeline {
             analysis_content.push_str("\n# 相关新闻\n\n");
             analysis_content.push_str(news);
         }
-
-        // 6. 操作建议
-        let operation_advice = match trend_result.signal_score {
-            80..=100 => "强烈建议买入",
-            60..=79 => "建议买入",
-            40..=59 => "观望",
-            20..=39 => "建议减仓",
-            _ => "建议卖出",
-        }
-        .to_string();
 
         // 7. 价格区间 / 近期统计
         let stats = price_stats::compute_price_stats(data);

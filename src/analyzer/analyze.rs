@@ -1,14 +1,10 @@
 //! 单股分析入口（从 analyzer.rs 拆分）。
 //!
-//! 负责 `analyze_stock` 与 `analyze` 两个对外方法。
+//! 仅保留 `analyze_stock` / `analyze_stock_with_extras` 两个对外方法。
 
 use anyhow::{anyhow, Result};
-use log::{debug, error, info};
-use serde_json::Value;
-use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use log::info;
 
-use super::types::AnalysisResult;
 use super::GeminiAnalyzer;
 
 impl GeminiAnalyzer {
@@ -19,11 +15,12 @@ impl GeminiAnalyzer {
         kline_data: &[crate::data_provider::KlineData],
         macro_context: Option<&str>,
     ) -> Result<String> {
-        self.analyze_stock_with_extras(code, None, kline_data, macro_context, None, None)
+        self.analyze_stock_with_extras(code, None, kline_data, macro_context, None, None, None)
             .await
     }
 
     /// 扩展版：允许调用方注入真实口径的资金流 / 分时 / 龙虎榜席位等额外 prompt 片段。
+    /// 当 `tech_assessment` 提供时，AI 必须按系统评分规则解释同一份评分（同一把尺子，不同表述）。
     pub async fn analyze_stock_with_extras(
         &self,
         code: &str,
@@ -32,16 +29,11 @@ impl GeminiAnalyzer {
         macro_context: Option<&str>,
         extra_context: Option<&str>,
         news_context: Option<&str>,
+        tech_assessment: Option<&crate::analyzer::TechAssessment<'_>>,
     ) -> Result<String> {
         if kline_data.is_empty() {
             return Err(anyhow!("数据为空"));
         }
-
-        // ========== 多 Agent 流水线已从个股分析中移除 ==========
-        // 多 Agent 模块（agents/）目前仅保留供新闻/宏观分析改造使用，
-        // 个股分析统一走下方单 prompt 模式，避免 6+ 次 LLM 调用带来的成本与失败率。
-        let _ = self.config.agent_pipeline; // 保留字段，避免破坏配置兼容
-        // 原 if self.config.agent_pipeline && self.is_available() { run_text_pipeline... } 已删除
 
         // 构建简化的分析上下文
         let latest = &kline_data[0];
@@ -362,148 +354,56 @@ impl GeminiAnalyzer {
             _ => String::new(),
         };
 
+        // 系统技术评分（与 AI 共用同一把尺子）
+        let rubric_section = match tech_assessment {
+            Some(ta) => {
+                let reasons = if ta.reasons.is_empty() {
+                    "（无显著加分项）".to_string()
+                } else {
+                    ta.reasons.iter().map(|s| format!("  · {}", s)).collect::<Vec<_>>().join("\n")
+                };
+                let risks = if ta.risks.is_empty() {
+                    "（无显著扣分项）".to_string()
+                } else {
+                    ta.risks.iter().map(|s| format!("  · {}", s)).collect::<Vec<_>>().join("\n")
+                };
+                format!(
+                    "\n\n[系统技术评分 - 你与系统共用同一把尺子]\n\
+                    评分规则: 均线排列 35 + 乖离率 30 + 量能 20 + 动量指标 ±10 + 夏普 5 + 支撑位 10 ± BB+MACD 共振 ≤15，0-100。\n\
+                    档位规则: 80-100 强烈建议买入 | 60-79 建议买入 | 40-59 观望 | 20-39 建议减仓 | 0-19 建议卖出。\n\
+                    系统评分: {score}/100 → {advice}\n\
+                    评分加分项:\n{reasons}\n\
+                    评分扣分项:\n{risks}\n",
+                    score = ta.score,
+                    advice = ta.advice,
+                    reasons = reasons,
+                    risks = risks,
+                )
+            }
+            None => String::new(),
+        };
+
+        // 仅当注入了系统评分时，加严输出约束，确保 AI 与评分同一标准
+        let alignment_rules = if tech_assessment.is_some() {
+            "\n输出硬性约束（评分一致性）：\n\
+            1) 【技术面】必须按上文\"评分加分项/扣分项\"逐项复述，不得引入未在评分明细中的技术指标。\n\
+            2) 【操作建议】结论必须严格等于上文\"系统评分→档位\"映射，不得自行降档或升档。\n\
+            3) 【基本面】【主力资金】【宏观影响】仅作背景说明；若发现严重背离，写入【风险提示】，不得改变操作建议档位。\n\
+            4) 不要输出任何与系统评分相矛盾的总结性结论。\n"
+        } else { "" };
+
         let prompt = format!(
-            "请基于以下数据分析该股，按【宏观影响】【技术面】【主力资金】【基本面】【操作建议（含买入价/目标价/止损位）】【风险提示】六段输出，每段不超过 3 句。\n\
-            若上下文含【布林+MACD 共振信号】段：TopSell→不得建议买入，评分压在 50 以下；BottomBuy→可买入但仓位≤30%；UptrendStart→可加仓至 60%；PreReversal→仅观察。\n\n{}{}",
-            context,
-            macro_section
+            "请基于以下数据分析该股，仅输出【宏观影响】【技术面】【主力资金】【基本面】【操作建议（含买入价/目标价/止损位）】【风险提示】六段，每段不超过 3 句。\n\
+            输出格式约束：使用 Markdown 标题（##/###）、不要使用引号块、不要复述输入数据中的章节标题（例如\"系统技术评分\"\"宏观市场背景\"），仅输出六段中文段落，每段以【XX】开头。\n\
+            若上下文含【布林+MACD 共振信号】段：TopSell→不得建议买入，评分压在 50 以下；BottomBuy→可买入但仓位≤30%；UptrendStart→可加仓至 60%；PreReversal→仅观察。{alignment}\n\n{ctx}{rubric}{macro_}",
+            alignment = alignment_rules,
+            ctx = context,
+            rubric = rubric_section,
+            macro_ = macro_section
         );
 
-        // 调用API（使用文本分析专用系统提示词）
+        // 标准模式：单次 LLM 调用，不触发工具循环（深度多智能体走 deep_analyzer 路径）
+        info!(">>> [{}] 标准模式：单次 LLM 调用", code);
         self.call_api_with_retry_ex(&prompt, Self::TEXT_SYSTEM_PROMPT).await
     }
-
-    /// 分析单只股票
-    pub async fn analyze(
-        &mut self,
-        context: &HashMap<String, Value>,
-        news_context: Option<&str>,
-    ) -> AnalysisResult {
-        let code = context
-            .get("code")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Unknown")
-            .to_string();
-
-        // 获取股票名称
-        let name = self.get_stock_name(context, &code);
-
-        // 检查可用性
-        if !self.is_available() {
-            return AnalysisResult {
-                code,
-                name,
-                sentiment_score: 50,
-                trend_prediction: "震荡".to_string(),
-                operation_advice: "持有".to_string(),
-                confidence_level: "低".to_string(),
-                dashboard: None,
-                trend_analysis: String::new(),
-                short_term_outlook: String::new(),
-                medium_term_outlook: String::new(),
-                technical_analysis: String::new(),
-                ma_analysis: String::new(),
-                volume_analysis: String::new(),
-                pattern_analysis: String::new(),
-                fundamental_analysis: String::new(),
-                sector_position: String::new(),
-                company_highlights: String::new(),
-                news_summary: String::new(),
-                market_sentiment: String::new(),
-                hot_topics: String::new(),
-                analysis_summary: "AI 分析功能未启用（未配置 API Key）".to_string(),
-                key_points: String::new(),
-                risk_warning: "请配置 API Key 后重试".to_string(),
-                buy_reason: String::new(),
-                raw_response: None,
-                search_performed: false,
-                data_sources: String::new(),
-                success: false,
-                error_message: Some("API Key 未配置".to_string()),
-            };
-        }
-
-        // 请求前延迟
-        if self.config.request_delay > 0.0 {
-            debug!(
-                "[LLM] 请求前等待 {:.1} 秒...",
-                self.config.request_delay
-            );
-            tokio::time::sleep(Duration::from_secs_f64(self.config.request_delay)).await;
-        }
-
-        info!("========== AI 分析 {}({}) ==========", name, code);
-        info!("[LLM配置] 模型: {}", self.current_model.borrow());
-        info!(
-            "[LLM配置] 是否包含新闻: {}",
-            if news_context.is_some() { "是" } else { "否" }
-        );
-
-        // 多 Agent 流水线在 analyze_stock_with_extras 中处理。
-        // analyze() 仍走旧版单 prompt + JSON 结构化路径（用于历史调用方）。
-
-        // 旧版：单 Agent prompt
-        let prompt = self.format_prompt(context, &name, news_context);
-        info!("[LLM配置] Prompt 长度: {} 字符", prompt.len());
-
-        // 调用 API
-        let start_time = Instant::now();
-        match self.call_api_with_retry(&prompt).await {
-            Ok(response_text) => {
-                let elapsed = start_time.elapsed().as_secs_f64();
-                info!(
-                    "[LLM返回] API 响应成功, 耗时 {:.2}s, 响应长度 {} 字符",
-                    elapsed,
-                    response_text.len()
-                );
-
-                // 解析响应
-                let mut result = self.parse_response(&response_text, &code, &name);
-                result.raw_response = Some(response_text);
-                result.search_performed = news_context.is_some();
-
-                info!(
-                    "[LLM解析] {}({}) 分析完成: {}, 评分 {}",
-                    name, code, result.trend_prediction, result.sentiment_score
-                );
-
-                result
-            }
-            Err(e) => {
-                error!("AI 分析 {}({}) 失败: {}", name, code, e);
-                AnalysisResult {
-                    code,
-                    name,
-                    sentiment_score: 50,
-                    trend_prediction: "震荡".to_string(),
-                    operation_advice: "持有".to_string(),
-                    confidence_level: "低".to_string(),
-                    dashboard: None,
-                    trend_analysis: String::new(),
-                    short_term_outlook: String::new(),
-                    medium_term_outlook: String::new(),
-                    technical_analysis: String::new(),
-                    ma_analysis: String::new(),
-                    volume_analysis: String::new(),
-                    pattern_analysis: String::new(),
-                    fundamental_analysis: String::new(),
-                    sector_position: String::new(),
-                    company_highlights: String::new(),
-                    news_summary: String::new(),
-                    market_sentiment: String::new(),
-                    hot_topics: String::new(),
-                    analysis_summary: format!("分析过程出错: {}", &e.to_string()[..100.min(e.to_string().len())]),
-                    key_points: String::new(),
-                    risk_warning: "分析失败，请稍后重试或手动分析".to_string(),
-                    buy_reason: String::new(),
-                    raw_response: None,
-                    search_performed: false,
-                    data_sources: String::new(),
-                    success: false,
-                    error_message: Some(e.to_string()),
-                }
-            }
-        }
-    }
-
 }

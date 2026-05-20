@@ -137,7 +137,7 @@ analysis_summary, key_points, risk_warning, buy_reason
 **关键要求**：
 1. sentiment_score 按因子加权评分：均线排列(25)+乖离率(20)+量价配合(15)+MACD/RSI(10)+价格位置(10)+基本面(10)+消息面/板块联动(10)，满分100。
 2. volume_analysis 必须包含主力资金动向代理判断（放量上涨/放量下跌/缩量/高换手横盘）。
-3. pattern_analysis 必须结合 MACD/RSI/KDJ 信号研判金叉死叉与超买超卖。
+3. pattern_analysis 必须结合 MACD/RSI/SKDJ 信号研判金叉死叉与超买超卖。
 4. sector_position 须评估板块联动：如消息面提及本股所属板块则加强看多，否则警惕跟涨乏力。
 5. risk_warning 必须包含具体止损位（格式：止损位：¥XX.XX元），参考 MA20/前低/-8% 三者较高者。
 6. buy_reason 若建议买入，必须包含具体目标价（格式：目标价：¥XX.XX元），参考 52周高点/季度高点/+15% 三者较低者。

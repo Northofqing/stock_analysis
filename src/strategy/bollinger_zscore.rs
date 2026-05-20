@@ -40,6 +40,8 @@ pub struct BollingerZScoreConfig {
     pub commission_rate: f64,
     /// 滑点率
     pub slippage_rate: f64,
+    /// 印花税率（A 股仅卖方征收，现行 0.001）
+    pub stamp_tax_rate: f64,
     /// 回测起始日期（None 表示不限制）
     pub start_date: Option<NaiveDate>,
     /// 回测结束日期（None 表示不限制）
@@ -58,6 +60,7 @@ impl Default for BollingerZScoreConfig {
             max_position_pct: 0.25,
             commission_rate: 0.0003,
             slippage_rate: 0.001,
+            stamp_tax_rate: 0.001,
             start_date: Some(NaiveDate::from_ymd_opt(2000, 1, 1).unwrap()),
             end_date: None,
         }
@@ -180,6 +183,7 @@ impl BollingerZScoreBacktest {
         // 提取列
         let dates = df.column("date")?.str()?;
         let close_col = df.column("close")?.f64()?;
+        let open_col = df.column("open")?.f64()?;   // 以次日 open 成交，避免未来函数
         let bb_upper = df.column("bb_upper")?.f64()?;
         let bb_lower = df.column("bb_lower")?.f64()?;
         let bb_mid = df.column("bb_mid")?.f64()?;
@@ -238,9 +242,31 @@ impl BollingerZScoreBacktest {
             // ──── 信号判定 ────
             let uptrend = is_uptrend.get(i).unwrap_or(false);
 
+            // 成交价：次日 open（避免 look-ahead）。末根信号丢弃
+            let next_exec = if i + 1 < n {
+                match (open_col.get(i + 1), dates.get(i + 1)) {
+                    (Some(p), Some(d_str)) => {
+                        let d = NaiveDate::parse_from_str(d_str, "%Y-%m-%d")
+                            .unwrap_or(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
+                        let dt_next = Local
+                            .from_local_datetime(&d.and_hms_opt(15, 0, 0).unwrap())
+                            .single()
+                            .unwrap_or_else(|| Local::now());
+                        Some((p, dt_next))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
             // 买入条件：价格 <= 下轨 且 Z-Score <= 买入阈值，且当前无满仓，且处于上升趋势
             if close <= lower && z <= self.config.zscore_buy && shares < 1.0 && uptrend {
-                let buy_price = close * (1.0 + self.config.slippage_rate);
+                let Some((next_open, next_dt)) = next_exec else {
+                    signals.push(Signal::Hold); // 最后一根无法成交
+                    continue;
+                };
+                let buy_price = next_open * (1.0 + self.config.slippage_rate);
                 let max_invest = self.config.initial_capital * self.config.max_position_pct;
                 let invest = cash.min(max_invest);
                 let buy_shares = (invest / buy_price).floor();
@@ -252,7 +278,7 @@ impl BollingerZScoreBacktest {
                     shares += buy_shares;
                     avg_cost = (old_val + amount) / shares;
                     trades.push(Trade {
-                        date: dt, code: code.to_string(), name: name.to_string(),
+                        date: next_dt, code: code.to_string(), name: name.to_string(),
                         action: TradeAction::Buy, shares: buy_shares,
                         price: buy_price, amount, commission: comm,
                     });
@@ -267,12 +293,17 @@ impl BollingerZScoreBacktest {
                 let should_sell = (close >= upper && z >= self.config.zscore_sell)
                     || (z >= self.config.zscore_exit && avg_cost > 0.0 && close > avg_cost);
                 if should_sell {
-                    let sell_price = close * (1.0 - self.config.slippage_rate);
+                    let Some((next_open, next_dt)) = next_exec else {
+                        signals.push(Signal::Hold); // 最后一根无法成交
+                        continue;
+                    };
+                    let sell_price = next_open * (1.0 - self.config.slippage_rate);
                     let amount = shares * sell_price;
-                    let comm = amount * self.config.commission_rate;
+                    // 印花税合并到 commission（字段语义：总交易费用）
+                    let comm = amount * (self.config.commission_rate + self.config.stamp_tax_rate);
                     cash += amount - comm;
                     trades.push(Trade {
-                        date: dt, code: code.to_string(), name: name.to_string(),
+                        date: next_dt, code: code.to_string(), name: name.to_string(),
                         action: TradeAction::Sell, shares,
                         price: sell_price, amount, commission: comm,
                     });
@@ -469,6 +500,10 @@ impl BollingerZScoreResult {
         let mut report = String::new();
         report.push_str("# 📊 布林带+Z-Score 均值回归策略回测报告\n\n");
         report.push_str(&format!("**生成时间**: {}\n\n", now));
+        report.push_str("> ⚠️ **免责声明**\n");
+        report.push_str("> - 股票池为静态清单，存在**幸存者偏差**（未含历史退市 / ST / 被剔除标的）。\n");
+        report.push_str("> - 交易事件采用 **T 日信号 / T+1 日 open 成交** （已修复 look-ahead）。\n");
+        report.push_str("> - 费用说明：commission 字段含佣金+印花税（卖出）+滑点已仅反映在成交价中。\n\n");
         report.push_str("---\n\n");
 
         // 策略参数

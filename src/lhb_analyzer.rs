@@ -337,25 +337,28 @@ impl LhbDataFetcher {
         if records.is_empty() {
             return 0;
         }
-        
+
+        let len = records.len();
+        let len_f = len as f64;
+
         // 统计净买入为正的次数
         let positive_count = records.iter()
             .filter(|r| r.net_amount > 0.0)
             .count();
-        
+
         // 计算平均净买入额
         let avg_net_amount: f64 = records.iter()
             .map(|r| r.net_amount)
-            .sum::<f64>() / records.len() as f64;
-        
+            .sum::<f64>() / len_f;
+
         // 评分逻辑
         let mut score = 0;
-        
+
         // 上榜频率加分
-        score += (records.len() * 10).min(30) as i32;
-        
+        score += (len * 10).min(30) as i32;
+
         // 净买入为正占比加分
-        let positive_ratio = positive_count as f64 / records.len() as f64;
+        let positive_ratio = positive_count as f64 / len_f;
         score += (positive_ratio * 40.0) as i32;
         
         // 平均净买入额加分
@@ -375,17 +378,20 @@ impl LhbDataFetcher {
         if records.is_empty() {
             return 0;
         }
-        
+
+        let len = records.len();
+        let len_f = len as f64;
+
         let mut score = 0;
-        
+
         // 上榜频率
-        score += (records.len() * 15).min(40) as i32;
-        
+        score += (len * 15).min(40) as i32;
+
         // 龙虎榜成交占比
         let avg_ratio: f64 = records.iter()
             .map(|r| r.lhb_ratio)
-            .sum::<f64>() / records.len() as f64;
-        
+            .sum::<f64>() / len_f;
+
         if avg_ratio > 20.0 {
             score += 40;
         } else if avg_ratio > 10.0 {
@@ -393,11 +399,11 @@ impl LhbDataFetcher {
         } else if avg_ratio > 5.0 {
             score += 20;
         }
-        
+
         // 涨跌幅
         let avg_pct: f64 = records.iter()
             .map(|r| r.pct_change.abs())
-            .sum::<f64>() / records.len() as f64;
+            .sum::<f64>() / len_f;
         
         if avg_pct > 8.0 {
             score += 20;

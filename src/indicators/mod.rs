@@ -1,19 +1,27 @@
 //! 技术指标模块
 //!
-//! 包含 MACD、KDJ、RSI 三项指标的计算、顶底背离检测及金叉共振判断。
+//! 包含 MACD、KDJ、SKDJ、RSI 四项指标的计算、顶底背离检测及金叉共振判断。
 //!
 //! ## 公式说明
 //!
 //! ### MACD（指数平滑异同移动平均线）
-//! - DIF  = EMA(close, 12) − EMA(close, 26)
-//! - DEA  = EMA(DIF, 9)
+//! - DIF  = EMA(close, `MACD_FAST`) − EMA(close, `MACD_SLOW`)
+//! - DEA  = EMA(DIF, `MACD_SIGNAL`)
 //! - MACD柱 = 2 × (DIF − DEA)
+//! - 项目默认参数：6/13/5（对齐东方财富客户端自定义设置）
 //!
-//! ### KDJ（随机指标）
+//! ### KDJ（随机指标，SMA 平滑）
 //! - RSV = (close − LLV(low, 9)) / (HHV(high, 9) − LLV(low, 9)) × 100
 //! - K = SMA(RSV, 3, 1)   （即 K_prev × 2/3 + RSV × 1/3）
 //! - D = SMA(K, 3, 1)
 //! - J = 3K − 2D
+//!
+//! ### SKDJ（慢速 KDJ，EMA 平滑）
+//! - RSV = (close − LLV(low, `SKDJ_N`)) / (HHV(high, `SKDJ_N`) − LLV(low, `SKDJ_N`)) × 100
+//! - K = EMA(RSV, `SKDJ_M`)
+//! - D = EMA(K,   `SKDJ_M`)
+//! - J = 3K − 2D
+//! - 项目默认参数：N=40, M=5（对齐东方财富客户端 SKDJ 设置）
 //!
 //! ### RSI（相对强弱指标）
 //! - RSI(N) = SMA(max(close−prev_close, 0), N) /
@@ -26,12 +34,26 @@ mod divergence;
 mod kdj;
 mod macd;
 mod rsi;
+mod skdj;
 
 pub use cross::{detect_cross, CrossType};
 pub use divergence::{detect_divergence, DivergenceResult, DivergenceType};
 pub use kdj::{calc_kdj, KdjPoint};
 pub use macd::{calc_macd, MacdPoint};
 pub use rsi::{calc_rsi, RsiPoint};
+pub use skdj::{calc_skdj, SkdjPoint};
+
+/// MACD 默认快线周期（对齐东方财富客户端自定义：6）
+pub const MACD_FAST: usize = 6;
+/// MACD 默认慢线周期（对齐东方财富客户端自定义：13）
+pub const MACD_SLOW: usize = 13;
+/// MACD 默认信号线周期（对齐东方财富客户端自定义：5）
+pub const MACD_SIGNAL: usize = 5;
+
+/// SKDJ 默认 RSV 周期（对齐东方财富客户端自定义：40）
+pub const SKDJ_N: usize = 40;
+/// SKDJ 默认 EMA 平滑周期（对齐东方财富客户端自定义：5）
+pub const SKDJ_M: usize = 5;
 
 // ============================================================================
 // 综合指标分析结果
@@ -47,7 +69,7 @@ pub struct IndicatorAnalysis {
     pub macd_cross: CrossType,
     pub macd_divergence: DivergenceResult,
 
-    // --- KDJ ---
+    // --- SKDJ（藏于只 kdj_* 字段名中以保持下游 API 兼容）---
     pub kdj_k: f64,
     pub kdj_d: f64,
     pub kdj_j: f64,
@@ -90,7 +112,7 @@ impl Default for IndicatorAnalysis {
             kdj_j: 50.0,
             kdj_cross: CrossType::None,
             kdj_divergence: DivergenceResult {
-                indicator: "KDJ".to_string(),
+                indicator: "SKDJ".to_string(),
                 divergence: DivergenceType::None,
                 description: String::new(),
             },
@@ -128,8 +150,8 @@ pub fn analyze_indicators(
         return result;
     }
 
-    // ---- MACD ----
-    let macd = calc_macd(closes, 12, 26, 9);
+    // ---- MACD (6/13/5) ----
+    let macd = calc_macd(closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL);
     if let Some(latest) = macd.last() {
         result.macd_dif = latest.dif;
         result.macd_dea = latest.dea;
@@ -140,8 +162,8 @@ pub fn analyze_indicators(
     result.macd_cross = detect_cross(&dif_series, &dea_series, 5);
     result.macd_divergence = detect_divergence(closes, &dif_series, 30.min(len), "MACD");
 
-    // ---- KDJ ----
-    let kdj = calc_kdj(highs, lows, closes, 9, 3, 3);
+    // ---- SKDJ (40/5) ----
+    let kdj = calc_skdj(highs, lows, closes, SKDJ_N, SKDJ_M);
     if let Some(latest) = kdj.last() {
         result.kdj_k = latest.k;
         result.kdj_d = latest.d;
@@ -150,7 +172,7 @@ pub fn analyze_indicators(
     let k_series: Vec<f64> = kdj.iter().map(|p| p.k).collect();
     let d_series: Vec<f64> = kdj.iter().map(|p| p.d).collect();
     result.kdj_cross = detect_cross(&k_series, &d_series, 5);
-    result.kdj_divergence = detect_divergence(closes, &k_series, 30.min(len), "KDJ-K");
+    result.kdj_divergence = detect_divergence(closes, &k_series, 30.min(len), "SKDJ-K");
 
     // ---- RSI ----
     let rsi = calc_rsi(closes);

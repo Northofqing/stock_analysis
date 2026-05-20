@@ -24,14 +24,14 @@ pub(super) mod trace;
 use anyhow::Result;
 use log::info;
 
-use super::types::AgentMode;
-use super::GeminiAnalyzer;
+use super::super::analyzer::types::AgentMode;
+use super::super::analyzer::GeminiAnalyzer;
 
-pub(crate) use slices::{build_slices, DomainSlices};
+pub use slices::{build_slices, DomainSlices};
 
 impl GeminiAnalyzer {
     /// 运行多 Agent 文本流水线，返回最终 markdown 报告。
-    pub(super) async fn run_text_pipeline(&self, slices: DomainSlices) -> Result<String> {
+    pub async fn run_text_pipeline(&self, slices: DomainSlices) -> Result<String> {
         let trace = trace::trace_enabled(self);
         let (provider, quick_model, deep_model) = if self.use_doubao {
             (

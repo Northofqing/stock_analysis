@@ -26,10 +26,12 @@ pub fn compute_precision_indicators(klines: &[KlineData]) -> Result<DataFrame> {
         .map(|k| k.date.format("%Y-%m-%d").to_string())
         .collect();
     let close: Vec<f64> = klines.iter().map(|k| k.close).collect();
+    let open: Vec<f64> = klines.iter().map(|k| k.open).collect();
 
     let df = df![
         "date"  => &dates,
         "close" => &close,
+        "open"  => &open,
     ]?;
 
     // 5日RSI
@@ -62,6 +64,8 @@ pub struct PrecisionRsiConfig {
     pub commission_rate: f64,
     /// 滑点率
     pub slippage_rate: f64,
+    /// 印花税率（A 股仅卖方征收，现行 0.001）
+    pub stamp_tax_rate: f64,
     /// 回测起始日期（None 表示不限制）
     pub start_date: Option<NaiveDate>,
     /// 回测结束日期（None 表示不限制）
@@ -75,6 +79,7 @@ impl Default for PrecisionRsiConfig {
             max_position_pct: 0.25,
             commission_rate: 0.0003,
             slippage_rate: 0.001,
+            stamp_tax_rate: 0.001,
             start_date: Some(NaiveDate::from_ymd_opt(2000, 1, 1).unwrap()),
             end_date: None,
         }
@@ -132,6 +137,10 @@ impl PrecisionRsiResult {
         let mut report = String::new();
         report.push_str("# 📊 精准RSI深度超卖均值回归策略回测报告\n\n");
         report.push_str(&format!("**生成时间**: {}\n\n", now));
+        report.push_str("> ⚠️ **免责声明**\n");
+        report.push_str("> - 股票池为静态清单，存在**幸存者偏差**（未含历史退市 / ST / 被剔除标的）。\n");
+        report.push_str("> - 交易事件采用 **T 日信号 / T+1 日 open 成交**（已修复 look-ahead）。\n");
+        report.push_str("> - commission 字段含佣金+印花税（卖出）；滑点已反映在成交价中。\n\n");
         report.push_str("---\n\n");
 
         report.push_str("## ⚙️ 策略规则\n\n");
@@ -226,6 +235,7 @@ impl PrecisionRsiBacktest {
 
         let dates = df.column("date")?.str()?.clone();
         let close_col = df.column("close")?.f64()?.clone();
+        let open_col = df.column("open")?.f64()?.clone();   // 以次日 open 成交，避免 look-ahead
         let rsi5_col = df.column("rsi_5")?.f64()?.clone();
         let ma200_col = df.column("ma200")?.f64()?.clone();
 
@@ -252,6 +262,24 @@ impl PrecisionRsiBacktest {
                 .from_local_datetime(&naive.and_hms_opt(15, 0, 0).unwrap())
                 .single()
                 .unwrap_or_else(|| Local::now());
+
+            // 成交价：次日 open。末根信号丢弃
+            let next_exec = if i + 1 < n {
+                match (open_col.get(i + 1), dates.get(i + 1)) {
+                    (Some(p), Some(d_str)) => {
+                        let d = NaiveDate::parse_from_str(d_str, "%Y-%m-%d")
+                            .unwrap_or_else(|_| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
+                        let dt_next = Local
+                            .from_local_datetime(&d.and_hms_opt(15, 0, 0).unwrap())
+                            .single()
+                            .unwrap_or_else(|| Local::now());
+                        Some((p, dt_next))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
 
             // 日期范围过滤：仅在范围内记录净值和交易
             let in_date_range = self.config.start_date.map_or(true, |s| naive >= s)
@@ -286,7 +314,11 @@ impl PrecisionRsiBacktest {
                 let cond4 = close > ma200;                            // 站稳200日均线
 
                 if cond1 && cond2 && cond3 && cond4 {
-                    let buy_price = close * (1.0 + self.config.slippage_rate);
+                    let Some((next_open, next_dt)) = next_exec else {
+                        signals.push(Signal::Hold);
+                        continue;
+                    };
+                    let buy_price = next_open * (1.0 + self.config.slippage_rate);
                     let invest = cash.min(self.config.initial_capital * self.config.max_position_pct);
                     let buy_shares = (invest / buy_price).floor();
                     if buy_shares > 0.0 {
@@ -296,7 +328,7 @@ impl PrecisionRsiBacktest {
                         avg_cost = (avg_cost * shares + amount) / (shares + buy_shares);
                         shares += buy_shares;
                         trades.push(Trade {
-                            date: dt, code: code.to_string(), name: name.to_string(),
+                            date: next_dt, code: code.to_string(), name: name.to_string(),
                             action: TradeAction::Buy, shares: buy_shares,
                             price: buy_price, amount, commission: comm,
                         });
@@ -311,12 +343,17 @@ impl PrecisionRsiBacktest {
                 // 突破：前一日 < 50，当日 >= 50
                 let cross_above_50 = rsi_1 < 50.0 && rsi_now >= 50.0;
                 if cross_above_50 {
-                    let sell_price = close * (1.0 - self.config.slippage_rate);
+                    let Some((next_open, next_dt)) = next_exec else {
+                        signals.push(Signal::Hold);
+                        continue;
+                    };
+                    let sell_price = next_open * (1.0 - self.config.slippage_rate);
                     let amount = shares * sell_price;
-                    let comm = amount * self.config.commission_rate;
+                    // 印花税合并到 commission
+                    let comm = amount * (self.config.commission_rate + self.config.stamp_tax_rate);
                     cash += amount - comm;
                     trades.push(Trade {
-                        date: dt, code: code.to_string(), name: name.to_string(),
+                        date: next_dt, code: code.to_string(), name: name.to_string(),
                         action: TradeAction::Sell, shares,
                         price: sell_price, amount, commission: comm,
                     });

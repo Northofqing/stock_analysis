@@ -14,13 +14,23 @@
 //! - Gemini - Google AI模型
 
 mod analyze;
-mod agents;
 mod client;
 mod macro_rec;
 mod prompts;
-mod types;
+pub(crate) mod types;
 
 pub use types::{AgentMode, AnalysisResult, GeminiConfig};
+
+/// 系统技术评分快照（与 AI 共享同一把尺子）。
+///
+/// 由 pipeline 在调用 AI 之前组装，注入到 prompt 中：
+/// AI 的【技术面】须按 `reasons`/`risks` 逐项复述，【操作建议】须严格匹配 `advice` 档位。
+pub struct TechAssessment<'a> {
+    pub score: i32,
+    pub advice: &'a str,
+    pub reasons: &'a [String],
+    pub risks: &'a [String],
+}
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -84,6 +94,7 @@ impl GeminiAnalyzer {
 - 只做多头排列的股票，空头排列坚决不碰
 - 均线发散上行优于均线粘合
 - MACD 辅助判断：DIFF 上穿 DEA 金叉为买点，死叉为卖点
+- SKDJ 辅助判断：K 线由下向上穿过 D 线为买点，反之为卖点
 - RSI 辅助判断：<30 超卖可能反弹，>70 超买警惕回调，>80 严禁追高
 
 ### 3. 主力资金动向（代理指标）
@@ -142,7 +153,7 @@ impl GeminiAnalyzer {
   "technical_analysis": "技术面综合分析文本",
   "ma_analysis": "均线分析文本",
   "volume_analysis": "量能分析文本（包含主力资金代理判断）",
-  "pattern_analysis": "K线形态/MACD/RSI/KDJ 分析",
+  "pattern_analysis": "K线形态/MACD/RSI/SKDJ 分析",
   "fundamental_analysis": "基本面分析文本",
   "sector_position": "行业地位及板块联动判断",
   "company_highlights": "公司亮点描述",
@@ -167,7 +178,7 @@ impl GeminiAnalyzer {
 - 均线排列（25分）：多头排列满分，空头排列0分，粘合12分
 - 乖离率（20分）：<2%满分，2-5%得12分，>5%得5分，>8%得0分
 - 量价配合（15分）：放量上涨或缩量回调满分，放量下跌或缩量上涨5分
-- MACD/RSI（10分）：MACD金叉+RSI 40-70满分，死叉/超买超卖0-3分
+- MACD/RSI/SKDJ（10分）：MACD金叉+RSI+SKDJ 40-70满分，死叉/超买超卖0-3分
 - 价格位置（10分）：52周低位区满分，中位区6分，高位区2分
 - 基本面（10分）：PE<15且PB<2满分，PE<30得7分，PE>30或亏损2分
 - 消息面/板块联动（10分）：明确利好+板块共振满分，中性5分，利空0分"#;
@@ -185,7 +196,7 @@ impl GeminiAnalyzer {
 ### 2. 趋势交易（顺势而为）
 - 多头排列必须条件：MA5 > MA10 > MA20
 - 只做多头排列的股票，空头排列坚决不碰
-- MACD 金叉+RSI 40-70 为健康区间，MACD 死叉或 RSI>80 警惕
+- MACD 金叉+RSI 40-70+SKDJ 金叉为健康区间，MACD 死叉或 RSI>80 或 SKDJ 死叉警惕
 
 ### 3. 主力资金动向（代理指标）
 - 放量上涨（量比>1.5 + 涨幅为正）→ 主力介入

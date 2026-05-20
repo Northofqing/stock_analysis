@@ -1,6 +1,6 @@
 //! 邮件渠道实现（纯文本 + 带图片）
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -11,6 +11,57 @@ use lettre::message::{header, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
 
 use super::service::NotificationService;
+
+/// 将本次邮件正文（Markdown + HTML）落盘到 `reports/email_archive/`。
+///
+/// 在 SMTP 发送之前调用，确保即使发送失败也能在本地查到内容。
+/// 文件名带毫秒时间戳，避免同一秒内多封邮件互相覆盖。
+/// 任意 I/O 错误只 `warn!`，不影响邮件主流程。
+fn archive_email(subject: &str, markdown: &str, html: &str, image_path: Option<&Path>) {
+    use std::fs;
+
+    let dir = PathBuf::from("reports").join("email_archive");
+    if let Err(e) = fs::create_dir_all(&dir) {
+        warn!("邮件归档目录创建失败: {}（跳过归档）", e);
+        return;
+    }
+
+    let stamp = Local::now().format("%Y%m%d_%H%M%S%3f").to_string();
+    let md_path = dir.join(format!("email_{}.md", stamp));
+    let html_path = dir.join(format!("email_{}.html", stamp));
+
+    let mut header_lines = vec![
+        format!("<!-- subject: {} -->", subject),
+        format!("<!-- sent_at: {} -->", Local::now().format("%Y-%m-%d %H:%M:%S")),
+    ];
+    if let Some(p) = image_path {
+        header_lines.push(format!("<!-- image: {} -->", p.display()));
+    }
+    let header_block = header_lines.join("\n");
+
+    let md_body = format!("{}\n\n{}", header_block, markdown);
+    let html_body = format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{}</title></head><body>\n{}\n{}\n</body></html>",
+        html_escape(subject),
+        header_block,
+        html,
+    );
+
+    if let Err(e) = fs::write(&md_path, md_body) {
+        warn!("邮件原文（md）写入失败 {}: {}", md_path.display(), e);
+    } else {
+        info!("📥 邮件原文已归档: {}", md_path.display());
+    }
+    if let Err(e) = fs::write(&html_path, html_body) {
+        warn!("邮件原文（html）写入失败 {}: {}", html_path.display(), e);
+    }
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
 
 impl NotificationService {
     /// 发送邮件
@@ -39,7 +90,10 @@ impl NotificationService {
         
         // 构建邮件主题
         let subject = format!("A股分析日报 - {}", Local::now().format("%Y-%m-%d"));
-        
+
+        // 发送前先把内容落盘归档（即使后续发送失败也有备份）
+        archive_email(&subject, content, &html_content, None);
+
         self.send_single_email(
             sender, 
             primary,
@@ -161,7 +215,10 @@ impl NotificationService {
         
         // 构建邮件主题
         let subject = format!("A股分析日报（含图表） - {}", Local::now().format("%Y-%m-%d"));
-        
+
+        // 发送前先把内容落盘归档（即使后续发送失败也有备份）
+        archive_email(&subject, content, &html_content, Some(image_path));
+
         self.send_single_email_with_image(
             sender,
             primary,

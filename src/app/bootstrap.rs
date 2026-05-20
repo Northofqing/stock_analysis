@@ -2,9 +2,15 @@
 
 use anyhow::Result;
 use log::{error, info};
+use once_cell::sync::Lazy;
+use regex::Regex;
 use std::collections::HashSet;
 
 use crate::cli::Args;
+
+/// 6 位 A 股代码（沪深主板/中小创/科创板）：以 0/3/6 开头。
+static STOCK_CODE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\b([036]\d{5})\b").expect("内置股票代码正则不应失败"));
 
 /// 启动前配置校验：检查 AI 模型与通知渠道等关键配置，
 /// 任一项不合法即打印明确提示并立即退出（exit code 1）。
@@ -78,9 +84,14 @@ pub fn build_stock_list(args: &Args) -> Result<(Vec<String>, HashSet<String>, St
     };
 
     // 2. 宏观 AI 推荐（受 MACRO_AI_ENABLED 控制，默认开启）
-    let macro_ai_enabled = std::env::var("MACRO_AI_ENABLED")
-        .map(|v| v.to_lowercase() != "false")
-        .unwrap_or(true);
+    // 若使用 --deep-analysis 模式，则强制关闭扩展，只分析输入的票
+    let macro_ai_enabled = if args.deep_analysis {
+        false
+    } else {
+        std::env::var("MACRO_AI_ENABLED")
+            .map(|v| v.to_lowercase() != "false")
+            .unwrap_or(true)
+    };
     let macro_news_context = if macro_ai_enabled {
         let runtime = tokio::runtime::Runtime::new()?;
         let (extra_codes, macro_text) = runtime.block_on(fetch_macro_recommended_codes());
@@ -103,10 +114,28 @@ pub fn build_stock_list(args: &Args) -> Result<(Vec<String>, HashSet<String>, St
         String::new()
     };
 
+    // 2.5 板块共振引擎（涨幅榜 ∩ 主力净流入榜 ∩ 宏观新闻）
+    let sector_resonance_enabled = if args.deep_analysis {
+        false
+    } else {
+        std::env::var("SECTOR_RESONANCE_ENABLED")
+            .map(|v| v.to_lowercase() != "false")
+            .unwrap_or(true)
+    };
+    if sector_resonance_enabled {
+        append_sector_resonance(&mut stock_codes, &macro_news_context);
+    } else {
+        info!("⚙️ SECTOR_RESONANCE_ENABLED=false：跳过板块共振追加");
+    }
+
     // 3. 龙虎榜 Top 10（受 LHB_APPEND_ENABLED 控制，默认开启）
-    let lhb_append_enabled = std::env::var("LHB_APPEND_ENABLED")
-        .map(|v| v.to_lowercase() != "false")
-        .unwrap_or(true);
+    let lhb_append_enabled = if args.deep_analysis {
+        false
+    } else {
+        std::env::var("LHB_APPEND_ENABLED")
+            .map(|v| v.to_lowercase() != "false")
+            .unwrap_or(true)
+    };
     if lhb_append_enabled {
         append_lhb_top10(&mut stock_codes)?;
     } else {
@@ -114,9 +143,13 @@ pub fn build_stock_list(args: &Args) -> Result<(Vec<String>, HashSet<String>, St
     }
 
     // 4. 涨停股票（受 LIMIT_UP_APPEND_ENABLED 控制，默认开启）
-    let limit_up_append_enabled = std::env::var("LIMIT_UP_APPEND_ENABLED")
-        .map(|v| v.to_lowercase() != "false")
-        .unwrap_or(true);
+    let limit_up_append_enabled = if args.deep_analysis {
+        false
+    } else {
+        std::env::var("LIMIT_UP_APPEND_ENABLED")
+            .map(|v| v.to_lowercase() != "false")
+            .unwrap_or(true)
+    };
     let limit_up_codes = if limit_up_append_enabled {
         append_limit_up(&mut stock_codes)
     } else {
@@ -219,6 +252,60 @@ fn append_limit_up(stock_codes: &mut Vec<String>) -> HashSet<String> {
     set
 }
 
+/// 板块共振追加：基于东方财富概念板块榜（涨幅 + 主力净流入）与宏观新闻共振，
+/// 找出真正在涨、有真金白银且新闻匹配的板块，注入其龙头股。
+fn append_sector_resonance(stock_codes: &mut Vec<String>, macro_news: &str) {
+    use stock_analysis::market_analyzer::sector_monitor;
+
+    let rank_top = std::env::var("SECTOR_RANK_TOP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20usize);
+    let max_sectors = std::env::var("SECTOR_RESONANCE_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5usize);
+    let leaders_per_sector = std::env::var("SECTOR_LEADERS_PER")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5usize);
+
+    match sector_monitor::detect_resonance_sectors(
+        macro_news,
+        rank_top,
+        max_sectors,
+        leaders_per_sector,
+    ) {
+        Ok(sectors) if !sectors.is_empty() => {
+            let leader_codes = sector_monitor::collect_leader_codes(&sectors);
+            let before = stock_codes.len();
+            for code in &leader_codes {
+                if !stock_codes.contains(code) {
+                    stock_codes.push(code.clone());
+                }
+            }
+            info!(
+                "🎯 板块共振命中 {} 个板块，候选龙头 {} 只，新增追加 {} 只（去重后）",
+                sectors.len(),
+                leader_codes.len(),
+                stock_codes.len() - before
+            );
+            for s in &sectors {
+                info!(
+                    "   ↳ {}({}) [{:?}] 涨幅{:.2}% 主力{:.2}亿",
+                    s.board.name,
+                    s.board.code,
+                    s.hit_dims,
+                    s.board.change_pct,
+                    s.board.main_inflow / 1e8
+                );
+            }
+        }
+        Ok(_) => info!("📋 今日板块共振未命中（涨幅榜与资金榜交集为空）"),
+        Err(e) => info!("⚠️ 板块共振检测失败（不影响正常分析）: {:#}", e),
+    }
+}
+
 fn append_open_positions(stock_codes: &mut Vec<String>) {
     use stock_analysis::database::DatabaseManager;
 
@@ -279,7 +366,9 @@ pub(crate) async fn fetch_macro_recommended_codes() -> (Vec<String>, String) {
     };
 
     let analyzer_clone = {
-        let guard = get_analyzer().lock().unwrap();
+        let guard = get_analyzer()
+            .lock()
+            .expect("AI analyzer mutex 已 poison");
         if guard.is_available() {
             Some(guard.clone())
         } else {
@@ -341,19 +430,18 @@ fn save_macro_report(macro_ctx: &str, rec_text: &str) {
 
 fn extract_stock_codes(rec_text: &str) -> Vec<String> {
     // 优先从【推荐代码】行提取（更可靠），回退到全文正则
-    let re = regex::Regex::new(r"\b([036]\d{5})\b").unwrap();
     let code_line_text = rec_text
         .lines()
         .find(|line| line.contains("【推荐代码】"))
         .unwrap_or(rec_text);
-    let mut codes: Vec<String> = re
+    let mut codes: Vec<String> = STOCK_CODE_RE
         .captures_iter(code_line_text)
         .map(|cap| cap[1].to_string())
         .collect::<HashSet<_>>()
         .into_iter()
         .collect();
     if codes.is_empty() {
-        codes = re
+        codes = STOCK_CODE_RE
             .captures_iter(rec_text)
             .map(|cap| cap[1].to_string())
             .collect::<HashSet<_>>()

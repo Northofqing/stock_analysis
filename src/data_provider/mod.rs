@@ -6,8 +6,10 @@ pub mod chip_distribution;
 pub mod eastmoney_provider;
 pub mod financials;
 pub mod gtimg_provider;
+pub mod intraday_kline;
 pub mod money_flow;
 pub mod rustdx_provider;
+pub mod service;
 pub mod tushare_provider;
 
 pub use chip_distribution::{

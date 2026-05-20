@@ -14,7 +14,7 @@ use super::GeminiAnalyzer;
 impl GeminiAnalyzer {
     // ========== 模型选择 ==========
 
-    pub(super) fn gemini_model_for(&self, mode: AgentMode) -> String {
+    pub(crate) fn gemini_model_for(&self, mode: AgentMode) -> String {
         match mode {
             AgentMode::Quick => self
                 .config
@@ -29,7 +29,7 @@ impl GeminiAnalyzer {
         }
     }
 
-    pub(super) fn doubao_model_for(&self, mode: AgentMode) -> String {
+    pub(crate) fn doubao_model_for(&self, mode: AgentMode) -> String {
         match mode {
             AgentMode::Quick => self
                 .config
@@ -44,7 +44,7 @@ impl GeminiAnalyzer {
         }
     }
 
-    pub(super) fn openai_model_for(&self, mode: AgentMode) -> String {
+    pub(crate) fn openai_model_for(&self, mode: AgentMode) -> String {
         match mode {
             AgentMode::Quick => self
                 .config
@@ -60,7 +60,7 @@ impl GeminiAnalyzer {
     }
 
     /// 是否在该 mode 下启用 thinking
-    pub(super) fn thinking_for(&self, mode: AgentMode) -> bool {
+    pub(crate) fn thinking_for(&self, mode: AgentMode) -> bool {
         match mode {
             AgentMode::Quick => false,
             AgentMode::Deep => self.config.enable_thinking,
@@ -89,7 +89,7 @@ impl GeminiAnalyzer {
     }
 
     /// 调用 API（按 AgentMode 路由模型与 thinking 开关）
-    pub(super) async fn call_api_mode(
+    pub(crate) async fn call_api_mode(
         &self,
         prompt: &str,
         system_prompt: &str,
@@ -365,7 +365,8 @@ impl GeminiAnalyzer {
 
         #[derive(Deserialize)]
         struct ResponseMessage {
-            content: String,
+            content: Option<String>,
+            reasoning_content: Option<String>,
         }
 
         let api_key = self
@@ -417,13 +418,23 @@ impl GeminiAnalyzer {
             return Err(anyhow!("HTTP {}: {}", status, error_text));
         }
 
-        let openai_response: OpenAIResponse =
-            response.json().await.context("解析 OpenAI 响应失败")?;
+        let response_text = response.text().await.context("读取 OpenAI 响应失败")?;
+        let openai_response: OpenAIResponse = serde_json::from_str(&response_text)
+            .with_context(|| {
+                let snippet = response_text.chars().take(1000).collect::<String>();
+                format!("解析 OpenAI 响应失败，原始响应片段: {}", snippet)
+            })?;
 
         openai_response
             .choices
             .get(0)
-            .map(|c| c.message.content.clone())
+            .and_then(|c| {
+                c.message
+                    .content
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| c.message.reasoning_content.clone())
+            })
             .ok_or_else(|| anyhow!("OpenAI 返回空响应"))
     }
 
@@ -469,7 +480,8 @@ impl GeminiAnalyzer {
 
         #[derive(Deserialize)]
         struct ResponseMessage {
-            content: String,
+            content: Option<String>,
+            reasoning_content: Option<String>,
         }
 
         let api_key = self
@@ -529,13 +541,23 @@ impl GeminiAnalyzer {
             return Err(anyhow!("HTTP {}: {}", status, error_text));
         }
 
-        let doubao_response: DoubaoResponse =
-            response.json().await.context("解析豆包响应失败")?;
+        let response_text = response.text().await.context("读取豆包响应失败")?;
+        let doubao_response: DoubaoResponse = serde_json::from_str(&response_text)
+            .with_context(|| {
+                let snippet = response_text.chars().take(1000).collect::<String>();
+                format!("解析豆包响应失败，原始响应片段: {}", snippet)
+            })?;
 
         doubao_response
             .choices
             .get(0)
-            .map(|c| c.message.content.clone())
+            .and_then(|c| {
+                c.message
+                    .content
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| c.message.reasoning_content.clone())
+            })
             .ok_or_else(|| anyhow!("豆包返回空响应"))
     }
 }

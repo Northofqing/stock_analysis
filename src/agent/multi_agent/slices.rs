@@ -3,9 +3,10 @@
 //! 每个 Agent 只看自己领域的切片，避免共享同一份长上下文导致的"假分工"。
 
 use crate::data_provider::KlineData;
+use crate::indicators::{calc_skdj, SKDJ_M, SKDJ_N};
 
 /// 4 大领域 + 消息 + 宏观的数据切片
-pub(crate) struct DomainSlices {
+pub struct DomainSlices {
     pub basics: String,
     pub technical: String,
     pub capital: String,
@@ -17,7 +18,7 @@ pub(crate) struct DomainSlices {
 }
 
 /// 从 K 线 / 额外上下文 / 新闻 / 宏观 构建领域切片。
-pub(crate) fn build_slices(
+pub fn build_slices(
     code: &str,
     name: Option<&str>,
     kline_data: &[KlineData],
@@ -265,40 +266,30 @@ fn build_technical_slice(
         s.push_str(&format!("【RSI(14)】{:.2} ({})\n", rsi, sig));
     }
 
-    // KDJ
+    // SKDJ (40, 5)
     if n >= 9 {
-        let chron: Vec<&KlineData> = kline_data.iter().rev().collect();
-        let mut k = 50.0;
-        let mut d = 50.0;
-        let m = chron.len();
-        let start = m.saturating_sub(30).max(8);
-        for i in start..m {
-            let ws = i.saturating_sub(8);
-            let win = &chron[ws..=i];
-            let hh = win.iter().map(|x| x.high).fold(f64::NEG_INFINITY, f64::max);
-            let ll = win.iter().map(|x| x.low).fold(f64::INFINITY, f64::min);
-            let rsv = if (hh - ll).abs() < 1e-9 {
-                50.0
+        let highs_chron: Vec<f64> = kline_data.iter().rev().map(|x| x.high).collect();
+        let lows_chron: Vec<f64> = kline_data.iter().rev().map(|x| x.low).collect();
+        let closes_chron: Vec<f64> = kline_data.iter().rev().map(|x| x.close).collect();
+        let skdj = calc_skdj(&highs_chron, &lows_chron, &closes_chron, SKDJ_N, SKDJ_M);
+        if let Some(last) = skdj.last() {
+            let k = last.k;
+            let d = last.d;
+            let j = last.j;
+            let sig = if k > 80.0 && d > 80.0 {
+                "超买区"
+            } else if k < 20.0 && d < 20.0 {
+                "超卖区"
+            } else if k > d {
+                "多头"
             } else {
-                (chron[i].close - ll) / (hh - ll) * 100.0
+                "空头"
             };
-            k = 2.0 / 3.0 * k + 1.0 / 3.0 * rsv;
-            d = 2.0 / 3.0 * d + 1.0 / 3.0 * k;
+            s.push_str(&format!(
+                "【SKDJ】K: {:.2}, D: {:.2}, J: {:.2} ({})\n",
+                k, d, j, sig
+            ));
         }
-        let j = 3.0 * k - 2.0 * d;
-        let sig = if k > 80.0 && d > 80.0 {
-            "超买区"
-        } else if k < 20.0 && d < 20.0 {
-            "超卖区"
-        } else if k > d {
-            "多头"
-        } else {
-            "空头"
-        };
-        s.push_str(&format!(
-            "【KDJ】K: {:.2}, D: {:.2}, J: {:.2} ({})\n",
-            k, d, j, sig
-        ));
     }
 
     // 价格区间

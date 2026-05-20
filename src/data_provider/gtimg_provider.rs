@@ -30,7 +30,7 @@ impl GtimgProvider {
     }
     
     /// 从腾讯财经API获取K线数据（异步版本）
-    async fn fetch_kline_data_internal(client: &reqwest::Client, code: &str, days: usize) -> Result<Vec<KlineData>> {
+    pub(crate) async fn fetch_kline_data_internal(client: &reqwest::Client, code: &str, days: usize) -> Result<Vec<KlineData>> {
         // 转换股票代码格式 (600519 -> sh600519, 000001 -> sz000001)
         let market_code = if code.starts_with('6') {
             format!("sh{}", code) // 上海

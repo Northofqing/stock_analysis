@@ -64,6 +64,8 @@ pub struct BacktestConfig {
     pub commission_rate: f64,
     /// 滑点率
     pub slippage_rate: f64,
+    /// 印花税率（A 股仅卖方征收，现行 0.001）
+    pub stamp_tax_rate: f64,
 }
 
 impl Default for BacktestConfig {
@@ -74,6 +76,7 @@ impl Default for BacktestConfig {
             position_count: 3,              // 持仓3只
             commission_rate: 0.0003,        // 万三手续费
             slippage_rate: 0.001,           // 千一滑点
+            stamp_tax_rate: 0.001,          // 千一印花税（仅卖出）
         }
     }
 }
@@ -270,7 +273,8 @@ impl BacktestEngine {
         let actual_price = price * (1.0 - self.config.slippage_rate); // 卖出滑点
         let amount = actual_price * shares;
         let commission = amount * self.config.commission_rate;
-        let proceeds = amount - commission;
+        let stamp_tax = amount * self.config.stamp_tax_rate;
+        let proceeds = amount - commission - stamp_tax;
 
         self.state.cash += proceeds;
         position.shares -= shares;
@@ -452,7 +456,7 @@ impl BacktestSummary {
         self.chart_path = Some(path);
     }
 
-    /// 生成回测净值曲线图表
+    /// 生成回测净值曲线图表（三 panel：净值+买卖点 / Drawdown / 指标）
     pub fn generate_chart(&self, state: &BacktestState, output_path: &str) -> Result<PathBuf> {
         let path_buf = PathBuf::from(output_path);
         
@@ -466,26 +470,31 @@ impl BacktestSummary {
             .map(|(date, value)| (*date, *value / initial_value))
             .collect();
 
-        // 找出最大最小值
-        let min_value = net_values.iter()
-            .map(|(_, v)| *v)
-            .fold(f64::INFINITY, f64::min);
-        let max_value = net_values.iter()
-            .map(|(_, v)| *v)
-            .fold(f64::NEG_INFINITY, f64::max);
+        // 计算 drawdown 序列：dd[i] = (cur - peak_so_far) / peak_so_far，单位为百分数
+        let mut peak = f64::NEG_INFINITY;
+        let drawdowns: Vec<(DateTime<Local>, f64)> = net_values.iter()
+            .map(|(d, v)| {
+                if *v > peak { peak = *v; }
+                let dd = if peak > 0.0 { (*v - peak) / peak * 100.0 } else { 0.0 };
+                (*d, dd)
+            })
+            .collect();
+
+        // 找出净值最大最小值
+        let min_value = net_values.iter().map(|(_, v)| *v).fold(f64::INFINITY, f64::min);
+        let max_value = net_values.iter().map(|(_, v)| *v).fold(f64::NEG_INFINITY, f64::max);
 
         {
-            let root = BitMapBackend::new(output_path, (1400, 900)).into_drawing_area();
+            let root = BitMapBackend::new(output_path, (1400, 1100)).into_drawing_area();
             root.fill(&WHITE)?;
 
-            // 分为上下两部分
-            let areas = root.split_evenly((2, 1));
+            // 上 50%（净值+买卖点） / 中 25%（drawdown） / 下 25%（指标）
+            let (top, rest) = root.split_vertically(550);
+            let (middle, bottom) = rest.split_vertically(275);
 
-            // 上半部分：净值曲线
-            Self::draw_net_value_curve(&areas[0], &net_values, min_value, max_value)?;
-
-            // 下半部分：回测指标
-            Self::draw_backtest_metrics(&areas[1], self)?;
+            Self::draw_net_value_curve_with_trades(&top, &net_values, min_value, max_value, &state.trades, initial_value)?;
+            Self::draw_drawdown_curve(&middle, &drawdowns, self.max_drawdown)?;
+            Self::draw_backtest_metrics(&bottom, self)?;
 
             root.present()?;
         }
@@ -493,12 +502,14 @@ impl BacktestSummary {
         Ok(path_buf)
     }
 
-    /// 绘制净值曲线
-    fn draw_net_value_curve(
+    /// 绘制净值曲线（含买卖点散点）
+    fn draw_net_value_curve_with_trades(
         area: &DrawingArea<BitMapBackend, plotters::coord::Shift>,
         net_values: &[(DateTime<Local>, f64)],
         min_value: f64,
         max_value: f64,
+        trades: &[Trade],
+        initial_value: f64,
     ) -> Result<()> {
         if net_values.is_empty() {
             return Ok(());
@@ -507,47 +518,142 @@ impl BacktestSummary {
         let first_date = net_values[0].0;
         let last_date = net_values.last().unwrap().0;
 
-        // 添加一些边距
         let y_min = (min_value * 0.95).max(0.0);
         let y_max = max_value * 1.05;
 
         let mut chart = ChartBuilder::on(area)
-            .caption("多因子策略净值曲线", ("sans-serif", 40).into_font().color(&BLACK))
-            .margin(20)
-            .x_label_area_size(60)
-            .y_label_area_size(80)
+            .caption("净值曲线 & 买卖点", ("sans-serif", 32).into_font().color(&BLACK))
+            .margin(15)
+            .x_label_area_size(40)
+            .y_label_area_size(70)
             .build_cartesian_2d(first_date..last_date, y_min..y_max)?;
 
         chart
             .configure_mesh()
             .x_desc("日期")
-            .y_desc("净值")
+            .y_desc("净值（归一化）")
             .x_labels(10)
-            .y_labels(10)
-            .x_label_formatter(&|date| date.format("%m-%d").to_string())
+            .y_labels(8)
+            .x_label_formatter(&|date| date.format("%y-%m-%d").to_string())
             .y_label_formatter(&|y| format!("{:.2}", y))
             .draw()?;
 
-        // 绘制净值线
+        // 净值线
         chart.draw_series(LineSeries::new(
             net_values.iter().map(|(date, value)| (*date, *value)),
-            &BLUE.mix(0.8),
+            BLUE.mix(0.85).stroke_width(2),
         ))?
         .label("净值")
         .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLUE));
 
-        // 绘制基准线（净值=1）
+        // 基准线
         chart.draw_series(LineSeries::new(
             vec![(first_date, 1.0), (last_date, 1.0)],
-            RED.mix(0.5).stroke_width(2),
+            RED.mix(0.5).stroke_width(1),
         ))?
-        .label("基准")
+        .label("基准 (1.0)")
         .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &RED));
 
+        // 买卖点：将 trade.date 上当日的净值作为标记 y
+        // 用 daily_values 做 O(N+M) 的双指针查找
+        let mut buy_pts: Vec<(DateTime<Local>, f64)> = Vec::new();
+        let mut sell_pts: Vec<(DateTime<Local>, f64)> = Vec::new();
+        let mut idx = 0usize;
+        for t in trades {
+            // 找到 net_values 中 >= t.date 的第一个点（trades 假定已排序，但 portfolio 聚合可能未严格排序）
+            let target = t.date;
+            // 当未排序时退化为线性扫描
+            if idx >= net_values.len() || net_values[idx].0 > target {
+                idx = 0;
+            }
+            while idx + 1 < net_values.len() && net_values[idx].0 < target {
+                idx += 1;
+            }
+            let nv = net_values[idx].1;
+            // 净值 y 已归一化；trade 用此点画散点
+            match t.action {
+                TradeAction::Buy => buy_pts.push((target, nv)),
+                TradeAction::Sell => sell_pts.push((target, nv)),
+            }
+            let _ = initial_value; // 抑制未使用警告（保留参数以备扩展）
+        }
+
+        if !buy_pts.is_empty() {
+            chart.draw_series(buy_pts.iter().map(|(d, v)| {
+                TriangleMarker::new((*d, *v), 6, GREEN.filled())
+            }))?
+            .label(format!("买入 ({})", buy_pts.len()))
+            .legend(|(x, y)| TriangleMarker::new((x + 10, y), 6, GREEN.filled()));
+        }
+        if !sell_pts.is_empty() {
+            chart.draw_series(sell_pts.iter().map(|(d, v)| {
+                Circle::new((*d, *v), 5, RED.filled())
+            }))?
+            .label(format!("卖出 ({})", sell_pts.len()))
+            .legend(|(x, y)| Circle::new((x + 10, y), 5, RED.filled()));
+        }
+
         chart.configure_series_labels()
-            .background_style(&WHITE.mix(0.8))
-            .border_style(&BLACK)
+            .position(SeriesLabelPosition::UpperLeft)
+            .background_style(WHITE.mix(0.85))
+            .border_style(BLACK)
             .draw()?;
+
+        Ok(())
+    }
+
+    /// 绘制 Drawdown 区域填充
+    fn draw_drawdown_curve(
+        area: &DrawingArea<BitMapBackend, plotters::coord::Shift>,
+        drawdowns: &[(DateTime<Local>, f64)],
+        max_drawdown: f64,
+    ) -> Result<()> {
+        if drawdowns.is_empty() {
+            return Ok(());
+        }
+
+        let first_date = drawdowns[0].0;
+        let last_date = drawdowns.last().unwrap().0;
+
+        // y 轴范围：dd 永远 <= 0；下界取 max_drawdown 与序列最小值的更深者，再留 5% 余量
+        let series_min = drawdowns.iter().map(|(_, d)| *d).fold(0.0_f64, f64::min);
+        let y_min = (series_min.min(-max_drawdown * 100.0)) * 1.10;
+        let y_max = 1.0_f64;
+
+        let mut chart = ChartBuilder::on(area)
+            .caption(
+                format!("Drawdown（最大回撤 {:.2}%）", max_drawdown * 100.0),
+                ("sans-serif", 28).into_font().color(&BLACK),
+            )
+            .margin(15)
+            .x_label_area_size(40)
+            .y_label_area_size(70)
+            .build_cartesian_2d(first_date..last_date, y_min..y_max)?;
+
+        chart
+            .configure_mesh()
+            .x_desc("日期")
+            .y_desc("Drawdown (%)")
+            .x_labels(10)
+            .y_labels(6)
+            .x_label_formatter(&|d| d.format("%y-%m-%d").to_string())
+            .y_label_formatter(&|y| format!("{:.1}%", y))
+            .draw()?;
+
+        // 区域填充：从 0 线到 dd 曲线
+        chart.draw_series(AreaSeries::new(
+            drawdowns.iter().map(|(d, v)| (*d, *v)),
+            0.0,
+            RED.mix(0.25),
+        ).border_style(RED.stroke_width(1)))?
+        .label("Drawdown")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &RED));
+
+        // 0 基准线
+        chart.draw_series(LineSeries::new(
+            vec![(first_date, 0.0), (last_date, 0.0)],
+            BLACK.mix(0.5).stroke_width(1),
+        ))?;
 
         Ok(())
     }

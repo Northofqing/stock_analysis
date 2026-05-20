@@ -162,7 +162,7 @@ pub struct TrendAnalysisResult {
     // 风险调整后收益指标
     pub sharpe_ratio: Option<f64>,
 
-    // MACD / KDJ / RSI 技术指标分析
+    // MACD / SKDJ / RSI 技术指标分析
     pub indicator_analysis: Option<IndicatorAnalysis>,
 }
 
@@ -324,7 +324,7 @@ impl StockTrendAnalyzer {
         // 4. 支撑压力分析
         self.analyze_support_resistance(&data_with_ma, &mut result);
 
-        // 5. MACD / KDJ / RSI 技术指标分析
+        // 5. MACD / SKDJ / RSI 技术指标分析
         let highs: Vec<f64> = data_with_ma.iter().map(|d| d.high).collect();
         let lows: Vec<f64> = data_with_ma.iter().map(|d| d.low).collect();
         let closes: Vec<f64> = data_with_ma.iter().map(|d| d.close).collect();
@@ -693,21 +693,41 @@ impl StockTrendAnalyzer {
             }
 
             if ind.golden_cross_resonance {
-                reasons.push("🚀 MACD/KDJ/RSI多指标金叉共振".to_string());
+                reasons.push("🚀 MACD/SKDJ/RSI多指标金叉共振".to_string());
+                score += 10;
             }
             if ind.death_cross_resonance {
-                risks.push("💀 MACD/KDJ/RSI多指标死叉共振".to_string());
+                risks.push("💀 MACD/SKDJ/RSI多指标死叉共振".to_string());
+                score -= 15;
             }
             if ind.bottom_divergence_resonance {
                 reasons.push("🔥 多指标底背离共振，强烈看涨".to_string());
+                score += 15;
             }
             if ind.top_divergence_resonance {
                 risks.push("💀 多指标顶背离共振，强烈看跌".to_string());
+                score -= 25;
+            }
+        }
+
+        // === 极端风险兜底 ===
+        // 如果指标极其恶劣，强制熔断分数，避免趋势项好导致最终给出"建议买入"
+        if let Some(ref ind) = result.indicator_analysis {
+            if ind.top_divergence_resonance {
+                if score >= 60 {
+                    score = 55;
+                    risks.push("❌ 触发顶背离共振，强制降级至观望档位".to_string());
+                }
+            } else if ind.death_cross_resonance {
+                if score >= 65 {
+                    score = 59;
+                    risks.push("❌ 触发死叉共振，强制降级至观望档位".to_string());
+                }
             }
         }
 
         // === 综合判断 ===
-        result.signal_score = score;
+        result.signal_score = score.clamp(0, 100);
         result.signal_reasons = reasons;
         result.risk_factors = risks;
 

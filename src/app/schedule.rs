@@ -168,9 +168,10 @@ async fn run_time_schedule(
             let mut candidate = now
                 .date_naive()
                 .and_hms_opt(target_hour, target_minute, 0)
-                .unwrap()
+                .expect("调度时间点已在配置阶段校验为合法 HH:MM")
                 .and_local_timezone(Local)
-                .unwrap();
+                .single()
+                .expect("本地时区转换不应模糊（中国大陆无 DST）");
 
             // 刚执行完的时间点避免立即再次命中
             if candidate <= now + chrono::Duration::minutes(2) {

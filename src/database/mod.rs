@@ -41,6 +41,7 @@ static DB_INSTANCE: OnceCell<DatabaseManager> = OnceCell::new();
 mod kline;
 mod lhb;
 mod positions;
+pub(crate) mod agent_logs;
 
 // ============================================================================
 // 数据库管理器 - 单例模式
@@ -79,6 +80,22 @@ impl DatabaseManager {
             .map_err(|_| "数据库已经初始化")?;
 
         info!("数据库初始化完成");
+        
+        // 创建 agent_scratchpad 表 (Agent 内部思考和工具执行记录)
+        diesel::sql_query(
+            r#"
+            CREATE TABLE IF NOT EXISTS agent_scratchpad (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                step INTEGER NOT NULL,
+                log_type TEXT NOT NULL,
+                content TEXT,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            "#
+        )
+        .execute(&mut *conn)?;
+
         Ok(())
     }
 
@@ -90,7 +107,7 @@ impl DatabaseManager {
     }
 
     /// 获取数据库连接
-    fn get_conn(&self) -> Result<DbConnection, Box<dyn std::error::Error>> {
+    pub fn get_conn(&self) -> Result<DbConnection, Box<dyn std::error::Error>> {
         Ok(self.pool.get()?)
     }
 
@@ -121,23 +138,23 @@ impl DatabaseManager {
             )
             "#,
         )
-        .execute(conn)?;
+        .execute(&mut *conn)?;
 
         // 创建索引
         diesel::sql_query(
             "CREATE INDEX IF NOT EXISTS ix_stock_daily_code ON stock_daily(code)",
         )
-        .execute(conn)?;
+        .execute(&mut *conn)?;
 
         diesel::sql_query(
             "CREATE INDEX IF NOT EXISTS ix_stock_daily_date ON stock_daily(date)",
         )
-        .execute(conn)?;
+        .execute(&mut *conn)?;
 
         diesel::sql_query(
             "CREATE INDEX IF NOT EXISTS ix_stock_daily_code_date ON stock_daily(code, date)",
         )
-        .execute(conn)?;
+        .execute(&mut *conn)?;
 
         // 创建 lhb_daily 表
         diesel::sql_query(
@@ -161,23 +178,23 @@ impl DatabaseManager {
             )
             "#,
         )
-        .execute(conn)?;
+        .execute(&mut *conn)?;
 
         // 创建龙虎榜索引
         diesel::sql_query(
             "CREATE INDEX IF NOT EXISTS ix_lhb_daily_code ON lhb_daily(code)",
         )
-        .execute(conn)?;
+        .execute(&mut *conn)?;
 
         diesel::sql_query(
             "CREATE INDEX IF NOT EXISTS ix_lhb_daily_trade_date ON lhb_daily(trade_date)",
         )
-        .execute(conn)?;
+        .execute(&mut *conn)?;
 
         diesel::sql_query(
             "CREATE INDEX IF NOT EXISTS ix_lhb_daily_code_date ON lhb_daily(code, trade_date)",
         )
-        .execute(conn)?;
+        .execute(&mut *conn)?;
 
         // 创建 analysis_result 表
         diesel::sql_query(
@@ -203,17 +220,17 @@ impl DatabaseManager {
             )
             "#,
         )
-        .execute(conn)?;
+        .execute(&mut *conn)?;
 
         diesel::sql_query(
             "CREATE INDEX IF NOT EXISTS ix_analysis_result_code ON analysis_result(code)",
         )
-        .execute(conn)?;
+        .execute(&mut *conn)?;
 
         diesel::sql_query(
             "CREATE INDEX IF NOT EXISTS ix_analysis_result_date ON analysis_result(date)",
         )
-        .execute(conn)?;
+        .execute(&mut *conn)?;
 
         // 创建 stock_position 表（模拟持仓）
         diesel::sql_query(
@@ -235,17 +252,17 @@ impl DatabaseManager {
             )
             "#,
         )
-        .execute(conn)?;
+        .execute(&mut *conn)?;
 
         diesel::sql_query(
             "CREATE INDEX IF NOT EXISTS ix_stock_position_code ON stock_position(code)",
         )
-        .execute(conn)?;
+        .execute(&mut *conn)?;
 
         diesel::sql_query(
             "CREATE INDEX IF NOT EXISTS ix_stock_position_status ON stock_position(status)",
         )
-        .execute(conn)?;
+        .execute(&mut *conn)?;
 
         Ok(())
     }

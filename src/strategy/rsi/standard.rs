@@ -41,11 +41,11 @@ pub struct RsiConfig {
     pub ema_period: usize,
     /// SMA 周期（默认 20）
     pub sma_period: usize,
-    /// MACD 快线周期（默认 12）
+    /// MACD 快线周期（默认 6，对齐东方财富客户端自定义）
     pub macd_fast: usize,
-    /// MACD 慢线周期（默认 26）
+    /// MACD 慢线周期（默认 13，对齐东方财富客户端自定义）
     pub macd_slow: usize,
-    /// MACD 信号线周期（默认 9）
+    /// MACD 信号线周期（默认 5，对齐东方财富客户端自定义）
     pub macd_signal: usize,
     /// 增强过滤器最少通过数量（评分制：启用的过滤器中至少通过几个才允许买入，默认 1）
     /// 设为 0 表示不需要任何增强过滤器通过，仅依赖 RSI 超卖信号
@@ -80,6 +80,8 @@ pub struct RsiConfig {
     pub commission_rate: f64,
     /// 滑点率
     pub slippage_rate: f64,
+    /// 印花税率（A 股仅卖方征收，现行 0.001）
+    pub stamp_tax_rate: f64,
 }
 
 impl Default for RsiConfig {
@@ -96,9 +98,9 @@ impl Default for RsiConfig {
             use_ema_sma_filter: true,
             ema_period: 20,
             sma_period: 20,
-            macd_fast: 12,
-            macd_slow: 26,
-            macd_signal: 9,
+            macd_fast: 6,
+            macd_slow: 13,
+            macd_signal: 5,
             min_buy_filters: 1,
             require_all_filters: false,
             cooldown_bars: 10,
@@ -115,6 +117,7 @@ impl Default for RsiConfig {
             max_position_pct: 0.50,
             commission_rate: 0.0003,
             slippage_rate: 0.001,
+            stamp_tax_rate: 0.001,
         }
     }
 }
@@ -310,6 +313,7 @@ pub fn compute_rsi_indicators(klines: &[KlineData], config: &RsiConfig) -> Resul
         .map(|k| k.date.format("%Y-%m-%d").to_string())
         .collect();
     let close: Vec<f64> = klines.iter().map(|k| k.close).collect();
+    let open: Vec<f64> = klines.iter().map(|k| k.open).collect();
 
     // 使用 Wilder 指数平滑计算 RSI（替代 Polars rolling_mean SMA 版本）
     let rsi_wilder = compute_rsi_wilder(&close, config.rsi_period);
@@ -321,6 +325,7 @@ pub fn compute_rsi_indicators(klines: &[KlineData], config: &RsiConfig) -> Resul
     let df = df![
         "date"  => &dates,
         "close" => &close,
+        "open"  => &open,
         "rsi"   => &rsi_series,
     ]?;
 
@@ -397,6 +402,10 @@ impl RsiResult {
         let mut report = String::new();
         report.push_str("# 📊 RSI 增强策略 v2 回测报告（Wilder RSI + 跌势减缓过滤 + 冷却期 + 分档加仓）\n\n");
         report.push_str(&format!("**生成时间**: {}\n\n", now));
+        report.push_str("> ⚠️ **免责声明**\n");
+        report.push_str("> - 股票池为静态清单，存在**幸存者偏差**（未含历史退市 / ST / 被剔除标的）。\n");
+        report.push_str("> - 交易事件采用 **T 日信号 / T+1 日 open 成交**（已修复 look-ahead）。\n");
+        report.push_str("> - commission 字段含佣金+印花税（卖出）；滑点已反映在成交价中。\n\n");
         report.push_str("---\n\n");
 
         // 策略参数
@@ -544,7 +553,7 @@ impl RsiResult {
         ));
         report.push_str("| 过滤器 | 条件 | 作用 |\n|--------|------|------|\n");
         report.push_str("| VWAP 月度 | 价格在 VWAP ±3% 范围内 | 接近机构成本线，有支撑 |\n");
-        report.push_str("| MACD (12/26/9) | 柱状线负值收窄 或 已转正 | 跌势放缓/动能恢复 |\n");
+        report.push_str("| MACD (6/13/5) | 柱状线负值收窄 或 已转正 | 跌势放缓/动能恢复 |\n");
         report.push_str("| EMA20 / SMA20 | 价格在均线下方 3% 以内 | 接近支撑位，非深度破位 |\n");
         report.push_str("| MA60 趋势 | 价格 > MA60 | 中期趋势过滤 |\n\n");
         report.push_str("### 卖出条件\n");
@@ -584,6 +593,7 @@ impl RsiBacktest {
 
         let dates = df.column("date")?.str()?.clone();
         let close_col = df.column("close")?.f64()?.clone();
+        let open_col = df.column("open")?.f64()?.clone();   // 以次日 open 成交，避免未来函数
         let rsi_col = df.column("rsi")?.f64()?.clone();
         let uptrend_col: Option<ChunkedArray<BooleanType>> = if self.config.use_trend_filter {
             df.column("is_uptrend")
@@ -644,6 +654,24 @@ impl RsiBacktest {
                 .from_local_datetime(&naive.and_hms_opt(15, 0, 0).unwrap())
                 .single()
                 .unwrap_or_else(|| Local::now());
+
+            // 成交价：次日 open（避免 look-ahead）。末根信号丢弃
+            let next_exec = if i + 1 < n {
+                match (open_col.get(i + 1), dates.get(i + 1)) {
+                    (Some(p), Some(d_str)) => {
+                        let d = NaiveDate::parse_from_str(d_str, "%Y-%m-%d")
+                            .unwrap_or_else(|_| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
+                        let dt_next = Local
+                            .from_local_datetime(&d.and_hms_opt(15, 0, 0).unwrap())
+                            .single()
+                            .unwrap_or_else(|| Local::now());
+                        Some((p, dt_next))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
 
             // 日期范围过滤：仅在范围内记录净值和交易
             let in_date_range = self.config.start_date.map_or(true, |s| naive >= s)
@@ -781,12 +809,17 @@ impl RsiBacktest {
                 let hit_tp = self.config.take_profit_pct > 0.0
                     && pnl_pct >= self.config.take_profit_pct;
                 if hit_stop || hit_tp {
-                    let sell_price = close * (1.0 - self.config.slippage_rate);
+                    let Some((next_open, next_dt)) = next_exec else {
+                        signals.push(Signal::Hold); // 末根无法成交
+                        continue;
+                    };
+                    let sell_price = next_open * (1.0 - self.config.slippage_rate);
                     let amount = shares * sell_price;
-                    let comm = amount * self.config.commission_rate;
+                    // 印花税合并到 commission（commission 语义为总交易费用）
+                    let comm = amount * (self.config.commission_rate + self.config.stamp_tax_rate);
                     cash += amount - comm;
                     trades.push(Trade {
-                        date: dt,
+                        date: next_dt,
                         code: code.to_string(),
                         name: name.to_string(),
                         action: TradeAction::Sell,
@@ -807,6 +840,10 @@ impl RsiBacktest {
 
             // ──── 买入：RSI 超卖 + 趋势 + 过滤器 + 冷却期（空仓首次建仓） ────
             if rsi < self.config.oversold && shares < 1.0 && uptrend && filters_ok && cooldown_ok && rsi_rising_ok {
+                let Some((next_open, next_dt)) = next_exec else {
+                    signals.push(Signal::Hold); // 末根无法成交
+                    continue;
+                };
                 // P2: RSI 分档决定仓位比例 — RSI 越低仓位越重
                 let position_pct = if rsi < 15.0 {
                     0.70_f64.min(self.config.max_position_pct * 2.0)
@@ -815,7 +852,7 @@ impl RsiBacktest {
                 } else {
                     self.config.max_position_pct
                 };
-                let buy_price = close * (1.0 + self.config.slippage_rate);
+                let buy_price = next_open * (1.0 + self.config.slippage_rate);
                 let invest = cash.min(self.config.initial_capital * position_pct);
                 let buy_shares = (invest / buy_price).floor();
                 if buy_shares > 0.0 {
@@ -827,7 +864,7 @@ impl RsiBacktest {
                     bars_held = 0;
                     min_rsi_in_pos = rsi;
                     trades.push(Trade {
-                        date: dt,
+                        date: next_dt,
                         code: code.to_string(),
                         name: name.to_string(),
                         action: TradeAction::Buy,
@@ -848,7 +885,11 @@ impl RsiBacktest {
                 && rsi < min_rsi_in_pos - self.config.add_on_rsi_delta
                 && cash > self.config.initial_capital * 0.05
             {
-                let buy_price = close * (1.0 + self.config.slippage_rate);
+                let Some((next_open, next_dt)) = next_exec else {
+                    signals.push(Signal::Hold);
+                    continue;
+                };
+                let buy_price = next_open * (1.0 + self.config.slippage_rate);
                 let invest = cash.min(self.config.initial_capital * self.config.add_on_position_pct);
                 let add_shares = (invest / buy_price).floor();
                 if add_shares > 0.0 {
@@ -859,7 +900,7 @@ impl RsiBacktest {
                     shares += add_shares;
                     min_rsi_in_pos = rsi;
                     trades.push(Trade {
-                        date: dt,
+                        date: next_dt,
                         code: code.to_string(),
                         name: name.to_string(),
                         action: TradeAction::Buy,
@@ -899,12 +940,16 @@ impl RsiBacktest {
                 }
 
                 if should_sell {
-                    let sell_price = close * (1.0 - self.config.slippage_rate);
+                    let Some((next_open, next_dt)) = next_exec else {
+                        signals.push(Signal::Hold);
+                        continue;
+                    };
+                    let sell_price = next_open * (1.0 - self.config.slippage_rate);
                     let amount = shares * sell_price;
-                    let comm = amount * self.config.commission_rate;
+                    let comm = amount * (self.config.commission_rate + self.config.stamp_tax_rate);
                     cash += amount - comm;
                     trades.push(Trade {
-                        date: dt,
+                        date: next_dt,
                         code: code.to_string(),
                         name: name.to_string(),
                         action: TradeAction::Sell,

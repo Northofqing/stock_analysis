@@ -15,6 +15,30 @@ pub fn run_analysis(
     macro_context: &str,
     limit_up_codes: std::collections::HashSet<String>,
 ) -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new()?;
+
+    // 如果启用了 Multi-Agent 深度分析，则只跑深度分析
+    if args.deep_analysis {
+        let deep_targets: Vec<String> = match &args.stocks {
+            Some(s) if !s.is_empty() => s.clone(),
+            _ => stock_codes.to_vec(),
+        };
+        info!(
+            "模式: Multi-Agent 深度分析（共 {} 只）",
+            deep_targets.len()
+        );
+        runtime.block_on(async {
+            for code in &deep_targets {
+                info!("[DeepAnalysis] 开始 {}", code);
+                match stock_analysis::deep_analyzer::run_and_save(code).await {
+                    Ok(path) => info!("[DeepAnalysis] {} 完成: {}", code, path.display()),
+                    Err(e) => log::error!("[DeepAnalysis] {} 失败: {:#}", code, e),
+                }
+            }
+        });
+        return Ok(());
+    }
+
     info!("模式: 单次分析");
 
     let config = PipelineConfig {
@@ -26,7 +50,6 @@ pub fn run_analysis(
 
     let pipeline = AnalysisPipeline::new(config)?.with_limit_up_codes(limit_up_codes);
 
-    let runtime = tokio::runtime::Runtime::new()?;
     let mc = if macro_context.is_empty() {
         None
     } else {
@@ -35,8 +58,9 @@ pub fn run_analysis(
     let results = runtime.block_on(pipeline.run(stock_codes, mc))?;
 
     if !results.is_empty() {
-        info!("\n===== 分析结果摘要 =====");
-        let mut sorted_results = results.clone();
+        info!("
+===== 分析结果摘要 =====");
+        let mut sorted_results = results;
         sorted_results.sort_by(|a, b| b.sentiment_score.cmp(&a.sentiment_score));
         for r in sorted_results.iter() {
             info!(
@@ -49,10 +73,10 @@ pub fn run_analysis(
             );
         }
     }
+    
     Ok(())
 }
 
-/// 仅运行大盘复盘。
 pub fn run_market_review_only() -> Result<()> {
     use stock_analysis::market_analyzer::MarketAnalyzer;
     use stock_analysis::notification::NotificationService;
@@ -130,14 +154,15 @@ pub fn run_lhb_analysis(args: &Args) -> Result<()> {
             .collect();
         info!("获取到 {} 只龙虎榜股票（去重后）", unique_lhb.len());
 
+        let total = unique_lhb.len();
         let mut good_stocks = Vec::new();
-        for (i, record) in unique_lhb.iter().enumerate() {
+        for (i, record) in unique_lhb.into_iter().enumerate() {
             if i > 0 && i % 10 == 0 {
-                info!("已处理 {}/{} 只股票", i, unique_lhb.len());
+                info!("已处理 {}/{} 只股票", i, total);
             }
             match fetcher.analyze_stock_lhb(&record.code).await {
                 Ok(analysis) if analysis.total_score >= lhb_min_score => {
-                    good_stocks.push((record.clone(), analysis));
+                    good_stocks.push((record, analysis));
                 }
                 Ok(_) => {}
                 Err(e) => log::warn!("分析 {} 失败: {}", record.code, e),
@@ -197,7 +222,7 @@ pub fn run_lhb_analysis(args: &Args) -> Result<()> {
 
     info!("\n===== 龙虎榜选股分析结果 =====");
     if !results.is_empty() {
-        let mut sorted = results.clone();
+        let mut sorted = results;
         sorted.sort_by(|a, b| b.sentiment_score.cmp(&a.sentiment_score));
         for r in sorted.iter() {
             let lhb_info = good_stocks

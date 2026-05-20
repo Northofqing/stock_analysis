@@ -83,7 +83,7 @@ fn as_f64(v: &Value) -> Option<f64> {
 }
 
 /// 抓取近 `lmt` 天资金流（daykline）
-async fn fetch_flow_history_async(
+pub async fn fetch_flow_history_async(
     client: &reqwest::Client,
     code: &str,
     lmt: usize,
@@ -153,7 +153,7 @@ async fn fetch_flow_history_async(
 }
 
 /// 抓取当日分时（trends2）并计算形态
-async fn fetch_intraday_shape_async(
+pub async fn fetch_intraday_shape_async(
     client: &reqwest::Client,
     code: &str,
 ) -> Result<IntradayShape> {

@@ -29,6 +29,7 @@ pub mod multi_factor;
 pub mod rsi;
 pub mod contrarian;
 pub mod boll_macd;
+pub mod multi_timeframe;
 
 pub use rsi::{RsiStrategy, RsiConfig, RsiBacktest, RsiResult, SingleRsiResult};
 pub use rsi::{PrecisionRsiStrategy, PrecisionRsiConfig, PrecisionRsiBacktest, PrecisionRsiResult, SinglePrecisionRsiResult};
@@ -37,6 +38,7 @@ pub use multi_factor::{MultiFactorStrategy, MultiFactorEngine, MultiFactorConfig
 pub use core::{BacktestSummary, BacktestState, BacktestEngine, BacktestConfig, Trade, TradeAction, Position};
 pub use contrarian::{detect_contrarian_signal, ContrarianSignal};
 pub use boll_macd::{detect_boll_macd_signal, BollMacdAction, BollMacdSignal};
+pub use multi_timeframe::{assess_entry as assess_multi_timeframe_entry, EntryAssessment};
 
 // ────────────────────────────── 通用信号类型 ──────────────────────────────
 
