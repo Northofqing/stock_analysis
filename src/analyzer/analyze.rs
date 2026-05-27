@@ -138,8 +138,8 @@ impl GeminiAnalyzer {
             context.push_str(&format!("\n【涨跌停】大涨 {:.2}%（未涨停）\n", latest.pct_chg));
         }
 
-        // ========== MACD (12,26,9) ==========
-        if data_len >= 26 {
+        // ========== MACD (6,13,5) ==========
+        if data_len >= 13 {
             // 注意：kline_data[0] 是最新，计算 EMA 需要按时间顺序（旧→新）
             let mut chron: Vec<f64> = closes.iter().rev().copied().collect();
             // 仅取最近 60 根以提升效率（足够让 EMA 收敛）
@@ -155,10 +155,10 @@ impl GeminiAnalyzer {
                 }
                 out
             };
-            let ema12 = ema(12, &chron);
-            let ema26 = ema(26, &chron);
-            let diff: Vec<f64> = ema12.iter().zip(ema26.iter()).map(|(a,b)| a-b).collect();
-            let dea = ema(9, &diff);
+            let ema6 = ema(6, &chron);
+            let ema13 = ema(13, &chron);
+            let diff: Vec<f64> = ema6.iter().zip(ema13.iter()).map(|(a,b)| a-b).collect();
+            let dea = ema(5, &diff);
             let n = diff.len();
             let macd = 2.0 * (diff[n-1] - dea[n-1]);
             let macd_signal = if diff[n-1] > dea[n-1] && n >= 2 && diff[n-2] <= dea[n-2] {
@@ -199,26 +199,27 @@ impl GeminiAnalyzer {
             context.push_str(&format!("【RSI14】{:.2}\n", rsi));
         }
 
-        // ========== KDJ(9,3,3) ==========
-        if data_len >= 9 {
+        // ========== SKDJ(40,5) ==========
+        if data_len >= 40 {
             let chron: Vec<&crate::data_provider::KlineData> = kline_data.iter().rev().collect();
             let mut k_val = 50.0;
             let mut d_val = 50.0;
-            let n = chron.len();
-            let start = n.saturating_sub(30).max(8); // 让 KDJ 迭代收敛
-            for i in start..n {
-                let window_start = i.saturating_sub(8);
+            let n_len = chron.len();
+            let start = n_len.saturating_sub(60).max(39); // 保证一定的预热期收敛
+            let alpha = 2.0 / (5.0 + 1.0);
+            for i in start..n_len {
+                let window_start = i.saturating_sub(39);
                 let window = &chron[window_start..=i];
                 let hh = window.iter().map(|k| k.high).fold(f64::NEG_INFINITY, f64::max);
                 let ll = window.iter().map(|k| k.low).fold(f64::INFINITY, f64::min);
                 let rsv = if (hh - ll).abs() < 1e-9 { 50.0 }
                     else { (chron[i].close - ll) / (hh - ll) * 100.0 };
-                k_val = 2.0 / 3.0 * k_val + 1.0 / 3.0 * rsv;
-                d_val = 2.0 / 3.0 * d_val + 1.0 / 3.0 * k_val;
+                k_val = alpha * rsv + (1.0 - alpha) * k_val;
+                d_val = alpha * k_val + (1.0 - alpha) * d_val;
             }
             let j_val = 3.0 * k_val - 2.0 * d_val;
             context.push_str(&format!(
-                "【KDJ】K={:.2} D={:.2} J={:.2}\n",
+                "【SKDJ】K={:.2} D={:.2} J={:.2}\n",
                 k_val, d_val, j_val
             ));
         }
@@ -388,13 +389,14 @@ impl GeminiAnalyzer {
             "\n输出硬性约束（评分一致性）：\n\
             1) 【技术面】必须按上文\"评分加分项/扣分项\"逐项复述，不得引入未在评分明细中的技术指标。\n\
             2) 【操作建议】结论必须严格等于上文\"系统评分→档位\"映射，不得自行降档或升档。\n\
-            3) 【基本面】【主力资金】【宏观影响】仅作背景说明；若发现严重背离，写入【风险提示】，不得改变操作建议档位。\n\
-            4) 不要输出任何与系统评分相矛盾的总结性结论。\n"
+            3) 【消息面】包括投资者关系、行业新闻、产业上下游、政策法规等，但仅作背景说明，不得作为评分的主要依据。\n\
+            4) 【基本面】【主力资金】【宏观影响】仅作背景说明；若发现严重背离，写入【风险提示】，不得改变操作建议档位。\n\
+            5) 不要输出任何与系统评分相矛盾的总结性结论。\n"
         } else { "" };
 
         let prompt = format!(
-            "请基于以下数据分析该股，仅输出【宏观影响】【技术面】【主力资金】【基本面】【操作建议（含买入价/目标价/止损位）】【风险提示】六段，每段不超过 3 句。\n\
-            输出格式约束：使用 Markdown 标题（##/###）、不要使用引号块、不要复述输入数据中的章节标题（例如\"系统技术评分\"\"宏观市场背景\"），仅输出六段中文段落，每段以【XX】开头。\n\
+            "请基于以下数据分析该股，仅输出【宏观影响】【消息面】【技术面】【主力资金】【基本面】【操作建议（含买入价/目标价/止损位）】【风险提示】七段，每段不超过 3 句。\n\
+            输出格式约束：使用 Markdown 标题（##/###）、不要使用引号块、不要复述输入数据中的章节标题（例如\"系统技术评分\"\"宏观市场背景\"），仅输出七段中文段落，每段以【XX】开头。\n\
             若上下文含【布林+MACD 共振信号】段：TopSell→不得建议买入，评分压在 50 以下；BottomBuy→可买入但仓位≤30%；UptrendStart→可加仓至 60%；PreReversal→仅观察。{alignment}\n\n{ctx}{rubric}{macro_}",
             alignment = alignment_rules,
             ctx = context,

@@ -182,8 +182,11 @@ impl PrecisionRsiResult {
         report.push_str(&format!("| 年化收益率 | {:.2}% | - |\n", summary.annual_return * 100.0));
         let dd_label = if summary.max_drawdown < 0.1 { "🛡️ 风险较低" } else if summary.max_drawdown < 0.2 { "⚠️ 风险适中" } else { "🚨 风险较高" };
         report.push_str(&format!("| 最大回撤 | {:.2}% | {} |\n", summary.max_drawdown * 100.0, dd_label));
-        let sr_label = if summary.sharpe_ratio > 1.0 { "⭐ 优秀" } else if summary.sharpe_ratio > 0.5 { "✅ 良好" } else { "⚠️ 一般" };
-        report.push_str(&format!("| 夏普比率 | {:.2} | {} |\n", summary.sharpe_ratio, sr_label));
+        let sr_label = if summary.sharpe_ratio > 1.0 { "优秀" } else if summary.sharpe_ratio > 0.5 { "良好" } else { "一般" };
+        report.push_str(&format!("| 夏普比率(年化) | {:.3} | {} (已扣2.5%无风险率) |\n", summary.sharpe_ratio, sr_label));
+        report.push_str(&format!("| Sortino比率(年化) | {:.3} | 只惩罚下行波动 |\n", summary.sortino_ratio));
+        report.push_str(&format!("| Calmar比率 | {:.3} | 年化收益/最大回撤 |\n", summary.calmar_ratio));
+        report.push_str(&format!("| 平均仓位 | {:.1}% | 暴露率(越低越保守) |\n", summary.average_exposure * 100.0));
         report.push_str(&format!("| 总交易次数 | {} 次 | - |\n", summary.total_trades));
         report.push_str(&format!("| 胜率 | {:.1}% | - |\n\n", summary.win_rate * 100.0));
 

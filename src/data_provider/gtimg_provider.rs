@@ -310,7 +310,11 @@ impl GtimgProvider {
                                         name: parts[1].to_string(),
                                         price,
                                         pct_chg,
-                                        pe_ratio: parts[39].parse::<f64>().unwrap_or(0.0),
+                                        // 【修改】腾讯接口的PE有两个：
+                                        // parts[39] 是动态市盈率/TTM，某些股容易飘
+                                        // parts[52] 是静态（部分软件展示的TTM或东财展示的值更接近这个）或者 TTM的另一种算法。
+                                        // 东财对于大港显示 69.29，而部分[52]下恰好就是 69.29 (参考打印日志)
+                                        pe_ratio: parts[52].parse::<f64>().unwrap_or_else(|_| parts[39].parse::<f64>().unwrap_or(0.0)),
                                         pb_ratio: parts[46].parse::<f64>().unwrap_or(0.0),
                                         turnover_rate: parts[38].parse::<f64>().unwrap_or(0.0),
                                         market_cap: parts[45].parse::<f64>().unwrap_or(0.0), // 已经是亿为单位

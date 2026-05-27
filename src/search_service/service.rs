@@ -124,6 +124,12 @@ impl SearchService {
         // 维度3: 行业/合作/订单（简称搜索）
         queries.push(format!("{} 合作 中标 订单 签约", invest_name));
 
+        // 维度4: 负面风险排查（简称 + 代码）
+        queries.push(format!("{} {} 减持 处罚 风险", stock_name, stock_code));
+
+        // 维度5: 业绩预期（简称 + 代码）
+        queries.push(format!("{} {} 年报预告 业绩预告 业绩快报", stock_name, stock_code));
+
         let mut all_results: Vec<SearchResult> = Vec::new();
         let mut success_provider = String::new();
         let mut total_search_time = 0.0;

@@ -54,7 +54,7 @@ pub(super) fn build_backtest_report(summary: &BacktestSummary) -> String {
     s.push_str(&format!(
         "| 总收益率 | {:.2}% | {} |\n",
         summary.total_return * 100.0,
-        if summary.total_return > 0.0 { "📈 盈利" } else { "📉 亏损" }
+        if summary.total_return > 0.0 { "盈利" } else { "亏损" }
     ));
     s.push_str(&format!(
         "| 年化收益率 | {:.2}% | 折算成年化收益 |\n",
@@ -64,24 +64,44 @@ pub(super) fn build_backtest_report(summary: &BacktestSummary) -> String {
         "| 最大回撤 | {:.2}% | {} |\n",
         summary.max_drawdown * 100.0,
         if summary.max_drawdown < 0.1 {
-            "🛡️ 风险较低"
+            "风险较低"
         } else if summary.max_drawdown < 0.2 {
-            "⚠️ 风险适中"
+            "风险适中"
         } else {
-            "🚨 风险较高"
+            "风险较高"
         }
     ));
     s.push_str(&format!(
-        "| 夏普比率 | {:.2} | {} |\n",
-        summary.sharpe_ratio,
-        if summary.sharpe_ratio > 1.0 {
-            "⭐ 优秀"
-        } else if summary.sharpe_ratio > 0.5 {
-            "✅ 良好"
-        } else {
-            "⚠️ 一般"
-        }
+        "| 夏普比率(年化) | {:.3} | 已扣2.5%无风险率 |\n",
+        summary.sharpe_ratio
     ));
+    s.push_str(&format!(
+        "| Sortino比率(年化) | {:.3} | 只惩罚下行波动 |\n",
+        summary.sortino_ratio
+    ));
+    s.push_str(&format!(
+        "| Calmar比率 | {:.3} | 年化收益/最大回撤 |\n",
+        summary.calmar_ratio
+    ));
+    s.push_str(&format!(
+        "| 平均仓位 | {:.1}% | 暴露率(越低越保守) |\n",
+        summary.average_exposure * 100.0
+    ));
+
+    // 基准对标
+    if let Some(benchmark) = summary.benchmark_annual_return {
+        s.push_str(&format!(
+            "| 基准年化收益 | {:.2}% | 沪深300年化收益 |\n",
+            benchmark * 100.0
+        ));
+        if let Some(alpha) = summary.alpha {
+            s.push_str(&format!(
+                "| Alpha超额收益 | {:.2}% | 相对基准的超额 |\n",
+                alpha * 100.0
+            ));
+        }
+    }
+
     s.push_str(&format!(
         "| 交易次数 | {} 次 | 总交易次数 |\n",
         summary.total_trades
@@ -91,7 +111,13 @@ pub(super) fn build_backtest_report(summary: &BacktestSummary) -> String {
         summary.win_rate * 100.0
     ));
 
-    s.push_str("\n## 策略说明\n\n");
+    s.push_str("\n## 风险免责声明\n\n");
+    s.push_str("- 股票池为静态清单，存在**幸存者偏差**（未含历史退市/ST/被剔除标的）\n");
+    s.push_str("- 涨跌停、停牌日期间无法成交的假设未完全真实化\n");
+    s.push_str("- 成本模型采用固定百分比滑点，未考虑市场流动性变化\n");
+    s.push_str("- 回测中基准对标为参考，实际业绩可能存在偏差\n\n");
+
+    s.push_str("## 策略说明\n\n");
     s.push_str("**多因子选股策略**: 基于市值、市盈率、市净率、换手率等多因子综合评分，选出得分最高的3只股票进行等权重配置。\n\n");
 
     if let Some(chart_path) = &summary.chart_path {

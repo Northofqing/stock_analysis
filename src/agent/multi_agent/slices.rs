@@ -186,7 +186,7 @@ fn build_technical_slice(
     }
 
     // MACD
-    if n >= 26 {
+    if n >= 13 {
         let mut chron: Vec<f64> = closes.iter().rev().copied().collect();
         if chron.len() > 120 {
             chron = chron[chron.len() - 120..].to_vec();
@@ -202,10 +202,10 @@ fn build_technical_slice(
             }
             out
         };
-        let ema12 = ema(12, &chron);
-        let ema26 = ema(26, &chron);
-        let diff: Vec<f64> = ema12.iter().zip(ema26.iter()).map(|(a, b)| a - b).collect();
-        let dea = ema(9, &diff);
+        let ema6 = ema(6, &chron);
+        let ema13 = ema(13, &chron);
+        let diff: Vec<f64> = ema6.iter().zip(ema13.iter()).map(|(a, b)| a - b).collect();
+        let dea = ema(5, &diff);
         let m = diff.len();
         let macd = 2.0 * (diff[m - 1] - dea[m - 1]);
         let sig = if diff[m - 1] > dea[m - 1] && m >= 2 && diff[m - 2] <= dea[m - 2] {
@@ -267,7 +267,7 @@ fn build_technical_slice(
     }
 
     // SKDJ (40, 5)
-    if n >= 9 {
+    if n >= SKDJ_N {
         let highs_chron: Vec<f64> = kline_data.iter().rev().map(|x| x.high).collect();
         let lows_chron: Vec<f64> = kline_data.iter().rev().map(|x| x.low).collect();
         let closes_chron: Vec<f64> = kline_data.iter().rev().map(|x| x.close).collect();

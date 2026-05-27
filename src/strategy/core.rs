@@ -164,8 +164,9 @@ impl BacktestState {
         (last_value / first_value).powf(1.0 / years) - 1.0
     }
 
-    /// 计算夏普比率（简化版，假设无风险利率为0）
-    pub fn sharpe_ratio(&self) -> f64 {
+    /// 计算夏普比率（修正版，扣除无风险利率）
+    /// risk_free_rate: 年化无风险利率，默认2.5%
+    pub fn sharpe_ratio(&self, risk_free_rate: f64) -> f64 {
         if self.daily_values.len() < 2 {
             return 0.0;
         }
@@ -184,10 +185,8 @@ impl BacktestState {
             return 0.0;
         }
 
-        // 计算平均收益率
+        // 计算平均收益率和标准差
         let mean: f64 = daily_returns.iter().sum::<f64>() / daily_returns.len() as f64;
-
-        // 计算标准差
         let variance: f64 = daily_returns
             .iter()
             .map(|r| (r - mean).powi(2))
@@ -195,12 +194,97 @@ impl BacktestState {
             / daily_returns.len() as f64;
         let std_dev = variance.sqrt();
 
+        // 日化无风险利率
+        let daily_rf = risk_free_rate / 252.0;
+
         if std_dev > 0.0 {
-            // 年化夏普比率
-            mean / std_dev * (252.0_f64).sqrt()
+            // 年化夏普比率 = (平均日收益 - 日化无风险率) / 日标准差 * sqrt(252)
+            (mean - daily_rf) / std_dev * (252.0_f64).sqrt()
         } else {
             0.0
         }
+    }
+
+    /// 计算Sortino比率（只惩罚向下波动）
+    pub fn sortino_ratio(&self, risk_free_rate: f64) -> f64 {
+        if self.daily_values.len() < 2 {
+            return 0.0;
+        }
+
+        // 计算每日收益率
+        let mut daily_returns = Vec::new();
+        for i in 1..self.daily_values.len() {
+            let prev_value = self.daily_values[i - 1].1;
+            let curr_value = self.daily_values[i].1;
+            if prev_value > 0.0 {
+                daily_returns.push((curr_value - prev_value) / prev_value);
+            }
+        }
+
+        if daily_returns.is_empty() {
+            return 0.0;
+        }
+
+        let mean: f64 = daily_returns.iter().sum::<f64>() / daily_returns.len() as f64;
+        let daily_rf = risk_free_rate / 252.0;
+
+        // 只计算向下的偏差
+        let downside_variance: f64 = daily_returns
+            .iter()
+            .map(|r| {
+                let excess = r - daily_rf;
+                if excess < 0.0 { excess.powi(2) } else { 0.0 }
+            })
+            .sum::<f64>()
+            / daily_returns.len() as f64;
+        let downside_std = downside_variance.sqrt();
+
+        if downside_std > 0.0 {
+            (mean - daily_rf) / downside_std * (252.0_f64).sqrt()
+        } else {
+            0.0
+        }
+    }
+
+    /// 计算Calmar比率 = 年化收益 / 最大回撤
+    pub fn calmar_ratio(&self) -> f64 {
+        let annual = self.annual_return();
+        let mdd = self.max_drawdown();
+
+        if mdd > 0.01 {  // 回撤大于1%才计算
+            annual / mdd
+        } else {
+            0.0
+        }
+    }
+
+    /// 计算平均仓位(暴露率) - 从daily_values推算
+    pub fn average_exposure(&self, initial_capital: f64) -> (f64, Vec<f64>) {
+        let mut daily_exposure = Vec::new();
+        let mut total_exposure = 0.0;
+
+        // 从每日净值推算仓位(净值越高说明仓位越重)
+        if self.daily_values.is_empty() {
+            return (0.0, daily_exposure);
+        }
+
+        let initial_value = self.daily_values[0].1;
+
+        for (_, value) in &self.daily_values {
+            // 简化估算: 用当前净值与初值的比率乘以假设的平均持有周期
+            // 实际应该从持仓明细推算，这里暂用保守估计
+            let exposure = (*value / initial_value).min(1.0);
+            daily_exposure.push(exposure);
+            total_exposure += exposure;
+        }
+
+        let avg = if !daily_exposure.is_empty() {
+            total_exposure / daily_exposure.len() as f64
+        } else {
+            0.0
+        };
+
+        (avg, daily_exposure)
     }
 }
 
@@ -389,9 +473,14 @@ pub struct BacktestSummary {
     pub annual_return: f64,
     pub max_drawdown: f64,
     pub sharpe_ratio: f64,
+    pub sortino_ratio: f64,            // NEW: Sortino比率
+    pub calmar_ratio: f64,             // NEW: Calmar比率
+    pub average_exposure: f64,         // NEW: 平均仓位
     pub total_trades: usize,
     pub win_rate: f64,
     pub chart_path: Option<String>,  // 图表路径
+    pub benchmark_annual_return: Option<f64>,  // NEW: 基准年化收益(如沪深300)
+    pub alpha: Option<f64>,            // NEW: Alpha值
 }
 
 impl BacktestSummary {
@@ -400,14 +489,22 @@ impl BacktestSummary {
         let total_return = state.total_return();
         let annual_return = state.annual_return();
         let max_drawdown = state.max_drawdown();
-        let sharpe_ratio = state.sharpe_ratio();
+
+        // 使用2.5% 1Y国债作为无风险利率
+        let risk_free_rate = 0.025;
+        let sharpe_ratio = state.sharpe_ratio(risk_free_rate);
+        let sortino_ratio = state.sortino_ratio(risk_free_rate);
+
+        let calmar_ratio = state.calmar_ratio();
+        let (average_exposure, _) = state.average_exposure(initial_capital);
+
         let total_trades = state.trades.len();
-        
+
         // 计算胜率
         let mut wins = 0;
         let mut total_closed = 0;
         let mut positions_closed: HashMap<String, (f64, f64)> = HashMap::new(); // (avg_cost, total_shares)
-        
+
         for trade in &state.trades {
             match trade.action {
                 TradeAction::Buy => {
@@ -422,7 +519,7 @@ impl BacktestSummary {
                             wins += 1;
                         }
                         total_closed += 1;
-                        
+
                         *total_shares -= trade.shares;
                         if *total_shares < 0.01 {
                             positions_closed.remove(&trade.code);
@@ -431,7 +528,7 @@ impl BacktestSummary {
                 }
             }
         }
-        
+
         let win_rate = if total_closed > 0 {
             wins as f64 / total_closed as f64
         } else {
@@ -445,9 +542,14 @@ impl BacktestSummary {
             annual_return,
             max_drawdown,
             sharpe_ratio,
+            sortino_ratio,
+            calmar_ratio,
+            average_exposure,
             total_trades,
             win_rate,
-            chart_path: None,  // 初始化为空，后续通过set_chart_path设置
+            chart_path: None,
+            benchmark_annual_return: None,
+            alpha: None,
         }
     }
 

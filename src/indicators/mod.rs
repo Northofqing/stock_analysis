@@ -485,9 +485,9 @@ mod tests {
     #[test]
     fn test_macd() {
         let (_, _, closes) = make_price_data(60);
-        let macd = calc_macd(&closes, 12, 26, 9);
+        let macd = calc_macd(&closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL);
         assert_eq!(macd.len(), 60);
-        // DIF = EMA12 - EMA26, 在上涨趋势中应为正
+        // DIF = EMA_FAST - EMA_SLOW, 在上涨趋势中应为正
         assert!(macd[40].dif > 0.0);
     }
 

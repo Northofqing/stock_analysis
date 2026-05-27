@@ -179,6 +179,24 @@ fn score_to_advice(score: i32) -> &'static str {
     }
 }
 
+/// 规范化 AI 输出的章节标题：
+/// 将以 `【XX】` 开头但缺失 `##` 前缀的行统一改为 `## 【XX】`，
+/// 保证日报与邮件中 AI 分析章节的 Markdown 格式一致。
+fn normalize_ai_sections(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 32);
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('【') && !trimmed.starts_with('#') {
+            // 保留行首空白（理论上 trim 之后通常无差别），统一前置 "## "
+            out.push_str("## ");
+            out.push_str(trimmed);
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
 impl AnalysisPipeline {
     /// 创建新的分析流程
     pub fn new(config: PipelineConfig) -> Result<Self> {
@@ -301,10 +319,66 @@ impl AnalysisPipeline {
             info!("[{}] 📊 布林+MACD 信号: {} | {} | 评分调整 {:+}", code, bm.action.name(), bm.reason, delta);
         }
 
-        info!(
-            "[{}] 趋势: {}, 买入信号: {}, 评分: {}",
-            code, trend_result.trend_status, trend_result.buy_signal, trend_result.signal_score
-        );
+        // // === 补充风控修正（核心拦截器，解决系统"精神分裂"问题）===
+        // // 1. 技术面极其危险的形态拦截：空头排列 / 乖离率极高
+        // use crate::trend_analyzer::{TrendStatus, BuySignal};
+        // if trend_result.bias_ma5 > 5.0 {
+        //     if trend_result.signal_score >= 60 {
+        //         trend_result.signal_score = 55;
+        //         trend_result.buy_signal = BuySignal::Hold;
+        //         trend_result.risk_factors.push("❌ 乖离率超5%有大幅回调风险，严禁追高，强制降级至观望".to_string());
+        //         info!("[{}] 触发风控拦截: 乖离率超5%，评分压至55", code);
+        //     }
+        // }
+        // if matches!(trend_result.trend_status, TrendStatus::StrongBear | TrendStatus::Bear) {
+        //     if trend_result.signal_score >= 60 {
+        //         trend_result.signal_score = 55;
+        //         trend_result.buy_signal = BuySignal::Hold;
+        //         trend_result.risk_factors.push("❌ 整体处于空头排列，极其弱势，放弃短线博弈避开接飞刀，强制降级至观望".to_string());
+        //         info!("[{}] 触发风控拦截: 空头排列，评分压至55", code);
+        //     }
+        // }
+
+        // // 2. 资金面拦截：主力大幅出逃严重/拉高出货诱多
+        // let svc = crate::data_provider::service::service();
+        // let flow_arc = svc.get_money_flow(code, 2).await;
+        // if let Some(last_day) = flow_arc.days.last() {
+        //     // 单日净流出 < -5000 万
+        //     if last_day.main_net < -50_000_000.0 {
+        //         if trend_result.signal_score >= 60 {
+        //             trend_result.signal_score = 55;
+        //             trend_result.buy_signal = BuySignal::Hold;
+        //             trend_result.risk_factors.push(format!("❌ 主力资金单日大幅流出({:.2}亿)，风险极高，强制取消买入建议", last_day.main_net / 1_0000_0000.0));
+        //             info!("[{}] 触发风控拦截: 主力大幅流出，评分压至55", code);
+        //         }
+        //     }
+        //     // 价涨量增但资金大幅流出（诱多）
+        //     if last_day.pct_chg > 4.0 && last_day.main_net < -10_000_000.0 {
+        //         if trend_result.signal_score >= 60 {
+        //             trend_result.signal_score = 55;
+        //             trend_result.buy_signal = BuySignal::Hold;
+        //             trend_result.risk_factors.push("❌ 股价大涨但主力净流出(典型诱多/拉高出货)，极其凶险，强制取消买入建议".to_string());
+        //             info!("[{}] 触发风控拦截: 价涨量缩/背离诱多，评分压至55", code);
+        //         }
+        //     }
+        // }
+
+        // // 3. 基本面拦截：严重亏损且高估或大幅衰退
+        // let pe = data[0].pe_ratio.unwrap_or(0.0);
+        // let net_profit_yoy = data[0].net_profit_yoy.unwrap_or(0.0);
+        // if (pe < 0.0 || pe > 300.0) && net_profit_yoy < -30.0 {
+        //     if trend_result.signal_score >= 60 {
+        //         trend_result.signal_score = 55;
+        //         trend_result.buy_signal = BuySignal::Hold;
+        //         trend_result.risk_factors.push("❌ 基本面极度恶化(业绩大幅下滑且估值畸高/亏损)，底线拦截取消买入".to_string());
+        //         info!("[{}] 触发风控拦截: 基本面极度恶化，评分压至55", code);
+        //     }
+        // }
+
+        // info!(
+        //     "[{}] 趋势: {}, 买入信号: {}, 评分: {}",
+        //     code, trend_result.trend_status, trend_result.buy_signal, trend_result.signal_score
+        // );
 
         // 2. 技术分析 Markdown
         let mut analysis_content = technical_report::build_technical_markdown(&trend_result);
@@ -397,7 +471,7 @@ impl AnalysisPipeline {
             {
                 Ok(ai_result) => {
                     analysis_content.push_str("\n# AI分析\n\n");
-                    analysis_content.push_str(&ai_result);
+                    analysis_content.push_str(&normalize_ai_sections(&ai_result));
                     if let Some(ref news) = news_context {
                         analysis_content.push_str("\n\n# 相关新闻\n\n");
                         analysis_content.push_str(news);
