@@ -119,6 +119,10 @@ mod tests {
             market_cap: None, circulating_cap: None,
             eps: None, roe: None, revenue_yoy: None, net_profit_yoy: None,
             gross_margin: None, net_margin: None, sharpe_ratio: None,
+            financials_history: None,
+            valuation_history: None,
+            consensus: None,
+            industry: None,
         }
     }
 

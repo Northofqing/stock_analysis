@@ -319,6 +319,10 @@ impl DatabaseManager {
                 analysis_result::close_price.eq(excluded(analysis_result::close_price)),
                 analysis_result::pct_chg.eq(excluded(analysis_result::pct_chg)),
                 analysis_result::data_source.eq(excluded(analysis_result::data_source)),
+                analysis_result::score_breakdown_json
+                    .eq(excluded(analysis_result::score_breakdown_json)),
+                analysis_result::original_advice.eq(excluded(analysis_result::original_advice)),
+                analysis_result::veto_flags_json.eq(excluded(analysis_result::veto_flags_json)),
             ))
             .execute(&mut conn)?;
 

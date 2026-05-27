@@ -484,6 +484,26 @@ fn build_fundamental_slice(latest: &KlineData) -> String {
         }
     }
 
+    // 估值历史分位
+    if let Some(vh) = latest.valuation_history.as_ref() {
+        if vh.sample_days >= 30 {
+            let label = |pct: f64| -> &'static str {
+                if pct < 20.0 { "极低估⭐" }
+                else if pct < 40.0 { "低估" }
+                else if pct < 60.0 { "中位" }
+                else if pct < 80.0 { "高估" }
+                else { "极高估⚠️" }
+            };
+            s.push_str(&format!("【估值分位】近{}日\n", vh.sample_days));
+            if let (Some(cur), Some(pct)) = (vh.current_pe, vh.pe_percentile) {
+                s.push_str(&format!("PE TTM {:.2} → 分位 {:.1}% ({})\n", cur, pct, label(pct)));
+            }
+            if let (Some(cur), Some(pct)) = (vh.current_pb, vh.pb_percentile) {
+                s.push_str(&format!("PB MRQ {:.2} → 分位 {:.1}% ({})\n", cur, pct, label(pct)));
+            }
+        }
+    }
+
     let has_fin = latest.eps.is_some()
         || latest.roe.is_some()
         || latest.gross_margin.is_some()
@@ -519,8 +539,104 @@ fn build_fundamental_slice(latest: &KlineData) -> String {
         }
     }
 
+    // 财务趋势（多期序列）
+    if let Some(hist) = latest.financials_history.as_ref() {
+        let show: Vec<_> = hist.iter().take(8).collect();
+        if show.len() >= 2 {
+            s.push_str("【财务趋势】（最近多期，由新到旧）\n");
+            for p in &show {
+                let date = p.report_date.as_deref().unwrap_or("-");
+                let mut parts: Vec<String> = Vec::new();
+                if let Some(v) = p.eps { parts.push(format!("EPS {:.3}", v)); }
+                if let Some(v) = p.roe { parts.push(format!("ROE {:.2}%", v)); }
+                if let Some(v) = p.gross_margin { parts.push(format!("毛利 {:.2}%", v)); }
+                if let Some(v) = p.revenue_yoy { parts.push(format!("营收YoY {:.2}%", v)); }
+                if let Some(v) = p.net_profit_yoy { parts.push(format!("净利YoY {:.2}%", v)); }
+                if let Some(v) = p.op_cash_flow_ps { parts.push(format!("每股CFO {:.3}", v)); }
+                s.push_str(&format!("{}: {}\n", date, parts.join(" | ")));
+            }
+        }
+
+        // 盈利质量：CFO/净利润
+        let ratios: Vec<f64> = show.iter().filter_map(|p| p.cfo_to_ni_ratio()).collect();
+        if !ratios.is_empty() {
+            let avg = ratios.iter().sum::<f64>() / ratios.len() as f64;
+            let tag = if avg <= 0.0 { "风险⚠️" }
+                      else if avg < 0.5 { "偏弱" }
+                      else if avg < 1.0 { "健康" }
+                      else { "优秀" };
+            s.push_str(&format!("盈利质量(CFO/NI 近{}期均值): {:.2} ({})\n", ratios.len(), avg, tag));
+            if avg < 0.3 {
+                s.push_str("⚠️ 盈利质量风险：CFO 长期低于净利润，疑似应收堆积\n");
+            }
+        }
+
+        // 财务异常信号
+        if let Some(q) = crate::data_provider::assess_quality(hist) {
+            if !q.flags.is_empty() {
+                s.push_str(&format!("【财务异常】评分 {}/100 ({})\n", q.risk_score, q.level));
+                for f in &q.flags {
+                    s.push_str(&format!("• {}\n", f));
+                }
+            }
+        }
+
+        // 杜邦分解（最新一期）
+        if let Some(latest_p) = show.first() {
+            if let Some((nm, at, em, theo)) = latest_p.dupont() {
+                s.push_str(&format!(
+                    "【杜邦】净利率 {:.2}% × 周转率 {:.2}次 × 权益乘数 {:.2} = 理论ROE {:.2}%\n",
+                    nm, at, em, theo
+                ));
+            }
+        }
+    }
+
     if let Some(sr) = latest.sharpe_ratio {
         s.push_str(&format!("夏普比率: {:.2}\n", sr));
+    }
+
+    // 卖方一致预期
+    if let Some(cs) = latest.consensus.as_ref() {
+        if cs.report_count > 0 {
+            s.push_str(&format!(
+                "【一致预期】{}份研报/{}家券商",
+                cs.report_count, cs.broker_count
+            ));
+            if let Some(eps_t) = cs.eps_this_year_avg {
+                s.push_str(&format!(" | 当年EPS均值 {:.2}", eps_t));
+                if let Some(eps_n) = cs.eps_next_year_avg {
+                    s.push_str(&format!(" 明年 {:.2}", eps_n));
+                }
+            }
+            if let Some(b) = cs.bullish_ratio() {
+                s.push_str(&format!(" | 看多 {:.0}%", b));
+            }
+            if let Some(high) = cs.target_price_high_avg {
+                let up = cs.upside_pct(latest.close).unwrap_or(0.0);
+                s.push_str(&format!(" | 目标价均值 ¥{:.2} ({:+.1}%)", high, up));
+            }
+            s.push('\n');
+        }
+    }
+
+    // 行业对标（同业 PE/PB/ROE/增速 百分位）
+    if let Some(ib) = latest.industry.as_ref() {
+        if ib.peer_count >= 3 {
+            let mut parts: Vec<String> = Vec::new();
+            parts.push(format!("【行业对标】{}({}家同业)", ib.industry_name, ib.peer_count));
+            if let (Some(s_pe), Some(m_pe), Some(p)) = (ib.stock_pe, ib.median_pe, ib.pe_percentile) {
+                parts.push(format!("PE {:.1} vs 中位 {:.1} (P{:.0})", s_pe, m_pe, p));
+            }
+            if let (Some(s_roe), Some(m_roe), Some(p)) = (ib.stock_roe, ib.median_roe, ib.roe_percentile) {
+                parts.push(format!("ROE {:.2} vs 中位 {:.2} (P{:.0})", s_roe, m_roe, p));
+            }
+            if let (Some(s_g), Some(m_g), Some(p)) = (ib.stock_growth, ib.median_growth, ib.growth_percentile) {
+                parts.push(format!("净利同比 {:.0}% vs 中位 {:.0}% (P{:.0})", s_g, m_g, p));
+            }
+            s.push_str(&parts.join(" | "));
+            s.push('\n');
+        }
     }
 
     if s.is_empty() {

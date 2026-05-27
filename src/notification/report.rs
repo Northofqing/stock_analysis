@@ -152,6 +152,34 @@ impl NotificationService {
             ));
             lines.push(String::new());
 
+            // ========== 交易类型标签 (Phase 2) ==========
+            if let Some(tt) = &result.trade_type {
+                if !tt.trim().is_empty() {
+                    lines.push(format!("**交易类型**：{}", tt));
+                    lines.push(String::new());
+                }
+            }
+
+            // ========== 多维评分（5 个独立维度） ==========
+            if let Some(sb) = &result.score_breakdown_section {
+                if !sb.trim().is_empty() {
+                    lines.push("#### 🎯 多维评分".to_string());
+                    lines.push(String::new());
+                    lines.push(sb.trim_end().to_string());
+                    lines.push(String::new());
+                }
+            }
+
+            // ========== 风险否决信号 ==========
+            if let Some(vs) = &result.veto_section {
+                if !vs.trim().is_empty() {
+                    lines.push("#### 🚫 风险否决信号".to_string());
+                    lines.push(String::new());
+                    lines.push(vs.trim_end().to_string());
+                    lines.push(String::new());
+                }
+            }
+
             // 模拟持仓收益展示
             if let (Some(buy_price), Some(return_rate), Some(quantity)) = (result.position_buy_price, result.position_return, result.position_quantity) {
                 let return_emoji = if return_rate > 0.0 { "📈" } else { "📉" };
@@ -368,6 +396,56 @@ impl NotificationService {
                 }
 
                 lines.push(String::new());
+            }
+
+            // ========== 行业横向对标 ==========
+            if let Some(ind) = &result.industry_section {
+                if !ind.trim().is_empty() {
+                    lines.push("#### 🆚 行业横向对标".to_string());
+                    lines.push(String::new());
+                    lines.push(ind.trim_end().to_string());
+                    lines.push(String::new());
+                }
+            }
+
+            // ========== 估值历史分位 ==========
+            if let Some(vh) = &result.valuation_history_section {
+                if !vh.trim().is_empty() {
+                    lines.push("#### 💹 估值历史分位（5 年）".to_string());
+                    lines.push(String::new());
+                    lines.push(vh.trim_end().to_string());
+                    lines.push(String::new());
+                }
+            }
+
+            // ========== 卖方一致预期 ==========
+            if let Some(cs) = &result.consensus_section {
+                if !cs.trim().is_empty() {
+                    lines.push("#### 🎯 研报一致预期".to_string());
+                    lines.push(String::new());
+                    lines.push(cs.trim_end().to_string());
+                    lines.push(String::new());
+                }
+            }
+
+            // ========== 多期财务趋势 ==========
+            if let Some(fh) = &result.fin_history_section {
+                if !fh.trim().is_empty() {
+                    lines.push("#### 📈 多期财务趋势".to_string());
+                    lines.push(String::new());
+                    lines.push(fh.trim_end().to_string());
+                    lines.push(String::new());
+                }
+            }
+
+            // ========== 财务质量评估 ==========
+            if let Some(q) = &result.quality_section {
+                if !q.trim().is_empty() {
+                    lines.push("#### 🩺 财务质量评估".to_string());
+                    lines.push(String::new());
+                    lines.push(q.trim_end().to_string());
+                    lines.push(String::new());
+                }
             }
 
             // 技术面分析（原有文本）

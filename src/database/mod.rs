@@ -232,6 +232,15 @@ impl DatabaseManager {
         )
         .execute(&mut *conn)?;
 
+        // Phase 1 增量：多维评分 + 风险否决（SQLite 不支持 IF NOT EXISTS，忽略已存在错误）
+        for sql in [
+            "ALTER TABLE analysis_result ADD COLUMN score_breakdown_json TEXT",
+            "ALTER TABLE analysis_result ADD COLUMN original_advice TEXT",
+            "ALTER TABLE analysis_result ADD COLUMN veto_flags_json TEXT",
+        ] {
+            let _ = diesel::sql_query(sql).execute(&mut *conn);
+        }
+
         // 创建 stock_position 表（模拟持仓）
         diesel::sql_query(
             r#"

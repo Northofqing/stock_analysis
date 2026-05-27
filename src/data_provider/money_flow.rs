@@ -7,10 +7,11 @@
 //! 返回结构面向 AI Prompt 组装：直接读字段构建【主力资金】【日内走势】两段。
 
 use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// 单日资金流数据
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MoneyFlowDay {
     pub date: String,
     pub main_net: f64,       // 主力净流入（元）
@@ -21,7 +22,7 @@ pub struct MoneyFlowDay {
 }
 
 /// 近期资金流汇总
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MoneyFlowSummary {
     pub days: Vec<MoneyFlowDay>, // 最近 N 天，时间升序
 }
@@ -41,6 +42,37 @@ impl MoneyFlowSummary {
         let len = self.days.len();
         let start = len.saturating_sub(n);
         self.days[start..].iter().map(|d| d.main_net).sum()
+    }
+
+    /// 指数加权主力净流入（以亿为单位）
+    /// 权重：最新日 0.4 / -1 0.25 / -2 0.15 / -3 0.1 / -4 0.1
+    pub fn ewma_main_net_yi(&self) -> Option<f64> {
+        if self.days.is_empty() {
+            return None;
+        }
+        const W: [f64; 5] = [0.1, 0.1, 0.15, 0.25, 0.4]; // 从老到新
+        let take = self.days.len().min(5);
+        let slice = &self.days[self.days.len() - take..];
+        // 取对应尾部权重
+        let w_slice = &W[5 - take..];
+        let total_w: f64 = w_slice.iter().sum();
+        let weighted: f64 = slice
+            .iter()
+            .zip(w_slice.iter())
+            .map(|(d, w)| d.main_net * w)
+            .sum();
+        Some(weighted / total_w / 1e8)
+    }
+
+    /// 检测“单日反弹但趋势未逆转”：
+    /// 近 5 日累计流出 > 30 亿 且 最新日流入 < 5 日累计流出绝对值的 20%
+    pub fn is_one_day_bounce(&self) -> bool {
+        let sum5_yi = self.recent_main_sum(5) / 1e8;
+        let Some(latest) = self.latest() else {
+            return false;
+        };
+        let latest_yi = latest.main_net / 1e8;
+        sum5_yi < -30.0 && latest_yi > 0.0 && latest_yi < (-sum5_yi) * 0.2
     }
 }
 

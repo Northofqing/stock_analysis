@@ -171,6 +171,14 @@ pub(super) fn save_analysis_result(code: &str, data: &[KlineData], result: &Anal
         return;
     };
     let latest_kline = &data[0];
+    let score_breakdown_json = result
+        .score_breakdown
+        .as_ref()
+        .and_then(|sb| serde_json::to_string(sb).ok());
+    let veto_flags_json = result
+        .veto_flags
+        .as_ref()
+        .and_then(|flags| serde_json::to_string(flags).ok());
     let new_result = crate::models::NewAnalysisResult {
         code: result.code.clone(),
         name: result.name.clone(),
@@ -186,6 +194,9 @@ pub(super) fn save_analysis_result(code: &str, data: &[KlineData], result: &Anal
         close_price: Some(latest_kline.close),
         pct_chg: Some(latest_kline.pct_chg),
         data_source: None,
+        score_breakdown_json,
+        original_advice: result.original_advice.clone(),
+        veto_flags_json,
     };
     match db.save_analysis_result(&new_result) {
         Ok(_) => info!("[{}] 分析结果已保存到数据库", code),

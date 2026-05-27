@@ -268,17 +268,23 @@ impl PrecisionRsiBacktest {
 
             // 成交价：次日 open。末根信号丢弃
             let next_exec = if i + 1 < n {
-                match (open_col.get(i + 1), dates.get(i + 1)) {
-                    (Some(p), Some(d_str)) => {
-                        let d = NaiveDate::parse_from_str(d_str, "%Y-%m-%d")
-                            .unwrap_or_else(|_| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
-                        let dt_next = Local
-                            .from_local_datetime(&d.and_hms_opt(15, 0, 0).unwrap())
-                            .single()
-                            .unwrap_or_else(|| Local::now());
-                        Some((p, dt_next))
+                let next_kline = &klines[i + 1];
+                // 次日涨跌停或停牌则无法成交
+                if next_kline.is_limit_up || next_kline.is_limit_down || next_kline.is_suspended {
+                    None
+                } else {
+                    match (open_col.get(i + 1), dates.get(i + 1)) {
+                        (Some(p), Some(d_str)) => {
+                            let d = NaiveDate::parse_from_str(d_str, "%Y-%m-%d")
+                                .unwrap_or_else(|_| NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
+                            let dt_next = Local
+                                .from_local_datetime(&d.and_hms_opt(15, 0, 0).unwrap())
+                                .single()
+                                .unwrap_or_else(|| Local::now());
+                            Some((p, dt_next))
+                        }
+                        _ => None,
                     }
-                    _ => None,
                 }
             } else {
                 None

@@ -59,6 +59,9 @@ diesel::table! {
         pct_chg -> Nullable<Double>,
         data_source -> Nullable<Text>,
         created_at -> Timestamp,
+        score_breakdown_json -> Nullable<Text>,
+        original_advice -> Nullable<Text>,
+        veto_flags_json -> Nullable<Text>,
     }
 }
 

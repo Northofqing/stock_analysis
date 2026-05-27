@@ -10,8 +10,14 @@ mod multi_timeframe;
 mod position_tracker;
 mod price_stats;
 mod reporting;
+pub mod score_breakdown;
 mod summary_notify;
 mod technical_report;
+mod trade_type;
+mod veto_rules;
+
+pub use score_breakdown::ScoreBreakdown;
+pub use veto_rules::VetoOutcome;
 
 use anyhow::{Context, Result};
 use futures::stream::{self, StreamExt};
@@ -21,6 +27,7 @@ use std::sync::Arc;
 
 use crate::analyzer::GeminiAnalyzer;
 use crate::data_provider::{DataFetcherManager, KlineData};
+use crate::data_provider::financials::FinancialPeriod;
 use crate::search_service::get_search_service;
 use crate::database::DatabaseManager;
 use crate::notification::NotificationService;
@@ -115,6 +122,42 @@ pub struct AnalysisResult {
     /// 真实主力资金流 + 日内分时 + 龙虎榜席位（已渲染的 Markdown 片段，可直接插入通知）
     #[serde(default)]
     pub money_flow_section: Option<String>,
+    /// 行业横向对标（已渲染的 Markdown 片段，可直接插入通知）
+    #[serde(default)]
+    pub industry_section: Option<String>,
+    /// 财务质量评估（已渲染的 Markdown 片段）
+    #[serde(default)]
+    pub quality_section: Option<String>,
+    /// 估值历史分位（已渲染的 Markdown 片段）
+    #[serde(default)]
+    pub valuation_history_section: Option<String>,
+    /// 卖方一致预期（已渲染的 Markdown 片段）
+    #[serde(default)]
+    pub consensus_section: Option<String>,
+    /// 多期财务趋势（已渲染的 Markdown 片段）
+    #[serde(default)]
+    pub fin_history_section: Option<String>,
+    /// 多维评分（5 个独立维度，0~100）
+    #[serde(default)]
+    pub score_breakdown: Option<ScoreBreakdown>,
+    /// 多维评分渲染片段
+    #[serde(default)]
+    pub score_breakdown_section: Option<String>,
+    /// 风险否决信号（已渲染片段）
+    #[serde(default)]
+    pub veto_section: Option<String>,
+    /// 触发的否决规则名（用于 DB 持久化）
+    #[serde(default)]
+    pub veto_flags: Option<Vec<String>>,
+    /// 原始（未被否决降级）的操作建议
+    #[serde(default)]
+    pub original_advice: Option<String>,
+    /// Phase 2: 交易类型标签（动量交易型/逆向价值型/趋势跟随型/综合配置型）
+    #[serde(default)]
+    pub trade_type: Option<String>,
+    /// Phase 3: 原始资金流时序（仅运行时使用，不持久化）
+    #[serde(default, skip_serializing)]
+    pub money_flow: Option<crate::data_provider::money_flow::MoneyFlowSummary>,
 }
 
 impl ScoreDisplay for AnalysisResult {
@@ -179,20 +222,63 @@ fn score_to_advice(score: i32) -> &'static str {
     }
 }
 
-/// 规范化 AI 输出的章节标题：
-/// 将以 `【XX】` 开头但缺失 `##` 前缀的行统一改为 `## 【XX】`，
-/// 保证日报与邮件中 AI 分析章节的 Markdown 格式一致。
+/// 规范化 AI 输出的章节标题：统一为 `## 【XX】` 形式。
+///
+/// 处理两类常见 AI 偏差：
+/// 1. 输出 `【XX】` 但忘记加 `##` 前缀；
+/// 2. 输出 `## XX`（去掉了书名号），导致与其它股票渲染样式不一致。
+///
+/// 已知章节：宏观影响 / 消息面 / 技术面 / 主力资金 / 基本面 /
+///   操作建议（可带「含买入价/目标价/止损位」后缀）/ 风险提示 / ⚠️ 逆势布局逻辑。
 fn normalize_ai_sections(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + 32);
+    const SECTIONS: &[&str] = &[
+        "宏观影响",
+        "消息面",
+        "技术面",
+        "主力资金",
+        "基本面",
+        "操作建议",
+        "风险提示",
+        "逆势布局逻辑",
+    ];
+
+    let mut out = String::with_capacity(text.len() + 64);
     for line in text.split_inclusive('\n') {
-        let trimmed = line.trim_start();
+        // 拆分行尾换行，便于精确匹配
+        let (body, eol) = match line.rfind('\n') {
+            Some(idx) => (&line[..idx], &line[idx..]),
+            None => (line, ""),
+        };
+        let trimmed = body.trim();
+
+        // case 1: `【XX】...` 缺失 `##` 前缀
         if trimmed.starts_with('【') && !trimmed.starts_with('#') {
-            // 保留行首空白（理论上 trim 之后通常无差别），统一前置 "## "
             out.push_str("## ");
             out.push_str(trimmed);
-        } else {
-            out.push_str(line);
+            out.push_str(eol);
+            continue;
         }
+
+        // case 2: `##` 标题，但内容缺少 `【】` 或带额外修饰
+        if trimmed.starts_with('#') {
+            // 去掉前导 # 和空白
+            let title = trimmed.trim_start_matches('#').trim();
+            // 已经是 `【...】` 形式：无需改动
+            if title.starts_with('【') {
+                out.push_str(line);
+                continue;
+            }
+            // 匹配任一已知章节名（用 contains 兼容 emoji/前后缀，例如 "⚠️ 逆势布局逻辑"）
+            if SECTIONS.iter().any(|s| title.contains(s)) {
+                out.push_str("## 【");
+                out.push_str(title);
+                out.push_str("】");
+                out.push_str(eol);
+                continue;
+            }
+        }
+
+        out.push_str(line);
     }
     out
 }
@@ -319,6 +405,180 @@ impl AnalysisPipeline {
             info!("[{}] 📊 布林+MACD 信号: {} | {} | 评分调整 {:+}", code, bm.action.name(), bm.reason, delta);
         }
 
+        // 1.6 基本面评分修正（财务质量 + 估值分位）
+        //     - 异常评分 ≥60：高风险，-20 并降档
+        //     - 异常评分 30~59：中风险，-8 风险提示
+        //     - PE 分位 <20%（极低估）：+5
+        //     - PE 分位 >80%（极高估）：-8 风险提示且 StrongBuy→Buy
+        //     - 高质量盈利（ROE 上行 + 毛利率上行 + CFO/NI≥0.8）：+5
+        if let Some(latest) = data.first() {
+            use crate::trend_analyzer::BuySignal;
+            let mut total_delta: i32 = 0;
+
+            // (a) 财务异常信号
+            if let Some(hist) = latest.financials_history.as_ref() {
+                if let Some(q) = crate::data_provider::assess_quality(hist) {
+                    if q.risk_score >= 60 {
+                        total_delta -= 20;
+                        let summary = q.flags.first().cloned().unwrap_or_else(|| q.level.to_string());
+                        trend_result
+                            .risk_factors
+                            .push(format!("💣 财务异常高风险(评分{}/100): {}", q.risk_score, summary));
+                        if matches!(trend_result.buy_signal, BuySignal::StrongBuy | BuySignal::Buy) {
+                            trend_result.buy_signal = BuySignal::Hold;
+                        }
+                    } else if q.risk_score >= 30 {
+                        total_delta -= 8;
+                        trend_result
+                            .risk_factors
+                            .push(format!("⚠️ 财务异常需关注(评分{}/100)", q.risk_score));
+                    }
+                }
+
+                // (c) 高质量盈利加分：近 4 期 ROE 与毛利率均单调向上 + CFO/NI 均值≥0.8
+                let take: Vec<_> = hist.iter().take(4).collect();
+                if take.len() >= 3 {
+                    let roe_chrono: Vec<f64> = take.iter().rev().filter_map(|p| p.roe).collect();
+                    let gm_chrono: Vec<f64> = take.iter().rev().filter_map(|p| p.gross_margin).collect();
+                    let cfo_ni: Vec<f64> = take.iter().filter_map(|p| p.cfo_to_ni_ratio()).collect();
+                    let roe_up = roe_chrono.len() >= 3
+                        && roe_chrono.windows(2).all(|w| w[1] >= w[0] - 0.01);
+                    let gm_up = gm_chrono.len() >= 3
+                        && gm_chrono.windows(2).all(|w| w[1] >= w[0] - 0.01);
+                    let cfo_ok = !cfo_ni.is_empty()
+                        && cfo_ni.iter().sum::<f64>() / cfo_ni.len() as f64 >= 0.8;
+                    if roe_up && gm_up && cfo_ok {
+                        total_delta += 5;
+                        trend_result
+                            .signal_reasons
+                            .push("💎 高质量盈利(ROE/毛利持续上行+CFO健康) +5".to_string());
+                    }
+                }
+            }
+
+            // (b) 估值分位
+            if let Some(vh) = latest.valuation_history.as_ref() {
+                if vh.sample_days >= 60 {
+                    if let Some(pe_pct) = vh.pe_percentile {
+                        if pe_pct < 20.0 {
+                            total_delta += 5;
+                            trend_result.signal_reasons.push(format!(
+                                "📉 PE 历史极低估(分位{:.0}%) +5",
+                                pe_pct
+                            ));
+                        } else if pe_pct > 80.0 {
+                            total_delta -= 8;
+                            trend_result.risk_factors.push(format!(
+                                "📈 PE 历史极高估(分位{:.0}%)，回调风险大",
+                                pe_pct
+                            ));
+                            if matches!(trend_result.buy_signal, BuySignal::StrongBuy) {
+                                trend_result.buy_signal = BuySignal::Buy;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // (d) 卖方一致预期
+            if let Some(cs) = latest.consensus.as_ref() {
+                if cs.broker_count >= 3 {
+                    if let Some(bull) = cs.bullish_ratio() {
+                        if bull >= 80.0 && cs.broker_count >= 5 {
+                            total_delta += 3;
+                            trend_result.signal_reasons.push(format!(
+                                "🏦 卖方高度一致看多({}家券商, 看多{:.0}%) +3",
+                                cs.broker_count, bull
+                            ));
+                        } else if bull < 30.0 {
+                            total_delta -= 5;
+                            trend_result.risk_factors.push(format!(
+                                "🏦 卖方一致看空(看多仅{:.0}%)",
+                                bull
+                            ));
+                        }
+                    }
+                    if let Some(up) = cs.upside_pct(latest.close) {
+                        if up > 30.0 {
+                            total_delta += 3;
+                            trend_result.signal_reasons.push(format!(
+                                "🎯 目标价均值隐含 {:+.0}% 上行空间 +3",
+                                up
+                            ));
+                        } else if up < -10.0 {
+                            total_delta -= 5;
+                            trend_result.risk_factors.push(format!(
+                                "🎯 现价已高于目标价均值 {:+.0}%",
+                                up
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // (e) 行业横向对标
+            if let Some(ib) = latest.industry.as_ref() {
+                if ib.peer_count >= 5 {
+                    if let Some(p) = ib.roe_percentile {
+                        if p >= 80.0 {
+                            total_delta += 3;
+                            trend_result.signal_reasons.push(format!(
+                                "💎 ROE 同业领先(P{:.0}, {} 家同业) +3",
+                                p, ib.peer_count
+                            ));
+                        } else if p <= 20.0 {
+                            total_delta -= 3;
+                            trend_result.risk_factors.push(format!(
+                                "ROE 同业落后(P{:.0})",
+                                p
+                            ));
+                        }
+                    }
+                    if let Some(p) = ib.pe_percentile {
+                        if p <= 20.0 {
+                            total_delta += 2;
+                            trend_result.signal_reasons.push(format!(
+                                "💰 PE 同业偏低(P{:.0}) +2",
+                                p
+                            ));
+                        } else if p >= 80.0 {
+                            total_delta -= 3;
+                            trend_result.risk_factors.push(format!(
+                                "PE 同业偏高(P{:.0})",
+                                p
+                            ));
+                        }
+                    }
+                    if let Some(p) = ib.growth_percentile {
+                        if p >= 80.0 {
+                            total_delta += 2;
+                            trend_result.signal_reasons.push(format!(
+                                "🚀 净利同比同业领先(P{:.0}) +2",
+                                p
+                            ));
+                        } else if p <= 20.0 {
+                            total_delta -= 2;
+                            trend_result.risk_factors.push(format!(
+                                "净利同比同业落后(P{:.0})",
+                                p
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // 总修正限幅 ±25，避免基本面单一维度主导
+            let clamped = total_delta.clamp(-25, 25);
+            if clamped != 0 {
+                trend_result.signal_score =
+                    (trend_result.signal_score + clamped).clamp(0, 100);
+                info!(
+                    "[{}] 🧮 基本面评分修正 {:+} → 总评分 {}",
+                    code, clamped, trend_result.signal_score
+                );
+            }
+        }
+
         // // === 补充风控修正（核心拦截器，解决系统"精神分裂"问题）===
         // // 1. 技术面极其危险的形态拦截：空头排列 / 乖离率极高
         // use crate::trend_analyzer::{TrendStatus, BuySignal};
@@ -420,7 +680,9 @@ impl AnalysisPipeline {
         };
 
         // 4. 真实资金/分时/龙虎榜 + 筹码分布上下文（不管 AI 是否启用，都抓一次给通知展示）
-        let mut extra_context = extra_context::fetch_extra_context(code, data).await;
+        let extra = extra_context::fetch_extra_context(code, data).await;
+        let mut extra_context = extra.section;
+        let money_flow_raw = extra.money_flow;
 
         // 4.5 多周期下钻（Multi-timeframe）：日线买入信号触发时，去 60min/15min 找精准入场点
         let mtf_trigger = {
@@ -448,11 +710,29 @@ impl AnalysisPipeline {
 
         // 5. 评分→操作建议（与 AI 共用同一档位表）
         let operation_advice = score_to_advice(trend_result.signal_score).to_string();
+        let trend_status_str = format!("{}", trend_result.trend_status);
+
+        // ===== Phase 1/2 提前计算：让 AI 在生成分析前就看到五维评分 + 否决信号 + 交易类型 =====
+        let sb_inputs = score_breakdown::ScoreInputs {
+            sentiment_score: trend_result.signal_score,
+            money_flow: money_flow_raw.as_ref(),
+            money_flow_section: extra_context.as_deref(),
+            volume_ratio_5d: Some(trend_result.volume_ratio_5d),
+        };
+        let sb_pre = score_breakdown::compute(&sb_inputs, &data[0]);
+        let veto_pre = veto_rules::evaluate(&operation_advice, money_flow_raw.as_ref(), &data[0]);
+        let trade_type_pre = trade_type::infer_from_breakdown(&sb_pre);
+        let empty_veto: Vec<String> = Vec::new();
+
         let tech_assessment = crate::analyzer::TechAssessment {
             score: trend_result.signal_score,
             advice: &operation_advice,
             reasons: &trend_result.signal_reasons,
             risks: &trend_result.risk_factors,
+            trend_status: &trend_status_str,
+            score_breakdown: Some(&sb_pre),
+            veto_flags: if veto_pre.flags.is_empty() { &empty_veto } else { &veto_pre.flags },
+            trade_type: trade_type_pre.as_deref(),
         };
 
         // 6. AI 增强分析（AI 与评分同一把尺子：评分明细 + 档位规则注入 prompt）
@@ -487,7 +767,336 @@ impl AnalysisPipeline {
         // 7. 价格区间 / 近期统计
         let stats = price_stats::compute_price_stats(data);
 
-        let result = AnalysisResult {
+        // 8. 行业横向对标渲染（如有）
+        let industry_section = data[0].industry.as_ref().and_then(|ib| {
+            if ib.peer_count < 3 {
+                return None;
+            }
+            let fmt_opt = |v: Option<f64>| match v {
+                Some(x) => format!("{:.2}", x),
+                None => "-".to_string(),
+            };
+            let fmt_pct = |v: Option<f64>| match v {
+                Some(x) => format!("P{:.0}", x),
+                None => "-".to_string(),
+            };
+            let mut s = String::new();
+            s.push_str(&format!(
+                "**同业范围**：{}（{}，共 {} 家同业）\n\n",
+                ib.industry_name, ib.board_code, ib.peer_count
+            ));
+            s.push_str("| 指标 | 个股 | 行业中位数 | 百分位 | 含义 |\n");
+            s.push_str("|------|------|------------|--------|------|\n");
+            s.push_str(&format!(
+                "| PE(TTM) | {} | {} | {} | 越低越便宜 |\n",
+                fmt_opt(ib.stock_pe),
+                fmt_opt(ib.median_pe),
+                fmt_pct(ib.pe_percentile)
+            ));
+            s.push_str(&format!(
+                "| PB | {} | {} | {} | 越低越便宜 |\n",
+                fmt_opt(ib.stock_pb),
+                fmt_opt(ib.median_pb),
+                fmt_pct(ib.pb_percentile)
+            ));
+            s.push_str(&format!(
+                "| ROE(单季%) | {} | {} | {} | 越高越好 |\n",
+                fmt_opt(ib.stock_roe),
+                fmt_opt(ib.median_roe),
+                fmt_pct(ib.roe_percentile)
+            ));
+            s.push_str(&format!(
+                "| 净利同比% | {} | {} | {} | 越高越好 |\n",
+                fmt_opt(ib.stock_growth),
+                fmt_opt(ib.median_growth),
+                fmt_pct(ib.growth_percentile)
+            ));
+            let mut tags: Vec<&str> = Vec::new();
+            if let Some(p) = ib.roe_percentile {
+                if p >= 75.0 {
+                    tags.push("💎 ROE 领先同业（前 25%）");
+                } else if p <= 25.0 {
+                    tags.push("⚠️ ROE 落后同业（后 25%）");
+                }
+            }
+            if let Some(p) = ib.pe_percentile {
+                if p <= 25.0 {
+                    tags.push("💰 估值低于多数同业（便宜）");
+                } else if p >= 75.0 {
+                    tags.push("📈 估值高于多数同业（偏贵）");
+                }
+            }
+            if let Some(p) = ib.growth_percentile {
+                if p >= 75.0 {
+                    tags.push("🚀 业绩增速领先同业");
+                } else if p <= 25.0 {
+                    tags.push("📉 业绩增速落后同业");
+                }
+            }
+            if !tags.is_empty() {
+                s.push_str(&format!("\n**行业地位**：{}\n", tags.join("；")));
+            }
+            Some(s)
+        });
+
+        // 9. 财务质量评估渲染
+        let quality_section = data[0]
+            .financials_history
+            .as_ref()
+            .and_then(|hist| crate::data_provider::assess_quality(hist))
+            .and_then(|q| {
+                if q.flags.is_empty() && q.risk_score == 0 {
+                    return None;
+                }
+                let icon = match q.level {
+                    "优秀" => "🟢",
+                    "良好" => "🟢",
+                    "一般" => "🟡",
+                    "偏弱" => "🟠",
+                    "风险" => "🔴",
+                    _ => "⚪",
+                };
+                let mut s = String::new();
+                s.push_str(&format!(
+                    "**风险评分**：{} {} / 100（等级：{}）\n",
+                    icon, q.risk_score, q.level
+                ));
+                if !q.flags.is_empty() {
+                    s.push_str("\n**触发的红旗信号**：\n");
+                    for f in &q.flags {
+                        s.push_str(&format!("- ⚠️ {}\n", f));
+                    }
+                }
+                Some(s)
+            });
+
+        // 10. 估值历史分位渲染
+        let valuation_history_section = data[0].valuation_history.as_ref().and_then(|vh| {
+            if vh.sample_days < 30 {
+                return None;
+            }
+            let fmt_opt = |v: Option<f64>| match v {
+                Some(x) => format!("{:.2}", x),
+                None => "-".to_string(),
+            };
+            let fmt_pct = |v: Option<f64>| match v {
+                Some(x) => format!("P{:.0}", x),
+                None => "-".to_string(),
+            };
+            let tag_for = |p: Option<f64>| match p {
+                Some(p) if p <= 20.0 => " 💎 历史底部区",
+                Some(p) if p <= 40.0 => " 偏低",
+                Some(p) if p < 60.0 => " 中位",
+                Some(p) if p < 80.0 => " 偏高",
+                Some(_) => " 🔥 历史高位",
+                None => "",
+            };
+            let range = match (&vh.oldest_date, &vh.newest_date) {
+                (Some(o), Some(n)) => format!("{} ~ {}", o, n),
+                _ => format!("近 {} 个交易日", vh.sample_days),
+            };
+            let mut s = String::new();
+            s.push_str(&format!(
+                "**样本区间**：{}（共 {} 个交易日）\n\n",
+                range, vh.sample_days
+            ));
+            s.push_str("| 指标 | 当前 | 历史最低 | 中位 | 最高 | 当前分位 |\n");
+            s.push_str("|------|------|---------|------|------|---------|\n");
+            s.push_str(&format!(
+                "| PE | {} | {} | {} | {} | {}{} |\n",
+                fmt_opt(vh.current_pe),
+                fmt_opt(vh.pe_min),
+                fmt_opt(vh.pe_median),
+                fmt_opt(vh.pe_max),
+                fmt_pct(vh.pe_percentile),
+                tag_for(vh.pe_percentile),
+            ));
+            s.push_str(&format!(
+                "| PB | {} | {} | {} | {} | {}{} |\n",
+                fmt_opt(vh.current_pb),
+                fmt_opt(vh.pb_min),
+                fmt_opt(vh.pb_median),
+                fmt_opt(vh.pb_max),
+                fmt_pct(vh.pb_percentile),
+                tag_for(vh.pb_percentile),
+            ));
+            Some(s)
+        });
+
+        // 11. 卖方一致预期渲染
+        let consensus_section = data[0].consensus.as_ref().and_then(|cs| {
+            if cs.report_count == 0 {
+                return None;
+            }
+            let cur = data[0].close;
+            let mut s = String::new();
+            s.push_str(&format!(
+                "**研报覆盖**：近 6 个月 {} 份研报 / {} 家券商\n",
+                cs.report_count, cs.broker_count
+            ));
+            if !cs.rating_distribution.is_empty() {
+                let mut parts: Vec<(String, u32)> = cs
+                    .rating_distribution
+                    .iter()
+                    .map(|(k, v)| (k.clone(), *v))
+                    .collect();
+                parts.sort_by(|a, b| b.1.cmp(&a.1));
+                let dist: Vec<String> =
+                    parts.iter().map(|(k, v)| format!("{} {}", k, v)).collect();
+                let bull = cs.bullish_ratio().unwrap_or(0.0);
+                s.push_str(&format!(
+                    "**评级分布**：{} | 看多比例 {:.0}%\n",
+                    dist.join(" / "),
+                    bull
+                ));
+            }
+            match (cs.target_price_low_avg, cs.target_price_high_avg) {
+                (Some(low), Some(high)) => {
+                    let upside = cs.upside_pct(cur).unwrap_or(0.0);
+                    let tag = if upside >= 30.0 {
+                        " 🚀 显著上行空间"
+                    } else if upside >= 10.0 {
+                        " ✅ 温和上行"
+                    } else if upside >= 0.0 {
+                        " 持平"
+                    } else {
+                        " ⚠️ 已高于目标价"
+                    };
+                    s.push_str(&format!(
+                        "**目标价区间**：¥{:.2} ~ ¥{:.2}（当前 ¥{:.2}，空间 {:+.1}%{}）\n",
+                        low, high, cur, upside, tag
+                    ));
+                }
+                (None, Some(high)) => {
+                    let upside = cs.upside_pct(cur).unwrap_or(0.0);
+                    s.push_str(&format!(
+                        "**目标价均值**：¥{:.2}（当前 ¥{:.2}，空间 {:+.1}%）\n",
+                        high, cur, upside
+                    ));
+                }
+                _ => {}
+            }
+            if let Some(e_t) = cs.eps_this_year_avg {
+                let mut line = format!("**EPS 预测**：当年 {:.2}", e_t);
+                if let Some(e_n) = cs.eps_next_year_avg {
+                    let g = if e_t.abs() > 1e-6 {
+                        format!("（同比 {:+.1}%）", (e_n - e_t) / e_t.abs() * 100.0)
+                    } else {
+                        String::new()
+                    };
+                    line.push_str(&format!(" / 明年 {:.2}{}", e_n, g));
+                }
+                if let Some(e_n2) = cs.eps_next2_year_avg {
+                    line.push_str(&format!(" / 后年 {:.2}", e_n2));
+                }
+                s.push_str(&line);
+                s.push('\n');
+            }
+            if !cs.recent_reports.is_empty() {
+                s.push_str("\n**最近研报**：\n\n");
+                s.push_str("| 日期 | 机构 | 评级 | 标题 |\n");
+                s.push_str("|------|------|------|------|\n");
+                for r in cs.recent_reports.iter().take(3) {
+                    let title = if r.title.chars().count() > 28 {
+                        format!("{}…", r.title.chars().take(28).collect::<String>())
+                    } else {
+                        r.title.clone()
+                    };
+                    s.push_str(&format!(
+                        "| {} | {} | {} | {} |\n",
+                        r.publish_date, r.org_name, r.rating, title
+                    ));
+                }
+            }
+            Some(s)
+        });
+
+        // 12. 多期财务趋势渲染
+        let fin_history_section = data[0].financials_history.as_ref().and_then(|hist| {
+            let show: Vec<&FinancialPeriod> = hist.iter().take(6).collect();
+            if show.len() < 2 {
+                return None;
+            }
+            let fmt_opt = |v: Option<f64>| match v {
+                Some(x) => format!("{:.2}", x),
+                None => "-".to_string(),
+            };
+            let fmt_ratio = |v: Option<f64>| match v {
+                Some(x) => format!("{:.2}", x),
+                None => "-".to_string(),
+            };
+            let mut s = String::new();
+            s.push_str("| 报告期 | ROE% | 营收YoY% | 净利YoY% | 毛利率% | 净利率% | CFO/NI |\n");
+            s.push_str("|--------|------|---------|---------|--------|--------|--------|\n");
+            for p in &show {
+                let date = p.report_date.clone().unwrap_or_else(|| "-".into());
+                let cfo_ni = p.cfo_to_ni_ratio();
+                s.push_str(&format!(
+                    "| {} | {} | {} | {} | {} | {} | {} |\n",
+                    date,
+                    fmt_opt(p.roe),
+                    fmt_opt(p.revenue_yoy),
+                    fmt_opt(p.net_profit_yoy),
+                    fmt_opt(p.gross_margin),
+                    fmt_opt(p.net_margin),
+                    fmt_ratio(cfo_ni),
+                ));
+            }
+            // 趋势提示
+            let trend = |f: fn(&FinancialPeriod) -> Option<f64>| -> Option<&'static str> {
+                let vals: Vec<f64> =
+                    show.iter().filter_map(|p| f(p)).collect();
+                if vals.len() < 3 {
+                    return None;
+                }
+                let up = vals.windows(2).all(|w| w[0] >= w[1]); // 最新→旧 递增 = 上行
+                let down = vals.windows(2).all(|w| w[0] <= w[1]);
+                if up && !down {
+                    Some("持续上行")
+                } else if down && !up {
+                    Some("持续下行")
+                } else {
+                    None
+                }
+            };
+            let mut hints: Vec<String> = Vec::new();
+            if let Some(t) = trend(|p| p.roe) {
+                hints.push(format!("ROE {}", t));
+            }
+            if let Some(t) = trend(|p| p.revenue_yoy) {
+                hints.push(format!("营收增速 {}", t));
+            }
+            if let Some(t) = trend(|p| p.gross_margin) {
+                hints.push(format!("毛利率 {}", t));
+            }
+            if !hints.is_empty() {
+                s.push_str(&format!("\n**趋势**：{}\n", hints.join("；")));
+            }
+            // CFO/NI 平均
+            let ratios: Vec<f64> =
+                show.iter().filter_map(|p| p.cfo_to_ni_ratio()).collect();
+            if !ratios.is_empty() {
+                let avg = ratios.iter().sum::<f64>() / ratios.len() as f64;
+                let tag = if avg < 0.3 {
+                    "⚠️ 偏低，需警惕利润含金量"
+                } else if avg < 0.6 {
+                    "🟡 健康下沿"
+                } else if avg < 1.0 {
+                    "🟢 健康"
+                } else {
+                    "💎 优秀（现金流回款好于账面利润）"
+                };
+                s.push_str(&format!(
+                    "**盈利质量**：近 {} 期 CFO/净利均值 {:.2}（{}）\n",
+                    ratios.len(),
+                    avg,
+                    tag
+                ));
+            }
+            Some(s)
+        });
+
+        let mut result = AnalysisResult {
             code: code.to_string(),
             name: stock_name,
             sentiment_score: trend_result.signal_score,
@@ -541,7 +1150,42 @@ impl AnalysisPipeline {
             position_sell_price: None,
             position_sell_date: None,
             money_flow_section: extra_context,
+            industry_section,
+            quality_section,
+            valuation_history_section,
+            consensus_section,
+            fin_history_section,
+            score_breakdown: None,
+            score_breakdown_section: None,
+            veto_section: None,
+            veto_flags: None,
+            original_advice: None,
+            trade_type: None,
+            money_flow: money_flow_raw,
         };
+
+        // ===== Phase 1: 多维评分拆解 + 风险否决规则 =====
+        // 注：sb_pre / veto_pre / trade_type_pre 已在 AI 调用前计算（用于注入 prompt），此处直接复用。
+        let sb = sb_pre;
+        let veto = veto_pre;
+        result.score_breakdown_section = Some(score_breakdown::render_section(&sb));
+        let original_advice = result.operation_advice.clone();
+        result.original_advice = Some(original_advice.clone());
+        if let Some(new_adv) = veto.downgraded_advice.as_ref() {
+            info!(
+                "[{}] 否决规则触发，操作建议下调：『{}』 → 『{}』",
+                code, original_advice, new_adv
+            );
+            result.operation_advice = new_adv.clone();
+        }
+        result.veto_section = veto_rules::render_section(&veto, &original_advice);
+        if !veto.flags.is_empty() {
+            result.veto_flags = Some(veto.flags.clone());
+        }
+        result.score_breakdown = Some(sb);
+
+        // ===== Phase 2: 交易类型标注 =====
+        result.trade_type = trade_type_pre;
 
         Ok(result)
     }
@@ -762,5 +1406,49 @@ impl AnalysisPipeline {
     /// 生成单股报告
     fn generate_single_report(&self, result: &AnalysisResult) -> String {
         reporting::generate_single_report(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_ai_sections;
+
+    #[test]
+    fn normalize_bare_headings_into_brackets() {
+        let input = "## 宏观影响\n内容1\n## 消息面\n内容2\n";
+        let got = normalize_ai_sections(input);
+        assert!(got.contains("## 【宏观影响】"), "got: {got}");
+        assert!(got.contains("## 【消息面】"), "got: {got}");
+    }
+
+    #[test]
+    fn normalize_preserves_already_bracketed() {
+        let input = "## 【宏观影响】\n内容\n";
+        let got = normalize_ai_sections(input);
+        assert_eq!(got, input);
+    }
+
+    #[test]
+    fn normalize_emoji_prefixed_title() {
+        let input = "## ⚠️ 逆势布局逻辑\nabc\n";
+        let got = normalize_ai_sections(input);
+        assert!(got.contains("## 【⚠️ 逆势布局逻辑】"), "got: {got}");
+    }
+
+    #[test]
+    fn normalize_action_advice_with_suffix() {
+        let input = "## 操作建议（含买入价/目标价/止损位）\nxx\n";
+        let got = normalize_ai_sections(input);
+        assert!(
+            got.contains("## 【操作建议（含买入价/目标价/止损位）】"),
+            "got: {got}"
+        );
+    }
+
+    #[test]
+    fn normalize_adds_hash_prefix_for_bare_bracket_line() {
+        let input = "【消息面】\n内容\n";
+        let got = normalize_ai_sections(input);
+        assert!(got.starts_with("## 【消息面】"), "got: {got}");
     }
 }

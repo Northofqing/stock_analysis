@@ -3,7 +3,16 @@
 //! 产出单份 Markdown 片段，既会被塞进 AI prompt，也会被挂到 `AnalysisResult.money_flow_section`
 //! 给通知展示。
 
+use crate::data_provider::money_flow::MoneyFlowSummary;
 use crate::data_provider::KlineData;
+
+/// `fetch_extra_context` 的产物：
+/// - `section`：用于通知 / AI prompt 的 Markdown 片段（与之前等价）。
+/// - `money_flow`：原始资金流时序，用于打分器做 EWMA / 单日反弹判定。
+pub(super) struct ExtraContext {
+    pub section: Option<String>,
+    pub money_flow: Option<MoneyFlowSummary>,
+}
 
 /// 抓取资金流/分时/LHB 数据，并合并由 K 线计算的筹码分布，返回格式化后的 Markdown。
 ///
@@ -14,7 +23,7 @@ use crate::data_provider::KlineData;
 pub(super) async fn fetch_extra_context(
     code: &str,
     kline_data: &[KlineData],
-) -> Option<String> {
+) -> ExtraContext {
     // 筹码分布（纯本地计算）
     let chip = crate::data_provider::compute_chip_distribution(kline_data);
     let chip_section = crate::data_provider::format_chip_prompt(&chip);
@@ -48,8 +57,22 @@ pub(super) async fn fetch_extra_context(
     }
 
     if s.trim().is_empty() {
-        None
+        ExtraContext {
+            section: None,
+            money_flow: if flow_arc.is_empty() {
+                None
+            } else {
+                Some((*flow_arc).clone())
+            },
+        }
     } else {
-        Some(s)
+        ExtraContext {
+            section: Some(s),
+            money_flow: if flow_arc.is_empty() {
+                None
+            } else {
+                Some((*flow_arc).clone())
+            },
+        }
     }
 }

@@ -256,6 +256,9 @@ pub struct AnalysisResultRecord {
     pub pct_chg: Option<f64>,
     pub data_source: Option<String>,
     pub created_at: NaiveDateTime,
+    pub score_breakdown_json: Option<String>,
+    pub original_advice: Option<String>,
+    pub veto_flags_json: Option<String>,
 }
 
 /// 插入新的分析结果
@@ -276,6 +279,9 @@ pub struct NewAnalysisResult {
     pub close_price: Option<f64>,
     pub pct_chg: Option<f64>,
     pub data_source: Option<String>,
+    pub score_breakdown_json: Option<String>,
+    pub original_advice: Option<String>,
+    pub veto_flags_json: Option<String>,
 }
 
 /// 插入新的龙虎榜数据

@@ -73,7 +73,7 @@ impl Default for BacktestConfig {
         Self {
             initial_capital: 100_000.0,    // 10万初始资金
             rebalance_days: 15,             // 15天调仓一次
-            position_count: 3,              // 持仓3只
+            position_count: 20,             // 持仓20只(扩展from 3)
             commission_rate: 0.0003,        // 万三手续费
             slippage_rate: 0.001,           // 千一滑点
             stamp_tax_rate: 0.001,          // 千一印花税（仅卖出）
@@ -825,6 +825,61 @@ impl BacktestSummary {
             area.draw(&value_text)?;
         }
 
+        Ok(())
+    }
+
+    /// 导出交易记录为CSV
+    pub fn export_trades_csv(&self, state: &BacktestState, output_path: &str) -> Result<()> {
+        use std::fs::File;
+        use std::io::Write;
+
+        let mut file = File::create(output_path)?;
+        // CSV 头
+        writeln!(file, "date,code,name,action,shares,price,amount,commission")?;
+
+        for trade in &state.trades {
+            let action = match trade.action {
+                TradeAction::Buy => "BUY",
+                TradeAction::Sell => "SELL",
+            };
+            writeln!(
+                file,
+                "{},{},{},{},{:.0},{:.4},{:.2},{:.2}",
+                trade.date.format("%Y-%m-%d"),
+                trade.code,
+                trade.name,
+                action,
+                trade.shares,
+                trade.price,
+                trade.amount,
+                trade.commission
+            )?;
+        }
+        Ok(())
+    }
+
+    /// 导出每日净值为CSV
+    pub fn export_daily_values_csv(&self, state: &BacktestState, output_path: &str, initial_capital: f64) -> Result<()> {
+        use std::fs::File;
+        use std::io::Write;
+
+        let mut file = File::create(output_path)?;
+        writeln!(file, "date,total_value,daily_return,cumulative_return")?;
+
+        let mut prev_value = initial_capital;
+        for (date, value) in &state.daily_values {
+            let daily_ret = (*value - prev_value) / prev_value;
+            let cum_ret = (*value - initial_capital) / initial_capital;
+            writeln!(
+                file,
+                "{},{:.2},{:.4},{:.4}",
+                date.format("%Y-%m-%d"),
+                value,
+                daily_ret,
+                cum_ret
+            )?;
+            prev_value = *value;
+        }
         Ok(())
     }
 }

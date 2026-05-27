@@ -30,6 +30,15 @@ pub struct TechAssessment<'a> {
     pub advice: &'a str,
     pub reasons: &'a [String],
     pub risks: &'a [String],
+    /// Phase 4: 系统判定的趋势状态（如"多头排列"/"空头排列"/"震荡"），
+    /// 用于强制 AI 在"技术方向 vs 操作建议"出现矛盾时给出独立的"逆势布局"段落。
+    pub trend_status: &'a str,
+    /// Phase 4 拓展：5 维评分明细（技术/质量/估值/资金/增长），让 AI 看见每个维度的具体分数。
+    pub score_breakdown: Option<&'a crate::pipeline::score_breakdown::ScoreBreakdown>,
+    /// Phase 4 拓展：已触发的风险否决信号；AI 须在【风险提示】中显式覆盖每一条。
+    pub veto_flags: &'a [String],
+    /// Phase 4 拓展：系统判定的交易类型（动量/逆向价值/趋势跟随/价值-趋势共振/综合配置）。
+    pub trade_type: Option<&'a str>,
 }
 
 use std::cell::RefCell;
