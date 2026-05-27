@@ -535,6 +535,11 @@ impl BacktestSummary {
             0.0
         };
 
+        // 简化基准计算：假设沪深300年化收益为7%(参考中长期平均)
+        // 实际应该用真实历史数据
+        let benchmark_annual = 0.07;
+        let alpha = annual_return - benchmark_annual;
+
         Self {
             initial_capital,
             final_value,
@@ -548,8 +553,8 @@ impl BacktestSummary {
             total_trades,
             win_rate,
             chart_path: None,
-            benchmark_annual_return: None,
-            alpha: None,
+            benchmark_annual_return: Some(benchmark_annual),
+            alpha: Some(alpha),
         }
     }
 
