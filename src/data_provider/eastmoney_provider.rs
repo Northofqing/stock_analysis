@@ -221,6 +221,13 @@ impl HttpProvider {
                 gross_margin: None,
                 net_margin: None,
                 sharpe_ratio: None,
+                financials_history: None,
+                valuation_history: None,
+                consensus: None,
+                industry: None,
+                is_limit_up: false,
+                is_limit_down: false,
+                is_suspended: false,
             };
             
             result.push(kline);

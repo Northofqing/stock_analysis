@@ -3,20 +3,23 @@
 //! 提供多种数据源的统一接口
 
 pub mod chip_distribution;
+pub mod consensus;
 pub mod eastmoney_provider;
 pub mod financials;
 pub mod gtimg_provider;
+pub mod industry;
 pub mod intraday_kline;
 pub mod money_flow;
 pub mod rustdx_provider;
 pub mod service;
 pub mod tushare_provider;
+pub mod valuation_history;
 
 pub use chip_distribution::{
     compute_chip_distribution, format_for_prompt as format_chip_prompt, ChipDistribution,
 };
 pub use eastmoney_provider::HttpProvider;
-pub use financials::{fetch_with_fallback_blocking as fetch_financials, Financials};
+pub use financials::{fetch_with_fallback_blocking as fetch_financials, assess_quality, FinancialPeriod, Financials, QualityReport};
 pub use gtimg_provider::GtimgProvider;
 pub use money_flow::{
     fetch_intraday_shape_blocking, fetch_money_flow_blocking, format_for_prompt as format_flow_prompt,
@@ -24,6 +27,9 @@ pub use money_flow::{
 };
 pub use rustdx_provider::RustdxProvider;
 pub use tushare_provider::TushareProvider;
+pub use valuation_history::{fetch_blocking as fetch_valuation_history, ValuationHistory};
+pub use consensus::{fetch_blocking as fetch_consensus, ConsensusData, RecentReport};
+pub use industry::{fetch_blocking as fetch_industry, IndustryBenchmark};
 
 use anyhow::Result;
 use chrono::NaiveDate;
@@ -69,6 +75,18 @@ pub struct KlineData {
     pub gross_margin: Option<f64>,    // 毛利率(%)
     pub net_margin: Option<f64>,      // 净利率(%)
     pub sharpe_ratio: Option<f64>,    // 夏普比率（风险调整后收益）
+    /// 多期财务历史序列（按报告期从新到旧），仅填充到 data[0]（最新一根 K 线）
+    pub financials_history: Option<Vec<FinancialPeriod>>,
+    /// PE/PB 历史分位（近 3 年），仅填充到 data[0]
+    pub valuation_history: Option<ValuationHistory>,
+    /// 卖方分析师一致预期（近 6 个月研报），仅填充到 data[0]
+    pub consensus: Option<ConsensusData>,
+    /// 行业横向对标（同业 PE/PB/ROE 中位数 + 个股百分位），仅填充到 data[0]
+    pub industry: Option<IndustryBenchmark>,
+    // NEW: 涨跌停标记
+    pub is_limit_up: bool,            // 是否涨停
+    pub is_limit_down: bool,          // 是否跌停
+    pub is_suspended: bool,           // 是否停牌
 }
 
 /// 数据提供者接口
@@ -182,6 +200,36 @@ impl DataFetcherManager {
                                 latest.net_profit_yoy.or(fin.net_profit_yoy);
                             latest.gross_margin = latest.gross_margin.or(fin.gross_margin);
                             latest.net_margin = latest.net_margin.or(fin.net_margin);
+                            if !fin.history.is_empty() {
+                                latest.financials_history = Some(fin.history.clone());
+                            }
+                        }
+                    }
+
+                    // 估值历史分位（PE/PB 近 3 年）
+                    if let Some(vh) = valuation_history::fetch_blocking(
+                        &self.financials_client,
+                        code,
+                    ) {
+                        if let Some(latest) = data.first_mut() {
+                            // 同时填充为空的 PE/PB 点估值
+                            latest.pe_ratio = latest.pe_ratio.or(vh.current_pe);
+                            latest.pb_ratio = latest.pb_ratio.or(vh.current_pb);
+                            latest.valuation_history = Some(vh);
+                        }
+                    }
+
+                    // 卖方一致预期（近 6 个月研报）
+                    if let Some(cs) = consensus::fetch_blocking(&self.financials_client, code) {
+                        if let Some(latest) = data.first_mut() {
+                            latest.consensus = Some(cs);
+                        }
+                    }
+
+                    // 行业横向对标（同业 PE/PB/ROE 百分位）
+                    if let Some(ib) = industry::fetch_blocking(&self.financials_client, code) {
+                        if let Some(latest) = data.first_mut() {
+                            latest.industry = Some(ib);
                         }
                     }
 
