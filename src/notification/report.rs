@@ -94,6 +94,53 @@ impl NotificationService {
             lines.push(String::new());
         }
 
+        // 趋势成长强势票（用于优先关注类似生益科技这类“业绩+趋势+资金”共振标的）
+        let mut trend_growth_focus: Vec<&AnalysisResult> = sorted_results
+            .iter()
+            .filter(|r| is_trend_growth_focus(r))
+            .collect();
+        trend_growth_focus.sort_by(|a, b| {
+            b.chg_10d
+                .unwrap_or(f64::NEG_INFINITY)
+                .partial_cmp(&a.chg_10d.unwrap_or(f64::NEG_INFINITY))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        if !trend_growth_focus.is_empty() {
+            lines.extend(vec![
+                "---".to_string(),
+                String::new(),
+                format!(
+                    "## 🚀 趋势成长强势票（{} 只，重点跟踪）",
+                    trend_growth_focus.len()
+                ),
+                String::new(),
+                "> 筛选规则：强势多头/多头排列 + 增长可持续≥80 + 资金面≥55 + 近5日涨幅≥15%（或近10日涨幅≥25%）。用于优先关注，不等同于追涨买入信号。".to_string(),
+                String::new(),
+                "| 股票 | 代码 | 趋势 | 近5日 | 近10日 | 增长分 | 资金分 | 估值分 | 建议 |".to_string(),
+                "|------|------|------|------|-------|--------|--------|--------|------|".to_string(),
+            ]);
+            for r in &trend_growth_focus {
+                let (growth, capital, valuation) = r
+                    .score_breakdown
+                    .as_ref()
+                    .map(|sb| (sb.growth_sustainability, sb.capital_flow, sb.valuation_safety))
+                    .unwrap_or((0, 0, 0));
+                lines.push(format!(
+                    "| {} | {} | {} | {:+.2}% | {:+.2}% | {} | {} | {} | {} |",
+                    r.name,
+                    r.code,
+                    r.trend_prediction,
+                    r.chg_5d.unwrap_or(0.0),
+                    r.chg_10d.unwrap_or(0.0),
+                    growth,
+                    capital,
+                    valuation,
+                    r.operation_advice
+                ));
+            }
+            lines.push(String::new());
+        }
+
         // 模拟持仓汇总
         let position_results: Vec<&AnalysisResult> = sorted_results.iter().filter(|r| r.position_return.is_some()).collect();
         if !position_results.is_empty() {
@@ -658,6 +705,18 @@ impl NotificationService {
         lines.join("\n")
     }
 
+}
+
+fn is_trend_growth_focus(result: &AnalysisResult) -> bool {
+    let Some(sb) = result.score_breakdown.as_ref() else {
+        return false;
+    };
+    let trend_ok = result.trend_prediction.contains("强势多头")
+        || result.trend_prediction.contains("多头排列");
+    let momentum_ok = result.chg_5d.unwrap_or(0.0) >= 15.0 || result.chg_10d.unwrap_or(0.0) >= 25.0;
+    let growth_ok = sb.growth_sustainability >= 80;
+    let capital_ok = sb.capital_flow >= 55;
+    trend_ok && momentum_ok && growth_ok && capital_ok
 }
 
 /// 将 `extra_context` 输出的 `【段落】+ 文本` 片段格式化为与日报其它部分一致的 Markdown

@@ -167,11 +167,62 @@ pub fn build_stock_list(args: &Args) -> Result<(Vec<String>, HashSet<String>, St
         info!("⚙️ POSITION_TRACKING_ENABLED=false：跳过持仓追加与持仓跟踪");
     }
 
+    // 6. 过滤退市股票（默认开启，可通过 STOCK_FILTER_DELISTED=false 关闭）
+    filter_delisted_stocks(&mut stock_codes);
+
     if stock_codes.is_empty() {
         info!("⚠️ 未配置自选股列表且宏观AI未推荐股票，将仅执行大盘复盘");
     }
 
     Ok((stock_codes, limit_up_codes, macro_news_context))
+}
+
+fn filter_delisted_stocks(stock_codes: &mut Vec<String>) {
+    let filter_enabled = std::env::var("STOCK_FILTER_DELISTED")
+        .map(|v| v.to_lowercase() != "false")
+        .unwrap_or(true);
+    if !filter_enabled {
+        info!("⚙️ STOCK_FILTER_DELISTED=false：跳过退市股票过滤");
+        return;
+    }
+
+    use stock_analysis::data_provider::DataFetcherManager;
+
+    let fetcher = match DataFetcherManager::new() {
+        Ok(f) => f,
+        Err(e) => {
+            info!("⚠️ 初始化数据获取器失败，跳过退市过滤: {}", e);
+            return;
+        }
+    };
+
+    let before = stock_codes.len();
+    let mut removed: Vec<(String, String)> = Vec::new();
+    stock_codes.retain(|code| match fetcher.get_stock_name(code) {
+        Some(name) if is_delisted_name(&name) => {
+            removed.push((code.clone(), name));
+            false
+        }
+        _ => true,
+    });
+
+    if removed.is_empty() {
+        return;
+    }
+
+    for (code, name) in &removed {
+        info!("🚫 过滤退市票: {}({})", name, code);
+    }
+    info!(
+        "🚫 退市过滤完成：移除 {} 只，剩余 {} 只",
+        before - stock_codes.len(),
+        stock_codes.len()
+    );
+}
+
+fn is_delisted_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    trimmed.contains("退市") || trimmed.starts_with('退') || trimmed.contains("终止上市")
 }
 
 fn append_lhb_top10(stock_codes: &mut Vec<String>) -> Result<()> {
@@ -291,13 +342,23 @@ fn append_sector_resonance(stock_codes: &mut Vec<String>, macro_news: &str) {
                 stock_codes.len() - before
             );
             for s in &sectors {
+                let leaders_desc = s
+                    .leaders
+                    .iter()
+                    .map(|l| format!("{}({} {:+.1}%)", l.name, l.code, l.change_pct))
+                    .collect::<Vec<_>>()
+                    .join(",");
                 info!(
-                    "   ↳ {}({}) [{:?}] 涨幅{:.2}% 主力{:.2}亿",
+                    "   ↳ {}({}) [{:?}] 涨幅{:.2}% 主力{:.2}亿 加速{:+.2}pp 量比{:.2} 点火涨停{}只 龙头[{}]",
                     s.board.name,
                     s.board.code,
                     s.hit_dims,
                     s.board.change_pct,
-                    s.board.main_inflow / 1e8
+                    s.board.main_inflow / 1e8,
+                    s.board.inflow_accel(),
+                    s.board.vol_ratio,
+                    s.ignition.limit_up_count,
+                    leaders_desc
                 );
             }
         }

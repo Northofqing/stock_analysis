@@ -110,6 +110,8 @@ const TECHNICAL_SYS: &str = r#"你是 A 股**技术面分析师**。只看均线
   - 准备变盘 PreReversal（布林收口） +0（仅提示）
 - 总分裁剪到 0-100
 
+若上下文出现【系统趋势快照】段落：视为**参考证据**，必须独立打分，不得直接照搬其中的系统结论。
+
 stance：score>=60 → bull；score<=40 → bear；其余 neutral。"#;
 
 const CAPITAL_SYS: &str = r#"你是 A 股**资金面分析师**。只看量能/主力代理/真实主力资金流/分时/龙虎榜/筹码分布，不要分析基本面/技术指标/新闻。
@@ -167,6 +169,7 @@ const TIMEFRAME_SYS: &str = r#"你是 A 股**时间窗口分析师**。基于技
 
 key_signals 必须分别给出"短期(1-3日)：xxx"和"中期(2-4周)：xxx"两条以上判断。
 summary 一句话归纳"短期与中期方向是否一致"。
+若上下文出现【系统趋势快照】段落：视为**参考证据**，必须独立打分，不得直接照搬其中的系统结论。
 stance：score>=60 → bull；score<=40 → bear；其余 neutral。"#;
 
 fn build_prompt(role: &str, slice: &str, basics: &str) -> String {

@@ -22,7 +22,7 @@ impl AnalysisPipeline {
                 code: r.code.clone(),
                 name: r.name.clone(),
                 market_cap: r.market_cap,
-                roe: None, // 暂时没有ROE数据
+                roe: r.roe, // 暂时没有ROE数据
                 pe: r.pe_ratio,
                 pb: r.pb_ratio,
                 turnover_rate: r.turnover_rate,

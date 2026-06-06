@@ -3,6 +3,7 @@
 //! 每个 Agent 只看自己领域的切片，避免共享同一份长上下文导致的"假分工"。
 
 use crate::data_provider::KlineData;
+use crate::deep_analyzer::TrendSnapshot;
 use crate::indicators::{calc_skdj, SKDJ_M, SKDJ_N};
 
 /// 4 大领域 + 消息 + 宏观的数据切片
@@ -25,6 +26,7 @@ pub fn build_slices(
     extra_context: Option<&str>,
     news_context: Option<&str>,
     macro_context: Option<&str>,
+    trend_snapshot: Option<&TrendSnapshot>,
 ) -> DomainSlices {
     let latest = &kline_data[0];
     let closes: Vec<f64> = kline_data.iter().map(|k| k.close).collect();
@@ -48,7 +50,11 @@ pub fn build_slices(
     );
 
     // ===== technical =====
-    let technical = build_technical_slice(latest, &closes, kline_data, code);
+    let mut technical = build_technical_slice(latest, &closes, kline_data, code);
+    // 系统趋势快照（仅技术面 / 时间窗口分析师可见，作为参考证据）
+    if let Some(ts) = trend_snapshot {
+        technical.push_str(&render_trend_snapshot(ts));
+    }
 
     // ===== capital =====
     let capital = build_capital_slice(latest, &closes, kline_data, extra_context);
@@ -68,6 +74,42 @@ pub fn build_slices(
         macro_ctx: macro_context.map(|s| s.to_string()),
         sector,
     }
+}
+
+/// 渲染系统趋势快照（参考证据型，不含最终评分/买入信号）。
+fn render_trend_snapshot(ts: &TrendSnapshot) -> String {
+    let mut s = String::from(
+        "\n【系统趋势快照（参考证据，请独立判断，勿照搬系统结论）】\n",
+    );
+    s.push_str(&format!(
+        "趋势状态: {} | 均线排列: {} | 趋势强度: {:.1}\n",
+        ts.trend_status, ts.ma_alignment, ts.trend_strength
+    ));
+    s.push_str(&format!(
+        "MA5乖离: {:.2}% | 量能: {} | 5日量比: {:.2}\n",
+        ts.bias_ma5, ts.volume_status, ts.volume_ratio_5d
+    ));
+    if !ts.support_levels.is_empty() {
+        let lv: Vec<String> = ts.support_levels.iter().map(|v| format!("{:.2}", v)).collect();
+        s.push_str(&format!("支撑位: {}\n", lv.join(" / ")));
+    }
+    if !ts.resistance_levels.is_empty() {
+        let lv: Vec<String> = ts.resistance_levels.iter().map(|v| format!("{:.2}", v)).collect();
+        s.push_str(&format!("压力位: {}\n", lv.join(" / ")));
+    }
+    if !ts.evidence_reasons.is_empty() {
+        s.push_str("技术线索:\n");
+        for r in &ts.evidence_reasons {
+            s.push_str(&format!("  - {}\n", r));
+        }
+    }
+    if !ts.risk_factors.is_empty() {
+        s.push_str("风险线索:\n");
+        for r in &ts.risk_factors {
+            s.push_str(&format!("  - {}\n", r));
+        }
+    }
+    s
 }
 
 fn calc_ma(closes: &[f64], period: usize) -> Option<f64> {

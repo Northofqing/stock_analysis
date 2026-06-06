@@ -24,17 +24,58 @@ use crate::agent::tools_sector::FetchSectorTool;
 use crate::agent::validation::ValidationEngine;
 use crate::analyzer::GeminiAnalyzer;
 use crate::data_provider::service;
+use crate::data_provider::KlineData;
 use anyhow::Result;
 use async_openai::{config::OpenAIConfig, Client};
 use serde_json::json;
 use std::env;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 const DEFAULT_MAX_ITERATIONS: usize = 12;
 const DEFAULT_SYSTEM_PROMPT: &str = "你是一个专精于 A 股深研的金融量化 Agent。\n\
 你的任务是通过调用提供的工具（Tool）来获取真实数据，严禁编造财务数据。\n\
 在拿到数据后，你需要做交叉分析。如果在分析中触发了系统校验失败，请立刻通过报错提示进行修正，不要固执己见。\n\
 请根据个股数据和行业板块联动，给出最终深入的评估。";
+
+/// 主流程（`process_stock`）已抓取数据的快照，供重点股深度研判复用，
+/// 避免在 [`run_multi_agent_analysis`] 中重复抓取 K线/资金/新闻/财务等数据。
+#[derive(Debug, Clone)]
+pub struct DeepAnalysisSeed {
+    pub code: String,
+    pub name: String,
+    /// 主流程抓取的 K 线（Arc 共享，零拷贝传递给深度分析）。
+    pub kline: Arc<Vec<KlineData>>,
+    /// 资金面上下文：真实主力资金流 + 筹码 + 多周期（资金面切片复用）。
+    pub extra_context: Option<String>,
+    /// 消息面上下文：新闻舆情（消息面切片复用）。
+    pub news_context: Option<String>,
+    /// 宏观背景。
+    pub macro_context: Option<String>,
+    /// 主流程已渲染的财务/估值/研报/行业对标（基本面切片增强，复用避免重复抓取）。
+    pub fundamental_ctx: Option<String>,
+    /// 系统趋势研判的中间证据快照（仅技术面 / 时间窗口分析师可见）。
+    pub trend_snapshot: TrendSnapshot,
+}
+
+/// 系统趋势研判的中间证据快照。
+///
+/// 只携带「证据型」字段，**刻意排除** `signal_score` / `buy_signal` 等最终结论，
+/// 避免深度分析师直接照搬系统结论形成自证循环。
+#[derive(Debug, Clone)]
+pub struct TrendSnapshot {
+    pub trend_status: String,
+    pub ma_alignment: String,
+    pub trend_strength: f64,
+    pub bias_ma5: f64,
+    pub volume_status: String,
+    pub volume_ratio_5d: f64,
+    pub support_levels: Vec<f64>,
+    pub resistance_levels: Vec<f64>,
+    /// 系统记录的技术线索（来自 signal_reasons，作为证据而非结论）。
+    pub evidence_reasons: Vec<String>,
+    pub risk_factors: Vec<String>,
+}
 
 #[derive(Debug, Clone)]
 struct ModelConfig {
@@ -249,6 +290,7 @@ pub async fn run_multi_agent_analysis(code: &str) -> Result<String> {
         extra_ctx.as_deref(),
         news_ctx_opt.as_deref(),
         None,
+        None,
     );
 
     // 5. 把财务工具数据注入基本面切片
@@ -262,6 +304,39 @@ pub async fn run_multi_agent_analysis(code: &str) -> Result<String> {
     // 6. 调用 GeminiAnalyzer 多 Agent 流水线
     let analyzer = GeminiAnalyzer::from_env();
     log::info!("[MultiAgent] 进入 6 分析师 + 辩论 + 仲裁阶段");
+    analyzer.run_text_pipeline(slices).await
+}
+
+/// 复用主流程数据的多角色流水线（重点股深度研判走此路径）。
+///
+/// 与 [`run_multi_agent_analysis`] 的区别：**不再重复抓取**任何数据，
+/// 直接复用 [`DeepAnalysisSeed`] 中主流程已获取的 K线/资金/新闻/财务，
+/// 并把系统趋势快照注入技术面 / 时间窗口分析师。
+pub async fn run_multi_agent_analysis_with_seed(seed: &DeepAnalysisSeed) -> Result<String> {
+    log::info!("[MultiAgent] 复用主流程数据，跳过重复抓取：{}", seed.code);
+    if seed.kline.is_empty() {
+        anyhow::bail!("K 线数据为空，无法进行多角色分析");
+    }
+
+    let mut slices = build_slices(
+        &seed.code,
+        Some(&seed.name),
+        &seed.kline,
+        seed.extra_context.as_deref(),
+        seed.news_context.as_deref(),
+        seed.macro_context.as_deref(),
+        Some(&seed.trend_snapshot),
+    );
+
+    if let Some(fund) = seed.fundamental_ctx.as_deref() {
+        slices.fundamental = format!(
+            "{}\n【主流程已抓取的财务/估值/研报/行业数据】\n{}",
+            slices.fundamental, fund
+        );
+    }
+
+    let analyzer = GeminiAnalyzer::from_env();
+    log::info!("[MultiAgent] 进入 6 分析师 + 辩论 + 仲裁阶段（复用数据）");
     analyzer.run_text_pipeline(slices).await
 }
 

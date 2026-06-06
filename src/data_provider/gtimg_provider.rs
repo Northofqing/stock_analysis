@@ -6,6 +6,7 @@
 use super::{DataProvider, KlineData, RealtimeQuote};
 use anyhow::{Context, Result, anyhow};
 use chrono::NaiveDate;
+use std::future::Future;
 
 /// 腾讯财经数据提供者
 pub struct GtimgProvider {
@@ -13,6 +14,63 @@ pub struct GtimgProvider {
 }
 
 impl GtimgProvider {
+    /// 统一规范化股票代码，并推导腾讯接口所需交易所前缀。
+    ///
+    /// 支持输入：
+    /// - 纯数字：300114
+    /// - 带前缀：sz300114 / sh600519 / bj430047
+    /// - 带后缀：300114.SZ / 600519.SH / 430047.BJ
+    fn normalize_for_tencent(code: &str) -> Option<(String, String)> {
+        let raw = code.trim();
+        if raw.is_empty() {
+            return None;
+        }
+
+        let lower = raw.to_ascii_lowercase();
+
+        // 1) 先处理显式前缀
+        if let Some(rest) = lower.strip_prefix("sh") {
+            if rest.len() == 6 && rest.chars().all(|c| c.is_ascii_digit()) {
+                return Some((rest.to_string(), format!("sh{}", rest)));
+            }
+        }
+        if let Some(rest) = lower.strip_prefix("sz") {
+            if rest.len() == 6 && rest.chars().all(|c| c.is_ascii_digit()) {
+                return Some((rest.to_string(), format!("sz{}", rest)));
+            }
+        }
+        if let Some(rest) = lower.strip_prefix("bj") {
+            if rest.len() == 6 && rest.chars().all(|c| c.is_ascii_digit()) {
+                return Some((rest.to_string(), format!("bj{}", rest)));
+            }
+        }
+
+        // 2) 再处理后缀格式（如 300114.SZ）
+        if let Some((num, suffix)) = lower.split_once('.') {
+            if num.len() == 6 && num.chars().all(|c| c.is_ascii_digit()) {
+                match suffix {
+                    "sh" => return Some((num.to_string(), format!("sh{}", num))),
+                    "sz" => return Some((num.to_string(), format!("sz{}", num))),
+                    "bj" => return Some((num.to_string(), format!("bj{}", num))),
+                    _ => {}
+                }
+            }
+        }
+
+        // 3) 纯数字按首位推导市场
+        if lower.len() == 6 && lower.chars().all(|c| c.is_ascii_digit()) {
+            let prefix = match lower.chars().next().unwrap_or('0') {
+                '5' | '6' | '9' => "sh",
+                '0' | '1' | '2' | '3' => "sz",
+                '4' | '8' => "bj",
+                _ => "sz",
+            };
+            return Some((lower.clone(), format!("{}{}", prefix, lower)));
+        }
+
+        None
+    }
+
     /// 创建新的提供者
     pub fn new() -> Result<Self> {
         let client = reqwest::Client::builder()
@@ -28,15 +86,49 @@ impl GtimgProvider {
     pub fn fetch_realtime_quote(&self, code: &str) -> Result<Option<RealtimeQuote>> {
         self.get_realtime_quote(code)
     }
+
+    /// 在同步上下文中安全执行异步任务：
+    /// - 若当前线程已在 Tokio runtime 内，使用 block_in_place + handle.block_on
+    /// - 若不在 runtime 内，临时创建 current_thread runtime 执行
+    fn run_async_blocking<T, F>(fut: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: Future<Output = Result<T>> + Send + 'static,
+    {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
+            Err(_) => {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("创建临时 Tokio 运行时失败")?;
+                rt.block_on(fut)
+            }
+        }
+    }
+
+    /// 与 `run_async_blocking` 类似，但返回任意值（非 Result）。
+    fn run_async_blocking_value<T, F>(fut: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: Future<Output = T> + Send + 'static,
+    {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => Ok(tokio::task::block_in_place(|| handle.block_on(fut))),
+            Err(_) => {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("创建临时 Tokio 运行时失败")?;
+                Ok(rt.block_on(fut))
+            }
+        }
+    }
     
     /// 从腾讯财经API获取K线数据（异步版本）
     pub(crate) async fn fetch_kline_data_internal(client: &reqwest::Client, code: &str, days: usize) -> Result<Vec<KlineData>> {
-        // 转换股票代码格式 (600519 -> sh600519, 000001 -> sz000001)
-        let market_code = if code.starts_with('6') {
-            format!("sh{}", code) // 上海
-        } else {
-            format!("sz{}", code) // 深圳/创业板/科创板
-        };
+        let (normalized_code, market_code) = Self::normalize_for_tencent(code)
+            .ok_or_else(|| anyhow!("无效股票代码格式: {}", code))?;
         
         // 腾讯财经K线API
         // ktype: day(日线), week(周线), month(月线)
@@ -77,14 +169,14 @@ impl GtimgProvider {
         log::debug!("[腾讯] 响应前200字符: {}", &text[..text.len().min(200)]);
         
         // 解析JSON
-        let mut klines = Self::parse_kline_response_internal(&text, code)?;
+        let mut klines = Self::parse_kline_response_internal(&text, &normalized_code)?;
         
         // 获取实时行情数据，补充盈利指标到最新K线
         if !klines.is_empty() {
             log::info!("[腾讯] {} K线数据条数: {}, 最新K线日期: {}, 收盘价: {:.2}元", 
                 code, klines.len(), klines[0].date, klines[0].close);
             
-            if let Ok(Some(quote)) = Self::fetch_realtime_quote_internal(client, code).await {
+            if let Ok(Some(quote)) = Self::fetch_realtime_quote_internal(client, &normalized_code).await {
                 // 将实时数据填充到最新的K线数据中
                 if let Some(latest) = klines.first_mut() {
                     let old_close = latest.close;
@@ -116,12 +208,9 @@ impl GtimgProvider {
             .context("解析JSON失败")?;
         
         // 获取K线数据数组
-        // 数据路径: data.{code}.day 或 data.{code}.qfqday
-        let market_code = if code.starts_with('6') {
-            format!("sh{}", code)
-        } else {
-            format!("sz{}", code)
-        };
+        // 数据路径: data.{market_code}.day 或 data.{market_code}.qfqday
+        let (_, market_code) = Self::normalize_for_tencent(code)
+            .ok_or_else(|| anyhow!("无效股票代码格式: {}", code))?;
         
         let klines = json["data"][&market_code]["qfqday"]
             .as_array()
@@ -213,12 +302,7 @@ impl GtimgProvider {
     
     /// 获取股票名称（静态异步方法）
     async fn fetch_stock_name_internal(client: &reqwest::Client, code: &str) -> Option<String> {
-        // 转换股票代码格式
-        let market_code = if code.starts_with('6') {
-            format!("sh{}", code)
-        } else {
-            format!("sz{}", code)
-        };
+        let (_, market_code) = Self::normalize_for_tencent(code)?;
         
         // 使用腾讯实时行情接口获取股票名称
         let url = format!("http://qt.gtimg.cn/q={}", market_code);
@@ -245,6 +329,7 @@ impl GtimgProvider {
                                         return Some(name);
                                     }
                                 }
+                                log::debug!("[腾讯] 股票名称解析失败，字段不足或名称为空: code={}, text={}", code, text);
                             }
                         }
                     }
@@ -259,11 +344,8 @@ impl GtimgProvider {
     
     /// 获取实时行情（包含盈利指标）
     async fn fetch_realtime_quote_internal(client: &reqwest::Client, code: &str) -> Result<Option<RealtimeQuote>> {
-        let market_code = if code.starts_with('6') {
-            format!("sh{}", code)
-        } else {
-            format!("sz{}", code)
-        };
+        let (normalized_code, market_code) = Self::normalize_for_tencent(code)
+            .ok_or_else(|| anyhow!("无效股票代码格式: {}", code))?;
         
         let url = format!("http://qt.gtimg.cn/q={}", market_code);
         
@@ -313,7 +395,7 @@ impl GtimgProvider {
                                     };
                                     
                                     let quote = RealtimeQuote {
-                                        code: code.to_string(),
+                                        code: normalized_code,
                                         name: parts[1].to_string(),
                                         price,
                                         pct_chg,
@@ -359,11 +441,8 @@ impl DataProvider for GtimgProvider {
         let client = self.client.clone();
         let code = code.to_string();
         
-        // 使用 tokio::task::block_in_place 来运行异步代码
-        let data = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                Self::fetch_kline_data_internal(&client, &code, days).await
-            })
+        let data = Self::run_async_blocking(async move {
+            Self::fetch_kline_data_internal(&client, &code, days).await
         })?;
         
         log::info!("[腾讯] 成功获取 {} 条数据", data.len());
@@ -375,12 +454,11 @@ impl DataProvider for GtimgProvider {
         let client = self.client.clone();
         let code_str = code.to_string();
         
-        // 使用 tokio::task::block_in_place 来运行异步代码
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                Self::fetch_stock_name_internal(&client, &code_str).await
-            })
-        });
+        let result = Self::run_async_blocking_value(async move {
+            Self::fetch_stock_name_internal(&client, &code_str).await
+        })
+        .ok()
+        .flatten();
         
         result.or_else(|| Some(format!("股票{}", code)))
     }
@@ -388,11 +466,9 @@ impl DataProvider for GtimgProvider {
     fn get_realtime_quote(&self, code: &str) -> Result<Option<RealtimeQuote>> {
         let client = self.client.clone();
         let code_str = code.to_string();
-        
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                Self::fetch_realtime_quote_internal(&client, &code_str).await
-            })
+
+        Self::run_async_blocking(async move {
+            Self::fetch_realtime_quote_internal(&client, &code_str).await
         })
     }
     
@@ -404,6 +480,25 @@ impl DataProvider for GtimgProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_normalize_for_tencent_formats() {
+        let cases = vec![
+            ("300114", "300114", "sz300114"),
+            ("sz300114", "300114", "sz300114"),
+            ("300114.SZ", "300114", "sz300114"),
+            ("600519", "600519", "sh600519"),
+            ("sh600519", "600519", "sh600519"),
+            ("430047.BJ", "430047", "bj430047"),
+        ];
+
+        for (input, expected_code, expected_market_code) in cases {
+            let (code, market_code) = GtimgProvider::normalize_for_tencent(input)
+                .expect("规范化不应失败");
+            assert_eq!(code, expected_code);
+            assert_eq!(market_code, expected_market_code);
+        }
+    }
     
     #[test]
     fn test_get_stock_name() {
