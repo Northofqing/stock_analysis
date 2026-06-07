@@ -23,5 +23,5 @@ pub(crate) fn get_max_workers(args: &Args) -> usize {
                 .ok()
                 .and_then(|s| s.parse().ok())
         })
-        .unwrap_or(3)
+        .unwrap_or(6)
 }

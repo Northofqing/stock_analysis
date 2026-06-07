@@ -95,30 +95,42 @@ impl AnalysisPipeline {
     }
 
     /// 运行布林带+Z-Score 均值回归策略回测
-    pub(super) async fn run_bollinger_zscore_backtest(&self, results: &[AnalysisResult]) -> Result<BacktestSummary> {
-        let config = BollingerZScoreConfig::default();
-        let engine = BollingerZScoreBacktest::new(config);
-
-        // 为评分前 20 的股票拉取较长历史数据（250 日）
+    /// 拉取评分前 N 只股票的长周期历史K线（供布林带/RSI 回测共享，避免重复抓取）
+    pub(super) async fn fetch_top_backtest_history(
+        &self,
+        results: &[AnalysisResult],
+        top_n: usize,
+        days: usize,
+    ) -> Vec<(String, String, Vec<crate::data_provider::KlineData>)> {
         let mut sorted = results.to_vec();
         sorted.sort_by(|a, b| b.sentiment_score.cmp(&a.sentiment_score));
 
-        let top_codes: Vec<_> = sorted.iter().take(3).collect();
-        let mut stocks_data: Vec<(String, String, Vec<crate::data_provider::KlineData>)> = Vec::new();
-
-        for r in &top_codes {
-            match self.data_manager.get_daily_data(&r.code, 7000) {
-                Ok((data, _)) if data.len() >= 30 => {
+        let mut stocks_data = Vec::new();
+        for r in sorted.iter().take(top_n) {
+            match self.data_manager.get_daily_data(&r.code, days) {
+                Ok((data, _)) if !data.is_empty() => {
                     stocks_data.push((r.code.clone(), r.name.clone(), data));
                 }
-                Ok(_) => {
-                    warn!("[{}] K线数据不足30条，跳过布林带回测", r.code);
-                }
-                Err(e) => {
-                    warn!("[{}] 拉取历史数据失败: {}", r.code, e);
-                }
+                Ok(_) => warn!("[{}] K线数据为空，跳过回测", r.code),
+                Err(e) => warn!("[{}] 拉取历史数据失败: {}", r.code, e),
             }
         }
+        stocks_data
+    }
+
+    pub(super) async fn run_bollinger_zscore_backtest(
+        &self,
+        history: &[(String, String, Vec<crate::data_provider::KlineData>)],
+    ) -> Result<BacktestSummary> {
+        let config = BollingerZScoreConfig::default();
+        let engine = BollingerZScoreBacktest::new(config);
+
+        // 布林带需要至少 30 条K线
+        let stocks_data: Vec<_> = history
+            .iter()
+            .filter(|(_, _, d)| d.len() >= 30)
+            .cloned()
+            .collect();
 
         if stocks_data.is_empty() {
             anyhow::bail!("无有效股票数据用于布林带回测");
@@ -145,32 +157,20 @@ impl AnalysisPipeline {
     }
 
     /// 运行 RSI 超买超卖策略回测
-    pub(super) async fn run_rsi_backtest(&self, results: &[AnalysisResult]) -> Result<BacktestSummary> {
+    pub(super) async fn run_rsi_backtest(
+        &self,
+        history: &[(String, String, Vec<crate::data_provider::KlineData>)],
+    ) -> Result<BacktestSummary> {
         // 使用 2026-04-18 优化定稿的 v10 配置（93.75% 胜率）；见 reports/rsi_optimization_log.md
         let config = RsiConfig::preset_daily_v10_no_stop();
         let engine = RsiBacktest::new(config);
 
-        // 取评分前 20 的股票拉取历史K线（250日）
-        let mut sorted = results.to_vec();
-        sorted.sort_by(|a, b| b.sentiment_score.cmp(&a.sentiment_score));
-
-        let top_codes: Vec<_> = sorted.iter().take(3).collect();
-        let mut stocks_data: Vec<(String, String, Vec<crate::data_provider::KlineData>)> =
-            Vec::new();
-
-        for r in &top_codes {
-            match self.data_manager.get_daily_data(&r.code, 7000) {
-                Ok((data, _)) if data.len() >= 20 => {
-                    stocks_data.push((r.code.clone(), r.name.clone(), data));
-                }
-                Ok(_) => {
-                    warn!("[{}] K线数据不足20条，跳过RSI回测", r.code);
-                }
-                Err(e) => {
-                    warn!("[{}] 拉取历史数据失败: {}", r.code, e);
-                }
-            }
-        }
+        // RSI 需要至少 20 条K线
+        let stocks_data: Vec<_> = history
+            .iter()
+            .filter(|(_, _, d)| d.len() >= 20)
+            .cloned()
+            .collect();
 
         if stocks_data.is_empty() {
             anyhow::bail!("无有效股票数据用于RSI回测");

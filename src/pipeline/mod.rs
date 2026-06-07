@@ -742,48 +742,10 @@ impl AnalysisPipeline {
         // 2. 技术分析 Markdown
         let mut analysis_content = technical_report::build_technical_markdown(&trend_result);
 
-        // 3. 获取股票名称（同步 HTTP，放 blocking 线程池）
-        let dm = self.data_manager.clone();
-        let code_owned = code.to_string();
-        let stock_name = tokio::task::spawn_blocking(move || dm.get_stock_name(&code_owned))
-            .await
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| format!("股票{}", code));
-
-        info!("[{}] 搜索最新新闻...", code);
-        let news_context = if self.use_news_search {
-            let search_service = get_search_service();
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                search_service.search_stock_news(code, &stock_name, 3),
-            )
-            .await
-            {
-                Ok(response) => {
-                    if response.success && !response.results.is_empty() {
-                        info!("[{}] 获取到 {} 条新闻", code, response.results.len());
-                        Some(response.to_context(3))
-                    } else {
-                        warn!("[{}] 新闻搜索未找到结果", code);
-                        None
-                    }
-                }
-                Err(_) => {
-                    warn!("[{}] 新闻搜索超时", code);
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        // 4. 真实资金/分时/龙虎榜 + 筹码分布上下文（不管 AI 是否启用，都抓一次给通知展示）
-        let extra = extra_context::fetch_extra_context(code, data).await;
-        let mut extra_context = extra.section;
-        let money_flow_raw = extra.money_flow;
-
-        // 4.5 多周期下钻（Multi-timeframe）：日线买入信号触发时，去 60min/15min 找精准入场点
+        // 3-4. 并行抓取三路互相独立的上下文，整体只等最慢一路：
+        //   ① 股票名→新闻（新闻依赖股票名，内部串行）
+        //   ② 真实资金/分时/龙虎榜/筹码分布（不管 AI 是否启用都抓一次给通知展示）
+        //   ③ 多周期下钻（60min/15min，仅在日线买入信号触发时）
         let mtf_trigger = {
             use crate::strategy::BollMacdAction;
             use crate::trend_analyzer::BuySignal;
@@ -794,17 +756,72 @@ impl AnalysisPipeline {
                 )
                 || matches!(trend_result.buy_signal, BuySignal::StrongBuy | BuySignal::Buy)
         };
-        if mtf_trigger {
-            info!("[{}] 触发多周期下钻（60min/15min 寻找精准入场点）", code);
-            if let Some(mtf_section) = multi_timeframe::fetch_multi_timeframe_section(code).await {
-                extra_context = match extra_context {
-                    Some(mut s) => {
-                        s.push_str(&mtf_section);
-                        Some(s)
+
+        let name_news_fut = async {
+            // 股票名称（同步 HTTP，放 blocking 线程池）
+            let dm = self.data_manager.clone();
+            let code_owned = code.to_string();
+            let stock_name = tokio::task::spawn_blocking(move || dm.get_stock_name(&code_owned))
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| format!("股票{}", code));
+
+            info!("[{}] 搜索最新新闻...", code);
+            let news_context = if self.use_news_search {
+                let search_service = get_search_service();
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    search_service.search_stock_news(code, &stock_name, 3),
+                )
+                .await
+                {
+                    Ok(response) => {
+                        if response.success && !response.results.is_empty() {
+                            info!("[{}] 获取到 {} 条新闻", code, response.results.len());
+                            Some(response.to_context(3))
+                        } else {
+                            warn!("[{}] 新闻搜索未找到结果", code);
+                            None
+                        }
                     }
-                    None => Some(mtf_section),
-                };
+                    Err(_) => {
+                        warn!("[{}] 新闻搜索超时", code);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            (stock_name, news_context)
+        };
+
+        let mtf_fut = async {
+            if mtf_trigger {
+                info!("[{}] 触发多周期下钻（60min/15min 寻找精准入场点）", code);
+                multi_timeframe::fetch_multi_timeframe_section(code).await
+            } else {
+                None
             }
+        };
+
+        let ((stock_name, news_context), extra, mtf_section_opt) = tokio::join!(
+            name_news_fut,
+            extra_context::fetch_extra_context(code, data),
+            mtf_fut
+        );
+
+        let mut extra_context = extra.section;
+        let money_flow_raw = extra.money_flow;
+
+        if let Some(mtf_section) = mtf_section_opt {
+            extra_context = match extra_context {
+                Some(mut s) => {
+                    s.push_str(&mtf_section);
+                    Some(s)
+                }
+                None => Some(mtf_section),
+            };
         }
 
         // 5. 评分→操作建议（与 AI 共用同一档位表）
@@ -1460,37 +1477,66 @@ impl AnalysisPipeline {
 
         info!("[深度研判] 命中重点股 {} 只（上限 {}）", candidates.len(), max);
 
-        for (idx, _) in candidates {
-            let code = results[idx].code.clone();
-            let name = results[idx].name.clone();
-            info!("[深度研判] ▶ {} {}", code, name);
-            // 优先复用主流程数据种子（避免重复抓取）；缺失时回退到现抓路径。
-            let seed_opt = results[idx].deep_seed.clone();
-            let deep = match &seed_opt {
-                Some(seed) => tokio::time::timeout(
-                    std::time::Duration::from_secs(300),
-                    crate::deep_analyzer::run_multi_agent_analysis_with_seed(seed),
-                )
-                .await,
-                None => tokio::time::timeout(
-                    std::time::Duration::from_secs(300),
-                    crate::deep_analyzer::run_multi_agent_analysis(&code),
-                )
-                .await,
-            };
-            match deep {
-                Ok(Ok(md)) if !md.trim().is_empty() => {
-                    results[idx].analysis_summary =
-                        merge_deep_analysis(&results[idx].analysis_summary, &md);
-                    if let Err(e) = save_deep_report(&code, &results[idx].analysis_summary) {
-                        warn!("[深度研判] {} 落盘失败: {}", code, e);
-                    }
-                    info!("[深度研判] ✓ {} 已合并进报告", code);
+        // 深度研判并发度（LLM 密集，默认 3，单独控制避免叠加放大限流）
+        let concurrency = std::env::var("DEEP_ANALYSIS_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&c| c > 0)
+            .unwrap_or(3);
+
+        // 并行跑多智能体分析，仅借用 self（不可变），结果回收后再写回 results
+        let deep_outputs: Vec<(usize, Option<String>)> = stream::iter(candidates)
+            .map(|(idx, _)| {
+                let code = results[idx].code.clone();
+                let name = results[idx].name.clone();
+                let seed_opt = results[idx].deep_seed.clone();
+                async move {
+                    info!("[深度研判] ▶ {} {}", code, name);
+                    // 优先复用主流程数据种子（避免重复抓取）；缺失时回退到现抓路径。
+                    let deep = match &seed_opt {
+                        Some(seed) => tokio::time::timeout(
+                            std::time::Duration::from_secs(300),
+                            crate::deep_analyzer::run_multi_agent_analysis_with_seed(seed),
+                        )
+                        .await,
+                        None => tokio::time::timeout(
+                            std::time::Duration::from_secs(300),
+                            crate::deep_analyzer::run_multi_agent_analysis(&code),
+                        )
+                        .await,
+                    };
+                    let md = match deep {
+                        Ok(Ok(md)) if !md.trim().is_empty() => Some(md),
+                        Ok(Ok(_)) => {
+                            warn!("[深度研判] {} 返回空，保留标准分析", code);
+                            None
+                        }
+                        Ok(Err(e)) => {
+                            warn!("[深度研判] {} 失败，保留标准分析: {:#}", code, e);
+                            None
+                        }
+                        Err(_) => {
+                            warn!("[深度研判] {} 超时(300s)，保留标准分析", code);
+                            None
+                        }
+                    };
+                    (idx, md)
                 }
-                Ok(Ok(_)) => warn!("[深度研判] {} 返回空，保留标准分析", code),
-                Ok(Err(e)) => warn!("[深度研判] {} 失败，保留标准分析: {:#}", code, e),
-                Err(_) => warn!("[深度研判] {} 超时(300s)，保留标准分析", code),
+            })
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
+
+        // 顺序写回（落盘 + 合并），避免并发可变借用
+        for (idx, md) in deep_outputs {
+            let Some(md) = md else { continue };
+            let code = results[idx].code.clone();
+            results[idx].analysis_summary =
+                merge_deep_analysis(&results[idx].analysis_summary, &md);
+            if let Err(e) = save_deep_report(&code, &results[idx].analysis_summary) {
+                warn!("[深度研判] {} 落盘失败: {}", code, e);
             }
+            info!("[深度研判] ✓ {} 已合并进报告", code);
         }
     }
 
@@ -1570,10 +1616,17 @@ impl AnalysisPipeline {
             None
         };
 
+        // 布林带 / RSI 回测共享同一份 top-3 长周期历史K线，只抓一次（避免重复重型抓取）
+        let backtest_history = if !results.is_empty() && !self.config.dry_run {
+            self.fetch_top_backtest_history(&results, 3, 7000).await
+        } else {
+            Vec::new()
+        };
+
         // 运行布林带+Z-Score 均值回归回测
-        if !results.is_empty() && !self.config.dry_run {
+        if !backtest_history.is_empty() {
             info!("===== 开始布林带+Z-Score 均值回归回测 =====");
-            match self.run_bollinger_zscore_backtest(&results).await {
+            match self.run_bollinger_zscore_backtest(&backtest_history).await {
                 Ok(summary) => {
                     info!("布林带回测完成: 总收益 {:.2}%, 年化收益 {:.2}%, 最大回撤 {:.2}%, 夏普比率 {:.2}",
                         summary.total_return * 100.0,
@@ -1589,9 +1642,9 @@ impl AnalysisPipeline {
         }
 
         // 运行 RSI 超买超卖策略回测
-        if !results.is_empty() && !self.config.dry_run {
+        if !backtest_history.is_empty() {
             info!("===== 开始 RSI 超买超卖策略回测 =====");
-            match self.run_rsi_backtest(&results).await {
+            match self.run_rsi_backtest(&backtest_history).await {
                 Ok(summary) => {
                     info!("RSI 回测完成: 总收益 {:.2}%, 年化收益 {:.2}%, 最大回撤 {:.2}%, 夏普比率 {:.2}",
                         summary.total_return * 100.0,

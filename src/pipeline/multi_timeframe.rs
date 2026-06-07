@@ -5,19 +5,25 @@
 //! AI prompt 的 Markdown 片段。失败或数据不足时返回 `None`。
 
 pub(super) async fn fetch_multi_timeframe_section(code: &str) -> Option<String> {
-    let code_owned = code.to_string();
-    tokio::task::spawn_blocking(move || {
-        let client = reqwest::Client::builder()
+    use once_cell::sync::Lazy;
+    // 复用单个 HTTP client，避免每次调用都重建连接池
+    static MTF_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+        reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(8))
             .user_agent(
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
                  AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             )
             .build()
-            .ok()?;
+            .unwrap_or_default()
+    });
+
+    let code_owned = code.to_string();
+    tokio::task::spawn_blocking(move || {
+        let client = &*MTF_CLIENT;
         // 60min 拉 120 根（约 30 个交易日，足够算 MA20/MACD），15min 拉 80 根
-        let h1 = crate::data_provider::intraday_kline::fetch_blocking(&client, &code_owned, 60, 120);
-        let m15 = crate::data_provider::intraday_kline::fetch_blocking(&client, &code_owned, 15, 80);
+        let h1 = crate::data_provider::intraday_kline::fetch_blocking(client, &code_owned, 60, 120);
+        let m15 = crate::data_provider::intraday_kline::fetch_blocking(client, &code_owned, 15, 80);
         if h1.is_empty() || m15.is_empty() {
             return None;
         }
