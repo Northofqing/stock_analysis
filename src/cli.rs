@@ -4,7 +4,7 @@
 
 use clap::{ArgAction, Parser};
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(
     name = "stock_analysis",
     about = "A股自选股智能分析系统",

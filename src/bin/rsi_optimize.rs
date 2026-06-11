@@ -283,7 +283,7 @@ fn all_presets() -> Vec<(&'static str, RsiConfig)> {
 }
 
 fn main() -> Result<()> {
-    dotenv::dotenv().ok();
+    dotenvy::dotenv().ok();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
     // gtimg 等 provider 使用 tokio runtime，需要在 tokio context 下运行

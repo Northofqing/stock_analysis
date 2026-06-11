@@ -9,7 +9,7 @@ use stock_analysis::agent::tools_research::FetchResearchTool;
 use stock_analysis::agent::validation::ValidationEngine;
 use stock_analysis::database::DatabaseManager;
 use async_openai::{config::OpenAIConfig, Client};
-use dotenv::dotenv;
+use dotenvy::dotenv;
 
 use std::env;
 

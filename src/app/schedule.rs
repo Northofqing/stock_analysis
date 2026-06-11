@@ -2,84 +2,44 @@
 
 use anyhow::Result;
 use chrono::{Datelike, Local};
-use log::{error, info};
+use log::{error, info, warn};
 use stock_analysis::pipeline::{AnalysisPipeline, PipelineConfig};
 
 use crate::app::get_max_workers;
 use crate::cli::Args;
 
 /// 运行定时任务：按命令行/环境变量选择间隔模式或指定时间点模式。
-pub fn run_scheduled_analysis(stock_codes: &[String], args: &Args) -> Result<()> {
-    info!("模式: 定时任务");
-
-    let market_review_enabled = args.market_review
-        || std::env::var("MARKET_REVIEW_ENABLED")
-            .unwrap_or_else(|_| "false".to_string())
-            .to_lowercase()
-            == "true";
-
-    info!(
-        "定时任务类型: {}",
-        if market_review_enabled { "大盘复盘" } else { "个股分析" }
-    );
-
-    let config = PipelineConfig {
-        max_workers: get_max_workers(args),
-        dry_run: args.dry_run,
-        send_notification: !args.no_notify,
-        single_notify: args.single_notify,
-    };
+///
+/// 注意：定时模式不在启动时预装配股票列表，而是在每次执行时重新读取
+/// `.env` 配置并重新装配，从而支持运行过程中修改配置即时生效。
+pub fn run_scheduled_analysis(args: &Args) -> Result<()> {
+    info!("模式: 定时任务（每次执行均重新读取配置）");
 
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
         if let Some(interval_minutes) = args.interval {
-            run_interval_schedule(
-                stock_codes,
-                &config,
-                interval_minutes,
-                args.run_now,
-                market_review_enabled,
-            )
-            .await
+            run_interval_schedule(args, interval_minutes, args.run_now).await
         } else if let Some(ref schedule_time) = args.schedule_time {
-            run_time_schedule(
-                stock_codes,
-                &config,
-                schedule_time,
-                args.weekdays.as_deref(),
-                args.run_now,
-                market_review_enabled,
-            )
-            .await
+            run_time_schedule(args, schedule_time, args.run_now).await
         } else {
             let env_time = std::env::var("SCHEDULE_TIME").unwrap_or_else(|_| "09:30".to_string());
             info!("使用环境变量定时配置: SCHEDULE_TIME={}", env_time);
-            run_time_schedule(
-                stock_codes,
-                &config,
-                &env_time,
-                args.weekdays.as_deref(),
-                args.run_now,
-                market_review_enabled,
-            )
-            .await
+            run_time_schedule(args, &env_time, args.run_now).await
         }
     })
 }
 
 /// 间隔执行模式：每 N 分钟执行一次。
 async fn run_interval_schedule(
-    stock_codes: &[String],
-    config: &PipelineConfig,
+    args: &Args,
     interval_minutes: u64,
     run_now: bool,
-    market_review_enabled: bool,
 ) -> Result<()> {
     info!("定时模式: 每 {} 分钟执行一次", interval_minutes);
 
     if run_now {
         info!("立即执行首次分析...");
-        execute_analysis_with_mode(stock_codes, config, market_review_enabled).await;
+        execute_once(args).await;
     }
 
     let interval_duration = std::time::Duration::from_secs(interval_minutes * 60);
@@ -96,19 +56,17 @@ async fn run_interval_schedule(
         tokio::time::sleep(interval_duration).await;
         execution_count += 1;
         info!("开始第 {} 次定时分析...", execution_count);
-        execute_analysis_with_mode(stock_codes, config, market_review_enabled).await;
+        execute_once(args).await;
     }
 }
 
 /// 指定时间点执行模式：支持多时间点与星期过滤。
 async fn run_time_schedule(
-    stock_codes: &[String],
-    config: &PipelineConfig,
+    args: &Args,
     schedule_time: &str,
-    weekdays: Option<&[u32]>,
     run_now: bool,
-    market_review_enabled: bool,
 ) -> Result<()> {
+    let weekdays = args.weekdays.as_deref();
     let time_points: Vec<(u32, u32)> = schedule_time
         .split(',')
         .filter_map(|t| {
@@ -154,7 +112,7 @@ async fn run_time_schedule(
 
     if run_now {
         info!("立即执行首次分析...");
-        execute_analysis_with_mode(stock_codes, config, market_review_enabled).await;
+        execute_once(args).await;
     }
 
     info!("\n定时任务已启动，按 Ctrl+C 退出...\n");
@@ -213,24 +171,69 @@ async fn run_time_schedule(
             "\n\n开始定时分析 [{}]...",
             Local::now().format("%Y-%m-%d %H:%M:%S")
         );
-        execute_analysis_with_mode(stock_codes, config, market_review_enabled).await;
+        execute_once(args).await;
         info!("\n");
     }
 }
 
-async fn execute_analysis_with_mode(
-    stock_codes: &[String],
-    config: &PipelineConfig,
-    market_review_only: bool,
-) {
+/// 单次定时执行：重新读取配置 + 重新装配股票列表后再分析。
+///
+/// 每次调用都会覆盖式重载 `.env`，并依据最新配置重建运行参数与股票池，
+/// 使运行过程中对配置的修改即时生效。
+async fn execute_once(args: &Args) {
+    reload_env();
+
+    // 依据最新环境变量/参数重建运行配置
+    let config = PipelineConfig {
+        max_workers: get_max_workers(args),
+        dry_run: args.dry_run,
+        send_notification: !args.no_notify,
+        single_notify: args.single_notify,
+    };
+
+    // 模式（个股分析 / 大盘复盘）每次执行重新判定
+    let market_review_only = args.market_review
+        || std::env::var("MARKET_REVIEW_ENABLED")
+            .unwrap_or_default()
+            .to_lowercase()
+            == "true";
+
     if market_review_only {
+        info!("本次定时任务类型: 大盘复盘");
         match tokio::task::spawn_blocking(crate::app::modes::run_market_review_only).await {
             Ok(Ok(())) => info!("大盘复盘完成"),
             Ok(Err(e)) => error!("大盘复盘失败: {}", e),
             Err(e) => error!("大盘复盘任务执行失败: {}", e),
         }
-    } else {
-        execute_analysis(stock_codes, config).await;
+        return;
+    }
+
+    // 重新装配股票列表。build_stock_list 内部会创建自己的 tokio runtime，
+    // 必须放在 spawn_blocking 线程执行，避免 "runtime within runtime" panic。
+    info!("本次定时任务类型: 个股分析（重新装配股票列表）");
+    let args_clone = args.clone();
+    let stock_codes =
+        match tokio::task::spawn_blocking(move || crate::app::build_stock_list(&args_clone)).await {
+            Ok(Ok((codes, _limit_up, _macro_ctx))) => codes,
+            Ok(Err(e)) => {
+                error!("装配股票列表失败: {}", e);
+                return;
+            }
+            Err(e) => {
+                error!("装配股票列表任务执行失败: {}", e);
+                return;
+            }
+        };
+
+    info!("本次待分析股票（共 {} 只）", stock_codes.len());
+    execute_analysis(&stock_codes, &config).await;
+}
+
+/// 覆盖式重新读取 `.env`，使运行中对配置文件的修改即时生效。
+fn reload_env() {
+    match dotenvy::from_filename_override(".env") {
+        Ok(_) => info!("🔄 已重新读取配置文件 .env"),
+        Err(e) => warn!("重新读取 .env 失败（沿用当前配置）: {}", e),
     }
 }
 

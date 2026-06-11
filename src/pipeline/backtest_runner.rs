@@ -8,11 +8,237 @@ use log::{info, warn};
 
 use super::{AnalysisPipeline, AnalysisResult};
 use crate::strategy::bollinger_zscore::{BollingerZScoreBacktest, BollingerZScoreConfig};
-use crate::strategy::core::{BacktestConfig, BacktestEngine, BacktestSummary};
+use crate::strategy::core::{
+    write_daily_values_csv, write_trades_csv, BacktestConfig, BacktestEngine, BacktestState,
+    BacktestSummary, BenchmarkSeries, WalkForwardFold, WalkForwardReport,
+};
 use crate::strategy::multi_factor::{MultiFactorConfig, MultiFactorEngine, StockFactors};
 use crate::strategy::rsi::{RsiBacktest, RsiConfig};
 
 impl AnalysisPipeline {
+    /// 抓取沪深300基准日线，构建 BenchmarkSeries（date->close）。
+    /// 失败一律返回 None，绝不编造基准数据。
+    async fn fetch_benchmark_series(&self, days: usize) -> Option<BenchmarkSeries> {
+        let code = "sh000300";
+        match self.data_manager.get_daily_data(code, days) {
+            Ok((data, _)) if !data.is_empty() => {
+                let mut closes = std::collections::HashMap::new();
+                for k in &data {
+                    closes.insert(k.date.format("%Y-%m-%d").to_string(), k.close);
+                }
+                info!("✓ 基准沪深300已加载 {} 个交易日", closes.len());
+                Some(BenchmarkSeries::new("沪深300", closes))
+            }
+            _ => {
+                warn!("基准沪深300(sh000300)数据获取失败，回测报告将标注'基准数据缺失'");
+                None
+            }
+        }
+    }
+
+    /// 将组合的每日净值与交易明细落盘到 reports/details/ 作为审计留痕。失败仅告警，不阻断主流程。
+    fn export_audit_csv(
+        &self,
+        strategy_tag: &str,
+        date_str: &str,
+        daily_values: &[(chrono::DateTime<chrono::Local>, f64)],
+        trades: &[crate::strategy::core::Trade],
+        initial_capital: f64,
+    ) {
+        let dir = "reports/details";
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            warn!("创建审计目录 {} 失败: {}", dir, e);
+            return;
+        }
+        let mut state = BacktestState::new(initial_capital);
+        state.daily_values = daily_values.to_vec();
+        state.trades = trades.to_vec();
+
+        let trades_path = format!("{}/{}_trades_{}.csv", dir, strategy_tag, date_str);
+        if let Err(e) = write_trades_csv(&state, &trades_path) {
+            warn!("导出交易明细CSV失败 ({}): {}", trades_path, e);
+        } else {
+            info!("✓ 交易明细已留痕: {}", trades_path);
+        }
+
+        let nav_path = format!("{}/{}_nav_{}.csv", dir, strategy_tag, date_str);
+        if let Err(e) = write_daily_values_csv(&state, &nav_path, initial_capital) {
+            warn!("导出每日净值CSV失败 ({}): {}", nav_path, e);
+        } else {
+            info!("✓ 每日净值已留痕: {}", nav_path);
+        }
+    }
+
+    /// 按全局交易日期把组合历史切成 前段(样本内)/后段(样本外) 两份。
+    /// `ratio` 为前段占比（如 0.6）。数据不足无法切分时返回 None。
+    /// 返回 (切分日期字符串, 前段, 后段)。
+    fn split_history_by_date(
+        history: &[(String, String, Vec<crate::data_provider::KlineData>)],
+        ratio: f64,
+    ) -> Option<(
+        String,
+        Vec<(String, String, Vec<crate::data_provider::KlineData>)>,
+        Vec<(String, String, Vec<crate::data_provider::KlineData>)>,
+    )> {
+        use std::collections::BTreeSet;
+        let mut dates: BTreeSet<chrono::NaiveDate> = BTreeSet::new();
+        for (_, _, ks) in history {
+            for k in ks {
+                dates.insert(k.date);
+            }
+        }
+        if dates.len() < 10 {
+            return None;
+        }
+        let dates: Vec<chrono::NaiveDate> = dates.into_iter().collect();
+        let idx = ((dates.len() as f64 * ratio) as usize).clamp(1, dates.len() - 1);
+        let cutoff = dates[idx];
+
+        let mut in_sample = Vec::new();
+        let mut out_sample = Vec::new();
+        for (code, name, ks) in history {
+            let in_ks: Vec<_> = ks.iter().filter(|k| k.date <= cutoff).cloned().collect();
+            let out_ks: Vec<_> = ks.iter().filter(|k| k.date > cutoff).cloned().collect();
+            if !in_ks.is_empty() {
+                in_sample.push((code.clone(), name.clone(), in_ks));
+            }
+            if !out_ks.is_empty() {
+                out_sample.push((code.clone(), name.clone(), out_ks));
+            }
+        }
+        if in_sample.is_empty() || out_sample.is_empty() {
+            return None;
+        }
+        Some((cutoff.format("%Y-%m-%d").to_string(), in_sample, out_sample))
+    }
+
+    /// 按 [start, end]（含端点）日期窗口筛选组合历史。
+    fn slice_history(
+        history: &[(String, String, Vec<crate::data_provider::KlineData>)],
+        start: chrono::NaiveDate,
+        end: chrono::NaiveDate,
+    ) -> Vec<(String, String, Vec<crate::data_provider::KlineData>)> {
+        let mut out = Vec::new();
+        for (code, name, ks) in history {
+            let slice: Vec<_> = ks
+                .iter()
+                .filter(|k| k.date >= start && k.date <= end)
+                .cloned()
+                .collect();
+            if !slice.is_empty() {
+                out.push((code.clone(), name.clone(), slice));
+            }
+        }
+        out
+    }
+
+    /// 通用 walk-forward 滚动优化（扩张窗口 anchored）。
+    ///
+    /// - `candidates`: (参数标签, 配置) 候选集；每折在训练段对全部候选回测并取**总收益最高**者；
+    /// - `run`: 给定配置与历史切片，返回该组合的 `BacktestSummary`（None=该切片无法回测）；
+    /// - `folds`: 折数（时间轴等分为 folds+1 块，块 0..f 训练、块 f+1 测试）。
+    ///
+    /// 仅统计样本外（测试段）业绩，避免参数过拟合。数据不足返回 None。
+    fn walk_forward<C, F>(
+        history: &[(String, String, Vec<crate::data_provider::KlineData>)],
+        candidates: &[(String, C)],
+        run: F,
+        folds: usize,
+    ) -> Option<WalkForwardReport>
+    where
+        F: Fn(&C, &[(String, String, Vec<crate::data_provider::KlineData>)]) -> Option<BacktestSummary>,
+    {
+        use std::collections::BTreeSet;
+        if candidates.is_empty() || folds == 0 {
+            return None;
+        }
+
+        let mut dates: BTreeSet<chrono::NaiveDate> = BTreeSet::new();
+        for (_, _, ks) in history {
+            for k in ks {
+                dates.insert(k.date);
+            }
+        }
+        let dates: Vec<chrono::NaiveDate> = dates.into_iter().collect();
+        let blocks = folds + 1;
+        // 每块至少需要一定交易日，否则无法稳定回测
+        if dates.len() < blocks * 15 {
+            return None;
+        }
+        let block_size = dates.len() / blocks;
+
+        let mut fold_results: Vec<WalkForwardFold> = Vec::new();
+        for f in 0..folds {
+            // 训练段：从起点到第 f 块末尾（扩张窗口）
+            let train_start = dates[0];
+            let train_end = dates[(f + 1) * block_size - 1];
+            // 测试段：第 f+1 块
+            let test_start = dates[(f + 1) * block_size];
+            let test_end = if f + 2 == blocks {
+                *dates.last().unwrap()
+            } else {
+                dates[(f + 2) * block_size - 1]
+            };
+
+            let train_slice = Self::slice_history(history, train_start, train_end);
+            let test_slice = Self::slice_history(history, test_start, test_end);
+            if train_slice.is_empty() || test_slice.is_empty() {
+                continue;
+            }
+
+            // 训练段寻优：取总收益最高的候选
+            let mut best: Option<(&str, f64)> = None;
+            for (label, cfg) in candidates {
+                if let Some(sum) = run(cfg, &train_slice) {
+                    let score = sum.total_return;
+                    if best.map_or(true, |(_, b)| score > b) {
+                        best = Some((label.as_str(), score));
+                    }
+                }
+            }
+            let Some((best_label, _)) = best else { continue };
+
+            // 用最优参数在测试段评估
+            let chosen_cfg = candidates
+                .iter()
+                .find(|(l, _)| l == best_label)
+                .map(|(_, c)| c)?;
+            let Some(test_sum) = run(chosen_cfg, &test_slice) else {
+                continue;
+            };
+
+            fold_results.push(WalkForwardFold {
+                fold: f + 1,
+                train_label: format!("{}~{}", train_start.format("%Y-%m-%d"), train_end.format("%Y-%m-%d")),
+                test_label: format!("{}~{}", test_start.format("%Y-%m-%d"), test_end.format("%Y-%m-%d")),
+                chosen_param: best_label.to_string(),
+                test_return: test_sum.total_return,
+                test_sharpe: test_sum.sharpe_ratio,
+                test_trades: test_sum.total_trades,
+            });
+        }
+
+        if fold_results.is_empty() {
+            return None;
+        }
+
+        let n = fold_results.len() as f64;
+        let avg_test_return = fold_results.iter().map(|f| f.test_return).sum::<f64>() / n;
+        let compounded_return = fold_results
+            .iter()
+            .fold(1.0, |acc, f| acc * (1.0 + f.test_return))
+            - 1.0;
+        let positive_fold_rate =
+            fold_results.iter().filter(|f| f.test_return > 0.0).count() as f64 / n;
+
+        Some(WalkForwardReport {
+            folds: fold_results,
+            avg_test_return,
+            compounded_return,
+            positive_fold_rate,
+        })
+    }
+
     /// 运行多因子回测
     pub(super) async fn run_multi_factor_backtest(&self, results: &[AnalysisResult]) -> Result<BacktestSummary> {
         // 1. 准备因子数据
@@ -137,11 +363,76 @@ impl AnalysisPipeline {
         }
 
         info!("布林带回测：共 {} 只股票参与", stocks_data.len());
-        let result = engine.run_portfolio(&stocks_data)?;
+        let mut result = engine.run_portfolio(&stocks_data)?;
+
+        // 注入真实基准（沪深300），失败则为 None，报告如实标注
+        result.benchmark = self.fetch_benchmark_series(7000).await;
 
         // 生成并保存报告
         let date_str = chrono::Local::now().format("%Y%m%d").to_string();
-        let report = result.generate_report();
+        let mut report = result.generate_report();
+
+        // C. 分市场状态拆解（需基准）
+        if let Some(bench) = &result.benchmark {
+            if let Some(rep) =
+                crate::strategy::core::regime_breakdown(&result.portfolio_daily_values, bench)
+            {
+                report.push_str(&super::reporting::build_regime_section(&rep));
+            }
+        }
+
+        // A. 时间样本外切分（前 60% 样本内 / 后 40% 样本外，参数固定做一致性检验）
+        if let Some((cutoff, in_h, out_h)) = Self::split_history_by_date(&stocks_data, 0.6) {
+            let oos_engine = BollingerZScoreBacktest::new(BollingerZScoreConfig::default());
+            if let (Ok(mut r_in), Ok(mut r_out)) =
+                (oos_engine.run_portfolio(&in_h), oos_engine.run_portfolio(&out_h))
+            {
+                r_in.benchmark = result.benchmark.clone();
+                r_out.benchmark = result.benchmark.clone();
+                report.push_str(&super::reporting::build_oos_section(
+                    &cutoff,
+                    &r_in.to_summary(),
+                    &r_out.to_summary(),
+                ));
+            }
+        }
+
+        // B. Walk-Forward 滚动优化（参数网格寻优 + 样本外验证）
+        let bb_grid: Vec<(String, BollingerZScoreConfig)> = [
+            ("zbuy-2.0/x2.0", -2.0_f64, 2.0_f64),
+            ("zbuy-1.5/x2.0", -1.5, 2.0),
+            ("zbuy-2.5/x2.0", -2.5, 2.0),
+            ("zbuy-2.0/x2.5", -2.0, 2.5),
+            ("zbuy-2.0/x1.5", -2.0, 1.5),
+            ("zbuy-1.8/x2.2", -1.8, 2.2),
+        ]
+        .iter()
+        .map(|(label, zbuy, mult)| {
+            (
+                label.to_string(),
+                BollingerZScoreConfig {
+                    zscore_buy: *zbuy,
+                    zscore_sell: -*zbuy,
+                    bb_std_mult: *mult,
+                    ..BollingerZScoreConfig::default()
+                },
+            )
+        })
+        .collect();
+        if let Some(wf) = Self::walk_forward(
+            &stocks_data,
+            &bb_grid,
+            |cfg, slice| {
+                BollingerZScoreBacktest::new(cfg.clone())
+                    .run_portfolio(slice)
+                    .ok()
+                    .map(|r| r.to_summary())
+            },
+            4,
+        ) {
+            report.push_str(&super::reporting::build_walk_forward_section(&wf));
+        }
+
         let report_filename = format!("bollinger_zscore_backtest_{}.md", date_str);
         self.notifier.save_report_to_file(&report, Some(&report_filename))?;
         info!("✓ 布林带+Z-Score回测报告已保存: reports/{}", report_filename);
@@ -152,6 +443,16 @@ impl AnalysisPipeline {
             Ok(path) => info!("✓ 布林带回测图表已生成: {}", path.display()),
             Err(e) => warn!("布林带回测图表生成失败: {}", e),
         }
+
+        // 审计留痕：交易明细 + 每日净值
+        let initial_capital = result.config.initial_capital * result.single_results.len() as f64;
+        self.export_audit_csv(
+            "bollinger_zscore",
+            &date_str,
+            &result.portfolio_daily_values,
+            &result.portfolio_trades,
+            initial_capital,
+        );
 
         Ok(result.to_summary())
     }
@@ -177,11 +478,75 @@ impl AnalysisPipeline {
         }
 
         info!("RSI 回测：共 {} 只股票参与", stocks_data.len());
-        let result = engine.run_portfolio(&stocks_data)?;
+        let mut result = engine.run_portfolio(&stocks_data)?;
+
+        // 注入真实基准（沪深300），失败则为 None，报告如实标注
+        result.benchmark = self.fetch_benchmark_series(7000).await;
 
         // 保存报告
         let date_str = chrono::Local::now().format("%Y%m%d").to_string();
-        let report = result.generate_report();
+        let mut report = result.generate_report();
+
+        // C. 分市场状态拆解（需基准）
+        if let Some(bench) = &result.benchmark {
+            if let Some(rep) =
+                crate::strategy::core::regime_breakdown(&result.portfolio_daily_values, bench)
+            {
+                report.push_str(&super::reporting::build_regime_section(&rep));
+            }
+        }
+
+        // A. 时间样本外切分（前 60% 样本内 / 后 40% 样本外，参数固定做一致性检验）
+        if let Some((cutoff, in_h, out_h)) = Self::split_history_by_date(&stocks_data, 0.6) {
+            let oos_engine = RsiBacktest::new(RsiConfig::preset_daily_v10_no_stop());
+            if let (Ok(mut r_in), Ok(mut r_out)) =
+                (oos_engine.run_portfolio(&in_h), oos_engine.run_portfolio(&out_h))
+            {
+                r_in.benchmark = result.benchmark.clone();
+                r_out.benchmark = result.benchmark.clone();
+                report.push_str(&super::reporting::build_oos_section(
+                    &cutoff,
+                    &r_in.to_summary(),
+                    &r_out.to_summary(),
+                ));
+            }
+        }
+
+        // B. Walk-Forward 滚动优化（参数网格寻优 + 样本外验证）
+        let rsi_grid: Vec<(String, RsiConfig)> = [
+            ("os25/tp0.08", 25.0_f64, 0.08_f64),
+            ("os22/tp0.10", 22.0, 0.10),
+            ("os28/tp0.06", 28.0, 0.06),
+            ("os25/tp0.06", 25.0, 0.06),
+            ("os22/tp0.08", 22.0, 0.08),
+            ("os30/tp0.08", 30.0, 0.08),
+        ]
+        .iter()
+        .map(|(label, os, tp)| {
+            (
+                label.to_string(),
+                RsiConfig {
+                    oversold: *os,
+                    take_profit_pct: *tp,
+                    ..RsiConfig::preset_daily_v10_no_stop()
+                },
+            )
+        })
+        .collect();
+        if let Some(wf) = Self::walk_forward(
+            &stocks_data,
+            &rsi_grid,
+            |cfg, slice| {
+                RsiBacktest::new(cfg.clone())
+                    .run_portfolio(slice)
+                    .ok()
+                    .map(|r| r.to_summary())
+            },
+            4,
+        ) {
+            report.push_str(&super::reporting::build_walk_forward_section(&wf));
+        }
+
         let report_filename = format!("rsi_strategy_backtest_{}.md", date_str);
         self.notifier
             .save_report_to_file(&report, Some(&report_filename))?;
@@ -194,6 +559,134 @@ impl AnalysisPipeline {
             Err(e) => warn!("RSI回测图表生成失败: {}", e),
         }
 
+        // 审计留痕：交易明细 + 每日净值
+        let initial_capital = result.config.initial_capital * result.single_results.len() as f64;
+        self.export_audit_csv(
+            "rsi_strategy",
+            &date_str,
+            &result.portfolio_daily_values,
+            &result.portfolio_trades,
+            initial_capital,
+        );
+
         Ok(result.to_summary())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data_provider::KlineData;
+    use crate::strategy::core::{BacktestState, BacktestSummary};
+
+    fn kl(date: chrono::NaiveDate, close: f64) -> KlineData {
+        KlineData {
+            date,
+            open: close,
+            high: close,
+            low: close,
+            close,
+            volume: 1000.0,
+            amount: 1000.0 * close,
+            pct_chg: 0.0,
+            pe_ratio: None,
+            pb_ratio: None,
+            turnover_rate: None,
+            market_cap: None,
+            circulating_cap: None,
+            eps: None,
+            roe: None,
+            revenue_yoy: None,
+            net_profit_yoy: None,
+            gross_margin: None,
+            net_margin: None,
+            sharpe_ratio: None,
+            financials_history: None,
+            valuation_history: None,
+            consensus: None,
+            industry: None,
+            is_limit_up: false,
+            is_limit_down: false,
+            is_suspended: false,
+        }
+    }
+
+    fn history(n: usize) -> Vec<(String, String, Vec<KlineData>)> {
+        let base = chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
+        let ks: Vec<KlineData> = (0..n)
+            .map(|i| kl(base + chrono::Duration::days(i as i64), 10.0 + i as f64 * 0.1))
+            .collect();
+        vec![("000001".into(), "测试股".into(), ks)]
+    }
+
+    #[test]
+    fn test_split_history_by_date() {
+        let h = history(100);
+        let (cutoff, in_h, out_h) =
+            AnalysisPipeline::split_history_by_date(&h, 0.6).expect("应可切分");
+        let in_len = in_h[0].2.len();
+        let out_len = out_h[0].2.len();
+        // 前段约 60%，后段非空，且无重叠（总数守恒）
+        assert!(in_len > out_len, "前段应大于后段: {} vs {}", in_len, out_len);
+        assert_eq!(in_len + out_len, 100, "切分应无重叠且不丢数据");
+        assert!(!cutoff.is_empty());
+    }
+
+    #[test]
+    fn test_split_history_insufficient() {
+        let h = history(5);
+        assert!(AnalysisPipeline::split_history_by_date(&h, 0.6).is_none());
+    }
+
+    #[test]
+    fn test_slice_history_window() {
+        let h = history(50);
+        let base = chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
+        let start = base + chrono::Duration::days(10);
+        let end = base + chrono::Duration::days(19);
+        let sliced = AnalysisPipeline::slice_history(&h, start, end);
+        assert_eq!(sliced[0].2.len(), 10, "应含 [10,19] 共 10 天");
+        assert!(sliced[0].2.iter().all(|k| k.date >= start && k.date <= end));
+    }
+
+    #[test]
+    fn test_walk_forward_picks_and_reports() {
+        // 候选用 f64 充当"目标收益"，run 闭包据此造 summary，
+        // 验证 walk_forward 的分块/扩张窗口/选优编排是确定性正确的。
+        let h = history(120);
+        let candidates: Vec<(String, f64)> = vec![
+            ("low".into(), 0.01),
+            ("high".into(), 0.05),
+            ("mid".into(), 0.03),
+        ];
+        let wf = AnalysisPipeline::walk_forward(
+            &h,
+            &candidates,
+            |cfg, slice| {
+                // 收益 = 候选值（与切片长度无关），best 必为 "high"
+                let mut state = BacktestState::new(100_000.0);
+                let last = slice
+                    .iter()
+                    .flat_map(|(_, _, ks)| ks.iter())
+                    .map(|k| k.date)
+                    .max()
+                    .unwrap();
+                let dt = chrono::Local::now();
+                state.daily_values = vec![(dt, 100_000.0), (dt, 100_000.0 * (1.0 + cfg))];
+                let _ = last;
+                Some(BacktestSummary::from_state(&state, 100_000.0))
+            },
+            4,
+        )
+        .expect("应产出 walk-forward 报告");
+
+        assert_eq!(wf.folds.len(), 4, "应有 4 折");
+        assert!(
+            wf.folds.iter().all(|f| f.chosen_param == "high"),
+            "每折都应选中收益最高的候选"
+        );
+        // 样本外平均收益应接近 5%
+        assert!((wf.avg_test_return - 0.05).abs() < 1e-6);
+        assert!((wf.positive_fold_rate - 1.0).abs() < 1e-9);
     }
 }

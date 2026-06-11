@@ -247,15 +247,47 @@ impl BacktestState {
     }
 
     /// 计算Calmar比率 = 年化收益 / 最大回撤
+    ///
+    /// 修正：移除「回撤<1%直接置0」的断层，只要存在有效回撤（>1e-6）即正常计算，
+    /// 避免低波动样本下 Calmar 被人为抹平为 0 造成误读。
     pub fn calmar_ratio(&self) -> f64 {
         let annual = self.annual_return();
         let mdd = self.max_drawdown();
 
-        if mdd > 0.01 {  // 回撤大于1%才计算
+        if mdd > 1e-6 {
             annual / mdd
         } else {
             0.0
         }
+    }
+
+    /// 计算最长回撤恢复期（净值处于水下、未创新高的最长连续自然日数）。
+    ///
+    /// 返回值为日历日（按 daily_values 的首尾日期跨度估算），用于衡量
+    /// 策略在最差情形下"被套"多久才回本，是机构评估资金占用质量的重要指标。
+    pub fn max_drawdown_duration_days(&self) -> i64 {
+        if self.daily_values.len() < 2 {
+            return 0;
+        }
+
+        let mut peak_value = self.daily_values[0].1;
+        let mut peak_date = self.daily_values[0].0;
+        let mut max_days: i64 = 0;
+
+        for (date, value) in &self.daily_values {
+            if *value >= peak_value {
+                // 创新高：水下区间结束，重置峰值
+                peak_value = *value;
+                peak_date = *date;
+            } else {
+                let days = (*date - peak_date).num_days();
+                if days > max_days {
+                    max_days = days;
+                }
+            }
+        }
+
+        max_days
     }
 
     /// 计算平均仓位(暴露率) - 从daily_values推算
@@ -285,6 +317,105 @@ impl BacktestState {
         };
 
         (avg, daily_exposure)
+    }
+
+    /// 基于真实基准日线序列，计算同期基准收益、Beta、CAPM Alpha 与信息比率。
+    ///
+    /// 仅使用策略净值日期与基准日期的交集对齐，缺失数据自动跳过；
+    /// 当有效对齐样本不足时返回 None（上层据此显示"基准数据缺失"，绝不伪造）。
+    pub(crate) fn benchmark_metrics(
+        &self,
+        bench: &BenchmarkSeries,
+        strat_annual: f64,
+        risk_free_rate: f64,
+    ) -> Option<BenchmarkMetrics> {
+        if self.daily_values.len() < 3 {
+            return None;
+        }
+
+        let mut strat_rets: Vec<f64> = Vec::new();
+        let mut bench_rets: Vec<f64> = Vec::new();
+        let mut first_bench: Option<(f64, DateTime<Local>)> = None;
+        let mut last_bench: Option<(f64, DateTime<Local>)> = None;
+
+        for i in 1..self.daily_values.len() {
+            let (d_prev, v_prev) = &self.daily_values[i - 1];
+            let (d_cur, v_cur) = &self.daily_values[i];
+            let key_prev = d_prev.format("%Y-%m-%d").to_string();
+            let key_cur = d_cur.format("%Y-%m-%d").to_string();
+
+            if let (Some(&bp), Some(&bc)) = (bench.closes.get(&key_prev), bench.closes.get(&key_cur)) {
+                if *v_prev > 0.0 && bp > 0.0 {
+                    strat_rets.push((*v_cur - *v_prev) / *v_prev);
+                    bench_rets.push((bc - bp) / bp);
+                    if first_bench.is_none() {
+                        first_bench = Some((bp, *d_prev));
+                    }
+                    last_bench = Some((bc, *d_cur));
+                }
+            }
+        }
+
+        if strat_rets.len() < 2 {
+            return None;
+        }
+
+        let (first_close, first_date) = first_bench?;
+        let (last_close, last_date) = last_bench?;
+
+        let bench_total = if first_close > 0.0 {
+            (last_close - first_close) / first_close
+        } else {
+            return None;
+        };
+
+        let days = (last_date - first_date).num_days() as f64;
+        let bench_annual = if days > 0.0 {
+            (1.0 + bench_total).powf(365.0 / days) - 1.0
+        } else {
+            0.0
+        };
+
+        let n = strat_rets.len() as f64;
+        let mean_s = strat_rets.iter().sum::<f64>() / n;
+        let mean_b = bench_rets.iter().sum::<f64>() / n;
+
+        let mut cov = 0.0;
+        let mut var_b = 0.0;
+        for i in 0..strat_rets.len() {
+            cov += (strat_rets[i] - mean_s) * (bench_rets[i] - mean_b);
+            var_b += (bench_rets[i] - mean_b).powi(2);
+        }
+        cov /= n;
+        var_b /= n;
+        let beta = if var_b > 1e-12 { cov / var_b } else { 0.0 };
+
+        // CAPM Alpha（年化）：策略年化 − [无风险 + beta×(基准年化 − 无风险)]
+        let alpha = strat_annual - (risk_free_rate + beta * (bench_annual - risk_free_rate));
+
+        // 信息比率：年化超额 / 跟踪误差
+        let mean_ex = mean_s - mean_b;
+        let var_ex = strat_rets
+            .iter()
+            .zip(&bench_rets)
+            .map(|(s, b)| ((s - b) - mean_ex).powi(2))
+            .sum::<f64>()
+            / n;
+        let std_ex = var_ex.sqrt();
+        let information_ratio = if std_ex > 1e-12 {
+            mean_ex / std_ex * (252.0_f64).sqrt()
+        } else {
+            0.0
+        };
+
+        Some(BenchmarkMetrics {
+            name: bench.name.clone(),
+            total_return: bench_total,
+            annual_return: bench_annual,
+            alpha,
+            beta,
+            information_ratio,
+        })
     }
 }
 
@@ -479,16 +610,220 @@ pub struct BacktestSummary {
     pub total_trades: usize,
     pub win_rate: f64,
     pub chart_path: Option<String>,  // 图表路径
-    pub benchmark_annual_return: Option<f64>,  // NEW: 基准年化收益(如沪深300)
-    pub alpha: Option<f64>,            // NEW: Alpha值
+    pub benchmark_annual_return: Option<f64>,  // NEW: 基准年化收益(真实指数, 缺失则 None)
+    pub alpha: Option<f64>,            // NEW: CAPM Alpha(年化, 相对真实基准)
+    pub benchmark_name: Option<String>,   // NEW: 基准名称(如 沪深300)
+    pub benchmark_total_return: Option<f64>, // NEW: 同期基准区间收益
+    pub excess_return: Option<f64>,    // NEW: 年化超额(策略年化-基准年化)
+    pub beta: Option<f64>,             // NEW: 相对基准的 beta
+    pub information_ratio: Option<f64>, // NEW: 信息比率(年化超额/跟踪误差)
+    pub max_dd_duration_days: i64,     // NEW: 最长回撤恢复期(自然日)
+}
+
+/// 真实基准日线序列（用于计算超额收益 / Alpha / Beta / 信息比率）。
+///
+/// `closes` 以 "YYYY-MM-DD" 为键映射到当日收盘价；缺失日期会被跳过，
+/// 因此当指数数据抓取失败时上层应传 `None`，而非伪造固定收益。
+#[derive(Debug, Clone)]
+pub struct BenchmarkSeries {
+    pub name: String,
+    pub closes: HashMap<String, f64>,
+}
+
+impl BenchmarkSeries {
+    pub fn new(name: impl Into<String>, closes: HashMap<String, f64>) -> Self {
+        Self { name: name.into(), closes }
+    }
+}
+
+/// 市场状态分类（基于基准指数的趋势）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegimeKind {
+    Bull,
+    Sideways,
+    Bear,
+}
+
+impl RegimeKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            RegimeKind::Bull => "牛市/上行",
+            RegimeKind::Sideways => "震荡/横盘",
+            RegimeKind::Bear => "熊市/下行",
+        }
+    }
+}
+
+/// 单个市场状态下的策略表现统计。
+#[derive(Debug, Clone)]
+pub struct RegimeStats {
+    pub kind: RegimeKind,
+    pub days: usize,
+    pub strat_return: f64, // 该状态下策略累计收益（复利）
+    pub bench_return: f64, // 该状态下基准累计收益（复利）
+    pub up_day_rate: f64,  // 策略上涨日占比
+}
+
+/// 分市场状态回测拆解报告。
+#[derive(Debug, Clone)]
+pub struct RegimeReport {
+    pub window: usize,        // 趋势判定窗口（交易日）
+    pub bull_threshold: f64,  // 牛市阈值（窗口涨幅）
+    pub bear_threshold: f64,  // 熊市阈值（窗口跌幅）
+    pub stats: Vec<RegimeStats>,
+}
+
+/// 按基准指数趋势把回测期切分为 牛/震荡/熊 三种状态，分别统计策略表现。
+///
+/// 趋势判定：基准在 `window` 个交易日内的累计涨幅 > `bull_threshold` 记为牛市，
+/// < `bear_threshold` 记为熊市，其余为震荡。基准数据不足或无法对齐时返回 None。
+pub fn regime_breakdown(
+    daily_values: &[(DateTime<Local>, f64)],
+    bench: &BenchmarkSeries,
+) -> Option<RegimeReport> {
+    if daily_values.len() < 5 {
+        return None;
+    }
+
+    // 基准按日期升序排列，便于按窗口取趋势
+    let mut bench_sorted: Vec<(String, f64)> =
+        bench.closes.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    bench_sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    let date_to_idx: HashMap<&str, usize> = bench_sorted
+        .iter()
+        .enumerate()
+        .map(|(i, (d, _))| (d.as_str(), i))
+        .collect();
+
+    let window = 20usize;
+    let bull_threshold = 0.03;
+    let bear_threshold = -0.03;
+
+    // 每种状态累加：(天数, 策略累计因子, 基准累计因子, 上涨日数)
+    let mut acc: [(usize, f64, f64, usize); 3] = [(0, 1.0, 1.0, 0); 3];
+
+    for i in 1..daily_values.len() {
+        let (d_prev, v_prev) = &daily_values[i - 1];
+        let (d_cur, v_cur) = &daily_values[i];
+        if *v_prev <= 0.0 {
+            continue;
+        }
+        let key_prev = d_prev.format("%Y-%m-%d").to_string();
+        let key_cur = d_cur.format("%Y-%m-%d").to_string();
+        let (Some(&idx_cur), Some(&idx_prev)) = (
+            date_to_idx.get(key_cur.as_str()),
+            date_to_idx.get(key_prev.as_str()),
+        ) else {
+            continue;
+        };
+        if idx_cur < window {
+            continue;
+        }
+
+        let base = bench_sorted[idx_cur - window].1;
+        if base <= 0.0 {
+            continue;
+        }
+        let trail = (bench_sorted[idx_cur].1 - base) / base;
+        let slot = if trail > bull_threshold {
+            0 // Bull
+        } else if trail < bear_threshold {
+            2 // Bear
+        } else {
+            1 // Sideways
+        };
+
+        let s_ret = (*v_cur - *v_prev) / *v_prev;
+        let prev_close = bench_sorted[idx_prev].1;
+        let b_ret = if prev_close > 0.0 {
+            (bench_sorted[idx_cur].1 - prev_close) / prev_close
+        } else {
+            0.0
+        };
+
+        acc[slot].0 += 1;
+        acc[slot].1 *= 1.0 + s_ret;
+        acc[slot].2 *= 1.0 + b_ret;
+        if s_ret > 0.0 {
+            acc[slot].3 += 1;
+        }
+    }
+
+    let kinds = [RegimeKind::Bull, RegimeKind::Sideways, RegimeKind::Bear];
+    let stats: Vec<RegimeStats> = acc
+        .iter()
+        .zip(kinds.iter())
+        .filter(|((days, ..), _)| *days > 0)
+        .map(|((days, sf, bf, ups), kind)| RegimeStats {
+            kind: *kind,
+            days: *days,
+            strat_return: sf - 1.0,
+            bench_return: bf - 1.0,
+            up_day_rate: *ups as f64 / *days as f64,
+        })
+        .collect();
+
+    if stats.is_empty() {
+        return None;
+    }
+
+    Some(RegimeReport {
+        window,
+        bull_threshold,
+        bear_threshold,
+        stats,
+    })
+}
+
+/// 基准对标计算结果（内部使用）。
+#[derive(Debug, Clone)]
+pub struct BenchmarkMetrics {
+    pub name: String,
+    pub total_return: f64,
+    pub annual_return: f64,
+    pub alpha: f64,
+    pub beta: f64,
+    pub information_ratio: f64,
+}
+
+/// 单个 walk-forward 折（fold）的样本外结果。
+#[derive(Debug, Clone)]
+pub struct WalkForwardFold {
+    pub fold: usize,
+    pub train_label: String,   // 训练区间（样本内）
+    pub test_label: String,    // 测试区间（样本外）
+    pub chosen_param: String,  // 训练段选出的最优参数标签
+    pub test_return: f64,      // 该参数在测试段的总收益
+    pub test_sharpe: f64,
+    pub test_trades: usize,
+}
+
+/// Walk-forward 滚动优化汇总。
+#[derive(Debug, Clone)]
+pub struct WalkForwardReport {
+    pub folds: Vec<WalkForwardFold>,
+    pub avg_test_return: f64,    // 各折样本外总收益的算术平均
+    pub compounded_return: f64,  // 各折样本外收益串联复利
+    pub positive_fold_rate: f64, // 样本外为正的折数占比
 }
 
 impl BacktestSummary {
+    /// 不带基准的构造（基准字段全部为 None，**不再伪造 7%**）。
     pub fn from_state(state: &BacktestState, initial_capital: f64) -> Self {
+        Self::from_state_with_benchmark(state, initial_capital, None)
+    }
+
+    /// 带真实基准的构造。`benchmark` 为 None 时基准相关字段保持 None。
+    pub fn from_state_with_benchmark(
+        state: &BacktestState,
+        initial_capital: f64,
+        benchmark: Option<&BenchmarkSeries>,
+    ) -> Self {
         let final_value = state.total_value();
         let total_return = state.total_return();
         let annual_return = state.annual_return();
         let max_drawdown = state.max_drawdown();
+        let max_dd_duration_days = state.max_drawdown_duration_days();
 
         // 使用2.5% 1Y国债作为无风险利率
         let risk_free_rate = 0.025;
@@ -535,10 +870,28 @@ impl BacktestSummary {
             0.0
         };
 
-        // 简化基准计算：假设沪深300年化收益为7%(参考中长期平均)
-        // 实际应该用真实历史数据
-        let benchmark_annual = 0.07;
-        let alpha = annual_return - benchmark_annual;
+        // ── 真实基准对标（缺失时全部 None，不伪造） ──
+        let bench = benchmark.and_then(|b| state.benchmark_metrics(b, annual_return, risk_free_rate));
+        let (
+            benchmark_name,
+            benchmark_annual_return,
+            benchmark_total_return,
+            excess_return,
+            alpha,
+            beta,
+            information_ratio,
+        ) = match bench {
+            Some(m) => (
+                Some(m.name),
+                Some(m.annual_return),
+                Some(m.total_return),
+                Some(annual_return - m.annual_return),
+                Some(m.alpha),
+                Some(m.beta),
+                Some(m.information_ratio),
+            ),
+            None => (None, None, None, None, None, None, None),
+        };
 
         Self {
             initial_capital,
@@ -553,8 +906,14 @@ impl BacktestSummary {
             total_trades,
             win_rate,
             chart_path: None,
-            benchmark_annual_return: Some(benchmark_annual),
-            alpha: Some(alpha),
+            benchmark_annual_return,
+            alpha,
+            benchmark_name,
+            benchmark_total_return,
+            excess_return,
+            beta,
+            information_ratio,
+            max_dd_duration_days,
         }
     }
 
@@ -889,6 +1248,58 @@ impl BacktestSummary {
     }
 }
 
+/// 导出交易明细 CSV（审计用，独立于回测引擎实例）
+pub fn write_trades_csv(state: &BacktestState, output_path: &str) -> Result<()> {
+    use std::fs::File;
+    use std::io::Write;
+
+    let mut file = File::create(output_path)?;
+    writeln!(file, "date,code,name,action,shares,price,amount,commission")?;
+    for trade in &state.trades {
+        let action = match trade.action {
+            TradeAction::Buy => "BUY",
+            TradeAction::Sell => "SELL",
+        };
+        writeln!(
+            file,
+            "{},{},{},{},{:.0},{:.4},{:.2},{:.2}",
+            trade.date.format("%Y-%m-%d"),
+            trade.code,
+            trade.name,
+            action,
+            trade.shares,
+            trade.price,
+            trade.amount,
+            trade.commission
+        )?;
+    }
+    Ok(())
+}
+
+/// 导出每日净值 CSV（审计用，独立于回测引擎实例）
+pub fn write_daily_values_csv(state: &BacktestState, output_path: &str, initial_capital: f64) -> Result<()> {
+    use std::fs::File;
+    use std::io::Write;
+
+    let mut file = File::create(output_path)?;
+    writeln!(file, "date,total_value,daily_return,cumulative_return")?;
+    let mut prev_value = initial_capital;
+    for (date, value) in &state.daily_values {
+        let daily_ret = if prev_value.abs() > 1e-9 { (*value - prev_value) / prev_value } else { 0.0 };
+        let cum_ret = (*value - initial_capital) / initial_capital;
+        writeln!(
+            file,
+            "{},{:.2},{:.4},{:.4}",
+            date.format("%Y-%m-%d"),
+            value,
+            daily_ret,
+            cum_ret
+        )?;
+        prev_value = *value;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -933,5 +1344,38 @@ mod tests {
         // 应该有回撤（从1_100_000跌到1_050_000）
         let dd = state.max_drawdown();
         assert!(dd > 0.0, "max_drawdown should be positive, got: {}", dd);
+    }
+
+    #[test]
+    fn test_regime_breakdown_buckets() {
+        // 构造 60 天基准：前 30 天上行，后 30 天下行
+        let base = Local::now();
+        let mut closes = HashMap::new();
+        let mut dates: Vec<DateTime<Local>> = Vec::new();
+        for i in 0..60i64 {
+            let dt = base + chrono::Duration::days(i);
+            let close = if i < 30 {
+                100.0 + i as f64 * 2.0 // 上行
+            } else {
+                160.0 - (i - 30) as f64 * 2.0 // 下行
+            };
+            closes.insert(dt.format("%Y-%m-%d").to_string(), close);
+            dates.push(dt);
+        }
+        let bench = BenchmarkSeries::new("测试指数", closes);
+
+        // 策略每日净值取基准 d20..d59（确保 idx_cur >= window=20）
+        let daily_values: Vec<(DateTime<Local>, f64)> = dates[20..]
+            .iter()
+            .enumerate()
+            .map(|(k, d)| (*d, 1_000_000.0 + k as f64 * 1000.0))
+            .collect();
+
+        let rep = regime_breakdown(&daily_values, &bench).expect("应返回 regime 报告");
+        // 同时存在牛市与熊市两种状态
+        let has_bull = rep.stats.iter().any(|s| s.kind == RegimeKind::Bull && s.days > 0);
+        let has_bear = rep.stats.iter().any(|s| s.kind == RegimeKind::Bear && s.days > 0);
+        assert!(has_bull, "应识别出牛市区间");
+        assert!(has_bear, "应识别出熊市区间");
     }
 }

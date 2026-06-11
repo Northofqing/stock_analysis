@@ -12,6 +12,47 @@ use crate::strategy::BollMacdAction;
 
 use super::AnalysisResult;
 
+/// 交易成本（与回测默认一致）：佣金万三、印花税千一(仅卖出)、滑点千一。
+const COMMISSION_RATE: f64 = 0.0003;
+const STAMP_TAX_RATE: f64 = 0.001;
+const SLIPPAGE_RATE: f64 = 0.001;
+/// 往返交易成本百分比（买:佣金+滑点；卖:佣金+印花税+滑点），用于把毛收益折算为净收益。
+const ROUND_TRIP_COST_PCT: f64 =
+    (COMMISSION_RATE + SLIPPAGE_RATE + COMMISSION_RATE + STAMP_TAX_RATE + SLIPPAGE_RATE) * 100.0;
+
+/// 模拟账户总本金（元），由 `TOTAL_CAPITAL` 配置，默认 10 万。
+fn total_capital() -> f64 {
+    std::env::var("TOTAL_CAPITAL")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(100_000.0)
+}
+
+/// 最多同时持有的仓位数（决定单笔仓位预算），由 `MAX_POSITIONS` 配置，默认 5。
+fn max_positions() -> usize {
+    std::env::var("MAX_POSITIONS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(5)
+}
+
+/// 按本金计算买入股数：单笔预算 = 总本金 / 最大仓位数；A股按 100 股整数倍，至少 1 手。
+fn position_shares(price: f64) -> i32 {
+    if price <= 0.0 {
+        return 100;
+    }
+    let budget = total_capital() / max_positions() as f64;
+    let lots = (budget / price / 100.0).floor() as i32;
+    lots.max(1) * 100
+}
+
+/// 毛收益率 → 净收益率（扣往返交易成本）。
+fn net_return_rate(gross_pct: f64) -> f64 {
+    gross_pct - ROUND_TRIP_COST_PCT
+}
+
 /// 对单只股票跟踪模拟持仓并在满足条件时开/平仓。
 pub(super) fn track_position(code: &str, data: &[KlineData], result: &mut AnalysisResult) {
     let Ok(db) = std::panic::catch_unwind(|| DatabaseManager::get()) else {
@@ -22,7 +63,7 @@ pub(super) fn track_position(code: &str, data: &[KlineData], result: &mut Analys
 
     match db.get_open_position(code) {
         Ok(Some(pos)) => {
-            let return_rate = (current_price / pos.buy_price - 1.0) * 100.0;
+            let return_rate = net_return_rate((current_price / pos.buy_price - 1.0) * 100.0);
             result.position_buy_price = Some(pos.buy_price);
             result.position_buy_date = Some(pos.buy_date.clone());
             result.position_return = Some(return_rate);
@@ -125,12 +166,13 @@ pub(super) fn track_position(code: &str, data: &[KlineData], result: &mut Analys
                 return;
             }
             let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+            let shares = position_shares(current_price);
             let new_position = crate::models::NewStockPosition {
                 code: code.to_string(),
                 name: result.name.clone(),
                 buy_date: today.clone(),
                 buy_price: current_price,
-                quantity: 1000,
+                quantity: shares,
                 status: "open".to_string(),
             };
             match db.save_position(&new_position) {
@@ -149,13 +191,19 @@ pub(super) fn track_position(code: &str, data: &[KlineData], result: &mut Analys
                         String::new()
                     };
                     info!(
-                        "[{}] 触发{}（AI 评分 {}），模拟买入 1000 股 @ {:.2}{}",
-                        code, tag, result.sentiment_score, current_price, extra
+                        "[{}] 触发{}（AI 评分 {}），模拟买入 {} 股 @ {:.2}（约 {:.0} 元）{}",
+                        code,
+                        tag,
+                        result.sentiment_score,
+                        shares,
+                        current_price,
+                        shares as f64 * current_price,
+                        extra
                     );
                     result.position_buy_price = Some(current_price);
                     result.position_buy_date = Some(today);
                     result.position_return = Some(0.0);
-                    result.position_quantity = Some(1000);
+                    result.position_quantity = Some(shares);
                     result.position_status = Some("new".to_string());
                 }
                 Err(e) => warn!("[{}] 记录模拟买入失败: {}", code, e),

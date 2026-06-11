@@ -23,7 +23,7 @@ path = "src/bin/rsi_optimize.rs"
 [dependencies]
 tokio = { version = "1.49.0", features = ["full", "rt"] }
 anyhow = "1.0.100"
-dotenv = "0.15.0"
+dotenvy = "0.15.7"
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

@@ -388,6 +388,7 @@ impl BollingerZScoreBacktest {
             single_results: all_single,
             portfolio_daily_values: portfolio.0,
             portfolio_trades: portfolio.1,
+            benchmark: None,
         })
     }
 
@@ -472,10 +473,12 @@ pub struct BollingerZScoreResult {
     pub single_results: Vec<SingleBacktestResult>,
     pub portfolio_daily_values: Vec<(chrono::DateTime<Local>, f64)>,
     pub portfolio_trades: Vec<Trade>,
+    /// 真实基准日线（如沪深300）；None 表示基准数据缺失，报告将如实标注
+    pub benchmark: Option<super::core::BenchmarkSeries>,
 }
 
 impl BollingerZScoreResult {
-    /// 转化为通用 BacktestSummary（复用现有回测报告和图表生成）
+    /// 转化为通用 BacktestSummary（复用现有回测报告和图表生成，带真实基准）
     pub fn to_summary(&self) -> BacktestSummary {
         let total_initial = self.config.initial_capital * self.single_results.len() as f64;
 
@@ -484,7 +487,7 @@ impl BollingerZScoreResult {
         state.daily_values = self.portfolio_daily_values.clone();
         state.trades = self.portfolio_trades.clone();
 
-        BacktestSummary::from_state(&state, total_initial)
+        BacktestSummary::from_state_with_benchmark(&state, total_initial, self.benchmark.as_ref())
     }
 
     /// 生成图表（复用 BacktestSummary 的图表逻辑）

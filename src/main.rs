@@ -22,7 +22,7 @@ use log::{error, info};
 use std::io::Write;
 
 fn main() -> Result<()> {
-    dotenv::dotenv().ok();
+    dotenvy::dotenv().ok();
     let args = cli::Args::parse();
 
     // 日志初始化（时间戳使用本地时区）
@@ -63,7 +63,20 @@ fn main() -> Result<()> {
         }
     }
 
-    // 装配待分析股票列表（含宏观推荐 / 龙虎榜 / 涨停 / 持仓）
+    // 模式分派
+    let env_true = |k: &str| std::env::var(k).unwrap_or_default().to_lowercase() == "true";
+
+    // 定时模式优先：放在最前面，启动时不预先装配股票列表。
+    // 改为每次定时执行时重新读取配置（.env）并重新装配，
+    // 使运行过程中对 .env / 股票池的修改即时生效。
+    if args.schedule || env_true("SCHEDULE_ENABLED") {
+        app::run_scheduled_analysis(&args)?;
+        info!("程序执行完成");
+        return Ok(());
+    }
+
+    // 非定时模式：启动时装配一次待分析股票列表
+    // （含宏观推荐 / 龙虎榜 / 涨停 / 持仓）
     let (stock_codes, limit_up_codes, macro_ctx) = app::build_stock_list(&args)?;
     info!(
         "待分析股票（共 {} 只）: {:?}",
@@ -71,12 +84,7 @@ fn main() -> Result<()> {
         stock_codes
     );
 
-    // 模式分派
-    let env_true = |k: &str| std::env::var(k).unwrap_or_default().to_lowercase() == "true";
-
-    if args.schedule || env_true("SCHEDULE_ENABLED") {
-        app::run_scheduled_analysis(&stock_codes, &args)?;
-    } else if args.lhb_mode || env_true("LHB_MODE") {
+    if args.lhb_mode || env_true("LHB_MODE") {
         app::run_lhb_analysis(&args)?;
     } else if args.market_review || env_true("MARKET_REVIEW_ENABLED") {
         info!("模式: 仅大盘复盘");
