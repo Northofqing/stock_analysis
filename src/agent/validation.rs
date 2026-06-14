@@ -1,5 +1,4 @@
 use crate::agent::context::ContextManager;
-use serde_json::Value;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ValidationError {
@@ -47,13 +46,13 @@ impl Validator for ConsensusDeviationValidator {
 pub struct ConceptLinkageValidator;
 impl Validator for ConceptLinkageValidator {
     fn name(&self) -> &str { "ConceptLinkageValidator" }
-    fn validate(&self, context: &ContextManager) -> Result<(), ValidationError> { Ok(()) }
+    fn validate(&self, _context: &ContextManager) -> Result<(), ValidationError> { Ok(()) }
 }
 
 pub struct DividendTaxValidator;
 impl Validator for DividendTaxValidator {
     fn name(&self) -> &str { "DividendTaxValidator" }
-    fn validate(&self, context: &ContextManager) -> Result<(), ValidationError> { Ok(()) }
+    fn validate(&self, _context: &ContextManager) -> Result<(), ValidationError> { Ok(()) }
 }
 
 pub struct ValidationEngine {

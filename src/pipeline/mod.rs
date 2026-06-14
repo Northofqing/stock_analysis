@@ -4,8 +4,10 @@
 //! 数据获取 → 趋势分析 → AI分析 → 通知推送
 
 mod backtest_runner;
+pub mod chain_analysis;
 mod extra_context;
 mod macro_news;
+mod market_regime;
 mod multi_timeframe;
 mod position_tracker;
 mod price_stats;
@@ -82,6 +84,9 @@ pub struct AnalysisResult {
     pub pos_quarter: Option<f64>,
 
     // ========== 近期走势 ==========
+    /// 当日涨跌幅(%)，用于大盘状态门控的广度统计与相对强度判断
+    #[serde(default)]
+    pub chg_1d: Option<f64>,
     pub chg_5d: Option<f64>,
     pub chg_10d: Option<f64>,
     pub volatility: Option<f64>,
@@ -1288,6 +1293,7 @@ impl AnalysisPipeline {
             high_quarter: stats.high_quarter,
             low_quarter: stats.low_quarter,
             pos_quarter: stats.pos_quarter,
+            chg_1d: Some(data[0].pct_chg),
             chg_5d: stats.chg_5d,
             chg_10d: stats.chg_10d,
             volatility: stats.volatility,
@@ -1665,7 +1671,58 @@ impl AnalysisPipeline {
             && !self.config.dry_run
             && !self.config.single_notify
         {
-            summary_notify::send_summary_notification(&self.notifier, &results, backtest_summary.as_ref()).await?;
+            // 产业链联动分析：仅在当日有涨停数据时执行，作为报告第一部分
+            // MarketAnalyzer 使用阻塞 HTTP，必须在 spawn_blocking 中执行
+            let chain_section = {
+                let limit_up_stocks = tokio::task::spawn_blocking(|| {
+                    match crate::market_analyzer::MarketAnalyzer::new(None) {
+                        Ok(analyzer) => match analyzer.get_limit_up_stocks() {
+                            Ok(stocks) => stocks,
+                            Err(e) => {
+                                log::warn!("[产业链] 获取涨停股列表失败: {}", e);
+                                Vec::new()
+                            }
+                        },
+                        Err(e) => {
+                            log::warn!("[产业链] 创建 MarketAnalyzer 失败: {}", e);
+                            Vec::new()
+                        }
+                    }
+                })
+                .await
+                .unwrap_or_default();
+                if limit_up_stocks.is_empty() {
+                    info!("[产业链] 今日无涨停数据，跳过产业链分析");
+                    None
+                } else {
+                    info!("[产业链] 获取到 {} 只涨停股，开始联动分析...", limit_up_stocks.len());
+                    match chain_analysis::run_chain_analysis(limit_up_stocks, None).await {
+                        Ok(report) if !report.trim().is_empty() => {
+                            info!("[产业链] 联动分析完成，将并入主报告");
+                            Some(report)
+                        }
+                        Ok(_) => {
+                            warn!("[产业链] 联动分析返回空，跳过");
+                            None
+                        }
+                        Err(e) => {
+                            warn!("[产业链] 联动分析失败: {}", e);
+                            None
+                        }
+                    }
+                }
+            };
+
+            // 大盘状态门控：普跌日豁免跑赢指数个股的机械减仓建议，并在日报头部输出市场定性
+            let regime_section = market_regime::apply(&self.data_manager, &mut results);
+            summary_notify::send_summary_notification(
+                &self.notifier,
+                &results,
+                backtest_summary.as_ref(),
+                regime_section.as_deref(),
+                chain_section.as_deref(),
+            )
+            .await?;
         }
 
         Ok(results)
@@ -1676,6 +1733,7 @@ impl AnalysisPipeline {
         reporting::generate_single_report(result)
     }
 }
+
 
 #[cfg(test)]
 mod tests {

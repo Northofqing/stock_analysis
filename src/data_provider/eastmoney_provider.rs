@@ -328,69 +328,71 @@ impl DataProvider for HttpProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
-    #[test]
-    fn test_get_stock_name() {
-        let provider = HttpProvider::new().unwrap();
-        
-        let test_codes = vec![
-            "600519", // 贵州茅台
-            "000001", // 平安银行
-            "002413", // 雷科防务
-        ];
-        
-        for code in test_codes {
-            if let Some(name) = provider.get_stock_name(code) {
-                println!("{} -> {}", code, name);
-                assert!(!name.is_empty());
-            }
-        }
+
+    /// 在 tokio runtime 的 spawn_blocking 中执行阻塞调用
+    async fn with_provider<F, T>(f: F) -> T
+    where
+        F: FnOnce(&HttpProvider) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        tokio::task::spawn_blocking(move || {
+            let provider = HttpProvider::new().unwrap();
+            f(&provider)
+        })
+        .await
+        .unwrap()
     }
-    
-    #[test]
-    fn test_get_daily_data() {
-        let provider = HttpProvider::new().unwrap();
-        let result = provider.get_daily_data("600519", 30);
-        
-        match result {
-            Ok(data) => {
-                assert!(!data.is_empty(), "数据不应为空");
-                println!("获取到 {} 条数据", data.len());
-                if let Some(first) = data.first() {
-                    println!("最新数据: {:?}", first);
-                    assert!(first.close > 0.0, "收盘价应大于0");
+
+    #[tokio::test]
+    async fn test_get_stock_name() {
+        with_provider(|p| {
+            for code in ["600519", "000001", "002413"] {
+                if let Some(name) = p.get_stock_name(code) {
+                    println!("{} -> {}", code, name);
+                    assert!(!name.is_empty());
                 }
             }
-            Err(e) => {
-                println!("获取数据失败（可能是网络问题）: {}", e);
-            }
-        }
+        })
+        .await;
     }
-    
-    #[test]
-    fn test_different_markets() {
-        let provider = HttpProvider::new().unwrap();
-        
-        // 测试不同市场的股票
-        let test_codes = vec![
-            ("600519", "上海"),
-            ("000001", "深圳"),
-            ("300750", "创业板"),
-        ];
-        
-        for (code, market) in test_codes {
-            println!("\n测试 {} 市场股票: {}", market, code);
-            match provider.get_daily_data(code, 5) {
+
+    #[tokio::test]
+    async fn test_get_daily_data() {
+        with_provider(|p| {
+            match p.get_daily_data("600519", 30) {
                 Ok(data) => {
-                    println!("  成功获取 {} 条数据", data.len());
+                    assert!(!data.is_empty(), "数据不应为空");
+                    println!("获取到 {} 条数据", data.len());
                     if let Some(first) = data.first() {
-                        println!("  最新: {} 收盘={}", first.date, first.close);
+                        assert!(first.close > 0.0, "收盘价应大于0");
                     }
                 }
                 Err(e) => {
-                    println!("  失败: {}", e);
+                    println!("获取数据失败（可能是网络问题）: {}", e);
                 }
             }
-        }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_different_markets() {
+        with_provider(|p| {
+            for (code, market) in [("600519", "上海"), ("000001", "深圳"), ("300750", "创业板")] {
+                println!("\n测试 {} 市场股票: {}", market, code);
+                match p.get_daily_data(code, 5) {
+                    Ok(data) => {
+                        println!("  成功获取 {} 条数据", data.len());
+                        if let Some(first) = data.first() {
+                            println!("  最新: {} 收盘={}", first.date, first.close);
+                        }
+                    }
+                    Err(e) => {
+                        println!("  失败: {}", e);
+                    }
+                }
+            }
+        })
+        .await;
     }
 }

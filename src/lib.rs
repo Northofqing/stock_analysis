@@ -8,6 +8,7 @@ pub mod trend_analyzer;
 pub mod database;
 pub mod models;
 pub mod schema;
+pub mod calendar;
 pub mod market_data;
 pub mod market_analyzer;
 pub mod notification;
@@ -16,6 +17,7 @@ pub mod data_provider;
 pub mod indicators;
 pub mod pipeline;
 pub mod lhb_analyzer;
+pub mod monitor;
 pub mod sharpe_calculator;
 pub mod chart_generator;
 

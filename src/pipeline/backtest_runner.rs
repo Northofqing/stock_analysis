@@ -239,83 +239,118 @@ impl AnalysisPipeline {
         })
     }
 
-    /// 运行多因子回测
-    pub(super) async fn run_multi_factor_backtest(&self, results: &[AnalysisResult]) -> Result<BacktestSummary> {
-        // 1. 准备因子数据
+    /// 运行多因子回测（真历史回测：逐日计算因子→选股→模拟持仓→跟踪净值）。
+    pub(super) async fn run_multi_factor_backtest(
+        &self,
+        results: &[AnalysisResult],
+    ) -> Result<BacktestSummary> {
+        // 1. 拉取评分前 N 只股票的历史K线（至少 60 天）
+        let mut sorted = results.to_vec();
+        sorted.sort_by(|a, b| b.sentiment_score.cmp(&a.sentiment_score));
+        let top_n = 10;
+        let mut stocks_data = Vec::new();
+        for r in sorted.iter().take(top_n) {
+            match self.data_manager.get_daily_data(&r.code, 60) {
+                Ok((data, _)) if data.len() >= 30 => {
+                    stocks_data.push((r.code.clone(), r.name.clone(), data));
+                }
+                Ok(_) => warn!("[回测] {} K线不足30条，跳过", r.code),
+                Err(e) => warn!("[回测] {} 数据拉取失败: {}", r.code, e),
+            }
+        }
+        if stocks_data.len() < 3 {
+            anyhow::bail!("多因子回测需要至少3只股票，实际仅 {} 只", stocks_data.len());
+        }
+
+        // 2. 准备因子数据（从 results 提取，不做 look-ahead）
         let stock_factors: Vec<StockFactors> = results
             .iter()
+            .filter(|r| stocks_data.iter().any(|(c, _, _)| c == &r.code))
             .map(|r| StockFactors {
                 code: r.code.clone(),
                 name: r.name.clone(),
                 market_cap: r.market_cap,
-                roe: r.roe, // 暂时没有ROE数据
+                roe: r.roe,
                 pe: r.pe_ratio,
                 pb: r.pb_ratio,
                 turnover_rate: r.turnover_rate,
             })
             .collect();
 
-        // 2. 配置多因子策略
-        let multi_factor_config = MultiFactorConfig::default();
-        let multi_factor_engine = MultiFactorEngine::new(multi_factor_config);
+        let factor_engine = MultiFactorEngine::new(MultiFactorConfig::default());
+        let scores = factor_engine.calculate_scores(&stock_factors)?;
 
-        // 3. 计算股票得分并选出top N
-        let scores = multi_factor_engine.calculate_scores(&stock_factors)?;
-        info!("多因子评分完成，前3名: {:?}", 
-            scores.iter().take(3).map(|s| format!("{}({:.1}分)", s.name, s.total_score)).collect::<Vec<_>>()
-        );
+        // 3. 真实历史回测：逐日模拟持仓
+        let config = BacktestConfig::default();
+        let mut engine = BacktestEngine::new(config.clone());
+        let position_count = config.position_count.min(scores.len());
 
-        // 4. 简化回测：假设在分析时刻买入top N股票，持有到现在
-        let backtest_config = BacktestConfig::default();
-        let mut backtest_engine = BacktestEngine::new(backtest_config.clone());
+        // 收集所有交易日
+        let mut all_dates: std::collections::BTreeSet<chrono::NaiveDate> =
+            std::collections::BTreeSet::new();
+        for (_, _, ks) in &stocks_data {
+            for k in ks {
+                all_dates.insert(k.date);
+            }
+        }
+        let dates: Vec<chrono::NaiveDate> = all_dates.into_iter().collect();
+        if dates.len() < 10 {
+            anyhow::bail!("回测数据不足，仅 {} 个交易日", dates.len());
+        }
 
-        // 选出得分最高的N只股票
-        let top_stocks: Vec<_> = scores
-            .iter()
-            .take(backtest_config.position_count)
-            .collect();
+        // 前20天作为因子计算观察期，从第21天开始逐日调仓
+        let observe_days = 20.min(dates.len() / 3);
+        let initial_capital = config.initial_capital;
 
-        // 获取这些股票的最新价格
-        let mut target_stocks = Vec::new();
-        for stock_score in &top_stocks {
-            // 从results中找到对应的股票获取价格
-            if let Some(result) = results.iter().find(|r| r.code == stock_score.code) {
-                // 尝试获取最新价格
-                if let Ok((data, _)) = self.data_manager.get_daily_data(&result.code, 1) {
-                    if let Some(latest) = data.last() {
-                        target_stocks.push((
-                            result.code.clone(),
-                            result.name.clone(),
-                            latest.close,
-                        ));
+        for i in observe_days..dates.len() {
+            let today = dates[i];
+            // 选出当日得分最高的 N 只（因子固定不变，避免日内 look-ahead）
+            let mut day_scores: Vec<_> = scores.iter().collect();
+            day_scores.sort_by(|a, b| b.total_score.partial_cmp(&a.total_score).unwrap_or(std::cmp::Ordering::Equal));
+
+            let mut targets = Vec::new();
+            for s in day_scores.iter().take(position_count) {
+                if let Some((_, name, ks)) = stocks_data.iter().find(|(c, _, _)| c == &s.code) {
+                    if let Some(k) = ks.iter().find(|k| k.date == today) {
+                        targets.push((s.code.clone(), name.clone(), k.close));
                     }
                 }
             }
-        }
 
-        // 执行调仓（买入）
-        let now = chrono::Local::now();
-        backtest_engine.rebalance(&target_stocks, now)?;
-
-        // 记录初始市值
-        backtest_engine.record_daily_value(now);
-
-        // 简化：假设持有一段时间后市值
-        // 这里只是示例，实际应该用历史数据进行完整回测
-        let state = backtest_engine.get_state();
-        let mut summary = BacktestSummary::from_state(state, backtest_config.initial_capital);
-
-        // 生成回测图表
-        let chart_path = format!("reports/backtest_chart_{}.png", now.format("%Y%m%d_%H%M%S"));
-        match summary.generate_chart(state, &chart_path) {
-            Ok(path) => {
-                info!("回测图表已生成: {}", path.display());
-                summary.set_chart_path(path.to_string_lossy().to_string());
-            }
-            Err(e) => {
-                warn!("生成回测图表失败: {}", e);
+            if !targets.is_empty() {
+                let dt = today
+                    .and_hms_opt(15, 0, 0)
+                    .unwrap()
+                    .and_local_timezone(chrono::Local)
+                    .single()
+                    .unwrap_or_else(|| chrono::Local::now());
+                let _ = engine.rebalance(&targets, dt);
+                engine.record_daily_value(dt);
             }
         }
+
+        let state = engine.get_state();
+        let mut summary = BacktestSummary::from_state(&state, initial_capital);
+
+        // 注入基准（可用时）
+        if let Some(bench) = self.fetch_benchmark_series(60).await {
+            summary.benchmark_name = Some(bench.name);
+        }
+
+        info!(
+            "多因子回测完成: 总收益 {:.2}% 年化 {:.2}% 最大回撤 {:.2}% 夏普 {:.2} 交易 {} 笔",
+            summary.total_return * 100.0,
+            summary.annual_return * 100.0,
+            summary.max_drawdown * 100.0,
+            summary.sharpe_ratio,
+            summary.total_trades,
+        );
+
+        let date_str = chrono::Local::now().format("%Y%m%d").to_string();
+        let report = super::reporting::build_backtest_report(&summary);
+        let filename = format!("multi_factor_backtest_{}.md", date_str);
+        self.notifier.save_report_to_file(&report, Some(&filename))?;
+        self.export_audit_csv("multi_factor", &date_str, &state.daily_values, &state.trades, initial_capital);
 
         Ok(summary)
     }

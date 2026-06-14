@@ -14,6 +14,8 @@ pub enum NotificationChannel {
     Pushover,
     /// 自定义Webhook
     Custom,
+    /// Server酱（普通微信推送）
+    ServerChan,
 }
 
 impl NotificationChannel {
@@ -26,6 +28,7 @@ impl NotificationChannel {
             Self::Email => "邮件",
             Self::Pushover => "Pushover",
             Self::Custom => "自定义Webhook",
+            Self::ServerChan => "Server酱(微信)",
         }
     }
 }
@@ -63,6 +66,9 @@ pub struct NotificationConfig {
     pub pushover_user_key: Option<String>,
     pub pushover_api_token: Option<String>,
     
+    // Server酱（普通微信推送）
+    pub server_chan_key: Option<String>,
+
     // 自定义Webhook
     pub custom_webhook_urls: Vec<String>,
     pub custom_webhook_bearer_token: Option<String>,
@@ -92,6 +98,7 @@ impl NotificationConfig {
                 .and_then(|s| s.parse().ok()),
             pushover_user_key: std::env::var("PUSHOVER_USER_KEY").ok(),
             pushover_api_token: std::env::var("PUSHOVER_API_TOKEN").ok(),
+            server_chan_key: std::env::var("SERVER_CHAN_KEY").ok(),
             custom_webhook_urls: std::env::var("CUSTOM_WEBHOOK_URLS")
                 .ok()
                 .map(|s| s.split(',').map(|s| s.trim().to_string()).collect())

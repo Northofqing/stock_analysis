@@ -226,6 +226,10 @@ async fn execute_once(args: &Args) {
         };
 
     info!("本次待分析股票（共 {} 只）", stock_codes.len());
+
+    // 产业链分析已整合到 AnalysisPipeline::run() 内部：
+    // 在 send_summary_notification 之前自动拉取涨停数据并执行联动分析，
+    // 有涨停数据才做分析，分析结果并入主报告头部。
     execute_analysis(&stock_codes, &config).await;
 }
 

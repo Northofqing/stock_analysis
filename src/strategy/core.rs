@@ -291,7 +291,7 @@ impl BacktestState {
     }
 
     /// 计算平均仓位(暴露率) - 从daily_values推算
-    pub fn average_exposure(&self, initial_capital: f64) -> (f64, Vec<f64>) {
+    pub fn average_exposure(&self, _initial_capital: f64) -> (f64, Vec<f64>) {
         let mut daily_exposure = Vec::new();
         let mut total_exposure = 0.0;
 

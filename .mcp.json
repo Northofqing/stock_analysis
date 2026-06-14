@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "wechat": {
+      "command": "bun",
+      "args": [
+        "/Users/zhangzhen/Desktop/claude-code-wechat/wechat-channel.ts"
+      ]
+    }
+  }
+}

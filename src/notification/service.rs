@@ -77,6 +77,9 @@ impl NotificationService {
             channels.push(NotificationChannel::Pushover);
         }
 
+        if config.server_chan_key.is_some() {
+            channels.push(NotificationChannel::ServerChan);
+        }
         if !config.custom_webhook_urls.is_empty() {
             channels.push(NotificationChannel::Custom);
         }
@@ -161,6 +164,13 @@ impl NotificationService {
                             error!("[邮件] 发送出错: {}", e);
                             fail_count += 1;
                         }
+                    }
+                }
+                NotificationChannel::ServerChan => {
+                    match self.send_to_server_chan(content).await {
+                        Ok(true) => success_count += 1,
+                        Ok(false) => { error!("[Server酱] 发送失败"); fail_count += 1; }
+                        Err(e) => { error!("[Server酱] 发送出错: {}", e); fail_count += 1; }
                     }
                 }
                 _ => {
@@ -254,6 +264,44 @@ impl NotificationService {
         info!("日报已保存到: {}", path_str);
         Ok(path_str)
     }
+
+    /// Server酱推送（普通微信）。
+    /// 文档: https://sct.ftqq.com/
+    pub async fn send_to_server_chan(&self, content: &str) -> Result<bool> {
+        let key = match &self.config.server_chan_key {
+            Some(k) => k,
+            None => return Ok(false),
+        };
+        let url = format!("https://sctapi.ftqq.com/{}.send", key);
+        // 取第一行作为标题
+        let title = content.lines().next().unwrap_or("监控告警");
+        let title = if title.starts_with('#') {
+            title.trim_start_matches('#').trim()
+        } else {
+            title
+        };
+        let title = truncate(title, 32);
+        let desp = truncate(content, 4096);
+
+        let resp = self.client
+            .post(&url)
+            .form(&[("title", title.as_str()), ("desp", desp.as_str())])
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let body = resp.text().await?;
+        if status.is_success() && body.contains("\"code\":0") {
+            Ok(true)
+        } else {
+            log::warn!("[Server酱] 推送失败: HTTP {} body={}", status, truncate(&body, 200));
+            Ok(false)
+        }
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max { s.to_string() } else { format!("{}…", s.chars().take(max).collect::<String>()) }
 }
 
 /// 便捷函数：发送每日报告
@@ -261,7 +309,7 @@ pub async fn send_daily_report(results: &[AnalysisResult]) -> Result<bool> {
     let service = NotificationService::from_env();
 
     // 生成报告
-    let report = service.generate_daily_report(results);
+    let report = service.generate_daily_report(results, None);
 
     // 保存到本地
     service.save_report_to_file(&report, None)?;

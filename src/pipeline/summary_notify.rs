@@ -10,10 +10,15 @@ use crate::strategy::core::BacktestSummary;
 use super::{reporting, AnalysisResult};
 
 /// 发送当日汇总通知：生成图表，拼装日报，保存到 reports/，并推送。
+///
+/// `chain_analysis_section`：产业链联动分析（涨停聚类 + LLM 分析），
+/// 仅在当日有涨停数据时非空，将作为报告第一部分。
 pub(super) async fn send_summary_notification(
     notifier: &NotificationService,
     results: &[AnalysisResult],
     backtest_summary: Option<&BacktestSummary>,
+    regime_section: Option<&str>,
+    chain_analysis_section: Option<&str>,
 ) -> Result<()> {
     info!("生成分析汇总报告...");
 
@@ -33,7 +38,18 @@ pub(super) async fn send_summary_notification(
     };
 
     // 日报使用 pipeline 的 AnalysisResult 类型，不做转换
-    let report = notifier.generate_daily_report(results);
+    let stock_report = notifier.generate_daily_report(results, regime_section);
+
+    // 合并产业链分析（如果有涨停数据）到报告头部
+    let report = if let Some(chain) = chain_analysis_section {
+        if chain.trim().is_empty() {
+            stock_report
+        } else {
+            format!("{}\n\n---\n\n{}", chain.trim(), stock_report)
+        }
+    } else {
+        stock_report
+    };
 
     if let Some(summary) = backtest_summary {
         let backtest_report = reporting::build_backtest_report(summary);

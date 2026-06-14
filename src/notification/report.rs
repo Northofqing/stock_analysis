@@ -6,7 +6,13 @@ use super::service::{AnalysisResult, NotificationService};
 
 impl NotificationService {
     /// 生成 Markdown 格式的日报
-    pub fn generate_daily_report(&self, results: &[AnalysisResult]) -> String {
+    ///
+    /// `regime_section`：可选的大盘状态区块（已渲染 Markdown），插入报告头部。
+    pub fn generate_daily_report(
+        &self,
+        results: &[AnalysisResult],
+        regime_section: Option<&str>,
+    ) -> String {
         let report_date = Local::now().format("%Y-%m-%d").to_string();
         let now = Local::now().format("%H:%M:%S").to_string();
 
@@ -18,6 +24,14 @@ impl NotificationService {
             "---".to_string(),
             String::new(),
         ];
+
+        // 大盘状态区块（普跌/普涨/结构性定性 + 普跌豁免明细）
+        if let Some(sec) = regime_section {
+            lines.push(sec.trim_end().to_string());
+            lines.push(String::new());
+            lines.push("---".to_string());
+            lines.push(String::new());
+        }
 
         // 按评分排序
         let mut sorted_results = results.to_vec();

@@ -10,7 +10,7 @@ pub mod modes;
 pub mod schedule;
 
 pub use bootstrap::{build_stock_list, validate_startup_config};
-pub use modes::{run_analysis, run_lhb_analysis, run_market_review_only};
+pub use modes::{run_analysis, run_chain_analysis_mode, run_lhb_analysis, run_market_review_only};
 pub use schedule::run_scheduled_analysis;
 
 use crate::cli::Args;

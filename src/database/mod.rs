@@ -38,6 +38,7 @@ pub struct DatabaseManager {
 static DB_INSTANCE: OnceCell<DatabaseManager> = OnceCell::new();
 
 
+mod concepts;
 mod kline;
 mod lhb;
 mod positions;
@@ -91,6 +92,33 @@ impl DatabaseManager {
                 log_type TEXT NOT NULL,
                 content TEXT,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            "#
+        )
+        .execute(&mut *conn)?;
+
+        // 创建 stock_concepts 表（概念板块标签缓存，产业链聚类用）
+        diesel::sql_query(
+            r#"
+            CREATE TABLE IF NOT EXISTS stock_concepts (
+                code TEXT PRIMARY KEY,
+                concepts TEXT NOT NULL,
+                updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            "#
+        )
+        .execute(&mut *conn)?;
+
+        // 创建 chain_daily 表（每日涨停主线簇，供单股分析注入主线上下文 + 主线生命周期追踪）
+        diesel::sql_query(
+            r#"
+            CREATE TABLE IF NOT EXISTS chain_daily (
+                date TEXT NOT NULL,
+                concept TEXT NOT NULL,
+                stocks TEXT NOT NULL,
+                continuation_count INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (date, concept)
             )
             "#
         )
@@ -273,13 +301,118 @@ impl DatabaseManager {
         )
         .execute(&mut *conn)?;
 
+        // 预测追踪表（Phase 5 预测闭环）
+        diesel::sql_query(
+            r#"
+            CREATE TABLE IF NOT EXISTS prediction_tracker (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pred_date TEXT NOT NULL,
+                target_date TEXT NOT NULL,
+                theme_name TEXT,
+                stock_code TEXT,
+                pred_direction TEXT NOT NULL,
+                pred_score REAL,
+                pred_detail TEXT,
+                actual_change REAL,
+                actual_result TEXT,
+                hit INTEGER,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            "#,
+        )
+        .execute(&mut *conn)?;
+        diesel::sql_query(
+            "CREATE INDEX IF NOT EXISTS ix_pred_date ON prediction_tracker(pred_date)",
+        )
+        .execute(&mut *conn)?;
+
+        // 概念共振表（Phase 4 动态产业链拓扑）
+        diesel::sql_query(
+            r#"
+            CREATE TABLE IF NOT EXISTS concept_cooccurrence (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                stock_code TEXT NOT NULL,
+                concept_name TEXT NOT NULL,
+                cooccur_weight REAL DEFAULT 0.0,
+                evidence_level TEXT DEFAULT 'C',
+                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(stock_code, concept_name)
+            )
+            "#,
+        )
+        .execute(&mut *conn)?;
+
         Ok(())
+    }
+
+    /// 保存预测记录（Phase 5 预测闭环）
+    pub fn save_prediction(
+        &self,
+        pred_date: &str,
+        target_date: &str,
+        theme_name: Option<&str>,
+        stock_code: Option<&str>,
+        direction: &str,
+        score: f64,
+        detail: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut conn = self.get_conn()?;
+        let tn = theme_name.unwrap_or("");
+        let sc = stock_code.unwrap_or("");
+        let det = detail.unwrap_or("");
+        diesel::sql_query(format!(
+            "INSERT INTO prediction_tracker (pred_date, target_date, theme_name, stock_code, pred_direction, pred_score, pred_detail) VALUES ('{}', '{}', '{}', '{}', '{}', {}, '{}')",
+            pred_date, target_date, tn, sc, direction, score, det
+        ))
+        .execute(&mut *conn)?;
+        Ok(())
+    }
+
+    /// 更新预测结果（次日收盘后回调）
+    pub fn update_prediction_result(
+        &self,
+        pred_date: &str,
+        stock_code: Option<&str>,
+        actual_change: f64,
+        hit: bool,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        let mut conn = self.get_conn()?;
+        let result_text = if hit { "命中" } else { "未命中" };
+        let rows = if let Some(code) = stock_code {
+            diesel::sql_query(format!(
+                "UPDATE prediction_tracker SET actual_change = {}, hit = {}, actual_result = '{}' WHERE pred_date = '{}' AND stock_code = '{}'",
+                actual_change, hit as i32, result_text, pred_date, code
+            ))
+            .execute(&mut *conn)?
+        } else {
+            diesel::sql_query(format!(
+                "UPDATE prediction_tracker SET actual_change = {}, hit = {}, actual_result = '{}' WHERE pred_date = '{}' AND theme_name != ''",
+                actual_change, hit as i32, result_text, pred_date
+            ))
+            .execute(&mut *conn)?
+        };
+        Ok(rows)
+    }
+
+    /// 获取预测命中率（简化实现，直接执行 SQL 返回 f64）
+    pub fn get_prediction_hit_rate(&self, _days: i32) -> Result<f64, Box<dyn std::error::Error>> {
+        let mut conn = self.get_conn()?;
+        // 使用 Diesel 的 sql_query + get_result 返回单值
+        #[derive(QueryableByName, Debug)]
+        struct HitRate {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            rate_text: String,
+        }
+        let raw = "SELECT CAST(COALESCE(SUM(CAST(hit AS REAL)), 0) / CASE WHEN COUNT(*) = 0 THEN 1 ELSE COUNT(*) END AS TEXT) as rate_text FROM prediction_tracker";
+        let result = diesel::sql_query(raw).get_result::<HitRate>(&mut *conn);
+        match result {
+            Ok(r) => Ok(r.rate_text.parse::<f64>().unwrap_or(0.0)),
+            Err(_) => Ok(0.0),
+        }
     }
 }
 
-// ============================================================================
 // 辅助数据结构
-// ============================================================================
 
 /// 股票日线记录（用于批量插入）
 #[derive(Debug, Clone)]
@@ -326,26 +459,24 @@ mod tests {
     use super::*;
     use chrono::NaiveDate;
 
+    // OnceCell 单例全局共享，测试共用同一路径避免竞态
+    static TEST_DB: &str = "./test_data/test.db";
+
+    fn init_db_for_test() {
+        std::fs::create_dir_all("./test_data").ok();
+        let _ = DatabaseManager::init(Some(PathBuf::from(TEST_DB)));
+    }
+
     #[test]
     fn test_database_init() {
-        let db_path = PathBuf::from("./test_data/test.db");
-        std::fs::create_dir_all("./test_data").ok();
-
-        DatabaseManager::init(Some(db_path)).expect("数据库初始化失败");
-
+        init_db_for_test();
         let db = DatabaseManager::get();
         assert!(db.pool.get().is_ok());
-
-        // 清理
-        std::fs::remove_dir_all("./test_data").ok();
     }
 
     #[test]
     fn test_save_and_retrieve() {
-        let db_path = PathBuf::from("./test_data/test2.db");
-        std::fs::create_dir_all("./test_data").ok();
-
-        DatabaseManager::init(Some(db_path)).expect("数据库初始化失败");
+        init_db_for_test();
         let db = DatabaseManager::get();
 
         // 保存数据
@@ -378,8 +509,7 @@ mod tests {
         assert_eq!(data[0].code, "600519");
         assert_eq!(data[0].close, Some(1820.0));
 
-        // 清理
+        // 清理数据（不删DB文件，并行测试可能还在用）
         db.delete_stock_data("600519").ok();
-        std::fs::remove_dir_all("./test_data").ok();
     }
 }

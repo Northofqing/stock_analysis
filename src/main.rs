@@ -75,6 +75,14 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // 产业链联动分析模式（仅 --chain-analysis 命令行参数触发，不再响应环境变量）：
+    // 不需要装配自选股列表，直接分析当日涨停池
+    if args.chain_analysis {
+        app::run_chain_analysis_mode(!args.no_notify)?;
+        info!("程序执行完成");
+        return Ok(());
+    }
+
     // 非定时模式：启动时装配一次待分析股票列表
     // （含宏观推荐 / 龙虎榜 / 涨停 / 持仓）
     let (stock_codes, limit_up_codes, macro_ctx) = app::build_stock_list(&args)?;

@@ -1,0 +1,29 @@
+//! 实盘监控模块（Phase 0-5 全部实现）。
+//!
+//! 子模块：
+//! - data_quality:   数据质量门
+//! - rate_budget:    请求预算与退避
+//! - scanner:        阶梯轮询扫描器
+//! - detector:       异动检测规则引擎
+//! - signal_state:   信号状态机
+//! - auction:        集合竞价扫描
+//! - alert:          分级告警推送
+//! - risk:           风控叠加
+//! - signal_fusion:  信号融合
+//! - checklist:      盘前/收盘总结
+//! - prediction:     预测追踪闭环
+
+pub mod data_quality;
+pub mod rate_budget;
+pub mod scanner;
+pub mod detector;
+pub mod signal_state;
+pub mod auction;
+pub mod alert;
+pub mod risk;
+pub mod signal_fusion;
+pub mod checklist;
+pub mod prediction;
+pub mod adaptive;
+pub mod alert_log;
+mod integration;

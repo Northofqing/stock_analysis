@@ -9,7 +9,10 @@
 //! - 营收连续 3 期负增长 → 不得输出『买入』
 //! - CFO/NI<0.3 且 净利同比>营收同比×2 → 利润含金量警告 + 仓位 ≤30%
 //! - 现价超出卖方目标价均值 >15% → 估值透支 + 仓位 ≤30%
-//! - PE 历史分位>80 且 PB 历史分位>90 → 禁止『强烈建议买入』
+//! - 双高估值分层否决：
+//!   - P99/P99 极端档：任何『买入』→『观望』，仓位 ≤20%
+//!   - P95/P95 严重档：任何『买入』→『观望』（仅回调介入），仓位 ≤30%
+//!   - P80/P90 基础档：禁止『强烈建议买入』
 
 use serde::{Deserialize, Serialize};
 
@@ -85,10 +88,31 @@ pub fn evaluate(
         }
     }
 
-    // Rule 4: PB 分位>90 且 PE 分位>80 → 禁止"强烈建议买入"
+    // Rule 4: 双高估值分层否决（按极端程度三档处理，越极端力度越强）
     if let Some(vh) = data.valuation_history.as_ref() {
         if let (Some(pep), Some(pbp)) = (vh.pe_percentile, vh.pb_percentile) {
-            if pep > 80.0 && pbp > 90.0 {
+            if pep >= 99.0 && pbp >= 99.0 {
+                // 极端档：估值处于历史最高分位，禁止任何买入
+                out.flags.push(format!(
+                    "🚫 极端双高估值：PE 历史分位 P{:.0} + PB 历史分位 P{:.0} 均处历史极值 → 禁止任何买入，仅回调后重新评估，仓位 ≤20%",
+                    pep, pbp
+                ));
+                if original.contains("买入") && out.downgraded_advice.is_none() {
+                    out.downgraded_advice = Some("观望".to_string());
+                }
+                cap_position(&mut out, 20);
+            } else if pep > 95.0 && pbp > 95.0 {
+                // 严重档：禁止追高买入，仅回调介入
+                out.flags.push(format!(
+                    "🚫 严重双高估值：PE 历史分位 P{:.0} + PB 历史分位 P{:.0} → 禁止追高买入（仅回调介入），仓位 ≤30%",
+                    pep, pbp
+                ));
+                if original.contains("买入") && out.downgraded_advice.is_none() {
+                    out.downgraded_advice = Some("观望".to_string());
+                }
+                cap_position(&mut out, 30);
+            } else if pep > 80.0 && pbp > 90.0 {
+                // 基础档：禁止『强烈建议买入』
                 out.flags.push(format!(
                     "🚫 双高估值：PE 历史分位 P{:.0} + PB 历史分位 P{:.0} → 禁止『强烈建议买入』",
                     pep, pbp

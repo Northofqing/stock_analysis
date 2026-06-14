@@ -4,8 +4,8 @@ use crate::agent::toolbelt::Toolbelt;
 use crate::agent::validation::ValidationEngine;
 use async_openai::types::{
     ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
-    ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestToolMessageArgs,
-    ChatCompletionRequestMessage, ChatCompletionToolChoiceOption,
+    ChatCompletionRequestAssistantMessageArgs,
+    ChatCompletionRequestMessage,
     CreateChatCompletionRequestArgs,
 };
 use async_openai::{config::OpenAIConfig, Client};

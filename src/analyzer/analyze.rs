@@ -24,11 +24,11 @@ impl GeminiAnalyzer {
     pub async fn analyze_stock_with_extras(
         &self,
         code: &str,
-        name: Option<&str>,
+        _name: Option<&str>,
         kline_data: &[crate::data_provider::KlineData],
         macro_context: Option<&str>,
         extra_context: Option<&str>,
-        news_context: Option<&str>,
+        _news_context: Option<&str>,
         tech_assessment: Option<&crate::analyzer::TechAssessment<'_>>,
     ) -> Result<String> {
         if kline_data.is_empty() {

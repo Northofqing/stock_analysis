@@ -94,6 +94,38 @@ pub fn run_market_review_only() -> Result<()> {
     Ok(())
 }
 
+/// 产业链联动分析模式：涨停池 → 概念聚类 → 产业链上下游定位（LLM）→ 报告 + 推送。
+pub fn run_chain_analysis_mode(send_notify: bool) -> Result<()> {
+    use stock_analysis::market_analyzer::MarketAnalyzer;
+    use stock_analysis::notification::NotificationService;
+
+    info!("模式: 产业链联动分析");
+
+    // 涨停池获取使用阻塞 HTTP 客户端，须在进入 tokio 运行时之前完成
+    let analyzer = MarketAnalyzer::new(None)?;
+    let limit_ups = analyzer.get_limit_up_stocks()?;
+    info!("今日涨停池共 {} 只", limit_ups.len());
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    let report = runtime.block_on(
+        stock_analysis::pipeline::chain_analysis::run_chain_analysis(limit_ups, None),
+    )?;
+
+    let notifier = NotificationService::from_env();
+    let filename = format!("chain_analysis_{}.md", Local::now().format("%Y%m%d"));
+    let path = notifier.save_report_to_file(&report, Some(&filename))?;
+    info!("产业链联动分析报告已保存: {}", path);
+
+    if send_notify {
+        match runtime.block_on(notifier.send(&report)) {
+            Ok(true) => info!("产业链联动分析报告已推送"),
+            Ok(false) => log::warn!("产业链联动分析报告推送失败（所有渠道均未成功）"),
+            Err(e) => log::warn!("产业链联动分析报告推送异常: {}", e),
+        }
+    }
+    Ok(())
+}
+
 /// 龙虎榜选股分析模式。
 pub fn run_lhb_analysis(args: &Args) -> Result<()> {
     use stock_analysis::database::DatabaseManager;

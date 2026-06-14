@@ -99,6 +99,20 @@ impl SearchService {
         self.providers.iter().any(|p| p.is_available())
     }
 
+    /// 通用主题搜索：按 provider 优先级故障转移，返回首个成功结果。
+    pub async fn search_topic(&self, query: &str, max_results: usize) -> Vec<SearchResult> {
+        for provider in &self.providers {
+            if !provider.is_available() {
+                continue;
+            }
+            let resp = provider.search(query, max_results).await;
+            if resp.success && !resp.results.is_empty() {
+                return resp.results;
+            }
+        }
+        Vec::new()
+    }
+
     /// 搜索股票相关新闻（多维度扩展关键词）
     pub async fn search_stock_news(
         &self,

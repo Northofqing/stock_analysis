@@ -56,6 +56,11 @@ pub(super) async fn fetch_extra_context(
         }
     }
 
+    // 产业链主线归属（来自最近一次涨停主线聚类，chain_daily 表）
+    if let Some(chain_note) = chain_mainline_note(code) {
+        s.push_str(&chain_note);
+    }
+
     if s.trim().is_empty() {
         ExtraContext {
             section: None,
@@ -75,4 +80,25 @@ pub(super) async fn fetch_extra_context(
             },
         }
     }
+}
+
+/// 查询该股是否属于最近一次涨停主线聚类（chain_daily 表），是则返回提示片段。
+fn chain_mainline_note(code: &str) -> Option<String> {
+    let db = crate::database::DatabaseManager::get();
+    let rows = db.get_latest_chain_clusters();
+    for row in rows {
+        let codes: Vec<String> = serde_json::from_str(&row.stocks).unwrap_or_default();
+        if codes.iter().any(|c| c == code) {
+            let streak = db.get_chain_streak_days(&row.concept, 10).max(1);
+            return Some(format!(
+                "\n【产业链主线归属】该股属于 {} 涨停主线「{}」（簇内 {} 只涨停，近10日该主线上榜 {} 天）。\
+                 主线发酵期个股动量通常更强，但主线退潮时会被联动补跌，研判时请结合主线生命周期。\n",
+                row.date,
+                row.concept,
+                codes.len(),
+                streak
+            ));
+        }
+    }
+    None
 }

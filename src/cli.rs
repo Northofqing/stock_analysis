@@ -75,6 +75,10 @@ pub struct Args {
     #[arg(long, default_value = "60")]
     pub lhb_min_score: i32,
 
+    /// 产业链联动分析模式（聚类当日涨停股 → 产业链上下游定位与预期推演）
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub chain_analysis: bool,
+
     /// 启用 ReAct Agent 深度分析（在标准分析之外，对选定股票额外跑一遍带 Critic 复核的深研）
     #[arg(long, action = ArgAction::SetTrue)]
     pub deep_analysis: bool,
