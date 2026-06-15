@@ -696,6 +696,7 @@ async fn fetch_laggard_candidates(
             name: name.to_string(),
             change_pct: pct,
             price,
+            ..Default::default()
         });
     }
     out.sort_by(|a, b| b.change_pct.partial_cmp(&a.change_pct).unwrap_or(std::cmp::Ordering::Equal));
@@ -1748,8 +1749,8 @@ mod tests {
     fn test_build_report_with_scores() {
         let date = "2026-06-13";
         let stocks = vec![
-            TopStock { code: "000001".into(), name: "测试A".into(), change_pct: 10.0, price: 10.0 },
-            TopStock { code: "000002".into(), name: "测试B".into(), change_pct: 9.5, price: 20.0 },
+            TopStock { code: "000001".into(), name: "测试A".into(), change_pct: 10.0, price: 10.0, ..Default::default() },
+            TopStock { code: "000002".into(), name: "测试B".into(), change_pct: 9.5, price: 20.0, ..Default::default() },
         ];
         let cluster = ChainCluster {
             concept: "测试概念".into(),
@@ -1778,9 +1779,9 @@ mod tests {
     fn test_build_report_tier3_hot_list() {
         let date = "2026-06-13";
         let stocks = vec![
-            TopStock { code: "000001".into(), name: "小概念A".into(), change_pct: 10.0, price: 10.0 },
-            TopStock { code: "000002".into(), name: "小概念B".into(), change_pct: 9.0, price: 20.0 },
-            TopStock { code: "000003".into(), name: "小概念C".into(), change_pct: 8.0, price: 30.0 },
+            TopStock { code: "000001".into(), name: "小概念A".into(), change_pct: 10.0, price: 10.0, ..Default::default() },
+            TopStock { code: "000002".into(), name: "小概念B".into(), change_pct: 9.0, price: 20.0, ..Default::default() },
+            TopStock { code: "000003".into(), name: "小概念C".into(), change_pct: 8.0, price: 30.0, ..Default::default() },
         ];
         let cluster = ChainCluster {
             concept: "弱主线".into(),
@@ -1806,7 +1807,7 @@ mod tests {
     fn test_build_report_position_diag_with_scores() {
         let date = "2026-06-13";
         let stocks = vec![
-            TopStock { code: "000001".into(), name: "测试持仓".into(), change_pct: 10.0, price: 10.0 },
+            TopStock { code: "000001".into(), name: "测试持仓".into(), change_pct: 10.0, price: 10.0, ..Default::default() },
         ];
         let cluster = ChainCluster {
             concept: "电池技术".into(),

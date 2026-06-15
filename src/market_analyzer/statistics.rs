@@ -123,10 +123,10 @@ impl MarketAnalyzer {
                 name: name.clone(),
                 change_pct: *change_pct,
                 price: *price,
+                ..Default::default()
             }
         }).collect();
 
-        // 收集涨停股票列表
         overview.limit_up_stocks = limit_up_stocks.iter().map(|(code, name, change_pct, price)| {
             use crate::market_data::TopStock;
             TopStock {
@@ -134,6 +134,7 @@ impl MarketAnalyzer {
                 name: name.clone(),
                 change_pct: *change_pct,
                 price: *price,
+                ..Default::default()
             }
         }).collect();
 

@@ -258,7 +258,7 @@ fn get_with_fallback(client: &Client, params: &[(&str, &str)]) -> Result<Value> 
 ///
 /// 两路调用均请求完整字段集（涨幅/净流入 + 量比/换手 + 今日/5日主力净占比），
 /// 保证无论板块来自哪一路榜单都携带完整的领先信号，便于后续共振判定。
-fn fetch_board_ranking(fid: &str, top_n: usize) -> Result<Vec<ConceptBoard>> {
+pub fn fetch_board_ranking(fid: &str, top_n: usize) -> Result<Vec<ConceptBoard>> {
     let client = build_client()?;
     let pz = top_n.clamp(10, 200).to_string();
     let params: [(&str, &str); 11] = [

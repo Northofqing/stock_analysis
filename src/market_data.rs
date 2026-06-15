@@ -130,6 +130,25 @@ pub struct TopStock {
     pub change_pct: f64,
     /// 现价
     pub price: f64,
+    /// 量比（f10，>1表示放量）
+    #[serde(default)]
+    pub volume_ratio: f64,
+    /// 主力净流入 亿元（f62）
+    #[serde(default)]
+    pub main_net_yi: f64,
+}
+
+impl Default for TopStock {
+    fn default() -> Self {
+        Self {
+            code: String::new(),
+            name: String::new(),
+            change_pct: 0.0,
+            price: 0.0,
+            volume_ratio: 0.0,
+            main_net_yi: 0.0,
+        }
+    }
 }
 
 impl MarketOverview {

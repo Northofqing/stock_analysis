@@ -106,6 +106,8 @@ pub struct AlertDetail {
     pub main_flow_yi: Option<f64>,
     pub threshold: Option<f64>,
     pub news_title: Option<String>,
+    pub news_summary: Option<String>,
+    pub ai_decision: Option<String>,
     pub t1_locked: bool,
     pub extra: Option<String>,
 }
@@ -256,7 +258,8 @@ impl Detector {
                     price: None, change_pct: Some(idx.change_5min_pct),
                     volume_ratio: None, main_flow_yi: None,
                     threshold: Some(self.config.index_plunge_5min_pct),
-                    news_title: None, t1_locked: false, extra: None,
+                    news_title: None, news_summary: None, ai_decision: None,
+                    t1_locked: false, extra: None,
                 },
                 triggered_at: Local::now(),
             })
@@ -292,6 +295,7 @@ impl Detector {
                     price: None, change_pct: None, volume_ratio: None, main_flow_yi: None,
                     threshold: None,
                     news_title: Some(news.title.clone()),
+                    news_summary: None, ai_decision: None,
                     t1_locked: false,
                     extra: Some(format!("来源: {}", news.source)),
                 },
@@ -312,7 +316,9 @@ impl Detector {
                 message: format!("{} 产业链集中度 {:.0}% ≥ {:.0}%", chain, pct, threshold),
                 detail: AlertDetail {
                     price: None, change_pct: Some(pct), volume_ratio: None, main_flow_yi: None,
-                    threshold: Some(threshold), news_title: None, t1_locked: false, extra: None,
+                    threshold: Some(threshold), news_title: None,
+                    news_summary: None, ai_decision: None,
+                    t1_locked: false, extra: None,
                 },
                 triggered_at: Local::now(),
             })
@@ -335,6 +341,8 @@ impl Detector {
                 main_flow_yi: Some(s.main_net_yi),
                 threshold: None,
                 news_title: None,
+                news_summary: None,
+                ai_decision: None,
                 t1_locked: s.t1_locked,
                 extra: None,
             },

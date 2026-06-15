@@ -94,6 +94,23 @@ impl SearchService {
         }
     }
 
+    /// 获取原始快讯标题列表（供 NewsMonitor 路径A 使用）
+    pub async fn fetch_flash_titles(&self, limit: usize) -> Vec<String> {
+        let (jin10_res, wscn_res) = tokio::join!(
+            self.jin10.fetch_flash_news(limit, true),   // 标星快讯
+            self.wscn.fetch_live_news(limit),
+        );
+        let mut titles = Vec::new();
+        if let Ok(lst) = jin10_res {
+            for r in lst { titles.push(r.title); }
+        }
+        if let Ok(lst) = wscn_res {
+            for r in lst { titles.push(r.title); }
+        }
+        titles.truncate(limit);
+        titles
+    }
+
     /// 检查是否有可用的搜索引擎
     pub fn is_available(&self) -> bool {
         self.providers.iter().any(|p| p.is_available())

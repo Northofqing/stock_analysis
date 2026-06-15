@@ -2,6 +2,7 @@
 //!
 //! 提供多种数据源的统一接口
 
+pub mod announcement;
 pub mod chip_distribution;
 pub mod consensus;
 pub mod eastmoney_provider;
@@ -14,6 +15,7 @@ pub mod rustdx_provider;
 pub mod service;
 pub mod tushare_provider;
 pub mod valuation_history;
+pub mod yahoo;
 
 pub use chip_distribution::{
     compute_chip_distribution, format_for_prompt as format_chip_prompt, ChipDistribution,

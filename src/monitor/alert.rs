@@ -10,13 +10,23 @@ use log::{info, warn};
 /// 格式化告警事件为推送文本
 pub fn format_alert(event: &AlertEvent) -> String {
     let d = &event.detail;
-    let mut lines = vec![format!(
-        "{} 【{}】{}({})",
-        event.level.emoji(),
-        event.level.label(),
-        event.name,
-        event.code,
-    )];
+    let header = if event.code.is_empty() {
+        format!(
+            "{} 【{}】{}",
+            event.level.emoji(),
+            event.level.label(),
+            event.name,
+        )
+    } else {
+        format!(
+            "{} 【{}】{}({})",
+            event.level.emoji(),
+            event.level.label(),
+            event.name,
+            event.code,
+        )
+    };
+    let mut lines = vec![header];
     lines.push(format!("  {}", event.message));
 
     if let Some(price) = d.price {
@@ -26,16 +36,30 @@ pub fn format_alert(event: &AlertEvent) -> String {
         lines.push(format!("  涨跌：{:+.2}%", pct));
     }
     if let Some(flow) = d.main_flow_yi {
-        lines.push(format!("  主力净流入：{:+.2}亿", flow));
+        if flow.abs() > 0.001 {  // 0 表示数据缺失，不显示
+            lines.push(format!("  主力净流入：{:+.2}亿", flow));
+        }
     }
     if let Some(vr) = d.volume_ratio {
-        lines.push(format!("  量比：{:.1}", vr));
+        if vr > 0.01 {
+            lines.push(format!("  量比：{:.1}", vr));
+        }
     }
+    if let Some(summary) = &d.news_summary {
+        lines.push(format!("  📋 摘要：{}", summary));
+    }
+    if let Some(decision) = &d.ai_decision {
+        lines.push(format!("  🧠 AI研判：{}【AI研判-仅供参考】", decision));
+    }
+    // 快讯：显示标题（公告的标题已在 message 中，不重复）
     if event.category.key() == "flash_news" {
         if let Some(title) = &d.news_title {
             lines.push(format!("  快讯：{}", title));
         }
-        if let Some(extra) = &d.extra {
+    }
+    // extra 字段：公告快讯的命中信息 / 涨停股的主力排名和共振得分
+    if let Some(extra) = &d.extra {
+        if !extra.is_empty() && !extra.starts_with("AI推荐") && !extra.starts_with("AI影响评估") {
             lines.push(format!("  {}", extra));
         }
     }
@@ -174,6 +198,8 @@ mod tests {
                 main_flow_yi: Some(-0.5),
                 threshold: None,
                 news_title: None,
+                news_summary: None,
+                ai_decision: None,
                 t1_locked: t1,
                 extra: None,
             },
@@ -206,6 +232,64 @@ mod tests {
     #[test]
     fn test_aggregate_empty() {
         assert!(aggregate_alerts(&[]).is_none());
+    }
+
+    #[test]
+    fn test_format_announcement_no_kuai_label() {
+        // 公告(ChainRisk)不显示"快讯"标签，标题已在message中
+        let e = AlertEvent {
+            level: AlertLevel::Important,
+            category: AlertCategory::ChainRisk,
+            code: "002421".into(),
+            name: "达实智能".into(),
+            message: "[公告] 达实智能:关于股东股份解除质押的公告 | 标题含'质押'".into(),
+            detail: AlertDetail {
+                price: None, change_pct: None, volume_ratio: None,
+                main_flow_yi: None, threshold: None,
+                news_title: Some("达实智能:关于股东股份解除质押的公告".into()),
+                news_summary: Some("触发原因：标题含'质押'".into()),
+                ai_decision: None,
+                t1_locked: false,
+                extra: Some("命中: 达实智能(002421)".into()),
+            },
+            triggered_at: Local::now(),
+        };
+        let text = format_alert(&e);
+        // 不应出现"快讯"标签
+        assert!(!text.contains("快讯"));
+        // 应有摘要
+        assert!(text.contains("📋 摘要"));
+        // 应有命中
+        assert!(text.contains("命中:"));
+        // 应有公司名和代码
+        assert!(text.contains("达实智能"));
+        assert!(text.contains("002421"));
+    }
+
+    #[test]
+    fn test_format_flash_news_has_kuai_label() {
+        let e = AlertEvent {
+            level: AlertLevel::Info,
+            category: AlertCategory::FlashNews,
+            code: "002421".into(),
+            name: "达实智能".into(),
+            message: "快讯催化".into(),
+            detail: AlertDetail {
+                price: None, change_pct: None, volume_ratio: None,
+                main_flow_yi: None, threshold: None,
+                news_title: Some("低空经济新政发布".into()),
+                news_summary: None,
+                ai_decision: Some("关注低空产业链龙头".into()),
+                t1_locked: false,
+                extra: None,
+            },
+            triggered_at: Local::now(),
+        };
+        let text = format_alert(&e);
+        // 快讯应有"快讯"标签
+        assert!(text.contains("快讯"));
+        // 应有AI研判
+        assert!(text.contains("AI研判"));
     }
 
     #[test]

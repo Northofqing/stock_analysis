@@ -99,6 +99,8 @@ impl MarketAnalyzer {
                         name: stock_name.to_string(),
                         change_pct,
                         price,
+                        volume_ratio: 0.0,  // 新浪API无此字段
+                        main_net_yi: 0.0,
                     });
                 }
             }
@@ -136,13 +138,14 @@ impl MarketAnalyzer {
                 ("invt", "2"),
                 ("fid", "f3"),     // 按涨幅排序
                 ("fs", "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048"),
-                ("fields", "f2,f3,f12,f14"),
+                ("fields", "f2,f3,f10,f12,f14,f62"),
             ];
 
             let response = self.client
                 .get(url)
                 .query(&params)
                 .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+                .header("Referer", "https://quote.eastmoney.com/")
                 .timeout(Duration::from_secs(10))
                 .send()
                 .context("东方财富push2 API请求失败")?;
@@ -161,6 +164,8 @@ impl MarketAnalyzer {
                 let name = item.get("f14").and_then(|v| v.as_str()).unwrap_or("");
                 let change_pct = item.get("f3").and_then(|v| v.as_f64()).unwrap_or(0.0);
                 let price = item.get("f2").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let volume_ratio = item.get("f10").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let main_net_yi = item.get("f62").and_then(|v| v.as_f64()).unwrap_or(0.0) / 1e8;
 
                 if change_pct < min_pct {
                     min_pct = change_pct;
@@ -190,6 +195,8 @@ impl MarketAnalyzer {
                     name: name.to_string(),
                     change_pct,
                     price,
+                    volume_ratio,
+                    main_net_yi,
                 });
             }
 

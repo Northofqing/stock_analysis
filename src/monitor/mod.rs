@@ -26,4 +26,7 @@ pub mod checklist;
 pub mod prediction;
 pub mod adaptive;
 pub mod alert_log;
+pub mod entity_linker;
+pub mod news_monitor;
+pub mod news_ai;
 mod integration;

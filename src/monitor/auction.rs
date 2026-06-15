@@ -73,6 +73,8 @@ pub fn classify_auction(r: &AuctionResult, t1_locked: bool, gap_pct: f64, vol_ra
             main_flow_yi: None,
             threshold: Some(gap_pct),
             news_title: None,
+            news_summary: None,
+            ai_decision: None,
             t1_locked,
             extra: if r.suspected_fake {
                 Some("疑似虚假申报（诱多），该股买入信号降级".into())

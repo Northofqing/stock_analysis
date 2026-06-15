@@ -216,6 +216,7 @@ mod tests {
             detail: AlertDetail {
                 price: None, change_pct: None, volume_ratio: None,
                 main_flow_yi: None, threshold: None, news_title: None,
+                news_summary: None, ai_decision: None,
                 t1_locked: false, extra: None,
             },
             triggered_at: Local::now(),

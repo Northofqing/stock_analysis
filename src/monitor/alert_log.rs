@@ -116,6 +116,7 @@ mod tests {
                 price: Some(10.0), change_pct: Some(-3.0),
                 volume_ratio: None, main_flow_yi: Some(-0.5),
                 threshold: None, news_title: None,
+                news_summary: None, ai_decision: None,
                 t1_locked: false, extra: None,
             },
             triggered_at: Local::now(),
