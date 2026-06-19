@@ -1,10 +1,14 @@
 {
   "mcpServers": {
-    "wechat": {
-      "command": "bun",
+    "aiclaw": {
+      "command": "/Users/zhangzhen/Desktop/aiclaw/target/release/aiclaw",
       "args": [
-        "/Users/zhangzhen/Desktop/claude-code-wechat/wechat-channel.ts"
-      ]
+        "--mcp"
+      ],
+      "env": {
+        "WECHAT_CHANNEL_DIR": "/Users/zhangzhen/Desktop/Quant/stock_analysis/.claude/channels/wechat",
+        "RUST_LOG": "info"
+      }
     }
   }
 }

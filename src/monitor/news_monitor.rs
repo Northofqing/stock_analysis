@@ -1,14 +1,15 @@
 //! 消息监控中枢（Phase 1.5 独立子系统）。
 //!
 //! 与价格扫描器平级，共用 SignalStateMachine + AlertRouter。
-//! 运行窗口独立：盘前08:00-09:30、盘中09:30-15:00、盘后15:00-22:00。
+//! 运行窗口独立：消息通知时段可由 `config/monitor.toml` 配置，默认 08:00-22:00。
 //!
 //! 核心流程：采集 → 去重 → 实体关联 → 分类分级 → 衰减策略 → 告警
 
 use crate::data_provider::announcement::{self, AnnLevel};
 use crate::monitor::detector::{AlertCategory, AlertDetail, AlertEvent, AlertLevel};
 use crate::monitor::entity_linker::EntityLinker;
-use chrono::Local;
+use chrono::{Local, Timelike};
+use diesel::prelude::*;
 use log::info;
 use std::collections::HashSet;
 
@@ -72,12 +73,13 @@ impl NewsMonitor {
                 info!("[NewsMonitor] 注册 {} 只持仓股", positions.len());
             }
         }
-        // 加载 STOCK_LIST（即使无持仓也监控）
-        let stock_list = std::env::var("STOCK_LIST").unwrap_or_default();
+        // 加载自选股（即使无持仓也监控）
         let mut watchlist_count = 0;
-        for code in stock_list.split(',').map(|s| s.trim()).filter(|s| s.len() == 6) {
-            linker.register_position(code, &format!("股票{}", code));
-            watchlist_count += 1;
+        if let Ok(codes) = crate::portfolio::get_all_codes() {
+            for code in codes {
+                linker.register_position(&code, &format!("股票{}", code));
+                watchlist_count += 1;
+            }
         }
         if watchlist_count > 0 {
             info!("[NewsMonitor] 注册 {} 只自选股", watchlist_count);
@@ -88,10 +90,23 @@ impl NewsMonitor {
         }
     }
 
-    /// 新闻监控全天候运行，无时间窗口限制。
-    /// 新闻不挑时间——凌晨公告、周末突发事件同样需要响应。
+    /// 新闻监控运行窗口由 `config/monitor.toml` 控制，默认 08:00 — 22:00。
+    /// 覆盖盘前隔夜消息 + 盘中快讯 + 盘后公告高峰(21:00)。
     pub fn should_run() -> bool {
-        true
+        Self::should_run_at(Local::now().hour())
+    }
+
+    /// 可测试的窗口判断：按小时判断当前是否处于消息通知窗口。
+    pub fn should_run_at(hour: u32) -> bool {
+        let cfg = crate::config::get_monitor_config();
+        let start = u32::from(cfg.news_window_start_hour);
+        let end = u32::from(cfg.news_window_end_hour);
+
+        if start >= end {
+            return (8..22).contains(&hour);
+        }
+
+        hour >= start && hour < end
     }
 
     /// 处理已拉取的公告列表（去重+关联+分级，纯CPU无阻塞）
@@ -284,6 +299,49 @@ impl NewsMonitor {
     pub fn linker_mut(&mut self) -> &mut EntityLinker {
         &mut self.linker
     }
+
+    /// 将 seen_titles 批量写入 news_dedup 表，每 5 分钟调用一次
+    pub fn flush_dedup(&self) {
+        let db = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::database::DatabaseManager::get()
+        })) {
+            Ok(db) => db,
+            Err(_) => return,
+        };
+        let mut conn = match db.get_conn() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        for key in &self.seen_titles {
+            let sql = format!("INSERT OR IGNORE INTO news_dedup(key) VALUES ('{}')", key.replace('\'', "''"));
+            let _ = diesel::sql_query(&sql).execute(&mut *conn);
+        }
+    }
+
+    /// 启动时从 news_dedup 恢复今天的 seen_titles，清理过期 key
+    pub fn restore_dedup(&mut self) {
+        let db = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::database::DatabaseManager::get()
+        })) {
+            Ok(db) => db,
+            Err(_) => return,
+        };
+        let mut conn = match db.get_conn() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        // 恢复今天的 key
+        #[derive(QueryableByName, Debug)]
+        struct DedupKey { #[diesel(sql_type = diesel::sql_types::Text)] key: String }
+        let sql = format!("SELECT key FROM news_dedup WHERE created_at >= '{}'", today);
+        if let Ok(rows) = diesel::sql_query(&sql).load::<DedupKey>(&mut *conn) {
+            for r in rows { self.seen_titles.insert(r.key); }
+        }
+        // 清理非今天的过期 key
+        let _ = diesel::sql_query(&format!("DELETE FROM news_dedup WHERE created_at < '{}'", today))
+            .execute(&mut *conn);
+    }
 }
 
 /// L2 概念索引刷新（独立函数，在 spawn_blocking 中执行，避免 reqwest::blocking runtime 冲突）
@@ -404,6 +462,14 @@ mod tests {
     #[test]
     fn test_should_run_detects_session() {
         let _ = NewsMonitor::should_run(); // 不应 panic
+    }
+
+    #[test]
+    fn test_should_run_at_uses_configured_window() {
+        assert!(!NewsMonitor::should_run_at(7));
+        assert!(NewsMonitor::should_run_at(8));
+        assert!(NewsMonitor::should_run_at(21));
+        assert!(!NewsMonitor::should_run_at(22));
     }
 
     #[test]

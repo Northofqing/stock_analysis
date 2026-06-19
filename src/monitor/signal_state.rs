@@ -5,6 +5,7 @@
 
 use crate::monitor::detector::{AlertCategory, AlertEvent, AlertLevel};
 use chrono::{DateTime, Duration, Local};
+use diesel::prelude::*;
 use std::collections::HashMap;
 
 // ============================================================================
@@ -188,6 +189,88 @@ impl SignalStateMachine {
             self.daily_important_max.saturating_sub(self.daily_important_count),
             self.daily_info_max.saturating_sub(self.daily_info_count),
         )
+    }
+
+    /// 每 5 分钟将当前状态写入 signal_state 表
+    pub fn flush_state(&self) {
+        let db = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::database::DatabaseManager::get()
+        })) {
+            Ok(db) => db,
+            Err(_) => return,
+        };
+        let mut conn = match db.get_conn() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        for (key, entry) in &self.entries {
+            let sql = format!(
+                "INSERT OR REPLACE INTO signal_state(key, state, last_alert, last_change, daily_important_count, daily_info_count) \
+                 VALUES ('{}', '{}', '{}', '{}', {}, {})",
+                key.replace('\'', "''"),
+                match entry.state { SignalState::Idle => "idle", SignalState::Firing => "firing", SignalState::Cooldown => "cooldown" },
+                entry.last_alert.format("%Y-%m-%d %H:%M:%S"),
+                entry.last_change.format("%Y-%m-%d %H:%M:%S"),
+                self.daily_important_count, self.daily_info_count,
+            );
+            let _ = diesel::sql_query(&sql).execute(&mut *conn);
+        }
+    }
+
+    /// 启动时从 signal_state 恢复状态，清理过期数据
+    pub fn restore_state(&mut self) {
+        let db = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::database::DatabaseManager::get()
+        })) {
+            Ok(db) => db,
+            Err(_) => return,
+        };
+        let mut conn = match db.get_conn() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        #[derive(QueryableByName, Debug)]
+        struct StateRow {
+            #[diesel(sql_type = diesel::sql_types::Text)] key: String,
+            #[diesel(sql_type = diesel::sql_types::Text)] state: String,
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)] last_alert: Option<String>,
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)] last_change: Option<String>,
+            #[diesel(sql_type = diesel::sql_types::Integer)] daily_important_count: i32,
+            #[diesel(sql_type = diesel::sql_types::Integer)] daily_info_count: i32,
+        }
+        let sql = format!("SELECT key, state, last_alert, last_change, daily_important_count, daily_info_count FROM signal_state");
+        if let Ok(rows) = diesel::sql_query(&sql).load::<StateRow>(&mut *conn) {
+            for r in rows {
+                // 只恢复有 last_change 且是今天的
+                if let Some(ref lc) = r.last_change {
+                    if lc.starts_with(&today) {
+                        let state = match r.state.as_str() {
+                            "firing" => SignalState::Firing,
+                            "cooldown" => SignalState::Cooldown,
+                            _ => SignalState::Idle,
+                        };
+                        let now = chrono::Local::now();
+                        let entry = SignalEntry {
+                            state,
+                            last_alert: r.last_alert.as_ref().and_then(|s| {
+                                chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok()
+                                    .and_then(|t| t.and_local_timezone(chrono::Local).latest())
+                            }).unwrap_or(now),
+                            last_change: chrono::NaiveDateTime::parse_from_str(lc, "%Y-%m-%d %H:%M:%S").ok()
+                                .and_then(|t| t.and_local_timezone(chrono::Local).latest())
+                                .unwrap_or(now),
+                        };
+                        self.entries.insert(r.key, entry);
+                        self.daily_important_count = self.daily_important_count.max(r.daily_important_count as usize);
+                        self.daily_info_count = self.daily_info_count.max(r.daily_info_count as usize);
+                    }
+                }
+            }
+        }
+        // 清理非今天的
+        let _ = diesel::sql_query(&format!("DELETE FROM signal_state WHERE last_change IS NULL OR last_change < '{}'", today))
+            .execute(&mut *conn);
     }
 }
 

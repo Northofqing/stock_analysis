@@ -63,30 +63,126 @@ pub struct Announcement {
 // ── 标题关键词哨兵 ──
 
 const EMERGENCY_KEYWORDS: &[&str] = &[
-    "立案调查", "终止上市", "ST风险", "无法表示意见", "强制退市",
-    "暂停上市", "破产", "清算", "实际控制人失联",
+    // 监管立案与调查
+    "立案调查", "信息披露违法违规", "财务造假", "涉嫌信息披露违规",
+    "涉嫌操纵市场", "涉嫌内幕交易", "涉嫌欺诈发行",
+    // 退市相关
+    "终止上市", "强制退市", "退市整理期", "退市风险警示",
+    "面值退市", "交易类强制退市",
+    // ST风险
+    "ST风险", "被实施退市风险警示", "实施其他风险警示",
+    // 审计问题
+    "无法表示意见", "否定意见", "审计否定意见", "审计保留意见",
+    "否定意见的审计报告", "非标准审计意见",
+    // 破产/清算
+    "破产", "清算", "破产重整", "破产清算", "申请破产",
+    // 公司治理严重问题
+    "实际控制人失联", "实际控制人被", "违规担保",
+    "非经营性资金占用", "大股东占用资金", "资金占用",
+    // 债务违约
+    "债务违约", "债券违约", "实质性违约",
+    // 暂停上市
+    "暂停上市", "暂停交易",
+    // 重大违法
+    "重大违法违规", "重大违法强制退市",
+    // 交易所处分
+    "公开谴责", "通报批评",
 ];
 
 const IMPORTANT_KEYWORDS: &[&str] = &[
-    "减持", "问询函", "业绩预亏", "商誉减值", "重大诉讼",
-    "质押", "冻结", "监管函", "警示函", "责令改正",
+    // 减持相关（代码内置 <1% 过滤仅对"减持"生效）
+    "减持", "预减持", "减持计划", "减持结果",
+    // 监管问询与处分
+    "问询函", "关注函", "监管函", "警示函", "责令改正",
+    "监管问询", "行政监管措施", "行政处罚",
+    "立案告知书",
+    // 业绩负面
+    "业绩预亏", "业绩预减", "业绩修正", "业绩变脸",
+    "业绩下滑", "预计亏损", "净利润亏损",
+    // 资产减值
+    "商誉减值", "资产减值", "计提减值", "计提资产减值",
+    "信用减值", "存货跌价",
+    // 诉讼与司法
+    "重大诉讼", "诉讼", "仲裁",
+    "司法拍卖", "司法冻结", "轮候冻结",
+    "质押", "冻结",
+    // 重组负面（先于 Positive 的"重组/并购"被检查，避免误命中）
+    "重组终止", "重组失败", "重组暂停",
+    "终止重组", "终止筹划重组", "终止重大资产重组", "终止本次重组",
+    "终止发行", "终止本次发行",
+    "并购失败", "并购终止",
+    // 公司治理
+    "高管辞职", "总经理辞职", "财务负责人辞职",
+    "会计师事务所变更", "审计机构变更",
+    "独立董事辞职", "董事会秘书辞职",
+    // 债务与担保
+    "债务逾期", "借款逾期", "贷款逾期",
+    "对外担保", "担保逾期", "大额担保",
+    // 经营风险
+    "限售股解禁", "暂停生产", "停产",
+    "安全事故", "重大事故", "爆炸",
+    "环保处罚", "环保督察", "责令停产",
+    // 其他风险
+    "募集资金变更", "募投项目延期",
+    "控制权变更", "实际控制人变更",
+    "关联方占用", "违规关联交易",
 ];
 
 const POSITIVE_KEYWORDS: &[&str] = &[
-    "回购", "增持", "中标", "重组", "业绩预增", "高送转",
-    "重大合同", "战略合作", "获得批文",
+    // 回购与增持
+    "回购", "增持", "股份增持", "回购股份",
+    "回购方案", "回购注销",
+    // 分红与送转
+    "分红", "现金分红", "高分红", "派息", "高送转",
+    "高比例分红", "中期分红", "特别分红",
+    // 业绩利好
+    "业绩预增", "业绩预喜", "扭亏为盈", "扭亏",
+    "业绩快报", "业绩高增", "业绩大幅增长",
+    // 股权激励与员工持股
+    "股权激励", "限制性股票", "股票期权", "员工持股",
+    "员工持股计划", "股权激励计划",
+    // 订单与合同
+    "中标", "中标项目", "中标合同", "中标公告",
+    "重大合同", "签订合同", "获得订单",
+    // 战略合作
+    "战略合作", "战略合作框架", "战略合作协议",
+    // 重组与并购利好（Important 的"重组终止/失败"先检查，此处不再误命中）
+    "重组", "重大资产重组", "并购", "资产注入",
+    "借壳上市", "整体上市",
+    // 批文与新业务
+    "获得批文", "新产品获批", "新药获批", "获批上市",
+    "获得注册证", "产品获批", "临床试验获批",
+    // 定增与融资
+    "定增", "非公开发行", "募资", "再融资",
+    "引进战略投资者", "战投", "混改",
+    // 举牌与收购
+    "举牌", "要约收购", "收购完成",
+    // 产能与技术突破
+    "产能释放", "产能扩建", "投产", "竣工投产",
+    "技术突破", "重大突破",
+    // 业务拓展
+    "业务拓展", "海外布局", "国际化布局",
+    "签订协议", "战略协议",
 ];
 
 fn classify_title(title: &str, _code: &str, _name: &str) -> (AnnLevel, String) {
-    for kw in EMERGENCY_KEYWORDS {
-        if title.contains(kw) {
+    // 优先 toml 配置，不可用回退 const
+    let (emergency, important, positive) = if let Some(cfg) = crate::config::get_announce_keywords() {
+        (cfg.emergency, cfg.important, cfg.positive)
+    } else {
+        (EMERGENCY_KEYWORDS.iter().map(|s| s.to_string()).collect(),
+         IMPORTANT_KEYWORDS.iter().map(|s| s.to_string()).collect(),
+         POSITIVE_KEYWORDS.iter().map(|s| s.to_string()).collect())
+    };
+
+    for kw in &emergency {
+        if title.contains(kw.as_str()) {
             return (AnnLevel::Emergency, format!("标题含'{}'，直接告警", kw));
         }
     }
-    for kw in IMPORTANT_KEYWORDS {
-        if title.contains(kw) {
-            // 减持需要判断比例
-            if kw == &"减持" {
+    for kw in &important {
+        if title.contains(kw.as_str()) {
+            if kw == "减持" {
                 if let Some(pct) = extract_reduction_pct(title) {
                     if pct < 1.0 {
                         continue; // <1% 不算重要
@@ -96,8 +192,8 @@ fn classify_title(title: &str, _code: &str, _name: &str) -> (AnnLevel, String) {
             return (AnnLevel::Important, format!("标题含'{}'", kw));
         }
     }
-    for kw in POSITIVE_KEYWORDS {
-        if title.contains(kw) {
+    for kw in &positive {
+        if title.contains(kw.as_str()) {
             return (AnnLevel::Info, format!("利好: '{}'", kw));
         }
     }
@@ -259,5 +355,74 @@ mod tests {
     fn test_small_reduction_downgraded() {
         let (lvl, _) = classify_title("关于股东减持股份不超过0.5%的提示性公告", "000005", "测试");
         assert_eq!(lvl, AnnLevel::Skip); // <1% 不告警
+    }
+
+    #[test]
+    fn test_financial_fraud_emergency() {
+        let (lvl, _) = classify_title("关于收到证监会涉嫌财务造假立案调查通知书的公告", "000006", "测试");
+        assert_eq!(lvl, AnnLevel::Emergency);
+    }
+
+    #[test]
+    fn test_audit_denial_emergency() {
+        let (lvl, _) = classify_title("公司2025年度审计报告被出具否定意见", "000007", "测试");
+        assert_eq!(lvl, AnnLevel::Emergency);
+    }
+
+    #[test]
+    fn test_restructure_failure_important() {
+        // "重组终止" 必须在 Important 中被捕获，不能被 Positive 的 "重组" 误命中
+        let (lvl, reason) = classify_title("关于终止重大资产重组事项的公告", "000008", "测试");
+        assert_eq!(lvl, AnnLevel::Important);
+        assert!(reason.contains("重组"));
+    }
+
+    #[test]
+    fn test_restructure_plan_positive() {
+        // 真正的重组利好仍应命中 Positive
+        let (lvl, _) = classify_title("关于重大资产重组预案暨关联交易的公告", "000009", "测试");
+        assert_eq!(lvl, AnnLevel::Info);
+    }
+
+    #[test]
+    fn test_merger_failure_important() {
+        let (lvl, _) = classify_title("关于终止发行股份购买资产暨并购重组事项的公告", "000010", "测试");
+        assert_eq!(lvl, AnnLevel::Important);
+    }
+
+    #[test]
+    fn test_equity_incentive_positive() {
+        let (lvl, _) = classify_title("关于向激励对象授予限制性股票的公告", "000011", "测试");
+        assert_eq!(lvl, AnnLevel::Info);
+    }
+
+    #[test]
+    fn test_dividend_positive() {
+        let (lvl, _) = classify_title("2025年度利润分配及高比例现金分红方案公告", "000012", "测试");
+        assert_eq!(lvl, AnnLevel::Info);
+    }
+
+    #[test]
+    fn test_debt_default_emergency() {
+        let (lvl, _) = classify_title("关于公司债券发生实质性违约的公告", "000013", "测试");
+        assert_eq!(lvl, AnnLevel::Emergency);
+    }
+
+    #[test]
+    fn test_stake_acquisition_positive() {
+        let (lvl, _) = classify_title("关于股东权益变动暨举牌的提示性公告", "000014", "测试");
+        assert_eq!(lvl, AnnLevel::Info);
+    }
+
+    #[test]
+    fn test_executive_resign_important() {
+        let (lvl, _) = classify_title("关于公司总经理及财务负责人辞职的公告", "000015", "测试");
+        assert_eq!(lvl, AnnLevel::Important);
+    }
+
+    #[test]
+    fn test_production_halt_important() {
+        let (lvl, _) = classify_title("关于子公司发生安全事故暂停生产的公告", "000016", "测试");
+        assert_eq!(lvl, AnnLevel::Important);
     }
 }

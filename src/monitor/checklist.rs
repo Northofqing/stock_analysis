@@ -4,12 +4,13 @@
 //! 收盘 15:30: 市场概况 + 操作回顾 + 信号统计 + 明日预判
 
 use crate::calendar::{self, MarketSession};
+use crate::portfolio::Position;
 use chrono::Local;
 
 /// 盘前 Checklist
 pub fn build_pre_market_checklist(
-    positions: &[PositionSummary],
-    t1_unlocks: &[PositionSummary],
+    positions: &[Position],
+    t1_unlocks: &[Position],
     macro_events: &[String],
 ) -> String {
     let today = Local::now().format("%Y-%m-%d").to_string();
@@ -34,16 +35,16 @@ pub fn build_pre_market_checklist(
     // 持仓风险检查
     if !positions.is_empty() {
         lines.push("## 💰 持仓风险检查".into());
-        lines.push("| 代码 | 名称 | 现价 | 止损价 | 距离 | 状态 |".into());
-        lines.push("|------|------|------|--------|------|------|".into());
+        lines.push("| 代码 | 名称 | 成本 | 止损 | 距离 | 股数 | 状态 |".into());
+        lines.push("|------|------|------|------|------|------|------|".into());
         for p in positions {
-            let dist = if p.stop_loss > 0.0 {
-                format!("{:.1}%", (p.current_price - p.stop_loss) / p.current_price * 100.0)
+            let dist = if p.hard_stop > 0.0 && p.cost_price > 0.0 {
+                format!("{:.1}%", (p.cost_price - p.hard_stop) / p.cost_price * 100.0)
             } else { "-".into() };
-            let status = if p.t1_locked { "🔒 T+1" } else { "✅ 可用" };
+            let status = if crate::portfolio::is_t1_locked(&p.code) { "🔒 T+1" } else { "✅ 可用" };
             lines.push(format!(
-                "| {} | {} | {:.2} | {:.2} | {} | {} |",
-                p.code, p.name, p.current_price, p.stop_loss, dist, status
+                "| {} | {} | {:.2} | {:.2} | {} | {} | {} |",
+                p.code, p.name, p.cost_price, p.hard_stop, dist, p.shares, status
             ));
         }
         lines.push(String::new());
@@ -54,8 +55,8 @@ pub fn build_pre_market_checklist(
         lines.push("## ⚠️ T+1 解禁预警（今日可卖）".into());
         for p in t1_unlocks {
             lines.push(format!(
-                "- **{}({})** 现价 {:.2}，止损 {:.2}。今日竞价关注，如低开 >2% 建议挂单",
-                p.name, p.code, p.current_price, p.stop_loss
+                "- **{}({})** 成本 {:.2}，止损 {:.2}。今日竞价关注，如低开 >2% 建议挂单",
+                p.name, p.code, p.cost_price, p.hard_stop
             ));
         }
         lines.push(String::new());
@@ -80,7 +81,7 @@ pub fn build_close_summary(
     break_rate: f64,
     signals_today: usize,
     alerts_sent: usize,
-    t1_holdings: &[PositionSummary],
+    t1_holdings: &[Position],
 ) -> String {
     let today = Local::now().format("%Y-%m-%d").to_string();
     let mut lines = vec![
@@ -100,8 +101,8 @@ pub fn build_close_summary(
         lines.push("## ⚠️ T+1 冻结股明日预警".into());
         for p in t1_holdings {
             lines.push(format!(
-                "- **{}({})** 现价 {:.2}，止损 {:.2}。明日解禁，竞价关注",
-                p.name, p.code, p.current_price, p.stop_loss
+                "- **{}({})** 成本 {:.2}，止损 {:.2}。明日解禁，竞价关注",
+                p.name, p.code, p.cost_price, p.hard_stop
             ));
         }
         lines.push(String::new());
@@ -110,40 +111,6 @@ pub fn build_close_summary(
     lines.push("---".into());
     lines.push("*收盘总结由监控模块自动生成*".into());
     lines.join("\n")
-}
-
-/// 持仓摘要（用于 Checklist 和收盘总结）
-#[derive(Debug, Clone)]
-pub struct PositionSummary {
-    pub code: String,
-    pub name: String,
-    pub current_price: f64,
-    pub stop_loss: f64,
-    pub t1_locked: bool,
-}
-
-impl PositionSummary {
-    pub fn from_db() -> Vec<Self> {
-        let db = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::database::DatabaseManager::get()
-        })) {
-            Ok(db) => db,
-            Err(_) => return Vec::new(),
-        };
-        match db.get_all_open_positions() {
-            Ok(positions) => positions
-                .iter()
-                .map(|p| PositionSummary {
-                    code: p.code.clone(),
-                    name: p.name.clone(),
-                    current_price: 0.0,
-                    stop_loss: 0.0,
-                    t1_locked: false,
-                })
-                .collect(),
-            Err(_) => Vec::new(),
-        }
-    }
 }
 
 /// 获取当前时段该做什么
@@ -161,6 +128,20 @@ pub fn session_action() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::NaiveDate;
+
+    fn init_db() {
+        let _ = crate::database::DatabaseManager::init(Some(std::path::PathBuf::from("./test_data/test.db")));
+    }
+
+    fn pos(code: &str, name: &str, cost: f64, stop: f64) -> Position {
+        Position {
+            code: code.into(), name: name.into(), shares: 1000,
+            cost_price: cost, hard_stop: stop,
+            added_at: NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+            status: crate::portfolio::PositionStatus::Holding,
+        }
+    }
 
     #[test]
     fn test_pre_market_empty() {
@@ -171,10 +152,8 @@ mod tests {
 
     #[test]
     fn test_pre_market_with_positions() {
-        let positions = vec![PositionSummary {
-            code: "000001".into(), name: "测试".into(),
-            current_price: 10.0, stop_loss: 9.2, t1_locked: false,
-        }];
+        init_db();
+        let positions = vec![pos("000001", "测试", 10.0, 9.2)];
         let text = build_pre_market_checklist(&positions, &[], &[]);
         assert!(text.contains("000001"));
         assert!(text.contains("10.00"));
@@ -183,10 +162,8 @@ mod tests {
 
     #[test]
     fn test_pre_market_with_t1_unlocks() {
-        let t1 = vec![PositionSummary {
-            code: "000002".into(), name: "解禁股".into(),
-            current_price: 10.0, stop_loss: 9.0, t1_locked: true,
-        }];
+        init_db();
+        let t1 = vec![pos("000002", "解禁股", 10.0, 9.0)];
         let text = build_pre_market_checklist(&[], &t1, &[]);
         assert!(text.contains("T+1 解禁预警"));
         assert!(text.contains("解禁股"));
@@ -202,10 +179,8 @@ mod tests {
 
     #[test]
     fn test_close_summary_with_t1() {
-        let t1 = vec![PositionSummary {
-            code: "000001".into(), name: "冻结股".into(),
-            current_price: 10.0, stop_loss: 9.0, t1_locked: true,
-        }];
+        init_db();
+        let t1 = vec![pos("000001", "冻结股", 10.0, 9.0)];
         let text = build_close_summary(0.0, 0, 0, 0.0, 0, 0, &t1);
         assert!(text.contains("T+1 冻结股明日预警"));
     }

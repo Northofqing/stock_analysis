@@ -106,8 +106,8 @@ impl TieredScanner {
 
     /// 加载自选股为扫描目标
     pub fn load_watchlist(targets: &mut Vec<ScanTarget>) {
-        let list = std::env::var("STOCK_LIST").unwrap_or_default();
-        for code in list.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let codes = crate::portfolio::get_all_codes().unwrap_or_default();
+        for code in codes {
             if !targets.iter().any(|t| t.code == code) {
                 targets.push(ScanTarget {
                     code: code.to_string(), name: format!("股票{}", code),

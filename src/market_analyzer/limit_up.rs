@@ -121,37 +121,50 @@ impl MarketAnalyzer {
     pub(super) fn get_limit_up_from_eastmoney(&self) -> Result<Vec<crate::market_data::TopStock>> {
         use crate::market_data::TopStock;
 
-        let url = "https://push2.eastmoney.com/api/qt/clist/get";
+        // 多主机轮询（与 sector_monitor 一致，解决单主机 RST/断流）
+        const PUSH2_HOSTS: &[&str] = &[
+            "push2delay.eastmoney.com",
+            "push2.eastmoney.com",
+            "82.push2.eastmoney.com",
+        ];
         let mut stocks = Vec::new();
         let mut seen = std::collections::HashSet::new();
 
-        // 分页获取，ST涨停阈值5%排名靠后需翻页，最多取5页兜底
         for page in 1..=5 {
             let page_str = page.to_string();
             let params = [
                 ("pn", page_str.as_str()),
                 ("pz", "100"),
-                ("po", "1"),       // 降序
+                ("po", "1"),
                 ("np", "1"),
                 ("ut", "bd1d9ddb04089700cf9c27f6f7426281"),
                 ("fltt", "2"),
                 ("invt", "2"),
-                ("fid", "f3"),     // 按涨幅排序
+                ("fid", "f3"),
                 ("fs", "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048"),
                 ("fields", "f2,f3,f10,f12,f14,f62"),
             ];
 
-            let response = self.client
-                .get(url)
-                .query(&params)
-                .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
-                .header("Referer", "https://quote.eastmoney.com/")
-                .timeout(Duration::from_secs(10))
-                .send()
-                .context("东方财富push2 API请求失败")?;
-
-            let text = response.text().context("读取响应失败")?;
-            let json: Value = serde_json::from_str(&text).context("解析JSON失败")?;
+            let mut json: Option<Value> = None;
+            for host in PUSH2_HOSTS {
+                let url = format!("https://{}/api/qt/clist/get", host);
+                let resp = self.client.get(&url).query(&params)
+                    .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+                    .header("Referer", "https://quote.eastmoney.com/")
+                    .timeout(Duration::from_secs(10))
+                    .send();
+                match resp.and_then(|r| r.text()) {
+                    Ok(t) => match serde_json::from_str::<Value>(&t) {
+                        Ok(j) if j.get("data").is_some() => { json = Some(j); break; }
+                        _ => continue,
+                    },
+                    Err(_) => continue,
+                }
+            }
+            let json = match json {
+                Some(j) => j,
+                None => return Err(anyhow::anyhow!("东方财富push2 API所有主机请求失败")),
+            };
 
             let diff = match json.get("data").and_then(|d| d.get("diff")).and_then(|d| d.as_array()) {
                 Some(arr) if !arr.is_empty() => arr,

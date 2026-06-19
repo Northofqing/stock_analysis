@@ -601,7 +601,7 @@ fn score_board(dims: &[&'static str], b: &ConceptBoard, cfg: &LeadingConfig) -> 
 /// 从板块成份股计算点火广度（首板溢价的板块级代理）。
 ///
 /// 用各板涨跌停阈值判定涨停 / 接近涨停家数；不依赖涨停历史接口。
-fn compute_ignition(comps: &[BoardStock]) -> IgnitionStats {
+pub fn compute_ignition(comps: &[BoardStock]) -> IgnitionStats {
     let mut limit_up_count = 0usize;
     let mut near_limit_count = 0usize;
     for s in comps {

@@ -301,6 +301,64 @@ impl DatabaseManager {
         )
         .execute(&mut *conn)?;
 
+        // trades 表（v3 每笔买卖独立记录，与 stock_position 互补）
+        diesel::sql_query(
+            r#"
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                direction TEXT NOT NULL CHECK(direction IN ('buy', 'sell')),
+                price REAL NOT NULL,
+                shares INTEGER NOT NULL,
+                amount REAL NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                traded_at TEXT NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            "#,
+        )
+        .execute(&mut *conn)?;
+        diesel::sql_query(
+            "CREATE INDEX IF NOT EXISTS ix_trades_code ON trades(code)",
+        )
+        .execute(&mut *conn)?;
+
+        // ledger 表（v3 每日净值快照）
+        diesel::sql_query(
+            r#"
+            CREATE TABLE IF NOT EXISTS ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date TEXT NOT NULL UNIQUE,
+                total_value REAL NOT NULL,
+                cash REAL NOT NULL DEFAULT 0,
+                market_value REAL NOT NULL DEFAULT 0,
+                daily_pnl REAL NOT NULL DEFAULT 0,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            "#,
+        )
+        .execute(&mut *conn)?;
+
+        // v5 状态持久化：新闻去重
+        diesel::sql_query(
+            "CREATE TABLE IF NOT EXISTS news_dedup (key TEXT PRIMARY KEY, created_at TEXT NOT NULL DEFAULT (datetime('now')))",
+        ).execute(&mut *conn)?;
+
+        // v5 状态持久化：信号状态
+        diesel::sql_query(
+            r#"
+            CREATE TABLE IF NOT EXISTS signal_state (
+                key TEXT PRIMARY KEY,
+                state TEXT NOT NULL DEFAULT 'idle',
+                last_alert TEXT,
+                last_change TEXT,
+                daily_important_count INTEGER DEFAULT 0,
+                daily_info_count INTEGER DEFAULT 0
+            )
+            "#,
+        ).execute(&mut *conn)?;
+
         // 预测追踪表（Phase 5 预测闭环）
         diesel::sql_query(
             r#"

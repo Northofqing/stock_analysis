@@ -1,63 +1,151 @@
-Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-specific instructions as needed.
+# 项目规则
 
-**Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
-
-## 1. Think Before Coding
-
-**Don't assume. Don't hide confusion. Surface tradeoffs.**
-
-Before implementing:
-- State your assumptions explicitly. If uncertain, ask.
-- If multiple interpretations exist, present them - don't pick silently.
-- If a simpler approach exists, say so. Push back when warranted.
-- If something is unclear, stop. Name what's confusing. Ask.
-
-## 2. Simplicity First
-
-**Minimum code that solves the problem. Nothing speculative.**
-
-- No features beyond what was asked.
-- No abstractions for single-use code.
-- No "flexibility" or "configurability" that wasn't requested.
-- No error handling for impossible scenarios.
-- If you write 200 lines and it could be 50, rewrite it.
-
-Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
-
-## 3. Surgical Changes
-
-**Touch only what you must. Clean up only your own mess.**
-
-When editing existing code:
-- Don't "improve" adjacent code, comments, or formatting.
-- Don't refactor things that aren't broken.
-- Match existing style, even if you'd do it differently.
-- If you notice unrelated dead code, mention it - don't delete it.
-
-When your changes create orphans:
-- Remove imports/variables/functions that YOUR changes made unused.
-- Don't remove pre-existing dead code unless asked.
-
-The test: Every changed line should trace directly to the user's request.
-
-## 4. Goal-Driven Execution
-
-**Define success criteria. Loop until verified.**
-
-Transform tasks into verifiable goals:
-- "Add validation" → "Write tests for invalid inputs, then make them pass"
-- "Fix the bug" → "Write a test that reproduces it, then make it pass"
-- "Refactor X" → "Ensure tests pass before and after"
-
-For multi-step tasks, state a brief plan:
-```
-1. [Step] → verify: [check]
-2. [Step] → verify: [check]
-3. [Step] → verify: [check]
-```
-
-Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
+> 适用范围:实盘量化交易系统
+> 强制力分级:**MUST**(违反即阻断) / **SHOULD**(强烈建议) / **MAY**(可选)
+> 本文档为所有开发、审查、上线活动的最高约束。数据红线优先级高于一切流程。
 
 ---
 
-**These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
+## 0. 总则
+
+- **MUST** 本规则的每一条数据红线(第二部分)是开发流程(第一部分)每个阶段的验收项,二者不可割裂。
+- **MUST** 所有流程产物落地到 Git,以 PR 为载体,checklist 逐项勾选后方可合并。
+- **MUST** 任何规则冲突时,数据安全 > 资金安全 > 流程合规 > 开发效率。
+- **MAY** 紧急情况走"受控例外通道"(见第三部分),但必须留痕并事后复盘。
+
+---
+
+## 一、开发流程
+
+按序执行,**上一步未达成 Definition of Done(DoD)不进入下一步**。每步 DoD 即该步的合并 Gate。
+
+### 流程步骤与完成判定
+
+| 步骤 | 命令 / 动作 | Definition of Done(MUST 全部满足) |
+|------|------------|------------------------------------|
+| 1 | `/architecture-patterns` 设计方案文档落地 | 文档已提交且包含:① 数据流图 ② 失败模式分析(每个数据源失败如何处理)③ 回滚方案 ④ 与旧模块的关系说明 |
+| 2 | 量化产品经理、量化资深技术研发、量化交易分析师、量化DDD架构四角挑战方案,反哺给 1 | 四个角色各留书面意见;所有 **Blocking 异议**已闭环;退出条件见下方"收敛规则" |
+| 3 | `/project-planner` 拆分计划文档落地 | 每个任务可独立验收;依赖关系明确;每个任务标注涉及的数据红线 |
+| 4 | `/andrej-karpathy-skills:karpathy-guidelines` 按规则编码 | 通过 lint + 单测;**无 mock 残留于生产路径**;每个数据源失败路径有显式处理 |
+| 5 | `/review` 审查代码 | ① review 意见全部记录 ② **旧模块接入检查表逐项勾选**(见下)③ 数据红线检查表逐项勾选 |
+| 6 | 修复 review 问题 | 所有问题 resolved,或显式标注 `wontfix` + 理由并经审查者确认 |
+| 7 | 测试验证 | **单元测试行覆盖率 ≥ 80%**;核心交易 / 数据链路覆盖率 **≥ 95%**;回归通过;实盘数据校验通过;不通过按"根因回退"处理 |
+
+### 收敛规则(第 2 步)
+
+- **MUST** 四角挑战以"**无新增 Blocking 异议**"为退出条件。
+- **MUST** 单一方案挑战轮次上限 **3 轮**;第 3 轮后仍有 Blocking 异议则升级决策,不得无限循环。
+
+### 根因回退(第 7 步)
+
+测试不通过时,**MUST 按根因回退到对应步骤**,而非一律回第 4 步:
+
+| 失败根因 | 回退到 |
+|----------|--------|
+| 数据流 / 架构设计错误 | 步骤 1 |
+| 计划遗漏 / 任务拆分不当 | 步骤 3 |
+| 实现 bug | 步骤 4 |
+| 数据红线违规 | 步骤 4,并复查步骤 1 的失败模式分析 |
+
+### 旧模块接入检查表(第 5 步 · MUST)
+
+> 新能力上线后,**必须对照旧模块**,逐个回答,不得跳过。
+
+- [ ] 列出所有与新能力同类 / 相关的现有模块
+- [ ] 对每个旧模块回答:**是否应升级接入新能力?**
+  - 接入 → 记录接入计划 / PR
+  - 不接入 → 记录明确理由
+- [ ] 确认无"应接入却遗漏"的旧模块
+
+### 流程载体(MUST)
+
+- **MUST** 每步产出物作为 PR 的 checklist 项或关联文档。
+- **MUST** 合并需指定审查者批准;前 7 步证据可追溯。
+- **MUST** 设计 / 计划文档存于仓库固定目录 `docs/`,非聊天记录或临时文件。
+
+---
+
+## 二、真实数据(实盘红线)
+
+实盘交易系统。**所有数据必须是真实数据。** 本部分每一条均为 **MUST**,违反即阻断上线。
+
+### 2.1 数据来源
+
+- **MUST** 生产路径禁止 mock 数据。
+- **MUST** 持仓、交易、净值来自真实账户,不编造。
+- **MUST** 数据源失败显式报错,不降级到假数据。
+
+### 2.2 缺失数据
+
+- **MUST** 缺数据留空或打 warning,**不静默填充**。
+
+### 2.3 坏数据校验
+
+> 错误数据比缺失数据更危险——穿仓价、未除权历史价会直接让策略下错单。
+
+- **MUST** 数据进入计算前做校验:
+  - **数值范围检查**:价格 > 0;单笔相对上一有效值涨跌幅 **超过 ±20%(对应 A 股涨跌停上限缓冲)** 触发告警并人工确认
+  - **时间连续性检查**:相邻数据时间间隔异常(缺口或重复时间戳)触发报错
+  - **除权除息一致性检查**:复权前后价格序列连续,除权日跳变在预期范围内
+- **MUST** 坏数据与缺数据同等处理:**显式报错,不带病计算**。
+
+### 2.4 数据时效
+
+> "真实"还不够,还得"当下有效"。3 小时前的盘中快照就是错的。
+
+- **MUST** 净值、持仓、行情等带时间戳,使用前做新鲜度校验。
+- **MUST** 超过过期阈值的数据视同失败,显式报错,不沿用。过期阈值写死如下:
+
+  | 数据类型 | 过期阈值 |
+  |----------|----------|
+  | 实时行情(盘中) | **5 秒** |
+  | 持仓 / 资金 | **30 秒** |
+  | 净值 | **当日有效**(跨交易日即过期) |
+  | 日线 / 历史数据 | **1 个交易日** |
+
+### 2.5 测试与实盘隔离
+
+- **MUST** 测试用 `TEST_CODE` 前缀区分真实股票。
+- **MUST** **硬隔离,非仅约定**:
+  - 生产环境拒绝任何 `TEST_CODE` 标的
+  - 测试环境拒绝任何真实标的下单
+- **MUST** 测试账户与实盘账户物理隔离。
+
+### 2.6 写入 / 下单侧防护
+
+> 读取侧编造数据危险,写入侧(下单 / 撤单)出错更致命。
+
+- **MUST** 订单提交前做边界校验:
+  - 单笔金额 ≤ **账户可用资金**,且 ≤ **单笔上限 100 万元**
+  - 单笔数量 > 0 且为 **100 股整数倍**(A 股最小交易单位)
+  - 委托价格在当日 **涨跌停区间内**
+- **MUST** 下单具备幂等性,**同一业务订单号 60 秒内重复提交直接拒绝**。
+- **MUST** 单笔金额 ≥ **50 万元** 的订单需二次确认。
+
+### 2.7 审计与可追溯
+
+> 实盘出问题必须能复盘。
+
+- **MUST** 关键数据流与每一笔订单留痕:来源、时间、决策依据。
+- **MUST** 审计日志不可篡改,**保留期 ≥ 5 年**(满足监管留痕要求)。
+
+---
+
+## 三、受控例外通道
+
+> 实盘会遇到紧急情况(临时熔断、手工干预)。与其让人绕过规则,不如留一个**受控的口子**。
+
+- **MUST** 例外必须事先获得授权(指定审批人 / 角色)。
+- **MUST** 例外操作全程留痕:谁、何时、做了什么、为什么。
+- **MUST** 事后 **24 小时**内复盘,补齐对应流程或数据校验。
+- **MUST NOT** 以"紧急"为由跳过数据红线中的资金安全条款(2.1 / 2.5 / 2.6)。
+
+---
+
+## 附:强制力速查
+
+| 分级 | 含义 | 违反后果 |
+|------|------|----------|
+| **MUST** | 强制 | 阻断,不可合并 / 上线 |
+| **SHOULD** | 强烈建议 | 需记录偏离理由 |
+| **MAY** | 可选 | 自行裁量 |

@@ -10,7 +10,7 @@ use diesel::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::schema::{stock_daily, lhb_daily, analysis_result, stock_position};
+use crate::schema::{stock_daily, lhb_daily, analysis_result, stock_position, trades, ledger};
 
 // ============================================================================
 // 数据模型
@@ -334,4 +334,50 @@ pub struct NewStockPosition {
     pub buy_price: f64,
     pub quantity: i32,
     pub status: String,
+}
+
+// ============================================================================
+// v3: 交易记录 + 净值快照
+// ============================================================================
+
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, Deserialize)]
+#[diesel(table_name = trades)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct TradeRecord {
+    pub id: i32,
+    pub code: String,
+    pub name: String,
+    pub direction: String,
+    pub price: f64,
+    pub shares: i32,
+    pub amount: f64,
+    pub reason: String,
+    pub traded_at: String,
+    pub created_at: NaiveDateTime,
+}
+
+#[derive(Debug, Clone, Insertable)]
+#[diesel(table_name = trades)]
+pub struct NewTradeRecord {
+    pub code: String,
+    pub name: String,
+    pub direction: String,
+    pub price: f64,
+    pub shares: i32,
+    pub amount: f64,
+    pub reason: String,
+    pub traded_at: String,
+}
+
+#[derive(Debug, Clone, Queryable, Selectable, Serialize, Deserialize)]
+#[diesel(table_name = ledger)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+pub struct LedgerRecord {
+    pub id: i32,
+    pub date: String,
+    pub total_value: f64,
+    pub cash: f64,
+    pub market_value: f64,
+    pub daily_pnl: f64,
+    pub created_at: NaiveDateTime,
 }

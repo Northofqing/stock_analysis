@@ -1,0 +1,51 @@
+# 排除板块 — 一票否决，绝不关注
+
+[[boards]]
+name = "白酒"
+reason = "成熟天花板，缺乏弹性"
+keywords = ["白酒", "酿酒"]
+
+[[boards]]
+name = "猪肉"
+reason = "周期下行，产能过剩"
+keywords = ["猪肉", "养殖"]
+
+[[boards]]
+name = "房地产"
+reason = "行业下行，政策刺激持续性弱"
+keywords = ["房地产", "地产"]
+
+[[boards]]
+name = "光伏"
+reason = "产能过剩，价格战未结束"
+keywords = ["光伏"]
+
+[[boards]]
+name = "家电"
+reason = "增长见顶，缺乏弹性"
+keywords = ["家电"]
+
+[[boards]]
+name = "银行"
+reason = "成熟天花板"
+keywords = ["银行"]
+
+[[boards]]
+name = "证券"
+reason = "高度周期，难成主线"
+keywords = ["证券", "券商"]
+
+[[boards]]
+name = "军工"
+reason = "纯政策刺激，持续性弱"
+keywords = ["军工"]
+
+[[boards]]
+name = "煤炭"
+reason = "周期下行"
+keywords = ["煤炭"]
+
+[[boards]]
+name = "钢铁"
+reason = "产能过剩"
+keywords = ["钢铁"]

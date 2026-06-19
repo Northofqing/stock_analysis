@@ -1,5 +1,13 @@
 // A股自选股智能分析系统 - 库入口
 
+pub mod config;
+pub mod breakout;
+pub mod portfolio;
+pub mod review;
+pub mod signal;
+pub mod opportunity;
+pub mod decision;
+pub mod risk;
 pub mod traits;
 pub mod strategy;
 pub mod search_service;

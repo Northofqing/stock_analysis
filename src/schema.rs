@@ -82,9 +82,38 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    trades (id) {
+        id -> Integer,
+        code -> Text,
+        name -> Text,
+        direction -> Text,
+        price -> Double,
+        shares -> Integer,
+        amount -> Double,
+        reason -> Text,
+        traded_at -> Text,
+        created_at -> Timestamp,
+    }
+}
+
+diesel::table! {
+    ledger (id) {
+        id -> Integer,
+        date -> Text,
+        total_value -> Double,
+        cash -> Double,
+        market_value -> Double,
+        daily_pnl -> Double,
+        created_at -> Timestamp,
+    }
+}
+
 diesel::allow_tables_to_appear_in_same_query!(
     stock_daily,
     lhb_daily,
     analysis_result,
     stock_position,
+    trades,
+    ledger,
 );

@@ -46,11 +46,12 @@ impl EntityLinker {
         linker
     }
 
-    /// 从环境变量 STOCK_LIST 加载自选股
+    /// 从 portfolio 加载自选股
     fn load_from_env(&mut self) {
-        let list = std::env::var("STOCK_LIST").unwrap_or_default();
-        for code in list.split(',').map(|s| s.trim()).filter(|s| s.len() == 6) {
-            self.code_to_name.insert(code.to_string(), format!("股票{}", code));
+        if let Ok(codes) = crate::portfolio::get_all_codes() {
+            for code in codes {
+                self.code_to_name.insert(code.clone(), format!("股票{}", code));
+            }
         }
     }
 

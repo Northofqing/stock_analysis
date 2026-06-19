@@ -79,6 +79,10 @@ impl NewsAIAnalyzer {
     // 路径A：机会发现（entity_linker 候选池 → AI 打分）
     // ═══════════════════════════════════════════════════════════
 
+    /// **[已废弃 v8]** 机会发现已统一到 `opportunity::run_opportunity_scan`（单一发现器）。
+    /// 保留实现以备回滚，生产路径不再调用。
+    #[deprecated(note = "v8: 机会发现统一到 opportunity::run_opportunity_scan")]
+    #[allow(dead_code)]
     pub async fn discover_opportunities(&mut self, flash_titles: &[String]) -> Vec<AlertEvent> {
         if flash_titles.is_empty() || !self.available() { return vec![]; }
         if AI_TASK_RUNNING.swap(true, Ordering::SeqCst) {
@@ -128,6 +132,7 @@ impl NewsAIAnalyzer {
         })
     }
 
+    #[allow(dead_code)]
     fn parse_opportunities(&mut self, text: &str, candidates: &[&EntityHit]) -> Vec<AlertEvent> {
         let mut events = Vec::new();
         for line in text.lines() {
@@ -321,6 +326,7 @@ impl NewsAIAnalyzer {
         else { self.hallucination_count as f64 / self.total_code_outputs as f64 }
     }
 
+    #[allow(dead_code)]
     pub fn stats(&self) -> String {
         format!("AI分析 | 幻觉率:{:.0}%({}/{})",
             self.hallucination_rate() * 100.0, self.hallucination_count, self.total_code_outputs)
