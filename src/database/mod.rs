@@ -124,6 +124,21 @@ impl DatabaseManager {
         )
         .execute(&mut *conn)?;
 
+        // 主题新闻去同质化历史（跨重启持久化）
+        diesel::sql_query(
+            r#"
+            CREATE TABLE IF NOT EXISTS topic_novelty_history (
+                signature TEXT PRIMARY KEY,
+                created_at INTEGER NOT NULL
+            )
+            "#,
+        )
+        .execute(&mut *conn)?;
+        diesel::sql_query(
+            "CREATE INDEX IF NOT EXISTS ix_topic_novelty_created_at ON topic_novelty_history(created_at)",
+        )
+        .execute(&mut *conn)?;
+
         Ok(())
     }
 
@@ -468,6 +483,66 @@ impl DatabaseManager {
             Err(_) => Ok(0.0),
         }
     }
+
+    /// 保存主题签名用于去同质化（重复签名更新 created_at）
+    pub fn upsert_topic_history_signatures(
+        &self,
+        signatures: &[String],
+        max_rows: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if signatures.is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = self.get_conn()?;
+        let now_ts = chrono::Local::now().timestamp();
+
+        for sig in signatures {
+            if sig.is_empty() {
+                continue;
+            }
+            diesel::sql_query(
+                "INSERT INTO topic_novelty_history(signature, created_at) VALUES (?1, ?2) ON CONFLICT(signature) DO UPDATE SET created_at=excluded.created_at",
+            )
+            .bind::<diesel::sql_types::Text, _>(sig)
+            .bind::<diesel::sql_types::BigInt, _>(now_ts)
+            .execute(&mut *conn)?;
+        }
+
+        let keep = max_rows.max(50) as i64;
+        diesel::sql_query(
+            "DELETE FROM topic_novelty_history WHERE signature NOT IN (SELECT signature FROM topic_novelty_history ORDER BY created_at DESC LIMIT ?1)",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(keep)
+        .execute(&mut *conn)?;
+
+        Ok(())
+    }
+
+    /// 读取近窗期主题签名（按最新时间倒序）
+    pub fn get_recent_topic_history_signatures(
+        &self,
+        lookback_hours: u64,
+        limit: usize,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        #[derive(QueryableByName, Debug)]
+        struct SigRow {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            signature: String,
+        }
+
+        let mut conn = self.get_conn()?;
+        let since_ts = chrono::Local::now().timestamp() - (lookback_hours as i64 * 3600);
+        let lim = limit.max(20) as i64;
+        let rows = diesel::sql_query(
+            "SELECT signature FROM topic_novelty_history WHERE created_at >= ?1 ORDER BY created_at DESC LIMIT ?2",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(since_ts)
+        .bind::<diesel::sql_types::BigInt, _>(lim)
+        .load::<SigRow>(&mut *conn)?;
+
+        Ok(rows.into_iter().map(|r| r.signature).collect())
+    }
 }
 
 // 辅助数据结构
@@ -510,6 +585,58 @@ pub struct AnalysisContext {
 /// 获取数据库管理器实例的快捷方式
 pub fn get_db() -> &'static DatabaseManager {
     DatabaseManager::get()
+}
+
+// ============================================================================
+// P0-3: FactorIC 因子分析 — 已平仓交易 + 评分 JOIN
+// ============================================================================
+
+/// 因子 IC 分析的查询结果行 (公开类型, review 模块使用)
+#[derive(Debug, Clone)]
+pub struct FactorIcRow {
+    pub buy_price: f64,
+    pub sell_price: f64,
+    pub sentiment_score: Option<i32>,
+    pub score_breakdown_json: Option<String>,
+}
+
+/// Diesel 返回的内部行
+#[derive(QueryableByName, Debug)]
+struct FactorIcRowDb {
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    buy_price: f64,
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    sell_price: f64,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
+    sentiment_score: Option<i32>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    score_breakdown_json: Option<String>,
+}
+
+impl DatabaseManager {
+    /// 获取已平仓交易的因子分析数据。
+    /// 最多 500 条, 用于 `--review` 路径的因子 IC 诊断。
+    pub fn get_factor_ic_data(&self) -> Result<Vec<FactorIcRow>, Box<dyn std::error::Error>> {
+        let mut conn = self.pool.get()?;
+        let rows = diesel::sql_query(
+            "SELECT sp.buy_price, sp.sell_price, ar.sentiment_score, ar.score_breakdown_json
+             FROM stock_position sp
+             LEFT JOIN analysis_result ar ON sp.code = ar.code AND sp.buy_date = ar.date
+             WHERE sp.status = 'closed'
+               AND sp.buy_price > 0
+               AND sp.sell_price IS NOT NULL
+             ORDER BY sp.buy_date DESC
+             LIMIT 500"
+        )
+        .load::<FactorIcRowDb>(&mut conn)?;
+
+        Ok(rows.into_iter().map(|r| FactorIcRow {
+            buy_price: r.buy_price,
+            sell_price: r.sell_price,
+            sentiment_score: r.sentiment_score,
+            score_breakdown_json: r.score_breakdown_json,
+        }).collect())
+    }
 }
 
 #[cfg(test)]

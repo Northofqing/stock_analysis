@@ -7,6 +7,10 @@
 //! 依赖 .env 中 MONITOR_ENABLED=true
 
 use std::io::Write;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
 use stock_analysis::calendar::{self, current_session, is_market_active, MarketSession};
 use stock_analysis::monitor::detector::{AlertCategory, AlertDetail, AlertEvent, AlertLevel, Detector, DetectorConfig, StockSnapshot};
 use stock_analysis::monitor::signal_state::SignalStateMachine;
@@ -14,6 +18,38 @@ use stock_analysis::monitor::scanner::TieredScanner;
 use stock_analysis::monitor::checklist;
 use stock_analysis::monitor::prediction;
 use stock_analysis::monitor::alert;
+
+const DEFAULT_AICLAW_API_ADDR: &str = "127.0.0.1:18011";
+const DEFAULT_AICLAW_PROJECT_ID: &str = "stock_analysis";
+const DEFAULT_AICLAW_CLIENT_NAME: &str = "monitor";
+const DEFAULT_AICLAW_TOKEN_TTL_SECS: i64 = 7 * 24 * 3600;
+const DEFAULT_AICLAW_TOKEN_REFRESH_AHEAD_SECS: i64 = 10 * 60;
+
+static AICLAW_DAEMON_BOOT_LOCK: Lazy<tokio::sync::Mutex<()>> =
+    Lazy::new(|| tokio::sync::Mutex::new(()));
+static AICLAW_TOKEN_MEM_CACHE: Lazy<tokio::sync::RwLock<Option<CachedApiToken>>> =
+    Lazy::new(|| tokio::sync::RwLock::new(None));
+static AICLAW_TOKEN_ISSUE_LOCK: Lazy<tokio::sync::Mutex<()>> =
+    Lazy::new(|| tokio::sync::Mutex::new(()));
+static AICLAW_DISABLE_ENV_TOKEN: AtomicBool = AtomicBool::new(false);
+
+enum DaemonReadySource {
+    Reused,
+    StartedNow,
+}
+
+enum ApiTokenSource {
+    Env,
+    DynamicMemCache,
+    DynamicFileCache,
+    DynamicIssued,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct CachedApiToken {
+    token: String,
+    expires_at: Option<i64>,
+}
 
 fn main() {
     dotenvy::dotenv().ok();
@@ -55,52 +91,609 @@ fn check_enabled() -> bool {
 }
 
 async fn push_wechat(text: &str) {
-    // 通过 aiclaw send 发送微信消息。
-    // aiclaw 自动读取 ~/.claude/channels/wechat/account.json + context_tokens.json，
-    // 优先走 daemon HTTP API（127.0.0.1:18011），daemon 不可达时直连 ilink 协议。
-    //
-    // 环境变量（均可选）：
-    //   AICLAW_BIN          aiclaw 二进制路径，默认 ~/Desktop/aiclaw/target/release/aiclaw
-    //   WECHAT_CHANNEL_DIR  覆盖 ~/.claude/channels/wechat 目录
-    //   AICLAW_API_ADDR     daemon 地址，默认 127.0.0.1:18011
-    let aiclaw_bin = std::env::var("AICLAW_BIN").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_default();
-        format!("{}/Desktop/aiclaw/target/release/aiclaw", home)
-    });
-
     log::info!("[微信] 开始推送 ({}字)...", text.chars().count());
 
-    let mut cmd = tokio::process::Command::new(&aiclaw_bin);
-    cmd.arg("send").arg("--message").arg(text);
+    let aiclaw_bin = resolve_aiclaw_bin();
+    let api_addr = resolve_api_addr();
+    let api_base = to_api_base_url(&api_addr);
+    // 关键：daemon 在 127.0.0.1 回环上，必须 .no_proxy() 绕过系统代理(Clash/Surge)。
+    // 否则 macOS 系统代理会劫持本地请求并返回 503，导致健康检查恒失败、误判 daemon 不可用。
+    let client = match reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(std::time::Duration::from_secs(2))
+        .timeout(std::time::Duration::from_secs(30))
+        .build() {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("[微信] 创建 HTTP 客户端失败: {}", e);
+            return;
+        }
+    };
 
-    // 透传 aiclaw 所需的可选环境变量
-    if let Ok(dir) = std::env::var("WECHAT_CHANNEL_DIR") {
-        cmd.arg("--data-dir").arg(&dir);
-    }
-    if let Ok(addr) = std::env::var("AICLAW_API_ADDR") {
-        cmd.env("AICLAW_API_ADDR", addr);
+    match ensure_aiclaw_daemon(&client, &aiclaw_bin, &api_addr, &api_base).await {
+        Ok(DaemonReadySource::Reused) => {
+            log::info!("[微信] daemon 来源: 复用已有实例 | {}", api_addr);
+        }
+        Ok(DaemonReadySource::StartedNow) => {
+            log::info!("[微信] daemon 来源: 本次自动拉起 | {}", api_addr);
+        }
+        Err(e) => {
+            log::error!("[微信] daemon 不可用: {}", e);
+            return;
+        }
     }
 
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        cmd.output(),
-    ).await {
-        Err(_) => log::error!("[微信] 推送超时(>30s)"),
-        Ok(Ok(o)) => {
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            if o.status.success() {
-                log::info!("[微信] 推送成功 | {}", stdout.trim());
-                if !stderr.trim().is_empty() {
-                    log::debug!("[微信] stderr: {}", stderr.trim());
+    let (mut active_token, mut active_token_source) = match resolve_or_issue_api_token(&aiclaw_bin).await {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!("[微信] 获取 daemon 动态鉴权 token 失败: {}", e);
+            return;
+        }
+    };
+
+    let verify_result = verify_daemon_auth(&client, &api_base, &active_token, &active_token_source).await;
+    if let Err(first_err) = verify_result {
+        if is_unauthorized_error(&first_err) {
+            match issue_and_cache_dynamic_api_token(&aiclaw_bin).await {
+                Ok(next) => {
+                    log::warn!("[微信] daemon token 鉴权失败，已自动签发动态 token 并重试预检");
+                    if matches!(active_token_source, ApiTokenSource::Env) {
+                        AICLAW_DISABLE_ENV_TOKEN.store(true, Ordering::Relaxed);
+                    }
+                    active_token = next.token;
+                    active_token_source = ApiTokenSource::DynamicIssued;
+                    if let Err(e) = verify_daemon_auth(&client, &api_base, &active_token, &active_token_source).await {
+                        log::error!("[微信] daemon 鉴权预检失败: {}", e);
+                        return;
+                    }
+                }
+                Err(issue_err) => {
+                    log::error!("[微信] daemon 鉴权预检失败: {}；自动续签失败: {}", first_err, issue_err);
+                    return;
+                }
+            }
+        } else {
+            log::error!("[微信] daemon 鉴权预检失败: {}", first_err);
+            return;
+        }
+    }
+
+    let (to, context_token) = match resolve_wechat_target() {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!("[微信] 解析收件人失败: {}", e);
+            return;
+        }
+    };
+
+    match send_via_aiclaw_daemon(&client, &api_base, &active_token, &to, context_token.as_deref(), text).await {
+        Ok(_) => {
+            log::info!("[微信] 推送成功 | to={}", to);
+        }
+        Err(first_err) => {
+            if is_unauthorized_error(&first_err) {
+                match issue_and_cache_dynamic_api_token(&aiclaw_bin).await {
+                    Ok(next) => {
+                        log::warn!("[微信] daemon token 鉴权失败，已自动签发动态 token 并重试发送");
+                        if matches!(active_token_source, ApiTokenSource::Env) {
+                            AICLAW_DISABLE_ENV_TOKEN.store(true, Ordering::Relaxed);
+                        }
+                        match send_via_aiclaw_daemon(&client, &api_base, &next.token, &to, context_token.as_deref(), text).await {
+                            Ok(_) => log::info!("[微信] 推送成功 | to={}", to),
+                            Err(retry_err) => log::error!("[微信] 推送失败: {}", retry_err),
+                        }
+                    }
+                    Err(issue_err) => {
+                        log::error!("[微信] 推送失败: {}；自动续签失败: {}", first_err, issue_err);
+                    }
                 }
             } else {
-                log::error!("[微信] 推送失败 | exit={} | stdout: {} | stderr: {}",
-                    o.status, stdout.trim(), stderr.trim());
+                log::error!("[微信] 推送失败: {}", first_err);
             }
         }
-        Ok(Err(e)) => log::error!("[微信] 推送异常 (aiclaw: {}): {}", aiclaw_bin, e),
     }
+}
+
+fn resolve_aiclaw_bin() -> String {
+    std::env::var("AICLAW_BIN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_default();
+            format!("{}/Desktop/aiclaw/target/release/aiclaw", home)
+        })
+}
+
+fn resolve_api_addr() -> String {
+    std::env::var("AICLAW_API_ADDR")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_AICLAW_API_ADDR.to_string())
+}
+
+async fn resolve_or_issue_api_token(aiclaw_bin: &str) -> Result<(String, ApiTokenSource), String> {
+    if !AICLAW_DISABLE_ENV_TOKEN.load(Ordering::Relaxed) {
+        if let Some(token) = std::env::var("AICLAW_API_TOKEN")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()) {
+            return Ok((token, ApiTokenSource::Env));
+        }
+    }
+
+    if let Some(cached) = load_dynamic_token_from_mem_cache().await {
+        return Ok((cached.token, ApiTokenSource::DynamicMemCache));
+    }
+
+    if let Some(cached) = load_dynamic_token_from_file_cache() {
+        cache_dynamic_token_in_mem(&cached).await;
+        return Ok((cached.token, ApiTokenSource::DynamicFileCache));
+    }
+
+    let issued = issue_and_cache_dynamic_api_token(aiclaw_bin).await?;
+    Ok((issued.token, ApiTokenSource::DynamicIssued))
+}
+
+fn is_unauthorized_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("401") || lower.contains("unauthorized")
+}
+
+fn api_token_cache_file_path() -> std::path::PathBuf {
+    let db_path = std::env::var("DATABASE_PATH").unwrap_or_else(|_| "./data/stock_analysis.db".to_string());
+    let db_path = std::path::PathBuf::from(db_path);
+    let parent = db_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("./data"));
+    parent.join("aiclaw_api_token_cache.json")
+}
+
+fn now_epoch_secs() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+fn token_refresh_ahead_secs() -> i64 {
+    std::env::var("AICLAW_TOKEN_REFRESH_AHEAD_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .filter(|v| *v >= 0)
+        .unwrap_or(DEFAULT_AICLAW_TOKEN_REFRESH_AHEAD_SECS)
+}
+
+fn is_cached_token_expired(token: &CachedApiToken) -> bool {
+    match token.expires_at {
+        Some(ts) => ts <= now_epoch_secs() + token_refresh_ahead_secs(),
+        None => false,
+    }
+}
+
+async fn load_dynamic_token_from_mem_cache() -> Option<CachedApiToken> {
+    let guard = AICLAW_TOKEN_MEM_CACHE.read().await;
+    let v = guard.clone();
+    drop(guard);
+    v.filter(|t| !t.token.trim().is_empty() && !is_cached_token_expired(t))
+}
+
+fn load_dynamic_token_from_file_cache() -> Option<CachedApiToken> {
+    let path = api_token_cache_file_path();
+    let text = std::fs::read_to_string(path).ok()?;
+    let token = serde_json::from_str::<CachedApiToken>(&text).ok()?;
+    if token.token.trim().is_empty() || is_cached_token_expired(&token) {
+        return None;
+    }
+    Some(token)
+}
+
+async fn cache_dynamic_token_in_mem(token: &CachedApiToken) {
+    let mut guard = AICLAW_TOKEN_MEM_CACHE.write().await;
+    *guard = Some(token.clone());
+}
+
+fn cache_dynamic_token_in_file(token: &CachedApiToken) -> Result<(), String> {
+    let path = api_token_cache_file_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("创建 token 缓存目录失败({}): {}", parent.display(), e))?;
+    }
+    let text = serde_json::to_string(token)
+        .map_err(|e| format!("序列化 token 缓存失败: {}", e))?;
+    std::fs::write(&path, text)
+        .map_err(|e| format!("写入 token 缓存失败({}): {}", path.display(), e))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(&path, perms)
+            .map_err(|e| format!("设置 token 缓存文件权限失败({}): {}", path.display(), e))?;
+    }
+
+    Ok(())
+}
+
+fn parse_issue_token_output(stdout: &str) -> Result<CachedApiToken, String> {
+    let mut token: Option<String> = None;
+    let mut expires_at: Option<i64> = None;
+
+    for line in stdout.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("token=") {
+            let v = rest.trim();
+            if !v.is_empty() {
+                token = Some(v.to_string());
+            }
+            continue;
+        }
+
+        if line.contains("expires_at=") {
+            for part in line.split_whitespace() {
+                if let Some(raw) = part.strip_prefix("expires_at=") {
+                    if let Ok(ts) = raw.trim().parse::<i64>() {
+                        expires_at = Some(ts);
+                    }
+                }
+            }
+        }
+    }
+
+    let token = token.ok_or_else(|| format!("auth issue 输出缺少 token 字段: {}", stdout.trim()))?;
+    Ok(CachedApiToken { token, expires_at })
+}
+
+async fn issue_and_cache_dynamic_api_token(aiclaw_bin: &str) -> Result<CachedApiToken, String> {
+    let _issue_guard = AICLAW_TOKEN_ISSUE_LOCK.lock().await;
+
+    // 双检锁：等待锁期间可能已有其他协程签发并写入缓存。
+    if let Some(cached) = load_dynamic_token_from_mem_cache().await {
+        return Ok(cached);
+    }
+    if let Some(cached) = load_dynamic_token_from_file_cache() {
+        cache_dynamic_token_in_mem(&cached).await;
+        return Ok(cached);
+    }
+
+    let project_id = std::env::var("AICLAW_PROJECT_ID")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_AICLAW_PROJECT_ID.to_string());
+    let client_name = std::env::var("AICLAW_CLIENT_NAME")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("{}-{}", DEFAULT_AICLAW_CLIENT_NAME, std::process::id()));
+    let ttl_secs = std::env::var("AICLAW_TOKEN_TTL_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_AICLAW_TOKEN_TTL_SECS);
+
+    let output = tokio::process::Command::new(aiclaw_bin)
+        .arg("auth")
+        .arg("issue")
+        .arg("--project")
+        .arg(&project_id)
+        .arg("--name")
+        .arg(&client_name)
+        .arg("--scopes")
+        .arg("send,window_status")
+        .arg("--ttl-secs")
+        .arg(ttl_secs.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| format!("执行 aiclaw auth issue 失败: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if !output.status.success() {
+        let stderr_tail = tail_lines(&stderr, 8);
+        let stdout_tail = tail_lines(&stdout, 3);
+        return Err(format!(
+            "aiclaw auth issue 失败(exit={}): {}{}",
+            output.status,
+            if !stderr_tail.is_empty() { format!("stderr={}", stderr_tail) } else { "".to_string() },
+            if !stdout_tail.is_empty() { format!(" | stdout={}", stdout_tail) } else { "".to_string() }
+        ));
+    }
+
+    let issued = parse_issue_token_output(&stdout)?;
+    cache_dynamic_token_in_mem(&issued).await;
+    cache_dynamic_token_in_file(&issued)?;
+    Ok(issued)
+}
+
+fn to_api_base_url(api_addr: &str) -> String {
+    if api_addr.starts_with("http://") || api_addr.starts_with("https://") {
+        api_addr.trim_end_matches('/').to_string()
+    } else {
+        format!("http://{}", api_addr)
+    }
+}
+
+fn resolve_wechat_data_dir() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("WECHAT_CHANNEL_DIR") {
+        return std::path::PathBuf::from(dir);
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    std::path::Path::new(&home).join(".claude").join("channels").join("wechat")
+}
+
+#[derive(Deserialize)]
+struct WechatAccountFile {
+    #[serde(rename = "userId")]
+    user_id: Option<String>,
+}
+
+fn resolve_wechat_target() -> Result<(String, Option<String>), String> {
+    if let Ok(to) = std::env::var("WECHAT_TO") {
+        let to = to.trim();
+        if !to.is_empty() {
+            return Ok((to.to_string(), None));
+        }
+    }
+
+    let data_dir = resolve_wechat_data_dir();
+    let account_path = data_dir.join("account.json");
+    let ctx_path = data_dir.join("context_tokens.json");
+
+    let account_text = std::fs::read_to_string(&account_path)
+        .map_err(|e| format!("读取 account.json 失败({}): {}", account_path.display(), e))?;
+    let account: WechatAccountFile = serde_json::from_str(&account_text)
+        .map_err(|e| format!("解析 account.json 失败: {}", e))?;
+
+    let tokens_text = std::fs::read_to_string(&ctx_path).unwrap_or_else(|_| "{}".to_string());
+    let tokens: std::collections::HashMap<String, String> = serde_json::from_str(&tokens_text)
+        .map_err(|e| format!("解析 context_tokens.json 失败: {}", e))?;
+
+    let to = tokens.keys().next().cloned()
+        .or(account.user_id)
+        .ok_or_else(|| {
+            format!(
+                "未找到收件人：请先在微信给 bot 发消息，或设置 WECHAT_TO，目录={}",
+                data_dir.display()
+            )
+        })?;
+
+    let context_token = tokens.get(&to).cloned();
+    Ok((to, context_token))
+}
+
+async fn daemon_health_ok(client: &reqwest::Client, api_base: &str) -> bool {
+    let health_url = format!("{}/api/health", api_base);
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.get(&health_url).send(),
+    ).await;
+
+    match resp {
+        Ok(Ok(r)) => r.status().is_success(),
+        _ => false,
+    }
+}
+
+async fn ensure_aiclaw_daemon(
+    client: &reqwest::Client,
+    aiclaw_bin: &str,
+    api_addr: &str,
+    api_base: &str,
+) -> Result<DaemonReadySource, String> {
+    if daemon_health_ok(client, api_base).await {
+        return Ok(DaemonReadySource::Reused);
+    }
+
+    let _guard = AICLAW_DAEMON_BOOT_LOCK.lock().await;
+    if daemon_health_ok(client, api_base).await {
+        return Ok(DaemonReadySource::Reused);
+    }
+
+    let mut cmd = tokio::process::Command::new(aiclaw_bin);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("AICLAW_API_ADDR", api_addr);
+
+    if let Ok(dir) = std::env::var("WECHAT_CHANNEL_DIR") {
+        cmd.env("WECHAT_CHANNEL_DIR", dir);
+    }
+
+    let mut child = cmd.spawn()
+        .map_err(|e| format!("启动 aiclaw daemon 失败(aiclaw: {}): {}", aiclaw_bin, e))?;
+
+    for _ in 0..100 {
+        if daemon_health_ok(client, api_base).await {
+            return Ok(DaemonReadySource::StartedNow);
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let out = child.wait_with_output().await;
+                let extra = match out {
+                    Ok(o) => {
+                        let stdout = String::from_utf8_lossy(&o.stdout);
+                        let stderr = String::from_utf8_lossy(&o.stderr);
+                        if stderr.contains("another aiclaw instance is already running") {
+                            if daemon_health_ok(client, api_base).await {
+                                return Ok(DaemonReadySource::Reused);
+                            }
+                            return Err(
+                                "检测到 aiclaw 单实例锁冲突(data/aiclaw.instance.lock)，且当前端口不可用。请先结束旧的 aiclaw 进程后重试（可用: pgrep -af aiclaw / pkill -f '/aiclaw'）"
+                                    .to_string(),
+                            );
+                        }
+                        let stderr_tail = tail_lines(&stderr, 8);
+                        let stdout_tail = tail_lines(&stdout, 3);
+                        if !stderr_tail.is_empty() {
+                            format!(" | stderr_tail={}", stderr_tail)
+                        } else if !stdout_tail.is_empty() {
+                            format!(" | stdout_tail={}", stdout_tail)
+                        } else {
+                            String::new()
+                        }
+                    }
+                    Err(e) => format!(" | 获取 daemon 输出失败: {}", e),
+                };
+                return Err(format!(
+                    "daemon 进程提前退出(exit={})，请检查 AICLAW_BIN/AICLAW_API_ADDR/AICLAW_API_TOKEN 配置{}",
+                    status,
+                    extra
+                ));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                log::warn!("[微信] 检查 daemon 进程状态失败: {}", e);
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+
+    Err(format!(
+        "daemon 启动后健康检查超时: {} (等待30s)",
+        api_addr
+    ))
+}
+
+fn tail_lines(s: &str, n: usize) -> String {
+    let mut v: Vec<&str> = s.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if v.len() > n {
+        v = v.split_off(v.len() - n);
+    }
+    v.join(" | ")
+}
+
+async fn send_via_aiclaw_daemon(
+    client: &reqwest::Client,
+    api_base: &str,
+    api_token: &str,
+    to: &str,
+    context_token: Option<&str>,
+    text: &str,
+) -> Result<(), String> {
+    let url = format!("{}/api/send", api_base);
+    let mut body = serde_json::json!({
+        "to": to,
+        "text": text,
+    });
+    if let Some(token) = context_token {
+        if !token.trim().is_empty() {
+            body["context_token"] = serde_json::Value::String(token.to_string());
+        }
+    }
+
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        client
+            .post(&url)
+            .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", api_token))
+            .json(&body)
+            .send(),
+    ).await
+        .map_err(|_| "调用 /api/send 超时(>30s)".to_string())
+        .and_then(|r| r.map_err(|e| format!("调用 /api/send 失败: {}", e)))?;
+
+    let status = resp.status();
+    let text_body = resp.text().await.unwrap_or_default();
+    if status.is_success() {
+        let ok = serde_json::from_str::<serde_json::Value>(&text_body)
+            .ok()
+            .and_then(|v| v.get("ok").and_then(|x| x.as_bool()))
+            .unwrap_or(false);
+        if ok {
+            return Ok(());
+        }
+        return Err(format!("/api/send 返回非成功体: {}", text_body));
+    }
+
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(
+            "daemon 鉴权失败(401)：请确保 monitor 与 daemon 使用相同 AICLAW_API_TOKEN，并重启 daemon 使新 token 生效".to_string(),
+        );
+    }
+
+    if status == reqwest::StatusCode::PRECONDITION_FAILED
+        && text_body.contains("no valid context_token for peer") {
+        return Err(
+            "daemon 拒绝发送(412)：当前会话 context_token 无效。请先在微信给 bot 发一条消息刷新会话窗口后重试".to_string(),
+        );
+    }
+
+    Err(format!("/api/send HTTP {}: {}", status, text_body))
+}
+
+async fn verify_daemon_auth(
+    client: &reqwest::Client,
+    api_base: &str,
+    api_token: &str,
+    api_token_source: &ApiTokenSource,
+) -> Result<(), String> {
+    let url = format!("{}/api/window_status", api_base);
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client
+            .get(&url)
+            .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", api_token))
+            .send(),
+    ).await
+        .map_err(|_| "调用 /api/window_status 超时(>5s)".to_string())
+        .and_then(|r| r.map_err(|e| format!("调用 /api/window_status 失败: {}", e)))?;
+
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+
+    if status.is_success() {
+        // 微信推送窗口是「短时 + 限量」的:一条用户入站消息只开一个允许少量主动
+        // 推送的窗口,用完/过期后 peer token 变 stale(ret=-2),没有新入站消息就无法
+        // 刷新,此时 /api/send 会在 daemon 侧反复重试等待刷新而长时间阻塞。
+        // 这里在预检阶段拦截两种不可用状态,给出可操作提示,避免每条推送干等 30s:
+        //   1) peers 为空        → 从未建立会话窗口
+        //   2) 所有 peer 均 stale → 窗口已过期/用尽
+        let parsed = serde_json::from_str::<serde_json::Value>(&body).ok();
+        let peers = parsed
+            .as_ref()
+            .and_then(|v| v.get("peers"))
+            .and_then(|p| p.as_array());
+
+        if let Some(peers) = peers {
+            if peers.is_empty() {
+                return Err(
+                    "当前没有活跃微信会话窗口(peers 为空)。微信限制:bot 主动推送前需用户近期给 bot 发过消息。请先在微信给 bot 发一条任意消息刷新会话窗口后重试".to_string(),
+                );
+            }
+            let has_usable = peers.iter().any(|p| {
+                !p.get("stale").and_then(|s| s.as_bool()).unwrap_or(false)
+            });
+            if !has_usable {
+                return Err(
+                    "微信会话窗口已过期(peer 全部 stale=true)。窗口为短时+限量,需用户重新给 bot 发一条消息刷新后才能继续推送".to_string(),
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        let source_tip = match api_token_source {
+            ApiTokenSource::Env => {
+                "当前 monitor 使用环境变量 AICLAW_API_TOKEN，但 daemon 侧 token 不一致"
+            }
+            ApiTokenSource::DynamicMemCache | ApiTokenSource::DynamicFileCache | ApiTokenSource::DynamicIssued => {
+                "当前 monitor 使用动态 token(数据库签发)。可能该 token 已过期/被吊销，monitor 将自动续签"
+            }
+        };
+        return Err(format!(
+            "HTTP 401 unauthorized，{}",
+            source_tip
+        ));
+    }
+
+    Err(format!("/api/window_status HTTP {}: {}", status, body))
 }
 
 
@@ -284,6 +877,11 @@ async fn run_test_scan() {
     log::info!("[测试] ======== 全链路连通性检查完成 ========");
 }
 
+/// P0-3: AI 评分因子 IC 分析。读取已平仓交易 + 买入日评分，计算各因子的 IC/IR。
+fn run_factor_ic_analysis() -> Option<String> {
+    stock_analysis::review::factor_ic::run_diagnostic()
+}
+
 /// 手动复盘：`cargo run --bin monitor -- --review`
 async fn run_review_only() {
     log::info!("[复盘] 手动触发盘后分析...");
@@ -384,6 +982,11 @@ async fn run_review_only() {
     let falsify_text = stock_analysis::review::falsify::daily_falsify();
     log::info!("[复盘] 证伪提醒:\n{}", falsify_text);
     push_wechat(&falsify_text).await;
+
+    // P0-3: AI 评分因子 IC 分析
+    if let Some(ic_report) = run_factor_ic_analysis() {
+        log::info!("[复盘] 因子IC分析:\n{}", ic_report);
+    }
 
     log::info!("[复盘] ======== 盘后分析完成 ========");
 }

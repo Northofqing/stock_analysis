@@ -3,5 +3,29 @@
 screener_interval_min = 5
 opportunity_scan_interval_min = 10
 # 消息通知窗口（默认 08:00-24:00）
-news_window_start_hour = 7
+news_window_start_hour = 8
 news_window_end_hour = 22
+
+# 主题新闻去同质化配置（search_topic）
+topic_search_intent_count = 6
+topic_search_timeout_sec = 10
+topic_mmr_relevance_weight = 0.72
+topic_mmr_diversity_penalty = 2.2
+topic_mmr_history_penalty = 1.4
+topic_history_window_hours = 72
+topic_history_memory_size = 160
+topic_history_db_limit = 400
+
+# ── 实时否决链配置 (VetoChain) ──
+# SIGHUP 热加载。上线首周默认 dry_run，观察拦截率。
+[live_veto]
+enabled = true
+mode = "dry_run"              # "dry_run" | "live"
+bias_rate_enabled = true      # 乖离率拦截
+bearish_alignment_enabled = true  # 空头排列拦截
+main_flow_enabled = true      # 主力资金拦截
+fundamental_enabled = true    # 基本面恶化拦截
+
+# ── 动态仓位配置 ──
+[position_sizing]
+use_dynamic = true            # false = 回退到旧固定仓位算法

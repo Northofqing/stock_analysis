@@ -3,11 +3,21 @@
 //! 从 `AnalysisPipeline::process_stock_inner` 中抽离的独立子模块，
 //! 通过 `track_position` 入口执行：查持仓 → 应用铁律 → 平仓或开仓 →
 //! 回写结果字段。所有 DB 失败只记录 warn，不中断主流程。
+//!
+//! ## v2 风控统一 (P0-2)
+//!
+//! - 买入: PositionSizer::max_position() + MarketRegime 门控 (替代固定 position_shares)
+//! - 卖出: StopLoss::triggered() + check_stops() 三级止损 (替代硬编码 8%)
+//! - T+1: PositionType 锁仓检查
+//! - 保留铁律2/3/4/5 作为额外保护层
+//! - 配置 `[position_sizing] use_dynamic = false` 可回退到旧逻辑
 
 use log::{info, warn};
 
 use crate::database::DatabaseManager;
 use crate::data_provider::KlineData;
+use crate::monitor::risk::{MarketRegime, PositionSizer, PositionType, StopLoss};
+use crate::risk::stop_loss::check_stops;
 use crate::strategy::BollMacdAction;
 
 use super::AnalysisResult;
@@ -20,7 +30,34 @@ const SLIPPAGE_RATE: f64 = 0.001;
 const ROUND_TRIP_COST_PCT: f64 =
     (COMMISSION_RATE + SLIPPAGE_RATE + COMMISSION_RATE + STAMP_TAX_RATE + SLIPPAGE_RATE) * 100.0;
 
+// ============================================================================
+// RiskContext — 注入 position_tracker 的风控参数
+// ============================================================================
+
+/// 风控上下文，封装所有注入 position_tracker 的风控组件。
+pub struct RiskContext {
+    pub sizer: PositionSizer,
+    pub regime: MarketRegime,
+    /// ATR 用于动态止损 (若为 None 则回退到固定 8%)
+    pub atr: Option<f64>,
+    /// 是否启用动态仓位 (false → 回退到旧 position_shares)
+    pub use_dynamic: bool,
+}
+
+impl RiskContext {
+    pub fn from_env(regime: MarketRegime, atr: Option<f64>) -> Self {
+        let use_dynamic = crate::config::get_position_sizing_config().use_dynamic;
+        Self {
+            sizer: PositionSizer::from_env(),
+            regime,
+            atr,
+            use_dynamic,
+        }
+    }
+}
+
 /// 模拟账户总本金（元），由 `TOTAL_CAPITAL` 配置，默认 10 万。
+/// 保留用于 fallback 路径。
 fn total_capital() -> f64 {
     std::env::var("TOTAL_CAPITAL")
         .ok()
@@ -30,6 +67,7 @@ fn total_capital() -> f64 {
 }
 
 /// 最多同时持有的仓位数（决定单笔仓位预算），由 `MAX_POSITIONS` 配置，默认 5。
+/// 保留用于 fallback 路径。
 fn max_positions() -> usize {
     std::env::var("MAX_POSITIONS")
         .ok()
@@ -38,7 +76,8 @@ fn max_positions() -> usize {
         .unwrap_or(5)
 }
 
-/// 按本金计算买入股数：单笔预算 = 总本金 / 最大仓位数；A股按 100 股整数倍，至少 1 手。
+/// [fallback] 按本金计算买入股数：单笔预算 = 总本金 / 最大仓位数。
+/// use_dynamic=false 时使用此函数。
 fn position_shares(price: f64) -> i32 {
     if price <= 0.0 {
         return 100;
@@ -54,7 +93,12 @@ fn net_return_rate(gross_pct: f64) -> f64 {
 }
 
 /// 对单只股票跟踪模拟持仓并在满足条件时开/平仓。
-pub(super) fn track_position(code: &str, data: &[KlineData], result: &mut AnalysisResult) {
+pub(super) fn track_position(
+    code: &str,
+    data: &[KlineData],
+    result: &mut AnalysisResult,
+    risk_ctx: &RiskContext,
+) {
     let Ok(db) = std::panic::catch_unwind(|| DatabaseManager::get()) else {
         return;
     };
@@ -69,9 +113,34 @@ pub(super) fn track_position(code: &str, data: &[KlineData], result: &mut Analys
             result.position_return = Some(return_rate);
             result.position_quantity = Some(pos.quantity);
 
-            // ====== 四大铁律 + 布林上轨减仓 ======
-            // 铁律1 止损：亏损 ≥ 8%
-            let stop_loss = return_rate <= -8.0;
+            // ====== 卖出判断: ATR 动态止损 + 三级止损 + 铁律2/3/4/5 ======
+
+            // P0-2: ATR 动态止损替代硬编码 8%
+            let stop_loss = if let Some(atr) = risk_ctx.atr {
+                if atr > 0.0 {
+                    let sl = StopLoss::new(pos.buy_price, atr, result.ma20);
+                    sl.triggered(current_price)
+                } else {
+                    // ATR 异常 → 回退到固定 8%
+                    warn!("[{}] ATR 异常({})，回退到固定 8% 止损", code, atr);
+                    return_rate <= -8.0
+                }
+            } else {
+                // ATR 数据缺失 → 回退到固定 8%
+                return_rate <= -8.0
+            };
+
+            // P0-2: 三级止损补充检查
+            let tiered_stops = check_stops(
+                code,
+                &result.name,
+                current_price,
+                pos.buy_price,
+                pos.buy_price * 0.92, // hard stop = 买入价 × 0.92
+                result.ma20,
+                result.ma60,
+            );
+
             // 铁律2 盈利<20% 绝不主动止盈（不触发卖出）
             // 铁律3 盈利 ≥ 20% 后，跌破 5 日均线
             let profit_trend_exit = return_rate >= 20.0
@@ -83,24 +152,61 @@ pub(super) fn track_position(code: &str, data: &[KlineData], result: &mut Analys
                 buy.map(|b| (now - b).num_days()).unwrap_or(0)
             };
             let timeout_loss = hold_days > 14 && return_rate < 0.0;
-            // 铁律5（新）布林上轨减仓：触上轨 + MACD 顶背离/红柱缩短/死叉
-            //   仅在已有浮盈（≥ 5%）且非首日时触发，避免短期假信号洗票
+            // 铁律5 布林上轨减仓：触上轨 + MACD 顶背离/红柱缩短/死叉
             let bm_top_sell = matches!(
                 result.boll_macd.as_ref().map(|s| s.action),
                 Some(BollMacdAction::TopSell)
             ) && return_rate >= 5.0
                 && hold_days >= 2;
 
-            let should_sell = stop_loss || profit_trend_exit || timeout_loss || bm_top_sell;
+            // P0-2: T+1 锁仓检查
+            let t1_locked = {
+                let buy = chrono::NaiveDate::parse_from_str(&pos.buy_date, "%Y-%m-%d");
+                let now = chrono::Local::now().date_naive();
+                buy.is_ok() && buy.unwrap() == now
+            };
+
+            let should_sell = stop_loss || !tiered_stops.is_empty()
+                || profit_trend_exit || timeout_loss || bm_top_sell;
+
             if should_sell {
+                // T+1 锁仓: A股当日买入不可卖出, 阻止所有平仓操作
+                if t1_locked {
+                    let reason_str = if stop_loss || !tiered_stops.is_empty() {
+                        "止损信号"
+                    } else if profit_trend_exit {
+                        "铁律3:跌破5日线止盈"
+                    } else if bm_top_sell {
+                        "铁律5:布林上轨减仓"
+                    } else {
+                        "铁律4:14天换股"
+                    };
+                    warn!(
+                        "[{}] T+1锁仓无法卖出(原因: {}) — 建议次日竞价挂单",
+                        code, reason_str
+                    );
+                    result.position_status = Some("open".to_string());
+                    return;
+                }
+
                 let reason = if stop_loss {
-                    "铁律1:止损(-8%)"
+                    if risk_ctx.atr.unwrap_or(0.0) > 0.0 {
+                        let sl = StopLoss::new(pos.buy_price, risk_ctx.atr.unwrap_or(3.0), result.ma20);
+                        format!("ATR动态止损(有效止损价 {:.2})", sl.effective())
+                    } else {
+                        "铁律1:止损(-8%)".to_string()
+                    }
+                } else if !tiered_stops.is_empty() {
+                    tiered_stops.iter()
+                        .map(|s| s.level.label().to_string())
+                        .collect::<Vec<_>>()
+                        .join("+")
                 } else if profit_trend_exit {
-                    "铁律3:跌破5日线止盈"
+                    "铁律3:跌破5日线止盈".to_string()
                 } else if bm_top_sell {
-                    "铁律5:布林上轨+MACD顶背离/红柱衰竭"
+                    "铁律5:布林上轨+MACD顶背离/红柱衰竭".to_string()
                 } else {
-                    "铁律4:14天不涨换股"
+                    "铁律4:14天不涨换股".to_string()
                 };
                 let today = chrono::Local::now().format("%Y-%m-%d").to_string();
                 match db.close_position(pos.id, current_price, &today) {
@@ -140,6 +246,16 @@ pub(super) fn track_position(code: &str, data: &[KlineData], result: &mut Analys
             //   2) 布林+MACD `UptrendStart`（布林张口 + 0 轴上方金叉，主升浪）
             //   3) Contrarian 反向信号（评分 < 40 + 超跌企稳）
             // 误区拦截已下沉到 detect_boll_macd_signal —— 单纯触轨不会买。
+
+            // P0-2: MarketRegime 门控 — 崩盘禁止新买入
+            if !risk_ctx.regime.allow_new_position() {
+                info!(
+                    "[{}] MarketRegime::{:?} 禁止新买入，跳过",
+                    code, risk_ctx.regime
+                );
+                return;
+            }
+
             let bm_action = result
                 .boll_macd
                 .as_ref()
@@ -165,8 +281,28 @@ pub(super) fn track_position(code: &str, data: &[KlineData], result: &mut Analys
                 }
                 return;
             }
+
+            // P0-2: 动态仓位计算 (PositionSizer 替代固定 position_shares)
+            let shares = if risk_ctx.use_dynamic {
+                let volatility = result.volatility.unwrap_or(3.0);
+                let max_amount = risk_ctx.sizer.max_position(
+                    risk_ctx.regime,
+                    volatility,
+                    0,  // TODO: 产业链持仓计数 (后续迭代)
+                    0,  // TODO: 产业链冻结计数
+                    false, // already_held 在 DB 层已检查
+                );
+                if max_amount <= 0.0 {
+                    warn!("[{}] PositionSizer 返回 0 仓位，跳过买入", code);
+                    return;
+                }
+                let lots = (max_amount / current_price / 100.0).floor() as i32;
+                lots.max(1) * 100
+            } else {
+                position_shares(current_price)
+            };
+
             let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-            let shares = position_shares(current_price);
             let new_position = crate::models::NewStockPosition {
                 code: code.to_string(),
                 name: result.name.clone(),
@@ -183,6 +319,11 @@ pub(super) fn track_position(code: &str, data: &[KlineData], result: &mut Analys
                         (_, true) => "反向信号",
                         _ => "其他",
                     };
+                    let sizing_label = if risk_ctx.use_dynamic {
+                        format!("动态仓位({}股 ≈ {:.0}元)", shares, shares as f64 * current_price)
+                    } else {
+                        format!("{}股", shares)
+                    };
                     let extra = if !bm_reason.is_empty() {
                         format!(" | {}", bm_reason)
                     } else if let Some(r) = result.contrarian_reason.as_ref() {
@@ -191,13 +332,12 @@ pub(super) fn track_position(code: &str, data: &[KlineData], result: &mut Analys
                         String::new()
                     };
                     info!(
-                        "[{}] 触发{}（AI 评分 {}），模拟买入 {} 股 @ {:.2}（约 {:.0} 元）{}",
+                        "[{}] 触发{}（AI 评分 {}），模拟买入 {} @ {:.2}{}",
                         code,
                         tag,
                         result.sentiment_score,
-                        shares,
+                        sizing_label,
                         current_price,
-                        shares as f64 * current_price,
                         extra
                     );
                     result.position_buy_price = Some(current_price);

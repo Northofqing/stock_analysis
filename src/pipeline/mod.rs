@@ -20,6 +20,7 @@ mod veto_rules;
 
 pub use score_breakdown::ScoreBreakdown;
 pub use veto_rules::VetoOutcome;
+pub use position_tracker::RiskContext;
 
 use anyhow::{Context, Result};
 use futures::stream::{self, StreamExt};
@@ -684,65 +685,8 @@ impl AnalysisPipeline {
         }
 
         // // === 补充风控修正（核心拦截器，解决系统"精神分裂"问题）===
-        // // 1. 技术面极其危险的形态拦截：空头排列 / 乖离率极高
-        // use crate::trend_analyzer::{TrendStatus, BuySignal};
-        // if trend_result.bias_ma5 > 5.0 {
-        //     if trend_result.signal_score >= 60 {
-        //         trend_result.signal_score = 55;
-        //         trend_result.buy_signal = BuySignal::Hold;
-        //         trend_result.risk_factors.push("❌ 乖离率超5%有大幅回调风险，严禁追高，强制降级至观望".to_string());
-        //         info!("[{}] 触发风控拦截: 乖离率超5%，评分压至55", code);
-        //     }
-        // }
-        // if matches!(trend_result.trend_status, TrendStatus::StrongBear | TrendStatus::Bear) {
-        //     if trend_result.signal_score >= 60 {
-        //         trend_result.signal_score = 55;
-        //         trend_result.buy_signal = BuySignal::Hold;
-        //         trend_result.risk_factors.push("❌ 整体处于空头排列，极其弱势，放弃短线博弈避开接飞刀，强制降级至观望".to_string());
-        //         info!("[{}] 触发风控拦截: 空头排列，评分压至55", code);
-        //     }
-        // }
-
-        // // 2. 资金面拦截：主力大幅出逃严重/拉高出货诱多
-        // let svc = crate::data_provider::service::service();
-        // let flow_arc = svc.get_money_flow(code, 2).await;
-        // if let Some(last_day) = flow_arc.days.last() {
-        //     // 单日净流出 < -5000 万
-        //     if last_day.main_net < -50_000_000.0 {
-        //         if trend_result.signal_score >= 60 {
-        //             trend_result.signal_score = 55;
-        //             trend_result.buy_signal = BuySignal::Hold;
-        //             trend_result.risk_factors.push(format!("❌ 主力资金单日大幅流出({:.2}亿)，风险极高，强制取消买入建议", last_day.main_net / 1_0000_0000.0));
-        //             info!("[{}] 触发风控拦截: 主力大幅流出，评分压至55", code);
-        //         }
-        //     }
-        //     // 价涨量增但资金大幅流出（诱多）
-        //     if last_day.pct_chg > 4.0 && last_day.main_net < -10_000_000.0 {
-        //         if trend_result.signal_score >= 60 {
-        //             trend_result.signal_score = 55;
-        //             trend_result.buy_signal = BuySignal::Hold;
-        //             trend_result.risk_factors.push("❌ 股价大涨但主力净流出(典型诱多/拉高出货)，极其凶险，强制取消买入建议".to_string());
-        //             info!("[{}] 触发风控拦截: 价涨量缩/背离诱多，评分压至55", code);
-        //         }
-        //     }
-        // }
-
-        // // 3. 基本面拦截：严重亏损且高估或大幅衰退
-        // let pe = data[0].pe_ratio.unwrap_or(0.0);
-        // let net_profit_yoy = data[0].net_profit_yoy.unwrap_or(0.0);
-        // if (pe < 0.0 || pe > 300.0) && net_profit_yoy < -30.0 {
-        //     if trend_result.signal_score >= 60 {
-        //         trend_result.signal_score = 55;
-        //         trend_result.buy_signal = BuySignal::Hold;
-        //         trend_result.risk_factors.push("❌ 基本面极度恶化(业绩大幅下滑且估值畸高/亏损)，底线拦截取消买入".to_string());
-        //         info!("[{}] 触发风控拦截: 基本面极度恶化，评分压至55", code);
-        //     }
-        // }
-
-        // info!(
-        //     "[{}] 趋势: {}, 买入信号: {}, 评分: {}",
-        //     code, trend_result.trend_status, trend_result.buy_signal, trend_result.signal_score
-        // );
+        // // 已重构为 VetoChain 策略模式 (src/risk/veto_chain.rs + veto_rules_live.rs)
+        // // 现在在数据获取完成后执行（见下方 "VetoChain 实时否决" 区块）
 
         // 2. 技术分析 Markdown
         let mut analysis_content = technical_report::build_technical_markdown(&trend_result);
@@ -827,6 +771,66 @@ impl AnalysisPipeline {
                 }
                 None => Some(mtf_section),
             };
+        }
+
+        // ===== VetoChain 实时否决 (替代原注释代码 686-740, 已重构为策略模式) =====
+        // 执行时机: 数据全部获取后 → VetoChain → score_to_advice
+        // 与 veto_rules (Phase 1/3 估值否决) 互补: VetoChain 做技术/资金/基本面实时拦截
+        {
+            use crate::trend_analyzer::{BuySignal, TrendStatus};
+            let veto_config = crate::config::get_veto_config();
+            if let Some(chain) = crate::risk::veto_rules_live::build_chain(&crate::risk::veto_chain::VetoChainConfig {
+                enabled: veto_config.enabled,
+                mode: crate::risk::veto_chain::VetoMode::from_str(&veto_config.mode),
+                bias_rate_enabled: veto_config.bias_rate_enabled,
+                bearish_alignment_enabled: veto_config.bearish_alignment_enabled,
+                main_flow_enabled: veto_config.main_flow_enabled,
+                fundamental_enabled: veto_config.fundamental_enabled,
+            }) {
+                let is_buy = matches!(trend_result.buy_signal, BuySignal::StrongBuy | BuySignal::Buy);
+                let is_bearish = matches!(trend_result.trend_status, TrendStatus::StrongBear | TrendStatus::Bear);
+                let mf_days = money_flow_raw.as_ref().map(|mf| mf.days.clone());
+
+                let veto_ctx = crate::risk::veto_chain::VetoContext {
+                    code: code.to_string(),
+                    current_price: data[0].close,
+                    signal_score: trend_result.signal_score,
+                    is_buy_signal: is_buy,
+                    bias_ma5: trend_result.bias_ma5,
+                    is_bearish,
+                    money_flow_days: mf_days,
+                    pct_chg: Some(data[0].pct_chg),
+                    pe_ratio: data[0].pe_ratio,
+                    net_profit_yoy: data[0].net_profit_yoy,
+                };
+
+                let outcome = chain.evaluate_all(&veto_ctx);
+
+                if !outcome.is_empty() {
+                    match veto_config.mode.as_str() {
+                        "live" => {
+                            if outcome.force_hold && is_buy {
+                                trend_result.signal_score = 55;
+                                trend_result.buy_signal = BuySignal::Hold;
+                                for flag in &outcome.flags {
+                                    trend_result.risk_factors.push(flag.clone());
+                                }
+                                info!("[{}] 🛑 VetoChain[live] 拦截: force_hold, 评分压至55", code);
+                            } else if outcome.total_penalty != 0 {
+                                trend_result.signal_score =
+                                    (trend_result.signal_score + outcome.total_penalty).clamp(0, 100);
+                            }
+                        }
+                        _ => {
+                            // dry_run: 记录日志但不实际修改信号
+                            info!(
+                                "[{}] 🔍 VetoChain[dry_run] 触发: flags={:?} penalty={} force_hold={} — 未实际拦截",
+                                code, outcome.flags, outcome.total_penalty, outcome.force_hold
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         // 5. 评分→操作建议（与 AI 共用同一档位表）
@@ -1436,7 +1440,27 @@ impl AnalysisPipeline {
             .map(|v| v.to_lowercase() != "false")
             .unwrap_or(true);
         if position_tracking_enabled {
-            position_tracker::track_position(&code, &data, &mut result);
+            // P0-2: 构建 RiskContext 注入风控组件
+            let regime = {
+                // 从市场广度数据判定当前市场状态
+                // 若无法获取上涨家数占比，默认 Structural (中性)
+                crate::monitor::risk::classify_market(0.5, data[0].pct_chg)
+            };
+            // ATR: 近 14 日真实波幅均值 (若数据不足则取可用天数)
+            let atr = {
+                let ranges: Vec<f64> = data.iter()
+                    .take(14)
+                    .map(|d| d.high - d.low)
+                    .filter(|r| r.is_finite() && *r > 0.0)
+                    .collect();
+                if ranges.is_empty() {
+                    None
+                } else {
+                    Some(ranges.iter().sum::<f64>() / ranges.len() as f64)
+                }
+            };
+            let risk_ctx = position_tracker::RiskContext::from_env(regime, atr);
+            position_tracker::track_position(&code, &data, &mut result, &risk_ctx);
         }
 
         // 5. 保存分析结果到数据库
