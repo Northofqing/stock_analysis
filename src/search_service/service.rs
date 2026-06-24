@@ -1,9 +1,12 @@
 //! 搜索服务聚合器（原 search_service.rs 尾部）
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use log::{info, warn};
+
+use crate::config::get_monitor_config;
 
 use super::providers::{
     BochaSearchProvider, EastmoneyNewsProvider, Jin10CalendarEvent, Jin10Provider,
@@ -27,6 +30,15 @@ pub struct SearchService {
     wscn: WallStreetCnProvider,
     /// 金十数据直连（免费，快讯 + 财经日历）
     jin10: Jin10Provider,
+    /// 最近入选主题新闻标题特征（用于抑制重复推送）
+    recent_topic_signatures: Mutex<VecDeque<String>>,
+}
+
+#[derive(Clone, Copy)]
+struct TopicRerankParams {
+    relevance_weight: f32,
+    diversity_penalty: f32,
+    history_penalty: f32,
 }
 
 impl SearchService {
@@ -76,10 +88,14 @@ impl SearchService {
 
         info!("已启用 华尔街见闻 直连（免费，全球财经快讯）");
         info!("已启用 金十数据 直连（免费，快讯 + 财经日历）");
+        let cfg = get_monitor_config();
         Self {
             providers,
             wscn: WallStreetCnProvider::new(),
             jin10: Jin10Provider::new(),
+            recent_topic_signatures: Mutex::new(VecDeque::with_capacity(
+                cfg.topic_history_memory_size.max(50),
+            )),
         }
     }
 
@@ -116,18 +132,336 @@ impl SearchService {
         self.providers.iter().any(|p| p.is_available())
     }
 
-    /// 通用主题搜索：按 provider 优先级故障转移，返回首个成功结果。
+    /// 通用主题搜索（去同质化）：
+    /// 1) 单 query 自动扩展为多意图查询；
+    /// 2) 多 provider 聚合而非首个成功即返回；
+    /// 3) MMR 重排抑制相似标题；
+    /// 4) 参考近期已推送标题做新颖性惩罚。
     pub async fn search_topic(&self, query: &str, max_results: usize) -> Vec<SearchResult> {
-        for provider in &self.providers {
-            if !provider.is_available() {
-                continue;
-            }
-            let resp = provider.search(query, max_results).await;
-            if resp.success && !resp.results.is_empty() {
-                return resp.results;
+        if max_results == 0 {
+            return Vec::new();
+        }
+
+        let available: Vec<_> = self
+            .providers
+            .iter()
+            .filter(|p| p.is_available())
+            .collect();
+        if available.is_empty() {
+            return Vec::new();
+        }
+
+        let cfg = get_monitor_config();
+        let timeout_sec = cfg.topic_search_timeout_sec.max(3);
+        let intent_cap = usize::from(cfg.topic_search_intent_count.clamp(2, 8));
+        let rerank_params = Self::topic_rerank_params();
+
+        let expanded_queries = Self::build_topic_queries(query, max_results, intent_cap);
+        let per_provider_max = (max_results / 2).max(2).min(4);
+
+        let mut aggregated: Vec<SearchResult> = Vec::new();
+        for q in &expanded_queries {
+            for provider in &available {
+                let resp = match tokio::time::timeout(
+                    Duration::from_secs(timeout_sec),
+                    provider.search(q, per_provider_max),
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) => {
+                        warn!("[topic] {} 查询超时: {}", provider.name(), q);
+                        continue;
+                    }
+                };
+
+                if !resp.success || resp.results.is_empty() {
+                    continue;
+                }
+
+                for mut r in resp.results {
+                    // 统一补齐分析字段，便于后续打分。
+                    r.analyze_type();
+                    r.analyze_sentiment();
+                    r.calculate_importance();
+                    aggregated.push(r);
+                }
             }
         }
-        Vec::new()
+
+        if aggregated.is_empty() {
+            return Vec::new();
+        }
+
+        // 先做一次粗去重（URL + 标题签名），再做 MMR 多样性重排。
+        let mut seen_url: HashSet<String> = HashSet::new();
+        let mut seen_title_sig: HashSet<String> = HashSet::new();
+        aggregated.retain(|r| {
+            let title_sig = Self::normalize_text(&r.title);
+            if title_sig.is_empty() {
+                return false;
+            }
+            let url_ok = if r.url.trim().is_empty() {
+                true
+            } else {
+                seen_url.insert(r.url.clone())
+            };
+            let title_ok = seen_title_sig.insert(title_sig);
+            url_ok && title_ok
+        });
+
+        if aggregated.is_empty() {
+            return Vec::new();
+        }
+
+        let history = self.snapshot_recent_topic_signatures();
+        let reranked = Self::rerank_topic_results(
+            query,
+            aggregated,
+            &history,
+            max_results,
+            rerank_params,
+        );
+        self.remember_topic_results(&reranked);
+        reranked
+    }
+
+    fn build_topic_queries(query: &str, max_results: usize, intent_cap: usize) -> Vec<String> {
+        let base = query.trim();
+        if base.is_empty() {
+            return Vec::new();
+        }
+
+        let mut queries = vec![base.to_string()];
+        let intents = [
+            "政策 监管 会议 文件",
+            "产业链 上游 下游 供需 价格",
+            "公司 公告 订单 并购 合作",
+            "风险 减持 处罚 违约 诉讼",
+            "资金 北向 龙虎榜 主力",
+            "海外 美联储 美股 大宗商品 汇率",
+        ];
+
+        let max_intents = max_results.clamp(3, 6).min(intent_cap);
+        for intent in intents.iter().take(max_intents) {
+            queries.push(format!("{} {}", base, intent));
+        }
+
+        queries
+    }
+
+    fn rerank_topic_results(
+        query: &str,
+        candidates: Vec<SearchResult>,
+        history: &[String],
+        max_results: usize,
+        params: TopicRerankParams,
+    ) -> Vec<SearchResult> {
+        #[derive(Clone)]
+        struct Scored {
+            item: SearchResult,
+            base_score: f32,
+            signature: String,
+        }
+
+        let query_terms = Self::extract_query_terms(query);
+        let mut pool: Vec<Scored> = candidates
+            .into_iter()
+            .map(|item| {
+                let signature = Self::normalize_text(&format!("{} {}", item.title, item.snippet));
+                let lexical = Self::query_match_score(&signature, &query_terms);
+                let base_score = (item.importance as f32) * 0.45 + item.relevance * 5.0 + lexical * 2.5;
+                Scored {
+                    item,
+                    base_score,
+                    signature,
+                }
+            })
+            .collect();
+
+        let mut selected: Vec<Scored> = Vec::new();
+        while selected.len() < max_results && !pool.is_empty() {
+            let mut best_idx = 0usize;
+            let mut best_score = f32::MIN;
+
+            for (idx, cand) in pool.iter().enumerate() {
+                let sim_to_selected = selected
+                    .iter()
+                    .map(|s| Self::text_similarity(&cand.signature, &s.signature))
+                    .fold(0.0_f32, f32::max);
+                let sim_to_history = history
+                    .iter()
+                    .map(|h| Self::text_similarity(&cand.signature, h))
+                    .fold(0.0_f32, f32::max);
+
+                // MMR: 兼顾相关性与多样性，并额外惩罚近期重复主题。
+                let mmr_score = params.relevance_weight * cand.base_score
+                    - params.diversity_penalty * sim_to_selected
+                    - params.history_penalty * sim_to_history;
+                if mmr_score > best_score {
+                    best_score = mmr_score;
+                    best_idx = idx;
+                }
+            }
+
+            selected.push(pool.swap_remove(best_idx));
+        }
+
+        selected.into_iter().map(|s| s.item).collect()
+    }
+
+    fn snapshot_recent_topic_signatures(&self) -> Vec<String> {
+        let cfg = get_monitor_config();
+        let mut merged: Vec<String> = match self.recent_topic_signatures.lock() {
+            Ok(guard) => guard.iter().cloned().collect(),
+            Err(_) => Vec::new(),
+        };
+
+        let db_hist = std::panic::catch_unwind(|| crate::database::DatabaseManager::get())
+            .ok()
+            .and_then(|db| {
+                db.get_recent_topic_history_signatures(
+                    cfg.topic_history_window_hours.max(24),
+                    cfg.topic_history_db_limit.max(100),
+                )
+                .ok()
+            })
+            .unwrap_or_default();
+
+        if db_hist.is_empty() {
+            return merged;
+        }
+
+        let mut seen: HashSet<String> = merged.iter().cloned().collect();
+        for sig in db_hist {
+            if seen.insert(sig.clone()) {
+                merged.push(sig);
+            }
+        }
+        merged
+    }
+
+    fn remember_topic_results(&self, results: &[SearchResult]) {
+        let mut signatures: Vec<String> = results
+            .iter()
+            .map(|r| Self::normalize_text(&format!("{} {}", r.title, r.snippet)))
+            .filter(|s| !s.is_empty())
+            .collect();
+        if signatures.is_empty() {
+            return;
+        }
+
+        if let Ok(mut guard) = self.recent_topic_signatures.lock() {
+            for sig in signatures.drain(..) {
+                guard.push_back(sig);
+            }
+            let cap = get_monitor_config().topic_history_memory_size.max(50);
+            while guard.len() > cap {
+                let _ = guard.pop_front();
+            }
+        }
+
+        let cfg = get_monitor_config();
+        let to_store: Vec<String> = results
+            .iter()
+            .map(|r| Self::normalize_text(&format!("{} {}", r.title, r.snippet)))
+            .filter(|s| !s.is_empty())
+            .collect();
+        if to_store.is_empty() {
+            return;
+        }
+
+        let _ = std::panic::catch_unwind(|| crate::database::DatabaseManager::get())
+            .ok()
+            .and_then(|db| {
+                db.upsert_topic_history_signatures(&to_store, cfg.topic_history_db_limit.max(100))
+                    .ok()
+            });
+    }
+
+    fn topic_rerank_params() -> TopicRerankParams {
+        let cfg = get_monitor_config();
+        TopicRerankParams {
+            relevance_weight: cfg.topic_mmr_relevance_weight.clamp(0.1, 2.0),
+            diversity_penalty: cfg.topic_mmr_diversity_penalty.clamp(0.1, 5.0),
+            history_penalty: cfg.topic_mmr_history_penalty.clamp(0.0, 5.0),
+        }
+    }
+
+    fn extract_query_terms(query: &str) -> Vec<String> {
+        let mut terms: Vec<String> = query
+            .split_whitespace()
+            .map(Self::normalize_text)
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if terms.len() <= 1 {
+            let compact = Self::normalize_text(query);
+            if compact.chars().count() >= 2 {
+                // 中文查询常无空格，补充 2~4 字片段提升匹配鲁棒性。
+                let chars: Vec<char> = compact.chars().collect();
+                for size in [2_usize, 3, 4] {
+                    for w in chars.windows(size).take(10) {
+                        terms.push(w.iter().collect::<String>());
+                    }
+                }
+            }
+        }
+
+        terms.truncate(18);
+        terms
+    }
+
+    fn query_match_score(text: &str, query_terms: &[String]) -> f32 {
+        if query_terms.is_empty() || text.is_empty() {
+            return 0.0;
+        }
+        let hit = query_terms.iter().filter(|t| text.contains(t.as_str())).count();
+        hit as f32 / query_terms.len() as f32
+    }
+
+    fn normalize_text(text: &str) -> String {
+        text.chars()
+            .filter(|c| c.is_alphanumeric() || ('\u{4e00}'..='\u{9fff}').contains(c))
+            .flat_map(|c| c.to_lowercase())
+            .collect::<String>()
+    }
+
+    fn text_similarity(a: &str, b: &str) -> f32 {
+        if a.is_empty() || b.is_empty() {
+            return 0.0;
+        }
+        if a == b {
+            return 1.0;
+        }
+
+        let a_grams = Self::char_ngrams(a, 2);
+        let b_grams = Self::char_ngrams(b, 2);
+        if a_grams.is_empty() || b_grams.is_empty() {
+            return 0.0;
+        }
+
+        let inter = a_grams.intersection(&b_grams).count() as f32;
+        let union = a_grams.union(&b_grams).count() as f32;
+        if union == 0.0 {
+            0.0
+        } else {
+            inter / union
+        }
+    }
+
+    fn char_ngrams(text: &str, n: usize) -> HashSet<String> {
+        let chars: Vec<char> = text.chars().collect();
+        if chars.is_empty() {
+            return HashSet::new();
+        }
+        if chars.len() < n {
+            return [text.to_string()].into_iter().collect();
+        }
+        chars
+            .windows(n)
+            .map(|w| w.iter().collect::<String>())
+            .collect()
     }
 
     /// 搜索股票相关新闻（多维度扩展关键词）

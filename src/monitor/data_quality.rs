@@ -15,6 +15,9 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
+use crate::calendar;
+use crate::data_provider::KlineData;
+
 // ============================================================================
 // 质量检查结果
 // ============================================================================
@@ -31,6 +34,25 @@ pub enum DqRejectReason {
     ExRights,
     /// 价格不合理（零、负、涨跌幅超限）
     UnreasonablePrice { price: f64, last_close: f64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreshnessDataType {
+    Quote,
+    Position,
+    Nav,
+    Daily,
+}
+
+impl FreshnessDataType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FreshnessDataType::Quote => "quote",
+            FreshnessDataType::Position => "position",
+            FreshnessDataType::Nav => "nav",
+            FreshnessDataType::Daily => "daily",
+        }
+    }
 }
 
 impl DqRejectReason {
@@ -212,6 +234,89 @@ impl Default for DqConfig {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct FreshnessConfig {
+    pub quote_max_age_secs: u64,
+    pub position_max_age_secs: u64,
+    pub nav_max_age_secs: u64,
+    pub daily_max_age_secs: u64,
+}
+
+impl FreshnessConfig {
+    pub fn max_age_secs(&self, data_type: FreshnessDataType) -> u64 {
+        match data_type {
+            FreshnessDataType::Quote => self.quote_max_age_secs,
+            FreshnessDataType::Position => self.position_max_age_secs,
+            FreshnessDataType::Nav => self.nav_max_age_secs,
+            FreshnessDataType::Daily => self.daily_max_age_secs,
+        }
+    }
+}
+
+impl Default for FreshnessConfig {
+    fn default() -> Self {
+        Self {
+            quote_max_age_secs: 5,
+            position_max_age_secs: 30,
+            nav_max_age_secs: 24 * 3600,
+            daily_max_age_secs: 24 * 3600,
+        }
+    }
+}
+
+pub fn validate_freshness(
+    data_type: FreshnessDataType,
+    update_time: DateTime<Local>,
+    freshness: &FreshnessConfig,
+    stats: &DqStats,
+) -> Result<(), DqRejectReason> {
+    stats.total_ticks.fetch_add(1, Ordering::Relaxed);
+    let max_secs = freshness.max_age_secs(data_type);
+    let age_secs = Local::now()
+        .signed_duration_since(update_time)
+        .num_seconds()
+        .max(0) as u64;
+    if age_secs > max_secs {
+        stats.rejected_stale.fetch_add(1, Ordering::Relaxed);
+        return Err(DqRejectReason::Stale { age_secs, max_secs });
+    }
+    stats.passed.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
+pub fn validate_daily_freshness(
+    data_date: NaiveDate,
+    now: DateTime<Local>,
+    freshness: &FreshnessConfig,
+    stats: &DqStats,
+) -> Result<(), DqRejectReason> {
+    stats.total_ticks.fetch_add(1, Ordering::Relaxed);
+    let today = now.date_naive();
+    let mut effective_today = today;
+    if !calendar::is_trading_day(today) {
+        effective_today = calendar::prev_trading_day(today);
+    }
+    if data_date > effective_today {
+        stats.rejected_stale.fetch_add(1, Ordering::Relaxed);
+        return Err(DqRejectReason::Stale {
+            age_secs: 0,
+            max_secs: freshness.daily_max_age_secs,
+        });
+    }
+    let max_trading_days = (freshness.daily_max_age_secs / (24 * 3600)).max(1) as usize;
+    let allowed_dates = calendar::recent_trading_days(effective_today, max_trading_days + 1);
+    if !allowed_dates.contains(&data_date) {
+        let age_secs = (effective_today - data_date).num_days().max(0) as u64 * 24 * 3600;
+        stats.rejected_stale.fetch_add(1, Ordering::Relaxed);
+        return Err(DqRejectReason::Stale {
+            age_secs,
+            max_secs: freshness.daily_max_age_secs,
+        });
+    }
+    stats.passed.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
 /// 主校验函数：对每个 tick 过五道门。
 /// 返回 Ok(()) 表示通过，Err(reason) 表示被拒绝。
 pub fn validate_tick(tick: &Tick, prev: Option<&PrevTick>, config: &DqConfig, stats: &DqStats) -> Result<(), DqRejectReason> {
@@ -284,10 +389,59 @@ pub fn quick_validate(tick: &Tick, config: &DqConfig) -> Result<(), DqRejectReas
     validate_tick(tick, None, config, &stats)
 }
 
+/// 日线最小质检：OHLC 一致性 + 开盘跳空异常。
+///
+/// - OHLC 一致性：`high >= max(open, close)` 且 `low <= min(open, close)` 且 `high >= low`
+/// - 跳空异常：相邻交易日 `open` 相对前一日 `close` 的绝对跳变超过阈值
+///
+/// 返回 Err(原因) 表示应阻断后续分析。
+pub fn validate_daily_kline_quality(kline: &[KlineData], max_gap_pct: f64) -> Result<(), String> {
+    if kline.is_empty() {
+        return Err("日线数据为空".to_string());
+    }
+
+    let mut bars: Vec<&KlineData> = kline.iter().collect();
+    bars.sort_by_key(|k| k.date);
+
+    for b in &bars {
+        if !b.open.is_finite() || !b.high.is_finite() || !b.low.is_finite() || !b.close.is_finite() {
+            return Err(format!("{} 存在 NaN/Inf 价格字段", b.date));
+        }
+        if b.open <= 0.0 || b.high <= 0.0 || b.low <= 0.0 || b.close <= 0.0 {
+            return Err(format!("{} 存在非正价格（open/high/low/close）", b.date));
+        }
+        let max_oc = b.open.max(b.close);
+        let min_oc = b.open.min(b.close);
+        if b.high + 1e-9 < max_oc || b.low - 1e-9 > min_oc || b.high + 1e-9 < b.low {
+            return Err(format!(
+                "{} OHLC 不一致: open={:.3} high={:.3} low={:.3} close={:.3}",
+                b.date, b.open, b.high, b.low, b.close
+            ));
+        }
+    }
+
+    for w in bars.windows(2) {
+        let prev = w[0];
+        let cur = w[1];
+        if prev.close <= 0.0 {
+            continue;
+        }
+        let gap_pct = ((cur.open - prev.close) / prev.close * 100.0).abs();
+        if gap_pct > max_gap_pct {
+            return Err(format!(
+                "{} 开盘跳变异常 {:.2}% (> {:.2}%)，prev_close={:.3} open={:.3}",
+                cur.date, gap_pct, max_gap_pct, prev.close, cur.open
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Duration;
+    use chrono::{Duration, TimeZone};
 
     fn make_tick(code: &str, price: f64, change_pct: f64) -> Tick {
         Tick {
@@ -306,6 +460,38 @@ mod tests {
             change_pct: 1.0,
             volume: 10000.0,
             update_time: Local::now() - Duration::seconds(300),
+        }
+    }
+
+    fn make_kline(date: NaiveDate, open: f64, high: f64, low: f64, close: f64) -> KlineData {
+        KlineData {
+            date,
+            open,
+            high,
+            low,
+            close,
+            volume: 1000.0,
+            amount: 1000.0 * close,
+            pct_chg: 0.0,
+            pe_ratio: None,
+            pb_ratio: None,
+            turnover_rate: None,
+            market_cap: None,
+            circulating_cap: None,
+            eps: None,
+            roe: None,
+            revenue_yoy: None,
+            net_profit_yoy: None,
+            gross_margin: None,
+            net_margin: None,
+            sharpe_ratio: None,
+            financials_history: None,
+            valuation_history: None,
+            consensus: None,
+            industry: None,
+            is_limit_up: false,
+            is_limit_down: false,
+            is_suspended: false,
         }
     }
 
@@ -465,5 +651,76 @@ mod tests {
             .label(),
             "价格异常"
         );
+    }
+
+    #[test]
+    fn test_typed_freshness_quote_threshold() {
+        let cfg = FreshnessConfig::default();
+        let stats = DqStats::new();
+        let fresh = Local::now() - Duration::seconds(3);
+        assert!(validate_freshness(FreshnessDataType::Quote, fresh, &cfg, &stats).is_ok());
+
+        let stale = Local::now() - Duration::seconds(6);
+        let r = validate_freshness(FreshnessDataType::Quote, stale, &cfg, &stats);
+        assert!(matches!(r, Err(DqRejectReason::Stale { .. })));
+    }
+
+    #[test]
+    fn test_typed_freshness_position_threshold() {
+        let cfg = FreshnessConfig::default();
+        let stats = DqStats::new();
+        let stale = Local::now() - Duration::seconds(31);
+        let r = validate_freshness(FreshnessDataType::Position, stale, &cfg, &stats);
+        assert!(matches!(r, Err(DqRejectReason::Stale { .. })));
+    }
+
+    #[test]
+    fn test_daily_freshness_within_one_trading_day() {
+        let cfg = FreshnessConfig::default();
+        let stats = DqStats::new();
+        let monday = Local.with_ymd_and_hms(2026, 6, 22, 10, 0, 0).unwrap();
+        let friday = NaiveDate::from_ymd_opt(2026, 6, 19).unwrap();
+        assert!(validate_daily_freshness(friday, monday, &cfg, &stats).is_ok());
+    }
+
+    #[test]
+    fn test_daily_freshness_stale_rejected() {
+        let cfg = FreshnessConfig::default();
+        let stats = DqStats::new();
+        let monday = Local.with_ymd_and_hms(2026, 6, 22, 10, 0, 0).unwrap();
+        let thursday = NaiveDate::from_ymd_opt(2026, 6, 18).unwrap();
+        let r = validate_daily_freshness(thursday, monday, &cfg, &stats);
+        assert!(matches!(r, Err(DqRejectReason::Stale { .. })));
+    }
+
+    #[test]
+    fn test_daily_kline_quality_ohlc_invalid_rejected() {
+        let d = NaiveDate::from_ymd_opt(2026, 6, 20).unwrap();
+        let bars = vec![make_kline(d, 10.0, 9.8, 9.5, 9.9)]; // high < open
+        let r = validate_daily_kline_quality(&bars, 20.0);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn test_daily_kline_quality_gap_jump_rejected() {
+        let d1 = NaiveDate::from_ymd_opt(2026, 6, 19).unwrap();
+        let d2 = NaiveDate::from_ymd_opt(2026, 6, 20).unwrap();
+        let bars = vec![
+            make_kline(d1, 10.0, 10.5, 9.8, 10.0),
+            make_kline(d2, 13.0, 13.2, 12.8, 13.1), // 开盘相对前收 +30%
+        ];
+        let r = validate_daily_kline_quality(&bars, 20.0);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn test_daily_kline_quality_passes() {
+        let d1 = NaiveDate::from_ymd_opt(2026, 6, 19).unwrap();
+        let d2 = NaiveDate::from_ymd_opt(2026, 6, 20).unwrap();
+        let bars = vec![
+            make_kline(d1, 10.0, 10.5, 9.8, 10.0),
+            make_kline(d2, 10.3, 10.6, 10.1, 10.4),
+        ];
+        assert!(validate_daily_kline_quality(&bars, 20.0).is_ok());
     }
 }

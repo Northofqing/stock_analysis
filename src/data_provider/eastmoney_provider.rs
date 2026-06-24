@@ -52,6 +52,8 @@ impl HttpProvider {
     /// 创建新的提供者
     pub fn new() -> Result<Self> {
         let client = reqwest::Client::builder()
+            // 东财域名在部分代理环境会被 fake-ip/拦截，强制直连更稳定。
+            .no_proxy()
             .timeout(std::time::Duration::from_secs(30))
             .connect_timeout(std::time::Duration::from_secs(10))
             .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -65,6 +67,12 @@ impl HttpProvider {
     /// 网络层错误（DNS/连接/超时/对端 RST）会做最多 2 次重试，500ms / 1000ms 退避；
     /// HTTP 4xx 等业务错误不重试，直接返回。
     pub async fn fetch_kline_data_internal(client: &reqwest::Client, code: &str, days: usize) -> Result<Vec<KlineData>> {
+        const KLINE_HOSTS: [&str; 3] = [
+            "push2his.eastmoney.com",
+            "push2his-bak.eastmoney.com",
+            "82.push2his.eastmoney.com",
+        ];
+
         // 转换股票代码格式 (600519 -> 1.600519 for Shanghai, 000001 -> 0.000001 for Shenzhen)
         let market_code = if code.starts_with('6') {
             format!("1.{}", code) // 上海
@@ -76,20 +84,31 @@ impl HttpProvider {
             format!("1.{}", code) // 默认上海
         };
 
-        // 构建URL
-        let url = format!(
-            "https://push2his.eastmoney.com/api/qt/stock/kline/get?secid={}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58&klt=101&fqt=1&end=20500101&lmt={}",
-            market_code, days
-        );
+        // 固定使用 no_proxy 客户端，规避系统代理 fake-ip/空回复问题。
+        let direct_client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .build()
+            .unwrap_or_else(|_| client.clone());
 
-        log::debug!("[HTTP] 请求URL: {}", url);
-
-        const MAX_ATTEMPTS: u32 = 3;
+        // 每个 host 最多尝试 2 次，总尝试数 = host 数 * 2。
+        const MAX_ATTEMPTS_PER_HOST: u32 = 2;
+        let max_attempts: u32 = (KLINE_HOSTS.len() as u32) * MAX_ATTEMPTS_PER_HOST;
         let mut last_err: Option<anyhow::Error> = None;
 
-        for attempt in 1..=MAX_ATTEMPTS {
+        for attempt in 1..=max_attempts {
+            let host = KLINE_HOSTS[((attempt - 1) as usize) % KLINE_HOSTS.len()];
+            let url = format!(
+                "https://{}/api/qt/stock/kline/get?secid={}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58&klt=101&fqt=1&end=20500101&lmt={}",
+                host, market_code, days
+            );
+
+            log::debug!("[HTTP] 请求URL(host={}): {}", host, url);
+
             // 发送请求（添加更多请求头模拟浏览器）
-            let send_result = client
+            let send_result = direct_client
                 .get(&url)
                 .header("Accept", "application/json, text/plain, */*")
                 .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
@@ -103,11 +122,11 @@ impl HttpProvider {
                 Err(e) => {
                     // 网络层错误 → 重试
                     log::warn!(
-                        "[HTTP] 请求失败 (attempt {}/{}): {} - URL: {}",
-                        attempt, MAX_ATTEMPTS, e, url
+                        "[HTTP] 请求失败 (attempt {}/{} host={}): {} - URL: {}",
+                        attempt, max_attempts, host, e, url
                     );
                     last_err = Some(anyhow!("HTTP请求失败: {}", e));
-                    if attempt < MAX_ATTEMPTS {
+                    if attempt < max_attempts {
                         tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
                     }
                     continue;
@@ -118,16 +137,16 @@ impl HttpProvider {
             if !status.is_success() {
                 // 4xx：客户端错误（URL/参数问题），重试也不会变好，直接失败
                 if status.is_client_error() {
-                    log::error!("[HTTP] 客户端错误 {} - URL: {}", status, url);
+                    log::error!("[HTTP] 客户端错误 {} (host={}) - URL: {}", status, host, url);
                     return Err(anyhow!("HTTP请求返回错误状态: {}", status));
                 }
                 // 5xx：可能瞬时，重试
                 log::warn!(
-                    "[HTTP] 响应状态 {} (attempt {}/{}) - URL: {}",
-                    status, attempt, MAX_ATTEMPTS, url
+                    "[HTTP] 响应状态 {} (attempt {}/{} host={}) - URL: {}",
+                    status, attempt, max_attempts, host, url
                 );
                 last_err = Some(anyhow!("HTTP请求返回错误状态: {}", status));
-                if attempt < MAX_ATTEMPTS {
+                if attempt < max_attempts {
                     tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
                 }
                 continue;
@@ -137,11 +156,11 @@ impl HttpProvider {
                 Ok(t) => t,
                 Err(e) => {
                     log::warn!(
-                        "[HTTP] 读取响应失败 (attempt {}/{}): {} - URL: {}",
-                        attempt, MAX_ATTEMPTS, e, url
+                        "[HTTP] 读取响应失败 (attempt {}/{} host={}): {} - URL: {}",
+                        attempt, max_attempts, host, e, url
                     );
                     last_err = Some(anyhow!("读取响应失败: {}", e));
-                    if attempt < MAX_ATTEMPTS {
+                    if attempt < max_attempts {
                         tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
                     }
                     continue;
@@ -150,11 +169,11 @@ impl HttpProvider {
 
             if text.is_empty() {
                 log::warn!(
-                    "[HTTP] 响应为空 (attempt {}/{}) - URL: {}",
-                    attempt, MAX_ATTEMPTS, url
+                    "[HTTP] 响应为空 (attempt {}/{} host={}) - URL: {}",
+                    attempt, max_attempts, host, url
                 );
                 last_err = Some(anyhow!("API返回空响应"));
-                if attempt < MAX_ATTEMPTS {
+                if attempt < max_attempts {
                     tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
                 }
                 continue;
@@ -168,7 +187,7 @@ impl HttpProvider {
 
         // 所有重试都失败：打印一次终态错误，避免上游再次重复输出
         let err = last_err.unwrap_or_else(|| anyhow!("HTTP请求失败（未知错误）"));
-        log::error!("[HTTP] 重试 {} 次后仍失败: {} - URL: {}", MAX_ATTEMPTS, err, url);
+        log::error!("[HTTP] 重试 {} 次后仍失败: {}", max_attempts, err);
         Err(err)
     }
     
@@ -241,43 +260,60 @@ impl HttpProvider {
     
     /// 获取股票名称（静态异步方法）
     async fn fetch_stock_name_internal(client: &reqwest::Client, code: &str) -> Option<String> {
+        const QUOTE_HOSTS: [&str; 3] = [
+            "push2.eastmoney.com",
+            "push2delay.eastmoney.com",
+            "82.push2.eastmoney.com",
+        ];
+
         // 转换股票代码格式
         let market_code = if code.starts_with('6') {
             format!("1.{}", code) // 上海
         } else {
             format!("0.{}", code) // 深圳/创业板/科创板
         };
-        
-        let url = format!(
-            "https://push2.eastmoney.com/api/qt/stock/get?secid={}&fields=f58",
-            market_code
-        );
-        
-        match client.get(&url)
-            .header("Accept", "application/json, text/plain, */*")
-            .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-            .header("Referer", "https://quote.eastmoney.com/")
+
+        let direct_client = reqwest::Client::builder()
+            .no_proxy()
             .timeout(std::time::Duration::from_secs(5))
-            .send()
-            .await
-        {
-            Ok(response) => {
-                if let Ok(text) = response.text().await {
-                    // 解析JSON获取名称 {"data":{"f58":"贵州茅台"}}
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-                        if let Some(name) = json["data"]["f58"].as_str() {
-                            if !name.is_empty() {
-                                log::debug!("[HTTP] 获取股票名称: {} -> {}", code, name);
-                                return Some(name.to_string());
+            .connect_timeout(std::time::Duration::from_secs(3))
+            .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .build()
+            .unwrap_or_else(|_| client.clone());
+
+        for host in QUOTE_HOSTS {
+            let url = format!(
+                "https://{}/api/qt/stock/get?secid={}&fields=f58",
+                host, market_code
+            );
+
+            match direct_client
+                .get(&url)
+                .header("Accept", "application/json, text/plain, */*")
+                .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+                .header("Referer", "https://quote.eastmoney.com/")
+                .send()
+                .await
+            {
+                Ok(response) => {
+                    if let Ok(text) = response.text().await {
+                        // 解析JSON获取名称 {"data":{"f58":"贵州茅台"}}
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if let Some(name) = json["data"]["f58"].as_str() {
+                                if !name.is_empty() {
+                                    log::debug!("[HTTP] 获取股票名称(host={}): {} -> {}", host, code, name);
+                                    return Some(name.to_string());
+                                }
                             }
                         }
                     }
                 }
-            }
-            Err(e) => {
-                log::debug!("[HTTP] 获取股票名称失败: {}", e);
+                Err(e) => {
+                    log::debug!("[HTTP] 获取股票名称失败(host={}): {}", host, e);
+                }
             }
         }
+
         None
     }
 }

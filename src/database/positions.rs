@@ -9,11 +9,26 @@ use crate::schema::stock_position;
 use super::DatabaseManager;
 use super::DbConnection;
 
+fn env_reject_error(msg: String) -> Box<dyn std::error::Error> {
+    Box::new(std::io::Error::new(std::io::ErrorKind::PermissionDenied, msg))
+}
+
 impl DatabaseManager {
     pub fn save_position(
         &self,
         position: &NewStockPosition,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Err(reason) = crate::risk::env_guard::validate_symbol_for_current_env(&position.code) {
+            log::warn!(
+                "[ENV_GUARD] rule_id=AGENTS-2.5 code={} env={:?} action=reject reason={} timestamp={}",
+                position.code,
+                crate::risk::env_guard::current_env(),
+                reason,
+                chrono::Utc::now().timestamp()
+            );
+            return Err(env_reject_error(reason));
+        }
+
         use diesel::upsert::excluded;
 
         let mut conn = self.get_conn()?;
@@ -92,6 +107,18 @@ impl DatabaseManager {
         sell_date: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut conn = self.get_conn()?;
+        let code = self.get_position_code(&mut conn, id)?;
+        if let Err(reason) = crate::risk::env_guard::validate_symbol_for_current_env(&code) {
+            log::warn!(
+                "[ENV_GUARD] rule_id=AGENTS-2.5 code={} env={:?} action=reject reason={} timestamp={}",
+                code,
+                crate::risk::env_guard::current_env(),
+                reason,
+                chrono::Utc::now().timestamp()
+            );
+            return Err(env_reject_error(reason));
+        }
+
         let return_rate = (sell_price / self.get_position_buy_price(&mut conn, id)? - 1.0) * 100.0;
 
         diesel::update(stock_position::table.filter(stock_position::id.eq(id)))
@@ -117,5 +144,17 @@ impl DatabaseManager {
             .select(stock_position::buy_price)
             .first(conn)?;
         Ok(price)
+    }
+
+    fn get_position_code(
+        &self,
+        conn: &mut DbConnection,
+        id: i32,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let code: String = stock_position::table
+            .filter(stock_position::id.eq(id))
+            .select(stock_position::code)
+            .first(conn)?;
+        Ok(code)
     }
 }

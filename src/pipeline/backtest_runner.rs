@@ -16,6 +16,106 @@ use crate::strategy::multi_factor::{MultiFactorConfig, MultiFactorEngine, StockF
 use crate::strategy::rsi::{RsiBacktest, RsiConfig};
 
 impl AnalysisPipeline {
+    /// 在给定历史切片上运行一次多因子回测，返回汇总结果。
+    ///
+    /// 说明：因缺少历史因子快照，当前以切片末日可得基本面生成一次因子分数，
+    /// 再在该切片内执行逐日调仓，作为最小可复现口径。
+    fn run_multi_factor_on_history(
+        history: &[(String, String, Vec<crate::data_provider::KlineData>)],
+        factor_cfg: &MultiFactorConfig,
+    ) -> Option<(BacktestSummary, BacktestState)> {
+        if history.len() < 3 {
+            return None;
+        }
+
+        let factor_engine = MultiFactorEngine::new(factor_cfg.clone());
+
+        let config = BacktestConfig::default();
+        let mut engine = BacktestEngine::new(config.clone());
+
+        let mut all_dates: std::collections::BTreeSet<chrono::NaiveDate> =
+            std::collections::BTreeSet::new();
+        for (_, _, ks) in history {
+            for k in ks {
+                all_dates.insert(k.date);
+            }
+        }
+        let dates: Vec<chrono::NaiveDate> = all_dates.into_iter().collect();
+        if dates.len() < 10 {
+            return None;
+        }
+
+        let observe_days = 20.min(dates.len() / 3);
+        if observe_days >= dates.len() {
+            return None;
+        }
+
+        let initial_capital = config.initial_capital;
+
+        for today in dates.iter().skip(observe_days) {
+            // 每个再平衡日仅使用截至当日可得数据重算因子，避免跨周期复用固定分数。
+            let day_factors: Vec<StockFactors> = history
+                .iter()
+                .filter_map(|(code, name, ks)| {
+                    let latest = ks
+                        .iter()
+                        .filter(|k| k.date <= *today)
+                        .max_by_key(|k| k.date)?;
+                    Some(StockFactors {
+                        code: code.clone(),
+                        name: name.clone(),
+                        market_cap: latest.market_cap,
+                        roe: latest.roe,
+                        pe: latest.pe_ratio,
+                        pb: latest.pb_ratio,
+                        turnover_rate: latest.turnover_rate,
+                    })
+                })
+                .collect();
+
+            if day_factors.len() < 3 {
+                continue;
+            }
+
+            let day_scores = factor_engine.calculate_scores(&day_factors).ok()?;
+            if day_scores.is_empty() {
+                continue;
+            }
+            let position_count = config.position_count.min(day_scores.len());
+
+            let mut targets = Vec::new();
+            for s in day_scores.iter().take(position_count) {
+                if let Some((_, name, ks)) = history.iter().find(|(c, _, _)| c == &s.code) {
+                    if let Some(k) = ks.iter().find(|k| &k.date == today) {
+                        targets.push((s.code.clone(), name.clone(), k.close));
+                    }
+                }
+            }
+
+            if !targets.is_empty() {
+                let dt = today
+                    .and_hms_opt(15, 0, 0)
+                    .unwrap()
+                    .and_local_timezone(chrono::Local)
+                    .single()
+                    .unwrap_or_else(chrono::Local::now);
+                let _ = engine.rebalance(&targets, dt);
+                engine.record_daily_value(dt);
+            }
+        }
+
+        let state = engine.get_state().clone();
+        let summary = BacktestSummary::from_state(&state, initial_capital);
+        Some((summary, state))
+    }
+
+    fn run_multi_factor_summary_on_history(
+        history: &[(String, String, Vec<crate::data_provider::KlineData>)],
+        factor_cfg: &MultiFactorConfig,
+    ) -> Option<BacktestSummary> {
+        Self::run_multi_factor_on_history(history, factor_cfg).map(|(s, _)| s)
+    }
+
     /// 抓取沪深300基准日线，构建 BenchmarkSeries（date->close）。
     /// 失败一律返回 None，绝不编造基准数据。
     async fn fetch_benchmark_series(&self, days: usize) -> Option<BenchmarkSeries> {
@@ -246,7 +346,7 @@ impl AnalysisPipeline {
     ) -> Result<BacktestSummary> {
         // 1. 拉取评分前 N 只股票的历史K线（至少 60 天）
         let mut sorted = results.to_vec();
-        sorted.sort_by(|a, b| b.sentiment_score.cmp(&a.sentiment_score));
+        sorted.sort_by(|a, b| b.ranking_score.cmp(&a.ranking_score));
         let top_n = 10;
         let mut stocks_data = Vec::new();
         for r in sorted.iter().take(top_n) {
@@ -262,75 +362,9 @@ impl AnalysisPipeline {
             anyhow::bail!("多因子回测需要至少3只股票，实际仅 {} 只", stocks_data.len());
         }
 
-        // 2. 准备因子数据（从 results 提取，不做 look-ahead）
-        let stock_factors: Vec<StockFactors> = results
-            .iter()
-            .filter(|r| stocks_data.iter().any(|(c, _, _)| c == &r.code))
-            .map(|r| StockFactors {
-                code: r.code.clone(),
-                name: r.name.clone(),
-                market_cap: r.market_cap,
-                roe: r.roe,
-                pe: r.pe_ratio,
-                pb: r.pb_ratio,
-                turnover_rate: r.turnover_rate,
-            })
-            .collect();
-
-        let factor_engine = MultiFactorEngine::new(MultiFactorConfig::default());
-        let scores = factor_engine.calculate_scores(&stock_factors)?;
-
-        // 3. 真实历史回测：逐日模拟持仓
-        let config = BacktestConfig::default();
-        let mut engine = BacktestEngine::new(config.clone());
-        let position_count = config.position_count.min(scores.len());
-
-        // 收集所有交易日
-        let mut all_dates: std::collections::BTreeSet<chrono::NaiveDate> =
-            std::collections::BTreeSet::new();
-        for (_, _, ks) in &stocks_data {
-            for k in ks {
-                all_dates.insert(k.date);
-            }
-        }
-        let dates: Vec<chrono::NaiveDate> = all_dates.into_iter().collect();
-        if dates.len() < 10 {
-            anyhow::bail!("回测数据不足，仅 {} 个交易日", dates.len());
-        }
-
-        // 前20天作为因子计算观察期，从第21天开始逐日调仓
-        let observe_days = 20.min(dates.len() / 3);
-        let initial_capital = config.initial_capital;
-
-        for i in observe_days..dates.len() {
-            let today = dates[i];
-            // 选出当日得分最高的 N 只（因子固定不变，避免日内 look-ahead）
-            let mut day_scores: Vec<_> = scores.iter().collect();
-            day_scores.sort_by(|a, b| b.total_score.partial_cmp(&a.total_score).unwrap_or(std::cmp::Ordering::Equal));
-
-            let mut targets = Vec::new();
-            for s in day_scores.iter().take(position_count) {
-                if let Some((_, name, ks)) = stocks_data.iter().find(|(c, _, _)| c == &s.code) {
-                    if let Some(k) = ks.iter().find(|k| k.date == today) {
-                        targets.push((s.code.clone(), name.clone(), k.close));
-                    }
-                }
-            }
-
-            if !targets.is_empty() {
-                let dt = today
-                    .and_hms_opt(15, 0, 0)
-                    .unwrap()
-                    .and_local_timezone(chrono::Local)
-                    .single()
-                    .unwrap_or_else(|| chrono::Local::now());
-                let _ = engine.rebalance(&targets, dt);
-                engine.record_daily_value(dt);
-            }
-        }
-
-        let state = engine.get_state();
-        let mut summary = BacktestSummary::from_state(&state, initial_capital);
+        let base_cfg = MultiFactorConfig::default();
+        let (mut summary, base_state) = Self::run_multi_factor_on_history(&stocks_data, &base_cfg)
+            .ok_or_else(|| anyhow::anyhow!("多因子基础回测失败：样本或因子不足，无法生成汇总"))?;
 
         // 注入基准（可用时）
         if let Some(bench) = self.fetch_benchmark_series(60).await {
@@ -347,10 +381,74 @@ impl AnalysisPipeline {
         );
 
         let date_str = chrono::Local::now().format("%Y%m%d").to_string();
-        let report = super::reporting::build_backtest_report(&summary);
+        let mut report = super::reporting::build_backtest_report(&summary);
+
+        // A. 时间样本外切分（前 60% 样本内 / 后 40% 样本外）
+        let (cutoff, in_h, out_h) = Self::split_history_by_date(&stocks_data, 0.6)
+            .ok_or_else(|| anyhow::anyhow!("多因子 OOS 切分失败：交易日不足或切分后样本为空"))?;
+        let in_sum = Self::run_multi_factor_summary_on_history(&in_h, &base_cfg)
+            .ok_or_else(|| anyhow::anyhow!("多因子 OOS 失败：样本内段无法完成回测"))?;
+        let out_sum = Self::run_multi_factor_summary_on_history(&out_h, &base_cfg)
+            .ok_or_else(|| anyhow::anyhow!("多因子 OOS 失败：样本外段无法完成回测"))?;
+        report.push_str(&super::reporting::build_oos_section(&cutoff, &in_sum, &out_sum));
+
+        // B. Walk-Forward 滚动优化（参数网格寻优 + 样本外验证）
+        let mk_cfg = |top_n: usize, pe_w: f64, pb_w: f64| MultiFactorConfig {
+            factors: vec![
+                (
+                    crate::strategy::multi_factor::Factor::MarketCap,
+                    crate::strategy::multi_factor::FactorDirection::Ascending,
+                    1.0,
+                ),
+                (
+                    crate::strategy::multi_factor::Factor::ROE,
+                    crate::strategy::multi_factor::FactorDirection::Descending,
+                    1.0,
+                ),
+                (
+                    crate::strategy::multi_factor::Factor::PE,
+                    crate::strategy::multi_factor::FactorDirection::Ascending,
+                    pe_w,
+                ),
+                (
+                    crate::strategy::multi_factor::Factor::PB,
+                    crate::strategy::multi_factor::FactorDirection::Ascending,
+                    pb_w,
+                ),
+                (
+                    crate::strategy::multi_factor::Factor::TurnoverRate,
+                    crate::strategy::multi_factor::FactorDirection::Descending,
+                    0.3,
+                ),
+            ],
+            top_n,
+        };
+        let wf_grid: Vec<(String, MultiFactorConfig)> = vec![
+            ("top10/pe0.5/pb0.5".to_string(), mk_cfg(10, 0.5, 0.5)),
+            ("top15/pe0.5/pb0.5".to_string(), mk_cfg(15, 0.5, 0.5)),
+            ("top20/pe0.5/pb0.5".to_string(), mk_cfg(20, 0.5, 0.5)),
+            ("top15/pe0.8/pb0.3".to_string(), mk_cfg(15, 0.8, 0.3)),
+            ("top15/pe0.3/pb0.8".to_string(), mk_cfg(15, 0.3, 0.8)),
+            ("top12/pe0.7/pb0.7".to_string(), mk_cfg(12, 0.7, 0.7)),
+        ];
+        let wf = Self::walk_forward(
+            &stocks_data,
+            &wf_grid,
+            |cfg, slice| Self::run_multi_factor_summary_on_history(slice, cfg),
+            4,
+        )
+        .ok_or_else(|| anyhow::anyhow!("多因子 Walk-Forward 失败：样本不足或候选参数无有效结果"))?;
+        report.push_str(&super::reporting::build_walk_forward_section(&wf));
+
         let filename = format!("multi_factor_backtest_{}.md", date_str);
         self.notifier.save_report_to_file(&report, Some(&filename))?;
-        self.export_audit_csv("multi_factor", &date_str, &state.daily_values, &state.trades, initial_capital);
+        self.export_audit_csv(
+            "multi_factor",
+            &date_str,
+            &base_state.daily_values,
+            &base_state.trades,
+            summary.initial_capital,
+        );
 
         Ok(summary)
     }
@@ -364,7 +462,7 @@ impl AnalysisPipeline {
         days: usize,
     ) -> Vec<(String, String, Vec<crate::data_provider::KlineData>)> {
         let mut sorted = results.to_vec();
-        sorted.sort_by(|a, b| b.sentiment_score.cmp(&a.sentiment_score));
+        sorted.sort_by(|a, b| b.ranking_score.cmp(&a.ranking_score));
 
         let mut stocks_data = Vec::new();
         for r in sorted.iter().take(top_n) {

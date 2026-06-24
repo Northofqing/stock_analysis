@@ -3,6 +3,7 @@
 use anyhow::Result;
 use chrono::Local;
 use log::info;
+use stock_analysis::config;
 use stock_analysis::pipeline::{AnalysisPipeline, PipelineConfig};
 
 use crate::app::get_max_workers;
@@ -41,11 +42,17 @@ pub fn run_analysis(
 
     info!("模式: 单次分析");
 
+    let monitor_cfg = config::get_monitor_config();
+
     let config = PipelineConfig {
         max_workers: get_max_workers(args),
         dry_run: args.dry_run,
         send_notification: !args.no_notify,
         single_notify: args.single_notify,
+        dq_quote_stale_sec: monitor_cfg.dq_quote_stale_sec,
+        dq_position_stale_sec: monitor_cfg.dq_position_stale_sec,
+        dq_nav_stale_sec: monitor_cfg.dq_nav_stale_sec,
+        dq_daily_stale_sec: monitor_cfg.dq_daily_stale_sec,
     };
 
     let pipeline = AnalysisPipeline::new(config)?.with_limit_up_codes(limit_up_codes);
@@ -243,11 +250,16 @@ pub fn run_lhb_analysis(args: &Args) -> Result<()> {
         return Ok(());
     }
 
+    let monitor_cfg = config::get_monitor_config();
     let config = PipelineConfig {
         max_workers: get_max_workers(args),
         dry_run: args.dry_run,
         send_notification: !args.no_notify,
         single_notify: args.single_notify,
+        dq_quote_stale_sec: monitor_cfg.dq_quote_stale_sec,
+        dq_position_stale_sec: monitor_cfg.dq_position_stale_sec,
+        dq_nav_stale_sec: monitor_cfg.dq_nav_stale_sec,
+        dq_daily_stale_sec: monitor_cfg.dq_daily_stale_sec,
     };
     let pipeline = AnalysisPipeline::new(config)?;
     let results = runtime.block_on(pipeline.run(&stock_codes, None))?;

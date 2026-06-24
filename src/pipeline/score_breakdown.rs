@@ -9,6 +9,33 @@ use serde::{Deserialize, Serialize};
 use crate::data_provider::money_flow::MoneyFlowSummary;
 use crate::data_provider::{assess_quality, KlineData};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FactorAction {
+    Normal,
+    Disable,
+    Invert,
+    DownWeight,
+}
+
+fn parse_factor_action(s: &str) -> FactorAction {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "disable" => FactorAction::Disable,
+        "invert" => FactorAction::Invert,
+        "down_weight" => FactorAction::DownWeight,
+        _ => FactorAction::Normal,
+    }
+}
+
+fn apply_factor_action(score: i32, action: FactorAction, down_weight_scale: f64) -> f64 {
+    let v = score.clamp(0, 100) as f64;
+    match action {
+        FactorAction::Normal => v,
+        FactorAction::Disable => 0.0,
+        FactorAction::Invert => 100.0 - v,
+        FactorAction::DownWeight => v * down_weight_scale.clamp(0.0, 1.0),
+    }
+}
+
 /// 计算评分所需的最小输入集合（不依赖完整 AnalysisResult，便于在 AI 调用前构造）。
 pub struct ScoreInputs<'a> {
     pub sentiment_score: i32,
@@ -268,4 +295,42 @@ pub fn render_section(sb: &ScoreBreakdown) -> String {
         tag(sb.growth_sustainability)
     ));
     s
+}
+
+/// 基于五维评分计算排序分（0~100），用于展示/排序/回测选股。
+///
+/// 注意：此分数不用于买入触发，不修改 sentiment_score 主链路。
+pub fn compute_ranking_score(sb: &ScoreBreakdown) -> i32 {
+    let cfg = crate::config::get_monitor_config().factor_feedback;
+
+    let (tech_action, quality_action, valuation_action, flow_action, growth_action) = if cfg.enabled {
+        (
+            parse_factor_action(&cfg.technical_action),
+            parse_factor_action(&cfg.quality_action),
+            parse_factor_action(&cfg.valuation_action),
+            parse_factor_action(&cfg.flow_action),
+            parse_factor_action(&cfg.growth_action),
+        )
+    } else {
+        (
+            FactorAction::Normal,
+            FactorAction::Normal,
+            FactorAction::Normal,
+            FactorAction::Normal,
+            FactorAction::Normal,
+        )
+    };
+
+    let scale = cfg.down_weight_scale;
+
+    // 等权平均：先按 action 转换，再聚合为排序分。
+    let dims = [
+        apply_factor_action(sb.technical, tech_action, scale),
+        apply_factor_action(sb.fundamental_quality, quality_action, scale),
+        apply_factor_action(sb.valuation_safety, valuation_action, scale),
+        apply_factor_action(sb.capital_flow, flow_action, scale),
+        apply_factor_action(sb.growth_sustainability, growth_action, scale),
+    ];
+
+    (dims.iter().sum::<f64>() / dims.len() as f64).round().clamp(0.0, 100.0) as i32
 }

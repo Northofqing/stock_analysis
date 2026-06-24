@@ -13,7 +13,6 @@ pub mod intraday_kline;
 pub mod money_flow;
 pub mod rustdx_provider;
 pub mod service;
-pub mod tushare_provider;
 pub mod valuation_history;
 pub mod yahoo;
 
@@ -28,7 +27,6 @@ pub use money_flow::{
     IntradayShape, MoneyFlowSummary,
 };
 pub use rustdx_provider::RustdxProvider;
-pub use tushare_provider::TushareProvider;
 pub use valuation_history::{fetch_blocking as fetch_valuation_history, ValuationHistory};
 pub use consensus::{fetch_blocking as fetch_consensus, ConsensusData, RecentReport};
 pub use industry::{fetch_blocking as fetch_industry, IndustryBenchmark};
@@ -137,11 +135,6 @@ impl DataFetcherManager {
         // 备用：腾讯财经（稳定可靠）
         if let Ok(gtimg_provider) = GtimgProvider::new() {
             providers.push(Box::new(gtimg_provider));
-        }
-
-        // 备用：Tushare Pro（专业数据源，需要积分）
-        if let Ok(tushare_provider) = TushareProvider::new() {
-            providers.push(Box::new(tushare_provider));
         }
 
         // 备用：东方财富HTTP数据源

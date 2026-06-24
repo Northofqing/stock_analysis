@@ -19,19 +19,19 @@ use stock_analysis::monitor::checklist;
 use stock_analysis::monitor::prediction;
 use stock_analysis::monitor::alert;
 
-const DEFAULT_AICLAW_API_ADDR: &str = "127.0.0.1:18011";
-const DEFAULT_AICLAW_PROJECT_ID: &str = "stock_analysis";
-const DEFAULT_AICLAW_CLIENT_NAME: &str = "monitor";
-const DEFAULT_AICLAW_TOKEN_TTL_SECS: i64 = 7 * 24 * 3600;
-const DEFAULT_AICLAW_TOKEN_REFRESH_AHEAD_SECS: i64 = 10 * 60;
+const DEFAULT_MAGICLAW_API_ADDR: &str = "127.0.0.1:18011";
+const DEFAULT_MAGICLAW_PROJECT_ID: &str = "stock_analysis";
+const DEFAULT_MAGICLAW_CLIENT_NAME: &str = "monitor";
+const DEFAULT_MAGICLAW_TOKEN_TTL_SECS: i64 = 7 * 24 * 3600;
+const DEFAULT_MAGICLAW_TOKEN_REFRESH_AHEAD_SECS: i64 = 10 * 60;
 
-static AICLAW_DAEMON_BOOT_LOCK: Lazy<tokio::sync::Mutex<()>> =
+static MAGICLAW_DAEMON_BOOT_LOCK: Lazy<tokio::sync::Mutex<()>> =
     Lazy::new(|| tokio::sync::Mutex::new(()));
-static AICLAW_TOKEN_MEM_CACHE: Lazy<tokio::sync::RwLock<Option<CachedApiToken>>> =
+static MAGICLAW_TOKEN_MEM_CACHE: Lazy<tokio::sync::RwLock<Option<CachedApiToken>>> =
     Lazy::new(|| tokio::sync::RwLock::new(None));
-static AICLAW_TOKEN_ISSUE_LOCK: Lazy<tokio::sync::Mutex<()>> =
+static MAGICLAW_TOKEN_ISSUE_LOCK: Lazy<tokio::sync::Mutex<()>> =
     Lazy::new(|| tokio::sync::Mutex::new(()));
-static AICLAW_DISABLE_ENV_TOKEN: AtomicBool = AtomicBool::new(false);
+static MAGICLAW_DISABLE_ENV_TOKEN: AtomicBool = AtomicBool::new(false);
 
 enum DaemonReadySource {
     Reused,
@@ -45,10 +45,235 @@ enum ApiTokenSource {
     DynamicIssued,
 }
 
+#[derive(Clone, Copy)]
+enum MessageSendType {
+    Wechat,
+    Feishu,
+}
+
+#[derive(Clone, Copy)]
+enum MessageSendTransport {
+    Http,
+    Cli,
+}
+
+impl MessageSendType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Wechat => "wechat",
+            Self::Feishu => "feishu",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Wechat => "微信",
+            Self::Feishu => "飞书",
+        }
+    }
+}
+
+impl MessageSendTransport {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Cli => "cli",
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct CachedApiToken {
     token: String,
     expires_at: Option<i64>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AirRefuelEntryMode {
+    Confirm,
+    Pilot,
+}
+
+fn air_refuel_entry_mode() -> AirRefuelEntryMode {
+    let mode = stock_analysis::config::get_monitor_config().air_refuel.entry_mode;
+    if mode.trim().eq_ignore_ascii_case("pilot") {
+        AirRefuelEntryMode::Pilot
+    } else {
+        AirRefuelEntryMode::Confirm
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VirtualObservationRecord {
+    entry_date: String,
+    code: String,
+    name: String,
+    entry_price: f64,
+    shares: u32,
+    entry_mode: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VirtualObservationSnapshot {
+    created_at: String,
+    records: Vec<VirtualObservationRecord>,
+}
+
+fn virtual_observation_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from("data/virtual_observation")
+}
+
+fn persist_virtual_observation_snapshot(records: &[VirtualObservationRecord]) {
+    if records.is_empty() {
+        return;
+    }
+    let dir = virtual_observation_dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        log::warn!("[虚拟观察仓] 创建目录失败: {}", e);
+        return;
+    }
+    let snapshot = VirtualObservationSnapshot {
+        created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        records: records.to_vec(),
+    };
+    let json = match serde_json::to_string_pretty(&snapshot) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("[虚拟观察仓] 序列化失败: {}", e);
+            return;
+        }
+    };
+    let today = chrono::Local::now().format("%Y%m%d").to_string();
+    let daily = dir.join(format!("{}.json", today));
+    let latest = dir.join("latest.json");
+    if let Err(e) = std::fs::write(&daily, &json) {
+        log::warn!("[虚拟观察仓] 写入日快照失败: {}", e);
+        return;
+    }
+    if let Err(e) = std::fs::write(&latest, &json) {
+        log::warn!("[虚拟观察仓] 写入 latest 失败: {}", e);
+        return;
+    }
+    log::info!("[虚拟观察仓] 已落盘: {} ({}条)", daily.display(), records.len());
+}
+
+fn load_latest_prior_virtual_snapshot() -> Option<VirtualObservationSnapshot> {
+    let dir = virtual_observation_dir();
+    let entries = std::fs::read_dir(&dir).ok()?;
+    let today = chrono::Local::now().format("%Y%m%d").to_string();
+    let mut best: Option<std::path::PathBuf> = None;
+    let mut best_day = String::new();
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()) != Some("json") {
+            continue;
+        }
+        let stem = match p.file_stem().and_then(|x| x.to_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+        if stem == "latest" || stem.len() != 8 || stem >= today.as_str() {
+            continue;
+        }
+        if best.is_none() || stem > best_day.as_str() {
+            best_day = stem.to_string();
+            best = Some(p);
+        }
+    }
+    let path = best?;
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<VirtualObservationSnapshot>(&raw).ok()
+}
+
+fn fetch_latest_close_map(codes: &[String]) -> std::collections::HashMap<String, f64> {
+    let mut out = std::collections::HashMap::new();
+    let fetcher = match stock_analysis::data_provider::DataFetcherManager::new() {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("[虚拟观察仓] 初始化数据抓取器失败: {:#}", e);
+            return out;
+        }
+    };
+    for code in codes {
+        if let Ok((kline, _)) = fetcher.get_daily_data(code, 3) {
+            if let Some(last) = kline.last() {
+                if last.close > 0.0 {
+                    out.insert(code.clone(), last.close);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn build_virtual_next_day_review_text(
+    snapshot: &VirtualObservationSnapshot,
+    close_map: &std::collections::HashMap<String, f64>,
+) -> Option<String> {
+    if snapshot.records.is_empty() {
+        return None;
+    }
+    let mut lines = vec![
+        format!("📘 虚拟观察仓次日表现（基于 {} 建仓）", snapshot.created_at),
+        "━━━━━━━━━━━━━━━━━━━━━━━━".to_string(),
+    ];
+    let mut win = 0usize;
+    let mut n = 0usize;
+    let mut pnl_total = 0.0_f64;
+    let mut capital_total = 0.0_f64;
+    for r in &snapshot.records {
+        if r.entry_price <= 0.0 || r.shares == 0 {
+            continue;
+        }
+        let Some(close) = close_map.get(&r.code).copied() else {
+            lines.push(format!("  {}({}) 数据不足", r.name, r.code));
+            continue;
+        };
+        let ret = (close / r.entry_price - 1.0) * 100.0;
+        let pnl = (close - r.entry_price) * r.shares as f64;
+        if ret > 0.0 {
+            win += 1;
+        }
+        n += 1;
+        pnl_total += pnl;
+        capital_total += r.entry_price * r.shares as f64;
+        lines.push(format!(
+            "  {}({}) {}股 入场¥{:.2} -> 收盘¥{:.2} | {:+.2}% | {:+.0}",
+            r.name, r.code, r.shares, r.entry_price, close, ret, pnl
+        ));
+    }
+    if n == 0 {
+        return None;
+    }
+    let hit_rate = win as f64 / n as f64 * 100.0;
+    let total_ret = if capital_total > 0.0 {
+        pnl_total / capital_total * 100.0
+    } else {
+        0.0
+    };
+    lines.push(String::new());
+    lines.push(format!(
+        "命中率 {:.1}% ({}/{}) | 组合收益 {:+.2}% | 组合盈亏 {:+.0}",
+        hit_rate, win, n, total_ret, pnl_total
+    ));
+    Some(lines.join("\n"))
+}
+
+async fn push_virtual_next_day_review_if_needed() {
+    let cfg = stock_analysis::config::get_monitor_config();
+    if !cfg.air_refuel.next_day_review_enabled {
+        return;
+    }
+    let Some(snapshot) = load_latest_prior_virtual_snapshot() else {
+        return;
+    };
+    let codes: Vec<String> = snapshot.records.iter().map(|r| r.code.clone()).collect();
+    let close_map = tokio::task::spawn_blocking(move || fetch_latest_close_map(&codes))
+        .await
+        .unwrap_or_default();
+    if let Some(text) = build_virtual_next_day_review_text(&snapshot, &close_map) {
+        push_wechat(&text).await;
+    }
 }
 
 fn main() {
@@ -60,11 +285,17 @@ fn main() {
     if !check_enabled() { return; }
     // 初始化数据库
     let db_path = std::env::var("DATABASE_PATH").unwrap_or_else(|_| "./data/stock_analysis.db".into());
+    if std::env::var("MAGICLAW_DB_PATH").ok().map(|s| s.trim().is_empty()).unwrap_or(true) {
+        std::env::set_var("MAGICLAW_DB_PATH", &db_path);
+    }
     let _ = stock_analysis::database::DatabaseManager::init(Some(std::path::PathBuf::from(&db_path)));
     // 加载热配置（toml 不可用时回退代码默认值）
     stock_analysis::config::load_all();
     let test_mode = std::env::args().any(|a| a == "--test");
     let review_mode = std::env::args().any(|a| a == "--review");
+
+    // AGENTS 2.5: 显式标记交易环境，供底层写入守卫执行双向隔离。
+    std::env::set_var("STOCK_ENV_MODE", if test_mode { "test" } else { "prod" });
 
     log::info!("实盘监控启动 | {} | 当前: {} | 模式: {}",
         if calendar::today_is_trading_day() { "交易日" } else { "非交易日" },
@@ -91,9 +322,29 @@ fn check_enabled() -> bool {
 }
 
 async fn push_wechat(text: &str) {
-    log::info!("[微信] 开始推送 ({}字)...", text.chars().count());
+    let send_type = resolve_send_type();
+    let send_transport = resolve_send_transport(send_type);
 
-    let aiclaw_bin = resolve_aiclaw_bin();
+    if matches!(send_transport, MessageSendTransport::Cli) {
+        push_via_magiclaw_cli(send_type, text).await;
+        return;
+    }
+
+    if matches!(send_type, MessageSendType::Feishu)
+        && matches!(send_transport, MessageSendTransport::Http)
+    {
+        push_feishu_via_http(text).await;
+        return;
+    }
+
+    log::info!(
+        "[{}] 开始推送 ({}字) | via={}",
+        send_type.label(),
+        text.chars().count(),
+        send_transport.as_str()
+    );
+
+    let magiclaw_bin = resolve_magiclaw_bin();
     let api_addr = resolve_api_addr();
     let api_base = to_api_base_url(&api_addr);
     // 关键：daemon 在 127.0.0.1 回环上，必须 .no_proxy() 绕过系统代理(Clash/Surge)。
@@ -105,28 +356,28 @@ async fn push_wechat(text: &str) {
         .build() {
         Ok(c) => c,
         Err(e) => {
-            log::error!("[微信] 创建 HTTP 客户端失败: {}", e);
+            log::error!("[{}] 创建 HTTP 客户端失败: {}", send_type.label(), e);
             return;
         }
     };
 
-    match ensure_aiclaw_daemon(&client, &aiclaw_bin, &api_addr, &api_base).await {
+    match ensure_magiclaw_daemon(&client, &magiclaw_bin, &api_addr, &api_base).await {
         Ok(DaemonReadySource::Reused) => {
-            log::info!("[微信] daemon 来源: 复用已有实例 | {}", api_addr);
+            log::info!("[{}] daemon 来源: 复用已有实例 | {}", send_type.label(), api_addr);
         }
         Ok(DaemonReadySource::StartedNow) => {
-            log::info!("[微信] daemon 来源: 本次自动拉起 | {}", api_addr);
+            log::info!("[{}] daemon 来源: 本次自动拉起 | {}", send_type.label(), api_addr);
         }
         Err(e) => {
-            log::error!("[微信] daemon 不可用: {}", e);
+            log::error!("[{}] daemon 不可用: {}", send_type.label(), e);
             return;
         }
     }
 
-    let (mut active_token, mut active_token_source) = match resolve_or_issue_api_token(&aiclaw_bin).await {
+    let (mut active_token, mut active_token_source) = match resolve_or_issue_api_token(&magiclaw_bin).await {
         Ok(v) => v,
         Err(e) => {
-            log::error!("[微信] 获取 daemon 动态鉴权 token 失败: {}", e);
+            log::error!("[{}] 获取 daemon 动态鉴权 token 失败: {}", send_type.label(), e);
             return;
         }
     };
@@ -134,88 +385,345 @@ async fn push_wechat(text: &str) {
     let verify_result = verify_daemon_auth(&client, &api_base, &active_token, &active_token_source).await;
     if let Err(first_err) = verify_result {
         if is_unauthorized_error(&first_err) {
-            match issue_and_cache_dynamic_api_token(&aiclaw_bin).await {
+            clear_dynamic_token_cache().await;
+            match issue_and_cache_dynamic_api_token(&magiclaw_bin).await {
                 Ok(next) => {
-                    log::warn!("[微信] daemon token 鉴权失败，已自动签发动态 token 并重试预检");
+                    log::warn!("[{}] daemon token 鉴权失败，已清缓存并重新签发动态 token 后重试预检", send_type.label());
                     if matches!(active_token_source, ApiTokenSource::Env) {
-                        AICLAW_DISABLE_ENV_TOKEN.store(true, Ordering::Relaxed);
+                        MAGICLAW_DISABLE_ENV_TOKEN.store(true, Ordering::Relaxed);
                     }
                     active_token = next.token;
                     active_token_source = ApiTokenSource::DynamicIssued;
                     if let Err(e) = verify_daemon_auth(&client, &api_base, &active_token, &active_token_source).await {
-                        log::error!("[微信] daemon 鉴权预检失败: {}", e);
-                        return;
+                        log::warn!("[{}] daemon 鉴权预检重试仍失败，但已重新签发 token，将继续尝试发送: {}", send_type.label(), e);
                     }
                 }
                 Err(issue_err) => {
-                    log::error!("[微信] daemon 鉴权预检失败: {}；自动续签失败: {}", first_err, issue_err);
+                    log::error!("[{}] daemon 鉴权预检失败: {}；自动续签失败: {}", send_type.label(), first_err, issue_err);
                     return;
                 }
             }
         } else {
-            log::error!("[微信] daemon 鉴权预检失败: {}", first_err);
+            log::error!("[{}] daemon 鉴权预检失败: {}", send_type.label(), first_err);
             return;
         }
     }
 
-    let (to, context_token) = match resolve_wechat_target() {
+    let to = match resolve_send_target(send_type, &client, &api_base, &active_token).await {
         Ok(v) => v,
         Err(e) => {
-            log::error!("[微信] 解析收件人失败: {}", e);
+            log::error!("[{}] 解析收件人失败: {}", send_type.label(), e);
             return;
         }
     };
+    let to_log = to.as_deref().unwrap_or("<magiclaw-default>");
 
-    match send_via_aiclaw_daemon(&client, &api_base, &active_token, &to, context_token.as_deref(), text).await {
-        Ok(_) => {
-            log::info!("[微信] 推送成功 | to={}", to);
+    match send_via_magiclaw_daemon(&client, &api_base, &active_token, send_type, to.as_deref(), text).await {
+        Ok(()) => {
+            log::info!("[{}] 推送成功 | to={}", send_type.label(), to_log);
         }
         Err(first_err) => {
             if is_unauthorized_error(&first_err) {
-                match issue_and_cache_dynamic_api_token(&aiclaw_bin).await {
+                clear_dynamic_token_cache().await;
+                match issue_and_cache_dynamic_api_token(&magiclaw_bin).await {
                     Ok(next) => {
-                        log::warn!("[微信] daemon token 鉴权失败，已自动签发动态 token 并重试发送");
+                        log::warn!("[{}] daemon token 鉴权失败，已清缓存并重新签发动态 token 后重试发送", send_type.label());
                         if matches!(active_token_source, ApiTokenSource::Env) {
-                            AICLAW_DISABLE_ENV_TOKEN.store(true, Ordering::Relaxed);
+                            MAGICLAW_DISABLE_ENV_TOKEN.store(true, Ordering::Relaxed);
                         }
-                        match send_via_aiclaw_daemon(&client, &api_base, &next.token, &to, context_token.as_deref(), text).await {
-                            Ok(_) => log::info!("[微信] 推送成功 | to={}", to),
-                            Err(retry_err) => log::error!("[微信] 推送失败: {}", retry_err),
+                        match send_via_magiclaw_daemon(&client, &api_base, &next.token, send_type, to.as_deref(), text).await {
+                            Ok(()) => {
+                                log::info!("[{}] 推送成功 | to={}", send_type.label(), to_log);
+                            }
+                            Err(retry_err) => log::error!("[{}] 推送失败: {}", send_type.label(), retry_err),
                         }
                     }
                     Err(issue_err) => {
-                        log::error!("[微信] 推送失败: {}；自动续签失败: {}", first_err, issue_err);
+                        log::error!("[{}] 推送失败: {}；自动续签失败: {}", send_type.label(), first_err, issue_err);
                     }
                 }
             } else {
-                log::error!("[微信] 推送失败: {}", first_err);
+                log::error!("[{}] 推送失败: {}", send_type.label(), first_err);
             }
         }
     }
 }
 
-fn resolve_aiclaw_bin() -> String {
-    std::env::var("AICLAW_BIN")
+async fn push_feishu_via_http(text: &str) {
+    let url = match resolve_feishu_webhook_url() {
+        Some(v) => v,
+        None => {
+            log::error!(
+                "[飞书] 推送失败: 未配置 FEISHU_WEBHOOK_URL（或 MAGICLAW_FEISHU_WEBHOOK_URL）"
+            );
+            return;
+        }
+    };
+
+    log::info!("[飞书] 开始推送 ({}字) | via=http", text.chars().count());
+
+    let client = match reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+    {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!("[飞书] 创建 HTTP 客户端失败: {}", e);
+            return;
+        }
+    };
+
+    let payload = serde_json::json!({
+        "msg_type": "text",
+        "content": {
+            "text": text,
+        }
+    });
+
+    let resp = match client.post(&url).json(&payload).send().await {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!("[飞书] 推送失败: 调用 webhook 失败: {}", e);
+            return;
+        }
+    };
+
+    let status = resp.status();
+    let body_text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        log::error!("[飞书] 推送失败: webhook HTTP {}: {}", status, body_text);
+        return;
+    }
+
+    let parsed = serde_json::from_str::<serde_json::Value>(&body_text).ok();
+    let ok_by_status_code = parsed
+        .as_ref()
+        .and_then(|v| v.get("StatusCode").and_then(|x| x.as_i64()))
+        .map(|code| code == 0)
+        .unwrap_or(false);
+    let ok_by_code = parsed
+        .as_ref()
+        .and_then(|v| v.get("code").and_then(|x| x.as_i64()))
+        .map(|code| code == 0)
+        .unwrap_or(false);
+
+    if ok_by_status_code || ok_by_code {
+        log::info!("[飞书] 推送成功 | via=http");
+        return;
+    }
+
+    log::error!("[飞书] 推送失败: webhook 返回非成功体: {}", body_text);
+}
+
+async fn push_via_magiclaw_cli(send_type: MessageSendType, text: &str) {
+    let to = match send_type {
+        MessageSendType::Wechat => None,
+        MessageSendType::Feishu => match resolve_feishu_target() {
+            Some(v) => Some(v),
+            None => {
+                log::error!(
+                    "[飞书] 解析收件人失败: 飞书发送缺少收件人，请设置 FEISHU_TO（或 MAGICLAW_FEISHU_TO / FEISHU_CHAT_ID / FEISHU_OPEN_ID / FEISHU_USER_ID / FEISHU_EMAIL）"
+                );
+                return;
+            }
+        },
+    };
+
+    let magiclaw_bin = resolve_magiclaw_bin();
+    log::info!("[{}] 开始推送 ({}字) | via=cli", send_type.label(), text.chars().count());
+
+    let mut cmd = tokio::process::Command::new(&magiclaw_bin);
+    cmd.arg("send")
+        .arg("--channel")
+        .arg(send_type.as_str())
+        .arg("--message")
+        .arg(text)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    if let Some(to) = to.as_deref() {
+        cmd.arg("--to").arg(to);
+    }
+
+    // 将 cwd 指向 magiclaw 项目根目录，使其 dotenv 能加载飞书凭证所在的 .env。
+    // 若 cwd 改变，则 MAGICLAW_DB_PATH 的相对路径会失效，故统一转为绝对路径传入。
+    let magiclaw_home = resolve_magiclaw_home(&magiclaw_bin);
+    if let Some(home) = magiclaw_home.as_deref() {
+        cmd.current_dir(home);
+    } else {
+        log::warn!(
+            "[{}] 未能定位 magiclaw 项目根目录（找不到 .env），飞书凭证可能加载失败 | bin={}",
+            send_type.label(),
+            magiclaw_bin
+        );
+    }
+
+    if let Ok(db_path) = std::env::var("MAGICLAW_DB_PATH") {
+        let db_path = db_path.trim();
+        if !db_path.is_empty() {
+            let abs_db = std::fs::canonicalize(db_path)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| {
+                    // 文件可能尚不存在或无法规范化：相对路径手动拼接当前进程 cwd
+                    let p = std::path::Path::new(db_path);
+                    if p.is_absolute() {
+                        db_path.to_string()
+                    } else {
+                        std::env::current_dir()
+                            .map(|cwd| cwd.join(p).to_string_lossy().into_owned())
+                            .unwrap_or_else(|_| db_path.to_string())
+                    }
+                });
+            cmd.env("MAGICLAW_DB_PATH", abs_db);
+        }
+    }
+
+    if let Ok(receive_id_type) = std::env::var("FEISHU_RECEIVE_ID_TYPE") {
+        let receive_id_type = receive_id_type.trim();
+        if !receive_id_type.is_empty() {
+            cmd.arg("--receive-id-type").arg(receive_id_type);
+        }
+    }
+
+    let output = match cmd.output().await {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!("[飞书] 调用 magiclaw send 失败(magiclaw: {}): {}", magiclaw_bin, e);
+            return;
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.success() {
+        let detail = tail_lines(&stdout, 3);
+        if detail.is_empty() {
+            log::info!(
+                "[{}] 推送成功 | to={}",
+                send_type.label(),
+                to.as_deref().unwrap_or("<auto>")
+            );
+        } else {
+            log::info!(
+                "[{}] 推送成功 | to={} | {}",
+                send_type.label(),
+                to.as_deref().unwrap_or("<auto>"),
+                detail
+            );
+        }
+        return;
+    }
+
+    let stderr_tail = tail_lines(&stderr, 8);
+    let stdout_tail = tail_lines(&stdout, 3);
+    log::error!(
+        "[{}] 推送失败(exit={}): {}{}",
+        send_type.label(),
+        output.status,
+        if !stderr_tail.is_empty() {
+            format!("stderr={}", stderr_tail)
+        } else {
+            "stderr=<empty>".to_string()
+        },
+        if !stdout_tail.is_empty() {
+            format!(" | stdout={}", stdout_tail)
+        } else {
+            "".to_string()
+        }
+    );
+}
+
+fn resolve_send_type() -> MessageSendType {
+    // 默认统一走飞书（test 与 prod 一致）；如需微信，显式设置 SEND_TYPE=wechat。
+    let default_type = MessageSendType::Feishu;
+
+    let raw = std::env::var("MAGICLAW_SEND_TYPE")
+        .or_else(|_| std::env::var("SEND_TYPE"))
+        .unwrap_or_else(|_| default_type.as_str().to_string());
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "wechat" | "weixin" | "wx" => MessageSendType::Wechat,
+        "feishu" | "lark" => MessageSendType::Feishu,
+        other => {
+            log::warn!(
+                "未识别的发送类型: {}，回退为默认 {}",
+                other,
+                default_type.as_str()
+            );
+            default_type
+        }
+    }
+}
+
+fn resolve_send_transport(send_type: MessageSendType) -> MessageSendTransport {
+    match send_type {
+        MessageSendType::Wechat => MessageSendTransport::Http,
+        // 飞书自动路由：配置了 webhook 则走 HTTP；否则走 CLI。
+        MessageSendType::Feishu => {
+            if resolve_feishu_webhook_url().is_some() {
+                MessageSendTransport::Http
+            } else {
+                MessageSendTransport::Cli
+            }
+        }
+    }
+}
+
+fn resolve_feishu_webhook_url() -> Option<String> {
+    ["FEISHU_WEBHOOK_URL", "MAGICLAW_FEISHU_WEBHOOK_URL"]
+        .iter()
+        .find_map(|key| {
+            std::env::var(key)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        })
+}
+
+fn resolve_magiclaw_bin() -> String {
+    std::env::var("MAGICLAW_BIN")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| {
             let home = std::env::var("HOME").unwrap_or_default();
-            format!("{}/Desktop/aiclaw/target/release/aiclaw", home)
+            format!("{}/Desktop/magiclaw/target/release/magiclaw", home)
         })
 }
 
+/// 解析 magiclaw 项目根目录（其 `.env` 所在目录）。
+/// magiclaw 启动时通过 dotenvy 从工作目录加载 `.env`，飞书凭证（FEISHU_APP_ID 等）
+/// 存放在 magiclaw 自己的 `.env` 中。派生子进程时需将 cwd 指向该目录，否则读不到凭证。
+/// 优先级：MAGICLAW_HOME 环境变量 > 从二进制路径推导（去掉 `target/release/magiclaw`）。
+fn resolve_magiclaw_home(magiclaw_bin: &str) -> Option<std::path::PathBuf> {
+    if let Ok(home) = std::env::var("MAGICLAW_HOME") {
+        let home = home.trim();
+        if !home.is_empty() {
+            return Some(std::path::PathBuf::from(home));
+        }
+    }
+    let bin_path = std::path::Path::new(magiclaw_bin);
+    // 形如 .../magiclaw/target/release/magiclaw → 上溯 3 级到 .../magiclaw
+    let home = bin_path.parent()?.parent()?.parent()?;
+    if home.join(".env").is_file() {
+        Some(home.to_path_buf())
+    } else {
+        None
+    }
+}
+
 fn resolve_api_addr() -> String {
-    std::env::var("AICLAW_API_ADDR")
+    std::env::var("MAGICLAW_API_ADDR")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_AICLAW_API_ADDR.to_string())
+        .unwrap_or_else(|| DEFAULT_MAGICLAW_API_ADDR.to_string())
 }
 
-async fn resolve_or_issue_api_token(aiclaw_bin: &str) -> Result<(String, ApiTokenSource), String> {
-    if !AICLAW_DISABLE_ENV_TOKEN.load(Ordering::Relaxed) {
-        if let Some(token) = std::env::var("AICLAW_API_TOKEN")
+async fn resolve_or_issue_api_token(magiclaw_bin: &str) -> Result<(String, ApiTokenSource), String> {
+    if !MAGICLAW_DISABLE_ENV_TOKEN.load(Ordering::Relaxed) {
+        if let Some(token) = std::env::var("MAGICLAW_API_TOKEN")
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty()) {
@@ -232,7 +740,7 @@ async fn resolve_or_issue_api_token(aiclaw_bin: &str) -> Result<(String, ApiToke
         return Ok((cached.token, ApiTokenSource::DynamicFileCache));
     }
 
-    let issued = issue_and_cache_dynamic_api_token(aiclaw_bin).await?;
+    let issued = issue_and_cache_dynamic_api_token(magiclaw_bin).await?;
     Ok((issued.token, ApiTokenSource::DynamicIssued))
 }
 
@@ -249,7 +757,7 @@ fn api_token_cache_file_path() -> std::path::PathBuf {
         .filter(|p| !p.as_os_str().is_empty())
         .map(std::path::Path::to_path_buf)
         .unwrap_or_else(|| std::path::PathBuf::from("./data"));
-    parent.join("aiclaw_api_token_cache.json")
+    parent.join("magiclaw_api_token_cache.json")
 }
 
 fn now_epoch_secs() -> i64 {
@@ -257,11 +765,11 @@ fn now_epoch_secs() -> i64 {
 }
 
 fn token_refresh_ahead_secs() -> i64 {
-    std::env::var("AICLAW_TOKEN_REFRESH_AHEAD_SECS")
+    std::env::var("MAGICLAW_TOKEN_REFRESH_AHEAD_SECS")
         .ok()
         .and_then(|s| s.trim().parse::<i64>().ok())
         .filter(|v| *v >= 0)
-        .unwrap_or(DEFAULT_AICLAW_TOKEN_REFRESH_AHEAD_SECS)
+        .unwrap_or(DEFAULT_MAGICLAW_TOKEN_REFRESH_AHEAD_SECS)
 }
 
 fn is_cached_token_expired(token: &CachedApiToken) -> bool {
@@ -272,7 +780,7 @@ fn is_cached_token_expired(token: &CachedApiToken) -> bool {
 }
 
 async fn load_dynamic_token_from_mem_cache() -> Option<CachedApiToken> {
-    let guard = AICLAW_TOKEN_MEM_CACHE.read().await;
+    let guard = MAGICLAW_TOKEN_MEM_CACHE.read().await;
     let v = guard.clone();
     drop(guard);
     v.filter(|t| !t.token.trim().is_empty() && !is_cached_token_expired(t))
@@ -289,8 +797,18 @@ fn load_dynamic_token_from_file_cache() -> Option<CachedApiToken> {
 }
 
 async fn cache_dynamic_token_in_mem(token: &CachedApiToken) {
-    let mut guard = AICLAW_TOKEN_MEM_CACHE.write().await;
+    let mut guard = MAGICLAW_TOKEN_MEM_CACHE.write().await;
     *guard = Some(token.clone());
+}
+
+async fn clear_dynamic_token_cache() {
+    {
+        let mut guard = MAGICLAW_TOKEN_MEM_CACHE.write().await;
+        *guard = None;
+    }
+
+    let path = api_token_cache_file_path();
+    let _ = std::fs::remove_file(path);
 }
 
 fn cache_dynamic_token_in_file(token: &CachedApiToken) -> Result<(), String> {
@@ -344,8 +862,8 @@ fn parse_issue_token_output(stdout: &str) -> Result<CachedApiToken, String> {
     Ok(CachedApiToken { token, expires_at })
 }
 
-async fn issue_and_cache_dynamic_api_token(aiclaw_bin: &str) -> Result<CachedApiToken, String> {
-    let _issue_guard = AICLAW_TOKEN_ISSUE_LOCK.lock().await;
+async fn issue_and_cache_dynamic_api_token(magiclaw_bin: &str) -> Result<CachedApiToken, String> {
+    let _issue_guard = MAGICLAW_TOKEN_ISSUE_LOCK.lock().await;
 
     // 双检锁：等待锁期间可能已有其他协程签发并写入缓存。
     if let Some(cached) = load_dynamic_token_from_mem_cache().await {
@@ -356,23 +874,23 @@ async fn issue_and_cache_dynamic_api_token(aiclaw_bin: &str) -> Result<CachedApi
         return Ok(cached);
     }
 
-    let project_id = std::env::var("AICLAW_PROJECT_ID")
+    let project_id = std::env::var("MAGICLAW_PROJECT_ID")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_AICLAW_PROJECT_ID.to_string());
-    let client_name = std::env::var("AICLAW_CLIENT_NAME")
+        .unwrap_or_else(|| DEFAULT_MAGICLAW_PROJECT_ID.to_string());
+    let client_name = std::env::var("MAGICLAW_CLIENT_NAME")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| format!("{}-{}", DEFAULT_AICLAW_CLIENT_NAME, std::process::id()));
-    let ttl_secs = std::env::var("AICLAW_TOKEN_TTL_SECS")
+        .unwrap_or_else(|| format!("{}-{}", DEFAULT_MAGICLAW_CLIENT_NAME, std::process::id()));
+    let ttl_secs = std::env::var("MAGICLAW_TOKEN_TTL_SECS")
         .ok()
         .and_then(|s| s.trim().parse::<i64>().ok())
         .filter(|v| *v > 0)
-        .unwrap_or(DEFAULT_AICLAW_TOKEN_TTL_SECS);
+        .unwrap_or(DEFAULT_MAGICLAW_TOKEN_TTL_SECS);
 
-    let output = tokio::process::Command::new(aiclaw_bin)
+    let output = tokio::process::Command::new(magiclaw_bin)
         .arg("auth")
         .arg("issue")
         .arg("--project")
@@ -383,12 +901,13 @@ async fn issue_and_cache_dynamic_api_token(aiclaw_bin: &str) -> Result<CachedApi
         .arg("send,window_status")
         .arg("--ttl-secs")
         .arg(ttl_secs.to_string())
+        .env("MAGICLAW_DB_PATH", std::env::var("MAGICLAW_DB_PATH").unwrap_or_else(|_| std::env::var("DATABASE_PATH").unwrap_or_else(|_| "./data/stock_analysis.db".to_string())))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
         .await
-        .map_err(|e| format!("执行 aiclaw auth issue 失败: {}", e))?;
+        .map_err(|e| format!("执行 magiclaw auth issue 失败: {}", e))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -396,7 +915,7 @@ async fn issue_and_cache_dynamic_api_token(aiclaw_bin: &str) -> Result<CachedApi
         let stderr_tail = tail_lines(&stderr, 8);
         let stdout_tail = tail_lines(&stdout, 3);
         return Err(format!(
-            "aiclaw auth issue 失败(exit={}): {}{}",
+            "magiclaw auth issue 失败(exit={}): {}{}",
             output.status,
             if !stderr_tail.is_empty() { format!("stderr={}", stderr_tail) } else { "".to_string() },
             if !stdout_tail.is_empty() { format!(" | stdout={}", stdout_tail) } else { "".to_string() }
@@ -425,44 +944,164 @@ fn resolve_wechat_data_dir() -> std::path::PathBuf {
     std::path::Path::new(&home).join(".claude").join("channels").join("wechat")
 }
 
+fn parse_first_peer_id_from_window_status(body: &str) -> Option<String> {
+    let peers = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("peers").cloned())
+        .and_then(|peers| peers.as_array().cloned())?;
+
+    peers
+        .iter()
+        .filter_map(|peer| peer.get("peer_id").and_then(|value| value.as_str()))
+        .map(str::trim)
+        .find(|peer_id| !peer_id.is_empty())
+        .map(|peer_id| peer_id.to_string())
+}
+
+fn resolve_magiclaw_log_dir() -> std::path::PathBuf {
+    let db_path = std::env::var("MAGICLAW_DB_PATH")
+        .unwrap_or_else(|_| std::env::var("DATABASE_PATH").unwrap_or_else(|_| "./data/stock_analysis.db".to_string()));
+    std::path::Path::new(&db_path)
+        .parent()
+        .map(|parent| parent.join("logs"))
+        .unwrap_or_else(|| std::path::PathBuf::from("logs"))
+}
+
+fn resolve_wechat_target_from_magiclaw_logs() -> Option<String> {
+    let log_dir = resolve_magiclaw_log_dir();
+    let mut log_files: Vec<std::path::PathBuf> = std::fs::read_dir(&log_dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.starts_with("magiclaw-") && name.ends_with(".log"))
+                .unwrap_or(false)
+        })
+        .collect();
+    log_files.sort();
+    log_files.reverse();
+
+    for log_path in log_files {
+        let content = match std::fs::read_to_string(&log_path) {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+        for line in content.lines().rev() {
+            if let Some(peer_id) = line
+                .split("peer_id=")
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .map(str::trim)
+                .filter(|peer_id| !peer_id.is_empty())
+            {
+                return Some(peer_id.to_string());
+            }
+        }
+    }
+
+    None
+}
+
 #[derive(Deserialize)]
 struct WechatAccountFile {
     #[serde(rename = "userId")]
     user_id: Option<String>,
 }
 
-fn resolve_wechat_target() -> Result<(String, Option<String>), String> {
+async fn resolve_wechat_target(
+    client: &reqwest::Client,
+    api_base: &str,
+    api_token: &str,
+) -> Result<String, String> {
     if let Ok(to) = std::env::var("WECHAT_TO") {
         let to = to.trim();
         if !to.is_empty() {
-            return Ok((to.to_string(), None));
+            return Ok(to.to_string());
         }
+    }
+
+    let url = format!("{}/api/window_status", api_base);
+    let daemon_resp = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client
+            .get(&url)
+            .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", api_token))
+            .send(),
+    )
+    .await;
+
+    if let Ok(Ok(resp)) = daemon_resp {
+        if resp.status().is_success() {
+            if let Ok(body) = resp.text().await {
+                if let Some(peer_id) = parse_first_peer_id_from_window_status(&body) {
+                    return Ok(peer_id);
+                }
+            }
+        }
+    }
+
+    if let Some(peer_id) = resolve_wechat_target_from_magiclaw_logs() {
+        return Ok(peer_id);
     }
 
     let data_dir = resolve_wechat_data_dir();
     let account_path = data_dir.join("account.json");
-    let ctx_path = data_dir.join("context_tokens.json");
 
     let account_text = std::fs::read_to_string(&account_path)
         .map_err(|e| format!("读取 account.json 失败({}): {}", account_path.display(), e))?;
     let account: WechatAccountFile = serde_json::from_str(&account_text)
         .map_err(|e| format!("解析 account.json 失败: {}", e))?;
 
-    let tokens_text = std::fs::read_to_string(&ctx_path).unwrap_or_else(|_| "{}".to_string());
-    let tokens: std::collections::HashMap<String, String> = serde_json::from_str(&tokens_text)
-        .map_err(|e| format!("解析 context_tokens.json 失败: {}", e))?;
+    account.user_id.ok_or_else(|| {
+        format!(
+            "未找到收件人：请先在微信给 bot 发消息，或设置 WECHAT_TO，目录={}",
+            data_dir.display()
+        )
+    })
+}
 
-    let to = tokens.keys().next().cloned()
-        .or(account.user_id)
-        .ok_or_else(|| {
-            format!(
-                "未找到收件人：请先在微信给 bot 发消息，或设置 WECHAT_TO，目录={}",
-                data_dir.display()
-            )
-        })?;
+fn resolve_feishu_target() -> Option<String> {
+    for key in [
+        "FEISHU_TO",
+        "MAGICLAW_FEISHU_TO",
+        "FEISHU_CHAT_ID",
+        "FEISHU_OPEN_ID",
+        "FEISHU_USER_ID",
+        "FEISHU_EMAIL",
+    ] {
+        if let Ok(to) = std::env::var(key) {
+            let to = to.trim();
+            if !to.is_empty() {
+                return Some(to.to_string());
+            }
+        }
+    }
+    None
+}
 
-    let context_token = tokens.get(&to).cloned();
-    Ok((to, context_token))
+async fn resolve_send_target(
+    send_type: MessageSendType,
+    client: &reqwest::Client,
+    api_base: &str,
+    api_token: &str,
+) -> Result<Option<String>, String> {
+    match send_type {
+        MessageSendType::Wechat => resolve_wechat_target(client, api_base, api_token)
+            .await
+            .map(Some),
+        MessageSendType::Feishu => {
+            let to = resolve_feishu_target();
+            if to.is_none() {
+                return Err(
+                    "飞书发送缺少收件人：请设置 FEISHU_TO（或 MAGICLAW_FEISHU_TO / FEISHU_CHAT_ID / FEISHU_OPEN_ID / FEISHU_USER_ID / FEISHU_EMAIL）"
+                        .to_string(),
+                );
+            }
+            Ok(to)
+        }
+    }
 }
 
 async fn daemon_health_ok(client: &reqwest::Client, api_base: &str) -> bool {
@@ -478,9 +1117,9 @@ async fn daemon_health_ok(client: &reqwest::Client, api_base: &str) -> bool {
     }
 }
 
-async fn ensure_aiclaw_daemon(
+async fn ensure_magiclaw_daemon(
     client: &reqwest::Client,
-    aiclaw_bin: &str,
+    magiclaw_bin: &str,
     api_addr: &str,
     api_base: &str,
 ) -> Result<DaemonReadySource, String> {
@@ -488,23 +1127,25 @@ async fn ensure_aiclaw_daemon(
         return Ok(DaemonReadySource::Reused);
     }
 
-    let _guard = AICLAW_DAEMON_BOOT_LOCK.lock().await;
+    let _guard = MAGICLAW_DAEMON_BOOT_LOCK.lock().await;
     if daemon_health_ok(client, api_base).await {
         return Ok(DaemonReadySource::Reused);
     }
 
-    let mut cmd = tokio::process::Command::new(aiclaw_bin);
+    let mut cmd = tokio::process::Command::new(magiclaw_bin);
+    let magiclaw_db_path = std::env::var("MAGICLAW_DB_PATH").unwrap_or_else(|_| std::env::var("DATABASE_PATH").unwrap_or_else(|_| "./data/stock_analysis.db".to_string()));
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env("AICLAW_API_ADDR", api_addr);
+        .env("MAGICLAW_API_ADDR", api_addr)
+        .env("MAGICLAW_DB_PATH", magiclaw_db_path);
 
     if let Ok(dir) = std::env::var("WECHAT_CHANNEL_DIR") {
         cmd.env("WECHAT_CHANNEL_DIR", dir);
     }
 
     let mut child = cmd.spawn()
-        .map_err(|e| format!("启动 aiclaw daemon 失败(aiclaw: {}): {}", aiclaw_bin, e))?;
+        .map_err(|e| format!("启动 magiclaw daemon 失败(magiclaw: {}): {}", magiclaw_bin, e))?;
 
     for _ in 0..100 {
         if daemon_health_ok(client, api_base).await {
@@ -518,12 +1159,12 @@ async fn ensure_aiclaw_daemon(
                     Ok(o) => {
                         let stdout = String::from_utf8_lossy(&o.stdout);
                         let stderr = String::from_utf8_lossy(&o.stderr);
-                        if stderr.contains("another aiclaw instance is already running") {
+                        if stderr.contains("another magiclaw instance is already running") {
                             if daemon_health_ok(client, api_base).await {
                                 return Ok(DaemonReadySource::Reused);
                             }
                             return Err(
-                                "检测到 aiclaw 单实例锁冲突(data/aiclaw.instance.lock)，且当前端口不可用。请先结束旧的 aiclaw 进程后重试（可用: pgrep -af aiclaw / pkill -f '/aiclaw'）"
+                                "检测到 magiclaw 单实例锁冲突(data/magiclaw.instance.lock)，且当前端口不可用。请先结束旧的 magiclaw 进程后重试（可用: pgrep -af magiclaw / pkill -f '/magiclaw'）"
                                     .to_string(),
                             );
                         }
@@ -540,7 +1181,7 @@ async fn ensure_aiclaw_daemon(
                     Err(e) => format!(" | 获取 daemon 输出失败: {}", e),
                 };
                 return Err(format!(
-                    "daemon 进程提前退出(exit={})，请检查 AICLAW_BIN/AICLAW_API_ADDR/AICLAW_API_TOKEN 配置{}",
+                    "daemon 进程提前退出(exit={})，请检查 MAGICLAW_BIN/MAGICLAW_API_ADDR/MAGICLAW_API_TOKEN 配置{}",
                     status,
                     extra
                 ));
@@ -568,23 +1209,20 @@ fn tail_lines(s: &str, n: usize) -> String {
     v.join(" | ")
 }
 
-async fn send_via_aiclaw_daemon(
+async fn send_via_magiclaw_daemon(
     client: &reqwest::Client,
     api_base: &str,
     api_token: &str,
-    to: &str,
-    context_token: Option<&str>,
+    send_type: MessageSendType,
+    to: Option<&str>,
     text: &str,
 ) -> Result<(), String> {
     let url = format!("{}/api/send", api_base);
-    let mut body = serde_json::json!({
-        "to": to,
-        "text": text,
-    });
-    if let Some(token) = context_token {
-        if !token.trim().is_empty() {
-            body["context_token"] = serde_json::Value::String(token.to_string());
-        }
+    let mut body = serde_json::Map::new();
+    body.insert("send_type".to_string(), serde_json::json!(send_type.as_str()));
+    body.insert("text".to_string(), serde_json::json!(text));
+    if let Some(to) = to.map(str::trim).filter(|v| !v.is_empty()) {
+        body.insert("to".to_string(), serde_json::json!(to));
     }
 
     let resp = tokio::time::timeout(
@@ -592,7 +1230,7 @@ async fn send_via_aiclaw_daemon(
         client
             .post(&url)
             .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", api_token))
-            .json(&body)
+            .json(&serde_json::Value::Object(body))
             .send(),
     ).await
         .map_err(|_| "调用 /api/send 超时(>30s)".to_string())
@@ -613,11 +1251,12 @@ async fn send_via_aiclaw_daemon(
 
     if status == reqwest::StatusCode::UNAUTHORIZED {
         return Err(
-            "daemon 鉴权失败(401)：请确保 monitor 与 daemon 使用相同 AICLAW_API_TOKEN，并重启 daemon 使新 token 生效".to_string(),
+            "daemon 鉴权失败(401)：请确保 monitor 与 daemon 使用相同 MAGICLAW_API_TOKEN，并重启 daemon 使新 token 生效".to_string(),
         );
     }
 
-    if status == reqwest::StatusCode::PRECONDITION_FAILED
+    if matches!(send_type, MessageSendType::Wechat)
+        && status == reqwest::StatusCode::PRECONDITION_FAILED
         && text_body.contains("no valid context_token for peer") {
         return Err(
             "daemon 拒绝发送(412)：当前会话 context_token 无效。请先在微信给 bot 发一条消息刷新会话窗口后重试".to_string(),
@@ -648,40 +1287,19 @@ async fn verify_daemon_auth(
     let body = resp.text().await.unwrap_or_default();
 
     if status.is_success() {
-        // 微信推送窗口是「短时 + 限量」的:一条用户入站消息只开一个允许少量主动
-        // 推送的窗口,用完/过期后 peer token 变 stale(ret=-2),没有新入站消息就无法
-        // 刷新,此时 /api/send 会在 daemon 侧反复重试等待刷新而长时间阻塞。
-        // 这里在预检阶段拦截两种不可用状态,给出可操作提示,避免每条推送干等 30s:
-        //   1) peers 为空        → 从未建立会话窗口
-        //   2) 所有 peer 均 stale → 窗口已过期/用尽
-        let parsed = serde_json::from_str::<serde_json::Value>(&body).ok();
-        let peers = parsed
-            .as_ref()
-            .and_then(|v| v.get("peers"))
-            .and_then(|p| p.as_array());
-
-        if let Some(peers) = peers {
-            if peers.is_empty() {
-                return Err(
-                    "当前没有活跃微信会话窗口(peers 为空)。微信限制:bot 主动推送前需用户近期给 bot 发过消息。请先在微信给 bot 发一条任意消息刷新会话窗口后重试".to_string(),
-                );
-            }
-            let has_usable = peers.iter().any(|p| {
-                !p.get("stale").and_then(|s| s.as_bool()).unwrap_or(false)
-            });
-            if !has_usable {
-                return Err(
-                    "微信会话窗口已过期(peer 全部 stale=true)。窗口为短时+限量,需用户重新给 bot 发一条消息刷新后才能继续推送".to_string(),
-                );
-            }
-        }
+        // 窗口可用性预检已移除。ilink 的 ret=-2 不是“窗口用尽/会话过期”的致命信号:
+        // daemon 侧 /api/send 现在对 ret=-2 直接当作成功继续发送(仅 errcode=-14 才算
+        // 会话过期),连续主动推送已验证可稳定工作。因此 stale / should_refresh /
+        // send_count>=9 这些旧启发式都已失效,不再用它们拦截发送。
+        // 这里只把 /api/window_status 当作鉴权连通性校验(HTTP 200 = token 有效);
+        // 真正无可用 context_token 时,/api/send 会返回 412 并给出可操作提示。
         return Ok(());
     }
 
     if status == reqwest::StatusCode::UNAUTHORIZED {
         let source_tip = match api_token_source {
             ApiTokenSource::Env => {
-                "当前 monitor 使用环境变量 AICLAW_API_TOKEN，但 daemon 侧 token 不一致"
+                "当前 monitor 使用环境变量 MAGICLAW_API_TOKEN，但 daemon 侧 token 不一致"
             }
             ApiTokenSource::DynamicMemCache | ApiTokenSource::DynamicFileCache | ApiTokenSource::DynamicIssued => {
                 "当前 monitor 使用动态 token(数据库签发)。可能该 token 已过期/被吊销，monitor 将自动续签"
@@ -773,7 +1391,8 @@ async fn run_test_scan() {
     let report = tokio::task::spawn_blocking(move || {
         let quotes = fetch_position_quotes();
         let trades = stock_analysis::portfolio::get_trade_history(90).unwrap_or_default();
-        let reviews = stock_analysis::review::journal::review_closed_trades(&trades);
+        let mut reviews = stock_analysis::review::journal::review_closed_trades(&trades);
+        stock_analysis::review::journal::enrich_post_exit(&mut reviews);
         let equity = stock_analysis::portfolio::get_equity_curve(365).unwrap_or_default();
         let mut stats = stock_analysis::review::equity::compute_stats(&equity);
         stock_analysis::review::equity::enrich_with_trades(&mut stats, &reviews);
@@ -788,9 +1407,13 @@ async fn run_test_scan() {
     let _ = tokio::task::spawn_blocking(snapshot_portfolio_value).await;
 
     // 13. 产业链扫描（v3 新增）
-    let opp_text = stock_analysis::opportunity::run_opportunity_scan().await;
-    log::info!("[测试] 产业链扫描:\n{}", opp_text);
-    push_wechat(&opp_text).await;
+    let scan = stock_analysis::opportunity::run_opportunity_scan().await;
+    log::info!("[测试] 产业链扫描:\n{}", scan.chain_text);
+    push_wechat(&scan.chain_text).await;
+    if !scan.impact_text.is_empty() {
+        log::info!("[测试] 持仓影响:\n{}", scan.impact_text);
+        push_wechat(&scan.impact_text).await;
+    }
 
     // 14. v4 决策层：排除引擎 + 风控（含 HTTP 调用，走 spawn_blocking）
     let h = holdings.clone();
@@ -886,12 +1509,13 @@ fn run_factor_ic_analysis() -> Option<String> {
 async fn run_review_only() {
     log::info!("[复盘] 手动触发盘后分析...");
 
-    let (report, breakout_text, risk_text) = tokio::task::spawn_blocking(|| {
+    let (report, holding_breakout_text, watch_breakout_text, market_breakout_text, risk_text) = tokio::task::spawn_blocking(|| {
         let holdings = stock_analysis::portfolio::get_positions().unwrap_or_default();
         let quotes = fetch_position_quotes();
         let prices = build_price_map(&quotes);
         let trades = stock_analysis::portfolio::get_trade_history(90).unwrap_or_default();
-        let reviews = stock_analysis::review::journal::review_closed_trades(&trades);
+        let mut reviews = stock_analysis::review::journal::review_closed_trades(&trades);
+        stock_analysis::review::journal::enrich_post_exit(&mut reviews);
         let equity = stock_analysis::portfolio::get_equity_curve(365).unwrap_or_default();
         let mut stats = stock_analysis::review::equity::compute_stats(&equity);
         stock_analysis::review::equity::enrich_with_trades(&mut stats, &reviews);
@@ -905,51 +1529,92 @@ async fn run_review_only() {
         let holding_map: std::collections::HashMap<String, &stock_analysis::portfolio::Position> =
             holdings.iter().map(|p| (p.code.clone(), p)).collect();
 
-        // v6 放量分析（持仓 + 自选）
-        let mut brk = String::new();
+        // v6 放量分析（持仓 / 自选 分开发送）
+        let mut holding_brk = String::new();
+        let mut watch_brk = String::new();
+        let mut market_brk = String::new();
         // v7 风控：收盘止损 + 轮动研判（复用已拉 K 线，零额外 HTTP）
         let mut stop_signals: Vec<stock_analysis::risk::stop_loss::StopSignal> = Vec::new();
         let mut rotation_lines: Vec<String> = Vec::new();
         let watchlist = stock_analysis::portfolio::get_watchlist().unwrap_or_default();
-        let all_stocks: Vec<_> = holdings.iter().chain(watchlist.iter()).collect();
+        let watch_codes: std::collections::HashSet<String> =
+            watchlist.iter().map(|p| p.code.clone()).collect();
         if let Ok(fetcher) = stock_analysis::data_provider::DataFetcherManager::new() {
-            let mut lines = vec!["📊 放量分析（盘后·算法研判仅供参考）".to_string()];
-            for p in &all_stocks {
+            // —— 持仓放量分析 + 止损 / 轮动 ——
+            let mut holding_lines = vec!["📊 放量分析·持仓（盘后·算法研判仅供参考）".to_string()];
+            for p in &holdings {
                 if let Ok((kline, _)) = fetcher.get_daily_data(&p.code, 60) {
                     let sig = stock_analysis::breakout::engine::analyze_postmarket(&p.code, &p.name, &kline);
-                    lines.push(format!(
+                    holding_lines.push(format!(
                         "  {} {}({}) — {} 置信{}% [{}]",
                         sig.breakout_type.emoji(), sig.name, sig.code,
                         sig.breakout_type.label(), sig.confidence, sig.description,
                     ));
 
-                    // 仅对持仓做风控检查
-                    if holding_codes.contains(&p.code) {
-                        // 现价：缺失则跳过止损（不静默用 0 价触发假硬止损 — AGENTS.md 2.2）
-                        match prices.get(&p.code) {
-                            Some(&cur) if cur > 0.0 => {
-                                let ma20 = compute_ma(&kline, 20);
-                                let ma60 = compute_ma(&kline, 60);
-                                if let Some(pos) = holding_map.get(&p.code) {
-                                    let mut sigs = stock_analysis::risk::stop_loss::check_stops(
-                                        &p.code, &p.name, cur, pos.cost_price, pos.hard_stop, ma20, ma60,
-                                    );
-                                    stop_signals.append(&mut sigs);
-                                }
+                    // 现价：缺失则跳过止损（不静默用 0 价触发假硬止损 — AGENTS.md 2.2）
+                    match prices.get(&p.code) {
+                        Some(&cur) if cur > 0.0 => {
+                            let ma20 = compute_ma(&kline, 20);
+                            let ma60 = compute_ma(&kline, 60);
+                            if let Some(pos) = holding_map.get(&p.code) {
+                                let mut sigs = stock_analysis::risk::stop_loss::check_stops(
+                                    &p.code, &p.name, cur, pos.cost_price, pos.hard_stop, ma20, ma60,
+                                );
+                                stop_signals.append(&mut sigs);
                             }
-                            _ => log::warn!("[复盘] {}({}) 现价缺失，跳过止损检查", p.name, p.code),
                         }
-                        // 轮动研判（健康回调 vs 趋势结束）
-                        let rot = stock_analysis::decision::rotation::judge_trend(&kline);
-                        rotation_lines.push(format!(
-                            "  {} {}({}) — {} [{}]",
-                            rot.status.emoji(), p.name, p.code,
-                            rot.status.label(), rot.reasons.join("·"),
-                        ));
+                        _ => log::warn!("[复盘] {}({}) 现价缺失，跳过止损检查", p.name, p.code),
                     }
+                    // 轮动研判（健康回调 vs 趋势结束）
+                    let rot = stock_analysis::decision::rotation::judge_trend(&kline);
+                    rotation_lines.push(format!(
+                        "  {} {}({}) — {} [{}]",
+                        rot.status.emoji(), p.name, p.code,
+                        rot.status.label(), rot.reasons.join("·"),
+                    ));
                 }
             }
-            if lines.len() > 1 { brk = lines.join("\n"); }
+            if holding_lines.len() > 1 { holding_brk = holding_lines.join("\n"); }
+
+            // —— 自选（STOCK_LIST）放量分析（剔除已在持仓列出的标的）——
+            let mut watch_lines = vec!["📊 放量分析·自选（盘后·算法研判仅供参考）".to_string()];
+            for p in &watchlist {
+                if holding_codes.contains(&p.code) { continue; }
+                if let Ok((kline, _)) = fetcher.get_daily_data(&p.code, 60) {
+                    let sig = stock_analysis::breakout::engine::analyze_postmarket(&p.code, &p.name, &kline);
+                    watch_lines.push(format!(
+                        "  {} {}({}) — {} 置信{}% [{}]",
+                        sig.breakout_type.emoji(), sig.name, sig.code,
+                        sig.breakout_type.label(), sig.confidence, sig.description,
+                    ));
+                }
+            }
+            if watch_lines.len() > 1 { watch_brk = watch_lines.join("\n"); }
+
+            // —— 实盘量能优选：全市场量能前列 + 走势较好（盘后 Top5）——
+            let mut market_lines = vec!["📊 放量分析·实盘优选（盘后·算法研判仅供参考）".to_string()];
+            let market_candidates = fetch_market_volume_ratio_leaders(80).unwrap_or_default();
+            let mut picked = 0usize;
+            for s in &market_candidates {
+                if picked >= 5 { break; }
+                if holding_codes.contains(&s.code) || watch_codes.contains(&s.code) {
+                    continue;
+                }
+                if let Ok((kline, _)) = fetcher.get_daily_data(&s.code, 60) {
+                    let sig = stock_analysis::breakout::engine::analyze_postmarket(&s.code, &s.name, &kline);
+                    if sig.breakout_type != stock_analysis::breakout::signal::BreakoutType::Launch || sig.confidence < 50 {
+                        continue;
+                    }
+                    market_lines.push(format!(
+                        "  {} {}({}) — {} 置信{}% [量比{:.1} 主力{:+.2}亿 | {}]",
+                        sig.breakout_type.emoji(), sig.name, sig.code,
+                        sig.breakout_type.label(), sig.confidence,
+                        s.volume_ratio, s.main_net_yi, sig.description,
+                    ));
+                    picked += 1;
+                }
+            }
+            if market_lines.len() > 1 { market_brk = market_lines.join("\n"); }
         }
 
         // 组装风控文本：止损告警 + 轮动研判
@@ -963,21 +1628,42 @@ async fn run_review_only() {
             risk.push_str("🔄 持仓轮动研判（算法·仅供参考）\n");
             risk.push_str(&rotation_lines.join("\n"));
         }
-        (r, brk, risk)
+        (r, holding_brk, watch_brk, market_brk, risk)
     }).await.unwrap_or_default();
 
     log::info!("[复盘] 复盘报告:\n{}", report);
     push_wechat(&report).await;
 
-    if !breakout_text.is_empty() {
-        log::info!("[复盘] 放量分析:\n{}", breakout_text);
-        push_wechat(&breakout_text).await;
+    // 与正常收盘路径保持一致：推送优选候选（最多5只，阈值过滤后可少推/不推）
+    let post_close_candidates = stock_analysis::opportunity::run_post_close_candidates(5).await;
+    log::info!("[复盘] 优选候选:\n{}", post_close_candidates);
+    push_wechat(&post_close_candidates).await;
+
+    // 盘后统计上一交易日虚拟观察仓表现（可配置开关）
+    push_virtual_next_day_review_if_needed().await;
+
+    if !holding_breakout_text.is_empty() {
+        log::info!("[复盘] 放量分析·持仓:\n{}", holding_breakout_text);
+        push_wechat(&holding_breakout_text).await;
+    }
+
+    if !watch_breakout_text.is_empty() {
+        log::info!("[复盘] 放量分析·自选:\n{}", watch_breakout_text);
+        push_wechat(&watch_breakout_text).await;
+    }
+
+    if !market_breakout_text.is_empty() {
+        log::info!("[复盘] 放量分析·实盘优选:\n{}", market_breakout_text);
+        push_wechat(&market_breakout_text).await;
     }
 
     if !risk_text.is_empty() {
         log::info!("[复盘] 风控研判:\n{}", risk_text);
         push_wechat(&risk_text).await;
     }
+
+    // 盘后持仓多 Agent 深度研判（6 分析师 + 多空辩论 + 仲裁），逐只推送飞书
+    run_review_deep_analysis().await;
 
     let falsify_text = stock_analysis::review::falsify::daily_falsify();
     log::info!("[复盘] 证伪提醒:\n{}", falsify_text);
@@ -991,7 +1677,83 @@ async fn run_review_only() {
     log::info!("[复盘] ======== 盘后分析完成 ========");
 }
 
-/// 消息监控独立循环 —— 不受交易日/交易时段限制。
+/// 盘后持仓多 Agent 深度研判：对每只真实持仓跑「6 分析师 + 多空辩论 + 仲裁」流水线，
+/// 结果逐只推送飞书。受 `AI_AGENT_PIPELINE`（默认开启）控制；关闭则整体跳过。
+async fn run_review_deep_analysis() {
+    use futures::stream::{self, StreamExt};
+
+    // 开关：与主流程一致，AI_AGENT_PIPELINE=false 时不跑多 Agent
+    let enabled = std::env::var("AI_AGENT_PIPELINE")
+        .map(|v| v.trim().to_lowercase() != "false")
+        .unwrap_or(true);
+    if !enabled {
+        log::info!("[复盘] AI_AGENT_PIPELINE=false，跳过持仓多 Agent 深度研判");
+        return;
+    }
+
+    let holdings = stock_analysis::portfolio::get_positions().unwrap_or_default();
+    if holdings.is_empty() {
+        log::info!("[复盘] 无持仓，跳过多 Agent 深度研判");
+        return;
+    }
+
+    // 深度研判并发度（LLM 密集，默认 3）
+    let concurrency = std::env::var("DEEP_ANALYSIS_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&c| c > 0)
+        .unwrap_or(3);
+
+    log::info!("[复盘] 持仓多 Agent 深度研判开始（{} 只，并发 {}）", holdings.len(), concurrency);
+
+    // 并发跑多 Agent，结果回收后按持仓顺序推送
+    let codes: Vec<(String, String)> =
+        holdings.iter().map(|p| (p.code.clone(), p.name.clone())).collect();
+
+    let results: Vec<(String, String, Option<String>)> = stream::iter(codes)
+        .map(|(code, name)| async move {
+            log::info!("[复盘] ▶ 多 Agent 研判 {} {}", code, name);
+            let deep = tokio::time::timeout(
+                std::time::Duration::from_secs(300),
+                stock_analysis::deep_analyzer::run_multi_agent_analysis(&code),
+            )
+            .await;
+            let md = match deep {
+                Ok(Ok(md)) if !md.trim().is_empty() => Some(md),
+                Ok(Ok(_)) => {
+                    log::warn!("[复盘] {} 多 Agent 返回空", code);
+                    None
+                }
+                Ok(Err(e)) => {
+                    log::warn!("[复盘] {} 多 Agent 失败: {:#}", code, e);
+                    None
+                }
+                Err(_) => {
+                    log::warn!("[复盘] {} 多 Agent 超时(300s)", code);
+                    None
+                }
+            };
+            (code, name, md)
+        })
+        .buffer_unordered(concurrency)
+        .collect()
+        .await;
+
+    // 按持仓原顺序推送（buffer_unordered 完成顺序不确定，重排回固定顺序）
+    let mut by_code: std::collections::HashMap<String, (String, Option<String>)> =
+        results.into_iter().map(|(c, n, m)| (c, (n, m))).collect();
+    for p in &holdings {
+        let Some((name, md)) = by_code.remove(&p.code) else { continue };
+        let Some(md) = md else { continue };
+        let header = format!("🧠 持仓深度研判 · {}({})\n", name, p.code);
+        let text = format!("{}{}", header, md);
+        log::info!("[复盘] 持仓深度研判 {}({}):\n{}", name, p.code, md);
+        push_wechat(&text).await;
+    }
+
+    log::info!("[复盘] 持仓多 Agent 深度研判完成");
+}
+
 /// 窗口：盘前08:00-09:30、盘中09:30-15:00、盘后15:00-22:00。
 async fn news_monitor_loop() {
     use stock_analysis::monitor::detector::{AlertEvent, AlertLevel};
@@ -1152,11 +1914,17 @@ async fn news_monitor_loop() {
         if opp_due {
             last_opp_scan = Some(std::time::Instant::now());
             tokio::spawn(async move {
-                let opp_text = stock_analysis::opportunity::run_opportunity_scan().await;
+                let scan = stock_analysis::opportunity::run_opportunity_scan().await;
                 // 仅在有实际机会时推送；空结果（暂无快讯/未命中/无可用标的）只记日志不刷屏。
+                let opp_text = &scan.chain_text;
                 if !opp_text.contains("暂无") && !opp_text.contains("无可用标的") && !opp_text.contains("未命中") {
                     log::info!("[产业链] {}", opp_text);
-                    push_wechat(&opp_text).await;
+                    push_wechat(opp_text).await;
+                }
+                // 持仓影响分开推送
+                if !scan.impact_text.is_empty() {
+                    log::info!("[持仓影响] {}", scan.impact_text);
+                    push_wechat(&scan.impact_text).await;
                 }
             });
         }
@@ -1243,20 +2011,157 @@ async fn monitor_loop() {
         let mut last_sector_push = std::time::Instant::now();    // 领涨板块（5分钟）
         let mut last_health_summary = std::time::Instant::now(); // 持仓健康度（5分钟）
         let mut last_screener_run = std::time::Instant::now();   // 选股推荐（30分钟）
+        let mut last_fund_top_push = std::time::Instant::now();  // 全市场主力净流入Top10（5分钟）
         // 产业链扫描已移至 news_monitor_loop 的 8:00-22:00 窗口统一调度。
         let mut was_limit_up: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // 连板追踪：已推送过的标的不重复推送；board_level_cache 存 1=首板/2=二板/3+=三板
+        let mut board_notified: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut board_level_cache: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
+        // 竞价量能扫描：9:20-9:25 每30秒推送一次全市场涨停量能榜
+        let mut auction_vol_notified: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // 优选候选虚拟仓位记录：从集合竞价推送的候选+开盘价记录
+        let mut virtual_observation: Vec<(String, String, f64)> = Vec::new(); // (code, name, open_price)
+        let mut post_close_candidates_notified = false;
+        let mut virtual_snapshot_persisted = false;
+        let entry_mode = air_refuel_entry_mode();
+        let monitor_cfg = stock_analysis::config::get_monitor_config();
+        let confirm_shares = monitor_cfg.air_refuel.confirm_lots.saturating_mul(100);
+        let pilot_shares = monitor_cfg.air_refuel.pilot_lots.saturating_mul(100);
 
         loop {
             let session = current_session();
 
+            // ── 9:20-9:25 竞价高量能扫描（30秒一次）+ 盘后优选重推 ──
             if session == MarketSession::Auction {
-                log::info!("[竞价] 09:25 扫描...");
-                let stocks = tokio::task::spawn_blocking(|| {
-                    let analyzer = stock_analysis::market_analyzer::MarketAnalyzer::new(None).ok()?;
-                    analyzer.get_limit_up_stocks().ok()
-                }).await.unwrap_or(None);
-                if let Some(stocks) = stocks {
-                    for s in stocks.iter().take(10) {
+                let now_time = chrono::Local::now().time();
+                // 9:20 之前只做持仓告警，不推全市场量能（数据不稳定）
+                if now_time >= chrono::NaiveTime::from_hms_opt(9, 20, 0).unwrap() {
+                    log::info!("[竞价] 9:20-9:25 量能扫描...");
+                    let limit_stocks = tokio::task::spawn_blocking(|| {
+                        let analyzer = stock_analysis::market_analyzer::MarketAnalyzer::new(None).ok()?;
+                        analyzer.get_limit_up_stocks().ok()
+                    }).await.unwrap_or(None).unwrap_or_default();
+
+                    if !limit_stocks.is_empty() {
+                        // 按量比降序，取量比最高的前10（量能高代表竞价封板意愿强）
+                        let mut sorted = limit_stocks.clone();
+                        sorted.sort_by(|a, b| {
+                            b.volume_ratio.partial_cmp(&a.volume_ratio).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        let new_items: Vec<_> = sorted.iter()
+                            .filter(|s| !auction_vol_notified.contains(&s.code))
+                            .take(10)
+                            .collect();
+                        if !new_items.is_empty() {
+                            let ts = chrono::Local::now().format("%H:%M:%S");
+                            let mut lines = vec![format!("⚡ 竞价涨停·量能 Top{}（{}）", new_items.len(), ts)];
+                            for s in &new_items {
+                                auction_vol_notified.insert(s.code.clone());
+                                lines.push(format!(
+                                    "  {}({}) 量比{:.1} 主力{:+.2}亿 {:+.1}%",
+                                    s.name, s.code, s.volume_ratio, s.main_net_yi, s.change_pct,
+                                ));
+                            }
+                            push_wechat(&lines.join("\n")).await;
+                        }
+                    }
+
+                    // ▶ 新增：9:20-9:25 集合竞价阶段重推优选候选（仅一次）
+                    if !post_close_candidates_notified {
+                        post_close_candidates_notified = true;
+                        log::info!("[竞价] 9:20-9:25 更新推送优选候选（2.1版本）...");
+                        let post_close = stock_analysis::opportunity::run_post_close_candidates(5).await;
+                        push_wechat(&post_close).await;
+                        
+                        // 提取候选的code和name以便后续虚拟记录（简单方式：从推送文案中正则提取）
+                        // 格式: "N. 名称(代码)" → 收集前5个作为虚拟观察对象
+                        let mut seen_codes: std::collections::HashSet<String> = std::collections::HashSet::new();
+                        for line in post_close.lines() {
+                            if let Some(paren_start) = line.find('(') {
+                                if let Some(paren_end) = line.find(')') {
+                                    if paren_start < paren_end {
+                                        let code_str = &line[paren_start+1..paren_end];
+                                        if code_str.len() == 6 && code_str.chars().all(|c| c.is_numeric()) {
+                                            if !seen_codes.insert(code_str.to_string()) {
+                                                continue;
+                                            }
+                                            // 从该行"  "后提取name
+                                            let name_part = line.trim_start();
+                                            if let Some(name_end) = name_part.find('(') {
+                                                let name = name_part[..name_end].trim_end();
+                                                // 移除序号 "N. "
+                                                let name = if let Some(dot_pos) = name.find('.') {
+                                                    name[dot_pos+1..].trim()
+                                                } else {
+                                                    name
+                                                };
+                                                virtual_observation.push((code_str.to_string(), name.to_string(), 0.0));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // pilot 模式：竞价阶段先按当前价格虚拟潜伏记录（仅一次）
+                        if entry_mode == AirRefuelEntryMode::Pilot && !virtual_observation.is_empty() {
+                            let codes: Vec<String> = virtual_observation.iter().map(|(c, _, _)| c.clone()).collect();
+                            let quote_map = tokio::task::spawn_blocking(move || {
+                                let quotes = fetch_eastmoney_quotes(&codes).unwrap_or_default();
+                                quotes.into_iter().map(|q| (q.code, q.price)).collect::<std::collections::HashMap<_, _>>()
+                            }).await.unwrap_or_default();
+
+                            for v in &mut virtual_observation {
+                                if let Some(px) = quote_map.get(&v.0) {
+                                    if *px > 0.0 {
+                                        v.2 = *px;
+                                    }
+                                }
+                            }
+
+                            let mut lines = vec![
+                                "🟠 虚拟观察仓位（尾盘/竞价潜伏模式）".to_string(),
+                                String::new(),
+                            ];
+                            let mut records: Vec<VirtualObservationRecord> = Vec::new();
+                            let mut total_amount = 0.0_f64;
+                            let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+                            for (code, name, price) in &virtual_observation {
+                                if *price <= 0.0 {
+                                    continue;
+                                }
+                                let amount = *price * pilot_shares as f64;
+                                total_amount += amount;
+                                lines.push(format!(
+                                    "  {}({}) @ ¥{:.2} | {}股 预计 ¥{:.0}",
+                                    name, code, price, pilot_shares, amount
+                                ));
+                                records.push(VirtualObservationRecord {
+                                    entry_date: today.clone(),
+                                    code: code.clone(),
+                                    name: name.clone(),
+                                    entry_price: *price,
+                                    shares: pilot_shares,
+                                    entry_mode: "pilot".to_string(),
+                                });
+                            }
+                            lines.push(format!(
+                                "\n合计虚拟敞口: ¥{:.0} ({}股×{}只)",
+                                total_amount,
+                                pilot_shares,
+                                records.len()
+                            ));
+                            lines.push("\n⚠️ 仅做观察、研究用途，未实际下单".to_string());
+                            if !records.is_empty() {
+                                persist_virtual_observation_snapshot(&records);
+                                virtual_snapshot_persisted = true;
+                                push_wechat(&lines.join("\n")).await;
+                            }
+                        }
+                    }
+
+                    // 持仓信号（原有逻辑保留）
+                    for s in limit_stocks.iter().take(10) {
                         if !our_codes.contains(&s.code) { continue; }
                         let snap = StockSnapshot {
                             code: s.code.clone(), name: s.name.clone(),
@@ -1272,6 +2177,13 @@ async fn monitor_loop() {
                             }
                         }
                     }
+
+                    tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                    continue;
+                } else {
+                    // 9:15-9:20 等待即可
+                    tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                    continue;
                 }
             }
 
@@ -1285,6 +2197,136 @@ async fn monitor_loop() {
                 }).await.unwrap_or(None);
 
                 if let Some((limit_stocks, position_quotes)) = result {
+                    // ▶ 新增：开盘后虚拟记录观察仓位（仅一次）
+                    if entry_mode == AirRefuelEntryMode::Confirm
+                        && session == MarketSession::Morning
+                        && !virtual_observation.is_empty()
+                        && virtual_observation.iter().all(|(_, _, p)| *p == 0.0)
+                    {
+                        log::info!(
+                            "[开盘] 虚拟观察仓位初始化（{}手 × {}只）",
+                            confirm_shares / 100,
+                            virtual_observation.len()
+                        );
+                        
+                        // 从当前行情中获取这些候选的开盘价/实时价
+                        for pos_quote in &position_quotes {
+                            for virtual_pos in &mut virtual_observation {
+                                if virtual_pos.0 == pos_quote.code && virtual_pos.2 == 0.0 {
+                                    virtual_pos.2 = pos_quote.price;
+                                }
+                            }
+                        }
+                        
+                        // 补充从limit_stocks中没获取到的价格
+                        for limit_stock in &limit_stocks {
+                            for virtual_pos in &mut virtual_observation {
+                                if virtual_pos.0 == limit_stock.code && virtual_pos.2 == 0.0 {
+                                    virtual_pos.2 = limit_stock.price;
+                                }
+                            }
+                        }
+                        
+                        // 推送虚拟观察仓位摘要
+                        let mut virtual_lines = vec![
+                            format!("🔍 虚拟观察仓位（盘后优选·开盘价·{}手/只）", confirm_shares / 100),
+                            "".to_string(),
+                        ];
+                        let mut total_amount = 0.0;
+                        let mut records: Vec<VirtualObservationRecord> = Vec::new();
+                        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+                        for (code, name, price) in &virtual_observation {
+                            if *price > 0.0 {
+                                let amount = price * confirm_shares as f64;
+                                total_amount += amount;
+                                virtual_lines.push(format!(
+                                    "  {}({}) @ ¥{:.2} | {}股 预计 ¥{:.0}",
+                                    name, code, price, confirm_shares, amount
+                                ));
+                                records.push(VirtualObservationRecord {
+                                    entry_date: today.clone(),
+                                    code: code.clone(),
+                                    name: name.clone(),
+                                    entry_price: *price,
+                                    shares: confirm_shares,
+                                    entry_mode: "confirm".to_string(),
+                                });
+                            }
+                        }
+                        virtual_lines.push(format!(
+                            "\n合计虚拟敞口: ¥{:.0} ({}股×{}只)",
+                            total_amount, confirm_shares, virtual_observation.len()
+                        ));
+                        virtual_lines.push("\n⚠️ 仅做观察、研究用途，未实际下单".to_string());
+
+                        if !virtual_snapshot_persisted && !records.is_empty() {
+                            persist_virtual_observation_snapshot(&records);
+                            virtual_snapshot_persisted = true;
+                        }
+                        
+                        push_wechat(&virtual_lines.join("\n")).await;
+                        log::info!("[开盘] 虚拟观察仓位已推送（合计 ¥{:.0}）", total_amount);
+                    }
+
+                    // 首板/二板/三板识别：全市场涨停池，各自独立消息，每只仅推一次
+                    if !limit_stocks.is_empty() {
+                        let mut need_lookup: Vec<(String, String)> = Vec::new();
+                        for s in &limit_stocks {
+                            if board_notified.contains(&s.code) { continue; }
+                            if !board_level_cache.contains_key(&s.code) {
+                                need_lookup.push((s.code.clone(), s.name.clone()));
+                            }
+                        }
+                        if !need_lookup.is_empty() {
+                            let need_lookup: Vec<(String, String)> = need_lookup.into_iter().take(40).collect();
+                            let looked_up = tokio::task::spawn_blocking(move || {
+                                lookup_board_level_batch(&need_lookup)
+                            }).await.unwrap_or_default();
+                            board_level_cache.extend(looked_up);
+                        }
+
+                        let mut first_lines: Vec<String> = Vec::new();
+                        let mut second_lines: Vec<String> = Vec::new();
+                        let mut third_lines: Vec<String> = Vec::new();
+                        let mut sorted_limits = limit_stocks.clone();
+                        sorted_limits.sort_by(|a, b| {
+                            b.main_net_yi.partial_cmp(&a.main_net_yi).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        for s in sorted_limits.iter().take(50) {
+                            let level = match board_level_cache.get(&s.code) {
+                                Some(v) => *v,
+                                None => continue,
+                            };
+                            if !board_notified.insert(s.code.clone()) { continue; }
+                            let row = format!(
+                                "  {}({}) 主力{:+.2}亿 量比{:.1} {:+.1}%",
+                                s.name, s.code, s.main_net_yi, s.volume_ratio, s.change_pct,
+                            );
+                            match level {
+                                1 => first_lines.push(row),
+                                2 => second_lines.push(row),
+                                _ => third_lines.push(row),
+                            }
+                        }
+
+                        let ts = chrono::Local::now().format("%H:%M");
+                        if !first_lines.is_empty() {
+                            let mut lines = vec![format!("🟢 首板涨停 Top{}（{}）", first_lines.len().min(10), ts)];
+                            lines.extend(first_lines.into_iter().take(10));
+                            push_wechat(&lines.join("\n")).await;
+                        }
+                        if !second_lines.is_empty() {
+                            let mut lines = vec![format!("🟡 二板涨停 Top{}（{}）", second_lines.len().min(10), ts)];
+                            lines.extend(second_lines.into_iter().take(10));
+                            push_wechat(&lines.join("\n")).await;
+                        }
+                        if !third_lines.is_empty() {
+                            let mut lines = vec![format!("🔴 三板+ 涨停 Top{}（{}）", third_lines.len().min(10), ts)];
+                            lines.extend(third_lines.into_iter().take(10));
+                            push_wechat(&lines.join("\n")).await;
+                        }
+                    }
+
                     // 合并两路数据：涨停列表中的持仓 + 持仓单独查询
                     let mut stock_map: std::collections::HashMap<String, &stock_analysis::market_data::TopStock> = std::collections::HashMap::new();
                     for s in &limit_stocks { if our_codes.contains(&s.code) { stock_map.insert(s.code.clone(), s); } }
@@ -1425,6 +2467,12 @@ async fn monitor_loop() {
                         last_sector_push = std::time::Instant::now();
                         push_sector_leaders().await;
                     }
+
+                    // 全市场主力净流入 Top10（独立计时器，每5分钟）
+                    if last_fund_top_push.elapsed().as_secs() >= 300 {
+                        last_fund_top_push = std::time::Instant::now();
+                        push_market_fund_top10().await;
+                    }
                 }
             }
 
@@ -1453,7 +2501,8 @@ async fn monitor_loop() {
 
         // v3 复盘报告
         let trades = stock_analysis::portfolio::get_trade_history(90).unwrap_or_default();
-        let reviews = stock_analysis::review::journal::review_closed_trades(&trades);
+        let mut reviews = stock_analysis::review::journal::review_closed_trades(&trades);
+        stock_analysis::review::journal::enrich_post_exit(&mut reviews);
         let equity = stock_analysis::portfolio::get_equity_curve(365).unwrap_or_default();
         let mut stats = stock_analysis::review::equity::compute_stats(&equity);
         stock_analysis::review::equity::enrich_with_trades(&mut stats, &reviews);
@@ -1467,8 +2516,18 @@ async fn monitor_loop() {
         let review_report = stock_analysis::review::report::generate_daily_report(&reviews, &stats, &holdings, &prices);
         push_wechat(&review_report).await;
 
+        // 盘后独立维度：优选次日候选（最多 5 只，达不到阈值可少推/不推），强调可解释性，不复用盘中量能信号口径。
+        let post_close_candidates = stock_analysis::opportunity::run_post_close_candidates(5).await;
+        push_wechat(&post_close_candidates).await;
+
+        // 盘后统计上一交易日虚拟观察仓表现（可配置开关）
+        push_virtual_next_day_review_if_needed().await;
+
         // v3 每日净值快照
         let _ = tokio::task::spawn_blocking(snapshot_portfolio_value).await;
+
+        // 盘后持仓多 Agent 深度研判（6 分析师 + 多空辩论 + 仲裁），逐只推送飞书
+        run_review_deep_analysis().await;
 
         log::info!("[收盘] 信号{}条 告警{}条 | DQ: {} | {}",
             signal_count, alert_count, scanner.dq_summary(), prediction::hit_rate_summary(7));
@@ -1555,21 +2614,29 @@ fn fetch_position_quotes() -> Vec<stock_analysis::market_data::TopStock> {
     let codes: Vec<String> = stock_analysis::portfolio::get_all_codes().unwrap_or_default();
     if codes.is_empty() { return vec![]; }
 
-    match fetch_eastmoney_quotes(&codes) {
+    let quotes = match fetch_eastmoney_quotes(&codes) {
         Ok(q) if !q.is_empty() => q,
         _ => fetch_sina_quotes(&codes),
+    };
+    if quotes.is_empty() {
+        return quotes;
     }
+    if !validate_position_freshness(chrono::Local::now()) {
+        return vec![];
+    }
+    quotes
 }
 
 /// 东方财富 push2 实时行情（多主机轮询，含 volume_ratio + main_net_yi）
 fn fetch_eastmoney_quotes(codes: &[String]) -> Result<Vec<stock_analysis::market_data::TopStock>, String> {
+    use chrono::TimeZone;
     use stock_analysis::market_data::TopStock;
     // secids: 0.000547,1.603618 (0=深交所,1=上交所)
     let secids: Vec<String> = codes.iter().map(|c| {
         if c.starts_with('6') || c.starts_with('5') { format!("1.{}", c) }
         else { format!("0.{}", c) }
     }).collect();
-    let url_path = format!("/api/qt/ulist.np/get?secids={}&fields=f2,f3,f10,f12,f14,f62&fltt=2&invt=2",
+    let url_path = format!("/api/qt/ulist.np/get?secids={}&fields=f2,f3,f10,f12,f14,f62,f124&fltt=2&invt=2",
         secids.join(","));
 
     const HOSTS: &[&str] = &["push2delay.eastmoney.com", "push2.eastmoney.com", "82.push2.eastmoney.com"];
@@ -1587,8 +2654,17 @@ fn fetch_eastmoney_quotes(codes: &[String]) -> Result<Vec<stock_analysis::market
             Ok(json) => {
                 if let Some(arr) = json.get("data").and_then(|d| d.get("diff")).and_then(|d| d.as_array()) {
                     let stocks: Vec<TopStock> = arr.iter().filter_map(|item| {
+                        let code = item.get("f12")?.as_str()?.to_string();
+                        let update_time = item
+                            .get("f124")
+                            .and_then(|v| v.as_i64())
+                            .and_then(|secs| chrono::Local.timestamp_opt(secs, 0).single())
+                            .unwrap_or_else(chrono::Local::now);
+                        if !validate_quote_freshness(update_time, "eastmoney", &code) {
+                            return None;
+                        }
                         Some(TopStock {
-                            code: item.get("f12")?.as_str()?.to_string(),
+                            code,
                             name: item.get("f14")?.as_str()?.to_string(),
                             price: item.get("f2").and_then(|v| v.as_f64()).unwrap_or(0.0),
                             change_pct: item.get("f3").and_then(|v| v.as_f64()).unwrap_or(0.0),
@@ -1603,6 +2679,154 @@ fn fetch_eastmoney_quotes(codes: &[String]) -> Result<Vec<stock_analysis::market
         }
     }
     Err("所有东财主机请求失败".into())
+}
+
+fn infer_limit_pct(code: &str, name: &str) -> f64 {
+    if name.contains("ST") || name.contains("st") {
+        5.0
+    } else if code.starts_with("30") || code.starts_with("688") {
+        20.0
+    } else if code.starts_with('8') || code.starts_with('4') {
+        30.0
+    } else {
+        10.0
+    }
+}
+
+/// 批量查询连板数，返回 1=首板 / 2=二板 / 3=三板+
+/// 仅向前看 4 个交易日的 K 线，够判断三板就够了。
+fn lookup_board_level_batch(codes: &[(String, String)]) -> std::collections::HashMap<String, u8> {
+    let mut out = std::collections::HashMap::new();
+    let fetcher = match stock_analysis::data_provider::DataFetcherManager::new() {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("[连板识别] 初始化数据抓取失败: {:#}", e);
+            return out;
+        }
+    };
+
+    for (code, name) in codes {
+        let level = match fetcher.get_daily_data(code, 5) {
+            Ok((kline, _)) if kline.len() >= 2 => {
+                let threshold = infer_limit_pct(code, name) - 0.2;
+                let n = kline.len();
+                // kline 按时间升序，最后一条是今日。往前数连续涨停天数：
+                // kline[n-2]=昨日, kline[n-3]=前天, …
+                let day1 = if n >= 2 { kline[n - 2].pct_chg >= threshold } else { false };
+                let day2 = if n >= 3 { kline[n - 3].pct_chg >= threshold } else { false };
+                match (day1, day2) {
+                    (false, _) => 1,  // 昨日未涨停 → 首板
+                    (true, false) => 2, // 昨日涨停、前天未 → 二板
+                    (true, true) => 3,  // 两天前均涨停 → 三板+
+                }
+            }
+            Ok(_) => {
+                log::warn!("[连板识别] {}({}) K线不足，跳过", name, code);
+                continue;
+            }
+            Err(e) => {
+                log::warn!("[连板识别] {}({}) 拉K线失败: {:#}", name, code, e);
+                continue;
+            }
+        };
+        out.insert(code.clone(), level);
+    }
+    out
+}
+
+fn fetch_market_top_by_fid(fid: &str, top_n: usize) -> Result<Vec<stock_analysis::market_data::TopStock>, String> {
+    use chrono::TimeZone;
+    use stock_analysis::market_data::TopStock;
+
+    let pz = top_n.clamp(20, 200).to_string();
+    let params = [
+        ("pn", "1"),
+        ("pz", pz.as_str()),
+        ("po", "1"),
+        ("np", "1"),
+        ("ut", "bd1d9ddb04089700cf9c27f6f7426281"),
+        ("fltt", "2"),
+        ("invt", "2"),
+        ("fid", fid),
+        ("fs", "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048"),
+        ("fields", "f2,f3,f10,f12,f14,f62,f124"),
+    ];
+
+    const HOSTS: &[&str] = &["push2delay.eastmoney.com", "push2.eastmoney.com", "82.push2.eastmoney.com"];
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build().map_err(|e| e.to_string())?;
+
+    for host in HOSTS {
+        let url = format!("https://{}/api/qt/clist/get", host);
+        let resp = client.get(&url)
+            .query(&params)
+            .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+            .header("Referer", "https://quote.eastmoney.com/")
+            .send();
+        match resp.and_then(|r| r.json::<serde_json::Value>()) {
+            Ok(json) => {
+                if let Some(arr) = json.get("data").and_then(|d| d.get("diff")).and_then(|d| d.as_array()) {
+                    let stocks: Vec<TopStock> = arr.iter().filter_map(|item| {
+                        let code = item.get("f12")?.as_str()?.to_string();
+                        let name = item.get("f14")?.as_str()?.to_string();
+                        if name.contains("ST") || name.contains("st") {
+                            return None;
+                        }
+                        if code.starts_with('8') || code.starts_with('4') || code.starts_with('9') {
+                            return None;
+                        }
+                        let update_time = item
+                            .get("f124")
+                            .and_then(|v| v.as_i64())
+                            .and_then(|secs| chrono::Local.timestamp_opt(secs, 0).single())
+                            .unwrap_or_else(chrono::Local::now);
+                        if !validate_quote_freshness(update_time, "eastmoney_market", &code) {
+                            return None;
+                        }
+                        Some(TopStock {
+                            code,
+                            name,
+                            price: item.get("f2").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                            change_pct: item.get("f3").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                            volume_ratio: item.get("f10").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                            main_net_yi: item.get("f62").and_then(|v| v.as_f64()).unwrap_or(0.0) / 1e8,
+                        })
+                    }).collect();
+                    if !stocks.is_empty() {
+                        return Ok(stocks);
+                    }
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+    Err("全市场榜单请求失败（所有东财主机）".to_string())
+}
+
+fn fetch_market_main_inflow_top(top_n: usize) -> Result<Vec<stock_analysis::market_data::TopStock>, String> {
+    let mut stocks = fetch_market_top_by_fid("f62", top_n * 4)?;
+    stocks.retain(|s| s.main_net_yi > 0.0 && s.price > 0.0);
+    stocks.sort_by(|a, b| b.main_net_yi.partial_cmp(&a.main_net_yi).unwrap_or(std::cmp::Ordering::Equal));
+    stocks.truncate(top_n);
+    Ok(stocks)
+}
+
+fn fetch_market_volume_ratio_leaders(top_n: usize) -> Result<Vec<stock_analysis::market_data::TopStock>, String> {
+    let mut stocks = fetch_market_top_by_fid("f10", top_n * 6)?;
+    stocks.retain(|s| {
+        s.price > 0.0
+            && s.volume_ratio >= 1.8
+            && s.change_pct >= 0.5
+            && s.change_pct <= 9.5
+    });
+    stocks.sort_by(|a, b| {
+        b.volume_ratio
+            .partial_cmp(&a.volume_ratio)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    stocks.truncate(top_n);
+    Ok(stocks)
 }
 
 /// 新浪行情 API：免费、稳定、无频率限制、无需 Referer/Cookie/Token。
@@ -1642,6 +2866,9 @@ fn fetch_sina_quotes(codes: &[String]) -> Vec<stock_analysis::market_data::TopSt
         let prev_close: f64 = fields.get(2).and_then(|s| s.parse().ok()).unwrap_or(0.0);
         let price: f64 = fields.get(3).and_then(|s| s.parse().ok()).unwrap_or(0.0);
         let change_pct = if prev_close > 0.0 { (price - prev_close) / prev_close * 100.0 } else { 0.0 };
+        if !validate_quote_freshness(chrono::Local::now(), "sina", code) {
+            continue;
+        }
 
         results.push(TopStock {
             code: code.clone(), name,
@@ -1696,6 +2923,34 @@ async fn push_sector_leaders() {
     push_wechat(&lines.join("\n")).await;
 }
 
+async fn push_market_fund_top10() {
+    let top = tokio::task::spawn_blocking(|| fetch_market_main_inflow_top(10))
+        .await
+        .unwrap_or_else(|_| Err("spawn_blocking join error".to_string()))
+        .unwrap_or_default();
+
+    if top.is_empty() {
+        return;
+    }
+
+    let mut lines = vec![format!(
+        "💰 主力净流入 Top 10（{}）",
+        chrono::Local::now().format("%H:%M")
+    )];
+    for (i, s) in top.iter().enumerate() {
+        lines.push(format!(
+            "  {:>2}. {}({}) 主力{:+.2}亿 量比{:.1} 涨幅{:+.1}%",
+            i + 1,
+            s.name,
+            s.code,
+            s.main_net_yi,
+            s.volume_ratio,
+            s.change_pct,
+        ));
+    }
+    push_wechat(&lines.join("\n")).await;
+}
+
 async fn push(event: &AlertEvent) {
     let text = alert::format_alert(event);
     log::info!("[告警] {} {} → {}", event.level.emoji(), event.code, event.message);
@@ -1706,6 +2961,96 @@ async fn push(event: &AlertEvent) {
 
 fn build_price_map(quotes: &[stock_analysis::market_data::TopStock]) -> std::collections::HashMap<String, f64> {
     quotes.iter().map(|q| (q.code.clone(), q.price)).collect()
+}
+
+fn monitor_freshness_config() -> stock_analysis::monitor::data_quality::FreshnessConfig {
+    let cfg = stock_analysis::config::get_monitor_config();
+    stock_analysis::monitor::data_quality::FreshnessConfig {
+        quote_max_age_secs: cfg.dq_quote_stale_sec,
+        position_max_age_secs: cfg.dq_position_stale_sec,
+        nav_max_age_secs: cfg.dq_nav_stale_sec,
+        daily_max_age_secs: cfg.dq_daily_stale_sec,
+    }
+}
+
+fn validate_position_freshness(fetch_time: chrono::DateTime<chrono::Local>) -> bool {
+    let stats = stock_analysis::monitor::data_quality::DqStats::new();
+    let freshness = monitor_freshness_config();
+    match stock_analysis::monitor::data_quality::validate_freshness(
+        stock_analysis::monitor::data_quality::FreshnessDataType::Position,
+        fetch_time,
+        &freshness,
+        &stats,
+    ) {
+        Ok(()) => true,
+        Err(reason) => {
+            log::warn!(
+                "[DQ_FRESHNESS] rule_id=AGENTS-2.4 data_type=position action=reject reason={} timestamp={}",
+                reason.label(),
+                chrono::Utc::now().timestamp()
+            );
+            false
+        }
+    }
+}
+
+fn validate_quote_freshness(update_time: chrono::DateTime<chrono::Local>, source: &str, code: &str) -> bool {
+    // AGENTS 2.4 指定为“实时行情(盘中) 5 秒”，非盘中时段不做 5 秒硬拦截。
+    if !matches!(
+        current_session(),
+        MarketSession::Auction | MarketSession::Morning | MarketSession::Afternoon
+    ) {
+        return true;
+    }
+
+    let stats = stock_analysis::monitor::data_quality::DqStats::new();
+    let freshness = monitor_freshness_config();
+    match stock_analysis::monitor::data_quality::validate_freshness(
+        stock_analysis::monitor::data_quality::FreshnessDataType::Quote,
+        update_time,
+        &freshness,
+        &stats,
+    ) {
+        Ok(()) => true,
+        Err(reason) => {
+            log::warn!(
+                "[DQ_FRESHNESS] rule_id=AGENTS-2.4 data_type=quote action=reject source={} code={} reason={} timestamp={}",
+                source,
+                code,
+                reason.label(),
+                chrono::Utc::now().timestamp()
+            );
+            false
+        }
+    }
+}
+
+fn validate_nav_freshness(nav_date: chrono::NaiveDate) -> bool {
+    let stats = stock_analysis::monitor::data_quality::DqStats::new();
+    let base = monitor_freshness_config();
+    let freshness = stock_analysis::monitor::data_quality::FreshnessConfig {
+        quote_max_age_secs: base.quote_max_age_secs,
+        position_max_age_secs: base.position_max_age_secs,
+        nav_max_age_secs: base.nav_max_age_secs,
+        daily_max_age_secs: base.nav_max_age_secs,
+    };
+    match stock_analysis::monitor::data_quality::validate_daily_freshness(
+        nav_date,
+        chrono::Local::now(),
+        &freshness,
+        &stats,
+    ) {
+        Ok(()) => true,
+        Err(reason) => {
+            log::warn!(
+                "[DQ_FRESHNESS] rule_id=AGENTS-2.4 data_type=nav action=reject reason={} nav_date={} timestamp={}",
+                reason.label(),
+                nav_date,
+                chrono::Utc::now().timestamp()
+            );
+            false
+        }
+    }
 }
 
 /// 计算最近 n 日收盘均价；K 线不足 n 条返回 None（避免误导结构止损 / 轮动判断）
@@ -1735,9 +3080,14 @@ fn snapshot_portfolio_value() {
         counted += 1;
     }
 
-    let prev_value = stock_analysis::portfolio::get_equity_curve(2).ok()
-        .and_then(|c| c.last().map(|e| e.total_value))
-        .unwrap_or(total_value);
+    let prev_curve = stock_analysis::portfolio::get_equity_curve(2).ok().unwrap_or_default();
+    if let Some(last) = prev_curve.last() {
+        if !validate_nav_freshness(last.date) {
+            log::warn!("[净值快照] NAV 数据过期，跳过本次快照");
+            return;
+        }
+    }
+    let prev_value = prev_curve.last().map(|e| e.total_value).unwrap_or(total_value);
     let daily_pnl = total_value - prev_value;
 
     let entry = stock_analysis::portfolio::LedgerEntry {

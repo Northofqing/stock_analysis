@@ -10,6 +10,13 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[derive(Debug, Deserialize)]
+struct SinaMoneyflowRow {
+    opendate: String,
+    r0_net: String,
+    changeratio: String,
+}
+
 /// 单日资金流数据
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MoneyFlowDay {
@@ -114,102 +121,262 @@ fn as_f64(v: &Value) -> Option<f64> {
     }
 }
 
-/// 抓取近 `lmt` 天资金流（daykline）
-pub async fn fetch_flow_history_async(
+fn to_sina_symbol(code: &str) -> String {
+    if code.starts_with('6') {
+        format!("sh{}", code)
+    } else {
+        format!("sz{}", code)
+    }
+}
+
+fn parse_ratio_to_percent(raw: &str) -> Option<f64> {
+    let v = raw.trim().parse::<f64>().ok()?;
+    if v.abs() <= 1.0 {
+        Some(v * 100.0)
+    } else {
+        Some(v)
+    }
+}
+
+async fn fetch_flow_history_sina_async(
     client: &reqwest::Client,
     code: &str,
     lmt: usize,
 ) -> Result<MoneyFlowSummary> {
-    let secid = to_em_numeric_secid(code);
+    let symbol = to_sina_symbol(code);
     let url = format!(
-        "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get?\
-         secid={}&lmt={}&klt=101&\
-         fields1=f1,f2,f3,f7&\
-         fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
-        secid, lmt
+        "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/MoneyFlow.ssl_qsfx_zjlrqs?page=1&num={}&sort=opendate&asc=0&daima={}",
+        lmt.max(5), symbol
     );
-    log::debug!("[资金流][日线] {}", url);
-
-    let resp = client
+    let response = client
         .get(&url)
-        .header("Referer", "https://data.eastmoney.com/")
         .send()
         .await
-        .context("资金流历史请求失败")?;
-    if !resp.status().is_success() {
-        return Err(anyhow!("资金流历史状态码 {}", resp.status()));
+        .context("Sina HTTP请求失败")?;
+    if !response.status().is_success() {
+        return Err(anyhow!("Sina 状态码 {}", response.status()));
     }
-    let text = resp.text().await.context("资金流历史读取失败")?;
-    let json: Value = serde_json::from_str(&text).context("资金流历史 JSON 解析失败")?;
 
-    let klines = json
-        .get("data")
-        .and_then(|d| d.get("klines"))
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| anyhow!("资金流无 klines 数组"))?;
-
-    // 字段顺序（EM 实测）：date, f52(主力), f53(小单), f54(中单), f55(大单),
-    //                      f56(超大单), f57(主力%), f58(小单%), f59(中单%),
-    //                      f60(大单%), f61(超大单%), f62(收盘价), f63(涨跌幅%), _, _
+    let text = response.text().await.context("Sina 读取响应失败")?;
+    if text.trim().is_empty() {
+        return Err(anyhow!("Sina 返回空响应"));
+    }
+    let rows: Vec<SinaMoneyflowRow> = serde_json::from_str(&text)
+        .context("Sina JSON解析失败")?;
+    if rows.is_empty() {
+        return Ok(MoneyFlowSummary::default());
+    }
     let mut days = Vec::new();
-    for kline in klines {
-        let s = match kline.as_str() {
-            Some(s) => s,
-            None => continue,
-        };
-        let parts: Vec<&str> = s.split(',').collect();
-        if parts.len() < 13 {
-            continue;
-        }
-        let parse_f = |i: usize| parts.get(i).and_then(|p| p.parse::<f64>().ok());
-        let (Some(main_net), Some(big_net), Some(xl_net), Some(main_pct), Some(pct_chg)) = (
-            parse_f(1),
-            parse_f(4),
-            parse_f(5),
-            parse_f(6),
-            parse_f(12),
-        ) else {
-            continue;
-        };
+    for row in rows {
+        let main_net = row
+            .r0_net
+            .trim()
+            .parse::<f64>()
+            .map_err(|_| anyhow!("Sina r0_net 解析失败"))?;
+        let pct_chg = parse_ratio_to_percent(&row.changeratio)
+            .ok_or_else(|| anyhow!("Sina changeratio 解析失败"))?;
+
         days.push(MoneyFlowDay {
-            date: parts[0].to_string(),
+            date: row.opendate,
             main_net,
-            big_net,
-            xl_net,
-            main_pct,
+            xl_net: 0.0,
+            big_net: 0.0,
+            main_pct: 0.0,
             pct_chg,
         });
     }
-
+    days.sort_by(|a, b| a.date.cmp(&b.date));
+    if days.len() > lmt {
+        let skip = days.len() - lmt;
+        days = days.into_iter().skip(skip).collect();
+    }
     Ok(MoneyFlowSummary { days })
+}
+
+/// push2his 多主机列表，主→备顺序。
+const PUSH2HIS_HOSTS: [&str; 3] = [
+    "push2his.eastmoney.com",
+    "push2his-bak.eastmoney.com",
+    "82.push2his.eastmoney.com",
+];
+
+/// 构建直连客户端（no_proxy），规避系统代理 fake-ip/拦截。
+fn direct_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(15))
+        .connect_timeout(std::time::Duration::from_secs(8))
+        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// 抓取近 `lmt` 天资金流（daykline）
+pub async fn fetch_flow_history_async(
+    _client: &reqwest::Client,
+    code: &str,
+    lmt: usize,
+) -> Result<MoneyFlowSummary> {
+    let secid = to_em_numeric_secid(code);
+    let client = direct_client();
+    let mut last_err = String::new();
+
+    for host in PUSH2HIS_HOSTS {
+        let url = format!(
+            "https://{}/api/qt/stock/fflow/daykline/get?\
+             secid={}&lmt={}&klt=101&\
+             fields1=f1,f2,f3,f7&\
+             fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
+            host, secid, lmt
+        );
+        log::debug!("[资金流][日线] host={} {}", host, url);
+
+        let resp = match client
+            .get(&url)
+            .header("Referer", "https://data.eastmoney.com/")
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = format!("{}: {}", host, e);
+                continue;
+            }
+        };
+        if !resp.status().is_success() {
+            last_err = format!("{}: 状态码 {}", host, resp.status());
+            continue;
+        }
+        let text = match resp.text().await {
+            Ok(t) => t,
+            Err(e) => {
+                last_err = format!("{}: 读取响应失败 {}", host, e);
+                continue;
+            }
+        };
+        let body = text.trim_start();
+        if body.starts_with('<') {
+            last_err = format!("{}: 非JSON回包（网关拦截）", host);
+            continue;
+        }
+        let json: Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(e) => {
+                last_err = format!("{}: JSON解析失败 {}", host, e);
+                continue;
+            }
+        };
+
+        let Some(klines) = json
+            .get("data")
+            .and_then(|d| d.get("klines"))
+            .and_then(|v| v.as_array())
+        else {
+            last_err = format!("{}: 资金流无 klines 数组", host);
+            continue;
+        };
+
+        // 字段顺序（EM 实测）：date, f52(主力), f53(小单), f54(中单), f55(大单),
+        //                      f56(超大单), f57(主力%), f58(小单%), f59(中单%),
+        //                      f60(大单%), f61(超大单%), f62(收盘价), f63(涨跌幅%), _, _
+        let mut days = Vec::new();
+        for kline in klines {
+            let s = match kline.as_str() {
+                Some(s) => s,
+                None => continue,
+            };
+            let parts: Vec<&str> = s.split(',').collect();
+            if parts.len() < 13 {
+                continue;
+            }
+            let parse_f = |i: usize| parts.get(i).and_then(|p| p.parse::<f64>().ok());
+            let (Some(main_net), Some(big_net), Some(xl_net), Some(main_pct), Some(pct_chg)) = (
+                parse_f(1),
+                parse_f(4),
+                parse_f(5),
+                parse_f(6),
+                parse_f(12),
+            ) else {
+                continue;
+            };
+            days.push(MoneyFlowDay {
+                date: parts[0].to_string(),
+                main_net,
+                big_net,
+                xl_net,
+                main_pct,
+                pct_chg,
+            });
+        }
+
+        return Ok(MoneyFlowSummary { days });
+    }
+
+    let east_err = last_err.clone();
+    let sina_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)")
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    match fetch_flow_history_sina_async(&sina_client, code, lmt).await {
+        Ok(summary) if !summary.is_empty() => {
+            log::info!("[资金流][Sina] {} 取得 {} 天数据", code, summary.days.len());
+            Ok(summary)
+        }
+        Ok(_) => Err(anyhow!("资金流历史全部主机失败: {}；Sina 返回空数据", east_err)),
+        Err(sina_err) => Err(anyhow!(
+            "资金流历史全部主机失败: {}；Sina fallback失败: {}",
+            east_err,
+            sina_err
+        )),
+    }
 }
 
 /// 抓取当日分时（trends2）并计算形态
 pub async fn fetch_intraday_shape_async(
-    client: &reqwest::Client,
+    _client: &reqwest::Client,
     code: &str,
 ) -> Result<IntradayShape> {
     let secid = to_em_numeric_secid(code);
-    let url = format!(
-        "https://push2his.eastmoney.com/api/qt/stock/trends2/get?\
-         secid={}&ndays=1&iscr=0&iscca=0&\
-         fields1=f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13&\
-         fields2=f51,f52,f53,f54,f55,f56,f57,f58",
-        secid
-    );
-    log::debug!("[分时] {}", url);
+    let client = direct_client();
+    let mut last_err = String::new();
+    let mut json_opt: Option<Value> = None;
 
-    let resp = client
-        .get(&url)
-        .header("Referer", "https://quote.eastmoney.com/")
-        .send()
-        .await
-        .context("分时请求失败")?;
-    if !resp.status().is_success() {
-        return Err(anyhow!("分时状态码 {}", resp.status()));
+    for host in PUSH2HIS_HOSTS {
+        let url = format!(
+            "https://{}/api/qt/stock/trends2/get?\
+             secid={}&ndays=1&iscr=0&iscca=0&\
+             fields1=f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13&\
+             fields2=f51,f52,f53,f54,f55,f56,f57,f58",
+            host, secid
+        );
+        log::debug!("[分时] host={} {}", host, url);
+
+        let resp = match client.get(&url).header("Referer", "https://quote.eastmoney.com/").send().await {
+            Ok(r) => r,
+            Err(e) => { last_err = format!("{}: {}", host, e); continue; }
+        };
+        if !resp.status().is_success() {
+            last_err = format!("{}: 状态码 {}", host, resp.status());
+            continue;
+        }
+        let text = match resp.text().await {
+            Ok(t) => t,
+            Err(e) => { last_err = format!("{}: 读取失败 {}", host, e); continue; }
+        };
+        let body = text.trim_start();
+        if body.starts_with('<') {
+            last_err = format!("{}: 非JSON回包（网关拦截）", host);
+            continue;
+        }
+        match serde_json::from_str::<Value>(&text) {
+            Ok(v) => { json_opt = Some(v); break; }
+            Err(e) => { last_err = format!("{}: JSON解析失败 {}", host, e); continue; }
+        }
     }
-    let text = resp.text().await.context("分时读取失败")?;
-    let json: Value = serde_json::from_str(&text).context("分时 JSON 解析失败")?;
+
+    let json = json_opt.ok_or_else(|| anyhow!("分时全部主机失败: {}", last_err))?;
 
     let data = json
         .get("data")

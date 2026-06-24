@@ -26,6 +26,11 @@ pub fn generate_daily_report(
         stats.max_drawdown_pct,
         stats.sharpe_ratio,
     ));
+    lines.push(format!(
+        "🛡️ 风险值：VaR95={:.2}% | CVaR95={:.2}%（日度）",
+        stats.var95_pct,
+        stats.cvar95_pct,
+    ));
 
     // ── 交易统计 ──
     if stats.total_trades > 0 {
@@ -126,6 +131,7 @@ mod tests {
             max_drawdown_pct: 5.2, sharpe_ratio: 0.92,
             win_rate: 58.0, total_trades: 12, winning_trades: 7,
             avg_win_pct: 8.2, avg_loss_pct: -4.1, profit_factor: 2.1,
+            var95_pct: 1.8, cvar95_pct: 2.4,
         };
 
         let holdings = vec![Position {
@@ -143,5 +149,6 @@ mod tests {
         assert!(report.contains("杭电股份"));
         assert!(report.contains("+9.8%"));
         assert!(report.contains("胜率：58%"));
+        assert!(report.contains("VaR95"));
     }
 }

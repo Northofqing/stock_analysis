@@ -14,6 +14,10 @@ pub struct EquityStats {
     pub avg_win_pct: f64,
     pub avg_loss_pct: f64,
     pub profit_factor: f64,
+    /// 日度 VaR(95%)，单位 %（正数表示潜在损失）
+    pub var95_pct: f64,
+    /// 日度 CVaR(95%)，单位 %（正数表示尾部期望损失）
+    pub cvar95_pct: f64,
 }
 
 /// 从净值序列计算统计指标
@@ -40,14 +44,19 @@ pub fn compute_stats(curve: &[LedgerEntry]) -> EquityStats {
         }
     }
 
-    // 夏普（简化：日收益率 std * sqrt(252)）
-    let sharpe = if curve.len() >= 2 {
-        let mut daily_returns = Vec::new();
+    let mut daily_returns = Vec::new();
+    if curve.len() >= 2 {
         for w in curve.windows(2) {
             let prev = w[0].total_value;
             let curr = w[1].total_value;
-            if prev > 0.0 { daily_returns.push((curr - prev) / prev); }
+            if prev > 0.0 {
+                daily_returns.push((curr - prev) / prev);
+            }
         }
+    }
+
+    // 夏普（简化：日收益率 std * sqrt(252)）
+    let sharpe = {
         let n = daily_returns.len() as f64;
         if n > 0.0 {
             let mean = daily_returns.iter().sum::<f64>() / n;
@@ -55,7 +64,21 @@ pub fn compute_stats(curve: &[LedgerEntry]) -> EquityStats {
             let std = variance.sqrt();
             if std > 0.0 { mean / std * 252.0_f64.sqrt() } else { 0.0 }
         } else { 0.0 }
-    } else { 0.0 };
+    };
+
+    // 日度 VaR/CVaR（95%）：对收益分布左尾 5% 估计损失
+    let (var95_pct, cvar95_pct) = if daily_returns.is_empty() {
+        (0.0, 0.0)
+    } else {
+        let mut sorted = daily_returns.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let n = sorted.len();
+        let idx = (((n as f64) * 0.05).floor() as usize).min(n - 1);
+        let q = sorted[idx];
+        let tail = &sorted[..=idx];
+        let tail_mean = tail.iter().sum::<f64>() / tail.len() as f64;
+        (q.min(0.0).abs() * 100.0, tail_mean.min(0.0).abs() * 100.0)
+    };
 
     EquityStats {
         total_return_pct: total_return,
@@ -68,6 +91,8 @@ pub fn compute_stats(curve: &[LedgerEntry]) -> EquityStats {
         avg_win_pct: 0.0,
         avg_loss_pct: 0.0,
         profit_factor: 0.0,
+        var95_pct,
+        cvar95_pct,
     }
 }
 

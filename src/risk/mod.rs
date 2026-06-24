@@ -19,3 +19,4 @@ pub mod stop_loss;
 pub mod sector_exit;
 pub mod veto_chain;
 pub mod veto_rules_live;
+pub mod env_guard;

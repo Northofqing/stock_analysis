@@ -86,3 +86,4 @@ pub use lhb_analyzer::{
 };
 pub mod agent;
 pub mod deep_analyzer;
+pub mod trading;

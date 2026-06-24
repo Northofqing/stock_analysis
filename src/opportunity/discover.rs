@@ -8,14 +8,30 @@ pub struct Candidate {
     pub name: String,
     pub chain: String,
     pub logic: String,
+    pub score: f64,
     pub price_note: String, // "已启动+5.2% 追高风险" or ""
+    pub reason_summary: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScoreBreakdown {
+    source_score: f64,
+    keyword_score: f64,
+    fund_score: f64,
+    position_score: f64,
+}
+
+impl ScoreBreakdown {
+    fn total(self) -> f64 {
+        self.source_score + self.keyword_score + self.fund_score + self.position_score
+    }
 }
 
 /// 「逻辑硬度」评分：政策力度(产业链来源可信度) × 产业链位置(关键词强度) × 资金验证(板块主力流向)
 /// + 低位卡位加分。替代旧的"按命中顺序/关键词计数"粗排。
 ///
 /// 数据红线 2.2：某维度数据缺失则该维度记 0 分，不补默认高分。
-fn logic_hardness(hit: &ChainHit, s: &super::chain_mapper::StockInfo) -> f64 {
+fn logic_hardness(hit: &ChainHit, s: &super::chain_mapper::StockInfo) -> ScoreBreakdown {
     // ① 产业链来源可信度：规则命中(已验证映射) > AI 推理
     let source_score = match hit.source {
         ChainSource::Rule => 10.0,
@@ -38,7 +54,12 @@ fn logic_hardness(hit: &ChainHit, s: &super::chain_mapper::StockInfo) -> f64 {
         0.0
     };
 
-    source_score + keyword_score + fund_score + position_score
+    ScoreBreakdown {
+        source_score,
+        keyword_score,
+        fund_score,
+        position_score,
+    }
 }
 
 /// 生成价格风险提示（v3 意图：已启动追高风险 / 低位卡位）
@@ -50,6 +71,36 @@ fn price_note(s: &super::chain_mapper::StockInfo) -> String {
     } else {
         String::new()
     }
+}
+
+fn reason_summary(hit: &ChainHit, s: &super::chain_mapper::StockInfo, b: ScoreBreakdown) -> String {
+    let source = match hit.source {
+        ChainSource::Rule => "规则命中",
+        ChainSource::Ai => "AI推理",
+        ChainSource::AiDegraded => "AI降级",
+    };
+
+    let position = if b.position_score > 0.0 {
+        "低位放量卡位"
+    } else if b.position_score < 0.0 {
+        "已启动偏追高"
+    } else {
+        "位置中性"
+    };
+
+    format!(
+        "总分{:.1} = 来源({}:{:.1}) + 关键词({}个:{:.1}) + 资金({:.1}) + 位置({}:{:.1})；现价涨幅{:+.1}% 量比{:.1}",
+        b.total(),
+        source,
+        b.source_score,
+        hit.keywords.len(),
+        b.keyword_score,
+        b.fund_score,
+        position,
+        b.position_score,
+        s.change_pct,
+        s.vol_ratio,
+    )
 }
 
 /// 从产业链命中结果中发现新标的，按逻辑硬度排序输出 Top N。
@@ -72,13 +123,16 @@ pub fn discover(
             }
             if !seen.insert(s.code.clone()) { continue; } // 去重
 
-            let score = logic_hardness(hit, s);
+            let score_breakdown = logic_hardness(hit, s);
+            let score = score_breakdown.total();
             scored.push((score, Candidate {
                 code: s.code.clone(),
                 name: s.name.clone(),
                 chain: hit.chain.clone(),
                 logic: hit.logic.clone(),
+                score,
                 price_note: price_note(s),
+                reason_summary: reason_summary(hit, s, score_breakdown),
             }));
         }
     }

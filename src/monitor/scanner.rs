@@ -3,7 +3,9 @@
 //! 按层级轮询不同标的，集成 RateBudget + DQ Gate + 交易日历门控。
 
 use crate::calendar::{self, MarketSession};
-use crate::monitor::data_quality::{DqConfig, DqStats, Tick, validate_tick};
+use crate::monitor::data_quality::{
+    validate_freshness, validate_tick, DqConfig, DqStats, FreshnessConfig, FreshnessDataType, Tick,
+};
 use crate::monitor::rate_budget::RateBudget;
 use log::info;
 
@@ -38,6 +40,7 @@ pub struct TieredScanner {
     targets: Vec<ScanTarget>,
     budgets: Vec<RateBudget>,
     dq_config: DqConfig,
+    freshness: FreshnessConfig,
     pub dq_stats: DqStats,
 }
 
@@ -49,7 +52,13 @@ impl TieredScanner {
             RateBudget::with_window(10, 60),  // L2: 10次/分钟
             RateBudget::with_window(5, 60),   // L3: 5次/分钟
         ];
-        Self { targets, budgets, dq_config: DqConfig::default(), dq_stats: DqStats::new() }
+        Self {
+            targets,
+            budgets,
+            dq_config: DqConfig::default(),
+            freshness: FreshnessConfig::default(),
+            dq_stats: DqStats::new(),
+        }
     }
 
     /// 判断现在是否应该扫描
@@ -79,6 +88,14 @@ impl TieredScanner {
 
     /// 验证一个 tick 是否通过数据质量门
     pub fn validate(&self, tick: &Tick) -> ScanResult {
+        if let Err(r) = validate_freshness(
+            FreshnessDataType::Quote,
+            tick.update_time,
+            &self.freshness,
+            &self.dq_stats,
+        ) {
+            return ScanResult { tick: None, dq_passed: false, dq_reason: Some(r.label().into()) };
+        }
         let prev = None; // 简化：不追踪前值
         match validate_tick(tick, prev, &self.dq_config, &self.dq_stats) {
             Ok(()) => ScanResult { tick: Some(tick.clone()), dq_passed: true, dq_reason: None },

@@ -35,7 +35,7 @@ impl NotificationService {
 
         // 按评分排序
         let mut sorted_results = results.to_vec();
-        sorted_results.sort_by(|a, b| b.sentiment_score.cmp(&a.sentiment_score));
+        sorted_results.sort_by(|a, b| b.ranking_score.cmp(&a.ranking_score));
 
         // 统计信息
         let buy_count = results
@@ -50,7 +50,7 @@ impl NotificationService {
             .iter()
             .filter(|r| matches!(r.operation_advice.as_str(), "持有" | "观望"))
             .count();
-        let avg_score: f64 = results.iter().map(|r| r.sentiment_score as f64).sum::<f64>()
+        let avg_score: f64 = results.iter().map(|r| r.ranking_score as f64).sum::<f64>()
             / results.len() as f64;
 
         lines.extend(vec![
@@ -79,7 +79,7 @@ impl NotificationService {
             for r in &limit_up_results {
                 lines.push(format!(
                     "| {} {} | {} | {}分 | {} | {} |",
-                    r.get_emoji(), r.name, r.code, r.sentiment_score, r.operation_advice, r.trend_prediction
+                    r.get_emoji(), r.name, r.code, r.ranking_score, r.operation_advice, r.trend_prediction
                 ));
             }
             lines.push(String::new());
@@ -208,8 +208,8 @@ impl NotificationService {
             lines.push(format!("### {} {} ({}){}{}", emoji, result.name, result.code, limit_up_tag, contrarian_tag));
             lines.push(String::new());
             lines.push(format!(
-                "**操作建议：{}** | **综合评分：{}分** | **趋势预测：{}**",
-                result.operation_advice, result.sentiment_score, result.trend_prediction
+                "**操作建议：{}** | **综合评分（排序）：{}分** | **趋势预测：{}**",
+                result.operation_advice, result.ranking_score, result.trend_prediction
             ));
             lines.push(String::new());
 
@@ -605,7 +605,7 @@ impl NotificationService {
         let report_date = Local::now().format("%Y-%m-%d").to_string();
 
         let mut sorted_results = results.to_vec();
-        sorted_results.sort_by(|b, a| a.sentiment_score.cmp(&b.sentiment_score));
+        sorted_results.sort_by(|b, a| a.ranking_score.cmp(&b.ranking_score));
 
         let buy_count = results
             .iter()
@@ -619,7 +619,7 @@ impl NotificationService {
             .iter()
             .filter(|r| matches!(r.operation_advice.as_str(), "持有" | "观望"))
             .count();
-        let avg_score: f64 = results.iter().map(|r| r.sentiment_score as f64).sum::<f64>()
+        let avg_score: f64 = results.iter().map(|r| r.ranking_score as f64).sum::<f64>()
             / results.len() as f64;
 
         let mut lines = vec![
@@ -641,7 +641,7 @@ impl NotificationService {
             lines.push(format!("### {} {}({})", emoji, result.name, result.code));
             lines.push(format!(
                 "**{}** | 评分:{} | {}",
-                result.operation_advice, result.sentiment_score, result.trend_prediction
+                result.operation_advice, result.ranking_score, result.trend_prediction
             ));
 
             // 紧凑的核心指标行

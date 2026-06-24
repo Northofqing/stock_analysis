@@ -3,6 +3,7 @@
 use anyhow::Result;
 use chrono::{Datelike, Local};
 use log::{error, info, warn};
+use stock_analysis::config;
 use stock_analysis::pipeline::{AnalysisPipeline, PipelineConfig};
 
 use crate::app::get_max_workers;
@@ -184,11 +185,16 @@ async fn execute_once(args: &Args) {
     reload_env();
 
     // 依据最新环境变量/参数重建运行配置
+    let monitor_cfg = config::get_monitor_config();
     let config = PipelineConfig {
         max_workers: get_max_workers(args),
         dry_run: args.dry_run,
         send_notification: !args.no_notify,
         single_notify: args.single_notify,
+        dq_quote_stale_sec: monitor_cfg.dq_quote_stale_sec,
+        dq_position_stale_sec: monitor_cfg.dq_position_stale_sec,
+        dq_nav_stale_sec: monitor_cfg.dq_nav_stale_sec,
+        dq_daily_stale_sec: monitor_cfg.dq_daily_stale_sec,
     };
 
     // 模式（个股分析 / 大盘复盘）每次执行重新判定

@@ -323,6 +323,86 @@ pub fn fetch_board_ranking(fid: &str, top_n: usize) -> Result<Vec<ConceptBoard>>
     Ok(boards)
 }
 
+/// 通过东财 suggest 接口按关键词查询板块代码（BKxxxx）。
+///
+/// 该接口可补齐「不在当下热点榜前N」但确实存在的板块，避免机会链路仅依赖榜单池。
+pub fn search_board_code_by_keyword(keyword: &str) -> Result<Option<(String, String)>> {
+    let key = keyword.trim();
+    if key.is_empty() {
+        return Ok(None);
+    }
+
+    let client = build_client()?;
+    let url = format!(
+        "https://searchapi.eastmoney.com/api/suggest/get?input={}&type=14&token=D43BF722C8E33BDC906FB84D85E326E8&count=20",
+        urlencoding::encode(key)
+    );
+
+    let body: Value = client
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0")
+        .send()
+        .context("请求东财 suggest 失败")?
+        .json()
+        .context("解析东财 suggest JSON 失败")?;
+
+    // 接口历史上存在两种包裹层，兼容两者。
+    let data = body
+        .get("QuotationCodeTable")
+        .and_then(|v| v.get("Data"))
+        .and_then(|v| v.as_array())
+        .or_else(|| {
+            body.get("Result")
+                .and_then(|v| v.get("QuotationCodeTable"))
+                .and_then(|v| v.get("Data"))
+                .and_then(|v| v.as_array())
+        });
+
+    let Some(items) = data else {
+        return Ok(None);
+    };
+
+    // 评分：优先精确命中，其次包含命中。
+    let mut best: Option<(u8, String, String)> = None;
+    for item in items {
+        let code = item.get("Code").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let name = item.get("Name").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let classify = item
+            .get("Classify")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let sec_type_name = item
+            .get("SecurityTypeName")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+
+        if code.is_empty() || name.is_empty() {
+            continue;
+        }
+        let is_board = classify == "BK" || sec_type_name == "板块" || code.starts_with("BK");
+        if !is_board {
+            continue;
+        }
+
+        let score = if name == key {
+            3
+        } else if name.contains(key) || key.contains(name) {
+            2
+        } else {
+            1
+        };
+
+        match &best {
+            Some((best_score, _, _)) if score <= *best_score => {}
+            _ => best = Some((score, code.to_string(), name.to_string())),
+        }
+    }
+
+    Ok(best.map(|(_, code, name)| (code, name)))
+}
+
 /// 拉取板块成份股，按成交额降序，取前 `top_n` 名
 pub fn fetch_board_components(board_code: &str, top_n: usize) -> Result<Vec<BoardStock>> {
     let client = build_client()?;

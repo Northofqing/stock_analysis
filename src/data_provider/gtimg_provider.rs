@@ -74,6 +74,8 @@ impl GtimgProvider {
     /// 创建新的提供者
     pub fn new() -> Result<Self> {
         let client = reqwest::Client::builder()
+            // 与东财一致：绕过系统代理，避免 fake-ip/代理回包导致解析失败。
+            .no_proxy()
             .timeout(std::time::Duration::from_secs(10))
             .connect_timeout(std::time::Duration::from_secs(5))
             .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -132,8 +134,9 @@ impl GtimgProvider {
         
         // 腾讯财经K线API
         // ktype: day(日线), week(周线), month(月线)
+        // 优先 HTTPS，避免部分网络环境下 HTTP 被网关重定向/拦截返回 HTML。
         let url = format!(
-            "http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={},day,,,{},qfq",
+            "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={},day,,,{},qfq",
             market_code, days
         );
         
@@ -164,6 +167,15 @@ impl GtimgProvider {
         if text.is_empty() {
             log::error!("[腾讯] 响应为空 - URL: {}", url);
             return Err(anyhow!("API返回空响应"));
+        }
+
+        let body = text.trim_start();
+        if body.starts_with('<') {
+            let preview: String = body.chars().take(120).collect();
+            return Err(anyhow!(
+                "腾讯K线接口返回非JSON内容（可能被网关重定向/拦截）: {}",
+                preview
+            ));
         }
         
         log::debug!("[腾讯] 响应前200字符: {}", &text[..text.len().min(200)]);

@@ -19,6 +19,9 @@ pub struct ChainRuleConfig {
     /// 大类分组，如 "AI硬件"、"半导体"、"新能源"。toml 缺失时默认空。
     #[serde(default)]
     pub category: String,
+    /// 是否为通用规则：当仅命中该类规则时，可触发 AI 二次分类验证。
+    #[serde(default)]
+    pub generic: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -77,12 +80,32 @@ pub struct MonitorConfig {
     pub topic_history_memory_size: usize,
     #[serde(default = "default_topic_history_db_limit")]
     pub topic_history_db_limit: usize,
+    #[serde(default = "default_dq_quote_stale_sec")]
+    pub dq_quote_stale_sec: u64,
+    #[serde(default = "default_dq_position_stale_sec")]
+    pub dq_position_stale_sec: u64,
+    #[serde(default = "default_dq_nav_stale_sec")]
+    pub dq_nav_stale_sec: u64,
+    #[serde(default = "default_dq_daily_stale_sec")]
+    pub dq_daily_stale_sec: u64,
+    /// 产业链命中最小置信度（0-100），低于该值仅观察不参与机会推荐
+    #[serde(default = "default_opportunity_min_confidence")]
+    pub opportunity_min_confidence: u8,
+    /// 是否强制要求快讯+Web双源共振
+    #[serde(default)]
+    pub opportunity_require_cross_source: bool,
     /// VetoChain 否决链配置 (可选 section [live_veto])
     #[serde(default)]
     pub live_veto: LiveVetoConfig,
     /// 动态仓位配置 (可选 section [position_sizing])
     #[serde(default)]
     pub position_sizing: PositionSizingConfig,
+    /// IC 反馈到排序评分配置（可选 section [factor_feedback]）
+    #[serde(default)]
+    pub factor_feedback: FactorFeedbackConfig,
+    /// 空中加油执行配置（可选 section [air_refuel]）
+    #[serde(default)]
+    pub air_refuel: AirRefuelConfig,
 }
 
 fn default_screener_interval() -> u64 { 30 }
@@ -97,6 +120,11 @@ fn default_topic_mmr_history_penalty() -> f32 { 1.4 }
 fn default_topic_history_window_hours() -> u64 { 72 }
 fn default_topic_history_memory_size() -> usize { 160 }
 fn default_topic_history_db_limit() -> usize { 400 }
+fn default_dq_quote_stale_sec() -> u64 { 5 }
+fn default_dq_position_stale_sec() -> u64 { 30 }
+fn default_dq_nav_stale_sec() -> u64 { 24 * 3600 }
+fn default_dq_daily_stale_sec() -> u64 { 24 * 3600 }
+fn default_opportunity_min_confidence() -> u8 { 55 }
 
 // ── 实时否决链配置 (VetoChain) ──
 
@@ -155,6 +183,84 @@ impl Default for PositionSizingConfig {
     }
 }
 
+// ── 因子 IC 反馈配置（仅影响排序/展示，不影响买入触发） ──
+
+/// 因子反馈配置，作为 `config/monitor.toml` 的 `[factor_feedback]` section。
+///
+/// action 取值：
+/// - normal: 保持原值
+/// - disable: 维度禁用（权重=0）
+/// - invert: 维度反转（score -> 100-score）
+/// - down_weight: 维度降权（乘以 down_weight_scale）
+#[derive(Debug, Clone, Deserialize)]
+pub struct FactorFeedbackConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_factor_action_normal")]
+    pub technical_action: String,
+    #[serde(default = "default_factor_action_normal")]
+    pub quality_action: String,
+    #[serde(default = "default_factor_action_normal")]
+    pub valuation_action: String,
+    #[serde(default = "default_factor_action_normal")]
+    pub flow_action: String,
+    #[serde(default = "default_factor_action_normal")]
+    pub growth_action: String,
+    #[serde(default = "default_down_weight_scale")]
+    pub down_weight_scale: f64,
+}
+
+// ── 空中加油执行配置 ──
+
+/// 空中加油执行配置，作为 `config/monitor.toml` 的 `[air_refuel]` section。
+///
+/// entry_mode 取值：
+/// - confirm: 次日早盘确认弱转强后再记录虚拟观察仓（默认）
+/// - pilot: 整盘日尾盘/竞价先潜伏记录虚拟观察仓
+#[derive(Debug, Clone, Deserialize)]
+pub struct AirRefuelConfig {
+    #[serde(default = "default_air_refuel_entry_mode")]
+    pub entry_mode: String,
+    #[serde(default = "default_air_refuel_confirm_lots")]
+    pub confirm_lots: u32,
+    #[serde(default = "default_air_refuel_pilot_lots")]
+    pub pilot_lots: u32,
+    #[serde(default = "default_true")]
+    pub next_day_review_enabled: bool,
+}
+
+fn default_air_refuel_entry_mode() -> String { "confirm".to_string() }
+fn default_air_refuel_confirm_lots() -> u32 { 10 }
+fn default_air_refuel_pilot_lots() -> u32 { 3 }
+
+impl Default for AirRefuelConfig {
+    fn default() -> Self {
+        Self {
+            entry_mode: "confirm".to_string(),
+            confirm_lots: 10,
+            pilot_lots: 3,
+            next_day_review_enabled: true,
+        }
+    }
+}
+
+fn default_factor_action_normal() -> String { "normal".to_string() }
+fn default_down_weight_scale() -> f64 { 0.5 }
+
+impl Default for FactorFeedbackConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            technical_action: "normal".to_string(),
+            quality_action: "normal".to_string(),
+            valuation_action: "normal".to_string(),
+            flow_action: "normal".to_string(),
+            growth_action: "normal".to_string(),
+            down_weight_scale: 0.5,
+        }
+    }
+}
+
 impl Default for MonitorConfig {
     fn default() -> Self {
         Self {
@@ -170,8 +276,16 @@ impl Default for MonitorConfig {
             topic_history_window_hours: 72,
             topic_history_memory_size: 160,
             topic_history_db_limit: 400,
+            dq_quote_stale_sec: 5,
+            dq_position_stale_sec: 30,
+            dq_nav_stale_sec: 24 * 3600,
+            dq_daily_stale_sec: 24 * 3600,
+            opportunity_min_confidence: 55,
+            opportunity_require_cross_source: false,
             live_veto: LiveVetoConfig::default(),
             position_sizing: PositionSizingConfig::default(),
+            factor_feedback: FactorFeedbackConfig::default(),
+            air_refuel: AirRefuelConfig::default(),
         }
     }
 }
@@ -195,6 +309,12 @@ static MONITOR_CONFIG: LazyLock<RwLock<MonitorConfig>> = LazyLock::new(|| {
         topic_history_window_hours: 72,
         topic_history_memory_size: 160,
         topic_history_db_limit: 400,
+        dq_quote_stale_sec: 5,
+        dq_position_stale_sec: 30,
+        dq_nav_stale_sec: 24 * 3600,
+        dq_daily_stale_sec: 24 * 3600,
+        opportunity_min_confidence: 55,
+        opportunity_require_cross_source: false,
         live_veto: LiveVetoConfig {
             enabled: true,
             mode: String::from("dry_run"),
@@ -204,6 +324,8 @@ static MONITOR_CONFIG: LazyLock<RwLock<MonitorConfig>> = LazyLock::new(|| {
             fundamental_enabled: true,
         },
         position_sizing: PositionSizingConfig { use_dynamic: true },
+        factor_feedback: FactorFeedbackConfig::default(),
+        air_refuel: AirRefuelConfig::default(),
     })
 });
 

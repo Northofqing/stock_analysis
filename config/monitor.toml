@@ -16,11 +16,19 @@ topic_history_window_hours = 72
 topic_history_memory_size = 160
 topic_history_db_limit = 400
 
+# ── 数据新鲜度阈值（AGENTS 2.4） ──
+dq_quote_stale_sec = 5         # 实时行情
+dq_position_stale_sec = 30     # 持仓/资金
+dq_nav_stale_sec = 86400       # 净值（当日有效）
+dq_daily_stale_sec = 86400     # 日线/历史数据（1交易日内）
+opportunity_min_confidence = 55      # 产业链命中置信度阈值（0-100）
+opportunity_require_cross_source = false # true=必须快讯+Web双源共振
+
 # ── 实时否决链配置 (VetoChain) ──
 # SIGHUP 热加载。上线首周默认 dry_run，观察拦截率。
 [live_veto]
 enabled = true
-mode = "dry_run"              # "dry_run" | "live"
+mode = "live"              # "dry_run" | "live"
 bias_rate_enabled = true      # 乖离率拦截
 bearish_alignment_enabled = true  # 空头排列拦截
 main_flow_enabled = true      # 主力资金拦截
@@ -29,3 +37,20 @@ fundamental_enabled = true    # 基本面恶化拦截
 # ── 动态仓位配置 ──
 [position_sizing]
 use_dynamic = true            # false = 回退到旧固定仓位算法
+
+# ── 因子 IC 反馈到排序评分（仅排序/展示/回测，不改买入触发） ──
+[factor_feedback]
+enabled = false               # 默认关闭，先观察复盘建议后再启用
+technical_action = "normal"   # normal | disable | invert | down_weight
+quality_action = "normal"
+valuation_action = "normal"
+flow_action = "normal"
+growth_action = "normal"
+down_weight_scale = 0.5       # down_weight 时乘数（0~1）
+
+# ── 空中加油执行配置 ──
+[air_refuel]
+entry_mode = "confirm"        # confirm | pilot
+confirm_lots = 10              # 次日确认模式：每只虚拟记录手数
+pilot_lots = 3                 # 尾盘潜伏模式：每只虚拟记录手数
+next_day_review_enabled = true # 复盘时统计上一交易日虚拟观察仓表现

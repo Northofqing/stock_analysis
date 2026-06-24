@@ -16,9 +16,12 @@ use log::{info, warn};
 
 use crate::database::DatabaseManager;
 use crate::data_provider::KlineData;
-use crate::monitor::risk::{MarketRegime, PositionSizer, PositionType, StopLoss};
+use crate::monitor::risk::{MarketRegime, PositionSizer, StopLoss};
 use crate::risk::stop_loss::check_stops;
 use crate::strategy::BollMacdAction;
+use crate::trading::{
+    ClosePositionCmd, OpenPositionCmd, SimulatedExecutionGateway, TradeExecutionGateway,
+};
 
 use super::AnalysisResult;
 
@@ -92,6 +95,10 @@ fn net_return_rate(gross_pct: f64) -> f64 {
     gross_pct - ROUND_TRIP_COST_PCT
 }
 
+fn validate_trade_symbol_env(code: &str) -> Result<(), String> {
+    crate::risk::env_guard::validate_symbol_for_current_env(code)
+}
+
 /// 对单只股票跟踪模拟持仓并在满足条件时开/平仓。
 pub(super) fn track_position(
     code: &str,
@@ -99,13 +106,23 @@ pub(super) fn track_position(
     result: &mut AnalysisResult,
     risk_ctx: &RiskContext,
 ) {
-    let Ok(db) = std::panic::catch_unwind(|| DatabaseManager::get()) else {
+    let gateway = SimulatedExecutionGateway::new();
+
+    // AGENTS 2.5: 双向硬隔离（生产拒绝 TEST_CODE，测试拒绝真实标的）
+    if let Err(reason) = validate_trade_symbol_env(code) {
+        warn!(
+            "[ENV_GUARD] rule_id=AGENTS-2.5 code={} env={:?} action=reject reason={} timestamp={}",
+            code,
+            crate::risk::env_guard::current_env(),
+            reason,
+            chrono::Utc::now().timestamp()
+        );
         return;
-    };
+    }
 
     let current_price = result.current_price.unwrap_or(data[0].close);
 
-    match db.get_open_position(code) {
+    match gateway.get_open_position(code) {
         Ok(Some(pos)) => {
             let return_rate = net_return_rate((current_price / pos.buy_price - 1.0) * 100.0);
             result.position_buy_price = Some(pos.buy_price);
@@ -209,7 +226,20 @@ pub(super) fn track_position(
                     "铁律4:14天不涨换股".to_string()
                 };
                 let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-                match db.close_position(pos.id, current_price, &today) {
+                let close_cmd = ClosePositionCmd {
+                    business_order_id: format!(
+                        "SIM-SELL-{}-{}-{}",
+                        code,
+                        pos.id,
+                        chrono::Utc::now().timestamp()
+                    ),
+                    position_id: pos.id,
+                    code: code.to_string(),
+                    trade_date: today.clone(),
+                    price: current_price,
+                    quantity: pos.quantity,
+                };
+                match gateway.close_position(&close_cmd) {
                     Ok(_) => {
                         info!(
                             "[{}] 触发平仓 [{}]，@ {:.2}，收益率: {:+.2}%",
@@ -230,7 +260,7 @@ pub(super) fn track_position(
                     "[{}] 持仓中，收益率: {:+.2}%（买入价 {:.2} → 现价 {:.2}）",
                     code, return_rate, pos.buy_price, current_price
                 );
-                if let Err(e) = db.update_position_return(pos.id, current_price, return_rate) {
+                if let Err(e) = gateway.update_position_return(pos.id, current_price, return_rate) {
                     warn!("[{}] 更新持仓收益率失败: {}", code, e);
                 }
             }
@@ -303,15 +333,19 @@ pub(super) fn track_position(
             };
 
             let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-            let new_position = crate::models::NewStockPosition {
+            let open_cmd = OpenPositionCmd {
+                business_order_id: format!(
+                    "SIM-BUY-{}-{}",
+                    code,
+                    chrono::Utc::now().timestamp()
+                ),
                 code: code.to_string(),
                 name: result.name.clone(),
-                buy_date: today.clone(),
-                buy_price: current_price,
+                trade_date: today.clone(),
+                price: current_price,
                 quantity: shares,
-                status: "open".to_string(),
             };
-            match db.save_position(&new_position) {
+            match gateway.open_position(&open_cmd) {
                 Ok(_) => {
                     let tag = match (bm_action, result.contrarian_signal) {
                         (BollMacdAction::UptrendStart, _) => "主升浪启动",
@@ -350,6 +384,54 @@ pub(super) fn track_position(
             }
         }
         Err(e) => warn!("[{}] 查询持仓失败: {}", code, e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_trade_symbol_env;
+    use once_cell::sync::Lazy;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+    fn with_env_mode<T>(mode: &str, f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
+        let prev = std::env::var("STOCK_ENV_MODE").ok();
+        std::env::set_var("STOCK_ENV_MODE", mode);
+        let out = f();
+        if let Some(v) = prev {
+            std::env::set_var("STOCK_ENV_MODE", v);
+        } else {
+            std::env::remove_var("STOCK_ENV_MODE");
+        }
+        out
+    }
+
+    #[test]
+    fn test_prod_rejects_test_code() {
+        with_env_mode("prod", || {
+            let r = validate_trade_symbol_env("TEST_CODE_000001");
+            assert!(r.is_err());
+        });
+    }
+
+    #[test]
+    fn test_test_rejects_real_code() {
+        with_env_mode("test", || {
+            let r = validate_trade_symbol_env("600519");
+            assert!(r.is_err());
+        });
+    }
+
+    #[test]
+    fn test_legal_symbol_matrix_passes() {
+        with_env_mode("prod", || {
+            assert!(validate_trade_symbol_env("600519").is_ok());
+        });
+        with_env_mode("test", || {
+            assert!(validate_trade_symbol_env("TEST_CODE_600519").is_ok());
+        });
     }
 }
 

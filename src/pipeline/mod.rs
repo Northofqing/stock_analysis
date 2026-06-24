@@ -36,6 +36,9 @@ use crate::database::DatabaseManager;
 use crate::notification::NotificationService;
 use crate::trend_analyzer::StockTrendAnalyzer;
 use crate::traits::ScoreDisplay;
+use crate::monitor::data_quality::{
+    validate_daily_freshness, validate_daily_kline_quality, DqStats, FreshnessConfig,
+};
 
 /// 股票综合分析结果
 ///
@@ -46,6 +49,10 @@ pub struct AnalysisResult {
     pub code: String,
     pub name: String,
     pub sentiment_score: i32,
+    /// 排序评分（0~100）：由五维 score_breakdown 结合 IC 反馈配置计算。
+    /// 仅用于排序/展示/回测选股，不参与买入触发。
+    #[serde(default)]
+    pub ranking_score: i32,
     pub operation_advice: String,
     pub trend_prediction: String,
     /// 技术分析正文（Markdown 格式），对应通知报告中的「综合分析」章节。
@@ -196,6 +203,14 @@ pub struct PipelineConfig {
     pub send_notification: bool,
     /// 单股推送模式
     pub single_notify: bool,
+    /// 实时行情新鲜度阈值（秒）
+    pub dq_quote_stale_sec: u64,
+    /// 持仓/资金新鲜度阈值（秒）
+    pub dq_position_stale_sec: u64,
+    /// 净值新鲜度阈值（秒）
+    pub dq_nav_stale_sec: u64,
+    /// 日线/历史数据新鲜度阈值（秒）
+    pub dq_daily_stale_sec: u64,
 }
 
 impl Default for PipelineConfig {
@@ -205,6 +220,10 @@ impl Default for PipelineConfig {
             dry_run: false,
             send_notification: true,
             single_notify: false,
+            dq_quote_stale_sec: 5,
+            dq_position_stale_sec: 30,
+            dq_nav_stale_sec: 24 * 3600,
+            dq_daily_stale_sec: 24 * 3600,
         }
     }
 }
@@ -242,11 +261,11 @@ fn key_stock_priority(r: &AnalysisResult) -> Option<i32> {
         p += 100;
         hit = true;
     }
-    if r.sentiment_score >= 75 {
+    if r.ranking_score >= 75 {
         p += 80;
         hit = true;
     }
-    if r.sentiment_score <= 25 {
+    if r.ranking_score <= 25 {
         p += 70;
         hit = true;
     }
@@ -449,6 +468,29 @@ impl AnalysisPipeline {
         if data.is_empty() {
             warn!("[{}] 获取到的数据为空", code);
             return Ok(data);
+        }
+
+        // AGENTS 2.4: 日线/历史数据超过 1 个交易日直接阻断。
+        let latest_date = data[0].date;
+        let freshness = FreshnessConfig {
+            quote_max_age_secs: self.config.dq_quote_stale_sec,
+            position_max_age_secs: self.config.dq_position_stale_sec,
+            nav_max_age_secs: self.config.dq_nav_stale_sec,
+            daily_max_age_secs: self.config.dq_daily_stale_sec,
+        };
+        let dq_stats = DqStats::new();
+        if let Err(reason) = validate_daily_freshness(latest_date, chrono::Local::now(), &freshness, &dq_stats) {
+            anyhow::bail!(
+                "[{}] 日线新鲜度校验失败: {} (latest_date={})",
+                code,
+                reason.label(),
+                latest_date
+            );
+        }
+
+        // 维度4最小闭环：日线 OHLC 一致性 + 异常跳变告警（失败即阻断）
+        if let Err(msg) = validate_daily_kline_quality(&data, 20.0) {
+            anyhow::bail!("[{}] 日线质量校验失败: {}", code, msg);
         }
 
         info!("[{}] 从 {} 获取到 {} 条数据", code, source, data.len());
@@ -1269,6 +1311,7 @@ impl AnalysisPipeline {
             code: code.to_string(),
             name: stock_name,
             sentiment_score: trend_result.signal_score,
+            ranking_score: trend_result.signal_score,
             operation_advice,
             trend_prediction: format!("{}", trend_result.trend_status),
             analysis_summary: analysis_content,
@@ -1353,6 +1396,7 @@ impl AnalysisPipeline {
         if !veto.flags.is_empty() {
             result.veto_flags = Some(veto.flags.clone());
         }
+        result.ranking_score = score_breakdown::compute_ranking_score(&sb);
         result.score_breakdown = Some(sb);
 
         // ===== Phase 2: 交易类型标注 =====

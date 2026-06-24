@@ -5,6 +5,13 @@
 
 use crate::market_analyzer::sector_monitor;
 
+/// 板块候选池大小：兼顾覆盖率与请求成本。
+const BOARD_RANK_TOP_N: usize = 200;
+/// 成份股抓取上限：避免只拿到高成交额头部导致持仓漏判。
+const COMPONENT_FETCH_TOP_N: usize = 100;
+/// 最终保留的板块成份股数量。
+const COMPONENT_KEEP_TOP_N: usize = 50;
+
 #[derive(Debug, Clone)]
 pub struct StockInfo {
     pub code: String,
@@ -41,72 +48,51 @@ pub struct ChainHit {
     pub fund_flow_pct: Option<f64>,
 }
 
-/// 关键词 → (关键词列表, 产业链名, 催化逻辑, 板块关键词, 优先级)
-/// toml 不可用时的编译期 fallback。与 config/chain_rules.toml 保持同步。
-const DEFAULT_CHAIN_RULES: &[(&[&str], &str, &str, &str, u32)] = &[
-    // ── AI硬件 ──
-    (&["液冷", "液冷服务器", "冷板", "浸没式冷却", "浸没式液冷", "冷却液", "液冷机柜", "液冷散热", "散热"], "AI硬件-液冷", "高功率密度算力集群驱动散热全面向液冷升级", "液冷", 100),
-    (&["CPO", "光模块", "光通信", "光器件", "光互联", "硅光", "硅光子", "硅光模块", "光引擎", "共封装光学", "LPO", "1.6T光模块", "800G光模块"], "AI硬件-CPO", "AI算力驱动高速光互联需求，CPO/LPO/硅光渗透率快速提升", "CPO", 100),
-    (&["铜缆", "高速连接", "DAC", "ACC", "AEC", "有源铜缆", "有源电缆", "高速线缆", "高速背板", "背板连接", "连接器", "铜连接", "铜互连", "高速互联", "内部互联"], "AI硬件-铜缆高速连接", "短距高速互连从光向铜延伸，GB300/GB200机柜内部铜缆方案催化", "铜缆高速连接", 100),
-    (&["HBM", "HBM2", "HBM2E", "HBM3", "HBM3E", "HBM4", "高带宽内存", "堆叠内存", "3D堆叠内存", "混合键合", "内存接口", "内存接口芯片", "HBM封装"], "HBM-高带宽内存", "HBM3E量产+HBM4路线图+AI芯片拉动高带宽内存需求爆发", "HBM", 100),
-    (&["PCB", "电路板", "覆铜板", "电子布", "印制电路", "印制电路板", "HDI板", "HDI", "IC载板", "ABF载板", "高频高速板", "服务器PCB", "封装基板"], "AI硬件-PCB", "电子布提价+AI服务器PCB需求激增，HDI与IC载板持续升级", "PCB", 90),
-    (&["MLCC", "被动元件", "陶瓷电容", "片式电容", "薄膜电容", "电感", "电阻", "电容", "被动器件", "元器件"], "AI硬件-MLCC", "AI服务器MLCC用量从2000颗激增至数十万颗，被动元件持续受益", "MLCC", 90),
-    (&["NVLink", "InfiniBand", "IB交换机", "NVSwitch", "Spectrum", "英伟达交换机", "英伟达互联", "GPU互联", "片间互联"], "AI硬件-NVLink", "英伟达NVLink/InfiniBand高速互联技术迭代，拉动配套硬件需求", "英伟达", 95),
-    (&["AI服务器", "算力", "GPU", "数据中心", "智算中心", "算力租赁", "算力基建", "训练集群", "GPU集群", "超算", "东数西算", "算力调度", "国产算力"], "AI算力", "算力基建持续扩张，国产GPU+算力租赁+智算中心三线并进", "算力", 60),
-    (&["Rubin", "Vera", "英伟达Rubin", "NVLink6", "Rubin Ultra", "Rubin平台", "英伟达下一代芯片"], "Rubin", "英伟达Rubin下一代AI芯片平台发布，拉动产业链备货需求", "英伟达", 95),
-    (&["服务器电源", "AI电源", "高功率电源", "冗余电源", "电源模块", "UPS", "备用电源", "电源管理", "功率密度", "机柜电源"], "AI硬件-服务器电源", "AI服务器功耗激增，电源功率密度升级与冗余配置需求爆发", "算力", 90),
-    // ── 半导体 ──
-    (&["先进封装", "Chiplet", "CoWoS", "2.5D封装", "3D封装", "扇出型封装", "FOPLP", "面板级封装", "TSV", "玻璃基板", "玻璃通孔", "TGV", "混合键合", "晶圆级封装", "系统级封装", "SiP"], "半导体-先进封装", "Chiplet与HBM推动先进封装扩产，CoWoS/玻璃基板/PLP技术迭代", "先进封装", 95),
-    (&["光刻机", "刻蚀机", "薄膜沉积", "PVD", "CVD", "ALD", "离子注入", "清洗设备", "CMP", "抛光机", "检测设备", "量测设备", "半导体设备", "晶圆厂", "半导体扩产"], "半导体-设备", "国产替代+晶圆厂扩产周期，半导体设备国产化率持续提升", "光刻机", 90),
-    (&["光刻胶", "光刻胶树脂", "光刻胶溶剂", "光刻胶显影剂", "电子气体", "电子特气", "六氟化钨", "氟化氢", "电子化学品", "靶材", "抛光液", "抛光垫", "前驱体", "硅片", "大硅片", "ABF绝缘膜", "薄膜铌酸锂", "电子铜箔", "磷化铟"], "半导体-材料", "半导体材料国产替代加速，从光刻胶到电子气体的全链条突破", "光刻胶", 90),
-    (&["存储芯片", "NAND", "NOR Flash", "DRAM", "内存芯片", "存储涨价", "存储器", "闪存", "内存颗粒", "利基型存储", "存储周期"], "半导体-存储芯片", "存储芯片涨价周期+国产NAND/DRAM突破，存储产业链价值重估", "存储芯片", 85),
-    (&["晶圆代工", "Foundry", "成熟制程", "先进制程", "制程节点", "28nm", "14nm", "7nm", "5nm", "产能利用率", "流片", "代工"], "半导体-制造代工", "成熟制程产能爬坡+先进制程突破，代工格局重塑", "半导体", 80),
-    (&["AI芯片", "NPU", "TPU", "ASIC芯片", "推理芯片", "训练芯片", "GPU替代", "国产GPU", "GPGPU", "智能芯片", "AI加速卡", "存算一体"], "半导体-AI芯片", "国产AI芯片在训练与推理两侧加速渗透，ASIC定制化趋势明确", "AI芯片", 90),
-    (&["RISC-V", "RISC-V架构", "开源指令集", "开放架构", "RISC-V芯片", "RISC-V处理器", "RISC-V IP", "开源芯片", "指令集架构"], "半导体-RISC-V", "RISC-V开放架构在全球半导体博弈中的战略价值持续提升", "RISC-V", 85),
-    (&["半导体", "芯片", "晶圆", "封测", "硅片", "国产替代", "集成电路", "IC设计", "IDM", "Fabless"], "半导体", "国产替代+扩产周期，半导体产业链整体受益", "半导体", 30),
-    // ── AI应用与终端 ──
-    (&["AI手机", "AIPC", "AI PC", "AI眼镜", "AI耳机", "端侧大模型", "端侧模型", "端云协同", "本地推理", "端侧推理", "端侧AI", "终端AI", "智能穿戴", "AI换机"], "AI终端", "端侧大模型落地带动AI手机/AIPC/AI眼镜换机周期", "AI手机", 85),
-    (&["AI Agent", "AI智能体", "智能体", "MCP协议", "大模型应用", "行业大模型", "垂直大模型", "AI软件", "AI应用", "AI+", "人工智能应用", "GPT-5", "GPT-4o"], "AI应用", "AI Agent与行业大模型从概念走向落地，应用层百花齐放", "人工智能", 80),
-    (&["智能驾驶", "自动驾驶", "无人驾驶", "L3自动驾驶", "L4自动驾驶", "端到端智驾", "智驾", "高阶智驾", "城市NOA", "高速NOA", "FSD", "FSD入华", "激光雷达", "LiDAR", "毫米波雷达", "智驾芯片", "域控制器", "智能座舱", "ADAS"], "智能驾驶", "L3级自动驾驶政策破冰+端到端大模型重塑智驾技术路线", "无人驾驶", 85),
-    // ── 新能源 ──
-    (&["固态电池", "全固态电池", "半固态电池", "硫化物固态", "氧化物固态", "固态电解质", "固态电池量产", "固态电池装车"], "新能源-固态电池", "固态电池技术路线收敛，硫化物路线与产业化进程加速", "固态电池", 95),
-    (&["钠离子电池", "钠电池", "钠电", "层状氧化物", "聚阴离子", "普鲁士蓝", "钠离子储能", "硬碳", "钠离子量产"], "新能源-钠离子电池", "钠离子电池量产线投产，成本优势打开储能与两轮车替代空间", "钠离子电池", 90),
-    (&["锂电池", "锂电", "磷酸铁锂", "LFP", "三元锂", "NCM", "电解液", "正极材料", "负极材料", "碳酸锂", "六氟磷酸锂", "锂矿", "盐湖提锂", "电池回收", "4680", "大圆柱电池", "刀片电池"], "新能源-锂电池", "锂电池技术迭代+成本下降+储能需求双轮驱动", "锂电池", 60),
-    (&["光伏", "硅料", "组件", "逆变器", "钙钛矿", "钙钛矿叠层", "异质结", "HJT", "TOPCon", "BC电池", "光伏出海", "光伏装机", "分布式光伏"], "新能源-光伏", "钙钛矿叠层效率突破+光伏出海加速+行业供需再平衡", "光伏", 65),
-    (&["氢能", "氢能源", "绿氢", "电解水制氢", "PEM电解槽", "碱性电解槽", "燃料电池", "氢燃料电池", "质子交换膜", "加氢站", "储氢", "氢能重卡", "氢储能"], "新能源-氢能", "氢能纳入国家能源体系，绿氢制备与燃料电池示范城市群加速", "氢能", 80),
-    (&["储能", "电化学储能", "储能电站", "独立储能", "共享储能", "储能变流器", "PCS", "BMS", "EMS", "储能电池", "液流电池", "全钒液流", "压缩空气储能", "新型储能", "储能装机"], "新能源-储能", "新型储能装机持续超预期，独立储能商业模式逐步跑通", "储能", 75),
-    // ── 电力电网 ──
-    (&["变压器", "电力变压器", "配电变压器", "干式变压器", "特高压", "升压站", "换流站", "换流变压器", "电网改造", "配电网", "输变电", "变电站", "取向硅钢"], "电力-变压器", "算力扩容+电网升级+新能源并网三重共振，变压器进入长景气周期", "特高压", 85),
-    (&["智能电网", "配电网", "电网数字化", "配网自动化", "电网改造", "变电站", "电力物联网", "电网智能化", "柔性直流", "继电保护", "配网设备", "环网柜"], "电力-智能电网", "新型电力系统建设加速，配网自动化与电网数字化投资高增", "智能电网", 80),
-    (&["虚拟电厂", "需求响应", "负荷聚合", "辅助服务", "电力现货", "电力市场化", "电力交易", "售电", "可调负荷", "VPP", "分布式能源", "需求侧管理"], "电力-虚拟电厂", "电力市场化改革深化，需求侧响应与虚拟电厂聚合交易加速", "虚拟电厂", 85),
-    (&["绿色电力", "绿电交易", "绿证", "新能源消纳", "可再生能源", "碳交易", "碳排放", "电力市场化", "CCER", "碳配额"], "电力-绿色电力", "绿电交易扩容+消纳机制完善+碳市场联动，绿电价值重估", "绿色电力", 75),
-    // ── 机器人 ──
-    (&["机器人", "人形机器人", "具身智能", "机械臂", "四足机器人", "服务机器人", "工业机器人", "协作机器人", "灵巧手", "机器人关节", "机器人电机", "机器人传感器", "机器人减速器", "宇树", "优必选", "Figure", "Tesla Bot", "Optimus", "机器人量产", "丝杠", "滚柱丝杠", "执行器"], "机器人", "人形机器人从实验室走向产线，具身智能+产业基金+量产预期驱动", "机器人", 80),
-    // ── 高端制造 ──
-    (&["低空经济", "无人机", "eVTOL", "飞行汽车", "低空空域", "通用航空", "通航", "城市空中交通", "UAM", "适航认证", "空域管理", "低空基础设施"], "低空经济", "低空空域管理改革+适航认证加速+eVTOL商业化运营在即", "低空经济", 85),
-    (&["商业航天", "卫星互联网", "低轨卫星", "星链", "Starlink", "可回收火箭", "商业发射", "火箭发动机", "固体火箭", "卫星", "卫星通信", "遥感卫星", "北斗", "卫星制造", "地面终端", "相控阵天线"], "商业航天", "卫星互联网纳入新基建+可回收火箭突破+商业发射密度提升", "商业航天", 85),
-    (&["量子计算", "量子芯片", "超导量子", "光量子", "离子阱", "量子比特", "量子纠错", "量子优越性", "量子通信", "量子密钥", "QKD", "量子网络", "量子精密测量"], "量子计算", "量子计算里程碑式突破，量子芯片+量子通信实用化加速", "量子计算", 80),
-    (&["稀土", "稀土永磁", "永磁材料", "钕铁硼", "稀土磁材", "氧化镨钕", "镨钕", "镝", "铽", "重稀土", "轻稀土", "稀土配额", "稀土供给", "磁材"], "稀土永磁", "稀土供给管控+人形机器人/新能源车拉动永磁需求结构性增长", "稀土永磁", 80),
-    // ── 政策驱动 ──
-    (&["城市更新", "老旧小区", "地下管网", "棚改", "城中村", "旧城改造", "市政管网", "海绵城市", "城市基础设施", "燃气管道", "供水管道", "综合管廊"], "城市更新", "15万亿城市更新规划落地，管网改造与城中村项目密集开工", "地下管网", 70),
-    (&["节能降碳", "碳达峰", "碳中和", "双碳", "减排", "节能改造", "钢铁改造", "水泥改造", "石化改造", "碳排放", "碳交易", "能耗双控", "超低排放", "碳捕集", "CCUS"], "节能降碳", "双碳目标+9大行业三年改造行动，高耗能行业绿色转型提速", "节能环保", 70),
-    (&["新能源重卡", "重卡", "商用车电动", "电动重卡", "换电重卡", "氢能重卡", "商用车新能源", "货车电动化", "重卡换电", "电动卡车"], "新能源-重卡", "11部门推动2030年新能源重卡渗透率达40%，商用车电动化加速", "新能源重卡", 75),
-];
+/// 产业链规则唯一来源：config/chain_rules.toml
+///
+/// 运行时优先读磁盘配置（支持热更新）；当文件缺失或解析失败时，
+/// 回退到编译期内嵌的同一份 toml 文本，避免代码中维护第二份规则。
+const DEFAULT_CHAIN_RULES_TOML: &str = include_str!("../../config/chain_rules.toml");
 
-/// 加载规则：优先 toml，不可用则回退 const。按 priority 降序返回。
-fn chain_rules() -> Vec<(Vec<String>, String, String, String, u32)> {
-    if let Some(config_rules) = crate::config::get_chain_rules() {
-        let mut rules: Vec<_> = config_rules.into_iter().map(|r| {
-            (r.keywords, r.chain, r.logic, r.board_keyword, r.priority)
-        }).collect();
-        rules.sort_by(|a, b| b.4.cmp(&a.4));
-        return rules;
-    }
-    let mut rules: Vec<_> = DEFAULT_CHAIN_RULES.iter().map(|(kw, c, l, bk, p)| {
-        (kw.iter().map(|s| s.to_string()).collect(), c.to_string(), l.to_string(), bk.to_string(), *p)
-    }).collect();
+fn normalize_chain_rules(mut rules: Vec<(Vec<String>, String, String, String, u32, bool)>) -> Vec<(Vec<String>, String, String, String, u32, bool)> {
     rules.sort_by(|a, b| b.4.cmp(&a.4));
     rules
+}
+
+fn map_chain_rules(config_rules: Vec<crate::config::ChainRuleConfig>) -> Vec<(Vec<String>, String, String, String, u32, bool)> {
+    config_rules
+        .into_iter()
+        .map(|r| (r.keywords, r.chain, r.logic, r.board_keyword, r.priority, r.generic))
+        .collect()
+}
+
+fn parse_chain_rules_toml(toml_text: &str) -> Option<Vec<(Vec<String>, String, String, String, u32, bool)>> {
+    let file_cfg = toml::from_str::<crate::config::ChainRulesFile>(toml_text).ok()?;
+    Some(normalize_chain_rules(map_chain_rules(file_cfg.rules)))
+}
+
+/// 加载规则：优先 toml，不可用则回退编译期内嵌 toml。按 priority 降序返回。
+fn chain_rules() -> Vec<(Vec<String>, String, String, String, u32, bool)> {
+    // 1) 优先使用已热加载进内存的配置（通常由 config::load_all 填充）
+    if let Some(config_rules) = crate::config::get_chain_rules() {
+        return normalize_chain_rules(map_chain_rules(config_rules));
+    }
+
+    // 2) 若内存缓存为空，直接读取 config/chain_rules.toml，避免与文件配置脱节。
+    if let Ok(s) = std::fs::read_to_string("config/chain_rules.toml") {
+        if let Some(rules) = parse_chain_rules_toml(&s) {
+            return rules;
+        }
+        log::warn!("[ChainMapper] 读取 config/chain_rules.toml 成功但解析失败，回退编译期内嵌规则");
+    }
+
+    // 3) 最后回退到编译期内嵌同源 toml，保障可用性。
+    if let Some(rules) = parse_chain_rules_toml(DEFAULT_CHAIN_RULES_TOML) {
+        return rules;
+    }
+
+    log::error!("[ChainMapper] 编译期内嵌规则解析失败，返回空规则集");
+    Vec::new()
 }
 
 /// 从新闻标题中匹配产业链（按 priority 降序遍历，高优先级规则先匹配）
@@ -114,7 +100,7 @@ pub fn map_news_to_chains(title: &str) -> Vec<ChainHit> {
     let mut hits: Vec<ChainHit> = Vec::new();
     let rules = chain_rules();
 
-    for (keywords, chain, logic, board_keyword, _priority) in &rules {
+    for (keywords, chain, logic, board_keyword, _priority, _generic) in &rules {
         let matched: Vec<&str> = keywords.iter()
             .filter(|kw| title.contains(kw.as_str()))
             .map(|s| s.as_str())
@@ -138,18 +124,38 @@ pub fn map_news_to_chains(title: &str) -> Vec<ChainHit> {
 /// 新闻 → 产业链（规则优先，未命中则 AI 兜底）。
 ///
 /// 决策（v8）：仅在关键词规则未命中时才调 AI，节省 token。
+/// v9 改进：规则命中结果过于单一时（只有1条且来自通用规则），也调 AI 二次分类。
 /// 数据红线 2.1/2.2：AI 不可用 → 返回空，**不编造产业链**。
 pub async fn map_news_to_chains_ai(titles: &[String]) -> Vec<ChainHit> {
     let combined = titles.join(" ");
     let rule_hits = map_news_to_chains(&combined);
-    if !rule_hits.is_empty() {
-        return rule_hits; // 规则命中，不调 AI
+    let rules = chain_rules();
+    
+    // 规则命中结果过于单一（仅命中 generic=true 的规则）时，调 AI 二次分类。
+    let should_call_ai = rule_hits.len() == 1 && {
+        let chain_name = &rule_hits[0].chain;
+        rules.iter().any(|(_, chain, _, _, _, generic)| chain == chain_name && *generic)
+    };
+    
+    if !rule_hits.is_empty() && !should_call_ai {
+        return rule_hits; // 规则命中且不需要二次分类
+    }
+    
+    // 规则命中过于单一或完全未命中 → AI 兜底分类
+    if should_call_ai {
+        log::info!(
+            "[ChainMapper] 规则命中1条通用规则({}) + {} 条新闻 → 调 AI 二次分类验证多样性",
+            rule_hits[0].chain, titles.len()
+        );
+    } else if rule_hits.is_empty() {
+        log::info!("[ChainMapper] 规则未命中({} 条新闻) → 调 AI 兜底", titles.len());
     }
 
-    // 规则未命中 → AI 兜底。
+    // 规则未命中或需要二次分类 → AI 兜底。
     // GeminiAnalyzer 含 RefCell（非 Sync），跨 await 会破坏外层 Future 的 Send，
     // 故隔离在独立 blocking 线程的 current-thread 运行时内执行。
     let titles_owned = titles.to_vec();
+    let existing_chain = rule_hits.first().map(|h| h.chain.clone());
     tokio::task::spawn_blocking(move || {
         let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
             Ok(rt) => rt,
@@ -158,21 +164,46 @@ pub async fn map_news_to_chains_ai(titles: &[String]) -> Vec<ChainHit> {
         rt.block_on(async move {
             let analyzer = crate::analyzer::GeminiAnalyzer::from_env();
             if !analyzer.is_available() {
-                log::warn!("[ChainMapper] 规则未命中且 AI 不可用 → [AI降级]，不编造产业链");
-                return Vec::new();
+                log::warn!("[ChainMapper] 需要 AI 二次分类但 AI 不可用 → [AI降级]");
+                return rule_hits; // 降级时保留规则命中结果
             }
-            let prompt = format!(
-                "你是A股产业链分析师。下面是最新快讯，请抽取其中**确有催化的产业链/概念**（没有则输出\"无\"）。\n\n<快讯>\n{}\n</快讯>\n\n要求：\n1. 最多输出3条，每条一行\n2. 格式：产业链名|催化逻辑(20字内)|板块名关键词\n3. 板块名关键词须是东方财富概念板块常见名(如 PCB、半导体、光伏、机器人)\n4. 只输出真实有逻辑的，宁缺毋滥",
-                titles_owned.join("\n")
-            );
+            
+            let prompt = if let Some(existing_chain) = existing_chain {
+                format!(
+                    "你是A股产业链分析师。已规则命中：【{}】。现需要验证是否有其他**不同类型**的产业链催化。\n\n<快讯>\n{}\n</快讯>\n\n要求：\n1. 如果新闻主要确实就是【{}】，输出\"无其他产业链\"\n2. 如果存在其他明显的产业链/概念催化（不同于{}），每条一行，最多3条\n3. 格式：产业链名|催化逻辑(20字内)|板块名关键词\n4. 只输出真实有逻辑的，宁缺毋滥",
+                    existing_chain, titles_owned.join("\n"), existing_chain, existing_chain
+                )
+            } else {
+                format!(
+                    "你是A股产业链分析师。下面是最新快讯，请抽取其中**确有催化的产业链/概念**（没有则输出\"无\"）。\n\n<快讯>\n{}\n</快讯>\n\n要求：\n1. 最多输出3条，每条一行\n2. 格式：产业链名|催化逻辑(20字内)|板块名关键词\n3. 板块名关键词须是东方财富概念板块常见名(如 PCB、半导体、光伏、机器人)\n4. 只输出真实有逻辑的，宁缺毋滥",
+                    titles_owned.join("\n")
+                )
+            };
+            
             match analyzer
                 .call_api_mode(&prompt, "你是A股产业链分析师,只输出格式化结果", crate::analyzer::AgentMode::Quick)
                 .await
             {
-                Ok(t) => parse_ai_chains(&t),
+                Ok(t) => {
+                    let ai_hits = parse_ai_chains(&t);
+                    if ai_hits.is_empty() {
+                        log::info!("[ChainMapper] AI 未发现新产业链，保留规则命中结果");
+                        rule_hits
+                    } else {
+                        log::info!("[ChainMapper] AI 发现 {} 条新产业链，合并规则结果", ai_hits.len());
+                        // 合并规则命中和 AI 结果，去重
+                        let mut merged = rule_hits;
+                        for ai_hit in ai_hits {
+                            if !merged.iter().any(|h| h.chain == ai_hit.chain) {
+                                merged.push(ai_hit);
+                            }
+                        }
+                        merged
+                    }
+                },
                 Err(e) => {
                     log::warn!("[ChainMapper] AI 调用失败: {} → [AI降级]", e);
-                    Vec::new()
+                    rule_hits
                 }
             }
         })
@@ -211,16 +242,24 @@ fn parse_ai_chains(text: &str) -> Vec<ChainHit> {
 /// 为 ChainHit 动态解析标的。
 /// 先拉取全部板块排名，按板块名关键词匹配板块代码，再拉成份股。
 pub fn resolve_stocks(hits: &mut [ChainHit]) {
-    // 一次性拉取板块列表，构建 name→(code, 今日主力净占比) 映射
-    let board_map = match sector_monitor::fetch_board_ranking("f3", 80) {
-        Ok(boards) => {
-            boards.into_iter()
-                .map(|b| (b.name, (b.code, b.main_net_pct_today)))
-                .collect::<std::collections::HashMap<String, (String, f64)>>()
+    // 一次性拉两路榜单并并集，避免只看涨幅榜导致板块池过窄。
+    let mut board_map: std::collections::HashMap<String, (String, f64)> = std::collections::HashMap::new();
+    if let Ok(boards) = sector_monitor::fetch_board_ranking("f3", BOARD_RANK_TOP_N) {
+        for b in boards {
+            board_map.entry(b.name).or_insert((b.code, b.main_net_pct_today));
         }
-        Err(_) => return,
-    };
+    }
+    if let Ok(boards) = sector_monitor::fetch_board_ranking("f62", BOARD_RANK_TOP_N) {
+        for b in boards {
+            board_map.entry(b.name).or_insert((b.code, b.main_net_pct_today));
+        }
+    }
+    if board_map.is_empty() {
+        return;
+    }
 
+    let mut failed_chains: Vec<String> = Vec::new();
+    
     for hit in hits.iter_mut() {
         // 优先用 hit 自带的 board_keyword（Rule 来源已直接存储，AI 来源亦然）
         let mut board_keyword = hit.board_keyword.clone();
@@ -228,43 +267,163 @@ pub fn resolve_stocks(hits: &mut [ChainHit]) {
         if board_keyword.is_empty() {
             let rules = chain_rules();
             board_keyword = rules.iter()
-                .find(|(_, chain, _, _, _)| chain == &hit.chain)
-                .map(|(_, _, _, kw, _)| kw.clone())
+                .find(|(_, chain, _, _, _, _)| chain == &hit.chain)
+                .map(|(_, _, _, kw, _, _)| kw.clone())
                 .unwrap_or_default();
         }
 
         // 空关键词会匹配任意板块，跳过以免错拉
-        if board_keyword.is_empty() { continue; }
+        if board_keyword.is_empty() {
+            failed_chains.push(format!("  • {} — 无板块关键词", hit.chain));
+            continue;
+        }
 
-        // 动态匹配板块代码：板块名包含关键词
-        let matched_board = board_map.iter()
-            .find(|(name, _)| name.contains(board_keyword.as_str()))
-            .map(|(_, v)| v.clone());
+        // 动态匹配板块代码：先在热点板块池匹配；未命中时回退到 suggest 全量检索。
+        let matched_board = find_best_board_match(&board_map, &board_keyword);
 
-        let (code, flow_pct) = match matched_board {
-            Some((c, flow)) => (c, flow),
-            None => continue,
+        let (code, flow_pct_opt) = match matched_board {
+            Some((c, flow)) => (c, Some(flow)),
+            None => match sector_monitor::search_board_code_by_keyword(&board_keyword) {
+                Ok(Some((fallback_code, fallback_name))) => {
+                    log::debug!(
+                        "[ChainMapper] 关键词'{}'未命中热点板块池，使用 suggest 回退命中板块 {}({})",
+                        board_keyword,
+                        fallback_name,
+                        fallback_code
+                    );
+                    (fallback_code, None)
+                }
+                Ok(None) => {
+                    failed_chains.push(format!("  • {} — 未找到板块关键词'{}'的对应板块", hit.chain, board_keyword));
+                    continue;
+                }
+                Err(e) => {
+                    failed_chains.push(format!("  • {} — 板块关键词'{}' suggest 查询失败: {}", hit.chain, board_keyword, e));
+                    continue;
+                }
+            },
         };
 
         // 资金流向数值校验（数据红线 2.3）：净占比应在合理区间，异常值视为不可用
-        hit.fund_flow_pct = if flow_pct.is_finite() && flow_pct.abs() <= 100.0 {
-            Some(flow_pct)
-        } else {
-            None
-        };
+        hit.fund_flow_pct = flow_pct_opt.and_then(|flow_pct| {
+            if flow_pct.is_finite() && flow_pct.abs() <= 100.0 {
+                Some(flow_pct)
+            } else {
+                None
+            }
+        });
 
-        match sector_monitor::fetch_board_components(&code, 30) {
+        match sector_monitor::fetch_board_components(&code, COMPONENT_FETCH_TOP_N) {
             Ok(stocks) => {
-                hit.stocks = stocks.into_iter()
+                let filtered: Vec<_> = stocks.into_iter()
                     .filter(|s| !s.code.starts_with('8') && !s.code.starts_with('4'))
                     .filter(|s| !s.code.starts_with("688"))
-                    .take(15)
+                    .take(COMPONENT_KEEP_TOP_N)
                     .map(|s| StockInfo { code: s.code, name: s.name, change_pct: s.change_pct, vol_ratio: s.vol_ratio })
                     .collect();
+                
+                if filtered.is_empty() {
+                    failed_chains.push(format!("  • {} — 板块'{}' 无有效成分股（过滤北交所/科创板）", hit.chain, board_keyword));
+                } else {
+                    hit.stocks = filtered;
+                }
             }
-            Err(_) => {}
+            Err(e) => {
+                failed_chains.push(format!("  • {} — 板块'{}' 拉取失败: {}", hit.chain, board_keyword, e));
+            }
         }
     }
+    
+    if !failed_chains.is_empty() {
+        log::debug!("[ChainMapper] 产业链标的解析：{} 条产业链失败\n{}", failed_chains.len(), failed_chains.join("\n"));
+    }
+}
+
+fn normalize_board_text(text: &str) -> String {
+    text.to_lowercase()
+        .replace(' ', "")
+        .replace('-', "")
+        .replace('_', "")
+        .replace('/', "")
+        .replace('（', "")
+        .replace('）', "")
+        .replace('(', "")
+        .replace(')', "")
+}
+
+fn matches_keyword_synonym(board_name: &str, keyword: &str) -> bool {
+    // 检查是否与关键词的任何同义词匹配
+    let name_norm = normalize_board_text(board_name);
+    
+    let synonyms = match keyword {
+        // AI 硬件相关
+        "PCB" => vec!["pcb", "电子元器件", "元器件", "电路板", "印制电路板"],
+        // 半导体设备相关
+        "光刻机" => vec!["光刻机", "半导体", "芯片", "集成电路", "半导体设备"],
+        // 稀有金属相关
+        "小金属" => vec!["小金属", "稀土", "稀有金属", "磁材", "材料"],
+        // 新能源相关
+        "光伏" => vec!["光伏", "太阳能", "新能源"],
+        "锂电" => vec!["锂电", "动力电池", "电池"],
+        _ => return false,
+    };
+    
+    for synonym in synonyms {
+        let syn_norm = normalize_board_text(synonym);
+        if board_name == synonym || name_norm == syn_norm || 
+           board_name.contains(synonym) || name_norm.contains(&syn_norm) {
+            return true;
+        }
+    }
+    false
+}
+
+fn board_match_score(board_name: &str, keyword: &str) -> Option<u8> {
+    if keyword.is_empty() {
+        return None;
+    }
+    if board_name == keyword {
+        return Some(4);
+    }
+
+    let name_norm = normalize_board_text(board_name);
+    let key_norm = normalize_board_text(keyword);
+    if key_norm.is_empty() {
+        return None;
+    }
+    if name_norm == key_norm {
+        return Some(4);
+    }
+    if board_name.starts_with(keyword) || name_norm.starts_with(&key_norm) {
+        return Some(3);
+    }
+    if board_name.contains(keyword) || name_norm.contains(&key_norm) {
+        return Some(2);
+    }
+    if keyword.contains(board_name) || key_norm.contains(&name_norm) {
+        return Some(1);
+    }
+
+    // 如果直接匹配失败，尝试同义词匹配
+    if matches_keyword_synonym(board_name, keyword) {
+        return Some(2); // 同义词匹配得分为 2
+    }
+
+    None
+}
+
+fn find_best_board_match(
+    board_map: &std::collections::HashMap<String, (String, f64)>,
+    keyword: &str,
+) -> Option<(String, f64)> {
+    board_map
+        .iter()
+        .filter_map(|(name, v)| board_match_score(name, keyword).map(|score| (score, name.len(), v.clone())))
+        .max_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| b.1.cmp(&a.1))
+        })
+        .map(|(_, _, v)| v)
 }
 
 #[cfg(test)]
@@ -381,5 +540,25 @@ mod tests {
     fn test_quantum_computing() {
         let hits = map_news_to_chains("中国量子计算原型机实现1000量子比特突破");
         assert!(hits.iter().any(|h| h.chain == "量子计算"));
+    }
+
+    #[test]
+    fn test_board_match_prefers_exact() {
+        let mut m = std::collections::HashMap::new();
+        m.insert("PCB".to_string(), ("BK001".to_string(), 1.0));
+        m.insert("PCB概念".to_string(), ("BK002".to_string(), 2.0));
+        let got = find_best_board_match(&m, "PCB").unwrap();
+        assert_eq!(got.0, "BK001");
+    }
+
+    #[test]
+    fn test_board_match_works_with_contains() {
+        let mut m = std::collections::HashMap::new();
+        m.insert("印制电路板".to_string(), ("BK888".to_string(), 1.0));
+        let got = find_best_board_match(&m, "PCB");
+        assert!(got.is_none());
+
+        let got2 = find_best_board_match(&m, "印制电路").unwrap();
+        assert_eq!(got2.0, "BK888");
     }
 }
