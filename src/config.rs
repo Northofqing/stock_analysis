@@ -296,37 +296,7 @@ static CHAIN_RULES: RwLock<Option<Vec<ChainRuleConfig>>> = RwLock::new(None);
 static EXCLUSION_BOARDS: RwLock<Option<Vec<ExclusionBoardConfig>>> = RwLock::new(None);
 static ANNOUNCE_KEYWORDS: RwLock<Option<AnnounceKeywordsFile>> = RwLock::new(None);
 static MONITOR_CONFIG: LazyLock<RwLock<MonitorConfig>> = LazyLock::new(|| {
-    RwLock::new(MonitorConfig {
-        screener_interval_min: 30,
-        opportunity_scan_interval_min: 60,
-        news_window_start_hour: 8,
-        news_window_end_hour: 22,
-        topic_search_intent_count: 6,
-        topic_search_timeout_sec: 10,
-        topic_mmr_relevance_weight: 0.72,
-        topic_mmr_diversity_penalty: 2.2,
-        topic_mmr_history_penalty: 1.4,
-        topic_history_window_hours: 72,
-        topic_history_memory_size: 160,
-        topic_history_db_limit: 400,
-        dq_quote_stale_sec: 5,
-        dq_position_stale_sec: 30,
-        dq_nav_stale_sec: 24 * 3600,
-        dq_daily_stale_sec: 24 * 3600,
-        opportunity_min_confidence: 55,
-        opportunity_require_cross_source: false,
-        live_veto: LiveVetoConfig {
-            enabled: true,
-            mode: String::from("dry_run"),
-            bias_rate_enabled: true,
-            bearish_alignment_enabled: true,
-            main_flow_enabled: true,
-            fundamental_enabled: true,
-        },
-        position_sizing: PositionSizingConfig { use_dynamic: true },
-        factor_feedback: FactorFeedbackConfig::default(),
-        air_refuel: AirRefuelConfig::default(),
-    })
+    RwLock::new(MonitorConfig::default())
 });
 
 /// 尝试加载所有 toml 配置。失败不崩溃，保留旧值。

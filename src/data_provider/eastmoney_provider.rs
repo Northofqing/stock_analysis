@@ -84,15 +84,6 @@ impl HttpProvider {
             format!("1.{}", code) // 默认上海
         };
 
-        // 固定使用 no_proxy 客户端，规避系统代理 fake-ip/空回复问题。
-        let direct_client = reqwest::Client::builder()
-            .no_proxy()
-            .timeout(std::time::Duration::from_secs(30))
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-            .build()
-            .unwrap_or_else(|_| client.clone());
-
         // 每个 host 最多尝试 2 次，总尝试数 = host 数 * 2。
         const MAX_ATTEMPTS_PER_HOST: u32 = 2;
         let max_attempts: u32 = (KLINE_HOSTS.len() as u32) * MAX_ATTEMPTS_PER_HOST;
@@ -108,7 +99,7 @@ impl HttpProvider {
             log::debug!("[HTTP] 请求URL(host={}): {}", host, url);
 
             // 发送请求（添加更多请求头模拟浏览器）
-            let send_result = direct_client
+            let send_result = client
                 .get(&url)
                 .header("Accept", "application/json, text/plain, */*")
                 .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
@@ -273,21 +264,13 @@ impl HttpProvider {
             format!("0.{}", code) // 深圳/创业板/科创板
         };
 
-        let direct_client = reqwest::Client::builder()
-            .no_proxy()
-            .timeout(std::time::Duration::from_secs(5))
-            .connect_timeout(std::time::Duration::from_secs(3))
-            .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-            .build()
-            .unwrap_or_else(|_| client.clone());
-
         for host in QUOTE_HOSTS {
             let url = format!(
                 "https://{}/api/qt/stock/get?secid={}&fields=f58",
                 host, market_code
             );
 
-            match direct_client
+            match client
                 .get(&url)
                 .header("Accept", "application/json, text/plain, */*")
                 .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")

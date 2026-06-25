@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use chrono::{Duration, Local};
 use futures::future::join_all;
+use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -216,14 +217,16 @@ async fn fetch_report_summary(client: &reqwest::Client, info_code: &str) -> Opti
     Some(html_to_plain_text(content_html, SUMMARY_MAX_CHARS))
 }
 
+static RE_BLOCK: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?is)<(script|style)[^>]*>.*?</\1>").unwrap());
+static RE_TAG: Lazy<Regex> = Lazy::new(|| Regex::new(r"<[^>]+>").unwrap());
+static RE_WS: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").unwrap());
+
 /// 简单地将 HTML 转为压缩后的纯文本，并按字符数截断。
 fn html_to_plain_text(html: &str, max_chars: usize) -> String {
     // 1) 去掉 <script>/<style> 整段
-    let re_block = Regex::new(r"(?is)<(script|style)[^>]*>.*?</\1>").unwrap();
-    let stripped = re_block.replace_all(html, "");
+    let stripped = RE_BLOCK.replace_all(html, "");
     // 2) 去掉所有标签
-    let re_tag = Regex::new(r"<[^>]+>").unwrap();
-    let no_tag = re_tag.replace_all(&stripped, " ");
+    let no_tag = RE_TAG.replace_all(&stripped, " ");
     // 3) 解码常见 HTML 实体
     let decoded = no_tag
         .replace("&nbsp;", " ")
@@ -233,8 +236,7 @@ fn html_to_plain_text(html: &str, max_chars: usize) -> String {
         .replace("&quot;", "\"")
         .replace("&#39;", "'");
     // 4) 压缩空白
-    let re_ws = Regex::new(r"\s+").unwrap();
-    let compact = re_ws.replace_all(decoded.trim(), " ").to_string();
+    let compact = RE_WS.replace_all(decoded.trim(), " ").to_string();
 
     if compact.chars().count() <= max_chars {
         compact

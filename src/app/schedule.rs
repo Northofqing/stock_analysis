@@ -13,21 +13,18 @@ use crate::cli::Args;
 ///
 /// 注意：定时模式不在启动时预装配股票列表，而是在每次执行时重新读取
 /// `.env` 配置并重新装配，从而支持运行过程中修改配置即时生效。
-pub fn run_scheduled_analysis(args: &Args) -> Result<()> {
+pub async fn run_scheduled_analysis(args: &Args) -> Result<()> {
     info!("模式: 定时任务（每次执行均重新读取配置）");
 
-    let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async {
-        if let Some(interval_minutes) = args.interval {
-            run_interval_schedule(args, interval_minutes, args.run_now).await
-        } else if let Some(ref schedule_time) = args.schedule_time {
-            run_time_schedule(args, schedule_time, args.run_now).await
-        } else {
-            let env_time = std::env::var("SCHEDULE_TIME").unwrap_or_else(|_| "09:30".to_string());
-            info!("使用环境变量定时配置: SCHEDULE_TIME={}", env_time);
-            run_time_schedule(args, &env_time, args.run_now).await
-        }
-    })
+    if let Some(interval_minutes) = args.interval {
+        run_interval_schedule(args, interval_minutes, args.run_now).await
+    } else if let Some(ref schedule_time) = args.schedule_time {
+        run_time_schedule(args, schedule_time, args.run_now).await
+    } else {
+        let env_time = std::env::var("SCHEDULE_TIME").unwrap_or_else(|_| "09:30".to_string());
+        info!("使用环境变量定时配置: SCHEDULE_TIME={}", env_time);
+        run_time_schedule(args, &env_time, args.run_now).await
+    }
 }
 
 /// 间隔执行模式：每 N 分钟执行一次。
@@ -206,27 +203,21 @@ async fn execute_once(args: &Args) {
 
     if market_review_only {
         info!("本次定时任务类型: 大盘复盘");
-        match tokio::task::spawn_blocking(crate::app::modes::run_market_review_only).await {
-            Ok(Ok(())) => info!("大盘复盘完成"),
-            Ok(Err(e)) => error!("大盘复盘失败: {}", e),
-            Err(e) => error!("大盘复盘任务执行失败: {}", e),
+        match crate::app::modes::run_market_review_only().await {
+            Ok(()) => info!("大盘复盘完成"),
+            Err(e) => error!("大盘复盘失败: {}", e),
         }
         return;
     }
 
-    // 重新装配股票列表。build_stock_list 内部会创建自己的 tokio runtime，
-    // 必须放在 spawn_blocking 线程执行，避免 "runtime within runtime" panic。
+    // 重新装配股票列表。
     info!("本次定时任务类型: 个股分析（重新装配股票列表）");
     let args_clone = args.clone();
     let stock_codes =
-        match tokio::task::spawn_blocking(move || crate::app::build_stock_list(&args_clone)).await {
-            Ok(Ok((codes, _limit_up, _macro_ctx))) => codes,
-            Ok(Err(e)) => {
-                error!("装配股票列表失败: {}", e);
-                return;
-            }
+        match crate::app::build_stock_list(&args_clone).await {
+            Ok((codes, _limit_up, _macro_ctx)) => codes,
             Err(e) => {
-                error!("装配股票列表任务执行失败: {}", e);
+                error!("装配股票列表失败: {}", e);
                 return;
             }
         };

@@ -2,9 +2,24 @@
 
 use anyhow::{Context, Result};
 use log::info;
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde_json::json;
 
 use super::service::NotificationService;
+
+static RE_HEADING: Lazy<Regex> = Lazy::new(|| Regex::new(r"^#{1,6}\s+(.+)$").unwrap());
+static RE_MULTI_NEWLINES: Lazy<Regex> = Lazy::new(|| Regex::new(r"\n{3,}").unwrap());
+static RE_QUOTE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)^> (.+)$").unwrap());
+static RE_H4: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)^####\s+(.+)$").unwrap());
+static RE_H3: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)^###\s+(.+)$").unwrap());
+static RE_H2: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)^##\s+(.+)$").unwrap());
+static RE_H1: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)^#\s+(.+)$").unwrap());
+static RE_BOLD: Lazy<Regex> = Lazy::new(|| Regex::new(r"\*\*(.+?)\*\*").unwrap());
+static RE_CLEAN_BEFORE_TAGS: Lazy<Regex> = Lazy::new(|| Regex::new(r"\n+(<(?:table|h[1-4]|ul|div|hr))").unwrap());
+static RE_CLEAN_AFTER_TAGS: Lazy<Regex> = Lazy::new(|| Regex::new(r"(</(?:table|h[1-4]|ul|div)>)\n+").unwrap());
+static RE_EMPTY_LINES_IN_BLOCKS: Lazy<Regex> = Lazy::new(|| Regex::new(r"(<(?:table|thead|tbody|tr|ul)>)\n+").unwrap());
+static RE_EMPTY_LINES_AFTER_BLOCKS: Lazy<Regex> = Lazy::new(|| Regex::new(r"\n+(</(?:table|thead|tbody|tr|ul)>)").unwrap());
 
 impl NotificationService {
     /// 发送到飞书
@@ -106,7 +121,7 @@ impl NotificationService {
         let mut result = content.to_string();
 
         // 标题转加粗
-        let re_h = Regex::new(r"^#{1,6}\s+(.+)$").unwrap();
+        let re_h = &RE_HEADING;
         result = re_h
             .replace_all(&result, |caps: &regex::Captures| format!("**{}**", &caps[1]))
             .to_string();
@@ -128,37 +143,32 @@ impl NotificationService {
         let mut html = markdown.to_string();
         
         // 清理多余的空行（3个以上连续换行合并为2个）
-        let re_multiple_newlines = regex::Regex::new(r"\n{3,}").unwrap();
+        let re_multiple_newlines = &RE_MULTI_NEWLINES;
         html = re_multiple_newlines.replace_all(&html, "\n\n").to_string();
         
         // 先处理表格（最重要的部分）
         html = self.convert_markdown_tables_enhanced(&html);
         
         // 处理引用块
-        let re_quote = regex::Regex::new(r"(?m)^> (.+)$").unwrap();
+        let re_quote = &RE_QUOTE;
         html = re_quote.replace_all(&html, 
             "<div style='border-left: 4px solid #3498db; padding: 10px 15px; margin: 15px 0; background-color: #f8f9fa; color: #555;'>$1</div>").to_string();
         
         // 处理标题（从小到大避免冲突）
-        let re_h4 = regex::Regex::new(r"(?m)^####\s+(.+)$").unwrap();
-        html = re_h4.replace_all(&html, 
+        html = RE_H4.replace_all(&html,
             "<h4 style='color: #666; margin: 15px 0 10px 0; font-size: 16px;'>$1</h4>").to_string();
-        
-        let re_h3 = regex::Regex::new(r"(?m)^###\s+(.+)$").unwrap();
-        html = re_h3.replace_all(&html, 
+
+        html = RE_H3.replace_all(&html,
             "<h3 style='color: #555; margin: 20px 0 10px 0; font-size: 18px;'>$1</h3>").to_string();
-        
-        let re_h2 = regex::Regex::new(r"(?m)^##\s+(.+)$").unwrap();
-        html = re_h2.replace_all(&html, 
+
+        html = RE_H2.replace_all(&html,
             "<h2 style='color: #34495e; margin: 25px 0 15px 0; padding-left: 10px; border-left: 4px solid #3498db; font-size: 20px;'>$1</h2>").to_string();
-        
-        let re_h1 = regex::Regex::new(r"(?m)^#\s+(.+)$").unwrap();
-        html = re_h1.replace_all(&html, 
+
+        html = RE_H1.replace_all(&html,
             "<h1 style='color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; margin: 30px 0 20px 0; font-size: 24px;'>$1</h1>").to_string();
-        
+
         // 处理粗体
-        let re_bold = regex::Regex::new(r"\*\*(.+?)\*\*").unwrap();
-        html = re_bold.replace_all(&html, "<strong style='color: #e74c3c; font-weight: bold;'>$1</strong>").to_string();
+        html = RE_BOLD.replace_all(&html, "<strong style='color: #e74c3c; font-weight: bold;'>$1</strong>").to_string();
         
         // 处理分隔线
         html = html.replace("\n---\n", "\n<hr style='border: none; border-top: 2px solid #ecf0f1; margin: 20px 0;'/>\n");
@@ -168,19 +178,14 @@ impl NotificationService {
         
         // 清理HTML标签周围的多余换行
         // 移除标签前后的空白行
-        let re_clean_before_tags = regex::Regex::new(r"\n+(<(?:table|h[1-4]|ul|div|hr))").unwrap();
-        html = re_clean_before_tags.replace_all(&html, "\n$1").to_string();
-        
-        let re_clean_after_tags = regex::Regex::new(r"(</(?:table|h[1-4]|ul|div)>)\n+").unwrap();
-        html = re_clean_after_tags.replace_all(&html, "$1\n").to_string();
-        
+        html = RE_CLEAN_BEFORE_TAGS.replace_all(&html, "\n$1").to_string();
+
+        html = RE_CLEAN_AFTER_TAGS.replace_all(&html, "$1\n").to_string();
+
         // 移除表格、列表等块级元素内部的单独换行符（但保留有内容的行）
-        // 这一步要在段落处理之前
-        let re_empty_lines_in_blocks = regex::Regex::new(r"(<(?:table|thead|tbody|tr|ul)>)\n+").unwrap();
-        html = re_empty_lines_in_blocks.replace_all(&html, "$1").to_string();
-        
-        let re_empty_lines_after_blocks = regex::Regex::new(r"\n+(</(?:table|thead|tbody|tr|ul)>)").unwrap();
-        html = re_empty_lines_after_blocks.replace_all(&html, "$1").to_string();
+        html = RE_EMPTY_LINES_IN_BLOCKS.replace_all(&html, "$1").to_string();
+
+        html = RE_EMPTY_LINES_AFTER_BLOCKS.replace_all(&html, "$1").to_string();
         
         // 最后处理剩余的文本换行
         // 只对纯文本段落添加 <br/>，而不是所有换行

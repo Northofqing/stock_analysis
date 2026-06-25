@@ -33,6 +33,8 @@ pub use industry::{fetch_blocking as fetch_industry, IndustryBenchmark};
 
 use anyhow::Result;
 use chrono::NaiveDate;
+use std::collections::HashMap;
+use std::sync::RwLock;
 
 /// 实时行情数据（包含盈利指标）
 #[derive(Debug, Clone)]
@@ -120,6 +122,7 @@ pub trait DataProvider: Send + Sync {
 pub struct DataFetcherManager {
     providers: Vec<Box<dyn DataProvider>>,
     financials_client: reqwest::Client,
+    stock_name_cache: RwLock<HashMap<String, String>>,
 }
 
 impl DataFetcherManager {
@@ -155,12 +158,18 @@ impl DataFetcherManager {
         Ok(Self {
             providers,
             financials_client,
+            stock_name_cache: RwLock::new(HashMap::new()),
         })
     }
     // 获取股票名称
     pub fn get_stock_name(&self, code: &str) -> Option<String> {
+        // 先查缓存（名称在进程生命周期内不变）
+        if let Some(name) = self.stock_name_cache.read().unwrap().get(code) {
+            return Some(name.clone());
+        }
         for provider in &self.providers {
             if let Some(name) = provider.get_stock_name(code) {
+                self.stock_name_cache.write().unwrap().insert(code.to_string(), name.clone());
                 return Some(name);
             }
         }

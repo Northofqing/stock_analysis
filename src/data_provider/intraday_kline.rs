@@ -35,25 +35,14 @@ const PUSH2HIS_HOSTS: [&str; 3] = [
     "82.push2his.eastmoney.com",
 ];
 
-fn direct_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .no_proxy()
-        .timeout(std::time::Duration::from_secs(15))
-        .connect_timeout(std::time::Duration::from_secs(8))
-        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
-}
-
 /// 抓取分钟 K 线（异步内部实现）。
 async fn fetch_async(
-    _client: &reqwest::Client,
+    client: &reqwest::Client,
     code: &str,
     klt: u8,
     lmt: usize,
 ) -> Result<Vec<MinuteBar>> {
     let secid = to_secid(code);
-    let client = direct_client();
     let mut last_err = String::new();
 
     for host in PUSH2HIS_HOSTS {

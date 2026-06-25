@@ -21,7 +21,8 @@ use env_logger::Env;
 use log::{error, info};
 use std::io::Write;
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     let args = cli::Args::parse();
 
@@ -70,22 +71,19 @@ fn main() -> Result<()> {
     // 改为每次定时执行时重新读取配置（.env）并重新装配，
     // 使运行过程中对 .env / 股票池的修改即时生效。
     if args.schedule || env_true("SCHEDULE_ENABLED") {
-        app::run_scheduled_analysis(&args)?;
+        app::run_scheduled_analysis(&args).await?;
         info!("程序执行完成");
         return Ok(());
     }
 
-    // 产业链联动分析模式（仅 --chain-analysis 命令行参数触发，不再响应环境变量）：
-    // 不需要装配自选股列表，直接分析当日涨停池
     if args.chain_analysis {
-        app::run_chain_analysis_mode(!args.no_notify)?;
+        app::run_chain_analysis_mode(!args.no_notify).await?;
         info!("程序执行完成");
         return Ok(());
     }
 
     // 非定时模式：启动时装配一次待分析股票列表
-    // （含宏观推荐 / 龙虎榜 / 涨停 / 持仓）
-    let (stock_codes, limit_up_codes, macro_ctx) = app::build_stock_list(&args)?;
+    let (stock_codes, limit_up_codes, macro_ctx) = app::build_stock_list(&args).await?;
     info!(
         "待分析股票（共 {} 只）: {:?}",
         stock_codes.len(),
@@ -93,12 +91,12 @@ fn main() -> Result<()> {
     );
 
     if args.lhb_mode || env_true("LHB_MODE") {
-        app::run_lhb_analysis(&args)?;
+        app::run_lhb_analysis(&args).await?;
     } else if args.market_review || env_true("MARKET_REVIEW_ENABLED") {
         info!("模式: 仅大盘复盘");
-        app::run_market_review_only()?;
+        app::run_market_review_only().await?;
     } else {
-        app::run_analysis(&stock_codes, &args, &macro_ctx, limit_up_codes)?;
+        app::run_analysis(&stock_codes, &args, &macro_ctx, limit_up_codes).await?;
     }
 
     info!("程序执行完成");

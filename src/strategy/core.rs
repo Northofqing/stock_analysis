@@ -1,6 +1,6 @@
 use anyhow::Result;
 use chrono::{DateTime, Local};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use serde::{Serialize, Deserialize};
 use plotters::prelude::*;
@@ -539,9 +539,9 @@ impl BacktestEngine {
         date: DateTime<Local>,
     ) -> Result<()> {
         // 1. 卖出不在目标列表的股票
-        let target_codes: Vec<String> = target_stocks.iter().map(|(c, _, _)| c.clone()).collect();
+        let target_codes: HashSet<&str> = target_stocks.iter().map(|(c, _, _)| c.as_str()).collect();
         let to_sell: Vec<String> = self.state.positions.keys()
-            .filter(|code| !target_codes.contains(code))
+            .filter(|code| !target_codes.contains(code.as_str()))
             .cloned()
             .collect();
 

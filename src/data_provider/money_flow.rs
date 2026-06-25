@@ -200,25 +200,13 @@ const PUSH2HIS_HOSTS: [&str; 3] = [
     "82.push2his.eastmoney.com",
 ];
 
-/// 构建直连客户端（no_proxy），规避系统代理 fake-ip/拦截。
-fn direct_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .no_proxy()
-        .timeout(std::time::Duration::from_secs(15))
-        .connect_timeout(std::time::Duration::from_secs(8))
-        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
-}
-
 /// 抓取近 `lmt` 天资金流（daykline）
 pub async fn fetch_flow_history_async(
-    _client: &reqwest::Client,
+    client: &reqwest::Client,
     code: &str,
     lmt: usize,
 ) -> Result<MoneyFlowSummary> {
     let secid = to_em_numeric_secid(code);
-    let client = direct_client();
     let mut last_err = String::new();
 
     for host in PUSH2HIS_HOSTS {
@@ -335,11 +323,10 @@ pub async fn fetch_flow_history_async(
 
 /// 抓取当日分时（trends2）并计算形态
 pub async fn fetch_intraday_shape_async(
-    _client: &reqwest::Client,
+    client: &reqwest::Client,
     code: &str,
 ) -> Result<IntradayShape> {
     let secid = to_em_numeric_secid(code);
-    let client = direct_client();
     let mut last_err = String::new();
     let mut json_opt: Option<Value> = None;
 

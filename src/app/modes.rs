@@ -10,14 +10,12 @@ use crate::app::get_max_workers;
 use crate::cli::Args;
 
 /// 单次分析流程（命令行默认模式）。
-pub fn run_analysis(
+pub async fn run_analysis(
     stock_codes: &[String],
     args: &Args,
     macro_context: &str,
     limit_up_codes: std::collections::HashSet<String>,
 ) -> Result<()> {
-    let runtime = tokio::runtime::Runtime::new()?;
-
     // 如果启用了 Multi-Agent 深度分析，则只跑深度分析
     if args.deep_analysis {
         let deep_targets: Vec<String> = match &args.stocks {
@@ -28,15 +26,13 @@ pub fn run_analysis(
             "模式: Multi-Agent 深度分析（共 {} 只）",
             deep_targets.len()
         );
-        runtime.block_on(async {
-            for code in &deep_targets {
-                info!("[DeepAnalysis] 开始 {}", code);
-                match stock_analysis::deep_analyzer::run_and_save(code).await {
-                    Ok(path) => info!("[DeepAnalysis] {} 完成: {}", code, path.display()),
-                    Err(e) => log::error!("[DeepAnalysis] {} 失败: {:#}", code, e),
-                }
+        for code in &deep_targets {
+            info!("[DeepAnalysis] 开始 {}", code);
+            match stock_analysis::deep_analyzer::run_and_save(code).await {
+                Ok(path) => info!("[DeepAnalysis] {} 完成: {}", code, path.display()),
+                Err(e) => log::error!("[DeepAnalysis] {} 失败: {:#}", code, e),
             }
-        });
+        }
         return Ok(());
     }
 
@@ -62,7 +58,7 @@ pub fn run_analysis(
     } else {
         Some(macro_context.to_string())
     };
-    let results = runtime.block_on(pipeline.run(stock_codes, mc))?;
+    let results = pipeline.run(stock_codes, mc).await?;
 
     if !results.is_empty() {
         info!("
@@ -80,16 +76,20 @@ pub fn run_analysis(
             );
         }
     }
-    
+
     Ok(())
 }
 
-pub fn run_market_review_only() -> Result<()> {
+pub async fn run_market_review_only() -> Result<()> {
     use stock_analysis::market_analyzer::MarketAnalyzer;
     use stock_analysis::notification::NotificationService;
 
-    let analyzer = MarketAnalyzer::new(None)?;
-    let overview = analyzer.get_market_overview()?;
+    let (analyzer, overview) = tokio::task::spawn_blocking(|| {
+        let analyzer = MarketAnalyzer::new(None)?;
+        let overview = analyzer.get_market_overview()?;
+        Ok::<(MarketAnalyzer, _), anyhow::Error>((analyzer, overview))
+    }).await??;
+
     info!("市场概览: {:?}", overview);
 
     let report = analyzer.generate_template_review(&overview);
@@ -102,21 +102,21 @@ pub fn run_market_review_only() -> Result<()> {
 }
 
 /// 产业链联动分析模式：涨停池 → 概念聚类 → 产业链上下游定位（LLM）→ 报告 + 推送。
-pub fn run_chain_analysis_mode(send_notify: bool) -> Result<()> {
+pub async fn run_chain_analysis_mode(send_notify: bool) -> Result<()> {
     use stock_analysis::market_analyzer::MarketAnalyzer;
     use stock_analysis::notification::NotificationService;
 
     info!("模式: 产业链联动分析");
 
-    // 涨停池获取使用阻塞 HTTP 客户端，须在进入 tokio 运行时之前完成
-    let analyzer = MarketAnalyzer::new(None)?;
-    let limit_ups = analyzer.get_limit_up_stocks()?;
+    // 涨停池获取使用阻塞 HTTP 客户端，通过 spawn_blocking 离线程
+    let (_analyzer, limit_ups) = tokio::task::spawn_blocking(|| {
+        let analyzer = MarketAnalyzer::new(None)?;
+        let limit_ups = analyzer.get_limit_up_stocks()?;
+        Ok::<(MarketAnalyzer, Vec<_>), anyhow::Error>((analyzer, limit_ups))
+    }).await??;
     info!("今日涨停池共 {} 只", limit_ups.len());
 
-    let runtime = tokio::runtime::Runtime::new()?;
-    let report = runtime.block_on(
-        stock_analysis::pipeline::chain_analysis::run_chain_analysis(limit_ups, None),
-    )?;
+    let report = stock_analysis::pipeline::chain_analysis::run_chain_analysis(limit_ups, None).await?;
 
     let notifier = NotificationService::from_env();
     let filename = format!("chain_analysis_{}.md", Local::now().format("%Y%m%d"));
@@ -124,7 +124,7 @@ pub fn run_chain_analysis_mode(send_notify: bool) -> Result<()> {
     info!("产业链联动分析报告已保存: {}", path);
 
     if send_notify {
-        match runtime.block_on(notifier.send(&report)) {
+        match notifier.send(&report).await {
             Ok(true) => info!("产业链联动分析报告已推送"),
             Ok(false) => log::warn!("产业链联动分析报告推送失败（所有渠道均未成功）"),
             Err(e) => log::warn!("产业链联动分析报告推送异常: {}", e),
@@ -134,9 +134,9 @@ pub fn run_chain_analysis_mode(send_notify: bool) -> Result<()> {
 }
 
 /// 龙虎榜选股分析模式。
-pub fn run_lhb_analysis(args: &Args) -> Result<()> {
+pub async fn run_lhb_analysis(args: &Args) -> Result<()> {
     use stock_analysis::database::DatabaseManager;
-    use stock_analysis::lhb_analyzer::{LhbAnalysis, LhbDataFetcher, LhbRecord};
+    use stock_analysis::lhb_analyzer::LhbDataFetcher;
 
     let db = DatabaseManager::get();
     if let Ok(deleted) = db.clean_old_lhb_data(60) {
@@ -151,104 +151,90 @@ pub fn run_lhb_analysis(args: &Args) -> Result<()> {
     }
 
     info!("开始获取龙虎榜数据...");
-    let runtime = tokio::runtime::Runtime::new()?;
 
-    let (good_stocks, stock_codes) = runtime.block_on(async {
-        let fetcher = LhbDataFetcher::new()?;
+    let lhb_date = args.lhb_date.clone().or_else(|| {
+        std::env::var("LHB_DATE").ok().filter(|s| !s.trim().is_empty())
+    });
+    let lhb_min_score = if args.lhb_min_score != 60 {
+        args.lhb_min_score
+    } else {
+        std::env::var("LHB_MIN_SCORE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60)
+    };
 
-        let lhb_date = args.lhb_date.clone().or_else(|| {
-            std::env::var("LHB_DATE").ok().filter(|s| !s.trim().is_empty())
-        });
-        let lhb_min_score = if args.lhb_min_score != 60 {
-            args.lhb_min_score
-        } else {
-            std::env::var("LHB_MIN_SCORE")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(60)
-        };
+    let fetcher = LhbDataFetcher::new()?;
 
-        let today_lhb = if let Some(date) = &lhb_date {
-            info!("正在获取 {} 的龙虎榜数据...", date);
-            fetcher.get_lhb_by_date(date).await?
-        } else {
-            let today = Local::now().format("%Y%m%d").to_string();
-            info!("正在获取今日 ({}) 的龙虎榜数据...", today);
-            fetcher.get_today_lhb().await?
-        };
+    let today_lhb = if let Some(date) = &lhb_date {
+        info!("正在获取 {} 的龙虎榜数据...", date);
+        fetcher.get_lhb_by_date(date).await?
+    } else {
+        let today = Local::now().format("%Y%m%d").to_string();
+        info!("正在获取今日 ({}) 的龙虎榜数据...", today);
+        fetcher.get_today_lhb().await?
+    };
 
-        if today_lhb.is_empty() {
-            info!("今日无龙虎榜数据");
-            return Ok::<(Vec<(LhbRecord, LhbAnalysis)>, Vec<String>), anyhow::Error>((
-                vec![],
-                vec![],
-            ));
-        }
-
-        // 同股票去重
-        let mut seen = std::collections::HashSet::new();
-        let unique_lhb: Vec<_> = today_lhb
-            .into_iter()
-            .filter(|r| seen.insert(r.code.clone()))
-            .collect();
-        info!("获取到 {} 只龙虎榜股票（去重后）", unique_lhb.len());
-
-        let total = unique_lhb.len();
-        let mut good_stocks = Vec::new();
-        for (i, record) in unique_lhb.into_iter().enumerate() {
-            if i > 0 && i % 10 == 0 {
-                info!("已处理 {}/{} 只股票", i, total);
-            }
-            match fetcher.analyze_stock_lhb(&record.code).await {
-                Ok(analysis) if analysis.total_score >= lhb_min_score => {
-                    good_stocks.push((record, analysis));
-                }
-                Ok(_) => {}
-                Err(e) => log::warn!("分析 {} 失败: {}", record.code, e),
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-        }
-
-        if good_stocks.is_empty() {
-            info!("未找到评分≥{}的股票", lhb_min_score);
-            return Ok::<(Vec<(LhbRecord, LhbAnalysis)>, Vec<String>), anyhow::Error>((
-                vec![],
-                vec![],
-            ));
-        }
-
-        good_stocks.sort_by(|a, b| b.1.total_score.cmp(&a.1.total_score));
-        info!("\n筛选到 {} 只优质股票:", good_stocks.len());
-        for (record, analysis) in &good_stocks {
-            info!(
-                "  {} {} 评分:{} (机构:{} 游资:{})",
-                record.code,
-                record.name,
-                analysis.total_score,
-                analysis.inst_score,
-                analysis.hot_money_score
-            );
-        }
-
-        // 过滤北交所（92 开头）
-        let stock_codes: Vec<String> = good_stocks
-            .iter()
-            .filter(|(r, _)| !r.code.starts_with("92"))
-            .map(|(r, _)| r.code.clone())
-            .collect();
-
-        if stock_codes.is_empty() {
-            info!("过滤后无有效股票");
-        } else {
-            info!("\n开始对 {} 只股票进行完整技术分析...", stock_codes.len());
-        }
-
-        Ok((good_stocks, stock_codes))
-    })?;
-
-    if stock_codes.is_empty() {
+    if today_lhb.is_empty() {
+        info!("今日无龙虎榜数据");
         return Ok(());
     }
+
+    // 同股票去重
+    let mut seen = std::collections::HashSet::new();
+    let unique_lhb: Vec<_> = today_lhb
+        .into_iter()
+        .filter(|r| seen.insert(r.code.clone()))
+        .collect();
+    info!("获取到 {} 只龙虎榜股票（去重后）", unique_lhb.len());
+
+    let total = unique_lhb.len();
+    let mut good_stocks = Vec::new();
+    for (i, record) in unique_lhb.into_iter().enumerate() {
+        if i > 0 && i % 10 == 0 {
+            info!("已处理 {}/{} 只股票", i, total);
+        }
+        match fetcher.analyze_stock_lhb(&record.code).await {
+            Ok(analysis) if analysis.total_score >= lhb_min_score => {
+                good_stocks.push((record, analysis));
+            }
+            Ok(_) => {}
+            Err(e) => log::warn!("分析 {} 失败: {}", record.code, e),
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    }
+
+    if good_stocks.is_empty() {
+        info!("未找到评分≥{}的股票", lhb_min_score);
+        return Ok(());
+    }
+
+    good_stocks.sort_by(|a, b| b.1.total_score.cmp(&a.1.total_score));
+    info!("\n筛选到 {} 只优质股票:", good_stocks.len());
+    for (record, analysis) in &good_stocks {
+        info!(
+            "  {} {} 评分:{} (机构:{} 游资:{})",
+            record.code,
+            record.name,
+            analysis.total_score,
+            analysis.inst_score,
+            analysis.hot_money_score
+        );
+    }
+
+    // 过滤北交所（92 开头）
+    let stock_codes: Vec<String> = good_stocks
+        .iter()
+        .filter(|(r, _)| !r.code.starts_with("92"))
+        .map(|(r, _)| r.code.clone())
+        .collect();
+
+    if stock_codes.is_empty() {
+        info!("过滤后无有效股票");
+        return Ok(());
+    }
+
+    info!("\n开始对 {} 只股票进行完整技术分析...", stock_codes.len());
 
     let monitor_cfg = config::get_monitor_config();
     let config = PipelineConfig {
@@ -262,7 +248,7 @@ pub fn run_lhb_analysis(args: &Args) -> Result<()> {
         dq_daily_stale_sec: monitor_cfg.dq_daily_stale_sec,
     };
     let pipeline = AnalysisPipeline::new(config)?;
-    let results = runtime.block_on(pipeline.run(&stock_codes, None))?;
+    let results = pipeline.run(&stock_codes, None).await?;
 
     info!("\n===== 龙虎榜选股分析结果 =====");
     if !results.is_empty() {

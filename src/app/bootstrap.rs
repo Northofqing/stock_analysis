@@ -68,7 +68,7 @@ pub fn validate_startup_config() {
 /// 5. 数据库中持仓中的股票
 ///
 /// 返回 `(stock_codes, limit_up_codes, macro_news_context)`。
-pub fn build_stock_list(args: &Args) -> Result<(Vec<String>, HashSet<String>, String)> {
+pub async fn build_stock_list(args: &Args) -> Result<(Vec<String>, HashSet<String>, String)> {
     // 1. 自选股基础列表
     let mut stock_codes: Vec<String> = if let Some(ref stocks) = args.stocks {
         stocks.clone()
@@ -93,8 +93,7 @@ pub fn build_stock_list(args: &Args) -> Result<(Vec<String>, HashSet<String>, St
             .unwrap_or(true)
     };
     let macro_news_context = if macro_ai_enabled {
-        let runtime = tokio::runtime::Runtime::new()?;
-        let (extra_codes, macro_text) = runtime.block_on(fetch_macro_recommended_codes());
+        let (extra_codes, macro_text) = fetch_macro_recommended_codes().await;
         if !extra_codes.is_empty() {
             let before = stock_codes.len();
             for code in &extra_codes {
@@ -137,7 +136,7 @@ pub fn build_stock_list(args: &Args) -> Result<(Vec<String>, HashSet<String>, St
             .unwrap_or(true)
     };
     if lhb_append_enabled {
-        append_lhb_top10(&mut stock_codes)?;
+        append_lhb_top10(&mut stock_codes).await?;
     } else {
         info!("⚙️ LHB_APPEND_ENABLED=false：跳过龙虎榜 Top10 追加");
     }
@@ -225,14 +224,11 @@ fn is_delisted_name(name: &str) -> bool {
     trimmed.contains("退市") || trimmed.starts_with('退') || trimmed.contains("终止上市")
 }
 
-fn append_lhb_top10(stock_codes: &mut Vec<String>) -> Result<()> {
+async fn append_lhb_top10(stock_codes: &mut Vec<String>) -> Result<()> {
     use stock_analysis::lhb_analyzer::LhbDataFetcher;
 
-    let runtime = tokio::runtime::Runtime::new()?;
-    match runtime.block_on(async {
-        let fetcher = LhbDataFetcher::new()?;
-        fetcher.get_today_lhb().await
-    }) {
+    let fetcher = LhbDataFetcher::new()?;
+    match fetcher.get_today_lhb().await {
         Ok(mut records) if !records.is_empty() => {
             records.sort_by(|a, b| {
                 b.net_amount
@@ -427,9 +423,7 @@ pub(crate) async fn fetch_macro_recommended_codes() -> (Vec<String>, String) {
     };
 
     let analyzer_clone = {
-        let guard = get_analyzer()
-            .lock()
-            .expect("AI analyzer mutex 已 poison");
+        let guard = get_analyzer().lock().await;
         if guard.is_available() {
             Some(guard.clone())
         } else {

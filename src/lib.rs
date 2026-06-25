@@ -15,6 +15,7 @@ pub mod analyzer;
 pub mod trend_analyzer;
 pub mod database;
 pub mod models;
+pub mod types;
 pub mod schema;
 pub mod calendar;
 pub mod market_data;

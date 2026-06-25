@@ -451,11 +451,13 @@ pub(super) fn format_volume(volume: Option<f64>) -> String {
 
 use once_cell::sync::OnceCell;
 
-static ANALYZER: OnceCell<std::sync::Mutex<GeminiAnalyzer>> = OnceCell::new();
+use tokio::sync::Mutex;
+
+static ANALYZER: OnceCell<Mutex<GeminiAnalyzer>> = OnceCell::new();
 
 /// 获取分析器单例
-pub fn get_analyzer() -> &'static std::sync::Mutex<GeminiAnalyzer> {
-    ANALYZER.get_or_init(|| std::sync::Mutex::new(GeminiAnalyzer::from_env()))
+pub fn get_analyzer() -> &'static Mutex<GeminiAnalyzer> {
+    ANALYZER.get_or_init(|| Mutex::new(GeminiAnalyzer::from_env()))
 }
 
 #[cfg(test)]
