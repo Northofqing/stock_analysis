@@ -353,7 +353,7 @@ impl BollingerZScoreBacktest {
         for (code, name, klines) in stocks {
             // klines 从数据源拿到通常是降序（最新在前），需要反转为升序
             let mut sorted = klines.clone();
-            sorted.sort_by(|a, b| a.date.cmp(&b.date));
+            sorted.sort_unstable_by(|a, b| a.date.cmp(&b.date));
 
             if sorted.len() < self.config.bb_window + 5 {
                 warn!("[{}] K线不足，跳过", code);

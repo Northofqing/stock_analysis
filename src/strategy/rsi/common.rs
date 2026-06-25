@@ -118,7 +118,7 @@ pub(super) fn compute_ema_vec(close: &[f64], period: usize) -> Vec<Option<f64>> 
 }
 
 /// 计算简单移动平均线 (SMA)
-pub(super) fn compute_sma_vec(close: &[f64], period: usize) -> Vec<Option<f64>> {
+pub(crate) fn compute_sma_vec(close: &[f64], period: usize) -> Vec<Option<f64>> {
     let n = close.len();
     let mut sma: Vec<Option<f64>> = vec![None; n];
     if n < period || period == 0 {

@@ -9,6 +9,8 @@
 //! - D   = EMA(K,   M)
 //! - J   = 3K − 2D
 
+use std::collections::VecDeque;
+
 /// 单条 SKDJ 数据点
 #[derive(Debug, Clone, Default)]
 pub struct SkdjPoint {
@@ -20,6 +22,7 @@ pub struct SkdjPoint {
 /// 计算 SKDJ 序列
 ///
 /// `highs`, `lows`, `closes` 按时间升序排列，长度必须一致。
+/// 使用单调双端队列实现 O(n) 滑动窗口最大/最小值查询。
 ///
 /// - `n`: RSV 周期（默认 40）
 /// - `m`: K/D EMA 平滑周期（默认 5）
@@ -37,12 +40,23 @@ pub fn calc_skdj(
     debug_assert_eq!(highs.len(), len);
     debug_assert_eq!(lows.len(), len);
 
-    // ---- RSV ----
+    // ---- RSV — 单调队列 O(n) ----
     let mut rsv = vec![50.0_f64; len];
+    let mut max_q: VecDeque<(usize, f64)> = VecDeque::new();
+    let mut min_q: VecDeque<(usize, f64)> = VecDeque::new();
+
     for i in 0..len {
-        let start = if i + 1 >= n { i + 1 - n } else { 0 };
-        let hh = highs[start..=i].iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        let ll = lows[start..=i].iter().cloned().fold(f64::INFINITY, f64::min);
+        while max_q.front().map_or(false, |&(idx, _)| idx + n <= i) { max_q.pop_front(); }
+        while min_q.front().map_or(false, |&(idx, _)| idx + n <= i) { min_q.pop_front(); }
+
+        while max_q.back().map_or(false, |&(_, v)| v <= highs[i]) { max_q.pop_back(); }
+        max_q.push_back((i, highs[i]));
+
+        while min_q.back().map_or(false, |&(_, v)| v >= lows[i]) { min_q.pop_back(); }
+        min_q.push_back((i, lows[i]));
+
+        let hh = max_q.front().map_or(highs[i], |&(_, v)| v);
+        let ll = min_q.front().map_or(lows[i], |&(_, v)| v);
         let denom = hh - ll;
         rsv[i] = if denom.abs() < 1e-12 {
             50.0
@@ -52,7 +66,6 @@ pub fn calc_skdj(
     }
 
     // ---- EMA(M) on RSV → K, EMA(M) on K → D ----
-    // EMA 系数 α = 2 / (M + 1)
     let alpha = 2.0 / (m as f64 + 1.0);
 
     let mut out = Vec::with_capacity(len);

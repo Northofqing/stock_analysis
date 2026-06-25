@@ -313,8 +313,9 @@ impl NewsMonitor {
             Err(_) => return,
         };
         for key in &self.seen_titles {
-            let sql = format!("INSERT OR IGNORE INTO news_dedup(key) VALUES ('{}')", key.replace('\'', "''"));
-            let _ = diesel::sql_query(&sql).execute(&mut *conn);
+            let _ = diesel::sql_query("INSERT OR IGNORE INTO news_dedup(key) VALUES (?1)")
+                .bind::<diesel::sql_types::Text, _>(key)
+                .execute(&mut *conn);
         }
     }
 

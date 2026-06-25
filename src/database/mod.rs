@@ -497,17 +497,21 @@ impl DatabaseManager {
         let mut conn = self.get_conn()?;
         let now_ts = chrono::Local::now().timestamp();
 
-        for sig in signatures {
-            if sig.is_empty() {
-                continue;
+        // 事务内批量写入，避免逐行 fsync
+        conn.transaction::<_, Box<dyn std::error::Error>, _>(|conn| {
+            for sig in signatures {
+                if sig.is_empty() {
+                    continue;
+                }
+                diesel::sql_query(
+                    "INSERT INTO topic_novelty_history(signature, created_at) VALUES (?1, ?2) ON CONFLICT(signature) DO UPDATE SET created_at=excluded.created_at",
+                )
+                .bind::<diesel::sql_types::Text, _>(sig)
+                .bind::<diesel::sql_types::BigInt, _>(now_ts)
+                .execute(conn)?;
             }
-            diesel::sql_query(
-                "INSERT INTO topic_novelty_history(signature, created_at) VALUES (?1, ?2) ON CONFLICT(signature) DO UPDATE SET created_at=excluded.created_at",
-            )
-            .bind::<diesel::sql_types::Text, _>(sig)
-            .bind::<diesel::sql_types::BigInt, _>(now_ts)
-            .execute(&mut *conn)?;
-        }
+            Ok(())
+        })?;
 
         let keep = max_rows.max(50) as i64;
         diesel::sql_query(

@@ -403,7 +403,7 @@ impl PrecisionRsiBacktest {
         let mut all_single: Vec<SinglePrecisionRsiResult> = Vec::new();
         for (code, name, klines) in stocks {
             let mut sorted = klines.clone();
-            sorted.sort_by(|a, b| a.date.cmp(&b.date));
+            sorted.sort_unstable_by(|a, b| a.date.cmp(&b.date));
 
             if sorted.len() < 205 {
                 warn!("[{}] K线不足205条，跳过精准RSI回测（当前{}条）", code, sorted.len());

@@ -1,5 +1,6 @@
 //! kdj（从 indicators.rs 拆分）
 
+use std::collections::VecDeque;
 
 // ============================================================================
 // KDJ
@@ -16,6 +17,7 @@ pub struct KdjPoint {
 /// 计算 KDJ 序列
 ///
 /// `highs`, `lows`, `closes` 按时间升序排列，长度必须一致。
+/// 使用单调双端队列实现 O(n) 滑动窗口最大/最小值查询。
 pub fn calc_kdj(
     highs: &[f64],
     lows: &[f64],
@@ -29,24 +31,35 @@ pub fn calc_kdj(
         return Vec::new();
     }
 
-    // 计算 RSV
+    // 计算 RSV — 使用单调队列 O(n) 替代原来的 O(n·n) 滑动窗口扫描
     let mut rsv = vec![50.0_f64; len];
+    // 递减队列：队首为窗口内最大值的 (index, value)
+    let mut max_q: VecDeque<(usize, f64)> = VecDeque::new();
+    // 递增队列：队首为窗口内最小值的 (index, value)
+    let mut min_q: VecDeque<(usize, f64)> = VecDeque::new();
+
     for i in 0..len {
-        let start = if i + 1 >= n { i + 1 - n } else { 0 };
-        let hh = highs[start..=i]
-            .iter()
-            .cloned()
-            .fold(f64::NEG_INFINITY, f64::max);
-        let ll = lows[start..=i]
-            .iter()
-            .cloned()
-            .fold(f64::INFINITY, f64::min);
+        // 移除窗口外元素
+        while max_q.front().map_or(false, |&(idx, _)| idx + n <= i) { max_q.pop_front(); }
+        while min_q.front().map_or(false, |&(idx, _)| idx + n <= i) { min_q.pop_front(); }
+
+        // 维护递减性质：弹出队尾 ≤ 当前值的元素
+        while max_q.back().map_or(false, |&(_, v)| v <= highs[i]) { max_q.pop_back(); }
+        max_q.push_back((i, highs[i]));
+
+        // 维护递增性质：弹出队尾 ≥ 当前值的元素
+        while min_q.back().map_or(false, |&(_, v)| v >= lows[i]) { min_q.pop_back(); }
+        min_q.push_back((i, lows[i]));
+
+        let hh = max_q.front().map_or(highs[i], |&(_, v)| v);
+        let ll = min_q.front().map_or(lows[i], |&(_, v)| v);
+
         if (hh - ll).abs() > 1e-10 {
             rsv[i] = (closes[i] - ll) / (hh - ll) * 100.0;
         }
     }
 
-    // SMA 平滑：K_i = K_{i-1} * (m-1)/m + RSV_i * 1/m
+    // SMA 平滑
     let mut k_vals = vec![50.0_f64; len];
     let mut d_vals = vec![50.0_f64; len];
     let mut j_vals = vec![50.0_f64; len];

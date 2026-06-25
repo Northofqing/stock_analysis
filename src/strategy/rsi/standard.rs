@@ -1019,7 +1019,7 @@ impl RsiBacktest {
         let mut all_single: Vec<SingleRsiResult> = Vec::new();
         for (code, name, klines) in stocks {
             let mut sorted = klines.clone();
-            sorted.sort_by(|a, b| a.date.cmp(&b.date));
+            sorted.sort_unstable_by(|a, b| a.date.cmp(&b.date));
 
             if sorted.len() < self.config.rsi_period + 5 {
                 warn!("[{}] K线不足，跳过 RSI 回测", code);

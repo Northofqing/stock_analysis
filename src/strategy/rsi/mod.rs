@@ -20,7 +20,7 @@
 //! **卖出条件**
 //! - 5 日 RSI 向上突破 50（前一日 < 50，当日 >= 50）— 超卖格局修复，均值回归完成
 
-mod common;
+pub(crate) mod common;
 pub mod precision;
 pub mod standard;
 

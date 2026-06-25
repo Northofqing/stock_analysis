@@ -336,44 +336,28 @@ impl StockTrendAnalyzer {
         result
     }
 
-    /// 计算均线
+    /// 计算均线（增量滑动窗口 O(n)，复用 compute_sma_vec）
     fn calculate_mas(&self, data: &[StockData]) -> Vec<StockData> {
-        let mut result = Vec::with_capacity(data.len());
+        use crate::strategy::rsi::common::compute_sma_vec;
 
-        for (i, item) in data.iter().enumerate() {
-            let mut new_item = item.clone();
+        let closes: Vec<f64> = data.iter().map(|d| d.close).collect();
+        let ma5 = compute_sma_vec(&closes, 5);
+        let ma10 = compute_sma_vec(&closes, 10);
+        let ma20 = compute_sma_vec(&closes, 20);
+        let ma60 = compute_sma_vec(&closes, 60);
 
-            // MA5
-            if i >= 4 {
-                let sum: f64 = data[i - 4..=i].iter().map(|d| d.close).sum();
-                new_item.ma5 = Some(sum / 5.0);
-            }
-
-            // MA10
-            if i >= 9 {
-                let sum: f64 = data[i - 9..=i].iter().map(|d| d.close).sum();
-                new_item.ma10 = Some(sum / 10.0);
-            }
-
-            // MA20
-            if i >= 19 {
-                let sum: f64 = data[i - 19..=i].iter().map(|d| d.close).sum();
-                new_item.ma20 = Some(sum / 20.0);
-            }
-
-            // MA60
-            if i >= 59 {
-                let sum: f64 = data[i - 59..=i].iter().map(|d| d.close).sum();
-                new_item.ma60 = Some(sum / 60.0);
-            } else {
-                // 数据不足时使用 MA20 替代
-                new_item.ma60 = new_item.ma20;
-            }
-
-            result.push(new_item);
-        }
-
-        result
+        data.iter()
+            .enumerate()
+            .map(|(i, item)| {
+                let mut new_item = item.clone();
+                new_item.ma5 = ma5[i];
+                new_item.ma10 = ma10[i];
+                // MA60 数据不足时使用 MA20 替代
+                new_item.ma20 = ma20[i];
+                new_item.ma60 = ma60[i].or(ma20[i]);
+                new_item
+            })
+            .collect()
     }
 
     /// 分析趋势状态

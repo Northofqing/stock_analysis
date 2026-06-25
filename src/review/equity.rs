@@ -71,7 +71,7 @@ pub fn compute_stats(curve: &[LedgerEntry]) -> EquityStats {
         (0.0, 0.0)
     } else {
         let mut sorted = daily_returns.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        sorted.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let n = sorted.len();
         let idx = (((n as f64) * 0.05).floor() as usize).min(n - 1);
         let q = sorted[idx];

@@ -18,16 +18,12 @@ impl DatabaseManager {
         let saved = conn.transaction::<usize, Box<dyn std::error::Error>, _>(|conn| {
             let mut count = 0;
             for record in records {
-                let result = diesel::insert_into(lhb_daily::table)
+                count += diesel::insert_into(lhb_daily::table)
                     .values(record)
                     .on_conflict((lhb_daily::code, lhb_daily::trade_date))
                     .do_nothing()
-                    .execute(conn);
-
-                match result {
-                    Ok(n) => count += n,
-                    Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error>),
-                }
+                    .execute(conn)
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
             }
             Ok(count)
         })?;
