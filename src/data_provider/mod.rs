@@ -6,6 +6,7 @@ pub mod announcement;
 pub mod chip_distribution;
 pub mod consensus;
 pub mod eastmoney_provider;
+pub mod limit_status;
 pub mod financials;
 pub mod gtimg_provider;
 pub mod industry;
