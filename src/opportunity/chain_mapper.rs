@@ -555,8 +555,10 @@ mod tests {
     fn test_board_match_works_with_contains() {
         let mut m = std::collections::HashMap::new();
         m.insert("印制电路板".to_string(), ("BK888".to_string(), 1.0));
+        // PCB = Printed Circuit Board = 印制电路板，应能匹配
         let got = find_best_board_match(&m, "PCB");
-        assert!(got.is_none());
+        assert!(got.is_some(), "PCB should match 印制电路板 (Printed Circuit Board)");
+        assert_eq!(got.unwrap().0, "BK888");
 
         let got2 = find_best_board_match(&m, "印制电路").unwrap();
         assert_eq!(got2.0, "BK888");

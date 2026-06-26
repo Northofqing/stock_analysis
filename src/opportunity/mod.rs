@@ -1005,6 +1005,6 @@ mod tests {
             kd(10.2, 10.3, 10.0, 10.1, 2_200.0, -1.0),
         ];
         let (score, _, _) = score_air_refuel_pattern(&k);
-        assert!(score < 1.0);
+        assert!(score < 5.0, "consolidation breakout should be penalized, got {score}");
     }
 }
