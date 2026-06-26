@@ -259,18 +259,21 @@ impl RustdxProvider {
 impl DataProvider for RustdxProvider {
     fn get_daily_data(&self, code: &str, days: usize) -> Result<Vec<KlineData>> {
         info!("[通达信] 获取股票 {} 最近 {} 天数据", code, days);
-        
+
         let mut kline_data = self.fetch_kline_internal(code, days)?;
-        
+
+        // 填涨跌停 / 停牌标记（在夏普和实时报价前先填，因为夏普的 close 改写可能影响）
+        super::limit_status::apply_limit_flags_inplace(code, None, &mut kline_data);
+
         // 计算夏普比率（使用60天滚动窗口）
         if !kline_data.is_empty() {
             use crate::sharpe_calculator;
-            
+
             // 数据是降序的（最新在前），反转来计算，原地反转避免 clone
             kline_data.reverse();
             sharpe_calculator::update_sharpe_ratios(&mut kline_data, Some(60), Some(0.03));
             kline_data.reverse();
-            
+
             if let Some(latest) = kline_data.first() {
                 if let Some(sharpe) = latest.sharpe_ratio {
                     debug!("[通达信] {} 夏普比率: {:.4}", code, sharpe);

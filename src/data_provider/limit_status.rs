@@ -80,6 +80,39 @@ pub fn fill_limit_flags(
     k.is_suspended = s.is_suspended; // 默认 false，查询 sse 后填
 }
 
+/// 批量为 K 线列表（按日期降序）填涨跌停标记。
+///
+/// - `klines[0]`（最新一根，即"今日"）的 prev_close 用 `klines[1].close`（昨日）
+/// - `klines[i]`（i>=1）的 prev_close 用 `klines[i+1].close`
+///
+/// 容忍停牌 / 节假日造成的 K 线间隔：前一根 bar 的 close 仍是当时最近一笔
+/// 可得收盘价，作为今日的"昨日收盘"是合理的近似。
+///
+/// `name` 可为 None（非 ST 假设）；如有 name 应调用方提供。
+pub fn apply_limit_flags_inplace(
+    code: &str,
+    name: Option<&str>,
+    klines: &mut [KlineData],
+) {
+    if klines.is_empty() {
+        return;
+    }
+    let calc = LimitStatusCalculator::new();
+    let name_str = name.unwrap_or("");
+    let n = klines.len();
+    // 倒序遍历（时间从旧到新），保持 prev_close 来源简单
+    // 由于 klines 已按日期降序，倒序遍历的下一个就是时间上更早的一根
+    for i in (0..n).rev() {
+        let prev_close = if i + 1 < n {
+            klines[i + 1].close
+        } else {
+            // 最旧一根没有 prev_close，留 0，fill_limit_flags 会跳过
+            0.0
+        };
+        fill_limit_flags(&calc, code, &mut klines[i], prev_close, name_str);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Board {
     Main,
@@ -286,5 +319,33 @@ mod tests {
         let mut k = kline("000001", 10.5); // close=10.5 = 5% 涨停
         fill_limit_flags(&calc, "000001", &mut k, 10.0, "*ST华微");
         assert!(k.is_limit_up);
+    }
+
+    #[test]
+    fn apply_limit_flags_to_desc_list() {
+        // 按日期降序: 11.0(今天), 10.0(昨天), 9.5(前天)
+        // 今天是涨停 (11.0 == 10*1.1)
+        // 昨天 close=10.0, prev=9.5, limit_down=9.5*0.9=8.55, 在范围内, 无标记
+        // 前天 close=9.5, 没有 prev, 不填
+        let mut klines = vec![
+            { let mut k = kline("600000", 11.0); k.date = NaiveDate::from_ymd_opt(2026, 6, 27).unwrap(); k },
+            { let mut k = kline("600000", 10.0); k.date = NaiveDate::from_ymd_opt(2026, 6, 26).unwrap(); k },
+            { let mut k = kline("600000", 9.5);  k.date = NaiveDate::from_ymd_opt(2026, 6, 25).unwrap(); k },
+        ];
+        apply_limit_flags_inplace("600000", Some("浦发银行"), &mut klines);
+        assert!(klines[0].is_limit_up, "今天 close=11.0 = 10*1.1, 应是涨停");
+        assert!(!klines[0].is_limit_down);
+        assert!(!klines[1].is_limit_up, "昨天在范围内");
+        assert!(!klines[1].is_limit_down);
+        // 前天没有 prev_close, 不填
+        assert!(!klines[2].is_limit_up);
+        assert!(!klines[2].is_limit_down);
+    }
+
+    #[test]
+    fn apply_limit_flags_to_empty() {
+        let mut klines: Vec<KlineData> = vec![];
+        apply_limit_flags_inplace("600000", None, &mut klines);
+        // 不应 panic
     }
 }

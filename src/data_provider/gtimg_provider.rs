@@ -152,20 +152,20 @@ impl GtimgProvider {
         let response = match response {
             Ok(resp) => resp,
             Err(e) => {
-                log::error!("[腾讯] 请求失败: {} - URL: {}", e, url);
+                log::error!("[腾讯] 请求失败 (code={}): {}", code, e);
                 return Err(anyhow!("HTTP请求失败: {}", e));
             }
         };
         
         if !response.status().is_success() {
-            log::error!("[腾讯] 响应状态码: {} - URL: {}", response.status(), url);
+            log::error!("[腾讯] 响应状态码: {} (code={})", response.status(), code);
             return Err(anyhow!("HTTP请求返回错误状态: {}", response.status()));
         }
         
         let text = response.text().await.context("读取响应失败")?;
         
         if text.is_empty() {
-            log::error!("[腾讯] 响应为空 - URL: {}", url);
+            log::error!("[腾讯] 响应为空 (code={})", code);
             return Err(anyhow!("API返回空响应"));
         }
 
@@ -448,17 +448,20 @@ impl Default for GtimgProvider {
 impl DataProvider for GtimgProvider {
     fn get_daily_data(&self, code: &str, days: usize) -> Result<Vec<KlineData>> {
         log::info!("[腾讯] 获取股票 {} 最近 {} 天数据", code, days);
-        
+
         // 克隆必要的数据用于 async block
         let client = self.client.clone();
-        let code = code.to_string();
-        
-        let data = Self::run_async_blocking(async move {
-            Self::fetch_kline_data_internal(&client, &code, days).await
+        let code_owned = code.to_string();
+
+        let mut data = Self::run_async_blocking(async move {
+            Self::fetch_kline_data_internal(&client, &code_owned, days).await
         })?;
-        
+
+        // 填涨跌停 / 停牌标记（名称后续用 get_stock_name 单独覆盖）
+        super::limit_status::apply_limit_flags_inplace(code, None, &mut data);
+
         log::info!("[腾讯] 成功获取 {} 条数据", data.len());
-        
+
         Ok(data)
     }
     

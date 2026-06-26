@@ -3,6 +3,7 @@
 //! 通过HTTP API直接获取股票数据
 //! 参考market_analyzer的实现，使用东方财富API
 
+use super::limit_status::apply_limit_flags_inplace;
 use super::{DataProvider, KlineData};
 use anyhow::{Context, Result, anyhow};
 use chrono::NaiveDate;
@@ -89,6 +90,17 @@ impl HttpProvider {
         let max_attempts: u32 = (KLINE_HOSTS.len() as u32) * MAX_ATTEMPTS_PER_HOST;
         let mut last_err: Option<anyhow::Error> = None;
 
+        // 截断超长错误信息（reqwest 错误会内嵌完整 URL），避免日志刷屏。
+        fn brief(s: String) -> String {
+            const MAX: usize = 120;
+            if s.chars().count() <= MAX {
+                s
+            } else {
+                let head: String = s.chars().take(MAX).collect();
+                format!("{head}…(截断)")
+            }
+        }
+
         for attempt in 1..=max_attempts {
             let host = KLINE_HOSTS[((attempt - 1) as usize) % KLINE_HOSTS.len()];
             let url = format!(
@@ -113,10 +125,10 @@ impl HttpProvider {
                 Err(e) => {
                     // 网络层错误 → 重试
                     log::warn!(
-                        "[HTTP] 请求失败 (attempt {}/{} host={}): {} - URL: {}",
-                        attempt, max_attempts, host, e, url
+                        "[HTTP] 请求失败 (attempt {}/{} host={} code={}): {}",
+                        attempt, max_attempts, host, code, brief(e.to_string())
                     );
-                    last_err = Some(anyhow!("HTTP请求失败: {}", e));
+                    last_err = Some(anyhow!("HTTP请求失败: {}", brief(e.to_string())));
                     if attempt < max_attempts {
                         tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
                     }
@@ -128,13 +140,13 @@ impl HttpProvider {
             if !status.is_success() {
                 // 4xx：客户端错误（URL/参数问题），重试也不会变好，直接失败
                 if status.is_client_error() {
-                    log::error!("[HTTP] 客户端错误 {} (host={}) - URL: {}", status, host, url);
+                    log::error!("[HTTP] 客户端错误 {} (host={} code={})", status, host, code);
                     return Err(anyhow!("HTTP请求返回错误状态: {}", status));
                 }
                 // 5xx：可能瞬时，重试
                 log::warn!(
-                    "[HTTP] 响应状态 {} (attempt {}/{} host={}) - URL: {}",
-                    status, attempt, max_attempts, host, url
+                    "[HTTP] 响应状态 {} (attempt {}/{} host={} code={})",
+                    status, attempt, max_attempts, host, code
                 );
                 last_err = Some(anyhow!("HTTP请求返回错误状态: {}", status));
                 if attempt < max_attempts {
@@ -147,10 +159,10 @@ impl HttpProvider {
                 Ok(t) => t,
                 Err(e) => {
                     log::warn!(
-                        "[HTTP] 读取响应失败 (attempt {}/{} host={}): {} - URL: {}",
-                        attempt, max_attempts, host, e, url
+                        "[HTTP] 读取响应失败 (attempt {}/{} host={} code={}): {}",
+                        attempt, max_attempts, host, code, brief(e.to_string())
                     );
-                    last_err = Some(anyhow!("读取响应失败: {}", e));
+                    last_err = Some(anyhow!("读取响应失败: {}", brief(e.to_string())));
                     if attempt < max_attempts {
                         tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
                     }
@@ -160,8 +172,8 @@ impl HttpProvider {
 
             if text.is_empty() {
                 log::warn!(
-                    "[HTTP] 响应为空 (attempt {}/{} host={}) - URL: {}",
-                    attempt, max_attempts, host, url
+                    "[HTTP] 响应为空 (attempt {}/{} host={} code={})",
+                    attempt, max_attempts, host, code
                 );
                 last_err = Some(anyhow!("API返回空响应"));
                 if attempt < max_attempts {
@@ -172,8 +184,28 @@ impl HttpProvider {
 
             log::debug!("[HTTP] 响应前200字符: {}", &text[..text.len().min(200)]);
 
-            // 解析JSON (简单的字符串解析，因为API返回的是字符串数组)
-            return Self::parse_kline_response_internal(&text);
+            // 解析JSON (简单的字符串解析，因为API返回的是字符串数组)。
+            // 200 但非 JSON（反爬/限流 HTML 页）视为可重试错误：换 host 再试，
+            // 而非立刻放弃整个东方财富源。
+            match Self::parse_kline_response_internal(&text) {
+                Ok(data) => return Ok(data),
+                Err(e) => {
+                    log::warn!(
+                        "[HTTP] 解析失败 (attempt {}/{} host={} code={}): {} - 响应前120字符: {}",
+                        attempt,
+                        max_attempts,
+                        host,
+                        code,
+                        e,
+                        brief(text.clone())
+                    );
+                    last_err = Some(e);
+                    if attempt < max_attempts {
+                        tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+                    }
+                    continue;
+                }
+            }
         }
 
         // 所有重试都失败：打印一次终态错误，避免上游再次重复输出
@@ -310,20 +342,25 @@ impl Default for HttpProvider {
 impl DataProvider for HttpProvider {
     fn get_daily_data(&self, code: &str, days: usize) -> Result<Vec<KlineData>> {
         log::info!("[HTTP] 获取股票 {} 最近 {} 天数据", code, days);
-        
+
         // 克隆必要的数据用于 async block
         let client = self.client.clone();
         let code = code.to_string();
-        
+
         // 使用 tokio::task::block_in_place 来运行异步代码
-        let data = tokio::task::block_in_place(|| {
+        let mut data = tokio::task::block_in_place(|| {
+            let code_inner = code.clone();
             tokio::runtime::Handle::current().block_on(async move {
-                Self::fetch_kline_data_internal(&client, &code, days).await
+                Self::fetch_kline_data_internal(&client, &code_inner, days).await
             })
         })?;
-        
+
+        // 填涨跌停 / 停牌标记
+        // 名称暂用 None（保守按非 ST 处理）；后续实时行情步骤会再覆盖
+        apply_limit_flags_inplace(&code, None, &mut data);
+
         log::info!("[HTTP] 成功获取 {} 条数据", data.len());
-        
+
         Ok(data)
     }
     fn get_stock_name(&self, code: &str) -> Option<String> {
