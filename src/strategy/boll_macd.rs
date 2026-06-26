@@ -99,8 +99,8 @@ pub fn detect_boll_macd_signal(data: &[KlineData]) -> BollMacdSignal {
     }
 
     // 转为时间正序（最旧 → 最新）
-    let closes: Vec<f64> = data.iter().rev().map(|k| k.close).collect();
-    let volumes: Vec<f64> = data.iter().rev().map(|k| k.volume).collect();
+    let (closes, volumes): (Vec<f64>, Vec<f64>) = data.iter().rev()
+        .map(|k| (k.close, k.volume)).unzip();
     let n = closes.len();
 
     // ============ 布林带 (20, 2σ) ============

@@ -13,17 +13,17 @@ use crate::search_service::get_search_service;
 pub(super) async fn resolve_macro_context(
     prefetched: Option<String>,
     use_news_search: bool,
-) -> Arc<String> {
+) -> Arc<str> {
     if let Some(mc) = prefetched {
         if !mc.is_empty() {
             info!("✓ 复用已获取的宏观新闻（{} 字符），跳过重复搜索", mc.len());
-            return Arc::new(mc);
+            return Arc::from(mc);
         }
-        return Arc::new(String::new());
+        return Arc::from(String::new());
     }
 
     if !use_news_search {
-        return Arc::new(String::new());
+        return Arc::from(String::new());
     }
 
     info!("📡 搜索今日宏观/市场最新新闻（所有股票共享）...");
@@ -47,5 +47,5 @@ pub(super) async fn resolve_macro_context(
             String::new()
         }
     };
-    Arc::new(mc)
+    Arc::from(mc)
 }

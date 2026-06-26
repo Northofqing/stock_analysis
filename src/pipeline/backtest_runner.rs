@@ -124,7 +124,7 @@ impl AnalysisPipeline {
             Ok((data, _)) if !data.is_empty() => {
                 let mut closes = std::collections::HashMap::new();
                 for k in &data {
-                    closes.insert(k.date.format("%Y-%m-%d").to_string(), k.close);
+                    closes.insert(k.date, k.close);
                 }
                 info!("✓ 基准沪深300已加载 {} 个交易日", closes.len());
                 Some(BenchmarkSeries::new("沪深300", closes))

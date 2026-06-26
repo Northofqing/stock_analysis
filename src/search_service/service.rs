@@ -9,7 +9,7 @@ use log::{info, warn};
 use crate::config::get_monitor_config;
 
 use super::providers::{
-    BochaSearchProvider, EastmoneyNewsProvider, Jin10CalendarEvent, Jin10Provider,
+    BochaSearchProvider, ClsProvider, EastmoneyNewsProvider, Jin10CalendarEvent, Jin10Provider,
     SerpAPISearchProvider, TavilySearchProvider, WallStreetCnProvider,
 };
 use super::types::{SearchProvider, SearchResponse, SearchResult};
@@ -28,10 +28,16 @@ pub struct SearchService {
     providers: Vec<Box<dyn SearchProvider>>,
     /// 华尔街见闻直连（免费，用于宏观新闻）
     wscn: WallStreetCnProvider,
+    /// 财联社直连（免费，A股电报）
+    cls: ClsProvider,
     /// 金十数据直连（免费，快讯 + 财经日历）
     jin10: Jin10Provider,
     /// 最近入选主题新闻标题特征（用于抑制重复推送）
     recent_topic_signatures: Mutex<VecDeque<String>>,
+    /// 新闻源健康统计（成功/超时/失败/空结果）
+    source_health: Mutex<HashMap<String, SourceHealthStats>>,
+    /// 汇总日志触发计数（每 N 次打印一次）
+    source_health_ticks: Mutex<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -39,6 +45,24 @@ struct TopicRerankParams {
     relevance_weight: f32,
     diversity_penalty: f32,
     history_penalty: f32,
+}
+
+#[derive(Default, Clone)]
+struct SourceHealthStats {
+    attempts: u64,
+    success: u64,
+    timeout: u64,
+    error: u64,
+    empty: u64,
+    items: u64,
+}
+
+#[derive(Clone, Copy)]
+enum SourceFetchOutcome {
+    Success,
+    Timeout,
+    Error,
+    Empty,
 }
 
 impl SearchService {
@@ -66,6 +90,12 @@ impl SearchService {
             providers.push(Box::new(EastmoneyNewsProvider::new()));
         }
 
+        // 2.5 华尔街见闻（免费直连，补充全球财经资讯）
+        providers.push(Box::new(WallStreetCnProvider::new()));
+
+        // 2.6 财联社（免费直连，补充A股电报）
+        providers.push(Box::new(ClsProvider::new()));
+
         // 3. Bocha（中文搜索优化，AI摘要）
         if let Some(keys) = bocha_keys {
             if !keys.is_empty() {
@@ -92,10 +122,68 @@ impl SearchService {
         Self {
             providers,
             wscn: WallStreetCnProvider::new(),
+            cls: ClsProvider::new(),
             jin10: Jin10Provider::new(),
             recent_topic_signatures: Mutex::new(VecDeque::with_capacity(
                 cfg.topic_history_memory_size.max(50),
             )),
+            source_health: Mutex::new(HashMap::new()),
+            source_health_ticks: Mutex::new(0),
+        }
+    }
+
+    fn record_source_health(&self, source: &str, outcome: SourceFetchOutcome, items: usize) {
+        if let Ok(mut guard) = self.source_health.lock() {
+            let stat = guard.entry(source.to_string()).or_default();
+            stat.attempts += 1;
+            stat.items += items as u64;
+            match outcome {
+                SourceFetchOutcome::Success => stat.success += 1,
+                SourceFetchOutcome::Timeout => stat.timeout += 1,
+                SourceFetchOutcome::Error => stat.error += 1,
+                SourceFetchOutcome::Empty => stat.empty += 1,
+            }
+        }
+    }
+
+    fn maybe_log_source_health_summary(&self, reason: &str) {
+        let should_log = if let Ok(mut ticks) = self.source_health_ticks.lock() {
+            *ticks += 1;
+            *ticks % 20 == 0
+        } else {
+            false
+        };
+        if !should_log {
+            return;
+        }
+
+        if let Ok(guard) = self.source_health.lock() {
+            if guard.is_empty() {
+                return;
+            }
+
+            let mut lines = Vec::new();
+            for (source, stat) in guard.iter() {
+                if stat.attempts == 0 {
+                    continue;
+                }
+                let success_rate = stat.success as f64 * 100.0 / stat.attempts as f64;
+                lines.push(format!(
+                    "{}: 成功 {}/{} ({:.1}%), 超时 {}, 错误 {}, 空结果 {}, 累计条数 {}",
+                    source,
+                    stat.success,
+                    stat.attempts,
+                    success_rate,
+                    stat.timeout,
+                    stat.error,
+                    stat.empty,
+                    stat.items
+                ));
+            }
+
+            if !lines.is_empty() {
+                info!("[source-health][{}] {}", reason, lines.join(" | "));
+            }
         }
     }
 
@@ -112,19 +200,97 @@ impl SearchService {
 
     /// 获取原始快讯标题列表（供 NewsMonitor 路径A 使用）
     pub async fn fetch_flash_titles(&self, limit: usize) -> Vec<String> {
-        let (jin10_res, wscn_res) = tokio::join!(
-            self.jin10.fetch_flash_news(limit, true),   // 标星快讯
-            self.wscn.fetch_live_news(limit),
+        let source_timeout = Duration::from_secs(get_monitor_config().topic_search_timeout_sec.max(3));
+        let (jin10_res, wscn_res, cls_res) = tokio::join!(
+            tokio::time::timeout(source_timeout, self.jin10.fetch_flash_news(limit, true)),
+            tokio::time::timeout(source_timeout, self.wscn.fetch_live_news(limit)),
+            tokio::time::timeout(source_timeout, self.cls.fetch_live_news(limit)),
         );
+
         let mut titles = Vec::new();
-        if let Ok(lst) = jin10_res {
-            for r in lst { titles.push(r.title); }
+
+        match jin10_res {
+            Ok(Ok(lst)) => {
+                info!("[flash][jin10] 成功 {} 条", lst.len());
+                if lst.is_empty() {
+                    self.record_source_health("jin10", SourceFetchOutcome::Empty, 0);
+                } else {
+                    self.record_source_health("jin10", SourceFetchOutcome::Success, lst.len());
+                }
+                for r in lst {
+                    titles.push(r.title);
+                }
+            }
+            Ok(Err(e)) => {
+                self.record_source_health("jin10", SourceFetchOutcome::Error, 0);
+                warn!("[flash][jin10] 失败: {}", e)
+            }
+            Err(_) => {
+                self.record_source_health("jin10", SourceFetchOutcome::Timeout, 0);
+                warn!("[flash][jin10] 超时（>{}s）", source_timeout.as_secs())
+            }
         }
-        if let Ok(lst) = wscn_res {
-            for r in lst { titles.push(r.title); }
+
+        match wscn_res {
+            Ok(Ok(lst)) => {
+                info!("[flash][wscn] 成功 {} 条", lst.len());
+                if lst.is_empty() {
+                    self.record_source_health("wscn", SourceFetchOutcome::Empty, 0);
+                } else {
+                    self.record_source_health("wscn", SourceFetchOutcome::Success, lst.len());
+                }
+                for r in lst {
+                    titles.push(r.title);
+                }
+            }
+            Ok(Err(e)) => {
+                self.record_source_health("wscn", SourceFetchOutcome::Error, 0);
+                warn!("[flash][wscn] 失败: {}", e)
+            }
+            Err(_) => {
+                self.record_source_health("wscn", SourceFetchOutcome::Timeout, 0);
+                warn!("[flash][wscn] 超时（>{}s）", source_timeout.as_secs())
+            }
         }
-        titles.truncate(limit);
-        titles
+
+        match cls_res {
+            Ok(Ok(lst)) => {
+                info!("[flash][cls] 成功 {} 条", lst.len());
+                if lst.is_empty() {
+                    self.record_source_health("cls", SourceFetchOutcome::Empty, 0);
+                } else {
+                    self.record_source_health("cls", SourceFetchOutcome::Success, lst.len());
+                }
+                for r in lst {
+                    titles.push(r.title);
+                }
+            }
+            Ok(Err(e)) => {
+                self.record_source_health("cls", SourceFetchOutcome::Error, 0);
+                warn!("[flash][cls] 失败: {}", e)
+            }
+            Err(_) => {
+                self.record_source_health("cls", SourceFetchOutcome::Timeout, 0);
+                warn!("[flash][cls] 超时（>{}s）", source_timeout.as_secs())
+            }
+        }
+
+        let mut seen = HashSet::new();
+        let mut deduped = Vec::new();
+        for title in titles {
+            let sig = Self::normalize_text(&title);
+            if sig.is_empty() || !seen.insert(sig) {
+                continue;
+            }
+            deduped.push(title);
+            if deduped.len() >= limit {
+                break;
+            }
+        }
+
+        self.maybe_log_source_health_summary("fetch_flash_titles");
+
+        deduped
     }
 
     /// 检查是否有可用的搜索引擎
@@ -176,6 +342,12 @@ impl SearchService {
                 };
 
                 if !resp.success || resp.results.is_empty() {
+                    warn!(
+                        "[topic] {} 查询失败: {} ({})",
+                        provider.name(),
+                        q,
+                        resp.error_message.as_deref().unwrap_or("空结果")
+                    );
                     continue;
                 }
 
@@ -826,9 +998,10 @@ impl SearchService {
         let mut sections: Vec<String> = Vec::new();
 
         // ── 第一步：免费直连源（华尔街见闻 + 金十数据）并发拉取 ──
-        let (live_res, article_res, jin10_flash_res, jin10_imp_res, calendar_res) = tokio::join!(
+        let (live_res, article_res, cls_res, jin10_flash_res, jin10_imp_res, calendar_res) = tokio::join!(
             self.wscn.fetch_live_news(30),
             self.wscn.fetch_articles(10),
+            self.cls.fetch_live_news(30),
             self.jin10.fetch_flash_news(20, false),
             self.jin10.fetch_flash_news(10, true),
             self.jin10.fetch_calendar(1, 2), // 今天+明天，重要性≥2
@@ -853,6 +1026,21 @@ impl SearchService {
             info!("[宏观新闻][wscn] 华尔街见闻获取 {} 条", wscn_items.len());
         } else {
             warn!("[宏观新闻][wscn] 华尔街见闻返回为空或超时");
+        }
+
+        let mut cls_items: Vec<String> = Vec::new();
+        if let Ok(lst) = cls_res {
+            for r in lst.iter().take(8) {
+                let t = r.published_date.as_deref().unwrap_or("");
+                let snippet: String = r.snippet.chars().take(120).collect();
+                cls_items.push(format!("- **{}** {}  \n  {}", r.title, t, snippet));
+            }
+        }
+        if !cls_items.is_empty() {
+            sections.push(format!("### 🧭 财联社电报（今日实时）\n{}", cls_items.join("\n")));
+            info!("[宏观新闻][cls] 财联社获取 {} 条", cls_items.len());
+        } else {
+            warn!("[宏观新闻][cls] 财联社返回为空或超时");
         }
 
         // ── 金十快讯（标星重要优先，普通快讯补充）──

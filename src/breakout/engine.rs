@@ -28,6 +28,21 @@ pub fn screen_intraday(
         VolumePattern::Flat
     };
 
+    // 1b. 高量但转弱：当日已经翻绿或涨幅明显不足时，按分布/出货风险处理。
+    // 这类标的容易在盘中从“放量启动”转成“冲高回落”，不应继续加分。
+    if vol_ratio >= 1.5 && change_pct < 1.0 {
+        confidence = confidence.saturating_sub(15);
+        desc_parts.push("高量转弱".into());
+    }
+    if vol_ratio >= 1.5 && change_pct < 0.0 {
+        confidence = confidence.saturating_sub(20);
+        desc_parts.push("放量下跌".into());
+    }
+    if vol_ratio >= 2.5 && change_pct <= 0.5 {
+        confidence = confidence.saturating_sub(20);
+        desc_parts.push("天量不涨".into());
+    }
+
     // 2. K线强度
     let candle_strength = if change_pct >= 5.0 {
         confidence = confidence.saturating_add(25);
@@ -55,7 +70,11 @@ pub fn screen_intraday(
     }
 
     // 5. 综合判定
-    let breakout_type = if confidence >= 50 {
+    let breakout_type = if vol_ratio >= 2.5 && change_pct <= 0.5 {
+        BreakoutType::Distribution
+    } else if vol_ratio >= 1.5 && change_pct < 0.0 {
+        BreakoutType::Distribution
+    } else if confidence >= 50 {
         BreakoutType::Launch
     } else if confidence >= 20 {
         BreakoutType::Uncertain

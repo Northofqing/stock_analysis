@@ -28,7 +28,7 @@ pub struct TradeReview {
 /// 每笔 sell 对应一个 TradeReview，通过买入卖出配对计算。
 pub fn review_closed_trades(trades: &[Trade]) -> Vec<TradeReview> {
     let mut reviews = Vec::new();
-    let mut pending_buys: Vec<&Trade> = Vec::new();
+    let mut pending_buys: std::collections::VecDeque<&Trade> = std::collections::VecDeque::new();
 
     // 按时间排序
     let mut sorted: Vec<&Trade> = trades.iter().collect();
@@ -37,11 +37,11 @@ pub fn review_closed_trades(trades: &[Trade]) -> Vec<TradeReview> {
     for trade in &sorted {
         match trade.direction {
             TradeDirection::Buy => {
-                pending_buys.push(trade);
+                pending_buys.push_back(trade);
             }
             TradeDirection::Sell => {
                 // 先进先出匹配
-                if let Some(buy) = pending_buys.first().cloned() {
+                if let Some(buy) = pending_buys.front().cloned() {
                     let holding_days = (trade.traded_at - buy.traded_at).num_days().max(0) as u32;
                     let pnl_pct = if buy.price > 0.0 {
                         (trade.price - buy.price) / buy.price * 100.0
@@ -63,7 +63,7 @@ pub fn review_closed_trades(trades: &[Trade]) -> Vec<TradeReview> {
                         self_rating: None,
                         lesson: None,
                     });
-                    pending_buys.remove(0);
+                    pending_buys.pop_front();
                 }
             }
         }

@@ -14,7 +14,7 @@ use crate::data_provider::financials::{fetch_with_fallback_async, Financials};
 use crate::data_provider::money_flow::{
     fetch_flow_history_async, fetch_intraday_shape_async, IntradayShape, MoneyFlowSummary,
 };
-use crate::data_provider::{GtimgProvider, HttpProvider, KlineData};
+use crate::data_provider::{DataProvider, GtimgProvider, HttpProvider, KlineData, RustdxProvider};
 use anyhow::Result;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
@@ -62,7 +62,7 @@ impl DataFetchService {
 
     /// 获取 K 线数据（缓存 by `(code, days)`）。
     ///
-    /// 多源回落：优先东方财富，失败后回落到腾讯财经。两者皆失败才返回 Err。
+    /// 多源回落：优先东方财富，失败后回落到腾讯财经，再失败则回落到通达信/RustDX。
     /// 仅成功结果会被 `OnceCell` 缓存；失败时 cell 仍未初始化，下次调用会重新尝试。
     pub async fn get_kline(&self, code: &str, days: usize) -> Result<Arc<Vec<KlineData>>> {
         let cell = Self::slot(&self.klines, (code.to_string(), days)).await;
@@ -86,11 +86,38 @@ impl DataFetchService {
                             );
                             Ok(Arc::new(data))
                         }
-                        Err(gt_err) => Err(anyhow::anyhow!(
-                            "K线获取全部失败: 东方财富={}; 腾讯={}",
-                            em_err,
-                            gt_err
-                        )),
+                        Err(gt_err) => {
+                            log::warn!(
+                                "[DataFetch] {} 腾讯获取失败，回落至通达信/RustDX: {}",
+                                code_owned,
+                                gt_err
+                            );
+
+                            let rustdx_code = code_owned.clone();
+                            let rustdx_result = tokio::task::spawn_blocking(move || {
+                                let provider = RustdxProvider::new()?;
+                                provider.get_daily_data(&rustdx_code, days)
+                            })
+                            .await
+                            .map_err(|e| anyhow::anyhow!("RustDX 任务执行失败: {}", e))?;
+
+                            match rustdx_result {
+                                Ok(data) => {
+                                    log::info!(
+                                        "[DataFetch] {} RustDX 回落成功，{} 条数据",
+                                        code_owned,
+                                        data.len()
+                                    );
+                                    Ok(Arc::new(data))
+                                }
+                                Err(rustdx_err) => Err(anyhow::anyhow!(
+                                    "K线获取全部失败: 东方财富={}; 腾讯={}; RustDX={}",
+                                    em_err,
+                                    gt_err,
+                                    rustdx_err
+                                )),
+                            }
+                        }
                     }
                 }
             }

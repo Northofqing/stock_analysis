@@ -1285,7 +1285,7 @@ impl AnalysisPipeline {
     }
 
     /// 处理单只股票的完整流程（含 120s 超时保护）
-    async fn process_stock(&self, code: String, macro_context: Arc<String>) -> Option<AnalysisResult> {
+    async fn process_stock(&self, code: String, macro_context: Arc<str>) -> Option<AnalysisResult> {
         let start = std::time::Instant::now();
         info!("========== [{}] 开始处理 ==========", code);
 
@@ -1309,7 +1309,7 @@ impl AnalysisPipeline {
         result
     }
 
-    async fn process_stock_inner(&self, code: String, macro_context: Arc<String>) -> Option<AnalysisResult> {
+    async fn process_stock_inner(&self, code: String, macro_context: Arc<str>) -> Option<AnalysisResult> {
         // 1. 获取数据
         let data = match self.fetch_and_save_data(&code).await {
             Ok(d) => d,
@@ -1334,7 +1334,7 @@ impl AnalysisPipeline {
         let data = Arc::new(data);
 
         // 3. 分析
-        let mc = if macro_context.is_empty() { None } else { Some(macro_context.as_str()) };
+        let mc = if macro_context.is_empty() { None } else { Some(&*macro_context) };
         let mut result = match self.analyze_stock(&code, &data, data.clone(), mc).await {
             Ok(r) => r,
             Err(e) => {

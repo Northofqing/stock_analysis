@@ -341,10 +341,7 @@ impl BacktestState {
         for i in 1..self.daily_values.len() {
             let (d_prev, v_prev) = &self.daily_values[i - 1];
             let (d_cur, v_cur) = &self.daily_values[i];
-            let key_prev = d_prev.format("%Y-%m-%d").to_string();
-            let key_cur = d_cur.format("%Y-%m-%d").to_string();
-
-            if let (Some(&bp), Some(&bc)) = (bench.closes.get(&key_prev), bench.closes.get(&key_cur)) {
+            if let (Some(&bp), Some(&bc)) = (bench.closes.get(&d_prev.date_naive()), bench.closes.get(&d_cur.date_naive())) {
                 if *v_prev > 0.0 && bp > 0.0 {
                     strat_rets.push((*v_cur - *v_prev) / *v_prev);
                     bench_rets.push((bc - bp) / bp);
@@ -627,11 +624,11 @@ pub struct BacktestSummary {
 #[derive(Debug, Clone)]
 pub struct BenchmarkSeries {
     pub name: String,
-    pub closes: HashMap<String, f64>,
+    pub closes: HashMap<chrono::NaiveDate, f64>,
 }
 
 impl BenchmarkSeries {
-    pub fn new(name: impl Into<String>, closes: HashMap<String, f64>) -> Self {
+    pub fn new(name: impl Into<String>, closes: HashMap<chrono::NaiveDate, f64>) -> Self {
         Self { name: name.into(), closes }
     }
 }
@@ -686,13 +683,13 @@ pub fn regime_breakdown(
     }
 
     // 基准按日期升序排列，便于按窗口取趋势
-    let mut bench_sorted: Vec<(String, f64)> =
-        bench.closes.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    let mut bench_sorted: Vec<(chrono::NaiveDate, f64)> =
+        bench.closes.iter().map(|(k, v)| (*k, *v)).collect();
     bench_sorted.sort_by(|a, b| a.0.cmp(&b.0));
-    let date_to_idx: HashMap<&str, usize> = bench_sorted
+    let date_to_idx: HashMap<chrono::NaiveDate, usize> = bench_sorted
         .iter()
         .enumerate()
-        .map(|(i, (d, _))| (d.as_str(), i))
+        .map(|(i, (d, _))| (*d, i))
         .collect();
 
     let window = 20usize;
@@ -708,11 +705,9 @@ pub fn regime_breakdown(
         if *v_prev <= 0.0 {
             continue;
         }
-        let key_prev = d_prev.format("%Y-%m-%d").to_string();
-        let key_cur = d_cur.format("%Y-%m-%d").to_string();
         let (Some(&idx_cur), Some(&idx_prev)) = (
-            date_to_idx.get(key_cur.as_str()),
-            date_to_idx.get(key_prev.as_str()),
+            date_to_idx.get(&d_cur.date_naive()),
+            date_to_idx.get(&d_prev.date_naive()),
         ) else {
             continue;
         };
@@ -1359,7 +1354,7 @@ mod tests {
             } else {
                 160.0 - (i - 30) as f64 * 2.0 // 下行
             };
-            closes.insert(dt.format("%Y-%m-%d").to_string(), close);
+            closes.insert(dt.date_naive(), close);
             dates.push(dt);
         }
         let bench = BenchmarkSeries::new("测试指数", closes);
