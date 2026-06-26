@@ -11,17 +11,12 @@
 //! - 报告文件落盘到 `reports/details/{date}_{code}.md`
 //! - [`run_and_save`] 默认走多角色路径
 
-use crate::agent::loop_runner::AgentRunner;
-use crate::agent::multi_agent::build_slices;
-use crate::agent::tool::Tool;
-use crate::agent::toolbelt::Toolbelt;
-use crate::agent::tools::FetchFinancialTool;
-use crate::agent::tools_chip::FetchChipDistributionTool;
-use crate::agent::tools_money_flow::FetchFundFlowTool;
-use crate::agent::tools_news::FetchNewsTool;
-use crate::agent::tools_research::FetchResearchTool;
-use crate::agent::tools_sector::FetchSectorTool;
-use crate::agent::validation::ValidationEngine;
+use crate::agent::{
+    AgentRunner, build_slices, Tool, Toolbelt,
+    FetchFinancialTool, FetchChipDistributionTool, FetchFundFlowTool,
+    FetchNewsTool, FetchResearchTool, FetchSectorTool,
+    ValidationEngine,
+};
 use crate::analyzer::GeminiAnalyzer;
 use crate::data_provider::service;
 use crate::data_provider::KlineData;

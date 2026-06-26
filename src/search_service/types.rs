@@ -1,6 +1,7 @@
 //! 搜索服务共享类型与抽象（原 search_service.rs 头部）
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use log::warn;
@@ -404,6 +405,36 @@ impl ApiKeyManager {
         *self.error_count.entry(key.to_string()).or_insert(0) += 1;
         let error_count = self.error_count.get(key).unwrap_or(&0);
         warn!("API Key {}... 错误计数: {}", &key[..8.min(key.len())], error_count);
+    }
+}
+
+/// 提取 key 或返回错误响应（消除重复的 lock→get_next_key→unwrap 模式）
+pub(crate) fn get_key_or_error(
+    key_manager: &Arc<Mutex<ApiKeyManager>>,
+    provider_name: &str,
+    query: &str,
+) -> Result<String, SearchResponse> {
+    let mut manager = key_manager.lock().unwrap();
+    manager.get_next_key().ok_or_else(|| {
+        SearchResponse::error(
+            query.to_string(),
+            provider_name.to_string(),
+            format!("{provider_name} 未配置 API Key"),
+        )
+    })
+}
+
+/// 记录 API 调用结果到 key_manager
+pub(crate) fn record_key_result(
+    key_manager: &Arc<Mutex<ApiKeyManager>>,
+    api_key: &str,
+    success: bool,
+) {
+    let mut manager = key_manager.lock().unwrap();
+    if success {
+        manager.record_success(api_key);
+    } else {
+        manager.record_error(api_key);
     }
 }
 

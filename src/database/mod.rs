@@ -38,6 +38,7 @@ pub struct DatabaseManager {
 static DB_INSTANCE: OnceCell<DatabaseManager> = OnceCell::new();
 
 
+pub mod repository;
 mod concepts;
 mod kline;
 mod lhb;

@@ -1,5 +1,6 @@
 // A股自选股智能分析系统 - 库入口
 
+pub mod errors;
 pub mod config;
 pub mod breakout;
 pub mod portfolio;
