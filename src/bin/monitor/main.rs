@@ -276,7 +276,8 @@ async fn push_virtual_next_day_review_if_needed() {
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     dotenvy::dotenv().ok();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format(|buf, record| writeln!(buf, "[{} {}] {}", chrono::Local::now().format("%H:%M:%S"), record.level(), record.args()))
@@ -289,12 +290,12 @@ fn main() {
         std::env::set_var("MAGICLAW_DB_PATH", &db_path);
     }
     let _ = stock_analysis::database::DatabaseManager::init(Some(std::path::PathBuf::from(&db_path)));
-    // 加载热配置（toml 不可用时回退代码默认值）
+    // 加载热配置
     stock_analysis::config::load_all();
     let test_mode = std::env::args().any(|a| a == "--test");
     let review_mode = std::env::args().any(|a| a == "--review");
 
-    // AGENTS 2.5: 显式标记交易环境，供底层写入守卫执行双向隔离。
+    // 显式标记交易环境，供底层写入守卫执行双向隔离。
     std::env::set_var("STOCK_ENV_MODE", if test_mode { "test" } else { "prod" });
 
     log::info!("实盘监控启动 | {} | 当前: {} | 模式: {}",
@@ -303,17 +304,28 @@ fn main() {
         if test_mode { "测试" } else if review_mode { "复盘" } else { "正常" },
     );
 
-    let rt = tokio::runtime::Runtime::new().expect("创建 tokio runtime 失败");
+    // 事件总线 — 允许多个消费者独立订阅监控事件
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<String>(256);
+
     if test_mode {
-        rt.block_on(run_test_scan());
+        run_test_scan().await;
     } else if review_mode {
-        rt.block_on(run_review_only());
+        run_review_only().await;
     } else {
-        rt.block_on(async {
-            // 两条独立扫描线：价格（仅交易时段）+ 消息（独立窗口）
-            // 用 join! 而非 spawn（GeminiAnalyzer 含 RefCell 不满足 Send）
+        let main_loops = async {
             tokio::join!(monitor_loop(), news_monitor_loop());
-        });
+        };
+
+        let _ = event_tx; // TODO: wire into scanner→detector→alert pipeline
+
+        tokio::select! {
+            _ = main_loops => {},
+            _ = tokio::signal::ctrl_c() => {
+                log::warn!("收到 SIGINT，正在优雅关闭监控...");
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                log::info!("监控已安全关闭");
+            }
+        }
     }
 }
 
@@ -321,20 +333,18 @@ fn check_enabled() -> bool {
     std::env::var("MONITOR_ENABLED").unwrap_or_default().to_lowercase() == "true"
 }
 
-async fn push_wechat(text: &str) {
+async fn push_wechat(text: &str) -> bool {
     let send_type = resolve_send_type();
     let send_transport = resolve_send_transport(send_type);
 
     if matches!(send_transport, MessageSendTransport::Cli) {
-        push_via_magiclaw_cli(send_type, text).await;
-        return;
+        return push_via_magiclaw_cli(send_type, text).await;
     }
 
     if matches!(send_type, MessageSendType::Feishu)
         && matches!(send_transport, MessageSendTransport::Http)
     {
-        push_feishu_via_http(text).await;
-        return;
+        return push_feishu_via_http(text).await;
     }
 
     log::info!(
@@ -357,7 +367,7 @@ async fn push_wechat(text: &str) {
         Ok(c) => c,
         Err(e) => {
             log::error!("[{}] 创建 HTTP 客户端失败: {}", send_type.label(), e);
-            return;
+            return false;
         }
     };
 
@@ -370,7 +380,7 @@ async fn push_wechat(text: &str) {
         }
         Err(e) => {
             log::error!("[{}] daemon 不可用: {}", send_type.label(), e);
-            return;
+            return false;
         }
     }
 
@@ -378,7 +388,7 @@ async fn push_wechat(text: &str) {
         Ok(v) => v,
         Err(e) => {
             log::error!("[{}] 获取 daemon 动态鉴权 token 失败: {}", send_type.label(), e);
-            return;
+            return false;
         }
     };
 
@@ -400,12 +410,12 @@ async fn push_wechat(text: &str) {
                 }
                 Err(issue_err) => {
                     log::error!("[{}] daemon 鉴权预检失败: {}；自动续签失败: {}", send_type.label(), first_err, issue_err);
-                    return;
+                    return false;
                 }
             }
         } else {
             log::error!("[{}] daemon 鉴权预检失败: {}", send_type.label(), first_err);
-            return;
+            return false;
         }
     }
 
@@ -413,7 +423,7 @@ async fn push_wechat(text: &str) {
         Ok(v) => v,
         Err(e) => {
             log::error!("[{}] 解析收件人失败: {}", send_type.label(), e);
-            return;
+            return false;
         }
     };
     let to_log = to.as_deref().unwrap_or("<magiclaw-default>");
@@ -421,6 +431,7 @@ async fn push_wechat(text: &str) {
     match send_via_magiclaw_daemon(&client, &api_base, &active_token, send_type, to.as_deref(), text).await {
         Ok(()) => {
             log::info!("[{}] 推送成功 | to={}", send_type.label(), to_log);
+            true
         }
         Err(first_err) => {
             if is_unauthorized_error(&first_err) {
@@ -434,29 +445,35 @@ async fn push_wechat(text: &str) {
                         match send_via_magiclaw_daemon(&client, &api_base, &next.token, send_type, to.as_deref(), text).await {
                             Ok(()) => {
                                 log::info!("[{}] 推送成功 | to={}", send_type.label(), to_log);
+                                true
                             }
-                            Err(retry_err) => log::error!("[{}] 推送失败: {}", send_type.label(), retry_err),
+                            Err(retry_err) => {
+                                log::error!("[{}] 推送失败: {}", send_type.label(), retry_err);
+                                false
+                            }
                         }
                     }
                     Err(issue_err) => {
                         log::error!("[{}] 推送失败: {}；自动续签失败: {}", send_type.label(), first_err, issue_err);
+                        false
                     }
                 }
             } else {
                 log::error!("[{}] 推送失败: {}", send_type.label(), first_err);
+                false
             }
         }
     }
 }
 
-async fn push_feishu_via_http(text: &str) {
+async fn push_feishu_via_http(text: &str) -> bool {
     let url = match resolve_feishu_webhook_url() {
         Some(v) => v,
         None => {
             log::error!(
                 "[飞书] 推送失败: 未配置 FEISHU_WEBHOOK_URL（或 MAGICLAW_FEISHU_WEBHOOK_URL）"
             );
-            return;
+            return false;
         }
     };
 
@@ -470,7 +487,7 @@ async fn push_feishu_via_http(text: &str) {
         Ok(v) => v,
         Err(e) => {
             log::error!("[飞书] 创建 HTTP 客户端失败: {}", e);
-            return;
+            return false;
         }
     };
 
@@ -485,7 +502,7 @@ async fn push_feishu_via_http(text: &str) {
         Ok(v) => v,
         Err(e) => {
             log::error!("[飞书] 推送失败: 调用 webhook 失败: {}", e);
-            return;
+            return false;
         }
     };
 
@@ -493,7 +510,7 @@ async fn push_feishu_via_http(text: &str) {
     let body_text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
         log::error!("[飞书] 推送失败: webhook HTTP {}: {}", status, body_text);
-        return;
+        return false;
     }
 
     let parsed = serde_json::from_str::<serde_json::Value>(&body_text).ok();
@@ -510,13 +527,14 @@ async fn push_feishu_via_http(text: &str) {
 
     if ok_by_status_code || ok_by_code {
         log::info!("[飞书] 推送成功 | via=http");
-        return;
+        return true;
     }
 
     log::error!("[飞书] 推送失败: webhook 返回非成功体: {}", body_text);
+    false
 }
 
-async fn push_via_magiclaw_cli(send_type: MessageSendType, text: &str) {
+async fn push_via_magiclaw_cli(send_type: MessageSendType, text: &str) -> bool {
     let to = match send_type {
         MessageSendType::Wechat => None,
         MessageSendType::Feishu => match resolve_feishu_target() {
@@ -525,7 +543,7 @@ async fn push_via_magiclaw_cli(send_type: MessageSendType, text: &str) {
                 log::error!(
                     "[飞书] 解析收件人失败: 飞书发送缺少收件人，请设置 FEISHU_TO（或 MAGICLAW_FEISHU_TO / FEISHU_CHAT_ID / FEISHU_OPEN_ID / FEISHU_USER_ID / FEISHU_EMAIL）"
                 );
-                return;
+                return false;
             }
         },
     };
@@ -591,7 +609,7 @@ async fn push_via_magiclaw_cli(send_type: MessageSendType, text: &str) {
         Ok(v) => v,
         Err(e) => {
             log::error!("[飞书] 调用 magiclaw send 失败(magiclaw: {}): {}", magiclaw_bin, e);
-            return;
+            return false;
         }
     };
 
@@ -613,7 +631,7 @@ async fn push_via_magiclaw_cli(send_type: MessageSendType, text: &str) {
                 detail
             );
         }
-        return;
+        return true;
     }
 
     let stderr_tail = tail_lines(&stderr, 8);
@@ -633,6 +651,40 @@ async fn push_via_magiclaw_cli(send_type: MessageSendType, text: &str) {
             "".to_string()
         }
     );
+    false
+}
+
+fn summarize_push_text(text: &str, max_chars: usize) -> String {
+    let one_line = text.replace('\n', " | ");
+    let mut out = String::new();
+    let mut count = 0usize;
+    for ch in one_line.chars() {
+        if count >= max_chars {
+            out.push_str("...");
+            break;
+        }
+        out.push(ch);
+        count += 1;
+    }
+    out
+}
+
+fn evaluate_opportunity_push_skip_reason(opp_text: &str) -> Option<&'static str> {
+    // 只对“整轮无有效产业链输出”的明确文案做跳过，避免
+    // “值得关注：暂无通过量能/趋势确认候选”这类正常结果被误判为应跳过。
+    if opp_text.contains("暂无最新快讯") {
+        return Some("contains:暂无最新快讯");
+    }
+    if opp_text.contains("当前快讯未命中已知产业链") {
+        return Some("contains:当前快讯未命中已知产业链");
+    }
+    if opp_text.contains("当前产业链信号可信度不足（已降级观察）") {
+        return Some("contains:当前产业链信号可信度不足");
+    }
+    if opp_text.contains("无可用标的") {
+        return Some("contains:无可用标的");
+    }
+    None
 }
 
 fn resolve_send_type() -> MessageSendType {
@@ -1917,14 +1969,30 @@ async fn news_monitor_loop() {
                 let scan = stock_analysis::opportunity::run_opportunity_scan().await;
                 // 仅在有实际机会时推送；空结果（暂无快讯/未命中/无可用标的）只记日志不刷屏。
                 let opp_text = &scan.chain_text;
-                if !opp_text.contains("暂无") && !opp_text.contains("无可用标的") && !opp_text.contains("未命中") {
+                if let Some(reason) = evaluate_opportunity_push_skip_reason(opp_text) {
+                    log::info!(
+                        "[产业链] 跳过推送 | reason={} | preview={}",
+                        reason,
+                        summarize_push_text(opp_text, 120)
+                    );
+                } else {
                     log::info!("[产业链] {}", opp_text);
-                    push_wechat(opp_text).await;
+                    let ok = push_wechat(opp_text).await;
+                    log::info!(
+                        "[产业链] 推送结果 | ok={} | preview={}",
+                        ok,
+                        summarize_push_text(opp_text, 120)
+                    );
                 }
                 // 持仓影响分开推送
                 if !scan.impact_text.is_empty() {
                     log::info!("[持仓影响] {}", scan.impact_text);
-                    push_wechat(&scan.impact_text).await;
+                    let ok = push_wechat(&scan.impact_text).await;
+                    log::info!(
+                        "[持仓影响] 推送结果 | ok={} | preview={}",
+                        ok,
+                        summarize_push_text(&scan.impact_text, 120)
+                    );
                 }
             });
         }
@@ -2882,6 +2950,25 @@ fn fetch_sina_quotes(codes: &[String]) -> Vec<stock_analysis::market_data::TopSt
 
 /// 拉取上证指数涨跌幅（新浪 API）
 fn fetch_sh_index_change() -> f64 {
+    fn is_reasonable_index_change(change_pct: f64) -> bool {
+        change_pct.is_finite() && change_pct.abs() <= 20.0
+    }
+
+    if let Ok(analyzer) = stock_analysis::market_analyzer::MarketAnalyzer::new(None) {
+        if let Ok(overview) = analyzer.get_market_overview() {
+            if let Some(sh_index) = overview.get_sh_index() {
+                if is_reasonable_index_change(sh_index.change_pct) {
+                    return sh_index.change_pct;
+                } else {
+                    log::warn!(
+                        "[收盘总结] 上证指数涨跌幅异常，已忽略概览数据: {:.2}%",
+                        sh_index.change_pct
+                    );
+                }
+            }
+        }
+    }
+
     let client = match reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build() { Ok(c) => c, Err(_) => return 0.0 };
@@ -2899,7 +2986,18 @@ fn fetch_sh_index_change() -> f64 {
             if fields.len() >= 3 {
                 let price: f64 = fields[1].parse().unwrap_or(0.0);
                 let prev: f64 = fields[2].parse().unwrap_or(0.0);
-                if prev > 0.0 { return (price - prev) / prev * 100.0; }
+                if prev > 0.0 {
+                    let change_pct = (price - prev) / prev * 100.0;
+                    if is_reasonable_index_change(change_pct) {
+                        return change_pct;
+                    }
+                    log::warn!(
+                        "[收盘总结] 新浪上证指数涨跌幅异常，已回退为 0: {:.2}% (price={:.2}, prev={:.2})",
+                        change_pct,
+                        price,
+                        prev
+                    );
+                }
             }
         }
     }

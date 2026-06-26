@@ -64,41 +64,49 @@ async fn main() -> Result<()> {
         }
     }
 
-    // 模式分派
-    let env_true = |k: &str| std::env::var(k).unwrap_or_default().to_lowercase() == "true";
+    // 模式分派 — 包裹在 graceful shutdown 中
+    let main_work = async {
+        let env_true = |k: &str| std::env::var(k).unwrap_or_default().to_lowercase() == "true";
 
-    // 定时模式优先：放在最前面，启动时不预先装配股票列表。
-    // 改为每次定时执行时重新读取配置（.env）并重新装配，
-    // 使运行过程中对 .env / 股票池的修改即时生效。
-    if args.schedule || env_true("SCHEDULE_ENABLED") {
-        app::run_scheduled_analysis(&args).await?;
+        if args.schedule || env_true("SCHEDULE_ENABLED") {
+            app::run_scheduled_analysis(&args).await?;
+            info!("程序执行完成");
+            return Ok(());
+        }
+
+        if args.chain_analysis {
+            app::run_chain_analysis_mode(!args.no_notify).await?;
+            info!("程序执行完成");
+            return Ok(());
+        }
+
+        let (stock_codes, limit_up_codes, macro_ctx) = app::build_stock_list(&args).await?;
+        info!(
+            "待分析股票（共 {} 只）: {:?}",
+            stock_codes.len(),
+            stock_codes
+        );
+
+        if args.lhb_mode || env_true("LHB_MODE") {
+            app::run_lhb_analysis(&args).await?;
+        } else if args.market_review || env_true("MARKET_REVIEW_ENABLED") {
+            info!("模式: 仅大盘复盘");
+            app::run_market_review_only().await?;
+        } else {
+            app::run_analysis(&stock_codes, &args, &macro_ctx, limit_up_codes).await?;
+        }
+
         info!("程序执行完成");
-        return Ok(());
+        Ok(())
+    };
+
+    tokio::select! {
+        result = main_work => { result }
+        _ = tokio::signal::ctrl_c() => {
+            log::warn!("收到 SIGINT，正在优雅关闭...");
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            info!("系统已安全关闭");
+            Ok(())
+        }
     }
-
-    if args.chain_analysis {
-        app::run_chain_analysis_mode(!args.no_notify).await?;
-        info!("程序执行完成");
-        return Ok(());
-    }
-
-    // 非定时模式：启动时装配一次待分析股票列表
-    let (stock_codes, limit_up_codes, macro_ctx) = app::build_stock_list(&args).await?;
-    info!(
-        "待分析股票（共 {} 只）: {:?}",
-        stock_codes.len(),
-        stock_codes
-    );
-
-    if args.lhb_mode || env_true("LHB_MODE") {
-        app::run_lhb_analysis(&args).await?;
-    } else if args.market_review || env_true("MARKET_REVIEW_ENABLED") {
-        info!("模式: 仅大盘复盘");
-        app::run_market_review_only().await?;
-    } else {
-        app::run_analysis(&stock_codes, &args, &macro_ctx, limit_up_codes).await?;
-    }
-
-    info!("程序执行完成");
-    Ok(())
 }

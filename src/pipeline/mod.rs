@@ -13,6 +13,7 @@ mod position_tracker;
 mod price_stats;
 mod reporting;
 pub mod score_breakdown;
+pub mod section_utils;
 mod summary_notify;
 mod technical_report;
 mod trade_type;
@@ -282,129 +283,6 @@ fn key_stock_priority(r: &AnalysisResult) -> Option<i32> {
     } else {
         None
     }
-}
-
-/// 把深度研判 markdown 合并进标准 `analysis_summary`：
-/// 保留「# 技术分析」部分，用机构级深度研判替换原「# AI分析」/「# 相关新闻」段
-/// （深度研判已自带消息面/板块等维度）。
-fn merge_deep_analysis(standard: &str, deep_md: &str) -> String {
-    let cut = ["\n# AI分析", "\n# 相关新闻"]
-        .iter()
-        .filter_map(|m| standard.find(m))
-        .min();
-    let tech_part = match cut {
-        Some(idx) => &standard[..idx],
-        None => standard,
-    };
-    format!(
-        "{}\n\n# 🏛️ 机构级深度研判（多智能体）\n\n{}\n",
-        tech_part.trim_end(),
-        deep_md.trim()
-    )
-}
-
-/// 深度研判报告落盘备份到 `reports/details/{date}_{code}.md`。
-fn save_deep_report(code: &str, content: &str) -> std::io::Result<()> {
-    let date = chrono::Local::now().format("%Y%m%d").to_string();
-    let dir = std::path::PathBuf::from("reports/details");
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join(format!("{}_{}.md", date, code)), content)
-}
-
-/// 规范化 AI 输出的章节标题：统一为 `## 【XX】` 形式。
-///
-/// 处理两类常见 AI 偏差：
-/// 1. 输出 `【XX】` 但忘记加 `##` 前缀；
-/// 2. 输出 `## XX`（去掉了书名号），导致与其它股票渲染样式不一致。
-///
-/// 已知章节：宏观影响 / 消息面 / 技术面 / 主力资金 / 基本面 /
-///   操作建议（可带「含买入价/目标价/止损位」后缀）/ 风险提示 / ⚠️ 逆势布局逻辑。
-const AI_SECTIONS: &[&str] = &[
-    "宏观影响",
-    "消息面",
-    "技术面",
-    "主力资金",
-    "基本面",
-    "操作建议",
-    "风险提示",
-    "逆势布局逻辑",
-];
-
-/// 尝试把一行解析为 AI 章节标题行。
-///
-/// 返回 `(canonical, full_name, content)`：
-/// - `canonical`：命中的标准章节名（来自 `AI_SECTIONS`，用于去重判断）
-/// - `full_name`：标题方括号内的完整文本（保留 emoji / 后缀，如 "操作建议（含买入价…）"）
-/// - `content`：与标题写在同一行时，标题之后的正文（可能为空）
-fn parse_ai_section_line(trimmed: &str) -> Option<(&'static str, String, String)> {
-    let has_hash = trimmed.starts_with('#');
-    let title = trimmed.trim_start_matches('#').trim();
-
-    // 形式 A：`【名称】可选正文`
-    if let Some(rest) = title.strip_prefix('【') {
-        let end = rest.find('】')?;
-        let name = rest[..end].trim();
-        let content = rest[end + '】'.len_utf8()..].trim();
-        for s in AI_SECTIONS {
-            if name.contains(s) {
-                return Some((s, name.to_string(), content.to_string()));
-            }
-        }
-        return None;
-    }
-
-    // 形式 B：`## 名称`（缺少方括号），仅在带 `#` 前缀时才视为标题，避免误伤正文
-    if has_hash {
-        for s in AI_SECTIONS {
-            if title.contains(s) {
-                return Some((s, title.to_string(), String::new()));
-            }
-        }
-    }
-
-    None
-}
-
-/// 规范化 AI 输出的章节结构：
-/// - 统一为 `## 【章节】` 标题
-/// - 去重：连续重复的同一章节标题只保留一个（修复模型把标签既单独成行、又内嵌到正文行首导致的重复标题）
-/// - 将与标题写在同一行的正文拆分为独立段落，避免正文被当作标题渲染
-fn normalize_ai_sections(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + 64);
-    let mut last_section: Option<&'static str> = None;
-
-    for raw_line in text.lines() {
-        let trimmed = raw_line.trim();
-        if trimmed.is_empty() {
-            out.push('\n');
-            continue;
-        }
-
-        if let Some((canonical, name, content)) = parse_ai_section_line(trimmed) {
-            // 仅当与上一次输出的章节不同才写标题（连续重复标题会被合并）
-            if last_section != Some(canonical) {
-                if !out.is_empty() && !out.ends_with("\n\n") {
-                    if !out.ends_with('\n') {
-                        out.push('\n');
-                    }
-                    out.push('\n');
-                }
-                out.push_str("## 【");
-                out.push_str(&name);
-                out.push_str("】\n");
-                last_section = Some(canonical);
-            }
-            if !content.is_empty() {
-                out.push_str(&content);
-                out.push('\n');
-            }
-            continue;
-        }
-
-        out.push_str(raw_line);
-        out.push('\n');
-    }
-    out
 }
 
 impl AnalysisPipeline {
@@ -918,7 +796,7 @@ impl AnalysisPipeline {
             {
                 Ok(ai_result) => {
                     analysis_content.push_str("\n# AI分析\n\n");
-                    analysis_content.push_str(&normalize_ai_sections(&ai_result));
+                    analysis_content.push_str(&self::section_utils::normalize_ai_sections(&ai_result));
                     if let Some(ref news) = news_context {
                         analysis_content.push_str("\n\n# 相关新闻\n\n");
                         analysis_content.push_str(news);
@@ -1606,8 +1484,8 @@ impl AnalysisPipeline {
             let Some(md) = md else { continue };
             let code = results[idx].code.clone();
             results[idx].analysis_summary =
-                merge_deep_analysis(&results[idx].analysis_summary, &md);
-            if let Err(e) = save_deep_report(&code, &results[idx].analysis_summary) {
+                self::section_utils::merge_deep_analysis(&results[idx].analysis_summary, &md);
+            if let Err(e) = self::section_utils::save_deep_report(&code, &results[idx].analysis_summary) {
                 warn!("[深度研判] {} 落盘失败: {}", code, e);
             }
             info!("[深度研判] ✓ {} 已合并进报告", code);
@@ -1805,7 +1683,7 @@ impl AnalysisPipeline {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_ai_sections;
+    use super::section_utils::normalize_ai_sections;
 
     #[test]
     fn normalize_bare_headings_into_brackets() {
