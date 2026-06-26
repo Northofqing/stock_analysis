@@ -12,6 +12,7 @@ mod multi_timeframe;
 mod position_tracker;
 mod price_stats;
 mod reporting;
+pub mod result_types;
 pub mod score_breakdown;
 pub mod section_utils;
 mod summary_notify;

@@ -189,19 +189,27 @@ impl DataFetcherManager {
                 Ok(mut data) if !data.is_empty() => {
                     log::info!("成功从 {} 获取到 {} 条数据", provider.name(), data.len());
 
-                    // 补充财报数据（独立于行情数据源，来自东方财富财报接口）
-                    let fin = financials::fetch_with_fallback_blocking(
-                        &self.financials_client,
-                        code,
-                    );
+                    // 四个补充数据源并行抓取（独立 HTTP 调用）
+                    let (fin, vh, cs, ib) = std::thread::scope(|s| {
+                        let client = &self.financials_client;
+                        let fin_h = s.spawn(|| financials::fetch_with_fallback_blocking(client, code));
+                        let vh_h = s.spawn(|| valuation_history::fetch_blocking(client, code));
+                        let cs_h = s.spawn(|| consensus::fetch_blocking(client, code));
+                        let ib_h = s.spawn(|| industry::fetch_blocking(client, code));
+                        (
+                            fin_h.join().unwrap_or_default(),
+                            vh_h.join().unwrap_or_default(),
+                            cs_h.join().unwrap_or_default(),
+                            ib_h.join().unwrap_or_default(),
+                        )
+                    });
+
                     if fin.any() {
                         if let Some(latest) = data.first_mut() {
-                            // 仅填充行情数据源没给出的字段（Option::or），避免覆盖
                             latest.eps = latest.eps.or(fin.eps);
                             latest.roe = latest.roe.or(fin.roe);
                             latest.revenue_yoy = latest.revenue_yoy.or(fin.revenue_yoy);
-                            latest.net_profit_yoy =
-                                latest.net_profit_yoy.or(fin.net_profit_yoy);
+                            latest.net_profit_yoy = latest.net_profit_yoy.or(fin.net_profit_yoy);
                             latest.gross_margin = latest.gross_margin.or(fin.gross_margin);
                             latest.net_margin = latest.net_margin.or(fin.net_margin);
                             if !fin.history.is_empty() {
@@ -210,28 +218,21 @@ impl DataFetcherManager {
                         }
                     }
 
-                    // 估值历史分位（PE/PB 近 3 年）
-                    if let Some(vh) = valuation_history::fetch_blocking(
-                        &self.financials_client,
-                        code,
-                    ) {
+                    if let Some(vh) = vh {
                         if let Some(latest) = data.first_mut() {
-                            // 同时填充为空的 PE/PB 点估值
                             latest.pe_ratio = latest.pe_ratio.or(vh.current_pe);
                             latest.pb_ratio = latest.pb_ratio.or(vh.current_pb);
                             latest.valuation_history = Some(vh);
                         }
                     }
 
-                    // 卖方一致预期（近 6 个月研报）
-                    if let Some(cs) = consensus::fetch_blocking(&self.financials_client, code) {
+                    if let Some(cs) = cs {
                         if let Some(latest) = data.first_mut() {
                             latest.consensus = Some(cs);
                         }
                     }
 
-                    // 行业横向对标（同业 PE/PB/ROE 百分位）
-                    if let Some(ib) = industry::fetch_blocking(&self.financials_client, code) {
+                    if let Some(ib) = ib {
                         if let Some(latest) = data.first_mut() {
                             latest.industry = Some(ib);
                         }
