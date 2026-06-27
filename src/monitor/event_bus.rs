@@ -10,14 +10,38 @@ use once_cell::sync::OnceCell;
 use tokio::sync::broadcast;
 
 /// 监控域事件。新增事件类型不影响既有消费者（消费者按需匹配）。
+///
+/// 修复 P3.6: 之前只 3 种事件 (Alert/OpportunityScan/Info)
+/// 量化分析师要求: 至少 6 种以支持模块解耦:
+///   - Alert: 告警
+///   - OpportunityScan: 机会扫描
+///   - OrderUpdate: 订单状态变化 (持仓/下单)
+///   - PriceUpdate: 价格异常变动 (涨跌停/异动)
+///   - DataQuality: 数据陈旧/缺失/异常
+///   - Info: 通用信息
 #[derive(Debug, Clone)]
 pub enum MonitorEvent {
     /// 一条告警被推送（含是否成功送达）
     Alert { title: String, success: bool },
     /// 机会扫描完成，附候选数量
     OpportunityScan { candidates: usize },
+    /// 修复 P3.6: 订单状态变化 (持仓建立/平仓/止损触发)
+    OrderUpdate { code: String, action: String, shares: u64 },
+    /// 修复 P3.6: 价格异常变动 (涨跌停/异动/突破)
+    PriceUpdate { code: String, change_pct: f64, reason: String },
+    /// 修复 P3.6: 数据质量事件 (陈旧/缺失/异常)
+    /// 用于 P3.5 之后的"指数 ATR 缺失"等数据降级告警
+    DataQuality { source: String, issue: String, severity: DataQualityLevel },
     /// 通用信息事件
     Info(String),
+}
+
+/// 数据质量严重度
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataQualityLevel {
+    Warn,   // 数据可用但有偏差 (e.g. ATR 缺失用静态回退)
+    Error,  // 数据不可用, 功能降级
+    Fatal,  // 数据源全挂, 必须停机
 }
 
 impl MonitorEvent {
@@ -26,6 +50,9 @@ impl MonitorEvent {
         match self {
             MonitorEvent::Alert { .. } => "alert",
             MonitorEvent::OpportunityScan { .. } => "opportunity_scan",
+            MonitorEvent::OrderUpdate { .. } => "order_update",
+            MonitorEvent::PriceUpdate { .. } => "price_update",
+            MonitorEvent::DataQuality { .. } => "data_quality",
             MonitorEvent::Info(_) => "info",
         }
     }

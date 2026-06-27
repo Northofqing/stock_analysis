@@ -350,6 +350,26 @@ async fn main() {
                         MonitorEvent::OpportunityScan { candidates } => {
                             log::info!("[event_bus] 机会扫描完成，候选 {} 个", candidates);
                         }
+                        // 修复 P3.6: 处理新事件类型
+                        MonitorEvent::OrderUpdate { code, action, shares } => {
+                            log::info!("[event_bus] 订单 {} {}({})", action, code, shares);
+                        }
+                        MonitorEvent::PriceUpdate { code, change_pct, reason } => {
+                            log::info!("[event_bus] 价格变动 {}({:+.2}%) {}", code, change_pct, reason);
+                        }
+                        MonitorEvent::DataQuality { source, issue, severity } => {
+                            match severity {
+                                stock_analysis::monitor::event_bus::DataQualityLevel::Warn => {
+                                    log::warn!("[event_bus] 数据质量 {}: {}", source, issue);
+                                }
+                                stock_analysis::monitor::event_bus::DataQualityLevel::Error => {
+                                    log::error!("[event_bus] 数据质量 {}: {} (功能降级)", source, issue);
+                                }
+                                stock_analysis::monitor::event_bus::DataQualityLevel::Fatal => {
+                                    log::error!("[event_bus] 数据质量 {}: {} (致命)", source, issue);
+                                }
+                            }
+                        }
                         MonitorEvent::Info(msg) => log::info!("[event_bus] {}", msg),
                     },
                     // Lagged：消费过慢丢失部分事件，记录后继续

@@ -133,6 +133,83 @@ pub fn load_ledger(since: NaiveDate) -> Result<Vec<LedgerEntry>, String> {
     }).collect())
 }
 
+/// 修复 P3.9: 实盘 rolling Sharpe (基于 ledger 净值)
+/// 计算最近 N 日的年化 Sharpe, rf=0.03 (与 sharpe_calculator 一致)
+/// 返回 None 当数据 < 30 日 (样本不足)
+pub fn live_rolling_sharpe(ledger: &[LedgerEntry], window: usize) -> Option<f64> {
+    if ledger.len() < 30 {
+        return None;
+    }
+    let recent = &ledger[ledger.len().saturating_sub(window)..];
+    if recent.len() < 2 {
+        return None;
+    }
+    let mut returns = Vec::new();
+    for w in recent.windows(2) {
+        if w[0].total_value > 0.0 {
+            returns.push((w[1].total_value - w[0].total_value) / w[0].total_value);
+        }
+    }
+    if returns.len() < 5 {
+        return None;
+    }
+    let mean: f64 = returns.iter().sum::<f64>() / returns.len() as f64;
+    let variance: f64 = returns.iter()
+        .map(|r| (r - mean).powi(2))
+        .sum::<f64>() / returns.len() as f64;
+    let std = variance.sqrt();
+    if std <= 0.0 {
+        return None;
+    }
+    let rf_daily = 0.03 / 252.0;
+    let ann_factor = 252.0_f64.sqrt();
+    Some((mean - rf_daily) * ann_factor / std)
+}
+
+/// 修复 P3.10: 策略相关性矩阵
+/// 输入多个策略的日收益率序列 (Vec<Vec<f64>>), 输出 (n, n) 相关性矩阵
+/// 量化分析师要求: 多策略组合时, 相关性 > 0.7 的策略对要降权
+pub fn strategy_correlation_matrix(daily_returns: &[Vec<f64>]) -> Vec<Vec<f64>> {
+    let n = daily_returns.len();
+    let mut matrix = vec![vec![0.0; n]; n];
+    for i in 0..n {
+        for j in 0..n {
+            if i == j {
+                matrix[i][j] = 1.0;
+            } else {
+                matrix[i][j] = pearson_corr(&daily_returns[i], &daily_returns[j]);
+            }
+        }
+    }
+    matrix
+}
+
+fn pearson_corr(xs: &[f64], ys: &[f64]) -> f64 {
+    let n = xs.len().min(ys.len());
+    if n < 5 {
+        return 0.0;
+    }
+    let (xs, ys) = (&xs[..n], &ys[..n]);
+    let mean_x: f64 = xs.iter().sum::<f64>() / n as f64;
+    let mean_y: f64 = ys.iter().sum::<f64>() / n as f64;
+    let mut cov = 0.0;
+    let mut var_x = 0.0;
+    let mut var_y = 0.0;
+    for k in 0..n {
+        let dx = xs[k] - mean_x;
+        let dy = ys[k] - mean_y;
+        cov += dx * dy;
+        var_x += dx * dx;
+        var_y += dy * dy;
+    }
+    let denom = (var_x * var_y).sqrt();
+    if denom <= 0.0 {
+        0.0
+    } else {
+        cov / denom
+    }
+}
+
 // ── diesel raw query row types ──
 
 #[derive(QueryableByName, Debug)]
