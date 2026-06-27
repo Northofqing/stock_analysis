@@ -4,7 +4,7 @@ screener_interval_min = 5
 opportunity_scan_interval_min = 10
 # 消息通知窗口（默认 08:00-24:00）
 news_window_start_hour = 8
-news_window_end_hour = 22
+news_window_end_hour = 24
 
 # 主题新闻去同质化配置（search_topic）
 topic_search_intent_count = 6
@@ -15,7 +15,7 @@ topic_mmr_history_penalty = 1.4
 topic_history_window_hours = 72
 topic_history_memory_size = 160
 topic_history_db_limit = 400
-topic_news_max_age_days = 3    # 主题/Web 搜索新闻新鲜度窗口（天），超过即丢弃（AGENTS 2.4）
+topic_news_max_age_days = 5    # 主题/Web 搜索新闻新鲜度窗口（天），超过即丢弃（AGENTS 2.4）
 
 # ── 数据新鲜度阈值（AGENTS 2.4） ──
 dq_quote_stale_sec = 5         # 实时行情
