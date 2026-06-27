@@ -39,6 +39,7 @@ static DB_INSTANCE: OnceCell<DatabaseManager> = OnceCell::new();
 
 
 pub mod repository;
+pub mod factor_snapshot;
 mod concepts;
 mod kline;
 mod lhb;
@@ -438,6 +439,29 @@ impl DatabaseManager {
                 UNIQUE(stock_code, concept_name)
             )
             "#,
+        )
+        .execute(&mut *conn)?;
+
+        // 创建 factor_snapshot 表（修复 QUANT_ANALYST_REVIEW §1.5）
+        diesel::sql_query(
+            r#"
+            CREATE TABLE IF NOT EXISTS factor_snapshot (
+                code TEXT NOT NULL,
+                snapshot_date TEXT NOT NULL,
+                pe_ttm REAL,
+                pb REAL,
+                roe REAL,
+                market_cap REAL,
+                turnover_rate REAL,
+                source TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (code, snapshot_date)
+            )
+            "#,
+        )
+        .execute(&mut *conn)?;
+        diesel::sql_query(
+            "CREATE INDEX IF NOT EXISTS idx_factor_snapshot_date ON factor_snapshot(snapshot_date)",
         )
         .execute(&mut *conn)?;
 
