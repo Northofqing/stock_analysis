@@ -16,6 +16,12 @@ pub enum NotificationChannel {
     Custom,
     /// Server酱（普通微信推送）
     ServerChan,
+    /// 钉钉 (修复 P0-0, 政企客户首选)
+    DingTalk,
+    /// Slack (修复 P0-0, 海外 dev 团队)
+    Slack,
+    /// Discord (修复 P0-0, 海外 quant 社区)
+    Discord,
 }
 
 impl NotificationChannel {
@@ -29,6 +35,9 @@ impl NotificationChannel {
             Self::Pushover => "Pushover",
             Self::Custom => "自定义Webhook",
             Self::ServerChan => "Server酱(微信)",
+            Self::DingTalk => "钉钉",
+            Self::Slack => "Slack",
+            Self::Discord => "Discord",
         }
     }
 }
@@ -69,6 +78,15 @@ pub struct NotificationConfig {
     // Server酱（普通微信推送）
     pub server_chan_key: Option<String>,
 
+    // 钉钉 (P0-0)
+    pub dingtalk_webhook_url: Option<String>,
+
+    // Slack (P0-0)
+    pub slack_webhook_url: Option<String>,
+
+    // Discord (P0-0)
+    pub discord_webhook_url: Option<String>,
+
     // 自定义Webhook
     pub custom_webhook_urls: Vec<String>,
     pub custom_webhook_bearer_token: Option<String>,
@@ -99,6 +117,9 @@ impl NotificationConfig {
             pushover_user_key: std::env::var("PUSHOVER_USER_KEY").ok(),
             pushover_api_token: std::env::var("PUSHOVER_API_TOKEN").ok(),
             server_chan_key: std::env::var("SERVER_CHAN_KEY").ok(),
+            dingtalk_webhook_url: std::env::var("DINGTALK_WEBHOOK_URL").ok(),
+            slack_webhook_url: std::env::var("SLACK_WEBHOOK_URL").ok(),
+            discord_webhook_url: std::env::var("DISCORD_WEBHOOK_URL").ok(),
             custom_webhook_urls: std::env::var("CUSTOM_WEBHOOK_URLS")
                 .ok()
                 .map(|s| s.split(',').map(|s| s.trim().to_string()).collect())
