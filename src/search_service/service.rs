@@ -76,7 +76,26 @@ impl SearchService {
         let mut providers: Vec<Box<dyn SearchProvider>> = Vec::new();
 
         // 按优先级添加搜索引擎
-        // 1. SerpAPI 最优先（Google搜索结果，质量高）
+        // 修复 P1.4: 免费源先于付费源, 避免 429/403/432 时无谓重试
+        // 原因: SerpAPI/Bocha/Tavily 都是有额度的付费/限免 API, 失败率高
+        //        而 东方财富/华尔街见闻/财联社 是免费直连, 优先用它们能保证稳定
+
+        // 1. 东方财富（免费，A股专业，无需API Key）
+        if enable_eastmoney {
+            info!("已启用 东方财富 新闻搜索（免费，无限制）");
+            providers.push(Box::new(EastmoneyNewsProvider::new()));
+        }
+
+        // 2. 华尔街见闻（免费直连，补充全球财经资讯）
+        providers.push(Box::new(WallStreetCnProvider::new()));
+
+        // 3. 财联社（免费直连，补充A股电报）
+        providers.push(Box::new(ClsProvider::new()));
+
+        // 4. 金十数据（免费直连，补充快讯）
+        // 见 providers/jin10.rs - 默认就是免费直连, 无 API Key
+
+        // 5. SerpAPI（付费，Google搜索结果，作为质量补充）
         if let Some(keys) = serpapi_keys {
             if !keys.is_empty() {
                 info!("已配置 SerpAPI 搜索，共 {} 个 API Key", keys.len());
@@ -84,19 +103,7 @@ impl SearchService {
             }
         }
 
-        // 2. 东方财富（免费，A股专业，无需API Key）
-        if enable_eastmoney {
-            info!("已启用 东方财富 新闻搜索（免费，无限制）");
-            providers.push(Box::new(EastmoneyNewsProvider::new()));
-        }
-
-        // 2.5 华尔街见闻（免费直连，补充全球财经资讯）
-        providers.push(Box::new(WallStreetCnProvider::new()));
-
-        // 2.6 财联社（免费直连，补充A股电报）
-        providers.push(Box::new(ClsProvider::new()));
-
-        // 3. Bocha（中文搜索优化，AI摘要）
+        // 6. Bocha（付费，中文搜索优化，AI摘要）
         if let Some(keys) = bocha_keys {
             if !keys.is_empty() {
                 info!("已配置 Bocha 搜索，共 {} 个 API Key", keys.len());
@@ -104,7 +111,7 @@ impl SearchService {
             }
         }
 
-        // 4. Tavily（免费额度更多，每月 1000 次）
+        // 7. Tavily（限免，作为最后补充）
         if let Some(keys) = tavily_keys {
             if !keys.is_empty() {
                 info!("已配置 Tavily 搜索，共 {} 个 API Key", keys.len());

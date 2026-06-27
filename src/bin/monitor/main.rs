@@ -563,7 +563,7 @@ fn run_factor_ic_analysis() -> Option<String> {
 async fn run_review_only() {
     log::info!("[复盘] 手动触发盘后分析...");
 
-    let (report, holding_breakout_text, watch_breakout_text, market_breakout_text, risk_text) = tokio::task::spawn_blocking(|| {
+    let (report, holding_breakout_text, watch_breakout_text, market_breakout_text, risk_text, market_overview_text) = tokio::task::spawn_blocking(|| {
         let holdings = stock_analysis::portfolio::get_positions().unwrap_or_default();
         let quotes = market_data::fetch_position_quotes();
         let prices = build_price_map(&quotes);
@@ -682,23 +682,56 @@ async fn run_review_only() {
             risk.push_str("🔄 持仓轮动研判（算法·仅供参考）\n");
             risk.push_str(&rotation_lines.join("\n"));
         }
-        (r, holding_brk, watch_brk, market_brk, risk)
+
+        // === 修复 P1.1: 在 spawn_blocking 闭包内获取市场概览 ===
+        // 这样 block_in_place / block_on 不会与外部 tokio runtime 冲突
+        let market_overview_text = match stock_analysis::market_analyzer::MarketAnalyzer::new(None) {
+            Ok(analyzer) => match analyzer.get_market_overview() {
+                Ok(overview) => Some(analyzer.generate_market_review(&overview, &[])),
+                Err(e) => {
+                    log::warn!("[复盘 P1.1] get_market_overview 失败: {}", e);
+                    None
+                }
+            },
+            Err(e) => {
+                log::warn!("[复盘 P1.1] MarketAnalyzer::new 失败: {}", e);
+                None
+            }
+        };
+
+        (r, holding_brk, watch_brk, market_brk, risk, market_overview_text)
     }).await.unwrap_or_default();
 
     log::info!("[复盘] 复盘报告:\n{}", report);
     push_wechat(&report).await;
 
+    // === 修复 P1.1: 推送市场概览（北向资金 + 真实板块）===
+    if let Some(overview_text) = market_overview_text {
+        log::info!("[复盘 P1.1] 市场概览已生成 ({}字):\n{}", overview_text.len(), overview_text);
+        push_wechat(&overview_text).await;
+    }
+
     // === 修复 P1.1: --review 模式开头增加市场概览 ===
     // 修复: QUANT_ANALYST_REVIEW §1.4 / §1.3 在 --review 路径下不可见
     // 让 T7 (北向资金) / T8 (真实板块) 修复在 review 模式下也能体现
-    if let Ok(analyzer) = stock_analysis::market_analyzer::MarketAnalyzer::new(None) {
-        match analyzer.get_market_overview() {
-            Ok(overview) => {
-                let txt = analyzer.generate_market_review(&overview, &[]);
-                log::info!("[复盘] 市场概览:\n{}", txt);
-                push_wechat(&txt).await;
+    // 关键: get_market_overview 内部用 block_in_place + block_on, 在 async context 中需要
+    //       多线程 runtime. #[tokio::main] 默认多线程, 但在 spawn_blocking 闭包内调用更稳.
+    // 失败时静默跳过(已用 warn log 记录), 不影响 review 主流程.
+    match stock_analysis::market_analyzer::MarketAnalyzer::new(None) {
+        Ok(analyzer) => {
+            match analyzer.get_market_overview() {
+                Ok(overview) => {
+                    let txt = analyzer.generate_market_review(&overview, &[]);
+                    log::info!("[复盘 P1.1] 市场概览已生成 ({}字)", txt.len());
+                    push_wechat(&txt).await;
+                }
+                Err(e) => {
+                    log::warn!("[复盘 P1.1] get_market_overview 失败: {} (跳过)", e);
+                }
             }
-            Err(e) => log::warn!("[复盘] 市场概览获取失败: {}", e),
+        }
+        Err(e) => {
+            log::warn!("[复盘 P1.1] MarketAnalyzer::new 失败: {} (跳过)", e);
         }
     }
 

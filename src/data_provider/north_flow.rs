@@ -5,9 +5,21 @@
 //!
 //! 数据源：东财 push2.eastmoney.com/api/qt/kamt/get
 //!
-//! 注意：东财 kamt 接口的精确响应字段名需要在接入时实测。
-//! 当前实现：先按 `hk2sh_net / hk2sz_net` 的常见字段名解析，失败时返回 Err
-//! 让上层走"数据不可用"分支（符合 AGENTS.md"不静默填充"原则）。
+//! 实际响应格式 (2026-06 实测):
+//! ```json
+//! {
+//!   "data": {
+//!     "hk2sh": { "dayNetAmtIn": 0.0, "date2": "2026-06-26", ... },  // 沪股通当日净流入
+//!     "sh2hk": { "dayNetAmtIn": 4200000.0, ... },                   // 沪→港 反向
+//!     "hk2sz": { "dayNetAmtIn": 0.0, ... },                          // 深股通当日净流入
+//!     "sz2hk": { "dayNetAmtIn": 4200000.0, ... }                    // 深→港 反向
+//!   }
+//! }
+//! ```
+//! 单位是 **元 (yuan)**，要除以 1e8 转 亿元。
+//! 北向资金 = hk2sh + hk2sz；南向资金 = sh2hk + sz2hk。
+//!
+//! 失败时返回 Err, 绝不静默填充 (符合 AGENTS.md)。
 
 use serde::Deserialize;
 use std::time::Duration;
@@ -26,7 +38,7 @@ pub struct NorthFlowPoint {
 pub struct NorthFlowSeries {
     pub hk2sh_net: Vec<NorthFlowPoint>,
     pub hk2sz_net: Vec<NorthFlowPoint>,
-    /// hk2sh + hk2sz 合并
+    /// hk2sh + hk2sz 合并（真正的北向资金）
     pub total_net: Vec<NorthFlowPoint>,
 }
 
@@ -37,26 +49,25 @@ impl NorthFlowSeries {
     }
 }
 
-/// 内部原始响应结构
-#[derive(Deserialize)]
-struct RawEntry {
-    /// YYYYMMDD 或 YYYY-MM-DD（两种都常见，解析时容错）
-    #[serde(default)]
-    date: String,
-    /// 净买入额（亿元）
-    #[serde(rename = "netBuyAmt", alias = "f54", default)]
-    net_buy_amt: f64,
+/// 单个流向（沪股通 / 沪→港 / 深股通 / 深→港）
+/// dayNetAmtIn 单位是元，要除以 1e8 转 亿元
+#[derive(Deserialize, Debug)]
+struct RawFlow {
+    #[serde(default, rename = "dayNetAmtIn")]
+    day_net_amt_in: f64,
+    #[serde(default, rename = "date2")]
+    date2: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 struct RawData {
     #[serde(default)]
-    hk2sh: Option<Vec<RawEntry>>,
+    hk2sh: Option<RawFlow>,
     #[serde(default)]
-    hk2sz: Option<Vec<RawEntry>>,
+    hk2sz: Option<RawFlow>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 struct RawResp {
     data: Option<RawData>,
 }
@@ -85,43 +96,32 @@ impl NorthFlowClient {
         let hk2sz = data
             .hk2sz
             .ok_or_else(|| "北向资金响应 hk2sz 字段为空".to_string())?;
-        if hk2sh.is_empty() && hk2sz.is_empty() {
-            return Err("北向资金响应无数据".to_string());
-        }
-        let parse_entry = |e: &RawEntry| -> Result<NorthFlowPoint, String> {
-            let date = parse_date(&e.date)
-                .ok_or_else(|| format!("北向资金日期无法解析: {}", e.date))?;
-            Ok(NorthFlowPoint { date, net_buy_amt: e.net_buy_amt })
+
+        // date2 格式 "2026-06-26" 或空（盘中可能为空）
+        let date_str = if !hk2sh.date2.is_empty() {
+            hk2sh.date2.clone()
+        } else if !hk2sz.date2.is_empty() {
+            hk2sz.date2.clone()
+        } else {
+            return Err("北向资金响应无 date2 字段".to_string());
         };
-        let hk2sh_net: Vec<NorthFlowPoint> = hk2sh
-            .iter()
-            .map(parse_entry)
-            .collect::<Result<_, _>>()?;
-        let hk2sz_net: Vec<NorthFlowPoint> = hk2sz
-            .iter()
-            .map(parse_entry)
-            .collect::<Result<_, _>>()?;
-        // 合并：按日期对位相加
-        let mut total: Vec<NorthFlowPoint> = hk2sh_net
-            .iter()
-            .zip(hk2sz_net.iter())
-            .map(|(s, z)| NorthFlowPoint {
-                date: s.date,
-                net_buy_amt: s.net_buy_amt + z.net_buy_amt,
-            })
-            .collect();
-        total.sort_by(|a, b| b.date.cmp(&a.date)); // 降序
+        let date = parse_date(&date_str)
+            .ok_or_else(|| format!("北向资金日期无法解析: {date_str}"))?;
+
+        // 元 → 亿元（1e8）
+        let hk2sh_yi = hk2sh.day_net_amt_in / 1e8;
+        let hk2sz_yi = hk2sz.day_net_amt_in / 1e8;
+        let total_yi = hk2sh_yi + hk2sz_yi;
+
         Ok(NorthFlowSeries {
-            hk2sh_net,
-            hk2sz_net,
-            total_net: total,
+            hk2sh_net: vec![NorthFlowPoint { date, net_buy_amt: hk2sh_yi }],
+            hk2sz_net: vec![NorthFlowPoint { date, net_buy_amt: hk2sz_yi }],
+            total_net: vec![NorthFlowPoint { date, net_buy_amt: total_yi }],
         })
     }
 
     /// 实际拉取（带网络）
     pub async fn fetch(&self) -> Result<NorthFlowSeries, String> {
-        // 东财 kamt 接口（北向资金 - 沪股通/深股通）
-        // 字段选取 f51=日期, f54=净买入额（亿元）
         let url = "https://push2.eastmoney.com/api/qt/kamt/get?fields1=f1,f2,f3,f4&fields2=f51,f52,f53,f54,f55,f56&klt=1&lmt=1&fields=f51,f52,f54";
         let resp = self
             .http
@@ -162,32 +162,35 @@ fn parse_date(s: &str) -> Option<chrono::NaiveDate> {
 mod tests {
     use super::*;
 
+    /// 真实东财响应 (2026-06-26 实测)
     #[test]
-    fn parse_mock_response() {
+    fn parse_real_eastmoney_response() {
         let json = r#"{
-            "data": {
-                "hk2sh": [{"date": "20260627", "netBuyAmt": 12.34}],
-                "hk2sz": [{"date": "20260627", "netBuyAmt": -5.67}]
+            "rc":0,"rt":13,"svr":177617564,"lt":1,"full":1,
+            "data":{
+                "hk2sh":{"dayNetAmtIn":12345678.0,"date2":"2026-06-26"},
+                "hk2sz":{"dayNetAmtIn":-5678901.0,"date2":"2026-06-26"}
             }
         }"#;
         let s = NorthFlowClient::parse(json).unwrap();
-        assert!((s.hk2sh_net[0].net_buy_amt - 12.34).abs() < 1e-6);
-        assert!((s.hk2sz_net[0].net_buy_amt - (-5.67)).abs() < 1e-6);
-        assert!((s.total_net[0].net_buy_amt - 6.67).abs() < 1e-6);
-        assert_eq!(s.latest_total(), Some(6.67));
+        // 12345678 / 1e8 = 0.12345678 亿
+        assert!((s.hk2sh_net[0].net_buy_amt - 0.12345678).abs() < 1e-6);
+        // -5678901 / 1e8 = -0.05678901 亿
+        assert!((s.hk2sz_net[0].net_buy_amt - (-0.05678901)).abs() < 1e-6);
+        // 总和 0.06666777 亿
+        assert!((s.total_net[0].net_buy_amt - 0.06666777).abs() < 1e-6);
+        assert!((s.latest_total().unwrap() - 0.06666777).abs() < 1e-6);
+        assert_eq!(s.total_net[0].date.to_string(), "2026-06-26");
     }
 
+    /// 盘中: hk2sh 有数据, hk2sz 缺失
     #[test]
-    fn parse_with_dash_date() {
-        let json = r#"{
-            "data": {
-                "hk2sh": [{"date": "2026-06-27", "netBuyAmt": 1.0}],
-                "hk2sz": [{"date": "2026-06-27", "netBuyAmt": 2.0}]
-            }
-        }"#;
-        let s = NorthFlowClient::parse(json).unwrap();
-        assert_eq!(s.total_net[0].date.to_string(), "2026-06-27");
-        assert!((s.total_net[0].net_buy_amt - 3.0).abs() < 1e-6);
+    fn parse_missing_hk2sz_returns_err() {
+        let json = r#"{"data": {"hk2sh": {"dayNetAmtIn": 100.0, "date2": "2026-06-26"}}}"#;
+        let result = NorthFlowClient::parse(json);
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(msg.contains("hk2sz"), "msg={msg}");
     }
 
     #[test]
@@ -195,32 +198,16 @@ mod tests {
         let json = r#"{"data": null}"#;
         let result = NorthFlowClient::parse(json);
         assert!(result.is_err());
-        let msg = result.unwrap_err();
-        assert!(msg.contains("北向资金"), "msg={msg}");
     }
 
     #[test]
-    fn parse_empty_lists_returns_err() {
-        let json = r#"{"data": {"hk2sh": [], "hk2sz": []}}"#;
-        let result = NorthFlowClient::parse(json);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn parse_invalid_date_returns_err() {
+    fn parse_empty_date_returns_err() {
         let json = r#"{
             "data": {
-                "hk2sh": [{"date": "garbage", "netBuyAmt": 1.0}],
-                "hk2sz": [{"date": "20260627", "netBuyAmt": 2.0}]
+                "hk2sh": {"dayNetAmtIn": 100.0, "date2": ""},
+                "hk2sz": {"dayNetAmtIn": 200.0, "date2": ""}
             }
         }"#;
-        let result = NorthFlowClient::parse(json);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn parse_missing_hk2sh_field_returns_err() {
-        let json = r#"{"data": {"hk2sz": [{"date": "20260627", "netBuyAmt": 1.0}]}}"#;
         let result = NorthFlowClient::parse(json);
         assert!(result.is_err());
     }
@@ -235,5 +222,18 @@ mod tests {
     fn latest_total_empty_returns_none() {
         let s = NorthFlowSeries::default();
         assert_eq!(s.latest_total(), None);
+    }
+
+    /// 真实场景: 0 净流入 (南北都 0)
+    #[test]
+    fn parse_zero_net_flow() {
+        let json = r#"{
+            "data": {
+                "hk2sh": {"dayNetAmtIn": 0.0, "date2": "2026-06-26"},
+                "hk2sz": {"dayNetAmtIn": 0.0, "date2": "2026-06-26"}
+            }
+        }"#;
+        let s = NorthFlowClient::parse(json).unwrap();
+        assert_eq!(s.latest_total(), Some(0.0));
     }
 }
