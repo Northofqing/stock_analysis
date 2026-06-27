@@ -5,11 +5,17 @@
 
 use crate::data_provider::KlineData;
 
+/// 修复 P1.2: 统一的无风险利率常量
+/// 量化分析师要求: 同一系统内 rf 必须一致
+/// 默认 3% (10Y 国债收益率, 2026 年水平)
+/// 可通过环境变量 `RISK_FREE_RATE` 覆盖 (例如央行降息期)
+pub const DEFAULT_RISK_FREE_RATE: f64 = 0.03;
+
 /// 计算夏普比率
 ///
 /// # 参数
 /// - kline_data: K线数据，至少需要20个交易日数据
-/// - risk_free_rate: 无风险利率（年化），默认使用3% (0.03)
+/// - risk_free_rate: 无风险利率（年化），默认使用 DEFAULT_RISK_FREE_RATE (3%)
 /// - trading_days_per_year: 一年交易日数，默认252天
 ///
 /// # 返回
@@ -25,7 +31,7 @@ pub fn calculate_sharpe_ratio(
         return None;
     }
 
-    let risk_free = risk_free_rate.unwrap_or(0.03); // 默认3%年化无风险利率
+    let risk_free = risk_free_rate.unwrap_or(DEFAULT_RISK_FREE_RATE);
     let trading_days = trading_days_per_year.unwrap_or(252) as f64;
 
     // 提取每日收益率
@@ -112,7 +118,7 @@ pub fn update_sharpe_ratios(
     risk_free_rate: Option<f64>,
 ) {
     let window = window_size.unwrap_or(60);
-    let risk_free = risk_free_rate.unwrap_or(0.03);
+    let risk_free = risk_free_rate.unwrap_or(DEFAULT_RISK_FREE_RATE);
 
     // 为每个数据点计算夏普比率（使用向前滚动窗口）
     for i in 0..kline_data.len() {

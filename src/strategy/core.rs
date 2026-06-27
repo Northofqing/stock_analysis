@@ -986,8 +986,11 @@ impl BacktestSummary {
         let max_drawdown = state.max_drawdown();
         let max_dd_duration_days = state.max_drawdown_duration_days();
 
-        // 使用2.5% 1Y国债作为无风险利率
-        let risk_free_rate = 0.025;
+        // 修复 P1.2: 统一无风险利率常量
+        // 之前 core.rs 用 2.5% (1Y 国债), sharpe_calculator.rs 默认 3%
+        // 量化分析师要求: 同一系统内 rf 必须一致, 跨报告不可比问题
+        // 改用 sharpe_calculator 模块的统一常量
+        let risk_free_rate = super::super::sharpe_calculator::DEFAULT_RISK_FREE_RATE;
         let sharpe_ratio = state.sharpe_ratio(risk_free_rate);
         let sortino_ratio = state.sortino_ratio(risk_free_rate);
 
