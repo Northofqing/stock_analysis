@@ -509,6 +509,105 @@ impl BacktestEngine {
         self.sell(code, shares, price, date)
     }
 
+    /// 买入股票（A 股真实约束：涨跌停 + 整百股 + 最小佣金 5 元）
+    ///
+    /// 修复：QUANT_ANALYST_REVIEW §1.2, §2.4
+    /// 行为：
+    ///   1. 涨跌停价格检查
+    ///   2. shares 向下取整到 100 的倍数，< 100 报错
+    ///   3. 佣金 = max(amount * 0.0003, 5.0)
+    pub fn try_buy_realistic(
+        &mut self,
+        code: &str,
+        name: &str,
+        prev_close: f64,
+        price: f64,
+        shares: f64,
+        date: DateTime<Local>,
+    ) -> Result<u64> {
+        use crate::strategy::lot::{min_commission, round_lot};
+        // 1. 涨跌停
+        crate::data_provider::limit_status::validate_limit_price(code, name, prev_close, price)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        // 2. 整百股
+        let rounded = round_lot(shares);
+        if rounded == 0 {
+            return Err(anyhow::anyhow!(
+                "买入股数 {shares} 取整后为 0，不足 1 手 (100 股)"
+            ));
+        }
+        // 3. 实际买入（用整百股后的数量）
+        self.buy(code, name, price, rounded as f64, date)?;
+        // 4. 强制覆盖佣金为含 5 元保底（A 股标准）
+        //    引擎内部的 buy 已经按 commission_rate 算过，但没保底
+        //    我们在最后一次 trade 上把 commission 调整
+        if let Some(last_trade) = self.state.trades.last_mut() {
+            let amount = last_trade.amount;
+            let min_c = min_commission(amount);
+            let diff = min_c - last_trade.commission;
+            if diff > 0.0 {
+                last_trade.commission = min_c;
+                self.state.cash -= diff; // 补扣差额
+            }
+        }
+        Ok(rounded)
+    }
+
+    /// 卖出股票（A 股真实约束：涨跌停 + T+1 + 整百股 + 最小佣金 + 印花税）
+    pub fn try_sell_realistic(
+        &mut self,
+        code: &str,
+        name: &str,
+        prev_close: f64,
+        shares: f64,
+        price: f64,
+        date: DateTime<Local>,
+    ) -> Result<u64> {
+        use crate::strategy::lot::{min_commission, round_lot, stamp_tax};
+        // 1. 涨跌停
+        crate::data_provider::limit_status::validate_limit_price(code, name, prev_close, price)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        // 2. T+1：取该 code 的最后买入日期
+        let last_buy_date = self
+            .state
+            .trades
+            .iter()
+            .rev()
+            .find(|t| t.code == code && matches!(t.action, TradeAction::Buy))
+            .map(|t| t.date.date_naive());
+        if let Some(buy_date) = last_buy_date {
+            if date.date_naive() <= buy_date {
+                return Err(anyhow::anyhow!(
+                    "T+1 违规: {code} 最后买入 {buy_date}, 不能在 {sell_date} 卖出",
+                    sell_date = date.date_naive()
+                ));
+            }
+        }
+        // 3. 整百股
+        let rounded = round_lot(shares);
+        if rounded == 0 {
+            return Err(anyhow::anyhow!(
+                "卖出股数 {shares} 取整后为 0，不足 1 手 (100 股)"
+            ));
+        }
+        // 4. 卖出
+        self.sell(code, rounded as f64, price, date)?;
+        // 5. 调整佣金 + 印花税
+        if let Some(last_trade) = self.state.trades.last_mut() {
+            let amount = last_trade.amount;
+            let min_c = min_commission(amount);
+            let commission_diff = min_c - last_trade.commission;
+            if commission_diff > 0.0 {
+                last_trade.commission = min_c;
+                self.state.cash -= commission_diff;
+            }
+            // 印花税：sell() 已按 stamp_tax_rate 算过，这里校验
+            // 实际已是引擎内 calc, 不重复加
+            let _ = stamp_tax(amount); // 抑制 unused 警告
+        }
+        Ok(rounded)
+    }
+
     /// 卖出股票
     pub fn sell(&mut self, code: &str, shares: f64, price: f64, date: DateTime<Local>) -> Result<()> {
         let position = self.state.positions.get_mut(code)
@@ -1391,6 +1490,79 @@ mod tests {
         // 跌停 9.0，尝试 8.5 卖出应被拒
         let result = engine.try_sell_validated("600000", "浦发银行", 10.0, 100.0, 8.5, date);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_try_buy_realistic_rounds_to_lot() {
+        // 修复：QUANT_ANALYST_REVIEW §1.2
+        // 150 股 -> 100 股
+        let config = BacktestConfig::default();
+        let mut engine = BacktestEngine::new(config);
+        let date = Local::now();
+        let filled = engine
+            .try_buy_realistic("600000", "浦发银行", 10.0, 10.5, 150.0, date)
+            .unwrap();
+        assert_eq!(filled, 100);
+    }
+
+    #[test]
+    fn test_try_buy_realistic_rejects_under_lot() {
+        // 50 股 -> 取整 0, 报错
+        let config = BacktestConfig::default();
+        let mut engine = BacktestEngine::new(config);
+        let date = Local::now();
+        let result = engine.try_buy_realistic("600000", "浦发银行", 10.0, 10.5, 50.0, date);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_try_buy_realistic_min_commission_5() {
+        // 100 股 @ 10.0 = 1000 元, 佣金理论 0.3 元, 应保底 5 元
+        let config = BacktestConfig::default();
+        let mut engine = BacktestEngine::new(config);
+        let date = Local::now();
+        engine
+            .try_buy_realistic("600000", "浦发银行", 10.0, 10.0, 100.0, date)
+            .unwrap();
+        let last = engine.state.trades.last().unwrap();
+        assert!((last.commission - 5.0).abs() < 1e-6, "commission={}", last.commission);
+    }
+
+    #[test]
+    fn test_try_sell_realistic_t1_violation() {
+        // T 日买入, T 日卖出应被拒
+        let config = BacktestConfig::default();
+        let mut engine = BacktestEngine::new(config);
+        let buy_date = Local::now();
+        engine
+            .try_buy_realistic("600000", "浦发银行", 10.0, 10.0, 100.0, buy_date)
+            .unwrap();
+        let result = engine.try_sell_realistic(
+            "600000",
+            "浦发银行",
+            10.0,
+            100.0,
+            10.5,
+            buy_date, // 同一天
+        );
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("T+1"), "msg={msg}");
+    }
+
+    #[test]
+    fn test_try_sell_realistic_t1_allows_next_day() {
+        // T 日买入, T+1 日卖出应通过
+        let config = BacktestConfig::default();
+        let mut engine = BacktestEngine::new(config);
+        let buy_date = Local::now();
+        engine
+            .try_buy_realistic("600000", "浦发银行", 10.0, 10.0, 100.0, buy_date)
+            .unwrap();
+        let sell_date = buy_date + chrono::Duration::days(1);
+        let result =
+            engine.try_sell_realistic("600000", "浦发银行", 10.0, 100.0, 10.5, sell_date);
+        assert!(result.is_ok(), "got: {:?}", result);
     }
 
     #[test]

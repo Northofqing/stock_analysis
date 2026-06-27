@@ -25,6 +25,7 @@ use crate::data_provider::KlineData;
 
 pub mod core;
 pub mod bollinger_zscore;
+pub mod lot;
 pub mod multi_factor;
 pub mod rsi;
 pub mod contrarian;
