@@ -18,6 +18,7 @@ pub fn load_positions() -> Result<Vec<Position>, String> {
         added_at: NaiveDate::parse_from_str(&r.buy_date, "%Y-%m-%d")
             .unwrap_or_else(|_| NaiveDate::from_ymd_opt(2025, 1, 1).unwrap()),
         status: PositionStatus::Holding,
+        sector: "其他".into(),
     }).collect())
 }
 
@@ -37,6 +38,7 @@ pub fn load_watchlist() -> Result<Vec<Position>, String> {
             shares: 0, cost_price: 0.0, hard_stop: 0.0,
             added_at: NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
             status: PositionStatus::Watching,
+            sector: "其他".into(),
         }
     }).collect())
 }

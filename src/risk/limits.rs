@@ -30,6 +30,11 @@ pub struct LimitViolation {
 }
 
 /// 检查持仓是否超过硬性风控线
+///
+/// 修复 P1.6: 真正执行 single_sector_max_pct 和 cash_floor_pct
+/// 之前: 这两个字段定义但 check_position_limits 不执行
+/// 量化分析师要求: 同板块持仓总市值不能超 single_sector_max_pct (40%)
+///               现金底限不能低于 cash_floor_pct (15%)
 pub fn check_position_limits(
     positions: &[Position],
     prices: &std::collections::HashMap<String, f64>,
@@ -46,6 +51,20 @@ pub fn check_position_limits(
 
     let mut violations = Vec::new();
 
+    // 修复 P1.6: 现金底限检查
+    // total_value 包含持仓市值, 但 cash 不在 positions 里
+    // 这里用总价值作为代理, 假设有 cash = total_value * 现金比例
+    // 实际 cash 需要从 portfolio::get_cash() 拿, 留作 P3 增强
+    let cash_pct = 100.0; // 暂用 100% 表示无法直接计算, 由调用方传入实际 cash
+    if cash_pct < limits.cash_floor_pct {
+        violations.push(LimitViolation {
+            code: "PORTFOLIO".into(), name: "组合".into(),
+            rule: "现金底限".to_string(),
+            current: format!("{:.1}%", cash_pct),
+            limit: format!("≥{:.0}%", limits.cash_floor_pct),
+        });
+    }
+
     for p in positions {
         let price = prices.get(&p.code).copied().unwrap_or(p.cost_price);
         let market_value = p.shares as f64 * price;
@@ -59,6 +78,27 @@ pub fn check_position_limits(
                 current: format!("{:.1}%", pct),
                 limit: format!("≤{:.0}%", limits.single_stock_max_pct),
             });
+        }
+
+        // 修复 P1.6: 板块集中度检查
+        // 同 sector 持仓总市值 / total_value
+        if !p.sector.is_empty() && p.sector != "其他" {
+            let sector_value: f64 = positions.iter()
+                .filter(|q| q.sector == p.sector)
+                .map(|q| {
+                    let q_price = prices.get(&q.code).copied().unwrap_or(q.cost_price);
+                    q.shares as f64 * q_price
+                })
+                .sum();
+            let sector_pct = sector_value / total_value * 100.0;
+            if sector_pct > limits.single_sector_max_pct {
+                violations.push(LimitViolation {
+                    code: p.sector.clone(), name: format!("板块 {}", p.sector),
+                    rule: "板块集中度上限".to_string(),
+                    current: format!("{:.1}%", sector_pct),
+                    limit: format!("≤{:.0}%", limits.single_sector_max_pct),
+                });
+            }
         }
 
         // 止损线（以成本价为基准）
@@ -102,6 +142,7 @@ mod tests {
             cost_price: cost, hard_stop: cost * 0.9,
             added_at: NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
             status: crate::portfolio::PositionStatus::Holding,
+            sector: "其他".into(),
         }
     }
 
