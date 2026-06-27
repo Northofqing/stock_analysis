@@ -66,6 +66,13 @@ pub struct BacktestConfig {
     pub slippage_rate: f64,
     /// 印花税率（A 股仅卖方征收，现行 0.001）
     pub stamp_tax_rate: f64,
+    /// 是否启用动态滑点 (P1.4)
+    /// true: 滑点 = α × σ_daily × sqrt(order_value / ADV)
+    /// false: 滑点 = slippage_rate (固定)
+    pub dynamic_slippage: bool,
+    /// 动态滑点的 α 系数 (P1.4)
+    /// 典型值 0.1-0.5, 默认 0.1 (保守)
+    pub dynamic_slippage_alpha: f64,
 }
 
 impl Default for BacktestConfig {
@@ -77,6 +84,8 @@ impl Default for BacktestConfig {
             commission_rate: 0.0003,        // 万三手续费
             slippage_rate: 0.001,           // 千一滑点
             stamp_tax_rate: 0.001,          // 千一印花税（仅卖出）
+            dynamic_slippage: false,        // 默认关闭, 量化分析师按需启用
+            dynamic_slippage_alpha: 0.1,    // 保守 α 系数
         }
     }
 }
