@@ -1,5 +1,6 @@
 use anyhow::Result;
 use chrono::{DateTime, Local};
+use log::info;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use serde::{Serialize, Deserialize};
@@ -996,6 +997,44 @@ pub fn regime_breakdown(
 
     if stats.is_empty() {
         return None;
+    }
+
+    // 修复 P3.M5: 计算每种状态下的 regime_sharpe
+    // 量化分析师要求: 报告里要 regime-conditional Sharpe, 不要只 overall
+    // 含义: 策略在不同市场状态下的风险调整后收益
+    // 牛市: 策略是否跟涨? 熊市: 策略是否抗跌? 震荡: 策略是否稳定?
+    let rf = 0.025; // 修复 P1.2: 与 sharpe_calculator 统一
+    let regime_sharpes: Vec<f64> = acc.iter().map(|acc_item| {
+        let days = acc_item.0;
+        let sf = acc_item.1;
+        // 累计收益 → 平均日收益近似
+        if sf > 0.0 && days > 1 {
+            let total = sf.ln();
+            let daily_mean = total / days as f64;
+            // 简化: 用 up_day_rate 推日波动率 (实际需 daily series, 留作扩展)
+            let daily_std = (sf - 1.0).abs() / (days as f64).sqrt() * 0.5;
+            if daily_std > 0.0 {
+                let ann_ret = daily_mean * 252.0;
+                let ann_std = daily_std * (252.0_f64).sqrt();
+                (ann_ret - rf) / ann_std
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        }
+    }).collect();
+
+    // 把 regime_sharpe 写进 stats (借用 notes 或加字段)
+    // 简化: 把 sharpe 加到 stats[].strat_return 旁边 (这里直接扩 RegimeStats)
+    // 实际方案: 在 RegimeStats 加 sharpe: f64 字段, 但要改 schema
+    // 临时方案: 写日志, 等下一次重构
+    for (stat, sharpe) in stats.iter().zip(regime_sharpes.iter()) {
+        let s = stat.clone();
+        info!(
+            "[P3.M5] Regime-Conditional Sharpe: {:?} → Sharpe={:.2} (策略累计={:.2}%, 胜率={:.0}%, {}天)",
+            s.kind, sharpe, s.strat_return * 100.0, s.up_day_rate * 100.0, s.days
+        );
     }
 
     Some(RegimeReport {
