@@ -155,6 +155,23 @@ impl DatabaseManager {
         Ok(self.pool.get()?)
     }
 
+    /// 给已存在的表增量添加列（如果列不存在）。
+    /// SQLite 没有原生的 `ADD COLUMN IF NOT EXISTS`；通过 PRAGMA table_info 读列名判断。
+    /// 用于把老库升级到新 schema，不破坏现有数据。
+    pub fn add_column_if_missing(
+        conn: &mut SqliteConnection,
+        table: &str,
+        column: &str,
+        column_def: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if column_exists(conn, table, column)? {
+            return Ok(());
+        }
+        let alter = format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, column_def);
+        diesel::sql_query(&alter).execute(conn)?;
+        Ok(())
+    }
+
     /// 运行数据库迁移
     fn run_migrations(conn: &mut SqliteConnection) -> Result<(), Box<dyn std::error::Error>> {
         // 创建 stock_daily 表
@@ -178,11 +195,19 @@ impl DatabaseManager {
                 data_source TEXT,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                is_limit_up TINYINT NOT NULL DEFAULT 0,
+                is_limit_down TINYINT NOT NULL DEFAULT 0,
+                is_suspended TINYINT NOT NULL DEFAULT 0,
                 UNIQUE(code, date)
             )
             "#,
         )
         .execute(&mut *conn)?;
+
+        // 老库升级：增量添加 3 列（QUANT_ANALYST_REVIEW §1.1）
+        Self::add_column_if_missing(conn, "stock_daily", "is_limit_up", "TINYINT NOT NULL DEFAULT 0")?;
+        Self::add_column_if_missing(conn, "stock_daily", "is_limit_down", "TINYINT NOT NULL DEFAULT 0")?;
+        Self::add_column_if_missing(conn, "stock_daily", "is_suspended", "TINYINT NOT NULL DEFAULT 0")?;
 
         // 创建索引
         diesel::sql_query(
@@ -616,6 +641,25 @@ struct FactorIcRowDb {
     sentiment_score: Option<i32>,
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     score_breakdown_json: Option<String>,
+}
+
+/// PRAGMA table_info 返回的列名行（只取 name 列）
+#[derive(QueryableByName, Debug)]
+struct ColumnNameRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    name: String,
+}
+
+/// 判断表中是否存在指定列（用于增量 schema 升级）
+fn column_exists(
+    conn: &mut SqliteConnection,
+    table: &str,
+    column: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    use diesel::RunQueryDsl;
+    let pragma_sql = format!("PRAGMA table_info({})", table);
+    let cols: Vec<ColumnNameRow> = diesel::sql_query(&pragma_sql).load(conn)?;
+    Ok(cols.iter().any(|c| c.name.eq_ignore_ascii_case(column)))
 }
 
 impl DatabaseManager {
