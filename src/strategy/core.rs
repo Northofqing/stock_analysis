@@ -473,6 +473,42 @@ impl BacktestEngine {
         Ok(())
     }
 
+    /// 买入股票（带涨跌停合规检查）
+    ///
+    /// 与 `buy` 的区别：要求传入 `name` 和 `prev_close`，会先用
+    /// `data_provider::limit_status::validate_limit_price` 检查价格是否
+    /// 在涨跌停范围内。如果超出，则返回 `Err(LimitPriceError)`，不下单。
+    ///
+    /// 修复：QUANT_ANALYST_REVIEW §1.1
+    pub fn try_buy_validated(
+        &mut self,
+        code: &str,
+        name: &str,
+        prev_close: f64,
+        price: f64,
+        shares: f64,
+        date: DateTime<Local>,
+    ) -> Result<()> {
+        crate::data_provider::limit_status::validate_limit_price(code, name, prev_close, price)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        self.buy(code, name, price, shares, date)
+    }
+
+    /// 卖出股票（带涨跌停合规检查）
+    pub fn try_sell_validated(
+        &mut self,
+        code: &str,
+        name: &str,
+        prev_close: f64,
+        shares: f64,
+        price: f64,
+        date: DateTime<Local>,
+    ) -> Result<()> {
+        crate::data_provider::limit_status::validate_limit_price(code, name, prev_close, price)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        self.sell(code, shares, price, date)
+    }
+
     /// 卖出股票
     pub fn sell(&mut self, code: &str, shares: f64, price: f64, date: DateTime<Local>) -> Result<()> {
         let position = self.state.positions.get_mut(code)
@@ -1317,6 +1353,44 @@ mod tests {
         // 测试清仓
         engine.sell("000001", 50.0, 11.0, date).unwrap();
         assert_eq!(engine.get_positions().len(), 0);
+    }
+
+    #[test]
+    fn test_try_buy_validated_rejects_above_limit() {
+        // 修复：QUANT_ANALYST_REVIEW §1.1
+        // 验证 try_buy_validated 在价格 > 涨停价时拒绝成交
+        let config = BacktestConfig::default();
+        let mut engine = BacktestEngine::new(config);
+        let date = Local::now();
+        // prev_close=10.0，主板 10%，涨停 11.0；试图以 11.5 买入应被拒
+        let result = engine.try_buy_validated("600000", "浦发银行", 10.0, 11.5, 100.0, date);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("涨停价") || msg.contains("高于"), "msg={msg}");
+        assert_eq!(engine.get_positions().len(), 0, "被拒后不应建仓");
+    }
+
+    #[test]
+    fn test_try_buy_validated_accepts_within_range() {
+        let config = BacktestConfig::default();
+        let mut engine = BacktestEngine::new(config);
+        let date = Local::now();
+        // 10.5 在 9.0~11.0 范围内，合规
+        let result = engine.try_buy_validated("600000", "浦发银行", 10.0, 10.5, 100.0, date);
+        assert!(result.is_ok(), "应当接受 10.5 买入, got: {:?}", result);
+        assert_eq!(engine.get_positions().len(), 1);
+    }
+
+    #[test]
+    fn test_try_sell_validated_rejects_below_limit() {
+        let config = BacktestConfig::default();
+        let mut engine = BacktestEngine::new(config);
+        let date = Local::now();
+        // 先买入 100 股 @10.0
+        engine.buy("600000", "浦发银行", 10.0, 100.0, date).unwrap();
+        // 跌停 9.0，尝试 8.5 卖出应被拒
+        let result = engine.try_sell_validated("600000", "浦发银行", 10.0, 100.0, 8.5, date);
+        assert!(result.is_err());
     }
 
     #[test]

@@ -113,6 +113,50 @@ pub fn apply_limit_flags_inplace(
     }
 }
 
+/// 检查价格是否在涨跌停范围内。
+/// 返回 `Ok(())` 当价格合法；`Err` 携带具体错误。
+///
+/// 用于在调用 BacktestEngine::buy / sell 之前做合规检查。
+pub fn validate_limit_price(
+    code: &str,
+    name: &str,
+    prev_close: f64,
+    price: f64,
+) -> Result<(), LimitPriceError> {
+    let s = LimitStatusCalculator::new().calculate(code, prev_close, name);
+    if s.limit_up_price > 0.0 && price > s.limit_up_price + 0.005 {
+        return Err(LimitPriceError::AboveLimitUp {
+            code: code.to_string(),
+            price,
+            limit_up: s.limit_up_price,
+        });
+    }
+    if s.limit_down_price > 0.0 && price < s.limit_down_price - 0.005 {
+        return Err(LimitPriceError::BelowLimitDown {
+            code: code.to_string(),
+            price,
+            limit_down: s.limit_down_price,
+        });
+    }
+    Ok(())
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum LimitPriceError {
+    #[error("买入价格 {price} 高于 {code} 涨停价 {limit_up}")]
+    AboveLimitUp {
+        code: String,
+        price: f64,
+        limit_up: f64,
+    },
+    #[error("卖出价格 {price} 低于 {code} 跌停价 {limit_down}")]
+    BelowLimitDown {
+        code: String,
+        price: f64,
+        limit_down: f64,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Board {
     Main,
