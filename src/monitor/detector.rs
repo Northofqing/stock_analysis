@@ -134,6 +134,11 @@ pub struct IndexSnapshot {
     pub name: String,
     pub change_pct: f64,
     pub change_5min_pct: f64,  // 最近5分钟涨跌幅
+    /// 修复 P3.5: 20 日 ATR 百分比 (绝对值, 例如 0.015 表示 1.5%)
+    /// 用于 check_index_plunge 自适应阈值
+    /// 量化分析师角度: 牛市 ATR ~0.8% (阈值 -1.6% 都不触发), 熊市 ATR ~2% (阈值 -4% 也不触发)
+    ///               真正崩盘的标志是 5min 跌幅 >> 2σ × ATR
+    pub atr_pct: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -249,19 +254,36 @@ impl Detector {
     // ── 大盘检测 ──
 
     pub fn check_index_plunge(&self, idx: &IndexSnapshot) -> Option<AlertEvent> {
-        if idx.change_5min_pct <= self.config.index_plunge_5min_pct {
+        // 修复 P3.5: 阈值从 -1.0 写死 → ATR 自适应
+        // 之前: 5 分钟跌 ≥ 1% 告警 (无视大盘波动率, 牛市震荡市都触发)
+        // 现在: 阈值 = -ATR(20) × 2.0 (默认配置, P3.1 集中 risk.toml)
+        // 牛市: ATR 小 → 阈值小 (-0.6% 即可)
+        // 熊市: ATR 大 → 阈值大 (-1.5% 才算崩盘)
+        // 量化分析师角度: 静态 -1% 在不同波动率时期信号质量差异巨大
+        let atr_threshold = if idx.atr_pct.abs() > 0.0 {
+            // idx.atr_pct 是 20 日 ATR 百分比, 阈值 = -2 × ATR
+            -idx.atr_pct * 2.0
+        } else {
+            // ATR 缺失时退回写死 -1% (兼容旧数据)
+            self.config.index_plunge_5min_pct
+        };
+        if idx.change_5min_pct <= atr_threshold {
             Some(AlertEvent {
                 level: AlertLevel::Emergency,
                 category: AlertCategory::IndexPlunge,
                 code: "INDEX".into(),
                 name: idx.name.clone(),
-                message: format!("{} 5分钟跌 {:.1}%", idx.name, idx.change_5min_pct),
+                message: format!(
+                    "{} 5分钟跌 {:.1}% (ATR阈值 {:.2}%, 静态回退 {:.1}%)",
+                    idx.name, idx.change_5min_pct, atr_threshold, self.config.index_plunge_5min_pct
+                ),
                 detail: AlertDetail {
                     price: None, change_pct: Some(idx.change_5min_pct),
                     volume_ratio: None, main_flow_yi: None,
-                    threshold: Some(self.config.index_plunge_5min_pct),
+                    threshold: Some(atr_threshold),
                     news_title: None, news_summary: None, ai_decision: None,
-                    t1_locked: false, extra: None,
+                    t1_locked: false,
+                    extra: Some(format!("ATR自适应当前阈值={:.3}%, 静态回退={:.1}%", atr_threshold, self.config.index_plunge_5min_pct)),
                 },
                 triggered_at: Local::now(),
             })
@@ -452,14 +474,14 @@ mod tests {
     #[test]
     fn test_index_plunge() {
         let d = Detector::new(DetectorConfig::default());
-        let idx = IndexSnapshot { name: "沪指".into(), change_pct: -1.5, change_5min_pct: -1.5 };
+        let idx = IndexSnapshot { name: "沪指".into(), change_pct: -1.5, change_5min_pct: -1.5, atr_pct: 0.0 };
         assert!(d.check_index_plunge(&idx).is_some());
     }
 
     #[test]
     fn test_index_normal() {
         let d = Detector::new(DetectorConfig::default());
-        let idx = IndexSnapshot { name: "沪指".into(), change_pct: -0.3, change_5min_pct: -0.3 };
+        let idx = IndexSnapshot { name: "沪指".into(), change_pct: -0.3, change_5min_pct: -0.3, atr_pct: 0.0 };
         assert!(d.check_index_plunge(&idx).is_none());
     }
 
