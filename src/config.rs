@@ -2,7 +2,7 @@
 //!
 //! SIGHUP 信号触发 reload。toml 缺失或格式错误 → 用代码默认值，不崩溃。
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::{LazyLock, RwLock};
 
 // ── 产业链规则 ──
@@ -304,8 +304,141 @@ static MONITOR_CONFIG: LazyLock<RwLock<MonitorConfig>> = LazyLock::new(|| {
     RwLock::new(MonitorConfig::default())
 });
 
+// 修复 P3.1: 集中风险/费用常量
+static RISK_CONFIG: LazyLock<RwLock<RiskConfig>> = LazyLock::new(|| {
+    RwLock::new(RiskConfig::default())
+});
+
+/// 修复 P3.1: 集中风险/费用常量
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RiskConfig {
+    pub trading: TradingConfig,
+    pub slippage: SlippageConfig,
+    pub performance: PerformanceConfig,
+    pub regime: RegimeConfig,
+    pub exposure: ExposureConfig,
+    pub alert: AlertConfig,
+}
+
+impl Default for RiskConfig {
+    fn default() -> Self {
+        Self {
+            trading: TradingConfig::default(),
+            slippage: SlippageConfig::default(),
+            performance: PerformanceConfig::default(),
+            regime: RegimeConfig::default(),
+            exposure: ExposureConfig::default(),
+            alert: AlertConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TradingConfig {
+    pub commission_rate: f64,
+    pub stamp_tax_rate: f64,
+    pub slippage_rate: f64,
+    pub min_commission: f64,
+    pub lot_size: u64,
+}
+impl Default for TradingConfig {
+    fn default() -> Self {
+        Self {
+            commission_rate: 0.0003,
+            stamp_tax_rate: 0.001,
+            slippage_rate: 0.001,
+            min_commission: 5.0,
+            lot_size: 100,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlippageConfig {
+    pub dynamic_enabled: bool,
+    pub alpha: f64,
+    pub adv_days: u32,
+}
+impl Default for SlippageConfig {
+    fn default() -> Self {
+        Self { dynamic_enabled: false, alpha: 0.1, adv_days: 20 }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerformanceConfig {
+    pub risk_free_rate: f64,
+    pub trading_days_year: u32,
+    pub sharpe_window: u32,
+    pub sortino_min_period: u32,
+}
+impl Default for PerformanceConfig {
+    fn default() -> Self {
+        Self { risk_free_rate: 0.03, trading_days_year: 252, sharpe_window: 60, sortino_min_period: 30 }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegimeConfig {
+    pub window_days: u32,
+    pub bull_threshold: f64,
+    pub bear_threshold: f64,
+    pub index_plunge_atr_mult: f64,
+    pub flow_outflow_threshold: f64,
+    pub flow_lookback_min: u32,
+}
+impl Default for RegimeConfig {
+    fn default() -> Self {
+        Self {
+            window_days: 20, bull_threshold: 0.03, bear_threshold: -0.03,
+            index_plunge_atr_mult: 2.0, flow_outflow_threshold: 0.5, flow_lookback_min: 15,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExposureConfig {
+    pub single_stock_max: f64,
+    pub single_sector_max: f64,
+    pub cash_floor: f64,
+    pub stop_loss_default: f64,
+}
+impl Default for ExposureConfig {
+    fn default() -> Self {
+        Self { single_stock_max: 0.10, single_sector_max: 0.40, cash_floor: 0.15, stop_loss_default: -0.10 }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertConfig {
+    pub min_importance_score: u8,
+    pub min_emergency_score: u8,
+    pub index_plunge_window_min: u32,
+    pub stale_data_max_age_sec: u64,
+}
+impl Default for AlertConfig {
+    fn default() -> Self {
+        Self { min_importance_score: 70, min_emergency_score: 85, index_plunge_window_min: 5, stale_data_max_age_sec: 30 }
+    }
+}
+
+/// 修复 P3.1: 读取集中风险配置
+pub fn get_risk_config() -> RiskConfig {
+    RISK_CONFIG.read().unwrap().clone()
+}
+
+/// 修复 P3.1: 集中加载 risk.toml
+pub fn load_risk_config() {
+    if let Ok(s) = std::fs::read_to_string("config/risk.toml") {
+        if let Ok(c) = toml::from_str::<RiskConfig>(&s) {
+            *RISK_CONFIG.write().unwrap() = c;
+        }
+    }
+}
+
 /// 尝试加载所有 toml 配置。失败不崩溃，保留旧值。
 pub fn load_all() {
+    load_risk_config();  // 修复 P3.1: 加载集中风险配置
     if let Ok(s) = std::fs::read_to_string("config/chain_rules.toml") {
         if let Ok(c) = toml::from_str::<ChainRulesFile>(&s) {
             *CHAIN_RULES.write().unwrap() = Some(c.rules);

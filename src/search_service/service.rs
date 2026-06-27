@@ -542,18 +542,33 @@ impl SearchService {
         }
 
         let mut queries = vec![base.to_string()];
+
+        // 紧凑锚点：通用宏观 base（含「重大新闻」）会让每条意图查询都背着同一段
+        // 泛化前缀（其中「政策 产业」还与意图词自我重复），导致 provider 拿到的是
+        // 一组高度同质的查询、结果大量重叠且浪费配额。此处仅对通用 base 压缩为
+        // 「今日 A股」锚点；调用方若传入的是具体主题（如「06月27日 机器人 最新
+        // 突发 催化」）则保持原文，确保产业链催化检索的针对性不被削弱。
+        let anchor: &str = if base.contains("重大新闻") {
+            "今日 A股"
+        } else {
+            base
+        };
+
+        // 维度顺序即采样优先级（max_intents 会截断尾部）。「技术突破」此前缺失，
+        // 导致科技/新品/研发类催化在源头被欠采样，故置于首位优先采集。
         let intents = [
+            "科技 技术突破 新品 研发 专利 量产",
             "政策 监管 会议 文件",
             "产业链 上游 下游 供需 价格",
-            "公司 公告 订单 并购 合作",
-            "风险 减持 处罚 违约 诉讼",
+            "公司 公告 订单 中标 并购 合作",
             "资金 北向 龙虎榜 主力",
             "海外 美联储 美股 大宗商品 汇率",
+            "风险 减持 处罚 违约 诉讼",
         ];
 
         let max_intents = max_results.clamp(3, 6).min(intent_cap);
         for intent in intents.iter().take(max_intents) {
-            queries.push(format!("{} {}", base, intent));
+            queries.push(format!("{} {}", anchor, intent));
         }
 
         queries
