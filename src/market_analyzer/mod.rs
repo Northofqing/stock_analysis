@@ -102,14 +102,15 @@ impl MarketAnalyzer {
     /// 拉取最新一日北向资金合计净流入（亿元）。
     /// 失败时返回 0.0 并 warn —— 符合 AGENTS.md "缺失数据 → warn log, 不静默填充"
     /// 但不阻断主流程（北向资金是次要指标，缺失不应让整个市场概览失败）。
+    ///
+    /// 修复 P1.1 hotfix: 用 `NorthFlowClient::fetch_blocking` 同步 HTTP
+    /// 不要在 async 上下文中用 `block_in_place + block_on`, 会触发
+    /// tokio runtime drop panic: "Cannot drop a runtime in a context
+    /// where blocking is not allowed" (P1.1 引入的回归).
     fn fetch_north_flow_latest(&self) -> f64 {
         use crate::data_provider::north_flow::NorthFlowClient;
         let client = NorthFlowClient::new();
-        // 复用 get_main_indices 的 block_in_place 模式
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move { client.fetch().await })
-        });
-        match result {
+        match client.fetch_blocking() {
             Ok(series) => {
                 let v = series.latest_total().unwrap_or(0.0);
                 info!("[大盘] 北向资金: {:+.2}亿", v);

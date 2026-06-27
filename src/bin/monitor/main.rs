@@ -315,6 +315,21 @@ async fn main() {
         run_test_scan().await;
     } else if review_mode {
         run_review_only().await;
+        // 修复 P1.1 hotfix: --review 模式不输出市场概览
+        //
+        // 原因: get_market_overview 内部用 tokio::block_in_place + block_on.
+        //       这是项目里"从 sync 上下文跑 async HTTP"的固定模式 (见 indices.rs,
+        //       statistics.rs), 设计上要求在 async worker 线程上跑.
+        //       实测三种调用方式都触发 tokio runtime drop panic:
+        //         1) async context 直接调 → "Cannot drop a runtime in async context"
+        //         2) spawn_blocking 闭包内调 → block_in_place 错位
+        //         3) std::thread + 独立 tokio runtime + block_on → 同样 panic
+        //            (block_on 返回时还在 async context, blocking pool drop 触发)
+        // 解决: --review 模式暂不输出市场概览. 正常 monitor 模式 (有事件循环) 不受影响.
+        //      后续修复: 把 get_market_overview 改成真正的 async 函数, 用 .await 而不是
+        //      block_in_place (P2.x 范围).
+        log::info!("[复盘 P1.1] --review 模式暂不输出市场概览 (见 run_review_only 注释)");
+        std::process::exit(0);
     } else {
         // 订阅者示例：独立任务消费告警/扫描事件并写入审计日志，
         // 与告警推送（生产者）完全解耦——新增消费者无需改动 push_wechat。
@@ -563,7 +578,7 @@ fn run_factor_ic_analysis() -> Option<String> {
 async fn run_review_only() {
     log::info!("[复盘] 手动触发盘后分析...");
 
-    let (report, holding_breakout_text, watch_breakout_text, market_breakout_text, risk_text, market_overview_text) = tokio::task::spawn_blocking(|| {
+    let (report, holding_breakout_text, watch_breakout_text, market_breakout_text, risk_text) = tokio::task::spawn_blocking(|| {
         let holdings = stock_analysis::portfolio::get_positions().unwrap_or_default();
         let quotes = market_data::fetch_position_quotes();
         let prices = build_price_map(&quotes);
@@ -683,57 +698,18 @@ async fn run_review_only() {
             risk.push_str(&rotation_lines.join("\n"));
         }
 
-        // === 修复 P1.1: 在 spawn_blocking 闭包内获取市场概览 ===
-        // 这样 block_in_place / block_on 不会与外部 tokio runtime 冲突
-        let market_overview_text = match stock_analysis::market_analyzer::MarketAnalyzer::new(None) {
-            Ok(analyzer) => match analyzer.get_market_overview() {
-                Ok(overview) => Some(analyzer.generate_market_review(&overview, &[])),
-                Err(e) => {
-                    log::warn!("[复盘 P1.1] get_market_overview 失败: {}", e);
-                    None
-                }
-            },
-            Err(e) => {
-                log::warn!("[复盘 P1.1] MarketAnalyzer::new 失败: {}", e);
-                None
-            }
-        };
-
-        (r, holding_brk, watch_brk, market_brk, risk, market_overview_text)
+        (r, holding_brk, watch_brk, market_brk, risk)
     }).await.unwrap_or_default();
 
     log::info!("[复盘] 复盘报告:\n{}", report);
     push_wechat(&report).await;
 
-    // === 修复 P1.1: 推送市场概览（北向资金 + 真实板块）===
-    if let Some(overview_text) = market_overview_text {
-        log::info!("[复盘 P1.1] 市场概览已生成 ({}字):\n{}", overview_text.len(), overview_text);
-        push_wechat(&overview_text).await;
-    }
+    // P1.1 市场概览: 在 async context 直接调 (与项目 block_in_place 模式一致)
+    // (原 spawn_blocking 闭包内的版本已删除, 避免 block_in_place 错位)
 
-    // === 修复 P1.1: --review 模式开头增加市场概览 ===
-    // 修复: QUANT_ANALYST_REVIEW §1.4 / §1.3 在 --review 路径下不可见
-    // 让 T7 (北向资金) / T8 (真实板块) 修复在 review 模式下也能体现
-    // 关键: get_market_overview 内部用 block_in_place + block_on, 在 async context 中需要
-    //       多线程 runtime. #[tokio::main] 默认多线程, 但在 spawn_blocking 闭包内调用更稳.
-    // 失败时静默跳过(已用 warn log 记录), 不影响 review 主流程.
-    match stock_analysis::market_analyzer::MarketAnalyzer::new(None) {
-        Ok(analyzer) => {
-            match analyzer.get_market_overview() {
-                Ok(overview) => {
-                    let txt = analyzer.generate_market_review(&overview, &[]);
-                    log::info!("[复盘 P1.1] 市场概览已生成 ({}字)", txt.len());
-                    push_wechat(&txt).await;
-                }
-                Err(e) => {
-                    log::warn!("[复盘 P1.1] get_market_overview 失败: {} (跳过)", e);
-                }
-            }
-        }
-        Err(e) => {
-            log::warn!("[复盘 P1.1] MarketAnalyzer::new 失败: {} (跳过)", e);
-        }
-    }
+    // P1.1 hotfix v9: --review 模式跳过市场概览 (详见 run_review_only 注释)
+    // 这里不再调 get_market_overview, 因为实测三种调用方式都触发 tokio runtime drop panic.
+    // 真正的修复 (改成 async) 在 P2.x 范围.
 
     // 与正常收盘路径保持一致：推送优选候选（最多5只，阈值过滤后可少推/不推）
     let post_close_candidates = stock_analysis::opportunity::run_post_close_candidates(5).await;

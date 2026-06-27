@@ -135,6 +135,21 @@ impl NorthFlowClient {
             .map_err(|e| format!("北向资金响应文本读取失败: {e}"))?;
         Self::parse(&text)
     }
+
+    /// 同步拉取（修复 P1.1 hotfix: 不依赖 tokio runtime, 避免 blocking pool panic）
+    ///
+    /// 用 `reqwest::blocking` 客户端, 适合从非 async context 调用
+    /// (例如 spawn_blocking 闭包, 或同步函数).
+    /// 用法与 `fetch` 相同, 只是不返回 Future.
+    pub fn fetch_blocking(&self) -> Result<NorthFlowSeries, String> {
+        let url = "https://push2.eastmoney.com/api/qt/kamt/get?fields1=f1,f2,f3,f4&fields2=f51,f52,f53,f54,f55,f56&klt=1&lmt=1&fields=f51,f52,f54";
+        let resp = reqwest::blocking::get(url)
+            .map_err(|e| format!("北向资金 HTTP 请求失败: {e}"))?;
+        let text = resp
+            .text()
+            .map_err(|e| format!("北向资金响应文本读取失败: {e}"))?;
+        Self::parse(&text)
+    }
 }
 
 impl Default for NorthFlowClient {
