@@ -93,7 +93,33 @@ impl MarketAnalyzer {
         // 3. 获取板块涨跌榜
         self.get_sector_rankings(&mut overview)?;
 
+        // 4. 获取北向资金（修复 QUANT_ANALYST_REVIEW §1.4）
+        overview.north_flow = self.fetch_north_flow_latest();
+
         Ok(overview)
+    }
+
+    /// 拉取最新一日北向资金合计净流入（亿元）。
+    /// 失败时返回 0.0 并 warn —— 符合 AGENTS.md "缺失数据 → warn log, 不静默填充"
+    /// 但不阻断主流程（北向资金是次要指标，缺失不应让整个市场概览失败）。
+    fn fetch_north_flow_latest(&self) -> f64 {
+        use crate::data_provider::north_flow::NorthFlowClient;
+        let client = NorthFlowClient::new();
+        // 复用 get_main_indices 的 block_in_place 模式
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async move { client.fetch().await })
+        });
+        match result {
+            Ok(series) => {
+                let v = series.latest_total().unwrap_or(0.0);
+                info!("[大盘] 北向资金: {:+.2}亿", v);
+                v
+            }
+            Err(e) => {
+                warn!("[大盘] 北向资金获取失败: {}，将显示 0", e);
+                0.0
+            }
+        }
     }
 
     /// 获取当日涨停股票列表
