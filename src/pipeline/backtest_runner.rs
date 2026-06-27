@@ -220,18 +220,33 @@ impl AnalysisPipeline {
     /// 抓取沪深300基准日线，构建 BenchmarkSeries（date->close）。
     /// 失败一律返回 None，绝不编造基准数据。
     async fn fetch_benchmark_series(&self, days: usize) -> Option<BenchmarkSeries> {
-        let code = "sh000300";
+        self.fetch_benchmark_series_with_code(
+            crate::strategy::core::benchmark_codes::HS300,
+            "沪深300",
+            days,
+        )
+        .await
+    }
+
+    /// 修复 P2.9: 支持多个基准 (按 strategy_kind 推荐)
+    /// 量化分析师建议: 不同策略用不同基准, 不要所有都用沪深300
+    async fn fetch_benchmark_series_with_code(
+        &self,
+        code: &str,
+        name: &str,
+        days: usize,
+    ) -> Option<BenchmarkSeries> {
         match self.data_manager.get_daily_data(code, days) {
             Ok((data, _)) if !data.is_empty() => {
                 let mut closes = std::collections::HashMap::new();
                 for k in &data {
                     closes.insert(k.date, k.close);
                 }
-                info!("✓ 基准沪深300已加载 {} 个交易日", closes.len());
-                Some(BenchmarkSeries::new("沪深300", closes))
+                info!("✓ 基准 {} ({}) 已加载 {} 个交易日", name, code, closes.len());
+                Some(BenchmarkSeries::new(name, closes))
             }
             _ => {
-                warn!("基准沪深300(sh000300)数据获取失败，回测报告将标注'基准数据缺失'");
+                warn!("基准 {}({}) 数据获取失败, 回测报告将标注'基准数据缺失'", name, code);
                 None
             }
         }

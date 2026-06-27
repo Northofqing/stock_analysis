@@ -768,6 +768,37 @@ impl BenchmarkSeries {
     }
 }
 
+/// 修复 P2.9: 常用基准指数代码常量
+/// 量化分析师建议: 不同策略用不同基准
+/// - 大盘股策略: 沪深300 (sh000300)
+/// - 中盘股策略: 中证500 (sh000905)
+/// - 小盘股策略: 中证1000 (sh000852) / 国证2000 (sz399303)
+/// - 创业板策略: 创业板指 (sz399006)
+/// - 科创板策略: 科创50 (sh000688)
+pub mod benchmark_codes {
+    pub const HS300: &str = "sh000300";      // 沪深300
+    pub const ZZ500: &str = "sh000905";      // 中证500
+    pub const ZZ1000: &str = "sh000852";     // 中证1000
+    pub const GZ2000: &str = "sz399303";     // 国证2000
+    pub const CHINEXT: &str = "sz399006";    // 创业板指
+    pub const STAR50: &str = "sh000688";     // 科创50
+    pub const SH_COMP: &str = "sh000001";    // 上证指数
+    pub const SZ_COMP: &str = "sz399001";    // 深证成指
+
+    /// 根据策略类型推荐基准
+    pub fn recommend_for_strategy(strategy_kind: &str) -> &'static str {
+        match strategy_kind {
+            "large_cap" => HS300,
+            "mid_cap" => ZZ500,
+            "small_cap" => ZZ1000,
+            "chinext" => CHINEXT,
+            "star" => STAR50,
+            "broad_market" => HS300,
+            _ => HS300, // 默认
+        }
+    }
+}
+
 /// 市场状态分类（基于基准指数的趋势）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegimeKind {
