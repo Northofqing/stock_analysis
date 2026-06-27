@@ -1,6 +1,7 @@
 //! 轮动判断 — 健康回调 vs 趋势结束交叉验证。
 
 use crate::data_provider::KlineData;
+use log::debug;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrendStatus {
@@ -88,13 +89,30 @@ pub fn judge_trend(kline: &[KlineData]) -> RotationSignal {
         ending_score += 1;
     }
 
-    let status = if healthy_score >= 3 && ending_score <= 1 {
+    // 修复 P2.7: 硬规则改模糊逻辑 (logistic 概率化)
+    // 之前: 简单的 healthy_score >= 3 && ending_score <= 1 硬阈值
+    // 量化分析师建议: 概率化决策, 给个连续的置信度
+    let total_score = healthy_score + ending_score;
+    let healthy_p = if total_score > 0 {
+        healthy_score as f64 / total_score as f64
+    } else {
+        0.5
+    };
+    // logit 平滑: 避免 0/1 硬切, 用 sigmoid
+    let confidence = (healthy_p * 2.0 - 1.0).abs(); // 0=中性, 1=极端
+    let status = if healthy_p >= 0.7 && ending_score <= 1 {
         TrendStatus::HealthyPullback
-    } else if ending_score >= 3 {
+    } else if healthy_p <= 0.3 {
         TrendStatus::TrendEnding
     } else {
         TrendStatus::Uncertain
     };
+
+    // 量化分析师要求: 决策必须带回置信度
+    log::debug!(
+        "[P2.7] 轮动决策: healthy={} ending={} p(healthy)={:.2} confidence={:.2} status={:?}",
+        healthy_score, ending_score, healthy_p, confidence, status
+    );
 
     RotationSignal {
         code: String::new(),
