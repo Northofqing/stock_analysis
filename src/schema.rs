@@ -94,6 +94,13 @@ diesel::table! {
         reason -> Text,
         traded_at -> Text,
         created_at -> Timestamp,
+        // 修复 P1.3: 量化分析师要求的真实业绩归因字段
+        commission_amount -> Nullable<Double>,
+        stamp_tax_amount -> Nullable<Double>,
+        slippage_amount -> Nullable<Double>,
+        realized_pnl -> Nullable<Double>,
+        strategy_tag -> Nullable<Text>,
+        signal_id -> Nullable<Text>,
     }
 }
 

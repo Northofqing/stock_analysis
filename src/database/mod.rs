@@ -210,6 +210,15 @@ impl DatabaseManager {
         Self::add_column_if_missing(conn, "stock_daily", "is_limit_down", "TINYINT NOT NULL DEFAULT 0")?;
         Self::add_column_if_missing(conn, "stock_daily", "is_suspended", "TINYINT NOT NULL DEFAULT 0")?;
 
+        // 老库升级：增量添加 6 列 (修复 P1.3 trades 业绩归因)
+        // 量化分析师要求: 必须能算真实 PnL (扣除 commission/stamp_tax/slippage)
+        Self::add_column_if_missing(conn, "trades", "commission_amount", "REAL DEFAULT 0")?;
+        Self::add_column_if_missing(conn, "trades", "stamp_tax_amount", "REAL DEFAULT 0")?;
+        Self::add_column_if_missing(conn, "trades", "slippage_amount", "REAL DEFAULT 0")?;
+        Self::add_column_if_missing(conn, "trades", "realized_pnl", "REAL DEFAULT 0")?;
+        Self::add_column_if_missing(conn, "trades", "strategy_tag", "TEXT DEFAULT ''")?;
+        Self::add_column_if_missing(conn, "trades", "signal_id", "TEXT DEFAULT ''")?;
+
         // 创建索引
         diesel::sql_query(
             "CREATE INDEX IF NOT EXISTS ix_stock_daily_code ON stock_daily(code)",
