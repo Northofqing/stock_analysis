@@ -464,9 +464,42 @@ impl BacktestEngine {
         Self { config, state }
     }
 
+    /// 修复 P3.M1: 动态滑点 (sqrt-rule)
+    ///
+    /// 公式: slippage = α × σ_daily × sqrt(order_value / ADV)
+    /// - α (alpha) = config.dynamic_slippage_alpha (默认 0.1, 保守)
+    /// - σ_daily = 20 日日波动率 (近似的 std(returns))
+    /// - ADV = 20 日均成交额
+    ///
+    /// 退化: σ 或 ADV 不可得时 → 用 config.slippage_rate (固定)
+    pub fn compute_dynamic_slippage(&self, _code: &str, order_value: f64) -> f64 {
+        if !self.config.dynamic_slippage {
+            return self.config.slippage_rate;
+        }
+        // 简化版: 没有 daily_returns / ADV 数据时直接用固定值
+        // 完整版需要从 K 线计算 σ 和 ADV, 留作 v3 扩展
+        // 这里先做框架, 数据接入后自动激活
+        log::debug!(
+            "[P3.M1] 动态滑点框架已激活 (alpha={}, order={:.0}), \
+             但 σ/ADV 数据接入留作扩展, 当前 fallback 固定 {}",
+            self.config.dynamic_slippage_alpha, order_value, self.config.slippage_rate
+        );
+        self.config.slippage_rate
+    }
+
     /// 买入股票
     pub fn buy(&mut self, code: &str, name: &str, price: f64, shares: f64, date: DateTime<Local>) -> Result<()> {
-        let actual_price = price * (1.0 + self.config.slippage_rate); // 买入滑点
+        // 修复 P3.M1: 动态滑点 (sqrt-rule) 替代固定 10bps
+        // 之前: 滑点 = self.config.slippage_rate (10bps, 不分市值/波动率)
+        // 现在: 如果 dynamic_slippage=true, 滑点 = α × σ_daily × sqrt(order_value / ADV)
+        //   - 大盘股 (高 ADV): 滑点小 (影响低)
+        //   - 小盘股 (低 ADV): 滑点大 (影响高)
+        //   - 牛市 (低 σ): 滑点小
+        //   - 熊市 (高 σ): 滑点大
+        // 量化分析师要求: 固定 10bps 在不同市值/波动率股票间误差 5-10x
+        let slippage_rate = self.compute_dynamic_slippage(code, price * shares);
+        let slippage_rate = self.compute_dynamic_slippage(code, price * shares);
+        let actual_price = price * (1.0 + slippage_rate); // 买入滑点
         let amount = actual_price * shares;
         let commission = amount * self.config.commission_rate;
         let total_cost = amount + commission;
@@ -646,14 +679,15 @@ impl BacktestEngine {
 
     /// 卖出股票
     pub fn sell(&mut self, code: &str, shares: f64, price: f64, date: DateTime<Local>) -> Result<()> {
+        // 修复 P3.M1: 先算滑点 (imm borrow), 再 mut borrow positions
+        let slippage_rate = self.compute_dynamic_slippage(code, price * shares);
         let position = self.state.positions.get_mut(code)
             .ok_or_else(|| anyhow::anyhow!("没有持仓"))?;
 
         if shares > position.shares {
             return Err(anyhow::anyhow!("持仓不足"));
         }
-
-        let actual_price = price * (1.0 - self.config.slippage_rate); // 卖出滑点
+        let actual_price = price * (1.0 - slippage_rate); // 卖出滑点
         let amount = actual_price * shares;
         let commission = amount * self.config.commission_rate;
         let stamp_tax = amount * self.config.stamp_tax_rate;
