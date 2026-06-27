@@ -42,17 +42,20 @@ pub fn load_watchlist() -> Result<Vec<Position>, String> {
 }
 
 /// 从 trades 表加载交易记录
+/// 修复 P1.1: SQL 注入风险
+/// 原代码用 format!() 拼接 SQL, 字段值含单引号或反斜杠时会破坏查询甚至被攻击
+/// 改用 ? 占位符 + bind 绑定, Diesel 自动转义
 pub fn load_trades_since(since: NaiveDate) -> Result<Vec<Trade>, String> {
+    use diesel::sql_types::{Date, Double, Integer, Text};
     let db = crate::database::DatabaseManager::get();
     let mut conn = db.get_conn().map_err(|e| e.to_string())?;
-    let sql = format!(
+    let rows: Vec<TradeRow> = diesel::sql_query(
         "SELECT id, code, name, direction, price, shares, amount, reason, traded_at \
-         FROM trades WHERE traded_at >= '{}' ORDER BY traded_at DESC",
-        since.format("%Y-%m-%d")
-    );
-    let rows: Vec<TradeRow> = diesel::sql_query(&sql)
-        .load(&mut *conn)
-        .map_err(|e| e.to_string())?;
+         FROM trades WHERE traded_at >= ? ORDER BY traded_at DESC"
+    )
+    .bind::<Date, _>(since)
+    .load(&mut *conn)
+    .map_err(|e| e.to_string())?;
     Ok(rows.into_iter().map(|r| Trade {
         id: Some(r.id.to_string()),
         code: r.code, name: r.name,
@@ -65,17 +68,21 @@ pub fn load_trades_since(since: NaiveDate) -> Result<Vec<Trade>, String> {
 }
 
 /// 检查今日是否有买入（DB 未初始化时返回 false）
+/// 修复 P1.1: SQL 注入风险 (改 ? 占位符)
 pub fn has_buy_today(code: &str, today: NaiveDate) -> Result<bool, String> {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        use diesel::sql_types::{Date, Integer, Text};
         let db = crate::database::DatabaseManager::get();
         let mut conn = db.get_conn().map_err(|e| e.to_string())?;
-        let sql = format!(
-            "SELECT COUNT(*) as cnt FROM trades WHERE code = '{}' AND direction = 'buy' AND traded_at = '{}'",
-            code, today.format("%Y-%m-%d")
-        );
         #[derive(QueryableByName, Debug)]
         struct Count { #[diesel(sql_type = diesel::sql_types::Integer)] cnt: i32 }
-        let result = diesel::sql_query(&sql).get_result::<Count>(&mut *conn).map_err(|e| e.to_string())?;
+        let result = diesel::sql_query(
+            "SELECT COUNT(*) as cnt FROM trades WHERE code = ? AND direction = 'buy' AND traded_at = ?"
+        )
+        .bind::<Text, _>(code)
+        .bind::<Date, _>(today)
+        .get_result::<Count>(&mut *conn)
+        .map_err(|e| e.to_string())?;
         Ok::<bool, String>(result.cnt > 0)
     }));
     match result {
@@ -85,28 +92,38 @@ pub fn has_buy_today(code: &str, today: NaiveDate) -> Result<bool, String> {
 }
 
 /// 保存净值快照
+/// 修复 P1.1: SQL 注入风险
 pub fn save_ledger(entry: LedgerEntry) -> Result<(), String> {
+    use diesel::sql_types::{Date, Double};
     let db = crate::database::DatabaseManager::get();
     let mut conn = db.get_conn().map_err(|e| e.to_string())?;
-    let sql = format!(
+    diesel::sql_query(
         "INSERT OR REPLACE INTO ledger (date, total_value, cash, market_value, daily_pnl) \
-         VALUES ('{}', {}, {}, {}, {})",
-        entry.date.format("%Y-%m-%d"), entry.total_value, entry.cash, entry.market_value, entry.daily_pnl
-    );
-    diesel::sql_query(&sql).execute(&mut *conn).map_err(|e| e.to_string())?;
+         VALUES (?, ?, ?, ?, ?)"
+    )
+    .bind::<Date, _>(entry.date)
+    .bind::<Double, _>(entry.total_value)
+    .bind::<Double, _>(entry.cash)
+    .bind::<Double, _>(entry.market_value)
+    .bind::<Double, _>(entry.daily_pnl)
+    .execute(&mut *conn)
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
 /// 加载净值时间序列
+/// 修复 P1.1: SQL 注入风险
 pub fn load_ledger(since: NaiveDate) -> Result<Vec<LedgerEntry>, String> {
+    use diesel::sql_types::Date;
     let db = crate::database::DatabaseManager::get();
     let mut conn = db.get_conn().map_err(|e| e.to_string())?;
-    let sql = format!(
+    let rows: Vec<LedgerRow> = diesel::sql_query(
         "SELECT date, total_value, cash, market_value, daily_pnl \
-         FROM ledger WHERE date >= '{}' ORDER BY date ASC",
-        since.format("%Y-%m-%d")
-    );
-    let rows: Vec<LedgerRow> = diesel::sql_query(&sql).load(&mut *conn).map_err(|e| e.to_string())?;
+         FROM ledger WHERE date >= ? ORDER BY date ASC"
+    )
+    .bind::<Date, _>(since)
+    .load(&mut *conn)
+    .map_err(|e| e.to_string())?;
     Ok(rows.into_iter().map(|r| LedgerEntry {
         date: NaiveDate::parse_from_str(&r.date, "%Y-%m-%d").unwrap_or(since),
         total_value: r.total_value, cash: r.cash,
