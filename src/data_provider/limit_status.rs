@@ -178,7 +178,8 @@ fn detect_board(code: &str) -> Board {
 }
 
 /// 严格匹配：^(ST|*ST|S*ST|SST)
-fn is_st_stock(name: &str) -> bool {
+/// 修复 P2.1: 公开给 market_analyzer 等模块复用, 避免散落各处的 `name.contains("ST")` 误判
+pub fn is_st_stock(name: &str) -> bool {
     name.starts_with("*ST")
         || name.starts_with("S*ST")
         || name.starts_with("SST")
@@ -194,6 +195,32 @@ impl Default for LimitStatusCalculator {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// 修复 P2.2: 判断某股在指定交易日是否处于"注册制新股上市前 5 个交易日"
+/// 这 5 天内 创业板/科创板/北交所新股 不设涨跌幅
+///
+/// **注意**: 真正的 IPO 日期需要从数据源拉取 (东财/同花顺).
+/// 这里用代码前缀 + 一个可配置的"近期上市"白名单 (默认空, 量化分析师按需填).
+/// 量化分析师建议: 接入 IPO 日期数据源, 取代硬编码白名单.
+pub fn is_ipo_first_5_days(code: &str, trade_date: chrono::NaiveDate) -> bool {
+    use once_cell::sync::Lazy;
+    use std::collections::HashMap;
+    // 近期 IPO 白名单 (code, 上市日期 YYYYMMDD)
+    // 量化分析师需维护这张表, 或接 IPO 数据源
+    static IPO_WHITELIST: Lazy<HashMap<&str, &str>> = Lazy::new(|| {
+        // 暂时为空, 量化分析师需手动维护或接入数据源
+        HashMap::new()
+    });
+    if let Some(start_str) = IPO_WHITELIST.get(code) {
+        if let Ok(start) = chrono::NaiveDate::parse_from_str(start_str, "%Y%m%d") {
+            let days = (trade_date - start).num_days();
+            return days >= 0 && days < 5;
+        }
+    }
+    // 兜底: 没法判断, 假设不是 IPO 前 5 日
+    let _ = (code, trade_date);
+    false
 }
 
 #[cfg(test)]
@@ -255,6 +282,14 @@ mod tests {
         assert_eq!(detect_board("830799"), Board::Bj);
         assert_eq!(detect_board("400001"), Board::Bj);
         assert_eq!(detect_board("920001"), Board::Bj);
+    }
+
+    #[test]
+    fn is_ipo_first_5_days_default_false() {
+        // 白名单为空, 默认 false
+        let d = chrono::NaiveDate::from_ymd_opt(2026, 6, 27).unwrap();
+        assert!(!is_ipo_first_5_days("300750", d));
+        assert!(!is_ipo_first_5_days("688981", d));
     }
 
     #[test]

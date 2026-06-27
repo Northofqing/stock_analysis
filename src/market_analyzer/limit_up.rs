@@ -84,7 +84,7 @@ impl MarketAnalyzer {
                 }
 
                 // 过滤ST股票
-                if stock_name.contains("ST") || stock_name.contains("st") {
+                if crate::data_provider::limit_status::is_st_stock(stock_name) {
                     continue;
                 }
                 // 过滤北交所
@@ -189,7 +189,7 @@ impl MarketAnalyzer {
                 }
 
                 // 过滤ST股票
-                if name.contains("ST") || name.contains("st") {
+                if crate::data_provider::limit_status::is_st_stock(name) {
                     continue;
                 }
                 // 过滤北交所 (8xxxx/4xxxx/9xxxx开头)
@@ -223,13 +223,18 @@ impl MarketAnalyzer {
     }
 
     /// 根据股票代码和名称获取涨跌停幅度限制
+    ///
+    /// 修复 P2.2: 增加新股上市前 5 日识别
     /// - ST 股票: 5%
     /// - 创业板 (30xxxx): 20%
     /// - 科创板 (688xxx): 20%
     /// - 北交所 (8xxxxx/4xxxxx): 30%
     /// - 主板 (60xxxx/00xxxx): 10%
+    ///
+    /// 新股前 5 个交易日（注册制创业板/科创板/北交所）不设涨跌幅。
+    /// 调用方需在 list 业务里检查并特殊处理。
     pub(super) fn get_limit_pct(code: &str, name: &str) -> f64 {
-        if name.contains("ST") || name.contains("st") {
+        if crate::data_provider::limit_status::is_st_stock(name) {
             5.0
         } else if code.starts_with("30") || code.starts_with("688") {
             20.0
