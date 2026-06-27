@@ -329,8 +329,6 @@ async fn main() {
         // 用 block_in_place 等独立线程结果 (async context, 不在 std::thread 里)
         let txt = tokio::task::block_in_place(|| rx.recv().unwrap_or_default());
         if !txt.is_empty() {
-            // 修复: 用 chars().count() 而非 len(), 区分字符数 vs 字节数
-            // (中文字符 UTF-8 占 3 字节, len() 会把 1 字当成 3 字)
             log::info!("[复盘 P1.1] 市场概览已生成 ({}字 / {}字节)", txt.chars().count(), txt.len());
             push_wechat(&txt).await;
         } else {

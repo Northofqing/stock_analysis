@@ -298,7 +298,7 @@ fn format_market_report(overview: &MarketOverview) -> String {
     let _ = writeln!(s, "| 平盘家数 | {} |", overview.flat_count);
     let _ = writeln!(s, "| 涨停 | {} |", overview.limit_up_count);
     let _ = writeln!(s, "| 跌停 | {} |", overview.limit_down_count);
-    let _ = writeln!(s, "| 两市成交额 | {:.0}亿 |", overview.total_amount);
+    let _ = writeln!(s, "| 两市成交额 (500只样本) | {:.0}亿 |", overview.total_amount);
     let _ = writeln!(s, "| 北向资金 | {:+.2}亿 |", overview.north_flow);
     let _ = writeln!(s);
     if !overview.top_sectors.is_empty() {
@@ -307,9 +307,20 @@ fn format_market_report(overview: &MarketOverview) -> String {
             let _ = writeln!(s, "- **{}**: {:+.2}%", s2.name, s2.change_pct);
         }
     }
-    if !overview.bottom_sectors.is_empty() {
+    // 修复: 只有当存在真正下跌的板块时才显示"领跌"段
+    // 之前可能显示 +0.5% 这种"最弱涨幅"被错标为"领跌", 误导
+    if !overview.bottom_sectors.is_empty()
+        && overview.bottom_sectors.iter().any(|s| s.change_pct < 0.0)
+    {
         let _ = writeln!(s);
         let _ = writeln!(s, "## 四、领跌板块");
+        for s2 in overview.bottom_sectors.iter() {
+            let _ = writeln!(s, "- **{}**: {:+.2}%", s2.name, s2.change_pct);
+        }
+    } else if !overview.bottom_sectors.is_empty() {
+        // 全市场普涨, 把最弱的几个标为"涨幅靠后"而不是"领跌"
+        let _ = writeln!(s);
+        let _ = writeln!(s, "## 四、涨幅靠后板块 (全市场普涨, 无下跌板块)");
         for s2 in overview.bottom_sectors.iter() {
             let _ = writeln!(s, "- **{}**: {:+.2}%", s2.name, s2.change_pct);
         }
