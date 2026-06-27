@@ -315,20 +315,26 @@ async fn main() {
         run_test_scan().await;
     } else if review_mode {
         run_review_only().await;
-        // 修复 P1.1 hotfix: --review 模式不输出市场概览
-        //
-        // 原因: get_market_overview 内部用 tokio::block_in_place + block_on.
-        //       这是项目里"从 sync 上下文跑 async HTTP"的固定模式 (见 indices.rs,
-        //       statistics.rs), 设计上要求在 async worker 线程上跑.
-        //       实测三种调用方式都触发 tokio runtime drop panic:
-        //         1) async context 直接调 → "Cannot drop a runtime in async context"
-        //         2) spawn_blocking 闭包内调 → block_in_place 错位
-        //         3) std::thread + 独立 tokio runtime + block_on → 同样 panic
-        //            (block_on 返回时还在 async context, blocking pool drop 触发)
-        // 解决: --review 模式暂不输出市场概览. 正常 monitor 模式 (有事件循环) 不受影响.
-        //      后续修复: 把 get_market_overview 改成真正的 async 函数, 用 .await 而不是
-        //      block_in_place (P2.x 范围).
-        log::info!("[复盘 P1.1] --review 模式暂不输出市场概览 (见 run_review_only 注释)");
+        // P1.1 真正修复 v5: 用 std::thread::spawn 调市场概览
+        // 原因: reqwest::blocking::Client::builder().build() 内部创建 tokio runtime
+        //       在 main async context 里 drop 时触发 panic (实测 v1~v4 全部 panic)
+        //       std::thread::spawn 启动独立线程, 不属于 main 的 tokio runtime
+        //       线程内创建 / drop runtime 都不会影响 main runtime
+        log::info!("[复盘 P1.1] 准备 std::thread::spawn 调市场概览...");
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let txt = stock_analysis::market_analyzer::async_overview::generate_market_overview_text_blocking();
+            let _ = tx.send(txt);
+        });
+        // 用 block_in_place 等独立线程结果 (async context, 不在 std::thread 里)
+        let txt = tokio::task::block_in_place(|| rx.recv().unwrap_or_default());
+        if !txt.is_empty() {
+            log::info!("[复盘 P1.1] 市场概览已生成 ({}字)", txt.len());
+            push_wechat(&txt).await;
+        } else {
+            log::warn!("[复盘 P1.1] 市场概览为空 (获取失败, 已跳过)");
+        }
+        // 干净退出 (避免 runtime drop panic)
         std::process::exit(0);
     } else {
         // 订阅者示例：独立任务消费告警/扫描事件并写入审计日志，

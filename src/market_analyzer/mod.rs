@@ -35,11 +35,14 @@ pub struct MarketAnalyzer {
     main_indices: HashMap<String, String>,
 }
 
+pub mod async_overview;
 mod indices;
 mod limit_up;
 pub mod review;
 pub mod sector_monitor;
 mod statistics;
+
+pub use async_overview::{generate_market_overview_text_blocking, get_market_overview_blocking};
 
 impl MarketAnalyzer {
     /// 主要指数代码
