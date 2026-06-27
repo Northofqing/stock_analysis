@@ -4,16 +4,20 @@
 
 pub mod bocha;
 pub mod cls;
+pub mod cninfo;
 pub mod eastmoney;
 pub mod jin10;
 pub mod serpapi;
+pub mod sse_szse;
 pub mod tavily;
 pub mod wallstreetcn;
 
 pub use bocha::BochaSearchProvider;
 pub use cls::ClsProvider;
+pub use cninfo::CninfoProvider;
 pub use eastmoney::EastmoneyNewsProvider;
 pub use jin10::{Jin10CalendarEvent, Jin10Provider};
 pub use serpapi::SerpAPISearchProvider;
+pub use sse_szse::SseSzseProvider;
 pub use tavily::TavilySearchProvider;
 pub use wallstreetcn::WallStreetCnProvider;

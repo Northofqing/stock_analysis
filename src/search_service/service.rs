@@ -9,8 +9,9 @@ use log::{info, warn};
 use crate::config::get_monitor_config;
 
 use super::providers::{
-    BochaSearchProvider, ClsProvider, EastmoneyNewsProvider, Jin10CalendarEvent, Jin10Provider,
-    SerpAPISearchProvider, TavilySearchProvider, WallStreetCnProvider,
+    BochaSearchProvider, ClsProvider, CninfoProvider, EastmoneyNewsProvider, Jin10CalendarEvent,
+    Jin10Provider, SerpAPISearchProvider, SseSzseProvider, TavilySearchProvider,
+    WallStreetCnProvider,
 };
 use super::types::{SearchProvider, SearchResponse, SearchResult};
 
@@ -91,6 +92,12 @@ impl SearchService {
 
         // 3. 财联社（免费直连，补充A股电报）
         providers.push(Box::new(ClsProvider::new()));
+
+        // 3b. 巨潮资讯（免费直连，A 股法定信披平台，沪深公告全覆盖）
+        providers.push(Box::new(CninfoProvider::new()));
+
+        // 3c. 沪深交易所（免费直连，上交所/深交所官方公告，按代码路由）
+        providers.push(Box::new(SseSzseProvider::new()));
 
         // 4. 金十数据（免费直连，补充快讯）
         // 见 providers/jin10.rs - 默认就是免费直连, 无 API Key

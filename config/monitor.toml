@@ -3,7 +3,7 @@
 screener_interval_min = 5
 opportunity_scan_interval_min = 10
 # 消息通知窗口（默认 08:00-24:00）
-news_window_start_hour = 8
+news_window_start_hour = 0
 news_window_end_hour = 24
 
 # 主题新闻去同质化配置（search_topic）

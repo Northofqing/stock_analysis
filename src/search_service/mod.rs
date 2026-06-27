@@ -20,8 +20,9 @@ pub mod types;
 
 // 保留原扁平路径，兼容 `crate::search_service::XXX` 调用
 pub use providers::{
-    BochaSearchProvider, ClsProvider, EastmoneyNewsProvider, Jin10CalendarEvent, Jin10Provider,
-    SerpAPISearchProvider, TavilySearchProvider, WallStreetCnProvider,
+    BochaSearchProvider, ClsProvider, CninfoProvider, EastmoneyNewsProvider, Jin10CalendarEvent,
+    Jin10Provider, SerpAPISearchProvider, SseSzseProvider, TavilySearchProvider,
+    WallStreetCnProvider,
 };
 pub use service::{get_search_service, SearchService};
 pub use types::{NewsType, SearchProvider, SearchResponse, SearchResult, Sentiment};
