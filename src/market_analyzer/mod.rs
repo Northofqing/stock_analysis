@@ -37,7 +37,7 @@ pub struct MarketAnalyzer {
 
 mod indices;
 mod limit_up;
-mod review;
+pub mod review;
 pub mod sector_monitor;
 mod statistics;
 

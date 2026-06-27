@@ -80,6 +80,9 @@ pub struct MonitorConfig {
     pub topic_history_memory_size: usize,
     #[serde(default = "default_topic_history_db_limit")]
     pub topic_history_db_limit: usize,
+    /// 主题/Web 搜索新闻的新鲜度窗口（天）：超过该阈值且能解析出发布日期的旧闻被丢弃（AGENTS.md §2.4）
+    #[serde(default = "default_topic_news_max_age_days")]
+    pub topic_news_max_age_days: i64,
     #[serde(default = "default_dq_quote_stale_sec")]
     pub dq_quote_stale_sec: u64,
     #[serde(default = "default_dq_position_stale_sec")]
@@ -120,6 +123,7 @@ fn default_topic_mmr_history_penalty() -> f32 { 1.4 }
 fn default_topic_history_window_hours() -> u64 { 72 }
 fn default_topic_history_memory_size() -> usize { 160 }
 fn default_topic_history_db_limit() -> usize { 400 }
+fn default_topic_news_max_age_days() -> i64 { 7 }
 fn default_dq_quote_stale_sec() -> u64 { 5 }
 fn default_dq_position_stale_sec() -> u64 { 30 }
 fn default_dq_nav_stale_sec() -> u64 { 24 * 3600 }
@@ -276,6 +280,7 @@ impl Default for MonitorConfig {
             topic_history_window_hours: 72,
             topic_history_memory_size: 160,
             topic_history_db_limit: 400,
+            topic_news_max_age_days: 7,
             dq_quote_stale_sec: 5,
             dq_position_stale_sec: 30,
             dq_nav_stale_sec: 24 * 3600,

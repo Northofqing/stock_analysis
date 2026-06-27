@@ -298,6 +298,103 @@ impl SearchService {
         self.providers.iter().any(|p| p.is_available())
     }
 
+    /// 尽力解析新闻发布日期，返回距今天数（用于主题新闻新鲜度过滤）。
+    ///
+    /// 兼容多种 provider 的日期格式：
+    /// - ISO / RFC3339 / RFC2822（Tavily、Bocha）
+    /// - 中文相对时间（百度/SerpAPI）："今天/昨天/前天/N分钟前/N小时前/N天前/N周前/N个月前"
+    /// - 中文绝对日期："YYYY年M月D日" / "M月D日"（无年份按今年推断）
+    /// - 英文 "Jun 20, 2026"
+    ///
+    /// 解析失败返回 `None`——调用方应保留该结果，不得静默丢弃（数据红线）。
+    fn topic_news_age_days(date_str: &str) -> Option<i64> {
+        use chrono::{Datelike, NaiveDate};
+
+        let s = date_str.trim();
+        if s.is_empty() {
+            return None;
+        }
+        let today = chrono::Local::now().date_naive();
+
+        // 1) 中文相对时间
+        if s.contains("今天") || s.contains("刚刚") || s.contains("分钟前") || s.contains("小时前") {
+            return Some(0);
+        }
+        if s.contains("昨天") {
+            return Some(1);
+        }
+        if s.contains("前天") {
+            return Some(2);
+        }
+        let lead_num: Option<i64> = s
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .ok();
+        if let Some(n) = lead_num {
+            if s.contains("天前") {
+                return Some(n);
+            }
+            if s.contains("周前") || s.contains("星期前") {
+                return Some(n * 7);
+            }
+            if s.contains("个月前") || s.contains("月前") {
+                return Some(n * 30);
+            }
+            if s.contains("年前") {
+                return Some(n * 365);
+            }
+        }
+
+        // 2) 中文绝对日期（先于 ISO 处理，避免对多字节串做字节切片）
+        if s.contains('年') || s.contains('月') {
+            let digits: Vec<i32> = s
+                .split(|c: char| !c.is_ascii_digit())
+                .filter(|x| !x.is_empty())
+                .filter_map(|x| x.parse().ok())
+                .collect();
+            if s.contains('年') && digits.len() >= 3 {
+                if let Some(d) =
+                    NaiveDate::from_ymd_opt(digits[0], digits[1] as u32, digits[2] as u32)
+                {
+                    return Some((today - d).num_days());
+                }
+            } else if s.contains('月') && digits.len() >= 2 {
+                let (m, day) = (digits[0] as u32, digits[1] as u32);
+                if let Some(cand) = NaiveDate::from_ymd_opt(today.year(), m, day) {
+                    // 无年份时按今年推断；若落在未来说明是去年的，回退一年
+                    let d = if cand > today {
+                        NaiveDate::from_ymd_opt(today.year() - 1, m, day).unwrap_or(cand)
+                    } else {
+                        cand
+                    };
+                    return Some((today - d).num_days());
+                }
+            }
+        }
+
+        // 3) ISO 前缀 YYYY-MM-DD（仅在前 10 字节为合法字符边界时切片）
+        if s.len() >= 10 && s.is_char_boundary(10) {
+            if let Ok(d) = NaiveDate::parse_from_str(&s[..10], "%Y-%m-%d") {
+                return Some((today - d).num_days());
+            }
+        }
+        // 4) RFC3339 / RFC2822
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+            return Some((today - dt.date_naive()).num_days());
+        }
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(s) {
+            return Some((today - dt.date_naive()).num_days());
+        }
+        // 5) 英文 "Jun 20, 2026"
+        if let Ok(d) = NaiveDate::parse_from_str(s, "%b %d, %Y") {
+            return Some((today - d).num_days());
+        }
+
+        None
+    }
+
     /// 通用主题搜索（去同质化）：
     /// 1) 单 query 自动扩展为多意图查询；
     /// 2) 多 provider 聚合而非首个成功即返回；
@@ -359,6 +456,39 @@ impl SearchService {
                     aggregated.push(r);
                 }
             }
+        }
+
+        if aggregated.is_empty() {
+            return Vec::new();
+        }
+
+        // 新鲜度门（AGENTS.md §2.4）：主题/Web 新闻超过 N 天视为过期（窗口可配置）。
+        // 能解析出发布日期且超阈值 → 丢弃并告警；解析不出 → 保留（不静默当成功）。
+        let max_age_days = get_monitor_config().topic_news_max_age_days.max(1);
+        let before = aggregated.len();
+        aggregated.retain(|r| {
+            match r
+                .published_date
+                .as_deref()
+                .and_then(Self::topic_news_age_days)
+            {
+                Some(age) if age > max_age_days => {
+                    warn!(
+                        "[topic] 丢弃过期新闻（{}天前）: {}",
+                        age,
+                        r.title.chars().take(40).collect::<String>()
+                    );
+                    false
+                }
+                _ => true,
+            }
+        });
+        let dropped = before - aggregated.len();
+        if dropped > 0 {
+            info!(
+                "[topic] 新鲜度过滤丢弃 {} 条（>{}天）",
+                dropped, max_age_days
+            );
         }
 
         if aggregated.is_empty() {
@@ -1236,5 +1366,33 @@ mod tests {
         } else {
             println!("未配置搜索引擎 API Key，跳过测试");
         }
+    }
+
+    #[test]
+    fn test_topic_news_age_days_parsing() {
+        use chrono::{Datelike, Duration};
+        let today = chrono::Local::now().date_naive();
+
+        // 中文相对时间
+        assert_eq!(SearchService::topic_news_age_days("3小时前"), Some(0));
+        assert_eq!(SearchService::topic_news_age_days("昨天 10:30"), Some(1));
+        assert_eq!(SearchService::topic_news_age_days("前天"), Some(2));
+        assert_eq!(SearchService::topic_news_age_days("5天前"), Some(5));
+        assert_eq!(SearchService::topic_news_age_days("2周前"), Some(14));
+
+        // ISO 与 RFC3339
+        let iso = (today - Duration::days(3)).format("%Y-%m-%d").to_string();
+        assert_eq!(SearchService::topic_news_age_days(&iso), Some(3));
+        let rfc = format!("{}T08:00:00+08:00", iso);
+        assert_eq!(SearchService::topic_news_age_days(&rfc), Some(3));
+
+        // 中文绝对日期（带年份）
+        let d = today - Duration::days(10);
+        let cn = format!("{}年{}月{}日", d.year(), d.month(), d.day());
+        assert_eq!(SearchService::topic_news_age_days(&cn), Some(10));
+
+        // 无法解析 → None（保留，不静默丢弃）
+        assert_eq!(SearchService::topic_news_age_days(""), None);
+        assert_eq!(SearchService::topic_news_age_days("近期"), None);
     }
 }

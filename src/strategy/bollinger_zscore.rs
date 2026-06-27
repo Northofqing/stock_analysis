@@ -351,16 +351,25 @@ impl BollingerZScoreBacktest {
         let mut all_single: Vec<SingleBacktestResult> = Vec::new();
 
         for (code, name, klines) in stocks {
-            // klines 从数据源拿到通常是降序（最新在前），需要反转为升序
-            let mut sorted = klines.clone();
-            sorted.sort_unstable_by(|a, b| a.date.cmp(&b.date));
+            // klines 从数据源拿到通常是降序（最新在前），已升序则直接借用避免克隆
+            let owned;
+            let sorted: &[KlineData] = if klines.windows(2).all(|w| w[0].date <= w[1].date) {
+                klines.as_slice()
+            } else {
+                owned = {
+                    let mut s = klines.clone();
+                    s.sort_unstable_by(|a, b| a.date.cmp(&b.date));
+                    s
+                };
+                &owned
+            };
 
             if sorted.len() < self.config.bb_window + 5 {
                 warn!("[{}] K线不足，跳过", code);
                 continue;
             }
 
-            match self.run_single(code, name, &sorted) {
+            match self.run_single(code, name, sorted) {
                 Ok(result) => {
                     info!(
                         "[{}] 回测完成: 收益 {:.2}%, 交易 {} 次",

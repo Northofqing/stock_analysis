@@ -29,4 +29,5 @@ pub mod alert_log;
 pub mod entity_linker;
 pub mod news_monitor;
 pub mod news_ai;
+pub mod event_bus;
 mod integration;

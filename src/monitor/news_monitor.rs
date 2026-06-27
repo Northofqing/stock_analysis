@@ -312,11 +312,23 @@ impl NewsMonitor {
             Ok(c) => c,
             Err(_) => return,
         };
-        for key in &self.seen_titles {
-            let _ = diesel::sql_query("INSERT OR IGNORE INTO news_dedup(key) VALUES (?1)")
-                .bind::<diesel::sql_types::Text, _>(key)
-                .execute(&mut *conn);
-        }
+        // 单事务内多行批量 INSERT，避免逐行 fsync 和逐行 SQL 解析
+        let keys: Vec<&String> = self.seen_titles.iter().collect();
+        let _ = conn.transaction::<_, diesel::result::Error, _>(|conn| {
+            for chunk in keys.chunks(200) {
+                let placeholders = std::iter::repeat("(?)")
+                    .take(chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let sql = format!("INSERT OR IGNORE INTO news_dedup(key) VALUES {placeholders}");
+                let mut q = diesel::sql_query(sql).into_boxed::<diesel::sqlite::Sqlite>();
+                for k in chunk {
+                    q = q.bind::<diesel::sql_types::Text, _>(*k);
+                }
+                q.execute(&mut *conn)?;
+            }
+            Ok(())
+        });
     }
 
     /// 启动时从 news_dedup 恢复今天的 seen_titles，清理过期 key
