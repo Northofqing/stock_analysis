@@ -237,7 +237,7 @@ mod tests {
             close,
             volume: 1_000_000.0,
             amount: 10_000_000.0,
-            pct_chg: 0.0,
+            pct_chg: 0.0, intraday_price: None, settled: true,
             pe_ratio: None,
             pb_ratio: None,
             turnover_rate: None,

@@ -65,6 +65,15 @@ pub struct KlineData {
     pub volume: f64,
     pub amount: f64,
     pub pct_chg: f64,
+    /// 修复 P1.8: 盘中实时价 (与 close 分离)
+    /// 之前: rustdx_provider 用 quote.price 覆盖 latest.close, 导致 Sharpe 用盘中价
+    ///       60 日滚动计算实际变成了盘中波动, 不是日线 settled close
+    /// 现在: intraday_price 单独存盘中价, close 保持日线 settled close
+    /// Sharpe 计算只用 close, 避免 look-ahead
+    pub intraday_price: Option<f64>,
+    /// 是否已收盘 (true: 收盘后 close 是最终价; false: 盘中 intraday 才是当前价)
+    /// 用于 Sharpe 计算时区分历史 vs 盘中
+    pub settled: bool,
     // 盈利水平相关字段
     pub pe_ratio: Option<f64>,        // 市盈率（动态）
     pub pb_ratio: Option<f64>,        // 市净率

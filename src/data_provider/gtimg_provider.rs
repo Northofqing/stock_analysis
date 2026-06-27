@@ -282,6 +282,7 @@ impl GtimgProvider {
                 volume,
                 amount,
                 pct_chg,
+                intraday_price: None, settled: true,
                 pe_ratio: None,        // K线数据中不包含，需要从实时行情获取
                 pb_ratio: None,
                 turnover_rate: None,

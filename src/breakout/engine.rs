@@ -242,7 +242,7 @@ mod tests {
         KlineData {
             date: NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap(),
             open, high: close.max(open), low: close.min(open), close, volume: vol,
-            amount: 0.0, pct_chg: pct, pe_ratio: None, pb_ratio: None,
+            amount: 0.0, pct_chg: pct, intraday_price: None, settled: true, pe_ratio: None, pb_ratio: None,
             turnover_rate: None, market_cap: None, circulating_cap: None,
             eps: None, roe: None, revenue_yoy: None, net_profit_yoy: None,
             gross_margin: None, net_margin: None, sharpe_ratio: None,

@@ -251,6 +251,7 @@ impl HttpProvider {
                 volume: parts[5].parse()?,
                 amount: parts[6].parse()?,
                 pct_chg: parts[7].parse()?,
+                intraday_price: None, settled: true,
                 pe_ratio: None,        // K线数据中不包含，需要从实时行情获取
                 pb_ratio: None,
                 turnover_rate: None,

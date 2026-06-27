@@ -957,6 +957,8 @@ mod tests {
             volume: vol,
             amount: vol * close,
             pct_chg: pct,
+            intraday_price: None,
+            settled: true,
             pe_ratio: None,
             pb_ratio: None,
             turnover_rate: None,
