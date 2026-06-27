@@ -204,20 +204,22 @@ impl Detector {
 
     pub fn check_limit_down(&self, s: &StockSnapshot) -> Option<AlertEvent> {
         if s.change_pct <= self.config.limit_down_pct {
-            let lvl = if s.t1_locked { AlertLevel::Emergency } else { AlertLevel::Emergency };
+            // 修复 P1.9: 去掉死分支 (两分支都是 Emergency)
+            // 跌停是严重的, T+1锁仓时尤其严重, 永远 Emergency
             let mut msg = format!("{} 跌幅 {:.1}%，跌停", s.name, s.change_pct);
             if s.t1_locked { msg.push_str(" ⚠️ T+1锁仓，不可当日卖出"); }
-            Some(self.build(s, AlertCategory::LimitDown, lvl, msg))
+            Some(self.build(s, AlertCategory::LimitDown, AlertLevel::Emergency, msg))
         } else { None }
     }
 
     pub fn check_main_outflow(&self, s: &StockSnapshot) -> Option<AlertEvent> {
         if s.main_net_yi <= -self.config.main_outflow_yi {
-            let lvl = if s.t1_locked { AlertLevel::Important } else { AlertLevel::Important };
+            // 修复 P1.9: 去掉死分支 (两分支都是 Important)
+            // 量化分析师要求: 死代码删除, 真实分级 (未来可按 magnitude 分 Important/Warning)
             let mut msg = format!("{} 主力净流出 {:.2}亿", s.name, -s.main_net_yi);
             if s.t1_locked { msg.push_str("（T+1锁仓中，观察收盘是否回补）"); }
             else { msg.push_str("，建议关注是否减仓"); }
-            Some(self.build(s, AlertCategory::MainOutflow, lvl, msg))
+            Some(self.build(s, AlertCategory::MainOutflow, AlertLevel::Important, msg))
         } else { None }
     }
 
