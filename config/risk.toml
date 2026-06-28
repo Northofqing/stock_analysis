@@ -1,0 +1,49 @@
+# =====================================================================
+# 修复 P3.1: 集中风险/费用常量配置
+# 量化分析师要求: 所有 magic numbers 集中到 toml, SIGHUP 热加载
+# 仓库纪律: 缺 toml 时有 const fallback (AGENTS.md §配置)
+# =====================================================================
+
+# A 股交易费率 (2024 监管标准)
+[trading]
+commission_rate = 0.0003   # 万三 (券商佣金, 含规费)
+stamp_tax_rate  = 0.001    # 千一 (印花税, 仅卖出)
+slippage_rate   = 0.001    # 千一 (滑点, 固定默认; 启用 dynamic_slippage 后用 sqrt-rule)
+min_commission  = 5.0      # 5 元 (A 股最低佣金)
+lot_size        = 100       # 1 手 = 100 股
+
+# 动态滑点 (修复 P1.4 / P3.M1)
+[slippage]
+dynamic_enabled    = false   # 默认关闭, 量化分析师按需启用
+alpha              = 0.1     # sqrt-rule 系数 (0.1-0.5, 0.1 保守)
+adv_days           = 20      # ADV 计算窗口
+
+# Sharpe / Sortino
+[performance]
+risk_free_rate   = 0.03     # 10Y 国债收益率 (2026 水平)
+trading_days_year = 252     # A 股年交易日数
+sharpe_window     = 60       # 滚动窗口
+sortino_min_period = 30      # Sortino 最小计算周期
+
+# 风险检测 (修复 P3.5 自适应阈值)
+[regime]
+window_days        = 20      # 市场状态检测窗口
+bull_threshold     = 0.03    # 20 日涨幅 > 3% → bull
+bear_threshold     = -0.03   # 20 日跌幅 < -3% → bear
+index_plunge_atr_mult = 2.0 # 大盘崩盘 ATR 倍数 (替代写死 -1%)
+flow_outflow_threshold = 0.5 # 主力净流出阈值 (亿)
+flow_lookback_min  = 15      # 资金流回溯窗口 (分钟)
+
+# 板块限制 (修复 P1.6)
+[exposure]
+single_stock_max  = 0.10     # 10% 单票上限
+single_sector_max = 0.40     # 40% 板块上限
+cash_floor        = 0.15     # 15% 现金底限
+stop_loss_default = -0.10    # -10% 默认止损
+
+# 推送/告警阈值
+[alert]
+min_importance_score = 70   # 重要告警最小分
+min_emergency_score  = 85   # 紧急告警最小分
+index_plunge_window_min = 5  # 5 分钟内崩盘检测窗口
+stale_data_max_age_sec = 30 # 行情数据最大陈旧时间 (秒)

@@ -6,12 +6,13 @@
 mod store;
 
 use chrono::{NaiveDate, NaiveDateTime};
+use serde::{Deserialize, Serialize};
 
 // ============================================================================
 // 公共结构（系统中唯一的 Position / Trade 定义）
 // ============================================================================
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Position {
     pub code: String,
     pub name: String,
@@ -20,9 +21,18 @@ pub struct Position {
     pub hard_stop: f64,
     pub added_at: NaiveDate,
     pub status: PositionStatus,
+    /// 修复 P1.6: 板块字段 (用于板块集中度检查)
+    /// 量化分析师要求: 同板块持仓总市值不能超 single_sector_max_pct
+    /// 默认 "其他" 表示未分类, 后续可接东财/同花顺的板块数据自动填充
+    #[serde(default = "default_sector")]
+    pub sector: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+fn default_sector() -> String {
+    "其他".to_string()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PositionStatus { Holding, Watching }
 
 impl PositionStatus {

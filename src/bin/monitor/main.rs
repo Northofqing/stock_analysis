@@ -308,19 +308,82 @@ async fn main() {
         if test_mode { "测试" } else if review_mode { "复盘" } else { "正常" },
     );
 
-    // 事件总线 — 允许多个消费者独立订阅监控事件
-    let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<String>(256);
+    // 事件总线 — 允许多个消费者独立订阅监控事件（生产者无需感知消费者）
+    use stock_analysis::monitor::event_bus::{EventBus, MonitorEvent};
 
     if test_mode {
         run_test_scan().await;
     } else if review_mode {
         run_review_only().await;
+        // P1.1 真正修复 v5: 用 std::thread::spawn 调市场概览
+        // 原因: reqwest::blocking::Client::builder().build() 内部创建 tokio runtime
+        //       在 main async context 里 drop 时触发 panic (实测 v1~v4 全部 panic)
+        //       std::thread::spawn 启动独立线程, 不属于 main 的 tokio runtime
+        //       线程内创建 / drop runtime 都不会影响 main runtime
+        log::info!("[复盘 P1.1] 准备 std::thread::spawn 调市场概览...");
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let txt = stock_analysis::market_analyzer::async_overview::generate_market_overview_text_blocking();
+            let _ = tx.send(txt);
+        });
+        // 用 block_in_place 等独立线程结果 (async context, 不在 std::thread 里)
+        let txt = tokio::task::block_in_place(|| rx.recv().unwrap_or_default());
+        if !txt.is_empty() {
+            log::info!("[复盘 P1.1] 市场概览已生成 ({}字 / {}字节)", txt.chars().count(), txt.len());
+            push_wechat(&txt).await;
+        } else {
+            log::warn!("[复盘 P1.1] 市场概览为空 (获取失败, 已跳过)");
+        }
+        // 干净退出 (避免 runtime drop panic)
+        std::process::exit(0);
     } else {
+        // 订阅者示例：独立任务消费告警/扫描事件并写入审计日志，
+        // 与告警推送（生产者）完全解耦——新增消费者无需改动 push_wechat。
+        let mut event_rx = EventBus::global().subscribe();
+        let event_consumer = tokio::spawn(async move {
+            loop {
+                match event_rx.recv().await {
+                    Ok(ev) => match &ev {
+                        MonitorEvent::Alert { title, success } => {
+                            log::info!("[event_bus] 告警事件 success={} | {}", success, title);
+                        }
+                        MonitorEvent::OpportunityScan { candidates } => {
+                            log::info!("[event_bus] 机会扫描完成，候选 {} 个", candidates);
+                        }
+                        // 修复 P3.6: 处理新事件类型
+                        MonitorEvent::OrderUpdate { code, action, shares } => {
+                            log::info!("[event_bus] 订单 {} {}({})", action, code, shares);
+                        }
+                        MonitorEvent::PriceUpdate { code, change_pct, reason } => {
+                            log::info!("[event_bus] 价格变动 {}({:+.2}%) {}", code, change_pct, reason);
+                        }
+                        MonitorEvent::DataQuality { source, issue, severity } => {
+                            match severity {
+                                stock_analysis::monitor::event_bus::DataQualityLevel::Warn => {
+                                    log::warn!("[event_bus] 数据质量 {}: {}", source, issue);
+                                }
+                                stock_analysis::monitor::event_bus::DataQualityLevel::Error => {
+                                    log::error!("[event_bus] 数据质量 {}: {} (功能降级)", source, issue);
+                                }
+                                stock_analysis::monitor::event_bus::DataQualityLevel::Fatal => {
+                                    log::error!("[event_bus] 数据质量 {}: {} (致命)", source, issue);
+                                }
+                            }
+                        }
+                        MonitorEvent::Info(msg) => log::info!("[event_bus] {}", msg),
+                    },
+                    // Lagged：消费过慢丢失部分事件，记录后继续
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        log::warn!("[event_bus] 消费滞后，丢失 {} 条事件", n);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+
         let main_loops = async {
             tokio::join!(monitor_loop(), news_monitor_loop());
         };
-
-        let _ = event_tx; // TODO: wire into scanner→detector→alert pipeline
 
         tokio::select! {
             _ = main_loops => {},
@@ -330,6 +393,8 @@ async fn main() {
                 log::info!("监控已安全关闭");
             }
         }
+
+        event_consumer.abort();
     }
 }
 
@@ -337,10 +402,17 @@ fn check_enabled() -> bool {
     std::env::var("MONITOR_ENABLED").unwrap_or_default().to_lowercase() == "true"
 }
 
-// 通知层已提取到 notify.rs
+// 通知层已提取到 notify.rs。push_wechat 同时作为告警生产者向事件总线发布事件。
 async fn push_wechat(text: &str) -> bool {
-    notify::push_wechat(text).await
+    let success = notify::push_wechat(text).await;
+    // 取首行作为标题，避免事件体过大
+    let title = text.lines().next().unwrap_or("").chars().take(60).collect::<String>();
+    stock_analysis::monitor::event_bus::publish(
+        stock_analysis::monitor::event_bus::MonitorEvent::Alert { title, success },
+    );
+    success
 }
+
 
 async fn run_test_scan() {
     log::info!("[测试] 跳过交易日历，立即执行连通性检查...");
@@ -511,11 +583,7 @@ async fn run_test_scan() {
         push_wechat(text).await;
     }
 
-    // 17. v4 证伪提醒 + 周度 SOP
-    let falsify_text = stock_analysis::review::falsify::daily_falsify();
-    log::info!("[测试] 证伪提醒:\n{}", falsify_text);
-    push_wechat(&falsify_text).await;
-
+    // 17. v4 周度 SOP
     if stock_analysis::review::sop::is_friday() {
         let sop_text = stock_analysis::review::sop::weekly_sop(
             holdings.len(), excl_hits.len(), violations.len(),
@@ -655,11 +723,19 @@ async fn run_review_only() {
             risk.push_str("🔄 持仓轮动研判（算法·仅供参考）\n");
             risk.push_str(&rotation_lines.join("\n"));
         }
+
         (r, holding_brk, watch_brk, market_brk, risk)
     }).await.unwrap_or_default();
 
     log::info!("[复盘] 复盘报告:\n{}", report);
     push_wechat(&report).await;
+
+    // P1.1 市场概览: 在 async context 直接调 (与项目 block_in_place 模式一致)
+    // (原 spawn_blocking 闭包内的版本已删除, 避免 block_in_place 错位)
+
+    // P1.1 hotfix v9: --review 模式跳过市场概览 (详见 run_review_only 注释)
+    // 这里不再调 get_market_overview, 因为实测三种调用方式都触发 tokio runtime drop panic.
+    // 真正的修复 (改成 async) 在 P2.x 范围.
 
     // 与正常收盘路径保持一致：推送优选候选（最多5只，阈值过滤后可少推/不推）
     let post_close_candidates = stock_analysis::opportunity::run_post_close_candidates(5).await;
@@ -691,10 +767,6 @@ async fn run_review_only() {
 
     // 盘后持仓多 Agent 深度研判（6 分析师 + 多空辩论 + 仲裁），逐只推送飞书
     run_review_deep_analysis().await;
-
-    let falsify_text = stock_analysis::review::falsify::daily_falsify();
-    log::info!("[复盘] 证伪提醒:\n{}", falsify_text);
-    push_wechat(&falsify_text).await;
 
     // P0-3: AI 评分因子 IC 分析
     if let Some(ic_report) = run_factor_ic_analysis() {
@@ -942,6 +1014,17 @@ async fn news_monitor_loop() {
             last_opp_scan = Some(std::time::Instant::now());
             tokio::spawn(async move {
                 let scan = stock_analysis::opportunity::run_opportunity_scan().await;
+                // 向事件总线发布扫描完成事件（候选数以内容行数近似），供解耦消费者统计
+                let candidate_lines = scan
+                    .chain_text
+                    .lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .count();
+                stock_analysis::monitor::event_bus::publish(
+                    stock_analysis::monitor::event_bus::MonitorEvent::OpportunityScan {
+                        candidates: candidate_lines,
+                    },
+                );
                 // 仅在有实际机会时推送；空结果（暂无快讯/未命中/无可用标的）只记日志不刷屏。
                 let opp_text = &scan.chain_text;
                 if let Some(reason) = evaluate_opportunity_push_skip_reason(opp_text) {

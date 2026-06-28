@@ -18,6 +18,7 @@ pub fn load_positions() -> Result<Vec<Position>, String> {
         added_at: NaiveDate::parse_from_str(&r.buy_date, "%Y-%m-%d")
             .unwrap_or_else(|_| NaiveDate::from_ymd_opt(2025, 1, 1).unwrap()),
         status: PositionStatus::Holding,
+        sector: "其他".into(),
     }).collect())
 }
 
@@ -37,22 +38,26 @@ pub fn load_watchlist() -> Result<Vec<Position>, String> {
             shares: 0, cost_price: 0.0, hard_stop: 0.0,
             added_at: NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
             status: PositionStatus::Watching,
+            sector: "其他".into(),
         }
     }).collect())
 }
 
 /// 从 trades 表加载交易记录
+/// 修复 P1.1: SQL 注入风险
+/// 原代码用 format!() 拼接 SQL, 字段值含单引号或反斜杠时会破坏查询甚至被攻击
+/// 改用 ? 占位符 + bind 绑定, Diesel 自动转义
 pub fn load_trades_since(since: NaiveDate) -> Result<Vec<Trade>, String> {
+    use diesel::sql_types::{Date, Double, Integer, Text};
     let db = crate::database::DatabaseManager::get();
     let mut conn = db.get_conn().map_err(|e| e.to_string())?;
-    let sql = format!(
+    let rows: Vec<TradeRow> = diesel::sql_query(
         "SELECT id, code, name, direction, price, shares, amount, reason, traded_at \
-         FROM trades WHERE traded_at >= '{}' ORDER BY traded_at DESC",
-        since.format("%Y-%m-%d")
-    );
-    let rows: Vec<TradeRow> = diesel::sql_query(&sql)
-        .load(&mut *conn)
-        .map_err(|e| e.to_string())?;
+         FROM trades WHERE traded_at >= ? ORDER BY traded_at DESC"
+    )
+    .bind::<Date, _>(since)
+    .load(&mut *conn)
+    .map_err(|e| e.to_string())?;
     Ok(rows.into_iter().map(|r| Trade {
         id: Some(r.id.to_string()),
         code: r.code, name: r.name,
@@ -65,17 +70,21 @@ pub fn load_trades_since(since: NaiveDate) -> Result<Vec<Trade>, String> {
 }
 
 /// 检查今日是否有买入（DB 未初始化时返回 false）
+/// 修复 P1.1: SQL 注入风险 (改 ? 占位符)
 pub fn has_buy_today(code: &str, today: NaiveDate) -> Result<bool, String> {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        use diesel::sql_types::{Date, Integer, Text};
         let db = crate::database::DatabaseManager::get();
         let mut conn = db.get_conn().map_err(|e| e.to_string())?;
-        let sql = format!(
-            "SELECT COUNT(*) as cnt FROM trades WHERE code = '{}' AND direction = 'buy' AND traded_at = '{}'",
-            code, today.format("%Y-%m-%d")
-        );
         #[derive(QueryableByName, Debug)]
         struct Count { #[diesel(sql_type = diesel::sql_types::Integer)] cnt: i32 }
-        let result = diesel::sql_query(&sql).get_result::<Count>(&mut *conn).map_err(|e| e.to_string())?;
+        let result = diesel::sql_query(
+            "SELECT COUNT(*) as cnt FROM trades WHERE code = ? AND direction = 'buy' AND traded_at = ?"
+        )
+        .bind::<Text, _>(code)
+        .bind::<Date, _>(today)
+        .get_result::<Count>(&mut *conn)
+        .map_err(|e| e.to_string())?;
         Ok::<bool, String>(result.cnt > 0)
     }));
     match result {
@@ -85,33 +94,120 @@ pub fn has_buy_today(code: &str, today: NaiveDate) -> Result<bool, String> {
 }
 
 /// 保存净值快照
+/// 修复 P1.1: SQL 注入风险
 pub fn save_ledger(entry: LedgerEntry) -> Result<(), String> {
+    use diesel::sql_types::{Date, Double};
     let db = crate::database::DatabaseManager::get();
     let mut conn = db.get_conn().map_err(|e| e.to_string())?;
-    let sql = format!(
+    diesel::sql_query(
         "INSERT OR REPLACE INTO ledger (date, total_value, cash, market_value, daily_pnl) \
-         VALUES ('{}', {}, {}, {}, {})",
-        entry.date.format("%Y-%m-%d"), entry.total_value, entry.cash, entry.market_value, entry.daily_pnl
-    );
-    diesel::sql_query(&sql).execute(&mut *conn).map_err(|e| e.to_string())?;
+         VALUES (?, ?, ?, ?, ?)"
+    )
+    .bind::<Date, _>(entry.date)
+    .bind::<Double, _>(entry.total_value)
+    .bind::<Double, _>(entry.cash)
+    .bind::<Double, _>(entry.market_value)
+    .bind::<Double, _>(entry.daily_pnl)
+    .execute(&mut *conn)
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
 /// 加载净值时间序列
+/// 修复 P1.1: SQL 注入风险
 pub fn load_ledger(since: NaiveDate) -> Result<Vec<LedgerEntry>, String> {
+    use diesel::sql_types::Date;
     let db = crate::database::DatabaseManager::get();
     let mut conn = db.get_conn().map_err(|e| e.to_string())?;
-    let sql = format!(
+    let rows: Vec<LedgerRow> = diesel::sql_query(
         "SELECT date, total_value, cash, market_value, daily_pnl \
-         FROM ledger WHERE date >= '{}' ORDER BY date ASC",
-        since.format("%Y-%m-%d")
-    );
-    let rows: Vec<LedgerRow> = diesel::sql_query(&sql).load(&mut *conn).map_err(|e| e.to_string())?;
+         FROM ledger WHERE date >= ? ORDER BY date ASC"
+    )
+    .bind::<Date, _>(since)
+    .load(&mut *conn)
+    .map_err(|e| e.to_string())?;
     Ok(rows.into_iter().map(|r| LedgerEntry {
         date: NaiveDate::parse_from_str(&r.date, "%Y-%m-%d").unwrap_or(since),
         total_value: r.total_value, cash: r.cash,
         market_value: r.market_value, daily_pnl: r.daily_pnl,
     }).collect())
+}
+
+/// 修复 P3.9: 实盘 rolling Sharpe (基于 ledger 净值)
+/// 计算最近 N 日的年化 Sharpe, rf=0.03 (与 sharpe_calculator 一致)
+/// 返回 None 当数据 < 30 日 (样本不足)
+pub fn live_rolling_sharpe(ledger: &[LedgerEntry], window: usize) -> Option<f64> {
+    if ledger.len() < 30 {
+        return None;
+    }
+    let recent = &ledger[ledger.len().saturating_sub(window)..];
+    if recent.len() < 2 {
+        return None;
+    }
+    let mut returns = Vec::new();
+    for w in recent.windows(2) {
+        if w[0].total_value > 0.0 {
+            returns.push((w[1].total_value - w[0].total_value) / w[0].total_value);
+        }
+    }
+    if returns.len() < 5 {
+        return None;
+    }
+    let mean: f64 = returns.iter().sum::<f64>() / returns.len() as f64;
+    let variance: f64 = returns.iter()
+        .map(|r| (r - mean).powi(2))
+        .sum::<f64>() / returns.len() as f64;
+    let std = variance.sqrt();
+    if std <= 0.0 {
+        return None;
+    }
+    let rf_daily = 0.03 / 252.0;
+    let ann_factor = 252.0_f64.sqrt();
+    Some((mean - rf_daily) * ann_factor / std)
+}
+
+/// 修复 P3.10: 策略相关性矩阵
+/// 输入多个策略的日收益率序列 (Vec<Vec<f64>>), 输出 (n, n) 相关性矩阵
+/// 量化分析师要求: 多策略组合时, 相关性 > 0.7 的策略对要降权
+pub fn strategy_correlation_matrix(daily_returns: &[Vec<f64>]) -> Vec<Vec<f64>> {
+    let n = daily_returns.len();
+    let mut matrix = vec![vec![0.0; n]; n];
+    for i in 0..n {
+        for j in 0..n {
+            if i == j {
+                matrix[i][j] = 1.0;
+            } else {
+                matrix[i][j] = pearson_corr(&daily_returns[i], &daily_returns[j]);
+            }
+        }
+    }
+    matrix
+}
+
+fn pearson_corr(xs: &[f64], ys: &[f64]) -> f64 {
+    let n = xs.len().min(ys.len());
+    if n < 5 {
+        return 0.0;
+    }
+    let (xs, ys) = (&xs[..n], &ys[..n]);
+    let mean_x: f64 = xs.iter().sum::<f64>() / n as f64;
+    let mean_y: f64 = ys.iter().sum::<f64>() / n as f64;
+    let mut cov = 0.0;
+    let mut var_x = 0.0;
+    let mut var_y = 0.0;
+    for k in 0..n {
+        let dx = xs[k] - mean_x;
+        let dy = ys[k] - mean_y;
+        cov += dx * dy;
+        var_x += dx * dx;
+        var_y += dy * dy;
+    }
+    let denom = (var_x * var_y).sqrt();
+    if denom <= 0.0 {
+        0.0
+    } else {
+        cov / denom
+    }
 }
 
 // ── diesel raw query row types ──

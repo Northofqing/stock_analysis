@@ -11,6 +11,5 @@ pub mod journal;
 pub mod equity;
 pub mod report;
 pub mod sop;
-pub mod falsify;
 pub mod factor_ic;
 pub mod factor_report;

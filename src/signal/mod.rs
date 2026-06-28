@@ -3,11 +3,11 @@
 //! 不重写 trend_analyzer/detector/strategy 的内部逻辑，
 //! 只定义它们输出信号的统一格式。保留每个指标的文字描述，不压缩成单分数。
 //!
-//! FIXME(architecture): Signal/SignalSet are defined but not imported by any module.
-//! They should serve as the canonical signal vocabulary for monitor, pipeline, and decision
-//! contexts. See ARCHITECTURE_REVIEW.md Finding F1.
+//! v9 流水线扩展: `market_event` 是事件→评分全链路标准中间件 (NS1)
 
 use chrono::NaiveDateTime;
+
+pub mod market_event;
 
 #[derive(Debug, Clone)]
 pub struct Signal {

@@ -260,7 +260,12 @@ impl AgentRunner {
                 
                 let cleaned_json = critic_text.trim_start_matches("```json").trim_end_matches("```").trim();
                 let eval: serde_json::Value = serde_json::from_str(cleaned_json).unwrap_or(serde_json::Value::Null);
-                let score = eval.get("score").and_then(|v| v.as_i64()).unwrap_or(100);
+                // 修复 P2.3 silent fail: 解析失败应得 0 分, 不是 100 分
+                // 之前: unwrap_or(100) → JSON 解析失败反而给满分, 完全反语义
+                let score = eval.get("score").and_then(|v| v.as_i64()).unwrap_or_else(|| {
+                    log::warn!("[P2.3] critic JSON 解析失败, 默认 score=0, raw={:?}", cleaned_json);
+                    0
+                });
                 let feedback = eval.get("feedback").and_then(|v| v.as_str()).unwrap_or("没有有效反馈").to_string();
 
                 match score {

@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 use chrono::{Local, NaiveDate, TimeZone};
-use log::{info, warn};
+use log::{info, warn, debug};
 use polars::prelude::*;
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -913,24 +913,41 @@ impl RsiBacktest {
                 let buy_price = next_open * (1.0 + self.config.slippage_rate);
                 let invest = cash.min(self.config.initial_capital * self.config.add_on_position_pct);
                 let add_shares = (invest / buy_price).floor();
-                if add_shares > 0.0 {
-                    let amount = add_shares * buy_price;
+
+                // 修复 P1.5: 硬性单股总仓位上限 (防止隐性杠杆)
+                // 之前: 加仓后 shares 可能 1.4× / 2× max_position_pct
+                // 量化分析师要求: 加仓后单股总仓位硬性 ≤ max_position_pct
+                let current_position_value = shares * avg_cost;
+                let new_position_value = add_shares * buy_price;
+                let max_position_value = self.config.initial_capital * self.config.max_position_pct;
+                let remaining_capacity = (max_position_value - current_position_value).max(0.0);
+                let capped_invest = invest.min(remaining_capacity);
+                let capped_shares = (capped_invest / buy_price).floor();
+
+                if capped_shares > 0.0 {
+                    let amount = capped_shares * buy_price;
                     let comm = amount * self.config.commission_rate;
                     cash -= amount + comm;
-                    avg_cost = (avg_cost * shares + amount) / (shares + add_shares);
-                    shares += add_shares;
+                    avg_cost = (avg_cost * shares + amount) / (shares + capped_shares);
+                    shares += capped_shares;
                     min_rsi_in_pos = rsi;
                     trades.push(Trade {
                         date: next_dt,
                         code: code.to_string(),
                         name: name.to_string(),
                         action: TradeAction::Buy,
-                        shares: add_shares,
+                        shares: capped_shares,
                         price: buy_price,
                         amount,
                         commission: comm,
                     });
                     signals.push(Signal::Buy);
+                    if add_shares > capped_shares {
+                        log::debug!(
+                            "[P1.5] RSI 加仓被 max_position_pct 限制: 想要 {} 股, 实际 {} 股 (单股总仓位硬性 ≤ {:.0}%)",
+                            add_shares, capped_shares, self.config.max_position_pct * 100.0
+                        );
+                    }
                     continue;
                 }
             }
@@ -1018,15 +1035,25 @@ impl RsiBacktest {
 
         let mut all_single: Vec<SingleRsiResult> = Vec::new();
         for (code, name, klines) in stocks {
-            let mut sorted = klines.clone();
-            sorted.sort_unstable_by(|a, b| a.date.cmp(&b.date));
+            // 已升序则直接借用，避免不必要的全量克隆
+            let owned;
+            let sorted: &[KlineData] = if klines.windows(2).all(|w| w[0].date <= w[1].date) {
+                klines.as_slice()
+            } else {
+                owned = {
+                    let mut s = klines.clone();
+                    s.sort_unstable_by(|a, b| a.date.cmp(&b.date));
+                    s
+                };
+                &owned
+            };
 
             if sorted.len() < self.config.rsi_period + 5 {
                 warn!("[{}] K线不足，跳过 RSI 回测", code);
                 continue;
             }
 
-            match self.run_single(code, name, &sorted) {
+            match self.run_single(code, name, sorted) {
                 Ok(r) => {
                     info!(
                         "[{}] RSI 回测完成: 收益 {:.2}%, 交易 {} 次",

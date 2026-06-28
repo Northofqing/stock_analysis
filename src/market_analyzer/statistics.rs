@@ -147,46 +147,22 @@ impl MarketAnalyzer {
     }
 
     /// 获取板块涨跌榜
+    ///
+    /// 修复：QUANT_ANALYST_REVIEW §1.3
+    /// 原 bug：用 `name.len() MOD 3` 伪随机生成板块涨跌数据，喂给 AI 提示词。
+    /// 违反 AGENTS.md "All data must be real. No mock data in production paths"。
+    ///
+    /// 修复方案：调用东财 `clist/get` 接口（m:90+t:2 行业板块）拉真实板块涨跌榜。
+    /// 失败时返回 Err，让上层走"数据不可用"分支；不静默填充任何伪数据。
     pub(super) fn get_sector_rankings(&self, overview: &mut MarketOverview) -> Result<()> {
         info!("[大盘] 获取板块涨跌榜...");
 
-        // 由于外部API限制，使用模拟的板块数据
-        // 基于市场整体表现生成合理的板块数据
-        let market_trend = if overview.up_count > overview.down_count {
-            1.0 // 市场上涨
-        } else if overview.up_count < overview.down_count {
-            -1.0 // 市场下跌
-        } else {
-            0.0 // 震荡
-        };
+        // 拉取真实板块数据
+        let sectors_data = self.fetch_real_sector_rankings(20)?;
 
-        // 常见热门板块及其相对强度（模拟）
-        let sectors_template = vec![
-            ("半导体", 1.2),
-            ("新能源", 1.1),
-            ("医药", 0.9),
-            ("证券", 1.3),
-            ("银行", 0.7),
-            ("房地产", 0.6),
-            ("煤炭", 0.8),
-            ("有色金属", 1.0),
-            ("白酒", 0.85),
-            ("军工", 1.15),
-        ];
-
-        // 根据市场趋势生成板块数据
-        let mut sectors_data: Vec<(String, f64)> = sectors_template
-            .iter()
-            .map(|(name, strength)| {
-                // 基准涨跌幅 = 市场趋势 * 板块强度 + 随机波动
-                let base = market_trend * strength * 1.5;
-                let variation = (name.len() % 3) as f64 * 0.3 - 0.3; // 简单的伪随机
-                (name.to_string(), base + variation)
-            })
-            .collect();
-
-        // 排序
-        sectors_data.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        if sectors_data.is_empty() {
+            anyhow::bail!("板块涨跌榜为空，不使用任何替代数据");
+        }
 
         // 领涨板块（前3）
         for (name, change_pct) in sectors_data.iter().take(3) {
@@ -196,7 +172,7 @@ impl MarketAnalyzer {
             });
         }
 
-        // 领跌板块（后3）  
+        // 领跌板块（后3）
         for (name, change_pct) in sectors_data.iter().rev().take(3) {
             overview.bottom_sectors.push(SectorInfo {
                 name: name.clone(),
@@ -205,7 +181,7 @@ impl MarketAnalyzer {
         }
 
         info!(
-            "[大盘] 生成 {} 个板块数据（基于市场趋势），领涨:{} 领跌:{}",
+            "[大盘] 真实板块数据 {} 条, 领涨:{} 领跌:{}",
             sectors_data.len(),
             overview.top_sectors.len(),
             overview.bottom_sectors.len()
@@ -214,4 +190,99 @@ impl MarketAnalyzer {
         Ok(())
     }
 
+    /// 调用东财 clist/get 拉行业板块涨跌幅榜
+    ///
+    /// 字段：f3=涨跌幅(%), f12=板块代码, f14=板块名称
+    /// m:90+t:2 是"行业板块"
+    /// 返回按涨跌幅降序排列的 (name, change_pct) 列表
+    fn fetch_real_sector_rankings(&self, top_n: usize) -> Result<Vec<(String, f64)>> {
+        fetch_sector_rankings_impl(top_n)
+    }
+
+}
+
+fn fetch_sector_rankings_impl(top_n: usize) -> Result<Vec<(String, f64)>> {
+        let url = "https://push2.eastmoney.com/api/qt/clist/get";
+        let params: &[(&str, &str)] = &[
+            ("pn", "1"),
+            ("pz", &top_n.to_string()),
+            ("po", "1"),  // 降序
+            ("np", "1"),
+            ("fltt", "2"),
+            ("invt", "2"),
+            ("fid", "f3"),
+            ("fs", "m:90+t:2"),  // 行业板块
+            ("fields", "f1,f2,f3,f4,f12,f14"),
+            ("_", "0"),
+        ];
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(8))
+            .build()
+            .context("创建 HTTP 客户端失败 (sector)")?;
+        let resp_text = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                client
+                    .get(url)
+                    .query(params)
+                    .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+                    .header("Referer", "https://quote.eastmoney.com/")
+                    .send()
+                    .await?
+                    .text()
+                    .await
+            })
+        })
+        .map_err(|e: reqwest::Error| anyhow::anyhow!("板块接口 HTTP 失败: {e}"))?;
+
+        let json: Value = serde_json::from_str(&resp_text)
+            .map_err(|e| anyhow::anyhow!("板块响应非 JSON: {e}"))?;
+        let diff = json
+            .get("data")
+            .and_then(|d| d.get("diff"))
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| anyhow::anyhow!("板块响应无 data.diff 数组"))?;
+        if diff.is_empty() {
+            anyhow::bail!("板块响应 diff 数组为空");
+        }
+        let mut out: Vec<(String, f64)> = Vec::with_capacity(diff.len());
+        for item in diff {
+            let name = item
+                .get("f14")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("板块项缺少 f14 (name)"))?
+                .to_string();
+            let change_pct = item
+                .get("f3")
+                .and_then(|v| v.as_f64())
+                .ok_or_else(|| anyhow::anyhow!("板块项缺少 f3 (change_pct)"))?;
+            out.push((name, change_pct));
+        }
+        // 按 f3 降序（接口已 po=1, 这里再保险排一次）
+        out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    /// 静态检查：非测试代码中不能出现伪随机作为板块数据源。
+    /// 修复：QUANT_ANALYST_REVIEW §1.3
+    ///
+    /// 实现思路：把 `mod tests {` 之前的所有源码单独拿出来检查，
+    /// 避免本测试模块自身的字符串污染检查。
+    #[test]
+    fn no_mock_random_in_sector_data() {
+        let src = include_str!("statistics.rs");
+        let test_mod_start = src.find("#[cfg(test)]\nmod tests {")
+            .unwrap_or(src.len());
+        let production_src = &src[..test_mod_start];
+        // 真正禁止的伪随机模式
+        assert!(
+            !production_src.contains("name.len() % 3"),
+            "禁止使用 name.len() 模运算等伪随机作为板块数据源（AGENTS.md 红线）"
+        );
+        assert!(
+            !production_src.contains("sectors_template"),
+            "禁止在生产路径使用硬编码 sectors_template（AGENTS.md 红线）"
+        );
+    }
 }

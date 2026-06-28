@@ -37,6 +37,8 @@ pub fn identify_leaders(
 }
 
 /// 用 AI 补充 BOM 环节信息（同一板块同一天缓存，AI 不可用时静默降级）
+use log::warn;
+
 pub async fn enrich_bom(leaders: &mut [LeaderRank], sector_name: &str) {
     let analyzer = crate::analyzer::GeminiAnalyzer::from_env();
     if !analyzer.is_available() { return; }
@@ -69,7 +71,13 @@ pub async fn enrich_bom(leaders: &mut [LeaderRank], sector_name: &str) {
                 }
             }
         }
-        _ => {}
+        Ok(Err(e)) => {
+            // 修复 P2.3: 之前 silent (let _ = ..), 现在显式 warn
+            log::warn!("[P2.3] enrich_bom AI 调用失败: {} (sector={}, leaders={})", e, sector_name, leaders.len());
+        }
+        Err(_timeout) => {
+            log::warn!("[P2.3] enrich_bom AI 调用超时 (5s, sector={}, leaders={})", sector_name, leaders.len());
+        }
     }
 }
 

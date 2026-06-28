@@ -438,6 +438,57 @@ pub(crate) fn record_key_result(
     }
 }
 
+/// key_manager 是否有可用 key（消除三个 provider 中重复的 is_available 锁模式）
+pub(crate) fn key_manager_available(key_manager: &Arc<Mutex<ApiKeyManager>>) -> bool {
+    !key_manager.lock().unwrap().keys.is_empty()
+}
+
+/// 模板方法：封装「取 key → do_search → 计时 → 记录成功/失败」统一流程，
+/// 消除 bocha / serpapi / tavily 三个 provider 中重复的编排代码。
+pub(crate) async fn run_key_managed_search<F, Fut>(
+    key_manager: &Arc<Mutex<ApiKeyManager>>,
+    provider_name: &str,
+    query: &str,
+    do_search: F,
+) -> SearchResponse
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<SearchResponse>> + Send,
+{
+    let api_key = match get_key_or_error(key_manager, provider_name, query) {
+        Ok(k) => k,
+        Err(resp) => return resp,
+    };
+
+    let start_time = std::time::Instant::now();
+    let mut response = match do_search(api_key.clone()).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            record_key_result(key_manager, &api_key, false);
+            log::error!("[{}] 搜索 '{}' 失败: {}", provider_name, query, e);
+            return SearchResponse::error(
+                query.to_string(),
+                provider_name.to_string(),
+                e.to_string(),
+            );
+        }
+    };
+
+    response.search_time = start_time.elapsed().as_secs_f64();
+    record_key_result(key_manager, &api_key, response.success);
+    if response.success {
+        log::info!(
+            "[{}] 搜索 '{}' 成功，返回 {} 条结果，耗时 {:.2}s",
+            provider_name,
+            query,
+            response.results.len(),
+            response.search_time
+        );
+    }
+
+    response
+}
+
 
 // ============================================================================
 // 共享工具函数

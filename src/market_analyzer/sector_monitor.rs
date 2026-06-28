@@ -443,7 +443,7 @@ pub fn fetch_board_components(board_code: &str, top_n: usize) -> Result<Vec<Boar
             continue;
         }
         // 过滤 ST / 北交所 (保持与 limit_up 一致的口径)
-        if name.contains("ST") || name.contains("st") {
+        if crate::data_provider::limit_status::is_st_stock(name) {
             continue;
         }
         if code.starts_with('8') || code.starts_with('4') || code.starts_with('9') {

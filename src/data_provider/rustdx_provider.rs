@@ -162,6 +162,7 @@ impl RustdxProvider {
                 volume: bar.vol,
                 amount: bar.amount,
                 pct_chg: 0.0, // 稍后计算
+                intraday_price: None, settled: true,
                 pe_ratio: None,
                 pb_ratio: None,
                 turnover_rate: None,
@@ -259,18 +260,21 @@ impl RustdxProvider {
 impl DataProvider for RustdxProvider {
     fn get_daily_data(&self, code: &str, days: usize) -> Result<Vec<KlineData>> {
         info!("[通达信] 获取股票 {} 最近 {} 天数据", code, days);
-        
+
         let mut kline_data = self.fetch_kline_internal(code, days)?;
-        
+
+        // 填涨跌停 / 停牌标记（在夏普和实时报价前先填，因为夏普的 close 改写可能影响）
+        super::limit_status::apply_limit_flags_inplace(code, None, &mut kline_data);
+
         // 计算夏普比率（使用60天滚动窗口）
         if !kline_data.is_empty() {
             use crate::sharpe_calculator;
-            
+
             // 数据是降序的（最新在前），反转来计算，原地反转避免 clone
             kline_data.reverse();
             sharpe_calculator::update_sharpe_ratios(&mut kline_data, Some(60), Some(0.03));
             kline_data.reverse();
-            
+
             if let Some(latest) = kline_data.first() {
                 if let Some(sharpe) = latest.sharpe_ratio {
                     debug!("[通达信] {} 夏普比率: {:.4}", code, sharpe);
@@ -285,19 +289,25 @@ impl DataProvider for RustdxProvider {
             match self.gtimg_provider.fetch_realtime_quote(code) {
                 Ok(Some(quote)) => {
                     if let Some(latest) = kline_data.first_mut() {
-                        // 更新最新K线的收盘价为实时价格
+                        // 修复 P1.8: 不再覆盖 latest.close (会污染 Sharpe 计算)
+                        // 之前: latest.close = quote.price (盘中价覆盖 settled close)
+                        //       → sharpe_calculator 用盘中价当 settled close 计算
+                        //       → 60 日 Sharpe 实际是盘中波动率, 不是日线收益
+                        // 现在: 盘中价存在 intraday_price, close 保持日线 settled
+                        // 标记 settled=false (盘中期)
                         let old_close = latest.close;
-                        latest.close = quote.price;
-                        
+                        latest.intraday_price = Some(quote.price);
+                        latest.settled = false; // 盘中期, 不是 settled close
+
                         // 补充盈利指标
                         latest.pe_ratio = Some(quote.pe_ratio);
                         latest.pb_ratio = Some(quote.pb_ratio);
                         latest.turnover_rate = Some(quote.turnover_rate);
                         latest.market_cap = Some(quote.market_cap);
                         latest.circulating_cap = Some(quote.circulating_cap);
-                        
-                        info!("[通达信+腾讯] {} 价格: {:.2}元 -> {:.2}元, PE={:.2}, PB={:.2}, 换手率={:.2}%, 总市值={:.2}亿, 流通市值={:.2}亿", 
-                            code, old_close, quote.price, quote.pe_ratio, quote.pb_ratio, 
+
+                        info!("[通达信+腾讯] {} 价格: close={:.2}元 (盘中={:.2}元), PE={:.2}, PB={:.2}, 换手率={:.2}%, 总市值={:.2}亿, 流通市值={:.2}亿",
+                            code, old_close, quote.price, quote.pe_ratio, quote.pb_ratio,
                             quote.turnover_rate, quote.market_cap, quote.circulating_cap);
                     }
                 }

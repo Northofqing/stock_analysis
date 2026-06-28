@@ -147,35 +147,17 @@ impl SearchProvider for TavilySearchProvider {
     }
 
     fn is_available(&self) -> bool {
-        let manager = self.key_manager.lock().unwrap();
-        !manager.keys.is_empty()
+        crate::search_service::types::key_manager_available(&self.key_manager)
     }
 
     async fn search(&self, query: &str, max_results: usize) -> SearchResponse {
-        use crate::search_service::types::{get_key_or_error, record_key_result};
-
-        let api_key = match get_key_or_error(&self.key_manager, &self.name, query) {
-            Ok(k) => k,
-            Err(resp) => return resp,
-        };
-
-        let start_time = std::time::Instant::now();
-        let mut response = match self.do_search(query, &api_key, max_results).await {
-            Ok(resp) => resp,
-            Err(e) => {
-                record_key_result(&self.key_manager, &api_key, false);
-                log::error!("[Tavily] 搜索 '{}' 失败: {}", query, e);
-                return SearchResponse::error(query.to_string(), self.name.clone(), e.to_string());
-            }
-        };
-
-        response.search_time = start_time.elapsed().as_secs_f64();
-        record_key_result(&self.key_manager, &api_key, response.success);
-        if response.success {
-            log::info!("[Tavily] 搜索 '{}' 成功，返回 {} 条结果，耗时 {:.2}s", query, response.results.len(), response.search_time);
-        }
-
-        response
+        crate::search_service::types::run_key_managed_search(
+            &self.key_manager,
+            &self.name,
+            query,
+            |api_key| async move { self.do_search(query, &api_key, max_results).await },
+        )
+        .await
     }
 }
 

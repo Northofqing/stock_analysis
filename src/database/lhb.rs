@@ -15,6 +15,8 @@ impl DatabaseManager {
         }
 
         let mut conn = self.get_conn()?;
+        // 注：diesel 的 SQLite 后端不支持「多行批量 INSERT + ON CONFLICT」组合，
+        // 故保持单事务内逐行 upsert——事务包裹已消除逐行 fsync，是此场景下的最优写法。
         let saved = conn.transaction::<usize, Box<dyn std::error::Error>, _>(|conn| {
             let mut count = 0;
             for record in records {

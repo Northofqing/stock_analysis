@@ -35,11 +35,14 @@ pub struct MarketAnalyzer {
     main_indices: HashMap<String, String>,
 }
 
+pub mod async_overview;
 mod indices;
 mod limit_up;
-mod review;
+pub mod review;
 pub mod sector_monitor;
 mod statistics;
+
+pub use async_overview::{generate_market_overview_text_blocking, get_market_overview_blocking};
 
 impl MarketAnalyzer {
     /// 主要指数代码
@@ -93,7 +96,34 @@ impl MarketAnalyzer {
         // 3. 获取板块涨跌榜
         self.get_sector_rankings(&mut overview)?;
 
+        // 4. 获取北向资金（修复 QUANT_ANALYST_REVIEW §1.4）
+        overview.north_flow = self.fetch_north_flow_latest();
+
         Ok(overview)
+    }
+
+    /// 拉取最新一日北向资金合计净流入（亿元）。
+    /// 失败时返回 0.0 并 warn —— 符合 AGENTS.md "缺失数据 → warn log, 不静默填充"
+    /// 但不阻断主流程（北向资金是次要指标，缺失不应让整个市场概览失败）。
+    ///
+    /// 修复 P1.1 hotfix: 用 `NorthFlowClient::fetch_blocking` 同步 HTTP
+    /// 不要在 async 上下文中用 `block_in_place + block_on`, 会触发
+    /// tokio runtime drop panic: "Cannot drop a runtime in a context
+    /// where blocking is not allowed" (P1.1 引入的回归).
+    fn fetch_north_flow_latest(&self) -> f64 {
+        use crate::data_provider::north_flow::NorthFlowClient;
+        let client = NorthFlowClient::new();
+        match client.fetch_blocking() {
+            Ok(series) => {
+                let v = series.latest_total().unwrap_or(0.0);
+                info!("[大盘] 北向资金: {:+.2}亿", v);
+                v
+            }
+            Err(e) => {
+                warn!("[大盘] 北向资金获取失败: {}，将显示 0", e);
+                0.0
+            }
+        }
     }
 
     /// 获取当日涨停股票列表

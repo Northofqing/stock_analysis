@@ -58,3 +58,25 @@ pub enum SearchError {
     #[error("Invalid query: {reason}")]
     InvalidQuery { reason: String },
 }
+
+/// 交易/下单领域错误（对齐 AGENTS.md 2.6 写入侧防护红线）
+#[derive(Error, Debug)]
+pub enum TradeError {
+    #[error("资金不足：需 {needed:.2} 元，可用 {available:.2} 元")]
+    InsufficientFunds { needed: f64, available: f64 },
+
+    #[error("数量非法：{shares} 股，必须为正且为 100 股整数倍")]
+    InvalidQuantity { shares: i64 },
+
+    #[error("委托价 {price:.2} 超出涨跌停区间 [{low:.2}, {high:.2}]")]
+    PriceOutOfLimit { price: f64, low: f64, high: f64 },
+
+    #[error("单笔金额 {amount:.2} 元超过上限 {limit:.2} 元")]
+    AmountExceedsLimit { amount: f64, limit: f64 },
+
+    #[error("持仓不存在：{code}")]
+    PositionNotFound { code: String },
+
+    #[error("重复订单：业务号 {order_id} 在去重窗口内重复提交")]
+    DuplicateOrder { order_id: String },
+}

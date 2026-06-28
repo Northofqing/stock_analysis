@@ -9,8 +9,9 @@ use log::{info, warn};
 use crate::config::get_monitor_config;
 
 use super::providers::{
-    BochaSearchProvider, ClsProvider, EastmoneyNewsProvider, Jin10CalendarEvent, Jin10Provider,
-    SerpAPISearchProvider, TavilySearchProvider, WallStreetCnProvider,
+    BochaSearchProvider, ClsProvider, CninfoProvider, EastmoneyNewsProvider, Jin10CalendarEvent,
+    Jin10Provider, SerpAPISearchProvider, SseSzseProvider, TavilySearchProvider,
+    WallStreetCnProvider,
 };
 use super::types::{SearchProvider, SearchResponse, SearchResult};
 
@@ -76,7 +77,32 @@ impl SearchService {
         let mut providers: Vec<Box<dyn SearchProvider>> = Vec::new();
 
         // 按优先级添加搜索引擎
-        // 1. SerpAPI 最优先（Google搜索结果，质量高）
+        // 修复 P1.4: 免费源先于付费源, 避免 429/403/432 时无谓重试
+        // 原因: SerpAPI/Bocha/Tavily 都是有额度的付费/限免 API, 失败率高
+        //        而 东方财富/华尔街见闻/财联社 是免费直连, 优先用它们能保证稳定
+
+        // 1. 东方财富（免费，A股专业，无需API Key）
+        if enable_eastmoney {
+            info!("已启用 东方财富 新闻搜索（免费，无限制）");
+            providers.push(Box::new(EastmoneyNewsProvider::new()));
+        }
+
+        // 2. 华尔街见闻（免费直连，补充全球财经资讯）
+        providers.push(Box::new(WallStreetCnProvider::new()));
+
+        // 3. 财联社（免费直连，补充A股电报）
+        providers.push(Box::new(ClsProvider::new()));
+
+        // 3b. 巨潮资讯（免费直连，A 股法定信披平台，沪深公告全覆盖）
+        providers.push(Box::new(CninfoProvider::new()));
+
+        // 3c. 沪深交易所（免费直连，上交所/深交所官方公告，按代码路由）
+        providers.push(Box::new(SseSzseProvider::new()));
+
+        // 4. 金十数据（免费直连，补充快讯）
+        // 见 providers/jin10.rs - 默认就是免费直连, 无 API Key
+
+        // 5. SerpAPI（付费，Google搜索结果，作为质量补充）
         if let Some(keys) = serpapi_keys {
             if !keys.is_empty() {
                 info!("已配置 SerpAPI 搜索，共 {} 个 API Key", keys.len());
@@ -84,19 +110,7 @@ impl SearchService {
             }
         }
 
-        // 2. 东方财富（免费，A股专业，无需API Key）
-        if enable_eastmoney {
-            info!("已启用 东方财富 新闻搜索（免费，无限制）");
-            providers.push(Box::new(EastmoneyNewsProvider::new()));
-        }
-
-        // 2.5 华尔街见闻（免费直连，补充全球财经资讯）
-        providers.push(Box::new(WallStreetCnProvider::new()));
-
-        // 2.6 财联社（免费直连，补充A股电报）
-        providers.push(Box::new(ClsProvider::new()));
-
-        // 3. Bocha（中文搜索优化，AI摘要）
+        // 6. Bocha（付费，中文搜索优化，AI摘要）
         if let Some(keys) = bocha_keys {
             if !keys.is_empty() {
                 info!("已配置 Bocha 搜索，共 {} 个 API Key", keys.len());
@@ -104,7 +118,7 @@ impl SearchService {
             }
         }
 
-        // 4. Tavily（免费额度更多，每月 1000 次）
+        // 7. Tavily（限免，作为最后补充）
         if let Some(keys) = tavily_keys {
             if !keys.is_empty() {
                 info!("已配置 Tavily 搜索，共 {} 个 API Key", keys.len());
@@ -298,6 +312,103 @@ impl SearchService {
         self.providers.iter().any(|p| p.is_available())
     }
 
+    /// 尽力解析新闻发布日期，返回距今天数（用于主题新闻新鲜度过滤）。
+    ///
+    /// 兼容多种 provider 的日期格式：
+    /// - ISO / RFC3339 / RFC2822（Tavily、Bocha）
+    /// - 中文相对时间（百度/SerpAPI）："今天/昨天/前天/N分钟前/N小时前/N天前/N周前/N个月前"
+    /// - 中文绝对日期："YYYY年M月D日" / "M月D日"（无年份按今年推断）
+    /// - 英文 "Jun 20, 2026"
+    ///
+    /// 解析失败返回 `None`——调用方应保留该结果，不得静默丢弃（数据红线）。
+    fn topic_news_age_days(date_str: &str) -> Option<i64> {
+        use chrono::{Datelike, NaiveDate};
+
+        let s = date_str.trim();
+        if s.is_empty() {
+            return None;
+        }
+        let today = chrono::Local::now().date_naive();
+
+        // 1) 中文相对时间
+        if s.contains("今天") || s.contains("刚刚") || s.contains("分钟前") || s.contains("小时前") {
+            return Some(0);
+        }
+        if s.contains("昨天") {
+            return Some(1);
+        }
+        if s.contains("前天") {
+            return Some(2);
+        }
+        let lead_num: Option<i64> = s
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .ok();
+        if let Some(n) = lead_num {
+            if s.contains("天前") {
+                return Some(n);
+            }
+            if s.contains("周前") || s.contains("星期前") {
+                return Some(n * 7);
+            }
+            if s.contains("个月前") || s.contains("月前") {
+                return Some(n * 30);
+            }
+            if s.contains("年前") {
+                return Some(n * 365);
+            }
+        }
+
+        // 2) 中文绝对日期（先于 ISO 处理，避免对多字节串做字节切片）
+        if s.contains('年') || s.contains('月') {
+            let digits: Vec<i32> = s
+                .split(|c: char| !c.is_ascii_digit())
+                .filter(|x| !x.is_empty())
+                .filter_map(|x| x.parse().ok())
+                .collect();
+            if s.contains('年') && digits.len() >= 3 {
+                if let Some(d) =
+                    NaiveDate::from_ymd_opt(digits[0], digits[1] as u32, digits[2] as u32)
+                {
+                    return Some((today - d).num_days());
+                }
+            } else if s.contains('月') && digits.len() >= 2 {
+                let (m, day) = (digits[0] as u32, digits[1] as u32);
+                if let Some(cand) = NaiveDate::from_ymd_opt(today.year(), m, day) {
+                    // 无年份时按今年推断；若落在未来说明是去年的，回退一年
+                    let d = if cand > today {
+                        NaiveDate::from_ymd_opt(today.year() - 1, m, day).unwrap_or(cand)
+                    } else {
+                        cand
+                    };
+                    return Some((today - d).num_days());
+                }
+            }
+        }
+
+        // 3) ISO 前缀 YYYY-MM-DD（仅在前 10 字节为合法字符边界时切片）
+        if s.len() >= 10 && s.is_char_boundary(10) {
+            if let Ok(d) = NaiveDate::parse_from_str(&s[..10], "%Y-%m-%d") {
+                return Some((today - d).num_days());
+            }
+        }
+        // 4) RFC3339 / RFC2822
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+            return Some((today - dt.date_naive()).num_days());
+        }
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc2822(s) {
+            return Some((today - dt.date_naive()).num_days());
+        }
+        // 5) 英文 "Jun 20, 2026"
+        if let Ok(d) = NaiveDate::parse_from_str(s, "%b %d, %Y") {
+            return Some((today - d).num_days());
+        }
+
+        None
+    }
+
     /// 通用主题搜索（去同质化）：
     /// 1) 单 query 自动扩展为多意图查询；
     /// 2) 多 provider 聚合而非首个成功即返回；
@@ -365,6 +476,39 @@ impl SearchService {
             return Vec::new();
         }
 
+        // 新鲜度门（AGENTS.md §2.4）：主题/Web 新闻超过 N 天视为过期（窗口可配置）。
+        // 能解析出发布日期且超阈值 → 丢弃并告警；解析不出 → 保留（不静默当成功）。
+        let max_age_days = get_monitor_config().topic_news_max_age_days.max(1);
+        let before = aggregated.len();
+        aggregated.retain(|r| {
+            match r
+                .published_date
+                .as_deref()
+                .and_then(Self::topic_news_age_days)
+            {
+                Some(age) if age > max_age_days => {
+                    warn!(
+                        "[topic] 丢弃过期新闻（{}天前）: {}",
+                        age,
+                        r.title.chars().take(40).collect::<String>()
+                    );
+                    false
+                }
+                _ => true,
+            }
+        });
+        let dropped = before - aggregated.len();
+        if dropped > 0 {
+            info!(
+                "[topic] 新鲜度过滤丢弃 {} 条（>{}天）",
+                dropped, max_age_days
+            );
+        }
+
+        if aggregated.is_empty() {
+            return Vec::new();
+        }
+
         // 先做一次粗去重（URL + 标题签名），再做 MMR 多样性重排。
         let mut seen_url: HashSet<String> = HashSet::new();
         let mut seen_title_sig: HashSet<String> = HashSet::new();
@@ -405,18 +549,33 @@ impl SearchService {
         }
 
         let mut queries = vec![base.to_string()];
+
+        // 紧凑锚点：通用宏观 base（含「重大新闻」）会让每条意图查询都背着同一段
+        // 泛化前缀（其中「政策 产业」还与意图词自我重复），导致 provider 拿到的是
+        // 一组高度同质的查询、结果大量重叠且浪费配额。此处仅对通用 base 压缩为
+        // 「今日 A股」锚点；调用方若传入的是具体主题（如「06月27日 机器人 最新
+        // 突发 催化」）则保持原文，确保产业链催化检索的针对性不被削弱。
+        let anchor: &str = if base.contains("重大新闻") {
+            "今日 A股"
+        } else {
+            base
+        };
+
+        // 维度顺序即采样优先级（max_intents 会截断尾部）。「技术突破」此前缺失，
+        // 导致科技/新品/研发类催化在源头被欠采样，故置于首位优先采集。
         let intents = [
+            "科技 技术突破 新品 研发 专利 量产",
             "政策 监管 会议 文件",
             "产业链 上游 下游 供需 价格",
-            "公司 公告 订单 并购 合作",
-            "风险 减持 处罚 违约 诉讼",
+            "公司 公告 订单 中标 并购 合作",
             "资金 北向 龙虎榜 主力",
             "海外 美联储 美股 大宗商品 汇率",
+            "风险 减持 处罚 违约 诉讼",
         ];
 
         let max_intents = max_results.clamp(3, 6).min(intent_cap);
         for intent in intents.iter().take(max_intents) {
-            queries.push(format!("{} {}", base, intent));
+            queries.push(format!("{} {}", anchor, intent));
         }
 
         queries
@@ -1236,5 +1395,33 @@ mod tests {
         } else {
             println!("未配置搜索引擎 API Key，跳过测试");
         }
+    }
+
+    #[test]
+    fn test_topic_news_age_days_parsing() {
+        use chrono::{Datelike, Duration};
+        let today = chrono::Local::now().date_naive();
+
+        // 中文相对时间
+        assert_eq!(SearchService::topic_news_age_days("3小时前"), Some(0));
+        assert_eq!(SearchService::topic_news_age_days("昨天 10:30"), Some(1));
+        assert_eq!(SearchService::topic_news_age_days("前天"), Some(2));
+        assert_eq!(SearchService::topic_news_age_days("5天前"), Some(5));
+        assert_eq!(SearchService::topic_news_age_days("2周前"), Some(14));
+
+        // ISO 与 RFC3339
+        let iso = (today - Duration::days(3)).format("%Y-%m-%d").to_string();
+        assert_eq!(SearchService::topic_news_age_days(&iso), Some(3));
+        let rfc = format!("{}T08:00:00+08:00", iso);
+        assert_eq!(SearchService::topic_news_age_days(&rfc), Some(3));
+
+        // 中文绝对日期（带年份）
+        let d = today - Duration::days(10);
+        let cn = format!("{}年{}月{}日", d.year(), d.month(), d.day());
+        assert_eq!(SearchService::topic_news_age_days(&cn), Some(10));
+
+        // 无法解析 → None（保留，不静默丢弃）
+        assert_eq!(SearchService::topic_news_age_days(""), None);
+        assert_eq!(SearchService::topic_news_age_days("近期"), None);
     }
 }

@@ -112,7 +112,7 @@ mod tests {
         KlineData {
             date: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
             open: close, high: close, low: close, close, volume,
-            amount: 0.0, pct_chg: 0.0,
+            amount: 0.0, pct_chg: 0.0, intraday_price: None, settled: true,
             pe_ratio: None, pb_ratio: None, turnover_rate: None,
             market_cap: None, circulating_cap: None,
             eps: None, roe: None, revenue_yoy: None, net_profit_yoy: None,

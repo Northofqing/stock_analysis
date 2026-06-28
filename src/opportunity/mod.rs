@@ -5,6 +5,10 @@
 pub mod chain_mapper;
 pub mod impact;
 pub mod discover;
+pub mod score;  // 修复 P0-1: dual_score 评分模型
+pub mod bom_kb;  // 修复 P0-2: BOM 弹性节点 + KB
+pub mod winrate;  // 修复 P1-2: winrate 二元化
+pub mod launch_gate;  // 修复 P0-3: 上线门槛
 
 use crate::data_provider::{assess_quality, fetch_financials};
 use crate::data_provider::service;
@@ -957,6 +961,8 @@ mod tests {
             volume: vol,
             amount: vol * close,
             pct_chg: pct,
+            intraday_price: None,
+            settled: true,
             pe_ratio: None,
             pb_ratio: None,
             turnover_rate: None,

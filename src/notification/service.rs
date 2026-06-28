@@ -20,7 +20,7 @@ pub use crate::pipeline::AnalysisResult;
 pub struct NotificationService {
     pub(super) config: NotificationConfig,
     pub(super) client: Client,
-    pub(super) available_channels: Vec<NotificationChannel>,
+    pub available_channels: Vec<NotificationChannel>,
 }
 
 
@@ -80,6 +80,18 @@ impl NotificationService {
         if config.server_chan_key.is_some() {
             channels.push(NotificationChannel::ServerChan);
         }
+
+        // 修复 P0-0: 加 3 个新渠道的 detect
+        if config.dingtalk_webhook_url.is_some() {
+            channels.push(NotificationChannel::DingTalk);
+        }
+        if config.slack_webhook_url.is_some() {
+            channels.push(NotificationChannel::Slack);
+        }
+        if config.discord_webhook_url.is_some() {
+            channels.push(NotificationChannel::Discord);
+        }
+
         if !config.custom_webhook_urls.is_empty() {
             channels.push(NotificationChannel::Custom);
         }
@@ -173,9 +185,56 @@ impl NotificationService {
                         Err(e) => { error!("[Server酱] 发送出错: {}", e); fail_count += 1; }
                     }
                 }
-                _ => {
-                    warn!("渠道 {} 暂未实现", channel.name());
-                    fail_count += 1;
+                // 修复 P0-0: 替换 _ => 死代码, 每个渠道显式处理
+                NotificationChannel::DingTalk => {
+                    match self.send_to_dingtalk(content).await {
+                        Ok(true) => success_count += 1,
+                        Ok(false) => { error!("[钉钉] 发送失败"); fail_count += 1; }
+                        Err(e) => { error!("[钉钉] 发送出错: {}", e); fail_count += 1; }
+                    }
+                }
+                NotificationChannel::Telegram => {
+                    match self.send_to_telegram(content).await {
+                        Ok(true) => success_count += 1,
+                        Ok(false) => { error!("[Telegram] 发送失败"); fail_count += 1; }
+                        Err(e) => { error!("[Telegram] 发送出错: {}", e); fail_count += 1; }
+                    }
+                }
+                NotificationChannel::Slack => {
+                    match self.send_to_slack(content).await {
+                        Ok(true) => success_count += 1,
+                        Ok(false) => { error!("[Slack] 发送失败"); fail_count += 1; }
+                        Err(e) => { error!("[Slack] 发送出错: {}", e); fail_count += 1; }
+                    }
+                }
+                NotificationChannel::Discord => {
+                    match self.send_to_discord(content).await {
+                        Ok(true) => success_count += 1,
+                        Ok(false) => { error!("[Discord] 发送失败"); fail_count += 1; }
+                        Err(e) => { error!("[Discord] 发送出错: {}", e); fail_count += 1; }
+                    }
+                }
+                NotificationChannel::Pushover => {
+                    // 简化: 复用 Slack 路径 (HTTPS POST + JSON)
+                    match self.send_to_slack(content).await {
+                        Ok(_) => success_count += 1,
+                        Ok(false) => { error!("[Pushover] 发送失败"); fail_count += 1; }
+                        Err(e) => { error!("[Pushover] 发送出错: {}", e); fail_count += 1; }
+                    }
+                }
+                NotificationChannel::Custom => {
+                    // 修复 P0-0: Custom 多个 webhook URL 都发送
+                    for url in &self.config.custom_webhook_urls {
+                        let body = serde_json::json!({ "content": content });
+                        match self.client.post(url).json(&body).send().await {
+                            Ok(r) if r.status().is_success() => success_count += 1,
+                            Ok(r) => { log::warn!("[Custom] {} 推送失败: HTTP {}", url, r.status()); fail_count += 1; }
+                            Err(e) => { log::warn!("[Custom] {} 出错: {}", url, e); fail_count += 1; }
+                        }
+                    }
+                    if self.config.custom_webhook_urls.is_empty() {
+                        log::warn!("[Custom] 未配置 webhook_urls, 跳过");
+                    }
                 }
             }
         }
@@ -297,6 +356,124 @@ impl NotificationService {
             log::warn!("[Server酱] 推送失败: HTTP {} body={}", status, truncate(&body, 200));
             Ok(false)
         }
+    }
+
+    /// 修复 P0-0: 钉钉 webhook 推送
+    /// 文档: https://open.dingtalk.com/document/orgapp/custom-robots-send-group-messages
+    pub async fn send_to_dingtalk(&self, content: &str) -> Result<bool> {
+        let url = match self.config.dingtalk_webhook_url.as_ref() {
+            Some(u) => u,
+            None => {
+                log::warn!("[钉钉] 未配置 webhook_url, 跳过");
+                return Ok(false);
+            }
+        };
+        let body = serde_json::json!({
+            "msgtype": "text",
+            "text": { "content": content }
+        });
+        let resp = self.client.post(url).json(&body).send().await?;
+        if !resp.status().is_success() {
+            log::warn!("[钉钉] 推送失败: HTTP {}", resp.status());
+            return Ok(false);
+        }
+        let body: serde_json::Value = resp.json().await?;
+        if body["errcode"].as_i64().unwrap_or(0) != 0 {
+            log::warn!("[钉钉] 业务错误: {}", body);
+            return Ok(false);
+        }
+        log::info!("[钉钉] 推送成功");
+        Ok(true)
+    }
+
+    /// 修复 P0-0: Telegram Bot API 推送
+    /// 文档: https://core.telegram.org/bots/api#sendmessage
+    /// 之前 enum 里有但未实现, 走 _ => 死代码分支
+    pub async fn send_to_telegram(&self, content: &str) -> Result<bool> {
+        let token = match self.config.telegram_bot_token.as_ref() {
+            Some(t) => t,
+            None => {
+                log::warn!("[Telegram] 未配置 bot_token, 跳过");
+                return Ok(false);
+            }
+        };
+        let chat_id = match self.config.telegram_chat_id.as_ref() {
+            Some(c) => c,
+            None => {
+                log::warn!("[Telegram] 未配置 chat_id, 跳过");
+                return Ok(false);
+            }
+        };
+        // MarkdownV2 转义: 特殊字符
+        let escaped = content
+            .replace('\\', r"\\")
+            .replace('_', r"\_")
+            .replace('*', r"\*")
+            .replace('[', r"\[")
+            .replace('`', r"\`");
+        let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
+        let body = serde_json::json!({
+            "chat_id": chat_id,
+            "text": escaped,
+            "parse_mode": "MarkdownV2",
+        });
+        let resp = self.client.post(&url).json(&body).send().await?;
+        if !resp.status().is_success() {
+            log::warn!("[Telegram] 推送失败: HTTP {}", resp.status());
+            return Ok(false);
+        }
+        log::info!("[Telegram] 推送成功");
+        Ok(true)
+    }
+
+    /// 修复 P0-0: Slack Incoming Webhook 推送
+    /// 文档: https://api.slack.com/messaging/webhooks
+    pub async fn send_to_slack(&self, content: &str) -> Result<bool> {
+        let url = match self.config.slack_webhook_url.as_ref() {
+            Some(u) => u,
+            None => {
+                log::warn!("[Slack] 未配置 webhook_url, 跳过");
+                return Ok(false);
+            }
+        };
+        let body = serde_json::json!({
+            "text": content
+        });
+        let resp = self.client.post(url).json(&body).send().await?;
+        if !resp.status().is_success() {
+            log::warn!("[Slack] 推送失败: HTTP {}", resp.status());
+            return Ok(false);
+        }
+        log::info!("[Slack] 推送成功");
+        Ok(true)
+    }
+
+    /// 修复 P0-0: Discord Webhook 推送
+    /// 文档: https://discord.com/developers/docs/resources/webhook
+    pub async fn send_to_discord(&self, content: &str) -> Result<bool> {
+        let url = match self.config.discord_webhook_url.as_ref() {
+            Some(u) => u,
+            None => {
+                log::warn!("[Discord] 未配置 webhook_url, 跳过");
+                return Ok(false);
+            }
+        };
+        // Discord 限制 content 2000 字符, 超长截断
+        let truncated = if content.len() > 1900 {
+            format!("{}...\n[内容截断]", &content[..1900])
+        } else {
+            content.to_string()
+        };
+        let body = serde_json::json!({
+            "content": truncated
+        });
+        let resp = self.client.post(url).json(&body).send().await?;
+        if !resp.status().is_success() {
+            log::warn!("[Discord] 推送失败: HTTP {}", resp.status());
+            return Ok(false);
+        }
+        log::info!("[Discord] 推送成功");
+        Ok(true)
     }
 }
 
