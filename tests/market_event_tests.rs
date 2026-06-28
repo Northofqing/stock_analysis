@@ -148,3 +148,57 @@ fn test_simhash_distinct_titles() {
     let b = compute_simhash("央行加息", "");
     assert_ne!(a, b, "完全不同事件 simhash 必不同");
 }
+
+#[test]
+fn test_simhash_cross_process_stable() {
+    // 修复 P1-1 跨进程稳定性: 用 sha256 (确定性) 替代 DefaultHasher (进程 seed 随机)
+    // 验证方法: 单 bigram 输入时, simhash 每个 bit = sha256(token) 对应 bit
+    // (单 token 累加和 = +1/-1, 符号 = token hash bit)
+    use sha2::{Digest, Sha256};
+    let title = "工信";  // 单 bigram
+    let mut hasher = Sha256::new();
+    hasher.update(title.as_bytes());
+    let result = hasher.finalize();
+    let expected_hash = u64::from_le_bytes([
+        result[0], result[1], result[2], result[3],
+        result[4], result[5], result[6], result[7],
+    ]);
+    let sim = compute_simhash(title, "");
+    for bit in 0..64 {
+        let sim_bit = (sim >> bit) & 1;
+        let expected_bit = (expected_hash >> bit) & 1;
+        assert_eq!(sim_bit, expected_bit, "bit {} 应等于 sha256(token) bit", bit);
+    }
+}
+
+#[test]
+fn test_simhash_punctuation_not_poluted() {
+    // 修复: ASCII 标点 / 空白不再被 tokenize 进 bigram
+    // 之前 "工信部:5G" 和 "工信部 5G" 都被切成 "部:" "部 " 这种带标点/空白的 bigram
+    // 现在两文本 simhash 必相等 (normalize + 标点过滤)
+    let a = compute_simhash("工信部:5G商用", "");
+    let b = compute_simhash("工信部 5G 商用", "");
+    let dist = hamming_distance(a, b);
+    assert_eq!(dist, 0, "normalize + 标点过滤后两文本必同 simhash, 实际距离 {}", dist);
+}
+
+#[test]
+fn test_simhash_noise_tokens_filtered() {
+    // 修复: 停用词组合 (如 "的了" "是在") 被跳过, 不再稀释真信号
+    // "工信部的了" 应与 "工信部" simhash 接近 (停用词被过滤)
+    let with_noise = compute_simhash("工信部的了半导体", "");
+    let clean = compute_simhash("工信部半导体", "");
+    let dist = hamming_distance(with_noise, clean);
+    // 允许少量 bit 差异 (噪声过滤不是 100% 完美), 但距离应该较小
+    assert!(dist <= 15, "停用词过滤后近重复事件距离应较小, 实际 {}", dist);
+}
+
+#[test]
+fn test_simhash_unrelated_no_overlap() {
+    // 修复: 完全不相关事件经过噪声过滤后距离仍应大
+    // "工信部" 事件 vs "央行加息" 事件 → 几乎无 token 重叠
+    let a = compute_simhash("工信部 5G 政策", "");
+    let b = compute_simhash("央行 加息 25 基点", "");
+    let dist = hamming_distance(a, b);
+    assert!(dist >= 10, "完全无关事件过滤后距离应仍大, 实际 {}", dist);
+}

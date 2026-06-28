@@ -148,19 +148,44 @@ fn normalize(s: &str) -> String {
         .join(" ")
 }
 
+/// 中文常见停用词 / 助词 / 功能字 (量化 PM 视角: 这些字符组成的 bigram 是噪声)
+/// 例: "的了" "是在" "和中" 都是无信号 token, 占 bit 反而稀释真信号
+const STOP_CHARS: &[char] = &[
+    '的', '了', '在', '是', '和', '等', '与', '为', '于', '及',
+    '或', '有', '其', '之', '也', '就', '都', '还', '把', '被',
+    '要', '能', '会', '可', '过', '又', '再', '这', '那', '此',
+    '某', '中', '上', '下', '一', '个', '不', '但',
+];
+
+/// 修复 P1-1: 噪声 token 过滤
+/// 两个字符都是停用词 → 跳过, 不参与 simhash 累计
+/// 修复: 中文 bigram "工信"+"信部" 不会被 "的了" 这类噪声稀释
+fn is_noise_token(token: &str) -> bool {
+    let mut chars = token.chars();
+    match (chars.next(), chars.next()) {
+        (Some(a), Some(b)) => STOP_CHARS.contains(&a) && STOP_CHARS.contains(&b),
+        _ => false,
+    }
+}
+
 /// 修复 P1-1: SimHash 64-bit, 用于跨源模糊去重
-/// tokenize 简单: 按字符 bigram
-/// 64-bit hash: 每个 token 的 hash 的 bit 累加
+/// tokenize: 字符 bigram, 跳过空白/ASCII 标点 + 停用词组合
+/// 64-bit hash: 每个 token 的稳定 hash 的 bit 累加 (sha256 截前 8 字节)
 pub fn compute_simhash(title: &str, body: &str) -> u64 {
     let combined = format!("{} {}", normalize(title), normalize(body));
-    let chars: Vec<char> = combined.chars().collect();
+    // 修复: 过滤空白和 ASCII 标点, 避免 "部 " " 5" 这类无意义 bigram
+    let chars: Vec<char> = combined
+        .chars()
+        .filter(|c| !c.is_whitespace() && !c.is_ascii_punctuation())
+        .collect();
     if chars.len() < 2 {
         return 0;
     }
     let mut v: [i32; 64] = [0; 64];
     for window in chars.windows(2) {
         let token: String = window.iter().collect();
-        let token_hash = simple_hash(&token);
+        if is_noise_token(&token) { continue; }
+        let token_hash = stable_hash_token(&token);
         for bit in 0..64 {
             if (token_hash >> bit) & 1 == 1 {
                 v[bit] += 1;
@@ -178,12 +203,18 @@ pub fn compute_simhash(title: &str, body: &str) -> u64 {
     result
 }
 
-/// 简单字符串 hash (修复 P1-1 SimHash 用, 不引外部 crate)
-fn simple_hash(s: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut h);
-    h.finish()
+/// 修复 P1-1: 跨进程稳定 token hash (sha256 截前 8 字节 → u64)
+/// 之前用 std DefaultHasher, 每次进程启动 seed 不同 → shadow 阶段索引在 gray 阶段失效
+/// sha256 是确定性算法, 同输入永远同输出, 跨进程/跨 OS/跨 Rust 版本都稳定
+fn stable_hash_token(s: &str) -> u64 {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(s.as_bytes());
+    let result = hasher.finalize();
+    u64::from_le_bytes([
+        result[0], result[1], result[2], result[3],
+        result[4], result[5], result[6], result[7],
+    ])
 }
 
 /// 修复 P1-1: SimHash 汉明距离 (量化"两事件多相似")
