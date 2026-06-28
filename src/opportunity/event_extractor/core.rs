@@ -1,3 +1,4 @@
+use crate::analyzer::{AgentMode, GeminiAnalyzer};
 use crate::signal::market_event::{MarketEvent, EventType, Direction, compute_event_id};
 use crate::signal::market_event::SourceRef;
 use super::adapter::{RawNewsItem, SourceType};
@@ -83,6 +84,23 @@ impl EventExtractorCore {
         me.event_id = event_id;
         me.ai_degraded = true;
         me
+    }
+
+    /// 修复 v9.1 集成: 真接 AI (Deep 模式)
+    /// 失败 → 退化为 build_degraded + ai_degraded=true
+    pub async fn extract_with(
+        gemini: &GeminiAnalyzer,
+        item: &RawNewsItem,
+    ) -> MarketEvent {
+        let prompt = Self::build_prompt(&item.title, &item.body);
+        match gemini
+            .call_api_mode(&prompt, "你是 A 股量化事件抽取专家。只输出 JSON。", AgentMode::Deep)
+            .await
+        {
+            Ok(text) => Self::parse_deep_response(item, &text)
+                .unwrap_or_else(|| Self::build_degraded(item, None)),
+            Err(_) => Self::build_degraded(item, None),
+        }
     }
 }
 
