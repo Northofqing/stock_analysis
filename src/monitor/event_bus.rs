@@ -99,9 +99,19 @@ pub fn subscribe() -> broadcast::Receiver<MonitorEvent> {
 mod tests {
     use super::*;
 
+    /// 修复 并行测试隔离: 测试用本地 EventBus 实例, 不共享全局 singleton
+    /// 之前: EventBus::global() 是 OnceCell<broadcast::Sender>, 所有测试共享
+    /// → 并行测试时, 先跑的 publish 的消息会进同一个 broadcast channel,
+    ///   后跑的测试 subscribe 时可能收到前序测试的"幽灵事件"
+    fn local_bus() -> EventBus {
+        let (tx, _rx) = broadcast::channel(256);
+        EventBus { tx }
+    }
+
     #[tokio::test]
     async fn publish_reaches_all_subscribers() {
-        let bus = EventBus::global();
+        // 修复: 用本地 bus, 不与并行测试共享状态
+        let bus = local_bus();
         let mut rx1 = bus.subscribe();
         let mut rx2 = bus.subscribe();
 
@@ -118,7 +128,8 @@ mod tests {
 
     #[tokio::test]
     async fn publish_without_subscriber_is_ok() {
-        // 无订阅者时不应 panic
-        publish(MonitorEvent::Info("no subscriber".to_string()));
+        // 修复: 无订阅者时不应 panic, 用本地 bus 验证
+        let bus = local_bus();
+        bus.publish(MonitorEvent::Info("no subscriber".to_string()));
     }
 }

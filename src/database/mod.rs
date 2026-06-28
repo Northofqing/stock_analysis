@@ -76,6 +76,16 @@ impl DatabaseManager {
         let mut conn = pool.get()?;
         Self::run_migrations(&mut conn)?;
 
+        // 修复 并行测试隔离: SQLite WAL 模式 + busy_timeout
+        // 之前: SQLite 默认 DELETE journal mode → 写锁整库, 并行测试同时写同一个 ./test_data/test.db → "database is locked"
+        // 现在: WAL 模式让读写不互斥, busy_timeout 让等待锁的连接最多等 5s
+        // 收益: (a) cargo test 默认并行度不再 flake, (b) 生产路径并发写也安全
+        diesel::sql_query("PRAGMA journal_mode = WAL").execute(&mut *conn)?;
+        diesel::sql_query("PRAGMA synchronous = NORMAL").execute(&mut *conn)?;
+        diesel::sql_query("PRAGMA busy_timeout = 5000").execute(&mut *conn)?;
+        diesel::sql_query("PRAGMA wal_autocheckpoint = 1000").execute(&mut *conn)?;
+        info!("SQLite PRAGMAs 已设置: WAL + busy_timeout=5000");
+
         let db = DatabaseManager { pool };
 
         DB_INSTANCE
