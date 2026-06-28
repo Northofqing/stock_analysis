@@ -236,19 +236,37 @@ impl AnalysisPipeline {
         name: &str,
         days: usize,
     ) -> Option<BenchmarkSeries> {
-        match self.data_manager.get_daily_data(code, days) {
-            Ok((data, _)) if !data.is_empty() => {
-                let mut closes = std::collections::HashMap::new();
-                for k in &data {
-                    closes.insert(k.date, k.close);
+        // 修复 B-003: benchmark 7000天拉取可能超时 → 分页拉取
+        // 之前: 单次请求 7000 天, 可能超时被 fail-through
+        // 现在: 365 天/页, 最多 20 页
+        let chunk_size = 365usize;
+        let max_pages = ((days + chunk_size - 1) / chunk_size).min(20);
+        let mut all_closes = std::collections::HashMap::new();
+        let mut total_loaded = 0usize;
+
+        for page in 0..max_pages {
+            let chunk_days = (days - page * chunk_size).min(chunk_size);
+            if chunk_days == 0 { break; }
+            match self.data_manager.get_daily_data(code, chunk_days) {
+                Ok((data, _)) if !data.is_empty() => {
+                    for k in &data {
+                        all_closes.insert(k.date, k.close);
+                    }
+                    total_loaded += data.len();
                 }
-                info!("✓ 基准 {} ({}) 已加载 {} 个交易日", name, code, closes.len());
-                Some(BenchmarkSeries::new(name, closes))
+                _ => {
+                    warn!("基准 {}({}) 第 {} 页数据获取失败, 继续下一页", name, code, page + 1);
+                    // 不中断, 继续下一页
+                }
             }
-            _ => {
-                warn!("基准 {}({}) 数据获取失败, 回测报告将标注'基准数据缺失'", name, code);
-                None
-            }
+        }
+
+        if all_closes.is_empty() {
+            warn!("基准 {}({}) 全部 {} 页数据获取均失败, 回测报告将标注'基准数据缺失'", name, code, max_pages);
+            None
+        } else {
+            info!("✓ 基准 {} ({}) 已加载 {} 个交易日 ({} 页)", name, code, all_closes.len(), max_pages);
+            Some(BenchmarkSeries::new(name, all_closes))
         }
     }
 

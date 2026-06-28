@@ -10,7 +10,7 @@ use crate::config::get_monitor_config;
 
 use super::providers::{
     BochaSearchProvider, ClsProvider, CninfoProvider, EastmoneyNewsProvider, Jin10CalendarEvent,
-    Jin10Provider, SerpAPISearchProvider, SseSzseProvider, TavilySearchProvider,
+    Jin10Provider, KcbDailyProvider, SerpAPISearchProvider, SseSzseProvider, TavilySearchProvider,
     WallStreetCnProvider,
 };
 use super::types::{SearchProvider, SearchResponse, SearchResult};
@@ -93,7 +93,10 @@ impl SearchService {
         // 3. 财联社（免费直连，补充A股电报）
         providers.push(Box::new(ClsProvider::new()));
 
-        // 3b. 巨潮资讯（免费直连，A 股法定信披平台，沪深公告全覆盖）
+        // 3b. 科创板日报 (修复 B-002: 半导体/新能源/AI 硬科技垂直媒体)
+        providers.push(Box::new(KcbDailyProvider::new()));
+
+        // 3c. 巨潮资讯（免费直连，A 股法定信披平台，沪深公告全覆盖）
         providers.push(Box::new(CninfoProvider::new()));
 
         // 3c. 沪深交易所（免费直连，上交所/深交所官方公告，按代码路由）
@@ -565,6 +568,10 @@ impl SearchService {
         // 导致科技/新品/研发类催化在源头被欠采样，故置于首位优先采集。
         let intents = [
             "科技 技术突破 新品 研发 专利 量产",
+            // 修复 B-002: 科创板/半导体/光刻/CO2/新能源等"行业垂媒"关键词
+            // 之前 search query 是泛宏观("今日 A股 重大新闻"), 行业技术新闻永远搜不到
+            "科创板 半导体 光刻 晶圆 CO2 激光 芯片制造",
+            "新能源 电池 光伏 储能 充电桩 材料突破",
             "政策 监管 会议 文件",
             "产业链 上游 下游 供需 价格",
             "公司 公告 订单 中标 并购 合作",
