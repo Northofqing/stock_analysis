@@ -65,7 +65,6 @@ fn test_adapter_source_priority_mapping() {
 }
 
 use stock_analysis::opportunity::event_extractor::rule_filter::*;
-use stock_analysis::signal::market_event::EventType;
 
 fn raw_item(title: &str) -> RawNewsItem {
     RawNewsItem {
@@ -110,7 +109,6 @@ fn test_rule_filter_unknown_keyword_passes() {
 }
 
 use stock_analysis::opportunity::event_extractor::classifier::*;
-use stock_analysis::signal::market_event::Direction;
 
 #[test]
 fn test_classifier_parse_valid_json() {
@@ -143,4 +141,77 @@ fn test_classifier_build_prompt_uses_first_100_chars() {
     let prompt = EventClassifier::build_prompt("test title", &body);
     assert!(prompt.contains("test title"));
     assert!(prompt.len() < 500, "prompt should be concise");
+}
+
+use stock_analysis::opportunity::event_extractor::core::*;
+use stock_analysis::opportunity::event_extractor::*;
+use stock_analysis::signal::market_event::{EventType, Direction};
+
+fn raw_t(title: &str, source: &str, st: SourceType) -> RawNewsItem {
+    RawNewsItem { title: title.into(), body: "".into(), source: source.into(), source_priority: 1, source_type: st, published_at: chrono::Local::now(), url: None }
+}
+
+fn search_result(title: &str, date: &str) -> SearchResult {
+    SearchResult { title: title.into(), snippet: "".into(), url: "".into(), source: "test".into(), published_date: Some(date.into()), news_type: NewsType::Other, sentiment: Sentiment::Neutral, importance: 0, relevance: 0.0, keywords: vec![] }
+}
+
+#[test]
+fn test_core_parse_deep_json() {
+    let json = r#"{"event_type":"TechBreak","direction":"Bull","subject":"CO2激光设备","object":"晶圆制造","strength":70,"certainty":60,"reason":"行业级技术突破"}"#;
+    let raw = raw_t("CO2 激光突破", "cls", SourceType::Search);
+    let me = EventExtractorCore::parse_deep_response(&raw, json).unwrap();
+    assert_eq!(me.event_type, EventType::TechBreak);
+    assert_eq!(me.strength, 70);
+    assert_eq!(me.certainty, 60);
+}
+
+#[test]
+fn test_core_quick_only_strength_lookup() {
+    assert_eq!(strength_for_event_type(EventType::TechBreak, 0.85), 55);
+}
+
+#[test]
+fn test_core_quick_only_certainty_lookup() {
+    assert_eq!(certainty_for_source(SourceType::Flash, 0.85), 68);
+}
+
+#[test]
+fn test_core_quick_only_yields_market_event() {
+    let raw = raw_t("工信部政策", "cls", SourceType::Flash);
+    let co = stock_analysis::opportunity::event_extractor::classifier::ClassifierOutput {
+        is_event: true, event_type: Some(EventType::Policy),
+        direction: Some(Direction::Bull), subject: Some("工信部".into()), confidence: 0.9,
+    };
+    let me = EventExtractorCore::from_quick_only(&raw, &co);
+    assert_eq!(me.event_type, EventType::Policy);
+    assert!(me.strength >= 20 && me.strength <= 80);
+}
+
+#[test]
+fn test_extract_batch_rules_only() {
+    let items = vec![
+        search_result("工信部: 5G-A 商用进入新阶段", "2026-06-27 10:00:00"),
+        search_result("A股收评：三大指数低开高走", "2026-06-27 10:00:00"),
+        search_result("碳酸锂价格上调 5000 元", "2026-06-27 10:00:00"),
+    ];
+    let events = extract_batch_rules_only(&items);
+    assert_eq!(events.len(), 2, "工信部 + 碳酸锂 → 2 个事件; 收评 → 丢弃");
+    for e in &events {
+        assert!(e.ai_degraded, "rules-only path must degrade");
+    }
+}
+
+#[test]
+fn test_extract_incremental_filters_stale() {
+    let now = chrono::Local::now();
+    let old_time = (now - chrono::Duration::hours(10)).format("%Y-%m-%d %H:%M:%S").to_string();
+    let old = search_result("旧快讯", &old_time);
+    let events = extract_incremental_rules_only(&[old], chrono::Duration::minutes(5));
+    assert!(events.is_empty(), "stale > 5min must be discarded");
+}
+
+#[test]
+fn test_extract_batch_empty_input() {
+    let events = extract_batch_rules_only(&[]);
+    assert!(events.is_empty());
 }
