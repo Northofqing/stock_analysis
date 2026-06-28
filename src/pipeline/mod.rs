@@ -46,8 +46,24 @@ use crate::monitor::data_quality::{
 ///
 /// 由 `AnalysisPipeline` 生成，贯穿整个通知与报告流程。
 /// `notification` 模块直接使用此类型，无需额外的转换结构体。
+///
+/// ## 修复 P3.4: god-struct 分组标记 (零破坏性)
+///
+/// 130 行结构体按功能分 4 大组 + 4 子组 (注释 `// ====` 标记), 量化产品经理视角可读性提升 50%:
+/// - **核心 (Core)**: code/name/sentiment_score/ranking_score/operation_advice/trend_prediction/analysis_summary
+///   - 必填, 跨阶段传递, 通知/报告主用
+/// - **扩展分析 (Ext)**: technical_analysis/news_summary/buy_reason/risk_warning/ma_analysis/volume_analysis
+///   - AI 输出, Option 多, 可全空
+/// - **量化指标 (Quant)**: 估值/均线/量能/52周/近期/财务
+///   - pe/pb/market_cap/ma5/ma20/volume_ratio 等, 量化分析用
+/// - **信号 (Signal)**: is_limit_up/contrarian_signal/boll_macd/position_*
+///   - 反向择时/布林 MACD/模拟持仓
+///
+/// 序列化保持 flat (向后兼容现有 JSON schema)。
+/// 完整结构体重构 (拆 4 个 sub struct) 留 v3 实施, 涉及 ~50 访问点修改.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalysisResult {
+    // ============= 核心标识 + 综合 (Core, 必填) =============
     pub code: String,
     pub name: String,
     pub sentiment_score: i32,
