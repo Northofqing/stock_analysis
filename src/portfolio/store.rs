@@ -135,6 +135,7 @@ pub fn load_ledger(since: NaiveDate) -> Result<Vec<LedgerEntry>, String> {
 
 /// 修复 P3.9: 实盘 rolling Sharpe (基于 ledger 净值)
 /// 计算最近 N 日的年化 Sharpe, rf=0.03 (与 sharpe_calculator 一致)
+/// A 股交易日数取 245 (US 默认 252; A 股实际 242-244, 245 略偏保守)
 /// 返回 None 当数据 < 30 日 (样本不足)
 pub fn live_rolling_sharpe(ledger: &[LedgerEntry], window: usize) -> Option<f64> {
     if ledger.len() < 30 {
@@ -161,8 +162,8 @@ pub fn live_rolling_sharpe(ledger: &[LedgerEntry], window: usize) -> Option<f64>
     if std <= 0.0 {
         return None;
     }
-    let rf_daily = 0.03 / 252.0;
-    let ann_factor = 252.0_f64.sqrt();
+    let rf_daily = 0.03 / 245.0;
+    let ann_factor = 245.0_f64.sqrt();
     Some((mean - rf_daily) * ann_factor / std)
 }
 
