@@ -108,3 +108,39 @@ fn test_rule_filter_unknown_keyword_passes() {
     assert!(rm.matched, "关键词未知必保留 (AI fallback)");
     assert_eq!(rm.event_type, Some(EventType::Other));
 }
+
+use stock_analysis::opportunity::event_extractor::classifier::*;
+use stock_analysis::signal::market_event::Direction;
+
+#[test]
+fn test_classifier_parse_valid_json() {
+    let json = r#"{"is_event":true,"event_type":"Policy","direction":"Bull","subject":"工信部","confidence":0.9}"#;
+    let out = EventClassifier::parse_response(json).unwrap();
+    assert!(out.is_event);
+    assert_eq!(out.event_type.unwrap(), EventType::Policy);
+    assert_eq!(out.direction.unwrap(), Direction::Bull);
+    assert_eq!(out.subject.unwrap(), "工信部");
+    assert!((out.confidence - 0.9).abs() < 0.01);
+}
+
+#[test]
+fn test_classifier_parse_non_event() {
+    let json = r#"{"is_event":false,"event_type":null,"direction":null,"subject":null,"confidence":0.3}"#;
+    let out = EventClassifier::parse_response(json).unwrap();
+    assert!(!out.is_event);
+    assert!(out.event_type.is_none());
+}
+
+#[test]
+fn test_classifier_parse_garbage_returns_none() {
+    let out = EventClassifier::parse_response("hello world");
+    assert!(out.is_none(), "AI garbage must not panic, return None");
+}
+
+#[test]
+fn test_classifier_build_prompt_uses_first_100_chars() {
+    let body = "a".repeat(200);
+    let prompt = EventClassifier::build_prompt("test title", &body);
+    assert!(prompt.contains("test title"));
+    assert!(prompt.len() < 500, "prompt should be concise");
+}
