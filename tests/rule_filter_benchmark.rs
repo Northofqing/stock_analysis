@@ -15,6 +15,7 @@ use stock_analysis::signal::market_event::EventType;
 
 /// 标注数据: (title, expected_event_type)
 /// expected_event_type = None 表示期望被丢弃 (噪声)
+#[allow(dead_code)] // rationale 仅供人工调试, 不参与断言
 struct LabeledItem {
     title: &'static str,
     expected: Option<EventType>,
