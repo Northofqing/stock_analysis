@@ -257,19 +257,20 @@ pub fn assess_impact(hits: &[ChainHit], holdings: &[Position]) -> Vec<PositionIm
                 let (direction, reason) = match hit.fund_flow_pct() {
                     Some(flow) if flow >= FLOW_POSITIVE_PCT => (
                         ImpactDirection::Positive,
-                        format!("{}：{}（主力净占比+{:.1}%）", hit.chain(), hit.logic(), flow),
+                        format!("{} {}({}): {}（主力净占比+{:.1}%）", hit.chain(), pos.name, pos.code, hit.logic(), flow),
                     ),
                     Some(flow) if flow <= FLOW_NEGATIVE_PCT => (
                         ImpactDirection::Negative,
-                        format!("{}：消息利好但主力净流出{:.1}%，资金背离", hit.chain(), flow),
+                        format!("{} {}({}): 消息利好但主力净流出{:.1}%，资金背离（链级资金，非个股）",
+                            hit.chain(), pos.name, pos.code, flow),
                     ),
                     Some(flow) => (
                         ImpactDirection::Neutral,
-                        format!("{}：资金平淡（主力净占比{:.1}%）", hit.chain(), flow),
+                        format!("{} {}({}): 资金平淡（主力净占比{:.1}%）", hit.chain(), pos.name, pos.code, flow),
                     ),
                     None => (
                         ImpactDirection::Neutral,
-                        format!("{}：{}（资金数据不足）", hit.chain(), hit.logic()),
+                        format!("{} {}({}): {}（资金数据不足）", hit.chain(), pos.name, pos.code, hit.logic()),
                     ),
                 };
                 results.push(PositionImpact {
