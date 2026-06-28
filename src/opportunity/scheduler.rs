@@ -36,15 +36,15 @@ impl OpportunitySchedule {
 
     pub fn seconds_until_next_trigger_at(&self, now: NaiveTime) -> u64 {
         let triggers = [self.batch_morning, self.batch_evening];
-        let now_secs = now.num_seconds_from_midnight();
+        let now_secs = now.num_seconds_from_midnight() as u64;
 
-        let mut best = 86400u64; // max 1 day
+        let mut best = 86400u64;
         for t in triggers {
-            let trigger_secs = t.num_seconds_from_midnight();
+            let trigger_secs = t.num_seconds_from_midnight() as u64;
             let diff = if trigger_secs >= now_secs {
                 trigger_secs - now_secs
             } else {
-                trigger_secs + 86400 - now_secs // wrap to tomorrow
+                trigger_secs + 86400 - now_secs
             };
             if diff < best { best = diff; }
         }
