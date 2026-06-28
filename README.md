@@ -1,9 +1,9 @@
 # A股量化系统
 
 > **Rust 写的 A 股分析 + 回测系统。**
-> **主要功能**：盘后复盘（AI 研判 + 飞书推送）、盘中监控（涨跌停/资金/异动）、5 个回测策略。
-> **最新进展**：[2026-06-27 完成 25 项量化严谨性修复](#修复成果) —— 数据真实性、回测可信度、资金安全都做了一遍。
-> **总规模**：~55,000 行 Rust，160+ 源文件，30+ 模块。
+> **主要功能**：盘后复盘（AI 研判 + 飞书推送）、盘中监控（涨跌停/资金/异动）、5 个回测策略、事件驱动机会发现 (v9)。
+> **最新进展**：[2026-06-28 v9.1 流水线 + event_extractor 落地](#修复成果) —— 28 项量化严谨性修复 + 事件抽取引擎。
+> **总规模**：~56,000 行 Rust，165+ 源文件，32+ 模块。
 
 ---
 
@@ -35,7 +35,7 @@ cargo run --bin rsi_optimize
 
 ```bash
 cargo build                  # 编译
-cargo test --lib -- --test-threads=1   # 423 个测试, 串行 100% 通过
+cargo test --lib -- --test-threads=1   # 454 个测试, 串行 100% 通过
 ```
 
 ---
@@ -45,15 +45,16 @@ cargo test --lib -- --test-threads=1   # 423 个测试, 串行 100% 通过
 | 是 | 不是 |
 |----|------|
 | **事件驱动的实盘监控 + AI 研判系统** | 单日扫描器 / 短线交易系统 |
-| **5 策略回测框架**（多因子/布林/RSI/多时间框架/逆势） | 预测明日涨跌的模型 |
+| **5 策略回测框架 + v9 事件驱动机会发现** | 预测明日涨跌的模型 |
 | **数据真实性优先**（拒绝 mock/伪造） | 漂亮的演示 dashboard |
-| **统计严谨**（Sharpe/Calmar/Sortino） | 营销导向的"年化 200%" |
+| **统计严谨**（Sharpe/Calmar/Sortino/dual_score） | 营销导向的"年化 200%" |
+| **AI 事件抽取** (v9.1, 8 provider → 三层漏斗 → MarketEvent) | 噪音标题党
 
 ---
 
-## 修复成果（2026-06-27 一次大修）
+## 修复成果（2026-06-27 数据真实性大修 + 2026-06-28 v9.1 流水线）
 
-这次修了 **25 个量化问题**，按风险从高到低：
+这次修了 **28 个量化问题**，按风险从高到低：
 
 | 风险等级 | 问题 | 修复前 | 修复后 |
 |---------|------|--------|--------|
@@ -153,7 +154,7 @@ cargo run --bin rsi_optimize
 | **Portfolio** | `src/portfolio/` | 持仓/交易/账本 单一来源 |
 | **Market** | `src/market_analyzer/` + `src/data_provider/` | 行情/涨跌停/板块/资金流 |
 | **Signal** | `src/signal/` | 统一信号（含 `MarketEvent` 标准中间件，v9 设计） |
-| **Opportunity** | `src/opportunity/` | 事件→产业链→候选→0~100 评分（v9 待实施） |
+| **Opportunity** | `src/opportunity/` | 事件→产业链→候选→0~100 评分. v9.1: event_extractor 三层漏斗 + dual_score |
 | **Decision** | `src/decision/` | 排除/板块分层/资金核验/龙头识别 |
 | **Risk** | `src/risk/` | 硬仓位/止损/VetoChain 否决链 |
 | **Review** | `src/review/` | 复盘/业绩归因/falsification |
@@ -179,7 +180,16 @@ src/
 ├── market_analyzer/        # 指数/涨跌停/板块/市场概览
 ├── monitor/                # 实时检测 + 事件总线
 ├── notification/           # 飞书推送
-├── opportunity/            # 事件→评分 (v9 设计)
+├── opportunity/            # 事件→评分 (v9)
+│   ├── event_extractor/    # P0-1 事件抽取 (5 文件, 20 测试)
+│   │   ├── adapter.rs      # SearchResult → RawNewsItem
+│   │   ├── rule_filter.rs  # 规则预筛 (6 discard + 9 keep)
+│   │   ├── classifier.rs   # Quick AI 分类
+│   │   └── core.rs         # Deep AI + 盘中确定性映射
+│   ├── score.rs            # dual_score (P0-1)
+│   ├── bom_kb.rs           # BOM 弹性节点 (P0-2)
+│   ├── winrate.rs          # winrate 二元化 (P1-2)
+│   └── launch_gate.rs      # 上线门槛 (P0-3)
 ├── pipeline/               # 主分析 pipeline
 │   ├── backtest_runner.rs  # 5 策略回测
 │   └── market_regime.rs    # 牛/震/熊 分状态
@@ -253,10 +263,11 @@ config/                     # SIGHUP 热加载 toml
 |----|------|----------|
 | P2.4 HybridStrategy 真实加权 | 需 IC 加权/BMA 设计 | 单独 P2 plan |
 | P2.6 幸存者偏差 | 需历史成分股数据 | 单独 P2 plan |
-| P3.4 god-struct 拆分 (130 字段) | 影响面大 | 单独 P3 plan |
-| P3.M1 σ/ADV 接入 | 需 K 线历史 | v3 扩展 |
-| P3.9 live Sharpe 接日报 | 函数已写, 接入留作日报改造 | v3 扩展 |
-| v9.1 实施 (8 任务) | 用户拍板"暂时不推" | 计划存档待启动 |
+| P3.4 god-struct 完整拆分 | v9.1 分组标记版已做, 完整拆需 50+ 访问点 | v3 扩展 |
+| P3.M1 σ/ADV 接入 | 框架已就绪, 数据接入推迟 | v3 扩展 |
+| B-002 科创板日报缺失 | 11 个 bug 待修 | `docs/KNOWN_BUGS-2026-06-28.md` |
+| B-003 函数未接日报/周报 | live_rolling_sharpe + strategy_correlation_matrix 已写, 未接输出 | 同上 |
+| v9 AI 调用接入 | event_extractor rules-only 版本已可跑, 真 AI 调用待接 | v9.1 最后一步 |
 | `test_ledger_roundtrip` 并发 flaky | SQLite 全局单例 | 串行 100% 通过 |
 
 ---
@@ -275,19 +286,21 @@ config/                     # SIGHUP 热加载 toml
 
 ```bash
 cargo build                                              # 编译
-cargo test --lib -- --test-threads=1                   # 423 测试, 串行 100% 通过
+cargo test --lib -- --test-threads=1                   # 454 测试, 串行 100% 通过
+cargo test --test event_extractor_tests                 # 20 个 event_extractor 测试
 cargo clippy --lib                                       # 26 个 warning (不阻塞)
 cargo run --bin monitor -- --review                     # 端到端, 15 飞书推送
 ```
 
 ### 文档
 
-- `docs/QUANT_ANALYST_REVIEW.md` — 25 项问题 + 修复状态
-- `docs/ACCEPTANCE_REPORT_2026-06-27.md` — 验收报告
-- `docs/architecture-v9-opportunity-pipeline.md` — v9 机会发现流水线
-- `docs/architecture-v9.1-opportunity-pipeline-fix.md` — v9.1 量化严谨性修正（计划存档）
-- `docs/ARCHITECTURE_REVIEW.md` — 整体 DDD 评审
-- `docs/OPTIMIZATION_REPORT.md` — P0-P3 性能优化
+- `docs/PROJECT_DESIGN-2026-06-28.md` — 全项目设计文档（一站式）
+- `docs/architecture-v9.1-opportunity-pipeline-fix-2026-06-28.md` — v9.1 现行架构 + 5 项量化修正
+- `docs/KNOWN_BUGS-2026-06-28.md` — 10 个已知 bug（按 P0/P1/P2 排序）
+- `docs/architecture/` — 10 个架构演进版本文档 (v2-v8 + P0 风控)
+- `docs/reviews/` — 3 个评审报告（量化机构 38KB + DDD 20KB + 代码审查）
+- `docs/reports/` — 1 个性能优化报告 (P0-P3 24-task)
+- `docs/plans/` — 6 个项目计划 (v3-v8 + P0 风控)
 
 ---
 
