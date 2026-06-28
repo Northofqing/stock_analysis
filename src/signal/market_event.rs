@@ -91,6 +91,11 @@ pub struct MarketEvent {
     pub provenance: Vec<SourceRef>,
     /// AI 降级标志 (true=规则降级抽取, 下游必须降权不编造)
     pub ai_degraded: bool,
+    /// 修复 P0-2: 过期事件标记 (true=超过 max_age, 不参与评分, 入审计)
+    /// 真实含义: published_at 距 now 超过 batch/incremental 阈值
+    /// 用途: 调用方按 stale 分桶, fresh 入评分, stale 入审计 (避免误推旧闻)
+    #[serde(default)]
+    pub stale: bool,
 }
 
 impl MarketEvent {
@@ -119,6 +124,7 @@ impl MarketEvent {
             occurred_at: now,
             provenance: Vec::new(),
             ai_degraded: false,
+            stale: false,
         }
     }
 }

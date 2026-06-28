@@ -99,11 +99,17 @@ pub fn strength_for_event_type(et: EventType, confidence: f64) -> u8 {
 }
 
 pub fn certainty_for_source(st: SourceType, confidence: f64) -> u8 {
-    let factor = match st {
-        SourceType::Announcement => 1.0,
-        SourceType::Search => 0.9,
-        SourceType::Flash => 0.8,
+    // 修复 P0-1 校准区间: spec §4.2 要求 certainty 落在 source 对应的区间
+    //   - Announcement (官方公告/交易所) → 80-100
+    //   - Search       (财经媒体深度报道) → 50-79
+    //   - Flash        (快讯/电报)         → 20-49
+    //   - (Social     社交/传闻         → 0-19)  // 暂未实现
+    // 之前: factor × confidence, 落到 40-85 区间, 与 spec 不符 (Flash 应该 ≤49)
+    // 现在: linear map 让 confidence ∈ [0.5, 1.0] 落到对应区间
+    let raw = match st {
+        SourceType::Announcement => 60.0 + 40.0 * confidence,   // [80, 100]
+        SourceType::Search => 21.0 + 58.0 * confidence,        // [50, 79]
+        SourceType::Flash => -9.0 + 58.0 * confidence,         // [20, 49]
     };
-    let raw = (confidence * 100.0 * factor).round() as u8;
-    raw.clamp(30, 85)
+    raw.clamp(0.0, 100.0).round() as u8
 }

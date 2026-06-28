@@ -17,6 +17,7 @@ fn test_e2e_full_pipeline_smoke() {
         cross_source_count: 3,   // 跨 3 源验证
         quality_score: Some(75.0),
         winrate_score: None,  // 沙盘阶段无 winrate
+        ai_degraded: false,
     };
     let score = compute_dual_score(&inputs, "v9.1-2026-06-test");
     // 修复 P0-1: 量化产品经理验收标准
@@ -58,6 +59,7 @@ fn test_e2e_pipeline_with_no_data() {
         chain_match_score: 50, flow_score: None,  // 缺
         cross_source_count: 1, quality_score: None,  // 缺
         winrate_score: None,  // 缺
+        ai_degraded: false,
     };
     let score = compute_dual_score(&inputs, "v9.1-2026-06-test");
     assert!(score.event_risk_score <= 70, "数据缺 2 项时 event_risk 必封顶 70");
@@ -75,6 +77,7 @@ fn test_e2e_weight_version_propagates() {
         chain_match_score: 70, flow_score: Some(60.0),
         cross_source_count: 2, quality_score: Some(60.0),
         winrate_score: None,
+        ai_degraded: false,
     };
     let score = compute_dual_score(&inputs, "test-v9.1-2026-06-28");
     assert_eq!(score.weight_version, "test-v9.1-2026-06-28");

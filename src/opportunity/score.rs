@@ -66,6 +66,27 @@ pub struct ScoreInputs {
     pub quality_score: Option<f64>,
     /// 修复 P1-2: None = 样本不足, Some(0) = 无数据, Some(0.65) = 真实胜率 65%
     pub winrate_score: Option<f64>,
+    /// 修复 P0-1: AI 降级标志 (true=规则降级抽取, event_score ×0.5)
+    /// spec §0/§5: "AI 不可用 → ⑦ 降权 ×0.5"
+    /// 默认 false (AI 正常抽取); event_extractor/build_degraded 路径置 true
+    pub ai_degraded: bool,
+}
+
+impl Default for ScoreInputs {
+    /// 提供默认值, 便于测试和增量构建
+    /// 量化 PM 视角: 任何字段缺省都应是"保守"而非"乐观"
+    fn default() -> Self {
+        Self {
+            event_strength: 0,
+            event_certainty: 0,
+            chain_match_score: 0,
+            flow_score: None,
+            cross_source_count: 1,  // 默认单源 (保守, cross_score 低)
+            quality_score: None,
+            winrate_score: None,
+            ai_degraded: false,
+        }
+    }
 }
 
 /// 修复 P0-1: dual_score 计算
@@ -76,13 +97,28 @@ pub fn compute_dual_score(inputs: &ScoreInputs, weight_version: &str) -> Opportu
     let mut notes = Vec::new();
 
     // event_risk_score 五项 (修复 P0-1: winrate 不参与, 这是 NS3 风险评估)
-    let event_s = (inputs.event_strength.min(100) as f64 + inputs.event_certainty.min(100) as f64) / 2.0;
+    let event_s_raw = (inputs.event_strength.min(100) as f64 + inputs.event_certainty.min(100) as f64) / 2.0;
+    // 修复 P0-1 + spec §0/§5: AI 不可用 → event_score ×0.5
+    // ai_degraded=true 表示规则降级, strength/certainty 是保守默认值, 应进一步降权
+    let event_s = if inputs.ai_degraded {
+        notes.push("[AI降级] event_score ×0.5".to_string());
+        event_s_raw * 0.5
+    } else {
+        event_s_raw
+    };
     let chain_s = inputs.chain_match_score.min(100) as f64;
     let flow_s = inputs.flow_score.unwrap_or(50.0);
     let cross_s = (inputs.cross_source_count.min(5) as f64 * 25.0).min(100.0);
     let quality_s = inputs.quality_score.unwrap_or(50.0);
 
-    parts.push(ScorePart { name: "event".into(), value: event_s, weight: 0.30, data_sufficiency: true });
+    // 修复 P0-1: ai_degraded 时 event 项 data_sufficiency=false
+    // 含义: 算法降级, value 不应被解读为真实信号
+    parts.push(ScorePart {
+        name: "event".into(),
+        value: event_s,
+        weight: 0.30,
+        data_sufficiency: !inputs.ai_degraded,
+    });
     parts.push(ScorePart { name: "chain".into(), value: chain_s, weight: 0.25, data_sufficiency: true });
     parts.push(ScorePart { name: "flow".into(), value: flow_s, weight: 0.15, data_sufficiency: inputs.flow_score.is_some() });
     parts.push(ScorePart { name: "cross".into(), value: cross_s, weight: 0.10, data_sufficiency: inputs.cross_source_count >= 2 });

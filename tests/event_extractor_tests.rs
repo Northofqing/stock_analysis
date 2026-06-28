@@ -172,7 +172,23 @@ fn test_core_quick_only_strength_lookup() {
 
 #[test]
 fn test_core_quick_only_certainty_lookup() {
-    assert_eq!(certainty_for_source(SourceType::Flash, 0.85), 68);
+    // 修复 P0-1: certainty 校准到 spec §4.2 区间
+    // Flash (快讯) → 20-49, conf=0.85 应得 ~40
+    assert_eq!(certainty_for_source(SourceType::Flash, 0.85), 40);
+}
+
+#[test]
+fn test_core_certainty_calibration_ranges() {
+    // 修复 P0-1: 验证 certainty 校准区间对齐 spec §4.2
+    // Announcement (官方) → 80-100
+    assert_eq!(certainty_for_source(SourceType::Announcement, 0.5), 80);
+    assert_eq!(certainty_for_source(SourceType::Announcement, 1.0), 100);
+    // Search (财经媒体) → 50-79
+    assert_eq!(certainty_for_source(SourceType::Search, 0.5), 50);
+    assert_eq!(certainty_for_source(SourceType::Search, 1.0), 79);
+    // Flash (快讯) → 20-49
+    assert_eq!(certainty_for_source(SourceType::Flash, 0.5), 20);
+    assert_eq!(certainty_for_source(SourceType::Flash, 1.0), 49);
 }
 
 #[test]
@@ -194,10 +210,11 @@ fn test_extract_batch_rules_only() {
         search_result("A股收评：三大指数低开高走", "2026-06-27 10:00:00"),
         search_result("碳酸锂价格上调 5000 元", "2026-06-27 10:00:00"),
     ];
-    let events = extract_batch_rules_only(&items);
-    assert_eq!(events.len(), 2, "工信部 + 碳酸锂 → 2 个事件; 收评 → 丢弃");
-    for e in &events {
+    let (fresh, _stale) = extract_batch_rules_only(&items);
+    assert_eq!(fresh.len(), 2, "工信部 + 碳酸锂 → 2 个事件; 收评 → 丢弃");
+    for e in &fresh {
         assert!(e.ai_degraded, "rules-only path must degrade");
+        assert!(!e.stale, "fresh 事件不应有 stale=true");
     }
 }
 
@@ -206,12 +223,37 @@ fn test_extract_incremental_filters_stale() {
     let now = chrono::Local::now();
     let old_time = (now - chrono::Duration::hours(10)).format("%Y-%m-%d %H:%M:%S").to_string();
     let old = search_result("旧快讯", &old_time);
-    let events = extract_incremental_rules_only(&[old], chrono::Duration::minutes(5));
-    assert!(events.is_empty(), "stale > 5min must be discarded");
+    let (fresh, stale) = extract_incremental_rules_only(&[old], chrono::Duration::minutes(5));
+    assert!(fresh.is_empty(), "stale > 5min 必入 stale 桶");
+    assert_eq!(stale.len(), 1);
+    assert!(stale[0].stale, "stale 桶事件 stale=true");
 }
 
 #[test]
 fn test_extract_batch_empty_input() {
-    let events = extract_batch_rules_only(&[]);
-    assert!(events.is_empty());
+    let (fresh, stale) = extract_batch_rules_only(&[]);
+    assert!(fresh.is_empty());
+    assert!(stale.is_empty());
+}
+
+#[test]
+fn test_extract_batch_marks_stale_events() {
+    // 修复 P0-2: batch 路径 > 1 个交易日的事件必标记 stale=true
+    let now = chrono::Local::now();
+    let old_time = (now - chrono::Duration::days(3)).format("%Y-%m-%d %H:%M:%S").to_string();
+    let old = search_result("旧闻：碳酸锂价格大幅上涨", &old_time);
+    let (fresh, stale) = extract_batch_rules_only(&[old]);
+    assert!(fresh.is_empty(), "3 日前 batch 必入 stale 桶");
+    assert_eq!(stale.len(), 1, "3 日前 batch 必标记 stale=true");
+    assert!(stale[0].stale);
+}
+
+#[test]
+fn test_extract_batch_with_custom_max_age() {
+    // 修复 P0-2: 1 日前的新闻, 阈值设 5 天应入 fresh
+    let now = chrono::Local::now();
+    let one_day_ago = (now - chrono::Duration::days(1)).format("%Y-%m-%d %H:%M:%S").to_string();
+    let item = search_result("5G-A 商用新进展", &one_day_ago);
+    let (fresh, _stale) = extract_batch_rules_only_with_max_age(&[item], chrono::Duration::days(5));
+    assert_eq!(fresh.len(), 1, "1 日前新闻 + 5 天阈值 → fresh");
 }

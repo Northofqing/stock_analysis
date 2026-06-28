@@ -62,6 +62,15 @@ fn test_ai_degraded_flag_persists() {
 }
 
 #[test]
+fn test_stale_flag_defaults_false() {
+    // 修复 P0-2: MarketEvent::new 必 stale=false, 由 event_extractor 按新鲜度设置
+    let e = MarketEvent::new(
+        EventType::Policy, "test".into(), None, Direction::Bull, 50, 50,
+    );
+    assert!(!e.stale, "新建事件默认 fresh, stale=false");
+}
+
+#[test]
 fn test_chains_initially_empty() {
     // 修复 P0-1 职责切分: ② 抽取阶段 chains 恒为空, 由 ③ 映射填充
     let e = MarketEvent::new(
