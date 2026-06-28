@@ -86,3 +86,63 @@ fn test_direction_opposite_zero() {
     // 不要求零, 但要求 < 0.5
     assert!(score < 0.5, "下游对 Bull 应 < 0.5, 实际 {}", score);
 }
+
+#[test]
+fn test_bom_table_size_meets_spec() {
+    // 修复 v9.1 §6 验收: BOM 表 ≥ 50 节点
+    // 之前 5 行业 × 5 环节 = 25 节点不够, 现扩展到 10 行业 = 50 节点
+    let all = boms();
+    assert!(all.len() >= 50, "BOM 表节点数 {} < spec §6 验收门槛 50", all.len());
+}
+
+#[test]
+fn test_bom_table_chain_diversity() {
+    // 修复: 至少 10 个不同产业链 (覆盖科技/金融/材料/制造)
+    use std::collections::HashSet;
+    let chains: HashSet<&str> = boms().iter().map(|n| n.chain.as_str()).collect();
+    assert!(chains.len() >= 10, "产业链数 {} < 10, 覆盖度不足", chains.len());
+}
+
+#[test]
+fn test_bom_table_segment_diversity() {
+    // 修复: 至少有上游/中游/下游三种 direction
+    let mut dirs: Vec<BomDirection> = boms().iter().map(|n| n.direction).collect();
+    dirs.sort_by_key(|d| *d as u8);
+    dirs.dedup();
+    assert_eq!(dirs.len(), 3, "direction 必覆盖 上游/中游/下游, 实际 {} 种", dirs.len());
+}
+
+#[test]
+fn test_new_chains_present() {
+    // 修复: v9.1 新增产业链必可查
+    let new_chains = ["军工", "银行", "计算机", "通信", "化工"];
+    for chain in &new_chains {
+        let found = boms().iter().any(|n| n.chain == *chain);
+        assert!(found, "新增产业链 {} 必可查", chain);
+    }
+}
+
+#[test]
+fn test_new_chain_find_by_segment() {
+    // 修复: 军工/计算机等新链的具体环节必可查
+    assert!(find_bom_node("军工", "总装").is_some(), "军工-总装必可查");
+    assert!(find_bom_node("计算机", "AI").is_some(), "计算机-AI 必可查");
+    assert!(find_bom_node("银行", "国有大行").is_some(), "银行-国有大行 必可查");
+    assert!(find_bom_node("通信", "光模块").is_some(), "通信-光模块 必可查");
+    assert!(find_bom_node("化工", "精细化工").is_some(), "化工-精细化工 必可查");
+}
+
+#[test]
+fn test_elasticity_field_bounds_all_nodes() {
+    // 修复: 所有节点的 elasticity/margin/confidence 必在 [0, 1]
+    for n in boms() {
+        assert!(n.elasticity_score >= 0.0 && n.elasticity_score <= 1.0,
+                "{}-{} elasticity {} 越界", n.chain, n.segment, n.elasticity_score);
+        assert!(n.margin_pct >= 0.0 && n.margin_pct <= 1.0,
+                "{}-{} margin {} 越界", n.chain, n.segment, n.margin_pct);
+        assert!(n.confidence >= 0.0 && n.confidence <= 1.0,
+                "{}-{} confidence {} 越界", n.chain, n.segment, n.confidence);
+        assert!(n.lead_days <= 255,
+                "{}-{} lead_days {} 越界", n.chain, n.segment, n.lead_days);
+    }
+}

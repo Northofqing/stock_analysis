@@ -88,40 +88,82 @@ pub fn chain_score_with_direction(node: &BomNode, event_dir: EventDirection) -> 
 
 /// 修复 P0-2: const fallback (量化 PM 视角: 表/toml 缺失时必可用, 不静默置空)
 ///
-/// 至少 25 节点 (5 行业 × 5 环节) 才能支撑 chain_score 评分
+/// 修复 v9.1 §6 验收: ≥ 50 节点 (10 行业 × 5 环节 = 50 节点)
+/// 之前 5 行业 × 5 环节 = 25 节点不够, 实际场景覆盖不到 (军工/银行/保险等)
+/// 现在覆盖 10 大行业: 新能源车/半导体/光伏/医药/消费电子/军工/银行/计算机/通信/化工
 pub fn boms() -> &'static [BomNode] {
     use std::sync::OnceLock;
     static CACHE: OnceLock<Vec<BomNode>> = OnceLock::new();
     CACHE.get_or_init(|| vec![
+        // ─── 新能源车 ───
         BomNode { chain: String::from("新能源车"), segment: String::from("锂矿"), direction: BomDirection::Upstream, elasticity_score: 0.7, margin_pct: 0.18, lead_days: 30, source: String::from("Industry"), confidence: 0.7 },
         BomNode { chain: String::from("新能源车"), segment: String::from("正极材料"), direction: BomDirection::Midstream, elasticity_score: 0.8, margin_pct: 0.15, lead_days: 15, source: String::from("Industry"), confidence: 0.7 },
         BomNode { chain: String::from("新能源车"), segment: String::from("电池"), direction: BomDirection::Midstream, elasticity_score: 0.9, margin_pct: 0.25, lead_days: 10, source: String::from("Industry"), confidence: 0.8 },
         BomNode { chain: String::from("新能源车"), segment: String::from("整车"), direction: BomDirection::Downstream, elasticity_score: 0.6, margin_pct: 0.30, lead_days: 5, source: String::from("Industry"), confidence: 0.7 },
         BomNode { chain: String::from("新能源车"), segment: String::from("充电桩"), direction: BomDirection::Downstream, elasticity_score: 0.5, margin_pct: 0.10, lead_days: 20, source: String::from("Industry"), confidence: 0.5 },
 
+        // ─── 半导体 ───
         BomNode { chain: String::from("半导体"), segment: String::from("硅片"), direction: BomDirection::Upstream, elasticity_score: 0.6, margin_pct: 0.20, lead_days: 45, source: String::from("Official"), confidence: 0.8 },
         BomNode { chain: String::from("半导体"), segment: String::from("设计"), direction: BomDirection::Midstream, elasticity_score: 0.7, margin_pct: 0.30, lead_days: 20, source: String::from("Official"), confidence: 0.7 },
         BomNode { chain: String::from("半导体"), segment: String::from("晶圆代工"), direction: BomDirection::Midstream, elasticity_score: 0.8, margin_pct: 0.35, lead_days: 30, source: String::from("Official"), confidence: 0.8 },
         BomNode { chain: String::from("半导体"), segment: String::from("封测"), direction: BomDirection::Midstream, elasticity_score: 0.6, margin_pct: 0.10, lead_days: 15, source: String::from("Industry"), confidence: 0.7 },
         BomNode { chain: String::from("半导体"), segment: String::from("应用"), direction: BomDirection::Downstream, elasticity_score: 0.5, margin_pct: 0.15, lead_days: 10, source: String::from("Industry"), confidence: 0.5 },
 
+        // ─── 光伏 ───
         BomNode { chain: String::from("光伏"), segment: String::from("硅料"), direction: BomDirection::Upstream, elasticity_score: 0.9, margin_pct: 0.25, lead_days: 30, source: String::from("Official"), confidence: 0.8 },
         BomNode { chain: String::from("光伏"), segment: String::from("硅片"), direction: BomDirection::Midstream, elasticity_score: 0.7, margin_pct: 0.20, lead_days: 15, source: String::from("Industry"), confidence: 0.7 },
         BomNode { chain: String::from("光伏"), segment: String::from("电池片"), direction: BomDirection::Midstream, elasticity_score: 0.8, margin_pct: 0.25, lead_days: 10, source: String::from("Industry"), confidence: 0.7 },
         BomNode { chain: String::from("光伏"), segment: String::from("组件"), direction: BomDirection::Downstream, elasticity_score: 0.6, margin_pct: 0.15, lead_days: 5, source: String::from("Industry"), confidence: 0.7 },
         BomNode { chain: String::from("光伏"), segment: String::from("电站"), direction: BomDirection::Downstream, elasticity_score: 0.4, margin_pct: 0.10, lead_days: 30, source: String::from("Industry"), confidence: 0.5 },
 
+        // ─── 医药 ───
         BomNode { chain: String::from("医药"), segment: String::from("原料药"), direction: BomDirection::Upstream, elasticity_score: 0.6, margin_pct: 0.15, lead_days: 30, source: String::from("Industry"), confidence: 0.6 },
         BomNode { chain: String::from("医药"), segment: String::from("制剂"), direction: BomDirection::Midstream, elasticity_score: 0.7, margin_pct: 0.30, lead_days: 15, source: String::from("Industry"), confidence: 0.7 },
         BomNode { chain: String::from("医药"), segment: String::from("流通"), direction: BomDirection::Downstream, elasticity_score: 0.5, margin_pct: 0.10, lead_days: 10, source: String::from("Industry"), confidence: 0.5 },
         BomNode { chain: String::from("医药"), segment: String::from("医院"), direction: BomDirection::Downstream, elasticity_score: 0.4, margin_pct: 0.20, lead_days: 5, source: String::from("Industry"), confidence: 0.5 },
         BomNode { chain: String::from("医药"), segment: String::from("创新药"), direction: BomDirection::Midstream, elasticity_score: 0.9, margin_pct: 0.40, lead_days: 60, source: String::from("Official"), confidence: 0.7 },
 
+        // ─── 消费电子 ───
         BomNode { chain: String::from("消费电子"), segment: String::from("芯片"), direction: BomDirection::Upstream, elasticity_score: 0.7, margin_pct: 0.20, lead_days: 20, source: String::from("Industry"), confidence: 0.7 },
         BomNode { chain: String::from("消费电子"), segment: String::from("屏幕"), direction: BomDirection::Upstream, elasticity_score: 0.6, margin_pct: 0.15, lead_days: 15, source: String::from("Industry"), confidence: 0.6 },
         BomNode { chain: String::from("消费电子"), segment: String::from("组装"), direction: BomDirection::Midstream, elasticity_score: 0.7, margin_pct: 0.15, lead_days: 10, source: String::from("Industry"), confidence: 0.7 },
         BomNode { chain: String::from("消费电子"), segment: String::from("品牌"), direction: BomDirection::Downstream, elasticity_score: 0.5, margin_pct: 0.20, lead_days: 5, source: String::from("Industry"), confidence: 0.6 },
         BomNode { chain: String::from("消费电子"), segment: String::from("渠道"), direction: BomDirection::Downstream, elasticity_score: 0.4, margin_pct: 0.10, lead_days: 5, source: String::from("Industry"), confidence: 0.5 },
+
+        // ─── 军工 (新增) ───
+        BomNode { chain: String::from("军工"), segment: String::from("原材料"), direction: BomDirection::Upstream, elasticity_score: 0.5, margin_pct: 0.12, lead_days: 60, source: String::from("Official"), confidence: 0.7 },
+        BomNode { chain: String::from("军工"), segment: String::from("元器件"), direction: BomDirection::Midstream, elasticity_score: 0.7, margin_pct: 0.25, lead_days: 30, source: String::from("Official"), confidence: 0.7 },
+        BomNode { chain: String::from("军工"), segment: String::from("主机厂"), direction: BomDirection::Midstream, elasticity_score: 0.6, margin_pct: 0.20, lead_days: 30, source: String::from("Official"), confidence: 0.6 },
+        BomNode { chain: String::from("军工"), segment: String::from("总装"), direction: BomDirection::Downstream, elasticity_score: 0.5, margin_pct: 0.15, lead_days: 30, source: String::from("Industry"), confidence: 0.5 },
+        BomNode { chain: String::from("军工"), segment: String::from("军贸"), direction: BomDirection::Downstream, elasticity_score: 0.8, margin_pct: 0.30, lead_days: 90, source: String::from("Industry"), confidence: 0.6 },
+
+        // ─── 银行 (新增, 高股息/利率敏感) ───
+        BomNode { chain: String::from("银行"), segment: String::from("国有大行"), direction: BomDirection::Upstream, elasticity_score: 0.7, margin_pct: 0.30, lead_days: 5, source: String::from("Official"), confidence: 0.8 },
+        BomNode { chain: String::from("银行"), segment: String::from("股份行"), direction: BomDirection::Midstream, elasticity_score: 0.8, margin_pct: 0.25, lead_days: 5, source: String::from("Industry"), confidence: 0.7 },
+        BomNode { chain: String::from("银行"), segment: String::from("城商行"), direction: BomDirection::Midstream, elasticity_score: 0.6, margin_pct: 0.20, lead_days: 5, source: String::from("Industry"), confidence: 0.6 },
+        BomNode { chain: String::from("银行"), segment: String::from("农商行"), direction: BomDirection::Downstream, elasticity_score: 0.4, margin_pct: 0.15, lead_days: 10, source: String::from("Industry"), confidence: 0.5 },
+        BomNode { chain: String::from("银行"), segment: String::from("保险"), direction: BomDirection::Downstream, elasticity_score: 0.7, margin_pct: 0.20, lead_days: 10, source: String::from("Industry"), confidence: 0.7 },
+
+        // ─── 计算机/软件 (新增) ───
+        BomNode { chain: String::from("计算机"), segment: String::from("硬件"), direction: BomDirection::Upstream, elasticity_score: 0.5, margin_pct: 0.12, lead_days: 30, source: String::from("Industry"), confidence: 0.6 },
+        BomNode { chain: String::from("计算机"), segment: String::from("软件平台"), direction: BomDirection::Midstream, elasticity_score: 0.8, margin_pct: 0.35, lead_days: 20, source: String::from("Industry"), confidence: 0.7 },
+        BomNode { chain: String::from("计算机"), segment: String::from("SaaS"), direction: BomDirection::Midstream, elasticity_score: 0.9, margin_pct: 0.40, lead_days: 15, source: String::from("Industry"), confidence: 0.8 },
+        BomNode { chain: String::from("计算机"), segment: String::from("AI"), direction: BomDirection::Midstream, elasticity_score: 0.95, margin_pct: 0.45, lead_days: 10, source: String::from("Industry"), confidence: 0.8 },
+        BomNode { chain: String::from("计算机"), segment: String::from("应用"), direction: BomDirection::Downstream, elasticity_score: 0.6, margin_pct: 0.25, lead_days: 15, source: String::from("Industry"), confidence: 0.6 },
+
+        // ─── 通信 (新增) ───
+        BomNode { chain: String::from("通信"), segment: String::from("光模块"), direction: BomDirection::Upstream, elasticity_score: 0.8, margin_pct: 0.25, lead_days: 15, source: String::from("Industry"), confidence: 0.7 },
+        BomNode { chain: String::from("通信"), segment: String::from("主设备"), direction: BomDirection::Midstream, elasticity_score: 0.6, margin_pct: 0.18, lead_days: 30, source: String::from("Official"), confidence: 0.6 },
+        BomNode { chain: String::from("通信"), segment: String::from("运营商"), direction: BomDirection::Midstream, elasticity_score: 0.5, margin_pct: 0.30, lead_days: 30, source: String::from("Official"), confidence: 0.7 },
+        BomNode { chain: String::from("通信"), segment: String::from("终端"), direction: BomDirection::Downstream, elasticity_score: 0.5, margin_pct: 0.15, lead_days: 10, source: String::from("Industry"), confidence: 0.5 },
+        BomNode { chain: String::from("通信"), segment: String::from("应用"), direction: BomDirection::Downstream, elasticity_score: 0.6, margin_pct: 0.20, lead_days: 15, source: String::from("Industry"), confidence: 0.6 },
+
+        // ─── 化工 (新增) ───
+        BomNode { chain: String::from("化工"), segment: String::from("原料"), direction: BomDirection::Upstream, elasticity_score: 0.7, margin_pct: 0.20, lead_days: 30, source: String::from("Industry"), confidence: 0.6 },
+        BomNode { chain: String::from("化工"), segment: String::from("中间体"), direction: BomDirection::Midstream, elasticity_score: 0.6, margin_pct: 0.18, lead_days: 20, source: String::from("Industry"), confidence: 0.6 },
+        BomNode { chain: String::from("化工"), segment: String::from("精细化工"), direction: BomDirection::Midstream, elasticity_score: 0.8, margin_pct: 0.30, lead_days: 15, source: String::from("Industry"), confidence: 0.7 },
+        BomNode { chain: String::from("化工"), segment: String::from("化纤"), direction: BomDirection::Downstream, elasticity_score: 0.5, margin_pct: 0.15, lead_days: 20, source: String::from("Industry"), confidence: 0.5 },
+        BomNode { chain: String::from("化工"), segment: String::from("终端材料"), direction: BomDirection::Downstream, elasticity_score: 0.6, margin_pct: 0.22, lead_days: 20, source: String::from("Industry"), confidence: 0.6 },
     ])
 }
 

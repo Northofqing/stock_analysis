@@ -97,6 +97,16 @@ pub struct MonitorConfig {
     /// 是否强制要求快讯+Web双源共振
     #[serde(default)]
     pub opportunity_require_cross_source: bool,
+    /// 修复 v9.1 §0 NS3: dual_score.event_risk_score 推送阈值
+    /// 实际推送的最低 event_risk_score, 默认 75
+    /// 60-74 入候选池 (供复盘), 75+ 实时推送, <60 不推
+    #[serde(default = "default_opportunity_push_threshold")]
+    pub opportunity_push_threshold: u8,
+    /// 修复 v9.1: 启用 v9.1 dual_score 评分门 (替代 ad-hoc score_hit_confidence)
+    /// false = 用 legacy score_hit_confidence (默认, 向后兼容)
+    /// true = 用 dual_score.event_risk_score (新评分模型, 更严谨)
+    #[serde(default)]
+    pub opportunity_use_dual_score: bool,
     /// VetoChain 否决链配置 (可选 section [live_veto])
     #[serde(default)]
     pub live_veto: LiveVetoConfig,
@@ -129,6 +139,7 @@ fn default_dq_position_stale_sec() -> u64 { 30 }
 fn default_dq_nav_stale_sec() -> u64 { 24 * 3600 }
 fn default_dq_daily_stale_sec() -> u64 { 24 * 3600 }
 fn default_opportunity_min_confidence() -> u8 { 55 }
+fn default_opportunity_push_threshold() -> u8 { 75 }
 
 // ── 实时否决链配置 (VetoChain) ──
 
@@ -287,6 +298,8 @@ impl Default for MonitorConfig {
             dq_daily_stale_sec: 24 * 3600,
             opportunity_min_confidence: 55,
             opportunity_require_cross_source: false,
+            opportunity_push_threshold: 75,
+            opportunity_use_dual_score: false,
             live_veto: LiveVetoConfig::default(),
             position_sizing: PositionSizingConfig::default(),
             factor_feedback: FactorFeedbackConfig::default(),
