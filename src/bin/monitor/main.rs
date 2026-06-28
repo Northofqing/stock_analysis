@@ -1001,7 +1001,7 @@ async fn news_monitor_loop() {
         }
 
         // 路径A 机会发现已统一到 opportunity::run_opportunity_scan（monitor_loop 内调度），
-        // 此处不再重复跑 news_ai::discover_opportunities（v8 单一发现器，消除重复路径）。
+        // news_ai::discover_opportunities 在 v9.1 Task 0 已删除。
 
         // 产业链机会扫描：统一在 8:00-22:00 窗口内按间隔调度（覆盖盘前/盘中/盘后）。
         // spawn 异步执行，不阻塞新闻轮询。

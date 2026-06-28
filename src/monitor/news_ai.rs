@@ -12,27 +12,12 @@
 
 use crate::analyzer::{AgentMode, GeminiAnalyzer};
 use crate::monitor::detector::{AlertCategory, AlertDetail, AlertEvent, AlertLevel};
-use crate::monitor::entity_linker::{EntityHit, EntityLinker};
+use crate::monitor::entity_linker::EntityLinker;
 use chrono::Local;
 use log::warn;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-// ── 异步雪崩防护 ──
-
-static AI_TASK_RUNNING: AtomicBool = AtomicBool::new(false);
-
 // ── 输出结构 ──
-
-#[derive(Debug, Clone)]
-pub struct Opportunity {
-    pub code: String,
-    pub name: String,
-    pub reason: String,
-    pub direction: String,  // "买入" / "回避"
-    pub confidence: u8,     // 0-100
-    pub horizon: String,    // "日内" / "1-3天" / "1周+"
-}
 
 #[derive(Debug, Clone)]
 pub struct PositionAnalysis {
@@ -50,9 +35,6 @@ pub struct NewsAIAnalyzer {
     linker: EntityLinker,
     analyzer: GeminiAnalyzer,
     available: bool,
-    /// 幻觉率追踪
-    hallucination_count: u64,
-    total_code_outputs: u64,
 }
 
 impl NewsAIAnalyzer {
@@ -70,126 +52,10 @@ impl NewsAIAnalyzer {
                 }
             }
         }
-        Self { linker, analyzer, available, hallucination_count: 0, total_code_outputs: 0 }
+        Self { linker, analyzer, available }
     }
 
     fn available(&self) -> bool { self.available }
-
-    // ═══════════════════════════════════════════════════════════
-    // 路径A：机会发现（entity_linker 候选池 → AI 打分）
-    // ═══════════════════════════════════════════════════════════
-
-    /// **[已废弃 v8]** 机会发现已统一到 `opportunity::run_opportunity_scan`（单一发现器）。
-    /// 保留实现以备回滚，生产路径不再调用。
-    #[deprecated(note = "v8: 机会发现统一到 opportunity::run_opportunity_scan")]
-    #[allow(dead_code)]
-    pub async fn discover_opportunities(&mut self, flash_titles: &[String]) -> Vec<AlertEvent> {
-        if flash_titles.is_empty() || !self.available() { return vec![]; }
-        if AI_TASK_RUNNING.swap(true, Ordering::SeqCst) {
-            warn!("[NewsAI] 上次扫描未完成，跳过本次");
-            return vec![];
-        }
-
-        let result = tokio::time::timeout(Duration::from_secs(3), async {
-            // Step 1: entity_linker 从快讯中初筛候选
-            let full_text = flash_titles.join("\n");
-            let raw_hits = self.linker.link(&full_text);
-            // 去重+限10只
-            let mut seen = std::collections::HashSet::new();
-            let mut candidates: Vec<&EntityHit> = Vec::new();
-            for h in &raw_hits {
-                if seen.insert(&h.code) { candidates.push(h); }
-                if candidates.len() >= 10 { break; }
-            }
-
-            if candidates.is_empty() {
-                return vec![];
-            }
-
-            // Step 2: 构建候选池文本
-            let mut cand_text = String::new();
-            for h in &candidates {
-                cand_text.push_str(&format!("{}|{}|匹配原因:{}|置信度:{:.0}%\n",
-                    h.code, h.name, h.reason, h.confidence * 100.0));
-            }
-
-            let prompt = format!(
-                "你是A股短线策略师。根据最新快讯评估候选标的。\n\n<快讯>\n{}\n</快讯>\n\n<候选标的>\n{}\n</候选标的>\n\n要求：1.从候选池选0-3个有催化的 2.格式：代码|名称|逻辑|买入/回避|置信度|持续期 3.已涨停不推 4.没好机会输出\"无\"",
-                flash_titles.join("\n"), cand_text
-            );
-
-            match self.analyzer.call_api_mode(&prompt, "你是A股策略师,只输出格式化的选股结果", AgentMode::Quick).await {
-                Ok(text) => self.parse_opportunities(&text, &candidates),
-                Err(e) => { warn!("[NewsAI] 机会发现失败: {}", e); vec![] }
-            }
-        }).await;
-
-        AI_TASK_RUNNING.store(false, Ordering::SeqCst);
-        result.unwrap_or_else(|_| {
-            AI_TASK_RUNNING.store(false, Ordering::SeqCst);
-            warn!("[NewsAI] 机会发现超时");
-            vec![]
-        })
-    }
-
-    #[allow(dead_code)]
-    fn parse_opportunities(&mut self, text: &str, candidates: &[&EntityHit]) -> Vec<AlertEvent> {
-        let mut events = Vec::new();
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line == "无" || line.starts_with('#') { continue; }
-            let parts: Vec<&str> = line.split('|').map(|s| s.trim()).collect();
-            if parts.len() < 5 { continue; }
-
-            let code = parts[0];
-            let name = parts.get(1).unwrap_or(&"");
-            self.total_code_outputs += 1;
-
-            // 代码校验闸
-            let validated = validate_llm_code(code, name);
-            if validated.is_none() {
-                self.hallucination_count += 1;
-                warn!("[NewsAI] 校验闸拦截: {}|{}", code, name);
-                continue;
-            }
-
-            // 确认在候选池内
-            if !candidates.iter().any(|c| c.code == code) {
-                warn!("[NewsAI] 代码{}不在候选池,跳过", code);
-                continue;
-            }
-
-            let reason = parts.get(2).unwrap_or(&"").to_string();
-            let direction = parts.get(3).unwrap_or(&"").to_string();
-            let confidence = parts.get(4).unwrap_or(&"50").parse::<u8>().unwrap_or(50);
-            let horizon = parts.get(5).unwrap_or(&"1-3天").to_string();
-
-            // 写入 prediction_tracker（Shadow mode）
-            let _ = crate::monitor::prediction::save_prediction(
-                None, Some(code), if direction.contains("买入") { "看多" } else { "看空" },
-                confidence as f64, Some(&reason),
-            );
-
-            events.push(AlertEvent {
-                level: AlertLevel::Info,
-                category: AlertCategory::FlashNews,
-                code: code.to_string(),
-                name: name.to_string(),
-                message: format!("【AI舆情研判-仅供参考】{} | {} | 置信度{}% | {}",
-                    direction, reason, confidence, horizon),
-                detail: AlertDetail {
-                    price: None, change_pct: None, volume_ratio: None,
-                    main_flow_yi: None, threshold: None,
-                    news_title: Some(reason.clone()),
-                    news_summary: None, ai_decision: None,
-                    t1_locked: false,
-                    extra: Some(format!("AI推荐,置信度{}%,持续期{}", confidence, horizon)),
-                },
-                triggered_at: Local::now(),
-            });
-        }
-        events
-    }
 
     // ═══════════════════════════════════════════════════════════
     // 路径B：持仓深研（消息 + 技术面 → 影响评估）
@@ -318,19 +184,8 @@ impl NewsAIAnalyzer {
     }
 
     // ═══════════════════════════════════════════════════════════
-    // 自监控
+    // 自监控 (v9.1 Task 0: discover_opportunities 已废弃, 暂无自监控指标)
     // ═══════════════════════════════════════════════════════════
-
-    pub fn hallucination_rate(&self) -> f64 {
-        if self.total_code_outputs == 0 { 0.0 }
-        else { self.hallucination_count as f64 / self.total_code_outputs as f64 }
-    }
-
-    #[allow(dead_code)]
-    pub fn stats(&self) -> String {
-        format!("AI分析 | 幻觉率:{:.0}%({}/{})",
-            self.hallucination_rate() * 100.0, self.hallucination_count, self.total_code_outputs)
-    }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -427,14 +282,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_opportunities_empty() {
-        let _ = crate::database::DatabaseManager::init(Some(std::path::PathBuf::from("./test_data/test_ai.db")));
-        let mut ai = NewsAIAnalyzer::new();
-        let events = ai.parse_opportunities("无", &[]);
-        assert!(events.is_empty());
-    }
-
-    #[test]
     fn test_parse_position_basic() {
         let _ = crate::database::DatabaseManager::init(Some(std::path::PathBuf::from("./test_data/test_ai.db")));
         let ai = NewsAIAnalyzer::new();
@@ -445,14 +292,6 @@ mod tests {
         assert_eq!(e.level, AlertLevel::Info);
         assert!(e.message.contains("AI舆情研判"));
         assert!(e.message.contains("偏空"));
-    }
-
-    #[test]
-    fn test_hallucination_rate() {
-        let mut ai = NewsAIAnalyzer::new();
-        ai.total_code_outputs = 10;
-        ai.hallucination_count = 3;
-        assert!((ai.hallucination_rate() - 0.3).abs() < 0.01);
     }
 
     #[test]
@@ -481,21 +320,5 @@ mod tests {
     fn test_keyword_decision_unknown() {
         let d = keyword_decision("关于公司日常经营情况的说明").unwrap();
         assert!(d.contains("观望"));
-    }
-
-    #[test]
-    fn test_validate_code_llm_output_ok() {
-        // 初始化DB（避免NewsAIAnalyzer::new中panic）
-        let _ = crate::database::DatabaseManager::init(Some(std::path::PathBuf::from("./test_data/test_ai.db")));
-        let mut ai = NewsAIAnalyzer::new();
-        // 构造候选池（含目标代码以通过"在候选池内"检查）
-        let hit = EntityHit { code: "000547".into(), name: "航天发展".into(), confidence: 0.9, reason: "匹配".into() };
-        let candidates = vec![&hit];
-        let text = "000547|航天发展|低空经济催化|买入|75|1-3天";
-        let events = ai.parse_opportunities(text, &candidates);
-        assert_eq!(ai.total_code_outputs, 1);
-        assert_eq!(ai.hallucination_count, 0);
-        assert_eq!(events.len(), 1);
-        assert!(events[0].message.contains("AI舆情研判"));
     }
 }
