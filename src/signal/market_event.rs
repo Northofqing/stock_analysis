@@ -64,8 +64,13 @@ pub struct SourceRef {
 /// MarketEvent 标准中间件 (修复 P0-1)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketEvent {
-    /// 事件指纹 (sha256 hex 64字符, 用于去重 + 历史检索)
+    /// 事件指纹 (sha256 hex 64字符, 用于精确去重 + 历史检索)
     pub event_id: String,
+    /// 修复 P1-1: SimHash 64-bit, 用于跨源模糊去重
+    /// 财联社 vs 新浪 同事件不同标题 → event_id 不同但 simhash 接近
+    /// 24h 内汉明距离 ≤ 3 → 同一事件
+    #[serde(default)]
+    pub simhash: u64,
     /// 事件类型
     pub event_type: EventType,
     /// 主体 (谁/什么产品/什么环节)
@@ -100,8 +105,10 @@ impl MarketEvent {
     ) -> Self {
         let now = Local::now();
         let event_id = compute_event_id(&subject, &now);
+        let simhash = compute_simhash(&subject, "");
         Self {
             event_id,
+            simhash,
             event_type,
             subject,
             object,
@@ -139,4 +146,47 @@ fn normalize(s: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// 修复 P1-1: SimHash 64-bit, 用于跨源模糊去重
+/// tokenize 简单: 按字符 bigram
+/// 64-bit hash: 每个 token 的 hash 的 bit 累加
+pub fn compute_simhash(title: &str, body: &str) -> u64 {
+    let combined = format!("{} {}", normalize(title), normalize(body));
+    let chars: Vec<char> = combined.chars().collect();
+    if chars.len() < 2 {
+        return 0;
+    }
+    let mut v: [i32; 64] = [0; 64];
+    for window in chars.windows(2) {
+        let token: String = window.iter().collect();
+        let token_hash = simple_hash(&token);
+        for bit in 0..64 {
+            if (token_hash >> bit) & 1 == 1 {
+                v[bit] += 1;
+            } else {
+                v[bit] -= 1;
+            }
+        }
+    }
+    let mut result: u64 = 0;
+    for (i, &count) in v.iter().enumerate() {
+        if count > 0 {
+            result |= 1u64 << i;
+        }
+    }
+    result
+}
+
+/// 简单字符串 hash (修复 P1-1 SimHash 用, 不引外部 crate)
+fn simple_hash(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+/// 修复 P1-1: SimHash 汉明距离 (量化"两事件多相似")
+pub fn hamming_distance(a: u64, b: u64) -> u32 {
+    (a ^ b).count_ones()
 }

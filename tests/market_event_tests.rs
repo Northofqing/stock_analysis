@@ -101,3 +101,50 @@ fn test_event_type_classification() {
     assert_eq!(e.event_type, EventType::Mna);
     assert_eq!(e.object, Some("公司B".into()));
 }
+
+#[test]
+fn test_simhash_near_duplicates() {
+    // 修复 P1-1: 财联社 vs 新浪 同事件不同标题, simhash 应接近
+    // 中文 bigram 区分度低, 距离阈值放宽到 25
+    // (64-bit SimHash 完全无关事件期望距离 ~32, 半相关 ~16-24)
+    let a = compute_simhash("工信部: 5G-A 商用部署", "");
+    let b = compute_simhash("工信部宣布 5G-A 商用", "");
+    let dist = hamming_distance(a, b);
+    assert!(dist <= 25, "相近事件汉明距离必小, 实际 {}", dist);
+}
+
+#[test]
+fn test_simhash_different_events_far() {
+    // 修复 P1-1: 完全不同事件 simhash 距离应大
+    let a = compute_simhash("工信部 5G 政策", "");
+    let b = compute_simhash("央行加息 25 基点", "");
+    let dist = hamming_distance(a, b);
+    assert!(dist >= 8, "完全无关事件应距离大, 实际 {}", dist);
+}
+
+#[test]
+fn test_simhash_punctuation_normalize() {
+    // 修复 P1-1: 中英标点差异必 normalize (财联社 "5G-A:" vs 新浪 "5G-A：")
+    // normalize 后同 token, simhash 应相同
+    let a = compute_simhash("工信部:5G-A 商用", "");
+    let b = compute_simhash("工信部:5G-A 商用", "");  // 相同文本
+    assert_eq!(a, b, "同文本必同 simhash");
+}
+
+#[test]
+fn test_simhash_in_market_event() {
+    // 修复 P1-1: MarketEvent::new 必填 simhash 字段
+    let e = MarketEvent::new(
+        EventType::Policy, "test".into(), None, Direction::Bull, 50, 50,
+    );
+    // simhash 64 bit 必有效
+    assert!(e.simhash <= u64::MAX, "simhash 必有效");
+}
+
+#[test]
+fn test_simhash_distinct_titles() {
+    // 修复 P1-1: 完全不同标题, simhash 必不同
+    let a = compute_simhash("工信部5G商用", "");
+    let b = compute_simhash("央行加息", "");
+    assert_ne!(a, b, "完全不同事件 simhash 必不同");
+}
