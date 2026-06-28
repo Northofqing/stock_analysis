@@ -496,7 +496,7 @@ async fn run_test_scan() {
         let mut stats = stock_analysis::review::equity::compute_stats(&equity);
         stock_analysis::review::equity::enrich_with_trades(&mut stats, &reviews);
         let prices = build_price_map(&quotes);
-        (stock_analysis::review::report::generate_daily_report(&reviews, &stats, &holdings, &prices), holdings)
+        (stock_analysis::review::report::generate_daily_report_with_ledger(&reviews, &stats, &holdings, &prices, Some(equity.as_slice())), holdings)
     }).await.unwrap_or_default();
     log::info!("[测试] 复盘报告:\n{}", report.0);
     push_wechat(&report.0).await;
@@ -614,7 +614,7 @@ async fn run_review_only() {
         let equity = stock_analysis::portfolio::get_equity_curve(365).unwrap_or_default();
         let mut stats = stock_analysis::review::equity::compute_stats(&equity);
         stock_analysis::review::equity::enrich_with_trades(&mut stats, &reviews);
-        let r = stock_analysis::review::report::generate_daily_report(&reviews, &stats, &holdings, &prices);
+        let r = stock_analysis::review::report::generate_daily_report_with_ledger(&reviews, &stats, &holdings, &prices, Some(equity.as_slice()));
         snapshot_portfolio_value();
 
         // 持仓代码集合：止损/轮动只对真实持仓有意义
@@ -1639,7 +1639,7 @@ async fn monitor_loop() {
         })
         .await
         .unwrap_or_default();
-        let review_report = stock_analysis::review::report::generate_daily_report(&reviews, &stats, &holdings, &prices);
+        let review_report = stock_analysis::review::report::generate_daily_report_with_ledger(&reviews, &stats, &holdings, &prices, Some(equity.as_slice()));
         push_wechat(&review_report).await;
 
         // 盘后独立维度：优选次日候选（最多 5 只，达不到阈值可少推/不推），强调可解释性，不复用盘中量能信号口径。

@@ -11,6 +11,17 @@ pub fn generate_daily_report(
     holdings: &[Position],
     prices: &std::collections::HashMap<String, f64>,
 ) -> String {
+    generate_daily_report_with_ledger(reviews, stats, holdings, prices, None)
+}
+
+/// 修复 B-005: 可选传 ledger 数据计算 rolling Sharpe
+pub fn generate_daily_report_with_ledger(
+    reviews: &[TradeReview],
+    stats: &EquityStats,
+    holdings: &[Position],
+    prices: &std::collections::HashMap<String, f64>,
+    ledger: Option<&[crate::portfolio::LedgerEntry]>,
+) -> String {
     let today = chrono::Local::now().format("%Y-%m-%d");
     let mut lines: Vec<String> = Vec::new();
 
@@ -96,6 +107,24 @@ pub fn generate_daily_report(
                 "  {} {}({}) 持{}天 {:+.1}%  ¥{:.2}→¥{:.2}  {}股",
                 emoji, p.name, p.code, holding_days, pnl_pct, p.cost_price, price, p.shares,
             ));
+        }
+    }
+
+    // 修复 B-005: 追加 live rolling Sharpe (如有 ledger 数据)
+    if let Some(ledger) = ledger {
+        if !ledger.is_empty() {
+            lines.push(String::new());
+            lines.push("📈 滚动风险指标".to_string());
+            if let Some(s30) = crate::portfolio::live_rolling_sharpe(ledger, 30) {
+                lines.push(format!("  - 30 日滚动 Sharpe: {:+.2}", s30));
+            } else {
+                lines.push("  - 30 日滚动 Sharpe: 样本不足 (需 ≥ 30 日)".to_string());
+            }
+            if let Some(s60) = crate::portfolio::live_rolling_sharpe(ledger, 60) {
+                lines.push(format!("  - 60 日滚动 Sharpe: {:+.2}", s60));
+            } else {
+                lines.push("  - 60 日滚动 Sharpe: 样本不足 (需 ≥ 30 日)".to_string());
+            }
         }
     }
 

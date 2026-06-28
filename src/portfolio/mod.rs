@@ -4,6 +4,7 @@
 //! API 是纯函数，不定义 trait（单用户，单实现）。
 
 mod store;
+pub use store::live_rolling_sharpe;
 
 use chrono::{NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
