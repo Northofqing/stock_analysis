@@ -63,3 +63,48 @@ fn test_adapter_source_priority_mapping() {
     assert_eq!(raw.source_priority, 4);
     assert_eq!(raw.source_type, SourceType::Announcement);
 }
+
+use stock_analysis::opportunity::event_extractor::rule_filter::*;
+use stock_analysis::signal::market_event::EventType;
+
+fn raw_item(title: &str) -> RawNewsItem {
+    RawNewsItem {
+        title: title.into(), body: "".into(), source: "test".into(),
+        source_priority: 1, source_type: SourceType::Search,
+        published_at: chrono::Local::now(), url: None,
+    }
+}
+
+#[test]
+fn test_rule_filter_discards_noise() {
+    let rm = RuleFilter::filter(&raw_item("A股收评：三大指数低开高走"));
+    assert!(!rm.matched);
+    assert!(rm.discard_reason.is_some());
+}
+
+#[test]
+fn test_rule_filter_keeps_tech_break() {
+    let rm = RuleFilter::filter(&raw_item("CO2 激光在半导体晶圆制造中取得重大突破"));
+    assert!(rm.matched);
+    assert_eq!(rm.event_type, Some(EventType::TechBreak));
+}
+
+#[test]
+fn test_rule_filter_keeps_policy() {
+    let rm = RuleFilter::filter(&raw_item("工信部：5G-A 商用部署进入新阶段"));
+    assert!(rm.matched);
+    assert_eq!(rm.event_type, Some(EventType::Policy));
+}
+
+#[test]
+fn test_rule_filter_discards_fund() {
+    let rm = RuleFilter::filter(&raw_item("XX 基金净值突破 2 元"));
+    assert!(!rm.matched);
+}
+
+#[test]
+fn test_rule_filter_unknown_keyword_passes() {
+    let rm = RuleFilter::filter(&raw_item("某公司召开年度股东大会"));
+    assert!(rm.matched, "关键词未知必保留 (AI fallback)");
+    assert_eq!(rm.event_type, Some(EventType::Other));
+}
