@@ -802,22 +802,6 @@ pub async fn run_opportunity_scan() -> OpportunityScan {
         return OpportunityScan { chain_text: lines.join("\n"), impact_text: String::new() };
     }
 
-    // 2a. 事件抽取 (修复 v9.1 集成: 真接 AI 替代占位规则)
-    //   之前: 规则层映射出来 score=39, 全部被 gate 过滤
-    //   现在: event_extractor 用 Quick AI 判事件+定 type, strength/certainty 真实化
-    let gemini = crate::analyzer::GeminiAnalyzer::from_env();
-    if gemini.is_available() {
-        let (events, _stale) = crate::opportunity::event_extractor::extract_batch(
-            &gemini, &web_results, crate::opportunity::event_extractor::BATCH_DEFAULT_MAX_AGE,
-        ).await;
-        for ev in &events {
-            if !ev.ai_degraded {
-                titles.push(format!("{} 重大突破", ev.subject));
-            }
-        }
-        log::info!("[Opportunity] event_extractor 抽出 {} 个真实事件 (AI 路径)", events.len());
-    }
-
     // 2. 产业链映射（规则优先，未命中则 AI 兜底）
     let mut hits = chain_mapper::map_news_to_chains_ai(&titles).await;
     if hits.is_empty() {
