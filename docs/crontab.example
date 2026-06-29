@@ -1,0 +1,62 @@
+# BR-007 季度 winrate review — crontab 配置示例
+
+## 推荐配置（季度首日 09:00 跑）
+
+```bash
+# 编辑 crontab
+crontab -e
+
+# 添加 (替换 /path/to/stock_analysis 为实际路径):
+0 9 1 */3 * cd /Users/zhangzhen/Desktop/Quant/stock_analysis && STOCK_DB=/Users/zhangzhen/Desktop/Quant/stock_analysis/data/stock_analysis.db bash tools/one_shot/winrate_review.sh 14 >> /tmp/winrate_review.log 2>&1
+```
+
+> 注: `*/3` 表示每 3 个月跑一次（1月/4月/7月/10月 1号 09:00）。
+> 如果想月度跑, 改为 `0 9 1 * *`。
+> 季度间隔更适合稳定市场（避免月度噪声触发误判）。
+
+## 报告路径
+
+- 输出: `reports/winrate_review_YYYY-MM-DD.md`
+- 日志: `/tmp/winrate_review.log` (推荐)
+- 邮件通知: 在 winrate_review.sh 末尾追加 `mail -s "Winrate Review" you@example.com < $REPORT`
+
+## 紧急跑（手动触发）
+
+```bash
+# 14 天回测 (推荐)
+bash tools/one_shot/winrate_review.sh 14
+
+# 30 天回测 (数据更多, 但慢)
+bash tools/one_shot/winrate_review.sh 30
+```
+
+## 验证 cron 设置成功
+
+```bash
+# 查看 cron 任务
+crontab -l
+
+# 测试 cron 环境 (不实际跑, 只检查)
+crontab -l | grep winrate_review
+```
+
+## 配套工具
+
+- `tools/compliance/check.sh` — 每次 commit 前必跑
+- `tools/one_shot/winrate_review.sh` — 季度跑
+- `src/bin/winrate_simulator.rs` — 手动决策时跑 (不写文件)
+
+## 触发后续动作
+
+每次 review 报告含:
+- 全局胜率 (vs 历史趋势)
+- ≥30% 主题清单 (建议加权)
+- <5% 主题清单 (建议关停)
+- 历史对比表
+
+如果新发现需要关停/加权的主题, 手动修改 `config/chain_rules.toml`:
+1. 关停: 加 `enabled = false` + AGENTS §2.9 边界证明注释
+2. 加权: 改 `priority` (≥80 = 加权) + 边界证明注释
+3. 跑 `bash tools/compliance/check.sh` 验证
+4. 跑 `cargo test --lib` 验证 (BR-006 测试覆盖)
+5. commit 写清楚决策依据 (引用 simulator 输出)

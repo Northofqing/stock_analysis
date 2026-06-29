@@ -21,14 +21,17 @@ use diesel::sql_types::{Text, Integer};
 use diesel::{QueryableByName, RunQueryDsl};
 use stock_analysis::database::DatabaseManager;
 
-/// BR-006 默认黑名单: 从 config/chain_rules.toml 动态读取 enabled=false 的 entry.
-fn load_br006_default_blacklist() -> Vec<String> {
+/// BR-006 默认黑名单 + 主题 priority + generic 标记: 从 config/chain_rules.toml 动态读取.
+fn load_br006_default_blacklist() -> (Vec<String>, std::collections::HashMap<String, u32>, std::collections::HashSet<String>) {
     let toml_text = include_str!("../../config/chain_rules.toml");
     #[derive(serde::Deserialize)]
     struct Rule {
         chain: String,
+        priority: u32,
         #[serde(default = "default_true")]
         enabled: bool,
+        #[serde(default)]
+        generic: bool,
     }
     #[derive(serde::Deserialize)]
     struct RulesFile {
@@ -36,10 +39,18 @@ fn load_br006_default_blacklist() -> Vec<String> {
     }
     fn default_true() -> bool { true }
     match toml::from_str::<RulesFile>(toml_text) {
-        Ok(file) => file.rules.into_iter().filter(|r| !r.enabled).map(|r| r.chain).collect(),
+        Ok(file) => {
+            let blacklist: Vec<String> = file.rules.iter()
+                .filter(|r| !r.enabled).map(|r| r.chain.clone()).collect();
+            let priorities: std::collections::HashMap<String, u32> = file.rules.iter()
+                .map(|r| (r.chain.clone(), r.priority)).collect();
+            let generics: std::collections::HashSet<String> = file.rules.iter()
+                .filter(|r| r.generic).map(|r| r.chain.clone()).collect();
+            (blacklist, priorities, generics)
+        }
         Err(e) => {
             eprintln!("[winrate_simulator] 解析 chain_rules.toml 失败: {}, 使用空 fallback", e);
-            Vec::new()
+            (Vec::new(), std::collections::HashMap::new(), std::collections::HashSet::new())
         }
     }
 }
@@ -65,7 +76,8 @@ struct GlobalRow {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. 解析参数
     let args: Vec<String> = env::args().collect();
-    let mut blacklist: Vec<String> = load_br006_default_blacklist();
+    let (default_blacklist, theme_priorities, theme_generics) = load_br006_default_blacklist();
+    let mut blacklist: Vec<String> = default_blacklist;
     let mut days: Option<i64> = None;
     let mut explicit_min_samples: usize = 5; // 主题级最小样本, <此值不展示
 
@@ -217,10 +229,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let high_perf: Vec<&(String, i32, i32, f64)> = theme_summaries.iter()
         .filter(|(name, total, _, rate)| !blacklist_set.contains(name) && *total >= explicit_min_samples as i32 && *rate >= 30.0)
         .collect();
-    if !high_perf.is_empty() {
-        println!("  以下未加权主题胜率 ≥ 30%, 建议下次评估提权:");
-        for (name, total, _, rate) in &high_perf {
-            println!("    - {} ({} 推送, {:.1}%)", name, total, rate);
+    // 修复 simulator false positive: 区分"已加权" (priority >= 80) vs "真正未加权"
+    const WEIGHTED_PRIORITY_THRESHOLD: u32 = 80;
+    let weighted: Vec<&&(String, i32, i32, f64)> = high_perf.iter()
+        .filter(|(name, _, _, _)| theme_priorities.get(name.as_str()).copied().unwrap_or(0) >= WEIGHTED_PRIORITY_THRESHOLD)
+        .collect();
+    let unweighted: Vec<&&(String, i32, i32, f64)> = high_perf.iter()
+        .filter(|(name, _, _, _)| theme_priorities.get(name.as_str()).copied().unwrap_or(0) < WEIGHTED_PRIORITY_THRESHOLD
+            && !theme_generics.contains(name.as_str()))
+        .collect();
+    if !weighted.is_empty() {
+        println!("  以下 ≥ 30% 主题已加权 (priority ≥ {}), 无需再调:", WEIGHTED_PRIORITY_THRESHOLD);
+        for &&(name, total, _, rate) in &weighted {
+            let p = theme_priorities.get(name.as_str()).copied().unwrap_or(0);
+            println!("    - {} [priority {}] ({} 推送, {:.1}%)", name, p, total, rate);
+        }
+    }
+    if !unweighted.is_empty() {
+        println!("  以下 ≥ 30% 主题未充分加权 (priority < {}), 建议下次评估提权:", WEIGHTED_PRIORITY_THRESHOLD);
+        for &&(name, total, _, rate) in &unweighted {
+            let p = theme_priorities.get(name.as_str()).copied().unwrap_or(0);
+            println!("    - {} [priority {}] ({} 推送, {:.1}%)", name, p, total, rate);
         }
     }
     println!();
