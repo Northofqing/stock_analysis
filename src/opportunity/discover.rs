@@ -2,6 +2,29 @@
 
 use super::chain_mapper::{ChainHit, ChainSource};
 
+/// 修复 F19 (2026-06-29 codex review): push_time 单调递增生成器.
+///
+/// 之前用 `chrono::Local::now().timestamp()` (秒级), 单次 `discover()` 调用所有
+/// candidate 共享同一时间, BR-004 "同分按 push_time 升序" 次级排序是死代码 (production
+/// 几乎不会触发).
+///
+/// 修法: 静态 AtomicI64 计数器, 每次 discover() 调用 +1, 给每个 candidate 分配单调递增
+/// 时间戳 (单位 ms). 起始值用 `Local::now().timestamp_millis()` 让早期数字仍然有意义.
+use std::sync::atomic::{AtomicI64, Ordering};
+static PUSH_TIME_COUNTER: AtomicI64 = AtomicI64::new(0);
+
+fn next_push_time() -> i64 {
+    // 首次调用初始化为当前时间 (ms), 之后每次 +1 保证单调
+    let prev = PUSH_TIME_COUNTER.load(Ordering::Relaxed);
+    let next = if prev == 0 {
+        chrono::Local::now().timestamp_millis()
+    } else {
+        prev + 1
+    };
+    PUSH_TIME_COUNTER.store(next, Ordering::Relaxed);
+    next
+}
+
 #[derive(Debug, Clone)]
 pub struct Candidate {
     pub code: String,
@@ -197,7 +220,7 @@ pub fn discover(
                 score,
                 price_note: price_note(s),
                 reason_summary: reason_summary(hit, s, score_breakdown),
-                push_time: chrono::Local::now().timestamp(),
+                push_time: next_push_time(),
             }));
         }
     }
@@ -233,6 +256,49 @@ mod tests {
         let candidates = discover(&hits, &["002579".to_string()], 3);
         assert_eq!(candidates.len(), 2);
         assert!(!candidates.iter().any(|c| c.code == "002579"));
+    }
+
+    // 修复 F19 (2026-06-29 codex review): 验证 next_push_time 单调递增,
+    // 让 BR-004 "同分按 push_time 升序" 次级排序在生产路径真生效.
+    #[test]
+    fn test_push_time_monotonic_incrementing() {
+        let t1 = super::next_push_time();
+        let t2 = super::next_push_time();
+        let t3 = super::next_push_time();
+        assert!(t2 > t1, "push_time 应单调递增: t1={t1} t2={t2}");
+        assert!(t3 > t2, "push_time 应单调递增: t2={t2} t3={t3}");
+        // 同一秒内调用也应 +1 (不会卡在同一时间戳)
+        assert_eq!(t3 - t1, 2, "三次连续调用应差 2 ms (atomic counter 递增)");
+    }
+
+    // 修复 F19 (2026-06-29 codex review): discover() 多次调用 next_push_time() 严格递增.
+    // 注: discover() 内部 sort_by 只按 score (不放 push_time), 实际 BR-004 同分排序
+    // 在 run_post_close_candidates 的 PostCloseCandidate sort_by (tests/ranking.rs 已覆盖).
+    // 这里只验证 next_push_time 单调 (counter atomic +1).
+    #[test]
+    fn test_discover_push_time_distinct_per_candidate() {
+        let hits = vec![ChainHit {
+            chain: "AI硬件-PCB".into(),
+            keywords: vec!["PCB".into()],
+            logic: "PCB涨价".into(),
+            stocks: (0..10).map(|i| si(&format!("PCB{:06}", i))).collect(),
+            source: crate::opportunity::chain_mapper::ChainSource::Rule,
+            board_keyword: String::new(),
+            fund_flow_pct: None,
+        }];
+        let candidates = discover(&hits, &[], 10);
+        assert_eq!(candidates.len(), 10);
+        // 用 HashSet 验证 push_time 都不同 (排除 stable sort 重排影响)
+        let unique_count = candidates
+            .iter()
+            .map(|c| c.push_time)
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        assert_eq!(
+            unique_count, 10,
+            "10 个 candidate push_time 应全部唯一 (atomic counter +1), 实际 {} 个",
+            unique_count
+        );
     }
 
     #[test]
