@@ -170,7 +170,7 @@ impl HttpProvider {
                     "[HTTP] 响应为空 (attempt {}/{} host={} code={})",
                     attempt, max_attempts, host, code
                 );
-                last_err = Some(ProviderError::NotFound { code: code.to_string() });
+                last_err = Some(ProviderError::ParseError { detail: format!("所有 host 返回空响应, code={}", code) });
                 if attempt < max_attempts {
                     tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
                 }
