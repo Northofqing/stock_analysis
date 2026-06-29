@@ -287,6 +287,26 @@ async fn main() {
         .format(|buf, record| writeln!(buf, "[{} {}] {}", chrono::Local::now().format("%H:%M:%S"), record.level(), record.args()))
         .init();
 
+    // 修复 F20 (2026-06-29 codex review): 启动 banner 显示当前 LaunchStage
+    // (从 env STAGE 读, 默认 Shadow). operator 一眼看清推送策略.
+    use stock_analysis::opportunity::launch_gate;
+    let stage = launch_gate::current_stage();
+    log::info!(
+        "═══════════════════════════════════════════════════════════════"
+    );
+    log::info!(
+        "🚀 Stock Monitor 启动 | LaunchStage = {} | 推送策略 = {}",
+        stage.name(),
+        match stage {
+            launch_gate::LaunchStage::Shadow => "不打用户, 仅日志",
+            launch_gate::LaunchStage::Gray => "仅 critical alert (止损/风控)",
+            launch_gate::LaunchStage::Live => "全量推送",
+        }
+    );
+    log::info!(
+        "═══════════════════════════════════════════════════════════════"
+    );
+
     if !check_enabled() { return; }
     // 初始化数据库
     let db_path = std::env::var("DATABASE_PATH").unwrap_or_else(|_| "./data/stock_analysis.db".into());
@@ -403,9 +423,31 @@ fn check_enabled() -> bool {
 }
 
 // 通知层已提取到 notify.rs。push_wechat 同时作为告警生产者向事件总线发布事件。
+//
+// 修复 F20 (2026-06-29 codex review): launch_gate 真接 push gate.
+// 当前 stage 决定是否推送:
+//   Shadow: 不打用户, 仅记日志
+//   Gray: 仅 critical alert (止损/风控/超阈值) → 其他普通扫描不推
+//   Live: 全量推送
+// 调用方传 is_critical_alert = true (风控/止损) 或 false (普通扫描).
 async fn push_wechat(text: &str) -> bool {
+    push_wechat_with_kind(text, false).await
+}
+
+async fn push_wechat_with_kind(text: &str, is_critical_alert: bool) -> bool {
+    use stock_analysis::opportunity::launch_gate;
+    let stage = launch_gate::current_stage();
+    if !launch_gate::should_push_user(stage, is_critical_alert) {
+        let label = if is_critical_alert { "critical" } else { "normal" };
+        log::info!(
+            "[LaunchGate] stage={} 跳过推送 ({}): {}",
+            stage.name(),
+            label,
+            text.lines().next().unwrap_or("").chars().take(60).collect::<String>()
+        );
+        return false;
+    }
     let success = notify::push_wechat(text).await;
-    // 取首行作为标题，避免事件体过大
     let title = text.lines().next().unwrap_or("").chars().take(60).collect::<String>();
     stock_analysis::monitor::event_bus::publish(
         stock_analysis::monitor::event_bus::MonitorEvent::Alert { title, success },
