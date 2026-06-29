@@ -4,7 +4,10 @@
 //! 职责：
 //! 1. 汇总分析结果生成日报
 //! 2. 支持 Markdown 格式输出
-//! 3. 多渠道推送：企业微信、飞书、Telegram、邮件、Pushover
+//! 3. 多渠道推送（10 个, P0-0 扩展: DingTalk/Slack/Discord 海外 + Custom/ServerChan 自定义）:
+//!    企业微信、飞书、Telegram、邮件、Pushover、Custom Webhook、Server酱、
+//!    钉钉 (P0-0, 政企客户首选)、Slack (P0-0, 海外 dev)、Discord (P0-0, 海外 quant 社区)
+//!    完整 enum 见 `src/notification/config.rs::NotificationChannel`
 //!
 //! 子模块：
 //! - `config`  — 渠道枚举与 `NotificationConfig`

@@ -256,6 +256,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("    - {} [priority {}] ({} 推送, {:.1}%)", name, p, total, rate);
         }
     }
+
+    // 修复 F17 (2026-06-29 codex review): dynamic priority 公式化建议.
+    // 解决 v9.3 commit 480b74f 批量 priority=100 注入破坏 simulator "已加权/未加权" 提示能力问题.
+    // 公式: dynamic_priority = winrate × log(samples + 1) × scale
+    //   - winrate ∈ [0, 100] 真实胜率
+    //   - log(samples + 1) ∈ [0.7, ~3.7] 样本量加权 (1 推送 → 0.7, 100 推送 → 2.3, 1000 → 3.0)
+    //   - scale = 25 让 winrate=30% samples=20 → 75, winrate=50% samples=100 → 115 (clamp 100)
+    // 输出推荐 priority, operator 手动复制到 chain_rules.toml.
+    const PRIORITY_SCALE: f64 = 25.0;
+    println!("【F17 dynamic_priority 推荐】 (修复 v9.3 批量 priority=100 注入破坏提示)");
+    println!("  公式: dynamic_priority = winrate × log(samples + 1) × {}, clamp [0, 100]", PRIORITY_SCALE);
+    println!("  {:<24} {:>8} {:>8} {:>10} {:>10} {:>10}", "主题", "胜率", "样本", "log加权", "dyn_prior", "static");
+    println!("  {}", "─".repeat(80));
+    let mut dyn_recommendations: Vec<(String, f64, f64, u32)> = Vec::new();
+    for (name, total, _, rate) in &theme_summaries {
+        if *total < explicit_min_samples as i32 { continue; }
+        let log_weight = ((*total as f64) + 1.0).ln();
+        let dyn_p = ((*rate / 100.0) * log_weight * PRIORITY_SCALE).clamp(0.0, 100.0);
+        let static_p = theme_priorities.get(name.as_str()).copied().unwrap_or(0);
+        // 只输出有意义的: dyn vs static 差 > 15 或 dyn > 50 但 static < 80
+        if (dyn_p - static_p as f64).abs() > 15.0 || (dyn_p > 50.0 && static_p < 80) {
+            println!("  {:<24} {:>7.1}% {:>8} {:>9.2} {:>9.1} {:>10}",
+                name, rate, total, log_weight, dyn_p, static_p);
+            dyn_recommendations.push((name.clone(), dyn_p, *rate, static_p));
+        }
+    }
+    if !dyn_recommendations.is_empty() {
+        println!("\n  建议: 把上述 dyn_prior 复制到 config/chain_rules.toml 的 priority 字段.");
+        println!("  注意: dyn_prior 只反映历史胜率, 不包含 forward-looking 因子 (市场风格切换 / 政策催化).");
+        println!("  使用 AGENTS §2.9 边界证明模板: dyn_prior={} ± {} (95% CI), 与样本量={}",
+            "?", "?", "?");
+    }
     println!();
     println!("═══════════════════════════════════════════════════════════════");
     Ok(())

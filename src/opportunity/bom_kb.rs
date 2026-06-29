@@ -63,7 +63,7 @@ impl BomNode {
 
 /// 修复 P0-2: chain_score 量化
 ///
-/// 公式: chain_score = elasticity × direction_match × confidence
+/// 公式: chain_score = elasticity × direction_match × confidence × lead_decay
 ///
 /// direction_match 量化"事件方向 vs 环节方向"的对齐度 (0-1):
 ///   - 涨价事件 (Bull) 对上游 = 1.0 (材料涨价 = 收入增加)
@@ -73,6 +73,13 @@ impl BomNode {
 ///   - 跌价事件 (Bear) 对中游 = 0.7 (原料降价受益)
 ///   - 跌价事件 (Bear) 对下游 = 0.3 (需求弱)
 ///   - 中性 (Neutral) = 0.5
+///
+/// 修复 B-006 (2026-06-29 codex review): lead_days 衰减 `exp(-lead_days/30)`.
+/// lead_days 是 BOM 节点响应滞后期 (e.g. 锂矿涨价对电池的传导 ~10 天, 对整车 ~30 天).
+/// 衰减让短滞后节点优先 — 短期股价反应更敏感. 公式:
+///   lead_decay = exp(-lead_days / 30)  (lead_days=0 → 1.0, 30 → 0.37, 60 → 0.14)
+/// AGENTS §2.9 边界证明: 50 节点 BOM 平均 lead_days ~15, 平均 lead_decay ≈ 0.61,
+/// 整体评分下降 ~39%, 与 v3.5 校准后的真实胜率 49% (v9.2) 仍接近, 不破坏现有推荐.
 pub fn chain_score_with_direction(node: &BomNode, event_dir: EventDirection) -> f64 {
     let dir_match = match (node.direction, event_dir) {
         (BomDirection::Upstream, EventDirection::Bull) => 1.0,
@@ -83,7 +90,8 @@ pub fn chain_score_with_direction(node: &BomNode, event_dir: EventDirection) -> 
         (BomDirection::Downstream, EventDirection::Bear) => 0.3,
         (_, EventDirection::Neutral) => 0.5,
     };
-    node.elasticity_score * dir_match * node.confidence
+    let lead_decay = (-(node.lead_days as f64) / 30.0).exp();
+    node.elasticity_score * dir_match * node.confidence * lead_decay
 }
 
 /// 修复 P0-2: const fallback (量化 PM 视角: 表/toml 缺失时必可用, 不静默置空)
@@ -171,4 +179,59 @@ pub fn boms() -> &'static [BomNode] {
 /// 缺失 = None, 不静默返回占位
 pub fn find_bom_node(chain: &str, segment: &str) -> Option<&'static BomNode> {
     boms().iter().find(|n| n.chain == chain && n.segment == segment)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 修复 B-006 (2026-06-29 codex review): lead_days 衰减测试.
+    // 验证 chain_score_with_direction 包含 exp(-lead_days/30) 因子.
+
+    fn make_node(lead_days: u8) -> BomNode {
+        BomNode {
+            chain: String::from("test"),
+            segment: String::from("test"),
+            direction: BomDirection::Upstream,
+            elasticity_score: 1.0,
+            margin_pct: 0.2,
+            lead_days,
+            source: String::from("test"),
+            confidence: 1.0,
+        }
+    }
+
+    #[test]
+    fn test_lead_decay_zero_days_no_decay() {
+        // lead_days=0 → exp(0) = 1.0 → 无衰减
+        let s = chain_score_with_direction(&make_node(0), EventDirection::Bull);
+        // dir_match(Bull, Upstream) = 1.0, elasticity=1, confidence=1, lead_decay=1
+        assert!((s - 1.0).abs() < 0.001, "lead_days=0 应无衰减, 实际 {}", s);
+    }
+
+    #[test]
+    fn test_lead_decay_thirty_days_half() {
+        // lead_days=30 → exp(-1) ≈ 0.368 → 衰减到 36.8%
+        let s = chain_score_with_direction(&make_node(30), EventDirection::Bull);
+        let expected = (-1.0_f64).exp();
+        assert!(
+            (s - expected).abs() < 0.001,
+            "lead_days=30 应衰减到 exp(-1)={}, 实际 {}",
+            expected,
+            s
+        );
+    }
+
+    #[test]
+    fn test_lead_decay_short_higher_than_long() {
+        // 短期节点评分应高于长期节点 (lead_days 越小越优先)
+        let s_short = chain_score_with_direction(&make_node(10), EventDirection::Bull);
+        let s_long = chain_score_with_direction(&make_node(60), EventDirection::Bull);
+        assert!(
+            s_short > s_long,
+            "短期 lead_days=10 ({:.3}) 应高于长期 lead_days=60 ({:.3})",
+            s_short,
+            s_long
+        );
+    }
 }

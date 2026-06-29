@@ -11,6 +11,10 @@ pub struct Candidate {
     pub score: f64,
     pub price_note: String, // "已启动+5.2% 追高风险" or ""
     pub reason_summary: String,
+    /// 修复 F15 (2026-06-29 BR-004): 发布时间, 用于"同分按发布时间升序"次级排序.
+    /// discover() 内填 Local::now().timestamp(). 老调用方 (e.g. 测试) 不填时为 0,
+    /// 排序时 0 < 实际时间, 所以老测试 case 会排在新 case 前面 — 可观测的回归.
+    pub push_time: i64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -193,6 +197,7 @@ pub fn discover(
                 score,
                 price_note: price_note(s),
                 reason_summary: reason_summary(hit, s, score_breakdown),
+                push_time: chrono::Local::now().timestamp(),
             }));
         }
     }

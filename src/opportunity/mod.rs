@@ -34,6 +34,9 @@ struct PostCloseCandidate {
     breakout_confidence: u8,
     stop_line: Option<f64>,
     quality_note: String,
+    /// 修复 F15 (2026-06-29 BR-004): 透传 Candidate.push_time, 用于"同分按发布时间升序"次级排序.
+    /// 0 = 老调用方未填 (排在新 case 前面), 可观测的回归.
+    push_time: i64,
 }
 
 fn classify_flow_error(err: Option<&str>) -> &'static str {
@@ -1054,7 +1057,7 @@ pub async fn run_post_close_candidates(top_n: usize) -> String {
         let final_score = c.score + profit_score + flow_score + pattern_score;
 
         rescored.push(PostCloseCandidate {
-            base: c,
+            base: c.clone(),  // 修复 F15: 需要 push_time, 不能 move
             profit_score,
             flow_score,
             pattern_score,
@@ -1067,13 +1070,16 @@ pub async fn run_post_close_candidates(top_n: usize) -> String {
             breakout_confidence,
             stop_line,
             quality_note,
+            push_time: c.push_time,  // 透传 discover::Candidate.push_time (BR-004)
         });
     }
 
+    // 修复 F15 (2026-06-29 BR-004): final_score 降序, 同分按 push_time 升序 (越早越前)
     rescored.sort_by(|a, b| {
         b.final_score
             .partial_cmp(&a.final_score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.push_time.cmp(&b.push_time))
     });
 
     // 盘后更强调"优中选优"：设置最低分，分不够宁缺毋滥。
