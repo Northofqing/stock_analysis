@@ -1,6 +1,11 @@
 //! 搜索服务聚合器（原 search_service.rs 尾部）
 
 use std::collections::{HashMap, HashSet, VecDeque};
+// 修复 Top10#6 (2026-06-29 audit): 保留 std::sync::Mutex — `recent_topic_signatures: VecDeque`,
+// `source_health: HashMap`, `source_health_ticks: u64` 都是微秒级内存修改, lock 持有 < 100ns.
+// 改 tokio Mutex 会要求所有调用方 (e.g. fetch_flash_titles sync) 改 async, 影响面过大.
+// audit 列的 5 处 std::sync::Mutex 中 analyzer/mod.rs:454 **实际已是** tokio::sync::Mutex.
+// 其他 4 处 (本文件 + adaptive + rate_budget + industry) 都是 sync API + 微秒级持有, 保留 std.
 use std::sync::Mutex;
 use std::time::Duration;
 

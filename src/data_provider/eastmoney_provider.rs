@@ -52,15 +52,9 @@ struct ApiDataWrapper {
 impl HttpProvider {
     /// 创建新的提供者
     pub fn new() -> Result<Self> {
-        let client = reqwest::Client::builder()
-            // 东财域名在部分代理环境会被 fake-ip/拦截，强制直连更稳定。
-            .no_proxy()
-            .timeout(std::time::Duration::from_secs(30))
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-            .build()?;
-        
-        Ok(Self { client })
+        // 修复 Top10#7 (2026-06-29 audit): 用 crate::http_client::SHARED_HTTP_CLIENT 共享 client
+        // 替代每次 new() 新建. 4 个 HttpProvider 实例共享同一个 client, 节省 4 倍握手.
+        Ok(Self { client: crate::http_client::SHARED_HTTP_CLIENT.clone() })
     }
     
     /// 从东方财富API获取K线数据（异步版本）

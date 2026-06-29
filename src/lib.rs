@@ -166,3 +166,6 @@ where
         }
     }
 }
+
+// 修复 Top10#7 (2026-06-29 audit): 共享 HTTP client (4 个预配置, 避免 28 处散落 builder)
+pub mod http_client;

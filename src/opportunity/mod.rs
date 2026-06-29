@@ -988,32 +988,37 @@ pub async fn run_post_close_candidates(top_n: usize) -> String {
     let mut flow_fail_parse = 0usize;
     let mut flow_fail_other = 0usize;
     for c in raw {
-        let fin = fetch_financials(&client, &c.code);
-        let (flow, flow_fetch_error) =
-            match crate::data_provider::money_flow::fetch_flow_history_async(&client, &c.code, 8)
-                .await
-            {
-                Ok(s) => {
-                    flow_ok_count += 1;
-                    (s, None)
+        // 修复 Top10#7 (2026-06-29 audit): 3 路 join! 并行 (financials + money_flow + kline)
+        // 替代串行. 200 只股票 × 2 路串行延迟节省 ≈ 5-10 倍.
+        let code = c.code.clone();
+        let (fin_result, flow_result, kline_result) = tokio::join!(
+            crate::data_provider::financials::fetch_with_fallback_async(&client, &code),
+            crate::data_provider::money_flow::fetch_flow_history_async(&client, &code, 8),
+            service::service().get_kline(&code, 80),
+        );
+        let fin = fin_result;
+        let (flow, flow_fetch_error) = match flow_result {
+            Ok(s) => {
+                flow_ok_count += 1;
+                (s, None)
+            }
+            Err(e) => {
+                log::warn!("[资金流] {} 抓取失败: {}", code, e);
+                flow_fail_count += 1;
+                let msg = e.to_string();
+                if msg.contains("非JSON回包") {
+                    flow_fail_non_json += 1;
+                } else if msg.contains("状态码") {
+                    flow_fail_http += 1;
+                } else if msg.contains("JSON解析失败") || msg.contains("无 klines") {
+                    flow_fail_parse += 1;
+                } else {
+                    flow_fail_other += 1;
                 }
-                Err(e) => {
-                    log::warn!("[资金流] {} 抓取失败: {}", c.code, e);
-                    flow_fail_count += 1;
-                    let msg = e.to_string();
-                    if msg.contains("非JSON回包") {
-                        flow_fail_non_json += 1;
-                    } else if msg.contains("状态码") {
-                        flow_fail_http += 1;
-                    } else if msg.contains("JSON解析失败") || msg.contains("无 klines") {
-                        flow_fail_parse += 1;
-                    } else {
-                        flow_fail_other += 1;
-                    }
-                    (crate::data_provider::MoneyFlowSummary::default(), Some(e.to_string()))
-                }
-            };
-        let kline = service::service().get_kline(&c.code, 80).await.ok();
+                (crate::data_provider::MoneyFlowSummary::default(), Some(e.to_string()))
+            }
+        };
+        let kline = kline_result.ok();
 
         let (profit_score, profit_reason, quality_note) = score_profit_elasticity(&fin);
         let (flow_score, flow_reason) =

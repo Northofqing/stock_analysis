@@ -9,6 +9,8 @@
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use std::collections::HashMap;
+// 修复 Top10#6 (2026-06-29 audit): 保留 std::sync::Mutex — `INDUSTRY_MAP: Mutex<Option<HashMap>>`
+// 是 cache 读, lock 持有微秒级. 改 tokio Mutex 需重写所有 industry 调用方 (sync) → async.
 use std::sync::Mutex;
 use std::sync::OnceLock;
 

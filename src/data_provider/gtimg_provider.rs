@@ -73,15 +73,8 @@ impl GtimgProvider {
 
     /// 创建新的提供者
     pub fn new() -> Result<Self> {
-        let client = reqwest::Client::builder()
-            // 与东财一致：绕过系统代理，避免 fake-ip/代理回包导致解析失败。
-            .no_proxy()
-            .timeout(std::time::Duration::from_secs(10))
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-            .build()?;
-        
-        Ok(Self { client })
+        // 修复 Top10#7 (2026-06-29 audit): 用 SHARED_TENCENT_HTTP_CLIENT 共享 client
+        Ok(Self { client: crate::http_client::SHARED_TENCENT_HTTP_CLIENT.clone() })
     }
     
     /// 公开方法：获取实时行情（用于其他数据提供者调用）

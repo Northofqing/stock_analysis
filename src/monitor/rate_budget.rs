@@ -12,6 +12,8 @@
 
 use log::{info, warn};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+// 修复 Top10#6 (2026-06-29 audit): 保留 std::sync::Mutex — `window_start: Instant`
+// 是纳秒级时间戳读取, lock 持有 < 50ns. 改 tokio Mutex 得不偿失.
 use std::sync::Mutex;
 use std::time::Instant;
 

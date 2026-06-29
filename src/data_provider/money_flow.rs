@@ -301,12 +301,8 @@ pub async fn fetch_flow_history_async(
     }
 
     let east_err = last_err.clone();
-    let sina_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)")
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+    // 修复 Top10#7 (2026-06-29 audit): 用 SHARED_HTTP_CLIENT 替代每次新建 sina client
+    let sina_client = crate::http_client::SHARED_HTTP_CLIENT.clone();
     match fetch_flow_history_sina_async(&sina_client, code, lmt).await {
         Ok(summary) if !summary.is_empty() => {
             log::info!("[资金流][Sina] {} 取得 {} 天数据", code, summary.days.len());

@@ -6,6 +6,12 @@
 use crate::monitor::signal_fusion::SignalSource;
 use log::info;
 use std::collections::HashMap;
+// 修复 Top10#6 (2026-06-29 audit): std::sync::Mutex → tokio::sync::Mutex
+// 此处保留 std::sync::Mutex 因为 `locked: Mutex<()>` 是 dummy lock guard,
+// 只保护 signal_weights HashMap 微秒级内存修改, 不横跨 await. 改 tokio Mutex 会
+// 要求 adjust_weights() 改 async, 影响面过大. audit 列的 5 处中 analyzer/mod.rs:454
+// 实际**已经**是 tokio::sync::Mutex (audit 描述错), 其他 3 处 (search_service/adaptive/rate_budget/industry)
+// 也是 sync API + 微秒级持有, 不阻塞 worker. 详见 v9.4.6 CHANGELOG 注释.
 use std::sync::Mutex;
 
 /// 信号规则的运行模式
