@@ -20,6 +20,16 @@ use std::sync::Mutex;
 
 static CONFIG_LOCK: Mutex<()> = Mutex::new(());
 
+/// 修复 (2026-06-29 v9.4.3): --test-threads=2 并行跑时, 第一个 test panic 后
+/// CONFIG_LOCK 会 poison, 第二个 test .lock().unwrap() 触发 PoisonError.
+/// 容忍 poison (e.into_inner()) 让后续 test 仍能拿锁串行, 不让测试间级联失败.
+fn acquire_config_lock() -> std::sync::MutexGuard<'static, ()> {
+    CONFIG_LOCK.lock().unwrap_or_else(|e| {
+        log::warn!("[test_design_contradiction] CONFIG_LOCK poisoned, recovering: {}", e);
+        e.into_inner()
+    })
+}
+
 fn script_path() -> PathBuf {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.push("tools/compliance/lib/check_design_contradiction.sh");
@@ -77,7 +87,7 @@ impl Drop for ConfigBackup {
 #[test]
 fn test_design_contradiction_passes_current_config() {
     // 取锁确保不与 fail-mode 测试并行 (后者会改写 config)
-    let _guard = CONFIG_LOCK.lock().unwrap();
+    let _guard = acquire_config_lock();
     // 当前 config 已对齐 (threshold 60, clamp 70), 应 pass
     let output = run_check();
     assert!(
@@ -91,7 +101,7 @@ fn test_design_contradiction_passes_current_config() {
 fn test_design_contradiction_fails_on_threshold_exceeding_clamp() {
     // 故意制造矛盾: 临时把 threshold 改到 80 (> clamp 70)
     // 用 RAII guard 保证 panic / 早返回时**自动恢复** config.
-    let _guard = CONFIG_LOCK.lock().unwrap();
+    let _guard = acquire_config_lock();
     let backup = ConfigBackup::new();
 
     let cfg = config_path();
@@ -108,9 +118,22 @@ fn test_design_contradiction_fails_on_threshold_exceeding_clamp() {
     );
     std::fs::write(&cfg, &mutated).expect("应能写 opportunity.toml");
 
+    // 修复 v9.4.3: 在 run_check 之前打印 cfg 状态, 排查 --test-threads=2 并行跑时偶发 "stderr 空"
+    if std::env::var("TEST_VERBOSE").is_ok() {
+        eprintln!("TEST (before run_check): cfg threshold line = {}",
+            std::fs::read_to_string(&cfg).ok()
+                .and_then(|s| s.lines().find(|l| l.contains("event_risk_score_threshold")).map(String::from))
+                .unwrap_or_else(|| "NOT FOUND".to_string()));
+    }
     let output = run_check();
     // 显式 restore (Drop 也会跑, 这里提前清理让 backup 早释放)
     backup.restore();
+
+    if std::env::var("TEST_VERBOSE").is_ok() {
+        eprintln!("TEST: script exit status = {:?}", output.status);
+        eprintln!("TEST: stderr = {}", String::from_utf8_lossy(&output.stderr));
+        eprintln!("TEST: stdout = {}", String::from_utf8_lossy(&output.stdout));
+    }
 
     assert!(
         !output.status.success(),

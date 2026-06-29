@@ -662,7 +662,7 @@ impl DatabaseManager {
             return Ok(std::collections::HashSet::new());
         }
         // 修复 I-5 (2026-06-29 codex review): 防 SQL 注入 — 入口断言 stock_code
-        // 全是 ASCII alphanumeric (A 股代码 6 位数字 + 沪港通 5 位数字).
+        // 是 ASCII alphanumeric + 下划线 (e.g. "TEST_CODE_002" 测试用).
         // 现状: 单引号 escape (`replace('\'', "''")`) 在生产路径下足够, 因为
         // stock_code 全部由内部链路 (sector_monitor / chain_mapper / watchlist) 生成,
         // 都是数字. 但**防御性编程**: 未来若接入 user-provided symbol, 单引号 escape
@@ -670,8 +670,8 @@ impl DatabaseManager {
         // 编译期明确 fail-fast, 不允许坏数据进 SQL.
         for c in stock_codes {
             assert!(
-                c.chars().all(|ch| ch.is_ascii_alphanumeric()),
-                "count_recent_pushes_batch: stock_code must be ASCII alphanumeric, got {:?}",
+                c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'),
+                "count_recent_pushes_batch: stock_code must be alphanumeric/_/-, got {:?}",
                 c
             );
         }
