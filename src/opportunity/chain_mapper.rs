@@ -60,8 +60,11 @@ fn normalize_chain_rules(mut rules: Vec<(Vec<String>, String, String, String, u3
 }
 
 fn map_chain_rules(config_rules: Vec<crate::config::ChainRuleConfig>) -> Vec<(Vec<String>, String, String, String, u32, bool)> {
+    // BR-006: 过滤 enabled=false 的规则. 关停的产业链不再参与关键词匹配,
+    // 防止低胜率主题持续产生推送.
     config_rules
         .into_iter()
+        .filter(|r| r.enabled)
         .map(|r| (r.keywords, r.chain, r.logic, r.board_keyword, r.priority, r.generic))
         .collect()
 }
@@ -75,6 +78,7 @@ fn parse_chain_rules_toml(toml_text: &str) -> Option<Vec<(Vec<String>, String, S
 fn chain_rules() -> Vec<(Vec<String>, String, String, String, u32, bool)> {
     // 1) 优先使用已热加载进内存的配置（通常由 config::load_all 填充）
     if let Some(config_rules) = crate::config::get_chain_rules() {
+        log_disabled_themes(&config_rules);
         return normalize_chain_rules(map_chain_rules(config_rules));
     }
 
@@ -93,6 +97,19 @@ fn chain_rules() -> Vec<(Vec<String>, String, String, String, u32, bool)> {
 
     log::error!("[ChainMapper] 编译期内嵌规则解析失败，返回空规则集");
     Vec::new()
+}
+
+/// BR-006: 启动时单次打印被关停的主题, 便于 audit.
+/// 只在 chain_rules() 首次加载内存配置时打印一次 (热更新时 SIGHUP 触发 reload, 也走这里).
+fn log_disabled_themes(rules: &[crate::config::ChainRuleConfig]) {
+    let disabled: Vec<&str> = rules.iter().filter(|r| !r.enabled).map(|r| r.chain.as_str()).collect();
+    if !disabled.is_empty() {
+        log::info!(
+            "[ChainMapper] BR-006 关停 {} 个 0% 主题: [{}]",
+            disabled.len(),
+            disabled.join(", ")
+        );
+    }
 }
 
 /// 从新闻标题中匹配产业链（按 priority 降序遍历，高优先级规则先匹配）
@@ -531,10 +548,11 @@ mod tests {
     #[test]
     fn test_board_keyword_stored_for_rule_hits() {
         // v2: rule 来源的 hit 应直接携带 board_keyword，不再依赖 resolve 阶段二次查表
-        let hits = map_news_to_chains("CPO光模块出货量翻倍，1.6T产品验证通过");
-        let cpo_hit = hits.iter().find(|h| h.chain == "AI硬件-CPO").unwrap();
-        assert_eq!(cpo_hit.board_keyword, "CPO");
-        assert!(!cpo_hit.board_keyword.is_empty());
+        // BR-006 (2026-06-29): AI硬件-CPO 已关停, 改用 AI硬件-PCB (已加权到 priority 95)
+        let hits = map_news_to_chains("PCB全线涨价20%，HDI高多层板持续紧缺");
+        let pcb_hit = hits.iter().find(|h| h.chain == "AI硬件-PCB").unwrap();
+        assert_eq!(pcb_hit.board_keyword, "PCB");
+        assert!(!pcb_hit.board_keyword.is_empty());
     }
 
     #[test]
@@ -580,5 +598,45 @@ mod tests {
 
         let got2 = find_best_board_match(&m, "印制电路").unwrap();
         assert_eq!(got2.0, "BK888");
+    }
+
+    // BR-006 (2026-06-29): 0% 胜率主题关停, chain_mapper 加载规则时跳过 enabled=false.
+    // 测试通过编译期内嵌 DEFAULT_CHAIN_RULES_TOML (关停的 entry 在那里) 验证.
+    #[test]
+    fn test_br006_disabled_chains_excluded() {
+        // 0% 主题: 这些关键词在历史 prediction_tracker 里 100% 未命中, 应被关停.
+        // 验证: 对应快讯不再命中该 chain (即使关键词完全匹配).
+        let cpo_hits = map_news_to_chains("CPO光模块出货量翻倍，1.6T产品验证通过");
+        assert!(
+            !cpo_hits.iter().any(|h| h.chain == "AI硬件-CPO"),
+            "BR-006: AI硬件-CPO (0% 胜率) 应被关停, 实际命中: {:?}",
+            cpo_hits.iter().map(|h| &h.chain).collect::<Vec<_>>()
+        );
+
+        let mlcc_hits = map_news_to_chains("MLCC多层陶瓷电容涨价，AI服务器需求激增");
+        assert!(
+            !mlcc_hits.iter().any(|h| h.chain == "AI硬件-MLCC"),
+            "BR-006: AI硬件-MLCC (0% 胜率) 应被关停"
+        );
+
+        let ai_hits = map_news_to_chains("AI服务器算力租赁需求爆发，智算中心建设加速");
+        assert!(
+            !ai_hits.iter().any(|h| h.chain == "AI算力"),
+            "BR-006: AI算力 (0% 胜率) 应被关停"
+        );
+
+        let cxo_hits = map_news_to_chains("创新药出海获批，CXO订单大幅增长");
+        assert!(
+            !cxo_hits.iter().any(|h| h.chain == "创新药-CXO"),
+            "BR-006: 创新药-CXO (0% 胜率) 应被关停"
+        );
+    }
+
+    // BR-006 加权: PCB 真实胜率 44.4% (12/27), priority 90→95.
+    // 测试: PCB 新闻仍命中 (PCB 启用, 仅 priority 提高).
+    #[test]
+    fn test_br006_enabled_chains_still_match() {
+        let hits = map_news_to_chains("PCB全线涨价20%，HDI高多层板持续紧缺");
+        assert!(hits.iter().any(|h| h.chain == "AI硬件-PCB"));
     }
 }

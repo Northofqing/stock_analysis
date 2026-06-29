@@ -22,7 +22,14 @@ pub struct ChainRuleConfig {
     /// 是否为通用规则：当仅命中该类规则时，可触发 AI 二次分类验证。
     #[serde(default)]
     pub generic: bool,
+    /// 是否启用：false 时 chain_mapper 在规则加载时跳过该 entry。
+    /// BR-006: 基于真实胜率 (0%) 关停某些主题, 防止它们继续产生低质推送。
+    /// toml 缺失时默认 true (向后兼容)。
+    #[serde(default = "default_chain_rule_enabled")]
+    pub enabled: bool,
 }
+
+fn default_chain_rule_enabled() -> bool { true }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChainRulesFile {

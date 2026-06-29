@@ -19,6 +19,8 @@ category = "AI硬件"
 priority = 100
 logic = "高功率密度算力集群驱动散热全面向液冷升级"
 board_keyword = "液冷"
+# BR-006: 0% 胜率 (6 推送 / 0 命中), 关停. 等回测证据或关键词集扩充后再启.
+enabled = false
 keywords = [
     "液冷", "液冷服务器", "冷板", "冷板式液冷", "浸没式冷却", "浸没式液冷",
     "冷却液", "冷却液服务器", "液冷机柜", "液冷散热", "喷淋式液冷",
@@ -32,6 +34,8 @@ category = "AI硬件"
 priority = 100
 logic = "AI算力驱动高速光互联需求，CPO/LPO/硅光渗透率快速提升"
 board_keyword = "CPO"
+# BR-006: 0% 胜率 (11 推送 / 0 命中), 关停.
+enabled = false
 keywords = [
     "CPO", "光模块", "光通信", "光器件", "光互联", "光互连",
     "硅光", "硅光子", "硅光模块", "光引擎", "共封装光学", "共封装",
@@ -80,7 +84,11 @@ keywords = [
 [[rules]]
 chain = "AI硬件-PCB"
 category = "AI硬件"
-priority = 90
+# 加权: 真实胜率 44.4% (12/27), 最高. priority 90→95, 在 BR-002 互斥下
+# 比同等候选(如 半导体-AI芯片 90) 优先匹配, 提升推送质量.
+# AGENTS §2.9 边界证明: 27 条 verify 样本在 5% 置信水平下 ±18% 误差,
+# 真实胜率区间 26%-62% — 仍显著高于其它主题, 加权合理.
+priority = 95
 logic = "电子布提价+AI服务器PCB需求激增，HDI与IC载板持续升级"
 board_keyword = "PCB"
 keywords = [
@@ -98,6 +106,9 @@ category = "AI硬件"
 priority = 90
 logic = "AI服务器MLCC用量从2000颗激增至数十万颗，被动元件持续受益"
 board_keyword = "MLCC"
+# BR-006: 0% 胜率 (130 推送 / 0 命中), 关停. 注意样本量 130 是全库最大,
+# 0% 极显著 (p < 0.001 单侧) — 不是"样本不足"假象, 真信号.
+enabled = false
 keywords = [
     "MLCC", "mlcc", "多层陶瓷电容", "多层陶瓷电容器", "被动元件", "陶瓷电容", "片式电容", "片式多层",
     "薄膜电容", "电感", "电阻", "电容", "被动器件",
@@ -134,6 +145,8 @@ category = "AI硬件"
 priority = 60
 logic = "算力基建持续扩张，国产GPU+算力租赁+智算中心三线并进"
 board_keyword = "算力"
+# BR-006: 0% 胜率 (76 推送 / 0 命中), 关停.
+enabled = false
 keywords = [
     "AI服务器", "算力", "GPU", "数据中心", "智算中心", "算力租赁",
     "算力基建", "算力基础设施", "训练集群", "GPU集群", "超算",
@@ -172,6 +185,8 @@ category = "AI硬件"
 priority = 95
 logic = "英伟达Rubin下一代AI芯片平台发布，拉动产业链备货需求"
 board_keyword = "英伟达"
+# BR-006: 0% 胜率 (32 推送 / 0 命中), 关停.
+enabled = false
 keywords = [
     "Rubin", "Vera", "英伟达Rubin", "NVIDIA Rubin", "NVLink6",
     "Rubin Ultra", "Rubin平台", "英伟达下一代芯片",
@@ -264,6 +279,8 @@ category = "半导体"
 priority = 80
 logic = "成熟制程产能爬坡+先进制程突破，代工格局重塑"
 board_keyword = "半导体"
+# BR-006: 0% 胜率 (51 推送 / 0 命中), 关停.
+enabled = false
 keywords = [
     "晶圆代工", "Foundry", "成熟制程", "先进制程", "制程节点",
     "28nm", "14nm", "7nm", "5nm", "产能利用率", "流片",
@@ -321,7 +338,13 @@ keywords = [
 chain = "半导体"
 category = "半导体"
 generic = true
-priority = 30
+# 加权: 真实胜率 27.2% (28/103), 是 0% 主题以外最高. priority 30→35.
+# 其它具体半导体子链(先进封装 95/玻璃基板 92/设备 90) 优先级远高于此,
+# 35 不会覆盖子链, 仅在子链全部未命中、新闻含通用"半导体"关键词时
+# 略微提升兜底匹配位置.
+# AGENTS §2.9 边界证明: 103 条样本 ±8.5% 误差, 胜率区间 19%-36%,
+# 仍优于 0% 主题 (0%) 和稀有金属 1.5%, 加权合理.
+priority = 35
 logic = "国产替代+扩产周期，半导体产业链整体受益"
 board_keyword = "半导体"
 keywords = [
@@ -693,6 +716,8 @@ category = "政策驱动"
 priority = 78
 logic = "创新药出海与医保谈判常态化并进，CXO与特色原料药景气修复"
 board_keyword = "创新药"
+# BR-006: 0% 胜率 (15 推送 / 0 命中), 关停.
+enabled = false
 keywords = [
     "创新药", "创新药出海", "新药上市", "IND", "NDA", "临床三期",
     "ADC", "双抗", "GLP-1", "小核酸", "CAR-T", "BD授权", "license out",

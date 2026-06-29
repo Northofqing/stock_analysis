@@ -20,6 +20,10 @@ path = "src/bin/lhb_query.rs"
 name = "rsi_optimize"
 path = "src/bin/rsi_optimize.rs"
 
+[[bin]]
+name = "winrate_simulator"
+path = "src/bin/winrate_simulator.rs"
+
 [dependencies]
 tokio = { version = "1.49.0", features = ["full", "rt"] }
 anyhow = "1.0.100"
