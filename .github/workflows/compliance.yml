@@ -1,0 +1,33 @@
+name: compliance
+on:
+  pull_request:
+  push:
+    branches: [master, main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install sqlite3 + python3
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sqlite3 python3
+      - name: AGENTS.md 合规门禁
+        run: bash tools/compliance/check.sh
+      - name: 单元测试 + e2e
+        run: cargo test --lib --test e2e --test test_data_freshness_check --test test_design_contradiction --test e2e_dedup --test chain_exclusive --test flash_filter
+      - name: PR commits spec 引用检查 (PR 触发时)
+        if: github.event_name == 'pull_request'
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+          # 检查 PR 里的 commits 至少有一条含 Refs: 引用
+          # (allow 第一次发 PR 时历史 commit 没 Refs, 因为 AGENTS §2.9 是 PR-3 之后才生效)
+          if ! git log --format="%B" "$BASE".."$HEAD" | grep -qE "Refs: (spec|config|docs/)"; then
+            echo "✗ PR 至少一条 commit message 必须含 'Refs: spec §X.X' / 'Refs: config XXX' / 'Refs: docs/' 引用" >&2
+            echo "    这是 AGENTS §2.9 的纪律 (PR-3 起强制)" >&2
+            exit 1
+          fi

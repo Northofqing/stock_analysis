@@ -96,6 +96,8 @@ fn chain_rules() -> Vec<(Vec<String>, String, String, String, u32, bool)> {
 }
 
 /// 从新闻标题中匹配产业链（按 priority 降序遍历，高优先级规则先匹配）
+///
+/// 修复 v9.2 BR-002: 一条快讯最多 1 条产业链（例外: AI 给出 ≥2 条独立产业链）
 pub fn map_news_to_chains(title: &str) -> Vec<ChainHit> {
     let mut hits: Vec<ChainHit> = Vec::new();
     let rules = chain_rules();
@@ -107,6 +109,13 @@ pub fn map_news_to_chains(title: &str) -> Vec<ChainHit> {
             .collect();
         if matched.is_empty() { continue; }
         if hits.iter().any(|h| h.chain == *chain) { continue; }
+
+        // BR-002 互斥: 只保留第 1 条命中 (按 priority 降序遍历, 优先级最高先匹配)
+        // 注: 不再允许"一条快讯命中 N 条产业链"除非 AI 显式给出多条独立逻辑
+        if !hits.is_empty() {
+            log::debug!("[ChainMapper] 互斥: {} 已命中, 跳过 {} (BR-002)", hits[0].chain, chain);
+            continue;
+        }
 
         hits.push(ChainHit {
             chain: chain.clone(),
@@ -439,9 +448,12 @@ mod tests {
 
     #[test]
     fn test_multi_chain_news() {
+        // 修复 v9.2 BR-002: 一条快讯最多 1 条产业链, 只保留 priority 最高那条
+        // 标题同时含 MLCC + PCB, 修复后只保留优先级最高的一条
         let hits = map_news_to_chains("MLCC突破带动PCB和半导体产业链全线走强");
-        assert!(hits.iter().any(|h| h.chain == "AI硬件-MLCC"));
-        assert!(hits.iter().any(|h| h.chain == "AI硬件-PCB"));
+        assert!(hits.len() <= 1, "BR-002: 一条快讯最多 1 条产业链, 实际 {} 条", hits.len());
+        // 至少命中一条 (按 priority 排序第一条)
+        assert!(!hits.is_empty(), "应至少命中 1 条");
     }
 
     #[test]
@@ -532,8 +544,13 @@ mod tests {
 
     #[test]
     fn test_rare_earth_magnets() {
+        // 修复 v9.2 BR-002: 标题同时含 稀土/机器人 关键词, 只保留 priority 最高那条
+        // 实际规则表: 机器人(80) 与 稀土永磁(80) priority 相同, 按 toml 出现顺序排序
+        // 调整断言: 最多 1 条, 不强求具体哪个 (避免规则表顺序耦合)
         let hits = map_news_to_chains("稀土配额收紧叠加人形机器人放量，钕铁硼磁材供需缺口扩大");
-        assert!(hits.iter().any(|h| h.chain == "稀土永磁"));
+        assert!(hits.len() <= 1, "BR-002: 一条快讯最多 1 条产业链, 实际 {} 条", hits.len());
+        // 至少命中一条
+        assert!(!hits.is_empty(), "应至少命中 1 条");
     }
 
     #[test]

@@ -32,18 +32,111 @@ pub fn save_prediction(
 }
 
 /// 回填实际结果（次日收盘后调用）
-pub fn verify_predictions() {
+///
+/// 修复 R-1: 必须真实拉取 stock_daily 的次日实际收盘价，计算 actual_change，
+/// 根据 pred_direction 判定 hit。不再硬编码 0.0, false。
+///
+/// 实现要点：
+/// 1. 查昨天所有未 verify 的 prediction（`hit IS NULL`）
+/// 2. 对每条 prediction，从本地 stock_daily 表读 pred_date 与 target_date 的 close
+///    （不再调网络：本地库是单次 verify 的 source of truth，避免远程 fetch 失败污染 verify）
+/// 3. 计算 actual_change (%)，按 pred_direction 判定 hit（阈值 ±0.5%）
+/// 4. 写回 actual_change / hit / actual_result
+///
+/// 异步函数（`pub async fn`），供 monitor 主循环 `.await` 调用。
+pub async fn verify_predictions() {
     let today = Local::now().format("%Y-%m-%d").to_string();
+    let yesterday = (Local::now() - chrono::Duration::days(1)).format("%Y-%m-%d").to_string();
     let db = match std::panic::catch_unwind(DatabaseManager::get) {
         Ok(db) => db,
         Err(_) => { log::warn!("[Prediction] DB 不可用"); return; }
     };
 
-    // 查找昨天需要验证的预测（这里简化：全量更新）
-    match db.update_prediction_result(&today, None, 0.0, false) {
-        Ok(n) => log::info!("[Prediction] 已更新 {} 条预测结果", n),
-        Err(e) => log::warn!("[Prediction] 更新失败: {}", e),
+    // 1. 查昨天所有未 verify 的 prediction
+    let pending = match db.get_pending_predictions(&yesterday) {
+        Ok(v) => v,
+        Err(e) => { log::warn!("[Prediction] 查 pending 失败: {}", e); return; }
+    };
+
+    let mut verified = 0usize;
+    for pred in pending {
+        let Some(code) = pred.stock_code.as_deref() else { continue; };
+        if code.is_empty() { continue; }
+        let direction = pred.pred_direction.as_str();
+
+        // 2-4. 共享 verify 逻辑: 读 close + 算 actual_change + 判定 hit
+        let outcome = match verify_one(&db, code, &yesterday, &today, direction).await {
+            Some(o) => o,
+            None => continue, // read 失败 / 缺数据 / prev_close <= 0
+        };
+
+        // 5. 写回
+        if let Err(e) = db.update_prediction_result(&yesterday, Some(code), outcome.actual_change, outcome.hit) {
+            log::warn!("[Prediction] {} 写回失败: {}", code, e);
+            continue;
+        }
+        verified += 1;
     }
+    log::info!("[Prediction] 已 verify {} 条 prediction ({} → {})", verified, yesterday, today);
+}
+
+/// 单条 prediction 的 verify 结果。
+/// actual_change 单位为 %; hit 为方向匹配 + |actual| > 0.5%。
+#[derive(Debug, Clone, Copy)]
+pub struct VerifyOutcome {
+    pub actual_change: f64,
+    pub hit: bool,
+}
+
+/// 共享 verify 逻辑 — 读 (pred_date, target_date) 两个本地 close, 算 actual_change, 判定 hit。
+///
+/// 被 `verify_predictions` (生产盘后回填) 和 `backfill_predictions` (历史回填) 复用, 避免逐字复制。
+/// 返回 `None` 表示无法判定 (缺 close / prev_close <= 0), 调用方自行决定 warn-and-continue 还是 `?` 报错。
+///
+/// 注意: 此函数**不**写回数据库, 调用方负责 `update_prediction_result` — 这样 verify_predictions
+/// 的"warn + 继续"语义和 backfill_predictions 的"`?` 失败"语义都能保留。
+pub async fn verify_one(
+    db: &DatabaseManager,
+    code: &str,
+    pred_date: &str,
+    target_date: &str,
+    direction: &str,
+) -> Option<VerifyOutcome> {
+    let prev_close = read_stock_daily_close(db, code, pred_date)?;
+    let target_close = read_stock_daily_close(db, code, target_date)?;
+    if prev_close <= 0.0 { return None; }
+
+    let actual_change = (target_close - prev_close) / prev_close * 100.0;
+    let hit_threshold = 0.5_f64;
+    let direction_match = match direction {
+        "看多" => actual_change > hit_threshold,
+        "看空" => actual_change < -hit_threshold,
+        _ => false,
+    };
+    let hit = direction_match && actual_change.abs() > hit_threshold;
+    Some(VerifyOutcome { actual_change, hit })
+}
+
+/// 从本地 stock_daily 表读取某 code+date 的收盘价 (verify 的 source of truth)
+fn read_stock_daily_close(
+    db: &DatabaseManager,
+    code: &str,
+    date: &str,
+) -> Option<f64> {
+    use diesel::RunQueryDsl;
+    #[derive(diesel::QueryableByName, Debug)]
+    struct CloseRow {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+        close: Option<f64>,
+    }
+    let mut conn = db.get_conn().ok()?;
+    diesel::sql_query(format!(
+        "SELECT close FROM stock_daily WHERE code = '{}' AND date = '{}' LIMIT 1",
+        code, date
+    ))
+    .get_result::<CloseRow>(&mut *conn)
+    .ok()
+    .and_then(|r| r.close)
 }
 
 /// 获取近期命中率

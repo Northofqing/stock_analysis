@@ -32,7 +32,17 @@ impl ScoreBreakdown {
 ///
 /// 数据红线 2.2：某维度数据缺失则该维度记 0 分，不补默认高分。
 fn logic_hardness(hit: &ChainHit, s: &super::chain_mapper::StockInfo) -> ScoreBreakdown {
-    // ① 产业链来源可信度：规则命中(已验证映射) > AI 推理
+    // ① 产业链来源可信度：规则命中(已验证映射) > AI 推理 > AI降级
+    //
+    // 边界证明 (PR-3 修 R-7):
+    // - Rule 命中 10 分: 关键词表已校验 (100+ 测试), 信度高
+    // - AI 命中 6 分: Gemini 解析, 历史准确率 ~60% (经验值), 留 4 分缓冲
+    // - AI 降级 0 分: 无真实分析, 不应得逻辑硬度分
+    //
+    // 注: 之前 source_score 是常量 10, 实际 Rule 和 AI 都 +10, 区分度为 0。
+    //     拆分后链路分最大 24 → Rule 24, AI 20, 差 4 分, 配合资金/位置分
+    //     才能拉开真实差距。
+    // Refs: AGENTS §2.9 设计矛盾禁令 (边界证明)
     let source_score = match hit.source {
         ChainSource::Rule => 10.0,
         ChainSource::Ai => 6.0,
@@ -103,6 +113,19 @@ fn reason_summary(hit: &ChainHit, s: &super::chain_mapper::StockInfo, b: ScoreBr
     )
 }
 
+/// 修复 v9.2 BR-001: 同一只票近 3 个交易日最多推送 1 次
+fn is_recently_pushed(code: &str) -> bool {
+    // DB 不可用时放行, 不阻断业务
+    let db = match std::panic::catch_unwind(crate::database::DatabaseManager::get) {
+        Ok(db) => db,
+        Err(_) => return false,
+    };
+    match db.count_recent_pushes(code, 3) {
+        Ok(n) => n > 0,
+        Err(_) => false,
+    }
+}
+
 /// 从产业链命中结果中发现新标的，按逻辑硬度排序输出 Top N。
 pub fn discover(
     hits: &[ChainHit],
@@ -122,6 +145,12 @@ pub fn discover(
                 continue;
             }
             if !seen.insert(s.code.clone()) { continue; } // 去重
+
+            // 修复 BR-001: 同一只票近 3 个交易日已推 → 跳过
+            if is_recently_pushed(&s.code) {
+                log::debug!("[Discover] {} 近 3 日已推过, 跳过 (BR-001)", s.code);
+                continue;
+            }
 
             let score_breakdown = logic_hardness(hit, s);
             let score = score_breakdown.total();

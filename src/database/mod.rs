@@ -536,6 +536,41 @@ impl DatabaseManager {
         Ok(rows)
     }
 
+    /// 按 stock_code + pred_date 查询 prediction 记录
+    ///
+    /// 修复 R-1: 用于 verify_predictions 真实回填后, 测试断言 hit/actual_change。
+    /// 返回最新的一条 (LIMIT 1) — 同一 (code, pred_date) 只期望一条。
+    pub fn get_prediction_by_code_date(
+        &self,
+        stock_code: &str,
+        pred_date: &str,
+    ) -> Result<PredictionRow, Box<dyn std::error::Error>> {
+        let mut conn = self.get_conn()?;
+        let row = diesel::sql_query(format!(
+            "SELECT id, pred_date, target_date, stock_code, pred_direction, pred_score, actual_change, hit, actual_result FROM prediction_tracker WHERE stock_code = '{}' AND pred_date = '{}' ORDER BY id DESC LIMIT 1",
+            stock_code, pred_date
+        ))
+        .get_result::<PredictionRow>(&mut *conn)?;
+        Ok(row)
+    }
+
+    /// 查某日所有未 verify 的 prediction（hit IS NULL）
+    ///
+    /// 修复 R-1: verify_predictions 真实拉取 stock_daily 后,
+    /// 用此函数找到待回填的预测记录 (替代之前硬编码 0.0, false 的假实现)。
+    pub fn get_pending_predictions(
+        &self,
+        pred_date: &str,
+    ) -> Result<Vec<PredictionRow>, Box<dyn std::error::Error>> {
+        let mut conn = self.get_conn()?;
+        let rows = diesel::sql_query(format!(
+            "SELECT id, pred_date, target_date, stock_code, pred_direction, pred_score, actual_change, hit, actual_result FROM prediction_tracker WHERE pred_date = '{}' AND hit IS NULL",
+            pred_date
+        ))
+        .load::<PredictionRow>(&mut *conn)?;
+        Ok(rows)
+    }
+
     /// 获取预测命中率（简化实现，直接执行 SQL 返回 f64）
     pub fn get_prediction_hit_rate(&self, _days: i32) -> Result<f64, Box<dyn std::error::Error>> {
         let mut conn = self.get_conn()?;
@@ -590,6 +625,29 @@ impl DatabaseManager {
         .execute(&mut *conn)?;
 
         Ok(())
+    }
+
+    /// 修复 v9.2 BR-001: 统计某只票近 N 天被 push 的次数
+    pub fn count_recent_pushes(
+        &self,
+        stock_code: &str,
+        days: i64,
+    ) -> Result<i64, Box<dyn std::error::Error>> {
+        let mut conn = self.get_conn()?;
+        let cutoff = (chrono::Local::now() - chrono::Duration::days(days))
+            .format("%Y-%m-%d")
+            .to_string();
+        #[derive(serde::Serialize, serde::Deserialize, diesel::QueryableByName)]
+        struct CountRow {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            cnt: i64,
+        }
+        let raw = format!(
+            "SELECT COUNT(*) as cnt FROM prediction_tracker WHERE stock_code = '{}' AND pred_date >= '{}'",
+            stock_code, cutoff
+        );
+        let row = diesel::sql_query(raw).get_result::<CountRow>(&mut *conn)?;
+        Ok(row.cnt)
     }
 
     /// 读取近窗期主题签名（按最新时间倒序）
@@ -663,6 +721,32 @@ pub fn get_db() -> &'static DatabaseManager {
 // ============================================================================
 // P0-3: FactorIC 因子分析 — 已平仓交易 + 评分 JOIN
 // ============================================================================
+
+/// 预测记录查询返回行 (公开类型, monitor 模块 + 测试使用)
+///
+/// 修复 R-1: verify_predictions 真实拉取 stock_daily 之后回填,
+/// 测试和 verify 函数本身都需要读这条记录。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, diesel::QueryableByName)]
+pub struct PredictionRow {
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    pub id: i32,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub pred_date: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub target_date: String,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    pub stock_code: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub pred_direction: String,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+    pub pred_score: Option<f64>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+    pub actual_change: Option<f64>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
+    pub hit: Option<i32>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    pub actual_result: Option<String>,
+}
 
 /// 因子 IC 分析的查询结果行 (公开类型, review 模块使用)
 #[derive(Debug, Clone)]

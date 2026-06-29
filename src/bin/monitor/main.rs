@@ -1109,7 +1109,7 @@ async fn monitor_loop() {
 
         push_wechat(&pre_market).await;
 
-        prediction::verify_predictions();
+        prediction::verify_predictions().await;
         let hit_rate = prediction::recent_hit_rate(7);
         if hit_rate > 0.0 { log::info!("[预测] 近7天命中率: {:.0}%", hit_rate * 100.0); }
 

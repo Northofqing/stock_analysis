@@ -9,8 +9,9 @@ use log::{info, warn};
 use crate::config::get_monitor_config;
 
 use super::providers::{
-    BochaSearchProvider, ClsProvider, CninfoProvider, EastmoneyNewsProvider, Jin10CalendarEvent,
-    Jin10Provider, KcbDailyProvider, SerpAPISearchProvider, SseSzseProvider, TavilySearchProvider,
+    BochaSearchProvider, ClsProvider, CninfoProvider, EastmoneyNewsProvider, EmAnnouncementProvider,
+    EmIndustryNewsProvider, Jin10CalendarEvent, Jin10Provider, KcbDailyProvider,
+    SerpAPISearchProvider, SinaFlashProvider, SseSzseProvider, TavilySearchProvider,
     WallStreetCnProvider,
 };
 use super::types::{SearchProvider, SearchResponse, SearchResult};
@@ -33,6 +34,12 @@ pub struct SearchService {
     cls: ClsProvider,
     /// 金十数据直连（免费，快讯 + 财经日历）
     jin10: Jin10Provider,
+    /// 新浪财经全球快讯（免费，4 lid 并发: 国际/国内/A股/港股）
+    sina_flash: SinaFlashProvider,
+    /// 东财全市场公告流（免费，A 股 5000+ 公司公告流）
+    em_announcement: EmAnnouncementProvider,
+    /// 东财行业新闻流（免费，10 个 BOM 行业关键词并发）
+    em_industry_news: EmIndustryNewsProvider,
     /// 最近入选主题新闻标题特征（用于抑制重复推送）
     recent_topic_signatures: Mutex<VecDeque<String>>,
     /// 新闻源健康统计（成功/超时/失败/空结果）
@@ -135,12 +142,18 @@ impl SearchService {
 
         info!("已启用 华尔街见闻 直连（免费，全球财经快讯）");
         info!("已启用 金十数据 直连（免费，快讯 + 财经日历）");
+        info!("已启用 新浪财经 直连（免费，国际/国内/A股/港股 4 lid 并发）");
+        info!("已启用 东财全市场公告流（免费，A 股 5000+ 公司公告）");
+        info!("已启用 东财行业新闻流（免费，10 个 BOM 行业关键词并发）");
         let cfg = get_monitor_config();
         Self {
             providers,
             wscn: WallStreetCnProvider::new(),
             cls: ClsProvider::new(),
             jin10: Jin10Provider::new(),
+            sina_flash: SinaFlashProvider::new(),
+            em_announcement: EmAnnouncementProvider::new(),
+            em_industry_news: EmIndustryNewsProvider::new(),
             recent_topic_signatures: Mutex::new(VecDeque::with_capacity(
                 cfg.topic_history_memory_size.max(50),
             )),
@@ -215,13 +228,113 @@ impl SearchService {
         }
     }
 
+    /// 抓取东财全市场今日公告（盘后/盘前定时调度使用）
+    ///
+    /// 注意：这是「公告流」而非「快讯」，建议在盘前/盘后触发，不要高频拉取。
+    /// 内部已用 15s 超时；失败不重试，记 source_health("em_ann")。
+    ///
+    /// - `limit`: 单次最多 100 条（API 单页上限）
+    /// - 返回: 标题已带 `[公司名] (分类) 标题` 前缀
+    pub async fn fetch_announcements_today(&self, limit: usize) -> Vec<SearchResult> {
+        let source_timeout = Duration::from_secs(15);
+        match tokio::time::timeout(source_timeout, self.em_announcement.fetch_today(limit)).await {
+            Ok(Ok(lst)) => {
+                info!("[ann][em] 今日公告 {} 条", lst.len());
+                if lst.is_empty() {
+                    self.record_source_health("em_ann", SourceFetchOutcome::Empty, 0);
+                } else {
+                    self.record_source_health("em_ann", SourceFetchOutcome::Success, lst.len());
+                }
+                lst
+            }
+            Ok(Err(e)) => {
+                self.record_source_health("em_ann", SourceFetchOutcome::Error, 0);
+                warn!("[ann][em] 抓取失败: {}", e);
+                Vec::new()
+            }
+            Err(_) => {
+                self.record_source_health("em_ann", SourceFetchOutcome::Timeout, 0);
+                warn!("[ann][em] 超时（>15s）");
+                Vec::new()
+            }
+        }
+    }
+
+    /// 抓取某只股票最近公告（用于个股研究）
+    pub async fn fetch_announcements_by_stock(&self, stock_code: &str, limit: usize) -> Vec<SearchResult> {
+        match self.em_announcement.fetch_by_stock(stock_code, limit).await {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("[ann][em] 个股 {stock_code} 抓取失败: {}", e);
+                Vec::new()
+            }
+        }
+    }
+
+    /// 抓取指定行业的最新新闻（按关键词，6h 内）
+    ///
+    /// 直接对接 BOM 链路：chain_mapper 拿到 event.chains 后，
+    /// 用行业名（如 "半导体"/"光伏"）查 em_industry_news，
+    /// 拿到该行业最近 6h 的全网新闻标题。
+    ///
+    /// - `industry`: BOM 行业名（必须是 INDUSTRY_KEYWORDS 里的）
+    /// - `limit`: 最大返回条数
+    pub async fn fetch_industry_news(&self, industry: &str, limit: usize) -> Vec<SearchResult> {
+        let source_timeout = Duration::from_secs(15);
+        match tokio::time::timeout(
+            source_timeout,
+            self.em_industry_news.fetch_by_keyword(industry, limit),
+        )
+        .await
+        {
+            Ok(Ok(lst)) => {
+                info!("[ind][em] {industry} 命中 {} 条", lst.len());
+                if lst.is_empty() {
+                    self.record_source_health("em_ind", SourceFetchOutcome::Empty, 0);
+                } else {
+                    self.record_source_health("em_ind", SourceFetchOutcome::Success, lst.len());
+                }
+                lst
+            }
+            Ok(Err(e)) => {
+                self.record_source_health("em_ind", SourceFetchOutcome::Error, 0);
+                warn!("[ind][em] {industry} 抓取失败: {}", e);
+                Vec::new()
+            }
+            Err(_) => {
+                self.record_source_health("em_ind", SourceFetchOutcome::Timeout, 0);
+                warn!("[ind][em] {industry} 超时");
+                Vec::new()
+            }
+        }
+    }
+
+    /// 一次性拉取所有 BOM 行业关键词的新闻（盘后/盘前调度用）
+    pub async fn fetch_all_industry_news(&self, per_keyword_limit: usize) -> Vec<SearchResult> {
+        let started = std::time::Instant::now();
+        let items = self
+            .em_industry_news
+            .fetch_all_industries(per_keyword_limit)
+            .await;
+        let elapsed = started.elapsed().as_secs();
+        info!(
+            "[ind][em] 10 行业全量扫描完成 {} 条（{}s）",
+            items.len(),
+            elapsed
+        );
+        items
+    }
+
     /// 获取原始快讯标题列表（供 NewsMonitor 路径A 使用）
     pub async fn fetch_flash_titles(&self, limit: usize) -> Vec<String> {
         let source_timeout = Duration::from_secs(get_monitor_config().topic_search_timeout_sec.max(3));
-        let (jin10_res, wscn_res, cls_res) = tokio::join!(
+        let (jin10_res, wscn_res, cls_res, sina_res) = tokio::join!(
             tokio::time::timeout(source_timeout, self.jin10.fetch_flash_news(limit, true)),
             tokio::time::timeout(source_timeout, self.wscn.fetch_live_news(limit)),
             tokio::time::timeout(source_timeout, self.cls.fetch_live_news(limit)),
+            tokio::time::timeout(source_timeout, async {
+                self.sina_flash.fetch_flash_news(limit).await
+            }),
         );
 
         let mut titles = Vec::new();
@@ -292,6 +405,24 @@ impl SearchService {
             }
         }
 
+        match sina_res {
+            Ok(lst) => {
+                info!("[flash][sina] 成功 {} 条", lst.len());
+                if lst.is_empty() {
+                    self.record_source_health("sina", SourceFetchOutcome::Empty, 0);
+                } else {
+                    self.record_source_health("sina", SourceFetchOutcome::Success, lst.len());
+                }
+                for r in lst {
+                    titles.push(r.title);
+                }
+            }
+            Err(e) => {
+                self.record_source_health("sina", SourceFetchOutcome::Error, 0);
+                warn!("[flash][sina] 失败: {}", e)
+            }
+        }
+
         let mut seen = HashSet::new();
         let mut deduped = Vec::new();
         for title in titles {
@@ -303,6 +434,32 @@ impl SearchService {
             if deduped.len() >= limit {
                 break;
             }
+        }
+
+        // 修复 v9.2 BR-003: 宏观新闻 (美联储/美股/汇率/大宗) 入 macro 通道, 不入 chain_mapper
+        // 这里只标记 + 过滤, 实际 macro 通道分流在 run_opportunity_scan 路径
+        const MACRO_KEYWORDS: &[&str] = &[
+            "美联储", "鲍威尔", "FOMC",
+            "美股", "纳斯达克", "标普", "道琼斯",
+            "汇率", "人民币兑", "美元指数",
+            "大宗商品", "原油", "黄金", "铜价",
+            "欧央行", "日银", "英国央行",
+        ];
+        let mut macro_count = 0usize;
+        deduped.retain(|t| {
+            if MACRO_KEYWORDS.iter().any(|kw| t.contains(kw)) {
+                macro_count += 1;
+                log::debug!(
+                    "[flash] 宏观新闻 (BR-003): {}",
+                    t.chars().take(40).collect::<String>()
+                );
+                false
+            } else {
+                true
+            }
+        });
+        if macro_count > 0 {
+            log::info!("[flash] BR-003 过滤 {} 条宏观新闻", macro_count);
         }
 
         self.maybe_log_source_health_summary("fetch_flash_titles");

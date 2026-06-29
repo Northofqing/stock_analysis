@@ -103,6 +103,16 @@
   | 净值 | **当日有效**(跨交易日即过期) |
   | 日线 / 历史数据 | **1 个交易日** |
 
+#### 2.4.1 数据新鲜度门禁 (R-3 修复新增, PR-2)
+
+> §2.4 的工程化补充。把抽象规则落到 CI / 自动化门禁,避免"停更 N 天无人察觉"的复盘。
+
+- **MUST** `stock_daily` 等时间序列表的 `MAX(date)` 与今日差不得超过 **1 个交易日**(周末/节假日除外)。
+- **MUST** 数据新鲜度由 `tools/compliance/lib/check_data_freshness.sh` 自动检查,`bash tools/compliance/check.sh` 阻断(CI / 合并前必跑)。
+- **MUST** 修复手段:`bash tools/one_shot/backfill_daily.sh` 全量回灌(数据源:RustDX 通达信 → Gtimg → HTTP);或在 PR 描述写明数据断层原因 + 手动修复命令。
+- **MUST NOT** 在数据新鲜度 FAIL 的情况下合并 PR — 即便其他检查全过。
+- **异常处理**: 数据断层超过 1 个交易日 → 触发 `bash tools/one_shot/backfill_daily.sh` 重灌, 并在 PR 描述写明原因; 仍 FAIL 则升级决策, 不得静默合并。
+
 ### 2.5 测试与实盘隔离
 
 - **MUST** 测试用 `TEST_CODE` 前缀区分真实股票。
@@ -128,6 +138,74 @@
 
 - **MUST** 关键数据流与每一笔订单留痕:来源、时间、决策依据。
 - **MUST** 审计日志不可篡改,**保留期 ≥ 5 年**(满足监管留痕要求)。
+
+### 2.8 假实现禁令
+
+> **MUST** 任何"写数据 / 验证 / 通知 / 同步"类函数(命名含 `verify`、`save`、`notify`、`push`、`sync`、`update_result`、`reconcile`)必须真实操作目标数据源。仅写日志不操作数据的实现视为 **假实现**,合并阻断。
+
+**反模式**:
+```rust
+// ❌ 假实现 — verify 硬编码 0.0, false
+match db.update_prediction_result(&today, None, 0.0, false) {
+    Ok(n) => log::info!("已更新 {} 条预测结果", n),
+    ...
+}
+```
+
+**正例**:
+```rust
+// ✅ 真实 verify — 拉 stock_daily, 算 actual_change, 写回
+let prev_close = read_stock_daily_close(code, &pred_date)?;
+let today_close = read_stock_daily_close(code, &target_date)?;
+let actual_change = (today_close - prev_close) / prev_close * 100.0;
+let hit = match pred_direction.as_str() {
+    "看多" => actual_change > 0.5,
+    "看空" => actual_change < -0.5,
+    _ => false,
+};
+db.update_prediction_result(&pred_date, Some(code), actual_change, hit)?;
+```
+
+**验证**: `tools/compliance/lib/check_fake_impl.sh` 拦截 `update_.*result.*0\.0.*false` 模式 (R-1 修复新增)。
+
+### 2.9 设计矛盾禁令
+
+> **MUST** 任何评分 / 阈值 / 门控的设置必须满足:
+> 1. 上下游互相引用: 改动 `config/*.toml` 阈值必须 PR 描述引用 spec 章节号; 改动 spec 必须引用 config 字段名
+> 2. 边界证明: `event_*_threshold`、`*_max`、`*_min`、`*_clamp` 必须注释证明"为什么是这个值"
+> 3. 矛盾检测: CI 解析 toml 与 rust 源码, 若 `threshold > clamp_max` 即 fail
+
+**反模式** (R-2):
+```toml
+[push]
+event_risk_score_threshold = 75
+```
+```rust
+if inputs.winrate_score.is_none() {
+    event_risk_score_clamped = event_risk_score_clamped.min(70.0);
+}
+```
+
+**验证**: `tools/compliance/lib/check_design_contradiction.sh` 拦截。
+**PR 描述**: 必须含 `Refs: spec §X.X` 或 `Refs: config XXX`。
+
+### 2.10 业务规则文档化
+
+> **MUST** 涉及"去重 / 互斥 / 过滤 / 排序 / 限额"的业务规则必须在 `docs/business_rules.md` 列清单。每条规则含: 编号、规则描述、对应代码位置、测试位置、最后审核日期。
+> **MUST** 任何新代码涉及上述类别, 必须先在 `business_rules.md` 登记再写实现。
+> **MUST** Review 检查表第 5 步加项: "本 PR 涉及的 5 类业务规则是否登记"。
+
+**初始登记 5 条** (R-4 / R-5 / R-6 对应):
+
+| 编号 | 类别 | 规则 |
+|------|------|------|
+| BR-001 | 去重 | 同一只票近 3 个交易日最多推送 1 次 |
+| BR-002 | 互斥 | 一条快讯最多命中 1 条产业链。例外: AI 给出 ≥2 条独立产业链可保留 |
+| BR-003 | 过滤 | 宏观新闻 (美联储/美股/汇率/大宗) 入 macro 通道, 不入 chain_mapper |
+| BR-004 | 排序 | 推送 TopN 按 final_score 降序, 同分按发布时间升序 |
+| BR-005 | 限额 | 每天推送机会数 ≤ 5, 超过入候选池 |
+
+**验证**: `tools/compliance/lib/check_business_rules.sh` 拦截缺规则的 PR。
 
 ---
 
