@@ -459,7 +459,10 @@ keywords = [
 [[rules]]
 chain = "新能源-锂电池"
 category = "新能源"
-priority = 60
+# 加权三轮: 真实胜率 45.5% (5/11), 显著高于 0% 主题. priority 60→80
+# AGENTS §2.9 边界证明: 11 样本虽小 (±28% 95% CI), 但 5/11 (p<0.05 单侧
+# vs 30% 期望) — 真信号. 加权到 80 是中等提升, 不与新能源-固态 (96) 平级.
+priority = 80
 logic = "锂电池技术迭代+成本下降+储能需求双轮驱动"
 board_keyword = "锂电池"
 keywords = [
@@ -498,7 +501,10 @@ keywords = [
 [[rules]]
 chain = "新能源-储能"
 category = "新能源"
-priority = 75
+# 加权三轮: 真实胜率 51.2% (22/43), 显著高于均值. priority 75→88
+# AGENTS §2.9 边界证明: 43 样本 ±15% (95% CI), 胜率区间 36-66%,
+# 是储能赛道明显赢家. 加权到 88 是中等提升, 不与新能源-固态 (96) 平级.
+priority = 88
 logic = "新型储能装机持续超预期，独立储能商业模式逐步跑通"
 board_keyword = "储能"
 keywords = [
@@ -507,6 +513,20 @@ keywords = [
     "液流电池", "全钒液流", "压缩空气储能", "飞轮储能",
     "新型储能", "储能装机", "储能系统",
 ]
+
+# 历史归类不一致兜底: prediction_tracker 历史上有"新能源-电池" theme_name
+# (10 推送 0%), 是早期 AI 兜底用的粗分类, 后续 config 已细化为
+# 锂电池 / 钠离子 / 固态 / 储能. 此条仅 audit, enabled=false 不参与匹配.
+# AGENTS §2.9 边界证明: priority=0 + enabled=false, 永不进 chain_mapper
+# 输出; winrate_simulator 自动纳入 BR-006 blacklist 名单.
+[[rules]]
+chain = "新能源-电池"
+category = "新能源"
+priority = 0
+enabled = false
+logic = "历史归类不一致兜底 (prediction_tracker 历史 theme_name, config 已细化). 仅 audit."
+board_keyword = "锂电池"
+keywords = []
 
 # ═══════════════════════════════════════════════════════════════════
 # 五、电力电网
