@@ -1,8 +1,9 @@
 //! E2E 测试: prediction 闭环真实 verify
-//! 修复 R-1: 插一条 TEST_CODE 前缀的 prediction，插入 stock_daily，
+//! 修复 R-1: 插一条 TEST_CODE_xxx 前缀的 prediction，插入 stock_daily，
 //! 调 verify，断言 actual_change / hit 被正确更新。
 //!
 //! 之前的实现是假实现 (硬编码 0.0, false)，现在必须真实计算变化率。
+//! 测试代码使用 TEST_CODE_ 前缀以通过 env_guard (AGENTS.md §2.5 隔离)。
 
 use chrono::{Duration, Local, NaiveDate};
 use diesel::RunQueryDsl;
@@ -46,17 +47,17 @@ async fn test_verify_predictions_writes_real_actual_change() {
     let today = Local::now().format("%Y-%m-%d").to_string();
     let yesterday = (Local::now() - Duration::days(1)).format("%Y-%m-%d").to_string();
 
-    // 清理: 删 TST001 残留 (单独测试, 不与其他测试共享 code)
+    // 清理: 删 TEST_CODE_001 残留 (单独测试, 不与其他测试共享 code)
     retry_db(|| {
-        let _ = diesel::sql_query("DELETE FROM prediction_tracker WHERE stock_code = 'TST001'")
+        let _ = diesel::sql_query("DELETE FROM prediction_tracker WHERE stock_code = 'TEST_CODE_001'")
             .execute(&mut *db.get_conn().unwrap());
-        let _ = diesel::sql_query("DELETE FROM stock_daily WHERE code = 'TST001'")
+        let _ = diesel::sql_query("DELETE FROM stock_daily WHERE code = 'TEST_CODE_001'")
             .execute(&mut *db.get_conn().unwrap());
     });
 
     // 1. 准备: 插入 prediction (pred_date = yesterday 让 verify 找到)
     retry_db(|| {
-        db.save_prediction(&yesterday, &today, Some("测试主题"), Some("TST001"), "看多", 75.0, Some("unit test"))
+        db.save_prediction(&yesterday, &today, Some("测试主题"), Some("TEST_CODE_001"), "看多", 75.0, Some("unit test"))
             .expect("save_prediction 应成功");
     });
 
@@ -65,12 +66,12 @@ async fn test_verify_predictions_writes_real_actual_change() {
     let today_date = NaiveDate::parse_from_str(&today, "%Y-%m-%d").unwrap();
     retry_db(|| {
         db.save_daily_record(
-            "TST001", yesterday_date,
+            "TEST_CODE_001", yesterday_date,
             Some(9.5), Some(10.2), Some(9.3), Some(10.0), Some(1_000_000.0), Some(10_000_000.0),
             Some(0.0), Some(10.0), Some(10.0), Some(10.0), Some(1.0), Some("TestSource"),
         ).expect("save yesterday daily 失败");
         db.save_daily_record(
-            "TST001", today_date,
+            "TEST_CODE_001", today_date,
             Some(10.5), Some(11.2), Some(10.3), Some(11.0), Some(1_500_000.0), Some(16_500_000.0),
             Some(10.0), Some(10.5), Some(10.5), Some(10.5), Some(1.5), Some("TestSource"),
         ).expect("save today daily 失败");
@@ -80,7 +81,7 @@ async fn test_verify_predictions_writes_real_actual_change() {
     stock_analysis::monitor::prediction::verify_predictions().await;
 
     // 4. 断言: hit=1, actual_change≈10%
-    let row = db.get_prediction_by_code_date("TST001", &yesterday)
+    let row = db.get_prediction_by_code_date("TEST_CODE_001", &yesterday)
         .expect("应能查回 prediction");
     assert_eq!(row.hit, Some(1), "看多+次日涨 10% → hit=1, row={:?}", row);
     let actual = row.actual_change.expect("actual_change 必须有值");
@@ -89,9 +90,9 @@ async fn test_verify_predictions_writes_real_actual_change() {
 
     // 清理
     retry_db(|| {
-        let _ = diesel::sql_query("DELETE FROM prediction_tracker WHERE stock_code = 'TST001'")
+        let _ = diesel::sql_query("DELETE FROM prediction_tracker WHERE stock_code = 'TEST_CODE_001'")
             .execute(&mut *db.get_conn().unwrap());
-        let _ = diesel::sql_query("DELETE FROM stock_daily WHERE code = 'TST001'")
+        let _ = diesel::sql_query("DELETE FROM stock_daily WHERE code = 'TEST_CODE_001'")
             .execute(&mut *db.get_conn().unwrap());
     });
 }
@@ -104,15 +105,15 @@ async fn test_verify_predictions_miss_for_bearish_prediction_on_up_day() {
     let yesterday = (Local::now() - Duration::days(1)).format("%Y-%m-%d").to_string();
 
     retry_db(|| {
-        let _ = diesel::sql_query("DELETE FROM prediction_tracker WHERE stock_code = 'TST002'")
+        let _ = diesel::sql_query("DELETE FROM prediction_tracker WHERE stock_code = 'TEST_CODE_002'")
             .execute(&mut *db.get_conn().unwrap());
-        let _ = diesel::sql_query("DELETE FROM stock_daily WHERE code = 'TST002'")
+        let _ = diesel::sql_query("DELETE FROM stock_daily WHERE code = 'TEST_CODE_002'")
             .execute(&mut *db.get_conn().unwrap());
     });
 
     // 1. 看空预测
     retry_db(|| {
-        db.save_prediction(&yesterday, &today, Some("测试主题"), Some("TST002"), "看空", 75.0, Some("unit test"))
+        db.save_prediction(&yesterday, &today, Some("测试主题"), Some("TEST_CODE_002"), "看空", 75.0, Some("unit test"))
             .expect("save_prediction 应成功");
     });
 
@@ -120,11 +121,11 @@ async fn test_verify_predictions_miss_for_bearish_prediction_on_up_day() {
     let yesterday_date = NaiveDate::parse_from_str(&yesterday, "%Y-%m-%d").unwrap();
     let today_date = NaiveDate::parse_from_str(&today, "%Y-%m-%d").unwrap();
     retry_db(|| {
-        db.save_daily_record("TST002", yesterday_date,
+        db.save_daily_record("TEST_CODE_002", yesterday_date,
             Some(9.5), Some(10.2), Some(9.3), Some(10.0), Some(1_000_000.0), Some(10_000_000.0),
             Some(0.0), None, None, None, None, Some("TestSource"),
         ).expect("save 失败");
-        db.save_daily_record("TST002", today_date,
+        db.save_daily_record("TEST_CODE_002", today_date,
             Some(10.5), Some(11.2), Some(10.3), Some(11.0), Some(1_500_000.0), Some(16_500_000.0),
             Some(10.0), None, None, None, None, Some("TestSource"),
         ).expect("save 失败");
@@ -134,15 +135,15 @@ async fn test_verify_predictions_miss_for_bearish_prediction_on_up_day() {
     stock_analysis::monitor::prediction::verify_predictions().await;
 
     // 4. 断言: 看空+次日涨 → hit=0
-    let row = db.get_prediction_by_code_date("TST002", &yesterday)
+    let row = db.get_prediction_by_code_date("TEST_CODE_002", &yesterday)
         .expect("应能查回");
     assert_eq!(row.hit, Some(0), "看空+次日涨 → hit=0 (未命中), row={:?}", row);
 
     // 清理
     retry_db(|| {
-        let _ = diesel::sql_query("DELETE FROM prediction_tracker WHERE stock_code = 'TST002'")
+        let _ = diesel::sql_query("DELETE FROM prediction_tracker WHERE stock_code = 'TEST_CODE_002'")
             .execute(&mut *db.get_conn().unwrap());
-        let _ = diesel::sql_query("DELETE FROM stock_daily WHERE code = 'TST002'")
+        let _ = diesel::sql_query("DELETE FROM stock_daily WHERE code = 'TEST_CODE_002'")
             .execute(&mut *db.get_conn().unwrap());
     });
 }

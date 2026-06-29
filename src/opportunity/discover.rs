@@ -40,8 +40,11 @@ fn logic_hardness(hit: &ChainHit, s: &super::chain_mapper::StockInfo) -> ScoreBr
     // - AI 降级 0 分: 无真实分析, 不应得逻辑硬度分
     //
     // 注: 之前 source_score 是常量 10, 实际 Rule 和 AI 都 +10, 区分度为 0。
-    //     拆分后链路分最大 24 → Rule 24, AI 20, 差 4 分, 配合资金/位置分
-    //     才能拉开真实差距。
+    //     拆分后链路分上限 (source + keyword + fund + position):
+    //       Rule max      = 10 + 9 + 10 + 5  = 34
+    //       AI max        =  6 + 9 + 10 + 5  = 30
+    //       AI 降级 max   =  0 + 9 + 10 + 5  = 24
+    //     Rule vs AI 差 4 分 (逻辑硬度项), 配合资金/位置分才能拉开真实差距。
     // Refs: AGENTS §2.9 设计矛盾禁令 (边界证明)
     let source_score = match hit.source {
         ChainSource::Rule => 10.0,
@@ -113,7 +116,8 @@ fn reason_summary(hit: &ChainHit, s: &super::chain_mapper::StockInfo, b: ScoreBr
     )
 }
 
-/// 修复 v9.2 BR-001: 同一只票近 3 个交易日最多推送 1 次
+/// 修复 v9.2 BR-001: 同一只票近 3 个日历日最多推送 1 次
+/// (注: 实际按日历日计算, 非交易日 — 见 business_rules.md BR-001 YAGNI 说明)
 fn is_recently_pushed(code: &str) -> bool {
     // DB 不可用时放行, 不阻断业务
     let db = match std::panic::catch_unwind(crate::database::DatabaseManager::get) {
