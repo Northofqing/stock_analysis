@@ -438,26 +438,8 @@ impl SearchService {
 
         // 修复 v9.2 BR-003: 宏观新闻 (美联储/美股/汇率/大宗) 入 macro 通道, 不入 chain_mapper
         // 这里只标记 + 过滤, 实际 macro 通道分流在 run_opportunity_scan 路径
-        const MACRO_KEYWORDS: &[&str] = &[
-            "美联储", "鲍威尔", "FOMC",
-            "美股", "纳斯达克", "标普", "道琼斯",
-            "汇率", "人民币兑", "美元指数",
-            "大宗商品", "原油", "黄金", "铜价",
-            "欧央行", "日银", "英国央行",
-        ];
-        let mut macro_count = 0usize;
-        deduped.retain(|t| {
-            if MACRO_KEYWORDS.iter().any(|kw| t.contains(kw)) {
-                macro_count += 1;
-                log::debug!(
-                    "[flash] 宏观新闻 (BR-003): {}",
-                    t.chars().take(40).collect::<String>()
-                );
-                false
-            } else {
-                true
-            }
-        });
+        // 抽到 filter_macro_titles 纯函数, 便于测试 (M3 修复)
+        let (deduped, macro_count) = filter_macro_titles(deduped);
         if macro_count > 0 {
             log::info!("[flash] BR-003 过滤 {} 条宏观新闻", macro_count);
         }
@@ -1501,6 +1483,37 @@ impl SearchService {
 // ============================================================================
 
 // extract_domain 已迁移至 super::types::extract_domain
+
+/// 修复 v9.2 BR-003: 宏观新闻关键词 (美联储/美股/汇率/大宗 等)
+pub const MACRO_KEYWORDS: &[&str] = &[
+    "美联储", "鲍威尔", "FOMC",
+    "美股", "纳斯达克", "标普", "道琼斯",
+    "汇率", "人民币兑", "美元指数",
+    "大宗商品", "原油", "黄金", "铜价",
+    "欧央行", "日银", "英国央行",
+];
+
+/// 修复 v9.2 M3 + BR-003: 纯函数过滤宏观新闻, 返回 (filtered_titles, macro_count).
+/// 抽出来便于 e2e 测试, 避免依赖真实网络.
+pub fn filter_macro_titles(titles: Vec<String>) -> (Vec<String>, usize) {
+    let mut macro_count = 0usize;
+    let filtered: Vec<String> = titles
+        .into_iter()
+        .filter(|t| {
+            if MACRO_KEYWORDS.iter().any(|kw| t.contains(kw)) {
+                macro_count += 1;
+                log::debug!(
+                    "[flash] 宏观新闻 (BR-003): {}",
+                    t.chars().take(40).collect::<String>()
+                );
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    (filtered, macro_count)
+}
 
 // ============================================================================
 // 单例服务
