@@ -184,11 +184,9 @@ pub async fn map_news_to_chains_ai(titles: &[String]) -> Vec<ChainHit> {
     let titles_owned = titles.to_vec();
     let existing_chain = rule_hits.first().map(|h| h.chain.clone());
     tokio::task::spawn_blocking(move || {
-        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-            Ok(rt) => rt,
-            Err(_) => return Vec::new(),
-        };
-        rt.block_on(async move {
+        // 修复 Top10#5 (2026-06-29 audit): 用 crate::block_on_async 统一替代
+        // spawn_blocking 内新建 current_thread runtime 的 pattern.
+        crate::block_on_async(async move {
             let analyzer = crate::analyzer::GeminiAnalyzer::from_env();
             if !analyzer.is_available() {
                 log::warn!("[ChainMapper] 需要 AI 二次分类但 AI 不可用 → [AI降级]");

@@ -348,17 +348,15 @@ impl DataProvider for HttpProvider {
         let client = self.client.clone();
         let code = code.to_string();
 
-        // 使用 tokio::task::block_in_place 来运行异步代码
-        let mut data = tokio::task::block_in_place(|| {
-            let code_inner = code.clone();
-            tokio::runtime::Handle::current().block_on(async move {
-                Self::fetch_kline_data_internal(&client, &code_inner, days).await
-            })
+        // 修复 Top10#5 (2026-06-29 audit): 用统一 block_on_async 替代 block_in_place + Handle::current().block_on
+        let code_for_apply = code.clone();
+        let mut data = crate::block_on_async(async move {
+            Self::fetch_kline_data_internal(&client, &code, days).await
         })?;
 
         // 填涨跌停 / 停牌标记
         // 名称暂用 None（保守按非 ST 处理）；后续实时行情步骤会再覆盖
-        apply_limit_flags_inplace(&code, None, &mut data);
+        apply_limit_flags_inplace(&code_for_apply, None, &mut data);
 
         log::info!("[HTTP] 成功获取 {} 条数据", data.len());
 
@@ -367,14 +365,12 @@ impl DataProvider for HttpProvider {
     fn get_stock_name(&self, code: &str) -> Option<String> {
         let client = self.client.clone();
         let code_str = code.to_string();
-        
-        // 使用 tokio::task::block_in_place 来运行异步代码
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                Self::fetch_stock_name_internal(&client, &code_str).await
-            })
+
+        // 修复 Top10#5: 用统一 block_on_async 替代
+        let result = crate::block_on_async(async move {
+            Self::fetch_stock_name_internal(&client, &code_str).await
         });
-        
+
         result.or_else(|| Some(format!("股票{}", code)))
     }
     fn name(&self) -> &'static str {

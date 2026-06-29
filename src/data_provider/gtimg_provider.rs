@@ -89,24 +89,15 @@ impl GtimgProvider {
         self.get_realtime_quote(code)
     }
 
-    /// 在同步上下文中安全执行异步任务：
-    /// - 若当前线程已在 Tokio runtime 内，使用 block_in_place + handle.block_on
-    /// - 若不在 runtime 内，临时创建 current_thread runtime 执行
+    /// 在同步上下文中安全执行异步任务 (委托给 crate::block_on_async).
+    /// 修复 Top10#5 (2026-06-29 audit): 统一全代码库 block_on pattern, 避免重复实现.
     fn run_async_blocking<T, F>(fut: F) -> Result<T>
     where
         T: Send + 'static,
         F: Future<Output = Result<T>> + Send + 'static,
     {
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
-            Err(_) => {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .context("创建临时 Tokio 运行时失败")?;
-                rt.block_on(fut)
-            }
-        }
+        // F::Output = Result<T>, 所以 block_on_async 直接返回 Result<T>
+        crate::block_on_async(fut)
     }
 
     /// 与 `run_async_blocking` 类似，但返回任意值（非 Result）。
@@ -115,16 +106,8 @@ impl GtimgProvider {
         T: Send + 'static,
         F: Future<Output = T> + Send + 'static,
     {
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => Ok(tokio::task::block_in_place(|| handle.block_on(fut))),
-            Err(_) => {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .context("创建临时 Tokio 运行时失败")?;
-                Ok(rt.block_on(fut))
-            }
-        }
+        // F::Output = T, block_on_async 返回 T, 用 Ok() 包装
+        Ok(crate::block_on_async::<F, T>(fut))
     }
     
     /// 从腾讯财经API获取K线数据（异步版本）

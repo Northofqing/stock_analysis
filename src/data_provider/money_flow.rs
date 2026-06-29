@@ -496,56 +496,54 @@ pub fn fetch_money_flow_blocking(
     code: &str,
     lmt: usize,
 ) -> MoneyFlowSummary {
-    let handle = match tokio::runtime::Handle::try_current() {
-        Ok(h) => h,
-        Err(_) => return MoneyFlowSummary::default(),
-    };
+    // 修复 Top10#5 (2026-06-29 audit): 用 crate::block_on_async 统一替代
+    // Handle::try_current + block_in_place + block_on pattern. 不在 runtime 时 fallback 到 default
+    // (保留旧 behavior, 旧 pattern 在不在 runtime 时 return default).
     let client = client.clone();
-    let code = code.to_string();
-    tokio::task::block_in_place(|| {
-        handle.block_on(async move {
-            match fetch_flow_history_async(&client, &code, lmt).await {
-                Ok(s) => {
-                    log::info!(
-                        "[资金流] {} 取得 {} 天数据（最新 {:?}）",
-                        code,
-                        s.days.len(),
-                        s.latest().map(|d| d.date.as_str())
-                    );
-                    s
-                }
-                Err(e) => {
-                    log::warn!("[资金流] {} 抓取失败: {}", code, e);
-                    MoneyFlowSummary::default()
-                }
+    let code_s = code.to_string();
+    if tokio::runtime::Handle::try_current().is_err() {
+        return MoneyFlowSummary::default();
+    }
+    crate::block_on_async(async move {
+        match fetch_flow_history_async(&client, &code_s, lmt).await {
+            Ok(s) => {
+                log::info!(
+                    "[资金流] {} 取得 {} 天数据（最新 {:?}）",
+                    code_s,
+                    s.days.len(),
+                    s.latest().map(|d| d.date.as_str())
+                );
+                s
             }
-        })
+            Err(e) => {
+                log::warn!("[资金流] {} 抓取失败: {}", code_s, e);
+                MoneyFlowSummary::default()
+            }
+        }
     })
 }
 
 pub fn fetch_intraday_shape_blocking(client: &reqwest::Client, code: &str) -> IntradayShape {
-    let handle = match tokio::runtime::Handle::try_current() {
-        Ok(h) => h,
-        Err(_) => return IntradayShape::default(),
-    };
+    // 修复 Top10#5: 同上, 统一 block_on_async
     let client = client.clone();
-    let code = code.to_string();
-    tokio::task::block_in_place(|| {
-        handle.block_on(async move {
-            match fetch_intraday_shape_async(&client, &code).await {
-                Ok(s) => {
-                    log::info!(
-                        "[分时] {} {} open={:+.2}% high={:+.2}% close={:+.2}% tail30={:+.2}% 形态={}",
-                        code, s.date, s.open_pct, s.high_pct, s.close_pct, s.tail_30m_pct, s.shape_label
-                    );
-                    s
-                }
-                Err(e) => {
-                    log::warn!("[分时] {} 抓取失败: {}", code, e);
-                    IntradayShape::default()
-                }
+    let code_s = code.to_string();
+    if tokio::runtime::Handle::try_current().is_err() {
+        return IntradayShape::default();
+    }
+    crate::block_on_async(async move {
+        match fetch_intraday_shape_async(&client, &code_s).await {
+            Ok(s) => {
+                log::info!(
+                    "[分时] {} {} open={:+.2}% high={:+.2}% close={:+.2}% tail30={:+.2}% 形态={}",
+                    code_s, s.date, s.open_pct, s.high_pct, s.close_pct, s.tail_30m_pct, s.shape_label
+                );
+                s
             }
-        })
+            Err(e) => {
+                log::warn!("[分时] {} 抓取失败: {}", code_s, e);
+                IntradayShape::default()
+            }
+        }
     })
 }
 

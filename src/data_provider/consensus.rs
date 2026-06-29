@@ -198,19 +198,20 @@ pub async fn fetch_async(client: &reqwest::Client, code: &str) -> Result<Consens
 
 /// 同步包装：在已有 tokio runtime 上下文内调用
 pub fn fetch_blocking(client: &reqwest::Client, code: &str) -> Option<ConsensusData> {
-    let handle = tokio::runtime::Handle::try_current().ok()?;
+    // 修复 Top10#5 (2026-06-29 audit): 用 crate::block_on_async 统一替代
+    if tokio::runtime::Handle::try_current().is_err() {
+        return None;
+    }
     let client = client.clone();
-    let code = code.to_string();
-    tokio::task::block_in_place(|| {
-        handle.block_on(async move {
-            match fetch_async(&client, &code).await {
-                Ok(v) => Some(v),
-                Err(e) => {
-                    log::warn!("[一致预期] {} 拉取失败: {}", code, e);
-                    None
-                }
+    let code_s = code.to_string();
+    crate::block_on_async(async move {
+        match fetch_async(&client, &code_s).await {
+            Ok(v) => Some(v),
+            Err(e) => {
+                log::warn!("[一致预期] {} 拉取失败: {}", code_s, e);
+                None
             }
-        })
+        }
     })
 }
 

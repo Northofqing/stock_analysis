@@ -131,24 +131,22 @@ pub fn fetch_blocking(
     klt: u8,
     lmt: usize,
 ) -> Vec<MinuteBar> {
-    let handle = match tokio::runtime::Handle::try_current() {
-        Ok(h) => h,
-        Err(_) => return Vec::new(),
-    };
+    // 修复 Top10#5 (2026-06-29 audit): 用 crate::block_on_async 统一替代
+    if tokio::runtime::Handle::try_current().is_err() {
+        return Vec::new();
+    }
     let client = client.clone();
-    let code = code.to_string();
-    tokio::task::block_in_place(|| {
-        handle.block_on(async move {
-            match fetch_async(&client, &code, klt, lmt).await {
-                Ok(b) => {
-                    log::info!("[分钟K线] {} klt={} 取得 {} 根", code, klt, b.len());
-                    b
-                }
-                Err(e) => {
-                    log::warn!("[分钟K线] {} klt={} 抓取失败: {}", code, klt, e);
-                    Vec::new()
-                }
+    let code_s = code.to_string();
+    crate::block_on_async(async move {
+        match fetch_async(&client, &code_s, klt, lmt).await {
+            Ok(b) => {
+                log::info!("[分钟K线] {} klt={} 取得 {} 根", code_s, klt, b.len());
+                b
             }
-        })
+            Err(e) => {
+                log::warn!("[分钟K线] {} klt={} 抓取失败: {}", code_s, klt, e);
+                Vec::new()
+            }
+        }
     })
 }

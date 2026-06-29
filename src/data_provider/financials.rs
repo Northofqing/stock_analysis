@@ -450,16 +450,14 @@ pub async fn fetch_with_fallback_async(client: &reqwest::Client, code: &str) -> 
 
 /// 同步包装：在已有 tokio runtime 上下文内调用；无 runtime 时返回 Default。
 pub fn fetch_with_fallback_blocking(client: &reqwest::Client, code: &str) -> Financials {
-    let handle = match tokio::runtime::Handle::try_current() {
-        Ok(h) => h,
-        Err(_) => {
-            log::debug!("[财报] 无 tokio runtime，跳过财报抓取");
-            return Financials::default();
-        }
-    };
+    // 修复 Top10#5 (2026-06-29 audit): 用 crate::block_on_async 统一替代
+    if tokio::runtime::Handle::try_current().is_err() {
+        log::debug!("[财报] 无 tokio runtime，跳过财报抓取");
+        return Financials::default();
+    }
     let client = client.clone();
-    let code = code.to_string();
-    tokio::task::block_in_place(|| {
-        handle.block_on(async move { fetch_with_fallback_async(&client, &code).await })
+    let code_s = code.to_string();
+    crate::block_on_async(async move {
+        fetch_with_fallback_async(&client, &code_s).await
     })
 }

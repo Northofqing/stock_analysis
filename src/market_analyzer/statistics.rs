@@ -219,18 +219,17 @@ fn fetch_sector_rankings_impl(top_n: usize) -> Result<Vec<(String, f64)>> {
             .timeout(Duration::from_secs(8))
             .build()
             .context("创建 HTTP 客户端失败 (sector)")?;
-        let resp_text = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                client
-                    .get(url)
-                    .query(params)
-                    .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
-                    .header("Referer", "https://quote.eastmoney.com/")
-                    .send()
-                    .await?
-                    .text()
-                    .await
-            })
+        // 修复 Top10#5 (2026-06-29 audit): 用统一 block_on_async 替代 block_in_place + Handle::current().block_on
+        let resp_text = crate::block_on_async(async {
+            client
+                .get(url)
+                .query(params)
+                .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+                .header("Referer", "https://quote.eastmoney.com/")
+                .send()
+                .await?
+                .text()
+                .await
         })
         .map_err(|e: reqwest::Error| anyhow::anyhow!("板块接口 HTTP 失败: {e}"))?;
 
