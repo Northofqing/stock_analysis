@@ -48,7 +48,7 @@ keywords = [
 [[rules]]
 chain = "AI硬件-光纤光缆"
 category = "AI硬件"
-priority = 95
+priority = 100
 logic = "数据中心高速互联升级，光纤预制棒到MPO/MTP连接环节景气抬升"
 board_keyword = "光通信"
 keywords = [
@@ -90,7 +90,7 @@ category = "AI硬件"
 # 比同等候选(如 半导体-AI芯片 90) 优先匹配, 提升推送质量.
 # AGENTS §2.9 边界证明: 27 条 verify 样本在 5% 置信水平下 ±18% 误差,
 # 真实胜率区间 26%-62% — 仍显著高于其它主题, 加权合理.
-priority = 95
+priority = 100
 logic = "电子布提价+AI服务器PCB需求激增，HDI与IC载板持续升级"
 board_keyword = "PCB"
 keywords = [
@@ -105,7 +105,7 @@ keywords = [
 [[rules]]
 chain = "AI硬件-MLCC"
 category = "AI硬件"
-priority = 90
+priority = 100
 logic = "AI服务器MLCC用量从2000颗激增至数十万颗，被动元件持续受益"
 board_keyword = "MLCC"
 # BR-006 修正 (PR-3 数据回灌后): 原 0% 实际是 R-3 stock_daily 数据断层假象,
@@ -122,7 +122,7 @@ keywords = [
 [[rules]]
 chain = "AI硬件-NVLink"
 category = "AI硬件"
-priority = 95
+priority = 100
 logic = "英伟达NVLink/InfiniBand高速互联技术迭代，拉动配套硬件需求"
 board_keyword = "英伟达"
 keywords = [
@@ -133,7 +133,7 @@ keywords = [
 [[rules]]
 chain = "AI硬件-交换芯片"
 category = "AI硬件"
-priority = 95
+priority = 100
 logic = "AI集群网络从IB向高速以太网并进，交换芯片与交换机环节受益"
 board_keyword = "交换芯片"
 keywords = [
@@ -145,7 +145,7 @@ keywords = [
 [[rules]]
 chain = "AI算力"
 category = "AI硬件"
-priority = 60
+priority = 100
 logic = "算力基建持续扩张，国产GPU+算力租赁+智算中心三线并进"
 board_keyword = "算力"
 # BR-006 修正 (PR-3 数据回灌后): 原 0% 实际是 R-3 数据断层假象,
@@ -162,7 +162,7 @@ keywords = [
 [[rules]]
 chain = "数据中心-机房建设"
 category = "AI硬件"
-priority = 92
+priority = 100
 logic = "AIDC与智算中心建设提速，机房工程与模块化基础设施进入扩张周期"
 board_keyword = "数据中心"
 keywords = [
@@ -174,7 +174,7 @@ keywords = [
 [[rules]]
 chain = "数据中心-供配电温控"
 category = "AI硬件"
-priority = 92
+priority = 100
 logic = "高功率密度机房驱动供配电与温控升级，UPS/HVDC/温控环节持续受益"
 board_keyword = "数据中心"
 keywords = [
@@ -187,7 +187,7 @@ keywords = [
 [[rules]]
 chain = "Rubin"
 category = "AI硬件"
-priority = 95
+priority = 100
 logic = "英伟达Rubin下一代AI芯片平台发布，拉动产业链备货需求"
 board_keyword = "英伟达"
 # BR-006 修正 (PR-3 数据回灌后): 原 0% 实际是 R-3 数据断层假象,
@@ -202,7 +202,7 @@ keywords = [
 [[rules]]
 chain = "AI硬件-服务器电源"
 category = "AI硬件"
-priority = 90
+priority = 100
 logic = "AI服务器功耗激增，电源功率密度升级与冗余配置需求爆发"
 board_keyword = "算力"
 keywords = [
@@ -218,7 +218,7 @@ keywords = [
 [[rules]]
 chain = "半导体-先进封装"
 category = "半导体"
-priority = 95
+priority = 100
 logic = "Chiplet与HBM推动先进封装扩产，CoWoS/玻璃基板/PLP技术迭代"
 board_keyword = "先进封装"
 # BR-006 二轮: 0% 胜率 (12 推送 / 0 命中), 关停. AGENTS §2.9 边界证明:
@@ -235,7 +235,7 @@ keywords = [
 [[rules]]
 chain = "半导体-玻璃基板"
 category = "半导体"
-priority = 92
+priority = 100
 logic = "先进封装向玻璃基板与TGV演进，带动设备材料与加工环节景气提升"
 board_keyword = "先进封装"
 keywords = [
@@ -251,7 +251,7 @@ category = "半导体"
 # 在 BR-002 互斥下比 PCB (95) 优先, 比 AI硬件子类优先.
 # AGENTS §2.9 边界证明: 41 样本 ±13% (95% CI), 胜率区间 60-86%,
 # 显著高于其它 AI 主题 0%, 加权合理.
-priority = 96
+priority = 100
 logic = "国产替代+晶圆厂扩产周期，半导体设备国产化率持续提升"
 board_keyword = "光刻机"
 keywords = [
@@ -264,7 +264,7 @@ keywords = [
 [[rules]]
 chain = "半导体-材料"
 category = "半导体"
-priority = 90
+priority = 100
 logic = "半导体材料国产替代加速，从光刻胶到电子气体的全链条突破"
 board_keyword = "光刻胶"
 keywords = [
@@ -278,7 +278,7 @@ keywords = [
 [[rules]]
 chain = "半导体-存储芯片"
 category = "半导体"
-priority = 85
+priority = 100
 logic = "存储芯片涨价周期+国产NAND/DRAM突破，存储产业链价值重估"
 board_keyword = "存储芯片"
 keywords = [
@@ -295,7 +295,7 @@ category = "半导体"
 # 因样本 82 vs 41/7 较多, 胜率波动空间大, 留余量).
 # AGENTS §2.9 边界证明: 82 样本 ±10% (95% CI), 胜率区间 54-74%,
 # 是半导体细分明确赢家. 之前的 0% 是 R-3 数据断层假象.
-priority = 88
+priority = 100
 logic = "成熟制程产能爬坡+先进制程突破，代工格局重塑"
 board_keyword = "半导体"
 # BR-006 修正 (PR-3 数据回灌后): 原 0% 是 R-3 数据断层假象,
@@ -309,7 +309,7 @@ keywords = [
 [[rules]]
 chain = "半导体-AI芯片"
 category = "半导体"
-priority = 90
+priority = 100
 logic = "国产AI芯片在训练与推理两侧加速渗透，ASIC定制化趋势明确"
 board_keyword = "AI芯片"
 keywords = [
@@ -322,7 +322,7 @@ keywords = [
 [[rules]]
 chain = "半导体-EDA/IP"
 category = "半导体"
-priority = 88
+priority = 100
 logic = "自主可控驱动EDA工具链与IP核加速替代，设计环节价值提升"
 board_keyword = "EDA"
 keywords = [
@@ -333,7 +333,7 @@ keywords = [
 [[rules]]
 chain = "半导体-功率半导体"
 category = "半导体"
-priority = 85
+priority = 100
 logic = "新能源车与电力电子拉动，SiC/GaN/IGBT功率器件需求持续增长"
 board_keyword = "功率半导体"
 keywords = [
@@ -344,7 +344,7 @@ keywords = [
 [[rules]]
 chain = "半导体-RISC-V"
 category = "半导体"
-priority = 85
+priority = 100
 logic = "RISC-V开放架构在全球半导体博弈中的战略价值持续提升"
 board_keyword = "RISC-V"
 keywords = [
@@ -363,7 +363,7 @@ generic = true
 # 略微提升兜底匹配位置.
 # AGENTS §2.9 边界证明: 103 条样本 ±8.5% 误差, 胜率区间 19%-36%,
 # 仍优于 0% 主题 (0%) 和稀有金属 1.5%, 加权合理.
-priority = 35
+priority = 100
 logic = "国产替代+扩产周期，半导体产业链整体受益"
 board_keyword = "半导体"
 keywords = [
@@ -378,7 +378,7 @@ keywords = [
 [[rules]]
 chain = "AI终端"
 category = "AI应用"
-priority = 85
+priority = 100
 logic = "端侧大模型落地带动AI手机/AIPC/AI眼镜换机周期"
 board_keyword = "AI手机"
 keywords = [
@@ -392,7 +392,7 @@ keywords = [
 chain = "AI应用"
 category = "AI应用"
 generic = true
-priority = 80
+priority = 100
 logic = "AI Agent与行业大模型从概念走向落地，应用层百花齐放"
 board_keyword = "人工智能"
 keywords = [
@@ -406,7 +406,7 @@ keywords = [
 [[rules]]
 chain = "智能驾驶"
 category = "AI应用"
-priority = 85
+priority = 100
 logic = "L3级自动驾驶政策破冰+端到端大模型重塑智驾技术路线"
 board_keyword = "无人驾驶"
 keywords = [
@@ -420,7 +420,7 @@ keywords = [
 [[rules]]
 chain = "消费电子"
 category = "AI应用"
-priority = 80
+priority = 100
 logic = "AI终端换机周期与新品创新共振，消费电子产业链需求修复"
 board_keyword = "消费电子"
 # BR-006 二轮: 0% 胜率 (6 推送 / 0 命中), 关停. AGENTS §2.9 边界证明:
@@ -444,7 +444,7 @@ category = "新能源"
 # 与 半导体-设备 平级, 体现 100% 胜率优势.
 # AGENTS §2.9 边界证明: 7 样本虽小 (±36% 95% CI), 但 7/7 (p<0.001 单侧,
 # 二项分布单边概率) — 显著优于通用主题. 等样本量到 30+ 再决定进一步加权.
-priority = 96
+priority = 100
 logic = "固态电池技术路线收敛，硫化物路线与产业化进程加速"
 board_keyword = "固态电池"
 keywords = [
@@ -459,7 +459,7 @@ category = "新能源"
 # 加权二轮: 真实胜率 33.3% (7/21), 显著高于 0% 主题. priority 90→92
 # AGENTS §2.9 边界证明: 21 样本 ±20% (95% CI), 胜率区间 13-53%,
 # 优于均值 (8.6% 全库胜率). 加权到 92 是保守提升, 不与固态电池 (96) 平级.
-priority = 92
+priority = 100
 logic = "钠离子电池量产线投产，成本优势打开储能与两轮车替代空间"
 board_keyword = "钠离子电池"
 keywords = [
@@ -474,7 +474,7 @@ category = "新能源"
 # 加权三轮: 真实胜率 45.5% (5/11), 显著高于 0% 主题. priority 60→80
 # AGENTS §2.9 边界证明: 11 样本虽小 (±28% 95% CI), 但 5/11 (p<0.05 单侧
 # vs 30% 期望) — 真信号. 加权到 80 是中等提升, 不与新能源-固态 (96) 平级.
-priority = 80
+priority = 100
 logic = "锂电池技术迭代+成本下降+储能需求双轮驱动"
 board_keyword = "锂电池"
 keywords = [
@@ -487,7 +487,7 @@ keywords = [
 [[rules]]
 chain = "新能源-光伏"
 category = "新能源"
-priority = 65
+priority = 100
 logic = "钙钛矿叠层效率突破+光伏出海加速+行业供需再平衡"
 board_keyword = "光伏"
 keywords = [
@@ -500,7 +500,7 @@ keywords = [
 [[rules]]
 chain = "新能源-氢能"
 category = "新能源"
-priority = 80
+priority = 100
 logic = "氢能纳入国家能源体系，绿氢制备与燃料电池示范城市群加速"
 board_keyword = "氢能"
 keywords = [
@@ -516,7 +516,7 @@ category = "新能源"
 # 加权三轮: 真实胜率 51.2% (22/43), 显著高于均值. priority 75→88
 # AGENTS §2.9 边界证明: 43 样本 ±15% (95% CI), 胜率区间 36-66%,
 # 是储能赛道明显赢家. 加权到 88 是中等提升, 不与新能源-固态 (96) 平级.
-priority = 88
+priority = 100
 logic = "新型储能装机持续超预期，独立储能商业模式逐步跑通"
 board_keyword = "储能"
 keywords = [
@@ -534,7 +534,7 @@ keywords = [
 [[rules]]
 chain = "新能源-电池"
 category = "新能源"
-priority = 0
+priority = 100
 enabled = false
 logic = "历史归类不一致兜底 (prediction_tracker 历史 theme_name, config 已细化). 仅 audit."
 board_keyword = "锂电池"
@@ -547,7 +547,7 @@ keywords = []
 [[rules]]
 chain = "电力-变压器"
 category = "电力电网"
-priority = 85
+priority = 100
 logic = "算力扩容+电网升级+新能源并网三重共振，变压器进入长景气周期"
 board_keyword = "特高压"
 keywords = [
@@ -560,7 +560,7 @@ keywords = [
 [[rules]]
 chain = "电力-智能电网"
 category = "电力电网"
-priority = 80
+priority = 100
 logic = "新型电力系统建设加速，配网自动化与电网数字化投资高增"
 board_keyword = "智能电网"
 keywords = [
@@ -573,7 +573,7 @@ keywords = [
 [[rules]]
 chain = "电力-虚拟电厂"
 category = "电力电网"
-priority = 85
+priority = 100
 logic = "电力市场化改革深化，需求侧响应与虚拟电厂聚合交易加速"
 board_keyword = "虚拟电厂"
 keywords = [
@@ -586,7 +586,7 @@ keywords = [
 [[rules]]
 chain = "电力-绿色电力"
 category = "电力电网"
-priority = 75
+priority = 100
 logic = "绿电交易扩容+消纳机制完善+碳市场联动，绿电价值重估"
 board_keyword = "绿色电力"
 keywords = [
@@ -603,7 +603,7 @@ keywords = [
 [[rules]]
 chain = "机器人"
 category = "机器人"
-priority = 80
+priority = 100
 logic = "人形机器人从实验室走向产线，具身智能+产业基金+量产预期驱动"
 board_keyword = "机器人"
 keywords = [
@@ -621,7 +621,7 @@ keywords = [
 [[rules]]
 chain = "低空经济"
 category = "高端制造"
-priority = 85
+priority = 100
 logic = "低空空域管理改革+适航认证加速+eVTOL商业化运营在即"
 board_keyword = "低空经济"
 keywords = [
@@ -634,7 +634,7 @@ keywords = [
 [[rules]]
 chain = "商业航天"
 category = "高端制造"
-priority = 85
+priority = 100
 logic = "卫星互联网纳入新基建+可回收火箭突破+商业发射密度提升"
 board_keyword = "商业航天"
 keywords = [
@@ -659,7 +659,7 @@ keywords = [
 [[rules]]
 chain = "量子计算"
 category = "高端制造"
-priority = 80
+priority = 100
 logic = "量子计算里程碑式突破，量子芯片+量子通信实用化加速"
 board_keyword = "量子计算"
 keywords = [
@@ -672,7 +672,7 @@ keywords = [
 [[rules]]
 chain = "稀土永磁"
 category = "高端制造"
-priority = 80
+priority = 100
 logic = "稀土供给管控+人形机器人/新能源车拉动永磁需求结构性增长"
 board_keyword = "稀土永磁"
 # BR-006 二轮: 0% 胜率 (15 推送 / 0 命中), 关停. AGENTS §2.9 边界证明:
@@ -703,7 +703,7 @@ keywords = [
 [[rules]]
 chain = "可控核聚变"
 category = "高端制造"
-priority = 85
+priority = 100
 logic = "全球核聚变装置建设提速，超导磁体与真空腔体等环节进入景气验证期"
 board_keyword = "可控核聚变"
 keywords = [
@@ -731,7 +731,7 @@ keywords = [
 [[rules]]
 chain = "城市更新"
 category = "政策驱动"
-priority = 70
+priority = 100
 logic = "15万亿城市更新规划落地，管网改造与城中村项目密集开工"
 board_keyword = "地下管网"
 keywords = [
@@ -743,7 +743,7 @@ keywords = [
 [[rules]]
 chain = "节能降碳"
 category = "政策驱动"
-priority = 70
+priority = 100
 logic = "双碳目标+9大行业三年改造行动，高耗能行业绿色转型提速"
 board_keyword = "节能环保"
 keywords = [
@@ -756,7 +756,7 @@ keywords = [
 [[rules]]
 chain = "新能源-重卡"
 category = "政策驱动"
-priority = 75
+priority = 100
 logic = "11部门推动2030年新能源重卡渗透率达40%，商用车电动化加速"
 board_keyword = "新能源重卡"
 keywords = [
@@ -771,7 +771,7 @@ category = "政策驱动"
 # 加权 (BR-008): 真实胜率 36.8% (7/19), ≥30% 门槛. priority 78→85
 # AGENTS §2.9 边界证明: 19 样本虽小 (±21% 95% CI), 胜率区间 16-58%,
 # 但 36.8% 显著高于均值, 加权合理. 等样本到 50+ 再决定进一步加权.
-priority = 85
+priority = 100
 logic = "创新药出海与医保谈判常态化并进，CXO与特色原料药景气修复"
 board_keyword = "创新药"
 # BR-006 修正 (PR-3 数据回灌后): 原 0% 是 R-3 数据断层假象,
