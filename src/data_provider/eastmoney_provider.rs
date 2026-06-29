@@ -5,6 +5,7 @@
 
 use super::limit_status::apply_limit_flags_inplace;
 use super::{DataProvider, KlineData};
+use crate::errors::ProviderError;
 use anyhow::{Context, Result, anyhow};
 use chrono::NaiveDate;
 use serde::Deserialize;
@@ -82,7 +83,7 @@ impl HttpProvider {
         // 每个 host 最多尝试 2 次，总尝试数 = host 数 * 2。
         const MAX_ATTEMPTS_PER_HOST: u32 = 2;
         let max_attempts: u32 = (KLINE_HOSTS.len() as u32) * MAX_ATTEMPTS_PER_HOST;
-        let mut last_err: Option<anyhow::Error> = None;
+        let mut last_err: Option<ProviderError> = None;
 
         // 截断超长错误信息（reqwest 错误会内嵌完整 URL），避免日志刷屏。
         fn brief(s: String) -> String {
@@ -122,7 +123,7 @@ impl HttpProvider {
                         "[HTTP] 请求失败 (attempt {}/{} host={} code={}): {}",
                         attempt, max_attempts, host, code, brief(e.to_string())
                     );
-                    last_err = Some(anyhow!("HTTP请求失败: {}", brief(e.to_string())));
+                    last_err = Some(ProviderError::Other { provider: "eastmoney".into(), detail: format!("HTTP请求失败: {}", brief(e.to_string())) });
                     if attempt < max_attempts {
                         tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
                     }
@@ -142,7 +143,7 @@ impl HttpProvider {
                     "[HTTP] 响应状态 {} (attempt {}/{} host={} code={})",
                     status, attempt, max_attempts, host, code
                 );
-                last_err = Some(anyhow!("HTTP请求返回错误状态: {}", status));
+                last_err = Some(ProviderError::Other { provider: "eastmoney".into(), detail: format!("HTTP请求返回错误状态: {}", status) });
                 if attempt < max_attempts {
                     tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
                 }
@@ -156,7 +157,7 @@ impl HttpProvider {
                         "[HTTP] 读取响应失败 (attempt {}/{} host={} code={}): {}",
                         attempt, max_attempts, host, code, brief(e.to_string())
                     );
-                    last_err = Some(anyhow!("读取响应失败: {}", brief(e.to_string())));
+                    last_err = Some(ProviderError::ParseError { detail: format!("读取响应失败: {}", brief(e.to_string())) });
                     if attempt < max_attempts {
                         tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
                     }
@@ -169,7 +170,7 @@ impl HttpProvider {
                     "[HTTP] 响应为空 (attempt {}/{} host={} code={})",
                     attempt, max_attempts, host, code
                 );
-                last_err = Some(anyhow!("API返回空响应"));
+                last_err = Some(ProviderError::NotFound { code: code.to_string() });
                 if attempt < max_attempts {
                     tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
                 }
@@ -193,7 +194,7 @@ impl HttpProvider {
                         e,
                         brief(text.clone())
                     );
-                    last_err = Some(e);
+                    last_err = Some(ProviderError::ParseError { detail: format!("解析失败: {} - {}", e, brief(text.clone())) });
                     if attempt < max_attempts {
                         tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
                     }
@@ -203,7 +204,7 @@ impl HttpProvider {
         }
 
         // 所有重试都失败：打印一次终态错误，避免上游再次重复输出
-        let err = last_err.unwrap_or_else(|| anyhow!("HTTP请求失败（未知错误）"));
+        let err = last_err.map(|e| anyhow::Error::from(e)).unwrap_or_else(|| anyhow!("HTTP请求失败（未知错误）"));
         log::error!("[HTTP] 重试 {} 次后仍失败: {}", max_attempts, err);
         Err(err)
     }
