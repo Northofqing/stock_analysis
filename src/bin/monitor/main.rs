@@ -37,6 +37,10 @@ mod notify;
 use notify::{summarize_push_text, evaluate_opportunity_push_skip_reason};
 
 mod market_data;
+
+// 修复 Top10#3+#4 (2026-06-29 audit): 拆大文件
+mod freshness;
+pub use freshness::{validate_position_freshness, validate_quote_freshness, validate_nav_freshness, monitor_freshness_config};
 pub enum DaemonReadySource {
     Reused,
     StartedNow,
@@ -1834,97 +1838,6 @@ fn build_price_map(quotes: &[stock_analysis::market_data::TopStock]) -> std::col
     quotes.iter().map(|q| (q.code.clone(), q.price)).collect()
 }
 
-fn monitor_freshness_config() -> stock_analysis::monitor::data_quality::FreshnessConfig {
-    let cfg = stock_analysis::config::get_monitor_config();
-    stock_analysis::monitor::data_quality::FreshnessConfig {
-        quote_max_age_secs: cfg.dq_quote_stale_sec,
-        position_max_age_secs: cfg.dq_position_stale_sec,
-        nav_max_age_secs: cfg.dq_nav_stale_sec,
-        daily_max_age_secs: cfg.dq_daily_stale_sec,
-    }
-}
-
-pub fn validate_position_freshness(fetch_time: chrono::DateTime<chrono::Local>) -> bool {
-    let stats = stock_analysis::monitor::data_quality::DqStats::new();
-    let freshness = monitor_freshness_config();
-    match stock_analysis::monitor::data_quality::validate_freshness(
-        stock_analysis::monitor::data_quality::FreshnessDataType::Position,
-        fetch_time,
-        &freshness,
-        &stats,
-    ) {
-        Ok(()) => true,
-        Err(reason) => {
-            log::warn!(
-                "[DQ_FRESHNESS] rule_id=AGENTS-2.4 data_type=position action=reject reason={} timestamp={}",
-                reason.label(),
-                chrono::Utc::now().timestamp()
-            );
-            false
-        }
-    }
-}
-
-pub fn validate_quote_freshness(update_time: chrono::DateTime<chrono::Local>, source: &str, code: &str) -> bool {
-    // AGENTS 2.4 指定为“实时行情(盘中) 5 秒”，非盘中时段不做 5 秒硬拦截。
-    if !matches!(
-        current_session(),
-        MarketSession::Auction | MarketSession::Morning | MarketSession::Afternoon
-    ) {
-        return true;
-    }
-
-    let stats = stock_analysis::monitor::data_quality::DqStats::new();
-    let freshness = monitor_freshness_config();
-    match stock_analysis::monitor::data_quality::validate_freshness(
-        stock_analysis::monitor::data_quality::FreshnessDataType::Quote,
-        update_time,
-        &freshness,
-        &stats,
-    ) {
-        Ok(()) => true,
-        Err(reason) => {
-            log::warn!(
-                "[DQ_FRESHNESS] rule_id=AGENTS-2.4 data_type=quote action=reject source={} code={} reason={} timestamp={}",
-                source,
-                code,
-                reason.label(),
-                chrono::Utc::now().timestamp()
-            );
-            false
-        }
-    }
-}
-
-fn validate_nav_freshness(nav_date: chrono::NaiveDate) -> bool {
-    let stats = stock_analysis::monitor::data_quality::DqStats::new();
-    let base = monitor_freshness_config();
-    let freshness = stock_analysis::monitor::data_quality::FreshnessConfig {
-        quote_max_age_secs: base.quote_max_age_secs,
-        position_max_age_secs: base.position_max_age_secs,
-        nav_max_age_secs: base.nav_max_age_secs,
-        daily_max_age_secs: base.nav_max_age_secs,
-    };
-    match stock_analysis::monitor::data_quality::validate_daily_freshness(
-        nav_date,
-        chrono::Local::now(),
-        &freshness,
-        &stats,
-    ) {
-        Ok(()) => true,
-        Err(reason) => {
-            log::warn!(
-                "[DQ_FRESHNESS] rule_id=AGENTS-2.4 data_type=nav action=reject reason={} nav_date={} timestamp={}",
-                reason.label(),
-                nav_date,
-                chrono::Utc::now().timestamp()
-            );
-            false
-        }
-    }
-}
-
-/// 计算最近 n 日收盘均价；K 线不足 n 条返回 None（避免误导结构止损 / 轮动判断）
 fn compute_ma(kline: &[stock_analysis::data_provider::KlineData], n: usize) -> Option<f64> {
     if n == 0 || kline.len() < n { return None; }
     let sum: f64 = kline.iter().rev().take(n).map(|k| k.close).sum();
