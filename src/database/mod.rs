@@ -650,6 +650,40 @@ impl DatabaseManager {
         Ok(row.cnt)
     }
 
+    /// 修复 v9.2 M1 性能: 批量查询近 N 天被 push 的 stock_code 集合
+    /// 一次 SQL 查所有 stock_code, 避免 discover() 内 N×M 次 sync DB round-trip
+    /// 阻塞 async runtime. 返回 HashSet 含所有近 N 天内被 push 过的 stock_code.
+    pub fn count_recent_pushes_batch(
+        &self,
+        stock_codes: &[String],
+        days: i64,
+    ) -> Result<std::collections::HashSet<String>, Box<dyn std::error::Error>> {
+        if stock_codes.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let mut conn = self.get_conn()?;
+        let cutoff = (chrono::Local::now() - chrono::Duration::days(days))
+            .format("%Y-%m-%d")
+            .to_string();
+        // 用 IN (...), 一次查所有 stock_code
+        let codes_csv = stock_codes
+            .iter()
+            .map(|c| format!("'{}'", c.replace('\'', "''"))) // 防 SQL injection
+            .collect::<Vec<_>>()
+            .join(",");
+        #[derive(serde::Serialize, serde::Deserialize, diesel::QueryableByName)]
+        struct CodeRow {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            stock_code: String,
+        }
+        let raw = format!(
+            "SELECT DISTINCT stock_code FROM prediction_tracker WHERE stock_code IN ({}) AND pred_date >= '{}'",
+            codes_csv, cutoff
+        );
+        let rows: Vec<CodeRow> = diesel::sql_query(raw).load::<CodeRow>(&mut *conn)?;
+        Ok(rows.into_iter().map(|r| r.stock_code).collect())
+    }
+
     /// 读取近窗期主题签名（按最新时间倒序）
     pub fn get_recent_topic_history_signatures(
         &self,

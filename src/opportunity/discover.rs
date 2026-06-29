@@ -118,15 +118,23 @@ fn reason_summary(hit: &ChainHit, s: &super::chain_mapper::StockInfo, b: ScoreBr
 
 /// 修复 v9.2 BR-001: 同一只票近 3 个日历日最多推送 1 次
 /// (注: 实际按日历日计算, 非交易日 — 见 business_rules.md BR-001 YAGNI 说明)
-fn is_recently_pushed(code: &str) -> bool {
-    // DB 不可用时放行, 不阻断业务
+/// 修复 v9.2 M1 性能: 改成批量查询 (HashSet O(1)) 替代每次 sync DB round-trip.
+/// 旧版本 `is_recently_pushed` 每个 stock 1 次 SQLite 查询, N×M 个 query 阻塞
+/// async runtime (discover 被 run_opportunity_scan / run_post_close_candidates 调).
+fn load_recently_pushed_codes(
+    candidate_codes: &[String],
+    days: i64,
+) -> std::collections::HashSet<String> {
     let db = match std::panic::catch_unwind(crate::database::DatabaseManager::get) {
         Ok(db) => db,
-        Err(_) => return false,
+        Err(_) => return std::collections::HashSet::new(), // DB 不可用 → 不阻断
     };
-    match db.count_recent_pushes(code, 3) {
-        Ok(n) => n > 0,
-        Err(_) => false,
+    match db.count_recent_pushes_batch(candidate_codes, days) {
+        Ok(set) => set,
+        Err(e) => {
+            log::warn!("[Discover] count_recent_pushes_batch 失败: {}, BR-001 放行", e);
+            std::collections::HashSet::new()
+        }
     }
 }
 
@@ -139,7 +147,26 @@ pub fn discover(
     let exclude: std::collections::HashSet<&str> = exclude_codes.iter().map(|c| c.as_str()).collect();
     let mut scored: Vec<(f64, Candidate)> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut all_codes: Vec<String> = Vec::new();
 
+    // 第一遍: 收集所有 candidate codes (dedup) 给批量 BR-001 查询用
+    for hit in hits {
+        if hit.stocks.is_empty() { continue; }
+        for s in &hit.stocks {
+            if exclude.contains(s.code.as_str()) { continue; }
+            if s.code.starts_with('8') || s.code.starts_with('4') || s.code.starts_with("688") {
+                continue;
+            }
+            if !seen.insert(s.code.clone()) { continue; } // 去重
+            all_codes.push(s.code.clone());
+        }
+    }
+
+    // 一次批量查 BR-001 (近 3 日历日已推), 替代 N 次 sync DB round-trip
+    let recently_pushed = load_recently_pushed_codes(&all_codes, 3);
+
+    // 第二遍: 真正的发现循环 (BR-001 用 HashSet O(1) 查, 不再 sync DB)
+    seen.clear(); // 重置 for 第二遍
     for hit in hits {
         if hit.stocks.is_empty() { continue; }
 
@@ -150,8 +177,8 @@ pub fn discover(
             }
             if !seen.insert(s.code.clone()) { continue; } // 去重
 
-            // 修复 BR-001: 同一只票近 3 个交易日已推 → 跳过
-            if is_recently_pushed(&s.code) {
+            // BR-001: 同一只票近 3 日历日已推 → 跳过 (HashSet O(1) 查, 0 次 DB)
+            if recently_pushed.contains(&s.code) {
                 log::debug!("[Discover] {} 近 3 日已推过, 跳过 (BR-001)", s.code);
                 continue;
             }
