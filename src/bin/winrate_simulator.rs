@@ -21,16 +21,28 @@ use diesel::sql_types::{Text, Integer};
 use diesel::{QueryableByName, RunQueryDsl};
 use stock_analysis::database::DatabaseManager;
 
-/// BR-006 默认黑名单: 7 个 0% 主题. 与 chain_rules.toml 中 enabled=false 的 entry 对齐.
-const BR006_DEFAULT_BLACKLIST: &[&str] = &[
-    "AI硬件-液冷",
-    "AI硬件-CPO",
-    "AI硬件-MLCC",
-    "AI算力",
-    "Rubin",
-    "半导体-制造代工",
-    "创新药-CXO",
-];
+/// BR-006 默认黑名单: 从 config/chain_rules.toml 动态读取 enabled=false 的 entry.
+fn load_br006_default_blacklist() -> Vec<String> {
+    let toml_text = include_str!("../../config/chain_rules.toml");
+    #[derive(serde::Deserialize)]
+    struct Rule {
+        chain: String,
+        #[serde(default = "default_true")]
+        enabled: bool,
+    }
+    #[derive(serde::Deserialize)]
+    struct RulesFile {
+        rules: Vec<Rule>,
+    }
+    fn default_true() -> bool { true }
+    match toml::from_str::<RulesFile>(toml_text) {
+        Ok(file) => file.rules.into_iter().filter(|r| !r.enabled).map(|r| r.chain).collect(),
+        Err(e) => {
+            eprintln!("[winrate_simulator] 解析 chain_rules.toml 失败: {}, 使用空 fallback", e);
+            Vec::new()
+        }
+    }
+}
 
 #[derive(Debug, Clone, QueryableByName)]
 struct ThemeRow {
@@ -53,7 +65,7 @@ struct GlobalRow {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. 解析参数
     let args: Vec<String> = env::args().collect();
-    let mut blacklist: Vec<String> = BR006_DEFAULT_BLACKLIST.iter().map(|s| s.to_string()).collect();
+    let mut blacklist: Vec<String> = load_br006_default_blacklist();
     let mut days: Option<i64> = None;
     let mut explicit_min_samples: usize = 5; // 主题级最小样本, <此值不展示
 
