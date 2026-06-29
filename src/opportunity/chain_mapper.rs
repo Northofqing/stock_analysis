@@ -108,10 +108,11 @@ pub fn map_news_to_chains(title: &str) -> Vec<ChainHit> {
             .map(|s| s.as_str())
             .collect();
         if matched.is_empty() { continue; }
-        if hits.iter().any(|h| h.chain == *chain) { continue; }
 
         // BR-002 互斥: 只保留第 1 条命中 (按 priority 降序遍历, 优先级最高先匹配)
         // 注: 不再允许"一条快讯命中 N 条产业链"除非 AI 显式给出多条独立逻辑
+        // (历史 line 111 `hits.iter().any(|h| h.chain == *chain)` dedup 已删除 — BR-002
+        //  互斥覆盖了"最多 1 条"语义, 同 chain 不可能再被 push)
         if !hits.is_empty() {
             log::debug!("[ChainMapper] 互斥: {} 已命中, 跳过 {} (BR-002)", hits[0].chain, chain);
             continue;
