@@ -116,7 +116,13 @@ fn test_design_contradiction_fails_on_threshold_exceeding_clamp() {
         mutated != original,
         "应能找到 threshold = 60 这一行 (前置条件: config 必须已对齐)"
     );
-    std::fs::write(&cfg, &mutated).expect("应能写 opportunity.toml");
+    // 修复 v9.4.5 (2026-06-29): atomic rename 替换, 避免 bash subprocess 看到 fs cache 旧内容.
+    // --test-threads=2 并行跑时, std::fs::write 写入后立即 fork bash subprocess 读 cfg,
+    // bash 可能从 page cache 读到旧内容 (60) 而非新内容 (80), 触发 "应 FAIL" panic.
+    // std::fs::rename 在 POSIX 同文件系统下是 atomic, subprocess 之后 open 一定看到新内容.
+    let tmp = cfg.with_extension("toml.tmp");
+    std::fs::write(&tmp, &mutated).expect("应能写 tmp config");
+    std::fs::rename(&tmp, &cfg).expect("应能 rename tmp → cfg");
 
     // 修复 v9.4.3: 在 run_check 之前打印 cfg 状态, 排查 --test-threads=2 并行跑时偶发 "stderr 空"
     if std::env::var("TEST_VERBOSE").is_ok() {

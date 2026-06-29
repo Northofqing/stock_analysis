@@ -25,7 +25,15 @@ jobs:
         # cargo test 多个 --test binary 并行时 (默认 --test-threads 数量) 偶发 transient
         # 失败. 60e4297 已经加 WAL + busy_timeout, 但 e2e binary 数量增加 (现在 8 个) 后
         # SQLite 写锁竞争又触发边界. 限到 2 线程保留并行收益同时缓解.
-        run: cargo test --lib --test e2e --test test_data_freshness_check --test test_design_contradiction --test e2e_dedup --test chain_exclusive --test flash_filter --test e2e_prediction_verify --test ranking -- --test-threads=2
+        # 修复 v9.4.5 (2026-06-29): test_design_contradiction 单独跑 --test-threads=1, 避免
+        # test 内部 fs::write + bash subprocess 读 cfg 的 fd/cache race (atomic rename 仍偶发).
+        # 其他 test binary 维持 --test-threads=2.
+        run: |
+          set -e
+          echo "=== cargo test --lib + 7 个 test binary (--test-threads=2) ==="
+          cargo test --lib --test e2e --test test_data_freshness_check --test e2e_dedup --test chain_exclusive --test flash_filter --test e2e_prediction_verify --test ranking -- --test-threads=2
+          echo "=== cargo test --test test_design_contradiction (--test-threads=1, 避免 fs race) ==="
+          cargo test --test test_design_contradiction -- --test-threads=1
       - name: PR commits spec 引用检查 (PR 触发时)
         if: github.event_name == 'pull_request'
         run: |
