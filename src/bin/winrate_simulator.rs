@@ -49,8 +49,12 @@ fn load_br006_default_blacklist() -> (Vec<String>, std::collections::HashMap<Str
             (blacklist, priorities, generics)
         }
         Err(e) => {
-            eprintln!("[winrate_simulator] 解析 chain_rules.toml 失败: {}, 使用空 fallback", e);
-            (Vec::new(), std::collections::HashMap::new(), std::collections::HashSet::new())
+            // 修复 I-10 (2026-06-29 codex review): 原 silently fallback 到空 list,
+            // operator 看到的"全库 0% / 全库 100% 主题"会误以为没数据, 违反 §2.2.
+            // 改为 fail-fast exit 2 让 CI / cron 立刻知道配置出问题.
+            eprintln!("[winrate_simulator] 解析 chain_rules.toml 失败: {}", e);
+            eprintln!("[winrate_simulator] 拒绝输出错误结果, exit 2 (修复 I-10)");
+            std::process::exit(2);
         }
     }
 }

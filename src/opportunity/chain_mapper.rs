@@ -466,12 +466,15 @@ mod tests {
 
     #[test]
     fn test_multi_chain_news() {
-        // 修复 v9.2 BR-002: 一条快讯最多 1 条产业链, 只保留 priority 最高那条
-        // 标题同时含 MLCC + PCB, 修复后只保留优先级最高的一条
+        // 修复 C-3 (2026-06-29 codex review): 恢复强断言 — BR-002 spec 例外条款
+        // 说"AI 给出 ≥2 条独立产业链可保留", 单元测试应覆盖**至少 1 条**,
+        // 不能退化为"随便命中 0 或 1 条". 当前 chain_rules.toml: PCB priority=100
+        // (toml 中排在 MLCC 之前), MLCC priority=100, 按 priority 降序 + toml 顺序
+        // PCB 应胜出, MLCC 应被互斥排除.
         let hits = map_news_to_chains("MLCC突破带动PCB和半导体产业链全线走强");
-        assert!(hits.len() <= 1, "BR-002: 一条快讯最多 1 条产业链, 实际 {} 条", hits.len());
-        // 至少命中一条 (按 priority 排序第一条)
-        assert!(!hits.is_empty(), "应至少命中 1 条");
+        assert_eq!(hits.len(), 1, "BR-002: 一条快讯最多 1 条产业链, 实际 {} 条", hits.len());
+        assert_eq!(hits[0].chain, "AI硬件-PCB", "BR-002: PCB 优先级=100 且 toml 顺序在前, 应胜出 MLCC");
+        assert!(!hits.iter().any(|h| h.chain == "AI硬件-MLCC"), "BR-002: MLCC 应被互斥排除");
     }
 
     #[test]
@@ -510,6 +513,25 @@ mod tests {
         assert!(parse_ai_chains("").is_empty());
         // 板块关键词为空 → 丢弃，不伪造
         assert!(parse_ai_chains("某链|某逻辑|").is_empty());
+    }
+
+    // 修复 C-3 (2026-06-29 codex review): BR-002 spec 例外条款"AI 给出 ≥2 条独立产业链
+    // 可保留", 单元测试需覆盖**parse 层支持 ≥2 条独立链**, 不能依赖 map_news_to_chains_ai
+    // 整体调用 (后者需要 mock GeminiAnalyzer, 测试在 CI 难构造).
+    // 间接覆盖: parse_ai_chains 在 AI 输出 3 条独立产业链时, 全部解析 + 来源标记为 Ai
+    // + 截断到 3 条 (line 264 hits.len() >= 3 break).
+    #[test]
+    fn test_br002_exception_parse_keeps_multiple_independent_chains() {
+        let text = "固态电池|技术迭代催化|固态电池\n机器人|人形量产提速|机器人\nPCB|AI服务器需求激增|印制电路板";
+        let hits = parse_ai_chains(text);
+        assert_eq!(hits.len(), 3, "BR-002 例外: AI 给出 3 条独立产业链应全部保留, 实际 {} 条", hits.len());
+        // 全部标记为 Ai 来源 (BR-002 例外专属)
+        assert!(hits.iter().all(|h| h.source == ChainSource::Ai), "AI 来源标记必须为 ChainSource::Ai");
+        // 3 条链必须独立 (无包含关系, 关键词不重叠)
+        let chains: Vec<&str> = hits.iter().map(|h| h.chain.as_str()).collect();
+        assert!(chains.contains(&"新能源-固态电池") || chains.contains(&"固态电池"));
+        assert!(chains.iter().any(|c| c.contains("机器人")));
+        assert!(chains.iter().any(|c| c.contains("PCB") || c.contains("电路")));
     }
 
     #[tokio::test]
@@ -563,13 +585,13 @@ mod tests {
 
     #[test]
     fn test_rare_earth_magnets() {
-        // 修复 v9.2 BR-002: 标题同时含 稀土/机器人 关键词, 只保留 priority 最高那条
-        // 实际规则表: 机器人(80) 与 稀土永磁(80) priority 相同, 按 toml 出现顺序排序
-        // 调整断言: 最多 1 条, 不强求具体哪个 (避免规则表顺序耦合)
+        // 修复 C-3 (2026-06-29 codex review): 恢复强断言 — 稀土永磁 BR-006 关停,
+        // 不应在 map_news_to_chains 中命中. 标题含"机器人"关键词, 应只命中
+        // 机器人(priority=80), 不命中关停的稀土永磁.
         let hits = map_news_to_chains("稀土配额收紧叠加人形机器人放量，钕铁硼磁材供需缺口扩大");
-        assert!(hits.len() <= 1, "BR-002: 一条快讯最多 1 条产业链, 实际 {} 条", hits.len());
-        // 至少命中一条
-        assert!(!hits.is_empty(), "应至少命中 1 条");
+        assert!(!hits.is_empty(), "应至少命中机器人");
+        assert_eq!(hits.len(), 1, "BR-002: 互斥后应只命中 1 条, 实际 {} 条", hits.len());
+        assert_eq!(hits[0].chain, "机器人", "稀土永磁 BR-006 关停, 机器人 priority=80 应胜出");
     }
 
     #[test]

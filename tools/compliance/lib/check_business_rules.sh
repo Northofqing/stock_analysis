@@ -32,6 +32,12 @@ REFS=(
 # 决定 base ref: env 优先, 默认 origin/master, 失败回退到第一个 commit
 BASE_REF="${BASE_REF:-origin/master}"
 if ! git rev-parse --verify "$BASE_REF" >/dev/null 2>&1; then
+  # 修复 I-7 (2026-06-29 codex review): 无远程仓库 (本仓库当前状态) 时,
+  # 默认 origin/master 不存在, fallback 走 git rev-list --max-parents=0 取第一个 commit,
+  # 导致所有"新增文件"判定为"已存在"走 WARN 路径, FAIL=0 通过 (实质失效).
+  # CI 必须显式设 BASE_REF=pr_base_sha 才能正确判新文件.
+  echo "⚠ §2.10 BASE_REF '$BASE_REF' 不存在, 走 root commit fallback, 可能误判新增文件 (修复 I-7)" >&2
+  WARN=$((WARN+1))
   BASE_REF="$(git rev-list --max-parents=0 HEAD | tail -n1)"
 fi
 

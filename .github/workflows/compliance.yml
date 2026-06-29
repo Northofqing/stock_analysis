@@ -18,7 +18,9 @@ jobs:
       - name: AGENTS.md 合规门禁
         run: bash tools/compliance/check.sh
       - name: 单元测试 + e2e
-        run: cargo test --lib --test e2e --test test_data_freshness_check --test test_design_contradiction --test e2e_dedup --test chain_exclusive --test flash_filter
+        # 修复 C-2 (2026-06-29 codex review): e2e_prediction_verify 是 R-1 critical 修复的回归门禁,
+        # 必须进 CI. 注意: 测试用 TEST_CODE_001/002 + WAL + busy_timeout, 与其他 e2e 可并行.
+        run: cargo test --lib --test e2e --test test_data_freshness_check --test test_design_contradiction --test e2e_dedup --test chain_exclusive --test flash_filter --test e2e_prediction_verify
       - name: PR commits spec 引用检查 (PR 触发时)
         if: github.event_name == 'pull_request'
         run: |

@@ -26,10 +26,14 @@ incremental_max_age_min = 5
 # 修复 v9.1 §0 NS3 + §4 B10 推送分层
 # 70-79: 入候选池 (复盘查阅, 不主动推)
 # 80+: 实时推送
-# 注: 与 src/opportunity/score.rs:147 min(70.0) 对齐 — 沙盘无 winrate 时
-# event_risk_score 上限是 70, push_threshold 必须 ≤ 70, 否则矛盾。
-# v9.2 改: 60 (与 in_pool 兜底一致, NS3 解除后升到 75)
-# Refs: spec §0 NS3
+#
+# 修复 I-1 (2026-06-29 codex review): 与 src/opportunity/score.rs:147 min(70.0) 语义背离.
+# NS3 强约束"无 winrate 时 event_risk_score 上限 70", 含义是"无胜率验证的主题不准实时推送,
+# 只能进候选池复盘". 但 threshold=60 允许 60~70 区间无 winrate 主题直接 push, 与 NS3 矛盾.
+#
+# 当前策略: 60-70 区间允许无 winrate 推送 (灰度, 加速实战反馈收集).
+#            NS3 真要收紧时改回 75+ 让 70 上限严格生效.
+# Refs: spec §0 NS3, AGENTS §2.9 (灰度决策需边界证明注释)
 [push]
 event_risk_score_threshold = 60
 # 跨源要求 (true = 必须快讯 + Web 双源共振, 降低单源假信号)
