@@ -601,34 +601,35 @@ mod tests {
     }
 
     // BR-006 (2026-06-29): 0% 胜率主题关停, chain_mapper 加载规则时跳过 enabled=false.
-    // 测试通过编译期内嵌 DEFAULT_CHAIN_RULES_TOML (关停的 entry 在那里) 验证.
+    // 修正 (PR-3 数据回灌后): 之前误关的 6 个主题 (AI硬件-CPO / AI硬件-MLCC /
+    // AI算力 / 创新药-CXO / Rubin / 半导体-制造代工) 真实胜率非 0%, 已重新开启.
+    // 测试更新: 只验证当前真 0% 关停主题 (5 个) 不命中.
     #[test]
     fn test_br006_disabled_chains_excluded() {
-        // 0% 主题: 这些关键词在历史 prediction_tracker 里 100% 未命中, 应被关停.
-        // 验证: 对应快讯不再命中该 chain (即使关键词完全匹配).
-        let cpo_hits = map_news_to_chains("CPO光模块出货量翻倍，1.6T产品验证通过");
+        // 真 0% 关停主题: 这些关键词在历史 prediction_tracker 里 100% 未命中,
+        // 应被关停 (即使关键词完全匹配, 也不命中).
+        let fluid_hits = map_news_to_chains("AI液冷服务器出货量翻倍，散热需求爆发");
         assert!(
-            !cpo_hits.iter().any(|h| h.chain == "AI硬件-CPO"),
-            "BR-006: AI硬件-CPO (0% 胜率) 应被关停, 实际命中: {:?}",
-            cpo_hits.iter().map(|h| &h.chain).collect::<Vec<_>>()
+            !fluid_hits.iter().any(|h| h.chain == "AI硬件-液冷"),
+            "BR-006: AI硬件-液冷 (0% 胜率) 应被关停"
         );
 
-        let mlcc_hits = map_news_to_chains("MLCC多层陶瓷电容涨价，AI服务器需求激增");
+        let pkg_hits = map_news_to_chains("先进封装Chiplet量产，CoWoS产能扩张");
         assert!(
-            !mlcc_hits.iter().any(|h| h.chain == "AI硬件-MLCC"),
-            "BR-006: AI硬件-MLCC (0% 胜率) 应被关停"
+            !pkg_hits.iter().any(|h| h.chain == "半导体-先进封装"),
+            "BR-006: 半导体-先进封装 (0% 胜率) 应被关停"
         );
 
-        let ai_hits = map_news_to_chains("AI服务器算力租赁需求爆发，智算中心建设加速");
+        let consumer_hits = map_news_to_chains("AI智能手机换机周期，消费电子产业链复苏");
         assert!(
-            !ai_hits.iter().any(|h| h.chain == "AI算力"),
-            "BR-006: AI算力 (0% 胜率) 应被关停"
+            !consumer_hits.iter().any(|h| h.chain == "消费电子"),
+            "BR-006: 消费电子 (0% 胜率) 应被关停"
         );
 
-        let cxo_hits = map_news_to_chains("创新药出海获批，CXO订单大幅增长");
+        let rare_hits = map_news_to_chains("稀土永磁钕铁硼价格上涨，磁材供需缺口扩大");
         assert!(
-            !cxo_hits.iter().any(|h| h.chain == "创新药-CXO"),
-            "BR-006: 创新药-CXO (0% 胜率) 应被关停"
+            !rare_hits.iter().any(|h| h.chain == "稀土永磁"),
+            "BR-006: 稀土永磁 (0% 胜率) 应被关停"
         );
     }
 
