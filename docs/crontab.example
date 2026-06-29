@@ -7,6 +7,8 @@
 crontab -e
 
 # 添加 (替换 /path/to/stock_analysis 为实际路径):
+# 修复 I-11 (2026-06-29 codex review): 加 CRON_TZ=Asia/Shanghai, 否则 UTC 服务器会变成 17 点跑.
+CRON_TZ=Asia/Shanghai
 0 9 1 */3 * cd /Users/zhangzhen/Desktop/Quant/stock_analysis && STOCK_DB=/Users/zhangzhen/Desktop/Quant/stock_analysis/data/stock_analysis.db bash tools/one_shot/winrate_review.sh 14 >> /tmp/winrate_review.log 2>&1
 ```
 
