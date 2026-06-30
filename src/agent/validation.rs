@@ -43,12 +43,18 @@ impl Validator for ConsensusDeviationValidator {
     }
 }
 
+/// Stub: no-op. Awaiting fact-source wiring (concept data + dividend schedule).
+/// 修复 (2026-06-30 codex review): 不再加入 new_with_defaults(), 避免 AGENTS §2.8
+/// 假实现禁令风险. 外部可通过 add_validator(ConceptLinkageValidator) opt-in.
 pub struct ConceptLinkageValidator;
 impl Validator for ConceptLinkageValidator {
     fn name(&self) -> &str { "ConceptLinkageValidator" }
     fn validate(&self, _context: &ContextManager) -> Result<(), ValidationError> { Ok(()) }
 }
 
+/// Stub: no-op. Awaiting fact-source wiring (dividend yield/schedule).
+/// 修复 (2026-06-30 codex review): 不再加入 new_with_defaults(), 避免 AGENTS §2.8
+/// 假实现禁令风险. 外部可通过 add_validator(DividendTaxValidator) opt-in.
 pub struct DividendTaxValidator;
 impl Validator for DividendTaxValidator {
     fn name(&self) -> &str { "DividendTaxValidator" }
@@ -64,17 +70,22 @@ impl ValidationEngine {
         Self { validators: Vec::new() }
     }
 
+    /// 默认只装两个真实 validator. 修复 (2026-06-30 codex review): 之前装的
+    /// ConceptLinkageValidator + DividendTaxValidator 都是 Ok(()) 假实现,
+    /// 占用 validation slot 制造 "已校验" 假象, 违反 AGENTS §2.8.
     pub fn new_with_defaults() -> Self {
         let mut engine = Self::new();
         engine.add_validator(GrossMarginValidator);
         engine.add_validator(ConsensusDeviationValidator);
-        engine.add_validator(ConceptLinkageValidator);
-        engine.add_validator(DividendTaxValidator);
         engine
     }
 
     pub fn add_validator(&mut self, validator: impl Validator + 'static) {
         self.validators.push(Box::new(validator));
+    }
+
+    pub fn validator_count(&self) -> usize {
+        self.validators.len()
     }
 
     pub fn run_all(&self, context: &ContextManager) -> Vec<ValidationError> {
@@ -83,5 +94,31 @@ impl ValidationEngine {
             if let Err(e) = validator.validate(context) { errors.push(e); }
         }
         errors
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_new_with_defaults_contains_only_real_validators() {
+        // 修复 (2026-06-30 codex review): new_with_defaults 必须只含真实 validator.
+        // ConceptLinkage / DividendTax 是 no-op stub, 只能通过 add_validator opt-in.
+        let engine = ValidationEngine::new_with_defaults();
+        assert_eq!(
+            engine.validator_count(), 2,
+            "new_with_defaults must only register the 2 real validators (GrossMargin + ConsensusDeviation), not the 2 no-op stubs"
+        );
+    }
+
+    #[test]
+    fn test_new_with_defaults_validator_names() {
+        let engine = ValidationEngine::new_with_defaults();
+        // 通过 run_all 行为反推: 空 context 下, 2 个真实 validator 都应返回 Ok
+        // (因为 financials/research 都不在 context 里, 走 default Ok 路径)
+        let ctx = crate::agent::context::ContextManager::new();
+        let errors = engine.run_all(&ctx);
+        assert!(errors.is_empty(), "default validators must pass on empty context");
     }
 }
