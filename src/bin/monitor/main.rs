@@ -305,7 +305,7 @@ async fn main() {
         "🚀 Stock Monitor 启动 | LaunchStage = {} | 推送策略 = {}",
         stage.name(),
         match stage {
-            launch_gate::LaunchStage::Shadow => "不打用户, 仅日志",
+            launch_gate::LaunchStage::Shadow => "推全量 (沙盘默认, F20 修复后 Shadow 也推)",
             launch_gate::LaunchStage::Gray => "仅 critical alert (止损/风控)",
             launch_gate::LaunchStage::Live => "全量推送",
         }
@@ -653,6 +653,42 @@ fn run_factor_ic_analysis() -> Option<String> {
 async fn run_review_only() {
     log::info!("[复盘] 手动触发盘后分析...");
 
+    // 修复 P0-G (2026-06-30 codex review): 顶层 5min fast-fail (AGENTS §2.1, BR-009).
+    // 沙箱 / 数据源全失联时, 进程可能在 reqwest 内部回调里死锁,
+    // 5min 后显式 exit 2 + ERROR 日志, 不推送噪声给用户.
+    let review_timeout_secs: u64 = std::env::var("MONITOR_REVIEW_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(300);
+    log::info!("[复盘] 顶层超时保护: {}s (env MONITOR_REVIEW_TIMEOUT_SECS 可覆盖)", review_timeout_secs);
+    let review_start = std::time::Instant::now();
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(review_timeout_secs),
+        run_review_only_inner(),
+    )
+    .await;
+    match outcome {
+        Ok(()) => {
+            log::info!(
+                "[复盘] ======== 盘后分析完成 ({}s) ========",
+                review_start.elapsed().as_secs()
+            );
+        }
+        Err(_elapsed) => {
+            log::error!(
+                "[复盘] {}s 超时未完成, 上游数据源可能全部不可用 / 网络黑洞 / 死锁. exit 2.",
+                review_timeout_secs
+            );
+            log::logger().flush();
+            std::process::exit(2);
+        }
+    }
+}
+
+/// 实际复盘子流程 (被 run_review_only 包 5min timeout).
+/// 单独提出便于测试 + 控制超时粒度.
+async fn run_review_only_inner() {
     let (report, holding_breakout_text, watch_breakout_text, market_breakout_text, risk_text) = tokio::task::spawn_blocking(|| {
         let holdings = stock_analysis::portfolio::get_positions().unwrap_or_default();
         let quotes = market_data::fetch_position_quotes();
@@ -890,16 +926,150 @@ async fn run_review_deep_analysis() {
     // 按持仓原顺序推送（buffer_unordered 完成顺序不确定，重排回固定顺序）
     let mut by_code: std::collections::HashMap<String, (String, Option<String>)> =
         results.into_iter().map(|(c, n, m)| (c, (n, m))).collect();
+    // 修复 P1-1 (2026-06-30 codex review): 7 只持仓研判聚合推送 (BR-013).
+    // 之前每只持仓单独 push_wechat 1 次, 7 次噪声. 现在按操作建议分组,
+    // 1 条聚合推送 + 模板按综合分裁剪 (BR-014).
+    // 7 只票的综合分在 36-48 都属减持/观望区间时, 用户只看到 1 条总结
+    // "今日 7 只持仓: 4 减持 [代码1,代码2,...] / 2 观望 / 1 卖出" 而非 7 条 1500 字.
     for p in &holdings {
         let Some((name, md)) = by_code.remove(&p.code) else { continue };
         let Some(md) = md else { continue };
-        let header = format!("🧠 持仓深度研判 · {}({})\n", name, p.code);
-        let text = format!("{}{}", header, md);
-        log::info!("[复盘] 持仓深度研判 {}({}):\n{}", name, p.code, md);
-        push_wechat(&text).await;
+        // 保留每只票的研判落盘 (供事后查询), 不再单独推送
+        log::info!("[复盘] 持仓深度研判 {}({}) 完成 ({} 字, 落盘+聚合推送)", name, p.code, md.chars().count());
+        let _ = stock_analysis::pipeline::section_utils::save_deep_report(&p.code, &md);
+    }
+    // 聚合推送: 按操作建议分组
+    let summary = build_holding_summary(&holdings, &by_code);
+    if !summary.is_empty() {
+        log::info!("[复盘] 持仓深度研判聚合推送:\n{}", summary);
+        push_wechat(&summary).await;
     }
 
     log::info!("[复盘] 持仓多 Agent 深度研判完成");
+}
+
+/// 修复 P1-1: 聚合推送. 从 LLM 输出提取 "操作建议" + "综合分", 按操作建议分组.
+/// 模板按综合分裁剪: < 30 或 > 70 → 200 字简短, 30-70 → 800 字详细.
+/// 综合分 OK<2 时 (来自 BR-011) 强制 N/A.
+fn build_holding_summary(
+    holdings: &[stock_analysis::portfolio::Position],
+    by_code: &std::collections::HashMap<String, (String, Option<String>)>,
+) -> String {
+    use std::collections::BTreeMap;
+    let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut failed: Vec<String> = Vec::new();
+    let mut missing_data: Vec<String> = Vec::new();
+
+    for p in holdings {
+        let Some((_name, md_opt)) = by_code.get(&p.code) else { continue };
+        let Some(md) = md_opt else {
+            failed.push(format!("{}({})", p.name, p.code));
+            continue;
+        };
+        let (advice, score) = extract_advice_and_score(md);
+        // 模板裁剪: 高/低分用简短, 中间用详细
+        let line = match score {
+            Some(s) if s < 30.0 || s > 70.0 => {
+                format!("  {} {}: 综合分 {:.0}, {}", p.code, p.name, s, advice)
+            }
+            Some(s) => {
+                format!("  {} {}: 综合分 {:.0}, {}\n    摘要: {}",
+                    p.code, p.name, s, advice,
+                    first_meaningful_line(md).chars().take(80).collect::<String>())
+            }
+            None => {
+                // 综合分缺失 (BR-011 触发 OK<2)
+                missing_data.push(format!("{}({})", p.name, p.code));
+                format!("  {} {}: 综合分 N/A (数据不足), {}", p.code, p.name, advice)
+            }
+        };
+        groups.entry(advice.clone()).or_default().push(line);
+    }
+
+    let total = holdings.len();
+    let ok = total - failed.len() - missing_data.len();
+    let mut out = String::new();
+    out.push_str(&format!("🧠 持仓深度研判 · 今日 {} 只 ({} 完成, {} 失败, {} 数据缺失)\n",
+        total, ok, failed.len(), missing_data.len()));
+    out.push_str("─────────────────\n");
+    // 排序: 卖出 > 减持 > 观望 > 买入
+    let priority = |k: &str| match k {
+        k if k.contains("强烈卖出") => 0,
+        k if k.contains("卖出") => 1,
+        k if k.contains("减持") => 2,
+        k if k.contains("观望") => 3,
+        k if k.contains("买入") => 4,
+        k if k.contains("强烈买入") => 5,
+        _ => 99,
+    };
+    let mut sorted_groups: Vec<_> = groups.iter().collect();
+    sorted_groups.sort_by_key(|(k, _)| priority(k));
+    for (advice, lines) in sorted_groups {
+        out.push_str(&format!("\n【{}】({} 只)\n", advice, lines.len()));
+        for l in lines {
+            out.push_str(l);
+            out.push('\n');
+        }
+    }
+    if !failed.is_empty() {
+        out.push_str(&format!("\n⚠️ 多 Agent 失败: {}\n", failed.join(", ")));
+    }
+    if !missing_data.is_empty() {
+        out.push_str(&format!("\n📊 数据缺失 (BR-011 触发): {}\n", missing_data.join(", ")));
+    }
+    out
+}
+
+/// 从 LLM markdown 提取 (操作建议, 综合分).
+/// 操作建议: 优先 "## 【操作建议】" 段第一行非空文本.
+/// 综合分: 匹配 "综合分" 关键词附近的数字.
+fn extract_advice_and_score(md: &str) -> (String, Option<f64>) {
+    let mut advice = "未知".to_string();
+    let mut score: Option<f64> = None;
+    let mut in_advice_section = false;
+    for line in md.lines() {
+        let t = line.trim();
+        if t.starts_with('#') && t.contains("操作建议") {
+            in_advice_section = true;
+            // 标题行内可能也含建议, 如 "## 【操作建议】减持"
+            if let Some(rest) = t.split('】').nth(1) {
+                let rest = rest.trim();
+                if !rest.is_empty() {
+                    advice = rest.to_string();
+                    in_advice_section = false;  // 已在标题取
+                }
+            }
+            continue;
+        }
+        if in_advice_section {
+            if t.is_empty() { continue; }
+            if t.starts_with('#') { in_advice_section = false; continue; }
+            advice = t.to_string();
+            in_advice_section = false;
+        }
+        // 提取综合分: "综合分: 45" / "综合分 45" / "综合分=45"
+        if t.contains("综合分") {
+            for token in t.split(|c: char| !c.is_ascii_digit() && c != '.') {
+                if let Ok(v) = token.parse::<f64>() {
+                    if (0.0..=100.0).contains(&v) {
+                        score = Some(v);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    (advice, score)
+}
+
+/// 提取 markdown 第一行非标题的非空行作为摘要.
+fn first_meaningful_line(md: &str) -> String {
+    for line in md.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') { continue; }
+        return t.to_string();
+    }
+    String::new()
 }
 
 /// 窗口：盘前08:00-09:30、盘中09:30-15:00、盘后15:00-22:00。
