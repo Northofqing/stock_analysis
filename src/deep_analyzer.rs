@@ -27,7 +27,93 @@ use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+// 修复 P0-E (2026-06-30 codex review): 多 Agent 研判必须 freshness 校验 (AGENTS §2.4, BR-010).
+// 之前 deep_analyzer 走 service::get_kline 拿缓存, 无任何新鲜度检查.
+// 现在加 daily freshness gate: 日线数据超过 1 交易日 (= dq_daily_stale_sec, 默认 86400s) 直接 bail.
+use crate::monitor::data_quality::{validate_daily_freshness, DqStats, FreshnessConfig};
+use crate::config;
+
+/// 构造 freshness 配置 (从 monitor config 读 dq_daily_stale_sec).
+/// 单独提出便于测试 mock.
+fn build_freshness_config() -> FreshnessConfig {
+    let cfg = config::get_monitor_config();
+    FreshnessConfig {
+        quote_max_age_secs: cfg.dq_quote_stale_sec,
+        position_max_age_secs: cfg.dq_position_stale_sec,
+        nav_max_age_secs: cfg.dq_nav_stale_sec,
+        daily_max_age_secs: cfg.dq_daily_stale_sec,
+    }
+}
+
+/// K 线数据 freshness gate (修复 P0-E).
+/// 拒绝时返回 Err 含中文 reason, 业务层 bail.
+fn check_kline_freshness(code: &str, kline: &[KlineData]) -> Result<()> {
+    let Some(last) = kline.last() else {
+        anyhow::bail!("[MultiAgent] {} K 线为空", code);
+    };
+    let freshness = build_freshness_config();
+    let stats = DqStats::new();
+    validate_daily_freshness(last.date, chrono::Local::now(), &freshness, &stats)
+        .map_err(|reason| {
+            anyhow::anyhow!(
+                "[MultiAgent] {} K 线过期 (data_date={}, reason={}), 拒绝研判 (AGENTS §2.4 / BR-010)",
+                code, last.date, reason.label()
+            )
+        })?;
+    Ok(())
+}
+
 const DEFAULT_MAX_ITERATIONS: usize = 12;
+
+// 修复 P1-F (2026-06-30 codex review): 6 Tool 失败显式标注 (AGENTS §2.1, BR-011).
+// 之前 `unwrap_or_warn` 把 `Ok(json!({"error": ...}))` 当成功, LLM 拿到错误 JSON 照样编造.
+// 现在 collect 返回 ToolResult{ok, data, err}, 拼装 data_inventory 注入 LLM prompt,
+// 强制 LLM 在 MISSING 字段标 [数据缺失] 而非编造.
+#[derive(Debug, Clone)]
+struct ToolResult {
+    name: String,
+    ok: bool,
+    data: String,
+    err: Option<String>,
+}
+
+impl ToolResult {
+    fn ok(name: &str, data: String) -> Self {
+        Self { name: name.to_string(), ok: true, data, err: None }
+    }
+    fn missing(name: &str, err: String) -> Self {
+        log::warn!("[MultiAgent] {} 工具失败/缺失: {}", name, err);
+        Self { name: name.to_string(), ok: false, data: String::new(), err: Some(err) }
+    }
+    /// 检测 Ok 但内容是错误 JSON 的"假成功"模式 (修复 P1-F 关键点).
+    fn classify(label: &str, r: Result<String>) -> Self {
+        match r {
+            Ok(s) if s.trim().is_empty() => Self::missing(label, "返回空字符串".into()),
+            Ok(s) if s.contains("\"error\"") || s.contains("\"Error\"") => {
+                Self::missing(label, format!("假成功: {}", s.chars().take(120).collect::<String>()))
+            }
+            Ok(s) => Self::ok(label, s),
+            Err(e) => Self::missing(label, format!("Err: {:#}", e)),
+        }
+    }
+}
+
+/// 渲染 data_inventory 段 (注入 LLM prompt 头部).
+/// 格式: "[financials] OK\n[research] MISSING: ...\n...".
+fn render_data_inventory(results: &[ToolResult]) -> String {
+    results.iter()
+        .map(|r| match &r.err {
+            Some(e) => format!("[{}] MISSING: {}", r.name, e.chars().take(80).collect::<String>()),
+            None => format!("[{}] OK", r.name),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// prompt 强制规则: data_inventory 标 MISSING 的字段必须写 [数据缺失].
+const DATA_INVENTORY_RULE: &str =
+    "【强制规则】data_inventory 标 MISSING 的字段，在结论中必须写 [数据缺失]，禁止编造。\
+     至少 2 个数据源成功才给出综合分；不足 2 个时综合分标 N/A。";
 const DEFAULT_SYSTEM_PROMPT: &str = "你是一个专精于 A 股深研的金融量化 Agent。\n\
 你的任务是通过调用提供的工具（Tool）来获取真实数据，严禁编造财务数据。\n\
 在拿到数据后，你需要做交叉分析。如果在分析中触发了系统校验失败，请立刻通过报错提示进行修正，不要固执己见。\n\
@@ -191,6 +277,8 @@ pub async fn run_multi_agent_analysis(code: &str) -> Result<String> {
     if kline.is_empty() {
         anyhow::bail!("K 线数据为空，无法进行多角色分析");
     }
+    // 修复 P0-E: freshness gate (AGENTS §2.4 / BR-010)
+    check_kline_freshness(code, &kline)?;
 
     // 2. 6 个工具并行
     let fin_tool = FetchFinancialTool::new();
@@ -212,31 +300,29 @@ pub async fn run_multi_agent_analysis(code: &str) -> Result<String> {
         flow_tool.call(code_input),
     );
 
-    let unwrap_or_warn = |label: &str, r: Result<String>| -> String {
-        match r {
-            Ok(s) => s,
-            Err(e) => {
-                log::warn!("[MultiAgent] {} 工具失败: {:#}", label, e);
-                String::new()
-            }
-        }
-    };
-    let fin_str = unwrap_or_warn("financials", fin_res);
-    let research_str = unwrap_or_warn("research", research_res);
-    let news_str_raw = unwrap_or_warn("news", news_res);
-    let sector_str = unwrap_or_warn("sector", sector_res);
-    let chip_str = unwrap_or_warn("chip", chip_res);
-    let flow_str = unwrap_or_warn("fund_flow", flow_res);
-
+    // 修复 P1-F: 用 ToolResult::classify 替代 unwrap_or_warn (BR-011).
+    // 关键差异: 即使 Result::Ok 也会检测内容是否 "假成功" (含 "error" 字符串).
+    let tool_results = vec![
+        ToolResult::classify("financials", fin_res),
+        ToolResult::classify("research", research_res),
+        ToolResult::classify("news", news_res),
+        ToolResult::classify("sector", sector_res),
+        ToolResult::classify("chip", chip_res),
+        ToolResult::classify("fund_flow", flow_res),
+    ];
+    let data_inventory = render_data_inventory(&tool_results);
+    let ok_count = tool_results.iter().filter(|r| r.ok).count();
+    let missing_count = tool_results.len() - ok_count;
     log::info!(
-        "[MultiAgent] 数据抓取完成 — 财务={} 研报={} 新闻={} 板块={} 筹码={} 资金={}",
-        !fin_str.is_empty(),
-        !research_str.is_empty(),
-        !news_str_raw.is_empty(),
-        !sector_str.is_empty(),
-        !chip_str.is_empty(),
-        !flow_str.is_empty()
+        "[MultiAgent] 数据抓取完成 — {}/{} OK, {}/{} MISSING\n{}",
+        ok_count, tool_results.len(), missing_count, tool_results.len(), data_inventory
     );
+    let fin_str = &tool_results[0].data;
+    let research_str = &tool_results[1].data;
+    let news_str_raw = &tool_results[2].data;
+    let sector_str = &tool_results[3].data;
+    let chip_str = &tool_results[4].data;
+    let flow_str = &tool_results[5].data;
 
     // 3. 拼装 extra_context（资金面分析师读取）= 资金流 + 筹码
     let mut extra = String::new();
@@ -295,6 +381,18 @@ pub async fn run_multi_agent_analysis(code: &str) -> Result<String> {
             slices.fundamental, fin_str
         );
     }
+    // 修复 P1-F: 把 data_inventory + 强制规则注入 basics 字段 (所有分析师都读).
+    // 修复 P1-F: 综合分门控 — 不足 2 个 OK 时禁止给出综合分.
+    slices.basics = format!(
+        "{}\n\n【数据可用性清单】\n{}\n\n{}",
+        slices.basics, data_inventory, DATA_INVENTORY_RULE
+    );
+    if ok_count < 2 {
+        log::warn!(
+            "[MultiAgent] {} 数据源 OK={} 不足 2, 强制综合分 = N/A",
+            code, ok_count
+        );
+    }
 
     // 6. 调用 GeminiAnalyzer 多 Agent 流水线
     let analyzer = GeminiAnalyzer::from_env();
@@ -312,6 +410,8 @@ pub async fn run_multi_agent_analysis_with_seed(seed: &DeepAnalysisSeed) -> Resu
     if seed.kline.is_empty() {
         anyhow::bail!("K 线数据为空，无法进行多角色分析");
     }
+    // 修复 P0-E: freshness gate (AGENTS §2.4 / BR-010)
+    check_kline_freshness(&seed.code, &seed.kline)?;
 
     let mut slices = build_slices(
         &seed.code,
@@ -346,4 +446,167 @@ pub async fn run_and_save(code: &str) -> Result<PathBuf> {
     std::fs::write(&path, &report)?;
     log::info!("[DeepAnalyzer] 报告已保存: {}", path.display());
     Ok(path)
+}
+
+
+#[cfg(test)]
+mod tests_br006 {
+    //! 修复 P0-E 业务规则 BR-010 单元测试:
+    //! 多 Agent 研判必须 freshness 校验, 拒绝过期 K 线 (AGENTS §2.4).
+    //! 注: 完整构造 KlineData 字段过多 (25+ 字段), 这里直接测 validate_daily_freshness
+    //! 单元, check_kline_freshness 只多一层 Option/unwrap 包装, 编译时已覆盖.
+    use super::*;
+
+    /// 测试 1: build_freshness_config 不 panic, 4 个字段都填上 config 默认值
+    #[test]
+    fn test_build_freshness_config() {
+        let f = build_freshness_config();
+        // 默认 1 天 = 86400s
+        assert_eq!(f.daily_max_age_secs, 86400);
+        // 实时行情 5s
+        assert_eq!(f.quote_max_age_secs, 5);
+        // 持仓 30s
+        assert_eq!(f.position_max_age_secs, 30);
+        // 净值 1 天
+        assert_eq!(f.nav_max_age_secs, 86400);
+    }
+
+    /// 测试 2: 今日 K 线 → freshness 通过
+    #[test]
+    fn test_fresh_kline_passes() {
+        let freshness = build_freshness_config();
+        let stats = DqStats::new();
+        let today = chrono::Local::now().date_naive();
+        let result = validate_daily_freshness(today, chrono::Local::now(), &freshness, &stats);
+        assert!(result.is_ok(), "今日 K 线应通过 freshness: {:?}", result.err());
+    }
+
+    /// 测试 3: 5 天前 K 线 → freshness 拒绝 (Stale + age > 0 + max = 86400)
+    #[test]
+    fn test_stale_kline_rejected() {
+        let freshness = build_freshness_config();
+        let stats = DqStats::new();
+        let five_days_ago = chrono::Local::now().date_naive() - chrono::Duration::days(5);
+        let result = validate_daily_freshness(five_days_ago, chrono::Local::now(), &freshness, &stats);
+        assert!(result.is_err(), "5 天前 K 线应被拒绝");
+        let reason = result.unwrap_err();
+        match reason {
+            crate::monitor::data_quality::DqRejectReason::Stale { age_secs, max_secs } => {
+                assert!(age_secs > 0);
+                assert_eq!(max_secs, 86400);
+            }
+            other => panic!("应为 Stale 原因, 实际 {:?}", other),
+        }
+    }
+
+    /// 测试 4: 严格阈值 (1s) → 任意历史 K 线都过期
+    #[test]
+    fn test_strict_threshold_rejects() {
+        let freshness = FreshnessConfig {
+            quote_max_age_secs: 5,
+            position_max_age_secs: 30,
+            nav_max_age_secs: 24 * 3600,
+            daily_max_age_secs: 1, // 1 秒
+        };
+        let stats = DqStats::new();
+        let old_date = chrono::Local::now().date_naive() - chrono::Duration::days(5);
+        let result = validate_daily_freshness(old_date, chrono::Local::now(), &freshness, &stats);
+        assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod tests_br011 {
+    //! 修复 P1-F 业务规则 BR-011 单元测试:
+    //! 6 Tool 失败显式标注 (AGENTS §2.1, 假实现禁令).
+    use super::*;
+
+    /// 测试 1: Ok("正常数据") → ok=true, data 保留
+    #[test]
+    fn test_classify_normal_ok() {
+        let r = ToolResult::classify("financials", Ok("正常财务数据".to_string()));
+        assert!(r.ok, "正常 Ok 应标记为 ok");
+        assert_eq!(r.data, "正常财务数据");
+        assert!(r.err.is_none());
+    }
+
+    /// 测试 2: Err → ok=false, data 为空, err 有内容
+    #[test]
+    fn test_classify_err() {
+        let r = ToolResult::classify("news", Err(anyhow::anyhow!("网络超时")));
+        assert!(!r.ok, "Err 应标记为 missing");
+        assert!(r.data.is_empty());
+        assert!(r.err.is_some());
+        assert!(r.err.unwrap().contains("网络超时"));
+    }
+
+    /// 测试 3: Ok(json!({"error": "..."})) → ok=false (假成功检测)
+    /// 关键场景: 之前 unwrap_or_warn 把它当成功, 现在识别为 missing.
+    #[test]
+    fn test_classify_fake_success_with_error() {
+        let fake = r#"{"error": "No recent news found for this stock."}"#;
+        let r = ToolResult::classify("news", Ok(fake.to_string()));
+        assert!(!r.ok, "Ok 但内容含 \"error\" 应被识别为假成功");
+        assert!(r.data.is_empty(), "假成功时 data 应清空");
+        assert!(r.err.is_some());
+        assert!(r.err.unwrap().contains("假成功"));
+    }
+
+    /// 测试 4: Ok("") → ok=false (空字符串也是无效)
+    #[test]
+    fn test_classify_empty_string() {
+        let r = ToolResult::classify("sector", Ok(String::new()));
+        assert!(!r.ok);
+        assert!(r.err.is_some());
+        assert!(r.err.unwrap().contains("空字符串"));
+    }
+
+    /// 测试 5: render_data_inventory 格式: OK/MISSING 标注
+    #[test]
+    fn test_render_data_inventory_format() {
+        let results = vec![
+            ToolResult::ok("financials", "EPS=1.2".to_string()),
+            ToolResult::missing("news", "网络超时".to_string()),
+            ToolResult::ok("sector", "半导体".to_string()),
+        ];
+        let s = render_data_inventory(&results);
+        assert!(s.contains("[financials] OK"));
+        assert!(s.contains("[news] MISSING:"));
+        assert!(s.contains("网络超时"));
+        assert!(s.contains("[sector] OK"));
+        assert!(s.contains("[chip]") == false, "不应含未提供的 tool");
+    }
+
+    /// 测试 6: 6 tool 全部 Ok → inventory 6 个 OK
+    #[test]
+    fn test_render_data_inventory_all_ok() {
+        let results: Vec<ToolResult> = ["financials", "research", "news", "sector", "chip", "fund_flow"]
+            .iter()
+            .map(|n| ToolResult::ok(n, "data".to_string()))
+            .collect();
+        let s = render_data_inventory(&results);
+        let ok_count = s.matches(" OK").count();
+        assert_eq!(ok_count, 6, "6 tool 全部 OK");
+    }
+
+    /// 测试 7: 6 tool 全部失败 → inventory 6 个 MISSING
+    #[test]
+    fn test_render_data_inventory_all_missing() {
+        let results: Vec<ToolResult> = ["financials", "research", "news", "sector", "chip", "fund_flow"]
+            .iter()
+            .map(|n| ToolResult::missing(n, "失败".to_string()))
+            .collect();
+        let s = render_data_inventory(&results);
+        let miss_count = s.matches("MISSING").count();
+        assert_eq!(miss_count, 6, "6 tool 全部 MISSING");
+    }
+
+    /// 测试 8: DATA_INVENTORY_RULE 包含关键约束词
+    #[test]
+    fn test_data_inventory_rule_contains_key_constraints() {
+        assert!(DATA_INVENTORY_RULE.contains("MISSING"));
+        assert!(DATA_INVENTORY_RULE.contains("数据缺失"));
+        assert!(DATA_INVENTORY_RULE.contains("禁止编造"));
+        assert!(DATA_INVENTORY_RULE.contains("N/A"));
+    }
 }
