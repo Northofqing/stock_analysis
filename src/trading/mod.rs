@@ -4,6 +4,7 @@
 //! 当前提供 SimulatedExecutionGateway（落库到 stock_position）。
 
 use crate::database::DatabaseManager;
+use crate::errors::TradeError;
 use crate::models::{NewStockPosition, StockPosition};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -91,18 +92,28 @@ impl SimulatedExecutionGateway {
         DatabaseManager::get()
     }
 
-    /// 检查并记录 business_order_id. 同 ID 在 DEDUP_WINDOW 内重复 → Err.
+    /// 检查并记录 business_order_id. 同 ID 在 DEDUP_WINDOW 内重复 → Err(TradeError::DuplicateOrder).
     /// 调用方: open_position / close_position / cancel_order 都应先调此方法.
+    /// 修复 (2026-06-30 codex review): 之前返回 String, typed error
+    ///   TradeError::DuplicateOrder 一直无人构造. 现在构造 typed error 再 to_string.
     fn dedup_check_and_record(&self, business_order_id: &str) -> Result<(), String> {
         let now = Instant::now();
-        let mut seen = self.seen.lock().map_err(|e| format!("mutex poisoned: {e}"))?;
+        let mut seen = match self.seen.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                // 修复 (2026-06-30 codex review): 之前静默吞掉 poison 错误
+                log::warn!("[SimulatedExecutionGateway] dedup mutex poisoned: {e}");
+                return Err(format!("dedup mutex poisoned: {e}"));
+            }
+        };
         // Lazy GC: 删除过期条目
         seen.retain(|_, t| now.duration_since(*t) < DEDUP_WINDOW);
         if let Some(t) = seen.get(business_order_id) {
+            let err = TradeError::DuplicateOrder { order_id: business_order_id.to_string() };
             return Err(format!(
-                "duplicate order within {}s window: {} (first seen {:?} ago)",
+                "{} (within {}s window, first seen {:?} ago)",
+                err,
                 DEDUP_WINDOW.as_secs(),
-                business_order_id,
                 now.duration_since(*t)
             ));
         }
@@ -146,8 +157,12 @@ impl TradeExecutionGateway for SimulatedExecutionGateway {
             }),
             // 失败时回滚 dedup 记录, 允许调用方重试
             Err(e) => {
-                if let Ok(mut seen) = self.seen.lock() {
-                    seen.remove(&cmd.business_order_id);
+                // 修复 (2026-06-30 codex review): 之前静默吞 poison 错误, 现在 warn
+                match self.seen.lock() {
+                    Ok(mut seen) => { seen.remove(&cmd.business_order_id); }
+                    Err(poison) => log::warn!(
+                        "[SimulatedExecutionGateway] rollback mutex poisoned: {poison}"
+                    ),
                 }
                 Err(e.to_string())
             }
@@ -168,8 +183,11 @@ impl TradeExecutionGateway for SimulatedExecutionGateway {
                 message: "simulated close position filled".to_string(),
             }),
             Err(e) => {
-                if let Ok(mut seen) = self.seen.lock() {
-                    seen.remove(&cmd.business_order_id);
+                match self.seen.lock() {
+                    Ok(mut seen) => { seen.remove(&cmd.business_order_id); }
+                    Err(poison) => log::warn!(
+                        "[SimulatedExecutionGateway] rollback mutex poisoned: {poison}"
+                    ),
                 }
                 Err(e.to_string())
             }
@@ -217,7 +235,12 @@ mod tests {
         assert!(gw.dedup_check_and_record(id).is_ok());
         // 第二次同 ID 应被拒绝
         let err = gw.dedup_check_and_record(id).unwrap_err();
-        assert!(err.contains("duplicate"), "expected dedup error, got: {err}");
+        // 修复 (2026-06-30 codex review): 错误信息现在包含 TradeError::DuplicateOrder
+        // 的 Display ("重复订单...") + dedup 上下文 ("within 60s window")
+        assert!(
+            err.contains("重复订单") && err.contains("within 60s window"),
+            "expected typed TradeError::DuplicateOrder + dedup context, got: {err}"
+        );
     }
 
     #[test]
