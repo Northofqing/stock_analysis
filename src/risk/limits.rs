@@ -31,10 +31,11 @@ pub struct LimitViolation {
 
 /// 检查持仓是否超过硬性风控线
 ///
-/// 修复 P1.6: 真正执行 single_sector_max_pct 和 cash_floor_pct
-/// 之前: 这两个字段定义但 check_position_limits 不执行
-/// 量化分析师要求: 同板块持仓总市值不能超 single_sector_max_pct (40%)
-///               现金底限不能低于 cash_floor_pct (15%)
+/// 修复 P1.6: 真正执行 single_sector_max_pct
+/// 修复 (2026-06-30 codex review): 删除 cash_floor_pct 死代码 (旧版本
+///   `let cash_pct = 100.0` 永远 false, 现金检查从未触发).
+///   现金底限检查已迁移到 `risk::cash_guard::check_cash`, 调用方在
+///   `bin/monitor/main.rs` 的风控研判路径单独调用.
 pub fn check_position_limits(
     positions: &[Position],
     prices: &std::collections::HashMap<String, f64>,
@@ -50,20 +51,6 @@ pub fn check_position_limits(
     if total_value <= 0.0 { return vec![]; }
 
     let mut violations = Vec::new();
-
-    // 修复 P1.6: 现金底限检查
-    // total_value 包含持仓市值, 但 cash 不在 positions 里
-    // 这里用总价值作为代理, 假设有 cash = total_value * 现金比例
-    // 实际 cash 需要从 portfolio::get_cash() 拿, 留作 P3 增强
-    let cash_pct = 100.0; // 暂用 100% 表示无法直接计算, 由调用方传入实际 cash
-    if cash_pct < limits.cash_floor_pct {
-        violations.push(LimitViolation {
-            code: "PORTFOLIO".into(), name: "组合".into(),
-            rule: "现金底限".to_string(),
-            current: format!("{:.1}%", cash_pct),
-            limit: format!("≥{:.0}%", limits.cash_floor_pct),
-        });
-    }
 
     for p in positions {
         let price = prices.get(&p.code).copied().unwrap_or(p.cost_price);

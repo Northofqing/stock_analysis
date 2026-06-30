@@ -565,7 +565,8 @@ async fn run_test_scan() {
 
     // 14. v4 决策层：排除引擎 + 风控（含 HTTP 调用，走 spawn_blocking）
     let h = holdings.clone();
-    let (excl_hits, violations) = tokio::task::spawn_blocking(move || {
+    let latest_ledger = stock_analysis::portfolio::get_equity_curve(1).ok().and_then(|c| c.last().cloned());
+    let (excl_hits, violations, cash_alert) = tokio::task::spawn_blocking(move || {
         let watchlist = stock_analysis::portfolio::get_watchlist().unwrap_or_default();
         let excl = stock_analysis::decision::exclusion::scan_exclusions(&h, &watchlist);
         let limits = stock_analysis::risk::limits::HardLimits::default();
@@ -573,8 +574,13 @@ async fn run_test_scan() {
         let price_map: std::collections::HashMap<String, f64> =
             quotes.iter().map(|q| (q.code.clone(), q.price)).collect();
         let viol = stock_analysis::risk::limits::check_position_limits(&h, &price_map, &limits);
-        (excl, viol)
-    }).await.unwrap_or_else(|_| (vec![], vec![]));
+        // 现金底限检查 (修复 codex review: 之前是死代码 100%)
+        let cash_alert = latest_ledger.and_then(|entry| {
+            let guard = stock_analysis::risk::cash_guard::CashGuard::default();
+            stock_analysis::risk::cash_guard::check_cash(entry.cash, entry.total_value, &guard)
+        });
+        (excl, viol, cash_alert)
+    }).await.unwrap_or_else(|_| (vec![], vec![], None));
     log::info!("[测试] 排除检查: {} 项命中", excl_hits.len());
     log::info!("[测试] 风控检查: {} 项超标", violations.len());
     if !excl_hits.is_empty() {
@@ -582,6 +588,11 @@ async fn run_test_scan() {
     }
     if !violations.is_empty() {
         push_wechat(&stock_analysis::risk::limits::format_limit_alert(&violations)).await;
+    }
+    if let Some(alert) = cash_alert {
+        let text = stock_analysis::risk::cash_guard::format_cash_alert(&alert);
+        log::warn!("[测试] {}", text);
+        push_wechat(&text).await;
     }
 
     // 16. v4 赛道分档
