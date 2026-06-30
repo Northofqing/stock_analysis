@@ -7,8 +7,7 @@
 //! 依赖 .env 中 MONITOR_ENABLED=true
 
 use std::io::Write;
-use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use stock_analysis::calendar::{self, current_session, is_market_active, MarketSession};
@@ -916,7 +915,7 @@ async fn news_monitor_loop() {
     log::info!("[NewsMonitor] 启动（独立窗口，不随价格扫描器静默）");
     let mut nm = NewsMonitor::new();
     nm.restore_dedup();
-    let mut ai = NewsAIAnalyzer::new();
+    let ai = NewsAIAnalyzer::new();
     let mut sm = SignalStateMachine::default();
     sm.restore_state();
     let mut last_concept_refresh = std::time::Instant::now();

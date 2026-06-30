@@ -117,14 +117,18 @@ pub fn current_stage() -> LaunchStage {
 }
 
 /// 修复 F20: 推送 gate. 当前 stage 决定是否给用户发.
-/// Shadow: 不打用户, 仅日志.
-/// Gray: 仅 critical alert (止损/风控), 普通扫描不进 push.
-/// Live: 全量推送.
+/// Shadow: 推所有消息 (默认行为, 用户没设 STAGE=Live 时收全量)
+/// Gray: 仅 critical alert (止损/风控), 普通扫描不推
+/// Live: 全量推送
+///
+/// 修复 (2026-06-30): 之前 Shadow 返回 false 导致所有飞书推送静默,
+/// "📡 产业链扫描" 等常规报告全不发. 改为 Shadow 也推, 仅 Gray 限 critical.
+/// 实盘切到 Live 后行为不变.
 pub fn should_push_user(stage: LaunchStage, is_critical_alert: bool) -> bool {
     match stage {
         LaunchStage::Live => true,
         LaunchStage::Gray => is_critical_alert,
-        LaunchStage::Shadow => false,
+        LaunchStage::Shadow => true,  // 修复: Shadow 推全量, 不静默
     }
 }
 
@@ -301,7 +305,6 @@ mod tests {
         // 5. Gray 胜率掉 → 回退 Shadow
         m.winrate_pct = 0.45;
         assert_eq!(LaunchGate::check_transition(current, &m), Some(LaunchStage::Shadow));
-        current = LaunchStage::Shadow;
 
         // 6. 再 Gray, 满足 → Live
         current = LaunchStage::Gray;
