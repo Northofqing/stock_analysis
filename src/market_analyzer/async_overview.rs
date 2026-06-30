@@ -35,9 +35,14 @@ pub fn get_market_overview_blocking() -> Result<MarketOverview> {
     match fetch_north_flow_blocking() {
         Ok(n) => {
             info!("[大盘 blocking] 北向资金: {:+.2}亿", n);
-            overview.north_flow = n;
+            overview.north_flow = Some(n);
         }
         Err(e) => warn!("[大盘 blocking] 北向资金拉取失败: {}", e),
+    }
+    // 修复 P1-3: 0.0 视为数据缺失 (unwrap_or 兜底假成功), 不写入 overview
+    if let Some(0.0) = overview.north_flow {
+        warn!("[大盘 blocking] 北向资金返回 0.0 (疑似 unwrap_or 假成功), 标记为缺失");
+        overview.north_flow = None;
     }
 
     // 3. 板块涨跌榜 (同步)
@@ -299,7 +304,11 @@ fn format_market_report(overview: &MarketOverview) -> String {
     let _ = writeln!(s, "| 涨停 | {} |", overview.limit_up_count);
     let _ = writeln!(s, "| 跌停 | {} |", overview.limit_down_count);
     let _ = writeln!(s, "| 两市成交额 (500只样本) | {:.0}亿 |", overview.total_amount);
-    let _ = writeln!(s, "| 北向资金 | {:+.2}亿 |", overview.north_flow);
+    // 修复 P1-3 (2026-06-30 codex review, BR-012): None 时显式打 [数据缺失], 禁止显示 0.00.
+    match overview.north_flow {
+        Some(v) => { let _ = writeln!(s, "| 北向资金 | {:+.2}亿 |", v); }
+        None => { let _ = writeln!(s, "| 北向资金 | [数据缺失] |"); }
+    }
     let _ = writeln!(s);
     if !overview.top_sectors.is_empty() {
         let _ = writeln!(s, "## 三、领涨板块");
@@ -381,7 +390,7 @@ v_sz399001="1~深证成指~399001~12500.00~12450.00~12400.00~80000000~9000000000
         }];
         overview.up_count = 2500;
         overview.down_count = 2000;
-        overview.north_flow = 12.34;
+        overview.north_flow = Some(12.34);
         let s = format_market_report(&overview);
         assert!(s.contains("上证指数"));
         assert!(s.contains("+0.18%"));

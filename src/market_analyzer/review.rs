@@ -68,7 +68,7 @@ impl MarketAnalyzer {
 | 涨停 | {} |
 | 跌停 | {} |
 | 两市成交额 | {:.0}亿 |
-| 北向资金 | {:+.2}亿 |
+| 北向资金 | {} |
 
 ### 四、板块表现
 - **领涨**: {}
@@ -93,7 +93,8 @@ impl MarketAnalyzer {
             overview.limit_up_count,
             overview.limit_down_count,
             overview.total_amount,
-            overview.north_flow,
+            // 修复 P1-3: None 时打 [数据缺失], 禁止 0.00 假数据 (BR-012)
+            overview.north_flow.map(|v| format!("{:+.2}亿", v)).unwrap_or_else(|| "[数据缺失]".to_string()),
             top_text,
             bottom_text,
             self.format_top_stocks(&overview.top_stocks),
@@ -184,7 +185,7 @@ impl MarketAnalyzer {
 - 上涨: {} 家 | 下跌: {} 家 | 平盘: {} 家
 - 涨停: {} 家 | 跌停: {} 家
 - 两市成交额: {:.0} 亿元
-- 北向资金: {:+.2} 亿元
+ - 北向资金: {}
 
 ## 板块表现
 领涨: {}
@@ -229,7 +230,8 @@ impl MarketAnalyzer {
             overview.limit_up_count,
             overview.limit_down_count,
             overview.total_amount,
-            overview.north_flow,
+            // 修复 P1-3: None → [数据缺失] (BR-012)
+            overview.north_flow.map(|v| format!("{:+.2} 亿元", v)).unwrap_or_else(|| "[数据缺失]".to_string()),
             top_sectors_text,
             bottom_sectors_text,
             news_text,

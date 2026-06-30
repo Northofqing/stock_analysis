@@ -108,7 +108,9 @@ pub struct MarketOverview {
     /// 两市成交额（亿元）
     pub total_amount: f64,
     /// 北向资金净流入（亿元）
-    pub north_flow: f64,
+    /// 修复 P1-3 (2026-06-30 codex review): None 表示数据缺失, 禁止静默填充 0.0 (AGENTS §2.1, BR-012).
+    /// 之前 north_flow 永远 0.0 假数据, 触发 "北向资金 +0.00亿" 噪声.
+    pub north_flow: Option<f64>,
     /// 涨幅前5板块
     pub top_sectors: Vec<SectorInfo>,
     /// 跌幅前5板块
@@ -163,7 +165,7 @@ impl MarketOverview {
             limit_up_count: 0,
             limit_down_count: 0,
             total_amount: 0.0,
-            north_flow: 0.0,
+            north_flow: None,
             top_sectors: Vec::new(),
             bottom_sectors: Vec::new(),
             top_stocks: Vec::new(),

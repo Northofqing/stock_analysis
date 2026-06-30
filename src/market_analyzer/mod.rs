@@ -97,7 +97,7 @@ impl MarketAnalyzer {
         self.get_sector_rankings(&mut overview)?;
 
         // 4. 获取北向资金（修复 QUANT_ANALYST_REVIEW §1.4）
-        overview.north_flow = self.fetch_north_flow_latest();
+        overview.north_flow = Some(self.fetch_north_flow_latest());
 
         Ok(overview)
     }
