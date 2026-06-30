@@ -212,8 +212,9 @@ mod tests {
 
     #[test]
     fn test_should_push_user() {
-        assert!(!should_push_user(LaunchStage::Shadow, false));
-        assert!(!should_push_user(LaunchStage::Shadow, true));
+        // 修复 v9.4.23: Shadow 推全量 (之前返回 false 导致飞书推送静默)
+        assert!(should_push_user(LaunchStage::Shadow, false));
+        assert!(should_push_user(LaunchStage::Shadow, true));
         assert!(!should_push_user(LaunchStage::Gray, false));
         assert!(should_push_user(LaunchStage::Gray, true));
         assert!(should_push_user(LaunchStage::Live, false));

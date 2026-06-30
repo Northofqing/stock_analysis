@@ -42,6 +42,26 @@ pub enum EventType {
     Other,
 }
 
+impl EventType {
+    /// 中文标签（用于推送/展示）。
+    /// 量化 PM 视角: 1 个定义点, 所有调用方共享。
+    /// 不会出现"政策"写成"政 策"或"策政"的偏差。
+    pub fn label(&self) -> &'static str {
+        match self {
+            EventType::Policy => "政策",
+            EventType::TechBreak => "技术突破",
+            EventType::OrderWin => "订单中标",
+            EventType::Capacity => "产能变化",
+            EventType::PriceUp => "涨价",
+            EventType::PriceDown => "跌价",
+            EventType::Mna => "并购重组",
+            EventType::Accident => "事故利空",
+            EventType::Overseas => "海外事件",
+            EventType::Other => "其他",
+        }
+    }
+}
+
 /// 事件方向 (对受益方)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Direction {

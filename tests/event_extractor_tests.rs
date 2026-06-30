@@ -205,10 +205,12 @@ fn test_core_quick_only_yields_market_event() {
 
 #[test]
 fn test_extract_batch_rules_only() {
+    // 修复 v9.4.24: 使用相对日期避免日期敏感 flaky (之前写死 2026-06-27, 超过 2 天 batch 阈值则全进 stale)
+    let today = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let items = vec![
-        search_result("工信部: 5G-A 商用进入新阶段", "2026-06-27 10:00:00"),
-        search_result("A股收评：三大指数低开高走", "2026-06-27 10:00:00"),
-        search_result("碳酸锂价格上调 5000 元", "2026-06-27 10:00:00"),
+        search_result("工信部: 5G-A 商用进入新阶段", &today),
+        search_result("A股收评：三大指数低开高走", &today),
+        search_result("碳酸锂价格上调 5000 元", &today),
     ];
     let (fresh, _stale) = extract_batch_rules_only(&items);
     assert_eq!(fresh.len(), 2, "工信部 + 碳酸锂 → 2 个事件; 收评 → 丢弃");

@@ -768,6 +768,40 @@ pub struct OpportunityScan {
 }
 
 /// 运行一次产业链扫描，返回「产业链」与「持仓影响」分离的结果
+// ═══════════════════════════════════════════════════════════
+// v9.4.24: 事件抽取公共逻辑 — rules-only 路径
+// ═══════════════════════════════════════════════════════════
+
+/// 从 Web 搜索结果中提取 MarketEvent，将非 Other 事件的 subject 回灌到 titles。
+/// 返回检出的事件列表供调用方展示。
+/// - stale 事件 (超过 2 天) 记录 warn 后丢弃
+/// - Other 类型事件 (无明确分类) 不过滤入 titles，仅用于展示统计
+fn collect_events_from_web(
+    web_results: &[SearchResult],
+    titles: &mut Vec<String>,
+) -> (Vec<crate::signal::market_event::MarketEvent>, usize) {
+    let (fresh_events, stale) = event_extractor::extract_batch_rules_only(web_results);
+    let stale_n = stale.len();
+    if stale_n > 0 {
+        log::warn!(
+            "[Opportunity] 事件抽取丢弃 {} 条过期事件 (>2天)",
+            stale_n
+        );
+    }
+    let detected: Vec<_> = fresh_events
+        .into_iter()
+        .filter(|e| e.event_type != crate::signal::market_event::EventType::Other)
+        .collect();
+    let event_n = detected.len();
+    // 将检出事件的 subject 回灌到产业链映射输入，丰富信号源
+    // 注: web_results 的完整 title 已在前一步通过 r.title.clone() 入 titles,
+    // subject 是 30 字符截断版，作为补充冗余信号加入 (chain mapper 不做去重)
+    for e in &detected {
+        titles.push(e.subject.clone());
+    }
+    (detected, event_n)
+}
+
 pub async fn run_opportunity_scan() -> OpportunityScan {
     let mut lines: Vec<String> = Vec::new();
     lines.push(format!("📡 产业链扫描（{}）", chrono::Local::now().format("%H:%M")));
@@ -798,6 +832,18 @@ pub async fn run_opportunity_scan() -> OpportunityScan {
         }
     }
     let web_n = web_results.len();
+
+    // 1c. (v9.4.24) 事件抽取 — rules-only 路径, 用 collect_events_from_web 统一
+    let (detected_events, event_n) = collect_events_from_web(&web_results, &mut titles);
+    if event_n > 0 {
+        let event_summary: Vec<String> = detected_events.iter()
+            .map(|e| format!("{}({})", e.event_type.label(), e.subject.chars().take(20).collect::<String>()))
+            .collect();
+        lines.push(format!(
+            "📊 事件抽取：快讯{}条/Web{}条 → 检出 {} 个有效事件 | {}",
+            flash_n, web_n, event_n, event_summary.join("; ")
+        ));
+    }
 
     if titles.is_empty() {
         log::info!("[Opportunity] 采集 0 条新闻 → 跳过本轮");
@@ -938,6 +984,18 @@ pub async fn run_post_close_candidates(top_n: usize) -> String {
                 }
             }
         }
+    }
+
+    // 1a. (v9.4.24) 事件抽取 — rules-only 路径, 用 collect_events_from_web 统一
+    let (detected_events, event_n) = collect_events_from_web(&web_results, &mut titles);
+    if event_n > 0 {
+        let event_summary: Vec<String> = detected_events.iter()
+            .map(|e| format!("{}({})", e.event_type.label(), e.subject.chars().take(20).collect::<String>()))
+            .collect();
+        lines.push(format!(
+            "📊 事件预检：检出 {} 个有效事件 → 参与产业链映射 | {}",
+            event_n, event_summary.join("; ")
+        ));
     }
 
     if titles.is_empty() {
