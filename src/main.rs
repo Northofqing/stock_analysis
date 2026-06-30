@@ -21,7 +21,7 @@ use env_logger::Env;
 use log::{error, info};
 use std::io::Write;
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     let args = cli::Args::parse();

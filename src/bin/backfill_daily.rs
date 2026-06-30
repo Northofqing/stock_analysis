@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use stock_analysis::database::DatabaseManager;
 use stock_analysis::data_provider::DataFetcherManager;
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. 参数: STOCK_LIST 优先; 否则命令行第一个参数 (逗号分隔); 否则用监控自选.
     let stock_list_env = env::var("STOCK_LIST").ok();

@@ -138,11 +138,16 @@ where
                 _ => {
                     // CurrentThread (旧版 tokio) 或其他 flavor:
                     // block_in_place 会 panic! 用 actionable error.
+                    // 修复 v9.4.20 (2026-06-29 codex M-2): 加 [BLOCK_ON_ASYNC_FLAVOR_ERROR] tag
+                    // + 英文 lead-line, 让 log scraper grep 友好.
                     panic!(
-                        "block_on_async: 不能在 {:?} runtime 内直接 block_on\n\
-                         解决: 1) 数据源调用方用 tokio::task::spawn_blocking 包装 sync API\n\
-                         解决: 2) 把 #[tokio::main] 改成 Builder::new_multi_thread().enable_all().build()\n\
-                         参考: v9.4.15 (2026-06-29) audit Top10#5 修复",
+                        "[BLOCK_ON_ASYNC_FLAVOR_ERROR] cannot block_on in {:?} runtime\n\
+                         block_on_async: cannot call handle.block_on() inside a current_thread runtime\n\n\
+                         Fix:\n  \
+                         1) Call from tokio::task::spawn_blocking (not from async fn body directly)\n  \
+                         2) Change #[tokio::main] to #[tokio::main(flavor = \"multi_thread\")]\n  \
+                         3) Build your own multi_thread runtime: Builder::new_multi_thread().enable_all().build()\n\n\
+                         Ref: v9.4.15 (2026-06-29) audit Top10#5 修复",
                         handle.runtime_flavor()
                     );
                 }

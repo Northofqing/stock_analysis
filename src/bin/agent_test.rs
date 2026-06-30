@@ -54,7 +54,7 @@ fn build_client(cfg: &ActiveModelConfig) -> Client<OpenAIConfig> {
     Client::with_config(openai_cfg)
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> anyhow::Result<()> {
     // 1. 初始化环境变量和日志
     dotenv().ok();

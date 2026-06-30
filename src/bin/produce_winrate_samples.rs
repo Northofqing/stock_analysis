@@ -9,7 +9,7 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().collect();
     let days: i64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(60);

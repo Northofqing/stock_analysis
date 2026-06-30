@@ -15,7 +15,7 @@ use std::env;
 use stock_analysis::database::DatabaseManager;
 use stock_analysis::monitor::prediction;
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let days: i64 = env::args()
         .nth(1)
