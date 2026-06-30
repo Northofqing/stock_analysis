@@ -20,34 +20,34 @@ fn test_shadow_stays_under_threshold() {
 #[test]
 fn test_shadow_to_gray_at_threshold() {
     // 修复 P0-3: 12 周 + 200 样本 + 60% 胜率 + Calmar 1.0 → 灰度
-    let m = metrics(60, 250, 0.65, 1.2);
+    let m = metrics(84, 250, 0.65, 1.2);
     assert_eq!(LaunchGate::check_transition(LaunchStage::Shadow, &m), Some(LaunchStage::Gray));
 }
 
 #[test]
 fn test_shadow_partial_fails_samples() {
     // 修复 P0-3: 样本不够, 不切换
-    let m = metrics(60, 199, 0.65, 1.2);
+    let m = metrics(84, 199, 0.65, 1.2);
     assert_eq!(LaunchGate::check_transition(LaunchStage::Shadow, &m), None);
 }
 
 #[test]
 fn test_shadow_partial_fails_winrate() {
     // 修复 P0-3: 胜率 < 60%, 不切换
-    let m = metrics(60, 250, 0.55, 1.2);
+    let m = metrics(84, 250, 0.55, 1.2);
     assert_eq!(LaunchGate::check_transition(LaunchStage::Shadow, &m), None);
 }
 
 #[test]
 fn test_shadow_partial_fails_calmar() {
     // 修复 P0-3: Calmar < 1.0, 不切换
-    let m = metrics(60, 250, 0.65, 0.8);
+    let m = metrics(84, 250, 0.65, 0.8);
     assert_eq!(LaunchGate::check_transition(LaunchStage::Shadow, &m), None);
 }
 
 #[test]
 fn test_shadow_partial_fails_days() {
-    // 修复 P0-3: 天数 < 60 (12 周), 不切换
+    // 修复 P0-3: 天数 < 84 (12 周), 不切换
     let m = metrics(50, 250, 0.65, 1.2);
     assert_eq!(LaunchGate::check_transition(LaunchStage::Shadow, &m), None);
 }
@@ -55,7 +55,7 @@ fn test_shadow_partial_fails_days() {
 #[test]
 fn test_gray_to_live() {
     // 修复 P0-3: 灰度 → 实盘: 30 天 + 55% 胜率
-    let mut m = metrics(60, 250, 0.65, 1.2);
+    let mut m = metrics(84, 250, 0.65, 1.2);
     m.gray_days = 30;
     let next = LaunchGate::check_transition(LaunchStage::Gray, &m);
     assert_eq!(next, Some(LaunchStage::Live));
@@ -64,7 +64,7 @@ fn test_gray_to_live() {
 #[test]
 fn test_gray_back_to_shadow_underperformance() {
     // 修复 P0-3: 灰度 → 沙盘 (回退): 胜率 < 50% 或触发风控
-    let mut m = metrics(60, 250, 0.45, 1.2);
+    let mut m = metrics(84, 250, 0.45, 1.2);
     m.gray_days = 30;
     let next = LaunchGate::check_transition(LaunchStage::Gray, &m);
     assert_eq!(next, Some(LaunchStage::Shadow));
@@ -73,7 +73,7 @@ fn test_gray_back_to_shadow_underperformance() {
 #[test]
 fn test_gray_needs_30_days() {
     // 修复 P0-3: 灰度 < 30 天不能升级
-    let mut m = metrics(60, 250, 0.65, 1.2);
+    let mut m = metrics(84, 250, 0.65, 1.2);
     m.gray_days = 20;
     assert_eq!(LaunchGate::check_transition(LaunchStage::Gray, &m), None);
 }
@@ -81,6 +81,6 @@ fn test_gray_needs_30_days() {
 #[test]
 fn test_live_no_auto_transition() {
     // 实盘阶段只能由人工/风控回退, LaunchGate::check_transition 不自动转
-    let m = metrics(60, 250, 0.65, 1.2);
+    let m = metrics(84, 250, 0.65, 1.2);
     assert_eq!(LaunchGate::check_transition(LaunchStage::Live, &m), None);
 }

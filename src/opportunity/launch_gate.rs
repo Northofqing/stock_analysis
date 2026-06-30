@@ -75,7 +75,12 @@ impl LaunchGate {
     pub fn check_transition(current: LaunchStage, m: &StageMetrics) -> Option<LaunchStage> {
         match current {
             LaunchStage::Shadow => {
-                if m.shadow_days >= 60
+                // 修复 (2026-06-30 codex review): 之前用 60 触发, 文档说 12 周
+                // (= 84 calendar days). metrics_from_db 用 (now.date_naive()
+                // - min_date).num_days() 计算 calendar days, 阈值必须对齐到 84
+                // (12 周). 60 会让 Shadow→Gray 在 ~8.5 周触发, 与文档矛盾,
+                // 违反 AGENTS §2.9 设计矛盾禁令.
+                if m.shadow_days >= 84
                     && m.winrate_samples >= 200
                     && m.winrate_pct >= 0.60
                     && m.calmar_ratio >= 1.0
@@ -229,7 +234,7 @@ mod tests {
         assert_eq!(LaunchGate::check_transition(LaunchStage::Shadow, &m), None);
 
         let m = StageMetrics {
-            shadow_days: 60, winrate_samples: 200, winrate_pct: 0.60, calmar_ratio: 1.0, gray_days: 0,
+            shadow_days: 84, winrate_samples: 200, winrate_pct: 0.60, calmar_ratio: 1.0, gray_days: 0,
         };
         assert_eq!(LaunchGate::check_transition(LaunchStage::Shadow, &m), Some(LaunchStage::Gray));
     }
@@ -285,8 +290,8 @@ mod tests {
         m.shadow_days = 30;
         assert_eq!(LaunchGate::check_transition(current, &m), None);
 
-        // 2. Shadow 60 天, 胜率低
-        m.shadow_days = 60;
+        // 2. Shadow 84 天, 胜率低 (修复 v9.4.25.3: 60 → 84, 与 12 周对齐)
+        m.shadow_days = 84;
         m.winrate_samples = 200;
         m.winrate_pct = 0.40;
         m.calmar_ratio = 0.5;
