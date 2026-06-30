@@ -47,16 +47,18 @@ fn build_freshness_config() -> FreshnessConfig {
 /// K 线数据 freshness gate (修复 P0-E).
 /// 拒绝时返回 Err 含中文 reason, 业务层 bail.
 fn check_kline_freshness(code: &str, kline: &[KlineData]) -> Result<()> {
-    let Some(last) = kline.last() else {
+    // 修复 v9.4.26 P3 bug: 之前用 kline.last() 取最旧日期 (RustDX 按 date 降序, last 是最旧),
+    // freshness 永远 reject. 改成用 kline.iter().map(|k| k.date).max() 拿最新日期.
+    let Some(latest_date) = kline.iter().map(|k| k.date).max() else {
         anyhow::bail!("[MultiAgent] {} K 线为空", code);
     };
     let freshness = build_freshness_config();
     let stats = DqStats::new();
-    validate_daily_freshness(last.date, chrono::Local::now(), &freshness, &stats)
+    validate_daily_freshness(latest_date, chrono::Local::now(), &freshness, &stats)
         .map_err(|reason| {
             anyhow::anyhow!(
                 "[MultiAgent] {} K 线过期 (data_date={}, reason={}), 拒绝研判 (AGENTS §2.4 / BR-010)",
-                code, last.date, reason.label()
+                code, latest_date, reason.label()
             )
         })?;
     Ok(())
@@ -71,11 +73,15 @@ async fn fetch_kline_via_manager(code: &str, days: usize) -> Result<Vec<KlineDat
     let (kline, source) = manager
         .get_daily_data(code, days)
         .map_err(|e| anyhow::anyhow!("K 线获取失败: {e}"))?;
+    let first_date = kline.first().map(|k| k.date.to_string()).unwrap_or_default();
+    let last_date = kline.last().map(|k| k.date.to_string()).unwrap_or_default();
     log::info!(
-        "[MultiAgent] {} K 线来源: {}, {} 条",
+        "[MultiAgent] {} K 线来源: {}, {} 条, date_range: {}..{}",
         code,
         source,
-        kline.len()
+        kline.len(),
+        first_date,
+        last_date
     );
     Ok(kline)
 }
@@ -532,6 +538,59 @@ mod tests_br006 {
         let old_date = chrono::Local::now().date_naive() - chrono::Duration::days(5);
         let result = validate_daily_freshness(old_date, chrono::Local::now(), &freshness, &stats);
         assert!(result.is_err());
+    }
+
+    /// 修复 v9.4.26 P3 bug: 之前 check_kline_freshness 用 kline.last() 取最旧日期,
+    /// RustDX 数据按 date 降序 (最新在前), last() 拿到 1 年前的旧日期, freshness
+    /// 永远 reject. 改用 kline.iter().map(|k| k.date).max() 拿最新日期.
+    /// 这个测试覆盖: 250 条 K 线, 最新 2026-06-30 + 最旧 2025-06-19 (降序),
+    /// freshness 应通过 (取最新日期).
+    #[test]
+    fn test_check_kline_freshness_uses_latest_date_not_last() {
+        use crate::data_provider::KlineData;
+        let today = chrono::Local::now().date_naive();
+        let old_date = today - chrono::Duration::days(249);
+        // 构造降序 K 线 (RustDX 默认顺序): 最新在前, 最旧在后
+        let kline: Vec<KlineData> = (0..250)
+            .map(|i| KlineData {
+                date: today - chrono::Duration::days(i),
+                open: 10.0,
+                high: 11.0,
+                low: 9.5,
+                close: 10.5,
+                volume: 1000.0,
+                amount: 10500.0,
+                pct_chg: 0.0,
+                intraday_price: None,
+                settled: true,
+                pe_ratio: None,
+                pb_ratio: None,
+                turnover_rate: None,
+                market_cap: None,
+                circulating_cap: None,
+                eps: None,
+                roe: None,
+                revenue_yoy: None,
+                net_profit_yoy: None,
+                gross_margin: None,
+                net_margin: None,
+                sharpe_ratio: None,
+                financials_history: None,
+                valuation_history: None,
+                consensus: None,
+                industry: None,
+                is_limit_up: false,
+                is_limit_down: false,
+                is_suspended: false,
+            })
+            .collect();
+        // 验证我们的逻辑: 最新日期 = today, 最旧日期 = today - 250 days
+        let latest_date = kline.iter().map(|k| k.date).max().expect("non-empty");
+        let last_date = kline.last().expect("non-empty").date;
+        assert_eq!(latest_date, today, "iter().map().max() 取最新日期");
+        assert_eq!(last_date, old_date, "last() 拿到最旧日期 (降序)");
+        // 关键断言: check_kline_freshness 必须通过 (用 latest_date 而不是 last_date)
+        check_kline_freshness("TEST", &kline).expect("降序 K 线应通过 freshness");
     }
 }
 
