@@ -808,7 +808,7 @@ async fn run_review_only_inner() {
             if market_lines.len() > 1 { market_brk = market_lines.join("\n"); }
         }
 
-        // 组装风控文本：止损告警 + 轮动研判
+        // 组装风控文本：止损告警 + 轮动研判 + 现金底限告警
         let mut risk = String::new();
         let stop_text = stock_analysis::risk::stop_loss::format_stop_alerts(&stop_signals);
         if !stop_text.is_empty() {
@@ -818,6 +818,19 @@ async fn run_review_only_inner() {
             if !risk.is_empty() { risk.push_str("\n\n"); }
             risk.push_str("🔄 持仓轮动研判（算法·仅供参考）\n");
             risk.push_str(&rotation_lines.join("\n"));
+        }
+        // 修复 (2026-06-30 codex review): --review 路径之前没调 cash_guard,
+        // P0 cash_floor 在 --review 模式下不生效. 补上现金底限告警.
+        if let Some(latest) = equity.last() {
+            let guard = stock_analysis::risk::cash_guard::CashGuard::default();
+            if let Some(alert) = stock_analysis::risk::cash_guard::check_cash(
+                latest.cash, latest.total_value, &guard,
+            ) {
+                if alert.below_floor {
+                    if !risk.is_empty() { risk.push_str("\n\n"); }
+                    risk.push_str(&stock_analysis::risk::cash_guard::format_cash_alert(&alert));
+                }
+            }
         }
 
         (r, holding_brk, watch_brk, market_brk, risk)
