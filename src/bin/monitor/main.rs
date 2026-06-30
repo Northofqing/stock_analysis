@@ -992,14 +992,17 @@ fn build_holding_summary(
     out.push_str(&format!("🧠 持仓深度研判 · 今日 {} 只 ({} 完成, {} 失败, {} 数据缺失)\n",
         total, ok, failed.len(), missing_data.len()));
     out.push_str("─────────────────\n");
-    // 排序: 卖出 > 减持 > 观望 > 买入
+    // 排序: 强烈卖出 > 卖出 > 减持 > 观望 > 增持 > 买入 > 强烈买入
+    // 修复 (2026-06-30 codex review): 涵盖 LLM 实际输出同义词
+    // (规避/降仓 → 减持系列; 增持/加仓 → 买入系列)
     let priority = |k: &str| match k {
         k if k.contains("强烈卖出") => 0,
         k if k.contains("卖出") => 1,
-        k if k.contains("减持") => 2,
+        k if k.contains("减持") || k.contains("规避") || k.contains("降仓") => 2,
         k if k.contains("观望") => 3,
-        k if k.contains("买入") => 4,
-        k if k.contains("强烈买入") => 5,
+        k if k.contains("增持") || k.contains("加仓") => 4,
+        k if k.contains("买入") => 5,
+        k if k.contains("强烈买入") => 6,
         _ => 99,
     };
     let mut sorted_groups: Vec<_> = groups.iter().collect();
@@ -1021,8 +1024,11 @@ fn build_holding_summary(
 }
 
 /// 从 LLM markdown 提取 (操作建议, 综合分).
-/// 操作建议: 优先 "## 【操作建议】" 段第一行非空文本.
-/// 综合分: 匹配 "综合分" 关键词附近的数字.
+/// 修复 (2026-06-30 codex review): LLM prompt 用 "composite_score" 而非 "综合分",
+/// 之前 "综合分" 关键词匹配不到 → score 永远 None → 全部进 missing_data 分支.
+/// 现在匹配 "综合分" / "composite_score" / "composite score" 三种关键词.
+/// 操作建议: 优先 "## 【操作建议】" 段第一行非空文本,
+/// 再清理 markdown 噪音 (- ** / ** / 前缀).
 fn extract_advice_and_score(md: &str) -> (String, Option<f64>) {
     let mut advice = "未知".to_string();
     let mut score: Option<f64> = None;
@@ -1047,8 +1053,10 @@ fn extract_advice_and_score(md: &str) -> (String, Option<f64>) {
             advice = t.to_string();
             in_advice_section = false;
         }
-        // 提取综合分: "综合分: 45" / "综合分 45" / "综合分=45"
-        if t.contains("综合分") {
+        // 修复: 提取综合分. LLM prompt 模板用 "composite_score",
+        // 但 analysis_report 里也可能有 "综合分" (来源 build_advice 模板).
+        // 匹配 "综合分" / "composite_score" / "composite score" 三种关键词.
+        if t.contains("综合分") || t.contains("composite_score") || t.contains("composite score") {
             for token in t.split(|c: char| !c.is_ascii_digit() && c != '.') {
                 if let Ok(v) = token.parse::<f64>() {
                     if (0.0..=100.0).contains(&v) {
@@ -1059,6 +1067,13 @@ fn extract_advice_and_score(md: &str) -> (String, Option<f64>) {
             }
         }
     }
+    // 清理 advice: 移除 markdown 噪音 (- ** / ** / 前缀空格)
+    let advice = advice
+        .trim_start_matches("- ")
+        .trim_start_matches("**")
+        .trim_end_matches("**")
+        .trim()
+        .to_string();
     (advice, score)
 }
 

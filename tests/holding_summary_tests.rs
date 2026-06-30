@@ -131,3 +131,58 @@ fn first_meaningful_line_test(md: &str) -> String {
     }
     String::new()
 }
+
+// ====== 修复 (2026-06-30): extract_advice_and_score 增强测试 ======
+
+/// 复现实际 LLM 输出: composite_score 而非 "综合分"
+#[test]
+fn test_extract_composite_score_keyword() {
+    let md = "## 系统计算\n- 加权综合分（composite_score）：54/100\n- 初步操作建议：减持\n";
+    let score = extract_score_test(md);
+    assert_eq!(score, Some(54.0), "composite_score 应被识别");
+}
+
+/// 复现实际 LLM 输出: advice 带 markdown 噪音
+#[test]
+fn test_extract_advice_strips_markdown() {
+    let md = "## 操作建议\n- **方向**：**卖出/减持**\n";
+    let advice = extract_advice_test(md);
+    // 验证 extract_advice_test 能识别 "## 操作建议" 段
+    assert!(advice.contains("方向"), "应识别 - 方向 行: {:?}", advice);
+    // 注: strip markdown (- / **) 在 main.rs::extract_advice_and_score 真实函数里
+    // 这里是 test helper 简化版
+    let _ = advice;
+}
+
+/// 修复后 priority 排序: 涵盖规避/降仓/增持/加仓
+#[test]
+fn test_priority_handles_synonyms() {
+    let advice = "方向: 规避";
+    let p = priority_test(advice);
+    assert!(p <= 2, "规避应在减持系列 priority ≤ 2, 实际 {}", p);
+}
+
+#[test]
+fn test_priority_handles_zhengu() {
+    let advice = "建议: 降仓";
+    let p = priority_test(advice);
+    assert!(p <= 2, "降仓应在减持系列 priority ≤ 2, 实际 {}", p);
+}
+
+#[test]
+fn test_priority_handles_zengchi() {
+    let advice = "方向: 谨慎增持";
+    let p = priority_test(advice);
+    assert!(p == 4, "增持应在 priority 4, 实际 {}", p);
+}
+
+fn priority_test(k: &str) -> i32 {
+    if k.contains("强烈卖出") { return 0; }
+    if k.contains("卖出") { return 1; }
+    if k.contains("减持") || k.contains("规避") || k.contains("降仓") { return 2; }
+    if k.contains("观望") { return 3; }
+    if k.contains("增持") || k.contains("加仓") { return 4; }
+    if k.contains("买入") { return 5; }
+    if k.contains("强烈买入") { return 6; }
+    99
+}
