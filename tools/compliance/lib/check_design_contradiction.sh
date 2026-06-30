@@ -31,16 +31,31 @@ if [ -z "$THRESHOLD" ]; then
   exit 0
 fi
 
-# 2. 提取 rust 源码里 event_risk_score 上下文的最大封顶值
-#    找所有 min(N.0) 在 winrate_score.is_none() 路径附近
-CLAMP_MAX=$(grep -rn -A 3 "winrate_score.is_none()" "$SRC_DIR" 2>/dev/null | \
+# 2. 提取 rust 源码里 event_risk_score 的最大封顶值
+#    适配 3 种模式 (R-2 修复后):
+#    (a) 直接: min(70.0)
+#    (b) 变量: clamp_max = 70.0 (let clamp_max = if gray_open { 70.0 } else { ... })
+#    (c) 注释: // 封顶 70
+CLAMP_MAX=""
+
+# (a) 抓 min(数字) 字面量
+CLAMP_A=$(grep -rn "event_risk_score" "$REPO_ROOT/src/" 2>/dev/null | \
   grep -oE "min\([0-9.]+\)" | grep -oE "[0-9.]+" | sort -rn | head -1 || echo "")
 
-# 3. 兜底: 找 event_risk_score 的所有 clamp/min
+# (b) 抓 clamp_max = ... { 数字 } else 模式
+CLAMP_B=$(grep -rn "clamp_max\s*=" "$SRC_DIR" 2>/dev/null | \
+  grep -oE "\{\s*[0-9.]+\s*\}" | grep -oE "[0-9.]+" | sort -rn | head -1 || echo "")
+
+# (c) 兜底: 抓注释 // 封顶 数字
+#     限制: 数字后必须接非数字 (避免抓到行号 "line 647")
+CLAMP_C=$(grep -rn "event_risk_score" "$REPO_ROOT/src/" 2>/dev/null | \
+  grep -E "封顶\s*[0-9]+\.[0-9]+|[0-9]+\s*分" 2>/dev/null | \
+  grep -oE "[0-9]+\.[0-9]+" | sort -rn | head -1 || echo "")
+
+# 取三路中最大值 (灰度期的 70 是设计意图, 应被检测)
+CLAMP_MAX=$(printf "%s\n%s\n%s\n" "$CLAMP_A" "$CLAMP_B" "$CLAMP_C" | sort -rn | head -1)
 if [ -z "$CLAMP_MAX" ]; then
-  CLAMP_MAX=$(grep -rn "event_risk_score" "$REPO_ROOT/src/" 2>/dev/null | \
-    grep -oE "(min\([0-9.]+\)|clamp\([0-9.]+)" | \
-    grep -oE "[0-9.]+" | sort -rn | head -1 || echo "")
+  CLAMP_MAX="0.0"
 fi
 
 # 4. 矛盾检测

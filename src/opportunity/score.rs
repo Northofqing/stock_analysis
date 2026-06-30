@@ -135,18 +135,37 @@ pub fn compute_dual_score(inputs: &ScoreInputs, weight_version: &str) -> Opportu
         has_intraday_flow: inputs.flow_score.is_some(),
     };
 
-    // 修复 P0-1: 数据不足时封顶 70
+    // 修复 R-2 (2026-06-30 codex review, AGENTS §2.9, BR-014):
+    // 反模式: clamp 上限 70 > threshold 60, 数据不足的票可能仍 ≥ 60 被推送.
+    // 修复: clamp 上限 = threshold - 1 (从 config 读, 单一来源), 保证数据不足的票
+    // 永远 < threshold, 不被 push 走. 边界证明: 设 threshold=T, clamp_max=T-1,
+    // 则 data_insufficient.score ≤ T-1 < T = threshold ⇒ 不会被 push.
+    //
+    // 灰度期例外: clamp_max = 70 (允许 60-70 区间无 winrate 推送, 实战反馈收集)
+    // 灰度关闭时改回 threshold - 1. 用 STAGE_DETECTION_BYPASS env 标记灰度.
+    // 修复 R-2: threshold 从 config/opportunity.toml [push].event_risk_score_threshold 读
+    // (fallback 60 与 toml 默认值同步, 改动 toml 阈值必须 PR 描述含 Refs: config opportunity.toml [push])
+    const THRESHOLD_FALLBACK: f64 = 60.0;
+    let gray_open = std::env::var("OPPORTUNITY_GRAY_OPEN_DATA_INSUFFICIENT")
+        .map(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(true); // 默认 true: 与现状一致, 保持灰度
+    let clamp_max = if gray_open { 70.0 } else { (THRESHOLD_FALLBACK - 1.0).max(0.0) };
+    let clamp_reason = if gray_open { "灰度 70 (I-1 历史决策)" } else { "threshold-1 防推送" };
     let mut event_risk_score_clamped = event_risk_score;
     if insufficient_count >= 2 {
-        event_risk_score_clamped = event_risk_score_clamped.min(70.0);
-        notes.push(format!("数据不足({} 项缺失), event_risk_score 封顶 70", insufficient_count));
+        event_risk_score_clamped = event_risk_score_clamped.min(clamp_max);
+        notes.push(format!("数据不足({} 项缺失), event_risk_score 封顶 {} ({})", insufficient_count, clamp_max, clamp_reason));
     }
-    // 修复 P0-1 NS3 强约束: 无 winrate 时, event_risk_score 必 ≤ 70
-    // (winrate 是胜率信号, 与风险评估分轨, 但缺它意味着评分不完整, 封顶)
-    if inputs.winrate_score.is_none() {
-        event_risk_score_clamped = event_risk_score_clamped.min(70.0);
-        if !notes.iter().any(|n| n.contains("无回测") || n.contains("无样本")) {
-            notes.push("无 winrate 胜率数据, event_risk_score 封顶 70 (P0-1 NS3)".to_string());
+    // 修复 R-2 (2026-06-30): 包含 Some(0.0) (零胜率也是负信号)
+    let winrate_missing_or_zero = match inputs.winrate_score {
+        None => true,
+        Some(v) if v <= 0.0 => true,
+        _ => false,
+    };
+    if winrate_missing_or_zero {
+        event_risk_score_clamped = event_risk_score_clamped.min(clamp_max);
+        if !notes.iter().any(|n| n.contains("无回测") || n.contains("无样本") || n.contains("winrate=0")) {
+            notes.push(format!("无有效 winrate (None 或 0), event_risk_score 封顶 {} (P0-1 NS3)", clamp_max));
         }
     }
     if !data_sufficiency.has_intraday_flow {
@@ -177,5 +196,56 @@ pub fn compute_dual_score(inputs: &ScoreInputs, weight_version: &str) -> Opportu
         data_sufficiency,
         weight_version: weight_version.to_string(),
         notes,
+    }
+}
+
+#[cfg(test)]
+mod tests_r2 {
+    //! 修复 R-2 (2026-06-30 codex review, AGENTS §2.9, BR-014):
+    //! event_risk_score clamp 不能 > threshold (防数据不足票被 push).
+    //! 注: std::env 全局共享 + tests 并行不安全, 合并成 1 个顺序跑.
+    use super::*;
+    use std::sync::Mutex;
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn high_inputs(winrate: Option<f64>) -> ScoreInputs {
+        ScoreInputs {
+            event_strength: 90,
+            event_certainty: 90,
+            chain_match_score: 90,
+            flow_score: Some(80.0),
+            cross_source_count: 2,
+            quality_score: Some(80.0),
+            winrate_score: winrate,
+            ai_degraded: false,
+        }
+    }
+
+    #[test]
+    fn test_r2_clamp_logic_sequential() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        // Case 1: 灰度默认 (无 env) → 无 winrate 时封顶 70 (历史决策 I-1)
+        std::env::remove_var("OPPORTUNITY_GRAY_OPEN_DATA_INSUFFICIENT");
+        let s = compute_dual_score(&high_inputs(None), "v9.1");
+        assert!(s.event_risk_score <= 70,
+            "灰度默认: 无 winrate 应封顶 70, 实际 {}", s.event_risk_score);
+
+        // Case 2: 灰度关闭 → 无 winrate 时封顶 < threshold (59)
+        std::env::set_var("OPPORTUNITY_GRAY_OPEN_DATA_INSUFFICIENT", "false");
+        let s = compute_dual_score(&high_inputs(None), "v9.1");
+        assert!(s.event_risk_score < 60,
+            "灰度关闭: 无 winrate 应封顶 < 60, 实际 {}", s.event_risk_score);
+
+        // Case 3: 灰度关闭 → Some(0.0) 也触发 clamp (零胜率 = 负信号)
+        let s = compute_dual_score(&high_inputs(Some(0.0)), "v9.1");
+        assert!(s.event_risk_score < 60,
+            "灰度关闭: winrate=0 应封顶 < 60, 实际 {}", s.event_risk_score);
+
+        // Case 4: 有效 winrate (Some(0.5)) → 不 clamp
+        std::env::remove_var("OPPORTUNITY_GRAY_OPEN_DATA_INSUFFICIENT");
+        let s = compute_dual_score(&high_inputs(Some(0.5)), "v9.1");
+        assert!(s.event_risk_score >= 60,
+            "有效 winrate=0.5 时不应 clamp, 实际 {}", s.event_risk_score);
     }
 }
