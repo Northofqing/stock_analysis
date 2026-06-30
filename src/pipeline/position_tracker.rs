@@ -11,6 +11,14 @@
 //! - T+1: PositionType 锁仓检查
 //! - 保留铁律2/3/4/5 作为额外保护层
 //! - 配置 `[position_sizing] use_dynamic = false` 可回退到旧逻辑
+//!
+//! ## BR-015: 产业链集中度检查当前禁用 (2026-06-30 codex review)
+//!
+//! `track_position` 中 `risk_ctx.sizer.max_position(_, _, 0, 0, _)` 两个
+//! 0 均为 placeholder (line 327-333), 当前监控无法拒绝同产业链第 N+1 只建仓.
+//! 完整启用需要: (1) stock_position 表加 chain_name 列 (2) open_position
+//! 时存 chain_name (3) DB 查同 chain 持仓 / T+1 冻结数 (4) chain_mapper
+//! 关键词表算 chain. 待 v9.4+ 接 broker API 时统一处理.
 
 use log::{info, warn};
 
