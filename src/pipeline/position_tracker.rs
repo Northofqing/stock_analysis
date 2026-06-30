@@ -315,14 +315,15 @@ pub(super) fn track_position(
             // P0-2: 动态仓位计算 (PositionSizer 替代固定 position_shares)
             let shares = if risk_ctx.use_dynamic {
                 let volatility = result.volatility.unwrap_or(3.0);
-                // 修复 B6 (2026-06-29 codex review): chain 集中度检查在 stock_position 表加
-                // chain_name 列后启用. 当前 stock_position 表 (database/mod.rs:336) 无 chain 列,
+                // 修复 B6 (2026-06-29 codex review) + BR-015 (2026-06-30):
+                // chain 集中度检查在 stock_position 表加 chain_name 列后启用.
+                // 当前 stock_position 表 (database/mod.rs:336) 无 chain 列,
                 // 要做需要: (1) schema migration 加列 (2) open_position 时存 chain_name
                 // (3) 查 DB 数同 chain 持仓/T+1 冻结数 (4) 通过 chain_mapper 关键词表算 chain.
-                // 当前 hardcoded 0 = 禁用产业链集中度折扣, 等 v9.4+ 接 broker API 时一起做.
+                // 当前 hardcoded 0 = 禁用产业链集中度折扣, 见 docs/business_rules.md BR-015.
                 // 警告日志让 operator 知道 chain 集中度检查当前不生效.
                 if !risk_ctx.use_dynamic {
-                    warn!("[{}] chain 集中度检查暂未启用 (TODO B6), max_position 用 base × vol × regime", code);
+                    warn!("[{}] chain 集中度检查暂未启用 (BR-015), max_position 用 base × vol × regime", code);
                 }
                 let max_amount = risk_ctx.sizer.max_position(
                     risk_ctx.regime,
