@@ -499,7 +499,6 @@ impl BacktestEngine {
         //   - 熊市 (高 σ): 滑点大
         // 量化分析师要求: 固定 10bps 在不同市值/波动率股票间误差 5-10x
         let slippage_rate = self.compute_dynamic_slippage(code, price * shares);
-        let slippage_rate = self.compute_dynamic_slippage(code, price * shares);
         let actual_price = price * (1.0 + slippage_rate); // 买入滑点
         let amount = actual_price * shares;
         let commission = amount * self.config.commission_rate;
