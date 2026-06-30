@@ -18,7 +18,6 @@ use crate::agent::{
     ValidationEngine,
 };
 use crate::analyzer::GeminiAnalyzer;
-use crate::data_provider::service;
 use crate::data_provider::KlineData;
 use anyhow::Result;
 use async_openai::{config::OpenAIConfig, Client};
@@ -61,6 +60,24 @@ fn check_kline_freshness(code: &str, kline: &[KlineData]) -> Result<()> {
             )
         })?;
     Ok(())
+}
+
+/// 修复 v9.4.26 P3: 走 DataFetcherManager 路径 (RustDX 优先) 而不是 service::service().get_kline.
+/// 后者东方财富 → 腾讯 → RustDX 顺序在东方财富被 ban / 腾讯返回旧数据时拿到 2025 年 K 线.
+/// 跟 backfill_daily 一致, 用 DataFetcherManager::new() 拿多源回落 (RustDX → 腾讯 → 东方财富).
+async fn fetch_kline_via_manager(code: &str, days: usize) -> Result<Vec<KlineData>> {
+    let manager = crate::data_provider::DataFetcherManager::new()
+        .map_err(|e| anyhow::anyhow!("DataFetcherManager 初始化失败: {e}"))?;
+    let (kline, source) = manager
+        .get_daily_data(code, days)
+        .map_err(|e| anyhow::anyhow!("K 线获取失败: {e}"))?;
+    log::info!(
+        "[MultiAgent] {} K 线来源: {}, {} 条",
+        code,
+        source,
+        kline.len()
+    );
+    Ok(kline)
 }
 
 const DEFAULT_MAX_ITERATIONS: usize = 12;
@@ -272,8 +289,11 @@ pub async fn run_react_analysis(code: &str) -> Result<String> {
 pub async fn run_multi_agent_analysis(code: &str) -> Result<String> {
     log::info!("[MultiAgent] 开始抓取数据：{}", code);
 
-    // 1. K 线（service 缓存）
-    let kline = service::service().get_kline(code, 250).await?;
+    // 1. K 线（修复 v9.4.26 P3）: 走 DataFetcherManager 路径
+    //    (RustDX → 腾讯 → 东方财富) 而不是 service::service().get_kline
+    //    (东方财富 → 腾讯 → RustDX). 后者东方财富被 ban 时落到腾讯
+    //    拿到 2025 年旧数据. 走 DataFetcherManager 让 RustDX 当首选.
+    let kline = fetch_kline_via_manager(code, 250).await?;
     if kline.is_empty() {
         anyhow::bail!("K 线数据为空，无法进行多角色分析");
     }
