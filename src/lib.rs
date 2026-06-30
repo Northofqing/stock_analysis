@@ -122,7 +122,32 @@ where
 {
     use tokio::runtime::Handle;
     match Handle::try_current() {
-        Ok(handle) => handle.block_on(fut),
+        Ok(handle) => {
+            // 修复 v9.4.15 (2026-06-29 production panic):
+            // 在 tokio runtime 内直接 handle.block_on(fut) 会 panic
+            // "Cannot start a runtime from within a runtime" (占住 worker).
+            //
+            // 正确做法: 检测 runtime flavor 分支处理:
+            //  - multi_thread: block_in_place + block_on 安全 (让出 worker)
+            //  - current_thread: block_in_place 会 panic! 这种情况应 panic
+            //    带 actionable error (用户应该用 spawn_blocking 隔离 sync API)
+            match handle.runtime_flavor() {
+                tokio::runtime::RuntimeFlavor::MultiThread => {
+                    tokio::task::block_in_place(|| handle.block_on(fut))
+                }
+                _ => {
+                    // CurrentThread (旧版 tokio) 或其他 flavor:
+                    // block_in_place 会 panic! 用 actionable error.
+                    panic!(
+                        "block_on_async: 不能在 {:?} runtime 内直接 block_on\n\
+                         解决: 1) 数据源调用方用 tokio::task::spawn_blocking 包装 sync API\n\
+                         解决: 2) 把 #[tokio::main] 改成 Builder::new_multi_thread().enable_all().build()\n\
+                         参考: v9.4.15 (2026-06-29) audit Top10#5 修复",
+                        handle.runtime_flavor()
+                    );
+                }
+            }
+        }
         Err(_) => {
             // 不在 tokio runtime 内 (e.g. 同步 binary, 测试).
             // 建 current_thread runtime 临时跑, 避免多 Runtime 嵌套.

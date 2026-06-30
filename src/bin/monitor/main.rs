@@ -284,7 +284,11 @@ async fn push_virtual_next_day_review_if_needed() {
     }
 }
 
-#[tokio::main]
+// 修复 v9.4.15 (2026-06-29 production panic):
+// 之前默认 current_thread runtime, block_on_async Ok 分支 handle.block_on(fut) panic
+// "Cannot start a runtime from within a runtime".
+// 改 multi_thread 让 block_in_place 安全让出 worker.
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     dotenvy::dotenv().ok();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))

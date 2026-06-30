@@ -391,7 +391,7 @@ mod tests {
         .unwrap()
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_get_stock_name() {
         with_provider(|p| {
             for code in ["600519", "000001", "002413"] {
@@ -404,7 +404,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_get_daily_data() {
         with_provider(|p| {
             match p.get_daily_data("600519", 30) {
@@ -423,7 +423,7 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_different_markets() {
         with_provider(|p| {
             for (code, market) in [("600519", "上海"), ("000001", "深圳"), ("300750", "创业板")] {
