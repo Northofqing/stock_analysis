@@ -62,8 +62,11 @@ pub fn validate_quote_freshness(update_time: DateTime<Local>, source: &str, code
 pub fn validate_nav_freshness(nav_date: NaiveDate) -> bool {
     let stats = DqStats::new();
     let freshness = monitor_freshness_config();
-    match data_quality::validate_freshness(
-        FreshnessDataType::Nav,
+    // 修复 (2026-06-30 codex review): 之前用 validate_freshness(_, Local::now(), _)
+    // 导致 age = now() - now() = 0 永远 Ok, 违反 AGENTS §2.4.
+    // 改用 validate_daily_freshness: calendar-aware, 按交易日阈值判定.
+    match data_quality::validate_daily_freshness(
+        nav_date,
         chrono::Local::now(),
         &freshness,
         &stats,
@@ -88,5 +91,28 @@ pub fn monitor_freshness_config() -> FreshnessConfig {
         position_max_age_secs: cfg.dq_position_stale_sec,
         nav_max_age_secs: cfg.dq_nav_stale_sec,
         daily_max_age_secs: cfg.dq_daily_stale_sec,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Datelike;
+
+    #[test]
+    fn validate_nav_freshness_passes_recent_date() {
+        // 今天或前一个交易日应通过 (阈值默认 86400s = 1 交易日)
+        let today = chrono::Local::now().date_naive();
+        assert!(validate_nav_freshness(today));
+    }
+
+    #[test]
+    fn validate_nav_freshness_rejects_old_date() {
+        // 修复 (2026-06-30 codex review): 修复前 always-passes,
+        // 这个测试现在能正确捕获 stale data.
+        let today = chrono::Local::now().date_naive();
+        // 一年前肯定 stale (远超 1 交易日阈值)
+        let old = chrono::NaiveDate::from_ymd_opt(today.year() - 1, today.month(), today.day()).unwrap();
+        assert!(!validate_nav_freshness(old));
     }
 }
