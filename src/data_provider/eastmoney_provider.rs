@@ -266,6 +266,7 @@ impl HttpProvider {
                 is_limit_up: false,
                 is_limit_down: false,
                 is_suspended: false,
+                adjust: crate::data_provider::AdjustType::Qfq, // 东财 URL fqt=1 前复权
             };
             
             result.push(kline);

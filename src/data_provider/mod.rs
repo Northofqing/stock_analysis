@@ -38,6 +38,26 @@ use chrono::NaiveDate;
 use std::collections::HashMap;
 use std::sync::RwLock;
 
+/// 复权方式标注 — v11 P0-2 引入
+///
+/// 每条 K 线标注其价格口径,便于切源时下游比对。
+/// - `Qfq`: 前复权 (腾讯/东财 HTTP 直出, 或 RustDX 经 gbbq 计算)
+/// - `None`: 不复权 (历史默认值; DB 反序列化路径也用此值, 语义为"上游假定 Qfq, 字段值不可知")
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AdjustType {
+    Qfq,
+    None,
+}
+
+impl AdjustType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AdjustType::Qfq => "qfq",
+            AdjustType::None => "none",
+        }
+    }
+}
+
 /// 实时行情数据（包含盈利指标）
 #[derive(Debug, Clone)]
 pub struct RealtimeQuote {
@@ -100,6 +120,8 @@ pub struct KlineData {
     pub is_limit_up: bool,            // 是否涨停
     pub is_limit_down: bool,          // 是否跌停
     pub is_suspended: bool,           // 是否停牌
+    // v11 P0-2: 复权方式标注
+    pub adjust: AdjustType,           // 该 K 线价格是前复权 (Qfq) 还是不复权 (None)
 }
 
 /// 数据提供者接口
@@ -267,5 +289,26 @@ impl DataFetcherManager {
 impl Default for DataFetcherManager {
     fn default() -> Self {
         Self::new().expect("创建DataFetcherManager失败")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// v11 P0-2: AdjustType as_str 应返回稳定的小写字符串,用于 data_source 复合命名 (rustdx_qfq / tencent_qfq / eastmoney_qfq)
+    #[test]
+    fn adjust_type_as_str_stable() {
+        assert_eq!(AdjustType::Qfq.as_str(), "qfq");
+        assert_eq!(AdjustType::None.as_str(), "none");
+    }
+
+    /// v11 P0-2: AdjustType 必须是 Copy (赋值零成本),且支持 PartialEq 比较
+    #[test]
+    fn adjust_type_is_copy_and_eq() {
+        let a = AdjustType::Qfq;
+        let b = a; // Copy: a 仍然可用
+        assert_eq!(a, b);
+        assert_ne!(AdjustType::Qfq, AdjustType::None);
     }
 }

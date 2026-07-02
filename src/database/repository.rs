@@ -76,6 +76,8 @@ fn stock_daily_to_kline(r: StockDaily) -> KlineData {
         is_limit_up: false,
         is_limit_down: false,
         is_suspended: false,
+        // DB 反序列化: schema 不存 adjust, 字段值不可知. 语义为"上游假定 Qfq".
+        adjust: crate::data_provider::AdjustType::None,
     }
 }
 
@@ -195,6 +197,7 @@ mod tests {
             is_limit_up: false,
             is_limit_down: false,
             is_suspended: false,
+            adjust: crate::data_provider::AdjustType::None,
         }
     }
 

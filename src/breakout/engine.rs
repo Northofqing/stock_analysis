@@ -249,6 +249,7 @@ mod tests {
             financials_history: None, valuation_history: None,
             consensus: None, industry: None,
             is_limit_up: false, is_limit_down: false, is_suspended: false,
+            adjust: crate::data_provider::AdjustType::None,
         }
     }
 

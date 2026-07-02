@@ -182,6 +182,8 @@ impl RustdxProvider {
                 is_limit_up: false,
                 is_limit_down: false,
                 is_suspended: false,
+                // TODO(v11/commit-2): 接入 gbbq 复权计算后改为 AdjustType::Qfq
+                adjust: crate::data_provider::AdjustType::None,
             }
         }).collect();
         

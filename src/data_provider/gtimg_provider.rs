@@ -278,6 +278,7 @@ impl GtimgProvider {
                 is_limit_up: false,
                 is_limit_down: false,
                 is_suspended: false,
+                adjust: crate::data_provider::AdjustType::Qfq, // 腾讯 URL ,qfq 前复权
             };
             
             result.push(kline_data);

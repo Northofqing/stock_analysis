@@ -582,6 +582,7 @@ mod tests_br006 {
                 is_limit_up: false,
                 is_limit_down: false,
                 is_suspended: false,
+                adjust: crate::data_provider::AdjustType::None,
             })
             .collect();
         // 验证我们的逻辑: 最新日期 = today, 最旧日期 = today - 250 days
