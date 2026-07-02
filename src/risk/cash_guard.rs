@@ -1,6 +1,5 @@
 //! 现金警戒 — 底仓现金不得低于阈值。
-
-use crate::portfolio::Position;
+//! BR-015: 产业链集中度检查的下游消费者 (上游 position_tracker.rs:314-340, 当前禁用待 stock_position 加 chain_name 列后启用)
 
 pub struct CashGuard {
     pub floor_pct: f64, // 现金占比下限，默认 15%

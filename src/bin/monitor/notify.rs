@@ -23,6 +23,13 @@ use crate::{
 };
 
 pub async fn push_wechat(text: &str) -> bool {
+    // v10 P6 5 要素接入: V10_DRY_RUN_PUSH=1 时跳过实际推送, 仅 log
+    // 用于开发/验证推送内容变化, 不骚扰飞书
+    if std::env::var("V10_DRY_RUN_PUSH").ok().as_deref() == Some("1") {
+        log::info!("[V10_DRY_RUN_PUSH] 跳过飞书推送, 内容预览:\n{}", text);
+        return true;
+    }
+
     let send_type = resolve_send_type();
     let send_transport = resolve_send_transport(send_type);
 

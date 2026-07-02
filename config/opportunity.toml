@@ -21,7 +21,7 @@ incremental_interval_min = 5
 # 盘前 batch: 1 个交易日内 (spec §5.1)
 batch_max_age_hours = 24
 # 盘中 incremental: 5min (快讯新鲜度)
-incremental_max_age_min = 5
+incremental_max_age_min = 20
 
 # 修复 v9.1 §0 NS3 + §4 B10 推送分层
 # 70-79: 入候选池 (复盘查阅, 不主动推)
@@ -35,6 +35,7 @@ incremental_max_age_min = 5
 #            NS3 真要收紧时改回 75+ 让 70 上限严格生效.
 # Refs: spec §0 NS3, AGENTS §2.9 (灰度决策需边界证明注释)
 [push]
+# BR-014: event_risk_score clamp_max < threshold, 禁止 clamp > threshold
 event_risk_score_threshold = 60
 # 跨源要求 (true = 必须快讯 + Web 双源共振, 降低单源假信号)
 # 沙盘/灰度阶段推荐 false, 实盘阶段 true

@@ -24,7 +24,7 @@ pub fn save_prediction(
         Err(_) => { log::warn!("[Prediction] DB 不可用"); return; }
     };
 
-    if let Err(e) = db.save_prediction(&today, &tomorrow, theme, stock, direction, score, detail) {
+    if let Err(e) = db.save_prediction_legacy(&today, &tomorrow, theme, stock, direction, score, detail) {
         log::warn!("[Prediction] 保存失败: {}", e);
     } else {
         log::info!("[Prediction] ✓ {} {} {}分", direction, stock.unwrap_or(theme.unwrap_or("?")), score);

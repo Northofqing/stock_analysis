@@ -11,6 +11,10 @@ pub mod winrate;  // 修复 P1-2: winrate 二元化
 pub mod launch_gate;  // 修复 P0-3: 上线门槛
 pub mod event_extractor;
 pub mod scheduler;  // 修复 v9.1 §1.3: 调度器
+pub mod hit_case;  // v10 P0.1 BC-3: 5 边界 hit CASE 逻辑
+pub mod virtual_reason;  // v10 P0.2 BR-016: VirtualReason 枚举 + 主理由优先级
+pub mod auction_agent;  // v10 P0.2: 09:25 竞价 Agent
+pub mod real_alpha;  // v10 P0.3 BC-1: real_alpha + A/B/C 置信度 + 5 要素信封
 
 use crate::data_provider::{assess_quality, fetch_financials};
 use crate::data_provider::service;
@@ -1007,14 +1011,20 @@ pub async fn run_post_close_candidates(top_n: usize) -> String {
     if hits.is_empty() {
         return "🎯 优选候选：未命中产业链，不输出候选".to_string();
     }
+    log::info!("[PostClose] map_news_to_chains_ai 命中 {} 条链", hits.len());
     let mut hits = tokio::task::spawn_blocking(move || {
         chain_mapper::resolve_stocks(&mut hits);
         hits
     })
     .await
     .unwrap_or_default();
+    let before_retain = hits.len();
     hits.retain(|h| !h.stocks.is_empty());
-    let (hits, _dropped) = gate_hits(hits, &flash_titles, &web_results);
+    log::info!("[PostClose] resolve_stocks 后: {} 条 → retain 后 {} 条 (保留有成分股的)", before_retain, hits.len());
+    let (hits, dropped) = gate_hits(hits, &flash_titles, &web_results);
+    if !dropped.is_empty() {
+        log::info!("[PostClose] gate_hits 过滤掉: {}", dropped.join(" | "));
+    }
     if hits.is_empty() {
         return "🎯 优选候选：产业链信号可信度不足（已降级观察）".to_string();
     }

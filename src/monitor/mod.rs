@@ -24,6 +24,7 @@ pub mod risk;
 pub mod signal_fusion;
 pub mod checklist;
 pub mod prediction;
+pub mod attribution;  // v10 P1 G5a 异动即时归因 (规则快归因, P95 ≤ 2s)
 pub mod adaptive;
 pub mod alert_log;
 pub mod entity_linker;

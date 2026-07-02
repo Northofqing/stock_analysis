@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # BR-007: 季度 winrate review — 跑 backfill + simulator, 输出 markdown 报告
+# BR-009: 整体 5min timeout (env MONITOR_REVIEW_TIMEOUT_SECS 可覆盖, 0/负数/非法 fallback)
 #
 # 用途: 季度 cron 跑一次, 跟踪主题胜率漂移, 给"下次评估"清单.
 # 设计哲学 (AGENTS §2.4): 数据驱动决策循环, 主动发现需要关停/加权的主题.
@@ -18,10 +19,24 @@
 # 退出码:
 #   0 = 跑通, 报告已生成
 #   1 = backfill / simulator 失败
+#   2 = BR-009 timeout
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+# shellcheck source=./_timeout_lib.sh
+source "$SCRIPT_DIR/_timeout_lib.sh"
+
+# BR-009: 整体 5min timeout (默认), env 覆盖
+TIMEOUT_SECS="${MONITOR_REVIEW_TIMEOUT_SECS:-300}"
+# codex P1#5 修复: DAYS 必须在 with_timeout 外层解析, 否则 bash -c 子 shell 看不到
+# 优先级: $1 (CLI) > env V10_DAYS > 默认 14
+DAYS="${1:-${V10_DAYS:-14}}"
+echo "BR-009 timeout: ${TIMEOUT_SECS}s (env MONITOR_REVIEW_TIMEOUT_SECS 可覆盖)"
+echo "DAYS: $DAYS"
+
+with_timeout "$TIMEOUT_SECS" bash -c '
+set -euo pipefail
 DAYS="${1:-14}"
 DB_PATH="${STOCK_DB:-$REPO_ROOT/data/stock_analysis.db}"
 REPORTS_DIR="$REPO_ROOT/reports"
@@ -125,3 +140,7 @@ echo "  推送: $TOTAL_PUSH, 命中: $TOTAL_HITS, pending: $PENDING"
 echo ""
 echo "查看完整报告:"
 echo "  cat $REPORT"
+' _ "$DAYS" || { rc=$?; if [ $rc -eq 2 ]; then
+  echo "✗ BR-009 timeout: winrate_review.sh 超过 ${TIMEOUT_SECS}s" >&2
+fi
+exit $rc; }

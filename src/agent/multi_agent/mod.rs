@@ -18,6 +18,7 @@
 mod analysts;
 mod arbitrator;
 mod debate;
+pub mod cost_board;  // v10 P2 Q7=C 成本看板 (自适应阈值 + 自动回退)
 pub(super) mod slices;
 pub(super) mod trace;
 

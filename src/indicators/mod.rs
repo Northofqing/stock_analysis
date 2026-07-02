@@ -33,6 +33,7 @@ mod cross;
 mod divergence;
 mod kdj;
 mod macd;
+mod multi_period;  // v10 P3 G1: 多周期确认 (日/周/月本地聚合, 不新数据源)
 mod rsi;
 mod skdj;
 

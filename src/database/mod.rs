@@ -445,6 +445,47 @@ impl DatabaseManager {
         )
         .execute(&mut *conn)?;
 
+        // v10 P0.1 (G0) — prediction_tracker 加 12 列 (idempotent ALTER, 2026-07-01)
+        // 设计: BR-016/017/020 落表; 12 列 = 1+1+3+3+3+1
+        // 1+1 = reason / reason_secondary (主/副理由, 枚举, v10 §10.3)
+        // 3   = actual_change_t1/t3/t5 (T+1/T+3/T+5 实际涨跌幅, BC-3)
+        // 3   = hit_t1/t3/t5 (三窗口命中布尔, BC-3)
+        // 3   = market_up_rate_t1/t3/t5 (同日同窗市场基准, BC-1, Q2=B 全市场上涨家数占比)
+        // 1   = t1_special_case (停牌/涨停/跌停/正常, BC-3)
+        //
+        // BR-016/017/020 落表; 幂等: 列已存在时 SQLite 报 "duplicate column name"
+        //
+        // BUG FIX (codex B1): 之前用 `let _ = ...` 吞错, DB 损坏/权限不足时静默 fail
+        // 现在区分: "duplicate column" → 静默 (幂等), 其他错误 → 返回 Err 显式报错
+        for col_def in [
+            "ALTER TABLE prediction_tracker ADD COLUMN reason TEXT",
+            "ALTER TABLE prediction_tracker ADD COLUMN reason_secondary TEXT",
+            "ALTER TABLE prediction_tracker ADD COLUMN actual_change_t1 REAL",
+            "ALTER TABLE prediction_tracker ADD COLUMN actual_change_t3 REAL",
+            "ALTER TABLE prediction_tracker ADD COLUMN actual_change_t5 REAL",
+            "ALTER TABLE prediction_tracker ADD COLUMN hit_t1 INTEGER",
+            "ALTER TABLE prediction_tracker ADD COLUMN hit_t3 INTEGER",
+            "ALTER TABLE prediction_tracker ADD COLUMN hit_t5 INTEGER",
+            "ALTER TABLE prediction_tracker ADD COLUMN market_up_rate_t1 REAL",
+            "ALTER TABLE prediction_tracker ADD COLUMN market_up_rate_t3 REAL",
+            "ALTER TABLE prediction_tracker ADD COLUMN market_up_rate_t5 REAL",
+            "ALTER TABLE prediction_tracker ADD COLUMN t1_special_case TEXT",
+        ] {
+            match diesel::sql_query(col_def).execute(&mut *conn) {
+                Ok(_) => {}
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if err_str.contains("duplicate column") {
+                        // 幂等: 列已存在, 跳过 (这是 re-run 期望行为)
+                    } else {
+                        // 真错误: DB 损坏/权限不足/磁盘满, 显式返回 Err
+                        eprintln!("[DatabaseManager::init_schema] ✗ 真错误 (col_def={}): {}", col_def, e);
+                        return Err(Box::new(e));
+                    }
+                }
+            }
+        }
+
         // 概念共振表（Phase 4 动态产业链拓扑）
         diesel::sql_query(
             r#"
@@ -488,6 +529,9 @@ impl DatabaseManager {
     }
 
     /// 保存预测记录（Phase 5 预测闭环）
+    ///
+    /// v10 P0.2 (BR-016): 加 `reason` + `reason_secondary` 参数, 写盘口时记主/副理由
+    /// 向后兼容: reason/reason_secondary 默认为 None (走 v9 旧路径)
     pub fn save_prediction(
         &self,
         pred_date: &str,
@@ -497,17 +541,74 @@ impl DatabaseManager {
         direction: &str,
         score: f64,
         detail: Option<&str>,
+        reason: Option<&str>,
+        reason_secondary: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut conn = self.get_conn()?;
-        let tn = theme_name.unwrap_or("");
-        let sc = stock_code.unwrap_or("");
-        let det = detail.unwrap_or("");
+        // codex P0#3: escape 单引号 (`'` → `''`) 防 SQL injection
+        // 项目惯例: raw SQL 嵌入字符串, 标准 SQL escape 用双单引号
+        let esc = |s: &str| s.replace('\'', "''");
+        let tn = esc(theme_name.unwrap_or(""));
+        let sc = esc(stock_code.unwrap_or(""));
+        let det = esc(detail.unwrap_or(""));
+        let rsn = esc(reason.unwrap_or(""));
+        let rsn2 = esc(reason_secondary.unwrap_or(""));
+        let pd = esc(pred_date);
+        let td = esc(target_date);
+        let dir = esc(direction);
         diesel::sql_query(format!(
-            "INSERT INTO prediction_tracker (pred_date, target_date, theme_name, stock_code, pred_direction, pred_score, pred_detail) VALUES ('{}', '{}', '{}', '{}', '{}', {}, '{}')",
-            pred_date, target_date, tn, sc, direction, score, det
+            "INSERT INTO prediction_tracker (pred_date, target_date, theme_name, stock_code, pred_direction, pred_score, pred_detail, reason, reason_secondary) VALUES ('{}', '{}', '{}', '{}', '{}', {}, '{}', '{}', '{}')",
+            pd, td, tn, sc, dir, score, det, rsn, rsn2
         ))
         .execute(&mut *conn)?;
         Ok(())
+    }
+
+    /// v10 P0.2 便捷重载: 不带 reason (旧调用路径, 走 v9 旧行为)
+    pub fn save_prediction_legacy(
+        &self,
+        pred_date: &str,
+        target_date: &str,
+        theme_name: Option<&str>,
+        stock_code: Option<&str>,
+        direction: &str,
+        score: f64,
+        detail: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.save_prediction(
+            pred_date, target_date, theme_name, stock_code, direction, score, detail, None, None,
+        )
+    }
+
+    /// 统计 prediction_tracker 总记录数 (用于 sample_threshold 动态计算)
+    pub fn count_predictions(&self) -> Result<i64, Box<dyn std::error::Error>> {
+        let mut conn = self.get_conn()?;
+        #[derive(diesel::QueryableByName)]
+        struct PredCountRow {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            cnt: i64,
+        }
+        let result = diesel::sql_query("SELECT COUNT(*) AS cnt FROM prediction_tracker")
+            .get_result::<PredCountRow>(&mut *conn)?;
+        Ok(result.cnt)
+    }
+
+    /// 统计某 reason 的记录数 (用于 sample_threshold 判断)
+    pub fn count_predictions_by_reason(&self, reason: &str) -> Result<i64, Box<dyn std::error::Error>> {
+        let mut conn = self.get_conn()?;
+        #[derive(diesel::QueryableByName)]
+        struct PredReasonCountRow {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            cnt: i64,
+        }
+        // codex P0#3: escape 单引号防 SQL injection
+        let rsn = reason.replace('\'', "''");
+        let result = diesel::sql_query(format!(
+            "SELECT COUNT(*) AS cnt FROM prediction_tracker WHERE reason = '{}'",
+            rsn
+        ))
+        .get_result::<PredReasonCountRow>(&mut *conn)?;
+        Ok(result.cnt)
     }
 
     /// 更新预测结果（次日收盘后回调）

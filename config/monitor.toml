@@ -15,14 +15,14 @@ topic_mmr_history_penalty = 1.4
 topic_history_window_hours = 72
 topic_history_memory_size = 160
 topic_history_db_limit = 400
-topic_news_max_age_days = 5    # 主题/Web 搜索新闻新鲜度窗口（天），超过即丢弃（AGENTS 2.4）
+topic_news_max_age_days = 3    # 主题/Web 搜索新闻新鲜度窗口（天），超过即丢弃（AGENTS 2.4）
 
 # ── 数据新鲜度阈值（AGENTS 2.4） ──
-dq_quote_stale_sec = 5         # 实时行情
+dq_quote_stale_sec = 6         # 实时行情
 dq_position_stale_sec = 30     # 持仓/资金
 dq_nav_stale_sec = 86400       # 净值（当日有效）
 dq_daily_stale_sec = 86400     # 日线/历史数据（1交易日内）
-opportunity_min_confidence = 55      # 产业链命中置信度阈值（0-100）
+opportunity_min_confidence = 45      # v10 P0.3 修复:55→45 沙盘阶段单源告警可见(score=45=2条flash+0web交叉,仅复盘不实时推送,AGENTS§2.9)
 opportunity_require_cross_source = false # true=必须快讯+Web双源共振
 
 # ── 实时否决链配置 (VetoChain) ──

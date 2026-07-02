@@ -555,6 +555,7 @@ async fn run_test_scan() {
     let _ = tokio::task::spawn_blocking(snapshot_portfolio_value).await;
 
     // 13. 产业链扫描（v3 新增）
+    // BR-005: 每天推送机会数 ≤ 5, 超过入候选池
     let scan = stock_analysis::opportunity::run_opportunity_scan().await;
     log::info!("[测试] 产业链扫描:\n{}", scan.chain_text);
     push_wechat(&scan.chain_text).await;
@@ -1044,7 +1045,129 @@ fn build_holding_summary(
     if !missing_data.is_empty() {
         out.push_str(&format!("\n📊 数据缺失 (BR-011 触发): {}\n", missing_data.join(", ")));
     }
+
+    // v10 §6.1 5 要素信封 (聚合层, 全局)
+    out.push_str(&build_v10_envelope_footer(holdings, by_code, &groups, &failed, &missing_data));
+
     out
+}
+
+/// v10 §6.1 5 要素信封 footer (聚合层)
+/// 现有"按操作建议分组"已含详细数据, 这里补 5 要素结构 (主因/置信度/4 视角/分层/留白)
+fn build_v10_envelope_footer(
+    holdings: &[stock_analysis::portfolio::Position],
+    by_code: &std::collections::HashMap<String, (String, Option<String>)>,
+    groups: &std::collections::BTreeMap<String, Vec<String>>,
+    failed: &[String],
+    missing_data: &[String],
+) -> String {
+    // codex P0#4 修复: 4 视角从实际数据算, 不再硬编码
+    let total = holdings.len();
+    let ok = by_code.values().filter(|(_, m)| m.is_some()).count();
+
+    // 平均 composite score (从 by_code 的 LLM md 提取)
+    let scores: Vec<f64> = by_code.values()
+        .filter_map(|(_, m)| m.as_ref())
+        .filter_map(|md| extract_advice_and_score(md).1)
+        .collect();
+    let avg_score = if scores.is_empty() { 0.0 } else { scores.iter().sum::<f64>() / scores.len() as f64 };
+    let score_range = if scores.is_empty() {
+        "N/A".to_string()
+    } else {
+        let min = scores.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        format!("{:.0}-{:.0}", min, max)
+    };
+
+    // 情绪共识: 减持/观望/买入 占比
+    let total_in_groups: usize = groups.values().map(|v| v.len()).sum();
+    let reduce_count = groups.keys().filter(|k| k.contains("减持") || k.contains("规避") || k.contains("降仓") || k.contains("减仓")).map(|_| 0).sum::<usize>();
+    let reduce_count: usize = groups.iter()
+        .filter(|(k, _)| k.contains("减持") || k.contains("规避") || k.contains("降仓") || k.contains("减仓"))
+        .map(|(_, v)| v.len())
+        .sum();
+    let hold_count: usize = groups.iter()
+        .filter(|(k, _)| k.contains("观望") || k.contains("持有") || k.contains("等待"))
+        .map(|(_, v)| v.len())
+        .sum();
+    let buy_count: usize = groups.iter()
+        .filter(|(k, _)| k.contains("买入") || k.contains("增持") || k.contains("加仓"))
+        .map(|(_, v)| v.len())
+        .sum();
+
+    // 1. 主因 (≤ 25 字)
+    let main_reason = if missing_data.len() > 0 {
+        format!("{} 只数据缺失, 仅推送有效研判", missing_data.len())
+    } else if total == 0 {
+        "无持仓, 维持观察".to_string()
+    } else if reduce_count > 0 {
+        format!("{} 只减持共识 (avg {:.0})", reduce_count, avg_score)
+    } else if hold_count > 0 {
+        "持有观望, 等待明确信号".to_string()
+    } else {
+        format!("{} 只持仓, 助决策", total)
+    };
+
+    // 2. 置信度 A/B/C (聚合层: 数据完整 → B, 有缺失 → C)
+    let confidence_str = if missing_data.is_empty() { "B" } else { "C" };
+
+    // 3. 4 视角速览 (实际数据, codex P0#4)
+    let four_views = format!(
+        "   · 公司/事件: {ok}/{total} 只 multi_agent 跑通 (composite {score_range})\n   · 资金:       ⚠️ 北向资金 MISSING (BR-012 触发, 0.0 假成功已拦)\n   · 技术:       avg score {avg_score:.1}, range {score_range}\n   · 情绪:       减持 {reduce_count} 只 / 观望 {hold_count} 只 / 买入 {buy_count} 只"
+    );
+
+    // 4. 分层建议 (从 groups 推断, 同义词覆盖)
+    let mut tier = String::new();
+    let has_strong_sell = groups.keys().any(|k| k.contains("强烈卖出"));
+    let has_sell = groups.keys().any(|k| k.contains("卖出") && !k.contains("强烈"));
+    let has_reduce = groups.keys().any(|k| k.contains("减持") || k.contains("规避") || k.contains("降仓") || k.contains("减仓"));
+    let has_hold = groups.keys().any(|k| k.contains("观望") || k.contains("持有") || k.contains("等待"));
+    let has_buy = groups.keys().any(|k| k.contains("买入") || k.contains("增持") || k.contains("加仓"));
+
+    if has_strong_sell {
+        tier.push_str("   · 激进: 立即清仓 (强烈卖出共识)\n");
+    } else if has_sell {
+        tier.push_str("   · 激进: 减仓优先 (卖出共识)\n");
+    }
+    if has_reduce {
+        tier.push_str("   · 稳健: 减仓 30-50%, 等待企稳\n");
+    }
+    if has_hold {
+        tier.push_str("   · 保守: 持有不动, 不加仓\n");
+    }
+    if has_buy {
+        tier.push_str("   · 机会: 逢低加仓 (买入共识)\n");
+    }
+    if tier.is_empty() {
+        tier.push_str("   · (无明确操作建议, 需查 LLM 输出)\n");
+    }
+
+    // 5. 留白 (MISSING 项, BR-011 强制)
+    let mut missing = Vec::new();
+    if !missing_data.is_empty() {
+        missing.push(format!("{} 只综合分 (BR-011)", missing_data.len()));
+    }
+    missing.push("北向资金 (BR-012, MISSING 标记)".to_string());
+    if !failed.is_empty() {
+        missing.push(format!("{} 只多 Agent 失败 (待重试)", failed.len()));
+    }
+
+    // 渲染 5 要素 (聚合层 footer)
+    let mut envelope = String::new();
+    envelope.push_str("\n─────────────────\n");
+    envelope.push_str("📦 v10 §6.1 5 要素信封 (聚合层)\n");
+    envelope.push_str(&format!("① 主因 (1 句话): {}\n", main_reason));
+    envelope.push_str(&format!("② 置信度: {} (聚合层, A=多源/B=单源/C=推算)\n", confidence_str));
+    envelope.push_str("③ 4 视角速览:\n");
+    envelope.push_str(&four_views);
+    envelope.push('\n');
+    envelope.push_str("④ 分层建议:\n");
+    envelope.push_str(&tier);
+    envelope.push_str("⑤ 留白: ");
+    envelope.push_str(&missing.join(", "));
+    envelope.push('\n');
+
+    envelope
 }
 
 /// 从 LLM markdown 提取 (操作建议, 综合分).
