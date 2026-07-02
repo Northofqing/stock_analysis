@@ -389,48 +389,112 @@ pub fn quick_validate(tick: &Tick, config: &DqConfig) -> Result<(), DqRejectReas
     validate_tick(tick, None, config, &stats)
 }
 
-/// 日线最小质检：OHLC 一致性 + 开盘跳空异常。
+/// v11 P0-1 commit 3: 按代码前缀返回该股的跳空阈值 (单位: 百分比, 与 `validate_daily_kline_quality` 一致)
 ///
-/// - OHLC 一致性：`high >= max(open, close)` 且 `low <= min(open, close)` 且 `high >= low`
-/// - 跳空异常：相邻交易日 `open` 相对前一日 `close` 的绝对跳变超过阈值
+/// - 主板 (6/0/2 开头, 沪市 6 深市 000/002) → 20%
+/// - 创业/科创板 (300/301/688/689) → 25%
+/// - 北交所 (8/92 开头) → 40%
+pub fn max_gap_for(code: &str) -> f64 {
+    if code.starts_with("8") || code.starts_with("92") {
+        40.0 // 北交所
+    } else if code.starts_with("30") || code.starts_with("68") {
+        25.0 // 创业/科创板
+    } else {
+        20.0 // 主板
+    }
+}
+
+/// v11 P0-1 commit 3: 日线质检 + 单条 skip + dedup + 跳空检测 + 除权豁免
 ///
-/// 返回 Err(原因) 表示应阻断后续分析。
-pub fn validate_daily_kline_quality(kline: &[KlineData], max_gap_pct: f64) -> Result<(), String> {
+/// **单条 skip** (内部过滤, 不连带整批 reject):
+/// - NaN/Inf 价格
+/// - 非正价 (open/high/low/close 任一 ≤ 0)
+/// - OHLC 不一致 (high < max(open,close) 或 low > min(open,close))
+/// - volume=0 但 close≠0 (显然数据点错误)
+///
+/// **Dedup**: 重复日期保留先到的 (HashSet)
+///
+/// **整批 reject** (返回 Err, 触发 fallback):
+/// - 相邻交易日跳空 (open vs prev.close) 超 `max_gap_pct` 阈值
+/// - 除权除息日 (`is_ex_rights`) 豁免该跳空
+///
+/// 参数:
+/// - `kline`: 改为 `&mut`, 因为单条 skip 需要过滤
+/// - `code`: 用于除权豁免查询 (B-1 决策: EX_RIGHTS_DATES 永远空, 保留机制)
+/// - `max_gap_pct`: 由调用方按 `max_gap_for(code)` 计算后传入
+pub fn validate_daily_kline_quality(
+    kline: &mut Vec<KlineData>,
+    code: &str,
+    max_gap_pct: f64,
+) -> Result<(), String> {
     if kline.is_empty() {
         return Err("日线数据为空".to_string());
     }
 
-    let mut bars: Vec<&KlineData> = kline.iter().collect();
-    bars.sort_by_key(|k| k.date);
-
-    for b in &bars {
+    // 1. 单条 skip
+    let before = kline.len();
+    kline.retain(|b| {
         if !b.open.is_finite() || !b.high.is_finite() || !b.low.is_finite() || !b.close.is_finite() {
-            return Err(format!("{} 存在 NaN/Inf 价格字段", b.date));
+            log::warn!("[{}] {} 单条 skip: NaN/Inf 价格", code, b.date);
+            return false;
         }
         if b.open <= 0.0 || b.high <= 0.0 || b.low <= 0.0 || b.close <= 0.0 {
-            return Err(format!("{} 存在非正价格（open/high/low/close）", b.date));
+            log::warn!("[{}] {} 单条 skip: 非正价格", code, b.date);
+            return false;
         }
         let max_oc = b.open.max(b.close);
         let min_oc = b.open.min(b.close);
         if b.high + 1e-9 < max_oc || b.low - 1e-9 > min_oc || b.high + 1e-9 < b.low {
-            return Err(format!(
-                "{} OHLC 不一致: open={:.3} high={:.3} low={:.3} close={:.3}",
-                b.date, b.open, b.high, b.low, b.close
-            ));
+            log::warn!(
+                "[{}] {} 单条 skip: OHLC 不一致 open={:.3} high={:.3} low={:.3} close={:.3}",
+                code, b.date, b.open, b.high, b.low, b.close
+            );
+            return false;
         }
+        if b.volume == 0.0 && b.close != 0.0 {
+            log::warn!("[{}] {} 单条 skip: volume=0 但 close≠0", code, b.date);
+            return false;
+        }
+        true
+    });
+    let skipped = before - kline.len();
+    if skipped > 0 {
+        log::info!("[{}] 质检单条 skip: {} 条 (剩 {} 条)", code, skipped, kline.len());
     }
 
-    for w in bars.windows(2) {
-        let prev = w[0];
-        let cur = w[1];
+    // 2. Dedup: 重复日期保留先到的
+    let mut seen = std::collections::HashSet::new();
+    let before = kline.len();
+    kline.retain(|b| seen.insert(b.date));
+    let deduped = before - kline.len();
+    if deduped > 0 {
+        log::info!("[{}] 质检 dedup: {} 条 (剩 {} 条)", code, deduped, kline.len());
+    }
+
+    if kline.is_empty() {
+        return Err(format!("[{}] 质检后日线数据为空 (全部 skip 或 dedup)", code));
+    }
+
+    // 3. 跳空检测 (按 max_gap_pct + is_ex_rights 豁免)
+    kline.sort_by_key(|b| b.date);
+    for w in kline.windows(2) {
+        let prev = &w[0];
+        let cur = &w[1];
         if prev.close <= 0.0 {
             continue;
         }
         let gap_pct = ((cur.open - prev.close) / prev.close * 100.0).abs();
         if gap_pct > max_gap_pct {
+            if is_ex_rights(code, cur.date) {
+                log::info!(
+                    "[{}] {} 跳空 {:.2}% 除权日豁免",
+                    code, cur.date, gap_pct
+                );
+                continue;
+            }
             return Err(format!(
-                "{} 开盘跳变异常 {:.2}% (> {:.2}%)，prev_close={:.3} open={:.3}",
-                cur.date, gap_pct, max_gap_pct, prev.close, cur.open
+                "[{}] {} 开盘跳变 {:.2}% (> {:.2}%), prev_close={:.3} open={:.3}",
+                code, cur.date, gap_pct, max_gap_pct, prev.close, cur.open
             ));
         }
     }
@@ -699,31 +763,101 @@ mod tests {
     #[test]
     fn test_daily_kline_quality_ohlc_invalid_rejected() {
         let d = NaiveDate::from_ymd_opt(2026, 6, 20).unwrap();
-        let bars = vec![make_kline(d, 10.0, 9.8, 9.5, 9.9)]; // high < open
-        let r = validate_daily_kline_quality(&bars, 20.0);
-        assert!(r.is_err());
+        let mut bars = vec![make_kline(d, 10.0, 9.8, 9.5, 9.9)]; // high < open → 单条 skip
+        let r = validate_daily_kline_quality(&mut bars, "000001", 20.0);
+        // commit 3 修订: OHLC 不一致改为单条 skip (不进整批 reject), 质检后 bars 应被过滤为空
+        assert!(r.is_err(), "all-skipped 应触发 Err");
+        assert!(bars.is_empty(), "OHLC 不一致的 bar 应被 skip");
     }
 
     #[test]
     fn test_daily_kline_quality_gap_jump_rejected() {
         let d1 = NaiveDate::from_ymd_opt(2026, 6, 19).unwrap();
         let d2 = NaiveDate::from_ymd_opt(2026, 6, 20).unwrap();
-        let bars = vec![
+        let mut bars = vec![
             make_kline(d1, 10.0, 10.5, 9.8, 10.0),
-            make_kline(d2, 13.0, 13.2, 12.8, 13.1), // 开盘相对前收 +30%
+            make_kline(d2, 13.0, 13.2, 12.8, 13.1), // 开盘相对前收 +30% > 20% 主板阈值
         ];
-        let r = validate_daily_kline_quality(&bars, 20.0);
-        assert!(r.is_err());
+        let r = validate_daily_kline_quality(&mut bars, "000001", 20.0);
+        assert!(r.is_err(), "主板 20% 阈值, +30% 跳空应 reject");
     }
 
     #[test]
     fn test_daily_kline_quality_passes() {
         let d1 = NaiveDate::from_ymd_opt(2026, 6, 19).unwrap();
         let d2 = NaiveDate::from_ymd_opt(2026, 6, 20).unwrap();
-        let bars = vec![
+        let mut bars = vec![
             make_kline(d1, 10.0, 10.5, 9.8, 10.0),
             make_kline(d2, 10.3, 10.6, 10.1, 10.4),
         ];
-        assert!(validate_daily_kline_quality(&bars, 20.0).is_ok());
+        assert!(validate_daily_kline_quality(&mut bars, "000001", 20.0).is_ok());
+    }
+
+    /// v11 commit 3: max_gap_for 按代码前缀返回不同阈值 (单位: 百分比)
+    #[test]
+    fn test_max_gap_for_by_code_prefix() {
+        // 主板 (6/0/2 开头) → 20.0
+        assert!((max_gap_for("600519") - 20.0).abs() < 1e-9);
+        assert!((max_gap_for("000001") - 20.0).abs() < 1e-9);
+        assert!((max_gap_for("002413") - 20.0).abs() < 1e-9);
+        // 创业/科创 (30/68) → 25.0
+        assert!((max_gap_for("300750") - 25.0).abs() < 1e-9);
+        assert!((max_gap_for("688981") - 25.0).abs() < 1e-9);
+        // 北交所 (8/92) → 40.0
+        assert!((max_gap_for("830799") - 40.0).abs() < 1e-9);
+        assert!((max_gap_for("920001") - 40.0).abs() < 1e-9);
+    }
+
+    /// v11 commit 3: 创业板 25% 阈值不误杀 25% 跳空 (主板 20% 会 reject, 创业 25% 不会)
+    #[test]
+    fn test_daily_kline_quality_gem_board_higher_threshold() {
+        let d1 = NaiveDate::from_ymd_opt(2026, 6, 19).unwrap();
+        let d2 = NaiveDate::from_ymd_opt(2026, 6, 20).unwrap();
+        let mut bars = vec![
+            make_kline(d1, 10.0, 10.5, 9.8, 10.0),
+            make_kline(d2, 12.5, 12.7, 12.3, 12.6), // +25% 跳空
+        ];
+        // 主板 (000001) 用 20% 阈值: 应 reject
+        let r_main = validate_daily_kline_quality(&mut bars, "000001", 20.0);
+        assert!(r_main.is_err(), "主板 20% 阈值, +25% 应 reject");
+
+        // 创业板 (300750) 用 25% 阈值: 应通过 (等于阈值不算超)
+        let mut bars2 = vec![
+            make_kline(d1, 10.0, 10.5, 9.8, 10.0),
+            make_kline(d2, 12.5, 12.7, 12.3, 12.6),
+        ];
+        let r_gem = validate_daily_kline_quality(&mut bars2, "300750", 25.0);
+        assert!(r_gem.is_ok(), "创业板 25% 阈值, +25% 应通过");
+    }
+
+    /// v11 commit 3: dedup 重复日期保留先到的
+    #[test]
+    fn test_daily_kline_quality_dedup() {
+        let d = NaiveDate::from_ymd_opt(2026, 6, 20).unwrap();
+        let mut bars = vec![
+            make_kline(d, 10.0, 10.5, 9.8, 10.0),
+            make_kline(d, 11.0, 11.5, 10.8, 11.0), // 重复日期 (11.00 应该是后到的)
+        ];
+        let r = validate_daily_kline_quality(&mut bars, "000001", 20.0);
+        assert!(r.is_ok());
+        assert_eq!(bars.len(), 1, "重复日期应被 dedup 到 1 条");
+        assert_eq!(bars[0].open, 10.0, "保留先到的 (open=10.0)");
+    }
+
+    /// v11 commit 3: 除权除息日豁免跳空 (即使 EX_RIGHTS_DATES 永远空, 跳空检测逻辑仍跑)
+    /// 注: 此测试不调 mark_ex_rights, 验证"无豁免时正常 reject"; 豁免路径需先 mark 才能测
+    #[test]
+    fn test_daily_kline_quality_no_exemption_marks_then_jump() {
+        // 先 mark 一个除权日
+        let d1 = NaiveDate::from_ymd_opt(2026, 6, 19).unwrap();
+        let d2 = NaiveDate::from_ymd_opt(2026, 6, 20).unwrap();
+        mark_ex_rights("000001", d2);
+
+        let mut bars = vec![
+            make_kline(d1, 10.0, 10.5, 9.8, 10.0),
+            make_kline(d2, 13.0, 13.2, 12.8, 13.1), // d2 已 mark 除权, +30% 跳空应豁免
+        ];
+        let r = validate_daily_kline_quality(&mut bars, "000001", 20.0);
+        assert!(r.is_ok(), "除权日豁免, +30% 跳空应通过");
     }
 }

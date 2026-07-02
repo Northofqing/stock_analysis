@@ -18,7 +18,7 @@ use log::{info, warn};
 use crate::data_provider::KlineData;
 use crate::database::DatabaseManager;
 use crate::monitor::data_quality::{
-    validate_daily_freshness, validate_daily_kline_quality, DqStats, FreshnessConfig,
+    max_gap_for, validate_daily_freshness, validate_daily_kline_quality, DqStats, FreshnessConfig,
 };
 
 use super::AnalysisPipeline;
@@ -36,7 +36,7 @@ impl AnalysisPipeline {
         // 不占用 tokio worker 线程，避免饿死异步任务（timeout/新闻搜索/AI 调用）。
         let dm = self.data_manager.clone();
         let code_owned = code.to_string();
-        let (data, source) = tokio::task::spawn_blocking(move || {
+        let (mut data, source) = tokio::task::spawn_blocking(move || {
             dm.get_daily_data(&code_owned, 30)
         }).await.context("spawn_blocking panicked")?.context("获取数据失败")?;
 
@@ -63,8 +63,9 @@ impl AnalysisPipeline {
             );
         }
 
-        // 维度4最小闭环：日线 OHLC 一致性 + 异常跳变告警（失败即阻断）
-        if let Err(msg) = validate_daily_kline_quality(&data, 20.0) {
+        // v11 P0-1 commit 3: 日线质检 (按代码前缀动态阈值 + 单条 skip + dedup + 除权豁免)
+        // 失败即 bail (pipeline 路径不走 fallback, 是 commit 2 之前就有的语义, 保持不变)
+        if let Err(msg) = validate_daily_kline_quality(&mut data, code, max_gap_for(code)) {
             anyhow::bail!("[{}] 日线质量校验失败: {}", code, msg);
         }
 

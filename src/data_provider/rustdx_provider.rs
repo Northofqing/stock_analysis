@@ -144,16 +144,28 @@ impl RustdxProvider {
             return Err(anyhow!("股票 {} 没有返回K线数据", code));
         }
         
-        // 转换为标准化的KlineData格式
-        let mut kline_data: Vec<KlineData> = all_bars.iter().map(|bar| {
-            // DateTime 转换为 NaiveDate
+        // v11 P0-1 commit 3 (Step 1.3): 坏日期 skip + warn, 不塞假日期
+        // 之前: unwrap_or_else(|| now) 把坏日期当今天 → 脏数据污染整批
+        // 现在: NaiveDate::from_ymd_opt 返回 None 时 skip 该 bar (return None)
+        let mut kline_data: Vec<KlineData> = all_bars.iter().filter_map(|bar| {
             let date = NaiveDate::from_ymd_opt(
                 bar.dt.year as i32,
                 bar.dt.month as u32,
                 bar.dt.day as u32
-            ).unwrap_or_else(|| chrono::Local::now().date_naive());
-            
-            KlineData {
+            );
+            let date = match date {
+                Some(d) => d,
+                None => {
+                    warn!(
+                        "[通达信] {} 跳过 bar: 坏日期 year={} month={} day={}",
+                        code,
+                        bar.dt.year, bar.dt.month, bar.dt.day
+                    );
+                    return None;
+                }
+            };
+
+            Some(KlineData {
                 date,
                 open: bar.open,
                 high: bar.high,
@@ -182,11 +194,11 @@ impl RustdxProvider {
                 is_limit_up: false,
                 is_limit_down: false,
                 is_suspended: false,
-                // TODO(v11/commit-2): 接入 gbbq 复权计算后改为 AdjustType::Qfq
+                // v11 P0-2 commit 2 修订后: RustDX 不做复权 (gbbq 下载源不存在, B 方案回退)
                 adjust: crate::data_provider::AdjustType::None,
-            }
+            })
         }).collect();
-        
+
         // 计算涨跌幅
         for i in 1..kline_data.len() {
             let prev_close = kline_data[i - 1].close;
