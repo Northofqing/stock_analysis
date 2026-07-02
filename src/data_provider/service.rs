@@ -18,7 +18,7 @@ use crate::data_provider::financials::{fetch_with_fallback_async, Financials};
 use crate::data_provider::money_flow::{
     fetch_flow_history_async, fetch_intraday_shape_async, IntradayShape, MoneyFlowSummary,
 };
-use crate::data_provider::{DataProvider, GtimgProvider, HttpProvider, KlineData, RustdxProvider};
+use crate::data_provider::KlineData;
 use anyhow::Result;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
@@ -123,94 +123,21 @@ impl DataFetchService {
     /// 获取 K 线数据（缓存 by `(code, days)`，带 TTL).
     ///
     /// P1: 盘内 5min / 盘后 1day, 过期自动 invalidate 重抓.
-    /// P2: 多源回落 (东方财富 → 腾讯 → RustDX), ban detected 时立刻跳下一个.
+    /// P2: 多源回落统一走 `fallback::fetch_kline_with_fallback` (v11 commit 2 抽取共享函数)
     pub async fn get_kline(&self, code: &str, days: usize) -> Result<Arc<Vec<KlineData>>> {
         let cell = Self::slot(&self.klines, (code.to_string(), days)).await;
         // 1. TTL 读缓存
         if let Some(cached) = Self::read_cache(&cell).await {
             return Ok(Arc::new(cached));
         }
-        // 2. cache miss / 过期 → 抓
-        let code_owned = code.to_string();
-        let client = self.client.clone();
+        // 2. cache miss / 过期 → 抓 (共享 fallback: 腾讯 → 东财 → RustDX)
         let cell_for_write = cell.clone();
-        let result: Result<Arc<Vec<KlineData>>> = async {
-            // 主源：东方财富
-            match HttpProvider::fetch_kline_data_internal(&client, &code_owned, days).await {
-                Ok(data) => {
-                    log::info!(
-                        "[DataFetch] {} 东方财富 OK, {} 条",
-                        code_owned,
-                        data.len()
-                    );
-                    Ok(Arc::new(data))
-                }
-                Err(em_err) => {
-                    let em_msg = format!("{:#}", em_err);
-                    let em_banned = is_ban_error(&em_msg);
-                    log::warn!(
-                        "[DataFetch] {} 东方财富获取失败 ({}), 回落到腾讯: {}",
-                        code_owned,
-                        if em_banned { "ban suspected" } else { "non-ban error" },
-                        brief(&em_msg)
-                    );
-                    // P2: 腾讯 fallback
-                    match GtimgProvider::fetch_kline_data_internal(&client, &code_owned, days)
-                        .await
-                    {
-                        Ok(data) => {
-                            log::info!(
-                                "[DataFetch] {} 腾讯回落成功, {} 条",
-                                code_owned,
-                                data.len()
-                            );
-                            Ok(Arc::new(data))
-                        }
-                        Err(gt_err) => {
-                            let gt_msg = format!("{:#}", gt_err);
-                            let gt_banned = is_ban_error(&gt_msg);
-                            log::warn!(
-                                "[DataFetch] {} 腾讯获取失败 ({}), 回落到 RustDX: {}",
-                                code_owned,
-                                if gt_banned { "ban suspected" } else { "non-ban error" },
-                                brief(&gt_msg)
-                            );
-                            // P2: RustDX 最终 fallback
-                            let rustdx_code = code_owned.clone();
-                            let rustdx_result = tokio::task::spawn_blocking(move || {
-                                let provider = RustdxProvider::new()?;
-                                provider.get_daily_data(&rustdx_code, days)
-                            })
-                            .await
-                            .map_err(|e| anyhow::anyhow!("RustDX 任务执行失败: {}", e))?;
-
-                            match rustdx_result {
-                                Ok(data) => {
-                                    log::info!(
-                                        "[DataFetch] {} RustDX 回落成功, {} 条",
-                                        code_owned,
-                                        data.len()
-                                    );
-                                    Ok(Arc::new(data))
-                                }
-                                Err(rustdx_err) => Err(anyhow::anyhow!(
-                                    "K线获取全部失败: 东方财富={}; 腾讯={}; RustDX={}",
-                                    em_msg,
-                                    gt_msg,
-                                    rustdx_err
-                                )),
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        .await;
+        let (data, source) = crate::data_provider::fallback::fetch_kline_with_fallback(code, days).await?;
+        log::info!("[DataFetch] {} OK (source={}), {} 条", code, source, data.len());
         // 3. 写缓存 (仅成功结果)
-        if let Ok(ref data) = result {
-            Self::write_cache(&cell_for_write, data.clone()).await;
-        }
-        result
+        let arc = Arc::new(data);
+        Self::write_cache(&cell_for_write, arc.clone()).await;
+        Ok(arc)
     }
 
     /// 获取最新一期核心财务指标（缓存 by `code`，带 TTL).

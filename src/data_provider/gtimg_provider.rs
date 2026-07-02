@@ -165,19 +165,21 @@ impl GtimgProvider {
                 code, klines.len(), klines[0].date, klines[0].close);
             
             if let Ok(Some(quote)) = Self::fetch_realtime_quote_internal(client, &normalized_code).await {
-                // 将实时数据填充到最新的K线数据中
+                // v11 P0-2 (commit 2): 修复盘中价污染
+                // 之前: latest.close = quote.price → Sharpe 等指标用盘中价滚动算
+                // 现在: 盘中价放 intraday_price, close 保持日线 settled 值
                 if let Some(latest) = klines.first_mut() {
-                    let old_close = latest.close;
-                    // 使用实时价格替换K线收盘价（K线收盘价是历史数据，实时价格才是当前价格）
-                    latest.close = quote.price;
+                    let _old_close = latest.close; // 保留日志用
+                    latest.intraday_price = Some(quote.price);
+                    latest.settled = false;
                     latest.pe_ratio = Some(quote.pe_ratio);
                     latest.pb_ratio = Some(quote.pb_ratio);
                     latest.turnover_rate = Some(quote.turnover_rate);
                     latest.market_cap = Some(quote.market_cap);
                     latest.circulating_cap = Some(quote.circulating_cap);
-                    
-                    log::info!("[腾讯] {} 更新价格: {:.2}元 -> {:.2}元, PE={:.2}, PB={:.2}, 换手率={:.2}%, 总市值={:.2}亿, 流通市值={:.2}亿", 
-                        code, old_close, quote.price, quote.pe_ratio, quote.pb_ratio, quote.turnover_rate, 
+
+                    log::info!("[腾讯] {} 盘中价 {:.2}元 (close 保持日线 settled {:.2}元), PE={:.2}, PB={:.2}, 换手率={:.2}%, 总市值={:.2}亿, 流通市值={:.2}亿",
+                        code, quote.price, _old_close, quote.pe_ratio, quote.pb_ratio, quote.turnover_rate,
                         quote.market_cap, quote.circulating_cap);
                 }
             } else {

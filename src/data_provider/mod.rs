@@ -6,6 +6,7 @@ pub mod announcement;
 pub mod chip_distribution;
 pub mod consensus;
 pub mod eastmoney_provider;
+pub mod fallback;
 pub mod limit_status;
 pub mod north_flow;
 pub mod financials;
@@ -37,6 +38,8 @@ use anyhow::Result;
 use chrono::NaiveDate;
 use std::collections::HashMap;
 use std::sync::RwLock;
+
+use crate::block_on_async_with_timeout;
 
 /// 复权方式标注 — v11 P0-2 引入
 ///
@@ -210,79 +213,80 @@ impl DataFetcherManager {
     }
 
     /// 获取股票数据（自动切换数据源）
+    ///
+    /// v11 P0-2 commit 2: 改用共享 fallback 函数 (`fallback::fetch_kline_with_fallback`),
+    /// 内部用 `block_on_async_with_timeout` 调共享 async 函数 (sync 入口保留, 13 个下游调用方零改动).
+    ///
+    /// ⚠️ 必须在 multi_thread runtime 中调用, 否则 `block_on_async` 会 panic (lib.rs:143).
+    /// 所有当前调用方 (`bin/*`, `pipeline/*` 等) 已在 multi_thread runtime 中。
     pub fn get_daily_data(
         &self,
         code: &str,
         days: usize,
     ) -> Result<(Vec<KlineData>, &'static str)> {
-        for provider in &self.providers {
-            log::info!("尝试使用数据源: {}", provider.name());
+        // 1. 走共享 fallback (腾讯 → 东财 → RustDX)
+        // block_on_async_with_timeout 把 future 输出包装成 Result<_, String>,
+        // future 本身又是 anyhow::Result, 故嵌套为 Result<Result<_>, String>. 两个 ? 解嵌套.
+        let timeout_result = block_on_async_with_timeout(
+            fallback::fetch_kline_with_fallback(code, days),
+            30,
+        )
+        .map_err(|e| anyhow::anyhow!("fallback 超时: {}", e))?;
+        let (mut data, source_name) = timeout_result
+            .map_err(|e| anyhow::anyhow!("fallback 失败: {}", e))?;
 
-            match provider.get_daily_data(code, days) {
-                Ok(mut data) if !data.is_empty() => {
-                    log::info!("成功从 {} 获取到 {} 条数据", provider.name(), data.len());
+        log::info!("成功从 {} 获取到 {} 条数据", source_name, data.len());
 
-                    // 四个补充数据源并行抓取（独立 HTTP 调用）
-                    let (fin, vh, cs, ib) = std::thread::scope(|s| {
-                        let client = &self.financials_client;
-                        let fin_h = s.spawn(|| financials::fetch_with_fallback_blocking(client, code));
-                        let vh_h = s.spawn(|| valuation_history::fetch_blocking(client, code));
-                        let cs_h = s.spawn(|| consensus::fetch_blocking(client, code));
-                        let ib_h = s.spawn(|| industry::fetch_blocking(client, code));
-                        (
-                            fin_h.join().unwrap_or_default(),
-                            vh_h.join().unwrap_or_default(),
-                            cs_h.join().unwrap_or_default(),
-                            ib_h.join().unwrap_or_default(),
-                        )
-                    });
+        // 2. 四个补充数据源并行抓取（独立 HTTP 调用）
+        let (fin, vh, cs, ib) = std::thread::scope(|s| {
+            let client = &self.financials_client;
+            let fin_h = s.spawn(|| financials::fetch_with_fallback_blocking(client, code));
+            let vh_h = s.spawn(|| valuation_history::fetch_blocking(client, code));
+            let cs_h = s.spawn(|| consensus::fetch_blocking(client, code));
+            let ib_h = s.spawn(|| industry::fetch_blocking(client, code));
+            (
+                fin_h.join().unwrap_or_default(),
+                vh_h.join().unwrap_or_default(),
+                cs_h.join().unwrap_or_default(),
+                ib_h.join().unwrap_or_default(),
+            )
+        });
 
-                    if fin.any() {
-                        if let Some(latest) = data.first_mut() {
-                            latest.eps = latest.eps.or(fin.eps);
-                            latest.roe = latest.roe.or(fin.roe);
-                            latest.revenue_yoy = latest.revenue_yoy.or(fin.revenue_yoy);
-                            latest.net_profit_yoy = latest.net_profit_yoy.or(fin.net_profit_yoy);
-                            latest.gross_margin = latest.gross_margin.or(fin.gross_margin);
-                            latest.net_margin = latest.net_margin.or(fin.net_margin);
-                            if !fin.history.is_empty() {
-                                latest.financials_history = Some(fin.history.clone());
-                            }
-                        }
-                    }
-
-                    if let Some(vh) = vh {
-                        if let Some(latest) = data.first_mut() {
-                            latest.pe_ratio = latest.pe_ratio.or(vh.current_pe);
-                            latest.pb_ratio = latest.pb_ratio.or(vh.current_pb);
-                            latest.valuation_history = Some(vh);
-                        }
-                    }
-
-                    if let Some(cs) = cs {
-                        if let Some(latest) = data.first_mut() {
-                            latest.consensus = Some(cs);
-                        }
-                    }
-
-                    if let Some(ib) = ib {
-                        if let Some(latest) = data.first_mut() {
-                            latest.industry = Some(ib);
-                        }
-                    }
-
-                    return Ok((data, provider.name()));
-                }
-                Ok(_) => {
-                    log::warn!("数据源 {} 返回空数据", provider.name());
-                }
-                Err(e) => {
-                    log::warn!("数据源 {} 获取失败: {}", provider.name(), e);
+        if fin.any() {
+            if let Some(latest) = data.first_mut() {
+                latest.eps = latest.eps.or(fin.eps);
+                latest.roe = latest.roe.or(fin.roe);
+                latest.revenue_yoy = latest.revenue_yoy.or(fin.revenue_yoy);
+                latest.net_profit_yoy = latest.net_profit_yoy.or(fin.net_profit_yoy);
+                latest.gross_margin = latest.gross_margin.or(fin.gross_margin);
+                latest.net_margin = latest.net_margin.or(fin.net_margin);
+                if !fin.history.is_empty() {
+                    latest.financials_history = Some(fin.history.clone());
                 }
             }
         }
 
-        anyhow::bail!("所有数据源均获取失败")
+        if let Some(vh) = vh {
+            if let Some(latest) = data.first_mut() {
+                latest.pe_ratio = latest.pe_ratio.or(vh.current_pe);
+                latest.pb_ratio = latest.pb_ratio.or(vh.current_pb);
+                latest.valuation_history = Some(vh);
+            }
+        }
+
+        if let Some(cs) = cs {
+            if let Some(latest) = data.first_mut() {
+                latest.consensus = Some(cs);
+            }
+        }
+
+        if let Some(ib) = ib {
+            if let Some(latest) = data.first_mut() {
+                latest.industry = Some(ib);
+            }
+        }
+
+        Ok((data, source_name))
     }
 }
 
@@ -310,5 +314,28 @@ mod tests {
         let b = a; // Copy: a 仍然可用
         assert_eq!(a, b);
         assert_ne!(AdjustType::Qfq, AdjustType::None);
+    }
+
+    /// v11 P0-2 commit 2: `DataFetcherManager::get_daily_data` (sync 入口) 在
+    /// `spawn_blocking` 上下文里能调, 不应触发 `block_on_async` panic (lib.rs:143).
+    ///
+    /// ⚠️ 网络依赖 — `#[ignore]` 跳过 CI, 手动跑: `cargo test --lib sync_get_daily_data_no_panic_in_spawn_blocking -- --ignored`
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn sync_get_daily_data_no_panic_in_spawn_blocking() {
+        let dm = DataFetcherManager::new().expect("create DataFetcherManager");
+        let result = tokio::task::spawn_blocking(move || dm.get_daily_data("600519", 5)).await;
+
+        // 关键断言: spawn_blocking 不应 panic. 网络错误是预期的 (Err(_)), 但
+        // spawn_blocking 自身的 JoinError 表示 panic, 必须 fail.
+        match result {
+            Ok(_outcome) => {
+                // Ok(Ok((data, src))) 或 Ok(Err(network)), 都接受.
+                println!("spawn_blocking did not panic (outcome: data fetched or network err)");
+            }
+            Err(join_err) => {
+                panic!("spawn_blocking panic'd: {} — sync 入口在 spawn_blocking 上下文不安全", join_err);
+            }
+        }
     }
 }
