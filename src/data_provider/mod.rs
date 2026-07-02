@@ -7,6 +7,7 @@ pub mod chip_distribution;
 pub mod consensus;
 pub mod eastmoney_provider;
 pub mod fallback;
+pub mod ipo_date;
 pub mod limit_status;
 pub mod north_flow;
 pub mod financials;
