@@ -61,6 +61,39 @@ impl AdjustType {
     }
 }
 
+/// Codex review P1 #4 修复: 公共 ban 检测 helper
+///
+/// HTTP/HTTPS 错误信息如果包含 empty reply / 4xx / 持续超时, 标记为该源被 ban / 不可用.
+/// fallback.rs 用这个分类日志: ban → "ban suspected" (建议切代理), non-ban → "non-ban error" (临时错误).
+///
+/// 原本只在 service.rs 私有, commit 2 抽 fallback 时丢失诊断信号.
+pub fn is_ban_error(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("empty reply")
+        || m.contains("connection reset")
+        || m.contains("connection refused")
+        || m.contains("timeout")
+        || m.contains("429")
+        || m.contains("403")
+        || m.contains("502")
+        || m.contains("503")
+        || m.contains("504")
+        || m.contains("peer closed connection")
+}
+
+/// Codex review P1 #4 修复: 公共 brief 截断 helper
+///
+/// 截断超长错误信息 (避免日志刷屏). fallback.rs 的 `?` 链会内嵌完整 URL, 必须截断.
+pub fn brief(s: &str) -> String {
+    const MAX: usize = 120;
+    if s.chars().count() <= MAX {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(MAX).collect();
+        format!("{head}…(截断)")
+    }
+}
+
 /// 实时行情数据（包含盈利指标）
 #[derive(Debug, Clone)]
 pub struct RealtimeQuote {

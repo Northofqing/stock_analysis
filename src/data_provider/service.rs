@@ -18,7 +18,7 @@ use crate::data_provider::financials::{fetch_with_fallback_async, Financials};
 use crate::data_provider::money_flow::{
     fetch_flow_history_async, fetch_intraday_shape_async, IntradayShape, MoneyFlowSummary,
 };
-use crate::data_provider::KlineData;
+use crate::data_provider::{brief, is_ban_error, KlineData};
 use anyhow::Result;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
@@ -42,22 +42,6 @@ fn ttl_for_now() -> Duration {
             | MarketSession::LunchBreak
             | MarketSession::AfterHours => Duration::from_secs(24 * 60 * 60),
     }
-}
-
-/// P2 ban 检测: HTTP/HTTPS 错误信息如果包含 empty reply / 4xx / 持续超时，
-/// 标记为该源被 ban / 不可用, 立即跳下一个, 不要重试.
-fn is_ban_error(msg: &str) -> bool {
-    let m = msg.to_ascii_lowercase();
-    m.contains("empty reply")
-        || m.contains("connection reset")
-        || m.contains("connection refused")
-        || m.contains("timeout")
-        || m.contains("429")
-        || m.contains("403")
-        || m.contains("502")
-        || m.contains("503")
-        || m.contains("504")
-        || m.contains("peer closed connection")
 }
 
 pub struct DataFetchService {
@@ -188,17 +172,6 @@ impl DataFetchService {
         let shape_arc = Arc::new(shape);
         Self::write_cache(&cell_for_write, shape_arc.clone()).await;
         shape_arc
-    }
-}
-
-/// 截断超长错误信息 (避免日志刷屏).
-fn brief(s: &str) -> String {
-    const MAX: usize = 120;
-    if s.chars().count() <= MAX {
-        s.to_string()
-    } else {
-        let head: String = s.chars().take(MAX).collect();
-        format!("{head}…(截断)")
     }
 }
 

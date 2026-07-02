@@ -18,7 +18,7 @@ use log::{info, warn};
 use crate::data_provider::KlineData;
 use crate::database::DatabaseManager;
 use crate::monitor::data_quality::{
-    max_gap_for, validate_daily_freshness, validate_daily_kline_quality, DqStats, FreshnessConfig,
+    validate_daily_freshness, DqStats, FreshnessConfig,
 };
 
 use super::AnalysisPipeline;
@@ -63,11 +63,11 @@ impl AnalysisPipeline {
             );
         }
 
-        // v11 P0-1 commit 3: 日线质检 (按代码前缀动态阈值 + 单条 skip + dedup + 除权豁免)
-        // 失败即 bail (pipeline 路径不走 fallback, 是 commit 2 之前就有的语义, 保持不变)
-        if let Err(msg) = validate_daily_kline_quality(&mut data, code, max_gap_for(code)) {
-            anyhow::bail!("[{}] 日线质量校验失败: {}", code, msg);
-        }
+        // Codex review P0 #2 修复: 删掉 pipeline 路径的二次质检.
+        // 之前: pipeline/data.rs:68 重复调 validate_daily_kline_quality
+        //   → 但 dm.get_daily_data 内部已走 fallback::fetch_kline_with_fallback, 每个 provider 都跑过质检.
+        //   → 二次校验是纯重复计算, 且注释"pipeline 路径不走 fallback"从 commit 2 (8cab678) 起已失真.
+        // 现在: 校验统一在 fallback.rs 入口做, pipeline 拿到的就是已通过质检的 data.
 
         info!("[{}] 从 {} 获取到 {} 条数据", code, source, data.len());
 

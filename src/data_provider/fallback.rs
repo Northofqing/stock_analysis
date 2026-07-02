@@ -12,7 +12,7 @@
 
 use anyhow::{anyhow, Result};
 
-use crate::data_provider::{DataProvider, GtimgProvider, HttpProvider, KlineData, RustdxProvider};
+use crate::data_provider::{DataProvider, GtimgProvider, HttpProvider, KlineData, RustdxProvider, is_ban_error};
 use crate::monitor::data_quality::{max_gap_for, validate_daily_kline_quality};
 
 /// 截断超长错误信息, 避免日志刷屏 (reqwest 错误会内嵌完整 URL)。
@@ -57,11 +57,15 @@ pub async fn fetch_kline_with_fallback(
             ),
         },
         Ok(_) => log::warn!("[fallback] {} 腾讯返回空数据", code),
-        Err(e) => log::warn!(
-            "[fallback] {} 腾讯失败: {}",
-            code,
-            brief(&format!("{:#}", e))
-        ),
+        Err(e) => {
+            // Codex review P1 #4 修复: 区分 ban/non-ban, 运维一眼看出"切代理 vs 临时错误"
+            let msg = brief(&format!("{:#}", e));
+            if is_ban_error(&msg) {
+                log::warn!("[fallback] {} 腾讯失败 (ban suspected) → 回落到东财: {}", code, msg);
+            } else {
+                log::warn!("[fallback] {} 腾讯失败 (non-ban error) → 回落到东财: {}", code, msg);
+            }
+        }
     }
 
     // Fallback 1: 东财
@@ -78,11 +82,14 @@ pub async fn fetch_kline_with_fallback(
             ),
         },
         Ok(_) => log::warn!("[fallback] {} 东财返回空数据", code),
-        Err(e) => log::warn!(
-            "[fallback] {} 东财失败: {}",
-            code,
-            brief(&format!("{:#}", e))
-        ),
+        Err(e) => {
+            let msg = brief(&format!("{:#}", e));
+            if is_ban_error(&msg) {
+                log::warn!("[fallback] {} 东财失败 (ban suspected) → 回落到RustDX: {}", code, msg);
+            } else {
+                log::warn!("[fallback] {} 东财失败 (non-ban error) → 回落到RustDX: {}", code, msg);
+            }
+        }
     }
 
     // Fallback 2: RustDX (TCP, 仅兜底, 不复权)

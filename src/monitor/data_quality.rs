@@ -499,6 +499,11 @@ pub fn validate_daily_kline_quality(
         }
     }
 
+    // 还原降序契约: 3 个 provider 都返回降序 (最新在前), 质检内部 sort_by_key 改成升序做跳空检测
+    // 后必须 sort 回降序, 否则下游 pipeline/data.rs:49 (`data[0].date` → Stale) 必 bail,
+    // chip_distribution.rs:94 / financials.rs:155 (用 .rev() 假设降序) 全错位.
+    kline.sort_by(|a, b| b.date.cmp(&a.date));
+
     Ok(())
 }
 
@@ -786,11 +791,28 @@ mod tests {
     fn test_daily_kline_quality_passes() {
         let d1 = NaiveDate::from_ymd_opt(2026, 6, 19).unwrap();
         let d2 = NaiveDate::from_ymd_opt(2026, 6, 20).unwrap();
+        // 入参顺序故意乱序 (升序), 验证出参被还原为降序 (最新在前)
         let mut bars = vec![
             make_kline(d1, 10.0, 10.5, 9.8, 10.0),
             make_kline(d2, 10.3, 10.6, 10.1, 10.4),
         ];
         assert!(validate_daily_kline_quality(&mut bars, "000001", 20.0).is_ok());
+        assert!(bars[0].date > bars[1].date, "出参必须降序 (最新在前), 实际: {} vs {}", bars[0].date, bars[1].date);
+    }
+
+    /// Codex review P0 #1 修复验证: 入参是降序, 质检后必须保持降序 (下游契约)
+    #[test]
+    fn test_daily_kline_quality_preserves_desc_order() {
+        // 入参降序: 最新在前 (d2 -> d1)
+        let d1 = NaiveDate::from_ymd_opt(2026, 6, 19).unwrap();
+        let d2 = NaiveDate::from_ymd_opt(2026, 6, 20).unwrap();
+        let mut bars = vec![
+            make_kline(d2, 10.3, 10.6, 10.1, 10.4), // 最新在前
+            make_kline(d1, 10.0, 10.5, 9.8, 10.0),
+        ];
+        validate_daily_kline_quality(&mut bars, "000001", 20.0).expect("ok");
+        assert_eq!(bars[0].date, d2, "出参 [0] 必须是最新 d2");
+        assert_eq!(bars[1].date, d1, "出参 [1] 必须是次新 d1");
     }
 
     /// v11 commit 3: max_gap_for 按代码前缀返回不同阈值 (单位: 百分比)
@@ -846,18 +868,21 @@ mod tests {
 
     /// v11 commit 3: 除权除息日豁免跳空 (即使 EX_RIGHTS_DATES 永远空, 跳空检测逻辑仍跑)
     /// 注: 此测试不调 mark_ex_rights, 验证"无豁免时正常 reject"; 豁免路径需先 mark 才能测
+    ///
+    /// Codex review P1 #3 修复: 用 (000002, 2026-07-01) 避开 test_daily_kline_quality_gap_jump_rejected
+    /// 用的 (000001, 2026-06-20), 防止 cargo test 并行时 EX_RIGHTS_DATES 全局污染造成 flaky.
     #[test]
     fn test_daily_kline_quality_no_exemption_marks_then_jump() {
-        // 先 mark 一个除权日
-        let d1 = NaiveDate::from_ymd_opt(2026, 6, 19).unwrap();
-        let d2 = NaiveDate::from_ymd_opt(2026, 6, 20).unwrap();
-        mark_ex_rights("000001", d2);
+        // 先 mark 一个除权日 (用 000002/2026-07-01, 不与其他测试重叠)
+        let d1 = NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
+        let d2 = NaiveDate::from_ymd_opt(2026, 7, 2).unwrap();
+        mark_ex_rights("000002", d2);
 
         let mut bars = vec![
             make_kline(d1, 10.0, 10.5, 9.8, 10.0),
-            make_kline(d2, 13.0, 13.2, 12.8, 13.1), // d2 已 mark 除权, +30% 跳空应豁免
+            make_kline(d2, 13.0, 13.2, 12.8, 13.1), // d2 已 mark 000002 除权, +30% 跳空应豁免
         ];
-        let r = validate_daily_kline_quality(&mut bars, "000001", 20.0);
+        let r = validate_daily_kline_quality(&mut bars, "000002", 20.0);
         assert!(r.is_ok(), "除权日豁免, +30% 跳空应通过");
     }
 }
