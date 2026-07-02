@@ -277,6 +277,9 @@ impl DataProvider for RustdxProvider {
 
         let mut kline_data = self.fetch_kline_internal(code, days)?;
 
+        // v11-P0-3 commit 2: K 线缺口推断 → 喂入 HALTED_PERIODS, 供 is_halted_period 查询
+        super::halt_status::infer_halt_from_kline_gaps(code, &kline_data);
+
         // 填涨跌停 / 停牌标记（在夏普和实时报价前先填，因为夏普的 close 改写可能影响）
         super::limit_status::apply_limit_flags_inplace(code, None, &mut kline_data);
 

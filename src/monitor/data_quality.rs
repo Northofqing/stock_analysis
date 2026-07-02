@@ -167,6 +167,41 @@ fn is_halted(code: &str) -> bool {
 }
 
 // ============================================================================
+// 停牌时间段缓存 (v11-P0-3 commit 2 新建)
+//
+// 与 HALTED_CODES 不同: HALTED_CODES 只存"现在是否停牌", HALTED_PERIODS 存历史时间段.
+// 数据来源: ① K 线缺口推断 (commit 2) ② 交易所公告 (留 P0-4).
+//
+// 解决"幸存者偏差": apply_limit_flags_inplace 之前 is_suspended 永远 false,
+// 回测在停牌日虚成交 → 虚高收益. 现在 is_halted_period(code, date) 查 HALTED_PERIODS.
+// ============================================================================
+
+static HALTED_PERIODS: Lazy<RwLock<HashMap<String, Vec<(NaiveDate, NaiveDate)>>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
+
+/// 喂入停牌时间段. (from, to) 半开区间 [from, to].
+pub fn mark_halted_period(code: &str, from: NaiveDate, to: NaiveDate) {
+    if let Ok(mut guard) = HALTED_PERIODS.write() {
+        guard
+            .entry(code.to_string())
+            .or_insert_with(Vec::new)
+            .push((from, to));
+    }
+}
+
+/// 查询某股在某日是否处于停牌期间.
+pub fn is_halted_period(code: &str, date: NaiveDate) -> bool {
+    let periods = match HALTED_PERIODS.read() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    match periods.get(code) {
+        Some(ps) => ps.iter().any(|&(from, to)| date >= from && date <= to),
+        None => false,
+    }
+}
+
+// ============================================================================
 // IPO 日期缓存 (v11-P0-3 commit 1 新建)
 // ============================================================================
 //

@@ -437,6 +437,9 @@ impl DataProvider for GtimgProvider {
             Self::fetch_kline_data_internal(&client, &code_owned, days).await
         })?;
 
+        // v11-P0-3 commit 2: K 线缺口推断 → 喂入 HALTED_PERIODS
+        super::halt_status::infer_halt_from_kline_gaps(code, &data);
+
         // 填涨跌停 / 停牌标记（名称后续用 get_stock_name 单独覆盖）
         super::limit_status::apply_limit_flags_inplace(code, None, &mut data);
 

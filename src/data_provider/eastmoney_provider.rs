@@ -350,6 +350,9 @@ impl DataProvider for HttpProvider {
             Self::fetch_kline_data_internal(&client, &code, days).await
         })?;
 
+        // v11-P0-3 commit 2: K 线缺口推断 → 喂入 HALTED_PERIODS
+        super::halt_status::infer_halt_from_kline_gaps(&code_for_apply, &data);
+
         // 填涨跌停 / 停牌标记
         // 名称暂用 None（保守按非 ST 处理）；后续实时行情步骤会再覆盖
         apply_limit_flags_inplace(&code_for_apply, None, &mut data);

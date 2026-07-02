@@ -77,7 +77,10 @@ pub fn fill_limit_flags(
     // 容忍 ±0.5 分的浮点误差
     k.is_limit_up = s.limit_up_price > 0.0 && (k.close - s.limit_up_price).abs() < 0.005;
     k.is_limit_down = s.limit_down_price > 0.0 && (k.close - s.limit_down_price).abs() < 0.005;
-    k.is_suspended = s.is_suspended; // 默认 false，查询 sse 后填
+    // v11-P0-3 commit 2 修订: 查 HALTED_PERIODS 缓存 (K 线缺口推断 / 公告),
+    // 不再永远 false (limit_status.rs:60 之前). 解决"幸存者偏差".
+    k.is_suspended = s.is_suspended
+        || crate::monitor::data_quality::is_halted_period(code, k.date);
 }
 
 /// 批量为 K 线列表（按日期降序）填涨跌停标记。
