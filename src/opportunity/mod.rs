@@ -12,6 +12,7 @@ pub mod launch_gate;  // 修复 P0-3: 上线门槛
 pub mod event_extractor;
 pub mod scheduler;  // 修复 v9.1 §1.3: 调度器
 pub mod hit_case;  // v10 P0.1 BC-3: 5 边界 hit CASE 逻辑
+pub mod candidate_panel;  // v11-P0-5+ Commit A: 候选筛选台模型 + 多源合并去重
 pub mod virtual_reason;  // v10 P0.2 BR-016: VirtualReason 枚举 + 主理由优先级
 pub mod auction_agent;  // v10 P0.2: 09:25 竞价 Agent
 pub mod real_alpha;  // v10 P0.3 BC-1: real_alpha + A/B/C 置信度 + 5 要素信封
