@@ -687,4 +687,62 @@ mod tests_llm_parse {
         // "中性" 在 keywords 列表里, 应该命中
         assert_eq!(advice, "中性");
     }
+
+    /// v14.4 集成测试: 真实 LLM 仲裁终稿 (从 shadow log 抓取) → 端到端 decisions_from_llm
+    /// 不依赖 LLM API 重跑, 单测直接验证决策台解析
+    #[test]
+    fn decisions_from_real_llm_sample() {
+        // 真实 LLM 仲裁终稿样本 (002208 合肥城建, 抓自 shadow run bk0p4w2gx)
+        let llm_md = r#"## 一句话结论
+偏空, 短期动能透支+板块承压, 资金面虽强但主力浮盈存在获利了结风险, EV为负。胜率约29%, 赔率0.74, EV = 0.29×4.7% - 0.71×6.3% = -3.1% 为负。
+
+## 因子归因
+- 价值: -2 → PE为负(亏损), ROE为负, 公司处于深度价值陷阱。
+- 动量: +1 → 近5日涨幅15.10%处于板块前20%分位。
+- 质量: -2 → 净利润同比大幅下降。
+- 资金: +1 → 近5日累计净流入+9.37亿。
+
+## 情景树
+- 乐观(P=10%): 主力资金持续加仓
+- 悲观(P=60%): 诱多出货
+"#;
+        let mut by_code = HashMap::new();
+        by_code.insert(
+            "002208".to_string(),
+            ("合肥城建".to_string(), Some(llm_md.to_string())),
+        );
+        let holdings = vec![make_position("002208", "合肥城建")];
+        let decisions = decisions_from_llm(&holdings, &by_code);
+        assert_eq!(decisions.len(), 1);
+        // "偏空" 关键词命中 → Reduce + P1
+        assert_eq!(decisions[0].action, Action::Reduce, "LLM 真实输出 '偏空' 应映射到 Reduce");
+        assert_eq!(decisions[0].priority, Priority::P1);
+        // reason 含 "偏空" 关键词 (兜底信息)
+        assert!(decisions[0].reasons[0].text.contains("偏空"));
+    }
+
+    /// v14.4 集成测试: 真实 LLM 仲裁终稿 (002131 利欧股份, 抓自 shadow run) — "强烈看空"
+    #[test]
+    fn decisions_from_real_llm_strong_bearish() {
+        let llm_md = r#"## 一句话结论
+**偏空**, 技术面空头排列+资金面主力净流出压制短期反弹, EV为负。
+
+## 因子归因
+- 价值: -2 → PE极高
+- 资金: -2 → 近期累计净流出
+
+## 情景树
+- 乐观: 资金面逆转
+- 悲观: 加速下跌
+"#;
+        let mut by_code = HashMap::new();
+        by_code.insert(
+            "002131".to_string(),
+            ("利欧股份".to_string(), Some(llm_md.to_string())),
+        );
+        let holdings = vec![make_position("002131", "利欧股份")];
+        let decisions = decisions_from_llm(&holdings, &by_code);
+        assert_eq!(decisions[0].action, Action::Reduce);
+        assert_eq!(decisions[0].priority, Priority::P1);
+    }
 }
