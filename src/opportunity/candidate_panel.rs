@@ -236,3 +236,202 @@ mod tests {
         assert_eq!(result[0].source_count(), 2);
     }
 }
+
+// ============================================================================
+// v11-P0-5+ Commit B: 证据分层 + 硬门槛过滤
+// ============================================================================
+
+/// 证据分档 (P5 §3.2 红线: 只有布林+MACD 能进 Strong)
+///
+/// 输入 evidence 文本列表 (LLM 或 breakout 输出), 命中关键词决定 tier:
+/// - "布林+MACD" / "B方案" / "主升浪" / "抄底" → Strong (P5 §3.2 唯一能进强证据)
+/// - 其它 (breakout / 空中加油 / 放量 / 资金净流入) → Reference (未验证)
+/// - 仅产业链 (无技术/资金信号) → Theme
+///
+/// **红线** (P5 §一): breakout 置信 75 / 空中加油形态+8 等**未验证打分不能进 Strong**。
+/// 即使 LLM 给 breakout 置信 99, 没 v11 factor_ic 验证, 一律 Reference.
+pub fn classify_tier(evidence: &[String]) -> EvidenceTier {
+    let combined = evidence.join(" ");
+    // 唯一 Strong: 布林+MACD (P5 §3.2 唯一能进强证据, 强证据的"已验证"标签来自 v11 factor_ic 认可 B 方案)
+    let strong_keywords = ["布林+MACD", "B方案", "主升浪启动", "B方案(已验证)", "布林+MACD主升浪"];
+    if strong_keywords.iter().any(|kw| combined.contains(kw)) {
+        return EvidenceTier::Strong;
+    }
+    // Reference: breakout / 空中加油 / 放量 / 资金 (未验证, P5 §3.2 强制不进 Strong)
+    let reference_keywords = ["breakout", "空中加油", "放量", "资金净流入", "MACD金叉", "RSI"];
+    if reference_keywords.iter().any(|kw| combined.contains(kw)) {
+        return EvidenceTier::Reference;
+    }
+    // Theme: 仅产业链 / 板块热度 (没技术/资金信号)
+    EvidenceTier::Theme
+}
+
+/// 硬门槛过滤 (P5 §3.3 — 用规则过滤, 用证据强度排序)
+///
+/// 剔除 (P5 §3.3):
+/// 1. 已持仓 — 归 P0-4 管, 不进候选
+/// 2. 停牌 — 用 v11 HALTED_CODES 缓存
+/// 3. ST — 名字含 "*ST"/"ST"/"SST" 等
+/// 4. 北交所 (8/4 开头) / 科创板 (688 开头) — 承接现有过滤
+/// 5. 已涨停 (change_pct >= 9.9%) — 涨停次日接盘风险高
+///
+/// 输入 entries + 持仓 codes, 输出 过滤后的 entries.
+pub fn filter_hard_gates(
+    entries: Vec<CandidateEntry>,
+    held_codes: &[String],
+) -> Vec<CandidateEntry> {
+    entries
+        .into_iter()
+        .filter(|e| {
+            // 1. 剔除已持仓
+            if held_codes.contains(&e.code) {
+                return false;
+            }
+            // 2. 剔除停牌 (用 v11 HALTED_CODES 缓存)
+            if is_halted(&e.code) {
+                return false;
+            }
+            // 3. 剔除 ST (从 name 字段判断)
+            if e.name.contains("ST") {
+                return false;
+            }
+            // 4. 剔除北交所/科创板 (8/4/688 开头, 承接现有过滤)
+            if e.code.starts_with('8')
+                || e.code.starts_with('4')
+                || e.code.starts_with("688")
+            {
+                return false;
+            }
+            // 5. 剔除已涨停 (change_pct >= 9.9%)
+            if e.change_pct >= 9.9 {
+                return false;
+            }
+            true
+        })
+        .collect()
+}
+
+/// 调 v11 HALTED_PERIODS 查 code 今天是否停牌 (用公开的 is_halted_period, 不依赖私有 is_halted)
+fn is_halted(code: &str) -> bool {
+    use chrono::Local;
+    let today = Local::now().date_naive();
+    crate::monitor::data_quality::is_halted_period(code, today)
+}
+
+#[cfg(test)]
+mod tests_b {
+    use super::*;
+
+    /// 布林+MACD → Strong
+    #[test]
+    fn tier_boll_macd_is_strong() {
+        let evidence = vec!["布林+MACD主升浪启动 (B方案, 已验证)".to_string()];
+        assert_eq!(classify_tier(&evidence), EvidenceTier::Strong);
+    }
+
+    /// breakout 置信 75 → Reference (即使置信高, 未验证)
+    #[test]
+    fn tier_breakout_is_reference_not_strong() {
+        let evidence = vec!["breakout 置信 78".to_string()];
+        assert_eq!(
+            classify_tier(&evidence),
+            EvidenceTier::Reference,
+            "breakout 未验证, P5 §3.2 红线: 绝不能进 Strong"
+        );
+    }
+
+    /// 仅有产业链 / 板块热度 → Theme
+    #[test]
+    fn tier_industry_only_is_theme() {
+        let evidence = vec!["机器人 (板块热度 88)".to_string()];
+        assert_eq!(classify_tier(&evidence), EvidenceTier::Theme);
+    }
+
+    /// 硬门槛: 剔除已持仓
+    #[test]
+    fn hard_gate_exclude_held() {
+        let entries = vec![
+            CandidateEntry {
+                code: "000001".to_string(),
+                name: "A".to_string(),
+                sources: vec![CandidateSource::StockPick],
+                tier: EvidenceTier::Strong,
+                evidence: vec!["布林+MACD".to_string()],
+                current_price: 10.0,
+                change_pct: 1.0,
+            },
+            CandidateEntry {
+                code: "000002".to_string(),
+                name: "B".to_string(),
+                sources: vec![CandidateSource::StockPick],
+                tier: EvidenceTier::Strong,
+                evidence: vec!["布林+MACD".to_string()],
+                current_price: 10.0,
+                change_pct: 1.0,
+            },
+        ];
+        let result = filter_hard_gates(entries, &["000001".to_string()]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].code, "000002", "已持仓 (000001) 应被剔除");
+    }
+
+    /// 硬门槛: 剔除 ST/北交所/科创板/已涨停
+    #[test]
+    fn hard_gate_exclude_st_bse_star() {
+        let entries = vec![
+            // ST 票 — 剔除
+            CandidateEntry {
+                code: "000005".to_string(),
+                name: "ST 测试".to_string(),
+                sources: vec![CandidateSource::StockPick],
+                tier: EvidenceTier::Strong,
+                evidence: vec![],
+                current_price: 10.0,
+                change_pct: 1.0,
+            },
+            // 北交所 (8 开头) — 剔除
+            CandidateEntry {
+                code: "830799".to_string(),
+                name: "北交所测试".to_string(),
+                sources: vec![CandidateSource::StockPick],
+                tier: EvidenceTier::Strong,
+                evidence: vec![],
+                current_price: 10.0,
+                change_pct: 1.0,
+            },
+            // 科创板 (688 开头) — 剔除
+            CandidateEntry {
+                code: "688981".to_string(),
+                name: "科创板测试".to_string(),
+                sources: vec![CandidateSource::StockPick],
+                tier: EvidenceTier::Strong,
+                evidence: vec![],
+                current_price: 10.0,
+                change_pct: 1.0,
+            },
+            // 已涨停 (10%+) — 剔除
+            CandidateEntry {
+                code: "000999".to_string(),
+                name: "涨停测试".to_string(),
+                sources: vec![CandidateSource::StockPick],
+                tier: EvidenceTier::Strong,
+                evidence: vec![],
+                current_price: 11.0,
+                change_pct: 10.0,
+            },
+            // 正常票 — 保留
+            CandidateEntry {
+                code: "600000".to_string(),
+                name: "正常".to_string(),
+                sources: vec![CandidateSource::StockPick],
+                tier: EvidenceTier::Strong,
+                evidence: vec![],
+                current_price: 10.0,
+                change_pct: 1.0,
+            },
+        ];
+        let result = filter_hard_gates(entries, &[]);
+        assert_eq!(result.len(), 1, "只 1 只正常票应通过 5 个门槛");
+        assert_eq!(result[0].code, "600000");
+    }
+}
