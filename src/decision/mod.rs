@@ -7,3 +7,4 @@ pub mod sector_score;
 pub mod capital_verify;
 pub mod rotation;
 pub mod leader;
+pub mod decision_panel;
