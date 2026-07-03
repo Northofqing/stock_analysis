@@ -603,7 +603,7 @@ async fn run_test_scan() {
         stock_analysis::decision::sector_score::format_tier_list(&graded)
     }).await.unwrap_or_default();
     log::info!("[测试] 赛道分档:\n{}", tier_text);
-    push_wechat(&tier_text).await;
+    notify::push_governor(&tier_text, crate::bin::monitor::notify::PushKind::SectorTier).await;
 
     // 16.1 v4 资金验证 + v6 放量分析（复用 K 线数据，走 spawn_blocking）
     let h2 = holdings.clone();
@@ -637,7 +637,7 @@ async fn run_test_scan() {
 
     if !capital_text.is_empty() {
         log::info!("[测试] 资金验证:\n{}", capital_text);
-        push_wechat(&capital_text).await;
+        notify::push_governor(&capital_text, crate::bin::monitor::notify::PushKind::CapitalVerify).await;
     }
     if let Some(ref text) = breakout_text {
         log::info!("[测试] 放量分析:\n{}", text);
@@ -650,7 +650,7 @@ async fn run_test_scan() {
             holdings.len(), excl_hits.len(), violations.len(),
         );
         log::info!("[测试] 周度SOP:\n{}", sop_text);
-        push_wechat(&sop_text).await;
+        notify::push_governor(&sop_text, crate::bin::monitor::notify::PushKind::WeeklySOP).await;
     }
 
     log::info!("[测试] ======== 全链路连通性检查完成 ========");
@@ -1578,7 +1578,7 @@ async fn monitor_loop() {
                                     s.name, s.code, s.volume_ratio, s.main_net_yi, s.change_pct,
                                 ));
                             }
-                            push_wechat(&lines.join("\n")).await;
+                            notify::push_governor(&lines.join("\n"), crate::bin::monitor::notify::PushKind::AuctionVolume).await;
                         }
                     }
 
@@ -1587,7 +1587,7 @@ async fn monitor_loop() {
                         post_close_candidates_notified = true;
                         log::info!("[竞价] 9:20-9:25 更新推送优选候选（2.1版本）...");
                         let post_close = stock_analysis::opportunity::run_post_close_candidates(5).await;
-                        push_wechat(&post_close).await;
+                        notify::push_governor(&post_close, crate::bin::monitor::notify::PushKind::AuctionRepush).await;
                         
                         // 提取候选的code和name以便后续虚拟记录（简单方式：从推送文案中正则提取）
                         // 格式: "N. 名称(代码)" → 收集前5个作为虚拟观察对象
@@ -1671,7 +1671,7 @@ async fn monitor_loop() {
                             if !records.is_empty() {
                                 persist_virtual_observation_snapshot(&records);
                                 virtual_snapshot_persisted = true;
-                                push_wechat(&lines.join("\n")).await;
+                                notify::push_governor(&lines.join("\n"), crate::bin::monitor::notify::PushKind::FactorIC).await;
                             }
                         }
                     }
@@ -1780,7 +1780,7 @@ async fn monitor_loop() {
                             virtual_snapshot_persisted = true;
                         }
                         
-                        push_wechat(&virtual_lines.join("\n")).await;
+                        notify::push_governor(&virtual_lines.join("\n"), crate::bin::monitor::notify::PushKind::VirtualWatch).await;
                         log::info!("[开盘] 虚拟观察仓位已推送（合计 ¥{:.0}）", total_amount);
                     }
 
@@ -1829,17 +1829,17 @@ async fn monitor_loop() {
                         if !first_lines.is_empty() {
                             let mut lines = vec![format!("🟢 首板涨停 Top{}（{}）", first_lines.len().min(10), ts)];
                             lines.extend(first_lines.into_iter().take(10));
-                            push_wechat(&lines.join("\n")).await;
+                            notify::push_governor(&lines.join("\n"), crate::bin::monitor::notify::PushKind::LimitBoards).await;
                         }
                         if !second_lines.is_empty() {
                             let mut lines = vec![format!("🟡 二板涨停 Top{}（{}）", second_lines.len().min(10), ts)];
                             lines.extend(second_lines.into_iter().take(10));
-                            push_wechat(&lines.join("\n")).await;
+                            notify::push_governor(&lines.join("\n"), crate::bin::monitor::notify::PushKind::LimitBoards).await;
                         }
                         if !third_lines.is_empty() {
                             let mut lines = vec![format!("🔴 三板+ 涨停 Top{}（{}）", third_lines.len().min(10), ts)];
                             lines.extend(third_lines.into_iter().take(10));
-                            push_wechat(&lines.join("\n")).await;
+                            notify::push_governor(&lines.join("\n"), crate::bin::monitor::notify::PushKind::LimitBoards).await;
                         }
                     }
 
@@ -2139,7 +2139,7 @@ async fn push_sector_leaders() {
         lines.push(format!("  {} {} {:+.1}% 主力{:.1}亿",
             medals[i.min(4)], b.name, b.change_pct, inflow_yi));
     }
-    push_wechat(&lines.join("\n")).await;
+    notify::push_governor(&lines.join("\n"), crate::bin::monitor::notify::PushKind::SectorTop).await;
 }
 
 async fn push_market_fund_top10() {
@@ -2167,7 +2167,7 @@ async fn push_market_fund_top10() {
             s.change_pct,
         ));
     }
-    push_wechat(&lines.join("\n")).await;
+    notify::push_governor(&lines.join("\n"), crate::bin::monitor::notify::PushKind::FundInflow).await;
 }
 
 async fn push(event: &AlertEvent) {

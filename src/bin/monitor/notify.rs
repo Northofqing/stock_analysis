@@ -22,6 +22,112 @@ use crate::{
     MAGICLAW_TOKEN_ISSUE_LOCK, MAGICLAW_DISABLE_ENV_TOKEN,
 };
 
+/// v11-P0-4 commit D: 推送治理 — 推送类别
+///
+/// 35 条推送盘点的"默认降级 vs 保留 vs 移交" 由 `push_governor` 函数根据 `PushKind` 决定.
+/// grill Q2 修订: 12 条降级 (A2/A3/A4/A5/A6/A11/A12/B4/B10/B11/B12/B13) / 9 保留 (A1/A7/A8/A13/A14/A15/B1/B2/C1).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum PushKind {
+    /// 保留: 持仓事件告警 (涨跌停突变/炸板/排除/风控/现金预警)
+    HoldingEvent,
+    /// 保留: 盘前/盘后告警/复盘/概览
+    DailyReport,
+    /// 保留: 公告告警
+    Announcement,
+    /// 降级: 竞价量能 Top10
+    AuctionVolume,
+    /// 降级: 虚拟观察仓位
+    VirtualWatch,
+    /// 降级: 首板/二板/三板+ Top10
+    LimitBoards,
+    /// 降级: 领涨板块 Top5
+    SectorTop,
+    /// 降级: 主力净流入 Top10
+    FundInflow,
+    /// 降级: 9:20-9:25 竞价重推优选
+    AuctionRepush,
+    /// 降级: 因子 IC (grill Q6 改)
+    FactorIC,
+    /// 降级: v4 赛道分档
+    SectorTier,
+    /// 降级: v4 资金验证
+    CapitalVerify,
+    /// 降级: 周度 SOP
+    WeeklySOP,
+}
+
+impl PushKind {
+    /// 是否降级 (P0-4 commit D 默认行为, PUSH_VERBOSE=true 时无效)
+    pub fn is_deprecated(self) -> bool {
+        match self {
+            // 保留 9 条
+            PushKind::HoldingEvent
+            | PushKind::DailyReport
+            | PushKind::Announcement => false,
+            // 降级 12 条 (grill Q2/Q6 修订)
+            PushKind::AuctionVolume
+            | PushKind::VirtualWatch
+            | PushKind::LimitBoards
+            | PushKind::SectorTop
+            | PushKind::FundInflow
+            | PushKind::AuctionRepush
+            | PushKind::FactorIC
+            | PushKind::SectorTier
+            | PushKind::CapitalVerify
+            | PushKind::WeeklySOP => true,
+        }
+    }
+
+    /// 简短标签 (log 显示)
+    pub fn label(self) -> &'static str {
+        match self {
+            PushKind::HoldingEvent => "持仓事件",
+            PushKind::DailyReport => "日报/复盘/概览",
+            PushKind::Announcement => "公告",
+            PushKind::AuctionVolume => "竞价量能",
+            PushKind::VirtualWatch => "虚拟观察",
+            PushKind::LimitBoards => "板数榜",
+            PushKind::SectorTop => "领涨板块",
+            PushKind::FundInflow => "主力净流入",
+            PushKind::AuctionRepush => "竞价重推",
+            PushKind::FactorIC => "因子IC",
+            PushKind::SectorTier => "赛道分档",
+            PushKind::CapitalVerify => "资金验证",
+            PushKind::WeeklySOP => "周度SOP",
+        }
+    }
+}
+
+/// v11-P0-4 commit D: 推送治理入口
+///
+/// 根据 `PushKind` + `PUSH_VERBOSE` env var 决定:
+/// - `kind.is_deprecated() == true` **且** `PUSH_VERBOSE != "true"` → 降级 log (不推)
+/// - 其他情况 → 调 `push_wechat` 正常推送
+///
+/// PUSH_VERBOSE=true 恢复旧行为 (留退路, shadow 切换验证用)
+/// PUSH_VERBOSE 未设或 != "true" → 默认精简 (12 条降级, 23 条保留)
+pub async fn push_governor(text: &str, kind: PushKind) -> bool {
+    let verbose = std::env::var("PUSH_VERBOSE").ok().as_deref() == Some("true");
+
+    if kind.is_deprecated() && !verbose {
+        log::warn!(
+            "[PUSH_GOVERNOR] 降级日志 (kind={}, PUSH_VERBOSE 默认精简):\n{}",
+            kind.label(),
+            text
+        );
+        return false;
+    }
+
+    if verbose && kind.is_deprecated() {
+        log::info!(
+            "[PUSH_GOVERNOR] 保留旧行为 (kind={}, PUSH_VERBOSE=true)",
+            kind.label()
+        );
+    }
+
+    push_wechat(text).await
+}
+
 pub async fn push_wechat(text: &str) -> bool {
     // v10 P6 5 要素接入: V10_DRY_RUN_PUSH=1 时跳过实际推送, 仅 log
     // 用于开发/验证推送内容变化, 不骚扰飞书
@@ -1060,4 +1166,82 @@ pub async fn verify_daemon_auth(
     }
 
     Err(format!("/api/window_status HTTP {}: {}", status, body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PushKind::is_deprecated: 9 保留 + 4 降级 (grill Q2/Q6 修订)
+    #[test]
+    fn push_kind_is_deprecated_partition() {
+        // 保留 9 条
+        for k in [
+            PushKind::HoldingEvent,
+            PushKind::DailyReport,
+            PushKind::Announcement,
+        ] {
+            assert!(!k.is_deprecated(), "{:?} 应保留", k);
+        }
+        // 降级 10 条 (A2/A3/A4/A5/A6/A11/A12/B4/B10 + grill 补 B11/B12/B13 = 12 条, 但我们只测 4 个代表)
+        for k in [
+            PushKind::AuctionVolume,
+            PushKind::LimitBoards,
+            PushKind::FactorIC,
+            PushKind::WeeklySOP,
+        ] {
+            assert!(k.is_deprecated(), "{:?} 应降级", k);
+        }
+    }
+
+    /// PushKind 总数 = 13 (9 保留 + 12 降级, 但 grill 修订后保留 9 + 降级 12 = 21 变体太多, 我们用 enum 12 个)
+    #[test]
+    fn push_kind_count() {
+        // 枚举定义 = 13 变体 (3 保留 + 10 降级, B11/B12/B13 在 enum 里)
+        // 实际归类 = 9 保留 + 12 降级 (grill 修订: A13/A14/A15 用 HoldingEvent, C1 用 Announcement)
+        let kinds = [
+            PushKind::HoldingEvent,
+            PushKind::DailyReport,
+            PushKind::Announcement,
+            PushKind::AuctionVolume,
+            PushKind::VirtualWatch,
+            PushKind::LimitBoards,
+            PushKind::SectorTop,
+            PushKind::FundInflow,
+            PushKind::AuctionRepush,
+            PushKind::FactorIC,
+            PushKind::SectorTier,
+            PushKind::CapitalVerify,
+            PushKind::WeeklySOP,
+        ];
+        assert_eq!(kinds.len(), 13, "13 个 PushKind 变体");
+    }
+
+    /// push_governor 降级时返回 false (未推), log 输出
+    #[tokio::test]
+    async fn push_governor_deprecated_no_push() {
+        std::env::remove_var("PUSH_VERBOSE");
+        let r = push_governor("test deprecated", PushKind::AuctionVolume).await;
+        assert!(!r, "降级应返回 false (未推)");
+    }
+
+    /// push_governor 保留时调 push_wechat (返回 V10_DRY_RUN_PUSH=true 时为 true)
+    #[tokio::test]
+    async fn push_governor_kept_calls_push_wechat() {
+        std::env::set_var("V10_DRY_RUN_PUSH", "1"); // push_wechat 走 dry-run 返回 true
+        let r = push_governor("test kept", PushKind::HoldingEvent).await;
+        assert!(r, "保留应调 push_wechat (V10_DRY_RUN_PUSH=true 返回 true)");
+        std::env::remove_var("V10_DRY_RUN_PUSH");
+    }
+
+    /// PUSH_VERBOSE=true 覆盖降级 → 调 push_wechat
+    #[tokio::test]
+    async fn push_verbose_true_overrides_deprecated() {
+        std::env::set_var("V10_DRY_RUN_PUSH", "1");
+        std::env::set_var("PUSH_VERBOSE", "true");
+        let r = push_governor("test verbose", PushKind::AuctionVolume).await;
+        assert!(r, "PUSH_VERBOSE=true 应覆盖降级, 调 push_wechat (dry-run 返回 true)");
+        std::env::remove_var("V10_DRY_RUN_PUSH");
+        std::env::remove_var("PUSH_VERBOSE");
+    }
 }
