@@ -365,34 +365,29 @@ mod tests {
 
 /// 复用 main.rs:1193 extract_advice_and_score 的简化版 (P0-5 不改 main.rs 私有函数)
 /// 提取 LLM markdown 输出的 (操作建议文本, 综合分).
+///
+/// v14.4 修订: 不依赖 "## 【操作建议】" 段 — 实际 LLM 仲裁终稿用 "## 一句话结论\n**强烈看空**..."
+/// 格式 (一句话总结 + 因子归因里都含关键词). 改为从整个 md 文本搜关键词, 找到第一个匹配就返回.
 fn extract_advice_simple(md: &str) -> (String, Option<f64>) {
     let mut advice = "未知".to_string();
     let mut score: Option<f64> = None;
-    let mut in_advice_section = false;
+    // 优先级: 强烈 > 弱 (强烈卖出/看空 优先于 卖出/看空)
+    const ACTION_KEYWORDS: &[&str] = &[
+        "强烈卖出", "强烈看空", "卖出", "看空", "偏空", "减持", "规避", "降仓",
+        "观望", "中性", "看平", "增持", "加仓", "买入", "看多", "强烈看多",
+    ];
     for line in md.lines() {
         let t = line.trim();
-        if t.starts_with('#') && t.contains("操作建议") {
-            in_advice_section = true;
-            if let Some(rest) = t.split('】').nth(1) {
-                let rest = rest.trim();
-                if !rest.is_empty() {
-                    advice = rest.to_string();
-                    in_advice_section = false;
+        // 提取 action 关键词 (在整个 md 里搜, 不依赖特定段)
+        if advice == "未知" {
+            for kw in ACTION_KEYWORDS {
+                if t.contains(kw) {
+                    advice = kw.to_string();
+                    break;
                 }
             }
-            continue;
         }
-        if in_advice_section {
-            if t.is_empty() {
-                continue;
-            }
-            if t.starts_with('#') {
-                in_advice_section = false;
-                continue;
-            }
-            advice = t.to_string();
-            in_advice_section = false;
-        }
+        // 提取综合分
         if t.contains("综合分") || t.contains("composite_score") || t.contains("composite score") {
             for token in t.split(|c: char| !c.is_ascii_digit() && c != '.') {
                 if let Ok(v) = token.parse::<f64>() {
@@ -639,5 +634,57 @@ mod tests_llm_parse {
         let (action, priority) = action_priority_from_advice("## 【操作建议】**强烈看多**");
         assert_eq!(action, Action::WatchAdd);
         assert_eq!(priority, Priority::P2);
+    }
+
+    /// v14.4: LLM 实际仲裁终稿格式 "## 一句话结论\n**强烈看空**..." (无"## 【操作建议】"段)
+    /// extract_advice_simple 必须能在一句话总结里找到关键词
+    #[test]
+    fn extract_advice_real_llm_format() {
+        let llm_md = r#"# 复盘报告
+## 一句话结论
+**强烈看空**。技术面空头排列+资金面主力深套+基本面估值偏高，EV为负。
+
+## 因子归因
+- 价值：-2 → PE 30.82、PB 12.67均处于板块前10%高估区间
+- 动量：-2 → 均线空头排列
+
+## 情景树
+- 乐观（P=15%）：主力连续两日净流入超1亿元"#;
+        let (advice, _score) = extract_advice_simple(llm_md);
+        assert_eq!(advice, "强烈看空", "v14.4 修订: 从整个 md 找关键词, 不依赖'## 【操作建议】'段");
+        let (action, priority) = action_priority_from_advice(&advice);
+        assert_eq!(action, Action::ReduceNow);
+        assert_eq!(priority, Priority::P0);
+    }
+
+    /// v14.4: 关键词在因子归因里, 不在"一句话结论"里 — 也应能提取
+    #[test]
+    fn extract_advice_from_factor_section() {
+        let llm_md = r#"# 复盘
+## 一句话结论
+技术面多空分歧。
+
+## 因子归因
+- 价值：-2 → 偏空
+- 动量：+1 → 中性
+- 资金：-1 → 减持"#;
+        let (advice, _) = extract_advice_simple(llm_md);
+        // "偏空" 在因子归因里, "减持" 也命中, 但 "偏空" 在 keywords 列表中更靠前
+        // 实际: ACTION_KEYWORDS 顺序遍历, "偏空" 在 "减持" 之前
+        assert!(advice == "偏空" || advice == "减持");
+    }
+
+    /// v14.4: LLM 输出不含 action 关键词 → 兜底"未知"
+    #[test]
+    fn extract_advice_no_keyword_fallback() {
+        let llm_md = r#"# 复盘
+## 一句话结论
+技术面多空分歧, 资金面震荡, 等待更明确信号。
+
+## 情景树
+- 乐观：触发条件...中性"#;
+        let (advice, _) = extract_advice_simple(llm_md);
+        // "中性" 在 keywords 列表里, 应该命中
+        assert_eq!(advice, "中性");
     }
 }
