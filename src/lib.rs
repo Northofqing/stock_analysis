@@ -167,6 +167,11 @@ where
 
 /// 修复 Top10#5: 统一 block_on + 超时, 防永久阻塞.
 /// 默认 30s 超时足够大多数 data_provider HTTP 调用, 长任务 (e.g. backtest) 显式传大值.
+///
+/// P0-5 修订: 之前直接 `handle.block_on(work)` 不检查 runtime_flavor,
+/// 在 current_thread runtime 里调用会 panic "Cannot start a runtime from within a runtime".
+/// (实际由 monitor --review 的 MultiAgent 路径触发, 2026-07-03)
+/// 修复: 跟 `block_on_async` 对齐 — 按 runtime_flavor 分支处理.
 pub fn block_on_async_with_timeout<F, T>(fut: F, timeout_secs: u64) -> Result<T, String>
 where
     F: std::future::Future<Output = T>,
@@ -186,7 +191,28 @@ where
         }
     };
     match Handle::try_current() {
-        Ok(handle) => handle.block_on(work),
+        Ok(handle) => {
+            // 跟 block_on_async 对齐: 按 runtime_flavor 分支处理
+            match handle.runtime_flavor() {
+                tokio::runtime::RuntimeFlavor::MultiThread => {
+                    tokio::task::block_in_place(|| handle.block_on(work))
+                }
+                _ => {
+                    // CurrentThread (旧版 tokio) 或其他 flavor:
+                    // block_in_place 会 panic! 用 actionable error (跟 block_on_async 一致).
+                    panic!(
+                        "[BLOCK_ON_ASYNC_FLAVOR_ERROR] cannot block_on in {:?} runtime\n\
+                         block_on_async_with_timeout: cannot call handle.block_on() inside a current_thread runtime\n\n\
+                         Fix:\n  \
+                         1) Call from tokio::task::spawn_blocking (not from async fn body directly)\n  \
+                         2) Change #[tokio::main] to #[tokio::main(flavor = \"multi_thread\")]\n  \
+                         3) Build your own multi_thread runtime: Builder::new_multi_thread().enable_all().build()\n\n\
+                         Ref: P0-5 (2026-07-03) monitor --review MultiAgent panic",
+                        handle.runtime_flavor()
+                    );
+                }
+            }
+        }
         Err(_) => {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -199,3 +225,63 @@ where
 
 // 修复 Top10#7 (2026-06-29 audit): 共享 HTTP client (4 个预配置, 避免 28 处散落 builder)
 pub mod http_client;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic;
+
+    /// P0-5: `block_on_async_with_timeout` 在 current_thread runtime 里 panic 时,
+    /// 错误信息含 actionable tag `[BLOCK_ON_ASYNC_FLAVOR_ERROR]` (跟 block_on_async 对齐).
+    ///
+    /// 之前直接 `handle.block_on(work)` 不检查 runtime_flavor, 报 "Cannot start a runtime
+    /// from within a runtime" 让用户困惑. 现在明确告诉用户:
+    ///   1) Call from spawn_blocking
+    ///   2) Change #[tokio::main] to multi_thread flavor
+    ///   3) Build your own multi_thread runtime
+    #[test]
+    fn block_on_async_with_timeout_panics_with_flavor_error_in_current_thread() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let unwind = panic::catch_unwind(|| {
+            rt.block_on(async {
+                block_on_async_with_timeout(async {}, 1).unwrap();
+            });
+        });
+        let panic_payload = unwind.err().expect("current_thread runtime 内调应 panic");
+        let panic_msg = extract_panic_message(&panic_payload);
+        assert!(
+            panic_msg.contains("BLOCK_ON_ASYNC_FLAVOR_ERROR"),
+            "panic message 应含 actionable tag, 实际: {}",
+            panic_msg
+        );
+        assert!(
+            panic_msg.contains("P0-5"),
+            "panic message 应含 P0-5 标记便于追踪, 实际: {}",
+            panic_msg
+        );
+    }
+
+    /// P0-5: `block_on_async_with_timeout` 在 multi_thread runtime 里正常工作.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn block_on_async_with_timeout_works_in_multi_thread() {
+        let result = block_on_async_with_timeout(
+            async { 42_u32 + 1 },
+            5,
+        );
+        assert_eq!(result.unwrap(), 43);
+    }
+
+    /// helper: 把 `Box<dyn Any>` (panic payload) 转成可读字符串.
+    fn extract_panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+        if let Some(s) = payload.downcast_ref::<&'static str>() {
+            s.to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string panic payload>".to_string()
+        }
+    }
+}
