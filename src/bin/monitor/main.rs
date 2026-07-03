@@ -976,6 +976,15 @@ async fn run_review_deep_analysis() {
 /// 修复 P1-1: 聚合推送. 从 LLM 输出提取 "操作建议" + "综合分", 按操作建议分组.
 /// 模板按综合分裁剪: < 30 或 > 70 → 200 字简短, 30-70 → 800 字详细.
 /// 综合分 OK<2 时 (来自 BR-011) 强制 N/A.
+///
+/// v11-P0-4 commit C: 标 `#[deprecated]`, 替换为 `stock_analysis::decision::decision_render::format_decision_board`.
+/// 当前仍保留 (grill Q3 修订: PUSH_SHADOW 切换, commit E 处理).
+/// 替代理由: 此函数靠 `extract_advice_and_score` 用 `contains("规避")` 字符串猜动作,
+/// 鲁棒性差. 决策台走结构化 `Action` / `Priority` (commit A) + `decide()` 5 层规则 (commit B).
+#[deprecated(
+    since = "v13.3 (P0-4 commit C)",
+    note = "replace with stock_analysis::decision::decision_render::format_decision_board (after PUSH_SHADOW switch, see P0-4 commit E)"
+)]
 fn build_holding_summary(
     holdings: &[stock_analysis::portfolio::Position],
     by_code: &std::collections::HashMap<String, (String, Option<String>)>,

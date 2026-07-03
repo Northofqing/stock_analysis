@@ -9,3 +9,4 @@ pub mod rotation;
 pub mod leader;
 pub mod decision_panel;
 pub mod decision_decide;
+pub mod decision_render;
