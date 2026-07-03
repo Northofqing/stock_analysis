@@ -435,3 +435,179 @@ mod tests_b {
         assert_eq!(result[0].code, "600000");
     }
 }
+
+// ============================================================================
+// v11-P0-5+ Commit C: 排序 + 渲染
+// ============================================================================
+
+/// 排序候选 (P5 §3.3 硬规则: 强证据优先 > 参考证据强度 > 题材热度)
+///
+/// 排序键:
+/// 1. tier 优先级: Strong (0) < Reference (1) < Theme (2) (数字小排前)
+/// 2. 同 tier 内: 多源 > 单源 (P5 §3.1 红线: 出现越多 ≈ 越多路信号)
+/// 3. 同 tier 同 source 数: source_count desc + code asc (稳定排序)
+///
+/// 题材热度排序留 P0-5+ 后续 (P5 §四 注释: 热度分从 sector_monitor 接入, 但本 commit 简化)
+pub fn sort_candidates(mut entries: Vec<CandidateEntry>) -> Vec<CandidateEntry> {
+    entries.sort_by(|a, b| {
+        let tier_a = match a.tier {
+            EvidenceTier::Strong => 0,
+            EvidenceTier::Reference => 1,
+            EvidenceTier::Theme => 2,
+        };
+        let tier_b = match b.tier {
+            EvidenceTier::Strong => 0,
+            EvidenceTier::Reference => 1,
+            EvidenceTier::Theme => 2,
+        };
+        tier_a
+            .cmp(&tier_b)
+            .then_with(|| b.source_count().cmp(&a.source_count()))
+            .then_with(|| a.code.cmp(&b.code))
+    });
+    entries
+}
+
+/// 渲染候选筛选台卡片 (P5 §五 输出形态)
+///
+/// 格式:
+/// ```
+/// 📋 候选筛选台 · 通过硬门槛 N 只
+/// 定位: 帮你筛选, 不替你拍板买入 | 证据分「已验证/参考」
+/// ━━━━━━━━━━━
+/// 1. XXX(000001) ¥25.30 +3.2%
+///    🟢 强: 布林+MACD主升浪启动 (B方案, 已验证)
+///    来源: 选股+优选+产业链 (3 路指向)
+///
+/// 2. YYY(002XXX) ¥14.10 +1.8%
+///    🟡 参考: breakout 置信 78 | 资金+2.3亿
+///    ⚠️ 无强证据, 仅参考
+///    来源: 放量自选 (1 路)
+/// ━━━━━━━━━━━
+/// 💡 强证据票排前; "参考" 类需你自行判断, 系统不下买入指令
+/// ```
+pub fn format_candidate_board(entries: &[CandidateEntry]) -> String {
+    let mut out = String::new();
+    let n = entries.len();
+    out.push_str(&format!("📋 候选筛选台 · 通过硬门槛 {} 只\n", n));
+    out.push_str("定位: 帮你筛选, 不替你拍板买入 | 证据分「已验证/参考」\n");
+    out.push_str("━━━━━━━━━━━\n");
+    for (i, e) in entries.iter().enumerate() {
+        out.push_str(&format!(
+            "{}. {}({}) ¥{:.2} {:+.2}%\n",
+            i + 1,
+            e.name,
+            e.code,
+            e.current_price,
+            e.change_pct
+        ));
+        // 证据分档
+        out.push_str(&format!(
+            "   {} {}: {}\n",
+            e.tier.emoji(),
+            e.tier.label(),
+            e.evidence.join(" | ")
+        ));
+        // 警告 (P5 §五 红线: 无强证据的标 ⚠️)
+        if e.needs_warning() {
+            out.push_str("   ⚠️ 无强证据, 仅参考\n");
+        }
+        // 来源
+        out.push_str(&format!("   来源: {} ({} 路指向)\n", e.sources_label(), e.source_count()));
+    }
+    out.push_str("━━━━━━━━━━━\n");
+    out.push_str("💡 强证据票排前; \"参考\" 类需你自行判断, 系统不下买入指令\n");
+    out
+}
+
+#[cfg(test)]
+mod tests_c {
+    use super::*;
+
+    fn make_entry(code: &str, tier: EvidenceTier, sources: Vec<CandidateSource>) -> CandidateEntry {
+        CandidateEntry {
+            code: code.to_string(),
+            name: format!("测试{}", code),
+            sources,
+            tier,
+            evidence: vec!["测试证据".to_string()],
+            current_price: 10.0,
+            change_pct: 1.0,
+        }
+    }
+
+    /// 排序: Strong > Reference > Theme
+    #[test]
+    fn sort_strong_before_reference() {
+        let entries = vec![
+            make_entry("000001", EvidenceTier::Theme, vec![CandidateSource::StockPick]),
+            make_entry("000002", EvidenceTier::Reference, vec![CandidateSource::StockPick]),
+            make_entry("000003", EvidenceTier::Strong, vec![CandidateSource::StockPick]),
+        ];
+        let sorted = sort_candidates(entries);
+        assert_eq!(sorted[0].code, "000003", "Strong 排第一");
+        assert_eq!(sorted[1].code, "000002");
+        assert_eq!(sorted[2].code, "000001");
+    }
+
+    /// 同 tier 内: 多源优先
+    #[test]
+    fn sort_multi_source_first_in_same_tier() {
+        let entries = vec![
+            make_entry("000001", EvidenceTier::Strong, vec![CandidateSource::StockPick]),
+            make_entry(
+                "000002",
+                EvidenceTier::Strong,
+                vec![
+                    CandidateSource::StockPick,
+                    CandidateSource::OptimalClose,
+                    CandidateSource::IndustryChain,
+                ],
+            ),
+        ];
+        let sorted = sort_candidates(entries);
+        assert_eq!(sorted[0].code, "000002", "3-source 排第一");
+    }
+
+    /// 渲染: 强证据 + 多源 (P5 §五 输出形态)
+    #[test]
+    fn format_strong_with_3_sources() {
+        let entry = make_entry(
+            "000001",
+            EvidenceTier::Strong,
+            vec![
+                CandidateSource::StockPick,
+                CandidateSource::OptimalClose,
+                CandidateSource::IndustryChain,
+            ],
+        );
+        let formatted = format_candidate_board(&[entry]);
+        assert!(formatted.contains("📋 候选筛选台 · 通过硬门槛 1 只"));
+        assert!(formatted.contains("🟢 强"));
+        assert!(formatted.contains("来源: 选股+优选+产业链 (3 路指向)"));
+        // 强证据不需要警告
+        assert!(!formatted.contains("⚠️ 无强证据"));
+    }
+
+    /// 渲染: 参考证据 + 单源 → 显示警告
+    #[test]
+    fn format_reference_with_warning() {
+        let entry = make_entry(
+            "000002",
+            EvidenceTier::Reference,
+            vec![CandidateSource::VolumeWatchlist],
+        );
+        let formatted = format_candidate_board(&[entry]);
+        assert!(formatted.contains("🟡 参考"));
+        assert!(formatted.contains("⚠️ 无强证据, 仅参考"), "P5 §五 红线");
+        assert!(formatted.contains("放量自选 (1 路指向)"));
+    }
+
+    /// 渲染: 空列表不报错
+    #[test]
+    fn format_empty_list() {
+        let formatted = format_candidate_board(&[]);
+        assert!(formatted.contains("通过硬门槛 0 只"));
+        assert!(!formatted.contains("⚠️")); // 空列表没警告
+    }
+}
