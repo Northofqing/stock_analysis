@@ -427,22 +427,32 @@ fn first_meaningful_line(md: &str) -> String {
 
 /// action_text → (Action, Priority) 映射 (grill Q3/Q4 决策, 不从 score 算 priority)
 /// v11 IC 证伪 sentiment_score, 数字不可靠, action 文本才是稳定信号
+///
+/// v14.3 修订: 加 "看空"/"偏空"/"看多"/"看平" 等 LLM 实际输出关键词
+/// (shadow 验证发现 commit 2 关键词不全: LLM 输出"强烈看空"但没映射 → 全 fallback Hold)
 fn action_priority_from_advice(advice: &str) -> (Action, Priority) {
-    // 优先级: 强烈卖出 > 卖出/减持 > 增持/加仓 > 观望 > 其它
-    if advice.contains("强烈卖出") {
+    // 优先级: 强烈卖出/看空 > 卖出/偏空/减持 > 增持/看多 > 观望/中性 > 其它
+    if advice.contains("强烈卖出") || advice.contains("强烈看空") {
         (Action::ReduceNow, Priority::P0)
     } else if advice.contains("卖出")
         || advice.contains("减持")
         || advice.contains("规避")
         || advice.contains("降仓")
+        || advice.contains("看空")
+        || advice.contains("偏空")
     {
         (Action::Reduce, Priority::P1)
     } else if advice.contains("增持")
         || advice.contains("加仓")
         || advice.contains("买入")
+        || advice.contains("看多")
+        || advice.contains("强烈看多")
     {
         (Action::WatchAdd, Priority::P2)
-    } else if advice.contains("观望") {
+    } else if advice.contains("观望")
+        || advice.contains("中性")
+        || advice.contains("看平")
+    {
         (Action::Hold, Priority::P2)
     } else {
         // 兜底: 未知 action → Hold (P2) 诚实标注
@@ -589,5 +599,45 @@ mod tests_llm_parse {
         assert_eq!(decisions[0].action, Action::Hold);
         assert_eq!(decisions[0].priority, Priority::P2);
         assert!(decisions[0].reasons[0].text.contains("默认 Hold"));
+    }
+
+    /// v14.3: LLM 实际输出"强烈看空" → ReduceNow (P0, 等价"强烈卖出")
+    #[test]
+    fn llm_advice_strong_short_sell() {
+        let (action, priority) = action_priority_from_advice("## 【操作建议】**强烈看空**");
+        assert_eq!(action, Action::ReduceNow);
+        assert_eq!(priority, Priority::P0);
+    }
+
+    /// v14.3: LLM 实际输出"偏空" → Reduce (P1, 等价"减持")
+    #[test]
+    fn llm_advice_bearish() {
+        let (action, priority) = action_priority_from_advice("## 【操作建议】**偏空**");
+        assert_eq!(action, Action::Reduce);
+        assert_eq!(priority, Priority::P1);
+    }
+
+    /// v14.3: LLM 实际输出"看空" → Reduce (P1, 等价"卖出")
+    #[test]
+    fn llm_advice_short() {
+        let (action, priority) = action_priority_from_advice("## 【操作建议】**看空**");
+        assert_eq!(action, Action::Reduce);
+        assert_eq!(priority, Priority::P1);
+    }
+
+    /// v14.3: LLM 实际输出"中性" → Hold (P2, 等价"观望")
+    #[test]
+    fn llm_advice_neutral() {
+        let (action, priority) = action_priority_from_advice("## 【操作建议】**中性**");
+        assert_eq!(action, Action::Hold);
+        assert_eq!(priority, Priority::P2);
+    }
+
+    /// v14.3: LLM 实际输出"强烈看多" → WatchAdd (P2, 等价"增持")
+    #[test]
+    fn llm_advice_strong_buy() {
+        let (action, priority) = action_priority_from_advice("## 【操作建议】**强烈看多**");
+        assert_eq!(action, Action::WatchAdd);
+        assert_eq!(priority, Priority::P2);
     }
 }
