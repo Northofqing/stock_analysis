@@ -8,3 +8,4 @@ pub mod capital_verify;
 pub mod rotation;
 pub mod leader;
 pub mod decision_panel;
+pub mod decision_decide;
