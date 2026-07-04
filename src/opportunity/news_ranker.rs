@@ -633,6 +633,87 @@ mod tests {
         shadow_rank_hits(&hits, &titles);
         std::env::remove_var("NEWS_RANKER_SHADOW");
     }
+
+    // ============ Commit 4 单测: 候选台 + 推送渲染 ============
+
+    /// 26) ranked_to_candidates: A/B 档进, C/Drop 不进
+    #[test]
+    fn ranked_to_candidates_filter() {
+        use crate::opportunity::chain_mapper::StockInfo;
+        let cand_factory = |title: &str, bucket: NewsRankBucket, stage: HeatStage| RankedNews {
+            candidate: NewsCandidate {
+                id: title.to_string(),
+                title: title.to_string(),
+                snippet: "".into(),
+                source: "test".into(),
+                published_at: Some(Local::now()),
+                chain_hits: vec![ChainHit {
+                    chain: "X".into(),
+                    keywords: vec!["x".into()],
+                    logic: "test".into(),
+                    stocks: vec![StockInfo { code: "000001".into(), name: "A".into(), change_pct: 0.0, vol_ratio: 1.0 }],
+                    source: ChainSource::Rule,
+                    board_keyword: "X".into(),
+                    fund_flow_pct: None,
+                }],
+                board_code: None,
+            },
+            event_type: EventType::PolicyCatalyst,
+            heat_stage: stage,
+            score: 70,
+            bucket,
+            evidence: NewsEvidenceBreakdown::default(),
+            reasons: vec!["test".into()],
+            drop_reason: None,
+        };
+        let ranked = vec![
+            cand_factory("推1", NewsRankBucket::PushNow, HeatStage::Start),
+            cand_factory("观1", NewsRankBucket::WatchCandidate, HeatStage::Ferment),
+            cand_factory("仅日1", NewsRankBucket::LogOnly, HeatStage::Climax),
+            cand_factory("丢1", NewsRankBucket::Drop, HeatStage::Unknown),
+        ];
+        let cands = ranked_to_candidates(&ranked);
+        assert_eq!(cands.len(), 2, "仅 A/B 档进候选台, got {}", cands.len());
+        assert!(cands.iter().all(|c| c.sources.contains(&crate::opportunity::candidate_panel::CandidateSource::NewsCatalyst)));
+    }
+
+    /// 27) format_news_ranked_board: 4 档分类输出
+    #[test]
+    fn format_ranked_board_basic() {
+        let ranked: Vec<RankedNews> = vec![];
+        let s = format_news_ranked_board(&ranked);
+        assert!(s.contains("新闻Ranker"));
+        assert!(s.contains("A=0"));
+        assert!(s.contains("B=0"));
+        assert!(s.contains("Drop=0"));
+    }
+
+    /// 28) format_news_ranked_board: A 档内容显示
+    #[test]
+    fn format_ranked_board_with_a() {
+        let r = RankedNews {
+            candidate: NewsCandidate {
+                id: "t".into(),
+                title: "国务院印发低空经济规划".into(),
+                snippet: "".into(),
+                source: "东财".into(),
+                published_at: Some(Local::now()),
+                chain_hits: vec![],
+                board_code: None,
+            },
+            event_type: EventType::PolicyCatalyst,
+            heat_stage: HeatStage::Start,
+            score: 75,
+            bucket: NewsRankBucket::PushNow,
+            evidence: NewsEvidenceBreakdown::default(),
+            reasons: vec!["规则召回 20 分".into()],
+            drop_reason: None,
+        };
+        let s = format_news_ranked_board(&[r]);
+        assert!(s.contains("🟢 [A1]"));
+        assert!(s.contains("政策催化"));
+        assert!(s.contains("启动"));
+    }
 }
 
 // ============ Commit 2 实现: 评分函数 + rank_news 主入口 ============
@@ -938,36 +1019,33 @@ fn decide_bucket(
 
 // ============ Commit 3: 影子模式入口 ============
 
-/// 影子模式: 在现有 `gate_hits` 之后跑一遍 ranker, 仅 log 对比, 不接 push_governor
+/// 影子模式: 在现有 `gate_hits` 之后跑一遍 ranker, log 对比 + 返回 ranked 列表
 ///
 /// **触发**: `NEWS_RANKER_SHADOW=true` env var
-/// **不触发**: 仅 log 一行 "shadow disabled"
+/// **不触发**: 返空 Vec, 不 log
 ///
 /// **行为**:
 ///   - 每个 ChainHit 构造 NewsCandidate (board_code=None, 一期不查板块)
 ///   - 调 rank_news (默认 MarketContext 全部 0)
 ///   - log: event_type / heat_stage / score / bucket / drop_reason
-///   - 累计 4 bucket 数量, 1 行汇总
+///   - 返 Vec<RankedNews> 供 run_opportunity_scan 填 news_ranked_text
 ///
 /// **红线**:
 ///   - 不修改 hits (不动旧 dual_score 路径)
-///   - 不接 push_governor
+///   - 不接 push_governor (由 main.rs 调)
 ///   - 失败仅 warn, 不 panic
 pub fn shadow_rank_hits(
     hits: &[crate::opportunity::chain_mapper::ChainHit],
     titles: &[String],
-) {
+) -> Vec<RankedNews> {
     let enabled = std::env::var("NEWS_RANKER_SHADOW")
         .map(|v| v.to_lowercase() == "true")
         .unwrap_or(false);
-    if !enabled {
-        log::debug!("[NEWS_RANKER] shadow disabled (set NEWS_RANKER_SHADOW=true)");
-        return;
-    }
-    if hits.is_empty() {
-        return;
+    if !enabled || hits.is_empty() {
+        return Vec::new();
     }
     let ctx = MarketContext::default();
+    let mut ranked_all = Vec::with_capacity(hits.len());
     let mut a_count = 0;
     let mut b_count = 0;
     let mut c_count = 0;
@@ -1009,6 +1087,7 @@ pub fn shadow_rank_hits(
             ranked.bucket,
             drop
         );
+        ranked_all.push(ranked);
     }
     log::info!(
         "[NEWS_RANKER][shadow] 汇总: {} 命中 → A={} B={} C={} Drop={}",
@@ -1018,4 +1097,118 @@ pub fn shadow_rank_hits(
         c_count,
         drop_count
     );
+    ranked_all
+}
+
+// ============ Commit 4: 候选台 + 推送治理 ============
+
+/// 把 RankedNews 列表转成 CandidateEntry (仅 A/B 档, C 档不进)
+pub fn ranked_to_candidates(ranked: &[RankedNews]) -> Vec<crate::opportunity::candidate_panel::CandidateEntry> {
+    let mut out = Vec::new();
+    for r in ranked {
+        // 仅 A/B 档进候选台
+        if !matches!(r.bucket, NewsRankBucket::PushNow | NewsRankBucket::WatchCandidate) {
+            continue;
+        }
+        // 取第一条 chain_hit 的第一支 stock 作 entry (一期简化)
+        let (code, name) = r
+            .candidate
+            .chain_hits
+            .iter()
+            .flat_map(|h| h.stocks.iter())
+            .next()
+            .map(|s| (s.code.clone(), s.name.clone()))
+            .unwrap_or_else(|| (r.candidate.id.clone(), r.candidate.chain_hits.first().map(|h| h.chain.clone()).unwrap_or_default()));
+        // 阶段判断决定 EvidenceTier: 启动/发酵 → Reference, 其他 → Theme
+        let tier = match r.heat_stage {
+            HeatStage::Start | HeatStage::Ferment => crate::opportunity::candidate_panel::EvidenceTier::Reference,
+            _ => crate::opportunity::candidate_panel::EvidenceTier::Theme,
+        };
+        // evidence 文本: 把 7 维评分塞进去, 人读透明
+        let evidence_text = format!(
+            "📰 新闻催化 | {} | {} | score={} | 规则{} 时效{} 热度{} 阶段{} 资金{} 来源{} 风险-{}",
+            r.event_type.label(),
+            r.heat_stage.label(),
+            r.score,
+            r.evidence.rule_score,
+            r.evidence.freshness_score,
+            r.evidence.heat_score,
+            r.evidence.stage_score,
+            r.evidence.capital_score,
+            r.evidence.source_score,
+            r.evidence.risk_penalty,
+        );
+        out.push(crate::opportunity::candidate_panel::CandidateEntry {
+            code,
+            name,
+            sources: vec![crate::opportunity::candidate_panel::CandidateSource::NewsCatalyst],
+            tier,
+            evidence: vec![evidence_text],
+            current_price: 0.0,
+            change_pct: 0.0,
+        });
+    }
+    out
+}
+
+/// 渲染 RankedNews 列表为可推送文本 (P5 §五 输出形态)
+pub fn format_news_ranked_board(ranked: &[RankedNews]) -> String {
+    let mut out = String::new();
+    let a: Vec<&RankedNews> = ranked.iter().filter(|r| r.bucket == NewsRankBucket::PushNow).collect();
+    let b: Vec<&RankedNews> = ranked.iter().filter(|r| r.bucket == NewsRankBucket::WatchCandidate).collect();
+    let c: Vec<&RankedNews> = ranked.iter().filter(|r| r.bucket == NewsRankBucket::LogOnly).collect();
+    let d: Vec<&RankedNews> = ranked.iter().filter(|r| r.bucket == NewsRankBucket::Drop).collect();
+    out.push_str(&format!(
+        "📰 新闻Ranker · A={} B={} C={} Drop={}\n",
+        a.len(), b.len(), c.len(), d.len()
+    ));
+    out.push_str("定位: 帮你筛选, 不替你拍板买入 | 阶段判断+风险过滤\n");
+    out.push_str("━━━━━━━━━━━\n");
+    // A 档
+    for (i, r) in a.iter().enumerate() {
+        out.push_str(&format!(
+            "🟢 [A{}] {} ({}分, {}/{})\n   {}\n",
+            i + 1,
+            r.candidate.title.chars().take(40).collect::<String>(),
+            r.score,
+            r.event_type.label(),
+            r.heat_stage.label(),
+            r.reasons.join(" | "),
+        ));
+    }
+    // B 档
+    for (i, r) in b.iter().enumerate() {
+        out.push_str(&format!(
+            "🟡 [B{}] {} ({}分, {}/{})\n   {}\n",
+            i + 1,
+            r.candidate.title.chars().take(40).collect::<String>(),
+            r.score,
+            r.event_type.label(),
+            r.heat_stage.label(),
+            r.reasons.join(" | "),
+        ));
+    }
+    // C 档
+    for r in &c {
+        out.push_str(&format!(
+            "⚪ [C] {} ({}分, {}阶段, 仅日志)\n",
+            r.candidate.title.chars().take(40).collect::<String>(),
+            r.score,
+            r.heat_stage.label(),
+        ));
+    }
+    // Drop (仅 5 条, 不刷屏)
+    for r in d.iter().take(5) {
+        out.push_str(&format!(
+            "🚫 [Drop] {} → {}\n",
+            r.candidate.title.chars().take(30).collect::<String>(),
+            r.drop_reason.as_deref().unwrap_or(""),
+        ));
+    }
+    if d.len() > 5 {
+        out.push_str(&format!("   ... 还有 {} 条 Drop\n", d.len() - 5));
+    }
+    out.push_str("━━━━━━━━━━━\n");
+    out.push_str("💡 A 档共振可推; B 档观察; C/Drop 仅审计; 系统不下买入指令\n");
+    out
 }

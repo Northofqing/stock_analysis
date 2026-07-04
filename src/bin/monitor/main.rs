@@ -563,6 +563,11 @@ async fn run_test_scan() {
         log::info!("[测试] 持仓影响:\n{}", scan.impact_text);
         push_wechat(&scan.impact_text).await;
     }
+    // P2-News Commit 4: NewsRanker 输出 (A/B/C/Drop 4 档) — 走 push_governor 不绕过
+    if !scan.news_ranked_text.is_empty() {
+        log::info!("[测试] 新闻Ranker:\n{}", scan.news_ranked_text);
+        notify::push_governor(&scan.news_ranked_text, notify::PushKind::NewsRanked).await;
+    }
 
     // 14. v4 决策层：排除引擎 + 风控（含 HTTP 调用，走 spawn_blocking）
     let h = holdings.clone();

@@ -771,6 +771,9 @@ pub struct OpportunityScan {
     pub chain_text: String,
     /// 持仓影响正文。空 = 无持仓影响，不推送。
     pub impact_text: String,
+    /// P2-News Commit 4: NewsRanker 输出文本 (A/B/C/Drop 4 档)
+    /// 旧调用方忽略此字段即可, 不影响向后兼容
+    pub news_ranked_text: String,
 }
 
 /// 运行一次产业链扫描，返回「产业链」与「持仓影响」分离的结果
@@ -854,7 +857,7 @@ pub async fn run_opportunity_scan() -> OpportunityScan {
     if titles.is_empty() {
         log::info!("[Opportunity] 采集 0 条新闻 → 跳过本轮");
         lines.push("暂无最新快讯".to_string());
-        return OpportunityScan { chain_text: lines.join("\n"), impact_text: String::new() };
+        return OpportunityScan { chain_text: lines.join("\n"), impact_text: String::new(), news_ranked_text: String::new() };
     }
 
     // 2. 产业链映射（规则优先，未命中则 AI 兜底）
@@ -862,7 +865,7 @@ pub async fn run_opportunity_scan() -> OpportunityScan {
     if hits.is_empty() {
         log::info!("[Opportunity] 采集 {} 条新闻(快讯{}/Web{}) → 命中 0 条产业链（含AI兜底）", titles.len(), flash_n, web_n);
         lines.push("当前快讯未命中已知产业链".to_string());
-        return OpportunityScan { chain_text: lines.join("\n"), impact_text: String::new() };
+        return OpportunityScan { chain_text: lines.join("\n"), impact_text: String::new(), news_ranked_text: String::new() };
     }
     let rule_n = hits.iter().filter(|h| h.source == chain_mapper::ChainSource::Rule).count();
     let ai_n = hits.iter().filter(|h| h.source == chain_mapper::ChainSource::Ai).count();
@@ -874,11 +877,14 @@ pub async fn run_opportunity_scan() -> OpportunityScan {
     }).await.unwrap_or_default();
     hits.retain(|h| !h.stocks.is_empty());
     let (hits, dropped) = gate_hits(hits, &flash_titles, &web_results);
-    // P2-News Commit 3: 影子模式跑新 ranker, 仅 log 对比, 不接 push_governor
-    // 不影响旧 dual_score 推送, 不阻断主流
-    if !hits.is_empty() {
-        crate::opportunity::news_ranker::shadow_rank_hits(&hits, &titles);
-    }
+    // P2-News Commit 3: 影子模式跑新 ranker, log 对比 + 收集 ranked 列表
+    // P2-News Commit 4: 收集后由 main.rs 推 PushKind::NewsRanked
+    let ranked_news = if !hits.is_empty() {
+        crate::opportunity::news_ranker::shadow_rank_hits(&hits, &titles)
+    } else {
+        Vec::new()
+    };
+    let news_ranked_text = crate::opportunity::news_ranker::format_news_ranked_board(&ranked_news);
     if hits.is_empty() {
         log::warn!(
             "[Opportunity] 采集 {} 条新闻(快讯{}/Web{}) → 候选被置信度门控全部过滤: {}",
@@ -887,6 +893,7 @@ pub async fn run_opportunity_scan() -> OpportunityScan {
         return OpportunityScan {
             chain_text: "当前产业链信号可信度不足（已降级观察）".to_string(),
             impact_text: String::new(),
+            news_ranked_text,
         };
     }
 
@@ -967,6 +974,7 @@ pub async fn run_opportunity_scan() -> OpportunityScan {
     OpportunityScan {
         chain_text: lines.join("\n"),
         impact_text: if impact_lines.is_empty() { String::new() } else { impact_lines.join("\n") },
+        news_ranked_text,
     }
 }
 
