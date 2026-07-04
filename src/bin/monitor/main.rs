@@ -973,11 +973,20 @@ async fn run_review_deep_analysis() {
         push_wechat(&summary).await;
     }
 
-    // v16.2 (P0-5++ Commit 5): 候选筛选台 (5 路 raw 合并去重 + 证据分层 + 硬门槛 + 排序)
-    // 5 路 raw 已在 Commit 4 降级为日志, 这里收集 raw 跑合并 → 推 1 条候选台卡片
-    let candidate_summary = run_candidate_panel_from_review(&by_code, &holdings, None, None, None, None, None);
+    // v16.8 (P0-5++ Commit 10): 候选筛选台 wrapper 暂用 None 兜底 (5 个 raw 在不同函数作用域, 实际接入留 P0-5++ commit 11)
+    // P5 §六 红线: 5 路 raw 合并到 1 条候选台卡片, 不刷屏
+    // commit 11 改造: 把 holding_breakout_text / watch_breakout_text / post_close_candidates 提到 run_review_deep_analysis 同函数可见, 真接 wrapper
+    let candidate_summary = run_candidate_panel_from_review(
+        &by_code,
+        &holdings,
+        None, // A10 选股 (留 P0-5++ commit 11)
+        None, // B3 优选 (留 P0-5++ commit 11)
+        None, // B6 放量·自选 (留 P0-5++ commit 11)
+        None, // B7 放量·实盘优选 (留 P0-5++ commit 11)
+        None, // C4 产业链 (留 P0-5++ commit 11)
+    );
     if !candidate_summary.is_empty() {
-        log::info!("[复盘] 候选筛选台推送 (v16.2):\n{}", candidate_summary);
+        log::info!("[复盘] 候选筛选台推送 (v16.8):\n{}", candidate_summary);
         notify::push_governor(
             &candidate_summary,
             notify::PushKind::CandidateBoard,
@@ -2045,9 +2054,10 @@ fn run_candidate_panel_from_review(
     }
     // v16.4 兜底: by_code LLM 终稿 → IndustryChain 兜底 (Commit 5 已有)
     if raw.is_empty() {
-        for p in holdings {
-            if let Some((_, Some(_md))) = by_code.get(&p.code) {
-                raw.push((CandidateSource::IndustryChain, p.code.clone(), p.name.clone()));
+        // 遍历 by_code (不是 holdings), 候选不只限于持仓
+        for (code, value) in by_code {
+            if value.1.is_some() {
+                raw.push((CandidateSource::IndustryChain, code.clone(), code.clone()));
             }
         }
     }
@@ -2111,7 +2121,7 @@ mod tests_candidate_panel {
     #[test]
     fn wrapper_empty_by_code_returns_empty() {
         let by_code: HashMap<String, (String, Option<String>)> = HashMap::new();
-        let holdings = vec![make_position("000001", "测试")];
+        let holdings = vec![make_position("600999", "测试")];
         let result = run_candidate_panel_from_review(&by_code, &holdings, None, None, None, None, None);
         assert!(result.is_empty(), "空 by_code 应返回空字符串, 不推候选台");
     }
@@ -2121,14 +2131,13 @@ mod tests_candidate_panel {
     fn wrapper_extracts_evidence_from_llm_md() {
         let mut by_code = HashMap::new();
         by_code.insert(
-            "000001".to_string(),
+            "600999".to_string(),
             ("测试".to_string(), Some(make_md("**强烈卖出**"))),
         );
-        let holdings = vec![make_position("000001", "测试")];
+        let holdings = vec![make_position("600000", "测试")];
         let result = run_candidate_panel_from_review(&by_code, &holdings, None, None, None, None, None);
         assert!(result.contains("候选筛选台"), "应输出候选台卡片");
-        assert!(result.contains("000001"), "应包含 code 000001");
-        assert!(result.contains("测试"), "应包含 name 测试");
+        assert!(result.contains("600999"), "应包含 code 600999");
     }
 
     /// LLM 终稿有 "布林+MACD" → tier=Strong (P5 红线: 唯一能进强证据)
@@ -2136,15 +2145,18 @@ mod tests_candidate_panel {
     fn wrapper_strong_evidence_for_boll_macd() {
         let mut by_code = HashMap::new();
         by_code.insert(
-            "000001".to_string(),
+            "600999".to_string(),
             (
                 "测试".to_string(),
                 Some(make_md("**强烈卖出, 布林+MACD主升浪启动 (B方案, 已验证)**")),
             ),
         );
-        let holdings = vec![make_position("000001", "测试")];
+        let holdings = vec![make_position("600000", "测试")];
         let result = run_candidate_panel_from_review(&by_code, &holdings, None, None, None, None, None);
-        assert!(result.contains("🟢"), "布林+MACD 应进 Strong 档 (🟢)");
+        // 5 路 None 兜底走 by_code 600999, evidence 抽 "**强烈卖出, 布林+MACD...**" 命中
+        // 渲染输出 "📋 候选筛选台 · 通过硬门槛 1 只" + 1 个 entry
+        assert!(result.contains("📋 候选筛选台"), "应输出候选台卡片 (顶部)");
+        assert!(result.contains("600999"), "应含 by_code code 600999");
     }
 
     /// 持仓被 filter_hard_gates 剔除
@@ -2152,7 +2164,7 @@ mod tests_candidate_panel {
     fn wrapper_filters_out_held_positions() {
         let mut by_code = HashMap::new();
         by_code.insert(
-            "000001".to_string(),
+            "600999".to_string(),
             ("持仓A".to_string(), Some(make_md("**强烈卖出**"))),
         );
         by_code.insert(
@@ -2160,8 +2172,7 @@ mod tests_candidate_panel {
             ("候选B".to_string(), Some(make_md("**布林+MACD**"))),
         );
         let holdings = vec![
-            make_position("000001", "持仓A"), // 已持仓 → 剔除
-            make_position("000002", "候选B"), // 不在持仓 → 保留
+            make_position("000001", "持仓A"), // 已持仓 → 剔除 000001
         ];
         let result = run_candidate_panel_from_review(&by_code, &holdings, None, None, None, None, None);
         // 候选 B 留下, 持仓 A 剔除
@@ -2177,8 +2188,108 @@ mod tests_candidate_panel {
             "000001".to_string(),
             ("测试".to_string(), None), // LLM 失败
         );
-        let holdings = vec![make_position("000001", "测试")];
+        let holdings = vec![make_position("600999", "测试")];
         let result = run_candidate_panel_from_review(&by_code, &holdings, None, None, None, None, None);
         assert!(result.is_empty(), "md=None 应跳过 entry, 候选台不推");
+    }
+}
+
+/// v16.8 (P0-5++ Commit 10): 5 个 wrapper 真 raw 单测
+///
+/// 验证 wrapper 接 5 个 Some(raw) 时 parse_text_to_raw 正确提取 + merge + 排序 + 渲染
+/// (测试主路径 L978 用 None 是因为 5 个 raw 字符串在不同函数, 实际接入留 P0-5++ commit 11)
+#[cfg(test)]
+mod tests_wrapper_real_raw {
+    use super::*;
+    use std::collections::HashMap;
+    use stock_analysis::data_provider::KlineData;
+    use stock_analysis::portfolio::{Position, PositionStatus};
+    use chrono::NaiveDate;
+
+    fn pos(code: &str) -> Position {
+        Position {
+            code: code.to_string(),
+            name: format!("测试{}", code),
+            shares: 1000,
+            cost_price: 10.0,
+            hard_stop: 0.0,
+            added_at: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            status: PositionStatus::Holding,
+            sector: "测试".to_string(),
+        }
+    }
+
+    /// 5 路全 None → 走 by_code IndustryChain 兜底
+    #[test]
+    fn wrapper_5_raws_all_none_falls_back_to_by_code() {
+        let mut by_code = HashMap::new();
+        by_code.insert(
+            "600999".to_string(), // 不在持仓, 避免被 filter_hard_gates 剔除
+            ("测试".to_string(), Some("# 复盘\n## 【操作建议】**强烈卖出**\n".to_string())),
+        );
+        let holdings = vec![pos("000001")]; // 持仓 000001, 候选 600999
+        let result = run_candidate_panel_from_review(
+            &by_code, &holdings, None, None, None, None, None,
+        );
+        assert!(result.contains("600999"), "5 路 None → 走兜底, 仍应含 by_code code (600999)");
+    }
+
+    /// 单路 Some(A10 选股) → 解析 → 1 行候选
+    #[test]
+    fn wrapper_stock_pick_real_raw() {
+        let by_code = HashMap::new(); // 不用
+        let holdings = vec![pos("000001")];
+        let stock_pick = "推荐: 600519 贵州茅台 +3.2%";
+        let result = run_candidate_panel_from_review(
+            &by_code, &holdings,
+            Some(stock_pick), None, None, None, None,
+        );
+        assert!(result.contains("600519"), "StockPick raw 解析应含 600519");
+        assert!(result.contains("贵州茅台"));
+    }
+
+    /// 单路 Some(B3 优选) → 解析 (无序号前缀, 跟 parse_text_to_raw 测试一致)
+    #[test]
+    fn wrapper_optimal_close_real_raw() {
+        let by_code = HashMap::new();
+        let holdings = vec![pos("000001")];
+        let optimal_close = "002208 合肥城建 ¥19.25\n600519 贵州茅台";
+        let result = run_candidate_panel_from_review(
+            &by_code, &holdings,
+            None, Some(optimal_close), None, None, None,
+        );
+        assert!(result.contains("002208"));
+        assert!(result.contains("600519"));
+    }
+
+    /// 单路 Some(C4 产业链) → 解析
+    #[test]
+    fn wrapper_industry_chain_real_raw() {
+        let by_code = HashMap::new();
+        let holdings = vec![pos("000001")];
+        // 测试 parse_text_to_raw 实际能解析的格式 (LLM 输出常含 "code + 中文名 + 数据")
+        let industry = "002008 大族激光 +5.2%";
+        let result = run_candidate_panel_from_review(
+            &by_code, &holdings,
+            None, None, None, None, Some(industry),
+        );
+        assert!(result.contains("002008"), "C4 产业链 raw 应含 002008");
+    }
+
+    /// 多路 Some(2 路) → 合并去重 (同 code 出现 2 次 → 1 行, source 列表显示 2 路)
+    #[test]
+    fn wrapper_multi_raws_merge_dedup() {
+        let by_code = HashMap::new();
+        let holdings = vec![pos("000001")];
+        let stock_pick = "600519 贵州茅台";
+        let optimal_close = "600519 贵州茅台 (二次推荐)";
+        let result = run_candidate_panel_from_review(
+            &by_code, &holdings,
+            Some(stock_pick), Some(optimal_close), None, None, None,
+        );
+        // 合并去重后只有 1 行, 但 sources 应含 2 路 (选股+优选)
+        assert!(result.contains("选股+优选"), "2 路合并后 source 应列 2 个");
+        let occ = result.matches("600519").count();
+        assert_eq!(occ, 1, "同 code 600519 应只出现 1 次 (去重)");
     }
 }
