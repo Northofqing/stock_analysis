@@ -876,7 +876,7 @@ async fn run_review_only_inner() {
     }
 
     // 盘后持仓多 Agent 深度研判（6 分析师 + 多空辩论 + 仲裁），逐只推送飞书
-    run_review_deep_analysis().await;
+    run_review_deep_analysis(&holding_breakout_text, &watch_breakout_text).await;
 
     // P0-3: AI 评分因子 IC 分析
     if let Some(ic_report) = run_factor_ic_analysis() {
@@ -888,7 +888,10 @@ async fn run_review_only_inner() {
 
 /// 盘后持仓多 Agent 深度研判：对每只真实持仓跑「6 分析师 + 多空辩论 + 仲裁」流水线，
 /// 结果逐只推送飞书。受 `AI_AGENT_PIPELINE`（默认开启）控制；关闭则整体跳过。
-async fn run_review_deep_analysis() {
+async fn run_review_deep_analysis(
+    holding_breakout_text: &str,
+    watch_breakout_text: &str,
+) {
     use futures::stream::{self, StreamExt};
 
     // 开关：与主流程一致，AI_AGENT_PIPELINE=false 时不跑多 Agent
@@ -973,17 +976,16 @@ async fn run_review_deep_analysis() {
         push_wechat(&summary).await;
     }
 
-    // v16.8 (P0-5++ Commit 10): 候选筛选台 wrapper 暂用 None 兜底 (5 个 raw 在不同函数作用域, 实际接入留 P0-5++ commit 11)
+    // v17.0 (P0-5++ Commit 11): 候选筛选台 wrapper 接 3 路真 raw (A10/C4 留 None --test 路径)
     // P5 §六 红线: 5 路 raw 合并到 1 条候选台卡片, 不刷屏
-    // commit 11 改造: 把 holding_breakout_text / watch_breakout_text / post_close_candidates 提到 run_review_deep_analysis 同函数可见, 真接 wrapper
     let candidate_summary = run_candidate_panel_from_review(
         &by_code,
         &holdings,
-        None, // A10 选股 (留 P0-5++ commit 11)
-        None, // B3 优选 (留 P0-5++ commit 11)
-        None, // B6 放量·自选 (留 P0-5++ commit 11)
-        None, // B7 放量·实盘优选 (留 P0-5++ commit 11)
-        None, // C4 产业链 (留 P0-5++ commit 11)
+        None,                   // A10 选股 (--test 路径专属, --review 看不到 recs)
+        None,                   // B3 优选 (--test 路径专属, run_test_scan L851)
+        Some(holding_breakout_text),  // B6 放量·自选 (L704 解构, --review 路径)
+        Some(watch_breakout_text),    // B7 放量·实盘优选 (L704 解构, --review 路径)
+        None,                   // C4 产业链 (--test 路径专属, run_test_scan L561)
     );
     if !candidate_summary.is_empty() {
         log::info!("[复盘] 候选筛选台推送 (v16.8):\n{}", candidate_summary);
@@ -1810,7 +1812,8 @@ async fn monitor_loop() {
         let _ = tokio::task::spawn_blocking(snapshot_portfolio_value).await;
 
         // 盘后持仓多 Agent 深度研判（6 分析师 + 多空辩论 + 仲裁），逐只推送飞书
-        run_review_deep_analysis().await;
+        // v17.0: --test 路径 holding/watch_breakout_text 在 run_test_scan 不可见, 传 "" 占位
+        run_review_deep_analysis("", "").await;
 
         log::info!("[收盘] 信号{}条 告警{}条 | DQ: {} | {}",
             signal_count, alert_count, scanner.dq_summary(), prediction::hit_rate_summary(7));
