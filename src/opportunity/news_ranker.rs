@@ -1063,9 +1063,11 @@ pub fn shadow_rank_hits(
     hits: &[crate::opportunity::chain_mapper::ChainHit],
     titles: &[String],
 ) -> Vec<RankedNews> {
+    // v19.3: 默认 true (盘后推荐, 跟 main.rs 一致)
+    // NEWS_RANKER_SHADOW=false 关闭
     let enabled = std::env::var("NEWS_RANKER_SHADOW")
-        .map(|v| v.to_lowercase() == "true")
-        .unwrap_or(false);
+        .map(|v| v.to_lowercase() != "false")
+        .unwrap_or(true);
     if !enabled || hits.is_empty() {
         return Vec::new();
     }

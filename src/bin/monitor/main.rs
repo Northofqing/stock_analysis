@@ -913,11 +913,13 @@ async fn run_review_only_inner() {
 
     if !risk_text.is_empty() {
         log::info!("[复盘] 风控研判:\n{}", risk_text);
-        push_wechat(&risk_text).await;
+        // v19.3: 风险卡合并到持仓决策台 (LLM 建议+止损+轮动+现金 1 张卡)
+        // 不再单独推, 推到 run_review_deep_analysis 完成后合并
     }
 
     // 盘后持仓多 Agent 深度研判（6 分析师 + 多空辩论 + 仲裁），逐只推送飞书
-    run_review_deep_analysis(&holding_breakout_text, &watch_breakout_text).await;
+    // v19.3: 传 risk_text 进去, 让决策台 1 张卡含风险段
+    run_review_deep_analysis(&holding_breakout_text, &watch_breakout_text, &risk_text).await;
 
     // P0-3: AI 评分因子 IC 分析
     if let Some(ic_report) = run_factor_ic_analysis() {
@@ -926,10 +928,12 @@ async fn run_review_only_inner() {
 
     log::info!("[复盘] ======== 盘后分析完成 ========");
 
-    // P2-News (NEWS_RANKER_SHADOW=true 触发, 默认 false)
-    // --review 末尾跑一遍 shadow, 用 holding_breakout_text + watch_breakout_text 当 raw
-    // 复用 wrapper 拿 raw, 走 shadow_rank_hits 评分, 输出到 news_ranked_text
-    if std::env::var("NEWS_RANKER_SHADOW").ok().as_deref() == Some("true") {
+    // v19.3: NewsRanker 默认 true (盘后新闻派生买入推荐, 你应该看到)
+    // NEWS_RANKER_SHADOW=false 关闭 (老 P0-4 PUSH_SHADOW 行为兼容)
+    let shadow_enabled = std::env::var("NEWS_RANKER_SHADOW")
+        .map(|v| v.to_lowercase() != "false")
+        .unwrap_or(true);
+    if shadow_enabled {
         let hbt = holding_breakout_text.clone();
         let wbt = watch_breakout_text.clone();
         let ranked_news = tokio::task::spawn_blocking(move || {
@@ -984,8 +988,10 @@ async fn run_review_only_inner() {
         .unwrap_or_default();
         if !ranked_news.is_empty() {
             let board = stock_analysis::opportunity::news_ranker::format_news_ranked_board(&ranked_news);
-            log::info!("[复盘] 新闻Ranker (v18.4):\n{}", board);
+            log::info!("[复盘] 新闻Ranker (v18.4, {} 命中):\n{}", ranked_news.len(), board);
             notify::push_governor(&board, notify::PushKind::NewsRanked).await;
+        } else {
+            log::info!("[NewsRanker] 0 命中, 跳过推送");
         }
     }
 
@@ -1021,6 +1027,7 @@ async fn run_review_only_inner() {
 async fn run_review_deep_analysis(
     holding_breakout_text: &str,
     watch_breakout_text: &str,
+    risk_text: &str, // v19.3: 风险段 (止损+轮动+现金) 合并到持仓决策台 1 张卡
 ) {
     use futures::stream::{self, StreamExt};
 
@@ -1097,9 +1104,16 @@ async fn run_review_deep_analysis(
     let decisions =
         stock_analysis::decision::decision_decide::decisions_from_llm(&holdings, &by_code);
     let summary = stock_analysis::decision::decision_render::format_decision_board(&decisions);
-    if !summary.is_empty() {
-        log::info!("[复盘] 持仓决策台推送 (v14.2 替换 B9):\n{}", summary);
-        push_wechat(&summary).await;
+    // v19.3: 风险段 (止损+轮动+现金) 合并到持仓决策台 (1 张卡全信息)
+    let mut combined = summary.clone();
+    if !risk_text.is_empty() {
+        combined.push_str("\n\n━━━ 🛡 风险与轮动段 ━━━\n");
+        combined.push_str(&risk_text);
+    }
+    let push_summary = if combined.is_empty() { summary.clone() } else { combined };
+    if !push_summary.is_empty() {
+        log::info!("[复盘] 持仓决策台推送 (v14.2 + 风险合并 v19.3):\n{}", push_summary);
+        push_wechat(&push_summary).await;
     }
 
     // v17.0 (P0-5++ Commit 11): 候选筛选台 wrapper 接 3 路真 raw (A10/C4 留 None --test 路径)
@@ -1939,7 +1953,7 @@ async fn monitor_loop() {
 
         // 盘后持仓多 Agent 深度研判（6 分析师 + 多空辩论 + 仲裁），逐只推送飞书
         // v17.0: --test 路径 holding/watch_breakout_text 在 run_test_scan 不可见, 传 "" 占位
-        run_review_deep_analysis("", "").await;
+        run_review_deep_analysis("", "", "").await;
 
         log::info!("[收盘] 信号{}条 告警{}条 | DQ: {} | {}",
             signal_count, alert_count, scanner.dq_summary(), prediction::hit_rate_summary(7));

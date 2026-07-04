@@ -9,7 +9,7 @@
 /reports
 /test_data
 /docs
-
-# 例外: 关键设计稿入 tracked (P0-4 决策收口 + grill 决策索引, 让 review 工具能看)
-!docs/v11-grill-decisions.md
-!docs/v11-口径不一致P4.md
+/.trellis
+/tests
+/tools
+/skills-lock.json
