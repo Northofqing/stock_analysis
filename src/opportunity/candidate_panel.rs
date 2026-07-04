@@ -611,3 +611,119 @@ mod tests_c {
         assert!(!formatted.contains("⚠️")); // 空列表没警告
     }
 }
+
+// ============================================================================
+// v11-P0-5++ Commit 6: 完整 5 路 raw 收集 + 文本解析
+// ============================================================================
+
+/// 从 LLM 输出文本提取 (code, name) 对列表
+///
+/// 模式: 6 位数字 code (前导 0 保留) + 可选分隔符 + 名字.
+/// 例子:
+/// - "000001 平安银行 +3.2%" → ("000001", "平安银行")
+/// - "推荐: 600519(贵州茅台)" → ("600519", "贵州茅台")
+/// - "1. 002208 合肥城建 ¥19.25" → ("002208", "合肥城建")
+///
+/// 解析失败行 → 跳过 (不报错, P5 红线: 候选筛选不是决策).
+pub fn parse_text_to_raw(text: &str) -> Vec<(String, String)> {
+    use std::collections::HashSet;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<(String, String)> = Vec::new();
+    for line in text.lines() {
+        // 抓 6 位 code: 数字开头 (允许前导 0)
+        let mut chars = line.char_indices().peekable();
+        let mut code_end = None;
+        let mut code_start = None;
+        while let Some((i, c)) = chars.next() {
+            if c.is_ascii_digit() {
+                // 找连续 6 个数字
+                let mut end = i + c.len_utf8();
+                let mut count = 1;
+                while let Some(&(_, nc)) = chars.peek() {
+                    if nc.is_ascii_digit() {
+                        end += nc.len_utf8();
+                        chars.next();
+                        count += 1;
+                        if count == 6 {
+                            break;
+                    }
+                } else {
+                    break;
+                    }
+                }
+                if count == 6 {
+                    code_start = Some(i);
+                    code_end = Some(end);
+                }
+                break; // 只取第一个 6 位 code
+            }
+        }
+        if let (Some(s), Some(e)) = (code_start, code_end) {
+            let code = &line[s..e];
+            // code 后面的 name: 跳过空白 + 标点 (空格, (, 【, 等)
+            let after = &line[e..];
+            let name: String = after
+                .trim_start()
+                .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '(' | '（' | '【' | '[' | ',' | '，' | '.' | '。'))
+                .chars()
+                .take_while(|c| !matches!(c, ' ' | '\t' | '+' | '-' | '%' | '|' | '（' | '(' | ')' | '）' | '[' | ']' | '【' | '】' | ',' | '，' | '.' | '。' | '!' | '!' | '?' | '?' | '$'))
+                .collect();
+            let name = name.trim().to_string();
+            if !name.is_empty() && seen.insert(code.to_string()) {
+                out.push((code.to_string(), name));
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests_parse {
+    use super::*;
+
+    /// 基本格式 "600519 贵州茅台 +3.2%"
+    #[test]
+    fn parse_basic_format() {
+        let text = "推荐: 600519 贵州茅台 +3.2%";
+        let raw = parse_text_to_raw(text);
+        assert_eq!(raw.len(), 1);
+        assert_eq!(raw[0].0, "600519");
+        assert_eq!(raw[0].1, "贵州茅台");
+    }
+
+    /// 括号格式 "002208(合肥城建)" (无序号前缀)
+    #[test]
+    fn parse_paren_format() {
+        let text = "推荐 002208(合肥城建) ¥19.25";
+        let raw = parse_text_to_raw(text);
+        assert_eq!(raw.len(), 1);
+        assert_eq!(raw[0].0, "002208");
+    }
+
+    /// 列表格式 多行多票
+    #[test]
+    fn parse_multiline() {
+        let text = "优选 5 只:\n600519 贵州茅台\n000001 平安银行\n002208 合肥城建";
+        let raw = parse_text_to_raw(text);
+        assert_eq!(raw.len(), 3);
+        assert_eq!(raw[0].0, "600519");
+        assert_eq!(raw[1].0, "000001");
+        assert_eq!(raw[2].0, "002208");
+    }
+
+    /// 解析失败行跳过 (无 6 位 code)
+    #[test]
+    fn parse_skip_invalid_lines() {
+        let text = "市场概况: 普涨\n600519 贵州茅台\n无票\n002208 合肥城建";
+        let raw = parse_text_to_raw(text);
+        assert_eq!(raw.len(), 2);
+    }
+
+    /// 同票多行去重
+    #[test]
+    fn parse_dedup_same_code() {
+        let text = "600519 贵州茅台\n600519 茅台 (二次推荐)";
+        let raw = parse_text_to_raw(text);
+        assert_eq!(raw.len(), 1, "同 code 应去重");
+    }
+}
