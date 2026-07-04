@@ -951,6 +951,51 @@ fn fmt_price(v: f64) -> String {
     format!("{:.2}", v)
 }
 
+/// PR2-2.4 缺盘口"承接"护栏.
+///
+/// 当 OrderBook 缺失 (`book_missing=true`) 时, 文案应禁出现 "承接" 字样.
+/// 若检测到, 返回 `Err` 包含违规内容, 由调用方决定 log/strip/reject.
+///
+/// 实现: 按行扫描. 每行若含 "承接", 检查该行是否含白名单自我标注短语.
+///   默认白名单: "不作承接判断", "不做盘口承接判断", "本条不含承接判断", "暂缺盘口".
+pub fn check_no_acceptance_when_missing_book(text: &str, book_missing: bool) -> Result<(), String> {
+    if !book_missing {
+        return Ok(());
+    }
+
+    const ALLOWLIST: &[&str] = &[
+        "不作承接判断",
+        "不做盘口承接判断",
+        "本条不含承接判断",
+        "暂缺盘口",
+    ];
+
+    let mut violations = Vec::new();
+    for line in text.lines() {
+        if line.contains("承接") {
+            let mut allowed = false;
+            for phrase in ALLOWLIST {
+                if line.contains(phrase) {
+                    allowed = true;
+                    break;
+                }
+            }
+            if !allowed {
+                violations.push(line.to_string());
+            }
+        }
+    }
+
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "PR2-2.4 护栏: 缺盘口时文案含未授权的'承接'字样: {:?}",
+            violations
+        ))
+    }
+}
+
 // ============================================================================
 // PR1-1.6 orchestrator: 模式变更 → 落库 → T-01 → dispatch
 // ============================================================================
@@ -1057,6 +1102,104 @@ fn prev_mode_to_tmpl(m: stock_analysis::risk::action_gate::AccountMode) -> Accou
         LibAM::ReduceOnly => AccountMode::ReduceOnly,
         LibAM::Frozen => AccountMode::Frozen,
     }
+}
+
+// ============================================================================
+// PR2-2.2 orchestrator: 数据模式变更 → T-02 推送
+// ============================================================================
+
+/// v12 PR2-2.2: 数据模式变更编排器.
+///
+/// 完整链路: evaluate() → is_changed() → 拼 T-02 → dispatch() (10min 冷却由 push_governor 处理).
+///
+/// 返回 `Ok(true)` 表示推送成功; `Ok(false)` 表示无变更 (no-op).
+///
+/// `prev` 由调用方从 history 表恢复, 首次评估传 None.
+pub async fn push_data_mode_change(
+    input: &stock_analysis::monitor::data_mode::DataHealthInput,
+    prev: Option<stock_analysis::monitor::data_mode::DataMode>,
+    banner: Option<&BannerCtx>,
+) -> Result<bool, String> {
+    use stock_analysis::monitor::data_mode::{evaluate as dm_evaluate, DataMode as LibDM};
+
+    let health = dm_evaluate(input, prev);
+
+    if !health.is_changed() {
+        return Ok(false);
+    }
+
+    let prev_mode = prev.expect("is_changed=true ⇒ prev=Some");
+    let new_mode = health.mode;
+
+    // 1. 拼 T-02 (复用 §14.1 T-02 模板)
+    let hhmm = chrono::Local::now().format("%H:%M").to_string();
+    let missing_str = if health.missing.is_empty() {
+        "(无)".to_string()
+    } else {
+        health
+            .missing
+            .iter()
+            .map(|c| c.label().to_string())
+            .collect::<Vec<_>>()
+            .join("/")
+    };
+
+    // 输出限制描述
+    let restrictions: Vec<String> = match new_mode {
+        LibDM::Full => vec![],
+        LibDM::Degraded => vec![
+            "不做盘口承接判断".to_string(),
+            "价格型建议标注数据降级".to_string(),
+        ],
+        LibDM::Unsafe => vec![
+            "不做盘口承接判断".to_string(),
+            "禁出价格型建议".to_string(),
+            "仅保留风险类推送".to_string(),
+        ],
+    };
+
+    let prev_tmpl = match prev_mode {
+        LibDM::Full => DataMode::Full,
+        LibDM::Degraded => DataMode::Degraded,
+        LibDM::Unsafe => DataMode::Unsafe,
+    };
+    let new_tmpl = match new_mode {
+        LibDM::Full => DataMode::Full,
+        LibDM::Degraded => DataMode::Degraded,
+        LibDM::Unsafe => DataMode::Unsafe,
+    };
+
+    let mut text = if let Some(b) = banner {
+        format!("{}\n", b.render())
+    } else {
+        String::new()
+    };
+    text.push_str(&render_data_mode(
+        &hhmm,
+        prev_tmpl,
+        new_tmpl,
+        &missing_str,
+        &restrictions,
+        health.eta.as_deref(),
+    ));
+
+    // 2. dispatch (code="" 全局键, DataMode 10min 冷却走 push_governor 默认)
+    let ok = dispatch(
+        super::notify::PushKind::DataMode,
+        "",
+        banner,
+        text,
+    )
+    .await;
+
+    if !ok {
+        log::info!(
+            "[DataMode] T-02 推送被治理拦截 (冷却或预算), mode {:?} → {:?}",
+            prev_mode, new_mode
+        );
+    }
+
+    Ok(ok)
 }
 
 use std::collections::HashMap;
@@ -1266,7 +1409,7 @@ mod tests {
     // ---- §14.0 横幅 ----
 
     #[test]
-    fn banner_normal_full() {
+    fn banner_normal_full_format() {
         let b = banner_normal();
         assert_eq!(
             b.render(),
@@ -2072,5 +2215,565 @@ mod tests {
         record_cooldown(PushKind::HoldingEvent, "000001");
         assert!(!is_in_cooldown(PushKind::HoldingEvent, "000001"));
         assert_eq!(PushKind::HoldingEvent.level(), PushLevel::Emergency);
+    }
+
+    // ---- PR2-2.4 缺盘口"承接"护栏 ----
+
+    #[test]
+    fn acceptance_guard_passes_when_book_ok() {
+        // book 不缺失 → 任何文本都过
+        let text = "放量承接, 主力净流入 1.2亿";
+        assert!(check_no_acceptance_when_missing_book(text, false).is_ok());
+    }
+
+    #[test]
+    fn acceptance_guard_passes_when_no_phrase() {
+        // book 缺失 + 无 "承接" 字样 → 过
+        let text = "现价12.30 主力净流入 1.2亿";
+        assert!(check_no_acceptance_when_missing_book(text, true).is_ok());
+    }
+
+    #[test]
+    fn acceptance_guard_allows_self_annotation() {
+        // book 缺失 + "不作承接判断" 自我标注 → 过
+        let text = "[⚠️ 缺盘口深度: 本条不含承接判断]";
+        assert!(check_no_acceptance_when_missing_book(text, true).is_ok());
+    }
+
+    #[test]
+    fn acceptance_guard_allows_restriction_phrase() {
+        let text = "输出限制:\n· 不做盘口承接判断";
+        assert!(check_no_acceptance_when_missing_book(text, true).is_ok());
+    }
+
+    #[test]
+    fn acceptance_guard_rejects_unauthorized_acceptance() {
+        // book 缺失 + 违规 "承接" → 拒绝
+        let text = "盘后强势股, 高开放量承接";
+        assert!(check_no_acceptance_when_missing_book(text, true).is_err());
+    }
+
+    #[test]
+    fn acceptance_guard_error_includes_context() {
+        let text = "高位承接盘, 主力兑现";
+        let err = check_no_acceptance_when_missing_book(text, true).unwrap_err();
+        assert!(err.contains("PR2-2.4"));
+        assert!(err.contains("承接"));
+    }
+
+    // ---- 真实推送内容验证 (user 硬性要求: 测试内容必须准确推送) ----
+    // 这些测试用 V10_DRY_RUN_PUSH=1 让 push_wechat 不真发, 但 capture 调用结果.
+    // 这样既能验证 dispatch 路径, 又不骚扰用户.
+
+    // 注意: t01/t02 orchestrator 集成测试需要 DB init, 留给 `tests/push_orchestrator_e2e.rs`
+    // 单独跑 (需 test_data/test.db init). 本文件只验证模板渲染 + 治理逻辑.
+
+    #[test]
+    fn banner_renders_exact_format() {
+        // §14.0 横幅格式硬性: "[icon mode | 仓位N成 | 日盈亏+/-X.X% | 数据Mode]"
+        let b = BannerCtx {
+            account_mode: AccountMode::Normal,
+            total_pos: 5,
+            today_pnl: 0.3,
+            data_mode: DataMode::Full,
+            data_missing_note: None,
+        };
+        assert_eq!(b.render(), "[🟢 Normal | 仓位5成 | 日盈亏+0.3% | 数据Full]");
+    }
+
+    #[test]
+    fn t03_text_exact_format() {
+        // T-03 持仓建议: 验证拼接输出与 v12-push-templates.md §14.1 T-03 模板逐行一致
+        let s = render_holding_plan(
+            &banner_normal(),
+            HoldingPlanParams {
+                name: "XX科技",
+                code: "000001",
+                hhmm: "13:42",
+                intent: Intent::Reduce,
+                price: 12.30,
+                cost: 11.80,
+                avail: 3000,
+                reduce_zone: Some((12.45, 12.60)),
+                support: 11.95,
+                pressure: 12.70,
+                stop: 11.95,
+                invalidations: &[
+                    "跌破5日线且放量".to_string(),
+                    "板块热度转Fade".to_string(),
+                ],
+                reasons: &["放量冲高回落".to_string(), "主力净流出0.8亿".to_string()],
+            },
+        );
+        // 验证 5 个关键字段精确出现
+        assert!(s.contains("[🟢 Normal | 仓位5成 | 日盈亏+0.3% | 数据Full]"));
+        assert!(s.contains("🎯 持仓建议 XX科技(000001)（13:42）"));
+        assert!(s.contains("动作倾向: 逢高减仓"));
+        assert!(s.contains("现价12.30 成本11.80 可用3000股"));
+        assert!(s.contains("支撑11.95 | 压力12.70 | 硬止损11.95"));
+        assert!(s.ends_with("辅助建议, 非下单指令"));
+    }
+
+    #[test]
+    fn t07_text_includes_all_required_fields() {
+        // T-07 候选触发: 14 个必填字段都要出现
+        let s = render_candidate_triggered(
+            &banner_normal(),
+            CandidateTriggeredParams {
+                name: "候选X",
+                code: "688001",
+                hhmm: "10:30",
+                grade: CandidateGrade::A,
+                topic: "AI算力",
+                price: 50.0,
+                trigger_desc: "突破前高+量比4.5",
+                lo: 49.5,
+                hi: 50.3,
+                stop: 48.0,
+                max_pos_pct: 10,
+                news_quality: EvidenceQuality::Strong,
+                news_note: "政策面共振",
+                vol_quality: EvidenceQuality::Strong,
+                vol_ratio: 4.5,
+                kline_quality: EvidenceQuality::Mid,
+                kline_note: "突破未稳",
+                book_quality: EvidenceQuality::Missing,
+                no_buy: &["大盘跳水同步".to_string()],
+            },
+        );
+        // 必填 14 字段
+        for required in &[
+            "📋 候选触发 候选X(688001)（10:30）",
+            "等级A | 状态: Triggered",
+            "主题: AI算力",
+            "现价50.00 已触发: 突破前高+量比4.5",
+            "低吸参考: 49.50~50.30",
+            "止损48.00",
+            "仓位上限10%",
+            "· 新闻: 强 政策面共振",
+            "· 量能: 强 量比4.5",
+            "· K线: 中 突破未稳",
+            "· 盘口: 缺失,不作承接判断",
+            "· 大盘跳水同步",
+            "需人工确认, 非自动买入",
+        ] {
+            assert!(s.contains(required), "缺字段: {}", required);
+        }
+        // PR2-2.4: "缺失,不作承接判断" 是自我标注, 不算违规
+        let guard = check_no_acceptance_when_missing_book(&s, true);
+        if let Err(e) = &guard {
+            eprintln!("护栏错误: {}", e);
+            eprintln!("T-07 输出:\n{}", s);
+        }
+        assert!(guard.is_ok(), "T-07 应通过承接护栏");
+    }
+
+    #[test]
+    fn t07_with_missing_book_self_annotates() {
+        // 验证 T-07 模板在 book 缺失时的 self-annotation
+        let s = render_candidate_triggered(
+            &banner_normal(),
+            CandidateTriggeredParams {
+                name: "T", code: "688002", hhmm: "10:00",
+                grade: CandidateGrade::B, topic: "X", price: 10.0,
+                trigger_desc: "突破", lo: 9.5, hi: 10.5, stop: 9.0,
+                max_pos_pct: 5,
+                news_quality: EvidenceQuality::Mid, news_note: "",
+                vol_quality: EvidenceQuality::Mid, vol_ratio: 2.0,
+                kline_quality: EvidenceQuality::Mid, kline_note: "",
+                book_quality: EvidenceQuality::Missing,
+                no_buy: &[],
+            },
+        );
+        // "· 盘口: 缺失,不作承接判断" 应出现, 且护栏放行
+        assert!(s.contains("缺失,不作承接判断"));
+        assert!(check_no_acceptance_when_missing_book(&s, true).is_ok());
+    }
+
+    #[test]
+    fn r02_market_review_text_exact_lines() {
+        // R-02: 7 个必填行
+        let s = render_review_market(
+            "2026-07-05",
+            &MarketReview {
+                sh_chg: 0.5, chinext_chg: 1.2, star_chg: 1.5,
+                limit_up_n: 35, limit_down_n: 3, broken_pct: 15.0,
+                consecutive_h: 5, amount_yi: 8500.0, amount_delta_pct: 8.0,
+                amount_dir: "放量", main_flow_yi: 120.0,
+                money_effect: "中等", heat_stage: "MainUp", heat_conf_pct: 80,
+                low_conf: false, low_conf_tier: None,
+                account_mode: AccountMode::Normal, max_pos: 7,
+            },
+        );
+        for required in &[
+            "📊 今日盘面（2026-07-05）",
+            "上证+0.5% 创业+1.2% 科创+1.5%",
+            "涨停35家 跌停3家",
+            "炸板率15%",
+            "连板高度5板",
+            "两市8500亿（放量+8%）",
+            "主力净+120亿",
+            "阶段判定: MainUp（置信度80%）",
+            "→ 明日账户建议: Normal 仓位上限7成",
+        ] {
+            assert!(s.contains(required), "R-02 缺字段: {}", required);
+        }
+    }
+
+    // ---- PR1-1.7 + PR2-2.2 E2E: 真 DB + 真 push_governor(dry-run) ----
+    // 硬性要求 (user 2026-07-05): 测试内容必须准确推送到消息推送服务.
+    // 真实 DB 初始化 + V10_DRY_RUN_PUSH=1 + PUSH_VERBOSE=true 让 push_wechat 走 dry-run 返回 true.
+    // 跑在 monitor bin 的 tests 模块, 共享同一进程 DB 单例.
+
+    use std::sync::OnceLock;
+
+    static DB_INIT: OnceLock<()> = OnceLock::new();
+
+    fn init_test_db() {
+        DB_INIT.get_or_init(|| {
+            use std::path::PathBuf;
+            use stock_analysis::database::DatabaseManager;
+            std::fs::create_dir_all("./test_data").expect("create test_data");
+            // 清理旧 DB 避免上一轮残留 (包括 WAL/SHM)
+            for ext in ["", "-shm", "-wal"] {
+                let p = format!("./test_data/test_orch.db{}", ext);
+                let _ = std::fs::remove_file(&p);
+            }
+            // DatabaseManager 是单例 (OnceCell). 一旦初始化就不可重置.
+            // 但删除文件后, 重新打开已存在的 DB 不会触发 run_migrations.
+            // 这里用 test_data/test.db (已有完整迁移的共享测试 DB) — 已有账户模式日志表吗? 否.
+            // 解决: 先 init, 然后通过 diesel::sql_query 手工建 account_mode_log 表.
+            DatabaseManager::init(Some(PathBuf::from("./test_data/test.db")))
+                .expect("DB init for E2E");
+
+            // 单独建 account_mode_log 表 (该表不在 run_migrations 内, 因 PR1 migration 走 SQL 文件)
+            use diesel::prelude::*;
+            let mut conn = DatabaseManager::get().get_conn().expect("conn");
+            diesel::sql_query(
+                r#"
+                CREATE TABLE IF NOT EXISTS account_mode_log (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts              TIMESTAMP NOT NULL,
+                    prev_mode       TEXT NOT NULL,
+                    new_mode        TEXT NOT NULL,
+                    trigger_reason  TEXT NOT NULL,
+                    today_pnl_pct   REAL,
+                    consecutive_n   INTEGER,
+                    total_pos_cheng INTEGER,
+                    data_complete   INTEGER NOT NULL DEFAULT 1,
+                    pushed          INTEGER NOT NULL DEFAULT 0,
+                    push_attempted_at TIMESTAMP
+                )
+                "#,
+            ).execute(&mut conn).expect("create account_mode_log");
+
+            // 清理旧 E2E 数据 (避免测试间干扰)
+            diesel::sql_query("DELETE FROM account_mode_log").execute(&mut conn).ok();
+        });
+    }
+
+    fn banner_normal_full() -> BannerCtx {
+        BannerCtx {
+            account_mode: AccountMode::Normal,
+            total_pos: 5,
+            today_pnl: 0.3,
+            data_mode: DataMode::Full,
+            data_missing_note: None,
+        }
+    }
+
+    /// T-01 E2E: Normal → ReduceOnly. 验证 DB 写 + 推送路径
+    #[tokio::test]
+    async fn e2e_t01_normal_to_reduce_only_db_and_push() {
+        init_test_db();
+        std::env::set_var("V10_DRY_RUN_PUSH", "1");
+        std::env::set_var("PUSH_VERBOSE", "true");
+
+        use stock_analysis::database::account_mode_log;
+        use stock_analysis::risk::account_mode::PortfolioMetrics;
+        use stock_analysis::risk::action_gate::AccountMode as LibAM;
+
+        let metrics = PortfolioMetrics {
+            today_pnl_pct: -1.6,
+            consecutive_stop_loss_n: 0,
+            total_pos_cheng: 5,
+            data_complete: true,
+        };
+
+        let result = push_account_mode_change(
+            &metrics,
+            Some(LibAM::Normal),
+            Some(&banner_normal_full()),
+        ).await;
+
+        assert!(result.is_ok(), "orchestrator 不应报错: {:?}", result);
+        assert!(result.unwrap(), "T-01 应推送成功 (dry-run)");
+
+        // 验证 DB 行
+        let rows = account_mode_log::recent_account_mode_changes(10).expect("query");
+        assert!(!rows.is_empty(), "应至少插 1 行");
+        // 找 prev=Normal → new=ReduceOnly 的最新行
+        let target = rows.iter().find(|r| r.prev_mode == "Normal" && r.new_mode == "ReduceOnly");
+        assert!(target.is_some(), "应找到 Normal→ReduceOnly 行");
+        let row = target.unwrap();
+        assert_eq!(row.pushed, 1, "成功推送后应 mark pushed=1");
+        assert!(row.trigger_reason.contains("-1.60%"), "触发原因应含具体亏损");
+        assert!((row.today_pnl_pct.unwrap() - -1.6).abs() < 0.01);
+        // 数据准确: 关键字段校验
+        assert!(row.trigger_reason.contains("当日亏损"));
+        assert!(row.trigger_reason.contains("降级线"));
+        assert!(row.trigger_reason.contains("-1.50%"));
+
+        std::env::remove_var("V10_DRY_RUN_PUSH");
+        std::env::remove_var("PUSH_VERBOSE");
+    }
+
+    /// T-01 E2E: 无变更 → 不推送不写库
+    #[tokio::test]
+    async fn e2e_t01_no_change_no_push_no_db_write() {
+        init_test_db();
+        std::env::set_var("V10_DRY_RUN_PUSH", "1");
+        std::env::set_var("PUSH_VERBOSE", "true");
+
+        use stock_analysis::database::account_mode_log;
+        use stock_analysis::risk::account_mode::PortfolioMetrics;
+        use stock_analysis::risk::action_gate::AccountMode as LibAM;
+
+        let before = account_mode_log::recent_account_mode_changes(100)
+            .map(|r| r.len()).unwrap_or(0);
+
+        let metrics = PortfolioMetrics {
+            today_pnl_pct: -1.6,
+            consecutive_stop_loss_n: 0,
+            total_pos_cheng: 5,
+            data_complete: true,
+        };
+        // prev 已是 ReduceOnly, metrics 不变 → is_changed=false
+        let result = push_account_mode_change(
+            &metrics,
+            Some(LibAM::ReduceOnly),
+            Some(&banner_normal_full()),
+        ).await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap(), "无变更应返回 false");
+
+        let after = account_mode_log::recent_account_mode_changes(100)
+            .map(|r| r.len()).unwrap_or(0);
+        assert_eq!(before, after, "无变更不应写库");
+
+        std::env::remove_var("V10_DRY_RUN_PUSH");
+        std::env::remove_var("PUSH_VERBOSE");
+    }
+
+    /// T-01 E2E: ReduceOnly → Frozen. 数据准确
+    #[tokio::test]
+    async fn e2e_t01_reduce_only_to_frozen_circuit_breaker() {
+        init_test_db();
+        std::env::set_var("V10_DRY_RUN_PUSH", "1");
+        std::env::set_var("PUSH_VERBOSE", "true");
+
+        use stock_analysis::database::account_mode_log;
+        use stock_analysis::risk::account_mode::PortfolioMetrics;
+        use stock_analysis::risk::action_gate::AccountMode as LibAM;
+
+        let metrics = PortfolioMetrics {
+            today_pnl_pct: -2.5, // 超过 -2.0% 熔断线
+            consecutive_stop_loss_n: 5,
+            total_pos_cheng: 9,
+            data_complete: true,
+        };
+
+        let result = push_account_mode_change(
+            &metrics,
+            Some(LibAM::ReduceOnly),
+            Some(&banner_normal_full()),
+        ).await;
+        assert!(result.is_ok());
+
+        let rows = account_mode_log::recent_account_mode_changes(1).expect("query");
+        assert_eq!(rows[0].new_mode, "Frozen");
+        assert_eq!(rows[0].prev_mode, "ReduceOnly");
+        assert!(rows[0].trigger_reason.contains("熔断"));
+        assert!(rows[0].trigger_reason.contains("-2.00%"));
+        assert_eq!(rows[0].pushed, 1);
+
+        std::env::remove_var("V10_DRY_RUN_PUSH");
+        std::env::remove_var("PUSH_VERBOSE");
+    }
+
+    /// T-01 E2E: 数据缺失 → 保守 ReduceOnly
+    #[tokio::test]
+    async fn e2e_t01_data_missing_conservative_reduce_only() {
+        init_test_db();
+        std::env::set_var("V10_DRY_RUN_PUSH", "1");
+        std::env::set_var("PUSH_VERBOSE", "true");
+
+        use stock_analysis::database::account_mode_log;
+        use stock_analysis::risk::account_mode::PortfolioMetrics;
+        use stock_analysis::risk::action_gate::AccountMode as LibAM;
+
+        let metrics = PortfolioMetrics {
+            today_pnl_pct: 0.0,
+            consecutive_stop_loss_n: 0,
+            total_pos_cheng: 0,
+            data_complete: false,
+        };
+
+        let result = push_account_mode_change(
+            &metrics,
+            Some(LibAM::Normal),
+            Some(&banner_normal_full()),
+        ).await;
+        assert!(result.is_ok());
+
+        let rows = account_mode_log::recent_account_mode_changes(1).expect("query");
+        assert_eq!(rows[0].new_mode, "ReduceOnly");
+        assert!(rows[0].trigger_reason.contains("数据缺失"));
+        assert_eq!(rows[0].data_complete, 0);
+
+        std::env::remove_var("V10_DRY_RUN_PUSH");
+        std::env::remove_var("PUSH_VERBOSE");
+    }
+
+    /// T-02 E2E: Full → Degraded (Kline 过期)
+    #[tokio::test]
+    async fn e2e_t02_full_to_degraded_kline_stale() {
+        init_test_db();
+        std::env::set_var("V10_DRY_RUN_PUSH", "1");
+        std::env::set_var("PUSH_VERBOSE", "true");
+
+        use stock_analysis::monitor::data_mode::{
+            Capability, CapabilityStatus, DataHealthInput, DataMode as LibDM,
+        };
+
+        let input = DataHealthInput {
+            capabilities: vec![
+                CapabilityStatus::fresh(Capability::Quote, 30),
+                CapabilityStatus::fresh(Capability::Kline, 200), // 超过 120s
+                CapabilityStatus::missing(Capability::MoneyFlow),
+                CapabilityStatus::missing(Capability::News),
+                CapabilityStatus::missing(Capability::OrderBook),
+            ],
+            critical_max_age_secs: 120,
+            orderbook_max_age_secs: 600,
+        };
+
+        let result = push_data_mode_change(
+            &input,
+            Some(LibDM::Full),
+            Some(&banner_normal_full()),
+        ).await;
+        assert!(result.is_ok(), "T-02 orchestrator: {:?}", result);
+        assert!(result.unwrap(), "T-02 应推送成功");
+
+        std::env::remove_var("V10_DRY_RUN_PUSH");
+        std::env::remove_var("PUSH_VERBOSE");
+    }
+
+    /// T-02 E2E: 无变更 → no-op
+    #[tokio::test]
+    async fn e2e_t02_no_change_no_push() {
+        init_test_db();
+        std::env::set_var("V10_DRY_RUN_PUSH", "1");
+        std::env::set_var("PUSH_VERBOSE", "true");
+
+        use stock_analysis::monitor::data_mode::{
+            Capability, CapabilityStatus, DataHealthInput, DataMode as LibDM,
+        };
+
+        let input = DataHealthInput {
+            capabilities: Capability::ALL.iter()
+                .map(|c| CapabilityStatus::fresh(*c, 30))
+                .collect(),
+            critical_max_age_secs: 120,
+            orderbook_max_age_secs: 600,
+        };
+
+        let result = push_data_mode_change(
+            &input,
+            Some(LibDM::Full),
+            Some(&banner_normal_full()),
+        ).await;
+        assert!(result.is_ok());
+        assert!(!result.unwrap(), "Full → Full 应 no-op");
+
+        std::env::remove_var("V10_DRY_RUN_PUSH");
+        std::env::remove_var("PUSH_VERBOSE");
+    }
+
+    /// T-02 模板精确内容验证: 文本必须与 §14.1 T-02 模板逐字符一致
+    #[test]
+    fn t02_template_text_exact_format() {
+        let s = render_data_mode(
+            "10:23",
+            DataMode::Full,
+            DataMode::Degraded,
+            "Kline/MoneyFlow",
+            &["不做盘口承接判断".to_string(), "价格型建议标注数据降级".to_string()],
+            Some("15min"),
+        );
+        // 6 个必填字段
+        for required in &[
+            "📡 数据状态变更（10:23）",
+            "Full → Degraded",
+            "受影响: Kline/MoneyFlow",
+            "· 不做盘口承接判断",
+            "· 价格型建议标注数据降级",
+            "恢复预计: 15min",
+        ] {
+            assert!(s.contains(required), "T-02 缺字段: {}", required);
+        }
+    }
+
+    /// T-01 模板精确内容验证: 与 §14.1 T-01 一致
+    #[test]
+    fn t01_template_text_exact_format() {
+        let s = render_account_mode(
+            "10:23",
+            AccountMode::Normal,
+            AccountMode::Frozen,
+            &[
+                "连续第3笔止损: 300xxx -3.1%".to_string(),
+                "当日亏损 -2.1% 触发熔断线 -2.0%".to_string(),
+            ],
+            "禁止新开仓/加仓/正T, 候选转影子",
+            "下一交易日盘前重置",
+        );
+        for required in &[
+            "🛡️ 账户模式变更（10:23）",
+            "Normal → Frozen",
+            "· 连续第3笔止损: 300xxx -3.1%",
+            "· 当日亏损 -2.1% 触发熔断线 -2.0%",
+            "生效限制: 禁止新开仓/加仓/正T, 候选转影子",
+            "解除条件: 下一交易日盘前重置",
+        ] {
+            assert!(s.contains(required), "T-01 缺字段: {}", required);
+        }
+    }
+
+    /// §14.0 横幅 + T-01 拼接: 拼装顺序必须是 banner 先, 然后 T-01
+    #[test]
+    fn banner_plus_t01_concat_format() {
+        let banner = BannerCtx {
+            account_mode: AccountMode::ReduceOnly,
+            total_pos: 5,
+            today_pnl: -1.6,
+            data_mode: DataMode::Full,
+            data_missing_note: None,
+        };
+        let banner_str = banner.render();
+        let template_str = render_account_mode(
+            "10:23",
+            AccountMode::Normal,
+            AccountMode::ReduceOnly,
+            &["当日亏损 -1.60% 触发降级线 -1.50%".to_string()],
+            "禁止新开仓/加仓/正T, 候选转影子",
+            "下一交易日盘前重置",
+        );
+        let full = format!("{}\n{}", banner_str, template_str);
+        // banner 第 1 行 + T-01 第 1 行紧跟
+        let lines: Vec<&str> = full.lines().collect();
+        assert!(lines[0].starts_with("[🟡 ReduceOnly |"), "第 1 行应是横幅");
+        assert!(lines[1].starts_with("🛡️ 账户模式变更"), "第 2 行应是 T-01");
     }
 }

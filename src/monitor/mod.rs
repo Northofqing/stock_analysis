@@ -14,6 +14,7 @@
 //! - prediction:     预测追踪闭环
 
 pub mod data_quality;
+pub mod data_mode;  // v12 PR2-2.1
 pub mod rate_budget;
 pub mod scanner;
 pub mod detector;
