@@ -558,7 +558,7 @@ async fn run_test_scan() {
     // BR-005: 每天推送机会数 ≤ 5, 超过入候选池
     let scan = stock_analysis::opportunity::run_opportunity_scan().await;
     log::info!("[测试] 产业链扫描:\n{}", scan.chain_text);
-    push_wechat(&scan.chain_text).await;
+    notify::push_governor(&scan.chain_text, notify::PushKind::IndustryChain).await;
     if !scan.impact_text.is_empty() {
         log::info!("[测试] 持仓影响:\n{}", scan.impact_text);
         push_wechat(&scan.impact_text).await;
@@ -850,19 +850,19 @@ async fn run_review_only_inner() {
     // 与正常收盘路径保持一致：推送优选候选（最多5只，阈值过滤后可少推/不推）
     let post_close_candidates = stock_analysis::opportunity::run_post_close_candidates(5).await;
     log::info!("[复盘] 优选候选:\n{}", post_close_candidates);
-    push_wechat(&post_close_candidates).await;
+    notify::push_governor(&post_close_candidates, notify::PushKind::OptimalClose).await;
 
     // 盘后统计上一交易日虚拟观察仓表现（可配置开关）
     push_virtual_next_day_review_if_needed().await;
 
     if !holding_breakout_text.is_empty() {
         log::info!("[复盘] 放量分析·持仓:\n{}", holding_breakout_text);
-        push_wechat(&holding_breakout_text).await;
+        notify::push_governor(&holding_breakout_text, notify::PushKind::VolumeWatchlist).await;
     }
 
     if !watch_breakout_text.is_empty() {
         log::info!("[复盘] 放量分析·自选:\n{}", watch_breakout_text);
-        push_wechat(&watch_breakout_text).await;
+        notify::push_governor(&watch_breakout_text, notify::PushKind::VolumeRealTrade).await;
     }
 
     if !market_breakout_text.is_empty() {
@@ -1717,7 +1717,7 @@ async fn monitor_loop() {
                         log::info!("[选股] 开始盘中选股扫描...");
                         let recs = tokio::task::spawn_blocking(run_stock_screener).await.unwrap_or(None);
                         if let Some(ref recs) = recs {
-                            for rec in recs { log::info!("[选股] {}", rec); push_wechat(rec).await; }
+                            for rec in recs { log::info!("[选股] {}", rec); notify::push_governor(rec, notify::PushKind::StockPick).await; }
                         }
                     }
 
@@ -1780,7 +1780,7 @@ async fn monitor_loop() {
 
         // 盘后独立维度：优选次日候选（最多 5 只，达不到阈值可少推/不推），强调可解释性，不复用盘中量能信号口径。
         let post_close_candidates = stock_analysis::opportunity::run_post_close_candidates(5).await;
-        push_wechat(&post_close_candidates).await;
+        notify::push_governor(&post_close_candidates, notify::PushKind::OptimalClose).await;
 
         // 盘后统计上一交易日虚拟观察仓表现（可配置开关）
         push_virtual_next_day_review_if_needed().await;

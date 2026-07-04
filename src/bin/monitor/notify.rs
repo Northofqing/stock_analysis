@@ -54,6 +54,17 @@ pub enum PushKind {
     CapitalVerify,
     /// 降级: 周度 SOP
     WeeklySOP,
+    // v11-P0-5+ Commit 4 加: 5 个候选源 (P5 §六 验收, 默认降级, 候选台统一推 1 条)
+    /// 降级: A10 选股推荐 (移交候选台)
+    StockPick,
+    /// 降级: B3 优选候选 (移交候选台)
+    OptimalClose,
+    /// 降级: B6 放量·自选 (移交候选台)
+    VolumeWatchlist,
+    /// 降级: B7 放量·实盘优选 (移交候选台)
+    VolumeRealTrade,
+    /// 降级: C4 产业链扫描 (移交候选台)
+    IndustryChain,
 }
 
 impl PushKind {
@@ -64,7 +75,7 @@ impl PushKind {
             PushKind::HoldingEvent
             | PushKind::DailyReport
             | PushKind::Announcement => false,
-            // 降级 12 条 (grill Q2/Q6 修订)
+            // 降级 17 条 (原 12 + P0-5+ Commit 4 加 5 个候选源)
             PushKind::AuctionVolume
             | PushKind::VirtualWatch
             | PushKind::LimitBoards
@@ -74,7 +85,12 @@ impl PushKind {
             | PushKind::FactorIC
             | PushKind::SectorTier
             | PushKind::CapitalVerify
-            | PushKind::WeeklySOP => true,
+            | PushKind::WeeklySOP
+            | PushKind::StockPick
+            | PushKind::OptimalClose
+            | PushKind::VolumeWatchlist
+            | PushKind::VolumeRealTrade
+            | PushKind::IndustryChain => true,
         }
     }
 
@@ -94,6 +110,11 @@ impl PushKind {
             PushKind::SectorTier => "赛道分档",
             PushKind::CapitalVerify => "资金验证",
             PushKind::WeeklySOP => "周度SOP",
+            PushKind::StockPick => "选股",
+            PushKind::OptimalClose => "优选",
+            PushKind::VolumeWatchlist => "放量自选",
+            PushKind::VolumeRealTrade => "放量实盘",
+            PushKind::IndustryChain => "产业链",
         }
     }
 }
