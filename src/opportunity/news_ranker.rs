@@ -395,4 +395,481 @@ mod tests {
         assert_eq!(HeatStage::Climax.label(), "高潮");
         assert_eq!(HeatStage::Divergence.label(), "分歧");
     }
+
+    // ============ Commit 2 单测: 评分函数 ============
+
+    /// 15) score_rule: 非 generic 命中 +20, generic +8, AI degraded +5
+    #[test]
+    fn score_rule_hit_quality() {
+        use crate::opportunity::chain_mapper::{ChainHit, ChainSource};
+        // 非 generic: 关键词 + 板块名双命中, board_keyword 非空
+        let c1 = ChainHit {
+            chain: "X".into(),
+            keywords: vec!["a".into()],
+            logic: "test".into(),
+            stocks: vec![],
+            source: ChainSource::Rule,
+            board_keyword: "板块".into(),
+            fund_flow_pct: Some(2.0),
+        };
+        // AI degraded: source = AiDegraded
+        let c2 = ChainHit {
+            source: ChainSource::AiDegraded,
+            ..c1.clone()
+        };
+        // 多个 chain 命中
+        let cands_single = vec![c1.clone()];
+        let cands_multi = vec![c1.clone(), c1.clone()];
+        let cands_ai = vec![c2];
+
+        let r1 = score_rule(&cands_single);
+        assert!(r1 >= 20, "非 generic 命中应 ≥20, got {}", r1);
+        let r2 = score_rule(&cands_multi);
+        assert!(r2 > r1, "多 chain 命中应加分");
+        let r3 = score_rule(&cands_ai);
+        assert!(r3 < r1, "AI degraded 命中应低于规则命中");
+    }
+
+    /// 16) score_freshness: 15 分钟内 +20, 6 小时后 0
+    #[test]
+    fn score_freshness_decay() {
+        let now = Local::now();
+        let r1 = score_freshness(Some(now));
+        assert!(r1 >= 18, "刚发布应高, got {}", r1);
+        let r2 = score_freshness(Some(now - chrono::Duration::minutes(30)));
+        assert!((12..=18).contains(&r2), "30 分钟应在 12-18, got {}", r2);
+        let r3 = score_freshness(Some(now - chrono::Duration::hours(8)));
+        assert_eq!(r3, 0, "8 小时外应为 0");
+        let r4 = score_freshness(None);
+        assert!(r4 > 0 && r4 < 10, "缺时间应给低分, got {}", r4);
+    }
+
+    /// 17) score_heat: Climax 限 5, Start/Ferment 给高, Fade 扣
+    #[test]
+    fn score_heat_by_stage() {
+        // Start: 涨幅 3% + 流入 + 涨停 2 → 期望 ≥ 15
+        let s1 = score_heat(HeatStage::Start, 3.0, 1e8, 2);
+        assert!(s1 >= 15, "Start 给高, got {}", s1);
+        // Climax: 限 5
+        let s2 = score_heat(HeatStage::Climax, 8.0, 5e8, 10);
+        assert!(s2 <= 5, "Climax 限 5, got {}", s2);
+        // Fade: 扣
+        let s3 = score_heat(HeatStage::Fade, -3.0, -5e7, 0);
+        assert!(s3 < 0, "Fade 应扣分, got {}", s3);
+    }
+
+    /// 18) score_capital: 强流入 +15, 强流出 -15
+    #[test]
+    fn score_capital_range() {
+        let r1 = score_capital(Some(5e8));
+        assert_eq!(r1, 15, "强流入应 +15");
+        let r2 = score_capital(Some(1e7));
+        assert!(r2 > 0 && r2 <= 10, "弱正应小正, got {}", r2);
+        let r3 = score_capital(Some(-3e8));
+        assert_eq!(r3, -15, "强流出应 -15");
+        let r4 = score_capital(None);
+        assert_eq!(r4, 0, "缺数据应 0");
+    }
+
+    /// 19) risk_penalty: 监管 +30, 减持 +40
+    #[test]
+    fn risk_penalty_by_event() {
+        let p1 = risk_penalty(EventType::RegulatoryRisk, HeatStage::Ferment, &[]);
+        assert!(p1 >= 30, "监管应扣 ≥30, got {}", p1);
+        let p2 = risk_penalty(EventType::CompanyAction, HeatStage::Ferment, &[String::from("减持")]);
+        assert!(p2 >= 30, "减持应扣 ≥30, got {}", p2);
+        let p3 = risk_penalty(EventType::PolicyCatalyst, HeatStage::Start, &[]);
+        assert_eq!(p3, 0, "政策+启动 不应扣");
+    }
+
+    /// 20) rank_news 主入口: 政策+启动+资金 → A 档
+    #[test]
+    fn rank_news_push_now() {
+        let cand = NewsCandidate {
+            id: "test-1".into(),
+            title: "国务院印发低空经济规划".into(),
+            snippet: "支持产业升级".into(),
+            source: "东财".into(),
+            published_at: Some(Local::now()),
+            chain_hits: vec![ChainHit {
+                chain: "低空经济".into(),
+                keywords: vec!["低空".into()],
+                logic: "test".into(),
+                stocks: vec![],
+                source: ChainSource::Rule,
+                board_keyword: "低空经济".into(),
+                fund_flow_pct: Some(3.0),
+            }],
+            board_code: Some("BK0815".into()),
+        };
+        let ctx = MarketContext {
+            today_chg: 2.0,
+            main_inflow: 2e8,
+            main_net_pct_today: 5.0,
+            main_net_pct_5d: 2.0,
+            limit_up_count: Some(2),
+        };
+        let r = rank_news(&cand, &ctx);
+        // 期望: 政策 + 启动 + 资金流入 → A 档或 B 档
+        assert!(matches!(r.bucket, NewsRankBucket::PushNow | NewsRankBucket::WatchCandidate),
+            "应进 A/B 档, got {:?}", r.bucket);
+        assert!(r.event_type == EventType::PolicyCatalyst);
+    }
+
+    /// 21) rank_news: 监管风险 → Drop 或 C 档 + drop_reason
+    #[test]
+    fn rank_news_regulatory_drop() {
+        let cand = NewsCandidate {
+            id: "test-2".into(),
+            title: "证监会立案调查某公司".into(),
+            snippet: "".into(),
+            source: "新浪".into(),
+            published_at: Some(Local::now()),
+            chain_hits: vec![],
+            board_code: None,
+        };
+        let ctx = MarketContext::default();
+        let r = rank_news(&cand, &ctx);
+        // 监管风险 + 无 chain_hit + 无 board → 应 Drop 或 LogOnly
+        assert!(matches!(r.bucket, NewsRankBucket::Drop | NewsRankBucket::LogOnly),
+            "应进 Drop/C 档, got {:?}", r.bucket);
+        if r.bucket == NewsRankBucket::Drop {
+            assert!(r.drop_reason.is_some(), "Drop 必须有 drop_reason");
+        }
+    }
+
+    /// 22) rank_news: 高潮阶段 → 不应 PushNow
+    #[test]
+    fn rank_news_climax_no_push() {
+        let cand = NewsCandidate {
+            id: "test-3".into(),
+            title: "机器人板块再获政策支持".into(),
+            snippet: "".into(),
+            source: "东财".into(),
+            published_at: Some(Local::now()),
+            chain_hits: vec![ChainHit {
+                chain: "机器人".into(),
+                keywords: vec!["机器人".into()],
+                logic: "test".into(),
+                stocks: vec![],
+                source: ChainSource::Rule,
+                board_keyword: "机器人".into(),
+                fund_flow_pct: Some(8.0),
+            }],
+            board_code: Some("BK0815".into()),
+        };
+        // 模拟高潮: 涨停 10 家 + 涨幅 8% + 资金强流入
+        let ctx = MarketContext {
+            today_chg: 8.0,
+            main_inflow: 5e8,
+            main_net_pct_today: 12.0,
+            main_net_pct_5d: 5.0,
+            limit_up_count: Some(10),
+        };
+        let r = rank_news(&cand, &ctx);
+        // Climax + 风险扣分 → 不应 PushNow
+        assert!(r.bucket != NewsRankBucket::PushNow,
+            "高潮阶段不应进 A 档, got {:?}", r.bucket);
+    }
+}
+
+// ============ Commit 2 实现: 评分函数 + rank_news 主入口 ============
+
+/// 市场上下文 (供 rank_news 评估一条新闻时的盘面快照)
+#[derive(Debug, Clone, Default)]
+pub struct MarketContext {
+    /// 关联板块今日涨幅 (%)
+    pub today_chg: f64,
+    /// 关联板块今日主力净流入 (元)
+    pub main_inflow: f64,
+    /// 关联板块今日主力净占比 (%)
+    pub main_net_pct_today: f64,
+    /// 关联板块 5 日主力净占比 (%)
+    pub main_net_pct_5d: f64,
+    /// 关联板块今日涨停家数
+    pub limit_up_count: Option<usize>,
+}
+
+/// 规则召回得分 (0-25)
+///
+/// 规则只负责召回, 不决定推送. 给分要透明可解释.
+pub fn score_rule(chain_hits: &[crate::opportunity::chain_mapper::ChainHit]) -> i32 {
+    if chain_hits.is_empty() {
+        return 0;
+    }
+    let mut total = 0i32;
+    let mut board_keyword_count = 0;
+    for hit in chain_hits {
+        // 单 hit 得分
+        let hit_score = match hit.source {
+            crate::opportunity::chain_mapper::ChainSource::Rule => {
+                if !hit.board_keyword.is_empty() {
+                    20 // 非 generic 规则命中 (有 board_keyword)
+                } else {
+                    8 // generic 规则命中
+                }
+            }
+            crate::opportunity::chain_mapper::ChainSource::Ai => 12, // AI 命中, 介于规则和 degraded 之间
+            crate::opportunity::chain_mapper::ChainSource::AiDegraded => 5, // 降级, 给低分
+        };
+        total += hit_score;
+        if !hit.board_keyword.is_empty() {
+            board_keyword_count += 1;
+        }
+    }
+    // 多 chain 命中 +5 加成 (上限 5)
+    if chain_hits.len() >= 2 {
+        total += 5;
+    }
+    // clamp 0-25
+    total.clamp(0, 25)
+}
+
+/// 时效得分 (0-20)
+///
+/// 短线新闻强依赖时效, 阶梯式衰减.
+pub fn score_freshness(published_at: Option<DateTime<Local>>) -> i32 {
+    let now = Local::now();
+    let age = match published_at {
+        Some(t) => (now - t).num_minutes().max(0),
+        None => return 5, // 缺时间给低分, 不为 0 (保守)
+    };
+    if age <= 15 {
+        20
+    } else if age <= 60 {
+        15
+    } else if age <= 180 {
+        8
+    } else if age <= 360 {
+        3
+    } else {
+        0
+    }
+}
+
+/// 热度得分 (-10 ~ 25, 受阶段约束)
+/// Climax 限 5 (防追高), Start/Ferment 给高, Fade 扣
+pub fn score_heat(stage: HeatStage, change_pct: f64, main_inflow: f64, limit_up: usize) -> i32 {
+    match stage {
+        HeatStage::Start | HeatStage::Ferment => {
+            let change = if change_pct >= 3.0 {
+                8
+            } else if change_pct > 0.0 {
+                4
+            } else {
+                0
+            };
+            let inflow = if main_inflow > 0.0 { 8 } else { -5 };
+            let limit = (limit_up as i32 * 3).min(9);
+            change + inflow + limit
+        }
+        HeatStage::Climax => 5, // 限, 不给高
+        HeatStage::Divergence => -10,
+        HeatStage::Fade => -15,
+        HeatStage::Cold | HeatStage::Unknown => 0,
+    }
+}
+
+/// 资金确认得分 (-15 ~ 20, 不是一票通过也不是一票否决)
+pub fn score_capital(main_inflow: Option<f64>) -> i32 {
+    match main_inflow {
+        None => 0, // 缺数据显式 0, 不臆测
+        Some(v) if v >= 3e8 => 15,    // 强流入
+        Some(v) if v > 0.0 => 8,      // 弱正
+        Some(v) if v == 0.0 => 0,     // 平
+        Some(v) if v >= -1e8 => -10,  // 弱流出
+        Some(_) => -15,                 // 强流出
+    }
+}
+
+/// 阶段得分 (-25 ~ 25, Climax/Divergence/Fade 大扣分)
+///
+/// **关键**: 这是防追高核心. Climax -10, Divergence -20, Fade -25.
+pub fn stage_score(stage: HeatStage) -> i32 {
+    match stage {
+        HeatStage::Start => 25,
+        HeatStage::Ferment => 18,
+        HeatStage::Cold => 0,
+        HeatStage::Climax => -10,
+        HeatStage::Divergence => -20,
+        HeatStage::Fade => -25,
+        HeatStage::Unknown => 0,
+    }
+}
+
+/// 来源可信度得分 (0-10)
+pub fn source_score(source: &str) -> i32 {
+    let s = source.to_lowercase();
+    if s.contains("东财") || s.contains("eastmoney") || s.contains("em") {
+        10
+    } else if s.contains("新浪") || s.contains("sina") {
+        8
+    } else if s.contains("金十") || s.contains("jin10") {
+        8
+    } else if s.contains("华尔街") || s.contains("wallstreetcn") || s.contains("wallstreet") {
+        7
+    } else if s.contains("公告") || s.contains("announcement") {
+        9
+    } else if s.contains("财联社") || s.contains("cls") {
+        7
+    } else {
+        3 // 未知源给低分
+    }
+}
+
+/// 风险扣分 (0-40, 监管/减持/立案/高潮叠加)
+///
+/// **关键**: 风险事件必须单独扣分, 不可和利好混在一起.
+pub fn risk_penalty(event: EventType, stage: HeatStage, keywords: &[String]) -> i32 {
+    let mut penalty = 0i32;
+    // 1. 事件类型基础扣分
+    match event {
+        EventType::RegulatoryRisk => penalty += 30,
+        EventType::Earnings => {
+            // 业绩预减/亏损加重 (关键词命中)
+            if keywords.iter().any(|k| k.contains("预减") || k.contains("亏损")) {
+                penalty += 25;
+            }
+        }
+        EventType::CompanyAction => {
+            // 减持/解禁/立案加重
+            if keywords.iter().any(|k| k.contains("减持") || k.contains("解禁") || k.contains("立案")) {
+                penalty += 30;
+            }
+        }
+        _ => {}
+    }
+    // 2. 阶段叠加 (Climax +10, Divergence +20)
+    match stage {
+        HeatStage::Climax => penalty += 10,
+        HeatStage::Divergence => penalty += 20,
+        _ => {}
+    }
+    penalty.min(40)
+}
+
+/// rank_news 主入口 — 一站式评分 + 分档
+///
+/// **算法** (透明公式):
+///   final_score = rule + freshness + heat + stage + capital + source - risk
+///   clamp 0..100
+///   bucket 按 score + stage + risk 三维分档
+pub fn rank_news(candidate: &NewsCandidate, ctx: &MarketContext) -> RankedNews {
+    let mut reasons = Vec::new();
+    let mut evidence = NewsEvidenceBreakdown::default();
+
+    // 1. 规则召回
+    evidence.rule_score = score_rule(&candidate.chain_hits);
+    if evidence.rule_score > 0 {
+        reasons.push(format!("规则召回 {} 分", evidence.rule_score));
+    }
+
+    // 2. 时效
+    evidence.freshness_score = score_freshness(candidate.published_at);
+    if evidence.freshness_score >= 15 {
+        reasons.push(format!("时效 {} 分 (新发布)", evidence.freshness_score));
+    } else if evidence.freshness_score == 0 {
+        reasons.push("时效 0 分 (超 6 小时)".to_string());
+    }
+
+    // 3. 阶段判断 (commit 1 detect_heat_stage)
+    let heat_stage = detect_heat_stage(
+        candidate.board_code.as_deref(),
+        ctx.today_chg,
+        ctx.main_inflow,
+        ctx.main_net_pct_today,
+        ctx.main_net_pct_5d,
+        ctx.limit_up_count,
+    );
+    reasons.push(format!("阶段: {}", heat_stage.label()));
+
+    // 4. 热度 + 阶段得分
+    evidence.heat_score = score_heat(heat_stage, ctx.today_chg, ctx.main_inflow, ctx.limit_up_count.unwrap_or(0));
+    evidence.stage_score = stage_score(heat_stage);
+
+    // 5. 资金确认
+    evidence.capital_score = score_capital(Some(ctx.main_inflow));
+    if ctx.main_inflow.abs() > 1e7 {
+        reasons.push(format!(
+            "资金 {} ({} 分)",
+            if ctx.main_inflow > 0.0 { "流入" } else { "流出" },
+            evidence.capital_score
+        ));
+    } else {
+        reasons.push("资金数据弱 (≈0 分)".to_string());
+    }
+
+    // 6. 来源可信度
+    evidence.source_score = source_score(&candidate.source);
+
+    // 7. 风险扣分
+    let event_type = classify_event_type(&candidate.title);
+    let keywords: Vec<String> = candidate.chain_hits.iter().flat_map(|h| h.keywords.clone()).collect();
+    evidence.risk_penalty = risk_penalty(event_type, heat_stage, &keywords);
+    if evidence.risk_penalty > 0 {
+        reasons.push(format!("风险扣 {} 分", evidence.risk_penalty));
+    }
+
+    // 8. 总分
+    let raw = evidence.rule_score
+        + evidence.freshness_score
+        + evidence.heat_score
+        + evidence.stage_score
+        + evidence.capital_score
+        + evidence.source_score
+        - evidence.risk_penalty;
+    let score = raw.clamp(0, 100);
+
+    // 9. 分档
+    let (bucket, drop_reason) = decide_bucket(score, heat_stage, evidence.risk_penalty, &candidate.chain_hits);
+    if let Some(reason) = &drop_reason {
+        reasons.push(format!("Drop: {}", reason));
+    }
+    reasons.push(format!("总分 {} → {:?}", score, bucket));
+
+    RankedNews {
+        candidate: candidate.clone(),
+        event_type,
+        heat_stage,
+        score,
+        bucket,
+        evidence,
+        reasons,
+        drop_reason,
+    }
+}
+
+/// 分档规则
+///
+/// A 档: score >= 70 AND stage in [Start, Ferment] AND risk < 20
+/// B 档: score >= 45 OR (news strong but market unconfirmed) OR (Cold + high freshness)
+/// C 档: score < 45 OR stage in [Climax, Divergence, Fade]
+/// Drop: 监管/减持/立案 risk ≥ 30, 或无 chain_hit, 或无 board
+fn decide_bucket(
+    score: i32,
+    stage: HeatStage,
+    risk: i32,
+    chain_hits: &[crate::opportunity::chain_mapper::ChainHit],
+) -> (NewsRankBucket, Option<String>) {
+    // Drop 优先级最高
+    if chain_hits.is_empty() {
+        return (NewsRankBucket::Drop, Some("无 chain_hit 召回".to_string()));
+    }
+    if risk >= 35 {
+        return (NewsRankBucket::Drop, Some(format!("风险扣分过高 ({})", risk)));
+    }
+    // A 档
+    if score >= 70 && matches!(stage, HeatStage::Start | HeatStage::Ferment) && risk < 20 {
+        return (NewsRankBucket::PushNow, None);
+    }
+    // C 档 (高潮/分歧/退潮 默认 C, 不推)
+    if matches!(stage, HeatStage::Climax | HeatStage::Divergence | HeatStage::Fade) {
+        return (NewsRankBucket::LogOnly, None);
+    }
+    // B 档
+    if score >= 45 {
+        return (NewsRankBucket::WatchCandidate, None);
+    }
+    // C 档 (分数不足)
+    (NewsRankBucket::LogOnly, None)
 }
