@@ -926,6 +926,53 @@ async fn run_review_only_inner() {
 
     log::info!("[复盘] ======== 盘后分析完成 ========");
 
+    // P2-News (NEWS_RANKER_SHADOW=true 触发, 默认 false)
+    // --review 末尾跑一遍 shadow, 用 holding_breakout_text + watch_breakout_text 当 raw
+    // 复用 wrapper 拿 raw, 走 shadow_rank_hits 评分, 输出到 news_ranked_text
+    if std::env::var("NEWS_RANKER_SHADOW").ok().as_deref() == Some("true") {
+        let hbt = holding_breakout_text.clone();
+        let wbt = watch_breakout_text.clone();
+        let ranked_news = tokio::task::spawn_blocking(move || {
+            use stock_analysis::opportunity::news_ranker;
+            use stock_analysis::data_provider::DataFetcherManager;
+            use stock_analysis::opportunity::candidate_panel::{self as cp, parse_text_to_raw};
+            use stock_analysis::opportunity::chain_mapper::{ChainHit, ChainSource};
+            // 复用 candidate_panel 解析逻辑
+            let mut raw: Vec<(cp::CandidateSource, String, String)> = Vec::new();
+            for (source, text) in [
+                (cp::CandidateSource::VolumeWatchlist, Some(hbt.as_str())),
+                (cp::CandidateSource::VolumeRealTrade, Some(wbt.as_str())),
+            ] {
+                if let Some(t) = text {
+                    for (code, name) in parse_text_to_raw(t) {
+                        raw.push((source, code, name));
+                    }
+                }
+            }
+            // 转 ChainHit 喂 shadow_rank_hits
+            let hits: Vec<ChainHit> = raw.into_iter().map(|(_, code, name)| {
+                ChainHit {
+                    chain: name.clone(),
+                    keywords: vec![code.clone(), name.clone()],
+                    logic: "review-path".into(),
+                    stocks: vec![],
+                    source: ChainSource::Rule,
+                    board_keyword: name,
+                    fund_flow_pct: None,
+                }
+            }).collect();
+            let titles: Vec<String> = hits.iter().map(|h| h.chain.clone()).collect();
+            news_ranker::shadow_rank_hits(&hits, &titles)
+        })
+        .await
+        .unwrap_or_default();
+        if !ranked_news.is_empty() {
+            let board = stock_analysis::opportunity::news_ranker::format_news_ranked_board(&ranked_news);
+            log::info!("[复盘] 新闻Ranker (v18.4):\n{}", board);
+            notify::push_governor(&board, notify::PushKind::NewsRanked).await;
+        }
+    }
+
     // P3 outcome 回看 (NEWS_OUTCOME_RUN=true 触发, 默认不跑)
     // --review 末尾加 (盘后正是回看推送效果的时间点)
     if std::env::var("NEWS_OUTCOME_RUN").ok().as_deref() == Some("true") {
@@ -1021,20 +1068,16 @@ async fn run_review_deep_analysis(
     // 按持仓原顺序推送（buffer_unordered 完成顺序不确定，重排回固定顺序）
     let mut by_code: std::collections::HashMap<String, (String, Option<String>)> =
         results.into_iter().map(|(c, n, m)| (c, (n, m))).collect();
-    // 修复 P1-1 (2026-06-30 codex review): 7 只持仓研判聚合推送 (BR-013).
-    // 之前每只持仓单独 push_wechat 1 次, 7 次噪声. 现在按操作建议分组,
-    // 1 条聚合推送 + 模板按综合分裁剪 (BR-014).
-    // 7 只票的综合分在 36-48 都属减持/观望区间时, 用户只看到 1 条总结
-    // "今日 7 只持仓: 4 减持 [代码1,代码2,...] / 2 观望 / 1 卖出" 而非 7 条 1500 字.
+    // 落盘每只持仓研判 (供事后查询, 不再单独推送)
     for p in &holdings {
-        let Some((name, md)) = by_code.remove(&p.code) else { continue };
+        let Some((name, md)) = by_code.get(&p.code) else { continue };
         let Some(md) = md else { continue };
-        // 保留每只票的研判落盘 (供事后查询), 不再单独推送
         log::info!("[复盘] 持仓深度研判 {}({}) 完成 ({} 字, 落盘+聚合推送)", name, p.code, md.chars().count());
         let _ = stock_analysis::pipeline::section_utils::save_deep_report(&p.code, &md);
     }
     // 聚合推送: 走持仓决策台 (P0-5 commit 2 替换原 build_holding_summary 字符串猜)
     // v14.2 路径: decisions_from_llm (commit 1) → format_decision_board (commit C 渲染)
+    // by_code 不再被 .remove() 走, 决策台能拿到 LLM 终稿
     let decisions =
         stock_analysis::decision::decision_decide::decisions_from_llm(&holdings, &by_code);
     let summary = stock_analysis::decision::decision_render::format_decision_board(&decisions);
@@ -2109,6 +2152,8 @@ fn run_candidate_panel_from_review(
     // P5 §三 3.1 红线: 多路信号合并, 这里 1 路来源 (IndustryChain 兜底)
     let mut raw: Vec<(CandidateSource, String, String)> = Vec::new();
     // v16.4: 5 路 raw 解析 (parse_text_to_raw, P0-5++ Commit 6 加的 helper)
+    // 同时收集每个 (code, source) 对应的原始行 (用作 evidence 题材段)
+    let mut evidence_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for (source, text) in [
         (CandidateSource::StockPick, stock_pick_raw),
         (CandidateSource::OptimalClose, optimal_close_raw),
@@ -2117,6 +2162,40 @@ fn run_candidate_panel_from_review(
         (CandidateSource::IndustryChain, industry_chain_raw),
     ] {
         if let Some(t) = text {
+            for line in t.lines() {
+                // 找 6 位 code + 名字
+                let mut chars = line.char_indices().peekable();
+                let mut code_end = None;
+                let mut code_start = None;
+                let mut count = 0;
+                while let Some((i, c)) = chars.next() {
+                    if c.is_ascii_digit() {
+                        let mut end = i + c.len_utf8();
+                        let mut cnt = 1;
+                        while let Some(&(_, nc)) = chars.peek() {
+                            if nc.is_ascii_digit() {
+                                end += nc.len_utf8();
+                                chars.next();
+                                cnt += 1;
+                                if cnt == 6 { break; }
+                            } else { break; }
+                        }
+                        if cnt == 6 { code_start = Some(i); code_end = Some(end); }
+                        break;
+                    }
+                }
+                if let (Some(s), Some(e)) = (code_start, code_end) {
+                    let code = &line[s..e];
+                    // 取 code 后 — 前的描述段 (置信% + [详情])
+                    let after = &line[e..];
+                    if let Some(em_dash_pos) = after.find('—') {
+                        let desc = &after[em_dash_pos+3..]; // 跳过 "— "
+                        if !desc.trim().is_empty() {
+                            evidence_map.insert(code.to_string(), desc.trim().to_string());
+                        }
+                    }
+                }
+            }
             for (code, name) in parse_text_to_raw(t) {
                 raw.push((source, code, name));
             }
@@ -2139,17 +2218,34 @@ fn run_candidate_panel_from_review(
     // 1. 多源合并去重
     let mut entries = merge_candidates(raw);
 
-    // 2. 证据分层 (P5 §3.2 红线: 唯一 Strong = 布林+MACD)
-    // 简化: 从 LLM 终稿 first_meaningful_line 抽, 命中布林+MACD 关键词才进 Strong
+    // 2. 证据分层 (P5 §3.2 红线: 唯一 Strong = 布林+MACD) + 拉价格/涨幅
+    // 拉 K 线 (5 日够看当日), 给 entry 填 current_price / change_pct / 题材
+    let fetcher = stock_analysis::data_provider::DataFetcherManager::new().ok();
     for e in &mut entries {
-        if let Some((_, Some(md))) = by_code.get(&e.code) {
-            // first_meaningful_line 简化版 (在本函数里, 不依赖 commit 1 的 helper)
-            let summary = md.lines().find(|l| !l.trim().is_empty() && !l.trim().starts_with('#'))
-                .map(|l| l.chars().take(80).collect::<String>())
-                .unwrap_or_default();
-            e.evidence = vec![summary];
-            e.tier = classify_tier(&e.evidence);
+        // 2.1 evidence: 优先 evidence_map (放量描述), fallback by_code LLM 终稿
+        let mut ev: Option<String> = None;
+        if let Some(desc) = evidence_map.get(&e.code) {
+            ev = Some(format!("放量: {}", desc));
+        } else if let Some((_, Some(md))) = by_code.get(&e.code) {
+            ev = md.lines().find(|l| !l.trim().is_empty() && !l.trim().starts_with('#'))
+                .map(|l| l.chars().take(80).collect::<String>());
         }
+        if let Some(s) = ev {
+            if !s.is_empty() {
+                e.evidence = vec![s];
+            }
+        }
+        // 2.2 价格/涨幅: 拉 K 线最近 1 日
+        if let Some(f) = &fetcher {
+            if let Ok((klines, _)) = f.get_daily_data(&e.code, 5) {
+                if let Some(last) = klines.last() {
+                    e.current_price = last.close;
+                    e.change_pct = last.pct_chg;
+                }
+            }
+        }
+        // 2.3 tier 分类
+        e.tier = classify_tier(&e.evidence);
     }
 
     // 3. 硬门槛过滤 (P5 §3.3): 剔除已持仓 / 停牌 / ST / 北交所/科创板 / 已涨停
