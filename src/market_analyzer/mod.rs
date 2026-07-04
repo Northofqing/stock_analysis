@@ -40,6 +40,7 @@ mod indices;
 mod limit_up;
 pub mod review;
 pub mod sector_monitor;
+pub mod sector_history;
 mod statistics;
 
 pub use async_overview::{generate_market_overview_text_blocking, get_market_overview_blocking};

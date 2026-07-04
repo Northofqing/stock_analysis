@@ -599,6 +599,11 @@ async fn run_test_scan() {
     // 16. v4 赛道分档
     let tier_text = tokio::task::spawn_blocking(|| {
         let boards = stock_analysis::market_analyzer::sector_monitor::fetch_board_ranking("f3", 30).unwrap_or_default();
+        // P2-News Commit 0: 拉完后 append 今日 (供 detect_heat_stage 后续 commit 用)
+        // 失败仅 warn, 不阻塞监控
+        if let Err(e) = stock_analysis::market_analyzer::sector_history::append_today(&boards) {
+            log::warn!("[SECTOR_HISTORY] 追加失败: {:#}", e);
+        }
         let graded = stock_analysis::decision::sector_score::grade_sectors(&boards);
         stock_analysis::decision::sector_score::format_tier_list(&graded)
     }).await.unwrap_or_default();
