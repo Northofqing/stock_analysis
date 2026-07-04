@@ -35,6 +35,8 @@ pub static MAGICLAW_DISABLE_ENV_TOKEN: AtomicBool = AtomicBool::new(false);
 mod notify;
 use notify::{summarize_push_text, evaluate_opportunity_push_skip_reason};
 
+mod push_templates;
+
 mod market_data;
 
 // 修复 Top10#3+#4 (2026-06-29 audit): 拆大文件

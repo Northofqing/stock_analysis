@@ -71,6 +71,36 @@ pub enum PushKind {
     // P2-News Commit 4 加: 新闻 Ranker 输出卡片 (A/B/C/Drop 4 档, 阶段判断+风险过滤)
     /// 保留: 新闻 Ranker 候选卡片 (P2-News 阶段判断+风险过滤后的输出)
     NewsRanked,
+    // ============= v12 §14.3 新增 PushKind =============
+    /// 账户模式变更 (T-01, ⚡ 无冷却) [MVP-1]
+    AccountMode,
+    /// 数据模式变更 (T-02, ⚡ 10min 冷却) [MVP-1]
+    DataMode,
+    /// 持仓操作建议 (T-03/T-04, ⚡ 30min/票) [MVP-1]
+    HoldingPlan,
+    /// 做T 建议 (T-05/T-06, ⚡ 30min/票) [MVP-2]
+    T0Advice,
+    /// 候选触发/转正 (T-07, ⚡ 1次/票/日) [MVP-3]
+    CandidateTriggered,
+    /// 禁止操作提示 (T-09, ℹ️ 60min/票, 默认降级) [MVP-1]
+    ForbiddenOps,
+    /// 虚拟盘成交回报 (T-10, ℹ️ 5min批, 默认降级) [MVP-1]
+    PaperTrade,
+    /// 尾盘决策 (T-12, ⚡ 1次/日) [MVP-4]
+    CloseCall,
+    // ============= v12 §14.2 盘后 PushKind =============
+    /// 盘面走向 (R-02, 盘后 1次/日) [MVP-4]
+    ReviewMarket,
+    /// 龙虎榜 (R-04, 盘后 21:00 补全) [MVP-4]
+    ReviewLhb,
+    /// 系统信号复盘 (R-05) [MVP-1→MVP-4]
+    ReviewSignal,
+    /// 失败样本归因 (R-06) [MVP-5]
+    ReviewFailure,
+    /// 明日观察池 (R-07) [MVP-4]
+    TomorrowWatch,
+    /// 明日事件日历 (R-08) [MVP-4]
+    EventCalendar,
 }
 
 impl PushKind {
@@ -83,7 +113,23 @@ impl PushKind {
             | PushKind::Announcement
             | PushKind::CandidateBoard
             | PushKind::NewsRanked => false,
-            // 降级 17 条 (原 12 + P0-5+ Commit 4 加 5 个候选源)
+            // v12 §14.3 新增：保留 (默认推送)
+            // AccountMode/DataMode 是状态变更即推, 永久保留
+            // HoldingPlan/T0Advice/CandidateTriggered/CloseCall 是交易建议类核心
+            // ReviewMarket/ReviewLhb/ReviewSignal/ReviewFailure/TomorrowWatch/EventCalendar 是盘后复盘
+            PushKind::AccountMode
+            | PushKind::DataMode
+            | PushKind::HoldingPlan
+            | PushKind::T0Advice
+            | PushKind::CandidateTriggered
+            | PushKind::CloseCall
+            | PushKind::ReviewMarket
+            | PushKind::ReviewLhb
+            | PushKind::ReviewSignal
+            | PushKind::ReviewFailure
+            | PushKind::TomorrowWatch
+            | PushKind::EventCalendar => false,
+            // 降级 19 条 (原 17 + v12 加 ForbiddenOps / PaperTrade 默认降级)
             PushKind::AuctionVolume
             | PushKind::VirtualWatch
             | PushKind::LimitBoards
@@ -98,7 +144,94 @@ impl PushKind {
             | PushKind::OptimalClose
             | PushKind::VolumeWatchlist
             | PushKind::VolumeRealTrade
-            | PushKind::IndustryChain => true,
+            | PushKind::IndustryChain
+            | PushKind::ForbiddenOps
+            | PushKind::PaperTrade => true,
+        }
+    }
+
+    /// v12 §14.3 等级: 🚨紧急 / ⚡重要 / ℹ️参考
+    pub fn level(self) -> PushLevel {
+        match self {
+            // 🚨紧急: HoldingEvent(已有, 包含跌停扫雷等)
+            PushKind::HoldingEvent => PushLevel::Emergency,
+            // ⚡重要
+            PushKind::Announcement
+            | PushKind::AccountMode
+            | PushKind::DataMode
+            | PushKind::HoldingPlan
+            | PushKind::T0Advice
+            | PushKind::CandidateTriggered
+            | PushKind::CloseCall
+            | PushKind::ReviewMarket
+            | PushKind::ReviewLhb
+            | PushKind::ReviewSignal
+            | PushKind::TomorrowWatch
+            | PushKind::EventCalendar
+            | PushKind::DailyReport
+            | PushKind::CandidateBoard
+            | PushKind::NewsRanked => PushLevel::Important,
+            // ℹ️参考 (降级 + ForbiddenOps/PaperTrade)
+            _ => PushLevel::Info,
+        }
+    }
+
+    /// v12 §14.3: 是否需强制全局横幅 (§14.0)
+    /// 交易建议类 (T-01/02/03/04/05/06/07/09/10/12) + 盘后 R 系列都需
+    pub fn requires_banner(self) -> bool {
+        matches!(
+            self,
+            PushKind::AccountMode
+                | PushKind::DataMode
+                | PushKind::HoldingPlan
+                | PushKind::HoldingEvent
+                | PushKind::T0Advice
+                | PushKind::CandidateTriggered
+                | PushKind::ForbiddenOps
+                | PushKind::PaperTrade
+                | PushKind::CloseCall
+                | PushKind::ReviewMarket
+                | PushKind::ReviewLhb
+                | PushKind::ReviewSignal
+                | PushKind::ReviewFailure
+                | PushKind::TomorrowWatch
+                | PushKind::EventCalendar
+                | PushKind::DailyReport
+                | PushKind::AuctionVolume
+        )
+    }
+
+    /// v12 §14.3 冷却 (秒). None = 无冷却 (紧急/状态变更)
+    pub fn cooldown_secs(self) -> Option<u32> {
+        match self {
+            // 无冷却 (状态变更即推)
+            PushKind::AccountMode | PushKind::HoldingEvent => None,
+            // 10 min
+            PushKind::DataMode => Some(600),
+            // 30 min / 票 (持有建议 + 做T 共享)
+            PushKind::HoldingPlan | PushKind::T0Advice => Some(1800),
+            // 1次/票/日 (86400s)
+            PushKind::CandidateTriggered => Some(86_400),
+            // 60 min / 票
+            PushKind::ForbiddenOps => Some(3600),
+            // 5 min / 票 (批推)
+            PushKind::PaperTrade => Some(300),
+            // 1次/日
+            PushKind::CloseCall => Some(86_400),
+            // 盘后系列 1次/日 (推送时机控制而非冷却)
+            PushKind::ReviewMarket
+            | PushKind::ReviewLhb
+            | PushKind::ReviewSignal
+            | PushKind::ReviewFailure
+            | PushKind::TomorrowWatch
+            | PushKind::EventCalendar
+            | PushKind::DailyReport => Some(86_400),
+            // 复用现有冷却配置
+            PushKind::AuctionVolume | PushKind::AuctionRepush => Some(600),
+            PushKind::SectorTier | PushKind::CapitalVerify => Some(1800),
+            PushKind::FactorIC => Some(3600),
+            PushKind::WeeklySOP => Some(86_400),
+            _ => Some(1800), // 默认 30min
         }
     }
 
@@ -125,7 +258,47 @@ impl PushKind {
             PushKind::IndustryChain => "产业链",
             PushKind::CandidateBoard => "候选台",
             PushKind::NewsRanked => "新闻Ranker",
+            // v12
+            PushKind::AccountMode => "账户模式",
+            PushKind::DataMode => "数据模式",
+            PushKind::HoldingPlan => "持仓建议",
+            PushKind::T0Advice => "做T建议",
+            PushKind::CandidateTriggered => "候选触发",
+            PushKind::ForbiddenOps => "禁止操作",
+            PushKind::PaperTrade => "虚拟盘",
+            PushKind::CloseCall => "尾盘决策",
+            PushKind::ReviewMarket => "盘面走向",
+            PushKind::ReviewLhb => "龙虎榜",
+            PushKind::ReviewSignal => "信号复盘",
+            PushKind::ReviewFailure => "失败归因",
+            PushKind::TomorrowWatch => "明日观察池",
+            PushKind::EventCalendar => "事件日历",
         }
+    }
+}
+
+/// v12 §14.3: 推送等级
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PushLevel {
+    /// 🚨紧急: 无视冷却
+    Emergency,
+    /// ⚡重要: 默认推送
+    Important,
+    /// ℹ️参考: 可降级 log
+    Info,
+}
+
+impl PushLevel {
+    pub fn label(self) -> &'static str {
+        match self {
+            PushLevel::Emergency => "🚨紧急",
+            PushLevel::Important => "⚡重要",
+            PushLevel::Info => "ℹ️参考",
+        }
+    }
+
+    pub fn is_emergency(self) -> bool {
+        matches!(self, PushLevel::Emergency)
     }
 }
 
