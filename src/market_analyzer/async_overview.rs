@@ -334,7 +334,122 @@ fn format_market_report(overview: &MarketOverview) -> String {
             let _ = writeln!(s, "- **{}**: {:+.2}%", s2.name, s2.change_pct);
         }
     }
+
+    // v19.1: 五、市场情绪判断 (启发式规则, 不接 LLM 避免限流)
+    let sentiment = judge_market_sentiment(overview);
+    let _ = writeln!(s);
+    let _ = writeln!(s, "## 五、市场情绪判断");
+    let _ = writeln!(s, "**{}**", sentiment.headline);
+    for line in &sentiment.bullets {
+        let _ = writeln!(s, "- {}", line);
+    }
     s
+}
+
+/// 启发式市场情绪判断 (5 维打分)
+#[derive(Debug)]
+struct MarketSentiment {
+    headline: String,
+    bullets: Vec<String>,
+}
+
+fn judge_market_sentiment(overview: &MarketOverview) -> MarketSentiment {
+    let mut score: i32 = 0;
+    let mut bullets: Vec<String> = Vec::new();
+
+    // 1. 涨跌家数 (up_count vs down_count)
+    let total = (overview.up_count + overview.down_count) as i32;
+    if total > 0 {
+        let up_ratio = overview.up_count as f64 / total as f64;
+        if up_ratio >= 0.7 {
+            score += 30;
+            bullets.push(format!("📈 普涨 ({} 上 / {} 下, {:.0}%)", overview.up_count, overview.down_count, up_ratio * 100.0));
+        } else if up_ratio >= 0.5 {
+            score += 10;
+            bullets.push(format!("📊 涨多跌少 ({} / {})", overview.up_count, overview.down_count));
+        } else if up_ratio >= 0.3 {
+            score -= 10;
+            bullets.push(format!("📉 跌多涨少 ({} / {})", overview.up_count, overview.down_count));
+        } else {
+            score -= 30;
+            bullets.push(format!("💀 普跌 ({} 上 / {} 下)", overview.up_count, overview.down_count));
+        }
+    }
+
+    // 2. 涨停 vs 跌停 (投机情绪)
+    let total_limit = overview.limit_up_count + overview.limit_down_count;
+    if total_limit > 0 {
+        let ratio = overview.limit_up_count as f64 / total_limit as f64;
+        if ratio >= 0.8 && overview.limit_up_count >= 30 {
+            score += 20;
+            bullets.push(format!("🚀 投机热 (涨停 {} / 跌停 {})", overview.limit_up_count, overview.limit_down_count));
+        } else if ratio <= 0.3 {
+            score -= 20;
+            bullets.push(format!("🥶 投机冷 (涨停 {} / 跌停 {})", overview.limit_up_count, overview.limit_down_count));
+        }
+    }
+
+    // 3. 北向资金 (外资风向)
+    if let Some(n) = overview.north_flow {
+        if n > 50.0 {
+            score += 15;
+            bullets.push(format!("🌏 北向大幅流入 +{:.0}亿 (外资乐观)", n));
+        } else if n > 0.0 {
+            score += 5;
+            bullets.push(format!("🌏 北向小幅流入 +{:.0}亿", n));
+        } else if n > -50.0 {
+            score -= 5;
+            bullets.push(format!("🌏 北向小幅流出 {:.0}亿", n));
+        } else {
+            score -= 15;
+            bullets.push(format!("🌏 北向大幅流出 {:.0}亿 (外资悲观)", n));
+        }
+    } else {
+        bullets.push("🌏 北向资金: [数据缺失]".to_string());
+    }
+
+    // 4. 主要指数强弱
+    let sh_index = overview.indices.iter().find(|i| i.code == "000001");
+    let sz_index = overview.indices.iter().find(|i| i.code == "399001");
+    if let (Some(sh), Some(sz)) = (sh_index, sz_index) {
+        if sh.change_pct > 0.5 && sz.change_pct > 0.5 {
+            score += 10;
+            bullets.push(format!("💪 沪深双涨 (上证 {:+.2}%, 深证 {:+.2}%)", sh.change_pct, sz.change_pct));
+        } else if sh.change_pct < -0.5 && sz.change_pct < -0.5 {
+            score -= 10;
+            bullets.push(format!("😰 沪深双跌 (上证 {:+.2}%, 深证 {:+.2}%)", sh.change_pct, sz.change_pct));
+        } else {
+            bullets.push(format!("😐 沪深分化 (上证 {:+.2}%, 深证 {:+.2}%)", sh.change_pct, sz.change_pct));
+        }
+    }
+
+    // 5. 板块普涨普跌
+    if !overview.top_sectors.is_empty() && !overview.bottom_sectors.is_empty() {
+        let avg_top: f64 = overview.top_sectors.iter().map(|s| s.change_pct).sum::<f64>() / overview.top_sectors.len() as f64;
+        let avg_bottom: f64 = overview.bottom_sectors.iter().map(|s| s.change_pct).sum::<f64>() / overview.bottom_sectors.len() as f64;
+        if avg_top > 3.0 && avg_bottom < 0.0 {
+            score += 10;
+            bullets.push(format!("🎯 板块轮动明显 (领涨均 {avg_top:+.1}% / 涨幅靠后均 {avg_bottom:+.1}%)"));
+        } else if avg_top < 1.0 && avg_bottom > -1.0 {
+            bullets.push(format!("🌀 板块分化弱 (领涨均 {avg_top:+.1}% / 靠后均 {avg_bottom:+.1}%)"));
+            score -= 5;
+        }
+    }
+
+    // 总分 → 标题
+    let headline = if score >= 50 {
+        "🟢 强势格局: 普涨 + 投机热 + 外资流入, 风险偏好高"
+    } else if score >= 20 {
+        "🟢 偏强: 局部机会, 注意板块轮动"
+    } else if score >= -10 {
+        "⚪ 中性: 多空均衡, 精选个股"
+    } else if score >= -30 {
+        "🔴 偏弱: 普跌 + 投机冷, 控制仓位"
+    } else {
+        "🔴 极弱: 系统性风险, 防御为主"
+    };
+
+    MarketSentiment { headline: headline.to_string(), bullets }
 }
 
 // =============================================================================
