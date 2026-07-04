@@ -41,6 +41,11 @@ mod limit_up;
 pub mod review;
 pub mod sector_monitor;
 pub mod sector_history;
+pub mod market_stage_confidence;  // v12 MVP4-4.1
+pub mod limit_chain_review;  // v12 MVP4-4.2
+pub mod lhb_review;  // v12 MVP4-4.3
+pub mod post_close_review;  // v12 MVP4-4.4
+pub mod performance_feedback;  // v12 MVP5-5.1
 mod statistics;
 
 pub use async_overview::{generate_market_overview_text_blocking, get_market_overview_blocking};

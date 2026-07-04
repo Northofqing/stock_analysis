@@ -1151,6 +1151,95 @@ pub async fn push_holding_emergency(
     .await
 }
 
+// ============================================================================
+// MVP2-2.2 orchestrator: T-05/T-06 做T建议
+// ============================================================================
+
+/// MVP2-2.2 T-05 做T建议推送 (⚡ 30min/票).
+///
+/// 拼接文本后调 dispatch, 治理 (mode/dm/cooling/budget) 由 dispatch 内部完成.
+pub async fn push_t0_advice(
+    code: &str,
+    banner: Option<&BannerCtx>,
+    params: T0AdviceParams<'_>,
+) -> bool {
+    let text = render_t0_advice(banner.unwrap_or(&BannerCtx::default()), params);
+    dispatch(
+        super::notify::PushKind::T0Advice,
+        code,
+        banner,
+        text,
+    )
+    .await
+}
+
+/// MVP2-2.2 T-06 不建议做T (ℹ️参考).
+pub async fn push_t0_forbid(
+    code: &str,
+    banner: Option<&BannerCtx>,
+    params: T0ForbidParams<'_>,
+) -> bool {
+    let text = render_t0_forbid(banner.unwrap_or(&BannerCtx::default()), params);
+    dispatch(
+        super::notify::PushKind::T0Advice,
+        code,
+        banner,
+        text,
+    )
+    .await
+}
+
+// ============================================================================
+// MVP3-3.2 orchestrator: T-07 候选触发 + T-08 候选失效
+// ============================================================================
+
+/// MVP3-3.2 T-07 候选触发 (⚡ 1次/票/日).
+///
+/// 由 candidate_state::is_candidate_live_enabled() 控制: 关闭时直接返回 false (零推送).
+pub async fn push_candidate_triggered(
+    code: &str,
+    banner: Option<&BannerCtx>,
+    params: CandidateTriggeredParams<'_>,
+    live_override: Option<bool>,
+) -> bool {
+    use stock_analysis::opportunity::candidate_state::is_candidate_live_enabled;
+
+    if !is_candidate_live_enabled(live_override) {
+        log::info!(
+            "[T-07] 候选触发被影子开关拦截 (code={}, 需 ENABLE_CANDIDATE_LIVE=true)",
+            code
+        );
+        return false;
+    }
+
+    let text = render_candidate_triggered(banner.unwrap_or(&BannerCtx::default()), params);
+    dispatch(
+        super::notify::PushKind::CandidateTriggered,
+        code,
+        banner,
+        text,
+    )
+    .await
+}
+
+/// MVP3-3.2 T-08 候选失效 (ℹ️参考, 复用 CandidateBoard).
+pub async fn push_candidate_invalidated(
+    code: &str,
+    hhmm: &str,
+    name: &str,
+    prev: &str,
+    reason: &str,
+) -> bool {
+    let text = render_candidate_invalidated(hhmm, name, code, prev, reason);
+    dispatch(
+        super::notify::PushKind::CandidateBoard,
+        code,
+        None,
+        text,
+    )
+    .await
+}
+
 /// v12 PR2-2.2: 数据模式变更编排器.
 ///
 /// 完整链路: evaluate() → is_changed() → 拼 T-02 → dispatch() (10min 冷却由 push_governor 处理).

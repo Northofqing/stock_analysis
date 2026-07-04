@@ -139,7 +139,7 @@ impl NewsMonitor {
                 AlertLevel::Emergency => self.emergency_count += 1,
                 AlertLevel::Important => self.important_count += 1,
                 AlertLevel::Info => self.info_count += 1,
-                _ => {}
+                // AlertLevel 只有 3 个变体, _ 分支不可达
             }
 
             // 名称/代码兜底：API 有时返回空，从标题解析
