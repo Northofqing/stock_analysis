@@ -116,6 +116,23 @@ diesel::table! {
     }
 }
 
+// v12 PR1-1.5 (BR-021): 账户模式变更日志表
+diesel::table! {
+    account_mode_log (id) {
+        id -> Integer,
+        ts -> Timestamp,
+        prev_mode -> Text,
+        new_mode -> Text,
+        trigger_reason -> Text,
+        today_pnl_pct -> Nullable<Double>,
+        consecutive_n -> Nullable<Integer>,
+        total_pos_cheng -> Nullable<Integer>,
+        data_complete -> Integer,
+        pushed -> Integer,
+        push_attempted_at -> Nullable<Timestamp>,
+    }
+}
+
 diesel::allow_tables_to_appear_in_same_query!(
     stock_daily,
     lhb_daily,
@@ -123,4 +140,5 @@ diesel::allow_tables_to_appear_in_same_query!(
     stock_position,
     trades,
     ledger,
+    account_mode_log,
 );

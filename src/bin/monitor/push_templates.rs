@@ -952,8 +952,112 @@ fn fmt_price(v: f64) -> String {
 }
 
 // ============================================================================
-// §14.3 治理: 冷却 + 日预算 + 紧急绕过 + 模式停发
+// PR1-1.6 orchestrator: 模式变更 → 落库 → T-01 → dispatch
 // ============================================================================
+
+/// v12 PR1-1.6: 模式变更编排器.
+///
+/// 完整链路: evaluate() → is_changed() → 落库 → 拼 T-01 → dispatch() → 标记 pushed.
+///
+/// 返回 `Ok(true)` 表示落库 + 推送成功; `Ok(false)` 表示无变更 (no-op).
+///
+/// `prev` 由调用方从 `database::account_mode_log::latest_account_mode_change()` 恢复.
+///
+/// 当前 PR1 不挂主循环调用 (留给 PR1-1.7), 单测覆盖函数本身.
+pub async fn push_account_mode_change(
+    metrics: &stock_analysis::risk::account_mode::PortfolioMetrics,
+    prev: Option<stock_analysis::risk::action_gate::AccountMode>,
+    banner: Option<&BannerCtx>,
+) -> Result<bool, String> {
+    use stock_analysis::config::get_risk_config;
+    use stock_analysis::risk::account_mode::{evaluate, ModeThresholds};
+    use stock_analysis::risk::action_gate::AccountMode as LibAM;
+
+    let thresholds: ModeThresholds = get_risk_config().account_mode.to_thresholds();
+    let eval = evaluate(metrics, prev, &thresholds);
+
+    if !eval.is_changed() {
+        return Ok(false);
+    }
+
+    let prev_mode = prev.expect("is_changed=true ⇒ prev=Some");
+    let new_mode = eval.mode;
+
+    // 1. 落库 (pushed=0)
+    let log_id = stock_analysis::database::account_mode_log::insert_account_mode_change(
+        prev_mode,
+        new_mode,
+        eval.trigger_reason.as_deref().unwrap_or(""),
+        Some(metrics.today_pnl_pct),
+        Some(metrics.consecutive_stop_loss_n),
+        Some(metrics.total_pos_cheng),
+        metrics.data_complete,
+    )
+    .map_err(|e| format!("insert_account_mode_change: {}", e))?;
+
+    // 2. 拼 T-01
+    let hhmm = chrono::Local::now().format("%H:%M").to_string();
+    let reasons = eval
+        .trigger_reason
+        .as_deref()
+        .map(|r| vec![r.to_string()])
+        .unwrap_or_default();
+    let forbidden = match new_mode {
+        LibAM::Normal => "(无)",
+        LibAM::ReduceOnly => "禁止新开仓/加仓/正T, 候选转影子",
+        LibAM::Frozen => "禁止新开仓/加仓/正T/反T, 候选转影子",
+    };
+    let recovery = match new_mode {
+        LibAM::Normal => "(已是 Normal)",
+        LibAM::ReduceOnly => "当日盈亏回到 -1.5% 内 或 连续止损 < 3 笔 (运行时) / 下一交易日盘前重置",
+        LibAM::Frozen => "下一交易日盘前重置为 Normal",
+    };
+    let prev_tmpl = prev_mode_to_tmpl(prev_mode);
+    let new_tmpl = prev_mode_to_tmpl(new_mode);
+
+    let mut text = if let Some(b) = banner {
+        format!("{}\n", b.render())
+    } else {
+        String::new()
+    };
+    text.push_str(&render_account_mode(
+        &hhmm,
+        prev_tmpl,
+        new_tmpl,
+        &reasons,
+        forbidden,
+        recovery,
+    ));
+
+    // 3. dispatch (code="" 全局键, AccountMode 无冷却)
+    let ok = dispatch(
+        super::notify::PushKind::AccountMode,
+        "", // code 空 = 全局键
+        banner,
+        text,
+    )
+    .await;
+
+    // 4. 标记 pushed
+    if ok {
+        if let Err(e) = stock_analysis::database::account_mode_log::mark_account_mode_pushed(log_id) {
+            log::warn!("[AccountMode] mark pushed=1 失败 (id={}): {}", log_id, e);
+        }
+    } else {
+        log::info!("[AccountMode] T-01 推送失败, log_id={} 保留 pushed=0 等重试", log_id);
+    }
+
+    Ok(ok)
+}
+
+fn prev_mode_to_tmpl(m: stock_analysis::risk::action_gate::AccountMode) -> AccountMode {
+    use stock_analysis::risk::action_gate::AccountMode as LibAM;
+    match m {
+        LibAM::Normal => AccountMode::Normal,
+        LibAM::ReduceOnly => AccountMode::ReduceOnly,
+        LibAM::Frozen => AccountMode::Frozen,
+    }
+}
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};

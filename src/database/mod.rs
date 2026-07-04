@@ -45,6 +45,8 @@ mod kline;
 mod lhb;
 mod positions;
 pub(crate) mod agent_logs;
+// v12 PR1-1.5 (BR-021)
+pub mod account_mode_log;
 
 // ============================================================================
 // 数据库管理器 - 单例模式

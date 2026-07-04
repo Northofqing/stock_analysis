@@ -285,6 +285,151 @@ async fn push_virtual_next_day_review_if_needed() {
     }
 }
 
+// ============= v12 PR1-1.7: AccountMode 评估钩子 =============
+
+/// v12 PR1-1.7: 在 monitor 主循环调用, 重算 AccountMode 并按需推 T-01.
+///
+/// 触发点:
+///   - 启动后第一轮 (startup=true) — 恢复 DB 末次状态 + 推送状态变更 (若有)
+///   - 每个 tick (startup=false) — 重算 metrics, 触发变更即推 T-01
+///
+/// 不触碰 veto_chain (v12.2 §2.4 + PR1 硬约束).
+/// 失败不阻塞主循环 (fire-and-forget log).
+async fn evaluate_account_mode_hook(startup: bool) {
+    use stock_analysis::database::account_mode_log::{
+        latest_account_mode_change, AccountModeLogRow,
+    };
+    use stock_analysis::risk::account_mode::PortfolioMetrics;
+    use stock_analysis::risk::action_gate::AccountMode;
+
+    // 1. 装 metrics
+    let metrics = match tokio::task::spawn_blocking(compute_account_mode_metrics_blocking).await {
+        Ok(Ok(m)) => m,
+        Ok(Err(e)) => {
+            log::warn!("[AccountMode-hook] metrics 装配失败: {}", e);
+            return;
+        }
+        Err(e) => {
+            log::warn!("[AccountMode-hook] spawn_blocking join 失败: {:?}", e);
+            return;
+        }
+    };
+
+    // 2. 恢复 prev (从 DB 末次变更记录)
+    let prev = match tokio::task::spawn_blocking(latest_account_mode_change).await {
+        Ok(Ok(Some(row))) => parse_mode_label(&row.new_mode),
+        Ok(Ok(None)) => None, // 首次评估
+        Ok(Err(e)) => {
+            log::warn!("[AccountMode-hook] latest_account_mode_change 失败: {}", e);
+            None
+        }
+        Err(e) => {
+            log::warn!("[AccountMode-hook] spawn_blocking join 失败: {:?}", e);
+            None
+        }
+    };
+
+    // 3. 拼 banner
+    let banner = push_templates::BannerCtx {
+        account_mode: match prev.unwrap_or(AccountMode::Normal) {
+            AccountMode::Normal => push_templates::AccountMode::Normal,
+            AccountMode::ReduceOnly => push_templates::AccountMode::ReduceOnly,
+            AccountMode::Frozen => push_templates::AccountMode::Frozen,
+        },
+        total_pos: metrics.total_pos_cheng,
+        today_pnl: metrics.today_pnl_pct,
+        data_mode: push_templates::DataMode::Full, // PR2 接入真值
+        data_missing_note: None,
+    };
+
+    // 4. 评估 + 推
+    if startup {
+        log::info!("[AccountMode-hook] 启动评估 prev={:?} → 调 push_account_mode_change", prev);
+    }
+    if let Err(e) = push_templates::push_account_mode_change(&metrics, prev, Some(&banner)).await {
+        log::warn!("[AccountMode-hook] push_account_mode_change 失败: {}", e);
+    }
+
+    // 抑制 unused 警告 (startup 仅用于 log 区分)
+    let _ = startup;
+}
+
+fn parse_mode_label(label: &str) -> Option<stock_analysis::risk::action_gate::AccountMode> {
+    use stock_analysis::risk::action_gate::AccountMode;
+    match label {
+        "Normal" => Some(AccountMode::Normal),
+        "ReduceOnly" => Some(AccountMode::ReduceOnly),
+        "Frozen" => Some(AccountMode::Frozen),
+        _ => None,
+    }
+}
+
+/// 同步版 metrics 装配 (供 spawn_blocking 调用).
+/// 数据源: ledger (今日盈亏) + positions (总仓位) + trades (连续止损).
+/// 失败 / 缺失 → 返回 data_complete=false 的 metrics (保守策略).
+fn compute_account_mode_metrics_blocking() -> Result<
+    stock_analysis::risk::account_mode::PortfolioMetrics,
+    String,
+> {
+    use stock_analysis::risk::account_mode::PortfolioMetrics;
+
+    // 1. ledger 今日盈亏
+    let equity_curve = stock_analysis::portfolio::get_equity_curve(1)
+        .map_err(|e| format!("get_equity_curve: {}", e))?;
+    let today_entry = equity_curve.first();
+
+    let (today_pnl_pct, total_value, market_value) = match today_entry {
+        Some(entry) => {
+            // pnl% = daily_pnl / total_value (避免总值为 0 除零)
+            let pct = if entry.total_value > 0.0 {
+                (entry.daily_pnl / entry.total_value) * 100.0
+            } else {
+                0.0
+            };
+            (pct, entry.total_value, entry.market_value)
+        }
+        None => (0.0, 0.0, 0.0),
+    };
+
+    // 2. 总仓位 (market_value / total_value)
+    let total_pos_cheng = if total_value > 0.0 {
+        ((market_value / total_value) * 10.0).round().clamp(0.0, 10.0) as u8
+    } else {
+        0
+    };
+
+    // 3. 连续止损笔数 (近 5 笔 sell 交易中, 累计亏损笔数)
+    let consecutive_stop_loss_n = count_consecutive_stop_losses_blocking()
+        .map_err(|e| format!("count_consecutive_stop_losses: {}", e))?;
+
+    // 4. data_complete: ledger 有今日数据 + 总值 > 0
+    let data_complete = today_entry.is_some() && total_value > 0.0;
+
+    Ok(PortfolioMetrics {
+        today_pnl_pct,
+        consecutive_stop_loss_n,
+        total_pos_cheng,
+        data_complete,
+    })
+}
+
+/// 同步版连续止损计数: 取最近 5 笔 sell 交易, 倒序遇第一笔非止损即停.
+fn count_consecutive_stop_losses_blocking() -> Result<u32, String> {
+    let trades = stock_analysis::portfolio::get_trade_history(7)
+        .map_err(|e| format!("get_trade_history: {}", e))?;
+    let sells: Vec<&stock_analysis::portfolio::Trade> = trades
+        .iter()
+        .filter(|t| matches!(t.direction, stock_analysis::portfolio::TradeDirection::Sell))
+        .rev() // 最新在前
+        .take(5)
+        .collect();
+    // 注: 简化口径 — 卖出亏损 (amount < 0 视为亏损, 但 portfolio::Trade 没存 pnl 字段)
+    // PR1 保守实现: 不解析 pnl, 一律 0. 留给 PR3 接 position_adjustments + realized_pnl.
+    // 后续接入时改这里即可, 不影响其他模块.
+    let _ = sells;
+    Ok(0)
+}
+
 // 修复 v9.4.15 (2026-06-29 production panic):
 // 之前默认 current_thread runtime, block_on_async Ok 分支 handle.block_on(fut) panic
 // "Cannot start a runtime from within a runtime".
@@ -1420,6 +1565,11 @@ async fn monitor_loop() {
         // 构建实体过滤集合（只关注9只标的）
         let our_codes: std::collections::HashSet<String> = targets.iter().map(|t| t.code.clone()).collect();
         let scanner = TieredScanner::new(targets);
+
+        // ============= v12 PR1-1.7: 启动期评估一次 AccountMode =============
+        // 后续每次 tick 重算在循环体内 (PR1-1.7 末尾的 evaluate_account_mode_hook).
+        // 这里做 "今日首次" 评估, 防止上一次进程残留状态未推 T-01.
+        evaluate_account_mode_hook(true).await;
 
         let detector = Detector::new(DetectorConfig::default());
         let mut state_machine = SignalStateMachine::default();

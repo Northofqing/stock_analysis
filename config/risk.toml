@@ -47,3 +47,13 @@ min_importance_score = 70   # 重要告警最小分
 min_emergency_score  = 85   # 紧急告警最小分
 index_plunge_window_min = 5  # 5 分钟内崩盘检测窗口
 stale_data_max_age_sec = 30 # 行情数据最大陈旧时间 (秒)
+
+# v12 PR1 账户模式三态阈值 (BR-021)
+# 缺此段时 risk::account_mode::thresholds const fallback 生效
+[account_mode]
+daily_loss_pct         = -1.5   # 当日累计亏损 ≤ 此值 → ReduceOnly (默认 -1.5%)
+circuit_breaker_pct    = -2.0   # 当日累计亏损 ≤ 此值 → Frozen (默认 -2.0%)
+consecutive_stop_loss_n = 3     # 连续止损笔数 ≥ 此值 → ReduceOnly (默认 3 笔)
+position_overload_cheng = 8     # 总仓位 > 此值 → Frozen (默认 8 成)
+
+# 解除条件: 下一交易日盘前重置为 Normal (由 monitor 主循环 09:25 前调 reset())

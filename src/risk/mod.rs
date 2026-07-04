@@ -20,3 +20,6 @@ pub mod sector_exit;
 pub mod veto_chain;
 pub mod veto_rules_live;
 pub mod env_guard;
+// v12 PR1: 动作门 (与 veto_chain 并存, 不替换)
+pub mod action_gate;
+pub mod account_mode;

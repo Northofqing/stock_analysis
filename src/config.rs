@@ -338,6 +338,9 @@ pub struct RiskConfig {
     pub regime: RegimeConfig,
     pub exposure: ExposureConfig,
     pub alert: AlertConfig,
+    /// v12 PR1: 账户模式三态判定阈值 (BR-021)
+    #[serde(default)]
+    pub account_mode: AccountModeConfig,
 }
 
 impl Default for RiskConfig {
@@ -349,6 +352,54 @@ impl Default for RiskConfig {
             regime: RegimeConfig::default(),
             exposure: ExposureConfig::default(),
             alert: AlertConfig::default(),
+            account_mode: AccountModeConfig::default(),
+        }
+    }
+}
+
+/// v12 PR1-1.4: 账户模式阈值配置 (对齐 `risk::account_mode::thresholds` const fallback)
+///
+/// 缺 toml 段时 serde(default) 走 Default 实现, 对应 code-level const.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountModeConfig {
+    /// 当日累计亏损 ≤ 此值触发 ReduceOnly (默认 -1.5)
+    #[serde(default = "default_daily_loss_pct")]
+    pub daily_loss_pct: f64,
+    /// 当日累计亏损 ≤ 此值触发 Frozen (默认 -2.0)
+    #[serde(default = "default_circuit_breaker_pct")]
+    pub circuit_breaker_pct: f64,
+    /// 连续止损笔数 ≥ 此值触发 ReduceOnly (默认 3)
+    #[serde(default = "default_consecutive_n")]
+    pub consecutive_stop_loss_n: u32,
+    /// 总仓位 > 此值触发 Frozen (默认 8 成)
+    #[serde(default = "default_position_overload")]
+    pub position_overload_cheng: u8,
+}
+
+fn default_daily_loss_pct() -> f64 { -1.5 }
+fn default_circuit_breaker_pct() -> f64 { -2.0 }
+fn default_consecutive_n() -> u32 { 3 }
+fn default_position_overload() -> u8 { 8 }
+
+impl Default for AccountModeConfig {
+    fn default() -> Self {
+        Self {
+            daily_loss_pct: default_daily_loss_pct(),
+            circuit_breaker_pct: default_circuit_breaker_pct(),
+            consecutive_stop_loss_n: default_consecutive_n(),
+            position_overload_cheng: default_position_overload(),
+        }
+    }
+}
+
+impl AccountModeConfig {
+    /// 转 `risk::account_mode::ModeThresholds` (PR1-1.3 评估用)
+    pub fn to_thresholds(&self) -> crate::risk::account_mode::ModeThresholds {
+        crate::risk::account_mode::ModeThresholds {
+            daily_loss_pct: self.daily_loss_pct,
+            circuit_breaker_pct: self.circuit_breaker_pct,
+            consecutive_stop_loss_n: self.consecutive_stop_loss_n,
+            position_overload_cheng: self.position_overload_cheng,
         }
     }
 }
