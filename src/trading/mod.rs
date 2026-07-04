@@ -2,6 +2,10 @@
 //!
 //! 目标：在不接入真实券商前，先统一模拟交易与未来实盘交易的接口边界。
 //! 当前提供 SimulatedExecutionGateway（落库到 stock_position）。
+//!
+//! v12 PR3-3.5: 新增 paper_trade 模块, 虚拟腿只写 paper_trades, 零写 stock_position (BR-023).
+
+pub mod paper_trade;  // v12 PR3-3.5
 
 use crate::database::DatabaseManager;
 use crate::errors::TradeError;

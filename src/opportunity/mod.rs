@@ -12,6 +12,7 @@ pub mod launch_gate;  // 修复 P0-3: 上线门槛
 pub mod event_extractor;
 pub mod scheduler;  // 修复 v9.1 §1.3: 调度器
 pub mod hit_case;  // v10 P0.1 BC-3: 5 边界 hit CASE 逻辑
+pub mod candidate_state;  // v12 PR3-3.4: 影子候选零推送
 pub mod candidate_panel;  // v11-P0-5+ Commit A: 候选筛选台模型 + 多源合并去重
 pub mod news_ranker;  // P2-News Commit 1: 新闻事件排序层 (EventType/HeatStage/Bucket/RankedNews)
 pub mod news_audit;   // P2-News Commit 5: 审计 JSONL 落盘

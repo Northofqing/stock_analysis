@@ -47,6 +47,8 @@ mod positions;
 pub(crate) mod agent_logs;
 // v12 PR1-1.5 (BR-021)
 pub mod account_mode_log;
+// v12 PR3-3.2/3.3 (BR-023/024)
+pub mod position_shares;
 
 // ============================================================================
 // 数据库管理器 - 单例模式

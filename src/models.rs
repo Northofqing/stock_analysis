@@ -322,6 +322,9 @@ pub struct StockPosition {
     pub return_rate: Option<f64>,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
+    /// v12 PR3-3.1: 产业链名 (BR-015 集中度检查接入)
+    #[serde(default)]
+    pub chain_name: Option<String>,
 }
 
 /// 插入新的模拟持仓记录

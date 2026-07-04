@@ -79,6 +79,60 @@ diesel::table! {
         return_rate -> Nullable<Double>,
         created_at -> Timestamp,
         updated_at -> Timestamp,
+        chain_name -> Nullable<Text>,
+    }
+}
+
+// v12 PR3-3.1 (BR-023/024) — 虚拟盘 + 调整 + 执行跟踪
+diesel::table! {
+    paper_trades (id) {
+        id -> Integer,
+        plan_id -> Text,
+        code -> Text,
+        name -> Text,
+        direction -> Text,
+        price -> Double,
+        quantity -> Integer,
+        status -> Text,
+        fill_price -> Nullable<Double>,
+        not_fill_reason -> Nullable<Text>,
+        virtual_reason -> Text,
+        account_mode -> Text,
+        data_mode -> Text,
+        ts -> Timestamp,
+        updated_at -> Timestamp,
+    }
+}
+
+diesel::table! {
+    execution_tracking (id) {
+        id -> Integer,
+        paper_trade_id -> Integer,
+        plan_id -> Text,
+        code -> Text,
+        expected_price -> Double,
+        actual_change_t1 -> Nullable<Double>,
+        actual_change_t3 -> Nullable<Double>,
+        actual_change_t5 -> Nullable<Double>,
+        mfe -> Nullable<Double>,
+        mae -> Nullable<Double>,
+        t1_special_case -> Nullable<Text>,
+        created_at -> Timestamp,
+        updated_at -> Timestamp,
+    }
+}
+
+diesel::table! {
+    position_adjustments (id) {
+        id -> Integer,
+        code -> Text,
+        delta -> Integer,
+        source -> Text,
+        reason -> Text,
+        effective_date -> Text,
+        applied_immediately -> Integer,
+        operator -> Nullable<Text>,
+        created_at -> Timestamp,
     }
 }
 

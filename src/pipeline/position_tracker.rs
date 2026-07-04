@@ -22,6 +22,7 @@
 
 use log::{info, warn};
 
+use diesel::prelude::*;
 use crate::database::DatabaseManager;
 use crate::data_provider::KlineData;
 use crate::monitor::risk::{MarketRegime, PositionSizer, StopLoss};
@@ -105,6 +106,53 @@ fn net_return_rate(gross_pct: f64) -> f64 {
 
 fn validate_trade_symbol_env(code: &str) -> Result<(), String> {
     crate::risk::env_guard::validate_symbol_for_current_env(code)
+}
+
+/// v12 PR3-3.6 (BR-015 偿还): 查同 chain 已持仓数 (open status).
+///
+/// 实现: 先取本标的 chain_name, 再数同 chain 的 open 持仓数.
+/// DB 错误时返回 0 (不阻断, 走 fallback 旧 hardcoded 行为).
+fn query_chain_held_count(code: &str) -> Result<i32, String> {
+    let mut conn = DatabaseManager::get().get_conn().map_err(|e| format!("DB: {}", e))?;
+
+    // raw SQL 全部 (避免 diesel count/select trait bound 不稳定)
+    let esc = |s: &str| s.replace('\'', "''");
+    let sql_chain = format!(
+        "SELECT chain_name FROM stock_position WHERE code = '{}' AND status = 'open' LIMIT 1",
+        esc(code)
+    );
+    let chain_row: Option<ChainNameRow> = diesel::sql_query(sql_chain)
+        .get_result(&mut conn)
+        .optional()
+        .map_err(|e| format!("query chain_name: {}", e))?;
+
+    let chain = match chain_row {
+        Some(r) if !r.chain_name.is_empty() && r.chain_name != "其他" => r.chain_name,
+        _ => return Ok(0),
+    };
+
+    let count_sql = format!(
+        "SELECT COUNT(*) AS cnt FROM stock_position WHERE chain_name = '{}' AND status = 'open'",
+        esc(&chain)
+    );
+    let count: i64 = diesel::sql_query(count_sql)
+        .get_result::<CountRow>(&mut conn)
+        .map(|r| r.cnt)
+        .map_err(|e| format!("count chain: {}", e))?;
+
+    Ok(count as i32)
+}
+
+#[derive(diesel::QueryableByName)]
+struct CountRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    cnt: i64,
+}
+
+#[derive(diesel::QueryableByName)]
+struct ChainNameRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    chain_name: String,
 }
 
 /// 对单只股票跟踪模拟持仓并在满足条件时开/平仓。
@@ -323,21 +371,20 @@ pub(super) fn track_position(
             // P0-2: 动态仓位计算 (PositionSizer 替代固定 position_shares)
             let shares = if risk_ctx.use_dynamic {
                 let volatility = result.volatility.unwrap_or(3.0);
-                // 修复 B6 (2026-06-29 codex review) + BR-015 (2026-06-30):
-                // chain 集中度检查在 stock_position 表加 chain_name 列后启用.
-                // 当前 stock_position 表 (database/mod.rs:336) 无 chain 列,
-                // 要做需要: (1) schema migration 加列 (2) open_position 时存 chain_name
-                // (3) 查 DB 数同 chain 持仓/T+1 冻结数 (4) 通过 chain_mapper 关键词表算 chain.
-                // 当前 hardcoded 0 = 禁用产业链集中度折扣, 见 docs/business_rules.md BR-015.
-                // 警告日志让 operator 知道 chain 集中度检查当前不生效.
+                // 修复 B6 + BR-015 + v12 PR3-3.6 (2026-07-05):
+                // stock_position 表已加 chain_name 列 (migration v12-p0-paper-and-adjust)
+                // 现在可以查同 chain 持仓数, 接真值替换之前的 hardcoded 0.
                 if !risk_ctx.use_dynamic {
                     warn!("[{}] chain 集中度检查暂未启用 (BR-015), max_position 用 base × vol × regime", code);
                 }
+                // PR3-3.6: 接入真值 (DB 查同 chain 持仓数). 失败时 fallback 0 (不阻断).
+                let chain_held = query_chain_held_count(code).unwrap_or(0) as usize;
+                let chain_frozen: usize = 0; // T+1 冻结数: 后续 PR 接入 buy_date 索引 + 同 chain 查
                 let max_amount = risk_ctx.sizer.max_position(
                     risk_ctx.regime,
                     volatility,
-                    0,  // B6 TODO: 产业链持仓计数 (待 stock_position 加 chain_name 列)
-                    0,  // B6 TODO: 产业链冻结计数 (待 buy_date 索引 + 同 chain 查)
+                    chain_held,
+                    chain_frozen,
                     false, // already_held 在 DB 层已检查
                 );
                 if max_amount <= 0.0 {
