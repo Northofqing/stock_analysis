@@ -660,14 +660,40 @@ pub fn parse_text_to_raw(text: &str) -> Vec<(String, String)> {
         }
         if let (Some(s), Some(e)) = (code_start, code_end) {
             let code = &line[s..e];
-            // code 后面的 name: 跳过空白 + 标点 (空格, (, 【, 等)
+
+            /// CJK Unified Ideographs (U+4E00..=U+9FFF) + 扩展 A (U+3400..=U+4DBF)
+            fn is_cjk(c: char) -> bool {
+                let cp = u32::from(c);
+                (0x4E00..=0x9FFF).contains(&cp) || (0x3400..=0x4DBF).contains(&cp)
+            }
+            // 优先: code 前的中文 (CJK) 字符 → name (放量格式 "纳微科技(688690)")
+            // 退化: code 后面跳过空白+标点, 取到下一个 stop 字符 (推荐格式 "600519 贵州茅台")
+            let before = &line[..s];
             let after = &line[e..];
-            let name: String = after
+            // 优先: code 后的空白/标点 跳过, 取下一个 stop 字符前所有内容
+            //       (推荐格式 "600519 贵州茅台 +3.2%" → "贵州茅台")
+            let name_after: String = after
                 .trim_start()
-                .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '(' | '（' | '【' | '[' | ',' | '，' | '.' | '。'))
+                .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '（' | '）' | '【' | '】' | '[' | ']' | ',' | '，' | '.' | '。' | ':' | '：'))
                 .chars()
-                .take_while(|c| !matches!(c, ' ' | '\t' | '+' | '-' | '%' | '|' | '（' | '(' | ')' | '）' | '[' | ']' | '【' | '】' | ',' | '，' | '.' | '。' | '!' | '?' | '$'))
+                .take_while(|c| !matches!(c, ' ' | '\t' | '+' | '-' | '%' | '|' | '（' | '(' | ')' | '）' | '[' | ']' | '【' | '】' | ',' | '，' | '.' | '。' | '!' | '?' | '$' | '—' | '·' | '、' | '：' | ':' | '；' | ';'))
                 .collect();
+            // 退化: code 前最近的 CJK 连续段
+            //       (放量格式 "纳微科技(688690) — ..." → "纳微科技")
+            let name_before: String = if name_after.is_empty() {
+                before
+                    .chars()
+                    .rev()
+                    .skip_while(|c| !is_cjk(*c))
+                    .take_while(|c| is_cjk(*c))
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect()
+            } else {
+                String::new()
+            };
+            let name = if !name_after.is_empty() { name_after } else { name_before };
             let name = name.trim().to_string();
             if !name.is_empty() && seen.insert(code.to_string()) {
                 out.push((code.to_string(), name));
@@ -725,6 +751,20 @@ mod tests_parse {
         let text = "600519 贵州茅台\n600519 茅台 (二次推荐)";
         let raw = parse_text_to_raw(text);
         assert_eq!(raw.len(), 1, "同 code 应去重");
+    }
+
+    /// 放量分析格式: name 在 code 前 (括号前) ——
+    /// "  ❓ 纳微科技(688690) — 不确定 置信30%"
+    /// 锁住回归: 之前只解析 code 后, 漏所有放量行 (P0-5++ Commit 12 L978 wrapper)
+    #[test]
+    fn parse_breakout_format_name_before_code() {
+        let text = "📊 放量分析·自选（盘后·算法研判仅供参考）\n  ❓ 纳微科技(688690) — 不确定 置信30%\n  🚀 黄河旋风(600172) — 启动 置信50%";
+        let raw = parse_text_to_raw(text);
+        assert_eq!(raw.len(), 2, "应解析 2 只 (header 行无 6 位 code 跳过)");
+        assert_eq!(raw[0].0, "688690");
+        assert_eq!(raw[0].1, "纳微科技");
+        assert_eq!(raw[1].0, "600172");
+        assert_eq!(raw[1].1, "黄河旋风");
     }
 }
 
