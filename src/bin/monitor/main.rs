@@ -925,6 +925,32 @@ async fn run_review_only_inner() {
     }
 
     log::info!("[复盘] ======== 盘后分析完成 ========");
+
+    // P3 outcome 回看 (NEWS_OUTCOME_RUN=true 触发, 默认不跑)
+    // --review 末尾加 (盘后正是回看推送效果的时间点)
+    if std::env::var("NEWS_OUTCOME_RUN").ok().as_deref() == Some("true") {
+        let report = tokio::task::spawn_blocking(|| {
+            let outcomes = stock_analysis::opportunity::news_outcome::run_today_outcome();
+            stock_analysis::opportunity::news_outcome::format_outcome_report(&outcomes)
+        })
+        .await
+        .unwrap_or_default();
+        if !report.is_empty() {
+            log::info!("[NewsOutcome] 报告:\n{}", report);
+            // 落盘到 data/news_outcome_YYYY-MM-DD.md (与 audit 同目录)
+            let prev_db = std::env::var("DATABASE_PATH").unwrap_or_else(|_| "./data/stock_analysis.db".into());
+            let dir = std::path::PathBuf::from(&prev_db)
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("./data"));
+            let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+            let path = dir.join(format!("news_outcome_{}.md", today));
+            let _ = std::fs::write(&path, &report);
+            log::info!("[NewsOutcome] 落盘: {}", path.display());
+        } else {
+            log::info!("[NewsOutcome] 今日 audit 为空, 跳过");
+        }
+    }
 }
 
 /// 盘后持仓多 Agent 深度研判：对每只真实持仓跑「6 分析师 + 多空辩论 + 仲裁」流水线，
