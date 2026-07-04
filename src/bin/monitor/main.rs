@@ -975,7 +975,7 @@ async fn run_review_deep_analysis() {
 
     // v16.2 (P0-5++ Commit 5): 候选筛选台 (5 路 raw 合并去重 + 证据分层 + 硬门槛 + 排序)
     // 5 路 raw 已在 Commit 4 降级为日志, 这里收集 raw 跑合并 → 推 1 条候选台卡片
-    let candidate_summary = run_candidate_panel_from_review(&by_code, &holdings);
+    let candidate_summary = run_candidate_panel_from_review(&by_code, &holdings, None, None, None, None, None);
     if !candidate_summary.is_empty() {
         log::info!("[复盘] 候选筛选台推送 (v16.2):\n{}", candidate_summary);
         notify::push_governor(
@@ -2003,26 +2003,52 @@ fn snapshot_portfolio_value() {
 /// - B7 放量·实盘优选 (watch_breakout_text)
 /// - C4 产业链 (scan.chain_text, 本函数不调, 留 P0-5++ commit 6 接入)
 ///
+/// **v16.4 修订 (P0-5++ Commit 7)**: 接受 5 路 raw (A10/B3/B6/B7/C4) 真正 5 路收集
+/// (主路径暂传 None, 留 P0-5++ commit 8 实际接入 5 处调用点).
+///
 /// **简化**: 本 commit 不解析 LLM 文本 (留 P0-5++ commit 6+), 直接用 by_code (LLM 终稿) 当 raw 喂入.
 /// 实际行为: 每只持仓的 "操作建议" + 板块/产业链 文本 = 1 条候选, source = IndustryChain (兜底).
 ///
 /// **P5 红线 (P5 §一)**: 候选筛选不是买入决策, 不合成"买入分".
+#[allow(clippy::too_many_arguments)]
 fn run_candidate_panel_from_review(
     by_code: &std::collections::HashMap<String, (String, Option<String>)>,
     holdings: &[stock_analysis::portfolio::Position],
+    // v16.4: 5 路 raw (主路径暂 None, 留 P0-5++ commit 8 接入)
+    stock_pick_raw: Option<&str>,
+    optimal_close_raw: Option<&str>,
+    volume_watchlist_raw: Option<&str>,
+    volume_real_trade_raw: Option<&str>,
+    industry_chain_raw: Option<&str>,
 ) -> String {
     use stock_analysis::opportunity::candidate_panel::{
         classify_tier, filter_hard_gates, format_candidate_board, merge_candidates,
-        sort_candidates, CandidateSource,
+        parse_text_to_raw, sort_candidates, CandidateSource,
     };
 
-    // 收集 5 路 raw (实际只 1 路: by_code LLM 终稿, 4 路留 placeholder 标 IndustryChain)
+    // 收集 5 路 raw (v16.4 P0-5++ Commit 7 修订: 5 个 String 参数, 主路径暂 None 走兜底)
     // P5 §三 3.1 红线: 多路信号合并, 这里 1 路来源 (IndustryChain 兜底)
     let mut raw: Vec<(CandidateSource, String, String)> = Vec::new();
-    for p in holdings {
-        // 优先: LLM 终稿里有 "操作建议" 段 → 当作 1 条候选
-        if let Some((_, Some(_md))) = by_code.get(&p.code) {
-            raw.push((CandidateSource::IndustryChain, p.code.clone(), p.name.clone()));
+    // v16.4: 5 路 raw 解析 (parse_text_to_raw, P0-5++ Commit 6 加的 helper)
+    for (source, text) in [
+        (CandidateSource::StockPick, stock_pick_raw),
+        (CandidateSource::OptimalClose, optimal_close_raw),
+        (CandidateSource::VolumeWatchlist, volume_watchlist_raw),
+        (CandidateSource::VolumeRealTrade, volume_real_trade_raw),
+        (CandidateSource::IndustryChain, industry_chain_raw),
+    ] {
+        if let Some(t) = text {
+            for (code, name) in parse_text_to_raw(t) {
+                raw.push((source, code, name));
+            }
+        }
+    }
+    // v16.4 兜底: by_code LLM 终稿 → IndustryChain 兜底 (Commit 5 已有)
+    if raw.is_empty() {
+        for p in holdings {
+            if let Some((_, Some(_md))) = by_code.get(&p.code) {
+                raw.push((CandidateSource::IndustryChain, p.code.clone(), p.name.clone()));
+            }
         }
     }
     // 简化: 实际 P0-5++ 还会接 A10/B3/B6/B7 4 路 raw, 这里先 1 路
@@ -2087,7 +2113,7 @@ mod tests_candidate_panel {
     fn wrapper_empty_by_code_returns_empty() {
         let by_code: HashMap<String, (String, Option<String>)> = HashMap::new();
         let holdings = vec![make_position("000001", "测试")];
-        let result = run_candidate_panel_from_review(&by_code, &holdings);
+        let result = run_candidate_panel_from_review(&by_code, &holdings, None, None, None, None, None);
         assert!(result.is_empty(), "空 by_code 应返回空字符串, 不推候选台");
     }
 
@@ -2100,7 +2126,7 @@ mod tests_candidate_panel {
             ("测试".to_string(), Some(make_md("**强烈卖出**"))),
         );
         let holdings = vec![make_position("000001", "测试")];
-        let result = run_candidate_panel_from_review(&by_code, &holdings);
+        let result = run_candidate_panel_from_review(&by_code, &holdings, None, None, None, None, None);
         assert!(result.contains("候选筛选台"), "应输出候选台卡片");
         assert!(result.contains("000001"), "应包含 code 000001");
         assert!(result.contains("测试"), "应包含 name 测试");
@@ -2118,7 +2144,7 @@ mod tests_candidate_panel {
             ),
         );
         let holdings = vec![make_position("000001", "测试")];
-        let result = run_candidate_panel_from_review(&by_code, &holdings);
+        let result = run_candidate_panel_from_review(&by_code, &holdings, None, None, None, None, None);
         assert!(result.contains("🟢"), "布林+MACD 应进 Strong 档 (🟢)");
     }
 
@@ -2138,7 +2164,7 @@ mod tests_candidate_panel {
             make_position("000001", "持仓A"), // 已持仓 → 剔除
             make_position("000002", "候选B"), // 不在持仓 → 保留
         ];
-        let result = run_candidate_panel_from_review(&by_code, &holdings);
+        let result = run_candidate_panel_from_review(&by_code, &holdings, None, None, None, None, None);
         // 候选 B 留下, 持仓 A 剔除
         assert!(result.contains("000002"));
         assert!(!result.contains("持仓A"));
@@ -2153,7 +2179,7 @@ mod tests_candidate_panel {
             ("测试".to_string(), None), // LLM 失败
         );
         let holdings = vec![make_position("000001", "测试")];
-        let result = run_candidate_panel_from_review(&by_code, &holdings);
+        let result = run_candidate_panel_from_review(&by_code, &holdings, None, None, None, None, None);
         assert!(result.is_empty(), "md=None 应跳过 entry, 候选台不推");
     }
 }
