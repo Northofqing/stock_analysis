@@ -12,7 +12,7 @@
 //!   1. 推送时是否涨停买不到 (push 当日 change >= 9.5%)
 //!   2. D+1 是否高开低走 (open > prev_close*1.01 AND close < open)
 //!   3. 是否先跌破止损再涨 (D+1~D+5 最低 < push_price*0.95 AND D+5 涨)
-//!   4. 是否板块普涨带动 (本期简化: 跳过, 留 commit 6+ 接入 board)
+//!   4. 是否板块普涨带动 (已接: D+1 个股涨幅 vs 板块 5 支成份股平均, 差距 < 0.5%)
 //!   5. 是否有可执行买点 (D+1 区间包含推送价 ±3% 内)
 //!
 //! **红线**:
@@ -86,7 +86,7 @@ pub struct NewsOutcome {
     pub limit_up_unbuyable: Option<bool>,
     pub open_high_sell_low_d1: Option<bool>,
     pub stop_break_first: Option<bool>,
-    pub sector_driven: Option<bool>, // 一期 None (留 commit 6+ 接入 board)
+    pub sector_driven: Option<bool>, // D+1 个股 vs 板块 5 支平均, 差距 < 0.5% = 板块带动
     pub executable_entry: Option<bool>,
     /// 总体评估
     pub verdict: String,
@@ -208,8 +208,10 @@ pub fn evaluate_audit(
         (Some(_), Some(_)) => Some(false),
         _ => None,
     };
-    // 4. 板块普涨: 留 None (commit 6+ 接入)
-    let sector_driven = None;
+    // 4. 板块普涨: 个股 D+5 涨幅 vs 板块 D+5 涨幅, 差距 < 0.5% 视为板块带动
+    // 板块涨幅: 推送日板块 (chain → board_code) 的 D+5 涨幅, 用 ConceptBoard 拉
+    // 没拉到板块 K 线 → None (不补 0)
+    let sector_driven = compute_sector_driven(row, klines_opt.as_deref(), push_date);
     // 5. 可执行买点: D+1 low <= push_price * 1.03 (推送价 ±3% 区间内可买)
     let executable_entry = klines_opt.as_ref().and_then(|ks| {
         let push_k = kline_at_or_before(ks, push_date)?;
@@ -219,7 +221,7 @@ pub fn evaluate_audit(
     });
 
     // 总体 verdict
-    let verdict = judge_verdict(d5_pct, mae, mfe, limit_up_unbuyable);
+    let verdict = judge_verdict(d5_pct, mae, mfe, limit_up_unbuyable, sector_driven);
 
     NewsOutcome {
         candidate_id: row.candidate_id.clone(),
@@ -250,6 +252,7 @@ fn judge_verdict(
     mae: Option<f64>,
     mfe: Option<f64>,
     limit_up_unbuyable: Option<bool>,
+    sector_driven: Option<bool>,
 ) -> String {
     if d5_pct.is_none() {
         return "无数据 (K 线缺失)".to_string();
@@ -262,7 +265,8 @@ fn judge_verdict(
         return "涨停买不到 (无法兑现)".to_string();
     }
     if d5 >= 3.0 && mae > -3.0 {
-        return "有兑现 (D+5 ≥ 3%, 回撤可控)".to_string();
+        let suffix = if sector_driven == Some(true) { " (板块普涨带动)" } else { "" };
+        return format!("有兑现 (D+5 ≥ 3%, 回撤可控){}", suffix);
     }
     if d5 >= 0.0 && mae > -5.0 {
         return "中性 (D+5 ≥ 0, 但涨幅有限)".to_string();
@@ -277,6 +281,47 @@ fn judge_verdict(
         return "有过机会但未兑现 (MFE > 5% 但 D+5 跌)".to_string();
     }
     format!("观察 (D+5={:.1}%, MAE={:.1}%, MFE={:.1}%)", d5, mae, mfe)
+}
+
+/// 计算 sector_driven 维度
+///
+/// 逻辑: 个股 D+1 涨幅 vs 板块成份股 D+1 平均涨幅, 差距 < 0.5% 视为板块普涨带动
+///
+/// 数据源: sector_monitor::fetch_board_components (5 支) → 拉每支 K 线
+///   - 个股 D+1 涨幅 vs 5 支平均 D+1 涨幅
+///   - 板块本身没 K 线 (虚的), 用成份股均值作代理
+///   - 失败 (K 线/board/components) → None
+///
+/// 一期: D+1 (单日) 而非 D+5 — 拉 5 支 D+5 K 线慢, 单日足以判断"是否板块普涨带动"
+fn compute_sector_driven(
+    row: &AuditRowRead,
+    stock_klines: Option<&[crate::data_provider::KlineData]>,
+    push_date: NaiveDate,
+) -> Option<bool> {
+    use crate::market_analyzer::sector_monitor;
+    use crate::data_provider::DataFetcherManager;
+    // 1. 个股 D+1 涨幅
+    let stock_d1 = pct_change_at(stock_klines?, push_date, 1)?;
+    // 2. chain → board_code → 5 支成份股
+    let (board_code, _) = sector_monitor::search_board_code_by_keyword(&row.chain).ok()??;
+    let comps = sector_monitor::fetch_board_components(&board_code, 5).ok()?;
+    // 3. 拉每支成份股 K 线, 算 D+1 平均涨幅
+    let fetcher = DataFetcherManager::new().ok()?;
+    let mut d1_sum = 0.0;
+    let mut d1_count = 0;
+    for c in &comps {
+        if let Ok((klines, _)) = fetcher.get_daily_data(&c.code, 5) {
+            if let Some(d) = pct_change_at(&klines, push_date, 1) {
+                d1_sum += d;
+                d1_count += 1;
+            }
+        }
+    }
+    if d1_count == 0 {
+        return None;
+    }
+    let board_d1 = d1_sum / d1_count as f64;
+    Some((stock_d1 - board_d1).abs() < 0.5)
 }
 
 /// 加载 audit JSONL
@@ -394,7 +439,7 @@ pub fn format_outcome_report(outcomes: &[NewsOutcome]) -> String {
     if !outcomes.is_empty() {
         out.push_str("\n## 注意事项\n");
         out.push_str("- 本报告**不自动调权**, 仅人工审计参考 (P2-News-2 评审 P3 决定)\n");
-        out.push_str("- 板块普涨 (sector_driven) 维度本期未接, 留 commit 6+ 接入 board\n");
+        out.push_str("- 板块普涨 (sector_driven) 维度已接 (D+1 个股 vs 板块 5 支平均)\n");
         out.push_str("- 数据缺失维度显示 '-', 不补 0 编造\n");
     }
     out
@@ -409,20 +454,75 @@ fn fmt_opt_bool(v: Option<bool>) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
-/// 主入口: 跑今日 audit 的回看
+/// 主入口: 跑过去所有 audit 的回看 (D+1/D+3/D+5 已发生)
 pub fn run_today_outcome() -> Vec<NewsOutcome> {
-    let path = audit_path();
-    if !path.exists() {
-        log::warn!("[NEWS_OUTCOME] 今日 audit 不存在: {}", path.display());
+    // 1. 找 audit 目录 (DATABASE_PATH 同目录)
+    let dir = std::env::var("DATABASE_PATH")
+        .ok()
+        .and_then(|p| {
+            let pb = PathBuf::from(p);
+            pb.parent().map(|p| p.to_path_buf())
+        })
+        .unwrap_or_else(|| PathBuf::from("./data"));
+    if !dir.exists() {
+        log::warn!("[NEWS_OUTCOME] audit 目录不存在: {}", dir.display());
         return Vec::new();
     }
-    let rows = load_audit(&path);
-    if rows.is_empty() {
+    // 2. 找所有 news_rank_audit_*.jsonl (按文件名日期排序)
+    let mut paths: Vec<PathBuf> = fs::read_dir(&dir)
+        .ok()
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|s| s.starts_with("news_rank_audit_") && s.ends_with(".jsonl"))
+                        .unwrap_or(false)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    paths.sort();
+    if paths.is_empty() {
+        log::warn!("[NEWS_OUTCOME] 未找到任何 audit JSONL");
         return Vec::new();
     }
-    // 推送日: audit 文件名是当天, 但 ts 字段更准. 一期用 today.
-    let today = Local::now().date_naive();
-    evaluate_batch(rows, today)
+    // 3. 每文件加载, 用文件日期作 push_date (一期: 文件名解析 YYYY-MM-DD)
+    let mut all_rows = Vec::new();
+    for p in &paths {
+        let push_date = parse_audit_date(p);
+        let rows = load_audit(p);
+        for r in rows {
+            all_rows.push((r, push_date));
+        }
+    }
+    if all_rows.is_empty() {
+        return Vec::new();
+    }
+    // 4. 批量评估 (push_date per row)
+    let fetcher = match crate::data_provider::DataFetcherManager::new() {
+        Ok(f) => f,
+        Err(e) => {
+            log::warn!("[NEWS_OUTCOME] DataFetcherManager 初始化失败: {:#}", e);
+            return Vec::new();
+        }
+    };
+    all_rows
+        .iter()
+        .map(|(r, d)| evaluate_audit(r, *d, &fetcher))
+        .collect()
+}
+
+/// 从 audit 文件名解析推送日 (news_rank_audit_YYYY-MM-DD.jsonl)
+fn parse_audit_date(path: &Path) -> NaiveDate {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    // 提取 YYYY-MM-DD
+    let date_str = name
+        .strip_prefix("news_rank_audit_")
+        .and_then(|s| s.strip_suffix(".jsonl"))
+        .unwrap_or("");
+    NaiveDate::parse_from_str(date_str, "%Y-%m-%d").unwrap_or_else(|_| Local::now().date_naive())
 }
 
 #[cfg(test)]
@@ -504,29 +604,33 @@ mod tests {
         assert!(s.contains("测试新闻"));
     }
 
-    /// 4) judge_verdict: 各分支覆盖
+    /// 4) judge_verdict: 各分支覆盖 (含 sector_driven 标注)
     #[test]
     fn judge_verdict_branches() {
         // 涨停买不到优先
-        let v = judge_verdict(Some(10.0), Some(-2.0), Some(15.0), Some(true));
+        let v = judge_verdict(Some(10.0), Some(-2.0), Some(15.0), Some(true), None);
         assert!(v.starts_with("涨停买不到"));
         // 有兑现
-        let v = judge_verdict(Some(5.0), Some(-1.0), Some(6.0), Some(false));
+        let v = judge_verdict(Some(5.0), Some(-1.0), Some(6.0), Some(false), None);
         assert!(v.starts_with("有兑现"));
+        // 有兑现 + 板块普涨 → 含 "板块普涨带动" 标注
+        let v = judge_verdict(Some(5.0), Some(-1.0), Some(6.0), Some(false), Some(true));
+        assert!(v.starts_with("有兑现"));
+        assert!(v.contains("板块普涨带动"));
         // 中性
-        let v = judge_verdict(Some(1.0), Some(-2.0), Some(2.0), Some(false));
+        let v = judge_verdict(Some(1.0), Some(-2.0), Some(2.0), Some(false), None);
         assert!(v.starts_with("中性"));
         // 未兑现
-        let v = judge_verdict(Some(-5.0), Some(-7.0), Some(0.0), Some(false));
+        let v = judge_verdict(Some(-5.0), Some(-7.0), Some(0.0), Some(false), None);
         assert!(v.starts_with("未兑现"));
         // 高回撤
-        let v = judge_verdict(Some(-2.0), Some(-10.0), Some(0.0), Some(false));
+        let v = judge_verdict(Some(-2.0), Some(-10.0), Some(0.0), Some(false), None);
         assert!(v.starts_with("高回撤"));
         // 有过机会但未兑现
-        let v = judge_verdict(Some(-1.0), Some(-1.0), Some(6.0), Some(false));
+        let v = judge_verdict(Some(-1.0), Some(-1.0), Some(6.0), Some(false), None);
         assert!(v.starts_with("有过机会但未兑现"));
         // 无数据
-        let v = judge_verdict(None, None, None, None);
+        let v = judge_verdict(None, None, None, None, None);
         assert!(v.starts_with("无数据"));
     }
 

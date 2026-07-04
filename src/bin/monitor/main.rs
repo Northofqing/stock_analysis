@@ -574,6 +574,31 @@ async fn run_test_scan() {
     if std::env::var("NEWS_RANKER_SHADOW").ok().as_deref() == Some("true") {
         let _ = stock_analysis::opportunity::news_audit::write_audit_jsonl(&[]); // 占位, 实际接 ranked
     }
+    // P3 outcome 回看 (NEWS_OUTCOME_RUN=true 触发, 默认不跑)
+    // 读昨日 audit → 算 D+1/D+3/D+5 → 写 report md → 不自动调权
+    if std::env::var("NEWS_OUTCOME_RUN").ok().as_deref() == Some("true") {
+        let report = tokio::task::spawn_blocking(|| {
+            let outcomes = stock_analysis::opportunity::news_outcome::run_today_outcome();
+            stock_analysis::opportunity::news_outcome::format_outcome_report(&outcomes)
+        })
+        .await
+        .unwrap_or_default();
+        if !report.is_empty() {
+            log::info!("[NewsOutcome] 报告:\n{}", report);
+            // 落盘到 data/news_outcome_YYYY-MM-DD.md (与 audit 同目录)
+            let prev_db = std::env::var("DATABASE_PATH").unwrap_or_else(|_| "./data/stock_analysis.db".into());
+            let dir = std::path::PathBuf::from(&prev_db)
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from("./data"));
+            let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+            let path = dir.join(format!("news_outcome_{}.md", today));
+            let _ = std::fs::write(&path, &report);
+            log::info!("[NewsOutcome] 落盘: {}", path.display());
+        } else {
+            log::info!("[NewsOutcome] 今日 audit 为空, 跳过");
+        }
+    }
 
     // 14. v4 决策层：排除引擎 + 风控（含 HTTP 调用，走 spawn_blocking）
     let h = holdings.clone();
