@@ -134,10 +134,21 @@ fn mfe_mae(klines: &[crate::data_provider::KlineData], push_date: NaiveDate, n_d
     (Some(mfe), Some(mae))
 }
 
-/// 从 chain 名反查代码 (一期: 简单规则, 实际应调 sector_monitor::search_board_code_by_keyword)
-/// 现在返回 None (留 commit 6+ 接入)
-fn code_from_chain(_chain: &str) -> Option<String> {
-    None
+/// 从 chain 名反查代码
+///
+/// **链路**: chain → board_code (东财 suggest API) → board components → 第一支股票
+/// 用 sector_monitor 已有函数, 不引入新 HTTP 调用
+///
+/// **失败**:
+///   - sector_monitor::search_board_code_by_keyword 返 None → 返 None
+///   - fetch_board_components 失败或空 → 返 None
+fn code_from_chain(chain: &str) -> Option<String> {
+    use crate::market_analyzer::sector_monitor;
+    // 1. chain → board_code
+    let (board_code, _board_name) = sector_monitor::search_board_code_by_keyword(chain).ok()??;
+    // 2. board_code → 第一支股票 (取第一支作关联)
+    let comps = sector_monitor::fetch_board_components(&board_code, 5).ok()?;
+    comps.first().map(|s| s.code.clone())
 }
 
 /// 评估单条 audit 的 outcome
@@ -517,5 +528,43 @@ mod tests {
         // 无数据
         let v = judge_verdict(None, None, None, None);
         assert!(v.starts_with("无数据"));
+    }
+
+    /// 5) code_from_chain: 空 chain → None
+    #[test]
+    fn code_from_chain_empty() {
+        // 空字符串不进 HTTP, 走 ok?? 提前返 None
+        // 实际 search_board_code_by_keyword("") 内部就返 None
+        let code = code_from_chain("");
+        assert!(code.is_none(), "空 chain 应返 None");
+    }
+
+    /// 6) NewsOutcome 字段全 None 时不 panic
+    #[test]
+    fn outcome_all_none_safe() {
+        let o = NewsOutcome {
+            candidate_id: "t".into(),
+            title: "t".into(),
+            chain: "c".into(),
+            bucket: "PushNow".into(),
+            push_at: "2026-07-04 10:00".into(),
+            code: None,
+            push_price: None,
+            d1_pct: None,
+            d3_pct: None,
+            d5_pct: None,
+            mfe: None,
+            mae: None,
+            limit_up_unbuyable: None,
+            open_high_sell_low_d1: None,
+            stop_break_first: None,
+            sector_driven: None,
+            executable_entry: None,
+            verdict: "无数据".into(),
+            reasons: vec![],
+        };
+        // 序列化 + 渲染都不应 panic
+        let s = format_outcome_report(&[o]);
+        assert!(s.contains("无数据"));
     }
 }
