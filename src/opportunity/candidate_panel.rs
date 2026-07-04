@@ -25,6 +25,8 @@ pub enum CandidateSource {
     VolumeWatchlist,
     VolumeRealTrade,
     IndustryChain,
+    /// P2-News Commit 1: 新闻催化来源 (news_ranker 输出的 A/B 档)
+    NewsCatalyst,
 }
 
 impl CandidateSource {
@@ -35,6 +37,7 @@ impl CandidateSource {
             CandidateSource::VolumeWatchlist => "放量自选",
             CandidateSource::VolumeRealTrade => "放量实盘",
             CandidateSource::IndustryChain => "产业链",
+            CandidateSource::NewsCatalyst => "新闻催化",
         }
     }
 }
