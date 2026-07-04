@@ -65,16 +65,20 @@ pub enum PushKind {
     VolumeRealTrade,
     /// 降级: C4 产业链扫描 (移交候选台)
     IndustryChain,
+    // v11-P0-5++ Commit 5 加: 候选台统一卡片 (5 路 raw 合并 → 1 张排序候选清单)
+    /// 保留: 候选筛选台卡片 (P5 §五 输出形态, 强证据>多源>题材)
+    CandidateBoard,
 }
 
 impl PushKind {
     /// 是否降级 (P0-4 commit D 默认行为, PUSH_VERBOSE=true 时无效)
     pub fn is_deprecated(self) -> bool {
         match self {
-            // 保留 9 条
+            // 保留 10 条 (原 9 + P0-5++ Commit 5 加 CandidateBoard)
             PushKind::HoldingEvent
             | PushKind::DailyReport
-            | PushKind::Announcement => false,
+            | PushKind::Announcement
+            | PushKind::CandidateBoard => false,
             // 降级 17 条 (原 12 + P0-5+ Commit 4 加 5 个候选源)
             PushKind::AuctionVolume
             | PushKind::VirtualWatch
@@ -115,6 +119,7 @@ impl PushKind {
             PushKind::VolumeWatchlist => "放量自选",
             PushKind::VolumeRealTrade => "放量实盘",
             PushKind::IndustryChain => "产业链",
+            PushKind::CandidateBoard => "候选台",
         }
     }
 }

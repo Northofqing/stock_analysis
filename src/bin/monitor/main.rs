@@ -973,6 +973,18 @@ async fn run_review_deep_analysis() {
         push_wechat(&summary).await;
     }
 
+    // v16.2 (P0-5++ Commit 5): 候选筛选台 (5 路 raw 合并去重 + 证据分层 + 硬门槛 + 排序)
+    // 5 路 raw 已在 Commit 4 降级为日志, 这里收集 raw 跑合并 → 推 1 条候选台卡片
+    let candidate_summary = run_candidate_panel_from_review(&by_code, &holdings);
+    if !candidate_summary.is_empty() {
+        log::info!("[复盘] 候选筛选台推送 (v16.2):\n{}", candidate_summary);
+        notify::push_governor(
+            &candidate_summary,
+            notify::PushKind::CandidateBoard,
+        )
+        .await;
+    }
+
     log::info!("[复盘] 持仓多 Agent 深度研判完成");
 }
 
@@ -1975,5 +1987,173 @@ fn snapshot_portfolio_value() {
         Ok(()) => log::info!("[净值快照] 总市值 ¥{:.0} ({}/{} 只) 日盈亏 {:+.0}",
             total_value, counted, positions.len(), daily_pnl),
         Err(e) => log::warn!("[净值快照] 保存失败: {}", e),
+    }
+}
+
+// ============================================================================
+// v11-P0-5++ Commit 5: 候选筛选台 wrapper (P5 §六 验收)
+// ============================================================================
+
+/// 从复盘路径 (LLM 终稿 by_code + 持仓) 收集 5 路 raw, 调 candidate_panel 合并+分档+门槛+排序+渲染
+///
+/// 5 路 raw 来源 (Commit 4 降级, Commit 5 集中推 1 条):
+/// - A10 选股 (本次复盘不直接拿, 留 placeholder)
+/// - B3 优选 (run_post_close_candidates)
+/// - B6 放量·自选 (holding_breakout_text)
+/// - B7 放量·实盘优选 (watch_breakout_text)
+/// - C4 产业链 (scan.chain_text, 本函数不调, 留 P0-5++ commit 6 接入)
+///
+/// **简化**: 本 commit 不解析 LLM 文本 (留 P0-5++ commit 6+), 直接用 by_code (LLM 终稿) 当 raw 喂入.
+/// 实际行为: 每只持仓的 "操作建议" + 板块/产业链 文本 = 1 条候选, source = IndustryChain (兜底).
+///
+/// **P5 红线 (P5 §一)**: 候选筛选不是买入决策, 不合成"买入分".
+fn run_candidate_panel_from_review(
+    by_code: &std::collections::HashMap<String, (String, Option<String>)>,
+    holdings: &[stock_analysis::portfolio::Position],
+) -> String {
+    use stock_analysis::opportunity::candidate_panel::{
+        classify_tier, filter_hard_gates, format_candidate_board, merge_candidates,
+        sort_candidates, CandidateSource,
+    };
+
+    // 收集 5 路 raw (实际只 1 路: by_code LLM 终稿, 4 路留 placeholder 标 IndustryChain)
+    // P5 §三 3.1 红线: 多路信号合并, 这里 1 路来源 (IndustryChain 兜底)
+    let mut raw: Vec<(CandidateSource, String, String)> = Vec::new();
+    for p in holdings {
+        // 优先: LLM 终稿里有 "操作建议" 段 → 当作 1 条候选
+        if let Some((_, Some(_md))) = by_code.get(&p.code) {
+            raw.push((CandidateSource::IndustryChain, p.code.clone(), p.name.clone()));
+        }
+    }
+    // 简化: 实际 P0-5++ 还会接 A10/B3/B6/B7 4 路 raw, 这里先 1 路
+    if raw.is_empty() {
+        return String::new();
+    }
+
+    // 1. 多源合并去重
+    let mut entries = merge_candidates(raw);
+
+    // 2. 证据分层 (P5 §3.2 红线: 唯一 Strong = 布林+MACD)
+    // 简化: 从 LLM 终稿 first_meaningful_line 抽, 命中布林+MACD 关键词才进 Strong
+    for e in &mut entries {
+        if let Some((_, Some(md))) = by_code.get(&e.code) {
+            // first_meaningful_line 简化版 (在本函数里, 不依赖 commit 1 的 helper)
+            let summary = md.lines().find(|l| !l.trim().is_empty() && !l.trim().starts_with('#'))
+                .map(|l| l.chars().take(80).collect::<String>())
+                .unwrap_or_default();
+            e.evidence = vec![summary];
+            e.tier = classify_tier(&e.evidence);
+        }
+    }
+
+    // 3. 硬门槛过滤 (P5 §3.3): 剔除已持仓 / 停牌 / ST / 北交所/科创板 / 已涨停
+    let held_codes: Vec<String> = holdings.iter().map(|p| p.code.clone()).collect();
+    entries = filter_hard_gates(entries, &held_codes);
+
+    // 4. 排序 (P5 §3.3 硬规则: 强证据优先 > 多源 > 题材)
+    entries = sort_candidates(entries);
+
+    // 5. 渲染
+    format_candidate_board(&entries)
+}
+
+#[cfg(test)]
+mod tests_candidate_panel {
+    use super::*;
+    use std::collections::HashMap;
+    use stock_analysis::data_provider::KlineData;
+    use stock_analysis::portfolio::{Position, PositionStatus};
+    use chrono::NaiveDate;
+
+    fn make_position(code: &str, name: &str) -> Position {
+        Position {
+            code: code.to_string(),
+            name: name.to_string(),
+            shares: 1000,
+            cost_price: 10.0,
+            hard_stop: 0.0,
+            added_at: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            status: PositionStatus::Holding,
+            sector: "测试".to_string(),
+        }
+    }
+
+    fn make_md(advice: &str) -> String {
+        format!("# 复盘\n## 【操作建议】{}\n", advice)
+    }
+
+    /// 空 by_code → 候选台不推 (空字符串)
+    #[test]
+    fn wrapper_empty_by_code_returns_empty() {
+        let by_code: HashMap<String, (String, Option<String>)> = HashMap::new();
+        let holdings = vec![make_position("000001", "测试")];
+        let result = run_candidate_panel_from_review(&by_code, &holdings);
+        assert!(result.is_empty(), "空 by_code 应返回空字符串, 不推候选台");
+    }
+
+    /// LLM 终稿有 "强烈卖出" → evidence + tier=Reference (因 keywords 是 "卖出" 不是 "布林+MACD")
+    #[test]
+    fn wrapper_extracts_evidence_from_llm_md() {
+        let mut by_code = HashMap::new();
+        by_code.insert(
+            "000001".to_string(),
+            ("测试".to_string(), Some(make_md("**强烈卖出**"))),
+        );
+        let holdings = vec![make_position("000001", "测试")];
+        let result = run_candidate_panel_from_review(&by_code, &holdings);
+        assert!(result.contains("候选筛选台"), "应输出候选台卡片");
+        assert!(result.contains("000001"), "应包含 code 000001");
+        assert!(result.contains("测试"), "应包含 name 测试");
+    }
+
+    /// LLM 终稿有 "布林+MACD" → tier=Strong (P5 红线: 唯一能进强证据)
+    #[test]
+    fn wrapper_strong_evidence_for_boll_macd() {
+        let mut by_code = HashMap::new();
+        by_code.insert(
+            "000001".to_string(),
+            (
+                "测试".to_string(),
+                Some(make_md("**强烈卖出, 布林+MACD主升浪启动 (B方案, 已验证)**")),
+            ),
+        );
+        let holdings = vec![make_position("000001", "测试")];
+        let result = run_candidate_panel_from_review(&by_code, &holdings);
+        assert!(result.contains("🟢"), "布林+MACD 应进 Strong 档 (🟢)");
+    }
+
+    /// 持仓被 filter_hard_gates 剔除
+    #[test]
+    fn wrapper_filters_out_held_positions() {
+        let mut by_code = HashMap::new();
+        by_code.insert(
+            "000001".to_string(),
+            ("持仓A".to_string(), Some(make_md("**强烈卖出**"))),
+        );
+        by_code.insert(
+            "000002".to_string(),
+            ("候选B".to_string(), Some(make_md("**布林+MACD**"))),
+        );
+        let holdings = vec![
+            make_position("000001", "持仓A"), // 已持仓 → 剔除
+            make_position("000002", "候选B"), // 不在持仓 → 保留
+        ];
+        let result = run_candidate_panel_from_review(&by_code, &holdings);
+        // 候选 B 留下, 持仓 A 剔除
+        assert!(result.contains("000002"));
+        assert!(!result.contains("持仓A"));
+    }
+
+    /// md=None (LLM 失败) → entry 跳过, 候选台不推
+    #[test]
+    fn wrapper_skips_md_none_entries() {
+        let mut by_code = HashMap::new();
+        by_code.insert(
+            "000001".to_string(),
+            ("测试".to_string(), None), // LLM 失败
+        );
+        let holdings = vec![make_position("000001", "测试")];
+        let result = run_candidate_panel_from_review(&by_code, &holdings);
+        assert!(result.is_empty(), "md=None 应跳过 entry, 候选台不推");
     }
 }
