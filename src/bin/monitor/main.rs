@@ -934,33 +934,49 @@ async fn run_review_only_inner() {
         let wbt = watch_breakout_text.clone();
         let ranked_news = tokio::task::spawn_blocking(move || {
             use stock_analysis::opportunity::news_ranker;
-            use stock_analysis::data_provider::DataFetcherManager;
             use stock_analysis::opportunity::candidate_panel::{self as cp, parse_text_to_raw};
             use stock_analysis::opportunity::chain_mapper::{ChainHit, ChainSource};
-            // 复用 candidate_panel 解析逻辑
-            let mut raw: Vec<(cp::CandidateSource, String, String)> = Vec::new();
-            for (source, text) in [
-                (cp::CandidateSource::VolumeWatchlist, Some(hbt.as_str())),
-                (cp::CandidateSource::VolumeRealTrade, Some(wbt.as_str())),
-            ] {
-                if let Some(t) = text {
-                    for (code, name) in parse_text_to_raw(t) {
-                        raw.push((source, code, name));
-                    }
+            // 1. 放量文本路径 (B6 持仓 + B7 自选)
+            let mut hits: Vec<ChainHit> = Vec::new();
+            for (text) in [&hbt, &wbt] {
+                for (code, name) in parse_text_to_raw(text) {
+                    hits.push(ChainHit {
+                        chain: name.clone(),
+                        keywords: vec![code.clone(), name.clone()],
+                        logic: "review-volume".into(),
+                        stocks: vec![],
+                        source: ChainSource::Rule,
+                        board_keyword: name,
+                        fund_flow_pct: None,
+                    });
                 }
             }
-            // 转 ChainHit 喂 shadow_rank_hits
-            let hits: Vec<ChainHit> = raw.into_iter().map(|(_, code, name)| {
-                ChainHit {
-                    chain: name.clone(),
-                    keywords: vec![code.clone(), name.clone()],
-                    logic: "review-path".into(),
-                    stocks: vec![],
-                    source: ChainSource::Rule,
-                    board_keyword: name,
-                    fund_flow_pct: None,
+            // 2. 公告路径 (em_announcement) — 拉今日公告, 走 chain_mapper 召回
+            // 公告是"真新闻", 比放量文本更可能进 A 档
+            if let Ok(anns) = stock_analysis::data_provider::announcement::fetch_announcements(None) {
+                for ann in anns.iter().take(30) {
+                    // 标题含风险关键词 (监管/立案/退市) → 跳过, 走 Drop 路径
+                    if ann.title.contains("立案") || ann.title.contains("退市") || ann.title.contains("ST风险") {
+                        continue;
+                    }
+                    // 公告 → 标记"启动"阶段 (新事件刺激, 让 P2-News A 档条件可达)
+                    // 用 logic 字段编码 HeatStage hint, shadow_rank_hits 解析
+                    let stage_hint = match ann.level {
+                        stock_analysis::data_provider::announcement::AnnLevel::Emergency => "FADE",
+                        stock_analysis::data_provider::announcement::AnnLevel::Important => "FERMENT",
+                        _ => "START",
+                    };
+                    hits.push(ChainHit {
+                        chain: ann.name.clone(),
+                        keywords: vec![ann.title.clone(), format!("__STAGE:{}", stage_hint)],
+                        logic: "review-announcement".into(),
+                        stocks: vec![],
+                        source: ChainSource::Rule,
+                        board_keyword: ann.name.clone(),
+                        fund_flow_pct: None,
+                    });
                 }
-            }).collect();
+            }
             let titles: Vec<String> = hits.iter().map(|h| h.chain.clone()).collect();
             news_ranker::shadow_rank_hits(&hits, &titles)
         })

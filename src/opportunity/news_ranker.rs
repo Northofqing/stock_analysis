@@ -916,7 +916,7 @@ pub fn rank_news(candidate: &NewsCandidate, ctx: &MarketContext) -> RankedNews {
     }
 
     // 3. 阶段判断 (commit 1 detect_heat_stage)
-    let heat_stage = detect_heat_stage(
+    let mut heat_stage = detect_heat_stage(
         candidate.board_code.as_deref(),
         ctx.today_chg,
         ctx.main_inflow,
@@ -924,6 +924,31 @@ pub fn rank_news(candidate: &NewsCandidate, ctx: &MarketContext) -> RankedNews {
         ctx.main_net_pct_5d,
         ctx.limit_up_count,
     );
+    // 阶段 hint 兜底: chain_hits keywords 含 __STAGE:XXX (公告/特殊源标记)
+    // 当 board_code 缺 (heat_stage=Unknown) 时, 用 hint 推断
+    if matches!(heat_stage, HeatStage::Unknown) {
+        for hit in &candidate.chain_hits {
+            for kw in &hit.keywords {
+                if let Some(stage_str) = kw.strip_prefix("__STAGE:") {
+                    let hinted = match stage_str {
+                        "START" => HeatStage::Start,
+                        "FERMENT" => HeatStage::Ferment,
+                        "CLIMAX" => HeatStage::Climax,
+                        "FADE" => HeatStage::Fade,
+                        "DIVERGENCE" => HeatStage::Divergence,
+                        _ => HeatStage::Unknown,
+                    };
+                    if !matches!(hinted, HeatStage::Unknown) {
+                        heat_stage = hinted;
+                        break;
+                    }
+                }
+            }
+            if !matches!(heat_stage, HeatStage::Unknown) {
+                break;
+            }
+        }
+    }
     reasons.push(format!("阶段: {}", heat_stage.label()));
 
     // 4. 热度 + 阶段得分
