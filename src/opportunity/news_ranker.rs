@@ -571,6 +571,68 @@ mod tests {
         assert!(r.bucket != NewsRankBucket::PushNow,
             "高潮阶段不应进 A 档, got {:?}", r.bucket);
     }
+
+    // ============ Commit 3 单测: 影子模式 ============
+
+    /// 23) shadow_rank_hits: env=false → 不 panic, 不输出
+    #[test]
+    fn shadow_disabled_no_op() {
+        std::env::remove_var("NEWS_RANKER_SHADOW");
+        let hits = vec![ChainHit {
+            chain: "测试".into(),
+            keywords: vec!["测试".into()],
+            logic: "test".into(),
+            stocks: vec![],
+            source: ChainSource::Rule,
+            board_keyword: "测试".into(),
+            fund_flow_pct: None,
+        }];
+        // 不应 panic
+        shadow_rank_hits(&hits, &vec!["测试".to_string()]);
+    }
+
+    /// 24) shadow_rank_hits: env=true + 空 hits → 不 panic
+    #[test]
+    fn shadow_enabled_empty_hits() {
+        std::env::set_var("NEWS_RANKER_SHADOW", "true");
+        shadow_rank_hits(&[], &vec![]);
+        std::env::remove_var("NEWS_RANKER_SHADOW");
+    }
+
+    /// 25) shadow_rank_hits: env=true + 真 hits → log 4 档分类
+    #[test]
+    fn shadow_enabled_with_hits() {
+        std::env::set_var("NEWS_RANKER_SHADOW", "true");
+        let hits = vec![
+            // 政策类 → A 或 B
+            ChainHit {
+                chain: "低空经济".into(),
+                keywords: vec!["低空".into()],
+                logic: "test".into(),
+                stocks: vec![],
+                source: ChainSource::Rule,
+                board_keyword: "低空经济".into(),
+                fund_flow_pct: Some(3.0),
+            },
+            // 监管类 → Drop
+            ChainHit {
+                chain: "某股".into(),
+                keywords: vec!["某股".into()],
+                logic: "test".into(),
+                stocks: vec![],
+                source: ChainSource::Rule,
+                board_keyword: "某股".into(),
+                fund_flow_pct: None,
+            },
+        ];
+        let titles = vec![
+            "国务院印发低空经济规划".to_string(),
+            "证监会立案调查某公司".to_string(),
+        ];
+        // 不应 panic
+        shadow_rank_hits(&hits, &titles);
+        std::env::remove_var("NEWS_RANKER_SHADOW");
+    }
 }
 
 // ============ Commit 2 实现: 评分函数 + rank_news 主入口 ============
@@ -872,4 +934,88 @@ fn decide_bucket(
     }
     // C 档 (分数不足)
     (NewsRankBucket::LogOnly, None)
+}
+
+// ============ Commit 3: 影子模式入口 ============
+
+/// 影子模式: 在现有 `gate_hits` 之后跑一遍 ranker, 仅 log 对比, 不接 push_governor
+///
+/// **触发**: `NEWS_RANKER_SHADOW=true` env var
+/// **不触发**: 仅 log 一行 "shadow disabled"
+///
+/// **行为**:
+///   - 每个 ChainHit 构造 NewsCandidate (board_code=None, 一期不查板块)
+///   - 调 rank_news (默认 MarketContext 全部 0)
+///   - log: event_type / heat_stage / score / bucket / drop_reason
+///   - 累计 4 bucket 数量, 1 行汇总
+///
+/// **红线**:
+///   - 不修改 hits (不动旧 dual_score 路径)
+///   - 不接 push_governor
+///   - 失败仅 warn, 不 panic
+pub fn shadow_rank_hits(
+    hits: &[crate::opportunity::chain_mapper::ChainHit],
+    titles: &[String],
+) {
+    let enabled = std::env::var("NEWS_RANKER_SHADOW")
+        .map(|v| v.to_lowercase() == "true")
+        .unwrap_or(false);
+    if !enabled {
+        log::debug!("[NEWS_RANKER] shadow disabled (set NEWS_RANKER_SHADOW=true)");
+        return;
+    }
+    if hits.is_empty() {
+        return;
+    }
+    let ctx = MarketContext::default();
+    let mut a_count = 0;
+    let mut b_count = 0;
+    let mut c_count = 0;
+    let mut drop_count = 0;
+    for (i, hit) in hits.iter().enumerate() {
+        // 找对应 title (titles 跟 hits 不一定 1:1, 用 chain 关键词模糊匹配)
+        let title = titles
+            .iter()
+            .find(|t| hit.keywords.iter().any(|k| t.contains(k)))
+            .cloned()
+            .unwrap_or_else(|| hit.chain.clone());
+        let cand = NewsCandidate {
+            id: format!("shadow-{}-{}", i, hit.chain),
+            title,
+            snippet: String::new(),
+            source: "shadow".to_string(),
+            published_at: Some(Local::now()),
+            chain_hits: vec![hit.clone()],
+            board_code: None, // 一期不查板块, 让 heat_stage 走 Unknown
+        };
+        let ranked = rank_news(&cand, &ctx);
+        match ranked.bucket {
+            NewsRankBucket::PushNow => a_count += 1,
+            NewsRankBucket::WatchCandidate => b_count += 1,
+            NewsRankBucket::LogOnly => c_count += 1,
+            NewsRankBucket::Drop => drop_count += 1,
+        }
+        let drop = ranked
+            .drop_reason
+            .as_deref()
+            .map(|r| format!(" drop={}", r))
+            .unwrap_or_default();
+        log::info!(
+            "[NEWS_RANKER][shadow] chain={} event={} stage={} score={} bucket={:?}{}",
+            hit.chain,
+            ranked.event_type.label(),
+            ranked.heat_stage.label(),
+            ranked.score,
+            ranked.bucket,
+            drop
+        );
+    }
+    log::info!(
+        "[NEWS_RANKER][shadow] 汇总: {} 命中 → A={} B={} C={} Drop={}",
+        hits.len(),
+        a_count,
+        b_count,
+        c_count,
+        drop_count
+    );
 }

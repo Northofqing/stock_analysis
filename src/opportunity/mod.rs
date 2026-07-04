@@ -874,6 +874,11 @@ pub async fn run_opportunity_scan() -> OpportunityScan {
     }).await.unwrap_or_default();
     hits.retain(|h| !h.stocks.is_empty());
     let (hits, dropped) = gate_hits(hits, &flash_titles, &web_results);
+    // P2-News Commit 3: 影子模式跑新 ranker, 仅 log 对比, 不接 push_governor
+    // 不影响旧 dual_score 推送, 不阻断主流
+    if !hits.is_empty() {
+        crate::opportunity::news_ranker::shadow_rank_hits(&hits, &titles);
+    }
     if hits.is_empty() {
         log::warn!(
             "[Opportunity] 采集 {} 条新闻(快讯{}/Web{}) → 候选被置信度门控全部过滤: {}",
