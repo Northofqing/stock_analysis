@@ -2087,7 +2087,6 @@ fn run_candidate_panel_from_review(
 mod tests_candidate_panel {
     use super::*;
     use std::collections::HashMap;
-    use stock_analysis::data_provider::KlineData;
     use stock_analysis::portfolio::{Position, PositionStatus};
     use chrono::NaiveDate;
 

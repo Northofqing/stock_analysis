@@ -666,7 +666,7 @@ pub fn parse_text_to_raw(text: &str) -> Vec<(String, String)> {
                 .trim_start()
                 .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '(' | '（' | '【' | '[' | ',' | '，' | '.' | '。'))
                 .chars()
-                .take_while(|c| !matches!(c, ' ' | '\t' | '+' | '-' | '%' | '|' | '（' | '(' | ')' | '）' | '[' | ']' | '【' | '】' | ',' | '，' | '.' | '。' | '!' | '!' | '?' | '?' | '$'))
+                .take_while(|c| !matches!(c, ' ' | '\t' | '+' | '-' | '%' | '|' | '（' | '(' | ')' | '）' | '[' | ']' | '【' | '】' | ',' | '，' | '.' | '。' | '!' | '?' | '$'))
                 .collect();
             let name = name.trim().to_string();
             if !name.is_empty() && seen.insert(code.to_string()) {
