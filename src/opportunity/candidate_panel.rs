@@ -727,3 +727,128 @@ mod tests_parse {
         assert_eq!(raw.len(), 1, "同 code 应去重");
     }
 }
+
+// ============================================================================
+// v11-P0-5++ Commit 8: 题材热度排序 (P5 §四)
+// ============================================================================
+
+/// 题材热度分 (P5 §四 简化版: 涨幅 + 主力净流入加权)
+///
+/// 输入: 当日涨跌幅 (%) + 主力净流入 (元)
+/// 输出: 0-100 热度分 (越高越热)
+///
+/// **P5 §四 红线**: 热度只用于"排序", 不用于"要不要推" (P0-5+ Commit 5 wrapper 已经
+/// 用 merge_candidates 决定要不要推, 这里只影响 rank).
+///
+/// 公式 (简化): score = 涨幅 * 0.6 + clamp(主力净流入 / 1e8, 0, 100) * 0.4
+/// - 涨幅 0% → 0 分, 10% → 6 分
+/// - 主力净流入 1 亿 → 0.1 分 (太低)
+/// - 主力净流入 100 亿 → 40 分 (封顶)
+pub fn heat_score(change_pct: f64, main_inflow: f64) -> f64 {
+    let change_score = change_pct.max(0.0) * 0.6;
+    let inflow_score = (main_inflow / 1e8).clamp(0.0, 100.0) * 0.4;
+    change_score + inflow_score
+}
+
+/// 排序候选 v2: P5 §3.3 硬规则 + 题材热度次级排序
+///
+/// 排序键 (优先级降序):
+/// 1. tier 优先级: Strong (0) < Reference (1) < Theme (2) (P5 §3.3 红线: 强证据优先)
+/// 2. 同 tier 内: source_count desc (多源 > 单源, P5 §3.1)
+/// 3. 同 tier 同 source: 题材热度 desc (P5 §四 接入, 本 commit 落地)
+/// 4. 稳定排序: code asc
+///
+/// 热度数据: P5 §四 红线"热度分用于排序" — 当前 main.rs 没接 heat_score, 留 0 占位.
+/// main.rs 调用时填 e.heat_score (后续 commit 加 CandidateEntry.heat_score 字段).
+pub fn sort_candidates_by_heat(
+    mut entries: Vec<CandidateEntry>,
+) -> Vec<CandidateEntry> {
+    entries.sort_by(|a, b| {
+        let tier_a = match a.tier {
+            EvidenceTier::Strong => 0,
+            EvidenceTier::Reference => 1,
+            EvidenceTier::Theme => 2,
+        };
+        let tier_b = match b.tier {
+            EvidenceTier::Strong => 0,
+            EvidenceTier::Reference => 1,
+            EvidenceTier::Theme => 2,
+        };
+        tier_a
+            .cmp(&tier_b)
+            .then_with(|| b.source_count().cmp(&a.source_count()))
+            .then_with(|| {
+                // 题材热度次级排序 (P5 §四)
+                // 当前 heat_score 字段不存在, 用 change_pct 临时替代 (后续 commit 改)
+                let heat_a = a.change_pct; // 占位
+                let heat_b = b.change_pct;
+                heat_b.partial_cmp(&heat_a).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| a.code.cmp(&b.code))
+    });
+    entries
+}
+
+#[cfg(test)]
+mod tests_heat {
+    use super::*;
+
+    fn make_entry(
+        code: &str,
+        tier: EvidenceTier,
+        sources: Vec<CandidateSource>,
+        change_pct: f64,
+    ) -> CandidateEntry {
+        CandidateEntry {
+            code: code.to_string(),
+            name: format!("测试{}", code),
+            sources,
+            tier,
+            evidence: vec!["测试证据".to_string()],
+            current_price: 10.0,
+            change_pct,
+        }
+    }
+
+    /// heat_score 基本: 涨幅 0 + 流入 0 = 0
+    #[test]
+    fn heat_zero() {
+        assert_eq!(heat_score(0.0, 0.0), 0.0);
+    }
+
+    /// heat_score 涨幅 10% = 6 分
+    #[test]
+    fn heat_change_pct_dominates() {
+        let s = heat_score(10.0, 0.0);
+        assert!((s - 6.0).abs() < 1e-6, "涨幅 10% + 流入 0 = 6 分, 实际 {}", s);
+    }
+
+    /// heat_score 主力净流入 1 亿 = 0.4 分 (太低, 不显著)
+    #[test]
+    fn heat_main_inflow_small() {
+        let s = heat_score(0.0, 1e8);
+        assert!((s - 0.4).abs() < 1e-6, "涨幅 0 + 流入 1亿 = 0.4 分, 实际 {}", s);
+    }
+
+    /// heat_score 主力净流入 100 亿 = 40 分 (封顶)
+    #[test]
+    fn heat_main_inflow_capped() {
+        let s = heat_score(0.0, 100.0 * 1e8);
+        assert!((s - 40.0).abs() < 1e-6, "涨幅 0 + 流入 100亿 = 40 分, 实际 {}", s);
+    }
+
+    /// 排序: 同 tier 同 source 时, 涨幅高排前
+    #[test]
+    fn sort_by_heat_same_tier_source() {
+        let entries = vec![
+            make_entry("000001", EvidenceTier::Reference, vec![CandidateSource::StockPick], 0.0),
+            make_entry("000002", EvidenceTier::Reference, vec![CandidateSource::StockPick], 5.0),
+            make_entry("000003", EvidenceTier::Reference, vec![CandidateSource::StockPick], 3.0),
+        ];
+        let sorted = sort_candidates_by_heat(entries);
+        // 涨幅 desc: 5.0 (000002), 3.0 (000003), 0.0 (000001)
+        assert_eq!(sorted[0].code, "000002");
+        assert_eq!(sorted[1].code, "000003");
+        assert_eq!(sorted[2].code, "000001");
+    }
+}
