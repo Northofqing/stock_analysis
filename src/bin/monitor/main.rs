@@ -568,6 +568,12 @@ async fn run_test_scan() {
         log::info!("[测试] 新闻Ranker:\n{}", scan.news_ranked_text);
         notify::push_governor(&scan.news_ranked_text, notify::PushKind::NewsRanked).await;
     }
+    // P2-News Commit 5: 审计 JSONL 落盘 (NEWS_RANK_AUDIT=true 触发, 默认不写)
+    // 收集 ranked 列表 (再跑一遍 ranker 太重, 实际生产链路口待 commit 6 改造)
+    // 一期: 影子模式 (NEWS_RANKER_SHADOW) 触发时也写审计
+    if std::env::var("NEWS_RANKER_SHADOW").ok().as_deref() == Some("true") {
+        let _ = stock_analysis::opportunity::news_audit::write_audit_jsonl(&[]); // 占位, 实际接 ranked
+    }
 
     // 14. v4 决策层：排除引擎 + 风控（含 HTTP 调用，走 spawn_blocking）
     let h = holdings.clone();

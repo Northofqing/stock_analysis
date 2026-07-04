@@ -14,6 +14,7 @@ pub mod scheduler;  // 修复 v9.1 §1.3: 调度器
 pub mod hit_case;  // v10 P0.1 BC-3: 5 边界 hit CASE 逻辑
 pub mod candidate_panel;  // v11-P0-5+ Commit A: 候选筛选台模型 + 多源合并去重
 pub mod news_ranker;  // P2-News Commit 1: 新闻事件排序层 (EventType/HeatStage/Bucket/RankedNews)
+pub mod news_audit;   // P2-News Commit 5: 审计 JSONL 落盘
 pub mod virtual_reason;  // v10 P0.2 BR-016: VirtualReason 枚举 + 主理由优先级
 pub mod auction_agent;  // v10 P0.2: 09:25 竞价 Agent
 pub mod real_alpha;  // v10 P0.3 BC-1: real_alpha + A/B/C 置信度 + 5 要素信封
