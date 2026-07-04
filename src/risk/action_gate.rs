@@ -23,6 +23,8 @@ pub enum ActionKind {
     Reduce,
     /// 清仓
     Clear,
+    /// 持有观望 (PR4-4.2 live_plan 加)
+    Hold,
     /// 正T (先卖后买, 等于加仓)
     T0Positive,
     /// 反T (先买后卖, 等于减仓)
@@ -37,17 +39,19 @@ impl ActionKind {
             ActionKind::Add => "加仓",
             ActionKind::Reduce => "减仓",
             ActionKind::Clear => "清仓",
+            ActionKind::Hold => "持有观望",
             ActionKind::T0Positive => "正T",
             ActionKind::T0Reverse => "反T",
         }
     }
 
-    /// 全部 6 变体 (单测遍历用)
-    pub const ALL: [ActionKind; 6] = [
+    /// 全部 7 变体 (单测遍历用)
+    pub const ALL: [ActionKind; 7] = [
         ActionKind::OpenNew,
         ActionKind::Add,
         ActionKind::Reduce,
         ActionKind::Clear,
+        ActionKind::Hold,
         ActionKind::T0Positive,
         ActionKind::T0Reverse,
     ];
@@ -121,7 +125,7 @@ pub fn authorize(action: ActionKind, mode: AccountMode) -> GateResult {
     match (action, mode) {
         // ============ Normal: 全 Allow ============
         (OpenNew, Normal) | (Add, Normal) | (Reduce, Normal) | (Clear, Normal)
-        | (T0Positive, Normal) | (T0Reverse, Normal) => GateResult::Allow,
+        | (Hold, Normal) | (T0Positive, Normal) | (T0Reverse, Normal) => GateResult::Allow,
 
         // ============ ReduceOnly ============
         (OpenNew, ReduceOnly) => GateResult::Deny("账户降级 ReduceOnly, 禁止开新仓"),
@@ -129,6 +133,7 @@ pub fn authorize(action: ActionKind, mode: AccountMode) -> GateResult {
         (T0Positive, ReduceOnly) => GateResult::Deny("账户降级 ReduceOnly, 只允许减仓, 不允许做T加仓"),
         (Reduce, ReduceOnly) => GateResult::Allow,
         (Clear, ReduceOnly) => GateResult::Allow,
+        (Hold, ReduceOnly) => GateResult::Allow, // 持有观望永远允许
         (T0Reverse, ReduceOnly) => GateResult::Allow, // 反T接回底仓允许 (v12.2 §2.3 显式)
 
         // ============ Frozen: 全 Deny (含反T) ============
@@ -136,11 +141,11 @@ pub fn authorize(action: ActionKind, mode: AccountMode) -> GateResult {
     }
 }
 
-/// 便捷: 批量检查一个 mode 下所有 6 个 action
+/// 便捷: 批量检查一个 mode 下所有 7 个 action (PR4-4.2 加 Hold)
 ///
-/// 供监控/审计/单测一次性确认 6 格结果.
-pub fn authorize_all(mode: AccountMode) -> [(ActionKind, GateResult); 6] {
-    let mut out = [(ActionKind::OpenNew, GateResult::Allow); 6];
+/// 供监控/审计/单测一次性确认 7 格结果.
+pub fn authorize_all(mode: AccountMode) -> [(ActionKind, GateResult); 7] {
+    let mut out = [(ActionKind::OpenNew, GateResult::Allow); 7];
     for (i, a) in ActionKind::ALL.iter().enumerate() {
         out[i] = (*a, authorize(*a, mode));
     }
@@ -245,11 +250,11 @@ mod tests {
         assert_eq!(deny.blocked_reason(), Some("test reason"));
     }
 
-    /// authorize_all 6 格齐全
+    /// authorize_all 7 格齐全 (PR4-4.2 加 Hold)
     #[test]
-    fn authorize_all_returns_6() {
+    fn authorize_all_returns_7() {
         let result = authorize_all(AccountMode::Normal);
-        assert_eq!(result.len(), 6);
+        assert_eq!(result.len(), 7);
         for (a, r) in result.iter() {
             assert!(r.is_allow(), "Normal 下 {:?} 应 Allow", a);
         }
@@ -278,14 +283,14 @@ mod tests {
         assert_eq!(AccountMode::Frozen.label(), "Frozen");
     }
 
-    /// ActionKind::ALL 6 个且无重复
+    /// ActionKind::ALL 7 个且无重复 (PR4-4.2 加 Hold)
     #[test]
     fn action_kind_all_unique() {
         let mut seen = std::collections::HashSet::new();
         for a in ActionKind::ALL.iter() {
             assert!(seen.insert(a), "{:?} 重复", a);
         }
-        assert_eq!(ActionKind::ALL.len(), 6);
+        assert_eq!(ActionKind::ALL.len(), 7);
     }
 
     /// AccountMode::ALL 3 个且无重复

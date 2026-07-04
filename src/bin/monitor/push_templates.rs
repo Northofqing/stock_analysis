@@ -1105,8 +1105,51 @@ fn prev_mode_to_tmpl(m: stock_analysis::risk::action_gate::AccountMode) -> Accou
 }
 
 // ============================================================================
-// PR2-2.2 orchestrator: 数据模式变更 → T-02 推送
+// PR4-4.3 orchestrator: T-03 持仓建议 + T-04 紧急风险推送
 // ============================================================================
+
+/// PR4-4.3 T-03 持仓建议推送 (普通建议, ⚡ 30min 冷却).
+///
+/// 治理已由 `dispatch()` 内部完成:
+///   - §14.3.4 mode/dm 停发 (T-03 在 Frozen/Unsafe 停发)
+///   - §14.3.1 冷却 30min/票
+///   - §14.3.3 日预算 30 条
+///   - §14.3.2 紧急类 (T-04 HoldingEvent) 跳过冷却 + 预算
+///
+/// `account_mode`/`data_mode` 用于横幅上下文 (Frozen/Unsafe 时 dispatch 内部会停发).
+pub async fn push_holding_plan_recommendation(
+    code: &str,
+    banner: Option<&BannerCtx>,
+    params: HoldingPlanParams<'_>,
+) -> bool {
+    let text = render_holding_plan(banner.unwrap_or(&BannerCtx::default()), params);
+    dispatch(
+        super::notify::PushKind::HoldingPlan,
+        code,
+        banner,
+        text,
+    )
+    .await
+}
+
+/// PR4-4.3 T-04 持仓紧急风险推送 (🚨紧急, 无视冷却).
+///
+/// 用于: 跌破硬止损/触发三级止损/板块跳水.
+/// 自动 PushLevel::Emergency → dispatch 跳过冷却和日预算.
+pub async fn push_holding_emergency(
+    code: &str,
+    banner: Option<&BannerCtx>,
+    params: HoldingEventParams<'_>,
+) -> bool {
+    let text = render_holding_event(banner.unwrap_or(&BannerCtx::default()), params);
+    dispatch(
+        super::notify::PushKind::HoldingEvent,
+        code,
+        banner,
+        text,
+    )
+    .await
+}
 
 /// v12 PR2-2.2: 数据模式变更编排器.
 ///

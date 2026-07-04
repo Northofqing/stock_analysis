@@ -4,6 +4,8 @@
 
 pub mod exclusion;
 pub mod pre_trade_filter;  // v12 PR2-2.3
+pub mod holding_plan;  // v12 PR4-4.1
+pub mod live_plan;  // v12 PR4-4.2
 pub mod sector_score;
 pub mod capital_verify;
 pub mod rotation;
