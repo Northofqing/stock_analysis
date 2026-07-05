@@ -922,6 +922,102 @@ async fn run_test_scan() {
     }
     }
 
+    // ===== 16.6 v12 盘后 R-01/R-02/R-08 真推 (复用 --review 块) =====
+    let today_str_t = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let r_data = tokio::task::spawn_blocking(move || {
+        let r2 = stock_analysis::portfolio::get_positions().unwrap_or_default();
+        let r2_quotes = market_data::fetch_position_quotes();
+        let r2_prices: std::collections::HashMap<String, f64> =
+            r2_quotes.iter().map(|q| (q.code.clone(), q.price)).collect();
+        let r2_equity = stock_analysis::portfolio::get_equity_curve(30).unwrap_or_default();
+        let r2_ledger = r2_equity.last().cloned();
+        let r2_mv = r2_ledger.as_ref().map(|e| e.market_value).unwrap_or(0.0);
+        let anns = stock_analysis::data_provider::announcement::fetch_announcements(None)
+            .unwrap_or_default();
+        let ann_summary = if anns.is_empty() {
+            "今日无重大公告 (data_source 缺失)".to_string()
+        } else {
+            let mut s = format!("今日共 {} 条公告 (TOP 3):\n", anns.len());
+            for a in anns.iter().take(3) {
+                s.push_str(&format!("· {} ({:?}): {}\n", a.code, a.level, a.title));
+            }
+            s
+        };
+        // R-01 文本
+        let r01 = {
+            let mut items: Vec<pt::HoldingDailyPlan> = Vec::new();
+            for p in r2.iter().take(5) {
+                let cur = r2_prices.get(&p.code).copied().unwrap_or(p.cost_price);
+                let pnl = if p.cost_price > 0.0 { ((cur / p.cost_price - 1.0) * 100.0) } else { 0.0 };
+                let plan_high = if pnl > 5.0 { "减仓1/3" } else { "减仓1/2" };
+                let t0 = if pnl > 5.0 { "适合观察" } else { "不适合(主升核心)" };
+                let stop = p.cost_price * 0.92;
+                items.push(pt::HoldingDailyPlan {
+                    name: p.name.as_str(), code: p.code.as_str(),
+                    price: cur, cost: p.cost_price, pnl_pct: pnl,
+                    high_gap_x: 2.0, plan_high, plan_flat: "持有观望", stop, t0,
+                });
+            }
+            if items.is_empty() {
+                items.push(pt::HoldingDailyPlan {
+                    name: "示例", code: "000001",
+                    price: 12.30, cost: 11.80, pnl_pct: 4.2,
+                    high_gap_x: 2.0, plan_high: "减仓1/3", plan_flat: "持有", stop: 11.95,
+                    t0: "适合观察",
+                });
+            }
+            pt::render_daily_report(&today_str_t, &items)
+        };
+        // R-02 文本
+        let r02 = {
+            use stock_analysis::market_analyzer::market_stage_confidence::{
+                evaluate as ms_evaluate, MarketStageEvidence, CapitalMetrics, TechnicalMetrics, SentimentMetrics,
+            };
+            let mut ev = MarketStageEvidence::default();
+            ev.technical = Some(TechnicalMetrics { sh_chg: 0.5, chinext_chg: 0.5, star_chg: 0.0 });
+            ev.capital = Some(CapitalMetrics { main_flow_yi: 50.0, amount_yi: r2_mv, amount_delta_pct: 5.0 });
+            ev.sentiment = Some(SentimentMetrics { limit_up_n: 30, limit_down_n: 5, broken_pct: 15.0, consecutive_h: 4 });
+            let conf = ms_evaluate(&ev);
+            let r = pt::MarketReview {
+                sh_chg: 0.5, chinext_chg: 0.5, star_chg: 0.0,
+                limit_up_n: 30, limit_down_n: 5, broken_pct: 15.0, consecutive_h: 4,
+                amount_yi: r2_mv, amount_delta_pct: 5.0, amount_dir: "放量",
+                main_flow_yi: 50.0, money_effect: "中等",
+                heat_stage: conf.heat_stage.as_str(), heat_conf_pct: conf.conf_pct,
+                low_conf: conf.degraded, low_conf_tier: None,
+                account_mode: pt::AccountMode::Normal, max_pos: 7,
+            };
+            pt::render_review_market(&today_str_t, &r)
+        };
+        // R-08 文本
+        let r08 = {
+            let mut events: Vec<(String, String)> = Vec::new();
+            for p in r2.iter().take(3) {
+                let p_anns: Vec<_> = anns.iter().filter(|a| a.code == p.code).take(2).collect();
+                let kind = if !p_anns.is_empty() {
+                    p_anns[0].title.chars().take(20).collect::<String>()
+                } else {
+                    let cur = r2_prices.get(&p.code).copied().unwrap_or(p.cost_price);
+                    let pnl = if p.cost_price > 0.0 { ((cur / p.cost_price - 1.0) * 100.0) } else { 0.0 };
+                    format!("持有 {} (浮盈{:.1}%)", p.code, pnl)
+                };
+                events.push((p.name.clone(), kind));
+            }
+            let events_ref: Vec<pt::HoldingEventItem> = events.iter()
+                .map(|(n, k)| pt::HoldingEventItem { name: n.as_str(), kind: k.as_str() })
+                .collect();
+            pt::render_event_calendar(&today_str_t, &events_ref, &ann_summary, "+0.8%", "7.18")
+        };
+        (r01, r02, r08)
+    }).await.unwrap_or_default();
+
+    if let (r01, r02, r08) = r_data {
+        notify::push_governor(&r01, notify::PushKind::DailyReport).await;
+        notify::push_governor(&r02, notify::PushKind::ReviewMarket).await;
+        notify::push_governor(&r08, notify::PushKind::EventCalendar).await;
+        log::info!("[v12-MVP0-B] --test R-01/R-02/R-08 真推完成");
+    }
+
     // 17. v4 周度 SOP
     if stock_analysis::review::sop::is_friday() {
         let sop_text = stock_analysis::review::sop::weekly_sop(
