@@ -1027,6 +1027,83 @@ async fn run_test_scan() {
         notify::push_governor(&sop_text, notify::PushKind::WeeklySOP).await;
     }
 
+    // v19.4: --test 跑全模板 (用户选 B: 跟 --review 一样)
+    // A股市场概览 + 情绪判断 + NewsRanker + P3 outcome
+    log::info!("[测试] v19.4 全模板模式: 概览 + NewsRanker + P3");
+
+    // 1. A股市场概览 + 情绪判断 (v19.1)
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let txt = stock_analysis::market_analyzer::async_overview::generate_market_overview_text_blocking();
+        let _ = tx.send(txt);
+    });
+    let overview_txt = tokio::task::block_in_place(|| rx.recv().unwrap_or_default());
+    if !overview_txt.is_empty() {
+        log::info!("[测试] A股市场概览:\n{}", overview_txt);
+        push_wechat(&overview_txt).await;
+    }
+
+    // 2. NewsRanker (默认 true) — 拉公告 + 评分
+    let ranked_news = tokio::task::spawn_blocking(|| {
+        use stock_analysis::opportunity::news_ranker;
+        use stock_analysis::opportunity::chain_mapper::{ChainHit, ChainSource};
+        let mut hits: Vec<ChainHit> = Vec::new();
+        if let Ok(anns) = stock_analysis::data_provider::announcement::fetch_announcements(None) {
+            for ann in anns.iter().take(30) {
+                if ann.title.contains("立案") || ann.title.contains("退市") || ann.title.contains("ST风险") {
+                    continue;
+                }
+                let stage_hint = match ann.level {
+                    stock_analysis::data_provider::announcement::AnnLevel::Emergency => "FADE",
+                    stock_analysis::data_provider::announcement::AnnLevel::Important => "FERMENT",
+                    _ => "START",
+                };
+                hits.push(ChainHit {
+                    chain: ann.name.clone(),
+                    keywords: vec![ann.title.clone(), format!("__STAGE:{}", stage_hint)],
+                    logic: "test-announcement".into(),
+                    stocks: vec![],
+                    source: ChainSource::Rule,
+                    board_keyword: ann.name.clone(),
+                    fund_flow_pct: None,
+                });
+            }
+        }
+        let titles: Vec<String> = hits.iter().map(|h| h.chain.clone()).collect();
+        news_ranker::shadow_rank_hits(&hits, &titles)
+    })
+    .await
+    .unwrap_or_default();
+    if !ranked_news.is_empty() {
+        let board = stock_analysis::opportunity::news_ranker::format_news_ranked_board(&ranked_news);
+        log::info!("[测试] 新闻Ranker (v19.4, {} 命中):\n{}", ranked_news.len(), board);
+        notify::push_governor(&board, notify::PushKind::NewsRanked).await;
+    } else {
+        log::info!("[测试] NewsRanker 0 命中, 跳过推送");
+    }
+
+    // 3. P3 outcome (默认 true, --test 也跑)
+    let report = tokio::task::spawn_blocking(|| {
+        let outcomes = stock_analysis::opportunity::news_outcome::run_today_outcome();
+        stock_analysis::opportunity::news_outcome::format_outcome_report(&outcomes)
+    })
+    .await
+    .unwrap_or_default();
+    if !report.is_empty() {
+        log::info!("[测试 P3] NewsOutcome 报告:\n{}", report);
+        let prev_db = std::env::var("DATABASE_PATH").unwrap_or_else(|_| "./data/stock_analysis.db".into());
+        let dir = std::path::PathBuf::from(&prev_db)
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("./data"));
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let path = dir.join(format!("news_outcome_{}.md", today));
+        let _ = std::fs::write(&path, &report);
+        log::info!("[测试 P3] 落盘: {}", path.display());
+    } else {
+        log::info!("[测试 P3] 今日 audit 为空, 跳过");
+    }
+
     log::info!("[测试] ======== 全链路连通性检查完成 ========");
 }
 
