@@ -3,124 +3,157 @@
 # SIGHUP 热加载, 缺 toml 时 Rust const fallback 生效
 # 整合自原 risk.toml + monitor.toml + opportunity.toml (3 文件 → 1)
 # 加载入口: src/config.rs::load_all() 读此文件 + chain.toml
+#
+# 字段值单位/范围约定:
+#   - 时间字段: 秒 (sec) / 分钟 (min) / 小时 (hours) / 24h "HH:MM"
+#   - 比例字段: 0~1 (0.10 = 10%) 或 -1~0 表示负向
+#   - 整数: 笔 / 只 / 条 / 张 / 个
+#   - 价格: 元 (¥)
 # =====================================================================
 
-# ── 数据新鲜度阈值 (AGENTS 2.4, 原 monitor.toml) ──
-dq_quote_stale_sec = 6         # 实时行情
-dq_position_stale_sec = 30     # 持仓/资金
-dq_nav_stale_sec = 86400       # 净值 (当日有效)
-dq_daily_stale_sec = 86400     # 日线/历史数据 (1 交易日内)
-opportunity_min_confidence = 45
-opportunity_require_cross_source = false
+# ── 数据新鲜度阈值 (AGENTS 2.4) ──
+# 数据陈旧时间超过阈值 → 视为缺失 (AGENTS.md 2.2: 缺失数据禁止静默填充)
+# 影响: 触发器 (T-01) 决策依据, 缺失时降级到 Hold 模式
+dq_quote_stale_sec = 6         # 实时行情 (秒): tick 数据, 默认 6s 过期 (含网络延迟)
+dq_position_stale_sec = 30     # 持仓/资金 (秒): 30s 容忍
+dq_nav_stale_sec = 86400       # 净值 (秒): 1 个交易日, 86400 = 24h
+dq_daily_stale_sec = 86400     # 日线/历史数据 (秒): 1 个交易日
+opportunity_min_confidence = 45  # 候选最低置信度阈值 (0-100), 低于不入候选
+opportunity_require_cross_source = false  # true=必须快讯+Web双源共振, 降低单源假信号
+                                      # 沙盘/灰度阶段推荐 false, 实盘阶段改 true
 
-# ── 监控定时器 (原 monitor.toml) ──
-screener_interval_min = 5
-opportunity_scan_interval_min = 10
-news_window_start_hour = 0
-news_window_end_hour = 24
+# ── 监控定时器 ──
+# 调度间隔, 影响 monitor_loop 主动轮询频率
+screener_interval_min = 5       # 扫描器轮询间隔 (分钟): 5min = K 线节奏
+opportunity_scan_interval_min = 10  # 机会发现扫描间隔 (分钟)
+news_window_start_hour = 0      # 主题新闻推送窗口起始 (24h 时, 0 = 0:00)
+news_window_end_hour = 24      # 主题新闻推送窗口结束 (24 = 24:00, 即不限制)
 
-# ── 主题新闻去同质化 (原 monitor.toml) ──
-topic_search_intent_count = 6
-topic_search_timeout_sec = 10
-topic_mmr_relevance_weight = 0.72
-topic_mmr_diversity_penalty = 2.2
-topic_mmr_history_penalty = 1.4
-topic_history_window_hours = 72
-topic_history_memory_size = 160
-topic_history_db_limit = 400
-topic_news_max_age_days = 3
+# ── 主题新闻去同质化 (search_topic 算法) ──
+# 用 MMR (Maximal Marginal Relevance) 算法平衡相关性与多样性
+topic_search_intent_count = 6  # 主题搜索意图数 (1 个 query 拆 N 个子意图), 增加覆盖面
+topic_search_timeout_sec = 10  # 搜索超时 (秒), 超过走降级路径
+topic_mmr_relevance_weight = 0.72  # MMR 相关性权重 (0~1): 越高越偏相关
+topic_mmr_diversity_penalty = 2.2  # MMR 多样性惩罚 (≥0): 越高越去重
+topic_mmr_history_penalty = 1.4  # MMR 历史惩罚 (≥0): 已推过的主题降权
+topic_history_window_hours = 72  # 历史查重窗口 (小时): 3 天内推过的不重推
+topic_history_memory_size = 160  # 内存 LRU 大小 (条), 超过淘汰最旧
+topic_history_db_limit = 400  # DB 持久化上限 (条)
+topic_news_max_age_days = 3   # 新闻新鲜度窗口 (天), 超过即丢弃
 
-# ── 实时否决链 (VetoChain, 原 monitor.toml) ──
+# ── 实时否决链 (VetoChain, 监控盘中止损/反模式拦截) ──
+# 上线首周建议 dry_run 观察拦截率, 再切 live.
+# 缺省 toml 时 const fallback: enabled=true, mode="live", 4 个开关均启用
 [live_veto]
-enabled = true
-mode = "live"
-bias_rate_enabled = true
-bearish_alignment_enabled = true
-main_flow_enabled = true
-fundamental_enabled = true
+enabled = true              # 总开关: false 时跳过整个否决链
+mode = "live"               # "dry_run" | "live": dry_run 仅记日志不拦截; live 真拦截
+bias_rate_enabled = true    # 乖离率 (价格远离均线) 拦截: 防止追高
+bearish_alignment_enabled = true  # 空头排列 (MA5 < MA10 < MA20) 拦截: 防止接飞刀
+main_flow_enabled = true    # 主力资金净流出 拦截: 防止跟主力出货
+fundamental_enabled = true  # 基本面恶化 (PE 异常/营收下滑) 拦截
 
-# ── 动态仓位 (原 monitor.toml) ──
+# ── 动态仓位 (PositionSizer 算法开关) ──
+# true = 用 market_regime 调整仓位 (牛市满仓/熊市减仓)
+# false = 固定仓位算法 (回退到旧逻辑, 仅做兼容)
 [position_sizing]
-use_dynamic = true
+use_dynamic = true           # true 启用动态仓位, false 回退固定仓位
 
-# ── 因子 IC 反馈 (原 monitor.toml) ──
+# ── 因子 IC 反馈 (排序评分, 不改买入触发) ──
+# 默认关闭, 等复盘建议稳定后启用
 [factor_feedback]
-enabled = false
-technical_action = "normal"
-quality_action = "normal"
-valuation_action = "normal"
-flow_action = "normal"
-growth_action = "normal"
-down_weight_scale = 0.5
+enabled = false              # 总开关
+technical_action = "normal"  # 技术面: normal | disable | invert | down_weight
+quality_action = "normal"    # 质量面
+valuation_action = "normal"  # 估值面
+flow_action = "normal"       # 资金面
+growth_action = "normal"     # 成长面
+down_weight_scale = 0.5      # down_weight 时乘数 (0~1): 0.5 = 减半权重
 
-# ── 空中加油 (原 monitor.toml) ──
+# ── 空中加油 (次日复盘买入模拟) ──
+# 盘后扫描候选, 次日复盘时按模式触发模拟买入, 统计胜率
 [air_refuel]
-entry_mode = "confirm"
-confirm_lots = 10
-pilot_lots = 3
-next_day_review_enabled = true
+entry_mode = "confirm"      # "confirm" (次日确认) | "pilot" (尾盘潜伏)
+confirm_lots = 10            # confirm 模式: 每只虚拟记录手数 (10 手 = 1000 股)
+pilot_lots = 3              # pilot 模式: 每只虚拟记录手数 (3 手 = 300 股)
+next_day_review_enabled = true  # 复盘时统计上一交易日虚拟观察仓表现
 
-# ── v9 机会发现调度 (原 opportunity.toml) ──
+# ── v9 机会发现调度 ──
+# batch 模式: 盘前/盘后整批跑; incremental: 盘中增量跑
+# 缺省 toml 时 const fallback 保持原 v9 行为
 [schedule]
-batch_morning_time = "09:00"
-batch_evening_time = "15:30"
-incremental_interval_min = 5
-batch_max_age_hours = 24
-incremental_max_age_min = 20
+batch_morning_time = "09:00"  # 盘前 batch 触发时刻 (24h "HH:MM"): A 股开盘前
+batch_evening_time = "15:30"  # 盘后 batch 触发时刻: A 股收盘后 30min
+incremental_interval_min = 5   # 盘中 incremental 间隔 (分钟): 与 5min K 线同步
+batch_max_age_hours = 24       # 盘前 batch 数据新鲜度窗口 (小时): 1 个交易日
+incremental_max_age_min = 20   # 盘中 incremental 数据新鲜度 (分钟): 快讯新鲜度
 
-# ── v9 推送阈值 (原 opportunity.toml) ──
+# ── v9 推送阈值 (NS3 §4 防 0 信号) ──
+# event_risk_score ≥ threshold 才推; BR-014: clamp_max < threshold
+# 灰度/沙盘阶段推荐 threshold=60; 实盘阶段应改回 75 (符合 NS3)
 [push]
-event_risk_score_threshold = 60
-require_cross_source = false
-min_total_hits = 1
+event_risk_score_threshold = 60  # 最低推送分数 (0-100), 低于入候选池不主动推
+require_cross_source = false    # true = 必须快讯+Web 双源共振, 降低单源假信号
+min_total_hits = 1              # 至少 fast_hits + web_hits 总和 (NS3 防 0 信号)
 
-# ── A 股交易费率 (原 risk.toml) ──
+# ── A 股交易费率 (2024 监管标准) ──
+# 缺省 const fallback: 0.0003 / 0.001 / 0.001 / 5.0 / 100
+# 影响: paper_trade + actual trade 的成本计算 (P&L 准确性)
 [trading]
-commission_rate = 0.0003
-stamp_tax_rate  = 0.001
-slippage_rate   = 0.001
-min_commission  = 5.0
-lot_size        = 100
+commission_rate = 0.0003  # 佣金率 (万三, 0.03%): 含规费
+stamp_tax_rate  = 0.001   # 印花税率 (千一, 0.1%): 仅卖出时收取
+slippage_rate   = 0.001   # 滑点率 (千一, 0.1%): 固定默认, 启用 dynamic_slippage 后用 sqrt-rule
+min_commission  = 5.0      # 最低佣金 (元): A 股单笔最低 5 元
+lot_size        = 100     # 1 手 = 100 股 (A 股固定)
 
-# ── 动态滑点 (原 risk.toml) ──
+# ── 动态滑点 (修复 P1.4 / P3.M1) ──
+# 缺省 const fallback: dynamic_enabled=false
+# 启用条件: 大额订单或低流动性股票
 [slippage]
-dynamic_enabled = false
-alpha = 0.1
-adv_days = 20
+dynamic_enabled = false  # true 启用 sqrt-rule 滑点: slippage = alpha * sqrt(订单/ADV)
+alpha = 0.1              # sqrt-rule 系数 (0.1~0.5): 0.1 保守, 0.5 激进
+adv_days = 20            # ADV (日均成交量) 计算窗口 (天)
 
-# ── Sharpe / Sortino (原 risk.toml) ──
+# ── Sharpe / Sortino ──
+# 缺省 const fallback: 0.03 / 252 / 60 / 30
 [performance]
-risk_free_rate = 0.03
-trading_days_year = 252
-sharpe_window = 60
-sortino_min_period = 30
+risk_free_rate = 0.03   # 无风险利率 (10Y 国债 2026 水平): 年化
+trading_days_year = 252 # 年交易日数: A 股 2026 实际
+sharpe_window = 60      # Sharpe 滚动窗口 (天)
+sortino_min_period = 30  # Sortino 最小计算周期 (天)
 
-# ── 风险检测阈值 (原 risk.toml) ──
+# ── 风险检测阈值 (市场状态判断) ──
+# 缺省 const fallback 保持原值
 [regime]
-window_days = 20
-bull_threshold = 0.03
-bear_threshold = -0.03
-index_plunge_atr_mult = 2.0
-flow_outflow_threshold = 0.5
-flow_lookback_min = 15
+window_days = 20        # 市场状态检测窗口 (天): 20 日均涨幅
+bull_threshold = 0.03   # 牛: 20 日涨幅 > 3%
+bear_threshold = -0.03  # 熊: 20 日跌幅 < -3%
+index_plunge_atr_mult = 2.0  # 大盘崩盘阈值: ATR × 2.0 替代写死 -1%
+flow_outflow_threshold = 0.5  # 主力净流出阈值 (亿)
+flow_lookback_min = 15   # 资金流回溯窗口 (分钟)
 
-# ── 板块限制 (原 risk.toml) ──
+# ── 板块限制 (持仓上限) ──
+# 缺省 const fallback: 0.10 / 0.40 / 0.15 / -0.10
 [exposure]
-single_stock_max = 0.10
-single_sector_max = 0.40
-cash_floor = 0.15
-stop_loss_default = -0.10
+single_stock_max = 0.10   # 单票上限 (10% 资金)
+single_sector_max = 0.40  # 单板块上限 (40% 资金)
+cash_floor = 0.15        # 现金底限 (15% 资金): 留弹药
+stop_loss_default = -0.10 # 默认止损 (-10% 跌幅触发)
 
-# ── 推送/告警阈值 (原 risk.toml) ──
+# ── 推送/告警阈值 ──
+# 缺省 const fallback 保持原值
 [alert]
-min_importance_score = 70
-min_emergency_score = 85
-index_plunge_window_min = 5
-stale_data_max_age_sec = 30
+min_importance_score = 70  # 重要告警最低分 (0-100): 低于不推
+min_emergency_score = 85   # 紧急告警最低分
+index_plunge_window_min = 5  # 大盘崩盘检测窗口 (分钟)
+stale_data_max_age_sec = 30  # 行情数据最大陈旧时间 (秒, 老 codex review 上限)
 
-# ── v12 PR1 账户模式三态 (BR-021, 原 risk.toml) ──
+# ── v12 PR1 账户模式三态 (BR-021) ──
+# 缺省 const fallback 保持原值 (-1.5 / -2.0 / 3 / 8)
+# 影响: monitor_loop 每次 tick 评估, 决定 ActionGate 权限
+# 三态: Normal → ReduceOnly (限减仓) → Frozen (禁新动作)
 [account_mode]
-daily_loss_pct = -1.5
-circuit_breaker_pct = -2.0
-consecutive_stop_loss_n = 3
-position_overload_cheng = 8
+daily_loss_pct = -1.5        # 当日累计亏损 ≤ 此值 → ReduceOnly (默认 -1.5%)
+circuit_breaker_pct = -2.0   # 当日累计亏损 ≤ 此值 → Frozen (默认 -2.0%, 熔断)
+consecutive_stop_loss_n = 3  # 连续止损笔数 ≥ 此值 → ReduceOnly (默认 3 笔)
+position_overload_cheng = 8  # 总仓位 > 此值 (成) → Frozen (默认 8 成)
+# 解除: 下一交易日盘前重置为 Normal (由 monitor_loop 09:25 前调 reset())
