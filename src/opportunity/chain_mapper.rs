@@ -52,7 +52,7 @@ pub struct ChainHit {
 ///
 /// 运行时优先读磁盘配置（支持热更新）；当文件缺失或解析失败时，
 /// 回退到编译期内嵌的同一份 toml 文本，避免代码中维护第二份规则。
-const DEFAULT_CHAIN_RULES_TOML: &str = include_str!("../../config/chain_rules.toml");
+const DEFAULT_CHAIN_RULES_TOML: &str = include_str!("../../config/chain.toml");
 
 fn normalize_chain_rules(mut rules: Vec<(Vec<String>, String, String, String, u32, bool)>) -> Vec<(Vec<String>, String, String, String, u32, bool)> {
     rules.sort_by(|a, b| b.4.cmp(&a.4));
@@ -83,7 +83,7 @@ fn chain_rules() -> Vec<(Vec<String>, String, String, String, u32, bool)> {
     }
 
     // 2) 若内存缓存为空，直接读取 config/chain_rules.toml，避免与文件配置脱节。
-    if let Ok(s) = std::fs::read_to_string("config/chain_rules.toml") {
+    if let Ok(s) = std::fs::read_to_string("config/chain.toml") {
         if let Some(rules) = parse_chain_rules_toml(&s) {
             return rules;
         }

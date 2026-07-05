@@ -1,0 +1,126 @@
+# =====================================================================
+# v12 Strategy 综合配置 — 交易策略/风控/调度/告警/账户模式
+# SIGHUP 热加载, 缺 toml 时 Rust const fallback 生效
+# 整合自原 risk.toml + monitor.toml + opportunity.toml (3 文件 → 1)
+# 加载入口: src/config.rs::load_all() 读此文件 + chain.toml
+# =====================================================================
+
+# ── 数据新鲜度阈值 (AGENTS 2.4, 原 monitor.toml) ──
+dq_quote_stale_sec = 6         # 实时行情
+dq_position_stale_sec = 30     # 持仓/资金
+dq_nav_stale_sec = 86400       # 净值 (当日有效)
+dq_daily_stale_sec = 86400     # 日线/历史数据 (1 交易日内)
+opportunity_min_confidence = 45
+opportunity_require_cross_source = false
+
+# ── 监控定时器 (原 monitor.toml) ──
+screener_interval_min = 5
+opportunity_scan_interval_min = 10
+news_window_start_hour = 0
+news_window_end_hour = 24
+
+# ── 主题新闻去同质化 (原 monitor.toml) ──
+topic_search_intent_count = 6
+topic_search_timeout_sec = 10
+topic_mmr_relevance_weight = 0.72
+topic_mmr_diversity_penalty = 2.2
+topic_mmr_history_penalty = 1.4
+topic_history_window_hours = 72
+topic_history_memory_size = 160
+topic_history_db_limit = 400
+topic_news_max_age_days = 3
+
+# ── 实时否决链 (VetoChain, 原 monitor.toml) ──
+[live_veto]
+enabled = true
+mode = "live"
+bias_rate_enabled = true
+bearish_alignment_enabled = true
+main_flow_enabled = true
+fundamental_enabled = true
+
+# ── 动态仓位 (原 monitor.toml) ──
+[position_sizing]
+use_dynamic = true
+
+# ── 因子 IC 反馈 (原 monitor.toml) ──
+[factor_feedback]
+enabled = false
+technical_action = "normal"
+quality_action = "normal"
+valuation_action = "normal"
+flow_action = "normal"
+growth_action = "normal"
+down_weight_scale = 0.5
+
+# ── 空中加油 (原 monitor.toml) ──
+[air_refuel]
+entry_mode = "confirm"
+confirm_lots = 10
+pilot_lots = 3
+next_day_review_enabled = true
+
+# ── v9 机会发现调度 (原 opportunity.toml) ──
+[schedule]
+batch_morning_time = "09:00"
+batch_evening_time = "15:30"
+incremental_interval_min = 5
+batch_max_age_hours = 24
+incremental_max_age_min = 20
+
+# ── v9 推送阈值 (原 opportunity.toml) ──
+[push]
+event_risk_score_threshold = 60
+require_cross_source = false
+min_total_hits = 1
+
+# ── A 股交易费率 (原 risk.toml) ──
+[trading]
+commission_rate = 0.0003
+stamp_tax_rate  = 0.001
+slippage_rate   = 0.001
+min_commission  = 5.0
+lot_size        = 100
+
+# ── 动态滑点 (原 risk.toml) ──
+[slippage]
+dynamic_enabled = false
+alpha = 0.1
+adv_days = 20
+
+# ── Sharpe / Sortino (原 risk.toml) ──
+[performance]
+risk_free_rate = 0.03
+trading_days_year = 252
+sharpe_window = 60
+sortino_min_period = 30
+
+# ── 风险检测阈值 (原 risk.toml) ──
+[regime]
+window_days = 20
+bull_threshold = 0.03
+bear_threshold = -0.03
+index_plunge_atr_mult = 2.0
+flow_outflow_threshold = 0.5
+flow_lookback_min = 15
+
+# ── 板块限制 (原 risk.toml) ──
+[exposure]
+single_stock_max = 0.10
+single_sector_max = 0.40
+cash_floor = 0.15
+stop_loss_default = -0.10
+
+# ── 推送/告警阈值 (原 risk.toml) ──
+[alert]
+min_importance_score = 70
+min_emergency_score = 85
+index_plunge_window_min = 5
+stale_data_max_age_sec = 30
+
+# ── v12 PR1 账户模式三态 (BR-021, 原 risk.toml) ──
+[account_mode]
+daily_loss_pct = -1.5
+circuit_breaker_pct = -2.0
+consecutive_stop_loss_n = 3
+position_overload_cheng = 8

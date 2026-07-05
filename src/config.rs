@@ -498,38 +498,65 @@ pub fn get_risk_config() -> RiskConfig {
     RISK_CONFIG.read().unwrap().clone()
 }
 
-/// 修复 P3.1: 集中加载 risk.toml
-pub fn load_risk_config() {
-    if let Ok(s) = std::fs::read_to_string("config/risk.toml") {
-        if let Ok(c) = toml::from_str::<RiskConfig>(&s) {
-            *RISK_CONFIG.write().unwrap() = c;
-        }
+/// 加载 strategy.toml (整合 risk + monitor + opportunity)
+///
+/// v12: 3 文件 → 1 文件整合. 解析出 RiskConfig + MonitorConfig 两个子 struct.
+fn parse_strategy_toml(content: &str) {
+    if let Ok(c) = toml::from_str::<RiskConfig>(content) {
+        *RISK_CONFIG.write().unwrap() = c;
+    }
+    if let Ok(c) = toml::from_str::<MonitorConfig>(content) {
+        *MONITOR_CONFIG.write().unwrap() = c;
     }
 }
 
+/// 加载 strategy.toml. 失败不崩溃, 保留 const fallback.
+fn load_strategy_config() {
+    match std::fs::read_to_string("config/strategy.toml") {
+        Ok(content) => {
+            log::debug!("[v12-config] 加载 config/strategy.toml ({} bytes)", content.len());
+            parse_strategy_toml(&content);
+        }
+        Err(e) => log::warn!("[v12-config] config/strategy.toml 读取失败: {} (用 const fallback)", e),
+    }
+}
+
+/// 加载 chain.toml (整合 chain_rules + announce_keywords + exclusion)
+///
+/// 3 文件 → 1 文件. 用 toml::from_str 独立 parse 三种 schema.
+fn load_chain_combined() {
+    let content = match std::fs::read_to_string("config/chain.toml") {
+        Ok(c) => {
+            log::debug!("[v12-config] 加载 config/chain.toml ({} bytes)", c.len());
+            c
+        }
+        Err(e) => {
+            log::warn!("[v12-config] config/chain.toml 读取失败: {} (用 const fallback)", e);
+            return;
+        }
+    };
+    if let Ok(c) = toml::from_str::<ChainRulesFile>(&content) {
+        *CHAIN_RULES.write().unwrap() = Some(c.rules);
+    }
+    if let Ok(c) = toml::from_str::<AnnounceKeywordsFile>(&content) {
+        *ANNOUNCE_KEYWORDS.write().unwrap() = Some(c);
+    }
+    if let Ok(c) = toml::from_str::<ExclusionFile>(&content) {
+        *EXCLUSION_BOARDS.write().unwrap() = Some(c.boards);
+    }
+}
+
+/// 兼容老 API: 加载 risk 配置 (内部调 load_strategy_config)
+pub fn load_risk_config() {
+    load_strategy_config();
+}
+
 /// 尝试加载所有 toml 配置。失败不崩溃，保留旧值。
+///
+/// v12 整合: 2 个文件 (strategy.toml + chain.toml) 替代原 6 个
 pub fn load_all() {
-    load_risk_config();  // 修复 P3.1: 加载集中风险配置
-    if let Ok(s) = std::fs::read_to_string("config/chain_rules.toml") {
-        if let Ok(c) = toml::from_str::<ChainRulesFile>(&s) {
-            *CHAIN_RULES.write().unwrap() = Some(c.rules);
-        }
-    }
-    if let Ok(s) = std::fs::read_to_string("config/exclusion.toml") {
-        if let Ok(c) = toml::from_str::<ExclusionFile>(&s) {
-            *EXCLUSION_BOARDS.write().unwrap() = Some(c.boards);
-        }
-    }
-    if let Ok(s) = std::fs::read_to_string("config/announce_keywords.toml") {
-        if let Ok(c) = toml::from_str::<AnnounceKeywordsFile>(&s) {
-            *ANNOUNCE_KEYWORDS.write().unwrap() = Some(c);
-        }
-    }
-    if let Ok(s) = std::fs::read_to_string("config/monitor.toml") {
-        if let Ok(c) = toml::from_str::<MonitorConfig>(&s) {
-            *MONITOR_CONFIG.write().unwrap() = c;
-        }
-    }
+    load_strategy_config();
+    load_chain_combined();
 }
 
 /// 获取产业链规则（优先 toml，fallback 调用方提供的默认值）
