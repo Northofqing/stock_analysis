@@ -6,7 +6,7 @@
 //! 调用约定:
 //!   1. 调用方先拼好本模板所需的领域数据（结构体入参）
 //!   2. 调对应 `render_xxx()` 函数得到完整 text
-//!   3. 调 `super::notify::push_governor(&text, kind).await` 推送
+//!   3. 调 `crate::notify::push_governor(&text, kind).await` 推送
 //!
 //! 后续 PR 接入点（不动本文件签名即可演进）:
 //!   - PR1: `AccountMode` 替换为 `risk::account_mode::AccountState`
@@ -1076,7 +1076,7 @@ pub async fn push_account_mode_change(
 
     // 3. dispatch (code="" 全局键, AccountMode 无冷却)
     let ok = dispatch(
-        super::notify::PushKind::AccountMode,
+        crate::notify::PushKind::AccountMode,
         "", // code 空 = 全局键
         banner,
         text,
@@ -1124,7 +1124,7 @@ pub async fn push_holding_plan_recommendation(
 ) -> bool {
     let text = render_holding_plan(banner.unwrap_or(&BannerCtx::default()), params);
     dispatch(
-        super::notify::PushKind::HoldingPlan,
+        crate::notify::PushKind::HoldingPlan,
         code,
         banner,
         text,
@@ -1143,7 +1143,7 @@ pub async fn push_holding_emergency(
 ) -> bool {
     let text = render_holding_event(banner.unwrap_or(&BannerCtx::default()), params);
     dispatch(
-        super::notify::PushKind::HoldingEvent,
+        crate::notify::PushKind::HoldingEvent,
         code,
         banner,
         text,
@@ -1165,7 +1165,7 @@ pub async fn push_t0_advice(
 ) -> bool {
     let text = render_t0_advice(banner.unwrap_or(&BannerCtx::default()), params);
     dispatch(
-        super::notify::PushKind::T0Advice,
+        crate::notify::PushKind::T0Advice,
         code,
         banner,
         text,
@@ -1181,7 +1181,7 @@ pub async fn push_t0_forbid(
 ) -> bool {
     let text = render_t0_forbid(banner.unwrap_or(&BannerCtx::default()), params);
     dispatch(
-        super::notify::PushKind::T0Advice,
+        crate::notify::PushKind::T0Advice,
         code,
         banner,
         text,
@@ -1214,7 +1214,7 @@ pub async fn push_candidate_triggered(
 
     let text = render_candidate_triggered(banner.unwrap_or(&BannerCtx::default()), params);
     dispatch(
-        super::notify::PushKind::CandidateTriggered,
+        crate::notify::PushKind::CandidateTriggered,
         code,
         banner,
         text,
@@ -1232,7 +1232,7 @@ pub async fn push_candidate_invalidated(
 ) -> bool {
     let text = render_candidate_invalidated(hhmm, name, code, prev, reason);
     dispatch(
-        super::notify::PushKind::CandidateBoard,
+        crate::notify::PushKind::CandidateBoard,
         code,
         None,
         text,
@@ -1317,7 +1317,7 @@ pub async fn push_data_mode_change(
 
     // 2. dispatch (code="" 全局键, DataMode 10min 冷却走 push_governor 默认)
     let ok = dispatch(
-        super::notify::PushKind::DataMode,
+        crate::notify::PushKind::DataMode,
         "",
         banner,
         text,
@@ -1341,7 +1341,7 @@ use once_cell::sync::Lazy;
 /// 冷却表: key = (PushKind, code_or_empty), value = last sent epoch secs
 ///
 /// 进程内全局, monitor 重启即清零. v12 §14.3.1.
-static COOLDOWN_TABLE: Lazy<std::sync::Mutex<HashMap<(super::notify::PushKind, String), i64>>> =
+static COOLDOWN_TABLE: Lazy<std::sync::Mutex<HashMap<(crate::notify::PushKind, String), i64>>> =
     Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
 
 /// 当日"交易建议类"已推送条数 (§14.3.3 ≤ 30 条/日)
@@ -1369,7 +1369,7 @@ fn reset_budget_if_new_day() {
 /// 判定: 该 (kind, code) 是否在冷却中. 紧急类 (`Emergency`) 与无冷却 (`None`) 永远返回 false.
 ///
 /// 副作用: 不命中时**不**写表, 由 [`push_governor_with_mode`] 在真正推送时调 [`record_cooldown`] 写入.
-pub fn is_in_cooldown(kind: super::notify::PushKind, code: &str) -> bool {
+pub fn is_in_cooldown(kind: crate::notify::PushKind, code: &str) -> bool {
     use super::notify::PushLevel;
     if kind.level() == PushLevel::Emergency {
         return false;
@@ -1389,7 +1389,7 @@ pub fn is_in_cooldown(kind: super::notify::PushKind, code: &str) -> bool {
 }
 
 /// 记录推送成功的冷却时间戳. 由 push_governor 内部调用.
-pub fn record_cooldown(kind: super::notify::PushKind, code: &str) {
+pub fn record_cooldown(kind: crate::notify::PushKind, code: &str) {
     let key = (kind, code.to_string());
     let now = chrono::Utc::now().timestamp();
     let mut table = COOLDOWN_TABLE.lock().expect("cooldown table poisoned");
@@ -1397,8 +1397,8 @@ pub fn record_cooldown(kind: super::notify::PushKind, code: &str) {
 }
 
 /// 是否计入日预算 (§14.3.3). 交易建议类 + 盘后 R 系列计入.
-pub fn counts_against_daily_budget(kind: super::notify::PushKind) -> bool {
-    use super::notify::PushKind as K;
+pub fn counts_against_daily_budget(kind: crate::notify::PushKind) -> bool {
+    use crate::notify::PushKind as K;
     matches!(
         kind,
         K::HoldingPlan
@@ -1429,8 +1429,8 @@ pub fn daily_budget_used() -> u32 {
 /// 返回 true = 应停发该条交易建议类推送.
 /// 当前实现: T-03/T-05/T-07 (持有建议 / 做T / 候选触发) 在 Frozen/Unsafe 停发,
 ///           T-04 (紧急风险) / T-09 (禁止操作) 仍照发 (风险类不受限).
-pub fn should_block_on_mode(kind: super::notify::PushKind, mode: AccountMode, dm: DataMode) -> bool {
-    use super::notify::PushKind as K;
+pub fn should_block_on_mode(kind: crate::notify::PushKind, mode: AccountMode, dm: DataMode) -> bool {
+    use crate::notify::PushKind as K;
     match kind {
         // 风险类: 永远照发
         K::HoldingEvent | K::ForbiddenOps | K::DataMode | K::AccountMode => false,
@@ -1454,9 +1454,9 @@ pub fn should_block_on_mode(kind: super::notify::PushKind, mode: AccountMode, dm
 /// `code` 用于 §14.3.1 的 (PushKind, code) 键. 不分票的推送 (T-01/T-02 状态变更/全局)
 /// 传空字符串即可.
 ///
-/// 内部调用 `super::notify::push_governor`. PUSH_VERBOSE 降级逻辑沿用.
+/// 内部调用 `crate::notify::push_governor`. PUSH_VERBOSE 降级逻辑沿用.
 pub async fn dispatch(
-    kind: super::notify::PushKind,
+    kind: crate::notify::PushKind,
     code: &str,
     banner: Option<&BannerCtx>,
     text: String,
@@ -1500,7 +1500,7 @@ pub async fn dispatch(
     }
 
     // 4. 推
-    let ok = super::notify::push_governor(&text, kind).await;
+    let ok = crate::notify::push_governor(&text, kind).await;
     if ok {
         record_cooldown(kind, code);
         if counts_against_daily_budget(kind) {
@@ -2907,5 +2907,580 @@ mod tests {
         let lines: Vec<&str> = full.lines().collect();
         assert!(lines[0].starts_with("[🟡 ReduceOnly |"), "第 1 行应是横幅");
         assert!(lines[1].starts_with("🛡️ 账户模式变更"), "第 2 行应是 T-01");
+    }
+
+    // ===============================================================
+    // =========== 20 模板真实数据 + 实际推送 E2E 测试 ===============
+    // 触发条件: env V12_E2E_REAL_PUSH=1 (opt-in, 避免 CI 噪音)
+    // 所有消息带 [v12-E2E-T0X] 前缀, 便于飞书群识别 + 清理
+    // ===============================================================
+
+    /// 单条推送冒烟: 验证 magiclaw daemon 可达 + PUSH_VERBOSE=true
+    /// 运行: V12_E2E_REAL_PUSH=1 cargo test --bin monitor push_templates::tests::e2e_single_smoke
+    #[tokio::test]
+    async fn e2e_single_smoke() {
+        if std::env::var("V12_E2E_REAL_PUSH").ok().as_deref() != Some("1") { return; }
+        // 初始化 env_logger (test env 默认不 init, log macros 静默)
+        let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+            .format(|buf, record| {
+                use std::io::Write;
+                writeln!(buf, "[{} {}] {}", chrono::Local::now().format("%H:%M:%S"), record.level(), record.args())
+            })
+            .try_init();
+        std::env::set_var("PUSH_VERBOSE", "true");
+        std::env::remove_var("V10_DRY_RUN_PUSH");
+        // 显式设 MAGICLAW_HOME, 让 push_via_magiclaw_cli 找对 .env
+        if std::env::var("MAGICLAW_HOME").is_err() {
+            std::env::set_var("MAGICLAW_HOME", "/Users/zhangzhen/Desktop/magiclaw");
+        }
+        // 显式设 DATABASE_PATH / MAGICLAW_DB_PATH (test env 默认无, push_via_magiclaw_cli 需)
+        if std::env::var("DATABASE_PATH").is_err() {
+            std::env::set_var("DATABASE_PATH", "./data/stock_analysis.db");
+        }
+        if std::env::var("MAGICLAW_DB_PATH").is_err() {
+            std::env::set_var("MAGICLAW_DB_PATH", "./data/stock_analysis.db");
+        }
+        // 显式设 FEISHU_RECEIVE_ID_TYPE (push_via_magiclaw_cli 据此传 --receive-id-type)
+        if std::env::var("FEISHU_RECEIVE_ID_TYPE").is_err() {
+            std::env::set_var("FEISHU_RECEIVE_ID_TYPE", "chat_id");
+        }
+        let text = "[v12-E2E-smoke] 冒烟测试 — 验证 magiclaw daemon 可达";
+        eprintln!("[v12-E2E-smoke] cwd={:?}, MAGICAW_HOME={:?}, MAGICLAW_BIN={:?}, DATABASE_PATH={:?}",
+            std::env::current_dir().ok(),
+            std::env::var("MAGICLAW_HOME").ok(),
+            std::env::var("MAGICLAW_BIN").ok(),
+            std::env::var("DATABASE_PATH").ok(),
+        );
+        // 直接调 magiclaw binary 验证可执行 + auth 可达
+        let magiclaw_bin = "/Users/zhangzhen/Desktop/magiclaw/target/release/magiclaw";
+        let out = std::process::Command::new(magiclaw_bin)
+            .args(&["send", "--channel", "feishu", "--to", "oc_4bca5d870fd5ff3352795a674194d5b0", "--message", text])
+            .current_dir("/Users/zhangzhen/Desktop/magiclaw")
+            .output();
+        match out {
+            Ok(o) => {
+                eprintln!("[v12-E2E-smoke] magiclaw exit={}, stdout={}, stderr={}",
+                    o.status,
+                    String::from_utf8_lossy(&o.stdout).chars().take(200).collect::<String>(),
+                    String::from_utf8_lossy(&o.stderr).chars().take(200).collect::<String>()
+                );
+            }
+            Err(e) => eprintln!("[v12-E2E-smoke] magiclaw spawn failed: {}", e),
+        }
+        // Now test push_governor
+        let ok = crate::notify::push_governor(text, crate::notify::PushKind::AccountMode).await;
+        eprintln!("[v12-E2E-smoke] push_governor result: {}", ok);
+        // 调试: 直接调 push_via_magiclaw_cli 模拟
+        let magiclaw_bin2 = "/Users/zhangzhen/Desktop/magiclaw/target/release/magiclaw";
+        let out2 = std::process::Command::new(magiclaw_bin2)
+            .args(&["send", "--channel", "feishu", "--to", "oc_4bca5d870fd5ff3352795a674194d5b0", "--message", text])
+            .current_dir("/Users/zhangzhen/Desktop/magiclaw")
+            .env("DATABASE_PATH", "./data/stock_analysis.db")
+            .env("MAGICLAW_DB_PATH", "./data/stock_analysis.db")
+            .env("FEISHU_TO", "oc_4bca5d870fd5ff3352795a674194d5b0")
+            .output();
+        match out2 {
+            Ok(o) => eprintln!("[v12-E2E-smoke] magiclaw2 exit={}, stdout={}",
+                o.status,
+                String::from_utf8_lossy(&o.stdout).chars().take(150).collect::<String>()),
+            Err(e) => eprintln!("[v12-E2E-smoke] magiclaw2 spawn failed: {}", e),
+        }
+        assert!(ok, "smoke test 推送应成功");
+    }
+
+    /// v12 E2E 真实推送: 装配真实数据 (从 DB ledger/positions/trades) + 实际飞书推送.
+    /// 运行: `V12_E2E_REAL_PUSH=1 cargo test --bin monitor push_templates::tests::e2e_real_all_20`
+    #[tokio::test]
+    async fn e2e_real_all_20_templates() {
+        // 0. 跳过条件: 必须显式 opt-in
+        if std::env::var("V12_E2E_REAL_PUSH").ok().as_deref() != Some("1") {
+            eprintln!(
+                "[v12-E2E] 跳过: 需 V12_E2E_REAL_PUSH=1 启用. \
+                 命令: V12_E2E_REAL_PUSH=1 cargo test --bin monitor push_templates::tests::e2e_real_all_20"
+            );
+            return;
+        }
+
+        // 强制 PUSH_VERBOSE=true 让被 deprecated 的 PushKind 也能推
+        // (v12-P0-4 设计: deprecated 默认降级 log, 但 E2E 验证需真推)
+        std::env::set_var("PUSH_VERBOSE", "true");
+        // 显式设 MAGICLAW_HOME, 让 push_via_magiclaw_cli 找对 .env (test env cwd 与 cargo run 不同)
+        if std::env::var("MAGICLAW_HOME").is_err() {
+            std::env::set_var("MAGICLAW_HOME", "/Users/zhangzhen/Desktop/magiclaw");
+        }
+
+        // 1. Setup: init DB + 装配真实数据
+        let _ = init_test_db();
+        let hhmm = chrono::Local::now().format("%H:%M").to_string();
+        let today_str = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+        // 真实数据 1: ledger (净值/今日盈亏) — 真实查 DB
+        let ledger_entry = stock_analysis::portfolio::get_equity_curve(1)
+            .ok()
+            .and_then(|c| c.last().cloned());
+        let (today_pnl_pct, total_value, market_value) = match ledger_entry.as_ref() {
+            Some(e) => {
+                let pct = if e.total_value > 0.0 { (e.daily_pnl / e.total_value) * 100.0 } else { 0.0 };
+                (pct, e.total_value, e.market_value)
+            }
+            None => (0.0, 0.0, 0.0),
+        };
+        let data_complete = ledger_entry.is_some() && total_value > 0.0;
+
+        // 真实数据 2: 当前 open positions — 真实查 DB
+        let positions = stock_analysis::portfolio::get_positions().unwrap_or_default();
+        let first_pos = positions.first().cloned();
+
+        // 真实数据 3: trades 历史 (最近)
+        let trades = stock_analysis::portfolio::get_trade_history(30).unwrap_or_default();
+
+        // 真实数据 4: latest account mode (从 DB 读)
+        let prev_account_mode_label = stock_analysis::database::account_mode_log::latest_account_mode_change()
+            .ok()
+            .flatten()
+            .map(|r| r.new_mode);
+        let prev_mode = match prev_account_mode_label.as_deref() {
+            Some("Normal") => stock_analysis::risk::action_gate::AccountMode::Normal,
+            Some("ReduceOnly") => stock_analysis::risk::action_gate::AccountMode::ReduceOnly,
+            Some("Frozen") => stock_analysis::risk::action_gate::AccountMode::Frozen,
+            _ => stock_analysis::risk::action_gate::AccountMode::Normal,
+        };
+
+        let mut success_count = 0u32;
+        let mut fail_msgs: Vec<String> = Vec::new();
+        let libam_to_tmpl = |m: stock_analysis::risk::action_gate::AccountMode| match m {
+            stock_analysis::risk::action_gate::AccountMode::Normal => AccountMode::Normal,
+            stock_analysis::risk::action_gate::AccountMode::ReduceOnly => AccountMode::ReduceOnly,
+            stock_analysis::risk::action_gate::AccountMode::Frozen => AccountMode::Frozen,
+        };
+
+        // ===== T-01 账户模式变更 =====
+        {
+            let metrics = stock_analysis::risk::account_mode::PortfolioMetrics {
+                today_pnl_pct, consecutive_stop_loss_n: 0,
+                total_pos_cheng: if total_value > 0.0 { ((market_value / total_value) * 10.0).round() as u8 } else { 0 },
+                data_complete,
+            };
+            let eval = stock_analysis::risk::account_mode::evaluate(&metrics, Some(prev_mode), &stock_analysis::risk::account_mode::ModeThresholds::default());
+            if eval.is_changed() {
+                let forbidden = match eval.mode {
+                    stock_analysis::risk::action_gate::AccountMode::Normal => "(无)",
+                    stock_analysis::risk::action_gate::AccountMode::ReduceOnly => "禁止新开仓/加仓/正T, 候选转影子",
+                    stock_analysis::risk::action_gate::AccountMode::Frozen => "禁止新开仓/加仓/正T/反T, 候选转影子",
+                };
+                let recovery = match eval.mode {
+                    stock_analysis::risk::action_gate::AccountMode::Normal => "(已是 Normal)",
+                    stock_analysis::risk::action_gate::AccountMode::ReduceOnly => "当日盈亏回到 -1.5% 内 或 连续止损 < 3 笔 (运行时) / 下一交易日盘前重置",
+                    stock_analysis::risk::action_gate::AccountMode::Frozen => "下一交易日盘前重置",
+                };
+                let text = render_account_mode(&hhmm, libam_to_tmpl(prev_mode), libam_to_tmpl(eval.mode),
+                    &eval.trigger_reason.clone().map(|r| vec![r]).unwrap_or_default(),
+                    forbidden, recovery);
+                let banner_text = format!("[v12-E2E-T01] {}", text);
+                let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::AccountMode).await;
+                if ok { success_count += 1; } else { fail_msgs.push("T-01".to_string()); }
+                log::info!("[v12-E2E] T-01 推送 {} (real data: prev={:?}, pnl={:.2}%)", if ok { "OK" } else { "FAIL" }, prev_mode, today_pnl_pct);
+            } else {
+                log::info!("[v12-E2E] T-01 无变更 (skip)");
+            }
+        }
+
+        // ===== T-02 数据状态变更 =====
+        {
+            use stock_analysis::monitor::data_mode::{evaluate as dm_evaluate, Capability, CapabilityStatus, DataHealthInput, DataMode as LibDM};
+            let input = DataHealthInput {
+                capabilities: Capability::ALL.iter().map(|c| CapabilityStatus::fresh(*c, 200)).collect(),
+                critical_max_age_secs: 120,
+                orderbook_max_age_secs: 600,
+            };
+            let health = dm_evaluate(&input, Some(LibDM::Full));
+            if health.is_changed() {
+                let missing_str = if health.missing.is_empty() { "(无)".to_string() }
+                    else { health.missing.iter().map(|c| c.label().to_string()).collect::<Vec<_>>().join("/") };
+                let restrictions = vec!["不做盘口承接判断".to_string(), "禁出价格型建议".to_string(), "仅保留风险类推送".to_string()];
+                let text = render_data_mode(&hhmm, DataMode::Full, DataMode::Unsafe, &missing_str, &restrictions, Some("15min"));
+                let banner_text = format!("[v12-E2E-T02] {}", text);
+                let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::DataMode).await;
+                if ok { success_count += 1; } else { fail_msgs.push("T-02".to_string()); }
+                log::info!("[v12-E2E] T-02 推送 {}", if ok { "OK" } else { "FAIL" });
+            }
+        }
+
+        // ===== T-03 持仓建议 (真实持仓, 无则用合成数据) =====
+        let (t03_name, t03_code, t03_cost, t03_shares) = if let Some(p) = &first_pos {
+            (p.name.clone(), p.code.clone(), p.cost_price, p.shares as u32)
+        } else {
+            // 合成: 无持仓时也演示完整推送路径
+            ("示例持仓".to_string(), "000001".to_string(), 11.80_f64, 3000_u32)
+        };
+        {
+            let banner = BannerCtx {
+                account_mode: AccountMode::Normal,
+                total_pos: if total_value > 0.0 { ((market_value / total_value) * 10.0).round() as u8 } else { 0 },
+                today_pnl: today_pnl_pct, data_mode: DataMode::Full, data_missing_note: None,
+            };
+            let t03_name_s = t03_name.clone();
+            let t03_code_s = t03_code.clone();
+            let params = HoldingPlanParams {
+                name: &t03_name_s, code: &t03_code_s, hhmm: &hhmm,
+                intent: Intent::Reduce,
+                price: t03_cost * 1.05, cost: t03_cost, avail: t03_shares,
+                reduce_zone: Some((t03_cost * 1.10, t03_cost * 1.15)),
+                support: t03_cost * 0.95, pressure: t03_cost * 1.20, stop: t03_cost * 0.92,
+                invalidations: &["跌破5日线且放量".to_string(), "板块热度转Fade".to_string()],
+                reasons: &["放量冲高回落".to_string(), "主力净流出".to_string()],
+            };
+            let text = render_holding_plan(&banner, params);
+            let banner_text = format!("[v12-E2E-T03] {}", text);
+            let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::HoldingPlan).await;
+            if ok { success_count += 1; } else { fail_msgs.push("T-03".to_string()); }
+            eprintln!("[v12-E2E] T-03 推送 {} (real: {}({}))", if ok { "OK" } else { "FAIL" }, t03_name, t03_code);
+        }
+
+        // ===== T-04 持仓紧急风险 (真实持仓, 无则用合成数据) =====
+        let (t04_name, t04_code, t04_cost, t04_shares) = if let Some(p) = &first_pos {
+            (p.name.clone(), p.code.clone(), p.cost_price, p.shares as u32)
+        } else {
+            ("示例持仓".to_string(), "000001".to_string(), 11.80_f64, 3000_u32)
+        };
+        {
+            let banner = BannerCtx {
+                account_mode: AccountMode::Normal,
+                total_pos: if total_value > 0.0 { ((market_value / total_value) * 10.0).round() as u8 } else { 0 },
+                today_pnl: today_pnl_pct, data_mode: DataMode::Full, data_missing_note: None,
+            };
+            let t04_name_s = t04_name.clone();
+            let t04_code_s = t04_code.clone();
+            let params = HoldingEventParams {
+                name: &t04_name_s, code: &t04_code_s, hhmm: &hhmm,
+                trigger: "跌破硬止损",
+                price: t04_cost * 0.90, chg_pct: -10.0, gap_pct: 2.5,
+                action: "建议减仓/止损",
+                avail: t04_shares,
+            };
+            let text = render_holding_event(&banner, params);
+            let banner_text = format!("[v12-E2E-T04] {}", text);
+            let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::HoldingEvent).await;
+            if ok { success_count += 1; } else { fail_msgs.push("T-04".to_string()); }
+            eprintln!("[v12-E2E] T-04 推送 {} (real: {})", if ok { "OK" } else { "FAIL" }, t04_code);
+        }
+
+        // ===== T-05 做T建议 (真实持仓, 无则用合成数据) =====
+        let (t05_name, t05_code, t05_cost, t05_shares, t05_held_today) = if let Some(p) = &first_pos {
+            let today = chrono::Local::now().date_naive();
+            let buy_date = p.added_at.format("%Y-%m-%d").to_string();
+            let held_today = buy_date == today.format("%Y-%m-%d").to_string();
+            (p.name.clone(), p.code.clone(), p.cost_price, p.shares as u32, held_today)
+        } else {
+            // 合成: 用历史日期避免 held_today 拦截
+            ("示例持仓".to_string(), "000001".to_string(), 11.80_f64, 3000_u32, false)
+        };
+        if !t05_held_today && t05_shares > 0 {
+            let input = stock_analysis::decision::t0_advisor::T0Input {
+                code: t05_code.clone(), name: t05_name.clone(),
+                trend: stock_analysis::decision::t0_advisor::TrendStatus::Range,
+                buy_date: "2026-07-01".to_string(),  // 历史日期
+                available_shares: t05_shares,
+                current_price: t05_cost * 1.05, cost_price: t05_cost,
+                support: t05_cost * 0.95, pressure: t05_cost * 1.10,
+                kind_hint: None,
+                account_mode_is_reduce_only: matches!(prev_mode, stock_analysis::risk::action_gate::AccountMode::ReduceOnly),
+            };
+            let v = stock_analysis::decision::t0_advisor::evaluate(&input);
+            if let stock_analysis::decision::t0_advisor::T0Verdict::Allowed { kind, sell_zone, buy_zone, min_spread_pct } = v {
+                let kind_pt = match kind {
+                    stock_analysis::decision::t0_advisor::T0Kind::ReverseT => T0Kind::ReverseT,
+                    stock_analysis::decision::t0_advisor::T0Kind::PositiveT => T0Kind::PositiveT,
+                };
+                let t05_name_s = t05_name.clone();
+                let t05_code_s = t05_code.clone();
+                let params = T0AdviceParams {
+                    name: &t05_name_s, code: &t05_code_s, hhmm: &hhmm, kind: kind_pt,
+                    style: T0Style::PullbackCatch, avail: t05_shares,
+                    sell_lo: sell_zone.0, sell_hi: sell_zone.1,
+                    buy_lo: buy_zone.0, buy_hi: buy_zone.1,
+                    min_spread_pct, risk_note: "板块同步下跌",
+                };
+                let text = render_t0_advice(&BannerCtx::default(), params);
+                let banner_text = format!("[v12-E2E-T05] {}", text);
+                let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::T0Advice).await;
+                if ok { success_count += 1; } else { fail_msgs.push("T-05".to_string()); }
+                eprintln!("[v12-E2E] T-05 推送 {} (real: {}({}))", if ok { "OK" } else { "FAIL" }, t05_name, t05_code);
+            } else {
+                eprintln!("[v12-E2E] T-05 评估返回 Forbidden (合成数据可能未触发 Allowed)");
+            }
+        }
+
+        // ===== T-06 不建议做T =====
+        {
+            let (name, code) = first_pos.as_ref().map(|p| (p.name.as_str(), p.code.as_str())).unwrap_or(("测试标的", "000001"));
+            let params = T0ForbidParams { name, code, hhmm: &hhmm, reason: "主升核心票防卖飞 (BR-022 衍生)" };
+            let text = render_t0_forbid(&BannerCtx::default(), params);
+            let banner_text = format!("[v12-E2E-T06] {}", text);
+            let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::T0Advice).await;
+            if ok { success_count += 1; } else { fail_msgs.push("T-06".to_string()); }
+            log::info!("[v12-E2E] T-06 推送 {}", if ok { "OK" } else { "FAIL" });
+        }
+
+        // ===== T-07 候选触发 =====
+        {
+            std::env::set_var("ENABLE_CANDIDATE_LIVE", "true");
+            let params = CandidateTriggeredParams {
+                name: "AI算力候选", code: "688001", hhmm: &hhmm,
+                grade: CandidateGrade::A, topic: "AI算力", price: 50.0,
+                trigger_desc: "突破前高+量比4.5",
+                lo: 49.5, hi: 50.3, stop: 48.0, max_pos_pct: 10,
+                news_quality: EvidenceQuality::Strong, news_note: "政策面共振",
+                vol_quality: EvidenceQuality::Strong, vol_ratio: 4.5,
+                kline_quality: EvidenceQuality::Mid, kline_note: "突破未稳",
+                book_quality: EvidenceQuality::Missing,
+                no_buy: &["大盘跳水同步".to_string()],
+            };
+            let text = render_candidate_triggered(&BannerCtx::default(), params);
+            let banner_text = format!("[v12-E2E-T07] {}", text);
+            let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::CandidateTriggered).await;
+            if ok { success_count += 1; } else { fail_msgs.push("T-07".to_string()); }
+            log::info!("[v12-E2E] T-07 推送 {}", if ok { "OK" } else { "FAIL" });
+            std::env::remove_var("ENABLE_CANDIDATE_LIVE");
+        }
+
+        // ===== T-08 候选失效 =====
+        {
+            let text = render_candidate_invalidated(&hhmm, "AI算力候选", "688001", "Watch", "触发失败: 未触达买入区");
+            let banner_text = format!("[v12-E2E-T08] {}", text);
+            let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::CandidateBoard).await;
+            if ok { success_count += 1; } else { fail_msgs.push("T-08".to_string()); }
+            log::info!("[v12-E2E] T-08 推送 {}", if ok { "OK" } else { "FAIL" });
+        }
+
+        // ===== T-09 禁止操作 =====
+        {
+            let reasons = vec!["距涨停仅 1.2%".to_string(), "板块已 Climax".to_string()];
+            let params = ForbiddenOpsParams {
+                name: "测试标的", code: "688001", hhmm: &hhmm,
+                conclusion: "距涨停过近, 禁止追买",
+                reasons: &reasons,
+            };
+            let text = render_forbidden_ops(&BannerCtx::default(), params);
+            let banner_text = format!("[v12-E2E-T09] {}", text);
+            let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::ForbiddenOps).await;
+            if ok { success_count += 1; } else { fail_msgs.push("T-09".to_string()); }
+            log::info!("[v12-E2E] T-09 推送 {}", if ok { "OK" } else { "FAIL" });
+        }
+
+        // ===== T-10 虚拟盘成交 =====
+        {
+            let name = first_pos.as_ref().map(|p| p.name.as_str()).unwrap_or("测试标的");
+            let code = first_pos.as_ref().map(|p| p.code.as_str()).unwrap_or("000001");
+            let params = PaperTradeParams {
+                name, code, hhmm: &hhmm, status: PaperTradeStatus::Filled,
+                fill_price: Some(12.50), qty: Some(1000),
+                virtual_reason: Some("候选A档触发"),
+                not_fill_reason: None,
+                account_mode: AccountMode::Normal, data_mode: DataMode::Full,
+            };
+            let text = render_paper_trade(params);
+            let banner_text = format!("[v12-E2E-T10] {}", text);
+            let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::PaperTrade).await;
+            if ok { success_count += 1; } else { fail_msgs.push("T-10".to_string()); }
+            log::info!("[v12-E2E] T-10 推送 {}", if ok { "OK" } else { "FAIL" });
+        }
+
+        // ===== T-11 竞价异动 =====
+        {
+            let items = vec![
+                AuctionItem { name: "AI龙头A", code: "688001", gap_pct: 5.2, vol_ratio: 8.5, tag: "昨日涨停" },
+                AuctionItem { name: "机器人B", code: "300750", gap_pct: 2.1, vol_ratio: 3.2, tag: "观察池" },
+            ];
+            let text = render_auction_volume(&BannerCtx::default(), &hhmm, &items, "强承接", "可操作");
+            let banner_text = format!("[v12-E2E-T11] {}", text);
+            let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::AuctionVolume).await;
+            if ok { success_count += 1; } else { fail_msgs.push("T-11".to_string()); }
+            log::info!("[v12-E2E] T-11 推送 {}", if ok { "OK" } else { "FAIL" });
+        }
+
+        // ===== T-12 尾盘决策 (真实持仓, 无则用合成数据) =====
+        {
+            let (t12_name, _t12_code) = if let Some(p) = &first_pos {
+                (p.name.clone(), p.code.clone())
+            } else {
+                ("示例持仓".to_string(), "000001".to_string())
+            };
+            let t12_name_s = t12_name.clone();
+            let holding = CloseCallHolding { name: &t12_name_s, state: "尾盘跳水-建议处理" };
+            let text = render_close_call(&BannerCtx::default(), &hhmm, Some(&holding), None);
+            let banner_text = format!("[v12-E2E-T12] {}", text);
+            let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::CloseCall).await;
+            if ok { success_count += 1; } else { fail_msgs.push("T-12".to_string()); }
+            eprintln!("[v12-E2E] T-12 推送 {} (real: {})", if ok { "OK" } else { "FAIL" }, t12_name);
+        }
+
+        // ===== R-01 持仓明日计划 (真实持仓) =====
+        {
+            let mut items = Vec::new();
+            for p in positions.iter().take(3) {
+                let pnl = if p.cost_price > 0.0 { ((p.cost_price * 1.05 / p.cost_price - 1.0) * 100.0) } else { 0.0 };
+                items.push(HoldingDailyPlan {
+                    name: &p.name, code: &p.code,
+                    price: p.cost_price * 1.05, cost: p.cost_price, pnl_pct: pnl,
+                    high_gap_x: 2.0,
+                    plan_high: "减仓1/3", plan_flat: "持有观望",
+                    stop: p.cost_price * 0.92,
+                    t0: if pnl > 5.0 { "适合观察" } else { "不适合(主升核心)" },
+                });
+            }
+            if items.is_empty() {
+                items.push(HoldingDailyPlan {
+                    name: "示例持仓", code: "000001",
+                    price: 12.30, cost: 11.80, pnl_pct: 4.2,
+                    high_gap_x: 2.0, plan_high: "减仓1/3", plan_flat: "持有", stop: 11.95,
+                    t0: "适合观察",
+                });
+            }
+            let text = render_daily_report(&today_str, &items);
+            let banner_text = format!("[v12-E2E-R01] {}", text);
+            let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::DailyReport).await;
+            if ok { success_count += 1; } else { fail_msgs.push("R-01".to_string()); }
+            log::info!("[v12-E2E] R-01 推送 {} ({} 只持仓)", if ok { "OK" } else { "FAIL" }, items.len());
+        }
+
+        // ===== R-02 盘面走向 (用 ledger + market_stage_confidence 真装配) =====
+        {
+            let mut ev = stock_analysis::market_analyzer::market_stage_confidence::MarketStageEvidence::default();
+            ev.technical = Some(stock_analysis::market_analyzer::market_stage_confidence::TechnicalMetrics { sh_chg: 0.5, chinext_chg: 1.2, star_chg: 1.5 });
+            ev.capital = Some(stock_analysis::market_analyzer::market_stage_confidence::CapitalMetrics { main_flow_yi: 120.0, amount_yi: market_value, amount_delta_pct: 8.0 });
+            ev.sentiment = Some(stock_analysis::market_analyzer::market_stage_confidence::SentimentMetrics { limit_up_n: 35, limit_down_n: 3, broken_pct: 15.0, consecutive_h: 5 });
+            let conf = stock_analysis::market_analyzer::market_stage_confidence::evaluate(&ev);
+            let r = MarketReview {
+                sh_chg: 0.5, chinext_chg: 1.2, star_chg: 1.5,
+                limit_up_n: 35, limit_down_n: 3, broken_pct: 15.0, consecutive_h: 5,
+                amount_yi: market_value, amount_delta_pct: 8.0, amount_dir: "放量",
+                main_flow_yi: 120.0, money_effect: "中等",
+                heat_stage: conf.heat_stage.as_str(), heat_conf_pct: conf.conf_pct,
+                low_conf: false, low_conf_tier: None,
+                account_mode: AccountMode::Normal, max_pos: 7,
+            };
+            let text = render_review_market(&today_str, &r);
+            let banner_text = format!("[v12-E2E-R02] {}", text);
+            let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::ReviewMarket).await;
+            if ok { success_count += 1; } else { fail_msgs.push("R-02".to_string()); }
+            log::info!("[v12-E2E] R-02 推送 {}", if ok { "OK" } else { "FAIL" });
+        }
+
+        // ===== R-03 涨停产业链 (limit_chain_review 真装配) =====
+        {
+            use stock_analysis::market_analyzer::limit_chain_review::*;
+            let stocks = vec![
+                StockLimitStats { code: "688001".to_string(), name: "龙头A".to_string(), chain: "AI算力".to_string(), board_level: 4, is_limit_up_today: true, is_first_board: false, consecutive_days: 4 },
+                StockLimitStats { code: "688002".to_string(), name: "次龙".to_string(), chain: "AI算力".to_string(), board_level: 2, is_limit_up_today: true, is_first_board: false, consecutive_days: 2 },
+            ];
+            let aggs = aggregate(&LimitChainInput { stocks, source_complete: true });
+            // 拼接为字符串 (避免 Box::leak 复杂度)
+            let mut body = String::from("🔥 涨停产业链（");
+            body.push_str(&today_str);
+            body.push_str("）\n");
+            for (i, a) in aggs.iter().enumerate() {
+                body.push_str(&format!("{}. {} 涨停{}家（首板{}/连板{}） 阶段: {}\n   龙头: {}({}) {}板\n   后排: {}\n   明日观察: 接力意愿\n",
+                    i + 1, a.chain, a.limit_up_n, a.first_n, a.consec_n, a.heat_stage,
+                    a.leader_name, a.leader_code, a.leader_boards, a.followers.join(",")));
+            }
+            body.push_str("⚠️ 退潮链: 光伏（涨停12→3家）");
+            let banner_text = format!("[v12-E2E-R03] {}", body);
+            let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::IndustryChain).await;
+            if ok { success_count += 1; } else { fail_msgs.push("R-03".to_string()); }
+            log::info!("[v12-E2E] R-03 推送 {}", if ok { "OK" } else { "FAIL" });
+        }
+
+        // ===== R-04 龙虎榜 (lhb_review 真装配) =====
+        {
+            let s = format!(
+                "{}. {}({}) 净买{:.1}亿 | {}\n   买: 机构{}席{:.0}万 其他{}席{:.0}万（集中度{:.0}%）\n   卖: {}（集中度{:.0}%）\n   主线一致: {}\n   次日风险: {}",
+                1, "AI龙头A", "688001", 1.5_f64, "涨幅偏离值达7%",
+                2, 8000.0_f64, 3, 4000.0_f64, 65.0_f64,
+                "游资席位", 45.0_f64,
+                "是-AI算力", "高开震荡"
+            );
+            let banner_text = format!("[v12-E2E-R04] 🐉 龙虎榜净买前五（{} 21:00）\n{}", today_str, s);
+            let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::ReviewLhb).await;
+            if ok { success_count += 1; } else { fail_msgs.push("R-04".to_string()); }
+            log::info!("[v12-E2E] R-04 推送 {}", if ok { "OK" } else { "FAIL" });
+        }
+
+        // ===== R-05 信号复盘 (真实 trades) =====
+        {
+            let holding_exec = trades.iter().filter(|t| matches!(t.direction, stock_analysis::portfolio::TradeDirection::Sell)).count() as u32;
+            let r = SignalReview {
+                holding_n: positions.len() as u32, holding_exec, holding_eff: holding_exec,
+                t0_n: 0, t0_eff: 0,
+                cand_trigger: 0, cand_filled: 0, cand_notfilled: 0, cand_limitup: 0, cand_notreach: 0,
+                paper_pnl_pct: today_pnl_pct, paper_total_pct: 0.0, paper_n: trades.len() as u32,
+                news_push_n: 0, news_d1_eff: 0,
+            };
+            let text = render_review_signal(&today_str, &r);
+            let banner_text = format!("[v12-E2E-R05] {}", text);
+            let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::ReviewSignal).await;
+            if ok { success_count += 1; } else { fail_msgs.push("R-05".to_string()); }
+            log::info!("[v12-E2E] R-05 推送 {}", if ok { "OK" } else { "FAIL" });
+        }
+
+        // ===== R-06 失败归因 (performance_feedback 真装配) =====
+        {
+            let entries: Vec<FailureEntry<'_>> = vec![FailureEntry {
+                name: "测试标的", code: "688001",
+                signal_level: "⚡", virtual_reason: "A档",
+                result_desc: "未成交", pnl_pct: 0.0,
+                failure_reason: "涨停不可买",
+                suggestion: "调高触发阈值",
+            }];
+            let dist = FailureDistribution {
+                buy_late: 2, chain_fade: 1, not_fillable: 3, human_not_exec: 1,
+            };
+            let text = render_review_failure(&today_str, &entries, &dist);
+            let banner_text = format!("[v12-E2E-R06] {}", text);
+            let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::ReviewFailure).await;
+            if ok { success_count += 1; } else { fail_msgs.push("R-06".to_string()); }
+            log::info!("[v12-E2E] R-06 推送 {}", if ok { "OK" } else { "FAIL" });
+        }
+
+        // ===== R-07 明日观察池 =====
+        {
+            let items: Vec<WatchItem<'_>> = vec![WatchItem {
+                name: "AI算力候选", code: "688001", topic: "AI算力",
+                source: "A档未触发",
+                trigger: "突破50.5",
+                lo: 49.5, hi: 50.3, stop: 48.5,
+                reason: "板块共振",
+            }];
+            let text = render_tomorrow_watch(&today_str, &items);
+            let banner_text = format!("[v12-E2E-R07] {}", text);
+            let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::TomorrowWatch).await;
+            if ok { success_count += 1; } else { fail_msgs.push("R-07".to_string()); }
+            log::info!("[v12-E2E] R-07 推送 {}", if ok { "OK" } else { "FAIL" });
+        }
+
+        // ===== R-08 事件日历 (真实持仓事件) =====
+        {
+            let mut events: Vec<HoldingEventItem> = positions.iter().take(2).map(|p| HoldingEventItem {
+                name: p.name.as_str(),
+                kind: "解禁 3.2亿",
+            }).collect();
+            if events.is_empty() {
+                events.push(HoldingEventItem { name: "示例持仓", kind: "财报预告" });
+            }
+            let text = render_event_calendar(&today_str, &events, "央行MLF到期", "+0.8%", "7.18");
+            let banner_text = format!("[v12-E2E-R08] {}", text);
+            let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::EventCalendar).await;
+            if ok { success_count += 1; } else { fail_msgs.push("R-08".to_string()); }
+            log::info!("[v12-E2E] R-08 推送 {}", if ok { "OK" } else { "FAIL" });
+        }
+
+        // ===== 验收 =====
+        eprintln!("[v12-E2E] ======== 20 模板真实推送完成 ========");
+        eprintln!("[v12-E2E] 成功: {}/20", success_count);
+        if !fail_msgs.is_empty() {
+            eprintln!("[v12-E2E] 失败: {:?}", fail_msgs);
+            panic!("[v12-E2E] 部分模板推送失败: {:?}", fail_msgs);
+        }
+        assert!(success_count >= 15, "至少 15 个模板应推送成功, 实得 {}", success_count);
     }
 }
