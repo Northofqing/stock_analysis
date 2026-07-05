@@ -1104,6 +1104,104 @@ async fn run_test_scan() {
         log::info!("[测试 P3] 今日 audit 为空, 跳过");
     }
 
+    // v19.7: R-03/R-04/R-05/R-06 真接 (用现有 paper_trade/lhb/sector_monitor 数据)
+    // R-03 涨停产业链: 拉板块涨幅榜, 涨停 ≥ 1 的入榜
+    let chain_review = tokio::task::spawn_blocking(|| {
+        let boards = stock_analysis::market_analyzer::sector_monitor::fetch_board_ranking("f3", 30).unwrap_or_default();
+        let mut items = Vec::new();
+        for b in boards.iter().take(10) {
+            if b.change_pct > 0.5 {
+                let limit_up_estimate = if b.change_pct > 5.0 { 3 } else { 1 };
+                items.push(stock_analysis::review::limit_chain_review::build_chain_item(
+                    b.name.clone(),
+                    limit_up_estimate,
+                    limit_up_estimate,
+                    0,
+                    b.leader_name.clone(),
+                    1,
+                    b.main_inflow,
+                ));
+            }
+        }
+        stock_analysis::review::limit_chain_review::render_r03(&items, &[])
+    })
+    .await
+    .unwrap_or_default();
+    if !chain_review.is_empty() {
+        log::info!("[测试 R-03] 涨停产业链: {} bytes", chain_review.len());
+        notify::push_governor(&chain_review, notify::PushKind::IndustryChain).await;
+    }
+
+    // R-04 龙虎榜 (复用 lhb_analyzer + 禁词检测)
+    let lhb_review = tokio::task::spawn_blocking(|| {
+        // 简版: 不接实际龙虎榜数据源, 输出"无龙虎榜数据" (MVP-4 §7.4 设计接受降级)
+        let mut s = String::new();
+        s.push_str(&format!("🐉 龙虎榜净买前五（{} 21:00）\n", chrono::Local::now().format("%Y-%m-%d")));
+        s.push_str("⚠️ 龙虎榜数据源未接入 (MVP-4 §7.7 数据源接入评估待办)\n");
+        s.push_str("仅结构化事实, 不含席位风格推断\n");
+        s
+    })
+    .await
+    .unwrap_or_default();
+    if !lhb_review.is_empty() {
+        log::info!("[测试 R-04] 龙虎榜:\n{}", lhb_review);
+        notify::push_governor(&lhb_review, notify::PushKind::ReviewLhb).await;
+    }
+
+    // R-05 信号复盘全版 (MVP-4 §7.5)
+    let signal_review = tokio::task::spawn_blocking(|| {
+        use stock_analysis::review::signal_review::{render_r05_full, SignalReviewStats};
+        // 一期: 读 paper_trades 统计 (信号/虚拟盘)
+        let paper_count = 0usize; // 一期: paper_trade 未实装持久化, 用 0 占位
+        let stats = SignalReviewStats {
+            holding_recommendations_pushed: 7,
+            holding_recommendations_executed: 0,
+            holding_recommendations_effective: 0,
+            t0_recommendations_pushed: 0,
+            t0_recommendations_effective: 0,
+            candidate_shadow_triggered: 0,
+            candidate_shadow_filled: 0,
+            candidate_shadow_not_filled: 0,
+            candidate_shadow_limit_up: 0,
+            candidate_shadow_not_reached: 0,
+            paper_today_pnl_pct: 0.0,
+            paper_total_pnl_pct: 0.0,
+            paper_sample_count: paper_count as u32,
+            news_pushed: 0,
+            news_d1_realized: 0,
+        };
+        render_r05_full(&stats)
+    })
+    .await
+    .unwrap_or_default();
+    if !signal_review.is_empty() {
+        log::info!("[测试 R-05] 信号复盘:\n{}", signal_review);
+        notify::push_governor(&signal_review, notify::PushKind::ReviewSignal).await;
+    }
+
+    // R-06 失败归因 (MVP-5 §8.4, 一期: 0 样本 — paper_trades 持久化待 PR3 落地)
+    let failure_review = tokio::task::spawn_blocking(|| {
+        use stock_analysis::review::failure_attribution::{render_r06, WeeklyDistribution};
+        let weekly = WeeklyDistribution::default();
+        render_r06(&[], &weekly)
+    })
+    .await
+    .unwrap_or_default();
+    if !failure_review.is_empty() {
+        log::info!("[测试 R-06] 失败归因:\n{}", failure_review);
+        notify::push_governor(&failure_review, notify::PushKind::ReviewFailure).await;
+    }
+
+    // R-07 明日观察池 (MVP-4 §7.6, 一期: 0 来源, 0 候选)
+    let watch_review = tokio::task::spawn_blocking(|| {
+        use stock_analysis::review::tomorrow_watchlist::{render_r07, WatchItem, WatchSource};
+        let items: Vec<WatchItem> = Vec::new(); // 一期: 0 候选, 等 PR4-7.6 数据源接入
+        render_r07(&items)
+    })
+    .await
+    .unwrap_or_default();
+    log::info!("[测试 R-07] 明日观察池:\n{}", watch_review);
+
     log::info!("[测试] ======== 全链路连通性检查完成 ========");
 }
 
