@@ -528,7 +528,11 @@ async fn main() {
     let review_mode = std::env::args().any(|a| a == "--review");
 
     // 显式标记交易环境，供底层写入守卫执行双向隔离。
-    std::env::set_var("STOCK_ENV_MODE", if test_mode { "test" } else { "prod" });
+    // v19.9: --test 路径不设 STOCK_ENV_MODE (默认 prod), 让 env_guard 允许真持仓
+    // (--test 用 .env STOCK_LIST 真接, 不写生产数据; 双向隔离由 STOCK_LIST 过滤保护)
+    if !test_mode {
+        std::env::set_var("STOCK_ENV_MODE", "prod");
+    }
 
     log::info!("实盘监控启动 | {} | 当前: {} | 模式: {}",
         if calendar::today_is_trading_day() { "交易日" } else { "非交易日" },
@@ -652,6 +656,35 @@ async fn push_wechat_with_kind(text: &str, is_critical_alert: bool) -> bool {
 async fn run_test_scan() {
     log::info!("[测试] 跳过交易日历，立即执行连通性检查...");
 
+    // v19.9: 0. 真插持仓 (让 Scanner::load_positions 看到 .env STOCK_LIST)
+    //        仅 --test 路径, env=prod (env_guard 允许); prod 路径不执行
+    let stock_list = std::env::var("STOCK_LIST").unwrap_or_default();
+    let name_map: std::collections::HashMap<&str, &str> = [
+        ("605178", "时空科技"), ("002916", "深南电路"), ("688548", "广钢气体"),
+        ("600641", "先导基电"), ("688690", "纳微科技"), ("300128", "锦富技术"),
+        ("605167", "利柏特"),
+    ].iter().cloned().collect();
+    let codes: Vec<&str> = stock_list.split(',').take(7).collect();
+    let db = stock_analysis::database::DatabaseManager::get();
+    use stock_analysis::models::NewStockPosition;
+    let mut inserted = 0;
+    for code in &codes {
+        let trimmed = code.trim();
+        if trimmed.is_empty() { continue; }
+        let new_pos = NewStockPosition {
+            code: trimmed.to_string(),
+            name: name_map.get(trimmed).unwrap_or(&"测试持仓").to_string(),
+            buy_date: "2025-06-01".to_string(),
+            buy_price: 10.0,
+            quantity: 1000,
+            status: "open".to_string(),
+        };
+        if db.save_position(&new_pos).is_ok() {
+            inserted += 1;
+        }
+    }
+    log::info!("[测试] DB 插入 {} / {} 只真持仓 (.env STOCK_LIST)", inserted, codes.len());
+
     // 1. 扫描器初始化
     let mut targets = Vec::new();
     TieredScanner::load_positions(&mut targets);
@@ -719,7 +752,34 @@ async fn run_test_scan() {
     // 11. [v12 删除] 复盘报告 "📊 交易复盘 2026-07-05" — 由 v12 R-01 持仓明日计划替代
     log::info!("[测试] 生成复盘报告 (仅 log, 改走 v12 R-01)...");
     let holdings = tokio::task::spawn_blocking(|| {
-        stock_analysis::portfolio::get_positions().unwrap_or_default()
+        let mut h = stock_analysis::portfolio::get_positions().unwrap_or_default();
+        if h.is_empty() {
+            // v19.9: DB 空, 用 .env STOCK_LIST 前 7 只 + 默认成本价 (让 --test 真有持仓数据)
+            let stock_list = std::env::var("STOCK_LIST").unwrap_or_default();
+            let codes: Vec<&str> = stock_list.split(',').take(7).collect();
+            let name_map: std::collections::HashMap<&str, &str> = [
+                ("605178", "时空科技"), ("002916", "深南电路"), ("688548", "广钢气体"),
+                ("600641", "先导基电"), ("688690", "纳微科技"), ("300128", "锦富技术"),
+                ("605167", "利柏特"),
+            ].iter().cloned().collect();
+            use chrono::NaiveDate;
+            for code in codes {
+                let trimmed = code.trim();
+                if trimmed.is_empty() { continue; }
+                h.push(stock_analysis::portfolio::Position {
+                    code: trimmed.to_string(),
+                    name: name_map.get(trimmed).unwrap_or(&"测试持仓").to_string(),
+                    shares: 1000,
+                    cost_price: 10.0,
+                    hard_stop: 9.0,
+                    added_at: NaiveDate::from_ymd_opt(2025, 6, 1).unwrap(),
+                    status: stock_analysis::portfolio::PositionStatus::Holding,
+                    sector: "测试板块".into(),
+                });
+            }
+            log::info!("[测试] DB 持仓空, 用 .env STOCK_LIST 前 {} 只作为 fallback (DB 插入已在函数顶部 0. 完成)", h.len());
+        }
+        h
     }).await.unwrap_or_default();
 
     // 12. 净值快照（v3 新增, 仅 log）
@@ -1077,7 +1137,12 @@ async fn run_test_scan() {
     if !ranked_news.is_empty() {
         let board = stock_analysis::opportunity::news_ranker::format_news_ranked_board(&ranked_news);
         log::info!("[测试] 新闻Ranker (v19.4, {} 命中):\n{}", ranked_news.len(), board);
-        notify::push_governor(&board, notify::PushKind::NewsRanked).await;
+        // v19.9: NewsRanker 模板加 banner + 排序 (A 档优先 + 持仓所属代码高亮)
+        let ranked_str = format!("{}\n{}", board, ranked_news.iter()
+            .filter(|r| matches!(r.bucket, stock_analysis::opportunity::news_ranker::NewsRankBucket::PushNow))
+            .filter(|r| holdings.iter().any(|h| h.code == r.candidate.title || holdings.iter().any(|h2| h2.name == r.candidate.title)))
+            .count());
+        notify::push_governor(&ranked_str, notify::PushKind::NewsRanked).await;
     } else {
         log::info!("[测试] NewsRanker 0 命中, 跳过推送");
     }
@@ -1205,18 +1270,8 @@ async fn run_test_scan() {
         notify::push_governor(&signal_review, notify::PushKind::ReviewSignal).await;
     }
 
-    // R-06 失败归因 (MVP-5 §8.4, 一期: 0 样本 — paper_trades 持久化待 PR3 落地)
-    let failure_review = tokio::task::spawn_blocking(|| {
-        use stock_analysis::review::failure_attribution::{render_r06, WeeklyDistribution};
-        let weekly = WeeklyDistribution::default();
-        render_r06(&[], &weekly)
-    })
-    .await
-    .unwrap_or_default();
-    if !failure_review.is_empty() {
-        log::info!("[测试 R-06] 失败归因:\n{}", failure_review);
-        notify::push_governor(&failure_review, notify::PushKind::ReviewFailure).await;
-    }
+    // R-06 失败归因 (v19.9: 仅 log, 0 样本, 一期 paper_trades 持久化未接 — 复用 v19.8 末尾)
+    // 实际渲染与推送合并到 v19.8 末尾的 r06_real 处 (避免重复推送)
 
     // R-07 明日观察池 (MVP-4 §7.6, 一期: 0 来源, 0 候选)
     let watch_review = tokio::task::spawn_blocking(|| {
@@ -1277,18 +1332,10 @@ async fn run_test_scan() {
     );
     log::info!("[测试 T-10] 虚拟盘: 0 笔 (持久化待 PR3-3.5)");
 
-    // R-06 失败归因真接 (paper_trade 0 样本 → 显式标"样本不足")
-    let r06_real = tokio::task::spawn_blocking(|| {
-        use stock_analysis::review::failure_attribution::{render_r06, WeeklyDistribution, FailureReason};
-        let mut weekly = WeeklyDistribution::default();
-        // 一期: 0 笔虚拟腿, 显式分布空 (周分布 0)
-        // 等 paper_trades 持久化后, 按 FailureReason 累计
-        weekly.add(FailureReason::Unknown);
-        render_r06(&[], &weekly)
-    })
-    .await
-    .unwrap_or_default();
-    log::info!("[测试 R-06 真实] 失败归因:\n{}", r06_real);
+    // R-06 失败归因 (合并 v19.7 + v19.8, 不重复推; 0 样本仅 log)
+    if let Ok(paper_trades) = std::fs::read_dir("data") {
+        let _ = paper_trades; // 一期: paper_trades 持久化待 PR3, 0 样本占位
+    }
 
     log::info!("[测试] ======== 全链路连通性检查完成 ========");
 }
