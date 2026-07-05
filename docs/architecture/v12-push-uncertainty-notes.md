@@ -59,6 +59,24 @@
 **影响**: 仅警告, 不阻塞编译/测试.
 **状态**: 各 PR 合入相应消费者后警告自动消失.
 
+## Q-20 [P0] 已修复: account_mode Frozen 被数据缺失降级
+**问题**: `account_mode.rs:100` 数据缺失分支早返回 ReduceOnly, 不论 prev 是什么. 与 BR-021 "Frozen 必须等下一交易日盘前重置" 矛盾.
+**触发**: 盘后 ledger 写入延迟 → data_complete=false → prev=Frozen 被强制改成 ReduceOnly → T-01 推送"Normal→ReduceOnly" 假变更 → 审计污染 + 误开新仓.
+**修复** (2026-07-05): 加 0 分支 `if matches!(prev, Some(Frozen))` 优先于数据缺失分支. 测试 `missing_data_does_not_override_frozen` → `missing_data_keeps_frozen`, 断言 Frozen.
+**影响**: 全部账户模式审计 + T-01 推送.
+
+## Q-21 [P0] 已修复: paper_trade.simulate 不检查 INSERT OR IGNORE 结果
+**问题**: `paper_trade.rs:148` `diesel::sql_query(...).execute(...)` 返回的 rows_affected 被丢弃. 重复 plan_id 调用返 Ok 而 DB 未插行.
+**触发**: 同 plan_id 第二次 simulate (例如 T+1 重评) 返回新 status (NotFilled), 但 DB 仍 Filled. execution_tracking 后续结算按 Filled 算 → 业绩归因错位.
+**修复** (2026-07-05): 新增 `PaperOutcome { result, inserted: bool }`. 调用方根据 `inserted` 决定是否启动 T+1 跟踪. simulate 返回类型由 `PaperResult` 改为 `PaperOutcome`.
+**影响**: paper_trades + execution_tracking + MVP-5 performance_feedback 业绩统计.
+
+## Q-22 [P1] 已修复: query_chain_held_count 非确定性选 chain
+**问题**: `position_tracker.rs:121` `SELECT chain_name ... LIMIT 1` 无 ORDER BY, SQLite 按 rowid 返回. 同 code 多 chain 时不同时间查询可能返回不同 row.
+**触发**: 同 code 多主题混合持仓, 集中度告警时有时无, BR-015 真集中度被绕过.
+**修复** (2026-07-05): 加 `ORDER BY buy_date DESC, id DESC LIMIT 1`, 取最新建仓的 chain.
+**影响**: BR-015 集中度告警可信度. 后续 PR 接 chain 聚合 (方案 B) 时再做彻底改造.
+
 ## Q-11 [P0] freshness 测试 pre-existing flake
 **问题**: `freshness::tests::validate_nav_freshness_passes_recent_date` 在 2026-07-05 03:xx CST 跑失败 (断言 `validate_nav_freshness(today)`).
 **根因**: freshness.rs 内有交易时段/日历判断, 凌晨时段可能落入"非交易日窗口". freshness.rs **未在本次改动中触碰** (git diff 已确认).

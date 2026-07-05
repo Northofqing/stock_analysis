@@ -110,15 +110,24 @@ fn validate_trade_symbol_env(code: &str) -> Result<(), String> {
 
 /// v12 PR3-3.6 (BR-015 偿还): 查同 chain 已持仓数 (open status).
 ///
-/// 实现: 先取本标的 chain_name, 再数同 chain 的 open 持仓数.
+/// 实现: 先取本标的**最近建仓**的 chain_name (ORDER BY buy_date DESC, id DESC),
+///       再数同 chain 的 open 持仓数.
 /// DB 错误时返回 0 (不阻断, 走 fallback 旧 hardcoded 行为).
+///
+/// Bug #3 fix (2026-07-05): 无 ORDER BY 的 LIMIT 1 在 SQLite 下非稳定,
+/// 同 code 多 chain 时不同时间查询可能返回不同 row. 加 ORDER BY 后取最新建仓.
 fn query_chain_held_count(code: &str) -> Result<i32, String> {
     let mut conn = DatabaseManager::get().get_conn().map_err(|e| format!("DB: {}", e))?;
 
     // raw SQL 全部 (避免 diesel count/select trait bound 不稳定)
     let esc = |s: &str| s.replace('\'', "''");
+    // 取最新建仓的 chain_name (排除 '其他' 占位 + NULL)
+    // ORDER BY buy_date DESC, id DESC 保证稳定性 (id 是 rowid 唯一)
     let sql_chain = format!(
-        "SELECT chain_name FROM stock_position WHERE code = '{}' AND status = 'open' LIMIT 1",
+        "SELECT chain_name FROM stock_position \
+         WHERE code = '{}' AND status = 'open' \
+           AND chain_name IS NOT NULL AND chain_name != '' AND chain_name != '其他' \
+         ORDER BY buy_date DESC, id DESC LIMIT 1",
         esc(code)
     );
     let chain_row: Option<ChainNameRow> = diesel::sql_query(sql_chain)

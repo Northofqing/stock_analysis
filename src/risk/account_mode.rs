@@ -97,7 +97,17 @@ pub fn evaluate(
     prev: Option<AccountMode>,
     thresholds: &ModeThresholds,
 ) -> ModeEvaluation {
-    // 1. 数据缺失 → 保守 ReduceOnly
+    // 0. Frozen 状态保持优先 (BR-021 强制: 等下一交易日盘前重置, 不运行时回退)
+    //    即使数据缺失也不能掩盖 Frozen 状态 — 会污染审计 + 误导下游 RiskMode
+    if matches!(prev, Some(AccountMode::Frozen)) {
+        return ModeEvaluation {
+            mode: AccountMode::Frozen,
+            trigger_reason: Some("Frozen 状态保持 (BR-021 强制, 等下一交易日盘前重置)".to_string()),
+            prev_mode: prev,
+        };
+    }
+
+    // 1. 数据缺失 → 保守 ReduceOnly (此时 prev 必非 Frozen, 已由 0 分支覆盖)
     if !metrics.data_complete {
         return ModeEvaluation {
             mode: AccountMode::ReduceOnly,
@@ -150,16 +160,8 @@ pub fn evaluate(
         };
     }
 
-    // 4. 触发线都没碰 → Normal (但 Frozen 不回退 — 见上 Frozen 处理注释)
-    if matches!(prev, Some(AccountMode::Frozen)) {
-        // Frozen 必须等下一交易日盘前重置 (PR1-1.7), 当前版本保持 Frozen
-        return ModeEvaluation {
-            mode: AccountMode::Frozen,
-            trigger_reason: Some("Frozen 状态保持 (等下一交易日盘前重置)".to_string()),
-            prev_mode: prev,
-        };
-    }
-
+    // 4. 触发线都没碰 → Normal
+    //    (Frozen 状态保持已在最前面 0 分支处理, 这里不再重复)
     ModeEvaluation {
         mode: AccountMode::Normal,
         trigger_reason: None,
@@ -330,17 +332,17 @@ mod tests {
     }
 
     #[test]
-    fn missing_data_does_not_override_frozen() {
-        // 数据缺失 + 当前 Frozen → 仍 Frozen (避免掩盖状态)
-        // 但当前实现是 ReduceOnly (保守), 测试这个预期
+    fn missing_data_keeps_frozen() {
+        // 修复 (2026-07-05 BR-021 强制): 数据缺失 + prev=Frozen → 必须保持 Frozen.
+        // BR-021 明确说"Frozen 必须等下一交易日盘前重置", 不运行时回退.
+        // 旧实现走 ReduceOnly, 会污染审计 + 误开 RiskMode 降级.
         let metrics = PortfolioMetrics {
             data_complete: false,
             ..Default::default()
         };
         let r = evaluate(&metrics, Some(AccountMode::Frozen), &t());
-        // 注: 数据缺失的保守策略不区分 prev, 一律 ReduceOnly
-        // 这是有意设计: 数据缺失时宁可过度保守, 也不假设 Normal
-        assert_eq!(r.mode, AccountMode::ReduceOnly);
+        assert_eq!(r.mode, AccountMode::Frozen, "Frozen 必须保持 (BR-021)");
+        assert!(r.trigger_reason.as_ref().unwrap().contains("Frozen"));
     }
 
     // ---- 阈值自定义 ----

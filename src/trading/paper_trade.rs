@@ -16,7 +16,6 @@
 use diesel::prelude::*;
 
 use crate::database::DatabaseManager;
-use crate::schema::paper_trades;
 
 /// 虚拟盘状态
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -119,8 +118,20 @@ pub fn evaluate(signal: &PaperSignal) -> PaperResult {
     }
 }
 
+/// 模拟成交结果 (含 DB 写入状态)
+#[derive(Clone, Debug)]
+pub struct PaperOutcome {
+    /// 评估结果 (Filled / NotFilled / Invalidated)
+    pub result: PaperResult,
+    /// true = INSERT 实际写入; false = INSERT OR IGNORE 跳过 (plan_id 重复)
+    pub inserted: bool,
+}
+
 /// 模拟成交: 写 paper_trades (含 plan_id 幂等)
-pub fn simulate(signal: &PaperSignal) -> Result<PaperResult, String> {
+///
+/// 返回 `PaperOutcome::inserted` 区分新建 vs 跳过 (plan_id 已存在).
+/// 调用方据此决定是否启动 execution_tracking 跟踪 (PR3-3.5 fix).
+pub fn simulate(signal: &PaperSignal) -> Result<PaperOutcome, String> {
     let result = evaluate(signal);
     let mut conn = DatabaseManager::get()
         .get_conn()
@@ -152,11 +163,14 @@ pub fn simulate(signal: &PaperSignal) -> Result<PaperResult, String> {
         esc(&signal.account_mode),
         esc(&signal.data_mode),
     );
-    diesel::sql_query(sql)
+    let rows = diesel::sql_query(sql)
         .execute(&mut conn)
         .map_err(|e| format!("insert paper_trades: {}", e))?;
 
-    Ok(result)
+    Ok(PaperOutcome {
+        result,
+        inserted: rows > 0,
+    })
 }
 
 #[cfg(test)]
@@ -243,5 +257,39 @@ mod tests {
     fn direction_strings() {
         assert_eq!(Direction::Buy.as_str(), "buy");
         assert_eq!(Direction::Sell.as_str(), "sell");
+    }
+
+    // ---- PaperOutcome.inserted 字段 (Bug #2 fix) ----
+
+    #[test]
+    fn paper_outcome_struct_fields() {
+        // PaperOutcome 必须含 inserted 字段, 调用方据此决定是否启动 T+1 跟踪
+        let o = PaperOutcome {
+            result: PaperResult {
+                status: PaperTradeStatus::Filled,
+                fill_price: Some(10.0),
+                not_fill_reason: None,
+            },
+            inserted: true,
+        };
+        assert!(o.inserted);
+        assert!(matches!(o.result.status, PaperTradeStatus::Filled));
+    }
+
+    #[test]
+    fn paper_outcome_inserted_flag_semantic() {
+        // inserted=true: 实际写入 (rows_affected > 0)
+        // inserted=false: plan_id 已存在 (rows_affected = 0, INSERT OR IGNORE 跳过)
+        // 调用方: inserted=true 才启动 execution_tracking
+        let inserted_true = PaperOutcome {
+            result: PaperResult { status: PaperTradeStatus::Filled, fill_price: Some(10.0), not_fill_reason: None },
+            inserted: true,
+        };
+        let inserted_false = PaperOutcome {
+            result: PaperResult { status: PaperTradeStatus::NotFilled, fill_price: None, not_fill_reason: Some("涨停不可买".to_string()) },
+            inserted: false,
+        };
+        assert!(inserted_true.inserted, "新建场景应 inserted=true");
+        assert!(!inserted_false.inserted, "重复 plan_id 应 inserted=false (避免假成功)");
     }
 }
