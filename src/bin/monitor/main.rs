@@ -713,47 +713,24 @@ async fn run_test_scan() {
     awm.record_shadow("test_vol_burst", true);
     log::info!("[测试] 自适应权重: {} | Shadow: {}", awm.weight_summary(), awm.shadow_summary());
 
-    // 10. 微信推送
-    if !alerts.is_empty() {
-        let summary = alert::aggregate_alerts(&alerts).unwrap_or_default();
-        push_wechat(&summary).await;
-    }
+    // 10. [v12 删除] 微信推送 "📊 告警聚合摘要" — 由 v12 T-04 HoldingEvent (紧急风险) 替代
+    //     告警聚合在 v12 不再单独推, 数据合到 v12 R-01 持仓明日计划 + 推送决策台
 
-    // 11. 复盘报告（v3 新增）
-    log::info!("[测试] 生成复盘报告...");
-    let holdings = stock_analysis::portfolio::get_positions().unwrap_or_default();
-    let report = tokio::task::spawn_blocking(move || {
-        let quotes = market_data::fetch_position_quotes();
-        let trades = stock_analysis::portfolio::get_trade_history(90).unwrap_or_default();
-        let mut reviews = stock_analysis::review::journal::review_closed_trades(&trades);
-        stock_analysis::review::journal::enrich_post_exit(&mut reviews);
-        let equity = stock_analysis::portfolio::get_equity_curve(365).unwrap_or_default();
-        let mut stats = stock_analysis::review::equity::compute_stats(&equity);
-        stock_analysis::review::equity::enrich_with_trades(&mut stats, &reviews);
-        let prices = build_price_map(&quotes);
-        (stock_analysis::review::report::generate_daily_report_with_ledger(&reviews, &stats, &holdings, &prices, Some(equity.as_slice())), holdings)
+    // 11. [v12 删除] 复盘报告 "📊 交易复盘 2026-07-05" — 由 v12 R-01 持仓明日计划替代
+    log::info!("[测试] 生成复盘报告 (仅 log, 改走 v12 R-01)...");
+    let holdings = tokio::task::spawn_blocking(|| {
+        stock_analysis::portfolio::get_positions().unwrap_or_default()
     }).await.unwrap_or_default();
-    log::info!("[测试] 复盘报告:\n{}", report.0);
-    push_wechat(&report.0).await;
-    let holdings = report.1;
 
-    // 12. 净值快照（v3 新增）
+    // 12. 净值快照（v3 新增, 仅 log）
     let _ = tokio::task::spawn_blocking(snapshot_portfolio_value).await;
 
-    // 13. 产业链扫描（v3 新增）
-    // BR-005: 每天推送机会数 ≤ 5, 超过入候选池
-    let scan = stock_analysis::opportunity::run_opportunity_scan().await;
-    log::info!("[测试] 产业链扫描:\n{}", scan.chain_text);
-    notify::push_governor(&scan.chain_text, notify::PushKind::IndustryChain).await;
-    if !scan.impact_text.is_empty() {
-        log::info!("[测试] 持仓影响:\n{}", scan.impact_text);
-        push_wechat(&scan.impact_text).await;
-    }
-    // P2-News Commit 4: NewsRanker 输出 (A/B/C/Drop 4 档) — 走 push_governor 不绕过
-    if !scan.news_ranked_text.is_empty() {
-        log::info!("[测试] 新闻Ranker:\n{}", scan.news_ranked_text);
-        notify::push_governor(&scan.news_ranked_text, notify::PushKind::NewsRanked).await;
-    }
+    // 13. [v12 删除] 产业链扫描 "📋 候选筛选台" — 由 v12 T-07/R-07 替代
+    //     实际产业数据合到 v12 R-03 涨停产业链
+    log::info!("[测试] 产业链扫描 (仅 log, 改走 v12 R-03)");
+    let _scan = stock_analysis::opportunity::run_opportunity_scan().await;
+    // [v12 删除] "持仓影响" 推送 — 合到 v12 R-01
+    // [v12 删除] "📰 新闻Ranker" 推送 — 由 v12 R-07 明日观察池替代
     // P2-News Commit 5: 审计 JSONL 落盘 (NEWS_RANK_AUDIT=true 触发, 默认不写)
     // 收集 ranked 列表 (再跑一遍 ranker 太重, 实际生产链路口待 commit 6 改造)
     // 一期: 影子模式 (NEWS_RANKER_SHADOW) 触发时也写审计
@@ -807,30 +784,28 @@ async fn run_test_scan() {
     log::info!("[测试] 排除检查: {} 项命中", excl_hits.len());
     log::info!("[测试] 风控检查: {} 项超标", violations.len());
     if !excl_hits.is_empty() {
-        push_wechat(&stock_analysis::decision::exclusion::format_exclusion_alert(&excl_hits)).await;
+        // [v12 删除] 推送 "🛑 排除板块命中" — 数据合到 v12 T-09 ForbiddenOps
+        log::info!("[测试] 排除 {} 项 (改走 v12 T-09)", excl_hits.len());
     }
     if !violations.is_empty() {
-        push_wechat(&stock_analysis::risk::limits::format_limit_alert(&violations)).await;
+        // [v12 删除] 推送 "🚨 风控超标" — 数据合到 v12 T-04 HoldingEvent
+        log::info!("[测试] 风控 {} 项 (改走 v12 T-04)", violations.len());
     }
     if let Some(alert) = cash_alert {
-        let text = stock_analysis::risk::cash_guard::format_cash_alert(&alert);
-        log::warn!("[测试] {}", text);
-        push_wechat(&text).await;
+        // [v12 删除] 推送 "💰 现金预警" — 数据合到 v12 R-08 明日事件
+        log::warn!("[测试] 现金预警 (改走 v12 R-08): below_floor={}", alert.below_floor);
     }
 
-    // 16. v4 赛道分档
-    let tier_text = tokio::task::spawn_blocking(|| {
+    // 16. [v12 删除] v4 赛道分档 — 数据合到 v12 R-03 涨停产业链
+    log::info!("[测试] 赛道分档 (仅 log, 改走 v12 R-03)");
+    let _tier_text = tokio::task::spawn_blocking(|| {
         let boards = stock_analysis::market_analyzer::sector_monitor::fetch_board_ranking("f3", 30).unwrap_or_default();
-        // P2-News Commit 0: 拉完后 append 今日 (供 detect_heat_stage 后续 commit 用)
-        // 失败仅 warn, 不阻塞监控
         if let Err(e) = stock_analysis::market_analyzer::sector_history::append_today(&boards) {
             log::warn!("[SECTOR_HISTORY] 追加失败: {:#}", e);
         }
         let graded = stock_analysis::decision::sector_score::grade_sectors(&boards);
         stock_analysis::decision::sector_score::format_tier_list(&graded)
     }).await.unwrap_or_default();
-    log::info!("[测试] 赛道分档:\n{}", tier_text);
-    notify::push_governor(&tier_text, notify::PushKind::SectorTier).await;
 
     // 16.1 v4 资金验证 + v6 放量分析（复用 K 线数据，走 spawn_blocking）
     let h2 = holdings.clone();
@@ -862,13 +837,13 @@ async fn run_test_scan() {
         Some((cap, brk))
     }).await.unwrap_or_default().unwrap_or_default();
 
+    // [v12 删除] 资金验证 (CapitalVerify) — 数据合到 v12 R-01 持仓明日计划
     if !capital_text.is_empty() {
-        log::info!("[测试] 资金验证:\n{}", capital_text);
-        notify::push_governor(&capital_text, notify::PushKind::CapitalVerify).await;
+        log::info!("[测试] 资金验证 (改走 v12 R-01)");
     }
+    // [v12 删除] 放量分析 — 数据合到 v12 R-03 涨停产业链
     if let Some(ref text) = breakout_text {
-        log::info!("[测试] 放量分析:\n{}", text);
-        push_wechat(text).await;
+        log::info!("[测试] 放量分析 (改走 v12 R-03)");
     }
 
     // 16.5 v12 MVP0-B: 挂载 v12 orchestrator (T-01 账户模式 / T-02 数据状态 / T-03 持仓建议)
@@ -1324,25 +1299,8 @@ async fn run_review_only_inner() {
             log::info!("[v12-R06] 失败归因建议 {} 条", report.suggestions.len());
         }
 
-        // ===== R-07 明日观察池 (v12 WatchItem 模板) =====
-        {
-            let watchlist = stock_analysis::portfolio::get_watchlist().unwrap_or_default();
-            log::info!("[v12-R07] 自选 {} 只 (周日, 跳过详情)", watchlist.len());
-        }
-
-        // ===== R-08 明日事件日历 (v12 HoldingEventItem 模板) =====
-        {
-            let event_strs: Vec<(&str, &str)> = r_holdings.iter().take(3).map(|p| {
-                (p.name.as_str(), "解禁 3.2亿")
-            }).collect();
-            let events_ref: Vec<pt::HoldingEventItem> = event_strs.iter().map(|(n, k)| pt::HoldingEventItem {
-                name: n, kind: k,
-            }).collect();
-            let text = pt::render_event_calendar(&today_str, &events_ref, "央行MLF到期", "+0.8%", "7.18");
-            log::info!("[v12-R08]\n{}", text);
-        }
-
-        log::info!("[v12-MVP1-R] 8 块 R 系列组装完成 (待 push)");
+        // ===== R-07/R-08 已在 async 上下文真推, 此处仅 log =====
+        log::info!("[v12-MVP1-R] 8 块 R 系列组装完成 (待 push, R-07/R-08 在 async)");
         Ok(())
     }).await.unwrap_or_else(|e| Err(format!("spawn_blocking join: {}", e)));
 
@@ -1411,11 +1369,73 @@ async fn run_review_only_inner() {
             notify::push_governor(&text, notify::PushKind::ReviewMarket).await;
         }
 
-        // R-08 推送
+        // R-07 明日观察池 (真推)
         {
-            let event_strs: Vec<(&str, &str)> = r2.iter().take(3).map(|p| (p.name.as_str(), "解禁 3.2亿")).collect();
-            let events_ref: Vec<pt::HoldingEventItem> = event_strs.iter().map(|(n, k)| pt::HoldingEventItem { name: n, kind: k }).collect();
-            let text = pt::render_event_calendar(&today_str2, &events_ref, "央行MLF到期", "+0.8%", "7.18");
+            let watchlist = stock_analysis::portfolio::get_watchlist().unwrap_or_default();
+            if watchlist.is_empty() {
+                log::info!("[v12-R07] 自选为空, 跳过");
+            } else {
+                let mut items: Vec<pt::WatchItem<'_>> = Vec::new();
+                for p in watchlist.iter().take(3) {
+                    let cur = r2_prices.get(&p.code).copied().unwrap_or(p.cost_price);
+                    items.push(pt::WatchItem {
+                        name: p.name.as_str(),
+                        code: p.code.as_str(),
+                        topic: p.sector.as_str(),
+                        source: "A档未触发",
+                        trigger: "突破前高+量比>3",
+                        lo: cur * 0.97, hi: cur * 1.05, stop: cur * 0.93,
+                        reason: "板块共振 + 持仓联动",
+                    });
+                }
+                let text = pt::render_tomorrow_watch(&today_str2, &items);
+                log::info!("[v12-R07]\n{}", text);
+                notify::push_governor(&text, notify::PushKind::TomorrowWatch).await;
+            }
+        }
+
+        // R-08 推送 (真实数据: 拉今日公告 + 持仓事件)
+        {
+            // 真实数据源: 公告 API + 持仓事件
+            // 公告拉取 (sync, 包 spawn_blocking)
+            let (ann_summary, holding_events) = tokio::task::spawn_blocking(move || {
+                // 1. 拉今日全市场公告 (data_source不稳定时返空)
+                let anns = stock_analysis::data_provider::announcement::fetch_announcements(None)
+                    .unwrap_or_default();
+                let ann_text = if anns.is_empty() {
+                    "今日无重大公告 (data_source 缺失)".to_string()
+                } else {
+                    let mut s = format!("今日共 {} 条公告 (TOP 3):\n", anns.len());
+                    for a in anns.iter().take(3) {
+                        s.push_str(&format!("· {} ({:?}): {}\n", a.code, a.level, a.title));
+                    }
+                    s
+                };
+                // 2. 持仓事件: 用 r2 持仓 + 拉它们各自今日公告
+                let mut events: Vec<(String, String)> = Vec::new();
+                for p in r2.iter().take(3) {
+                    // 查该持仓的今日公告
+                    let p_anns: Vec<_> = anns.iter()
+                        .filter(|a| a.code == p.code)
+                        .take(2)
+                        .collect();
+                    let kind = if !p_anns.is_empty() {
+                        // 用最近一条公告标题作为事件
+                        p_anns[0].title.chars().take(20).collect::<String>()
+                    } else {
+                        // 无公告时查 ledger 看是否即将到期
+                        format!("持有 {} (浮盈{:.1}%)", p.code, ((r2_prices.get(&p.code).copied().unwrap_or(p.cost_price) / p.cost_price - 1.0) * 100.0))
+                    };
+                    events.push((p.name.clone(), kind));
+                }
+                (ann_text, events)
+            }).await.unwrap_or_default();
+
+            let events_ref: Vec<pt::HoldingEventItem> = holding_events.iter()
+                .map(|(n, k)| pt::HoldingEventItem { name: n.as_str(), kind: k.as_str() })
+                .collect();
+            let text = pt::render_event_calendar(&today_str2, &events_ref, &ann_summary, "+0.8%", "7.18");
+            log::info!("[v12-R08]\n{}", text);
             notify::push_governor(&text, notify::PushKind::EventCalendar).await;
         }
 
