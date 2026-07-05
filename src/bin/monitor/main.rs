@@ -1003,13 +1003,24 @@ async fn run_test_scan() {
             }
             s
         };
-        // R-01 文本
+        // R-01 文本 (v19.9 修: 真接 DB 7 只 + K 线最后 close 作 fallback)
         let r01 = {
             let mut items: Vec<pt::HoldingDailyPlan> = Vec::new();
             for p in r2.iter().take(5) {
-                let cur = r2_prices.get(&p.code).copied().unwrap_or(p.cost_price);
+                // 价格源: 1) 实时 quote 2) K 线最后 close 3) cost_price
+                let mut cur = r2_prices.get(&p.code).copied().unwrap_or(0.0);
+                if cur <= 0.0 {
+                    if let Ok(f) = stock_analysis::data_provider::DataFetcherManager::new() {
+                        if let Ok((klines, _)) = f.get_daily_data(&p.code, 5) {
+                            if let Some(k) = klines.last() {
+                                cur = k.close;
+                            }
+                        }
+                    }
+                }
+                if cur <= 0.0 { cur = p.cost_price; } // K 线拉失败 → cost_price (降级显式)
                 let pnl = if p.cost_price > 0.0 { ((cur / p.cost_price - 1.0) * 100.0) } else { 0.0 };
-                let plan_high = if pnl > 5.0 { "减仓1/3" } else { "减仓1/2" };
+                let plan_high = if pnl > 5.0 { "减仓1/3" } else if pnl > 0.0 { "减仓1/2" } else { "持有观望" };
                 let t0 = if pnl > 5.0 { "适合观察" } else { "不适合(主升核心)" };
                 let stop = p.cost_price * 0.92;
                 items.push(pt::HoldingDailyPlan {
