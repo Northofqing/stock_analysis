@@ -366,6 +366,12 @@ impl DatabaseManager {
         )
         .execute(&mut *conn)?;
 
+        // v12 PR3-3.6 (BR-015 偿还): stock_position 加 chain_name 列
+        // 旧库可能没有, 用 add_column_if_missing 包一层 (SQLite 1.06 无 ADD COLUMN IF NOT EXISTS)
+        Self::add_column_if_missing(conn, "stock_position", "chain_name", "TEXT DEFAULT '其他'")?;
+        diesel::sql_query("CREATE INDEX IF NOT EXISTS idx_stock_position_chain_name ON stock_position(chain_name)")
+            .execute(&mut *conn).ok();
+
         // trades 表（v3 每笔买卖独立记录，与 stock_position 互补）
         diesel::sql_query(
             r#"
@@ -528,6 +534,106 @@ impl DatabaseManager {
             "CREATE INDEX IF NOT EXISTS idx_factor_snapshot_date ON factor_snapshot(snapshot_date)",
         )
         .execute(&mut *conn)?;
+
+        // ===== v12 PR1/PR3 表 (idempotent CREATE IF NOT EXISTS) =====
+        // Bug A fix (2026-07-05): 原 run_migrations() 不读 migrations/*.sql,
+        // v12 表必须在此手写 CREATE IF NOT EXISTS.
+
+        // account_mode_log
+        diesel::sql_query(
+            "CREATE TABLE IF NOT EXISTS account_mode_log (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts              TIMESTAMP NOT NULL,
+                prev_mode       TEXT NOT NULL,
+                new_mode        TEXT NOT NULL,
+                trigger_reason  TEXT NOT NULL,
+                today_pnl_pct   REAL,
+                consecutive_n   INTEGER,
+                total_pos_cheng INTEGER,
+                data_complete   INTEGER NOT NULL DEFAULT 1,
+                pushed          INTEGER NOT NULL DEFAULT 0,
+                push_attempted_at TIMESTAMP
+            )",
+        )
+        .execute(&mut *conn)?;
+        diesel::sql_query("CREATE INDEX IF NOT EXISTS idx_account_mode_log_ts ON account_mode_log(ts)")
+            .execute(&mut *conn).ok();
+        diesel::sql_query("CREATE INDEX IF NOT EXISTS idx_account_mode_log_new_mode ON account_mode_log(new_mode)")
+            .execute(&mut *conn).ok();
+
+        // paper_trades (PR3-3.5)
+        diesel::sql_query(
+            "CREATE TABLE IF NOT EXISTS paper_trades (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                plan_id         TEXT NOT NULL,
+                code            TEXT NOT NULL,
+                name            TEXT NOT NULL,
+                direction       TEXT NOT NULL CHECK(direction IN ('buy','sell')),
+                price           REAL NOT NULL,
+                quantity        INTEGER NOT NULL,
+                status          TEXT NOT NULL CHECK(status IN ('SignalTriggered','Filled','NotFilled','Invalidated')),
+                fill_price      REAL,
+                not_fill_reason TEXT,
+                virtual_reason  TEXT NOT NULL,
+                account_mode    TEXT NOT NULL,
+                data_mode       TEXT NOT NULL,
+                ts              TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )",
+        )
+        .execute(&mut *conn)?;
+        diesel::sql_query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uniq_paper_trades_plan_id ON paper_trades(plan_id)",
+        )
+        .execute(&mut *conn).ok();
+        diesel::sql_query("CREATE INDEX IF NOT EXISTS idx_paper_trades_code ON paper_trades(code)")
+            .execute(&mut *conn).ok();
+        diesel::sql_query("CREATE INDEX IF NOT EXISTS idx_paper_trades_status ON paper_trades(status)")
+            .execute(&mut *conn).ok();
+
+        // execution_tracking (PR3-3.5)
+        diesel::sql_query(
+            "CREATE TABLE IF NOT EXISTS execution_tracking (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                paper_trade_id      INTEGER NOT NULL,
+                plan_id             TEXT NOT NULL,
+                code                TEXT NOT NULL,
+                expected_price      REAL NOT NULL,
+                actual_change_t1    REAL,
+                actual_change_t3    REAL,
+                actual_change_t5    REAL,
+                mfe                 REAL,
+                mae                 REAL,
+                t1_special_case     TEXT,
+                created_at          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at          TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )",
+        )
+        .execute(&mut *conn)?;
+        diesel::sql_query("CREATE INDEX IF NOT EXISTS idx_execution_tracking_plan_id ON execution_tracking(plan_id)")
+            .execute(&mut *conn).ok();
+        diesel::sql_query("CREATE INDEX IF NOT EXISTS idx_execution_tracking_code ON execution_tracking(code)")
+            .execute(&mut *conn).ok();
+
+        // position_adjustments (PR3-3.3)
+        diesel::sql_query(
+            "CREATE TABLE IF NOT EXISTS position_adjustments (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                code            TEXT NOT NULL,
+                delta           INTEGER NOT NULL,
+                source          TEXT NOT NULL CHECK(source IN ('manual_confirm','import')),
+                reason          TEXT NOT NULL DEFAULT '',
+                effective_date  TEXT NOT NULL,
+                applied_immediately INTEGER NOT NULL DEFAULT 0,
+                operator        TEXT,
+                created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )",
+        )
+        .execute(&mut *conn)?;
+        diesel::sql_query("CREATE INDEX IF NOT EXISTS idx_position_adjustments_code ON position_adjustments(code)")
+            .execute(&mut *conn).ok();
+        diesel::sql_query("CREATE INDEX IF NOT EXISTS idx_position_adjustments_effective ON position_adjustments(effective_date)")
+            .execute(&mut *conn).ok();
 
         Ok(())
     }
