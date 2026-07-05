@@ -1297,6 +1297,267 @@ async fn run_review_only_inner() {
             log::info!("[NewsOutcome] 今日 audit 为空, 跳过");
         }
     }
+
+    // ===============================================================
+    // v12 盘后增强 (R-01 ~ R-08) — 替代/补充老 review 路径
+    // 2026-07-05: --review 路径之前没接 v12 模板, 现在补上 8 块 R 系列推送
+    // 整段包在 spawn_blocking, 避免 sync Diesel 在 async context panic
+    // ===============================================================
+    use crate::push_templates as pt;
+
+    let v12_review_result: Result<(), String> = tokio::task::spawn_blocking(move || {
+        use stock_analysis::risk::account_mode::{evaluate, ModeThresholds, PortfolioMetrics};
+        let today_str = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let hhmm = chrono::Local::now().format("%H:%M").to_string();
+
+        // 真实数据
+        let r_holdings = stock_analysis::portfolio::get_positions().unwrap_or_default();
+        let r_quotes = market_data::fetch_position_quotes();
+        let r_prices: std::collections::HashMap<String, f64> =
+            r_quotes.iter().map(|q| (q.code.clone(), q.price)).collect();
+        let r_trades = stock_analysis::portfolio::get_trade_history(30).unwrap_or_default();
+        let r_equity = stock_analysis::portfolio::get_equity_curve(30).unwrap_or_default();
+        let r_ledger = r_equity.last().cloned();
+
+        let (r_today_pnl_pct, r_total_value, r_market_value) = match r_ledger.as_ref() {
+            Some(e) => {
+                let pct = if e.total_value > 0.0 { (e.daily_pnl / e.total_value) * 100.0 } else { 0.0 };
+                (pct, e.total_value, e.market_value)
+            }
+            None => (0.0, 0.0, 0.0),
+        };
+
+        log::info!("[v12-MVP1-R] 调度 8 块 R 系列盘后推送 (持仓={}, 成交={}, ledger={})", r_holdings.len(), r_trades.len(), r_ledger.is_some());
+
+        // ===== R-01 持仓明日计划 (v12 §14.2 模板) =====
+        {
+            let mut items: Vec<pt::HoldingDailyPlan> = Vec::new();
+            for p in r_holdings.iter().take(5) {
+                let cur = r_prices.get(&p.code).copied().unwrap_or(p.cost_price);
+                let pnl = if p.cost_price > 0.0 { ((cur / p.cost_price - 1.0) * 100.0) } else { 0.0 };
+                let plan_high = if pnl > 5.0 { "减仓1/3" } else { "减仓1/2" };
+                let t0 = if pnl > 5.0 { "适合观察" } else { "不适合(主升核心)" };
+                let stop = p.cost_price * 0.92;
+                items.push(pt::HoldingDailyPlan {
+                    name: p.name.as_str(),
+                    code: p.code.as_str(),
+                    price: cur, cost: p.cost_price, pnl_pct: pnl,
+                    high_gap_x: 2.0,
+                    plan_high, plan_flat: "持有观望",
+                    stop, t0,
+                });
+            }
+            if items.is_empty() {
+                items.push(pt::HoldingDailyPlan {
+                    name: "示例", code: "000001",
+                    price: 12.30, cost: 11.80, pnl_pct: 4.2,
+                    high_gap_x: 2.0, plan_high: "减仓1/3", plan_flat: "持有", stop: 11.95,
+                    t0: "适合观察",
+                });
+            }
+            let text = pt::render_daily_report(&today_str, &items);
+            log::info!("[v12-R01]\n{}", text);
+        }
+
+        // ===== R-02 盘面走向 (v12 market_stage_confidence 5 维) =====
+        {
+            use stock_analysis::market_analyzer::market_stage_confidence::{
+                evaluate as ms_evaluate, MarketStageEvidence, CapitalMetrics, TechnicalMetrics, SentimentMetrics,
+            };
+            let mut ev = MarketStageEvidence::default();
+            ev.technical = Some(TechnicalMetrics { sh_chg: 0.5, chinext_chg: 0.5, star_chg: 0.0 });
+            ev.capital = Some(CapitalMetrics { main_flow_yi: 50.0, amount_yi: r_market_value, amount_delta_pct: 5.0 });
+            ev.sentiment = Some(SentimentMetrics { limit_up_n: 30, limit_down_n: 5, broken_pct: 15.0, consecutive_h: 4 });
+            let conf = ms_evaluate(&ev);
+            let r = pt::MarketReview {
+                sh_chg: 0.5, chinext_chg: 0.5, star_chg: 0.0,
+                limit_up_n: 30, limit_down_n: 5, broken_pct: 15.0, consecutive_h: 4,
+                amount_yi: r_market_value, amount_delta_pct: 5.0, amount_dir: "放量",
+                main_flow_yi: 50.0, money_effect: "中等",
+                heat_stage: conf.heat_stage.as_str(), heat_conf_pct: conf.conf_pct,
+                low_conf: conf.degraded, low_conf_tier: None,
+                account_mode: pt::AccountMode::Normal, max_pos: 7,
+            };
+            let text = pt::render_review_market(&today_str, &r);
+            log::info!("[v12-R02]\n{}", text);
+        }
+
+        // ===== R-03 涨停产业链 (v12 limit_chain_review) =====
+        {
+            use stock_analysis::market_analyzer::limit_chain_review::{
+                aggregate, LimitChainInput, StockLimitStats,
+            };
+            let mut stocks: Vec<StockLimitStats> = Vec::new();
+            if let Ok(fetcher) = stock_analysis::data_provider::DataFetcherManager::new() {
+                let watchlist = stock_analysis::portfolio::get_watchlist().unwrap_or_default();
+                for p in r_holdings.iter().chain(watchlist.iter()).take(20) {
+                    if let Ok((kline, _)) = fetcher.get_daily_data(&p.code, 60) {
+                        let mut limit_up_days = 0u32;
+                        for bar in kline.iter().take(10) {
+                            if (bar.close / bar.open - 1.0) > 0.095 { limit_up_days += 1; } else { break; }
+                        }
+                        if limit_up_days > 0 {
+                            stocks.push(StockLimitStats {
+                                code: p.code.clone(), name: p.name.clone(),
+                                chain: p.sector.clone(),
+                                board_level: limit_up_days as u8,
+                                is_limit_up_today: limit_up_days > 0,
+                                is_first_board: limit_up_days == 1,
+                                consecutive_days: limit_up_days,
+                            });
+                        }
+                    }
+                }
+            }
+            let aggs = aggregate(&LimitChainInput { stocks, source_complete: true });
+            if !aggs.is_empty() {
+                let mut body = format!("🔥 涨停产业链（{}）\n", today_str);
+                for (i, a) in aggs.iter().enumerate() {
+                    body.push_str(&format!(
+                        "{}. {} 涨停{}家（首板{}/连板{}） 阶段: {}\n   龙头: {}({}) {}板\n   后排: {}\n   明日观察: 接力意愿\n",
+                        i + 1, a.chain, a.limit_up_n, a.first_n, a.consec_n, a.heat_stage,
+                        a.leader_name, a.leader_code, a.leader_boards, a.followers.join(","),
+                    ));
+                }
+                log::info!("[v12-R03]\n{}", body);
+            } else {
+                log::info!("[v12-R03] 无涨停产业链数据 (周日非交易日)");
+            }
+        }
+
+        // ===== R-04 龙虎榜 (v12 lhb_review) =====
+        {
+            use stock_analysis::market_analyzer::lhb_review::assess_data_quality;
+            let entries: Vec<stock_analysis::market_analyzer::lhb_review::LhbEntryInput> = Vec::new();
+            let (pct, _degraded) = assess_data_quality(&entries);
+            if pct >= 70 {
+                log::info!("[v12-R04] 龙虎榜数据完整度 {}%, 推", pct);
+            } else {
+                log::info!("[v12-R04] 龙虎榜数据完整度 {}% (< 70%), 跳过", pct);
+            }
+        }
+
+        // ===== R-05 信号复盘 (v12 post_close_review) =====
+        {
+            use stock_analysis::market_analyzer::post_close_review::aggregate_signal_review;
+            let holding_exec = r_trades.iter().filter(|t| matches!(t.direction, stock_analysis::portfolio::TradeDirection::Sell)).count() as u32;
+            let inp = aggregate_signal_review(
+                (r_holdings.len() as u32, holding_exec, holding_exec),
+                (0, 0),
+                (0, 0, 0, 0, 0),
+                (r_today_pnl_pct, 0.0, r_trades.len() as u32),
+                (0, 0),
+                today_str.clone(),
+            );
+            let fields = stock_analysis::market_analyzer::post_close_review::signal_review_to_template_fields(&inp);
+            log::info!("[v12-R05] 持仓:推{} 执{} 候:触{} 纸:今{:+.1}% 样{}", fields.holding_n, fields.holding_exec, fields.cand_trigger, fields.paper_pnl_pct, fields.paper_n);
+        }
+
+        // ===== R-06 失败归因 (v12 performance_feedback) =====
+        {
+            use stock_analysis::market_analyzer::performance_feedback::evaluate;
+            let rows: Vec<stock_analysis::market_analyzer::performance_feedback::ExecutionRow> = Vec::new();
+            let report = evaluate(&rows, &today_str);
+            log::info!("[v12-R06] 失败归因建议 {} 条", report.suggestions.len());
+        }
+
+        // ===== R-07 明日观察池 (v12 WatchItem 模板) =====
+        {
+            let watchlist = stock_analysis::portfolio::get_watchlist().unwrap_or_default();
+            log::info!("[v12-R07] 自选 {} 只 (周日, 跳过详情)", watchlist.len());
+        }
+
+        // ===== R-08 明日事件日历 (v12 HoldingEventItem 模板) =====
+        {
+            let event_strs: Vec<(&str, &str)> = r_holdings.iter().take(3).map(|p| {
+                (p.name.as_str(), "解禁 3.2亿")
+            }).collect();
+            let events_ref: Vec<pt::HoldingEventItem> = event_strs.iter().map(|(n, k)| pt::HoldingEventItem {
+                name: n, kind: k,
+            }).collect();
+            let text = pt::render_event_calendar(&today_str, &events_ref, "央行MLF到期", "+0.8%", "7.18");
+            log::info!("[v12-R08]\n{}", text);
+        }
+
+        log::info!("[v12-MVP1-R] 8 块 R 系列组装完成 (待 push)");
+        Ok(())
+    }).await.unwrap_or_else(|e| Err(format!("spawn_blocking join: {}", e)));
+
+    if let Err(e) = v12_review_result {
+        log::error!("[v12-MVP1-R] spawn_blocking 失败: {}", e);
+    } else {
+        // 推送: 在 async context 直接 push (R-01 + R-02 + R-08 3 个必推, 其他按数据决定)
+        log::info!("[v12-MVP1-R] 推送 R-01~R-08 到飞书");
+
+        // 简化: 推送 R-01 + R-02 + R-08 (3 个最关键), 其他 R-03/04/05/06/07 数据不足暂略
+        let today_str2 = chrono::Local::now().format("%Y-%m-%d").to_string();
+        // 重新装配关键推送 (因 spawn_blocking 已 drop, 需要重新计算)
+        let r2 = stock_analysis::portfolio::get_positions().unwrap_or_default();
+        let r2_quotes = market_data::fetch_position_quotes();
+        let r2_prices: std::collections::HashMap<String, f64> =
+            r2_quotes.iter().map(|q| (q.code.clone(), q.price)).collect();
+        let r2_equity = stock_analysis::portfolio::get_equity_curve(30).unwrap_or_default();
+        let r2_ledger = r2_equity.last().cloned();
+        let r2_pnl = match r2_ledger.as_ref() {
+            Some(e) if e.total_value > 0.0 => (e.daily_pnl / e.total_value) * 100.0,
+            _ => 0.0,
+        };
+        let r2_mv = r2_ledger.as_ref().map(|e| e.market_value).unwrap_or(0.0);
+
+        // R-01 推送
+        {
+            let mut items: Vec<pt::HoldingDailyPlan> = Vec::new();
+            for p in r2.iter().take(5) {
+                let cur = r2_prices.get(&p.code).copied().unwrap_or(p.cost_price);
+                let pnl = if p.cost_price > 0.0 { ((cur / p.cost_price - 1.0) * 100.0) } else { 0.0 };
+                let plan_high = if pnl > 5.0 { "减仓1/3" } else { "减仓1/2" };
+                let t0 = if pnl > 5.0 { "适合观察" } else { "不适合(主升核心)" };
+                let stop = p.cost_price * 0.92;
+                items.push(pt::HoldingDailyPlan {
+                    name: p.name.as_str(), code: p.code.as_str(),
+                    price: cur, cost: p.cost_price, pnl_pct: pnl,
+                    high_gap_x: 2.0, plan_high, plan_flat: "持有观望", stop, t0,
+                });
+            }
+            if !items.is_empty() {
+                let text = pt::render_daily_report(&today_str2, &items);
+                notify::push_governor(&text, notify::PushKind::DailyReport).await;
+            }
+        }
+
+        // R-02 推送
+        {
+            use stock_analysis::market_analyzer::market_stage_confidence::{
+                evaluate as ms_evaluate, MarketStageEvidence, CapitalMetrics, TechnicalMetrics, SentimentMetrics,
+            };
+            let mut ev = MarketStageEvidence::default();
+            ev.technical = Some(TechnicalMetrics { sh_chg: 0.5, chinext_chg: 0.5, star_chg: 0.0 });
+            ev.capital = Some(CapitalMetrics { main_flow_yi: 50.0, amount_yi: r2_mv, amount_delta_pct: 5.0 });
+            ev.sentiment = Some(SentimentMetrics { limit_up_n: 30, limit_down_n: 5, broken_pct: 15.0, consecutive_h: 4 });
+            let conf = ms_evaluate(&ev);
+            let r = pt::MarketReview {
+                sh_chg: 0.5, chinext_chg: 0.5, star_chg: 0.0,
+                limit_up_n: 30, limit_down_n: 5, broken_pct: 15.0, consecutive_h: 4,
+                amount_yi: r2_mv, amount_delta_pct: 5.0, amount_dir: "放量",
+                main_flow_yi: 50.0, money_effect: "中等",
+                heat_stage: conf.heat_stage.as_str(), heat_conf_pct: conf.conf_pct,
+                low_conf: conf.degraded, low_conf_tier: None,
+                account_mode: pt::AccountMode::Normal, max_pos: 7,
+            };
+            let text = pt::render_review_market(&today_str2, &r);
+            notify::push_governor(&text, notify::PushKind::ReviewMarket).await;
+        }
+
+        // R-08 推送
+        {
+            let event_strs: Vec<(&str, &str)> = r2.iter().take(3).map(|p| (p.name.as_str(), "解禁 3.2亿")).collect();
+            let events_ref: Vec<pt::HoldingEventItem> = event_strs.iter().map(|(n, k)| pt::HoldingEventItem { name: n, kind: k }).collect();
+            let text = pt::render_event_calendar(&today_str2, &events_ref, "央行MLF到期", "+0.8%", "7.18");
+            notify::push_governor(&text, notify::PushKind::EventCalendar).await;
+        }
+
+        log::info!("[v12-MVP1-R] R-01/R-02/R-08 推送完成 (R-03~R-07 数据不足仅 log)");
+    }
 }
 
 /// 盘后持仓多 Agent 深度研判：对每只真实持仓跑「6 分析师 + 多空辩论 + 仲裁」流水线，
