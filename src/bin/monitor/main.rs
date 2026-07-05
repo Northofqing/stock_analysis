@@ -1132,13 +1132,39 @@ async fn run_test_scan() {
         notify::push_governor(&chain_review, notify::PushKind::IndustryChain).await;
     }
 
-    // R-04 龙虎榜 (复用 lhb_analyzer + 禁词检测)
+    // R-04 龙虎榜 (真接 LhbAnalyzer::get_today_lhb + 转 LhbTop5Item)
     let lhb_review = tokio::task::spawn_blocking(|| {
-        // 简版: 不接实际龙虎榜数据源, 输出"无龙虎榜数据" (MVP-4 §7.4 设计接受降级)
+        use stock_analysis::lhb_analyzer::{LhbDataFetcher};
+        use stock_analysis::review::lhb_review::{render_r04, LhbTop5Item};
         let mut s = String::new();
         s.push_str(&format!("🐉 龙虎榜净买前五（{} 21:00）\n", chrono::Local::now().format("%Y-%m-%d")));
-        s.push_str("⚠️ 龙虎榜数据源未接入 (MVP-4 §7.7 数据源接入评估待办)\n");
-        s.push_str("仅结构化事实, 不含席位风格推断\n");
+        let rt = tokio::runtime::Runtime::new().ok();
+        let records = rt.as_ref()
+            .and_then(|r| r.block_on(async { LhbDataFetcher::new().ok()?.get_today_lhb().await.ok() }))
+            .unwrap_or_default();
+        if records.is_empty() {
+            s.push_str("⚠️ 今日无龙虎榜数据 (东方财富 API 未返或非交易日)\n");
+            s.push_str("仅结构化事实, 不含席位风格推断\n");
+        } else {
+            // 净买前 5
+            let mut sorted = records.clone();
+            sorted.sort_by(|a, b| b.net_amount.partial_cmp(&a.net_amount).unwrap_or(std::cmp::Ordering::Equal));
+            let top5: Vec<LhbTop5Item> = sorted.iter().take(5).map(|r| LhbTop5Item {
+                code: r.code.clone(),
+                name: r.name.clone(),
+                net_buy_yi: r.net_amount / 1e8, // 万元 → 亿元
+                reason: r.reason.clone(),
+                buy_seats_inst: 0, // 暂未拆席位
+                buy_seats_inst_amt_wan: 0.0,
+                buy_seats_other: 0,
+                buy_seats_other_amt_wan: r.buy_amount,
+                buy_concentration_pct: if r.total_amount > 0.0 { r.lhb_ratio } else { 0.0 },
+                sell_concentration_pct: 0.0,
+                chain_match: false,
+                next_day_risk: if r.pct_change > 5.0 { "高 (涨幅偏大, 谨防回调)".to_string() } else { "中".to_string() },
+            }).collect();
+            s.push_str(&render_r04(&top5));
+        }
         s
     })
     .await
@@ -1201,6 +1227,68 @@ async fn run_test_scan() {
     .await
     .unwrap_or_default();
     log::info!("[测试 R-07] 明日观察池:\n{}", watch_review);
+
+    // T-04 持仓紧急风险 (复用 --review 路径 check_stops + format)
+    let t04_text = tokio::task::spawn_blocking(move || {
+        let watchlist = stock_analysis::portfolio::get_watchlist().unwrap_or_default();
+        let quotes = market_data::fetch_position_quotes();
+        let price_map: std::collections::HashMap<String, f64> =
+            quotes.iter().map(|q| (q.code.clone(), q.price)).collect();
+        let mut stop_signals: Vec<stock_analysis::risk::stop_loss::StopSignal> = Vec::new();
+        let holdings_inner = stock_analysis::portfolio::get_positions().unwrap_or_default();
+        for p in &holdings_inner {
+            let cur = price_map.get(&p.code).copied().unwrap_or(0.0);
+            if cur <= 0.0 { continue; }
+            let kline = stock_analysis::data_provider::DataFetcherManager::new()
+                .ok()
+                .and_then(|f| f.get_daily_data(&p.code, 60).ok())
+                .map(|(k, _)| k);
+            let kline = match kline { Some(k) => k, None => continue };
+            let ma20 = compute_ma(&kline, 20);
+            let ma60 = compute_ma(&kline, 60);
+            let sigs = stock_analysis::risk::stop_loss::check_stops(
+                &p.code, &p.name, cur, p.cost_price, p.hard_stop, ma20, ma60,
+            );
+            stop_signals.extend(sigs);
+        }
+        let _ = watchlist; // 抑制未用警告
+        stock_analysis::risk::stop_loss::format_stop_alerts(&stop_signals)
+    })
+    .await
+    .unwrap_or_default();
+    if !t04_text.is_empty() {
+        log::info!("[测试 T-04] 持仓紧急风险:\n{}", t04_text);
+        notify::push_governor(&t04_text, notify::PushKind::HoldingEvent).await;
+    }
+
+    // T-09 禁止操作 (复用 --test 已扫的 excl_hits 渲染)
+    if !excl_hits.is_empty() {
+        let t09_text = format!("🚫 禁止操作（{}）\n{}\n",
+            chrono::Local::now().format("%H:%M"),
+            excl_hits.iter().map(|h| format!("· {}({}): {}", h.name, h.code, h.reason)).collect::<Vec<_>>().join("\n"),
+        );
+        log::info!("[测试 T-09] 禁止操作:\n{}", t09_text);
+        notify::push_governor(&t09_text, notify::PushKind::ForbiddenOps).await;
+    }
+
+    // T-10 虚拟盘成交回报 (一期: paper_trade 持久化未接, 显示 0 笔 + 不自动改规则)
+    let t10_text = format!("🧪 虚拟盘（{}）\n今日 0 笔成交 (paper_trades 持久化待 PR3-3.5 落地后接入)\n辅助建议, 非下单指令",
+        chrono::Local::now().format("%H:%M"),
+    );
+    log::info!("[测试 T-10] 虚拟盘: 0 笔 (持久化待 PR3-3.5)");
+
+    // R-06 失败归因真接 (paper_trade 0 样本 → 显式标"样本不足")
+    let r06_real = tokio::task::spawn_blocking(|| {
+        use stock_analysis::review::failure_attribution::{render_r06, WeeklyDistribution, FailureReason};
+        let mut weekly = WeeklyDistribution::default();
+        // 一期: 0 笔虚拟腿, 显式分布空 (周分布 0)
+        // 等 paper_trades 持久化后, 按 FailureReason 累计
+        weekly.add(FailureReason::Unknown);
+        render_r06(&[], &weekly)
+    })
+    .await
+    .unwrap_or_default();
+    log::info!("[测试 R-06 真实] 失败归因:\n{}", r06_real);
 
     log::info!("[测试] ======== 全链路连通性检查完成 ========");
 }
