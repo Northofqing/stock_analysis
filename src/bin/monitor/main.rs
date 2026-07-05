@@ -932,6 +932,34 @@ async fn run_test_scan() {
         let _ = banner; // 显式标注 banner 已构造 (供真生产路径用)
     } else {
         log::info!("[v12-MVP0-B] T-03 无持仓可建议 (STOCK_LIST 配置后会有数据)");
+
+    // T-03 演示: 模拟 1 只持仓走完整建议流程 (无持仓时演示模板 + 治理)
+    if holdings.is_empty() {
+        let banner = pt::BannerCtx {
+            account_mode: pt::AccountMode::Normal,
+            total_pos: 5,
+            today_pnl: 0.3,
+            data_mode: pt::DataMode::Full,
+            data_missing_note: None,
+        };
+        let t03_params = pt::HoldingPlanParams {
+            name: "测试持仓",
+            code: "000001",
+            hhmm: "13:42",
+            intent: pt::Intent::Reduce,
+            price: 12.30,
+            cost: 11.80,
+            avail: 3000,
+            reduce_zone: Some((12.45, 12.60)),
+            support: 11.95,
+            pressure: 12.70,
+            stop: 11.95,
+            invalidations: &["跌破5日线且放量".to_string(), "板块热度转Fade".to_string()],
+            reasons: &["放量冲高回落".to_string(), "主力净流出0.8亿".to_string()],
+        };
+        let _ = pt::push_holding_plan_recommendation("000001", Some(&banner), t03_params).await;
+        log::info!("[v12-MVP0-B] T-03 演示触发完成 (合成持仓)");
+    }
     }
 
     // 17. v4 周度 SOP
