@@ -656,34 +656,22 @@ async fn push_wechat_with_kind(text: &str, is_critical_alert: bool) -> bool {
 async fn run_test_scan() {
     log::info!("[测试] 跳过交易日历，立即执行连通性检查...");
 
-    // v19.9: 0. 真插持仓 (让 Scanner::load_positions 看到 .env STOCK_LIST)
-    //        仅 --test 路径, env=prod (env_guard 允许); prod 路径不执行
-    let stock_list = std::env::var("STOCK_LIST").unwrap_or_default();
-    let name_map: std::collections::HashMap<&str, &str> = [
-        ("605178", "时空科技"), ("002916", "深南电路"), ("688548", "广钢气体"),
-        ("600641", "先导基电"), ("688690", "纳微科技"), ("300128", "锦富技术"),
-        ("605167", "利柏特"),
-    ].iter().cloned().collect();
-    let codes: Vec<&str> = stock_list.split(',').take(7).collect();
+    // v19.11: 0. 持仓: 读 DB 已有 (无则 warn, 不插假种子)
+    //        之前 v19.9 hardcode name_map (时空科技/深南电路/...) 是错的:
+    //        真实持仓 (利欧股份/德展健康/达实智能/华电辽能/三安光电/建业股份)
+    //        应通过 stock_position 表本身提供. --test 路径不自动造数据.
+    //        恢复指引: docs/architecture/v12-push-uncertainty-notes.md §误删 7 只持仓
+    //        → data/rollback_v10_p0_1/*.db 5 个一致快照.
     let db = stock_analysis::database::DatabaseManager::get();
-    use stock_analysis::models::NewStockPosition;
-    let mut inserted = 0;
-    for code in &codes {
-        let trimmed = code.trim();
-        if trimmed.is_empty() { continue; }
-        let new_pos = NewStockPosition {
-            code: trimmed.to_string(),
-            name: name_map.get(trimmed).unwrap_or(&"测试持仓").to_string(),
-            buy_date: "2025-06-01".to_string(),
-            buy_price: 10.0,
-            quantity: 1000,
-            status: "open".to_string(),
-        };
-        if db.save_position(&new_pos).is_ok() {
-            inserted += 1;
-        }
+    let existing_count = db.count_open_positions().unwrap_or(0);
+    if existing_count == 0 {
+        log::warn!(
+            "[测试] stock_position 表为空, --test 不再自动插种子持仓.\n  \
+             请从 data/rollback_v10_p0_1/*.db 恢复, 或手动 SQLite INSERT 真实持仓."
+        );
+    } else {
+        log::info!("[测试] DB 已有 {} 只 open 持仓, --test 不再插种子", existing_count);
     }
-    log::info!("[测试] DB 插入 {} / {} 只真持仓 (.env STOCK_LIST)", inserted, codes.len());
 
     // 1. 扫描器初始化
     let mut targets = Vec::new();
@@ -1129,9 +1117,21 @@ async fn run_test_scan() {
                     stock_analysis::data_provider::announcement::AnnLevel::Important => "FERMENT",
                     _ => "START",
                 };
+                // v19.11: 公告级别映射到事件类型 hint (供 rank_news 优先于 classify_event_type)
+                // Emergency 监管/紧急 → REGULATORY, Important 重要 → COMPANY (一般公司行为)
+                // 默认 INFO → 政策/产业 (取标题关键词第一类)
+                let event_hint = match ann.level {
+                    stock_analysis::data_provider::announcement::AnnLevel::Emergency => "REGULATORY",
+                    stock_analysis::data_provider::announcement::AnnLevel::Important => "COMPANY",
+                    _ => "INDUSTRY",
+                };
                 hits.push(ChainHit {
                     chain: ann.name.clone(),
-                    keywords: vec![ann.title.clone(), format!("__STAGE:{}", stage_hint)],
+                    keywords: vec![
+                        ann.title.clone(),
+                        format!("__STAGE:{}", stage_hint),
+                        format!("__EVENT:{}", event_hint),
+                    ],
                     logic: "test-announcement".into(),
                     stocks: vec![],
                     source: ChainSource::Rule,

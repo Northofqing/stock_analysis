@@ -951,6 +951,33 @@ pub fn rank_news(candidate: &NewsCandidate, ctx: &MarketContext) -> RankedNews {
     }
     reasons.push(format!("阶段: {}", heat_stage.label()));
 
+    // 事件类型 hint 兜底: chain_hits keywords 含 __EVENT:XXX (公告 ann.level 映射)
+    // 优先级高于 classify_event_type (因为 hint 是公告源权威标记, classify 是关键词启发式)
+    let mut event_hint: Option<EventType> = None;
+    for hit in &candidate.chain_hits {
+        for kw in &hit.keywords {
+            if let Some(ev_str) = kw.strip_prefix("__EVENT:") {
+                let hinted = match ev_str {
+                    "POLICY" => EventType::PolicyCatalyst,
+                    "INDUSTRY" => EventType::IndustryCatalyst,
+                    "EARNINGS" => EventType::Earnings,
+                    "REGULATORY" => EventType::RegulatoryRisk,
+                    "SUPPLY" => EventType::SupplyDemand,
+                    "COMPANY" => EventType::CompanyAction,
+                    _ => EventType::Unknown,
+                };
+                if !matches!(hinted, EventType::Unknown) {
+                    event_hint = Some(hinted);
+                    break;
+                }
+            }
+        }
+        if event_hint.is_some() {
+            break;
+        }
+    }
+    let _ = event_hint; // 占位, 下方 event_type 赋值时使用
+
     // 4. 热度 + 阶段得分
     evidence.heat_score = score_heat(heat_stage, ctx.today_chg, ctx.main_inflow, ctx.limit_up_count.unwrap_or(0));
     evidence.stage_score = stage_score(heat_stage);
@@ -971,7 +998,8 @@ pub fn rank_news(candidate: &NewsCandidate, ctx: &MarketContext) -> RankedNews {
     evidence.source_score = source_score(&candidate.source);
 
     // 7. 风险扣分
-    let event_type = classify_event_type(&candidate.title);
+    // 优先用 hint (公告源权威标记), 否则 classify_event_type (关键词启发)
+    let event_type = event_hint.unwrap_or_else(|| classify_event_type(&candidate.title));
     let keywords: Vec<String> = candidate.chain_hits.iter().flat_map(|h| h.keywords.clone()).collect();
     evidence.risk_penalty = risk_penalty(event_type, heat_stage, &keywords);
     if evidence.risk_penalty > 0 {

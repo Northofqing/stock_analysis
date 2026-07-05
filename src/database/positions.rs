@@ -80,6 +80,16 @@ impl DatabaseManager {
         Ok(results)
     }
 
+    /// 统计持仓中(open)的记录数 (v19.11 用于 --test 路径判断 DB 是否已被真实持仓填充)
+    pub fn count_open_positions(&self) -> Result<usize, Box<dyn std::error::Error>> {
+        let mut conn = self.get_conn()?;
+        let count: i64 = stock_position::table
+            .filter(stock_position::status.eq("open"))
+            .count()
+            .get_result(&mut conn)?;
+        Ok(count as usize)
+    }
+
     /// 更新持仓收益率
     pub fn update_position_return(
         &self,
