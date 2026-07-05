@@ -1999,6 +1999,11 @@ async fn monitor_loop() {
         loop {
             let session = current_session();
 
+            // ============= v12 MVP0-B: T-02 数据状态每分钟评估 =============
+            // 任一 capability staleness > 120s → Degraded; Quote stale > 120s → Unsafe
+            // 治理 (mode/dm 停发) 走 dispatch 内部, 变更才推
+            evaluate_data_mode_hook(None).await;
+
             // ── 9:20-9:25 竞价高量能扫描（30秒一次）+ 盘后优选重推 ──
             if session == MarketSession::Auction {
                 let now_time = chrono::Local::now().time();

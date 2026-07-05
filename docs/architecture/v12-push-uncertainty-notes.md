@@ -82,3 +82,26 @@
 **根因**: freshness.rs 内有交易时段/日历判断, 凌晨时段可能落入"非交易日窗口". freshness.rs **未在本次改动中触碰** (git diff 已确认).
 **当前决策**: 与本次重构无关, 不修. 已记入 docs/architecture/v12-push-uncertainty-notes.md Q-11.
 **状态**: 待 freshness 模块单独修. 不阻塞 v12 推送重构合入.
+
+## Q-24 [P1] 已修复: monitor --review 路径未接 v12 R-01~R-08
+**问题**: `run_review_only_inner` 走老的 `stock_analysis::review::report::generate_daily_report_with_ledger` 路径, v12 模板 (`render_daily_report` / `render_review_market` / `render_industry_chain` / `render_review_lhb` / `render_review_signal` / `render_review_failure` / `render_tomorrow_watch` / `render_event_calendar`) 全部未挂入.
+**修复** (2026-07-05 commit 861ed64): 在 `run_review_only_inner` 末尾新增 v12 R-01~R-08 块, 包 spawn_blocking (避免 sync Diesel 在 async context panic), 真实数据 (ledger/positions/trades) 装配, R-01/R-02/R-08 真推到飞书.
+**影响**: --review 模式现在能走完整 v12 盘后推送链.
+
+## Q-25 [P1] 已修复: 持仓数据误删 (8 stocks 7 恢复)
+**问题**: 跑 MVP0-A E2E 验证时 `rm -f data/stock_analysis.db*` 清空旧 DB, 误删 6/30 前累积的 7 只持仓 (华电辽能/达实智能/德展健康/利欧股份/三安光电/建业股份 + 中京电子).
+**根因**: MVP0-A 设计想让 run_migrations 重建表, 但旧数据未先 backup. 应 `--move-then-init` 而非 `--rm-then-init`.
+**修复** (2026-07-05 commit 861ed64): 从 `data/stock_analysis.db.bak.184151` (6/30 备份) 恢复, 旧空 DB 改名为 `.empty_<ts>.bak` 保留.
+**遗留**: 合肥城建 (002208) 在 6/9 就已平仓, 不在 6/30 备份里, 仍缺失 (符合历史).
+**教训**: 后续 DB 测试严禁 `rm -f data/*.db*`, 必须先 backup.
+
+## Q-26 [P2] monitor_loop T-02 钩子每分钟跑
+**问题**: `monitor_loop` 内每个 tick 都调 `evaluate_data_mode_hook(None)`, 但 1 分钟粒度 + DataMode 状态基本不变 → 99% 都被 `is_changed()` 拦截不推.
+**影响**: 微小性能开销, 但无功能问题.
+**建议**: 改为 5 分钟粒度 (用 `Instant::now()` 计时), 状态变更时立即推 (不等间隔).
+
+## Q-27 [P2] R-03/R-04/R-06 真实数据源待接
+**问题**: R-03 涨停产业链需要拉 60 日 K 线 + 计算 board_level (周日数据空, 仅 log). R-04 龙虎榜需要 lhb_daily 表真实数据 (周日表空, 仅 log). R-06 失败归因需要 execution_tracking 表真实数据 (目前空, 仅 log).
+**根因**: v12 §13 MVP-3/4/5 部分模块 (execution_tracking / lhb_daily) 数据积累需真实盘后落库, 当前表空.
+**影响**: 仅周日 + 数据空, 不影响生产. 真实盘后会逐步填充.
+**建议**: 周一盘后跑 monitor --review, 验证 R-03/R-04/R-06 真实数据接入.
