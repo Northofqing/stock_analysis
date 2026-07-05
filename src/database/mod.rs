@@ -173,12 +173,19 @@ impl DatabaseManager {
     /// 给已存在的表增量添加列（如果列不存在）。
     /// SQLite 没有原生的 `ADD COLUMN IF NOT EXISTS`；通过 PRAGMA table_info 读列名判断。
     /// 用于把老库升级到新 schema，不破坏现有数据。
+    ///
+    /// 修复 (2026-07-05 MVP0-A): 如果表本身不存在 (CREATE 还没跑到), 静默跳过,
+    ///   等表建好后再 ALTER. 避免 "no such table: X" 错误导致 init 失败.
     pub fn add_column_if_missing(
         conn: &mut SqliteConnection,
         table: &str,
         column: &str,
         column_def: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        if !table_exists(conn, table)? {
+            // 表还没建, 跳过. 等 CREATE TABLE 之后再回头补.
+            return Ok(());
+        }
         if column_exists(conn, table, column)? {
             return Ok(());
         }
@@ -1034,6 +1041,18 @@ struct FactorIcRowDb {
 struct ColumnNameRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     name: String,
+}
+
+/// 判断表是否存在 (PRAGMA table_info 返回空 = 不存在)
+/// 修复 (2026-07-05 MVP0-A): 用于 add_column_if_missing 跳过未建表, 避免 init 失败
+fn table_exists(
+    conn: &mut SqliteConnection,
+    table: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    use diesel::RunQueryDsl;
+    let pragma_sql = format!("PRAGMA table_info({})", table);
+    let cols: Vec<ColumnNameRow> = diesel::sql_query(pragma_sql).load(conn)?;
+    Ok(!cols.is_empty())
 }
 
 /// 判断表中是否存在指定列（用于增量 schema 升级）

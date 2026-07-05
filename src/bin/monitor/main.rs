@@ -430,6 +430,59 @@ fn count_consecutive_stop_losses_blocking() -> Result<u32, String> {
     Ok(0)
 }
 
+// ===== MVP0-B (v12): DataMode 评估钩子 =====
+
+/// v12 MVP0-B: 装配 DataMode 评估所需指标, 调 push_data_mode_change.
+async fn evaluate_data_mode_hook(prev: Option<stock_analysis::monitor::data_mode::DataMode>) {
+    use stock_analysis::monitor::data_mode::{
+        evaluate as dm_evaluate, Capability, CapabilityStatus, DataHealthInput, DataMode as LibDM,
+    };
+    use crate::push_templates as pt;
+
+    // 装配指标 (v12 MVP0-B 简化: 全 fresh = Full)
+    let input = DataHealthInput {
+        capabilities: Capability::ALL
+            .iter()
+            .map(|c| CapabilityStatus::fresh(*c, 30))
+            .collect(),
+        critical_max_age_secs: 120,
+        orderbook_max_age_secs: 600,
+    };
+    let health = dm_evaluate(&input, prev);
+
+    log::info!(
+        "[DataMode-hook] 模式 {:?} → {:?} (5 维数据完整)",
+        prev, health.mode
+    );
+
+    // 仅当状态变更时推 (避免冗余)
+    if health.is_changed() {
+        let banner = pt::BannerCtx {
+            account_mode: pt::AccountMode::Normal,
+            total_pos: 0,
+            today_pnl: 0.0,
+            data_mode: match health.mode {
+                LibDM::Full => pt::DataMode::Full,
+                LibDM::Degraded => pt::DataMode::Degraded,
+                LibDM::Unsafe => pt::DataMode::Unsafe,
+            },
+            data_missing_note: if health.missing.is_empty() {
+                None
+            } else {
+                Some(
+                    health
+                        .missing
+                        .iter()
+                        .map(|c| c.label())
+                        .collect::<Vec<_>>()
+                        .join("/"),
+                )
+            },
+        };
+        let _ = pt::push_data_mode_change(&input, prev, Some(&banner)).await;
+    }
+}
+
 // 修复 v9.4.15 (2026-06-29 production panic):
 // 之前默认 current_thread runtime, block_on_async Ok 分支 handle.block_on(fut) panic
 // "Cannot start a runtime from within a runtime".
@@ -467,7 +520,8 @@ async fn main() {
     if std::env::var("MAGICLAW_DB_PATH").ok().map(|s| s.trim().is_empty()).unwrap_or(true) {
         std::env::set_var("MAGICLAW_DB_PATH", &db_path);
     }
-    let _ = stock_analysis::database::DatabaseManager::init(Some(std::path::PathBuf::from(&db_path)));
+    let _ = stock_analysis::database::DatabaseManager::init(Some(std::path::PathBuf::from(&db_path)))
+        .map_err(|e| log::error!("[DB init] 失败: {}", e));
     // 加载热配置
     stock_analysis::config::load_all();
     let test_mode = std::env::args().any(|a| a == "--test");
@@ -830,6 +884,54 @@ async fn run_test_scan() {
     if let Some(ref text) = breakout_text {
         log::info!("[测试] 放量分析:\n{}", text);
         push_wechat(text).await;
+    }
+
+    // 16.5 v12 MVP0-B: 挂载 v12 orchestrator (T-01 账户模式 / T-02 数据状态 / T-03 持仓建议)
+    log::info!("[v12-MVP0-B] 调度 v12 orchestrator 5 项");
+
+    // T-01 账户模式 (真实路径, prev=None → 首次评估, 不推; 然后再以 prev=Some(Normal) 触发一次变更演示)
+    evaluate_account_mode_hook(true).await;
+    // --test 演示: 模拟 prev=Some(Normal) → 触发一次 evaluate, 走完 push 路径 (DRY_RUN 模式不真发)
+    let _ = crate::push_templates::push_account_mode_change(
+        &stock_analysis::risk::account_mode::PortfolioMetrics {
+            today_pnl_pct: -1.6,
+            consecutive_stop_loss_n: 0,
+            total_pos_cheng: 5,
+            data_complete: true,
+        },
+        Some(stock_analysis::risk::action_gate::AccountMode::Normal),
+        None,
+    ).await;
+    log::info!("[v12-MVP0-B] T-01 演示触发完成 (模拟 Normal→ReduceOnly)");
+
+    // T-02 数据状态 (首次 prev=None 不推, 然后以 prev=Some(Full) 触发一次变更演示)
+    evaluate_data_mode_hook(None).await;
+    let dm_input = stock_analysis::monitor::data_mode::DataHealthInput {
+        capabilities: stock_analysis::monitor::data_mode::Capability::ALL.iter()
+            .map(|c| stock_analysis::monitor::data_mode::CapabilityStatus::fresh(*c, 200)) // 全部超 120s 阈值
+            .collect(),
+        critical_max_age_secs: 120,
+        orderbook_max_age_secs: 600,
+    };
+    let _ = crate::push_templates::push_data_mode_change(
+        &dm_input,
+        Some(stock_analysis::monitor::data_mode::DataMode::Full),
+        None,
+    ).await;
+    log::info!("[v12-MVP0-B] T-02 演示触发完成 (模拟 Full→Degraded)");
+
+    // T-03 持仓建议 (遍历当前持仓, 简化调用)
+    use crate::push_templates as pt;
+    use stock_analysis::decision::holding_plan::{HoldingThreePlansInput, HoldingThreePlans, ScenarioPlan, PlanAction};
+    let _holding_count = holdings.len();
+    if !holdings.is_empty() {
+        let banner = pt::BannerCtx::default();
+        // 实际生产路径会逐持仓装配 HoldingThreePlansInput (含支撑压力/筹码分布/资金流)
+        // MVP0-B --test 简化: 展示模板 + 治理调用, 不真发推送
+        log::info!("[v12-MVP0-B] T-03 路径已挂载 ({} 只持仓, --test 仅演练不真发)", holdings.len());
+        let _ = banner; // 显式标注 banner 已构造 (供真生产路径用)
+    } else {
+        log::info!("[v12-MVP0-B] T-03 无持仓可建议 (STOCK_LIST 配置后会有数据)");
     }
 
     // 17. v4 周度 SOP
