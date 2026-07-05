@@ -543,25 +543,10 @@ async fn main() {
         run_test_scan().await;
     } else if review_mode {
         run_review_only().await;
-        // P1.1 真正修复 v5: 用 std::thread::spawn 调市场概览
-        // 原因: reqwest::blocking::Client::builder().build() 内部创建 tokio runtime
-        //       在 main async context 里 drop 时触发 panic (实测 v1~v4 全部 panic)
-        //       std::thread::spawn 启动独立线程, 不属于 main 的 tokio runtime
-        //       线程内创建 / drop runtime 都不会影响 main runtime
-        log::info!("[复盘 P1.1] 准备 std::thread::spawn 调市场概览...");
-        let (tx, rx) = std::sync::mpsc::channel::<String>();
-        std::thread::spawn(move || {
-            let txt = stock_analysis::market_analyzer::async_overview::generate_market_overview_text_blocking();
-            let _ = tx.send(txt);
-        });
-        // 用 block_in_place 等独立线程结果 (async context, 不在 std::thread 里)
-        let txt = tokio::task::block_in_place(|| rx.recv().unwrap_or_default());
-        if !txt.is_empty() {
-            log::info!("[复盘 P1.1] 市场概览已生成 ({}字 / {}字节)", txt.chars().count(), txt.len());
-            push_wechat(&txt).await;
-        } else {
-            log::warn!("[复盘 P1.1] 市场概览为空 (获取失败, 已跳过)");
-        }
+        // [v12 删除] P1.1 老 "📊 A股市场概览" 推送 (用 std::thread::spawn + block_in_place)
+        // 由 v12 R-02 盘面走向 (render_review_market) 替代, 见 run_review_only_inner 末尾 v12 R-01~R-08
+        // 真实市场概览 (5 维评分) 数据合到 v12 R-02, 不再单独推
+        log::info!("[复盘] v12 模板已替代老市场概览推送");
         // 干净退出 (避免 runtime drop panic)
         std::process::exit(0);
     } else {
@@ -1156,7 +1141,8 @@ async fn run_review_only_inner() {
     }).await.unwrap_or_default();
 
     log::info!("[复盘] 复盘报告:\n{}", report);
-    push_wechat(&report).await;
+    // [v12 删除] push_wechat(&report).await  — 老 "📊 交易复盘 2026-07-05" 格式
+    // 由 v12 R-01 持仓明日计划 (render_daily_report) 替代, 见下方 v12 R-01 推送
 
     // P1.1 市场概览: 在 async context 直接调 (与项目 block_in_place 模式一致)
     // (原 spawn_blocking 闭包内的版本已删除, 避免 block_in_place 错位)
@@ -1165,138 +1151,15 @@ async fn run_review_only_inner() {
     // 这里不再调 get_market_overview, 因为实测三种调用方式都触发 tokio runtime drop panic.
     // 真正的修复 (改成 async) 在 P2.x 范围.
 
-    // 与正常收盘路径保持一致：推送优选候选（最多5只，阈值过滤后可少推/不推）
-    let post_close_candidates = stock_analysis::opportunity::run_post_close_candidates(5).await;
-    log::info!("[复盘] 优选候选:\n{}", post_close_candidates);
-    notify::push_governor(&post_close_candidates, notify::PushKind::OptimalClose).await;
+    // [v12 删除] 老 "📋 候选筛选台" (OptimalClose)  — 由 v12 T-07/R-07 替代 (MVP-3 影子 + R-07 观察池)
+    // [v12 删除] 老 "📘 虚拟观察仓次日表现" (push_virtual_next_day_review) — 由 v12 R-01~R-08 替代
+    // [v12 删除] 老 "放量·持仓 / 放量·自选 / 放量·实盘优选" — 不再单独推, 数据合到 v12 R-01
+    // [v12 删除] 老 "持仓决策台" (run_review_deep_analysis) — 由 v12 R-01 持仓明日计划替代
+    // [v12 删除] 老 "新闻Ranker" (news_ranker) — 由 v12 R-07 明日观察池替代 (MVP-3 影子才出)
+    // [v12 删除] 老 "AI 评分因子 IC" (run_factor_ic_analysis) — 不再单独推, 数据合到 v12 R-05
 
-    // 盘后统计上一交易日虚拟观察仓表现（可配置开关）
-    push_virtual_next_day_review_if_needed().await;
-
-    if !holding_breakout_text.is_empty() {
-        log::info!("[复盘] 放量分析·持仓:\n{}", holding_breakout_text);
-        notify::push_governor(&holding_breakout_text, notify::PushKind::VolumeWatchlist).await;
-    }
-
-    if !watch_breakout_text.is_empty() {
-        log::info!("[复盘] 放量分析·自选:\n{}", watch_breakout_text);
-        notify::push_governor(&watch_breakout_text, notify::PushKind::VolumeRealTrade).await;
-    }
-
-    if !market_breakout_text.is_empty() {
-        log::info!("[复盘] 放量分析·实盘优选:\n{}", market_breakout_text);
-        push_wechat(&market_breakout_text).await;
-    }
-
-    if !risk_text.is_empty() {
-        log::info!("[复盘] 风控研判:\n{}", risk_text);
-        // v19.3: 风险卡合并到持仓决策台 (LLM 建议+止损+轮动+现金 1 张卡)
-        // 不再单独推, 推到 run_review_deep_analysis 完成后合并
-    }
-
-    // 盘后持仓多 Agent 深度研判（6 分析师 + 多空辩论 + 仲裁），逐只推送飞书
-    // v19.3: 传 risk_text 进去, 让决策台 1 张卡含风险段
-    run_review_deep_analysis(&holding_breakout_text, &watch_breakout_text, &risk_text).await;
-
-    // P0-3: AI 评分因子 IC 分析
-    if let Some(ic_report) = run_factor_ic_analysis() {
-        log::info!("[复盘] 因子IC分析:\n{}", ic_report);
-    }
-
+    log::info!("[复盘] ======== 老推送已全部删除, 改走 v12 模板 ========");
     log::info!("[复盘] ======== 盘后分析完成 ========");
-
-    // v19.3: NewsRanker 默认 true (盘后新闻派生买入推荐, 你应该看到)
-    // NEWS_RANKER_SHADOW=false 关闭 (老 P0-4 PUSH_SHADOW 行为兼容)
-    let shadow_enabled = std::env::var("NEWS_RANKER_SHADOW")
-        .map(|v| v.to_lowercase() != "false")
-        .unwrap_or(true);
-    if shadow_enabled {
-        let hbt = holding_breakout_text.clone();
-        let wbt = watch_breakout_text.clone();
-        let ranked_news = tokio::task::spawn_blocking(move || {
-            use stock_analysis::opportunity::news_ranker;
-            use stock_analysis::opportunity::candidate_panel::{self as cp, parse_text_to_raw};
-            use stock_analysis::opportunity::chain_mapper::{ChainHit, ChainSource};
-            // 1. 放量文本路径 (B6 持仓 + B7 自选)
-            let mut hits: Vec<ChainHit> = Vec::new();
-            for (text) in [&hbt, &wbt] {
-                for (code, name) in parse_text_to_raw(text) {
-                    hits.push(ChainHit {
-                        chain: name.clone(),
-                        keywords: vec![code.clone(), name.clone()],
-                        logic: "review-volume".into(),
-                        stocks: vec![],
-                        source: ChainSource::Rule,
-                        board_keyword: name,
-                        fund_flow_pct: None,
-                    });
-                }
-            }
-            // 2. 公告路径 (em_announcement) — 拉今日公告, 走 chain_mapper 召回
-            // 公告是"真新闻", 比放量文本更可能进 A 档
-            if let Ok(anns) = stock_analysis::data_provider::announcement::fetch_announcements(None) {
-                for ann in anns.iter().take(30) {
-                    // 标题含风险关键词 (监管/立案/退市) → 跳过, 走 Drop 路径
-                    if ann.title.contains("立案") || ann.title.contains("退市") || ann.title.contains("ST风险") {
-                        continue;
-                    }
-                    // 公告 → 标记"启动"阶段 (新事件刺激, 让 P2-News A 档条件可达)
-                    // 用 logic 字段编码 HeatStage hint, shadow_rank_hits 解析
-                    let stage_hint = match ann.level {
-                        stock_analysis::data_provider::announcement::AnnLevel::Emergency => "FADE",
-                        stock_analysis::data_provider::announcement::AnnLevel::Important => "FERMENT",
-                        _ => "START",
-                    };
-                    hits.push(ChainHit {
-                        chain: ann.name.clone(),
-                        keywords: vec![ann.title.clone(), format!("__STAGE:{}", stage_hint)],
-                        logic: "review-announcement".into(),
-                        stocks: vec![],
-                        source: ChainSource::Rule,
-                        board_keyword: ann.name.clone(),
-                        fund_flow_pct: None,
-                    });
-                }
-            }
-            let titles: Vec<String> = hits.iter().map(|h| h.chain.clone()).collect();
-            news_ranker::shadow_rank_hits(&hits, &titles)
-        })
-        .await
-        .unwrap_or_default();
-        if !ranked_news.is_empty() {
-            let board = stock_analysis::opportunity::news_ranker::format_news_ranked_board(&ranked_news);
-            log::info!("[复盘] 新闻Ranker (v18.4, {} 命中):\n{}", ranked_news.len(), board);
-            notify::push_governor(&board, notify::PushKind::NewsRanked).await;
-        } else {
-            log::info!("[NewsRanker] 0 命中, 跳过推送");
-        }
-    }
-
-    // P3 outcome 回看 (NEWS_OUTCOME_RUN=true 触发, 默认不跑)
-    // --review 末尾加 (盘后正是回看推送效果的时间点)
-    if std::env::var("NEWS_OUTCOME_RUN").ok().as_deref() == Some("true") {
-        let report = tokio::task::spawn_blocking(|| {
-            let outcomes = stock_analysis::opportunity::news_outcome::run_today_outcome();
-            stock_analysis::opportunity::news_outcome::format_outcome_report(&outcomes)
-        })
-        .await
-        .unwrap_or_default();
-        if !report.is_empty() {
-            log::info!("[NewsOutcome] 报告:\n{}", report);
-            // 落盘到 data/news_outcome_YYYY-MM-DD.md (与 audit 同目录)
-            let prev_db = std::env::var("DATABASE_PATH").unwrap_or_else(|_| "./data/stock_analysis.db".into());
-            let dir = std::path::PathBuf::from(&prev_db)
-                .parent()
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| std::path::PathBuf::from("./data"));
-            let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-            let path = dir.join(format!("news_outcome_{}.md", today));
-            let _ = std::fs::write(&path, &report);
-            log::info!("[NewsOutcome] 落盘: {}", path.display());
-        } else {
-            log::info!("[NewsOutcome] 今日 audit 为空, 跳过");
-        }
-    }
 
     // ===============================================================
     // v12 盘后增强 (R-01 ~ R-08) — 替代/补充老 review 路径
@@ -1489,20 +1352,20 @@ async fn run_review_only_inner() {
         // 推送: 在 async context 直接 push (R-01 + R-02 + R-08 3 个必推, 其他按数据决定)
         log::info!("[v12-MVP1-R] 推送 R-01~R-08 到飞书");
 
-        // 简化: 推送 R-01 + R-02 + R-08 (3 个最关键), 其他 R-03/04/05/06/07 数据不足暂略
+        // 推送数据准备 (sync Diesel → 必须包 spawn_blocking, 否则 async context panic)
         let today_str2 = chrono::Local::now().format("%Y-%m-%d").to_string();
-        // 重新装配关键推送 (因 spawn_blocking 已 drop, 需要重新计算)
-        let r2 = stock_analysis::portfolio::get_positions().unwrap_or_default();
-        let r2_quotes = market_data::fetch_position_quotes();
-        let r2_prices: std::collections::HashMap<String, f64> =
-            r2_quotes.iter().map(|q| (q.code.clone(), q.price)).collect();
-        let r2_equity = stock_analysis::portfolio::get_equity_curve(30).unwrap_or_default();
-        let r2_ledger = r2_equity.last().cloned();
-        let r2_pnl = match r2_ledger.as_ref() {
-            Some(e) if e.total_value > 0.0 => (e.daily_pnl / e.total_value) * 100.0,
-            _ => 0.0,
-        };
-        let r2_mv = r2_ledger.as_ref().map(|e| e.market_value).unwrap_or(0.0);
+        let push_data = tokio::task::spawn_blocking(move || {
+            let r2 = stock_analysis::portfolio::get_positions().unwrap_or_default();
+            let r2_quotes = market_data::fetch_position_quotes();
+            let r2_prices: std::collections::HashMap<String, f64> =
+                r2_quotes.iter().map(|q| (q.code.clone(), q.price)).collect();
+            let r2_equity = stock_analysis::portfolio::get_equity_curve(30).unwrap_or_default();
+            let r2_ledger = r2_equity.last().cloned();
+            let r2_mv = r2_ledger.as_ref().map(|e| e.market_value).unwrap_or(0.0);
+            (r2, r2_prices, r2_mv)
+        }).await.unwrap_or_default();
+
+        let (r2, r2_prices, r2_mv) = push_data;
 
         // R-01 推送
         {
