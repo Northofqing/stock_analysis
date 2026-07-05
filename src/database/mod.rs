@@ -40,6 +40,8 @@ static DB_INSTANCE: OnceCell<DatabaseManager> = OnceCell::new();
 
 pub mod repository;
 pub mod factor_snapshot;
+// v12 MVP-5 §8.1
+pub mod execution_tracking;
 mod concepts;
 mod kline;
 mod lhb;

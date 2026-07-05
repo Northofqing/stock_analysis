@@ -11,6 +11,8 @@ pub mod tools_money_flow;
 pub mod tools_chip;
 pub mod tools_news;
 pub mod multi_agent;
+// v12 MVP-4 §7.8
+pub mod auction_agent;
 
 // Facade re-exports — 外部模块只应通过 `crate::agent` 访问，不直接导入子模块
 pub use loop_runner::AgentRunner;
