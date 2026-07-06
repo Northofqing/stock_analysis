@@ -120,6 +120,8 @@ pub enum PushKind {
     PostFixedPriceOrder,
     /// v13.1 §5.3 T-15 盘后固定价格成交 (⚡ 5min/票)
     PostFixedPriceFill,
+    /// v13.1 §5.4 T-16 ST 涨跌幅变更提醒 (新规 5%→10%, ⚡ 1次/票/日)
+    StPriceLimitChanged,
 }
 
 impl PushKind {
@@ -159,7 +161,8 @@ impl PushKind {
             | PushKind::CatalystReview
             | PushKind::IndustryChainIntraday
             | PushKind::PostFixedPriceOrder
-            | PushKind::PostFixedPriceFill => PushLevel::Important,
+            | PushKind::PostFixedPriceFill
+            | PushKind::StPriceLimitChanged => PushLevel::Important,
             // ℹ️参考 (降级 + ForbiddenOps/PaperTrade)
             _ => PushLevel::Info,
         }
@@ -194,6 +197,7 @@ impl PushKind {
                 | PushKind::IndustryChainIntraday
                 | PushKind::PostFixedPriceOrder
                 | PushKind::PostFixedPriceFill
+                | PushKind::StPriceLimitChanged
         )
     }
 
@@ -235,6 +239,7 @@ impl PushKind {
             PushKind::IndustryChainIntraday => Some(1800),                     // 30 min
             PushKind::PostFixedPriceOrder => Some(60),                        // 1 min/票
             PushKind::PostFixedPriceFill => Some(300),                         // 5 min/票
+            PushKind::StPriceLimitChanged => Some(86_400),                     // 1次/票/日
             _ => Some(1800),                                                  // 默认 30min
         }
     }
@@ -286,6 +291,7 @@ impl PushKind {
             PushKind::IndustryChainIntraday => "盘中涨停扩散",
             PushKind::PostFixedPriceOrder => "盘后固定价格申报",
             PushKind::PostFixedPriceFill => "盘后固定价格成交",
+            PushKind::StPriceLimitChanged => "ST 涨跌幅变更",
         }
     }
 }

@@ -1955,6 +1955,54 @@ pub fn render_post_fixed_price_fill(p: PostFixedPriceFillParams<'_>) -> String {
     )
 }
 
+/// v13.1 §5.4 ST/*ST 类型
+pub enum StType {
+    ST,    // ST
+    StarST, // *ST
+}
+
+/// v13.1 §5.4 T-16 ST 涨跌幅变更提醒 (新规 5%→10%, 2026-07-06 生效)
+pub struct StPriceLimitChangedParams<'a> {
+    pub hhmm: &'a str,
+    pub name: &'a str,
+    pub code: &'a str,
+    pub st_type: StType,
+    pub old_limit: f32, // 原 0.05
+    pub new_limit: f32, // 新 0.10
+    pub holding_qty: u32,
+    pub cost: f64,
+    pub now_price: f64,
+    pub new_stop_loss: Option<f64>,
+    pub new_take_profit: Option<f64>,
+}
+
+/// v13.1 §5.4 T-16 ST 涨跌幅变更提醒（⚡交易建议类, 带 banner）
+pub fn render_st_price_limit_changed(p: StPriceLimitChangedParams<'_>) -> String {
+    let st = match p.st_type {
+        StType::ST => "ST",
+        StType::StarST => "*ST",
+    };
+    let mut s = format!(
+        "⚠️ ST 涨跌幅变更（{}）\n{}({}) [{}] 持仓 {} 股\n原涨跌幅: {:+.0}% → 新涨跌幅: {:+.0}%\n现价: {:.2} 成本: {:.2} 浮盈: {:+.1}%\n",
+        p.hhmm, p.name, p.code, st, p.holding_qty,
+        p.old_limit * 100.0, p.new_limit * 100.0,
+        p.now_price, p.cost, ((p.now_price - p.cost) / p.cost) * 100.0
+    );
+    if let Some(sl) = p.new_stop_loss {
+        s.push_str(&format!(
+            "新止损: {:.2} (基于 {:.0}% 阈值)\n",
+            sl, p.new_limit * 100.0
+        ));
+    } else {
+        s.push_str("新止损: 未重算\n");
+    }
+    if let Some(tp) = p.new_take_profit {
+        s.push_str(&format!("新止盈: {:.2}\n", tp));
+    }
+    s.push_str("辅助建议, 非下单指令 — 现有持仓风险阈值已重新校准");
+    s
+}
+
 // ============================================================================
 // 测试
 // ============================================================================
@@ -3165,6 +3213,57 @@ mod tests {
     #[test] fn gov_post_fixed_price_fill_banner() { assert!(crate::notify::PushKind::PostFixedPriceFill.requires_banner()); }
     #[test] fn gov_post_fixed_price_order_level() { assert_eq!(crate::notify::PushKind::PostFixedPriceOrder.level(), crate::notify::PushLevel::Important); }
     #[test] fn gov_post_fixed_price_fill_level() { assert_eq!(crate::notify::PushKind::PostFixedPriceFill.level(), crate::notify::PushLevel::Important); }
+
+    // ====== v13.1 T-16 ST 涨跌幅变更 (3 用例) ======
+    #[test]
+    fn st_price_limit_changed_with_recalc() {
+        let p = StPriceLimitChangedParams {
+            hhmm: "09:30", name: "A", code: "600000", st_type: StType::ST,
+            old_limit: 0.05, new_limit: 0.10,
+            holding_qty: 1000, cost: 10.0, now_price: 11.0,
+            new_stop_loss: Some(9.0), new_take_profit: Some(12.0),
+        };
+        let out = render_st_price_limit_changed(p);
+        assert!(out.contains("⚠️ ST 涨跌幅变更（09:30）"));
+        assert!(out.contains("A(600000) [ST] 持仓 1000 股"));
+        assert!(out.contains("原涨跌幅: +5% → 新涨跌幅: +10%"));
+        assert!(out.contains("新止损: 9.00 (基于 10% 阈值)"));
+        assert!(out.contains("新止盈: 12.00"));
+        assert!(out.contains("浮盈: +10.0%"));
+        assert!(out.contains("辅助建议, 非下单指令 — 现有持仓风险阈值已重新校准"));
+    }
+
+    #[test]
+    fn st_price_limit_changed_star_st_no_recalc() {
+        let p = StPriceLimitChangedParams {
+            hhmm: "09:30", name: "B", code: "000001", st_type: StType::StarST,
+            old_limit: 0.05, new_limit: 0.10,
+            holding_qty: 500, cost: 5.0, now_price: 4.5,
+            new_stop_loss: None, new_take_profit: None,
+        };
+        let out = render_st_price_limit_changed(p);
+        assert!(out.contains("B(000001) [*ST]"));
+        assert!(out.contains("新止损: 未重算"));
+        assert!(!out.contains("新止盈:"));
+        assert!(out.contains("浮盈: -10.0%"));
+    }
+
+    #[test]
+    fn st_price_limit_changed_zero_qty_alert() {
+        let p = StPriceLimitChangedParams {
+            hhmm: "09:30", name: "A", code: "600000", st_type: StType::ST,
+            old_limit: 0.05, new_limit: 0.10,
+            holding_qty: 0, cost: 0.0, now_price: 0.0,
+            new_stop_loss: None, new_take_profit: None,
+        };
+        let out = render_st_price_limit_changed(p);
+        assert!(out.contains("持仓 0 股"));
+    }
+
+    // ====== v13.1 治理元信息测试 (T-16) ======
+    #[test] fn gov_st_price_limit_changed_cooldown() { assert_eq!(crate::notify::PushKind::StPriceLimitChanged.cooldown_secs(), Some(86_400)); }
+    #[test] fn gov_st_price_limit_changed_banner() { assert!(crate::notify::PushKind::StPriceLimitChanged.requires_banner()); }
+    #[test] fn gov_st_price_limit_changed_level() { assert_eq!(crate::notify::PushKind::StPriceLimitChanged.level(), crate::notify::PushLevel::Important); }
 
     #[test]
     fn evidence_quality_labels() {
