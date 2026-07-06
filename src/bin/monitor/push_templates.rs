@@ -1534,32 +1534,46 @@ pub fn build_news_catalyst_from_snapshot<'a>(s: &'a NewsCatalystSnapshot) -> New
     }
 }
 
-/// v16.2: 真实数据集成 — 从 chain_daily DB 取 top concept 作为 headline
-/// 简化: chain_daily 第一个 concept 作为 "新闻催化" 主题 (替代 news_monitor 待 v16.3+)
+/// v17.2: 实时涨跌接入 (data_provider::gtimg)
+/// 替代 v16.2 的 chg=0.0 占位
 pub fn load_news_catalyst_snapshot_real(hhmm: &str) -> NewsCatalystSnapshot {
     use stock_analysis::database::DatabaseManager;
+    use stock_analysis::data_provider::GtimgProvider;
     let clusters = DatabaseManager::get().get_latest_chain_clusters();
     if clusters.is_empty() {
         return NewsCatalystSnapshot::default();
     }
-    // top concept → headline (chain_daily 简化复用)
     let top = &clusters[0];
-    let stocks = clusters
-        .iter()
-        .take(3)
-        .filter_map(|c| {
-            // 从 stocks JSON 解析前 3 个 code (复用 P-01 解析逻辑)
-            let codes: Vec<&str> = c
-                .stocks
-                .trim_matches(|ch| ch == '[' || ch == ']')
-                .split(',')
-                .take(3)
-                .map(|s| s.trim_matches('"').trim())
-                .filter(|s| !s.is_empty())
-                .collect();
-            codes.first().map(|code| (code.to_string(), code.to_string(), Some(0.0_f32)))
-        })
-        .collect();
+    let provider = match GtimgProvider::new() {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("[I-02] GtimgProvider::new 失败: {}, 退到 chg=0.0", e);
+            return load_news_catalyst_snapshot_real_fallback(hhmm);
+        }
+    };
+    let mut stocks: Vec<(String, String, Option<f32>)> = Vec::new();
+    for c in clusters.iter().take(3) {
+        let codes: Vec<&str> = c
+            .stocks
+            .trim_matches(|ch| ch == '[' || ch == ']')
+            .split(',')
+            .take(3)
+            .map(|s| s.trim_matches('"').trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        for code in codes {
+            // v17.2: 调 fetch_realtime_quote 拿真实涨跌幅
+            let chg = match provider.fetch_realtime_quote(code) {
+                Ok(Some(q)) => Some(q.pct_chg as f32),
+                Ok(None) => None,
+                Err(e) => {
+                    log::debug!("[I-02] fetch_realtime_quote({}) 失败: {}", code, e);
+                    None
+                }
+            };
+            stocks.push((code.to_string(), code.to_string(), chg));
+        }
+    }
     NewsCatalystSnapshot {
         hhmm: hhmm.to_string(),
         headline: format!("{} 板块持续走强", top.concept),
@@ -1571,6 +1585,37 @@ pub fn load_news_catalyst_snapshot_real(hhmm: &str) -> NewsCatalystSnapshot {
 /// v15.3 兼容: 同步占位
 pub fn load_news_catalyst_snapshot(_hhmm: &str) -> NewsCatalystSnapshot {
     NewsCatalystSnapshot::default()
+}
+
+/// v17.2 内部: provider 失败时 fallback (避免 v16.2 的 chg=0.0 占位)
+fn load_news_catalyst_snapshot_real_fallback(hhmm: &str) -> NewsCatalystSnapshot {
+    use stock_analysis::database::DatabaseManager;
+    let clusters = DatabaseManager::get().get_latest_chain_clusters();
+    if clusters.is_empty() {
+        return NewsCatalystSnapshot::default();
+    }
+    let top = &clusters[0];
+    let stocks: Vec<(String, String, Option<f32>)> = clusters
+        .iter()
+        .take(3)
+        .filter_map(|c| {
+            let codes: Vec<&str> = c
+                .stocks
+                .trim_matches(|ch| ch == '[' || ch == ']')
+                .split(',')
+                .take(3)
+                .map(|s| s.trim_matches('"').trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            codes.first().map(|code| (code.to_string(), code.to_string(), None))
+        })
+        .collect();
+    NewsCatalystSnapshot {
+        hhmm: hhmm.to_string(),
+        headline: format!("{} 板块持续走强", top.concept),
+        theme: top.concept.clone(),
+        stocks,
+    }
 }
 
 /// v15.3 业务层入口 (v16.2 改用真实 chain_daily 数据)
