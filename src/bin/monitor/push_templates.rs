@@ -1720,20 +1720,105 @@ pub fn build_industry_chain_intraday_from_snapshot<'a>(
     }
 }
 
-/// v16.3: 真实数据集成 — 复用 chain_daily DB (top 1 cluster → 龙头/补涨)
-/// 简化: chain_daily.continuation_count 作 leader_height, stocks JSON 前 3 → supplements
+/// v16.3+v14.1: 真实数据集成 — 复用 chain_daily DB + GtimgProvider + aggregate()
+/// v14.1 改进: 走 market_analyzer::limit_chain_review::aggregate() 真正集成
 pub fn load_industry_chain_snapshot_real(hhmm: &str) -> IndustryChainSnapshot {
+    use stock_analysis::database::DatabaseManager;
+    use stock_analysis::data_provider::GtimgProvider;
+    use stock_analysis::market_analyzer::limit_chain_review::{
+        aggregate, LimitChainInput, StockLimitStats,
+    };
+
+    let clusters = DatabaseManager::get().get_latest_chain_clusters();
+    if clusters.is_empty() {
+        return IndustryChainSnapshot::default();
+    }
+
+    // v14.1: 构造 StockLimitStats[] (从 chain_daily + 实时行情)
+    let provider = match GtimgProvider::new() {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("[I-03] GtimgProvider::new 失败: {}, 退化到 chain_daily 简化版", e);
+            return load_industry_chain_snapshot_real_fallback(hhmm);
+        }
+    };
+
+    let mut stocks: Vec<StockLimitStats> = Vec::new();
+    for c in clusters.iter().take(5) {
+        // 解析 stocks JSON
+        let codes: Vec<String> = c
+            .stocks
+            .trim_matches(|ch| ch == '[' || ch == ']')
+            .split(',')
+            .map(|s| s.trim_matches('"').trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        for (i, code) in codes.iter().take(3).enumerate() {
+            // v14.1: 实时行情接入 (替代 chg=0.0 占位)
+            let (price, chg_pct) = match provider.fetch_realtime_quote(code) {
+                Ok(Some(q)) => (q.price, q.pct_chg as f64),
+                _ => (0.0, 0.0),
+            };
+            stocks.push(StockLimitStats {
+                code: code.clone(),
+                name: code.clone(),  // 简化: code 作为 name
+                chain: c.concept.clone(),
+                board_level: (i + 1) as u8,  // 简化: 按位置推断 (1=首板)
+                is_limit_up_today: chg_pct > 9.5,  // ST/*ST 涨跌幅 10% 视为涨停
+                is_first_board: i == 0,
+                consecutive_days: c.continuation_count as u32,
+            });
+        }
+    }
+
+    if stocks.is_empty() {
+        return load_industry_chain_snapshot_real_fallback(hhmm);
+    }
+
+    // v14.1: 真正调 aggregate() (vs v16.3 简化)
+    let input = LimitChainInput {
+        stocks: stocks.clone(),
+        source_complete: false,  // 简化 (v14+ 接真实 fetcher 改 true)
+    };
+    let aggregates = aggregate(&input);
+    if aggregates.is_empty() {
+        return load_industry_chain_snapshot_real_fallback(hhmm);
+    }
+
+    // 取 top 1 aggregate (按 limit_up_n 降序)
+    let mut sorted: Vec<_> = aggregates.iter().collect();
+    sorted.sort_by(|a, b| b.limit_up_n.cmp(&a.limit_up_n));
+    let top = sorted[0];
+
+    // 解析 followers → supplements (前 3)
+    let supplements: Vec<(String, String, String, f64, f64, f64)> = top
+        .followers
+        .iter()
+        .take(3)
+        .map(|c| (c.clone(), c.clone(), "首板".to_string(), 0.0, 0.0, 0.0))
+        .collect();
+
+    IndustryChainSnapshot {
+        hhmm: hhmm.to_string(),
+        chain: top.chain.clone(),
+        limit_count: top.limit_up_n,
+        leader_name: top.leader_name.clone(),
+        leader_code: top.leader_code.clone(),
+        leader_height: top.leader_boards,
+        supplements,
+    }
+}
+
+/// v14.1 fallback: GtimgProvider 失败时退化
+fn load_industry_chain_snapshot_real_fallback(hhmm: &str) -> IndustryChainSnapshot {
     use stock_analysis::database::DatabaseManager;
     let clusters = DatabaseManager::get().get_latest_chain_clusters();
     if clusters.is_empty() {
         return IndustryChainSnapshot::default();
     }
-    // top 1 cluster (按 continuation_count 排序)
     let mut sorted: Vec<_> = clusters.iter().collect();
     sorted.sort_by(|a, b| b.continuation_count.cmp(&a.continuation_count));
     let top = sorted[0];
-
-    // 解析 stocks JSON → 补涨候选 (前 3, leader 在 stocks[0])
     let codes: Vec<String> = top
         .stocks
         .trim_matches(|ch| ch == '[' || ch == ']')
@@ -1741,20 +1826,18 @@ pub fn load_industry_chain_snapshot_real(hhmm: &str) -> IndustryChainSnapshot {
         .map(|s| s.trim_matches('"').trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
-
     let leader_name = if !codes.is_empty() { codes[0].clone() } else { String::new() };
     let leader_code = codes.get(0).cloned().unwrap_or_default();
     let supplements: Vec<(String, String, String, f64, f64, f64)> = codes
         .iter()
-        .skip(1)  // 跳过 leader
+        .skip(1)
         .take(3)
         .map(|c| (c.clone(), c.clone(), "首板".to_string(), 0.0, 0.0, 0.0))
         .collect();
-
     IndustryChainSnapshot {
         hhmm: hhmm.to_string(),
         chain: top.concept.clone(),
-        limit_count: top.continuation_count as u32,  // 简化映射
+        limit_count: top.continuation_count as u32,
         leader_name,
         leader_code,
         leader_height: top.continuation_count as u32,
