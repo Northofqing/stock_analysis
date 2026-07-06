@@ -1338,7 +1338,7 @@ mod tests {
             PushKind::FactorIC,
             PushKind::WeeklySOP,
         ] {
-            assert!(k.is_deprecated(), "{:?} 应降级", k);
+            assert!(!k.is_deprecated(), "{:?} v19.12 起保留, 不再降级", k);
         }
     }
 
@@ -1365,12 +1365,13 @@ mod tests {
         assert_eq!(kinds.len(), 13, "13 个 PushKind 变体");
     }
 
-    /// push_governor 降级时返回 false (未推), log 输出
+    /// v19.12 起所有变体均保留, 此测试验证 push_governor 对保留的 AuctionVolume 返回 true
+    /// (旧测试期望降级返回 false, 已废弃; commit 6cffecf fix(v19.12))
     #[tokio::test]
     async fn push_governor_deprecated_no_push() {
-        std::env::remove_var("PUSH_VERBOSE");
-        let r = push_governor("test deprecated", PushKind::AuctionVolume).await;
-        assert!(!r, "降级应返回 false (未推)");
+        std::env::set_var("V10_DRY_RUN_PUSH", "1"); // dry-run 模式返回 true
+        let r = push_governor("test kept", PushKind::AuctionVolume).await;
+        assert!(r, "v19.12 起 AuctionVolume 保留, push_governor 应返回 true (dry-run)");
     }
 
     /// push_governor 保留时调 push_wechat (返回 V10_DRY_RUN_PUSH=true 时为 true)

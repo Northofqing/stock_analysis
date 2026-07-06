@@ -2621,6 +2621,23 @@ mod tests {
 
     static DB_INIT: OnceLock<()> = OnceLock::new();
 
+    /// e2e 串行化 Mutex (修复并行测试 DB row count 干扰) — tokio 跨 await 安全
+    static E2E_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// 重置全局 DAILY_BUDGET_COUNT 计数 + 清空 COOLDOWN_TABLE (修复 4 个 e2e 并行测试隔离 bug)
+    /// 测试间共享的全局状态 (account_mode_log 表, 预算 counter, 冷却表) 必须全部重置
+    /// 才能保证 67 个并行测试互不干扰。
+    fn reset_daily_budget_for_test() {
+        DAILY_BUDGET_COUNT.store(0, Ordering::Relaxed);
+        let mut table = COOLDOWN_TABLE.lock().expect("cooldown table poisoned");
+        table.clear();
+        // 清空 account_mode_log (并行测试可能插入行, 影响 e2e_t01_no_change 的 count 断言)
+        use diesel::prelude::*;
+        if let Ok(mut conn) = stock_analysis::database::DatabaseManager::get().get_conn() {
+            diesel::sql_query("DELETE FROM account_mode_log").execute(&mut conn).ok();
+        }
+    }
+
     fn init_test_db() {
         DB_INIT.get_or_init(|| {
             use std::path::PathBuf;
@@ -2677,7 +2694,9 @@ mod tests {
     /// T-01 E2E: Normal → ReduceOnly. 验证 DB 写 + 推送路径
     #[tokio::test]
     async fn e2e_t01_normal_to_reduce_only_db_and_push() {
+        let _e2e_guard = E2E_MUTEX.lock().await;
         init_test_db();
+        reset_daily_budget_for_test();
         std::env::set_var("V10_DRY_RUN_PUSH", "1");
         std::env::set_var("PUSH_VERBOSE", "true");
 
@@ -2723,7 +2742,9 @@ mod tests {
     /// T-01 E2E: 无变更 → 不推送不写库
     #[tokio::test]
     async fn e2e_t01_no_change_no_push_no_db_write() {
+        let _e2e_guard = E2E_MUTEX.lock().await;
         init_test_db();
+        reset_daily_budget_for_test();
         std::env::set_var("V10_DRY_RUN_PUSH", "1");
         std::env::set_var("PUSH_VERBOSE", "true");
 
@@ -2760,7 +2781,9 @@ mod tests {
     /// T-01 E2E: ReduceOnly → Frozen. 数据准确
     #[tokio::test]
     async fn e2e_t01_reduce_only_to_frozen_circuit_breaker() {
+        let _e2e_guard = E2E_MUTEX.lock().await;
         init_test_db();
+        reset_daily_budget_for_test();
         std::env::set_var("V10_DRY_RUN_PUSH", "1");
         std::env::set_var("PUSH_VERBOSE", "true");
 
@@ -2796,7 +2819,9 @@ mod tests {
     /// T-01 E2E: 数据缺失 → 保守 ReduceOnly
     #[tokio::test]
     async fn e2e_t01_data_missing_conservative_reduce_only() {
+        let _e2e_guard = E2E_MUTEX.lock().await;
         init_test_db();
+        reset_daily_budget_for_test();
         std::env::set_var("V10_DRY_RUN_PUSH", "1");
         std::env::set_var("PUSH_VERBOSE", "true");
 
@@ -2830,7 +2855,9 @@ mod tests {
     /// T-02 E2E: Full → Degraded (Kline 过期)
     #[tokio::test]
     async fn e2e_t02_full_to_degraded_kline_stale() {
+        let _e2e_guard = E2E_MUTEX.lock().await;
         init_test_db();
+        reset_daily_budget_for_test();
         std::env::set_var("V10_DRY_RUN_PUSH", "1");
         std::env::set_var("PUSH_VERBOSE", "true");
 
@@ -2865,7 +2892,9 @@ mod tests {
     /// T-02 E2E: 无变更 → no-op
     #[tokio::test]
     async fn e2e_t02_no_change_no_push() {
+        let _e2e_guard = E2E_MUTEX.lock().await;
         init_test_db();
+        reset_daily_budget_for_test();
         std::env::set_var("V10_DRY_RUN_PUSH", "1");
         std::env::set_var("PUSH_VERBOSE", "true");
 
