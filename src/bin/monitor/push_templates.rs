@@ -1383,7 +1383,7 @@ pub async fn push_candidate_invalidated(
     reason: &str,
 ) -> bool {
     let text = render_candidate_invalidated(hhmm, name, code, prev, reason);
-    dispatch(crate::notify::PushKind::CandidateBoard, code, None, text).await
+    dispatch(crate::notify::PushKind::CandidateInvalidated, code, None, text).await
 }
 
 /// v12 PR2-2.2: 数据模式变更编排器.
@@ -3778,6 +3778,11 @@ mod tests {
     #[test] fn gov_paper_review_cooldown() { assert_eq!(crate::notify::PushKind::PaperReview.cooldown_secs(), Some(86_400)); }
     #[test] fn gov_paper_review_no_banner() { assert!(!crate::notify::PushKind::PaperReview.requires_banner()); }
     #[test] fn gov_paper_review_level() { assert_eq!(crate::notify::PushKind::PaperReview.level(), crate::notify::PushLevel::Info); }
+
+    // ====== v14.3 F-12: 候选失效独立 enum 治理测试 ======
+    #[test] fn gov_candidate_invalidated_cooldown() { assert_eq!(crate::notify::PushKind::CandidateInvalidated.cooldown_secs(), Some(1800)); }
+    #[test] fn gov_candidate_invalidated_no_banner() { assert!(!crate::notify::PushKind::CandidateInvalidated.requires_banner()); }
+    #[test] fn gov_candidate_invalidated_level() { assert_eq!(crate::notify::PushKind::CandidateInvalidated.level(), crate::notify::PushLevel::Important); }
 
     #[test]
     fn evidence_quality_labels() {

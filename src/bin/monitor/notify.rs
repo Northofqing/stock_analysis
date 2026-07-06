@@ -131,6 +131,8 @@ pub enum PushKind {
     // ============= v14 新增 (原 A-01, 复用 T-11) =============
     /// v13 §14.3 A-01 虚拟仓复盘 (ℹ️ 1次/日, 盘后参考)
     PaperReview,
+    /// v14.3 F-12: T-08 候选失效 (从 CandidateBoard 拆出独立 PushKind, ℹ️参考)
+    CandidateInvalidated,
 }
 
 impl PushKind {
@@ -175,7 +177,8 @@ impl PushKind {
             | PushKind::EtfClosingCallAuction
             | PushKind::BlockTradeIntradayConfirm
             | PushKind::BlockTradePriceRange => PushLevel::Important,
-            // v14 PaperReview: ℹ️ 盘后参考
+            // v14 PaperReview + CandidateInvalidated
+            | PushKind::CandidateInvalidated => PushLevel::Important,
             // ℹ️参考 (降级 + ForbiddenOps/PaperTrade)
             _ => PushLevel::Info,
         }
@@ -261,6 +264,7 @@ impl PushKind {
             PushKind::BlockTradeIntradayConfirm => Some(300),                 // 5 min/票
             PushKind::BlockTradePriceRange => Some(3600),                     // 60 min/票
             PushKind::PaperReview => Some(86_400),                             // 1次/日
+            PushKind::CandidateInvalidated => Some(1800),                      // 30 min
             _ => Some(1800),                                                  // 默认 30min
         }
     }
@@ -317,6 +321,7 @@ impl PushKind {
             PushKind::BlockTradeIntradayConfirm => "大宗盘中确认",
             PushKind::BlockTradePriceRange => "北交所大宗价格区间",
             PushKind::PaperReview => "虚拟仓复盘",
+            PushKind::CandidateInvalidated => "候选失效",
         }
     }
 }
