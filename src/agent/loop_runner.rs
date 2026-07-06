@@ -2,6 +2,7 @@ use crate::database::agent_logs::AgentLogDao;
 use crate::agent::context::ContextManager;
 use crate::agent::toolbelt::Toolbelt;
 use crate::agent::validation::ValidationEngine;
+use serde_json::Value;
 use async_openai::types::{
     ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
     ChatCompletionRequestAssistantMessageArgs,
@@ -149,7 +150,9 @@ impl AgentRunner {
                     info!("[执行智能体 Action Agent] 决定调用工具：{}，参数：{}", tool_name, arguments);
 
                     // ================= 安全层：死循环检测 (Loop Detection) =================
-                    let call_sig = format!("{}-{}", tool_name, arguments);
+                    // v17.4 (P2 fix): 用 sorted JSON keys 生成签名, 避免字段顺序不同导致不同签名
+                    let canonical_args = canonicalize_json_value(&arguments);
+                    let call_sig = format!("{}-{}", tool_name, canonical_args);
                     let count = tool_call_history.entry(call_sig.clone()).or_insert(0);
                     *count += 1;
 
@@ -331,3 +334,33 @@ impl AgentRunner {
         &self.context
     }
 }
+
+/// v17.4 (P2 fix): 递归规范化 JSON Value, 按 key 排序 (BTreeMap), 保证字段顺序无关
+fn canonicalize_json_value(v: &Value) -> String {
+    match v {
+        Value::Object(map) => {
+            let mut sorted: std::collections::BTreeMap<String, &Value> = std::collections::BTreeMap::new();
+            for (k, v) in map {
+                sorted.insert(k.clone(), v);
+            }
+            let parts: Vec<String> = sorted
+                .iter()
+                .map(|(k, v)| format!("\"{}\":{}", k, canonicalize_json_value(v)))
+                .collect();
+            format!("{{{}}}", parts.join(","))
+        }
+        Value::Array(arr) => {
+            let parts: Vec<String> = arr.iter().map(canonicalize_json_value).collect();
+            format!("[{}]", parts.join(","))
+        }
+        Value::String(s) => {
+            // 转义双引号 + 反斜杠, 避免破坏 JSON 字符串边界
+            let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+            format!("\"{}\"", escaped)
+        }
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Null => "null".to_string(),
+    }
+}
+
