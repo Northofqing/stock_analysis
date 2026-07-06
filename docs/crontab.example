@@ -13,6 +13,58 @@ CRON_TZ=Asia/Shanghai
 ```
 
 > 注: `*/3` 表示每 3 个月跑一次（1月/4月/7月/10月 1号 09:00）。
+
+---
+
+# v13 push templates — 工作日 5 时点推送 (v14.0)
+
+```bash
+# 编辑 crontab
+crontab -e
+
+# 添加 (替换 /path/to/stock_analysis 为实际路径):
+CRON_TZ=Asia/Shanghai
+# 09:00 盘前 (P-01 盘前新闻)
+0 9 * * 1-5  cd /path/to/stock_analysis && ./target/release/monitor --push  >> /tmp/monitor_push.log 2>&1
+# 10:30 盘中 (I-01/I-02/I-03/D-01)
+30 10 * * 1-5 cd /path/to/stock_analysis && ./target/release/monitor --push  >> /tmp/monitor_push.log 2>&1
+# 11:00 盘中
+0 11 * * 1-5  cd /path/to/stock_analysis && ./target/release/monitor --push  >> /tmp/monitor_push.log 2>&1
+# 14:30 盘中
+30 14 * * 1-5 cd /path/to/stock_analysis && ./target/release/monitor --push  >> /tmp/monitor_push.log 2>&1
+# 19:00 盘后 (A-01 虚拟仓复盘)
+0 19 * * 1-5  cd /path/to/stock_analysis && ./target/release/monitor --push  >> /tmp/monitor_push.log 2>&1
+```
+
+## 部署前健康检查 (--push-dry-run)
+
+```bash
+# 验证 6 dispatcher 加载 (不实际推送)
+cd /path/to/stock_analysis && ./target/release/monitor --push-dry-run 2>&1 | head -20
+
+# 期望: 6 行 dispatcher_log 记录
+tail -6 data/dispatcher_log.jsonl | jq '{kind, success, snapshot_size}'
+# {"kind":"P-01-dry","success":true,"snapshot_size":3}
+# {"kind":"I-01-dry","success":true,"snapshot_size":3}
+# {"kind":"I-02-dry","success":true,"snapshot_size":9}
+# {"kind":"I-03-dry","success":true,"snapshot_size":4}
+# {"kind":"D-01-dry","success":true,"snapshot_size":3}
+# {"kind":"A-01-dry","success":true,"snapshot_size":1}
+```
+
+## logrotate 配置
+
+```bash
+# /etc/logrotate.d/monitor_push
+/path/to/stock_analysis/data/dispatcher_log.jsonl {
+    daily
+    rotate 7
+    compress
+    missingok
+    notifempty
+    create 0644 user group
+}
+```
 > 如果想月度跑, 改为 `0 9 1 * *`。
 > 季度间隔更适合稳定市场（避免月度噪声触发误判）。
 
