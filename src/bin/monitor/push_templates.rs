@@ -1898,9 +1898,47 @@ pub fn build_news_to_idea_from_snapshot<'a>(s: &'a NewsToIdeaSnapshot) -> NewsTo
     }
 }
 
-/// v16.4+v13.6.2: 真实数据集成 — 从候选台取 top 1 candidate
+/// v14.2: P5 源真实 fetcher (文件化)
+// 读 data/p5_sources/{source}.jsonl, 每行 JSON {code, name, chg_pct}
+pub fn load_p5_source_items(source_name: &str) -> Vec<(stock_analysis::opportunity::candidate_panel::CandidateSource, String, String)> {
+    use stock_analysis::opportunity::candidate_panel::CandidateSource;
+    use std::fs;
+    let path = format!("data/p5_sources/{}.jsonl", source_name);
+    let source = match source_name {
+        "stock_pick" => CandidateSource::StockPick,
+        "optimal_close" => CandidateSource::OptimalClose,
+        "volume_watchlist" => CandidateSource::VolumeWatchlist,
+        "volume_real_trade" => CandidateSource::VolumeRealTrade,
+        _ => return Vec::new(),
+    };
+    let mut items = Vec::new();
+    let raw = match fs::read_to_string(&path) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    for line in raw.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        #[derive(serde::Deserialize)]
+        struct P5Item {
+            code: String,
+            name: String,
+            #[allow(dead_code)]
+            chg_pct: Option<f32>,
+        }
+        if let Ok(p) = serde_json::from_str::<P5Item>(line) {
+            if !p.code.is_empty() {
+                items.push((source, p.code, p.name));
+            }
+        }
+    }
+    items
+}
+
+/// v16.4+v13.6.2+v14.2: 真实数据集成 — 从候选台取 top 1 candidate
 /// 联接 opportunity::candidate_panel::merge_candidates
-/// v13.6.2 改进: 多源合并 (5 路候选源同时入)
+/// v14.2 改进: P5 源文件化 (data/p5_sources/*.jsonl)
 pub fn load_news_to_idea_snapshot_real(hhmm: &str) -> NewsToIdeaSnapshot {
     use stock_analysis::opportunity::candidate_panel::{merge_candidates, CandidateSource};
     use stock_analysis::database::DatabaseManager;
@@ -1909,12 +1947,6 @@ pub fn load_news_to_idea_snapshot_real(hhmm: &str) -> NewsToIdeaSnapshot {
         return NewsToIdeaSnapshot::default();
     }
 
-    // v13.6.2: 多源合并 — 5 路候选源同时入
-    // (1) chain_daily cluster → IndustryChain (5 个)
-    // (2) top 1 cluster → StockPick (候选台 P5 源) 重复 1 票 (验证多源)
-    // (3) top 1 cluster → OptimalClose (P5 源) 重复 1 票
-    // (4) top 1 cluster → VolumeWatchlist (P5 源) 重复 1 票
-    // (5) top 1 cluster → VolumeRealTrade (P5 源) 重复 1 票
     let mut items: Vec<(CandidateSource, String, String)> = Vec::new();
 
     // 1. IndustryChain: 5 个 cluster 头部
@@ -1931,20 +1963,28 @@ pub fn load_news_to_idea_snapshot_real(hhmm: &str) -> NewsToIdeaSnapshot {
         }
     }
 
-    // 2-5. 4 路 P5 源: 复用 top 1 cluster (演示多源合并, v14+ 接真实 P5 fetcher)
-    if let Some(top) = clusters.first() {
-        let code = top
-            .stocks
-            .trim_matches(|ch| ch == '[' || ch == ']')
-            .split(',')
-            .next()
-            .map(|s| s.trim_matches('"').trim().to_string())
-            .unwrap_or_default();
-        if !code.is_empty() {
-            items.push((CandidateSource::StockPick, code.clone(), top.concept.clone()));
-            items.push((CandidateSource::OptimalClose, code.clone(), top.concept.clone()));
-            items.push((CandidateSource::VolumeWatchlist, code.clone(), top.concept.clone()));
-            items.push((CandidateSource::VolumeRealTrade, code, top.concept.clone()));
+    // 2-5. 4 路 P5 源: v14.2 文件化加载 (data/p5_sources/{source}.jsonl)
+    items.extend(load_p5_source_items("stock_pick"));
+    items.extend(load_p5_source_items("optimal_close"));
+    items.extend(load_p5_source_items("volume_watchlist"));
+    items.extend(load_p5_source_items("volume_real_trade"));
+
+    // v14.2 fallback: 若 P5 文件都不存在, 复用 top 1 cluster (v13.6.2 兼容)
+    if items.iter().filter(|(s, _, _)| matches!(s, CandidateSource::StockPick | CandidateSource::OptimalClose | CandidateSource::VolumeWatchlist | CandidateSource::VolumeRealTrade)).count() == 0 {
+        if let Some(top) = clusters.first() {
+            let code = top
+                .stocks
+                .trim_matches(|ch| ch == '[' || ch == ']')
+                .split(',')
+                .next()
+                .map(|s| s.trim_matches('"').trim().to_string())
+                .unwrap_or_default();
+            if !code.is_empty() {
+                items.push((CandidateSource::StockPick, code.clone(), top.concept.clone()));
+                items.push((CandidateSource::OptimalClose, code.clone(), top.concept.clone()));
+                items.push((CandidateSource::VolumeWatchlist, code.clone(), top.concept.clone()));
+                items.push((CandidateSource::VolumeRealTrade, code, top.concept.clone()));
+            }
         }
     }
 
@@ -1952,10 +1992,8 @@ pub fn load_news_to_idea_snapshot_real(hhmm: &str) -> NewsToIdeaSnapshot {
     if candidates.is_empty() {
         return NewsToIdeaSnapshot::default();
     }
-    // top 1 candidate (按 source_count 排序已由 merge_candidates 完成)
     let top = &candidates[0];
     let reasons: Vec<String> = top.evidence.iter().take(3).cloned().collect();
-    // stage 简化: source_count >= 3 → Starting, >= 2 → Fermenting, else Diverging
     let stage = if top.source_count() >= 3 {
         NewsStage::Starting
     } else if top.source_count() >= 2 {
@@ -1963,7 +2001,6 @@ pub fn load_news_to_idea_snapshot_real(hhmm: &str) -> NewsToIdeaSnapshot {
     } else {
         NewsStage::Diverging
     };
-    // action 简化: change_pct > 5% → DoNotChase (不追高), > 0% → BuyDip, else Observe
     let action = if top.change_pct > 5.0 {
         Some(NewsAction::DoNotChase)
     } else if top.change_pct > 0.0 {
@@ -4976,6 +5013,38 @@ mod tests {
 
         // 清理
         let _ = fs::remove_file(&path);
+    }
+
+    // ====== v14.2: P5 源文件化测试 ======
+    #[test]
+    fn v14_2_p5_source_loads_jsonl() {
+        use std::fs;
+        let dir = std::path::PathBuf::from("data/p5_sources");
+        let _ = fs::create_dir_all(&dir);
+
+        // 写 2 个 P5 源文件
+        let stock_pick_path = dir.join("stock_pick.jsonl");
+        let optimal_path = dir.join("optimal_close.jsonl");
+        fs::write(&stock_pick_path, "{\"code\":\"600519\",\"name\":\"贵州茅台\",\"chg_pct\":3.2}\n{\"code\":\"000858\",\"name\":\"五粮液\",\"chg_pct\":2.1}\n").unwrap();
+        fs::write(&optimal_path, "{\"code\":\"002208\",\"name\":\"合肥城建\",\"chg_pct\":5.5}\n").unwrap();
+
+        // 验证加载
+        let items1 = load_p5_source_items("stock_pick");
+        assert_eq!(items1.len(), 2);
+        assert_eq!(items1[0].1, "600519");
+        assert_eq!(items1[0].2, "贵州茅台");
+
+        let items2 = load_p5_source_items("optimal_close");
+        assert_eq!(items2.len(), 1);
+        assert_eq!(items2[0].1, "002208");
+
+        // 不存在的文件 → 空 Vec (不报错)
+        let items3 = load_p5_source_items("nonexistent");
+        assert_eq!(items3.len(), 0);
+
+        // 清理
+        let _ = fs::remove_file(&stock_pick_path);
+        let _ = fs::remove_file(&optimal_path);
     }
 
     #[test]
