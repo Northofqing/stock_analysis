@@ -1438,8 +1438,25 @@ pub fn build_intraday_market_from_snapshot<'a>(s: &'a SectorSnapshot) -> Intrada
     }
 }
 
+/// v16.2: LLM-style 分类器 trait (mock + 真实 LLM 集成接口)
+/// 现阶段: 启发式关键词 (32 个), 可替换为 LLM API 调用
+pub trait SectorClassifier {
+    fn classify(&self, name: &str) -> Option<&'static str>;
+}
+
+/// v16.2: 默认实现 (启发式关键词, 与 v13.5 一致)
+/// 后续 v17+ 可换为: LlmClassifier { client: LlmClient }
+pub struct HeuristicClassifier;
+
+impl SectorClassifier for HeuristicClassifier {
+    fn classify(&self, name: &str) -> Option<&'static str> {
+        classify_sector_to_family(name)
+    }
+}
+
 /// v17.1+v13.5: 板块关键词过滤 (tech/power/robot 按 name 关键词匹配)
 /// v13.5 扩展: 半导体子分支/电力子分支/机器人子分支细分
+/// v16.2: 此函数作为默认启发式实现, 被 HeuristicClassifier 调用
 fn classify_sector_to_family(name: &str) -> Option<&'static str> {
     let n = name.to_lowercase();
     // tech 关键词 (v13.5 扩展: 半导体子分支)
@@ -1469,6 +1486,12 @@ fn classify_sector_to_family(name: &str) -> Option<&'static str> {
     None
 }
 
+/// v16.2: LLM-style 分类器 (mock 占位, 接口稳定)
+/// 真实 LLM 集成 (v17+): 替换 HeuristicClassifier 为 LlmClassifier { client }
+pub fn default_classifier() -> HeuristicClassifier {
+    HeuristicClassifier
+}
+
 /// v16.1+v17.1: 真实 sector_score 算法集成
 /// 联接 sector_monitor::fetch_board_ranking + sector_score::grade_sectors
 /// v17.1 改进: 按关键词分类 tech/power/robot
@@ -1491,6 +1514,8 @@ pub fn load_sector_snapshot_real(hhmm: &str) -> SectorSnapshot {
     let graded = grade_sectors(&boards);
 
     // v17.1 改进: 按关键词分类 tech/power/robot
+    // v16.2: 通过 SectorClassifier trait (可换 LLM)
+    let classifier = default_classifier();
     let mut tech: Option<&str> = None;
     let mut tech_score: Option<f64> = None;
     let mut power: Option<&str> = None;
@@ -1501,7 +1526,7 @@ pub fn load_sector_snapshot_real(hhmm: &str) -> SectorSnapshot {
     let mut best_score = f64::MIN;
 
     for s in &graded {
-        if let Some(family) = classify_sector_to_family(&s.name) {
+        if let Some(family) = classifier.classify(&s.name) {
             if s.change_pct > best_score {
                 best_score = s.change_pct;
                 main_attack = s.name.clone();
@@ -5212,6 +5237,34 @@ mod tests {
         // 空 codes → 返回空 HashMap (不调 provider)
         let result = fetch_realtime_quotes_batch(&[]);
         assert!(result.is_empty());
+    }
+
+    // ====== v16.2: LLM-style 分类器 trait 测试 ======
+    #[test]
+    fn v16_2_sector_classifier_trait() {
+        // HeuristicClassifier 默认实现 (v13.5 关键词 32 个)
+        let c = HeuristicClassifier;
+
+        // tech 家族
+        assert_eq!(c.classify("AI算力"), Some("tech"));
+        assert_eq!(c.classify("半导体"), Some("tech"));
+        assert_eq!(c.classify("光刻"), Some("tech"));
+
+        // power 家族
+        assert_eq!(c.classify("特高压"), Some("power"));
+        assert_eq!(c.classify("储能"), Some("power"));
+
+        // robot 家族
+        assert_eq!(c.classify("减速器"), Some("robot"));
+        assert_eq!(c.classify("人形"), Some("robot"));
+
+        // 未匹配
+        assert_eq!(c.classify("银行"), None);
+        assert_eq!(c.classify("白酒"), None);
+
+        // default_classifier() = HeuristicClassifier
+        let c2 = default_classifier();
+        assert_eq!(c2.classify("AI"), Some("tech"));
     }
 
     #[test]
