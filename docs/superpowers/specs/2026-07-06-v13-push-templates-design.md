@@ -1,4 +1,4 @@
-# v13 推送模板整体设计 — 7 新增模板 + 6 新规模板 + 24 对齐 + 35 PushKind 治理
+# v13 推送模板整体设计 — 7 新增模板 + 6 新规模板 + 21 对齐 + 34 PushKind 治理
 
 > **类型**：设计文档（Design Spec / Gate A 产物）
 > **日期**：2026-07-06
@@ -24,7 +24,7 @@
 
 | 项 | 值 |
 |---|---|
-| 标题 | v13 推送模板整体设计 — 7 新增 + 6 新规 + 24 对齐 + 35 治理 |
+| 标题 | v13 推送模板整体设计 — 7 新增 + 6 新规 + 21 对齐 + 34 治理 |
 | 日期 | 2026-07-06 |
 | 路径 | `docs/superpowers/specs/2026-07-06-v13-push-templates-design.md` |
 | 关联 spec | `docs/architecture/v13-push-templates.md §14.0~§14.6` |
@@ -67,8 +67,8 @@
 
 - 7 个 v13 spec `[新增]` 模板（含审计多发现的 I-03 盘中 IndustryChain）
 - 6 个**新规 v13.1 模板**（盘后固定价格扩围 / ST 涨跌幅 / ETF 集合竞价 / 大宗交易等）
-- 12 项现有 24 render 与 v13 spec 的差异对齐
-- §14.5 治理清单 35 PushKind 全表对齐
+- 12 项现有 21 render 与 v13 spec 的差异对齐（v19.16 实际 21 个 render 函数）
+- §14.5 治理清单 34 PushKind 全表对齐（v19.16 实际 34 variant；TurnoverTop enum 待接通）
 - 风格统一与共性约束
 - 分阶段 PR 提交节奏（预估 13 个 PR）+ 测试矩阵 + 证据 + 回滚
 
@@ -80,8 +80,8 @@
 |---|---|---|
 | v13 新增模板 | P-01 / I-01 / I-02 / I-03 / A-01 / A-10 / D-01 | 7 |
 | 新规 v13.1 模板 | T-14 ~ T-19 | 6 |
-| 现有 24 render 对齐 | 12 项差异（见 §6） | 12 |
-| PushKind 治理对齐 | 19 v13 spec 现有 + 7 v13 新增（含 1 审计多发现）+ 6 新规 + 3 代码有 spec 无（CandidateBoard / NewsRanked / CloseCall） = 35 项 | 35 |
+| 现有 21 render 对齐 | 12 项差异（见 §6） | 12 |
+| PushKind 治理对齐 | 17 v19.16 实际 enum + 6 v13 [新增] + 6 v13.1 新规 + 3 code-only (CandidateBoard/NewsRanked/CloseCall) + 1 TurnoverTop 接通 + 11 v11 降级注明 = 34 项 | 34 |
 | 测试矩阵 | 7+6 新模板 + 35 治理 + 5 红线 + 4 BR | — |
 | 紧急治理参数同步 | ST 阈值 / 做市商流动性（不需 PR，先 `config/*.toml` 改） | 2 |
 | PR 节奏 | 13 PR 分阶段 | 13 |
@@ -103,7 +103,7 @@
 | `docs/superpowers/specs/2026-07-06-v13-push-templates-audit.md` | 审计报告（已产出，含 3 段差异表） |
 | `config/risk/stop_loss.toml` | ST 阈值（待更新 5% → 10%） |
 | `config/risk/limits.toml` | 流动性阈值（创业板做市商校准） |
-| `docs/business_rules.md` | BR 登记（4 个新增：BR-NEWS-CLUSTER / BR-NEWS-CATALYST / BR-THEME-STAGE / BR-NEWS-TO-IDEA / BR-POST-FIXED-PRICE / BR-ST-PRICE-CHANGE） |
+| `docs/business_rules.md` | BR 登记（10 个：4 v13 spec + 6 新规 v13.1） |
 
 ---
 
@@ -116,7 +116,7 @@
 | `PushKind` 枚举 | 22+ variant |
 | `push_templates.rs` 行数 | 3545 |
 | `notify.rs` 行数 | 1395 |
-| 已实现 render 函数 | 24 |
+| 已实现 render 函数 | 21（v19.16 实际 `grep -c "^pub fn render_"` = 21） |
 | 完全一致模板 | 11（与 v13 spec） |
 | 有差异模板 | 12（见 §6） |
 | 代码完全缺失模板 | 7（v13 新增）+ 6（新规 v13.1）= 13 |
@@ -171,7 +171,7 @@
 |---|---|---|---|
 | **A. v13 spec 6+1 `[新增]`** | 7 | P-01 / I-01 / I-02 / I-03 / A-01 / A-10 / D-01 | spec §14 |
 | **B. 新规 v13.1 `[2026-07-06]`** | 6 | T-14 / T-15 / T-16 / T-17 / T-18 / T-19 | 新规 |
-| **C. 现有 24 render（部分对齐）** | 24 | T-01~T-12, R-01~R-08, P-02~P-04, I-04~I-08, A-02~A-09 | 既有 |
+| **C. 现有 21 render（部分对齐）** | 21 | T-01~T-12, R-01~R-08, P-02~P-04, I-04~I-08, A-02~A-09 | 既有 |
 | **D. v11 候选台（仅兼容）** | 3 | CandidateBoard / NewsRanked / CloseCall | v11 降级 |
 
 ### 3.2 时间窗口分布
@@ -228,7 +228,7 @@
 | `news_1/2` + `chain_1/2` | `&str` + `&str` | news_monitor event | 整行省略 |
 | `name/code/reason` ×N | `&str` | 候选台 + news | 跳过该行 |
 
-**治理**：`Important` / `Some(900)` / `requires_banner=false`（盘前）/ `is_deprecated=false`。
+**治理**：`Important` / `Some(900)` / `requires_banner=false`（盘前无持仓语义）/ `is_deprecated=false`。
 
 **红线 Gate**：2.1 / 2.2 / 2.4。
 
@@ -332,6 +332,12 @@
 **红线 Gate**：2.1 / 2.4 / 2.6。
 
 **PR 证据**：`Refs: spec §14.4 D-01` / `Business-Rules: BR-NEWS-TO-IDEA`。
+
+**Banner 时段约束**（Codex F7）：D-01 全天持续推送，但 banner 在不同时段需调整：
+- **盘前（09:00 前）**：banner 省略"日盈亏"和"仓位%"（无交易语境）
+- **盘中（09:30-15:00）**：标准 banner
+- **盘后（15:00 后）**：banner 保留但仓位语义弱化
+- 实现：PR #2 中 `BannerCtx::render_for_session(Preopen|Intraday|Post)` 变体函数（PR #2 范围扩展）
 
 ---
 
@@ -495,7 +501,7 @@
 
 > 12 项差异逐项修复。每项：**现状 / spec 要求 / 修复方向 / 风险 / 关联 PR**。
 
-### 6.1 字段级修复（9 项）
+### 6.1 字段级修复（12 项，Codex F4 已修正）
 
 | # | 模板 | 现状 | spec 要求 | 修复方向 | 关联 PR |
 |---|---|---|---|---|---|
@@ -511,6 +517,8 @@
 | F-10 | A-07 ReviewFailure | 段落顺序"原信号/结果/归因/处理建议/─────/分布" | 与 spec 一致 | 保持 | — |
 | F-11 | I-03 IndustryChain (盘中) | 复用 R-03 形态 | 独立盘中形态 | 新增 `IndustryChainIntraday` enum + render（见 §4.4） | PR #4 |
 | F-12 | T-08 CandidateInvalidated | 复用 `CandidateBoard` | spec 无独立项 | 升级为 `CandidateInvalidated` 独立 enum 或保留并补 spec | PR #11 |
+
+**Emoji 一致性验证**（Codex F15）：PR #1-#10 实施时每个 render 测试加 `assert!(out.starts_with("<expected emoji>"))` 断言，确保 13 新模板首字符 emoji 与 spec §14.x 一致。可选：`tools/compliance/check_emoji.sh` 静态扫描脚本（独立 PR，不在本批次）。
 
 ### 6.2 治理级修复（8 项）
 
@@ -534,7 +542,7 @@
 
 ---
 
-## 7. 治理元信息全表对齐（35 PushKind）
+## 7. 治理元信息全表对齐（34 PushKind）
 
 ### 7.1 治理表（§14.5 扩展）
 
@@ -550,7 +558,7 @@
 | `ForbiddenOps` | ℹ️ | 60min/票 | 照发 | true（v19.12 注） | ⚠️ G-02 | v12 |
 | `PaperTrade` | ℹ️ | 5min批 | **照发**（spec 改） | true（v19.12 注） | ⚠️ G-03 | v12 |
 | `AuctionVolume` | ⚡ | 10min | 视数据质量 | false | ⚠️ G-04 | v12 |
-| `TurnoverTop` | ℹ️ | 10min | 照发 | false | ⚠️ G-05 | v19.15 |
+| `TurnoverTop` | ℹ️ | 10min | 照发 | false | ⚠️ G-05 (enum 未接通) | v19.15 |
 | **`IntradayMarket`** | ⚡ | 15min | 照发 | false | **缺** | v13 §14.2 I-01 |
 | **`NewsCatalyst`** | ⚡ | 10min | 照发 | false | **缺** | v13 §14.2 I-02 |
 | **`NewsToIdea`** | ⚡ | 20min/票 | ReduceOnly可发 / Frozen谨慎 | false | **缺** | v13 §14.4 D-01 |
@@ -559,7 +567,7 @@
 | `DailyReport` | 盘后 | 1次/日 | 可发 | false | ✅ 一致 | v12 R-01 |
 | `ReviewMarket` | 盘后 | 1次/日 | 可发 | false | ✅ 一致 | v12 R-02 |
 | **`IndustryChain`** | 盘后 | 1次/日 | 可发 | false | ⚠️ G-06 | v12 R-03（盘中 I-03 独立） |
-| **`IndustryChainIntraday`** | ⚡ | 30min | 照发 | false | **缺** | v13 §14.2 I-03 |
+| **`IndustryChainIntraday`** | ⚡ | 30min | 照发 | false | **缺** | v13 §14.2 I-03 (Codex F5: 需更新上游 spec §14.2 I-03 + §14.5 治理表) |
 | `ReviewLhb` | 盘后 | 1次/日(21:00) | 可发 | false | ✅ 一致 | v12 R-04 |
 | `ReviewSignal` | 盘后 | 1次/日 | 可发 | false | ✅ 一致 | v12 R-05 |
 | `ReviewFailure` | 盘后 | 1次/日 | 可发 | false | ✅ 一致 | v12 R-06 |
@@ -576,7 +584,7 @@
 | `NewsRanked`（仅兼容） | ⚡ | 30min | 照发 | false | ⚠️ G-08（spec 补登） | v11 |
 | `CloseCall`（T-12） | ⚡ | 1次/日 | 照发 | false | ⚠️ G-08（spec 补登） | v12 |
 
-**合计**：35 PushKind（19 v13 spec 现有 + 7 v13 新增 + 6 新规 v13.1 + 3 仅兼容需补登）
+**合计**：34 PushKind（17 v19.16 enum 现有 + 6 v13 [新增] + 6 v13.1 新规 + 3 code-only 需补登 + 1 TurnoverTop 接通 + 1 v11 降级归类）
 
 ### 7.2 requires_banner() 对齐
 
@@ -596,7 +604,9 @@
 - CatalystReview  // 盘后非交易建议
 ```
 
-保留 banner 的：`HoldingPlan / HoldingEvent / T0Advice / CandidateTriggered / PaperTrade / AuctionVolume / IntradayMarket / NewsCatalyst / NewsToIdea / PreopenNewsHot / PostFixedPriceOrder / PostFixedPriceFill / StPriceLimitChanged`
+保留 banner 的：`HoldingPlan / HoldingEvent / T0Advice / CandidateTriggered / PaperTrade / AuctionVolume / IntradayMarket / NewsCatalyst / NewsToIdea / PostFixedPriceOrder / PostFixedPriceFill / StPriceLimitChanged`
+
+> **决策统一**（Codex F3）：PreopenNewsHot 盘前无持仓语义，`requires_banner=false`；盘后 R 系列 + PaperReview + CatalystReview 同样 `requires_banner=false`。
 
 ---
 
@@ -643,13 +653,13 @@ trait RenderCtx {
 
 **合计**：43 render 用例。
 
-### 9.2 治理元信息测试（35 PushKind）
+### 9.2 治理元信息测试（34 PushKind）
 
 | PushKind | 断言维度 |
 |---|---|
-| 全部 38 | `level() / cooldown_secs() / requires_banner() / is_deprecated() / counts_against_daily_budget()` |
+| 全部 34 | `level() / cooldown_secs() / requires_banner() / is_deprecated() / counts_against_daily_budget()` |
 
-**合计**：35 × 5 = 175 治理断言。
+**合计**：34 × 5 = 170 治理断言（实际实现 plan gov 测试 ≈ 17 个，仅覆盖 P0/P1 新增模板；其余依赖类型系统穷尽性 `match`）。
 
 ### 9.3 红线门禁测试（ENGINEERING_RULES_V2 §2.1~§2.10）
 
@@ -661,7 +671,7 @@ trait RenderCtx {
 | §2.4 时效 | `UT-RL24-NEW` | 申报时效/集合竞价窗口超时报 warning |
 | §2.6 下单防护 | `UT-RL26-NEW` | T-14/T-15 不自动下单（与 §2.6 一致） |
 | §2.8 假实现 | 复用 check_fake_impl.sh | — |
-| §2.10 BR 登记 | `UT-BR-NEW` | 6 个 BR 引用 |
+| §2.10 BR 登记 | `UT-BR-NEW` | 10 个 BR 引用 |
 
 **合计**：6 红线 + 6 BR 引用。
 
@@ -691,7 +701,7 @@ trait RenderCtx {
 | **#8** | `fix(v13): 现有 render 对齐 §14 风格与字段（12 项差异）` | F-01~F-12 | P0 | B→C |
 | **#9** | `feat(v13.1): PushKind 新增 EtfClosingCallAuction 沪市 ETF + 治理` | 1 新规 P1 | P1 | A→B→C |
 | **#10** | `feat(v13.1): PushKind 新增 BlockTradeIntradayConfirm/PriceRange 大宗 + 治理` | 2 新规 P1 | P1 | A→B→C |
-| **#11** | `chore(v13): §14.5 治理全表对齐 + 35 PushKind + requires_banner 修正` | G-01~G-08 | 收尾 | C |
+| **#11** | `chore(v13): §14.5 治理全表对齐 + 34 PushKind + requires_banner 修正` | G-01~G-08 | 收尾 | C |
 | **#12** | `chore(v13): 文档漂移修正 + spec 文件头注释 v13` | S-01/S-02 | 收尾 | C |
 | **#13** | `chore(v13): 紧急治理参数同步（ST 阈值 + 做市商流动性）` | config/*.toml + docs/business_rules.md | **紧急** | 立即 |
 
@@ -787,8 +797,8 @@ tools/compliance/lib/check_business_rules.sh
 | 2 | 设计文档落盘 + git commit | `git log -- docs/superpowers/specs/2026-07-06-v13-push-templates-design.md` |
 | 3 | 9 P0 PR（#1~#4, #6, #7, #8, #11）合并 | `git log --oneline \| grep "feat/v13"` |
 | 4 | 4 P1 PR（#5, #9, #10, #12）合并 | 同上 |
-| 5 | §14.5 治理表 35 PushKind 100% 对齐 | PR #11 审计脚本 0 差量 |
-| 6 | 43 render 用例 + 175 治理断言 + 6 红线 全绿 | `cargo test` |
+| 5 | §14.5 治理表 34 PushKind 100% 对齐 | PR #11 审计脚本 0 差量 |
+| 6 | 27 render 用例 + 17 治理 + 6 红线 全绿 | `cargo test` |
 | 7 | 覆盖率 ≥ 85% / 90% / 70% | `cargo tarpaulin` |
 | 8 | 紧急 BR 6 个已登记 | `docs/business_rules.md` |
 | 9 | 无 mock/fake 数据 | `check_fake_impl.sh` |

@@ -485,7 +485,14 @@ fn news_catalyst_missing_chg_omits_row() {
 }
 ```
 
-> **注**：若 `BannerCtx::test_default()` 不存在，需在 BannerCtx 实现 `#[cfg(test)] pub fn test_default() -> Self`，参考 v19.x 既有测试 helper。
+> **注**（Codex F8）：`BannerCtx::test_default()` 实际**不存在**（push_templates.rs:106 只有 `Default::default()`）。修复方法：Task 1.1 Step 0 显式新增：
+> ```rust
+> #[cfg(test)]
+> impl BannerCtx {
+>     pub fn test_default() -> Self { Self::default() }
+> }
+> ```
+> 或测试改用 `BannerCtx::default()`。
 
 - [ ] **Step 4: 运行新测试**
 
@@ -941,16 +948,18 @@ pub struct SupplementCandidate<'a> {
 
 - [ ] **Step 2: 添加 `render_industry_chain_intraday` 函数**
 
+> **Codex F9 修正**：§4.4 I-03 治理 `requires_banner=true`，签名必须带 `banner: &BannerCtx`。
+
 ```rust
-/// §14.2 I-03 盘中涨停扩散
-pub fn render_industry_chain_intraday(p: IndustryChainIntradayParams<'_>) -> String {
+/// §14.2 I-03 盘中涨停扩散（⚡交易建议类，带 banner）
+pub fn render_industry_chain_intraday(banner: &BannerCtx, p: IndustryChainIntradayParams<'_>) -> String {
     let leader = match (p.leader_name, p.leader_code) {
         (Some(n), Some(c)) => format!("龙头: {}({}) {}板", n, c, p.leader_height),
         _ => "龙头: 暂无".to_string(),
     };
     let mut s = format!(
-        "🔥 盘中涨停扩散（{}）\n主链: {} | 涨停{}家 | 连板高度{}板\n{}\n",
-        p.hhmm, p.chain, p.limit_count, p.leader_height, leader
+        "{}\n🔥 盘中涨停扩散（{}）\n主链: {} | 涨停{}家 | 连板高度{}板\n{}\n",
+        banner.render(), p.hhmm, p.chain, p.limit_count, p.leader_height, leader
     );
     if !p.supplements.is_empty() {
         s.push_str("补涨候选:\n");
@@ -1094,6 +1103,17 @@ fn paper_review_pnl_missing() {
 }
 ```
 
+> **Codex F12 修正**：T-16 ST 涨跌幅变更需要重算止损/止盈。新建 helper：
+> ```rust
+> // src/bin/monitor/risk/st_recalc.rs
+> pub fn recalc_st_position(code: &str, st_type: StType, new_limit: f32) -> (Option<f64>, Option<f64>) {
+>     // 调用点: main.rs 在 T-16 推送前
+>     // 返回 (new_stop_loss, new_take_profit) 基于 10% 阈值
+>     unimplemented!("PR #7 实现")
+> }
+> ```
+> Task 2.2 显式列出该 helper 实现步骤。
+
 - [ ] **Step 4: notify.rs variant + 治理**
 
 ```rust
@@ -1173,6 +1193,21 @@ pub fn render_post_fixed_price_order(p: PostFixedPriceOrderParams<'_>) -> String
     let status = match p.status {
         OrderStatus::Submitted => "已报", OrderStatus::Cancelled => "已撤", OrderStatus::Rejected => "废单",
     };
+
+    // Codex F13 修正: 按交易所申报窗口区分 (沪 9:30 / 深 9:15 / 北 9:15)
+    let market_open = match p.exchange {
+        Exchange::SH => p.hhmm >= "09:30",
+        Exchange::SZ | Exchange::BJ => p.hhmm >= "09:15",
+    };
+    if !market_open {
+        return format!(
+            "⚠️ 盘后固定价格申报（{} {}）\n{}({}) 价格{:.2} 数量{}\n错误: 申报时间 {} 早于 {} 开盘时间\n辅助建议, 非下单指令",
+            p.hhmm, ex, p.name, p.code, p.price, p.qty,
+            p.hhmm,
+            match p.exchange { Exchange::SH => "09:30", _ => "09:15" }
+        );
+    }
+
     let window = match p.hhmm {
         t if t < "11:30" => "上午",
         t if t < "15:00" => "下午（含中午）",
@@ -1730,6 +1765,8 @@ Co-Authored-By: Claude <noreply@anthropic.com>"
 ### 4. 紧急项
 
 Phase 0 三 Task **必须**在 Task 1.1 之前完成。否则现有持仓风险计算基于旧 ST 阈值（5%）。
+
+> **Codex F14 修正**：Phase 0 三个 commit 走 AGENTS.md §8 受控例外路径（紧急 + 24h 复盘 + 留痕），不绕过红线（不修改生产路径数据/不静默填充），仅同步配置参数。实施时 commit message 需标注 `受控例外: AGENTS §8`，并 24h 内补 PR #13（含 6 字段证据）走正式 PR 流程。
 
 ---
 
