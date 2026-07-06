@@ -1,4 +1,4 @@
-# v13 推送模板整体设计 — 7 新增模板 + 6 新规模板 + 24 对齐 + 34 PushKind 治理
+# v13 推送模板整体设计 — 7 新增模板 + 6 新规模板 + 24 对齐 + 35 PushKind 治理
 
 > **类型**：设计文档（Design Spec / Gate A 产物）
 > **日期**：2026-07-06
@@ -24,7 +24,7 @@
 
 | 项 | 值 |
 |---|---|
-| 标题 | v13 推送模板整体设计 — 7 新增 + 6 新规 + 24 对齐 + 34 治理 |
+| 标题 | v13 推送模板整体设计 — 7 新增 + 6 新规 + 24 对齐 + 35 治理 |
 | 日期 | 2026-07-06 |
 | 路径 | `docs/superpowers/specs/2026-07-06-v13-push-templates-design.md` |
 | 关联 spec | `docs/architecture/v13-push-templates.md §14.0~§14.6` |
@@ -68,7 +68,7 @@
 - 7 个 v13 spec `[新增]` 模板（含审计多发现的 I-03 盘中 IndustryChain）
 - 6 个**新规 v13.1 模板**（盘后固定价格扩围 / ST 涨跌幅 / ETF 集合竞价 / 大宗交易等）
 - 12 项现有 24 render 与 v13 spec 的差异对齐
-- §14.5 治理清单 34 PushKind 全表对齐
+- §14.5 治理清单 35 PushKind 全表对齐
 - 风格统一与共性约束
 - 分阶段 PR 提交节奏（预估 13 个 PR）+ 测试矩阵 + 证据 + 回滚
 
@@ -81,8 +81,8 @@
 | v13 新增模板 | P-01 / I-01 / I-02 / I-03 / A-01 / A-10 / D-01 | 7 |
 | 新规 v13.1 模板 | T-14 ~ T-19 | 6 |
 | 现有 24 render 对齐 | 12 项差异（见 §6） | 12 |
-| PushKind 治理对齐 | 22 现有 + 7 v13 + 6 新规 + 3 代码有 spec 无（CandidateBoard / NewsRanked / CloseCall） = 38 项 | 38 |
-| 测试矩阵 | 7+6 新模板 + 34 治理 + 5 红线 + 4 BR | — |
+| PushKind 治理对齐 | 19 v13 spec 现有 + 7 v13 新增（含 1 审计多发现）+ 6 新规 + 3 代码有 spec 无（CandidateBoard / NewsRanked / CloseCall） = 35 项 | 35 |
+| 测试矩阵 | 7+6 新模板 + 35 治理 + 5 红线 + 4 BR | — |
 | 紧急治理参数同步 | ST 阈值 / 做市商流动性（不需 PR，先 `config/*.toml` 改） | 2 |
 | PR 节奏 | 13 PR 分阶段 | 13 |
 
@@ -534,7 +534,7 @@
 
 ---
 
-## 7. 治理元信息全表对齐（38 PushKind）
+## 7. 治理元信息全表对齐（35 PushKind）
 
 ### 7.1 治理表（§14.5 扩展）
 
@@ -576,7 +576,7 @@
 | `NewsRanked`（仅兼容） | ⚡ | 30min | 照发 | false | ⚠️ G-08（spec 补登） | v11 |
 | `CloseCall`（T-12） | ⚡ | 1次/日 | 照发 | false | ⚠️ G-08（spec 补登） | v12 |
 
-**合计**：38 PushKind（22 现有 + 7 v13 新增 + 6 新规 + 3 仅兼容需补登）
+**合计**：35 PushKind（19 v13 spec 现有 + 7 v13 新增 + 6 新规 v13.1 + 3 仅兼容需补登）
 
 ### 7.2 requires_banner() 对齐
 
@@ -643,13 +643,13 @@ trait RenderCtx {
 
 **合计**：43 render 用例。
 
-### 9.2 治理元信息测试（38 PushKind）
+### 9.2 治理元信息测试（35 PushKind）
 
 | PushKind | 断言维度 |
 |---|---|
 | 全部 38 | `level() / cooldown_secs() / requires_banner() / is_deprecated() / counts_against_daily_budget()` |
 
-**合计**：38 × 5 = 190 治理断言。
+**合计**：35 × 5 = 175 治理断言。
 
 ### 9.3 红线门禁测试（ENGINEERING_RULES_V2 §2.1~§2.10）
 
@@ -691,7 +691,7 @@ trait RenderCtx {
 | **#8** | `fix(v13): 现有 render 对齐 §14 风格与字段（12 项差异）` | F-01~F-12 | P0 | B→C |
 | **#9** | `feat(v13.1): PushKind 新增 EtfClosingCallAuction 沪市 ETF + 治理` | 1 新规 P1 | P1 | A→B→C |
 | **#10** | `feat(v13.1): PushKind 新增 BlockTradeIntradayConfirm/PriceRange 大宗 + 治理` | 2 新规 P1 | P1 | A→B→C |
-| **#11** | `chore(v13): §14.5 治理全表对齐 + 38 PushKind + requires_banner 修正` | G-01~G-08 | 收尾 | C |
+| **#11** | `chore(v13): §14.5 治理全表对齐 + 35 PushKind + requires_banner 修正` | G-01~G-08 | 收尾 | C |
 | **#12** | `chore(v13): 文档漂移修正 + spec 文件头注释 v13` | S-01/S-02 | 收尾 | C |
 | **#13** | `chore(v13): 紧急治理参数同步（ST 阈值 + 做市商流动性）` | config/*.toml + docs/business_rules.md | **紧急** | 立即 |
 
@@ -787,8 +787,8 @@ tools/compliance/lib/check_business_rules.sh
 | 2 | 设计文档落盘 + git commit | `git log -- docs/superpowers/specs/2026-07-06-v13-push-templates-design.md` |
 | 3 | 9 P0 PR（#1~#4, #6, #7, #8, #11）合并 | `git log --oneline \| grep "feat/v13"` |
 | 4 | 4 P1 PR（#5, #9, #10, #12）合并 | 同上 |
-| 5 | §14.5 治理表 38 PushKind 100% 对齐 | PR #11 审计脚本 0 差量 |
-| 6 | 43 render 用例 + 190 治理断言 + 6 红线 全绿 | `cargo test` |
+| 5 | §14.5 治理表 35 PushKind 100% 对齐 | PR #11 审计脚本 0 差量 |
+| 6 | 43 render 用例 + 175 治理断言 + 6 红线 全绿 | `cargo test` |
 | 7 | 覆盖率 ≥ 85% / 90% / 70% | `cargo tarpaulin` |
 | 8 | 紧急 BR 6 个已登记 | `docs/business_rules.md` |
 | 9 | 无 mock/fake 数据 | `check_fake_impl.sh` |
