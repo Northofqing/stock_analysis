@@ -1484,17 +1484,50 @@ pub fn build_news_catalyst_from_snapshot<'a>(s: &'a NewsCatalystSnapshot) -> New
     }
 }
 
-/// v15.3: 占位 — 真实 news_monitor + 实时行情待 v16+
+/// v16.2: 真实数据集成 — 从 chain_daily DB 取 top concept 作为 headline
+/// 简化: chain_daily 第一个 concept 作为 "新闻催化" 主题 (替代 news_monitor 待 v16.3+)
+pub fn load_news_catalyst_snapshot_real(hhmm: &str) -> NewsCatalystSnapshot {
+    use stock_analysis::database::DatabaseManager;
+    let clusters = DatabaseManager::get().get_latest_chain_clusters();
+    if clusters.is_empty() {
+        return NewsCatalystSnapshot::default();
+    }
+    // top concept → headline (chain_daily 简化复用)
+    let top = &clusters[0];
+    let stocks = clusters
+        .iter()
+        .take(3)
+        .filter_map(|c| {
+            // 从 stocks JSON 解析前 3 个 code (复用 P-01 解析逻辑)
+            let codes: Vec<&str> = c
+                .stocks
+                .trim_matches(|ch| ch == '[' || ch == ']')
+                .split(',')
+                .take(3)
+                .map(|s| s.trim_matches('"').trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            codes.first().map(|code| (code.to_string(), code.to_string(), Some(0.0_f32)))
+        })
+        .collect();
+    NewsCatalystSnapshot {
+        hhmm: hhmm.to_string(),
+        headline: format!("{} 板块持续走强", top.concept),
+        theme: top.concept.clone(),
+        stocks,
+    }
+}
+
+/// v15.3 兼容: 同步占位
 pub fn load_news_catalyst_snapshot(_hhmm: &str) -> NewsCatalystSnapshot {
-    log::info!("[I-02] news_monitor + 实时行情待 v16+, 使用默认空快照");
     NewsCatalystSnapshot::default()
 }
 
-/// v15.3: 业务层入口 — 盘中新闻催化触发
+/// v15.3 业务层入口 (v16.2 改用真实 chain_daily 数据)
 pub async fn dispatch_news_catalyst_daily(hhmm: &str, banner: &BannerCtx) -> bool {
-    let snapshot = load_news_catalyst_snapshot(hhmm);
+    let snapshot = load_news_catalyst_snapshot_real(hhmm);
     if snapshot.headline.is_empty() {
-        log::info!("[I-02] news_catalyst_snapshot 空 (v16+ 待集成), 跳过推送");
+        log::info!("[I-02] news_catalyst_snapshot 空 (chain_daily 无数据), 跳过推送");
         return false;
     }
     let params = build_news_catalyst_from_snapshot(&snapshot);
