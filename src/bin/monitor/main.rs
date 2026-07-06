@@ -2368,6 +2368,13 @@ async fn monitor_loop() {
         TieredScanner::load_watchlist(&mut targets);
         // 构建实体过滤集合（只关注9只标的）
         let our_codes: std::collections::HashSet<String> = targets.iter().map(|t| t.code.clone()).collect();
+        // v19.13: 真实持仓 set (只 stock_position open), 不含 watchlist
+        // 做T建议只能对真实持仓推, 不能对 watchlist 候选票推 (AGENTS.md §2.1)
+        let holding_only_codes: std::collections::HashSet<String> = stock_analysis::portfolio::get_positions()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| p.code)
+            .collect();
         let scanner = TieredScanner::new(targets);
 
         // ============= v12 PR1-1.7: 启动期评估一次 AccountMode =============
@@ -2824,14 +2831,11 @@ async fn monitor_loop() {
                         if resonance.abs() > 30.0 {
                             log::info!("[信号融合] {}({}) 共振={:0} 建议={}", s.name, code, resonance, recommend);
                         }
-                        // v19.12: 做T T-05/T-06 — 每个持仓都推 (无条件, 用户要求全推)
-                        let t0_text = format!(
-                            "🔄 做T建议 {}({}) | 共振{:.0} 建议{}\n   现价 ¥{:.2} 涨跌 {:+.2}%\n   高抛: +{:.1}% 减仓1/3\n   低吸: -{:.1}% 回补2/3\n   止损: ¥{:.2}",
-                            s.name, code, resonance, recommend, s.price, s.change_pct,
-                            s.change_pct.max(2.0), s.change_pct.abs().max(2.0),
-                            s.price * 0.95
-                        );
-                        notify::push_governor(&t0_text, notify::PushKind::T0Advice).await;
+                        // v19.13: 移除原来的做T推送 (line 2827-2834)
+// 旧: 对 limit_stocks (涨停股 Top 10) ∩ our_codes (持仓+watchlist) 推
+// 问题: 涨停股很少是持仓 (持仓 6 只, 涨停 Top 10 通常不重叠), 即使重叠也包括 watchlist
+// 新: 上面 last_screener_run 后的 "持仓专属做T扫描" 才是真路径
+// 这里只保留 signal_count + alert_count, 不推做T
                     }
 
                     // v19.12: 持仓健康度 → 每 5 分钟硬推 (去掉条件限制, 用户要求全推)
@@ -2852,6 +2856,61 @@ async fn monitor_loop() {
                         let recs = tokio::task::spawn_blocking(run_stock_screener).await.unwrap_or(None);
                         if let Some(ref recs) = recs {
                             for rec in recs { log::info!("[选股] {}", rec); notify::push_governor(rec, notify::PushKind::StockPick).await; }
+                        }
+                    }
+
+                    // v19.13: 持仓专属做T扫描 (每 30s, 真接 DB 持仓股, 不依赖涨停)
+                    // AGENTS.md §2.1: 做T建议只对真实持仓推 (不是 watchlist 候选票)
+                    if last_health_summary.elapsed().as_secs() >= 30 {
+                        // 复用 last_health_summary 计时器 (30s 间隔), 单独 lock 避免阻塞
+                        let holding_codes_vec: Vec<String> = holding_only_codes.iter().cloned().collect();
+                        if !holding_codes_vec.is_empty() {
+                            let holding_signals = tokio::task::spawn_blocking(move || {
+                                use stock_analysis::monitor::detector::{Detector, DetectorConfig, StockSnapshot as SS};
+                                let detector_local = Detector::new(DetectorConfig::default());
+                                let quotes = market_data::fetch_position_quotes();
+                                let name_map: std::collections::HashMap<String, String> = stock_analysis::portfolio::get_positions()
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .map(|p| (p.code, p.name))
+                                    .collect();
+                                let mut out: Vec<String> = Vec::new();
+                                for q in &quotes {
+                                    if !holding_codes_vec.contains(&q.code) { continue; }
+                                    let snap = SS {
+                                        code: q.code.clone(),
+                                        name: name_map.get(&q.code).cloned().unwrap_or_else(|| q.code.clone()),
+                                        price: q.price,
+                                        change_pct: q.change_pct,
+                                        volume_ratio: q.volume_ratio,
+                                        main_net_yi: 0.0,
+                                        limit_up_price: None, was_limit_up: false, t1_locked: false,
+                                    };
+                                    for e in detector_local.scan_stock(&snap) {
+                                        // 强信号才推做T (VolumeBurst / MainInflow / MainOutflow)
+                                        if matches!(e.category,
+                                            stock_analysis::monitor::detector::AlertCategory::VolBurst
+                                            | stock_analysis::monitor::detector::AlertCategory::MainInflow
+                                            | stock_analysis::monitor::detector::AlertCategory::MainOutflow)
+                                        {
+                                            let dir = if matches!(e.category,
+                                                stock_analysis::monitor::detector::AlertCategory::MainInflow) { "+" } else { "-" };
+                                            out.push(format!(
+                                                "🔄 做T建议 {}({}) | {} {}\n   现价 ¥{:.2} 涨跌 {:+.2}%\n   高抛: +{:.1}% 减仓1/3\n   低吸: -{:.1}% 回补2/3\n   止损: ¥{:.2}",
+                                                snap.name, snap.code, dir, e.message,
+                                                snap.price, snap.change_pct,
+                                                snap.change_pct.abs().max(2.0), snap.change_pct.abs().max(2.0),
+                                                snap.price * 0.95
+                                            ));
+                                        }
+                                    }
+                                }
+                                out
+                            }).await.unwrap_or_default();
+                            for t0 in holding_signals {
+                                log::info!("[做T-持仓] 推送: {}", t0.lines().next().unwrap_or(""));
+                                notify::push_governor(&t0, notify::PushKind::T0Advice).await;
+                            }
                         }
                     }
 
