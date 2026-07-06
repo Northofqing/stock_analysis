@@ -112,6 +112,9 @@ pub enum PushKind {
     // ============= v13 §14.3 新增 PushKind (PR #3) =============
     /// v13 §14.3 A-10 盘后题材催化复盘 (⚡盘后 1次/日)
     CatalystReview,
+    // ============= v13 §14.2 新增 PushKind (PR #4 - 审计多发现) =============
+    /// v13 §14.2 I-03 盘中涨停扩散 (⚡ 30min 冷却) — 与盘后 IndustryChain (R-03) 区分
+    IndustryChainIntraday,
 }
 
 impl PushKind {
@@ -148,7 +151,8 @@ impl PushKind {
             | PushKind::IntradayMarket
             | PushKind::NewsCatalyst
             | PushKind::NewsToIdea
-            | PushKind::CatalystReview => PushLevel::Important,
+            | PushKind::CatalystReview
+            | PushKind::IndustryChainIntraday => PushLevel::Important,
             // ℹ️参考 (降级 + ForbiddenOps/PaperTrade)
             _ => PushLevel::Info,
         }
@@ -180,6 +184,7 @@ impl PushKind {
                 | PushKind::IntradayMarket
                 | PushKind::NewsCatalyst
                 | PushKind::NewsToIdea
+                | PushKind::IndustryChainIntraday
         )
     }
 
@@ -218,6 +223,7 @@ impl PushKind {
             PushKind::NewsCatalyst => Some(600),                              // 10 min
             PushKind::NewsToIdea => Some(1200),                               // 20 min/票
             PushKind::CatalystReview => Some(86_400),                         // 1次/日
+            PushKind::IndustryChainIntraday => Some(1800),                     // 30 min
             _ => Some(1800),                                                  // 默认 30min
         }
     }
@@ -266,6 +272,7 @@ impl PushKind {
             PushKind::NewsCatalyst => "新闻催化",
             PushKind::NewsToIdea => "新闻驱动个股",
             PushKind::CatalystReview => "题材催化复盘",
+            PushKind::IndustryChainIntraday => "盘中涨停扩散",
         }
     }
 }

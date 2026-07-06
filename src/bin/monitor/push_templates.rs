@@ -1820,6 +1820,55 @@ pub fn render_catalyst_review(p: CatalystReviewParams<'_>) -> String {
     s
 }
 
+/// v13 §14.2 I-03 盘中涨停扩散 — 补涨候选
+pub struct SupplementCandidate<'a> {
+    pub name: &'a str,
+    pub code: &'a str,
+    pub trigger: &'a str,
+    pub lo: f64,
+    pub hi: f64,
+    pub stop: f64,
+}
+
+/// v13 §14.2 I-03 盘中涨停扩散
+pub struct IndustryChainIntradayParams<'a> {
+    pub hhmm: &'a str,
+    pub chain: &'a str,
+    pub limit_count: u32,
+    pub leader_name: Option<&'a str>,
+    pub leader_code: Option<&'a str>,
+    pub leader_height: u32,
+    pub supplements: Vec<SupplementCandidate<'a>>,
+}
+
+/// v13 §14.2 I-03 盘中涨停扩散（盘中交易建议类, 带 banner）
+pub fn render_industry_chain_intraday(banner: &BannerCtx, p: IndustryChainIntradayParams<'_>) -> String {
+    let leader = match (p.leader_name, p.leader_code) {
+        (Some(n), Some(c)) => format!("龙头: {}({}) {}板", n, c, p.leader_height),
+        _ => "龙头: 暂无".to_string(),
+    };
+    let mut s = format!(
+        "{}\n🔥 盘中涨停扩散（{}）\n主链: {} | 涨停{}家 | 连板高度{}板\n{}\n",
+        banner.render(),
+        p.hhmm,
+        p.chain,
+        p.limit_count,
+        p.leader_height,
+        leader
+    );
+    if !p.supplements.is_empty() {
+        s.push_str("补涨候选:\n");
+        for c in &p.supplements {
+            s.push_str(&format!(
+                "· {}({}) 触发条件{} | 低吸{:.2}~{:.2} | 止损{:.2}\n",
+                c.name, c.code, c.trigger, c.lo, c.hi, c.stop
+            ));
+        }
+    }
+    s.push_str("辅助建议, 非下单指令");
+    s
+}
+
 // ============================================================================
 // 测试
 // ============================================================================
@@ -2908,6 +2957,53 @@ mod tests {
     #[test]
     fn gov_catalyst_review_level() {
         assert_eq!(crate::notify::PushKind::CatalystReview.level(), crate::notify::PushLevel::Important);
+    }
+
+    // ====== v13 I-03 盘中涨停扩散 (审计多发现) (2 用例) ======
+    #[test]
+    fn industry_chain_intraday_with_supplements() {
+        let p = IndustryChainIntradayParams {
+            hhmm: "10:30", chain: "AI算力", limit_count: 5,
+            leader_name: Some("A"), leader_code: Some("000001"), leader_height: 3,
+            supplements: vec![SupplementCandidate {
+                name: "B", code: "000002", trigger: "首板",
+                lo: 10.0, hi: 12.0, stop: 9.0,
+            }],
+        };
+        let banner = BannerCtx::test_default();
+        let out = render_industry_chain_intraday(&banner, p);
+        assert!(out.contains("🔥 盘中涨停扩散（10:30）"));
+        assert!(out.contains("主链: AI算力 | 涨停5家 | 连板高度3板"));
+        assert!(out.contains("龙头: A(000001) 3板"));
+        assert!(out.contains("· B(000002) 触发条件首板 | 低吸10.00~12.00 | 止损9.00"));
+    }
+
+    #[test]
+    fn industry_chain_intraday_no_leader_no_supplements() {
+        let p = IndustryChainIntradayParams {
+            hhmm: "10:30", chain: "X", limit_count: 0,
+            leader_name: None, leader_code: None, leader_height: 0,
+            supplements: vec![],
+        };
+        let banner = BannerCtx::test_default();
+        let out = render_industry_chain_intraday(&banner, p);
+        assert!(out.contains("龙头: 暂无"));
+        assert!(out.contains("涨停0家 | 连板高度0板"));
+        assert!(!out.contains("补涨候选:"));
+    }
+
+    // ====== v13 治理元信息测试 (I-03) ======
+    #[test]
+    fn gov_industry_chain_intraday_cooldown() {
+        assert_eq!(crate::notify::PushKind::IndustryChainIntraday.cooldown_secs(), Some(1800));
+    }
+    #[test]
+    fn gov_industry_chain_intraday_banner() {
+        assert!(crate::notify::PushKind::IndustryChainIntraday.requires_banner());
+    }
+    #[test]
+    fn gov_industry_chain_intraday_level() {
+        assert_eq!(crate::notify::PushKind::IndustryChainIntraday.level(), crate::notify::PushLevel::Important);
     }
 
     #[test]
