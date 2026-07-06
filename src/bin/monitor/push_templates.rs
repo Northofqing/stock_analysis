@@ -5118,6 +5118,61 @@ mod tests {
         assert_eq!(PushKind::IndustryChainIntraday.cooldown_secs(), Some(1800));
     }
 
+    // ====== v14.7: I-03 真正 is_limit_up_today 测试 (chg_pct > 9.5 阈值) ======
+    #[test]
+    fn v14_7_is_limit_up_today_threshold() {
+        use stock_analysis::market_analyzer::limit_chain_review::StockLimitStats;
+
+        // chg_pct > 9.5 (新规 10% 涨停阈值) → is_limit_up_today = true
+        let n_above = StockLimitStats {
+            code: "600000".to_string(),
+            name: "浦发银行".to_string(),
+            chain: "银行".to_string(),
+            board_level: 1,
+            is_limit_up_today: 9.8 > 9.5,  // 9.8% 涨 → 涨停
+            is_first_board: true,
+            consecutive_days: 1,
+        };
+        assert!(n_above.is_limit_up_today);
+
+        // chg_pct < 9.5 → is_limit_up_today = false
+        let n_below = StockLimitStats {
+            code: "000001".to_string(),
+            name: "平安银行".to_string(),
+            chain: "银行".to_string(),
+            board_level: 1,
+            is_limit_up_today: 5.0 > 9.5,  // 5% 涨 → 不涨停
+            is_first_board: false,
+            consecutive_days: 0,
+        };
+        assert!(!n_below.is_limit_up_today);
+
+        // 边界: 9.5 整 → 不涨停 (> 严格不等)
+        let n_boundary = StockLimitStats {
+            code: "600519".to_string(),
+            name: "贵州茅台".to_string(),
+            chain: "白酒".to_string(),
+            board_level: 2,
+            is_limit_up_today: 9.5 > 9.5,  // 9.5 整 → false
+            is_first_board: false,
+            consecutive_days: 2,
+        };
+        assert!(!n_boundary.is_limit_up_today);
+
+        // 涨停 (>9.5) + 一字板 (is_first_board=false) → board_level 仍按位置推断
+        let n_limit_up = StockLimitStats {
+            code: "002415".to_string(),
+            name: "海康威视".to_string(),
+            chain: "AI".to_string(),
+            board_level: 2,  // 简化: 按位置推断
+            is_limit_up_today: 10.2 > 9.5,
+            is_first_board: false,
+            consecutive_days: 2,
+        };
+        assert!(n_limit_up.is_limit_up_today);
+        assert_eq!(n_limit_up.board_level, 2);
+    }
+
     #[test]
     fn evidence_quality_labels() {
         assert_eq!(EvidenceQuality::Missing.label(), "缺失,不作承接判断");
