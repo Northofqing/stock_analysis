@@ -1400,6 +1400,54 @@ pub async fn dispatch_intraday_market_daily(hhmm: &str, banner: &BannerCtx) -> b
     push_intraday_market("", Some(banner), params).await
 }
 
+// ============================================================================
+// v15.3: I-02 业务层集成 (news_catalyst 抽口)
+// ============================================================================
+
+/// v15.3: 新闻催化快照 (headline + theme + 上涨个股)
+/// 注: 真实数据集成待 v16+ (news_monitor + 实时行情)
+#[derive(Debug, Clone, Default)]
+pub struct NewsCatalystSnapshot {
+    pub hhmm: String,
+    pub headline: String,
+    pub theme: String,
+    /// (name, code, chg_pct)
+    pub stocks: Vec<(String, String, Option<f32>)>,
+}
+
+/// v15.3: 从 NewsCatalystSnapshot 构造 NewsCatalystParams
+pub fn build_news_catalyst_from_snapshot<'a>(s: &'a NewsCatalystSnapshot) -> NewsCatalystParams<'a> {
+    // 借用 String → &str 转换 (注意生命周期与 s 一致)
+    let stocks_ref: Vec<(&'a str, &'a str, Option<f32>, &'a str)> = s
+        .stocks
+        .iter()
+        .map(|(n, c, chg)| (n.as_str(), c.as_str(), *chg, n.as_str()))  // reason=name (简化)
+        .collect();
+    NewsCatalystParams {
+        hhmm: &s.hhmm,
+        headline: &s.headline,
+        theme: if s.theme.is_empty() { None } else { Some(&s.theme) },
+        stocks: stocks_ref,
+    }
+}
+
+/// v15.3: 占位 — 真实 news_monitor + 实时行情待 v16+
+pub fn load_news_catalyst_snapshot(_hhmm: &str) -> NewsCatalystSnapshot {
+    log::info!("[I-02] news_monitor + 实时行情待 v16+, 使用默认空快照");
+    NewsCatalystSnapshot::default()
+}
+
+/// v15.3: 业务层入口 — 盘中新闻催化触发
+pub async fn dispatch_news_catalyst_daily(hhmm: &str, banner: &BannerCtx) -> bool {
+    let snapshot = load_news_catalyst_snapshot(hhmm);
+    if snapshot.headline.is_empty() {
+        log::info!("[I-02] news_catalyst_snapshot 空 (v16+ 待集成), 跳过推送");
+        return false;
+    }
+    let params = build_news_catalyst_from_snapshot(&snapshot);
+    push_news_catalyst("", Some(banner), params).await
+}
+
 /// v13 §14.2 I-01 盘中轮动总览 (⚡交易建议类, 带 banner)
 pub async fn push_intraday_market(
     code: &str,
@@ -3985,6 +4033,41 @@ mod tests {
         assert_eq!(s.hhmm, "10:30");
         assert!(s.tech_sub.is_empty());
         assert_eq!(s.rotation_state, RotationState::Fading);
+    }
+
+    // ====== v15.3: I-02 业务层集成测试 (news_catalyst 抽口) ======
+    #[test]
+    fn v15_build_news_catalyst_from_snapshot() {
+        let s = NewsCatalystSnapshot {
+            hhmm: "10:30".to_string(),
+            headline: "英伟达H200发布".to_string(),
+            theme: "AI算力".to_string(),
+            stocks: vec![
+                ("中科曙光".to_string(), "603019".to_string(), Some(5.2)),
+                ("浪潮信息".to_string(), "000977".to_string(), Some(3.8)),
+            ],
+        };
+        let p = build_news_catalyst_from_snapshot(&s);
+        assert_eq!(p.headline, "英伟达H200发布");
+        assert_eq!(p.theme, Some("AI算力"));
+        assert_eq!(p.stocks.len(), 2);
+    }
+
+    #[test]
+    fn v15_news_catalyst_snapshot_empty_skips() {
+        let s = NewsCatalystSnapshot::default();
+        assert!(s.headline.is_empty());
+        let p = build_news_catalyst_from_snapshot(&s);
+        assert_eq!(p.theme, None);
+        assert!(p.stocks.is_empty());
+    }
+
+    #[test]
+    fn v15_load_news_catalyst_snapshot_default() {
+        // v16+ 待集成真实 news_monitor + 实时行情
+        let s = load_news_catalyst_snapshot("10:30");
+        assert!(s.headline.is_empty());
+        assert!(s.stocks.is_empty());
     }
 
     #[test]
