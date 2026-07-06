@@ -45,7 +45,7 @@ pub fn render_r05_full(stats: &SignalReviewStats) -> String {
     }
     // 做T建议
     if stats.t0_recommendations_pushed == 0 {
-        s.push_str("做T建议: 推 0 条 [MVP-2 待启用, 当前占位]\n");
+        s.push_str("做T建议: 推 0 条 (v19.15+ 启用 — 详见 docs/architecture/v12-dev-plan.md §MVP-2)\n");
     } else {
         s.push_str(&format!(
             "做T建议: 推 {} 条 / 有效 {} 条\n",
@@ -55,7 +55,7 @@ pub fn render_r05_full(stats: &SignalReviewStats) -> String {
     }
     // 候选(影子) — v19.12: 样本 < 30 显式标注, 不报 "0"
     if stats.candidate_shadow_triggered == 0 {
-        s.push_str("候选(影子): 样本不足 (MVP-3 待 ≥30 笔触发, 当前 0 笔)\n");
+        s.push_str("候选(影子): 样本不足 (转正需 ≥30 笔影子样本, 当前 0 笔 — 详见 v12-dev-plan.md §MVP-3)\n");
     } else {
         s.push_str(&format!(
             "候选(影子): 触发 {} / 模拟成交 {} / 未成交 {} (涨停 {}/未触达 {})\n",

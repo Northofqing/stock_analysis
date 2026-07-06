@@ -2,7 +2,7 @@
 # §2.10 业务规则文档化 (v10 P0.0 动态版 · 2026-07-01)
 #
 # 升级内容:
-#   - REFS 数组硬编码 → 从 docs/business_rules.md 动态解析 BR + 代码位置
+#   - REFS 数组硬编码 → 从 docs/业务规则清单-registry.md 动态解析 BR + 代码位置
 #   - 支持任意 BR-NNN (不再卡 BR-001/002/003 硬编码)
 #   - 标"待实现" 的 BR (PENDING) 走 WARN 提醒而非 FAIL
 #   - 5 类 (去重/互斥/过滤/排序/限额) 必全有 (硬约束)
@@ -19,8 +19,8 @@ set -euo pipefail
 FAIL_LINES_FILE="$(mktemp -t cbr_fail.XXXXXX)"
 WARN_LINES_FILE="$(mktemp -t cbr_warn.XXXXXX)"
 trap 'rm -f "$FAIL_LINES_FILE" "$WARN_LINES_FILE"' EXIT
-# RULES_FILE env override (fixture 测试用), 默认 docs/business_rules.md
-RULES_FILE="${RULES_FILE:-docs/business_rules.md}"
+# RULES_FILE env override (fixture 测试用), 默认 docs/业务规则清单-registry.md
+RULES_FILE="${RULES_FILE:-docs/业务规则清单-registry.md}"
 
 fail() { echo "✗ $*" >> "$FAIL_LINES_FILE"; }
 warn() { echo "⚠ $*" >> "$WARN_LINES_FILE"; }
@@ -38,7 +38,7 @@ for cat in "去重" "互斥" "过滤" "排序" "限额"; do
   fi
 done
 
-# 规则 3: 从 business_rules.md 动态提取 BR + 代码位置
+# 规则 3: 从 业务规则清单-registry.md 动态提取 BR + 代码位置
 # 表格行格式: | BR-NNN | 类别 | 规则 | `file:line` (可能有多个 + 分隔) | 测试位置 | 末审 |
 # 输出 TSV: <br_id>\tPENDING\t<code_loc>   OR   <br_id>\t<file>
 EXTRACTED=$(awk -F'|' '

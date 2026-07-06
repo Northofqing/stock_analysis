@@ -144,7 +144,7 @@ fn reason_summary(hit: &ChainHit, s: &super::chain_mapper::StockInfo, b: ScoreBr
 }
 
 /// 修复 v9.2 BR-001: 同一只票近 3 个日历日最多推送 1 次
-/// (注: 实际按日历日计算, 非交易日 — 见 business_rules.md BR-001 YAGNI 说明)
+/// (注: 实际按日历日计算, 非交易日 — 见 业务规则清单-registry.md BR-001 YAGNI 说明)
 /// 修复 v9.2 M1 性能: 改成批量查询 (HashSet O(1)) 替代每次 sync DB round-trip.
 /// 旧版本 `is_recently_pushed` 每个 stock 1 次 SQLite 查询, N×M 个 query 阻塞
 /// async runtime (discover 被 run_opportunity_scan / run_post_close_candidates 调).

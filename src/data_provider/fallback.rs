@@ -5,7 +5,7 @@
 //!
 //! 顺序: **腾讯 → 东财 → RustDX**
 //! - 腾讯/东财: 前复权 (`adjust = Qfq`), HTTP 稳定, 刚修过盘中价
-//! - RustDX: 不复权 (`adjust = None`), TCP 仅做兜底 (B 方案回退, 见 v11-design-final-v2 §5.3)
+//! - RustDX: 不复权 (`adjust = None`), TCP 仅做兜底 (B 方案回退, 见 v11-p0-1-p0-2-设计定稿v2-2026-07-02 §5.3)
 //!
 //! v11 P0-1 commit 3: 每个 provider 返回 Ok 后调 `validate_daily_kline_quality`,
 //! 校验失败 → 自动 fallback 下一个源 (单条 skip 在质检内部处理, 整批 reject 触发 fallback).

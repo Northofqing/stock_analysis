@@ -6,7 +6,7 @@
 //! - 多理由命中时按固定优先级取主理由:
 //!   NewsCatalyst > AuctionAnomaly > MainNetInflow > SectorLeader > Breakout > VolumeSurge
 //! - 结算时按主理由分组统计胜率, reason 样本 < 阈值 → "样本不足"
-//! - 新增理由走 enum 变更 + business_rules.md 登记 (AGENTS §2.10 MUST)
+//! - 新增理由走 enum 变更 + 业务规则清单-registry.md 登记 (AGENTS §2.10 MUST)
 //!
 //! 归属 (BC-6 DDD): VirtualReason 作 Opportunity context 值对象,
 //! Portfolio 存 reason_name snapshot 字符串 (非 FK), Opportunity 自读自分组.

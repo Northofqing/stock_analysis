@@ -259,7 +259,7 @@ trait FreshnessGuard {
 
 ### 5.2 业务规则登记（§2.10）
 
-- [ ] `docs/business_rules.md` 新增 **BR-010: 多 Agent 研判必须 freshness 校验**（占位即可，详情见 §2.4）
+- [ ] `docs/业务规则清单-registry.md` 新增 **BR-010: 多 Agent 研判必须 freshness 校验**（占位即可，详情见 §2.4）
 
 ### 5.3 单元测试
 
@@ -287,7 +287,7 @@ trait FreshnessGuard {
 ### 5.6 Review 检查（§2 红线）
 
 - [ ] review 第 5 步：grep `src/deep_analyzer.rs` + `src/data_provider/service.rs` + `src/bin/monitor/main.rs` 确认无其他 `get_kline` / `run_multi_agent_analysis` 绕开 freshness
-- [ ] review 第 5 步：检查 `docs/business_rules.md` BR-010 登记完整
+- [ ] review 第 5 步：检查 `docs/业务规则清单-registry.md` BR-010 登记完整
 - [ ] review 第 5 步：检查单元测试 + 集成测试覆盖盘内/盘后/边界 3 个场景
 
 ### 5.7 数据红线（§2）

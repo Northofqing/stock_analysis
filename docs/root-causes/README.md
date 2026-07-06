@@ -1,7 +1,7 @@
 # 根因索引
 
-> 父文档: `docs/review-output-diagnosis-codex.md`（Codex 视角完整诊断）
-> 关联: `docs/review-output-diagnosis.md`（Claude 视角诊断）
+> 父文档: `docs/v9.4-review-output-诊断-codex-2026-06-30.md`（Codex 视角完整诊断）
+> 关联: `docs/v9.4-review-output-诊断-2026-06-30.md`（Claude 视角诊断）
 > 创建: 2026-06-30
 
 本目录收录 Codex 在诊断 `monitor --review` 输出质量问题时挖出的、**Claude 诊断未覆盖**的根因。每个根因文档独立成文，含复现路径、代码定位、影响面、修复方案、合并 Gate。
@@ -86,7 +86,7 @@ rg -B2 -A5 "get_kline" src/deep_analyzer.rs | head -30
 
 ## 相关文档
 
-- `docs/review-output-diagnosis.md` — Claude 视角诊断
-- `docs/review-output-diagnosis-codex.md` — Codex 视角综合诊断
+- `docs/v9.4-review-output-诊断-2026-06-30.md` — Claude 视角诊断
+- `docs/v9.4-review-output-诊断-codex-2026-06-30.md` — Codex 视角综合诊断
 - `docs/monitor-runs/2026-06-30/sandbox-blocked.log` — Codex 沙箱跑 review 的 543 行原始 log
-- `docs/business_rules.md` — 业务规则登记（BR-010/007/008 待新增）
+- `docs/业务规则清单-registry.md` — 业务规则登记（BR-010/007/008 待新增）

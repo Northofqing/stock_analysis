@@ -299,7 +299,7 @@ let user_prompt = format!(
 
 ### 5.2 业务规则登记（§2.10）
 
-- [ ] `docs/business_rules.md` 新增 **BR-011: Tool 失败时禁止静默填空字符串，必须显式标注 data_inventory**
+- [ ] `docs/业务规则清单-registry.md` 新增 **BR-011: Tool 失败时禁止静默填空字符串，必须显式标注 data_inventory**
 
 ### 5.3 单元测试
 
@@ -323,7 +323,7 @@ let user_prompt = format!(
 ### 5.6 Review 检查（§2 红线）
 
 - [ ] review 第 5 步：grep `src/deep_analyzer.rs` 确认 prompt 拼装含 data_inventory 段
-- [ ] review 第 5 步：检查 `docs/business_rules.md` BR-011 登记完整
+- [ ] review 第 5 步：检查 `docs/业务规则清单-registry.md` BR-011 登记完整
 - [ ] review 第 5 步：检查单元测试覆盖 mock 失败场景
 
 ### 5.7 数据红线（§2）

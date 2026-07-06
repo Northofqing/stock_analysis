@@ -6,7 +6,7 @@
 
 经过 2026-06-29 对当前系统的根因调查，发现 7 个独立 bug 漏过了完整的开发流程（设计 → 四角挑战 → 计划 → 编码 → review → 测试）。bug 类型横跨"假实现""设计矛盾""数据断层""业务规则缺位"4 大类。
 
-具体 bug 清单（详见 `docs/KNOWN_BUGS-2026-06-28.md`）：
+具体 bug 清单（详见 `docs/v9-known-bugs-已知bug清单-2026-06-28.md`）：
 
 | 编号 | 类型 | 描述 | 严重度 |
 |------|------|------|--------|
@@ -108,9 +108,9 @@ if inputs.winrate_score.is_none() {
 
 #### §2.10 业务规则文档化（防 R-4 / R-5 / R-6）
 
-**MUST** 涉及"去重 / 互斥 / 过滤 / 排序 / 限额"的业务规则必须在 `docs/business_rules.md` 列清单。每条规则包含：编号、规则描述、对应代码位置、测试位置、最后审核日期。
+**MUST** 涉及"去重 / 互斥 / 过滤 / 排序 / 限额"的业务规则必须在 `docs/业务规则清单-registry.md` 列清单。每条规则包含：编号、规则描述、对应代码位置、测试位置、最后审核日期。
 
-**MUST** 任何新代码涉及上述类别，必须先在 `business_rules.md` 登记再写实现。
+**MUST** 任何新代码涉及上述类别，必须先在 `业务规则清单-registry.md` 登记再写实现。
 
 **MUST** Review 检查表第 5 步加项："本 PR 涉及的 5 类业务规则是否登记"。
 
@@ -178,7 +178,7 @@ done
 #### check_business_rules.sh（拦 R-4 / R-5 / R-6）
 
 检查项：
-1. `docs/business_rules.md` 必须存在
+1. `docs/业务规则清单-registry.md` 必须存在
 2. 5 类规则（去重/互斥/过滤/排序/限额）必须全有
 3. 关键函数（discover, map_news_to_chains, fetch_flash_titles 等）必须引用规则编号
 
@@ -254,7 +254,7 @@ DoD：
 
 | 步骤 | 改动 |
 |------|------|
-| 1 | 建 `docs/business_rules.md`，写 5 条规则 |
+| 1 | 建 `docs/业务规则清单-registry.md`，写 5 条规则 |
 | 2 | 修 R-4：加"近 3 交易日已推"硬去重 |
 | 3 | 修 R-5：chain_mapper 加"一条快讯最多 1 条产业链"互斥（例外：AI 给出 ≥2 条独立产业链时保留，见 BR-002） |
 | 4 | 修 R-6：`fetch_flash_titles` 加 A 股过滤（macro 通道分离） |
@@ -350,8 +350,8 @@ DoD：
 ## 7. 关联文档
 
 - `AGENTS.md`（被修改：新增 §2.8 / §2.9 / §2.10）
-- `docs/KNOWN_BUGS-2026-06-28.md`（7 个 bug 的根因记录）
-- `docs/PROJECT_DESIGN-2026-06-28.md`（项目整体设计）
+- `docs/v9-known-bugs-已知bug清单-2026-06-28.md`（7 个 bug 的根因记录）
+- `docs/v9-project-design-全项目设计-2026-06-28.md`（项目整体设计）
 - `docs/architecture/`（v9.1 机会 pipeline 架构）
 
 ---

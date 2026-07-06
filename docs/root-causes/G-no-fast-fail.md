@@ -404,7 +404,7 @@ async fn health_check() -> Result<()> {
 
 ### 5.2 业务规则登记（§2.10）
 
-- [ ] `docs/business_rules.md` 新增 **BR-009: monitor 任何工作流必须有显式超时，超时必须显式退出**
+- [ ] `docs/业务规则清单-registry.md` 新增 **BR-009: monitor 任何工作流必须有显式超时，超时必须显式退出**
 
 ### 5.3 单元测试
 
@@ -430,7 +430,7 @@ async fn health_check() -> Result<()> {
 ### 5.6 Review 检查（§2 红线）
 
 - [ ] review 第 5 步：grep `src/bin/` 所有 `async fn` 入口确认有 timeout
-- [ ] review 第 5 步：检查 `docs/business_rules.md` BR-009 登记完整
+- [ ] review 第 5 步：检查 `docs/业务规则清单-registry.md` BR-009 登记完整
 - [ ] review 第 5 步：检查 CI 沙箱跑 `--review` 5 分钟内必须 exit
 
 ### 5.7 数据红线（§2）

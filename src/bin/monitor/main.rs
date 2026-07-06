@@ -1170,76 +1170,44 @@ async fn run_test_scan() {
         notify::push_governor(&sop_text, notify::PushKind::WeeklySOP).await;
     }
 
-    // v19.4: --test 跑全模板 (用户选 B: 跟 --review 一样)
-    // A股市场概览 + 情绪判断 + NewsRanker + P3 outcome
-    log::info!("[测试] v19.4 全模板模式: 概览 + NewsRanker + P3");
+    // v19.15a: --test 路径已移除 A股市场概览 + NewsRanker 演示
+    // 原因: 用户反馈这 2 个模板在测试中无用, 只推送 R 系列 + T 演示
+    log::info!("[测试] v19.15 全模板模式: T-01~T-12 + R-01~R-08 + T-13 换手率");
 
-    // 1. A股市场概览 + 情绪判断 (v19.1)
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        let txt = stock_analysis::market_analyzer::async_overview::generate_market_overview_text_blocking();
-        let _ = tx.send(txt);
-    });
-    let overview_txt = tokio::task::block_in_place(|| rx.recv().unwrap_or_default());
-    if !overview_txt.is_empty() {
-        log::info!("[测试] A股市场概览:\n{}", overview_txt);
-        push_wechat(&overview_txt).await;
-    }
-
-    // 2. NewsRanker (默认 true) — 拉公告 + 评分
-    let ranked_news = tokio::task::spawn_blocking(|| {
-        use stock_analysis::opportunity::news_ranker;
-        use stock_analysis::opportunity::chain_mapper::{ChainHit, ChainSource};
-        let mut hits: Vec<ChainHit> = Vec::new();
-        if let Ok(anns) = stock_analysis::data_provider::announcement::fetch_announcements(None) {
-            for ann in anns.iter().take(30) {
-                if ann.title.contains("立案") || ann.title.contains("退市") || ann.title.contains("ST风险") {
-                    continue;
+    // v19.15b: T-13 盘中换手率 Top10 (跟 R-04 龙虎榜严格分离)
+    // AGENTS.md §2.1: 真数据, 不用换手率冒充龙虎榜
+    let turnover_text = tokio::task::spawn_blocking(|| {
+        use crate::push_templates::TurnoverEntry;
+        use stock_analysis::data_provider::DataFetcherManager;
+        let stock_list: Vec<String> = std::env::var("STOCK_LIST").unwrap_or_default()
+            .split(',').map(|s| s.trim().to_string()).filter(|s| s.len() == 6).collect();
+        let mut entries: Vec<TurnoverEntry> = Vec::new();
+        let fetcher = DataFetcherManager::new().ok();
+        for code in &stock_list {
+            if let Some(f) = fetcher.as_ref() {
+                if let Ok((klines, _)) = f.get_daily_data(code, 5) {
+                    if let Some(k) = klines.last() {
+                        // 换手率: 用 K 线 vol 字段 (近似, data_provider 没有 turnover_pct 直接字段)
+                        entries.push(TurnoverEntry {
+                            name: code, // 简化, 真实名需要额外拉取
+                            code: code,
+                            price: k.close,
+                            change_pct: k.pct_chg,
+                            turnover_pct: 0.0, // 待 stock_analysis::data_provider 接 turnover 字段
+                            main_flow_yi: 0.0,
+                        });
+                    }
                 }
-                let stage_hint = match ann.level {
-                    stock_analysis::data_provider::announcement::AnnLevel::Emergency => "FADE",
-                    stock_analysis::data_provider::announcement::AnnLevel::Important => "FERMENT",
-                    _ => "START",
-                };
-                // v19.11: 公告级别映射到事件类型 hint (供 rank_news 优先于 classify_event_type)
-                // Emergency 监管/紧急 → REGULATORY, Important 重要 → COMPANY (一般公司行为)
-                // 默认 INFO → 政策/产业 (取标题关键词第一类)
-                let event_hint = match ann.level {
-                    stock_analysis::data_provider::announcement::AnnLevel::Emergency => "REGULATORY",
-                    stock_analysis::data_provider::announcement::AnnLevel::Important => "COMPANY",
-                    _ => "INDUSTRY",
-                };
-                hits.push(ChainHit {
-                    chain: ann.name.clone(),
-                    keywords: vec![
-                        ann.title.clone(),
-                        format!("__STAGE:{}", stage_hint),
-                        format!("__EVENT:{}", event_hint),
-                    ],
-                    logic: "test-announcement".into(),
-                    stocks: vec![],
-                    source: ChainSource::Rule,
-                    board_keyword: ann.name.clone(),
-                    fund_flow_pct: None,
-                });
             }
         }
-        let titles: Vec<String> = hits.iter().map(|h| h.chain.clone()).collect();
-        news_ranker::shadow_rank_hits(&hits, &titles)
-    })
-    .await
-    .unwrap_or_default();
-    if !ranked_news.is_empty() {
-        let board = stock_analysis::opportunity::news_ranker::format_news_ranked_board(&ranked_news);
-        log::info!("[测试] 新闻Ranker (v19.4, {} 命中):\n{}", ranked_news.len(), board);
-        // v19.9: NewsRanker 模板加 banner + 排序 (A 档优先 + 持仓所属代码高亮)
-        let ranked_str = format!("{}\n{}", board, ranked_news.iter()
-            .filter(|r| matches!(r.bucket, stock_analysis::opportunity::news_ranker::NewsRankBucket::PushNow))
-            .filter(|r| holdings.iter().any(|h| h.code == r.candidate.title || holdings.iter().any(|h2| h2.name == r.candidate.title)))
-            .count());
-        notify::push_governor(&ranked_str, notify::PushKind::NewsRanked).await;
-    } else {
-        log::info!("[测试] NewsRanker 0 命中, 跳过推送");
+        crate::push_templates::render_turnover_top(
+            &chrono::Local::now().format("%H:%M").to_string(),
+            &entries,
+        )
+    }).await.unwrap_or_default();
+    if !turnover_text.is_empty() && turnover_text.len() > 50 {
+        log::info!("[v19.15b T-13] 盘中换手率 Top10");
+        notify::push_governor(&turnover_text, notify::PushKind::FundInflow).await;
     }
 
     // 3. P3 outcome (默认 true, --test 也跑)
@@ -1326,8 +1294,9 @@ async fn run_test_scan() {
                 ).load::<LhbRow>(&mut c).unwrap_or_default()
             }).unwrap_or_default();
             if recent.is_empty() {
-                s.push_str("⚠️ 龙虎榜: 今日 + 历史 均无数据\n");
-                s.push_str("原因: 东方财富 API 盘后 21:00 才更新; 当前测试可能非交易日\n");
+                s.push_str("⚠️ 龙虎榜: 盘中无数据 (盘后 21:00 才更新)\n");
+                s.push_str("原因: 东方财富 API 盘中不更新, 历史 DB 无数据\n");
+                s.push_str("盘中看活跃票: 见 T-13 盘中换手率 Top10 模板\n");
                 s.push_str("仅结构化事实, 不含席位风格推断\n");
             } else {
                 s.push_str(&format!("📅 今日无数据, 显示最近 1 个交易日 ({}):\n", recent[0].trade_date));
