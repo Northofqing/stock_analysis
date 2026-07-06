@@ -46,7 +46,7 @@
 | 6 个新增 render 函数 | `render_preopen_news_hot` / `render_intraday_market` / `render_news_catalyst` / `render_paper_review` / `render_catalyst_review` / `render_news_to_idea` |
 | 6 个 Params 结构体 | 与 v19.x 现存 `*Params` 同形（生命周期 + `&str` 借用） |
 | 调用路径 | `bin/monitor/main.rs` 6 个新调用点 + `signal_state.rs` 注册 |
-| 测试矩阵 | 6 render 单测 + 17 治理元信息单测 + 5 红线专项 + 4 BR 登记引用 |
+| 测试矩阵 | 19 render 单测（覆盖 6 函数）+ 17 治理元信息单测 + 5 红线专项 + 4 BR 登记引用 |
 | PR 证据样例 | 6 段 `Refs / Data-Redlines / OldModules / Threshold-Proof / Business-Rules / Rollback` |
 | 回滚 | L1 单 PR revert / L2 PR 链暂停 / L3 整体回 baseline / L4 红线阻断 |
 
@@ -216,7 +216,7 @@
 | `date` | `&str` | 调度器 | 必填 |
 | `name/code/trigger` | `&str` / `&str` / `&str` | virtual_watch DB | 缺失 → 整行省略 |
 | `desc/pnl` | `&str` / `f32` | virtual_close DB | pnl 缺失 → "N/A%" |
-| `plan_high/flat/low` | `&str` ×3 | TBD 生成（与 T-11 同源） | 缺失 → "暂无计划" |
+| `plan_high/flat/low` | `&str` ×3 | 调用点计算（依赖 T-11 通路，A-01 PR #4 落实） | 缺失 → "暂无计划" |
 
 **治理元信息**：`Info`（盘后参考）/ `Some(86400)`（1次/日）/ `requires_banner() = false` / `is_deprecated() = false` / `counts_against_daily_budget() = false`。
 
@@ -236,7 +236,7 @@
 | `theme` | `&str` | news cluster | 必填 |
 | `score` | `f32` | 板块强度 | 缺失 → "N/A" |
 | `persistent` | `enum`（high/med/low） | 持续性判定 | 缺失 → "med" |
-| `started_names/todo_names/watch` | `&[&str]` | news + 候选台 | 缺失 → 整段省略 |
+| `started_names/pending_names/watch` | `&[&str]` | news + 候选台 | 缺失 → 整段省略 |
 
 **治理元信息**：`Important`（⚡盘后）/ `Some(86400)`（1次/日，盘后段 15:30-23:00 触发即记当日已推）/ `requires_banner() = false`（盘后非交易建议）/ `is_deprecated() = false` / `counts_against_daily_budget() = true`。
 
@@ -489,7 +489,7 @@ cargo build --release  # 验证无 dangling ref
 | # | 项 | 验证方式 |
 |---|---|---|
 | 1 | 设计文档落盘 + git commit | `git log -- docs/superpowers/specs/2026-07-06-v13-push-templates-design.md` |
-| 2 | 4 个 P0 PR 全部合并 + Gate C 全绿 | `git log --oneline \| grep "feat(v13)"` + `bash tools/compliance/check.sh` |
+| 2 | 3 个 P0 PR（#1/#2/#3）+ 1 个 P1 PR（#4）合并 + Gate C 全绿 | `git log --oneline \| grep "feat(v13)"` + `bash tools/compliance/check.sh` |
 | 3 | 1 个 P1 PR（PaperReview）合并且 `#[ignore]` 待 T-11 解除 | PR #4 含 `#[ignore]` 与前置依赖注释 |
 | 4 | §14.5 全表与代码治理元信息 100% 对齐 | PR #5 审计脚本输出 0 差量 |
 | 5 | 19 render 用例 + 17 治理用例 + 5 红线用例 全绿 | `cargo test` |
