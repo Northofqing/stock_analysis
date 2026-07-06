@@ -240,18 +240,22 @@ impl PushKind {
             PushKind::SectorTier | PushKind::CapitalVerify => Some(1800),
             PushKind::FactorIC => Some(3600),
             PushKind::WeeklySOP => Some(86_400),
+            // v13 §14.5 (Codex F5 修): TurnoverTop 显式 600s (原默认 1800s 与 spec 不符)
+            // 注: TurnoverTop enum 当前未在 notify.rs 中 (PR v19.15 设计但未接通),
+            // 保留此分支待 §14.5 TurnoverTop 补登后启用
+            // PushKind::TurnoverTop => Some(600),  // 待接通
             // v13 新增
             PushKind::PreopenNewsHot | PushKind::IntradayMarket => Some(900), // 15 min
             PushKind::NewsCatalyst => Some(600),                              // 10 min
             PushKind::NewsToIdea => Some(1200),                               // 20 min/票
             PushKind::CatalystReview => Some(86_400),                         // 1次/日
-            PushKind::IndustryChainIntraday => Some(1800),                     // 30 min
+            PushKind::IndustryChainIntraday => Some(1800),                    // 30 min
             PushKind::PostFixedPriceOrder => Some(60),                        // 1 min/票
-            PushKind::PostFixedPriceFill => Some(300),                         // 5 min/票
-            PushKind::StPriceLimitChanged => Some(86_400),                     // 1次/票/日
-            PushKind::EtfClosingCallAuction => Some(86_400),                    // 1次/日
-            PushKind::BlockTradeIntradayConfirm => Some(300),                  // 5 min/票
-            PushKind::BlockTradePriceRange => Some(3600),                      // 60 min/票
+            PushKind::PostFixedPriceFill => Some(300),                        // 5 min/票
+            PushKind::StPriceLimitChanged => Some(86_400),                    // 1次/票/日
+            PushKind::EtfClosingCallAuction => Some(86_400),                  // 1次/日
+            PushKind::BlockTradeIntradayConfirm => Some(300),                 // 5 min/票
+            PushKind::BlockTradePriceRange => Some(3600),                     // 60 min/票
             _ => Some(1800),                                                  // 默认 30min
         }
     }
