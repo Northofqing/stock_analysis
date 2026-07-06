@@ -23,7 +23,15 @@ fn test_discover_dedups_recently_pushed_stocks() {
     let today = Local::now().format("%Y-%m-%d").to_string();
 
     // 准备: 把 TEST_CODE_002 标记为"今天已推"
-    let _ = db.save_prediction(&today, &today, Some("T"), Some("TEST_CODE_002"), "看多", 60.0, Some("setup"));
+    let _ = db.save_prediction_legacy(
+        &today,
+        &today,
+        Some("T"),
+        Some("TEST_CODE_002"),
+        "看多",
+        60.0,
+        Some("setup"),
+    );
 
     // 准备: hits 包含 TEST_CODE_002
     use stock_analysis::opportunity::chain_mapper::{ChainHit, ChainSource, StockInfo};
@@ -31,7 +39,12 @@ fn test_discover_dedups_recently_pushed_stocks() {
         chain: "测试链".into(),
         keywords: vec!["T".into()],
         logic: "test".into(),
-        stocks: vec![StockInfo { code: "TEST_CODE_002".into(), name: "测试2".into(), change_pct: 0.0, vol_ratio: 1.0 }],
+        stocks: vec![StockInfo {
+            code: "TEST_CODE_002".into(),
+            name: "测试2".into(),
+            change_pct: 0.0,
+            vol_ratio: 1.0,
+        }],
         source: ChainSource::Rule,
         board_keyword: "".into(),
         fund_flow_pct: None,

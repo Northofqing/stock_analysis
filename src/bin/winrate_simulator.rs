@@ -14,16 +14,21 @@
 //! 设计: 只读不写. 与 backfill_predictions / backfill_daily 保持一致风格 —
 //!       直接调 lib 公共 API, 不触发 monitor pipeline.
 
+use chrono::{Duration, Local};
+use diesel::sql_types::{Integer, Text};
+use diesel::{QueryableByName, RunQueryDsl};
 use std::env;
 use std::path::PathBuf;
-use chrono::{Local, Duration};
-use diesel::sql_types::{Text, Integer};
-use diesel::{QueryableByName, RunQueryDsl};
 use stock_analysis::database::DatabaseManager;
 
-/// BR-006 默认黑名单 + 主题 priority + generic 标记: 从 config/chain_rules.toml 动态读取.
-fn load_br006_default_blacklist() -> (Vec<String>, std::collections::HashMap<String, u32>, std::collections::HashSet<String>) {
-    let toml_text = include_str!("../../config/chain_rules.toml");
+/// BR-006 默认黑名单 + 主题 priority + generic 标记: 从 config/chain.toml 动态读取.
+/// v14.3: 文件名修正 (原 chain_rules.toml 已合并入 chain.toml).
+fn load_br006_default_blacklist() -> (
+    Vec<String>,
+    std::collections::HashMap<String, u32>,
+    std::collections::HashSet<String>,
+) {
+    let toml_text = include_str!("../../config/chain.toml");
     #[derive(serde::Deserialize)]
     struct Rule {
         chain: String,
@@ -37,15 +42,28 @@ fn load_br006_default_blacklist() -> (Vec<String>, std::collections::HashMap<Str
     struct RulesFile {
         rules: Vec<Rule>,
     }
-    fn default_true() -> bool { true }
+    fn default_true() -> bool {
+        true
+    }
     match toml::from_str::<RulesFile>(toml_text) {
         Ok(file) => {
-            let blacklist: Vec<String> = file.rules.iter()
-                .filter(|r| !r.enabled).map(|r| r.chain.clone()).collect();
-            let priorities: std::collections::HashMap<String, u32> = file.rules.iter()
-                .map(|r| (r.chain.clone(), r.priority)).collect();
-            let generics: std::collections::HashSet<String> = file.rules.iter()
-                .filter(|r| r.generic).map(|r| r.chain.clone()).collect();
+            let blacklist: Vec<String> = file
+                .rules
+                .iter()
+                .filter(|r| !r.enabled)
+                .map(|r| r.chain.clone())
+                .collect();
+            let priorities: std::collections::HashMap<String, u32> = file
+                .rules
+                .iter()
+                .map(|r| (r.chain.clone(), r.priority))
+                .collect();
+            let generics: std::collections::HashSet<String> = file
+                .rules
+                .iter()
+                .filter(|r| r.generic)
+                .map(|r| r.chain.clone())
+                .collect();
             (blacklist, priorities, generics)
         }
         Err(e) => {
@@ -91,7 +109,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--blacklist" | "-b" => {
                 i += 1;
                 if let Some(list) = args.get(i) {
-                    blacklist = list.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+                    blacklist = list
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
                 }
             }
             "--days" | "-d" => {
@@ -128,7 +150,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 3. 构造 SQL 时间过滤
     let since_clause = match days {
         Some(d) => {
-            let since = (Local::now() - Duration::days(d)).format("%Y-%m-%d").to_string();
+            let since = (Local::now() - Duration::days(d))
+                .format("%Y-%m-%d")
+                .to_string();
             format!(" AND pred_date >= '{}' ", since)
         }
         None => String::new(),
@@ -159,13 +183,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pre: GlobalRow = diesel::sql_query(global_sql).get_result(&mut conn)?;
 
     // 6. 全局: 调整后 (按黑名单过滤)
-    let blacklist_escaped: Vec<String> = blacklist.iter().map(|b| format!("'{}'", b.replace('\'', "''"))).collect();
+    let blacklist_escaped: Vec<String> = blacklist
+        .iter()
+        .map(|b| format!("'{}'", b.replace('\'', "''")))
+        .collect();
     let blacklist_in = blacklist_escaped.join(",");
     let post_sql = format!(
         "SELECT COUNT(*) as total, SUM(CASE WHEN hit = 1 THEN 1 ELSE 0 END) as hits
          FROM prediction_tracker
          WHERE hit IS NOT NULL AND theme_name != '' AND theme_name NOT IN ({bl}) {sc}",
-        bl = blacklist_in, sc = since_clause,
+        bl = blacklist_in,
+        sc = since_clause,
     );
     let post: GlobalRow = diesel::sql_query(post_sql).get_result(&mut conn)?;
 
@@ -183,7 +211,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     println!("【主题级明细】 (min-samples = {})", explicit_min_samples);
-    println!("{:<24} {:>8} {:>8} {:>8} {:>10}  {}", "主题", "推送", "命中", "未中", "胜率", "建议");
+    println!(
+        "{:<24} {:>8} {:>8} {:>8} {:>10}  {}",
+        "主题", "推送", "命中", "未中", "胜率", "建议"
+    );
     println!("{}", "─".repeat(80));
     let blacklist_set: std::collections::HashSet<&String> = blacklist.iter().collect();
     let mut theme_summaries: Vec<(String, i32, i32, f64)> = Vec::new();
@@ -191,9 +222,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let total = r.total;
         let hits = r.hits;
         let losses = total - hits;
-        let rate = if total > 0 { hits as f64 / total as f64 * 100.0 } else { 0.0 };
+        let rate = if total > 0 {
+            hits as f64 / total as f64 * 100.0
+        } else {
+            0.0
+        };
         theme_summaries.push((r.theme_name.clone(), total, hits, rate));
-        if total < explicit_min_samples as i32 { continue; }
+        if total < explicit_min_samples as i32 {
+            continue;
+        }
         let recommendation = if blacklist_set.contains(&r.theme_name) {
             "关停中 (BR-006)"
         } else if rate < 5.0 {
@@ -205,7 +242,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             "维持"
         };
-        println!("{:<24} {:>8} {:>8} {:>8} {:>9.1}%  {}", r.theme_name, total, hits, losses, rate, recommendation);
+        println!(
+            "{:<24} {:>8} {:>8} {:>8} {:>9.1}%  {}",
+            r.theme_name, total, hits, losses, rate, recommendation
+        );
     }
     println!();
 
@@ -217,12 +257,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if delta.abs() < 1.0 {
         println!("  当前黑名单对全局胜率影响 < 1pp, 继续观察.");
     } else if delta > 0.0 {
-        println!("  关停黑名单后全局胜率 +{:.1}pp ({:.1}% → {:.1}%), 推荐保留关停.", delta, pre_rate, post_rate);
+        println!(
+            "  关停黑名单后全局胜率 +{:.1}pp ({:.1}% → {:.1}%), 推荐保留关停.",
+            delta, pre_rate, post_rate
+        );
     } else {
-        println!("  关停黑名单后全局胜率 {:.1}pp 下降 — 黑名单可能错伤, 复核清单.", delta);
+        println!(
+            "  关停黑名单后全局胜率 {:.1}pp 下降 — 黑名单可能错伤, 复核清单.",
+            delta
+        );
     }
-    let low_perf: Vec<&(String, i32, i32, f64)> = theme_summaries.iter()
-        .filter(|(name, total, _, rate)| !blacklist_set.contains(name) && *total >= explicit_min_samples as i32 && *rate < 5.0)
+    let low_perf: Vec<&(String, i32, i32, f64)> = theme_summaries
+        .iter()
+        .filter(|(name, total, _, rate)| {
+            !blacklist_set.contains(name) && *total >= explicit_min_samples as i32 && *rate < 5.0
+        })
         .collect();
     if !low_perf.is_empty() {
         println!("  以下未关停主题胜率 < 5%, 建议下次评估纳入黑名单:");
@@ -230,30 +279,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("    - {} ({} 推送, {:.1}%)", name, total, rate);
         }
     }
-    let high_perf: Vec<&(String, i32, i32, f64)> = theme_summaries.iter()
-        .filter(|(name, total, _, rate)| !blacklist_set.contains(name) && *total >= explicit_min_samples as i32 && *rate >= 30.0)
+    let high_perf: Vec<&(String, i32, i32, f64)> = theme_summaries
+        .iter()
+        .filter(|(name, total, _, rate)| {
+            !blacklist_set.contains(name) && *total >= explicit_min_samples as i32 && *rate >= 30.0
+        })
         .collect();
     // 修复 simulator false positive: 区分"已加权" (priority >= 80) vs "真正未加权"
     const WEIGHTED_PRIORITY_THRESHOLD: u32 = 80;
-    let weighted: Vec<&&(String, i32, i32, f64)> = high_perf.iter()
-        .filter(|(name, _, _, _)| theme_priorities.get(name.as_str()).copied().unwrap_or(0) >= WEIGHTED_PRIORITY_THRESHOLD)
+    let weighted: Vec<&&(String, i32, i32, f64)> = high_perf
+        .iter()
+        .filter(|(name, _, _, _)| {
+            theme_priorities.get(name.as_str()).copied().unwrap_or(0) >= WEIGHTED_PRIORITY_THRESHOLD
+        })
         .collect();
-    let unweighted: Vec<&&(String, i32, i32, f64)> = high_perf.iter()
-        .filter(|(name, _, _, _)| theme_priorities.get(name.as_str()).copied().unwrap_or(0) < WEIGHTED_PRIORITY_THRESHOLD
-            && !theme_generics.contains(name.as_str()))
+    let unweighted: Vec<&&(String, i32, i32, f64)> = high_perf
+        .iter()
+        .filter(|(name, _, _, _)| {
+            theme_priorities.get(name.as_str()).copied().unwrap_or(0) < WEIGHTED_PRIORITY_THRESHOLD
+                && !theme_generics.contains(name.as_str())
+        })
         .collect();
     if !weighted.is_empty() {
-        println!("  以下 ≥ 30% 主题已加权 (priority ≥ {}), 无需再调:", WEIGHTED_PRIORITY_THRESHOLD);
+        println!(
+            "  以下 ≥ 30% 主题已加权 (priority ≥ {}), 无需再调:",
+            WEIGHTED_PRIORITY_THRESHOLD
+        );
         for &&(name, total, _, rate) in &weighted {
             let p = theme_priorities.get(name.as_str()).copied().unwrap_or(0);
-            println!("    - {} [priority {}] ({} 推送, {:.1}%)", name, p, total, rate);
+            println!(
+                "    - {} [priority {}] ({} 推送, {:.1}%)",
+                name, p, total, rate
+            );
         }
     }
     if !unweighted.is_empty() {
-        println!("  以下 ≥ 30% 主题未充分加权 (priority < {}), 建议下次评估提权:", WEIGHTED_PRIORITY_THRESHOLD);
+        println!(
+            "  以下 ≥ 30% 主题未充分加权 (priority < {}), 建议下次评估提权:",
+            WEIGHTED_PRIORITY_THRESHOLD
+        );
         for &&(name, total, _, rate) in &unweighted {
             let p = theme_priorities.get(name.as_str()).copied().unwrap_or(0);
-            println!("    - {} [priority {}] ({} 推送, {:.1}%)", name, p, total, rate);
+            println!(
+                "    - {} [priority {}] ({} 推送, {:.1}%)",
+                name, p, total, rate
+            );
         }
     }
 
@@ -266,27 +336,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 输出推荐 priority, operator 手动复制到 chain_rules.toml.
     const PRIORITY_SCALE: f64 = 25.0;
     println!("【F17 dynamic_priority 推荐】 (修复 v9.3 批量 priority=100 注入破坏提示)");
-    println!("  公式: dynamic_priority = winrate × log(samples + 1) × {}, clamp [0, 100]", PRIORITY_SCALE);
-    println!("  {:<24} {:>8} {:>8} {:>10} {:>10} {:>10}", "主题", "胜率", "样本", "log加权", "dyn_prior", "static");
+    println!(
+        "  公式: dynamic_priority = winrate × log(samples + 1) × {}, clamp [0, 100]",
+        PRIORITY_SCALE
+    );
+    println!(
+        "  {:<24} {:>8} {:>8} {:>10} {:>10} {:>10}",
+        "主题", "胜率", "样本", "log加权", "dyn_prior", "static"
+    );
     println!("  {}", "─".repeat(80));
     let mut dyn_recommendations: Vec<(String, f64, f64, u32)> = Vec::new();
     for (name, total, _, rate) in &theme_summaries {
-        if *total < explicit_min_samples as i32 { continue; }
+        if *total < explicit_min_samples as i32 {
+            continue;
+        }
         let log_weight = ((*total as f64) + 1.0).ln();
         let dyn_p = ((*rate / 100.0) * log_weight * PRIORITY_SCALE).clamp(0.0, 100.0);
         let static_p = theme_priorities.get(name.as_str()).copied().unwrap_or(0);
         // 只输出有意义的: dyn vs static 差 > 15 或 dyn > 50 但 static < 80
         if (dyn_p - static_p as f64).abs() > 15.0 || (dyn_p > 50.0 && static_p < 80) {
-            println!("  {:<24} {:>7.1}% {:>8} {:>9.2} {:>9.1} {:>10}",
-                name, rate, total, log_weight, dyn_p, static_p);
+            println!(
+                "  {:<24} {:>7.1}% {:>8} {:>9.2} {:>9.1} {:>10}",
+                name, rate, total, log_weight, dyn_p, static_p
+            );
             dyn_recommendations.push((name.clone(), dyn_p, *rate, static_p));
         }
     }
     if !dyn_recommendations.is_empty() {
         println!("\n  建议: 把上述 dyn_prior 复制到 config/chain_rules.toml 的 priority 字段.");
         println!("  注意: dyn_prior 只反映历史胜率, 不包含 forward-looking 因子 (市场风格切换 / 政策催化).");
-        println!("  使用 AGENTS §2.9 边界证明模板: dyn_prior={} ± {} (95% CI), 与样本量={}",
-            "?", "?", "?");
+        println!(
+            "  使用 AGENTS §2.9 边界证明模板: dyn_prior={} ± {} (95% CI), 与样本量={}",
+            "?", "?", "?"
+        );
     }
     println!();
     println!("═══════════════════════════════════════════════════════════════");
@@ -315,7 +397,11 @@ fn print_delta(pre: &GlobalRow, post: &GlobalRow) {
 }
 
 fn rate(row: &GlobalRow) -> f64 {
-    if row.total > 0 { row.hits as f64 / row.total as f64 * 100.0 } else { 0.0 }
+    if row.total > 0 {
+        row.hits as f64 / row.total as f64 * 100.0
+    } else {
+        0.0
+    }
 }
 
 fn print_help() {
