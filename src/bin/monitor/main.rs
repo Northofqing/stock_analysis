@@ -215,11 +215,17 @@ fn fetch_latest_close_map(codes: &[String]) -> std::collections::HashMap<String,
         }
     };
     for code in codes {
-        if let Ok((kline, _)) = fetcher.get_daily_data(code, 3) {
-            if let Some(last) = kline.last() {
-                if last.close > 0.0 {
-                    out.insert(code.clone(), last.close);
+        match fetcher.get_daily_data(code, 3) {
+            Ok((kline, _)) => {
+                if let Some(last) = kline.last() {
+                    if last.close > 0.0 {
+                        out.insert(code.clone(), last.close);
+                    }
                 }
+            }
+            // v17.6 (P3 fix): 静默失败 → 显式 warn (operator 可观察)
+            Err(e) => {
+                log::warn!("[虚拟观察仓] fetch_daily_data({}) 失败: {:#}", code, e);
             }
         }
     }
