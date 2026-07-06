@@ -3,7 +3,7 @@
 # check_design_contradiction.sh — AGENTS.md §2.9 设计矛盾门禁 (R-2 修复新增)
 #
 # 目的: 拦截"推送门 > 评分封顶"这类上下游配置矛盾。
-# 原理: 从 config/opportunity.toml 读 event_risk_score_threshold,
+# 原理: 从 config/strategy.toml 读 event_risk_score_threshold (v12 重构后从 opportunity.toml 合并),
 #       从 src/opportunity/ 源码里 grep 出最大的 min(N.0) 封顶值,
 #       若 threshold > clamp_max 即 fail。
 #
@@ -18,7 +18,7 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-CONFIG="$REPO_ROOT/config/opportunity.toml"
+CONFIG="$REPO_ROOT/config/strategy.toml"  # v12 重构后从 opportunity.toml 合并
 SRC_DIR="$REPO_ROOT/src/opportunity"
 
 FAIL=0

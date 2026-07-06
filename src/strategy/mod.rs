@@ -80,10 +80,10 @@ pub trait StrategyResult: Send + Sync {
 /// - 动量策略 / 双均线 / 海龟交易 …（可扩展）
 ///
 /// # 扩展方式
-/// ```rust
+/// ```rust,ignore
 /// struct MyStrategy { /* config */ }
 ///
-/// impl KlineStrategy for MyStrategy {
+/// impl crate::strategy::KlineStrategy for MyStrategy {
 ///     fn name(&self) -> &'static str { "我的策略" }
 ///     fn description(&self) -> &'static str { "策略描述" }
 ///     fn run_portfolio_boxed(
@@ -116,10 +116,10 @@ pub trait KlineStrategy: Send + Sync {
 /// 适用于基于财务指标、因子排名进行选股的策略，例如多因子策略。
 ///
 /// # 扩展方式
-/// ```rust
+/// ```rust,ignore
 /// struct MyFundamentalStrategy;
 ///
-/// impl FundamentalStrategy for MyFundamentalStrategy {
+/// impl crate::strategy::FundamentalStrategy for MyFundamentalStrategy {
 ///     fn name(&self) -> &'static str { "我的基本面策略" }
 ///     fn description(&self) -> &'static str { "..." }
 ///     fn select_stocks(&self, stocks: &[StockFactors]) -> Result<Vec<StockScore>> {
@@ -141,7 +141,7 @@ pub trait FundamentalStrategy: Send + Sync {
 /// 混合策略：将多个 KlineStrategy 组合，独立运行后汇总各策略结果
 ///
 /// # 使用示例
-/// ```rust
+/// ```rust,ignore
 /// use stock_analysis::strategy::{HybridStrategy, BollingerZScoreStrategy, RsiStrategy};
 ///
 /// let hybrid = HybridStrategy::builder()

@@ -474,7 +474,7 @@ pub fn sort_candidates(mut entries: Vec<CandidateEntry>) -> Vec<CandidateEntry> 
 /// 渲染候选筛选台卡片 (P5 §五 输出形态)
 ///
 /// 格式:
-/// ```
+/// ```text
 /// 📋 候选筛选台 · 通过硬门槛 N 只
 /// 定位: 帮你筛选, 不替你拍板买入 | 证据分「已验证/参考」
 /// ━━━━━━━━━━━
