@@ -2,24 +2,22 @@
 //!
 //! 从 main.rs 提取，减少单文件体积。
 
-use std::io::Write;
-use std::process::Stdio;
-use std::sync::atomic::Ordering;
 use log;
 use reqwest;
 use serde::{Deserialize, Serialize};
 use serde_json;
-use tokio;
+use std::io::Write;
+use std::process::Stdio;
+use std::sync::atomic::Ordering;
 use stock_analysis;
+use tokio;
 
 use crate::{
-    CachedApiToken, MessageSendType, MessageSendTransport,
-    DaemonReadySource, ApiTokenSource,
-    DEFAULT_MAGICLAW_API_ADDR, DEFAULT_MAGICLAW_PROJECT_ID,
-    DEFAULT_MAGICLAW_CLIENT_NAME, DEFAULT_MAGICLAW_TOKEN_TTL_SECS,
-    DEFAULT_MAGICLAW_TOKEN_REFRESH_AHEAD_SECS,
-    MAGICLAW_DAEMON_BOOT_LOCK, MAGICLAW_TOKEN_MEM_CACHE,
-    MAGICLAW_TOKEN_ISSUE_LOCK, MAGICLAW_DISABLE_ENV_TOKEN,
+    ApiTokenSource, CachedApiToken, DaemonReadySource, MessageSendTransport, MessageSendType,
+    DEFAULT_MAGICLAW_API_ADDR, DEFAULT_MAGICLAW_CLIENT_NAME, DEFAULT_MAGICLAW_PROJECT_ID,
+    DEFAULT_MAGICLAW_TOKEN_REFRESH_AHEAD_SECS, DEFAULT_MAGICLAW_TOKEN_TTL_SECS,
+    MAGICLAW_DAEMON_BOOT_LOCK, MAGICLAW_DISABLE_ENV_TOKEN, MAGICLAW_TOKEN_ISSUE_LOCK,
+    MAGICLAW_TOKEN_MEM_CACHE,
 };
 
 /// v11-P0-4 commit D: 推送治理 — 推送类别
@@ -101,6 +99,13 @@ pub enum PushKind {
     TomorrowWatch,
     /// 明日事件日历 (R-08) [MVP-4]
     EventCalendar,
+    // ============= v13 §14 新增 PushKind (PR #1) =============
+    /// v13 §14.1 P-01 盘前新闻热点 (⚡ 15min 冷却)
+    PreopenNewsHot,
+    /// v13 §14.2 I-01 盘中轮动总览 (⚡ 15min 冷却)
+    IntradayMarket,
+    /// v13 §14.2 I-02 新闻催化映射 (⚡ 10min 冷却)
+    NewsCatalyst,
 }
 
 impl PushKind {
@@ -131,7 +136,11 @@ impl PushKind {
             | PushKind::EventCalendar
             | PushKind::DailyReport
             | PushKind::CandidateBoard
-            | PushKind::NewsRanked => PushLevel::Important,
+            | PushKind::NewsRanked
+            // v13 新增
+            | PushKind::PreopenNewsHot
+            | PushKind::IntradayMarket
+            | PushKind::NewsCatalyst => PushLevel::Important,
             // ℹ️参考 (降级 + ForbiddenOps/PaperTrade)
             _ => PushLevel::Info,
         }
@@ -159,6 +168,9 @@ impl PushKind {
                 | PushKind::EventCalendar
                 | PushKind::DailyReport
                 | PushKind::AuctionVolume
+                // v13 新增 (P-01 盘前无持仓语义, 不要 banner; I-01/I-02 盘中交易建议类, 要 banner)
+                | PushKind::IntradayMarket
+                | PushKind::NewsCatalyst
         )
     }
 
@@ -192,7 +204,10 @@ impl PushKind {
             PushKind::SectorTier | PushKind::CapitalVerify => Some(1800),
             PushKind::FactorIC => Some(3600),
             PushKind::WeeklySOP => Some(86_400),
-            _ => Some(1800), // 默认 30min
+            // v13 新增
+            PushKind::PreopenNewsHot | PushKind::IntradayMarket => Some(900), // 15 min
+            PushKind::NewsCatalyst => Some(600),                              // 10 min
+            _ => Some(1800),                                                  // 默认 30min
         }
     }
 
@@ -234,6 +249,10 @@ impl PushKind {
             PushKind::ReviewFailure => "失败归因",
             PushKind::TomorrowWatch => "明日观察池",
             PushKind::EventCalendar => "事件日历",
+            // v13 新增
+            PushKind::PreopenNewsHot => "盘前热点",
+            PushKind::IntradayMarket => "盘中轮动",
+            PushKind::NewsCatalyst => "新闻催化",
         }
     }
 }
@@ -313,7 +332,8 @@ pub async fn push_wechat(text: &str) -> bool {
         .no_proxy()
         .connect_timeout(std::time::Duration::from_secs(2))
         .timeout(std::time::Duration::from_secs(30))
-        .build() {
+        .build()
+    {
         Ok(c) => c,
         Err(e) => {
             log::error!("[{}] 创建 HTTP 客户端失败: {}", send_type.label(), e);
@@ -323,10 +343,18 @@ pub async fn push_wechat(text: &str) -> bool {
 
     match ensure_magiclaw_daemon(&client, &magiclaw_bin, &api_addr, &api_base).await {
         Ok(DaemonReadySource::Reused) => {
-            log::info!("[{}] daemon 来源: 复用已有实例 | {}", send_type.label(), api_addr);
+            log::info!(
+                "[{}] daemon 来源: 复用已有实例 | {}",
+                send_type.label(),
+                api_addr
+            );
         }
         Ok(DaemonReadySource::StartedNow) => {
-            log::info!("[{}] daemon 来源: 本次自动拉起 | {}", send_type.label(), api_addr);
+            log::info!(
+                "[{}] daemon 来源: 本次自动拉起 | {}",
+                send_type.label(),
+                api_addr
+            );
         }
         Err(e) => {
             log::error!("[{}] daemon 不可用: {}", send_type.label(), e);
@@ -334,32 +362,49 @@ pub async fn push_wechat(text: &str) -> bool {
         }
     }
 
-    let (mut active_token, mut active_token_source) = match resolve_or_issue_api_token(&magiclaw_bin).await {
-        Ok(v) => v,
-        Err(e) => {
-            log::error!("[{}] 获取 daemon 动态鉴权 token 失败: {}", send_type.label(), e);
-            return false;
-        }
-    };
+    let (mut active_token, mut active_token_source) =
+        match resolve_or_issue_api_token(&magiclaw_bin).await {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!(
+                    "[{}] 获取 daemon 动态鉴权 token 失败: {}",
+                    send_type.label(),
+                    e
+                );
+                return false;
+            }
+        };
 
-    let verify_result = verify_daemon_auth(&client, &api_base, &active_token, &active_token_source).await;
+    let verify_result =
+        verify_daemon_auth(&client, &api_base, &active_token, &active_token_source).await;
     if let Err(first_err) = verify_result {
         if is_unauthorized_error(&first_err) {
             clear_dynamic_token_cache().await;
             match issue_and_cache_dynamic_api_token(&magiclaw_bin).await {
                 Ok(next) => {
-                    log::warn!("[{}] daemon token 鉴权失败，已清缓存并重新签发动态 token 后重试预检", send_type.label());
+                    log::warn!(
+                        "[{}] daemon token 鉴权失败，已清缓存并重新签发动态 token 后重试预检",
+                        send_type.label()
+                    );
                     if matches!(active_token_source, ApiTokenSource::Env) {
                         MAGICLAW_DISABLE_ENV_TOKEN.store(true, Ordering::Relaxed);
                     }
                     active_token = next.token;
                     active_token_source = ApiTokenSource::DynamicIssued;
-                    if let Err(e) = verify_daemon_auth(&client, &api_base, &active_token, &active_token_source).await {
+                    if let Err(e) =
+                        verify_daemon_auth(&client, &api_base, &active_token, &active_token_source)
+                            .await
+                    {
                         log::warn!("[{}] daemon 鉴权预检重试仍失败，但已重新签发 token，将继续尝试发送: {}", send_type.label(), e);
                     }
                 }
                 Err(issue_err) => {
-                    log::error!("[{}] daemon 鉴权预检失败: {}；自动续签失败: {}", send_type.label(), first_err, issue_err);
+                    log::error!(
+                        "[{}] daemon 鉴权预检失败: {}；自动续签失败: {}",
+                        send_type.label(),
+                        first_err,
+                        issue_err
+                    );
                     return false;
                 }
             }
@@ -378,7 +423,16 @@ pub async fn push_wechat(text: &str) -> bool {
     };
     let to_log = to.as_deref().unwrap_or("<magiclaw-default>");
 
-    match send_via_magiclaw_daemon(&client, &api_base, &active_token, send_type, to.as_deref(), text).await {
+    match send_via_magiclaw_daemon(
+        &client,
+        &api_base,
+        &active_token,
+        send_type,
+        to.as_deref(),
+        text,
+    )
+    .await
+    {
         Ok(()) => {
             log::info!("[{}] 推送成功 | to={}", send_type.label(), to_log);
             true
@@ -388,11 +442,23 @@ pub async fn push_wechat(text: &str) -> bool {
                 clear_dynamic_token_cache().await;
                 match issue_and_cache_dynamic_api_token(&magiclaw_bin).await {
                     Ok(next) => {
-                        log::warn!("[{}] daemon token 鉴权失败，已清缓存并重新签发动态 token 后重试发送", send_type.label());
+                        log::warn!(
+                            "[{}] daemon token 鉴权失败，已清缓存并重新签发动态 token 后重试发送",
+                            send_type.label()
+                        );
                         if matches!(active_token_source, ApiTokenSource::Env) {
                             MAGICLAW_DISABLE_ENV_TOKEN.store(true, Ordering::Relaxed);
                         }
-                        match send_via_magiclaw_daemon(&client, &api_base, &next.token, send_type, to.as_deref(), text).await {
+                        match send_via_magiclaw_daemon(
+                            &client,
+                            &api_base,
+                            &next.token,
+                            send_type,
+                            to.as_deref(),
+                            text,
+                        )
+                        .await
+                        {
                             Ok(()) => {
                                 log::info!("[{}] 推送成功 | to={}", send_type.label(), to_log);
                                 true
@@ -404,7 +470,12 @@ pub async fn push_wechat(text: &str) -> bool {
                         }
                     }
                     Err(issue_err) => {
-                        log::error!("[{}] 推送失败: {}；自动续签失败: {}", send_type.label(), first_err, issue_err);
+                        log::error!(
+                            "[{}] 推送失败: {}；自动续签失败: {}",
+                            send_type.label(),
+                            first_err,
+                            issue_err
+                        );
                         false
                     }
                 }
@@ -499,7 +570,11 @@ pub async fn push_via_magiclaw_cli(send_type: MessageSendType, text: &str) -> bo
     };
 
     let magiclaw_bin = resolve_magiclaw_bin();
-    log::info!("[{}] 开始推送 ({}字) | via=cli", send_type.label(), text.chars().count());
+    log::info!(
+        "[{}] 开始推送 ({}字) | via=cli",
+        send_type.label(),
+        text.chars().count()
+    );
 
     let mut cmd = tokio::process::Command::new(&magiclaw_bin);
     cmd.arg("send")
@@ -558,7 +633,11 @@ pub async fn push_via_magiclaw_cli(send_type: MessageSendType, text: &str) -> bo
     let output = match cmd.output().await {
         Ok(v) => v,
         Err(e) => {
-            log::error!("[飞书] 调用 magiclaw send 失败(magiclaw: {}): {}", magiclaw_bin, e);
+            log::error!(
+                "[飞书] 调用 magiclaw send 失败(magiclaw: {}): {}",
+                magiclaw_bin,
+                e
+            );
             return false;
         }
     };
@@ -723,12 +802,15 @@ pub fn resolve_api_addr() -> String {
         .unwrap_or_else(|| DEFAULT_MAGICLAW_API_ADDR.to_string())
 }
 
-pub async fn resolve_or_issue_api_token(magiclaw_bin: &str) -> Result<(String, ApiTokenSource), String> {
+pub async fn resolve_or_issue_api_token(
+    magiclaw_bin: &str,
+) -> Result<(String, ApiTokenSource), String> {
     if !MAGICLAW_DISABLE_ENV_TOKEN.load(Ordering::Relaxed) {
         if let Some(token) = std::env::var("MAGICLAW_API_TOKEN")
             .ok()
             .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty()) {
+            .filter(|s| !s.is_empty())
+        {
             return Ok((token, ApiTokenSource::Env));
         }
     }
@@ -752,7 +834,8 @@ pub fn is_unauthorized_error(msg: &str) -> bool {
 }
 
 pub fn api_token_cache_file_path() -> std::path::PathBuf {
-    let db_path = std::env::var("DATABASE_PATH").unwrap_or_else(|_| "./data/stock_analysis.db".to_string());
+    let db_path =
+        std::env::var("DATABASE_PATH").unwrap_or_else(|_| "./data/stock_analysis.db".to_string());
     let db_path = std::path::PathBuf::from(db_path);
     let parent = db_path
         .parent()
@@ -819,8 +902,7 @@ pub fn cache_dynamic_token_in_file(token: &CachedApiToken) -> Result<(), String>
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("创建 token 缓存目录失败({}): {}", parent.display(), e))?;
     }
-    let text = serde_json::to_string(token)
-        .map_err(|e| format!("序列化 token 缓存失败: {}", e))?;
+    let text = serde_json::to_string(token).map_err(|e| format!("序列化 token 缓存失败: {}", e))?;
     std::fs::write(&path, text)
         .map_err(|e| format!("写入 token 缓存失败({}): {}", path.display(), e))?;
 
@@ -860,11 +942,14 @@ pub fn parse_issue_token_output(stdout: &str) -> Result<CachedApiToken, String> 
         }
     }
 
-    let token = token.ok_or_else(|| format!("auth issue 输出缺少 token 字段: {}", stdout.trim()))?;
+    let token =
+        token.ok_or_else(|| format!("auth issue 输出缺少 token 字段: {}", stdout.trim()))?;
     Ok(CachedApiToken { token, expires_at })
 }
 
-pub async fn issue_and_cache_dynamic_api_token(magiclaw_bin: &str) -> Result<CachedApiToken, String> {
+pub async fn issue_and_cache_dynamic_api_token(
+    magiclaw_bin: &str,
+) -> Result<CachedApiToken, String> {
     let _issue_guard = MAGICLAW_TOKEN_ISSUE_LOCK.lock().await;
 
     // 双检锁：等待锁期间可能已有其他协程签发并写入缓存。
@@ -903,7 +988,13 @@ pub async fn issue_and_cache_dynamic_api_token(magiclaw_bin: &str) -> Result<Cac
         .arg("send,window_status")
         .arg("--ttl-secs")
         .arg(ttl_secs.to_string())
-        .env("MAGICLAW_DB_PATH", std::env::var("MAGICLAW_DB_PATH").unwrap_or_else(|_| std::env::var("DATABASE_PATH").unwrap_or_else(|_| "./data/stock_analysis.db".to_string())))
+        .env(
+            "MAGICLAW_DB_PATH",
+            std::env::var("MAGICLAW_DB_PATH").unwrap_or_else(|_| {
+                std::env::var("DATABASE_PATH")
+                    .unwrap_or_else(|_| "./data/stock_analysis.db".to_string())
+            }),
+        )
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -919,8 +1010,16 @@ pub async fn issue_and_cache_dynamic_api_token(magiclaw_bin: &str) -> Result<Cac
         return Err(format!(
             "magiclaw auth issue 失败(exit={}): {}{}",
             output.status,
-            if !stderr_tail.is_empty() { format!("stderr={}", stderr_tail) } else { "".to_string() },
-            if !stdout_tail.is_empty() { format!(" | stdout={}", stdout_tail) } else { "".to_string() }
+            if !stderr_tail.is_empty() {
+                format!("stderr={}", stderr_tail)
+            } else {
+                "".to_string()
+            },
+            if !stdout_tail.is_empty() {
+                format!(" | stdout={}", stdout_tail)
+            } else {
+                "".to_string()
+            }
         ));
     }
 
@@ -943,7 +1042,10 @@ pub fn resolve_wechat_data_dir() -> std::path::PathBuf {
         return std::path::PathBuf::from(dir);
     }
     let home = std::env::var("HOME").unwrap_or_default();
-    std::path::Path::new(&home).join(".claude").join("channels").join("wechat")
+    std::path::Path::new(&home)
+        .join(".claude")
+        .join("channels")
+        .join("wechat")
 }
 
 pub fn parse_first_peer_id_from_window_status(body: &str) -> Option<String> {
@@ -961,8 +1063,9 @@ pub fn parse_first_peer_id_from_window_status(body: &str) -> Option<String> {
 }
 
 pub fn resolve_magiclaw_log_dir() -> std::path::PathBuf {
-    let db_path = std::env::var("MAGICLAW_DB_PATH")
-        .unwrap_or_else(|_| std::env::var("DATABASE_PATH").unwrap_or_else(|_| "./data/stock_analysis.db".to_string()));
+    let db_path = std::env::var("MAGICLAW_DB_PATH").unwrap_or_else(|_| {
+        std::env::var("DATABASE_PATH").unwrap_or_else(|_| "./data/stock_analysis.db".to_string())
+    });
     std::path::Path::new(&db_path)
         .parent()
         .map(|parent| parent.join("logs"))
@@ -1029,7 +1132,10 @@ pub async fn resolve_wechat_target(
         std::time::Duration::from_secs(5),
         client
             .get(&url)
-            .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", api_token))
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", api_token),
+            )
             .send(),
     )
     .await;
@@ -1111,7 +1217,8 @@ pub async fn daemon_health_ok(client: &reqwest::Client, api_base: &str) -> bool 
     let resp = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         client.get(&health_url).send(),
-    ).await;
+    )
+    .await;
 
     match resp {
         Ok(Ok(r)) => r.status().is_success(),
@@ -1135,7 +1242,9 @@ pub async fn ensure_magiclaw_daemon(
     }
 
     let mut cmd = tokio::process::Command::new(magiclaw_bin);
-    let magiclaw_db_path = std::env::var("MAGICLAW_DB_PATH").unwrap_or_else(|_| std::env::var("DATABASE_PATH").unwrap_or_else(|_| "./data/stock_analysis.db".to_string()));
+    let magiclaw_db_path = std::env::var("MAGICLAW_DB_PATH").unwrap_or_else(|_| {
+        std::env::var("DATABASE_PATH").unwrap_or_else(|_| "./data/stock_analysis.db".to_string())
+    });
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1146,8 +1255,12 @@ pub async fn ensure_magiclaw_daemon(
         cmd.env("WECHAT_CHANNEL_DIR", dir);
     }
 
-    let mut child = cmd.spawn()
-        .map_err(|e| format!("启动 magiclaw daemon 失败(magiclaw: {}): {}", magiclaw_bin, e))?;
+    let mut child = cmd.spawn().map_err(|e| {
+        format!(
+            "启动 magiclaw daemon 失败(magiclaw: {}): {}",
+            magiclaw_bin, e
+        )
+    })?;
 
     for _ in 0..100 {
         if daemon_health_ok(client, api_base).await {
@@ -1197,10 +1310,7 @@ pub async fn ensure_magiclaw_daemon(
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
 
-    Err(format!(
-        "daemon 启动后健康检查超时: {} (等待30s)",
-        api_addr
-    ))
+    Err(format!("daemon 启动后健康检查超时: {} (等待30s)", api_addr))
 }
 
 pub fn tail_lines(s: &str, n: usize) -> String {
@@ -1221,7 +1331,10 @@ pub async fn send_via_magiclaw_daemon(
 ) -> Result<(), String> {
     let url = format!("{}/api/send", api_base);
     let mut body = serde_json::Map::new();
-    body.insert("send_type".to_string(), serde_json::json!(send_type.as_str()));
+    body.insert(
+        "send_type".to_string(),
+        serde_json::json!(send_type.as_str()),
+    );
     body.insert("text".to_string(), serde_json::json!(text));
     if let Some(to) = to.map(str::trim).filter(|v| !v.is_empty()) {
         body.insert("to".to_string(), serde_json::json!(to));
@@ -1231,12 +1344,16 @@ pub async fn send_via_magiclaw_daemon(
         std::time::Duration::from_secs(30),
         client
             .post(&url)
-            .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", api_token))
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", api_token),
+            )
             .json(&serde_json::Value::Object(body))
             .send(),
-    ).await
-        .map_err(|_| "调用 /api/send 超时(>30s)".to_string())
-        .and_then(|r| r.map_err(|e| format!("调用 /api/send 失败: {}", e)))?;
+    )
+    .await
+    .map_err(|_| "调用 /api/send 超时(>30s)".to_string())
+    .and_then(|r| r.map_err(|e| format!("调用 /api/send 失败: {}", e)))?;
 
     let status = resp.status();
     let text_body = resp.text().await.unwrap_or_default();
@@ -1259,7 +1376,8 @@ pub async fn send_via_magiclaw_daemon(
 
     if matches!(send_type, MessageSendType::Wechat)
         && status == reqwest::StatusCode::PRECONDITION_FAILED
-        && text_body.contains("no valid context_token for peer") {
+        && text_body.contains("no valid context_token for peer")
+    {
         return Err(
             "daemon 拒绝发送(412)：当前会话 context_token 无效。请先在微信给 bot 发一条消息刷新会话窗口后重试".to_string(),
         );
@@ -1279,11 +1397,15 @@ pub async fn verify_daemon_auth(
         std::time::Duration::from_secs(5),
         client
             .get(&url)
-            .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", api_token))
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", api_token),
+            )
             .send(),
-    ).await
-        .map_err(|_| "调用 /api/window_status 超时(>5s)".to_string())
-        .and_then(|r| r.map_err(|e| format!("调用 /api/window_status 失败: {}", e)))?;
+    )
+    .await
+    .map_err(|_| "调用 /api/window_status 超时(>5s)".to_string())
+    .and_then(|r| r.map_err(|e| format!("调用 /api/window_status 失败: {}", e)))?;
 
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
@@ -1307,10 +1429,7 @@ pub async fn verify_daemon_auth(
                 "当前 monitor 使用动态 token(数据库签发)。可能该 token 已过期/被吊销，monitor 将自动续签"
             }
         };
-        return Err(format!(
-            "HTTP 401 unauthorized，{}",
-            source_tip
-        ));
+        return Err(format!("HTTP 401 unauthorized，{}", source_tip));
     }
 
     Err(format!("/api/window_status HTTP {}: {}", status, body))
@@ -1371,7 +1490,10 @@ mod tests {
     async fn push_governor_deprecated_no_push() {
         std::env::set_var("V10_DRY_RUN_PUSH", "1"); // dry-run 模式返回 true
         let r = push_governor("test kept", PushKind::AuctionVolume).await;
-        assert!(r, "v19.12 起 AuctionVolume 保留, push_governor 应返回 true (dry-run)");
+        assert!(
+            r,
+            "v19.12 起 AuctionVolume 保留, push_governor 应返回 true (dry-run)"
+        );
     }
 
     /// push_governor 保留时调 push_wechat (返回 V10_DRY_RUN_PUSH=true 时为 true)
@@ -1389,7 +1511,10 @@ mod tests {
         std::env::set_var("V10_DRY_RUN_PUSH", "1");
         std::env::set_var("PUSH_VERBOSE", "true");
         let r = push_governor("test verbose", PushKind::AuctionVolume).await;
-        assert!(r, "PUSH_VERBOSE=true 应覆盖降级, 调 push_wechat (dry-run 返回 true)");
+        assert!(
+            r,
+            "PUSH_VERBOSE=true 应覆盖降级, 调 push_wechat (dry-run 返回 true)"
+        );
         std::env::remove_var("V10_DRY_RUN_PUSH");
         std::env::remove_var("PUSH_VERBOSE");
     }

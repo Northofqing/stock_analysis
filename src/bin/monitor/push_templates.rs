@@ -116,6 +116,18 @@ impl Default for BannerCtx {
 }
 
 impl BannerCtx {
+    /// 测试用 BannerCtx (Normal/Full, 仓位 0, 日盈亏 0.0)
+    #[cfg(test)]
+    pub fn test_default() -> Self {
+        Self {
+            account_mode: AccountMode::Normal,
+            total_pos: 0,
+            today_pnl: 0.0,
+            data_mode: DataMode::Full,
+            data_missing_note: None,
+        }
+    }
+
     /// 渲染 §14.0 横幅 (1~2 行).
     ///
     /// 第 1 行: `[icon mode | 仓位N成 | 日盈亏+/-X.X% | 数据DataMode]`
@@ -239,7 +251,11 @@ pub fn render_holding_plan(banner: &BannerCtx, params: HoldingPlanParams<'_>) ->
         params.avail,
     );
     if let Some((lo, hi)) = params.reduce_zone {
-        out.push_str(&format!("\n减仓观察区: {}~{}", fmt_price(lo), fmt_price(hi)));
+        out.push_str(&format!(
+            "\n减仓观察区: {}~{}",
+            fmt_price(lo),
+            fmt_price(hi)
+        ));
     }
     out.push_str(&format!(
         "\n支撑{} | 压力{} | 硬止损{}",
@@ -389,7 +405,10 @@ pub fn render_t0_forbid(banner: &BannerCtx, p: T0ForbidParams<'_>) -> String {
     format!(
         "{}\n🔁🚫 不建议做T {}({})（{}）\n原因: {}",
         banner.render(),
-        p.name, p.code, p.hhmm, p.reason,
+        p.name,
+        p.code,
+        p.hhmm,
+        p.reason,
     )
 }
 
@@ -448,12 +467,21 @@ pub fn render_candidate_triggered(banner: &BannerCtx, p: CandidateTriggeredParam
         fmt_price(p.stop), p.max_pos_pct,
     );
     out.push_str("\n证据:");
-    out.push_str(&format!("\n· 新闻: {} {}", p.news_quality.label(), p.news_note));
+    out.push_str(&format!(
+        "\n· 新闻: {} {}",
+        p.news_quality.label(),
+        p.news_note
+    ));
     out.push_str(&format!(
         "\n· 量能: {} 量比{:.1}",
-        p.vol_quality.label(), p.vol_ratio,
+        p.vol_quality.label(),
+        p.vol_ratio,
     ));
-    out.push_str(&format!("\n· K线: {} {}", p.kline_quality.label(), p.kline_note));
+    out.push_str(&format!(
+        "\n· K线: {} {}",
+        p.kline_quality.label(),
+        p.kline_note
+    ));
     out.push_str(&format!("\n· 盘口: {}", p.book_quality.label()));
     if !p.no_buy.is_empty() {
         out.push_str("\n不买条件:");
@@ -510,7 +538,9 @@ pub fn render_forbidden_ops(banner: &BannerCtx, p: ForbiddenOpsParams<'_>) -> St
         "{}\n🚫 禁止操作（{}）\n{}({}): {}\n· {}",
         banner.render(),
         p.hhmm,
-        p.name, p.code, p.conclusion,
+        p.name,
+        p.code,
+        p.conclusion,
         p.reasons.first().map(String::as_str).unwrap_or(""),
     );
     for r in p.reasons.iter().skip(1) {
@@ -550,7 +580,10 @@ impl PaperTradeStatus {
 pub fn render_paper_trade(p: PaperTradeParams<'_>) -> String {
     let mut out = format!(
         "🧪 虚拟盘（{}）\n{}({}) {}",
-        p.hhmm, p.name, p.code, p.status.label(),
+        p.hhmm,
+        p.name,
+        p.code,
+        p.status.label(),
     );
     if p.status == PaperTradeStatus::Filled {
         out.push_str(&format!(
@@ -596,7 +629,12 @@ pub fn render_auction_volume(
     sentiment: &str,
     watch_status: &str,
 ) -> String {
-    let mut out = format!("{}\n🌅 竞价异动 Top{}（{}）", banner.render(), items.len(), hhmm);
+    let mut out = format!(
+        "{}\n🌅 竞价异动 Top{}（{}）",
+        banner.render(),
+        items.len(),
+        hhmm
+    );
     for it in items {
         out.push_str(&format!(
             "\n  {}({}) 高开{:+.1}% 量比{:.1} [{}]",
@@ -648,7 +686,8 @@ pub fn render_close_call(
     if let Some(g) = gamble {
         out.push_str(&format!(
             "\n[博弈] {}({}): 尾盘买入博次日溢价条件{}满足: {}",
-            g.name, g.code,
+            g.name,
+            g.code,
             if g.satisfied { "已" } else { "未" },
             g.cond,
         ));
@@ -686,8 +725,8 @@ pub struct TurnoverEntry {
     pub code: String,
     pub price: f64,
     pub change_pct: f64,
-    pub turnover_pct: f64,        // 换手率 (%)
-    pub main_flow_yi: f64,        // 主力净流入 (亿)
+    pub turnover_pct: f64, // 换手率 (%)
+    pub main_flow_yi: f64, // 主力净流入 (亿)
 }
 
 /// v12 §14.1 T-13 TurnoverTop 模板渲染 — 字段顺序严格对齐 docs/architecture/v12-push-templates.md
@@ -707,7 +746,13 @@ pub fn render_turnover_top(hhmm: &str, entries: &[TurnoverEntry]) -> String {
     for (i, e) in entries.iter().enumerate() {
         out.push_str(&format!(
             "  {}. {}({}) 现价¥{:.2} 涨跌{:+.2}% 换手{:.2}% 主力{:.2}亿\n",
-            i + 1, e.name, e.code, e.price, e.change_pct, e.turnover_pct, e.main_flow_yi,
+            i + 1,
+            e.name,
+            e.code,
+            e.price,
+            e.change_pct,
+            e.turnover_pct,
+            e.main_flow_yi,
         ));
     }
     out.push_str("数据源: 实时行情 (非龙虎榜, 龙虎榜盘后 21:00 才更新)\n");
@@ -727,15 +772,9 @@ pub fn render_daily_report(date: &str, items: &[HoldingDailyPlan<'_>]) -> String
             fmt_price(it.cost),
             it.pnl_pct,
         ));
-        out.push_str(&format!(
-            "\n· 高开>{:.1}%: {}",
-            it.high_gap_x, it.plan_high,
-        ));
+        out.push_str(&format!("\n· 高开>{:.1}%: {}", it.high_gap_x, it.plan_high,));
         out.push_str(&format!("\n· 平开: {}", it.plan_flat));
-        out.push_str(&format!(
-            "\n· 低开/跌破{}: 执行止损",
-            fmt_price(it.stop),
-        ));
+        out.push_str(&format!("\n· 低开/跌破{}: 执行止损", fmt_price(it.stop),));
         out.push_str(&format!("\n· 做T: {}", it.t0));
         out.push_str("\n─────");
     }
@@ -759,7 +798,7 @@ pub struct MarketReview<'a> {
     pub money_effect: &'a str, // 赚钱效应描述
     pub heat_stage: &'a str,
     pub heat_conf_pct: u8,
-    pub low_conf: bool, // 是否低置信
+    pub low_conf: bool,                 // 是否低置信
     pub low_conf_tier: Option<&'a str>, // "保守档"
     pub account_mode: AccountMode,
     pub max_pos: u8,
@@ -866,10 +905,10 @@ pub fn render_review_lhb(date: &str, entries: &[LhbEntry<'_>]) -> String {
 /// R-05 系统信号复盘
 #[derive(Debug, Default)]
 pub struct SignalReview {
-    pub holding_n: u32,   // 持仓建议推 n 条
+    pub holding_n: u32, // 持仓建议推 n 条
     pub holding_exec: u32,
     pub holding_eff: u32,
-    pub t0_n: u32,        // 做T 推 n
+    pub t0_n: u32, // 做T 推 n
     pub t0_eff: u32,
     pub cand_trigger: u32,
     pub cand_filled: u32,
@@ -928,9 +967,14 @@ pub fn render_review_failure(
     for e in entries {
         out.push_str(&format!(
             "\n{}({}) 原信号: {}{}\n结果: {} {:+.1}%\n归因: {}\n处理建议: {}\n─────",
-            e.name, e.code, e.signal_level, e.virtual_reason,
-            e.result_desc, e.pnl_pct,
-            e.failure_reason, e.suggestion,
+            e.name,
+            e.code,
+            e.signal_level,
+            e.virtual_reason,
+            e.result_desc,
+            e.pnl_pct,
+            e.failure_reason,
+            e.suggestion,
         ));
     }
     out.push_str(&format!(
@@ -961,18 +1005,19 @@ pub fn render_tomorrow_watch(date: &str, items: &[WatchItem<'_>]) -> String {
         out.push_str(&format!(
             "\n{}. {}({}) [{}] 来源: {}\n   触发{} | 低吸{}~{} | 止损{}\n   理由: {}",
             i + 1,
-            it.name, it.code, it.topic, it.source,
+            it.name,
+            it.code,
+            it.topic,
+            it.source,
             it.trigger,
-            fmt_price(it.lo), fmt_price(it.hi),
+            fmt_price(it.lo),
+            fmt_price(it.hi),
             fmt_price(it.stop),
             it.reason,
         ));
         out.push_str("\n─────");
     }
-    out.push_str(&format!(
-        "\n共{}只 | 明日竞价后按 T-11 复核",
-        items.len(),
-    ));
+    out.push_str(&format!("\n共{}只 | 明日竞价后按 T-11 复核", items.len(),));
     out
 }
 
@@ -1114,7 +1159,9 @@ pub async fn push_account_mode_change(
     };
     let recovery = match new_mode {
         LibAM::Normal => "(已是 Normal)",
-        LibAM::ReduceOnly => "当日盈亏回到 -1.5% 内 或 连续止损 < 3 笔 (运行时) / 下一交易日盘前重置",
+        LibAM::ReduceOnly => {
+            "当日盈亏回到 -1.5% 内 或 连续止损 < 3 笔 (运行时) / 下一交易日盘前重置"
+        }
         LibAM::Frozen => "下一交易日盘前重置为 Normal",
     };
     let prev_tmpl = prev_mode_to_tmpl(prev_mode);
@@ -1126,12 +1173,7 @@ pub async fn push_account_mode_change(
         String::new()
     };
     text.push_str(&render_account_mode(
-        &hhmm,
-        prev_tmpl,
-        new_tmpl,
-        &reasons,
-        forbidden,
-        recovery,
+        &hhmm, prev_tmpl, new_tmpl, &reasons, forbidden, recovery,
     ));
 
     // 3. dispatch (code="" 全局键, AccountMode 无冷却)
@@ -1145,11 +1187,15 @@ pub async fn push_account_mode_change(
 
     // 4. 标记 pushed
     if ok {
-        if let Err(e) = stock_analysis::database::account_mode_log::mark_account_mode_pushed(log_id) {
+        if let Err(e) = stock_analysis::database::account_mode_log::mark_account_mode_pushed(log_id)
+        {
             log::warn!("[AccountMode] mark pushed=1 失败 (id={}): {}", log_id, e);
         }
     } else {
-        log::info!("[AccountMode] T-01 推送失败, log_id={} 保留 pushed=0 等重试", log_id);
+        log::info!(
+            "[AccountMode] T-01 推送失败, log_id={} 保留 pushed=0 等重试",
+            log_id
+        );
     }
 
     Ok(ok)
@@ -1183,13 +1229,7 @@ pub async fn push_holding_plan_recommendation(
     params: HoldingPlanParams<'_>,
 ) -> bool {
     let text = render_holding_plan(banner.unwrap_or(&BannerCtx::default()), params);
-    dispatch(
-        crate::notify::PushKind::HoldingPlan,
-        code,
-        banner,
-        text,
-    )
-    .await
+    dispatch(crate::notify::PushKind::HoldingPlan, code, banner, text).await
 }
 
 /// PR4-4.3 T-04 持仓紧急风险推送 (🚨紧急, 无视冷却).
@@ -1202,13 +1242,7 @@ pub async fn push_holding_emergency(
     params: HoldingEventParams<'_>,
 ) -> bool {
     let text = render_holding_event(banner.unwrap_or(&BannerCtx::default()), params);
-    dispatch(
-        crate::notify::PushKind::HoldingEvent,
-        code,
-        banner,
-        text,
-    )
-    .await
+    dispatch(crate::notify::PushKind::HoldingEvent, code, banner, text).await
 }
 
 // ============================================================================
@@ -1224,13 +1258,7 @@ pub async fn push_t0_advice(
     params: T0AdviceParams<'_>,
 ) -> bool {
     let text = render_t0_advice(banner.unwrap_or(&BannerCtx::default()), params);
-    dispatch(
-        crate::notify::PushKind::T0Advice,
-        code,
-        banner,
-        text,
-    )
-    .await
+    dispatch(crate::notify::PushKind::T0Advice, code, banner, text).await
 }
 
 /// MVP2-2.2 T-06 不建议做T (ℹ️参考).
@@ -1240,13 +1268,7 @@ pub async fn push_t0_forbid(
     params: T0ForbidParams<'_>,
 ) -> bool {
     let text = render_t0_forbid(banner.unwrap_or(&BannerCtx::default()), params);
-    dispatch(
-        crate::notify::PushKind::T0Advice,
-        code,
-        banner,
-        text,
-    )
-    .await
+    dispatch(crate::notify::PushKind::T0Advice, code, banner, text).await
 }
 
 // ============================================================================
@@ -1291,13 +1313,7 @@ pub async fn push_candidate_invalidated(
     reason: &str,
 ) -> bool {
     let text = render_candidate_invalidated(hhmm, name, code, prev, reason);
-    dispatch(
-        crate::notify::PushKind::CandidateBoard,
-        code,
-        None,
-        text,
-    )
-    .await
+    dispatch(crate::notify::PushKind::CandidateBoard, code, None, text).await
 }
 
 /// v12 PR2-2.2: 数据模式变更编排器.
@@ -1376,27 +1392,22 @@ pub async fn push_data_mode_change(
     ));
 
     // 2. dispatch (code="" 全局键, DataMode 10min 冷却走 push_governor 默认)
-    let ok = dispatch(
-        crate::notify::PushKind::DataMode,
-        "",
-        banner,
-        text,
-    )
-    .await;
+    let ok = dispatch(crate::notify::PushKind::DataMode, "", banner, text).await;
 
     if !ok {
         log::info!(
             "[DataMode] T-02 推送被治理拦截 (冷却或预算), mode {:?} → {:?}",
-            prev_mode, new_mode
+            prev_mode,
+            new_mode
         );
     }
 
     Ok(ok)
 }
 
+use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
-use once_cell::sync::Lazy;
 
 /// 冷却表: key = (PushKind, code_or_empty), value = last sent epoch secs
 ///
@@ -1489,7 +1500,11 @@ pub fn daily_budget_used() -> u32 {
 /// 返回 true = 应停发该条交易建议类推送.
 /// 当前实现: T-03/T-05/T-07 (持有建议 / 做T / 候选触发) 在 Frozen/Unsafe 停发,
 ///           T-04 (紧急风险) / T-09 (禁止操作) 仍照发 (风险类不受限).
-pub fn should_block_on_mode(kind: crate::notify::PushKind, mode: AccountMode, dm: DataMode) -> bool {
+pub fn should_block_on_mode(
+    kind: crate::notify::PushKind,
+    mode: AccountMode,
+    dm: DataMode,
+) -> bool {
     use crate::notify::PushKind as K;
     match kind {
         // 风险类: 永远照发
@@ -1581,6 +1596,123 @@ impl fmt::Display for BannerCtx {
 }
 
 // ============================================================================
+// v13 §14.1/14.2 新增模板 — P-01 盘前新闻热点 / I-01 盘中轮动 / I-02 新闻催化
+// ============================================================================
+
+/// v13 §14.1 P-01 盘前新闻热点
+pub struct PreopenNewsHotParams<'a> {
+    pub hhmm: &'a str,
+    pub theme_1: Option<&'a str>,
+    pub theme_2: Option<&'a str>,
+    pub theme_3: Option<&'a str>,
+    pub news_pairs: Vec<(&'a str, &'a str)>, // (news, chain)
+    pub watch_stocks: Vec<(&'a str, &'a str, &'a str)>, // (name, code, reason)
+}
+
+/// v13 §14.2 I-01 盘中轮动 — 板块状态
+pub enum RotationState {
+    Spreading, // 扩散
+    Diverging, // 分化
+    Fading,    // 退潮
+}
+
+/// v13 §14.2 I-01 盘中轮动总览
+pub struct IntradayMarketParams<'a> {
+    pub hhmm: &'a str,
+    pub tech_sub: Option<&'a str>,
+    pub tech_score: Option<f32>,
+    pub power_sub: Option<&'a str>,
+    pub power_score: Option<f32>,
+    pub robot_sub: Option<&'a str>,
+    pub robot_score: Option<f32>,
+    pub main_attack: Option<&'a str>,
+    pub rotation_state: RotationState,
+}
+
+/// v13 §14.2 I-02 新闻催化映射
+pub struct NewsCatalystParams<'a> {
+    pub hhmm: &'a str,
+    pub headline: &'a str,
+    pub theme: Option<&'a str>,
+    pub stocks: Vec<(&'a str, &'a str, Option<f32>, &'a str)>, // (name, code, chg, reason)
+}
+
+/// v13 §14.1 P-01 盘前新闻热点（盘前无 banner）
+pub fn render_preopen_news_hot(p: PreopenNewsHotParams<'_>) -> String {
+    let mut s = format!("📰 盘前热点（{}）\n", p.hhmm);
+    let themes: Vec<&str> = [p.theme_1, p.theme_2, p.theme_3]
+        .into_iter()
+        .flatten()
+        .collect();
+    if !themes.is_empty() {
+        s.push_str(&format!("主线: {}\n", themes.join(" / ")));
+    }
+    if !p.news_pairs.is_empty() {
+        s.push_str("催化:\n");
+        for (news, chain) in &p.news_pairs {
+            s.push_str(&format!("· {} → 利好{}\n", news, chain));
+        }
+    }
+    if !p.watch_stocks.is_empty() {
+        s.push_str("关注票:\n");
+        for (name, code, reason) in &p.watch_stocks {
+            s.push_str(&format!("· {}({}) 逻辑: {}\n", name, code, reason));
+        }
+    }
+    s.push_str("辅助建议, 非下单指令");
+    s
+}
+
+/// v13 §14.2 I-01 盘中轮动总览（盘中交易建议类带 banner）
+pub fn render_intraday_market(banner: &BannerCtx, p: IntradayMarketParams<'_>) -> String {
+    let render_sub = |sub: Option<&str>, score: Option<f32>| -> String {
+        let s = sub.unwrap_or("—");
+        let sc = score
+            .map(|v| format!("{:.1}", v))
+            .unwrap_or_else(|| "N/A".to_string());
+        format!("{}(强度{})", s, sc)
+    };
+    let state = match p.rotation_state {
+        RotationState::Spreading => "扩散",
+        RotationState::Diverging => "分化",
+        RotationState::Fading => "退潮",
+    };
+    let main = p.main_attack.unwrap_or("暂无主攻");
+    format!(
+        "{}\n📊 盘中轮动（{}）\n科技: {}\n电力: {}\n机器人: {}\n当前主攻: {} | 轮动状态: {}\n辅助建议, 非下单指令",
+        banner.render(),
+        p.hhmm,
+        render_sub(p.tech_sub, p.tech_score),
+        render_sub(p.power_sub, p.power_score),
+        render_sub(p.robot_sub, p.robot_score),
+        main,
+        state,
+    )
+}
+
+/// v13 §14.2 I-02 新闻催化映射（盘中交易建议类带 banner）
+pub fn render_news_catalyst(banner: &BannerCtx, p: NewsCatalystParams<'_>) -> String {
+    let theme = p.theme.unwrap_or("未分类");
+    let mut s = format!(
+        "{}\n📰⚡ 新闻催化跟踪（{}）\n新闻: {}\n受益板块: {}\n",
+        banner.render(),
+        p.hhmm,
+        p.headline,
+        theme
+    );
+    for (name, code, chg, reason) in &p.stocks {
+        if let Some(c) = chg {
+            s.push_str(&format!(
+                "· {}({}) {:+.1}% | 原因:{}\n",
+                name, code, c, reason
+            ));
+        }
+    }
+    s.push_str("辅助建议, 非下单指令");
+    s
+}
+
+// ============================================================================
 // 测试
 // ============================================================================
 
@@ -1603,10 +1735,7 @@ mod tests {
     #[test]
     fn banner_normal_full_format() {
         let b = banner_normal();
-        assert_eq!(
-            b.render(),
-            "[🟢 Normal | 仓位5成 | 日盈亏+0.3% | 数据Full]"
-        );
+        assert_eq!(b.render(), "[🟢 Normal | 仓位5成 | 日盈亏+0.3% | 数据Full]");
     }
 
     #[test]
@@ -1718,10 +1847,7 @@ mod tests {
                 support: 11.95,
                 pressure: 12.70,
                 stop: 11.95,
-                invalidations: &[
-                    "跌破5日线且放量".to_string(),
-                    "板块热度转Fade".to_string(),
-                ],
+                invalidations: &["跌破5日线且放量".to_string(), "板块热度转Fade".to_string()],
                 reasons: &["放量冲高回落".to_string(), "主力净流出0.8亿".to_string()],
             },
         );
@@ -1895,10 +2021,7 @@ mod tests {
                 code: "000001",
                 hhmm: "10:00",
                 conclusion: "距涨停过近, 禁止追买",
-                reasons: &[
-                    "距涨停仅 1.2%".to_string(),
-                    "板块已 Climax".to_string(),
-                ],
+                reasons: &["距涨停仅 1.2%".to_string(), "板块已 Climax".to_string()],
             },
         );
         assert!(s.contains("🚫 禁止操作（10:00）"));
@@ -1953,16 +2076,22 @@ mod tests {
     #[test]
     fn t11_auction_volume() {
         let items = vec![
-            AuctionItem { name: "A", code: "000001", gap_pct: 5.2, vol_ratio: 8.5, tag: "昨日涨停" },
-            AuctionItem { name: "B", code: "600000", gap_pct: 2.1, vol_ratio: 3.2, tag: "观察池" },
+            AuctionItem {
+                name: "A",
+                code: "000001",
+                gap_pct: 5.2,
+                vol_ratio: 8.5,
+                tag: "昨日涨停",
+            },
+            AuctionItem {
+                name: "B",
+                code: "600000",
+                gap_pct: 2.1,
+                vol_ratio: 3.2,
+                tag: "观察池",
+            },
         ];
-        let s = render_auction_volume(
-            &banner_normal(),
-            "09:25",
-            &items,
-            "强承接",
-            "可操作",
-        );
+        let s = render_auction_volume(&banner_normal(), "09:25", &items, "强承接", "可操作");
         assert!(s.contains("🌅 竞价异动 Top2（09:25）"));
         assert!(s.contains("A(000001) 高开+5.2% 量比8.5 [昨日涨停]"));
         assert!(s.contains("B(600000) 高开+2.1% 量比3.2 [观察池]"));
@@ -1973,7 +2102,10 @@ mod tests {
 
     #[test]
     fn t12_close_call_holding_only() {
-        let h = CloseCallHolding { name: "XX", state: "尾盘跳水-建议处理" };
+        let h = CloseCallHolding {
+            name: "XX",
+            state: "尾盘跳水-建议处理",
+        };
         let s = render_close_call(&banner_normal(), "14:45", Some(&h), None);
         assert!(s.contains("🌇 尾盘提示（14:45）"));
         assert!(s.contains("[持仓] XX: 尾盘跳水-建议处理"));
@@ -2083,12 +2215,24 @@ mod tests {
 
     fn test_market_review_default() -> MarketReview<'static> {
         MarketReview {
-            sh_chg: 0.0, chinext_chg: 0.0, star_chg: 0.0,
-            limit_up_n: 0, limit_down_n: 0, broken_pct: 0.0, consecutive_h: 0,
-            amount_yi: 0.0, amount_delta_pct: 0.0, amount_dir: "放量",
-            main_flow_yi: 0.0, money_effect: "差", heat_stage: "Fade", heat_conf_pct: 50,
-            low_conf: false, low_conf_tier: None,
-            account_mode: AccountMode::Normal, max_pos: 5,
+            sh_chg: 0.0,
+            chinext_chg: 0.0,
+            star_chg: 0.0,
+            limit_up_n: 0,
+            limit_down_n: 0,
+            broken_pct: 0.0,
+            consecutive_h: 0,
+            amount_yi: 0.0,
+            amount_delta_pct: 0.0,
+            amount_dir: "放量",
+            main_flow_yi: 0.0,
+            money_effect: "差",
+            heat_stage: "Fade",
+            heat_conf_pct: 50,
+            low_conf: false,
+            low_conf_tier: None,
+            account_mode: AccountMode::Normal,
+            max_pos: 5,
         }
     }
 
@@ -2099,17 +2243,25 @@ mod tests {
         let chains = vec![
             ChainLine {
                 chain: "AI算力",
-                limit_up_n: 8, first_n: 5, consec_n: 3,
+                limit_up_n: 8,
+                first_n: 5,
+                consec_n: 3,
                 heat_stage: "MainUp",
-                leader_name: "龙头A", leader_code: "688001", leader_boards: 4,
+                leader_name: "龙头A",
+                leader_code: "688001",
+                leader_boards: 4,
                 followers: "B,C,D",
                 watch_point: "明日分歧",
             },
             ChainLine {
                 chain: "机器人",
-                limit_up_n: 5, first_n: 4, consec_n: 1,
+                limit_up_n: 5,
+                first_n: 4,
+                consec_n: 1,
                 heat_stage: "HeatUp",
-                leader_name: "龙头Z", leader_code: "300750", leader_boards: 2,
+                leader_name: "龙头Z",
+                leader_code: "300750",
+                leader_boards: 2,
                 followers: "X,Y",
                 watch_point: "接力意愿",
             },
@@ -2126,18 +2278,21 @@ mod tests {
 
     #[test]
     fn r04_review_lhb() {
-        let entries = vec![
-            LhbEntry {
-                name: "X", code: "688001", net_buy_yi: 1.5,
-                reason: "涨幅偏离值达7%",
-                buy_inst_n: 2, buy_inst_amt_wan: 8000.0,
-                buy_other_n: 3, buy_other_amt_wan: 4000.0,
-                buy_conc_pct: 65.0,
-                sell_desc: "游资席位", sell_conc_pct: 45.0,
-                chain_match: Some("AI算力"),
-                next_day_risk: "高开震荡",
-            },
-        ];
+        let entries = vec![LhbEntry {
+            name: "X",
+            code: "688001",
+            net_buy_yi: 1.5,
+            reason: "涨幅偏离值达7%",
+            buy_inst_n: 2,
+            buy_inst_amt_wan: 8000.0,
+            buy_other_n: 3,
+            buy_other_amt_wan: 4000.0,
+            buy_conc_pct: 65.0,
+            sell_desc: "游资席位",
+            sell_conc_pct: 45.0,
+            chain_match: Some("AI算力"),
+            next_day_risk: "高开震荡",
+        }];
         let s = render_review_lhb("2026-07-05", &entries);
         assert!(s.starts_with("🐉 龙虎榜净买前五（2026-07-05 21:00）"));
         assert!(s.contains("X(688001) 净买1.5亿"));
@@ -2152,12 +2307,21 @@ mod tests {
     #[test]
     fn r05_review_signal() {
         let r = SignalReview {
-            holding_n: 5, holding_exec: 4, holding_eff: 3,
-            t0_n: 2, t0_eff: 1,
-            cand_trigger: 6, cand_filled: 3, cand_notfilled: 3,
-            cand_limitup: 2, cand_notreach: 1,
-            paper_pnl_pct: 0.5, paper_total_pct: 3.2, paper_n: 12,
-            news_push_n: 4, news_d1_eff: 2,
+            holding_n: 5,
+            holding_exec: 4,
+            holding_eff: 3,
+            t0_n: 2,
+            t0_eff: 1,
+            cand_trigger: 6,
+            cand_filled: 3,
+            cand_notfilled: 3,
+            cand_limitup: 2,
+            cand_notreach: 1,
+            paper_pnl_pct: 0.5,
+            paper_total_pct: 3.2,
+            paper_n: 12,
+            news_push_n: 4,
+            news_d1_eff: 2,
         };
         let s = render_review_signal("2026-07-05", &r);
         assert!(s.starts_with("🤖 信号复盘（2026-07-05）"));
@@ -2172,18 +2336,21 @@ mod tests {
 
     #[test]
     fn r06_review_failure() {
-        let entries = vec![
-            FailureEntry {
-                name: "X", code: "688001",
-                signal_level: "⚡", virtual_reason: "A档",
-                result_desc: "未成交",
-                pnl_pct: 0.0,
-                failure_reason: "涨停不可买",
-                suggestion: "调高触发阈值",
-            },
-        ];
+        let entries = vec![FailureEntry {
+            name: "X",
+            code: "688001",
+            signal_level: "⚡",
+            virtual_reason: "A档",
+            result_desc: "未成交",
+            pnl_pct: 0.0,
+            failure_reason: "涨停不可买",
+            suggestion: "调高触发阈值",
+        }];
         let dist = FailureDistribution {
-            buy_late: 2, chain_fade: 1, not_fillable: 3, human_not_exec: 1,
+            buy_late: 2,
+            chain_fade: 1,
+            not_fillable: 3,
+            human_not_exec: 1,
         };
         let s = render_review_failure("2026-07-05", &entries, &dist);
         assert!(s.starts_with("❌ 失败归因（2026-07-05）"));
@@ -2197,15 +2364,17 @@ mod tests {
 
     #[test]
     fn r07_tomorrow_watch() {
-        let items = vec![
-            WatchItem {
-                name: "Y", code: "002415", topic: "机器人",
-                source: "A档未触发",
-                trigger: "突破50.5",
-                lo: 49.5, hi: 50.3, stop: 48.5,
-                reason: "板块共振",
-            },
-        ];
+        let items = vec![WatchItem {
+            name: "Y",
+            code: "002415",
+            topic: "机器人",
+            source: "A档未触发",
+            trigger: "突破50.5",
+            lo: 49.5,
+            hi: 50.3,
+            stop: 48.5,
+            reason: "板块共振",
+        }];
         let s = render_tomorrow_watch("2026-07-05", &items);
         assert!(s.starts_with("📌 明日观察池（2026-07-05）"));
         assert!(s.contains("1. Y(002415) [机器人] 来源: A档未触发"));
@@ -2218,8 +2387,14 @@ mod tests {
     #[test]
     fn r08_event_calendar() {
         let holdings = vec![
-            HoldingEventItem { name: "XX", kind: "解禁3.2亿" },
-            HoldingEventItem { name: "YY", kind: "财报预告" },
+            HoldingEventItem {
+                name: "XX",
+                kind: "解禁3.2亿",
+            },
+            HoldingEventItem {
+                name: "YY",
+                kind: "财报预告",
+            },
         ];
         let s = render_event_calendar("2026-07-06", &holdings, "央行MLF到期", "+0.8%", "7.18");
         assert!(s.starts_with("🗓️ 明日事件（2026-07-06）"));
@@ -2253,6 +2428,253 @@ mod tests {
     fn t0_kind_labels() {
         assert_eq!(T0Kind::ReverseT.label(), "ReverseT");
         assert_eq!(T0Kind::PositiveT.label(), "PositiveT");
+    }
+
+    // ====== v13 P-01 盘前新闻热点 (4 用例) ======
+    #[test]
+    fn preopen_news_hot_three_themes_two_news_two_stocks() {
+        let p = PreopenNewsHotParams {
+            hhmm: "09:05",
+            theme_1: Some("AI算力"),
+            theme_2: Some("机器人"),
+            theme_3: Some("消费电子"),
+            news_pairs: vec![("英伟达新品", "GPU"), ("特斯拉FSD入华", "智驾")],
+            watch_stocks: vec![
+                ("中科曙光", "603019", "AI算力龙头"),
+                ("绿的谐波", "688017", "减速器"),
+            ],
+        };
+        let out = render_preopen_news_hot(p);
+        assert!(out.contains("📰 盘前热点（09:05）"));
+        assert!(out.contains("主线: AI算力 / 机器人 / 消费电子"));
+        assert!(out.contains("· 英伟达新品 → 利好GPU"));
+        assert!(out.contains("· 中科曙光(603019) 逻辑: AI算力龙头"));
+        assert!(out.ends_with("辅助建议, 非下单指令"));
+    }
+
+    #[test]
+    fn preopen_news_hot_missing_themes_omits_section() {
+        let p = PreopenNewsHotParams {
+            hhmm: "09:05",
+            theme_1: None,
+            theme_2: None,
+            theme_3: None,
+            news_pairs: vec![],
+            watch_stocks: vec![("X", "000001", "r")],
+        };
+        let out = render_preopen_news_hot(p);
+        assert!(!out.contains("主线:"));
+        assert!(!out.contains("催化:"));
+        assert!(out.contains("· X(000001) 逻辑: r"));
+    }
+
+    #[test]
+    fn preopen_news_hot_partial_themes() {
+        // 1 theme only
+        let p = PreopenNewsHotParams {
+            hhmm: "09:05",
+            theme_1: Some("AI"),
+            theme_2: None,
+            theme_3: None,
+            news_pairs: vec![("N", "C")],
+            watch_stocks: vec![],
+        };
+        let out = render_preopen_news_hot(p);
+        assert!(out.contains("主线: AI"));
+        assert!(!out.contains("AI /"));
+    }
+
+    #[test]
+    fn preopen_news_hot_empty_watch_stocks_omits_section() {
+        let p = PreopenNewsHotParams {
+            hhmm: "09:05",
+            theme_1: Some("T"),
+            theme_2: None,
+            theme_3: None,
+            news_pairs: vec![],
+            watch_stocks: vec![],
+        };
+        let out = render_preopen_news_hot(p);
+        assert!(!out.contains("关注票:"));
+        assert!(out.ends_with("辅助建议, 非下单指令"));
+    }
+
+    // ====== v13 I-01 盘中轮动总览 (3 用例) ======
+    #[test]
+    fn intraday_market_full_state() {
+        let p = IntradayMarketParams {
+            hhmm: "10:30",
+            tech_sub: Some("AI算力"),
+            tech_score: Some(85.5),
+            power_sub: Some("特高压"),
+            power_score: Some(60.0),
+            robot_sub: Some("减速器"),
+            robot_score: Some(72.3),
+            main_attack: Some("AI算力"),
+            rotation_state: RotationState::Spreading,
+        };
+        let banner = BannerCtx::test_default();
+        let out = render_intraday_market(&banner, p);
+        assert!(out.contains("📊 盘中轮动（10:30）"));
+        assert!(out.contains("科技: AI算力(强度85.5)"));
+        assert!(out.contains("电力: 特高压(强度60.0)"));
+        assert!(out.contains("机器人: 减速器(强度72.3)"));
+        assert!(out.contains("轮动状态: 扩散"));
+        assert!(out.contains("当前主攻: AI算力"));
+        assert!(out.ends_with("辅助建议, 非下单指令"));
+    }
+
+    #[test]
+    fn intraday_market_missing_score_shows_na() {
+        let p = IntradayMarketParams {
+            hhmm: "10:30",
+            tech_sub: Some("AI"),
+            tech_score: None,
+            power_sub: None,
+            power_score: None,
+            robot_sub: None,
+            robot_score: None,
+            main_attack: None,
+            rotation_state: RotationState::Fading,
+        };
+        let banner = BannerCtx::test_default();
+        let out = render_intraday_market(&banner, p);
+        assert!(out.contains("AI(强度N/A)"));
+        assert!(out.contains("—(强度N/A)")); // power and robot default to "—"
+        assert!(out.contains("轮动状态: 退潮"));
+        assert!(out.contains("当前主攻: 暂无主攻"));
+    }
+
+    #[test]
+    fn intraday_market_rotation_states() {
+        for (state, label) in [
+            (RotationState::Spreading, "扩散"),
+            (RotationState::Diverging, "分化"),
+            (RotationState::Fading, "退潮"),
+        ] {
+            let p = IntradayMarketParams {
+                hhmm: "10:30",
+                tech_sub: None,
+                tech_score: None,
+                power_sub: None,
+                power_score: None,
+                robot_sub: None,
+                robot_score: None,
+                main_attack: None,
+                rotation_state: state,
+            };
+            let banner = BannerCtx::test_default();
+            let out = render_intraday_market(&banner, p);
+            assert!(
+                out.contains(&format!("轮动状态: {}", label)),
+                "missing state label: {}",
+                label
+            );
+        }
+    }
+
+    // ====== v13 I-02 新闻催化映射 (3 用例) ======
+    #[test]
+    fn news_catalyst_full_state() {
+        let p = NewsCatalystParams {
+            hhmm: "10:30",
+            headline: "英伟达发布H200",
+            theme: Some("AI算力"),
+            stocks: vec![("中科曙光", "603019", Some(5.2), "AI龙头")],
+        };
+        let banner = BannerCtx::test_default();
+        let out = render_news_catalyst(&banner, p);
+        assert!(out.contains("🟢")); // banner 包含 Normal icon
+        assert!(out.contains("📰⚡ 新闻催化跟踪（10:30）"));
+        assert!(out.contains("新闻: 英伟达发布H200"));
+        assert!(out.contains("受益板块: AI算力"));
+        assert!(out.contains("· 中科曙光(603019) +5.2% | 原因:AI龙头"));
+        assert!(out.ends_with("辅助建议, 非下单指令"));
+    }
+
+    #[test]
+    fn news_catalyst_missing_chg_omits_row() {
+        let p = NewsCatalystParams {
+            hhmm: "10:30",
+            headline: "X",
+            theme: None,
+            stocks: vec![("A", "000001", None, "r"), ("B", "000002", Some(3.0), "r2")],
+        };
+        let banner = BannerCtx::test_default();
+        let out = render_news_catalyst(&banner, p);
+        assert!(!out.contains("· A(000001)"));
+        assert!(out.contains("· B(000002) +3.0% | 原因:r2"));
+        assert!(out.contains("受益板块: 未分类"));
+    }
+
+    #[test]
+    fn news_catalyst_no_stocks() {
+        let p = NewsCatalystParams {
+            hhmm: "10:30",
+            headline: "催化",
+            theme: Some("X"),
+            stocks: vec![],
+        };
+        let banner = BannerCtx::test_default();
+        let out = render_news_catalyst(&banner, p);
+        assert!(out.contains("受益板块: X"));
+        assert!(out.ends_with("辅助建议, 非下单指令"));
+    }
+
+    // ====== v13 治理元信息测试 (9 用例) ======
+    #[test]
+    fn gov_preopen_news_hot_cooldown() {
+        assert_eq!(
+            crate::notify::PushKind::PreopenNewsHot.cooldown_secs(),
+            Some(900)
+        );
+    }
+    #[test]
+    fn gov_intraday_market_cooldown() {
+        assert_eq!(
+            crate::notify::PushKind::IntradayMarket.cooldown_secs(),
+            Some(900)
+        );
+    }
+    #[test]
+    fn gov_news_catalyst_cooldown() {
+        assert_eq!(
+            crate::notify::PushKind::NewsCatalyst.cooldown_secs(),
+            Some(600)
+        );
+    }
+    #[test]
+    fn gov_preopen_news_hot_no_banner() {
+        assert!(!crate::notify::PushKind::PreopenNewsHot.requires_banner());
+    }
+    #[test]
+    fn gov_intraday_market_banner() {
+        assert!(crate::notify::PushKind::IntradayMarket.requires_banner());
+    }
+    #[test]
+    fn gov_news_catalyst_banner() {
+        assert!(crate::notify::PushKind::NewsCatalyst.requires_banner());
+    }
+    #[test]
+    fn gov_preopen_news_hot_level() {
+        assert_eq!(
+            crate::notify::PushKind::PreopenNewsHot.level(),
+            crate::notify::PushLevel::Important
+        );
+    }
+    #[test]
+    fn gov_intraday_market_level() {
+        assert_eq!(
+            crate::notify::PushKind::IntradayMarket.level(),
+            crate::notify::PushLevel::Important
+        );
+    }
+    #[test]
+    fn gov_news_catalyst_level() {
+        assert_eq!(
+            crate::notify::PushKind::NewsCatalyst.level(),
+            crate::notify::PushLevel::Important
+        );
     }
 
     #[test]
@@ -2320,15 +2742,51 @@ mod tests {
     fn push_kind_v12_cooldown_table() {
         use super::super::notify::PushKind;
         // §14.3 冷却表
-        assert_eq!(PushKind::AccountMode.cooldown_secs(), None, "AccountMode 无冷却");
-        assert_eq!(PushKind::HoldingEvent.cooldown_secs(), None, "HoldingEvent 无冷却");
-        assert_eq!(PushKind::DataMode.cooldown_secs(), Some(600), "DataMode 10min");
-        assert_eq!(PushKind::HoldingPlan.cooldown_secs(), Some(1800), "HoldingPlan 30min");
-        assert_eq!(PushKind::T0Advice.cooldown_secs(), Some(1800), "T0Advice 30min");
-        assert_eq!(PushKind::CandidateTriggered.cooldown_secs(), Some(86_400), "1次/票/日");
-        assert_eq!(PushKind::ForbiddenOps.cooldown_secs(), Some(3600), "ForbiddenOps 60min");
-        assert_eq!(PushKind::PaperTrade.cooldown_secs(), Some(300), "PaperTrade 5min");
-        assert_eq!(PushKind::CloseCall.cooldown_secs(), Some(86_400), "CloseCall 1次/日");
+        assert_eq!(
+            PushKind::AccountMode.cooldown_secs(),
+            None,
+            "AccountMode 无冷却"
+        );
+        assert_eq!(
+            PushKind::HoldingEvent.cooldown_secs(),
+            None,
+            "HoldingEvent 无冷却"
+        );
+        assert_eq!(
+            PushKind::DataMode.cooldown_secs(),
+            Some(600),
+            "DataMode 10min"
+        );
+        assert_eq!(
+            PushKind::HoldingPlan.cooldown_secs(),
+            Some(1800),
+            "HoldingPlan 30min"
+        );
+        assert_eq!(
+            PushKind::T0Advice.cooldown_secs(),
+            Some(1800),
+            "T0Advice 30min"
+        );
+        assert_eq!(
+            PushKind::CandidateTriggered.cooldown_secs(),
+            Some(86_400),
+            "1次/票/日"
+        );
+        assert_eq!(
+            PushKind::ForbiddenOps.cooldown_secs(),
+            Some(3600),
+            "ForbiddenOps 60min"
+        );
+        assert_eq!(
+            PushKind::PaperTrade.cooldown_secs(),
+            Some(300),
+            "PaperTrade 5min"
+        );
+        assert_eq!(
+            PushKind::CloseCall.cooldown_secs(),
+            Some(86_400),
+            "CloseCall 1次/日"
+        );
     }
 
     #[test]
@@ -2397,7 +2855,10 @@ mod tests {
         assert!(!is_in_cooldown(PushKind::HoldingPlan, "000002"));
         record_cooldown(PushKind::HoldingPlan, "000001");
         assert!(is_in_cooldown(PushKind::HoldingPlan, "000001"));
-        assert!(!is_in_cooldown(PushKind::HoldingPlan, "000002"), "不同 code 应独立");
+        assert!(
+            !is_in_cooldown(PushKind::HoldingPlan, "000002"),
+            "不同 code 应独立"
+        );
     }
 
     #[test]
@@ -2490,10 +2951,7 @@ mod tests {
                 support: 11.95,
                 pressure: 12.70,
                 stop: 11.95,
-                invalidations: &[
-                    "跌破5日线且放量".to_string(),
-                    "板块热度转Fade".to_string(),
-                ],
+                invalidations: &["跌破5日线且放量".to_string(), "板块热度转Fade".to_string()],
                 reasons: &["放量冲高回落".to_string(), "主力净流出0.8亿".to_string()],
             },
         );
@@ -2566,13 +3024,23 @@ mod tests {
         let s = render_candidate_triggered(
             &banner_normal(),
             CandidateTriggeredParams {
-                name: "T", code: "688002", hhmm: "10:00",
-                grade: CandidateGrade::B, topic: "X", price: 10.0,
-                trigger_desc: "突破", lo: 9.5, hi: 10.5, stop: 9.0,
+                name: "T",
+                code: "688002",
+                hhmm: "10:00",
+                grade: CandidateGrade::B,
+                topic: "X",
+                price: 10.0,
+                trigger_desc: "突破",
+                lo: 9.5,
+                hi: 10.5,
+                stop: 9.0,
                 max_pos_pct: 5,
-                news_quality: EvidenceQuality::Mid, news_note: "",
-                vol_quality: EvidenceQuality::Mid, vol_ratio: 2.0,
-                kline_quality: EvidenceQuality::Mid, kline_note: "",
+                news_quality: EvidenceQuality::Mid,
+                news_note: "",
+                vol_quality: EvidenceQuality::Mid,
+                vol_ratio: 2.0,
+                kline_quality: EvidenceQuality::Mid,
+                kline_note: "",
                 book_quality: EvidenceQuality::Missing,
                 no_buy: &[],
             },
@@ -2588,13 +3056,24 @@ mod tests {
         let s = render_review_market(
             "2026-07-05",
             &MarketReview {
-                sh_chg: 0.5, chinext_chg: 1.2, star_chg: 1.5,
-                limit_up_n: 35, limit_down_n: 3, broken_pct: 15.0,
-                consecutive_h: 5, amount_yi: 8500.0, amount_delta_pct: 8.0,
-                amount_dir: "放量", main_flow_yi: 120.0,
-                money_effect: "中等", heat_stage: "MainUp", heat_conf_pct: 80,
-                low_conf: false, low_conf_tier: None,
-                account_mode: AccountMode::Normal, max_pos: 7,
+                sh_chg: 0.5,
+                chinext_chg: 1.2,
+                star_chg: 1.5,
+                limit_up_n: 35,
+                limit_down_n: 3,
+                broken_pct: 15.0,
+                consecutive_h: 5,
+                amount_yi: 8500.0,
+                amount_delta_pct: 8.0,
+                amount_dir: "放量",
+                main_flow_yi: 120.0,
+                money_effect: "中等",
+                heat_stage: "MainUp",
+                heat_conf_pct: 80,
+                low_conf: false,
+                low_conf_tier: None,
+                account_mode: AccountMode::Normal,
+                max_pos: 7,
             },
         );
         for required in &[
@@ -2634,7 +3113,9 @@ mod tests {
         // 清空 account_mode_log (并行测试可能插入行, 影响 e2e_t01_no_change 的 count 断言)
         use diesel::prelude::*;
         if let Ok(mut conn) = stock_analysis::database::DatabaseManager::get().get_conn() {
-            diesel::sql_query("DELETE FROM account_mode_log").execute(&mut conn).ok();
+            diesel::sql_query("DELETE FROM account_mode_log")
+                .execute(&mut conn)
+                .ok();
         }
     }
 
@@ -2674,10 +3155,14 @@ mod tests {
                     push_attempted_at TIMESTAMP
                 )
                 "#,
-            ).execute(&mut conn).expect("create account_mode_log");
+            )
+            .execute(&mut conn)
+            .expect("create account_mode_log");
 
             // 清理旧 E2E 数据 (避免测试间干扰)
-            diesel::sql_query("DELETE FROM account_mode_log").execute(&mut conn).ok();
+            diesel::sql_query("DELETE FROM account_mode_log")
+                .execute(&mut conn)
+                .ok();
         });
     }
 
@@ -2711,11 +3196,9 @@ mod tests {
             data_complete: true,
         };
 
-        let result = push_account_mode_change(
-            &metrics,
-            Some(LibAM::Normal),
-            Some(&banner_normal_full()),
-        ).await;
+        let result =
+            push_account_mode_change(&metrics, Some(LibAM::Normal), Some(&banner_normal_full()))
+                .await;
 
         assert!(result.is_ok(), "orchestrator 不应报错: {:?}", result);
         assert!(result.unwrap(), "T-01 应推送成功 (dry-run)");
@@ -2724,11 +3207,16 @@ mod tests {
         let rows = account_mode_log::recent_account_mode_changes(10).expect("query");
         assert!(!rows.is_empty(), "应至少插 1 行");
         // 找 prev=Normal → new=ReduceOnly 的最新行
-        let target = rows.iter().find(|r| r.prev_mode == "Normal" && r.new_mode == "ReduceOnly");
+        let target = rows
+            .iter()
+            .find(|r| r.prev_mode == "Normal" && r.new_mode == "ReduceOnly");
         assert!(target.is_some(), "应找到 Normal→ReduceOnly 行");
         let row = target.unwrap();
         assert_eq!(row.pushed, 1, "成功推送后应 mark pushed=1");
-        assert!(row.trigger_reason.contains("-1.60%"), "触发原因应含具体亏损");
+        assert!(
+            row.trigger_reason.contains("-1.60%"),
+            "触发原因应含具体亏损"
+        );
         assert!((row.today_pnl_pct.unwrap() - -1.6).abs() < 0.01);
         // 数据准确: 关键字段校验
         assert!(row.trigger_reason.contains("当日亏损"));
@@ -2753,7 +3241,8 @@ mod tests {
         use stock_analysis::risk::action_gate::AccountMode as LibAM;
 
         let before = account_mode_log::recent_account_mode_changes(100)
-            .map(|r| r.len()).unwrap_or(0);
+            .map(|r| r.len())
+            .unwrap_or(0);
 
         let metrics = PortfolioMetrics {
             today_pnl_pct: -1.6,
@@ -2766,12 +3255,14 @@ mod tests {
             &metrics,
             Some(LibAM::ReduceOnly),
             Some(&banner_normal_full()),
-        ).await;
+        )
+        .await;
         assert!(result.is_ok());
         assert!(!result.unwrap(), "无变更应返回 false");
 
         let after = account_mode_log::recent_account_mode_changes(100)
-            .map(|r| r.len()).unwrap_or(0);
+            .map(|r| r.len())
+            .unwrap_or(0);
         assert_eq!(before, after, "无变更不应写库");
 
         std::env::remove_var("V10_DRY_RUN_PUSH");
@@ -2802,7 +3293,8 @@ mod tests {
             &metrics,
             Some(LibAM::ReduceOnly),
             Some(&banner_normal_full()),
-        ).await;
+        )
+        .await;
         assert!(result.is_ok());
 
         let rows = account_mode_log::recent_account_mode_changes(1).expect("query");
@@ -2836,11 +3328,9 @@ mod tests {
             data_complete: false,
         };
 
-        let result = push_account_mode_change(
-            &metrics,
-            Some(LibAM::Normal),
-            Some(&banner_normal_full()),
-        ).await;
+        let result =
+            push_account_mode_change(&metrics, Some(LibAM::Normal), Some(&banner_normal_full()))
+                .await;
         assert!(result.is_ok());
 
         let rows = account_mode_log::recent_account_mode_changes(1).expect("query");
@@ -2877,11 +3367,8 @@ mod tests {
             orderbook_max_age_secs: 600,
         };
 
-        let result = push_data_mode_change(
-            &input,
-            Some(LibDM::Full),
-            Some(&banner_normal_full()),
-        ).await;
+        let result =
+            push_data_mode_change(&input, Some(LibDM::Full), Some(&banner_normal_full())).await;
         assert!(result.is_ok(), "T-02 orchestrator: {:?}", result);
         assert!(result.unwrap(), "T-02 应推送成功");
 
@@ -2903,18 +3390,16 @@ mod tests {
         };
 
         let input = DataHealthInput {
-            capabilities: Capability::ALL.iter()
+            capabilities: Capability::ALL
+                .iter()
                 .map(|c| CapabilityStatus::fresh(*c, 30))
                 .collect(),
             critical_max_age_secs: 120,
             orderbook_max_age_secs: 600,
         };
 
-        let result = push_data_mode_change(
-            &input,
-            Some(LibDM::Full),
-            Some(&banner_normal_full()),
-        ).await;
+        let result =
+            push_data_mode_change(&input, Some(LibDM::Full), Some(&banner_normal_full())).await;
         assert!(result.is_ok());
         assert!(!result.unwrap(), "Full → Full 应 no-op");
 
@@ -2930,7 +3415,10 @@ mod tests {
             DataMode::Full,
             DataMode::Degraded,
             "Kline/MoneyFlow",
-            &["不做盘口承接判断".to_string(), "价格型建议标注数据降级".to_string()],
+            &[
+                "不做盘口承接判断".to_string(),
+                "价格型建议标注数据降级".to_string(),
+            ],
             Some("15min"),
         );
         // 6 个必填字段
@@ -3008,12 +3496,20 @@ mod tests {
     /// 运行: V12_E2E_REAL_PUSH=1 cargo test --bin monitor push_templates::tests::e2e_single_smoke
     #[tokio::test]
     async fn e2e_single_smoke() {
-        if std::env::var("V12_E2E_REAL_PUSH").ok().as_deref() != Some("1") { return; }
+        if std::env::var("V12_E2E_REAL_PUSH").ok().as_deref() != Some("1") {
+            return;
+        }
         // 初始化 env_logger (test env 默认不 init, log macros 静默)
         let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
             .format(|buf, record| {
                 use std::io::Write;
-                writeln!(buf, "[{} {}] {}", chrono::Local::now().format("%H:%M:%S"), record.level(), record.args())
+                writeln!(
+                    buf,
+                    "[{} {}] {}",
+                    chrono::Local::now().format("%H:%M:%S"),
+                    record.level(),
+                    record.args()
+                )
             })
             .try_init();
         std::env::set_var("PUSH_VERBOSE", "true");
@@ -3034,7 +3530,8 @@ mod tests {
             std::env::set_var("FEISHU_RECEIVE_ID_TYPE", "chat_id");
         }
         let text = "[v12-E2E-smoke] 冒烟测试 — 验证 magiclaw daemon 可达";
-        eprintln!("[v12-E2E-smoke] cwd={:?}, MAGICAW_HOME={:?}, MAGICLAW_BIN={:?}, DATABASE_PATH={:?}",
+        eprintln!(
+            "[v12-E2E-smoke] cwd={:?}, MAGICAW_HOME={:?}, MAGICLAW_BIN={:?}, DATABASE_PATH={:?}",
             std::env::current_dir().ok(),
             std::env::var("MAGICLAW_HOME").ok(),
             std::env::var("MAGICLAW_BIN").ok(),
@@ -3043,15 +3540,30 @@ mod tests {
         // 直接调 magiclaw binary 验证可执行 + auth 可达
         let magiclaw_bin = "/Users/zhangzhen/Desktop/magiclaw/target/release/magiclaw";
         let out = std::process::Command::new(magiclaw_bin)
-            .args(&["send", "--channel", "feishu", "--to", "oc_4bca5d870fd5ff3352795a674194d5b0", "--message", text])
+            .args(&[
+                "send",
+                "--channel",
+                "feishu",
+                "--to",
+                "oc_4bca5d870fd5ff3352795a674194d5b0",
+                "--message",
+                text,
+            ])
             .current_dir("/Users/zhangzhen/Desktop/magiclaw")
             .output();
         match out {
             Ok(o) => {
-                eprintln!("[v12-E2E-smoke] magiclaw exit={}, stdout={}, stderr={}",
+                eprintln!(
+                    "[v12-E2E-smoke] magiclaw exit={}, stdout={}, stderr={}",
                     o.status,
-                    String::from_utf8_lossy(&o.stdout).chars().take(200).collect::<String>(),
-                    String::from_utf8_lossy(&o.stderr).chars().take(200).collect::<String>()
+                    String::from_utf8_lossy(&o.stdout)
+                        .chars()
+                        .take(200)
+                        .collect::<String>(),
+                    String::from_utf8_lossy(&o.stderr)
+                        .chars()
+                        .take(200)
+                        .collect::<String>()
                 );
             }
             Err(e) => eprintln!("[v12-E2E-smoke] magiclaw spawn failed: {}", e),
@@ -3062,16 +3574,29 @@ mod tests {
         // 调试: 直接调 push_via_magiclaw_cli 模拟
         let magiclaw_bin2 = "/Users/zhangzhen/Desktop/magiclaw/target/release/magiclaw";
         let out2 = std::process::Command::new(magiclaw_bin2)
-            .args(&["send", "--channel", "feishu", "--to", "oc_4bca5d870fd5ff3352795a674194d5b0", "--message", text])
+            .args(&[
+                "send",
+                "--channel",
+                "feishu",
+                "--to",
+                "oc_4bca5d870fd5ff3352795a674194d5b0",
+                "--message",
+                text,
+            ])
             .current_dir("/Users/zhangzhen/Desktop/magiclaw")
             .env("DATABASE_PATH", "./data/stock_analysis.db")
             .env("MAGICLAW_DB_PATH", "./data/stock_analysis.db")
             .env("FEISHU_TO", "oc_4bca5d870fd5ff3352795a674194d5b0")
             .output();
         match out2 {
-            Ok(o) => eprintln!("[v12-E2E-smoke] magiclaw2 exit={}, stdout={}",
+            Ok(o) => eprintln!(
+                "[v12-E2E-smoke] magiclaw2 exit={}, stdout={}",
                 o.status,
-                String::from_utf8_lossy(&o.stdout).chars().take(150).collect::<String>()),
+                String::from_utf8_lossy(&o.stdout)
+                    .chars()
+                    .take(150)
+                    .collect::<String>()
+            ),
             Err(e) => eprintln!("[v12-E2E-smoke] magiclaw2 spawn failed: {}", e),
         }
         assert!(ok, "smoke test 推送应成功");
@@ -3109,7 +3634,11 @@ mod tests {
             .and_then(|c| c.last().cloned());
         let (today_pnl_pct, total_value, market_value) = match ledger_entry.as_ref() {
             Some(e) => {
-                let pct = if e.total_value > 0.0 { (e.daily_pnl / e.total_value) * 100.0 } else { 0.0 };
+                let pct = if e.total_value > 0.0 {
+                    (e.daily_pnl / e.total_value) * 100.0
+                } else {
+                    0.0
+                };
                 (pct, e.total_value, e.market_value)
             }
             None => (0.0, 0.0, 0.0),
@@ -3124,10 +3653,11 @@ mod tests {
         let trades = stock_analysis::portfolio::get_trade_history(30).unwrap_or_default();
 
         // 真实数据 4: latest account mode (从 DB 读)
-        let prev_account_mode_label = stock_analysis::database::account_mode_log::latest_account_mode_change()
-            .ok()
-            .flatten()
-            .map(|r| r.new_mode);
+        let prev_account_mode_label =
+            stock_analysis::database::account_mode_log::latest_account_mode_change()
+                .ok()
+                .flatten()
+                .map(|r| r.new_mode);
         let prev_mode = match prev_account_mode_label.as_deref() {
             Some("Normal") => stock_analysis::risk::action_gate::AccountMode::Normal,
             Some("ReduceOnly") => stock_analysis::risk::action_gate::AccountMode::ReduceOnly,
@@ -3146,29 +3676,66 @@ mod tests {
         // ===== T-01 账户模式变更 =====
         {
             let metrics = stock_analysis::risk::account_mode::PortfolioMetrics {
-                today_pnl_pct, consecutive_stop_loss_n: 0,
-                total_pos_cheng: if total_value > 0.0 { ((market_value / total_value) * 10.0).round() as u8 } else { 0 },
+                today_pnl_pct,
+                consecutive_stop_loss_n: 0,
+                total_pos_cheng: if total_value > 0.0 {
+                    ((market_value / total_value) * 10.0).round() as u8
+                } else {
+                    0
+                },
                 data_complete,
             };
-            let eval = stock_analysis::risk::account_mode::evaluate(&metrics, Some(prev_mode), &stock_analysis::risk::account_mode::ModeThresholds::default());
+            let eval = stock_analysis::risk::account_mode::evaluate(
+                &metrics,
+                Some(prev_mode),
+                &stock_analysis::risk::account_mode::ModeThresholds::default(),
+            );
             if eval.is_changed() {
                 let forbidden = match eval.mode {
                     stock_analysis::risk::action_gate::AccountMode::Normal => "(无)",
-                    stock_analysis::risk::action_gate::AccountMode::ReduceOnly => "禁止新开仓/加仓/正T, 候选转影子",
-                    stock_analysis::risk::action_gate::AccountMode::Frozen => "禁止新开仓/加仓/正T/反T, 候选转影子",
+                    stock_analysis::risk::action_gate::AccountMode::ReduceOnly => {
+                        "禁止新开仓/加仓/正T, 候选转影子"
+                    }
+                    stock_analysis::risk::action_gate::AccountMode::Frozen => {
+                        "禁止新开仓/加仓/正T/反T, 候选转影子"
+                    }
                 };
                 let recovery = match eval.mode {
                     stock_analysis::risk::action_gate::AccountMode::Normal => "(已是 Normal)",
-                    stock_analysis::risk::action_gate::AccountMode::ReduceOnly => "当日盈亏回到 -1.5% 内 或 连续止损 < 3 笔 (运行时) / 下一交易日盘前重置",
+                    stock_analysis::risk::action_gate::AccountMode::ReduceOnly => {
+                        "当日盈亏回到 -1.5% 内 或 连续止损 < 3 笔 (运行时) / 下一交易日盘前重置"
+                    }
                     stock_analysis::risk::action_gate::AccountMode::Frozen => "下一交易日盘前重置",
                 };
-                let text = render_account_mode(&hhmm, libam_to_tmpl(prev_mode), libam_to_tmpl(eval.mode),
-                    &eval.trigger_reason.clone().map(|r| vec![r]).unwrap_or_default(),
-                    forbidden, recovery);
+                let text = render_account_mode(
+                    &hhmm,
+                    libam_to_tmpl(prev_mode),
+                    libam_to_tmpl(eval.mode),
+                    &eval
+                        .trigger_reason
+                        .clone()
+                        .map(|r| vec![r])
+                        .unwrap_or_default(),
+                    forbidden,
+                    recovery,
+                );
                 let banner_text = format!("[v12-E2E-T01] {}", text);
-                let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::AccountMode).await;
-                if ok { success_count += 1; } else { fail_msgs.push("T-01".to_string()); }
-                log::info!("[v12-E2E] T-01 推送 {} (real data: prev={:?}, pnl={:.2}%)", if ok { "OK" } else { "FAIL" }, prev_mode, today_pnl_pct);
+                let ok = crate::notify::push_governor(
+                    &banner_text,
+                    crate::notify::PushKind::AccountMode,
+                )
+                .await;
+                if ok {
+                    success_count += 1;
+                } else {
+                    fail_msgs.push("T-01".to_string());
+                }
+                log::info!(
+                    "[v12-E2E] T-01 推送 {} (real data: prev={:?}, pnl={:.2}%)",
+                    if ok { "OK" } else { "FAIL" },
+                    prev_mode,
+                    today_pnl_pct
+                );
             } else {
                 log::info!("[v12-E2E] T-01 无变更 (skip)");
             }
@@ -3176,107 +3743,226 @@ mod tests {
 
         // ===== T-02 数据状态变更 =====
         {
-            use stock_analysis::monitor::data_mode::{evaluate as dm_evaluate, Capability, CapabilityStatus, DataHealthInput, DataMode as LibDM};
+            use stock_analysis::monitor::data_mode::{
+                evaluate as dm_evaluate, Capability, CapabilityStatus, DataHealthInput,
+                DataMode as LibDM,
+            };
             let input = DataHealthInput {
-                capabilities: Capability::ALL.iter().map(|c| CapabilityStatus::fresh(*c, 200)).collect(),
+                capabilities: Capability::ALL
+                    .iter()
+                    .map(|c| CapabilityStatus::fresh(*c, 200))
+                    .collect(),
                 critical_max_age_secs: 120,
                 orderbook_max_age_secs: 600,
             };
             let health = dm_evaluate(&input, Some(LibDM::Full));
             if health.is_changed() {
-                let missing_str = if health.missing.is_empty() { "(无)".to_string() }
-                    else { health.missing.iter().map(|c| c.label().to_string()).collect::<Vec<_>>().join("/") };
-                let restrictions = vec!["不做盘口承接判断".to_string(), "禁出价格型建议".to_string(), "仅保留风险类推送".to_string()];
-                let text = render_data_mode(&hhmm, DataMode::Full, DataMode::Unsafe, &missing_str, &restrictions, Some("15min"));
+                let missing_str = if health.missing.is_empty() {
+                    "(无)".to_string()
+                } else {
+                    health
+                        .missing
+                        .iter()
+                        .map(|c| c.label().to_string())
+                        .collect::<Vec<_>>()
+                        .join("/")
+                };
+                let restrictions = vec![
+                    "不做盘口承接判断".to_string(),
+                    "禁出价格型建议".to_string(),
+                    "仅保留风险类推送".to_string(),
+                ];
+                let text = render_data_mode(
+                    &hhmm,
+                    DataMode::Full,
+                    DataMode::Unsafe,
+                    &missing_str,
+                    &restrictions,
+                    Some("15min"),
+                );
                 let banner_text = format!("[v12-E2E-T02] {}", text);
-                let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::DataMode).await;
-                if ok { success_count += 1; } else { fail_msgs.push("T-02".to_string()); }
+                let ok =
+                    crate::notify::push_governor(&banner_text, crate::notify::PushKind::DataMode)
+                        .await;
+                if ok {
+                    success_count += 1;
+                } else {
+                    fail_msgs.push("T-02".to_string());
+                }
                 log::info!("[v12-E2E] T-02 推送 {}", if ok { "OK" } else { "FAIL" });
             }
         }
 
         // ===== T-03 持仓建议 (真实持仓, 无则用合成数据) =====
         let (t03_name, t03_code, t03_cost, t03_shares) = if let Some(p) = &first_pos {
-            (p.name.clone(), p.code.clone(), p.cost_price, p.shares as u32)
+            (
+                p.name.clone(),
+                p.code.clone(),
+                p.cost_price,
+                p.shares as u32,
+            )
         } else {
             // 合成: 无持仓时也演示完整推送路径
-            ("示例持仓".to_string(), "000001".to_string(), 11.80_f64, 3000_u32)
+            (
+                "示例持仓".to_string(),
+                "000001".to_string(),
+                11.80_f64,
+                3000_u32,
+            )
         };
         {
             let banner = BannerCtx {
                 account_mode: AccountMode::Normal,
-                total_pos: if total_value > 0.0 { ((market_value / total_value) * 10.0).round() as u8 } else { 0 },
-                today_pnl: today_pnl_pct, data_mode: DataMode::Full, data_missing_note: None,
+                total_pos: if total_value > 0.0 {
+                    ((market_value / total_value) * 10.0).round() as u8
+                } else {
+                    0
+                },
+                today_pnl: today_pnl_pct,
+                data_mode: DataMode::Full,
+                data_missing_note: None,
             };
             let t03_name_s = t03_name.clone();
             let t03_code_s = t03_code.clone();
             let params = HoldingPlanParams {
-                name: &t03_name_s, code: &t03_code_s, hhmm: &hhmm,
+                name: &t03_name_s,
+                code: &t03_code_s,
+                hhmm: &hhmm,
                 intent: Intent::Reduce,
-                price: t03_cost * 1.05, cost: t03_cost, avail: t03_shares,
+                price: t03_cost * 1.05,
+                cost: t03_cost,
+                avail: t03_shares,
                 reduce_zone: Some((t03_cost * 1.10, t03_cost * 1.15)),
-                support: t03_cost * 0.95, pressure: t03_cost * 1.20, stop: t03_cost * 0.92,
+                support: t03_cost * 0.95,
+                pressure: t03_cost * 1.20,
+                stop: t03_cost * 0.92,
                 invalidations: &["跌破5日线且放量".to_string(), "板块热度转Fade".to_string()],
                 reasons: &["放量冲高回落".to_string(), "主力净流出".to_string()],
             };
             let text = render_holding_plan(&banner, params);
             let banner_text = format!("[v12-E2E-T03] {}", text);
-            let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::HoldingPlan).await;
-            if ok { success_count += 1; } else { fail_msgs.push("T-03".to_string()); }
-            eprintln!("[v12-E2E] T-03 推送 {} (real: {}({}))", if ok { "OK" } else { "FAIL" }, t03_name, t03_code);
+            let ok =
+                crate::notify::push_governor(&banner_text, crate::notify::PushKind::HoldingPlan)
+                    .await;
+            if ok {
+                success_count += 1;
+            } else {
+                fail_msgs.push("T-03".to_string());
+            }
+            eprintln!(
+                "[v12-E2E] T-03 推送 {} (real: {}({}))",
+                if ok { "OK" } else { "FAIL" },
+                t03_name,
+                t03_code
+            );
         }
 
         // ===== T-04 持仓紧急风险 (真实持仓, 无则用合成数据) =====
         let (t04_name, t04_code, t04_cost, t04_shares) = if let Some(p) = &first_pos {
-            (p.name.clone(), p.code.clone(), p.cost_price, p.shares as u32)
+            (
+                p.name.clone(),
+                p.code.clone(),
+                p.cost_price,
+                p.shares as u32,
+            )
         } else {
-            ("示例持仓".to_string(), "000001".to_string(), 11.80_f64, 3000_u32)
+            (
+                "示例持仓".to_string(),
+                "000001".to_string(),
+                11.80_f64,
+                3000_u32,
+            )
         };
         {
             let banner = BannerCtx {
                 account_mode: AccountMode::Normal,
-                total_pos: if total_value > 0.0 { ((market_value / total_value) * 10.0).round() as u8 } else { 0 },
-                today_pnl: today_pnl_pct, data_mode: DataMode::Full, data_missing_note: None,
+                total_pos: if total_value > 0.0 {
+                    ((market_value / total_value) * 10.0).round() as u8
+                } else {
+                    0
+                },
+                today_pnl: today_pnl_pct,
+                data_mode: DataMode::Full,
+                data_missing_note: None,
             };
             let t04_name_s = t04_name.clone();
             let t04_code_s = t04_code.clone();
             let params = HoldingEventParams {
-                name: &t04_name_s, code: &t04_code_s, hhmm: &hhmm,
+                name: &t04_name_s,
+                code: &t04_code_s,
+                hhmm: &hhmm,
                 trigger: "跌破硬止损",
-                price: t04_cost * 0.90, chg_pct: -10.0, gap_pct: 2.5,
+                price: t04_cost * 0.90,
+                chg_pct: -10.0,
+                gap_pct: 2.5,
                 action: "建议减仓/止损",
                 avail: t04_shares,
             };
             let text = render_holding_event(&banner, params);
             let banner_text = format!("[v12-E2E-T04] {}", text);
-            let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::HoldingEvent).await;
-            if ok { success_count += 1; } else { fail_msgs.push("T-04".to_string()); }
-            eprintln!("[v12-E2E] T-04 推送 {} (real: {})", if ok { "OK" } else { "FAIL" }, t04_code);
+            let ok =
+                crate::notify::push_governor(&banner_text, crate::notify::PushKind::HoldingEvent)
+                    .await;
+            if ok {
+                success_count += 1;
+            } else {
+                fail_msgs.push("T-04".to_string());
+            }
+            eprintln!(
+                "[v12-E2E] T-04 推送 {} (real: {})",
+                if ok { "OK" } else { "FAIL" },
+                t04_code
+            );
         }
 
         // ===== T-05 做T建议 (真实持仓, 无则用合成数据) =====
-        let (t05_name, t05_code, t05_cost, t05_shares, t05_held_today) = if let Some(p) = &first_pos {
+        let (t05_name, t05_code, t05_cost, t05_shares, t05_held_today) = if let Some(p) = &first_pos
+        {
             let today = chrono::Local::now().date_naive();
             let buy_date = p.added_at.format("%Y-%m-%d").to_string();
             let held_today = buy_date == today.format("%Y-%m-%d").to_string();
-            (p.name.clone(), p.code.clone(), p.cost_price, p.shares as u32, held_today)
+            (
+                p.name.clone(),
+                p.code.clone(),
+                p.cost_price,
+                p.shares as u32,
+                held_today,
+            )
         } else {
             // 合成: 用历史日期避免 held_today 拦截
-            ("示例持仓".to_string(), "000001".to_string(), 11.80_f64, 3000_u32, false)
+            (
+                "示例持仓".to_string(),
+                "000001".to_string(),
+                11.80_f64,
+                3000_u32,
+                false,
+            )
         };
         if !t05_held_today && t05_shares > 0 {
             let input = stock_analysis::decision::t0_advisor::T0Input {
-                code: t05_code.clone(), name: t05_name.clone(),
+                code: t05_code.clone(),
+                name: t05_name.clone(),
                 trend: stock_analysis::decision::t0_advisor::TrendStatus::Range,
-                buy_date: "2026-07-01".to_string(),  // 历史日期
+                buy_date: "2026-07-01".to_string(), // 历史日期
                 available_shares: t05_shares,
-                current_price: t05_cost * 1.05, cost_price: t05_cost,
-                support: t05_cost * 0.95, pressure: t05_cost * 1.10,
+                current_price: t05_cost * 1.05,
+                cost_price: t05_cost,
+                support: t05_cost * 0.95,
+                pressure: t05_cost * 1.10,
                 kind_hint: None,
-                account_mode_is_reduce_only: matches!(prev_mode, stock_analysis::risk::action_gate::AccountMode::ReduceOnly),
+                account_mode_is_reduce_only: matches!(
+                    prev_mode,
+                    stock_analysis::risk::action_gate::AccountMode::ReduceOnly
+                ),
             };
             let v = stock_analysis::decision::t0_advisor::evaluate(&input);
-            if let stock_analysis::decision::t0_advisor::T0Verdict::Allowed { kind, sell_zone, buy_zone, min_spread_pct } = v {
+            if let stock_analysis::decision::t0_advisor::T0Verdict::Allowed {
+                kind,
+                sell_zone,
+                buy_zone,
+                min_spread_pct,
+            } = v
+            {
                 let kind_pt = match kind {
                     stock_analysis::decision::t0_advisor::T0Kind::ReverseT => T0Kind::ReverseT,
                     stock_analysis::decision::t0_advisor::T0Kind::PositiveT => T0Kind::PositiveT,
@@ -3284,17 +3970,35 @@ mod tests {
                 let t05_name_s = t05_name.clone();
                 let t05_code_s = t05_code.clone();
                 let params = T0AdviceParams {
-                    name: &t05_name_s, code: &t05_code_s, hhmm: &hhmm, kind: kind_pt,
-                    style: T0Style::PullbackCatch, avail: t05_shares,
-                    sell_lo: sell_zone.0, sell_hi: sell_zone.1,
-                    buy_lo: buy_zone.0, buy_hi: buy_zone.1,
-                    min_spread_pct, risk_note: "板块同步下跌",
+                    name: &t05_name_s,
+                    code: &t05_code_s,
+                    hhmm: &hhmm,
+                    kind: kind_pt,
+                    style: T0Style::PullbackCatch,
+                    avail: t05_shares,
+                    sell_lo: sell_zone.0,
+                    sell_hi: sell_zone.1,
+                    buy_lo: buy_zone.0,
+                    buy_hi: buy_zone.1,
+                    min_spread_pct,
+                    risk_note: "板块同步下跌",
                 };
                 let text = render_t0_advice(&BannerCtx::default(), params);
                 let banner_text = format!("[v12-E2E-T05] {}", text);
-                let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::T0Advice).await;
-                if ok { success_count += 1; } else { fail_msgs.push("T-05".to_string()); }
-                eprintln!("[v12-E2E] T-05 推送 {} (real: {}({}))", if ok { "OK" } else { "FAIL" }, t05_name, t05_code);
+                let ok =
+                    crate::notify::push_governor(&banner_text, crate::notify::PushKind::T0Advice)
+                        .await;
+                if ok {
+                    success_count += 1;
+                } else {
+                    fail_msgs.push("T-05".to_string());
+                }
+                eprintln!(
+                    "[v12-E2E] T-05 推送 {} (real: {}({}))",
+                    if ok { "OK" } else { "FAIL" },
+                    t05_name,
+                    t05_code
+                );
             } else {
                 eprintln!("[v12-E2E] T-05 评估返回 Forbidden (合成数据可能未触发 Allowed)");
             }
@@ -3302,12 +4006,25 @@ mod tests {
 
         // ===== T-06 不建议做T =====
         {
-            let (name, code) = first_pos.as_ref().map(|p| (p.name.as_str(), p.code.as_str())).unwrap_or(("测试标的", "000001"));
-            let params = T0ForbidParams { name, code, hhmm: &hhmm, reason: "主升核心票防卖飞 (BR-022 衍生)" };
+            let (name, code) = first_pos
+                .as_ref()
+                .map(|p| (p.name.as_str(), p.code.as_str()))
+                .unwrap_or(("测试标的", "000001"));
+            let params = T0ForbidParams {
+                name,
+                code,
+                hhmm: &hhmm,
+                reason: "主升核心票防卖飞 (BR-022 衍生)",
+            };
             let text = render_t0_forbid(&BannerCtx::default(), params);
             let banner_text = format!("[v12-E2E-T06] {}", text);
-            let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::T0Advice).await;
-            if ok { success_count += 1; } else { fail_msgs.push("T-06".to_string()); }
+            let ok =
+                crate::notify::push_governor(&banner_text, crate::notify::PushKind::T0Advice).await;
+            if ok {
+                success_count += 1;
+            } else {
+                fail_msgs.push("T-06".to_string());
+            }
             log::info!("[v12-E2E] T-06 推送 {}", if ok { "OK" } else { "FAIL" });
         }
 
@@ -3315,30 +4032,60 @@ mod tests {
         {
             std::env::set_var("ENABLE_CANDIDATE_LIVE", "true");
             let params = CandidateTriggeredParams {
-                name: "AI算力候选", code: "688001", hhmm: &hhmm,
-                grade: CandidateGrade::A, topic: "AI算力", price: 50.0,
+                name: "AI算力候选",
+                code: "688001",
+                hhmm: &hhmm,
+                grade: CandidateGrade::A,
+                topic: "AI算力",
+                price: 50.0,
                 trigger_desc: "突破前高+量比4.5",
-                lo: 49.5, hi: 50.3, stop: 48.0, max_pos_pct: 10,
-                news_quality: EvidenceQuality::Strong, news_note: "政策面共振",
-                vol_quality: EvidenceQuality::Strong, vol_ratio: 4.5,
-                kline_quality: EvidenceQuality::Mid, kline_note: "突破未稳",
+                lo: 49.5,
+                hi: 50.3,
+                stop: 48.0,
+                max_pos_pct: 10,
+                news_quality: EvidenceQuality::Strong,
+                news_note: "政策面共振",
+                vol_quality: EvidenceQuality::Strong,
+                vol_ratio: 4.5,
+                kline_quality: EvidenceQuality::Mid,
+                kline_note: "突破未稳",
                 book_quality: EvidenceQuality::Missing,
                 no_buy: &["大盘跳水同步".to_string()],
             };
             let text = render_candidate_triggered(&BannerCtx::default(), params);
             let banner_text = format!("[v12-E2E-T07] {}", text);
-            let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::CandidateTriggered).await;
-            if ok { success_count += 1; } else { fail_msgs.push("T-07".to_string()); }
+            let ok = crate::notify::push_governor(
+                &banner_text,
+                crate::notify::PushKind::CandidateTriggered,
+            )
+            .await;
+            if ok {
+                success_count += 1;
+            } else {
+                fail_msgs.push("T-07".to_string());
+            }
             log::info!("[v12-E2E] T-07 推送 {}", if ok { "OK" } else { "FAIL" });
             std::env::remove_var("ENABLE_CANDIDATE_LIVE");
         }
 
         // ===== T-08 候选失效 =====
         {
-            let text = render_candidate_invalidated(&hhmm, "AI算力候选", "688001", "Watch", "触发失败: 未触达买入区");
+            let text = render_candidate_invalidated(
+                &hhmm,
+                "AI算力候选",
+                "688001",
+                "Watch",
+                "触发失败: 未触达买入区",
+            );
             let banner_text = format!("[v12-E2E-T08] {}", text);
-            let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::CandidateBoard).await;
-            if ok { success_count += 1; } else { fail_msgs.push("T-08".to_string()); }
+            let ok =
+                crate::notify::push_governor(&banner_text, crate::notify::PushKind::CandidateBoard)
+                    .await;
+            if ok {
+                success_count += 1;
+            } else {
+                fail_msgs.push("T-08".to_string());
+            }
             log::info!("[v12-E2E] T-08 推送 {}", if ok { "OK" } else { "FAIL" });
         }
 
@@ -3346,45 +4093,89 @@ mod tests {
         {
             let reasons = vec!["距涨停仅 1.2%".to_string(), "板块已 Climax".to_string()];
             let params = ForbiddenOpsParams {
-                name: "测试标的", code: "688001", hhmm: &hhmm,
+                name: "测试标的",
+                code: "688001",
+                hhmm: &hhmm,
                 conclusion: "距涨停过近, 禁止追买",
                 reasons: &reasons,
             };
             let text = render_forbidden_ops(&BannerCtx::default(), params);
             let banner_text = format!("[v12-E2E-T09] {}", text);
-            let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::ForbiddenOps).await;
-            if ok { success_count += 1; } else { fail_msgs.push("T-09".to_string()); }
+            let ok =
+                crate::notify::push_governor(&banner_text, crate::notify::PushKind::ForbiddenOps)
+                    .await;
+            if ok {
+                success_count += 1;
+            } else {
+                fail_msgs.push("T-09".to_string());
+            }
             log::info!("[v12-E2E] T-09 推送 {}", if ok { "OK" } else { "FAIL" });
         }
 
         // ===== T-10 虚拟盘成交 =====
         {
-            let name = first_pos.as_ref().map(|p| p.name.as_str()).unwrap_or("测试标的");
-            let code = first_pos.as_ref().map(|p| p.code.as_str()).unwrap_or("000001");
+            let name = first_pos
+                .as_ref()
+                .map(|p| p.name.as_str())
+                .unwrap_or("测试标的");
+            let code = first_pos
+                .as_ref()
+                .map(|p| p.code.as_str())
+                .unwrap_or("000001");
             let params = PaperTradeParams {
-                name, code, hhmm: &hhmm, status: PaperTradeStatus::Filled,
-                fill_price: Some(12.50), qty: Some(1000),
+                name,
+                code,
+                hhmm: &hhmm,
+                status: PaperTradeStatus::Filled,
+                fill_price: Some(12.50),
+                qty: Some(1000),
                 virtual_reason: Some("候选A档触发"),
                 not_fill_reason: None,
-                account_mode: AccountMode::Normal, data_mode: DataMode::Full,
+                account_mode: AccountMode::Normal,
+                data_mode: DataMode::Full,
             };
             let text = render_paper_trade(params);
             let banner_text = format!("[v12-E2E-T10] {}", text);
-            let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::PaperTrade).await;
-            if ok { success_count += 1; } else { fail_msgs.push("T-10".to_string()); }
+            let ok =
+                crate::notify::push_governor(&banner_text, crate::notify::PushKind::PaperTrade)
+                    .await;
+            if ok {
+                success_count += 1;
+            } else {
+                fail_msgs.push("T-10".to_string());
+            }
             log::info!("[v12-E2E] T-10 推送 {}", if ok { "OK" } else { "FAIL" });
         }
 
         // ===== T-11 竞价异动 =====
         {
             let items = vec![
-                AuctionItem { name: "AI龙头A", code: "688001", gap_pct: 5.2, vol_ratio: 8.5, tag: "昨日涨停" },
-                AuctionItem { name: "机器人B", code: "300750", gap_pct: 2.1, vol_ratio: 3.2, tag: "观察池" },
+                AuctionItem {
+                    name: "AI龙头A",
+                    code: "688001",
+                    gap_pct: 5.2,
+                    vol_ratio: 8.5,
+                    tag: "昨日涨停",
+                },
+                AuctionItem {
+                    name: "机器人B",
+                    code: "300750",
+                    gap_pct: 2.1,
+                    vol_ratio: 3.2,
+                    tag: "观察池",
+                },
             ];
-            let text = render_auction_volume(&BannerCtx::default(), &hhmm, &items, "强承接", "可操作");
+            let text =
+                render_auction_volume(&BannerCtx::default(), &hhmm, &items, "强承接", "可操作");
             let banner_text = format!("[v12-E2E-T11] {}", text);
-            let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::AuctionVolume).await;
-            if ok { success_count += 1; } else { fail_msgs.push("T-11".to_string()); }
+            let ok =
+                crate::notify::push_governor(&banner_text, crate::notify::PushKind::AuctionVolume)
+                    .await;
+            if ok {
+                success_count += 1;
+            } else {
+                fail_msgs.push("T-11".to_string());
+            }
             log::info!("[v12-E2E] T-11 推送 {}", if ok { "OK" } else { "FAIL" });
         }
 
@@ -3396,63 +4187,139 @@ mod tests {
                 ("示例持仓".to_string(), "000001".to_string())
             };
             let t12_name_s = t12_name.clone();
-            let holding = CloseCallHolding { name: &t12_name_s, state: "尾盘跳水-建议处理" };
+            let holding = CloseCallHolding {
+                name: &t12_name_s,
+                state: "尾盘跳水-建议处理",
+            };
             let text = render_close_call(&BannerCtx::default(), &hhmm, Some(&holding), None);
             let banner_text = format!("[v12-E2E-T12] {}", text);
-            let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::CloseCall).await;
-            if ok { success_count += 1; } else { fail_msgs.push("T-12".to_string()); }
-            eprintln!("[v12-E2E] T-12 推送 {} (real: {})", if ok { "OK" } else { "FAIL" }, t12_name);
+            let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::CloseCall)
+                .await;
+            if ok {
+                success_count += 1;
+            } else {
+                fail_msgs.push("T-12".to_string());
+            }
+            eprintln!(
+                "[v12-E2E] T-12 推送 {} (real: {})",
+                if ok { "OK" } else { "FAIL" },
+                t12_name
+            );
         }
 
         // ===== R-01 持仓明日计划 (真实持仓) =====
         {
             let mut items = Vec::new();
             for p in positions.iter().take(3) {
-                let pnl = if p.cost_price > 0.0 { ((p.cost_price * 1.05 / p.cost_price - 1.0) * 100.0) } else { 0.0 };
+                let pnl = if p.cost_price > 0.0 {
+                    ((p.cost_price * 1.05 / p.cost_price - 1.0) * 100.0)
+                } else {
+                    0.0
+                };
                 items.push(HoldingDailyPlan {
-                    name: &p.name, code: &p.code,
-                    price: p.cost_price * 1.05, cost: p.cost_price, pnl_pct: pnl,
+                    name: &p.name,
+                    code: &p.code,
+                    price: p.cost_price * 1.05,
+                    cost: p.cost_price,
+                    pnl_pct: pnl,
                     high_gap_x: 2.0,
-                    plan_high: "减仓1/3", plan_flat: "持有观望",
+                    plan_high: "减仓1/3",
+                    plan_flat: "持有观望",
                     stop: p.cost_price * 0.92,
-                    t0: if pnl > 5.0 { "适合观察" } else { "不适合(主升核心)" },
+                    t0: if pnl > 5.0 {
+                        "适合观察"
+                    } else {
+                        "不适合(主升核心)"
+                    },
                 });
             }
             if items.is_empty() {
                 items.push(HoldingDailyPlan {
-                    name: "示例持仓", code: "000001",
-                    price: 12.30, cost: 11.80, pnl_pct: 4.2,
-                    high_gap_x: 2.0, plan_high: "减仓1/3", plan_flat: "持有", stop: 11.95,
+                    name: "示例持仓",
+                    code: "000001",
+                    price: 12.30,
+                    cost: 11.80,
+                    pnl_pct: 4.2,
+                    high_gap_x: 2.0,
+                    plan_high: "减仓1/3",
+                    plan_flat: "持有",
+                    stop: 11.95,
                     t0: "适合观察",
                 });
             }
             let text = render_daily_report(&today_str, &items);
             let banner_text = format!("[v12-E2E-R01] {}", text);
-            let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::DailyReport).await;
-            if ok { success_count += 1; } else { fail_msgs.push("R-01".to_string()); }
-            log::info!("[v12-E2E] R-01 推送 {} ({} 只持仓)", if ok { "OK" } else { "FAIL" }, items.len());
+            let ok =
+                crate::notify::push_governor(&banner_text, crate::notify::PushKind::DailyReport)
+                    .await;
+            if ok {
+                success_count += 1;
+            } else {
+                fail_msgs.push("R-01".to_string());
+            }
+            log::info!(
+                "[v12-E2E] R-01 推送 {} ({} 只持仓)",
+                if ok { "OK" } else { "FAIL" },
+                items.len()
+            );
         }
 
         // ===== R-02 盘面走向 (用 ledger + market_stage_confidence 真装配) =====
         {
             let mut ev = stock_analysis::market_analyzer::market_stage_confidence::MarketStageEvidence::default();
-            ev.technical = Some(stock_analysis::market_analyzer::market_stage_confidence::TechnicalMetrics { sh_chg: 0.5, chinext_chg: 1.2, star_chg: 1.5 });
-            ev.capital = Some(stock_analysis::market_analyzer::market_stage_confidence::CapitalMetrics { main_flow_yi: 120.0, amount_yi: market_value, amount_delta_pct: 8.0 });
-            ev.sentiment = Some(stock_analysis::market_analyzer::market_stage_confidence::SentimentMetrics { limit_up_n: 35, limit_down_n: 3, broken_pct: 15.0, consecutive_h: 5 });
+            ev.technical = Some(
+                stock_analysis::market_analyzer::market_stage_confidence::TechnicalMetrics {
+                    sh_chg: 0.5,
+                    chinext_chg: 1.2,
+                    star_chg: 1.5,
+                },
+            );
+            ev.capital = Some(
+                stock_analysis::market_analyzer::market_stage_confidence::CapitalMetrics {
+                    main_flow_yi: 120.0,
+                    amount_yi: market_value,
+                    amount_delta_pct: 8.0,
+                },
+            );
+            ev.sentiment = Some(
+                stock_analysis::market_analyzer::market_stage_confidence::SentimentMetrics {
+                    limit_up_n: 35,
+                    limit_down_n: 3,
+                    broken_pct: 15.0,
+                    consecutive_h: 5,
+                },
+            );
             let conf = stock_analysis::market_analyzer::market_stage_confidence::evaluate(&ev);
             let r = MarketReview {
-                sh_chg: 0.5, chinext_chg: 1.2, star_chg: 1.5,
-                limit_up_n: 35, limit_down_n: 3, broken_pct: 15.0, consecutive_h: 5,
-                amount_yi: market_value, amount_delta_pct: 8.0, amount_dir: "放量",
-                main_flow_yi: 120.0, money_effect: "中等",
-                heat_stage: conf.heat_stage.as_str(), heat_conf_pct: conf.conf_pct,
-                low_conf: false, low_conf_tier: None,
-                account_mode: AccountMode::Normal, max_pos: 7,
+                sh_chg: 0.5,
+                chinext_chg: 1.2,
+                star_chg: 1.5,
+                limit_up_n: 35,
+                limit_down_n: 3,
+                broken_pct: 15.0,
+                consecutive_h: 5,
+                amount_yi: market_value,
+                amount_delta_pct: 8.0,
+                amount_dir: "放量",
+                main_flow_yi: 120.0,
+                money_effect: "中等",
+                heat_stage: conf.heat_stage.as_str(),
+                heat_conf_pct: conf.conf_pct,
+                low_conf: false,
+                low_conf_tier: None,
+                account_mode: AccountMode::Normal,
+                max_pos: 7,
             };
             let text = render_review_market(&today_str, &r);
             let banner_text = format!("[v12-E2E-R02] {}", text);
-            let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::ReviewMarket).await;
-            if ok { success_count += 1; } else { fail_msgs.push("R-02".to_string()); }
+            let ok =
+                crate::notify::push_governor(&banner_text, crate::notify::PushKind::ReviewMarket)
+                    .await;
+            if ok {
+                success_count += 1;
+            } else {
+                fail_msgs.push("R-02".to_string());
+            }
             log::info!("[v12-E2E] R-02 推送 {}", if ok { "OK" } else { "FAIL" });
         }
 
@@ -3460,10 +4327,29 @@ mod tests {
         {
             use stock_analysis::market_analyzer::limit_chain_review::*;
             let stocks = vec![
-                StockLimitStats { code: "688001".to_string(), name: "龙头A".to_string(), chain: "AI算力".to_string(), board_level: 4, is_limit_up_today: true, is_first_board: false, consecutive_days: 4 },
-                StockLimitStats { code: "688002".to_string(), name: "次龙".to_string(), chain: "AI算力".to_string(), board_level: 2, is_limit_up_today: true, is_first_board: false, consecutive_days: 2 },
+                StockLimitStats {
+                    code: "688001".to_string(),
+                    name: "龙头A".to_string(),
+                    chain: "AI算力".to_string(),
+                    board_level: 4,
+                    is_limit_up_today: true,
+                    is_first_board: false,
+                    consecutive_days: 4,
+                },
+                StockLimitStats {
+                    code: "688002".to_string(),
+                    name: "次龙".to_string(),
+                    chain: "AI算力".to_string(),
+                    board_level: 2,
+                    is_limit_up_today: true,
+                    is_first_board: false,
+                    consecutive_days: 2,
+                },
             ];
-            let aggs = aggregate(&LimitChainInput { stocks, source_complete: true });
+            let aggs = aggregate(&LimitChainInput {
+                stocks,
+                source_complete: true,
+            });
             // 拼接为字符串 (避免 Box::leak 复杂度)
             let mut body = String::from("🔥 涨停产业链（");
             body.push_str(&today_str);
@@ -3475,8 +4361,14 @@ mod tests {
             }
             body.push_str("⚠️ 退潮链: 光伏（涨停12→3家）");
             let banner_text = format!("[v12-E2E-R03] {}", body);
-            let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::IndustryChain).await;
-            if ok { success_count += 1; } else { fail_msgs.push("R-03".to_string()); }
+            let ok =
+                crate::notify::push_governor(&banner_text, crate::notify::PushKind::IndustryChain)
+                    .await;
+            if ok {
+                success_count += 1;
+            } else {
+                fail_msgs.push("R-03".to_string());
+            }
             log::info!("[v12-E2E] R-03 推送 {}", if ok { "OK" } else { "FAIL" });
         }
 
@@ -3489,77 +4381,139 @@ mod tests {
                 "游资席位", 45.0_f64,
                 "是-AI算力", "高开震荡"
             );
-            let banner_text = format!("[v12-E2E-R04] 🐉 龙虎榜净买前五（{} 21:00）\n{}", today_str, s);
-            let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::ReviewLhb).await;
-            if ok { success_count += 1; } else { fail_msgs.push("R-04".to_string()); }
+            let banner_text = format!(
+                "[v12-E2E-R04] 🐉 龙虎榜净买前五（{} 21:00）\n{}",
+                today_str, s
+            );
+            let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::ReviewLhb)
+                .await;
+            if ok {
+                success_count += 1;
+            } else {
+                fail_msgs.push("R-04".to_string());
+            }
             log::info!("[v12-E2E] R-04 推送 {}", if ok { "OK" } else { "FAIL" });
         }
 
         // ===== R-05 信号复盘 (真实 trades) =====
         {
-            let holding_exec = trades.iter().filter(|t| matches!(t.direction, stock_analysis::portfolio::TradeDirection::Sell)).count() as u32;
+            let holding_exec = trades
+                .iter()
+                .filter(|t| matches!(t.direction, stock_analysis::portfolio::TradeDirection::Sell))
+                .count() as u32;
             let r = SignalReview {
-                holding_n: positions.len() as u32, holding_exec, holding_eff: holding_exec,
-                t0_n: 0, t0_eff: 0,
-                cand_trigger: 0, cand_filled: 0, cand_notfilled: 0, cand_limitup: 0, cand_notreach: 0,
-                paper_pnl_pct: today_pnl_pct, paper_total_pct: 0.0, paper_n: trades.len() as u32,
-                news_push_n: 0, news_d1_eff: 0,
+                holding_n: positions.len() as u32,
+                holding_exec,
+                holding_eff: holding_exec,
+                t0_n: 0,
+                t0_eff: 0,
+                cand_trigger: 0,
+                cand_filled: 0,
+                cand_notfilled: 0,
+                cand_limitup: 0,
+                cand_notreach: 0,
+                paper_pnl_pct: today_pnl_pct,
+                paper_total_pct: 0.0,
+                paper_n: trades.len() as u32,
+                news_push_n: 0,
+                news_d1_eff: 0,
             };
             let text = render_review_signal(&today_str, &r);
             let banner_text = format!("[v12-E2E-R05] {}", text);
-            let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::ReviewSignal).await;
-            if ok { success_count += 1; } else { fail_msgs.push("R-05".to_string()); }
+            let ok =
+                crate::notify::push_governor(&banner_text, crate::notify::PushKind::ReviewSignal)
+                    .await;
+            if ok {
+                success_count += 1;
+            } else {
+                fail_msgs.push("R-05".to_string());
+            }
             log::info!("[v12-E2E] R-05 推送 {}", if ok { "OK" } else { "FAIL" });
         }
 
         // ===== R-06 失败归因 (performance_feedback 真装配) =====
         {
             let entries: Vec<FailureEntry<'_>> = vec![FailureEntry {
-                name: "测试标的", code: "688001",
-                signal_level: "⚡", virtual_reason: "A档",
-                result_desc: "未成交", pnl_pct: 0.0,
+                name: "测试标的",
+                code: "688001",
+                signal_level: "⚡",
+                virtual_reason: "A档",
+                result_desc: "未成交",
+                pnl_pct: 0.0,
                 failure_reason: "涨停不可买",
                 suggestion: "调高触发阈值",
             }];
             let dist = FailureDistribution {
-                buy_late: 2, chain_fade: 1, not_fillable: 3, human_not_exec: 1,
+                buy_late: 2,
+                chain_fade: 1,
+                not_fillable: 3,
+                human_not_exec: 1,
             };
             let text = render_review_failure(&today_str, &entries, &dist);
             let banner_text = format!("[v12-E2E-R06] {}", text);
-            let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::ReviewFailure).await;
-            if ok { success_count += 1; } else { fail_msgs.push("R-06".to_string()); }
+            let ok =
+                crate::notify::push_governor(&banner_text, crate::notify::PushKind::ReviewFailure)
+                    .await;
+            if ok {
+                success_count += 1;
+            } else {
+                fail_msgs.push("R-06".to_string());
+            }
             log::info!("[v12-E2E] R-06 推送 {}", if ok { "OK" } else { "FAIL" });
         }
 
         // ===== R-07 明日观察池 =====
         {
             let items: Vec<WatchItem<'_>> = vec![WatchItem {
-                name: "AI算力候选", code: "688001", topic: "AI算力",
+                name: "AI算力候选",
+                code: "688001",
+                topic: "AI算力",
                 source: "A档未触发",
                 trigger: "突破50.5",
-                lo: 49.5, hi: 50.3, stop: 48.5,
+                lo: 49.5,
+                hi: 50.3,
+                stop: 48.5,
                 reason: "板块共振",
             }];
             let text = render_tomorrow_watch(&today_str, &items);
             let banner_text = format!("[v12-E2E-R07] {}", text);
-            let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::TomorrowWatch).await;
-            if ok { success_count += 1; } else { fail_msgs.push("R-07".to_string()); }
+            let ok =
+                crate::notify::push_governor(&banner_text, crate::notify::PushKind::TomorrowWatch)
+                    .await;
+            if ok {
+                success_count += 1;
+            } else {
+                fail_msgs.push("R-07".to_string());
+            }
             log::info!("[v12-E2E] R-07 推送 {}", if ok { "OK" } else { "FAIL" });
         }
 
         // ===== R-08 事件日历 (真实持仓事件) =====
         {
-            let mut events: Vec<HoldingEventItem> = positions.iter().take(2).map(|p| HoldingEventItem {
-                name: p.name.as_str(),
-                kind: "解禁 3.2亿",
-            }).collect();
+            let mut events: Vec<HoldingEventItem> = positions
+                .iter()
+                .take(2)
+                .map(|p| HoldingEventItem {
+                    name: p.name.as_str(),
+                    kind: "解禁 3.2亿",
+                })
+                .collect();
             if events.is_empty() {
-                events.push(HoldingEventItem { name: "示例持仓", kind: "财报预告" });
+                events.push(HoldingEventItem {
+                    name: "示例持仓",
+                    kind: "财报预告",
+                });
             }
             let text = render_event_calendar(&today_str, &events, "央行MLF到期", "+0.8%", "7.18");
             let banner_text = format!("[v12-E2E-R08] {}", text);
-            let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::EventCalendar).await;
-            if ok { success_count += 1; } else { fail_msgs.push("R-08".to_string()); }
+            let ok =
+                crate::notify::push_governor(&banner_text, crate::notify::PushKind::EventCalendar)
+                    .await;
+            if ok {
+                success_count += 1;
+            } else {
+                fail_msgs.push("R-08".to_string());
+            }
             log::info!("[v12-E2E] R-08 推送 {}", if ok { "OK" } else { "FAIL" });
         }
 
@@ -3570,6 +4524,10 @@ mod tests {
             eprintln!("[v12-E2E] 失败: {:?}", fail_msgs);
             panic!("[v12-E2E] 部分模板推送失败: {:?}", fail_msgs);
         }
-        assert!(success_count >= 15, "至少 15 个模板应推送成功, 实得 {}", success_count);
+        assert!(
+            success_count >= 15,
+            "至少 15 个模板应推送成功, 实得 {}",
+            success_count
+        );
     }
 }
