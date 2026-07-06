@@ -29,10 +29,12 @@ use log::{info, warn};
 /// 此处实现 P0 阶段简化版 veto: 检查 BR-005 (≤5/日), BR-006 (0% 关停),
 /// BR-008 (priority 加权)。实际 veto 应在 risk/veto_chain.rs 调, 这里只是
 /// 保证结构上 save_prediction 之前有 veto 占位。
-pub fn veto_check_auction_anomaly(r: &AuctionResult) -> bool {
+pub fn veto_check_auction_anomaly(_r: &AuctionResult) -> bool {
     // P0 阶段: dry-run, veto 永远通过
     // P1 阶段: 接入真实 veto_chain, 检查 BR-005/006/008 + 新规则
-    let _ = r; // 避免 unused warning
+    //
+    // v17.5 (P3 fix): dry-run stub 显式 warn (生产可识别)
+    warn!("[AUCTION] veto_check_auction_anomaly STUB 模式 (P0 dry-run), 实际 veto 未触发 (P1 接入真实 veto_chain)");
     true
 }
 
