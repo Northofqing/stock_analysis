@@ -17,7 +17,7 @@ use super::providers::{
     BochaSearchProvider, ClsProvider, CninfoProvider, EastmoneyNewsProvider, EmAnnouncementProvider,
     EmIndustryNewsProvider, Jin10CalendarEvent, Jin10Provider, KcbDailyProvider,
     SerpAPISearchProvider, SinaFlashProvider, SseSzseProvider, TavilySearchProvider,
-    WallStreetCnProvider,
+    WallStreetCnProvider, XueqiuProvider,
 };
 use super::types::{SearchProvider, SearchResponse, SearchResult};
 
@@ -41,6 +41,8 @@ pub struct SearchService {
     jin10: Jin10Provider,
     /// 新浪财经全球快讯（免费，4 lid 并发: 国际/国内/A股/港股）
     sina_flash: SinaFlashProvider,
+    /// 雪球 (xueqiu) 公共时间线 (v21: A股 + 全部 category, 用户/机构观点聚合)
+    xueqiu: XueqiuProvider,
     /// 东财全市场公告流（免费，A 股 5000+ 公司公告流）
     em_announcement: EmAnnouncementProvider,
     /// 东财行业新闻流（免费，10 个 BOM 行业关键词并发）
@@ -157,6 +159,7 @@ impl SearchService {
             cls: ClsProvider::new(),
             jin10: Jin10Provider::new(),
             sina_flash: SinaFlashProvider::new(),
+            xueqiu: XueqiuProvider::new(),
             em_announcement: EmAnnouncementProvider::new(),
             em_industry_news: EmIndustryNewsProvider::new(),
             recent_topic_signatures: Mutex::new(VecDeque::with_capacity(

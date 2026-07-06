@@ -15,6 +15,7 @@ pub mod sina_flash;
 pub mod sse_szse;
 pub mod tavily;
 pub mod wallstreetcn;
+pub mod xueqiu;
 
 pub use bocha::BochaSearchProvider;
 pub use cls::ClsProvider;
@@ -29,3 +30,4 @@ pub use sina_flash::SinaFlashProvider;
 pub use sse_szse::SseSzseProvider;
 pub use tavily::TavilySearchProvider;
 pub use wallstreetcn::WallStreetCnProvider;
+pub use xueqiu::XueqiuProvider;
