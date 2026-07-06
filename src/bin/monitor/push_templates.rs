@@ -1671,17 +1671,84 @@ pub fn build_news_to_idea_from_snapshot<'a>(s: &'a NewsToIdeaSnapshot) -> NewsTo
     }
 }
 
-/// v15.5: 占位 — 真实 news_monitor + 候选台待 v16+
+/// v16.4: 真实数据集成 — 从候选台取 top 1 candidate
+/// 联接 opportunity::candidate_panel::merge_candidates
+/// 注: merge_candidates 需要上游传入 (source, code, name) Vec, 此处 v16.4 简化:
+///     复用 chain_daily top 1 cluster → 构造 mock (source=ChainDaily, code, name)
+pub fn load_news_to_idea_snapshot_real(hhmm: &str) -> NewsToIdeaSnapshot {
+    use stock_analysis::opportunity::candidate_panel::{merge_candidates, CandidateSource};
+    use stock_analysis::database::DatabaseManager;
+    let clusters = DatabaseManager::get().get_latest_chain_clusters();
+    if clusters.is_empty() {
+        return NewsToIdeaSnapshot::default();
+    }
+    // 构造 merge_candidates 输入: (CandidateSource, code, name) 三元组
+    let mut items: Vec<(CandidateSource, String, String)> = clusters
+        .iter()
+        .take(5)
+        .map(|c| {
+            let code = c
+                .stocks
+                .trim_matches(|ch| ch == '[' || ch == ']')
+                .split(',')
+                .next()
+                .map(|s| s.trim_matches('"').trim().to_string())
+                .unwrap_or_default();
+            (CandidateSource::IndustryChain, code, c.concept.clone())
+        })
+        .collect();
+    items.retain(|(_, c, _)| !c.is_empty());
+
+    let candidates = merge_candidates(items);
+    if candidates.is_empty() {
+        return NewsToIdeaSnapshot::default();
+    }
+    // top 1 candidate (按 source_count 排序已由 merge_candidates 完成)
+    let top = &candidates[0];
+    let reasons: Vec<String> = top
+        .evidence
+        .iter()
+        .take(3)
+        .cloned()
+        .collect();
+    // stage 简化: source_count >= 3 → Starting, >= 2 → Fermenting, else Diverging
+    let stage = if top.source_count() >= 3 {
+        NewsStage::Starting
+    } else if top.source_count() >= 2 {
+        NewsStage::Fermenting
+    } else {
+        NewsStage::Diverging
+    };
+    // action 简化: change_pct > 5% → DoNotChase (不追高), > 0% → BuyDip, else Observe
+    let action = if top.change_pct > 5.0 {
+        Some(NewsAction::DoNotChase)
+    } else if top.change_pct > 0.0 {
+        Some(NewsAction::BuyDip)
+    } else {
+        Some(NewsAction::Observe)
+    };
+    NewsToIdeaSnapshot {
+        hhmm: hhmm.to_string(),
+        headline: format!("{} ({}) 多源验证 ({} 源)", top.name, top.code, top.source_count()),
+        theme: clusters[0].concept.clone(),
+        stage,
+        name: top.name.clone(),
+        code: top.code.clone(),
+        reasons,
+        action,
+    }
+}
+
+/// v15.5 兼容: 同步占位
 pub fn load_news_to_idea_snapshot(_hhmm: &str) -> NewsToIdeaSnapshot {
-    log::info!("[D-01] news_monitor + 候选台待 v16+, 使用默认空快照");
     NewsToIdeaSnapshot::default()
 }
 
-/// v15.5: 业务层入口 — 新闻驱动个股触发
+/// v15.5 业务层入口 (v16.4 改用真实候选台数据)
 pub async fn dispatch_news_to_idea_daily(hhmm: &str, banner: &BannerCtx) -> bool {
-    let snapshot = load_news_to_idea_snapshot(hhmm);
+    let snapshot = load_news_to_idea_snapshot_real(hhmm);
     if snapshot.headline.is_empty() {
-        log::info!("[D-01] news_to_idea_snapshot 空 (v16+ 待集成), 跳过推送");
+        log::info!("[D-01] news_to_idea_snapshot 空 (候选台无候选), 跳过推送");
         return false;
     }
     let params = build_news_to_idea_from_snapshot(&snapshot);
