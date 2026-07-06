@@ -176,7 +176,7 @@ pub fn render_account_mode(
         out.push_str(&format!("\n· {}", r));
     }
     out.push_str(&format!(
-        "\n生效限制: {}\n解除条件: {}",
+        "\n生效限制: {}\n解除条件: {}\n辅助建议, 非下单指令",
         forbidden_actions, recovery_condition,
     ));
     out
@@ -203,7 +203,9 @@ pub fn render_data_mode(
         out.push_str(&format!("\n· {}", r));
     }
     if let Some(eta) = eta.filter(|s| !s.is_empty()) {
-        out.push_str(&format!("\n恢复预计: {}", eta));
+        out.push_str(&format!("\n恢复预计: {}\n辅助建议, 非下单指令", eta));
+    } else {
+        out.push_str("\n辅助建议, 非下单指令");
     }
     out
 }
@@ -630,7 +632,7 @@ pub fn render_auction_volume(
     watch_status: &str,
 ) -> String {
     let mut out = format!(
-        "{}\n🌅 竞价异动 Top{}（{}）",
+        "{}\n🌅 竞价热点量能 Top{}（{}）",
         banner.render(),
         items.len(),
         hhmm
@@ -642,7 +644,7 @@ pub fn render_auction_volume(
         ));
     }
     out.push_str(&format!(
-        "\n情绪判读: {}, 观察池今日{}",
+        "\n情绪判读: {}, 观察池今日{}\n辅助建议, 非下单指令",
         sentiment, watch_status,
     ));
     out
@@ -737,7 +739,7 @@ pub struct TurnoverEntry {
 ///
 /// AGENTS.md §2.1 红线: 不允许用换手率编造"龙虎榜"假数据.
 pub fn render_turnover_top(hhmm: &str, entries: &[TurnoverEntry]) -> String {
-    let mut out = format!("🔄 盘中换手率 Top10 ({} 盘中)\n", hhmm);
+    let mut out = format!("🔄 盘中换手率 Top10 ({})\n", hhmm);
     if entries.is_empty() {
         out.push_str("⚠️ 数据源不稳定, 跳过\n");
         out.push_str("数据源: 实时行情 (非龙虎榜, 龙虎榜盘后 21:00 才更新)\n");
@@ -822,7 +824,7 @@ pub fn render_review_market(date: &str, m: &MarketReview<'_>) -> String {
         ));
     }
     out.push_str(&format!(
-        "\n→ 明日账户建议: {} 仓位上限{}成",
+        "\n→ 明日账户建议: {} 仓位上限{}成\n辅助建议, 非下单指令",
         m.account_mode.label(),
         m.max_pos,
     ));
@@ -883,6 +885,12 @@ pub struct LhbEntry<'a> {
 
 /// v12 §14.2 R-04 ReviewLhb 模板渲染 — 字段顺序严格对齐 docs/architecture/v12-push-templates.md
 pub fn render_review_lhb(date: &str, entries: &[LhbEntry<'_>]) -> String {
+    if entries.is_empty() {
+        return format!(
+            "🐉 龙虎榜净买前五（{} 21:00）\n盘中无数据 (盘后 21:00 才更新), 请参考 T-13 盘中换手率 Top10\n仅结构化事实, 不含席位风格推断",
+            date
+        );
+    }
     let mut out = format!("🐉 龙虎榜净买前五（{} 21:00）", date);
     for (i, e) in entries.iter().enumerate() {
         out.push_str(&format!(
@@ -2383,10 +2391,11 @@ mod tests {
             },
         ];
         let s = render_auction_volume(&banner_normal(), "09:25", &items, "强承接", "可操作");
-        assert!(s.contains("🌅 竞价异动 Top2（09:25）"));
+        assert!(s.contains("🌅 竞价热点量能 Top2（09:25）"));  // v13 标题统一
         assert!(s.contains("A(000001) 高开+5.2% 量比8.5 [昨日涨停]"));
         assert!(s.contains("B(600000) 高开+2.1% 量比3.2 [观察池]"));
         assert!(s.contains("情绪判读: 强承接, 观察池今日可操作"));
+        assert!(s.contains("辅助建议, 非下单指令"));
     }
 
     // ---- T-12 尾盘决策 ----
