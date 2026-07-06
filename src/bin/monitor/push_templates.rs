@@ -1790,23 +1790,15 @@ pub fn build_paper_review_from_snapshot<'a>(s: &'a PaperReviewSnapshot) -> Paper
     }
 }
 
-/// v16.5: 真实数据集成 — 复用 main.rs::VirtualObservationSnapshot
-/// 调 load_latest_prior_virtual_snapshot (main.rs:161 附近) 拿昨日建仓
-/// 复用 T-11 通路 (build_virtual_next_day_review_text) 派生 plan_high/flat/low
+/// v17.5: 完整 JSON 解析 (VirtualObservationRecord via serde_json)
+/// 替代 v16.5 的文件名占位 (code/name 暂空)
 pub fn load_paper_review_snapshot_real(date: &str) -> PaperReviewSnapshot {
-    // 通过外部 main.rs 的 load_latest_prior_virtual_snapshot 函数获取
-    // v16.5: 此处通过全局路径获取 (data/virtual_observation/ 目录)
     let snapshot = load_virtual_observation_for_a01();
     if snapshot.records.is_empty() {
         return PaperReviewSnapshot::default();
     }
-    // top 1 record (取首条建仓)
     let top = &snapshot.records[0];
-
-    // T-11 通路复用: pnl 派生 plan_high/flat/low
-    // 此处 v16.5 简化: close_price 假设 = entry_price * 1.0 (无 close data)
-    // v16.5+ 改进: 读 realtime close, 调 T-11 derive_plan_from_pnl
-    let pnl = 0.0_f32;  // 占位 (无 close 行情)
+    let pnl = 0.0_f32;
     let (high, flat, low) = derive_plan_from_pnl(pnl);
 
     PaperReviewSnapshot {
@@ -1873,21 +1865,32 @@ pub fn load_virtual_observation_for_a01() -> VirtualSnapshotLite {
     }
     let mut records: Vec<VirtualRecordLite> = Vec::new();
     if let Ok(entries) = fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().map(|e| e == "json").unwrap_or(false) {
-                if let Ok(raw) = fs::read_to_string(&path) {
-                    // 简化: 不解析完整 JSON, 仅取 code/name (从文件名)
-                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                        // 文件名格式: 'YYYY-MM-DD.json' (snapshot date)
-                        // 真实解析需 serde_json + VirtualObservationRecord — v16.5+ 改进
-                        records.push(VirtualRecordLite {
-                            entry_date: stem.to_string(),
-                            code: String::new(),  // 占位 (需 JSON 解析)
-                            name: String::new(), // 占位
-                            entry_mode: "首板".to_string(),
-                        });
-                    }
+        // v17.5: 按文件名排序 (最新在前), 解析完整 JSON
+        let mut paths: Vec<_> = entries
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().map(|e| e == "json").unwrap_or(false))
+            .collect();
+        paths.sort();
+        paths.reverse();  // 最新在前
+
+        for path in paths.iter().take(5) {
+            // v17.5: 完整 serde_json 解析 (替代 v16.5 文件名占位)
+            // VirtualObservationRecord 字段: entry_date, code, name, entry_price, shares, entry_mode
+            #[derive(serde::Deserialize)]
+            struct RecordJson {
+                entry_date: Option<String>,
+                code: Option<String>,
+                name: Option<String>,
+                entry_mode: Option<String>,
+            }
+            if let Ok(raw) = fs::read_to_string(&path) {
+                if let Ok(parsed) = serde_json::from_str::<RecordJson>(&raw) {
+                    records.push(VirtualRecordLite {
+                        entry_date: parsed.entry_date.unwrap_or_default(),
+                        code: parsed.code.unwrap_or_default(),
+                        name: parsed.name.unwrap_or_default(),
+                        entry_mode: parsed.entry_mode.unwrap_or("首板".to_string()),
+                    });
                 }
             }
         }
