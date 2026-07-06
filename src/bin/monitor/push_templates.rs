@@ -679,11 +679,11 @@ pub struct HoldingDailyPlan<'a> {
 // §14.1 T-13 盘中换手率 Top10 (v19.15 新增, 跟 R-04 龙虎榜分离)
 // ============================================================================
 
-/// 换手率 Top10 单条
+/// 换手率 Top10 单条 (v19.16 改 owned, 不带生命周期, 便于 spawn_blocking 跨边界)
 #[derive(Debug, Clone)]
-pub struct TurnoverEntry<'a> {
-    pub name: &'a str,
-    pub code: &'a str,
+pub struct TurnoverEntry {
+    pub name: String,
+    pub code: String,
     pub price: f64,
     pub change_pct: f64,
     pub turnover_pct: f64,        // 换手率 (%)
@@ -697,7 +697,7 @@ pub struct TurnoverEntry<'a> {
 /// - R-04: 盘后龙虎榜席位 (东方财富 API, 盘后 21:00 才更新)
 ///
 /// AGENTS.md §2.1 红线: 不允许用换手率编造"龙虎榜"假数据.
-pub fn render_turnover_top(hhmm: &str, entries: &[TurnoverEntry<'_>]) -> String {
+pub fn render_turnover_top(hhmm: &str, entries: &[TurnoverEntry]) -> String {
     let mut out = format!("🔄 盘中换手率 Top10 ({} 盘中)\n", hhmm);
     if entries.is_empty() {
         out.push_str("⚠️ 数据源不稳定, 跳过\n");

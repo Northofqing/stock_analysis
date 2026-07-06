@@ -970,64 +970,9 @@ async fn run_test_scan() {
     }
     }
 
-    // T-07 候选触发演示 (测试阶段: 全部推送)
-    let t07_banner = pt::BannerCtx::default();
-    let t07_params = pt::CandidateTriggeredParams {
-        name: "中钨高新",
-        code: "000657",
-        hhmm: &chrono::Local::now().format("%H:%M").to_string(),
-        grade: pt::CandidateGrade::A,
-        topic: "钨业-先进制造",
-        price: 18.50,
-        trigger_desc: "突破前高 + 量比 4.2",
-        lo: 18.20,
-        hi: 18.80,
-        stop: 17.85,
-        max_pos_pct: 20,
-        news_quality: pt::EvidenceQuality::Strong,
-        news_note: "工信部支持钨深加工, 板块共振+12%",
-        vol_quality: pt::EvidenceQuality::Strong,
-        vol_ratio: 4.2,
-        kline_quality: pt::EvidenceQuality::Mid,
-        kline_note: "突破 60 日均线, MACD 金叉",
-        book_quality: pt::EvidenceQuality::Missing,
-        no_buy: &["板块转 Fade".to_string(), "大盘转跌".to_string()],
-    };
-    let _ = pt::push_candidate_triggered("000657", Some(&t07_banner), t07_params, Some(true)).await;
-    log::info!("[v19.14b] T-07 候选触发演示完成");
-
-    // T-10 虚拟盘成交回报演示
-    let t10_params = pt::PaperTradeParams {
-        hhmm: &chrono::Local::now().format("%H:%M").to_string(),
-        name: "三安光电",
-        code: "600703",
-        status: pt::PaperTradeStatus::Filled,
-        fill_price: Some(17.26),
-        qty: Some(400),
-        virtual_reason: Some("T0Positive (震荡市, 底仓做T)"),
-        not_fill_reason: None,
-        account_mode: pt::AccountMode::ReduceOnly,
-        data_mode: pt::DataMode::Full,
-    };
-    let t10_text = pt::render_paper_trade(t10_params);
-    log::info!("[v19.14b] T-10 虚拟盘成交:\n{}", t10_text);
-    notify::push_governor(&t10_text, notify::PushKind::PaperTrade).await;
-    log::info!("[v19.14b] T-10 虚拟盘成交演示完成");
-
-    // T-12 尾盘决策演示
-    let t12_banner = pt::BannerCtx::default();
-    let t12_holding = pt::CloseCallHolding {
-        name: "华电辽能", state: "尾盘跳水-建议处理",
-    };
-    let t12_gamble = pt::CloseCallGamble {
-        name: "中钨高新", code: "000657",
-        satisfied: true,
-        cond: "板块 Ferment + 主升核心, 尾盘买入博次日溢价",
-    };
-    let t12_text = pt::render_close_call(&t12_banner, "14:45", Some(&t12_holding), Some(&t12_gamble));
-    log::info!("[v19.14b] T-12 尾盘决策:\n{}", t12_text);
-    notify::push_governor(&t12_text, notify::PushKind::CloseCall).await;
-    log::info!("[v19.14b] T-12 尾盘决策演示完成");
+    // v19.16: 删 v19.14b 演示数据推送 (T-07/T-10/T-12 hardcode)
+// AGENTS.md §2.1: 生产路径禁止 mock 数据, --test 也算生产路径
+// 这些模板渲染函数保留 (push_templates.rs), 但 --test 路径不调, 等真数据通路接通
 
     // ===== 16.6 v12 盘后 R-01/R-02/R-08 真推 (复用 --review 块) =====
     let today_str_t = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -1137,29 +1082,9 @@ async fn run_test_scan() {
     }
 
     // v19.14b: R-06 失败归因演示 (--test 路径, 全部推送)
-    use stock_analysis::review::failure_attribution::{FailureItem, FailureReason, WeeklyDistribution};
-    let r06_items = vec![
-        FailureItem {
-            name: "德展健康".into(), code: "000813".into(),
-            signal_level: "B".into(),
-            reason: FailureReason::StopLossHit,
-            pnl_pct: -51.7,
-            suggestion: "停牌中跳过, 复牌后重新评估".into(),
-        },
-        FailureItem {
-            name: "达实智能".into(), code: "002421".into(),
-            signal_level: "A".into(),
-            reason: FailureReason::MacdBearish,
-            pnl_pct: -8.5,
-            suggestion: "等待右侧放量信号, 避免左侧抄底".into(),
-        },
-    ];
-    let mut r06_weekly = WeeklyDistribution::default();
-    r06_weekly.add(FailureReason::StopLossHit);
-    r06_weekly.add(FailureReason::MacdBearish);
-    let r06_text = stock_analysis::review::failure_attribution::render_r06(&r06_items, &r06_weekly);
-    log::info!("[v19.14b R-06]\n{}", r06_text);
-    notify::push_governor(&r06_text, notify::PushKind::ReviewFailure).await;
+    // v19.16: 删 R-06 演示数据推送 (德展健康/达实智能 reason/pnl/suggestion 是 hardcode)
+// AGENTS.md §2.1: 生产路径禁止 mock 数据, --test 也算生产路径
+// 渲染函数保留 (push_templates.rs), 真数据通路: 等 execution_tracking WHERE hit=0 累积
 
     // 17. v4 周度 SOP
     if stock_analysis::review::sop::is_friday() {
@@ -1174,40 +1099,41 @@ async fn run_test_scan() {
     // 原因: 用户反馈这 2 个模板在测试中无用, 只推送 R 系列 + T 演示
     log::info!("[测试] v19.15 全模板模式: T-01~T-12 + R-01~R-08 + T-13 换手率");
 
-    // v19.15b: T-13 盘中换手率 Top10 (跟 R-04 龙虎榜严格分离)
-    // AGENTS.md §2.1: 真数据, 不用换手率冒充龙虎榜
-    let turnover_text = tokio::task::spawn_blocking(|| {
+    // v19.16: T-13 盘中换手率 Top10 改造 — 真接东财 API fid=f8
+// AGENTS.md §2.1: 0 数据时不推 (之前 turnover_pct=0.0 是 mock 数据)
+// fetch_market_top_by_fid 是 sync reqwest, 必须 spawn_blocking 避免 async panic
+    let t13_entries: Vec<crate::push_templates::TurnoverEntry> = tokio::task::spawn_blocking(|| {
         use crate::push_templates::TurnoverEntry;
-        use stock_analysis::data_provider::DataFetcherManager;
-        let stock_list: Vec<String> = std::env::var("STOCK_LIST").unwrap_or_default()
-            .split(',').map(|s| s.trim().to_string()).filter(|s| s.len() == 6).collect();
-        let mut entries: Vec<TurnoverEntry> = Vec::new();
-        let fetcher = DataFetcherManager::new().ok();
-        for code in &stock_list {
-            if let Some(f) = fetcher.as_ref() {
-                if let Ok((klines, _)) = f.get_daily_data(code, 5) {
-                    if let Some(k) = klines.last() {
-                        // 换手率: 用 K 线 vol 字段 (近似, data_provider 没有 turnover_pct 直接字段)
-                        entries.push(TurnoverEntry {
-                            name: code, // 简化, 真实名需要额外拉取
-                            code: code,
-                            price: k.close,
-                            change_pct: k.pct_chg,
-                            turnover_pct: 0.0, // 待 stock_analysis::data_provider 接 turnover 字段
-                            main_flow_yi: 0.0,
-                        });
-                    }
-                }
-            }
-        }
-        crate::push_templates::render_turnover_top(
-            &chrono::Local::now().format("%H:%M").to_string(),
-            &entries,
-        )
+        use crate::market_data;
+        // 真接东财换手率榜 (fid=f8 换手率, 包含沪深京 3 市)
+        // fields 用 f2,f3,f8,f10,f12,f14,f62,f124 让 f8 (换手率) 解析到 volume_ratio 字段
+        let leaders = market_data::fetch_market_top_by_fid("f8", 30).unwrap_or_default();
+        // 立即把所有字段 clone 到 owned TurnoverEntry, 避免借用 leaders
+        let mut entries: Vec<TurnoverEntry> = leaders.iter()
+            .filter(|s| s.volume_ratio > 0.0)
+            .map(|s| TurnoverEntry {
+                name: s.name.clone(),
+                code: s.code.clone(),
+                price: s.price,
+                change_pct: s.change_pct,
+                turnover_pct: s.volume_ratio,
+                main_flow_yi: s.main_net_yi,
+            })
+            .collect();
+        // 按 turnover_pct 排序取前 10
+        entries.sort_by(|a, b| b.turnover_pct.partial_cmp(&a.turnover_pct).unwrap_or(std::cmp::Ordering::Equal));
+        entries.truncate(10);
+        entries
     }).await.unwrap_or_default();
-    if !turnover_text.is_empty() && turnover_text.len() > 50 {
-        log::info!("[v19.15b T-13] 盘中换手率 Top10");
-        notify::push_governor(&turnover_text, notify::PushKind::FundInflow).await;
+    if !t13_entries.is_empty() {
+        let text = crate::push_templates::render_turnover_top(
+            &chrono::Local::now().format("%H:%M").to_string(),
+            &t13_entries,
+        );
+        log::info!("[v19.16 T-13] 盘中换手率 Top10 ({} 只):\n{}", t13_entries.len(), text);
+        notify::push_governor(&text, notify::PushKind::FundInflow).await;
+    } else {
+        log::info!("[v19.16 T-13] 0 数据, 不推送 (东财 API 返空或字段为 0)");
     }
 
     // 3. P3 outcome (默认 true, --test 也跑)
