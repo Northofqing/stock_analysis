@@ -1344,6 +1344,62 @@ pub async fn dispatch_preopen_news_hot_daily() -> bool {
     push_preopen_news_hot("", params).await
 }
 
+// ============================================================================
+// v15.2: I-01 业务层集成 (sector_score 抽口)
+// ============================================================================
+
+/// v15.2: 板块快照 (3 大板块: 科技/电力/机器人)
+/// 注: 真实 sector_score 算法待 v16+ 集成 (本结构仅作数据载体)
+#[derive(Debug, Clone, Default)]
+pub struct SectorSnapshot {
+    pub hhmm: String,
+    pub tech_sub: String,
+    pub tech_score: Option<f32>,
+    pub power_sub: String,
+    pub power_score: Option<f32>,
+    pub robot_sub: String,
+    pub robot_score: Option<f32>,
+    pub main_attack: String,
+    pub rotation_state: RotationState,
+}
+
+/// v15.2: 从 SectorSnapshot 构造 IntradayMarketParams
+pub fn build_intraday_market_from_snapshot<'a>(s: &'a SectorSnapshot) -> IntradayMarketParams<'a> {
+    IntradayMarketParams {
+        hhmm: &s.hhmm,
+        tech_sub: if s.tech_sub.is_empty() { None } else { Some(&s.tech_sub) },
+        tech_score: s.tech_score,
+        power_sub: if s.power_sub.is_empty() { None } else { Some(&s.power_sub) },
+        power_score: s.power_score,
+        robot_sub: if s.robot_sub.is_empty() { None } else { Some(&s.robot_sub) },
+        robot_score: s.robot_score,
+        main_attack: if s.main_attack.is_empty() { None } else { Some(&s.main_attack) },
+        rotation_state: s.rotation_state.clone(),
+    }
+}
+
+/// v15.2: 占位 — 真实 sector_score 算法待 v16+
+/// 返回默认 SectorSnapshot (板块强度未知, 默认 None)
+pub fn load_sector_snapshot(_hhmm: &str) -> SectorSnapshot {
+    log::info!("[I-01] sector_score 算法待 v16+, 使用默认空快照");
+    SectorSnapshot {
+        hhmm: _hhmm.to_string(),
+        rotation_state: RotationState::Fading,  // 退潮兜底
+        ..Default::default()
+    }
+}
+
+/// v15.2: 业务层入口 — 10/11/13/14 盘中调用
+pub async fn dispatch_intraday_market_daily(hhmm: &str, banner: &BannerCtx) -> bool {
+    let snapshot = load_sector_snapshot(hhmm);
+    if snapshot.tech_sub.is_empty() && snapshot.power_sub.is_empty() && snapshot.robot_sub.is_empty() {
+        log::info!("[I-01] sector_snapshot 空 (v16+ 待集成), 跳过推送");
+        return false;
+    }
+    let params = build_intraday_market_from_snapshot(&snapshot);
+    push_intraday_market("", Some(banner), params).await
+}
+
 /// v13 §14.2 I-01 盘中轮动总览 (⚡交易建议类, 带 banner)
 pub async fn push_intraday_market(
     code: &str,
@@ -1735,7 +1791,9 @@ pub struct PreopenNewsHotParams<'a> {
 }
 
 /// v13 §14.2 I-01 盘中轮动 — 板块状态
+#[derive(Debug, Clone, Default, PartialEq)]
 pub enum RotationState {
+    #[default]
     Spreading, // 扩散
     Diverging, // 分化
     Fading,    // 退潮
@@ -3889,6 +3947,44 @@ mod tests {
         let clusters: Vec<ChainDailyRow> = vec![];
         let p = build_preopen_news_hot_from_db("09:05", &clusters);
         assert!(p.theme_1.is_none());
+    }
+
+    // ====== v15.2: I-01 业务层集成测试 (sector_score 抽口) ======
+    #[test]
+    fn v15_build_intraday_market_from_snapshot() {
+        let s = SectorSnapshot {
+            hhmm: "10:30".to_string(),
+            tech_sub: "AI算力".to_string(), tech_score: Some(85.5),
+            power_sub: "特高压".to_string(), power_score: Some(60.0),
+            robot_sub: "减速器".to_string(), robot_score: Some(72.3),
+            main_attack: "AI算力".to_string(),
+            rotation_state: RotationState::Spreading,
+        };
+        let p = build_intraday_market_from_snapshot(&s);
+        assert_eq!(p.hhmm, "10:30");
+        assert_eq!(p.tech_sub, Some("AI算力"));
+        assert_eq!(p.tech_score, Some(85.5));
+        assert_eq!(p.rotation_state, RotationState::Spreading);
+    }
+
+    #[test]
+    fn v15_sector_snapshot_empty_skips() {
+        let s = SectorSnapshot::default();
+        assert!(s.tech_sub.is_empty());
+        // 空 snapshot → dispatch 应返回 false
+        let p = build_intraday_market_from_snapshot(&s);
+        assert!(p.tech_sub.is_none());
+        assert!(p.tech_score.is_none());
+        assert!(p.main_attack.is_none());
+    }
+
+    #[test]
+    fn v15_load_sector_snapshot_default() {
+        // v16+ 待集成真实 sector_score 算法, 验证默认空 snapshot
+        let s = load_sector_snapshot("10:30");
+        assert_eq!(s.hhmm, "10:30");
+        assert!(s.tech_sub.is_empty());
+        assert_eq!(s.rotation_state, RotationState::Fading);
     }
 
     #[test]
