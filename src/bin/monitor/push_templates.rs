@@ -1378,25 +1378,31 @@ pub fn build_intraday_market_from_snapshot<'a>(s: &'a SectorSnapshot) -> Intrada
     }
 }
 
-/// v17.1: 板块关键词过滤 (tech/power/robot 按 name 关键词匹配)
-/// 替代 v16.1 的 top 3 简化映射
+/// v17.1+v13.5: 板块关键词过滤 (tech/power/robot 按 name 关键词匹配)
+/// v13.5 扩展: 半导体子分支/电力子分支/机器人子分支细分
 fn classify_sector_to_family(name: &str) -> Option<&'static str> {
     let n = name.to_lowercase();
-    // tech 关键词
+    // tech 关键词 (v13.5 扩展: 半导体子分支)
     if n.contains("ai") || n.contains("算力") || n.contains("芯片") || n.contains("半导体")
+        || n.contains("集成电路") || n.contains("封测") || n.contains("光刻")
         || n.contains("软件") || n.contains("互联网") || n.contains("电子")
+        || n.contains("云计算") || n.contains("大数据") || n.contains("5g")
     {
         return Some("tech");
     }
-    // power 关键词
+    // power 关键词 (v13.5 扩展: 电力子分支)
     if n.contains("电") || n.contains("电网") || n.contains("储能") || n.contains("光伏")
         || n.contains("新能源") || n.contains("电池") || n.contains("锂")
+        || n.contains("风电") || n.contains("核电") || n.contains("特高压")
+        || n.contains("充电桩") || n.contains("氢能")
     {
         return Some("power");
     }
-    // robot 关键词
+    // robot 关键词 (v13.5 扩展: 机器人子分支)
     if n.contains("机器") || n.contains("减速") || n.contains("伺服") || n.contains("机器视觉")
         || n.contains("自动化") || n.contains("智能")
+        || n.contains("传感器") || n.contains("控制器") || n.contains("工业母机")
+        || n.contains("人形") || n.contains("无人机")
     {
         return Some("robot");
     }
