@@ -1378,9 +1378,34 @@ pub fn build_intraday_market_from_snapshot<'a>(s: &'a SectorSnapshot) -> Intrada
     }
 }
 
-/// v16.1: 真实 sector_score 算法集成
+/// v17.1: 板块关键词过滤 (tech/power/robot 按 name 关键词匹配)
+/// 替代 v16.1 的 top 3 简化映射
+fn classify_sector_to_family(name: &str) -> Option<&'static str> {
+    let n = name.to_lowercase();
+    // tech 关键词
+    if n.contains("ai") || n.contains("算力") || n.contains("芯片") || n.contains("半导体")
+        || n.contains("软件") || n.contains("互联网") || n.contains("电子")
+    {
+        return Some("tech");
+    }
+    // power 关键词
+    if n.contains("电") || n.contains("电网") || n.contains("储能") || n.contains("光伏")
+        || n.contains("新能源") || n.contains("电池") || n.contains("锂")
+    {
+        return Some("power");
+    }
+    // robot 关键词
+    if n.contains("机器") || n.contains("减速") || n.contains("伺服") || n.contains("机器视觉")
+        || n.contains("自动化") || n.contains("智能")
+    {
+        return Some("robot");
+    }
+    None
+}
+
+/// v16.1+v17.1: 真实 sector_score 算法集成
 /// 联接 sector_monitor::fetch_board_ranking + sector_score::grade_sectors
-/// 简化: 取 top 3 graded sectors, 按 change_pct 映射 tech/power/robot 三大板块
+/// v17.1 改进: 按关键词分类 tech/power/robot
 pub fn load_sector_snapshot_real(hhmm: &str) -> SectorSnapshot {
     use stock_analysis::decision::sector_score::grade_sectors;
     use stock_analysis::market_analyzer::sector_monitor::fetch_board_ranking;
@@ -1399,16 +1424,41 @@ pub fn load_sector_snapshot_real(hhmm: &str) -> SectorSnapshot {
 
     let graded = grade_sectors(&boards);
 
-    // 取前 3 强板块 → 映射 tech/power/robot (按 score 排序)
-    let top: Vec<_> = graded.iter().take(3).collect();
+    // v17.1 改进: 按关键词分类 tech/power/robot
+    let mut tech: Option<&str> = None;
+    let mut tech_score: Option<f64> = None;
+    let mut power: Option<&str> = None;
+    let mut power_score: Option<f64> = None;
+    let mut robot: Option<&str> = None;
+    let mut robot_score: Option<f64> = None;
+    let mut main_attack = String::new();
+    let mut best_score = f64::MIN;
 
-    // 简化映射: 第 1 强 → tech, 第 2 强 → power, 第 3 强 → robot
-    // 真实映射需关键词过滤 (后续 v16.2 改进)
-    let tech = top.get(0).map(|s| (s.name.as_str(), s.change_pct));
-    let power = top.get(1).map(|s| (s.name.as_str(), s.change_pct));
-    let robot = top.get(2).map(|s| (s.name.as_str(), s.change_pct));
+    for s in &graded {
+        if let Some(family) = classify_sector_to_family(&s.name) {
+            if s.change_pct > best_score {
+                best_score = s.change_pct;
+                main_attack = s.name.clone();
+            }
+            match family {
+                "tech" if tech.is_none() => {
+                    tech = Some(&s.name);
+                    tech_score = Some(s.change_pct);
+                }
+                "power" if power.is_none() => {
+                    power = Some(&s.name);
+                    power_score = Some(s.change_pct);
+                }
+                "robot" if robot.is_none() => {
+                    robot = Some(&s.name);
+                    robot_score = Some(s.change_pct);
+                }
+                _ => {}  // 已填或无家族
+            }
+        }
+    }
 
-    // rotation_state: 强板块 score 全正 → Spreading, 半数正 → Diverging, 全负 → Fading
+    // rotation_state 派生 (与 v16.1 一致)
     let positive_count = graded.iter().filter(|s| s.change_pct > 0.0).count();
     let total = graded.len().max(1);
     let rotation_state = if positive_count * 3 >= total * 2 {
@@ -1421,13 +1471,13 @@ pub fn load_sector_snapshot_real(hhmm: &str) -> SectorSnapshot {
 
     SectorSnapshot {
         hhmm: hhmm.to_string(),
-        tech_sub: tech.map(|(n, _)| n.to_string()).unwrap_or_default(),
-        tech_score: tech.map(|(_, s)| s as f32),
-        power_sub: power.map(|(n, _)| n.to_string()).unwrap_or_default(),
-        power_score: power.map(|(_, s)| s as f32),
-        robot_sub: robot.map(|(n, _)| n.to_string()).unwrap_or_default(),
-        robot_score: robot.map(|(_, s)| s as f32),
-        main_attack: top.first().map(|s| s.name.clone()).unwrap_or_default(),
+        tech_sub: tech.unwrap_or("").to_string(),
+        tech_score: tech_score.map(|s| s as f32),
+        power_sub: power.unwrap_or("").to_string(),
+        power_score: power_score.map(|s| s as f32),
+        robot_sub: robot.unwrap_or("").to_string(),
+        robot_score: robot_score.map(|s| s as f32),
+        main_attack,
         rotation_state,
     }
 }
