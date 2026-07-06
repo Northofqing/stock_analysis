@@ -157,3 +157,18 @@ circuit_breaker_pct = -2.0   # 当日累计亏损 ≤ 此值 → Frozen (默认 
 consecutive_stop_loss_n = 3  # 连续止损笔数 ≥ 此值 → ReduceOnly (默认 3 笔)
 position_overload_cheng = 8  # 总仓位 > 此值 (成) → Frozen (默认 8 成)
 # 解除: 下一交易日盘前重置为 Normal (由 monitor_loop 09:25 前调 reset())
+
+# ── v13.1 新规 2026-07-06 生效 (沪深北《交易规则（2026 修订）》) ──
+# 缺省 const fallback: 0.10 / 0.10 / 0.65
+# 受控例外: AGENTS §8 (新规紧急, 24h 内补 PR #13)
+# 影响: 持仓 ST 票的止损/止盈阈值; 中小盘流动性评估
+[st_price_limit]
+st_daily_limit = 0.10      # 主板 ST/*ST 涨跌幅上限 (新规 5%→10%, 2026-07-06 生效)
+st_take_profit = 0.10      # ST 止盈阈值 (基于 10% 涨跌幅)
+st_stop_loss = -0.10       # ST 止损阈值 (基于 10% 涨跌幅)
+# 注: 原 5% 阈值自 2026-07-06 起作废, 所有 ST/*ST 持仓重算
+
+[gem_market_maker]
+liquidity_threshold = 0.65 # 创业板做市商流动性阈值 (原 0.50 + 0.15 校准)
+small_cap_lookback = 20    # 中小市值流动性回溯窗口 (日)
+# 注: 2026-07-06 创业板引入做市商制度生效, 中小盘流动性增强, 阈值上修 15%
