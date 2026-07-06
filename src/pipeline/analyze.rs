@@ -374,16 +374,20 @@ impl AnalysisPipeline {
                 if !outcome.is_empty() {
                     match veto_config.mode.as_str() {
                         "live" => {
+                            // v17.1 (P1 fix): 仅 buy 信号 + force_hold 时压分 (避免影响 Sell/Hold)
                             if outcome.force_hold && is_buy {
                                 trend_result.signal_score = 55;
                                 trend_result.buy_signal = BuySignal::Hold;
-                                for flag in &outcome.flags {
-                                    trend_result.risk_factors.push(flag.clone());
-                                }
-                                info!("[{}] 🛑 VetoChain[live] 拦截: force_hold, 评分压至55", code);
-                            } else if outcome.total_penalty != 0 {
+                            } else if is_buy && outcome.total_penalty != 0 {
                                 trend_result.signal_score =
                                     (trend_result.signal_score + outcome.total_penalty).clamp(0, 100);
+                            }
+                            // v17.2 (P2 fix): risk flags 始终传播 (不依赖 force_hold 分支)
+                            for flag in &outcome.flags {
+                                trend_result.risk_factors.push(flag.clone());
+                            }
+                            if outcome.force_hold && is_buy {
+                                info!("[{}] 🛑 VetoChain[live] 拦截: force_hold, 评分压至55", code);
                             }
                         }
                         _ => {
