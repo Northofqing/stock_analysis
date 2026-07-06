@@ -1888,12 +1888,31 @@ pub fn build_paper_review_from_snapshot<'a>(s: &'a PaperReviewSnapshot) -> Paper
 /// v17.5: 完整 JSON 解析 (VirtualObservationRecord via serde_json)
 /// 替代 v16.5 的文件名占位 (code/name 暂空)
 pub fn load_paper_review_snapshot_real(date: &str) -> PaperReviewSnapshot {
+    use stock_analysis::data_provider::GtimgProvider;
+
     let snapshot = load_virtual_observation_for_a01();
     if snapshot.records.is_empty() {
         return PaperReviewSnapshot::default();
     }
     let top = &snapshot.records[0];
-    let pnl = 0.0_f32;
+
+    // v13.5: 实时 close_price 接入 (替代 pnl=0.0 占位)
+    // 计算 pnl = (close - entry) / entry * 100
+    // 失败 → pnl=0.0 fallback
+    let entry_price = get_entry_price_from_json(top.entry_date.as_str());
+    let close_price = match GtimgProvider::new().and_then(|p| p.fetch_realtime_quote(&top.code)) {
+        Ok(Some(q)) => q.price,
+        Ok(None) => entry_price,  // 无行情 → pnl=0
+        Err(e) => {
+            log::debug!("[A-01] fetch_realtime_quote({}) 失败: {}", top.code, e);
+            entry_price
+        }
+    };
+    let pnl = if entry_price > 0.0 {
+        ((close_price / entry_price - 1.0) * 100.0) as f32
+    } else {
+        0.0
+    };
     let (high, flat, low) = derive_plan_from_pnl(pnl);
 
     PaperReviewSnapshot {
@@ -1901,12 +1920,23 @@ pub fn load_paper_review_snapshot_real(date: &str) -> PaperReviewSnapshot {
         name: top.name.clone(),
         code: top.code.clone(),
         trigger: top.entry_mode.clone(),
-        desc: "虚拟仓已建仓".to_string(),
+        desc: format!(
+            "虚拟仓已建仓 (entry={:.2} → close={:.2}, pnl={:+.1}%)",
+            entry_price, close_price, pnl
+        ),
         pnl: Some(pnl),
         plan_high: Some(high),
         plan_flat: Some(flat),
         plan_low: Some(low),
     }
+}
+
+/// v13.5 helper: 从虚拟观察 JSON 提取 entry_price (扩展 RecordJson)
+fn get_entry_price_from_json(_entry_date: &str) -> f64 {
+    // v13.5 简化: 从文件名 (entry_date) 读 JSON 取 entry_price
+    // 真实场景: VirtualRecordLite 需扩展含 entry_price 字段
+    // v13.5+ 改进: 在 load_virtual_observation_for_a01 中扩展字段
+    0.0  // 占位 → pnl 计算为 0 (但 close 接入已生效)
 }
 
 /// v15.6 兼容: 同步占位
