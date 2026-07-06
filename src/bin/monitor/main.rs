@@ -970,6 +970,65 @@ async fn run_test_scan() {
     }
     }
 
+    // T-07 候选触发演示 (测试阶段: 全部推送)
+    let t07_banner = pt::BannerCtx::default();
+    let t07_params = pt::CandidateTriggeredParams {
+        name: "中钨高新",
+        code: "000657",
+        hhmm: &chrono::Local::now().format("%H:%M").to_string(),
+        grade: pt::CandidateGrade::A,
+        topic: "钨业-先进制造",
+        price: 18.50,
+        trigger_desc: "突破前高 + 量比 4.2",
+        lo: 18.20,
+        hi: 18.80,
+        stop: 17.85,
+        max_pos_pct: 20,
+        news_quality: pt::EvidenceQuality::Strong,
+        news_note: "工信部支持钨深加工, 板块共振+12%",
+        vol_quality: pt::EvidenceQuality::Strong,
+        vol_ratio: 4.2,
+        kline_quality: pt::EvidenceQuality::Mid,
+        kline_note: "突破 60 日均线, MACD 金叉",
+        book_quality: pt::EvidenceQuality::Missing,
+        no_buy: &["板块转 Fade".to_string(), "大盘转跌".to_string()],
+    };
+    let _ = pt::push_candidate_triggered("000657", Some(&t07_banner), t07_params, Some(true)).await;
+    log::info!("[v19.14b] T-07 候选触发演示完成");
+
+    // T-10 虚拟盘成交回报演示
+    let t10_params = pt::PaperTradeParams {
+        hhmm: &chrono::Local::now().format("%H:%M").to_string(),
+        name: "三安光电",
+        code: "600703",
+        status: pt::PaperTradeStatus::Filled,
+        fill_price: Some(17.26),
+        qty: Some(400),
+        virtual_reason: Some("T0Positive (震荡市, 底仓做T)"),
+        not_fill_reason: None,
+        account_mode: pt::AccountMode::ReduceOnly,
+        data_mode: pt::DataMode::Full,
+    };
+    let t10_text = pt::render_paper_trade(t10_params);
+    log::info!("[v19.14b] T-10 虚拟盘成交:\n{}", t10_text);
+    notify::push_governor(&t10_text, notify::PushKind::PaperTrade).await;
+    log::info!("[v19.14b] T-10 虚拟盘成交演示完成");
+
+    // T-12 尾盘决策演示
+    let t12_banner = pt::BannerCtx::default();
+    let t12_holding = pt::CloseCallHolding {
+        name: "华电辽能", state: "尾盘跳水-建议处理",
+    };
+    let t12_gamble = pt::CloseCallGamble {
+        name: "中钨高新", code: "000657",
+        satisfied: true,
+        cond: "板块 Ferment + 主升核心, 尾盘买入博次日溢价",
+    };
+    let t12_text = pt::render_close_call(&t12_banner, "14:45", Some(&t12_holding), Some(&t12_gamble));
+    log::info!("[v19.14b] T-12 尾盘决策:\n{}", t12_text);
+    notify::push_governor(&t12_text, notify::PushKind::CloseCall).await;
+    log::info!("[v19.14b] T-12 尾盘决策演示完成");
+
     // ===== 16.6 v12 盘后 R-01/R-02/R-08 真推 (复用 --review 块) =====
     let today_str_t = chrono::Local::now().format("%Y-%m-%d").to_string();
     let r_data = tokio::task::spawn_blocking(move || {
@@ -1076,6 +1135,31 @@ async fn run_test_scan() {
         notify::push_governor(&r08, notify::PushKind::EventCalendar).await;
         log::info!("[v12-MVP0-B] --test R-01/R-02/R-08 真推完成");
     }
+
+    // v19.14b: R-06 失败归因演示 (--test 路径, 全部推送)
+    use stock_analysis::review::failure_attribution::{FailureItem, FailureReason, WeeklyDistribution};
+    let r06_items = vec![
+        FailureItem {
+            name: "德展健康".into(), code: "000813".into(),
+            signal_level: "B".into(),
+            reason: FailureReason::StopLossHit,
+            pnl_pct: -51.7,
+            suggestion: "停牌中跳过, 复牌后重新评估".into(),
+        },
+        FailureItem {
+            name: "达实智能".into(), code: "002421".into(),
+            signal_level: "A".into(),
+            reason: FailureReason::MacdBearish,
+            pnl_pct: -8.5,
+            suggestion: "等待右侧放量信号, 避免左侧抄底".into(),
+        },
+    ];
+    let mut r06_weekly = WeeklyDistribution::default();
+    r06_weekly.add(FailureReason::StopLossHit);
+    r06_weekly.add(FailureReason::MacdBearish);
+    let r06_text = stock_analysis::review::failure_attribution::render_r06(&r06_items, &r06_weekly);
+    log::info!("[v19.14b R-06]\n{}", r06_text);
+    notify::push_governor(&r06_text, notify::PushKind::ReviewFailure).await;
 
     // 17. v4 周度 SOP
     if stock_analysis::review::sop::is_friday() {
@@ -1928,7 +2012,34 @@ async fn run_review_only_inner() {
             notify::push_governor(&text, notify::PushKind::EventCalendar).await;
         }
 
-        log::info!("[v12-MVP1-R] R-01/R-02/R-08 推送完成 (R-03~R-07 数据不足仅 log)");
+        // v19.14b: R-06 失败归因演示 (测试阶段, 全部推送)
+        use stock_analysis::review::failure_attribution::{
+            FailureItem, FailureReason, WeeklyDistribution,
+        };
+        let r06_items = vec![
+            FailureItem {
+                name: "德展健康".into(), code: "000813".into(),
+                signal_level: "B".into(),
+                reason: FailureReason::StopLossHit,
+                pnl_pct: -51.7,
+                suggestion: "停牌中跳过, 复牌后重新评估".into(),
+            },
+            FailureItem {
+                name: "达实智能".into(), code: "002421".into(),
+                signal_level: "A".into(),
+                reason: FailureReason::MacdBearish,
+                pnl_pct: -8.5,
+                suggestion: "等待右侧放量信号, 避免左侧抄底".into(),
+            },
+        ];
+        let mut r06_weekly = WeeklyDistribution::default();
+        r06_weekly.add(FailureReason::StopLossHit);
+        r06_weekly.add(FailureReason::MacdBearish);
+        let r06_text = stock_analysis::review::failure_attribution::render_r06(&r06_items, &r06_weekly);
+        log::info!("[v19.14b R-06]\n{}", r06_text);
+        notify::push_governor(&r06_text, notify::PushKind::ReviewFailure).await;
+
+        log::info!("[v12-MVP1-R] R-01/R-02/R-06/R-08 推送完成 (R-03~R-05/R-07 数据不足仅 log)");
     }
 }
 
