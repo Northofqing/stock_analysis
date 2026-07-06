@@ -122,6 +122,12 @@ pub enum PushKind {
     PostFixedPriceFill,
     /// v13.1 §5.4 T-16 ST 涨跌幅变更提醒 (新规 5%→10%, ⚡ 1次/票/日)
     StPriceLimitChanged,
+    /// v13.1 §5.5 T-17 ETF 收盘集合竞价 (ℹ️ 1次/日, 仅沪市 ETF)
+    EtfClosingCallAuction,
+    /// v13.1 §5.6 T-18 创业板协议大宗盘中确认 (ℹ️ 5min/票)
+    BlockTradeIntradayConfirm,
+    /// v13.1 §5.7 T-19 北交所大宗价格区间 (ℹ️ 60min/票)
+    BlockTradePriceRange,
 }
 
 impl PushKind {
@@ -162,7 +168,10 @@ impl PushKind {
             | PushKind::IndustryChainIntraday
             | PushKind::PostFixedPriceOrder
             | PushKind::PostFixedPriceFill
-            | PushKind::StPriceLimitChanged => PushLevel::Important,
+            | PushKind::StPriceLimitChanged
+            | PushKind::EtfClosingCallAuction
+            | PushKind::BlockTradeIntradayConfirm
+            | PushKind::BlockTradePriceRange => PushLevel::Important,
             // ℹ️参考 (降级 + ForbiddenOps/PaperTrade)
             _ => PushLevel::Info,
         }
@@ -240,6 +249,9 @@ impl PushKind {
             PushKind::PostFixedPriceOrder => Some(60),                        // 1 min/票
             PushKind::PostFixedPriceFill => Some(300),                         // 5 min/票
             PushKind::StPriceLimitChanged => Some(86_400),                     // 1次/票/日
+            PushKind::EtfClosingCallAuction => Some(86_400),                    // 1次/日
+            PushKind::BlockTradeIntradayConfirm => Some(300),                  // 5 min/票
+            PushKind::BlockTradePriceRange => Some(3600),                      // 60 min/票
             _ => Some(1800),                                                  // 默认 30min
         }
     }
@@ -292,6 +304,9 @@ impl PushKind {
             PushKind::PostFixedPriceOrder => "盘后固定价格申报",
             PushKind::PostFixedPriceFill => "盘后固定价格成交",
             PushKind::StPriceLimitChanged => "ST 涨跌幅变更",
+            PushKind::EtfClosingCallAuction => "ETF 集合竞价尾盘",
+            PushKind::BlockTradeIntradayConfirm => "大宗盘中确认",
+            PushKind::BlockTradePriceRange => "北交所大宗价格区间",
         }
     }
 }

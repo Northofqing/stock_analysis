@@ -2011,6 +2011,114 @@ pub fn render_st_price_limit_changed(p: StPriceLimitChangedParams<'_>) -> String
     s
 }
 
+/// v13.1 §5.5 T-17 ETF 收盘集合竞价（仅沪市 ETF, 14:57-15:00）
+pub struct EtfClosingCallAuctionParams<'a> {
+    pub hhmm: &'a str, // 14:57-15:00
+    pub name: &'a str,
+    pub code: &'a str,
+    pub call_auction_price: Option<f64>,
+    pub vs_continuous_est: Option<f32>,
+    pub liquidity_note: &'a str,
+}
+
+/// v13.1 §5.5 T-17 ETF 收盘集合竞价（盘后参考, 无 banner）
+pub fn render_etf_closing_call_auction(p: EtfClosingCallAuctionParams<'_>) -> String {
+    let price = p
+        .call_auction_price
+        .map(|v| format!("{:.3}", v))
+        .unwrap_or_else(|| "暂无".to_string());
+    let vs = p
+        .vs_continuous_est
+        .map(|v| format!("{:+.2}%", v))
+        .unwrap_or_else(|| "N/A".to_string());
+    format!(
+        "📊 ETF 集合竞价尾盘（{}）\n{}({}) 沪市 ETF 收盘价: {}\nvs 连续竞价估值: {}\n流动性: {}\n注: 14:57-15:00 集合竞价形成收盘价（抑制尾盘操纵）",
+        p.hhmm, p.name, p.code, price, vs, p.liquidity_note
+    )
+}
+
+/// v13.1 §5.6 大宗类型
+pub enum BlockType {
+    Agreed,     // 协议大宗
+    Competitive, // 竞价大宗
+}
+
+/// v13.1 §5.6 板块
+pub enum Board {
+    GEM,  // 创业板
+    STAR, // 科创板
+    Main, // 主板
+}
+
+/// v13.1 §5.6 清算节奏
+pub enum SettleType {
+    NextSession, // 次日
+    RealTime,    // 实时
+}
+
+/// v13.1 §5.6 T-18 创业板协议大宗盘中确认
+pub struct BlockTradeIntradayConfirmParams<'a> {
+    pub hhmm: &'a str,
+    pub name: &'a str,
+    pub code: &'a str,
+    pub qty: u32,
+    pub price: f64,
+    pub block_type: BlockType,
+    pub board: Board,
+    pub real_time_confirm: bool,
+    pub next_session_settle: SettleType,
+}
+
+/// v13.1 §5.6 T-18 创业板协议大宗盘中确认（盘后参考, 无 banner）
+pub fn render_block_trade_intraday_confirm(p: BlockTradeIntradayConfirmParams<'_>) -> String {
+    let bt = match p.block_type {
+        BlockType::Agreed => "协议大宗",
+        BlockType::Competitive => "竞价大宗",
+    };
+    let bd = match p.board {
+        Board::GEM => "创业板",
+        Board::STAR => "科创板",
+        Board::Main => "主板",
+    };
+    let settle = match p.next_session_settle {
+        SettleType::NextSession => "次日清算",
+        SettleType::RealTime => "实时清算",
+    };
+    let confirm = if p.real_time_confirm {
+        "✅ 盘中实时确认"
+    } else {
+        "⏳ 等待确认"
+    };
+    format!(
+        "📋 大宗交易盘中确认（{}）\n{}({}) {} {}\n数量: {} 价格: {:.2}\n板块: {} | 清算: {}",
+        p.hhmm, p.name, p.code, bt, confirm, p.qty, p.price, bd, settle
+    )
+}
+
+/// v13.1 §5.7 T-19 北交所大宗价格区间
+pub struct BlockTradePriceRangeParams<'a> {
+    pub hhmm: &'a str,
+    pub name: &'a str,
+    pub code: &'a str,
+    pub prev_close: Option<f64>,
+    pub today_avg_price: f64,
+    pub block_price_range: Option<&'a str>,
+    pub note: &'a str,
+}
+
+/// v13.1 §5.7 T-19 北交所大宗价格区间（盘后参考, 无 banner）
+pub fn render_block_trade_price_range(p: BlockTradePriceRangeParams<'_>) -> String {
+    let prev = p
+        .prev_close
+        .map(|v| format!("{:.2}", v))
+        .unwrap_or_else(|| "N/A".to_string());
+    let range = p.block_price_range.unwrap_or("暂无");
+    format!(
+        "📊 北交所大宗价格区间（{}）\n{}({})\n前收盘价: {} (原口径)\n当日实时均价: {:.2} (新口径)\n价格区间: {}\n注: {}",
+        p.hhmm, p.name, p.code, prev, p.today_avg_price, range, p.note
+    )
+}
+
 // ============================================================================
 // 测试
 // ============================================================================
@@ -3273,6 +3381,66 @@ mod tests {
     #[test] fn gov_st_price_limit_changed_cooldown() { assert_eq!(crate::notify::PushKind::StPriceLimitChanged.cooldown_secs(), Some(86_400)); }
     #[test] fn gov_st_price_limit_changed_banner() { assert!(crate::notify::PushKind::StPriceLimitChanged.requires_banner()); }
     #[test] fn gov_st_price_limit_changed_level() { assert_eq!(crate::notify::PushKind::StPriceLimitChanged.level(), crate::notify::PushLevel::Important); }
+
+    // ====== v13.1 T-17/T-18/T-19 剩余 3 新规 (3 用例) ======
+    #[test]
+    fn etf_closing_call_auction_with_data() {
+        let p = EtfClosingCallAuctionParams {
+            hhmm: "14:58", name: "沪深300ETF", code: "510300",
+            call_auction_price: Some(3.952),
+            vs_continuous_est: Some(0.15),
+            liquidity_note: "正常, 无尾盘操纵",
+        };
+        let out = render_etf_closing_call_auction(p);
+        assert!(out.contains("📊 ETF 集合竞价尾盘（14:58）"));
+        assert!(out.contains("沪深300ETF(510300) 沪市 ETF 收盘价: 3.952"));
+        assert!(out.contains("vs 连续竞价估值: +0.15%"));
+        assert!(out.contains("14:57-15:00 集合竞价形成收盘价"));
+    }
+
+    #[test]
+    fn block_trade_intraday_confirm_gem() {
+        let p = BlockTradeIntradayConfirmParams {
+            hhmm: "11:15", name: "A", code: "300750", qty: 1000, price: 50.0,
+            block_type: BlockType::Agreed,
+            board: Board::GEM,
+            real_time_confirm: true,
+            next_session_settle: SettleType::NextSession,
+        };
+        let out = render_block_trade_intraday_confirm(p);
+        assert!(out.contains("📋 大宗交易盘中确认（11:15）"));
+        assert!(out.contains("A(300750) 协议大宗 ✅ 盘中实时确认"));
+        assert!(out.contains("数量: 1000 价格: 50.00"));
+        assert!(out.contains("板块: 创业板"));
+        assert!(out.contains("清算: 次日清算"));
+    }
+
+    #[test]
+    fn block_trade_price_range_bj() {
+        let p = BlockTradePriceRangeParams {
+            hhmm: "14:30", name: "A", code: "830001",
+            prev_close: Some(10.50), today_avg_price: 10.80,
+            block_price_range: Some("10.50~11.10"),
+            note: "原口径为前收盘价, 新口径为当日均价",
+        };
+        let out = render_block_trade_price_range(p);
+        assert!(out.contains("📊 北交所大宗价格区间（14:30）"));
+        assert!(out.contains("A(830001)"));
+        assert!(out.contains("前收盘价: 10.50 (原口径)"));
+        assert!(out.contains("当日实时均价: 10.80 (新口径)"));
+        assert!(out.contains("价格区间: 10.50~11.10"));
+    }
+
+    // ====== v13.1 治理元信息测试 (T-17/T-18/T-19) ======
+    #[test] fn gov_etf_closing_call_auction_cooldown() { assert_eq!(crate::notify::PushKind::EtfClosingCallAuction.cooldown_secs(), Some(86_400)); }
+    #[test] fn gov_block_trade_intraday_confirm_cooldown() { assert_eq!(crate::notify::PushKind::BlockTradeIntradayConfirm.cooldown_secs(), Some(300)); }
+    #[test] fn gov_block_trade_price_range_cooldown() { assert_eq!(crate::notify::PushKind::BlockTradePriceRange.cooldown_secs(), Some(3600)); }
+    #[test] fn gov_etf_closing_call_auction_no_banner() { assert!(!crate::notify::PushKind::EtfClosingCallAuction.requires_banner()); }
+    #[test] fn gov_block_trade_intraday_confirm_no_banner() { assert!(!crate::notify::PushKind::BlockTradeIntradayConfirm.requires_banner()); }
+    #[test] fn gov_block_trade_price_range_no_banner() { assert!(!crate::notify::PushKind::BlockTradePriceRange.requires_banner()); }
+    #[test] fn gov_etf_closing_call_auction_level() { assert_eq!(crate::notify::PushKind::EtfClosingCallAuction.level(), crate::notify::PushLevel::Important); }
+    #[test] fn gov_block_trade_intraday_confirm_level() { assert_eq!(crate::notify::PushKind::BlockTradeIntradayConfirm.level(), crate::notify::PushLevel::Important); }
+    #[test] fn gov_block_trade_price_range_level() { assert_eq!(crate::notify::PushKind::BlockTradePriceRange.level(), crate::notify::PushLevel::Important); }
 
     #[test]
     fn evidence_quality_labels() {
