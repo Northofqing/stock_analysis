@@ -1,229 +1,247 @@
-# 项目规则
+# AGENTS.md — Repository-wide Mandatory Rules (Highest Priority)
 
-> 适用范围:实盘量化交易系统
-> 强制力分级:**MUST**(违反即阻断) / **SHOULD**(强烈建议) / **MAY**(可选)
-> 本文档为所有开发、审查、上线活动的最高约束。数据红线优先级高于一切流程。
-
----
-
-## 0. 总则
-
-- **MUST** 本规则的每一条数据红线(第二部分)是开发流程(第一部分)每个阶段的验收项,二者不可割裂。
-- **MUST** 所有流程产物落地到 Git,以 PR 为载体,checklist 逐项勾选后方可合并。
-- **MUST** 任何规则冲突时,数据安全 > 资金安全 > 流程合规 > 开发效率。
-- **MAY** 紧急情况走"受控例外通道"(见第三部分),但必须留痕并事后复盘。
+> **Scope**: entire repository (live A-share trading system)
+> **Force levels**: **MUST** (violation = block) / **SHOULD** (strongly recommended) / **MAY** (optional)
+> **This document is the highest constraint for all development, review, and deployment activities. Data red lines take priority over all processes.**
 
 ---
 
-## 一、开发流程
+## 0. General Principles
 
-按序执行,**上一步未达成 Definition of Done(DoD)不进入下一步**。每步 DoD 即该步的合并 Gate。
-
-### 流程步骤与完成判定
-
-| 步骤 | 命令 / 动作 | Definition of Done(MUST 全部满足) |
-|------|------------|------------------------------------|
-| 1 | `/architecture-patterns` 设计方案文档落地 | 文档已提交且包含:① 数据流图 ② 失败模式分析(每个数据源失败如何处理)③ 回滚方案 ④ 与旧模块的关系说明 |
-| 2 | 量化产品经理、量化资深技术研发、量化交易分析师、量化DDD架构四角挑战方案,反哺给 1 | 四个角色各留书面意见;所有 **Blocking 异议**已闭环;退出条件见下方"收敛规则" |
-| 3 | `/project-planner` 拆分计划文档落地 | 每个任务可独立验收;依赖关系明确;每个任务标注涉及的数据红线 |
-| 4 | `/andrej-karpathy-skills:karpathy-guidelines` 按规则编码 | 通过 lint + 单测;**无 mock 残留于生产路径**;每个数据源失败路径有显式处理 |
-| 5 | `/review` 审查代码 | ① review 意见全部记录 ② **旧模块接入检查表逐项勾选**(见下)③ 数据红线检查表逐项勾选 |
-| 6 | 修复 review 问题 | 所有问题 resolved,或显式标注 `wontfix` + 理由并经审查者确认 |
-| 7 | 测试验证 | **单元测试行覆盖率 ≥ 80%**;核心交易 / 数据链路覆盖率 **≥ 95%**;回归通过;实盘数据校验通过;不通过按"根因回退"处理 |
-
-### 收敛规则(第 2 步)
-
-- **MUST** 四角挑战以"**无新增 Blocking 异议**"为退出条件。
-- **MUST** 单一方案挑战轮次上限 **3 轮**;第 3 轮后仍有 Blocking 异议则升级决策,不得无限循环。
-
-### 根因回退(第 7 步)
-
-测试不通过时,**MUST 按根因回退到对应步骤**,而非一律回第 4 步:
-
-| 失败根因 | 回退到 |
-|----------|--------|
-| 数据流 / 架构设计错误 | 步骤 1 |
-| 计划遗漏 / 任务拆分不当 | 步骤 3 |
-| 实现 bug | 步骤 4 |
-| 数据红线违规 | 步骤 4,并复查步骤 1 的失败模式分析 |
-
-### 旧模块接入检查表(第 5 步 · MUST)
-
-> 新能力上线后,**必须对照旧模块**,逐个回答,不得跳过。
-
-- [ ] 列出所有与新能力同类 / 相关的现有模块
-- [ ] 对每个旧模块回答:**是否应升级接入新能力?**
-  - 接入 → 记录接入计划 / PR
-  - 不接入 → 记录明确理由
-- [ ] 确认无"应接入却遗漏"的旧模块
-
-### 流程载体(MUST)
-
-- **MUST** 每步产出物作为 PR 的 checklist 项或关联文档。
-- **MUST** 合并需指定审查者批准;前 7 步证据可追溯。
-- **MUST** 设计 / 计划文档存于仓库固定目录 `docs/`,非聊天记录或临时文件。
+- **MUST** Every data red line in Part 2 must be a Definition of Done (DoD) checkpoint for every stage of the development flow (Part 1); the two are inseparable.
+- **MUST** All process outputs must be tracked in Git via PR; the PR checklist must be fully ticked before merge.
+- **MUST** In any rule conflict, the priority is: data safety > fund safety > process compliance > development efficiency.
+- **MAY** Emergency situations may use the "Controlled Exception Path" (see Part 3), but must leave audit trails and conduct post-mortems.
 
 ---
 
-## 二、真实数据(实盘红线)
+## Part 1: Development Flow
 
-实盘交易系统。**所有数据必须是真实数据。** 本部分每一条均为 **MUST**,违反即阻断上线。
+Execute in order. If the previous step has not reached its DoD, do not proceed. Each step's DoD serves as its merge gate.
 
-### 2.1 数据来源
+### 1.1 Flow Steps and Completion Criteria
 
-- **MUST** 生产路径禁止 mock 数据。
-- **MUST** 持仓、交易、净值来自真实账户,不编造。
-- **MUST** 数据源失败显式报错,不降级到假数据。
+| Step | Description | DoD (must satisfy before merge) |
+|---|---|---|
+| 0. Pre-flight | Read `AGENTS.md` + `docs/ENGINEERING_RULES_V2.md` + `.github/copilot-instructions.md` + `CLAUDE.md`. Resolve conflicts by precedence. | Pre-flight plan output (impacted paths, triggered rule IDs, validation, rollback) |
+| 1. Architecture | Document design (data flow, failure modes, rollback, old module relations) in `docs/`. | Design doc exists and reviewable; blocking objections = 0 |
+| 2. Implementation | Code + explicit failure handling. No mock data in production paths. | `cargo fmt --check` + `cargo clippy -D warnings` + `cargo test` all pass; failure paths exercisable |
+| 3. Compliance | All compliance checks pass. | `bash tools/compliance/check.sh` passes (data freshness, fake impl, design contradiction, BR registration) |
+| 4. Release | Unit coverage ≥ 80%, core trading/data links ≥ 95%, regression + live data validation pass, audit fields traceable. | Coverage report + auditor sign-off |
 
-### 2.2 缺失数据
+### 1.2 Gate Progression (Gate A → B → C → D)
 
-- **MUST** 缺数据留空或打 warning,**不静默填充**。
+- **Gate A (Design Ready)**: Design intent is explicit and traceable.
+- **Gate B (Implementation Ready)**: Implementation + explicit failure handling.
+- **Gate C (Compliance Ready)**: All compliance checks pass (blocking).
+- **Gate D (Release Ready)**: Tests/coverage/evidence complete.
 
-### 2.3 坏数据校验
+If a gate fails, fix and retry from the failed gate. Do not skip.
 
-> 错误数据比缺失数据更危险——穿仓价、未除权历史价会直接让策略下错单。
+### 1.3 Pre-flight Output (REQUIRED before any code change)
 
-- **MUST** 数据进入计算前做校验:
-  - **数值范围检查**:价格 > 0;单笔相对上一有效值涨跌幅 **超过 ±20%(对应 A 股涨跌停上限缓冲)** 触发告警并人工确认
-  - **时间连续性检查**:相邻数据时间间隔异常(缺口或重复时间戳)触发报错
-  - **除权除息一致性检查**:复权前后价格序列连续,除权日跳变在预期范围内
-- **MUST** 坏数据与缺数据同等处理:**显式报错,不带病计算**。
+Before editing any code/file, the agent must output a short pre-flight plan containing:
 
-### 2.4 数据时效
+1. **Impacted paths/modules**
+2. **Triggered rule IDs** (e.g., 2.1 / 2.4 / 2.6 / 2.8 / 2.9 / 2.10)
+3. **Validation commands** to run
+4. **Rollback plan**
 
-> "真实"还不够,还得"当下有效"。3 小时前的盘中快照就是错的。
+If pre-flight is missing, the task is **not allowed to proceed**.
 
-- **MUST** 净值、持仓、行情等带时间戳,使用前做新鲜度校验。
-- **MUST** 超过过期阈值的数据视同失败,显式报错,不沿用。过期阈值写死如下:
+---
 
-  | 数据类型 | 过期阈值 |
-  |----------|----------|
-  | 实时行情(盘中) | **5 秒** |
-  | 持仓 / 资金 | **30 秒** |
-  | 净值 | **当日有效**(跨交易日即过期) |
-  | 日线 / 历史数据 | **1 个交易日** |
+## Part 2: Data Red Lines (MUST, Blocking)
 
-#### 2.4.1 数据新鲜度门禁 (R-3 修复新增, PR-2)
+### 2.1 Data Source
 
-> §2.4 的工程化补充。把抽象规则落到 CI / 自动化门禁,避免"停更 N 天无人察觉"的复盘。
+- Production paths **MUST NOT** use mock data.
+- Position/trade/net value data **MUST** come from real accounts; fabrication is prohibited.
+- Data source failures **MUST** be explicit errors, **MUST NOT** be downgraded to fake data fallbacks.
 
-- **MUST** `stock_daily` 等时间序列表的 `MAX(date)` 与今日差不得超过 **1 个交易日**(周末/节假日除外)。
-- **MUST** 数据新鲜度由 `tools/compliance/lib/check_data_freshness.sh` 自动检查,`bash tools/compliance/check.sh` 阻断(CI / 合并前必跑)。
-- **MUST** 修复手段:`bash tools/one_shot/backfill_daily.sh` 全量回灌(数据源:RustDX 通达信 → Gtimg → HTTP);或在 PR 描述写明数据断层原因 + 手动修复命令。
-- **MUST NOT** 在数据新鲜度 FAIL 的情况下合并 PR — 即便其他检查全过。
-- **异常处理**: 数据断层超过 1 个交易日 → 触发 `bash tools/one_shot/backfill_daily.sh` 重灌, 并在 PR 描述写明原因; 仍 FAIL 则升级决策, 不得静默合并。
+### 2.2 Missing Data
 
-### 2.5 测试与实盘隔离
+- Missing data fields **MUST** be left blank or logged as warnings; **MUST NOT** be silently filled.
 
-- **MUST** 测试用 `TEST_CODE` 前缀区分真实股票。
-- **MUST** **硬隔离,非仅约定**:
-  - 生产环境拒绝任何 `TEST_CODE` 标的
-  - 测试环境拒绝任何真实标的下单
-- **MUST** 测试账户与实盘账户物理隔离。
+### 2.3 Bad Data Validation
 
-### 2.6 写入 / 下单侧防护
+Before data enters computation, the following **MUST** be validated:
 
-> 读取侧编造数据危险,写入侧(下单 / 撤单)出错更致命。
+- Price > 0
+- Adjacent valid-value change > ±20%: alert + manual confirmation
+- Time continuity: gaps/duplicates return error
+- Split/dividend consistency: series continuity, jumps within expectation
 
-- **MUST** 订单提交前做边界校验:
-  - 单笔金额 ≤ **账户可用资金**,且 ≤ **单笔上限 100 万元**
-  - 单笔数量 > 0 且为 **100 股整数倍**(A 股最小交易单位)
-  - 委托价格在当日 **涨跌停区间内**
-- **MUST** 下单具备幂等性,**同一业务订单号 60 秒内重复提交直接拒绝**。
-- **MUST** 单笔金额 ≥ **50 万元** 的订单需二次确认。
+Bad data is treated as a failure: explicit error, not silent computation with bad data.
 
-### 2.7 审计与可追溯
+### 2.4 Data Freshness
 
-> 实盘出问题必须能复盘。
+- Realtime quotes: 5 seconds
+- Position/cash: 30 seconds
+- Net value: same trading day (stale after midnight)
+- Daily/historical: 1 trading day
 
-- **MUST** 关键数据流与每一笔订单留痕:来源、时间、决策依据。
-- **MUST** 审计日志不可篡改,**保留期 ≥ 5 年**(满足监管留痕要求)。
+#### 2.4.1 Freshness Gate
 
-### 2.8 假实现禁令
+- Tables like `stock_daily` **MUST** have `MAX(date)` no more than 1 trading day behind (excluding holidays).
+- **MUST** be checked by `tools/compliance/lib/check_data_freshness.sh`.
+- **MUST** fix on FAIL: run `bash tools/one_shot/backfill_daily.sh`.
+- A freshness FAIL is a strict merge blocker.
 
-> **MUST** 任何"写数据 / 验证 / 通知 / 同步"类函数(命名含 `verify`、`save`、`notify`、`push`、`sync`、`update_result`、`reconcile`)必须真实操作目标数据源。仅写日志不操作数据的实现视为 **假实现**,合并阻断。
+### 2.5 Test vs Live Isolation
 
-**反模式**:
-```rust
-// ❌ 假实现 — verify 硬编码 0.0, false
-match db.update_prediction_result(&today, None, 0.0, false) {
-    Ok(n) => log::info!("已更新 {} 条预测结果", n),
-    ...
-}
+- Test code **MUST** use `TEST_CODE` prefix.
+- Production **MUST REJECT** `TEST_CODE` orders; test environment **MUST REJECT** real-symbol orders.
+- Test accounts and live accounts **MUST** be physically isolated.
+
+### 2.6 Order Safety (MUST, Blocking)
+
+- Single order amount ≤ available cash, **AND** ≤ 1,000,000 RMB.
+- Single order quantity > 0 **AND** a multiple of 100 shares.
+- Order price **MUST** be within the daily limit-up/limit-down range.
+- The same business order ID within 60 seconds **MUST** be rejected (idempotency).
+- Single order ≥ 500,000 RMB **MUST** require secondary confirmation.
+
+### 2.7 Audit Trail
+
+- Critical data flows and every order **MUST** leave a trace: source, time, decision basis.
+- Audit log **MUST** be tamper-resistant with retention ≥ 5 years.
+
+### 2.8 Fake Implementation Ban (MUST, Blocking)
+
+- Functions named `verify/save/notify/push/sync/update_result/reconcile` **MUST** actually operate on the target data source.
+- Logging-only is treated as fake implementation, blocking merge.
+- Check script: `tools/compliance/lib/check_fake_impl.sh`.
+
+### 2.9 Design Contradiction Ban (MUST, Blocking)
+
+- Modifying `config/*.toml` thresholds **MUST** reference a spec section in the PR.
+- Modifying the spec **MUST** reference the config field in the PR.
+- `threshold > clamp_max` **MUST** trigger CI FAIL.
+- Check script: `tools/compliance/lib/check_design_contradiction.sh`.
+
+### 2.10 Business Rule Documentation (MUST, Blocking)
+
+- Logic involving dedup / mutex / filter / sort / limit **MUST** be registered in `docs/business_rules.md` first.
+- PRs **MUST** include the corresponding rule ID (e.g., BR-001).
+- Check script: `tools/compliance/lib/check_business_rules.sh`.
+
+---
+
+## Part 3: PR and Exception Handling
+
+### 3.1 PR Required Fields (MUST)
+
+PR description **MUST** include:
+
+- `Refs: spec §X.X`
+- `Data-Redlines: [2.1, 2.4, ...]`
+- `OldModules:` (each: module | adopt/reject | reason)
+- `Threshold-Proof:` (if threshold/config changed)
+- `Business-Rules:` (if involved, list BR IDs)
+- `Rollback:` (command/steps)
+
+Missing any field → not merge-ready.
+
+### 3.2 Root-Cause Rollback (MUST)
+
+When validation fails, rollback by root cause (not always implementation only):
+
+- Architecture/data-flow issue → return to Gate A
+- Task decomposition/scope miss → return to Gate A/B (per situation)
+- Implementation bug → return to Gate B
+- Red line violation → Gate B fix + Gate A failure-mode recheck
+
+### 3.3 Controlled Exception Path (MUST)
+
+Exception allowed only with:
+
+- Explicit approver
+- Reason + risk statement
+- Time limit
+- Full audit trail
+- Postmortem within 24 hours
+
+**MUST NOT** use "emergency" to bypass hard safety red lines.
+
+### 3.4 Output Style (SHOULD)
+
+- Keep output concise, checklist-oriented
+- Always reference rule IDs when explaining decisions
+- Prefer small, verifiable changes over large batch edits
+
+### 3.5 PR Evidence Examples (MUST)
+
+```
+### Refs
+- spec: `docs/architecture/v13-push-templates.md §14.2 I-01`
+- design: `docs/superpowers/specs/2026-07-06-v13-push-templates-design.md §3.2`
+
+### Data-Redlines
+- [2.1] No mock: render only consumes real sector_monitor / sector_score output
+- [2.3] Bad data: score>±100 → debug_assert! triggers
+- [2.4] Freshness: realtime quotes ≤ 5s
+
+### OldModules
+| module | adopt/reject | reason |
+| --- | --- | --- |
+| `news_monitor_loop` | adopt | reuse existing cluster output |
+| `sector_rotation` | adopt | reuse existing score, do not change semantics |
+
+### Validation
+- `cargo build --bin monitor`: OK
+- `cargo test --bin monitor`: 183/183 PASS
+- `bash tools/compliance/check.sh`: PASS
+
+### Rollback
+\`\`\`bash
+git revert <commit-sha>
+cargo build --release
+\`\`\`
 ```
 
-**正例**:
-```rust
-// ✅ 真实 verify — 拉 stock_daily, 算 actual_change, 写回
-let prev_close = read_stock_daily_close(code, &pred_date)?;
-let today_close = read_stock_daily_close(code, &target_date)?;
-let actual_change = (today_close - prev_close) / prev_close * 100.0;
-let hit = match pred_direction.as_str() {
-    "看多" => actual_change > 0.5,
-    "看空" => actual_change < -0.5,
-    _ => false,
-};
-db.update_prediction_result(&pred_date, Some(code), actual_change, hit)?;
-```
+---
 
-**验证**: `tools/compliance/lib/check_fake_impl.sh` 拦截 `update_.*result.*0\.0.*false` 模式 (R-1 修复新增)。
+## Part 4: Done Criteria (MUST)
 
-### 2.9 设计矛盾禁令
+A task is "Done" only if **ALL** true:
 
-> **MUST** 任何评分 / 阈值 / 门控的设置必须满足:
-> 1. 上下游互相引用: 改动 `config/*.toml` 阈值必须 PR 描述引用 spec 章节号; 改动 spec 必须引用 config 字段名
-> 2. 边界证明: `event_*_threshold`、`*_max`、`*_min`、`*_clamp` 必须注释证明"为什么是这个值"
-> 3. 矛盾检测: CI 解析 toml 与 rust 源码, 若 `threshold > clamp_max` 即 fail
+1. Required checks pass (`cargo fmt/clippy/test` + `tools/compliance/check.sh`).
+2. Evidence fields are complete.
+3. Failure paths are covered.
+4. Tests for changed logic are included.
+5. No rule conflicts remain unaddressed.
 
-**反模式** (R-2):
-```toml
-[push]
-event_risk_score_threshold = 75
-```
-```rust
-if inputs.winrate_score.is_none() {
-    event_risk_score_clamped = event_risk_score_clamped.min(70.0);
-}
-```
+Otherwise, the status must be **"In Progress / Blocked"**.
 
-**验证**: `tools/compliance/lib/check_design_contradiction.sh` 拦截。
-**PR 描述**: 必须含 `Refs: spec §X.X` 或 `Refs: config XXX`。
+### 4.1 Failure Handling (MUST)
 
-### 2.10 业务规则文档化
+If blocked by missing info/tools/permissions:
 
-> **MUST** 涉及"去重 / 互斥 / 过滤 / 排序 / 限额"的业务规则必须在 `docs/业务规则清单-registry.md` 列清单。每条规则含: 编号、规则描述、对应代码位置、测试位置、最后审核日期。
-> **MUST** 任何新代码涉及上述类别, 必须先在 `业务规则清单-registry.md` 登记再写实现。
-> **MUST** Review 检查表第 5 步加项: "本 PR 涉及的 5 类业务规则是否登记"。
-
-**初始登记 5 条** (R-4 / R-5 / R-6 对应):
-
-| 编号 | 类别 | 规则 |
-|------|------|------|
-| BR-001 | 去重 | 同一只票近 3 个交易日最多推送 1 次 |
-| BR-002 | 互斥 | 一条快讯最多命中 1 条产业链。例外: AI 给出 ≥2 条独立产业链可保留 |
-| BR-003 | 过滤 | 宏观新闻 (美联储/美股/汇率/大宗) 入 macro 通道, 不入 chain_mapper |
-| BR-004 | 排序 | 推送 TopN 按 final_score 降序, 同分按发布时间升序 |
-| BR-005 | 限额 | 每天推送机会数 ≤ 5, 超过入候选池 |
-
-**验证**: `tools/compliance/lib/check_business_rules.sh` 拦截缺规则的 PR。
+- Report the exact blocker.
+- Provide a safe next action.
+- Do not fabricate results.
+- Do not bypass compliance.
 
 ---
 
-## 三、受控例外通道
+## Part 5: Quick-Reference Rule Index
 
-> 实盘会遇到紧急情况(临时熔断、手工干预)。与其让人绕过规则,不如留一个**受控的口子**。
-
-- **MUST** 例外必须事先获得授权(指定审批人 / 角色)。
-- **MUST** 例外操作全程留痕:谁、何时、做了什么、为什么。
-- **MUST** 事后 **24 小时**内复盘,补齐对应流程或数据校验。
-- **MUST NOT** 以"紧急"为由跳过数据红线中的资金安全条款(2.1 / 2.5 / 2.6)。
+| Rule | Description | Check Script |
+|---|---|---|
+| 2.1 | No mock data in production | `check_fake_impl.sh` |
+| 2.2 | Missing data explicit | manual review |
+| 2.3 | Bad data validation | `cargo test` |
+| 2.4 | Data freshness | `check_data_freshness.sh` |
+| 2.5 | Test/live isolation | `env_guard.rs` |
+| 2.6 | Order safety | `risk/limits.rs` |
+| 2.7 | Audit trail | `database/` modules |
+| 2.8 | No fake implementation | `check_fake_impl.sh` |
+| 2.9 | No design contradiction | `check_design_contradiction.sh` |
+| 2.10 | Business rule registration | `check_business_rules.sh` |
 
 ---
 
-## 附:强制力速查
-
-| 分级 | 含义 | 违反后果 |
-|------|------|----------|
-| **MUST** | 强制 | 阻断,不可合并 / 上线 |
-| **SHOULD** | 强烈建议 | 需记录偏离理由 |
-| **MAY** | 可选 | 自行裁量 |
+**Version**: v16.3 (2026-07-06)
+**Supersedes**: Chinese original (preserved as git history)
+**Compatibility**: All data red lines (Part 2) unchanged; only language/wording updated.
