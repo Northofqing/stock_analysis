@@ -116,6 +116,10 @@ impl SearchService {
         // 3c. 沪深交易所（免费直连，上交所/深交所官方公告，按代码路由）
         providers.push(Box::new(SseSzseProvider::new()));
 
+        // 3d. 雪球 (v21: 公共时间线, A股+全部 category, 用户/机构观点, 冗余补充)
+        providers.push(Box::new(XueqiuProvider::new()));
+        info!("已启用 雪球 公共时间线（免费，A股+全部 category）");
+
         // 4. 金十数据（免费直连，补充快讯）
         // 见 providers/jin10.rs - 默认就是免费直连, 无 API Key
 
