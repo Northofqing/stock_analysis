@@ -1280,6 +1280,68 @@ pub async fn push_t0_forbid(
 }
 
 // ============================================================================
+// v14.2: v13 核心 6 模板 push_* wrapper (render + dispatch)
+// ============================================================================
+
+/// v13 §14.1 P-01 盘前新闻热点 (ℹ️参考, 盘前无 banner)
+pub async fn push_preopen_news_hot(code: &str, params: PreopenNewsHotParams<'_>) -> bool {
+    let text = render_preopen_news_hot(params);
+    dispatch(crate::notify::PushKind::PreopenNewsHot, code, None, text).await
+}
+
+/// v13 §14.2 I-01 盘中轮动总览 (⚡交易建议类, 带 banner)
+pub async fn push_intraday_market(
+    code: &str,
+    banner: Option<&BannerCtx>,
+    params: IntradayMarketParams<'_>,
+) -> bool {
+    let text = render_intraday_market(banner.unwrap_or(&BannerCtx::default()), params);
+    dispatch(crate::notify::PushKind::IntradayMarket, code, banner, text).await
+}
+
+/// v13 §14.2 I-02 新闻催化映射 (⚡交易建议类, 带 banner)
+pub async fn push_news_catalyst(
+    code: &str,
+    banner: Option<&BannerCtx>,
+    params: NewsCatalystParams<'_>,
+) -> bool {
+    let text = render_news_catalyst(banner.unwrap_or(&BannerCtx::default()), params);
+    dispatch(crate::notify::PushKind::NewsCatalyst, code, banner, text).await
+}
+
+/// v13 §14.2 I-03 盘中涨停扩散 (⚡交易建议类, 带 banner, 审计多发现)
+pub async fn push_industry_chain_intraday(
+    code: &str,
+    banner: Option<&BannerCtx>,
+    params: IndustryChainIntradayParams<'_>,
+) -> bool {
+    let text = render_industry_chain_intraday(banner.unwrap_or(&BannerCtx::default()), params);
+    dispatch(
+        crate::notify::PushKind::IndustryChainIntraday,
+        code,
+        banner,
+        text,
+    )
+    .await
+}
+
+/// v13 §14.4 D-01 新闻驱动个股 (⚡交易建议类, 带 banner)
+pub async fn push_news_to_idea(
+    code: &str,
+    banner: Option<&BannerCtx>,
+    params: NewsToIdeaParams<'_>,
+) -> bool {
+    let text = render_news_to_idea(banner.unwrap_or(&BannerCtx::default()), params);
+    dispatch(crate::notify::PushKind::NewsToIdea, code, banner, text).await
+}
+
+/// v13 §14.3 A-01 虚拟仓复盘 (ℹ️盘后参考, 复用 T-11 竞价复算)
+pub async fn push_paper_review(code: &str, params: PaperReviewParams<'_>) -> bool {
+    let text = render_paper_review(params);
+    dispatch(crate::notify::PushKind::PaperReview, code, None, text).await
+}
+
+// ============================================================================
 // MVP3-3.2 orchestrator: T-07 候选触发 + T-08 候选失效
 // ============================================================================
 
