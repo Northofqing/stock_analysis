@@ -109,6 +109,9 @@ pub enum PushKind {
     // ============= v13 §14.4 新增 PushKind (PR #2) =============
     /// v13 §14.4 D-01 新闻驱动个股 (⚡ 20min/票 冷却)
     NewsToIdea,
+    // ============= v13 §14.3 新增 PushKind (PR #3) =============
+    /// v13 §14.3 A-10 盘后题材催化复盘 (⚡盘后 1次/日)
+    CatalystReview,
 }
 
 impl PushKind {
@@ -144,7 +147,8 @@ impl PushKind {
             | PushKind::PreopenNewsHot
             | PushKind::IntradayMarket
             | PushKind::NewsCatalyst
-            | PushKind::NewsToIdea => PushLevel::Important,
+            | PushKind::NewsToIdea
+            | PushKind::CatalystReview => PushLevel::Important,
             // ℹ️参考 (降级 + ForbiddenOps/PaperTrade)
             _ => PushLevel::Info,
         }
@@ -213,6 +217,7 @@ impl PushKind {
             PushKind::PreopenNewsHot | PushKind::IntradayMarket => Some(900), // 15 min
             PushKind::NewsCatalyst => Some(600),                              // 10 min
             PushKind::NewsToIdea => Some(1200),                               // 20 min/票
+            PushKind::CatalystReview => Some(86_400),                         // 1次/日
             _ => Some(1800),                                                  // 默认 30min
         }
     }
@@ -260,6 +265,7 @@ impl PushKind {
             PushKind::IntradayMarket => "盘中轮动",
             PushKind::NewsCatalyst => "新闻催化",
             PushKind::NewsToIdea => "新闻驱动个股",
+            PushKind::CatalystReview => "题材催化复盘",
         }
     }
 }

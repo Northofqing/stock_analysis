@@ -1774,6 +1774,52 @@ pub fn render_news_to_idea(banner: &BannerCtx, p: NewsToIdeaParams<'_>) -> Strin
     s
 }
 
+/// v13 §14.3 A-10 题材催化复盘 — 持续性
+pub enum PersistentLevel {
+    High,
+    Med,
+    Low,
+}
+
+/// v13 §14.3 A-10 盘后题材催化复盘
+pub struct CatalystReviewParams<'a> {
+    pub date: &'a str,
+    pub theme: &'a str,
+    pub score: Option<f32>,
+    pub persistent: PersistentLevel,
+    pub started_names: Vec<&'a str>,
+    pub pending_names: Vec<&'a str>,
+    pub watch_point: Option<&'a str>,
+}
+
+/// v13 §14.3 A-10 盘后题材催化复盘
+pub fn render_catalyst_review(p: CatalystReviewParams<'_>) -> String {
+    let score_str = p
+        .score
+        .map(|v| format!("{:.1}", v))
+        .unwrap_or_else(|| "N/A".to_string());
+    let persistent = match p.persistent {
+        PersistentLevel::High => "high",
+        PersistentLevel::Med => "med",
+        PersistentLevel::Low => "low",
+    };
+    let mut s = format!(
+        "📰 题材催化复盘（{}）\n{}: 当日强度{} | 持续性{}\n",
+        p.date, p.theme, score_str, persistent
+    );
+    if !p.started_names.is_empty() {
+        s.push_str(&format!("已启动: {}\n", p.started_names.join("、")));
+    }
+    if !p.pending_names.is_empty() {
+        s.push_str(&format!("待启动: {}\n", p.pending_names.join("、")));
+    }
+    if let Some(w) = p.watch_point {
+        s.push_str(&format!("明日观察点: {}\n", w));
+    }
+    s.push_str("辅助建议, 非下单指令");
+    s
+}
+
 // ============================================================================
 // 测试
 // ============================================================================
@@ -2814,6 +2860,54 @@ mod tests {
             crate::notify::PushKind::NewsToIdea.level(),
             crate::notify::PushLevel::Important
         );
+    }
+
+    // ====== v13 A-10 盘后题材催化复盘 (2 用例) ======
+    #[test]
+    fn catalyst_review_full() {
+        let p = CatalystReviewParams {
+            date: "2026-07-06", theme: "AI算力", score: Some(85.0),
+            persistent: PersistentLevel::High,
+            started_names: vec!["A", "B"], pending_names: vec!["C"],
+            watch_point: Some("明日是否扩散"),
+        };
+        let out = render_catalyst_review(p);
+        assert!(out.contains("📰 题材催化复盘（2026-07-06）"));
+        assert!(out.contains("AI算力: 当日强度85.0 | 持续性high"));
+        assert!(out.contains("已启动: A、B"));
+        assert!(out.contains("待启动: C"));
+        assert!(out.contains("明日观察点: 明日是否扩散"));
+    }
+
+    #[test]
+    fn catalyst_review_persistent_low_empty() {
+        let p = CatalystReviewParams {
+            date: "2026-07-06", theme: "X", score: None,
+            persistent: PersistentLevel::Low,
+            started_names: vec![], pending_names: vec![],
+            watch_point: None,
+        };
+        let out = render_catalyst_review(p);
+        assert!(out.contains("当日强度N/A"));
+        assert!(out.contains("持续性low"));
+        assert!(!out.contains("已启动:"));
+        assert!(!out.contains("待启动:"));
+        assert!(!out.contains("明日观察点:"));
+    }
+
+    // ====== v13 治理元信息测试 (A-10) ======
+    #[test]
+    fn gov_catalyst_review_cooldown() {
+        assert_eq!(crate::notify::PushKind::CatalystReview.cooldown_secs(), Some(86_400));
+    }
+    #[test]
+    fn gov_catalyst_review_no_banner() {
+        // A-10 盘后非交易建议类, 不要 banner
+        assert!(!crate::notify::PushKind::CatalystReview.requires_banner());
+    }
+    #[test]
+    fn gov_catalyst_review_level() {
+        assert_eq!(crate::notify::PushKind::CatalystReview.level(), crate::notify::PushLevel::Important);
     }
 
     #[test]
