@@ -1850,7 +1850,10 @@ pub struct IndustryChainIntradayParams<'a> {
 }
 
 /// v13 §14.2 I-03 盘中涨停扩散（盘中交易建议类, 带 banner）
-pub fn render_industry_chain_intraday(banner: &BannerCtx, p: IndustryChainIntradayParams<'_>) -> String {
+pub fn render_industry_chain_intraday(
+    banner: &BannerCtx,
+    p: IndustryChainIntradayParams<'_>,
+) -> String {
     let leader = match (p.leader_name, p.leader_code) {
         (Some(n), Some(c)) => format!("龙头: {}({}) {}板", n, c, p.leader_height),
         _ => "龙头: 暂无".to_string(),
@@ -1965,7 +1968,7 @@ pub fn render_post_fixed_price_fill(p: PostFixedPriceFillParams<'_>) -> String {
 
 /// v13.1 §5.4 ST/*ST 类型
 pub enum StType {
-    ST,    // ST
+    ST,     // ST
     StarST, // *ST
 }
 
@@ -1999,7 +2002,8 @@ pub fn render_st_price_limit_changed(p: StPriceLimitChangedParams<'_>) -> String
     if let Some(sl) = p.new_stop_loss {
         s.push_str(&format!(
             "新止损: {:.2} (基于 {:.0}% 阈值)\n",
-            sl, p.new_limit * 100.0
+            sl,
+            p.new_limit * 100.0
         ));
     } else {
         s.push_str("新止损: 未重算\n");
@@ -2039,7 +2043,7 @@ pub fn render_etf_closing_call_auction(p: EtfClosingCallAuctionParams<'_>) -> St
 
 /// v13.1 §5.6 大宗类型
 pub enum BlockType {
-    Agreed,     // 协议大宗
+    Agreed,      // 协议大宗
     Competitive, // 竞价大宗
 }
 
@@ -2117,6 +2121,46 @@ pub fn render_block_trade_price_range(p: BlockTradePriceRangeParams<'_>) -> Stri
         "📊 北交所大宗价格区间（{}）\n{}({})\n前收盘价: {} (原口径)\n当日实时均价: {:.2} (新口径)\n价格区间: {}\n注: {}",
         p.hhmm, p.name, p.code, prev, p.today_avg_price, range, p.note
     )
+}
+
+/// v13 §14.3 A-01 虚拟仓复盘 (P1, 复用 T-11 竞价复算通路)
+pub struct PaperReviewParams<'a> {
+    pub date: &'a str,
+    pub name: &'a str,
+    pub code: &'a str,
+    pub trigger: &'a str,
+    pub desc: &'a str,
+    pub pnl: Option<f32>,
+    pub plan_high: Option<&'a str>,
+    pub plan_flat: Option<&'a str>,
+    pub plan_low: Option<&'a str>,
+}
+
+/// v13 §14.3 A-01 虚拟仓复盘（盘后参考, 无 banner）
+pub fn render_paper_review(p: PaperReviewParams<'_>) -> String {
+    let pnl_str = p
+        .pnl
+        .map(|v| format!("{:+.1}%", v))
+        .unwrap_or_else(|| "N/A%".to_string());
+    let mut s = format!(
+        "🧪 虚拟仓复盘（{}）\n{}({}) 原触发: {}\n结果: {} {}\n",
+        p.date, p.name, p.code, p.trigger, p.desc, pnl_str
+    );
+    let has_plan = p.plan_high.is_some() || p.plan_flat.is_some() || p.plan_low.is_some();
+    if has_plan {
+        s.push_str("次日计划:\n");
+        if let Some(h) = p.plan_high {
+            s.push_str(&format!("· 高开>1%: {}\n", h));
+        }
+        if let Some(f) = p.plan_flat {
+            s.push_str(&format!("· 平开: {}\n", f));
+        }
+        if let Some(l) = p.plan_low {
+            s.push_str(&format!("· 低开/跌破止损: {}\n", l));
+        }
+    }
+    s.push_str("辅助建议, 非下单指令");
+    s
 }
 
 // ============================================================================
@@ -2499,7 +2543,7 @@ mod tests {
             },
         ];
         let s = render_auction_volume(&banner_normal(), "09:25", &items, "强承接", "可操作");
-        assert!(s.contains("🌅 竞价热点量能 Top2（09:25）"));  // v13 标题统一
+        assert!(s.contains("🌅 竞价热点量能 Top2（09:25）")); // v13 标题统一
         assert!(s.contains("A(000001) 高开+5.2% 量比8.5 [昨日涨停]"));
         assert!(s.contains("B(600000) 高开+2.1% 量比3.2 [观察池]"));
         assert!(s.contains("情绪判读: 强承接, 观察池今日可操作"));
@@ -3089,8 +3133,12 @@ mod tests {
     #[test]
     fn news_to_idea_full_state() {
         let p = NewsToIdeaParams {
-            hhmm: "10:30", headline: "英伟达H200发布", theme: Some("AI算力"),
-            stage: NewsStage::Starting, name: "中科曙光", code: "603019",
+            hhmm: "10:30",
+            headline: "英伟达H200发布",
+            theme: Some("AI算力"),
+            stage: NewsStage::Starting,
+            name: "中科曙光",
+            code: "603019",
             reasons: vec!["AI算力龙头", "业绩超预期"],
             action: Some(NewsAction::BuyDip),
         };
@@ -3107,9 +3155,14 @@ mod tests {
     #[test]
     fn news_to_idea_no_reasons_no_action() {
         let p = NewsToIdeaParams {
-            hhmm: "10:30", headline: "X", theme: None,
-            stage: NewsStage::Fermenting, name: "A", code: "000001",
-            reasons: vec![], action: None,
+            hhmm: "10:30",
+            headline: "X",
+            theme: None,
+            stage: NewsStage::Fermenting,
+            name: "A",
+            code: "000001",
+            reasons: vec![],
+            action: None,
         };
         let banner = BannerCtx::test_default();
         let out = render_news_to_idea(&banner, p);
@@ -3121,9 +3174,14 @@ mod tests {
     #[test]
     fn news_to_idea_action_do_not_chase() {
         let p = NewsToIdeaParams {
-            hhmm: "10:30", headline: "X", theme: Some("X"),
-            stage: NewsStage::Diverging, name: "A", code: "000001",
-            reasons: vec!["r"], action: Some(NewsAction::DoNotChase),
+            hhmm: "10:30",
+            headline: "X",
+            theme: Some("X"),
+            stage: NewsStage::Diverging,
+            name: "A",
+            code: "000001",
+            reasons: vec!["r"],
+            action: Some(NewsAction::DoNotChase),
         };
         let banner = BannerCtx::test_default();
         let out = render_news_to_idea(&banner, p);
@@ -3134,9 +3192,14 @@ mod tests {
     #[test]
     fn news_to_idea_action_observe() {
         let p = NewsToIdeaParams {
-            hhmm: "10:30", headline: "X", theme: Some("X"),
-            stage: NewsStage::Starting, name: "A", code: "000001",
-            reasons: vec!["r1", "r2"], action: Some(NewsAction::Observe),
+            hhmm: "10:30",
+            headline: "X",
+            theme: Some("X"),
+            stage: NewsStage::Starting,
+            name: "A",
+            code: "000001",
+            reasons: vec!["r1", "r2"],
+            action: Some(NewsAction::Observe),
         };
         let banner = BannerCtx::test_default();
         let out = render_news_to_idea(&banner, p);
@@ -3148,7 +3211,10 @@ mod tests {
     // ====== v13 治理元信息测试 (D-01) ======
     #[test]
     fn gov_news_to_idea_cooldown() {
-        assert_eq!(crate::notify::PushKind::NewsToIdea.cooldown_secs(), Some(1200));
+        assert_eq!(
+            crate::notify::PushKind::NewsToIdea.cooldown_secs(),
+            Some(1200)
+        );
     }
     #[test]
     fn gov_news_to_idea_banner() {
@@ -3166,9 +3232,12 @@ mod tests {
     #[test]
     fn catalyst_review_full() {
         let p = CatalystReviewParams {
-            date: "2026-07-06", theme: "AI算力", score: Some(85.0),
+            date: "2026-07-06",
+            theme: "AI算力",
+            score: Some(85.0),
             persistent: PersistentLevel::High,
-            started_names: vec!["A", "B"], pending_names: vec!["C"],
+            started_names: vec!["A", "B"],
+            pending_names: vec!["C"],
             watch_point: Some("明日是否扩散"),
         };
         let out = render_catalyst_review(p);
@@ -3182,9 +3251,12 @@ mod tests {
     #[test]
     fn catalyst_review_persistent_low_empty() {
         let p = CatalystReviewParams {
-            date: "2026-07-06", theme: "X", score: None,
+            date: "2026-07-06",
+            theme: "X",
+            score: None,
             persistent: PersistentLevel::Low,
-            started_names: vec![], pending_names: vec![],
+            started_names: vec![],
+            pending_names: vec![],
             watch_point: None,
         };
         let out = render_catalyst_review(p);
@@ -3198,7 +3270,10 @@ mod tests {
     // ====== v13 治理元信息测试 (A-10) ======
     #[test]
     fn gov_catalyst_review_cooldown() {
-        assert_eq!(crate::notify::PushKind::CatalystReview.cooldown_secs(), Some(86_400));
+        assert_eq!(
+            crate::notify::PushKind::CatalystReview.cooldown_secs(),
+            Some(86_400)
+        );
     }
     #[test]
     fn gov_catalyst_review_no_banner() {
@@ -3207,18 +3282,29 @@ mod tests {
     }
     #[test]
     fn gov_catalyst_review_level() {
-        assert_eq!(crate::notify::PushKind::CatalystReview.level(), crate::notify::PushLevel::Important);
+        assert_eq!(
+            crate::notify::PushKind::CatalystReview.level(),
+            crate::notify::PushLevel::Important
+        );
     }
 
     // ====== v13 I-03 盘中涨停扩散 (审计多发现) (2 用例) ======
     #[test]
     fn industry_chain_intraday_with_supplements() {
         let p = IndustryChainIntradayParams {
-            hhmm: "10:30", chain: "AI算力", limit_count: 5,
-            leader_name: Some("A"), leader_code: Some("000001"), leader_height: 3,
+            hhmm: "10:30",
+            chain: "AI算力",
+            limit_count: 5,
+            leader_name: Some("A"),
+            leader_code: Some("000001"),
+            leader_height: 3,
             supplements: vec![SupplementCandidate {
-                name: "B", code: "000002", trigger: "首板",
-                lo: 10.0, hi: 12.0, stop: 9.0,
+                name: "B",
+                code: "000002",
+                trigger: "首板",
+                lo: 10.0,
+                hi: 12.0,
+                stop: 9.0,
             }],
         };
         let banner = BannerCtx::test_default();
@@ -3232,8 +3318,12 @@ mod tests {
     #[test]
     fn industry_chain_intraday_no_leader_no_supplements() {
         let p = IndustryChainIntradayParams {
-            hhmm: "10:30", chain: "X", limit_count: 0,
-            leader_name: None, leader_code: None, leader_height: 0,
+            hhmm: "10:30",
+            chain: "X",
+            limit_count: 0,
+            leader_name: None,
+            leader_code: None,
+            leader_height: 0,
             supplements: vec![],
         };
         let banner = BannerCtx::test_default();
@@ -3246,7 +3336,10 @@ mod tests {
     // ====== v13 治理元信息测试 (I-03) ======
     #[test]
     fn gov_industry_chain_intraday_cooldown() {
-        assert_eq!(crate::notify::PushKind::IndustryChainIntraday.cooldown_secs(), Some(1800));
+        assert_eq!(
+            crate::notify::PushKind::IndustryChainIntraday.cooldown_secs(),
+            Some(1800)
+        );
     }
     #[test]
     fn gov_industry_chain_intraday_banner() {
@@ -3254,16 +3347,24 @@ mod tests {
     }
     #[test]
     fn gov_industry_chain_intraday_level() {
-        assert_eq!(crate::notify::PushKind::IndustryChainIntraday.level(), crate::notify::PushLevel::Important);
+        assert_eq!(
+            crate::notify::PushKind::IndustryChainIntraday.level(),
+            crate::notify::PushLevel::Important
+        );
     }
 
     // ====== v13.1 T-14/T-15 盘后固定价格 (4 用例) ======
     #[test]
     fn post_fixed_price_order_sh_submitted() {
         let p = PostFixedPriceOrderParams {
-            exchange: Exchange::SH, hhmm: "10:00",
-            name: "A", code: "600000", price: 10.50, qty: 1000,
-            order_id: "ORD001", status: OrderStatus::Submitted,
+            exchange: Exchange::SH,
+            hhmm: "10:00",
+            name: "A",
+            code: "600000",
+            price: 10.50,
+            qty: 1000,
+            order_id: "ORD001",
+            status: OrderStatus::Submitted,
         };
         let out = render_post_fixed_price_order(p);
         assert!(out.contains("📋 盘后固定价格申报（10:00 沪市）"));
@@ -3275,9 +3376,14 @@ mod tests {
     #[test]
     fn post_fixed_price_order_sz_afternoon_cancelled() {
         let p = PostFixedPriceOrderParams {
-            exchange: Exchange::SZ, hhmm: "13:30",
-            name: "A", code: "000001", price: 10.0, qty: 100,
-            order_id: "X", status: OrderStatus::Cancelled,
+            exchange: Exchange::SZ,
+            hhmm: "13:30",
+            name: "A",
+            code: "000001",
+            price: 10.0,
+            qty: 100,
+            order_id: "X",
+            status: OrderStatus::Cancelled,
         };
         let out = render_post_fixed_price_order(p);
         assert!(out.contains("深市"));
@@ -3288,9 +3394,14 @@ mod tests {
     #[test]
     fn post_fixed_price_order_bj_tail_rejected() {
         let p = PostFixedPriceOrderParams {
-            exchange: Exchange::BJ, hhmm: "15:00",
-            name: "A", code: "830001", price: 5.0, qty: 500,
-            order_id: "Y", status: OrderStatus::Rejected,
+            exchange: Exchange::BJ,
+            hhmm: "15:00",
+            name: "A",
+            code: "830001",
+            price: 5.0,
+            qty: 500,
+            order_id: "Y",
+            status: OrderStatus::Rejected,
         };
         let out = render_post_fixed_price_order(p);
         assert!(out.contains("北交所"));
@@ -3301,9 +3412,14 @@ mod tests {
     #[test]
     fn post_fixed_price_fill_with_carry() {
         let p = PostFixedPriceFillParams {
-            exchange: Exchange::SH, hhmm: "15:10",
-            name: "A", code: "600000", fill_price: 10.0, qty: 100,
-            vs_limit_pct: Some(2.5), next_session_carry: true,
+            exchange: Exchange::SH,
+            hhmm: "15:10",
+            name: "A",
+            code: "600000",
+            fill_price: 10.0,
+            qty: 100,
+            vs_limit_pct: Some(2.5),
+            next_session_carry: true,
         };
         let out = render_post_fixed_price_fill(p);
         assert!(out.contains("✅ 盘后固定价格成交（15:10 沪市）"));
@@ -3314,9 +3430,14 @@ mod tests {
     #[test]
     fn post_fixed_price_fill_no_carry() {
         let p = PostFixedPriceFillParams {
-            exchange: Exchange::BJ, hhmm: "15:20",
-            name: "A", code: "830001", fill_price: 5.0, qty: 100,
-            vs_limit_pct: None, next_session_carry: false,
+            exchange: Exchange::BJ,
+            hhmm: "15:20",
+            name: "A",
+            code: "830001",
+            fill_price: 5.0,
+            qty: 100,
+            vs_limit_pct: None,
+            next_session_carry: false,
         };
         let out = render_post_fixed_price_fill(p);
         assert!(out.contains("价差N/A"));
@@ -3324,21 +3445,58 @@ mod tests {
     }
 
     // ====== v13.1 治理元信息测试 (T-14/T-15) ======
-    #[test] fn gov_post_fixed_price_order_cooldown() { assert_eq!(crate::notify::PushKind::PostFixedPriceOrder.cooldown_secs(), Some(60)); }
-    #[test] fn gov_post_fixed_price_fill_cooldown() { assert_eq!(crate::notify::PushKind::PostFixedPriceFill.cooldown_secs(), Some(300)); }
-    #[test] fn gov_post_fixed_price_order_banner() { assert!(crate::notify::PushKind::PostFixedPriceOrder.requires_banner()); }
-    #[test] fn gov_post_fixed_price_fill_banner() { assert!(crate::notify::PushKind::PostFixedPriceFill.requires_banner()); }
-    #[test] fn gov_post_fixed_price_order_level() { assert_eq!(crate::notify::PushKind::PostFixedPriceOrder.level(), crate::notify::PushLevel::Important); }
-    #[test] fn gov_post_fixed_price_fill_level() { assert_eq!(crate::notify::PushKind::PostFixedPriceFill.level(), crate::notify::PushLevel::Important); }
+    #[test]
+    fn gov_post_fixed_price_order_cooldown() {
+        assert_eq!(
+            crate::notify::PushKind::PostFixedPriceOrder.cooldown_secs(),
+            Some(60)
+        );
+    }
+    #[test]
+    fn gov_post_fixed_price_fill_cooldown() {
+        assert_eq!(
+            crate::notify::PushKind::PostFixedPriceFill.cooldown_secs(),
+            Some(300)
+        );
+    }
+    #[test]
+    fn gov_post_fixed_price_order_banner() {
+        assert!(crate::notify::PushKind::PostFixedPriceOrder.requires_banner());
+    }
+    #[test]
+    fn gov_post_fixed_price_fill_banner() {
+        assert!(crate::notify::PushKind::PostFixedPriceFill.requires_banner());
+    }
+    #[test]
+    fn gov_post_fixed_price_order_level() {
+        assert_eq!(
+            crate::notify::PushKind::PostFixedPriceOrder.level(),
+            crate::notify::PushLevel::Important
+        );
+    }
+    #[test]
+    fn gov_post_fixed_price_fill_level() {
+        assert_eq!(
+            crate::notify::PushKind::PostFixedPriceFill.level(),
+            crate::notify::PushLevel::Important
+        );
+    }
 
     // ====== v13.1 T-16 ST 涨跌幅变更 (3 用例) ======
     #[test]
     fn st_price_limit_changed_with_recalc() {
         let p = StPriceLimitChangedParams {
-            hhmm: "09:30", name: "A", code: "600000", st_type: StType::ST,
-            old_limit: 0.05, new_limit: 0.10,
-            holding_qty: 1000, cost: 10.0, now_price: 11.0,
-            new_stop_loss: Some(9.0), new_take_profit: Some(12.0),
+            hhmm: "09:30",
+            name: "A",
+            code: "600000",
+            st_type: StType::ST,
+            old_limit: 0.05,
+            new_limit: 0.10,
+            holding_qty: 1000,
+            cost: 10.0,
+            now_price: 11.0,
+            new_stop_loss: Some(9.0),
+            new_take_profit: Some(12.0),
         };
         let out = render_st_price_limit_changed(p);
         assert!(out.contains("⚠️ ST 涨跌幅变更（09:30）"));
@@ -3353,10 +3511,17 @@ mod tests {
     #[test]
     fn st_price_limit_changed_star_st_no_recalc() {
         let p = StPriceLimitChangedParams {
-            hhmm: "09:30", name: "B", code: "000001", st_type: StType::StarST,
-            old_limit: 0.05, new_limit: 0.10,
-            holding_qty: 500, cost: 5.0, now_price: 4.5,
-            new_stop_loss: None, new_take_profit: None,
+            hhmm: "09:30",
+            name: "B",
+            code: "000001",
+            st_type: StType::StarST,
+            old_limit: 0.05,
+            new_limit: 0.10,
+            holding_qty: 500,
+            cost: 5.0,
+            now_price: 4.5,
+            new_stop_loss: None,
+            new_take_profit: None,
         };
         let out = render_st_price_limit_changed(p);
         assert!(out.contains("B(000001) [*ST]"));
@@ -3368,25 +3533,49 @@ mod tests {
     #[test]
     fn st_price_limit_changed_zero_qty_alert() {
         let p = StPriceLimitChangedParams {
-            hhmm: "09:30", name: "A", code: "600000", st_type: StType::ST,
-            old_limit: 0.05, new_limit: 0.10,
-            holding_qty: 0, cost: 0.0, now_price: 0.0,
-            new_stop_loss: None, new_take_profit: None,
+            hhmm: "09:30",
+            name: "A",
+            code: "600000",
+            st_type: StType::ST,
+            old_limit: 0.05,
+            new_limit: 0.10,
+            holding_qty: 0,
+            cost: 0.0,
+            now_price: 0.0,
+            new_stop_loss: None,
+            new_take_profit: None,
         };
         let out = render_st_price_limit_changed(p);
         assert!(out.contains("持仓 0 股"));
     }
 
     // ====== v13.1 治理元信息测试 (T-16) ======
-    #[test] fn gov_st_price_limit_changed_cooldown() { assert_eq!(crate::notify::PushKind::StPriceLimitChanged.cooldown_secs(), Some(86_400)); }
-    #[test] fn gov_st_price_limit_changed_banner() { assert!(crate::notify::PushKind::StPriceLimitChanged.requires_banner()); }
-    #[test] fn gov_st_price_limit_changed_level() { assert_eq!(crate::notify::PushKind::StPriceLimitChanged.level(), crate::notify::PushLevel::Important); }
+    #[test]
+    fn gov_st_price_limit_changed_cooldown() {
+        assert_eq!(
+            crate::notify::PushKind::StPriceLimitChanged.cooldown_secs(),
+            Some(86_400)
+        );
+    }
+    #[test]
+    fn gov_st_price_limit_changed_banner() {
+        assert!(crate::notify::PushKind::StPriceLimitChanged.requires_banner());
+    }
+    #[test]
+    fn gov_st_price_limit_changed_level() {
+        assert_eq!(
+            crate::notify::PushKind::StPriceLimitChanged.level(),
+            crate::notify::PushLevel::Important
+        );
+    }
 
     // ====== v13.1 T-17/T-18/T-19 剩余 3 新规 (3 用例) ======
     #[test]
     fn etf_closing_call_auction_with_data() {
         let p = EtfClosingCallAuctionParams {
-            hhmm: "14:58", name: "沪深300ETF", code: "510300",
+            hhmm: "14:58",
+            name: "沪深300ETF",
+            code: "510300",
             call_auction_price: Some(3.952),
             vs_continuous_est: Some(0.15),
             liquidity_note: "正常, 无尾盘操纵",
@@ -3401,7 +3590,11 @@ mod tests {
     #[test]
     fn block_trade_intraday_confirm_gem() {
         let p = BlockTradeIntradayConfirmParams {
-            hhmm: "11:15", name: "A", code: "300750", qty: 1000, price: 50.0,
+            hhmm: "11:15",
+            name: "A",
+            code: "300750",
+            qty: 1000,
+            price: 50.0,
             block_type: BlockType::Agreed,
             board: Board::GEM,
             real_time_confirm: true,
@@ -3418,8 +3611,11 @@ mod tests {
     #[test]
     fn block_trade_price_range_bj() {
         let p = BlockTradePriceRangeParams {
-            hhmm: "14:30", name: "A", code: "830001",
-            prev_close: Some(10.50), today_avg_price: 10.80,
+            hhmm: "14:30",
+            name: "A",
+            code: "830001",
+            prev_close: Some(10.50),
+            today_avg_price: 10.80,
             block_price_range: Some("10.50~11.10"),
             note: "原口径为前收盘价, 新口径为当日均价",
         };
@@ -3432,15 +3628,94 @@ mod tests {
     }
 
     // ====== v13.1 治理元信息测试 (T-17/T-18/T-19) ======
-    #[test] fn gov_etf_closing_call_auction_cooldown() { assert_eq!(crate::notify::PushKind::EtfClosingCallAuction.cooldown_secs(), Some(86_400)); }
-    #[test] fn gov_block_trade_intraday_confirm_cooldown() { assert_eq!(crate::notify::PushKind::BlockTradeIntradayConfirm.cooldown_secs(), Some(300)); }
-    #[test] fn gov_block_trade_price_range_cooldown() { assert_eq!(crate::notify::PushKind::BlockTradePriceRange.cooldown_secs(), Some(3600)); }
-    #[test] fn gov_etf_closing_call_auction_no_banner() { assert!(!crate::notify::PushKind::EtfClosingCallAuction.requires_banner()); }
-    #[test] fn gov_block_trade_intraday_confirm_no_banner() { assert!(!crate::notify::PushKind::BlockTradeIntradayConfirm.requires_banner()); }
-    #[test] fn gov_block_trade_price_range_no_banner() { assert!(!crate::notify::PushKind::BlockTradePriceRange.requires_banner()); }
-    #[test] fn gov_etf_closing_call_auction_level() { assert_eq!(crate::notify::PushKind::EtfClosingCallAuction.level(), crate::notify::PushLevel::Important); }
-    #[test] fn gov_block_trade_intraday_confirm_level() { assert_eq!(crate::notify::PushKind::BlockTradeIntradayConfirm.level(), crate::notify::PushLevel::Important); }
-    #[test] fn gov_block_trade_price_range_level() { assert_eq!(crate::notify::PushKind::BlockTradePriceRange.level(), crate::notify::PushLevel::Important); }
+    #[test]
+    fn gov_etf_closing_call_auction_cooldown() {
+        assert_eq!(
+            crate::notify::PushKind::EtfClosingCallAuction.cooldown_secs(),
+            Some(86_400)
+        );
+    }
+    #[test]
+    fn gov_block_trade_intraday_confirm_cooldown() {
+        assert_eq!(
+            crate::notify::PushKind::BlockTradeIntradayConfirm.cooldown_secs(),
+            Some(300)
+        );
+    }
+    #[test]
+    fn gov_block_trade_price_range_cooldown() {
+        assert_eq!(
+            crate::notify::PushKind::BlockTradePriceRange.cooldown_secs(),
+            Some(3600)
+        );
+    }
+    #[test]
+    fn gov_etf_closing_call_auction_no_banner() {
+        assert!(!crate::notify::PushKind::EtfClosingCallAuction.requires_banner());
+    }
+    #[test]
+    fn gov_block_trade_intraday_confirm_no_banner() {
+        assert!(!crate::notify::PushKind::BlockTradeIntradayConfirm.requires_banner());
+    }
+    #[test]
+    fn gov_block_trade_price_range_no_banner() {
+        assert!(!crate::notify::PushKind::BlockTradePriceRange.requires_banner());
+    }
+    #[test]
+    fn gov_etf_closing_call_auction_level() {
+        assert_eq!(
+            crate::notify::PushKind::EtfClosingCallAuction.level(),
+            crate::notify::PushLevel::Important
+        );
+    }
+    #[test]
+    fn gov_block_trade_intraday_confirm_level() {
+        assert_eq!(
+            crate::notify::PushKind::BlockTradeIntradayConfirm.level(),
+            crate::notify::PushLevel::Important
+        );
+    }
+    #[test]
+    fn gov_block_trade_price_range_level() {
+        assert_eq!(
+            crate::notify::PushKind::BlockTradePriceRange.level(),
+            crate::notify::PushLevel::Important
+        );
+    }
+
+    // ====== v14 A-01 虚拟仓复盘 (2 用例) ======
+    #[test]
+    fn paper_review_full() {
+        let p = PaperReviewParams {
+            date: "2026-07-06", name: "A", code: "000001", trigger: "首板",
+            desc: "已成交", pnl: Some(2.5),
+            plan_high: Some("观察"), plan_flat: Some("持有"), plan_low: Some("止损"),
+        };
+        let out = render_paper_review(p);
+        assert!(out.contains("🧪 虚拟仓复盘（2026-07-06）"));
+        assert!(out.contains("A(000001) 原触发: 首板"));
+        assert!(out.contains("结果: 已成交 +2.5%"));
+        assert!(out.contains("· 高开>1%: 观察"));
+        assert!(out.contains("· 平开: 持有"));
+        assert!(out.contains("· 低开/跌破止损: 止损"));
+    }
+
+    #[test]
+    fn paper_review_pnl_missing_no_plan() {
+        let p = PaperReviewParams {
+            date: "2026-07-06", name: "A", code: "000001", trigger: "T",
+            desc: "X", pnl: None,
+            plan_high: None, plan_flat: None, plan_low: None,
+        };
+        let out = render_paper_review(p);
+        assert!(out.contains("结果: X N/A%"));
+        assert!(!out.contains("次日计划:"));
+    }
+
+    // ====== v14 治理元信息测试 (A-01) ======
+    #[test] fn gov_paper_review_cooldown() { assert_eq!(crate::notify::PushKind::PaperReview.cooldown_secs(), Some(86_400)); }
+    #[test] fn gov_paper_review_no_banner() { assert!(!crate::notify::PushKind::PaperReview.requires_banner()); }
+    #[test] fn gov_paper_review_level() { assert_eq!(crate::notify::PushKind::PaperReview.level(), crate::notify::PushLevel::Info); }
 
     #[test]
     fn evidence_quality_labels() {

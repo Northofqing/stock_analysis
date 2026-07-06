@@ -128,6 +128,9 @@ pub enum PushKind {
     BlockTradeIntradayConfirm,
     /// v13.1 §5.7 T-19 北交所大宗价格区间 (ℹ️ 60min/票)
     BlockTradePriceRange,
+    // ============= v14 新增 (原 A-01, 复用 T-11) =============
+    /// v13 §14.3 A-01 虚拟仓复盘 (ℹ️ 1次/日, 盘后参考)
+    PaperReview,
 }
 
 impl PushKind {
@@ -172,6 +175,7 @@ impl PushKind {
             | PushKind::EtfClosingCallAuction
             | PushKind::BlockTradeIntradayConfirm
             | PushKind::BlockTradePriceRange => PushLevel::Important,
+            // v14 PaperReview: ℹ️ 盘后参考
             // ℹ️参考 (降级 + ForbiddenOps/PaperTrade)
             _ => PushLevel::Info,
         }
@@ -256,6 +260,7 @@ impl PushKind {
             PushKind::EtfClosingCallAuction => Some(86_400),                  // 1次/日
             PushKind::BlockTradeIntradayConfirm => Some(300),                 // 5 min/票
             PushKind::BlockTradePriceRange => Some(3600),                     // 60 min/票
+            PushKind::PaperReview => Some(86_400),                             // 1次/日
             _ => Some(1800),                                                  // 默认 30min
         }
     }
@@ -311,6 +316,7 @@ impl PushKind {
             PushKind::EtfClosingCallAuction => "ETF 集合竞价尾盘",
             PushKind::BlockTradeIntradayConfirm => "大宗盘中确认",
             PushKind::BlockTradePriceRange => "北交所大宗价格区间",
+            PushKind::PaperReview => "虚拟仓复盘",
         }
     }
 }
