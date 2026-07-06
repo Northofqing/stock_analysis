@@ -1100,11 +1100,9 @@ pub fn shadow_rank_hits(
         return Vec::new();
     }
     let ctx = MarketContext::default();
-    let mut ranked_all = Vec::with_capacity(hits.len());
-    let mut a_count = 0;
-    let mut b_count = 0;
-    let mut c_count = 0;
-    let mut drop_count = 0;
+    // v19.12: 按 chain 合并 (同股票多条公告聚合到 1 条 RankedNews)
+    use std::collections::HashMap;
+    let mut by_chain: HashMap<String, (NewsCandidate, Vec<RankedNews>)> = HashMap::new();
     for (i, hit) in hits.iter().enumerate() {
         // 找对应 title (titles 跟 hits 不一定 1:1, 用 chain 关键词模糊匹配)
         let title = titles
@@ -1114,43 +1112,77 @@ pub fn shadow_rank_hits(
             .unwrap_or_else(|| hit.chain.clone());
         let cand = NewsCandidate {
             id: format!("shadow-{}-{}", i, hit.chain),
-            title,
+            title: title.clone(),
             snippet: String::new(),
             source: "shadow".to_string(),
             published_at: Some(Local::now()),
             chain_hits: vec![hit.clone()],
-            board_code: None, // 一期不查板块, 让 heat_stage 走 Unknown
+            board_code: None,
         };
         let ranked = rank_news(&cand, &ctx);
-        match ranked.bucket {
+        // 合并到 by_chain
+        let entry = by_chain.entry(hit.chain.clone()).or_insert_with(|| (cand.clone(), Vec::new()));
+        entry.1.push(ranked);
+    }
+
+    let mut ranked_all = Vec::new();
+    let mut a_count = 0;
+    let mut b_count = 0;
+    let mut c_count = 0;
+    let mut drop_count = 0;
+
+    for (chain, (cand, mut ranked_vec)) in by_chain {
+        if ranked_vec.is_empty() { continue; }
+        // 取 score 最高的作为代表
+        ranked_vec.sort_by(|a, b| b.score.cmp(&a.score));
+        let best = ranked_vec[0].clone();
+        // 合并事件类型 + reasons
+        let event_labels: Vec<String> = ranked_vec.iter()
+            .map(|r| r.event_type.label().to_string())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        let merged_event = if event_labels.len() == 1 {
+            event_labels[0].clone()
+        } else {
+            format!("多事件({})", event_labels.join("/"))
+        };
+        let n = ranked_vec.len();
+        let mut merged = best;
+        merged.candidate = cand;
+        merged.reasons.push(format!("合并 {} 条事件: {}", n, merged_event));
+        // 用最新 published_at
+        if let Some(last) = ranked_vec.first() {
+            merged.candidate.published_at = last.candidate.published_at;
+        }
+
+        match merged.bucket {
             NewsRankBucket::PushNow => a_count += 1,
             NewsRankBucket::WatchCandidate => b_count += 1,
             NewsRankBucket::LogOnly => c_count += 1,
             NewsRankBucket::Drop => drop_count += 1,
         }
-        let drop = ranked
+        let drop = merged
             .drop_reason
             .as_deref()
             .map(|r| format!(" drop={}", r))
             .unwrap_or_default();
         log::info!(
-            "[NEWS_RANKER][shadow] chain={} event={} stage={} score={} bucket={:?}{}",
-            hit.chain,
-            ranked.event_type.label(),
-            ranked.heat_stage.label(),
-            ranked.score,
-            ranked.bucket,
+            "[NEWS_RANKER][shadow] chain={} 合并{}条 event={} stage={} score={} bucket={:?}{}",
+            chain, n,
+            merged.event_type.label(),
+            merged.heat_stage.label(),
+            merged.score,
+            merged.bucket,
             drop
         );
-        ranked_all.push(ranked);
+        ranked_all.push(merged);
     }
+
     log::info!(
-        "[NEWS_RANKER][shadow] 汇总: {} 命中 → A={} B={} C={} Drop={}",
-        hits.len(),
-        a_count,
-        b_count,
-        c_count,
-        drop_count
+        "[NEWS_RANKER][shadow] 汇总: {} 命中 → 合并后 {} 链 → A={} B={} C={} Drop={}",
+        hits.len(), ranked_all.len(),
+        a_count, b_count, c_count, drop_count
     );
     ranked_all
 }

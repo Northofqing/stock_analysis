@@ -104,50 +104,11 @@ pub enum PushKind {
 }
 
 impl PushKind {
-    /// 是否降级 (P0-4 commit D 默认行为, PUSH_VERBOSE=true 时无效)
+    /// v19.12: 全部保留 false (用户要求去掉条件限制, 所有模板都推送)
+    /// 旧: 11 保留 + 19 deprecated 降级 (P0-4 commit D 默认行为, PUSH_VERBOSE=true 时无效)
+    /// 新: 所有 30 个 PushKind 都保留, deprecated=0
     pub fn is_deprecated(self) -> bool {
-        match self {
-            // 保留 11 条 (原 9 + P0-5++ Commit 5 加 CandidateBoard + P2-News Commit 4 加 NewsRanked)
-            PushKind::HoldingEvent
-            | PushKind::DailyReport
-            | PushKind::Announcement
-            | PushKind::CandidateBoard
-            | PushKind::NewsRanked => false,
-            // v12 §14.3 新增：保留 (默认推送)
-            // AccountMode/DataMode 是状态变更即推, 永久保留
-            // HoldingPlan/T0Advice/CandidateTriggered/CloseCall 是交易建议类核心
-            // ReviewMarket/ReviewLhb/ReviewSignal/ReviewFailure/TomorrowWatch/EventCalendar 是盘后复盘
-            PushKind::AccountMode
-            | PushKind::DataMode
-            | PushKind::HoldingPlan
-            | PushKind::T0Advice
-            | PushKind::CandidateTriggered
-            | PushKind::CloseCall
-            | PushKind::ReviewMarket
-            | PushKind::ReviewLhb
-            | PushKind::ReviewSignal
-            | PushKind::ReviewFailure
-            | PushKind::TomorrowWatch
-            | PushKind::EventCalendar => false,
-            // 降级 19 条 (原 17 + v12 加 ForbiddenOps / PaperTrade 默认降级)
-            PushKind::AuctionVolume
-            | PushKind::VirtualWatch
-            | PushKind::LimitBoards
-            | PushKind::SectorTop
-            | PushKind::FundInflow
-            | PushKind::AuctionRepush
-            | PushKind::FactorIC
-            | PushKind::SectorTier
-            | PushKind::CapitalVerify
-            | PushKind::WeeklySOP
-            | PushKind::StockPick
-            | PushKind::OptimalClose
-            | PushKind::VolumeWatchlist
-            | PushKind::VolumeRealTrade
-            | PushKind::IndustryChain
-            | PushKind::ForbiddenOps
-            | PushKind::PaperTrade => true,
-        }
+        false
     }
 
     /// v12 §14.3 等级: 🚨紧急 / ⚡重要 / ℹ️参考
@@ -309,26 +270,9 @@ impl PushLevel {
 /// - 其他情况 → 调 `push_wechat` 正常推送
 ///
 /// PUSH_VERBOSE=true 恢复旧行为 (留退路, shadow 切换验证用)
-/// PUSH_VERBOSE 未设或 != "true" → 默认精简 (12 条降级, 23 条保留)
+/// v19.12: 全部保留 true (用户要求去掉条件限制, 所有模板都推送)
+/// PUSH_VERBOSE 已废: 之前用来切换 deprecated 模板, 现在 deprecated=0 所以无需开关
 pub async fn push_governor(text: &str, kind: PushKind) -> bool {
-    let verbose = std::env::var("PUSH_VERBOSE").ok().as_deref() == Some("true");
-
-    if kind.is_deprecated() && !verbose {
-        log::warn!(
-            "[PUSH_GOVERNOR] 降级日志 (kind={}, PUSH_VERBOSE 默认精简):\n{}",
-            kind.label(),
-            text
-        );
-        return false;
-    }
-
-    if verbose && kind.is_deprecated() {
-        log::info!(
-            "[PUSH_GOVERNOR] 保留旧行为 (kind={}, PUSH_VERBOSE=true)",
-            kind.label()
-        );
-    }
-
     push_wechat(text).await
 }
 

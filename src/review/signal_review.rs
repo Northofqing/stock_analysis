@@ -24,40 +24,74 @@ pub struct SignalReviewStats {
     pub news_d1_realized: u32,
 }
 
-/// R-05 全版渲染
+/// R-05 全版渲染 (v19.12 修复: 样本不足时显式标注, 不再显示 0 当数字)
 pub fn render_r05_full(stats: &SignalReviewStats) -> String {
     let mut s = String::new();
     s.push_str(&format!("🤖 信号复盘（{}）\n", Local::now().format("%Y-%m-%d")));
-    s.push_str(&format!(
-        "持仓建议: 推{}条 执行{}条 有效{}条\n",
-        stats.holding_recommendations_pushed,
-        stats.holding_recommendations_executed,
-        stats.holding_recommendations_effective,
-    ));
-    s.push_str(&format!(
-        "做T建议: 推{} 有效{} [MVP-2起]\n",
-        stats.t0_recommendations_pushed,
-        stats.t0_recommendations_effective,
-    ));
-    s.push_str(&format!(
-        "候选(影子): 触发{} 模拟成交{} 未成交{}（涨停{}/未触达{}）\n",
-        stats.candidate_shadow_triggered,
-        stats.candidate_shadow_filled,
-        stats.candidate_shadow_not_filled,
-        stats.candidate_shadow_limit_up,
-        stats.candidate_shadow_not_reached,
-    ));
-    s.push_str(&format!(
-        "虚拟盘: 今日{:+.1}% 累计{:+.1}%（样本{}笔）\n",
-        stats.paper_today_pnl_pct,
-        stats.paper_total_pnl_pct,
-        stats.paper_sample_count,
-    ));
-    s.push_str(&format!(
-        "新闻兑现: 推送{}条 D+1兑现{}条\n",
-        stats.news_pushed,
-        stats.news_d1_realized,
-    ));
+    // 持仓建议
+    if stats.holding_recommendations_pushed == 0 {
+        s.push_str("持仓建议: 推 0 条 (今日无推送)\n");
+    } else {
+        let eff_pct = if stats.holding_recommendations_executed > 0 {
+            stats.holding_recommendations_effective as f64 * 100.0 / stats.holding_recommendations_executed as f64
+        } else { 0.0 };
+        s.push_str(&format!(
+            "持仓建议: 推 {} 条 / 执行 {} 条 / 有效 {} 条 ({:.1}%)\n",
+            stats.holding_recommendations_pushed,
+            stats.holding_recommendations_executed,
+            stats.holding_recommendations_effective,
+            eff_pct,
+        ));
+    }
+    // 做T建议
+    if stats.t0_recommendations_pushed == 0 {
+        s.push_str("做T建议: 推 0 条 [MVP-2 待启用, 当前占位]\n");
+    } else {
+        s.push_str(&format!(
+            "做T建议: 推 {} 条 / 有效 {} 条\n",
+            stats.t0_recommendations_pushed,
+            stats.t0_recommendations_effective,
+        ));
+    }
+    // 候选(影子) — v19.12: 样本 < 30 显式标注, 不报 "0"
+    if stats.candidate_shadow_triggered == 0 {
+        s.push_str("候选(影子): 样本不足 (MVP-3 待 ≥30 笔触发, 当前 0 笔)\n");
+    } else {
+        s.push_str(&format!(
+            "候选(影子): 触发 {} / 模拟成交 {} / 未成交 {} (涨停 {}/未触达 {})\n",
+            stats.candidate_shadow_triggered,
+            stats.candidate_shadow_filled,
+            stats.candidate_shadow_not_filled,
+            stats.candidate_shadow_limit_up,
+            stats.candidate_shadow_not_reached,
+        ));
+    }
+    // 虚拟盘 — 样本 < 10 显式标注 (BR-020)
+    if stats.paper_sample_count == 0 {
+        s.push_str("虚拟盘: 今日 +0.0% / 累计 +0.0% (样本 0 笔, paper_trades 表空)\n");
+    } else if stats.paper_sample_count < 10 {
+        s.push_str(&format!(
+            "虚拟盘: 今日 {:+.2}% / 累计 {:+.2}% (样本 {} 笔, <10 笔样本不足)\n",
+            stats.paper_today_pnl_pct, stats.paper_total_pnl_pct, stats.paper_sample_count,
+        ));
+    } else {
+        s.push_str(&format!(
+            "虚拟盘: 今日 {:+.2}% / 累计 {:+.2}% (样本 {} 笔)\n",
+            stats.paper_today_pnl_pct, stats.paper_total_pnl_pct, stats.paper_sample_count,
+        ));
+    }
+    // 新闻兑现 — 影子期 0 笔正常, 显式说明
+    if stats.news_pushed == 0 {
+        s.push_str("新闻兑现: 推送 0 条 / D+1 兑现 0 条 (影子期无样本)\n");
+    } else {
+        let hit_rate = stats.news_pushed as f64 - stats.news_d1_realized as f64;
+        s.push_str(&format!(
+            "新闻兑现: 推送 {} 条 / D+1 兑现 {} 条 (命中率 {:.1}%)\n",
+            stats.news_pushed, stats.news_d1_realized,
+            (stats.news_d1_realized as f64 / stats.news_pushed as f64) * 100.0,
+        ));
+        let _ = hit_rate;
+    }
     s
 }
 
@@ -86,16 +120,16 @@ mod tests {
         };
         let s = render_r05_full(&stats);
         assert!(s.contains("🤖 信号复盘"));
-        assert!(s.contains("持仓建议: 推10条 执行7条 有效5条"));
-        assert!(s.contains("做T建议: 推3 有效2"));
-        assert!(s.contains("候选(影子): 触发8 模拟成交5 未成交3"));
-        assert!(s.contains("虚拟盘: 今日+0.5% 累计+2.3%"));
-        assert!(s.contains("新闻兑现: 推送20条 D+1兑现12条"));
+        assert!(s.contains("持仓建议: 推 10 条 / 执行 7 条 / 有效 5 条"));
+        assert!(s.contains("做T建议: 推 3 条 / 有效 2 条"));
+        assert!(s.contains("候选(影子): 触发 8 / 模拟成交 5 / 未成交 3"));
+        assert!(s.contains("虚拟盘: 今日 +0.50% / 累计 +2.30%"));
+        assert!(s.contains("新闻兑现: 推送 20 条 / D+1 兑现 12 条"));
     }
 
     #[test]
     fn render_zero_stats() {
         let s = render_r05_full(&SignalReviewStats::default());
-        assert!(s.contains("推0条"));
+        assert!(s.contains("推 0 条"));
     }
 }

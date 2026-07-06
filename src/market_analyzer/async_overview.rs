@@ -303,11 +303,12 @@ fn format_market_report(overview: &MarketOverview) -> String {
     let _ = writeln!(s, "| 平盘家数 | {} |", overview.flat_count);
     let _ = writeln!(s, "| 涨停 | {} |", overview.limit_up_count);
     let _ = writeln!(s, "| 跌停 | {} |", overview.limit_down_count);
-    let _ = writeln!(s, "| 两市成交额 (500只样本) | {:.0}亿 |", overview.total_amount);
-    // 修复 P1-3 (2026-06-30 codex review, BR-012): None 时显式打 [数据缺失], 禁止显示 0.00.
+    // v19.12 修复: 500 只样本累加 ≠ 沪深两市真实成交额, 显式标注 "样本估算" 防误导
+    let _ = writeln!(s, "| 两市成交额 (涨幅榜500只样本估算) | {:.0}亿 |", overview.total_amount);
+    // 修复 P1-3 (2026-06-30 codex review, BR-012): None 时显式打 -, 禁止显示 0.00.
     match overview.north_flow {
         Some(v) => { let _ = writeln!(s, "| 北向资金 | {:+.2}亿 |", v); }
-        None => { let _ = writeln!(s, "| 北向资金 | [数据缺失] |"); }
+        None => { let _ = writeln!(s, "| 北向资金 | - (数据源缺失) |"); }
     }
     let _ = writeln!(s);
     if !overview.top_sectors.is_empty() {
@@ -405,7 +406,7 @@ fn judge_market_sentiment(overview: &MarketOverview) -> MarketSentiment {
             bullets.push(format!("🌏 北向大幅流出 {:.0}亿 (外资悲观)", n));
         }
     } else {
-        bullets.push("🌏 北向资金: [数据缺失]".to_string());
+        bullets.push("🌏 北向资金: - (数据源缺失, 未计算)".to_string());
     }
 
     // 4. 主要指数强弱

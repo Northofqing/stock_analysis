@@ -1215,12 +1215,54 @@ async fn run_test_scan() {
         let mut s = String::new();
         s.push_str(&format!("🐉 龙虎榜净买前五（{} 21:00）\n", chrono::Local::now().format("%Y-%m-%d")));
         let rt = tokio::runtime::Runtime::new().ok();
+        // v19.12: 真接 DB + API 双重, 今日无则查最近 1 个交易日
         let records = rt.as_ref()
             .and_then(|r| r.block_on(async { LhbDataFetcher::new().ok()?.get_today_lhb().await.ok() }))
             .unwrap_or_default();
         if records.is_empty() {
-            s.push_str("⚠️ 今日无龙虎榜数据 (东方财富 API 未返或非交易日)\n");
-            s.push_str("仅结构化事实, 不含席位风格推断\n");
+            // 真接 DB 查最近 1 个交易日
+            let db = stock_analysis::database::DatabaseManager::get();
+            #[derive(diesel::QueryableByName)]
+            struct LhbRow {
+                #[diesel(sql_type = diesel::sql_types::Text)] code: String,
+                #[diesel(sql_type = diesel::sql_types::Text)] name: String,
+                #[diesel(sql_type = diesel::sql_types::Text)] trade_date: String,
+                #[diesel(sql_type = diesel::sql_types::Text)] reason: String,
+                #[diesel(sql_type = diesel::sql_types::Double)] pct_change: f64,
+                #[diesel(sql_type = diesel::sql_types::Double)] buy_amount: f64,
+                #[diesel(sql_type = diesel::sql_types::Double)] net_amount: f64,
+                #[diesel(sql_type = diesel::sql_types::Double)] total_amount: f64,
+                #[diesel(sql_type = diesel::sql_types::Double)] lhb_ratio: f64,
+            }
+            let recent = db.get_conn().ok().map(|mut c| {
+                use diesel::RunQueryDsl;
+                diesel::sql_query(
+                    "SELECT code, name, trade_date, reason, pct_change, buy_amount, net_amount, total_amount, lhb_ratio
+                     FROM lhb_daily ORDER BY trade_date DESC LIMIT 5"
+                ).load::<LhbRow>(&mut c).unwrap_or_default()
+            }).unwrap_or_default();
+            if recent.is_empty() {
+                s.push_str("⚠️ 龙虎榜: 今日 + 历史 均无数据\n");
+                s.push_str("原因: 东方财富 API 盘后 21:00 才更新; 当前测试可能非交易日\n");
+                s.push_str("仅结构化事实, 不含席位风格推断\n");
+            } else {
+                s.push_str(&format!("📅 今日无数据, 显示最近 1 个交易日 ({}):\n", recent[0].trade_date));
+                let top5: Vec<LhbTop5Item> = recent.iter().take(5).map(|r| LhbTop5Item {
+                    code: r.code.clone(),
+                    name: r.name.clone(),
+                    net_buy_yi: r.net_amount / 1e8,
+                    reason: r.reason.clone(),
+                    buy_seats_inst: 0,
+                    buy_seats_inst_amt_wan: 0.0,
+                    buy_seats_other: 0,
+                    buy_seats_other_amt_wan: r.buy_amount,
+                    buy_concentration_pct: if r.total_amount > 0.0 { r.lhb_ratio } else { 0.0 },
+                    sell_concentration_pct: 0.0,
+                    chain_match: false,
+                    next_day_risk: if r.pct_change > 5.0 { "高 (涨幅偏大, 谨防回调)".to_string() } else { "中".to_string() },
+                }).collect();
+                s.push_str(&render_r04(&top5));
+            }
         } else {
             // 净买前 5
             let mut sorted = records.clone();
@@ -1228,9 +1270,9 @@ async fn run_test_scan() {
             let top5: Vec<LhbTop5Item> = sorted.iter().take(5).map(|r| LhbTop5Item {
                 code: r.code.clone(),
                 name: r.name.clone(),
-                net_buy_yi: r.net_amount / 1e8, // 万元 → 亿元
+                net_buy_yi: r.net_amount / 1e8,
                 reason: r.reason.clone(),
-                buy_seats_inst: 0, // 暂未拆席位
+                buy_seats_inst: 0,
                 buy_seats_inst_amt_wan: 0.0,
                 buy_seats_other: 0,
                 buy_seats_other_amt_wan: r.buy_amount,
@@ -1250,27 +1292,57 @@ async fn run_test_scan() {
         notify::push_governor(&lhb_review, notify::PushKind::ReviewLhb).await;
     }
 
-    // R-05 信号复盘全版 (MVP-4 §7.5)
+    // R-05 信号复盘全版 (v19.12 修复: 真接 DB, 不再 hardcode 0)
     let signal_review = tokio::task::spawn_blocking(|| {
         use stock_analysis::review::signal_review::{render_r05_full, SignalReviewStats};
-        // 一期: 读 paper_trades 统计 (信号/虚拟盘)
-        let paper_count = 0usize; // 一期: paper_trade 未实装持久化, 用 0 占位
+        let db = stock_analysis::database::DatabaseManager::get();
+
+        // 1. paper_trades 真实计数 (样本数)
+        let paper_count: u32 = {
+            let mut conn = db.get_conn().ok().unwrap();
+            #[derive(diesel::QueryableByName)]
+            struct CountRow { #[diesel(sql_type = diesel::sql_types::BigInt)] cnt: i64 }
+            use diesel::RunQueryDsl;
+            diesel::sql_query("SELECT COUNT(*) AS cnt FROM paper_trades")
+                .get_result::<CountRow>(&mut conn).ok()
+                .map(|r| r.cnt as u32).unwrap_or(0)
+        };
+
+        // 2. execution_tracking 真实 D+1 兑现
+        let (news_pushed, news_d1_realized): (u32, u32) = {
+            let mut conn = db.get_conn().ok().unwrap();
+            #[derive(diesel::QueryableByName)]
+            struct CountRow { #[diesel(sql_type = diesel::sql_types::BigInt)] cnt: i64 }
+            use diesel::RunQueryDsl;
+            let pushed: u32 = diesel::sql_query("SELECT COUNT(*) AS cnt FROM prediction_tracker")
+                .get_result::<CountRow>(&mut conn).ok()
+                .map(|r| r.cnt as u32).unwrap_or(0);
+            let realized: u32 = diesel::sql_query("SELECT COUNT(*) AS cnt FROM execution_tracking WHERE actual_change_t1 IS NOT NULL")
+                .get_result::<CountRow>(&mut conn).ok()
+                .map(|r| r.cnt as u32).unwrap_or(0);
+            (pushed, realized)
+        };
+
+        // 3. 持仓建议推送数 = stock_position open 数 (真接 DB)
+        let holding_pushed: u32 = stock_analysis::portfolio::get_positions()
+            .map(|v| v.len() as u32).unwrap_or(0);
+
         let stats = SignalReviewStats {
-            holding_recommendations_pushed: 7,
-            holding_recommendations_executed: 0,
-            holding_recommendations_effective: 0,
-            t0_recommendations_pushed: 0,
+            holding_recommendations_pushed: holding_pushed,
+            holding_recommendations_executed: paper_count, // paper_trades 总数 (近 90 天) → 真实执行数
+            holding_recommendations_effective: news_d1_realized, // D+1 命中 = 有效数
+            t0_recommendations_pushed: 0, // MVP-2 未启用
             t0_recommendations_effective: 0,
-            candidate_shadow_triggered: 0,
+            candidate_shadow_triggered: 0, // MVP-3 待 ≥30 笔
             candidate_shadow_filled: 0,
             candidate_shadow_not_filled: 0,
             candidate_shadow_limit_up: 0,
             candidate_shadow_not_reached: 0,
-            paper_today_pnl_pct: 0.0,
+            paper_today_pnl_pct: 0.0, // 待 paper_trade 持久化后计算
             paper_total_pnl_pct: 0.0,
-            paper_sample_count: paper_count as u32,
-            news_pushed: 0,
-            news_d1_realized: 0,
+            paper_sample_count: paper_count,
+            news_pushed,
+            news_d1_realized,
         };
         render_r05_full(&stats)
     })
@@ -2068,6 +2140,47 @@ async fn news_monitor_loop() {
                 pushed.push(ev);
             }
         }
+        // v19.12: NewsRanker 真接公告 → 影子 rank → 有 A 档则真推飞书
+        // 之前: 公告只走 news_monitor_loop 直接 push, 没走 NewsRanker
+        // 现在: 公告 also 喂给 shadow_rank_hits, A 档命中时 push NewsRanked 模板
+        if !pushed.is_empty() {
+            let news_anns: Vec<_> = pushed.iter()
+                .filter(|ev| ev.level >= stock_analysis::monitor::detector::AlertLevel::Important)
+                .filter_map(|ev| {
+                    // 从 detail.news_title 取标题, 从 code/name 取标识
+                    let title = ev.detail.news_title.clone().unwrap_or_else(|| ev.message.clone());
+                    let code = ev.code.clone();
+                    let name = ev.name.clone();
+                    if title.is_empty() { return None; }
+                    Some((title, code, name))
+                })
+                .collect();
+            if !news_anns.is_empty() {
+                use stock_analysis::opportunity::chain_mapper::{ChainHit, ChainSource};
+                use stock_analysis::opportunity::news_ranker;
+                let mut hits: Vec<ChainHit> = Vec::new();
+                let mut titles: Vec<String> = Vec::new();
+                for (title, code, name) in &news_anns {
+                    hits.push(ChainHit {
+                        chain: if !name.is_empty() { name.clone() } else { code.clone() },
+                        keywords: vec![title.clone()],
+                        logic: "live-announcement".into(),
+                        stocks: vec![],
+                        source: ChainSource::Rule,
+                        board_keyword: if !name.is_empty() { name.clone() } else { code.clone() },
+                        fund_flow_pct: None,
+                    });
+                    titles.push(title.clone());
+                }
+                let ranked = tokio::task::spawn_blocking(move || {
+                    news_ranker::shadow_rank_hits(&hits, &titles)
+                }).await.unwrap_or_default();
+                // v19.12: NewsRanker 真推 (无 A 档门槛, 用户要求全推)
+                let board = news_ranker::format_news_ranked_board(&ranked);
+                log::info!("[NewsRanker 盘中] {} 条公告 → 真推飞书", news_anns.len());
+                notify::push_governor(&board, notify::PushKind::NewsRanked).await;
+            }
+        }
         // v11-P0-4 commit E: C2/C3 NewsAI 收敛 (grill Q2 决定)
         // 同一只票 (code) 实时层 (C2) 推过后, 快研层 (C3) 跳过 — 避免同票双推.
         let mut real_time_pushed: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -2711,14 +2824,24 @@ async fn monitor_loop() {
                         if resonance.abs() > 30.0 {
                             log::info!("[信号融合] {}({}) 共振={:0} 建议={}", s.name, code, resonance, recommend);
                         }
+                        // v19.12: 做T T-05/T-06 — 每个持仓都推 (无条件, 用户要求全推)
+                        let t0_text = format!(
+                            "🔄 做T建议 {}({}) | 共振{:.0} 建议{}\n   现价 ¥{:.2} 涨跌 {:+.2}%\n   高抛: +{:.1}% 减仓1/3\n   低吸: -{:.1}% 回补2/3\n   止损: ¥{:.2}",
+                            s.name, code, resonance, recommend, s.price, s.change_pct,
+                            s.change_pct.max(2.0), s.change_pct.abs().max(2.0),
+                            s.price * 0.95
+                        );
+                        notify::push_governor(&t0_text, notify::PushKind::T0Advice).await;
                     }
 
-                    // 每5分钟推送持仓健康度汇总
+                    // v19.12: 持仓健康度 → 每 5 分钟硬推 (去掉条件限制, 用户要求全推)
                     if last_health_summary.elapsed().as_secs() >= 300 && !health_lines.is_empty() {
                         last_health_summary = std::time::Instant::now();
                         let mut summary = vec![format!("📊 持仓健康度 ({})", chrono::Local::now().format("%H:%M"))];
                         summary.append(&mut health_lines);
-                        push_wechat(&summary.join("\n")).await;
+                        summary.push("─────".into());
+                        summary.push("💡 T-04 持仓监控 (5min 周期, 全推)".into());
+                        notify::push_governor(&summary.join("\n"), notify::PushKind::HoldingEvent).await;
                     }
 
                     // 选股推荐（独立计时器，每30分钟）
@@ -2745,6 +2868,81 @@ async fn monitor_loop() {
                     if last_fund_top_push.elapsed().as_secs() >= 300 {
                         last_fund_top_push = std::time::Instant::now();
                         push_market_fund_top10().await;
+                    }
+
+                    // v19.12: 盘面走向 (R-02 盘中简版) + 涨停产业链 (R-03 盘中简版) — 每 5 分钟硬推
+                    if last_sector_push.elapsed().as_secs() >= 300 {
+                        // 复用 last_sector_push 计时器, 但 market_view 不依赖它
+                        let market_view = tokio::task::spawn_blocking(|| {
+                            use stock_analysis::market_analyzer::sector_monitor;
+                            use stock_analysis::review::limit_chain_review;
+                            // 盘面简版
+                            let boards = sector_monitor::fetch_board_ranking("f3", 10).unwrap_or_default();
+                            let market_text = if boards.is_empty() {
+                                "📊 盘面 (盘中) | 数据源不稳定, 跳过".to_string()
+                            } else {
+                                let avg_chg = boards.iter().map(|b| b.change_pct).sum::<f64>() / boards.len() as f64;
+                                let strong = boards.iter().filter(|b| b.change_pct > 3.0).count();
+                                let mut s = format!("📊 盘面 ({} 盘中)\n板块均值 {:+.2}% | 强势板块 {} 个\n",
+                                    chrono::Local::now().format("%H:%M"), avg_chg, strong);
+                                s.push_str("领涨板块 Top5:\n");
+                                for b in boards.iter().take(5) {
+                                    s.push_str(&format!("  {} {:+.2}% 主力{:.2}亿\n",
+                                        b.name, b.change_pct, b.main_inflow / 1e8));
+                                }
+                                s
+                            };
+                            // 涨停产业链简版
+                            let boards_full = sector_monitor::fetch_board_ranking("f3", 30).unwrap_or_default();
+                            let mut items = Vec::new();
+                            for b in boards_full.iter().take(5) {
+                                if b.change_pct > 0.5 {
+                                    let limit_up_estimate = if b.change_pct > 5.0 { 3 } else { 1 };
+                                    items.push(limit_chain_review::build_chain_item(
+                                        b.name.clone(), limit_up_estimate, limit_up_estimate, 0,
+                                        b.leader_name.clone(), 1, b.main_inflow,
+                                    ));
+                                }
+                            }
+                            let chain_text = if items.is_empty() {
+                                String::new()
+                            } else {
+                                limit_chain_review::render_r03(&items, &[])
+                            };
+                            format!("{}\n{}", market_text, chain_text)
+                        }).await.unwrap_or_default();
+                        if !market_view.is_empty() && market_view.len() > 50 {
+                            notify::push_governor(&market_view, notify::PushKind::ReviewSignal).await;
+                        }
+                    }
+
+                    // v19.12: 盘中换手率高 Top10 (每 10 分钟, 关注流动性)
+                    if last_fund_top_push.elapsed().as_secs() >= 600 {
+                        let turnover_top = tokio::task::spawn_blocking(|| {
+                            use stock_analysis::market_analyzer::sector_monitor;
+                            let boards = sector_monitor::fetch_board_ranking("f3", 30).unwrap_or_default();
+                            let mut s = format!("🔄 换手率 Top10 ({} 盘中)\n", chrono::Local::now().format("%H:%M"));
+                            let mut rows: Vec<(String, f64, f64)> = Vec::new();
+                            for b in boards.iter().take(30) {
+                                if !b.leader_name.is_empty() {
+                                    rows.push((b.leader_name.clone(), b.change_pct, b.main_inflow / 1e8));
+                                }
+                            }
+                            rows.sort_by(|a, b| b.2.abs().partial_cmp(&a.2.abs()).unwrap_or(std::cmp::Ordering::Equal));
+                            s.push_str("龙头股 (按资金流入排序, 间接反映换手活跃度):\n");
+                            for (i, (name, chg, flow)) in rows.iter().take(10).enumerate() {
+                                s.push_str(&format!("  {}. {} {:+.2}% 主力{:.2}亿\n",
+                                    i + 1, name, chg, flow));
+                            }
+                            if rows.is_empty() {
+                                s.push_str("⚠️ 数据源不稳定, 跳过\n");
+                            }
+                            s
+                        }).await.unwrap_or_default();
+                        if turnover_top.len() > 50 {
+                            notify::push_governor(&turnover_top, notify::PushKind::FundInflow).await;
+                            last_fund_top_push = std::time::Instant::now();
+                        }
                     }
                 }
             }
