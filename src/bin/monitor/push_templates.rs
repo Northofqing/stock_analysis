@@ -5267,6 +5267,146 @@ mod tests {
         assert_eq!(c2.classify("AI"), Some("tech"));
     }
 
+    // ====== v18: 13 个新模板 render 函数实测 (Phase 1 完整覆盖) ======
+    #[test]
+    fn v18_render_all_13_templates_smoke() {
+        let banner = BannerCtx::test_default();
+
+        // 1. P-01
+        let p1 = render_preopen_news_hot(PreopenNewsHotParams {
+            hhmm: "09:05", theme_1: Some("AI算力"), theme_2: Some("机器人"),
+            theme_3: None, news_pairs: vec![("英伟达H200", "GPU")],
+            watch_stocks: vec![("中科曙光", "603019", "AI龙头")],
+        });
+        assert!(p1.contains("📰 盘前热点"));
+        assert!(p1.contains("AI算力"));
+        assert!(p1.contains("中科曙光"));
+
+        // 2. I-01
+        let i1 = render_intraday_market(&banner, IntradayMarketParams {
+            hhmm: "10:30", tech_sub: "AI算力".into(), tech_score: Some(85.5),
+            power_sub: "特高压".into(), power_score: Some(60.0),
+            robot_sub: "减速器".into(), robot_score: Some(72.3),
+            main_attack: Some("AI算力"), rotation_state: RotationState::Spreading,
+        });
+        assert!(i1.contains("📊 盘中轮动"));
+        assert!(i1.contains("轮动状态: 扩散"));
+
+        // 3. I-02
+        let i2 = render_news_catalyst(&banner, NewsCatalystParams {
+            hhmm: "10:30", headline: "英伟达H200发布", theme: Some("AI算力"),
+            stocks: vec![("中科曙光", "603019", Some(5.2), "AI算力订单"), ("浪潮信息", "000977", Some(3.8), "服务器受益")],
+        });
+        assert!(i2.contains("📰⚡ 新闻催化跟踪"));
+        assert!(i2.contains("中科曙光"));
+
+        // 4. I-03
+        let i3 = render_industry_chain_intraday(&banner, IndustryChainIntradayParams {
+            hhmm: "10:30", chain: "AI算力", limit_count: 5,
+            leader_name: Some("中科曙光"), leader_code: Some("603019"), leader_height: 3,
+            supplements: vec![SupplementCandidate { name: "浪潮信息", code: "000977",
+                trigger: "首板".into(), lo: 10.0, hi: 12.0, stop: 9.0 }],
+        });
+        assert!(i3.contains("🔥 盘中涨停扩散"));
+        assert!(i3.contains("AI算力"));
+
+        // 5. D-01
+        let d1 = render_news_to_idea(&banner, NewsToIdeaParams {
+            hhmm: "10:30", headline: "AI算力龙头", theme: Some("AI"),
+            stage: NewsStage::Starting, name: "中科曙光", code: "603019",
+            reasons: vec!["AI龙头", "业绩超预期"], action: Some(NewsAction::BuyDip),
+        });
+        assert!(d1.contains("🧭 新闻驱动个股"));
+        assert!(d1.contains("[建议动作: 低吸]"));
+
+        // 6. A-10
+        let a10 = render_catalyst_review(CatalystReviewParams {
+            date: "2026-07-06", theme: "AI算力", score: Some(85.0),
+            persistent: PersistentLevel::High,
+            started_names: vec!["中科曙光", "浪潮信息"],
+            pending_names: vec!["紫光股份"],
+            watch_point: Some("明日是否扩散"),
+        });
+        assert!(a10.contains("📰 题材催化复盘"));
+        assert!(a10.contains("AI算力"));
+
+        // 7. A-01
+        let a01 = render_paper_review(PaperReviewParams {
+            date: "2026-07-06", name: "中科曙光", code: "603019",
+            trigger: "首板", desc: "已成交", pnl: Some(2.5),
+            plan_high: Some("减仓1/2"), plan_flat: Some("持有"), plan_low: Some("止损"),
+        });
+        assert!(a01.contains("🧪 虚拟仓复盘"));
+        assert!(a01.contains("中科曙光"));
+
+        // 8. T-14
+        let t14 = render_post_fixed_price_order(PostFixedPriceOrderParams {
+            exchange: Exchange::SH, hhmm: "10:00", name: "A", code: "600000",
+            price: 10.5, qty: 1000, order_id: "ORD001",
+            status: OrderStatus::Submitted,
+        });
+        assert!(t14.contains("📋 盘后固定价格申报"));
+        assert!(t14.contains("沪市"));
+
+        // 9. T-15
+        let t15 = render_post_fixed_price_fill(PostFixedPriceFillParams {
+            exchange: Exchange::BJ, hhmm: "15:10", name: "A", code: "830001",
+            fill_price: 10.0, qty: 100, vs_limit_pct: Some(2.5),
+            next_session_carry: true,
+        });
+        assert!(t15.contains("✅ 盘后固定价格成交"));
+        assert!(t15.contains("北交所"));
+
+        // 10. T-16
+        let t16 = render_st_price_limit_changed(StPriceLimitChangedParams {
+            hhmm: "09:30", name: "A", code: "600000", st_type: StType::ST,
+            old_limit: 0.05, new_limit: 0.10, holding_qty: 1000,
+            cost: 10.0, now_price: 11.0,
+            new_stop_loss: Some(9.0), new_take_profit: Some(12.0),
+        });
+        assert!(t16.contains("⚠️ ST 涨跌幅变更"));
+        assert!(t16.contains("原涨跌幅"));
+        assert!(t16.contains("新涨跌幅"));
+
+        // 11. T-17
+        let t17 = render_etf_closing_call_auction(EtfClosingCallAuctionParams {
+            hhmm: "14:58", name: "沪深300ETF", code: "510300",
+            call_auction_price: Some(3.952),
+            vs_continuous_est: Some(0.15),
+            liquidity_note: "正常",
+        });
+        assert!(t17.contains("📊 ETF 集合竞价尾盘"));
+        assert!(t17.contains("沪市 ETF"));
+
+        // 12. T-18
+        let t18 = render_block_trade_intraday_confirm(BlockTradeIntradayConfirmParams {
+            hhmm: "11:15", name: "A", code: "300750", qty: 1000, price: 50.0,
+            block_type: BlockType::Agreed, board: Board::GEM,
+            real_time_confirm: true, next_session_settle: SettleType::NextSession,
+        });
+        assert!(t18.contains("📋 大宗交易盘中确认"));
+        assert!(t18.contains("创业板"));
+
+        // 13. T-19
+        let t19 = render_block_trade_price_range(BlockTradePriceRangeParams {
+            hhmm: "14:30", name: "A", code: "830001",
+            prev_close: Some(10.50), today_avg_price: 10.80,
+            block_price_range: Some("10.50~11.10"),
+            note: "原口径为前收盘价, 新口径为当日均价",
+        });
+        assert!(t19.contains("📊 北交所大宗价格区间"));
+        assert!(t19.contains("北交所"));
+
+        // 全部 13 个模板 + 辅助行 ("辅助建议, 非下单指令" 等)
+        assert!(p1.contains("辅助建议, 非下单指令"));
+        assert!(i1.contains("辅助建议, 非下单指令"));
+        assert!(i2.contains("辅助建议, 非下单指令"));
+        assert!(i3.contains("辅助建议, 非下单指令"));
+        assert!(d1.contains("辅助建议, 非下单指令"));
+        assert!(a10.contains("辅助建议, 非下单指令"));
+        assert!(a01.contains("辅助建议, 非下单指令"));
+    }
+
     #[test]
     fn evidence_quality_labels() {
         assert_eq!(EvidenceQuality::Missing.label(), "缺失,不作承接判断");
