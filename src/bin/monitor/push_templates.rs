@@ -1335,13 +1335,44 @@ pub async fn dispatch_preopen_news_hot_daily() -> bool {
     use stock_analysis::database::DatabaseManager;
     let clusters = DatabaseManager::get().get_latest_chain_clusters();
     if clusters.is_empty() {
+        log_dispatcher_attempt("P-01", false, 0, "no clusters");
         log::info!("[P-01] 无主线簇, 跳过推送");
         return false;
     }
     let now = chrono::Local::now();
     let hhmm = now.format("%H:%M").to_string();
     let params = build_preopen_news_hot_from_db(&hhmm, &clusters);
-    push_preopen_news_hot("", params).await
+    let snapshot_size = clusters.len();
+    let result = push_preopen_news_hot("", params).await;
+    log_dispatcher_attempt("P-01", result, snapshot_size, "");
+    result
+}
+
+// ============================================================================
+// v13.7: dispatcher_log (JSONL) — 6 dispatcher 统一记录
+// ============================================================================
+
+/// v13.7: 记录 1 次 dispatch 尝试 (生产可观测)
+/// 输出: data/dispatcher_log.jsonl (append-only)
+/// 字段: ts, kind, success, snapshot_size, error
+pub fn log_dispatcher_attempt(kind: &str, success: bool, snapshot_size: usize, error: &str) {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    let path = std::path::PathBuf::from("data/dispatcher_log.jsonl");
+    std::fs::create_dir_all("data").ok();
+    let now = chrono::Local::now();
+    let ts = now.format("%Y-%m-%dT%H:%M:%S%.3f").to_string();
+    let line = format!(
+        "{{\"ts\":\"{}\",\"kind\":\"{}\",\"success\":{},\"snapshot_size\":{},\"error\":\"{}\"}}\n",
+        ts,
+        kind,
+        success,
+        snapshot_size,
+        error.replace('"', "'")
+    );
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = f.write_all(line.as_bytes());
+    }
 }
 
 // ============================================================================
@@ -1502,11 +1533,15 @@ pub fn load_sector_snapshot(hhmm: &str) -> SectorSnapshot {
 pub async fn dispatch_intraday_market_daily(hhmm: &str, banner: &BannerCtx) -> bool {
     let snapshot = load_sector_snapshot_real(hhmm);
     if snapshot.tech_sub.is_empty() && snapshot.power_sub.is_empty() && snapshot.robot_sub.is_empty() {
+        log_dispatcher_attempt("I-01", false, 0, "sector_snapshot empty");
         log::info!("[I-01] sector_snapshot 空 (grade_sectors 无数据), 跳过推送");
         return false;
     }
     let params = build_intraday_market_from_snapshot(&snapshot);
-    push_intraday_market("", Some(banner), params).await
+    let snap_size = 3;  // tech/power/robot
+    let result = push_intraday_market("", Some(banner), params).await;
+    log_dispatcher_attempt("I-01", result, snap_size, "");
+    result
 }
 
 // ============================================================================
@@ -1628,11 +1663,15 @@ fn load_news_catalyst_snapshot_real_fallback(hhmm: &str) -> NewsCatalystSnapshot
 pub async fn dispatch_news_catalyst_daily(hhmm: &str, banner: &BannerCtx) -> bool {
     let snapshot = load_news_catalyst_snapshot_real(hhmm);
     if snapshot.headline.is_empty() {
+        log_dispatcher_attempt("I-02", false, 0, "news_catalyst_snapshot empty");
         log::info!("[I-02] news_catalyst_snapshot 空 (chain_daily 无数据), 跳过推送");
         return false;
     }
     let params = build_news_catalyst_from_snapshot(&snapshot);
-    push_news_catalyst("", Some(banner), params).await
+    let snap_size = snapshot.stocks.len();
+    let result = push_news_catalyst("", Some(banner), params).await;
+    log_dispatcher_attempt("I-02", result, snap_size, "");
+    result
 }
 
 // ============================================================================
@@ -1732,11 +1771,15 @@ pub fn load_industry_chain_snapshot(_hhmm: &str) -> IndustryChainSnapshot {
 pub async fn dispatch_industry_chain_intraday_daily(hhmm: &str, banner: &BannerCtx) -> bool {
     let snapshot = load_industry_chain_snapshot_real(hhmm);
     if snapshot.chain.is_empty() {
+        log_dispatcher_attempt("I-03", false, 0, "industry_chain_snapshot empty");
         log::info!("[I-03] industry_chain_snapshot 空 (chain_daily 无数据), 跳过推送");
         return false;
     }
     let params = build_industry_chain_intraday_from_snapshot(&snapshot);
-    push_industry_chain_intraday("", Some(banner), params).await
+    let snap_size = snapshot.supplements.len() + 1;  // +1 leader
+    let result = push_industry_chain_intraday("", Some(banner), params).await;
+    log_dispatcher_attempt("I-03", result, snap_size, "");
+    result
 }
 
 // ============================================================================
@@ -1871,11 +1914,15 @@ pub fn load_news_to_idea_snapshot(_hhmm: &str) -> NewsToIdeaSnapshot {
 pub async fn dispatch_news_to_idea_daily(hhmm: &str, banner: &BannerCtx) -> bool {
     let snapshot = load_news_to_idea_snapshot_real(hhmm);
     if snapshot.headline.is_empty() {
+        log_dispatcher_attempt("D-01", false, 0, "news_to_idea_snapshot empty");
         log::info!("[D-01] news_to_idea_snapshot 空 (候选台无候选), 跳过推送");
         return false;
     }
     let params = build_news_to_idea_from_snapshot(&snapshot);
-    push_news_to_idea("", Some(banner), params).await
+    let snap_size = snapshot.reasons.len();
+    let result = push_news_to_idea("", Some(banner), params).await;
+    log_dispatcher_attempt("D-01", result, snap_size, "");
+    result
 }
 
 // ============================================================================
@@ -1978,11 +2025,15 @@ pub fn derive_plan_from_pnl(pnl: f32) -> (String, String, String) {
 pub async fn dispatch_paper_review_daily(date: &str) -> bool {
     let snapshot = load_paper_review_snapshot_real(date);
     if snapshot.name.is_empty() {
+        log_dispatcher_attempt("A-01", false, 0, "paper_review_snapshot empty");
         log::info!("[A-01] paper_review_snapshot 空 (virtual_observation 无数据), 跳过推送");
         return false;
     }
     let params = build_paper_review_from_snapshot(&snapshot);
-    push_paper_review("", params).await
+    let snap_size = 1;  // 1 record
+    let result = push_paper_review("", params).await;
+    log_dispatcher_attempt("A-01", result, snap_size, "");
+    result
 }
 
 // ============================================================================
@@ -4812,6 +4863,36 @@ mod tests {
         // v16+ 待集成真实 virtual_watch/paper_trades
         let s = load_paper_review_snapshot("2026-07-06");
         assert!(s.name.is_empty());
+    }
+
+    // ====== v13.7: dispatcher_log 可观测性测试 ======
+    #[test]
+    fn v13_7_dispatcher_log_writes_jsonl() {
+        use std::fs;
+        // 测试前清理 (避免污染)
+        let path = std::path::PathBuf::from("data/dispatcher_log.jsonl");
+        let _ = fs::remove_file(&path);
+
+        // 写 3 条 (成功 2 + 失败 1)
+        log_dispatcher_attempt("P-01", true, 3, "");
+        log_dispatcher_attempt("I-01", false, 0, "sector empty");
+        log_dispatcher_attempt("A-01", true, 1, "");
+
+        // 验证文件存在 + 内容
+        assert!(path.exists());
+        let raw = fs::read_to_string(&path).expect("read dispatcher_log");
+        let lines: Vec<&str> = raw.trim().split('\n').collect();
+        assert_eq!(lines.len(), 3);
+        // 验证 JSON 格式
+        assert!(lines[0].contains("\"kind\":\"P-01\""));
+        assert!(lines[0].contains("\"success\":true"));
+        assert!(lines[0].contains("\"snapshot_size\":3"));
+        assert!(lines[1].contains("\"success\":false"));
+        assert!(lines[1].contains("\"error\":\"sector empty\""));
+        assert!(lines[2].contains("\"kind\":\"A-01\""));
+
+        // 清理
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
