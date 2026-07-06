@@ -1561,6 +1561,70 @@ pub async fn dispatch_news_to_idea_daily(hhmm: &str, banner: &BannerCtx) -> bool
     push_news_to_idea("", Some(banner), params).await
 }
 
+// ============================================================================
+// v15.6: A-01 业务层集成 (paper_review 抽口, T-11 通路)
+// ============================================================================
+
+/// v15.6: 虚拟仓复盘快照 (复用 T-11 竞价复算 logic)
+/// 注: 真实数据集成 (virtual_watch/paper_trades DB) 待 v16+
+#[derive(Debug, Clone, Default)]
+pub struct PaperReviewSnapshot {
+    pub date: String,
+    pub name: String,
+    pub code: String,
+    pub trigger: String,
+    pub desc: String,
+    pub pnl: Option<f32>,
+    /// (high, flat, low) — 复用 T-11 plan_high/flat/low 派生
+    pub plan_high: Option<String>,
+    pub plan_flat: Option<String>,
+    pub plan_low: Option<String>,
+}
+
+/// v15.6: 构造 PaperReviewParams
+pub fn build_paper_review_from_snapshot<'a>(s: &'a PaperReviewSnapshot) -> PaperReviewParams<'a> {
+    PaperReviewParams {
+        date: &s.date,
+        name: &s.name,
+        code: &s.code,
+        trigger: &s.trigger,
+        desc: &s.desc,
+        pnl: s.pnl,
+        plan_high: s.plan_high.as_deref(),
+        plan_flat: s.plan_flat.as_deref(),
+        plan_low: s.plan_low.as_deref(),
+    }
+}
+
+/// v15.6: 占位 — 真实 virtual_watch/paper_trades 待 v16+
+/// 复用 T-11 通路设计 (main.rs:1159-1193 plan_high 派生): pnl>5% → "减仓1/3", pnl>0% → "减仓1/2", else → "持有观望"
+pub fn derive_plan_from_pnl(pnl: f32) -> (String, String, String) {
+    if pnl > 5.0 {
+        ("减仓1/3".to_string(), "减仓1/2".to_string(), "持有观望".to_string())
+    } else if pnl > 0.0 {
+        ("减仓1/2".to_string(), "持有".to_string(), "止损".to_string())
+    } else {
+        ("持有观望".to_string(), "止损".to_string(), "止损".to_string())
+    }
+}
+
+/// v15.6: 占位 — 真实 virtual_watch 待 v16+
+pub fn load_paper_review_snapshot(_date: &str) -> PaperReviewSnapshot {
+    log::info!("[A-01] virtual_watch/paper_trades 待 v16+, 使用默认空快照");
+    PaperReviewSnapshot::default()
+}
+
+/// v15.6: 业务层入口 — 盘后 19:00 虚拟仓复盘
+pub async fn dispatch_paper_review_daily(date: &str) -> bool {
+    let snapshot = load_paper_review_snapshot(date);
+    if snapshot.name.is_empty() {
+        log::info!("[A-01] paper_review_snapshot 空 (v16+ 待集成), 跳过推送");
+        return false;
+    }
+    let params = build_paper_review_from_snapshot(&snapshot);
+    push_paper_review("", params).await
+}
+
 /// v13 §14.2 I-01 盘中轮动总览 (⚡交易建议类, 带 banner)
 pub async fn push_intraday_market(
     code: &str,
@@ -4266,6 +4330,56 @@ mod tests {
         let s = load_news_to_idea_snapshot("10:30");
         assert!(s.headline.is_empty());
         assert!(s.reasons.is_empty());
+    }
+
+    // ====== v15.6: A-01 业务层集成测试 (paper_review 抽口) ======
+    #[test]
+    fn v15_build_paper_review_from_snapshot() {
+        let s = PaperReviewSnapshot {
+            date: "2026-07-06".to_string(),
+            name: "A".to_string(),
+            code: "000001".to_string(),
+            trigger: "首板".to_string(),
+            desc: "已成交".to_string(),
+            pnl: Some(2.5),
+            plan_high: Some("减仓1/2".to_string()),
+            plan_flat: Some("持有".to_string()),
+            plan_low: Some("止损".to_string()),
+        };
+        let p = build_paper_review_from_snapshot(&s);
+        assert_eq!(p.name, "A");
+        assert_eq!(p.code, "000001");
+        assert_eq!(p.pnl, Some(2.5));
+        assert_eq!(p.plan_high, Some("减仓1/2"));
+    }
+
+    #[test]
+    fn v15_paper_review_snapshot_empty_skips() {
+        let s = PaperReviewSnapshot::default();
+        let p = build_paper_review_from_snapshot(&s);
+        assert_eq!(p.name, "");
+        assert_eq!(p.pnl, None);
+        assert!(p.plan_high.is_none());
+    }
+
+    #[test]
+    fn v15_derive_plan_from_pnl() {
+        // pnl > 5% → 减仓1/3
+        let (h, f, l) = derive_plan_from_pnl(7.0);
+        assert_eq!(h, "减仓1/3");
+        // pnl > 0% → 减仓1/2
+        let (h, f, l) = derive_plan_from_pnl(3.0);
+        assert_eq!(h, "减仓1/2");
+        // pnl <= 0% → 持有观望
+        let (h, f, l) = derive_plan_from_pnl(-1.0);
+        assert_eq!(h, "持有观望");
+    }
+
+    #[test]
+    fn v15_load_paper_review_snapshot_default() {
+        // v16+ 待集成真实 virtual_watch/paper_trades
+        let s = load_paper_review_snapshot("2026-07-06");
+        assert!(s.name.is_empty());
     }
 
     #[test]
