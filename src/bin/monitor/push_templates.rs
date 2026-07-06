@@ -1448,6 +1448,69 @@ pub async fn dispatch_news_catalyst_daily(hhmm: &str, banner: &BannerCtx) -> boo
     push_news_catalyst("", Some(banner), params).await
 }
 
+// ============================================================================
+// v15.4: I-03 业务层集成 (industry_chain_intraday 抽口)
+// ============================================================================
+
+/// v15.4: 涨停扩散快照 (主链 + 龙头 + 补涨候选)
+/// 注: 真实板块涨停扫描待 v16+ (限 + 龙头 + 候选台)
+#[derive(Debug, Clone, Default)]
+pub struct IndustryChainSnapshot {
+    pub hhmm: String,
+    pub chain: String,
+    pub limit_count: u32,
+    pub leader_name: String,
+    pub leader_code: String,
+    pub leader_height: u32,
+    /// (name, code, trigger, lo, hi, stop)
+    pub supplements: Vec<(String, String, String, f64, f64, f64)>,
+}
+
+/// v15.4: 构造 IndustryChainIntradayParams
+pub fn build_industry_chain_intraday_from_snapshot<'a>(
+    s: &'a IndustryChainSnapshot,
+) -> IndustryChainIntradayParams<'a> {
+    let supplement_refs: Vec<SupplementCandidate<'a>> = s
+        .supplements
+        .iter()
+        .map(|(n, c, t, lo, hi, st)| SupplementCandidate {
+            name: n.as_str(),
+            code: c.as_str(),
+            trigger: t.as_str(),
+            lo: *lo,
+            hi: *hi,
+            stop: *st,
+        })
+        .collect();
+
+    IndustryChainIntradayParams {
+        hhmm: &s.hhmm,
+        chain: &s.chain,
+        limit_count: s.limit_count,
+        leader_name: if s.leader_name.is_empty() { None } else { Some(&s.leader_name) },
+        leader_code: if s.leader_code.is_empty() { None } else { Some(&s.leader_code) },
+        leader_height: s.leader_height,
+        supplements: supplement_refs,
+    }
+}
+
+/// v15.4: 占位 — 真实涨停扫描待 v16+
+pub fn load_industry_chain_snapshot(_hhmm: &str) -> IndustryChainSnapshot {
+    log::info!("[I-03] 涨停扫描待 v16+, 使用默认空快照");
+    IndustryChainSnapshot::default()
+}
+
+/// v15.4: 业务层入口 — 盘中涨停扩散触发
+pub async fn dispatch_industry_chain_intraday_daily(hhmm: &str, banner: &BannerCtx) -> bool {
+    let snapshot = load_industry_chain_snapshot(hhmm);
+    if snapshot.chain.is_empty() {
+        log::info!("[I-03] industry_chain_snapshot 空 (v16+ 待集成), 跳过推送");
+        return false;
+    }
+    let params = build_industry_chain_intraday_from_snapshot(&snapshot);
+    push_industry_chain_intraday("", Some(banner), params).await
+}
+
 /// v13 §14.2 I-01 盘中轮动总览 (⚡交易建议类, 带 banner)
 pub async fn push_intraday_market(
     code: &str,
@@ -4068,6 +4131,49 @@ mod tests {
         let s = load_news_catalyst_snapshot("10:30");
         assert!(s.headline.is_empty());
         assert!(s.stocks.is_empty());
+    }
+
+    // ====== v15.4: I-03 业务层集成测试 (industry_chain 抽口) ======
+    #[test]
+    fn v15_build_industry_chain_intraday_from_snapshot() {
+        let s = IndustryChainSnapshot {
+            hhmm: "10:30".to_string(),
+            chain: "AI算力".to_string(),
+            limit_count: 5,
+            leader_name: "龙头A".to_string(),
+            leader_code: "000001".to_string(),
+            leader_height: 3,
+            supplements: vec![(
+                "补涨B".to_string(),
+                "000002".to_string(),
+                "首板".to_string(),
+                10.0,
+                12.0,
+                9.0,
+            )],
+        };
+        let p = build_industry_chain_intraday_from_snapshot(&s);
+        assert_eq!(p.chain, "AI算力");
+        assert_eq!(p.limit_count, 5);
+        assert_eq!(p.leader_name, Some("龙头A"));
+        assert_eq!(p.supplements.len(), 1);
+        assert_eq!(p.supplements[0].lo, 10.0);
+    }
+
+    #[test]
+    fn v15_industry_chain_snapshot_empty_skips() {
+        let s = IndustryChainSnapshot::default();
+        let p = build_industry_chain_intraday_from_snapshot(&s);
+        assert_eq!(p.chain, "");
+        assert_eq!(p.leader_name, None);
+        assert_eq!(p.leader_height, 0);
+    }
+
+    #[test]
+    fn v15_load_industry_chain_snapshot_default() {
+        // v16+ 待集成真实涨停扫描
+        let s = load_industry_chain_snapshot("10:30");
+        assert!(s.chain.is_empty());
     }
 
     #[test]
