@@ -2536,9 +2536,11 @@ pub fn should_block_on_mode(
         // 风险类: 永远照发
         K::HoldingEvent | K::ForbiddenOps | K::DataMode | K::AccountMode => false,
         // 交易建议类: Frozen 全停, Unsafe 全停
-        K::HoldingPlan | K::T0Advice | K::CandidateTriggered | K::PaperTrade => {
+        K::HoldingPlan | K::T0Advice | K::CandidateTriggered => {
             matches!(mode, AccountMode::Frozen) || matches!(dm, DataMode::Unsafe)
         }
+        // v14.5 G-03: PaperTrade 虚拟盘演示, 永远照发 (不因 Frozen 阻断)
+        K::PaperTrade => false,
         // 其它 (T-12 尾盘, 盘后系列): 不停
         _ => false,
     }
@@ -5076,6 +5078,44 @@ mod tests {
         // 清理
         let _ = fs::remove_file(&stock_pick_path);
         let _ = fs::remove_file(&optimal_path);
+    }
+
+    // ====== v14.5: 治理微调测试 ======
+    #[test]
+    fn v14_5_governance_micro_adjust() {
+        use crate::notify::PushKind;
+
+        // G-03: PaperTrade 永远照发 (不因 Frozen 阻断)
+        assert!(!should_block_on_mode(
+            PushKind::PaperTrade,
+            AccountMode::Frozen,
+            DataMode::Full
+        ));
+        assert!(!should_block_on_mode(
+            PushKind::PaperTrade,
+            AccountMode::Normal,
+            DataMode::Degraded
+        ));
+
+        // G-03 验证对照: HoldingPlan 仍按 spec 阻断
+        assert!(should_block_on_mode(
+            PushKind::HoldingPlan,
+            AccountMode::Frozen,
+            DataMode::Full
+        ));
+        assert!(!should_block_on_mode(
+            PushKind::HoldingPlan,
+            AccountMode::Normal,
+            DataMode::Full
+        ));
+
+        // G-05: TurnoverTop 显式 600s (10 min)
+        assert_eq!(PushKind::TurnoverTop.cooldown_secs(), Some(600));
+
+        // G-06: IndustryChain 显式 86400s (1次/日)
+        assert_eq!(PushKind::IndustryChain.cooldown_secs(), Some(86_400));
+        // 对照: IndustryChainIntraday 仍 30 min (不影响)
+        assert_eq!(PushKind::IndustryChainIntraday.cooldown_secs(), Some(1800));
     }
 
     #[test]

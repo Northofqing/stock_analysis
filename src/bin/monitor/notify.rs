@@ -63,6 +63,8 @@ pub enum PushKind {
     VolumeRealTrade,
     /// 降级: C4 产业链扫描 (移交候选台)
     IndustryChain,
+    /// v14.5 G-05: T-13 盘中换手率 Top10 (ℹ️ 1次/日, 10min 冷却)
+    TurnoverTop,
     // v11-P0-5++ Commit 5 加: 候选台统一卡片 (5 路 raw 合并 → 1 张排序候选清单)
     /// 保留: 候选筛选台卡片 (P5 §五 输出形态, 强证据>多源>题材)
     CandidateBoard,
@@ -248,9 +250,10 @@ impl PushKind {
             PushKind::FactorIC => Some(3600),
             PushKind::WeeklySOP => Some(86_400),
             // v13 §14.5 (Codex F5 修): TurnoverTop 显式 600s (原默认 1800s 与 spec 不符)
-            // 注: TurnoverTop enum 当前未在 notify.rs 中 (PR v19.15 设计但未接通),
-            // 保留此分支待 §14.5 TurnoverTop 补登后启用
-            // PushKind::TurnoverTop => Some(600),  // 待接通
+            // v14.5: TurnoverTop enum 已接通 (line 67), 启用该分支
+            PushKind::TurnoverTop => Some(600),                                // 10 min
+            // v14.5 G-06: IndustryChain 显式 86400s (1次/日, vs 默认 1800s)
+            PushKind::IndustryChain => Some(86_400),                          // 1次/日
             // v13 新增
             PushKind::PreopenNewsHot | PushKind::IntradayMarket => Some(900), // 15 min
             PushKind::NewsCatalyst => Some(600),                              // 10 min
@@ -290,6 +293,8 @@ impl PushKind {
             PushKind::VolumeWatchlist => "放量自选",
             PushKind::VolumeRealTrade => "放量实盘",
             PushKind::IndustryChain => "产业链",
+            // v14.5 G-05
+            PushKind::TurnoverTop => "盘中换手率 Top10",
             PushKind::CandidateBoard => "候选台",
             PushKind::NewsRanked => "新闻Ranker",
             // v12
