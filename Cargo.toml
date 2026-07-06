@@ -53,3 +53,8 @@ polars = { version = "0.46", features = ["lazy", "round_series", "cum_agg", "rol
 thiserror = "2.0.18"
 async-openai = "0.19.0"
 toml = "0.8"
+
+# v20.2: race condition 彻底解决 (test_design_contradiction 跨 test binary 文件 race)
+# serial_test 0.10+ 用 process-wide mutex (std Mutex 跨 test binary 不可见)
+[dev-dependencies]
+serial_test = "0.10"

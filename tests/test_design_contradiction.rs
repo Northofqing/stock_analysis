@@ -102,10 +102,11 @@ fn test_design_contradiction_passes_current_config() {
     );
 }
 
-// v20.1: 标记 #[ignore] 因为有 race condition (cargo test -- --test-threads=1 需单跑)
-// TODO: 加 serial_test 依赖彻底解决
+// v20.2: 用 serial_test 替代 #[ignore] (跨 test binary 文件锁, 解决 race condition)
+use serial_test::serial;
+// (注: 保留 acquire_config_lock() 作为同 binary 内串行保护, 双重保险)
 #[test]
-#[ignore = "v20.1 race condition — run with: cargo test -- --test-threads=1"]
+#[serial]  // 跨 test binary 串行, 防止 race
 fn test_design_contradiction_fails_on_threshold_exceeding_clamp() {
     // 故意制造矛盾: 临时把 threshold 改到 80 (> clamp 70)
     // 用 RAII guard 保证 panic / 早返回时**自动恢复** config.
