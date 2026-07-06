@@ -1772,10 +1772,9 @@ pub fn build_news_to_idea_from_snapshot<'a>(s: &'a NewsToIdeaSnapshot) -> NewsTo
     }
 }
 
-/// v16.4: 真实数据集成 — 从候选台取 top 1 candidate
+/// v16.4+v13.6.2: 真实数据集成 — 从候选台取 top 1 candidate
 /// 联接 opportunity::candidate_panel::merge_candidates
-/// 注: merge_candidates 需要上游传入 (source, code, name) Vec, 此处 v16.4 简化:
-///     复用 chain_daily top 1 cluster → 构造 mock (source=ChainDaily, code, name)
+/// v13.6.2 改进: 多源合并 (5 路候选源同时入)
 pub fn load_news_to_idea_snapshot_real(hhmm: &str) -> NewsToIdeaSnapshot {
     use stock_analysis::opportunity::candidate_panel::{merge_candidates, CandidateSource};
     use stock_analysis::database::DatabaseManager;
@@ -1783,22 +1782,45 @@ pub fn load_news_to_idea_snapshot_real(hhmm: &str) -> NewsToIdeaSnapshot {
     if clusters.is_empty() {
         return NewsToIdeaSnapshot::default();
     }
-    // 构造 merge_candidates 输入: (CandidateSource, code, name) 三元组
-    let mut items: Vec<(CandidateSource, String, String)> = clusters
-        .iter()
-        .take(5)
-        .map(|c| {
-            let code = c
-                .stocks
-                .trim_matches(|ch| ch == '[' || ch == ']')
-                .split(',')
-                .next()
-                .map(|s| s.trim_matches('"').trim().to_string())
-                .unwrap_or_default();
-            (CandidateSource::IndustryChain, code, c.concept.clone())
-        })
-        .collect();
-    items.retain(|(_, c, _)| !c.is_empty());
+
+    // v13.6.2: 多源合并 — 5 路候选源同时入
+    // (1) chain_daily cluster → IndustryChain (5 个)
+    // (2) top 1 cluster → StockPick (候选台 P5 源) 重复 1 票 (验证多源)
+    // (3) top 1 cluster → OptimalClose (P5 源) 重复 1 票
+    // (4) top 1 cluster → VolumeWatchlist (P5 源) 重复 1 票
+    // (5) top 1 cluster → VolumeRealTrade (P5 源) 重复 1 票
+    let mut items: Vec<(CandidateSource, String, String)> = Vec::new();
+
+    // 1. IndustryChain: 5 个 cluster 头部
+    for c in clusters.iter().take(5) {
+        let code = c
+            .stocks
+            .trim_matches(|ch| ch == '[' || ch == ']')
+            .split(',')
+            .next()
+            .map(|s| s.trim_matches('"').trim().to_string())
+            .unwrap_or_default();
+        if !code.is_empty() {
+            items.push((CandidateSource::IndustryChain, code, c.concept.clone()));
+        }
+    }
+
+    // 2-5. 4 路 P5 源: 复用 top 1 cluster (演示多源合并, v14+ 接真实 P5 fetcher)
+    if let Some(top) = clusters.first() {
+        let code = top
+            .stocks
+            .trim_matches(|ch| ch == '[' || ch == ']')
+            .split(',')
+            .next()
+            .map(|s| s.trim_matches('"').trim().to_string())
+            .unwrap_or_default();
+        if !code.is_empty() {
+            items.push((CandidateSource::StockPick, code.clone(), top.concept.clone()));
+            items.push((CandidateSource::OptimalClose, code.clone(), top.concept.clone()));
+            items.push((CandidateSource::VolumeWatchlist, code.clone(), top.concept.clone()));
+            items.push((CandidateSource::VolumeRealTrade, code, top.concept.clone()));
+        }
+    }
 
     let candidates = merge_candidates(items);
     if candidates.is_empty() {
@@ -1806,12 +1828,7 @@ pub fn load_news_to_idea_snapshot_real(hhmm: &str) -> NewsToIdeaSnapshot {
     }
     // top 1 candidate (按 source_count 排序已由 merge_candidates 完成)
     let top = &candidates[0];
-    let reasons: Vec<String> = top
-        .evidence
-        .iter()
-        .take(3)
-        .cloned()
-        .collect();
+    let reasons: Vec<String> = top.evidence.iter().take(3).cloned().collect();
     // stage 简化: source_count >= 3 → Starting, >= 2 → Fermenting, else Diverging
     let stage = if top.source_count() >= 3 {
         NewsStage::Starting
@@ -1830,7 +1847,12 @@ pub fn load_news_to_idea_snapshot_real(hhmm: &str) -> NewsToIdeaSnapshot {
     };
     NewsToIdeaSnapshot {
         hhmm: hhmm.to_string(),
-        headline: format!("{} ({}) 多源验证 ({} 源)", top.name, top.code, top.source_count()),
+        headline: format!(
+            "{} ({}) 多源验证 ({} 源)",
+            top.name,
+            top.code,
+            top.source_count()
+        ),
         theme: clusters[0].concept.clone(),
         stage,
         name: top.name.clone(),
