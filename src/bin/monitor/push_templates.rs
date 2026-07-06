@@ -1352,15 +1352,21 @@ pub async fn dispatch_preopen_news_hot_daily() -> bool {
 // v13.7: dispatcher_log (JSONL) — 6 dispatcher 统一记录
 // ============================================================================
 
-/// v13.7: 记录 1 次 dispatch 尝试 (生产可观测)
-/// 输出: data/dispatcher_log.jsonl (append-only)
+/// v13.7+v14.4: 记录 1 次 dispatch 尝试 (生产可观测)
+/// 输出: data/dispatcher_log/{YYYY-MM-DD}.jsonl (按天轮转, 7 天保留)
 /// 字段: ts, kind, success, snapshot_size, error
 pub fn log_dispatcher_attempt(kind: &str, success: bool, snapshot_size: usize, error: &str) {
     use std::fs::OpenOptions;
     use std::io::Write;
-    let path = std::path::PathBuf::from("data/dispatcher_log.jsonl");
-    std::fs::create_dir_all("data").ok();
     let now = chrono::Local::now();
+    let date_str = now.format("%Y-%m-%d").to_string();
+    let dir = std::path::PathBuf::from("data/dispatcher_log");
+    std::fs::create_dir_all(&dir).ok();
+    let path = dir.join(format!("{}.jsonl", date_str));
+
+    // v14.4: 按天轮转 + 7 天清理 (避免无限增长)
+    rotate_dispatcher_logs(&dir, 7);
+
     let ts = now.format("%Y-%m-%dT%H:%M:%S%.3f").to_string();
     let line = format!(
         "{{\"ts\":\"{}\",\"kind\":\"{}\",\"success\":{},\"snapshot_size\":{},\"error\":\"{}\"}}\n",
@@ -1372,6 +1378,29 @@ pub fn log_dispatcher_attempt(kind: &str, success: bool, snapshot_size: usize, e
     );
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
         let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// v14.4: 清理 N 天前的 dispatcher_log 文件
+fn rotate_dispatcher_logs(dir: &std::path::Path, retention_days: u64) {
+    use std::time::{Duration, SystemTime};
+    let threshold = match SystemTime::now().checked_sub(Duration::from_secs(retention_days * 86400)) {
+        Some(t) => t,
+        None => return,
+    };
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Ok(meta) = path.metadata() {
+            if let Ok(modified) = meta.modified() {
+                if modified < threshold {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
     }
 }
 
@@ -4990,15 +5019,17 @@ mod tests {
     fn v13_7_dispatcher_log_writes_jsonl() {
         use std::fs;
         // 测试前清理 (避免污染)
-        let path = std::path::PathBuf::from("data/dispatcher_log.jsonl");
-        let _ = fs::remove_file(&path);
+        let dir = std::path::PathBuf::from("data/dispatcher_log");
+        let _ = fs::remove_dir_all(&dir);
 
         // 写 3 条 (成功 2 + 失败 1)
         log_dispatcher_attempt("P-01", true, 3, "");
         log_dispatcher_attempt("I-01", false, 0, "sector empty");
         log_dispatcher_attempt("A-01", true, 1, "");
 
-        // 验证文件存在 + 内容
+        // v14.4: 按天轮转, 找今天的文件
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let path = dir.join(format!("{}.jsonl", today));
         assert!(path.exists());
         let raw = fs::read_to_string(&path).expect("read dispatcher_log");
         let lines: Vec<&str> = raw.trim().split('\n').collect();
@@ -5012,7 +5043,7 @@ mod tests {
         assert!(lines[2].contains("\"kind\":\"A-01\""));
 
         // 清理
-        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     // ====== v14.2: P5 源文件化测试 ======
