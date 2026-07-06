@@ -1580,17 +1580,58 @@ pub fn build_industry_chain_intraday_from_snapshot<'a>(
     }
 }
 
-/// v15.4: 占位 — 真实涨停扫描待 v16+
+/// v16.3: 真实数据集成 — 复用 chain_daily DB (top 1 cluster → 龙头/补涨)
+/// 简化: chain_daily.continuation_count 作 leader_height, stocks JSON 前 3 → supplements
+pub fn load_industry_chain_snapshot_real(hhmm: &str) -> IndustryChainSnapshot {
+    use stock_analysis::database::DatabaseManager;
+    let clusters = DatabaseManager::get().get_latest_chain_clusters();
+    if clusters.is_empty() {
+        return IndustryChainSnapshot::default();
+    }
+    // top 1 cluster (按 continuation_count 排序)
+    let mut sorted: Vec<_> = clusters.iter().collect();
+    sorted.sort_by(|a, b| b.continuation_count.cmp(&a.continuation_count));
+    let top = sorted[0];
+
+    // 解析 stocks JSON → 补涨候选 (前 3, leader 在 stocks[0])
+    let codes: Vec<String> = top
+        .stocks
+        .trim_matches(|ch| ch == '[' || ch == ']')
+        .split(',')
+        .map(|s| s.trim_matches('"').trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let leader_name = if !codes.is_empty() { codes[0].clone() } else { String::new() };
+    let leader_code = codes.get(0).cloned().unwrap_or_default();
+    let supplements: Vec<(String, String, String, f64, f64, f64)> = codes
+        .iter()
+        .skip(1)  // 跳过 leader
+        .take(3)
+        .map(|c| (c.clone(), c.clone(), "首板".to_string(), 0.0, 0.0, 0.0))
+        .collect();
+
+    IndustryChainSnapshot {
+        hhmm: hhmm.to_string(),
+        chain: top.concept.clone(),
+        limit_count: top.continuation_count as u32,  // 简化映射
+        leader_name,
+        leader_code,
+        leader_height: top.continuation_count as u32,
+        supplements,
+    }
+}
+
+/// v15.4 兼容: 同步占位
 pub fn load_industry_chain_snapshot(_hhmm: &str) -> IndustryChainSnapshot {
-    log::info!("[I-03] 涨停扫描待 v16+, 使用默认空快照");
     IndustryChainSnapshot::default()
 }
 
-/// v15.4: 业务层入口 — 盘中涨停扩散触发
+/// v15.4 业务层入口 (v16.3 改用真实 chain_daily 数据)
 pub async fn dispatch_industry_chain_intraday_daily(hhmm: &str, banner: &BannerCtx) -> bool {
-    let snapshot = load_industry_chain_snapshot(hhmm);
+    let snapshot = load_industry_chain_snapshot_real(hhmm);
     if snapshot.chain.is_empty() {
-        log::info!("[I-03] industry_chain_snapshot 空 (v16+ 待集成), 跳过推送");
+        log::info!("[I-03] industry_chain_snapshot 空 (chain_daily 无数据), 跳过推送");
         return false;
     }
     let params = build_industry_chain_intraday_from_snapshot(&snapshot);
