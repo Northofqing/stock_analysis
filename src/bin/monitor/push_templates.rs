@@ -1511,6 +1511,56 @@ pub async fn dispatch_industry_chain_intraday_daily(hhmm: &str, banner: &BannerC
     push_industry_chain_intraday("", Some(banner), params).await
 }
 
+// ============================================================================
+// v15.5: D-01 业务层集成 (news_to_idea 抽口)
+// ============================================================================
+
+/// v15.5: 新闻驱动个股快照
+/// 注: 真实数据集成 (news_monitor + 候选台) 待 v16+
+#[derive(Debug, Clone, Default)]
+pub struct NewsToIdeaSnapshot {
+    pub hhmm: String,
+    pub headline: String,
+    pub theme: String,
+    pub stage: NewsStage,
+    pub name: String,
+    pub code: String,
+    pub reasons: Vec<String>,
+    pub action: Option<NewsAction>,
+}
+
+/// v15.5: 构造 NewsToIdeaParams
+pub fn build_news_to_idea_from_snapshot<'a>(s: &'a NewsToIdeaSnapshot) -> NewsToIdeaParams<'a> {
+    let reasons_ref: Vec<&'a str> = s.reasons.iter().map(|r| r.as_str()).collect();
+    NewsToIdeaParams {
+        hhmm: &s.hhmm,
+        headline: &s.headline,
+        theme: if s.theme.is_empty() { None } else { Some(&s.theme) },
+        stage: s.stage.clone(),
+        name: &s.name,
+        code: &s.code,
+        reasons: reasons_ref,
+        action: s.action.clone(),
+    }
+}
+
+/// v15.5: 占位 — 真实 news_monitor + 候选台待 v16+
+pub fn load_news_to_idea_snapshot(_hhmm: &str) -> NewsToIdeaSnapshot {
+    log::info!("[D-01] news_monitor + 候选台待 v16+, 使用默认空快照");
+    NewsToIdeaSnapshot::default()
+}
+
+/// v15.5: 业务层入口 — 新闻驱动个股触发
+pub async fn dispatch_news_to_idea_daily(hhmm: &str, banner: &BannerCtx) -> bool {
+    let snapshot = load_news_to_idea_snapshot(hhmm);
+    if snapshot.headline.is_empty() {
+        log::info!("[D-01] news_to_idea_snapshot 空 (v16+ 待集成), 跳过推送");
+        return false;
+    }
+    let params = build_news_to_idea_from_snapshot(&snapshot);
+    push_news_to_idea("", Some(banner), params).await
+}
+
 /// v13 §14.2 I-01 盘中轮动总览 (⚡交易建议类, 带 banner)
 pub async fn push_intraday_market(
     code: &str,
@@ -2007,14 +2057,18 @@ pub fn render_news_catalyst(banner: &BannerCtx, p: NewsCatalystParams<'_>) -> St
 }
 
 /// v13 §14.4 D-01 新闻驱动个股 — 主题阶段
+#[derive(Debug, Clone, Default, PartialEq)]
 pub enum NewsStage {
+    #[default]
     Starting,   // 启动
     Fermenting, // 发酵
     Diverging,  // 分歧
 }
 
 /// v13 §14.4 D-01 新闻驱动个股 — 建议动作
+#[derive(Debug, Clone, Default, PartialEq)]
 pub enum NewsAction {
+    #[default]
     Observe,    // 观察
     BuyDip,     // 低吸
     DoNotChase, // 不追
@@ -4174,6 +4228,44 @@ mod tests {
         // v16+ 待集成真实涨停扫描
         let s = load_industry_chain_snapshot("10:30");
         assert!(s.chain.is_empty());
+    }
+
+    // ====== v15.5: D-01 业务层集成测试 (news_to_idea 抽口) ======
+    #[test]
+    fn v15_build_news_to_idea_from_snapshot() {
+        let s = NewsToIdeaSnapshot {
+            hhmm: "10:30".to_string(),
+            headline: "英伟达H200发布".to_string(),
+            theme: "AI算力".to_string(),
+            stage: NewsStage::Starting,
+            name: "中科曙光".to_string(),
+            code: "603019".to_string(),
+            reasons: vec!["AI算力龙头".to_string(), "业绩超预期".to_string()],
+            action: Some(NewsAction::BuyDip),
+        };
+        let p = build_news_to_idea_from_snapshot(&s);
+        assert_eq!(p.headline, "英伟达H200发布");
+        assert_eq!(p.name, "中科曙光");
+        assert_eq!(p.reasons.len(), 2);
+        assert_eq!(p.action, Some(NewsAction::BuyDip));
+    }
+
+    #[test]
+    fn v15_news_to_idea_snapshot_empty_skips() {
+        let s = NewsToIdeaSnapshot::default();
+        assert_eq!(s.stage, NewsStage::Starting);  // default
+        let p = build_news_to_idea_from_snapshot(&s);
+        assert!(p.headline.is_empty());
+        assert!(p.reasons.is_empty());
+        assert_eq!(p.action, None);
+    }
+
+    #[test]
+    fn v15_load_news_to_idea_snapshot_default() {
+        // v16+ 待集成真实 news_monitor + 候选台
+        let s = load_news_to_idea_snapshot("10:30");
+        assert!(s.headline.is_empty());
+        assert!(s.reasons.is_empty());
     }
 
     #[test]
