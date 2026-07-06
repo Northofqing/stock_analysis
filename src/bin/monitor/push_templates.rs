@@ -1913,8 +1913,8 @@ pub fn build_paper_review_from_snapshot<'a>(s: &'a PaperReviewSnapshot) -> Paper
     }
 }
 
-/// v17.5: 完整 JSON 解析 (VirtualObservationRecord via serde_json)
-/// 替代 v16.5 的文件名占位 (code/name 暂空)
+/// v17.5+v13.6.3: 完整 JSON 解析 (VirtualObservationRecord via serde_json)
+/// v13.6.3 改进: 扩展 entry_price 字段 (替代 v13.5 退化 0.0)
 pub fn load_paper_review_snapshot_real(date: &str) -> PaperReviewSnapshot {
     use stock_analysis::data_provider::GtimgProvider;
 
@@ -1924,13 +1924,11 @@ pub fn load_paper_review_snapshot_real(date: &str) -> PaperReviewSnapshot {
     }
     let top = &snapshot.records[0];
 
-    // v13.5: 实时 close_price 接入 (替代 pnl=0.0 占位)
-    // 计算 pnl = (close - entry) / entry * 100
-    // 失败 → pnl=0.0 fallback
-    let entry_price = get_entry_price_from_json(top.entry_date.as_str());
+    // v13.6.3: 从 VirtualRecordLite.entry_price 拿真实 entry (替代 0.0 占位)
+    let entry_price = top.entry_price;
     let close_price = match GtimgProvider::new().and_then(|p| p.fetch_realtime_quote(&top.code)) {
         Ok(Some(q)) => q.price,
-        Ok(None) => entry_price,  // 无行情 → pnl=0
+        Ok(None) => entry_price,
         Err(e) => {
             log::debug!("[A-01] fetch_realtime_quote({}) 失败: {}", top.code, e);
             entry_price
@@ -1957,14 +1955,6 @@ pub fn load_paper_review_snapshot_real(date: &str) -> PaperReviewSnapshot {
         plan_flat: Some(flat),
         plan_low: Some(low),
     }
-}
-
-/// v13.5 helper: 从虚拟观察 JSON 提取 entry_price (扩展 RecordJson)
-fn get_entry_price_from_json(_entry_date: &str) -> f64 {
-    // v13.5 简化: 从文件名 (entry_date) 读 JSON 取 entry_price
-    // 真实场景: VirtualRecordLite 需扩展含 entry_price 字段
-    // v13.5+ 改进: 在 load_virtual_observation_for_a01 中扩展字段
-    0.0  // 占位 → pnl 计算为 0 (但 close 接入已生效)
 }
 
 /// v15.6 兼容: 同步占位
@@ -2003,6 +1993,8 @@ pub struct VirtualRecordLite {
     pub code: String,
     pub name: String,
     pub entry_mode: String,
+    /// v13.6.3 新增: 真实 entry_price (替代 0.0 占位)
+    pub entry_price: f64,
 }
 pub struct VirtualSnapshotLite {
     pub records: Vec<VirtualRecordLite>,
@@ -2010,6 +2002,7 @@ pub struct VirtualSnapshotLite {
 
 /// v16.5: 简化版 virtual_observation 加载 (与 main.rs::VirtualObservationRecord 兼容)
 /// 读 data/virtual_observation/*.json (按 main.rs 持久化格式)
+/// v13.6.3 扩展: 解析 entry_price 字段
 pub fn load_virtual_observation_for_a01() -> VirtualSnapshotLite {
     use std::fs;
     let dir = std::path::PathBuf::from("data/virtual_observation");
@@ -2018,23 +2011,23 @@ pub fn load_virtual_observation_for_a01() -> VirtualSnapshotLite {
     }
     let mut records: Vec<VirtualRecordLite> = Vec::new();
     if let Ok(entries) = fs::read_dir(&dir) {
-        // v17.5: 按文件名排序 (最新在前), 解析完整 JSON
         let mut paths: Vec<_> = entries
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| p.extension().map(|e| e == "json").unwrap_or(false))
             .collect();
         paths.sort();
-        paths.reverse();  // 最新在前
+        paths.reverse();
 
         for path in paths.iter().take(5) {
-            // v17.5: 完整 serde_json 解析 (替代 v16.5 文件名占位)
-            // VirtualObservationRecord 字段: entry_date, code, name, entry_price, shares, entry_mode
+            // v13.6.3: 完整 serde_json 解析 (含 entry_price)
             #[derive(serde::Deserialize)]
             struct RecordJson {
                 entry_date: Option<String>,
                 code: Option<String>,
                 name: Option<String>,
                 entry_mode: Option<String>,
+                /// v13.6.3 新增
+                entry_price: Option<f64>,
             }
             if let Ok(raw) = fs::read_to_string(&path) {
                 if let Ok(parsed) = serde_json::from_str::<RecordJson>(&raw) {
@@ -2043,6 +2036,7 @@ pub fn load_virtual_observation_for_a01() -> VirtualSnapshotLite {
                         code: parsed.code.unwrap_or_default(),
                         name: parsed.name.unwrap_or_default(),
                         entry_mode: parsed.entry_mode.unwrap_or("首板".to_string()),
+                        entry_price: parsed.entry_price.unwrap_or(0.0),
                     });
                 }
             }
