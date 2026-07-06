@@ -298,6 +298,83 @@ async fn push_virtual_next_day_review_if_needed() {
 
 // ============= v17.6: 6 dispatcher 调度入口 (--push 模式) ============
 
+/// v14.0: dry-run 模式, 验证 dispatcher 数据源 + 渲染, 不实际推送
+async fn run_daily_pushes_dry_run() {
+    use push_templates::{
+        build_preopen_news_hot_from_db, build_intraday_market_from_snapshot,
+        build_news_catalyst_from_snapshot, build_industry_chain_intraday_from_snapshot,
+        build_news_to_idea_from_snapshot, build_paper_review_from_snapshot,
+        load_sector_snapshot_real, load_news_catalyst_snapshot_real,
+        load_industry_chain_snapshot_real, load_news_to_idea_snapshot_real,
+        load_paper_review_snapshot_real, log_dispatcher_attempt,
+    };
+    use stock_analysis::database::DatabaseManager;
+    let now = chrono::Local::now();
+    let hhmm = now.format("%H:%M").to_string();
+    let date = now.format("%Y-%m-%d").to_string();
+
+    log::info!("[v14.0 dry-run] 模式启动 ({} {})", date, hhmm);
+
+    // P-01 dry-run
+    let clusters = DatabaseManager::get().get_latest_chain_clusters();
+    if !clusters.is_empty() {
+        let _params = build_preopen_news_hot_from_db(&hhmm, &clusters);
+        log_dispatcher_attempt("P-01-dry", true, clusters.len(), "");
+        log::info!("[dry-run] P-01 OK: {} clusters", clusters.len());
+    } else {
+        log_dispatcher_attempt("P-01-dry", false, 0, "no clusters");
+        log::warn!("[dry-run] P-01 SKIP: no clusters");
+    }
+
+    // I-01 dry-run
+    let s = load_sector_snapshot_real(&hhmm);
+    if !s.tech_sub.is_empty() {
+        let _p = build_intraday_market_from_snapshot(&s);
+        log_dispatcher_attempt("I-01-dry", true, 3, "");
+        log::info!("[dry-run] I-01 OK: tech={} power={} robot={}", s.tech_sub, s.power_sub, s.robot_sub);
+    } else {
+        log_dispatcher_attempt("I-01-dry", false, 0, "sector empty");
+        log::warn!("[dry-run] I-01 SKIP: no sectors");
+    }
+
+    // I-02/I-03/D-01/A-01 dry-run
+    let s2 = load_news_catalyst_snapshot_real(&hhmm);
+    if !s2.headline.is_empty() {
+        let _p = build_news_catalyst_from_snapshot(&s2);
+        log_dispatcher_attempt("I-02-dry", true, s2.stocks.len(), "");
+        log::info!("[dry-run] I-02 OK: {} stocks", s2.stocks.len());
+    } else {
+        log_dispatcher_attempt("I-02-dry", false, 0, "snapshot empty");
+    }
+    let s3 = load_industry_chain_snapshot_real(&hhmm);
+    if !s3.chain.is_empty() {
+        let _p = build_industry_chain_intraday_from_snapshot(&s3);
+        log_dispatcher_attempt("I-03-dry", true, s3.supplements.len() + 1, "");
+        log::info!("[dry-run] I-03 OK: chain={}", s3.chain);
+    } else {
+        log_dispatcher_attempt("I-03-dry", false, 0, "snapshot empty");
+    }
+    let s4 = load_news_to_idea_snapshot_real(&hhmm);
+    if !s4.headline.is_empty() {
+        let _p = build_news_to_idea_from_snapshot(&s4);
+        log_dispatcher_attempt("D-01-dry", true, s4.reasons.len(), "");
+        log::info!("[dry-run] D-01 OK: name={} code={}", s4.name, s4.code);
+    } else {
+        log_dispatcher_attempt("D-01-dry", false, 0, "snapshot empty");
+    }
+    let s5 = load_paper_review_snapshot_real(&date);
+    if !s5.name.is_empty() {
+        let _p = build_paper_review_from_snapshot(&s5);
+        log_dispatcher_attempt("A-01-dry", true, 1, "");
+        log::info!("[dry-run] A-01 OK: name={} pnl={:?}", s5.name, s5.pnl);
+    } else {
+        log_dispatcher_attempt("A-01-dry", false, 0, "snapshot empty");
+    }
+
+    log::info!("[v14.0 dry-run] 完成 ({} {})", date, hhmm);
+    log::info!("[v14.0 dry-run] 详见 data/dispatcher_log.jsonl");
+}
+
 /// v17.6: 按当前时间窗触发 6 dispatcher
 /// - 09:00 → P-01 (盘前新闻)
 /// - 10:00/11:00/14:00 → I-01/I-02/I-03/D-01 (盘中)
@@ -608,6 +685,8 @@ async fn main() {
     let review_mode = std::env::args().any(|a| a == "--review");
     // v17.6: 推送模式 (--push), 调 6 dispatcher 一次后退出
     let push_mode = std::env::args().any(|a| a == "--push");
+    // v14.0: dry-run 模式, 验证 dispatcher 加载 + 渲染, 不实际推送
+    let push_dry_run = std::env::args().any(|a| a == "--push-dry-run");
 
     // 显式标记交易环境，供底层写入守卫执行双向隔离。
     // v19.9: --test 路径不设 STOCK_ENV_MODE (默认 prod), 让 env_guard 允许真持仓
@@ -638,6 +717,10 @@ async fn main() {
 
     if test_mode {
         run_test_scan().await;
+    } else if push_dry_run {
+        // v14.0: dry-run 模式, 仅验证 + 渲染, 不实际推送
+        run_daily_pushes_dry_run().await;
+        std::process::exit(0);
     } else if push_mode {
         // v17.6: 推送模式, 调 6 dispatcher (按时间窗决定哪些触发)
         run_daily_pushes().await;
