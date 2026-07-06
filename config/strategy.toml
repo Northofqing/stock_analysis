@@ -87,6 +87,14 @@ incremental_interval_min = 5   # 盘中 incremental 间隔 (分钟): 与 5min K 
 batch_max_age_hours = 24       # 盘前 batch 数据新鲜度窗口 (小时): 1 个交易日
 incremental_max_age_min = 20   # 盘中 incremental 数据新鲜度 (分钟): 快讯新鲜度
 
+# v22: push 推送窗口 (替代 v17.6 写死的 09:00-19:00)
+# push_preopen_time: 盘前 push 时刻 (P-01 触发)
+# push_intraday_times: 盘中 push 时刻列表 (4 个盘中 dispatcher 触发)
+# push_evening_time: 盘后 push 时刻 (A-01 触发)
+push_preopen_time = "09:00"
+push_intraday_times = ["10:30", "11:00", "14:30"]
+push_evening_time = "19:00"
+
 # ── v9 推送阈值 (NS3 §4 防 0 信号) ──
 # event_risk_score ≥ threshold 才推; BR-014: clamp_max < threshold
 # 灰度/沙盘阶段推荐 threshold=60; 实盘阶段应改回 75 (符合 NS3)

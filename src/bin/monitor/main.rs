@@ -385,16 +385,20 @@ async fn run_daily_pushes_dry_run() {
 /// - 09:00 → P-01 (盘前新闻)
 /// - 10:00/11:00/14:00 → I-01/I-02/I-03/D-01 (盘中)
 /// - 19:00 → A-01 (盘后复盘)
+/// - v22: 时刻从 config/strategy.toml [schedule] 读, 不再写死
 async fn run_daily_pushes() {
     use push_templates::{
         dispatch_preopen_news_hot_daily, dispatch_intraday_market_daily,
         dispatch_news_catalyst_daily, dispatch_industry_chain_intraday_daily,
         dispatch_news_to_idea_daily, dispatch_paper_review_daily,
     };
+    use stock_analysis::opportunity::scheduler::{OpportunitySchedule, PushWindow};
+    // v22: 从 config 读取 push 时刻 (替代写死的 09:00 / 10:30 / 11:00 / 14:30 / 19:00)
+    let schedule = OpportunitySchedule::default();
     let now = chrono::Local::now();
     let hhmm = now.format("%H:%M").to_string();
     let date = now.format("%Y-%m-%d").to_string();
-    let hour: u32 = hhmm[..2].parse().unwrap_or(0);
+    let now_time = now.time();
 
     // banner for 盘中模板 (复用现有 BannerCtx::default)
     let banner = push_templates::BannerCtx {
@@ -405,28 +409,36 @@ async fn run_daily_pushes() {
         data_missing_note: None,
     };
 
-    log::info!("[v17.6] --push 模式启动 (当前 {} {})", date, hhmm);
+    log::info!("[v22] --push 模式启动 (当前 {} {}, 时刻读 config)", date, hhmm);
 
-    if hour < 9 || hour >= 19 {
-        log::warn!("[v17.6] 当前时间 {} 超出推送窗口 (09:00-19:00), 仅推 A-01", hhmm);
-        dispatch_paper_review_daily(&date).await;
-        return;
-    }
-
-    // 09:00 盘前
-    if hour < 10 {
-        let _ = dispatch_preopen_news_hot_daily().await;
-    }
-    // 10:00 / 11:00 / 14:00 盘中 (4 个 dispatcher)
-    if hour >= 10 && hour < 15 {
-        let _ = dispatch_intraday_market_daily(&hhmm, &banner).await;
-        let _ = dispatch_news_catalyst_daily(&hhmm, &banner).await;
-        let _ = dispatch_industry_chain_intraday_daily(&hhmm, &banner).await;
-        let _ = dispatch_news_to_idea_daily(&hhmm, &banner).await;
-    }
-    // 19:00 盘后
-    if hour >= 15 {
-        let _ = dispatch_paper_review_daily(&date).await;
+    // v22: 用 push_window() 判断当前时刻窗口 (替代 v17.6 写死 hour)
+    let window = schedule.push_window(now_time);
+    log::info!("[v22] 推送窗口: {:?}", window);
+    match window {
+        PushWindow::Preopen => {
+            let _ = dispatch_preopen_news_hot_daily().await;
+        }
+        PushWindow::Intraday => {
+            // 4 个盘中 dispatcher (I-01/I-02/I-03/D-01)
+            let _ = dispatch_intraday_market_daily(&hhmm, &banner).await;
+            let _ = dispatch_news_catalyst_daily(&hhmm, &banner).await;
+            let _ = dispatch_industry_chain_intraday_daily(&hhmm, &banner).await;
+            let _ = dispatch_news_to_idea_daily(&hhmm, &banner).await;
+        }
+        PushWindow::Evening => {
+            let _ = dispatch_paper_review_daily(&date).await;
+        }
+        PushWindow::Outside => {
+            // v22: 窗口外, 仅 A-01 兜底 (窗口信息读 config, 不再写死 09:00-19:00)
+            log::warn!(
+                "[v22] 当前时间 {} 不在 push 窗口内 (盘前 {} / 盘中 {:?} / 盘后 {}), 仅推 A-01 兜底",
+                hhmm,
+                schedule.push_preopen.format("%H:%M"),
+                schedule.push_intraday.iter().map(|t| t.format("%H:%M").to_string()).collect::<Vec<_>>(),
+                schedule.push_evening.format("%H:%M"),
+            );
+            let _ = dispatch_paper_review_daily(&date).await;
+        }
     }
 
     log::info!("[v17.6] --push 完成 (HHMM: {})", hhmm);
