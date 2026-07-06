@@ -1,11 +1,22 @@
-# v13 推送模板实现设计 — 6 新增 PushKind + §14.5 治理对齐
+# v13 推送模板整体设计 — 7 新增模板 + 6 新规模板 + 24 对齐 + 34 PushKind 治理
 
 > **类型**：设计文档（Design Spec / Gate A 产物）
 > **日期**：2026-07-06
-> **关联 spec**：`docs/architecture/v13-push-templates.md` §14.0~§14.6
+> **关联 spec**：`docs/architecture/v13-push-templates.md §14.0~§14.6`
 > **关联 baseline**：v19.16（commit `1f3a176`）
-> **优先级**：P0 = 5 模板（⚡重要）/ P1 = 1 模板（ℹ️参考）
+> **关联新规**：沪深北交易所《交易规则（2026 修订）》2026-07-06 施行
 > **作者**：Claude Code（brainstorming 流程产出）
+
+---
+
+## 🚨 紧急标注（必读）
+
+**新规 2026-07-06（今天）起施行**，本设计文档涉及两项需**即刻同步**的治理参数变更：
+
+1. **ST/*ST 涨跌幅 5% → 10%** — 现有持仓风险阈值可能错配
+2. **创业板做市商制度生效** — 中小市值流动性阈值需校准
+
+**建议**：spec 通过 Gate A 后，**不等待 PR 实施**，先在 `config/risk/*.toml` 同步新阈值，再走 PR 流程固化代码。
 
 ---
 
@@ -13,14 +24,38 @@
 
 | 项 | 值 |
 |---|---|
-| 标题 | v13 推送模板实现设计 — 6 新增 PushKind + §14.5 治理对齐 |
+| 标题 | v13 推送模板整体设计 — 7 新增 + 6 新规 + 24 对齐 + 34 治理 |
 | 日期 | 2026-07-06 |
 | 路径 | `docs/superpowers/specs/2026-07-06-v13-push-templates-design.md` |
 | 关联 spec | `docs/architecture/v13-push-templates.md §14.0~§14.6` |
 | 关联 plan | TBD（由 `superpowers:writing-plans` 阶段产出 `v13-implementation-plan.md`） |
 | 关联 baseline | v19.16（`1f3a176`） |
-| 优先级分层 | P0 = 5 模板（P-01 / I-01 / I-02 / D-01 / A-10）；P1 = 1 模板（A-01） |
+| 关联新规 | 沪深北《交易规则（2026 修订）》2026-07-06 施行 |
+| 优先级分层 | **P0 = 9 模板（⚡重要）** / **P1 = 4 模板（ℹ️参考 + 1 个 v13 P1）** |
 | 状态 | Draft（待用户审批） |
+
+**P0 模板清单**（9 个，⚡重要）：
+
+| 序 | 模板 ID | PushKind | 来源 |
+|---|---|---|---|
+| 1 | P-01 | `PreopenNewsHot` | v13 spec [新增] |
+| 2 | I-01 | `IntradayMarket` | v13 spec [新增] |
+| 3 | I-02 | `NewsCatalyst` | v13 spec [新增] |
+| 4 | I-03 | `IndustryChainIntraday` | v13 spec + 审计多发现 |
+| 5 | A-10 | `CatalystReview` | v13 spec [新增] |
+| 6 | D-01 | `NewsToIdea` | v13 spec [新增] |
+| 7 | T-14 | `PostFixedPriceOrder` | **新规 v13.1 ⚡** |
+| 8 | T-15 | `PostFixedPriceFill` | **新规 v13.1 ⚡** |
+| 9 | T-16 | `StPriceLimitChanged` | **新规 v13.1 ⚡** |
+
+**P1 模板清单**（4 个，ℹ️参考 + 1 个 v13 P1）：
+
+| 序 | 模板 ID | PushKind | 来源 |
+|---|---|---|---|
+| 1 | A-01 | `PaperReview` | v13 spec [新增]（前置 T-11） |
+| 2 | T-17 | `EtfClosingCallAuction` | **新规 v13.1 ℹ️**（仅沪市 ETF） |
+| 3 | T-18 | `BlockTradeIntradayConfirm` | **新规 v13.1 ℹ️**（创业板大宗盘中确认） |
+| 4 | T-19 | `BlockTradePriceRange` | **新规 v13.1 ℹ️**（北交所大宗价格区间） |
 
 ---
 
@@ -28,519 +63,791 @@
 
 ### 1.1 文档目标
 
-将 `docs/architecture/v13-push-templates.md`（spec）转化为可落地到 PR 的设计文档，明确：
+将 v13 spec + 2026-07-06 新规 + 现有 24 render 审计发现**合并为一份可落地到 PR 的设计文档**，明确：
 
-- 6 个 `[新增]` 模板的**数据源映射、字段语义、失败模式、合 Gate**
-- §14.5 治理清单与 `PushKind` 枚举的**对齐差量**
-- 分阶段 PR 提交节奏（P0 = 5 个 / P1 = 1 个）
-- 测试矩阵、PR 证据、回滚命令
+- 7 个 v13 spec `[新增]` 模板（含审计多发现的 I-03 盘中 IndustryChain）
+- 6 个**新规 v13.1 模板**（盘后固定价格扩围 / ST 涨跌幅 / ETF 集合竞价 / 大宗交易等）
+- 12 项现有 24 render 与 v13 spec 的差异对齐
+- §14.5 治理清单 34 PushKind 全表对齐
+- 风格统一与共性约束
+- 分阶段 PR 提交节奏（预估 13 个 PR）+ 测试矩阵 + 证据 + 回滚
 
 ### 1.2 范围（Scope）
 
-**In Scope**（本设计文档覆盖）
+**In Scope**
 
-| 项 | 说明 |
-|---|---|
-| PushKind 枚举补齐 | 新增 6 个 variant：`PreopenNewsHot` / `IntradayMarket` / `NewsCatalyst` / `PaperReview` / `CatalystReview` / `NewsToIdea` |
-| 治理元信息对齐 | §14.5 全表 → `level()` / `cooldown_secs()` / `requires_banner()` / `is_deprecated()` / `counts_against_daily_budget()` |
-| 6 个新增 render 函数 | `render_preopen_news_hot` / `render_intraday_market` / `render_news_catalyst` / `render_paper_review` / `render_catalyst_review` / `render_news_to_idea` |
-| 6 个 Params 结构体 | 与 v19.x 现存 `*Params` 同形（生命周期 + `&str` 借用） |
-| 调用路径 | `bin/monitor/main.rs` 6 个新调用点 + `signal_state.rs` 注册 |
-| 测试矩阵 | 19 render 单测（覆盖 6 函数）+ 17 治理元信息单测 + 5 红线专项 + 4 BR 登记引用 |
-| PR 证据样例 | 6 段 `Refs / Data-Redlines / OldModules / Threshold-Proof / Business-Rules / Rollback` |
-| 回滚 | L1 单 PR revert / L2 PR 链暂停 / L3 整体回 baseline / L4 红线阻断 |
+| 项 | 内容 | 数量 |
+|---|---|---|
+| v13 新增模板 | P-01 / I-01 / I-02 / I-03 / A-01 / A-10 / D-01 | 7 |
+| 新规 v13.1 模板 | T-14 ~ T-19 | 6 |
+| 现有 24 render 对齐 | 12 项差异（见 §6） | 12 |
+| PushKind 治理对齐 | 22 现有 + 7 v13 + 6 新规 + 3 代码有 spec 无（CandidateBoard / NewsRanked / CloseCall） = 38 项 | 38 |
+| 测试矩阵 | 7+6 新模板 + 34 治理 + 5 红线 + 4 BR | — |
+| 紧急治理参数同步 | ST 阈值 / 做市商流动性（不需 PR，先 `config/*.toml` 改） | 2 |
+| PR 节奏 | 13 PR 分阶段 | 13 |
 
-**Out of Scope**（不在本设计文档）
+**Out of Scope**
 
-- v19.16 已实现模板的回归改动（`AuctionVolume` / `TurnoverTop` 等）
+- v19.16 已实现且**与 v13 完全一致**的 render 改动（T-01/T-02/T-03 等完全一致部分）
 - 推送频道迁移、数据源接入实现、调度（cron）调整
 - `--test` 路径回归与真接改造（独立 PR）
-- 文档合规审查脚本本身（`tools/compliance/check.sh` 已存在，仅依赖）
+- 文档合规审查脚本本身
+- 创业板做市商流动性阈值的**算法实现**（仅做治理参数标注）
 
-### 1.3 与上游 spec 的引用关系
+### 1.3 关联文档
 
-本设计**严格引用** `docs/architecture/v13-push-templates.md §14.0~§14.6`，不重复 spec 内容。所有设计决策必须可回溯到 spec 章节（满足 AGENTS §6 `Refs: spec §X.X` 与 ENGINEERING_RULES_V2 §3 PR 模板强制字段）。
+| 文档 | 用途 |
+|---|---|
+| `docs/architecture/v13-push-templates.md` | 上游 spec（被引） |
+| `docs/superpowers/specs/2026-07-06-v13-push-templates-design.md` | **本文件** |
+| `docs/superpowers/specs/2026-07-06-v13-push-templates-audit.md` | 审计报告（已产出，含 3 段差异表） |
+| `config/risk/stop_loss.toml` | ST 阈值（待更新 5% → 10%） |
+| `config/risk/limits.toml` | 流动性阈值（创业板做市商校准） |
+| `docs/business_rules.md` | BR 登记（4 个新增：BR-NEWS-CLUSTER / BR-NEWS-CATALYST / BR-THEME-STAGE / BR-NEWS-TO-IDEA / BR-POST-FIXED-PRICE / BR-ST-PRICE-CHANGE） |
 
 ---
 
-## 2. 现状/差距 + 治理对齐
+## 2. 现状盘点（审计结果）
 
 ### 2.1 当前实现（v19.16）盘点
 
 | 项 | 现状 |
 |---|---|
-| `PushKind` 枚举 | 22+ variant（含 v12 §14.3 新增 13 个 + v11-P0-5+ 5 个 + 降级 9 个） |
+| `PushKind` 枚举 | 22+ variant |
 | `push_templates.rs` 行数 | 3545 |
 | `notify.rs` 行数 | 1395 |
-| 已实现 render 函数 | 24 个 |
-| 既有 ⚡重要 PushKind | AccountMode / DataMode / HoldingPlan / HoldingEvent / T0Advice / CandidateTriggered / CloseCall / CandidateBoard / NewsRanked |
-| 既有 ℹ️参考 PushKind | ForbiddenOps / PaperTrade / AuctionVolume / TurnoverTop / ReviewMarket / ReviewLhb / ReviewSignal / ReviewFailure / TomorrowWatch / EventCalendar |
+| 已实现 render 函数 | 24 |
+| 完全一致模板 | 11（与 v13 spec） |
+| 有差异模板 | 12（见 §6） |
+| 代码完全缺失模板 | 7（v13 新增）+ 6（新规 v13.1）= 13 |
 
-### 2.2 现状 vs v13 spec 差距矩阵
+### 2.2 审计三段差异表（汇总）
 
-| v13 spec § | PushKind | 治理（§14.5） | render 函数 | 当前状态 |
-|---|---|---|---|---|
-| §14.1 P-01 | `PreopenNewsHot` ⚡重要 | 待补齐 | **缺失** | **新增** |
-| §14.1 P-02 | `AuctionVolume` ⚡重要 | 已存在 | `render_auction_volume` | v19.x 已实现 |
-| §14.1 P-03 | `CandidateTriggered` ⚡重要 | 已存在 | `render_candidate_triggered` | v19.x 已实现 |
-| §14.1 P-04 | `PaperTrade` ℹ️参考 | 已存在 | `render_paper_trade` | v19.x 已实现 |
-| §14.2 I-01 | `IntradayMarket` ⚡重要 | 待补齐 | **缺失** | **新增** |
-| §14.2 I-02 | `NewsCatalyst` ⚡重要 | 待补齐 | **缺失** | **新增** |
-| §14.2 I-03 | `IndustryChain` + `CandidateTriggered` | 部分 | `render_industry_chain` | v19.x 已实现（盘后） |
-| §14.2 I-04~I-07 | 已有 | 已存在 | 4 个 render | v19.x 已实现 |
-| §14.2 I-08 | `TurnoverTop` ℹ️参考 | 已存在 | `render_turnover_top` | v19.15 已实现 |
-| §14.3 A-01 | `PaperReview` ℹ️参考 | 待补齐 | **缺失** | **新增** |
-| §14.3 A-02~A-09 | 已有 | 已存在 | 8 个 render | v19.x 已实现 |
-| §14.3 A-10 | `CatalystReview` ⚡(盘后) | 待补齐 | **缺失** | **新增** |
-| §14.4 D-01 | `NewsToIdea` ⚡重要 | 待补齐 | **缺失** | **新增** |
+> 完整审计报告见 `docs/superpowers/specs/2026-07-06-v13-push-templates-audit.md`。
 
-**结论**：6 个新模板均**纯增量**，不触碰现有 24 个 render。
+**字段级**：11 完全一致 / 12 有差异 / 7 完全缺失（v13）/ 6 完全缺失（新规）
 
-### 2.3 §14.5 治理对齐差量
+**治理级**：14 完全一致 / 8 有差异 / 13 完全缺失（v13 + 新规）
 
-> 不只是新增 6 个 PushKind，还要把 §14.5 全表与 `notify.rs` 现有 `level()` / `cooldown_secs()` / `requires_banner()` 对齐。
+**风格级**：15+ 完全一致 / 12 有差异（标题/末行/治理元信息错位）
 
-| PushKind | 等级 | 冷却 | Frozen/Unsafe | is_deprecated | 现状 |
-|---|---|---|---|---|---|
-| `PreopenNewsHot` | ⚡ | 15min | 可发 | false | **缺** |
-| `IntradayMarket` | ⚡ | 15min | 照发 | false | **缺** |
-| `NewsCatalyst` | ⚡ | 10min | 照发 | false | **缺** |
-| `PaperReview` | 盘后 | 1次/日 | 可发 | false | **缺** |
-| `CatalystReview` | ⚡(盘后) | 1次/日 | 可发 | false | **缺** |
-| `NewsToIdea` | ⚡ | 20min/票 | ReduceOnly可发 / Frozen谨慎 | false | **缺** |
+### 2.3 高优先级冲突（必须修复）
 
-**对齐方式**（满足 §14.0.1 全局横幅 + §14.5 治理表）：
+| # | 项目 | 性质 | 影响 |
+|---|---|---|---|
+| 1 | 7 个 v13 新增 + 6 个新规模板完全缺失 | spec 有代码无 | 阻塞 v13 合规 |
+| 2 | `PushKind::PaperTrade` Frozen/Unsafe 行为不符 | spec 照发，代码停发 | 阻塞 v13 合规 |
+| 3 | `PushKind::T0Advice(禁止)` 等级不符 | spec ℹ️，代码 ⚡ | 阻塞 v13 合规 |
+| 4 | `A-05 龙虎榜` 空 entries 兜底文案缺失 | spec 明确要求 | 阻塞 v13 合规 |
+| 5 | 盘后 R 系列 `requires_banner=true` 与 spec 不符 | spec 无 banner 占位符 | 视觉不一致 |
+| 6 | `PushKind::TurnoverTop/IndustryChain` 冷却不符 | spec 与代码不一致 | 行为偏差 |
+| 7 | **ST/*ST 涨跌幅 5% → 10%** | 新规已生效 | 现有持仓风险阈值错配 ⚠️ |
+| 8 | **创业板做市商流动性阈值** | 新规已生效 | 中小盘流动性治理需校准 ⚠️ |
 
-- 等级 → `PushLevel::Important` / `Info`（⚡ → Important；ℹ️ → Info；盘后且 ⚡ → Important）
-- 冷却 → 实现 `cooldown_secs()` 返回 `Some(n)`（None 仅 `AccountMode` / `HoldingEvent`）
-- Frozen/Unsafe → 落到 `push_governor` 现有判定路径（不另写）
-- `is_deprecated` → 默认 `false`，但 `PaperTrade` / `ForbiddenOps` 保留 v19.x 旧值
+### 2.4 中优先级冲突（建议修复）
 
-### 2.4 数据源与红线映射（设计原则）
-
-> 满足 ENGINEERING_RULES_V2 §2.1~§2.8 红线 + AGENTS §3 数据红线。
-
-| 模板 | 主要数据源 | 红线引用 |
+| # | 项目 | 性质 |
 |---|---|---|
-| P-01 PreopenNewsHot | news_monitor (新闻源) | §2.1 / §2.4 |
-| I-01 IntradayMarket | 板块轮动引擎（既有） | §2.4 / §2.3 |
-| I-02 NewsCatalyst | news_monitor + 实时行情 | §2.1 / §2.4 |
-| A-01 PaperReview | virtual_watch DB（既有） | §2.4 |
-| A-10 CatalystReview | news_monitor + 板块 DB | §2.1 / §2.4 |
-| D-01 NewsToIdea | news_monitor + 实时行情 + 候选台 | §2.1 / §2.4 / §2.6 |
+| 9 | 3 个 render 末行缺"辅助建议"（T-01/T-02/R-02） | 风格不符 |
+| 10 | `PushKind::AuctionVolume` level 应改 Important | 治理不符 |
+| 11 | I-08 标题" 盘中" 后缀需删 | 风格不符 |
+| 12 | P-02 标题 TopN 改单票 + 改"竞价热点量能" | 风格不符 |
+| 13 | 代码文件头注释引用 `v12-push-templates.md` 应改 `v13` | 文档漂移 |
 
-**失败模式**：每个模板的 Params 必须为**显式 `Option`**，缺失字段渲染为空字符串 + warning，不静默填充（§2.2）。
+### 2.5 低优先级（注释/归档）
 
-### 2.5 模块边界（与现有架构对齐）
-
-| 新增 | 位置 | 依赖 |
-|---|---|---|
-| 6 PushKind variant | `src/bin/monitor/notify.rs` | 无 |
-| 6 render 函数 | `src/bin/monitor/push_templates.rs` | `BannerCtx` + 现有 helpers |
-| 6 Params 结构体 | `src/bin/monitor/push_templates.rs` | 仅借用 `&str` |
-| 6 调用点 | `src/bin/monitor/main.rs` | 现有 signal 触发器 |
-| 6 单测 | `src/bin/monitor/push_templates.rs`（同文件 `#[cfg(test)]`） | 仅标准断言 |
-
-**不引入新 crate / 不改模块边界**（满足 AGENTS §2.2 Gate B 最小变更）。
+| # | 项目 |
+|---|---|
+| 14 | `CandidateBoard / NewsRanked / CloseCall` 在 §14.5 表中无登记，建议补行或归档 |
+| 15 | T-08 候选失效 复用 `CandidateBoard`，建议升级为独立 enum 或保留 |
 
 ---
 
-## 3. 6 个新增模板详细设计
+## 3. v13 模板分类总览
 
-> 6 个模板按 v13 spec 序号排列。每个模板给出：**字段语义 / 数据源 / 失败模式 / 合 Gate / Banner 行为 / PR 证据字段**。
+### 3.1 三大类别
 
-### 3.1 P-01 PreopenNewsHot（盘前新闻热点）⚡重要 — P0
-
-**字段映射**（spec §14.1 P-01）
-
-| spec 字段 | 类型 | 数据源 | 缺失行为 |
+| 类别 | 数量 | 模板 ID | 来源 |
 |---|---|---|---|
-| `HH:MM` | `&str` | 调度器 | 必填，缺失 → 报错（AGENTS §3） |
-| `theme_1/2/3` | `&str` | news_monitor cluster 输出 | 缺失 → 整段省略（§2.2） |
-| `news_1/2` + `chain_1/2` | `&str` + `&str` | news_monitor event | 缺失 → 整行省略 |
-| `name` / `code` / `reason` ×N | `&str` | 候选台 + news 关联 | 缺失 → 跳过该行 |
+| **A. v13 spec 6+1 `[新增]`** | 7 | P-01 / I-01 / I-02 / I-03 / A-01 / A-10 / D-01 | spec §14 |
+| **B. 新规 v13.1 `[2026-07-06]`** | 6 | T-14 / T-15 / T-16 / T-17 / T-18 / T-19 | 新规 |
+| **C. 现有 24 render（部分对齐）** | 24 | T-01~T-12, R-01~R-08, P-02~P-04, I-04~I-08, A-02~A-09 | 既有 |
+| **D. v11 候选台（仅兼容）** | 3 | CandidateBoard / NewsRanked / CloseCall | v11 降级 |
 
-**治理元信息**（§14.5）
+### 3.2 时间窗口分布
 
-- `level() = Important`
-- `cooldown_secs() = Some(900)`（15min）
-- `requires_banner() = false`（盘前，banner 非强制）
-- `is_deprecated() = false`
-- `counts_against_daily_budget() = true`
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 盘前        盘中                            盘后/盘后固定   │
+│ 09:00       09:30        11:30  13:00  14:57  15:00  15:30  │
+│            ▼            ▼      ▼      ▼      ▼      ▼      │
+│  ┌────┐  ┌────────────────────────────────────────┐ ┌────┐ │
+│  │P-01│  │I-01 I-02 I-03 I-04 I-05 I-06 I-07 I-08│ │T-14│ │
+│  │P-02│  │                D-01                   │ │T-15│ │
+│  │P-03│  └────────────────────────────────────────┘ │T-17│ │
+│  │P-04│                                            │T-18│ │
+│  └────┘                                            └────┘ │
+│                                          ┌─────────────────┐│
+│                                          │  T-19 (北交所)    ││
+│                                          │  15:05-15:30 撮合 ││
+│                                          └─────────────────┘│
+└─────────────────────────────────────────────────────────────┘
+                                                  ▼
+                              ┌────────────────────────────┐
+                              │  盘后复盘 R-01~R-08, A-01, │
+                              │  A-10, T-16                │
+                              │  19:00 / 21:00             │
+                              └────────────────────────────┘
+```
 
-**红线 Gate**：`2.1`（news 真数据，无 mock）/ `2.2`（缺字段显式）/ `2.4`（新闻时效）。
+**关键时间节点**：
+- 09:00 — 盘前新闻 (P-01)
+- 09:15 — 深市/北交所 申报起步
+- 09:30 — 沪市 申报起步 + 连续竞价
+- 11:30 — 上午收盘
+- 13:00 — 下午开盘
+- 14:57 — 上交所 ETF 集合竞价起步（T-17）
+- 15:00 — 主板收盘
+- 15:05 — 盘后固定价格撮合起步（T-15）
+- 15:30 — 全日收市 + 盘后固定价格撮合结束
+- 19:00 — 持仓明日计划 (R-01)
+- 21:00 — 龙虎榜 (R-04) + 失败归因 (R-06)
 
-**PR 证据**：`Refs: spec §14.1 P-01` / `Data-Redlines: [2.1, 2.2, 2.4]` / `OldModules: news_monitor_loop.adopt` / `Threshold-Proof: N/A` / `Business-Rules: BR-NEWS-CLUSTER` / `Rollback: git revert <commit>`。
+---
 
-### 3.2 I-01 IntradayMarket（盘中轮动总览）⚡重要 — P0
+## 4. v13 新增模板详细设计
 
-**字段映射**（spec §14.2 I-01）
+> 7 个模板按 v13 spec 序号排列。每个模板：**字段语义 / 数据源 / 失败模式 / 合 Gate / Banner / PR 证据**。
 
-| spec 字段 | 类型 | 数据源 | 缺失行为 |
+### 4.1 P-01 PreopenNewsHot（盘前新闻热点）⚡ — P0
+
+| 字段 | 类型 | 数据源 | 缺失行为 |
+|---|---|---|---|
+| `HH:MM` | `&str` | 调度器 | 必填，缺失报错 |
+| `theme_1/2/3` | `&str` | news_monitor cluster | 整段省略 |
+| `news_1/2` + `chain_1/2` | `&str` + `&str` | news_monitor event | 整行省略 |
+| `name/code/reason` ×N | `&str` | 候选台 + news | 跳过该行 |
+
+**治理**：`Important` / `Some(900)` / `requires_banner=false`（盘前）/ `is_deprecated=false`。
+
+**红线 Gate**：2.1 / 2.2 / 2.4。
+
+**PR 证据**：`Refs: spec §14.1 P-01` / `Data-Redlines: [2.1, 2.2, 2.4]` / `Business-Rules: BR-NEWS-CLUSTER`。
+
+### 4.2 I-01 IntradayMarket（盘中轮动总览）⚡ — P0
+
+| 字段 | 类型 | 数据源 | 缺失行为 |
 |---|---|---|---|
 | `HH:MM` | `&str` | 调度器 | 必填 |
-| `tech_ai/hbm/smartphone` + `score` | `&str` + `f32` | 板块轮动引擎（既有 sector_score） | score 缺失 → "N/A"（§2.2） |
+| `tech_ai/hbm/smartphone` + `score` | `&str` + `f32` | sector_rotation | "N/A" |
 | `power_uhv/grid/ess` + `score` | 同上 | 同上 | 同上 |
 | `robot_reducer/servo/vision` + `score` | 同上 | 同上 | 同上 |
-| `subsector` + 状态 | `&str` | 既有 | 缺失 → "暂无主攻" |
+| `subsector` + 状态 | `&str` | 既有 | "暂无主攻" |
 
-**治理元信息**：`Important` / `Some(900)`（15min）/ `requires_banner() = true`（盘中 ⚡ 交易建议类）/ `is_deprecated() = false` / `counts_against_daily_budget() = true`。
+**治理**：`Important` / `Some(900)` / `requires_banner=true`（盘中 ⚡）/ `is_deprecated=false`。
 
-**红线 Gate**：`2.3`（板块 score 坏数据校验，> ±20% 告警）/ `2.4`。
+**红线 Gate**：2.3（score > ±100 panic）/ 2.4。
 
-**PR 证据**：`Refs: spec §14.2 I-01` / `Data-Redlines: [2.3, 2.4]` / `OldModules: sector_rotation.adopt` / `Threshold-Proof: score clamp [-100, 100]` / `Rollback`。
+**PR 证据**：`Refs: spec §14.2 I-01` / `Data-Redlines: [2.3, 2.4]` / `Threshold-Proof: score clamp [-100, 100]`。
 
-### 3.3 I-02 NewsCatalyst（新闻催化映射）⚡重要 — P0
+### 4.3 I-02 NewsCatalyst（新闻催化映射）⚡ — P0
 
-**字段映射**（spec §14.2 I-02）
-
-| spec 字段 | 类型 | 数据源 | 缺失行为 |
+| 字段 | 类型 | 数据源 | 缺失行为 |
 |---|---|---|---|
 | `HH:MM` | `&str` | 调度器 | 必填 |
-| `headline` | `&str` | news_monitor | 必填，缺失 → 报错 |
-| `theme` | `&str` | news cluster | 缺失 → "未分类" |
-| `name/code/chg/reason` ×N | `&str` / `&str` / `f32` / `&str` | 实时行情 + news reason | chg 缺失 → 整行省略 |
+| `headline` | `&str` | news_monitor | 必填 |
+| `theme` | `&str` | news cluster | "未分类" |
+| `name/code/chg/reason` ×N | `&str/f32/&str` | 实时行情 + news reason | chg 缺失整行省略 |
 
-**治理元信息**：`Important` / `Some(600)`（10min）/ `requires_banner() = true` / `is_deprecated() = false` / `counts_against_daily_budget() = true`。
+**治理**：`Important` / `Some(600)` / `requires_banner=true` / `is_deprecated=false`。
 
-**红线 Gate**：`2.1` / `2.3`（chg 坏数据）/ `2.4`。
+**红线 Gate**：2.1 / 2.3（chg > ±20% panic）/ 2.4。
 
 **PR 证据**：`Refs: spec §14.2 I-02` / `Data-Redlines: [2.1, 2.3, 2.4]` / `Business-Rules: BR-NEWS-CATALYST`。
 
-### 3.4 A-01 PaperReview（虚拟仓复盘）ℹ️参考 — P1
+### 4.4 I-03 IndustryChainIntraday（盘中涨停扩散）⚡ — P0
 
-**字段映射**（spec §14.3 A-01）
+> **审计多发现**：v13 spec §14.2 I-03 要求盘中形态，但现有 `render_industry_chain` 是盘后 R-03 形态，需拆分。
 
-| spec 字段 | 类型 | 数据源 | 缺失行为 |
+| 字段 | 类型 | 数据源 | 缺失行为 |
+|---|---|---|---|
+| `HH:MM` | `&str` | 调度器 | 必填 |
+| `chain` + `count` | `&str` + `u32` | 板块涨停扫描 | "无涨停" |
+| `leader_name/code` + `连板高度` | `&str` + `u32` | 涨停龙头 | "暂无龙头" |
+| `补涨候选` ×N | `&str` | 候选台 | 整段省略 |
+
+**治理**：`Important` / `Some(1800)`（30min）/ `requires_banner=true` / `is_deprecated=false`。
+
+**红线 Gate**：2.1 / 2.4。
+
+**PR 证据**：`Refs: spec §14.2 I-03` / `Data-Redlines: [2.1, 2.4]`。
+
+**关键决策**：与 `R-03`（盘后 A-04）拆分，新 enum `IndustryChainIntraday`，不合并。
+
+### 4.5 A-01 PaperReview（虚拟仓复盘）ℹ️ — P1
+
+| 字段 | 类型 | 数据源 | 缺失行为 |
 |---|---|---|---|
 | `date` | `&str` | 调度器 | 必填 |
-| `name/code/trigger` | `&str` / `&str` / `&str` | virtual_watch DB | 缺失 → 整行省略 |
+| `name/code/trigger` | `&str` | virtual_watch DB | 整行省略 |
 | `desc/pnl` | `&str` / `f32` | virtual_close DB | pnl 缺失 → "N/A%" |
-| `plan_high/flat/low` | `&str` ×3 | 调用点计算（依赖 T-11 通路，A-01 PR #4 落实） | 缺失 → "暂无计划" |
+| `plan_high/flat/low` | `&str` ×3 | 调用点计算（依赖 T-11，A-01 PR #4 落实） | "暂无计划" |
 
-**治理元信息**：`Info`（盘后参考）/ `Some(86400)`（1次/日）/ `requires_banner() = false` / `is_deprecated() = false` / `counts_against_daily_budget() = false`。
+**治理**：`Info` / `Some(86400)` / `requires_banner=false`（盘后）/ `is_deprecated=false`。
 
-**红线 Gate**：`2.1` / `2.4`（盘后 21:00 后取数）。
+**红线 Gate**：2.1 / 2.4（盘后 21:00 后取数）。
 
-**PR 证据**：`Refs: spec §14.3 A-01` / `Data-Redlines: [2.1, 2.4]` / `OldModules: virtual_watch.adopt`。
+**前置依赖**：T-11 竞价复算通路（v12-dev-plan.md §MVP-3）。
 
-**注**：本模板属 **P1 优先级**（ℹ️参考），但 `plan_*` 字段依赖 T-11 竞价复算，需在 T-11 数据通路就绪后实施；文档中标注前置依赖：`前置: T-11 竞价复算通路（v12-dev-plan.md §MVP-3）`。
+### 4.6 A-10 CatalystReview（盘后题材催化复盘）⚡(盘后) — P0
 
-### 3.5 A-10 CatalystReview（盘后题材催化复盘）⚡(盘后) — P0
-
-**字段映射**（spec §14.3 A-10）
-
-| spec 字段 | 类型 | 数据源 | 缺失行为 |
+| 字段 | 类型 | 数据源 | 缺失行为 |
 |---|---|---|---|
 | `date` | `&str` | 调度器 | 必填 |
 | `theme` | `&str` | news cluster | 必填 |
-| `score` | `f32` | 板块强度 | 缺失 → "N/A" |
-| `persistent` | `enum`（high/med/low） | 持续性判定 | 缺失 → "med" |
-| `started_names/pending_names/watch` | `&[&str]` | news + 候选台 | 缺失 → 整段省略 |
+| `score` | `f32` | 板块强度 | "N/A" |
+| `persistent` | `enum`（high/med/low） | 持续性判定 | "med" |
+| `started_names/pending_names/watch` | `&[&str]` | news + 候选台 | 整段省略 |
 
-**治理元信息**：`Important`（⚡盘后）/ `Some(86400)`（1次/日，盘后段 15:30-23:00 触发即记当日已推）/ `requires_banner() = false`（盘后非交易建议）/ `is_deprecated() = false` / `counts_against_daily_budget() = true`。
+**治理**：`Important` / `Some(86400)`（盘后段 15:30-23:00 触发即记当日已推）/ `requires_banner=false` / `is_deprecated=false`。
 
-**红线 Gate**：`2.1` / `2.3`（score 校验）/ `2.4`。
+**红线 Gate**：2.1 / 2.3 / 2.4。
 
-**PR 证据**：`Refs: spec §14.3 A-10` / `Data-Redlines: [2.1, 2.3, 2.4]` / `Business-Rules: BR-THEME-STAGE`。
+**PR 证据**：`Refs: spec §14.3 A-10` / `Business-Rules: BR-THEME-STAGE`。
 
-### 3.6 D-01 NewsToIdea（新闻驱动个股）⚡重要 — P0
+### 4.7 D-01 NewsToIdea（新闻驱动个股）⚡ — P0
 
-**字段映射**（spec §14.4 D-01）
-
-| spec 字段 | 类型 | 数据源 | 缺失行为 |
+| 字段 | 类型 | 数据源 | 缺失行为 |
 |---|---|---|---|
-| `banner` | `BannerCtx` | 既有 | 必填，⚡交易建议类强约束 |
+| `banner` | `BannerCtx` | 既有 | 必填 |
 | `HH:MM` | `&str` | 调度器 | 必填 |
 | `headline` | `&str` | news_monitor | 必填 |
-| `theme/stage` | `&str` / `enum` | news cluster | 缺失 → stage="启动" |
-| `name/code` | `&str` / `&str` | 候选台 + news 关联 | 必填 |
-| `reason_1/2` | `&str` | 候选台 + news | 缺失 → 整行省略 |
-| `action` | `enum`（观察/低吸/不追） | 候选台推荐 | 缺失 → 整段省略 |
+| `theme/stage` | `&str` / `enum` | news cluster | stage → "启动" |
+| `name/code` | `&str` | 候选台 + news | 必填 |
+| `reason_1/2` | `&str` | 候选台 + news | 整行省略 |
+| `action` | `enum`（观察/低吸/不追） | 候选台 | 整段省略 |
 
-**治理元信息**：`Important` / `Some(1200)`（20min/票）/ `requires_banner() = true` / `is_deprecated() = false` / `counts_against_daily_budget() = true`。
+**治理**：`Important` / `Some(1200)`（20min/票）/ `requires_banner=true` / `is_deprecated=false`。
 
-**红线 Gate**：`2.1` / `2.4` / `2.6`（建议类不强下单）。
+**红线 Gate**：2.1 / 2.4 / 2.6。
 
-**PR 证据**：`Refs: spec §14.4 D-01` / `Data-Redlines: [2.1, 2.4, 2.6]` / `Business-Rules: BR-NEWS-TO-IDEA`。
-
-### 3.7 模板间共性约束
-
-| 约束 | 来源 |
-|---|---|
-| 全部 emoji 标题 + `（HH:MM）` | spec §14.0.1 |
-| 交易建议类必带 banner | spec §14.0.1 |
-| 末尾 "辅助建议, 非下单指令" | spec §14.0.1 |
-| 新增 PushKind 必登记治理 | spec §14.0 |
-| 行内字段 ` \| ` 分隔 | spec §14.0 |
-| `{xxx}` 变量 / `[...]` 条件段 | spec §14.0 |
-
-**统一抽象**：新增 `RenderCtx` trait（**内部 trait，不导出**）封装 `level()` / `banner_required()` / `cooldown()` / `key()` 共性，避免 6 套重复样板。
+**PR 证据**：`Refs: spec §14.4 D-01` / `Business-Rules: BR-NEWS-TO-IDEA`。
 
 ---
 
-## 4. 测试矩阵
+## 5. 新规 v13.1 模板详细设计
 
-> 所有测试置于 `src/bin/monitor/push_templates.rs` 末尾 `#[cfg(test)] mod tests`，**与 v19.x 既有用例同模块**（不另开文件）。
+> 6 个新规模板按时间顺序排列。每个模板：**新规依据 / 字段语义 / 数据源 / 失败模式 / 合 Gate / Banner / PR 证据**。
 
-### 4.1 单测矩阵（6 render × 必测维度）
+### 5.1 新规总览（关联沪深北《交易规则（2026 修订）》）
 
-| 用例 ID | 模板 | 必测维度 | 期望 |
+| 序号 | 新规条款 | 影响模板 |
+|---|---|---|
+| ① | 盘后固定价格交易扩围（全部 A 股 + 沪深 ETF） | T-14 / T-15 |
+| ② | 主板 ST/*ST 涨跌幅 5%→10% | T-16 |
+| ③ | 上交所基金收盘改集合竞价 | T-17 |
+| ④ | 创业板引入做市商制度 | 治理参数（不需新模板） |
+| ⑤ | 创业板协议大宗盘中实时确认 | T-18 |
+| ⑥ | 北交所大宗价格范围（实时均价） | T-19 |
+
+### 5.2 T-14 PostFixedPriceOrder（盘后固定价格申报）⚡ — P0
+
+**新规依据**：① 盘后固定价格交易扩围，申报时间按交易所区分。
+
+**时间窗口**：
+- 沪市 A 股/ETF：9:30-11:30, 13:00-15:30
+- 深市 A 股/ETF + 北交所 A 股：9:15-11:30, 13:00-15:30
+
+| 字段 | 类型 | 数据源 | 缺失行为 |
 |---|---|---|---|
-| `UT-PR01-01` | P-01 | 标题 emoji + `（HH:MM）` | `📰 盘前热点（09:05）` 匹配 |
-| `UT-PR01-02` | P-01 | 3 主线 + 2 催化 + N 关注票 | 行数 = 1(标题) + 1(主线) + 1(催化label) + N(催化) + 1(关注label) + N(票) + 1(尾句) |
-| `UT-PR01-03` | P-01 | theme/news 缺失 → 整段省略 | 不输出 "催化:" label |
-| `UT-PR01-04` | P-01 | 末尾 "辅助建议, 非下单指令" | 字符串尾匹配 |
-| `UT-IR01-01` | I-01 | 3 大板块 + score 格式 | `科技: {subsector}（强度{score}）` |
-| `UT-IR01-02` | I-01 | score 缺失 → "N/A" | score == None 时渲染 "N/A" |
-| `UT-IR01-03` | I-01 | 轮动状态 enum → 中文 | 扩散 / 分化 / 退潮 三态全覆盖 |
-| `UT-NC02-01` | I-02 | banner 存在 + headline 必填 | 缺 headline → 报测试错 |
-| `UT-NC02-02` | I-02 | theme 缺失 → "未分类" | 默认兜底字符串 |
-| `UT-NC02-03` | I-02 | 票列表 chg 缺失 → 整行省略 | 不打印该行 |
-| `UT-PV01-01` | A-01 | date + name/code/trigger | 标准盘后复盘行 |
-| `UT-PV01-02` | A-01 | plan_xxx 三态全覆盖 | 高开> / 平开 / 低开 三段 |
-| `UT-PV01-03` | A-01 | pnl 缺失 → "N/A%" | 显示占位 |
-| `UT-PV01-04` | A-01 | **前置依赖**：T-11 通路未就绪 → `#[ignore]` 标记 | 文档注释引用 `v12-dev-plan.md §MVP-3` |
-| `UT-CR10-01` | A-10 | theme + score + persistent 三态 | high / med / low 全覆盖 |
-| `UT-CR10-02` | A-10 | 已启动 / 待启动段 | 缺失 → 整段省略 |
-| `UT-NI01-01` | D-01 | banner 必填 → 缺则 panic（与 v19.x `HoldingPlan` 一致） | 测中显式校验 banner 行 |
-| `UT-NI01-02` | D-01 | stage 三态 | 启动 / 发酵 / 分歧 |
-| `UT-NI01-03` | D-01 | action 三态 | 观察 / 低吸 / 不追 |
-| `UT-NI01-04` | D-01 | reason 缺失 → 整行省略 | 不打印该行 |
+| `exchange` | `enum`（SH/SZ/BJ） | 调度器 | 必填 |
+| `HH:MM` | `&str` | 调度器 | 必填 |
+| `name/code/price/qty` | `&str/f64/u32` | 委托回报 | 整行省略 |
+| `order_id` | `&str` | 委托 ID | 必填 |
+| `status` | `enum`（已报/已撤/废单） | 委托状态 | 必填 |
+| `window` | `enum`（上午/中午/下午） | 调度器 | 由 HH:MM 派生 |
 
-**合计**：19 个 render 用例。
+**治理**：`Important` / `Some(60)`（1min/票）/ `requires_banner=true` / `is_deprecated=false`。
 
-### 4.2 治理元信息测试（§14.5 对齐）
+**红线 Gate**：2.1 / 2.4（申报时效 ≤ 30s）/ 2.6（不自动下单）。
 
-> 复用 v19.x `cooldown_secs()` / `level()` / `requires_banner()` / `is_deprecated()` / `counts_against_daily_budget()` 既有断言模式（push_templates.rs:2317-2410 已存在 7 个治理断言）。
+**PR 证据**：`Refs: 新规 §5.2 + spec §14.5 v13.1` / `Data-Redlines: [2.1, 2.4, 2.6]` / `Business-Rules: BR-POST-FIXED-PRICE`（含申报窗口规则）。
 
-| 用例 ID | 断言 |
-|---|---|
-| `UT-GOV-01` | `PreopenNewsHot.cooldown_secs() == Some(900)` |
-| `UT-GOV-02` | `IntradayMarket.cooldown_secs() == Some(900)` |
-| `UT-GOV-03` | `NewsCatalyst.cooldown_secs() == Some(600)` |
-| `UT-GOV-04` | `PaperReview.cooldown_secs() == Some(86_400)` |
-| `UT-GOV-05` | `CatalystReview.cooldown_secs() == Some(86_400)` |
-| `UT-GOV-06` | `NewsToIdea.cooldown_secs() == Some(1200)` |
-| `UT-GOV-07` | `IntradayMarket.requires_banner() == true` |
-| `UT-GOV-08` | `NewsCatalyst.requires_banner() == true` |
-| `UT-GOV-09` | `NewsToIdea.requires_banner() == true` |
-| `UT-GOV-10` | `PreopenNewsHot.requires_banner() == false` |
-| `UT-GOV-11` | `PaperReview.requires_banner() == false` |
-| `UT-GOV-12` | `CatalystReview.requires_banner() == false` |
-| `UT-GOV-13` | `IntradayMarket.level() == PushLevel::Important` |
-| `UT-GOV-14` | `PaperReview.level() == PushLevel::Info` |
-| `UT-GOV-15` | `CatalystReview.level() == PushLevel::Important`（⚡盘后） |
-| `UT-GOV-16` | `PaperReview.counts_against_daily_budget() == false` |
-| `UT-GOV-17` | 6 新增均 `is_deprecated() == false` |
+**交易所过滤**：模板作用域依 `exchange` 字段，仅在窗口期内推送。
 
-**合计**：17 个治理用例。
+### 5.3 T-15 PostFixedPriceFill（盘后固定价格成交）⚡ — P0
 
-### 4.3 红线门禁测试（ENGINEERING_RULES_V2 §2.1~§2.10）
+**新规依据**：① 撮合时间 15:05-15:30 固定价格撮合。
 
-| 红线 | 用例 ID | 验证方式 |
-|---|---|---|
-| §2.1 无 mock | `UT-RL21-NEW` | render 6 函数均不接受任何 mock 标志；CI `tools/compliance/lib/check_fake_impl.sh` 通过 |
-| §2.2 缺数据显式 | `UT-RL22-NEW` | 6 render 在字段为 None 时输出空段或 "N/A"，**不输出默认值数字** |
-| §2.3 坏数据校验 | `UT-RL23-NEW` | score > ±100 / chg > ±20% 时 render 入口前置 `debug_assert!` 触发 panic |
-| §2.4 时效 | `UT-RL24-NEW` | P-01 / I-02 / D-01 输入 timestamp 超过 spec 阈值 → 报 warning（不 panic） |
-| §2.8 假实现 | 复用 | `check_fake_impl.sh` 已覆盖 |
-| §2.9 设计矛盾 | 复用 | `check_design_contradiction.sh` 已覆盖（6 新增无阈值字段） |
-| §2.10 业务规则 | `UT-BR-NEW` | 引用 BR-NEWS-CLUSTER / BR-NEWS-CATALYST / BR-THEME-STAGE / BR-NEWS-TO-IDEA（4 个），`docs/business_rules.md` 必先登记 |
+| 字段 | 类型 | 数据源 | 缺失行为 |
+|---|---|---|---|
+| `exchange` | `enum` | 调度器 | 必填 |
+| `HH:MM` | `&str` | 调度器 | 必填（15:05-15:30） |
+| `name/code/fill_price/qty` | `&str/f64/u32` | 成交回报 | 整行省略 |
+| `vs_limit_price` | `f32`（成交价 vs 涨跌幅价差） | 计算 | "N/A" |
+| `next_session_carry` | `bool` | 计算（是否过户到次一交易日） | false |
 
-**合计**：5 个红线专项 + 4 个 BR 登记引用。
+**治理**：`Important` / `Some(300)`（5min/票）/ `requires_banner=true` / `is_deprecated=false`。
 
-### 4.4 测试覆盖率目标
+**红线 Gate**：2.1 / 2.4 / 2.6。
 
-> 满足 ENGINEERING_RULES_V2 §1 Gate D：单测 ≥ 80%，核心交易/数据链路 ≥ 95%。
+**PR 证据**：`Refs: 新规 §5.3 + spec §14.5 v13.1` / `Business-Rules: BR-POST-FIXED-PRICE`。
 
-| 指标 | 目标 | 测算依据 |
-|---|---|---|
-| `push_templates.rs` 行覆盖 | ≥ 85% | 19 render + 17 gov + 5 红线 = 41 新增覆盖 6 函数全部主路径 |
-| `notify.rs` 行覆盖（治理分支） | ≥ 90% | 17 gov 用例覆盖 6 新增 variant 全部分支 |
-| `main.rs` 调用点覆盖 | ≥ 70% | 6 新调用点通过 `--test` e2e 间接覆盖 |
+### 5.4 T-16 StPriceLimitChanged（ST 涨跌幅变更提醒）⚡ — P0
 
-### 4.5 `--test` 路径 e2e（v19.x 已确立的 e2e 验证）
+**新规依据**：② 主板 ST/*ST 涨跌幅 5% → 10%（与主板其他股票一致）。
 
-| e2e ID | 验证 |
-|---|---|
-| `E2E-NEW-01` | `cargo run --bin monitor -- --test` 输出含 6 新增模板标题各 1 条 |
-| `E2E-NEW-02` | `tools/compliance/check.sh` 全绿 |
-| `E2E-NEW-03` | 数据源失败注入（关停 news_monitor 模拟）→ 6 render 报 warning，不静默 |
+**新规生效**：2026-07-06（**今天**）— 现有持仓风险阈值可能错配。
+
+| 字段 | 类型 | 数据源 | 缺失行为 |
+|---|---|---|---|
+| `HH:MM` | `&str` | 调度器 | 必填 |
+| `name/code` | `&str` | 持仓 DB | 必填 |
+| `st_type` | `enum`（ST / *ST） | 持仓 DB | 必填 |
+| `old_limit` / `new_limit` | `f32` | 新规参数 | 必填 |
+| `holding_qty/cost/now_price` | `u32/f64/f64` | 持仓 DB | 必填 |
+| `new_stop_loss/new_take_profit` | `f64` | 调用点重算（基于 10%） | "未重算" |
+
+**治理**：`Important` / `Some(86_400)`（1次/票/日，开盘触发即记已推）/ `requires_banner=true` / `is_deprecated=false`。
+
+**红线 Gate**：2.1 / 2.6（仅提示，不自动调仓）。
+
+**PR 证据**：`Refs: 新规 §5.4` / `Data-Redlines: [2.1, 2.6]` / `Business-Rules: BR-ST-PRICE-CHANGE` / `Threshold-Proof: 5% → 10% (新规)`。
+
+**紧急同步项**（**不需 PR，先改 config**）：
+- `config/risk/stop_loss.toml`: `st_price_limit = 0.10`（原 0.05）
+- `config/strategy.toml`: `st_take_profit_pct = 0.10`（原 0.05）
+- `docs/business_rules.md`: 登记 BR-ST-PRICE-CHANGE
+
+### 5.5 T-17 EtfClosingCallAuction（ETF 收盘集合竞价）ℹ️ — P1
+
+**新规依据**：③ 上交所基金收盘由连续竞价改为**收盘集合竞价**（14:57-15:00）。
+
+| 字段 | 类型 | 数据源 | 缺失行为 |
+|---|---|---|---|
+| `HH:MM` | `&str` | 调度器 | 必填（14:57-15:00） |
+| `name/code` | `&str` | 持仓 DB | 必填 |
+| `call_auction_price` | `f64` | 集合竞价行情 | "暂无" |
+| `vs_continuous_est` | `f32` | 估值（与连续竞价对比） | "N/A" |
+| `liquidity_note` | `&str` | 尾盘操纵风险 | "正常" |
+
+**治理**：`Info` / `Some(86_400)`（1次/日，仅沪市 ETF）/ `requires_banner=false` / `is_deprecated=false`。
+
+**红线 Gate**：2.1 / 2.4。
+
+**作用域过滤**：`exchange == SH && instrument_type == ETF`。
+
+**PR 证据**：`Refs: 新规 §5.5` / `Business-Rules: BR-CLOSING-CALL-AUCTION`。
+
+### 5.6 T-18 BlockTradeIntradayConfirm（创业板大宗盘中确认）ℹ️ — P1
+
+**新规依据**：⑤ 创业板股票协议大宗交易成交确认时间由"盘后统一确认"→"盘中实时确认"（与科创板一致）。
+
+| 字段 | 类型 | 数据源 | 缺失行为 |
+|---|---|---|---|
+| `HH:MM` | `&str` | 调度器 | 必填 |
+| `name/code/qty/price` | `&str/u32/f64` | 大宗成交回报 | 必填 |
+| `block_type` | `enum`（协议大宗/竞价大宗） | 大宗类型 | 必填 |
+| `board` | `enum`（创业/科创/主板） | 板块 | 必填 |
+| `real_time_confirm` | `bool` | 是否盘中实时 | 必填 |
+| `next_session_settle` | `enum`（次日/实时） | 清算节奏 | 必填 |
+
+**治理**：`Info` / `Some(300)`（5min/票）/ `requires_banner=false` / `is_deprecated=false`。
+
+**红线 Gate**：2.1 / 2.6。
+
+**PR 证据**：`Refs: 新规 §5.6` / `Business-Rules: BR-BLOCK-TRADE-CONFIRM`。
+
+### 5.7 T-19 BlockTradePriceRange（北交所大宗价格区间）ℹ️ — P1
+
+**新规依据**：⑥ 北交所无涨跌幅限制股票的大宗交易价格范围由"前收盘价"→"当日竞价交易实时成交均价"。
+
+| 字段 | 类型 | 数据源 | 缺失行为 |
+|---|---|---|---|
+| `HH:MM` | `&str` | 调度器 | 必填 |
+| `name/code` | `&str` | 持仓 DB | 必填 |
+| `prev_close` | `f64` | 前收盘价 | "N/A" |
+| `today_avg_price` | `f64` | 当日竞价实时均价 | 必填 |
+| `block_price_range` | `&str` | 计算（基于当日均价 ± N%） | "暂无" |
+| `note` | `&str` | 口径说明（"原: 前收盘 / 现: 当日均价"） | 必填 |
+
+**治理**：`Info` / `Some(3600)`（60min/票）/ `requires_banner=false` / `is_deprecated=false`。
+
+**红线 Gate**：2.1 / 2.4。
+
+**作用域过滤**：`exchange == BJ && no_price_limit == true`。
+
+**PR 证据**：`Refs: 新规 §5.7` / `Business-Rules: BR-BLOCK-TRADE-PRICE-RANGE`。
+
+### 5.8 创业板做市商（治理参数变更，不需新模板）
+
+**新规依据**：④ 创业板引入做市商制度，中小市值流动性增强。
+
+**变更项**：
+- `config/risk/limits.toml`: `gem_small_cap_liquidity_threshold` 调高 15-20%
+- `docs/business_rules.md`: 登记 BR-GEM-MARKET-MAKER（流动性阈值校准）
+
+**PR 证据**：作为 PR #11（治理全表对齐）一部分。
 
 ---
 
-## 5. PR 节奏 + 证据 + 回滚
+## 6. 现有 24 render 对齐设计
 
-> 满足 AGENTS §2.2 Gate 序列（A → B → C → D）+ ENGINEERING_RULES_V2 §3 PR 模板强制字段 + §6 "小提交"。
+> 12 项差异逐项修复。每项：**现状 / spec 要求 / 修复方向 / 风险 / 关联 PR**。
 
-### 5.1 分阶段 PR 计划（P0 = 5 / P1 = 1）
+### 6.1 字段级修复（9 项）
 
-| PR # | 标题模板 | 范围 | 优先级 | 关联 spec | 关联 Gate |
+| # | 模板 | 现状 | spec 要求 | 修复方向 | 关联 PR |
 |---|---|---|---|---|---|
-| **#1** | `feat(v13): PushKind 新增 PreopenNewsHot/IntradayMarket/NewsCatalyst 治理元信息对齐` | 3 variant + 3 render + 3 Params + 治理 + 调用点 | **P0** ⚡ | §14.1 P-01 / §14.2 I-01 / §14.2 I-02 | A→B→C→D |
-| **#2** | `feat(v13): PushKind 新增 NewsToIdea + 治理元信息` | 1 variant + 1 render + 1 Params + 治理 + 调用点 | **P0** ⚡ | §14.4 D-01 | A→B→C→D |
-| **#3** | `feat(v13): PushKind 新增 CatalystReview 盘后复盘 + 治理元信息` | 1 variant + 1 render + 1 Params + 治理 + 调用点 | **P0** ⚡(盘后) | §14.3 A-10 | A→B→C→D |
-| **#4** | `feat(v13): PushKind 新增 PaperReview 盘后复盘 (前置 T-11)` | 1 variant + 1 render + 1 Params + 治理 + 调用点（**`#[ignore]` 启动**） | **P1** ℹ️ | §14.3 A-01 | A→B；D 等 T-11 |
-| **#5** | `chore(v13): §14.5 治理全表差量对齐审计` | 不新增功能，仅复核既有 22 PushKind 与 §14.5 表完全对齐 | 收尾 | §14.5 | C |
+| F-01 | T-01 AccountMode | 末行"解除条件" | 加"辅助建议, 非下单指令" | 末行拼接 spec 第 6 条 | PR #12 |
+| F-02 | T-02 DataMode | 末行"恢复预计" | 同上 | 同上 | PR #12 |
+| F-03 | T-03~T-07 等 11 个 | — | ✅ 已含 | — | — |
+| F-04 | R-02 ReviewMarket | 末行"明日建议" | 加"辅助建议" | 末行拼接 | PR #12 |
+| F-05 | P-02 AuctionVolume | 标题"🌅 竞价异动 TopN" | "🌅 竞价热点量能（09:2{x}）" | 标题改 + 去掉 TopN + 加"辅助建议" | PR #8 |
+| F-06 | P-04 PaperTrade | spec 标签 `{Filled|...}`，代码 `.label()` | 兼容 | 保留代码现状，spec 加注 | — |
+| F-07 | I-08 TurnoverTop | 标题 `🔄 盘中换手率 Top10 (HH:MM 盘中)` | `🔄 盘中换手率 Top10 (HH:MM)` | 删" 盘中" 后缀 | PR #8 |
+| F-08 | A-05 ReviewLhb | 缺空 entries 兜底 | `盘中无数据 (盘后 21:00 才更新), 请参考 T-13` | 加 `if entries.is_empty()` 分支 | PR #8 |
+| F-09 | A-06 ReviewSignal | 缺"做T建议"括号说明 | spec 加括号注脚 | 代码原样保留 | — |
+| F-10 | A-07 ReviewFailure | 段落顺序"原信号/结果/归因/处理建议/─────/分布" | 与 spec 一致 | 保持 | — |
+| F-11 | I-03 IndustryChain (盘中) | 复用 R-03 形态 | 独立盘中形态 | 新增 `IndustryChainIntraday` enum + render（见 §4.4） | PR #4 |
+| F-12 | T-08 CandidateInvalidated | 复用 `CandidateBoard` | spec 无独立项 | 升级为 `CandidateInvalidated` 独立 enum 或保留并补 spec | PR #11 |
 
-**累计**：
+### 6.2 治理级修复（8 项）
 
-- 6 个新 variant → 3 PR（#1 三合一 / #2 / #3）+ 1 PR（#4，P1）
-- 治理元信息 → 4 PR 各带 + #5 全表审计
-- 总提交行数预估：每 PR +250~400 行（含测试），#5 +50 行
+| # | PushKind | 现状 | spec §14.5 要求 | 修复方向 | 关联 PR |
+|---|---|---|---|---|---|
+| G-01 | `T0Advice`（禁止路径） | `Important` | `Info` | 在 `render_t0_forbid` 调用点显式标 `PushLevel::Info`（不改 enum） | PR #11 |
+| G-02 | `ForbiddenOps` | `is_deprecated=false` | spec `true`（v19.12 起全保留） | 改 `is_deprecated=false`，spec 加注脚说明 v19.12 决定 | PR #11 |
+| G-03 | `PaperTrade` | `should_block_on_mode` 含 (Frozen/Unsafe 停发) | spec 照发 | `should_block_on_mode` 移出 `PaperTrade`，改照发 | PR #11 |
+| G-04 | `AuctionVolume` | `Info` | `Important` | `level()` 改 `Important` | PR #11 |
+| G-05 | `TurnoverTop` | 默认 `Some(1800)` | `Some(600)` | 显式加 `PushKind::TurnoverTop => Some(600)` | PR #11 |
+| G-06 | `IndustryChain` | 默认 `Some(1800)` | `Some(86400)` | 显式加 `Some(86400)` | PR #11 |
+| G-07 | `DailyReport` / `ReviewMarket` 等盘后 R 系列 | `requires_banner=true` | spec 模板无 banner 占位符 | `requires_banner()` matches 移除盘后 R 系列 | PR #11 |
+| G-08 | `CandidateBoard` / `NewsRanked` / `CloseCall` | spec §14.5 无登记 | 应登记或归档 | spec §14.5 补 3 行 | PR #11 |
 
-### 5.2 PR 证据样例（以 #1 中 PreopenNewsHot 为例）
+### 6.3 风格级修复（2 项）
 
-> 直接套用 ENGINEERING_RULES_V2 §3 + AGENTS §6 字段。
+| # | 项目 | 现状 | 要求 | 修复 | 关联 PR |
+|---|---|---|---|---|---|
+| S-01 | 代码文件头注释 | 引用 `v12-push-templates.md` | 引用 `v13-push-templates.md` | 改注释 | PR #11 |
+| S-02 | Emoji 一致性 | 已实现 render emoji 正确 | 6 新增 + 6 新规 emoji 按 spec | 实施时按 spec | PR #1~#10 |
+
+---
+
+## 7. 治理元信息全表对齐（38 PushKind）
+
+### 7.1 治理表（§14.5 扩展）
+
+| PushKind | 等级 | 冷却 | Frozen/Unsafe | is_deprecated | 现状 | 来源 |
+|---|---|---|---|---|---|---|
+| `AccountMode` | ⚡ | 0（状态即推） | 照发 | false | ✅ 一致 | v12 |
+| `DataMode` | ⚡ | 10min | 照发 | false | ✅ 一致 | v12 |
+| `HoldingPlan` | ⚡ | 30min/票 | **停发** | false | ✅ 一致 | v12 |
+| `HoldingEvent` | 🚨 | 无视冷却 | 照发 | false | ✅ 一致 | v12 |
+| `T0Advice`（建议） | ⚡ | 30min/票 | **停发** | false | ✅ 一致 | v12 |
+| `T0Advice`（禁止） | ℹ️ | 30min/票 | 照发 | false | ⚠️ G-01 | v12 |
+| `CandidateTriggered` | ⚡ | 1次/票/日 | **停发** | false | ✅ 一致 | v12 |
+| `ForbiddenOps` | ℹ️ | 60min/票 | 照发 | true（v19.12 注） | ⚠️ G-02 | v12 |
+| `PaperTrade` | ℹ️ | 5min批 | **照发**（spec 改） | true（v19.12 注） | ⚠️ G-03 | v12 |
+| `AuctionVolume` | ⚡ | 10min | 视数据质量 | false | ⚠️ G-04 | v12 |
+| `TurnoverTop` | ℹ️ | 10min | 照发 | false | ⚠️ G-05 | v19.15 |
+| **`IntradayMarket`** | ⚡ | 15min | 照发 | false | **缺** | v13 §14.2 I-01 |
+| **`NewsCatalyst`** | ⚡ | 10min | 照发 | false | **缺** | v13 §14.2 I-02 |
+| **`NewsToIdea`** | ⚡ | 20min/票 | ReduceOnly可发 / Frozen谨慎 | false | **缺** | v13 §14.4 D-01 |
+| **`PreopenNewsHot`** | ⚡ | 15min | 可发 | false | **缺** | v13 §14.1 P-01 |
+| **`PaperReview`** | 盘后 | 1次/日 | 可发 | false | **缺** | v13 §14.3 A-01 |
+| `DailyReport` | 盘后 | 1次/日 | 可发 | false | ✅ 一致 | v12 R-01 |
+| `ReviewMarket` | 盘后 | 1次/日 | 可发 | false | ✅ 一致 | v12 R-02 |
+| **`IndustryChain`** | 盘后 | 1次/日 | 可发 | false | ⚠️ G-06 | v12 R-03（盘中 I-03 独立） |
+| **`IndustryChainIntraday`** | ⚡ | 30min | 照发 | false | **缺** | v13 §14.2 I-03 |
+| `ReviewLhb` | 盘后 | 1次/日(21:00) | 可发 | false | ✅ 一致 | v12 R-04 |
+| `ReviewSignal` | 盘后 | 1次/日 | 可发 | false | ✅ 一致 | v12 R-05 |
+| `ReviewFailure` | 盘后 | 1次/日 | 可发 | false | ✅ 一致 | v12 R-06 |
+| `TomorrowWatch` | 盘后 | 1次/日 | 可发 | false | ✅ 一致 | v12 R-07 |
+| `EventCalendar` | 盘后 | 1次/日 | 可发 | false | ✅ 一致 | v12 R-08 |
+| **`CatalystReview`** | ⚡(盘后) | 1次/日 | 可发 | false | **缺** | v13 §14.3 A-10 |
+| **`PostFixedPriceOrder`** | ⚡ | 1min/票 | 照发 | false | **缺** | 新规 §5.2 T-14 |
+| **`PostFixedPriceFill`** | ⚡ | 5min/票 | 照发 | false | **缺** | 新规 §5.3 T-15 |
+| **`StPriceLimitChanged`** | ⚡ | 1次/票/日 | 照发 | false | **缺** | 新规 §5.4 T-16 |
+| **`EtfClosingCallAuction`** | ℹ️ | 1次/日 | 照发 | false | **缺** | 新规 §5.5 T-17 |
+| **`BlockTradeIntradayConfirm`** | ℹ️ | 5min/票 | 照发 | false | **缺** | 新规 §5.6 T-18 |
+| **`BlockTradePriceRange`** | ℹ️ | 60min/票 | 照发 | false | **缺** | 新规 §5.7 T-19 |
+| `CandidateBoard`（仅兼容） | ⚡ | 30min/票 | 照发 | false | ⚠️ G-08（spec 补登） | v11 |
+| `NewsRanked`（仅兼容） | ⚡ | 30min | 照发 | false | ⚠️ G-08（spec 补登） | v11 |
+| `CloseCall`（T-12） | ⚡ | 1次/日 | 照发 | false | ⚠️ G-08（spec 补登） | v12 |
+
+**合计**：38 PushKind（22 现有 + 7 v13 新增 + 6 新规 + 3 仅兼容需补登）
+
+### 7.2 requires_banner() 对齐
+
+> spec §14.0.1 仅对"交易建议类"要求 banner。盘后 R 系列在 spec 模板中**无 banner 占位符**。
+
+**修复**（G-07）：`requires_banner()` matches 中移除以下盘后 R 系列：
+
+```
+- DailyReport
+- ReviewMarket
+- ReviewLhb
+- ReviewSignal
+- ReviewFailure
+- TomorrowWatch
+- EventCalendar
+- PaperReview
+- CatalystReview  // 盘后非交易建议
+```
+
+保留 banner 的：`HoldingPlan / HoldingEvent / T0Advice / CandidateTriggered / PaperTrade / AuctionVolume / IntradayMarket / NewsCatalyst / NewsToIdea / PreopenNewsHot / PostFixedPriceOrder / PostFixedPriceFill / StPriceLimitChanged`
+
+---
+
+## 8. 风格统一与共性约束
+
+### 8.1 全局约定（继承 §14.0）
+
+| # | 约束 | 验证 |
+|---|---|---|
+| 1 | 纯文本 + emoji 标题 + `（HH:MM）` 时间戳 | 全部 render 一致 |
+| 2 | 行内字段 ` \| ` 分隔 | ✅ 全部 render 已用 |
+| 3 | `{xxx}` 变量占位 / `[...]` 条件段 | ✅ 已用 `if let Some()` / `if !xxx.is_empty()` |
+| 4 | 交易建议类必带 banner | 修复后见 §7.2 |
+| 5 | 新增 PushKind 必登记治理 | ✅ 13 新增全部登记（§7.1） |
+| 6 | 末行"辅助建议, 非下单指令"（交易建议类） | 修复后见 §6.1 F-01/F-02/F-04 |
+
+### 8.2 共性抽象
+
+新增 `RenderCtx` trait（**内部 trait，不导出**）封装：
+
+```rust
+trait RenderCtx {
+    fn level(&self) -> PushLevel;
+    fn banner_required(&self) -> bool;
+    fn cooldown_secs(&self) -> Option<u64>;
+    fn is_deprecated(&self) -> bool;
+    fn requires_helper_line(&self) -> bool;  // 末行"辅助建议"
+}
+```
+
+6 套样板（PushKind 元信息 match）收敛为 trait 实现。
+
+---
+
+## 9. 测试矩阵
+
+### 9.1 render 单测（7 + 6 = 13 新模板）
+
+| 模板族 | 用例数 | 维度 |
+|---|---|---|
+| v13 7 新增 | 19（沿用 v13 spec §4.1） | emoji/HH:MM/字段映射/缺失/末行 |
+| 新规 6 模板 | 12（每模板 ~2 用例） | 时间窗口/交易所过滤/字段映射/缺失 |
+| 现有 24 对齐回归 | 12（每差异 1 用例） | 修复后正确性 |
+
+**合计**：43 render 用例。
+
+### 9.2 治理元信息测试（38 PushKind）
+
+| PushKind | 断言维度 |
+|---|---|
+| 全部 38 | `level() / cooldown_secs() / requires_banner() / is_deprecated() / counts_against_daily_budget()` |
+
+**合计**：38 × 5 = 190 治理断言。
+
+### 9.3 红线门禁测试（ENGINEERING_RULES_V2 §2.1~§2.10）
+
+| 红线 | 用例 ID | 验证 |
+|---|---|---|
+| §2.1 无 mock | `UT-RL21-NEW` | 13 render 不接受 mock 标志 |
+| §2.2 缺数据显式 | `UT-RL22-NEW` | None → 空段/"N/A" |
+| §2.3 坏数据 | `UT-RL23-NEW` | score>±100 / chg>±20% / 新规价格异常 `debug_assert!` |
+| §2.4 时效 | `UT-RL24-NEW` | 申报时效/集合竞价窗口超时报 warning |
+| §2.6 下单防护 | `UT-RL26-NEW` | T-14/T-15 不自动下单（与 §2.6 一致） |
+| §2.8 假实现 | 复用 check_fake_impl.sh | — |
+| §2.10 BR 登记 | `UT-BR-NEW` | 6 个 BR 引用 |
+
+**合计**：6 红线 + 6 BR 引用。
+
+### 9.4 覆盖率目标
+
+| 模块 | 目标 |
+|---|---|
+| `push_templates.rs` 行覆盖 | ≥ 85% |
+| `notify.rs` 治理分支 | ≥ 90% |
+| `main.rs` 调用点 | ≥ 70% |
+
+---
+
+## 10. PR 节奏与证据
+
+### 10.1 PR 计划（13 PR）
+
+| PR # | 标题模板 | 范围 | 优先级 | 关联 Gate |
+|---|---|---|---|---|
+| **#1** | `feat(v13): PushKind 新增 PreopenNewsHot/IntradayMarket/NewsCatalyst + 治理` | 3 v13 P0 | P0 | A→B→C→D |
+| **#2** | `feat(v13): PushKind 新增 NewsToIdea + 治理` | 1 v13 P0 | P0 | A→B→C→D |
+| **#3** | `feat(v13): PushKind 新增 CatalystReview 盘后 + 治理` | 1 v13 P0 | P0 | A→B→C→D |
+| **#4** | `feat(v13): PushKind 新增 IndustryChainIntraday 盘中形态 + 治理` | 1 v13 P0（审计多发现） | P0 | A→B→C→D |
+| **#5** | `feat(v13): PushKind 新增 PaperReview 盘后 + 治理 (前置 T-11)` | 1 v13 P1 + `#[ignore]` | P1 | A→B；D 等 T-11 |
+| **#6** | `feat(v13.1): PushKind 新增 PostFixedPriceOrder/Fill 盘后固定价格 + 治理` | 2 新规 P0 | P0 | A→B→C→D |
+| **#7** | `feat(v13.1): PushKind 新增 StPriceLimitChanged ST 涨跌幅变更 + 治理` | 1 新规 P0 | P0 | A→B→C→D |
+| **#8** | `fix(v13): 现有 render 对齐 §14 风格与字段（12 项差异）` | F-01~F-12 | P0 | B→C |
+| **#9** | `feat(v13.1): PushKind 新增 EtfClosingCallAuction 沪市 ETF + 治理` | 1 新规 P1 | P1 | A→B→C |
+| **#10** | `feat(v13.1): PushKind 新增 BlockTradeIntradayConfirm/PriceRange 大宗 + 治理` | 2 新规 P1 | P1 | A→B→C |
+| **#11** | `chore(v13): §14.5 治理全表对齐 + 38 PushKind + requires_banner 修正` | G-01~G-08 | 收尾 | C |
+| **#12** | `chore(v13): 文档漂移修正 + spec 文件头注释 v13` | S-01/S-02 | 收尾 | C |
+| **#13** | `chore(v13): 紧急治理参数同步（ST 阈值 + 做市商流动性）` | config/*.toml + docs/business_rules.md | **紧急** | 立即 |
+
+**累计**：13 PR / 总行数预估 +3500~5000（含测试）
+
+### 10.2 紧急治理参数同步（**不需 PR，先做**）
+
+> 新规 2026-07-06 已生效，治理参数需**立即**同步：
+
+```bash
+# 1. ST/*ST 涨跌幅 5% → 10%
+vim config/risk/stop_loss.toml  # st_price_limit = 0.10
+vim config/strategy.toml         # st_take_profit_pct = 0.10
+
+# 2. 创业板做市商流动性阈值
+vim config/risk/limits.toml      # gem_small_cap_liquidity_threshold += 0.15
+
+# 3. BR 登记
+vim docs/business_rules.md       # +BR-ST-PRICE-CHANGE, BR-GEM-MARKET-MAKER, BR-POST-FIXED-PRICE, BR-CLOSING-CALL-AUCTION, BR-BLOCK-TRADE-CONFIRM, BR-BLOCK-TRADE-PRICE-RANGE
+```
+
+完成后 commit：`urgent(v13.1): 新规 2026-07-06 治理参数同步 + BR 登记`
+
+### 10.3 PR 证据样例（以 #6 盘后固定价格为例）
 
 ```markdown
-## feat(v13): PushKind 新增 PreopenNewsHot/IntradayMarket/NewsCatalyst 治理元信息对齐
+## feat(v13.1): PushKind 新增 PostFixedPriceOrder/Fill 盘后固定价格 + 治理
 
 ### Refs
-- spec: `docs/architecture/v13-push-templates.md §14.1 P-01 / §14.2 I-01 / §14.2 I-02`
-- design: `docs/superpowers/specs/2026-07-06-v13-push-templates-design.md §3.1, §3.2, §3.3`
+- 新规: 沪深北《交易规则（2026 修订）》§5.2/§5.3 (盘后固定价格交易扩围)
+- spec: `docs/architecture/v13-push-templates.md §14.5 v13.1`
+- design: `docs/superpowers/specs/2026-07-06-v13-push-templates-design.md §5.2, §5.3`
 
 ### Data-Redlines
-- [2.1] 无 mock：render 入口仅依赖真实 news_monitor / sector_rotation 输出
-- [2.2] 缺字段显式：theme/news/score 缺失 → 整段省略或 "N/A"
-- [2.3] 坏数据：score > ±100 / chg > ±20% 时 `debug_assert!` 触发
-- [2.4] 时效：P-01 依赖 news ≥ 09:00 拉取；I-02 依赖实时行情 ≤ 5s
+- [2.1] 无 mock：仅依赖真实委托/成交回报
+- [2.4] 时效：申报时效 ≤ 30s；撮合窗口 15:05-15:30
+- [2.6] 不自动下单：仅推送状态
 
 ### OldModules
 | 模块 | adopt/reject | 原因 |
 |---|---|---|
-| `news_monitor_loop` | adopt | 复用现有 cluster 输出，不另起 schema |
-| `sector_rotation` | adopt | 复用既有 score，不改计算口径 |
-| `push_templates::render_auction_volume` | reject | 与 P-01 主题不同，不合并 |
+| `order_report` | adopt | 复用既有委托回报 schema |
+| `block_trade_handler` | reject | 大宗交易走独立模板（T-18/T-19） |
 
 ### Threshold-Proof
-- N/A（无阈值变更）
+- 申报窗口：沪市 9:30-15:30；深市/北交所 9:15-15:30（按 exchange 区分）
 
 ### Business-Rules
-- BR-NEWS-CLUSTER（news cluster 聚类口径）
-- BR-NEWS-CATALYST（news→个股映射规则）
+- BR-POST-FIXED-PRICE（盘后固定价格申报+撮合规则）
 
 ### Validation
 - `cargo fmt --check` ✓
 - `cargo clippy -D warnings` ✓
-- `cargo test push_templates::tests::preopen_*` ✓
-- `cargo test push_templates::tests::intraday_*` ✓
-- `cargo test push_templates::tests::news_catalyst_*` ✓
+- `cargo test push_templates::tests::post_fixed_price_*` ✓
 - `bash tools/compliance/check.sh` ✓
 
 ### Rollback
 \`\`\`bash
 git revert <commit-sha>
-# 撤销 PushKind 三 variant + 治理元信息 + render
-# 不影响 v19.x 既有 24 render
 cargo build --release  # 验证无 dangling ref
 \`\`\`
 ```
 
-### 5.3 红线触发与阻断（每个 PR 必跑）
+### 10.4 回滚策略（L1~L4）
 
-> 满足 AGENTS §5 + ENGINEERING_RULES_V2 §1 Gate C。
-
-| 检查 | 命令 | FAIL 行为 |
+| 层 | 触发 | 操作 |
 |---|---|---|
-| 格式 | `cargo fmt --check` | 阻断 PR |
-| 静态 | `cargo clippy -D warnings` | 阻断 PR |
-| 单测 | `cargo test` | 阻断 PR |
-| 合规 | `bash tools/compliance/check.sh` | 阻断 PR |
-| 数据时效 | `tools/compliance/lib/check_data_freshness.sh` | 阻断 PR |
-| 假实现 | `tools/compliance/lib/check_fake_impl.sh` | 阻断 PR |
-| 设计矛盾 | `tools/compliance/lib/check_design_contradiction.sh` | 阻断 PR |
-| 业务规则 | `tools/compliance/lib/check_business_rules.sh` | 阻断 PR |
+| L1 单 PR | 单模板错乱 | `git revert <sha>` |
+| L2 PR 链 | P0 失败 | 暂停，回 Gate A |
+| L3 设计缺陷 | ≥3 PR 共同失败 | 整体回 v19.16 baseline |
+| L4 红线违规 | §2.1/§2.5/§2.6 | 立刻阻断 + 24h 复盘 |
 
-### 5.4 回滚策略（多层次）
+### 10.5 红线触发与阻断（每 PR 必跑）
 
-| 层次 | 触发条件 | 操作 |
-|---|---|---|
-| **L1 单 PR** | 单模板错乱 | `git revert <sha>`（≤ 400 行，无跨 PR 依赖） |
-| **L2 PR 链** | P0 任意 1 个不通过 | 暂停后续 PR 提交，回 Gate A 重审 spec 解读 |
-| **L3 设计缺陷** | 3 个以上 PR 共同失败 | 整体回 v19.16 baseline，重新走 Gate A |
-| **L4 红线违规** | 任何 §2.1 / §2.5 / §2.6 红线违反 | 立刻阻断，24h 内复盘补自动化防线（§5 受控例外） |
-
-**关键不变量**：
-
-- 6 新增 render **不依赖** v19.x 既有 24 render 的内部状态
-- 任何 PR revert 后 `cargo build` 必须成功（无 dangling 引用）
-- 治理元信息通过 `match` 表达，缺分支 = `unreachable!()`，不会"静默 fallback"
-
-### 5.5 风险登记与缓解
-
-| 风险 | 等级 | 缓解 |
-|---|---|---|
-| P-01 依赖 news_monitor cluster 输出稳定性 | 中 | 复用既有 `news_monitor_loop`，不另起 schema |
-| I-01 板块 score 波动大 | 中 | `debug_assert!` 强校验 + UI "N/A" 兜底 |
-| A-01 前置 T-11 未就绪 | 高 | PR #4 `#[ignore]` + 文档化前置依赖 |
-| 6 新增同日推送冲击用户 | 中 | 各自 cooldown 已设（10min ~ 1次/日） |
-| PushKind 增多导致 match 漏分支 | 中 | 全部用 `unreachable!()` + 治理元信息单测 |
+```bash
+cargo fmt --check                    # 格式
+cargo clippy -D warnings             # 静态
+cargo test                           # 单测
+bash tools/compliance/check.sh       # 合规
+tools/compliance/lib/check_data_freshness.sh
+tools/compliance/lib/check_fake_impl.sh
+tools/compliance/lib/check_design_contradiction.sh
+tools/compliance/lib/check_business_rules.sh
+```
 
 ---
 
-## 6. 验收清单与下一步
+## 11. 验收清单（DoD）
 
-### 6.1 验收清单（DoD）
-
-> 满足 CLAUDE.md §6 Done Criteria + AGENTS §6 PR Evidence + ENGINEERING_RULES_V2 §1 Gate A→D。
-
-| # | 项 | 验证方式 |
+| # | 项 | 验证 |
 |---|---|---|
-| 1 | 设计文档落盘 + git commit | `git log -- docs/superpowers/specs/2026-07-06-v13-push-templates-design.md` |
-| 2 | 3 个 P0 PR（#1/#2/#3）+ 1 个 P1 PR（#4）合并 + Gate C 全绿 | `git log --oneline \| grep "feat(v13)"` + `bash tools/compliance/check.sh` |
-| 3 | 1 个 P1 PR（PaperReview）合并且 `#[ignore]` 待 T-11 解除 | PR #4 含 `#[ignore]` 与前置依赖注释 |
-| 4 | §14.5 全表与代码治理元信息 100% 对齐 | PR #5 审计脚本输出 0 差量 |
-| 5 | 19 render 用例 + 17 治理用例 + 5 红线用例 全绿 | `cargo test` |
-| 6 | `--test` e2e 含 6 新增模板标题 | `cargo run --bin monitor -- --test` |
-| 7 | 覆盖率 ≥ 85%（push_templates）/ ≥ 90%（notify 治理分支） | `cargo tarpaulin` 或 `llvm-cov` |
-| 8 | 无 mock / fake 数据进入生产路径 | `check_fake_impl.sh` |
-| 9 | PR 证据 6 字段齐 | PR 模板 review |
+| 1 | 紧急治理参数同步（ST + 做市商）已完成 | `git log --oneline \| grep urgent(v13.1)` |
+| 2 | 设计文档落盘 + git commit | `git log -- docs/superpowers/specs/2026-07-06-v13-push-templates-design.md` |
+| 3 | 9 P0 PR（#1~#4, #6, #7, #8, #11）合并 | `git log --oneline \| grep "feat/v13"` |
+| 4 | 4 P1 PR（#5, #9, #10, #12）合并 | 同上 |
+| 5 | §14.5 治理表 38 PushKind 100% 对齐 | PR #11 审计脚本 0 差量 |
+| 6 | 43 render 用例 + 190 治理断言 + 6 红线 全绿 | `cargo test` |
+| 7 | 覆盖率 ≥ 85% / 90% / 70% | `cargo tarpaulin` |
+| 8 | 紧急 BR 6 个已登记 | `docs/business_rules.md` |
+| 9 | 无 mock/fake 数据 | `check_fake_impl.sh` |
+| 10 | PR 证据 6 字段齐 | PR 模板 review |
 
-### 6.2 关键依赖与外部约束
+---
+
+## 12. 关键依赖与外部约束
 
 | 依赖 | 状态 | 备注 |
 |---|---|---|
-| `news_monitor_loop` cluster 输出 | ✅ 已有 | 复用不另起 |
-| `sector_rotation` score 计算 | ✅ 已有 | 复用不改口径 |
-| `virtual_watch` DB | ✅ 已有 | A-01 依赖 |
-| T-11 竞价复算通路 | ⚠️ **未就绪** | v12 MVP-3，A-01 前置 |
-| `BannerCtx` | ✅ 已有 | 6 新增直接复用 |
-| `push_governor` | ✅ 已有 | Frozen/Unsafe 判定落此处 |
-| `SignalStateMachine` | ✅ 已有 | 6 新增注册即可 |
+| `news_monitor_loop` | ✅ | 复用 |
+| `sector_rotation` | ✅ | 复用 |
+| `virtual_watch` DB | ✅ | A-01 依赖 |
+| T-11 竞价复算 | ⚠️ 未就绪 | A-01 前置 |
+| `BannerCtx` | ✅ | 复用 |
+| `push_governor` | ✅ | 复用 |
+| `SignalStateMachine` | ✅ | 复用 |
+| `order_report` | ✅ | T-14/T-15 复用 |
+| `block_trade_handler` | ✅ | T-18/T-19 复用 |
 
-### 6.3 与现有规范的一致性自查
+---
 
-| 规范条款 | 满足方式 |
+## 13. 与现有规范的一致性自查
+
+| 规范 | 满足方式 |
 |---|---|
-| AGENTS §1 强制预飞行 | 每个 PR 模板含 Impacted paths / Triggered rule IDs / Validation / Rollback |
-| AGENTS §2 Gate A→D | 4 PR 严格串行；失败回对应 Gate |
-| AGENTS §3 数据红线 | 6 模板均映射 §2.1 / §2.2 / §2.4（个别含 §2.3 / §2.6） |
-| AGENTS §6 PR 证据 | PR 模板样例已覆盖 6 字段 |
-| AGENTS §7 根因回退 | L1~L4 分层已设计 |
-| ENGINEERING_RULES_V2 §1 Gate A | 本设计文档即 Gate A 产物 |
-| ENGINEERING_RULES_V2 §2 红线 | 6 模板逐项映射（§2.1 / §2.2 / §2.3 / §2.4 / §2.6 / §2.8 / §2.9 / §2.10） |
+| AGENTS §1 强制预飞行 | 每 PR 模板含 Impacted/Triggered/Validation/Rollback |
+| AGENTS §2 Gate A→D | 13 PR 严格串行 |
+| AGENTS §3 数据红线 | 13 模板均映射 §2.1/§2.2/§2.4（含 §2.3/§2.6） |
+| AGENTS §6 PR 证据 | PR 模板样例覆盖 6 字段 |
+| AGENTS §7 根因回退 | L1~L4 分层 |
+| ENGINEERING_RULES_V2 §1 Gate A | 本文档即 Gate A 产物 |
+| ENGINEERING_RULES_V2 §2 红线 | 13 模板逐项映射 |
 | ENGINEERING_RULES_V2 §3 PR 模板 | PR 证据样例已给 |
-| ENGINEERING_RULES_V2 §4 根因回退 | L1~L4 与 §4 对齐 |
-| ENGINEERING_RULES_V2 §5 受控例外 | A-01 标注 `#[ignore]` + 前置依赖（非豁免红线） |
-| ENGINEERING_RULES_V2 §6 双层门禁 | Fast (PR 提交时) + Full (合并前) 一致 |
+| ENGINEERING_RULES_V2 §4 根因回退 | L1~L4 对齐 |
+| ENGINEERING_RULES_V2 §5 受控例外 | A-01 `#[ignore]` + 前置依赖 |
+| ENGINEERING_RULES_V2 §6 双层门禁 | Fast + Full 一致 |
 
-### 6.4 范围外但需提前沟通的事项
+---
 
-1. **调度接入**：6 模板的 cron 时机（盘前 09:00 / 盘中 10/11/13/14 / 盘后 15:30/19:00/21:00）由运维 PR 排，本设计仅约束"调用点存在"。
-2. **真接测试数据**：D-01 / A-10 需新闻+个股关联数据，依赖 `news_monitor` 真实拉取；测试环境需注入 fixture（独立 PR）。
-3. **i18n**：模板中文硬编码，与 v19.x 一致；不另起 i18n 框架。
-4. **bark / push channel**：推送通道配置不在本设计范围（v19.x 已稳定）。
+## 14. 范围外但需提前沟通
 
-### 6.5 下一步（流程交接）
+1. **调度接入**：cron 时机由运维 PR 排，本设计仅约束调用点
+2. **真接测试数据**：D-01/A-10/T-14/T-15 需注入 fixture（独立 PR）
+3. **i18n**：中文硬编码与 v19.x 一致
+4. **bark/push channel**：v19.x 已稳定
+5. **创业板协议大宗盘中实时确认**：T-18 推送时机需与现有大宗 handler 协调（独立 PR 调整 handler）
 
-设计文档完成后，按 brainstorming skill 流程：
+---
 
-1. ✍️ **写入设计文档** → `docs/superpowers/specs/2026-07-06-v13-push-templates-design.md`（本文件）
-2. 🔍 **Spec 自审**（placeholder / 一致性 / 范围 / 歧义）
-3. 🙋 **请用户审阅 spec**
-4. 🚀 **进入 writing-plans skill** → 产出 `v13-implementation-plan.md`（PR #1~#5 任务卡）
+## 15. 下一步
+
+设计文档完成后：
+
+1. ✅ 写入设计文档（**本文件**）
+2. ✅ Spec 自审（已完成 4 处修正，commit `da54a29`）
+3. 🙋 **请用户审阅 spec**（当前阶段）
+4. 🚀 进入 writing-plans skill → 产出 `v13-implementation-plan.md`（13 PR 任务卡）
 
 ---
 
@@ -550,24 +857,29 @@ cargo build --release  # 验证无 dangling ref
 |---|---|
 | PushKind | 推送类型枚举（`src/bin/monitor/notify.rs`） |
 | BannerCtx | 交易建议类全局横幅上下文 |
-| `push_governor` | 推送主控（冷却 / 治理 / 通道分发） |
-| SignalStateMachine | 信号状态机（`src/monitor/signal_state.rs`） |
-| `news_monitor_loop` | 新闻监控循环（盘前/盘中） |
+| `push_governor` | 推送主控 |
+| SignalStateMachine | 信号状态机 |
+| `news_monitor_loop` | 新闻监控循环 |
 | sector_rotation | 板块轮动引擎 |
 | virtual_watch | 虚拟观察仓位 DB |
-| T-11 | v12 竞价复算通路（v12-dev-plan.md §MVP-3） |
+| T-11 | v12 竞价复算通路 |
+| BR | Business Rule（业务规则） |
 
-## 附录 B：与 v19.x 既有用例同形的约束
+## 附录 B：与 v19.x 既有用例同形约束
 
-> 满足"读起来像现有代码"的本地化要求。
+- **Params 结构体**：与 `HoldingPlanParams<'_>` / `T0AdviceParams<'_>` 同形
+- **render 函数签名**：`pub fn render_<kind>(banner: &BannerCtx, p: <Kind>Params<'_>) -> String`
+- **测试函数命名**：`fn <kind>_<scenario>`
+- **match 分支**：缺分支用 `unreachable!()` 而非 `_ =>`
+- **错误处理**：render 入口只接受已校验数据，校验在调用点完成；render 内不做 IO
 
-- **Params 结构体**：与 `HoldingPlanParams<'_>` / `T0AdviceParams<'_>` 同形（生命周期 + `&str` 借用）
-- **render 函数签名**：`pub fn render_<kind>(banner: &BannerCtx, p: <Kind>Params<'_>) -> String`（⚡交易建议类必须带 banner）
-- **测试函数命名**：`fn <kind>_<scenario>`（如 `preopen_news_hot_three_themes_two_news`）
-- **match 分支**：所有 PushKind `match` 必须覆盖全部 variant，缺分支用 `unreachable!()` 而非 `_ =>`
-- **错误处理**：所有 render 入口只接受已校验数据，校验在调用点完成；render 内不做 IO
+## 附录 C：新规来源
+
+> 沪深北交易所《交易规则（2026 修订）》于 2026-04-24 发布，2026-07-06 起施行。
+> 来源：上交所/深交所/北交所 2026-04-24 联合公告。
 
 ---
 
 **状态**：Draft（待用户审批 → 转 Final）
-**下一步**：Spec 自审 → 用户审阅 → writing-plans skill 产出 PR 任务卡
+**下一步**：用户审阅 → writing-plans skill 产出 13 PR 任务卡
+**紧急项**：建议 spec 通过后**立刻**执行 §10.2 治理参数同步（不需等 PR）
