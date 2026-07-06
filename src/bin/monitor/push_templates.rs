@@ -145,6 +145,7 @@ impl BannerCtx {
 /// T-01 账户模式变更
 ///
 /// `reasons` / `forbidden_actions` / `recovery_condition` 由调用方拼好.
+/// v12 §14.1 T-01 AccountMode 模板渲染 — 字段顺序严格对齐 docs/architecture/v12-push-templates.md
 pub fn render_account_mode(
     hhmm: &str,
     old: AccountMode,
@@ -170,6 +171,7 @@ pub fn render_account_mode(
 }
 
 /// T-02 数据状态变更
+/// v12 §14.1 T-02 DataMode 模板渲染 — 字段顺序严格对齐 docs/architecture/v12-push-templates.md
 pub fn render_data_mode(
     hhmm: &str,
     old: DataMode,
@@ -222,6 +224,7 @@ impl Intent {
 }
 
 /// T-03 持仓操作建议
+/// v12 §14.1 T-03 HoldingPlan 模板渲染 — 字段顺序严格对齐 docs/architecture/v12-push-templates.md
 pub fn render_holding_plan(banner: &BannerCtx, params: HoldingPlanParams<'_>) -> String {
     let hhmm = params.hhmm;
     let mut out = format!(
@@ -275,6 +278,7 @@ pub struct HoldingPlanParams<'a> {
 }
 
 /// T-04 持仓紧急风险
+/// v12 §14.1 T-04 HoldingEvent 模板渲染 — 字段顺序严格对齐 docs/architecture/v12-push-templates.md
 pub fn render_holding_event(banner: &BannerCtx, p: HoldingEventParams<'_>) -> String {
     format!(
         "{}\n🚨 持仓风险 {}({})（{}）\n触发: {}\n现价{}（{:+.1}%） 距止损{:+.1}%\n建议: {}\n可用股数: {}\n辅助建议, 非下单指令",
@@ -343,6 +347,7 @@ impl T0Style {
     }
 }
 
+/// v12 §14.1 T-05 T0Advice 模板渲染 — 字段顺序严格对齐 docs/architecture/v12-push-templates.md
 pub fn render_t0_advice(banner: &BannerCtx, p: T0AdviceParams<'_>) -> String {
     format!(
         "{}\n🔁 做T {}({})（{}）\n结论: {} | 类型: {}\n可用底仓: {}股\n卖出观察区: {}~{}\n接回观察区: {}~{}\n最小价差: ≥{:.1}%（覆盖2×成本）\n风险: {}\n做T不改变总仓位判断; 趋势走强优先持有",
@@ -379,6 +384,7 @@ pub struct T0AdviceParams<'a> {
 }
 
 /// T-06 不建议做T
+/// v12 §14.1 T-06 T0Forbid 模板渲染 — 字段顺序严格对齐 docs/architecture/v12-push-templates.md
 pub fn render_t0_forbid(banner: &BannerCtx, p: T0ForbidParams<'_>) -> String {
     format!(
         "{}\n🔁🚫 不建议做T {}({})（{}）\n原因: {}",
@@ -430,6 +436,7 @@ impl EvidenceQuality {
     }
 }
 
+/// v12 §14.1 T-07 CandidateTriggered 模板渲染 — 字段顺序严格对齐 docs/architecture/v12-push-templates.md
 pub fn render_candidate_triggered(banner: &BannerCtx, p: CandidateTriggeredParams<'_>) -> String {
     let mut out = format!(
         "{}\n📋 候选触发 {}({})（{}）\n等级{} | 状态: Triggered | 主题: {}\n现价{} 已触发: {}\n低吸参考: {}~{} | 止损{} | 仓位上限{}%",
@@ -482,6 +489,7 @@ pub struct CandidateTriggeredParams<'a> {
 }
 
 /// T-08 候选失效
+/// v12 §14.1 T-08 CandidateInvalidated 模板渲染 — 字段顺序严格对齐 docs/architecture/v12-push-templates.md
 pub fn render_candidate_invalidated(
     hhmm: &str,
     name: &str,
@@ -496,6 +504,7 @@ pub fn render_candidate_invalidated(
 }
 
 /// T-09 禁止操作提示
+/// v12 §14.1 T-09 ForbiddenOps 模板渲染 — 字段顺序严格对齐 docs/architecture/v12-push-templates.md
 pub fn render_forbidden_ops(banner: &BannerCtx, p: ForbiddenOpsParams<'_>) -> String {
     let mut out = format!(
         "{}\n🚫 禁止操作（{}）\n{}({}): {}\n· {}",
@@ -537,6 +546,7 @@ impl PaperTradeStatus {
     }
 }
 
+/// v12 §14.1 T-10 PaperTrade 模板渲染 — 字段顺序严格对齐 docs/architecture/v12-push-templates.md
 pub fn render_paper_trade(p: PaperTradeParams<'_>) -> String {
     let mut out = format!(
         "🧪 虚拟盘（{}）\n{}({}) {}",
@@ -578,6 +588,7 @@ pub struct PaperTradeParams<'a> {
 }
 
 /// T-11 竞价异动 (复用 AuctionVolume, 加横幅)
+/// v12 §14.1 T-11 AuctionVolume 模板渲染 — 字段顺序严格对齐 docs/architecture/v12-push-templates.md
 pub fn render_auction_volume(
     banner: &BannerCtx,
     hhmm: &str,
@@ -623,6 +634,7 @@ pub struct CloseCallGamble<'a> {
     pub cond: &'a str,
 }
 
+/// v12 §14.1 T-12 CloseCall 模板渲染 — 字段顺序严格对齐 docs/architecture/v12-push-templates.md
 pub fn render_close_call(
     banner: &BannerCtx,
     hhmm: &str,
@@ -663,6 +675,7 @@ pub struct HoldingDailyPlan<'a> {
     pub t0: &'a str, // "适合观察" / "不适合(原因)"
 }
 
+/// v12 §14.2 R-01 DailyReport 模板渲染 — 字段顺序严格对齐 docs/architecture/v12-push-templates.md
 pub fn render_daily_report(date: &str, items: &[HoldingDailyPlan<'_>]) -> String {
     let mut out = format!("📌 持仓明日计划（{} 19:00）", date);
     for it in items {
@@ -712,6 +725,7 @@ pub struct MarketReview<'a> {
     pub max_pos: u8,
 }
 
+/// v12 §14.2 R-02 ReviewMarket 模板渲染 — 字段顺序严格对齐 docs/architecture/v12-push-templates.md
 pub fn render_review_market(date: &str, m: &MarketReview<'_>) -> String {
     let mut out = format!(
         "📊 今日盘面（{}）\n指数: 上证{:+.1}% 创业{:+.1}% 科创{:+.1}%\n情绪: 涨停{}家 跌停{}家 炸板率{:.0}% 连板高度{}板\n资金: 两市{:.0}亿（{}{:+.0}%） 主力净{:+.0}亿\n赚钱效应: {}\n阶段判定: {}（置信度{}%）",
@@ -751,6 +765,7 @@ pub struct ChainLine<'a> {
     pub watch_point: &'a str,
 }
 
+/// v12 §14.2 R-03 IndustryChain 模板渲染 — 字段顺序严格对齐 docs/architecture/v12-push-templates.md
 pub fn render_industry_chain(date: &str, chains: &[ChainLine<'_>], fade: Option<&str>) -> String {
     let mut out = format!("🔥 涨停产业链（{}）", date);
     for (i, c) in chains.iter().enumerate() {
@@ -787,6 +802,7 @@ pub struct LhbEntry<'a> {
     pub next_day_risk: &'a str,
 }
 
+/// v12 §14.2 R-04 ReviewLhb 模板渲染 — 字段顺序严格对齐 docs/architecture/v12-push-templates.md
 pub fn render_review_lhb(date: &str, entries: &[LhbEntry<'_>]) -> String {
     let mut out = format!("🐉 龙虎榜净买前五（{} 21:00）", date);
     for (i, e) in entries.iter().enumerate() {
@@ -827,6 +843,7 @@ pub struct SignalReview {
     pub news_d1_eff: u32,
 }
 
+/// v12 §14.2 R-05 ReviewSignal 模板渲染 — 字段顺序严格对齐 docs/architecture/v12-push-templates.md
 pub fn render_review_signal(date: &str, r: &SignalReview) -> String {
     format!(
         "🤖 信号复盘（{}）\n持仓建议: 推{}条 执行{}条 有效{}条\n做T建议: 推{} 有效{}\n候选(影子): 触发{} 模拟成交{} 未成交{}（涨停{}/未触达{}）\n虚拟盘: 今日{:+.1}% 累计{:+.1}%（样本{}笔）\n新闻兑现: 推送{}条 D+1兑现{}条",
@@ -861,6 +878,7 @@ pub struct FailureDistribution {
     pub human_not_exec: u32,
 }
 
+/// v12 §14.2 R-06 ReviewFailure 模板渲染 — 字段顺序严格对齐 docs/architecture/v12-push-templates.md
 pub fn render_review_failure(
     date: &str,
     entries: &[FailureEntry<'_>],
@@ -896,6 +914,7 @@ pub struct WatchItem<'a> {
     pub reason: &'a str,
 }
 
+/// v12 §14.2 R-07 TomorrowWatch 模板渲染 — 字段顺序严格对齐 docs/architecture/v12-push-templates.md
 pub fn render_tomorrow_watch(date: &str, items: &[WatchItem<'_>]) -> String {
     let mut out = format!("📌 明日观察池（{}）", date);
     for (i, it) in items.iter().enumerate() {
@@ -924,6 +943,7 @@ pub struct HoldingEventItem<'a> {
     pub kind: &'a str, // "解禁{amt}亿" / "财报预告" / "减持到期"
 }
 
+/// v12 §14.2 R-08 EventCalendar 模板渲染 — 字段顺序严格对齐 docs/architecture/v12-push-templates.md
 pub fn render_event_calendar(
     date: &str,
     holdings: &[HoldingEventItem<'_>],
