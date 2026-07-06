@@ -1712,6 +1712,68 @@ pub fn render_news_catalyst(banner: &BannerCtx, p: NewsCatalystParams<'_>) -> St
     s
 }
 
+/// v13 §14.4 D-01 新闻驱动个股 — 主题阶段
+pub enum NewsStage {
+    Starting,   // 启动
+    Fermenting, // 发酵
+    Diverging,  // 分歧
+}
+
+/// v13 §14.4 D-01 新闻驱动个股 — 建议动作
+pub enum NewsAction {
+    Observe,    // 观察
+    BuyDip,     // 低吸
+    DoNotChase, // 不追
+}
+
+/// v13 §14.4 D-01 新闻驱动个股
+pub struct NewsToIdeaParams<'a> {
+    pub hhmm: &'a str,
+    pub headline: &'a str,
+    pub theme: Option<&'a str>,
+    pub stage: NewsStage,
+    pub name: &'a str,
+    pub code: &'a str,
+    pub reasons: Vec<&'a str>,
+    pub action: Option<NewsAction>,
+}
+
+/// v13 §14.4 D-01 新闻驱动个股（⚡交易建议类带 banner）
+pub fn render_news_to_idea(banner: &BannerCtx, p: NewsToIdeaParams<'_>) -> String {
+    let stage = match p.stage {
+        NewsStage::Starting => "启动",
+        NewsStage::Fermenting => "发酵",
+        NewsStage::Diverging => "分歧",
+    };
+    let theme = p.theme.unwrap_or("未分类");
+    let mut s = format!(
+        "{}\n🧭 新闻驱动个股（{}）\n新闻: {}\n板块: {} | 阶段: {}\n个股: {}({})\n",
+        banner.render(),
+        p.hhmm,
+        p.headline,
+        theme,
+        stage,
+        p.name,
+        p.code
+    );
+    if !p.reasons.is_empty() {
+        s.push_str("推送原因:\n");
+        for r in &p.reasons {
+            s.push_str(&format!("· {}\n", r));
+        }
+    }
+    if let Some(act) = p.action {
+        let a = match act {
+            NewsAction::Observe => "观察",
+            NewsAction::BuyDip => "低吸",
+            NewsAction::DoNotChase => "不追",
+        };
+        s.push_str(&format!("[建议动作: {}]\n", a));
+    }
+    s.push_str("辅助建议, 非下单指令");
+    s
+}
+
 // ============================================================================
 // 测试
 // ============================================================================
@@ -2673,6 +2735,83 @@ mod tests {
     fn gov_news_catalyst_level() {
         assert_eq!(
             crate::notify::PushKind::NewsCatalyst.level(),
+            crate::notify::PushLevel::Important
+        );
+    }
+
+    // ====== v13 D-01 新闻驱动个股 (4 用例) ======
+    #[test]
+    fn news_to_idea_full_state() {
+        let p = NewsToIdeaParams {
+            hhmm: "10:30", headline: "英伟达H200发布", theme: Some("AI算力"),
+            stage: NewsStage::Starting, name: "中科曙光", code: "603019",
+            reasons: vec!["AI算力龙头", "业绩超预期"],
+            action: Some(NewsAction::BuyDip),
+        };
+        let banner = BannerCtx::test_default();
+        let out = render_news_to_idea(&banner, p);
+        assert!(out.contains("🧭 新闻驱动个股（10:30）"));
+        assert!(out.contains("板块: AI算力 | 阶段: 启动"));
+        assert!(out.contains("个股: 中科曙光(603019)"));
+        assert!(out.contains("· AI算力龙头"));
+        assert!(out.contains("[建议动作: 低吸]"));
+        assert!(out.ends_with("辅助建议, 非下单指令"));
+    }
+
+    #[test]
+    fn news_to_idea_no_reasons_no_action() {
+        let p = NewsToIdeaParams {
+            hhmm: "10:30", headline: "X", theme: None,
+            stage: NewsStage::Fermenting, name: "A", code: "000001",
+            reasons: vec![], action: None,
+        };
+        let banner = BannerCtx::test_default();
+        let out = render_news_to_idea(&banner, p);
+        assert!(out.contains("板块: 未分类 | 阶段: 发酵"));
+        assert!(!out.contains("推送原因:"));
+        assert!(!out.contains("[建议动作:"));
+    }
+
+    #[test]
+    fn news_to_idea_action_do_not_chase() {
+        let p = NewsToIdeaParams {
+            hhmm: "10:30", headline: "X", theme: Some("X"),
+            stage: NewsStage::Diverging, name: "A", code: "000001",
+            reasons: vec!["r"], action: Some(NewsAction::DoNotChase),
+        };
+        let banner = BannerCtx::test_default();
+        let out = render_news_to_idea(&banner, p);
+        assert!(out.contains("[建议动作: 不追]"));
+        assert!(out.contains("阶段: 分歧"));
+    }
+
+    #[test]
+    fn news_to_idea_action_observe() {
+        let p = NewsToIdeaParams {
+            hhmm: "10:30", headline: "X", theme: Some("X"),
+            stage: NewsStage::Starting, name: "A", code: "000001",
+            reasons: vec!["r1", "r2"], action: Some(NewsAction::Observe),
+        };
+        let banner = BannerCtx::test_default();
+        let out = render_news_to_idea(&banner, p);
+        assert!(out.contains("[建议动作: 观察]"));
+        assert!(out.contains("· r1"));
+        assert!(out.contains("· r2"));
+    }
+
+    // ====== v13 治理元信息测试 (D-01) ======
+    #[test]
+    fn gov_news_to_idea_cooldown() {
+        assert_eq!(crate::notify::PushKind::NewsToIdea.cooldown_secs(), Some(1200));
+    }
+    #[test]
+    fn gov_news_to_idea_banner() {
+        assert!(crate::notify::PushKind::NewsToIdea.requires_banner());
+    }
+    #[test]
+    fn gov_news_to_idea_level() {
+        assert_eq!(
+            crate::notify::PushKind::NewsToIdea.level(),
             crate::notify::PushLevel::Important
         );
     }
