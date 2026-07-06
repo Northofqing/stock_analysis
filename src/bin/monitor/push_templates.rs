@@ -1869,6 +1869,92 @@ pub fn render_industry_chain_intraday(banner: &BannerCtx, p: IndustryChainIntrad
     s
 }
 
+/// v13.1 §5.2 交易所
+pub enum Exchange {
+    SH, // 沪市 A 股/ETF (9:30-11:30, 13:00-15:30)
+    SZ, // 深市 A 股/ETF (9:15-11:30, 13:00-15:30)
+    BJ, // 北交所 A 股 (9:15-11:30, 13:00-15:30)
+}
+
+/// v13.1 §5.2 委托状态
+pub enum OrderStatus {
+    Submitted, // 已报
+    Cancelled, // 已撤
+    Rejected,  // 废单
+}
+
+/// v13.1 §5.2 T-14 盘后固定价格申报
+pub struct PostFixedPriceOrderParams<'a> {
+    pub exchange: Exchange,
+    pub hhmm: &'a str,
+    pub name: &'a str,
+    pub code: &'a str,
+    pub price: f64,
+    pub qty: u32,
+    pub order_id: &'a str,
+    pub status: OrderStatus,
+}
+
+/// v13.1 §5.3 T-15 盘后固定价格成交
+pub struct PostFixedPriceFillParams<'a> {
+    pub exchange: Exchange,
+    pub hhmm: &'a str,
+    pub name: &'a str,
+    pub code: &'a str,
+    pub fill_price: f64,
+    pub qty: u32,
+    pub vs_limit_pct: Option<f32>,
+    pub next_session_carry: bool,
+}
+
+/// v13.1 §5.2 T-14 盘后固定价格申报
+pub fn render_post_fixed_price_order(p: PostFixedPriceOrderParams<'_>) -> String {
+    let ex = match p.exchange {
+        Exchange::SH => "沪市",
+        Exchange::SZ => "深市",
+        Exchange::BJ => "北交所",
+    };
+    let status = match p.status {
+        OrderStatus::Submitted => "已报",
+        OrderStatus::Cancelled => "已撤",
+        OrderStatus::Rejected => "废单",
+    };
+    // 按 HH:MM 派生窗口 (上午/下午/尾盘)
+    let window = if p.hhmm < "11:30" {
+        "上午"
+    } else if p.hhmm < "15:00" {
+        "下午"
+    } else {
+        "尾盘"
+    };
+    format!(
+        "📋 盘后固定价格申报（{} {}）\n{}({}) 价格{:.2} 数量{} | 状态: {} | 窗口: {}\n订单号: {}\n辅助建议, 非下单指令",
+        p.hhmm, ex, p.name, p.code, p.price, p.qty, status, window, p.order_id
+    )
+}
+
+/// v13.1 §5.3 T-15 盘后固定价格成交
+pub fn render_post_fixed_price_fill(p: PostFixedPriceFillParams<'_>) -> String {
+    let ex = match p.exchange {
+        Exchange::SH => "沪市",
+        Exchange::SZ => "深市",
+        Exchange::BJ => "北交所",
+    };
+    let vs = p
+        .vs_limit_pct
+        .map(|v| format!("{:+.1}%", v))
+        .unwrap_or_else(|| "N/A".to_string());
+    let carry = if p.next_session_carry {
+        "过户到次一交易日"
+    } else {
+        "本日内"
+    };
+    format!(
+        "✅ 盘后固定价格成交（{} {}）\n{}({}) 成交价{:.2} 数量{} | 价差{}\n清算: {}\n辅助建议, 非下单指令",
+        p.hhmm, ex, p.name, p.code, p.fill_price, p.qty, vs, carry
+    )
+}
+
 // ============================================================================
 // 测试
 // ============================================================================
@@ -3005,6 +3091,80 @@ mod tests {
     fn gov_industry_chain_intraday_level() {
         assert_eq!(crate::notify::PushKind::IndustryChainIntraday.level(), crate::notify::PushLevel::Important);
     }
+
+    // ====== v13.1 T-14/T-15 盘后固定价格 (4 用例) ======
+    #[test]
+    fn post_fixed_price_order_sh_submitted() {
+        let p = PostFixedPriceOrderParams {
+            exchange: Exchange::SH, hhmm: "10:00",
+            name: "A", code: "600000", price: 10.50, qty: 1000,
+            order_id: "ORD001", status: OrderStatus::Submitted,
+        };
+        let out = render_post_fixed_price_order(p);
+        assert!(out.contains("📋 盘后固定价格申报（10:00 沪市）"));
+        assert!(out.contains("价格10.50 数量1000 | 状态: 已报"));
+        assert!(out.contains("窗口: 上午"));
+        assert!(out.contains("订单号: ORD001"));
+    }
+
+    #[test]
+    fn post_fixed_price_order_sz_afternoon_cancelled() {
+        let p = PostFixedPriceOrderParams {
+            exchange: Exchange::SZ, hhmm: "13:30",
+            name: "A", code: "000001", price: 10.0, qty: 100,
+            order_id: "X", status: OrderStatus::Cancelled,
+        };
+        let out = render_post_fixed_price_order(p);
+        assert!(out.contains("深市"));
+        assert!(out.contains("窗口: 下午"));
+        assert!(out.contains("已撤"));
+    }
+
+    #[test]
+    fn post_fixed_price_order_bj_tail_rejected() {
+        let p = PostFixedPriceOrderParams {
+            exchange: Exchange::BJ, hhmm: "15:00",
+            name: "A", code: "830001", price: 5.0, qty: 500,
+            order_id: "Y", status: OrderStatus::Rejected,
+        };
+        let out = render_post_fixed_price_order(p);
+        assert!(out.contains("北交所"));
+        assert!(out.contains("窗口: 尾盘"));
+        assert!(out.contains("废单"));
+    }
+
+    #[test]
+    fn post_fixed_price_fill_with_carry() {
+        let p = PostFixedPriceFillParams {
+            exchange: Exchange::SH, hhmm: "15:10",
+            name: "A", code: "600000", fill_price: 10.0, qty: 100,
+            vs_limit_pct: Some(2.5), next_session_carry: true,
+        };
+        let out = render_post_fixed_price_fill(p);
+        assert!(out.contains("✅ 盘后固定价格成交（15:10 沪市）"));
+        assert!(out.contains("成交价10.00 数量100 | 价差+2.5%"));
+        assert!(out.contains("清算: 过户到次一交易日"));
+    }
+
+    #[test]
+    fn post_fixed_price_fill_no_carry() {
+        let p = PostFixedPriceFillParams {
+            exchange: Exchange::BJ, hhmm: "15:20",
+            name: "A", code: "830001", fill_price: 5.0, qty: 100,
+            vs_limit_pct: None, next_session_carry: false,
+        };
+        let out = render_post_fixed_price_fill(p);
+        assert!(out.contains("价差N/A"));
+        assert!(out.contains("清算: 本日内"));
+    }
+
+    // ====== v13.1 治理元信息测试 (T-14/T-15) ======
+    #[test] fn gov_post_fixed_price_order_cooldown() { assert_eq!(crate::notify::PushKind::PostFixedPriceOrder.cooldown_secs(), Some(60)); }
+    #[test] fn gov_post_fixed_price_fill_cooldown() { assert_eq!(crate::notify::PushKind::PostFixedPriceFill.cooldown_secs(), Some(300)); }
+    #[test] fn gov_post_fixed_price_order_banner() { assert!(crate::notify::PushKind::PostFixedPriceOrder.requires_banner()); }
+    #[test] fn gov_post_fixed_price_fill_banner() { assert!(crate::notify::PushKind::PostFixedPriceFill.requires_banner()); }
+    #[test] fn gov_post_fixed_price_order_level() { assert_eq!(crate::notify::PushKind::PostFixedPriceOrder.level(), crate::notify::PushLevel::Important); }
+    #[test] fn gov_post_fixed_price_fill_level() { assert_eq!(crate::notify::PushKind::PostFixedPriceFill.level(), crate::notify::PushLevel::Important); }
 
     #[test]
     fn evidence_quality_labels() {

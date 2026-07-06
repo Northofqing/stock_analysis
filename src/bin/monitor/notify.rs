@@ -115,6 +115,11 @@ pub enum PushKind {
     // ============= v13 §14.2 新增 PushKind (PR #4 - 审计多发现) =============
     /// v13 §14.2 I-03 盘中涨停扩散 (⚡ 30min 冷却) — 与盘后 IndustryChain (R-03) 区分
     IndustryChainIntraday,
+    // ============= v13.1 新规模板 (新规 2026-07-06 生效) =============
+    /// v13.1 §5.2 T-14 盘后固定价格申报 (⚡ 1min/票)
+    PostFixedPriceOrder,
+    /// v13.1 §5.3 T-15 盘后固定价格成交 (⚡ 5min/票)
+    PostFixedPriceFill,
 }
 
 impl PushKind {
@@ -152,7 +157,9 @@ impl PushKind {
             | PushKind::NewsCatalyst
             | PushKind::NewsToIdea
             | PushKind::CatalystReview
-            | PushKind::IndustryChainIntraday => PushLevel::Important,
+            | PushKind::IndustryChainIntraday
+            | PushKind::PostFixedPriceOrder
+            | PushKind::PostFixedPriceFill => PushLevel::Important,
             // ℹ️参考 (降级 + ForbiddenOps/PaperTrade)
             _ => PushLevel::Info,
         }
@@ -185,6 +192,8 @@ impl PushKind {
                 | PushKind::NewsCatalyst
                 | PushKind::NewsToIdea
                 | PushKind::IndustryChainIntraday
+                | PushKind::PostFixedPriceOrder
+                | PushKind::PostFixedPriceFill
         )
     }
 
@@ -224,6 +233,8 @@ impl PushKind {
             PushKind::NewsToIdea => Some(1200),                               // 20 min/票
             PushKind::CatalystReview => Some(86_400),                         // 1次/日
             PushKind::IndustryChainIntraday => Some(1800),                     // 30 min
+            PushKind::PostFixedPriceOrder => Some(60),                        // 1 min/票
+            PushKind::PostFixedPriceFill => Some(300),                         // 5 min/票
             _ => Some(1800),                                                  // 默认 30min
         }
     }
@@ -273,6 +284,8 @@ impl PushKind {
             PushKind::NewsToIdea => "新闻驱动个股",
             PushKind::CatalystReview => "题材催化复盘",
             PushKind::IndustryChainIntraday => "盘中涨停扩散",
+            PushKind::PostFixedPriceOrder => "盘后固定价格申报",
+            PushKind::PostFixedPriceFill => "盘后固定价格成交",
         }
     }
 }
