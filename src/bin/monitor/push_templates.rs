@@ -1604,45 +1604,78 @@ pub fn build_news_catalyst_from_snapshot<'a>(s: &'a NewsCatalystSnapshot) -> New
     }
 }
 
-/// v17.2: 实时涨跌接入 (data_provider::gtimg)
-/// 替代 v16.2 的 chg=0.0 占位
+/// v16.1: 批量 fetch_realtime_quote (并行, 避免 N 次 HTTP)
+/// 注: gtimg_provider 无 batch API, 用 std::thread::scope 并行调用单股接口
+pub fn fetch_realtime_quotes_batch(
+    codes: &[&str],
+) -> std::collections::HashMap<String, f32> {
+    use stock_analysis::data_provider::GtimgProvider;
+    let provider = match GtimgProvider::new() {
+        Ok(p) => std::sync::Arc::new(p),
+        Err(e) => {
+            log::warn!("[v16.1] GtimgProvider::new 失败: {}", e);
+            return std::collections::HashMap::new();
+        }
+    };
+    let mut result = std::collections::HashMap::new();
+    std::thread::scope(|s| {
+        let handles: Vec<_> = codes
+            .iter()
+            .map(|code| {
+                let code_owned = code.to_string();
+                let provider_ref = provider.clone();
+                s.spawn(move || {
+                    let chg = match provider_ref.fetch_realtime_quote(&code_owned) {
+                        Ok(Some(q)) => Some(q.pct_chg as f32),
+                        _ => None,
+                    };
+                    (code_owned, chg)
+                })
+            })
+            .collect();
+        for h in handles {
+            if let Ok((code, Some(chg))) = h.join() {
+                result.insert(code, chg);
+            }
+        }
+    });
+    result
+}
+
+/// v17.2+v16.1: 实时涨跌接入 (data_provider::gtimg, 批量)
 pub fn load_news_catalyst_snapshot_real(hhmm: &str) -> NewsCatalystSnapshot {
     use stock_analysis::database::DatabaseManager;
-    use stock_analysis::data_provider::GtimgProvider;
     let clusters = DatabaseManager::get().get_latest_chain_clusters();
     if clusters.is_empty() {
         return NewsCatalystSnapshot::default();
     }
     let top = &clusters[0];
-    let provider = match GtimgProvider::new() {
-        Ok(p) => p,
-        Err(e) => {
-            log::warn!("[I-02] GtimgProvider::new 失败: {}, 退到 chg=0.0", e);
-            return load_news_catalyst_snapshot_real_fallback(hhmm);
-        }
-    };
-    let mut stocks: Vec<(String, String, Option<f32>)> = Vec::new();
+
+    // 收集所有 codes (前 3 cluster × 前 3 code = 最多 9 个, 去重)
+    let mut codes: Vec<String> = Vec::new();
     for c in clusters.iter().take(3) {
-        let codes: Vec<&str> = c
+        for code in c
             .stocks
             .trim_matches(|ch| ch == '[' || ch == ']')
             .split(',')
             .take(3)
-            .map(|s| s.trim_matches('"').trim())
+            .map(|s| s.trim_matches('"').trim().to_string())
             .filter(|s| !s.is_empty())
-            .collect();
-        for code in codes {
-            // v17.2: 调 fetch_realtime_quote 拿真实涨跌幅
-            let chg = match provider.fetch_realtime_quote(code) {
-                Ok(Some(q)) => Some(q.pct_chg as f32),
-                Ok(None) => None,
-                Err(e) => {
-                    log::debug!("[I-02] fetch_realtime_quote({}) 失败: {}", code, e);
-                    None
-                }
-            };
-            stocks.push((code.to_string(), code.to_string(), chg));
+        {
+            if !codes.contains(&code) {
+                codes.push(code);
+            }
         }
+    }
+
+    // v16.1: 批量 fetch (并行, 1 次 vs N 次)
+    let code_refs: Vec<&str> = codes.iter().map(|s| s.as_str()).collect();
+    let chg_map = fetch_realtime_quotes_batch(&code_refs);
+
+    let mut stocks: Vec<(String, String, Option<f32>)> = Vec::new();
+    for code in codes {
+        let chg = chg_map.get(&code).copied();
+        stocks.push((code.clone(), code, chg));
     }
     NewsCatalystSnapshot {
         hhmm: hhmm.to_string(),
@@ -5171,6 +5204,14 @@ mod tests {
         };
         assert!(n_limit_up.is_limit_up_today);
         assert_eq!(n_limit_up.board_level, 2);
+    }
+
+    // ====== v16.1: 批量 fetch_realtime_quote 测试 (空 codes + 正常 codes) ======
+    #[test]
+    fn v16_1_batch_fetch_empty_codes() {
+        // 空 codes → 返回空 HashMap (不调 provider)
+        let result = fetch_realtime_quotes_batch(&[]);
+        assert!(result.is_empty());
     }
 
     #[test]
