@@ -37,16 +37,15 @@ pub struct DatabaseManager {
 
 static DB_INSTANCE: OnceCell<DatabaseManager> = OnceCell::new();
 
-
-pub mod repository;
 pub mod factor_snapshot;
+pub mod repository;
 // v12 MVP-5 §8.1
+pub(crate) mod agent_logs;
+pub mod concepts;  // v15.1: 公开供 push_templates 集成使用
 pub mod execution_tracking;
-mod concepts;
 mod kline;
 mod lhb;
 mod positions;
-pub(crate) mod agent_logs;
 // v12 PR1-1.5 (BR-021)
 pub mod account_mode_log;
 // v12 PR3-3.2/3.3 (BR-023/024)
@@ -74,9 +73,7 @@ impl DatabaseManager {
         info!("初始化数据库: {}", database_url);
 
         let manager = ConnectionManager::<SqliteConnection>::new(database_url);
-        let pool = Pool::builder()
-            .max_size(10)
-            .build(manager)?;
+        let pool = Pool::builder().max_size(10).build(manager)?;
 
         // 运行迁移
         let mut conn = pool.get()?;
@@ -94,12 +91,10 @@ impl DatabaseManager {
 
         let db = DatabaseManager { pool };
 
-        DB_INSTANCE
-            .set(db)
-            .map_err(|_| "数据库已经初始化")?;
+        DB_INSTANCE.set(db).map_err(|_| "数据库已经初始化")?;
 
         info!("数据库初始化完成");
-        
+
         // 创建 agent_scratchpad 表 (Agent 内部思考和工具执行记录)
         diesel::sql_query(
             r#"
@@ -111,7 +106,7 @@ impl DatabaseManager {
                 content TEXT,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
-            "#
+            "#,
         )
         .execute(&mut *conn)?;
 
@@ -123,7 +118,7 @@ impl DatabaseManager {
                 concepts TEXT NOT NULL,
                 updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
-            "#
+            "#,
         )
         .execute(&mut *conn)?;
 
@@ -138,7 +133,7 @@ impl DatabaseManager {
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (date, concept)
             )
-            "#
+            "#,
         )
         .execute(&mut *conn)?;
 
@@ -229,9 +224,24 @@ impl DatabaseManager {
         .execute(&mut *conn)?;
 
         // 老库升级：增量添加 3 列（QUANT_ANALYST_REVIEW §1.1）
-        Self::add_column_if_missing(conn, "stock_daily", "is_limit_up", "TINYINT NOT NULL DEFAULT 0")?;
-        Self::add_column_if_missing(conn, "stock_daily", "is_limit_down", "TINYINT NOT NULL DEFAULT 0")?;
-        Self::add_column_if_missing(conn, "stock_daily", "is_suspended", "TINYINT NOT NULL DEFAULT 0")?;
+        Self::add_column_if_missing(
+            conn,
+            "stock_daily",
+            "is_limit_up",
+            "TINYINT NOT NULL DEFAULT 0",
+        )?;
+        Self::add_column_if_missing(
+            conn,
+            "stock_daily",
+            "is_limit_down",
+            "TINYINT NOT NULL DEFAULT 0",
+        )?;
+        Self::add_column_if_missing(
+            conn,
+            "stock_daily",
+            "is_suspended",
+            "TINYINT NOT NULL DEFAULT 0",
+        )?;
 
         // 老库升级：增量添加 6 列 (修复 P1.3 trades 业绩归因)
         // 量化分析师要求: 必须能算真实 PnL (扣除 commission/stamp_tax/slippage)
@@ -243,15 +253,11 @@ impl DatabaseManager {
         Self::add_column_if_missing(conn, "trades", "signal_id", "TEXT DEFAULT ''")?;
 
         // 创建索引
-        diesel::sql_query(
-            "CREATE INDEX IF NOT EXISTS ix_stock_daily_code ON stock_daily(code)",
-        )
-        .execute(&mut *conn)?;
+        diesel::sql_query("CREATE INDEX IF NOT EXISTS ix_stock_daily_code ON stock_daily(code)")
+            .execute(&mut *conn)?;
 
-        diesel::sql_query(
-            "CREATE INDEX IF NOT EXISTS ix_stock_daily_date ON stock_daily(date)",
-        )
-        .execute(&mut *conn)?;
+        diesel::sql_query("CREATE INDEX IF NOT EXISTS ix_stock_daily_date ON stock_daily(date)")
+            .execute(&mut *conn)?;
 
         diesel::sql_query(
             "CREATE INDEX IF NOT EXISTS ix_stock_daily_code_date ON stock_daily(code, date)",
@@ -283,10 +289,8 @@ impl DatabaseManager {
         .execute(&mut *conn)?;
 
         // 创建龙虎榜索引
-        diesel::sql_query(
-            "CREATE INDEX IF NOT EXISTS ix_lhb_daily_code ON lhb_daily(code)",
-        )
-        .execute(&mut *conn)?;
+        diesel::sql_query("CREATE INDEX IF NOT EXISTS ix_lhb_daily_code ON lhb_daily(code)")
+            .execute(&mut *conn)?;
 
         diesel::sql_query(
             "CREATE INDEX IF NOT EXISTS ix_lhb_daily_trade_date ON lhb_daily(trade_date)",
@@ -399,10 +403,8 @@ impl DatabaseManager {
             "#,
         )
         .execute(&mut *conn)?;
-        diesel::sql_query(
-            "CREATE INDEX IF NOT EXISTS ix_trades_code ON trades(code)",
-        )
-        .execute(&mut *conn)?;
+        diesel::sql_query("CREATE INDEX IF NOT EXISTS ix_trades_code ON trades(code)")
+            .execute(&mut *conn)?;
 
         // ledger 表（v3 每日净值快照）
         diesel::sql_query(
@@ -437,7 +439,8 @@ impl DatabaseManager {
                 daily_info_count INTEGER DEFAULT 0
             )
             "#,
-        ).execute(&mut *conn)?;
+        )
+        .execute(&mut *conn)?;
 
         // 预测追踪表（Phase 5 预测闭环）
         diesel::sql_query(
@@ -498,7 +501,10 @@ impl DatabaseManager {
                         // 幂等: 列已存在, 跳过 (这是 re-run 期望行为)
                     } else {
                         // 真错误: DB 损坏/权限不足/磁盘满, 显式返回 Err
-                        eprintln!("[DatabaseManager::init_schema] ✗ 真错误 (col_def={}): {}", col_def, e);
+                        eprintln!(
+                            "[DatabaseManager::init_schema] ✗ 真错误 (col_def={}): {}",
+                            col_def, e
+                        );
                         return Err(Box::new(e));
                     }
                 }
@@ -565,8 +571,11 @@ impl DatabaseManager {
             )",
         )
         .execute(&mut *conn)?;
-        diesel::sql_query("CREATE INDEX IF NOT EXISTS idx_account_mode_log_ts ON account_mode_log(ts)")
-            .execute(&mut *conn).ok();
+        diesel::sql_query(
+            "CREATE INDEX IF NOT EXISTS idx_account_mode_log_ts ON account_mode_log(ts)",
+        )
+        .execute(&mut *conn)
+        .ok();
         diesel::sql_query("CREATE INDEX IF NOT EXISTS idx_account_mode_log_new_mode ON account_mode_log(new_mode)")
             .execute(&mut *conn).ok();
 
@@ -594,11 +603,16 @@ impl DatabaseManager {
         diesel::sql_query(
             "CREATE UNIQUE INDEX IF NOT EXISTS uniq_paper_trades_plan_id ON paper_trades(plan_id)",
         )
-        .execute(&mut *conn).ok();
+        .execute(&mut *conn)
+        .ok();
         diesel::sql_query("CREATE INDEX IF NOT EXISTS idx_paper_trades_code ON paper_trades(code)")
-            .execute(&mut *conn).ok();
-        diesel::sql_query("CREATE INDEX IF NOT EXISTS idx_paper_trades_status ON paper_trades(status)")
-            .execute(&mut *conn).ok();
+            .execute(&mut *conn)
+            .ok();
+        diesel::sql_query(
+            "CREATE INDEX IF NOT EXISTS idx_paper_trades_status ON paper_trades(status)",
+        )
+        .execute(&mut *conn)
+        .ok();
 
         // execution_tracking (PR3-3.5)
         diesel::sql_query(
@@ -621,8 +635,11 @@ impl DatabaseManager {
         .execute(&mut *conn)?;
         diesel::sql_query("CREATE INDEX IF NOT EXISTS idx_execution_tracking_plan_id ON execution_tracking(plan_id)")
             .execute(&mut *conn).ok();
-        diesel::sql_query("CREATE INDEX IF NOT EXISTS idx_execution_tracking_code ON execution_tracking(code)")
-            .execute(&mut *conn).ok();
+        diesel::sql_query(
+            "CREATE INDEX IF NOT EXISTS idx_execution_tracking_code ON execution_tracking(code)",
+        )
+        .execute(&mut *conn)
+        .ok();
 
         // position_adjustments (PR3-3.3)
         diesel::sql_query(
@@ -695,7 +712,15 @@ impl DatabaseManager {
         detail: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.save_prediction(
-            pred_date, target_date, theme_name, stock_code, direction, score, detail, None, None,
+            pred_date,
+            target_date,
+            theme_name,
+            stock_code,
+            direction,
+            score,
+            detail,
+            None,
+            None,
         )
     }
 
@@ -713,7 +738,10 @@ impl DatabaseManager {
     }
 
     /// 统计某 reason 的记录数 (用于 sample_threshold 判断)
-    pub fn count_predictions_by_reason(&self, reason: &str) -> Result<i64, Box<dyn std::error::Error>> {
+    pub fn count_predictions_by_reason(
+        &self,
+        reason: &str,
+    ) -> Result<i64, Box<dyn std::error::Error>> {
         let mut conn = self.get_conn()?;
         #[derive(diesel::QueryableByName)]
         struct PredReasonCountRow {
@@ -890,7 +918,8 @@ impl DatabaseManager {
         // 编译期明确 fail-fast, 不允许坏数据进 SQL.
         for c in stock_codes {
             assert!(
-                c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'),
+                c.chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'),
                 "count_recent_pushes_batch: stock_code must be alphanumeric/_/-, got {:?}",
                 c
             );
@@ -1082,16 +1111,19 @@ impl DatabaseManager {
                AND sp.buy_price > 0
                AND sp.sell_price IS NOT NULL
              ORDER BY sp.buy_date DESC
-             LIMIT 500"
+             LIMIT 500",
         )
         .load::<FactorIcRowDb>(&mut conn)?;
 
-        Ok(rows.into_iter().map(|r| FactorIcRow {
-            buy_price: r.buy_price,
-            sell_price: r.sell_price,
-            sentiment_score: r.sentiment_score,
-            score_breakdown_json: r.score_breakdown_json,
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| FactorIcRow {
+                buy_price: r.buy_price,
+                sell_price: r.sell_price,
+                sentiment_score: r.sentiment_score,
+                score_breakdown_json: r.score_breakdown_json,
+            })
+            .collect())
     }
 }
 

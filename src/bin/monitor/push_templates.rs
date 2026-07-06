@@ -1289,6 +1289,61 @@ pub async fn push_preopen_news_hot(code: &str, params: PreopenNewsHotParams<'_>)
     dispatch(crate::notify::PushKind::PreopenNewsHot, code, None, text).await
 }
 
+/// v15.1: 从 chain_daily DB 构造 PreopenNewsHotParams (业务层集成入口)
+/// - themes: 取 clusters 中前 3 个 concept
+/// - watch_stocks: 每个 cluster 取前 3 个 stock code (简化: 无名称)
+/// - news_pairs: 暂空, 需 v15.1+ 集成 news_monitor API 后填充
+pub fn build_preopen_news_hot_from_db<'a>(
+    hhmm: &'a str,
+    clusters: &'a [stock_analysis::database::concepts::ChainDailyRow],
+) -> PreopenNewsHotParams<'a> {
+    let themes: Vec<&str> = clusters.iter().take(3).map(|c| c.concept.as_str()).collect();
+    let theme_1 = themes.first().copied();
+    let theme_2 = themes.get(1).copied();
+    let theme_3 = themes.get(2).copied();
+
+    let watch_stocks: Vec<(&str, &str, &str)> = clusters
+        .iter()
+        .take(3)
+        .filter_map(|c| {
+            // stocks 是 JSON 数组字符串 ["code1","code2",...]
+            // 简化: 取前 3 个 code (无名称, 用 code 作为 reason)
+            let codes: Vec<&str> = c
+                .stocks
+                .trim_matches(|c| c == '[' || c == ']')
+                .split(',')
+                .take(3)
+                .map(|s| s.trim_matches('"').trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            codes.first().map(|code| (*code, *code, c.concept.as_str()))
+        })
+        .collect();
+
+    PreopenNewsHotParams {
+        hhmm,
+        theme_1,
+        theme_2,
+        theme_3,
+        news_pairs: Vec::new(), // TODO: 集成 news_monitor API
+        watch_stocks,
+    }
+}
+
+/// v15.1: 业务层入口 — 09:00 盘前自动调用
+pub async fn dispatch_preopen_news_hot_daily() -> bool {
+    use stock_analysis::database::DatabaseManager;
+    let clusters = DatabaseManager::get().get_latest_chain_clusters();
+    if clusters.is_empty() {
+        log::info!("[P-01] 无主线簇, 跳过推送");
+        return false;
+    }
+    let now = chrono::Local::now();
+    let hhmm = now.format("%H:%M").to_string();
+    let params = build_preopen_news_hot_from_db(&hhmm, &clusters);
+    push_preopen_news_hot("", params).await
+}
+
 /// v13 §14.2 I-01 盘中轮动总览 (⚡交易建议类, 带 banner)
 pub async fn push_intraday_market(
     code: &str,
@@ -3783,6 +3838,58 @@ mod tests {
     #[test] fn gov_candidate_invalidated_cooldown() { assert_eq!(crate::notify::PushKind::CandidateInvalidated.cooldown_secs(), Some(1800)); }
     #[test] fn gov_candidate_invalidated_no_banner() { assert!(!crate::notify::PushKind::CandidateInvalidated.requires_banner()); }
     #[test] fn gov_candidate_invalidated_level() { assert_eq!(crate::notify::PushKind::CandidateInvalidated.level(), crate::notify::PushLevel::Important); }
+
+    // ====== v15.1: P-01 业务层集成测试 ======
+    #[test]
+    fn v15_build_preopen_news_hot_from_db() {
+        use stock_analysis::database::concepts::ChainDailyRow;
+        let clusters = vec![
+            ChainDailyRow {
+                date: "2026-07-06".to_string(),
+                concept: "AI算力".to_string(),
+                stocks: r#"["600000","000001","600519"]"#.to_string(),
+                continuation_count: 3,
+            },
+            ChainDailyRow {
+                date: "2026-07-06".to_string(),
+                concept: "机器人".to_string(),
+                stocks: r#"["000002","000003"]"#.to_string(),
+                continuation_count: 2,
+            },
+        ];
+        let p = build_preopen_news_hot_from_db("09:05", &clusters);
+        assert_eq!(p.hhmm, "09:05");
+        assert_eq!(p.theme_1, Some("AI算力"));
+        assert_eq!(p.theme_2, Some("机器人"));
+        assert_eq!(p.theme_3, None);  // 只有 2 cluster
+        assert_eq!(p.watch_stocks.len(), 2);
+        assert_eq!(p.watch_stocks[0], ("600000", "600000", "AI算力"));
+        assert_eq!(p.news_pairs.len(), 0);  // TODO v15.1+
+    }
+
+    #[test]
+    fn v15_build_preopen_news_hot_empty_db() {
+        use stock_analysis::database::concepts::ChainDailyRow;
+        let clusters: Vec<ChainDailyRow> = vec![];
+        let p = build_preopen_news_hot_from_db("09:05", &clusters);
+        assert!(p.theme_1.is_none());
+        assert!(p.watch_stocks.is_empty());
+        let out = render_preopen_news_hot(p);
+        assert!(out.contains("📰 盘前热点（09:05）"));
+        assert!(!out.contains("主线:"));
+        assert!(!out.contains("关注票:"));
+        assert!(out.ends_with("辅助建议, 非下单指令"));
+    }
+
+    #[test]
+    fn v15_dispatch_preopen_news_hot_daily_no_data() {
+        // 空 DB 时不推送 (graceful no-op)
+        // 实际需要 DB, 此处仅验证 build_* 函数路径, dispatch 行为在 e2e
+        use stock_analysis::database::concepts::ChainDailyRow;
+        let clusters: Vec<ChainDailyRow> = vec![];
+        let p = build_preopen_news_hot_from_db("09:05", &clusters);
+        assert!(p.theme_1.is_none());
+    }
 
     #[test]
     fn evidence_quality_labels() {
