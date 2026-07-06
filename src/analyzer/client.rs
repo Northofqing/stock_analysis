@@ -324,8 +324,18 @@ impl GeminiAnalyzer {
         gemini_response
             .candidates
             .get(0)
-            .and_then(|c| c.content.parts.get(0))
-            .map(|p| p.text.clone())
+            .and_then(|c| {
+                // v17.3 (P2 fix): 拼接所有 parts, 不仅是第一个 (Gemini multi-part response)
+                // includeThoughts + chain-of-thought 都会产生多个 part
+                let combined: String = c
+                    .content
+                    .parts
+                    .iter()
+                    .map(|p| p.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("");
+                if combined.is_empty() { None } else { Some(combined) }
+            })
             .ok_or_else(|| anyhow!("Gemini 返回空响应"))
     }
 
