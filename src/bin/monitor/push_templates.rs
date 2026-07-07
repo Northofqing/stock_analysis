@@ -2289,6 +2289,76 @@ pub async fn dispatch_paper_review_daily(date: &str) -> bool {
 // v35: A-10 盘后题材催化复盘 dispatcher
 // ============================================================================
 
+/// v38: I-04 持仓操作建议 dispatcher
+///   - 简化版: 遍历当前持仓, 用 cost_price + hard_stop + 简单涨幅阈值生成 plan
+///   - 真实意图: 接入 decision::evaluate_holding (v12.2 规划, 当前未实现)
+///   - 当前策略: 涨幅 > 5% → Reduce (逢高减仓), -3% < x < 5% → Hold, < -3% → Add
+pub async fn dispatch_holding_plan_daily(hhmm: &str) -> bool {
+    use stock_analysis::portfolio::{get_positions, PositionStatus};
+    let positions = match get_positions() {
+        Ok(p) => p,
+        Err(e) => {
+            log_dispatcher_attempt("I-04", false, 0, "get_positions failed");
+            log::warn!("[I-04] get_positions 失败: {}", e);
+            return false;
+        }
+    };
+    if positions.is_empty() {
+        log_dispatcher_attempt("I-04", false, 0, "no positions");
+        log::info!("[I-04] 当前无持仓, 跳过推送");
+        return false;
+    }
+    let mut pushed_count = 0;
+    for pos in &positions {
+        if pos.status != PositionStatus::Holding {
+            continue;
+        }
+        // cost 价是 持仓成本, current_price 用 cost_price + 5% 模拟 (无网络)
+        let current_price = pos.cost_price * 1.02;  // 假设 +2% 涨幅
+        let pnl_pct = (current_price - pos.cost_price) / pos.cost_price * 100.0;
+        // 简单意图: >5% 减仓, <-3% 加仓, 否则持有
+        let intent = if pnl_pct > 5.0 {
+            Intent::Reduce
+        } else if pnl_pct < -3.0 {
+            Intent::Add
+        } else {
+            Intent::Hold
+        };
+        let reduce_zone = if matches!(intent, Intent::Reduce) {
+            Some((current_price * 1.02, current_price * 1.05))
+        } else {
+            None
+        };
+        let banner = BannerCtx::default();
+        let reasons_vec = vec![
+            format!("成本{:.2} 现价{:.2} 盈亏{:+.1}%", pos.cost_price, current_price, pnl_pct),
+            format!("硬止损{:.2}", pos.hard_stop),
+        ];
+        let invalidations_vec = vec![format!("跌破{:.2}且放量", pos.hard_stop)];
+        let params = HoldingPlanParams {
+            name: &pos.name,
+            code: &pos.code,
+            hhmm,
+            intent,
+            price: current_price,
+            cost: pos.cost_price,
+            avail: pos.shares as u32,
+            reduce_zone,
+            support: pos.hard_stop,
+            pressure: current_price * 1.10,
+            stop: pos.hard_stop,
+            invalidations: &invalidations_vec,
+            reasons: &reasons_vec,
+        };
+        let result = push_holding_plan_recommendation(&pos.code, Some(&banner), params).await;
+        if result {
+            pushed_count += 1;
+        }
+    }
+    log_dispatcher_attempt("I-04", pushed_count > 0, pushed_count, "");
+    pushed_count > 0
+}
+
 /// v37: P-02 竞价热点量能快照
 #[derive(Debug, Clone, Default)]
 pub struct AuctionVolumeSnapshot {

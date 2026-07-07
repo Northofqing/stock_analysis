@@ -394,7 +394,7 @@ async fn run_daily_pushes() {
         dispatch_preopen_news_hot_daily, dispatch_intraday_market_daily,
         dispatch_news_catalyst_daily, dispatch_industry_chain_intraday_daily,
         dispatch_news_to_idea_daily, dispatch_paper_review_daily,
-        dispatch_catalyst_review_daily,
+        dispatch_catalyst_review_daily, dispatch_holding_plan_daily,
     };
     use stock_analysis::opportunity::scheduler::{OpportunitySchedule, PushWindow};
     // v22: 从 config 读取 push 时刻 (替代写死的 09:00 / 10:30 / 11:00 / 14:30 / 19:00)
@@ -423,11 +423,12 @@ async fn run_daily_pushes() {
             let _ = dispatch_preopen_news_hot_daily().await;
         }
         PushWindow::Intraday => {
-            // 4 个盘中 dispatcher (I-01/I-02/I-03/D-01)
+            // 5 个盘中 dispatcher (I-01/I-02/I-03/I-04/D-01)
             let _ = dispatch_intraday_market_daily(&hhmm, &banner).await;
             let _ = dispatch_news_catalyst_daily(&hhmm, &banner).await;
             let _ = dispatch_industry_chain_intraday_daily(&hhmm, &banner).await;
             let _ = dispatch_news_to_idea_daily(&hhmm, &banner).await;
+            let _ = dispatch_holding_plan_daily(&hhmm).await;
         }
         PushWindow::Evening => {
             let _ = dispatch_paper_review_daily(&date).await;
@@ -3075,6 +3076,7 @@ async fn monitor_loop() {
         let mut last_fund_top_push = std::time::Instant::now(); // 全市场主力净流入Top10（5分钟）
         let mut last_intraday_market = std::time::Instant::now(); // v31: I-01 盘中轮动总览 (10 min)
         let mut last_industry_chain_intraday = std::time::Instant::now(); // v34: I-03 涨停扩散 (15 min)
+        let mut last_holding_plan = std::time::Instant::now(); // v38: I-04 持仓操作建议 (30 min)
                                                                 // 产业链扫描已移至 news_monitor_loop 的 8:00-22:00 窗口统一调度。
         let mut was_limit_up: std::collections::HashSet<String> = std::collections::HashSet::new();
         // 连板追踪：已推送过的标的不重复推送；board_level_cache 存 1=首板/2=二板/3+=三板
@@ -3966,6 +3968,19 @@ async fn monitor_loop() {
                         let hhmm = chrono::Local::now().format("%H:%M").to_string();
                         let _ = dispatch_industry_chain_intraday_daily(&hhmm, &banner).await;
                         last_industry_chain_intraday = std::time::Instant::now();
+                    }
+
+                    // ═══════════════════════════════════════════════════════════════
+                    // v38: I-04 持仓操作建议 (30 min 周期, v12 §14.5 冷却 30 min/票)
+                    //   - 遍历当前持仓, 用 cost/hard_stop 生成 plan
+                    //   - 简化版: 涨幅 >5% 减仓, <-3% 加仓, 否则持有
+                    //   - 真实意图: 接入 decision::evaluate_holding (v12.2 规划)
+                    //   - 静默: 无持仓时短路
+                    // ═══════════════════════════════════════════════════════════════
+                    if last_holding_plan.elapsed().as_secs() >= 1800 {
+                        let hhmm = chrono::Local::now().format("%H:%M").to_string();
+                        let _ = push_templates::dispatch_holding_plan_daily(&hhmm).await;
+                        last_holding_plan = std::time::Instant::now();
                     }
                 }
             }
