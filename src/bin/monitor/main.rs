@@ -752,6 +752,14 @@ async fn main() {
         log::info!("[复盘] v12 模板已替代老市场概览推送");
         // 干净退出 (避免 runtime drop panic)
         std::process::exit(0);
+    } else if push_mode {
+        // v30: --push 模式 (修复 v22 死代码)
+        //   调 6 dispatcher 一次后退出, 时刻读 config/strategy.toml [schedule]
+        //   替代 v17.6 写死的 09:00 / 10:30 / 11:00 / 14:30 / 19:00
+        log::info!("[v30] --push 模式启动");
+        run_daily_pushes().await;
+        log::info!("[v30] --push 完成");
+        std::process::exit(0);
     } else {
         // 订阅者示例：独立任务消费告警/扫描事件并写入审计日志，
         // 与告警推送（生产者）完全解耦——新增消费者无需改动 push_wechat。
