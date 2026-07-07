@@ -3876,7 +3876,8 @@ async fn monitor_loop() {
                         if let Some(ref recs) = recs {
                             for rec in recs {
                                 log::info!("[选股] {}", rec);
-                                notify::push_governor(rec, notify::PushKind::StockPick).await;
+                                // v57: 改用 D-01 NewsToIdea PushKind (合并 StockPick)
+                                notify::push_governor(rec, notify::PushKind::NewsToIdea).await;
                             }
                         }
                     }
@@ -4217,8 +4218,9 @@ async fn monitor_loop() {
         push_wechat(&review_report).await;
 
         // 盘后独立维度：优选次日候选（最多 5 只，达不到阈值可少推/不推），强调可解释性，不复用盘中量能信号口径。
+        // v57: 改用 A-08 TomorrowWatch PushKind (合并 OptimalClose)
         let post_close_candidates = stock_analysis::opportunity::run_post_close_candidates(5).await;
-        notify::push_governor(&post_close_candidates, notify::PushKind::OptimalClose).await;
+        notify::push_governor(&post_close_candidates, notify::PushKind::TomorrowWatch).await;
 
         // 盘后统计上一交易日虚拟观察仓表现（可配置开关）
         push_virtual_next_day_review_if_needed().await;
