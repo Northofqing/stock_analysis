@@ -2442,6 +2442,49 @@ pub async fn dispatch_etf_closing_call_auction(
     result
 }
 
+/// v48: T-18 创业板大宗盘中确认 dispatcher
+///   - 新规 2026-07-06: 创业板大宗盘中实时确认 (与科创板一致)
+///   - 触发: 大宗成交回报 event
+///   - 数据源: 大宗成交回报
+pub async fn dispatch_block_trade_intraday_confirm(
+    hhmm: &str,
+    name: &str,
+    code: &str,
+    qty: u32,
+    price: f64,
+    block_type: BlockType,
+    board: Board,
+    real_time_confirm: bool,
+    next_session_settle: SettleType,
+) -> bool {
+    let params = BlockTradeIntradayConfirmParams {
+        hhmm,
+        name,
+        code,
+        qty,
+        price,
+        block_type,
+        board,
+        real_time_confirm,
+        next_session_settle,
+    };
+    let text = render_block_trade_intraday_confirm(params);
+    let result = dispatch(
+        crate::notify::PushKind::BlockTradeIntradayConfirm,
+        code,
+        None,
+        text,
+    )
+    .await;
+    log_dispatcher_attempt(
+        "T-18",
+        result,
+        1,
+        &format!("board={:?} block={:?}", board, block_type),
+    );
+    result
+}
+
 /// v40: P-04 虚拟盘成交 dispatcher 包装
 pub async fn push_paper_trade(code: &str, params: PaperTradeParams<'_>) -> bool {
     let text = render_paper_trade(params);
@@ -3695,12 +3738,14 @@ pub fn render_etf_closing_call_auction(p: EtfClosingCallAuctionParams<'_>) -> St
 }
 
 /// v13.1 §5.6 大宗类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockType {
     Agreed,      // 协议大宗
     Competitive, // 竞价大宗
 }
 
 /// v13.1 §5.6 板块
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Board {
     GEM,  // 创业板
     STAR, // 科创板
@@ -3708,6 +3753,7 @@ pub enum Board {
 }
 
 /// v13.1 §5.6 清算节奏
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettleType {
     NextSession, // 次日
     RealTime,    // 实时
