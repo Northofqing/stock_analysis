@@ -391,3 +391,41 @@ cat data/dry_run_report.json | jq '.by_kind[] | select(.kind | contains("NewsToI
 - v22 `run_daily_pushes()` 6 dispatcher 调度参考
 - 现有 NewsRanked 推送 (`src/bin/monitor/main.rs:2770-2773`)
 - v26 dry-run 报告 (`src/bin/monitor/dryrun_report.rs`)
+
+---
+
+## 11. 实现日志 (2026-07-07)
+
+**实际改动**:
+- `src/bin/monitor/push_templates.rs`: +69 行 (memo static + 检查 + 测试, Tasks 1+2)
+- `src/bin/monitor/main.rs`: +21 行 (news_monitor_loop 触发块, Task 3)
+- **合计: +90 行, 2 文件**
+
+**测试**: 893 lib + 184 monitor → 893 lib + 185 monitor (+1 memo 容器测试)
+
+**Commits**:
+1. `0db806c` feat(v29.1): D-01 dispatcher memo 静态容器 + 单元测试
+2. `f1665de` feat(v29.2): dispatch_news_to_idea_daily 加 memo 1h/票 检查
+3. `13a0f2a` feat(v29.3): news_monitor_loop 触发 D-01 dispatcher (事件驱动)
+
+**端到端验证 (2026-07-07 11:16)**:
+- `cargo test --lib`: 893 passed; 0 failed; 2 ignored
+- `cargo test --bin monitor`: 185 passed; 0 failed
+- `cargo build --release --bin monitor`: clean
+- `monitor --test --v13-diag`: D-01 load_news_to_idea empty (沙箱无网络, 候选台返回 default, 链路通)
+
+**任务 review 状态**:
+- Task 1: ✅ APPROVED (reviewer 0 Critical, 0 Important, 3 Minor cosmetic)
+- Task 2: ✅ APPROVED (reviewer 0 Critical, 0 Important, 3 Minor)
+- Task 3: ✅ APPROVED (reviewer 0 Critical, 0 Important, 0 Minor)
+
+**实施中的偏差** (与 plan 差异):
+- Plan 写 "894 lib tests", 实际是 "185 monitor tests" (push_templates.rs 在 monitor binary, 不在 lib)
+- Plan Task 3 头部说"嵌套在 `if !pushed.is_empty()` 块内", Step 1 代码说是"在 closing brace 后 top-level" — 实现遵循代码, top-level 是正确选择 (语义等价, 避免双重 `if !pushed.is_empty()`)
+- 3 个 Minor cosmetic (imports 位置 / `last.elapsed().as_secs()` 截断) — 不影响功能
+
+**未做** (后续 PR):
+- 盘前 P-01~P-04 / 盘中 I-01~I-04 / 盘后 A-10 模板接入
+- `run_daily_pushes()` 未被调用 (--push 模式完全失效)
+- AccountMode 评估接横幅 (DataMode 写死 Full)
+- v13.27 端到端诊断中 I-01 load_sector panic (与 v29 无关, 已知问题)
