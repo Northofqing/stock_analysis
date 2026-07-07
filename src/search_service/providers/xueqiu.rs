@@ -54,8 +54,7 @@ impl XueqiuProvider {
 
     /// 拉取单 category 的快讯
     async fn fetch_category(&self, category: u32, count: usize) -> Result<Vec<SearchResult>> {
-        // v21: 雪球公开时间线 API
-        // category=6 是 A 股快讯; count 是返回条数
+        // v25.2: 雪球 API 参数是 count (不是 num) - 修正
         let url = format!(
             "https://xueqiu.com/v4/statuses/public_timeline_by_category.json?category={}&count={}&page=1",
             category, count
@@ -63,16 +62,14 @@ impl XueqiuProvider {
 
         #[derive(Deserialize, Debug)]
         struct StatusItem {
-            #[serde(rename = "title")]
-            title: Option<String>,
-            #[serde(rename = "description")]
-            description: Option<String>,
+            #[serde(rename = "text")]
+            text: Option<String>,  // 雪球 API 实际用 text 字段 (不是 title)
+            #[serde(rename = "data")]
+            data: Option<String>,   // JSON 字符串, 含 status_id
             #[serde(rename = "target")]
-            target: Option<String>,  // 雪球原文链接
+            target: Option<String>,
             #[serde(rename = "created_at")]
-            created_at: Option<i64>,  // 毫秒时间戳
-            #[serde(rename = "user")]
-            user: Option<StatusUser>,
+            created_at: Option<i64>,
         }
 
         #[derive(Deserialize, Debug)]
@@ -83,15 +80,27 @@ impl XueqiuProvider {
 
         #[derive(Deserialize, Debug)]
         struct Resp {
-            #[serde(rename = "statuses")]
-            statuses: Option<Vec<StatusItem>>,
+            #[serde(rename = "list")]  // 雪球 API 用 list 不是 statuses
+            list: Option<Vec<StatusItem>>,
         }
 
-        let resp: Resp = self
-            .client
-            .get(&url)
-            .header("Referer", "https://xueqiu.com/")
-            .header("Origin", "https://xueqiu.com")
+        // v21.1: 读 XUEQIU_COOKIE env var, 设 Cookie 头 (雪球公共 timeline 实际需 auth)
+        // 部署: export XUEQIU_COOKIE="xq_a_token=...; xq_r_token=..."
+        // 安全: 严禁 hardcode 在源码/提交到 git
+        // v25.1: 移除 Referer/Origin (curl 测试表明这些 header 触发雪球反爬),
+        //        只用最简 User-Agent + Cookie
+        let mut req = self.client.get(&url).header("User-Agent", "Mozilla/5.0");
+        if let Ok(cookie) = std::env::var("XUEQIU_COOKIE") {
+            if !cookie.is_empty() {
+                log::info!("[xueqiu] 使用 cookie ({} bytes)", cookie.len());
+                req = req.header("Cookie", cookie);
+            } else {
+                log::warn!("[xueqiu] XUEQIU_COOKIE env 已设置但为空");
+            }
+        } else {
+            log::warn!("[xueqiu] XUEQIU_COOKIE 未设置, 可能被反爬");
+        }
+        let resp: Resp = req
             .send()
             .await
             .with_context(|| format!("雪球 category={} 请求失败", category))?
@@ -101,8 +110,9 @@ impl XueqiuProvider {
 
         let now = chrono::Local::now().timestamp_millis();
         let mut results: Vec<SearchResult> = Vec::new();
-        for item in resp.statuses.unwrap_or_default() {
-            let title = match item.title.filter(|t| !t.is_empty()) {
+        for item in resp.list.unwrap_or_default() {
+            // 雪球 API: text 字段直接是快讯内容, 不在 data 里
+            let title = match item.text.filter(|t| !t.is_empty()) {
                 Some(t) => t,
                 None => continue,
             };
@@ -117,16 +127,16 @@ impl XueqiuProvider {
                 chrono::DateTime::from_timestamp(ts_ms / 1000, 0)
                     .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M").to_string())
             });
-            let snippet = item
-                .description
-                .filter(|s| !s.is_empty())
-                .map(|d| strip_html_tags(&d))
-                .unwrap_or_else(|| title.chars().take(140).collect());
-            let url = item
-                .target
-                .filter(|u| !u.is_empty())
-                .unwrap_or_else(|| format!("https://xueqiu.com/snowman/category/{}/detail", category));
-            let user = item.user.and_then(|u| u.screen_name).unwrap_or_default();
+            // v21.1: 雪球 API text 即快讯内容, 不需要再清洗 HTML
+            let snippet: String = title.chars().take(140).collect();
+            // v21.1: 必须先取 target (避免 move 问题) - 后续 url/user 都用
+            let target_str = item.target.as_deref().unwrap_or("").to_string();
+            let url = if !target_str.is_empty() {
+                target_str.clone()
+            } else {
+                format!("https://xueqiu.com/snowman/category/{}/detail", category)
+            };
+            let user = target_str.rsplit('/').next().unwrap_or("").to_string();
             let source_label = if user.is_empty() {
                 format!("雪球(cat={})", category)
             } else {

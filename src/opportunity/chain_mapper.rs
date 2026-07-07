@@ -621,37 +621,13 @@ mod tests {
     }
 
     // BR-006 (2026-06-29): 0% 胜率主题关停, chain_mapper 加载规则时跳过 enabled=false.
-    // 修正 (PR-3 数据回灌后): 之前误关的 6 个主题 (AI硬件-CPO / AI硬件-MLCC /
-    // AI算力 / 创新药-CXO / Rubin / 半导体-制造代工) 真实胜率非 0%, 已重新开启.
-    // 测试更新: 只验证当前真 0% 关停主题 (5 个) 不命中.
-    #[test]
-    fn test_br006_disabled_chains_excluded() {
-        // 真 0% 关停主题: 这些关键词在历史 prediction_tracker 里 100% 未命中,
-        // 应被关停 (即使关键词完全匹配, 也不命中).
-        let fluid_hits = map_news_to_chains("AI液冷服务器出货量翻倍，散热需求爆发");
-        assert!(
-            !fluid_hits.iter().any(|h| h.chain == "AI硬件-液冷"),
-            "BR-006: AI硬件-液冷 (0% 胜率) 应被关停"
-        );
-
-        let pkg_hits = map_news_to_chains("先进封装Chiplet量产，CoWoS产能扩张");
-        assert!(
-            !pkg_hits.iter().any(|h| h.chain == "半导体-先进封装"),
-            "BR-006: 半导体-先进封装 (0% 胜率) 应被关停"
-        );
-
-        let consumer_hits = map_news_to_chains("AI智能手机换机周期，消费电子产业链复苏");
-        assert!(
-            !consumer_hits.iter().any(|h| h.chain == "消费电子"),
-            "BR-006: 消费电子 (0% 胜率) 应被关停"
-        );
-
-        let rare_hits = map_news_to_chains("稀土永磁钕铁硼价格上涨，磁材供需缺口扩大");
-        assert!(
-            !rare_hits.iter().any(|h| h.chain == "稀土永磁"),
-            "BR-006: 稀土永磁 (0% 胜率) 应被关停"
-        );
-    }
+    //
+    // v24 状态: 用户要求重开 7 个关停主题 (AI硬件-液冷/半导体-先进封装/消费电子/
+    // 稀土永磁/新能源-电池/稀有金属/AI硬件-液冷副本), 全部 enabled=true.
+    // 当前 chain.toml 86 条规则全部 enabled, BR-006 关停池为空.
+    //
+    // 此测试在 v24 已被废除 (无法验证不存在的关停主题).
+    // 如未来新增 BR-006 关停主题, 恢复本测试并按需加新 case.
 
     // BR-006 加权: PCB 真实胜率 44.4% (12/27), priority 90→95.
     // 测试: PCB 新闻仍命中 (PCB 启用, 仅 priority 提高).
