@@ -356,6 +356,19 @@ impl PushLevel {
     }
 }
 
+/// v42: 推送冷却 memo (按 PushKind 维度, §14.5 治理强制)
+/// key = format!("{}_{}", kind, code) - 票级别冷却用 (e.g. T-07 1次/票/日)
+use std::sync::Mutex;
+use once_cell::sync::Lazy;
+static COOLDOWN_MEMO: Lazy<Mutex<std::collections::HashMap<String, std::time::Instant>>> =
+    Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// v42: 测试用 — 重置冷却 memo
+#[cfg(test)]
+pub fn _reset_cooldown_memo_for_test() {
+    COOLDOWN_MEMO.lock().unwrap().clear();
+}
+
 /// v11-P0-4 commit D: 推送治理入口
 ///
 /// 根据 `PushKind` + `PUSH_VERBOSE` env var 决定:
@@ -365,7 +378,27 @@ impl PushLevel {
 /// PUSH_VERBOSE=true 恢复旧行为 (留退路, shadow 切换验证用)
 /// v19.12: 全部保留 true (用户要求去掉条件限制, 所有模板都推送)
 /// PUSH_VERBOSE 已废: 之前用来切换 deprecated 模板, 现在 deprecated=0 所以无需开关
+///
+/// v42: 接入 §14.5 治理 — 按 cooldown_secs 强制冷却
 pub async fn push_governor(text: &str, kind: PushKind) -> bool {
+    // v42: 冷却检查 (按 PushKind 维度, 不按票 — 票级冷却由 dispatcher memo 负责)
+    if let Some(cooldown_secs) = kind.cooldown_secs() {
+        let key = format!("{:?}", kind);
+        let mut map = COOLDOWN_MEMO.lock().unwrap();
+        if let Some(last) = map.get(&key) {
+            let elapsed = last.elapsed().as_secs();
+            if elapsed < cooldown_secs as u64 {
+                log::debug!(
+                    "[v42 cooldown] {:?} 冷却中, 跳过推送 (剩余 {}s / 总 {}s)",
+                    kind,
+                    cooldown_secs as u64 - elapsed,
+                    cooldown_secs
+                );
+                return false;
+            }
+        }
+        map.insert(key, std::time::Instant::now());
+    }
     push_wechat(text).await
 }
 
@@ -1561,7 +1594,9 @@ mod tests {
     /// v19.12 起所有变体均保留, 此测试验证 push_governor 对保留的 AuctionVolume 返回 true
     /// (旧测试期望降级返回 false, 已废弃; commit 6cffecf fix(v19.12))
     #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
     async fn push_governor_deprecated_no_push() {
+        _reset_cooldown_memo_for_test(); // v42
         std::env::set_var("V10_DRY_RUN_PUSH", "1"); // dry-run 模式返回 true
         let r = push_governor("test kept", PushKind::AuctionVolume).await;
         assert!(
@@ -1572,16 +1607,39 @@ mod tests {
 
     /// push_governor 保留时调 push_wechat (返回 V10_DRY_RUN_PUSH=true 时为 true)
     #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
     async fn push_governor_kept_calls_push_wechat() {
+        _reset_cooldown_memo_for_test(); // v42
         std::env::set_var("V10_DRY_RUN_PUSH", "1"); // push_wechat 走 dry-run 返回 true
         let r = push_governor("test kept", PushKind::HoldingEvent).await;
         assert!(r, "保留应调 push_wechat (V10_DRY_RUN_PUSH=true 返回 true)");
         std::env::remove_var("V10_DRY_RUN_PUSH");
     }
 
+    // v42: 冷却强制 — 同一 PushKind 第二次立即调应被冷却挡
+    #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
+    async fn push_governor_cooldown_blocks_rapid_repeat() {
+        use std::env;
+        _reset_cooldown_memo_for_test();
+        env::set_var("V10_DRY_RUN_PUSH", "1");
+        // 用 HoldingPlan (30 min 冷却), 隔离度高
+        let r1 = push_governor("first", PushKind::HoldingPlan).await;
+        assert!(r1, "首次应通过 (dry-run 返回 true)");
+        let r2 = push_governor("second", PushKind::HoldingPlan).await;
+        assert!(
+            !r2,
+            "30 min 冷却内重复调应被挡 (cooldown memo 命中)"
+        );
+        env::remove_var("V10_DRY_RUN_PUSH");
+    }
+
     /// PUSH_VERBOSE=true 覆盖降级 → 调 push_wechat
     #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
     async fn push_verbose_true_overrides_deprecated() {
+        // v42: 重置冷却 memo 避免测试间污染
+        _reset_cooldown_memo_for_test();
         std::env::set_var("V10_DRY_RUN_PUSH", "1");
         std::env::set_var("PUSH_VERBOSE", "true");
         let r = push_governor("test verbose", PushKind::AuctionVolume).await;
