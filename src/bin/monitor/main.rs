@@ -2824,6 +2824,11 @@ async fn e2e_all_templates_run() {
     log::info!("[v70] 3/3 跑盘中 14.x 模板 (mock fallback)");
     push_e2e_14x_templates(&today_str, &hhmm).await;
 
+    // 4. 跑 v12 §14.1 + 14.2 新闻模块 (D-01 / I-02) — mock data 推
+    //   news_monitor_loop 真实路径需有公告源 (沙箱无), 这里 e2e 直接走 dispatcher mock
+    log::info!("[v70] 4/4 跑新闻模块 (D-01 / I-02 mock fallback)");
+    push_e2e_news_modules(&hhmm).await;
+
     log::info!("[v70] E2E 完成 — 检查 data/push_log/{}/ 查所有推送", today_str);
 }
 
@@ -2860,6 +2865,45 @@ fn seed_e2e_data_via_sqlite(date: &str) {
         ('002208','合肥城建','sell',17.50,200,3500.0,'止损卖出','{date} 14:35:00');"#
     );
     let _ = Command::new("sqlite3").args([db_path, &trades_sql]).output();
+}
+
+/// v70: 推新闻模块 (D-01 / I-02) — mock fallback
+///   news_monitor_loop 真实路径需公告源 (沙箱无), 这里直接走 dispatcher mock
+///   公告数据 mock: 3 主题 + 2 票 (覆盖 D-01 + I-02)
+async fn push_e2e_news_modules(hhmm: &str) {
+    use push_templates as pt;
+    // D-01 新闻驱动个股 (mock)
+    let d01 = pt::render_news_to_idea(
+        &pt::BannerCtx::default(),
+        pt::NewsToIdeaParams {
+            hhmm,
+            headline: "002916 净利润 +45% 超预期",
+            theme: Some("AI 算力"),
+            stage: pt::NewsStage::Starting,
+            name: "深南电路",
+            code: "002916",
+            reasons: vec!["PCB 涨价 12%", "算力国产替代加速"],
+            action: Some(pt::NewsAction::BuyDip),
+        },
+    );
+    log::info!("[v70] D-01 推 ({} 字)", d01.chars().count());
+    let _ = notify::push_governor(&d01, notify::PushKind::NewsToIdea).await;
+
+    // I-02 新闻催化映射 (mock)
+    let i02 = pt::render_news_catalyst(
+        &pt::BannerCtx::default(),
+        pt::NewsCatalystParams {
+            hhmm,
+            headline: "DeepSeek V4 发布, AI 算力国产替代加速",
+            theme: Some("AI 算力"),
+            stocks: vec![
+                ("深南电路", "002916", Some(10.0), "PCB 龙头, Q1 业绩超预期"),
+                ("沪电股份", "002463", Some(9.5), "800G 交换机 PCB 受益"),
+            ],
+        },
+    );
+    log::info!("[v70] I-02 推 ({} 字)", i02.chars().count());
+    let _ = notify::push_governor(&i02, notify::PushKind::NewsCatalyst).await;
 }
 
 /// v70: 推所有盘中 14.x 模板 (mock fallback)
