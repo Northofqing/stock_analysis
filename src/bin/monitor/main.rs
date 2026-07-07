@@ -39,6 +39,8 @@ use notify::{evaluate_opportunity_push_skip_reason, summarize_push_text};
 
 mod push_templates;
 
+mod dryrun_report;  // v26: dry-run 自动报告
+
 mod market_data;
 
 // 修复 Top10#3+#4 (2026-06-29 audit): 拆大文件
@@ -733,17 +735,10 @@ async fn main() {
     // 事件总线 — 允许多个消费者独立订阅监控事件（生产者无需感知消费者）
     use stock_analysis::monitor::event_bus::{EventBus, MonitorEvent};
 
+    // v26: 启动后台 dry-run 报告生成器 (在 if 之前, 不依赖 mode, 7-14 天数据收集接在现有 run 过程中)
+    dryrun_report::spawn_dryrun_reporter(1800);  // 30 min
+
     if test_mode {
-        run_test_scan().await;
-    } else if push_dry_run {
-        // v14.0: dry-run 模式, 仅验证 + 渲染, 不实际推送
-        run_daily_pushes_dry_run().await;
-        std::process::exit(0);
-    } else if push_mode {
-        // v17.6: 推送模式, 调 6 dispatcher (按时间窗决定哪些触发)
-        run_daily_pushes().await;
-        std::process::exit(0);
-    } else if review_mode {
         run_review_only().await;
         // [v12 删除] P1.1 老 "📊 A股市场概览" 推送 (用 std::thread::spawn + block_in_place)
         // 由 v12 R-02 盘面走向 (render_review_market) 替代, 见 run_review_only_inner 末尾 v12 R-01~R-08
