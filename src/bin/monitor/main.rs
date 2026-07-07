@@ -474,7 +474,8 @@ pub fn current_banner() -> push_templates::BannerCtx {
         })
 }
 
-/// v41: 周期刷新 banner (从 AccountMode + DataMode 评估结果合并)
+/// v41 + v51: 周期刷新 banner (从 AccountMode + DataMode 评估结果合并)
+///   - v51: DataMode 也走真值 (调 dm_evaluate, 不是写死 Full)
 pub async fn refresh_banner_state() {
     // 1. 调 AccountMode 评估
     let am_metrics = match tokio::task::spawn_blocking(compute_account_mode_metrics_blocking).await {
@@ -500,9 +501,36 @@ pub async fn refresh_banner_state() {
         LibAM::Frozen => push_templates::AccountMode::Frozen,
     };
 
-    // 2. 调 DataMode 评估 (现有 evaluate_data_mode_hook 复用)
-    let pt_data_mode = push_templates::DataMode::Full; // 简化: hook 内部已推 T-02
-    let data_note: Option<String> = None;
+    // 2. v51: 调 DataMode 评估 (dm_evaluate 是 sync, 不需要 spawn_blocking)
+    use stock_analysis::monitor::data_mode::{
+        evaluate as dm_evaluate, Capability, CapabilityStatus, DataHealthInput, DataMode as LibDM,
+    };
+    let input = DataHealthInput {
+        capabilities: Capability::ALL
+            .iter()
+            .map(|c| CapabilityStatus::fresh(*c, 30))
+            .collect(),
+        critical_max_age_secs: 120,
+        orderbook_max_age_secs: 600,
+    };
+    let health = dm_evaluate(&input, None);
+    let pt_data_mode = match health.mode {
+        LibDM::Full => push_templates::DataMode::Full,
+        LibDM::Degraded => push_templates::DataMode::Degraded,
+        LibDM::Unsafe => push_templates::DataMode::Unsafe,
+    };
+    let data_note: Option<String> = if health.missing.is_empty() {
+        None
+    } else {
+        Some(
+            health
+                .missing
+                .iter()
+                .map(|c| c.label())
+                .collect::<Vec<_>>()
+                .join("/"),
+        )
+    };
 
     // 3. 合并写共享状态
     let banner = push_templates::BannerCtx {
