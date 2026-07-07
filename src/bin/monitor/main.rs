@@ -428,7 +428,7 @@ async fn run_daily_pushes() {
             let _ = dispatch_news_catalyst_daily(&hhmm, &banner).await;
             let _ = dispatch_industry_chain_intraday_daily(&hhmm, &banner).await;
             let _ = dispatch_news_to_idea_daily(&hhmm, &banner).await;
-            let _ = dispatch_holding_plan_daily(&hhmm).await;
+            let _ = dispatch_holding_plan_daily(&hhmm, &banner).await;
         }
         PushWindow::Evening => {
             let _ = dispatch_paper_review_daily(&date).await;
@@ -543,6 +543,62 @@ pub async fn refresh_banner_state() {
     *LATEST_BANNER.lock().unwrap() = Some(banner);
 }
 
+/// v60 (F10): refresh_banner_state 复用版 — 接受已算的 metrics, 避免重复 DB 查询
+///   - 旧 refresh_banner_state: 每次调都重新算 metrics (2x spawn_blocking)
+///   - 新 refresh_banner_state_with_metrics: 复用 caller 算好的 metrics, 1x dm_evaluate
+///   - 由 evaluate_account_mode_hook 调用 (caller 已有 metrics, 复用)
+pub async fn refresh_banner_state_with_metrics(
+    am_metrics: &stock_analysis::risk::account_mode::PortfolioMetrics,
+    lib_mode: stock_analysis::risk::action_gate::AccountMode,
+) {
+    let pt_mode = match lib_mode {
+        stock_analysis::risk::action_gate::AccountMode::Normal => push_templates::AccountMode::Normal,
+        stock_analysis::risk::action_gate::AccountMode::ReduceOnly => {
+            push_templates::AccountMode::ReduceOnly
+        }
+        stock_analysis::risk::action_gate::AccountMode::Frozen => push_templates::AccountMode::Frozen,
+    };
+
+    use stock_analysis::monitor::data_mode::{
+        evaluate as dm_evaluate, Capability, CapabilityStatus, DataHealthInput, DataMode as LibDM,
+    };
+    let input = DataHealthInput {
+        capabilities: Capability::ALL
+            .iter()
+            .map(|c| CapabilityStatus::fresh(*c, 30))
+            .collect(),
+        critical_max_age_secs: 120,
+        orderbook_max_age_secs: 600,
+    };
+    let health = dm_evaluate(&input, None);
+    let pt_data_mode = match health.mode {
+        LibDM::Full => push_templates::DataMode::Full,
+        LibDM::Degraded => push_templates::DataMode::Degraded,
+        LibDM::Unsafe => push_templates::DataMode::Unsafe,
+    };
+    let data_note: Option<String> = if health.missing.is_empty() {
+        None
+    } else {
+        Some(
+            health
+                .missing
+                .iter()
+                .map(|c| c.label())
+                .collect::<Vec<_>>()
+                .join("/"),
+        )
+    };
+
+    let banner = push_templates::BannerCtx {
+        account_mode: pt_mode,
+        total_pos: am_metrics.total_pos_cheng,
+        today_pnl: am_metrics.today_pnl_pct,
+        data_mode: pt_data_mode,
+        data_missing_note: data_note,
+    };
+    *LATEST_BANNER.lock().unwrap() = Some(banner);
+}
+
 /// v12 PR1-1.7: 在 monitor 主循环调用, 重算 AccountMode 并按需推 T-01.
 ///
 /// 触发点:
@@ -614,8 +670,9 @@ async fn evaluate_account_mode_hook(startup: bool) {
     // 抑制 unused 警告 (startup 仅用于 log 区分)
     let _ = startup;
 
-    // v41: 周期刷新共享 banner (写 LATEST_BANNER)
-    refresh_banner_state().await;
+    // v41 + v60: 复用已算的 metrics (F10 修复 — 避免 refresh_banner_state 重复 DB 查询)
+    let lib_mode_for_banner = prev.unwrap_or(AccountMode::Normal);
+    refresh_banner_state_with_metrics(&metrics, lib_mode_for_banner).await;
 }
 
 fn parse_mode_label(label: &str) -> Option<stock_analysis::risk::action_gate::AccountMode> {
@@ -2884,13 +2941,18 @@ async fn news_monitor_loop() {
         }
 
         // ═══════════════════════════════════════════════════════════════
-        // v29: D-01 新闻驱动个股推送 (事件驱动)
+        // v29 + v60: D-01 新闻驱动个股推送 (事件驱动)
         //   - 触发: pushed 不空 (有重要公告/事件) 时, 每轮 news_monitor_loop 调一次
+        //   - v60 F9: 加 AlertLevel::Important 过滤 (NewsRanker line 2830 已有)
+        //     - 低优先级 Info 事件不再触发 D-01 1h memo slot
         //   - 去重: dispatcher memo 1h/票 + push_governor 20min 冷却 (v12 §14.5)
         //   - 数据源: 候选台 (5 源合并) - 与 NewsRanked 公告影子 rank 互补
         //   - 静默: 候选台空时短路返回, log
         // ═══════════════════════════════════════════════════════════════
-        if !pushed.is_empty() {
+        let has_important: bool = pushed
+            .iter()
+            .any(|ev| ev.level >= stock_analysis::monitor::detector::AlertLevel::Important);
+        if has_important {
             use push_templates::dispatch_news_to_idea_daily;
             // v41: 读共享 banner (替换写死)
             let banner = current_banner();
@@ -2900,14 +2962,15 @@ async fn news_monitor_loop() {
         }
 
         // ═══════════════════════════════════════════════════════════════
-        // v33: I-02 新闻催化映射 (事件驱动, 同 D-01 时机)
+        // v33 + v60: I-02 新闻催化映射 (事件驱动, 同 D-01 时机)
         //   - 触发: pushed 不空 (有重要公告) 时, 调一次
+        //   - v60 F9: 加 AlertLevel::Important 过滤
         //   - 数据源: load_news_catalyst_snapshot_real (公告 + 板块聚类)
         //   - 模板: render_news_catalyst (带 banner)
         //   - 静默: 公告空时短路
         //   - 与 D-01 互补: D-01 推个股, I-02 推板块
         // ═══════════════════════════════════════════════════════════════
-        if !pushed.is_empty() {
+        if has_important {
             use push_templates::dispatch_news_catalyst_daily;
             // v41: 读共享 banner
             let banner = current_banner();
@@ -3218,7 +3281,8 @@ async fn monitor_loop() {
                     let _ = push_templates::dispatch_preopen_news_hot_daily().await;
                     // v39: P-03 候选触发 (同盘前窗口, 影子开关控制)
                     let hhmm = chrono::Local::now().format("%H:%M").to_string();
-                    let _ = push_templates::dispatch_candidate_triggered_daily(&hhmm).await;
+                    let banner = current_banner();
+                    let _ = push_templates::dispatch_candidate_triggered_daily(&hhmm, &banner).await;
                     preopen_pushed = true;
                 }
             }
@@ -3286,7 +3350,8 @@ async fn monitor_loop() {
                             for s in &new_items {
                                 auction_vol_notified.insert(s.code.clone());
                             }
-                            let _ = push_templates::dispatch_auction_volume_daily(&ts).await;
+                            let banner = current_banner();
+                            let _ = push_templates::dispatch_auction_volume_daily(&ts, &banner).await;
                         }
                     }
 
@@ -4100,24 +4165,27 @@ async fn monitor_loop() {
                     // ═══════════════════════════════════════════════════════════════
                     if last_holding_plan.elapsed().as_secs() >= 1800 {
                         let hhmm = chrono::Local::now().format("%H:%M").to_string();
-                        let _ = push_templates::dispatch_holding_plan_daily(&hhmm).await;
+                        let banner = current_banner();
+                        let _ = push_templates::dispatch_holding_plan_daily(&hhmm, &banner).await;
                         last_holding_plan = std::time::Instant::now();
                     }
 
                     // ═══════════════════════════════════════════════════════════════
-                    // v44 + v54: T-14/T-15 trade_pipeline 调度
-                    //   - 15 min (T-14) + 5 min (T-15) 轮询 trade_pipeline
+                    // v44 + v54 + v60: T-14/T-15 trade_pipeline 调度 (F8 拆分)
+                    //   - T-14 (15 min) 调 dispatch_trade_pipeline_orders (只 order events)
+                    //   - T-15 (5 min) 调 dispatch_trade_pipeline_fills (只 fill events)
+                    //   - 拆分后 5 min T-15 不会再扫 order events (旧 bug 3x 工作量)
                     //   - 沙箱: trade_pipeline 空, 静默短路
                     //   - 真实 intent: broker 委托/成交回报 event
                     if last_post_fixed_order.elapsed().as_secs() >= 900 {
                         let hhmm = chrono::Local::now().format("%H:%M").to_string();
-                        let _ = push_templates::dispatch_trade_pipeline_daily(&hhmm).await;
+                        let _ = push_templates::dispatch_trade_pipeline_orders(&hhmm).await;
                         last_post_fixed_order = std::time::Instant::now();
                     }
 
                     if last_post_fixed_fill.elapsed().as_secs() >= 300 {
                         let hhmm = chrono::Local::now().format("%H:%M").to_string();
-                        let _ = push_templates::dispatch_trade_pipeline_daily(&hhmm).await;
+                        let _ = push_templates::dispatch_trade_pipeline_fills(&hhmm).await;
                         last_post_fixed_fill = std::time::Instant::now();
                     }
 
@@ -4147,6 +4215,7 @@ async fn monitor_loop() {
                                     let now_price = pos.cost_price * 1.02; // 简化: 无 fetch
                                     let new_stop = pos.cost_price * 0.90;
                                     let new_take = pos.cost_price * 1.10;
+                                    let banner = current_banner();
                                     let _ = push_templates::dispatch_st_price_limit_changed(
                                         "09:30",
                                         &pos.name,
@@ -4158,6 +4227,7 @@ async fn monitor_loop() {
                                         now_price,
                                         Some(new_stop),
                                         Some(new_take),
+                                        &banner,
                                     )
                                     .await;
                                 }

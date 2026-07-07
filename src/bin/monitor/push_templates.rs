@@ -2495,6 +2495,75 @@ pub fn fetch_pending_trade_events() -> Vec<TradeEvent> {
 /// v54: T-14/T-15 dispatcher (事件驱动入口)
 ///   - 拉 trade_pipeline 事件, 按 event_type 分发到 T-14/T-15
 ///   - 沙箱: 事件空, 静默
+// v60 (F8): 拆 T-14/T-15 共享 dispatcher 为两个 (避免 3x 工作量)
+//   - 旧: dispatch_trade_pipeline_daily 内部 match event_type 调不同 dispatcher
+//   - 新: dispatch_trade_pipeline_orders (T-14) + dispatch_trade_pipeline_fills (T-15)
+//   - main_loop 两个 ticker 各自调自己的 dispatcher, 互不重复
+pub async fn dispatch_trade_pipeline_orders(hhmm: &str) -> bool {
+    let events = fetch_pending_trade_events();
+    let order_events: Vec<TradeEvent> = events
+        .into_iter()
+        .filter(|ev| ev.event_type == "order")
+        .collect();
+    if order_events.is_empty() {
+        log_dispatcher_attempt("T-14", false, 0, "no order events");
+        return false;
+    }
+    let mut pushed = 0;
+    for ev in order_events {
+        if let (Some(oid), Some(status)) = (&ev.order_id, &ev.status) {
+            let r = dispatch_post_fixed_price_order(
+                ev.exchange, hhmm, &ev.name, &ev.code, ev.price, ev.qty, oid, *status, &BannerCtx::default(),
+            )
+            .await;
+            if r {
+                pushed += 1;
+            }
+        } else {
+            log::warn!("[T-14] 事件缺 order_id/status, 跳过");
+        }
+    }
+    log_dispatcher_attempt("T-14", pushed > 0, pushed, "");
+    pushed > 0
+}
+
+pub async fn dispatch_trade_pipeline_fills(hhmm: &str) -> bool {
+    let events = fetch_pending_trade_events();
+    let fill_events: Vec<TradeEvent> = events
+        .into_iter()
+        .filter(|ev| ev.event_type == "fill")
+        .collect();
+    if fill_events.is_empty() {
+        log_dispatcher_attempt("T-15", false, 0, "no fill events");
+        return false;
+    }
+    let mut pushed = 0;
+    for ev in fill_events {
+        let r = dispatch_post_fixed_price_fill(
+            ev.exchange,
+            hhmm,
+            &ev.name,
+            &ev.code,
+            ev.price,
+            ev.qty,
+            None,
+            ev.next_session_carry.unwrap_or(false),
+            &BannerCtx::default(),
+        )
+        .await;
+        if r {
+            pushed += 1;
+        }
+    }
+    log_dispatcher_attempt("T-15", pushed > 0, pushed, "");
+    pushed > 0
+}
+
+// 保留 dispatch_trade_pipeline_daily 为 v54 兼容入口 (F8 deprecation warning)
+#[deprecated(
+    since = "v60",
+    note = "F8 修复: 拆为 dispatch_trade_pipeline_orders (T-14) + dispatch_trade_pipeline_fills (T-15)"
+)]
 pub async fn dispatch_trade_pipeline_daily(hhmm: &str) -> bool {
     let events = fetch_pending_trade_events();
     if events.is_empty() {
@@ -2516,6 +2585,7 @@ pub async fn dispatch_trade_pipeline_daily(hhmm: &str) -> bool {
                         ev.qty,
                         oid,
                         *status,
+                        &BannerCtx::default(),
                     )
                     .await
                 } else {
@@ -2532,6 +2602,7 @@ pub async fn dispatch_trade_pipeline_daily(hhmm: &str) -> bool {
                 ev.qty,
                 None,                 // vs_limit_pct 后续 PR 算
                 ev.next_session_carry.unwrap_or(false),
+                &BannerCtx::default(),
             )
             .await,
             other => {
@@ -2561,8 +2632,8 @@ pub async fn dispatch_post_fixed_price_order(
     qty: u32,
     order_id: &str,
     status: OrderStatus,
+    banner: &BannerCtx,
 ) -> bool {
-    let banner = BannerCtx::default();
     let params = PostFixedPriceOrderParams {
         exchange,
         hhmm,
@@ -2598,8 +2669,8 @@ pub async fn dispatch_post_fixed_price_fill(
     qty: u32,
     vs_limit_pct: Option<f32>,
     next_session_carry: bool,
+    banner: &BannerCtx,
 ) -> bool {
-    let banner = BannerCtx::default();
     let params = PostFixedPriceFillParams {
         exchange,
         hhmm,
@@ -2639,8 +2710,8 @@ pub async fn dispatch_st_price_limit_changed(
     now_price: f64,
     new_stop_loss: Option<f64>,
     new_take_profit: Option<f64>,
+    banner: &BannerCtx,
 ) -> bool {
-    let banner = BannerCtx::default();
     let params = StPriceLimitChangedParams {
         hhmm,
         name,
@@ -2849,7 +2920,7 @@ pub async fn dispatch_paper_trade_daily(hhmm: &str, count: usize) -> bool {
 ///   - 候选台取 top 1 candidate (按 source_count 排序)
 ///   - is_candidate_live_enabled 影子开关 (默认 false)
 ///   - 简化版: 推送 1 条 A 档候选, evidence 拼成 trigger_desc
-pub async fn dispatch_candidate_triggered_daily(hhmm: &str) -> bool {
+pub async fn dispatch_candidate_triggered_daily(hhmm: &str, banner: &BannerCtx) -> bool {
     use stock_analysis::opportunity::candidate_panel::{
         merge_candidates, CandidateSource, EvidenceTier,
     };
@@ -2897,6 +2968,22 @@ pub async fn dispatch_candidate_triggered_daily(hhmm: &str) -> bool {
     }
 
     let top = &candidates[0];
+    // v60 (F6): 短路 0 价格假推荐 (industry_chain fallback 价格=0)
+    //   真实 intent: fetch_realtime_quote(top.code) 拿真价, 后续 PR 接
+    //   沙箱: 推 "N/A" 价格不如不推
+    if top.current_price <= 0.0 {
+        log_dispatcher_attempt(
+            "P-03",
+            false,
+            0,
+            &format!("current_price=0, 短路 ({} {})", top.name, top.code),
+        );
+        log::warn!(
+            "[P-03] {} ({}) 价格为 0, 短路避免假推荐 (v60 F6 修复, 真价 fetch 后续 PR)",
+            top.name, top.code
+        );
+        return false;
+    }
     let grade = if top.tier == EvidenceTier::Strong { CandidateGrade::A } else { CandidateGrade::B };
     let topic = top.sources_label();
     // v50: 真实 trigger_desc 优先 evidence, 兜底用 cluster.name + code
@@ -2905,7 +2992,6 @@ pub async fn dispatch_candidate_triggered_daily(hhmm: &str) -> bool {
         .first()
         .cloned()
         .unwrap_or_else(|| format!("{} ({}) 主线异动", top.name, top.code));
-    let banner = BannerCtx::default();
     let params = CandidateTriggeredParams {
         name: &top.name,
         code: &top.code,
@@ -2937,7 +3023,7 @@ pub async fn dispatch_candidate_triggered_daily(hhmm: &str) -> bool {
 ///   - 简化版: 遍历当前持仓, 用 real_price + cost + hard_stop 生成 plan
 ///   - 真实意图: 接入 decision::evaluate_holding (v12.2 规划, 当前未实现)
 ///   - 当前策略: 涨幅 > 5% → Reduce (逢高减仓), -3% < x < 5% → Hold, < -3% → Add
-pub async fn dispatch_holding_plan_daily(hhmm: &str) -> bool {
+pub async fn dispatch_holding_plan_daily(hhmm: &str, banner: &BannerCtx) -> bool {
     use stock_analysis::portfolio::{get_positions, PositionStatus};
     let positions = match get_positions() {
         Ok(p) => p,
@@ -2972,6 +3058,20 @@ pub async fn dispatch_holding_plan_daily(hhmm: &str) -> bool {
         if pos.status != PositionStatus::Holding {
             continue;
         }
+        // v60 (F12): 短路 0 数据持仓 — 报价+成本都为 0 时不要推假推荐
+        if pos.cost_price <= 0.0 {
+            log_dispatcher_attempt(
+                "I-04",
+                false,
+                0,
+                &format!("{} cost_price=0, 短路 (F12 修复)", pos.code),
+            );
+            log::warn!(
+                "[I-04] {}({}) cost_price=0, 短路避免假推荐 (v60 F12 修复)",
+                pos.name, pos.code
+            );
+            continue;
+        }
         // v43: 用真报价, fallback cost 价
         let current_price = quotes
             .get(&pos.code)
@@ -2997,7 +3097,6 @@ pub async fn dispatch_holding_plan_daily(hhmm: &str) -> bool {
         } else {
             None
         };
-        let banner = BannerCtx::default();
         let reasons_vec = vec![
             format!("成本{:.2} 现价{:.2} 盈亏{:+.1}%", pos.cost_price, current_price, pnl_pct),
             format!("硬止损{:.2}", pos.hard_stop),
@@ -3082,7 +3181,7 @@ pub fn load_auction_volume_snapshot_real(hhmm: &str) -> AuctionVolumeSnapshot {
 }
 
 /// v37: P-02 dispatcher
-pub async fn dispatch_auction_volume_daily(hhmm: &str) -> bool {
+pub async fn dispatch_auction_volume_daily(hhmm: &str, banner: &BannerCtx) -> bool {
     let snapshot = load_auction_volume_snapshot_real(hhmm);
     if snapshot.items.is_empty() {
         log_dispatcher_attempt("P-02", false, 0, "auction_volume_snapshot empty");
@@ -3101,9 +3200,8 @@ pub async fn dispatch_auction_volume_daily(hhmm: &str) -> bool {
             tag: "",  // 简化: 不填 tag
         })
         .collect();
-    let banner = BannerCtx::default();
     let text = render_auction_volume(
-        &banner,
+        banner,
         &snapshot.hhmm,
         &auction_items,
         &snapshot.sentiment,
