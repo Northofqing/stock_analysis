@@ -2607,7 +2607,12 @@ pub async fn dispatch_candidate_triggered_daily(hhmm: &str) -> bool {
     let top = &candidates[0];
     let grade = if top.tier == EvidenceTier::Strong { CandidateGrade::A } else { CandidateGrade::B };
     let topic = top.sources_label();
-    let trigger_desc = top.evidence.first().cloned().unwrap_or_else(|| "主线异动".to_string());
+    // v50: 真实 trigger_desc 优先 evidence, 兜底用 cluster.name + code
+    let trigger_desc = top
+        .evidence
+        .first()
+        .cloned()
+        .unwrap_or_else(|| format!("{} ({}) 主线异动", top.name, top.code));
     let banner = BannerCtx::default();
     let params = CandidateTriggeredParams {
         name: &top.name,
