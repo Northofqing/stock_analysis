@@ -2405,8 +2405,9 @@ pub async fn dispatch_candidate_triggered_daily(hhmm: &str) -> bool {
     result
 }
 
-/// v38: I-04 持仓操作建议 dispatcher
-///   - 简化版: 遍历当前持仓, 用 cost_price + hard_stop + 简单涨幅阈值生成 plan
+/// v38 + v43: I-04 持仓操作建议 dispatcher
+///   - v43: 接入真实报价 (fetch_realtime_quotes_batch), 替换 cost*1.02 写死
+///   - 简化版: 遍历当前持仓, 用 real_price + cost + hard_stop 生成 plan
 ///   - 真实意图: 接入 decision::evaluate_holding (v12.2 规划, 当前未实现)
 ///   - 当前策略: 涨幅 > 5% → Reduce (逢高减仓), -3% < x < 5% → Hold, < -3% → Add
 pub async fn dispatch_holding_plan_daily(hhmm: &str) -> bool {
@@ -2424,14 +2425,37 @@ pub async fn dispatch_holding_plan_daily(hhmm: &str) -> bool {
         log::info!("[I-04] 当前无持仓, 跳过推送");
         return false;
     }
+
+    // v43: 批量拉真实报价 (并行, 避免 N 次 HTTP)
+    let codes: Vec<String> = positions.iter().map(|p| p.code.clone()).collect();
+    let quotes = tokio::task::spawn_blocking(move || {
+        let code_refs: Vec<&str> = codes.iter().map(|s| s.as_str()).collect();
+        fetch_realtime_quotes_batch(&code_refs)
+    })
+    .await
+    .unwrap_or_default();
+    if quotes.is_empty() {
+        log_dispatcher_attempt("I-04", false, 0, "fetch_realtime_quotes empty");
+        log::warn!("[I-04] 拉报价失败, 跳过推送 (沙箱无网络/数据源挂)");
+        return false;
+    }
+
     let mut pushed_count = 0;
     for pos in &positions {
         if pos.status != PositionStatus::Holding {
             continue;
         }
-        // cost 价是 持仓成本, current_price 用 cost_price + 5% 模拟 (无网络)
-        let current_price = pos.cost_price * 1.02;  // 假设 +2% 涨幅
-        let pnl_pct = (current_price - pos.cost_price) / pos.cost_price * 100.0;
+        // v43: 用真报价, fallback cost 价
+        let current_price = quotes
+            .get(&pos.code)
+            .map(|p| *p as f64)
+            .filter(|p| *p > 0.0)
+            .unwrap_or(pos.cost_price);
+        let pnl_pct = if pos.cost_price > 0.0 {
+            (current_price - pos.cost_price) / pos.cost_price * 100.0
+        } else {
+            0.0
+        };
         // 简单意图: >5% 减仓, <-3% 加仓, 否则持有
         let intent = if pnl_pct > 5.0 {
             Intent::Reduce
@@ -2440,6 +2464,7 @@ pub async fn dispatch_holding_plan_daily(hhmm: &str) -> bool {
         } else {
             Intent::Hold
         };
+        // v43: reduce_zone 按真实波动, pressure = 现价 * 1.10
         let reduce_zone = if matches!(intent, Intent::Reduce) {
             Some((current_price * 1.02, current_price * 1.05))
         } else {
