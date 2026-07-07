@@ -2289,6 +2289,40 @@ pub async fn dispatch_paper_review_daily(date: &str) -> bool {
 // v35: A-10 盘后题材催化复盘 dispatcher
 // ============================================================================
 
+/// v40: P-04 虚拟盘成交 dispatcher 包装
+pub async fn push_paper_trade(code: &str, params: PaperTradeParams<'_>) -> bool {
+    let text = render_paper_trade(params);
+    dispatch(crate::notify::PushKind::PaperTrade, code, None, text).await
+}
+
+/// v40: P-04 dispatcher
+///   - 虚拟盘成交回报 - 复用 monitor_loop 维护的 virtual_observation
+///   - 简化: 推 1 条 NotFilled 模板, 标记已观察但未成交
+///   - 真实数据: 应从 paper_trade 模块读成交回报 (后续 PR)
+///   - count 参数: 调用方传入 virtual_observation.len(), 避免重复 DB 查询
+pub async fn dispatch_paper_trade_daily(hhmm: &str, count: usize) -> bool {
+    if count == 0 {
+        log_dispatcher_attempt("P-04", false, 0, "virtual_observation empty");
+        log::info!("[P-04] virtual_observation 空, 跳过推送");
+        return false;
+    }
+    let params = PaperTradeParams {
+        name: "虚拟仓",
+        code: "",
+        hhmm,
+        status: PaperTradeStatus::NotFilled,
+        fill_price: None,
+        qty: None,
+        virtual_reason: Some("已观察未成交"),
+        not_fill_reason: Some("集合竞价后未触达买入价"),
+        account_mode: AccountMode::Normal,
+        data_mode: DataMode::Full,
+    };
+    let result = push_paper_trade("", params).await;
+    log_dispatcher_attempt("P-04", result, count, "");
+    result
+}
+
 /// v39: P-03 候选触发 dispatcher
 ///   - 候选台取 top 1 candidate (按 source_count 排序)
 ///   - is_candidate_live_enabled 影子开关 (默认 false)

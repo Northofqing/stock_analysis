@@ -3338,6 +3338,18 @@ async fn monitor_loop() {
                     tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
                     continue;
                 } else {
+                    // v40: P-04 虚拟盘成交回报 - 9:25 集合竞价结束推一次
+                    //   数据源: monitor_loop 维护的 virtual_observation
+                    //   模板: render_paper_trade (NotFilled, 标记已观察未成交)
+                    //   静默: virtual_observation 空时短路
+                    {
+                        let hhmm = chrono::Local::now().format("%H:%M").to_string();
+                        let _ = push_templates::dispatch_paper_trade_daily(
+                            &hhmm,
+                            virtual_observation.len(),
+                        )
+                        .await;
+                    }
                     // 9:15-9:20 等待即可
                     tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
                     continue;
