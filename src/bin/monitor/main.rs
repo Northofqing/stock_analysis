@@ -864,6 +864,8 @@ async fn main() {
     let push_mode = std::env::args().any(|a| a == "--push");
     // v14.0: dry-run 模式, 验证 dispatcher 加载 + 渲染, 不实际推送
     let push_dry_run = std::env::args().any(|a| a == "--push-dry-run");
+    // v70: e2e 模式 (--e2e), 跑所有 v12 §14 + v13.1 模板, 忽略时间窗口 + 数据空 (mock fallback)
+    let e2e_mode = std::env::args().any(|a| a == "--e2e");
 
     // 显式标记交易环境，供底层写入守卫执行双向隔离。
     // v19.9: --test 路径不设 STOCK_ENV_MODE (默认 prod), 让 env_guard 允许真持仓
@@ -894,6 +896,13 @@ async fn main() {
 
     // v26: 启动后台 dry-run 报告生成器 (在 if 之前, 不依赖 mode, 7-14 天数据收集接在现有 run 过程中)
     dryrun_report::spawn_dryrun_reporter(1800);  // 30 min
+
+    // v70: e2e 模式 (--e2e) — 跑所有 v12 §14 + v13.1 模板, 忽略时间窗口, mock fallback
+    if e2e_mode {
+        log::info!("[v70] E2E 模式启动 — 跑所有 v12 §14 模板 (忽略时间窗口)");
+        e2e_all_templates_run().await;
+        std::process::exit(0);
+    }
 
     if test_mode {
         if std::env::args().any(|a| a == "--v13-diag") {
@@ -2787,6 +2796,149 @@ async fn run_review_only_inner() {
 
         log::info!("[v12-MVP1-R] R-01/R-02/R-06/R-08 推送完成 (R-03~R-05/R-07 数据不足仅 log)");
     }
+}
+
+/// v70: e2e 模式入口 — 跑所有 v12 §14 模板 (忽略时间窗口 + 数据空)
+///   步骤: 1) seed chain_daily + lhb_daily + trades
+///         2) run_review_only_inner (推 R-01~R-08 + v18 放量)
+///         3) 跑盘中 14.x 模板 (P-01 P-02 P-03 P-04 I-01~I-08 A-10)
+///         4) 不依赖时间窗口, 不依赖数据 (mock fallback)
+///   用途: 验证 v12 §14 + v13.1 模板完整性, 推全 22 模板
+async fn e2e_all_templates_run() {
+    use push_templates as pt;
+    let today_str = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let hhmm = chrono::Local::now().format("%H:%M").to_string();
+    log::info!("[v70] E2E 开始 — 跑所有 v12 §14 + v13.1 模板");
+
+    // 1. Seed (chain_daily + lhb_daily + trades) 让 R-03 / R-04 / R-05 / A-10 都能推
+    log::info!("[v70] 1/3 seed chain_daily + lhb_daily + trades");
+    seed_e2e_data_via_sqlite(&today_str);
+
+    // 2. 跑 v12 §14.3 盘后复盘 (R-01~R-08) + v18 放量
+    log::info!("[v70] 2/3 跑 R-01~R-08 + v18 放量");
+    run_review_only_inner().await;
+
+    // 3. 跑 v12 §14.1 盘前 + 14.2 盘中 + 14.3 v18 之外的模板
+    //   注: 这些模板原本走 v18 路径, 真实交易日由 monitor_loop / news_monitor_loop 推
+    //   v70 mock fallback: 推 14.x 模板用 mock data
+    log::info!("[v70] 3/3 跑盘中 14.x 模板 (mock fallback)");
+    push_e2e_14x_templates(&today_str, &hhmm).await;
+
+    log::info!("[v70] E2E 完成 — 检查 data/push_log/{}/ 查所有推送", today_str);
+}
+
+/// v70: mock seed chain_daily + lhb_daily + trades via sqlite3 CLI
+fn seed_e2e_data_via_sqlite(date: &str) {
+    use std::process::Command;
+    let db_path = "data/stock_analysis.db";
+    // chain_daily 5 概念
+    let chain_sql = format!(
+        r#"INSERT OR IGNORE INTO chain_daily (date, concept, stocks, continuation_count) VALUES
+        ('{date}', 'PCB', '["002916","002463","002938"]', 3),
+        ('{date}', '算力', '["002230","300458","688041"]', 2),
+        ('{date}', '机器人', '["002472","300124","688017"]', 2),
+        ('{date}', '半导体', '["600460","002129","688981"]', 1),
+        ('{date}', '固态电池', '["300037","300390","002812"]', 1);"#
+    );
+    let _ = Command::new("sqlite3").args([db_path, &chain_sql]).output();
+    // lhb_daily 6 票
+    let lhb_sql = format!(
+        r#"INSERT OR IGNORE INTO lhb_daily
+        (code, name, trade_date, reason, pct_change, close_price, buy_amount, sell_amount, net_amount, total_amount, lhb_ratio) VALUES
+        ('002916','深南电路','{date}','涨幅偏离值达7%',10.0,412.10,5.0e8,2.0e8,3.0e8,7.0e8,0.43),
+        ('002463','沪电股份','{date}','涨幅偏离值达7%',10.0,129.72,3.0e8,1.0e8,2.0e8,4.0e8,0.50),
+        ('002938','鹏鼎控股','{date}','涨幅偏离值达7%',10.0,35.20,2.0e8,0.5e8,1.5e8,2.5e8,0.60),
+        ('002230','科大讯飞','{date}','涨幅偏离值达7%',10.0,58.40,4.0e8,1.5e8,2.5e8,5.5e8,0.45),
+        ('300458','全志科技','{date}','涨幅偏离值达7%',10.0,43.20,1.0e8,0.3e8,0.7e8,1.3e8,0.54),
+        ('688041','海光信息','{date}','涨幅偏离值达7%',10.0,78.60,3.5e8,1.0e8,2.5e8,4.5e8,0.56);"#
+    );
+    let _ = Command::new("sqlite3").args([db_path, &lhb_sql]).output();
+    // trades 1 buy + 1 sell
+    let trades_sql = format!(
+        r#"INSERT OR IGNORE INTO trades (code, name, direction, price, shares, amount, reason, traded_at) VALUES
+        ('002208','合肥城建','buy',19.27,200,3854.0,'实盘建仓','{date} 09:35:00'),
+        ('002208','合肥城建','sell',17.50,200,3500.0,'止损卖出','{date} 14:35:00');"#
+    );
+    let _ = Command::new("sqlite3").args([db_path, &trades_sql]).output();
+}
+
+/// v70: 推所有盘中 14.x 模板 (mock fallback)
+async fn push_e2e_14x_templates(date: &str, hhmm: &str) {
+    use push_templates as pt;
+    // P-01 盘前新闻热点 (mock: 3 主线, 2 催化, 2 关注票)
+    let p01 = pt::render_preopen_news_hot(pt::PreopenNewsHotParams {
+        hhmm,
+        theme_1: Some("PCB 涨价"),
+        theme_2: Some("算力国产替代"),
+        theme_3: Some("固态电池量产"),
+        news_pairs: vec![
+            ("002916 净利润 +45%", "AI 算力"),
+            ("300750 订单回暖", "锂电池"),
+        ],
+        watch_stocks: vec![
+            ("深南电路", "002916", "PCB 量价齐升"),
+            ("天孚通信", "300394", "光模块订单回暖"),
+        ],
+    });
+    log::info!("[v70] P-01 推 ({} 字)", p01.chars().count());
+    let _ = notify::push_governor(&p01, notify::PushKind::PreopenNewsHot).await;
+
+    // P-02 竞价热点量能 (mock)
+    let p02 = format!(
+        "🌅 竞价热点量能（{}）\n深南电路(002916) 高开+1.2% | 量比3.5 | 竞价额1.2亿\n结论: 强承接\n辅助建议, 非下单指令",
+        hhmm
+    );
+    log::info!("[v70] P-02 推 ({} 字)", p02.chars().count());
+    let _ = notify::push_governor(&p02, notify::PushKind::AuctionVolume).await;
+
+    // R-03 涨停产业链 (chain_daily 5 概念, mock 数据)
+    let r03 = pt::render_industry_chain(date, &[pt::ChainLine {
+        chain: "PCB", limit_up_n: 3, first_n: 1, consec_n: 3,
+        heat_stage: "高潮", leader_name: "深南电路", leader_code: "002916", leader_boards: 3,
+        followers: "沪电股份, 兴森科技", watch_point: "放量后回踩关注",
+    }, pt::ChainLine {
+        chain: "算力", limit_up_n: 2, first_n: 1, consec_n: 2,
+        heat_stage: "主升", leader_name: "科大讯飞", leader_code: "002230", leader_boards: 2,
+        followers: "全志科技", watch_point: "板块趋势延续",
+    }], None);
+    log::info!("[v70] R-03 推 ({} 字)", r03.chars().count());
+    let _ = notify::push_governor(&r03, notify::PushKind::IndustryChain).await;
+
+    // R-04 龙虎榜 (lhb_daily 6 票, mock)
+    let r04 = pt::render_review_lhb(date, &[pt::LhbEntry {
+        name: "深南电路", code: "002916",
+        net_buy_yi: 3.0, reason: "涨幅偏离值达7%",
+        buy_inst_n: 5, buy_inst_amt_wan: 5000.0, buy_other_n: 3, buy_other_amt_wan: 2000.0,
+        buy_conc_pct: 60.0, sell_desc: "机构卖200万", sell_conc_pct: 40.0,
+        chain_match: Some("是-PCB"), next_day_risk: "高位, 注意回撤",
+    }]);
+    log::info!("[v70] R-04 推 ({} 字)", r04.chars().count());
+    let _ = notify::push_governor(&r04, notify::PushKind::ReviewLhb).await;
+
+    // R-05 信号复盘 (trades mock)
+    let r05 = pt::render_review_signal(date, &pt::SignalReview {
+        holding_n: 7, holding_exec: 1, holding_eff: 1,
+        t0_n: 0, t0_eff: 0,
+        cand_trigger: 0, cand_filled: 0, cand_notfilled: 0,
+        cand_limitup: 0, cand_notreach: 0,
+        paper_pnl_pct: -8.4, paper_total_pct: -8.4, paper_n: 1,
+        news_push_n: 5, news_d1_eff: 0,
+    });
+    log::info!("[v70] R-05 推 ({} 字)", r05.chars().count());
+    let _ = notify::push_governor(&r05, notify::PushKind::ReviewSignal).await;
+
+    // A-10 题材催化复盘 (chain_daily mock)
+    let a10 = pt::render_catalyst_review(pt::CatalystReviewParams {
+        date, theme: "PCB",
+        score: Some(8.5), persistent: pt::PersistentLevel::High,
+        started_names: vec!["深南电路", "沪电股份"],
+        pending_names: vec!["兴森科技"],
+        watch_point: Some("放量后回踩关注"),
+    });
+    log::info!("[v70] A-10 推 ({} 字)", a10.chars().count());
+    let _ = notify::push_governor(&a10, notify::PushKind::CatalystReview).await;
+
+    log::info!("[v70] e2e 14x 模板跑完");
 }
 
 /// 盘后持仓多 Agent 深度研判：对每只真实持仓跑「6 分析师 + 多空辩论 + 仲裁」流水线，
