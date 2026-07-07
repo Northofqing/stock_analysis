@@ -2802,6 +2802,28 @@ async fn news_monitor_loop() {
             let hhmm = now_ts.format("%H:%M").to_string();
             let _ = dispatch_news_to_idea_daily(&hhmm, &banner).await;
         }
+
+        // ═══════════════════════════════════════════════════════════════
+        // v33: I-02 新闻催化映射 (事件驱动, 同 D-01 时机)
+        //   - 触发: pushed 不空 (有重要公告) 时, 调一次
+        //   - 数据源: load_news_catalyst_snapshot_real (公告 + 板块聚类)
+        //   - 模板: render_news_catalyst (带 banner)
+        //   - 静默: 公告空时短路
+        //   - 与 D-01 互补: D-01 推个股, I-02 推板块
+        // ═══════════════════════════════════════════════════════════════
+        if !pushed.is_empty() {
+            use push_templates::dispatch_news_catalyst_daily;
+            let banner = push_templates::BannerCtx {
+                account_mode: push_templates::AccountMode::Normal,
+                total_pos: 0,
+                today_pnl: 0.0,
+                data_mode: push_templates::DataMode::Full,
+                data_missing_note: None,
+            };
+            let now_ts = chrono::Local::now();
+            let hhmm = now_ts.format("%H:%M").to_string();
+            let _ = dispatch_news_catalyst_daily(&hhmm, &banner).await;
+        }
         // v11-P0-4 commit E: C2/C3 NewsAI 收敛 (grill Q2 决定)
         // 同一只票 (code) 实时层 (C2) 推过后, 快研层 (C3) 跳过 — 避免同票双推.
         let mut real_time_pushed: std::collections::HashSet<String> =
