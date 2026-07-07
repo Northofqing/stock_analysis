@@ -394,6 +394,7 @@ async fn run_daily_pushes() {
         dispatch_preopen_news_hot_daily, dispatch_intraday_market_daily,
         dispatch_news_catalyst_daily, dispatch_industry_chain_intraday_daily,
         dispatch_news_to_idea_daily, dispatch_paper_review_daily,
+        dispatch_catalyst_review_daily,
     };
     use stock_analysis::opportunity::scheduler::{OpportunitySchedule, PushWindow};
     // v22: 从 config 读取 push 时刻 (替代写死的 09:00 / 10:30 / 11:00 / 14:30 / 19:00)
@@ -430,17 +431,19 @@ async fn run_daily_pushes() {
         }
         PushWindow::Evening => {
             let _ = dispatch_paper_review_daily(&date).await;
+            let _ = dispatch_catalyst_review_daily(&date).await;
         }
         PushWindow::Outside => {
-            // v22: 窗口外, 仅 A-01 兜底 (窗口信息读 config, 不再写死 09:00-19:00)
+            // v22: 窗口外, 仅 A-01/A-10 兜底 (窗口信息读 config, 不再写死 09:00-19:00)
             log::warn!(
-                "[v22] 当前时间 {} 不在 push 窗口内 (盘前 {} / 盘中 {:?} / 盘后 {}), 仅推 A-01 兜底",
+                "[v22] 当前时间 {} 不在 push 窗口内 (盘前 {} / 盘中 {:?} / 盘后 {}), 仅推 A-01/A-10 兜底",
                 hhmm,
                 schedule.push_preopen.format("%H:%M"),
                 schedule.push_intraday.iter().map(|t| t.format("%H:%M").to_string()).collect::<Vec<_>>(),
                 schedule.push_evening.format("%H:%M"),
             );
             let _ = dispatch_paper_review_daily(&date).await;
+            let _ = dispatch_catalyst_review_daily(&date).await;
         }
     }
 
@@ -3088,6 +3091,8 @@ async fn monitor_loop() {
         let mut virtual_snapshot_persisted = false;
         // v32: P-01 盘前新闻热点 — 每个交易日首次进入 9:00-9:15 窗口时推一次
         let mut preopen_pushed = false;
+        // v35: A-10 盘后催化复盘 — 每个交易日首次进入 19:00 后推一次
+        let mut evening_pushed = false;
         let entry_mode = air_refuel_entry_mode();
         let monitor_cfg = stock_analysis::config::get_monitor_config();
         let confirm_shares = monitor_cfg.air_refuel.confirm_lots.saturating_mul(100);
@@ -3113,6 +3118,24 @@ async fn monitor_loop() {
                         preopen_start.format("%H:%M"), preopen_end.format("%H:%M"));
                     let _ = push_templates::dispatch_preopen_news_hot_daily().await;
                     preopen_pushed = true;
+                }
+            }
+
+            // ═══════════════════════════════════════════════════════════════
+            // v35: A-10 盘后催化复盘 (AfterHours session, 19:00 后首次)
+            //   - 触发: 首次进入 AfterHours, 每个交易日推一次
+            //   - 数据源: chain_daily cluster + continuation_count 推断持续性
+            //   - 模板: render_catalyst_review (无 banner, ℹ️盘后)
+            //   - 静默: chain_daily 空时短路
+            // ═══════════════════════════════════════════════════════════════
+            if !evening_pushed && session == MarketSession::AfterHours {
+                let now_time = chrono::Local::now().time();
+                let evening_start = chrono::NaiveTime::from_hms_opt(19, 0, 0).unwrap();
+                if now_time >= evening_start {
+                    log::info!("[A-10] 盘后窗口 ({} 后), 推催化复盘", evening_start.format("%H:%M"));
+                    let date_str = chrono::Local::now().format("%Y-%m-%d").to_string();
+                    let _ = push_templates::dispatch_catalyst_review_daily(&date_str).await;
+                    evening_pushed = true;
                 }
             }
 

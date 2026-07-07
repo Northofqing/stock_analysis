@@ -2286,6 +2286,79 @@ pub async fn dispatch_paper_review_daily(date: &str) -> bool {
 }
 
 // ============================================================================
+// v35: A-10 盘后题材催化复盘 dispatcher
+// ============================================================================
+
+/// v35: 加载 A-10 快照 - 取 chain_daily 最新 cluster, 推断持续性
+pub fn load_catalyst_review_snapshot_real(date: &str) -> (String, Option<f32>, PersistentLevel, Vec<String>, Vec<String>, Option<String>) {
+    use stock_analysis::database::DatabaseManager;
+    use stock_analysis::database::concepts::ChainDailyRow;
+    let clusters = DatabaseManager::get().get_latest_chain_clusters();
+    if clusters.is_empty() {
+        return (String::new(), None, PersistentLevel::Low, Vec::new(), Vec::new(), None);
+    }
+
+    // 取第一个 cluster 作主推
+    let top: &ChainDailyRow = &clusters[0];
+    let stocks: Vec<String> = serde_json::from_str(&top.stocks).unwrap_or_default();
+
+    // 持续性: 用 continuation_count 推断
+    let persistent = if top.continuation_count >= 3 {
+        PersistentLevel::High
+    } else if top.continuation_count >= 1 {
+        PersistentLevel::Med
+    } else {
+        PersistentLevel::Low
+    };
+
+    // 强度: 用 cluster 数 (粗略代理) — 多个 cluster = 强
+    let score = if clusters.len() >= 5 {
+        Some(8.5)
+    } else if clusters.len() >= 3 {
+        Some(7.0)
+    } else {
+        Some(5.5)
+    };
+
+    // 已启动: cluster 头部 (前 3)
+    let started: Vec<String> = stocks.iter().take(3).cloned().collect();
+    // 待启动: cluster 尾部 (3-5)
+    let pending: Vec<String> = stocks.iter().skip(3).take(3).cloned().collect();
+
+    // 明日观察点: 简单模板
+    let watch_point = format!("明日竞价复核 {} 主线持续性", top.concept);
+
+    (date.to_string(), score, persistent, started, pending, Some(watch_point))
+}
+
+/// v35: A-10 dispatcher 入口
+pub async fn dispatch_catalyst_review_daily(date: &str) -> bool {
+    let (date_str, score, persistent, started, pending, watch_point) =
+        load_catalyst_review_snapshot_real(date);
+    if started.is_empty() {
+        log_dispatcher_attempt("A-10", false, 0, "catalyst_review_snapshot empty");
+        log::info!("[A-10] catalyst_review_snapshot 空 (chain_daily 无 cluster), 跳过推送");
+        return false;
+    }
+    let started_refs: Vec<&str> = started.iter().map(|s| s.as_str()).collect();
+    let pending_refs: Vec<&str> = pending.iter().map(|s| s.as_str()).collect();
+    let theme = "主线题材";  // 简化: 第一个 cluster 主题
+    let params = CatalystReviewParams {
+        date: &date_str,
+        theme,
+        score,
+        persistent,
+        started_names: started_refs,
+        pending_names: pending_refs,
+        watch_point: watch_point.as_deref(),
+    };
+    let text = render_catalyst_review(params);
+    let result = dispatch(crate::notify::PushKind::CatalystReview, "", None, text).await;
+    log_dispatcher_attempt("A-10", result, started.len(), "");
+    result
+}
+
+// ============================================================================
 // v16.5 helper: 加载 virtual_observation (简化, 复用 main.rs::VirtualObservationRecord)
 // ============================================================================
 pub struct VirtualRecordLite {
