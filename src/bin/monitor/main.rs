@@ -4060,7 +4060,8 @@ async fn monitor_loop() {
                         .await
                         .unwrap_or_default();
                         if turnover_top.len() > 50 {
-                            notify::push_governor(&turnover_top, notify::PushKind::FundInflow)
+                            // v56: PushKind 修正 (之前错用 FundInflow, 实际是 I-08 换手率)
+                            notify::push_governor(&turnover_top, notify::PushKind::TurnoverTop)
                                 .await;
                             last_fund_top_push = std::time::Instant::now();
                         }
@@ -4362,57 +4363,15 @@ fn run_stock_screener() -> Option<Vec<String>> {
 
 /// 持仓实时行情：东财 push2 为主（多主机轮询），新浪兜底
 async fn push_sector_leaders() {
-    let boards = tokio::task::spawn_blocking(|| {
-        stock_analysis::market_analyzer::sector_monitor::fetch_board_ranking("f3", 5)
-    })
-    .await
-    .unwrap_or(Ok(vec![]))
-    .unwrap_or_default();
-
-    if boards.is_empty() {
-        return;
-    }
-    let mut lines = vec!["📊 领涨板块 Top 5".to_string()];
-    let medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"];
-    for (i, b) in boards.iter().enumerate() {
-        let inflow_yi = b.main_inflow / 1e8;
-        lines.push(format!(
-            "  {} {} {:+.1}% 主力{:.1}亿",
-            medals[i.min(4)],
-            b.name,
-            b.change_pct,
-            inflow_yi
-        ));
-    }
-    notify::push_governor(&lines.join("\n"), notify::PushKind::SectorTop).await;
+    // v56: 改用 dispatch_sector_top_daily (I-09 v12 §14.5 模板)
+    let hhmm = chrono::Local::now().format("%H:%M").to_string();
+    let _ = push_templates::dispatch_sector_top_daily(&hhmm).await;
 }
 
 async fn push_market_fund_top10() {
-    let top = tokio::task::spawn_blocking(|| market_data::fetch_market_main_inflow_top(10))
-        .await
-        .unwrap_or_else(|_| Err("spawn_blocking join error".to_string()))
-        .unwrap_or_default();
-
-    if top.is_empty() {
-        return;
-    }
-
-    let mut lines = vec![format!(
-        "💰 主力净流入 Top 10（{}）",
-        chrono::Local::now().format("%H:%M")
-    )];
-    for (i, s) in top.iter().enumerate() {
-        lines.push(format!(
-            "  {:>2}. {}({}) 主力{:+.2}亿 量比{:.1} 涨幅{:+.1}%",
-            i + 1,
-            s.name,
-            s.code,
-            s.main_net_yi,
-            s.volume_ratio,
-            s.change_pct,
-        ));
-    }
-    notify::push_governor(&lines.join("\n"), notify::PushKind::FundInflow).await;
+    // v56: 改用 dispatch_fund_inflow_top_daily (I-10 v12 §14.5 模板)
+    let hhmm = chrono::Local::now().format("%H:%M").to_string();
+    let _ = push_templates::dispatch_fund_inflow_top_daily(&hhmm).await;
 }
 
 async fn push(event: &AlertEvent) {

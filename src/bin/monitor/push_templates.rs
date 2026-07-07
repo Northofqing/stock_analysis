@@ -733,6 +733,58 @@ pub struct TurnoverEntry {
 
 /// v12 §14.1 T-13 TurnoverTop 模板渲染 — 字段顺序严格对齐 docs/architecture/v13-push-templates.md
 ///
+
+/// v56: I-09 领涨板块 Top N 模板 (v12 §14.5 新增)
+///
+/// 数据源: stock_analysis::market_analyzer::sector_monitor::fetch_board_ranking
+/// 治理: 5 min 冷却 (PushKind::SectorTop)
+/// 模板示例:
+/// ```
+/// 📊 领涨板块 Top 5 (10:30)
+///   🥇 PCB +3.2% 主力1.5亿
+///   🥈 半导体 +2.8% 主力1.2亿
+///   ...
+/// ```
+pub fn render_sector_top(hhmm: &str, boards: &[(String, f64, f64)]) -> String {
+    let mut out = format!("📊 领涨板块 Top {} ({})\n", boards.len(), hhmm);
+    let medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"];
+    for (i, (name, change_pct, main_inflow_yi)) in boards.iter().enumerate() {
+        out.push_str(&format!(
+            "  {} {} {:+.1}% 主力{:.1}亿\n",
+            medals[i.min(4)],
+            name,
+            change_pct,
+            main_inflow_yi
+        ));
+    }
+    out
+}
+
+/// v56: I-10 主力净流入 Top N 模板 (v12 §14.5 新增)
+///
+/// 数据源: market_data::fetch_market_main_inflow_top
+/// 治理: 5 min 冷却 (PushKind::FundInflow)
+/// 模板示例:
+/// ```
+/// 💰 主力净流入 Top 10 (10:30)
+///   1. XX(000001) 主力+2.5亿 量比1.8 涨幅+1.2%
+///   2. ...
+/// ```
+pub fn render_fund_inflow_top(hhmm: &str, entries: &[(String, String, f64, f64, f64)]) -> String {
+    let mut out = format!("💰 主力净流入 Top {} ({})\n", entries.len(), hhmm);
+    for (i, (name, code, main_yi, vol_ratio, change_pct)) in entries.iter().enumerate() {
+        out.push_str(&format!(
+            "  {:>2}. {}({}) 主力{:+.2}亿 量比{:.1} 涨幅{:+.1}%\n",
+            i + 1,
+            name,
+            code,
+            main_yi,
+            vol_ratio,
+            change_pct
+        ));
+    }
+    out
+}
 /// 与 R-04 龙虎榜严格区分:
 /// - T-13: 盘中实时换手率 (真数据, data_provider 拉取)
 /// - R-04: 盘后龙虎榜席位 (东方财富 API, 盘后 21:00 才更新)
@@ -4024,6 +4076,80 @@ pub fn render_paper_review(p: PaperReviewParams<'_>) -> String {
     }
     s.push_str("辅助建议, 非下单指令");
     s
+}
+
+// ============================================================================
+// v56: I-09 领涨板块 + I-10 主力净流入 dispatcher
+// ============================================================================
+
+/// v56: I-09 领涨板块 Top N dispatcher
+///   数据源: stock_analysis::market_analyzer::sector_monitor::fetch_board_ranking
+pub async fn dispatch_sector_top_daily(hhmm: &str) -> bool {
+    let boards = match tokio::task::spawn_blocking(|| {
+        stock_analysis::market_analyzer::sector_monitor::fetch_board_ranking("f3", 5)
+    })
+    .await
+    {
+        Ok(Ok(b)) => b,
+        Ok(Err(e)) => {
+            log_dispatcher_attempt("I-09", false, 0, "fetch_board_ranking failed");
+            log::warn!("[I-09] fetch_board_ranking 失败: {}", e);
+            return false;
+        }
+        Err(e) => {
+            log_dispatcher_attempt("I-09", false, 0, "spawn_blocking failed");
+            log::warn!("[I-09] spawn_blocking 失败: {}", e);
+            return false;
+        }
+    };
+    if boards.is_empty() {
+        log_dispatcher_attempt("I-09", false, 0, "boards empty");
+        log::info!("[I-09] 板块数据空, 跳过");
+        return false;
+    }
+    let items: Vec<(String, f64, f64)> = boards
+        .iter()
+        .map(|b| (b.name.clone(), b.change_pct, b.main_inflow / 1e8))
+        .collect();
+    let text = render_sector_top(hhmm, &items);
+    let result = dispatch(crate::notify::PushKind::SectorTop, "", None, text).await;
+    log_dispatcher_attempt("I-09", result, items.len(), "");
+    result
+}
+
+/// v56: I-10 主力净流入 Top N dispatcher
+///   数据源: super::market_data::fetch_market_main_inflow_top
+pub async fn dispatch_fund_inflow_top_daily(hhmm: &str) -> bool {
+    let top = match tokio::task::spawn_blocking(|| {
+        super::market_data::fetch_market_main_inflow_top(10)
+    })
+    .await
+    {
+        Ok(Ok(t)) => t,
+        _ => {
+            log_dispatcher_attempt("I-10", false, 0, "fetch_market_main_inflow_top failed");
+            return false;
+        }
+    };
+    if top.is_empty() {
+        log_dispatcher_attempt("I-10", false, 0, "top empty");
+        log::info!("[I-10] 主力净流入空, 跳过");
+        return false;
+    }
+    let items: Vec<(String, String, f64, f64, f64)> = top
+        .iter()
+        .map(|s| (
+            s.name.clone(),
+            s.code.clone(),
+            s.main_net_yi,
+            s.volume_ratio,
+            s.change_pct,
+        ))
+        .collect();
+    let text = render_fund_inflow_top(hhmm, &items);
+    let result = dispatch(crate::notify::PushKind::FundInflow, "", None, text).await;
+    log_dispatcher_attempt("I-10", result, items.len(), "");
+    result
 }
 
 // ============================================================================
