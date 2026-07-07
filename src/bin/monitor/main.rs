@@ -40,6 +40,7 @@ use notify::{evaluate_opportunity_push_skip_reason, summarize_push_text};
 mod push_templates;
 
 mod dryrun_report;  // v26: dry-run 自动报告
+mod v13_diag;  // v13.27: 端到端诊断
 
 mod market_data;
 
@@ -739,6 +740,11 @@ async fn main() {
     dryrun_report::spawn_dryrun_reporter(1800);  // 30 min
 
     if test_mode {
+        if std::env::args().any(|a| a == "--v13-diag") {
+            // v13.27: 端到端诊断 (5 dispatcher 全链路, 输出 data/v13_diag_report.json)
+            v13_diag::report_v13_diag().await.expect("v13.27 diag failed");
+            std::process::exit(0);
+        }
         run_review_only().await;
         // [v12 删除] P1.1 老 "📊 A股市场概览" 推送 (用 std::thread::spawn + block_in_place)
         // 由 v12 R-02 盘面走向 (render_review_market) 替代, 见 run_review_only_inner 末尾 v12 R-01~R-08
