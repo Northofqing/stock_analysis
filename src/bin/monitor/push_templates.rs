@@ -2485,6 +2485,40 @@ pub async fn dispatch_block_trade_intraday_confirm(
     result
 }
 
+/// v49: T-19 北交所大宗价格区间 dispatcher
+///   - 新规 2026-07-06: 北交所大宗价格范围改为"当日竞价实时成交均价"
+///   - 触发: 大宗事件
+///   - 数据源: 北交所大宗成交回报
+pub async fn dispatch_block_trade_price_range(
+    hhmm: &str,
+    name: &str,
+    code: &str,
+    prev_close: Option<f64>,
+    today_avg_price: f64,
+    block_price_range: Option<&str>,
+    note: &str,
+) -> bool {
+    let params = BlockTradePriceRangeParams {
+        hhmm,
+        name,
+        code,
+        prev_close,
+        today_avg_price,
+        block_price_range,
+        note,
+    };
+    let text = render_block_trade_price_range(params);
+    let result = dispatch(
+        crate::notify::PushKind::BlockTradePriceRange,
+        code,
+        None,
+        text,
+    )
+    .await;
+    log_dispatcher_attempt("T-19", result, 1, &format!("code={}", code));
+    result
+}
+
 /// v40: P-04 虚拟盘成交 dispatcher 包装
 pub async fn push_paper_trade(code: &str, params: PaperTradeParams<'_>) -> bool {
     let text = render_paper_trade(params);

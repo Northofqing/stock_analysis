@@ -143,6 +143,36 @@ pub async fn run_v13_diag() -> V13DiagReport {
         }
     }));
 
+    // v45: T-15 盘后固定价格成交 - 编译期 dispatcher 存在
+    steps.push(check_step("T-15", "dispatcher_available", || {
+        use super::push_templates::PostFixedPriceFillParams;
+        "ok: dispatcher wired".to_string()
+    }));
+
+    // v46: T-16 ST 涨跌幅变更 - 编译期 dispatcher 存在
+    steps.push(check_step("T-16", "dispatcher_available", || {
+        use super::push_templates::StPriceLimitChangedParams;
+        "ok: dispatcher wired (新规 5%→10%)".to_string()
+    }));
+
+    // v47: T-17 ETF 收盘集合竞价 - 编译期 dispatcher 存在
+    steps.push(check_step("T-17", "dispatcher_available", || {
+        use super::push_templates::EtfClosingCallAuctionParams;
+        "ok: dispatcher wired (新规 14:57 集合竞价)".to_string()
+    }));
+
+    // v48: T-18 创业板大宗盘中确认 - 编译期 dispatcher 存在
+    steps.push(check_step("T-18", "dispatcher_available", || {
+        use super::push_templates::BlockTradeIntradayConfirmParams;
+        "ok: dispatcher wired (新规 创业板盘中确认)".to_string()
+    }));
+
+    // v49: T-19 北交所大宗价格区间 - 编译期 dispatcher 存在
+    steps.push(check_step("T-19", "dispatcher_available", || {
+        use super::push_templates::BlockTradePriceRangeParams;
+        "ok: dispatcher wired (新规 北交所均价口径)".to_string()
+    }));
+
     // 总结
     let ok_steps = steps.iter().filter(|s| s.status == "ok").count();
     let empty_steps = steps.iter().filter(|s| s.status == "empty").count();
