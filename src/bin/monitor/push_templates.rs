@@ -2364,6 +2364,50 @@ pub async fn dispatch_post_fixed_price_fill(
     result
 }
 
+/// v46: T-16 ST 涨跌幅变更 dispatcher
+///   - 新规 2026-07-06: 主板 ST/*ST 5%→10%
+///   - 触发: 开盘 9:30 一次/票/日
+///   - 数据源: 持仓 DB (ST/*ST 票) + 新规参数 (5%→10%)
+///   - 真实 intent: 每天首次入 9:30 推一次
+pub async fn dispatch_st_price_limit_changed(
+    hhmm: &str,
+    name: &str,
+    code: &str,
+    st_type: StType,
+    old_limit: f32,
+    new_limit: f32,
+    holding_qty: u32,
+    cost: f64,
+    now_price: f64,
+    new_stop_loss: Option<f64>,
+    new_take_profit: Option<f64>,
+) -> bool {
+    let banner = BannerCtx::default();
+    let params = StPriceLimitChangedParams {
+        hhmm,
+        name,
+        code,
+        st_type,
+        old_limit,
+        new_limit,
+        holding_qty,
+        cost,
+        now_price,
+        new_stop_loss,
+        new_take_profit,
+    };
+    let text = render_st_price_limit_changed(params);
+    let result =
+        dispatch(crate::notify::PushKind::StPriceLimitChanged, code, Some(&banner), text).await;
+    log_dispatcher_attempt(
+        "T-16",
+        result,
+        1,
+        &format!("st_type={:?} {}→{}%", st_type, old_limit * 100.0, new_limit * 100.0),
+    );
+    result
+}
+
 /// v40: P-04 虚拟盘成交 dispatcher 包装
 pub async fn push_paper_trade(code: &str, params: PaperTradeParams<'_>) -> bool {
     let text = render_paper_trade(params);
@@ -3541,6 +3585,7 @@ pub fn render_post_fixed_price_fill(p: PostFixedPriceFillParams<'_>) -> String {
 }
 
 /// v13.1 §5.4 ST/*ST 类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StType {
     ST,     // ST
     StarST, // *ST
