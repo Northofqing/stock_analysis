@@ -1406,9 +1406,12 @@ mod tests {
         // 修复 watchlist-aware: 板块必去重, 不重复触发同一查询
         use crate::portfolio::Position;
         let positions = vec![
-            Position { code: "600703".into(), name: "三安光电".into(), shares: 1000, cost_price: 10.0, hard_stop: 9.0, added_at: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), status: crate::portfolio::PositionStatus::Holding, sector: "半导体".into() },
-            Position { code: "002049".into(), name: "紫光国微".into(), shares: 500, cost_price: 100.0, hard_stop: 90.0, added_at: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), status: crate::portfolio::PositionStatus::Holding, sector: "半导体".into() },
-            Position { code: "600276".into(), name: "恒瑞医药".into(), shares: 800, cost_price: 50.0, hard_stop: 45.0, added_at: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), status: crate::portfolio::PositionStatus::Holding, sector: "医药".into() },
+            Position { code: "600703".into(), name: "三安光电".into(), shares: 1000, cost_price: 10.0, hard_stop: 9.0, added_at: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), status: crate::portfolio::PositionStatus::Holding, sector: "半导体".into(),
+            ..Default::default() },
+            Position { code: "002049".into(), name: "紫光国微".into(), shares: 500, cost_price: 100.0, hard_stop: 90.0, added_at: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), status: crate::portfolio::PositionStatus::Holding, sector: "半导体".into(),
+            ..Default::default() },
+            Position { code: "600276".into(), name: "恒瑞医药".into(), shares: 800, cost_price: 50.0, hard_stop: 45.0, added_at: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), status: crate::portfolio::PositionStatus::Holding, sector: "医药".into(),
+            ..Default::default() },
         ];
         let queries = super::build_sector_queries_from_positions(&positions);
         // 半导体(2 只) + 医药(1 只) → 2 个 sector 查询 + 1 兜底 = 3 个
@@ -1425,7 +1428,8 @@ mod tests {
         // 修复: "其他" sector 必过滤, 不产生查询
         use crate::portfolio::Position;
         let positions = vec![
-            Position { code: "600000".into(), name: "浦发银行".into(), shares: 1000, cost_price: 10.0, hard_stop: 9.0, added_at: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), status: crate::portfolio::PositionStatus::Watching, sector: "其他".into() },
+            Position { code: "600000".into(), name: "浦发银行".into(), shares: 1000, cost_price: 10.0, hard_stop: 9.0, added_at: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), status: crate::portfolio::PositionStatus::Watching, sector: "其他".into(),
+            ..Default::default() },
         ];
         let queries = super::build_sector_queries_from_positions(&positions);
         // "其他" 被过滤, 仅有兜底查询
@@ -1443,7 +1447,7 @@ mod tests {
             shares: 100, cost_price: 10.0, hard_stop: 9.0,
             added_at: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
             status: crate::portfolio::PositionStatus::Holding,
-            sector: format!("行业{}", i),  // 每个 sector 都不同 → 20 个 sector
+            sector: format!("行业{}", i), ..Default::default()  // 每个 sector 都不同 → 20 个 sector
         }).collect();
         let queries = super::build_sector_queries_from_positions(&positions);
         // 20 个不同 sector + 1 兜底 → truncate(6) → 6 个

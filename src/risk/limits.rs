@@ -129,7 +129,7 @@ mod tests {
             cost_price: cost, hard_stop: cost * 0.9,
             added_at: NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
             status: crate::portfolio::PositionStatus::Holding,
-            sector: "其他".into(),
+            sector: "其他".into(), ..Default::default()
         }
     }
 

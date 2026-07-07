@@ -19,6 +19,10 @@ pub fn load_positions() -> Result<Vec<Position>, String> {
             .unwrap_or_else(|_| NaiveDate::from_ymd_opt(2025, 1, 1).unwrap()),
         status: PositionStatus::Holding,
         sector: "其他".into(),
+        // v53: ST/*ST 字段从 stock_position.st_type 列读 (TEXT: "ST" / "*ST" / NULL)
+        //   当前 schema 暂未加 st_type 列, 默认 false
+        is_st: false,
+        star_st: false,
     }).collect())
 }
 
@@ -39,6 +43,7 @@ pub fn load_watchlist() -> Result<Vec<Position>, String> {
             added_at: NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
             status: PositionStatus::Watching,
             sector: "其他".into(),
+            ..Default::default()
         }
     }).collect())
 }

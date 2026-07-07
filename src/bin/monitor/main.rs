@@ -1133,7 +1133,7 @@ async fn run_test_scan() {
                     hard_stop: 9.0,
                     added_at: NaiveDate::from_ymd_opt(2025, 6, 1).unwrap(),
                     status: stock_analysis::portfolio::PositionStatus::Holding,
-                    sector: "测试板块".into(),
+                    sector: "测试板块".into(), ..Default::default()
                 });
             }
             log::info!("[测试] DB 持仓空, 用 .env STOCK_LIST 前 {} 只作为 fallback (DB 插入已在函数顶部 0. 完成)", h.len());
@@ -4683,7 +4683,7 @@ mod tests_candidate_panel {
             hard_stop: 0.0,
             added_at: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
             status: PositionStatus::Holding,
-            sector: "测试".to_string(),
+            sector: "测试".to_string(), ..Default::default()
         }
     }
 
@@ -4794,7 +4794,7 @@ mod tests_wrapper_real_raw {
             hard_stop: 0.0,
             added_at: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
             status: PositionStatus::Holding,
-            sector: "测试".to_string(),
+            sector: "测试".to_string(), ..Default::default()
         }
     }
 

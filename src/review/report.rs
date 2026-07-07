@@ -167,7 +167,7 @@ mod tests {
             code: "603618".into(), name: "杭电股份".into(),
             shares: 1000, cost_price: 8.2, hard_stop: 7.5,
             added_at: date("2026-06-05"), status: PositionStatus::Holding,
-            sector: "其他".into(),
+            sector: "其他".into(), ..Default::default()
         }];
 
         let mut prices = std::collections::HashMap::new();

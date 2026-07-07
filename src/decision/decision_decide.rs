@@ -536,7 +536,7 @@ mod tests_llm_parse {
             hard_stop: 9.0,
             added_at: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
             status: crate::portfolio::PositionStatus::Holding,
-            sector: "测试".to_string(),
+            sector: "测试".to_string(), ..Default::default()
         }
     }
 

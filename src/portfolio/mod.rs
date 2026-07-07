@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 // 公共结构（系统中唯一的 Position / Trade 定义）
 // ============================================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Position {
     pub code: String,
     pub name: String,
@@ -27,14 +27,21 @@ pub struct Position {
     /// 默认 "其他" 表示未分类, 后续可接东财/同花顺的板块数据自动填充
     #[serde(default = "default_sector")]
     pub sector: String,
+    /// v53: ST/*ST 标识 (T-16 ST 涨跌幅变更 dispatcher 数据源)
+    /// 默认 false, 由 broker/exchange 推送更新, 或手工设置
+    /// `*ST` 用 star_st 字段, `ST` 用 is_st
+    #[serde(default)]
+    pub is_st: bool,
+    #[serde(default)]
+    pub star_st: bool,
 }
 
 fn default_sector() -> String {
     "其他".to_string()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PositionStatus { Holding, Watching }
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PositionStatus { #[default] Holding, Watching }
 
 impl PositionStatus {
     pub fn label(&self) -> &'static str {
@@ -109,6 +116,17 @@ pub fn get_all_names() -> Result<Vec<(String, String)>, String> {
 /// 获取指定 code 的持仓（None = 不在持仓中）
 pub fn find_position(code: &str) -> Option<Position> {
     get_positions().ok()?.into_iter().find(|p| p.code == code)
+}
+
+/// v53: 获取 ST/*ST 持仓 (T-16 ST 涨跌幅变更 dispatcher 数据源)
+///   简化版: 当前 is_st/star_st 都默认 false, 真实来源待 broker 接入
+///   真实意图: 每天 9:30 推一次, 给所有 ST/*ST 持仓提醒涨跌幅变更
+pub fn get_st_positions() -> Vec<Position> {
+    get_positions()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| p.is_st || p.star_st)
+        .collect()
 }
 
 /// 判断是否 T+1 锁仓（今日买入的不可卖出）
