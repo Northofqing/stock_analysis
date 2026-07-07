@@ -465,9 +465,13 @@ fn action_priority_from_advice(advice: &str) -> (Action, Priority) {
 ///
 /// 替换 main.rs:967 `build_holding_summary` + `extract_advice_and_score` 字符串猜
 /// (commit C 标 deprecated, commit E 留 PUSH_SHADOW 退路)
+/// v62: 加 `quotes` 参数 (TopStock 列表含 price/change_pct), 用真报价填充 current_price
+///   - 旧: p.cost_price 当现价 + change_pct=0.0 硬编码 (用户看到"今日+0.00%")
+///   - 新: 优先用 quotes 拿真价/真涨跌幅, fallback 到 cost_price + 0
 pub fn decisions_from_llm(
     holdings: &[Position],
     by_code: &HashMap<String, (String, Option<String>)>,
+    quotes: &HashMap<String, (f64, f64)>, // code -> (price, change_pct)
 ) -> Vec<FinalDecision> {
     let mut out = Vec::new();
     for p in holdings {
@@ -493,11 +497,16 @@ pub fn decisions_from_llm(
             .and_then(|(_, md)| md.as_ref())
             .map(|md| first_meaningful_line(md))
             .unwrap_or_default();
+        // v62: 用真报价填 current_price/change_pct
+        let (current_price, change_pct) = quotes
+            .get(&p.code)
+            .map(|(price, pct)| if *price > 0.0 { (*price, *pct) } else { (p.cost_price, 0.0) })
+            .unwrap_or((p.cost_price, 0.0));
         let mut d = FinalDecision::new(
             p.code.clone(),
             p.name.clone(),
-            p.cost_price, // 简化为成本价 (无实时价数据时)
-            0.0,           // 涨跌幅: LLM 输出无统一字段, 留 0 由上游补
+            current_price, // v62: 用真报价
+            change_pct,    // v62: 用真涨跌幅
             action,
             priority,
             reasons,
@@ -546,7 +555,8 @@ mod tests_llm_parse {
         let holdings = vec![make_position("000001", "测试")];
         let mut by_code = HashMap::new();
         by_code.insert("000001".to_string(), ("测试".to_string(), Some(make_md("强烈卖出", Some(20.0)))));
-        let decisions = decisions_from_llm(&holdings, &by_code);
+        let quote_map: HashMap<String, (f64, f64)> = HashMap::new();
+        let decisions = decisions_from_llm(&holdings, &by_code, &quote_map);
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].action, Action::ReduceNow);
         assert_eq!(decisions[0].priority, Priority::P0);
@@ -558,7 +568,8 @@ mod tests_llm_parse {
         let holdings = vec![make_position("000001", "测试")];
         let mut by_code = HashMap::new();
         by_code.insert("000001".to_string(), ("测试".to_string(), Some(make_md("减持观望", Some(48.0)))));
-        let decisions = decisions_from_llm(&holdings, &by_code);
+        let quote_map: HashMap<String, (f64, f64)> = HashMap::new();
+        let decisions = decisions_from_llm(&holdings, &by_code, &quote_map);
         assert_eq!(decisions[0].action, Action::Reduce);
         assert_eq!(decisions[0].priority, Priority::P1);
     }
@@ -569,7 +580,7 @@ mod tests_llm_parse {
         let holdings = vec![make_position("000001", "测试")];
         let mut by_code = HashMap::new();
         by_code.insert("000001".to_string(), ("测试".to_string(), Some(make_md("观望", Some(50.0)))));
-        let decisions = decisions_from_llm(&holdings, &by_code);
+        let quote_map: std::collections::HashMap<String, (f64, f64)> = std::collections::HashMap::new(); let decisions = decisions_from_llm(&holdings, &by_code, &quote_map);
         assert_eq!(decisions[0].action, Action::Hold);
         assert_eq!(decisions[0].priority, Priority::P2);
     }
@@ -580,7 +591,7 @@ mod tests_llm_parse {
         let holdings = vec![make_position("000001", "测试")];
         let mut by_code = HashMap::new();
         by_code.insert("000001".to_string(), ("测试".to_string(), Some(make_md("加仓", Some(80.0)))));
-        let decisions = decisions_from_llm(&holdings, &by_code);
+        let quote_map: std::collections::HashMap<String, (f64, f64)> = std::collections::HashMap::new(); let decisions = decisions_from_llm(&holdings, &by_code, &quote_map);
         assert_eq!(decisions[0].action, Action::WatchAdd);
         assert_eq!(decisions[0].priority, Priority::P2);
     }
@@ -590,7 +601,7 @@ mod tests_llm_parse {
     fn llm_missing_fallback_hold() {
         let holdings = vec![make_position("000001", "测试")];
         let by_code: HashMap<String, (String, Option<String>)> = HashMap::new(); // 缺失
-        let decisions = decisions_from_llm(&holdings, &by_code);
+        let quote_map: std::collections::HashMap<String, (f64, f64)> = std::collections::HashMap::new(); let decisions = decisions_from_llm(&holdings, &by_code, &quote_map);
         assert_eq!(decisions[0].action, Action::Hold);
         assert_eq!(decisions[0].priority, Priority::P2);
         assert!(decisions[0].reasons[0].text.contains("默认 Hold"));
@@ -712,7 +723,7 @@ mod tests_llm_parse {
             ("合肥城建".to_string(), Some(llm_md.to_string())),
         );
         let holdings = vec![make_position("002208", "合肥城建")];
-        let decisions = decisions_from_llm(&holdings, &by_code);
+        let quote_map: std::collections::HashMap<String, (f64, f64)> = std::collections::HashMap::new(); let decisions = decisions_from_llm(&holdings, &by_code, &quote_map);
         assert_eq!(decisions.len(), 1);
         // "偏空" 关键词命中 → Reduce + P1
         assert_eq!(decisions[0].action, Action::Reduce, "LLM 真实输出 '偏空' 应映射到 Reduce");
@@ -741,7 +752,7 @@ mod tests_llm_parse {
             ("利欧股份".to_string(), Some(llm_md.to_string())),
         );
         let holdings = vec![make_position("002131", "利欧股份")];
-        let decisions = decisions_from_llm(&holdings, &by_code);
+        let quote_map: std::collections::HashMap<String, (f64, f64)> = std::collections::HashMap::new(); let decisions = decisions_from_llm(&holdings, &by_code, &quote_map);
         assert_eq!(decisions[0].action, Action::Reduce);
         assert_eq!(decisions[0].priority, Priority::P1);
     }

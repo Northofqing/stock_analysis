@@ -2026,6 +2026,7 @@ async fn run_review_only() {
 /// 实际复盘子流程 (被 run_review_only 包 5min timeout).
 /// 单独提出便于测试 + 控制超时粒度.
 async fn run_review_only_inner() {
+    // v62: 6-tuple 返回 (实盘数据误差修复需要 quotes, 第二轮 fetch 在外部重新拉)
     let (report, holding_breakout_text, watch_breakout_text, market_breakout_text, risk_text) =
         tokio::task::spawn_blocking(|| {
             let holdings = stock_analysis::portfolio::get_positions().unwrap_or_default();
@@ -2730,8 +2731,18 @@ async fn run_review_deep_analysis(
     // 聚合推送: 走持仓决策台 (P0-5 commit 2 替换原 build_holding_summary 字符串猜)
     // v14.2 路径: decisions_from_llm (commit 1) → format_decision_board (commit C 渲染)
     // by_code 不再被 .remove() 走, 决策台能拿到 LLM 终稿
-    let decisions =
-        stock_analysis::decision::decision_decide::decisions_from_llm(&holdings, &by_code);
+    // v62: 用真报价填 current_price / change_pct (F1 实盘数据误差修复)
+    //   - 第二轮 fetch (第一轮 quotes 已被 spawn_blocking move 走)
+    let r_quotes2 = market_data::fetch_position_quotes();
+    let quote_map: std::collections::HashMap<String, (f64, f64)> = r_quotes2
+        .iter()
+        .map(|q| (q.code.clone(), (q.price, q.change_pct)))
+        .collect();
+    let decisions = stock_analysis::decision::decision_decide::decisions_from_llm(
+        &holdings,
+        &by_code,
+        &quote_map,
+    );
     let summary = stock_analysis::decision::decision_render::format_decision_board(&decisions);
     // v19.3: 风险段 (止损+轮动+现金) 合并到持仓决策台 (1 张卡全信息)
     let mut combined = summary.clone();
