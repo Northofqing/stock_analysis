@@ -3063,6 +3063,8 @@ async fn monitor_loop() {
         let mut virtual_observation: Vec<(String, String, f64)> = Vec::new(); // (code, name, open_price)
         let mut post_close_candidates_notified = false;
         let mut virtual_snapshot_persisted = false;
+        // v32: P-01 盘前新闻热点 — 每个交易日首次进入 9:00-9:15 窗口时推一次
+        let mut preopen_pushed = false;
         let entry_mode = air_refuel_entry_mode();
         let monitor_cfg = stock_analysis::config::get_monitor_config();
         let confirm_shares = monitor_cfg.air_refuel.confirm_lots.saturating_mul(100);
@@ -3070,6 +3072,26 @@ async fn monitor_loop() {
 
         loop {
             let session = current_session();
+
+            // ═══════════════════════════════════════════════════════════════
+            // v32: P-01 盘前新闻热点 (9:00-9:15 窗口, 每日首次)
+            //   - 触发: 首次进入 9:00 ≤ now < 9:15, 每个 monitor_loop session 推一次
+            //   - 数据源: news_monitor 拉今日 + 昨日要闻 + 板块聚类
+            //   - 模板: render_preopen_news_hot (无 banner, ℹ️参考级)
+            //   - 静默: 公告空时短路
+            //   - 注意: P-02 竞价量能 / P-03 候选触发 已有独立路径, 不在此重复
+            // ═══════════════════════════════════════════════════════════════
+            if !preopen_pushed && session == MarketSession::Closed {
+                let now_time = chrono::Local::now().time();
+                let preopen_start = chrono::NaiveTime::from_hms_opt(9, 0, 0).unwrap();
+                let preopen_end = chrono::NaiveTime::from_hms_opt(9, 15, 0).unwrap();
+                if now_time >= preopen_start && now_time < preopen_end {
+                    log::info!("[P-01] 盘前窗口 ({}-{}), 推盘前新闻热点",
+                        preopen_start.format("%H:%M"), preopen_end.format("%H:%M"));
+                    let _ = push_templates::dispatch_preopen_news_hot_daily().await;
+                    preopen_pushed = true;
+                }
+            }
 
             // ============= v12 MVP0-B: T-02 数据状态每分钟评估 =============
             // 任一 capability staleness > 120s → Degraded; Quote stale > 120s → Unsafe
