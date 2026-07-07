@@ -1594,7 +1594,18 @@ async fn run_test_scan() {
                     kind: k.as_str(),
                 })
                 .collect();
-            pt::render_event_calendar(&today_str_t, &events_ref, &ann_summary, "+0.8%", "7.18")
+            // v64: 隔夜关注数据 (美股 + 汇率) 真值 — 雅虎财经 API
+            //   旧: 写死 "+0.8%" "7.18" 假数据 (用户报"隔夜关注数据不对")
+            //   新: 拉 ^IXIC ^DJI ^GSPC + CNY=X 真值
+            let (us_summary, fx_summary) =
+                stock_analysis::data_provider::yahoo::fetch_overnight_data();
+            pt::render_event_calendar(
+                &today_str_t,
+                &events_ref,
+                &ann_summary,
+                &us_summary,
+                &fx_summary,
+            )
         };
         (r01, r02, r08)
     })
@@ -2599,8 +2610,16 @@ async fn run_review_only_inner() {
                     kind: k.as_str(),
                 })
                 .collect();
-            let text =
-                pt::render_event_calendar(&today_str2, &events_ref, &ann_summary, "+0.8%", "7.18");
+            // v64: 隔夜关注真值 (美股 + 汇率 雅虎 API)
+            let (us_summary2, fx_summary2) =
+                stock_analysis::data_provider::yahoo::fetch_overnight_data();
+            let text = pt::render_event_calendar(
+                &today_str2,
+                &events_ref,
+                &ann_summary,
+                &us_summary2,
+                &fx_summary2,
+            );
             log::info!("[v12-R08]\n{}", text);
             notify::push_governor(&text, notify::PushKind::EventCalendar).await;
         }
