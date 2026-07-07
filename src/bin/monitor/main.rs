@@ -3071,6 +3071,7 @@ async fn monitor_loop() {
         let mut last_screener_run = std::time::Instant::now(); // 选股推荐（30分钟）
         let mut last_fund_top_push = std::time::Instant::now(); // 全市场主力净流入Top10（5分钟）
         let mut last_intraday_market = std::time::Instant::now(); // v31: I-01 盘中轮动总览 (10 min)
+        let mut last_industry_chain_intraday = std::time::Instant::now(); // v34: I-03 涨停扩散 (15 min)
                                                                 // 产业链扫描已移至 news_monitor_loop 的 8:00-22:00 窗口统一调度。
         let mut was_limit_up: std::collections::HashSet<String> = std::collections::HashSet::new();
         // 连板追踪：已推送过的标的不重复推送；board_level_cache 存 1=首板/2=二板/3+=三板
@@ -3924,6 +3925,27 @@ async fn monitor_loop() {
                         let hhmm = chrono::Local::now().format("%H:%M").to_string();
                         let _ = dispatch_intraday_market_daily(&hhmm, &banner).await;
                         last_intraday_market = std::time::Instant::now();
+                    }
+
+                    // ═══════════════════════════════════════════════════════════════
+                    // v34: I-03 涨停扩散与板块补涨 (15 min 周期, 与 v18 LimitBoards 互补)
+                    //   - 数据源: limit_up_stocks + chain_mapper 板块归类
+                    //   - 模板: render_industry_chain_intraday (主链 + 龙头 + 补涨候选)
+                    //   - 静默: 涨停池空时短路
+                    //   - 与 v18 LimitBoards (首板/二板/三板 split) 互补不冲突
+                    // ═══════════════════════════════════════════════════════════════
+                    if last_industry_chain_intraday.elapsed().as_secs() >= 900 {
+                        use push_templates::dispatch_industry_chain_intraday_daily;
+                        let banner = push_templates::BannerCtx {
+                            account_mode: push_templates::AccountMode::Normal,
+                            total_pos: 0,
+                            today_pnl: 0.0,
+                            data_mode: push_templates::DataMode::Full,
+                            data_missing_note: None,
+                        };
+                        let hhmm = chrono::Local::now().format("%H:%M").to_string();
+                        let _ = dispatch_industry_chain_intraday_daily(&hhmm, &banner).await;
+                        last_industry_chain_intraday = std::time::Instant::now();
                     }
                 }
             }
