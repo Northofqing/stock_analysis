@@ -2289,6 +2289,97 @@ pub async fn dispatch_paper_review_daily(date: &str) -> bool {
 // v35: A-10 盘后题材催化复盘 dispatcher
 // ============================================================================
 
+/// v54: T-14/T-15 事件数据源
+///   - 真实数据源: trade_pipeline::fetch_pending_events()
+///   - 沙箱: 永远返回空 (无 broker)
+///   - 真实 intent: broker 委托/成交回报 event 触发
+use serde::Serialize;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TradeEvent {
+    pub exchange: Exchange,
+    pub code: String,
+    pub name: String,
+    /// price: 委托/成交价
+    pub price: f64,
+    pub qty: u32,
+    /// event_type: "order" (T-14) | "fill" (T-15)
+    pub event_type: String,
+    /// order_id: 委托 ID (T-14 必填, T-15 选填)
+    pub order_id: Option<String>,
+    /// status: 委托状态 (T-14)
+    pub status: Option<OrderStatus>,
+    /// next_session_carry: 是否过户到次一交易日 (T-15)
+    pub next_session_carry: Option<bool>,
+}
+
+/// v54: trade_pipeline stub
+///   - 真实 intent: 接 broker API (东财/华泰/银河), 拉委托 + 成交回报
+///   - 沙箱: 返回空 (broker 接入后续 PR)
+pub fn fetch_pending_trade_events() -> Vec<TradeEvent> {
+    // 沙箱无 broker. 真实实现:
+    //   1. 调 data_provider::order_api::fetch_pending_orders()
+    //   2. 调 data_provider::fill_api::fetch_today_fills()
+    //   3. 转 TradeEvent
+    log::debug!("[v54 trade_pipeline] 沙箱无 broker, 返回空");
+    Vec::new()
+}
+
+/// v54: T-14/T-15 dispatcher (事件驱动入口)
+///   - 拉 trade_pipeline 事件, 按 event_type 分发到 T-14/T-15
+///   - 沙箱: 事件空, 静默
+pub async fn dispatch_trade_pipeline_daily(hhmm: &str) -> bool {
+    let events = fetch_pending_trade_events();
+    if events.is_empty() {
+        log_dispatcher_attempt("T-14/T-15", false, 0, "trade_pipeline empty");
+        log::info!("[T-14/T-15] trade_pipeline 空 (沙箱无 broker), 跳过");
+        return false;
+    }
+    let mut pushed = 0;
+    for ev in events {
+        let result = match ev.event_type.as_str() {
+            "order" => {
+                if let (Some(oid), Some(status)) = (&ev.order_id, &ev.status) {
+                    dispatch_post_fixed_price_order(
+                        ev.exchange,
+                        hhmm,
+                        &ev.name,
+                        &ev.code,
+                        ev.price,
+                        ev.qty,
+                        oid,
+                        *status,
+                    )
+                    .await
+                } else {
+                    log::warn!("[T-14] 事件缺 order_id/status, 跳过");
+                    continue;
+                }
+            }
+            "fill" => dispatch_post_fixed_price_fill(
+                ev.exchange,
+                hhmm,
+                &ev.name,
+                &ev.code,
+                ev.price,
+                ev.qty,
+                None,                 // vs_limit_pct 后续 PR 算
+                ev.next_session_carry.unwrap_or(false),
+            )
+            .await,
+            other => {
+                log::warn!("[T-14/T-15] 未知 event_type: {}", other);
+                continue;
+            }
+        };
+        if result {
+            pushed += 1;
+        }
+    }
+    log_dispatcher_attempt("T-14/T-15", pushed > 0, pushed, "");
+    pushed > 0
+}
+
 /// v44: T-14 盘后固定价格申报 dispatcher
 ///   - 数据源: 委托回报 event (持仓/候选股)
 ///   - 简化: 沙箱无委托系统, 接受外部 caller 传具体 (exchange, code, name, price, qty, order_id, status)
@@ -3647,7 +3738,7 @@ pub fn render_industry_chain_intraday(
 }
 
 /// v13.1 §5.2 交易所
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Exchange {
     SH, // 沪市 A 股/ETF (9:30-11:30, 13:00-15:30)
     SZ, // 深市 A 股/ETF (9:15-11:30, 13:00-15:30)
@@ -3655,7 +3746,7 @@ pub enum Exchange {
 }
 
 /// v13.1 §5.2 委托状态
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum OrderStatus {
     Submitted, // 已报
     Cancelled, // 已撤

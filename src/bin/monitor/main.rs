@@ -4112,23 +4112,19 @@ async fn monitor_loop() {
                     }
 
                     // ═══════════════════════════════════════════════════════════════
-                    // v44: T-14 盘后固定价格申报 (15 min 周期, 申报窗口 9:30-15:30)
-                    //   - 数据源: 委托回报 (trade_pipeline 接入后)
-                    //   - 沙箱无委托系统, 走通 push_governor 链路即可
-                    //   - 真实 intent: 委托回报 event 触发
-                    // ═══════════════════════════════════════════════════════════════
+                    // v44 + v54: T-14/T-15 trade_pipeline 调度
+                    //   - 15 min (T-14) + 5 min (T-15) 轮询 trade_pipeline
+                    //   - 沙箱: trade_pipeline 空, 静默短路
+                    //   - 真实 intent: broker 委托/成交回报 event
                     if last_post_fixed_order.elapsed().as_secs() >= 900 {
-                        log::info!("[T-14] 盘后固定价格申报 ticker (沙箱无委托系统, 静默)");
+                        let hhmm = chrono::Local::now().format("%H:%M").to_string();
+                        let _ = push_templates::dispatch_trade_pipeline_daily(&hhmm).await;
                         last_post_fixed_order = std::time::Instant::now();
                     }
 
-                    // ═══════════════════════════════════════════════════════════════
-                    // v45: T-15 盘后固定价格成交 (5 min 周期, 撮合 15:05-15:30)
-                    //   - 数据源: 成交回报
-                    //   - 真实 intent: 成交回报 event 触发
-                    // ═══════════════════════════════════════════════════════════════
                     if last_post_fixed_fill.elapsed().as_secs() >= 300 {
-                        log::info!("[T-15] 盘后固定价格成交 ticker (沙箱无成交回报, 静默)");
+                        let hhmm = chrono::Local::now().format("%H:%M").to_string();
+                        let _ = push_templates::dispatch_trade_pipeline_daily(&hhmm).await;
                         last_post_fixed_fill = std::time::Instant::now();
                     }
 
