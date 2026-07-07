@@ -173,6 +173,32 @@ pub async fn run_v13_diag() -> V13DiagReport {
         "ok: dispatcher wired (新规 北交所均价口径)".to_string()
     }));
 
+    // v58: P-05 虚拟观察仓 (开盘 9:30 推一次)
+    steps.push(check_step("P-05", "render_template", || {
+        use super::push_templates::{
+            render_virtual_watch, VirtualWatchItem, VirtualWatchParams,
+        };
+        let items = vec![VirtualWatchItem {
+            name: "测试股",
+            code: "600000",
+            open_price: 10.0,
+            shares: 1000,
+            estimated_amount: 10000.0,
+        }];
+        let text = render_virtual_watch(VirtualWatchParams {
+            hhmm: "09:30",
+            shares_per_lot: 1000,
+            items,
+            total_amount: 10000.0,
+            item_count: 1,
+        });
+        if text.contains("🔍 虚拟观察仓位") && text.contains("测试股(600000)") {
+            "ok: template wired (P-05 v12 §14.5)".to_string()
+        } else {
+            "error: template format wrong".to_string()
+        }
+    }));
+
     // 总结
     let ok_steps = steps.iter().filter(|s| s.status == "ok").count();
     let empty_steps = steps.iter().filter(|s| s.status == "empty").count();

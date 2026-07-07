@@ -578,6 +578,112 @@ impl PaperTradeStatus {
     }
 }
 
+// ============================================================================
+// v58: P-05 虚拟观察仓 (v12 §14.5 新增)
+// ============================================================================
+
+/// v58: P-05 虚拟观察条目
+#[derive(Debug, Clone)]
+pub struct VirtualWatchItem<'a> {
+    pub name: &'a str,
+    pub code: &'a str,
+    pub open_price: f64,
+    pub shares: u32,
+    pub estimated_amount: f64,
+}
+
+/// v58: P-05 模板参数
+#[derive(Debug)]
+pub struct VirtualWatchParams<'a> {
+    pub hhmm: &'a str,
+    pub shares_per_lot: u32, // 每股/手
+    pub items: Vec<VirtualWatchItem<'a>>,
+    pub total_amount: f64,
+    pub item_count: usize,
+}
+
+/// v58: P-05 模板渲染 (无 banner, ℹ️参考级)
+/// 模板示例:
+/// ```
+/// 🔍 虚拟观察仓位（{HH:MM}）
+///
+/// · {name}({code}) @ ¥{price} | {shares}股 预计 ¥{amount}
+/// · ...
+///
+/// 合计虚拟敞口: ¥{total} ({shares}股×{item_count}只)
+/// ⚠️ 仅做观察、研究用途，未实际下单
+/// 辅助建议, 非下单指令
+/// ```
+pub fn render_virtual_watch(p: VirtualWatchParams<'_>) -> String {
+    let mut s = format!("🔍 虚拟观察仓位（{}）\n", p.hhmm);
+    if p.items.is_empty() {
+        s.push_str("⚠️ 候选空, 跳过\n");
+        return s;
+    }
+    s.push('\n');
+    for item in &p.items {
+        s.push_str(&format!(
+            "· {}({}) @ ¥{:.2} | {}股 预计 ¥{:.0}\n",
+            item.name, item.code, item.open_price, item.shares, item.estimated_amount
+        ));
+    }
+    s.push_str(&format!(
+        "\n合计虚拟敞口: ¥{:.0} ({}股×{}只)",
+        p.total_amount, p.shares_per_lot, p.item_count
+    ));
+    s.push_str("\n⚠️ 仅做观察、研究用途，未实际下单");
+    s.push_str("\n辅助建议, 非下单指令");
+    s
+}
+
+/// v58: P-05 dispatcher
+///   数据源: monitor_loop 维护的 virtual_observation (9:30 开盘已 populate)
+///   触发: 9:30 开盘一次 (已 v57 改为 --push 路径, 这里保留 monitor_loop 调用入口)
+pub async fn dispatch_virtual_watch_daily(
+    hhmm: &str,
+    virtual_observation: &[(String, String, f64)], // (code, name, open_price)
+    shares_per_lot: u32,
+) -> bool {
+    if virtual_observation.is_empty() {
+        log_dispatcher_attempt("P-05", false, 0, "virtual_observation empty");
+        log::info!("[P-05] virtual_observation 空, 跳过推送");
+        return false;
+    }
+    // 过滤 open_price > 0 的项
+    let items: Vec<VirtualWatchItem> = virtual_observation
+        .iter()
+        .filter(|(_, _, price)| *price > 0.0)
+        .map(|(code, name, price)| {
+            let amount = price * shares_per_lot as f64;
+            VirtualWatchItem {
+                name: name.as_str(),
+                code: code.as_str(),
+                open_price: *price,
+                shares: shares_per_lot,
+                estimated_amount: amount,
+            }
+        })
+        .collect();
+    if items.is_empty() {
+        log_dispatcher_attempt("P-05", false, 0, "all items price=0");
+        log::info!("[P-05] 所有项开盘价=0, 跳过");
+        return false;
+    }
+    let total_amount: f64 = items.iter().map(|i| i.estimated_amount).sum();
+    let item_count = items.len();
+    let params = VirtualWatchParams {
+        hhmm,
+        shares_per_lot,
+        items,
+        total_amount,
+        item_count,
+    };
+    let text = render_virtual_watch(params);
+    let result = dispatch(crate::notify::PushKind::VirtualWatch, "", None, text).await;
+    log_dispatcher_attempt("P-05", result, item_count, "");
+    result
+}
+
 /// v12 §14.1 T-10 PaperTrade 模板渲染 — 字段顺序严格对齐 docs/architecture/v13-push-templates.md
 pub fn render_paper_trade(p: PaperTradeParams<'_>) -> String {
     let mut out = format!(
@@ -8184,6 +8290,54 @@ mod tests {
             "至少 15 个模板应推送成功, 实得 {}",
             success_count
         );
+    }
+
+    // v58: P-05 虚拟观察仓 模板测试
+    #[test]
+    fn test_p05_virtual_watch_template() {
+        use super::{render_virtual_watch, VirtualWatchItem, VirtualWatchParams};
+        let items = vec![
+            VirtualWatchItem {
+                name: "XX科技",
+                code: "000001",
+                open_price: 12.30,
+                shares: 1000,
+                estimated_amount: 12300.0,
+            },
+            VirtualWatchItem {
+                name: "YY股份",
+                code: "002049",
+                open_price: 100.50,
+                shares: 1000,
+                estimated_amount: 100500.0,
+            },
+        ];
+        let text = render_virtual_watch(VirtualWatchParams {
+            hhmm: "09:30",
+            shares_per_lot: 1000,
+            items,
+            total_amount: 112800.0,
+            item_count: 2,
+        });
+        assert!(text.contains("🔍 虚拟观察仓位（09:30）"));
+        assert!(text.contains("· XX科技(000001) @ ¥12.30 | 1000股 预计 ¥12300"));
+        assert!(text.contains("· YY股份(002049) @ ¥100.50 | 1000股 预计 ¥100500"));
+        assert!(text.contains("合计虚拟敞口: ¥112800 (1000股×2只)"));
+        assert!(text.contains("⚠️ 仅做观察、研究用途，未实际下单"));
+        assert!(text.ends_with("辅助建议, 非下单指令"));
+    }
+
+    #[test]
+    fn test_p05_virtual_watch_empty() {
+        use super::{render_virtual_watch, VirtualWatchParams};
+        let text = render_virtual_watch(VirtualWatchParams {
+            hhmm: "09:30",
+            shares_per_lot: 1000,
+            items: vec![],
+            total_amount: 0.0,
+            item_count: 0,
+        });
+        assert!(text.contains("⚠️ 候选空, 跳过"));
     }
 
     // v29: D-01 dispatcher memo 测试

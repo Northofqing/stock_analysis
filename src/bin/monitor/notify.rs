@@ -268,6 +268,8 @@ impl PushKind {
             PushKind::BlockTradePriceRange => Some(3600),                     // 60 min/票
             PushKind::PaperReview => Some(86_400),                             // 1次/日
             PushKind::CandidateInvalidated => Some(1800),                      // 30 min
+            // v58: P-05 虚拟观察仓 (开盘 9:30 推一次, 1次/日)
+            PushKind::VirtualWatch => Some(86_400),                           // 1次/日
             _ => Some(1800),                                                  // 默认 30min
         }
     }

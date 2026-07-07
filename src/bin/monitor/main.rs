@@ -3499,7 +3499,7 @@ async fn monitor_loop() {
                         && virtual_observation.iter().all(|(_, _, p)| *p == 0.0)
                     {
                         log::info!(
-                            "[开盘] 虚拟观察仓位初始化（{}手 × {}只）",
+                            "[P-05 开盘] 虚拟观察仓位初始化（{}手 × {}只）",
                             confirm_shares / 100,
                             virtual_observation.len()
                         );
@@ -3522,54 +3522,45 @@ async fn monitor_loop() {
                             }
                         }
 
-                        // 推送虚拟观察仓位摘要
-                        let mut virtual_lines = vec![
-                            format!(
-                                "🔍 虚拟观察仓位（盘后优选·开盘价·{}手/只）",
-                                confirm_shares / 100
-                            ),
-                            "".to_string(),
-                        ];
-                        let mut total_amount = 0.0;
-                        let mut records: Vec<VirtualObservationRecord> = Vec::new();
-                        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-                        for (code, name, price) in &virtual_observation {
-                            if *price > 0.0 {
-                                let amount = price * confirm_shares as f64;
-                                total_amount += amount;
-                                virtual_lines.push(format!(
-                                    "  {}({}) @ ¥{:.2} | {}股 预计 ¥{:.0}",
-                                    name, code, price, confirm_shares, amount
-                                ));
-                                records.push(VirtualObservationRecord {
-                                    entry_date: today.clone(),
-                                    code: code.clone(),
-                                    name: name.clone(),
-                                    entry_price: *price,
-                                    shares: confirm_shares,
-                                    entry_mode: "confirm".to_string(),
-                                });
+                        // v58: 持久化虚拟观察快照 (保留旧逻辑)
+                        if !virtual_snapshot_persisted {
+                            let mut records: Vec<VirtualObservationRecord> = Vec::new();
+                            let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+                            for (code, name, price) in &virtual_observation {
+                                if *price > 0.0 {
+                                    records.push(VirtualObservationRecord {
+                                        entry_date: today.clone(),
+                                        code: code.clone(),
+                                        name: name.clone(),
+                                        entry_price: *price,
+                                        shares: confirm_shares,
+                                        entry_mode: "confirm".to_string(),
+                                    });
+                                }
+                            }
+                            if !records.is_empty() {
+                                persist_virtual_observation_snapshot(&records);
+                                virtual_snapshot_persisted = true;
                             }
                         }
-                        virtual_lines.push(format!(
-                            "\n合计虚拟敞口: ¥{:.0} ({}股×{}只)",
-                            total_amount,
+
+                        // v58: 改用 v12 §14.5 P-05 dispatcher (替代内联 lines.join)
+                        let hhmm = chrono::Local::now().format("%H:%M").to_string();
+                        let total_amount: f64 = virtual_observation
+                            .iter()
+                            .filter(|(_, _, p)| *p > 0.0)
+                            .map(|(_, _, p)| p * confirm_shares as f64)
+                            .sum();
+                        let _ = push_templates::dispatch_virtual_watch_daily(
+                            &hhmm,
+                            &virtual_observation,
                             confirm_shares,
-                            virtual_observation.len()
-                        ));
-                        virtual_lines.push("\n⚠️ 仅做观察、研究用途，未实际下单".to_string());
-
-                        if !virtual_snapshot_persisted && !records.is_empty() {
-                            persist_virtual_observation_snapshot(&records);
-                            virtual_snapshot_persisted = true;
-                        }
-
-                        notify::push_governor(
-                            &virtual_lines.join("\n"),
-                            notify::PushKind::VirtualWatch,
                         )
                         .await;
-                        log::info!("[开盘] 虚拟观察仓位已推送（合计 ¥{:.0}）", total_amount);
+                        log::info!(
+                            "[P-05 开盘] 虚拟观察仓位已推送（合计 ¥{:.0}）",
+                            total_amount
+                        );
                     }
 
                     // 首板/二板/三板识别：全市场涨停池，各自独立消息，每只仅推一次
