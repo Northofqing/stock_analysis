@@ -3119,6 +3119,9 @@ async fn monitor_loop() {
                     log::info!("[P-01] 盘前窗口 ({}-{}), 推盘前新闻热点",
                         preopen_start.format("%H:%M"), preopen_end.format("%H:%M"));
                     let _ = push_templates::dispatch_preopen_news_hot_daily().await;
+                    // v39: P-03 候选触发 (同盘前窗口, 影子开关控制)
+                    let hhmm = chrono::Local::now().format("%H:%M").to_string();
+                    let _ = push_templates::dispatch_candidate_triggered_daily(&hhmm).await;
                     preopen_pushed = true;
                 }
             }

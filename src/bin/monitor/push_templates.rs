@@ -2289,6 +2289,88 @@ pub async fn dispatch_paper_review_daily(date: &str) -> bool {
 // v35: A-10 盘后题材催化复盘 dispatcher
 // ============================================================================
 
+/// v39: P-03 候选触发 dispatcher
+///   - 候选台取 top 1 candidate (按 source_count 排序)
+///   - is_candidate_live_enabled 影子开关 (默认 false)
+///   - 简化版: 推送 1 条 A 档候选, evidence 拼成 trigger_desc
+pub async fn dispatch_candidate_triggered_daily(hhmm: &str) -> bool {
+    use stock_analysis::opportunity::candidate_panel::{
+        merge_candidates, CandidateSource, EvidenceTier,
+    };
+    use stock_analysis::opportunity::candidate_state::is_candidate_live_enabled;
+
+    if !is_candidate_live_enabled(None) {
+        log_dispatcher_attempt("P-03", false, 0, "candidate_live disabled");
+        log::info!("[P-03] 候选触发被影子开关拦截 (需 ENABLE_CANDIDATE_LIVE=true)");
+        return false;
+    }
+
+    // 复用 load_news_to_idea_snapshot_real 的多源合并逻辑 (P5 4 路 + IndustryChain)
+    // 简化: 直接调 merge_candidates, 给定空 items (实际应从各 P5 源拉)
+    let items: Vec<(CandidateSource, String, String)> = Vec::new();
+    let mut candidates = merge_candidates(items);
+    if candidates.is_empty() {
+        // 兜底: 从 chain_daily 拉 cluster 头部
+        use stock_analysis::database::DatabaseManager;
+        let clusters = DatabaseManager::get().get_latest_chain_clusters();
+        if let Some(top) = clusters.first() {
+            let code = top
+                .stocks
+                .trim_matches(|ch| ch == '[' || ch == ']')
+                .split(',')
+                .next()
+                .map(|s| s.trim_matches('"').trim().to_string())
+                .unwrap_or_default();
+            if !code.is_empty() {
+                candidates.push(stock_analysis::opportunity::candidate_panel::CandidateEntry {
+                    code: code.clone(),
+                    name: top.concept.clone(),
+                    sources: vec![CandidateSource::IndustryChain],
+                    tier: EvidenceTier::Theme,
+                    evidence: vec![format!("主线 {} 涨停梯队", top.concept)],
+                    current_price: 0.0,
+                    change_pct: 0.0,
+                });
+            }
+        }
+    }
+    if candidates.is_empty() {
+        log_dispatcher_attempt("P-03", false, 0, "candidates empty");
+        log::info!("[P-03] 候选台无候选, 跳过推送");
+        return false;
+    }
+
+    let top = &candidates[0];
+    let grade = if top.tier == EvidenceTier::Strong { CandidateGrade::A } else { CandidateGrade::B };
+    let topic = top.sources_label();
+    let trigger_desc = top.evidence.first().cloned().unwrap_or_else(|| "主线异动".to_string());
+    let banner = BannerCtx::default();
+    let params = CandidateTriggeredParams {
+        name: &top.name,
+        code: &top.code,
+        hhmm,
+        grade,
+        topic: &topic,
+        price: top.current_price,
+        trigger_desc: &trigger_desc,
+        lo: top.current_price * 0.97,
+        hi: top.current_price * 1.03,
+        stop: top.current_price * 0.95,
+        max_pos_pct: 10,
+        news_quality: EvidenceQuality::Mid,
+        news_note: "见 evidence",
+        vol_quality: EvidenceQuality::Mid,
+        vol_ratio: 1.0,
+        kline_quality: EvidenceQuality::Mid,
+        kline_note: "N/A",
+        book_quality: EvidenceQuality::Missing,
+        no_buy: &["一字板不可买".to_string(), "板块跳水".to_string()],
+    };
+    let result = push_candidate_triggered(&top.code, Some(&banner), params, None).await;
+    log_dispatcher_attempt("P-03", result, 1, "");
+    result
+}
+
 /// v38: I-04 持仓操作建议 dispatcher
 ///   - 简化版: 遍历当前持仓, 用 cost_price + hard_stop + 简单涨幅阈值生成 plan
 ///   - 真实意图: 接入 decision::evaluate_holding (v12.2 规划, 当前未实现)
