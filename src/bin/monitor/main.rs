@@ -3435,17 +3435,43 @@ async fn monitor_loop() {
                     tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
                     continue;
                 } else {
-                    // v40: P-04 虚拟盘成交回报 - 9:25 集合竞价结束推一次
+                    // v40 + v52: P-04 虚拟盘成交回报 - 9:25 集合竞价结束推一次
                     //   数据源: monitor_loop 维护的 virtual_observation
-                    //   模板: render_paper_trade (NotFilled, 标记已观察未成交)
+                    //   v52: 遍历每只虚拟仓, 单独推 PaperTrade 模板 (替代 v40 占位)
                     //   静默: virtual_observation 空时短路
                     {
                         let hhmm = chrono::Local::now().format("%H:%M").to_string();
-                        let _ = push_templates::dispatch_paper_trade_daily(
-                            &hhmm,
-                            virtual_observation.len(),
-                        )
-                        .await;
+                        if virtual_observation.is_empty() {
+                            log::info!("[P-04] virtual_observation 空, 跳过推送");
+                        } else {
+                            // v52: 每只虚拟仓单独推 (code/name/entry_price 真实)
+                            for (code, name, entry_price) in &virtual_observation {
+                                let status = if *entry_price > 0.0 {
+                                    push_templates::PaperTradeStatus::Filled
+                                } else {
+                                    push_templates::PaperTradeStatus::NotFilled
+                                };
+                                let _ = push_templates::dispatch_paper_trade_one(
+                                    &hhmm,
+                                    name,
+                                    code,
+                                    status,
+                                    if *entry_price > 0.0 { Some(*entry_price) } else { None },
+                                    None, // qty: monitor_loop 未存
+                                    Some(if *entry_price > 0.0 {
+                                        "开盘价触达"
+                                    } else {
+                                        "已观察未成交"
+                                    }),
+                                    Some(if *entry_price > 0.0 {
+                                        ""
+                                    } else {
+                                        "集合竞价后未触达买入价"
+                                    }),
+                                )
+                                .await;
+                            }
+                        }
                     }
                     // 9:15-9:20 等待即可
                     tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;

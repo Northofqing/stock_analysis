@@ -2525,11 +2525,45 @@ pub async fn push_paper_trade(code: &str, params: PaperTradeParams<'_>) -> bool 
     dispatch(crate::notify::PushKind::PaperTrade, code, None, text).await
 }
 
-/// v40: P-04 dispatcher
-///   - 虚拟盘成交回报 - 复用 monitor_loop 维护的 virtual_observation
-///   - 简化: 推 1 条 NotFilled 模板, 标记已观察但未成交
-///   - 真实数据: 应从 paper_trade 模块读成交回报 (后续 PR)
-///   - count 参数: 调用方传入 virtual_observation.len(), 避免重复 DB 查询
+/// v52: P-04 虚拟盘成交回报 dispatcher
+///   - 遍历 virtual_observation, 每只单独推 PaperTrade 模板
+///   - 真实数据: 调用方传 (name, code, entry_price, status, virtual_reason, not_fill_reason) 元组
+///   - 沙箱无 paper_trade 模块, 走通 push_governor 链路即可
+pub async fn dispatch_paper_trade_one(
+    hhmm: &str,
+    name: &str,
+    code: &str,
+    status: PaperTradeStatus,
+    fill_price: Option<f64>,
+    qty: Option<u32>,
+    virtual_reason: Option<&str>,
+    not_fill_reason: Option<&str>,
+) -> bool {
+    let params = PaperTradeParams {
+        name,
+        code,
+        hhmm,
+        status: status.clone(),
+        fill_price,
+        qty,
+        virtual_reason,
+        not_fill_reason,
+        account_mode: AccountMode::Normal,
+        data_mode: DataMode::Full,
+    };
+    let result = push_paper_trade(code, params).await;
+    log_dispatcher_attempt(
+        "P-04",
+        result,
+        1,
+        &format!("name={} status={:?}", name, status),
+    );
+    result
+}
+
+/// v40 + v52: P-04 batch dispatcher (兼容旧调用)
+///   - 旧签名 dispatch_paper_trade_daily(hhmm, count) 保留
+///   - 推 1 条占位 "NotFilled 虚拟仓" (旧逻辑, 等真实 paper_trade 模块接入后废弃)
 pub async fn dispatch_paper_trade_daily(hhmm: &str, count: usize) -> bool {
     if count == 0 {
         log_dispatcher_attempt("P-04", false, 0, "virtual_observation empty");
