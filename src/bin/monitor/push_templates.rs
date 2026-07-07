@@ -2327,6 +2327,43 @@ pub async fn dispatch_post_fixed_price_order(
     result
 }
 
+/// v45: T-15 盘后固定价格成交 dispatcher
+///   - 数据源: 成交回报 event
+///   - 撮合期 15:05-15:30
+///   - 模板: render_post_fixed_price_fill
+pub async fn dispatch_post_fixed_price_fill(
+    exchange: Exchange,
+    hhmm: &str,
+    name: &str,
+    code: &str,
+    fill_price: f64,
+    qty: u32,
+    vs_limit_pct: Option<f32>,
+    next_session_carry: bool,
+) -> bool {
+    let banner = BannerCtx::default();
+    let params = PostFixedPriceFillParams {
+        exchange,
+        hhmm,
+        name,
+        code,
+        fill_price,
+        qty,
+        vs_limit_pct,
+        next_session_carry,
+    };
+    let text = render_post_fixed_price_fill(params);
+    let result =
+        dispatch(crate::notify::PushKind::PostFixedPriceFill, code, Some(&banner), text).await;
+    log_dispatcher_attempt(
+        "T-15",
+        result,
+        1,
+        &format!("exchange={:?} fill_price={}", exchange, fill_price),
+    );
+    result
+}
+
 /// v40: P-04 虚拟盘成交 dispatcher 包装
 pub async fn push_paper_trade(code: &str, params: PaperTradeParams<'_>) -> bool {
     let text = render_paper_trade(params);
