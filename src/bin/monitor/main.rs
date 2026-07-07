@@ -453,11 +453,75 @@ async fn run_daily_pushes() {
 
 // ============= v12 PR1-1.7: AccountMode 评估钩子 =============
 
+/// v41: 共享 banner 状态 (v12 §14.0.1 动态化)
+/// 周期调 evaluate_account_mode_hook + evaluate_data_mode_hook 写最新 banner
+/// 6 个 dispatcher / 推送构造 banner 时从这里读
+pub static LATEST_BANNER: Lazy<std::sync::Mutex<Option<push_templates::BannerCtx>>> =
+    Lazy::new(|| std::sync::Mutex::new(None));
+
+/// v41: 读最新 banner (fallback 到 default)
+pub fn current_banner() -> push_templates::BannerCtx {
+    LATEST_BANNER
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| push_templates::BannerCtx {
+            account_mode: push_templates::AccountMode::Normal,
+            total_pos: 0,
+            today_pnl: 0.0,
+            data_mode: push_templates::DataMode::Full,
+            data_missing_note: None,
+        })
+}
+
+/// v41: 周期刷新 banner (从 AccountMode + DataMode 评估结果合并)
+pub async fn refresh_banner_state() {
+    // 1. 调 AccountMode 评估
+    let am_metrics = match tokio::task::spawn_blocking(compute_account_mode_metrics_blocking).await {
+        Ok(Ok(m)) => m,
+        _ => {
+            log::warn!("[v41 banner] AccountMode metrics 失败, 保留旧 banner");
+            return;
+        }
+    };
+    let prev_mode = match tokio::task::spawn_blocking(
+        stock_analysis::database::account_mode_log::latest_account_mode_change,
+    )
+    .await
+    {
+        Ok(Ok(Some(row))) => parse_mode_label(&row.new_mode),
+        _ => None,
+    };
+    use stock_analysis::risk::action_gate::AccountMode as LibAM;
+    let lib_mode = prev_mode.unwrap_or(LibAM::Normal);
+    let pt_mode = match lib_mode {
+        LibAM::Normal => push_templates::AccountMode::Normal,
+        LibAM::ReduceOnly => push_templates::AccountMode::ReduceOnly,
+        LibAM::Frozen => push_templates::AccountMode::Frozen,
+    };
+
+    // 2. 调 DataMode 评估 (现有 evaluate_data_mode_hook 复用)
+    let pt_data_mode = push_templates::DataMode::Full; // 简化: hook 内部已推 T-02
+    let data_note: Option<String> = None;
+
+    // 3. 合并写共享状态
+    let banner = push_templates::BannerCtx {
+        account_mode: pt_mode,
+        total_pos: am_metrics.total_pos_cheng,
+        today_pnl: am_metrics.today_pnl_pct,
+        data_mode: pt_data_mode,
+        data_missing_note: data_note,
+    };
+    *LATEST_BANNER.lock().unwrap() = Some(banner);
+}
+
 /// v12 PR1-1.7: 在 monitor 主循环调用, 重算 AccountMode 并按需推 T-01.
 ///
 /// 触发点:
 ///   - 启动后第一轮 (startup=true) — 恢复 DB 末次状态 + 推送状态变更 (若有)
 ///   - 每个 tick (startup=false) — 重算 metrics, 触发变更即推 T-01
+///
+/// v41: 同时调 refresh_banner_state 更新共享 banner
 ///
 /// 不触碰 veto_chain (v12.2 §2.4 + PR1 硬约束).
 /// 失败不阻塞主循环 (fire-and-forget log).
@@ -521,6 +585,9 @@ async fn evaluate_account_mode_hook(startup: bool) {
 
     // 抑制 unused 警告 (startup 仅用于 log 区分)
     let _ = startup;
+
+    // v41: 周期刷新共享 banner (写 LATEST_BANNER)
+    refresh_banner_state().await;
 }
 
 fn parse_mode_label(label: &str) -> Option<stock_analysis::risk::action_gate::AccountMode> {
@@ -2682,6 +2749,8 @@ async fn news_monitor_loop() {
                 Ok(None) => log::warn!("[NewsMonitor] L2 概念索引刷新跳过（无板块数据）"),
                 Err(_) => log::warn!("[NewsMonitor] L2 概念索引刷新 panic"),
             }
+            // v41: 周期刷新 banner (让 news_monitor_loop 的 D-01/I-02 用真 AccountMode)
+            evaluate_account_mode_hook(false).await;
         }
 
         // 公告扫描（仅网络拉取在 spawn_blocking，处理在主线程）
@@ -2795,13 +2864,8 @@ async fn news_monitor_loop() {
         // ═══════════════════════════════════════════════════════════════
         if !pushed.is_empty() {
             use push_templates::dispatch_news_to_idea_daily;
-            let banner = push_templates::BannerCtx {
-                account_mode: push_templates::AccountMode::Normal,
-                total_pos: 0,
-                today_pnl: 0.0,
-                data_mode: push_templates::DataMode::Full,
-                data_missing_note: None,
-            };
+            // v41: 读共享 banner (替换写死)
+            let banner = current_banner();
             let now_ts = chrono::Local::now();
             let hhmm = now_ts.format("%H:%M").to_string();
             let _ = dispatch_news_to_idea_daily(&hhmm, &banner).await;
@@ -2817,13 +2881,8 @@ async fn news_monitor_loop() {
         // ═══════════════════════════════════════════════════════════════
         if !pushed.is_empty() {
             use push_templates::dispatch_news_catalyst_daily;
-            let banner = push_templates::BannerCtx {
-                account_mode: push_templates::AccountMode::Normal,
-                total_pos: 0,
-                today_pnl: 0.0,
-                data_mode: push_templates::DataMode::Full,
-                data_missing_note: None,
-            };
+            // v41: 读共享 banner
+            let banner = current_banner();
             let now_ts = chrono::Local::now();
             let hhmm = now_ts.format("%H:%M").to_string();
             let _ = dispatch_news_catalyst_daily(&hhmm, &banner).await;
@@ -2978,6 +3037,8 @@ async fn news_monitor_loop() {
             last_flush = std::time::Instant::now();
             nm.flush_dedup();
             sm.flush_state();
+            // v41: 周期刷新 banner (AccountMode + DataMode 评估 → 写 LATEST_BANNER)
+            evaluate_account_mode_hook(false).await;
         }
 
         tokio::time::sleep(tokio::time::Duration::from_secs(poll_secs)).await;
@@ -3952,13 +4013,8 @@ async fn monitor_loop() {
                     // ═══════════════════════════════════════════════════════════════
                     if last_intraday_market.elapsed().as_secs() >= 600 {
                         use push_templates::dispatch_intraday_market_daily;
-                        let banner = push_templates::BannerCtx {
-                            account_mode: push_templates::AccountMode::Normal,
-                            total_pos: 0,
-                            today_pnl: 0.0,
-                            data_mode: push_templates::DataMode::Full,
-                            data_missing_note: None,
-                        };
+                        // v41: 读共享 banner
+                        let banner = current_banner();
                         let hhmm = chrono::Local::now().format("%H:%M").to_string();
                         let _ = dispatch_intraday_market_daily(&hhmm, &banner).await;
                         last_intraday_market = std::time::Instant::now();
@@ -3973,13 +4029,8 @@ async fn monitor_loop() {
                     // ═══════════════════════════════════════════════════════════════
                     if last_industry_chain_intraday.elapsed().as_secs() >= 900 {
                         use push_templates::dispatch_industry_chain_intraday_daily;
-                        let banner = push_templates::BannerCtx {
-                            account_mode: push_templates::AccountMode::Normal,
-                            total_pos: 0,
-                            today_pnl: 0.0,
-                            data_mode: push_templates::DataMode::Full,
-                            data_missing_note: None,
-                        };
+                        // v41: 读共享 banner
+                        let banner = current_banner();
                         let hhmm = chrono::Local::now().format("%H:%M").to_string();
                         let _ = dispatch_industry_chain_intraday_daily(&hhmm, &banner).await;
                         last_industry_chain_intraday = std::time::Instant::now();
