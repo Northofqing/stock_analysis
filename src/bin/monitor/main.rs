@@ -3598,6 +3598,27 @@ async fn monitor_loop() {
                             }
                         }
 
+                        // v63 (P-04 fix): 兜底拉 LLM 推荐的虚拟观察 codes 真报价
+                        //   - 旧 bug: virtual_pos 来自 LLM 文本解析, 但 fill 只查 user holdings/watchlist + 涨停
+                        //     限制, LLM 推的非持仓非涨停股 entry_price 永远 0.0 → push_virtual_next_day_review 跳过整条
+                        //   - 新: 显式 fetch_position_quotes 给所有 virtual_observation codes (无持仓关系)
+                        let virt_codes: Vec<String> = virtual_observation
+                            .iter()
+                            .filter(|(_, _, p)| *p == 0.0)
+                            .map(|(c, _, _)| c.clone())
+                            .collect();
+                        if !virt_codes.is_empty() {
+                            let virt_quotes = market_data::fetch_eastmoney_quotes(&virt_codes)
+                                .unwrap_or_default();
+                            for q in virt_quotes {
+                                for virtual_pos in &mut virtual_observation {
+                                    if virtual_pos.0 == q.code && virtual_pos.2 == 0.0 && q.price > 0.0 {
+                                        virtual_pos.2 = q.price;
+                                    }
+                                }
+                            }
+                        }
+
                         // v58: 持久化虚拟观察快照 (保留旧逻辑)
                         if !virtual_snapshot_persisted {
                             let mut records: Vec<VirtualObservationRecord> = Vec::new();
