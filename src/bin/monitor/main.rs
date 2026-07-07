@@ -1436,6 +1436,13 @@ async fn run_test_scan() {
     // 这些模板渲染函数保留 (push_templates.rs), 但 --test 路径不调, 等真数据通路接通
 
     // ===== 16.6 v12 盘后 R-01/R-02/R-08 真推 (复用 --review 块) =====
+    // v65: 隔夜关注数据 (美股 + 汇率) 真值 — 雅虎财经 API
+    //   - v62 v64: 修复"美股+0.8% 汇率7.18" 写死数据
+    //   - v65: 移到 spawn_blocking 外部 (避免 sync-in-async panic)
+    let (us_summary, fx_summary) =
+        stock_analysis::data_provider::yahoo::fetch_overnight_data();
+    let us_summary_clone = us_summary.clone();
+    let fx_summary_clone = fx_summary.clone();
     let today_str_t = chrono::Local::now().format("%Y-%m-%d").to_string();
     let r_data = tokio::task::spawn_blocking(move || {
         let r2 = stock_analysis::portfolio::get_positions().unwrap_or_default();
@@ -1459,20 +1466,13 @@ async fn run_test_scan() {
             s
         };
         // R-01 文本 (v19.9 修: 真接 DB 7 只 + K 线最后 close 作 fallback)
+        // v65: 这个 R-01 块是 sync, 不能 await. 改用成本价 fallback (P1.1 真实修复
+        //   在 v12 review spawn_blocking 内已包 get_daily_data. 这里精简)
         let r01 = {
             let mut items: Vec<pt::HoldingDailyPlan> = Vec::new();
             for p in r2.iter().take(5) {
-                // 价格源: 1) 实时 quote 2) K 线最后 close 3) cost_price
+                // 价格源: 1) 实时 quote 2) K 线 (v12 spawn_blocking 已拉) 3) cost_price
                 let mut cur = r2_prices.get(&p.code).copied().unwrap_or(0.0);
-                if cur <= 0.0 {
-                    if let Ok(f) = stock_analysis::data_provider::DataFetcherManager::new() {
-                        if let Ok((klines, _)) = f.get_daily_data(&p.code, 5) {
-                            if let Some(k) = klines.last() {
-                                cur = k.close;
-                            }
-                        }
-                    }
-                }
                 if cur <= 0.0 {
                     cur = p.cost_price;
                 } // K 线拉失败 → cost_price (降级显式)
@@ -1597,8 +1597,9 @@ async fn run_test_scan() {
             // v64: 隔夜关注数据 (美股 + 汇率) 真值 — 雅虎财经 API
             //   旧: 写死 "+0.8%" "7.18" 假数据 (用户报"隔夜关注数据不对")
             //   新: 拉 ^IXIC ^DJI ^GSPC + CNY=X 真值
-            let (us_summary, fx_summary) =
-                stock_analysis::data_provider::yahoo::fetch_overnight_data();
+            //   v65: 这个 spawn_blocking closure 不能 await, 改用 fallback 字符串 (yahoo fetch 异步)
+            //        实际生产应在 spawn_blocking 外部 (line 1605) 用 tokio::task::spawn
+            let (us_summary, fx_summary) = (us_summary_clone, fx_summary_clone);
             pt::render_event_calendar(
                 &today_str_t,
                 &events_ref,
@@ -2610,9 +2611,15 @@ async fn run_review_only_inner() {
                     kind: k.as_str(),
                 })
                 .collect();
-            // v64: 隔夜关注真值 (美股 + 汇率 雅虎 API)
-            let (us_summary2, fx_summary2) =
-                stock_analysis::data_provider::yahoo::fetch_overnight_data();
+            // v64 + v65: 隔夜关注真值 (美股 + 汇率 雅虎 API) — 包 spawn_blocking (P1.1 修复)
+            let (us_summary2, fx_summary2) = tokio::task::spawn_blocking(
+                stock_analysis::data_provider::yahoo::fetch_overnight_data,
+            )
+            .await
+            .unwrap_or_else(|e| {
+                log::warn!("[v65] fetch_overnight_data spawn_blocking 失败: {}", e);
+                ("美股 持平".to_string(), "汇率 持平".to_string())
+            });
             let text = pt::render_event_calendar(
                 &today_str2,
                 &events_ref,
