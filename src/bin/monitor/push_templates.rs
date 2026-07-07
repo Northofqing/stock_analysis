@@ -2408,6 +2408,40 @@ pub async fn dispatch_st_price_limit_changed(
     result
 }
 
+/// v47: T-17 ETF 收盘集合竞价 dispatcher
+///   - 新规 2026-07-06: 上交所基金收盘 14:57-15:00 集合竞价
+///   - 触发: 14:57 推一次 (1次/日)
+///   - 数据源: 持仓 DB (沪市 ETF 持仓) + 集合竞价行情
+///   - 真实 intent: 14:57 推一次
+pub async fn dispatch_etf_closing_call_auction(
+    hhmm: &str,
+    name: &str,
+    code: &str,
+    call_auction_price: Option<f64>,
+    vs_continuous_est: Option<f32>,
+    liquidity_note: &str,
+) -> bool {
+    // v47: T-17 是无 banner 盘后参考
+    let params = EtfClosingCallAuctionParams {
+        hhmm,
+        name,
+        code,
+        call_auction_price,
+        vs_continuous_est,
+        liquidity_note,
+    };
+    let text = render_etf_closing_call_auction(params);
+    let result = dispatch(
+        crate::notify::PushKind::EtfClosingCallAuction,
+        code,
+        None,
+        text,
+    )
+    .await;
+    log_dispatcher_attempt("T-17", result, 1, &format!("code={}", code));
+    result
+}
+
 /// v40: P-04 虚拟盘成交 dispatcher 包装
 pub async fn push_paper_trade(code: &str, params: PaperTradeParams<'_>) -> bool {
     let text = render_paper_trade(params);
