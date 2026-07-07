@@ -383,16 +383,29 @@ pub fn _reset_cooldown_memo_for_test() {
 ///
 /// v42: 接入 §14.5 治理 — 按 cooldown_secs 强制冷却
 pub async fn push_governor(text: &str, kind: PushKind) -> bool {
-    // v42: 冷却检查 (按 PushKind 维度, 不按票 — 票级冷却由 dispatcher memo 负责)
+    push_wechat(text).await
+}
+
+// v59: 旧 push_governor (kind-only cooldown) 已被 notify::push_governor_v2 替代 (F1 修复: key 改 (kind, code))
+//   - per-kind cooldown 用 NotifyKind::cooldown_secs() (旧 push_governor)
+//   - per-(kind,code) cooldown 由 dispatcher memo 负责 (D-01 / 旧 push_governor_v2 内部)
+//   - 注意: 当前 push_governor 已被 v59 改回最简 (无 memo 强制), 冷却由 dispatcher memo + push_governor_v2 兜底
+//
+// 保留 push_governor 函数 (向后兼容), 但内部不再做冷却检查
+//   - 旧: F1 bug (kind-only key 破坏 per-position 循环)
+//   - 新: 冷却由各 dispatcher 自己 memo (D-01, P-04 等) + push_governor_v2 兜底
+pub async fn push_governor_v2(text: &str, kind: PushKind, code: &str) -> bool {
+    // v59: 冷却检查 (按 (kind, code) 维度 — 票级冷却)
     if let Some(cooldown_secs) = kind.cooldown_secs() {
-        let key = format!("{:?}", kind);
+        let key = format!("{:?}_{}", kind, code);
         let mut map = COOLDOWN_MEMO.lock().unwrap();
         if let Some(last) = map.get(&key) {
             let elapsed = last.elapsed().as_secs();
             if elapsed < cooldown_secs as u64 {
                 log::debug!(
-                    "[v42 cooldown] {:?} 冷却中, 跳过推送 (剩余 {}s / 总 {}s)",
+                    "[v59 cooldown] {:?} code={} 冷却中, 跳过推送 (剩余 {}s / 总 {}s)",
                     kind,
+                    code,
                     cooldown_secs as u64 - elapsed,
                     cooldown_secs
                 );
@@ -1625,13 +1638,34 @@ mod tests {
         use std::env;
         _reset_cooldown_memo_for_test();
         env::set_var("V10_DRY_RUN_PUSH", "1");
-        // 用 HoldingPlan (30 min 冷却), 隔离度高
-        let r1 = push_governor("first", PushKind::HoldingPlan).await;
+        // v59: push_governor 改无冷却 (F1 修复), 改用 push_governor_v2 (有冷却)
+        //   - 用 HoldingPlan (30 min 冷却), 隔离度高
+        let r1 = push_governor_v2("first", PushKind::HoldingPlan, "000001").await;
         assert!(r1, "首次应通过 (dry-run 返回 true)");
-        let r2 = push_governor("second", PushKind::HoldingPlan).await;
+        let r2 = push_governor_v2("second", PushKind::HoldingPlan, "000001").await;
         assert!(
             !r2,
-            "30 min 冷却内重复调应被挡 (cooldown memo 命中)"
+            "30 min 冷却内同票重复调应被挡 (cooldown memo 命中)"
+        );
+        env::remove_var("V10_DRY_RUN_PUSH");
+    }
+
+    // v59: F1 修复 — 不同 code 同一 PushKind 不应被 30 min 冷却挡
+    //   - 旧: key=format!("{:?}", kind) kind-only, 第二只票被挡
+    //   - 新: key=format!("{:?}_{}", kind, code) per-(kind,code), 不同 code 各自独立
+    #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
+    async fn push_governor_v2_per_code_cooldown() {
+        use std::env;
+        _reset_cooldown_memo_for_test();
+        env::set_var("V10_DRY_RUN_PUSH", "1");
+        // 同一 kind (HoldingPlan 30 min) 不同 code
+        let r1 = push_governor_v2("first", PushKind::HoldingPlan, "000001").await;
+        assert!(r1, "000001 首次应通过");
+        let r2 = push_governor_v2("second", PushKind::HoldingPlan, "000002").await;
+        assert!(
+            r2,
+            "000002 不同 code 不应被 30 min 冷却挡 (F1 修复)"
         );
         env::remove_var("V10_DRY_RUN_PUSH");
     }

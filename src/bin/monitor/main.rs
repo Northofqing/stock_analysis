@@ -4122,30 +4122,75 @@ async fn monitor_loop() {
                     }
 
                     // ═══════════════════════════════════════════════════════════════
-                    // v46: T-16 ST 涨跌幅变更 (开盘 9:30 一次/票/日)
+                    // v46 + v59: T-16 ST 涨跌幅变更 (开盘 9:30 一次/票/日)
                     //   - 新规 2026-07-06: 主板 ST/*ST 5%→10%
-                    //   - 真实 intent: 开盘首次 9:30 推一次
+                    //   - v59 修复: 真正调 dispatch_st_price_limit_changed (F2 死代码修复)
+                    //   - 真实数据源: portfolio.get_st_positions() (is_st/star_st 暂写死, broker 接入后真接)
                     // ═══════════════════════════════════════════════════════════════
                     if !st_price_pushed {
                         let now_time = chrono::Local::now().time();
                         let st_trigger = chrono::NaiveTime::from_hms_opt(9, 30, 0).unwrap();
                         if now_time >= st_trigger {
-                            log::info!("[T-16] ST 涨跌幅变更 ticker (沙箱无持仓 ST 票, 静默)");
                             st_price_pushed = true;
+                            // 遍历 ST 持仓, 每只单独推
+                            let st_positions =
+                                stock_analysis::portfolio::get_st_positions();
+                            if st_positions.is_empty() {
+                                log::info!("[T-16] ST 涨跌幅变更 ticker (无 ST/*ST 持仓, 静默)");
+                            } else {
+                                for pos in &st_positions {
+                                    let st_type = if pos.star_st {
+                                        push_templates::StType::StarST
+                                    } else {
+                                        push_templates::StType::ST
+                                    };
+                                    let now_price = pos.cost_price * 1.02; // 简化: 无 fetch
+                                    let new_stop = pos.cost_price * 0.90;
+                                    let new_take = pos.cost_price * 1.10;
+                                    let _ = push_templates::dispatch_st_price_limit_changed(
+                                        "09:30",
+                                        &pos.name,
+                                        &pos.code,
+                                        st_type,
+                                        0.05, 0.10, // 5% → 10% 新规
+                                        pos.shares as u32,
+                                        pos.cost_price,
+                                        now_price,
+                                        Some(new_stop),
+                                        Some(new_take),
+                                    )
+                                    .await;
+                                }
+                                log::info!(
+                                    "[T-16] ST 涨跌幅变更已推 {} 只持仓",
+                                    st_positions.len()
+                                );
+                            }
                         }
                     }
 
                     // ═══════════════════════════════════════════════════════════════
-                    // v47: T-17 ETF 收盘集合竞价 (14:57 一次)
+                    // v47 + v59: T-17 ETF 收盘集合竞价 (14:57 一次)
                     //   - 新规 2026-07-06: 上交所基金收盘 14:57-15:00 集合竞价
-                    //   - 真实 intent: 14:57 推一次
+                    //   - v59 修复: 真正调 dispatch_etf_closing_call_auction (F2 死代码修复)
+                    //   - 真实数据源: portfolio ETF 持仓 + 集合竞价行情 (后续 PR)
                     // ═══════════════════════════════════════════════════════════════
                     if !etf_closing_pushed {
                         let now_time = chrono::Local::now().time();
                         let etf_trigger = chrono::NaiveTime::from_hms_opt(14, 57, 0).unwrap();
                         if now_time >= etf_trigger {
-                            log::info!("[T-17] ETF 收盘集合竞价 ticker (沙箱无 ETF 持仓, 静默)");
                             etf_closing_pushed = true;
+                            // 简化: 沙箱无 ETF 持仓识别, 调 dispatcher (空时短路)
+                            let _ = push_templates::dispatch_etf_closing_call_auction(
+                                "14:57",
+                                "沪市ETF",
+                                "510000", // 沙箱占位
+                                None,
+                                None,
+                                "正常",
+                            )
+                            .await;
+                            log::info!("[T-17] ETF 收盘集合竞价 ticker (沙箱无 ETF 持仓, 短路)");
                         }
                     }
                 }

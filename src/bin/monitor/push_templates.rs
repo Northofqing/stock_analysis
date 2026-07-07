@@ -2300,13 +2300,16 @@ pub async fn dispatch_news_to_idea_daily(hhmm: &str, banner: &BannerCtx) -> bool
         return false;
     }
 
-    // v29: memo 1h/票 (与 push_governor 20min 冷却叠加, 实际间隔 ≥ 1h)
+    // v29 + v59: memo 1h/票 (F5 修复 — 仅 push 成功才 insert, 防止 transient 失败自我阻塞)
+    //   - 旧: map.insert 在 push 前, push 失败 (502/budget) 也写 memo, 1h 自我阻塞
+    //   - 新: 失败时 return false, 不写 memo; 成功才 insert
     let memo_key = format!("{}:{}", snapshot.code, snapshot.name);
     {
-        let mut map = D01_LAST_PUSH.lock().unwrap();
+        let map = D01_LAST_PUSH.lock().unwrap();
         if let Some(last) = map.get(&memo_key) {
             let elapsed = last.elapsed().as_secs();
             if elapsed < 3600 {
+                drop(map);
                 log_dispatcher_attempt(
                     "D-01",
                     false,
@@ -2322,12 +2325,18 @@ pub async fn dispatch_news_to_idea_daily(hhmm: &str, banner: &BannerCtx) -> bool
                 return false;
             }
         }
-        map.insert(memo_key.clone(), Instant::now());
     }
 
     let params = build_news_to_idea_from_snapshot(&snapshot);
     let snap_size = snapshot.reasons.len();
     let result = push_news_to_idea("", Some(banner), params).await;
+    if result {
+        // v59: 仅 push 成功才写 memo (F5 修复)
+        D01_LAST_PUSH
+            .lock()
+            .unwrap()
+            .insert(memo_key, Instant::now());
+    }
     log_dispatcher_attempt("D-01", result, snap_size, "");
     result
 }
@@ -3947,13 +3956,14 @@ pub fn render_post_fixed_price_order(p: PostFixedPriceOrderParams<'_>) -> String
         OrderStatus::Cancelled => "已撤",
         OrderStatus::Rejected => "废单",
     };
-    // 按 HH:MM 派生窗口 (上午/下午/尾盘)
-    let window = if p.hhmm < "11:30" {
-        "上午"
-    } else if p.hhmm < "15:00" {
-        "下午"
-    } else {
-        "尾盘"
+    // v59: 按 HH:MM 派生窗口 (上午/下午/尾盘) — 用 NaiveTime 比较 (F3 修复)
+    //   - 旧代码用字符串比较, "09:15" lexicographic > "11:30" (因 '9' > '1')
+    //   - 应解析为 NaiveTime 后按时间值比较
+    let window = match chrono::NaiveTime::parse_from_str(p.hhmm, "%H:%M") {
+        Ok(t) if t < chrono::NaiveTime::from_hms_opt(11, 30, 0).unwrap() => "上午",
+        Ok(t) if t < chrono::NaiveTime::from_hms_opt(15, 0, 0).unwrap() => "下午",
+        Ok(_) => "尾盘",
+        Err(_) => "未知", // 解析失败兜底
     };
     format!(
         "📋 盘后固定价格申报（{} {}）\n{}({}) 价格{:.2} 数量{} | 状态: {} | 窗口: {}\n订单号: {}\n辅助建议, 非下单指令",
@@ -4011,11 +4021,17 @@ pub fn render_st_price_limit_changed(p: StPriceLimitChangedParams<'_>) -> String
         StType::ST => "ST",
         StType::StarST => "*ST",
     };
+    // v59: NaN 守卫 (F4 修复) — cost=0 时浮盈显示 "N/A" 而非 "nan%"
+    let pnl_pct = if p.cost > 0.0 {
+        format!("{:+.1}%", ((p.now_price - p.cost) / p.cost) * 100.0)
+    } else {
+        "N/A (成本未记录)".to_string()
+    };
     let mut s = format!(
-        "⚠️ ST 涨跌幅变更（{}）\n{}({}) [{}] 持仓 {} 股\n原涨跌幅: {:+.0}% → 新涨跌幅: {:+.0}%\n现价: {:.2} 成本: {:.2} 浮盈: {:+.1}%\n",
+        "⚠️ ST 涨跌幅变更（{}）\n{}({}) [{}] 持仓 {} 股\n原涨跌幅: {:+.0}% → 新涨跌幅: {:+.0}%\n现价: {:.2} 成本: {:.2} 浮盈: {}\n",
         p.hhmm, p.name, p.code, st, p.holding_qty,
         p.old_limit * 100.0, p.new_limit * 100.0,
-        p.now_price, p.cost, ((p.now_price - p.cost) / p.cost) * 100.0
+        p.now_price, p.cost, pnl_pct
     );
     if let Some(sl) = p.new_stop_loss {
         s.push_str(&format!(
