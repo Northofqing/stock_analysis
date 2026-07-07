@@ -2133,6 +2133,7 @@ pub fn _reset_d01_memo_for_test() {
 }
 
 /// v15.5 业务层入口 (v16.4 改用真实候选台数据)
+/// v29: 加 dispatcher 内部 memo (1h/票) — 防止公告密集时同票刷屏
 pub async fn dispatch_news_to_idea_daily(hhmm: &str, banner: &BannerCtx) -> bool {
     let snapshot = load_news_to_idea_snapshot_real(hhmm);
     if snapshot.headline.is_empty() {
@@ -2140,6 +2141,32 @@ pub async fn dispatch_news_to_idea_daily(hhmm: &str, banner: &BannerCtx) -> bool
         log::info!("[D-01] news_to_idea_snapshot 空 (候选台无候选), 跳过推送");
         return false;
     }
+
+    // v29: memo 1h/票 (与 push_governor 20min 冷却叠加, 实际间隔 ≥ 1h)
+    let memo_key = format!("{}:{}", snapshot.code, snapshot.name);
+    {
+        let mut map = D01_LAST_PUSH.lock().unwrap();
+        if let Some(last) = map.get(&memo_key) {
+            let elapsed = last.elapsed().as_secs();
+            if elapsed < 3600 {
+                log_dispatcher_attempt(
+                    "D-01",
+                    false,
+                    0,
+                    &format!("1h memo 冷却, 还需 {}s", 3600 - elapsed),
+                );
+                log::info!(
+                    "[D-01] {}:{} memo 冷却中, 跳过推送 (剩余 {}s)",
+                    snapshot.code,
+                    snapshot.name,
+                    3600 - elapsed
+                );
+                return false;
+            }
+        }
+        map.insert(memo_key.clone(), Instant::now());
+    }
+
     let params = build_news_to_idea_from_snapshot(&snapshot);
     let snap_size = snapshot.reasons.len();
     let result = push_news_to_idea("", Some(banner), params).await;
