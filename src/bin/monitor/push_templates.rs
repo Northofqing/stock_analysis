@@ -2289,6 +2289,93 @@ pub async fn dispatch_paper_review_daily(date: &str) -> bool {
 // v35: A-10 盘后题材催化复盘 dispatcher
 // ============================================================================
 
+/// v37: P-02 竞价热点量能快照
+#[derive(Debug, Clone, Default)]
+pub struct AuctionVolumeSnapshot {
+    pub hhmm: String,
+    pub items: Vec<(String, String, f64, f64)>,  // (name, code, gap_pct, vol_ratio)
+    pub sentiment: String,   // "强承接" | "一般" | "弱承接"
+    pub watch_status: String, // 观察状态描述
+}
+
+/// v37: 加载 P-02 快照 - 复用 limit_up_stocks
+pub fn load_auction_volume_snapshot_real(hhmm: &str) -> AuctionVolumeSnapshot {
+    use stock_analysis::market_analyzer::MarketAnalyzer;
+    let analyzer = match MarketAnalyzer::new(None) {
+        Ok(a) => a,
+        Err(_) => return AuctionVolumeSnapshot::default(),
+    };
+    let limit_stocks = match analyzer.get_limit_up_stocks() {
+        Ok(s) => s,
+        Err(_) => return AuctionVolumeSnapshot::default(),
+    };
+    if limit_stocks.is_empty() {
+        return AuctionVolumeSnapshot::default();
+    }
+    // 按量比降序, 取前 10
+    let mut sorted = limit_stocks.clone();
+    sorted.sort_by(|a, b| {
+        b.volume_ratio
+            .partial_cmp(&a.volume_ratio)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let items: Vec<(String, String, f64, f64)> = sorted
+        .iter()
+        .take(10)
+        .map(|s| (s.name.clone(), s.code.clone(), s.change_pct, s.volume_ratio))
+        .collect();
+
+    // sentiment: 平均量比 >= 3 强承接, >= 1 一般, < 1 弱承接
+    let avg_vr: f64 = items.iter().map(|(_, _, _, vr)| vr).sum::<f64>() / items.len() as f64;
+    let sentiment = if avg_vr >= 3.0 {
+        "强承接"
+    } else if avg_vr >= 1.0 {
+        "一般"
+    } else {
+        "弱承接"
+    };
+
+    AuctionVolumeSnapshot {
+        hhmm: hhmm.to_string(),
+        items,
+        sentiment: sentiment.to_string(),
+        watch_status: "9:25 集合竞价结果, 关注开盘承接".to_string(),
+    }
+}
+
+/// v37: P-02 dispatcher
+pub async fn dispatch_auction_volume_daily(hhmm: &str) -> bool {
+    let snapshot = load_auction_volume_snapshot_real(hhmm);
+    if snapshot.items.is_empty() {
+        log_dispatcher_attempt("P-02", false, 0, "auction_volume_snapshot empty");
+        log::info!("[P-02] auction_volume_snapshot 空 (无涨停/无数据), 跳过推送");
+        return false;
+    }
+    // 构造 AuctionItem refs
+    let auction_items: Vec<AuctionItem<'_>> = snapshot
+        .items
+        .iter()
+        .map(|(n, c, g, v)| AuctionItem {
+            name: n,
+            code: c,
+            gap_pct: *g,
+            vol_ratio: *v,
+            tag: "",  // 简化: 不填 tag
+        })
+        .collect();
+    let banner = BannerCtx::default();
+    let text = render_auction_volume(
+        &banner,
+        &snapshot.hhmm,
+        &auction_items,
+        &snapshot.sentiment,
+        &snapshot.watch_status,
+    );
+    let result = dispatch(crate::notify::PushKind::AuctionVolume, "", Some(&banner), text).await;
+    log_dispatcher_attempt("P-02", result, snapshot.items.len(), "");
+    result
+}
+
 /// v35: 加载 A-10 快照 - 取 chain_daily 最新 cluster, 推断持续性
 pub fn load_catalyst_review_snapshot_real(date: &str) -> (String, Option<f32>, PersistentLevel, Vec<String>, Vec<String>, Option<String>) {
     use stock_analysis::database::DatabaseManager;

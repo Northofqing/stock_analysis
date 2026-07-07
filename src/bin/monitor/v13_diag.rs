@@ -16,7 +16,8 @@ use super::dryrun_report::KindStat;
 use super::push_templates::{
     load_sector_snapshot_real, load_news_catalyst_snapshot_real,
     load_industry_chain_snapshot_real, load_news_to_idea_snapshot_real,
-    load_paper_review_snapshot_real,
+    load_paper_review_snapshot_real, load_auction_volume_snapshot_real,
+    load_catalyst_review_snapshot_real,
 };
 
 /// 端到端诊断步骤
@@ -95,6 +96,36 @@ pub async fn run_v13_diag() -> V13DiagReport {
             "empty".into()
         } else {
             format!("ok: name={}, pnl={:?}", snap.name, snap.pnl)
+        }
+    }));
+
+    // v37: P-02 竞价热点量能 (依赖 limit_up_stocks)
+    steps.push(check_step("P-02", "load_auction_volume", || {
+        let snap = load_auction_volume_snapshot_real("09:25");
+        if snap.items.is_empty() {
+            "empty".into()
+        } else {
+            format!(
+                "ok: items={}, sentiment={}",
+                snap.items.len(),
+                snap.sentiment
+            )
+        }
+    }));
+
+    // v35: A-10 盘后催化复盘 (依赖 chain_daily cluster)
+    steps.push(check_step("A-10", "load_catalyst_review", || {
+        let (date, score, persistent, started, pending, _) =
+            load_catalyst_review_snapshot_real("2026-07-07");
+        if started.is_empty() {
+            "empty".into()
+        } else {
+            format!(
+                "ok: date={}, score={:?}, started={}",
+                date,
+                score,
+                started.len()
+            )
         }
     }));
 

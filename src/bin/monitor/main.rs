@@ -3175,21 +3175,16 @@ async fn monitor_loop() {
                             .take(10)
                             .collect();
                         if !new_items.is_empty() {
-                            let ts = chrono::Local::now().format("%H:%M:%S");
-                            let mut lines =
-                                vec![format!("⚡ 竞价涨停·量能 Top{}（{}）", new_items.len(), ts)];
+                            // v37: 升级到 v12 §14.1 P-02 模板
+                            //   之前: lines.join + PushKind::AuctionVolume (v19 格式)
+                            //   现在: dispatch_auction_volume_daily + render_auction_volume
+                            //   模板: 🌅 竞价热点量能 TopN (banner + 强承接/一般/弱承接)
+                            let ts = chrono::Local::now().format("%H:%M:%S").to_string();
+                            // 标记已通知 (避免同票重复推)
                             for s in &new_items {
                                 auction_vol_notified.insert(s.code.clone());
-                                lines.push(format!(
-                                    "  {}({}) 量比{:.1} 主力{:+.2}亿 {:+.1}%",
-                                    s.name, s.code, s.volume_ratio, s.main_net_yi, s.change_pct,
-                                ));
                             }
-                            notify::push_governor(
-                                &lines.join("\n"),
-                                notify::PushKind::AuctionVolume,
-                            )
-                            .await;
+                            let _ = push_templates::dispatch_auction_volume_daily(&ts).await;
                         }
                     }
 
