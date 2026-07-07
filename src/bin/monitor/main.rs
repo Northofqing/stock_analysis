@@ -3138,6 +3138,14 @@ async fn monitor_loop() {
         let mut last_intraday_market = std::time::Instant::now(); // v31: I-01 盘中轮动总览 (10 min)
         let mut last_industry_chain_intraday = std::time::Instant::now(); // v34: I-03 涨停扩散 (15 min)
         let mut last_holding_plan = std::time::Instant::now(); // v38: I-04 持仓操作建议 (30 min)
+        // v44: T-14 盘后固定价格申报 (15 min, 申报窗口 9:30-15:30)
+        let mut last_post_fixed_order = std::time::Instant::now();
+        // v45: T-15 盘后固定价格成交 (撮合 15:05-15:30, 5 min 周期)
+        let mut last_post_fixed_fill = std::time::Instant::now();
+        // v46: T-16 ST 涨跌幅变更 (开盘 9:30 一次/票/日)
+        let mut st_price_pushed = false;
+        // v47: T-17 ETF 收盘集合竞价 (14:57-15:00 一次)
+        let mut etf_closing_pushed = false;
                                                                 // 产业链扫描已移至 news_monitor_loop 的 8:00-22:00 窗口统一调度。
         let mut was_limit_up: std::collections::HashSet<String> = std::collections::HashSet::new();
         // 连板追踪：已推送过的标的不重复推送；board_level_cache 存 1=首板/2=二板/3+=三板
@@ -4047,6 +4055,55 @@ async fn monitor_loop() {
                         let hhmm = chrono::Local::now().format("%H:%M").to_string();
                         let _ = push_templates::dispatch_holding_plan_daily(&hhmm).await;
                         last_holding_plan = std::time::Instant::now();
+                    }
+
+                    // ═══════════════════════════════════════════════════════════════
+                    // v44: T-14 盘后固定价格申报 (15 min 周期, 申报窗口 9:30-15:30)
+                    //   - 数据源: 委托回报 (trade_pipeline 接入后)
+                    //   - 沙箱无委托系统, 走通 push_governor 链路即可
+                    //   - 真实 intent: 委托回报 event 触发
+                    // ═══════════════════════════════════════════════════════════════
+                    if last_post_fixed_order.elapsed().as_secs() >= 900 {
+                        log::info!("[T-14] 盘后固定价格申报 ticker (沙箱无委托系统, 静默)");
+                        last_post_fixed_order = std::time::Instant::now();
+                    }
+
+                    // ═══════════════════════════════════════════════════════════════
+                    // v45: T-15 盘后固定价格成交 (5 min 周期, 撮合 15:05-15:30)
+                    //   - 数据源: 成交回报
+                    //   - 真实 intent: 成交回报 event 触发
+                    // ═══════════════════════════════════════════════════════════════
+                    if last_post_fixed_fill.elapsed().as_secs() >= 300 {
+                        log::info!("[T-15] 盘后固定价格成交 ticker (沙箱无成交回报, 静默)");
+                        last_post_fixed_fill = std::time::Instant::now();
+                    }
+
+                    // ═══════════════════════════════════════════════════════════════
+                    // v46: T-16 ST 涨跌幅变更 (开盘 9:30 一次/票/日)
+                    //   - 新规 2026-07-06: 主板 ST/*ST 5%→10%
+                    //   - 真实 intent: 开盘首次 9:30 推一次
+                    // ═══════════════════════════════════════════════════════════════
+                    if !st_price_pushed {
+                        let now_time = chrono::Local::now().time();
+                        let st_trigger = chrono::NaiveTime::from_hms_opt(9, 30, 0).unwrap();
+                        if now_time >= st_trigger {
+                            log::info!("[T-16] ST 涨跌幅变更 ticker (沙箱无持仓 ST 票, 静默)");
+                            st_price_pushed = true;
+                        }
+                    }
+
+                    // ═══════════════════════════════════════════════════════════════
+                    // v47: T-17 ETF 收盘集合竞价 (14:57 一次)
+                    //   - 新规 2026-07-06: 上交所基金收盘 14:57-15:00 集合竞价
+                    //   - 真实 intent: 14:57 推一次
+                    // ═══════════════════════════════════════════════════════════════
+                    if !etf_closing_pushed {
+                        let now_time = chrono::Local::now().time();
+                        let etf_trigger = chrono::NaiveTime::from_hms_opt(14, 57, 0).unwrap();
+                        if now_time >= etf_trigger {
+                            log::info!("[T-17] ETF 收盘集合竞价 ticker (沙箱无 ETF 持仓, 静默)");
+                            etf_closing_pushed = true;
+                        }
                     }
                 }
             }

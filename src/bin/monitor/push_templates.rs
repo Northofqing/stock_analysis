@@ -2289,6 +2289,44 @@ pub async fn dispatch_paper_review_daily(date: &str) -> bool {
 // v35: A-10 盘后题材催化复盘 dispatcher
 // ============================================================================
 
+/// v44: T-14 盘后固定价格申报 dispatcher
+///   - 数据源: 委托回报 event (持仓/候选股)
+///   - 简化: 沙箱无委托系统, 接受外部 caller 传具体 (exchange, code, name, price, qty, order_id, status)
+///   - 模板: render_post_fixed_price_order
+///   - 真实意图: 接 trade_pipeline 委托回报
+pub async fn dispatch_post_fixed_price_order(
+    exchange: Exchange,
+    hhmm: &str,
+    name: &str,
+    code: &str,
+    price: f64,
+    qty: u32,
+    order_id: &str,
+    status: OrderStatus,
+) -> bool {
+    let banner = BannerCtx::default();
+    let params = PostFixedPriceOrderParams {
+        exchange,
+        hhmm,
+        name,
+        code,
+        price,
+        qty,
+        order_id,
+        status,
+    };
+    let text = render_post_fixed_price_order(params);
+    let result =
+        dispatch(crate::notify::PushKind::PostFixedPriceOrder, code, Some(&banner), text).await;
+    log_dispatcher_attempt(
+        "T-14",
+        result,
+        1,
+        &format!("exchange={:?} status={:?}", exchange, status),
+    );
+    result
+}
+
 /// v40: P-04 虚拟盘成交 dispatcher 包装
 pub async fn push_paper_trade(code: &str, params: PaperTradeParams<'_>) -> bool {
     let text = render_paper_trade(params);
@@ -3378,6 +3416,7 @@ pub fn render_industry_chain_intraday(
 }
 
 /// v13.1 §5.2 交易所
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Exchange {
     SH, // 沪市 A 股/ETF (9:30-11:30, 13:00-15:30)
     SZ, // 深市 A 股/ETF (9:15-11:30, 13:00-15:30)
@@ -3385,6 +3424,7 @@ pub enum Exchange {
 }
 
 /// v13.1 §5.2 委托状态
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderStatus {
     Submitted, // 已报
     Cancelled, // 已撤
