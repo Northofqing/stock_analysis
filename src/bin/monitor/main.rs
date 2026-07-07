@@ -2661,6 +2661,130 @@ async fn run_review_only_inner() {
         log::info!("[v19.14b R-06]\n{}", r06_text);
         notify::push_governor(&r06_text, notify::PushKind::ReviewFailure).await;
 
+        // v68: 盘后复盘对齐 v18 — 推 3 张 v18 风格卡片 (放量·持仓 / 放量·自选 / 放量·实盘优选)
+        //   - v18 路径: 单独推 holding_brk + watch_brk + market_brk
+        //   - v12 路径: 只推 candidate_summary, 没单独推放量卡片 — 用户要"内容跟 v18 一样"
+        let v18_brk = tokio::task::spawn_blocking(|| {
+            let holdings = stock_analysis::portfolio::get_positions().unwrap_or_default();
+            let watchlist = stock_analysis::portfolio::get_watchlist().unwrap_or_default();
+            let quotes = market_data::fetch_position_quotes();
+            let prices = build_price_map(&quotes);
+            let holding_codes: std::collections::HashSet<String> =
+                holdings.iter().map(|p| p.code.clone()).collect();
+            let watch_codes: std::collections::HashSet<String> =
+                watchlist.iter().map(|p| p.code.clone()).collect();
+            let mut holding_brk = String::new();
+            let mut watch_brk = String::new();
+            let mut market_brk = String::new();
+            if let Ok(fetcher) = stock_analysis::data_provider::DataFetcherManager::new() {
+                // 持仓放量
+                let mut holding_lines =
+                    vec!["📊 放量分析·持仓（盘后·算法研判仅供参考）".to_string()];
+                for p in &holdings {
+                    if let Ok((kline, _)) = fetcher.get_daily_data(&p.code, 60) {
+                        let sig = stock_analysis::breakout::engine::analyze_postmarket(
+                            &p.code, &p.name, &kline,
+                        );
+                        holding_lines.push(format!(
+                            "  {} {}({}) — {} 置信{}% [{}]",
+                            sig.breakout_type.emoji(),
+                            sig.name, sig.code,
+                            sig.breakout_type.label(),
+                            sig.confidence, sig.description,
+                        ));
+                    }
+                }
+                if holding_lines.len() > 1 {
+                    holding_brk = holding_lines.join("\n");
+                }
+                // 自选放量 (剔除已在持仓列出的)
+                let mut watch_lines = vec!["📊 放量分析·自选（盘后·算法研判仅供参考）".to_string()];
+                for p in &watchlist {
+                    if holding_codes.contains(&p.code) {
+                        continue;
+                    }
+                    if let Ok((kline, _)) = fetcher.get_daily_data(&p.code, 60) {
+                        let sig = stock_analysis::breakout::engine::analyze_postmarket(
+                            &p.code, &p.name, &kline,
+                        );
+                        watch_lines.push(format!(
+                            "  {} {}({}) — {} 置信{}% [{}]",
+                            sig.breakout_type.emoji(),
+                            sig.name, sig.code,
+                            sig.breakout_type.label(),
+                            sig.confidence, sig.description,
+                        ));
+                    }
+                }
+                if watch_lines.len() > 1 {
+                    watch_brk = watch_lines.join("\n");
+                }
+                // 实盘量能优选 (全市场)
+                let market_candidates =
+                    market_data::fetch_market_volume_ratio_leaders(80).unwrap_or_default();
+                let mut market_lines =
+                    vec!["📊 放量分析·实盘优选（盘后·算法研判仅供参考）".to_string()];
+                let mut picked = 0usize;
+                for s in &market_candidates {
+                    if picked >= 5 { break; }
+                    if holding_codes.contains(&s.code) || watch_codes.contains(&s.code) {
+                        continue;
+                    }
+                    if let Ok((kline, _)) = fetcher.get_daily_data(&s.code, 60) {
+                        let sig = stock_analysis::breakout::engine::analyze_postmarket(
+                            &s.code, &s.name, &kline,
+                        );
+                        if sig.breakout_type
+                            != stock_analysis::breakout::signal::BreakoutType::Launch
+                            || sig.confidence < 50
+                        {
+                            continue;
+                        }
+                        market_lines.push(format!(
+                            "  {} {}({}) — {} 置信{}% [量比{:.1} 主力{:+.2}亿 | {}]",
+                            sig.breakout_type.emoji(),
+                            sig.name, sig.code,
+                            sig.breakout_type.label(),
+                            sig.confidence, s.volume_ratio, s.main_net_yi, sig.description,
+                        ));
+                        picked += 1;
+                    }
+                }
+                if market_lines.len() > 1 {
+                    market_brk = market_lines.join("\n");
+                }
+            }
+            (holding_brk, watch_brk, market_brk)
+        })
+        .await
+        .unwrap_or_default();
+        let (holding_brk, watch_brk, market_brk) = v18_brk;
+
+        if !holding_brk.is_empty() {
+            let holding_brk_text = format!(
+                "📊 放量分析·持仓（盘后·算法研判仅供参考）\n{}",
+                holding_brk
+            );
+            log::info!("[v68] 放量·持仓 推送 ({} 字)", holding_brk_text.chars().count());
+            push_wechat(&holding_brk_text).await;
+        }
+        if !watch_brk.is_empty() {
+            let watch_brk_text = format!(
+                "📊 放量分析·自选（盘后·算法研判仅供参考）\n{}",
+                watch_brk
+            );
+            log::info!("[v68] 放量·自选 推送 ({} 字)", watch_brk_text.chars().count());
+            push_wechat(&watch_brk_text).await;
+        }
+        if !market_brk.is_empty() {
+            let market_brk_text = format!(
+                "📊 放量分析·实盘优选（盘后·算法研判仅供参考）\n{}",
+                market_brk
+            );
+            log::info!("[v68] 放量·实盘优选 推送 ({} 字)", market_brk_text.chars().count());
+            push_wechat(&market_brk_text).await;
+        }
+
         log::info!("[v12-MVP1-R] R-01/R-02/R-06/R-08 推送完成 (R-03~R-05/R-07 数据不足仅 log)");
     }
 }
