@@ -3048,6 +3048,7 @@ async fn monitor_loop() {
         let mut last_health_summary = std::time::Instant::now(); // 持仓健康度（5分钟）
         let mut last_screener_run = std::time::Instant::now(); // 选股推荐（30分钟）
         let mut last_fund_top_push = std::time::Instant::now(); // 全市场主力净流入Top10（5分钟）
+        let mut last_intraday_market = std::time::Instant::now(); // v31: I-01 盘中轮动总览 (10 min)
                                                                 // 产业链扫描已移至 news_monitor_loop 的 8:00-22:00 窗口统一调度。
         let mut was_limit_up: std::collections::HashSet<String> = std::collections::HashSet::new();
         // 连板追踪：已推送过的标的不重复推送；board_level_cache 存 1=首板/2=二板/3+=三板
@@ -3858,6 +3859,27 @@ async fn monitor_loop() {
                                 .await;
                             last_fund_top_push = std::time::Instant::now();
                         }
+                    }
+
+                    // ═══════════════════════════════════════════════════════════════
+                    // v31: I-01 盘中轮动总览 (10 min 周期, 替代老 SectorTop)
+                    //   - 数据源: sector_monitor::fetch_board_ranking (科技/电力/机器人三轴)
+                    //   - 模板: render_intraday_market (带 banner)
+                    //   - 静默: grade_sectors 无数据时短路, log
+                    //   - 横幅 DataMode 写死 Full (与 v12 已推模板一致)
+                    // ═══════════════════════════════════════════════════════════════
+                    if last_intraday_market.elapsed().as_secs() >= 600 {
+                        use push_templates::dispatch_intraday_market_daily;
+                        let banner = push_templates::BannerCtx {
+                            account_mode: push_templates::AccountMode::Normal,
+                            total_pos: 0,
+                            today_pnl: 0.0,
+                            data_mode: push_templates::DataMode::Full,
+                            data_missing_note: None,
+                        };
+                        let hhmm = chrono::Local::now().format("%H:%M").to_string();
+                        let _ = dispatch_intraday_market_daily(&hhmm, &banner).await;
+                        last_intraday_market = std::time::Instant::now();
                     }
                 }
             }
