@@ -2117,6 +2117,21 @@ pub fn load_news_to_idea_snapshot(_hhmm: &str) -> NewsToIdeaSnapshot {
     NewsToIdeaSnapshot::default()
 }
 
+// v29: D-01 dispatcher 内部 memo (1h/票, 跨日重置)
+// 静态 Lazy 容器, 跨函数调用复用
+// 注: Lazy/HashMap 已在文件顶部 import 过 (避免 unused import 警告), 这里只补 Mutex/Instant
+use std::sync::Mutex;
+use std::time::Instant;
+
+pub static D01_LAST_PUSH: Lazy<Mutex<HashMap<String, Instant>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// v29: 测试用 - 重置 memo 容器
+#[cfg(test)]
+pub fn _reset_d01_memo_for_test() {
+    D01_LAST_PUSH.lock().unwrap().clear();
+}
+
 /// v15.5 业务层入口 (v16.4 改用真实候选台数据)
 pub async fn dispatch_news_to_idea_daily(hhmm: &str, banner: &BannerCtx) -> bool {
     let snapshot = load_news_to_idea_snapshot_real(hhmm);
@@ -7279,5 +7294,32 @@ mod tests {
             "至少 15 个模板应推送成功, 实得 {}",
             success_count
         );
+    }
+
+    // v29: D-01 dispatcher memo 测试
+    // 注: 验证 memo 容器可写入 + 可重置, 集成测试由 monitor --test --v13-diag 覆盖
+    #[test]
+    fn test_d01_memo_map_basic() {
+        use super::{D01_LAST_PUSH, _reset_d01_memo_for_test};
+        _reset_d01_memo_for_test();
+
+        // 写入
+        {
+            let mut map = D01_LAST_PUSH.lock().unwrap();
+            map.insert("000001:平安银行".to_string(), std::time::Instant::now());
+        }
+
+        // 读出
+        let map = D01_LAST_PUSH.lock().unwrap();
+        assert!(
+            map.contains_key("000001:平安银行"),
+            "memo 容器应包含刚插入的 key"
+        );
+
+        // 重置
+        drop(map);
+        _reset_d01_memo_for_test();
+        let map = D01_LAST_PUSH.lock().unwrap();
+        assert!(map.is_empty(), "重置后 memo 容器应为空");
     }
 }
