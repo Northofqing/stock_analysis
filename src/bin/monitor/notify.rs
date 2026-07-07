@@ -365,6 +365,39 @@ use once_cell::sync::Lazy;
 static COOLDOWN_MEMO: Lazy<Mutex<std::collections::HashMap<String, std::time::Instant>>> =
     Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
+/// v69: 推送日志保存 — 把每条实际推送的内容按日期路径写到 data/push_log/
+///   - 路径: data/push_log/YYYY-MM-DD/HHMMSS_<随机>.md
+///   - 沙箱 V10_DRY_RUN_PUSH=1 也保存 (用户能查测试推送)
+///   - 写失败不阻塞主流程 (warn log)
+fn save_push_log(text: &str) {
+    use std::io::Write;
+    log::info!("[v69] save_push_log entered, text len={}", text.chars().count());
+    let now = chrono::Local::now();
+    let date_dir = now.format("%Y-%m-%d").to_string();
+    let time_prefix = now.format("%H%M%S").to_string();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let rand_suffix = format!("{:08x}", nanos & 0xffffffff);
+    let dir = std::path::PathBuf::from("data/push_log").join(&date_dir);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        log::warn!("[v69] push_log 目录创建失败: {}", e);
+        return;
+    }
+    let path = dir.join(format!("{}_{}.md", time_prefix, &rand_suffix[..6]));
+    match std::fs::File::create(&path) {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(text.as_bytes()) {
+                log::warn!("[v69] push_log 写入失败: {}", e);
+            } else {
+                log::info!("[v69] push_log 写入: {}", path.display());
+            }
+        }
+        Err(e) => log::warn!("[v69] push_log 创建文件失败: {}", e),
+    }
+}
+
 /// v42: 测试用 — 重置冷却 memo
 #[cfg(test)]
 pub fn _reset_cooldown_memo_for_test() {
@@ -422,8 +455,13 @@ pub async fn push_wechat(text: &str) -> bool {
     // 用于开发/验证推送内容变化, 不骚扰飞书
     if std::env::var("V10_DRY_RUN_PUSH").ok().as_deref() == Some("1") {
         log::info!("[V10_DRY_RUN_PUSH] 跳过飞书推送, 内容预览:\n{}", text);
+        // v69: 沙箱 dry-run 也保存 push_log
+        save_push_log(text);
         return true;
     }
+
+    // v69: 不管走哪条推送路径 (magiclaw cli / feishu http / 后续), 都先保存 push_log
+    save_push_log(text);
 
     let send_type = resolve_send_type();
     let send_transport = resolve_send_transport(send_type);

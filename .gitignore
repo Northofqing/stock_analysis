@@ -12,4 +12,5 @@
 /.trellis
 /tests
 /tools
-/skills-lock.json
+/skills-lock.json# 推送日志 (data/push_log, 运行时生成)
+data/push_log/
