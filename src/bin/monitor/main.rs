@@ -3135,6 +3135,8 @@ async fn monitor_loop() {
                     log::info!("[A-10] 盘后窗口 ({} 后), 推催化复盘", evening_start.format("%H:%M"));
                     let date_str = chrono::Local::now().format("%Y-%m-%d").to_string();
                     let _ = push_templates::dispatch_catalyst_review_daily(&date_str).await;
+                    // v36: A-01 虚拟仓复盘 - 同 19:00 窗口, 复用 evening_pushed flag
+                    let _ = push_templates::dispatch_paper_review_daily(&date_str).await;
                     evening_pushed = true;
                 }
             }
