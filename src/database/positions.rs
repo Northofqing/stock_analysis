@@ -44,6 +44,8 @@ impl DatabaseManager {
                 stock_position::status.eq(excluded(stock_position::status)),
                 // v14.1 F7: 同步 st_type (broker 推送更新时同步写)
                 stock_position::st_type.eq(excluded(stock_position::st_type)),
+                // v14.1 BR-015: 同步 chain_name (板块集中度数据源)
+                stock_position::chain_name.eq(excluded(stock_position::chain_name)),
             ))
             .execute(&mut conn)?;
 
@@ -193,4 +195,32 @@ impl DatabaseManager {
         .execute(&mut conn)?;
         Ok(star_updated + st_updated)
     }
+
+    /// v14.1 BR-015: 统计 chain_name 缺失的持仓数
+    ///   返回 (total_open, missing_chain_name)
+    ///   当前不实算 chain (等 chain registry / position_tracker.rs 接入);
+    ///   CLI --backfill-chain-name 用此输出待回填数.
+    pub fn count_missing_chain_name(&self) -> Result<(i64, i64), Box<dyn std::error::Error>> {
+        let mut conn = self.get_conn()?;
+        let total: i64 = diesel::sql_query(
+            "SELECT COUNT(*) AS cnt FROM stock_position WHERE status = 'open'",
+        )
+        .get_result::<CountRow>(&mut conn)
+        .map(|r| r.cnt)?;
+        let missing: i64 = diesel::sql_query(
+            "SELECT COUNT(*) AS cnt FROM stock_position
+             WHERE status = 'open'
+               AND (chain_name IS NULL OR chain_name = '' OR chain_name = '其他')",
+        )
+        .get_result::<CountRow>(&mut conn)
+        .map(|r| r.cnt)?;
+        Ok((total, missing))
+    }
+}
+
+/// v14.1 BR-015: count helper (Query 复用)
+#[derive(diesel::QueryableByName)]
+struct CountRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    cnt: i64,
 }

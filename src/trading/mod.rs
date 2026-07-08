@@ -149,6 +149,9 @@ impl TradeExecutionGateway for SimulatedExecutionGateway {
             status: "open".to_string(),
             // v14.1 F7: 默认 None, 由 name LIKE 推断 (--backfill-st-type) 或 broker 推送
             st_type: None,
+            // v14.1 BR-015: chain_name 缺省 None → store.rs 派生 "其他"
+            //   真实来源待 chain registry / position_tracker.rs 接入
+            chain_name: None,
         };
 
         match self.db().save_position(&new_position) {

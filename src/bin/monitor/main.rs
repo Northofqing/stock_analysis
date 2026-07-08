@@ -873,6 +873,9 @@ async fn main() {
     let backfill_outcome_date: Option<String> = std::env::args()
         .find_map(|a| a.strip_prefix("--backfill-outcome=").map(|s| s.to_string()));
 
+    // v14.1 BR-015: stock_position.chain_name 缺失统计 (待 chain registry 接入)
+    let backfill_chain_name = std::env::args().any(|a| a == "--backfill-chain-name");
+
     // 显式标记交易环境，供底层写入守卫执行双向隔离。
     // v19.9: --test 路径不设 STOCK_ENV_MODE (默认 prod), 让 env_guard 允许真持仓
     // (--test 用 .env STOCK_LIST 真接, 不写生产数据; 双向隔离由 STOCK_LIST 过滤保护)
@@ -916,6 +919,21 @@ async fn main() {
         use stock_analysis::opportunity::news_outcome::backfill_recommendations_outcome;
         let updated = backfill_recommendations_outcome(&date);
         log::info!("[v70+] 回填完成 | {} | 更新行数 = {}", date, updated);
+        std::process::exit(0);
+    }
+
+    // v14.1 BR-015: chain_name 缺失统计 (实算留给 chain registry 接入)
+    if backfill_chain_name {
+        log::info!("[v14.1 BR-015] --backfill-chain-name 模式启动 | 统计 chain_name 缺失");
+        use stock_analysis::database::DatabaseManager;
+        let db = DatabaseManager::get();
+        match db.count_missing_chain_name() {
+            Ok((total, missing)) => log::info!(
+                "[v14.1 BR-015] open 持仓 {} 条, chain_name 缺失 {} 条 (待 chain registry 接入后实算)",
+                total, missing
+            ),
+            Err(e) => log::error!("[v14.1 BR-015] 统计失败: {}", e),
+        }
         std::process::exit(0);
     }
 

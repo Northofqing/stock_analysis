@@ -343,6 +343,9 @@ pub struct NewStockPosition {
     pub status: String,
     /// v14.1 F7: ST/*ST 标识 (默认 None → 普通股)
     pub st_type: Option<String>,
+    /// v14.1 BR-015: 产业链名 (板块集中度检查数据源)
+    /// 默认 None → "其他" (由 store.rs Position 派生)
+    pub chain_name: Option<String>,
 }
 
 // ============================================================================
