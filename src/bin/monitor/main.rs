@@ -3426,10 +3426,11 @@ async fn news_monitor_loop() {
         }
 
         // 公告扫描（仅网络拉取在 spawn_blocking，处理在主线程）
-        // review #15: fetch_announcements 改 async, 已在 spawn_blocking closure 内,
-// 直接 Handle::block_on 驱动 future.
-        let anns = tokio::runtime::Handle::current()
-            .block_on(stock_analysis::data_provider::announcement::fetch_announcements(None))
+        // v13.10.1: fetch_announcements 改 async, news_monitor_loop 已在 tokio 运行时内
+        // (由 tokio::join! 启动), 直接 .await 即可. review #15 用的 Handle::current().block_on
+        // 会 panic (Cannot start a runtime from within a runtime).
+        let anns = stock_analysis::data_provider::announcement::fetch_announcements(None)
+            .await
             .unwrap_or_default();
 
         // 异步预解析：公告API缺失code时，通过东方财富搜索反查
