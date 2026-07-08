@@ -734,9 +734,11 @@ pub fn backfill_recommendations_outcome(date: &str) -> usize {
                 continue;
             }
         };
+        // v14.1 review fix: 拉 20 天 K 线 (push_date + 5 天 D+1/D+3/D+5 + 15 天 padding)
+        //   之前 5 天太短, 实际 D+1 窗口可能挤掉历史数据
         let kline_result = crate::data_provider::DataFetcherManager::new()
             .ok()
-            .and_then(|f| f.get_daily_data(code, 5).ok())
+            .and_then(|f| f.get_daily_data(code, 20).ok())
             .unwrap_or((Vec::new(), ""));
         let (klines, _): (Vec<_>, &str) = kline_result;
         if klines.is_empty() {
@@ -756,22 +758,29 @@ pub fn backfill_recommendations_outcome(date: &str) -> usize {
         updated += 1;
     }
 
-    // 3. 写回 (覆写)
-    let file = match fs::File::create(&path) {
-        Ok(f) => f,
-        Err(e) => {
-            log::warn!("[v70+] 写 {} 失败: {}", path.display(), e);
-            return 0;
+    // 3. 写回 (原子: 写 .tmp + rename, 防止 process crash 损坏原文件)
+    let tmp_path = path.with_extension("jsonl.tmp");
+    let write_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let file = fs::File::create(&tmp_path)?;
+        let mut writer = BufWriter::new(file);
+        for row in &rows {
+            let json = serde_json::Value::Object(
+                row.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+            );
+            // review fix: writeln 错误传播, 第一个错误即 abort, 不继续写损坏 jsonl
+            writeln!(writer, "{}", json)?;
         }
-    };
-    let mut writer = BufWriter::new(file);
-    for row in &rows {
-        let json = serde_json::Value::Object(
-            row.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-        );
-        if let Err(e) = writeln!(writer, "{}", json) {
-            log::warn!("[v70+] 写 jsonl 失败: {}", e);
-        }
+        writer.flush()?;
+        // 显式 drop BufWriter 关闭文件句柄, rename 在 Windows 上要求句柄关闭
+        drop(writer);
+        // 原子 rename: POSIX 保证, 失败则清理 .tmp
+        fs::rename(&tmp_path, &path)?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        log::error!("[v70+] 写 {} 失败: {} (保留原文件, 清理 .tmp)", path.display(), e);
+        let _ = fs::remove_file(&tmp_path);
+        return 0;
     }
     log::info!("[v70+] backfill {} 写回 {} 条 (date={})", path.display(), updated, date);
     updated
