@@ -35,6 +35,7 @@ pub use money_flow::{
     IntradayShape, MoneyFlowSummary,
 };
 pub use rustdx_provider::RustdxProvider;
+pub use sina_provider::SinaProvider;
 pub use valuation_history::{fetch_blocking as fetch_valuation_history, ValuationHistory};
 pub use consensus::{fetch_blocking as fetch_consensus, ConsensusData, RecentReport};
 pub use industry::{fetch_blocking as fetch_industry, IndustryBenchmark};

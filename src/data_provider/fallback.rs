@@ -16,7 +16,9 @@
 
 use anyhow::{anyhow, Result};
 
-use crate::data_provider::{DataProvider, GtimgProvider, HttpProvider, KlineData, RustdxProvider, is_ban_error};
+use crate::data_provider::{
+    DataProvider, GtimgProvider, HttpProvider, KlineData, RustdxProvider, SinaProvider, is_ban_error,
+};
 use crate::monitor::data_quality::{max_gap_for, validate_daily_kline_quality};
 
 /// 截断超长错误信息, 避免日志刷屏 (reqwest 错误会内嵌完整 URL)。
@@ -49,17 +51,34 @@ pub async fn fetch_kline_with_fallback(
     code: &str,
     days: usize,
 ) -> Result<(Vec<KlineData>, &'static str)> {
+    // Task 4 startup log: 列出 4-way fallback 链 + priority, 便于线上排查.
+    log::info!(
+        "[fallback] {} 启动 4-way 竞速链: sina_hq (P1) → tencent_qfq (P2) → eastmoney_qfq (P3) → rustdx_none (P4)",
+        code
+    );
+
     let client = crate::http_client::SHARED_HTTP_CLIENT.clone();
     let qc_threshold = max_gap_for(code);
 
-    // review #15: 三源并行启动 (腾讯 + 东财 HTTP, RustDX spawn_blocking).
+    // review #15 + Task 4: 4-way 并行竞速 (Sina priority 1 + 腾讯 + 东财 HTTP, RustDX spawn_blocking).
     enum SourceResult {
+        Sina(Result<Vec<KlineData>>),
         Tencent(Result<Vec<KlineData>>),
         Eastmoney(Result<Vec<KlineData>>),
         Rustdx(Result<Vec<KlineData>>),
     }
 
     let code_str = code.to_string();
+    // Task 4: Sina 加入 4-way 竞速 (priority 1 — HTTP 稳定 + GBK 内置反编码).
+    let sina_fut = {
+        let code = code.to_string();
+        async move {
+            // SinaProvider::fetch_kline_raw 已是 async, 直接 .await 而非 block_on,
+            // 否则 join! 内部嵌套 runtime 会 panic.
+            let r = SinaProvider::new().fetch_kline_raw(&code, days).await;
+            SourceResult::Sina(r)
+        }
+    };
     let tencent_fut = {
         let client = client.clone();
         async move {
@@ -85,11 +104,12 @@ pub async fn fetch_kline_with_fallback(
         SourceResult::Rustdx(r)
     };
 
-    // join! 三源 (顺序无关, race)
-    let (t, e, r) = tokio::join!(tencent_fut, eastmoney_fut, rustdx_fut);
+    // join! 4 源 (顺序无关, race)
+    let (s, t, e, r) = tokio::join!(sina_fut, tencent_fut, eastmoney_fut, rustdx_fut);
 
-    // 按优先级顺序处理 (腾讯 > 东财 > RustDX): 第一个 Ok+质检 通过即胜出.
-    let candidates: [(SourceResult, &'static str); 3] = [
+    // 按优先级顺序处理 (sina > 腾讯 > 东财 > RustDX): 第一个 Ok+质检 通过即胜出.
+    let candidates: [(SourceResult, &'static str); 4] = [
+        (s, "sina_hq"),
         (t, "tencent_qfq"),
         (e, "eastmoney_qfq"),
         (r, "rustdx_none"),
@@ -101,6 +121,7 @@ pub async fn fetch_kline_with_fallback(
 
     for (res, src) in candidates {
         let data = match res {
+            SourceResult::Sina(r) => r,
             SourceResult::Tencent(r) => r,
             SourceResult::Eastmoney(r) => r,
             SourceResult::Rustdx(r) => r,
@@ -138,7 +159,7 @@ pub async fn fetch_kline_with_fallback(
 
     Err(if all_empty {
         anyhow!(
-            "所有数据源均返回空: 腾讯=空, 东财=空, RustDX=空 ({})",
+            "所有数据源均返回空: sina=空, 腾讯=空, 东财=空, RustDX=空 ({})",
             code
         )
     } else if !all_qc_reject.is_empty() {
