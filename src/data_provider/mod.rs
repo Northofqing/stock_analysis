@@ -3,6 +3,7 @@
 //! 提供多种数据源的统一接口
 
 pub mod announcement;
+pub mod baostock_provider;
 pub mod chain_registry;
 pub mod chip_distribution;
 pub mod consensus;
