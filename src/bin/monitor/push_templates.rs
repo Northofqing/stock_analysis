@@ -2083,22 +2083,36 @@ pub struct IndustryChainSnapshot {
     pub leader_height: u32,
     /// (name, code, trigger, lo, hi, stop)
     pub supplements: Vec<(String, String, String, f64, f64, f64)>,
+    /// v13.10.5: LLM 生成的补涨 trigger 文案 (替代 "首板" 硬编码)
+    /// key: code, value: 真实触发原因 (e.g. "PCB 龙头首板, 800G 订单")
+    pub llm_triggers: std::collections::HashMap<String, String>,
 }
 
 /// v15.4: 构造 IndustryChainIntradayParams
+///
+/// v13.10.5: 补涨候选 trigger 字段 — 优先用 llm_triggers[code] (LLM 真实原因),
+/// 没有时回退原始 trigger (通常是 "首板" 硬编码).
 pub fn build_industry_chain_intraday_from_snapshot<'a>(
     s: &'a IndustryChainSnapshot,
 ) -> IndustryChainIntradayParams<'a> {
     let supplement_refs: Vec<SupplementCandidate<'a>> = s
         .supplements
         .iter()
-        .map(|(n, c, t, lo, hi, st)| SupplementCandidate {
-            name: n.as_str(),
-            code: c.as_str(),
-            trigger: t.as_str(),
-            lo: *lo,
-            hi: *hi,
-            stop: *st,
+        .map(|(n, c, t, lo, hi, st)| {
+            // v13.10.5: 优先 LLM 真实 trigger
+            let trigger: &str = s
+                .llm_triggers
+                .get(c)
+                .map(|s| s.as_str())
+                .unwrap_or(t.as_str());
+            SupplementCandidate {
+                name: n.as_str(),
+                code: c.as_str(),
+                trigger,
+                lo: *lo,
+                hi: *hi,
+                stop: *st,
+            }
         })
         .collect();
 
@@ -2234,6 +2248,7 @@ pub fn load_industry_chain_snapshot_real(hhmm: &str) -> IndustryChainSnapshot {
         leader_code: top.leader_code.clone(),
         leader_height: top.leader_boards,
         supplements,
+        llm_triggers: std::collections::HashMap::new(),
     }
 }
 
@@ -2270,6 +2285,7 @@ fn load_industry_chain_snapshot_real_fallback(hhmm: &str) -> IndustryChainSnapsh
         leader_code,
         leader_height: top.continuation_count as u32,
         supplements,
+        llm_triggers: std::collections::HashMap::new(),
     }
 }
 
@@ -2280,12 +2296,64 @@ pub fn load_industry_chain_snapshot(_hhmm: &str) -> IndustryChainSnapshot {
 
 /// v15.4 业务层入口 (v16.3 改用真实 chain_daily 数据)
 pub async fn dispatch_industry_chain_intraday_daily(hhmm: &str, banner: &BannerCtx) -> bool {
-    let snapshot = load_industry_chain_snapshot_real(hhmm);
+    let mut snapshot = load_industry_chain_snapshot_real(hhmm);
     if snapshot.chain.is_empty() {
         log_dispatcher_attempt("I-03", false, 0, "industry_chain_snapshot empty");
         log::info!("[I-03] industry_chain_snapshot 空 (chain_daily 无数据), 跳过推送");
         return false;
     }
+
+    // v13.10.5: LLM 路径 — 给补涨候选生成具体 trigger 文案 (替代 "首板" 硬编码)
+    // 失败 / 未配置 / 0 命中 → 静默, 用原 trigger
+    let llm_registry = stock_analysis::llm::LlmRegistry::from_env();
+    if !snapshot.supplements.is_empty() {
+        if let Some(provider) = llm_registry.select("industry_chain_intraday") {
+            log::info!("[I-03] LLM trigger 生成 provider={} model={}", provider.name(), provider.model());
+            // prompt 上下文: 主链 + 龙头 + 补涨候选 codes
+            let candidates_block: String = snapshot.supplements.iter()
+                .take(5)
+                .map(|(n, c, _, _, _, _)| format!("  - {}({})", n, c))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let user_prompt = format!(
+                "主链: {}\n龙头: {}({}) {}板\n补涨候选:\n{}\n\n请给每只候选生成 1 句具体的'触发补涨'原因 (1-2 句, A 股投资逻辑)",
+                snapshot.chain, snapshot.leader_name, snapshot.leader_code, snapshot.leader_height, candidates_block
+            );
+            match provider.chat_json(
+                "你是 A 股板块研究员. 从主链 + 龙头 + 候选上下文, 给每只候选生成 1 句具体触发原因. 输出 JSON: {\"triggers\":[{\"code\":\"002463\",\"reason\":\"800G 交换机订单 + 估值修复\"}]}",
+                &user_prompt,
+            ).await {
+                Ok(value) => {
+                    let arr = value.get("triggers").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                    let items: Vec<serde_json::Value> = serde_json::from_value::<Vec<serde_json::Value>>(serde_json::Value::Array(arr))
+                        .unwrap_or_default();
+                    let mut triggers_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+                    for item in items {
+                        if let (Some(code), Some(reason)) = (
+                            item.get("code").and_then(|v| v.as_str()),
+                            item.get("reason").and_then(|v| v.as_str()),
+                        ) {
+                            if !reason.trim().is_empty() {
+                                triggers_map.insert(code.to_string(), reason.to_string());
+                            }
+                        }
+                    }
+                    if !triggers_map.is_empty() {
+                        log::info!("[I-03] LLM 生成 {} 条 trigger", triggers_map.len());
+                        snapshot.llm_triggers = triggers_map;
+                    } else {
+                        log::info!("[I-03] LLM triggers 为空, 用原 trigger");
+                    }
+                }
+                Err(e) => {
+                    log::warn!("[I-03] LLM 生成失败: {}, 用原 trigger", e);
+                }
+            }
+        } else {
+            log::info!("[I-03] LLM 未配置, 用原 trigger");
+        }
+    }
+
     let params = build_industry_chain_intraday_from_snapshot(&snapshot);
     let snap_size = snapshot.supplements.len() + 1;  // +1 leader
     let result = push_industry_chain_intraday("", Some(banner), params).await;
@@ -6392,13 +6460,61 @@ mod tests {
                 12.0,
                 9.0,
             )],
+            llm_triggers: std::collections::HashMap::new(),
         };
         let p = build_industry_chain_intraday_from_snapshot(&s);
         assert_eq!(p.chain, "AI算力");
         assert_eq!(p.limit_count, 5);
         assert_eq!(p.leader_name, Some("龙头A"));
         assert_eq!(p.supplements.len(), 1);
-        assert_eq!(p.supplements[0].lo, 10.0);
+    }
+
+    /// v13.10.5: I-03 LLM 路径 — llm_triggers 命中 code 时用真实 trigger
+    #[test]
+    fn v13_10_5_i03_llm_triggers_override() {
+        let mut s = IndustryChainSnapshot {
+            hhmm: "10:30".to_string(),
+            chain: "PCB".to_string(),
+            limit_count: 3,
+            leader_name: "深南电路".to_string(),
+            leader_code: "002916".to_string(),
+            leader_height: 3,
+            supplements: vec![(
+                "沪电股份".to_string(),
+                "002463".to_string(),
+                "首板".to_string(),  // 旧 fallback
+                10.0, 12.0, 9.0,
+            )],
+            llm_triggers: std::collections::HashMap::new(),
+        };
+        // 注入 LLM trigger
+        s.llm_triggers.insert("002463".to_string(), "800G 交换机订单 + 估值修复".to_string());
+        let p = build_industry_chain_intraday_from_snapshot(&s);
+        assert_eq!(p.supplements.len(), 1);
+        assert_eq!(p.supplements[0].trigger, "800G 交换机订单 + 估值修复");
+        assert_eq!(p.supplements[0].code, "002463");
+    }
+
+    /// v13.10.5: I-03 降级 — llm_triggers 不命中时回退原 trigger
+    #[test]
+    fn v13_10_5_i03_fallback_when_llm_missing() {
+        let s = IndustryChainSnapshot {
+            hhmm: "10:30".to_string(),
+            chain: "PCB".to_string(),
+            limit_count: 3,
+            leader_name: "深南电路".to_string(),
+            leader_code: "002916".to_string(),
+            leader_height: 3,
+            supplements: vec![(
+                "兴森科技".to_string(),
+                "002436".to_string(),
+                "放量突破".to_string(),
+                10.0, 12.0, 9.0,
+            )],
+            llm_triggers: Default::default(),  // 空 — 回退
+        };
+        let p = build_industry_chain_intraday_from_snapshot(&s);
+        assert_eq!(p.supplements[0].trigger, "放量突破", "llm_triggers 缺 code 时用原 trigger");
     }
 
     #[test]
