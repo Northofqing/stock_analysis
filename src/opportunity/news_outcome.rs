@@ -672,3 +672,98 @@ mod tests {
         assert!(s.contains("无数据"));
     }
 }
+
+/// v70+: 兑现回填 (D+1 outcome 写回 d01_recommendations_YYYY-MM-DD.jsonl)
+///   - 读: data/d01_recommendations/YYYY-MM-DD.jsonl
+///   - 算: 用 push_at 后 1-5 天的 K 线算 D+1/D+3/D+5 + MFE/MAE
+///   - 写: 更新每行 outcome 字段, 写回原 jsonl 文件
+///   - 漏报: K 线缺失 (沙箱 / 非交易日) 时 outcome 保持 null
+pub fn backfill_recommendations_outcome(date: &str) -> usize {
+    use std::collections::HashMap;
+    use std::fs;
+    use std::io::{BufRead, BufWriter, Write};
+
+    let path = std::path::PathBuf::from("data/d01_recommendations").join(format!("{}.jsonl", date));
+    if !path.exists() {
+        log::info!("[v70+] {} 不存在, skip", path.display());
+        return 0;
+    }
+
+    // 1. 读 jsonl → (ts, code, push_price) 提取
+    let content = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("[v70+] 读 {} 失败: {}", path.display(), e);
+            return 0;
+        }
+    };
+    let mut rows: Vec<HashMap<String, serde_json::Value>> = Vec::new();
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(obj) = v.as_object() {
+                rows.push(obj.iter().map(|(k, val)| (k.clone(), val.clone())).collect());
+            }
+        }
+    }
+    if rows.is_empty() {
+        return 0;
+    }
+
+    // 2. 算每行 D+1/D+3/D+5
+    let mut updated = 0;
+    for row in &mut rows {
+        let code = row.get("code").and_then(|v| v.as_str()).unwrap_or("");
+        let ts = row.get("ts").and_then(|v| v.as_str()).unwrap_or("");
+        if code.is_empty() || ts.is_empty() {
+            continue;
+        }
+        // 拉 K 线 (推送日 + 5 天)
+        let push_date = match NaiveDate::parse_from_str(&ts[..10], "%Y-%m-%d") {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let kline_result = crate::data_provider::DataFetcherManager::new()
+            .ok()
+            .and_then(|f| f.get_daily_data(code, 5).ok())
+            .unwrap_or((Vec::new(), ""));
+        let (klines, _): (Vec<_>, &str) = kline_result;
+        if klines.is_empty() {
+            continue;
+        }
+        let d1 = pct_change_at(&klines, push_date, 1);
+        let d3 = pct_change_at(&klines, push_date, 3);
+        let d5 = pct_change_at(&klines, push_date, 5);
+        let (mfe, mae) = mfe_mae(&klines, push_date, 5);
+        let push_price = kline_at_or_before(&klines, push_date).map(|k| k.close);
+
+        let outcome = serde_json::json!({
+            "d1_pct": d1, "d3_pct": d3, "d5_pct": d5,
+            "mfe": mfe, "mae": mae, "push_price": push_price,
+        });
+        row.insert("outcome".to_string(), outcome);
+        updated += 1;
+    }
+
+    // 3. 写回 (覆写)
+    let file = match fs::File::create(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            log::warn!("[v70+] 写 {} 失败: {}", path.display(), e);
+            return 0;
+        }
+    };
+    let mut writer = BufWriter::new(file);
+    for row in &rows {
+        let json = serde_json::Value::Object(
+            row.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        );
+        if let Err(e) = writeln!(writer, "{}", json) {
+            log::warn!("[v70+] 写 jsonl 失败: {}", e);
+        }
+    }
+    log::info!("[v70+] backfill {} 写回 {} 条 (date={})", path.display(), updated, date);
+    updated
+}

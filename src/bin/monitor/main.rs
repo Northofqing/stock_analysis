@@ -867,6 +867,12 @@ async fn main() {
     // v70: e2e 模式 (--e2e), 跑所有 v12 §14 + v13.1 模板, 忽略时间窗口 + 数据空 (mock fallback)
     let e2e_mode = std::env::args().any(|a| a == "--e2e");
 
+    // v70+: 兑现回填模式 (--backfill-outcome=YYYY-MM-DD)
+    //   回填 d01_recommendations/YYYY-MM-DD.jsonl 里的 outcome 字段 (D+1/D+3/D+5/MFE/MAE)
+    //   用途: D 日推送 → D+1 收盘后跑这个命令, 把推荐兑现数据写回
+    let backfill_outcome_date: Option<String> = std::env::args()
+        .find_map(|a| a.strip_prefix("--backfill-outcome=").map(|s| s.to_string()));
+
     // 显式标记交易环境，供底层写入守卫执行双向隔离。
     // v19.9: --test 路径不设 STOCK_ENV_MODE (默认 prod), 让 env_guard 允许真持仓
     // (--test 用 .env STOCK_LIST 真接, 不写生产数据; 双向隔离由 STOCK_LIST 过滤保护)
@@ -901,6 +907,15 @@ async fn main() {
     if e2e_mode {
         log::info!("[v70] E2E 模式启动 — 跑所有 v12 §14 模板 (忽略时间窗口)");
         e2e_all_templates_run().await;
+        std::process::exit(0);
+    }
+
+    // v70+: 兑现回填 (D+1 outcome 写回 d01_recommendations jsonl)
+    if let Some(date) = backfill_outcome_date {
+        log::info!("[v70+] --backfill-outcome 模式启动 | 日期 = {}", date);
+        use stock_analysis::opportunity::news_outcome::backfill_recommendations_outcome;
+        let updated = backfill_recommendations_outcome(&date);
+        log::info!("[v70+] 回填完成 | {} | 更新行数 = {}", date, updated);
         std::process::exit(0);
     }
 
