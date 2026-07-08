@@ -967,6 +967,14 @@ async fn main() {
     let broker_src = stock_analysis::broker::detect_and_register();
     log::info!("[broker] 启动完成 | 当前数据源 = {}", broker_src.label());
 
+    // Task 8: 启动 banner 列出 K线 fallback 链 + 盘后路径, 便于线上排查.
+    // 4-way 盘中 (review #15 + Phase 1): Sina → 腾讯 → 东财 → RustDX 并行竞速.
+    // 盘后专用 (Phase 1 post_close): Baostock (P1) → 4-way fallthrough (P2).
+    log::info!(
+        "[启动] K线 fallback chain (盘中): sina_hq (P1) → tencent_qfq (P2) → eastmoney_qfq (P3) → rustdx_none (P4) | review #15 + #16"
+    );
+    log::info!("[启动] 盘后路径: baostock (P1) → 4-way join (P2, post_close)");
+
     // v70: e2e 模式 (--e2e) — 跑所有 v12 §14 + v13.1 模板, 忽略时间窗口, mock fallback
     if e2e_mode {
         log::info!("[v70] E2E 模式启动 — 跑所有 v12 §14 模板 (忽略时间窗口)");

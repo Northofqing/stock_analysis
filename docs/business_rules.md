@@ -17,6 +17,8 @@
 | BR-010 | ✅ registered | Push-index caching in `evaluate_audit` — single `locate_push_idx` at entry, helpers consume `push_idx` for O(1) slice | `src/opportunity/news_outcome.rs:188-260` |
 | BR-011 | ✅ registered | Per-iteration RustDHC `analyze_postmarket` dedup — single `sig_opt` reused across `pattern_score` and `breakout_reason` blocks | `src/opportunity/mod.rs:1112-1135` |
 | BR-012 | ✅ registered | Tokio `join!` for `compute_account_mode_metrics_blocking` + `latest_account_mode_change` (concurrent DB calls) | `src/bin/monitor/main.rs:479-500` |
+| BR-014 | ✅ registered | Sina (hq.sinajs.cn) 接入 fallback priority 1 — GBK 编码 + 公开 HTTP + JSONP 解析, IP 独立于腾讯/东财 | `src/data_provider/sina_provider.rs`, `src/data_provider/stock_code_map.rs` |
+| BR-015 | ✅ registered | Baostock (baostock.com) 盘后专用日终数据, 无限调用, WebSocket-like session + 复权 (adjustflag=2) | `src/data_provider/baostock_provider.rs`, `src/data_provider/fallback.rs` |
 
 ---
 

@@ -159,6 +159,15 @@ cargo run --bin rsi_optimize
 | **Risk** | `src/risk/` | 硬仓位/止损/VetoChain 否决链 |
 | **Review** | `src/review/` | 复盘/业绩归因/falsification |
 
+### 数据源 (Phase 1, review #15 + #16)
+
+| 路径 | 数据源 | 优先级 |
+|------|--------|--------|
+| **K线 (盘中)** | Sina → 腾讯 (qfq) → 东财 (qfq) → RustDX TCP | P1 → P2 → P3 → P4 (4-way 竞速) |
+| **K线 (盘后)** | Baostock → 上面 4-way | Baostock P1, 4-way P2 (盘后专用) |
+
+详见 `docs/sina_baostock_integration.md` 与 `docs/business_rules.md` (BR-014, BR-015)。
+
 ---
 
 ## 目录结构
