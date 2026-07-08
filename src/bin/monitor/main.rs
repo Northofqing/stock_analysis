@@ -2991,13 +2991,30 @@ async fn push_e2e_news_modules(hhmm: &str) {
 }
 
 /// v14.1 task #163: T-16 ST 涨跌幅变更 e2e 验证
-///   步骤: 1) seed 一只 st_type='*ST' 持仓 (代码 600090 测试用)
+/// v14.1 review fix: RAII 清理 guard, panic/dispatch hang 时 Drop 兜底 DELETE
+///   之前 cleanup 在每个 return 路径手写, dispatcher panic 会泄露 seed row
+struct E2ECleanup<'a> {
+    db_path: &'a str,
+    code: &'a str,
+}
+
+impl Drop for E2ECleanup<'_> {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("sqlite3")
+            .args([self.db_path, &format!("DELETE FROM stock_position WHERE code='{}'", self.code)])
+            .output();
+        log::info!("[v14.1 #163] T-16 e2e seed 已清理 (RAII)");
+    }
+}
+
+///   步骤: 1) seed 一只 st_type='*ST' 持仓 (代码 999999 测试用, 无效 A 股防冲突)
 ///         2) 调 portfolio::get_st_positions() 验证非空
 ///         3) 调 push_templates::dispatch_st_price_limit_changed() 推 1 条
-///         4) DELETE 清理 (e2e 不能污染真实 DB)
+///         4) E2ECleanup Drop 兜底 DELETE (panic / 早退 / 正常完成都触发)
 async fn push_e2e_t16_st_price_limit(hhmm: &str) {
     use std::process::Command;
     let db_path = "data/stock_analysis.db";
+    const E2E_CODE: &str = "999999";
 
     // 1. Seed: insert 一只 *ST 持仓 (买价 5.00, 1000 股, st_type='*ST')
     // v14.1 review fix: 用 999999 (无效 A 股代码) + INSERT OR IGNORE 避免 clobber 真用户持仓
@@ -3012,14 +3029,13 @@ async fn push_e2e_t16_st_price_limit(hhmm: &str) {
         return;
     }
 
+    // v14.1 review fix: RAII guard, 函数任意 return / panic 都触发 DELETE
+    let _cleanup = E2ECleanup { db_path, code: E2E_CODE };
+
     // 2. 验证 get_st_positions 非空
     let st_positions = stock_analysis::portfolio::get_st_positions();
     if st_positions.is_empty() {
         log::warn!("[v14.1 #163] get_st_positions 仍为空 (seed 失败?) — 跳过推");
-        // 清理
-        let _ = Command::new("sqlite3")
-            .args([db_path, "DELETE FROM stock_position WHERE code='999999'"])
-            .output();
         return;
     }
     log::info!("[v14.1 #163] get_st_positions 找到 {} 只 ST 持仓", st_positions.len());
@@ -3048,12 +3064,7 @@ async fn push_e2e_t16_st_price_limit(hhmm: &str) {
         .await;
     }
     log::info!("[v14.1 #163] T-16 已推 {} 条", st_positions.len());
-
-    // 4. 清理 (e2e 不能污染真实 DB). code='999999' 无效 A 股, DELETE 不会误伤
-    let _ = Command::new("sqlite3")
-        .args([db_path, "DELETE FROM stock_position WHERE code='999999'"])
-        .output();
-    log::info!("[v14.1 #163] T-16 e2e seed 已清理");
+    // _cleanup 在函数 return 时 Drop, 兜底 DELETE
 }
 
 /// v70: 推所有盘中 14.x 模板 (mock fallback)
