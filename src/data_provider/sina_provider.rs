@@ -43,6 +43,66 @@ pub struct SinaKlineRow {
     pub volume: String,     // 手
 }
 
+/// 构造 Sina 实时行情 URL.
+///
+/// `https://hq.sinajs.cn/list=sh600519,sz000001`
+///
+/// 多个 code 用逗号分隔, 一次请求拿多个. 内部自动 `to_sina` 加前缀.
+pub fn build_hq_url(codes: &str) -> String {
+    let sina_codes: Vec<String> = codes
+        .split(',')
+        .map(|c| to_sina(c.trim()))
+        .collect();
+    format!("https://hq.sinajs.cn/list={}", sina_codes.join(","))
+}
+
+/// Sina 实时行情 hq_str 解析结果.
+///
+/// 字段顺序 (Sina 标准): name, open, yesterday_close, current, high, low,
+/// bid, ask, volume, amount, ...
+#[derive(Debug, Default, PartialEq)]
+pub struct SinaHqQuote {
+    pub name: String,
+    pub open: f64,
+    pub yesterday_close: f64,
+    pub current: f64,
+    pub high: f64,
+    pub low: f64,
+    pub volume: f64,
+    pub amount: f64,
+}
+
+/// 解析 `var hq_str_xx="name,open,prev_close,current,high,low,bid,ask,volume,amount,...";`
+///
+/// 至少需要 10 个字段 (含 name + 9 个数值), 少于则报错.
+pub fn parse_hq_str(body: &str, code: &str) -> Result<SinaHqQuote> {
+    // 提取第一对 `"..."` 内的 CSV.
+    let start = body
+        .find('"')
+        .ok_or_else(|| anyhow!("Sina hq: 无引号"))?;
+    let end = body
+        .rfind('"')
+        .ok_or_else(|| anyhow!("Sina hq: 引号不闭合"))?;
+    if end <= start {
+        return Err(anyhow!("Sina hq {}: 引号位置异常", code));
+    }
+    let csv = &body[start + 1..end];
+    let fields: Vec<&str> = csv.split(',').collect();
+    if fields.len() < 10 {
+        return Err(anyhow!("Sina hq {}: 字段数 {} < 10", code, fields.len()));
+    }
+    Ok(SinaHqQuote {
+        name: fields[0].to_string(),
+        open: fields[1].parse().unwrap_or(0.0),
+        yesterday_close: fields[2].parse().unwrap_or(0.0),
+        current: fields[3].parse().unwrap_or(0.0),
+        high: fields[4].parse().unwrap_or(0.0),
+        low: fields[5].parse().unwrap_or(0.0),
+        volume: fields[8].parse().unwrap_or(0.0),
+        amount: fields[9].parse().unwrap_or(0.0),
+    })
+}
+
 impl SinaProvider {
     /// 创建新的 SinaProvider, 10s 超时, 简单 UA.
     pub fn new() -> Self {
@@ -72,6 +132,25 @@ impl SinaProvider {
         }
         let body = utf8.into_owned();
         parse_kline_body(&body, code)
+    }
+
+    /// 抓取 Sina 实时行情 (单只, GBK → UTF-8 decode).
+    pub async fn fetch_hq_async(&self, code: &str) -> Result<SinaHqQuote> {
+        let url = build_hq_url(code);
+        let bytes = self.client
+            .get(&url)
+            .header("Referer", "https://finance.sina.com.cn")
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?;
+        let (utf8, _, had_errors) = GBK.decode(&bytes);
+        if had_errors {
+            log::warn!("[Sina] {code} hq GBK decode 错误, 部分字符可能异常");
+        }
+        let body = utf8.into_owned();
+        parse_hq_str(&body, code)
     }
 }
 
@@ -145,9 +224,27 @@ impl DataProvider for SinaProvider {
         None
     }
 
-    fn get_realtime_quote(&self, _code: &str) -> Result<Option<RealtimeQuote>> {
-        // Task 3 实现
-        Ok(None)
+    fn get_realtime_quote(&self, code: &str) -> Result<Option<RealtimeQuote>> {
+        // sync DataProvider trait 内部跑 async — 用 crate 共享 helper
+        let hq = crate::block_on_async(self.fetch_hq_async(code))?;
+        let pct_chg = if hq.yesterday_close > 0.0 {
+            (hq.current - hq.yesterday_close) / hq.yesterday_close * 100.0
+        } else {
+            0.0
+        };
+        Ok(Some(RealtimeQuote {
+            code: code.to_string(),
+            name: hq.name,
+            price: hq.current,
+            pct_chg,
+            pe_ratio: 0.0,
+            pb_ratio: 0.0,
+            turnover_rate: 0.0,
+            market_cap: 0.0,
+            circulating_cap: 0.0,
+            volume: hq.volume,
+            amount: hq.amount,
+        }))
     }
 }
 
