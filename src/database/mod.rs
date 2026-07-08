@@ -1138,6 +1138,7 @@ impl DatabaseManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::StockPosition;
     use chrono::NaiveDate;
 
     // OnceCell 单例全局共享，测试共用同一路径避免竞态
@@ -1258,6 +1259,124 @@ mod tests {
         assert_eq!(row2.name, "*ST测试改名", "upsert name 未同步");
 
         // 4. 清理
+        let _ = std::fs::remove_file(test_db);
+    }
+
+    // v14.1 review fix: 测试 backfill_st_type 前缀锚定 (LIKE 'ST%' / 'ST*%' 而非 '%ST%')
+    // 之前 '%ST%' 子串匹配会把 'BEST' / 'GST' 误判成 ST 类
+    #[test]
+    fn test_backfill_st_type_prefix_anchored() {
+        use crate::models::NewStockPosition;
+        use crate::schema::stock_position;
+        use diesel::prelude::*;
+
+        let test_db = "./test_data/test_backfill_st_type.db";
+        std::fs::create_dir_all("./test_data").ok();
+        let _ = std::fs::remove_file(test_db);
+        let _ = DatabaseManager::init(Some(PathBuf::from(test_db)));
+
+        let db = DatabaseManager::get();
+
+        // Insert 4 测试持仓: 真正 ST 开头 + 子串含 ST (非 ST 类) + 普通 + *ST
+        let cases = vec![
+            ("TEST001", "ST康美", Some("ST")),
+            ("TEST002", "*ST华微", Some("*ST")),
+            ("TEST003", "BEST新材", None),    // 子串含 ST 但不是 ST 类
+            ("TEST004", "GST电子", None),     // 子串含 ST 但不是 ST 类
+            ("TEST005", "浦发银行", None),    // 普通
+            ("TEST006", "SST集成", Some("ST")),
+            ("TEST007", "S*ST海伦", Some("*ST")),
+        ];
+        for (code, name, _expected) in &cases {
+            db.save_position(&NewStockPosition {
+                code: code.to_string(),
+                name: name.to_string(),
+                buy_date: "2026-07-01".to_string(),
+                buy_price: 10.0,
+                quantity: 100,
+                status: "open".to_string(),
+                st_type: None,
+                chain_name: None,
+            }).expect("save 失败");
+        }
+
+        // 跑 backfill
+        let updated = db.backfill_st_type().expect("backfill 失败");
+        assert!(updated > 0, "至少应更新 4 条真 ST 类");
+
+        // 验证每个 case
+        let mut conn = db.get_conn().unwrap();
+        for (code, name, expected) in &cases {
+            let row: StockPosition = stock_position::table
+                .filter(stock_position::code.eq(code.as_ref() as &str))
+                .first(&mut conn)
+                .expect("query 失败");
+            assert_eq!(
+                row.st_type.as_deref(), *expected,
+                "code={code} name={name} expected={expected:?} got={:?}",
+                row.st_type
+            );
+        }
+
+        // 清理
+        let _ = std::fs::remove_file(test_db);
+    }
+
+    // v14.1 review fix: 测试 save_position upsert 不覆盖 st_type (COALESCE 行为)
+    // 之前 excluded(st_type) 会把 backfill 写好的 *ST 清成 NULL
+    #[test]
+    fn test_save_position_upsert_preserves_st_type() {
+        use crate::models::NewStockPosition;
+        use crate::schema::stock_position;
+        use diesel::prelude::*;
+
+        let test_db = "./test_data/test_upsert_preserve_st.db";
+        std::fs::create_dir_all("./test_data").ok();
+        let _ = std::fs::remove_file(test_db);
+        let _ = DatabaseManager::init(Some(PathBuf::from(test_db)));
+
+        let db = DatabaseManager::get();
+
+        // 1. 首次 insert, st_type=None
+        db.save_position(&NewStockPosition {
+            code: "600519".to_string(),
+            name: "贵州茅台".to_string(),
+            buy_date: "2026-07-01".to_string(),
+            buy_price: 1800.0,
+            quantity: 100,
+            status: "open".to_string(),
+            st_type: None,
+            chain_name: None,
+        }).expect("save 1 失败");
+
+        // 2. 模拟 broker 推送 *ST (用 raw SQL 写, 模拟 broker update path)
+        let mut conn = db.get_conn().unwrap();
+        diesel::sql_query("UPDATE stock_position SET st_type = '*ST' WHERE code = '600519'")
+            .execute(&mut conn).expect("st_type set 失败");
+
+        // 3. trading::open_position re-buy 同 (code, buy_date) — 传 None
+        db.save_position(&NewStockPosition {
+            code: "600519".to_string(),
+            name: "贵州茅台".to_string(),
+            buy_date: "2026-07-01".to_string(),
+            buy_price: 1850.0,  // 价格变 (新买入)
+            quantity: 200,       // 数量变
+            status: "open".to_string(),
+            st_type: None,        // 重买不带 st_type
+            chain_name: None,     // 重买不带 chain
+        }).expect("save 2 失败");
+
+        // 4. 验证: st_type 应保持 '*ST' (COALESCE 保 NULL 时不覆盖), 价格/数量更新
+        let row: StockPosition = stock_position::table
+            .filter(stock_position::code.eq("600519"))
+            .first(&mut conn)
+            .expect("re-query 失败");
+        assert_eq!(row.st_type.as_deref(), Some("*ST"),
+            "st_type 应保持 broker 推送的 *ST, 不应被 re-buy NULL 覆盖");
+        assert_eq!(row.buy_price, 1850.0, "价格应更新");
+        assert_eq!(row.quantity, 200, "数量应更新");
+
+        // 清理
         let _ = std::fs::remove_file(test_db);
     }
 }
