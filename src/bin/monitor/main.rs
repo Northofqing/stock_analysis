@@ -612,9 +612,8 @@ pub async fn refresh_banner_state_with_metrics(
 /// 失败不阻塞主循环 (fire-and-forget log).
 async fn evaluate_account_mode_hook(startup: bool) {
     use stock_analysis::database::account_mode_log::{
-        latest_account_mode_change, AccountModeLogRow,
+        latest_account_mode_change,
     };
-    use stock_analysis::risk::account_mode::PortfolioMetrics;
     use stock_analysis::risk::action_gate::AccountMode;
 
     // 1. 装 metrics
@@ -1448,11 +1447,8 @@ async fn run_test_scan() {
     log::info!("[v12-MVP0-B] T-02 演示触发完成 (模拟 Full→Degraded)");
 
     // T-03 持仓建议 (遍历当前持仓, 简化调用)
-    use crate::push_templates as pt;
-    use stock_analysis::decision::holding_plan::{
-        HoldingThreePlans, HoldingThreePlansInput, PlanAction, ScenarioPlan,
-    };
     let _holding_count = holdings.len();
+    use crate::push_templates as pt;
     if !holdings.is_empty() {
         let banner = pt::BannerCtx::default();
         // 实际生产路径会逐持仓装配 HoldingThreePlansInput (含支撑压力/筹码分布/资金流)
@@ -1517,7 +1513,10 @@ async fn run_test_scan() {
         let r2_equity = stock_analysis::portfolio::get_equity_curve(30).unwrap_or_default();
         let r2_ledger = r2_equity.last().cloned();
         let r2_mv = r2_ledger.as_ref().map(|e| e.market_value).unwrap_or(0.0);
-        let anns = stock_analysis::data_provider::announcement::fetch_announcements(None)
+        // review #15: fetch_announcements 改 async. 外层已经在 spawn_blocking closure
+        // (sync context), 用 Handle::current().block_on() 直接驱动 future, 无需嵌套.
+        let anns = tokio::runtime::Handle::current()
+            .block_on(stock_analysis::data_provider::announcement::fetch_announcements(None))
             .unwrap_or_default();
         let ann_summary = if anns.is_empty() {
             "今日无重大公告 (data_source 缺失)".to_string()
@@ -1972,7 +1971,7 @@ async fn run_test_scan() {
 
     // R-07 明日观察池 (MVP-4 §7.6, 一期: 0 来源, 0 候选)
     let watch_review = tokio::task::spawn_blocking(|| {
-        use stock_analysis::review::tomorrow_watchlist::{render_r07, WatchItem, WatchSource};
+        use stock_analysis::review::tomorrow_watchlist::{render_r07, WatchItem};
         let items: Vec<WatchItem> = Vec::new(); // 一期: 0 候选, 等 PR4-7.6 数据源接入
         render_r07(&items)
     })
@@ -2328,7 +2327,6 @@ async fn run_review_only_inner() {
     use crate::push_templates as pt;
 
     let v12_review_result: Result<(), String> = tokio::task::spawn_blocking(move || {
-        use stock_analysis::risk::account_mode::{evaluate, ModeThresholds, PortfolioMetrics};
         let today_str = chrono::Local::now().format("%Y-%m-%d").to_string();
         let hhmm = chrono::Local::now().format("%H:%M").to_string();
 
@@ -2630,7 +2628,10 @@ async fn run_review_only_inner() {
             // 公告拉取 (sync, 包 spawn_blocking)
             let (ann_summary, holding_events) = tokio::task::spawn_blocking(move || {
                 // 1. 拉今日全市场公告 (data_source不稳定时返空)
-                let anns = stock_analysis::data_provider::announcement::fetch_announcements(None)
+                // review #15: fetch_announcements 改 async. 外层 spawn_blocking closure
+                // 是 sync context, 用 Handle::current().block_on 驱动 future.
+                let anns = tokio::runtime::Handle::current()
+                    .block_on(stock_analysis::data_provider::announcement::fetch_announcements(None))
                     .unwrap_or_default();
                 let ann_text = if anns.is_empty() {
                     "今日无重大公告 (data_source 缺失)".to_string()
@@ -2859,7 +2860,6 @@ async fn run_review_only_inner() {
 ///         4) 不依赖时间窗口, 不依赖数据 (mock fallback)
 ///   用途: 验证 v12 §14 + v13.1 模板完整性, 推全 22 模板
 async fn e2e_all_templates_run() {
-    use push_templates as pt;
     let today_str = chrono::Local::now().format("%Y-%m-%d").to_string();
     let hhmm = chrono::Local::now().format("%H:%M").to_string();
     log::info!("[v70] E2E 开始 — 跑所有 v12 §14 + v13.1 模板");
@@ -3363,12 +3363,11 @@ async fn news_monitor_loop() {
         }
 
         // 公告扫描（仅网络拉取在 spawn_blocking，处理在主线程）
-        let anns = tokio::task::spawn_blocking(|| {
-            stock_analysis::data_provider::announcement::fetch_announcements(None)
-                .unwrap_or_default()
-        })
-        .await
-        .unwrap_or_else(|_| vec![]);
+        // review #15: fetch_announcements 改 async, 已在 spawn_blocking closure 内,
+// 直接 Handle::block_on 驱动 future.
+        let anns = tokio::runtime::Handle::current()
+            .block_on(stock_analysis::data_provider::announcement::fetch_announcements(None))
+            .unwrap_or_default();
 
         // 异步预解析：公告API缺失code时，通过东方财富搜索反查
         let mut resolved_codes: std::collections::HashMap<String, String> =
@@ -5413,7 +5412,6 @@ mod tests_wrapper_real_raw {
     use super::*;
     use chrono::NaiveDate;
     use std::collections::HashMap;
-    use stock_analysis::data_provider::KlineData;
     use stock_analysis::portfolio::{Position, PositionStatus};
 
     fn pos(code: &str) -> Position {

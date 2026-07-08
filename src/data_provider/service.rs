@@ -18,17 +18,13 @@ use crate::data_provider::financials::{fetch_with_fallback_async, Financials};
 use crate::data_provider::money_flow::{
     fetch_flow_history_async, fetch_intraday_shape_async, IntradayShape, MoneyFlowSummary,
 };
-use crate::data_provider::{is_ban_error, KlineData};
+use crate::data_provider::KlineData;
 use anyhow::Result;
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-
-// 测试代码会引用 brief/is_ban_error. lib build 不需要 (#[allow] 给 test build).
-#[allow(unused_imports)]
-use crate::data_provider::brief;
 
 /// 缓存条目：value + 写入时间。读时检查 TTL，过期则 invalidate。
 type CachedSlot<T> = Arc<RwLock<Option<(Instant, Arc<T>)>>>;
@@ -189,6 +185,11 @@ pub fn service() -> &'static DataFetchService {
 
 #[cfg(test)]
 mod tests {
+    // review #15: 把测试 only 的 import (brief/is_ban_error) 移进 test mod,
+    // 避免 lib build 的 #[allow(unused_imports)] smell.
+    #[allow(unused_imports)]
+    use crate::data_provider::brief;
+    use crate::data_provider::is_ban_error;
     use super::*;
 
     #[test]

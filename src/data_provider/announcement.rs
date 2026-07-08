@@ -7,6 +7,7 @@
 use anyhow::Result;
 use log::{info, warn};
 use serde::Deserialize;
+use std::sync::Arc;
 
 const ANNOUNCE_URL: &str = "https://np-anotice-stock.eastmoney.com/api/security/ann";
 const MAX_PER_FETCH: usize = 200;
@@ -206,6 +207,12 @@ fn classify_title(title: &str, _code: &str, _name: &str) -> (AnnLevel, String) {
     static CACHED_CFG: std::sync::OnceLock<
         Option<(Vec<String>, Vec<String>, Vec<String>)>,
     > = std::sync::OnceLock::new();
+    // review #15 改进: 首次 init 时如果 config 缺失 (None), 显式 log warn.
+    // AGENTS.md §2.2 要求 "missing data fields MUST be left blank or logged as warnings;
+    // MUST NOT be silently filled" — config 缺失 = 走 const fallback 是 silent fill.
+    // 用 OnceLock 状态一次性记录是否 warn 过 (避免每次 classify_title 重复打).
+    static CFG_MISSING_WARNED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
     let (emergency, important, positive) = CACHED_CFG
         .get_or_init(|| {
             crate::config::get_announce_keywords()
@@ -213,11 +220,22 @@ fn classify_title(title: &str, _code: &str, _name: &str) -> (AnnLevel, String) {
         })
         .as_ref()
         .map(|(e, i, p)| (KwList::Owned(e), KwList::Owned(i), KwList::Owned(p)))
-        .unwrap_or((
-            KwList::Static(EMERGENCY_KEYWORDS),
-            KwList::Static(IMPORTANT_KEYWORDS),
-            KwList::Static(POSITIVE_KEYWORDS),
-        ));
+        .unwrap_or_else(|| {
+            // review #15: 仅首次 fallback 时 log warn 一次 (避免每公告重复打印).
+            if !CFG_MISSING_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log::warn!(
+                    "[announcement] announce_keywords 配置缺失, 走 const 编译期 fallback \
+                     ({} EMERGENCY / {} IMPORTANT / {} POSITIVE). 检查 config/chain.toml \
+                     announce_keywords 段是否合法.",
+                    EMERGENCY_KEYWORDS.len(), IMPORTANT_KEYWORDS.len(), POSITIVE_KEYWORDS.len()
+                );
+            }
+            (
+                KwList::Static(EMERGENCY_KEYWORDS),
+                KwList::Static(IMPORTANT_KEYWORDS),
+                KwList::Static(POSITIVE_KEYWORDS),
+            )
+        });
 
     if let Some(kw) = emergency.first_match(title) {
         return (AnnLevel::Emergency, format!("标题含'{kw}'，直接告警"));
@@ -256,13 +274,12 @@ fn extract_reduction_pct(title: &str) -> Option<f64> {
 
 // ── API 拉取 ──
 
-pub fn fetch_announcements(date: Option<&str>) -> Result<Vec<Announcement>> {
+/// review #15: 改 async + FuturesUnordered 并发 fetch_ann_detail.
+pub async fn fetch_announcements(date: Option<&str>) -> Result<Vec<Announcement>> {
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let date_str = date.unwrap_or(&today);
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()?;
+    let client = crate::http_client::SHARED_HTTP_CLIENT.clone();
 
     let url = format!(
         "{}?page_size={}&page_index=1&ann_type=SHA,SZA&start_date={}&end_date={}",
@@ -273,8 +290,11 @@ pub fn fetch_announcements(date: Option<&str>) -> Result<Vec<Announcement>> {
         .get(&url)
         .header("User-Agent", "Mozilla/5.0")
         .header("Referer", "https://data.eastmoney.com/")
-        .send()?
-        .json()?;
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
 
     let list = resp.data.and_then(|d| d.list).unwrap_or_default();
     info!("[公告] {} 获取 {} 条", date_str, list.len());
@@ -283,6 +303,32 @@ pub fn fetch_announcements(date: Option<&str>) -> Result<Vec<Announcement>> {
     if list.len() >= MAX_PER_FETCH {
         warn!("[公告] 单日 {} 条，触发熔断，仅标题扫描", list.len());
     }
+
+    // review #15: 高危公告 body 拉取改成 FuturesUnordered 并发, 不再串行 N × 10s.
+    let client_arc = Arc::new(client);
+    let detail_futures = list.iter()
+        .filter_map(|item| {
+            let title = item.title.as_deref().unwrap_or("");
+            let (level, _reason) = classify_title(title, "", "");
+            let art_code = item.art_code.as_deref().unwrap_or("");
+            if matches!(level, AnnLevel::Emergency | AnnLevel::Important) && !art_code.is_empty() {
+                Some(art_code.to_string())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    let detail_results: Vec<(String, String)> = futures::future::join_all(
+        detail_futures.iter().map(|art_code| {
+            let c = Arc::clone(&client_arc);
+            let ac = art_code.clone();
+            async move {
+                let content = fetch_ann_detail(&c, &ac).await.unwrap_or_default();
+                (ac, content)
+            }
+        })
+    ).await;
+    let detail_map: std::collections::HashMap<String, String> = detail_results.into_iter().collect();
 
     let mut results = Vec::new();
     for item in list {
@@ -309,12 +355,12 @@ pub fn fetch_announcements(date: Option<&str>) -> Result<Vec<Announcement>> {
             .and_then(|c| c.column_name.as_deref())
             .unwrap_or("");
 
-        // 高危公告尝试拉取正文
-        let content = if matches!(level, AnnLevel::Emergency | AnnLevel::Important) {
-            let art_code = item.art_code.as_deref().unwrap_or("");
-            if !art_code.is_empty() {
-                fetch_ann_detail(art_code).unwrap_or_default()
-            } else { String::new() }
+        // 高危公告从预取的 detail_map 取正文
+        let art_code = item.art_code.as_deref().unwrap_or("");
+        let content = if matches!(level, AnnLevel::Emergency | AnnLevel::Important)
+            && !art_code.is_empty()
+        {
+            detail_map.get(art_code).cloned().unwrap_or_default()
         } else { String::new() };
 
         results.push(Announcement {
@@ -333,11 +379,8 @@ pub fn fetch_announcements(date: Option<&str>) -> Result<Vec<Announcement>> {
     Ok(results)
 }
 
-/// 获取公告正文（东方财富公告详情API）
-fn fetch_ann_detail(art_code: &str) -> Result<String> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()?;
+/// 获取公告正文（东方财富公告详情API，review #15 改 async）
+async fn fetch_ann_detail(client: &reqwest::Client, art_code: &str) -> Result<String> {
     let url = format!(
         "https://np-anotice-stock.eastmoney.com/api/security/ann/detail?art_code={}",
         art_code
@@ -351,8 +394,13 @@ fn fetch_ann_detail(art_code: &str) -> Result<String> {
         .get(&url)
         .header("User-Agent", "Mozilla/5.0")
         .header("Referer", "https://data.eastmoney.com/")
-        .send()?
-        .json()?;
+        .send()
+        .await?
+        .error_for_status()
+        .map_err(|e| anyhow::anyhow!("ann detail HTTP error: {}", e))?
+        .json()
+        .await
+        .map_err(|e| anyhow::anyhow!("ann detail json: {}", e))?;
 
     Ok(resp.data.and_then(|d| d.content).unwrap_or_default())
 }

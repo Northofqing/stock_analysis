@@ -19,11 +19,8 @@
 //!   - K 线拉取失败 → graceful 返 None, 不 panic
 //!   - 关联股票找不到 → 标 "无关联股票", 不强行编
 //!   - 缺数据维度 → 在 reasons 列显式标, 不为 0
-use crate::opportunity::news_audit::audit_path;
-use crate::opportunity::news_ranker::{EventType, HeatStage, NewsRankBucket};
 use chrono::{Local, NaiveDate};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};

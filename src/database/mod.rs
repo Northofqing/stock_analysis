@@ -171,6 +171,32 @@ impl DatabaseManager {
         DB_INSTANCE.get()
     }
 
+    /// 在 DB 已初始化前提下执行闭包; 否则记录一次 warn 并返回 None.
+    /// review #15: 取代 13+ 处 `let Some(db) = DatabaseManager::try_get() else { return; };`
+    /// 重复模板. 调用方写 `DatabaseManager::with_db(|db| { ... })?` 比手写 Option 处理更清晰.
+    ///
+    /// 闭包返回 `Option<T>` 表示 DB 操作本身的成功/失败 (None = 操作失败/缺数据, 不一定是 DB 不可用).
+    /// 用 `Once` 状态确保 DB 未初始化只 warn 一次 (避免每 tick 重复刷屏).
+    pub fn with_db<F, T>(caller: &str, f: F) -> Option<T>
+    where
+        F: FnOnce(&DatabaseManager) -> Option<T>,
+    {
+        match DB_INSTANCE.get() {
+            Some(db) => f(db),
+            None => {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    log::warn!(
+                        "[{}] DatabaseManager 未初始化, 跳过 (后续同路径 DB 错误不再 warn)",
+                        caller
+                    );
+                }
+                None
+            }
+        }
+    }
+
     /// 获取数据库连接
     pub fn get_conn(&self) -> Result<DbConnection, Box<dyn std::error::Error>> {
         Ok(self.pool.get()?)
