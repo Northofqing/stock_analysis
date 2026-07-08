@@ -1141,6 +1141,14 @@ mod tests {
     use crate::models::StockPosition;
     use chrono::NaiveDate;
 
+    // v14.1 review fix: RAII test DB guard, panic 时 Drop 兜底清理
+    struct TestDbGuard(&'static str);
+    impl Drop for TestDbGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(self.0);
+        }
+    }
+
     // OnceCell 单例全局共享，测试共用同一路径避免竞态
     static TEST_DB: &str = "./test_data/test.db";
 
@@ -1274,6 +1282,8 @@ mod tests {
         std::fs::create_dir_all("./test_data").ok();
         let _ = std::fs::remove_file(test_db);
         let _ = DatabaseManager::init(Some(PathBuf::from(test_db)));
+        // review fix: RAII guard, panic 时 Drop 清理 test_db
+        let _guard = TestDbGuard(test_db);
 
         let db = DatabaseManager::get();
 
@@ -1334,6 +1344,8 @@ mod tests {
         std::fs::create_dir_all("./test_data").ok();
         let _ = std::fs::remove_file(test_db);
         let _ = DatabaseManager::init(Some(PathBuf::from(test_db)));
+        // review fix: RAII guard
+        let _guard = TestDbGuard(test_db);
 
         let db = DatabaseManager::get();
 
