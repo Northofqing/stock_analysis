@@ -30,6 +30,7 @@ impl DatabaseManager {
         }
 
         use diesel::upsert::excluded;
+        use diesel::dsl::sql;
 
         let mut conn = self.get_conn()?;
 
@@ -42,10 +43,15 @@ impl DatabaseManager {
                 stock_position::buy_price.eq(excluded(stock_position::buy_price)),
                 stock_position::quantity.eq(excluded(stock_position::quantity)),
                 stock_position::status.eq(excluded(stock_position::status)),
-                // v14.1 F7: 同步 st_type (broker 推送更新时同步写)
-                stock_position::st_type.eq(excluded(stock_position::st_type)),
-                // v14.1 BR-015: 同步 chain_name (板块集中度数据源)
-                stock_position::chain_name.eq(excluded(stock_position::chain_name)),
+                // v14.1 F7 fix: COALESCE 保 NULL 时不覆盖 backfilled / broker-pushed 值
+                // trading::open_position 总是传 None, 之前会清掉 backfill 写好的 *ST
+                stock_position::st_type.eq(sql::<diesel::sql_types::Nullable<diesel::sql_types::Text>>(
+                    "COALESCE(excluded.st_type, stock_position.st_type)"
+                )),
+                // v14.1 BR-015 fix: 同上, 保 chain_name
+                stock_position::chain_name.eq(sql::<diesel::sql_types::Nullable<diesel::sql_types::Text>>(
+                    "COALESCE(excluded.chain_name, stock_position.chain_name)"
+                )),
             ))
             .execute(&mut conn)?;
 
@@ -174,23 +180,25 @@ impl DatabaseManager {
 
     /// v14.1 F7: 回填 stock_position.st_type 列 (从 name 字段 LIKE 推断)
     ///   - name 含 "*ST" → "*ST"
-    ///   - name 含 "ST" / "SST" / "S*ST" → "ST"
+    ///   - name 以 "ST" / "SST" / "S*ST" 开头 → "ST"
     ///   - 其他保持 NULL
     /// 返回更新的行数. 只在 st_type IS NULL 时更新, 重复跑幂等.
     pub fn backfill_st_type(&self) -> Result<usize, Box<dyn std::error::Error>> {
         let mut conn = self.get_conn()?;
+        // v14.1 review fix: 前缀锚定 ('ST%' / '*ST%' / 'SST%' / 'S*ST%') 避免子串误判
+        // 之前 '%ST%' 会把 'BEST' / 'GST' / 'VST' 误判成 ST 类
         // 顺序: 先标 *ST, 再标 ST, 避免 ST 把 *ST 覆盖
         let star_updated = diesel::sql_query(
             "UPDATE stock_position
              SET st_type = '*ST'
-             WHERE st_type IS NULL AND name LIKE '%*ST%'",
+             WHERE st_type IS NULL AND (name LIKE '*ST%' OR name LIKE 'S*ST%')",
         )
         .execute(&mut conn)?;
         let st_updated = diesel::sql_query(
             "UPDATE stock_position
              SET st_type = 'ST'
              WHERE st_type IS NULL
-               AND (name LIKE '%SST%' OR name LIKE '%ST%')",
+               AND (name LIKE 'ST%' OR name LIKE 'SST%')",
         )
         .execute(&mut conn)?;
         Ok(star_updated + st_updated)
