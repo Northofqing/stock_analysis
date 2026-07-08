@@ -90,8 +90,9 @@ impl NewsMonitor {
         }
     }
 
-    /// 新闻监控运行窗口由 `config/monitor.toml` 控制，默认 08:00 — 22:00。
+    /// 新闻监控运行窗口由 `config/strategy.toml [monitor]` 控制，默认 08:00 — 22:00。
     /// 覆盖盘前隔夜消息 + 盘中快讯 + 盘后公告高峰(21:00)。
+    /// SIGHUP 热加载, 修改 news_window_start_hour / news_window_end_hour 后无需重启.
     pub fn should_run() -> bool {
         Self::should_run_at(Local::now().hour())
     }
