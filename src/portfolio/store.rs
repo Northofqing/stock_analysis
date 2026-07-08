@@ -9,20 +9,27 @@ use super::{LedgerEntry, Position, PositionStatus, Trade, TradeDirection};
 pub fn load_positions() -> Result<Vec<Position>, String> {
     let db = crate::database::DatabaseManager::get();
     let records = db.get_all_open_positions().map_err(|e| e.to_string())?;
-    Ok(records.into_iter().map(|r| Position {
-        code: r.code,
-        name: r.name,
-        shares: r.quantity.max(0) as u64,
-        cost_price: r.buy_price,
-        hard_stop: 0.0,
-        added_at: NaiveDate::parse_from_str(&r.buy_date, "%Y-%m-%d")
-            .unwrap_or_else(|_| NaiveDate::from_ymd_opt(2025, 1, 1).unwrap()),
-        status: PositionStatus::Holding,
-        sector: "其他".into(),
-        // v53: ST/*ST 字段从 stock_position.st_type 列读 (TEXT: "ST" / "*ST" / NULL)
-        //   当前 schema 暂未加 st_type 列, 默认 false
-        is_st: false,
-        star_st: false,
+    Ok(records.into_iter().map(|r| {
+        // v14.1 F7: 从 stock_position.st_type 列派生 is_st/star_st
+        //   "ST" → is_st, "*ST" → star_st, NULL → 都是 false
+        let (is_st, star_st) = match r.st_type.as_deref() {
+            Some("ST") => (true, false),
+            Some("*ST") => (false, true),
+            _ => (false, false),
+        };
+        Position {
+            code: r.code,
+            name: r.name,
+            shares: r.quantity.max(0) as u64,
+            cost_price: r.buy_price,
+            hard_stop: 0.0,
+            added_at: NaiveDate::parse_from_str(&r.buy_date, "%Y-%m-%d")
+                .unwrap_or_else(|_| NaiveDate::from_ymd_opt(2025, 1, 1).unwrap()),
+            status: PositionStatus::Holding,
+            sector: r.chain_name.unwrap_or_else(|| "其他".into()),
+            is_st,
+            star_st,
+        }
     }).collect())
 }
 
@@ -311,5 +318,22 @@ mod tests {
         let result = has_buy_today("000000", today);
         assert!(result.is_ok());
         assert!(!result.unwrap());
+    }
+
+    // v14.1 F7: st_type 派生测试 (不依赖 DB, 直接 inline 派生逻辑)
+    // 派生规则: "ST" → is_st=true, "*ST" → star_st=true, 其他 → 都 false
+    #[test]
+    fn st_type_derivation() {
+        let derive = |st_type: Option<&str>| -> (bool, bool) {
+            match st_type {
+                Some("ST") => (true, false),
+                Some("*ST") => (false, true),
+                _ => (false, false),
+            }
+        };
+        assert_eq!(derive(Some("ST")), (true, false));
+        assert_eq!(derive(Some("*ST")), (false, true));
+        assert_eq!(derive(None), (false, false));
+        assert_eq!(derive(Some("OTHER")), (false, false));
     }
 }

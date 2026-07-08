@@ -42,6 +42,8 @@ impl DatabaseManager {
                 stock_position::buy_price.eq(excluded(stock_position::buy_price)),
                 stock_position::quantity.eq(excluded(stock_position::quantity)),
                 stock_position::status.eq(excluded(stock_position::status)),
+                // v14.1 F7: 同步 st_type (broker 推送更新时同步写)
+                stock_position::st_type.eq(excluded(stock_position::st_type)),
             ))
             .execute(&mut conn)?;
 
@@ -166,5 +168,29 @@ impl DatabaseManager {
             .select(stock_position::code)
             .first(conn)?;
         Ok(code)
+    }
+
+    /// v14.1 F7: 回填 stock_position.st_type 列 (从 name 字段 LIKE 推断)
+    ///   - name 含 "*ST" → "*ST"
+    ///   - name 含 "ST" / "SST" / "S*ST" → "ST"
+    ///   - 其他保持 NULL
+    /// 返回更新的行数. 只在 st_type IS NULL 时更新, 重复跑幂等.
+    pub fn backfill_st_type(&self) -> Result<usize, Box<dyn std::error::Error>> {
+        let mut conn = self.get_conn()?;
+        // 顺序: 先标 *ST, 再标 ST, 避免 ST 把 *ST 覆盖
+        let star_updated = diesel::sql_query(
+            "UPDATE stock_position
+             SET st_type = '*ST'
+             WHERE st_type IS NULL AND name LIKE '%*ST%'",
+        )
+        .execute(&mut conn)?;
+        let st_updated = diesel::sql_query(
+            "UPDATE stock_position
+             SET st_type = 'ST'
+             WHERE st_type IS NULL
+               AND (name LIKE '%SST%' OR name LIKE '%ST%')",
+        )
+        .execute(&mut conn)?;
+        Ok(star_updated + st_updated)
     }
 }
