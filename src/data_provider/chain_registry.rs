@@ -7,16 +7,18 @@
 //! 维护原则:
 //!   - 只收录各板块龙头 (1-3 只), 不收全板块 (5000+ 太长)
 //!   - chain 名跟 config/chain.toml 板块名一致 (e.g. "AI硬件-PCB")
-//!   - 一个 code 可映射到多个 chain (Vec<String>), 取第一个作为主 chain
+//!   - 当前 PRIMARY 是 1:1 映射 (code → 主 chain). 注释里曾承诺的
+//!     "lookup_all 拿全" 暂时不实现 (YAGNI — 没 caller), 等真有多链
+//!     需求时再加, 届时返回 Vec<&'static str>.
 //!
-//! 查询: `lookup(code)` → Option<String>
+//! 查询: `lookup(code)` → Option<&'static str>
 
 /// code → 主 chain 静态映射. 缺失返回 None.
 pub fn lookup(code: &str) -> Option<&'static str> {
     PRIMARY.get(code).copied()
 }
 
-/// 静态主映射 (code → 第一主 chain). 多个 chain 用 `lookup_all` 拿全.
+/// 静态主映射 (code → 第一主 chain). 当前是 1:1, 预留多链时改 return 类型.
 fn primary_map() -> &'static [(&'static str, &'static str)] {
     &[
         // AI 硬件 — 算力
