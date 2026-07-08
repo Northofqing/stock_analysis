@@ -905,6 +905,8 @@ async fn main() {
 
     // v26: 启动后台 dry-run 报告生成器 (在 if 之前, 不依赖 mode, 7-14 天数据收集接在现有 run 过程中)
     dryrun_report::spawn_dryrun_reporter(1800);  // 30 min
+    // v14.1 task #162: 启动 outcome backfill 调度器 (每个交易日 15:30 自动跑)
+    dryrun_report::spawn_outcome_backfill_scheduler();
 
     // v70: e2e 模式 (--e2e) — 跑所有 v12 §14 + v13.1 模板, 忽略时间窗口, mock fallback
     if e2e_mode {

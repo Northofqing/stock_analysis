@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
+
 use serde::Serialize;
 
 /// 报告数据 (整体序列化)
@@ -67,6 +68,45 @@ pub fn spawn_dryrun_reporter(interval_secs: u64) {
         }
     });
     log::info!("[v26 dryrun] 后台报告生成器已启动 (interval: {}s)", interval_secs);
+}
+
+/// v14.1 task #162: 启动后台 backfill 调度器
+///   每个交易日 15:30 跑一次 backfill_recommendations_outcome(yesterday)
+///   - D 日推送 → D+1 收盘后 (15:30) 自动算 outcome
+///   - 非交易日不跑 (calendar::is_trading_day)
+///   - interval: 1 min (粗粒度, 触发后当天不再跑)
+pub fn spawn_outcome_backfill_scheduler() {
+    tokio::spawn(async move {
+        // 等 1 min 让 DB 起来
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        let mut last_run_date: Option<String> = None;
+        let mut ticker = tokio::time::interval(Duration::from_secs(60));
+        ticker.tick().await; // 跳过第一个
+        loop {
+            ticker.tick().await;
+            let now = chrono::Local::now();
+            let today = now.date_naive();
+            // 触发条件: 15:30 后 + 交易日 + 今日没跑过
+            if now.time() < chrono::NaiveTime::from_hms_opt(15, 30, 0).unwrap() {
+                continue;
+            }
+            if !crate::calendar::is_trading_day(today) {
+                continue;
+            }
+            let today_str = today.format("%Y-%m-%d").to_string();
+            if last_run_date.as_deref() == Some(&today_str) {
+                continue;
+            }
+            // 回填昨天 (D 日推送 → 今天 D+1 收盘)
+            let yesterday = crate::calendar::prev_trading_day(today);
+            let date_str = yesterday.format("%Y-%m-%d").to_string();
+            log::info!("[v14.1 #162] 自动 backfill outcome | 日期 = {}", date_str);
+            let updated = stock_analysis::opportunity::news_outcome::backfill_recommendations_outcome(&date_str);
+            log::info!("[v14.1 #162] 自动 backfill 完成 | {} | 更新 {} 条", date_str, updated);
+            last_run_date = Some(today_str);
+        }
+    });
+    log::info!("[v14.1 #162] 后台 outcome backfill 调度器已启动 (15:30 每日)");
 }
 
 /// 生成一次报告 (立即调用, 也被后台 task 调用)
