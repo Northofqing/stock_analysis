@@ -1793,12 +1793,20 @@ pub struct NewsCatalystSnapshot {
 }
 
 /// v15.3: 从 NewsCatalystSnapshot 构造 NewsCatalystParams
+///
+/// v13.10.3: 修复"原因:002916" — 之前 reason = name 造成重复; 现 reason = theme (板块名),
+/// 至少能说明"这票为啥进新闻催化".
 pub fn build_news_catalyst_from_snapshot<'a>(s: &'a NewsCatalystSnapshot) -> NewsCatalystParams<'a> {
+    let reason_text = if s.theme.is_empty() {
+        "板块联动"
+    } else {
+        s.theme.as_str()
+    };
     // 借用 String → &str 转换 (注意生命周期与 s 一致)
     let stocks_ref: Vec<(&'a str, &'a str, Option<f32>, &'a str)> = s
         .stocks
         .iter()
-        .map(|(n, c, chg)| (n.as_str(), c.as_str(), *chg, n.as_str()))  // reason=name (简化)
+        .map(|(n, c, chg)| (n.as_str(), c.as_str(), *chg, reason_text))
         .collect();
     NewsCatalystParams {
         hhmm: &s.hhmm,
@@ -1876,10 +1884,17 @@ pub fn load_news_catalyst_snapshot_real(hhmm: &str) -> NewsCatalystSnapshot {
     let code_refs: Vec<&str> = codes.iter().map(|s| s.as_str()).collect();
     let chg_map = fetch_realtime_quotes_batch(&code_refs);
 
+    // v13.10.3: 查持仓/自选表, 把 code 翻成真实股票名 (之前直接用 code 当 name 显示 "002916(002916)")
+    let name_map = stock_analysis::portfolio::get_all_names().unwrap_or_default();
     let mut stocks: Vec<(String, String, Option<f32>)> = Vec::new();
     for code in codes {
         let chg = chg_map.get(&code).copied();
-        stocks.push((code.clone(), code, chg));
+        let name = name_map
+            .iter()
+            .find(|(c, _)| c == &code)
+            .map(|(_, n)| n.clone())
+            .unwrap_or_else(|| code.clone()); // 找不到时退回 code (避免空字符串)
+        stocks.push((name, code, chg));
     }
     NewsCatalystSnapshot {
         hhmm: hhmm.to_string(),
@@ -2276,6 +2291,14 @@ pub fn load_news_to_idea_snapshot_real(hhmm: &str) -> NewsToIdeaSnapshot {
         return NewsToIdeaSnapshot::default();
     }
     let top = &candidates[0];
+    // v13.10.3: merge_candidates 把 chain 概念填到 name 字段, 推送会显示 "PCB(002916)".
+    // 实际推送前用持仓/自选表反查真名, 找不到就回退 chain 名 (至少比 code 有意义)
+    let name_map = stock_analysis::portfolio::get_all_names().unwrap_or_default();
+    let real_name = name_map
+        .iter()
+        .find(|(c, _)| c == &top.code)
+        .map(|(_, n)| n.clone())
+        .unwrap_or_else(|| top.name.clone());
     let reasons: Vec<String> = top.evidence.iter().take(3).cloned().collect();
     let stage = if top.source_count() >= 3 {
         NewsStage::Starting
@@ -2295,13 +2318,13 @@ pub fn load_news_to_idea_snapshot_real(hhmm: &str) -> NewsToIdeaSnapshot {
         hhmm: hhmm.to_string(),
         headline: format!(
             "{} ({}) 多源验证 ({} 源)",
-            top.name,
+            real_name,
             top.code,
             top.source_count()
         ),
         theme: clusters[0].concept.clone(),
         stage,
-        name: top.name.clone(),
+        name: real_name,
         code: top.code.clone(),
         reasons,
         action,
