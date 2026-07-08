@@ -1193,4 +1193,71 @@ mod tests {
         // 清理数据（不删DB文件，并行测试可能还在用）
         db.delete_stock_data("600519").ok();
     }
+
+    // v14.1 task #167: stock_position.st_type round-trip DB 集成测试
+    // 路径: save_position(NewStockPosition{ st_type: Some("*ST") }) →
+    //       get_all_open_positions → StockPosition.st_type 真读出
+    // 用独立 DB 文件避免与上面 test_save_and_query_stock_data 竞态.
+    #[test]
+    fn test_st_type_db_round_trip() {
+        use crate::models::{NewStockPosition, StockPosition};
+        use crate::schema::stock_position;
+        use diesel::prelude::*;
+
+        let test_db = "./test_data/test_st_type_round_trip.db";
+        std::fs::create_dir_all("./test_data").ok();
+        // 删旧文件保证干净
+        let _ = std::fs::remove_file(test_db);
+        let _ = DatabaseManager::init(Some(PathBuf::from(test_db)));
+
+        let db = DatabaseManager::get();
+
+        // 1. insert 一只 *ST 持仓
+        let new_pos = NewStockPosition {
+            code: "600090".to_string(),
+            name: "*ST测试".to_string(),
+            buy_date: "2026-07-01".to_string(),
+            buy_price: 5.0,
+            quantity: 1000,
+            status: "open".to_string(),
+            st_type: Some("*ST".to_string()),
+            chain_name: None,
+        };
+        db.save_position(&new_pos).expect("save_position 失败");
+
+        // 2. 读回 — 验证 st_type 真写入
+        let mut conn = db.get_conn().expect("get_conn 失败");
+        let row: StockPosition = stock_position::table
+            .filter(stock_position::code.eq("600090"))
+            .first(&mut conn)
+            .expect("query 失败");
+        assert_eq!(row.st_type.as_deref(), Some("*ST"), "st_type 写入/读出不一致");
+        assert_eq!(row.code, "600090");
+        assert_eq!(row.name, "*ST测试");
+        assert_eq!(row.quantity, 1000);
+
+        // 3. 测试 upsert: 同 (code, buy_date) 再 save 不报错, st_type 应被 excluded 同步
+        let update_pos = NewStockPosition {
+            code: "600090".to_string(),
+            name: "*ST测试改名".to_string(),
+            buy_date: "2026-07-01".to_string(),
+            buy_price: 5.5,
+            quantity: 1500,
+            status: "open".to_string(),
+            st_type: Some("ST".to_string()), // 改 ST
+            chain_name: Some("化工".to_string()),
+        };
+        db.save_position(&update_pos).expect("upsert 失败");
+
+        let row2: StockPosition = stock_position::table
+            .filter(stock_position::code.eq("600090"))
+            .first(&mut conn)
+            .expect("re-query 失败");
+        assert_eq!(row2.st_type.as_deref(), Some("ST"), "upsert st_type 未同步");
+        assert_eq!(row2.chain_name.as_deref(), Some("化工"), "upsert chain_name 未同步");
+        assert_eq!(row2.name, "*ST测试改名", "upsert name 未同步");
+
+        // 4. 清理
+        let _ = std::fs::remove_file(test_db);
+    }
 }
