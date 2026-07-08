@@ -79,6 +79,11 @@ pub fn build_pre_market_checklist(
 }
 
 /// 收盘总结
+///
+/// v13.10.1 P0-#5: 区分两种语义, 不再混用:
+/// - `t1_frozen`: 今日买入, 明日解禁可卖 (持仓快照, 标 "T+1 冻结")
+/// - `tomorrow_unlocks`: 今日解禁, 明日可卖 (现持仓, 标 "明日可卖")
+/// 同时止损为 0 时不写 "止损 0.00" 误导.
 pub fn build_close_summary(
     market_pct: f64,
     limit_up_count: usize,
@@ -86,7 +91,8 @@ pub fn build_close_summary(
     break_rate: f64,
     signals_today: usize,
     alerts_sent: usize,
-    t1_holdings: &[Position],
+    t1_frozen: &[Position],
+    tomorrow_unlocks: &[Position],
 ) -> String {
     let today = Local::now().format("%Y-%m-%d").to_string();
     let mut lines = vec![
@@ -102,12 +108,33 @@ pub fn build_close_summary(
         String::new(),
     ];
 
-    if !t1_holdings.is_empty() {
-        lines.push("## ⚠️ T+1 冻结股明日预警".into());
-        for p in t1_holdings {
+    if !t1_frozen.is_empty() {
+        lines.push("## 🔒 T+1 冻结股（明日解禁可卖）".into());
+        for p in t1_frozen {
+            let stop = if p.hard_stop > 0.0 {
+                format!("止损 {:.2}", p.hard_stop)
+            } else {
+                "止损未设".to_string()
+            };
             lines.push(format!(
-                "- **{}({})** 成本 {:.2}，止损 {:.2}。明日解禁，竞价关注",
-                p.name, p.code, p.cost_price, p.hard_stop
+                "- **{}({})** 成本 {:.2}, {}. 明日解禁, 竞价关注",
+                p.name, p.code, p.cost_price, stop
+            ));
+        }
+        lines.push(String::new());
+    }
+
+    if !tomorrow_unlocks.is_empty() {
+        lines.push("## ✅ 明日可卖（今日已解禁）".into());
+        for p in tomorrow_unlocks {
+            let stop = if p.hard_stop > 0.0 {
+                format!("止损 {:.2}", p.hard_stop)
+            } else {
+                "止损未设".to_string()
+            };
+            lines.push(format!(
+                "- **{}({})** 成本 {:.2}, {}. 明日可自由买卖",
+                p.name, p.code, p.cost_price, stop
             ));
         }
         lines.push(String::new());
@@ -177,17 +204,36 @@ mod tests {
 
     #[test]
     fn test_close_summary() {
-        let text = build_close_summary(0.82, 94, 3, 28.0, 12, 3, &[]);
+        let text = build_close_summary(0.82, 94, 3, 28.0, 12, 3, &[], &[]);
         assert!(text.contains("今日复盘"));
         assert!(text.contains("+0.82%"));
         assert!(text.contains("94"));
     }
 
     #[test]
-    fn test_close_summary_with_t1() {
+    fn test_close_summary_with_t1_frozen() {
         init_db();
         let t1 = vec![pos("000001", "冻结股", 10.0, 9.0)];
-        let text = build_close_summary(0.0, 0, 0, 0.0, 0, 0, &t1);
-        assert!(text.contains("T+1 冻结股明日预警"));
+        let text = build_close_summary(0.0, 0, 0, 0.0, 0, 0, &t1, &[]);
+        assert!(text.contains("T+1 冻结股"));
+        assert!(text.contains("明日解禁"));
+    }
+
+    #[test]
+    fn test_close_summary_with_tomorrow_unlocks() {
+        init_db();
+        let unlocks = vec![pos("000002", "可卖", 10.0, 9.0)];
+        let text = build_close_summary(0.0, 0, 0, 0.0, 0, 0, &[], &unlocks);
+        assert!(text.contains("明日可卖"));
+        assert!(text.contains("可自由买卖"));
+    }
+
+    #[test]
+    fn test_close_summary_hides_zero_stop() {
+        // 止损为 0 时不应显示 "止损 0.00"
+        let t1 = vec![pos("000003", "无止损", 10.0, 0.0)];
+        let text = build_close_summary(0.0, 0, 0, 0.0, 0, 0, &t1, &[]);
+        assert!(text.contains("止损未设"));
+        assert!(!text.contains("止损 0.00"));
     }
 }

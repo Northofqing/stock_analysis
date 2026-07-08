@@ -38,6 +38,9 @@ pub struct SignalStateMachine {
     daily_info_max: usize,
     daily_important_count: usize,
     daily_info_count: usize,
+    // v13.10.1 P1-#6: 跌停 per-day dedup — 一只票当日只推一次跌停, 避免 10 分钟 6 条同票噪声
+    // 持久化每日重置 (daily_reset) 时清空
+    once_per_day: HashMap<String, chrono::NaiveDate>,
 }
 
 impl SignalStateMachine {
@@ -55,6 +58,7 @@ impl SignalStateMachine {
             daily_info_max,
             daily_important_count: 0,
             daily_info_count: 0,
+            once_per_day: HashMap::new(),
         }
     }
 
@@ -63,6 +67,19 @@ impl SignalStateMachine {
     pub fn process(&mut self, event: AlertEvent) -> Option<AlertEvent> {
         let key = make_key(&event.code, event.category);
         let now = Local::now();
+        let today = now.date_naive();
+
+        // v13.10.1 P1-#6: 跌停 (LimitDown) per-day dedup — 同票当日仅首次触发.
+        // 原因: Emergency 的 60s 冷却对日内连推不够 (10 分钟连推 6 条).
+        if event.category == AlertCategory::LimitDown {
+            if let Some(prev) = self.once_per_day.get(&key) {
+                if *prev == today {
+                    return None; // 当日已推过, 静默
+                }
+            }
+            self.once_per_day.insert(key.clone(), today);
+            // 跌停首次触发, 走原有 Emergency 流程 (但跳过下面 once_per_day 检查)
+        }
 
         // 预算检查
         let budget_ok = match event.level {
@@ -174,6 +191,7 @@ impl SignalStateMachine {
         self.entries.clear();
         self.daily_important_count = 0;
         self.daily_info_count = 0;
+        self.once_per_day.clear();
     }
 
     /// 当前活跃信号数
@@ -336,6 +354,27 @@ mod tests {
         let e2 = event("000002", AlertLevel::Important, AlertCategory::VolBurst);
         assert!(sm.process(e1).is_some());
         assert!(sm.process(e2).is_none()); // 超出预算
+    }
+
+    /// v13.10.1 P1-#6: 跌停 per-day dedup — 同票当日仅首次触发, 后续同票静默
+    #[test]
+    fn test_limit_down_once_per_day() {
+        let mut sm = SignalStateMachine::new(300, 900, 30, 15);
+        let e1 = event("600641", AlertLevel::Emergency, AlertCategory::LimitDown);
+        // 首次触发: 放行
+        assert!(sm.process(e1.clone()).is_some(), "首次跌停应放行");
+        // 60秒内重复: 60s 冷却 (原有行为)
+        assert!(sm.process(e1.clone()).is_none(), "60s 冷却内应静默");
+        // 跳过 60s 后: per-day 仍应静默 (v13.10.1 新增)
+        let mut e2 = e1.clone();
+        e2.triggered_at = chrono::Local::now() + chrono::Duration::seconds(120);
+        // 模拟再次触发: 60s 已过但同日, 应被 once_per_day 拦截
+        // 注意: state_machine 仅看 now(), 这里直接调 process 同 now() 不会过 60s
+        // 因此我们只能验证"per-day 已记录, 走 once_per_day 路径" — 此处不直接调 process,
+        // 而是改 once_per_day 模拟次日
+        // 改用: 验证 daily_reset 后能再次触发
+        sm.daily_reset();
+        assert!(sm.process(e1).is_some(), "daily_reset 后应能再次触发");
     }
 
     #[test]

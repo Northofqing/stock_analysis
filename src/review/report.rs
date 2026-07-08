@@ -100,12 +100,16 @@ pub fn generate_daily_report_with_ledger(
         let today = chrono::Local::now().date_naive();
         for p in holdings {
             let holding_days = (today - p.added_at).num_days().max(0);
-            let price = prices.get(&p.code).copied().unwrap_or(p.cost_price);
+            // v13.10.1 P0-#4: 拉不到实时价时显式标注 "数据不足", 避免误导 (之前用 cost_price 顶替导致浮盈 0.0% 看起来像"持仓未动")
+            let (price, price_note) = match prices.get(&p.code).copied() {
+                Some(v) if (v - p.cost_price).abs() > 0.001 || v == 0.0 => (v, String::new()),
+                _ => (p.cost_price, " 数据不足".to_string()),
+            };
             let pnl_pct = if p.cost_price > 0.0 { (price - p.cost_price) / p.cost_price * 100.0 } else { 0.0 };
             let emoji = if pnl_pct > 0.0 { "🔺" } else if pnl_pct < -5.0 { "🔻" } else { "→" };
             lines.push(format!(
-                "  {} {}({}) 持{}天 {:+.1}%  ¥{:.2}→¥{:.2}  {}股",
-                emoji, p.name, p.code, holding_days, pnl_pct, p.cost_price, price, p.shares,
+                "  {} {}({}) 持{}天 {:+.1}%  ¥{:.2}→¥{:.2}  {}股{}",
+                emoji, p.name, p.code, holding_days, pnl_pct, p.cost_price, price, p.shares, price_note,
             ));
         }
     }

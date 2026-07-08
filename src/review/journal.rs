@@ -26,12 +26,36 @@ pub struct TradeReview {
 
 /// 从交易历史生成复盘记录。
 /// 每笔 sell 对应一个 TradeReview，通过买入卖出配对计算。
+///
+/// v13.10.1 P0-#4: 先按 (code, direction, date, price, shares) 去重 DB 重复行,
+/// 避免同一笔日内交易被重复配对出 6 条相同的"已平仓"记录 (用户反馈噪声).
 pub fn review_closed_trades(trades: &[Trade]) -> Vec<TradeReview> {
+    use std::collections::HashSet;
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut deduped: Vec<&Trade> = Vec::with_capacity(trades.len());
+    for t in trades {
+        let dir = match t.direction {
+            TradeDirection::Buy => "B",
+            TradeDirection::Sell => "S",
+        };
+        let key = format!(
+            "{}|{}|{}|{:.4}|{}",
+            t.code,
+            dir,
+            t.traded_at.date(),
+            t.price,
+            t.shares
+        );
+        if seen.insert(key) {
+            deduped.push(t);
+        }
+    }
+
     let mut reviews = Vec::new();
     let mut pending_buys: std::collections::VecDeque<&Trade> = std::collections::VecDeque::new();
 
     // 按时间排序
-    let mut sorted: Vec<&Trade> = trades.iter().collect();
+    let mut sorted: Vec<&Trade> = deduped.into_iter().collect();
     sorted.sort_by_key(|t| t.traded_at);
 
     for trade in &sorted {

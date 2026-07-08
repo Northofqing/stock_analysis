@@ -234,6 +234,47 @@ fn fetch_latest_close_map(codes: &[String]) -> std::collections::HashMap<String,
     out
 }
 
+/// v13.10.1 P0-#2: 拉 T+1 收盘价, 即 base_date 后第 1 个交易日的 close.
+/// 修复前: fetch_latest_close_map 取的是当下 K 线最后一日, 跨 13 天后 close 实际是 T+13, 不是"次日".
+/// 返回 None 时调用方写"数据不足"避免误用累积收益当次日表现.
+fn fetch_t1_close_map(
+    codes: &[String],
+    base_date: chrono::NaiveDate,
+) -> std::collections::HashMap<String, f64> {
+    let mut out = std::collections::HashMap::new();
+    let fetcher = match stock_analysis::data_provider::DataFetcherManager::new() {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("[虚拟观察仓] 初始化数据抓取器失败: {:#}", e);
+            return out;
+        }
+    };
+    for code in codes {
+        // 拉 30 天 K 线足够覆盖 base_date 之后 1-2 周的交易日
+        match fetcher.get_daily_data(code, 30) {
+            Ok((kline, _)) => {
+                // 找 base_date 之后第 1 个交易日 (K 线按日期升序)
+                if let Some(t1) = kline.iter().find(|k| k.date > base_date) {
+                    if t1.close > 0.0 {
+                        out.insert(code.clone(), t1.close);
+                    }
+                }
+                // 没有 T+1 → 不 insert, 调用方通过 .get() == None 显示"数据不足"
+            }
+            Err(e) => {
+                log::warn!("[虚拟观察仓] fetch_daily_data({}) 失败: {:#}", code, e);
+            }
+        }
+    }
+    out
+}
+
+/// 从 snapshot.created_at (格式 "YYYY-MM-DD HH:MM:SS") 解析出 NaiveDate
+fn parse_snapshot_base_date(created_at: &str) -> Option<chrono::NaiveDate> {
+    let s = created_at.split_whitespace().next()?;
+    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
+}
+
 fn build_virtual_next_day_review_text(
     snapshot: &VirtualObservationSnapshot,
     close_map: &std::collections::HashMap<String, f64>,
@@ -296,7 +337,19 @@ async fn push_virtual_next_day_review_if_needed() {
         return;
     };
     let codes: Vec<String> = snapshot.records.iter().map(|r| r.code.clone()).collect();
-    let close_map = tokio::task::spawn_blocking(move || fetch_latest_close_map(&codes))
+    // v13.10.1 P0-#2: 用 T+1 收盘价 (snapshot.created_at 后第 1 个交易日),
+    // 不用当前最新 close, 否则跨多日后收益是累积而非"次日".
+    let base_date = match parse_snapshot_base_date(&snapshot.created_at) {
+        Some(d) => d,
+        None => {
+            log::warn!(
+                "[虚拟观察仓] snapshot.created_at 解析失败: {}",
+                snapshot.created_at
+            );
+            return;
+        }
+    };
+    let close_map = tokio::task::spawn_blocking(move || fetch_t1_close_map(&codes, base_date))
         .await
         .unwrap_or_default();
     if let Some(text) = build_virtual_next_day_review_text(&snapshot, &close_map) {
@@ -3278,14 +3331,24 @@ async fn run_review_deep_analysis(
 
     // v17.0 (P0-5++ Commit 11): 候选筛选台 wrapper 接 3 路真 raw (A10/C4 留 None --test 路径)
     // P5 §六 红线: 5 路 raw 合并到 1 条候选台卡片, 不刷屏
+    //
+    // v13.10.1 P0-#3: 主流程(--review 不传 raw)时, 主动拉取 run_post_close_candidates
+    // 作为 OptimalClose raw 注入候选台, 合并原来 9:20-9:25 独立推送的优选候选.
+    let optimal_close_text: String = if holding_breakout_text.is_empty()
+        && watch_breakout_text.is_empty()
+    {
+        stock_analysis::opportunity::run_post_close_candidates(5).await
+    } else {
+        String::new()
+    };
     let candidate_summary = run_candidate_panel_from_review(
         &by_code,
         &holdings,
-        None,                        // A10 选股 (--test 路径专属, --review 看不到 recs)
-        None,                        // B3 优选 (--test 路径专属, run_test_scan L851)
-        Some(holding_breakout_text), // B6 放量·自选 (L704 解构, --review 路径)
-        Some(watch_breakout_text),   // B7 放量·实盘优选 (L704 解构, --review 路径)
-        None,                        // C4 产业链 (--test 路径专属, run_test_scan L561)
+        None,                            // A10 选股 (--test 路径专属, --review 看不到 recs)
+        Some(&optimal_close_text),       // B3 优选 (v13.10.1: 主流程自动拉取)
+        Some(holding_breakout_text),     // B6 放量·自选 (L704 解构, --review 路径)
+        Some(watch_breakout_text),       // B7 放量·实盘优选 (L704 解构, --review 路径)
+        None,                            // C4 产业链 (--test 路径专属, run_test_scan L561)
     );
     if !candidate_summary.is_empty() {
         log::info!("[复盘] 候选筛选台推送 (v16.8):\n{}", candidate_summary);
@@ -3890,13 +3953,15 @@ async fn monitor_loop() {
                         }
                     }
 
-                    // ▶ 新增：9:20-9:25 集合竞价阶段重推优选候选（仅一次）
+                    // ▶ v13.10.1 P0-#3: 9:20-9:25 不再独立推送优选候选,
+                    // 候选台(CandidateBoard)统一承载, 这里仅拉取用于虚拟观察.
                     if !post_close_candidates_notified {
                         post_close_candidates_notified = true;
-                        log::info!("[竞价] 9:20-9:25 更新推送优选候选（2.1版本）...");
+                        log::info!("[竞价] 9:20-9:25 拉优选候选用于虚拟观察（v13.10.1 不再独立推送）...");
                         let post_close =
                             stock_analysis::opportunity::run_post_close_candidates(5).await;
-                        notify::push_governor(&post_close, notify::PushKind::AuctionRepush).await;
+                        // 删 v13.10.1: notify::push_governor(&post_close, notify::PushKind::AuctionRepush).await;
+                        // 候选并入候选台 (run_candidate_panel_from_review) 统一推送
 
                         // 提取候选的code和name以便后续虚拟记录（简单方式：从推送文案中正则提取）
                         // 格式: "N. 名称(代码)" → 收集前5个作为虚拟观察对象
@@ -4856,6 +4921,22 @@ async fn monitor_loop() {
         } else {
             0.0
         };
+        // v13.10.1 P0-#5: 区分"今日冻结(明日解禁)"与"今日解禁(明日可卖)"
+        // 之前 close_summary 把 t1_unlocks(今日解禁) 误标为"T+1 冻结", 7 只全部命中,
+        // 全显示"止损 0.00"无意义.
+        let positions_for_close = stock_analysis::portfolio::get_positions().unwrap_or_default();
+        let mut t1_frozen: Vec<stock_analysis::portfolio::Position> = Vec::new();
+        let mut tomorrow_unlocks: Vec<stock_analysis::portfolio::Position> = Vec::new();
+        for p in &positions_for_close {
+            match stock_analysis::portfolio::is_t1_locked(&p.code) {
+                Ok(true) => t1_frozen.push(p.clone()),
+                Ok(false) => tomorrow_unlocks.push(p.clone()),
+                Err(e) => {
+                    log::error!("[盘后] is_t1_locked({}) 失败: {} — 保守按已锁定归类", p.code, e);
+                    t1_frozen.push(p.clone());
+                }
+            }
+        }
         let summary = checklist::build_close_summary(
             index_change,
             up_count,
@@ -4863,7 +4944,8 @@ async fn monitor_loop() {
             board_break_rate,
             signal_count as usize,
             alert_count as usize,
-            &t1_unlocks,
+            &t1_frozen,
+            &tomorrow_unlocks,
         );
         push_wechat(&summary).await;
 
@@ -5009,11 +5091,12 @@ fn run_stock_screener() -> Option<Vec<String>> {
         signals.push((sig, c.board.clone()));
     }
 
-    // 5. 按置信度降序，取置信度达阈值（≥20）的 Top 3
+    // 5. 按置信度降序，取置信度达阈值（≥50）的 Top 3
+    // v13.10.1 P1-#7: 阈值 20→50. 修复前 30-40 置信度全推, 用户反馈"只推送无意义".
     signals.sort_by(|a, b| b.0.confidence.cmp(&a.0.confidence));
     let recs: Vec<String> = signals
         .iter()
-        .filter(|(s, _)| s.confidence >= 20)
+        .filter(|(s, _)| s.confidence >= 50)
         .take(3)
         .map(|(s, board)| {
             format!(
@@ -5292,6 +5375,12 @@ fn run_candidate_panel_from_review(
 
     // 4. 排序 (P5 §3.3 硬规则: 强证据优先 > 多源 > 题材)
     entries = sort_candidates(entries);
+
+    // v13.10.1 P0-#1: 通过硬门槛为 0 时不推"空台"卡片 (用户反馈噪声).
+    // format_candidate_board 会输出 "通过硬门槛 0 只" 的卡片, 这里直接短路.
+    if entries.is_empty() {
+        return String::new();
+    }
 
     // 5. 渲染
     format_candidate_board(&entries)
