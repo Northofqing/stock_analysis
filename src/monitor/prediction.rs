@@ -19,9 +19,9 @@ pub fn save_prediction(
     let today = Local::now().format("%Y-%m-%d").to_string();
     let tomorrow = (Local::now() + chrono::Duration::days(1)).format("%Y-%m-%d").to_string();
 
-    let db = match std::panic::catch_unwind(DatabaseManager::get) {
-        Ok(db) => db,
-        Err(_) => { log::warn!("[Prediction] DB 不可用"); return; }
+    let Some(db) = DatabaseManager::try_get() else {
+        log::warn!("[Prediction] DB 未初始化");
+        return;
     };
 
     if let Err(e) = db.save_prediction_legacy(&today, &tomorrow, theme, stock, direction, score, detail) {
@@ -51,9 +51,9 @@ pub fn save_prediction(
 pub async fn verify_predictions() {
     let today_date = Local::now().date_naive();
     let today = today_date.format("%Y-%m-%d").to_string();
-    let db = match std::panic::catch_unwind(DatabaseManager::get) {
-        Ok(db) => db,
-        Err(_) => { log::warn!("[Prediction] DB 不可用"); return; }
+    let Some(db) = DatabaseManager::try_get() else {
+        log::warn!("[Prediction] DB 未初始化");
+        return;
     };
 
     let mut total_pending = 0usize;
@@ -221,10 +221,7 @@ fn read_stock_daily_close_with_offset(
 
 /// 获取近期命中率
 pub fn recent_hit_rate(days: i32) -> f64 {
-    let db = match std::panic::catch_unwind(DatabaseManager::get) {
-        Ok(db) => db,
-        Err(_) => return 0.0,
-    };
+    let Some(db) = DatabaseManager::try_get() else { return 0.0; };
     db.get_prediction_hit_rate(days).unwrap_or(0.0)
 }
 

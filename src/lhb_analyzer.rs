@@ -88,12 +88,10 @@ pub struct LhbDataFetcher {
 
 impl LhbDataFetcher {
     /// 创建新实例
+    /// review #14: 改用 SHARED_HTTP_CLIENT 共享 client, 避免每次 new Client
+    /// 触发 TLS handshake. screen_lhb_stocks 循环 N 次调 new() 浪费数百 ms.
     pub fn new() -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
-            .build()?;
-        
+        let client = crate::http_client::SHARED_HTTP_CLIENT.clone();
         Ok(Self { client })
     }
 
@@ -115,7 +113,7 @@ impl LhbDataFetcher {
         log::info!("[龙虎榜] 正在查询 {} 的数据（标准化后：{}）", date, date_normalized);
         
         // 1. 先尝试从数据库读取缓存（支持模糊匹配日期）
-        if let Ok(db) = std::panic::catch_unwind(|| DatabaseManager::get()) {
+        if let Some(db) = DatabaseManager::try_get() {
             if let Ok(cached_records) = db.get_lhb_by_date(&date_normalized) {
                 if !cached_records.is_empty() {
                     log::info!("[龙虎榜] 从数据库缓存读取 {} 的数据 ({} 条记录)", date, cached_records.len());
@@ -132,7 +130,7 @@ impl LhbDataFetcher {
         let records = self.fetch_lhb_from_api(date).await?;
 
         // 3. 保存到数据库缓存
-        if let Ok(db) = std::panic::catch_unwind(|| DatabaseManager::get()) {
+        if let Some(db) = DatabaseManager::try_get() {
             let new_records: Vec<NewLhbDaily> = records
                 .iter()
                 .map(|r| Self::convert_record_to_db(r))

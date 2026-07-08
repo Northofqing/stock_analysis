@@ -121,18 +121,26 @@ pub fn find_position(code: &str) -> Option<Position> {
 /// v53: 获取 ST/*ST 持仓 (T-16 ST 涨跌幅变更 dispatcher 数据源)
 ///   简化版: 当前 is_st/star_st 都默认 false, 真实来源待 broker 接入
 ///   真实意图: 每天 9:30 推一次, 给所有 ST/*ST 持仓提醒涨跌幅变更
-pub fn get_st_positions() -> Vec<Position> {
+///
+/// 修复 review #14: 只返回 code 列表, 避免 50 × Position (含 3 个 String)
+/// deep clone. 调用方按需 find_position(code) 取单只详情.
+pub fn get_st_positions() -> Vec<String> {
     get_positions()
         .unwrap_or_default()
-        .into_iter()
+        .iter()
         .filter(|p| p.is_st || p.star_st)
+        .map(|p| p.code.clone())
         .collect()
 }
 
 /// 判断是否 T+1 锁仓（今日买入的不可卖出）
-pub fn is_t1_locked(code: &str) -> bool {
+///
+/// 修复 review #14: 原 `unwrap_or(false)` 在 DB 错误时返回 false,
+/// 即"未锁仓" → 调用方可能当日卖出今日买入的票, 违反 T+1 制度.
+/// 现在返回 `Result<bool, String>` 让调用方显式处理失败, 不可静默.
+pub fn is_t1_locked(code: &str) -> Result<bool, String> {
     let today = chrono::Local::now().date_naive();
-    crate::portfolio::store::has_buy_today(code, today).unwrap_or(false)
+    crate::portfolio::store::has_buy_today(code, today)
 }
 
 /// 获取今日交易

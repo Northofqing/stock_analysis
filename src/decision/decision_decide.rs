@@ -366,28 +366,41 @@ mod tests {
 /// 复用 main.rs:1193 extract_advice_and_score 的简化版 (P0-5 不改 main.rs 私有函数)
 /// 提取 LLM markdown 输出的 (操作建议文本, 综合分).
 ///
+/// 编译期 AhoCorasick 自动机: 一次扫描找出所有 ACTION_KEYWORDS 出现位置.
+/// review #14 性能: 原 15 个 keywords × N 次 .contains() = 90K 次字符串扫描/review.
+/// 改自动机 1 次扫描 = 1 次 O(n+m), 中文/英文都用 SIMD 加速.
+static ACTION_AC: once_cell::sync::Lazy<aho_corasick::AhoCorasick> =
+    once_cell::sync::Lazy::new(|| {
+        aho_corasick::AhoCorasick::builder()
+            .match_kind(aho_corasick::MatchKind::LeftmostLongest)
+            .build([
+                "强烈卖出", "强烈看空", "卖出", "看空", "偏空", "减持", "规避", "降仓",
+                "观望", "中性", "看平", "增持", "加仓", "买入", "看多", "强烈看多",
+            ])
+            .expect("ACTION_KEYWORDS 是固定列表, build 不应失败")
+    });
+
 /// v14.4 修订: 不依赖 "## 【操作建议】" 段 — 实际 LLM 仲裁终稿用 "## 一句话结论\n**强烈看空**..."
 /// 格式 (一句话总结 + 因子归因里都含关键词). 改为从整个 md 文本搜关键词, 找到第一个匹配就返回.
 fn extract_advice_simple(md: &str) -> (String, Option<f64>) {
-    let mut advice = "未知".to_string();
-    let mut score: Option<f64> = None;
-    // 优先级: 强烈 > 弱 (强烈卖出/看空 优先于 卖出/看空)
+    // review #14: 用 AhoCorasick 自动机 1 次扫描, 取代 15 个 .contains() 重复扫描.
+    // LeftmostLongest 模式 → "强烈卖出" 优先于 "卖出" 出现在同一位置时.
+    // 由于 build 顺序就是优先级顺序, find_iter 第一个结果就是最高优先级匹配.
     const ACTION_KEYWORDS: &[&str] = &[
         "强烈卖出", "强烈看空", "卖出", "看空", "偏空", "减持", "规避", "降仓",
         "观望", "中性", "看平", "增持", "加仓", "买入", "看多", "强烈看多",
     ];
+    let advice = ACTION_AC
+        .find(md.as_bytes())
+        .map(|m| ACTION_KEYWORDS[m.pattern().as_usize()].to_string())
+        .unwrap_or_else(|| "未知".to_string());
+
+    let mut score: Option<f64> = None;
     for line in md.lines() {
-        let t = line.trim();
-        // 提取 action 关键词 (在整个 md 里搜, 不依赖特定段)
-        if advice == "未知" {
-            for kw in ACTION_KEYWORDS {
-                if t.contains(kw) {
-                    advice = kw.to_string();
-                    break;
-                }
-            }
+        if score.is_some() {
+            break;
         }
-        // 提取综合分
+        let t = line.trim();
         if t.contains("综合分") || t.contains("composite_score") || t.contains("composite score") {
             for token in t.split(|c: char| !c.is_ascii_digit() && c != '.') {
                 if let Ok(v) = token.parse::<f64>() {
@@ -399,12 +412,6 @@ fn extract_advice_simple(md: &str) -> (String, Option<f64>) {
             }
         }
     }
-    let advice = advice
-        .trim_start_matches("- ")
-        .trim_start_matches("**")
-        .trim_end_matches("**")
-        .trim()
-        .to_string();
     (advice, score)
 }
 
@@ -475,9 +482,13 @@ pub fn decisions_from_llm(
 ) -> Vec<FinalDecision> {
     let mut out = Vec::new();
     for p in holdings {
-        let (advice, _score) = match by_code.get(&p.code) {
-            Some((_, Some(md))) => extract_advice_simple(md),
-            _ => ("未知".to_string(), None),
+        // review #14: 一次 by_code.get() 拿 (name, md) — 原代码 3 次 get + 多次 clone.
+        // review #15 简化: 去掉 name_owned 手工 Cow 生命周期扩展 — holdings 永远有 name,
+        // 缺失 by_code entry 时回退用 p.name (与原代码 p.name.clone() 行为一致).
+        let entry = by_code.get(&p.code);
+        let (advice, _score) = match entry.and_then(|(_, md)| md.as_ref()) {
+            Some(md) => extract_advice_simple(md),
+            None => ("未知".to_string(), None),
         };
         let (action, priority) = action_priority_from_advice(&advice);
         let mut reasons = vec![DecisionReason::new(
@@ -492,8 +503,8 @@ pub fn decisions_from_llm(
                 "多 Agent 失败或数据缺失, 默认 Hold (诚实标注)",
             ));
         }
-        let ai_summary = by_code
-            .get(&p.code)
+        // review #14: 复用 entry (上面已 get), 不再二次 get.
+        let ai_summary = entry
             .and_then(|(_, md)| md.as_ref())
             .map(|md| first_meaningful_line(md))
             .unwrap_or_default();
@@ -502,9 +513,12 @@ pub fn decisions_from_llm(
             .get(&p.code)
             .map(|(price, pct)| if *price > 0.0 { (*price, *pct) } else { (p.cost_price, 0.0) })
             .unwrap_or((p.cost_price, 0.0));
+        // review #15 简化: name 优先用 by_code 提供的 (LLM 视角的最新名字),
+        // 没有则用 holdings p.name. 简化掉之前 name_owned 手工 lifetime 扩展.
+        let name = entry.map(|(n, _)| n.as_str()).unwrap_or(&p.name);
         let mut d = FinalDecision::new(
             p.code.clone(),
-            p.name.clone(),
+            name.to_string(),
             current_price, // v62: 用真报价
             change_pct,    // v62: 用真涨跌幅
             action,

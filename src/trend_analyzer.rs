@@ -325,11 +325,17 @@ impl StockTrendAnalyzer {
         self.analyze_support_resistance(&data_with_ma, &mut result);
 
         // 5. MACD / SKDJ / RSI 技术指标分析
-        let (highs, lows, closes): (Vec<f64>, Vec<f64>, Vec<f64>) = data_with_ma.iter()
-            .map(|d| (d.high, d.low, d.close))
-            .fold((vec![], vec![], vec![]), |(mut h, mut l, mut c), (hi, lo, cl)| {
-                h.push(hi); l.push(lo); c.push(cl); (h, l, c)
-            });
+        // review #14: 原 fold(vec![], vec![], vec![]) 起 cap=0, 每次 push 都 realloc.
+        // 改单 for 循环 + Vec::with_capacity(n) — 0 realloc.
+        let n = data_with_ma.len();
+        let mut highs = Vec::with_capacity(n);
+        let mut lows = Vec::with_capacity(n);
+        let mut closes = Vec::with_capacity(n);
+        for d in &data_with_ma {
+            highs.push(d.high);
+            lows.push(d.low);
+            closes.push(d.close);
+        }
         result.indicator_analysis = Some(indicators::analyze_indicators(&highs, &lows, &closes));
 
         // 6. 生成买入信号

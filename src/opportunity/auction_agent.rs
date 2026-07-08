@@ -168,8 +168,8 @@ pub fn run_auction_agent(
         let score = (r.gap_pct.abs() * 10.0 + r.vol_ratio * 5.0).min(100.0);
 
         // 调 db.save_prediction, 用 v10 新签名 (带 reason)
-        let db_result = std::panic::catch_unwind(|| {
-            DatabaseManager::get().save_prediction(
+        let db_result = DatabaseManager::try_get().map(|db| {
+            db.save_prediction(
                 &today,
                 &tomorrow,
                 Some("auction"), // theme_name
@@ -183,36 +183,36 @@ pub fn run_auction_agent(
         });
 
         match db_result {
-            Ok(Ok(())) => {
+            Some(Ok(())) => {
                 record.written = true;
                 record.reason = Some(VirtualReason::AuctionAnomaly.to_string());
                 report.written += 1;
             }
-            Ok(Err(e)) => {
+            Some(Err(e)) => {
                 record.error = Some(format!("DB 写失败: {}", e));
                 report.errors += 1;
                 warn!("[AuctionAgent] 写盘口失败: {} ({})", r.code, e);
             }
-            Err(_) => {
-                record.error = Some("DB 不可用 (panic)".to_string());
+            None => {
+                record.error = Some("DB 未初始化".to_string());
                 report.errors += 1;
-                warn!("[AuctionAgent] DB 不可用, 跳过写盘口");
+                warn!("[AuctionAgent] DB 未初始化, 跳过写盘口");
             }
         }
         report.records.push(record);
     }
 
     // 4. 样本 < 阈值检查 (Q4=C, 警告而非阻断)
-    // 包 catch_unwind 防 DB 未初始化时 panic (test 环境 + production 防御)
+    // review #14: try_get() 不 panic, None 路径走 DB 未初始化分支
     let total = report.written as usize;
     if total > 0 {
-        let sample_check = std::panic::catch_unwind(|| {
-            let reason_count = DatabaseManager::get().count_predictions_by_reason("AuctionAnomaly").unwrap_or(0) as usize;
-            let total_pred = DatabaseManager::get().count_predictions().unwrap_or(0) as usize;
+        let sample_check = DatabaseManager::try_get().map(|db| {
+            let reason_count = db.count_predictions_by_reason("AuctionAnomaly").unwrap_or(0) as usize;
+            let total_pred = db.count_predictions().unwrap_or(0) as usize;
             (reason_count, total_pred)
         });
         match sample_check {
-            Ok((reason_count, total_pred)) => {
+            Some((reason_count, total_pred)) => {
                 if !is_sample_sufficient(reason_count, total_pred) {
                     report.sample_warnings += 1;
                     warn!(
@@ -223,8 +223,8 @@ pub fn run_auction_agent(
                     );
                 }
             }
-            Err(_) => {
-                warn!("[AuctionAgent] DB 不可用, 跳过样本检查");
+            None => {
+                warn!("[AuctionAgent] DB 未初始化, 跳过样本检查");
             }
         }
     }

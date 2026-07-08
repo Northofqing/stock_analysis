@@ -112,9 +112,8 @@ pub enum AirRefuelEntryMode {
 }
 
 fn air_refuel_entry_mode() -> AirRefuelEntryMode {
-    let mode = stock_analysis::config::get_monitor_config()
-        .air_refuel
-        .entry_mode;
+    let cfg = stock_analysis::config::get_monitor_config();
+    let mode = cfg.air_refuel.entry_mode.as_str();
     if mode.trim().eq_ignore_ascii_case("pilot") {
         AirRefuelEntryMode::Pilot
     } else {
@@ -477,19 +476,21 @@ pub fn current_banner() -> push_templates::BannerCtx {
 /// v41 + v51: 周期刷新 banner (从 AccountMode + DataMode 评估结果合并)
 ///   - v51: DataMode 也走真值 (调 dm_evaluate, 不是写死 Full)
 pub async fn refresh_banner_state() {
-    // 1. 调 AccountMode 评估
-    let am_metrics = match tokio::task::spawn_blocking(compute_account_mode_metrics_blocking).await {
+    // 1. 并发调 AccountMode 评估 + prev_mode 查询 (review #14: 原串行 await 浪费 DB RT)
+    let (am_metrics_res, prev_mode_res) = tokio::join!(
+        tokio::task::spawn_blocking(compute_account_mode_metrics_blocking),
+        tokio::task::spawn_blocking(
+            stock_analysis::database::account_mode_log::latest_account_mode_change,
+        ),
+    );
+    let am_metrics = match am_metrics_res {
         Ok(Ok(m)) => m,
         _ => {
             log::warn!("[v41 banner] AccountMode metrics 失败, 保留旧 banner");
             return;
         }
     };
-    let prev_mode = match tokio::task::spawn_blocking(
-        stock_analysis::database::account_mode_log::latest_account_mode_change,
-    )
-    .await
-    {
+    let prev_mode = match prev_mode_res {
         Ok(Ok(Some(row))) => parse_mode_label(&row.new_mode),
         _ => None,
     };
@@ -3041,8 +3042,13 @@ async fn push_e2e_t16_st_price_limit(hhmm: &str) {
     log::info!("[v14.1 #163] get_st_positions 找到 {} 只 ST 持仓", st_positions.len());
 
     // 3. 调 T-16 dispatcher 推 1 条
+    // review #14: get_st_positions 现在返 Vec<String> (code list), 按 code 反查 Position
     use push_templates as pt;
-    for pos in &st_positions {
+    for code in &st_positions {
+        let Some(pos) = stock_analysis::portfolio::find_position(code) else {
+            log::warn!("[v14.1 #163] ST code {} 无 Position 详情, 跳过", code);
+            continue;
+        };
         let st_type = if pos.star_st { pt::StType::StarST } else { pt::StType::ST };
         let now_price = pos.cost_price * 1.02;
         let new_stop = pos.cost_price * 0.90;
@@ -3681,9 +3687,21 @@ async fn monitor_loop() {
         log::info!("进入交易时段，开始监控");
 
         let positions = stock_analysis::portfolio::get_positions().unwrap_or_default();
+        // review #14: is_t1_locked 返回 Result, 显式 match; DB 失败时按"未解锁"
+        // 处理 (保守), 同时 log warn 让 operator 知道.
+        // review #14 修正: 原 Err → false (按未解锁处理) 与另一 caller Err → true (按锁定)
+// 不一致, 违反"安全保守"原则. 统一保守: DB 失败 → 按已锁定处理,
+// 持仓跳过解禁候选, 防止违反 T+1.
         let t1_unlocks: Vec<_> = positions
             .iter()
-            .filter(|p| stock_analysis::portfolio::is_t1_locked(&p.code))
+            .filter(|p| match stock_analysis::portfolio::is_t1_locked(&p.code) {
+                Ok(true) => false,
+                Ok(false) => true,
+                Err(e) => {
+                    log::error!("[盘前] is_t1_locked({}) 失败: {} — 保守按已锁定处理", p.code, e);
+                    false
+                }
+            })
             .cloned()
             .collect();
         let pre_market = checklist::build_pre_market_checklist(&positions, &t1_unlocks, &[]);
@@ -4279,7 +4297,14 @@ async fn monitor_loop() {
                     // 持仓遍历：信号融合（不再单独推送每条事件）
                     let mut health_lines: Vec<String> = Vec::new();
                     for (code, s) in &stock_map {
-                        let t1_locked = stock_analysis::portfolio::is_t1_locked(code);
+                        // review #14: DB 错误按"已锁定"处理 (保守), log warn 提醒.
+                        let t1_locked = match stock_analysis::portfolio::is_t1_locked(code) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                log::warn!("[t+1] is_t1_locked({}) 失败: {} — 按锁定处理", code, e);
+                                true
+                            }
+                        };
                         let rank = ranked.iter().position(|r| r.code == *code).map(|p| p + 1);
                         let is_limit_up = s.change_pct >= 9.5;
                         let prev_was_limit = was_limit_up.contains(code);
@@ -4739,13 +4764,17 @@ async fn monitor_loop() {
                         let st_trigger = chrono::NaiveTime::from_hms_opt(9, 30, 0).unwrap();
                         if now_time >= st_trigger {
                             st_price_pushed = true;
-                            // 遍历 ST 持仓, 每只单独推
-                            let st_positions =
-                                stock_analysis::portfolio::get_st_positions();
-                            if st_positions.is_empty() {
+                            // review #14: get_st_positions 现在返回 Vec<String>, 按 code 反查 Position.
+                            let st_codes = stock_analysis::portfolio::get_st_positions();
+                            if st_codes.is_empty() {
                                 log::info!("[T-16] ST 涨跌幅变更 ticker (无 ST/*ST 持仓, 静默)");
                             } else {
-                                for pos in &st_positions {
+                                for code in &st_codes {
+                                    // 找不到完整持仓则跳过 (DB 可能刚 reset)
+                                    let Some(pos) = stock_analysis::portfolio::find_position(code) else {
+                                        log::warn!("[T-16] ST code {} 无 Position 详情, 跳过", code);
+                                        continue;
+                                    };
                                     let st_type = if pos.star_st {
                                         push_templates::StType::StarST
                                     } else {
@@ -4772,7 +4801,7 @@ async fn monitor_loop() {
                                 }
                                 log::info!(
                                     "[T-16] ST 涨跌幅变更已推 {} 只持仓",
-                                    st_positions.len()
+                                    st_codes.len()
                                 );
                             }
                         }

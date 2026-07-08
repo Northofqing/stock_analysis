@@ -94,44 +94,77 @@ pub struct NewsOutcome {
     pub reasons: Vec<String>,
 }
 
-/// 推送日收盘价 (K 线按 push_at 日期取)
+/// 推送日收盘价 (K 线按 push_at 日期取).
+/// review #14: 原本 iter().rev().find() 调用 8+ 次 (evaluate_audit 一次评估内).
+/// 改 rposition 一次扫, 同时配合 evaluate_audit 入口的 push_idx 缓存,
+/// 整体评估从 O(n × k_calls) 降到 O(n) + O(1) 索引.
 fn kline_at_or_before(klines: &[crate::data_provider::KlineData], date: NaiveDate) -> Option<&crate::data_provider::KlineData> {
-    klines.iter().rev().find(|k| k.date <= date)
+    klines
+        .iter()
+        .rposition(|k| k.date <= date)
+        .map(|i| &klines[i])
+}
+
+/// 推送日 idx 缓存 (review #14 新增). evaluate_audit 入口算一次,
+/// 所有 helper 走 push_idx + 切片偏移, 不再每次都反扫.
+/// 假设 K 线按日期**降序**(最新在前), push_idx+1 之后是推送后窗口.
+fn locate_push_idx(klines: &[crate::data_provider::KlineData], push_date: NaiveDate) -> Option<usize> {
+    klines.iter().rposition(|k| k.date <= push_date)
 }
 
 /// D+N 涨幅 (推送后 N 个交易日的收盘涨幅 vs push_price)
-fn pct_change_at(klines: &[crate::data_provider::KlineData], push_date: NaiveDate, n_days: usize) -> Option<f64> {
-    let push_k = kline_at_or_before(klines, push_date)?;
-    // 从 push_date 之后数 n_days 个交易日
-    let after: Vec<&crate::data_provider::KlineData> = klines
-        .iter()
-        .filter(|k| k.date > push_date)
-        .take(n_days)
-        .collect();
-    let target = after.last()?;
+/// review #14: 接收 push_idx, 不再扫全数组, 不再 collect 中间 Vec.
+fn pct_change_at_idx(
+    klines: &[crate::data_provider::KlineData],
+    push_idx: usize,
+    n_days: usize,
+) -> Option<f64> {
+    let push_k = klines.get(push_idx)?;
     if push_k.close <= 0.0 {
         return None;
     }
+    let target_idx = push_idx.saturating_sub(n_days);
+    let target = klines.get(target_idx)?;
     Some((target.close - push_k.close) / push_k.close * 100.0)
 }
 
 /// MFE / MAE (推送后 n_days 内, 最高 / 最低 收盘 vs push_price, %)
-fn mfe_mae(klines: &[crate::data_provider::KlineData], push_date: NaiveDate, n_days: usize) -> (Option<f64>, Option<f64>) {
-    let push_k = match kline_at_or_before(klines, push_date) {
+/// review #14: 用 push_idx + 切片, 单循环同时算 max/min (省一次迭代).
+fn mfe_mae_idx(
+    klines: &[crate::data_provider::KlineData],
+    push_idx: usize,
+    n_days: usize,
+) -> (Option<f64>, Option<f64>) {
+    let push_k = match klines.get(push_idx) {
         Some(k) if k.close > 0.0 => k,
         _ => return (None, None),
     };
-    let window: Vec<&crate::data_provider::KlineData> = klines
-        .iter()
-        .filter(|k| k.date > push_date)
-        .take(n_days)
-        .collect();
+    let end_idx = push_idx.saturating_sub(n_days);
+    let window = &klines[end_idx..push_idx]; // push_idx 自身不算 (date > push_date)
     if window.is_empty() {
         return (None, None);
     }
-    let mfe = window.iter().map(|k| (k.close - push_k.close) / push_k.close * 100.0).fold(f64::NEG_INFINITY, f64::max);
-    let mae = window.iter().map(|k| (k.close - push_k.close) / push_k.close * 100.0).fold(f64::INFINITY, f64::min);
+    let mut mfe = f64::NEG_INFINITY;
+    let mut mae = f64::INFINITY;
+    for k in window {
+        let r = (k.close - push_k.close) / push_k.close * 100.0;
+        if r > mfe { mfe = r; }
+        if r < mae { mae = r; }
+    }
     (Some(mfe), Some(mae))
+}
+
+// ===== 兼容 wrapper: 旧 API (klines + push_date) 走新 idx 实现 =====
+fn pct_change_at(klines: &[crate::data_provider::KlineData], push_date: NaiveDate, n_days: usize) -> Option<f64> {
+    let push_idx = locate_push_idx(klines, push_date)?;
+    pct_change_at_idx(klines, push_idx, n_days)
+}
+
+fn mfe_mae(klines: &[crate::data_provider::KlineData], push_date: NaiveDate, n_days: usize) -> (Option<f64>, Option<f64>) {
+    match locate_push_idx(klines, push_date) {
+        Some(idx) => mfe_mae_idx(klines, idx, n_days),
+        None => (None, None),
+    }
 }
 
 /// 从 chain 名反查代码
@@ -173,32 +206,44 @@ pub fn evaluate_audit(
         reasons.push("K 线拉取失败".to_string());
     }
 
-    let push_price = klines_opt
+    // review #14 + 15: 入口算一次 push_idx, 所有 helper 走 *_idx 避免重复 rposition.
+    // 原本 8+ 次 kline_at_or_before / pct_change_at 每次都全扫, 改 push_idx 后 O(1) 切片.
+    let push_idx_opt = klines_opt
         .as_ref()
-        .and_then(|ks| kline_at_or_before(ks, push_date).map(|k| k.close));
+        .and_then(|ks| locate_push_idx(ks, push_date));
 
-    // 涨幅
-    let d1_pct = klines_opt.as_ref().and_then(|ks| pct_change_at(ks, push_date, 1));
-    let d3_pct = klines_opt.as_ref().and_then(|ks| pct_change_at(ks, push_date, 3));
-    let d5_pct = klines_opt.as_ref().and_then(|ks| pct_change_at(ks, push_date, 5));
+    let push_price = push_idx_opt
+        .and_then(|idx| klines_opt.as_ref().and_then(|ks| ks.get(idx).map(|k| k.close)));
+
+    // 涨幅 (走 *_idx, push_idx 复用)
+    let d1_pct = push_idx_opt.and_then(|idx| {
+        klines_opt.as_ref().and_then(|ks| pct_change_at_idx(ks, idx, 1))
+    });
+    let d3_pct = push_idx_opt.and_then(|idx| {
+        klines_opt.as_ref().and_then(|ks| pct_change_at_idx(ks, idx, 3))
+    });
+    let d5_pct = push_idx_opt.and_then(|idx| {
+        klines_opt.as_ref().and_then(|ks| pct_change_at_idx(ks, idx, 5))
+    });
 
     // MFE/MAE (D+1~D+5 5 日窗口)
-    let (mfe, mae) = klines_opt
-        .as_ref()
-        .map(|ks| mfe_mae(ks, push_date, 5))
+    let (mfe, mae) = push_idx_opt
+        .and_then(|idx| {
+            klines_opt.as_ref().map(|ks| mfe_mae_idx(ks, idx, 5))
+        })
         .unwrap_or((None, None));
 
     // 5 维度
     // 1. 涨停买不到: push 当日 pct_chg >= 9.5%
-    let limit_up_unbuyable = klines_opt
-        .as_ref()
-        .and_then(|ks| kline_at_or_before(ks, push_date))
-        .map(|k| k.pct_chg >= 9.5);
+    let limit_up_unbuyable = push_idx_opt.and_then(|idx| {
+        klines_opt.as_ref().and_then(|ks| ks.get(idx).map(|k| k.pct_chg >= 9.5))
+    });
     // 2. 高开低走 D+1: D+1 open > D+1 prev_close*1.01 AND D+1 close < D+1 open
-    let open_high_sell_low_d1 = klines_opt.as_ref().and_then(|ks| {
-        let push_k = kline_at_or_before(ks, push_date)?;
-        let after: Vec<&crate::data_provider::KlineData> = ks.iter().filter(|k| k.date > push_date).take(1).collect();
-        let d1 = after.first()?;
+    //    push_idx+1 直接拿 D+1 K 线, 不再 filter+collect Vec.
+    let open_high_sell_low_d1 = push_idx_opt.and_then(|idx| {
+        let ks = klines_opt.as_ref()?;
+        let push_k = ks.get(idx)?;
+        let d1 = ks.get(idx.checked_sub(1)?)?; // K 线降序: push_idx-1 是更近一日 (D+1)
         let prev_close = push_k.close;
         Some(d1.open > prev_close * 1.01 && d1.close < d1.open)
     });
@@ -213,10 +258,10 @@ pub fn evaluate_audit(
     // 没拉到板块 K 线 → None (不补 0)
     let sector_driven = compute_sector_driven(row, klines_opt.as_deref(), push_date);
     // 5. 可执行买点: D+1 low <= push_price * 1.03 (推送价 ±3% 区间内可买)
-    let executable_entry = klines_opt.as_ref().and_then(|ks| {
-        let push_k = kline_at_or_before(ks, push_date)?;
-        let after: Vec<&crate::data_provider::KlineData> = ks.iter().filter(|k| k.date > push_date).take(1).collect();
-        let d1 = after.first()?;
+    let executable_entry = push_idx_opt.and_then(|idx| {
+        let ks = klines_opt.as_ref()?;
+        let push_k = ks.get(idx)?;
+        let d1 = ks.get(idx.checked_sub(1)?)?;
         Some(d1.low <= push_k.close * 1.03)
     });
 

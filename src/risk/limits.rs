@@ -36,24 +36,56 @@ pub struct LimitViolation {
 ///   `let cash_pct = 100.0` 永远 false, 现金检查从未触发).
 ///   现金底限检查已迁移到 `risk::cash_guard::check_cash`, 调用方在
 ///   `bin/monitor/main.rs` 的风控研判路径单独调用.
+///
+/// 修复 review #14: 缺价 fallback `cost_price` 会让硬止损永远不触发
+/// (cost - cost)/cost = 0%). 改为显式 emit "缺价告警" violation, 让持仓
+/// 缺价的事实进入风控信号, 不再静默失真.
 pub fn check_position_limits(
     positions: &[Position],
     prices: &std::collections::HashMap<String, f64>,
     limits: &HardLimits,
 ) -> Vec<LimitViolation> {
-    let total_value: f64 = positions.iter()
-        .map(|p| {
-            let price = prices.get(&p.code).copied().unwrap_or(p.cost_price);
-            p.shares as f64 * price
-        })
-        .sum();
+    if positions.is_empty() { return vec![]; }
 
-    if total_value <= 0.0 { return vec![]; }
+    // 单次遍历: 收集 (position, price) 列表 + sector 总市值 + 总市值
+    // 同时识别缺价持仓 (review #14: 不再 fallback 到 cost_price).
+    struct ValuedPos<'a> {
+        pos: &'a Position,
+        price: Option<f64>,
+    }
+    let mut valued: Vec<ValuedPos<'_>> = Vec::with_capacity(positions.len());
+    let mut sector_totals: std::collections::HashMap<&str, f64> =
+        std::collections::HashMap::new();
+    let mut total_value = 0.0;
+    for p in positions {
+        let price = prices.get(&p.code).copied();
+        if let Some(pr) = price {
+            let mv = p.shares as f64 * pr;
+            total_value += mv;
+            if !p.sector.is_empty() && p.sector != "其他" {
+                *sector_totals.entry(p.sector.as_str()).or_insert(0.0) += mv;
+            }
+        }
+        valued.push(ValuedPos { pos: p, price });
+    }
 
     let mut violations = Vec::new();
 
-    for p in positions {
-        let price = prices.get(&p.code).copied().unwrap_or(p.cost_price);
+    for v in &valued {
+        let p = v.pos;
+        // 缺价 — emit 显式 violation, 不再静默用成本价 (review #14 修复)
+        let Some(price) = v.price else {
+            violations.push(LimitViolation {
+                code: p.code.clone(),
+                name: p.name.clone(),
+                rule: "缺价".to_string(),
+                current: "无".to_string(),
+                limit: "需实时价".to_string(),
+            });
+            continue;
+        };
+        if total_value <= 0.0 { continue; }
+
         let market_value = p.shares as f64 * price;
         let pct = market_value / total_value * 100.0;
 
@@ -67,17 +99,15 @@ pub fn check_position_limits(
             });
         }
 
-        // 修复 P1.6: 板块集中度检查
-        // 同 sector 持仓总市值 / total_value
+        // 修复 P1.6: 板块集中度检查 (review #14: 用预计算的 sector_totals,
+        // O(1) lookup, 不再 O(N) filter)
         if !p.sector.is_empty() && p.sector != "其他" {
-            let sector_value: f64 = positions.iter()
-                .filter(|q| q.sector == p.sector)
-                .map(|q| {
-                    let q_price = prices.get(&q.code).copied().unwrap_or(q.cost_price);
-                    q.shares as f64 * q_price
-                })
-                .sum();
-            let sector_pct = sector_value / total_value * 100.0;
+            let sector_pct = sector_totals
+                .get(p.sector.as_str())
+                .copied()
+                .unwrap_or(0.0)
+                / total_value
+                * 100.0;
             if sector_pct > limits.single_sector_max_pct {
                 violations.push(LimitViolation {
                     code: p.sector.clone(), name: format!("板块 {}", p.sector),

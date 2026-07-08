@@ -1110,12 +1110,18 @@ pub async fn run_post_close_candidates(top_n: usize) -> String {
         let (flow_score, flow_reason) =
             score_capital_consensus(&flow, flow_fetch_error.as_deref());
         let flow_source_status = classify_flow_error(flow_fetch_error.as_deref()).to_string();
-        let (pattern_score, pattern_reason, stop_line) = kline
+        // review #14 性能: 原代码两个 .map(|k| { ... analyze_postmarket ... }) 各自
+        // 跑一遍完整 K 线扫描 (5-10ms/只). 200 只股票 = 400 次 = 400×10ms = 4s 浪费.
+        // 提到外层算一次 sig, 两个 closure 共享.
+        let sig_opt = kline
             .as_deref()
-            .map(|k| {
+            .map(|k| crate::breakout::engine::analyze_postmarket(&c.code, &c.name, k));
+        let (pattern_score, pattern_reason, stop_line) = sig_opt
+            .as_ref()
+            .zip(kline.as_deref())
+            .map(|(sig, k)| {
                 let (rhythm_score, rhythm_reason, stop_line) = score_air_refuel_pattern(k);
-                let sig = crate::breakout::engine::analyze_postmarket(&c.code, &c.name, k);
-                let (breakout_score, breakout_reason) = score_breakout_structure(&sig);
+                let (breakout_score, breakout_reason) = score_breakout_structure(sig);
                 let total = (rhythm_score + breakout_score).clamp(-8.0, 14.0);
                 (
                     total,
@@ -1124,10 +1130,9 @@ pub async fn run_post_close_candidates(top_n: usize) -> String {
                 )
             })
             .unwrap_or((0.0, "K线数据抓取失败，趋势结构按0分处理".to_string(), None));
-        let (breakout_reason, breakout_confidence, volume_ok) = kline
-            .as_deref()
-            .map(|k| {
-                let sig = crate::breakout::engine::analyze_postmarket(&c.code, &c.name, k);
+        let (breakout_reason, breakout_confidence, volume_ok) = sig_opt
+            .as_ref()
+            .map(|sig| {
                 let vol_ratio = sig.vol_vs_20d_avg.unwrap_or(0.0);
                 (
                     format!(

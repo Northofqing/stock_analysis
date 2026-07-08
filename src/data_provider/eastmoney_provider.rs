@@ -220,14 +220,15 @@ impl HttpProvider {
             .as_array()
             .ok_or_else(|| anyhow!("未找到klines数据"))?;
         
-        let mut result = Vec::new();
-        
+        let mut result = Vec::with_capacity(klines.len());
+
         for kline_str in klines {
             let kline_str = kline_str.as_str()
                 .ok_or_else(|| anyhow!("kline不是字符串"))?;
-            
+
+            // review #14: splitn(8, ',') 限制切分数量, 11 字段也只切 8 个 Vec 元素.
             // 格式: "2026-01-22,10.0,10.5,9.8,10.3,1000000,10000000,2.5,0,0,0"
-            let parts: Vec<&str> = kline_str.split(',').collect();
+            let parts: Vec<&str> = kline_str.splitn(8, ',').collect();
             
             if parts.len() < 8 {
                 log::warn!("[HTTP] K线数据格式错误: {}", kline_str);

@@ -166,36 +166,78 @@ const POSITIVE_KEYWORDS: &[&str] = &[
 ];
 
 fn classify_title(title: &str, _code: &str, _name: &str) -> (AnnLevel, String) {
-    // 优先 toml 配置，不可用回退 const
-    let (emergency, important, positive) = if let Some(cfg) = crate::config::get_announce_keywords() {
-        (cfg.emergency, cfg.important, cfg.positive)
-    } else {
-        (EMERGENCY_KEYWORDS.iter().map(|s| s.to_string()).collect(),
-         IMPORTANT_KEYWORDS.iter().map(|s| s.to_string()).collect(),
-         POSITIVE_KEYWORDS.iter().map(|s| s.to_string()).collect())
-    };
-
-    for kw in &emergency {
-        if title.contains(kw.as_str()) {
-            return (AnnLevel::Emergency, format!("标题含'{}'，直接告警", kw));
-        }
+    // review #14 性能: 原 fallback 分支 3 次 .map(to_string).collect() 触发 3 次堆分配
+    // (EMERGENCY 50 + IMPORTANT 50 + POSITIVE 30 ≈ 130 个 String). 公告热路径
+    // (200+ 条/批), 每天触发数百次. 改为按配置来源直接传 &[&str], const 路径零分配.
+    // review #14 性能: 原 fallback 分支 3 次 .map(to_string).collect() 触发 3 次堆分配
+    // (EMERGENCY 50 + IMPORTANT 50 + POSITIVE 30 ≈ 130 个 String). 公告热路径
+    // (200+ 条/批), 每天触发数百次. 改为按配置来源直接传 &[&str], const 路径零分配.
+    // 用 enum 统一两种来源 (const &[&str] / config Vec<String>).
+    enum KwList<'a> {
+        Static(&'a [&'a str]),
+        Owned(&'a [String]),
     }
-    for kw in &important {
-        if title.contains(kw.as_str()) {
-            if kw == "减持" {
-                if let Some(pct) = extract_reduction_pct(title) {
-                    if pct < 1.0 {
-                        continue; // <1% 不算重要
-                    }
-                }
+    impl<'a> KwList<'a> {
+        fn first_match(&self, s: &str) -> Option<String> {
+            match self {
+                KwList::Static(v) => v.iter().find(|k| s.contains(**k)).map(|k| k.to_string()),
+                KwList::Owned(v) => v.iter().find(|k| s.contains(k.as_str())).map(|k| k.clone()),
             }
-            return (AnnLevel::Important, format!("标题含'{}'", kw));
+        }
+        /// review #14: 跳过指定 keyword, 找下一个匹配 (用于减持 <1% 降级场景).
+        fn first_match_skip(&self, s: &str, skip: &str) -> Option<String> {
+            match self {
+                KwList::Static(v) => v
+                    .iter()
+                    .find(|k| **k != skip && s.contains(**k))
+                    .map(|k| k.to_string()),
+                KwList::Owned(v) => v
+                    .iter()
+                    .find(|k| k.as_str() != skip && s.contains(k.as_str()))
+                    .map(|k| k.clone()),
+            }
         }
     }
-    for kw in &positive {
-        if title.contains(kw.as_str()) {
-            return (AnnLevel::Info, format!("利好: '{}'", kw));
+    // 模块级静态缓存: 配置 keyword 一旦加载就永久驻留 (review #14 + 15).
+    // review #15 修正: 原 Lazy<(Vec, Vec, Vec)> + is_empty() 区分不了"配置未加载"
+    // 和"配置加载但 Vec 为空". 用 OnceLock<Option<(Vec,Vec,Vec)>> 显式区分.
+    // 同时去掉冗余的 `|| get_announce_keywords().is_some()` (每次 classify_title
+    // 调一次 ArcSwap load + Arc clone, 完全违背零分配意图).
+    static CACHED_CFG: std::sync::OnceLock<
+        Option<(Vec<String>, Vec<String>, Vec<String>)>,
+    > = std::sync::OnceLock::new();
+    let (emergency, important, positive) = CACHED_CFG
+        .get_or_init(|| {
+            crate::config::get_announce_keywords()
+                .map(|cfg| (cfg.emergency.clone(), cfg.important.clone(), cfg.positive.clone()))
+        })
+        .as_ref()
+        .map(|(e, i, p)| (KwList::Owned(e), KwList::Owned(i), KwList::Owned(p)))
+        .unwrap_or((
+            KwList::Static(EMERGENCY_KEYWORDS),
+            KwList::Static(IMPORTANT_KEYWORDS),
+            KwList::Static(POSITIVE_KEYWORDS),
+        ));
+
+    if let Some(kw) = emergency.first_match(title) {
+        return (AnnLevel::Emergency, format!("标题含'{kw}'，直接告警"));
+    }
+    // 减持特例: <1% 不算重要, 跳过此 kw 重找下一个.
+    // review #14: 改 first_match_skip 替代之前的 inner-loop continue.
+    let important_kw = if let Some(pct) = title.find("减持").map(|_| extract_reduction_pct(title)).flatten() {
+        if pct < 1.0 {
+            important.first_match_skip(title, "减持")
+        } else {
+            important.first_match(title)
         }
+    } else {
+        important.first_match(title)
+    };
+    if let Some(kw) = important_kw {
+        return (AnnLevel::Important, format!("标题含'{kw}'"));
+    }
+    if let Some(kw) = positive.first_match(title) {
+        return (AnnLevel::Info, format!("利好: '{kw}'"));
     }
     (AnnLevel::Skip, String::new())
 }

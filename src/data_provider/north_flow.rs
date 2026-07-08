@@ -78,10 +78,8 @@ pub struct NorthFlowClient {
 
 impl NorthFlowClient {
     pub fn new() -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(8))
-            .build()
-            .expect("reqwest client init failed");
+        // review #15: 复用 SHARED_FAST_HTTP_CLIENT (5s timeout, 适合快查).
+        let http = crate::http_client::SHARED_FAST_HTTP_CLIENT.clone();
         Self { http }
     }
 

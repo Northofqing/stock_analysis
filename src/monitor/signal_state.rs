@@ -193,12 +193,7 @@ impl SignalStateMachine {
 
     /// 每 5 分钟将当前状态写入 signal_state 表
     pub fn flush_state(&self) {
-        let db = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::database::DatabaseManager::get()
-        })) {
-            Ok(db) => db,
-            Err(_) => return,
-        };
+        let Some(db) = crate::database::DatabaseManager::try_get() else { return; };
         let mut conn = match db.get_conn() {
             Ok(c) => c,
             Err(_) => return,
@@ -219,12 +214,7 @@ impl SignalStateMachine {
 
     /// 启动时从 signal_state 恢复状态，清理过期数据
     pub fn restore_state(&mut self) {
-        let db = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::database::DatabaseManager::get()
-        })) {
-            Ok(db) => db,
-            Err(_) => return,
-        };
+        let Some(db) = crate::database::DatabaseManager::try_get() else { return; };
         let mut conn = match db.get_conn() {
             Ok(c) => c,
             Err(_) => return,

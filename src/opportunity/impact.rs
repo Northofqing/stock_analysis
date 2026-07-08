@@ -176,10 +176,9 @@ fn build_static_chain_hit(chain: &str, concepts: &[String]) -> Option<ChainHit> 
 }
 
 fn load_cached_concepts_safe(max_age_days: i64) -> std::collections::HashMap<String, Vec<String>> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::database::DatabaseManager::get().get_cached_concepts(max_age_days)
-    }))
-    .unwrap_or_default()
+    crate::database::DatabaseManager::try_get()
+        .map(|db| db.get_cached_concepts(max_age_days))
+        .unwrap_or_default()
 }
 
 /// 评估新闻对持仓的影响。

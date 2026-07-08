@@ -63,9 +63,7 @@ impl NewsMonitor {
     pub fn new() -> Self {
         let mut linker = EntityLinker::new();
         // 加载持仓
-        if let Ok(db) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::database::DatabaseManager::get()
-        })) {
+        if let Some(db) = crate::database::DatabaseManager::try_get() {
             if let Ok(positions) = db.get_all_open_positions() {
                 for p in &positions {
                     linker.register_position(&p.code, &p.name);
@@ -121,8 +119,14 @@ impl NewsMonitor {
         self.passive_count_today += anns.len() as u64;
 
         for ann in anns {
-            // 去重
-            let key = format!("ann:{}", &ann.title.chars().take(40).collect::<String>());
+            // review #14: char_indices().nth() 找第 40 字符的 byte 边界, 一次性扫描,
+            // 避免 chars().take(40).collect::<String>() + format! 双重分配.
+            let title_prefix: &str = ann.title
+                .char_indices()
+                .nth(40)
+                .map(|(i, _)| &ann.title[..i])
+                .unwrap_or(&ann.title);
+            let key = format!("ann:{title_prefix}");
             if !self.seen_titles.insert(key) { continue; }
 
             // 实体关联（纯 CPU 计算，但输入短不需要 spawn_blocking）
@@ -187,15 +191,22 @@ impl NewsMonitor {
                 continue; // L1和L2都不匹配 → 丢弃
             }
 
-            let hit_names: Vec<String> = {
-                let mut names: Vec<String> = hits.iter()
-                    .map(|h| format!("{}({})", h.name, h.code))
-                    .collect();
-                if !l2_concept.is_empty() {
-                    names.push(format!("板块'{}'关联: {}", l2_concept, l2_codes.join(",")));
-                }
-                names
-            };
+            // review #14: 用 String + write! 拼接, 避免每次 format! 触发 String 分配.
+            // 先预算容量 (人均 ~30 字节), 减少 grow.
+            let mut hit_summary = String::with_capacity(hits.len() * 32);
+            for (i, h) in hits.iter().enumerate() {
+                if i > 0 { hit_summary.push_str(", "); }
+                let _ = std::fmt::Write::write_fmt(
+                    &mut hit_summary,
+                    format_args!("{}({})", h.name, h.code),
+                );
+            }
+            if !l2_concept.is_empty() {
+                let _ = std::fmt::Write::write_fmt(
+                    &mut hit_summary,
+                    format_args!(", 板块'{}'关联: {}", l2_concept, l2_codes.join(",")),
+                );
+            }
 
             // 标题中剥离公司名前缀（避免和header的公司名重复）
             let short_title = strip_company_prefix(&ann.title, &name);
@@ -223,8 +234,8 @@ impl NewsMonitor {
                     },
                     ai_decision: None,
                     t1_locked: false,
-                    extra: if hit_names.is_empty() { None } else {
-                        Some(format!("命中: {}", hit_names.join(", ")))
+                    extra: if hit_summary.is_empty() { None } else {
+                        Some(format!("命中: {hit_summary}"))
                     },
                 },
                 triggered_at: Local::now(),
@@ -303,12 +314,7 @@ impl NewsMonitor {
 
     /// 将 seen_titles 批量写入 news_dedup 表，每 5 分钟调用一次
     pub fn flush_dedup(&self) {
-        let db = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::database::DatabaseManager::get()
-        })) {
-            Ok(db) => db,
-            Err(_) => return,
-        };
+        let Some(db) = crate::database::DatabaseManager::try_get() else { return; };
         let mut conn = match db.get_conn() {
             Ok(c) => c,
             Err(_) => return,
@@ -334,12 +340,7 @@ impl NewsMonitor {
 
     /// 启动时从 news_dedup 恢复今天的 seen_titles，清理过期 key
     pub fn restore_dedup(&mut self) {
-        let db = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::database::DatabaseManager::get()
-        })) {
-            Ok(db) => db,
-            Err(_) => return,
-        };
+        let Some(db) = crate::database::DatabaseManager::try_get() else { return; };
         let mut conn = match db.get_conn() {
             Ok(c) => c,
             Err(_) => return,
@@ -393,8 +394,10 @@ impl Default for NewsMonitor {
     fn default() -> Self { Self::new() }
 }
 
+// review #15: 委托给 util::truncate_chars (DRY, 之前 news_monitor + notification
+// 各自实现了一份字节级相同的 truncate).
 fn truncate_str(s: &str, max: usize) -> String {
-    if s.chars().count() <= max { s.to_string() } else { format!("{}…", s.chars().take(max).collect::<String>()) }
+    crate::util::truncate_chars(s, max)
 }
 
 /// 从公告标题中提取公司名（格式："公司名:公告内容" 或 "公司名关于..."）

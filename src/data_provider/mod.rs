@@ -217,15 +217,8 @@ impl DataFetcherManager {
             providers.push(Box::new(http_provider));
         }
 
-        let financials_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .user_agent(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
-                 AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            )
-            .build()
-            .unwrap_or_default();
+        // review #15: 复用 SHARED_FALLBACK_HTTP_CLIENT (10s timeout, 财务数据中等时长).
+        let financials_client = crate::http_client::SHARED_FALLBACK_HTTP_CLIENT.clone();
 
         Ok(Self {
             providers,
