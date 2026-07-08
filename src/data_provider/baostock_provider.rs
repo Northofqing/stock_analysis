@@ -10,9 +10,11 @@
 //! Task 6+: 真实 `get_daily_data` 实现 + 集成到 fallback chain.
 
 use anyhow::{anyhow, Result};
+use chrono::NaiveDate;
 use tokio::sync::Mutex;
 
-use super::{DataProvider, KlineData, RealtimeQuote};
+use super::stock_code_map::to_baostock;
+use super::{AdjustType, DataProvider, KlineData, RealtimeQuote};
 
 /// Baostock 默认 base URL (公开 endpoint).
 pub const BAOSTOCK_DEFAULT_BASE: &str = "http://baostock.com/baostock";
@@ -152,6 +154,136 @@ impl BaostockProvider {
             }
         }
     }
+
+    /// 异步拉取 K 线 (内部 helper, 由 `get_daily_data` sync 入口包装).
+    ///
+    /// 协议: `POST {base}/QueryHistoryKLinePlus` (form-encoded).
+    /// `adjustflag=2` (前复权) 已在 `build_kline_query_body` 写死.
+    /// 起始日期用 `days * 2` 留 buffer (含停牌日).
+    pub async fn fetch_kline_async(&self, code: &str, days: usize) -> Result<Vec<KlineData>> {
+        let sid = self.ensure_session().await?;
+        let bs_code = to_baostock(code);
+        let end_date = chrono::Local::now().date_naive();
+        let start_date = end_date - chrono::Duration::days(days as i64 * 2);
+
+        let body = build_kline_query_body(
+            &bs_code,
+            "date,open,high,low,close,volume,amount",
+            &start_date.format("%Y%m%d").to_string(),
+            &end_date.format("%Y%m%d").to_string(),
+            &sid,
+        );
+        let resp = self
+            .client
+            .post(&format!("{}/QueryHistoryKLinePlus", self.base_url))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(body)
+            .send()
+            .await?
+            .text()
+            .await?;
+        let error_code = parse_baostock_response(&resp, "ErrorCode")?
+            .ok_or_else(|| anyhow!("Baostock K线: 无 ErrorCode"))?;
+        if error_code != "0" {
+            let msg = parse_baostock_response(&resp, "ErrorMsg")?.unwrap_or_default();
+            return Err(anyhow!("Baostock K线失败: code={error_code} msg={msg}"));
+        }
+        parse_kline_body(&resp, code)
+    }
+}
+
+/// 解析 Baostock K线 CSV body → `Vec<KlineData>`.
+///
+/// 输入格式 (实测):
+/// ```text
+/// code,date,open,high,low,close,volume,amount
+/// sh.600000,2024-01-15,13.50,13.60,13.45,13.55,12345,16789.50
+/// ```
+///
+/// - 第 1 行是表头, 后续每行 1 条 K线.
+/// - `date` 格式 `"YYYY-MM-DD"`.
+/// - 解析失败的字段回退为 0.0 / 今天 (不抛 Err, 保证解析容错).
+pub fn parse_kline_body(body: &str, _our_code: &str) -> Result<Vec<KlineData>> {
+    let mut lines = body.lines();
+    let header_line = lines
+        .next()
+        .ok_or_else(|| anyhow!("Baostock K线: 空 body"))?;
+    let headers: Vec<&str> = header_line.split(',').collect();
+
+    let idx = |name: &str| -> Result<usize> {
+        headers
+            .iter()
+            .position(|h| h.trim() == name)
+            .ok_or_else(|| anyhow!("Baostock K线: 缺 {} 列", name))
+    };
+    let i_date = idx("date")?;
+    let i_open = idx("open")?;
+    let i_high = idx("high")?;
+    let i_low = idx("low")?;
+    let i_close = idx("close")?;
+    let i_volume = idx("volume")?;
+    let i_amount = idx("amount")?;
+
+    let mut result = Vec::new();
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split(',').collect();
+        if fields.len() < 7 {
+            continue;
+        }
+
+        let date = NaiveDate::parse_from_str(fields[i_date], "%Y-%m-%d")
+            .unwrap_or_else(|_| chrono::Local::now().date_naive());
+        let open: f64 = fields[i_open].parse().unwrap_or(0.0);
+        let high: f64 = fields[i_high].parse().unwrap_or(0.0);
+        let low: f64 = fields[i_low].parse().unwrap_or(0.0);
+        let close: f64 = fields[i_close].parse().unwrap_or(0.0);
+        let volume: f64 = fields[i_volume].parse().unwrap_or(0.0);
+        let amount: f64 = fields[i_amount].parse().unwrap_or(0.0);
+        let pct_chg = if open > 0.0 {
+            (close - open) / open * 100.0
+        } else {
+            0.0
+        };
+
+        result.push(KlineData {
+            date,
+            open,
+            high,
+            low,
+            close,
+            volume,
+            amount,
+            pct_chg,
+            intraday_price: None,
+            settled: true,
+            pe_ratio: None,
+            pb_ratio: None,
+            turnover_rate: None,
+            market_cap: None,
+            circulating_cap: None,
+            eps: None,
+            roe: None,
+            revenue_yoy: None,
+            net_profit_yoy: None,
+            gross_margin: None,
+            net_margin: None,
+            sharpe_ratio: None,
+            financials_history: None,
+            valuation_history: None,
+            consensus: None,
+            industry: None,
+            is_limit_up: false,
+            is_limit_down: false,
+            is_suspended: false,
+            // Baostock QueryHistoryKLinePlus 默认 adjustflag=2 (前复权), 在 build_kline_query_body 已固定.
+            adjust: AdjustType::Qfq,
+        });
+    }
+    let _ = _our_code; // 当前解析已用 baostock code, 保留参数供未来扩展 (回填本地 code).
+    Ok(result)
 }
 
 impl Default for BaostockProvider {
@@ -164,9 +296,8 @@ impl DataProvider for BaostockProvider {
     fn name(&self) -> &'static str {
         "baostock"
     }
-    fn get_daily_data(&self, _code: &str, _days: usize) -> Result<Vec<KlineData>> {
-        // Task 6 实现
-        Err(anyhow!("not yet implemented"))
+    fn get_daily_data(&self, code: &str, days: usize) -> Result<Vec<KlineData>> {
+        crate::block_on_async(self.fetch_kline_async(code, days))
     }
     fn get_stock_name(&self, _code: &str) -> Option<String> {
         None

@@ -10,6 +10,23 @@ use stock_analysis::data_provider::baostock_provider::{
 };
 
 #[test]
+fn parse_kline_body_format() {
+    // Baostock 响应格式 (实测):
+    // code,date,open,high,low,close,volume,amount
+    // sh.600000,2024-01-15,13.50,13.60,13.45,13.55,12345,16789.50
+    let body = "code,date,open,high,low,close,volume,amount\n\
+                sh.600000,2024-01-15,13.50,13.60,13.45,13.55,12345,16789.50\n\
+                sh.600000,2024-01-16,13.55,13.70,13.50,13.65,15000,20000.00\n";
+    let klines = stock_analysis::data_provider::baostock_provider::parse_kline_body(body, "600000").unwrap();
+    assert_eq!(klines.len(), 2);
+    assert_eq!(klines[0].open, 13.50);
+    assert_eq!(klines[0].close, 13.55);
+    assert_eq!(klines[0].volume, 12345.0);
+    assert_eq!(klines[0].amount, 16789.50);
+    assert_eq!(klines[1].date, chrono::NaiveDate::from_ymd_opt(2024, 1, 16).unwrap());
+}
+
+#[test]
 fn test_build_login_url() {
     assert_eq!(build_login_url(), "http://baostock.com/baostock/Login");
 }
