@@ -1,8 +1,201 @@
 # Sina + Baostock 数据源集成 — 设计文档
 
 **Date**: 2026-07-08
-**Status**: Approved (brainstorming complete)
+**Status**: Approved (brainstorming complete) + Phase 2 (News) approved
 **Author**: Claude + user
+
+---
+
+## Phase 2: 新闻数据集成 (2026-07-08 追加)
+
+### P2.1 背景
+
+现有项目新闻数据来源：
+- `Jin10` + `WallStreetCN` — 快讯，**已在用**（`search_service/providers/jin10.rs`, `wallstreetcn.rs`）
+- 公告（`announcement.rs`）— 单独路径，**已在用**
+
+**缺口**：
+- 缺 **大盘财经要闻**（A 股大盘/政策/外盘快讯）
+- 缺 **个股相关新闻**（按 code 拉相关新闻，事件驱动推送增强）
+- Jin10/WallStreetCN 是 WS 推送，**连接稳定性依赖服务在线**
+
+**目标**：加 Sina 作为**拉模式**新闻数据源，与现有 WS 推送互补（推送失败时回退拉）。
+
+### P2.2 Sina 新闻 API
+
+#### 财经要闻
+```
+GET https://feed.mix.sina.com.cn/api/roll/get
+    ?pageid=153
+    &lid=1686          # 财经要闻 lid
+    &k=
+    &num=20            # 一次 20 条
+    &page=1
+    &_=1700000000000
+→ JSON: { result: { data: [{ url, title, intro, ctime, media_name, ... }] } }
+```
+
+#### 个股新闻
+```
+GET https://feed.mix.sina.com.cn/api/roll/get
+    ?pageid=155
+    &lid=2516          # 个股新闻 lid
+    &k={code}          # 6 位 code, e.g. "600519"
+    &num=20
+    &page=1
+```
+
+### P2.3 架构
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ 实时轮询 (盘中每 1-2 分钟)                                        │
+│   monitor_loop → fetch_financial_news(num=20)                     │
+│   ├─ SinaNewsProvider.fetch_top_news() → Vec<NewsItem>  ← NEW    │
+│   ├─ 现有 Jin10 / WallStreetCN 推送 (WS)                          │
+│   └─ 双写: news_dedup (5min 去重) + news_items (详存)            │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│ 历史回溯 (盘后 1 次)                                              │
+│   post_close_review → fetch_news_for_code(code, days)            │
+│   ├─ SinaNewsProvider.fetch_stock_news(code, days_back)          │
+│   └─ 详存 news_items, 不写 dedup (dedup 仅实时去重)              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### P2.4 数据模型
+
+```rust
+// src/data_provider/news_item.rs
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewsItem {
+    pub source: String,         // "sina_financial" / "sina_stock"
+    pub external_id: String,    // Sina 返回的 url 作为 id
+    pub category: String,       // 财经要闻 / 个股新闻
+    pub code: Option<String>,   // 6 位 code (仅个股新闻)
+    pub title: String,
+    pub summary: String,        // intro 字段
+    pub url: String,
+    pub source_name: String,    // media_name 字段 (e.g. "新浪财经")
+    pub published_at: DateTime<Utc>,
+    pub fetched_at: DateTime<Utc>,
+    pub content_hash: String,   // SHA256(title+summary) 用于 dedup
+}
+```
+
+### P2.5 存储 (双写)
+
+#### news_dedup (现有)
+- 5 分钟去重窗口
+- 仅 key (content_hash)
+- 实时轮询写此表，dedup 在 `news_monitor.rs`
+
+#### news_items (新)
+```sql
+CREATE TABLE news_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    category TEXT NOT NULL,
+    code TEXT,                          -- 6 位 code, 个股新闻才有
+    title TEXT NOT NULL,
+    summary TEXT,
+    url TEXT NOT NULL,
+    source_name TEXT,
+    published_at INTEGER NOT NULL,      -- unix timestamp
+    fetched_at INTEGER NOT NULL,
+    content_hash TEXT NOT NULL,
+    UNIQUE(source, external_id)          -- dedup 索引
+);
+CREATE INDEX idx_news_items_code_time ON news_items(code, published_at);
+CREATE INDEX idx_news_items_published ON news_items(published_at);
+```
+
+双写策略：
+- `news_dedup`: 实时 (rolling 5min window), 避免 WS 推送 + Sina 拉重复
+- `news_items`: 详存 (no TTL), 用于复盘 / 查询
+
+### P2.6 组件设计
+
+```rust
+// src/data_provider/sina_news_provider.rs
+pub struct SinaNewsProvider {
+    client: reqwest::Client,
+    api_base: String,  // "https://feed.mix.sina.com.cn/api/roll/get"
+}
+
+impl SinaNewsProvider {
+    pub fn new() -> Self;
+    
+    /// 财经要闻 (大盘/政策/外盘).
+    /// lid 1686 = 财经要闻.
+    pub async fn fetch_top_news(&self, num: usize) -> Result<Vec<NewsItem>>;
+    
+    /// 个股新闻 (按 code).
+    /// lid 2516 = 个股新闻, k=code.
+    pub async fn fetch_stock_news(&self, code: &str, num: usize) -> Result<Vec<NewsItem>>;
+    
+    /// 历史回溯 (按 code + 时间范围).
+    /// Sina 不直接支持范围, 但可以分页拉然后客户端过滤.
+    pub async fn fetch_stock_news_in_range(&self, code: &str, from: DateTime, to: DateTime) -> Result<Vec<NewsItem>>;
+}
+
+fn parse_sina_news(body: &str, category: &str, code: Option<&str>) -> Result<Vec<NewsItem>> {
+    // Sina 返回 JSON: { result: { data: [...] }, result: { stat: ... } }
+    // data 数组里每个元素: { url, title, intro, ctime, media_name }
+    // 用 serde_json::Value 解析
+}
+```
+
+### P2.7 main.rs 集成
+
+```rust
+// 实时轮询
+async fn poll_news_loop() {
+    loop {
+        let news = sina_news.fetch_top_news(20).await.unwrap_or_default();
+        for item in news {
+            // 双写
+            db::with_db("news", |db| {
+                db.insert_news_dedup(&item.content_hash);
+                db.insert_news_item(&item);
+            });
+        }
+        tokio::time::sleep(Duration::from_secs(90)).await;
+    }
+}
+
+// 盘后回溯
+async fn post_close_news_review() {
+    for code in holdings {
+        let news = sina_news.fetch_stock_news_in_range(code, ...).await.unwrap_or_default();
+        for item in news {
+            db::with_db("news", |db| db.insert_news_item(&item));
+        }
+    }
+}
+```
+
+### P2.8 测试
+
+```rust
+#[tokio::test] async fn sina_top_news_returns_20_items() { ... }
+#[tokio::test] async fn sina_stock_news_600000() { ... }
+#[tokio::test] async fn parse_sina_news_extracts_fields() { ... }
+#[tokio::test] async fn news_item_dedup_skips_duplicates() { ... }
+```
+
+### P2.9 验收
+
+- [ ] Sina 新闻 API 4+ 测试通过
+- [ ] 实时轮询每 90s 拉 1 次, 写 news_items + news_dedup
+- [ ] 盘后回溯对持仓 code 拉近 30 天新闻
+- [ ] 启动 log 显示新闻轮询周期
+
+---
+
+## 1. 背景 (Phase 1, K线)
 **Scope**: 2 个免费稳定源替代/补充 review #15 的 4 源 fallback.
 
 ## 1. 背景
