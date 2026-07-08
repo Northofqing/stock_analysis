@@ -147,6 +147,8 @@ impl TradeExecutionGateway for SimulatedExecutionGateway {
             buy_price: cmd.price,
             quantity: cmd.quantity,
             status: "open".to_string(),
+            // v14.1 F7: 默认 None, 由 name LIKE 推断 (--backfill-st-type) 或 broker 推送
+            st_type: None,
         };
 
         match self.db().save_position(&new_position) {

@@ -80,6 +80,9 @@ diesel::table! {
         created_at -> Timestamp,
         updated_at -> Timestamp,
         chain_name -> Nullable<Text>,
+        // v14.1 F7: ST/*ST 标识 (T-16 ST 涨跌幅变更 dispatcher 数据源)
+        //  'ST' / '*ST' / NULL
+        st_type -> Nullable<Text>,
     }
 }
 

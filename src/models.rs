@@ -325,6 +325,10 @@ pub struct StockPosition {
     /// v12 PR3-3.1: 产业链名 (BR-015 集中度检查接入)
     #[serde(default)]
     pub chain_name: Option<String>,
+    /// v14.1 F7: ST/*ST 标识 (T-16 ST 涨跌幅变更 dispatcher 数据源)
+    ///   "ST" → ST 类, "*ST" → *ST 类, NULL → 普通股
+    #[serde(default)]
+    pub st_type: Option<String>,
 }
 
 /// 插入新的模拟持仓记录
@@ -337,6 +341,8 @@ pub struct NewStockPosition {
     pub buy_price: f64,
     pub quantity: i32,
     pub status: String,
+    /// v14.1 F7: ST/*ST 标识 (默认 None → 普通股)
+    pub st_type: Option<String>,
 }
 
 // ============================================================================

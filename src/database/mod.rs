@@ -363,6 +363,7 @@ impl DatabaseManager {
                 return_rate REAL,
                 created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                st_type TEXT,
                 UNIQUE(code, buy_date)
             )
             "#,
@@ -383,6 +384,13 @@ impl DatabaseManager {
         // 旧库可能没有, 用 add_column_if_missing 包一层 (SQLite 1.06 无 ADD COLUMN IF NOT EXISTS)
         Self::add_column_if_missing(conn, "stock_position", "chain_name", "TEXT DEFAULT '其他'")?;
         diesel::sql_query("CREATE INDEX IF NOT EXISTS idx_stock_position_chain_name ON stock_position(chain_name)")
+            .execute(&mut *conn).ok();
+
+        // v14.1 F7: stock_position 加 st_type 列 (TEXT: 'ST' / '*ST' / NULL)
+        // T-16 ST 涨跌幅变更 dispatcher 数据源. 由 --backfill-st-type 从 name 字段回填,
+        // 后续 broker/exchange 推送时更新. 无 CHECK 约束 (SQLite ALTER ADD COLUMN 不支持)
+        Self::add_column_if_missing(conn, "stock_position", "st_type", "TEXT")?;
+        diesel::sql_query("CREATE INDEX IF NOT EXISTS idx_stock_position_st_type ON stock_position(st_type)")
             .execute(&mut *conn).ok();
 
         // trades 表（v3 每笔买卖独立记录，与 stock_position 互补）
