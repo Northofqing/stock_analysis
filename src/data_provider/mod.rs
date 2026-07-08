@@ -3,6 +3,7 @@
 //! 提供多种数据源的统一接口
 
 pub mod announcement;
+pub mod chain_registry;
 pub mod chip_distribution;
 pub mod consensus;
 pub mod eastmoney_provider;

@@ -941,15 +941,15 @@ async fn main() {
 
     // v14.1 BR-015: chain_name 缺失统计 (实算留给 chain registry 接入)
     if backfill_chain_name {
-        log::info!("[v14.1 BR-015] --backfill-chain-name 模式启动 | 统计 chain_name 缺失");
+        log::info!("[v14.1 BR-015] --backfill-chain-name 模式启动 | 用 chain_registry 实算");
         use stock_analysis::database::DatabaseManager;
         let db = DatabaseManager::get();
-        match db.count_missing_chain_name() {
-            Ok((total, missing)) => log::info!(
-                "[v14.1 BR-015] open 持仓 {} 条, chain_name 缺失 {} 条 (待 chain registry 接入后实算)",
-                total, missing
+        match db.backfill_chain_name() {
+            Ok((updated, missing)) => log::info!(
+                "[v14.1 BR-015] 回填完成 | 更新 {} 条, 仍缺失 {} 条 (查不到 chain 或未在 registry)",
+                updated, missing
             ),
-            Err(e) => log::error!("[v14.1 BR-015] 统计失败: {}", e),
+            Err(e) => log::error!("[v14.1 BR-015] 回填失败: {}", e),
         }
         std::process::exit(0);
     }

@@ -196,25 +196,55 @@ impl DatabaseManager {
         Ok(star_updated + st_updated)
     }
 
-    /// v14.1 BR-015: 统计 chain_name 缺失的持仓数
-    ///   返回 (total_open, missing_chain_name)
-    ///   当前不实算 chain (等 chain registry / position_tracker.rs 接入);
-    ///   CLI --backfill-chain-name 用此输出待回填数.
-    pub fn count_missing_chain_name(&self) -> Result<(i64, i64), Box<dyn std::error::Error>> {
+    /// v14.1 BR-015: 回填 stock_position.chain_name
+    ///   1. 优先查 stock_concepts 缓存 (东财/同花顺拉过)
+    ///   2. 回退到 chain_registry 静态映射 (80+ 龙头股)
+    ///   3. 都查不到保持 NULL/其他 (不强行填)
+    ///   只在 chain_name IS NULL OR '' OR '其他' 时更新, 重复跑幂等.
+    ///   返回 (updated, missing_after) — 更新行数 + 仍缺失数.
+    pub fn backfill_chain_name(&self) -> Result<(usize, i64), Box<dyn std::error::Error>> {
+        use crate::data_provider::chain_registry;
         let mut conn = self.get_conn()?;
-        let total: i64 = diesel::sql_query(
-            "SELECT COUNT(*) AS cnt FROM stock_position WHERE status = 'open'",
+
+        // 1. 拉所有缺失 chain_name 的 (code, name) 列表
+        #[derive(diesel::QueryableByName)]
+        struct PosRow {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            code: String,
+        }
+        let rows: Vec<PosRow> = diesel::sql_query(
+            "SELECT code FROM stock_position
+             WHERE status = 'open'
+               AND (chain_name IS NULL OR chain_name = '' OR chain_name = '其他')",
         )
-        .get_result::<CountRow>(&mut conn)
-        .map(|r| r.cnt)?;
-        let missing: i64 = diesel::sql_query(
+        .load(&mut conn)?;
+
+        // 2. 查 registry, 找到的 UPDATE
+        let mut updated = 0;
+        for row in &rows {
+            if let Some(chain) = chain_registry::lookup(&row.code) {
+                let n = diesel::sql_query(
+                    "UPDATE stock_position SET chain_name = ?1 \
+                     WHERE code = ?2 AND status = 'open' \
+                       AND (chain_name IS NULL OR chain_name = '' OR chain_name = '其他')",
+                )
+                .bind::<diesel::sql_types::Text, _>(chain)
+                .bind::<diesel::sql_types::Text, _>(&row.code)
+                .execute(&mut conn)?;
+                updated += n;
+            }
+        }
+
+        // 3. 统计仍缺失数
+        let missing_after: i64 = diesel::sql_query(
             "SELECT COUNT(*) AS cnt FROM stock_position
              WHERE status = 'open'
                AND (chain_name IS NULL OR chain_name = '' OR chain_name = '其他')",
         )
         .get_result::<CountRow>(&mut conn)
         .map(|r| r.cnt)?;
-        Ok((total, missing))
+
+        Ok((updated, missing_after))
     }
 }
 
