@@ -2888,6 +2888,16 @@ async fn push_e2e_news_modules(hhmm: &str) {
     );
     log::info!("[v70] D-01 推 ({} 字)", d01.chars().count());
     let _ = notify::push_governor(&d01, notify::PushKind::NewsToIdea).await;
+    // v70+: 落盘推荐记录 (供后续 D+1 兑现分析)
+    notify::record_news_recommendation(
+        "D-01",
+        "002916",
+        "深南电路",
+        "AI 算力",
+        &["PCB 涨价 12%", "算力国产替代加速"],
+        Some("BuyDip"),
+        None,
+    );
 
     // I-02 新闻催化映射 (mock)
     let i02 = pt::render_news_catalyst(
@@ -2904,6 +2914,21 @@ async fn push_e2e_news_modules(hhmm: &str) {
     );
     log::info!("[v70] I-02 推 ({} 字)", i02.chars().count());
     let _ = notify::push_governor(&i02, notify::PushKind::NewsCatalyst).await;
+    // v70+: 落盘 I-02 推荐 (多票, 每票写一条)
+    for (name, code, chg, reason) in [
+        ("深南电路", "002916", Some(10.0_f64), "PCB 龙头, Q1 业绩超预期"),
+        ("沪电股份", "002463", Some(9.5_f64), "800G 交换机 PCB 受益"),
+    ] {
+        notify::record_news_recommendation(
+            "I-02",
+            code,
+            name,
+            "AI 算力",
+            &[reason],
+            None,
+            chg,
+        );
+    }
 }
 
 /// v70: 推所有盘中 14.x 模板 (mock fallback)

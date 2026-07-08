@@ -398,6 +398,54 @@ fn save_push_log(text: &str) {
     }
 }
 
+/// v70+: 新闻推荐落盘 (D-01 / I-02 推荐时 → D+1 兑现 关联)
+///   - 文件: data/d01_recommendations_YYYY-MM-DD.jsonl (按天)
+///   - 字段: ts (推送时间), template (D-01/I-02), code, name, theme, reason (3 条), action, price
+///   - 后续: 跟 news_outcome_YYYY-MM-DD.md 关联 (D+1 兑现 → 胜率)
+///   - 调用: push_news_recommendation() 在 notify::push_governor(D-01/I-02) 后调
+pub fn record_news_recommendation(
+    template: &str,
+    code: &str,
+    name: &str,
+    theme: &str,
+    reason: &[&str],
+    action: Option<&str>,
+    price: Option<f64>,
+) {
+    use std::fs::{create_dir_all, OpenOptions};
+    use std::io::Write;
+    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let dir = std::path::PathBuf::from("data").join("d01_recommendations");
+    if let Err(e) = create_dir_all(&dir) {
+        log::warn!("[v70+] d01_recommendations 目录创建失败: {}", e);
+        return;
+    }
+    let path = dir.join(format!("{}.jsonl", date));
+    let reason_json: Vec<String> = reason.iter().map(|s| s.to_string()).collect();
+    let entry = serde_json::json!({
+        "ts": ts,
+        "template": template,
+        "code": code,
+        "name": name,
+        "theme": theme,
+        "reason": reason_json,
+        "action": action.unwrap_or(""),
+        "price": price.unwrap_or(0.0),
+        "outcome": null, // 后续回填
+    });
+    match OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(mut f) => {
+            if let Err(e) = writeln!(f, "{}", entry) {
+                log::warn!("[v70+] d01_recommendations 写入失败: {}", e);
+            } else {
+                log::info!("[v70+] 落盘推荐: {} ({}) → {}", template, code, path.display());
+            }
+        }
+        Err(e) => log::warn!("[v70+] d01_recommendations 创建文件失败: {}", e),
+    }
+}
+
 /// v42: 测试用 — 重置冷却 memo
 #[cfg(test)]
 pub fn _reset_cooldown_memo_for_test() {
