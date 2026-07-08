@@ -208,9 +208,14 @@ pub fn detect_and_register() -> BrokerSource {
         }
         "magiclaw" => {
             // 现有 magiclaw 模拟盘 — 当前 NoopBroker 占位 (后续 impl BrokerPush)
-            log::info!("[broker] magiclaw 模拟盘路径 — 当前 NoopBroker 占位");
+            // v14.1 review fix: 诚实返回 Noop 而非 Magiclaw, 跟实际注册的 impl 匹配
+            //   之前 label 说 "magiclaw" 但 with() 调 NoopBroker, operator 被误导
+            log::warn!(
+                "[broker] BROKER_SOURCE=magiclaw 但 MagiclawBroker 尚未实现, \
+                 降级 NoopBroker (label 也将显示 noop). 后续 impl 后启用."
+            );
             register(Box::new(NoopBroker));
-            BrokerSource::Magiclaw
+            BrokerSource::Noop
         }
         "public" | "" => {
             log::info!("[broker] 公开数据路径 (东财 push2 + 雅虎, 免费, 当前默认)");
