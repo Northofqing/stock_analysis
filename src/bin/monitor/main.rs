@@ -873,6 +873,9 @@ async fn main() {
     let backfill_outcome_date: Option<String> = std::env::args()
         .find_map(|a| a.strip_prefix("--backfill-outcome=").map(|s| s.to_string()));
 
+    // v14.1 F7: stock_position.st_type 回填 (从 name LIKE 推断 ST/*ST)
+    let backfill_st_type = std::env::args().any(|a| a == "--backfill-st-type");
+
     // v14.1 BR-015: stock_position.chain_name 缺失统计 (待 chain registry 接入)
     let backfill_chain_name = std::env::args().any(|a| a == "--backfill-chain-name");
 
@@ -921,6 +924,18 @@ async fn main() {
         use stock_analysis::opportunity::news_outcome::backfill_recommendations_outcome;
         let updated = backfill_recommendations_outcome(&date);
         log::info!("[v70+] 回填完成 | {} | 更新行数 = {}", date, updated);
+        std::process::exit(0);
+    }
+
+    // v14.1 F7: stock_position.st_type 回填 (从 name LIKE 推断)
+    if backfill_st_type {
+        log::info!("[v14.1 F7] --backfill-st-type 模式启动 | 从 name 字段推断 ST/*ST");
+        use stock_analysis::database::DatabaseManager;
+        let db = DatabaseManager::get();
+        match db.backfill_st_type() {
+            Ok(n) => log::info!("[v14.1 F7] 回填完成 | 更新行数 = {}", n),
+            Err(e) => log::error!("[v14.1 F7] 回填失败: {}", e),
+        }
         std::process::exit(0);
     }
 
