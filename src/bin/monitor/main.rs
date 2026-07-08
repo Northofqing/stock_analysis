@@ -2864,6 +2864,12 @@ async fn e2e_all_templates_run() {
     log::info!("[v70] 4/4 跑新闻模块 (D-01 / I-02 mock fallback)");
     push_e2e_news_modules(&hhmm).await;
 
+    // 5. v14.1 task #163: T-16 ST 涨跌幅变更 e2e 真接 (seed 一只 ST 持仓, 调 dispatcher, 推完清理)
+    //   真实路径在 main_loop 9:30 触发 + 真实 ST 持仓. e2e mock 一只, 验证 get_st_positions +
+    //   dispatch_st_price_limit_changed 数据流通.
+    log::info!("[v70] 5/5 T-16 ST 涨跌幅变更 e2e (mock ST 持仓)");
+    push_e2e_t16_st_price_limit(&hhmm).await;
+
     log::info!("[v70] E2E 完成 — 检查 data/push_log/{}/ 查所有推送", today_str);
 }
 
@@ -2964,6 +2970,70 @@ async fn push_e2e_news_modules(hhmm: &str) {
             chg,
         );
     }
+}
+
+/// v14.1 task #163: T-16 ST 涨跌幅变更 e2e 验证
+///   步骤: 1) seed 一只 st_type='*ST' 持仓 (代码 600090 测试用)
+///         2) 调 portfolio::get_st_positions() 验证非空
+///         3) 调 push_templates::dispatch_st_price_limit_changed() 推 1 条
+///         4) DELETE 清理 (e2e 不能污染真实 DB)
+async fn push_e2e_t16_st_price_limit(hhmm: &str) {
+    use std::process::Command;
+    let db_path = "data/stock_analysis.db";
+
+    // 1. Seed: insert 一只 *ST 持仓 (买价 5.00, 1000 股, st_type='*ST')
+    let seed_sql = "INSERT OR REPLACE INTO stock_position \
+        (code, name, buy_date, buy_price, quantity, status, st_type, chain_name, created_at, updated_at) \
+        VALUES ('600090', '*ST测试', '2026-07-01', 5.00, 1000, 'open', '*ST', '其他', \
+                CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)";
+    let seed_out = Command::new("sqlite3").args([db_path, seed_sql]).output();
+    if let Err(e) = &seed_out {
+        log::warn!("[v14.1 #163] seed 失败: {}", e);
+        return;
+    }
+
+    // 2. 验证 get_st_positions 非空
+    let st_positions = stock_analysis::portfolio::get_st_positions();
+    if st_positions.is_empty() {
+        log::warn!("[v14.1 #163] get_st_positions 仍为空 (seed 失败?) — 跳过推");
+        // 清理
+        let _ = Command::new("sqlite3")
+            .args([db_path, "DELETE FROM stock_position WHERE code='600090' AND name='*ST测试'"])
+            .output();
+        return;
+    }
+    log::info!("[v14.1 #163] get_st_positions 找到 {} 只 ST 持仓", st_positions.len());
+
+    // 3. 调 T-16 dispatcher 推 1 条
+    use push_templates as pt;
+    for pos in &st_positions {
+        let st_type = if pos.star_st { pt::StType::StarST } else { pt::StType::ST };
+        let now_price = pos.cost_price * 1.02;
+        let new_stop = pos.cost_price * 0.90;
+        let new_take = pos.cost_price * 1.10;
+        let banner = current_banner();
+        let _ = pt::dispatch_st_price_limit_changed(
+            hhmm,
+            &pos.name,
+            &pos.code,
+            st_type,
+            0.05, 0.10, // 5% → 10% 新规
+            pos.shares as u32,
+            pos.cost_price,
+            now_price,
+            Some(new_stop),
+            Some(new_take),
+            &banner,
+        )
+        .await;
+    }
+    log::info!("[v14.1 #163] T-16 已推 {} 条", st_positions.len());
+
+    // 4. 清理 (e2e 不能污染真实 DB)
+    let _ = Command::new("sqlite3")
+        .args([db_path, "DELETE FROM stock_position WHERE code='600090' AND name='*ST测试'"])
+        .output();
+    log::info!("[v14.1 #163] T-16 e2e seed 已清理");
 }
 
 /// v70: 推所有盘中 14.x 模板 (mock fallback)
