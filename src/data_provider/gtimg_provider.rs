@@ -295,10 +295,10 @@ impl GtimgProvider {
     /// 获取股票名称（静态异步方法）
     async fn fetch_stock_name_internal(client: &reqwest::Client, code: &str) -> Option<String> {
         let (_, market_code) = Self::normalize_for_tencent(code)?;
-        
+
         // 使用腾讯实时行情接口获取股票名称
         let url = format!("http://qt.gtimg.cn/q={}", market_code);
-        
+
         match client.get(&url)
             .header("Referer", "http://gu.qq.com/")
             .timeout(std::time::Duration::from_secs(5))
@@ -312,16 +312,19 @@ impl GtimgProvider {
                         if let Some(end) = text.rfind('"') {
                             if start < end {
                                 let data = &text[start + 1..end];
-                                // review #14: splitn(2, '~') 只切前 2 段 (50+ 字段 → 2 元素 Vec).
-                                let parts: Vec<&str> = data.splitn(2, '~').collect();
-                                if parts.len() > 1 {
-                                    let name = parts[1].to_string();
-                                    if !name.is_empty() {
-                                        log::debug!("[腾讯] 获取股票名称: {} -> {}", code, name);
-                                        return Some(name);
-                                    }
+                                // v13.10.6: 修复 review #14 引入的 bug
+                                //   旧: splitn(2, '~') → parts[1] = "雷科防务~002413~15.00~..." (整个尾部)
+                                //   新: splitn(3, '~').nth(1) = "雷科防务" (第二个字段, 即股票名)
+                                let name = data
+                                    .splitn(3, '~')
+                                    .nth(1)
+                                    .map(|s| s.trim().to_string())
+                                    .filter(|s| !s.is_empty());
+                                if let Some(name) = name {
+                                    log::debug!("[腾讯] 获取股票名称: {} -> {}", code, name);
+                                    return Some(name);
                                 }
-                                log::debug!("[腾讯] 股票名称解析失败，字段不足或名称为空: code={}, text={}", code, text);
+                                log::debug!("[腾讯] 股票名称解析失败: code={}, text={}", code, text);
                             }
                         }
                     }
@@ -536,6 +539,33 @@ mod tests {
                 println!("获取数据失败（可能是网络问题）: {}", e);
             }
         }
+    }
+
+    /// v13.10.6: 验证 review #14 修复后, parse 不再吞掉股票名
+    /// 腾讯返回: `v_sz002413="51~雷科防务~002413~15.00~..."`
+    /// 旧 splitn(2, '~').collect()[1] = "雷科防务~002413~15.00~..." (整个尾部)
+    /// 新 splitn(3, '~').nth(1) = "雷科防务" (第二个字段)
+    #[test]
+    fn test_parse_name_does_not_inject_quote_data() {
+        let data = "51~雷科防务~002413~15.00~15.50~52080~24286~27817";
+        let name: Option<String> = data
+            .splitn(3, '~')
+            .nth(1)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        assert_eq!(name.as_deref(), Some("雷科防务"), "应只取第二个字段");
+    }
+
+    /// v13.10.6: 单元素 (异常格式) 应返回 None
+    #[test]
+    fn test_parse_name_handles_short_response() {
+        let data = "51";
+        let name: Option<String> = data
+            .splitn(3, '~')
+            .nth(1)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        assert!(name.is_none(), "单元素应返回 None (避免空 name)");
     }
     
     #[test]
