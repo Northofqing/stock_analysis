@@ -19,6 +19,7 @@ pub mod intraday_kline;
 pub mod money_flow;
 pub mod rustdx_provider;
 pub mod service;
+pub mod sina_provider;
 pub mod stock_code_map;
 pub mod valuation_history;
 pub mod yahoo;

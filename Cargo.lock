@@ -5491,6 +5491,7 @@ dependencies = [
  "dashmap 6.2.1",
  "diesel",
  "dotenvy",
+ "encoding_rs",
  "env_logger",
  "futures",
  "hex",

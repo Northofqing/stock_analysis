@@ -46,6 +46,7 @@ lettre = { version = "0.11.19", features = ["smtp-transport", "sendmail-transpor
 clap = { version = "4.5.54", features = ["derive"] }
 rustdx-complete = "=1.0.0"
 urlencoding = "2.1"
+encoding_rs = "0.8"
 plotters = "0.3"
 image = "0.25"
 futures = "0.3"
