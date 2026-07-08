@@ -2309,11 +2309,20 @@ pub struct NewsToIdeaSnapshot {
     pub code: String,
     pub reasons: Vec<String>,
     pub action: Option<NewsAction>,
+    /// v13.10.5: LLM 生成的更具体 reasons (替代 evidence 截取)
+    /// 非空时 build 阶段优先用此字段
+    pub llm_reasons: Vec<String>,
 }
 
 /// v15.5: 构造 NewsToIdeaParams
+///
+/// v13.10.5: llm_reasons 非空时优先 (LLM 生成的更具体原因)
 pub fn build_news_to_idea_from_snapshot<'a>(s: &'a NewsToIdeaSnapshot) -> NewsToIdeaParams<'a> {
-    let reasons_ref: Vec<&'a str> = s.reasons.iter().map(|r| r.as_str()).collect();
+    let reasons_ref: Vec<&'a str> = if !s.llm_reasons.is_empty() {
+        s.llm_reasons.iter().map(|r| r.as_str()).collect()
+    } else {
+        s.reasons.iter().map(|r| r.as_str()).collect()
+    };
     NewsToIdeaParams {
         hhmm: &s.hhmm,
         headline: &s.headline,
@@ -2458,6 +2467,7 @@ pub fn load_news_to_idea_snapshot_real(hhmm: &str) -> NewsToIdeaSnapshot {
         code: top.code.clone(),
         reasons,
         action,
+        llm_reasons: vec![],
     }
 }
 
@@ -2496,11 +2506,50 @@ pub fn _reset_d01_memo_for_test() {
 /// v15.5 业务层入口 (v16.4 改用真实候选台数据)
 /// v29: 加 dispatcher 内部 memo (1h/票) — 防止公告密集时同票刷屏
 pub async fn dispatch_news_to_idea_daily(hhmm: &str, banner: &BannerCtx) -> bool {
-    let snapshot = load_news_to_idea_snapshot_real(hhmm);
+    let mut snapshot = load_news_to_idea_snapshot_real(hhmm);
     if snapshot.headline.is_empty() {
         log_dispatcher_attempt("D-01", false, 0, "news_to_idea_snapshot empty");
         log::info!("[D-01] news_to_idea_snapshot 空 (候选台无候选), 跳过推送");
         return false;
+    }
+
+    // v13.10.5: LLM 路径 — 给已选 top 票生成更具体的原因 (替代 evidence 截取)
+    // 失败 / 未配置 / 0 命中 → 静默降级, 用原 reasons
+    let llm_registry = stock_analysis::llm::LlmRegistry::from_env();
+    if let Some(provider) = llm_registry.select("news_to_idea") {
+        log::info!("[D-01] LLM 原因生成 provider={} model={}", provider.name(), provider.model());
+        let user_prompt = format!(
+            "新闻: {}\n板块: {}\n个股: {}({})\n\n请给出 1-3 条具体的'为什么这只票是首选'原因 (各 1-2 句, 用 A 股投资逻辑)",
+            snapshot.headline, snapshot.theme, snapshot.name, snapshot.code
+        );
+        match provider.chat_json(
+            "你是 A 股投资研究员. 从新闻 + 板块 + 个股上下文, 给出 1-3 条具体投资逻辑. 输出 JSON: {\"reasons\":[\"PCB 涨价直接传导到毛利\",\"800G 交换机放量拉动订单\"]}",
+            &user_prompt,
+        ).await {
+            Ok(value) => {
+                let arr = value.get("reasons").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                let llm_reasons: Vec<String> = serde_json::from_value::<Vec<String>>(serde_json::Value::Array(arr))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|s: &String| !s.trim().is_empty())
+                    .take(3)
+                    .collect();
+                if !llm_reasons.is_empty() {
+                    log::info!("[D-01] LLM 生成 {} 条 reasons", llm_reasons.len());
+                    for r in &llm_reasons {
+                        log::info!("[D-01]   LLM reason: {}", r);
+                    }
+                    snapshot.llm_reasons = llm_reasons;
+                } else {
+                    log::info!("[D-01] LLM reasons 为空, 用原 evidence");
+                }
+            }
+            Err(e) => {
+                log::warn!("[D-01] LLM 生成失败: {}, 用原 evidence", e);
+            }
+        }
+    } else {
+        log::info!("[D-01] LLM 未配置, 用原 evidence");
     }
 
     // v29 + v59: memo 1h/票 (F5 修复 — 仅 push 成功才 insert, 防止 transient 失败自我阻塞)
@@ -6380,6 +6429,7 @@ mod tests {
             code: "603019".to_string(),
             reasons: vec!["AI算力龙头".to_string(), "业绩超预期".to_string()],
             action: Some(NewsAction::BuyDip),
+            llm_reasons: vec![],
         };
         let p = build_news_to_idea_from_snapshot(&s);
         assert_eq!(p.headline, "英伟达H200发布");
@@ -6404,6 +6454,48 @@ mod tests {
         let s = load_news_to_idea_snapshot("10:30");
         assert!(s.headline.is_empty());
         assert!(s.reasons.is_empty());
+    }
+
+    /// v13.10.5: D-01 LLM 路径 — llm_reasons 非空时优先
+    #[test]
+    fn v13_10_5_d01_llm_reasons_take_precedence() {
+        let s = NewsToIdeaSnapshot {
+            hhmm: "10:30".to_string(),
+            headline: "PCB 涨价 12%".to_string(),
+            theme: "PCB".to_string(),
+            stage: NewsStage::Starting,
+            name: "深南电路".to_string(),
+            code: "002916".to_string(),
+            reasons: vec!["多源验证".to_string()],
+            action: Some(NewsAction::BuyDip),
+            llm_reasons: vec![
+                "PCB 涨价 12% 直接传导到毛利".to_string(),
+                "800G 交换机订单超预期".to_string(),
+                "国产替代加速".to_string(),
+            ],
+        };
+        let p = build_news_to_idea_from_snapshot(&s);
+        assert_eq!(p.reasons.len(), 3, "应使用 llm_reasons (3 条)");
+        assert!(p.reasons[0].contains("PCB"));
+    }
+
+    /// v13.10.5: D-01 降级 — llm_reasons 空时用原 evidence
+    #[test]
+    fn v13_10_5_d01_fallback_to_evidence() {
+        let s = NewsToIdeaSnapshot {
+            hhmm: "10:30".to_string(),
+            headline: "PCB".to_string(),
+            theme: "PCB".to_string(),
+            stage: NewsStage::Fermenting,
+            name: "深南电路".to_string(),
+            code: "002916".to_string(),
+            reasons: vec!["多源验证".to_string(), "放量突破".to_string()],
+            action: Some(NewsAction::Observe),
+            llm_reasons: vec![],
+        };
+        let p = build_news_to_idea_from_snapshot(&s);
+        assert_eq!(p.reasons.len(), 2);
+        assert_eq!(p.reasons[0], "多源验证");
     }
 
     // ====== v15.6: A-01 业务层集成测试 (paper_review 抽口) ======
