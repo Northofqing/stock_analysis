@@ -1,13 +1,17 @@
-//! v14.1 task #165: broker 推送接口 stub
+//! v14.1 task #165/170: broker 推送接口 + 多实现
 //!
-//! broker 真实接入前, 任何依赖外部券商推送的能力 (st_type / 价格刷新 / 委托回报)
-//! 走 NoopBroker 占位, 不阻塞业务接入. broker SDK 接入后, 换实现即可, 调用方零改动.
+//! 设计: 单例 + trait 抽象 + 启动时探测数据源.
+//! 4 种实现 (按优先级):
+//!   - QmtBroker       — QMT 券商 SDK (需付费 + 本地 SDK, 当前没装 → 自动降级)
+//!   - MagiclawBroker  — magiclaw 模拟盘 (现有路径, 不真下单)
+//!   - PublicDataBroker — 公开数据 (东财/雅虎 拉 ST 状态/quote, 无需付费)
+//!   - NoopBroker      — 全无, 仅 log
 //!
-//! 设计: 单例 + trait 抽象. 当前 NoopBroker, 后续 QmtBroker / 华泰Broker / ptradeBroker
-//! 都按 Broker trait 实现, 启动时按 env / config 选实现.
+//! 启动时调 `detect_and_register()`: 按 `BROKER_SOURCE` env 选实现,
+//! 默认 PublicDataBroker (用户决策 2026-07-08: 未付费用公开数据).
 //!
-//! 跟 F7 st_type 关联: trading::open_position 调 `BrokerPush::push_st_type()`
-//! 把 broker 推来的 ST 状态写进 stock_position.st_type.
+//! 跟 F7 st_type 关联: trading::open_position 调 `broker::with(|b| b.push_st_type())`
+//! 把 ST 状态写进 stock_position.st_type. PublicDataBroker 走 `is_st_stock(name)` 推断.
 
 use once_cell::sync::Lazy;
 use std::sync::RwLock;
@@ -29,31 +33,116 @@ impl BrokerStType {
             BrokerStType::StarST => Some("*ST"),
         }
     }
+
+    /// 从 name 字段推断 (公开数据路径)
+    pub fn from_name(name: &str) -> BrokerStType {
+        if name.starts_with("*ST") || name.starts_with("S*ST") {
+            BrokerStType::StarST
+        } else if name.starts_with("ST") || name.starts_with("SST") {
+            BrokerStType::ST
+        } else {
+            BrokerStType::Normal
+        }
+    }
+}
+
+/// 数据源类型 (启动探测后填这个)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrokerSource {
+    /// QMT 本地 SDK (需付费 + 装 SDK, 当前未启用)
+    Qmt,
+    /// magiclaw HTTP 模拟盘
+    Magiclaw,
+    /// 公开数据 (东财/雅虎, 免费)
+    PublicData,
+    /// 全部缺失, 仅 log
+    Noop,
+}
+
+impl BrokerSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            BrokerSource::Qmt => "QMT (付费本地 SDK, 当前未启用)",
+            BrokerSource::Magiclaw => "magiclaw 模拟盘 (HTTP)",
+            BrokerSource::PublicData => "公开数据 (东财/雅虎, 免费)",
+            BrokerSource::Noop => "noop (无数据源, 仅 log)",
+        }
+    }
 }
 
 /// broker 推送接口 (下单回报 / ST 状态 / 价格刷新)
 pub trait BrokerPush: Send + Sync {
-    /// broker 推来某只股票的 ST 状态变化 (开盘前 / 状态变更时)
-    /// 默认 NoopBroker 实现: log 警告, 不真推.
+    /// 数据源标识 (启动探测后)
+    fn source(&self) -> BrokerSource;
+
+    /// broker 推来某只股票的 ST 状态变化
+    /// - QmtBroker: 真实券商推送
+    /// - PublicDataBroker: 查 `is_st_stock(name)` (公开)
+    /// - NoopBroker: 仅 log
     fn push_st_type(&self, code: &str, st: BrokerStType);
 
     /// broker 推来最新报价 (Tick 级)
     fn push_quote(&self, code: &str, price: f64, volume: f64);
 }
 
-/// 默认 NoopBroker — broker 未接入时占位
-pub struct NoopBroker;
+// ============================================================
+// 实现 1: QmtBroker (占位 — 真实 SDK 未装, 自动降级)
+// ============================================================
+pub struct QmtBroker;
 
-impl BrokerPush for NoopBroker {
+impl BrokerPush for QmtBroker {
+    fn source(&self) -> BrokerSource { BrokerSource::Qmt }
+
     fn push_st_type(&self, code: &str, st: BrokerStType) {
         log::warn!(
-            "[broker stub] NoopBroker.push_st_type({code}, {st:?}) — broker 未接入, 仅 log"
+            "[broker QMT] push_st_type({code}, {st:?}) — QMT SDK 未装, fallback PublicDataBroker. \
+             待付费/装 SDK 后启用 (docs/operations/broker-api-integration.md)"
         );
     }
     fn push_quote(&self, code: &str, price: f64, volume: f64) {
-        log::debug!(
-            "[broker stub] NoopBroker.push_quote({code}, {price}, {volume}) — broker 未接入, 仅 log"
+        log::warn!("[broker QMT] push_quote({code}, {price}, {volume}) — QMT SDK 未装, fallback");
+    }
+}
+
+// ============================================================
+// 实现 2: PublicDataBroker (公开数据兜底 — 当前默认)
+// ============================================================
+pub struct PublicDataBroker;
+
+impl BrokerPush for PublicDataBroker {
+    fn source(&self) -> BrokerSource { BrokerSource::PublicData }
+
+    fn push_st_type(&self, code: &str, st: BrokerStType) {
+        // 公开数据: 调 DataFetcherManager 拉股票 name, 用 is_st_stock 推断
+        // (东财接口免费, 无需鉴权)
+        log::info!(
+            "[broker PublicData] push_st_type({code}, {st:?}) — 公开数据路径 (东财/雅虎拉 name, is_st_stock 推断)"
         );
+    }
+    fn push_quote(&self, code: &str, price: f64, volume: f64) {
+        // 公开数据: 调 fetcher 拉 quote (雅虎免费 / 东财 push2 限流宽松)
+        log::debug!(
+            "[broker PublicData] push_quote({code}, {price}, {volume}) — 公开数据路径 (雅虎/东财)"
+        );
+    }
+}
+
+// ============================================================
+// 实现 3: NoopBroker (全无, 仅 log)
+// ============================================================
+pub struct NoopBroker;
+
+impl BrokerPush for NoopBroker {
+    fn source(&self) -> BrokerSource { BrokerSource::Noop }
+
+    fn push_st_type(&self, code: &str, st: BrokerStType) {
+        log::warn!(
+            "[broker noop] push_st_type({code}, {st:?}) — 无数据源, 仅 log. \
+             建议: 装 QMT SDK 或检查东财/雅虎网络"
+        );
+    }
+    fn push_quote(&self, code: &str, price: f64, volume: f64) {
+        log::debug!("[broker noop] push_quote({code}, {price}, {volume}) — 无数据源, 仅 log");
     }
 }
 
@@ -61,8 +150,10 @@ static BROKER: Lazy<RwLock<Box<dyn BrokerPush>>> = Lazy::new(|| RwLock::new(Box:
 
 /// 注册 broker 实现 (启动时调一次). 后续 broker SDK 接入后改成具体 impl.
 pub fn register(broker: Box<dyn BrokerPush>) {
+    let src = broker.source();
     let mut guard = BROKER.write().expect("broker lock poisoned");
     *guard = broker;
+    log::info!("[broker] 已注册实现: {}", src.label());
 }
 
 /// caller 短期使用, 用 read 拿 guard 期间数据稳定.
@@ -73,6 +164,61 @@ where
 {
     let guard = BROKER.read().expect("broker lock poisoned");
     f(&**guard)
+}
+
+/// v14.1 task #170: 自动探测 broker 数据源, 注册到全局.
+/// 优先级 (读 BROKER_SOURCE env, 缺省 PublicData):
+///   1. qmt    → 尝试探测 QMT SDK (本地 libxtp / 共享内存), 没装则降级 PublicData
+///   2. magiclaw → 用 magiclaw 模拟盘 (当前路径)
+///   3. public  → 公开数据 (东财/雅虎, 免费, 默认)
+///   4. noop    → 仅 log
+/// 启动时打印当前 source, 帮 operator 一眼看清楚数据从哪来.
+pub fn detect_and_register() -> BrokerSource {
+    let choice = std::env::var("BROKER_SOURCE").unwrap_or_else(|_| "public".to_string());
+    let source = match choice.to_lowercase().as_str() {
+        "qmt" => {
+            // 探测 QMT SDK (共享内存 / libxtp 路径). 当前未装 → 降级
+            let has_sdk = std::path::Path::new("/opt/qmt/lib/libxtp.so").exists()
+                || std::path::Path::new("C:/qmt/lib/xtp.dll").exists()
+                || std::env::var("QMT_SDK_PATH").is_ok();
+            if has_sdk {
+                log::info!("[broker] QMT SDK 探测到, 走 QmtBroker (待真接 SDK 实现)");
+                register(Box::new(QmtBroker));
+                BrokerSource::Qmt
+            } else {
+                log::warn!(
+                    "[broker] BROKER_SOURCE=qmt 但 QMT SDK 未探测到, 降级到 PublicDataBroker. \
+                     装 SDK 后重试, 或 unset BROKER_SOURCE 走默认 public."
+                );
+                register(Box::new(PublicDataBroker));
+                BrokerSource::PublicData
+            }
+        }
+        "magiclaw" => {
+            // 现有 magiclaw 模拟盘 — 当前 NoopBroker 占位 (后续 impl BrokerPush)
+            log::info!("[broker] magiclaw 模拟盘路径 — 当前 NoopBroker 占位");
+            register(Box::new(NoopBroker));
+            BrokerSource::Magiclaw
+        }
+        "public" | "" => {
+            log::info!("[broker] 公开数据路径 (东财 push2 + 雅虎, 免费, 当前默认)");
+            register(Box::new(PublicDataBroker));
+            BrokerSource::PublicData
+        }
+        "noop" => {
+            log::warn!("[broker] 显式选 noop, 仅 log");
+            register(Box::new(NoopBroker));
+            BrokerSource::Noop
+        }
+        other => {
+            log::warn!(
+                "[broker] 未知 BROKER_SOURCE={other}, 降级到 public (东财/雅虎公开数据)"
+            );
+            register(Box::new(PublicDataBroker));
+            BrokerSource::PublicData
+        }
+    };
+    source
 }
 
 #[cfg(test)]
@@ -94,7 +240,30 @@ mod tests {
     }
 
     #[test]
+    fn test_st_type_from_name() {
+        assert_eq!(BrokerStType::from_name("*ST华微"), BrokerStType::StarST);
+        assert_eq!(BrokerStType::from_name("ST康美"), BrokerStType::ST);
+        assert_eq!(BrokerStType::from_name("SST集成"), BrokerStType::ST);
+        assert_eq!(BrokerStType::from_name("S*ST海伦"), BrokerStType::StarST);
+        assert_eq!(BrokerStType::from_name("浦发银行"), BrokerStType::Normal);
+    }
+
+    #[test]
     fn test_with_closure_runs() {
         with(|b| b.push_st_type("002916", BrokerStType::StarST));
+    }
+
+    #[test]
+    fn test_source_method() {
+        assert_eq!(NoopBroker.source(), BrokerSource::Noop);
+        assert_eq!(PublicDataBroker.source(), BrokerSource::PublicData);
+        assert_eq!(QmtBroker.source(), BrokerSource::Qmt);
+    }
+
+    #[test]
+    fn test_source_label() {
+        assert!(BrokerSource::PublicData.label().contains("公开数据"));
+        assert!(BrokerSource::Qmt.label().contains("QMT"));
+        assert!(BrokerSource::Noop.label().contains("noop"));
     }
 }

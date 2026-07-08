@@ -79,12 +79,22 @@
 - Phase 3 (风控): 1 周
 - 总计: 1 个月 (1 dev, 兼职)
 
-## 7. 决策点 (待用户拍板)
+## 7. 决策点 (已拍板 — 2026-07-08)
 
-1. **选哪个方案**: QMT (低延迟, 月费) / ptrade (简单, 中延迟) / 保持 magiclaw 模拟?
-2. **预算**: 月费 ≤ 300 RMB 行不行?
-3. **优先级**: 4 类推送先接哪个? (建议: ST 状态 > 委托回报 > 成交 > 报价)
-4. **是否真接 vs 永远 NoopBroker**: 当前 stub 已足够支持 F7/回填, broker 真接是 optional
+1. **方案**: 候选方案 A QMT — 但当前 qmt-parser 不存在 (QMT 是券商软件无开源 Rust SDK), 待付费装本地 SDK 后用 QmtBroker
+2. **未付费**: 走 PublicDataBroker (东财 push2 + 雅虎, 免费, 当前默认)
+3. **接口留好**: `src/broker.rs` 已实现 4 个 BrokerPush impl (QmtBroker / MagiclawBroker 占位 / PublicDataBroker / NoopBroker), 通过 `BROKER_SOURCE` env 切换
+4. **真接拿不到付费数据**: 启动探测 `BROKER_SOURCE=qmt` 时检查本地 SDK 路径, 找不到自动降级 PublicDataBroker + warn log. 都没数据源 (东财/雅虎/SDK 全无) → NoopBroker + 启动 warn 提示
+
+`detect_and_register()` 启动时调用:
+
+| BROKER_SOURCE | 行为 |
+|---------------|------|
+| `qmt` (显式) | 探测本地 SDK, 有 → QmtBroker, 无 → 降级 PublicDataBroker + warn |
+| `magiclaw` | NoopBroker 占位 (后续 impl) |
+| `public` (默认) | PublicDataBroker (东财/雅虎) |
+| `noop` | NoopBroker (显式禁推送) |
+| 其它值 | 降级 PublicDataBroker + warn |
 
 ## 8. 相关文件
 

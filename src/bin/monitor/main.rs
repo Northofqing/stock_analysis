@@ -910,6 +910,9 @@ async fn main() {
     dryrun_report::spawn_dryrun_reporter(1800);  // 30 min
     // v14.1 task #162: 启动 outcome backfill 调度器 (每个交易日 15:30 自动跑)
     dryrun_report::spawn_outcome_backfill_scheduler();
+    // v14.1 task #170: 探测 broker 数据源, 注册到全局 (用户决策: 未付费用公开数据)
+    let broker_src = stock_analysis::broker::detect_and_register();
+    log::info!("[broker] 启动完成 | 当前数据源 = {}", broker_src.label());
 
     // v70: e2e 模式 (--e2e) — 跑所有 v12 §14 + v13.1 模板, 忽略时间窗口, mock fallback
     if e2e_mode {
