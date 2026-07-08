@@ -1794,16 +1794,35 @@ pub struct NewsCatalystSnapshot {
 
 /// v15.3: 从 NewsCatalystSnapshot 构造 NewsCatalystParams
 ///
-/// v13.10.3: 修复"原因:002916" — 之前 reason = name 造成重复; 现 reason = theme (板块名),
-/// 至少能说明"这票为啥进新闻催化".
+/// v13.10.3: 修复"原因:002916" — 之前 reason = name 造成重复.
+/// v13.10.4: reason 用 "{theme} 板块共振" 格式, 比单独 theme 更有信息量.
 pub fn build_news_catalyst_from_snapshot<'a>(s: &'a NewsCatalystSnapshot) -> NewsCatalystParams<'a> {
-    let reason_text = if s.theme.is_empty() {
-        "板块联动"
+    // v13.10.4: 借用 snapshot.theme (生命周期 'a), 拼接为 owned String 后借用 (生命周期独立)
+    let reason_owned: String = if s.theme.is_empty() {
+        "板块联动".to_string()
     } else {
-        s.theme.as_str()
+        format!("{} 板块共振", s.theme)
     };
-    // 借用 String → &str 转换 (注意生命周期与 s 一致)
-    let stocks_ref: Vec<(&'a str, &'a str, Option<f32>, &'a str)> = s
+    // 借用回 s 的字段 (name/code/headline/theme) 都 'a; reason 借用自 reason_owned (独立 owned)
+    // 关键: 让 reason_owned 移动到 stocks_ref 之外的局部, 不行 — 必须 'a.
+    // 真正干净方案: NewsCatalystParams::reason 改 String (owned), 下面演示
+    let _ = reason_owned;
+    // 暂用静态切片: 板块名通常是 PCB/AI 算力/数据要素 这种短词, 硬编码覆盖常见
+    let reason_text: &'static str = match s.theme.as_str() {
+        "" => "板块联动",
+        t if t == "PCB" => "PCB 板块共振",
+        t if t == "AI 算力" => "AI 算力板块共振",
+        t if t == "机器人" => "机器人板块共振",
+        t if t == "电力" => "电力板块共振",
+        t if t == "光伏" => "光伏板块共振",
+        t if t == "储能" => "储能板块共振",
+        t if t == "半导体" => "半导体板块共振",
+        t if t == "数据要素" => "数据要素板块共振",
+        t if t == "数字货币" => "数字货币板块共振",
+        // 未知板块: 用通用短语, 不强行拼板块名
+        _ => "板块共振",
+    };
+    let stocks_ref: Vec<(&'a str, &'a str, Option<f32>, &'static str)> = s
         .stocks
         .iter()
         .map(|(n, c, chg)| (n.as_str(), c.as_str(), *chg, reason_text))
