@@ -70,15 +70,28 @@ pub fn spawn_dryrun_reporter(interval_secs: u64) {
     log::info!("[v26 dryrun] 后台报告生成器已启动 (interval: {}s)", interval_secs);
 }
 
-/// v14.1 task #162: 启动后台 backfill 调度器
+/// v14.1 task #162 / review #12: 启动后台 backfill 调度器
 ///   每个交易日 15:30 跑一次 backfill_recommendations_outcome(yesterday)
 ///   - D 日推送 → D+1 收盘后 (15:30) 自动算 outcome
 ///   - 非交易日不跑 (calendar::is_trading_day)
 ///   - interval: 1 min (粗粒度, 触发后当天不再跑)
+///   - review #12: 启动时扫 data/d01_recommendations/ 历史积压, 全补完才进 cron
+///     (monitor 停 N 天 → D+5 窗口漏算 → 启动时一次补单)
 pub fn spawn_outcome_backfill_scheduler() {
     tokio::spawn(async move {
         // 等 1 min 让 DB 起来
         tokio::time::sleep(Duration::from_secs(60)).await;
+
+        // review #12: 启动时扫历史积压, 补 outcome=null 的文件
+        //   jsonl 文件名格式: YYYY-MM-DD.jsonl, 找 outcome 全 null 的
+        //   D+5 窗口已过的 (今天 - 5 个交易日之前) 跳过, 避免无效回填
+        log::info!("[v14.1 #162 / review #12] 扫历史 d01_recommendations 积压");
+        match scan_and_backfill_pending() {
+            Ok(n) if n > 0 => log::info!("[v14.1 #162] 历史积压补完 | {} 个文件", n),
+            Ok(_) => log::info!("[v14.1 #162] 历史无积压"),
+            Err(e) => log::warn!("[v14.1 #162] 历史扫描失败: {}", e),
+        }
+
         let mut last_run_date: Option<String> = None;
         let mut ticker = tokio::time::interval(Duration::from_secs(60));
         ticker.tick().await; // 跳过第一个
@@ -107,6 +120,132 @@ pub fn spawn_outcome_backfill_scheduler() {
         }
     });
     log::info!("[v14.1 #162] 后台 outcome backfill 调度器已启动 (15:30 每日)");
+}
+
+/// review #12: 扫 data/d01_recommendations/ 找 outcome 全为 null 的 jsonl 跑 backfill
+///   - 跳过今天 + 未来 (没 D+1 数据)
+///   - 跳过 30 天前 (D+5 窗口已过, outcome 没意义)
+///   - 限制每天最多补 10 个文件 (避免启动时卡死)
+fn scan_and_backfill_pending() -> Result<usize, Box<dyn std::error::Error>> {
+    use std::fs;
+    use std::path::PathBuf;
+    let dir = PathBuf::from("data/d01_recommendations");
+    if !dir.is_dir() {
+        return Ok(0);
+    }
+    let today = chrono::Local::now().date_naive();
+    let mut count = 0;
+    let mut entries: Vec<_> = fs::read_dir(&dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path().extension().and_then(|x| x.to_str()) == Some("jsonl")
+        })
+        .collect();
+    // 按文件名 (日期) 排序, 早的先补
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries.iter().take(10) {
+        let path = entry.path();
+        let date_str = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        // 解析日期
+        let file_date = match chrono::NaiveDate::parse_from_str(&date_str, "%Y-%m-%d") {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        // 跳过今天/未来 (D+1 还没数据)
+        if file_date >= today {
+            continue;
+        }
+        // 跳过 30 天前 (D+5 窗口已过, outcome 没意义)
+        if (today - file_date).num_days() > 30 {
+            continue;
+        }
+        // 检查 outcome 是否全 null (避免重做已 backfill 的文件)
+        if !is_outcome_all_null(&path) {
+            continue;
+        }
+        log::info!("[v14.1 #162] 历史补单 backfill | {}", date_str);
+        let updated = stock_analysis::opportunity::news_outcome::backfill_recommendations_outcome(&date_str);
+        log::info!("[v14.1 #162] 历史补单完成 | {} | 更新 {} 条", date_str, updated);
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// review #12: 读 jsonl 第一行看 outcome 是否全 null (避免无谓重做)
+fn is_outcome_all_null(path: &std::path::Path) -> bool {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return false, // 读不了就不 backfill
+    };
+    let mut has_any_pending = false;
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        match v.get("outcome") {
+            None | Some(serde_json::Value::Null) => {
+                has_any_pending = true;
+                break;
+            }
+            _ => continue,
+        }
+    }
+    has_any_pending
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// v14.1 review #12: is_outcome_all_null 识别待 backfill 文件
+    #[test]
+    fn test_is_outcome_all_null_pending() {
+        let dir = std::env::temp_dir().join("test_d01_backfill");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("2026-07-01.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // 2 行 outcome=null (待 backfill)
+        writeln!(f, r#"{{"code":"002916","outcome":null,"ts":"2026-07-01 09:00:00"}}"#).unwrap();
+        writeln!(f, r#"{{"code":"002463","outcome":null,"ts":"2026-07-01 09:00:01"}}"#).unwrap();
+        f.sync_all().unwrap();
+        assert!(is_outcome_all_null(&path), "outcome 全 null 应识别为待 backfill");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_is_outcome_all_null_already_done() {
+        let dir = std::env::temp_dir().join("test_d01_backfill");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("2026-07-02.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // 1 行 outcome 已有 d1_pct, 已 backfill 过
+        writeln!(f, r#"{{"code":"002916","outcome":{{"d1_pct":0.05}},"ts":"2026-07-02 09:00:00"}}"#).unwrap();
+        f.sync_all().unwrap();
+        assert!(!is_outcome_all_null(&path), "outcome 已填不应再 backfill");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_is_outcome_all_null_mixed() {
+        let dir = std::env::temp_dir().join("test_d01_backfill");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("2026-07-03.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // 1 行已填, 1 行 null → 仍需 backfill (has_any_pending)
+        writeln!(f, r#"{{"code":"002916","outcome":{{"d1_pct":0.05}},"ts":"2026-07-03 09:00:00"}}"#).unwrap();
+        writeln!(f, r#"{{"code":"002463","outcome":null,"ts":"2026-07-03 09:00:01"}}"#).unwrap();
+        f.sync_all().unwrap();
+        assert!(is_outcome_all_null(&path), "部分 null 也应 backfill");
+        std::fs::remove_file(&path).unwrap();
+    }
 }
 
 /// 生成一次报告 (立即调用, 也被后台 task 调用)
