@@ -57,6 +57,12 @@ arc-swap = "1.9.2"
 dashmap = "6.2.1"
 aho-corasick = "1.1.4"
 
+# qmt-parser 0.2.1 — GPL-3.0 license, 项目自用 (不分发).
+# 计划在后续 Task (QMT 本地缓存集成) 接入 fallback priority 0.
+# 本 task (stock_code_map) 不直接使用此 dep, 仅为后续预备.
+# 注意: crates.io 暂未发现此 crate, 实际接入时可能需要 git/path 依赖.
+qmt-parser = "=0.2.1"
+
 # v20.2: race condition 彻底解决 (test_design_contradiction 跨 test binary 文件 race)
 # serial_test 0.10+ 用 process-wide mutex (std Mutex 跨 test binary 不可见)
 [dev-dependencies]
