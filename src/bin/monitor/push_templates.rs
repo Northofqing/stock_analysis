@@ -1790,24 +1790,49 @@ pub struct NewsCatalystSnapshot {
     pub theme: String,
     /// (name, code, chg_pct)
     pub stocks: Vec<(String, String, Option<f32>)>,
+    /// v13.10.5: LLM 提取的 ticker (有真实 chain + reason)
+    /// 非空时 build 阶段优先用此字段, 不用 stocks (避免 LLM 提取被主题 match 覆盖)
+    pub llm_tickers: Vec<stock_analysis::llm::TickerHit>,
 }
 
 /// v15.3: 从 NewsCatalystSnapshot 构造 NewsCatalystParams
 ///
 /// v13.10.3: 修复"原因:002916" — 之前 reason = name 造成重复.
-/// v13.10.4: reason 用 "{theme} 板块共振" 格式, 比单独 theme 更有信息量.
+/// v13.10.5: LLM 路径 — snapshot.llm_tickers 非空时, 用 LLM 提供的 (name, code, chg, reason, chain)
+/// 直接渲染, 不再 match 硬编码板块名; LLM 空时 fallback 到 theme 短语.
 pub fn build_news_catalyst_from_snapshot<'a>(s: &'a NewsCatalystSnapshot) -> NewsCatalystParams<'a> {
-    // v13.10.4: 借用 snapshot.theme (生命周期 'a), 拼接为 owned String 后借用 (生命周期独立)
-    let reason_owned: String = if s.theme.is_empty() {
-        "板块联动".to_string()
-    } else {
-        format!("{} 板块共振", s.theme)
-    };
-    // 借用回 s 的字段 (name/code/headline/theme) 都 'a; reason 借用自 reason_owned (独立 owned)
-    // 关键: 让 reason_owned 移动到 stocks_ref 之外的局部, 不行 — 必须 'a.
-    // 真正干净方案: NewsCatalystParams::reason 改 String (owned), 下面演示
-    let _ = reason_owned;
-    // 暂用静态切片: 板块名通常是 PCB/AI 算力/数据要素 这种短词, 硬编码覆盖常见
+    // v13.10.5: LLM 优先, 用 LLM 提取的 ticker (含真实 chain + reason)
+    if !s.llm_tickers.is_empty() {
+        let stocks_ref: Vec<(&'a str, &'a str, Option<f32>, &'a str)> = s
+            .llm_tickers
+            .iter()
+            .map(|t| {
+                let name = t.name.as_str();
+                let code = t.code.as_str();
+                // 优先用 ticker.reason (LLM 生成的 "PCB 涨价 12% 直接受益")
+                // 缺 reason 时退到 chain 名
+                let reason: &str = if !t.reason.is_empty() {
+                    t.reason.as_str()
+                } else if !t.chain.is_empty() {
+                    // owned borrow: 这需要 chain 是 'a, 但 t.chain 是 owned String.
+                    // v13.10.5 简化: reason 一定由 LLM prompt 要求, 几乎不会空, 这里直接给 "板块共振"
+                    "板块共振"
+                } else {
+                    "板块联动"
+                };
+                (name, code, None, reason)
+            })
+            .collect();
+        return NewsCatalystParams {
+            hhmm: &s.hhmm,
+            headline: &s.headline,
+            theme: if s.theme.is_empty() { None } else { Some(&s.theme) },
+            stocks: stocks_ref,
+        };
+    }
+
+    // 降级: LLM 未配置/失败时, 用 snapshot.stocks + theme 短语
+    // v13.10.4: reason 用 "{theme} 板块共振" 短语 (硬编码 9 个常见板块匹配)
     let reason_text: &'static str = match s.theme.as_str() {
         "" => "板块联动",
         t if t == "PCB" => "PCB 板块共振",
@@ -1819,7 +1844,6 @@ pub fn build_news_catalyst_from_snapshot<'a>(s: &'a NewsCatalystSnapshot) -> New
         t if t == "半导体" => "半导体板块共振",
         t if t == "数据要素" => "数据要素板块共振",
         t if t == "数字货币" => "数字货币板块共振",
-        // 未知板块: 用通用短语, 不强行拼板块名
         _ => "板块共振",
     };
     let stocks_ref: Vec<(&'a str, &'a str, Option<f32>, &'static str)> = s
@@ -1920,6 +1944,7 @@ pub fn load_news_catalyst_snapshot_real(hhmm: &str) -> NewsCatalystSnapshot {
         headline: format!("{} 板块持续走强", top.concept),
         theme: top.concept.clone(),
         stocks,
+        llm_tickers: vec![],
     }
 }
 
@@ -1956,19 +1981,87 @@ fn load_news_catalyst_snapshot_real_fallback(hhmm: &str) -> NewsCatalystSnapshot
         headline: format!("{} 板块持续走强", top.concept),
         theme: top.concept.clone(),
         stocks,
+        llm_tickers: vec![],
     }
 }
 
 /// v15.3 业务层入口 (v16.2 改用真实 chain_daily 数据)
 pub async fn dispatch_news_catalyst_daily(hhmm: &str, banner: &BannerCtx) -> bool {
-    let snapshot = load_news_catalyst_snapshot_real(hhmm);
+    let mut snapshot = load_news_catalyst_snapshot_real(hhmm);
     if snapshot.headline.is_empty() {
         log_dispatcher_attempt("I-02", false, 0, "news_catalyst_snapshot empty");
         log::info!("[I-02] news_catalyst_snapshot 空 (chain_daily 无数据), 跳过推送");
         return false;
     }
+
+    // v13.10.5: LLM 板块识别 — 用 headline + 板块名作 prompt, 提取 ticker (含真实 chain + reason)
+    // 失败 / 未配置 / 0 命中 → 静默, 走 theme match 降级路径
+    let llm_registry = stock_analysis::llm::LlmRegistry::from_env();
+    if let Some(provider) = llm_registry.select("news_catalyst") {
+        log::info!("[I-02] LLM 板块识别 provider={} model={}", provider.name(), provider.model());
+        // prompt 上下文: 头条 + theme + 候选板块 (让 LLM 关联个股 + 板块)
+        let user_prompt = format!(
+            "新闻: {}\n板块: {}\n\n请提取新闻中提及或受益的 A 股个股 (按 6 位 code, 关联原因, 重要度 1-10)",
+            snapshot.headline, snapshot.theme
+        );
+        match provider.chat_json(
+            "你是 A 股板块映射专家. 从新闻 + 板块上下文, 提取 1-9 只受益个股. 输出 JSON: {\"hits\":[{\"code\":\"002916\",\"name\":\"深南电路\",\"importance\":8,\"reason\":\"PCB 涨价 12% 直接受益\",\"chain\":\"PCB\"}]}",
+            &user_prompt,
+        ).await {
+            Ok(value) => {
+                // 解析 LLM 响应
+                let hits_val = if let Some(arr) = value.get("hits").and_then(|v| v.as_array()) {
+                    serde_json::Value::Array(arr.clone())
+                } else if let Some(arr) = value.as_array() {
+                    serde_json::Value::Array(arr.clone())
+                } else {
+                    serde_json::Value::Array(vec![])
+                };
+                let tickers: Vec<stock_analysis::llm::TickerHit> =
+                    serde_json::from_value(hits_val).unwrap_or_default();
+                // 二次清洗 (复用 extract_tickers 同样的过滤)
+                let mut by_code: std::collections::HashMap<String, stock_analysis::llm::TickerHit> = Default::default();
+                for mut t in tickers {
+                    if t.code.len() != 6 || !t.code.chars().all(|c| c.is_ascii_digit()) {
+                        continue;
+                    }
+                    t.importance = t.importance.clamp(1, 10);
+                    if t.importance < 4 {
+                        continue;
+                    }
+                    match by_code.get(&t.code) {
+                        Some(existing) if existing.importance >= t.importance => {}
+                        _ => { by_code.insert(t.code.clone(), t); }
+                    }
+                }
+                let mut cleaned: Vec<_> = by_code.into_values().collect();
+                cleaned.sort_by(|a, b| b.importance.cmp(&a.importance));
+
+                if !cleaned.is_empty() {
+                    log::info!("[I-02] LLM 提取 {} 只 ticker", cleaned.len());
+                    for t in &cleaned {
+                        log::info!("[I-02]   LLM hit: {}({}) imp={} chain={} reason={}",
+                            t.name, t.code, t.importance, t.chain, t.reason);
+                    }
+                    snapshot.llm_tickers = cleaned;
+                } else {
+                    log::info!("[I-02] LLM 提取 0 只, 降级到 theme 短语");
+                }
+            }
+            Err(e) => {
+                log::warn!("[I-02] LLM 提取失败: {}, 降级到 theme 短语", e);
+            }
+        }
+    } else {
+        log::info!("[I-02] LLM 未配置, 走 theme 短语路径");
+    }
+
+    let snap_size = if !snapshot.llm_tickers.is_empty() {
+        snapshot.llm_tickers.len()
+    } else {
+        snapshot.stocks.len()
+    };
     let params = build_news_catalyst_from_snapshot(&snapshot);
-    let snap_size = snapshot.stocks.len();
     let result = push_news_catalyst("", Some(banner), params).await;
     log_dispatcher_attempt("I-02", result, snap_size, "");
     result
@@ -6156,6 +6249,7 @@ mod tests {
                 ("中科曙光".to_string(), "603019".to_string(), Some(5.2)),
                 ("浪潮信息".to_string(), "000977".to_string(), Some(3.8)),
             ],
+            llm_tickers: vec![],
         };
         let p = build_news_catalyst_from_snapshot(&s);
         assert_eq!(p.headline, "英伟达H200发布");
@@ -6170,6 +6264,57 @@ mod tests {
         let p = build_news_catalyst_from_snapshot(&s);
         assert_eq!(p.theme, None);
         assert!(p.stocks.is_empty());
+    }
+
+    /// v13.10.5: LLM 路径 — llm_tickers 非空时优先用 LLM 提供的 chain + reason
+    #[test]
+    fn v13_10_5_llm_tickers_take_precedence() {
+        use stock_analysis::llm::TickerHit;
+        let s = NewsCatalystSnapshot {
+            hhmm: "10:30".to_string(),
+            headline: "PCB 涨价 12%".to_string(),
+            theme: "PCB".to_string(),
+            stocks: vec![],  // 空 — LLM 路径接管
+            llm_tickers: vec![
+                TickerHit {
+                    code: "002916".to_string(),
+                    name: "深南电路".to_string(),
+                    importance: 9,
+                    reason: "PCB 涨价 12% 直接受益".to_string(),
+                    chain: "PCB".to_string(),
+                },
+                TickerHit {
+                    code: "002463".to_string(),
+                    name: "沪电股份".to_string(),
+                    importance: 7,
+                    reason: "800G 交换机 PCB 订单".to_string(),
+                    chain: "PCB".to_string(),
+                },
+            ],
+        };
+        let p = build_news_catalyst_from_snapshot(&s);
+        assert_eq!(p.stocks.len(), 2, "应使用 llm_tickers");
+        assert_eq!(p.stocks[0].0, "深南电路", "用 LLM 提供的 name");
+        assert_eq!(p.stocks[0].1, "002916");
+        assert_eq!(p.stocks[0].3, "PCB 涨价 12% 直接受益", "用 LLM 提供的 reason");
+        assert_eq!(p.stocks[1].3, "800G 交换机 PCB 订单");
+    }
+
+    /// v13.10.5: 降级路径 — llm_tickers 空时, 用 stocks + theme 短语
+    #[test]
+    fn v13_10_5_fallback_to_theme_when_llm_empty() {
+        let s = NewsCatalystSnapshot {
+            hhmm: "10:30".to_string(),
+            headline: "PCB 涨价".to_string(),
+            theme: "PCB".to_string(),
+            stocks: vec![
+                ("深南电路".to_string(), "002916".to_string(), Some(10.0)),
+            ],
+            llm_tickers: vec![],
+        };
+        let p = build_news_catalyst_from_snapshot(&s);
+        assert_eq!(p.stocks.len(), 1);
+        assert_eq!(p.stocks[0].3, "PCB 板块共振", "降级用 theme match 短语");
     }
 
     #[test]
