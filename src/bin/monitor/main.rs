@@ -3000,9 +3000,11 @@ async fn push_e2e_t16_st_price_limit(hhmm: &str) {
     let db_path = "data/stock_analysis.db";
 
     // 1. Seed: insert 一只 *ST 持仓 (买价 5.00, 1000 股, st_type='*ST')
-    let seed_sql = "INSERT OR REPLACE INTO stock_position \
+    // v14.1 review fix: 用 999999 (无效 A 股代码) + INSERT OR IGNORE 避免 clobber 真用户持仓
+    //   之前用真代码 600090 + INSERT OR REPLACE 会覆盖用户真持仓
+    let seed_sql = "INSERT OR IGNORE INTO stock_position \
         (code, name, buy_date, buy_price, quantity, status, st_type, chain_name, created_at, updated_at) \
-        VALUES ('600090', '*ST测试', '2026-07-01', 5.00, 1000, 'open', '*ST', '其他', \
+        VALUES ('999999', '*ST_E2E_TEST', '2099-01-01', 5.00, 1000, 'open', '*ST', '其他', \
                 CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)";
     let seed_out = Command::new("sqlite3").args([db_path, seed_sql]).output();
     if let Err(e) = &seed_out {
@@ -3016,7 +3018,7 @@ async fn push_e2e_t16_st_price_limit(hhmm: &str) {
         log::warn!("[v14.1 #163] get_st_positions 仍为空 (seed 失败?) — 跳过推");
         // 清理
         let _ = Command::new("sqlite3")
-            .args([db_path, "DELETE FROM stock_position WHERE code='600090' AND name='*ST测试'"])
+            .args([db_path, "DELETE FROM stock_position WHERE code='999999'"])
             .output();
         return;
     }
@@ -3047,9 +3049,9 @@ async fn push_e2e_t16_st_price_limit(hhmm: &str) {
     }
     log::info!("[v14.1 #163] T-16 已推 {} 条", st_positions.len());
 
-    // 4. 清理 (e2e 不能污染真实 DB)
+    // 4. 清理 (e2e 不能污染真实 DB). code='999999' 无效 A 股, DELETE 不会误伤
     let _ = Command::new("sqlite3")
-        .args([db_path, "DELETE FROM stock_position WHERE code='600090' AND name='*ST测试'"])
+        .args([db_path, "DELETE FROM stock_position WHERE code='999999'"])
         .output();
     log::info!("[v14.1 #163] T-16 e2e seed 已清理");
 }
