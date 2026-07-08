@@ -721,9 +721,18 @@ pub fn backfill_recommendations_outcome(date: &str) -> usize {
             continue;
         }
         // 拉 K 线 (推送日 + 5 天)
-        let push_date = match NaiveDate::parse_from_str(&ts[..10], "%Y-%m-%d") {
-            Ok(d) => d,
-            Err(_) => continue,
+        // v14.1 review fix: `&ts[..10]` 字节切片在 ts < 10 字节时 panic, 改 ts.get(..10) + warn log
+        let push_date = match ts.get(..10)
+            .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+        {
+            Some(d) => d,
+            None => {
+                log::warn!(
+                    "[v70+] backfill skip row: ts='{}' (len<10 or unparseable as YYYY-MM-DD), code={}",
+                    ts, code
+                );
+                continue;
+            }
         };
         let kline_result = crate::data_provider::DataFetcherManager::new()
             .ok()
