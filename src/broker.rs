@@ -13,8 +13,8 @@
 //! 跟 F7 st_type 关联: trading::open_position 调 `broker::with(|b| b.push_st_type())`
 //! 把 ST 状态写进 stock_position.st_type. PublicDataBroker 走 `is_st_stock(name)` 推断.
 
-use once_cell::sync::Lazy;
-use std::sync::RwLock;
+// use once_cell::sync::Lazy;   // v14.1 review fix: 改 OnceLock
+// use std::sync::RwLock;         // v14.1 review fix: OnceLock 无需锁
 
 /// broker 推送过来的股票 ST 状态 (跟 push_templates::StType 区分: 这是 broker 数据源)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,25 +146,37 @@ impl BrokerPush for NoopBroker {
     }
 }
 
-static BROKER: Lazy<RwLock<Box<dyn BrokerPush>>> = Lazy::new(|| RwLock::new(Box::new(NoopBroker)));
+// v14.1 review fix: Lazy<RwLock<Box<dyn BrokerPush>>> 换成 OnceLock<Box<...>>
+// 原因: (a) register() 启动时调一次, 无需 RwLock hot-swap; (b) with() 长持读锁 + closure
+// panic 会让 RwLock 中毒, OnceLock 不可中毒; (c) 写锁在 with() 长闭包 (网络 I/O) 期间饿死.
+// 设计 trade-off: register() 失败 (重复注册) 仅 warn 不 panic, 启动时调一次是默认用法.
+use std::sync::OnceLock;
+
+static BROKER: OnceLock<Box<dyn BrokerPush>> = OnceLock::new();
 
 /// 注册 broker 实现 (启动时调一次). 后续 broker SDK 接入后改成具体 impl.
+/// 重复注册仅 warn, 不替换已注册的 (避免运行时 hot-swap 引入一致性 bug).
 pub fn register(broker: Box<dyn BrokerPush>) {
     let src = broker.source();
-    let mut guard = BROKER.write().expect("broker lock poisoned");
-    *guard = broker;
-    log::info!("[broker] 已注册实现: {}", src.label());
+    match BROKER.set(broker) {
+        Ok(()) => log::info!("[broker] 已注册实现: {}", src.label()),
+        Err(_) => log::warn!("[broker] 重复 register({}) — 保留首次注册, 忽略", src.label()),
+    }
 }
 
-/// caller 短期使用, 用 read 拿 guard 期间数据稳定.
+/// caller 短期使用, lock-free 读.
 ///   broker::with(|b| b.push_st_type("002916", BrokerStType::ST))
+/// 没注册时返回 NoopBroker (保证不 panic, 跟之前 Lazy default 行为一致).
 pub fn with<F, R>(f: F) -> R
 where
     F: FnOnce(&dyn BrokerPush) -> R,
 {
-    let guard = BROKER.read().expect("broker lock poisoned");
-    f(&**guard)
+    let b: &dyn BrokerPush = BROKER.get().map(|b| &**b as &dyn BrokerPush).unwrap_or(&NOOP_REF);
+    f(b)
 }
+
+/// 静态 NoopBroker 引用 (没注册时 fallback, 避免 unwrap)
+static NOOP_REF: NoopBroker = NoopBroker;
 
 /// v14.1 task #170: 自动探测 broker 数据源, 注册到全局.
 /// 优先级 (读 BROKER_SOURCE env, 缺省 PublicData):
