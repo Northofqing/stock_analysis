@@ -2048,6 +2048,16 @@ pub fn load_industry_chain_snapshot_real(hhmm: &str) -> IndustryChainSnapshot {
     let code_refs: Vec<&str> = all_codes.iter().map(|s| s.as_str()).collect();
     let chg_map = fetch_realtime_quotes_batch(&code_refs);
 
+    // v13.10.3: 查持仓/自选表, code → 真实股票名, 找不到回落 code
+    let name_map = stock_analysis::portfolio::get_all_names().unwrap_or_default();
+    let lookup_name = |code: &str| -> String {
+        name_map
+            .iter()
+            .find(|(c, _)| c == code)
+            .map(|(_, n)| n.clone())
+            .unwrap_or_else(|| code.to_string())
+    };
+
     let mut stocks: Vec<StockLimitStats> = Vec::new();
     for (c_idx, code) in &cluster_codes {
         let c = &clusters[*c_idx];
@@ -2060,7 +2070,7 @@ pub fn load_industry_chain_snapshot_real(hhmm: &str) -> IndustryChainSnapshot {
         //     简化: 用 price 反推 chg_pct (实际生产应 fetch_realtime_quotes_batch 返回更全字段)
         stocks.push(StockLimitStats {
             code: code.clone(),
-            name: code.clone(),  // 简化: code 作为 name
+            name: lookup_name(code),  // v13.10.3: 反查真名, 之前是 code
             chain: c.concept.clone(),
             board_level: (i + 1) as u8,  // 简化: 按位置推断 (1=首板)
             is_limit_up_today: chg_pct > 9.5,  // ST/*ST 涨跌幅 10% 视为涨停
@@ -2089,11 +2099,19 @@ pub fn load_industry_chain_snapshot_real(hhmm: &str) -> IndustryChainSnapshot {
     let top = sorted[0];
 
     // 解析 followers → supplements (前 3)
+    // v13.10.3: followers 是 code 列表, 反查真名作 name (之前 name=code 会显示 002916(002916))
     let supplements: Vec<(String, String, String, f64, f64, f64)> = top
         .followers
         .iter()
         .take(3)
-        .map(|c| (c.clone(), c.clone(), "首板".to_string(), 0.0, 0.0, 0.0))
+        .map(|c| {
+            let real_name = name_map
+                .iter()
+                .find(|(code, _)| code == c)
+                .map(|(_, n)| n.clone())
+                .unwrap_or_else(|| c.clone());
+            (real_name, c.clone(), "首板".to_string(), 0.0, 0.0, 0.0)
+        })
         .collect();
 
     IndustryChainSnapshot {
