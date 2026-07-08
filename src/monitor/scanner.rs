@@ -108,7 +108,7 @@ impl TieredScanner {
 
     /// 加载持仓股为扫描目标
     pub fn load_positions(targets: &mut Vec<ScanTarget>) {
-        if let Ok(db) = std::panic::catch_unwind(crate::database::DatabaseManager::get) {
+        if let Some(db) = crate::database::DatabaseManager::try_get() {
             if let Ok(positions) = db.get_all_open_positions() {
                 for p in &positions {
                     targets.push(ScanTarget {

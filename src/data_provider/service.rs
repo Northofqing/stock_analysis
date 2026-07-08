@@ -18,13 +18,17 @@ use crate::data_provider::financials::{fetch_with_fallback_async, Financials};
 use crate::data_provider::money_flow::{
     fetch_flow_history_async, fetch_intraday_shape_async, IntradayShape, MoneyFlowSummary,
 };
-use crate::data_provider::{brief, is_ban_error, KlineData};
+use crate::data_provider::{is_ban_error, KlineData};
 use anyhow::Result;
+use dashmap::DashMap;
 use once_cell::sync::Lazy;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
+
+// 测试代码会引用 brief/is_ban_error. lib build 不需要 (#[allow] 给 test build).
+#[allow(unused_imports)]
+use crate::data_provider::brief;
 
 /// 缓存条目：value + 写入时间。读时检查 TTL，过期则 invalidate。
 type CachedSlot<T> = Arc<RwLock<Option<(Instant, Arc<T>)>>>;
@@ -46,37 +50,38 @@ fn ttl_for_now() -> Duration {
 
 pub struct DataFetchService {
     client: reqwest::Client,
-    klines: Mutex<HashMap<(String, usize), CachedSlot<Vec<KlineData>>>>,
-    financials: Mutex<HashMap<String, CachedSlot<Financials>>>,
-    money_flow: Mutex<HashMap<(String, usize), CachedSlot<MoneyFlowSummary>>>,
-    intraday: Mutex<HashMap<String, CachedSlot<IntradayShape>>>,
+    // review #14: 原 Mutex<HashMap<...>> 串行化所有缓存访问, 100 并发请求全排队.
+    // 改 DashMap (分片锁): 4 个字段独立分片, 同 key 串行 + 跨 key 并行.
+    klines: DashMap<(String, usize), CachedSlot<Vec<KlineData>>>,
+    financials: DashMap<String, CachedSlot<Financials>>,
+    money_flow: DashMap<(String, usize), CachedSlot<MoneyFlowSummary>>,
+    intraday: DashMap<String, CachedSlot<IntradayShape>>,
 }
 
 impl DataFetchService {
     fn new() -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(8))
-            .user_agent(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
-                 AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            )
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        // review #15: 复用 SHARED_HTTP_CLIENT (30s timeout + Arc 内核),
+        // 替代每次 new Client. 多 DataFetchService 实例 + 频繁 new 会浪费 TLS handshake.
+        let client = crate::http_client::SHARED_HTTP_CLIENT.clone();
         Self {
             client,
-            klines: Mutex::new(HashMap::new()),
-            financials: Mutex::new(HashMap::new()),
-            money_flow: Mutex::new(HashMap::new()),
-            intraday: Mutex::new(HashMap::new()),
+            klines: DashMap::new(),
+            financials: DashMap::new(),
+            money_flow: DashMap::new(),
+            intraday: DashMap::new(),
         }
     }
 
-    async fn slot<K, V>(map: &Mutex<HashMap<K, CachedSlot<V>>>, key: K) -> CachedSlot<V>
+    /// 获取或创建 key 对应的 CachedSlot. review #14: DashMap.entry() lock-free fast path.
+    async fn slot<K, V>(map: &DashMap<K, CachedSlot<V>>, key: K) -> CachedSlot<V>
     where
         K: std::hash::Hash + Eq + Clone,
     {
-        let mut g = map.lock().await;
-        g.entry(key)
+        if let Some(cell) = map.get(&key) {
+            return cell.clone();
+        }
+        // entry() 在多线程下可能 race, 但 entry().or_insert_with() 原子 — 谁先到谁 insert.
+        map.entry(key)
             .or_insert_with(|| Arc::new(RwLock::new(None)))
             .clone()
     }

@@ -43,9 +43,7 @@ impl NewsAIAnalyzer {
         let available = analyzer.is_available();
         let mut linker = EntityLinker::new();
         // 加载持仓
-        if let Ok(db) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::database::DatabaseManager::get()
-        })) {
+        if let Some(db) = crate::database::DatabaseManager::try_get() {
             if let Ok(positions) = db.get_all_open_positions() {
                 for p in &positions {
                     linker.register_position(&p.code, &p.name);

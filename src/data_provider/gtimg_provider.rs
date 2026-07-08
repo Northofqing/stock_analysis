@@ -207,7 +207,7 @@ impl GtimgProvider {
             .or_else(|| json["data"][&market_code]["day"].as_array())
             .ok_or_else(|| anyhow!("未找到K线数据"))?;
         
-        let mut result: Vec<KlineData> = Vec::new();
+        let mut result: Vec<KlineData> = Vec::with_capacity(klines.len());
         
         for kline in klines {
             let kline_array = kline.as_array()
@@ -312,8 +312,8 @@ impl GtimgProvider {
                         if let Some(end) = text.rfind('"') {
                             if start < end {
                                 let data = &text[start + 1..end];
-                                // 分割字段，第2个字段（索引1）是股票名称
-                                let parts: Vec<&str> = data.split('~').collect();
+                                // review #14: splitn(2, '~') 只切前 2 段 (50+ 字段 → 2 元素 Vec).
+                                let parts: Vec<&str> = data.splitn(2, '~').collect();
                                 if parts.len() > 1 {
                                     let name = parts[1].to_string();
                                     if !name.is_empty() {
@@ -354,10 +354,12 @@ impl GtimgProvider {
                         if let Some(end) = text.rfind('"') {
                             if start < end {
                                 let data = &text[start + 1..end];
-                                let parts: Vec<&str> = data.split('~').collect();
-                                
+                                // review #14: splitn(60, '~') 限制切分数量. 实测 parts[52] 仍要访问,
+                                // 60 留足 buffer, 避免 100+ 元素 Vec 完整分配.
+                                let parts: Vec<&str> = data.splitn(60, '~').collect();
+
                                 // 腾讯API字段说明（索引，实际验证）：
-                                // 0: 未知 1: 名称 2: 代码 3: 当前价 4: 昨收 5: 今开 
+                                // 0: 未知 1: 名称 2: 代码 3: 当前价 4: 昨收 5: 今开
                                 // 6: 成交量(手) 7: 外盘 8: 内盘 9: 买一 10: 买一量
                                 // ...
                                 // 33: 涨跌幅% 

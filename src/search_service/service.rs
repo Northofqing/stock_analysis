@@ -808,9 +808,7 @@ impl SearchService {
             Err(_) => Vec::new(),
         };
 
-        let db_hist = std::panic::catch_unwind(|| crate::database::DatabaseManager::get())
-            .ok()
-            .and_then(|db| {
+        let db_hist = crate::database::DatabaseManager::try_get().and_then(|db| {
                 db.get_recent_topic_history_signatures(
                     cfg.topic_history_window_hours.max(24),
                     cfg.topic_history_db_limit.max(100),
@@ -862,9 +860,7 @@ impl SearchService {
             return;
         }
 
-        let _ = std::panic::catch_unwind(|| crate::database::DatabaseManager::get())
-            .ok()
-            .and_then(|db| {
+        let _ = crate::database::DatabaseManager::try_get().and_then(|db| {
                 db.upsert_topic_history_signatures(&to_store, cfg.topic_history_db_limit.max(100))
                     .ok()
             });

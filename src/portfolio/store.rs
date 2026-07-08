@@ -83,26 +83,23 @@ pub fn load_trades_since(since: NaiveDate) -> Result<Vec<Trade>, String> {
 
 /// 检查今日是否有买入（DB 未初始化时返回 false）
 /// 修复 P1.1: SQL 注入风险 (改 ? 占位符)
+/// review #14: 去 catch_unwind — try_get 显式处理 None (init 失败),
+/// 不再静默吞 panic. 调用方需检查错误.
 pub fn has_buy_today(code: &str, today: NaiveDate) -> Result<bool, String> {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        use diesel::sql_types::{Date, Integer, Text};
-        let db = crate::database::DatabaseManager::get();
-        let mut conn = db.get_conn().map_err(|e| e.to_string())?;
-        #[derive(QueryableByName, Debug)]
-        struct Count { #[diesel(sql_type = diesel::sql_types::Integer)] cnt: i32 }
-        let result = diesel::sql_query(
-            "SELECT COUNT(*) as cnt FROM trades WHERE code = ? AND direction = 'buy' AND traded_at = ?"
-        )
-        .bind::<Text, _>(code)
-        .bind::<Date, _>(today)
-        .get_result::<Count>(&mut *conn)
-        .map_err(|e| e.to_string())?;
-        Ok::<bool, String>(result.cnt > 0)
-    }));
-    match result {
-        Ok(Ok(v)) => Ok(v),
-        _ => Ok(false), // DB 未初始化或查询失败 → 保守返回 false
-    }
+    use diesel::sql_types::{Date, Text};
+    let db = crate::database::DatabaseManager::try_get()
+        .ok_or_else(|| "DB 未初始化".to_string())?;
+    let mut conn = db.get_conn().map_err(|e| e.to_string())?;
+    #[derive(QueryableByName, Debug)]
+    struct Count { #[diesel(sql_type = diesel::sql_types::Integer)] cnt: i32 }
+    let result = diesel::sql_query(
+        "SELECT COUNT(*) as cnt FROM trades WHERE code = ? AND direction = 'buy' AND traded_at = ?"
+    )
+    .bind::<Text, _>(code)
+    .bind::<Date, _>(today)
+    .get_result::<Count>(&mut *conn)
+    .map_err(|e| e.to_string())?;
+    Ok(result.cnt > 0)
 }
 
 /// 保存净值快照

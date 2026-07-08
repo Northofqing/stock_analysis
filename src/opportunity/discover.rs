@@ -152,9 +152,8 @@ fn load_recently_pushed_codes(
     candidate_codes: &[String],
     days: i64,
 ) -> std::collections::HashSet<String> {
-    let db = match std::panic::catch_unwind(crate::database::DatabaseManager::get) {
-        Ok(db) => db,
-        Err(_) => return std::collections::HashSet::new(), // DB 不可用 → 不阻断
+    let Some(db) = crate::database::DatabaseManager::try_get() else {
+        return std::collections::HashSet::new(); // DB 未初始化 → 不阻断
     };
     match db.count_recent_pushes_batch(candidate_codes, days) {
         Ok(set) => set,

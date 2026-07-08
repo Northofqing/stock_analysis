@@ -366,10 +366,7 @@ fn append_sector_resonance(stock_codes: &mut Vec<String>, macro_news: &str) {
 fn append_open_positions(stock_codes: &mut Vec<String>) {
     use stock_analysis::database::DatabaseManager;
 
-    let db = match std::panic::catch_unwind(DatabaseManager::get) {
-        Ok(db) => db,
-        Err(_) => return,
-    };
+    let Some(db) = DatabaseManager::try_get() else { return; };
     match db.get_all_open_positions() {
         Ok(positions) if !positions.is_empty() => {
             let before = stock_codes.len();

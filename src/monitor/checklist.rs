@@ -41,7 +41,12 @@ pub fn build_pre_market_checklist(
             let dist = if p.hard_stop > 0.0 && p.cost_price > 0.0 {
                 format!("{:.1}%", (p.cost_price - p.hard_stop) / p.cost_price * 100.0)
             } else { "-".into() };
-            let status = if crate::portfolio::is_t1_locked(&p.code) { "🔒 T+1" } else { "✅ 可用" };
+            // review #14: DB 失败时不再静默 "可用", 而是显示警告, 让 operator 知道有异常.
+            let status = match crate::portfolio::is_t1_locked(&p.code) {
+                Ok(true) => "🔒 T+1",
+                Ok(false) => "✅ 可用",
+                Err(_) => "⚠️ DB",
+            };
             lines.push(format!(
                 "| {} | {} | {:.2} | {:.2} | {} | {} | {} |",
                 p.code, p.name, p.cost_price, p.hard_stop, dist, p.shares, status

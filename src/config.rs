@@ -3,7 +3,7 @@
 //! SIGHUP 信号触发 reload。toml 缺失或格式错误 → 用代码默认值，不崩溃。
 
 use serde::{Deserialize, Serialize};
-use std::sync::{LazyLock, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 
 // ── 产业链规则 ──
 
@@ -316,13 +316,22 @@ impl Default for MonitorConfig {
 }
 
 // ── 全局配置缓存 ──
+// review #14: 原 RwLock<Option<Vec<T>>> + .read().clone() 热路径触发 RwLock read + 整 Vec clone.
+// 改 ArcSwap: 内部类型是 T (不是 Arc<T>), ArcSwap::load_full() 自动返回 Arc<T> 共享引用.
+// store() / from() 都要求 Arc<T>, 但内部 T 是普通值, ArcSwap 内部会做 Arc wrap.
+type ChainRulesSwap = arc_swap::ArcSwap<Option<Vec<ChainRuleConfig>>>;
+type ExclusionBoardsSwap = arc_swap::ArcSwap<Option<Vec<ExclusionBoardConfig>>>;
+type AnnounceKeywordsSwap = arc_swap::ArcSwap<Option<AnnounceKeywordsFile>>;
+type MonitorConfigSwap = arc_swap::ArcSwap<MonitorConfig>;
 
-static CHAIN_RULES: RwLock<Option<Vec<ChainRuleConfig>>> = RwLock::new(None);
-static EXCLUSION_BOARDS: RwLock<Option<Vec<ExclusionBoardConfig>>> = RwLock::new(None);
-static ANNOUNCE_KEYWORDS: RwLock<Option<AnnounceKeywordsFile>> = RwLock::new(None);
-static MONITOR_CONFIG: LazyLock<RwLock<MonitorConfig>> = LazyLock::new(|| {
-    RwLock::new(MonitorConfig::default())
-});
+static CHAIN_RULES: LazyLock<ChainRulesSwap> =
+    LazyLock::new(|| ChainRulesSwap::from(Arc::new(None)));
+static EXCLUSION_BOARDS: LazyLock<ExclusionBoardsSwap> =
+    LazyLock::new(|| ExclusionBoardsSwap::from(Arc::new(None)));
+static ANNOUNCE_KEYWORDS: LazyLock<AnnounceKeywordsSwap> =
+    LazyLock::new(|| AnnounceKeywordsSwap::from(Arc::new(None)));
+static MONITOR_CONFIG: LazyLock<MonitorConfigSwap> =
+    LazyLock::new(|| MonitorConfigSwap::from(Arc::new(MonitorConfig::default())));
 
 // 修复 P3.1: 集中风险/费用常量
 static RISK_CONFIG: LazyLock<RwLock<RiskConfig>> = LazyLock::new(|| {
@@ -506,7 +515,8 @@ fn parse_strategy_toml(content: &str) {
         *RISK_CONFIG.write().unwrap() = c;
     }
     if let Ok(c) = toml::from_str::<MonitorConfig>(content) {
-        *MONITOR_CONFIG.write().unwrap() = c;
+        // review #14: ArcSwap 原子替换 (lock-free for readers).
+        MONITOR_CONFIG.store(Arc::new(c));
     }
 }
 
@@ -536,13 +546,14 @@ fn load_chain_combined() {
         }
     };
     if let Ok(c) = toml::from_str::<ChainRulesFile>(&content) {
-        *CHAIN_RULES.write().unwrap() = Some(c.rules);
+        // review #14: ArcSwap store 是 atomic 替换, 不阻塞读.
+        CHAIN_RULES.store(Arc::new(Some(c.rules)));
     }
     if let Ok(c) = toml::from_str::<AnnounceKeywordsFile>(&content) {
-        *ANNOUNCE_KEYWORDS.write().unwrap() = Some(c);
+        ANNOUNCE_KEYWORDS.store(Arc::new(Some(c)));
     }
     if let Ok(c) = toml::from_str::<ExclusionFile>(&content) {
-        *EXCLUSION_BOARDS.write().unwrap() = Some(c.boards);
+        EXCLUSION_BOARDS.store(Arc::new(Some(c.boards)));
     }
 }
 
@@ -559,32 +570,36 @@ pub fn load_all() {
     load_chain_combined();
 }
 
-/// 获取产业链规则（优先 toml，fallback 调用方提供的默认值）
-pub fn get_chain_rules() -> Option<Vec<ChainRuleConfig>> {
-    CHAIN_RULES.read().unwrap().clone()
+/// 获取产业链规则 (review #14: ArcSwap 引用, 0 clone).
+/// 返回 Arc<Vec<...>> 让调用方共享同一份内存. 热路径 (chain_mapper) 用 .as_slice() 或 .iter().
+pub fn get_chain_rules() -> Option<Arc<Vec<ChainRuleConfig>>> {
+    (*CHAIN_RULES.load_full()).clone().map(Arc::new)
 }
 
-/// 获取排除板块配置
-pub fn get_exclusion_boards() -> Option<Vec<ExclusionBoardConfig>> {
-    EXCLUSION_BOARDS.read().unwrap().clone()
+/// 获取排除板块配置 (review #14: ArcSwap 引用, 0 clone).
+pub fn get_exclusion_boards() -> Option<Arc<Vec<ExclusionBoardConfig>>> {
+    (*EXCLUSION_BOARDS.load_full()).clone().map(Arc::new)
 }
 
-/// 获取公告关键词配置
-pub fn get_announce_keywords() -> Option<AnnounceKeywordsFile> {
-    ANNOUNCE_KEYWORDS.read().unwrap().clone()
+/// 获取公告关键词配置 (review #14: ArcSwap 引用, 0 clone).
+pub fn get_announce_keywords() -> Option<Arc<AnnounceKeywordsFile>> {
+    (*ANNOUNCE_KEYWORDS.load_full()).clone().map(Arc::new)
 }
 
 /// 获取监控定时器配置
-pub fn get_monitor_config() -> MonitorConfig {
-    MONITOR_CONFIG.read().unwrap().clone()
+// review #14: get_monitor_config 改返回 Arc<MonitorConfig>, 调用方共享同一份内存,
+// 改 6 字段 String clone (200B alloc) 为 0 alloc. 调用方通过 .as_ref() 拿 &MonitorConfig.
+/// 获取 MonitorConfig (Arc 引用, 0 clone).
+pub fn get_monitor_config() -> Arc<MonitorConfig> {
+    MONITOR_CONFIG.load_full()
 }
 
-/// 获取 VetoChain 否决链配置
-pub fn get_veto_config() -> LiveVetoConfig {
-    MONITOR_CONFIG.read().unwrap().live_veto.clone()
+/// 获取 VetoChain 否决链配置 (review #14: 走 Arc 引用, 不再 deep clone 整个 LiveVetoConfig).
+pub fn get_veto_config() -> Arc<LiveVetoConfig> {
+    Arc::new(MONITOR_CONFIG.load_full().live_veto.clone())
 }
 
-/// 获取动态仓位配置
-pub fn get_position_sizing_config() -> PositionSizingConfig {
-    MONITOR_CONFIG.read().unwrap().position_sizing.clone()
+/// 获取动态仓位配置.
+pub fn get_position_sizing_config() -> Arc<PositionSizingConfig> {
+    Arc::new(MONITOR_CONFIG.load_full().position_sizing.clone())
 }

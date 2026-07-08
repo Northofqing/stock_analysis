@@ -96,11 +96,15 @@ static HOLIDAYS: Lazy<RwLock<HashSet<NaiveDate>>> = Lazy::new(|| {
 });
 
 /// 添加节假日（运行时注入，用于测试或动态更新）
+/// review #14: poison 时 log error 而非静默丢弃, 让调用方知道 add 失败.
 pub fn add_holidays(dates: &[NaiveDate]) {
-    if let Ok(mut guard) = HOLIDAYS.write() {
-        for d in dates {
-            guard.insert(*d);
+    match HOLIDAYS.write() {
+        Ok(mut guard) => {
+            for d in dates {
+                guard.insert(*d);
+            }
         }
+        Err(e) => log::error!("[calendar] HOLIDAYS RwLock poisoned, add 失败: {}", e),
     }
 }
 
@@ -111,12 +115,19 @@ pub fn is_trading_day(date: NaiveDate) -> bool {
         return false;
     }
     // 节假日
-    if let Ok(guard) = HOLIDAYS.read() {
-        if guard.contains(&date) {
-            return false;
+    // review #14 修复: RwLock poison 时 .read() 返回 Err, 原 `if let Ok(guard)` 静默
+    // fall through → 节假日当交易日. 改为显式处理: poison 时按"非节假日"处理
+    // (保守, 让周末检查继续生效) + log::error 提醒 operator 排查.
+    match HOLIDAYS.read() {
+        Ok(guard) => !guard.contains(&date),
+        Err(e) => {
+            log::error!(
+                "[calendar] HOLIDAYS RwLock poisoned: {} — 当作非节假日处理, 请排查",
+                e
+            );
+            true
         }
     }
-    true
 }
 
 /// 判断今天是否为交易日

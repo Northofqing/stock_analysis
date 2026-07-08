@@ -27,10 +27,10 @@ pub struct NotificationService {
 impl NotificationService {
     /// 创建新的通知服务
     pub fn new(config: NotificationConfig) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .expect("Failed to create HTTP client");
+        // review #14: 改用 SHARED_HTTP_CLIENT 共享 client (30s timeout + Arc 内核),
+        // 替代每次 new Client. 多 NotificationService 实例 + 频繁 new 会浪费
+        // TLS handshake. SHARED_HTTP_CLIENT 是 Lazy static, 进程生命周期单例.
+        let client = crate::http_client::SHARED_HTTP_CLIENT.clone();
 
         let available_channels = Self::detect_channels(&config);
 
@@ -459,8 +459,14 @@ impl NotificationService {
             }
         };
         // Discord 限制 content 2000 字符, 超长截断
+        // review #14 修复: 原 &content[..1900] 在中文 UTF-8 中间切会 panic.
+        // 改用 is_char_boundary 找到安全切点.
         let truncated = if content.len() > 1900 {
-            format!("{}...\n[内容截断]", &content[..1900])
+            let mut idx = 1900;
+            while idx > 0 && !content.is_char_boundary(idx) {
+                idx -= 1;
+            }
+            format!("{}...\n[内容截断]", &content[..idx])
         } else {
             content.to_string()
         };
@@ -477,8 +483,9 @@ impl NotificationService {
     }
 }
 
+// review #15: 委托给 util::truncate_chars (DRY).
 fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max { s.to_string() } else { format!("{}…", s.chars().take(max).collect::<String>()) }
+    crate::util::truncate_chars(s, max)
 }
 
 /// 便捷函数：发送每日报告

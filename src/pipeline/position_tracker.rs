@@ -511,7 +511,7 @@ mod tests {
 
 /// 保存当日分析结果到数据库。
 pub(super) fn save_analysis_result(code: &str, data: &[KlineData], result: &AnalysisResult) {
-    let Ok(db) = std::panic::catch_unwind(|| DatabaseManager::get()) else {
+    let Some(db) = DatabaseManager::try_get() else {
         return;
     };
     let latest_kline = &data[0];

@@ -166,7 +166,7 @@ async fn fetch_flow_history_sina_async(
     if rows.is_empty() {
         return Ok(MoneyFlowSummary::default());
     }
-    let mut days = Vec::new();
+    let mut days = Vec::with_capacity(rows.len());
     for row in rows {
         let main_net = row
             .r0_net
@@ -267,16 +267,15 @@ pub async fn fetch_flow_history_async(
         // 字段顺序（EM 实测）：date, f52(主力), f53(小单), f54(中单), f55(大单),
         //                      f56(超大单), f57(主力%), f58(小单%), f59(中单%),
         //                      f60(大单%), f61(超大单%), f62(收盘价), f63(涨跌幅%), _, _
-        let mut days = Vec::new();
+        let mut days = Vec::with_capacity(klines.len());
         for kline in klines {
             let s = match kline.as_str() {
                 Some(s) => s,
                 None => continue,
             };
-            let parts: Vec<&str> = s.split(',').collect();
-            if parts.len() < 13 {
-                continue;
-            }
+            // review #14: splitn(13, ',') 限制切分数量, 避免 15 字段时分配 15 元素 Vec.
+            let parts: Vec<&str> = s.splitn(13, ',').collect();
+            if parts.len() < 13 { continue; }
             let parse_f = |i: usize| parts.get(i).and_then(|p| p.parse::<f64>().ok());
             let (Some(main_net), Some(big_net), Some(xl_net), Some(main_pct), Some(pct_chg)) = (
                 parse_f(1),
@@ -381,7 +380,8 @@ pub async fn fetch_intraday_shape_async(
 
     // 格式: "date time, open, close, high, low, volume, amount, avg"
     let parse_row = |s: &str| -> Option<(String, f64, f64, f64, f64)> {
-        let parts: Vec<&str> = s.split(',').collect();
+        // review #14: splitn(6, ',') 限制切分, 8 字段也只切 6 个.
+        let parts: Vec<&str> = s.splitn(6, ',').collect();
         if parts.len() < 6 {
             return None;
         }

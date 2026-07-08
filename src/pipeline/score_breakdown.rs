@@ -301,7 +301,7 @@ pub fn render_section(sb: &ScoreBreakdown) -> String {
 ///
 /// 注意：此分数不用于买入触发，不修改 sentiment_score 主链路。
 pub fn compute_ranking_score(sb: &ScoreBreakdown) -> i32 {
-    let cfg = crate::config::get_monitor_config().factor_feedback;
+    let cfg = &crate::config::get_monitor_config().factor_feedback;
 
     let (tech_action, quality_action, valuation_action, flow_action, growth_action) = if cfg.enabled {
         (

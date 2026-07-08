@@ -72,7 +72,7 @@ impl AnalysisPipeline {
         info!("[{}] 从 {} 获取到 {} 条数据", code, source, data.len());
 
         // 保存到数据库
-        if let Ok(db) = std::panic::catch_unwind(|| DatabaseManager::get()) {
+        if let Some(db) = DatabaseManager::try_get() {
             match db.save_kline_data(code, &data, &source) {
                 Ok(count) => info!("[{}] 已保存 {} 条K线数据到数据库", code, count),
                 Err(e) => warn!("[{}] 保存K线数据到数据库失败: {}", code, e),

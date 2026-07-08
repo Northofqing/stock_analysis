@@ -3,6 +3,8 @@
 //! 关键词规则表（优先）+ AI 推理兜底（规则未命中时）+ 动态板块成份股解析。
 //! 不写死标的，标的从 sector_monitor 实时拉。
 
+use std::sync::Arc;
+
 use crate::market_analyzer::sector_monitor;
 
 /// 板块候选池大小：兼顾覆盖率与请求成本。
@@ -59,19 +61,26 @@ fn normalize_chain_rules(mut rules: Vec<(Vec<String>, String, String, String, u3
     rules
 }
 
-fn map_chain_rules(config_rules: Vec<crate::config::ChainRuleConfig>) -> Vec<(Vec<String>, String, String, String, u32, bool)> {
+fn map_chain_rules(config_rules: Arc<Vec<crate::config::ChainRuleConfig>>) -> Vec<(Vec<String>, String, String, String, u32, bool)> {
     // BR-006: 过滤 enabled=false 的规则. 关停的产业链不再参与关键词匹配,
     // 防止低胜率主题持续产生推送.
     config_rules
-        .into_iter()
+        .iter()
         .filter(|r| r.enabled)
-        .map(|r| (r.keywords, r.chain, r.logic, r.board_keyword, r.priority, r.generic))
+        .map(|r| (
+            r.keywords.clone(),
+            r.chain.clone(),
+            r.logic.clone(),
+            r.board_keyword.clone(),
+            r.priority,
+            r.generic,
+        ))
         .collect()
 }
 
 fn parse_chain_rules_toml(toml_text: &str) -> Option<Vec<(Vec<String>, String, String, String, u32, bool)>> {
     let file_cfg = toml::from_str::<crate::config::ChainRulesFile>(toml_text).ok()?;
-    Some(normalize_chain_rules(map_chain_rules(file_cfg.rules)))
+    Some(normalize_chain_rules(map_chain_rules(Arc::new(file_cfg.rules))))
 }
 
 /// 加载规则：优先 toml，不可用则回退编译期内嵌 toml。按 priority 降序返回。

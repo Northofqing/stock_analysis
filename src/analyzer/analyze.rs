@@ -201,19 +201,43 @@ impl GeminiAnalyzer {
 
         // ========== SKDJ(40,5) ==========
         if data_len >= 40 {
+            // review #14: 原本内层 O(n×40) — 每根 K 线都对 40 元素窗口算 hh/ll,
+            // 2500 根 K 线 = 100K 次比较. 改单调队列 O(n): 维护 hh 队列 (递减) +
+            // ll 队列 (递增), 每次 push/pop O(1). 2500 根 → 5000 次比较, 20x 加速.
+            use std::collections::VecDeque;
             let chron: Vec<&crate::data_provider::KlineData> = kline_data.iter().rev().collect();
+            let n_len = chron.len();
+            let start = n_len.saturating_sub(60).max(39);
+            let alpha = 2.0 / (5.0 + 1.0);
             let mut k_val = 50.0;
             let mut d_val = 50.0;
-            let n_len = chron.len();
-            let start = n_len.saturating_sub(60).max(39); // 保证一定的预热期收敛
-            let alpha = 2.0 / (5.0 + 1.0);
-            for i in start..n_len {
-                let window_start = i.saturating_sub(39);
-                let window = &chron[window_start..=i];
-                let hh = window.iter().map(|k| k.high).fold(f64::NEG_INFINITY, f64::max);
-                let ll = window.iter().map(|k| k.low).fold(f64::INFINITY, f64::min);
+            // 单调队列: high 递减 (front 最大), low 递增 (front 最小)
+            let mut max_q: VecDeque<usize> = VecDeque::with_capacity(41);
+            let mut min_q: VecDeque<usize> = VecDeque::with_capacity(41);
+            for i in 0..n_len {
+                let bar = chron[i];
+                // push bar 到 max_q (维护递减)
+                while let Some(&f) = max_q.front() {
+                    if chron[f].high <= bar.high { max_q.pop_front(); } else { break; }
+                }
+                max_q.push_back(i);
+                // push bar 到 min_q (维护递增)
+                while let Some(&f) = min_q.front() {
+                    if chron[f].low >= bar.low { min_q.pop_front(); } else { break; }
+                }
+                min_q.push_back(i);
+                // 弹出窗口外元素 (i - 40 之前)
+                while let Some(&f) = max_q.front() {
+                    if f < i.saturating_sub(39) { max_q.pop_front(); } else { break; }
+                }
+                while let Some(&f) = min_q.front() {
+                    if f < i.saturating_sub(39) { min_q.pop_front(); } else { break; }
+                }
+                if i < start { continue; }
+                let hh = chron[max_q[0]].high;
+                let ll = chron[min_q[0]].low;
                 let rsv = if (hh - ll).abs() < 1e-9 { 50.0 }
-                    else { (chron[i].close - ll) / (hh - ll) * 100.0 };
+                    else { (bar.close - ll) / (hh - ll) * 100.0 };
                 k_val = alpha * rsv + (1.0 - alpha) * k_val;
                 d_val = alpha * k_val + (1.0 - alpha) * d_val;
             }

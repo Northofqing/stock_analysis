@@ -2,6 +2,8 @@
 //!
 //! 匹配方式：拉取排除板块的成份股 → 交叉比对持仓代码。
 
+use std::sync::OnceLock;
+
 use crate::portfolio::Position;
 
 /// 排除板块：板块名 → 原因。toml 不可用时回退此默认值。
@@ -20,9 +22,64 @@ const DEFAULT_EXCLUDED_BOARDS: &[(&str, &str)] = &[
 
 fn excluded_boards() -> Vec<(String, String)> {
     if let Some(config_boards) = crate::config::get_exclusion_boards() {
-        return config_boards.into_iter().map(|b| (b.name, b.reason)).collect();
+        return config_boards.iter().map(|b| (b.name.clone(), b.reason.clone())).collect();
     }
     DEFAULT_EXCLUDED_BOARDS.iter().map(|(n, r)| (n.to_string(), r.to_string())).collect()
+}
+
+/// 缓存的 (日期, 映射) — 同一天复用, 避免每次 review 600 次 HTTP (review #14 修复).
+/// review 路径每天跑多次, 这里缓存一天一次拉取就够.
+struct CachedExclusionMap {
+    date: chrono::NaiveDate,
+    map: std::collections::HashMap<String, (String, String)>,
+}
+
+static EXCLUSION_MAP_CACHE: OnceLock<std::sync::Mutex<Option<CachedExclusionMap>>> = OnceLock::new();
+
+fn cached_exclusion_map() -> std::collections::HashMap<String, (String, String)> {
+    let cell = EXCLUSION_MAP_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    let today = chrono::Local::now().date_naive();
+    {
+        let guard = cell.lock().unwrap();
+        if let Some(c) = guard.as_ref() {
+            if c.date == today {
+                return c.map.clone();
+            }
+        }
+    }
+    let map = build_exclusion_map();
+    *cell.lock().unwrap() = Some(CachedExclusionMap { date: today, map: map.clone() });
+    map
+}
+
+/// 测试 / 调试用 — 强制清缓存 (例如 toml reload 后).
+#[cfg(test)]
+pub fn clear_exclusion_cache() {
+    if let Some(cell) = EXCLUSION_MAP_CACHE.get() {
+        *cell.lock().unwrap() = None;
+    }
+}
+
+/// review #15: source 改 enum, 替代字符串比较 (`if h.source == "持仓"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExclusionSource {
+    Holding,
+    Watchlist,
+}
+
+impl ExclusionSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            ExclusionSource::Holding => "持仓",
+            ExclusionSource::Watchlist => "自选",
+        }
+    }
+    pub fn emoji(self) -> &'static str {
+        match self {
+            ExclusionSource::Holding => "⚠️",
+            ExclusionSource::Watchlist => "📌",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -31,48 +88,77 @@ pub struct ExclusionHit {
     pub name: String,
     pub matched_board: String,
     pub reason: String,
-    pub source: String,
+    pub source: ExclusionSource,
 }
 
-/// 一次拉取所有排除板块的成份股，构建 code→board 映射（缓存当天）
+/// 一次拉取所有排除板块的成份股，构建 code→board 映射
 fn build_exclusion_map() -> std::collections::HashMap<String, (String, String)> {
     let mut map = std::collections::HashMap::new();
-    for (board_name, reason) in &excluded_boards() {
-        // 先用板块名直接搜
-        if let Ok(boards) = crate::market_analyzer::sector_monitor::fetch_board_ranking("f3", 100) {
-            if let Some(b) = boards.iter().find(|b| b.name.contains(board_name)) {
-                if let Ok(stocks) = crate::market_analyzer::sector_monitor::fetch_board_components(&b.code, 50) {
-                    for s in stocks {
-                        map.entry(s.code).or_insert_with(|| (board_name.to_string(), reason.to_string()));
-                    }
+    let boards_listing = match crate::market_analyzer::sector_monitor::fetch_board_ranking("f3", 100) {
+        Ok(b) => b,
+        Err(e) => {
+            log::warn!(
+                "exclusion: 板块排名拉取失败 ({}), 跳过本次排除扫描 — 风险板块可能漏检",
+                e
+            );
+            return map;
+        }
+    };
+    let mut failed_boards: Vec<&str> = Vec::new();
+    let excluded = excluded_boards();
+    for (board_name, reason) in &excluded {
+        let Some(b) = boards_listing.iter().find(|b| b.name.contains(board_name)) else {
+            failed_boards.push(board_name);
+            continue;
+        };
+        match crate::market_analyzer::sector_monitor::fetch_board_components(&b.code, 50) {
+            Ok(stocks) => {
+                for s in stocks {
+                    map.entry(s.code)
+                        .or_insert_with(|| (board_name.clone(), reason.clone()));
                 }
             }
+            Err(e) => {
+                log::warn!("exclusion: 板块 {} 成份股拉取失败: {}", board_name, e);
+                failed_boards.push(board_name);
+            }
         }
+    }
+    if !failed_boards.is_empty() {
+        log::warn!(
+            "exclusion: {} 个排除板块扫描失败: {:?}, 请人工复核持仓",
+            failed_boards.len(),
+            failed_boards
+        );
     }
     map
 }
 
 /// 扫描持仓和自选，返回命中排除板块的标的
 pub fn scan_exclusions(holdings: &[Position], watchlist: &[Position]) -> Vec<ExclusionHit> {
-    let exclusion_map = build_exclusion_map();
+    let exclusion_map = cached_exclusion_map();
     if exclusion_map.is_empty() { return vec![]; }
 
     let mut hits = Vec::new();
     for p in holdings {
         if let Some((board, reason)) = exclusion_map.get(&p.code) {
             hits.push(ExclusionHit {
-                code: p.code.clone(), name: p.name.clone(),
-                matched_board: board.clone(), reason: reason.clone(),
-                source: "持仓".to_string(),
+                code: p.code.clone(),
+                name: p.name.clone(),
+                matched_board: board.clone(),
+                reason: reason.clone(),
+                source: ExclusionSource::Holding,
             });
         }
     }
     for p in watchlist {
         if let Some((board, reason)) = exclusion_map.get(&p.code) {
             hits.push(ExclusionHit {
-                code: p.code.clone(), name: p.name.clone(),
-                matched_board: board.clone(), reason: reason.clone(),
-                source: "自选".to_string(),
+                code: p.code.clone(),
+                name: p.name.clone(),
+                matched_board: board.clone(),
+                reason: reason.clone(),
+                source: ExclusionSource::Watchlist,
             });
         }
     }
@@ -82,15 +168,18 @@ pub fn scan_exclusions(holdings: &[Position], watchlist: &[Position]) -> Vec<Exc
 /// 格式化排除告警
 pub fn format_exclusion_alert(hits: &[ExclusionHit]) -> String {
     if hits.is_empty() { return String::new(); }
-    let mut lines = vec!["🛑 排除板块命中".to_string()];
+    use std::fmt::Write;
+    let mut out = String::with_capacity(64 + hits.len() * 40);
+    out.push_str("🛑 排除板块命中\n");
     for h in hits {
-        lines.push(format!(
+        let _ = writeln!(
+            out,
             "  {} {}({}) — {}: {}",
-            if h.source == "持仓" { "⚠️" } else { "📌" },
+            h.source.emoji(),
             h.name, h.code, h.matched_board, h.reason,
-        ));
+        );
     }
-    lines.join("\n")
+    out
 }
 
 #[cfg(test)]
@@ -107,7 +196,7 @@ mod tests {
         let hits = vec![ExclusionHit {
             code: "000858".into(), name: "五粮液".into(),
             matched_board: "白酒".into(), reason: "成熟天花板".into(),
-            source: "持仓".into(),
+            source: ExclusionSource::Holding,
         }];
         let text = format_exclusion_alert(&hits);
         assert!(text.contains("排除板块命中"));
@@ -116,9 +205,9 @@ mod tests {
 
     #[test]
     fn test_exclusion_map_built() {
+        clear_exclusion_cache();
         // 不依赖网络时返回空 map（优雅降级）
         let map = build_exclusion_map();
-        // map 可能为空（无网络）或非空（有网络），两种都合法
         assert!(map.is_empty() || !map.is_empty());
     }
 }

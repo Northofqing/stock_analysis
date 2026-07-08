@@ -162,6 +162,15 @@ impl DatabaseManager {
             .expect("数据库未初始化，请先调用 DatabaseManager::init()")
     }
 
+    /// 尝试获取数据库管理器单例（返回 Option，不 panic）.
+    /// review #14: 取代之前各处 `catch_unwind(DatabaseManager::get)` 的反 pattern.
+    /// catch_unwind 强制 panic = unwind + 还要 AssertUnwindSafe wrap, 而且静默吞
+    /// init 失败, 让 operator 看到「数据全空」但不知道 DB 没起来.
+    /// 显式 Option 让调用方必须处理 None 路径 (早返回 / log warn).
+    pub fn try_get() -> Option<&'static DatabaseManager> {
+        DB_INSTANCE.get()
+    }
+
     /// 获取数据库连接
     pub fn get_conn(&self) -> Result<DbConnection, Box<dyn std::error::Error>> {
         Ok(self.pool.get()?)
@@ -917,41 +926,45 @@ impl DatabaseManager {
         if stock_codes.is_empty() {
             return Ok(std::collections::HashSet::new());
         }
-        // 修复 I-5 (2026-06-29 codex review): 防 SQL 注入 — 入口断言 stock_code
-        // 是 ASCII alphanumeric + 下划线 (e.g. "TEST_CODE_002" 测试用).
-        // 现状: 单引号 escape (`replace('\'', "''")`) 在生产路径下足够, 因为
-        // stock_code 全部由内部链路 (sector_monitor / chain_mapper / watchlist) 生成,
-        // 都是数字. 但**防御性编程**: 未来若接入 user-provided symbol, 单引号 escape
-        // 可能被绕过 (e.g. backslash 转义, unicode). assert 在 release build 也保留 (panic),
-        // 编译期明确 fail-fast, 不允许坏数据进 SQL.
+        // 修复 I-5 (2026-06-29 codex review) + review #14:
+        // 1. 防 SQL 注入 — 显式 if 校验 stock_code 是 ASCII alphanumeric + 下划线.
+        //    原 assert! 在 release 默认被优化掉 (除非显式 panic=abort + debug-assertions),
+        //    防护失效. 改为返回 Result 错误, 调用方决定如何处理.
+        // 2. 用 diesel prepared statement + ? bind 走参数化, 彻底消除字符串拼接风险.
         for c in stock_codes {
-            assert!(
-                c.chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'),
-                "count_recent_pushes_batch: stock_code must be alphanumeric/_/-, got {:?}",
-                c
-            );
+            if !c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-') {
+                return Err(format!(
+                    "count_recent_pushes_batch: stock_code must be alphanumeric/_/-, got {:?}",
+                    c
+                ).into());
+            }
         }
         let mut conn = self.get_conn()?;
         let cutoff = (chrono::Local::now() - chrono::Duration::days(days))
             .format("%Y-%m-%d")
             .to_string();
-        // 用 IN (...), 一次查所有 stock_code
-        let codes_csv = stock_codes
-            .iter()
-            .map(|c| format!("'{}'", c.replace('\'', "''"))) // 防 SQL injection (双层防御)
+        // 用 IN (?, ?, ...) + bind 走 prepared statement, 字符串拼接为零.
+        // SQLite parameter binding 类型安全, 无 escape 风险.
+        use diesel::sql_types::Text;
+        let placeholders = std::iter::repeat("?")
+            .take(stock_codes.len())
             .collect::<Vec<_>>()
             .join(",");
+        let raw = format!(
+            "SELECT DISTINCT stock_code FROM prediction_tracker WHERE stock_code IN ({}) AND pred_date >= ?",
+            placeholders
+        );
+        let mut q = diesel::sql_query(raw).into_boxed::<diesel::sqlite::Sqlite>();
+        for c in stock_codes {
+            q = q.bind::<Text, _>(c.clone());
+        }
+        q = q.bind::<Text, _>(cutoff);
         #[derive(serde::Serialize, serde::Deserialize, diesel::QueryableByName)]
         struct CodeRow {
             #[diesel(sql_type = diesel::sql_types::Text)]
             stock_code: String,
         }
-        let raw = format!(
-            "SELECT DISTINCT stock_code FROM prediction_tracker WHERE stock_code IN ({}) AND pred_date >= '{}'",
-            codes_csv, cutoff
-        );
-        let rows: Vec<CodeRow> = diesel::sql_query(raw).load::<CodeRow>(&mut *conn)?;
+        let rows: Vec<CodeRow> = q.load::<CodeRow>(&mut *conn)?;
         Ok(rows.into_iter().map(|r| r.stock_code).collect())
     }
 
