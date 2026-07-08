@@ -1033,14 +1033,23 @@ pub async fn run_post_close_candidates(top_n: usize) -> String {
 
     // 2a. v13.10.2: LLM 直接出 ticker (一劳永逸路径)
     // 不维护 32 关键词表, 让 LLM 认识所有公司/产品/产业链词.
-    // 失败 / 离线 / 无 provider → 静默, 不影响主路径.
+    // 失败 / 离线 / 无 provider → 降级到 chain_mapper, 路径信息写入推送文本.
+    //
+    // path_status: 写到推送文本头部, 让用户看到本轮走的是 AI 还是降级
+    let mut path_status: String = "🔧 降级 chain_mapper".to_string();
     {
         let llm_registry = crate::llm::LlmRegistry::from_env();
         if let Some(provider) = llm_registry.select("ticker_extraction") {
             log::info!("[PostClose] LLM provider={} model={}, 提取 ticker", provider.name(), provider.model());
-            match crate::llm::extract_tickers(provider, titles.clone()).await {
+            match crate::llm::extract_tickers(provider.clone(), titles.clone()).await {
                 Ok(ticker_hits) if !ticker_hits.is_empty() => {
-                    log::info!("[PostClose] LLM 提取 {} 只 ticker", ticker_hits.is_empty());
+                    log::info!("[PostClose] LLM 提取 {} 只 ticker", ticker_hits.len());
+                    path_status = format!(
+                        "🤖 AI 路径 (provider={}, model={}, 提取 {} 只)",
+                        provider.name(),
+                        provider.model(),
+                        ticker_hits.len()
+                    );
                     for t in &ticker_hits {
                         log::info!("[PostClose]   LLM hit: {}({}) imp={} chain={} reason={}",
                             t.name, t.code, t.importance, t.chain, t.reason);
@@ -1067,13 +1076,23 @@ pub async fn run_post_close_candidates(top_n: usize) -> String {
                         });
                     }
                 }
-                Ok(_) => log::info!("[PostClose] LLM 提取为空 (无命中 ticker)"),
-                Err(e) => log::warn!("[PostClose] LLM 提取失败: {}, 降级到 chain_mapper", e),
+                Ok(empty) => {
+                    log::info!("[PostClose] LLM 提取为空 ({} 命中), 降级到 chain_mapper", empty.len());
+                    path_status = format!("🔧 降级 chain_mapper (LLM 提取 0 只, provider={})", provider.name());
+                }
+                Err(e) => {
+                    log::warn!("[PostClose] LLM 提取失败: {}, 降级到 chain_mapper", e);
+                    path_status = format!("🔧 降级 chain_mapper (LLM 失败: {}, provider={})", e, provider.name());
+                }
             }
         } else {
             log::info!("[PostClose] LLM 未配置 (env 无 *_API_KEY), 走 chain_mapper 路径");
+            path_status = "🔧 降级 chain_mapper (LLM 未配置)".to_string();
         }
     }
+    // 把路径状态写到 lines 开头 (位于事件预检之后, 让 LLM 信息也参与排序前的展示)
+    lines.push(path_status.clone());
+    log::info!("[PostClose] 本轮路径: {}", path_status);
     let mut hits = tokio::task::spawn_blocking(move || {
         chain_mapper::resolve_stocks(&mut hits);
         hits
