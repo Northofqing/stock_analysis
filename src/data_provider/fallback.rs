@@ -16,6 +16,7 @@
 
 use anyhow::{anyhow, Result};
 
+use crate::data_provider::baostock_provider::BaostockProvider;
 use crate::data_provider::{
     DataProvider, GtimgProvider, HttpProvider, KlineData, RustdxProvider, SinaProvider, is_ban_error,
 };
@@ -30,6 +31,39 @@ fn brief(s: &str) -> String {
         let head: String = s.chars().take(MAX).collect();
         format!("{head}…(截断)")
     }
+}
+
+/// 盘后专用 K线拉取 (15:00-次日 9:30).
+///
+/// 优先级:
+/// 1. Baostock (证券所级别日终数据, 0 风险, 无频限) — 盘后窗口的权威源
+/// 2. fallthrough 到 review #15 5-way join (sina_hq / tencent_qfq / eastmoney_qfq / rustdx_none)
+///
+/// 返回 `(data, source_name)`: source_name 是 `baostock` 或 5-way 之一.
+///
+/// 设计: Baostock 在盘后窗口能拿到交易所日终结算价, 比盘中 fetch 的腾讯/东财
+/// 更稳定 (盘中数据可能含最后一笔 tick 的抖动). 因此盘后窗口盘后专用路径
+/// (review #15 5-way) 反过来把 Baostock 列为第一优先.
+pub async fn fetch_kline_post_close(
+    code: &str,
+    days: usize,
+) -> Result<(Vec<KlineData>, &'static str)> {
+    log::info!("[盘后] {code} 启动盘后专用链: baostock (P1) → 5-way fallthrough (P2)");
+
+    // 1. Baostock (日终权威, 0 风险)
+    let baostock = BaostockProvider::new();
+    match baostock.fetch_kline_async(code, days).await {
+        Ok(data) if !data.is_empty() => {
+            log::info!("[盘后] {code} Baostock 命中, {} 条", data.len());
+            return Ok((data, "baostock"));
+        }
+        Ok(_) => log::debug!("[盘后] {code} Baostock 返回空"),
+        Err(e) => log::warn!("[盘后] {code} Baostock 失败: {e}"),
+    }
+
+    // 2. Baostock 失败/空 → fallthrough 5-way join
+    log::info!("[盘后] {code} Baostock 失败, fallthrough 5-way join");
+    fetch_kline_with_fallback(code, days).await
 }
 
 /// 多源 fallback 拉取 K 线 + 质检门禁 (review #15 改三源竞速).
