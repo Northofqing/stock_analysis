@@ -32,6 +32,7 @@ pub mod lhb_analyzer;
 pub mod monitor;
 pub mod sharpe_calculator;
 pub mod chart_generator;
+pub mod llm;
 
 // 向外兼容：旧模块路径指向新的 strategy 子模块
 pub use strategy::core as backtest;

@@ -1030,6 +1030,50 @@ pub async fn run_post_close_candidates(top_n: usize) -> String {
         return "🎯 优选候选：未命中产业链，不输出候选".to_string();
     }
     log::info!("[PostClose] map_news_to_chains_ai 命中 {} 条链", hits.len());
+
+    // 2a. v13.10.2: LLM 直接出 ticker (一劳永逸路径)
+    // 不维护 32 关键词表, 让 LLM 认识所有公司/产品/产业链词.
+    // 失败 / 离线 / 无 provider → 静默, 不影响主路径.
+    {
+        let llm_registry = crate::llm::LlmRegistry::from_env();
+        if let Some(provider) = llm_registry.select("ticker_extraction") {
+            log::info!("[PostClose] LLM provider={} model={}, 提取 ticker", provider.name(), provider.model());
+            match crate::llm::extract_tickers(provider, titles.clone()).await {
+                Ok(ticker_hits) if !ticker_hits.is_empty() => {
+                    log::info!("[PostClose] LLM 提取 {} 只 ticker", ticker_hits.is_empty());
+                    for t in &ticker_hits {
+                        log::info!("[PostClose]   LLM hit: {}({}) imp={} chain={} reason={}",
+                            t.name, t.code, t.importance, t.chain, t.reason);
+                    }
+                    // 转 ChainHit 注入 hits, 复用下游 resolve_stocks / gate_hits
+                    for t in ticker_hits {
+                        // 去重: 已存在的 code 不重复加
+                        if hits.iter().any(|h| h.stocks.iter().any(|s| s.code == t.code)) {
+                            continue;
+                        }
+                        hits.push(chain_mapper::ChainHit {
+                            chain: t.chain.clone(),
+                            keywords: vec![t.name.clone()],
+                            logic: format!("[LLM] {}", t.reason),
+                            stocks: vec![chain_mapper::StockInfo {
+                                code: t.code.clone(),
+                                name: t.name.clone(),
+                                change_pct: 0.0,
+                                vol_ratio: 0.0,
+                            }],
+                            source: chain_mapper::ChainSource::Ai,
+                            board_keyword: t.chain.clone(),
+                            fund_flow_pct: None,
+                        });
+                    }
+                }
+                Ok(_) => log::info!("[PostClose] LLM 提取为空 (无命中 ticker)"),
+                Err(e) => log::warn!("[PostClose] LLM 提取失败: {}, 降级到 chain_mapper", e),
+            }
+        } else {
+            log::info!("[PostClose] LLM 未配置 (env 无 *_API_KEY), 走 chain_mapper 路径");
+        }
+    }
     let mut hits = tokio::task::spawn_blocking(move || {
         chain_mapper::resolve_stocks(&mut hits);
         hits
