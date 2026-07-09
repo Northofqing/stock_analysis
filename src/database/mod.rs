@@ -226,6 +226,27 @@ impl DatabaseManager {
         Ok(())
     }
 
+    /// review #16: news_items 详存 (与 news_dedup 5min 去重互补, 永久详存)
+    pub const NEWS_ITEMS_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS news_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    category TEXT NOT NULL,
+    code TEXT,
+    title TEXT NOT NULL,
+    summary TEXT,
+    url TEXT NOT NULL,
+    source_name TEXT,
+    published_at INTEGER NOT NULL,
+    fetched_at INTEGER NOT NULL,
+    content_hash TEXT NOT NULL,
+    UNIQUE(source, external_id)
+);
+CREATE INDEX IF NOT EXISTS idx_news_items_code_time ON news_items(code, published_at);
+CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
+"#;
+
     /// 运行数据库迁移
     fn run_migrations(conn: &mut SqliteConnection) -> Result<(), Box<dyn std::error::Error>> {
         // 创建 stock_daily 表
@@ -704,6 +725,41 @@ impl DatabaseManager {
         diesel::sql_query("CREATE INDEX IF NOT EXISTS idx_position_adjustments_effective ON position_adjustments(effective_date)")
             .execute(&mut *conn).ok();
 
+        // review #16: news_items 详存 schema (idempotent CREATE IF NOT EXISTS)
+        diesel::sql_query(Self::NEWS_ITEMS_SCHEMA).execute(&mut *conn)?;
+
+        Ok(())
+    }
+
+    /// review #16: 插入单条 NewsItem (INSERT OR IGNORE 走 UNIQUE 约束去重).
+    ///
+    /// 同 `(source, external_id)` 已存在则跳过 (UNIQUE constraint + INSERT OR IGNORE).
+    /// `code` 为 None 时写空串 (schema 列允许 TEXT 无默认值, 实际查询时按 code IS NULL 或 code = '' 过滤).
+    /// 时间戳写 unix seconds (i64, 落 INTEGER 列).
+    pub fn insert_news_item(
+        &self,
+        item: &crate::data_provider::news_item::NewsItem,
+    ) -> Result<(), String> {
+        use crate::data_provider::news_item::NewsItem;
+        use diesel::sql_types::{BigInt, Text};
+        let mut conn = self.get_conn().map_err(|e| e.to_string())?;
+        diesel::sql_query(
+            "INSERT OR IGNORE INTO news_items (source, external_id, category, code, title, summary, url, source_name, published_at, fetched_at, content_hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        )
+        .bind::<Text, _>(&item.source)
+        .bind::<Text, _>(&item.external_id)
+        .bind::<Text, _>(&item.category)
+        .bind::<Text, _>(item.code.as_deref().unwrap_or(""))
+        .bind::<Text, _>(&item.title)
+        .bind::<Text, _>(&item.summary)
+        .bind::<Text, _>(&item.url)
+        .bind::<Text, _>(&item.source_name)
+        .bind::<BigInt, _>(item.published_at.timestamp())
+        .bind::<BigInt, _>(item.fetched_at.timestamp())
+        .bind::<Text, _>(&item.content_hash)
+        .execute(&mut *conn)
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
 

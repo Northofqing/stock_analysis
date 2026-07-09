@@ -24,6 +24,8 @@ pub mod sina_provider;
 pub mod stock_code_map;
 pub mod valuation_history;
 pub mod yahoo;
+// review #16: 新闻条目结构 + content_hash
+pub mod news_item;
 
 pub use chip_distribution::{
     compute_chip_distribution, format_for_prompt as format_chip_prompt, ChipDistribution,
