@@ -13,7 +13,7 @@
 use stock_analysis::data_provider::baostock_provider::{
     build_kline_query_body, build_kline_request_body, build_login_msg, build_login_url,
     build_logout_body, build_logout_url, parse_baostock_response, parse_baostock_response_kline,
-    parse_baostock_tcp_response, BaostockTcpMessage,
+    parse_baostock_tcp_response, read_tcp_response, BaostockTcpMessage,
 };
 
 #[test]
@@ -283,4 +283,40 @@ fn test_build_logout_body_format() {
     assert_eq!(parts[1], "anonymous", "field 1 must be user");
     assert_eq!(parts[2], "888888", "field 2 must be pass");
     assert_eq!(parts[3], "1", "field 3 must be options='1' (logout)");
+}
+
+// ============================================================================
+// Batch 1 P0 #3: Baostock read_tcp_response 加 timeout (防服务端挂起)
+// ============================================================================
+
+/// P0 #3: read_tcp_response 必须在 timeout 后返 Err, 不能永久 await.
+/// 模拟服务端 accept 后不发数据 (挂起).
+#[tokio::test]
+async fn test_read_tcp_response_times_out_on_hang() {
+    // 启动一个 dummy listener, accept 后 sleep 60s (远超 timeout)
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        // 不发数据, sleep 60s 让 client read 超时
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        drop(stream);
+    });
+
+    // client connect
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+    // 用 500ms timeout, 服务端挂起, 应返 Err (而不是永久 await)
+    let result =
+        read_tcp_response(&mut stream, std::time::Duration::from_millis(500)).await;
+
+    assert!(
+        result.is_err(),
+        "timeout 后 read_tcp_response 应返 Err, got: {result:?}"
+    );
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(
+        err_msg.contains("超时") || err_msg.contains("timeout"),
+        "错误信息应含 '超时'/'timeout', got: {err_msg}"
+    );
 }

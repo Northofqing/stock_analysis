@@ -267,23 +267,35 @@ pub fn parse_baostock_tcp_response(buf: &[u8]) -> Result<BaostockTcpMessage> {
 /// 等待 TCP 响应 (从已连接的 stream 读取直到末尾 marker).
 ///
 /// 累积到 buf 里, 末尾匹配 `<![CDATA[]]>\n` (13 bytes) 或超过 1 MB 强制返回.
-async fn read_tcp_response(stream: &mut TcpStream) -> Result<Vec<u8>> {
-    let mut buf = Vec::with_capacity(4096);
-    let mut chunk = [0u8; 4096];
-    const MAX_BUF: usize = 1_048_576; // 1 MB 上限
-    loop {
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            return Err(anyhow!("Baostock TCP: 连接在响应中途关闭"));
+///
+/// review #16 P0 #3: 之前无 timeout, 服务端挂起会永久 await 任务泄漏.
+/// 现 wrap 在 `tokio::time::timeout` 里, 超时返 Err 让上层重连.
+pub async fn read_tcp_response(
+    stream: &mut TcpStream,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>> {
+    let read = async {
+        let mut buf = Vec::with_capacity(4096);
+        let mut chunk = [0u8; 4096];
+        const MAX_BUF: usize = 1_048_576; // 1 MB 上限
+        loop {
+            let n = stream.read(&mut chunk).await?;
+            if n == 0 {
+                return Err(anyhow!("Baostock TCP: 连接在响应中途关闭"));
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.len() > MAX_BUF {
+                return Err(anyhow!("Baostock TCP: 响应超 {MAX_BUF} 字节, 强制截断"));
+            }
+            // 末尾匹配
+            if buf.ends_with(RESPONSE_END_MARKER) {
+                return Ok(buf);
+            }
         }
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.len() > MAX_BUF {
-            return Err(anyhow!("Baostock TCP: 响应超 {MAX_BUF} 字节, 强制截断"));
-        }
-        // 末尾匹配
-        if buf.ends_with(RESPONSE_END_MARKER) {
-            return Ok(buf);
-        }
+    };
+    match tokio::time::timeout(timeout, read).await {
+        Ok(r) => r,
+        Err(_) => Err(anyhow!("Baostock TCP: 读取超时 ({:?})", timeout)),
     }
 }
 
@@ -501,7 +513,7 @@ impl BaostockProvider {
         }
     }
 
-    /// 发送一帧 + 接收完整响应.
+    /// 发送一帧 + 接收完整响应 (15s timeout 防服务端挂起).
     pub(crate) async fn send_and_recv(&self, frame: &[u8]) -> Result<Vec<u8>> {
         let mut guard = self.stream.lock().await;
         let stream = guard
@@ -510,8 +522,8 @@ impl BaostockProvider {
         stream.write_all(frame).await.map_err(|e| {
             anyhow!("Baostock TCP: 发送失败: {e}")
         })?;
-        // 单次响应: 累积到末尾 marker
-        read_tcp_response(stream).await
+        // 单次响应: 累积到末尾 marker, 15s 超时
+        read_tcp_response(stream, std::time::Duration::from_secs(15)).await
     }
 
     /// 异步拉取 K 线 (TCP).
