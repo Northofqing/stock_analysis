@@ -305,3 +305,17 @@ ab4e246 fix(v9.2): §2.8 门禁脚本 + verify_one DRY 重构 (R-1 fix review fi
 - `cargo build`: OK
 - `cargo test --lib`: 924 passed / 1 failed (pre-existing) / 3 ignored
 - 所有 12 tasks 完整, 8 个 K线 + 4 个新闻
+
+### Task 13: ⚠️ DONE_WITH_CONCERNS
+- c324866 — fix(baostock): rewrite as TCP socket protocol (C1 from final review)
+- 14 tests pass (10 integration + 4 inline)
+- Files: baostock_provider.rs (197→510 lines), tests (70→265 lines), Cargo.toml (+flate2)
+- 重大发现: brief 协议细节猜错 (CRC decimal 不是 hex, client frame 无 \n, body len 用 chars 不是 bytes)
+- e2e 未验证: server 限制本环境 IP 新连接, Python fresh socket 也 timeout (不只是 Rust 问题)
+- 保留旧 HTTP helpers 标 `#[deprecated]` (兼容)
+
+### Task 14: ✅ DONE
+- 171784f — fix(sina-news): use pageid=155 (实测 code:0, pageid=153 返未注册)
+- 5 tests pass (含实测 JSON 验证)
+- Files: sina_news_provider.rs (pageid 153→155 + media_name fallback), tests/sina_news_provider_test.rs
+- Concern: 1 个测试用硬编码 JSON 不需网络, 未标 #[ignore]
