@@ -140,6 +140,15 @@ pub fn build_login_msg(body: &str) -> String {
     String::from_utf8(frame).expect("login msg 必为 UTF-8")
 }
 
+/// 构造登出 body (msg_type="00" 复用, 协议层共用).
+///
+/// review #16 P0 #2: 协议要求 4 字段 (login|user|pass|options).
+/// 之前 logout 拼了 6 字段 (USER/PASS 重复 + session_id), 与 baostock 协议不符.
+/// options="1" 表示登出 (服务端会清 session).
+pub fn build_logout_body(user: &str, pass: &str, _session_id: &str) -> String {
+    format!("login\x01{user}\x01{pass}\x011")
+}
+
 /// 构造 K线查询请求 body.
 ///
 /// body 格式: `query_history_k_data_plus\x01user\x1page\x1per_page\x1code\x1fields\x1start\x1end\x1frequency\x1adjustflag`
@@ -475,8 +484,11 @@ impl BaostockProvider {
     }
 
     /// 登出 (msg_type="00" body 含 options="1", 服务端会清 session).
+    ///
+    /// review #16 P0 #2: body 改为 4 字段 `login|user|pass|options=1`,
+    /// 之前 6 字段 (USER/PASS 重复 + session_id) 与协议不符.
     pub async fn logout(&self, session_id: &str) {
-        let body = format!("login\x01{BAOSTOCK_USER}\x01{BAOSTOCK_PASS}\x01{BAOSTOCK_USER}\x01{BAOSTOCK_PASS}\x01{session_id}");
+        let body = build_logout_body(BAOSTOCK_USER, BAOSTOCK_PASS, session_id);
         let frame = build_login_msg(&body);
         match self.send_and_recv(frame.as_bytes()).await {
             Ok(resp) => {

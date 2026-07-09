@@ -12,7 +12,7 @@
 
 use stock_analysis::data_provider::baostock_provider::{
     build_kline_query_body, build_kline_request_body, build_login_msg, build_login_url,
-    build_logout_url, parse_baostock_response, parse_baostock_response_kline,
+    build_logout_body, build_logout_url, parse_baostock_response, parse_baostock_response_kline,
     parse_baostock_tcp_response, BaostockTcpMessage,
 };
 
@@ -261,4 +261,26 @@ fn _tcp_message_struct_exists() {
         body: "login".to_string(),
         crc32: 0,
     };
+}
+
+// ============================================================================
+// Batch 1 P0 #2: Baostock logout body 4 字段 (login|user|pass|options=1)
+// ============================================================================
+
+/// P0 #2: logout body 协议修复 — 4 字段 (login|user|pass|options).
+/// 之前 6 字段 (USER/PASS 重复 + session_id) 与 baostock 协议不符, 服务端会拒包.
+#[test]
+fn test_build_logout_body_format() {
+    let body = build_logout_body("anonymous", "888888", "session_123");
+    let parts: Vec<&str> = body.split('\x01').collect();
+    assert_eq!(
+        parts.len(),
+        4,
+        "logout body 应 4 字段, 实际 {} 字段: {body:?}",
+        parts.len()
+    );
+    assert_eq!(parts[0], "login", "field 0 must be 'login'");
+    assert_eq!(parts[1], "anonymous", "field 1 must be user");
+    assert_eq!(parts[2], "888888", "field 2 must be pass");
+    assert_eq!(parts[3], "1", "field 3 must be options='1' (logout)");
 }
