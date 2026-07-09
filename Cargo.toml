@@ -57,6 +57,7 @@ toml = "0.8"
 arc-swap = "1.9.2"
 dashmap = "6.2.1"
 aho-corasick = "1.1.4"
+flate2 = "1"  # Task 13: Baostock TCP 协议 msg_type="96" 解压 (C1 fix)
 
 # qmt-parser 0.2.1 — GPL-3.0 license, 项目自用 (不分发).
 # 计划在后续 Task (QMT 本地缓存集成) 接入 fallback priority 0.

@@ -5493,6 +5493,7 @@ dependencies = [
  "dotenvy",
  "encoding_rs",
  "env_logger",
+ "flate2",
  "futures",
  "hex",
  "image 0.25.10",
