@@ -94,3 +94,67 @@ T0+60ms: 输出 (data, "tencent_qfq") | ... | Err(...)
 - 测试: `src/data_provider/{sina_provider, baostock_provider, fallback, stock_code_map}_test.rs`
 - 业务规则: `docs/business_rules.md` (BR-014, BR-015)
 - 评审: review #15 (4-way 竞速) + review #16 (Phase 1 集成)
+
+---
+
+## Phase 2: Sina 新闻数据集成 (review #16, 2026-07-09)
+
+### 数据源
+
+Sina 公开新闻 feed (与 K线 hq.sinajs.cn 同源不同域, 复用 GBK 容错):
+
+| 用途 | lid | pageid | URL 模板 | 字段 |
+|------|-----|--------|----------|------|
+| 财经要闻 | 1686 | 153 | `?pageid=153&lid=1686&k=&num=20&page=1` | url / title / intro / ctime / media_name |
+| 个股新闻 | 2516 | 155 | `?pageid=155&lid=2516&k={code}&num=20&page=1` | url / title / intro / ctime / media_name |
+
+Base URL: `https://feed.mix.sina.com.cn/api/roll/get`.
+
+### 架构
+
+```
+              ┌──── 实时轮询 (poll_news_loop, 90s)
+              │     - 拉 20 条财经要闻
+              │     - 每条 → insert_news_item (dedup by content_hash)
+              │
+Sina  ────────┤
+              │
+              │
+              └──── 盘后回溯 (post_close_news_scheduler, 30min tick)
+                    - 触发条件: 本地时间 >= 15:30
+                    - 取持仓代码列表 (get_positions)
+                    - 每只 code → fetch_stock_news_in_range (5 页 × 20 = 100 条)
+                    - 客户端过滤 30 天时间窗 → insert_news_item
+```
+
+- 实时路径: `poll_news_loop` (`src/bin/monitor/main.rs:5150`) — Task 11
+- 盘后路径: `post_close_news_scheduler` → `post_close_news_review` (`src/bin/monitor/main.rs:5190-5240`) — Task 12
+
+### 双写 news_items 表
+
+- 旧 `news_dedup` (5 min 滑窗) — 仍用于实时"短时间内不要再推"提示
+- 新 `news_items` (永久详存) — 跨重启追溯 + 后续 LLM 复盘数据源
+- 去重键: `content_hash` = SHA256(title + summary) — 同源同 ID 但内容变时可检测
+- 入库函数: `DatabaseManager::with_db(caller, |db| db.insert_news_item(item))` (review #15 helper, 一次 warn 不刷屏)
+
+### BR-016
+
+- 业务规则: `docs/business_rules.md` BR-016
+- intent: Sina 新闻 API 双路径 (实时 + 盘后) 双写 news_items; 含 content_hash 去重
+- code: `src/data_provider/sina_news_provider.rs`, `src/data_provider/news_item.rs`, `src/database/mod.rs`
+
+### 启动 banner
+
+```text
+[启动] 新闻轮询: Sina 财经要闻 (90s 间隔, 双写 news_items)
+[启动] 盘后回溯: Sina 个股新闻 (15:30 后, 30 天, 持仓代码)
+```
+
+### Commit 列表 (Phase 2)
+
+| Task | 内容 | Commit |
+|------|------|--------|
+| 9 | NewsItem struct + news_items migration | (Task 9 实施, 详见 `.superpowers/sdd/task-9-report.md`) |
+| 10 | SinaNewsProvider (top + stock + history range) | (Task 10 实施) |
+| 11 | poll_news_loop (90s 财经要闻) | `d9b082f` |
+| 12 | post_close_news_review + BR-016 + Phase 2 docs | (Task 12 commit, 详见 `.superpowers/sdd/task-12-report.md`) |

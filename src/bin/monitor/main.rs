@@ -975,6 +975,10 @@ async fn main() {
     );
     log::info!("[启动] 盘后路径: baostock (P1) → 4-way join (P2, post_close)");
 
+    // Task 11 + Task 12 (Phase 2): Sina 新闻链路 — 实时 + 盘后回溯.
+    log::info!("[启动] 新闻轮询: Sina 财经要闻 (90s 间隔, 双写 news_items)");
+    log::info!("[启动] 盘后回溯: Sina 个股新闻 (15:30 后, 30 天, 持仓代码)");
+
     // v70: e2e 模式 (--e2e) — 跑所有 v12 §14 + v13.1 模板, 忽略时间窗口, mock fallback
     if e2e_mode {
         log::info!("[v70] E2E 模式启动 — 跑所有 v12 §14 模板 (忽略时间窗口)");
@@ -1109,6 +1113,8 @@ async fn main() {
 
         // v13.11 (Task 11): 独立轮询 Sina 财经要闻 (90s) → 双写 DB
         tokio::spawn(poll_news_loop());
+        // v13.12 (Task 12): 盘后回溯调度 — 30 min tick, 15:30 后触发持仓个股近 30 天新闻回溯
+        tokio::spawn(post_close_news_scheduler());
 
         tokio::select! {
             _ = main_loops => {},
@@ -5183,6 +5189,92 @@ async fn poll_news_loop() {
                 );
             }
             Err(e) => log::warn!("[新闻] Sina 拉取失败: {e}"),
+        }
+    }
+}
+
+/// v13.12 (Task 12): 盘后回溯 — 拉取持仓个股近 30 天 Sina 个股新闻, 双写 news_items.
+/// 与 poll_news_loop 解耦: 本函数一次性跑完所有持仓, 不循环.
+/// 入口: scheduler 在每 30 分钟 tick 时, 若本地时间 >= 15:30 触发一次.
+async fn post_close_news_review() {
+    use chrono::{Duration as ChronoDuration, Utc};
+    use stock_analysis::data_provider::sina_news_provider::SinaNewsProvider;
+    use stock_analysis::database::DatabaseManager;
+
+    let now = Utc::now();
+    let from = now - ChronoDuration::days(30);
+    let provider = SinaNewsProvider::new();
+
+    // 读持仓代码列表 (失败 → 用空 Vec, 不会 panic).
+    let holdings: Vec<String> = stock_analysis::portfolio::get_positions()
+        .unwrap_or_default()
+        .iter()
+        .map(|p| p.code.clone())
+        .collect();
+
+    log::info!(
+        "[盘后] 拉 {} 只持仓近 30 天个股新闻 (from={}, to={})",
+        holdings.len(),
+        from.format("%Y-%m-%d"),
+        now.format("%Y-%m-%d")
+    );
+
+    if holdings.is_empty() {
+        log::warn!("[盘后] 当前无持仓, 跳过回溯");
+        return;
+    }
+
+    for code in &holdings {
+        match provider.fetch_stock_news_in_range(code, from, now).await {
+            Ok(items) => {
+                let total = items.len();
+                let mut written = 0usize;
+                for item in &items {
+                    let ok = DatabaseManager::with_db("post_close_news", |db| {
+                        if db.insert_news_item(item).is_ok() {
+                            Some(())
+                        } else {
+                            None
+                        }
+                    });
+                    if ok.is_some() {
+                        written += 1;
+                    }
+                }
+                log::info!(
+                    "[盘后] {code} Sina 个股新闻: 拉 {} 条, DB 写 {} 条",
+                    total,
+                    written
+                );
+            }
+            Err(e) => log::warn!("[盘后] {code} Sina 拉取失败: {e}"),
+        }
+    }
+    log::info!("[盘后] 持仓回溯完成 ({} 只持仓)", holdings.len());
+}
+
+/// v13.12 (Task 12): 盘后回溯调度 — 每 30 分钟 tick 一次, 若本地时间已过 15:30 则触发一次.
+/// 简化策略: 进入盘后时段后每 30 分钟最多触发一次 (避免重启后多触).
+async fn post_close_news_scheduler() {
+    use std::time::Duration;
+
+    let threshold = chrono::NaiveTime::from_hms_opt(15, 30, 0).unwrap_or_else(|| {
+        chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap()
+    });
+    let mut interval = tokio::time::interval(Duration::from_secs(1800));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    log::info!(
+        "[盘后调度] 启动 (30 min tick, 触发条件: 本地时间 >= {})",
+        threshold.format("%H:%M")
+    );
+
+    loop {
+        interval.tick().await;
+        let now_local = chrono::Local::now();
+        if now_local.time() >= threshold {
+            log::info!("[盘后调度] tick @ {} → 触发回溯", now_local.format("%H:%M"));
+            post_close_news_review().await;
         }
     }
 }
