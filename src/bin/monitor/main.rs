@@ -1107,6 +1107,9 @@ async fn main() {
             tokio::join!(monitor_loop(), news_monitor_loop());
         };
 
+        // v13.11 (Task 11): 独立轮询 Sina 财经要闻 (90s) → 双写 DB
+        tokio::spawn(poll_news_loop());
+
         tokio::select! {
             _ = main_loops => {},
             _ = tokio::signal::ctrl_c() => {
@@ -5139,6 +5142,49 @@ async fn push_market_fund_top10() {
     // v56: 改用 dispatch_fund_inflow_top_daily (I-10 v12 §14.5 模板)
     let hhmm = chrono::Local::now().format("%H:%M").to_string();
     let _ = push_templates::dispatch_fund_inflow_top_daily(&hhmm).await;
+}
+
+/// v13.11 (Task 11): 独立轮询 Sina 财经要闻, 每 90s 拉一次 top 20,
+/// 双写 DatabaseManager::news_items 表 (供后续链路/回溯使用).
+/// 与 news_monitor_loop 解耦: 本 loop 不做信号/AI 分析, 仅入库.
+async fn poll_news_loop() {
+    use stock_analysis::data_provider::sina_news_provider::SinaNewsProvider;
+    use stock_analysis::database::DatabaseManager;
+    use std::time::Duration;
+
+    let provider = SinaNewsProvider::new();
+    let mut interval = tokio::time::interval(Duration::from_secs(90));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    log::info!("[PollNews] 启动 (Sina 财经要闻, 90s 间隔, 双写 DB)");
+
+    loop {
+        interval.tick().await;
+        match provider.fetch_top_news(20).await {
+            Ok(items) => {
+                let count = items.len();
+                let mut written = 0usize;
+                for item in &items {
+                    let ok = DatabaseManager::with_db("poll_news", |db| {
+                        if db.insert_news_item(item).is_ok() {
+                            Some(())
+                        } else {
+                            None
+                        }
+                    });
+                    if ok.is_some() {
+                        written += 1;
+                    }
+                }
+                log::info!(
+                    "[新闻] Sina 拉取 {} 条, DB 写 {} 条",
+                    count,
+                    written
+                );
+            }
+            Err(e) => log::warn!("[新闻] Sina 拉取失败: {e}"),
+        }
+    }
 }
 
 async fn push(event: &AlertEvent) {
