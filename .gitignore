@@ -10,7 +10,11 @@
 /test_data
 /docs
 /.trellis
-/tests
 /tools
-/skills-lock.json# 推送日志 (data/push_log, 运行时生成)
+/skills-lock.json
+# 推送日志 (data/push_log, 运行时生成)
 data/push_log/
+
+# review #16 fix (B-001): 不忽略 tests/ 目录, 让 cargo integration tests 正常入仓
+# (之前 /tests 在 .gitignore line 13, 导致新 test files 需 `git add -f`, 易漏)
+# 例外: 测试运行时数据 (test_data) 已在 line 10 单独忽略
