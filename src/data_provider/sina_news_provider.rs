@@ -19,10 +19,10 @@ use super::news_item::{content_hash, NewsItem};
 /// Sina 新闻 feed API base URL.
 pub const SINA_NEWS_API_BASE: &str = "https://feed.mix.sina.com.cn/api/roll/get";
 
-/// 财经要闻 URL (lid=1686, pageid=153).
+/// 财经要闻 URL (lid=1686, pageid=155).
 pub fn build_top_news_url(num: usize) -> String {
     format!(
-        "{SINA_NEWS_API_BASE}?pageid=153&lid=1686&k=&num={num}&page=1"
+        "{SINA_NEWS_API_BASE}?pageid=155&lid=1686&k=&num={num}&page=1"
     )
 }
 
@@ -72,11 +72,37 @@ pub fn parse_sina_news_body(body: &str, category: &str, code: Option<&str>) -> R
             .unwrap_or("")
             .to_string();
         let ctime = entry.get("ctime").and_then(|x| x.as_i64()).unwrap_or(0);
-        let media_name = entry
-            .get("media_name")
-            .and_then(|x| x.as_str())
-            .unwrap_or("新浪财经")
-            .to_string();
+        // Sina 财经要闻响应中 `media_name` 经常为空字符串.
+        // Fallback 顺序: media_name 非空 -> oid/docid 字段 -> 默认 "新浪财经".
+        let media_name = {
+            let raw = entry
+                .get("media_name")
+                .and_then(|x| x.as_str())
+                .map(|s| s.trim())
+                .unwrap_or("");
+            if !raw.is_empty() {
+                raw.to_string()
+            } else {
+                // 尝试从 oid/docid 字段提取; 都缺失则用默认.
+                let oid = entry
+                    .get("oid")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.trim())
+                    .unwrap_or("");
+                let docid = entry
+                    .get("docid")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.trim())
+                    .unwrap_or("");
+                if !oid.is_empty() {
+                    format!("sina:{oid}")
+                } else if !docid.is_empty() {
+                    format!("sina:{docid}")
+                } else {
+                    "新浪财经".to_string()
+                }
+            }
+        };
         let published_at = chrono::DateTime::from_timestamp(ctime, 0).unwrap_or_else(|| now);
         let hash = content_hash(&title, &intro);
         items.push(NewsItem {
