@@ -179,7 +179,10 @@ impl SinaNewsProvider {
             .collect())
     }
 
-    /// 内部 helper: GET → GBK 容错 → UTF-8 String.
+    /// 内部 helper: GET → UTF-8 first → GBK fallback → String.
+    ///
+    /// review #16 P0 #1: Sina news API 实际返 UTF-8, 强制 GBK 解会乱码 (中文标题/摘要
+    /// 全部 mojibake, content_hash 撞 dedup 失效). 先试 UTF-8 decode, 失败再 fallback GBK.
     async fn fetch_bytes(&self, url: &str) -> Result<String> {
         let bytes = self
             .client
@@ -190,8 +193,22 @@ impl SinaNewsProvider {
             .error_for_status()?
             .bytes()
             .await?;
-        let (utf8, _, _) = GBK.decode(&bytes);
-        Ok(utf8.into_owned())
+        Ok(decode_sina_bytes(&bytes))
+    }
+}
+
+/// 把 Sina news API 响应字节解码为 UTF-8 String.
+/// 先试 UTF-8, 失败 fallback GBK + log warn (旧版接口).
+pub fn decode_sina_bytes(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => {
+            let (s, _, had_errors) = GBK.decode(bytes);
+            if had_errors {
+                log::warn!("[Sina news] GBK decode 错误, 部分字符可能异常");
+            }
+            s.into_owned()
+        }
     }
 }
 
