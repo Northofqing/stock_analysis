@@ -9,11 +9,11 @@
 
 use anyhow::Result;
 use chrono::Local;
+use std::fs::OpenOptions;
+use std::io::Write;
 use stock_analysis::data_provider::{DataFetcherManager, KlineData};
 use stock_analysis::strategy::rsi::{RsiBacktest, RsiConfig, SingleRsiResult};
 use stock_analysis::strategy::TradeAction;
-use std::fs::OpenOptions;
-use std::io::Write;
 
 /// 股票池：覆盖不同板块与行情特征，共 30 只
 const STOCK_POOL: &[(&str, &str)] = &[
@@ -127,9 +127,7 @@ fn compute_stock_stat(r: &SingleRsiResult) -> SingleStockStat {
     }
 }
 
-fn fetch_pool(
-    dm: &DataFetcherManager,
-) -> Vec<(String, String, Vec<KlineData>)> {
+fn fetch_pool(dm: &DataFetcherManager) -> Vec<(String, String, Vec<KlineData>)> {
     let mut out = Vec::new();
     for (code, name) in STOCK_POOL.iter() {
         match dm.get_daily_data(code, 7000) {
@@ -222,7 +220,13 @@ fn format_preset_report(s: &PresetStats) -> String {
     out.push_str(&format!(
         "- **整体胜率**：{:.2}%  {}\n",
         wr,
-        if wr >= 80.0 { "✅ 达标" } else if wr >= 70.0 { "🟡 接近" } else { "🔴 未达" }
+        if wr >= 80.0 {
+            "✅ 达标"
+        } else if wr >= 70.0 {
+            "🟡 接近"
+        } else {
+            "🔴 未达"
+        }
     ));
     out.push_str(&format!("- 平均收益：{:.2}%\n", s.avg_return_pct));
     out.push_str(&format!(
@@ -243,11 +247,21 @@ fn format_preset_report(s: &PresetStats) -> String {
     out.push_str("| 代码 | 名称 | 交易次数 | 平仓次数 | 胜 | 胜率 | 收益率 |\n");
     out.push_str("|------|------|---------|---------|----|------|--------|\n");
     let mut sorted = s.per_stock.iter().collect::<Vec<_>>();
-    sorted.sort_by(|a, b| b.win_rate.partial_cmp(&a.win_rate).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.sort_by(|a, b| {
+        b.win_rate
+            .partial_cmp(&a.win_rate)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     for st in sorted.iter().filter(|x| x.round_trips > 0) {
         out.push_str(&format!(
             "| {} | {} | {} | {} | {} | {:.1}% | {:+.2}% |\n",
-            st.code, st.name, st.trades, st.round_trips, st.wins, st.win_rate * 100.0, st.return_pct
+            st.code,
+            st.name,
+            st.trades,
+            st.round_trips,
+            st.wins,
+            st.win_rate * 100.0,
+            st.return_pct
         ));
     }
     out.push('\n');
@@ -270,15 +284,27 @@ fn all_presets() -> Vec<(&'static str, RsiConfig)> {
         ("daily_v2", RsiConfig::preset_daily_v2()),
         ("daily_v3_strict", RsiConfig::preset_daily_v3_strict()),
         ("daily_v4_stop_take", RsiConfig::preset_daily_v4_stop_take()),
-        ("daily_v5_high_winrate", RsiConfig::preset_daily_v5_high_winrate()),
+        (
+            "daily_v5_high_winrate",
+            RsiConfig::preset_daily_v5_high_winrate(),
+        ),
         ("daily_v6_clean", RsiConfig::preset_daily_v6_clean()),
         ("daily_v7_deeper", RsiConfig::preset_daily_v7_deeper()),
         ("daily_v8_score2", RsiConfig::preset_daily_v8_score2()),
         ("daily_v9_reversal", RsiConfig::preset_daily_v9_reversal()),
         ("daily_v10_no_stop", RsiConfig::preset_daily_v10_no_stop()),
-        ("daily_v11_no_stop_rising", RsiConfig::preset_daily_v11_no_stop_rising()),
-        ("daily_v12_deep_no_stop", RsiConfig::preset_daily_v12_deep_no_stop()),
-        ("daily_v13_strict_rising", RsiConfig::preset_daily_v13_strict_rising()),
+        (
+            "daily_v11_no_stop_rising",
+            RsiConfig::preset_daily_v11_no_stop_rising(),
+        ),
+        (
+            "daily_v12_deep_no_stop",
+            RsiConfig::preset_daily_v12_deep_no_stop(),
+        ),
+        (
+            "daily_v13_strict_rising",
+            RsiConfig::preset_daily_v13_strict_rising(),
+        ),
     ]
 }
 

@@ -45,16 +45,31 @@ pub fn calc_winrate_score(samples: &[BacktestSample]) -> Option<f64> {
 pub fn compute_winrate_summary(samples: &[BacktestSample]) -> WinrateSummary {
     const MIN_SAMPLES: usize = 200;
     // 过滤掉 n_day_return=0 (中性, 不算胜负)
-    let valid: Vec<_> = samples.iter().filter(|s| s.n_day_return.abs() > 0.0001).collect();
+    let valid: Vec<_> = samples
+        .iter()
+        .filter(|s| s.n_day_return.abs() > 0.0001)
+        .collect();
     let total = valid.len();
     let wins = valid.iter().filter(|s| s.n_day_return > 0.0).count();
     let losses = total - wins;
     if total < MIN_SAMPLES {
         // insufficient 仍报告真实 wins/losses/total (数据缺 ≠ 数据全零)
-        return WinrateSummary { score: 0.0, sufficient: false, total, wins, losses };
+        return WinrateSummary {
+            score: 0.0,
+            sufficient: false,
+            total,
+            wins,
+            losses,
+        };
     }
     let raw_score = wins as f64 / total as f64;
     // 修复 P1-2: 明确负信号 (胜率 < 50%) → 0, 正信号 → 真实值
     let score = if raw_score < 0.5 { 0.0 } else { raw_score };
-    WinrateSummary { score, sufficient: true, total, wins, losses }
+    WinrateSummary {
+        score,
+        sufficient: true,
+        total,
+        wins,
+        losses,
+    }
 }

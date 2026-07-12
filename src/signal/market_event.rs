@@ -76,7 +76,7 @@ pub enum Direction {
 /// 数据来源溯源 (跨源验证基础)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceRef {
-    pub provider: String,    // "东财" / "新浪" / "巨潮"
+    pub provider: String, // "东财" / "新浪" / "巨潮"
     pub url: Option<String>,
     pub fetched_at: DateTime<Local>,
 }
@@ -91,6 +91,13 @@ pub struct MarketEvent {
     /// 24h 内汉明距离 ≤ 3 → 同一事件
     #[serde(default)]
     pub simhash: u64,
+    /// FIX-1 (review): 完整原始标题 (非 30 字符截断 subject)
+    ///   用于 event_seen_simhash 落库, 跨日 LCS 不会因 30 字符边界误判.
+    ///   例: Day1 "国务院发布数字经济发展规划, 重点支持半导体" (存 full)
+    ///       Day2 "国务院发布数字经济发展规划, 重点支持新能源" (LCS 完整比对, 找到差异)
+    ///   之前只存 subject (30 字符), Day1/2 共享前 30 字, LCS 误判同事件.
+    #[serde(default)]
+    pub full_title: String,
     /// 事件类型
     pub event_type: EventType,
     /// 主体 (谁/什么产品/什么环节)
@@ -120,6 +127,8 @@ pub struct MarketEvent {
 
 impl MarketEvent {
     /// 创建新事件 (事件 ID 自动生成, 修复 P0-1 NS2 可追溯)
+    /// FIX-1: 新增 full_title 参数, 用于 event_seen_simhash 落库.
+    ///   旧调用方传 subject 两次, 向后兼容.
     pub fn new(
         event_type: EventType,
         subject: String,
@@ -128,14 +137,37 @@ impl MarketEvent {
         strength: u8,
         certainty: u8,
     ) -> Self {
+        // subject 同时用作 subject 和 full_title (向后兼容: 旧调用方没显式传 full_title)
+        let full_title = subject.clone();
+        Self::new_with_title(
+            event_type, subject, full_title, object, direction, strength, certainty,
+        )
+    }
+
+    /// 完整构造: 显式传 full_title (可与 subject 不同, 比如 subject="国务院" + full_title="国务院发布数字经济发展规划...")
+    pub fn new_with_title(
+        event_type: EventType,
+        subject: String,
+        full_title: String,
+        object: Option<String>,
+        direction: Direction,
+        strength: u8,
+        certainty: u8,
+    ) -> Self {
         let now = Local::now();
         let event_id = compute_event_id(&subject, &now);
         let simhash = compute_simhash(&subject, "");
+        let final_full_title = if full_title.is_empty() {
+            subject.clone()
+        } else {
+            full_title
+        };
         Self {
             event_id,
             simhash,
             event_type,
             subject,
+            full_title: final_full_title,
             object,
             direction,
             strength: strength.min(100),
@@ -164,9 +196,16 @@ pub fn compute_event_id(title: &str, occurred_at: &DateTime<Local>) -> String {
 fn normalize(s: &str) -> String {
     s.chars()
         .map(|c| match c {
-            '：' => ':', '，' => ',', '。' => '.', '；' => ';',
-            '（' => '(', '）' => ')', '？' => '?', '！' => '!',
-            '\u{3000}' => ' ', c => c,
+            '：' => ':',
+            '，' => ',',
+            '。' => '.',
+            '；' => ';',
+            '（' => '(',
+            '）' => ')',
+            '？' => '?',
+            '！' => '!',
+            '\u{3000}' => ' ',
+            c => c,
         })
         .collect::<String>()
         .split_whitespace()
@@ -177,10 +216,9 @@ fn normalize(s: &str) -> String {
 /// 中文常见停用词 / 助词 / 功能字 (量化 PM 视角: 这些字符组成的 bigram 是噪声)
 /// 例: "的了" "是在" "和中" 都是无信号 token, 占 bit 反而稀释真信号
 const STOP_CHARS: &[char] = &[
-    '的', '了', '在', '是', '和', '等', '与', '为', '于', '及',
-    '或', '有', '其', '之', '也', '就', '都', '还', '把', '被',
-    '要', '能', '会', '可', '过', '又', '再', '这', '那', '此',
-    '某', '中', '上', '下', '一', '个', '不', '但',
+    '的', '了', '在', '是', '和', '等', '与', '为', '于', '及', '或', '有', '其', '之', '也', '就',
+    '都', '还', '把', '被', '要', '能', '会', '可', '过', '又', '再', '这', '那', '此', '某', '中',
+    '上', '下', '一', '个', '不', '但',
 ];
 
 /// 修复 P1-1: 噪声 token 过滤
@@ -210,7 +248,9 @@ pub fn compute_simhash(title: &str, body: &str) -> u64 {
     let mut v: [i32; 64] = [0; 64];
     for window in chars.windows(2) {
         let token: String = window.iter().collect();
-        if is_noise_token(&token) { continue; }
+        if is_noise_token(&token) {
+            continue;
+        }
         let token_hash = stable_hash_token(&token);
         for bit in 0..64 {
             if (token_hash >> bit) & 1 == 1 {
@@ -238,8 +278,7 @@ fn stable_hash_token(s: &str) -> u64 {
     hasher.update(s.as_bytes());
     let result = hasher.finalize();
     u64::from_le_bytes([
-        result[0], result[1], result[2], result[3],
-        result[4], result[5], result[6], result[7],
+        result[0], result[1], result[2], result[3], result[4], result[5], result[6], result[7],
     ])
 }
 

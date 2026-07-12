@@ -6,7 +6,9 @@ pub struct CashGuard {
 }
 
 impl Default for CashGuard {
-    fn default() -> Self { Self { floor_pct: 15.0 } }
+    fn default() -> Self {
+        Self { floor_pct: 15.0 }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -20,7 +22,9 @@ pub struct CashAlert {
 
 /// 检查现金占比是否低于底线。cash 由用户手动输入或从 ledger 读取。
 pub fn check_cash(cash: f64, total_value: f64, guard: &CashGuard) -> Option<CashAlert> {
-    if total_value <= 0.0 { return None; }
+    if total_value <= 0.0 {
+        return None;
+    }
     let cash_pct = cash / total_value * 100.0;
     Some(CashAlert {
         total_value,
@@ -39,7 +43,10 @@ pub fn format_cash_alert(alert: &CashAlert) -> String {
             alert.cash_pct, 15.0
         )
     } else {
-        format!("💰 现金: {:.0}% (总资产 ¥{:.0})", alert.cash_pct, alert.total_value)
+        format!(
+            "💰 现金: {:.0}% (总资产 ¥{:.0})",
+            alert.cash_pct, alert.total_value
+        )
     }
 }
 

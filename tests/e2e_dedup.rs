@@ -48,6 +48,8 @@ fn test_discover_dedups_recently_pushed_stocks() {
         source: ChainSource::Rule,
         board_keyword: "".into(),
         fund_flow_pct: None,
+        board_code: None,
+        board_change_pct: None,
     }];
 
     let candidates = stock_analysis::opportunity::discover::discover(&hits, &[], 5);

@@ -3,7 +3,11 @@
 //! 复用 monitor/risk.rs 已有逻辑（StopLoss/MarketRegime），提供检查接口。
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StopLevel { Technical, Structural, Hard }
+pub enum StopLevel {
+    Technical,
+    Structural,
+    Hard,
+}
 
 impl StopLevel {
     pub fn label(&self) -> &'static str {
@@ -40,9 +44,11 @@ pub fn check_stops(
     // 硬止损：跌破用户设定的硬止损价
     if hard_stop > 0.0 && current_price <= hard_stop {
         signals.push(StopSignal {
-            code: code.to_string(), name: name.to_string(),
+            code: code.to_string(),
+            name: name.to_string(),
             level: StopLevel::Hard,
-            current_price, trigger_price: hard_stop,
+            current_price,
+            trigger_price: hard_stop,
             reason: format!("跌破硬止损价 ¥{:.2}", hard_stop),
         });
     }
@@ -52,9 +58,11 @@ pub fn check_stops(
         let loss_pct = (current_price - cost_price) / cost_price * 100.0;
         if loss_pct <= -10.0 {
             signals.push(StopSignal {
-                code: code.to_string(), name: name.to_string(),
+                code: code.to_string(),
+                name: name.to_string(),
                 level: StopLevel::Technical,
-                current_price, trigger_price: cost_price * 0.9,
+                current_price,
+                trigger_price: cost_price * 0.9,
                 reason: format!("亏损 {:.1}% 触发技术止损", loss_pct),
             });
         }
@@ -64,7 +72,8 @@ pub fn check_stops(
     if let (Some(ma60_v), Some(ma20_v)) = (ma60, ma20) {
         if current_price < ma60_v && ma20_v < ma60_v {
             signals.push(StopSignal {
-                code: code.to_string(), name: name.to_string(),
+                code: code.to_string(),
+                name: name.to_string(),
                 level: StopLevel::Structural,
                 current_price,
                 trigger_price: ma60_v,
@@ -78,13 +87,22 @@ pub fn check_stops(
 
 /// 格式化止损告警
 pub fn format_stop_alerts(signals: &[StopSignal]) -> String {
-    if signals.is_empty() { return String::new(); }
+    if signals.is_empty() {
+        return String::new();
+    }
     let mut lines = vec!["🛑 止损触发".to_string()];
     for s in signals {
         lines.push(format!(
             "  {} {}({}) ¥{:.2} — {}",
-            if s.level == StopLevel::Hard { "🔴" } else { "⚠️" },
-            s.name, s.code, s.current_price, s.reason,
+            if s.level == StopLevel::Hard {
+                "🔴"
+            } else {
+                "⚠️"
+            },
+            s.name,
+            s.code,
+            s.current_price,
+            s.reason,
         ));
     }
     lines.join("\n")

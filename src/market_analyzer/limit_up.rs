@@ -1,10 +1,9 @@
 //! limit_up（从 market_analyzer.rs 拆分）
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use log::{info, warn};
 use serde_json::Value;
 use std::time::Duration;
-
 
 use super::MarketAnalyzer;
 
@@ -23,16 +22,20 @@ impl MarketAnalyzer {
                 ("page", page_str.as_str()),
                 ("num", "200"),
                 ("sort", "changepercent"),
-                ("asc", "0"),        // 降序
+                ("asc", "0"), // 降序
                 ("node", "hs_a"),
                 ("symbol", ""),
                 ("_s_r_a", "page"),
             ];
 
-            let response = self.client
+            let response = self
+                .client
                 .get(url)
                 .query(&params)
-                .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+                .header(
+                    "User-Agent",
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                )
                 .timeout(Duration::from_secs(15))
                 .send();
 
@@ -68,13 +71,18 @@ impl MarketAnalyzer {
             let mut min_pct = f64::MAX;
 
             for item in items {
-                let change_pct = item.get("changepercent").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let change_pct = item
+                    .get("changepercent")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
                 let stock_name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 let raw_code = item.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
-                let code = raw_code.trim_start_matches("sh")
+                let code = raw_code
+                    .trim_start_matches("sh")
                     .trim_start_matches("sz")
                     .trim_start_matches("bj");
-                let price = item.get("trade")
+                let price = item
+                    .get("trade")
                     .and_then(|v| v.as_str())
                     .and_then(|s| s.parse::<f64>().ok())
                     .unwrap_or(0.0);
@@ -99,7 +107,7 @@ impl MarketAnalyzer {
                         name: stock_name.to_string(),
                         change_pct,
                         price,
-                        volume_ratio: 0.0,  // 新浪API无此字段
+                        volume_ratio: 0.0, // 新浪API无此字段
                         main_net_yi: 0.0,
                     });
                 }
@@ -111,7 +119,10 @@ impl MarketAnalyzer {
             }
         }
 
-        info!("[大盘] 新浪API发现 {} 只涨停股票（已排除ST/北交所）", stocks.len());
+        info!(
+            "[大盘] 新浪API发现 {} 只涨停股票（已排除ST/北交所）",
+            stocks.len()
+        );
         Ok(stocks)
     }
 
@@ -148,14 +159,23 @@ impl MarketAnalyzer {
             let mut json: Option<Value> = None;
             for host in PUSH2_HOSTS {
                 let url = format!("https://{}/api/qt/clist/get", host);
-                let resp = self.client.get(&url).query(&params)
-                    .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+                let resp = self
+                    .client
+                    .get(&url)
+                    .query(&params)
+                    .header(
+                        "User-Agent",
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                    )
                     .header("Referer", "https://quote.eastmoney.com/")
                     .timeout(Duration::from_secs(10))
                     .send();
                 match resp.and_then(|r| r.text()) {
                     Ok(t) => match serde_json::from_str::<Value>(&t) {
-                        Ok(j) if j.get("data").is_some() => { json = Some(j); break; }
+                        Ok(j) if j.get("data").is_some() => {
+                            json = Some(j);
+                            break;
+                        }
                         _ => continue,
                     },
                     Err(_) => continue,
@@ -166,7 +186,11 @@ impl MarketAnalyzer {
                 None => return Err(anyhow::anyhow!("东方财富push2 API所有主机请求失败")),
             };
 
-            let diff = match json.get("data").and_then(|d| d.get("diff")).and_then(|d| d.as_array()) {
+            let diff = match json
+                .get("data")
+                .and_then(|d| d.get("diff"))
+                .and_then(|d| d.as_array())
+            {
                 Some(arr) if !arr.is_empty() => arr,
                 _ => break,
             };
@@ -244,5 +268,4 @@ impl MarketAnalyzer {
             10.0
         }
     }
-
 }

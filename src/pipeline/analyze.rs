@@ -6,33 +6,34 @@
 //!
 //! Rust 允许跨模块 impl, 所以这里直接 `impl AnalysisPipeline { ... }`.
 
-use anyhow::{Context, Result};
-use futures::stream::{self, StreamExt};
+use anyhow::Result;
+use futures::stream::StreamExt;
 use log::{error, info, warn};
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use crate::analyzer::GeminiAnalyzer;
-use crate::data_provider::{DataFetcherManager, KlineData};
 use crate::data_provider::financials::FinancialPeriod;
+use crate::data_provider::KlineData;
 use crate::search_service::get_search_service;
-use crate::database::DatabaseManager;
-use crate::notification::NotificationService;
-use crate::trend_analyzer::StockTrendAnalyzer;
 use crate::traits::ScoreDisplay;
-use crate::monitor::data_quality::{
-    validate_daily_freshness, validate_daily_kline_quality, DqStats, FreshnessConfig,
-};
 
+use super::score_to_advice;
+use super::section_utils;
 use super::AnalysisPipeline;
 use super::AnalysisResult;
-use super::{technical_report, multi_timeframe, extra_context, score_breakdown, veto_rules, trade_type, position_tracker, price_stats};
-use super::section_utils;
-use super::score_to_advice;
+use super::{
+    extra_context, multi_timeframe, position_tracker, price_stats, score_breakdown,
+    technical_report, trade_type, veto_rules,
+};
 
 impl AnalysisPipeline {
     /// 分析单只股票
-    async fn analyze_stock(&self, code: &str, data: &[KlineData], kline_arc: Arc<Vec<KlineData>>, macro_context: Option<&str>) -> Result<AnalysisResult> {
+    async fn analyze_stock(
+        &self,
+        code: &str,
+        data: &[KlineData],
+        kline_arc: Arc<Vec<KlineData>>,
+        macro_context: Option<&str>,
+    ) -> Result<AnalysisResult> {
         if data.is_empty() {
             return Err(anyhow::anyhow!("数据为空"));
         }
@@ -48,14 +49,19 @@ impl AnalysisPipeline {
         if bm.action != crate::strategy::BollMacdAction::None {
             use crate::strategy::BollMacdAction;
             let (delta, is_reason) = match bm.action {
-                BollMacdAction::UptrendStart => (12, true),  // 主升浪启动：强买
-                BollMacdAction::BottomBuy => (10, true),     // 下轨抄底：反转
-                BollMacdAction::PreReversal => (3, true),    // 准备变盘：中性提示
-                BollMacdAction::TopSell => (-15, false),     // 顶部减仓：强压评分
+                BollMacdAction::UptrendStart => (12, true), // 主升浪启动：强买
+                BollMacdAction::BottomBuy => (10, true),    // 下轨抄底：反转
+                BollMacdAction::PreReversal => (3, true),   // 准备变盘：中性提示
+                BollMacdAction::TopSell => (-15, false),    // 顶部减仓：强压评分
                 BollMacdAction::None => (0, true),
             };
             trend_result.signal_score = (trend_result.signal_score + delta).clamp(0, 100);
-            let line = format!("📊 BB+MACD: {} | {} ({:+})", bm.action.name(), bm.reason, delta);
+            let line = format!(
+                "📊 BB+MACD: {} | {} ({:+})",
+                bm.action.name(),
+                bm.reason,
+                delta
+            );
             if is_reason {
                 trend_result.signal_reasons.push(line);
             } else {
@@ -64,7 +70,10 @@ impl AnalysisPipeline {
             // 评分跌破 65 分时降级买入信号（避免顶部 TopSell 仍报"买入"）
             if matches!(bm.action, BollMacdAction::TopSell) {
                 use crate::trend_analyzer::BuySignal;
-                if matches!(trend_result.buy_signal, BuySignal::StrongBuy | BuySignal::Buy) {
+                if matches!(
+                    trend_result.buy_signal,
+                    BuySignal::StrongBuy | BuySignal::Buy
+                ) {
                     trend_result.buy_signal = BuySignal::Hold;
                 }
                 // 【核心修正】强制压低总评分，确保 score_to_advice 不会映射为"建议买入"
@@ -72,7 +81,13 @@ impl AnalysisPipeline {
                     trend_result.signal_score = 55; // 压至“观望”及以下
                 }
             }
-            info!("[{}] 📊 布林+MACD 信号: {} | {} | 评分调整 {:+}", code, bm.action.name(), bm.reason, delta);
+            info!(
+                "[{}] 📊 布林+MACD 信号: {} | {} | 评分调整 {:+}",
+                code,
+                bm.action.name(),
+                bm.reason,
+                delta
+            );
         }
 
         // 1.6 基本面评分修正（财务质量 + 估值分位）
@@ -90,11 +105,19 @@ impl AnalysisPipeline {
                 if let Some(q) = crate::data_provider::assess_quality(hist) {
                     if q.risk_score >= 60 {
                         total_delta -= 20;
-                        let summary = q.flags.first().cloned().unwrap_or_else(|| q.level.to_string());
-                        trend_result
-                            .risk_factors
-                            .push(format!("💣 财务异常高风险(评分{}/100): {}", q.risk_score, summary));
-                        if matches!(trend_result.buy_signal, BuySignal::StrongBuy | BuySignal::Buy) {
+                        let summary = q
+                            .flags
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| q.level.to_string());
+                        trend_result.risk_factors.push(format!(
+                            "💣 财务异常高风险(评分{}/100): {}",
+                            q.risk_score, summary
+                        ));
+                        if matches!(
+                            trend_result.buy_signal,
+                            BuySignal::StrongBuy | BuySignal::Buy
+                        ) {
                             trend_result.buy_signal = BuySignal::Hold;
                         }
                     } else if q.risk_score >= 30 {
@@ -109,12 +132,14 @@ impl AnalysisPipeline {
                 let take: Vec<_> = hist.iter().take(4).collect();
                 if take.len() >= 3 {
                     let roe_chrono: Vec<f64> = take.iter().rev().filter_map(|p| p.roe).collect();
-                    let gm_chrono: Vec<f64> = take.iter().rev().filter_map(|p| p.gross_margin).collect();
-                    let cfo_ni: Vec<f64> = take.iter().filter_map(|p| p.cfo_to_ni_ratio()).collect();
-                    let roe_up = roe_chrono.len() >= 3
-                        && roe_chrono.windows(2).all(|w| w[1] >= w[0] - 0.01);
-                    let gm_up = gm_chrono.len() >= 3
-                        && gm_chrono.windows(2).all(|w| w[1] >= w[0] - 0.01);
+                    let gm_chrono: Vec<f64> =
+                        take.iter().rev().filter_map(|p| p.gross_margin).collect();
+                    let cfo_ni: Vec<f64> =
+                        take.iter().filter_map(|p| p.cfo_to_ni_ratio()).collect();
+                    let roe_up =
+                        roe_chrono.len() >= 3 && roe_chrono.windows(2).all(|w| w[1] >= w[0] - 0.01);
+                    let gm_up =
+                        gm_chrono.len() >= 3 && gm_chrono.windows(2).all(|w| w[1] >= w[0] - 0.01);
                     let cfo_ok = !cfo_ni.is_empty()
                         && cfo_ni.iter().sum::<f64>() / cfo_ni.len() as f64 >= 0.8;
                     if roe_up && gm_up && cfo_ok {
@@ -132,16 +157,14 @@ impl AnalysisPipeline {
                     if let Some(pe_pct) = vh.pe_percentile {
                         if pe_pct < 20.0 {
                             total_delta += 5;
-                            trend_result.signal_reasons.push(format!(
-                                "📉 PE 历史极低估(分位{:.0}%) +5",
-                                pe_pct
-                            ));
+                            trend_result
+                                .signal_reasons
+                                .push(format!("📉 PE 历史极低估(分位{:.0}%) +5", pe_pct));
                         } else if pe_pct > 80.0 {
                             total_delta -= 8;
-                            trend_result.risk_factors.push(format!(
-                                "📈 PE 历史极高估(分位{:.0}%)，回调风险大",
-                                pe_pct
-                            ));
+                            trend_result
+                                .risk_factors
+                                .push(format!("📈 PE 历史极高估(分位{:.0}%)，回调风险大", pe_pct));
                             if matches!(trend_result.buy_signal, BuySignal::StrongBuy) {
                                 trend_result.buy_signal = BuySignal::Buy;
                             }
@@ -162,25 +185,22 @@ impl AnalysisPipeline {
                             ));
                         } else if bull < 30.0 {
                             total_delta -= 5;
-                            trend_result.risk_factors.push(format!(
-                                "🏦 卖方一致看空(看多仅{:.0}%)",
-                                bull
-                            ));
+                            trend_result
+                                .risk_factors
+                                .push(format!("🏦 卖方一致看空(看多仅{:.0}%)", bull));
                         }
                     }
                     if let Some(up) = cs.upside_pct(latest.close) {
                         if up > 30.0 {
                             total_delta += 3;
-                            trend_result.signal_reasons.push(format!(
-                                "🎯 目标价均值隐含 {:+.0}% 上行空间 +3",
-                                up
-                            ));
+                            trend_result
+                                .signal_reasons
+                                .push(format!("🎯 目标价均值隐含 {:+.0}% 上行空间 +3", up));
                         } else if up < -10.0 {
                             total_delta -= 5;
-                            trend_result.risk_factors.push(format!(
-                                "🎯 现价已高于目标价均值 {:+.0}%",
-                                up
-                            ));
+                            trend_result
+                                .risk_factors
+                                .push(format!("🎯 现价已高于目标价均值 {:+.0}%", up));
                         }
                     }
                 }
@@ -198,40 +218,35 @@ impl AnalysisPipeline {
                             ));
                         } else if p <= 20.0 {
                             total_delta -= 3;
-                            trend_result.risk_factors.push(format!(
-                                "ROE 同业落后(P{:.0})",
-                                p
-                            ));
+                            trend_result
+                                .risk_factors
+                                .push(format!("ROE 同业落后(P{:.0})", p));
                         }
                     }
                     if let Some(p) = ib.pe_percentile {
                         if p <= 20.0 {
                             total_delta += 2;
-                            trend_result.signal_reasons.push(format!(
-                                "💰 PE 同业偏低(P{:.0}) +2",
-                                p
-                            ));
+                            trend_result
+                                .signal_reasons
+                                .push(format!("💰 PE 同业偏低(P{:.0}) +2", p));
                         } else if p >= 80.0 {
                             total_delta -= 3;
-                            trend_result.risk_factors.push(format!(
-                                "PE 同业偏高(P{:.0})",
-                                p
-                            ));
+                            trend_result
+                                .risk_factors
+                                .push(format!("PE 同业偏高(P{:.0})", p));
                         }
                     }
                     if let Some(p) = ib.growth_percentile {
                         if p >= 80.0 {
                             total_delta += 2;
-                            trend_result.signal_reasons.push(format!(
-                                "🚀 净利同比同业领先(P{:.0}) +2",
-                                p
-                            ));
+                            trend_result
+                                .signal_reasons
+                                .push(format!("🚀 净利同比同业领先(P{:.0}) +2", p));
                         } else if p <= 20.0 {
                             total_delta -= 2;
-                            trend_result.risk_factors.push(format!(
-                                "净利同比同业落后(P{:.0})",
-                                p
-                            ));
+                            trend_result
+                                .risk_factors
+                                .push(format!("净利同比同业落后(P{:.0})", p));
                         }
                     }
                 }
@@ -240,8 +255,7 @@ impl AnalysisPipeline {
             // 总修正限幅 ±25，避免基本面单一维度主导
             let clamped = total_delta.clamp(-25, 25);
             if clamped != 0 {
-                trend_result.signal_score =
-                    (trend_result.signal_score + clamped).clamp(0, 100);
+                trend_result.signal_score = (trend_result.signal_score + clamped).clamp(0, 100);
                 info!(
                     "[{}] 🧮 基本面评分修正 {:+} → 总评分 {}",
                     code, clamped, trend_result.signal_score
@@ -268,7 +282,10 @@ impl AnalysisPipeline {
                     bm.action,
                     BollMacdAction::BottomBuy | BollMacdAction::UptrendStart
                 )
-                || matches!(trend_result.buy_signal, BuySignal::StrongBuy | BuySignal::Buy)
+                || matches!(
+                    trend_result.buy_signal,
+                    BuySignal::StrongBuy | BuySignal::Buy
+                )
         };
 
         let name_news_fut = async {
@@ -344,16 +361,24 @@ impl AnalysisPipeline {
         {
             use crate::trend_analyzer::{BuySignal, TrendStatus};
             let veto_config = crate::config::get_veto_config();
-            if let Some(chain) = crate::risk::veto_rules_live::build_chain(&crate::risk::veto_chain::VetoChainConfig {
-                enabled: veto_config.enabled,
-                mode: crate::risk::veto_chain::VetoMode::from_str(&veto_config.mode),
-                bias_rate_enabled: veto_config.bias_rate_enabled,
-                bearish_alignment_enabled: veto_config.bearish_alignment_enabled,
-                main_flow_enabled: veto_config.main_flow_enabled,
-                fundamental_enabled: veto_config.fundamental_enabled,
-            }) {
-                let is_buy = matches!(trend_result.buy_signal, BuySignal::StrongBuy | BuySignal::Buy);
-                let is_bearish = matches!(trend_result.trend_status, TrendStatus::StrongBear | TrendStatus::Bear);
+            if let Some(chain) = crate::risk::veto_rules_live::build_chain(
+                &crate::risk::veto_chain::VetoChainConfig {
+                    enabled: veto_config.enabled,
+                    mode: crate::risk::veto_chain::VetoMode::from_str(&veto_config.mode),
+                    bias_rate_enabled: veto_config.bias_rate_enabled,
+                    bearish_alignment_enabled: veto_config.bearish_alignment_enabled,
+                    main_flow_enabled: veto_config.main_flow_enabled,
+                    fundamental_enabled: veto_config.fundamental_enabled,
+                },
+            ) {
+                let is_buy = matches!(
+                    trend_result.buy_signal,
+                    BuySignal::StrongBuy | BuySignal::Buy
+                );
+                let is_bearish = matches!(
+                    trend_result.trend_status,
+                    TrendStatus::StrongBear | TrendStatus::Bear
+                );
                 let mf_days = money_flow_raw.as_ref().map(|mf| mf.days.clone());
 
                 let veto_ctx = crate::risk::veto_chain::VetoContext {
@@ -379,8 +404,9 @@ impl AnalysisPipeline {
                                 trend_result.signal_score = 55;
                                 trend_result.buy_signal = BuySignal::Hold;
                             } else if is_buy && outcome.total_penalty != 0 {
-                                trend_result.signal_score =
-                                    (trend_result.signal_score + outcome.total_penalty).clamp(0, 100);
+                                trend_result.signal_score = (trend_result.signal_score
+                                    + outcome.total_penalty)
+                                    .clamp(0, 100);
                             }
                             // v17.2 (P2 fix): risk flags 始终传播 (不依赖 force_hold 分支)
                             for flag in &outcome.flags {
@@ -425,7 +451,11 @@ impl AnalysisPipeline {
             risks: &trend_result.risk_factors,
             trend_status: &trend_status_str,
             score_breakdown: Some(&sb_pre),
-            veto_flags: if veto_pre.flags.is_empty() { &empty_veto } else { &veto_pre.flags },
+            veto_flags: if veto_pre.flags.is_empty() {
+                &empty_veto
+            } else {
+                &veto_pre.flags
+            },
             trade_type: trade_type_pre.as_deref(),
         };
 
@@ -438,14 +468,15 @@ impl AnalysisPipeline {
                     data,
                     macro_context,
                     extra_context.as_deref(),
-                    news_context.as_deref(), 
+                    news_context.as_deref(),
                     Some(&tech_assessment),
                 )
                 .await
             {
                 Ok(ai_result) => {
                     analysis_content.push_str("\n# AI分析\n\n");
-                    analysis_content.push_str(&self::section_utils::normalize_ai_sections(&ai_result));
+                    analysis_content
+                        .push_str(&self::section_utils::normalize_ai_sections(&ai_result));
                     if let Some(ref news) = news_context {
                         analysis_content.push_str("\n\n# 相关新闻\n\n");
                         analysis_content.push_str(news);
@@ -635,8 +666,7 @@ impl AnalysisPipeline {
                     .map(|(k, v)| (k.clone(), *v))
                     .collect();
                 parts.sort_by(|a, b| b.1.cmp(&a.1));
-                let dist: Vec<String> =
-                    parts.iter().map(|(k, v)| format!("{} {}", k, v)).collect();
+                let dist: Vec<String> = parts.iter().map(|(k, v)| format!("{} {}", k, v)).collect();
                 let bull = cs.bullish_ratio().unwrap_or(0.0);
                 s.push_str(&format!(
                     "**评级分布**：{} | 看多比例 {:.0}%\n",
@@ -738,8 +768,7 @@ impl AnalysisPipeline {
             }
             // 趋势提示
             let trend = |f: fn(&FinancialPeriod) -> Option<f64>| -> Option<&'static str> {
-                let vals: Vec<f64> =
-                    show.iter().filter_map(|p| f(p)).collect();
+                let vals: Vec<f64> = show.iter().filter_map(|p| f(p)).collect();
                 if vals.len() < 3 {
                     return None;
                 }
@@ -767,8 +796,7 @@ impl AnalysisPipeline {
                 s.push_str(&format!("\n**趋势**：{}\n", hints.join("；")));
             }
             // CFO/NI 平均
-            let ratios: Vec<f64> =
-                show.iter().filter_map(|p| p.cfo_to_ni_ratio()).collect();
+            let ratios: Vec<f64> = show.iter().filter_map(|p| p.cfo_to_ni_ratio()).collect();
             if !ratios.is_empty() {
                 let avg = ratios.iter().sum::<f64>() / ratios.len() as f64;
                 let tag = if avg < 0.3 {
@@ -821,7 +849,11 @@ impl AnalysisPipeline {
             if let Some(s) = quality_section.as_deref() {
                 parts.push(format!("【财务质量评估】\n{}", s));
             }
-            if parts.is_empty() { None } else { Some(parts.join("\n\n")) }
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n\n"))
+            }
         };
         let deep_seed = crate::deep_analyzer::DeepAnalysisSeed {
             code: code.to_string(),
@@ -933,7 +965,11 @@ impl AnalysisPipeline {
     }
 
     /// 处理单只股票的完整流程（含 120s 超时保护）
-    pub(super) async fn process_stock(&self, code: String, macro_context: Arc<str>) -> Option<AnalysisResult> {
+    pub(super) async fn process_stock(
+        &self,
+        code: String,
+        macro_context: Arc<str>,
+    ) -> Option<AnalysisResult> {
         let start = std::time::Instant::now();
         info!("========== [{}] 开始处理 ==========", code);
 
@@ -941,7 +977,9 @@ impl AnalysisPipeline {
         let result = match tokio::time::timeout(
             std::time::Duration::from_secs(120),
             self.process_stock_inner(code.clone(), macro_context),
-        ).await {
+        )
+        .await
+        {
             Ok(r) => r,
             Err(_) => {
                 error!("[{}] 处理超时（120s），跳过", code);
@@ -951,13 +989,27 @@ impl AnalysisPipeline {
 
         let elapsed = start.elapsed();
         match &result {
-            Some(r) => info!("[{}] ✓ 处理完成 ({:.1}s)：{} 评分 {}", code, elapsed.as_secs_f32(), r.operation_advice, r.sentiment_score),
-            None    => warn!("[{}] ✗ 处理失败或超时 ({:.1}s)", code, elapsed.as_secs_f32()),
+            Some(r) => info!(
+                "[{}] ✓ 处理完成 ({:.1}s)：{} 评分 {}",
+                code,
+                elapsed.as_secs_f32(),
+                r.operation_advice,
+                r.sentiment_score
+            ),
+            None => warn!(
+                "[{}] ✗ 处理失败或超时 ({:.1}s)",
+                code,
+                elapsed.as_secs_f32()
+            ),
         }
         result
     }
 
-    async fn process_stock_inner(&self, code: String, macro_context: Arc<str>) -> Option<AnalysisResult> {
+    async fn process_stock_inner(
+        &self,
+        code: String,
+        macro_context: Arc<str>,
+    ) -> Option<AnalysisResult> {
         // 1. 获取数据
         let data = match self.fetch_and_save_data(&code).await {
             Ok(d) => d,
@@ -982,7 +1034,11 @@ impl AnalysisPipeline {
         let data = Arc::new(data);
 
         // 3. 分析
-        let mc = if macro_context.is_empty() { None } else { Some(&*macro_context) };
+        let mc = if macro_context.is_empty() {
+            None
+        } else {
+            Some(&*macro_context)
+        };
         let mut result = match self.analyze_stock(&code, &data, data.clone(), mc).await {
             Ok(r) => r,
             Err(e) => {
@@ -1019,7 +1075,8 @@ impl AnalysisPipeline {
             };
             // ATR: 近 14 日真实波幅均值 (若数据不足则取可用天数)
             let atr = {
-                let ranges: Vec<f64> = data.iter()
+                let ranges: Vec<f64> = data
+                    .iter()
                     .take(14)
                     .map(|d| d.high - d.low)
                     .filter(|r| r.is_finite() && *r > 0.0)
@@ -1049,5 +1106,4 @@ impl AnalysisPipeline {
 
         Some(result)
     }
-
-    }
+}

@@ -25,9 +25,9 @@ pub mod precision;
 pub mod standard;
 
 pub use precision::{
-    PrecisionRsiBacktest, PrecisionRsiConfig, PrecisionRsiResult, PrecisionRsiStrategy,
-    SinglePrecisionRsiResult, compute_precision_indicators,
+    compute_precision_indicators, PrecisionRsiBacktest, PrecisionRsiConfig, PrecisionRsiResult,
+    PrecisionRsiStrategy, SinglePrecisionRsiResult,
 };
 pub use standard::{
-    RsiBacktest, RsiConfig, RsiResult, RsiStrategy, SingleRsiResult, compute_rsi_indicators,
+    compute_rsi_indicators, RsiBacktest, RsiConfig, RsiResult, RsiStrategy, SingleRsiResult,
 };

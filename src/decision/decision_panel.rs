@@ -114,7 +114,10 @@ pub struct DecisionReason {
 
 impl DecisionReason {
     pub fn new(kind: DecisionReasonKind, text: impl Into<String>) -> Self {
-        Self { kind, text: text.into() }
+        Self {
+            kind,
+            text: text.into(),
+        }
     }
 }
 
@@ -212,9 +215,18 @@ mod tests {
     /// Action 简短标签 ≤ 4 汉字
     #[test]
     fn action_label_short() {
-        for a in [Action::ReduceNow, Action::Reduce, Action::Hold, Action::WatchAdd] {
+        for a in [
+            Action::ReduceNow,
+            Action::Reduce,
+            Action::Hold,
+            Action::WatchAdd,
+        ] {
             let l = a.label();
-            assert!(l.chars().count() <= 4, "Action 标签应 ≤ 4 汉字, 实际: '{}'", l);
+            assert!(
+                l.chars().count() <= 4,
+                "Action 标签应 ≤ 4 汉字, 实际: '{}'",
+                l
+            );
         }
     }
 
@@ -245,14 +257,25 @@ mod tests {
         assert_eq!(parsed.reasons.len(), 2);
         assert_eq!(parsed.reasons[0].kind, DecisionReasonKind::StopLoss);
         assert_eq!(parsed.stop_loss, Some(12.10));
-        assert_eq!(parsed.ai_card_summary.as_deref(), Some("技术破位, 主力净流出 3.5亿"));
+        assert_eq!(
+            parsed.ai_card_summary.as_deref(),
+            Some("技术破位, 主力净流出 3.5亿")
+        );
     }
 
     /// FinalDecision 链式 builder
     #[test]
     fn final_decision_builder() {
-        let d = FinalDecision::new("600519", "贵州茅台", 1500.0, 0.5, Action::Hold, Priority::P2, vec![])
-            .with_ai_summary("无明显信号, 持有观察");
+        let d = FinalDecision::new(
+            "600519",
+            "贵州茅台",
+            1500.0,
+            0.5,
+            Action::Hold,
+            Priority::P2,
+            vec![],
+        )
+        .with_ai_summary("无明显信号, 持有观察");
         assert_eq!(d.ai_card_summary.as_deref(), Some("无明显信号, 持有观察"));
         assert_eq!(d.stop_loss, None, "未设止损价应 None");
     }
@@ -260,7 +283,15 @@ mod tests {
     /// AI card_summary None 序列化时跳过 (落盘 JSON 不含该字段)
     #[test]
     fn ai_summary_none_skipped_in_json() {
-        let d = FinalDecision::new("000001", "test", 10.0, 0.0, Action::Hold, Priority::P2, vec![]);
+        let d = FinalDecision::new(
+            "000001",
+            "test",
+            10.0,
+            0.0,
+            Action::Hold,
+            Priority::P2,
+            vec![],
+        );
         let json = serde_json::to_string(&d).expect("serialize");
         assert!(!json.contains("ai_card_summary"), "None 时应跳过该字段");
         assert!(!json.contains("stop_loss"), "None 时应跳过该字段");

@@ -14,7 +14,9 @@ pub fn check_sector_exit(
     weekly_flows: &[f64], // 最近 N 周的主力净流入（正=流入，负=流出）
     threshold_weeks: u32,
 ) -> Option<SectorExitSignal> {
-    if weekly_flows.is_empty() { return None; }
+    if weekly_flows.is_empty() {
+        return None;
+    }
 
     // 从最近一周往前数，连续净流出的周数
     let mut consecutive = 0u32;
@@ -40,11 +42,14 @@ pub fn check_sector_exit(
 
 /// 格式化板块退潮告警
 pub fn format_sector_exit(signals: &[SectorExitSignal]) -> String {
-    if signals.is_empty() { return String::new(); }
+    if signals.is_empty() {
+        return String::new();
+    }
     let mut lines = vec!["🔻 板块退潮预警".to_string()];
     for s in signals {
         lines.push(format!(
-            "  ⚠️ {} — {}，建议减仓并移出观察池", s.sector_name, s.reason,
+            "  ⚠️ {} — {}，建议减仓并移出观察池",
+            s.sector_name, s.reason,
         ));
     }
     lines.join("\n")

@@ -1,8 +1,8 @@
-use async_trait::async_trait;
-use serde_json::json;
 use crate::agent::tool::Tool;
 use crate::data_provider::chip_distribution::{compute_chip_distribution, format_for_prompt};
 use crate::data_provider::service::service;
+use async_trait::async_trait;
+use serde_json::json;
 
 pub struct FetchChipDistributionTool;
 
@@ -36,25 +36,30 @@ impl Tool for FetchChipDistributionTool {
     }
 
     async fn call(&self, input: serde_json::Value) -> anyhow::Result<String> {
-        let code = input.get("code")
+        let code = input
+            .get("code")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'code' parameter"))?;
 
         // 经 DataFetchService 缓存：与 pipeline 共享 250 日 K 线
         let daily_data = match service().get_kline(code, 250).await {
             Ok(d) => d,
-            Err(e) => return Ok(json!({"error": format!("Failed to fetch daily data: {}", e)}).to_string()),
+            Err(e) => {
+                return Ok(
+                    json!({"error": format!("Failed to fetch daily data: {}", e)}).to_string(),
+                )
+            }
         };
 
         if daily_data.is_empty() {
-             return Ok(json!({"error": "No K-line data for chip distribution."}).to_string());
+            return Ok(json!({"error": "No K-line data for chip distribution."}).to_string());
         }
 
         let chip_dist = compute_chip_distribution(&daily_data);
         if chip_dist.present {
             Ok(format_for_prompt(&chip_dist))
         } else {
-             Ok(json!({"error": "Failed to compute chip distribution."}).to_string())
+            Ok(json!({"error": "Failed to compute chip distribution."}).to_string())
         }
     }
 }

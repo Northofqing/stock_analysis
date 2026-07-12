@@ -41,11 +41,7 @@ pub fn format_single_decision(d: &FinalDecision) -> String {
     // 标题行: emoji + 优先级 + 动作 + 名称(代码)
     out.push_str(&format!(
         "{} [{}] {} {}({})\n",
-        emoji,
-        priority,
-        action_label,
-        d.name,
-        d.code
+        emoji, priority, action_label, d.name, d.code
     ));
 
     // 缩进: 现价行
@@ -135,7 +131,15 @@ mod tests {
         reasons: Vec<DecisionReason>,
         ai: Option<&str>,
     ) -> FinalDecision {
-        let mut d = FinalDecision::new(code, name, current_price, change_pct, action, priority, reasons);
+        let mut d = FinalDecision::new(
+            code,
+            name,
+            current_price,
+            change_pct,
+            action,
+            priority,
+            reasons,
+        );
         if let Some(a) = ai {
             d = d.with_ai_summary(a);
         }
@@ -170,7 +174,10 @@ mod tests {
         assert!(s.contains("-3.20%"), "涨跌幅");
         assert!(s.contains("硬止损触发"), "reason 1");
         assert!(s.contains("单票仓位"), "reason 2");
-        assert!(s.contains("💬 AI参考(不入决策): 技术破位"), "AI 摘要 grill Q4 格式");
+        assert!(
+            s.contains("💬 AI参考(不入决策): 技术破位"),
+            "AI 摘要 grill Q4 格式"
+        );
     }
 
     /// 单只卡片: 无 AI 摘要时省略 "💬 AI" 行
@@ -185,7 +192,7 @@ mod tests {
             0.0,
             vec![DecisionReason::new(
                 DecisionReasonKind::Health,
-                "无风险信号, 持有观察 (默认)"
+                "无风险信号, 持有观察 (默认)",
             )],
             None,
         );
@@ -199,11 +206,56 @@ mod tests {
     #[test]
     fn decision_board_stats() {
         let decisions = vec![
-            make_decision("000001", "P0票", Action::ReduceNow, Priority::P0, 10.0, 0.0, vec![], None),
-            make_decision("000002", "P0票2", Action::ReduceNow, Priority::P0, 10.0, 0.0, vec![], None),
-            make_decision("000003", "P1票", Action::Reduce, Priority::P1, 10.0, 0.0, vec![], None),
-            make_decision("000004", "P2票", Action::WatchAdd, Priority::P2, 10.0, 0.0, vec![], None),
-            make_decision("000005", "Hold票", Action::Hold, Priority::P2, 10.0, 0.0, vec![], None),
+            make_decision(
+                "000001",
+                "P0票",
+                Action::ReduceNow,
+                Priority::P0,
+                10.0,
+                0.0,
+                vec![],
+                None,
+            ),
+            make_decision(
+                "000002",
+                "P0票2",
+                Action::ReduceNow,
+                Priority::P0,
+                10.0,
+                0.0,
+                vec![],
+                None,
+            ),
+            make_decision(
+                "000003",
+                "P1票",
+                Action::Reduce,
+                Priority::P1,
+                10.0,
+                0.0,
+                vec![],
+                None,
+            ),
+            make_decision(
+                "000004",
+                "P2票",
+                Action::WatchAdd,
+                Priority::P2,
+                10.0,
+                0.0,
+                vec![],
+                None,
+            ),
+            make_decision(
+                "000005",
+                "Hold票",
+                Action::Hold,
+                Priority::P2,
+                10.0,
+                0.0,
+                vec![],
+                None,
+            ),
         ];
         let s = format_decision_board(&decisions);
         assert!(s.contains("共 5 只 (2 P0 / 1 P1 / 2 P2)"), "顶部统计");
@@ -215,9 +267,36 @@ mod tests {
     #[test]
     fn decision_board_sorted_by_priority() {
         let decisions = vec![
-            make_decision("000005", "Hold票", Action::Hold, Priority::P2, 10.0, 0.0, vec![], None),
-            make_decision("000001", "P0票", Action::ReduceNow, Priority::P0, 10.0, 0.0, vec![], None),
-            make_decision("000003", "P1票", Action::Reduce, Priority::P1, 10.0, 0.0, vec![], None),
+            make_decision(
+                "000005",
+                "Hold票",
+                Action::Hold,
+                Priority::P2,
+                10.0,
+                0.0,
+                vec![],
+                None,
+            ),
+            make_decision(
+                "000001",
+                "P0票",
+                Action::ReduceNow,
+                Priority::P0,
+                10.0,
+                0.0,
+                vec![],
+                None,
+            ),
+            make_decision(
+                "000003",
+                "P1票",
+                Action::Reduce,
+                Priority::P1,
+                10.0,
+                0.0,
+                vec![],
+                None,
+            ),
         ];
         let s = format_decision_board(&decisions);
         // P0 应在 P1 之前

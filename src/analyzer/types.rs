@@ -100,7 +100,11 @@ impl AnalysisResult {
         if let Some(dashboard) = &self.dashboard {
             if let Some(core) = dashboard.get("core_conclusion") {
                 if let Some(advice) = core.get("position_advice") {
-                    let key = if has_position { "has_position" } else { "no_position" };
+                    let key = if has_position {
+                        "has_position"
+                    } else {
+                        "no_position"
+                    };
                     if let Some(val) = advice.get(key) {
                         if let Some(s) = val.as_str() {
                             return s.to_string();

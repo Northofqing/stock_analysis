@@ -77,13 +77,18 @@ fn logic_hardness(hit: &ChainHit, s: &super::chain_mapper::StockInfo) -> ScoreBr
         ChainSource::Rule => 10.0,
         ChainSource::Ai => 6.0,
         ChainSource::AiDegraded => 0.0,
+        // B-002 板块联动: 基于实时东财板块数据, 置信度接近 Rule 但略低 (无 100+ 测试回灌)
+        ChainSource::Board => 8.0,
     };
 
     // ② 产业链位置/匹配强度：命中关键词越多越硬
     let keyword_score = (hit.keywords.len() as f64).min(3.0) * 3.0;
 
     // ③ 资金验证：板块主力净占比（缺数据记 0，不臆测）
-    let fund_score = hit.fund_flow_pct.map(|f| f.clamp(-10.0, 10.0)).unwrap_or(0.0);
+    let fund_score = hit
+        .fund_flow_pct
+        .map(|f| f.clamp(-10.0, 10.0))
+        .unwrap_or(0.0);
 
     // ④ 低位卡位：涨幅低 + 量比抬头 → 补涨空间大；已启动则减分（追高风险）
     let position_score = if s.change_pct >= 7.0 {
@@ -118,6 +123,7 @@ fn reason_summary(hit: &ChainHit, s: &super::chain_mapper::StockInfo, b: ScoreBr
         ChainSource::Rule => "规则命中",
         ChainSource::Ai => "AI推理",
         ChainSource::AiDegraded => "AI降级",
+        ChainSource::Board => "板块联动",
     };
 
     let position = if b.position_score > 0.0 {
@@ -158,32 +164,38 @@ fn load_recently_pushed_codes(
     match db.count_recent_pushes_batch(candidate_codes, days) {
         Ok(set) => set,
         Err(e) => {
-            log::warn!("[Discover] count_recent_pushes_batch 失败: {}, BR-001 放行", e);
+            log::warn!(
+                "[Discover] count_recent_pushes_batch 失败: {}, BR-001 放行",
+                e
+            );
             std::collections::HashSet::new()
         }
     }
 }
 
 /// 从产业链命中结果中发现新标的，按逻辑硬度排序输出 Top N。
-pub fn discover(
-    hits: &[ChainHit],
-    exclude_codes: &[String],
-    top_n: usize,
-) -> Vec<Candidate> {
-    let exclude: std::collections::HashSet<&str> = exclude_codes.iter().map(|c| c.as_str()).collect();
+pub fn discover(hits: &[ChainHit], exclude_codes: &[String], top_n: usize) -> Vec<Candidate> {
+    let exclude: std::collections::HashSet<&str> =
+        exclude_codes.iter().map(|c| c.as_str()).collect();
     let mut scored: Vec<(f64, Candidate)> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut all_codes: Vec<String> = Vec::new();
 
     // 第一遍: 收集所有 candidate codes (dedup) 给批量 BR-001 查询用
     for hit in hits {
-        if hit.stocks.is_empty() { continue; }
+        if hit.stocks.is_empty() {
+            continue;
+        }
         for s in &hit.stocks {
-            if exclude.contains(s.code.as_str()) { continue; }
+            if exclude.contains(s.code.as_str()) {
+                continue;
+            }
             if s.code.starts_with('8') || s.code.starts_with('4') || s.code.starts_with("688") {
                 continue;
             }
-            if !seen.insert(s.code.clone()) { continue; } // 去重
+            if !seen.insert(s.code.clone()) {
+                continue;
+            } // 去重
             all_codes.push(s.code.clone());
         }
     }
@@ -194,14 +206,20 @@ pub fn discover(
     // 第二遍: 真正的发现循环 (BR-001 用 HashSet O(1) 查, 不再 sync DB)
     seen.clear(); // 重置 for 第二遍
     for hit in hits {
-        if hit.stocks.is_empty() { continue; }
+        if hit.stocks.is_empty() {
+            continue;
+        }
 
         for s in &hit.stocks {
-            if exclude.contains(s.code.as_str()) { continue; }
+            if exclude.contains(s.code.as_str()) {
+                continue;
+            }
             if s.code.starts_with('8') || s.code.starts_with('4') || s.code.starts_with("688") {
                 continue;
             }
-            if !seen.insert(s.code.clone()) { continue; } // 去重
+            if !seen.insert(s.code.clone()) {
+                continue;
+            } // 去重
 
             // BR-001: 同一只票近 3 日历日已推 → 跳过 (HashSet O(1) 查, 0 次 DB)
             if recently_pushed.contains(&s.code) {
@@ -211,16 +229,19 @@ pub fn discover(
 
             let score_breakdown = logic_hardness(hit, s);
             let score = score_breakdown.total();
-            scored.push((score, Candidate {
-                code: s.code.clone(),
-                name: s.name.clone(),
-                chain: hit.chain.clone(),
-                logic: hit.logic.clone(),
+            scored.push((
                 score,
-                price_note: price_note(s),
-                reason_summary: reason_summary(hit, s, score_breakdown),
-                push_time: next_push_time(),
-            }));
+                Candidate {
+                    code: s.code.clone(),
+                    name: s.name.clone(),
+                    chain: hit.chain.clone(),
+                    logic: hit.logic.clone(),
+                    score,
+                    price_note: price_note(s),
+                    reason_summary: reason_summary(hit, s, score_breakdown),
+                    push_time: next_push_time(),
+                },
+            ));
         }
     }
 
@@ -234,11 +255,25 @@ mod tests {
     use super::*;
 
     fn si(code: &str) -> crate::opportunity::chain_mapper::StockInfo {
-        crate::opportunity::chain_mapper::StockInfo { code: code.into(), name: format!("股票{}", code), change_pct: 0.0, vol_ratio: 1.0 }
+        crate::opportunity::chain_mapper::StockInfo {
+            code: code.into(),
+            name: format!("股票{}", code),
+            change_pct: 0.0,
+            vol_ratio: 1.0,
+        }
     }
 
-    fn si_full(code: &str, change_pct: f64, vol_ratio: f64) -> crate::opportunity::chain_mapper::StockInfo {
-        crate::opportunity::chain_mapper::StockInfo { code: code.into(), name: format!("股票{}", code), change_pct, vol_ratio }
+    fn si_full(
+        code: &str,
+        change_pct: f64,
+        vol_ratio: f64,
+    ) -> crate::opportunity::chain_mapper::StockInfo {
+        crate::opportunity::chain_mapper::StockInfo {
+            code: code.into(),
+            name: format!("股票{}", code),
+            change_pct,
+            vol_ratio,
+        }
     }
 
     #[test]
@@ -251,6 +286,8 @@ mod tests {
             source: crate::opportunity::chain_mapper::ChainSource::Rule,
             board_keyword: String::new(),
             fund_flow_pct: None,
+            board_code: None,
+            board_change_pct: None,
         }];
         let candidates = discover(&hits, &["002579".to_string()], 3);
         assert_eq!(candidates.len(), 2);
@@ -284,6 +321,8 @@ mod tests {
             source: crate::opportunity::chain_mapper::ChainSource::Rule,
             board_keyword: String::new(),
             fund_flow_pct: None,
+            board_code: None,
+            board_change_pct: None,
         }];
         let candidates = discover(&hits, &[], 10);
         assert_eq!(candidates.len(), 10);
@@ -310,6 +349,8 @@ mod tests {
             source: crate::opportunity::chain_mapper::ChainSource::Rule,
             board_keyword: String::new(),
             fund_flow_pct: None,
+            board_code: None,
+            board_change_pct: None,
         }];
         let candidates = discover(&hits, &[], 10);
         // 002938 中小板保留，其余北交所/科创板被过滤
@@ -321,16 +362,26 @@ mod tests {
     fn test_rank_by_fund_validation() {
         // 同等关键词，资金验证更强的产业链其标的排序靠前
         let weak = ChainHit {
-            chain: "弱链".into(), keywords: vec!["A".into()], logic: "x".into(),
+            chain: "弱链".into(),
+            keywords: vec!["A".into()],
+            logic: "x".into(),
             stocks: vec![si("002001")],
-            source: ChainSource::Rule, board_keyword: String::new(),
+            source: ChainSource::Rule,
+            board_keyword: String::new(),
             fund_flow_pct: Some(0.5),
+            board_code: None,
+            board_change_pct: None,
         };
         let strong = ChainHit {
-            chain: "强链".into(), keywords: vec!["B".into()], logic: "y".into(),
+            chain: "强链".into(),
+            keywords: vec!["B".into()],
+            logic: "y".into(),
             stocks: vec![si("002002")],
-            source: ChainSource::Rule, board_keyword: String::new(),
+            source: ChainSource::Rule,
+            board_keyword: String::new(),
             fund_flow_pct: Some(8.0),
+            board_code: None,
+            board_change_pct: None,
         };
         let candidates = discover(&[weak, strong], &[], 2);
         assert_eq!(candidates[0].code, "002002"); // 强资金验证排第一
@@ -340,10 +391,15 @@ mod tests {
     fn test_low_position_beats_chased() {
         // 低位放量卡位 优于 已启动追高
         let hit = ChainHit {
-            chain: "链".into(), keywords: vec!["A".into()], logic: "x".into(),
+            chain: "链".into(),
+            keywords: vec!["A".into()],
+            logic: "x".into(),
             stocks: vec![si_full("002003", 9.0, 3.0), si_full("002004", 1.0, 1.5)],
-            source: ChainSource::Rule, board_keyword: String::new(),
+            source: ChainSource::Rule,
+            board_keyword: String::new(),
             fund_flow_pct: Some(3.0),
+            board_code: None,
+            board_change_pct: None,
         };
         let candidates = discover(&[hit], &[], 2);
         assert_eq!(candidates[0].code, "002004"); // 低位卡位排第一

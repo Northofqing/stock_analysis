@@ -10,7 +10,7 @@ use diesel::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::schema::{stock_daily, lhb_daily, analysis_result, stock_position, trades, ledger};
+use crate::schema::{analysis_result, ledger, lhb_daily, stock_daily, stock_position, trades};
 
 // ============================================================================
 // 数据模型
@@ -109,7 +109,7 @@ impl StockDaily {
         let mut map = HashMap::with_capacity(16);
         map.insert("code".to_string(), serde_json::json!(self.code));
         map.insert("date".to_string(), serde_json::json!(self.date.to_string()));
-        
+
         if let Some(v) = self.open {
             map.insert("open".to_string(), serde_json::json!(v));
         }
@@ -146,7 +146,7 @@ impl StockDaily {
         if let Some(ref v) = self.data_source {
             map.insert("data_source".to_string(), serde_json::json!(v));
         }
-        
+
         map
     }
 }

@@ -41,10 +41,10 @@ impl PositionType {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarketRegime {
-    BullRally,    // 普涨（上涨 > 70%）
-    Structural,   // 结构性（30%-70%）
-    BearDecline,  // 普跌（< 30%）
-    Crash,        // 崩盘（沪指 < -3%）
+    BullRally,   // 普涨（上涨 > 70%）
+    Structural,  // 结构性（30%-70%）
+    BearDecline, // 普跌（< 30%）
+    Crash,       // 崩盘（沪指 < -3%）
 }
 
 impl MarketRegime {
@@ -83,9 +83,9 @@ pub fn classify_market(up_ratio: f64, index_change_pct: f64) -> MarketRegime {
 
 #[derive(Debug, Clone)]
 pub struct StopLoss {
-    pub technical: f64,   // 一级：买入价 × (1 - 2×ATR%)
-    pub structural: f64,  // 二级：最近支撑位 × 0.98
-    pub hard: f64,        // 三级：买入价 × 0.92（硬止损）
+    pub technical: f64,  // 一级：买入价 × (1 - 2×ATR%)
+    pub structural: f64, // 二级：最近支撑位 × 0.98
+    pub hard: f64,       // 三级：买入价 × 0.92（硬止损）
     pub atr: f64,
     pub buy_price: f64,
     pub support_level: Option<f64>,
@@ -96,7 +96,14 @@ impl StopLoss {
         let technical = buy_price * (1.0 - 2.0 * atr / 100.0);
         let hard = buy_price * 0.92;
         let structural = support.map(|s| s * 0.98).unwrap_or(hard);
-        StopLoss { technical, structural, hard, atr, buy_price, support_level: support }
+        StopLoss {
+            technical,
+            structural,
+            hard,
+            atr,
+            buy_price,
+            support_level: support,
+        }
     }
 
     /// 有效止损价：取最紧的（更早保护本金）
@@ -157,12 +164,33 @@ impl Default for PositionSizer {
 
 impl PositionSizer {
     pub fn from_env() -> Self {
-        let total = std::env::var("TOTAL_CAPITAL").ok().and_then(|s| s.parse().ok()).unwrap_or(100_000.0);
-        let max_pos = std::env::var("MAX_POSITIONS").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
-        let cap = std::env::var("RISK_SINGLE_STOCK_CAP_PCT").ok().and_then(|s| s.parse().ok()).unwrap_or(20.0);
-        let chain = std::env::var("RISK_CHAIN_CONCENTRATION_PCT").ok().and_then(|s| s.parse().ok()).unwrap_or(40.0);
-        let t1 = std::env::var("RISK_T1_FROZEN_RATIO").ok().and_then(|s| s.parse().ok()).unwrap_or(30.0);
-        Self { total_capital: total, max_positions: max_pos, single_stock_cap_pct: cap, chain_concentration_limit: chain, t1_frozen_warn_ratio: t1 }
+        let total = std::env::var("TOTAL_CAPITAL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100_000.0);
+        let max_pos = std::env::var("MAX_POSITIONS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5);
+        let cap = std::env::var("RISK_SINGLE_STOCK_CAP_PCT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20.0);
+        let chain = std::env::var("RISK_CHAIN_CONCENTRATION_PCT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(40.0);
+        let t1 = std::env::var("RISK_T1_FROZEN_RATIO")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30.0);
+        Self {
+            total_capital: total,
+            max_positions: max_pos,
+            single_stock_cap_pct: cap,
+            chain_concentration_limit: chain,
+            t1_frozen_warn_ratio: t1,
+        }
     }
 
     /// 基准仓位（单只股票）
@@ -175,9 +203,9 @@ impl PositionSizer {
         &self,
         regime: MarketRegime,
         volatility_pct: f64,
-        chain_positions: usize,      // 同产业链已有持仓数
-        chain_frozen: usize,         // 同产业链冻结持仓数
-        already_held: bool,           // 该股当前是否已持有
+        chain_positions: usize, // 同产业链已有持仓数
+        chain_frozen: usize,    // 同产业链冻结持仓数
+        already_held: bool,     // 该股当前是否已持有
     ) -> f64 {
         if already_held {
             return 0.0; // 禁止当日重复买入同一只
@@ -235,7 +263,9 @@ mod tests {
     #[test]
     fn test_position_type_labels() {
         assert!(PositionType::Available.can_sell_today());
-        let locked = PositionType::Locked { unlock_date: NaiveDate::from_ymd_opt(2026, 6, 14).unwrap() };
+        let locked = PositionType::Locked {
+            unlock_date: NaiveDate::from_ymd_opt(2026, 6, 14).unwrap(),
+        };
         assert!(!locked.can_sell_today());
         assert!(locked.is_locked());
     }
@@ -280,14 +310,20 @@ mod tests {
     #[test]
     fn test_stop_loss_advice_locked() {
         let sl = StopLoss::new(10.0, 3.0, None);
-        let locked = PositionType::Locked { unlock_date: NaiveDate::from_ymd_opt(2026, 6, 14).unwrap() };
+        let locked = PositionType::Locked {
+            unlock_date: NaiveDate::from_ymd_opt(2026, 6, 14).unwrap(),
+        };
         let advice = sl.advice(9.5, locked);
         assert!(advice.contains("T+1锁仓"));
     }
 
     #[test]
     fn test_position_sizer_base() {
-        let sizer = PositionSizer { total_capital: 100_000.0, max_positions: 5, ..Default::default() };
+        let sizer = PositionSizer {
+            total_capital: 100_000.0,
+            max_positions: 5,
+            ..Default::default()
+        };
         assert!((sizer.base_position() - 20_000.0).abs() < 0.01);
     }
 
@@ -323,14 +359,22 @@ mod tests {
 
     #[test]
     fn test_t1_risk_warning() {
-        let sizer = PositionSizer { total_capital: 100_000.0, t1_frozen_warn_ratio: 30.0, ..Default::default() };
+        let sizer = PositionSizer {
+            total_capital: 100_000.0,
+            t1_frozen_warn_ratio: 30.0,
+            ..Default::default()
+        };
         assert!(sizer.check_t1_risk(35_000.0).is_some());
         assert!(sizer.check_t1_risk(10_000.0).is_none());
     }
 
     #[test]
     fn test_chain_concentration_warning() {
-        let sizer = PositionSizer { total_capital: 100_000.0, chain_concentration_limit: 40.0, ..Default::default() };
+        let sizer = PositionSizer {
+            total_capital: 100_000.0,
+            chain_concentration_limit: 40.0,
+            ..Default::default()
+        };
         assert!(sizer.check_chain_concentration(45_000.0).is_some());
         assert!(sizer.check_chain_concentration(20_000.0).is_none());
     }

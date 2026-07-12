@@ -1,6 +1,5 @@
 //! rsi（从 indicators.rs 拆分）
 
-
 // ============================================================================
 // RSI
 // ============================================================================
@@ -19,7 +18,14 @@ pub struct RsiPoint {
 pub fn calc_rsi(closes: &[f64]) -> Vec<RsiPoint> {
     let len = closes.len();
     if len < 2 {
-        return vec![RsiPoint { rsi6: 50.0, rsi12: 50.0, rsi24: 50.0 }; len];
+        return vec![
+            RsiPoint {
+                rsi6: 50.0,
+                rsi12: 50.0,
+                rsi24: 50.0
+            };
+            len
+        ];
     }
 
     let rsi6 = rsi_single(closes, 6);
@@ -79,4 +85,3 @@ pub(super) fn rsi_single(closes: &[f64], period: usize) -> Vec<f64> {
 
     result
 }
-

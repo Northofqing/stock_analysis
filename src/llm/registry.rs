@@ -72,9 +72,17 @@ impl LlmRegistry {
             providers.len(),
             providers.keys().collect::<Vec<_>>()
         );
-        log::info!("[LLM] {} 个 role 配置, fallback={:?}", roles.len(), default_fallback);
+        log::info!(
+            "[LLM] {} 个 role 配置, fallback={:?}",
+            roles.len(),
+            default_fallback
+        );
 
-        Self { providers, roles, default_fallback }
+        Self {
+            providers,
+            roles,
+            default_fallback,
+        }
     }
 
     /// 按 role 选 provider, 返回第一个可用的. 无可用 → None, 业务降级.
@@ -93,7 +101,10 @@ impl LlmRegistry {
                 return Some(p.clone());
             }
         }
-        log::warn!("[LLM] role={} 无可用 provider (env 未配置 / 全部失败)", role);
+        log::warn!(
+            "[LLM] role={} 无可用 provider (env 未配置 / 全部失败)",
+            role
+        );
         None
     }
 

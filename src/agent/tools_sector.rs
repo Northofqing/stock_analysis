@@ -1,6 +1,6 @@
+use crate::agent::tool::Tool;
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use crate::agent::tool::Tool;
 
 pub struct FetchSectorTool {
     client: reqwest::Client,
@@ -58,7 +58,8 @@ impl Tool for FetchSectorTool {
     }
 
     async fn call(&self, input: serde_json::Value) -> anyhow::Result<String> {
-        let code = input.get("code")
+        let code = input
+            .get("code")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'code' parameter"))?;
 
@@ -83,7 +84,11 @@ impl Tool for FetchSectorTool {
         let body: Value = match resp {
             Ok(r) => match r.json().await {
                 Ok(v) => v,
-                Err(e) => return Ok(json!({"error": format!("板块接口 JSON 解析失败: {}", e)}).to_string()),
+                Err(e) => {
+                    return Ok(
+                        json!({"error": format!("板块接口 JSON 解析失败: {}", e)}).to_string()
+                    )
+                }
             },
             Err(e) => return Ok(json!({"error": format!("板块接口请求失败: {}", e)}).to_string()),
         };
@@ -109,7 +114,10 @@ impl Tool for FetchSectorTool {
             if name.is_empty() {
                 continue;
             }
-            let rank = item.get("BOARD_RANK").and_then(|v| v.as_i64()).unwrap_or(99);
+            let rank = item
+                .get("BOARD_RANK")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(99);
             boards.push((rank, name.to_string()));
         }
         boards.sort_by_key(|(r, _)| *r);

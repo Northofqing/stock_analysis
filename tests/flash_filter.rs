@@ -96,8 +96,8 @@ fn test_filter_macro_titles_traditional_chinese() {
     // 提醒: 如果未来发现快讯繁体混排, 需要加 normalize (如 opencc-rust 或手动 unicode 映射).
     // 当前测试**仅**确保已收录关键词的简体形式被过滤, 繁体失败作为已知限制记录.
     let input = vec![
-        "美聯儲宣布降息".to_string(),  // 繁体美联储 - 当前**不**被过滤 (已知限制)
-        "美联储宣布加息".to_string(),  // 简体 - 被过滤
+        "美聯儲宣布降息".to_string(), // 繁体美联储 - 当前**不**被过滤 (已知限制)
+        "美联储宣布加息".to_string(), // 简体 - 被过滤
     ];
     let (filtered, count) = filter_macro_titles(input);
     assert_eq!(count, 1, "仅简体被过滤, 繁体作为已知限制");
@@ -110,8 +110,8 @@ fn test_filter_macro_titles_case_insensitive_for_english() {
     // 修复 I-4: 英文关键词大小写. "FOMC" 应被过滤 (已收录), 但 "fomc" 小写不命中.
     // 当前 .contains() 是 byte-sensitive, 大小写不互通. 这个测试记录已知限制.
     let input = vec![
-        "FOMC 决议维持利率不变".to_string(),  // 大写 - 被过滤
-        "fomc 决议维持利率不变".to_string(),  // 小写 - 当前不被过滤 (已知限制)
+        "FOMC 决议维持利率不变".to_string(), // 大写 - 被过滤
+        "fomc 决议维持利率不变".to_string(), // 小写 - 当前不被过滤 (已知限制)
     ];
     let (filtered, count) = filter_macro_titles(input);
     assert_eq!(count, 1, "仅大写被过滤");
@@ -140,12 +140,15 @@ fn test_filter_macro_titles_dollar_keyword() {
     // 但实测 "公司美元收入占比" 也命中, 误伤公司层面信息.
     // 最终决定: 仅保留 "美元指数", 不加 "美元" 单字 (本测试记录决策边界).
     let input = vec![
-        "美元指数走强".to_string(),       // 宏观 - 被过滤
-        "美元强势升值".to_string(),       // 宏观 - **不**被过滤 (无"美元指数")
-        "公司美元收入占比".to_string(),   // 公司层面 - 不被过滤
+        "美元指数走强".to_string(),     // 宏观 - 被过滤
+        "美元强势升值".to_string(),     // 宏观 - **不**被过滤 (无"美元指数")
+        "公司美元收入占比".to_string(), // 公司层面 - 不被过滤
     ];
     let (filtered, count) = filter_macro_titles(input);
-    assert_eq!(count, 1, "仅 '美元指数' 被过滤, '美元' 单字不加 (避免误伤公司层面)");
+    assert_eq!(
+        count, 1,
+        "仅 '美元指数' 被过滤, '美元' 单字不加 (避免误伤公司层面)"
+    );
     assert_eq!(filtered.len(), 2);
     assert!(filtered[0].contains("强势升值") || filtered[0].contains("收入"));
 }

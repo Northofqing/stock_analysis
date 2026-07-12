@@ -6,11 +6,11 @@
 //! 3. 分析机构和游资动向
 //! 4. 作为选股指标
 
-use anyhow::{Result, Context};
+use crate::database::DatabaseManager;
+use crate::models::{LhbDaily, NewLhbDaily};
+use anyhow::{Context, Result};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
-use crate::database::DatabaseManager;
-use crate::models::{NewLhbDaily, LhbDaily};
 
 /// 龙虎榜记录
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,14 +109,22 @@ impl LhbDataFetcher {
         } else {
             date.to_string()
         };
-        
-        log::info!("[龙虎榜] 正在查询 {} 的数据（标准化后：{}）", date, date_normalized);
-        
+
+        log::info!(
+            "[龙虎榜] 正在查询 {} 的数据（标准化后：{}）",
+            date,
+            date_normalized
+        );
+
         // 1. 先尝试从数据库读取缓存（支持模糊匹配日期）
         if let Some(db) = DatabaseManager::try_get() {
             if let Ok(cached_records) = db.get_lhb_by_date(&date_normalized) {
                 if !cached_records.is_empty() {
-                    log::info!("[龙虎榜] 从数据库缓存读取 {} 的数据 ({} 条记录)", date, cached_records.len());
+                    log::info!(
+                        "[龙虎榜] 从数据库缓存读取 {} 的数据 ({} 条记录)",
+                        date,
+                        cached_records.len()
+                    );
                     return Ok(Self::convert_db_to_records(cached_records));
                 } else {
                     log::info!("[龙虎榜] 数据库中没有 {} 的缓存数据", date);
@@ -135,7 +143,7 @@ impl LhbDataFetcher {
                 .iter()
                 .map(|r| Self::convert_record_to_db(r))
                 .collect();
-            
+
             if let Ok(saved) = db.save_lhb_records(&new_records) {
                 log::info!("[龙虎榜] 已缓存 {} 条记录到数据库", saved);
             }
@@ -152,7 +160,7 @@ impl LhbDataFetcher {
         } else {
             date.to_string()
         };
-        
+
         let url = format!(
             "http://datacenter-web.eastmoney.com/api/data/v1/get?\
             reportName=RPT_DAILYBILLBOARD_DETAILS\
@@ -163,17 +171,17 @@ impl LhbDataFetcher {
             date_formatted
         );
 
-        let response = self.client
+        let response = self
+            .client
             .get(&url)
             .send()
             .await
             .context("请求龙虎榜数据失败")?;
 
         let text = response.text().await?;
-        
+
         // 解析JSON
-        let json: serde_json::Value = serde_json::from_str(&text)
-            .context("解析龙虎榜JSON失败")?;
+        let json: serde_json::Value = serde_json::from_str(&text).context("解析龙虎榜JSON失败")?;
 
         let mut records = Vec::new();
 
@@ -234,7 +242,7 @@ impl LhbDataFetcher {
         // 计算日期范围
         let end_date = Local::now();
         let start_date = end_date - chrono::Duration::days(days as i64);
-        
+
         let url = format!(
             "http://datacenter-web.eastmoney.com/api/data/v1/get?\
             reportName=RPT_DAILYBILLBOARD_DETAILS\
@@ -249,15 +257,16 @@ impl LhbDataFetcher {
 
         log::info!("[龙虎榜] 获取{}最近{}天的数据...", code, days);
 
-        let response = self.client
+        let response = self
+            .client
             .get(&url)
             .send()
             .await
             .context("请求个股龙虎榜数据失败")?;
 
         let text = response.text().await?;
-        let json: serde_json::Value = serde_json::from_str(&text)
-            .context("解析个股龙虎榜JSON失败")?;
+        let json: serde_json::Value =
+            serde_json::from_str(&text).context("解析个股龙虎榜JSON失败")?;
 
         let mut records = Vec::new();
 
@@ -287,7 +296,7 @@ impl LhbDataFetcher {
             net_amount: item["BILLBOARD_NET_AMT"].as_f64().unwrap_or(0.0),
             total_amount: item["ACCUM_AMOUNT"].as_f64().unwrap_or(0.0),
             lhb_ratio: item["DEAL_NET_RATIO"].as_f64().unwrap_or(0.0),
-            inst_buy_seats: 0,  // 需要额外接口获取
+            inst_buy_seats: 0, // 需要额外接口获取
             inst_sell_seats: 0,
             inst_net_amount: 0.0,
         })
@@ -296,28 +305,29 @@ impl LhbDataFetcher {
     /// 分析个股龙虎榜数据，生成选股指标
     pub async fn analyze_stock_lhb(&self, code: &str) -> Result<LhbAnalysis> {
         let records = self.get_stock_lhb_history(code, 30).await?;
-        
+
         let recent_count = records.len() as i32;
-        
+
         // 计算机构参与度
         let inst_score = self.calculate_inst_score(&records);
-        
-        // 计算游资活跃度  
+
+        // 计算游资活跃度
         let hot_money_score = self.calculate_hot_money_score(&records);
-        
+
         // 综合评分
         let total_score = (inst_score * 6 + hot_money_score * 4) / 10;
-        
+
         // 生成推荐理由
         let reason = self.generate_recommendation(&records, inst_score, hot_money_score);
-        
+
         // 风险提示
         let risk_warning = self.generate_risk_warning(&records);
-        
-        let name = records.first()
+
+        let name = records
+            .first()
             .map(|r| r.name.clone())
             .unwrap_or_else(|| "未知".to_string());
-        
+
         Ok(LhbAnalysis {
             code: code.to_string(),
             name,
@@ -340,14 +350,10 @@ impl LhbDataFetcher {
         let len_f = len as f64;
 
         // 统计净买入为正的次数
-        let positive_count = records.iter()
-            .filter(|r| r.net_amount > 0.0)
-            .count();
+        let positive_count = records.iter().filter(|r| r.net_amount > 0.0).count();
 
         // 计算平均净买入额
-        let avg_net_amount: f64 = records.iter()
-            .map(|r| r.net_amount)
-            .sum::<f64>() / len_f;
+        let avg_net_amount: f64 = records.iter().map(|r| r.net_amount).sum::<f64>() / len_f;
 
         // 评分逻辑
         let mut score = 0;
@@ -358,7 +364,7 @@ impl LhbDataFetcher {
         // 净买入为正占比加分
         let positive_ratio = positive_count as f64 / len_f;
         score += (positive_ratio * 40.0) as i32;
-        
+
         // 平均净买入额加分
         if avg_net_amount > 5000.0 {
             score += 30;
@@ -367,7 +373,7 @@ impl LhbDataFetcher {
         } else if avg_net_amount > 0.0 {
             score += 10;
         }
-        
+
         score.min(100)
     }
 
@@ -386,9 +392,7 @@ impl LhbDataFetcher {
         score += (len * 15).min(40) as i32;
 
         // 龙虎榜成交占比
-        let avg_ratio: f64 = records.iter()
-            .map(|r| r.lhb_ratio)
-            .sum::<f64>() / len_f;
+        let avg_ratio: f64 = records.iter().map(|r| r.lhb_ratio).sum::<f64>() / len_f;
 
         if avg_ratio > 20.0 {
             score += 40;
@@ -399,55 +403,60 @@ impl LhbDataFetcher {
         }
 
         // 涨跌幅
-        let avg_pct: f64 = records.iter()
-            .map(|r| r.pct_change.abs())
-            .sum::<f64>() / len_f;
-        
+        let avg_pct: f64 = records.iter().map(|r| r.pct_change.abs()).sum::<f64>() / len_f;
+
         if avg_pct > 8.0 {
             score += 20;
         } else if avg_pct > 5.0 {
             score += 10;
         }
-        
+
         score.min(100)
     }
 
     /// 生成推荐理由
-    fn generate_recommendation(&self, records: &[LhbRecord], inst_score: i32, hot_money_score: i32) -> String {
+    fn generate_recommendation(
+        &self,
+        records: &[LhbRecord],
+        inst_score: i32,
+        hot_money_score: i32,
+    ) -> String {
         if records.is_empty() {
             return "近期未上榜龙虎榜".to_string();
         }
-        
+
         let mut reasons = Vec::new();
-        
+
         if inst_score >= 70 {
             reasons.push("机构高度参与，资金实力雄厚".to_string());
         } else if inst_score >= 50 {
             reasons.push("机构适度关注".to_string());
         }
-        
+
         if hot_money_score >= 70 {
             reasons.push("游资高度活跃，题材热度高".to_string());
         } else if hot_money_score >= 50 {
             reasons.push("游资参与度较高".to_string());
         }
-        
+
         // 统计净买入情况
-        let net_buy_count = records.iter()
-            .filter(|r| r.net_amount > 0.0)
-            .count();
-        
+        let net_buy_count = records.iter().filter(|r| r.net_amount > 0.0).count();
+
         if net_buy_count > records.len() / 2 {
-            reasons.push(format!("最近{}次上榜中{}次为净买入", records.len(), net_buy_count));
+            reasons.push(format!(
+                "最近{}次上榜中{}次为净买入",
+                records.len(),
+                net_buy_count
+            ));
         }
-        
+
         // 最近一次上榜
         if let Some(latest) = records.first() {
             if latest.net_amount > 1000.0 {
                 reasons.push(format!("最近上榜净买入{:.0}万元", latest.net_amount));
             }
         }
-        
+
         if reasons.is_empty() {
             "龙虎榜数据一般，建议谨慎".to_string()
         } else {
@@ -460,34 +469,31 @@ impl LhbDataFetcher {
         if records.is_empty() {
             return "".to_string();
         }
-        
+
         let mut warnings = Vec::new();
-        
+
         // 检查是否频繁上榜但净卖出
-        let net_sell_count = records.iter()
-            .filter(|r| r.net_amount < -1000.0)
-            .count();
-        
+        let net_sell_count = records.iter().filter(|r| r.net_amount < -1000.0).count();
+
         if net_sell_count > records.len() / 2 {
             warnings.push("频繁出现大额净卖出，资金流出风险");
         }
-        
+
         // 检查涨跌幅波动
-        let avg_pct: f64 = records.iter()
-            .map(|r| r.pct_change.abs())
-            .sum::<f64>() / records.len() as f64;
-        
+        let avg_pct: f64 =
+            records.iter().map(|r| r.pct_change.abs()).sum::<f64>() / records.len() as f64;
+
         if avg_pct > 9.0 {
             warnings.push("波动剧烈，短线炒作风险高");
         }
-        
+
         // 检查最近是否大幅下跌上榜
         if let Some(latest) = records.first() {
             if latest.pct_change < -7.0 {
                 warnings.push("最近因大跌上榜，注意止损");
             }
         }
-        
+
         warnings.join("；")
     }
 
@@ -495,9 +501,9 @@ impl LhbDataFetcher {
     pub async fn screen_lhb_stocks(&self, min_score: i32) -> Result<Vec<LhbAnalysis>> {
         // 获取今日龙虎榜
         let today_lhb = self.get_today_lhb().await?;
-        
+
         let mut results = Vec::new();
-        
+
         for record in today_lhb {
             // 分析每只股票
             if let Ok(analysis) = self.analyze_stock_lhb(&record.code).await {
@@ -505,14 +511,14 @@ impl LhbDataFetcher {
                     results.push(analysis);
                 }
             }
-            
+
             // 避免请求过快
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         }
-        
+
         // 按评分排序
         results.sort_by(|a, b| b.total_score.cmp(&a.total_score));
-        
+
         Ok(results)
     }
 }
@@ -531,13 +537,18 @@ mod tests {
     async fn test_get_today_lhb() {
         let fetcher = LhbDataFetcher::new().unwrap();
         let result = fetcher.get_today_lhb().await;
-        
+
         match result {
             Ok(records) => {
                 println!("今日龙虎榜: {} 条记录", records.len());
                 for (i, record) in records.iter().take(5).enumerate() {
-                    println!("{}. {} {} 净买入: {:.0}万", 
-                        i+1, record.code, record.name, record.net_amount);
+                    println!(
+                        "{}. {} {} 净买入: {:.0}万",
+                        i + 1,
+                        record.code,
+                        record.name,
+                        record.net_amount
+                    );
                 }
             }
             Err(e) => {
@@ -549,11 +560,11 @@ mod tests {
     #[tokio::test]
     async fn test_analyze_stock() {
         let fetcher = LhbDataFetcher::new().unwrap();
-        
+
         // 测试一个股票代码
         let code = "600519";
         let result = fetcher.analyze_stock_lhb(code).await;
-        
+
         match result {
             Ok(analysis) => {
                 println!("\n龙虎榜分析结果:");

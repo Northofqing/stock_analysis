@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 
 use super::super::types::{SearchProvider, SearchResponse, SearchResult};
 
-
 // ============================================================================
 // 金十数据 直连API（快讯 + 财经日历，免费无需Key）
 // ============================================================================
@@ -61,7 +60,8 @@ impl Jin10Provider {
 
     /// 构造带金十通用请求头的 GET
     fn flash_req(&self, url: &str) -> reqwest::RequestBuilder {
-        self.client.get(url)
+        self.client
+            .get(url)
             .header("x-app-id", "bVBF4FyRTn5NJF5n")
             .header("x-version", "1.0.0")
             .header("Referer", "https://www.jin10.com/")
@@ -72,7 +72,11 @@ impl Jin10Provider {
     ///
     /// - `limit`: 最大返回条数
     /// - `only_important`: 只返回 important=1 的标星快讯
-    pub async fn fetch_flash_news(&self, limit: usize, only_important: bool) -> Result<Vec<SearchResult>> {
+    pub async fn fetch_flash_news(
+        &self,
+        limit: usize,
+        only_important: bool,
+    ) -> Result<Vec<SearchResult>> {
         #[derive(Deserialize, Debug)]
         struct FlashInner {
             #[serde(default)]
@@ -108,10 +112,13 @@ impl Jin10Provider {
         }
 
         let url = "https://flash-api.jin10.com/get_flash_list?channel=-8200&vip=1";
-        let resp: FlashResp = self.flash_req(url)
-            .send().await
+        let resp: FlashResp = self
+            .flash_req(url)
+            .send()
+            .await
             .context("金十快讯请求失败")?
-            .json().await
+            .json()
+            .await
             .context("金十快讯解析失败")?;
 
         if resp.status != Some(200) {
@@ -125,14 +132,23 @@ impl Jin10Provider {
         for item in items {
             // type=0 普通快讯，type=1 数据类，其他可能是广告/图片，跳过
             let kind = item.kind.unwrap_or(0);
-            if kind > 1 { continue; }
+            if kind > 1 {
+                continue;
+            }
 
-            let inner = match item.data { Some(v) => v, None => continue };
+            let inner = match item.data {
+                Some(v) => v,
+                None => continue,
+            };
             let content = inner.content.unwrap_or_default();
-            if content.is_empty() { continue; }
+            if content.is_empty() {
+                continue;
+            }
 
             let important_flag = item.important.unwrap_or(0) == 1;
-            if only_important && !important_flag { continue; }
+            if only_important && !important_flag {
+                continue;
+            }
 
             // 解析时间，过滤 6h 以外
             let (date_tag, ts_opt) = match item.time.as_deref() {
@@ -148,27 +164,34 @@ impl Jin10Provider {
                 None => (String::new(), None),
             };
             if let Some(ts) = ts_opt {
-                if now.timestamp() - ts > 6 * 3600 { continue; }
+                if now.timestamp() - ts > 6 * 3600 {
+                    continue;
+                }
             }
 
             // 截取标题
-            let title = inner.title.filter(|s| !s.is_empty()).unwrap_or_else(|| {
-                content.chars().take(60).collect()
-            });
+            let title = inner
+                .title
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| content.chars().take(60).collect());
             let snippet: String = content.chars().take(240).collect();
             let title_display = if important_flag {
                 format!("⭐ {}", title)
             } else {
                 title
             };
-            let url = inner.source_link.filter(|s| !s.is_empty())
+            let url = inner
+                .source_link
+                .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "https://www.jin10.com/".to_string());
 
             results.push(
                 SearchResult::new(title_display, snippet, url, "金十数据".to_string())
-                    .with_date(date_tag)
+                    .with_date(date_tag),
             );
-            if results.len() >= limit { break; }
+            if results.len() >= limit {
+                break;
+            }
         }
 
         Ok(results)
@@ -181,7 +204,11 @@ impl Jin10Provider {
     ///
     /// - `days_ahead`: 0=仅今天，1=今天+明天，N=未来 N+1 天
     /// - `min_star`: 只保留重要性 >= min_star 的事件（1-3）
-    pub async fn fetch_calendar(&self, days_ahead: u32, min_star: u8) -> Result<Vec<Jin10CalendarEvent>> {
+    pub async fn fetch_calendar(
+        &self,
+        days_ahead: u32,
+        min_star: u8,
+    ) -> Result<Vec<Jin10CalendarEvent>> {
         use chrono::Datelike;
         let today = chrono::Local::now().date_naive();
         let mut weeks: std::collections::BTreeSet<(i32, u32)> = std::collections::BTreeSet::new();
@@ -196,14 +223,24 @@ impl Jin10Provider {
 
         for (year, week) in weeks {
             // 抓经济数据 & 事件（并发）
-            let econ_url = format!("https://cdn-rili.jin10.com/web_data/{}/week/{:02}/economics.json", year, week);
-            let event_url = format!("https://cdn-rili.jin10.com/web_data/{}/week/{:02}/event.json", year, week);
+            let econ_url = format!(
+                "https://cdn-rili.jin10.com/web_data/{}/week/{:02}/economics.json",
+                year, week
+            );
+            let event_url = format!(
+                "https://cdn-rili.jin10.com/web_data/{}/week/{:02}/event.json",
+                year, week
+            );
             let (econ_res, event_res) = tokio::join!(
                 self.fetch_calendar_entries(&econ_url, "data"),
                 self.fetch_calendar_entries(&event_url, "event"),
             );
-            if let Ok(mut v) = econ_res { events.append(&mut v); }
-            if let Ok(mut v) = event_res { events.append(&mut v); }
+            if let Ok(mut v) = econ_res {
+                events.append(&mut v);
+            }
+            if let Ok(mut v) = event_res {
+                events.append(&mut v);
+            }
         }
 
         // 过滤日期窗口 + 重要性
@@ -220,11 +257,19 @@ impl Jin10Provider {
     }
 
     /// 内部：拉取单个 economics.json / event.json 并映射为统一结构
-    async fn fetch_calendar_entries(&self, url: &str, kind: &str) -> Result<Vec<Jin10CalendarEvent>> {
+    async fn fetch_calendar_entries(
+        &self,
+        url: &str,
+        kind: &str,
+    ) -> Result<Vec<Jin10CalendarEvent>> {
         // 日历 CDN 不要求 app-id，但加上不会出错
-        let text = self.flash_req(url).send().await
+        let text = self
+            .flash_req(url)
+            .send()
+            .await
             .with_context(|| format!("金十日历请求失败: {}", url))?
-            .text().await
+            .text()
+            .await
             .context("金十日历读取失败")?;
         if text.trim().is_empty() {
             return Ok(Vec::new());
@@ -236,40 +281,67 @@ impl Jin10Provider {
             Err(_) => return Ok(Vec::new()),
         };
 
-        let arr = v.as_array()
+        let arr = v
+            .as_array()
             .or_else(|| v.get("data").and_then(|d| d.as_array()))
             .cloned()
             .unwrap_or_default();
 
         let mut out: Vec<Jin10CalendarEvent> = Vec::new();
         for item in arr {
-            let date = item.get("pub_time").or_else(|| item.get("date"))
+            let date = item
+                .get("pub_time")
+                .or_else(|| item.get("date"))
                 .and_then(|s| s.as_str())
                 .map(|s| s.split(' ').next().unwrap_or(s).to_string())
                 .unwrap_or_default();
-            if date.is_empty() { continue; }
+            if date.is_empty() {
+                continue;
+            }
 
-            let time = item.get("pub_time").or_else(|| item.get("time"))
+            let time = item
+                .get("pub_time")
+                .or_else(|| item.get("time"))
                 .and_then(|s| s.as_str())
                 .map(|s| {
                     let parts: Vec<&str> = s.splitn(2, ' ').collect();
-                    if parts.len() == 2 { parts[1].to_string() } else { "全天".to_string() }
+                    if parts.len() == 2 {
+                        parts[1].to_string()
+                    } else {
+                        "全天".to_string()
+                    }
                 })
                 .unwrap_or_else(|| "全天".to_string());
 
-            let country = item.get("country").and_then(|s| s.as_str()).unwrap_or("").to_string();
-            let name = item.get("name").or_else(|| item.get("title"))
-                .and_then(|s| s.as_str()).unwrap_or("").to_string();
-            if name.is_empty() { continue; }
+            let country = item
+                .get("country")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
+            let name = item
+                .get("name")
+                .or_else(|| item.get("title"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
+            if name.is_empty() {
+                continue;
+            }
 
             let star = item.get("star").and_then(|s| s.as_u64()).unwrap_or(0) as u8;
 
             let grab_str = |key: &str| -> Option<String> {
-                item.get(key).and_then(|x| {
-                    if x.is_string() { x.as_str().map(|s| s.to_string()) }
-                    else if x.is_number() { Some(x.to_string()) }
-                    else { None }
-                }).filter(|s| !s.is_empty() && s != "--")
+                item.get(key)
+                    .and_then(|x| {
+                        if x.is_string() {
+                            x.as_str().map(|s| s.to_string())
+                        } else if x.is_number() {
+                            Some(x.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .filter(|s| !s.is_empty() && s != "--")
             };
 
             out.push(Jin10CalendarEvent {
@@ -290,12 +362,17 @@ impl Jin10Provider {
 
 #[async_trait]
 impl SearchProvider for Jin10Provider {
-    fn name(&self) -> &str { &self.name }
-    fn is_available(&self) -> bool { true }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_available(&self) -> bool {
+        true
+    }
 
     async fn search(&self, query: &str, max_results: usize) -> SearchResponse {
         let start = Instant::now();
-        let keywords: Vec<String> = query.split_whitespace()
+        let keywords: Vec<String> = query
+            .split_whitespace()
             .filter(|w| w.chars().count() >= 2)
             .take(6)
             .map(|w| w.to_lowercase())
@@ -322,9 +399,12 @@ impl SearchProvider for Jin10Provider {
             results: filtered,
             provider: self.name.clone(),
             success,
-            error_message: if success { None } else { Some("金十无相关快讯".to_string()) },
+            error_message: if success {
+                None
+            } else {
+                Some("金十无相关快讯".to_string())
+            },
             search_time: start.elapsed().as_secs_f64(),
         }
     }
 }
-

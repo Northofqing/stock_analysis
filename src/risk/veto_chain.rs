@@ -116,9 +116,8 @@ impl VetoChain {
         let mut outcome = VetoOutcome::default();
 
         for rule in &self.rules {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                rule.evaluate(ctx)
-            }));
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rule.evaluate(ctx)));
 
             match result {
                 Ok(verdict) => {
@@ -338,10 +337,7 @@ mod tests {
 
     #[test]
     fn test_panic_rule_does_not_propagate() {
-        let chain = VetoChain::new(vec![
-            Box::new(PanicRule),
-            Box::new(AlwaysTriggerRule),
-        ]);
+        let chain = VetoChain::new(vec![Box::new(PanicRule), Box::new(AlwaysTriggerRule)]);
         let outcome = chain.evaluate_all(&make_ctx());
         // PanicRule 被跳过，AlwaysTriggerRule 正常触发
         assert_eq!(outcome.flags.len(), 1);

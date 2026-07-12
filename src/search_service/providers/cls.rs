@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 
 use super::super::types::{SearchProvider, SearchResponse, SearchResult};
+use super::cls_sign::build_signed_params;
 
 #[derive(Debug, Deserialize)]
 struct ClsTelegraphResp {
@@ -48,16 +49,14 @@ impl ClsProvider {
     }
 
     /// 拉取 CLS 最新电报（接口由前端页面请求链路逆向得到）。
+    /// BR-037: 统一走 cls_sign 构造签名参数，禁止裸 query 请求。
     pub async fn fetch_live_news(&self, limit: usize) -> Result<Vec<SearchResult>> {
-        let now = chrono::Local::now().timestamp();
-        let url = format!(
-            "https://www.cls.cn/api/cache?lastTime={}&name=refreshTenTelegraph",
-            now
-        );
+        let params = build_signed_params(&[("name", "telegraph".to_string())]);
 
         let resp: ClsTelegraphResp = self
             .client
-            .get(&url)
+            .get("https://www.cls.cn/api/cache")
+            .query(&params)
             .header("Origin", "https://www.cls.cn")
             .header("Referer", "https://www.cls.cn/telegraph")
             .send()

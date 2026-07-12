@@ -7,7 +7,13 @@
 use stock_analysis::opportunity::launch_gate::*;
 
 fn metrics(shadow_days: u32, winrate_samples: u32, winrate_pct: f64, calmar: f64) -> StageMetrics {
-    StageMetrics { shadow_days, winrate_samples, winrate_pct, calmar_ratio: calmar, gray_days: 0 }
+    StageMetrics {
+        shadow_days,
+        winrate_samples,
+        winrate_pct,
+        calmar_ratio: calmar,
+        gray_days: 0,
+    }
 }
 
 #[test]
@@ -21,7 +27,10 @@ fn test_shadow_stays_under_threshold() {
 fn test_shadow_to_gray_at_threshold() {
     // 修复 P0-3: 12 周 + 200 样本 + 60% 胜率 + Calmar 1.0 → 灰度
     let m = metrics(84, 250, 0.65, 1.2);
-    assert_eq!(LaunchGate::check_transition(LaunchStage::Shadow, &m), Some(LaunchStage::Gray));
+    assert_eq!(
+        LaunchGate::check_transition(LaunchStage::Shadow, &m),
+        Some(LaunchStage::Gray)
+    );
 }
 
 #[test]

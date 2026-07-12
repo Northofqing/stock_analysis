@@ -50,4 +50,3 @@ pub fn detect_cross(fast: &[f64], slow: &[f64], lookback: usize) -> CrossType {
     }
     CrossType::None
 }
-

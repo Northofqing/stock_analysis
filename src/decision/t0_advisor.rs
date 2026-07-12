@@ -136,18 +136,13 @@ pub fn evaluate(input: &T0Input) -> T0Verdict {
 
     // 4. 无可卖底仓
     if input.available_shares == 0 {
-        return T0Verdict::Forbidden(format!(
-            "无可卖底仓 ({} 股)",
-            input.available_shares
-        ));
+        return T0Verdict::Forbidden(format!("无可卖底仓 ({} 股)", input.available_shares));
     }
 
     // 5. ReduceOnly 仅反T
     let kind = if let Some(h) = input.kind_hint {
         if input.account_mode_is_reduce_only && h == T0Kind::PositiveT {
-            return T0Verdict::Forbidden(
-                "ReduceOnly 账户仅允许反T, 不允许正T".to_string(),
-            );
+            return T0Verdict::Forbidden("ReduceOnly 账户仅允许反T, 不允许正T".to_string());
         }
         h
     } else if input.account_mode_is_reduce_only {
@@ -161,7 +156,10 @@ pub fn evaluate(input: &T0Input) -> T0Verdict {
     let pressure_band = input.pressure * 0.01;
     let support_band = input.support * 0.01;
 
-    let sell_zone = (input.pressure - pressure_band, input.pressure + pressure_band);
+    let sell_zone = (
+        input.pressure - pressure_band,
+        input.pressure + pressure_band,
+    );
     let buy_zone = (input.support - support_band, input.support + support_band);
 
     // 最小价差 (覆盖 2× 往返成本 ~0.6%, 取 ≥1.5% 为门槛)
@@ -278,7 +276,13 @@ mod tests {
     fn range_default_allows_reverse_t() {
         let v = evaluate(&input_default());
         assert!(v.is_allowed(), "Range 默认应允许反T");
-        if let T0Verdict::Allowed { kind, sell_zone, buy_zone, .. } = v {
+        if let T0Verdict::Allowed {
+            kind,
+            sell_zone,
+            buy_zone,
+            ..
+        } = v
+        {
             assert_eq!(kind, T0Kind::ReverseT);
             // sell_zone 在 pressure ± 1% (12.5 ± 0.125)
             assert!((sell_zone.0 - 12.375).abs() < 0.01);
@@ -307,7 +311,11 @@ mod tests {
         inp.pressure = 12.5;
         let v = evaluate(&inp);
         if let T0Verdict::Allowed { min_spread_pct, .. } = v {
-            assert!(min_spread_pct < 1.5, "实测 spread 应 < 1.5, 实得 {}", min_spread_pct);
+            assert!(
+                min_spread_pct < 1.5,
+                "实测 spread 应 < 1.5, 实得 {}",
+                min_spread_pct
+            );
         } else {
             panic!("应允许但 spread 不足");
         }

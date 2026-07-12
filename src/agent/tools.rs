@@ -1,7 +1,7 @@
-use async_trait::async_trait;
-use serde_json::json;
 use crate::agent::tool::Tool;
 use crate::data_provider::service::service;
+use async_trait::async_trait;
+use serde_json::json;
 // Replace standard serde_json::Value with local alias or fully qualify to avoid type collisions.
 
 pub struct FetchFinancialTool;
@@ -36,12 +36,13 @@ impl Tool for FetchFinancialTool {
     }
 
     async fn call(&self, input: serde_json::Value) -> anyhow::Result<String> {
-        let code = input.get("code")
+        let code = input
+            .get("code")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'code' parameter"))?;
-        
+
         let fin = service().get_financials(code).await;
-        
+
         if fin.any() {
             let result = json!({
                 "report_date": fin.report_date,

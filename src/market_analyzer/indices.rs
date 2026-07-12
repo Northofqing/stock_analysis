@@ -20,7 +20,8 @@ impl MarketAnalyzer {
         let full_url = format!("{}{}", url, codes_str);
 
         let data = self.call_api_with_retry("指数行情", 2, || {
-            let response = self.client
+            let response = self
+                .client
                 .get(&full_url)
                 .timeout(Duration::from_secs(10))
                 .send()
@@ -40,7 +41,9 @@ impl MarketAnalyzer {
                     for (code, name) in &self.main_indices {
                         if line.contains(code) {
                             if let Some(data_str) = self.parse_tencent_line(line) {
-                                if let Some(mut index) = self.parse_tencent_index_data(code, name, &data_str) {
+                                if let Some(mut index) =
+                                    self.parse_tencent_index_data(code, name, &data_str)
+                                {
                                     index.calculate_amplitude();
                                     indices.push(index);
                                 }
@@ -70,7 +73,12 @@ impl MarketAnalyzer {
 
     /// 解析腾讯指数数据
     /// 腾讯接口格式：v_sh000001="1~上证指数~000001~当前价~昨收~今开~成交量~...~涨跌~涨跌幅~最高~最低~..."
-    pub(super) fn parse_tencent_index_data(&self, code: &str, name: &str, data_str: &str) -> Option<MarketIndex> {
+    pub(super) fn parse_tencent_index_data(
+        &self,
+        code: &str,
+        name: &str,
+        data_str: &str,
+    ) -> Option<MarketIndex> {
         let parts: Vec<&str> = data_str.split('~').collect();
         if parts.len() < 33 {
             warn!("[大盘] {} 数据字段不足: {}", name, parts.len());
@@ -106,5 +114,4 @@ impl MarketAnalyzer {
             amplitude: 0.0, // 稍后计算
         })
     }
-
 }

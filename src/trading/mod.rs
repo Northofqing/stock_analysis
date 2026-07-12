@@ -5,7 +5,7 @@
 //!
 //! v12 PR3-3.5: 新增 paper_trade 模块, 虚拟腿只写 paper_trades, 零写 stock_position (BR-023).
 
-pub mod paper_trade;  // v12 PR3-3.5
+pub mod paper_trade; // v12 PR3-3.5
 
 use crate::database::DatabaseManager;
 use crate::errors::TradeError;
@@ -70,7 +70,12 @@ pub struct CancelOrderCmd {
 
 pub trait TradeExecutionGateway {
     fn get_open_position(&self, code: &str) -> Result<Option<StockPosition>, String>;
-    fn update_position_return(&self, id: i32, current_price: f64, return_rate: f64) -> Result<(), String>;
+    fn update_position_return(
+        &self,
+        id: i32,
+        current_price: f64,
+        return_rate: f64,
+    ) -> Result<(), String>;
     fn open_position(&self, cmd: &OpenPositionCmd) -> Result<OrderReceipt, String>;
     fn close_position(&self, cmd: &ClosePositionCmd) -> Result<OrderReceipt, String>;
     fn cancel_order(&self, cmd: &CancelOrderCmd) -> Result<OrderReceipt, String>;
@@ -84,12 +89,16 @@ pub struct SimulatedExecutionGateway {
 }
 
 impl Default for SimulatedExecutionGateway {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SimulatedExecutionGateway {
     pub fn new() -> Self {
-        Self { seen: Mutex::new(HashMap::new()) }
+        Self {
+            seen: Mutex::new(HashMap::new()),
+        }
     }
 
     fn db(&self) -> &'static DatabaseManager {
@@ -113,7 +122,9 @@ impl SimulatedExecutionGateway {
         // Lazy GC: 删除过期条目
         seen.retain(|_, t| now.duration_since(*t) < DEDUP_WINDOW);
         if let Some(t) = seen.get(business_order_id) {
-            let err = TradeError::DuplicateOrder { order_id: business_order_id.to_string() };
+            let err = TradeError::DuplicateOrder {
+                order_id: business_order_id.to_string(),
+            };
             return Err(format!(
                 "{} (within {}s window, first seen {:?} ago)",
                 err,
@@ -131,7 +142,12 @@ impl TradeExecutionGateway for SimulatedExecutionGateway {
         self.db().get_open_position(code).map_err(|e| e.to_string())
     }
 
-    fn update_position_return(&self, id: i32, current_price: f64, return_rate: f64) -> Result<(), String> {
+    fn update_position_return(
+        &self,
+        id: i32,
+        current_price: f64,
+        return_rate: f64,
+    ) -> Result<(), String> {
         self.db()
             .update_position_return(id, current_price, return_rate)
             .map_err(|e| e.to_string())
@@ -168,10 +184,12 @@ impl TradeExecutionGateway for SimulatedExecutionGateway {
             Err(e) => {
                 // 修复 (2026-06-30 codex review): 之前静默吞 poison 错误, 现在 warn
                 match self.seen.lock() {
-                    Ok(mut seen) => { seen.remove(&cmd.business_order_id); }
-                    Err(poison) => log::warn!(
-                        "[SimulatedExecutionGateway] rollback mutex poisoned: {poison}"
-                    ),
+                    Ok(mut seen) => {
+                        seen.remove(&cmd.business_order_id);
+                    }
+                    Err(poison) => {
+                        log::warn!("[SimulatedExecutionGateway] rollback mutex poisoned: {poison}")
+                    }
                 }
                 Err(e.to_string())
             }
@@ -181,7 +199,10 @@ impl TradeExecutionGateway for SimulatedExecutionGateway {
     fn close_position(&self, cmd: &ClosePositionCmd) -> Result<OrderReceipt, String> {
         self.dedup_check_and_record(&cmd.business_order_id)?;
 
-        match self.db().close_position(cmd.position_id, cmd.price, &cmd.trade_date) {
+        match self
+            .db()
+            .close_position(cmd.position_id, cmd.price, &cmd.trade_date)
+        {
             Ok(()) => Ok(OrderReceipt {
                 business_order_id: cmd.business_order_id.clone(),
                 side: OrderSide::Sell,
@@ -193,10 +214,12 @@ impl TradeExecutionGateway for SimulatedExecutionGateway {
             }),
             Err(e) => {
                 match self.seen.lock() {
-                    Ok(mut seen) => { seen.remove(&cmd.business_order_id); }
-                    Err(poison) => log::warn!(
-                        "[SimulatedExecutionGateway] rollback mutex poisoned: {poison}"
-                    ),
+                    Ok(mut seen) => {
+                        seen.remove(&cmd.business_order_id);
+                    }
+                    Err(poison) => {
+                        log::warn!("[SimulatedExecutionGateway] rollback mutex poisoned: {poison}")
+                    }
                 }
                 Err(e.to_string())
             }
@@ -296,5 +319,7 @@ mod tests {
 
     // 保留对命令结构的最小引用, 防止 unused import 警告
     #[allow(dead_code)]
-    fn _cmd_silence() -> OpenPositionCmd { cmd_buy("X") }
+    fn _cmd_silence() -> OpenPositionCmd {
+        cmd_buy("X")
+    }
 }

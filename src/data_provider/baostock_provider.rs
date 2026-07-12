@@ -87,11 +87,7 @@ pub fn baostock_crc32(buf: &[u8]) -> u32 {
     for i in 0..256u32 {
         let mut c = i;
         for _ in 0..8 {
-            c = if c & 1 != 0 {
-                POLY ^ (c >> 1)
-            } else {
-                c >> 1
-            };
+            c = if c & 1 != 0 { POLY ^ (c >> 1) } else { c >> 1 };
         }
         table[i as usize] = c;
     }
@@ -191,7 +187,10 @@ pub fn build_kline_query_frame(
 /// 不严格校验 CRC32 (跳过校验, 避免误拒包; 服务端一般不发脏包).
 pub fn parse_baostock_tcp_response(buf: &[u8]) -> Result<BaostockTcpMessage> {
     if buf.len() < 21 {
-        return Err(anyhow!("Baostock TCP 响应: 短于 header (21 字节), got {}", buf.len()));
+        return Err(anyhow!(
+            "Baostock TCP 响应: 短于 header (21 字节), got {}",
+            buf.len()
+        ));
     }
     // 1. header 固定 21 字节
     let header_bytes = &buf[..21];
@@ -463,9 +462,9 @@ impl BaostockProvider {
         }
         let addr = format!("{}:{}", self.host, self.port);
         log::info!("[Baostock] TCP 连接 {addr}");
-        let stream = TcpStream::connect(&addr).await.map_err(|e| {
-            anyhow!("Baostock TCP 连接 {addr} 失败: {e}")
-        })?;
+        let stream = TcpStream::connect(&addr)
+            .await
+            .map_err(|e| anyhow!("Baostock TCP 连接 {addr} 失败: {e}"))?;
         // 设 read/write timeout (10s), 防服务端挂起
         stream.set_nodelay(true).ok();
         *guard = Some(stream);
@@ -519,9 +518,10 @@ impl BaostockProvider {
         let stream = guard
             .as_mut()
             .ok_or_else(|| anyhow!("Baostock TCP: 未连接 (应先 connect)"))?;
-        stream.write_all(frame).await.map_err(|e| {
-            anyhow!("Baostock TCP: 发送失败: {e}")
-        })?;
+        stream
+            .write_all(frame)
+            .await
+            .map_err(|e| anyhow!("Baostock TCP: 发送失败: {e}"))?;
         // 单次响应: 累积到末尾 marker, 15s 超时
         read_tcp_response(stream, std::time::Duration::from_secs(15)).await
     }
@@ -650,7 +650,11 @@ mod inline_tests {
         assert!(frame.starts_with(b"00.9.20\x0100\x01"));
         // 末尾必为数字 (CRC32 decimal), 不是 \n
         let last = *frame.last().unwrap();
-        assert!(last.is_ascii_digit(), "frame tail must be digit, got {:?}", last as char);
+        assert!(
+            last.is_ascii_digit(),
+            "frame tail must be digit, got {:?}",
+            last as char
+        );
         // CRC 分隔符 \x01 必须在 body 之后
         let body_end = 21 + "login".len();
         assert_eq!(frame[body_end], b'\x01', "frame[body_end] must be \\x01");

@@ -37,15 +37,15 @@ pub struct MarketAnalyzer {
 
 pub mod async_overview;
 mod indices;
+pub mod lhb_review; // v12 MVP4-4.3
+pub mod limit_chain_review; // v12 MVP4-4.2
 mod limit_up;
+pub mod market_stage_confidence; // v12 MVP4-4.1
+pub mod performance_feedback; // v12 MVP5-5.1
+pub mod post_close_review; // v12 MVP4-4.4
 pub mod review;
-pub mod sector_monitor;
 pub mod sector_history;
-pub mod market_stage_confidence;  // v12 MVP4-4.1
-pub mod limit_chain_review;  // v12 MVP4-4.2
-pub mod lhb_review;  // v12 MVP4-4.3
-pub mod post_close_review;  // v12 MVP4-4.4
-pub mod performance_feedback;  // v12 MVP5-5.1
+pub mod sector_monitor;
 mod statistics;
 
 pub use async_overview::{generate_market_overview_text_blocking, get_market_overview_blocking};
@@ -167,7 +167,10 @@ impl MarketAnalyzer {
                 Ok(data) => return Some(data),
                 Err(e) => {
                     last_error = Some(e);
-                    warn!("[大盘] {} 获取失败 (attempt {}/{}): {:?}", name, attempt, attempts, last_error);
+                    warn!(
+                        "[大盘] {} 获取失败 (attempt {}/{}): {:?}",
+                        name, attempt, attempts, last_error
+                    );
                     if attempt < attempts {
                         let sleep_duration = Duration::from_secs(2u64.pow(attempt).min(5));
                         thread::sleep(sleep_duration);
@@ -200,10 +203,10 @@ impl MarketAnalyzer {
         ];
 
         info!("[大盘] 开始搜索市场新闻...");
-        
+
         for query in search_queries {
             let result = search_service.search_stock_news("market", "大盘", 3).await;
-            
+
             let count = result.results.len();
             all_news.push(result);
             info!("[大盘] 搜索 '{}' 获取 {} 条结果", query, count);

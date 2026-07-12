@@ -168,7 +168,10 @@ mod tests {
     fn promote_below_threshold_blocked() {
         assert!(!should_promote_to_live(0, 0.5, 0.5));
         assert!(!should_promote_to_live(29, 0.5, 0.5));
-        assert!(!should_promote_to_live(30, 0.29, 0.5), "Strong 胜率 < 30% 不转正");
+        assert!(
+            !should_promote_to_live(30, 0.29, 0.5),
+            "Strong 胜率 < 30% 不转正"
+        );
     }
 
     #[test]
@@ -232,25 +235,49 @@ mod tests {
     #[test]
     fn state_machine_disabled_when_live_off() {
         // 关闭时, 任何样本数 + triggered 都跳变不到下一态
-        assert_eq!(next_state(CandidateState::Shadow, 100, true, Some(false)), CandidateState::Shadow);
-        assert_eq!(next_state(CandidateState::Armed, 100, true, Some(false)), CandidateState::Armed);
+        assert_eq!(
+            next_state(CandidateState::Shadow, 100, true, Some(false)),
+            CandidateState::Shadow
+        );
+        assert_eq!(
+            next_state(CandidateState::Armed, 100, true, Some(false)),
+            CandidateState::Armed
+        );
     }
 
     #[test]
     fn state_machine_shadow_to_watch() {
-        assert_eq!(next_state(CandidateState::Shadow, 10, false, Some(true)), CandidateState::Watch);
-        assert_eq!(next_state(CandidateState::Shadow, 9, false, Some(true)), CandidateState::Shadow);
+        assert_eq!(
+            next_state(CandidateState::Shadow, 10, false, Some(true)),
+            CandidateState::Watch
+        );
+        assert_eq!(
+            next_state(CandidateState::Shadow, 9, false, Some(true)),
+            CandidateState::Shadow
+        );
     }
 
     #[test]
     fn state_machine_watch_to_armed() {
-        assert_eq!(next_state(CandidateState::Watch, 20, false, Some(true)), CandidateState::Armed);
-        assert_eq!(next_state(CandidateState::Watch, 19, false, Some(true)), CandidateState::Watch);
+        assert_eq!(
+            next_state(CandidateState::Watch, 20, false, Some(true)),
+            CandidateState::Armed
+        );
+        assert_eq!(
+            next_state(CandidateState::Watch, 19, false, Some(true)),
+            CandidateState::Watch
+        );
     }
 
     #[test]
     fn state_machine_armed_to_triggered() {
-        assert_eq!(next_state(CandidateState::Armed, 25, true, Some(true)), CandidateState::Triggered);
-        assert_eq!(next_state(CandidateState::Armed, 25, false, Some(true)), CandidateState::Armed);
+        assert_eq!(
+            next_state(CandidateState::Armed, 25, true, Some(true)),
+            CandidateState::Triggered
+        );
+        assert_eq!(
+            next_state(CandidateState::Armed, 25, false, Some(true)),
+            CandidateState::Armed
+        );
     }
 }

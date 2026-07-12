@@ -44,11 +44,7 @@ impl EmAnnouncementProvider {
     ///
     /// - `date`: YYYY-MM-DD（通常传当天/昨天）
     /// - `limit`: 最大返回条数（API 单页最多 ~100）
-    pub async fn fetch_announcements(
-        &self,
-        date: &str,
-        limit: usize,
-    ) -> Result<Vec<SearchResult>> {
+    pub async fn fetch_announcements(&self, date: &str, limit: usize) -> Result<Vec<SearchResult>> {
         #[derive(Deserialize, Debug)]
         struct Code {
             stock_code: Option<String>,
@@ -113,8 +109,12 @@ impl EmAnnouncementProvider {
             &body
         };
 
-        let resp: AnnResp = serde_json::from_str(json_str)
-            .with_context(|| format!("东财公告 JSON 解析失败: head={}", &body.chars().take(120).collect::<String>()))?;
+        let resp: AnnResp = serde_json::from_str(json_str).with_context(|| {
+            format!(
+                "东财公告 JSON 解析失败: head={}",
+                &body.chars().take(120).collect::<String>()
+            )
+        })?;
 
         let items = resp.data.and_then(|d| d.list).unwrap_or_default();
         let mut results: Vec<SearchResult> = Vec::new();
@@ -184,7 +184,11 @@ impl EmAnnouncementProvider {
     }
 
     /// 抓取某个具体 A 股的最近公告
-    pub async fn fetch_by_stock(&self, stock_code: &str, limit: usize) -> Result<Vec<SearchResult>> {
+    pub async fn fetch_by_stock(
+        &self,
+        stock_code: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>> {
         #[derive(Deserialize, Debug)]
         struct Code {
             stock_code: Option<String>,
@@ -244,8 +248,12 @@ impl EmAnnouncementProvider {
             &body
         };
 
-        let resp: AnnResp = serde_json::from_str(json_str)
-            .with_context(|| format!("东财个股公告解析失败: head={}", &body.chars().take(120).collect::<String>()))?;
+        let resp: AnnResp = serde_json::from_str(json_str).with_context(|| {
+            format!(
+                "东财个股公告解析失败: head={}",
+                &body.chars().take(120).collect::<String>()
+            )
+        })?;
 
         let items = resp.data.and_then(|d| d.list).unwrap_or_default();
         let mut results: Vec<SearchResult> = Vec::new();
@@ -291,7 +299,10 @@ impl SearchProvider for EmAnnouncementProvider {
     /// 调用 fetch_today(50)，作为 SearchProvider 兜底接口
     async fn search(&self, _query: &str, max_results: usize) -> SearchResponse {
         let started = std::time::Instant::now();
-        let items = self.fetch_today(max_results.min(50)).await.unwrap_or_default();
+        let items = self
+            .fetch_today(max_results.min(50))
+            .await
+            .unwrap_or_default();
         SearchResponse {
             query: _query.to_string(),
             success: true,

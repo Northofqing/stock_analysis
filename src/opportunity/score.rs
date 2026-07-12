@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScorePart {
     pub name: String,
-    pub value: f64,        // 0-100
+    pub value: f64, // 0-100
     pub weight: f64,
     /// 修复 P0-1: 区分"真弱"和"数据不足"
     /// false = 数据缺, 给的中性值 50, 不应被解读为中性
@@ -81,7 +81,7 @@ impl Default for ScoreInputs {
             event_certainty: 0,
             chain_match_score: 0,
             flow_score: None,
-            cross_source_count: 1,  // 默认单源 (保守, cross_score 低)
+            cross_source_count: 1, // 默认单源 (保守, cross_score 低)
             quality_score: None,
             winrate_score: None,
             ai_degraded: false,
@@ -97,7 +97,8 @@ pub fn compute_dual_score(inputs: &ScoreInputs, weight_version: &str) -> Opportu
     let mut notes = Vec::new();
 
     // event_risk_score 五项 (修复 P0-1: winrate 不参与, 这是 NS3 风险评估)
-    let event_s_raw = (inputs.event_strength.min(100) as f64 + inputs.event_certainty.min(100) as f64) / 2.0;
+    let event_s_raw =
+        (inputs.event_strength.min(100) as f64 + inputs.event_certainty.min(100) as f64) / 2.0;
     // 修复 P0-1 + spec §0/§5: AI 不可用 → event_score ×0.5
     // ai_degraded=true 表示规则降级, strength/certainty 是保守默认值, 应进一步降权
     let event_s = if inputs.ai_degraded {
@@ -119,10 +120,30 @@ pub fn compute_dual_score(inputs: &ScoreInputs, weight_version: &str) -> Opportu
         weight: 0.30,
         data_sufficiency: !inputs.ai_degraded,
     });
-    parts.push(ScorePart { name: "chain".into(), value: chain_s, weight: 0.25, data_sufficiency: true });
-    parts.push(ScorePart { name: "flow".into(), value: flow_s, weight: 0.15, data_sufficiency: inputs.flow_score.is_some() });
-    parts.push(ScorePart { name: "cross".into(), value: cross_s, weight: 0.10, data_sufficiency: inputs.cross_source_count >= 2 });
-    parts.push(ScorePart { name: "quality".into(), value: quality_s, weight: 0.20, data_sufficiency: inputs.quality_score.is_some() });
+    parts.push(ScorePart {
+        name: "chain".into(),
+        value: chain_s,
+        weight: 0.25,
+        data_sufficiency: true,
+    });
+    parts.push(ScorePart {
+        name: "flow".into(),
+        value: flow_s,
+        weight: 0.15,
+        data_sufficiency: inputs.flow_score.is_some(),
+    });
+    parts.push(ScorePart {
+        name: "cross".into(),
+        value: cross_s,
+        weight: 0.10,
+        data_sufficiency: inputs.cross_source_count >= 2,
+    });
+    parts.push(ScorePart {
+        name: "quality".into(),
+        value: quality_s,
+        weight: 0.20,
+        data_sufficiency: inputs.quality_score.is_some(),
+    });
 
     let event_risk_score: f64 = parts.iter().map(|p| p.value * p.weight).sum();
 
@@ -149,12 +170,23 @@ pub fn compute_dual_score(inputs: &ScoreInputs, weight_version: &str) -> Opportu
     let gray_open = std::env::var("OPPORTUNITY_GRAY_OPEN_DATA_INSUFFICIENT")
         .map(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"))
         .unwrap_or(true); // 默认 true: 与现状一致, 保持灰度
-    let clamp_max = if gray_open { 70.0 } else { (THRESHOLD_FALLBACK - 1.0).max(0.0) };
-    let clamp_reason = if gray_open { "灰度 70 (I-1 历史决策)" } else { "threshold-1 防推送" };
+    let clamp_max = if gray_open {
+        70.0
+    } else {
+        (THRESHOLD_FALLBACK - 1.0).max(0.0)
+    };
+    let clamp_reason = if gray_open {
+        "灰度 70 (I-1 历史决策)"
+    } else {
+        "threshold-1 防推送"
+    };
     let mut event_risk_score_clamped = event_risk_score;
     if insufficient_count >= 2 {
         event_risk_score_clamped = event_risk_score_clamped.min(clamp_max);
-        notes.push(format!("数据不足({} 项缺失), event_risk_score 封顶 {} ({})", insufficient_count, clamp_max, clamp_reason));
+        notes.push(format!(
+            "数据不足({} 项缺失), event_risk_score 封顶 {} ({})",
+            insufficient_count, clamp_max, clamp_reason
+        ));
     }
     // 修复 R-2 (2026-06-30): 包含 Some(0.0) (零胜率也是负信号)
     let winrate_missing_or_zero = match inputs.winrate_score {
@@ -164,8 +196,14 @@ pub fn compute_dual_score(inputs: &ScoreInputs, weight_version: &str) -> Opportu
     };
     if winrate_missing_or_zero {
         event_risk_score_clamped = event_risk_score_clamped.min(clamp_max);
-        if !notes.iter().any(|n| n.contains("无回测") || n.contains("无样本") || n.contains("winrate=0")) {
-            notes.push(format!("无有效 winrate (None 或 0), event_risk_score 封顶 {} (P0-1 NS3)", clamp_max));
+        if !notes
+            .iter()
+            .any(|n| n.contains("无回测") || n.contains("无样本") || n.contains("winrate=0"))
+        {
+            notes.push(format!(
+                "无有效 winrate (None 或 0), event_risk_score 封顶 {} (P0-1 NS3)",
+                clamp_max
+            ));
         }
     }
     if !data_sufficiency.has_intraday_flow {
@@ -228,24 +266,36 @@ mod tests_r2 {
         // Case 1: 灰度默认 (无 env) → 无 winrate 时封顶 70 (历史决策 I-1)
         std::env::remove_var("OPPORTUNITY_GRAY_OPEN_DATA_INSUFFICIENT");
         let s = compute_dual_score(&high_inputs(None), "v9.1");
-        assert!(s.event_risk_score <= 70,
-            "灰度默认: 无 winrate 应封顶 70, 实际 {}", s.event_risk_score);
+        assert!(
+            s.event_risk_score <= 70,
+            "灰度默认: 无 winrate 应封顶 70, 实际 {}",
+            s.event_risk_score
+        );
 
         // Case 2: 灰度关闭 → 无 winrate 时封顶 < threshold (59)
         std::env::set_var("OPPORTUNITY_GRAY_OPEN_DATA_INSUFFICIENT", "false");
         let s = compute_dual_score(&high_inputs(None), "v9.1");
-        assert!(s.event_risk_score < 60,
-            "灰度关闭: 无 winrate 应封顶 < 60, 实际 {}", s.event_risk_score);
+        assert!(
+            s.event_risk_score < 60,
+            "灰度关闭: 无 winrate 应封顶 < 60, 实际 {}",
+            s.event_risk_score
+        );
 
         // Case 3: 灰度关闭 → Some(0.0) 也触发 clamp (零胜率 = 负信号)
         let s = compute_dual_score(&high_inputs(Some(0.0)), "v9.1");
-        assert!(s.event_risk_score < 60,
-            "灰度关闭: winrate=0 应封顶 < 60, 实际 {}", s.event_risk_score);
+        assert!(
+            s.event_risk_score < 60,
+            "灰度关闭: winrate=0 应封顶 < 60, 实际 {}",
+            s.event_risk_score
+        );
 
         // Case 4: 有效 winrate (Some(0.5)) → 不 clamp
         std::env::remove_var("OPPORTUNITY_GRAY_OPEN_DATA_INSUFFICIENT");
         let s = compute_dual_score(&high_inputs(Some(0.5)), "v9.1");
-        assert!(s.event_risk_score >= 60,
-            "有效 winrate=0.5 时不应 clamp, 实际 {}", s.event_risk_score);
+        assert!(
+            s.event_risk_score >= 60,
+            "有效 winrate=0.5 时不应 clamp, 实际 {}",
+            s.event_risk_score
+        );
     }
 }

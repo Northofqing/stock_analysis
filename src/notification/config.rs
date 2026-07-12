@@ -1,6 +1,5 @@
 //! 通知渠道 / SMTP / 顶层配置（原 notification.rs 前部）
 
-
 pub enum NotificationChannel {
     /// 企业微信
     Wechat,
@@ -56,25 +55,25 @@ pub struct SmtpConfig {
 pub struct NotificationConfig {
     // 企业微信
     pub wechat_webhook_url: Option<String>,
-    
+
     // 飞书
     pub feishu_webhook_url: Option<String>,
-    
+
     // Telegram
     pub telegram_bot_token: Option<String>,
     pub telegram_chat_id: Option<String>,
-    
+
     // 邮件
     pub email_sender: Option<String>,
     pub email_password: Option<String>,
     pub email_receivers: Vec<String>,
     pub smtp_server: Option<String>,
     pub smtp_port: Option<u16>,
-    
+
     // Pushover
     pub pushover_user_key: Option<String>,
     pub pushover_api_token: Option<String>,
-    
+
     // Server酱（普通微信推送）
     pub server_chan_key: Option<String>,
 
@@ -90,7 +89,7 @@ pub struct NotificationConfig {
     // 自定义Webhook
     pub custom_webhook_urls: Vec<String>,
     pub custom_webhook_bearer_token: Option<String>,
-    
+
     // 消息长度限制
     pub wechat_max_bytes: usize,
     pub feishu_max_bytes: usize,
@@ -111,9 +110,7 @@ impl NotificationConfig {
                 .map(|s| s.split(',').map(|s| s.trim().to_string()).collect())
                 .unwrap_or_default(),
             smtp_server: std::env::var("SMTP_SERVER").ok(),
-            smtp_port: std::env::var("SMTP_PORT")
-                .ok()
-                .and_then(|s| s.parse().ok()),
+            smtp_port: std::env::var("SMTP_PORT").ok().and_then(|s| s.parse().ok()),
             pushover_user_key: std::env::var("PUSHOVER_USER_KEY").ok(),
             pushover_api_token: std::env::var("PUSHOVER_API_TOKEN").ok(),
             server_chan_key: std::env::var("SERVER_CHAN_KEY").ok(),
@@ -201,4 +198,3 @@ impl NotificationConfig {
         errors
     }
 }
-

@@ -2,31 +2,31 @@
 //!
 //! 新闻事件 → 产业链映射 → 持仓影响评估 → 新标的推荐。
 
+pub mod auction_agent; // v10 P0.2: 09:25 竞价 Agent
+pub mod bom_kb; // 修复 P0-2: BOM 弹性节点 + KB
+pub mod candidate_panel; // v11-P0-5+ Commit A: 候选筛选台模型 + 多源合并去重
+pub mod candidate_state; // v12 PR3-3.4: 影子候选零推送
 pub mod chain_mapper;
-pub mod impact;
 pub mod discover;
-pub mod score;  // 修复 P0-1: dual_score 评分模型
-pub mod bom_kb;  // 修复 P0-2: BOM 弹性节点 + KB
-pub mod winrate;  // 修复 P1-2: winrate 二元化
-pub mod launch_gate;  // 修复 P0-3: 上线门槛
 pub mod event_extractor;
-pub mod scheduler;  // 修复 v9.1 §1.3: 调度器
-pub mod hit_case;  // v10 P0.1 BC-3: 5 边界 hit CASE 逻辑
-pub mod candidate_state;  // v12 PR3-3.4: 影子候选零推送
-pub mod candidate_panel;  // v11-P0-5+ Commit A: 候选筛选台模型 + 多源合并去重
-pub mod news_ranker;  // P2-News Commit 1: 新闻事件排序层 (EventType/HeatStage/Bucket/RankedNews)
-pub mod news_audit;   // P2-News Commit 5: 审计 JSONL 落盘
+pub mod hit_case; // v10 P0.1 BC-3: 5 边界 hit CASE 逻辑
+pub mod impact;
+pub mod launch_gate; // 修复 P0-3: 上线门槛
+pub mod news_audit; // P2-News Commit 5: 审计 JSONL 落盘
 pub mod news_outcome; // P3: D+1/D+3/D+5 outcome 回看 (不自动调权)
-pub mod virtual_reason;  // v10 P0.2 BR-016: VirtualReason 枚举 + 主理由优先级
-pub mod auction_agent;  // v10 P0.2: 09:25 竞价 Agent
-pub mod real_alpha;  // v10 P0.3 BC-1: real_alpha + A/B/C 置信度 + 5 要素信封
+pub mod news_ranker; // P2-News Commit 1: 新闻事件排序层 (EventType/HeatStage/Bucket/RankedNews)
+pub mod real_alpha;
+pub mod scheduler; // 修复 v9.1 §1.3: 调度器
+pub mod score; // 修复 P0-1: dual_score 评分模型
+pub mod virtual_reason; // v10 P0.2 BR-016: VirtualReason 枚举 + 主理由优先级
+pub mod winrate; // 修复 P1-2: winrate 二元化 // v10 P0.3 BC-1: real_alpha + A/B/C 置信度 + 5 要素信封
 
-use crate::data_provider::{assess_quality, fetch_financials};
 use crate::data_provider::service;
+use crate::data_provider::assess_quality;
 use crate::indicators::{calc_macd, MACD_FAST, MACD_SIGNAL, MACD_SLOW};
+use crate::opportunity::score::{compute_dual_score, ScoreInputs, ScorePart};
 use crate::portfolio;
 use crate::search_service::SearchResult;
-use crate::opportunity::score::{compute_dual_score, ScoreInputs, ScorePart};
 
 #[derive(Debug, Clone)]
 struct PostCloseCandidate {
@@ -188,12 +188,32 @@ fn score_air_refuel_pattern(
     let reason = format!(
         "节奏结构{:+.1}：启动日{}{}{}；整盘日{}{}{}；技术共振({})；硬止损参考={}",
         score,
-        if launch_big { "涨幅>7% " } else { "涨幅不足 " },
-        if launch_gap { "跳空成立 " } else { "无有效跳空 " },
-        if launch_vol_burst || launch_phase_vol_high { "放量成立" } else { "放量不足" },
-        if no_gap_fill { "缺口未补 " } else { "缺口回补 " },
+        if launch_big {
+            "涨幅>7% "
+        } else {
+            "涨幅不足 "
+        },
+        if launch_gap {
+            "跳空成立 "
+        } else {
+            "无有效跳空 "
+        },
+        if launch_vol_burst || launch_phase_vol_high {
+            "放量成立"
+        } else {
+            "放量不足"
+        },
+        if no_gap_fill {
+            "缺口未补 "
+        } else {
+            "缺口回补 "
+        },
         if vol_shrink { "缩量 " } else { "未缩量 " },
-        if small_body || lower_shadow_ok { "K线温和" } else { "K线偏弱" },
+        if small_body || lower_shadow_ok {
+            "K线温和"
+        } else {
+            "K线偏弱"
+        },
         macd_note,
         stop_line
             .map(|v| format!("¥{:.2}", v))
@@ -241,7 +261,11 @@ fn score_breakout_structure(sig: &crate::breakout::signal::BreakoutSignal) -> (f
 
 fn score_profit_elasticity(fin: &crate::data_provider::Financials) -> (f64, String, String) {
     if !fin.any() {
-        return (0.0, "财务数据不足，利润弹性按0分处理".to_string(), "盈利质量未知（数据不足）".to_string());
+        return (
+            0.0,
+            "财务数据不足，利润弹性按0分处理".to_string(),
+            "盈利质量未知（数据不足）".to_string(),
+        );
     }
 
     let mut score: f64 = 0.0;
@@ -291,10 +315,18 @@ fn score_profit_elasticity(fin: &crate::data_provider::Financials) -> (f64, Stri
     let reason = format!(
         "利润弹性{:+.1}：净利YoY={} 营收YoY={} 毛利率={} ROE={}，{}",
         score,
-        fin.net_profit_yoy.map(|v| format!("{:+.1}%", v)).unwrap_or_else(|| "NA".to_string()),
-        fin.revenue_yoy.map(|v| format!("{:+.1}%", v)).unwrap_or_else(|| "NA".to_string()),
-        fin.gross_margin.map(|v| format!("{:.1}%", v)).unwrap_or_else(|| "NA".to_string()),
-        fin.roe.map(|v| format!("{:.1}%", v)).unwrap_or_else(|| "NA".to_string()),
+        fin.net_profit_yoy
+            .map(|v| format!("{:+.1}%", v))
+            .unwrap_or_else(|| "NA".to_string()),
+        fin.revenue_yoy
+            .map(|v| format!("{:+.1}%", v))
+            .unwrap_or_else(|| "NA".to_string()),
+        fin.gross_margin
+            .map(|v| format!("{:.1}%", v))
+            .unwrap_or_else(|| "NA".to_string()),
+        fin.roe
+            .map(|v| format!("{:.1}%", v))
+            .unwrap_or_else(|| "NA".to_string()),
         quality_note,
     );
     (score, reason, quality_note)
@@ -349,7 +381,11 @@ fn score_capital_consensus(
         latest_main_yi,
         sum5_yi,
         ewma_yi,
-        if flow.is_one_day_bounce() { "，存在单日反弹未逆转迹象" } else { "" },
+        if flow.is_one_day_bounce() {
+            "，存在单日反弹未逆转迹象"
+        } else {
+            ""
+        },
     );
     (score, reason)
 }
@@ -427,6 +463,8 @@ fn score_hit_confidence(
         chain_mapper::ChainSource::Rule => 28,
         chain_mapper::ChainSource::Ai => 16,
         chain_mapper::ChainSource::AiDegraded => 8,
+        // B-002 板块联动: 真实东财数据, 介于 Rule 和 Ai 之间
+        chain_mapper::ChainSource::Board => 22,
     };
 
     if !hit.board_keyword.trim().is_empty() {
@@ -477,6 +515,11 @@ fn gate_hits_by_confidence(
     let mut dropped = Vec::new();
 
     for hit in hits {
+        // B-002 板块联动 (Board): 实时板块数据 + 异动股已过滤, 不走主题归因的置信度门控
+        if hit.source == chain_mapper::ChainSource::Board {
+            kept.push(hit);
+            continue;
+        }
         let (score, cross, reason) = score_hit_confidence(&hit, flash_titles, web_results);
         let pass = score >= threshold && (!require_cross || cross);
         if pass {
@@ -501,7 +544,13 @@ fn gate_hits_by_dual_score(
     let mut kept = Vec::new();
     let mut dropped = Vec::new();
     for hit in hits {
-        let (score, _tss, _parts, passed, reason) = evaluate_hit_for_push(&hit, flash_titles, web_results);
+        // B-002 板块联动 (Board): 实时板块数据, 不走 dual_score 主题归因门控
+        if hit.source == chain_mapper::ChainSource::Board {
+            kept.push(hit);
+            continue;
+        }
+        let (score, _tss, _parts, passed, reason) =
+            evaluate_hit_for_push(&hit, flash_titles, web_results);
         // 修复 v9.1 §0 NS3: 沙盘阶段 NS3 封顶 70 → push_threshold 75 几乎不可达
         // 放宽到 60 (候选池门槛) 让沙盘也有可见候选, 灰度后再严格 75
         let in_pool = score >= 60;
@@ -554,21 +603,34 @@ pub fn build_score_inputs_from_hit(
         chain_mapper::ChainSource::Rule => 70u8,
         chain_mapper::ChainSource::Ai => 50u8,
         chain_mapper::ChainSource::AiDegraded => 20u8,
+        // B-002 板块联动: 与 Ai 同档但略高 (有真实板块数据作锚)
+        chain_mapper::ChainSource::Board => 55u8,
     };
     // event_certainty: 跨源加分 + 板名命中
-    let flash_hits = flash_titles.iter().filter(|t| text_matches_hit(t, hit)).count();
-    let web_hits = web_results.iter()
+    let flash_hits = flash_titles
+        .iter()
+        .filter(|t| text_matches_hit(t, hit))
+        .count();
+    let web_hits = web_results
+        .iter()
         .filter(|r| text_matches_hit(&format!("{} {}", r.title, r.snippet), hit))
         .count();
     let cross_count = if flash_hits > 0 && web_hits > 0 { 2 } else { 1 };
-    let board_bonus: u8 = if !hit.board_keyword.trim().is_empty() { 15 } else { 0 };
+    let board_bonus: u8 = if !hit.board_keyword.trim().is_empty() {
+        15
+    } else {
+        0
+    };
     let event_certainty = (cross_count as u8 * 30 + board_bonus).min(100);
 
     // chain_match_score: flash + web 命中综合
-    let chain_match_score = ((flash_hits.min(3) as u8) * 25 + (web_hits.min(3) as u8) * 15).min(100);
+    let chain_match_score =
+        ((flash_hits.min(3) as u8) * 25 + (web_hits.min(3) as u8) * 15).min(100);
 
     // flow_score: 链级资金流, None 时 50 中性
-    let flow_score = hit.fund_flow_pct.map(|f| (50.0 + f * 5.0).clamp(0.0, 100.0));
+    let flow_score = hit
+        .fund_flow_pct
+        .map(|f| (50.0 + f * 5.0).clamp(0.0, 100.0));
 
     ScoreInputs {
         event_strength,
@@ -598,13 +660,15 @@ pub fn evaluate_hit_for_push(
     let passed = score.event_risk_score >= threshold;
     let reason = format!(
         "event_risk={}/{} trade_signal={:?} passed={} notes={:?}",
-        score.event_risk_score,
-        threshold,
-        score.trade_signal_score,
-        passed,
-        score.notes,
+        score.event_risk_score, threshold, score.trade_signal_score, passed, score.notes,
     );
-    (score.event_risk_score, score.trade_signal_score, score.parts, passed, reason)
+    (
+        score.event_risk_score,
+        score.trade_signal_score,
+        score.parts,
+        passed,
+        reason,
+    )
 }
 
 /// 修复 v9.1 §0 NS3 + §4 B10: 推送分层
@@ -614,11 +678,11 @@ pub fn evaluate_hit_for_push(
 /// 注意: NS3 约束 event_risk_score 是唯一"风险评估"维度; trade_signal_score 触发 [实盘信号] 标签需另行评估
 pub fn push_tier(event_risk_score: u8, push_threshold: u8) -> &'static str {
     if event_risk_score >= push_threshold {
-        "realtime"  // 实时推送
+        "realtime" // 实时推送
     } else if event_risk_score >= 60 {
-        "candidate_pool"  // 入候选池, 不主动推
+        "candidate_pool" // 入候选池, 不主动推
     } else {
-        "suppressed"  // 不推
+        "suppressed" // 不推
     }
 }
 
@@ -627,7 +691,12 @@ mod push_gate_tests {
     use super::*;
     use crate::opportunity::chain_mapper::ChainSource;
 
-    fn make_hit(chain: &str, source: ChainSource, board_kw: &str, flow: Option<f64>) -> chain_mapper::ChainHit {
+    fn make_hit(
+        chain: &str,
+        source: ChainSource,
+        board_kw: &str,
+        flow: Option<f64>,
+    ) -> chain_mapper::ChainHit {
         chain_mapper::ChainHit {
             chain: chain.into(),
             keywords: vec!["测试".into()],
@@ -636,6 +705,8 @@ mod push_gate_tests {
             source,
             board_keyword: board_kw.into(),
             fund_flow_pct: flow,
+            board_code: None,
+            board_change_pct: None,
         }
     }
 
@@ -664,15 +735,25 @@ mod push_gate_tests {
             published_date: Some("2026-06-28 10:00:00".into()),
             news_type: crate::search_service::NewsType::Industry,
             sentiment: crate::search_service::Sentiment::Positive,
-            importance: 8, relevance: 0.9, keywords: vec![],
+            importance: 8,
+            relevance: 0.9,
+            keywords: vec![],
         }];
         let (score, _tss, _parts, _passed, reason) = evaluate_hit_for_push(&hit, &flash, &web);
         // 量化 PM 视角: Rule 命中 + 跨源 + 板名 = 实际生产中应入"候选池" (≥ 60)
         // NS3 封顶 70 是设计选择 (沙盘阶段无 winrate 时不假装可上 75)
-        assert!(score >= 50, "Rule + 跨源 必 ≥ 50 (候选池门槛), 实际 {} ({})", score, reason);
+        assert!(
+            score >= 50,
+            "Rule + 跨源 必 ≥ 50 (候选池门槛), 实际 {} ({})",
+            score,
+            reason
+        );
         // 注: 没 winrate 时通过不了 75 push 门槛 (NS3 强约束), 但 trade_signal 显式 None
-        assert!(reason.contains("封顶") || reason.contains("无 winrate"),
-                "reason 必标注 NS3 约束, 实际: {}", reason);
+        assert!(
+            reason.contains("封顶") || reason.contains("无 winrate"),
+            "reason 必标注 NS3 约束, 实际: {}",
+            reason
+        );
     }
 
     #[test]
@@ -682,7 +763,11 @@ mod push_gate_tests {
         let flash = vec!["半导体新闻".to_string()];
         let web = vec![];
         let (score, _tss, _parts, passed, _reason) = evaluate_hit_for_push(&hit, &flash, &web);
-        assert!(!passed, "AiDegraded + 单源 必 < 75, 实际 {} (passed={})", score, passed);
+        assert!(
+            !passed,
+            "AiDegraded + 单源 必 < 75, 实际 {} (passed={})",
+            score, passed
+        );
     }
 
     #[test]
@@ -692,7 +777,7 @@ mod push_gate_tests {
         let inputs = build_score_inputs_from_hit(&hit, &[], &[]);
         assert_eq!(inputs.event_strength, 70);
         assert!(!inputs.ai_degraded);
-        assert_eq!(inputs.cross_source_count, 1);  // flash=0 web=0 → 单源
+        assert_eq!(inputs.cross_source_count, 1); // flash=0 web=0 → 单源
     }
 
     #[test]
@@ -701,15 +786,24 @@ mod push_gate_tests {
         let hit = make_hit("半导体", ChainSource::Rule, "", None);
         let flash = vec!["半导体".to_string()];
         let web = vec![SearchResult {
-            title: "半导体".into(), snippet: "".into(), url: "".into(),
-            source: "东财".into(), published_date: Some("2026-06-28".into()),
+            title: "半导体".into(),
+            snippet: "".into(),
+            url: "".into(),
+            source: "东财".into(),
+            published_date: Some("2026-06-28".into()),
             news_type: crate::search_service::NewsType::Other,
             sentiment: crate::search_service::Sentiment::Neutral,
-            importance: 5, relevance: 0.5, keywords: vec![],
+            importance: 5,
+            relevance: 0.5,
+            keywords: vec![],
         }];
         let inputs = build_score_inputs_from_hit(&hit, &flash, &web);
         assert_eq!(inputs.cross_source_count, 2, "跨源必 = 2");
-        assert!(inputs.event_certainty >= 60, "跨源 + certainty 必 ≥ 60, 实际 {}", inputs.event_certainty);
+        assert!(
+            inputs.event_certainty >= 60,
+            "跨源 + certainty 必 ≥ 60, 实际 {}",
+            inputs.event_certainty
+        );
     }
 
     #[test]
@@ -718,7 +812,7 @@ mod push_gate_tests {
         let hit = make_hit("新能源车", ChainSource::AiDegraded, "", None);
         let inputs = build_score_inputs_from_hit(&hit, &[], &[]);
         assert!(inputs.ai_degraded);
-        assert_eq!(inputs.event_strength, 20);  // AiDegraded 基础分最低
+        assert_eq!(inputs.event_strength, 20); // AiDegraded 基础分最低
     }
 }
 
@@ -750,7 +844,10 @@ fn breakout_gate_candidates(
     let fetcher = match crate::data_provider::DataFetcherManager::new() {
         Ok(v) => v,
         Err(e) => {
-            log::warn!("[Opportunity] 初始化数据抓取器失败，跳过趋势二次门控: {:#}", e);
+            log::warn!(
+                "[Opportunity] 初始化数据抓取器失败，跳过趋势二次门控: {:#}",
+                e
+            );
             return Vec::new();
         }
     };
@@ -792,14 +889,50 @@ fn collect_events_from_web(
     web_results: &[SearchResult],
     titles: &mut Vec<String>,
 ) -> (Vec<crate::signal::market_event::MarketEvent>, usize) {
-    let (fresh_events, stale) = event_extractor::extract_batch_rules_only(web_results);
+    // B-003: 跨批次去重 — 从 DB 加载最近 2 天的事件 (simhash + title),
+    // 用于 simhash 汉明距 / LCS 去重. 防止「苹果折叠屏」类事件跨日重复推送.
+    let seen_events: Vec<crate::database::concepts::EventSeenEntry> =
+        crate::database::DatabaseManager::try_get()
+            .map(|db| db.get_recent_event_seen(2))
+            .unwrap_or_default();
+    let seen_pairs: Vec<(u64, String)> = seen_events
+        .iter()
+        .map(|e| (e.simhash, e.title.clone()))
+        .collect();
+
+    let (fresh_events, stale) = event_extractor::extract_batch_rules_only_with_seen(
+        web_results,
+        &seen_pairs,
+        event_extractor::BATCH_DEFAULT_MAX_AGE,
+    );
     let stale_n = stale.len();
     if stale_n > 0 {
-        log::warn!(
-            "[Opportunity] 事件抽取丢弃 {} 条过期事件 (>2天)",
-            stale_n
-        );
+        log::warn!("[Opportunity] 事件抽取丢弃 {} 条过期事件 (>2天)", stale_n);
     }
+
+    // B-003: 把本轮 fresh 事件 (含去重后) 写入 DB, 下轮去重
+    // FIX-1 (review): 用 full_title 而非 30 字符 subject 落库, 修跨日 LCS 边界场景误判
+    //   Day 1 "国务院发布数字经济发展规划, 重点支持半导体" → full_title 存完整
+    //   Day 2 "国务院发布数字经济发展规划, 重点支持新能源" → LCS 完整比对找到差异
+    //   之前: 30 字符 subject 共享, 误判同事件, Day 2 被静默漏报
+    let detected_for_db: Vec<_> = fresh_events
+        .iter()
+        .map(|e| crate::database::concepts::EventSeenEntry {
+            simhash: e.simhash,
+            title: if !e.full_title.is_empty() {
+                e.full_title.clone()
+            } else {
+                // Fallback (旧 MarketEvent 实例或测试构造未填 full_title)
+                e.subject.clone()
+            },
+        })
+        .collect();
+    if !detected_for_db.is_empty() {
+        if let Some(db) = crate::database::DatabaseManager::try_get() {
+            db.save_event_seen(&detected_for_db);
+        }
+    }
+
     let detected: Vec<_> = fresh_events
         .into_iter()
         .filter(|e| e.event_type != crate::signal::market_event::EventType::Other)
@@ -815,8 +948,17 @@ fn collect_events_from_web(
 }
 
 pub async fn run_opportunity_scan() -> OpportunityScan {
+    // CR-32 (review): 之前考虑加 SCAN_MUTEX 串行化防止 SQLite 'database is locked',
+    //   但 std::sync::MutexGuard 不是 Send, 不能跨越 async .await 持有.
+    //   实际: busy_timeout=5000ms 已经在 SQLite 层兜底锁等待,
+    //   scan 在 spawn_blocking 内运行, 5s 等待发生在 blocking pool (不阻塞 main tokio runtime).
+    //   结论: 不加 Mutex, 让 SQLite busy_timeout 处理.
+
     let mut lines: Vec<String> = Vec::new();
-    lines.push(format!("📡 产业链扫描（{}）", chrono::Local::now().format("%H:%M")));
+    lines.push(format!(
+        "📡 产业链扫描（{}）",
+        chrono::Local::now().format("%H:%M")
+    ));
     lines.push("━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
 
     // 1. 获取最新快讯标题
@@ -848,38 +990,118 @@ pub async fn run_opportunity_scan() -> OpportunityScan {
     // 1c. (v9.4.24) 事件抽取 — rules-only 路径, 用 collect_events_from_web 统一
     let (detected_events, event_n) = collect_events_from_web(&web_results, &mut titles);
     if event_n > 0 {
-        let event_summary: Vec<String> = detected_events.iter()
-            .map(|e| format!("{}({})", e.event_type.label(), e.subject.chars().take(20).collect::<String>()))
+        let event_summary: Vec<String> = detected_events
+            .iter()
+            .map(|e| {
+                format!(
+                    "{}({})",
+                    e.event_type.label(),
+                    e.subject.chars().take(20).collect::<String>()
+                )
+            })
             .collect();
         lines.push(format!(
             "📊 事件抽取：快讯{}条/Web{}条 → 检出 {} 个有效事件 | {}",
-            flash_n, web_n, event_n, event_summary.join("; ")
+            flash_n,
+            web_n,
+            event_n,
+            event_summary.join("; ")
         ));
     }
 
     if titles.is_empty() {
         log::info!("[Opportunity] 采集 0 条新闻 → 跳过本轮");
         lines.push("暂无最新快讯".to_string());
-        return OpportunityScan { chain_text: lines.join("\n"), impact_text: String::new(), news_ranked_text: String::new() };
+        return OpportunityScan {
+            chain_text: lines.join("\n"),
+            impact_text: String::new(),
+            news_ranked_text: String::new(),
+        };
     }
 
     // 2. 产业链映射（规则优先，未命中则 AI 兜底）
     let mut hits = chain_mapper::map_news_to_chains_ai(&titles).await;
     if hits.is_empty() {
-        log::info!("[Opportunity] 采集 {} 条新闻(快讯{}/Web{}) → 命中 0 条产业链（含AI兜底）", titles.len(), flash_n, web_n);
+        log::info!(
+            "[Opportunity] 采集 {} 条新闻(快讯{}/Web{}) → 命中 0 条产业链（含AI兜底）",
+            titles.len(),
+            flash_n,
+            web_n
+        );
         lines.push("当前快讯未命中已知产业链".to_string());
-        return OpportunityScan { chain_text: lines.join("\n"), impact_text: String::new(), news_ranked_text: String::new() };
+        return OpportunityScan {
+            chain_text: lines.join("\n"),
+            impact_text: String::new(),
+            news_ranked_text: String::new(),
+        };
     }
-    let rule_n = hits.iter().filter(|h| h.source == chain_mapper::ChainSource::Rule).count();
-    let ai_n = hits.iter().filter(|h| h.source == chain_mapper::ChainSource::Ai).count();
+    let rule_n = hits
+        .iter()
+        .filter(|h| h.source == chain_mapper::ChainSource::Rule)
+        .count();
+    let ai_n = hits
+        .iter()
+        .filter(|h| h.source == chain_mapper::ChainSource::Ai)
+        .count();
 
     // 3. 动态解析标的（sector_monitor 内部用 reqwest::blocking，走 spawn_blocking）
-    let mut hits = tokio::task::spawn_blocking(move || {
+    // B-002: 同时跑 板块联动归因 (extract_board_rotation), 与 chain_rules 并列的第二路径
+    let titles_for_board = titles.clone();
+    let hits = tokio::task::spawn_blocking(move || {
         chain_mapper::resolve_stocks(&mut hits);
+        hits.retain(|h| !h.stocks.is_empty());
+        // 板块联动: Board hits 内部已自带异动股 (stocks 字段), resolve_stocks 会自动跳过
+        let mut board_hits = chain_mapper::extract_board_rotation(&titles_for_board);
+        log::info!(
+            "[Opportunity] 板块联动归因: {} 条 Board hits (vs Rule/Ai {} 条)",
+            board_hits.len(),
+            hits.len()
+        );
+        hits.append(&mut board_hits);
         hits
-    }).await.unwrap_or_default();
-    hits.retain(|h| !h.stocks.is_empty());
+    })
+    .await
+    .unwrap_or_default();
     let (hits, dropped) = gate_hits(hits, &flash_titles, &web_results);
+
+    // CR-2 (review): board_n 在 gate_hits 之后算, 用真实的 Board 命中数 (之前在 spawn_blocking 之前算永远=0)
+    let board_n = hits
+        .iter()
+        .filter(|h| h.source == chain_mapper::ChainSource::Board)
+        .count();
+
+    // B-002: Board hits 落库到 board_rotation_daily, 供 NewsCatalyst 推送读取
+    if board_n > 0 {
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let entries: Vec<crate::database::concepts::BoardRotationEntry> = hits
+            .iter()
+            .filter(|h| h.source == chain_mapper::ChainSource::Board)
+            .map(|h| crate::database::concepts::BoardRotationEntry {
+                // CR-2 (review): 用 ChainHit.board_code (真实板块代码 e.g. BK0815) 而非 board.name.
+                //              之前用 board_keyword (= board.name "房地产开发") 错存为 PK.
+                board_code: h
+                    .board_code
+                    .clone()
+                    .unwrap_or_else(|| h.board_keyword.clone()),
+                // CR-2 (review): board_name 用板块名 (去掉 chain field 里 "[板块联动] " 前缀).
+                //              之前用 h.chain (= "[板块联动] 房地产开发") 错存, 读时再 prefix 变 "[板块联动] [板块联动]".
+                board_name: h
+                    .chain
+                    .strip_prefix("[板块联动] ")
+                    .unwrap_or(&h.chain)
+                    .to_string(),
+                news_title: h.logic.clone(),
+                // CR-2 (review): board_change_pct 用真实涨幅 (e.g. 2.5%), board_main_net_pct 用资金净占比.
+                //              之前两者都取自 fund_flow_pct (资金占比 ~1.5%), 让 chg 标签错位.
+                board_change_pct: h.board_change_pct.unwrap_or(0.0),
+                board_main_net_pct: h.fund_flow_pct.unwrap_or(0.0),
+                stocks_json: serde_json::to_string(&h.stocks).unwrap_or_else(|_| "[]".to_string()),
+            })
+            .collect();
+        if let Some(db) = crate::database::DatabaseManager::try_get() {
+            db.save_board_rotations(&today, &entries);
+        }
+    }
     // P2-News Commit 3: 影子模式跑新 ranker, log 对比 + 收集 ranked 列表
     // P2-News Commit 4: 收集后由 main.rs 推 PushKind::NewsRanked
     let ranked_news = if !hits.is_empty() {
@@ -891,7 +1113,10 @@ pub async fn run_opportunity_scan() -> OpportunityScan {
     if hits.is_empty() {
         log::warn!(
             "[Opportunity] 采集 {} 条新闻(快讯{}/Web{}) → 候选被置信度门控全部过滤: {}",
-            titles.len(), flash_n, web_n, dropped.join(" | ")
+            titles.len(),
+            flash_n,
+            web_n,
+            dropped.join(" | ")
         );
         return OpportunityScan {
             chain_text: "当前产业链信号可信度不足（已降级观察）".to_string(),
@@ -910,20 +1135,54 @@ pub async fn run_opportunity_scan() -> OpportunityScan {
         lines.push(String::new());
         lines.push(format!("🔥 {}：{}", hit.chain, hit.logic));
         lines.push(format!("  关键词：{}", hit.keywords.join("、")));
-        let stock_list: Vec<String> = hit.stocks.iter().take(5)
-            .map(|s| format!("{}({})", s.name, s.code)).collect();
+        let stock_list: Vec<String> = hit
+            .stocks
+            .iter()
+            .take(5)
+            .map(|s| format!("{}({})", s.name, s.code))
+            .collect();
         lines.push(format!("  受益标的：{}", stock_list.join(" ")));
     }
 
     // 持仓影响（独立成段，分开推送）
+    // B-004 (2026-07-09): 「中性: 无直接产业链关联」是纯噪声, 折叠成单行 summary.
+    // 全是零信号则完全抑制推送 (避免 7 行废话重复推送).
     let mut impact_lines: Vec<String> = Vec::new();
     if !impacts.is_empty() {
-        impact_lines.push(format!("📌 持仓影响（{}）", chrono::Local::now().format("%H:%M")));
-        impact_lines.push("━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
-        for imp in &impacts {
-            impact_lines.push(format!("  {} {}({}) — {}: {}",
-                imp.direction.emoji(), imp.name, imp.code,
-                imp.direction.label(), imp.reason));
+        let meaningful: Vec<_> = impacts.iter().filter(|i| !i.is_zero_signal()).collect();
+        let zero_signal: Vec<_> = impacts.iter().filter(|i| i.is_zero_signal()).collect();
+
+        // 全部零信号 → 抑制推送 (噪声)
+        if meaningful.is_empty() {
+            log::debug!(
+                "[持仓影响] 全部 {} 只持仓无产业链关联, 抑制推送 (B-004)",
+                zero_signal.len()
+            );
+        } else {
+            impact_lines.push(format!(
+                "📌 持仓影响（{}）",
+                chrono::Local::now().format("%H:%M")
+            ));
+            impact_lines.push("━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
+            for imp in &meaningful {
+                impact_lines.push(format!(
+                    "  {} {}({}) — {}: {}",
+                    imp.direction.emoji(),
+                    imp.name,
+                    imp.code,
+                    imp.direction.label(),
+                    imp.reason
+                ));
+            }
+            // 零信号持仓折叠成单行 summary (避免推送噪声, 但保留可见性)
+            if !zero_signal.is_empty() {
+                let codes: Vec<String> = zero_signal.iter().map(|i| i.code.clone()).collect();
+                impact_lines.push(format!(
+                    "  … 其余 {} 只持仓无产业链关联: {}",
+                    zero_signal.len(),
+                    codes.join(", ")
+                ));
+            }
         }
     }
 
@@ -936,7 +1195,11 @@ pub async fn run_opportunity_scan() -> OpportunityScan {
         lines.push(String::new());
         lines.push("🎯 值得关注：".to_string());
         for (c, sig) in gated.iter().take(3) {
-            let note = if c.price_note.is_empty() { String::new() } else { format!(" [{}]", c.price_note) };
+            let note = if c.price_note.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", c.price_note)
+            };
             lines.push(format!(
                 "  {}({}) — {}：{}{} | 量能/趋势确认: {} {} 置信{} [{}]",
                 c.name,
@@ -951,12 +1214,17 @@ pub async fn run_opportunity_scan() -> OpportunityScan {
             ));
             // 影子盘留痕（合规可追溯，AGENTS.md 2.7）：机会以"看多"记入 prediction_tracker
             crate::monitor::prediction::save_prediction(
-                Some(&c.chain), Some(&c.code), "看多", 60.0, Some(&c.logic),
+                Some(&c.chain),
+                Some(&c.code),
+                "看多",
+                60.0,
+                Some(&c.logic),
             );
         }
     } else {
         lines.push(String::new());
-        lines.push("🎯 值得关注：暂无通过量能/趋势确认的候选（等待趋势向上或变盘向上）".to_string());
+        lines
+            .push("🎯 值得关注：暂无通过量能/趋势确认的候选（等待趋势向上或变盘向上）".to_string());
     }
 
     // (T6b) 卖飞复盘：已平仓标的今日又走强且出现在机会产业链中 → 提醒“可能卖飞”
@@ -970,13 +1238,17 @@ pub async fn run_opportunity_scan() -> OpportunityScan {
     }
 
     log::info!(
-        "[Opportunity] 采集 {} 条新闻(快讯{}/Web{}) → 命中产业链 {} 条(规则{}/AI{}) → 趋势二次门控后推送 {} 个机会",
-        titles.len(), flash_n, web_n, hits.len(), rule_n, ai_n, gated.len().min(3)
+        "[Opportunity] 采集 {} 条新闻(快讯{}/Web{}) → 命中产业链 {} 条(规则{}/AI{}/板块联动{}) → 趋势二次门控后推送 {} 个机会",
+        titles.len(), flash_n, web_n, hits.len(), rule_n, ai_n, board_n, gated.len().min(3)
     );
 
     OpportunityScan {
         chain_text: lines.join("\n"),
-        impact_text: if impact_lines.is_empty() { String::new() } else { impact_lines.join("\n") },
+        impact_text: if impact_lines.is_empty() {
+            String::new()
+        } else {
+            impact_lines.join("\n")
+        },
         news_ranked_text,
     }
 }
@@ -986,7 +1258,10 @@ pub async fn run_opportunity_scan() -> OpportunityScan {
 /// - 强制输出入选原因，便于复盘与执行前二次确认
 pub async fn run_post_close_candidates(top_n: usize) -> String {
     let mut lines: Vec<String> = Vec::new();
-    lines.push(format!("🎯 优选候选（{}）", chrono::Local::now().format("%H:%M")));
+    lines.push(format!(
+        "🎯 优选候选（{}）",
+        chrono::Local::now().format("%H:%M")
+    ));
     lines.push("━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
 
     // 1. 获取新闻
@@ -1011,12 +1286,20 @@ pub async fn run_post_close_candidates(top_n: usize) -> String {
     // 1a. (v9.4.24) 事件抽取 — rules-only 路径, 用 collect_events_from_web 统一
     let (detected_events, event_n) = collect_events_from_web(&web_results, &mut titles);
     if event_n > 0 {
-        let event_summary: Vec<String> = detected_events.iter()
-            .map(|e| format!("{}({})", e.event_type.label(), e.subject.chars().take(20).collect::<String>()))
+        let event_summary: Vec<String> = detected_events
+            .iter()
+            .map(|e| {
+                format!(
+                    "{}({})",
+                    e.event_type.label(),
+                    e.subject.chars().take(20).collect::<String>()
+                )
+            })
             .collect();
         lines.push(format!(
             "📊 事件预检：检出 {} 个有效事件 → 参与产业链映射 | {}",
-            event_n, event_summary.join("; ")
+            event_n,
+            event_summary.join("; ")
         ));
     }
 
@@ -1040,7 +1323,11 @@ pub async fn run_post_close_candidates(top_n: usize) -> String {
     {
         let llm_registry = crate::llm::LlmRegistry::from_env();
         if let Some(provider) = llm_registry.select("ticker_extraction") {
-            log::info!("[PostClose] LLM provider={} model={}, 提取 ticker", provider.name(), provider.model());
+            log::info!(
+                "[PostClose] LLM provider={} model={}, 提取 ticker",
+                provider.name(),
+                provider.model()
+            );
             match crate::llm::extract_tickers(provider.clone(), titles.clone()).await {
                 Ok(ticker_hits) if !ticker_hits.is_empty() => {
                     log::info!("[PostClose] LLM 提取 {} 只 ticker", ticker_hits.len());
@@ -1051,13 +1338,22 @@ pub async fn run_post_close_candidates(top_n: usize) -> String {
                         ticker_hits.len()
                     );
                     for t in &ticker_hits {
-                        log::info!("[PostClose]   LLM hit: {}({}) imp={} chain={} reason={}",
-                            t.name, t.code, t.importance, t.chain, t.reason);
+                        log::info!(
+                            "[PostClose]   LLM hit: {}({}) imp={} chain={} reason={}",
+                            t.name,
+                            t.code,
+                            t.importance,
+                            t.chain,
+                            t.reason
+                        );
                     }
                     // 转 ChainHit 注入 hits, 复用下游 resolve_stocks / gate_hits
                     for t in ticker_hits {
                         // 去重: 已存在的 code 不重复加
-                        if hits.iter().any(|h| h.stocks.iter().any(|s| s.code == t.code)) {
+                        if hits
+                            .iter()
+                            .any(|h| h.stocks.iter().any(|s| s.code == t.code))
+                        {
                             continue;
                         }
                         hits.push(chain_mapper::ChainHit {
@@ -1073,16 +1369,28 @@ pub async fn run_post_close_candidates(top_n: usize) -> String {
                             source: chain_mapper::ChainSource::Ai,
                             board_keyword: t.chain.clone(),
                             fund_flow_pct: None,
+                            board_code: None,
+                            board_change_pct: None,
                         });
                     }
                 }
                 Ok(empty) => {
-                    log::info!("[PostClose] LLM 提取为空 ({} 命中), 降级到 chain_mapper", empty.len());
-                    path_status = format!("🔧 降级 chain_mapper (LLM 提取 0 只, provider={})", provider.name());
+                    log::info!(
+                        "[PostClose] LLM 提取为空 ({} 命中), 降级到 chain_mapper",
+                        empty.len()
+                    );
+                    path_status = format!(
+                        "🔧 降级 chain_mapper (LLM 提取 0 只, provider={})",
+                        provider.name()
+                    );
                 }
                 Err(e) => {
                     log::warn!("[PostClose] LLM 提取失败: {}, 降级到 chain_mapper", e);
-                    path_status = format!("🔧 降级 chain_mapper (LLM 失败: {}, provider={})", e, provider.name());
+                    path_status = format!(
+                        "🔧 降级 chain_mapper (LLM 失败: {}, provider={})",
+                        e,
+                        provider.name()
+                    );
                 }
             }
         } else {
@@ -1093,15 +1401,29 @@ pub async fn run_post_close_candidates(top_n: usize) -> String {
     // 把路径状态写到 lines 开头 (位于事件预检之后, 让 LLM 信息也参与排序前的展示)
     lines.push(path_status.clone());
     log::info!("[PostClose] 本轮路径: {}", path_status);
+    // CR-22 fix: 提前 clone titles 避免 spawn_blocking move 后无法在 line 1424 复用
+    let titles_for_post = titles.clone();
     let mut hits = tokio::task::spawn_blocking(move || {
         chain_mapper::resolve_stocks(&mut hits);
+        // CR-22 (review): 追加 Board path — Board hits 也能进 TomorrowWatch / 优选候选
+        // 之前只走 Rule/Ai, 002208 房地产板块拉升 → Board hit 永远不进盘后 watchlist
+        let mut board_hits = chain_mapper::extract_board_rotation(&titles_for_post);
+        log::info!(
+            "[PostClose] 板块联动归因 (post-close): {} 条 Board hits",
+            board_hits.len()
+        );
+        hits.append(&mut board_hits);
         hits
     })
     .await
     .unwrap_or_default();
     let before_retain = hits.len();
     hits.retain(|h| !h.stocks.is_empty());
-    log::info!("[PostClose] resolve_stocks 后: {} 条 → retain 后 {} 条 (保留有成分股的)", before_retain, hits.len());
+    log::info!(
+        "[PostClose] resolve_stocks 后: {} 条 → retain 后 {} 条 (保留有成分股的)",
+        before_retain,
+        hits.len()
+    );
     let (hits, dropped) = gate_hits(hits, &flash_titles, &web_results);
     if !dropped.is_empty() {
         log::info!("[PostClose] gate_hits 过滤掉: {}", dropped.join(" | "));
@@ -1164,14 +1486,16 @@ pub async fn run_post_close_candidates(top_n: usize) -> String {
                 } else {
                     flow_fail_other += 1;
                 }
-                (crate::data_provider::MoneyFlowSummary::default(), Some(e.to_string()))
+                (
+                    crate::data_provider::MoneyFlowSummary::default(),
+                    Some(e.to_string()),
+                )
             }
         };
         let kline = kline_result.ok();
 
         let (profit_score, profit_reason, quality_note) = score_profit_elasticity(&fin);
-        let (flow_score, flow_reason) =
-            score_capital_consensus(&flow, flow_fetch_error.as_deref());
+        let (flow_score, flow_reason) = score_capital_consensus(&flow, flow_fetch_error.as_deref());
         let flow_source_status = classify_flow_error(flow_fetch_error.as_deref()).to_string();
         // review #14 性能: 原代码两个 .map(|k| { ... analyze_postmarket ... }) 各自
         // 跑一遍完整 K 线扫描 (5-10ms/只). 200 只股票 = 400 次 = 400×10ms = 4s 浪费.
@@ -1188,7 +1512,10 @@ pub async fn run_post_close_candidates(top_n: usize) -> String {
                 let total = (rhythm_score + breakout_score).clamp(-8.0, 14.0);
                 (
                     total,
-                    format!("{}；放量结构{:+.1}：{}", rhythm_reason, breakout_score, breakout_reason),
+                    format!(
+                        "{}；放量结构{:+.1}：{}",
+                        rhythm_reason, breakout_score, breakout_reason
+                    ),
                     stop_line,
                 )
             })
@@ -1216,7 +1543,7 @@ pub async fn run_post_close_candidates(top_n: usize) -> String {
         let final_score = c.score + profit_score + flow_score + pattern_score;
 
         rescored.push(PostCloseCandidate {
-            base: c.clone(),  // 修复 F15: 需要 push_time, 不能 move
+            base: c.clone(), // 修复 F15: 需要 push_time, 不能 move
             profit_score,
             flow_score,
             pattern_score,
@@ -1229,7 +1556,7 @@ pub async fn run_post_close_candidates(top_n: usize) -> String {
             breakout_confidence,
             stop_line,
             quality_note,
-            push_time: c.push_time,  // 透传 discover::Candidate.push_time (BR-004)
+            push_time: c.push_time, // 透传 discover::Candidate.push_time (BR-004)
         });
     }
 
@@ -1252,8 +1579,7 @@ pub async fn run_post_close_candidates(top_n: usize) -> String {
     if picked.is_empty() {
         return format!(
             "🎯 优选候选：本轮无满足阈值的标的（总分阈值 >= {:.1}，量能阈值 >= {:.2}x）",
-            POST_CLOSE_MIN_SCORE,
-            POST_CLOSE_MIN_VOL_RATIO
+            POST_CLOSE_MIN_SCORE, POST_CLOSE_MIN_VOL_RATIO
         );
     }
 
@@ -1299,8 +1625,7 @@ pub async fn run_post_close_candidates(top_n: usize) -> String {
         lines.push(format!("   ③ 利润弹性: {}", c.profit_reason));
         lines.push(format!(
             "   ④ 机构/资金共识(代理): {} [资金源:{}]",
-            c.flow_reason,
-            c.flow_source_status
+            c.flow_reason, c.flow_source_status
         ));
         lines.push(format!("   ⑤ 股价位置: {}", c.base.reason_summary));
         lines.push(format!("   ⑥ 放量分析: {}", c.breakout_reason));
@@ -1344,12 +1669,21 @@ fn review_sold_too_early(hits: &[chain_mapper::ChainHit], owned_codes: &[String]
     let mut out = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for t in &trades {
-        if t.direction != TradeDirection::Sell { continue; }
-        if owned.contains(t.code.as_str()) { continue; } // 已重新持仓不算卖飞
+        if t.direction != TradeDirection::Sell {
+            continue;
+        }
+        if owned.contains(t.code.as_str()) {
+            continue;
+        } // 已重新持仓不算卖飞
         for hit in hits {
             if hit.stocks.iter().any(|s| s.code == t.code) {
-                if !seen.insert(t.code.clone()) { continue; }
-                out.push(format!("{}({}) 已卖出，今在[{}]再起：{}", t.name, t.code, hit.chain, hit.logic));
+                if !seen.insert(t.code.clone()) {
+                    continue;
+                }
+                out.push(format!(
+                    "{}({}) 已卖出，今在[{}]再起：{}",
+                    t.name, t.code, hit.chain, hit.logic
+                ));
                 break;
             }
         }
@@ -1378,9 +1712,12 @@ fn build_watchlist_sector_queries() -> Vec<String> {
 }
 
 /// 修复: 内层纯函数 (供测试和复用), 输入 positions 输出查询
-pub fn build_sector_queries_from_positions(positions: &[crate::portfolio::Position]) -> Vec<String> {
+pub fn build_sector_queries_from_positions(
+    positions: &[crate::portfolio::Position],
+) -> Vec<String> {
     // 1) 提取去重的 sector (过滤 "其他" 未分类和空字符串)
-    let mut sectors: Vec<String> = positions.iter()
+    let mut sectors: Vec<String> = positions
+        .iter()
         .map(|p| p.sector.clone())
         .filter(|s| !s.is_empty() && s != "其他")
         .collect();
@@ -1388,7 +1725,8 @@ pub fn build_sector_queries_from_positions(positions: &[crate::portfolio::Positi
     sectors.dedup();
 
     // 2) 转查询: 每 sector 一个查询 + 通用兜底
-    let mut queries: Vec<String> = sectors.iter()
+    let mut queries: Vec<String> = sectors
+        .iter()
         .map(|s| format!("今日 {} 重大新闻 政策 催化", s))
         .collect();
 
@@ -1466,7 +1804,10 @@ mod tests {
             kd(10.2, 10.3, 10.0, 10.1, 2_200.0, -1.0),
         ];
         let (score, _, _) = score_air_refuel_pattern(&k);
-        assert!(score < 5.0, "consolidation breakout should be penalized, got {score}");
+        assert!(
+            score < 5.0,
+            "consolidation breakout should be penalized, got {score}"
+        );
     }
 
     #[test]
@@ -1474,12 +1815,39 @@ mod tests {
         // 修复 watchlist-aware: 板块必去重, 不重复触发同一查询
         use crate::portfolio::Position;
         let positions = vec![
-            Position { code: "600703".into(), name: "三安光电".into(), shares: 1000, cost_price: 10.0, hard_stop: 9.0, added_at: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), status: crate::portfolio::PositionStatus::Holding, sector: "半导体".into(),
-            ..Default::default() },
-            Position { code: "002049".into(), name: "紫光国微".into(), shares: 500, cost_price: 100.0, hard_stop: 90.0, added_at: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), status: crate::portfolio::PositionStatus::Holding, sector: "半导体".into(),
-            ..Default::default() },
-            Position { code: "600276".into(), name: "恒瑞医药".into(), shares: 800, cost_price: 50.0, hard_stop: 45.0, added_at: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), status: crate::portfolio::PositionStatus::Holding, sector: "医药".into(),
-            ..Default::default() },
+            Position {
+                code: "600703".into(),
+                name: "三安光电".into(),
+                shares: 1000,
+                cost_price: 10.0,
+                hard_stop: 9.0,
+                added_at: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+                status: crate::portfolio::PositionStatus::Holding,
+                sector: "半导体".into(),
+                ..Default::default()
+            },
+            Position {
+                code: "002049".into(),
+                name: "紫光国微".into(),
+                shares: 500,
+                cost_price: 100.0,
+                hard_stop: 90.0,
+                added_at: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+                status: crate::portfolio::PositionStatus::Holding,
+                sector: "半导体".into(),
+                ..Default::default()
+            },
+            Position {
+                code: "600276".into(),
+                name: "恒瑞医药".into(),
+                shares: 800,
+                cost_price: 50.0,
+                hard_stop: 45.0,
+                added_at: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+                status: crate::portfolio::PositionStatus::Holding,
+                sector: "医药".into(),
+                ..Default::default()
+            },
         ];
         let queries = super::build_sector_queries_from_positions(&positions);
         // 半导体(2 只) + 医药(1 只) → 2 个 sector 查询 + 1 兜底 = 3 个
@@ -1495,10 +1863,17 @@ mod tests {
     fn test_build_watchlist_sector_queries_filters_other() {
         // 修复: "其他" sector 必过滤, 不产生查询
         use crate::portfolio::Position;
-        let positions = vec![
-            Position { code: "600000".into(), name: "浦发银行".into(), shares: 1000, cost_price: 10.0, hard_stop: 9.0, added_at: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), status: crate::portfolio::PositionStatus::Watching, sector: "其他".into(),
-            ..Default::default() },
-        ];
+        let positions = vec![Position {
+            code: "600000".into(),
+            name: "浦发银行".into(),
+            shares: 1000,
+            cost_price: 10.0,
+            hard_stop: 9.0,
+            added_at: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            status: crate::portfolio::PositionStatus::Watching,
+            sector: "其他".into(),
+            ..Default::default()
+        }];
         let queries = super::build_sector_queries_from_positions(&positions);
         // "其他" 被过滤, 仅有兜底查询
         assert_eq!(queries.len(), 1);
@@ -1509,14 +1884,19 @@ mod tests {
     fn test_build_watchlist_sector_queries_caps_at_six() {
         // 修复 watchlist-aware: 查询数 ≤ 6, 防止 provider 配额耗尽
         use crate::portfolio::Position;
-        let positions: Vec<Position> = (0..20).map(|i| Position {
-            code: format!("60000{}", i),
-            name: format!("测试{}", i),
-            shares: 100, cost_price: 10.0, hard_stop: 9.0,
-            added_at: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
-            status: crate::portfolio::PositionStatus::Holding,
-            sector: format!("行业{}", i), ..Default::default()  // 每个 sector 都不同 → 20 个 sector
-        }).collect();
+        let positions: Vec<Position> = (0..20)
+            .map(|i| Position {
+                code: format!("60000{}", i),
+                name: format!("测试{}", i),
+                shares: 100,
+                cost_price: 10.0,
+                hard_stop: 9.0,
+                added_at: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+                status: crate::portfolio::PositionStatus::Holding,
+                sector: format!("行业{}", i),
+                ..Default::default() // 每个 sector 都不同 → 20 个 sector
+            })
+            .collect();
         let queries = super::build_sector_queries_from_positions(&positions);
         // 20 个不同 sector + 1 兜底 → truncate(6) → 6 个
         assert_eq!(queries.len(), 6, "20 个 sector + 兜底必 truncate 到 6");

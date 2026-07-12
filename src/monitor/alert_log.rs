@@ -25,7 +25,10 @@ pub fn append_jsonl(event: &AlertEvent) {
     let path = today_file("jsonl");
     let mut f = match fs::OpenOptions::new().create(true).append(true).open(&path) {
         Ok(f) => f,
-        Err(e) => { warn!("[AlertLog] 无法打开 {}: {}", path.display(), e); return; }
+        Err(e) => {
+            warn!("[AlertLog] 无法打开 {}: {}", path.display(), e);
+            return;
+        }
     };
     let _ = writeln!(f, "{}", line);
 }
@@ -37,7 +40,10 @@ pub fn append_md(event: &AlertEvent) {
     let path = today_file("md");
     let mut f = match fs::OpenOptions::new().create(true).append(true).open(&path) {
         Ok(f) => f,
-        Err(e) => { warn!("[AlertLog] 无法打开 {}: {}", path.display(), e); return; }
+        Err(e) => {
+            warn!("[AlertLog] 无法打开 {}: {}", path.display(), e);
+            return;
+        }
     };
     let _ = writeln!(f, "---\n{}\n", text);
 }
@@ -54,7 +60,11 @@ pub fn append_batch(events: &[AlertEvent]) {
 pub fn read_today() -> Vec<String> {
     let path = today_file("md");
     match fs::read_to_string(&path) {
-        Ok(s) => s.split("---\n").filter(|p| !p.trim().is_empty()).map(|p| p.trim().to_string()).collect(),
+        Ok(s) => s
+            .split("---\n")
+            .filter(|p| !p.trim().is_empty())
+            .map(|p| p.trim().to_string())
+            .collect(),
         Err(_) => Vec::new(),
     }
 }
@@ -110,14 +120,20 @@ mod tests {
         AlertEvent {
             level: AlertLevel::Important,
             category: AlertCategory::MainOutflow,
-            code: "000001".into(), name: "测试".into(),
+            code: "000001".into(),
+            name: "测试".into(),
             message: "测试告警".into(),
             detail: AlertDetail {
-                price: Some(10.0), change_pct: Some(-3.0),
-                volume_ratio: None, main_flow_yi: Some(-0.5),
-                threshold: None, news_title: None,
-                news_summary: None, ai_decision: None,
-                t1_locked: false, extra: None,
+                price: Some(10.0),
+                change_pct: Some(-3.0),
+                volume_ratio: None,
+                main_flow_yi: Some(-0.5),
+                threshold: None,
+                news_title: None,
+                news_summary: None,
+                ai_decision: None,
+                t1_locked: false,
+                extra: None,
             },
             triggered_at: Local::now(),
         }

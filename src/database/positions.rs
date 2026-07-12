@@ -10,7 +10,10 @@ use super::DatabaseManager;
 use super::DbConnection;
 
 fn env_reject_error(msg: String) -> Box<dyn std::error::Error> {
-    Box::new(std::io::Error::new(std::io::ErrorKind::PermissionDenied, msg))
+    Box::new(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        msg,
+    ))
 }
 
 impl DatabaseManager {
@@ -18,7 +21,8 @@ impl DatabaseManager {
         &self,
         position: &NewStockPosition,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if let Err(reason) = crate::risk::env_guard::validate_symbol_for_current_env(&position.code) {
+        if let Err(reason) = crate::risk::env_guard::validate_symbol_for_current_env(&position.code)
+        {
             log::warn!(
                 "[ENV_GUARD] rule_id=AGENTS-2.5 code={} env={:?} action=reject reason={} timestamp={}",
                 position.code,
@@ -29,8 +33,8 @@ impl DatabaseManager {
             return Err(env_reject_error(reason));
         }
 
-        use diesel::upsert::excluded;
         use diesel::dsl::sql;
+        use diesel::upsert::excluded;
 
         let mut conn = self.get_conn()?;
 
@@ -45,17 +49,24 @@ impl DatabaseManager {
                 stock_position::status.eq(excluded(stock_position::status)),
                 // v14.1 F7 fix: COALESCE 保 NULL 时不覆盖 backfilled / broker-pushed 值
                 // trading::open_position 总是传 None, 之前会清掉 backfill 写好的 *ST
-                stock_position::st_type.eq(sql::<diesel::sql_types::Nullable<diesel::sql_types::Text>>(
+                stock_position::st_type.eq(sql::<
+                    diesel::sql_types::Nullable<diesel::sql_types::Text>,
+                >(
                     "COALESCE(excluded.st_type, stock_position.st_type)"
                 )),
                 // v14.1 BR-015 fix: 同上, 保 chain_name
-                stock_position::chain_name.eq(sql::<diesel::sql_types::Nullable<diesel::sql_types::Text>>(
-                    "COALESCE(excluded.chain_name, stock_position.chain_name)"
+                stock_position::chain_name.eq(sql::<
+                    diesel::sql_types::Nullable<diesel::sql_types::Text>,
+                >(
+                    "COALESCE(excluded.chain_name, stock_position.chain_name)",
                 )),
             ))
             .execute(&mut conn)?;
 
-        info!("[{}] 模拟买入记录已保存（价格: {:.2}, 数量: {}）", position.code, position.buy_price, position.quantity);
+        info!(
+            "[{}] 模拟买入记录已保存（价格: {:.2}, 数量: {}）",
+            position.code, position.buy_price, position.quantity
+        );
         Ok(())
     }
 
@@ -77,9 +88,7 @@ impl DatabaseManager {
     }
 
     /// 获取所有持仓中(open)的记录
-    pub fn get_all_open_positions(
-        &self,
-    ) -> Result<Vec<StockPosition>, Box<dyn std::error::Error>> {
+    pub fn get_all_open_positions(&self) -> Result<Vec<StockPosition>, Box<dyn std::error::Error>> {
         let mut conn = self.get_conn()?;
 
         let results = stock_position::table

@@ -53,7 +53,12 @@ impl NotificationService {
     }
 
     /// 分批发送长消息到企业微信
-    pub(super) async fn send_wechat_chunked(&self, url: &str, content: &str, max_bytes: usize) -> Result<bool> {
+    pub(super) async fn send_wechat_chunked(
+        &self,
+        url: &str,
+        content: &str,
+        max_bytes: usize,
+    ) -> Result<bool> {
         let chunks = self.chunk_by_sections(content, max_bytes);
         let total_chunks = chunks.len();
         let mut success_count = 0;
@@ -91,7 +96,8 @@ impl NotificationService {
         } else if content.contains("\n### ") {
             let parts: Vec<&str> = content.split("\n### ").collect();
             let mut result = vec![parts[0]];
-            let formatted_parts: Vec<String> = parts[1..].iter().map(|p| format!("### {}", p)).collect();
+            let formatted_parts: Vec<String> =
+                parts[1..].iter().map(|p| format!("### {}", p)).collect();
             result.extend(formatted_parts.iter().map(|s| s.as_str()));
             return self.chunk_sections(&result, max_bytes);
         } else {

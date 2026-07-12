@@ -23,7 +23,7 @@ use std::time::Duration;
 pub struct PositionAnalysis {
     pub code: String,
     pub name: String,
-    pub impact: String,      // "重大利空" / "偏空" / "中性" / "偏多" / "重大利好"
+    pub impact: String, // "重大利空" / "偏空" / "中性" / "偏多" / "重大利好"
     pub confidence: u8,
     pub uncertainty: String,
     pub core_logic: String,
@@ -50,22 +50,39 @@ impl NewsAIAnalyzer {
                 }
             }
         }
-        Self { linker, analyzer, available }
+        Self {
+            linker,
+            analyzer,
+            available,
+        }
     }
 
-    fn available(&self) -> bool { self.available }
+    fn available(&self) -> bool {
+        self.available
+    }
 
     // ═══════════════════════════════════════════════════════════
     // 路径B：持仓深研（消息 + 技术面 → 影响评估）
     // ═══════════════════════════════════════════════════════════
 
     pub async fn analyze_position_news(
-        &self, code: &str, name: &str, news_text: &str,
-        price: f64, pe: f64, roe: f64, chg_5d: f64,
-        alignment: &str, bias_5: f64, limit_status: &str,
-        chip_position: &str, hard_stop: f64,
+        &self,
+        code: &str,
+        name: &str,
+        news_text: &str,
+        price: f64,
+        pe: f64,
+        roe: f64,
+        chg_5d: f64,
+        alignment: &str,
+        bias_5: f64,
+        limit_status: &str,
+        chip_position: &str,
+        hard_stop: f64,
     ) -> Option<AlertEvent> {
-        if !self.available() { return None; }
+        if !self.available() {
+            return None;
+        }
 
         let prompt = format!(
             "你是A股风控分析师。分析消息对持仓股的影响。\n\n股票：{}({})\n最新价：{:.2} | PE：{:.1} | ROE：{:.1}%\n近5日：{:+.1}% | 均线：{}\n5日乖离(BIAS_5)：{:+.1}% | 状态：{}\n筹码位置：{}\n硬止损价：{:.2}\n\n消息：\n{}\n\n输出（严格格式）：\n影响判断：重大利空/偏空/中性/偏多/重大利好\n置信度：0-100\n不确定点：（一句话）\n核心逻辑：（一句话）\n\n限制：已涨停禁建议加仓，已跌停禁建议减仓，高开>5%建议等回落。禁输出操作指令。",
@@ -73,17 +90,36 @@ impl NewsAIAnalyzer {
         );
 
         let result = tokio::time::timeout(Duration::from_secs(3), async {
-            self.analyzer.call_api_mode(&prompt, "你是A股风控分析师,只输出结构化的影响评估", AgentMode::Quick).await
-        }).await;
+            self.analyzer
+                .call_api_mode(
+                    &prompt,
+                    "你是A股风控分析师,只输出结构化的影响评估",
+                    AgentMode::Quick,
+                )
+                .await
+        })
+        .await;
 
         match result {
             Ok(Ok(text)) => self.parse_position_analysis(code, name, &text, news_text),
-            Ok(Err(e)) => { warn!("[NewsAI] 持仓分析失败: {}", e); None },
-            Err(_) => { warn!("[NewsAI] 持仓分析超时"); None },
+            Ok(Err(e)) => {
+                warn!("[NewsAI] 持仓分析失败: {}", e);
+                None
+            }
+            Err(_) => {
+                warn!("[NewsAI] 持仓分析超时");
+                None
+            }
         }
     }
 
-    fn parse_position_analysis(&self, code: &str, name: &str, text: &str, news_text: &str) -> Option<AlertEvent> {
+    fn parse_position_analysis(
+        &self,
+        code: &str,
+        name: &str,
+        text: &str,
+        news_text: &str,
+    ) -> Option<AlertEvent> {
         let mut impact = "中性";
         let mut confidence = 50u8;
         let mut uncertainty = "";
@@ -95,7 +131,13 @@ impl NewsAIAnalyzer {
                 impact = line.split(['：', ':']).last().unwrap_or("中性").trim();
             }
             if line.starts_with("置信度：") || line.starts_with("置信度:") {
-                confidence = line.split(['：', ':']).last().unwrap_or("50").trim().parse().unwrap_or(50);
+                confidence = line
+                    .split(['：', ':'])
+                    .last()
+                    .unwrap_or("50")
+                    .trim()
+                    .parse()
+                    .unwrap_or(50);
             }
             if line.starts_with("不确定点：") || line.starts_with("不确定点:") {
                 uncertainty = line.split(['：', ':']).last().unwrap_or("").trim();
@@ -115,8 +157,15 @@ impl NewsAIAnalyzer {
 
         // 写入 prediction_tracker
         let _ = crate::monitor::prediction::save_prediction(
-            None, Some(code), if impact.contains("利好") { "看多" } else { "看空" },
-            confidence as f64, Some(core_logic),
+            None,
+            Some(code),
+            if impact.contains("利好") {
+                "看多"
+            } else {
+                "看空"
+            },
+            confidence as f64,
+            Some(core_logic),
         );
 
         let msg = format!(
@@ -127,13 +176,18 @@ impl NewsAIAnalyzer {
         Some(AlertEvent {
             level,
             category: AlertCategory::FlashNews,
-            code: code.to_string(), name: name.to_string(),
+            code: code.to_string(),
+            name: name.to_string(),
             message: msg,
             detail: AlertDetail {
-                price: None, change_pct: None, volume_ratio: None,
-                main_flow_yi: None, threshold: None,
+                price: None,
+                change_pct: None,
+                volume_ratio: None,
+                main_flow_yi: None,
+                threshold: None,
                 news_title: Some(news_text.chars().take(100).collect()),
-                news_summary: None, ai_decision: None,
+                news_summary: None,
+                ai_decision: None,
                 t1_locked: false,
                 extra: Some(format!("AI影响评估:{},置信度:{}%", impact, confidence)),
             },
@@ -156,10 +210,15 @@ impl NewsAIAnalyzer {
             );
 
             let result = tokio::time::timeout(Duration::from_secs(6), async {
-                self.analyzer.call_api_mode(
-                    &prompt, "你是A股交易助手,只输出一句话建议", AgentMode::Quick,
-                ).await
-            }).await;
+                self.analyzer
+                    .call_api_mode(
+                        &prompt,
+                        "你是A股交易助手,只输出一句话建议",
+                        AgentMode::Quick,
+                    )
+                    .await
+            })
+            .await;
 
             match result {
                 Ok(Ok(text)) => {
@@ -169,7 +228,10 @@ impl NewsAIAnalyzer {
                         return Some(trimmed.to_string());
                     }
                     if trimmed.chars().count() > 80 {
-                        log::warn!("[NewsAI] AI输出过长({}字), 降级关键词", trimmed.chars().count());
+                        log::warn!(
+                            "[NewsAI] AI输出过长({}字), 降级关键词",
+                            trimmed.chars().count()
+                        );
                     }
                 }
                 Ok(Err(e)) => log::warn!("[NewsAI] AI失败: {}, 降级关键词", e),
@@ -193,20 +255,40 @@ impl NewsAIAnalyzer {
 fn keyword_decision(title: &str) -> Option<String> {
     // 利空关键词 → 回避
     const BEARISH: &[&str] = &[
-        "立案", "ST风险", "退市", "破产", "清算", "无法表示意见",
-        "减持", "业绩预亏", "商誉减值", "重大诉讼", "强制退市",
-        "暂停上市", "失联", "冻结", "监管函", "警示函", "责令改正",
+        "立案",
+        "ST风险",
+        "退市",
+        "破产",
+        "清算",
+        "无法表示意见",
+        "减持",
+        "业绩预亏",
+        "商誉减值",
+        "重大诉讼",
+        "强制退市",
+        "暂停上市",
+        "失联",
+        "冻结",
+        "监管函",
+        "警示函",
+        "责令改正",
         "问询函",
     ];
     // 利好关键词 → 关注
     const BULLISH: &[&str] = &[
-        "中标", "回购", "增持", "业绩预增", "重组", "重大合同",
-        "战略合作", "获得批文", "高送转", "解除质押",
+        "中标",
+        "回购",
+        "增持",
+        "业绩预增",
+        "重组",
+        "重大合同",
+        "战略合作",
+        "获得批文",
+        "高送转",
+        "解除质押",
     ];
     // 中性关键词 → 观察
-    const NEUTRAL: &[&str] = &[
-        "质押", "解禁", "股东大会", "董事会", "变更",
-    ];
+    const NEUTRAL: &[&str] = &["质押", "解禁", "股东大会", "董事会", "变更"];
 
     for &kw in BEARISH {
         if title.contains(kw) {
@@ -252,14 +334,22 @@ fn keyword_decision(title: &str) -> Option<String> {
 // ═══════════════════════════════════════════════════════════
 
 fn validate_llm_code(code: &str, name: &str) -> Option<String> {
-    if code.len() != 6 || !code.chars().all(|c| c.is_ascii_digit()) { return None; }
-    if code.starts_with('8') || code.starts_with('4') || code.starts_with('9') { return None; }
-    if name.contains("ST") || name.contains("退") { return None; }
+    if code.len() != 6 || !code.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    if code.starts_with('8') || code.starts_with('4') || code.starts_with('9') {
+        return None;
+    }
+    if name.contains("ST") || name.contains("退") {
+        return None;
+    }
     Some(code.to_string())
 }
 
 impl Default for NewsAIAnalyzer {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -274,14 +364,16 @@ mod tests {
 
     #[test]
     fn test_validate_code_invalid() {
-        assert!(validate_llm_code("00054", "测试").is_none());   // 5位
+        assert!(validate_llm_code("00054", "测试").is_none()); // 5位
         assert!(validate_llm_code("800547", "北交所").is_none()); // 北交所
         assert!(validate_llm_code("000001", "ST测试").is_none()); // ST
     }
 
     #[test]
     fn test_parse_position_basic() {
-        let _ = crate::database::DatabaseManager::init(Some(std::path::PathBuf::from("./test_data/test_ai.db")));
+        let _ = crate::database::DatabaseManager::init(Some(std::path::PathBuf::from(
+            "./test_data/test_ai.db",
+        )));
         let ai = NewsAIAnalyzer::new();
         let text = "影响判断：偏空\n置信度：70\n不确定点：减持比例未明确\n核心逻辑：大股东减持通常短期承压";
         let event = ai.parse_position_analysis("000001", "测试", text, "减持公告");

@@ -4,7 +4,6 @@
 //! 具体渠道实现（微信 / 飞书 / 邮件 / 报告生成）位于同级子模块。
 
 use std::path::Path;
-use std::time::Duration;
 
 use anyhow::Result;
 use chrono::Local;
@@ -23,7 +22,6 @@ pub struct NotificationService {
     pub available_channels: Vec<NotificationChannel>,
 }
 
-
 impl NotificationService {
     /// 创建新的通知服务
     pub fn new(config: NotificationConfig) -> Self {
@@ -38,7 +36,11 @@ impl NotificationService {
             warn!("未配置有效的通知渠道，将不发送推送通知");
         } else {
             let names: Vec<_> = available_channels.iter().map(|c| c.name()).collect();
-            info!("已配置 {} 个通知渠道：{}", available_channels.len(), names.join(", "));
+            info!(
+                "已配置 {} 个通知渠道：{}",
+                available_channels.len(),
+                names.join(", ")
+            );
         }
 
         Self {
@@ -117,7 +119,6 @@ impl NotificationService {
             .collect::<Vec<_>>()
             .join(", ")
     }
-
 }
 
 impl NotificationService {
@@ -139,87 +140,107 @@ impl NotificationService {
 
         for channel in &self.available_channels {
             match channel {
-                NotificationChannel::Wechat => {
-                    match self.send_to_wechat(content).await {
-                        Ok(true) => success_count += 1,
-                        Ok(false) => {
-                            error!("[企业微信] 发送失败");
-                            fail_count += 1;
-                        }
-                        Err(e) => {
-                            error!("[企业微信] 发送出错: {}", e);
-                            fail_count += 1;
-                        }
+                NotificationChannel::Wechat => match self.send_to_wechat(content).await {
+                    Ok(true) => success_count += 1,
+                    Ok(false) => {
+                        error!("[企业微信] 发送失败");
+                        fail_count += 1;
                     }
-                }
-                NotificationChannel::Feishu => {
-                    match self.send_to_feishu(content).await {
-                        Ok(true) => success_count += 1,
-                        Ok(false) => {
-                            error!("[飞书] 发送失败");
-                            fail_count += 1;
-                        }
-                        Err(e) => {
-                            error!("[飞书] 发送出错: {}", e);
-                            fail_count += 1;
-                        }
+                    Err(e) => {
+                        error!("[企业微信] 发送出错: {}", e);
+                        fail_count += 1;
                     }
-                }
-                NotificationChannel::Email => {
-                    match self.send_to_email(content) {
-                        Ok(true) => success_count += 1,
-                        Ok(false) => {
-                            error!("[邮件] 发送失败");
-                            fail_count += 1;
-                        }
-                        Err(e) => {
-                            error!("[邮件] 发送出错: {}", e);
-                            fail_count += 1;
-                        }
+                },
+                NotificationChannel::Feishu => match self.send_to_feishu(content).await {
+                    Ok(true) => success_count += 1,
+                    Ok(false) => {
+                        error!("[飞书] 发送失败");
+                        fail_count += 1;
                     }
-                }
-                NotificationChannel::ServerChan => {
-                    match self.send_to_server_chan(content).await {
-                        Ok(true) => success_count += 1,
-                        Ok(false) => { error!("[Server酱] 发送失败"); fail_count += 1; }
-                        Err(e) => { error!("[Server酱] 发送出错: {}", e); fail_count += 1; }
+                    Err(e) => {
+                        error!("[飞书] 发送出错: {}", e);
+                        fail_count += 1;
                     }
-                }
+                },
+                NotificationChannel::Email => match self.send_to_email(content) {
+                    Ok(true) => success_count += 1,
+                    Ok(false) => {
+                        error!("[邮件] 发送失败");
+                        fail_count += 1;
+                    }
+                    Err(e) => {
+                        error!("[邮件] 发送出错: {}", e);
+                        fail_count += 1;
+                    }
+                },
+                NotificationChannel::ServerChan => match self.send_to_server_chan(content).await {
+                    Ok(true) => success_count += 1,
+                    Ok(false) => {
+                        error!("[Server酱] 发送失败");
+                        fail_count += 1;
+                    }
+                    Err(e) => {
+                        error!("[Server酱] 发送出错: {}", e);
+                        fail_count += 1;
+                    }
+                },
                 // 修复 P0-0: 替换 _ => 死代码, 每个渠道显式处理
-                NotificationChannel::DingTalk => {
-                    match self.send_to_dingtalk(content).await {
-                        Ok(true) => success_count += 1,
-                        Ok(false) => { error!("[钉钉] 发送失败"); fail_count += 1; }
-                        Err(e) => { error!("[钉钉] 发送出错: {}", e); fail_count += 1; }
+                NotificationChannel::DingTalk => match self.send_to_dingtalk(content).await {
+                    Ok(true) => success_count += 1,
+                    Ok(false) => {
+                        error!("[钉钉] 发送失败");
+                        fail_count += 1;
                     }
-                }
-                NotificationChannel::Telegram => {
-                    match self.send_to_telegram(content).await {
-                        Ok(true) => success_count += 1,
-                        Ok(false) => { error!("[Telegram] 发送失败"); fail_count += 1; }
-                        Err(e) => { error!("[Telegram] 发送出错: {}", e); fail_count += 1; }
+                    Err(e) => {
+                        error!("[钉钉] 发送出错: {}", e);
+                        fail_count += 1;
                     }
-                }
-                NotificationChannel::Slack => {
-                    match self.send_to_slack(content).await {
-                        Ok(true) => success_count += 1,
-                        Ok(false) => { error!("[Slack] 发送失败"); fail_count += 1; }
-                        Err(e) => { error!("[Slack] 发送出错: {}", e); fail_count += 1; }
+                },
+                NotificationChannel::Telegram => match self.send_to_telegram(content).await {
+                    Ok(true) => success_count += 1,
+                    Ok(false) => {
+                        error!("[Telegram] 发送失败");
+                        fail_count += 1;
                     }
-                }
-                NotificationChannel::Discord => {
-                    match self.send_to_discord(content).await {
-                        Ok(true) => success_count += 1,
-                        Ok(false) => { error!("[Discord] 发送失败"); fail_count += 1; }
-                        Err(e) => { error!("[Discord] 发送出错: {}", e); fail_count += 1; }
+                    Err(e) => {
+                        error!("[Telegram] 发送出错: {}", e);
+                        fail_count += 1;
                     }
-                }
+                },
+                NotificationChannel::Slack => match self.send_to_slack(content).await {
+                    Ok(true) => success_count += 1,
+                    Ok(false) => {
+                        error!("[Slack] 发送失败");
+                        fail_count += 1;
+                    }
+                    Err(e) => {
+                        error!("[Slack] 发送出错: {}", e);
+                        fail_count += 1;
+                    }
+                },
+                NotificationChannel::Discord => match self.send_to_discord(content).await {
+                    Ok(true) => success_count += 1,
+                    Ok(false) => {
+                        error!("[Discord] 发送失败");
+                        fail_count += 1;
+                    }
+                    Err(e) => {
+                        error!("[Discord] 发送出错: {}", e);
+                        fail_count += 1;
+                    }
+                },
                 NotificationChannel::Pushover => {
                     // 简化: 复用 Slack 路径 (HTTPS POST + JSON)
                     match self.send_to_slack(content).await {
                         Ok(_) => success_count += 1,
-                        Ok(false) => { error!("[Pushover] 发送失败"); fail_count += 1; }
-                        Err(e) => { error!("[Pushover] 发送出错: {}", e); fail_count += 1; }
+                        Ok(false) => {
+                            error!("[Pushover] 发送失败");
+                            fail_count += 1;
+                        }
+                        Err(e) => {
+                            error!("[Pushover] 发送出错: {}", e);
+                            fail_count += 1;
+                        }
                     }
                 }
                 NotificationChannel::Custom => {
@@ -228,8 +249,14 @@ impl NotificationService {
                         let body = serde_json::json!({ "content": content });
                         match self.client.post(url).json(&body).send().await {
                             Ok(r) if r.status().is_success() => success_count += 1,
-                            Ok(r) => { log::warn!("[Custom] {} 推送失败: HTTP {}", url, r.status()); fail_count += 1; }
-                            Err(e) => { log::warn!("[Custom] {} 出错: {}", url, e); fail_count += 1; }
+                            Ok(r) => {
+                                log::warn!("[Custom] {} 推送失败: HTTP {}", url, r.status());
+                                fail_count += 1;
+                            }
+                            Err(e) => {
+                                log::warn!("[Custom] {} 出错: {}", url, e);
+                                fail_count += 1;
+                            }
                         }
                     }
                     if self.config.custom_webhook_urls.is_empty() {
@@ -239,7 +266,10 @@ impl NotificationService {
             }
         }
 
-        info!("通知发送完成：成功 {} 个，失败 {} 个", success_count, fail_count);
+        info!(
+            "通知发送完成：成功 {} 个，失败 {} 个",
+            success_count, fail_count
+        );
         Ok(success_count > 0)
     }
 
@@ -278,20 +308,16 @@ impl NotificationService {
                     // 其他渠道暂时降级为文本发送
                     warn!("渠道 {} 暂不支持图片，降级为文本发送", channel.name());
                     match channel {
-                        NotificationChannel::Wechat => {
-                            match self.send_to_wechat(content).await {
-                                Ok(true) => success_count += 1,
-                                Ok(false) => fail_count += 1,
-                                Err(_) => fail_count += 1,
-                            }
-                        }
-                        NotificationChannel::Feishu => {
-                            match self.send_to_feishu(content).await {
-                                Ok(true) => success_count += 1,
-                                Ok(false) => fail_count += 1,
-                                Err(_) => fail_count += 1,
-                            }
-                        }
+                        NotificationChannel::Wechat => match self.send_to_wechat(content).await {
+                            Ok(true) => success_count += 1,
+                            Ok(false) => fail_count += 1,
+                            Err(_) => fail_count += 1,
+                        },
+                        NotificationChannel::Feishu => match self.send_to_feishu(content).await {
+                            Ok(true) => success_count += 1,
+                            Ok(false) => fail_count += 1,
+                            Err(_) => fail_count += 1,
+                        },
                         _ => {
                             warn!("渠道 {} 暂未实现", channel.name());
                             fail_count += 1;
@@ -301,7 +327,10 @@ impl NotificationService {
             }
         }
 
-        info!("通知发送完成：成功 {} 个，失败 {} 个", success_count, fail_count);
+        info!(
+            "通知发送完成：成功 {} 个，失败 {} 个",
+            success_count, fail_count
+        );
         Ok(success_count > 0)
     }
 
@@ -342,7 +371,8 @@ impl NotificationService {
         let title = truncate(title, 32);
         let desp = truncate(content, 4096);
 
-        let resp = self.client
+        let resp = self
+            .client
             .post(&url)
             .form(&[("title", title.as_str()), ("desp", desp.as_str())])
             .send()
@@ -353,7 +383,11 @@ impl NotificationService {
         if status.is_success() && body.contains("\"code\":0") {
             Ok(true)
         } else {
-            log::warn!("[Server酱] 推送失败: HTTP {} body={}", status, truncate(&body, 200));
+            log::warn!(
+                "[Server酱] 推送失败: HTTP {} body={}",
+                status,
+                truncate(&body, 200)
+            );
             Ok(false)
         }
     }

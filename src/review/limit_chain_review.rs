@@ -9,10 +9,10 @@ use crate::opportunity::news_ranker::HeatStage;
 pub struct ChainLimitUpItem {
     pub chain: String,
     pub limit_up_count: usize,
-    pub first_limit_up: usize,        // 首板数
-    pub continuous: usize,            // 连板数
+    pub first_limit_up: usize, // 首板数
+    pub continuous: usize,     // 连板数
     pub leader_name: String,
-    pub leader_board_count: usize,    // 龙头板数
+    pub leader_board_count: usize, // 龙头板数
     pub stage: HeatStage,
     pub watch_point: String,
 }
@@ -29,7 +29,10 @@ pub struct FadeWarning {
 /// R-03 复盘渲染
 pub fn render_r03(items: &[ChainLimitUpItem], fade: &[FadeWarning]) -> String {
     let mut s = String::new();
-    s.push_str(&format!("🔥 涨停产业链（{}）\n", chrono::Local::now().format("%Y-%m-%d")));
+    s.push_str(&format!(
+        "🔥 涨停产业链（{}）\n",
+        chrono::Local::now().format("%Y-%m-%d")
+    ));
     for (i, it) in items.iter().enumerate() {
         s.push_str(&format!(
             "{}. {} 涨停{}家（首板{}/连板{}） 阶段: {}\n   龙头: {} {}板\n   明日观察: {}\n",
@@ -49,7 +52,10 @@ pub fn render_r03(items: &[ChainLimitUpItem], fade: &[FadeWarning]) -> String {
         for f in fade {
             s.push_str(&format!(
                 "{}（涨停{}→{}家, 资金流出{:.0}万）暂回避\n",
-                f.chain, f.prev_limit_up, f.today_limit_up, f.main_outflow / 1e4,
+                f.chain,
+                f.prev_limit_up,
+                f.today_limit_up,
+                f.main_outflow / 1e4,
             ));
         }
     }
@@ -100,7 +106,15 @@ mod tests {
 
     #[test]
     fn render_basic() {
-        let items = vec![build_chain_item("机器人".into(), 8, 3, 5, "XX科技".into(), 5, 5e7)];
+        let items = vec![build_chain_item(
+            "机器人".into(),
+            8,
+            3,
+            5,
+            "XX科技".into(),
+            5,
+            5e7,
+        )];
         let s = render_r03(&items, &[]);
         assert!(s.contains("机器人"));
         assert!(s.contains("涨停8家"));
@@ -109,7 +123,15 @@ mod tests {
 
     #[test]
     fn render_with_fade() {
-        let items = vec![build_chain_item("AI硬件".into(), 3, 2, 1, "YY".into(), 1, -3e7)];
+        let items = vec![build_chain_item(
+            "AI硬件".into(),
+            3,
+            2,
+            1,
+            "YY".into(),
+            1,
+            -3e7,
+        )];
         let fade = vec![FadeWarning {
             chain: "元宇宙".into(),
             prev_limit_up: 5,

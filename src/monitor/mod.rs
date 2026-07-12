@@ -13,23 +13,23 @@
 //! - checklist:      盘前/收盘总结
 //! - prediction:     预测追踪闭环
 
-pub mod data_quality;
-pub mod data_mode;  // v12 PR2-2.1
-pub mod rate_budget;
-pub mod scanner;
-pub mod detector;
-pub mod signal_state;
-pub mod auction;
-pub mod alert;
-pub mod risk;
-pub mod signal_fusion;
-pub mod checklist;
-pub mod prediction;
-pub mod attribution;  // v10 P1 G5a 异动即时归因 (规则快归因, P95 ≤ 2s)
 pub mod adaptive;
+pub mod alert;
 pub mod alert_log;
+pub mod attribution; // v10 P1 G5a 异动即时归因 (规则快归因, P95 ≤ 2s)
+pub mod auction;
+pub mod checklist;
+pub mod data_mode; // v12 PR2-2.1
+pub mod data_quality;
+pub mod detector;
 pub mod entity_linker;
-pub mod news_monitor;
-pub mod news_ai;
 pub mod event_bus;
 mod integration;
+pub mod news_ai;
+pub mod news_monitor;
+pub mod prediction;
+pub mod rate_budget;
+pub mod risk;
+pub mod scanner;
+pub mod signal_fusion;
+pub mod signal_state;

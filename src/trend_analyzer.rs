@@ -158,7 +158,7 @@ pub struct TrendAnalysisResult {
     pub signal_score: i32,
     pub signal_reasons: Vec<String>,
     pub risk_factors: Vec<String>,
-    
+
     // 风险调整后收益指标
     pub sharpe_ratio: Option<f64>,
 
@@ -239,10 +239,10 @@ pub struct StockData {
 /// 4. 买点识别 - 回踩 MA5/MA10 支撑
 pub struct StockTrendAnalyzer {
     // 交易参数配置
-    bias_threshold: f64,        // 乖离率阈值（%），超过此值不买入
-    volume_shrink_ratio: f64,   // 缩量判断阈值（当日量/5日均量）
-    volume_heavy_ratio: f64,    // 放量判断阈值
-    ma_support_tolerance: f64,  // MA 支撑判断容忍度（2%）
+    bias_threshold: f64,       // 乖离率阈值（%），超过此值不买入
+    volume_shrink_ratio: f64,  // 缩量判断阈值（当日量/5日均量）
+    volume_heavy_ratio: f64,   // 放量判断阈值
+    ma_support_tolerance: f64, // MA 支撑判断容忍度（2%）
 }
 
 impl Default for StockTrendAnalyzer {
@@ -297,7 +297,9 @@ impl StockTrendAnalyzer {
 
         if data.is_empty() || data.len() < 20 {
             warn!("{} 数据不足，无法进行趋势分析", code);
-            result.risk_factors.push("数据不足，无法完成分析".to_string());
+            result
+                .risk_factors
+                .push("数据不足，无法完成分析".to_string());
             return result;
         }
 
@@ -478,7 +480,7 @@ impl StockTrendAnalyzer {
         }
 
         let latest = &data[data.len() - 1];
-        
+
         // 计算5日均量
         let vol_5d_avg: f64 = data[data.len() - 6..data.len() - 1]
             .iter()
@@ -631,7 +633,7 @@ impl StockTrendAnalyzer {
             _ => {}
         }
 
-        // === 夏普比率评分（5分）=== 
+        // === 夏普比率评分（5分）===
         // 夏普比率衡量风险调整后收益，是重要的质量指标
         if let Some(sharpe) = result.sharpe_ratio {
             let sharpe_score = if sharpe >= 2.0 {
@@ -646,9 +648,9 @@ impl StockTrendAnalyzer {
                 // 负夏普比率，扣分
                 -2
             };
-            
+
             score += sharpe_score;
-            
+
             if sharpe >= 2.0 {
                 reasons.push(format!("✅ 夏普比率优秀({:.2}，风险调整后收益高)", sharpe));
             } else if sharpe >= 1.0 {
@@ -657,7 +659,7 @@ impl StockTrendAnalyzer {
                 risks.push(format!("⚠️ 夏普比率为负({:.2}，风险大于收益)", sharpe));
             }
         }
-        
+
         // === 支撑评分（10分）===
         if result.support_ma5 {
             score += 5;
@@ -728,8 +730,7 @@ impl StockTrendAnalyzer {
             && matches!(
                 result.trend_status,
                 TrendStatus::StrongBull | TrendStatus::Bull
-            )
-        {
+            ) {
             BuySignal::StrongBuy
         } else if score >= 65
             && matches!(
@@ -742,7 +743,10 @@ impl StockTrendAnalyzer {
             BuySignal::Hold
         } else if score >= 35 {
             BuySignal::Wait
-        } else if matches!(result.trend_status, TrendStatus::Bear | TrendStatus::StrongBear) {
+        } else if matches!(
+            result.trend_status,
+            TrendStatus::Bear | TrendStatus::StrongBear
+        ) {
             BuySignal::StrongSell
         } else {
             BuySignal::Sell
@@ -761,8 +765,14 @@ impl StockTrendAnalyzer {
             "📈 均线数据:".to_string(),
             format!("   现价: {:.2}", result.current_price),
             format!("   MA5:  {:.2} (乖离 {:+.2}%)", result.ma5, result.bias_ma5),
-            format!("   MA10: {:.2} (乖离 {:+.2}%)", result.ma10, result.bias_ma10),
-            format!("   MA20: {:.2} (乖离 {:+.2}%)", result.ma20, result.bias_ma20),
+            format!(
+                "   MA10: {:.2} (乖离 {:+.2}%)",
+                result.ma10, result.bias_ma10
+            ),
+            format!(
+                "   MA20: {:.2} (乖离 {:+.2}%)",
+                result.ma20, result.bias_ma20
+            ),
             String::new(),
             format!("📊 量能分析: {}", result.volume_status),
             format!("   量比(vs5日): {:.2}", result.volume_ratio_5d),
@@ -851,7 +861,7 @@ mod tests {
     #[test]
     fn test_bull_trend() {
         let mut data = create_test_data(60);
-        
+
         // 强制创建多头排列
         for item in data.iter_mut().rev().take(20) {
             item.ma5 = Some(item.close * 1.02);

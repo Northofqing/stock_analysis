@@ -92,11 +92,7 @@ pub fn load_history_at(path: &Path) -> Vec<BoardDay> {
         }
         match serde_json::from_str::<BoardDay>(&line) {
             Ok(b) => out.push(b),
-            Err(e) => log::warn!(
-                "[SECTOR_HISTORY] 第 {} 行解析失败: {:#} (跳过)",
-                i + 1,
-                e
-            ),
+            Err(e) => log::warn!("[SECTOR_HISTORY] 第 {} 行解析失败: {:#} (跳过)", i + 1, e),
         }
     }
     out
@@ -412,7 +408,11 @@ mod tests {
         write_jsonl(&path, &items).unwrap();
 
         let cum = cumulative_change_pct_at("BK0001", 3, &path).unwrap_or(f64::NAN);
-        assert!((cum - 6.0).abs() < 1e-6, "3 日累计 = 1+2+3 = 6, got {}", cum);
+        assert!(
+            (cum - 6.0).abs() < 1e-6,
+            "3 日累计 = 1+2+3 = 6, got {}",
+            cum
+        );
         let _ = fs::remove_file(&path);
     }
 

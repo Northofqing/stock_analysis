@@ -76,14 +76,14 @@ impl SearchResult {
             .as_ref()
             .map(|d| format!(" ({})", d))
             .unwrap_or_default();
-        
+
         let sentiment_icon = match self.sentiment {
             Sentiment::Positive => "📈",
             Sentiment::Negative => "📉",
             Sentiment::Neutral => "➡️",
             Sentiment::Unknown => "❓",
         };
-        
+
         let type_label = match self.news_type {
             NewsType::Announcement => "[公告]",
             NewsType::Earnings => "[财报]",
@@ -93,23 +93,23 @@ impl SearchResult {
             NewsType::Risk => "[风险]",
             NewsType::Other => "",
         };
-        
+
         let importance_stars = "★".repeat(self.importance.min(5) as usize);
-        
+
         format!(
             "【{}】{} {} {}{} {} (相关度:{:.0}%)\n{}\n关键词: {}",
-            self.source, 
+            self.source,
             sentiment_icon,
             type_label,
-            self.title, 
-            date_str, 
+            self.title,
+            date_str,
             importance_stars,
             self.relevance * 100.0,
             self.snippet,
             self.keywords.join(", ")
         )
     }
-    
+
     /// 创建默认的SearchResult
     pub fn new(title: String, snippet: String, url: String, source: String) -> Self {
         Self {
@@ -137,59 +137,108 @@ impl SearchResult {
     /// 分析并设置新闻类型
     pub fn analyze_type(&mut self) {
         let text = format!("{} {}", self.title, self.snippet).to_lowercase();
-        
+
         if text.contains("公告") || text.contains("披露") || text.contains("发布") {
             self.news_type = NewsType::Announcement;
-        } else if text.contains("财报") || text.contains("业绩") || text.contains("营收") 
-            || text.contains("利润") || text.contains("季报") || text.contains("年报") {
+        } else if text.contains("财报")
+            || text.contains("业绩")
+            || text.contains("营收")
+            || text.contains("利润")
+            || text.contains("季报")
+            || text.contains("年报")
+        {
             self.news_type = NewsType::Earnings;
-        } else if text.contains("政策") || text.contains("监管") || text.contains("证监会") 
-            || text.contains("交易所") {
+        } else if text.contains("政策")
+            || text.contains("监管")
+            || text.contains("证监会")
+            || text.contains("交易所")
+        {
             self.news_type = NewsType::Policy;
         } else if text.contains("行业") || text.contains("板块") || text.contains("赛道") {
             self.news_type = NewsType::Industry;
-        } else if text.contains("分析") || text.contains("研报") || text.contains("评级") 
-            || text.contains("研究") {
+        } else if text.contains("分析")
+            || text.contains("研报")
+            || text.contains("评级")
+            || text.contains("研究")
+        {
             self.news_type = NewsType::Analysis;
-        } else if text.contains("风险") || text.contains("警示") || text.contains("违规") 
-            || text.contains("调查") || text.contains("处罚") {
+        } else if text.contains("风险")
+            || text.contains("警示")
+            || text.contains("违规")
+            || text.contains("调查")
+            || text.contains("处罚")
+        {
             self.news_type = NewsType::Risk;
         }
     }
-    
+
     /// 分析并设置情感倾向
     pub fn analyze_sentiment(&mut self) {
         let text = format!("{} {}", self.title, self.snippet).to_lowercase();
-        
+
         // 利好关键词
         let positive_keywords = [
-            "涨", "上涨", "增长", "突破", "利好", "盈利", "增加", "提升", 
-            "创新高", "超预期", "中标", "合作", "签约", "订单", "扩产",
-            "收购", "增持", "买入", "推荐", "看好", "龙头"
+            "涨",
+            "上涨",
+            "增长",
+            "突破",
+            "利好",
+            "盈利",
+            "增加",
+            "提升",
+            "创新高",
+            "超预期",
+            "中标",
+            "合作",
+            "签约",
+            "订单",
+            "扩产",
+            "收购",
+            "增持",
+            "买入",
+            "推荐",
+            "看好",
+            "龙头",
         ];
-        
+
         // 利空关键词
         let negative_keywords = [
-            "跌", "下跌", "下滑", "亏损", "利空", "风险", "警示", "违规",
-            "处罚", "调查", "减持", "卖出", "业绩预警", "商誉减值",
-            "诉讼", "质押", "停牌", "ST", "退市"
+            "跌",
+            "下跌",
+            "下滑",
+            "亏损",
+            "利空",
+            "风险",
+            "警示",
+            "违规",
+            "处罚",
+            "调查",
+            "减持",
+            "卖出",
+            "业绩预警",
+            "商誉减值",
+            "诉讼",
+            "质押",
+            "停牌",
+            "ST",
+            "退市",
         ];
-        
+
         let mut positive_count = 0;
         let mut negative_count = 0;
-        
+
         for keyword in &positive_keywords {
             if text.contains(keyword) {
                 positive_count += 1;
             }
         }
-        
+
         for keyword in &negative_keywords {
             if text.contains(keyword) {
                 negative_count += 1;
             }
         }
-        
+
         if positive_count > negative_count && positive_count > 0 {
             self.sentiment = Sentiment::Positive;
         } else if negative_count > positive_count && negative_count > 0 {
@@ -200,12 +249,12 @@ impl SearchResult {
             self.sentiment = Sentiment::Unknown;
         }
     }
-    
+
     /// 计算重要性评分
     pub fn calculate_importance(&mut self) {
         let text = format!("{} {}", self.title, self.snippet).to_lowercase();
         let mut score = 5u8; // 基础分5分
-        
+
         // 根据新闻类型调整
         match self.news_type {
             NewsType::Announcement => score += 2,
@@ -214,40 +263,38 @@ impl SearchResult {
             NewsType::Policy => score += 2,
             _ => {}
         }
-        
+
         // 关键词加分
         let important_keywords = [
-            "重大", "重要", "紧急", "突发", "独家", "首次",
-            "涨停", "跌停", "停牌", "复牌"
+            "重大", "重要", "紧急", "突发", "独家", "首次", "涨停", "跌停", "停牌", "复牌",
         ];
-        
+
         for keyword in &important_keywords {
             if text.contains(keyword) {
                 score = score.saturating_add(1);
             }
         }
-        
+
         self.importance = score.min(10);
     }
-    
+
     /// 提取关键词
     pub fn extract_keywords(&mut self, stock_name: &str, stock_code: &str) {
         let text = format!("{} {}", self.title, self.snippet);
         let mut keywords = Vec::new();
-        
+
         // 常见股票相关关键词
         let patterns = [
-            "涨停", "跌停", "增长", "下滑", "业绩", "财报", "营收", "利润",
-            "市值", "股价", "研发", "创新", "合作", "订单", "中标",
-            "政策", "监管", "风险", "违规", "重组", "并购"
+            "涨停", "跌停", "增长", "下滑", "业绩", "财报", "营收", "利润", "市值", "股价", "研发",
+            "创新", "合作", "订单", "中标", "政策", "监管", "风险", "违规", "重组", "并购",
         ];
-        
+
         for pattern in &patterns {
             if text.contains(pattern) {
                 keywords.push(pattern.to_string());
             }
         }
-        
+
         // 添加股票名称和代码
         if text.contains(stock_name) {
             keywords.insert(0, stock_name.to_string());
@@ -255,7 +302,7 @@ impl SearchResult {
         if text.contains(stock_code) {
             keywords.insert(0, stock_code.to_string());
         }
-        
+
         self.keywords = keywords;
     }
 }
@@ -334,6 +381,14 @@ pub trait SearchProvider: Send + Sync {
     /// 检查是否有可用的 API Key
     fn is_available(&self) -> bool;
 
+    /// 是否支持"主题词/自然语言"搜索.
+    /// false = 该 provider 只能按股票代码/公告检索 (如交易所/巨潮), 主题搜索时应排除,
+    ///          避免对宽泛主题词反复报"需提供代码/空结果"噪声.
+    /// BR-036: 主题搜索能力位过滤规则.
+    fn supports_topic_search(&self) -> bool {
+        true
+    }
+
     /// 执行搜索
     async fn search(&self, query: &str, max_results: usize) -> SearchResponse;
 }
@@ -404,7 +459,11 @@ impl ApiKeyManager {
     pub(crate) fn record_error(&mut self, key: &str) {
         *self.error_count.entry(key.to_string()).or_insert(0) += 1;
         let error_count = self.error_count.get(key).unwrap_or(&0);
-        warn!("API Key {}... 错误计数: {}", &key[..8.min(key.len())], error_count);
+        warn!(
+            "API Key {}... 错误计数: {}",
+            &key[..8.min(key.len())],
+            error_count
+        );
     }
 }
 
@@ -489,7 +548,6 @@ where
     response
 }
 
-
 // ============================================================================
 // 共享工具函数
 // ============================================================================
@@ -497,10 +555,7 @@ where
 /// 从 URL 提取域名作为来源（原 search_service.rs 中的 extract_domain）
 pub(crate) fn extract_domain(url: &str) -> String {
     match url::Url::parse(url) {
-        Ok(parsed) => parsed
-            .host_str()
-            .unwrap_or("未知来源")
-            .replace("www.", ""),
+        Ok(parsed) => parsed.host_str().unwrap_or("未知来源").replace("www.", ""),
         Err(_) => "未知来源".to_string(),
     }
 }

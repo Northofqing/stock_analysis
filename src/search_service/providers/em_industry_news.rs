@@ -172,7 +172,10 @@ impl EmIndustryNewsProvider {
 
             let art_code = a.code.unwrap_or_default();
             let url = if art_code.is_empty() {
-                format!("https://so.eastmoney.com/web/s?keyword={}", urlencode(keyword))
+                format!(
+                    "https://so.eastmoney.com/web/s?keyword={}",
+                    urlencode(keyword)
+                )
             } else {
                 format!("https://so.eastmoney.com/news/detail/{}", art_code)
             };
@@ -215,14 +218,16 @@ impl EmIndustryNewsProvider {
     ///
     /// - `per_keyword_limit`: 每个行业取最新 N 条
     /// - 返回合并后按时间排序（最新在前）
-    pub async fn fetch_all_industries(
-        &self,
-        per_keyword_limit: usize,
-    ) -> Vec<SearchResult> {
+    pub async fn fetch_all_industries(&self, per_keyword_limit: usize) -> Vec<SearchResult> {
         // 10 个行业并发
         let futures: Vec<_> = INDUSTRY_KEYWORDS
             .iter()
-            .map(|(kw, _)| async move { (kw.to_string(), self.fetch_by_keyword(kw, per_keyword_limit).await) })
+            .map(|(kw, _)| async move {
+                (
+                    kw.to_string(),
+                    self.fetch_by_keyword(kw, per_keyword_limit).await,
+                )
+            })
             .collect();
 
         let results = futures::future::join_all(futures).await;
@@ -263,19 +268,10 @@ fn urlencode(s: &str) -> String {
     out
 }
 
-/// 简单 HTML 标签剥离（处理 <em>关键词</em> 这种高亮）
+/// CR-9 (review): 改用 crate::util::strip_html_tags, 去掉本地重复实现.
+/// 注: util 版本不 trim(), 调用方需要 trim 时显式调 .trim().
 fn strip_html_tags(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut in_tag = false;
-    for c in s.chars() {
-        match c {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(c),
-            _ => {}
-        }
-    }
-    out.trim().to_string()
+    crate::util::strip_html_tags(s).trim().to_string()
 }
 
 #[async_trait]

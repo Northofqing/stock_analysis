@@ -10,16 +10,16 @@ use chrono::Local;
 pub struct LhbTop5Item {
     pub code: String,
     pub name: String,
-    pub net_buy_yi: f64,             // 净买 (亿元)
-    pub reason: String,                // 上榜原因
-    pub buy_seats_inst: u32,           // 买方机构席位数
+    pub net_buy_yi: f64,     // 净买 (亿元)
+    pub reason: String,      // 上榜原因
+    pub buy_seats_inst: u32, // 买方机构席位数
     pub buy_seats_inst_amt_wan: f64,
     pub buy_seats_other: u32,
     pub buy_seats_other_amt_wan: f64,
-    pub buy_concentration_pct: f64,    // 集中度
+    pub buy_concentration_pct: f64, // 集中度
     pub sell_concentration_pct: f64,
-    pub chain_match: bool,             // 主线一致
-    pub next_day_risk: String,         // 次日风险
+    pub chain_match: bool,     // 主线一致
+    pub next_day_risk: String, // 次日风险
 }
 
 /// 禁关键词黑名单 (personality label)
@@ -33,7 +33,10 @@ pub fn has_banned_label(text: &str) -> bool {
 /// R-04 渲染 (21:00 推)
 pub fn render_r04(items: &[LhbTop5Item]) -> String {
     let mut s = String::new();
-    s.push_str(&format!("🐉 龙虎榜净买前五（{} 21:00）\n", Local::now().format("%Y-%m-%d")));
+    s.push_str(&format!(
+        "🐉 龙虎榜净买前五（{} 21:00）\n",
+        Local::now().format("%Y-%m-%d")
+    ));
     for (i, it) in items.iter().enumerate() {
         s.push_str(&format!(
             "{}. {}({}) 净买{:.1}亿 | {}\n   买: 机构{}席{:.0}万 其他{}席{:.0}万（集中度{:.0}%）\n   卖: 集中度{:.0}%\n   主线一致: {}\n   次日风险: {}\n─────\n",

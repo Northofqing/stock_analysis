@@ -37,10 +37,10 @@ impl PlanAction {
 /// 单预案
 #[derive(Clone, Debug)]
 pub struct ScenarioPlan {
-    pub name: &'static str, // "高开"/"平开"/"低开"
+    pub name: &'static str,     // "高开"/"平开"/"低开"
     pub gap_threshold_pct: f64, // 高开阈值 (例如 +2.0 表示 >2% 高开)
     pub action: PlanAction,
-    pub rationale: String, // 预案理由 (人类可读)
+    pub rationale: String,   // 预案理由 (人类可读)
     pub data_degraded: bool, // 数据缺失降级标记
 }
 

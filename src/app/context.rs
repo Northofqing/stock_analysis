@@ -4,8 +4,8 @@
 //! 渐进迁移策略：新增代码通过 AppContext 访问服务；
 //! 旧代码仍通过全局 OnceCell 访问，逐步迁移。
 
-use std::sync::Arc;
 use anyhow::Result;
+use std::sync::Arc;
 use stock_analysis::analyzer::GeminiAnalyzer;
 use stock_analysis::config;
 use stock_analysis::pipeline::PipelineConfig;
@@ -19,7 +19,8 @@ pub struct AppContext {
 impl AppContext {
     /// 初始化应用上下文。数据库和搜索服务仍通过全局单例访问（渐进迁移）。
     pub fn init(pipeline_config: PipelineConfig) -> Result<Self> {
-        let ai_analyzer = std::env::var("GEMINI_API_KEY").ok()
+        let ai_analyzer = std::env::var("GEMINI_API_KEY")
+            .ok()
             .filter(|k| !k.is_empty())
             .map(|_| Arc::new(GeminiAnalyzer::from_env()));
 

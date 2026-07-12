@@ -56,45 +56,40 @@ pub(super) fn compute_rsi_wilder(closes: &[f64], period: usize) -> Vec<f64> {
 /// 注意：此函数使用 rolling_mean（SMA 版），仅供 PrecisionRsiBacktest 使用
 pub(super) fn build_rsi_lazy(lf: LazyFrame, period: usize, close_col: &str) -> LazyFrame {
     let alias = format!("rsi_{}", period);
-    lf.with_columns([
-        (col(close_col) - col(close_col).shift(lit(1))).alias("_delta")
-    ])
-    .with_columns([
-        when(col("_delta").gt(lit(0.0f64)))
-            .then(col("_delta"))
-            .otherwise(lit(0.0f64))
-            .alias("_gain"),
-        when(col("_delta").lt(lit(0.0f64)))
-            .then(lit(0.0f64) - col("_delta"))
-            .otherwise(lit(0.0f64))
-            .alias("_loss"),
-    ])
-    .with_columns([
-        col("_gain")
-            .rolling_mean(RollingOptionsFixedWindow {
-                window_size: period,
-                min_periods: period,
-                ..Default::default()
-            })
-            .alias("_avg_gain"),
-        col("_loss")
-            .rolling_mean(RollingOptionsFixedWindow {
-                window_size: period,
-                min_periods: period,
-                ..Default::default()
-            })
-            .alias("_avg_loss"),
-    ])
-    .with_columns([
-        when(col("_avg_loss").eq(lit(0.0f64)))
+    lf.with_columns([(col(close_col) - col(close_col).shift(lit(1))).alias("_delta")])
+        .with_columns([
+            when(col("_delta").gt(lit(0.0f64)))
+                .then(col("_delta"))
+                .otherwise(lit(0.0f64))
+                .alias("_gain"),
+            when(col("_delta").lt(lit(0.0f64)))
+                .then(lit(0.0f64) - col("_delta"))
+                .otherwise(lit(0.0f64))
+                .alias("_loss"),
+        ])
+        .with_columns([
+            col("_gain")
+                .rolling_mean(RollingOptionsFixedWindow {
+                    window_size: period,
+                    min_periods: period,
+                    ..Default::default()
+                })
+                .alias("_avg_gain"),
+            col("_loss")
+                .rolling_mean(RollingOptionsFixedWindow {
+                    window_size: period,
+                    min_periods: period,
+                    ..Default::default()
+                })
+                .alias("_avg_loss"),
+        ])
+        .with_columns([when(col("_avg_loss").eq(lit(0.0f64)))
             .then(lit(100.0f64))
             .otherwise(
-                lit(100.0f64)
-                    - lit(100.0f64) / (lit(1.0f64) + col("_avg_gain") / col("_avg_loss")),
+                lit(100.0f64) - lit(100.0f64) / (lit(1.0f64) + col("_avg_gain") / col("_avg_loss")),
             )
-            .alias(alias),
-    ])
-    .drop(["_delta", "_gain", "_loss", "_avg_gain", "_avg_loss"])
+            .alias(alias)])
+        .drop(["_delta", "_gain", "_loss", "_avg_gain", "_avg_loss"])
 }
 
 // ────────────────────────────── 辅助指标计算（Vec 版） ──────────────────────────────

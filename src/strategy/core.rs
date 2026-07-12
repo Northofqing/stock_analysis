@@ -1,20 +1,20 @@
 use anyhow::Result;
 use chrono::{DateTime, Local};
 use log::info;
+use plotters::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use serde::{Serialize, Deserialize};
-use plotters::prelude::*;
 
 /// 持仓记录
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Position {
     pub code: String,
     pub name: String,
-    pub shares: f64,           // 持有数量
-    pub avg_price: f64,        // 平均成本
-    pub current_price: f64,    // 当前价格
-    pub market_value: f64,     // 市值
+    pub shares: f64,        // 持有数量
+    pub avg_price: f64,     // 平均成本
+    pub current_price: f64, // 当前价格
+    pub market_value: f64,  // 市值
 }
 
 impl Position {
@@ -79,14 +79,14 @@ pub struct BacktestConfig {
 impl Default for BacktestConfig {
     fn default() -> Self {
         Self {
-            initial_capital: 100_000.0,    // 10万初始资金
-            rebalance_days: 15,             // 15天调仓一次
-            position_count: 20,             // 持仓20只(扩展from 3)
-            commission_rate: 0.0003,        // 万三手续费
-            slippage_rate: 0.001,           // 千一滑点
-            stamp_tax_rate: 0.001,          // 千一印花税（仅卖出）
-            dynamic_slippage: false,        // 默认关闭, 量化分析师按需启用
-            dynamic_slippage_alpha: 0.1,    // 保守 α 系数
+            initial_capital: 100_000.0,  // 10万初始资金
+            rebalance_days: 15,          // 15天调仓一次
+            position_count: 20,          // 持仓20只(扩展from 3)
+            commission_rate: 0.0003,     // 万三手续费
+            slippage_rate: 0.001,        // 千一滑点
+            stamp_tax_rate: 0.001,       // 千一印花税（仅卖出）
+            dynamic_slippage: false,     // 默认关闭, 量化分析师按需启用
+            dynamic_slippage_alpha: 0.1, // 保守 α 系数
         }
     }
 }
@@ -94,11 +94,11 @@ impl Default for BacktestConfig {
 /// 回测状态
 #[derive(Debug, Clone)]
 pub struct BacktestState {
-    pub cash: f64,                                    // 现金
-    pub positions: HashMap<String, Position>,         // 持仓
-    pub trades: Vec<Trade>,                           // 交易记录
-    pub daily_values: Vec<(DateTime<Local>, f64)>,   // 每日市值
-    pub last_rebalance: Option<DateTime<Local>>,     // 上次调仓时间
+    pub cash: f64,                                 // 现金
+    pub positions: HashMap<String, Position>,      // 持仓
+    pub trades: Vec<Trade>,                        // 交易记录
+    pub daily_values: Vec<(DateTime<Local>, f64)>, // 每日市值
+    pub last_rebalance: Option<DateTime<Local>>,   // 上次调仓时间
 }
 
 impl BacktestState {
@@ -123,10 +123,10 @@ impl BacktestState {
         if self.daily_values.len() < 2 {
             return 0.0;
         }
-        
+
         let (_, initial_value) = self.daily_values.first().unwrap();
         let (_, final_value) = self.daily_values.last().unwrap();
-        
+
         if *initial_value > 0.0 {
             (final_value - initial_value) / initial_value
         } else {
@@ -164,7 +164,7 @@ impl BacktestState {
 
         let (first_date, first_value) = &self.daily_values[0];
         let (last_date, last_value) = self.daily_values.last().unwrap();
-        
+
         let days = (*last_date - *first_date).num_days() as f64;
         if days <= 0.0 || *first_value <= 0.0 {
             return 0.0;
@@ -243,7 +243,11 @@ impl BacktestState {
             .iter()
             .map(|r| {
                 let excess = r - daily_rf;
-                if excess < 0.0 { excess.powi(2) } else { 0.0 }
+                if excess < 0.0 {
+                    excess.powi(2)
+                } else {
+                    0.0
+                }
             })
             .sum::<f64>()
             / daily_returns.len() as f64;
@@ -322,8 +326,12 @@ impl BacktestState {
         // 限制: daily_values 没有时间点对应的 positions 快照, 这里用 BacktestEngine
         //       在回测过程中记录的 positions 历史 (如果有).
         //       简化: 用 last_known_positions_value 与 daily_values 的 ratio
-        let last_positions_value: f64 = self.positions.values().map(|p| p.shares * p.current_price).sum();
-        let last_total_value = self
+        let last_positions_value: f64 = self
+            .positions
+            .values()
+            .map(|p| p.shares * p.current_price)
+            .sum();
+        let _last_total_value = self
             .daily_values
             .last()
             .map(|(_, v)| *v)
@@ -335,8 +343,16 @@ impl BacktestState {
             // 这里用线性插值近似: 假设持仓价值在 daily_values 期间线性变化
             // 首日 holdings=0, 最后一日=last_positions_value
             let n = self.daily_values.len();
-            let pos = self.daily_values.iter().position(|(d, _)| d == dt).unwrap_or(0);
-            let linear_factor = if n > 1 { pos as f64 / (n - 1) as f64 } else { 0.0 };
+            let pos = self
+                .daily_values
+                .iter()
+                .position(|(d, _)| d == dt)
+                .unwrap_or(0);
+            let linear_factor = if n > 1 {
+                pos as f64 / (n - 1) as f64
+            } else {
+                0.0
+            };
             let estimated_position_value = last_positions_value * linear_factor;
             // exposure = estimated_position / total_value
             let exposure = if *total_value > 0.0 {
@@ -378,7 +394,10 @@ impl BacktestState {
         for i in 1..self.daily_values.len() {
             let (d_prev, v_prev) = &self.daily_values[i - 1];
             let (d_cur, v_cur) = &self.daily_values[i];
-            if let (Some(&bp), Some(&bc)) = (bench.closes.get(&d_prev.date_naive()), bench.closes.get(&d_cur.date_naive())) {
+            if let (Some(&bp), Some(&bc)) = (
+                bench.closes.get(&d_prev.date_naive()),
+                bench.closes.get(&d_cur.date_naive()),
+            ) {
                 if *v_prev > 0.0 && bp > 0.0 {
                     strat_rets.push((*v_cur - *v_prev) / *v_prev);
                     bench_rets.push((bc - bp) / bp);
@@ -483,13 +502,22 @@ impl BacktestEngine {
         log::debug!(
             "[P3.M1] 动态滑点框架已激活 (alpha={}, order={:.0}), \
              但 σ/ADV 数据接入留作扩展, 当前 fallback 固定 {}",
-            self.config.dynamic_slippage_alpha, order_value, self.config.slippage_rate
+            self.config.dynamic_slippage_alpha,
+            order_value,
+            self.config.slippage_rate
         );
         self.config.slippage_rate
     }
 
     /// 买入股票
-    pub fn buy(&mut self, code: &str, name: &str, price: f64, shares: f64, date: DateTime<Local>) -> Result<()> {
+    pub fn buy(
+        &mut self,
+        code: &str,
+        name: &str,
+        price: f64,
+        shares: f64,
+        date: DateTime<Local>,
+    ) -> Result<()> {
         // 修复 P3.M1: 动态滑点 (sqrt-rule) 替代固定 10bps
         // 之前: 滑点 = self.config.slippage_rate (10bps, 不分市值/波动率)
         // 现在: 如果 dynamic_slippage=true, 滑点 = α × σ_daily × sqrt(order_value / ADV)
@@ -511,14 +539,18 @@ impl BacktestEngine {
         self.state.cash -= total_cost;
 
         // 更新持仓
-        let position = self.state.positions.entry(code.to_string()).or_insert(Position {
-            code: code.to_string(),
-            name: name.to_string(),
-            shares: 0.0,
-            avg_price: 0.0,
-            current_price: price,
-            market_value: 0.0,
-        });
+        let position = self
+            .state
+            .positions
+            .entry(code.to_string())
+            .or_insert(Position {
+                code: code.to_string(),
+                name: name.to_string(),
+                shares: 0.0,
+                avg_price: 0.0,
+                current_price: price,
+                market_value: 0.0,
+            });
 
         // 更新平均成本
         let old_value = position.avg_price * position.shares;
@@ -678,10 +710,19 @@ impl BacktestEngine {
     }
 
     /// 卖出股票
-    pub fn sell(&mut self, code: &str, shares: f64, price: f64, date: DateTime<Local>) -> Result<()> {
+    pub fn sell(
+        &mut self,
+        code: &str,
+        shares: f64,
+        price: f64,
+        date: DateTime<Local>,
+    ) -> Result<()> {
         // 修复 P3.M1: 先算滑点 (imm borrow), 再 mut borrow positions
         let slippage_rate = self.compute_dynamic_slippage(code, price * shares);
-        let position = self.state.positions.get_mut(code)
+        let position = self
+            .state
+            .positions
+            .get_mut(code)
             .ok_or_else(|| anyhow::anyhow!("没有持仓"))?;
 
         if shares > position.shares {
@@ -695,7 +736,7 @@ impl BacktestEngine {
 
         self.state.cash += proceeds;
         position.shares -= shares;
-        
+
         // 记录交易
         self.state.trades.push(Trade {
             date,
@@ -741,8 +782,12 @@ impl BacktestEngine {
         date: DateTime<Local>,
     ) -> Result<()> {
         // 1. 卖出不在目标列表的股票
-        let target_codes: HashSet<&str> = target_stocks.iter().map(|(c, _, _)| c.as_str()).collect();
-        let to_sell: Vec<String> = self.state.positions.keys()
+        let target_codes: HashSet<&str> =
+            target_stocks.iter().map(|(c, _, _)| c.as_str()).collect();
+        let to_sell: Vec<String> = self
+            .state
+            .positions
+            .keys()
             .filter(|code| !target_codes.contains(code.as_str()))
             .cloned()
             .collect();
@@ -762,14 +807,18 @@ impl BacktestEngine {
         // 3. 买入目标股票
         for (code, name, price) in target_stocks {
             // 如果已有持仓，计算需要补足的金额
-            let current_value = self.state.positions.get(code)
+            let current_value = self
+                .state
+                .positions
+                .get(code)
                 .map(|p| p.market_value)
                 .unwrap_or(0.0);
-            
+
             let target_value = per_stock_value;
             let diff_value = target_value - current_value;
 
-            if diff_value > 100.0 {  // 差额大于100元才交易
+            if diff_value > 100.0 {
+                // 差额大于100元才交易
                 let shares = (diff_value / price).floor();
                 if shares > 0.0 {
                     let _ = self.buy(code, name, *price, shares, date);
@@ -806,20 +855,20 @@ pub struct BacktestSummary {
     pub annual_return: f64,
     pub max_drawdown: f64,
     pub sharpe_ratio: f64,
-    pub sortino_ratio: f64,            // NEW: Sortino比率
-    pub calmar_ratio: f64,             // NEW: Calmar比率
-    pub average_exposure: f64,         // NEW: 平均仓位
+    pub sortino_ratio: f64,    // NEW: Sortino比率
+    pub calmar_ratio: f64,     // NEW: Calmar比率
+    pub average_exposure: f64, // NEW: 平均仓位
     pub total_trades: usize,
     pub win_rate: f64,
-    pub chart_path: Option<String>,  // 图表路径
-    pub benchmark_annual_return: Option<f64>,  // NEW: 基准年化收益(真实指数, 缺失则 None)
-    pub alpha: Option<f64>,            // NEW: CAPM Alpha(年化, 相对真实基准)
-    pub benchmark_name: Option<String>,   // NEW: 基准名称(如 沪深300)
-    pub benchmark_total_return: Option<f64>, // NEW: 同期基准区间收益
-    pub excess_return: Option<f64>,    // NEW: 年化超额(策略年化-基准年化)
-    pub beta: Option<f64>,             // NEW: 相对基准的 beta
-    pub information_ratio: Option<f64>, // NEW: 信息比率(年化超额/跟踪误差)
-    pub max_dd_duration_days: i64,     // NEW: 最长回撤恢复期(自然日)
+    pub chart_path: Option<String>,           // 图表路径
+    pub benchmark_annual_return: Option<f64>, // NEW: 基准年化收益(真实指数, 缺失则 None)
+    pub alpha: Option<f64>,                   // NEW: CAPM Alpha(年化, 相对真实基准)
+    pub benchmark_name: Option<String>,       // NEW: 基准名称(如 沪深300)
+    pub benchmark_total_return: Option<f64>,  // NEW: 同期基准区间收益
+    pub excess_return: Option<f64>,           // NEW: 年化超额(策略年化-基准年化)
+    pub beta: Option<f64>,                    // NEW: 相对基准的 beta
+    pub information_ratio: Option<f64>,       // NEW: 信息比率(年化超额/跟踪误差)
+    pub max_dd_duration_days: i64,            // NEW: 最长回撤恢复期(自然日)
 }
 
 /// 真实基准日线序列（用于计算超额收益 / Alpha / Beta / 信息比率）。
@@ -834,7 +883,10 @@ pub struct BenchmarkSeries {
 
 impl BenchmarkSeries {
     pub fn new(name: impl Into<String>, closes: HashMap<chrono::NaiveDate, f64>) -> Self {
-        Self { name: name.into(), closes }
+        Self {
+            name: name.into(),
+            closes,
+        }
     }
 }
 
@@ -846,14 +898,14 @@ impl BenchmarkSeries {
 /// - 创业板策略: 创业板指 (sz399006)
 /// - 科创板策略: 科创50 (sh000688)
 pub mod benchmark_codes {
-    pub const HS300: &str = "sh000300";      // 沪深300
-    pub const ZZ500: &str = "sh000905";      // 中证500
-    pub const ZZ1000: &str = "sh000852";     // 中证1000
-    pub const GZ2000: &str = "sz399303";     // 国证2000
-    pub const CHINEXT: &str = "sz399006";    // 创业板指
-    pub const STAR50: &str = "sh000688";     // 科创50
-    pub const SH_COMP: &str = "sh000001";    // 上证指数
-    pub const SZ_COMP: &str = "sz399001";    // 深证成指
+    pub const HS300: &str = "sh000300"; // 沪深300
+    pub const ZZ500: &str = "sh000905"; // 中证500
+    pub const ZZ1000: &str = "sh000852"; // 中证1000
+    pub const GZ2000: &str = "sz399303"; // 国证2000
+    pub const CHINEXT: &str = "sz399006"; // 创业板指
+    pub const STAR50: &str = "sh000688"; // 科创50
+    pub const SH_COMP: &str = "sh000001"; // 上证指数
+    pub const SZ_COMP: &str = "sz399001"; // 深证成指
 
     /// 根据策略类型推荐基准
     pub fn recommend_for_strategy(strategy_kind: &str) -> &'static str {
@@ -900,9 +952,9 @@ pub struct RegimeStats {
 /// 分市场状态回测拆解报告。
 #[derive(Debug, Clone)]
 pub struct RegimeReport {
-    pub window: usize,        // 趋势判定窗口（交易日）
-    pub bull_threshold: f64,  // 牛市阈值（窗口涨幅）
-    pub bear_threshold: f64,  // 熊市阈值（窗口跌幅）
+    pub window: usize,       // 趋势判定窗口（交易日）
+    pub bull_threshold: f64, // 牛市阈值（窗口涨幅）
+    pub bear_threshold: f64, // 熊市阈值（窗口跌幅）
     pub stats: Vec<RegimeStats>,
 }
 
@@ -1003,26 +1055,29 @@ pub fn regime_breakdown(
     // 含义: 策略在不同市场状态下的风险调整后收益
     // 牛市: 策略是否跟涨? 熊市: 策略是否抗跌? 震荡: 策略是否稳定?
     let rf = 0.025; // 修复 P1.2: 与 sharpe_calculator 统一
-    let regime_sharpes: Vec<f64> = acc.iter().map(|acc_item| {
-        let days = acc_item.0;
-        let sf = acc_item.1;
-        // 累计收益 → 平均日收益近似
-        if sf > 0.0 && days > 1 {
-            let total = sf.ln();
-            let daily_mean = total / days as f64;
-            // 简化: 用 up_day_rate 推日波动率 (实际需 daily series, 留作扩展)
-            let daily_std = (sf - 1.0).abs() / (days as f64).sqrt() * 0.5;
-            if daily_std > 0.0 {
-                let ann_ret = daily_mean * 252.0;
-                let ann_std = daily_std * (252.0_f64).sqrt();
-                (ann_ret - rf) / ann_std
+    let regime_sharpes: Vec<f64> = acc
+        .iter()
+        .map(|acc_item| {
+            let days = acc_item.0;
+            let sf = acc_item.1;
+            // 累计收益 → 平均日收益近似
+            if sf > 0.0 && days > 1 {
+                let total = sf.ln();
+                let daily_mean = total / days as f64;
+                // 简化: 用 up_day_rate 推日波动率 (实际需 daily series, 留作扩展)
+                let daily_std = (sf - 1.0).abs() / (days as f64).sqrt() * 0.5;
+                if daily_std > 0.0 {
+                    let ann_ret = daily_mean * 252.0;
+                    let ann_std = daily_std * (252.0_f64).sqrt();
+                    (ann_ret - rf) / ann_std
+                } else {
+                    0.0
+                }
             } else {
                 0.0
             }
-        } else {
-            0.0
-        }
-    }).collect();
+        })
+        .collect();
 
     // 把 regime_sharpe 写进 stats (借用 notes 或加字段)
     // 简化: 把 sharpe 加到 stats[].strat_return 旁边 (这里直接扩 RegimeStats)
@@ -1059,10 +1114,10 @@ pub struct BenchmarkMetrics {
 #[derive(Debug, Clone)]
 pub struct WalkForwardFold {
     pub fold: usize,
-    pub train_label: String,   // 训练区间（样本内）
-    pub test_label: String,    // 测试区间（样本外）
-    pub chosen_param: String,  // 训练段选出的最优参数标签
-    pub test_return: f64,      // 该参数在测试段的总收益
+    pub train_label: String,  // 训练区间（样本内）
+    pub test_label: String,   // 测试区间（样本外）
+    pub chosen_param: String, // 训练段选出的最优参数标签
+    pub test_return: f64,     // 该参数在测试段的总收益
     pub test_sharpe: f64,
     pub test_trades: usize,
 }
@@ -1115,7 +1170,9 @@ impl BacktestSummary {
         for trade in &state.trades {
             match trade.action {
                 TradeAction::Buy => {
-                    let entry = positions_closed.entry(trade.code.clone()).or_insert((0.0, 0.0));
+                    let entry = positions_closed
+                        .entry(trade.code.clone())
+                        .or_insert((0.0, 0.0));
                     let old_value = entry.0 * entry.1;
                     entry.1 += trade.shares;
                     entry.0 = (old_value + trade.amount) / entry.1;
@@ -1143,7 +1200,8 @@ impl BacktestSummary {
         };
 
         // ── 真实基准对标（缺失时全部 None，不伪造） ──
-        let bench = benchmark.and_then(|b| state.benchmark_metrics(b, annual_return, risk_free_rate));
+        let bench =
+            benchmark.and_then(|b| state.benchmark_metrics(b, annual_return, risk_free_rate));
         let (
             benchmark_name,
             benchmark_annual_return,
@@ -1197,30 +1255,45 @@ impl BacktestSummary {
     /// 生成回测净值曲线图表（三 panel：净值+买卖点 / Drawdown / 指标）
     pub fn generate_chart(&self, state: &BacktestState, output_path: &str) -> Result<PathBuf> {
         let path_buf = PathBuf::from(output_path);
-        
+
         if state.daily_values.is_empty() {
             return Err(anyhow::anyhow!("No daily values to plot"));
         }
 
         // 计算净值曲线（归一化为1开始）
         let initial_value = state.daily_values[0].1;
-        let net_values: Vec<_> = state.daily_values.iter()
+        let net_values: Vec<_> = state
+            .daily_values
+            .iter()
             .map(|(date, value)| (*date, *value / initial_value))
             .collect();
 
         // 计算 drawdown 序列：dd[i] = (cur - peak_so_far) / peak_so_far，单位为百分数
         let mut peak = f64::NEG_INFINITY;
-        let drawdowns: Vec<(DateTime<Local>, f64)> = net_values.iter()
+        let drawdowns: Vec<(DateTime<Local>, f64)> = net_values
+            .iter()
             .map(|(d, v)| {
-                if *v > peak { peak = *v; }
-                let dd = if peak > 0.0 { (*v - peak) / peak * 100.0 } else { 0.0 };
+                if *v > peak {
+                    peak = *v;
+                }
+                let dd = if peak > 0.0 {
+                    (*v - peak) / peak * 100.0
+                } else {
+                    0.0
+                };
                 (*d, dd)
             })
             .collect();
 
         // 找出净值最大最小值
-        let min_value = net_values.iter().map(|(_, v)| *v).fold(f64::INFINITY, f64::min);
-        let max_value = net_values.iter().map(|(_, v)| *v).fold(f64::NEG_INFINITY, f64::max);
+        let min_value = net_values
+            .iter()
+            .map(|(_, v)| *v)
+            .fold(f64::INFINITY, f64::min);
+        let max_value = net_values
+            .iter()
+            .map(|(_, v)| *v)
+            .fold(f64::NEG_INFINITY, f64::max);
 
         {
             let root = BitMapBackend::new(output_path, (1400, 1100)).into_drawing_area();
@@ -1230,13 +1303,20 @@ impl BacktestSummary {
             let (top, rest) = root.split_vertically(550);
             let (middle, bottom) = rest.split_vertically(275);
 
-            Self::draw_net_value_curve_with_trades(&top, &net_values, min_value, max_value, &state.trades, initial_value)?;
+            Self::draw_net_value_curve_with_trades(
+                &top,
+                &net_values,
+                min_value,
+                max_value,
+                &state.trades,
+                initial_value,
+            )?;
             Self::draw_drawdown_curve(&middle, &drawdowns, self.max_drawdown)?;
             Self::draw_backtest_metrics(&bottom, self)?;
 
             root.present()?;
         }
-        
+
         Ok(path_buf)
     }
 
@@ -1260,7 +1340,10 @@ impl BacktestSummary {
         let y_max = max_value * 1.05;
 
         let mut chart = ChartBuilder::on(area)
-            .caption("净值曲线 & 买卖点", ("sans-serif", 32).into_font().color(&BLACK))
+            .caption(
+                "净值曲线 & 买卖点",
+                ("sans-serif", 32).into_font().color(&BLACK),
+            )
             .margin(15)
             .x_label_area_size(40)
             .y_label_area_size(70)
@@ -1277,20 +1360,22 @@ impl BacktestSummary {
             .draw()?;
 
         // 净值线
-        chart.draw_series(LineSeries::new(
-            net_values.iter().map(|(date, value)| (*date, *value)),
-            BLUE.mix(0.85).stroke_width(2),
-        ))?
-        .label("净值")
-        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLUE));
+        chart
+            .draw_series(LineSeries::new(
+                net_values.iter().map(|(date, value)| (*date, *value)),
+                BLUE.mix(0.85).stroke_width(2),
+            ))?
+            .label("净值")
+            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLUE));
 
         // 基准线
-        chart.draw_series(LineSeries::new(
-            vec![(first_date, 1.0), (last_date, 1.0)],
-            RED.mix(0.5).stroke_width(1),
-        ))?
-        .label("基准 (1.0)")
-        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &RED));
+        chart
+            .draw_series(LineSeries::new(
+                vec![(first_date, 1.0), (last_date, 1.0)],
+                RED.mix(0.5).stroke_width(1),
+            ))?
+            .label("基准 (1.0)")
+            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &RED));
 
         // 买卖点：将 trade.date 上当日的净值作为标记 y
         // 用 daily_values 做 O(N+M) 的双指针查找
@@ -1317,21 +1402,28 @@ impl BacktestSummary {
         }
 
         if !buy_pts.is_empty() {
-            chart.draw_series(buy_pts.iter().map(|(d, v)| {
-                TriangleMarker::new((*d, *v), 6, GREEN.filled())
-            }))?
-            .label(format!("买入 ({})", buy_pts.len()))
-            .legend(|(x, y)| TriangleMarker::new((x + 10, y), 6, GREEN.filled()));
+            chart
+                .draw_series(
+                    buy_pts
+                        .iter()
+                        .map(|(d, v)| TriangleMarker::new((*d, *v), 6, GREEN.filled())),
+                )?
+                .label(format!("买入 ({})", buy_pts.len()))
+                .legend(|(x, y)| TriangleMarker::new((x + 10, y), 6, GREEN.filled()));
         }
         if !sell_pts.is_empty() {
-            chart.draw_series(sell_pts.iter().map(|(d, v)| {
-                Circle::new((*d, *v), 5, RED.filled())
-            }))?
-            .label(format!("卖出 ({})", sell_pts.len()))
-            .legend(|(x, y)| Circle::new((x + 10, y), 5, RED.filled()));
+            chart
+                .draw_series(
+                    sell_pts
+                        .iter()
+                        .map(|(d, v)| Circle::new((*d, *v), 5, RED.filled())),
+                )?
+                .label(format!("卖出 ({})", sell_pts.len()))
+                .legend(|(x, y)| Circle::new((x + 10, y), 5, RED.filled()));
         }
 
-        chart.configure_series_labels()
+        chart
+            .configure_series_labels()
             .position(SeriesLabelPosition::UpperLeft)
             .background_style(WHITE.mix(0.85))
             .border_style(BLACK)
@@ -1379,13 +1471,13 @@ impl BacktestSummary {
             .draw()?;
 
         // 区域填充：从 0 线到 dd 曲线
-        chart.draw_series(AreaSeries::new(
-            drawdowns.iter().map(|(d, v)| (*d, *v)),
-            0.0,
-            RED.mix(0.25),
-        ).border_style(RED.stroke_width(1)))?
-        .label("Drawdown")
-        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &RED));
+        chart
+            .draw_series(
+                AreaSeries::new(drawdowns.iter().map(|(d, v)| (*d, *v)), 0.0, RED.mix(0.25))
+                    .border_style(RED.stroke_width(1)),
+            )?
+            .label("Drawdown")
+            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &RED));
 
         // 0 基准线
         chart.draw_series(LineSeries::new(
@@ -1415,7 +1507,10 @@ impl BacktestSummary {
             ("初始资金", format!("¥{:.2}", summary.initial_capital)),
             ("最终市值", format!("¥{:.2}", summary.final_value)),
             ("总收益率", format!("{:+.2}%", summary.total_return * 100.0)),
-            ("年化收益率", format!("{:+.2}%", summary.annual_return * 100.0)),
+            (
+                "年化收益率",
+                format!("{:+.2}%", summary.annual_return * 100.0),
+            ),
             ("最大回撤", format!("{:.2}%", summary.max_drawdown * 100.0)),
             ("夏普比率", format!("{:.2}", summary.sharpe_ratio)),
             ("总交易次数", format!("{}", summary.total_trades)),
@@ -1495,7 +1590,12 @@ impl BacktestSummary {
     }
 
     /// 导出每日净值为CSV
-    pub fn export_daily_values_csv(&self, state: &BacktestState, output_path: &str, initial_capital: f64) -> Result<()> {
+    pub fn export_daily_values_csv(
+        &self,
+        state: &BacktestState,
+        output_path: &str,
+        initial_capital: f64,
+    ) -> Result<()> {
         use std::fs::File;
         use std::io::Write;
 
@@ -1549,7 +1649,11 @@ pub fn write_trades_csv(state: &BacktestState, output_path: &str) -> Result<()> 
 }
 
 /// 导出每日净值 CSV（审计用，独立于回测引擎实例）
-pub fn write_daily_values_csv(state: &BacktestState, output_path: &str, initial_capital: f64) -> Result<()> {
+pub fn write_daily_values_csv(
+    state: &BacktestState,
+    output_path: &str,
+    initial_capital: f64,
+) -> Result<()> {
     use std::fs::File;
     use std::io::Write;
 
@@ -1557,7 +1661,11 @@ pub fn write_daily_values_csv(state: &BacktestState, output_path: &str, initial_
     writeln!(file, "date,total_value,daily_return,cumulative_return")?;
     let mut prev_value = initial_capital;
     for (date, value) in &state.daily_values {
-        let daily_ret = if prev_value.abs() > 1e-9 { (*value - prev_value) / prev_value } else { 0.0 };
+        let daily_ret = if prev_value.abs() > 1e-9 {
+            (*value - prev_value) / prev_value
+        } else {
+            0.0
+        };
         let cum_ret = (*value - initial_capital) / initial_capital;
         writeln!(
             file,
@@ -1667,7 +1775,11 @@ mod tests {
             .try_buy_realistic("600000", "浦发银行", 10.0, 10.0, 100.0, date)
             .unwrap();
         let last = engine.state.trades.last().unwrap();
-        assert!((last.commission - 5.0).abs() < 1e-6, "commission={}", last.commission);
+        assert!(
+            (last.commission - 5.0).abs() < 1e-6,
+            "commission={}",
+            last.commission
+        );
     }
 
     #[test]
@@ -1702,28 +1814,33 @@ mod tests {
             .try_buy_realistic("600000", "浦发银行", 10.0, 10.0, 100.0, buy_date)
             .unwrap();
         let sell_date = buy_date + chrono::Duration::days(1);
-        let result =
-            engine.try_sell_realistic("600000", "浦发银行", 10.0, 100.0, 10.5, sell_date);
+        let result = engine.try_sell_realistic("600000", "浦发银行", 10.0, 100.0, 10.5, sell_date);
         assert!(result.is_ok(), "got: {:?}", result);
     }
 
     #[test]
     fn test_backtest_metrics() {
         let mut state = BacktestState::new(1_000_000.0);
-        
+
         // 清空初始值，使用一个明确的时间序列
         state.daily_values.clear();
-        
+
         let start = Local::now();
         state.daily_values.push((start, 1_000_000.0)); // Day 0: 初始资金
-        state.daily_values.push((start + chrono::Days::new(1), 1_100_000.0)); // Day 1: +10%
-        state.daily_values.push((start + chrono::Days::new(2), 1_050_000.0)); // Day 2: 回撤
-        state.daily_values.push((start + chrono::Days::new(3), 1_200_000.0)); // Day 3: 新高
+        state
+            .daily_values
+            .push((start + chrono::Days::new(1), 1_100_000.0)); // Day 1: +10%
+        state
+            .daily_values
+            .push((start + chrono::Days::new(2), 1_050_000.0)); // Day 2: 回撤
+        state
+            .daily_values
+            .push((start + chrono::Days::new(3), 1_200_000.0)); // Day 3: 新高
 
         // 最后一个值 1_200_000 > 初始值 1_000_000，所以收益率应该 > 0
         let ret = state.total_return();
         assert!(ret > 0.0, "total_return should be positive, got: {}", ret);
-        
+
         // 应该有回撤（从1_100_000跌到1_050_000）
         let dd = state.max_drawdown();
         assert!(dd > 0.0, "max_drawdown should be positive, got: {}", dd);
@@ -1756,8 +1873,14 @@ mod tests {
 
         let rep = regime_breakdown(&daily_values, &bench).expect("应返回 regime 报告");
         // 同时存在牛市与熊市两种状态
-        let has_bull = rep.stats.iter().any(|s| s.kind == RegimeKind::Bull && s.days > 0);
-        let has_bear = rep.stats.iter().any(|s| s.kind == RegimeKind::Bear && s.days > 0);
+        let has_bull = rep
+            .stats
+            .iter()
+            .any(|s| s.kind == RegimeKind::Bull && s.days > 0);
+        let has_bear = rep
+            .stats
+            .iter()
+            .any(|s| s.kind == RegimeKind::Bear && s.days > 0);
         assert!(has_bull, "应识别出牛市区间");
         assert!(has_bear, "应识别出熊市区间");
     }

@@ -55,7 +55,10 @@ pub(super) async fn send_summary_notification(
         let backtest_report = reporting::build_backtest_report(summary);
         let backtest_filename = format!("backtest_report_{}.md", date_str);
         notifier.save_report_to_file(&backtest_report, Some(&backtest_filename))?;
-        info!("✓ 多因子回测报告已保存到本地: reports/{}", backtest_filename);
+        info!(
+            "✓ 多因子回测报告已保存到本地: reports/{}",
+            backtest_filename
+        );
     }
 
     let filename = format!("stock_analysis_{}.md", date_str);

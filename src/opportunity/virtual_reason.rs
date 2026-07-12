@@ -63,12 +63,12 @@ impl VirtualReason {
     /// v10 §10.3 + BC-6: NewsCatalyst > AuctionAnomaly > MainNetInflow > SectorLeader > Breakout > VolumeSurge
     pub fn priority(&self) -> u8 {
         match self {
-            VirtualReason::NewsCatalyst => 1,    // 最高优先
+            VirtualReason::NewsCatalyst => 1, // 最高优先
             VirtualReason::AuctionAnomaly => 2,
             VirtualReason::MainNetInflow => 3,
             VirtualReason::SectorLeader => 4,
             VirtualReason::Breakout => 5,
-            VirtualReason::VolumeSurge => 6,     // 最低
+            VirtualReason::VolumeSurge => 6, // 最低
         }
     }
 
@@ -102,7 +102,9 @@ pub fn pick_primary(reasons: &[VirtualReason]) -> Option<VirtualReason> {
 /// 主/副理由拆分: 选主, 剩余作副
 /// 返回 (primary, Option<secondary>)
 /// 单一理由时 secondary = None
-pub fn split_primary_secondary(reasons: &[VirtualReason]) -> (Option<VirtualReason>, Option<VirtualReason>) {
+pub fn split_primary_secondary(
+    reasons: &[VirtualReason],
+) -> (Option<VirtualReason>, Option<VirtualReason>) {
     let primary = pick_primary(reasons);
     let secondary = reasons
         .iter()
@@ -240,7 +242,10 @@ mod tests {
         ];
         assert_eq!(
             split_primary_secondary(&r),
-            (Some(VirtualReason::NewsCatalyst), Some(VirtualReason::MainNetInflow))
+            (
+                Some(VirtualReason::NewsCatalyst),
+                Some(VirtualReason::MainNetInflow)
+            )
         );
     }
 

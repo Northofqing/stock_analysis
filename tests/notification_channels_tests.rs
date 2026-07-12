@@ -20,7 +20,11 @@ async fn try_send_one(channel: NotificationChannel) -> Result<bool, String> {
 #[tokio::test]
 async fn test_dingtalk_send_no_webhook() {
     let result = try_send_one(NotificationChannel::DingTalk).await;
-    assert!(result.is_ok(), "DingTalk 没 webhook 必 Ok(false), 不能 panic: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "DingTalk 没 webhook 必 Ok(false), 不能 panic: {:?}",
+        result
+    );
 }
 
 #[tokio::test]
@@ -38,7 +42,10 @@ async fn test_slack_send_no_webhook() {
 #[tokio::test]
 async fn test_discord_send_no_webhook() {
     let result = try_send_one(NotificationChannel::Discord).await;
-    assert!(result.is_ok(), "Discord 没 webhook 必 Ok(false), 不能 panic");
+    assert!(
+        result.is_ok(),
+        "Discord 没 webhook 必 Ok(false), 不能 panic"
+    );
 }
 
 #[tokio::test]
@@ -72,6 +79,10 @@ fn test_no_dead_code_channels() {
     for ch in &all_channels {
         // 任何渠道必须有 name()
         let n = ch.name();
-        assert!(!n.is_empty(), "渠道 {:?} 没 name", std::any::type_name_of_val(ch));
+        assert!(
+            !n.is_empty(),
+            "渠道 {:?} 没 name",
+            std::any::type_name_of_val(ch)
+        );
     }
 }

@@ -41,11 +41,18 @@ fn default_sector() -> String {
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PositionStatus { #[default] Holding, Watching }
+pub enum PositionStatus {
+    #[default]
+    Holding,
+    Watching,
+}
 
 impl PositionStatus {
     pub fn label(&self) -> &'static str {
-        match self { PositionStatus::Holding => "持仓", PositionStatus::Watching => "自选" }
+        match self {
+            PositionStatus::Holding => "持仓",
+            PositionStatus::Watching => "自选",
+        }
     }
 }
 
@@ -63,7 +70,10 @@ pub struct Trade {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TradeDirection { Buy, Sell }
+pub enum TradeDirection {
+    Buy,
+    Sell,
+}
 
 #[derive(Debug, Clone)]
 pub struct LedgerEntry {
@@ -94,7 +104,9 @@ pub fn get_all_codes() -> Result<Vec<String>, String> {
     let watchlist = get_watchlist()?;
     let mut codes: Vec<String> = positions.iter().map(|p| p.code.clone()).collect();
     for w in &watchlist {
-        if !codes.contains(&w.code) { codes.push(w.code.clone()); }
+        if !codes.contains(&w.code) {
+            codes.push(w.code.clone());
+        }
     }
     Ok(codes)
 }
@@ -103,8 +115,10 @@ pub fn get_all_codes() -> Result<Vec<String>, String> {
 pub fn get_all_names() -> Result<Vec<(String, String)>, String> {
     let positions = get_positions()?;
     let watchlist = get_watchlist()?;
-    let mut result: Vec<(String, String)> = positions.iter()
-        .map(|p| (p.code.clone(), p.name.clone())).collect();
+    let mut result: Vec<(String, String)> = positions
+        .iter()
+        .map(|p| (p.code.clone(), p.name.clone()))
+        .collect();
     for w in &watchlist {
         if !result.iter().any(|(c, _)| c == &w.code) {
             result.push((w.code.clone(), w.name.clone()));

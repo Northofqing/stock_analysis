@@ -22,8 +22,8 @@
 //!   - AI 失败 fallback 静态 — 规则分类, 不阻塞
 //!   - drop_reason 强制 — 任何 Drop 都有原因
 //!   - 不绕过候选台 — Ranker 输出进 candidate_panel 二次过滤
-use crate::market_analyzer::sector_history::{cumulative_change_pct, BoardDay};
-use chrono::{DateTime, Local, NaiveDate};
+use crate::market_analyzer::sector_history::cumulative_change_pct;
+use chrono::{DateTime, Local};
 
 /// 一条新闻 (Ranker 输入, 不 derive Serialize 因为 ChainHit 不支持)
 #[derive(Debug, Clone)]
@@ -164,11 +164,26 @@ pub struct RankedNews {
 pub fn classify_event_type(title: &str) -> EventType {
     let t = title;
     // 1. 监管风险 (最高优先级, 关键词含"监管/处罚/立案/问询/警示/函")
-    if contains_any(t, &["监管", "处罚", "立案", "问询", "警示", "关注函", "监管措施", "ST"]) {
+    if contains_any(
+        t,
+        &[
+            "监管",
+            "处罚",
+            "立案",
+            "问询",
+            "警示",
+            "关注函",
+            "监管措施",
+            "ST",
+        ],
+    ) {
         return EventType::RegulatoryRisk;
     }
     // 2. 业绩
-    if contains_any(t, &["业绩", "预增", "预减", "亏损", "扭亏", "净利润", "营收"]) {
+    if contains_any(
+        t,
+        &["业绩", "预增", "预减", "亏损", "扭亏", "净利润", "营收"],
+    ) {
         return EventType::Earnings;
     }
     // 3. 公司行为
@@ -176,11 +191,19 @@ pub fn classify_event_type(title: &str) -> EventType {
         return EventType::CompanyAction;
     }
     // 4. 供需
-    if contains_any(t, &["涨价", "提价", "供给", "库存", "产能", "减产", "扩产", "短缺", "过剩"]) {
+    if contains_any(
+        t,
+        &[
+            "涨价", "提价", "供给", "库存", "产能", "减产", "扩产", "短缺", "过剩",
+        ],
+    ) {
         return EventType::SupplyDemand;
     }
     // 5. 政策催化
-    if contains_any(t, &["政策", "规划", "印发", "支持", "指导意见", "国务院", "印发"]) {
+    if contains_any(
+        t,
+        &["政策", "规划", "印发", "支持", "指导意见", "国务院", "印发"],
+    ) {
         return EventType::PolicyCatalyst;
     }
     // 6. 产业催化
@@ -244,7 +267,8 @@ pub fn detect_heat_stage(
         return HeatStage::Ferment;
     }
     // 启动: 今日 > 0 + 3 日累计 < 5% + 主力流入 + 涨停 1-2
-    if today_chg > 0.0 && cum_3d < 5.0 && today_main_inflow > 0.0 && limit_up >= 1 && limit_up <= 2 {
+    if today_chg > 0.0 && cum_3d < 5.0 && today_main_inflow > 0.0 && limit_up >= 1 && limit_up <= 2
+    {
         return HeatStage::Start;
     }
     // 冷: 今日 ≤ 0 + 涨停 = 0 + 主力流入 ≤ 0
@@ -283,6 +307,8 @@ mod tests {
                 source: ChainSource::Rule,
                 board_keyword: title.to_string(),
                 fund_flow_pct: None,
+                board_code: None,
+                board_change_pct: None,
             }],
             board_code: board_code.map(String::from),
         }
@@ -291,8 +317,14 @@ mod tests {
     /// 1) 监管风险分类
     #[test]
     fn classify_regulatory_risk() {
-        assert_eq!(classify_event_type("公司收到证监会立案通知"), EventType::RegulatoryRisk);
-        assert_eq!(classify_event_type("某股被处罚 50 万"), EventType::RegulatoryRisk);
+        assert_eq!(
+            classify_event_type("公司收到证监会立案通知"),
+            EventType::RegulatoryRisk
+        );
+        assert_eq!(
+            classify_event_type("某股被处罚 50 万"),
+            EventType::RegulatoryRisk
+        );
         assert_eq!(classify_event_type("问询函回复"), EventType::RegulatoryRisk);
     }
 
@@ -306,22 +338,37 @@ mod tests {
     /// 3) 公司行为分类
     #[test]
     fn classify_company_action() {
-        assert_eq!(classify_event_type("公司拟回购股份"), EventType::CompanyAction);
-        assert_eq!(classify_event_type("大股东减持公告"), EventType::CompanyAction);
+        assert_eq!(
+            classify_event_type("公司拟回购股份"),
+            EventType::CompanyAction
+        );
+        assert_eq!(
+            classify_event_type("大股东减持公告"),
+            EventType::CompanyAction
+        );
     }
 
     /// 4) 供需分类
     #[test]
     fn classify_supply_demand() {
-        assert_eq!(classify_event_type("锂电池原材料涨价"), EventType::SupplyDemand);
+        assert_eq!(
+            classify_event_type("锂电池原材料涨价"),
+            EventType::SupplyDemand
+        );
         assert_eq!(classify_event_type("工厂减产"), EventType::SupplyDemand);
     }
 
     /// 5) 政策催化
     #[test]
     fn classify_policy() {
-        assert_eq!(classify_event_type("国务院印发新能源汽车规划"), EventType::PolicyCatalyst);
-        assert_eq!(classify_event_type("工信部支持产业升级"), EventType::PolicyCatalyst);
+        assert_eq!(
+            classify_event_type("国务院印发新能源汽车规划"),
+            EventType::PolicyCatalyst
+        );
+        assert_eq!(
+            classify_event_type("工信部支持产业升级"),
+            EventType::PolicyCatalyst
+        );
     }
 
     /// 6) 监管优先级高于利好 (复合标题)
@@ -411,6 +458,8 @@ mod tests {
             source: ChainSource::Rule,
             board_keyword: "板块".into(),
             fund_flow_pct: Some(2.0),
+            board_code: None,
+            board_change_pct: None,
         };
         // AI degraded: source = AiDegraded
         let c2 = ChainHit {
@@ -476,7 +525,11 @@ mod tests {
     fn risk_penalty_by_event() {
         let p1 = risk_penalty(EventType::RegulatoryRisk, HeatStage::Ferment, &[]);
         assert!(p1 >= 30, "监管应扣 ≥30, got {}", p1);
-        let p2 = risk_penalty(EventType::CompanyAction, HeatStage::Ferment, &[String::from("减持")]);
+        let p2 = risk_penalty(
+            EventType::CompanyAction,
+            HeatStage::Ferment,
+            &[String::from("减持")],
+        );
         assert!(p2 >= 30, "减持应扣 ≥30, got {}", p2);
         let p3 = risk_penalty(EventType::PolicyCatalyst, HeatStage::Start, &[]);
         assert_eq!(p3, 0, "政策+启动 不应扣");
@@ -499,6 +552,8 @@ mod tests {
                 source: ChainSource::Rule,
                 board_keyword: "低空经济".into(),
                 fund_flow_pct: Some(3.0),
+                board_code: None,
+                board_change_pct: None,
             }],
             board_code: Some("BK0815".into()),
         };
@@ -511,8 +566,14 @@ mod tests {
         };
         let r = rank_news(&cand, &ctx);
         // 期望: 政策 + 启动 + 资金流入 → A 档或 B 档
-        assert!(matches!(r.bucket, NewsRankBucket::PushNow | NewsRankBucket::WatchCandidate),
-            "应进 A/B 档, got {:?}", r.bucket);
+        assert!(
+            matches!(
+                r.bucket,
+                NewsRankBucket::PushNow | NewsRankBucket::WatchCandidate
+            ),
+            "应进 A/B 档, got {:?}",
+            r.bucket
+        );
         assert!(r.event_type == EventType::PolicyCatalyst);
     }
 
@@ -531,8 +592,11 @@ mod tests {
         let ctx = MarketContext::default();
         let r = rank_news(&cand, &ctx);
         // 监管风险 + 无 chain_hit + 无 board → 应 Drop 或 LogOnly
-        assert!(matches!(r.bucket, NewsRankBucket::Drop | NewsRankBucket::LogOnly),
-            "应进 Drop/C 档, got {:?}", r.bucket);
+        assert!(
+            matches!(r.bucket, NewsRankBucket::Drop | NewsRankBucket::LogOnly),
+            "应进 Drop/C 档, got {:?}",
+            r.bucket
+        );
         if r.bucket == NewsRankBucket::Drop {
             assert!(r.drop_reason.is_some(), "Drop 必须有 drop_reason");
         }
@@ -555,6 +619,8 @@ mod tests {
                 source: ChainSource::Rule,
                 board_keyword: "机器人".into(),
                 fund_flow_pct: Some(8.0),
+                board_code: None,
+                board_change_pct: None,
             }],
             board_code: Some("BK0815".into()),
         };
@@ -568,8 +634,11 @@ mod tests {
         };
         let r = rank_news(&cand, &ctx);
         // Climax + 风险扣分 → 不应 PushNow
-        assert!(r.bucket != NewsRankBucket::PushNow,
-            "高潮阶段不应进 A 档, got {:?}", r.bucket);
+        assert!(
+            r.bucket != NewsRankBucket::PushNow,
+            "高潮阶段不应进 A 档, got {:?}",
+            r.bucket
+        );
     }
 
     // ============ Commit 3 单测: 影子模式 ============
@@ -586,6 +655,8 @@ mod tests {
             source: ChainSource::Rule,
             board_keyword: "测试".into(),
             fund_flow_pct: None,
+            board_code: None,
+            board_change_pct: None,
         }];
         // 不应 panic
         shadow_rank_hits(&hits, &vec!["测试".to_string()]);
@@ -613,6 +684,8 @@ mod tests {
                 source: ChainSource::Rule,
                 board_keyword: "低空经济".into(),
                 fund_flow_pct: Some(3.0),
+                board_code: None,
+                board_change_pct: None,
             },
             // 监管类 → Drop
             ChainHit {
@@ -623,6 +696,8 @@ mod tests {
                 source: ChainSource::Rule,
                 board_keyword: "某股".into(),
                 fund_flow_pct: None,
+                board_code: None,
+                board_change_pct: None,
             },
         ];
         let titles = vec![
@@ -651,10 +726,17 @@ mod tests {
                     chain: "X".into(),
                     keywords: vec!["x".into()],
                     logic: "test".into(),
-                    stocks: vec![StockInfo { code: "000001".into(), name: "A".into(), change_pct: 0.0, vol_ratio: 1.0 }],
+                    stocks: vec![StockInfo {
+                        code: "000001".into(),
+                        name: "A".into(),
+                        change_pct: 0.0,
+                        vol_ratio: 1.0,
+                    }],
                     source: ChainSource::Rule,
                     board_keyword: "X".into(),
                     fund_flow_pct: None,
+                    board_code: None,
+                    board_change_pct: None,
                 }],
                 board_code: None,
             },
@@ -674,7 +756,9 @@ mod tests {
         ];
         let cands = ranked_to_candidates(&ranked);
         assert_eq!(cands.len(), 2, "仅 A/B 档进候选台, got {}", cands.len());
-        assert!(cands.iter().all(|c| c.sources.contains(&crate::opportunity::candidate_panel::CandidateSource::NewsCatalyst)));
+        assert!(cands.iter().all(|c| c
+            .sources
+            .contains(&crate::opportunity::candidate_panel::CandidateSource::NewsCatalyst)));
     }
 
     /// 27) format_news_ranked_board: 4 档分类输出
@@ -754,6 +838,8 @@ pub fn score_rule(chain_hits: &[crate::opportunity::chain_mapper::ChainHit]) -> 
             }
             crate::opportunity::chain_mapper::ChainSource::Ai => 12, // AI 命中, 介于规则和 degraded 之间
             crate::opportunity::chain_mapper::ChainSource::AiDegraded => 5, // 降级, 给低分
+            // B-002 板块联动: 有真实 board_keyword 但无深主题, 给中等分 (高于 Ai 略低)
+            crate::opportunity::chain_mapper::ChainSource::Board => 14,
         };
         total += hit_score;
         if !hit.board_keyword.is_empty() {
@@ -816,12 +902,12 @@ pub fn score_heat(stage: HeatStage, change_pct: f64, main_inflow: f64, limit_up:
 /// 资金确认得分 (-15 ~ 20, 不是一票通过也不是一票否决)
 pub fn score_capital(main_inflow: Option<f64>) -> i32 {
     match main_inflow {
-        None => 0, // 缺数据显式 0, 不臆测
-        Some(v) if v >= 3e8 => 15,    // 强流入
-        Some(v) if v > 0.0 => 8,      // 弱正
-        Some(v) if v == 0.0 => 0,     // 平
-        Some(v) if v >= -1e8 => -10,  // 弱流出
-        Some(_) => -15,                 // 强流出
+        None => 0,                   // 缺数据显式 0, 不臆测
+        Some(v) if v >= 3e8 => 15,   // 强流入
+        Some(v) if v > 0.0 => 8,     // 弱正
+        Some(v) if v == 0.0 => 0,    // 平
+        Some(v) if v >= -1e8 => -10, // 弱流出
+        Some(_) => -15,              // 强流出
     }
 }
 
@@ -870,13 +956,19 @@ pub fn risk_penalty(event: EventType, stage: HeatStage, keywords: &[String]) -> 
         EventType::RegulatoryRisk => penalty += 30,
         EventType::Earnings => {
             // 业绩预减/亏损加重 (关键词命中)
-            if keywords.iter().any(|k| k.contains("预减") || k.contains("亏损")) {
+            if keywords
+                .iter()
+                .any(|k| k.contains("预减") || k.contains("亏损"))
+            {
                 penalty += 25;
             }
         }
         EventType::CompanyAction => {
             // 减持/解禁/立案加重
-            if keywords.iter().any(|k| k.contains("减持") || k.contains("解禁") || k.contains("立案")) {
+            if keywords
+                .iter()
+                .any(|k| k.contains("减持") || k.contains("解禁") || k.contains("立案"))
+            {
                 penalty += 30;
             }
         }
@@ -979,7 +1071,12 @@ pub fn rank_news(candidate: &NewsCandidate, ctx: &MarketContext) -> RankedNews {
     let _ = event_hint; // 占位, 下方 event_type 赋值时使用
 
     // 4. 热度 + 阶段得分
-    evidence.heat_score = score_heat(heat_stage, ctx.today_chg, ctx.main_inflow, ctx.limit_up_count.unwrap_or(0));
+    evidence.heat_score = score_heat(
+        heat_stage,
+        ctx.today_chg,
+        ctx.main_inflow,
+        ctx.limit_up_count.unwrap_or(0),
+    );
     evidence.stage_score = stage_score(heat_stage);
 
     // 5. 资金确认
@@ -987,7 +1084,11 @@ pub fn rank_news(candidate: &NewsCandidate, ctx: &MarketContext) -> RankedNews {
     if ctx.main_inflow.abs() > 1e7 {
         reasons.push(format!(
             "资金 {} ({} 分)",
-            if ctx.main_inflow > 0.0 { "流入" } else { "流出" },
+            if ctx.main_inflow > 0.0 {
+                "流入"
+            } else {
+                "流出"
+            },
             evidence.capital_score
         ));
     } else {
@@ -1000,7 +1101,11 @@ pub fn rank_news(candidate: &NewsCandidate, ctx: &MarketContext) -> RankedNews {
     // 7. 风险扣分
     // 优先用 hint (公告源权威标记), 否则 classify_event_type (关键词启发)
     let event_type = event_hint.unwrap_or_else(|| classify_event_type(&candidate.title));
-    let keywords: Vec<String> = candidate.chain_hits.iter().flat_map(|h| h.keywords.clone()).collect();
+    let keywords: Vec<String> = candidate
+        .chain_hits
+        .iter()
+        .flat_map(|h| h.keywords.clone())
+        .collect();
     evidence.risk_penalty = risk_penalty(event_type, heat_stage, &keywords);
     if evidence.risk_penalty > 0 {
         reasons.push(format!("风险扣 {} 分", evidence.risk_penalty));
@@ -1017,7 +1122,12 @@ pub fn rank_news(candidate: &NewsCandidate, ctx: &MarketContext) -> RankedNews {
     let score = raw.clamp(0, 100);
 
     // 9. 分档
-    let (bucket, drop_reason) = decide_bucket(score, heat_stage, evidence.risk_penalty, &candidate.chain_hits);
+    let (bucket, drop_reason) = decide_bucket(
+        score,
+        heat_stage,
+        evidence.risk_penalty,
+        &candidate.chain_hits,
+    );
     if let Some(reason) = &drop_reason {
         reasons.push(format!("Drop: {}", reason));
     }
@@ -1052,14 +1162,20 @@ fn decide_bucket(
         return (NewsRankBucket::Drop, Some("无 chain_hit 召回".to_string()));
     }
     if risk >= 35 {
-        return (NewsRankBucket::Drop, Some(format!("风险扣分过高 ({})", risk)));
+        return (
+            NewsRankBucket::Drop,
+            Some(format!("风险扣分过高 ({})", risk)),
+        );
     }
     // A 档
     if score >= 70 && matches!(stage, HeatStage::Start | HeatStage::Ferment) && risk < 20 {
         return (NewsRankBucket::PushNow, None);
     }
     // C 档 (高潮/分歧/退潮 默认 C, 不推)
-    if matches!(stage, HeatStage::Climax | HeatStage::Divergence | HeatStage::Fade) {
+    if matches!(
+        stage,
+        HeatStage::Climax | HeatStage::Divergence | HeatStage::Fade
+    ) {
         return (NewsRankBucket::LogOnly, None);
     }
     // B 档
@@ -1117,11 +1233,16 @@ pub fn shadow_rank_hits(
             source: "shadow".to_string(),
             published_at: Some(Local::now()),
             chain_hits: vec![hit.clone()],
-            board_code: None,
+            // CR-27 (review): 把 ChainHit.board_code 传给 NewsCandidate.board_code.
+            //   之前硬编码 None → detect_heat_stage 默认 HeatStage::Unknown, 所有 Board
+            //   (B-002) hits 被错判, heat-stage 路径静默失效.
+            board_code: hit.board_code.clone(),
         };
         let ranked = rank_news(&cand, &ctx);
         // 合并到 by_chain
-        let entry = by_chain.entry(hit.chain.clone()).or_insert_with(|| (cand.clone(), Vec::new()));
+        let entry = by_chain
+            .entry(hit.chain.clone())
+            .or_insert_with(|| (cand.clone(), Vec::new()));
         entry.1.push(ranked);
     }
 
@@ -1132,12 +1253,15 @@ pub fn shadow_rank_hits(
     let mut drop_count = 0;
 
     for (chain, (cand, mut ranked_vec)) in by_chain {
-        if ranked_vec.is_empty() { continue; }
+        if ranked_vec.is_empty() {
+            continue;
+        }
         // 取 score 最高的作为代表
         ranked_vec.sort_by(|a, b| b.score.cmp(&a.score));
         let best = ranked_vec[0].clone();
         // 合并事件类型 + reasons
-        let event_labels: Vec<String> = ranked_vec.iter()
+        let event_labels: Vec<String> = ranked_vec
+            .iter()
             .map(|r| r.event_type.label().to_string())
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
@@ -1150,7 +1274,9 @@ pub fn shadow_rank_hits(
         let n = ranked_vec.len();
         let mut merged = best;
         merged.candidate = cand;
-        merged.reasons.push(format!("合并 {} 条事件: {}", n, merged_event));
+        merged
+            .reasons
+            .push(format!("合并 {} 条事件: {}", n, merged_event));
         // 用最新 published_at
         if let Some(last) = ranked_vec.first() {
             merged.candidate.published_at = last.candidate.published_at;
@@ -1169,7 +1295,8 @@ pub fn shadow_rank_hits(
             .unwrap_or_default();
         log::info!(
             "[NEWS_RANKER][shadow] chain={} 合并{}条 event={} stage={} score={} bucket={:?}{}",
-            chain, n,
+            chain,
+            n,
             merged.event_type.label(),
             merged.heat_stage.label(),
             merged.score,
@@ -1181,8 +1308,12 @@ pub fn shadow_rank_hits(
 
     log::info!(
         "[NEWS_RANKER][shadow] 汇总: {} 命中 → 合并后 {} 链 → A={} B={} C={} Drop={}",
-        hits.len(), ranked_all.len(),
-        a_count, b_count, c_count, drop_count
+        hits.len(),
+        ranked_all.len(),
+        a_count,
+        b_count,
+        c_count,
+        drop_count
     );
     ranked_all
 }
@@ -1190,11 +1321,16 @@ pub fn shadow_rank_hits(
 // ============ Commit 4: 候选台 + 推送治理 ============
 
 /// 把 RankedNews 列表转成 CandidateEntry (仅 A/B 档, C 档不进)
-pub fn ranked_to_candidates(ranked: &[RankedNews]) -> Vec<crate::opportunity::candidate_panel::CandidateEntry> {
+pub fn ranked_to_candidates(
+    ranked: &[RankedNews],
+) -> Vec<crate::opportunity::candidate_panel::CandidateEntry> {
     let mut out = Vec::new();
     for r in ranked {
         // 仅 A/B 档进候选台
-        if !matches!(r.bucket, NewsRankBucket::PushNow | NewsRankBucket::WatchCandidate) {
+        if !matches!(
+            r.bucket,
+            NewsRankBucket::PushNow | NewsRankBucket::WatchCandidate
+        ) {
             continue;
         }
         // 取第一条 chain_hit 的第一支 stock 作 entry (一期简化)
@@ -1205,10 +1341,21 @@ pub fn ranked_to_candidates(ranked: &[RankedNews]) -> Vec<crate::opportunity::ca
             .flat_map(|h| h.stocks.iter())
             .next()
             .map(|s| (s.code.clone(), s.name.clone()))
-            .unwrap_or_else(|| (r.candidate.id.clone(), r.candidate.chain_hits.first().map(|h| h.chain.clone()).unwrap_or_default()));
+            .unwrap_or_else(|| {
+                (
+                    r.candidate.id.clone(),
+                    r.candidate
+                        .chain_hits
+                        .first()
+                        .map(|h| h.chain.clone())
+                        .unwrap_or_default(),
+                )
+            });
         // 阶段判断决定 EvidenceTier: 启动/发酵 → Reference, 其他 → Theme
         let tier = match r.heat_stage {
-            HeatStage::Start | HeatStage::Ferment => crate::opportunity::candidate_panel::EvidenceTier::Reference,
+            HeatStage::Start | HeatStage::Ferment => {
+                crate::opportunity::candidate_panel::EvidenceTier::Reference
+            }
             _ => crate::opportunity::candidate_panel::EvidenceTier::Theme,
         };
         // evidence 文本: 把 7 维评分塞进去, 人读透明
@@ -1241,13 +1388,28 @@ pub fn ranked_to_candidates(ranked: &[RankedNews]) -> Vec<crate::opportunity::ca
 /// 渲染 RankedNews 列表为可推送文本 (P5 §五 输出形态)
 pub fn format_news_ranked_board(ranked: &[RankedNews]) -> String {
     let mut out = String::new();
-    let a: Vec<&RankedNews> = ranked.iter().filter(|r| r.bucket == NewsRankBucket::PushNow).collect();
-    let b: Vec<&RankedNews> = ranked.iter().filter(|r| r.bucket == NewsRankBucket::WatchCandidate).collect();
-    let c: Vec<&RankedNews> = ranked.iter().filter(|r| r.bucket == NewsRankBucket::LogOnly).collect();
-    let d: Vec<&RankedNews> = ranked.iter().filter(|r| r.bucket == NewsRankBucket::Drop).collect();
+    let a: Vec<&RankedNews> = ranked
+        .iter()
+        .filter(|r| r.bucket == NewsRankBucket::PushNow)
+        .collect();
+    let b: Vec<&RankedNews> = ranked
+        .iter()
+        .filter(|r| r.bucket == NewsRankBucket::WatchCandidate)
+        .collect();
+    let c: Vec<&RankedNews> = ranked
+        .iter()
+        .filter(|r| r.bucket == NewsRankBucket::LogOnly)
+        .collect();
+    let d: Vec<&RankedNews> = ranked
+        .iter()
+        .filter(|r| r.bucket == NewsRankBucket::Drop)
+        .collect();
     out.push_str(&format!(
         "📰 新闻Ranker · A={} B={} C={} Drop={}\n",
-        a.len(), b.len(), c.len(), d.len()
+        a.len(),
+        b.len(),
+        c.len(),
+        d.len()
     ));
     out.push_str("定位: 帮你筛选, 不替你拍板买入 | 阶段判断+风险过滤\n");
     out.push_str("━━━━━━━━━━━\n");

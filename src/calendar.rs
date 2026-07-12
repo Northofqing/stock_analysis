@@ -353,7 +353,9 @@ mod tests {
         let days = recent_trading_days(mon, 5);
         assert_eq!(days.len(), 5);
         // All should be weekdays
-        assert!(days.iter().all(|d| !matches!(d.weekday(), Weekday::Sat | Weekday::Sun)));
+        assert!(days
+            .iter()
+            .all(|d| !matches!(d.weekday(), Weekday::Sat | Weekday::Sun)));
     }
 
     #[test]

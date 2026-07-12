@@ -13,11 +13,11 @@ use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SignalSource {
-    Technical,   // 技术面
-    FundFlow,    // 资金面
-    News,        // 消息面
-    Chain,       // 产业链
-    Valuation,   // 估值面
+    Technical, // 技术面
+    FundFlow,  // 资金面
+    News,      // 消息面
+    Chain,     // 产业链
+    Valuation, // 估值面
 }
 
 impl SignalSource {
@@ -49,7 +49,12 @@ pub struct Signal {
 
 impl Signal {
     pub fn new(source: SignalSource, direction: f64, strength: f64, age_minutes: f64) -> Self {
-        Signal { source, direction, strength, age_minutes }
+        Signal {
+            source,
+            direction,
+            strength,
+            age_minutes,
+        }
     }
 
     /// 时效衰减后的有效强度
@@ -91,18 +96,21 @@ impl Default for SignalFusion {
         correlations.insert((SignalSource::Technical, SignalSource::FundFlow), 0.6);
         correlations.insert((SignalSource::Technical, SignalSource::Chain), 0.3);
         correlations.insert((SignalSource::FundFlow, SignalSource::News), 0.4);
-        Self { weights, correlations }
+        Self {
+            weights,
+            correlations,
+        }
     }
 }
 
 impl SignalFusion {
     pub fn with_weights(weights: HashMap<SignalSource, f64>) -> Self {
         let total: f64 = weights.values().sum();
-        let normalized: HashMap<_, _> = weights
-            .into_iter()
-            .map(|(k, v)| (k, v / total))
-            .collect();
-        Self { weights: normalized, ..Default::default() }
+        let normalized: HashMap<_, _> = weights.into_iter().map(|(k, v)| (k, v / total)).collect();
+        Self {
+            weights: normalized,
+            ..Default::default()
+        }
     }
 
     /// 计算多信号共振得分（-100 到 +100）
@@ -126,7 +134,8 @@ impl SignalFusion {
             for j in (i + 1)..effective.len() {
                 let (sa, _, _) = effective[i];
                 let (sb, _, _) = effective[j];
-                let corr = self.correlations
+                let corr = self
+                    .correlations
                     .get(&(sa, sb))
                     .or_else(|| self.correlations.get(&(sb, sa)))
                     .copied()
@@ -222,7 +231,7 @@ mod tests {
     fn test_conflicting_signals() {
         let f = SignalFusion::default();
         let signals = vec![
-            Signal::new(SignalSource::Technical, 1.0, 80.0, 0.0),  // 看多
+            Signal::new(SignalSource::Technical, 1.0, 80.0, 0.0), // 看多
             Signal::new(SignalSource::FundFlow, -1.0, 80.0, 0.0), // 看空
         ];
         let score = f.resonance(&signals);

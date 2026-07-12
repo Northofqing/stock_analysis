@@ -43,9 +43,7 @@ impl FromStr for LaunchStage {
             "shadow" => Ok(Self::Shadow),
             "gray" | "grey" => Ok(Self::Gray),
             "live" | "prod" => Ok(Self::Live),
-            other => Err(format!(
-                "未识别 stage '{other}', 期望 Shadow|Gray|Live"
-            )),
+            other => Err(format!("未识别 stage '{other}', 期望 Shadow|Gray|Live")),
         }
     }
 }
@@ -133,7 +131,7 @@ pub fn should_push_user(stage: LaunchStage, is_critical_alert: bool) -> bool {
     match stage {
         LaunchStage::Live => true,
         LaunchStage::Gray => is_critical_alert,
-        LaunchStage::Shadow => true,  // 修复: Shadow 推全量, 不静默
+        LaunchStage::Shadow => true, // 修复: Shadow 推全量, 不静默
     }
 }
 
@@ -207,7 +205,10 @@ mod tests {
 
     #[test]
     fn test_stage_from_str() {
-        assert_eq!("shadow".parse::<LaunchStage>().unwrap(), LaunchStage::Shadow);
+        assert_eq!(
+            "shadow".parse::<LaunchStage>().unwrap(),
+            LaunchStage::Shadow
+        );
         assert_eq!("GRAY".parse::<LaunchStage>().unwrap(), LaunchStage::Gray);
         assert_eq!("Grey".parse::<LaunchStage>().unwrap(), LaunchStage::Gray);
         assert_eq!("live".parse::<LaunchStage>().unwrap(), LaunchStage::Live);
@@ -229,30 +230,59 @@ mod tests {
     #[test]
     fn test_check_transition_shadow_to_gray() {
         let m = StageMetrics {
-            shadow_days: 10, winrate_samples: 50, winrate_pct: 0.40, calmar_ratio: 0.5, gray_days: 0,
+            shadow_days: 10,
+            winrate_samples: 50,
+            winrate_pct: 0.40,
+            calmar_ratio: 0.5,
+            gray_days: 0,
         };
         assert_eq!(LaunchGate::check_transition(LaunchStage::Shadow, &m), None);
 
         let m = StageMetrics {
-            shadow_days: 84, winrate_samples: 200, winrate_pct: 0.60, calmar_ratio: 1.0, gray_days: 0,
+            shadow_days: 84,
+            winrate_samples: 200,
+            winrate_pct: 0.60,
+            calmar_ratio: 1.0,
+            gray_days: 0,
         };
-        assert_eq!(LaunchGate::check_transition(LaunchStage::Shadow, &m), Some(LaunchStage::Gray));
+        assert_eq!(
+            LaunchGate::check_transition(LaunchStage::Shadow, &m),
+            Some(LaunchStage::Gray)
+        );
     }
 
     #[test]
     fn test_check_transition_gray_to_live_or_shadow() {
         let m = StageMetrics {
-            shadow_days: 0, winrate_samples: 0, winrate_pct: 0.55, calmar_ratio: 0.0, gray_days: 30,
+            shadow_days: 0,
+            winrate_samples: 0,
+            winrate_pct: 0.55,
+            calmar_ratio: 0.0,
+            gray_days: 30,
         };
-        assert_eq!(LaunchGate::check_transition(LaunchStage::Gray, &m), Some(LaunchStage::Live));
+        assert_eq!(
+            LaunchGate::check_transition(LaunchStage::Gray, &m),
+            Some(LaunchStage::Live)
+        );
 
         let m = StageMetrics {
-            shadow_days: 0, winrate_samples: 0, winrate_pct: 0.45, calmar_ratio: 0.0, gray_days: 15,
+            shadow_days: 0,
+            winrate_samples: 0,
+            winrate_pct: 0.45,
+            calmar_ratio: 0.0,
+            gray_days: 15,
         };
-        assert_eq!(LaunchGate::check_transition(LaunchStage::Gray, &m), Some(LaunchStage::Shadow));
+        assert_eq!(
+            LaunchGate::check_transition(LaunchStage::Gray, &m),
+            Some(LaunchStage::Shadow)
+        );
 
         let m = StageMetrics {
-            shadow_days: 0, winrate_samples: 0, winrate_pct: 0.52, calmar_ratio: 0.0, gray_days: 10,
+            shadow_days: 0,
+            winrate_samples: 0,
+            winrate_pct: 0.52,
+            calmar_ratio: 0.0,
+            gray_days: 10,
         };
         assert_eq!(LaunchGate::check_transition(LaunchStage::Gray, &m), None);
     }
@@ -260,7 +290,11 @@ mod tests {
     #[test]
     fn test_check_transition_live_no_auto() {
         let m = StageMetrics {
-            shadow_days: 100, winrate_samples: 1000, winrate_pct: 0.30, calmar_ratio: 0.0, gray_days: 60,
+            shadow_days: 100,
+            winrate_samples: 1000,
+            winrate_pct: 0.30,
+            calmar_ratio: 0.0,
+            gray_days: 60,
         };
         assert_eq!(LaunchGate::check_transition(LaunchStage::Live, &m), None);
     }
@@ -283,7 +317,11 @@ mod tests {
     fn test_shadow_gray_live_three_stage_e2e() {
         let mut current = LaunchStage::Shadow;
         let mut m = StageMetrics {
-            shadow_days: 0, winrate_samples: 0, winrate_pct: 0.0, calmar_ratio: 0.0, gray_days: 0,
+            shadow_days: 0,
+            winrate_samples: 0,
+            winrate_pct: 0.0,
+            calmar_ratio: 0.0,
+            gray_days: 0,
         };
 
         // 1. Shadow 早期
@@ -300,7 +338,10 @@ mod tests {
         // 3. Shadow 满足 → Gray
         m.winrate_pct = 0.65;
         m.calmar_ratio = 1.2;
-        assert_eq!(LaunchGate::check_transition(current, &m), Some(LaunchStage::Gray));
+        assert_eq!(
+            LaunchGate::check_transition(current, &m),
+            Some(LaunchStage::Gray)
+        );
         current = LaunchStage::Gray;
         m.shadow_days = 0;
 
@@ -310,13 +351,19 @@ mod tests {
 
         // 5. Gray 胜率掉 → 回退 Shadow
         m.winrate_pct = 0.45;
-        assert_eq!(LaunchGate::check_transition(current, &m), Some(LaunchStage::Shadow));
+        assert_eq!(
+            LaunchGate::check_transition(current, &m),
+            Some(LaunchStage::Shadow)
+        );
 
         // 6. 再 Gray, 满足 → Live
         current = LaunchStage::Gray;
         m.gray_days = 30;
         m.winrate_pct = 0.55;
-        assert_eq!(LaunchGate::check_transition(current, &m), Some(LaunchStage::Live));
+        assert_eq!(
+            LaunchGate::check_transition(current, &m),
+            Some(LaunchStage::Live)
+        );
         current = LaunchStage::Live;
 
         // 7. Live 阶段, 胜率暴跌也不自动转

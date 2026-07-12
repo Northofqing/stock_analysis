@@ -61,11 +61,11 @@ pub struct EventCalendarInput {
 
 /// MVP4-4.4: R-05 数据聚合 (从 prediction_tracker + paper_trades)
 pub fn aggregate_signal_review(
-    holding: (u32, u32, u32), // (推, 执行, 有效)
-    t0: (u32, u32), // (推, 有效)
+    holding: (u32, u32, u32),             // (推, 执行, 有效)
+    t0: (u32, u32),                       // (推, 有效)
     candidate: (u32, u32, u32, u32, u32), // (触发, 成交, 未成交, 涨停, 未触达)
-    paper: (f64, f64, u32), // (今日pnl%, 累计%, 样本)
-    news: (u32, u32), // (推送, D+1兑现)
+    paper: (f64, f64, u32),               // (今日pnl%, 累计%, 样本)
+    news: (u32, u32),                     // (推送, D+1兑现)
     date: String,
 ) -> SignalReviewInput {
     SignalReviewInput {
@@ -137,11 +137,11 @@ mod tests {
     #[test]
     fn signal_review_aggregate() {
         let r = aggregate_signal_review(
-            (5, 4, 3), // holding
-            (2, 1), // t0
+            (5, 4, 3),       // holding
+            (2, 1),          // t0
             (6, 3, 3, 2, 1), // candidate
-            (0.5, 3.2, 12), // paper
-            (4, 2), // news
+            (0.5, 3.2, 12),  // paper
+            (4, 2),          // news
             "2026-07-05".to_string(),
         );
         assert_eq!(r.date, "2026-07-05");
@@ -153,8 +153,12 @@ mod tests {
     #[test]
     fn signal_review_to_template_basic() {
         let r = aggregate_signal_review(
-            (5, 4, 3), (2, 1), (6, 3, 3, 2, 1),
-            (0.5, 3.2, 12), (4, 2), "2026-07-05".to_string(),
+            (5, 4, 3),
+            (2, 1),
+            (6, 3, 3, 2, 1),
+            (0.5, 3.2, 12),
+            (4, 2),
+            "2026-07-05".to_string(),
         );
         let t = signal_review_to_template_fields(&r);
         assert_eq!(t.holding_n, 5);
@@ -164,8 +168,12 @@ mod tests {
     #[test]
     fn signal_review_all_zero() {
         let r = aggregate_signal_review(
-            (0, 0, 0), (0, 0), (0, 0, 0, 0, 0),
-            (0.0, 0.0, 0), (0, 0), "2026-07-05".to_string(),
+            (0, 0, 0),
+            (0, 0),
+            (0, 0, 0, 0, 0),
+            (0.0, 0.0, 0),
+            (0, 0),
+            "2026-07-05".to_string(),
         );
         assert_eq!(r.holding_n, 0);
         assert_eq!(r.paper_n, 0);

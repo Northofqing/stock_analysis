@@ -88,7 +88,10 @@ impl LeadingConfig {
     pub fn from_env() -> Self {
         let d = Self::default();
         let f = |key: &str, def: f64| -> f64 {
-            std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(def)
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(def)
         };
         Self {
             enabled: std::env::var("SECTOR_LEAD_ENABLED")
@@ -144,10 +147,16 @@ impl LeaderConfig {
     pub fn from_env() -> Self {
         let d = Self::default();
         let f = |key: &str, def: f64| -> f64 {
-            std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(def)
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(def)
         };
         let u = |key: &str, def: usize| -> usize {
-            std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(def)
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(def)
         };
         Self {
             lowpos_enabled: std::env::var("SECTOR_LOWPOS_ENABLED")
@@ -365,8 +374,16 @@ pub fn search_board_code_by_keyword(keyword: &str) -> Result<Option<(String, Str
     // 评分：优先精确命中，其次包含命中。
     let mut best: Option<(u8, String, String)> = None;
     for item in items {
-        let code = item.get("Code").and_then(|v| v.as_str()).unwrap_or("").trim();
-        let name = item.get("Name").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let code = item
+            .get("Code")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let name = item
+            .get("Name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
         let classify = item
             .get("Classify")
             .and_then(|v| v.as_str())
@@ -503,7 +520,8 @@ pub fn detect_resonance_sectors(
     let inflow_set: HashSet<&String> = by_inflow.iter().map(|b| &b.code).collect();
 
     for b in by_change.iter().chain(by_inflow.iter()) {
-        map.entry(b.code.clone()).or_insert_with(|| (b.clone(), Vec::new()));
+        map.entry(b.code.clone())
+            .or_insert_with(|| (b.clone(), Vec::new()));
     }
 
     for (code, (board, dims)) in map.iter_mut() {
@@ -543,7 +561,8 @@ pub fn detect_resonance_sectors(
         match fetch_board_components(&board.code, leaders_per_sector.max(3) * 2) {
             Ok(comps) => {
                 let ignition = compute_ignition(&comps);
-                let leaders = pick_leaders(&comps, leaders_per_sector, board.change_pct, &leader_cfg);
+                let leaders =
+                    pick_leaders(&comps, leaders_per_sector, board.change_pct, &leader_cfg);
                 info!(
                     "[共振] 板块 {}({}) 维度{:?} 涨幅={:.2}% 资金={:.2}亿 加速={:+.2}pp 量比={:.2} 点火(涨停{}/接近{}) 龙头={}",
                     board.name,
@@ -733,7 +752,11 @@ fn pick_leaders(
     }
 
     let mut by_amount: Vec<&BoardStock> = comps.iter().collect();
-    by_amount.sort_by(|a, b| b.amount.partial_cmp(&a.amount).unwrap_or(std::cmp::Ordering::Equal));
+    by_amount.sort_by(|a, b| {
+        b.amount
+            .partial_cmp(&a.amount)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let mut seen = HashSet::new();
     let mut picks: Vec<BoardStock> = Vec::new();
@@ -817,7 +840,11 @@ fn pick_leaders_legacy(comps: &[BoardStock], leaders_per_sector: usize) -> Vec<B
     let take_change = leaders_per_sector.saturating_sub(take_amount).min(2);
 
     let mut by_amount: Vec<&BoardStock> = comps.iter().collect();
-    by_amount.sort_by(|a, b| b.amount.partial_cmp(&a.amount).unwrap_or(std::cmp::Ordering::Equal));
+    by_amount.sort_by(|a, b| {
+        b.amount
+            .partial_cmp(&a.amount)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let mut by_change: Vec<&BoardStock> = comps.iter().collect();
     by_change.sort_by(|a, b| {
@@ -842,6 +869,196 @@ fn pick_leaders_legacy(comps: &[BoardStock], leaders_per_sector: usize) -> Vec<B
         }
     }
     picks
+}
+
+// ============================================================================
+// 量价反向发现（BR-021）：板块异动但无新闻归因
+//
+// 动机：新闻源永远不可能全（财经快讯漏掉"长十乙火箭回收"这类科技/时政事件）。
+// 兜底哲学——不赌"能订到所有新闻"，而赌"任何值钱的题材最终反映在成交量上"。
+// 因此反向检测：板块出现强量价异动（放量/资金加速/涨幅/点火）但**新闻文本无法解释**，
+// 即提示人工核查——可能是系统完全未预设的新题材。
+// ============================================================================
+
+/// 触发某板块被判定为「异动」的原因（可多条，用于说明推送理由）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnomalyReason {
+    /// 当日涨幅达阈值
+    HighChange,
+    /// 量比达阈值（今日相对近5日异常放量）
+    HighVolRatio,
+    /// 主力资金加速度达阈值
+    InflowAccel,
+}
+
+impl AnomalyReason {
+    pub fn label(&self) -> &'static str {
+        match self {
+            AnomalyReason::HighChange => "涨幅异动",
+            AnomalyReason::HighVolRatio => "放量",
+            AnomalyReason::InflowAccel => "资金加速",
+        }
+    }
+}
+
+/// 一个「异动但无新闻归因」的板块。
+#[derive(Debug, Clone)]
+pub struct UnexplainedMove {
+    pub board: ConceptBoard,
+    /// 触发异动的原因（≥1 条）
+    pub reasons: Vec<AnomalyReason>,
+}
+
+/// 反向发现阈值配置（可由环境变量覆盖）。
+#[derive(Debug, Clone)]
+pub struct UnexplainedConfig {
+    /// 是否启用反向发现
+    pub enabled: bool,
+    /// 涨幅异动阈值（%）
+    pub change_min: f64,
+    /// 量比异动阈值
+    pub vol_ratio_min: f64,
+    /// 资金加速度异动阈值（百分点）
+    pub accel_min: f64,
+    /// 最多返回的异动板块数（限流，防噪声）
+    pub max_n: usize,
+}
+
+impl Default for UnexplainedConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            change_min: 4.0,
+            vol_ratio_min: 2.0,
+            accel_min: 5.0,
+            max_n: 5,
+        }
+    }
+}
+
+impl UnexplainedConfig {
+    pub fn from_env() -> Self {
+        let d = Self::default();
+        let f = |key: &str, def: f64| -> f64 {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(def)
+        };
+        let u = |key: &str, def: usize| -> usize {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(def)
+        };
+        Self {
+            enabled: std::env::var("SECTOR_UNEXPLAINED_ENABLED")
+                .map(|v| v.to_lowercase() != "false")
+                .unwrap_or(d.enabled),
+            change_min: f("SECTOR_UNEXPLAINED_CHANGE_MIN", d.change_min),
+            vol_ratio_min: f("SECTOR_UNEXPLAINED_VOLRATIO_MIN", d.vol_ratio_min),
+            accel_min: f("SECTOR_UNEXPLAINED_ACCEL_MIN", d.accel_min),
+            max_n: u("SECTOR_UNEXPLAINED_MAX", d.max_n),
+        }
+    }
+}
+
+/// 计算单板块的异动原因（纯函数）。无异动返回空 Vec。
+fn anomaly_reasons(b: &ConceptBoard, cfg: &UnexplainedConfig) -> Vec<AnomalyReason> {
+    let mut reasons = Vec::new();
+    if b.change_pct >= cfg.change_min {
+        reasons.push(AnomalyReason::HighChange);
+    }
+    if b.vol_ratio >= cfg.vol_ratio_min {
+        reasons.push(AnomalyReason::HighVolRatio);
+    }
+    if b.inflow_accel() >= cfg.accel_min {
+        reasons.push(AnomalyReason::InflowAccel);
+    }
+    reasons
+}
+
+/// 异动严重度（用于排序）：涨幅 + 放量超额 + 资金加速的加权和。
+fn anomaly_severity(b: &ConceptBoard) -> f64 {
+    let vol_excess = (b.vol_ratio - 1.0).max(0.0);
+    b.change_pct.max(0.0) + vol_excess * 5.0 + b.inflow_accel().max(0.0) * 2.0
+}
+
+/// 纯函数核心（BR-021，离线可测，不触网）：
+/// 从已拉取的板块列表中，筛出**有量价异动但新闻文本无法解释**的板块，按严重度降序，限 `max_n` 条。
+///
+/// 红线 2.2：`news_text` 为空时，不臆测「有新闻」——空文本下所有异动板块都算未归因
+/// （由调用方保证传入的是真实新闻聚合文本；空表示今日确无新闻覆盖）。
+fn classify_unexplained(
+    boards: &[ConceptBoard],
+    news_text: &str,
+    cfg: &UnexplainedConfig,
+) -> Vec<UnexplainedMove> {
+    let mut out: Vec<UnexplainedMove> = boards
+        .iter()
+        .filter(|b| !news_match(news_text, &b.name))
+        .filter_map(|b| {
+            let reasons = anomaly_reasons(b, cfg);
+            if reasons.is_empty() {
+                None
+            } else {
+                Some(UnexplainedMove {
+                    board: b.clone(),
+                    reasons,
+                })
+            }
+        })
+        .collect();
+
+    out.sort_by(|a, b| {
+        anomaly_severity(&b.board)
+            .partial_cmp(&anomaly_severity(&a.board))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out.truncate(cfg.max_n);
+    out
+}
+
+/// 反向发现入口：拉取概念板块榜（涨幅 + 资金），找出量价异动但无新闻归因的板块。
+///
+/// - `news_text`：当日/近段真实新闻聚合文本（宏观 + 快讯 + 微博热搜等），用于归因匹配
+/// - `rank_top`：涨幅榜 / 资金榜各取前 N 名
+///
+/// 失败（板块榜为空/网络）返回 `Err`，由调用方按 best-effort 处理，不编造异动。
+pub fn detect_unexplained_moves(news_text: &str, rank_top: usize) -> Result<Vec<UnexplainedMove>> {
+    let cfg = UnexplainedConfig::from_env();
+    if !cfg.enabled {
+        return Ok(Vec::new());
+    }
+
+    let by_change = fetch_board_ranking("f3", rank_top)?;
+    let by_inflow = fetch_board_ranking("f62", rank_top)?;
+    if by_change.is_empty() && by_inflow.is_empty() {
+        warn!("[反向发现] 概念板块榜为空，跳过");
+        return Ok(Vec::new());
+    }
+
+    // 按 code 合并去重（保留任一路的板块条目）
+    let mut merged: HashMap<String, ConceptBoard> = HashMap::new();
+    for b in by_change.into_iter().chain(by_inflow.into_iter()) {
+        merged.entry(b.code.clone()).or_insert(b);
+    }
+    let boards: Vec<ConceptBoard> = merged.into_values().collect();
+
+    let moves = classify_unexplained(&boards, news_text, &cfg);
+    for m in &moves {
+        let reasons: Vec<&str> = m.reasons.iter().map(|r| r.label()).collect();
+        warn!(
+            "[反向发现] 异动无归因: {}({}) 涨{:.2}% 量比{:.2} 加速{:+.2}pp 原因[{}] → 建议人工查新闻",
+            m.board.name,
+            m.board.code,
+            m.board.change_pct,
+            m.board.vol_ratio,
+            m.board.inflow_accel(),
+            reasons.join("/")
+        );
+    }
+    Ok(moves)
 }
 
 #[cfg(test)]
@@ -989,5 +1206,97 @@ mod tests {
         assert_eq!(ig.limit_up_count, 2);
         assert_eq!(ig.near_limit_count, 3);
         assert_eq!(ig.sample, 4);
+    }
+
+    // ---- 反向发现（BR-021）----
+
+    /// 构造带名字的板块（默认阈值下：change_min=4, vol_ratio_min=2, accel_min=5）
+    fn named_board(name: &str, change: f64, today_pct: f64, pct5: f64, vol: f64) -> ConceptBoard {
+        ConceptBoard {
+            code: "BK9999".into(),
+            name: name.into(),
+            change_pct: change,
+            main_inflow: 1e8,
+            leader_name: String::new(),
+            vol_ratio: vol,
+            turnover: 0.0,
+            main_net_pct_today: today_pct,
+            main_net_pct_5d: pct5,
+        }
+    }
+
+    #[test]
+    fn anomaly_reasons_detects_each_dimension() {
+        let cfg = UnexplainedConfig::default();
+        // 仅涨幅异动
+        assert_eq!(
+            anomaly_reasons(&named_board("商业航天", 5.0, 0.0, 0.0, 1.0), &cfg),
+            vec![AnomalyReason::HighChange]
+        );
+        // 仅放量
+        assert_eq!(
+            anomaly_reasons(&named_board("商业航天", 1.0, 0.0, 0.0, 2.5), &cfg),
+            vec![AnomalyReason::HighVolRatio]
+        );
+        // 仅资金加速 (today-5d = 6 ≥ 5)
+        assert_eq!(
+            anomaly_reasons(&named_board("商业航天", 1.0, 6.0, 0.0, 1.0), &cfg),
+            vec![AnomalyReason::InflowAccel]
+        );
+        // 平稳板块无异动
+        assert!(anomaly_reasons(&named_board("商业航天", 1.0, 0.0, 0.0, 1.0), &cfg).is_empty());
+    }
+
+    #[test]
+    fn unexplained_excludes_news_matched_boards() {
+        let cfg = UnexplainedConfig::default();
+        let boards = vec![
+            named_board("商业航天", 6.0, 0.0, 0.0, 2.5), // 异动 + 无新闻 → 命中
+            named_board("光伏概念", 7.0, 0.0, 0.0, 3.0), // 异动但新闻已覆盖 → 排除
+        ];
+        // 新闻文本解释了光伏（"概念"尾缀去除后匹配"光伏"），但没有航天
+        let news = "光伏产业链价格企稳，行业需求回暖";
+        let moves = classify_unexplained(&boards, news, &cfg);
+        assert_eq!(moves.len(), 1);
+        assert_eq!(moves[0].board.name, "商业航天");
+    }
+
+    #[test]
+    fn unexplained_empty_news_keeps_all_anomalies() {
+        // 红线 2.2：空新闻文本不臆测有新闻 → 异动板块全部算未归因
+        let cfg = UnexplainedConfig::default();
+        let boards = vec![named_board("商业航天", 6.0, 0.0, 0.0, 2.5)];
+        let moves = classify_unexplained(&boards, "", &cfg);
+        assert_eq!(moves.len(), 1);
+    }
+
+    #[test]
+    fn unexplained_sorts_by_severity_and_limits() {
+        let cfg = UnexplainedConfig {
+            max_n: 2,
+            ..UnexplainedConfig::default()
+        };
+        let boards = vec![
+            named_board("弱异动", 4.5, 0.0, 0.0, 2.0),
+            named_board("强异动", 9.0, 8.0, 0.0, 3.5),
+            named_board("中异动", 6.0, 0.0, 0.0, 2.5),
+        ];
+        let moves = classify_unexplained(&boards, "", &cfg);
+        assert_eq!(moves.len(), 2); // 限流到 2
+        assert_eq!(moves[0].board.name, "强异动"); // 严重度降序
+        assert_eq!(moves[1].board.name, "中异动");
+    }
+
+    #[test]
+    fn unexplained_disabled_config_via_default_flag() {
+        // 阈值极高时无板块达标（验证阈值生效）
+        let cfg = UnexplainedConfig {
+            change_min: 99.0,
+            vol_ratio_min: 99.0,
+            accel_min: 99.0,
+            ..UnexplainedConfig::default()
+        };
+        let boards = vec![named_board("商业航天", 6.0, 0.0, 0.0, 2.5)];
+        assert!(classify_unexplained(&boards, "", &cfg).is_empty());
     }
 }

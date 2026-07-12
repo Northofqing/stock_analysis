@@ -57,7 +57,12 @@ async fn try_get(client: &reqwest::Client, path: &str) -> Result<Value> {
     let mut last_err: Option<anyhow::Error> = None;
     for host in HOSTS {
         let url = format!("https://{}{}", host, path);
-        match client.get(&url).header("Referer", "https://quote.eastmoney.com/").send().await {
+        match client
+            .get(&url)
+            .header("Referer", "https://quote.eastmoney.com/")
+            .send()
+            .await
+        {
             Ok(resp) => match resp.json::<Value>().await {
                 Ok(v) => return Ok(v),
                 Err(e) => last_err = Some(anyhow!("{}: parse {}", host, e)),
@@ -79,7 +84,11 @@ async fn load_industry_map(client: &reqwest::Client) -> Result<HashMap<String, S
             pn
         );
         let v = try_get(client, &path).await?;
-        let rows = v.pointer("/data/diff").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+        let rows = v
+            .pointer("/data/diff")
+            .and_then(|x| x.as_array())
+            .cloned()
+            .unwrap_or_default();
         if rows.is_empty() {
             break;
         }
@@ -122,7 +131,9 @@ async fn fetch_industry_name(client: &reqwest::Client, code: &str) -> Result<Str
         secid_for(code)
     );
     let v = try_get(client, &path).await?;
-    let name = v.pointer("/data/f127").and_then(|x| x.as_str())
+    let name = v
+        .pointer("/data/f127")
+        .and_then(|x| x.as_str())
         .ok_or_else(|| anyhow!("缺少 f127 行业字段"))?;
     Ok(name.to_string())
 }
@@ -164,10 +175,18 @@ async fn fetch_constituents(
         bk_code
     );
     let v = try_get(client, &path).await?;
-    let rows = v.pointer("/data/diff").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+    let rows = v
+        .pointer("/data/diff")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
     let mut out = Vec::with_capacity(rows.len());
     for r in rows {
-        let code = r.get("f12").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let code = r
+            .get("f12")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
         let pe = r.get("f9").and_then(|x| x.as_f64()).unwrap_or(f64::NAN);
         let pb = r.get("f23").and_then(|x| x.as_f64()).unwrap_or(f64::NAN);
         let roe = r.get("f37").and_then(|x| x.as_f64()).unwrap_or(f64::NAN);
@@ -180,14 +199,18 @@ async fn fetch_constituents(
 }
 
 pub async fn fetch_async(client: &reqwest::Client, code: &str) -> Result<IndustryBenchmark> {
-    let industry_name = fetch_industry_name(client, code).await.context("取行业名")?;
+    let industry_name = fetch_industry_name(client, code)
+        .await
+        .context("取行业名")?;
     let map = get_industry_map(client).await.context("加载行业列表")?;
     let bk_code = map
         .get(&industry_name)
         .cloned()
         .ok_or_else(|| anyhow!("行业名未匹配到 BK 代码: {}", industry_name))?;
 
-    let rows = fetch_constituents(client, &bk_code).await.context("取成份股")?;
+    let rows = fetch_constituents(client, &bk_code)
+        .await
+        .context("取成份股")?;
     if rows.is_empty() {
         return Err(anyhow!("行业 {} 无成份股", bk_code));
     }

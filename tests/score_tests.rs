@@ -11,7 +11,7 @@ fn base_inputs() -> ScoreInputs {
         flow_score: Some(70.0),
         cross_source_count: 2,
         quality_score: Some(60.0),
-        winrate_score: None,  // 默认无 winrate 数据
+        winrate_score: None, // 默认无 winrate 数据
         ai_degraded: false,
     }
 }
@@ -22,9 +22,17 @@ fn test_dual_score_default_event_risk_only() {
     let inputs = base_inputs();
     let score = compute_dual_score(&inputs, "v9.1-2026-06");
     assert!(score.event_risk_score >= 60);
-    assert!(score.trade_signal_score.is_none(), "无 winrate 数据时 trade_signal 必为 None");
-    assert!(score.notes.iter().any(|n| n.contains("无回测") || n.contains("无样本")),
-            "notes 必须标注无历史样本");
+    assert!(
+        score.trade_signal_score.is_none(),
+        "无 winrate 数据时 trade_signal 必为 None"
+    );
+    assert!(
+        score
+            .notes
+            .iter()
+            .any(|n| n.contains("无回测") || n.contains("无样本")),
+        "notes 必须标注无历史样本"
+    );
 }
 
 #[test]
@@ -54,32 +62,44 @@ fn test_winrate_zero_no_data() {
 fn test_event_risk_floor_70_no_winrate() {
     // 修复 P0-1: 无 winrate 时 event_risk_score 封顶 70 (B6 单源封顶规则的延伸)
     let mut inputs = ScoreInputs {
-        event_strength: 100, event_certainty: 100,
-        chain_match_score: 100, flow_score: Some(100.0),
-        cross_source_count: 5, quality_score: Some(100.0),
+        event_strength: 100,
+        event_certainty: 100,
+        chain_match_score: 100,
+        flow_score: Some(100.0),
+        cross_source_count: 5,
+        quality_score: Some(100.0),
         winrate_score: None,
         ai_degraded: false,
     };
     let score = compute_dual_score(&inputs, "v9.1-2026-06");
     // 即便所有项满分, 无 winrate 时总分封顶 70
-    assert!(score.event_risk_score <= 70,
-            "无 winrate 时 event_risk_score 封顶 70, 实际 {}", score.event_risk_score);
+    assert!(
+        score.event_risk_score <= 70,
+        "无 winrate 时 event_risk_score 封顶 70, 实际 {}",
+        score.event_risk_score
+    );
 }
 
 #[test]
 fn test_data_sufficiency_tracking() {
     // 修复 P0-1: data_sufficiency 区分真假 50
     let inputs = ScoreInputs {
-        event_strength: 80, event_certainty: 90,
-        chain_match_score: 75, flow_score: None,
-        cross_source_count: 1, quality_score: None, winrate_score: None,
+        event_strength: 80,
+        event_certainty: 90,
+        chain_match_score: 75,
+        flow_score: None,
+        cross_source_count: 1,
+        quality_score: None,
+        winrate_score: None,
         ai_degraded: false,
     };
     let score = compute_dual_score(&inputs, "v9.1-2026-06");
     assert!(!score.data_sufficiency.event_risk_sufficient);
     assert!(!score.data_sufficiency.has_intraday_flow);
-    assert!(score.notes.iter().any(|n| n.contains("数据不足")),
-            "≥ 2 项 data_sufficiency=false 必标注 数据不足");
+    assert!(
+        score.notes.iter().any(|n| n.contains("数据不足")),
+        "≥ 2 项 data_sufficiency=false 必标注 数据不足"
+    );
 }
 
 #[test]
@@ -92,24 +112,46 @@ fn test_ai_degraded_halves_event_score() {
     inputs.ai_degraded = true;
     let degraded = compute_dual_score(&inputs, "v9.1-2026-06");
 
-    let normal_event = normal.parts.iter().find(|p| p.name == "event").unwrap().value;
-    let degraded_event = degraded.parts.iter().find(|p| p.name == "event").unwrap().value;
+    let normal_event = normal
+        .parts
+        .iter()
+        .find(|p| p.name == "event")
+        .unwrap()
+        .value;
+    let degraded_event = degraded
+        .parts
+        .iter()
+        .find(|p| p.name == "event")
+        .unwrap()
+        .value;
 
-    assert!((degraded_event - normal_event * 0.5).abs() < 0.5,
-            "ai_degraded=true 时 event value 必为正常时的 0.5, 正常={} 降级={}", normal_event, degraded_event);
+    assert!(
+        (degraded_event - normal_event * 0.5).abs() < 0.5,
+        "ai_degraded=true 时 event value 必为正常时的 0.5, 正常={} 降级={}",
+        normal_event,
+        degraded_event
+    );
 
     // event_risk_score 也必降低
-    assert!(degraded.event_risk_score < normal.event_risk_score,
-            "ai_degraded 必降低 event_risk_score, 正常={} 降级={}", normal.event_risk_score, degraded.event_risk_score);
+    assert!(
+        degraded.event_risk_score < normal.event_risk_score,
+        "ai_degraded 必降低 event_risk_score, 正常={} 降级={}",
+        normal.event_risk_score,
+        degraded.event_risk_score
+    );
 
     // notes 必含 [AI降级] 标记
-    assert!(degraded.notes.iter().any(|n| n.contains("AI降级")),
-            "notes 必标注 [AI降级]");
+    assert!(
+        degraded.notes.iter().any(|n| n.contains("AI降级")),
+        "notes 必标注 [AI降级]"
+    );
 
     // event 项 data_sufficiency=false (算法降级, value 不应被解读为真实)
     let degraded_event_part = degraded.parts.iter().find(|p| p.name == "event").unwrap();
-    assert!(!degraded_event_part.data_sufficiency,
-            "ai_degraded 时 event 项 data_sufficiency=false");
+    assert!(
+        !degraded_event_part.data_sufficiency,
+        "ai_degraded 时 event 项 data_sufficiency=false"
+    );
 }
 
 #[test]
@@ -119,8 +161,16 @@ fn test_score_parts_count() {
     let score = compute_dual_score(&inputs, "v9.1-2026-06");
     assert!(score.parts.len() >= 5, "parts 必含 ≥ 5 项明细");
     for part in &score.parts {
-        assert!(part.value >= 0.0 && part.value <= 100.0, "{} value 越界", part.name);
-        assert!(part.weight > 0.0 && part.weight <= 1.0, "{} weight 越界", part.name);
+        assert!(
+            part.value >= 0.0 && part.value <= 100.0,
+            "{} value 越界",
+            part.name
+        );
+        assert!(
+            part.weight > 0.0 && part.weight <= 1.0,
+            "{} weight 越界",
+            part.name
+        );
     }
 }
 
@@ -128,9 +178,12 @@ fn test_score_parts_count() {
 fn test_score_part_data_sufficiency_flag() {
     // 修复 P0-1: 每项 part 携带 data_sufficiency 标识 (区分真弱 vs 数据不足)
     let inputs = ScoreInputs {
-        event_strength: 80, event_certainty: 90,
-        chain_match_score: 75, flow_score: None,  // 缺
-        cross_source_count: 1, quality_score: None,  // 缺
+        event_strength: 80,
+        event_certainty: 90,
+        chain_match_score: 75,
+        flow_score: None, // 缺
+        cross_source_count: 1,
+        quality_score: None, // 缺
         winrate_score: None,
         ai_degraded: false,
     };
@@ -138,7 +191,10 @@ fn test_score_part_data_sufficiency_flag() {
     let flow_part = score.parts.iter().find(|p| p.name == "flow");
     assert!(flow_part.is_some());
     let flow_part = flow_part.unwrap();
-    assert!(!flow_part.data_sufficiency, "flow 缺数据时 data_sufficiency=false");
+    assert!(
+        !flow_part.data_sufficiency,
+        "flow 缺数据时 data_sufficiency=false"
+    );
 }
 
 #[test]

@@ -17,9 +17,7 @@ use log::{info, warn};
 
 use crate::data_provider::KlineData;
 use crate::database::DatabaseManager;
-use crate::monitor::data_quality::{
-    validate_daily_freshness, DqStats, FreshnessConfig,
-};
+use crate::monitor::data_quality::{validate_daily_freshness, DqStats, FreshnessConfig};
 
 use super::AnalysisPipeline;
 
@@ -36,9 +34,11 @@ impl AnalysisPipeline {
         // 不占用 tokio worker 线程，避免饿死异步任务（timeout/新闻搜索/AI 调用）。
         let dm = self.data_manager.clone();
         let code_owned = code.to_string();
-        let (mut data, source) = tokio::task::spawn_blocking(move || {
-            dm.get_daily_data(&code_owned, 30)
-        }).await.context("spawn_blocking panicked")?.context("获取数据失败")?;
+        let (data, source) =
+            tokio::task::spawn_blocking(move || dm.get_daily_data(&code_owned, 30))
+                .await
+                .context("spawn_blocking panicked")?
+                .context("获取数据失败")?;
 
         if data.is_empty() {
             warn!("[{}] 获取到的数据为空", code);
@@ -54,7 +54,9 @@ impl AnalysisPipeline {
             daily_max_age_secs: self.config.dq_daily_stale_sec,
         };
         let dq_stats = DqStats::new();
-        if let Err(reason) = validate_daily_freshness(latest_date, chrono::Local::now(), &freshness, &dq_stats) {
+        if let Err(reason) =
+            validate_daily_freshness(latest_date, chrono::Local::now(), &freshness, &dq_stats)
+        {
             anyhow::bail!(
                 "[{}] 日线新鲜度校验失败: {} (latest_date={})",
                 code,

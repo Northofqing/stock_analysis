@@ -51,15 +51,21 @@ fn to_yahoo_symbol(code: &str) -> String {
 
 /// 批量拉取实时行情（一次请求最多约 20 只）
 pub fn fetch_quotes(codes: &[String]) -> Vec<YahooQuote> {
-    if codes.is_empty() { return vec![]; }
+    if codes.is_empty() {
+        return vec![];
+    }
 
     // 构建符号列表和反向映射
-    let mut symbol_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let symbols: Vec<String> = codes.iter().map(|c| {
-        let sym = to_yahoo_symbol(c);
-        symbol_map.insert(sym.clone(), c.clone());
-        sym
-    }).collect();
+    let mut symbol_map: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let symbols: Vec<String> = codes
+        .iter()
+        .map(|c| {
+            let sym = to_yahoo_symbol(c);
+            symbol_map.insert(sym.clone(), c.clone());
+            sym
+        })
+        .collect();
 
     let url = format!(
         "https://query1.finance.yahoo.com/v7/finance/quote?symbols={}",
@@ -87,17 +93,21 @@ pub fn fetch_quotes(codes: &[String]) -> Vec<YahooQuote> {
         }
     };
 
-    resp.quote_response.result.into_iter().filter_map(|r| {
-        let symbol = r.symbol.as_deref()?;
-        let code = symbol_map.get(symbol)?.clone();
-        Some(YahooQuote {
-            code,
-            price: r.regular_market_price.unwrap_or(0.0),
-            change_pct: r.regular_market_change_percent.unwrap_or(0.0),
-            volume: r.regular_market_volume.unwrap_or(0.0),
-            previous_close: r.regular_market_previous_close.unwrap_or(0.0),
+    resp.quote_response
+        .result
+        .into_iter()
+        .filter_map(|r| {
+            let symbol = r.symbol.as_deref()?;
+            let code = symbol_map.get(symbol)?.clone();
+            Some(YahooQuote {
+                code,
+                price: r.regular_market_price.unwrap_or(0.0),
+                change_pct: r.regular_market_change_percent.unwrap_or(0.0),
+                volume: r.regular_market_volume.unwrap_or(0.0),
+                previous_close: r.regular_market_previous_close.unwrap_or(0.0),
+            })
         })
-    }).collect()
+        .collect()
 }
 
 /// v64: 隔夜关注数据 (美股三大指数 + USD/CNY 汇率) — 雅虎财经 API
@@ -135,14 +145,18 @@ pub fn fetch_overnight_data() -> (String, String) {
         .iter()
         .copied()
         .filter(|x| x.abs() > 0.01)
-        .max_by(|a, b| a.abs().partial_cmp(&b.abs()).unwrap_or(std::cmp::Ordering::Equal))
+        .max_by(|a, b| {
+            a.abs()
+                .partial_cmp(&b.abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
         .unwrap_or(0.0);
 
     let us_summary = if main_pct.abs() < 0.01 {
-        "美股 持平".to_string()
+        "持平".to_string()
     } else {
         format!(
-            "美股 {}{:.1}% (纳{:+.1}% 道{:+.1}% 标{:+.1}%)",
+            "{}{:.1}% (纳{:+.1}% 道{:+.1}% 标{:+.1}%)",
             if main_pct > 0.0 { "+" } else { "" },
             main_pct,
             nasdaq_pct,
@@ -155,12 +169,12 @@ pub fn fetch_overnight_data() -> (String, String) {
     let usd_cny = by_code.get("CNY=X").copied().unwrap_or(0.0);
     // 变化: 涨 = 人民币贬值 (利空 A股), 跌 = 人民币升值 (利好 A股)
     let fx_summary = if usd_cny.abs() < 0.0001 {
-        "汇率 持平".to_string()
+        "持平".to_string()
     } else {
         // yahoo CNY=X 是 1 美元 = ? 人民币 (e.g. 7.18)
         // 我们需要 price (汇率值), 但 fetch_quotes 只返 change_pct
         // 简化: 只显示涨跌幅方向, 真实汇率值需另查 (后续 PR)
-        format!("汇率 {:+.2}% (USD/CNY)", usd_cny)
+        format!("{:+.2}% (USD/CNY)", usd_cny)
     };
 
     (us_summary, fx_summary)

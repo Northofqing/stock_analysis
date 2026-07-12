@@ -69,7 +69,9 @@ pub fn review_closed_trades(trades: &[Trade]) -> Vec<TradeReview> {
                     let holding_days = (trade.traded_at - buy.traded_at).num_days().max(0) as u32;
                     let pnl_pct = if buy.price > 0.0 {
                         (trade.price - buy.price) / buy.price * 100.0
-                    } else { 0.0 };
+                    } else {
+                        0.0
+                    };
 
                     reviews.push(TradeReview {
                         code: trade.code.clone(),
@@ -82,7 +84,7 @@ pub fn review_closed_trades(trades: &[Trade]) -> Vec<TradeReview> {
                         sell_price: trade.price,
                         holding_days,
                         pnl_pct,
-                        post_exit_chg_5d: None,  // 需要 K 线数据，后续补充
+                        post_exit_chg_5d: None, // 需要 K 线数据，后续补充
                         post_exit_chg_20d: None,
                         self_rating: None,
                         lesson: None,
@@ -107,7 +109,9 @@ pub fn enrich_post_exit(reviews: &mut [TradeReview]) {
     for r in reviews.iter_mut() {
         // 只补充已卖出 5 天以上的（否则数据不足）
         let days_since_sell = (chrono::Local::now().date_naive() - r.sell_date).num_days();
-        if days_since_sell < 5 { continue; }
+        if days_since_sell < 5 {
+            continue;
+        }
 
         match fetcher.get_daily_data(&r.code, 60) {
             Ok((kline, _)) => {
@@ -140,7 +144,9 @@ pub fn enrich_post_exit(reviews: &mut [TradeReview]) {
 mod tests {
     use super::*;
 
-    fn date(d: &str) -> NaiveDate { NaiveDate::parse_from_str(d, "%Y-%m-%d").unwrap() }
+    fn date(d: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(d, "%Y-%m-%d").unwrap()
+    }
     fn dt(d: &str) -> NaiveDateTime {
         NaiveDateTime::parse_from_str(&format!("{} 10:00:00", d), "%Y-%m-%d %H:%M:%S").unwrap()
     }
@@ -148,9 +154,14 @@ mod tests {
     fn make_trade(code: &str, dir: TradeDirection, price: f64, date_str: &str) -> Trade {
         Trade {
             id: None,
-            code: code.into(), name: format!("股票{}", code),
-            direction: dir, price, shares: 100, amount: price * 100.0,
-            reason: String::new(), traded_at: dt(date_str),
+            code: code.into(),
+            name: format!("股票{}", code),
+            direction: dir,
+            price,
+            shares: 100,
+            amount: price * 100.0,
+            reason: String::new(),
+            traded_at: dt(date_str),
         }
     }
 
@@ -181,9 +192,12 @@ mod tests {
 
     #[test]
     fn test_no_review_for_holding() {
-        let trades = vec![
-            make_trade("000547", TradeDirection::Buy, 10.0, "2026-06-01"),
-        ];
+        let trades = vec![make_trade(
+            "000547",
+            TradeDirection::Buy,
+            10.0,
+            "2026-06-01",
+        )];
         let reviews = review_closed_trades(&trades);
         assert_eq!(reviews.len(), 0);
     }

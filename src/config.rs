@@ -29,7 +29,9 @@ pub struct ChainRuleConfig {
     pub enabled: bool,
 }
 
-fn default_chain_rule_enabled() -> bool { true }
+fn default_chain_rule_enabled() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChainRulesFile {
@@ -128,25 +130,63 @@ pub struct MonitorConfig {
     pub air_refuel: AirRefuelConfig,
 }
 
-fn default_screener_interval() -> u64 { 30 }
-fn default_opp_interval() -> u64 { 60 }
-fn default_news_window_start_hour() -> u8 { 8 }
-fn default_news_window_end_hour() -> u8 { 22 }
-fn default_topic_search_intent_count() -> u8 { 6 }
-fn default_topic_search_timeout_sec() -> u64 { 10 }
-fn default_topic_mmr_relevance_weight() -> f32 { 0.72 }
-fn default_topic_mmr_diversity_penalty() -> f32 { 2.2 }
-fn default_topic_mmr_history_penalty() -> f32 { 1.4 }
-fn default_topic_history_window_hours() -> u64 { 72 }
-fn default_topic_history_memory_size() -> usize { 160 }
-fn default_topic_history_db_limit() -> usize { 400 }
-fn default_topic_news_max_age_days() -> i64 { 7 }
-fn default_dq_quote_stale_sec() -> u64 { 5 }
-fn default_dq_position_stale_sec() -> u64 { 30 }
-fn default_dq_nav_stale_sec() -> u64 { 24 * 3600 }
-fn default_dq_daily_stale_sec() -> u64 { 24 * 3600 }
-fn default_opportunity_min_confidence() -> u8 { 55 }
-fn default_opportunity_push_threshold() -> u8 { 75 }
+fn default_screener_interval() -> u64 {
+    30
+}
+fn default_opp_interval() -> u64 {
+    60
+}
+fn default_news_window_start_hour() -> u8 {
+    8
+}
+fn default_news_window_end_hour() -> u8 {
+    22
+}
+fn default_topic_search_intent_count() -> u8 {
+    6
+}
+fn default_topic_search_timeout_sec() -> u64 {
+    10
+}
+fn default_topic_mmr_relevance_weight() -> f32 {
+    0.72
+}
+fn default_topic_mmr_diversity_penalty() -> f32 {
+    2.2
+}
+fn default_topic_mmr_history_penalty() -> f32 {
+    1.4
+}
+fn default_topic_history_window_hours() -> u64 {
+    72
+}
+fn default_topic_history_memory_size() -> usize {
+    160
+}
+fn default_topic_history_db_limit() -> usize {
+    400
+}
+fn default_topic_news_max_age_days() -> i64 {
+    7
+}
+fn default_dq_quote_stale_sec() -> u64 {
+    5
+}
+fn default_dq_position_stale_sec() -> u64 {
+    30
+}
+fn default_dq_nav_stale_sec() -> u64 {
+    24 * 3600
+}
+fn default_dq_daily_stale_sec() -> u64 {
+    24 * 3600
+}
+fn default_opportunity_min_confidence() -> u8 {
+    55
+}
+fn default_opportunity_push_threshold() -> u8 {
+    75
+}
 
 // ── 实时否决链配置 (VetoChain) ──
 
@@ -173,8 +213,12 @@ pub struct LiveVetoConfig {
     pub fundamental_enabled: bool,
 }
 
-fn default_true() -> bool { true }
-fn default_veto_mode() -> String { "dry_run".to_string() }
+fn default_true() -> bool {
+    true
+}
+fn default_veto_mode() -> String {
+    "dry_run".to_string()
+}
 
 impl Default for LiveVetoConfig {
     fn default() -> Self {
@@ -251,9 +295,15 @@ pub struct AirRefuelConfig {
     pub next_day_review_enabled: bool,
 }
 
-fn default_air_refuel_entry_mode() -> String { "confirm".to_string() }
-fn default_air_refuel_confirm_lots() -> u32 { 10 }
-fn default_air_refuel_pilot_lots() -> u32 { 3 }
+fn default_air_refuel_entry_mode() -> String {
+    "confirm".to_string()
+}
+fn default_air_refuel_confirm_lots() -> u32 {
+    10
+}
+fn default_air_refuel_pilot_lots() -> u32 {
+    3
+}
 
 impl Default for AirRefuelConfig {
     fn default() -> Self {
@@ -266,8 +316,12 @@ impl Default for AirRefuelConfig {
     }
 }
 
-fn default_factor_action_normal() -> String { "normal".to_string() }
-fn default_down_weight_scale() -> f64 { 0.5 }
+fn default_factor_action_normal() -> String {
+    "normal".to_string()
+}
+fn default_down_weight_scale() -> f64 {
+    0.5
+}
 
 impl Default for FactorFeedbackConfig {
     fn default() -> Self {
@@ -334,9 +388,8 @@ static MONITOR_CONFIG: LazyLock<MonitorConfigSwap> =
     LazyLock::new(|| MonitorConfigSwap::from(Arc::new(MonitorConfig::default())));
 
 // 修复 P3.1: 集中风险/费用常量
-static RISK_CONFIG: LazyLock<RwLock<RiskConfig>> = LazyLock::new(|| {
-    RwLock::new(RiskConfig::default())
-});
+static RISK_CONFIG: LazyLock<RwLock<RiskConfig>> =
+    LazyLock::new(|| RwLock::new(RiskConfig::default()));
 
 /// 修复 P3.1: 集中风险/费用常量
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -385,10 +438,18 @@ pub struct AccountModeConfig {
     pub position_overload_cheng: u8,
 }
 
-fn default_daily_loss_pct() -> f64 { -1.5 }
-fn default_circuit_breaker_pct() -> f64 { -2.0 }
-fn default_consecutive_n() -> u32 { 3 }
-fn default_position_overload() -> u8 { 8 }
+fn default_daily_loss_pct() -> f64 {
+    -1.5
+}
+fn default_circuit_breaker_pct() -> f64 {
+    -2.0
+}
+fn default_consecutive_n() -> u32 {
+    3
+}
+fn default_position_overload() -> u8 {
+    8
+}
 
 impl Default for AccountModeConfig {
     fn default() -> Self {
@@ -441,7 +502,11 @@ pub struct SlippageConfig {
 }
 impl Default for SlippageConfig {
     fn default() -> Self {
-        Self { dynamic_enabled: false, alpha: 0.1, adv_days: 20 }
+        Self {
+            dynamic_enabled: false,
+            alpha: 0.1,
+            adv_days: 20,
+        }
     }
 }
 
@@ -454,7 +519,12 @@ pub struct PerformanceConfig {
 }
 impl Default for PerformanceConfig {
     fn default() -> Self {
-        Self { risk_free_rate: 0.03, trading_days_year: 252, sharpe_window: 60, sortino_min_period: 30 }
+        Self {
+            risk_free_rate: 0.03,
+            trading_days_year: 252,
+            sharpe_window: 60,
+            sortino_min_period: 30,
+        }
     }
 }
 
@@ -470,8 +540,12 @@ pub struct RegimeConfig {
 impl Default for RegimeConfig {
     fn default() -> Self {
         Self {
-            window_days: 20, bull_threshold: 0.03, bear_threshold: -0.03,
-            index_plunge_atr_mult: 2.0, flow_outflow_threshold: 0.5, flow_lookback_min: 15,
+            window_days: 20,
+            bull_threshold: 0.03,
+            bear_threshold: -0.03,
+            index_plunge_atr_mult: 2.0,
+            flow_outflow_threshold: 0.5,
+            flow_lookback_min: 15,
         }
     }
 }
@@ -485,7 +559,12 @@ pub struct ExposureConfig {
 }
 impl Default for ExposureConfig {
     fn default() -> Self {
-        Self { single_stock_max: 0.10, single_sector_max: 0.40, cash_floor: 0.15, stop_loss_default: -0.10 }
+        Self {
+            single_stock_max: 0.10,
+            single_sector_max: 0.40,
+            cash_floor: 0.15,
+            stop_loss_default: -0.10,
+        }
     }
 }
 
@@ -498,7 +577,12 @@ pub struct AlertConfig {
 }
 impl Default for AlertConfig {
     fn default() -> Self {
-        Self { min_importance_score: 70, min_emergency_score: 85, index_plunge_window_min: 5, stale_data_max_age_sec: 30 }
+        Self {
+            min_importance_score: 70,
+            min_emergency_score: 85,
+            index_plunge_window_min: 5,
+            stale_data_max_age_sec: 30,
+        }
     }
 }
 
@@ -524,10 +608,16 @@ fn parse_strategy_toml(content: &str) {
 fn load_strategy_config() {
     match std::fs::read_to_string("config/strategy.toml") {
         Ok(content) => {
-            log::debug!("[v12-config] 加载 config/strategy.toml ({} bytes)", content.len());
+            log::debug!(
+                "[v12-config] 加载 config/strategy.toml ({} bytes)",
+                content.len()
+            );
             parse_strategy_toml(&content);
         }
-        Err(e) => log::warn!("[v12-config] config/strategy.toml 读取失败: {} (用 const fallback)", e),
+        Err(e) => log::warn!(
+            "[v12-config] config/strategy.toml 读取失败: {} (用 const fallback)",
+            e
+        ),
     }
 }
 
@@ -541,7 +631,10 @@ fn load_chain_combined() {
             c
         }
         Err(e) => {
-            log::warn!("[v12-config] config/chain.toml 读取失败: {} (用 const fallback)", e);
+            log::warn!(
+                "[v12-config] config/chain.toml 读取失败: {} (用 const fallback)",
+                e
+            );
             return;
         }
     };

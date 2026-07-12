@@ -96,6 +96,12 @@ struct GlobalRow {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // CR-AUTH: winrate_simulator 启动前 operator 认证 (BR-028)
+    if let Err(e) = stock_analysis::auth::operator::require_monitor_operator_auth() {
+        eprintln!("[CR-AUTH] 认证失败: {:?} 拒绝启动 winrate_simulator", e);
+        std::process::exit(1);
+    }
+
     // 1. 解析参数
     let args: Vec<String> = env::args().collect();
     let (default_blacklist, theme_priorities, theme_generics) = load_br006_default_blacklist();
@@ -212,8 +218,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("【主题级明细】 (min-samples = {})", explicit_min_samples);
     println!(
-        "{:<24} {:>8} {:>8} {:>8} {:>10}  {}",
-        "主题", "推送", "命中", "未中", "胜率", "建议"
+        "{:<24} {:>8} {:>8} {:>8} {:>10}  建议",
+        "主题", "推送", "命中", "未中", "胜率"
     );
     println!("{}", "─".repeat(80));
     let blacklist_set: std::collections::HashSet<&String> = blacklist.iter().collect();
@@ -366,8 +372,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("\n  建议: 把上述 dyn_prior 复制到 config/chain_rules.toml 的 priority 字段.");
         println!("  注意: dyn_prior 只反映历史胜率, 不包含 forward-looking 因子 (市场风格切换 / 政策催化).");
         println!(
-            "  使用 AGENTS §2.9 边界证明模板: dyn_prior={} ± {} (95% CI), 与样本量={}",
-            "?", "?", "?"
+            "  使用 AGENTS §2.9 边界证明模板: dyn_prior=? ± ? (95% CI), 与样本量=?"
         );
     }
     println!();

@@ -65,8 +65,7 @@ impl VetoRule for BiasRateRule {
         // 条件 2: 空头排列 → 反弹诱多风险
         if ctx.is_bearish {
             verdict.risk_flags.push(
-                "❌ 整体处于空头排列，极其弱势，放弃短线博弈避开接飞刀，强制降级至观望"
-                    .to_string(),
+                "❌ 整体处于空头排列，极其弱势，放弃短线博弈避开接飞刀，强制降级至观望".to_string(),
             );
             verdict.force_hold = true;
         }

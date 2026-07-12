@@ -1,10 +1,8 @@
 //! divergence（从 indicators.rs 拆分）
 
+use super::{max_with_index, min_with_index};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use super::{max_with_index, min_with_index};
-
-
 
 // ============================================================================
 // 背离检测
@@ -110,4 +108,3 @@ pub fn detect_divergence(
         description: format!("{}未发现背离", indicator_name),
     }
 }
-

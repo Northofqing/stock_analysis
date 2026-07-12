@@ -8,8 +8,10 @@ use async_trait::async_trait;
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
 
-use super::super::types::{extract_domain, ApiKeyManager, NewsType, SearchProvider, SearchResponse, SearchResult, Sentiment};
-
+use super::super::types::{
+    extract_domain, ApiKeyManager, NewsType, SearchProvider, SearchResponse, SearchResult,
+    Sentiment,
+};
 
 // ============================================================================
 // Tavily 搜索引擎
@@ -38,7 +40,12 @@ impl TavilySearchProvider {
         }
     }
 
-    async fn do_search(&self, query: &str, api_key: &str, max_results: usize) -> Result<SearchResponse> {
+    async fn do_search(
+        &self,
+        query: &str,
+        api_key: &str,
+        max_results: usize,
+    ) -> Result<SearchResponse> {
         #[derive(Serialize)]
         struct TavilyRequest {
             query: String,
@@ -85,13 +92,14 @@ impl TavilySearchProvider {
         if !response.status().is_success() {
             let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
-            
-            let error_msg = if status.as_u16() == 429 || error_text.to_lowercase().contains("rate limit") {
-                format!("API 配额已用尽: {}", error_text)
-            } else {
-                format!("HTTP {}: {}", status, error_text)
-            };
-            
+
+            let error_msg =
+                if status.as_u16() == 429 || error_text.to_lowercase().contains("rate limit") {
+                    format!("API 配额已用尽: {}", error_text)
+                } else {
+                    format!("HTTP {}: {}", status, error_text)
+                };
+
             return Ok(SearchResponse::error(
                 query.to_string(),
                 self.name.clone(),
@@ -99,7 +107,8 @@ impl TavilySearchProvider {
             ));
         }
 
-        let tavily_response: TavilyResponse = response.json().await.context("解析 Tavily 响应失败")?;
+        let tavily_response: TavilyResponse =
+            response.json().await.context("解析 Tavily 响应失败")?;
 
         info!(
             "[Tavily] 搜索完成，query='{}', 返回 {} 条结果",
@@ -160,4 +169,3 @@ impl SearchProvider for TavilySearchProvider {
         .await
     }
 }
-

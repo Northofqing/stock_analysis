@@ -8,15 +8,15 @@ use std::collections::HashMap;
 /// 失败归因 10 变体 (BR-016 模式枚举)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FailureReason {
-    BuyTooLate,           // 买点过晚
-    SectorFade,            // 板块退潮
-    NotTradable,           // 不可成交 (涨停)
-    HumanNotExecuted,      // 人未执行
-    StopLossHit,           // 止损触发
-    MacdBearish,           // MACD 死叉
-    VolumeDivergence,      // 量能背离
-    NewsPositive,          // 新闻利好但未涨 (数据问题)
-    IndexDrag,             // 大盘拖累
+    BuyTooLate,       // 买点过晚
+    SectorFade,       // 板块退潮
+    NotTradable,      // 不可成交 (涨停)
+    HumanNotExecuted, // 人未执行
+    StopLossHit,      // 止损触发
+    MacdBearish,      // MACD 死叉
+    VolumeDivergence, // 量能背离
+    NewsPositive,     // 新闻利好但未涨 (数据问题)
+    IndexDrag,        // 大盘拖累
     Unknown,
 }
 
@@ -42,10 +42,10 @@ impl FailureReason {
 pub struct FailureItem {
     pub code: String,
     pub name: String,
-    pub signal_level: String,        // 原始信号级别 (A/B/C)
+    pub signal_level: String, // 原始信号级别 (A/B/C)
     pub reason: FailureReason,
-    pub pnl_pct: f64,                // 实际盈亏
-    pub suggestion: String,          // 处理建议
+    pub pnl_pct: f64,       // 实际盈亏
+    pub suggestion: String, // 处理建议
 }
 
 /// 周分布统计
@@ -72,11 +72,17 @@ impl WeeklyDistribution {
 /// R-06 渲染
 pub fn render_r06(items: &[FailureItem], weekly: &WeeklyDistribution) -> String {
     let mut s = String::new();
-    s.push_str(&format!("❌ 失败归因（{}）\n", Local::now().format("%Y-%m-%d")));
+    s.push_str(&format!(
+        "❌ 失败归因（{}）\n",
+        Local::now().format("%Y-%m-%d")
+    ));
     for it in items {
         s.push_str(&format!(
             "{}({}) 原信号: {} {}\n结果: pnl{:+.1}%\n归因: {}\n处理建议: {}\n─────\n",
-            it.name, it.code, it.signal_level, it.reason.label(),
+            it.name,
+            it.code,
+            it.signal_level,
+            it.reason.label(),
             it.pnl_pct,
             it.reason.label(),
             it.suggestion,

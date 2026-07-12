@@ -36,14 +36,36 @@ pub fn fetch_recent_lhb(_date: NaiveDate, _limit: usize) -> Vec<LhbEntryInput> {
 ///
 /// 数据缺失字段填 "数据缺失" 占位.
 pub fn render_to_string(inp: &LhbEntryInput, index: usize) -> String {
-    let buy_inst = inp.buy_inst_n.map(|n| n.to_string()).unwrap_or_else(|| "数据缺失".to_string());
-    let buy_inst_amt = inp.buy_inst_amt_wan.map(|v| format!("{:.0}", v)).unwrap_or_else(|| "数据缺失".to_string());
-    let buy_other = inp.buy_other_n.map(|n| n.to_string()).unwrap_or_else(|| "数据缺失".to_string());
-    let buy_other_amt = inp.buy_other_amt_wan.map(|v| format!("{:.0}", v)).unwrap_or_else(|| "数据缺失".to_string());
-    let buy_conc = inp.buy_conc_pct.map(|v| format!("{:.0}", v)).unwrap_or_else(|| "数据缺失".to_string());
+    let buy_inst = inp
+        .buy_inst_n
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "数据缺失".to_string());
+    let buy_inst_amt = inp
+        .buy_inst_amt_wan
+        .map(|v| format!("{:.0}", v))
+        .unwrap_or_else(|| "数据缺失".to_string());
+    let buy_other = inp
+        .buy_other_n
+        .map(|n| n.to_string())
+        .unwrap_or_else(|| "数据缺失".to_string());
+    let buy_other_amt = inp
+        .buy_other_amt_wan
+        .map(|v| format!("{:.0}", v))
+        .unwrap_or_else(|| "数据缺失".to_string());
+    let buy_conc = inp
+        .buy_conc_pct
+        .map(|v| format!("{:.0}", v))
+        .unwrap_or_else(|| "数据缺失".to_string());
     let sell = inp.sell_desc.as_deref().unwrap_or("数据缺失");
-    let sell_conc = inp.sell_conc_pct.map(|v| format!("{:.0}", v)).unwrap_or_else(|| "数据缺失".to_string());
-    let chain = inp.chain_match.as_deref().map(|s| format!("是-{}", s)).unwrap_or_else(|| "否".to_string());
+    let sell_conc = inp
+        .sell_conc_pct
+        .map(|v| format!("{:.0}", v))
+        .unwrap_or_else(|| "数据缺失".to_string());
+    let chain = inp
+        .chain_match
+        .as_deref()
+        .map(|s| format!("是-{}", s))
+        .unwrap_or_else(|| "否".to_string());
     let risk = inp.next_day_risk.as_deref().unwrap_or("数据缺失");
 
     format!(
@@ -66,13 +88,27 @@ pub fn assess_data_quality(entries: &[LhbEntryInput]) -> (u8, bool) {
     }
     let mut filled = 0;
     for e in entries {
-        if e.buy_inst_n.is_some() { filled += 1; }
-        if e.buy_inst_amt_wan.is_some() { filled += 1; }
-        if e.buy_other_n.is_some() { filled += 1; }
-        if e.buy_other_amt_wan.is_some() { filled += 1; }
-        if e.buy_conc_pct.is_some() { filled += 1; }
-        if e.sell_conc_pct.is_some() { filled += 1; }
-        if e.next_day_risk.is_some() { filled += 1; }
+        if e.buy_inst_n.is_some() {
+            filled += 1;
+        }
+        if e.buy_inst_amt_wan.is_some() {
+            filled += 1;
+        }
+        if e.buy_other_n.is_some() {
+            filled += 1;
+        }
+        if e.buy_other_amt_wan.is_some() {
+            filled += 1;
+        }
+        if e.buy_conc_pct.is_some() {
+            filled += 1;
+        }
+        if e.sell_conc_pct.is_some() {
+            filled += 1;
+        }
+        if e.next_day_risk.is_some() {
+            filled += 1;
+        }
     }
     let pct = ((filled as f64 / total as f64) * 100.0) as u8;
     let degraded = pct < 70;
@@ -128,21 +164,23 @@ mod tests {
 
     #[test]
     fn data_quality_full() {
-        let entries: Vec<LhbEntryInput> = (0..5).map(|i| LhbEntryInput {
-            code: format!("{:06}", i),
-            name: format!("N{}", i),
-            net_buy_yi: 1.0,
-            reason: "R".to_string(),
-            buy_inst_n: Some(2),
-            buy_inst_amt_wan: Some(8000.0),
-            buy_other_n: Some(3),
-            buy_other_amt_wan: Some(4000.0),
-            buy_conc_pct: Some(65.0),
-            sell_desc: Some("X".to_string()),
-            sell_conc_pct: Some(45.0),
-            chain_match: Some("AI".to_string()),
-            next_day_risk: Some("高开".to_string()),
-        }).collect();
+        let entries: Vec<LhbEntryInput> = (0..5)
+            .map(|i| LhbEntryInput {
+                code: format!("{:06}", i),
+                name: format!("N{}", i),
+                net_buy_yi: 1.0,
+                reason: "R".to_string(),
+                buy_inst_n: Some(2),
+                buy_inst_amt_wan: Some(8000.0),
+                buy_other_n: Some(3),
+                buy_other_amt_wan: Some(4000.0),
+                buy_conc_pct: Some(65.0),
+                sell_desc: Some("X".to_string()),
+                sell_conc_pct: Some(45.0),
+                chain_match: Some("AI".to_string()),
+                next_day_risk: Some("高开".to_string()),
+            })
+            .collect();
         let (pct, degraded) = assess_data_quality(&entries);
         assert_eq!(pct, 100);
         assert!(!degraded);

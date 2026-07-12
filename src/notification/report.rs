@@ -19,7 +19,11 @@ impl NotificationService {
         let mut lines = vec![
             format!("# 📅 {} A股自选股智能分析报告", report_date),
             String::new(),
-            format!("> 共分析 **{}** 只股票 | 报告生成时间：{}", results.len(), now),
+            format!(
+                "> 共分析 **{}** 只股票 | 报告生成时间：{}",
+                results.len(),
+                now
+            ),
             String::new(),
             "---".to_string(),
             String::new(),
@@ -40,18 +44,28 @@ impl NotificationService {
         // 统计信息
         let buy_count = results
             .iter()
-            .filter(|r| matches!(r.operation_advice.as_str(), "买入" | "加仓" | "强烈买入" | "建议买入" | "强烈建议买入"))
+            .filter(|r| {
+                matches!(
+                    r.operation_advice.as_str(),
+                    "买入" | "加仓" | "强烈买入" | "建议买入" | "强烈建议买入"
+                )
+            })
             .count();
         let sell_count = results
             .iter()
-            .filter(|r| matches!(r.operation_advice.as_str(), "卖出" | "减仓" | "建议减仓" | "建议卖出" |"强烈卖出"))
+            .filter(|r| {
+                matches!(
+                    r.operation_advice.as_str(),
+                    "卖出" | "减仓" | "建议减仓" | "建议卖出" | "强烈卖出"
+                )
+            })
             .count();
         let hold_count = results
             .iter()
             .filter(|r| matches!(r.operation_advice.as_str(), "持有" | "观望"))
             .count();
-        let avg_score: f64 = results.iter().map(|r| r.ranking_score as f64).sum::<f64>()
-            / results.len() as f64;
+        let avg_score: f64 =
+            results.iter().map(|r| r.ranking_score as f64).sum::<f64>() / results.len() as f64;
 
         lines.extend(vec![
             "## 📊 操作建议汇总".to_string(),
@@ -66,7 +80,8 @@ impl NotificationService {
         ]);
 
         // 当日涨停股票汇总
-        let limit_up_results: Vec<&AnalysisResult> = sorted_results.iter().filter(|r| r.is_limit_up).collect();
+        let limit_up_results: Vec<&AnalysisResult> =
+            sorted_results.iter().filter(|r| r.is_limit_up).collect();
         if !limit_up_results.is_empty() {
             lines.extend(vec![
                 "---".to_string(),
@@ -79,14 +94,22 @@ impl NotificationService {
             for r in &limit_up_results {
                 lines.push(format!(
                     "| {} {} | {} | {}分 | {} | {} |",
-                    r.get_emoji(), r.name, r.code, r.ranking_score, r.operation_advice, r.trend_prediction
+                    r.get_emoji(),
+                    r.name,
+                    r.code,
+                    r.ranking_score,
+                    r.operation_advice,
+                    r.trend_prediction
                 ));
             }
             lines.push(String::new());
         }
 
         // 反向择时信号汇总（sentiment_score<40 + 技术面企稳，历史 T5 胜率 55.62%）
-        let contrarian_results: Vec<&AnalysisResult> = sorted_results.iter().filter(|r| r.contrarian_signal).collect();
+        let contrarian_results: Vec<&AnalysisResult> = sorted_results
+            .iter()
+            .filter(|r| r.contrarian_signal)
+            .collect();
         if !contrarian_results.is_empty() {
             lines.extend(vec![
                 "---".to_string(),
@@ -137,7 +160,13 @@ impl NotificationService {
                 let (growth, capital, valuation) = r
                     .score_breakdown
                     .as_ref()
-                    .map(|sb| (sb.growth_sustainability, sb.capital_flow, sb.valuation_safety))
+                    .map(|sb| {
+                        (
+                            sb.growth_sustainability,
+                            sb.capital_flow,
+                            sb.valuation_safety,
+                        )
+                    })
                     .unwrap_or((0, 0, 0));
                 lines.push(format!(
                     "| {} | {} | {} | {:+.2}% | {:+.2}% | {} | {} | {} | {} |",
@@ -156,14 +185,20 @@ impl NotificationService {
         }
 
         // 模拟持仓汇总
-        let position_results: Vec<&AnalysisResult> = sorted_results.iter().filter(|r| r.position_return.is_some()).collect();
+        let position_results: Vec<&AnalysisResult> = sorted_results
+            .iter()
+            .filter(|r| r.position_return.is_some())
+            .collect();
         if !position_results.is_empty() {
-            let total_profit: f64 = position_results.iter().map(|r| {
-                let buy_price = r.position_buy_price.unwrap_or(0.0);
-                let qty = r.position_quantity.unwrap_or(0) as f64;
-                let ret = r.position_return.unwrap_or(0.0);
-                buy_price * qty * ret / 100.0
-            }).sum();
+            let total_profit: f64 = position_results
+                .iter()
+                .map(|r| {
+                    let buy_price = r.position_buy_price.unwrap_or(0.0);
+                    let qty = r.position_quantity.unwrap_or(0) as f64;
+                    let ret = r.position_return.unwrap_or(0.0);
+                    buy_price * qty * ret / 100.0
+                })
+                .sum();
 
             lines.extend(vec![
                 "---".to_string(),
@@ -180,7 +215,11 @@ impl NotificationService {
                 let profit = buy_price * qty * ret / 100.0;
                 let cur_price = r.current_price.unwrap_or(0.0);
                 let date = r.position_buy_date.as_deref().unwrap_or("-");
-                let ret_str = if ret >= 0.0 { format!("🟢 {:+.2}%", ret) } else { format!("🔴 {:+.2}%", ret) };
+                let ret_str = if ret >= 0.0 {
+                    format!("🟢 {:+.2}%", ret)
+                } else {
+                    format!("🔴 {:+.2}%", ret)
+                };
                 lines.push(format!(
                     "| {} | {} | {:.2} | {:.2} | {} | {:+.2} | {} |",
                     r.name, r.code, buy_price, cur_price, ret_str, profit, date
@@ -188,7 +227,10 @@ impl NotificationService {
             }
             lines.push(String::new());
             let total_emoji = if total_profit >= 0.0 { "📈" } else { "📉" };
-            lines.push(format!("**{} 持仓总浮动盈亏：{:+.2} 元**", total_emoji, total_profit));
+            lines.push(format!(
+                "**{} 持仓总浮动盈亏：{:+.2} 元**",
+                total_emoji, total_profit
+            ));
             lines.push(String::new());
         }
 
@@ -202,10 +244,21 @@ impl NotificationService {
         // 逐个股票的详细分析
         for result in &sorted_results {
             let emoji = result.get_emoji();
-            let limit_up_tag = if result.is_limit_up { " 🔥涨停" } else { "" };
-            let contrarian_tag = if result.contrarian_signal { " 🔄反向信号" } else { "" };
+            let limit_up_tag = if result.is_limit_up {
+                " 🔥涨停"
+            } else {
+                ""
+            };
+            let contrarian_tag = if result.contrarian_signal {
+                " 🔄反向信号"
+            } else {
+                ""
+            };
 
-            lines.push(format!("### {} {} ({}){}{}", emoji, result.name, result.code, limit_up_tag, contrarian_tag));
+            lines.push(format!(
+                "### {} {} ({}){}{}",
+                emoji, result.name, result.code, limit_up_tag, contrarian_tag
+            ));
             lines.push(String::new());
             lines.push(format!(
                 "**操作建议：{}** | **综合评分（排序）：{}分** | **趋势预测：{}**",
@@ -242,7 +295,11 @@ impl NotificationService {
             }
 
             // 模拟持仓收益展示
-            if let (Some(buy_price), Some(return_rate), Some(quantity)) = (result.position_buy_price, result.position_return, result.position_quantity) {
+            if let (Some(buy_price), Some(return_rate), Some(quantity)) = (
+                result.position_buy_price,
+                result.position_return,
+                result.position_quantity,
+            ) {
                 let return_emoji = if return_rate > 0.0 { "📈" } else { "📉" };
                 let buy_date_str = result.position_buy_date.as_deref().unwrap_or("未知");
                 let profit = buy_price * quantity as f64 * return_rate / 100.0;
@@ -256,7 +313,11 @@ impl NotificationService {
                         buy_price, sell_price, quantity, return_rate, profit, buy_date_str, sell_date
                     ));
                 } else {
-                    let status_tag = if result.position_status.as_deref() == Some("new") { "🟢 新建仓" } else { "📊 持仓中" };
+                    let status_tag = if result.position_status.as_deref() == Some("new") {
+                        "🟢 新建仓"
+                    } else {
+                        "📊 持仓中"
+                    };
                     lines.push(format!(
                         "**{} 模拟持仓（{}）**：买入价 {:.2} | {} 股 | 收益率 **{:+.2}%** | 浮动盈亏 **{:+.2} 元** | 买入日期 {}",
                         return_emoji, status_tag, buy_price, quantity, return_rate, profit, buy_date_str
@@ -336,10 +397,15 @@ impl NotificationService {
                 lines.push(String::new());
 
                 if let Some(vr) = result.volume_ratio_5d {
-                    let vol_status = if vr > 2.0 { "显著放量" }
-                        else if vr > 1.2 { "温和放量" }
-                        else if vr > 0.8 { "量能平稳" }
-                        else { "明显缩量" };
+                    let vol_status = if vr > 2.0 {
+                        "显著放量"
+                    } else if vr > 1.2 {
+                        "温和放量"
+                    } else if vr > 0.8 {
+                        "量能平稳"
+                    } else {
+                        "明显缩量"
+                    };
                     lines.push(format!("- **5日量比**: {:.2} ({})", vr, vol_status));
                 }
                 if let Some(chg) = result.chg_5d {
@@ -349,9 +415,13 @@ impl NotificationService {
                     lines.push(format!("- **近10日涨幅**: {:.2}%", chg));
                 }
                 if let Some(vol) = result.volatility {
-                    let vol_level = if vol > 5.0 { "⚠️ 波动剧烈" }
-                        else if vol > 3.0 { "波动较大" }
-                        else { "波动正常" };
+                    let vol_level = if vol > 5.0 {
+                        "⚠️ 波动剧烈"
+                    } else if vol > 3.0 {
+                        "波动较大"
+                    } else {
+                        "波动正常"
+                    };
                     lines.push(format!("- **日波动率**: {:.2}% ({})", vol, vol_level));
                 }
 
@@ -359,8 +429,10 @@ impl NotificationService {
             }
 
             // ========== 估值指标 ==========
-            let has_valuation = result.pe_ratio.is_some() || result.pb_ratio.is_some()
-                || result.market_cap.is_some() || result.turnover_rate.is_some();
+            let has_valuation = result.pe_ratio.is_some()
+                || result.pb_ratio.is_some()
+                || result.market_cap.is_some()
+                || result.turnover_rate.is_some();
             if has_valuation {
                 lines.push("#### 💰 估值指标".to_string());
                 lines.push(String::new());
@@ -368,31 +440,51 @@ impl NotificationService {
                 lines.push("|------|------|------|".to_string());
 
                 if let Some(pe) = result.pe_ratio {
-                    let a = if pe < 0.0 { "亏损" }
-                        else if pe < 15.0 { "✅ 合理" }
-                        else if pe < 30.0 { "⚠️ 适中" }
-                        else { "🔴 偏高" };
+                    let a = if pe < 0.0 {
+                        "亏损"
+                    } else if pe < 15.0 {
+                        "✅ 合理"
+                    } else if pe < 30.0 {
+                        "⚠️ 适中"
+                    } else {
+                        "🔴 偏高"
+                    };
                     lines.push(format!("| PE | {:.2} | {} |", pe, a));
                 }
                 if let Some(pb) = result.pb_ratio {
-                    let a = if pb < 1.0 { "✅ 可能低估" }
-                        else if pb < 3.0 { "正常" }
-                        else { "🔴 偏高" };
+                    let a = if pb < 1.0 {
+                        "✅ 可能低估"
+                    } else if pb < 3.0 {
+                        "正常"
+                    } else {
+                        "🔴 偏高"
+                    };
                     lines.push(format!("| PB | {:.2} | {} |", pb, a));
                 }
                 if let Some(t) = result.turnover_rate {
-                    let a = if t < 1.0 { "极度清淡" }
-                        else if t < 3.0 { "清淡" }
-                        else if t < 7.0 { "正常" }
-                        else if t < 15.0 { "活跃" }
-                        else { "火热" };
+                    let a = if t < 1.0 {
+                        "极度清淡"
+                    } else if t < 3.0 {
+                        "清淡"
+                    } else if t < 7.0 {
+                        "正常"
+                    } else if t < 15.0 {
+                        "活跃"
+                    } else {
+                        "火热"
+                    };
                     lines.push(format!("| 换手率 | {:.2}% | {} |", t, a));
                 }
                 if let Some(mc) = result.market_cap {
-                    let cap = if mc < 50.0 { "小盘" }
-                        else if mc < 300.0 { "中盘" }
-                        else if mc < 1000.0 { "大盘" }
-                        else { "超大盘" };
+                    let cap = if mc < 50.0 {
+                        "小盘"
+                    } else if mc < 300.0 {
+                        "中盘"
+                    } else if mc < 1000.0 {
+                        "大盘"
+                    } else {
+                        "超大盘"
+                    };
                     lines.push(format!("| 总市值 | {:.2}亿 | {} |", mc, cap));
                 }
                 if let Some(cc) = result.circulating_cap {
@@ -403,8 +495,10 @@ impl NotificationService {
             }
 
             // ========== 财务指标 ==========
-            let has_financials = result.eps.is_some() || result.roe.is_some()
-                || result.gross_margin.is_some() || result.revenue_yoy.is_some();
+            let has_financials = result.eps.is_some()
+                || result.roe.is_some()
+                || result.gross_margin.is_some()
+                || result.revenue_yoy.is_some();
             if has_financials {
                 lines.push("#### 📋 财务指标".to_string());
                 lines.push(String::new());
@@ -412,47 +506,76 @@ impl NotificationService {
                 lines.push("|------|------|------|".to_string());
 
                 if let Some(eps) = result.eps {
-                    let a = if eps < 0.0 { "亏损" }
-                        else if eps < 0.5 { "较弱" }
-                        else if eps < 2.0 { "正常" }
-                        else { "✅ 优秀" };
+                    let a = if eps < 0.0 {
+                        "亏损"
+                    } else if eps < 0.5 {
+                        "较弱"
+                    } else if eps < 2.0 {
+                        "正常"
+                    } else {
+                        "✅ 优秀"
+                    };
                     lines.push(format!("| EPS | {:.3}元 | {} |", eps, a));
                 }
                 if let Some(roe) = result.roe {
-                    let a = if roe < 5.0 { "较低" }
-                        else if roe < 15.0 { "正常" }
-                        else if roe < 25.0 { "✅ 优秀" }
-                        else { "🌟 卓越" };
+                    let a = if roe < 5.0 {
+                        "较低"
+                    } else if roe < 15.0 {
+                        "正常"
+                    } else if roe < 25.0 {
+                        "✅ 优秀"
+                    } else {
+                        "🌟 卓越"
+                    };
                     lines.push(format!("| ROE | {:.2}% | {} |", roe, a));
                 }
                 if let Some(gm) = result.gross_margin {
-                    let a = if gm < 20.0 { "竞争激烈" }
-                        else if gm < 40.0 { "正常" }
-                        else { "✅ 高壁垒" };
+                    let a = if gm < 20.0 {
+                        "竞争激烈"
+                    } else if gm < 40.0 {
+                        "正常"
+                    } else {
+                        "✅ 高壁垒"
+                    };
                     lines.push(format!("| 毛利率 | {:.2}% | {} |", gm, a));
                 }
                 if let Some(nm) = result.net_margin {
                     lines.push(format!("| 净利率 | {:.2}% | - |", nm));
                 }
                 if let Some(r) = result.revenue_yoy {
-                    let a = if r < 0.0 { "🔴 下滑" }
-                        else if r < 10.0 { "缓慢" }
-                        else if r < 30.0 { "✅ 稳健" }
-                        else { "🚀 高速" };
+                    let a = if r < 0.0 {
+                        "🔴 下滑"
+                    } else if r < 10.0 {
+                        "缓慢"
+                    } else if r < 30.0 {
+                        "✅ 稳健"
+                    } else {
+                        "🚀 高速"
+                    };
                     lines.push(format!("| 营收同比 | {:.2}% | {} |", r, a));
                 }
                 if let Some(p) = result.net_profit_yoy {
-                    let a = if p < -20.0 { "🔴 大幅下滑" }
-                        else if p < 0.0 { "⚠️ 下滑" }
-                        else if p < 20.0 { "稳定" }
-                        else { "✅ 高速增长" };
+                    let a = if p < -20.0 {
+                        "🔴 大幅下滑"
+                    } else if p < 0.0 {
+                        "⚠️ 下滑"
+                    } else if p < 20.0 {
+                        "稳定"
+                    } else {
+                        "✅ 高速增长"
+                    };
                     lines.push(format!("| 净利润同比 | {:.2}% | {} |", p, a));
                 }
                 if let Some(sr) = result.sharpe_ratio {
-                    let a = if sr < 0.0 { "🔴 亏损" }
-                        else if sr < 1.0 { "一般" }
-                        else if sr < 2.0 { "✅ 良好" }
-                        else { "🌟 优秀" };
+                    let a = if sr < 0.0 {
+                        "🔴 亏损"
+                    } else if sr < 1.0 {
+                        "一般"
+                    } else if sr < 2.0 {
+                        "✅ 良好"
+                    } else {
+                        "🌟 优秀"
+                    };
                     lines.push(format!("| 夏普比率 | {:.2} | {} |", sr, a));
                 }
 
@@ -556,7 +679,9 @@ impl NotificationService {
                     };
                     lines.push(format!(
                         "| 信号动作 | {} {} | {} |",
-                        icon, bm.action.name(), bm.reason
+                        icon,
+                        bm.action.name(),
+                        bm.reason
                     ));
                     lines.push(format!(
                         "| 布林轨道 | 上 ¥{:.2} / 中 ¥{:.2} / 下 ¥{:.2} | 收 ¥{:.2} |",
@@ -619,8 +744,8 @@ impl NotificationService {
             .iter()
             .filter(|r| matches!(r.operation_advice.as_str(), "持有" | "观望"))
             .count();
-        let avg_score: f64 = results.iter().map(|r| r.ranking_score as f64).sum::<f64>()
-            / results.len() as f64;
+        let avg_score: f64 =
+            results.iter().map(|r| r.ranking_score as f64).sum::<f64>() / results.len() as f64;
 
         let mut lines = vec![
             format!("## 📅 {} A股分析报告", report_date),
@@ -658,7 +783,13 @@ impl NotificationService {
                 }
             }
             if let Some(vr) = result.volume_ratio_5d {
-                let vs = if vr > 2.0 { "放量" } else if vr < 0.8 { "缩量" } else { "" };
+                let vs = if vr > 2.0 {
+                    "放量"
+                } else if vr < 0.8 {
+                    "缩量"
+                } else {
+                    ""
+                };
                 if !vs.is_empty() {
                     indicators.push(format!("量比{:.1}({})", vr, vs));
                 }
@@ -718,7 +849,6 @@ impl NotificationService {
 
         lines.join("\n")
     }
-
 }
 
 fn is_trend_growth_focus(result: &AnalysisResult) -> bool {

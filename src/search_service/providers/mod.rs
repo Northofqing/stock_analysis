@@ -4,10 +4,13 @@
 
 pub mod bocha;
 pub mod cls;
+pub mod cls_sign;
 pub mod cninfo;
 pub mod eastmoney;
 pub mod em_announcement;
 pub mod em_industry_news;
+pub mod gelonghui;
+pub mod gov_policy;
 pub mod jin10;
 pub mod kcb_daily;
 pub mod serpapi;
@@ -15,6 +18,7 @@ pub mod sina_flash;
 pub mod sse_szse;
 pub mod tavily;
 pub mod wallstreetcn;
+pub mod weibo_hot;
 pub mod xueqiu;
 
 pub use bocha::BochaSearchProvider;
@@ -23,6 +27,8 @@ pub use cninfo::CninfoProvider;
 pub use eastmoney::EastmoneyNewsProvider;
 pub use em_announcement::EmAnnouncementProvider;
 pub use em_industry_news::EmIndustryNewsProvider;
+pub use gelonghui::GelonghuiProvider;
+pub use gov_policy::GovPolicyProvider;
 pub use jin10::{Jin10CalendarEvent, Jin10Provider};
 pub use kcb_daily::KcbDailyProvider;
 pub use serpapi::SerpAPISearchProvider;
@@ -30,4 +36,5 @@ pub use sina_flash::SinaFlashProvider;
 pub use sse_szse::SseSzseProvider;
 pub use tavily::TavilySearchProvider;
 pub use wallstreetcn::WallStreetCnProvider;
+pub use weibo_hot::WeiboHotProvider;
 pub use xueqiu::XueqiuProvider;

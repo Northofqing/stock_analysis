@@ -42,7 +42,10 @@ fn percentile_of(sorted: &[f64], current: f64) -> f64 {
     // 当前值在升序序列中的排名 / 总数 * 100；相同则取中点
     let n = sorted.len() as f64;
     let less = sorted.iter().filter(|v| **v < current).count() as f64;
-    let equal = sorted.iter().filter(|v| (**v - current).abs() < 1e-9).count() as f64;
+    let equal = sorted
+        .iter()
+        .filter(|v| (**v - current).abs() < 1e-9)
+        .count() as f64;
     ((less + equal / 2.0) / n) * 100.0
 }
 

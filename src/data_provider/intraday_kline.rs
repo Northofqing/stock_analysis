@@ -7,7 +7,7 @@
 //! 返回的 `MinuteBar` 按时间**升序**排列（最新在末尾），便于直接喂给
 //! `indicators::analyze_indicators(highs, lows, closes)`。
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 
 /// 分钟级 K 线（仅保留多周期分析需要的字段）
 #[derive(Debug, Clone)]
@@ -54,13 +54,18 @@ async fn fetch_async(
         );
         log::debug!("[分钟K线 klt={} host={}] {}", klt, host, url);
 
-        let resp = match client.get(&url)
+        let resp = match client
+            .get(&url)
             .header("Referer", "https://quote.eastmoney.com/")
             .header("Accept", "application/json, text/plain, */*")
-            .send().await
+            .send()
+            .await
         {
             Ok(r) => r,
-            Err(e) => { last_err = format!("{}: {}", host, e); continue; }
+            Err(e) => {
+                last_err = format!("{}: {}", host, e);
+                continue;
+            }
         };
         if !resp.status().is_success() {
             last_err = format!("{}: 状态码 {}", host, resp.status());
@@ -68,7 +73,10 @@ async fn fetch_async(
         }
         let text = match resp.text().await {
             Ok(t) => t,
-            Err(e) => { last_err = format!("{}: 读取失败 {}", host, e); continue; }
+            Err(e) => {
+                last_err = format!("{}: 读取失败 {}", host, e);
+                continue;
+            }
         };
         let body = text.trim_start();
         if body.starts_with('<') {
@@ -77,14 +85,17 @@ async fn fetch_async(
         }
         let json: serde_json::Value = match serde_json::from_str(&text) {
             Ok(v) => v,
-            Err(e) => { last_err = format!("{}: JSON解析失败 {}", host, e); continue; }
+            Err(e) => {
+                last_err = format!("{}: JSON解析失败 {}", host, e);
+                continue;
+            }
         };
 
         let Some(klines) = json
             .get("data")
             .and_then(|d| d.get("klines"))
-            .and_then(|v| v.as_array()) else
-        {
+            .and_then(|v| v.as_array())
+        else {
             last_err = format!("{}: 分钟K线无 klines 数组", host);
             continue;
         };
@@ -125,12 +136,7 @@ async fn fetch_async(
 }
 
 /// 同步阻塞包装（在 tokio runtime 上下文调用）。
-pub fn fetch_blocking(
-    client: &reqwest::Client,
-    code: &str,
-    klt: u8,
-    lmt: usize,
-) -> Vec<MinuteBar> {
+pub fn fetch_blocking(client: &reqwest::Client, code: &str, klt: u8, lmt: usize) -> Vec<MinuteBar> {
     // 修复 Top10#5 (2026-06-29 audit): 用 crate::block_on_async 统一替代
     if tokio::runtime::Handle::try_current().is_err() {
         return Vec::new();

@@ -40,7 +40,9 @@ pub struct AccountModeLogRow {
 }
 
 /// 单引号 escape (与 `database::mod.rs::save_prediction` 一致)
-fn esc(s: &str) -> String { s.replace('\'', "''") }
+fn esc(s: &str) -> String {
+    s.replace('\'', "''")
+}
 
 /// 插入一行模式变更 (pushed=0), 返回新行 id
 pub fn insert_account_mode_change(
@@ -61,9 +63,15 @@ pub fn insert_account_mode_change(
     let new_s = mode_label(new);
     let reason_s = esc(trigger_reason);
 
-    let pnl = today_pnl_pct.map(|v| v.to_string()).unwrap_or_else(|| "NULL".to_string());
-    let cons = consecutive_n.map(|v| v.to_string()).unwrap_or_else(|| "NULL".to_string());
-    let pos = total_pos_cheng.map(|v| v.to_string()).unwrap_or_else(|| "NULL".to_string());
+    let pnl = today_pnl_pct
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "NULL".to_string());
+    let cons = consecutive_n
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "NULL".to_string());
+    let pos = total_pos_cheng
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "NULL".to_string());
     let dc = if data_complete { 1 } else { 0 };
 
     let sql = format!(
@@ -77,7 +85,10 @@ pub fn insert_account_mode_change(
 
     // 取 last_insert_rowid
     #[derive(diesel::QueryableByName)]
-    struct IdRow { #[diesel(sql_type = diesel::sql_types::BigInt)] id: i64 }
+    struct IdRow {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        id: i64,
+    }
     let row: IdRow = diesel::sql_query("SELECT last_insert_rowid() AS id")
         .get_result(&mut conn)
         .map_err(|e| format!("last_insert_rowid: {}", e))?;
@@ -147,7 +158,11 @@ mod tests {
     /// 这里只测试纯函数 (mode_label).
     #[test]
     fn mode_label_coverage() {
-        for m in [AccountMode::Normal, AccountMode::ReduceOnly, AccountMode::Frozen] {
+        for m in [
+            AccountMode::Normal,
+            AccountMode::ReduceOnly,
+            AccountMode::Frozen,
+        ] {
             assert!(!mode_label(m).is_empty());
         }
     }

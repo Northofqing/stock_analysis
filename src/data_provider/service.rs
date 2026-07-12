@@ -38,9 +38,9 @@ fn ttl_for_now() -> Duration {
         MarketSession::Morning | MarketSession::Afternoon | MarketSession::Auction => {
             Duration::from_secs(5 * 60)
         }
-        MarketSession::Closed
-            | MarketSession::LunchBreak
-            | MarketSession::AfterHours => Duration::from_secs(24 * 60 * 60),
+        MarketSession::Closed | MarketSession::LunchBreak | MarketSession::AfterHours => {
+            Duration::from_secs(24 * 60 * 60)
+        }
     }
 }
 
@@ -117,8 +117,14 @@ impl DataFetchService {
         }
         // 2. cache miss / 过期 → 抓 (共享 fallback: 腾讯 → 东财 → RustDX)
         let cell_for_write = cell.clone();
-        let (data, source) = crate::data_provider::fallback::fetch_kline_with_fallback(code, days).await?;
-        log::info!("[DataFetch] {} OK (source={}), {} 条", code, source, data.len());
+        let (data, source) =
+            crate::data_provider::fallback::fetch_kline_with_fallback(code, days).await?;
+        log::info!(
+            "[DataFetch] {} OK (source={}), {} 条",
+            code,
+            source,
+            data.len()
+        );
         // 3. 写缓存 (仅成功结果)
         let arc = Arc::new(data);
         Self::write_cache(&cell_for_write, arc.clone()).await;
@@ -187,30 +193,29 @@ pub fn service() -> &'static DataFetchService {
 mod tests {
     // review #15: 把测试 only 的 import (brief/is_ban_error) 移进 test mod,
     // 避免 lib build 的 #[allow(unused_imports)] smell.
+    use super::*;
     #[allow(unused_imports)]
     use crate::data_provider::brief;
     use crate::data_provider::is_ban_error;
-    use super::*;
 
     #[test]
     fn test_ttl_for_now_outside_trading_hours_is_long() {
         // 周日中午 → 隔夜/盘后 → 24h TTL
-        let sunday_noon = chrono::NaiveDateTime::parse_from_str(
-            "2026-06-21 12:00:00",
-            "%Y-%m-%d %H:%M:%S",
-        )
-        .unwrap();
-        assert_eq!(ttl_for_now_at(sunday_noon), Duration::from_secs(24 * 60 * 60));
+        let sunday_noon =
+            chrono::NaiveDateTime::parse_from_str("2026-06-21 12:00:00", "%Y-%m-%d %H:%M:%S")
+                .unwrap();
+        assert_eq!(
+            ttl_for_now_at(sunday_noon),
+            Duration::from_secs(24 * 60 * 60)
+        );
     }
 
     #[test]
     fn test_ttl_for_now_during_trading_is_short() {
         // 周三 10:30 → 盘内 → 5min TTL
-        let wed_morning = chrono::NaiveDateTime::parse_from_str(
-            "2026-06-24 10:30:00",
-            "%Y-%m-%d %H:%M:%S",
-        )
-        .unwrap();
+        let wed_morning =
+            chrono::NaiveDateTime::parse_from_str("2026-06-24 10:30:00", "%Y-%m-%d %H:%M:%S")
+                .unwrap();
         assert_eq!(ttl_for_now_at(wed_morning), Duration::from_secs(5 * 60));
     }
 
@@ -243,9 +248,9 @@ mod tests {
             MarketSession::Morning | MarketSession::Afternoon | MarketSession::Auction => {
                 Duration::from_secs(5 * 60)
             }
-            MarketSession::Closed
-            | MarketSession::LunchBreak
-            | MarketSession::AfterHours => Duration::from_secs(24 * 60 * 60),
+            MarketSession::Closed | MarketSession::LunchBreak | MarketSession::AfterHours => {
+                Duration::from_secs(24 * 60 * 60)
+            }
+        }
     }
-}
 }

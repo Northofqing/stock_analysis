@@ -9,15 +9,15 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use log::{info, warn};
+use log::{debug, info, warn};
 
 use crate::config::get_monitor_config;
 
 use super::providers::{
-    BochaSearchProvider, ClsProvider, CninfoProvider, EastmoneyNewsProvider, EmAnnouncementProvider,
-    EmIndustryNewsProvider, Jin10CalendarEvent, Jin10Provider, KcbDailyProvider,
-    SerpAPISearchProvider, SinaFlashProvider, SseSzseProvider, TavilySearchProvider,
-    WallStreetCnProvider, XueqiuProvider,
+    BochaSearchProvider, ClsProvider, CninfoProvider, EastmoneyNewsProvider,
+    EmAnnouncementProvider, EmIndustryNewsProvider, GelonghuiProvider, GovPolicyProvider,
+    Jin10CalendarEvent, Jin10Provider, KcbDailyProvider, SerpAPISearchProvider, SinaFlashProvider,
+    SseSzseProvider, TavilySearchProvider, WallStreetCnProvider, WeiboHotProvider, XueqiuProvider,
 };
 use super::types::{SearchProvider, SearchResponse, SearchResult};
 
@@ -37,12 +37,20 @@ pub struct SearchService {
     wscn: WallStreetCnProvider,
     /// 财联社直连（免费，A股电报）
     cls: ClsProvider,
+    /// 科创板日报直连（CLS 同源，走快讯池）
+    kcb: KcbDailyProvider,
     /// 金十数据直连（免费，快讯 + 财经日历）
     jin10: Jin10Provider,
     /// 新浪财经全球快讯（免费，4 lid 并发: 国际/国内/A股/港股）
     sina_flash: SinaFlashProvider,
     /// 雪球 (xueqiu) 公共时间线 (v21: A股 + 全部 category, 用户/机构观点聚合)
     xueqiu: XueqiuProvider,
+    /// 微博热搜榜（正交源：全民级突发/科技/政策热点，补财经快讯的盲区）
+    weibo_hot: WeiboHotProvider,
+    /// 格隆汇快讯（市场与公司层面高频资讯）
+    gelonghui: GelonghuiProvider,
+    /// 政府/监管公告（发改委等公开政策信息）
+    gov_policy: GovPolicyProvider,
     /// 东财全市场公告流（免费，A 股 5000+ 公司公告流）
     em_announcement: EmAnnouncementProvider,
     /// 东财行业新闻流（免费，10 个 BOM 行业关键词并发）
@@ -107,9 +115,6 @@ impl SearchService {
         // 3. 财联社（免费直连，补充A股电报）
         providers.push(Box::new(ClsProvider::new()));
 
-        // 3b. 科创板日报 (修复 B-002: 半导体/新能源/AI 硬科技垂直媒体)
-        providers.push(Box::new(KcbDailyProvider::new()));
-
         // 3c. 巨潮资讯（免费直连，A 股法定信披平台，沪深公告全覆盖）
         providers.push(Box::new(CninfoProvider::new()));
 
@@ -154,8 +159,12 @@ impl SearchService {
         }
 
         info!("已启用 华尔街见闻 直连（免费，全球财经快讯）");
+        info!("已启用 科创板日报 直连（免费，快讯池错峰抓取）");
+        info!("已启用 格隆汇快讯（免费，页面内嵌实时流）");
+        info!("已启用 政府监管公告（发改委 RSS）");
         info!("已启用 金十数据 直连（免费，快讯 + 财经日历）");
         info!("已启用 新浪财经 直连（免费，国际/国内/A股/港股 4 lid 并发）");
+        info!("已启用 微博热搜 直连（免费，正交源：全民/科技/政策突发热点）");
         info!("已启用 东财全市场公告流（免费，A 股 5000+ 公司公告）");
         info!("已启用 东财行业新闻流（免费，10 个 BOM 行业关键词并发）");
         let cfg = get_monitor_config();
@@ -163,9 +172,13 @@ impl SearchService {
             providers,
             wscn: WallStreetCnProvider::new(),
             cls: ClsProvider::new(),
+            kcb: KcbDailyProvider::new(),
             jin10: Jin10Provider::new(),
             sina_flash: SinaFlashProvider::new(),
             xueqiu: XueqiuProvider::new(),
+            weibo_hot: WeiboHotProvider::new(),
+            gelonghui: GelonghuiProvider::new(),
+            gov_policy: GovPolicyProvider::new(),
             em_announcement: EmAnnouncementProvider::new(),
             em_industry_news: EmIndustryNewsProvider::new(),
             recent_topic_signatures: Mutex::new(VecDeque::with_capacity(
@@ -232,7 +245,11 @@ impl SearchService {
     }
 
     /// 获取金十财经日历（未来 `days_ahead` 天，重要性 >= `min_star`）
-    pub async fn fetch_financial_calendar(&self, days_ahead: u32, min_star: u8) -> Vec<Jin10CalendarEvent> {
+    pub async fn fetch_financial_calendar(
+        &self,
+        days_ahead: u32,
+        min_star: u8,
+    ) -> Vec<Jin10CalendarEvent> {
         match self.jin10.fetch_calendar(days_ahead, min_star).await {
             Ok(v) => v,
             Err(e) => {
@@ -275,7 +292,11 @@ impl SearchService {
     }
 
     /// 抓取某只股票最近公告（用于个股研究）
-    pub async fn fetch_announcements_by_stock(&self, stock_code: &str, limit: usize) -> Vec<SearchResult> {
+    pub async fn fetch_announcements_by_stock(
+        &self,
+        stock_code: &str,
+        limit: usize,
+    ) -> Vec<SearchResult> {
         match self.em_announcement.fetch_by_stock(stock_code, limit).await {
             Ok(v) => v,
             Err(e) => {
@@ -341,14 +362,24 @@ impl SearchService {
 
     /// 获取原始快讯标题列表（供 NewsMonitor 路径A 使用）
     pub async fn fetch_flash_titles(&self, limit: usize) -> Vec<String> {
-        let source_timeout = Duration::from_secs(get_monitor_config().topic_search_timeout_sec.max(3));
-        let (jin10_res, wscn_res, cls_res, sina_res) = tokio::join!(
+        let source_timeout =
+            Duration::from_secs(get_monitor_config().topic_search_timeout_sec.max(3));
+        // BR-037: kcb 与 cls 同源，kcb 只走快讯池并错峰抓取，避免同源并发拥塞。
+        let kcb_timeout = source_timeout + Duration::from_secs(2);
+        let (jin10_res, wscn_res, cls_res, kcb_res, sina_res, weibo_res, gel_res, gov_res) = tokio::join!(
             tokio::time::timeout(source_timeout, self.jin10.fetch_flash_news(limit, true)),
             tokio::time::timeout(source_timeout, self.wscn.fetch_live_news(limit)),
             tokio::time::timeout(source_timeout, self.cls.fetch_live_news(limit)),
+            tokio::time::timeout(kcb_timeout, async {
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+                self.kcb.fetch_latest(limit).await
+            }),
             tokio::time::timeout(source_timeout, async {
                 self.sina_flash.fetch_flash_news(limit).await
             }),
+            tokio::time::timeout(source_timeout, self.weibo_hot.fetch_hot_search(limit)),
+            tokio::time::timeout(source_timeout, self.gelonghui.fetch_live(limit)),
+            tokio::time::timeout(source_timeout, self.gov_policy.fetch_latest(limit)),
         );
 
         let mut titles = Vec::new();
@@ -419,6 +450,28 @@ impl SearchService {
             }
         }
 
+        match kcb_res {
+            Ok(Ok(lst)) => {
+                info!("[flash][kcb] 成功 {} 条", lst.len());
+                if lst.is_empty() {
+                    self.record_source_health("kcb", SourceFetchOutcome::Empty, 0);
+                } else {
+                    self.record_source_health("kcb", SourceFetchOutcome::Success, lst.len());
+                }
+                for r in lst {
+                    titles.push(r.title);
+                }
+            }
+            Ok(Err(e)) => {
+                self.record_source_health("kcb", SourceFetchOutcome::Error, 0);
+                warn!("[flash][kcb] 失败: {}", e)
+            }
+            Err(_) => {
+                self.record_source_health("kcb", SourceFetchOutcome::Timeout, 0);
+                warn!("[flash][kcb] 超时（>{}s）", source_timeout.as_secs())
+            }
+        }
+
         match sina_res {
             Ok(lst) => {
                 info!("[flash][sina] 成功 {} 条", lst.len());
@@ -434,6 +487,72 @@ impl SearchService {
             Err(e) => {
                 self.record_source_health("sina", SourceFetchOutcome::Error, 0);
                 warn!("[flash][sina] 失败: {}", e)
+            }
+        }
+
+        match weibo_res {
+            Ok(Ok(lst)) => {
+                info!("[flash][weibo] 成功 {} 条", lst.len());
+                if lst.is_empty() {
+                    self.record_source_health("weibo", SourceFetchOutcome::Empty, 0);
+                } else {
+                    self.record_source_health("weibo", SourceFetchOutcome::Success, lst.len());
+                }
+                for r in lst {
+                    titles.push(r.title);
+                }
+            }
+            Ok(Err(e)) => {
+                self.record_source_health("weibo", SourceFetchOutcome::Error, 0);
+                warn!("[flash][weibo] 失败: {}", e)
+            }
+            Err(_) => {
+                self.record_source_health("weibo", SourceFetchOutcome::Timeout, 0);
+                warn!("[flash][weibo] 超时（>{}s）", source_timeout.as_secs())
+            }
+        }
+
+        match gel_res {
+            Ok(Ok(lst)) => {
+                info!("[flash][gel] 成功 {} 条", lst.len());
+                if lst.is_empty() {
+                    self.record_source_health("gel", SourceFetchOutcome::Empty, 0);
+                } else {
+                    self.record_source_health("gel", SourceFetchOutcome::Success, lst.len());
+                }
+                for r in lst {
+                    titles.push(r.title);
+                }
+            }
+            Ok(Err(e)) => {
+                self.record_source_health("gel", SourceFetchOutcome::Error, 0);
+                warn!("[flash][gel] 失败: {}", e)
+            }
+            Err(_) => {
+                self.record_source_health("gel", SourceFetchOutcome::Timeout, 0);
+                warn!("[flash][gel] 超时（>{}s）", source_timeout.as_secs())
+            }
+        }
+
+        match gov_res {
+            Ok(Ok(lst)) => {
+                info!("[flash][gov] 成功 {} 条", lst.len());
+                if lst.is_empty() {
+                    self.record_source_health("gov", SourceFetchOutcome::Empty, 0);
+                } else {
+                    self.record_source_health("gov", SourceFetchOutcome::Success, lst.len());
+                }
+                for r in lst {
+                    titles.push(r.title);
+                }
+            }
+            Ok(Err(e)) => {
+                self.record_source_health("gov", SourceFetchOutcome::Error, 0);
+                warn!("[flash][gov] 失败: {}", e)
+            }
+            Err(_) => {
+                self.record_source_health("gov", SourceFetchOutcome::Timeout, 0);
+                warn!("[flash][gov] 超时（>{}s）", source_timeout.as_secs())
             }
         }
 
@@ -487,7 +606,8 @@ impl SearchService {
         let today = chrono::Local::now().date_naive();
 
         // 1) 中文相对时间
-        if s.contains("今天") || s.contains("刚刚") || s.contains("分钟前") || s.contains("小时前") {
+        if s.contains("今天") || s.contains("刚刚") || s.contains("分钟前") || s.contains("小时前")
+        {
             return Some(0);
         }
         if s.contains("昨天") {
@@ -575,10 +695,11 @@ impl SearchService {
             return Vec::new();
         }
 
+        // BR-036: 仅纳入声明支持主题搜索的 provider，避免结构错配源进入主题池。
         let available: Vec<_> = self
             .providers
             .iter()
-            .filter(|p| p.is_available())
+            .filter(|p| p.is_available() && p.supports_topic_search())
             .collect();
         if available.is_empty() {
             return Vec::new();
@@ -603,14 +724,14 @@ impl SearchService {
                 {
                     Ok(r) => r,
                     Err(_) => {
-                        warn!("[topic] {} 查询超时: {}", provider.name(), q);
+                        debug!("[topic] {} 查询超时: {}", provider.name(), q);
                         continue;
                     }
                 };
 
                 if !resp.success || resp.results.is_empty() {
-                    warn!(
-                        "[topic] {} 查询失败: {} ({})",
+                    debug!(
+                        "[topic] {} 无结果: {} ({})",
                         provider.name(),
                         q,
                         resp.error_message.as_deref().unwrap_or("空结果")
@@ -687,13 +808,8 @@ impl SearchService {
         }
 
         let history = self.snapshot_recent_topic_signatures();
-        let reranked = Self::rerank_topic_results(
-            query,
-            aggregated,
-            &history,
-            max_results,
-            rerank_params,
-        );
+        let reranked =
+            Self::rerank_topic_results(query, aggregated, &history, max_results, rerank_params);
         self.remember_topic_results(&reranked);
         reranked
     }
@@ -761,7 +877,8 @@ impl SearchService {
             .map(|item| {
                 let signature = Self::normalize_text(&format!("{} {}", item.title, item.snippet));
                 let lexical = Self::query_match_score(&signature, &query_terms);
-                let base_score = (item.importance as f32) * 0.45 + item.relevance * 5.0 + lexical * 2.5;
+                let base_score =
+                    (item.importance as f32) * 0.45 + item.relevance * 5.0 + lexical * 2.5;
                 Scored {
                     item,
                     base_score,
@@ -808,7 +925,8 @@ impl SearchService {
             Err(_) => Vec::new(),
         };
 
-        let db_hist = crate::database::DatabaseManager::try_get().and_then(|db| {
+        let db_hist = crate::database::DatabaseManager::try_get()
+            .and_then(|db| {
                 db.get_recent_topic_history_signatures(
                     cfg.topic_history_window_hours.max(24),
                     cfg.topic_history_db_limit.max(100),
@@ -861,9 +979,9 @@ impl SearchService {
         }
 
         let _ = crate::database::DatabaseManager::try_get().and_then(|db| {
-                db.upsert_topic_history_signatures(&to_store, cfg.topic_history_db_limit.max(100))
-                    .ok()
-            });
+            db.upsert_topic_history_signatures(&to_store, cfg.topic_history_db_limit.max(100))
+                .ok()
+        });
     }
 
     fn topic_rerank_params() -> TopicRerankParams {
@@ -903,7 +1021,10 @@ impl SearchService {
         if query_terms.is_empty() || text.is_empty() {
             return 0.0;
         }
-        let hit = query_terms.iter().filter(|t| text.contains(t.as_str())).count();
+        let hit = query_terms
+            .iter()
+            .filter(|t| text.contains(t.as_str()))
+            .count();
         hit as f32 / query_terms.len() as f32
     }
 
@@ -970,7 +1091,11 @@ impl SearchService {
         ];
 
         // 维度2: 持股/投资/并购相关（用简称扩大搜索范围）
-        let invest_name = if short_name != stock_name { &short_name } else { stock_name };
+        let invest_name = if short_name != stock_name {
+            &short_name
+        } else {
+            stock_name
+        };
         queries.push(format!("{} 持股 投资 收购 参股", invest_name));
 
         // 维度3: 行业/合作/订单（简称搜索）
@@ -980,7 +1105,10 @@ impl SearchService {
         queries.push(format!("{} {} 减持 处罚 风险", stock_name, stock_code));
 
         // 维度5: 业绩预期（简称 + 代码）
-        queries.push(format!("{} {} 年报预告 业绩预告 业绩快报", stock_name, stock_code));
+        queries.push(format!(
+            "{} {} 年报预告 业绩预告 业绩快报",
+            stock_name, stock_code
+        ));
 
         let mut all_results: Vec<SearchResult> = Vec::new();
         let mut success_provider = String::new();
@@ -988,7 +1116,11 @@ impl SearchService {
 
         for (dim_idx, query) in queries.iter().enumerate() {
             // 每个维度取少量结果，合并后再截断
-            let per_query_max = if dim_idx == 0 { max_results } else { 3_usize.min(max_results) };
+            let per_query_max = if dim_idx == 0 {
+                max_results
+            } else {
+                3_usize.min(max_results)
+            };
 
             for provider in &self.providers {
                 if !provider.is_available() {
@@ -1004,8 +1136,13 @@ impl SearchService {
                     } else if !success_provider.contains(&response.provider) {
                         success_provider = format!("{}+{}", success_provider, response.provider);
                     }
-                    info!("[维度{}] 使用 {} 搜索 '{}' 获得 {} 条结果",
-                        dim_idx + 1, response.provider, query, response.results.len());
+                    info!(
+                        "[维度{}] 使用 {} 搜索 '{}' 获得 {} 条结果",
+                        dim_idx + 1,
+                        response.provider,
+                        query,
+                        response.results.len()
+                    );
                     all_results.extend(response.results);
                     break; // 该维度搜索成功，不再尝试其他引擎
                 } else {
@@ -1052,7 +1189,9 @@ impl SearchService {
                 result.relevance = (result.relevance + 0.2).min(1.0);
             }
             // 包含持股/投资/并购等高价值关键词加重要性
-            let high_value_keywords = ["持股", "投资", "收购", "参股", "并购", "入股", "中标", "签约", "订单"];
+            let high_value_keywords = [
+                "持股", "投资", "收购", "参股", "并购", "入股", "中标", "签约", "订单",
+            ];
             for kw in &high_value_keywords {
                 if title_lower.contains(kw) || result.snippet.contains(kw) {
                     result.importance = result.importance.saturating_add(1).min(10);
@@ -1065,13 +1204,19 @@ impl SearchService {
         all_results.sort_by(|a, b| {
             let score_a = (a.importance as f32) * a.relevance;
             let score_b = (b.importance as f32) * b.relevance;
-            score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
+            score_b
+                .partial_cmp(&score_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
         // 截断到max_results + 2（多保留一点给AI更多上下文）
         all_results.truncate(max_results + 2);
 
-        info!("多维度搜索完成: {} 条结果（去重后），来源: {}", all_results.len(), success_provider);
+        info!(
+            "多维度搜索完成: {} 条结果（去重后），来源: {}",
+            all_results.len(),
+            success_provider
+        );
 
         SearchResponse {
             query: format!("{} {} 多维度搜索", stock_name, stock_code),
@@ -1088,24 +1233,57 @@ impl SearchService {
     fn extract_short_name(stock_name: &str) -> String {
         // 常见后缀词（按长度从长到短排列，优先匹配长的）
         let suffixes = [
-            "电子科技", "高新技术", "信息技术",
-            "新材料", "新能源", "生物科技",
-            "科技", "集团", "股份", "控股", "实业", "产业",
-            "资本", "投资", "金融", "银行", "证券", "保险",
-            "医药", "制药", "生物",
-            "电气", "电子", "电力", "能源", "环保",
-            "汽车", "机械", "材料", "化工", "建设",
-            "通信", "传媒", "文化", "教育", "旅游",
-            "食品", "乳业", "酿酒", "地产", "置业",
-            "物流", "航空", "航天",
+            "电子科技",
+            "高新技术",
+            "信息技术",
+            "新材料",
+            "新能源",
+            "生物科技",
+            "科技",
+            "集团",
+            "股份",
+            "控股",
+            "实业",
+            "产业",
+            "资本",
+            "投资",
+            "金融",
+            "银行",
+            "证券",
+            "保险",
+            "医药",
+            "制药",
+            "生物",
+            "电气",
+            "电子",
+            "电力",
+            "能源",
+            "环保",
+            "汽车",
+            "机械",
+            "材料",
+            "化工",
+            "建设",
+            "通信",
+            "传媒",
+            "文化",
+            "教育",
+            "旅游",
+            "食品",
+            "乳业",
+            "酿酒",
+            "地产",
+            "置业",
+            "物流",
+            "航空",
+            "航天",
         ];
 
         // 常见地名前缀
         let prefixes = [
-            "贵州", "云南", "四川", "山东", "江苏", "浙江", "广东", "福建",
-            "河南", "河北", "湖南", "湖北", "安徽", "江西", "陕西", "山西",
-            "辽宁", "吉林", "黑龙", "甘肃", "青海", "海南", "广西", "内蒙",
-            "新疆", "西藏", "宁夏", "上海", "北京", "天津", "重庆", "深圳",
+            "贵州", "云南", "四川", "山东", "江苏", "浙江", "广东", "福建", "河南", "河北", "湖南",
+            "湖北", "安徽", "江西", "陕西", "山西", "辽宁", "吉林", "黑龙", "甘肃", "青海", "海南",
+            "广西", "内蒙", "新疆", "西藏", "宁夏", "上海", "北京", "天津", "重庆", "深圳",
         ];
 
         let mut name = stock_name.to_string();
@@ -1146,7 +1324,10 @@ impl SearchService {
         let event_query = events.join(" OR ");
         let query = format!("{} ({})", stock_name, event_query);
 
-        info!("搜索股票事件: {}({}) - {:?}", stock_name, stock_code, events);
+        info!(
+            "搜索股票事件: {}({}) - {:?}",
+            stock_name, stock_code, events
+        );
 
         for provider in &self.providers {
             if !provider.is_available() {
@@ -1195,11 +1376,8 @@ impl SearchService {
         info!("开始多维度情报搜索: {}({})", stock_name, stock_code);
 
         let mut provider_index = 0;
-        let available_providers: Vec<_> = self
-            .providers
-            .iter()
-            .filter(|p| p.is_available())
-            .collect();
+        let available_providers: Vec<_> =
+            self.providers.iter().filter(|p| p.is_available()).collect();
 
         if available_providers.is_empty() {
             return results;
@@ -1218,7 +1396,11 @@ impl SearchService {
             let response = provider.search(&query, 3).await;
 
             if response.success {
-                info!("[情报搜索] {}: 获取 {} 条结果", desc, response.results.len());
+                info!(
+                    "[情报搜索] {}: 获取 {} 条结果",
+                    desc,
+                    response.results.len()
+                );
             } else {
                 warn!(
                     "[情报搜索] {}: 搜索失败 - {}",
@@ -1337,7 +1519,10 @@ impl SearchService {
             }
         }
         if !wscn_items.is_empty() {
-            sections.push(format!("### 🌐 华尔街见闻快讯（今日实时）\n{}", wscn_items.join("\n")));
+            sections.push(format!(
+                "### 🌐 华尔街见闻快讯（今日实时）\n{}",
+                wscn_items.join("\n")
+            ));
             info!("[宏观新闻][wscn] 华尔街见闻获取 {} 条", wscn_items.len());
         } else {
             warn!("[宏观新闻][wscn] 华尔街见闻返回为空或超时");
@@ -1352,7 +1537,10 @@ impl SearchService {
             }
         }
         if !cls_items.is_empty() {
-            sections.push(format!("### 🧭 财联社电报（今日实时）\n{}", cls_items.join("\n")));
+            sections.push(format!(
+                "### 🧭 财联社电报（今日实时）\n{}",
+                cls_items.join("\n")
+            ));
             info!("[宏观新闻][cls] 财联社获取 {} 条", cls_items.len());
         } else {
             warn!("[宏观新闻][cls] 财联社返回为空或超时");
@@ -1368,28 +1556,42 @@ impl SearchService {
             }
         }
         if !jin10_imp_items.is_empty() {
-            sections.push(format!("### ⭐ 金十重磅快讯（近6小时标星）\n{}", jin10_imp_items.join("\n")));
+            sections.push(format!(
+                "### ⭐ 金十重磅快讯（近6小时标星）\n{}",
+                jin10_imp_items.join("\n")
+            ));
             info!("[宏观新闻][jin10] 金十标星 {} 条", jin10_imp_items.len());
         }
 
         let mut jin10_flash_items: Vec<String> = Vec::new();
         if let Ok(lst) = jin10_flash_res {
             // 去重：不再包含已在 important 列表里的
-            let imp_titles: std::collections::HashSet<String> = jin10_imp_items.iter()
+            let imp_titles: std::collections::HashSet<String> = jin10_imp_items
+                .iter()
                 .map(|s| s.chars().take(40).collect())
                 .collect();
             for r in lst.iter() {
                 let key: String = format!("- **{}**", r.title).chars().take(40).collect();
-                if imp_titles.contains(&key) { continue; }
+                if imp_titles.contains(&key) {
+                    continue;
+                }
                 let t = r.published_date.as_deref().unwrap_or("");
                 let snippet: String = r.snippet.chars().take(140).collect();
                 jin10_flash_items.push(format!("- **{}** {}  \n  {}", r.title, t, snippet));
-                if jin10_flash_items.len() >= 6 { break; }
+                if jin10_flash_items.len() >= 6 {
+                    break;
+                }
             }
         }
         if !jin10_flash_items.is_empty() {
-            sections.push(format!("### 📣 金十快讯（今日实时）\n{}", jin10_flash_items.join("\n")));
-            info!("[宏观新闻][jin10] 金十快讯补充 {} 条", jin10_flash_items.len());
+            sections.push(format!(
+                "### 📣 金十快讯（今日实时）\n{}",
+                jin10_flash_items.join("\n")
+            ));
+            info!(
+                "[宏观新闻][jin10] 金十快讯补充 {} 条",
+                jin10_flash_items.len()
+            );
         } else if jin10_imp_items.is_empty() {
             warn!("[宏观新闻][jin10] 金十快讯为空或超时");
         }
@@ -1401,16 +1603,29 @@ impl SearchService {
                 for ev in events.iter().take(15) {
                     let stars = "★".repeat(ev.star.min(3) as usize);
                     let mut extra: Vec<String> = Vec::new();
-                    if let Some(p) = &ev.previous { extra.push(format!("前值 {}", p)); }
-                    if let Some(f) = &ev.forecast { extra.push(format!("预期 {}", f)); }
-                    if let Some(a) = &ev.actual { extra.push(format!("公布 {}", a)); }
-                    let tail = if extra.is_empty() { String::new() } else { format!("  \n  {}", extra.join(" | ")) };
+                    if let Some(p) = &ev.previous {
+                        extra.push(format!("前值 {}", p));
+                    }
+                    if let Some(f) = &ev.forecast {
+                        extra.push(format!("预期 {}", f));
+                    }
+                    if let Some(a) = &ev.actual {
+                        extra.push(format!("公布 {}", a));
+                    }
+                    let tail = if extra.is_empty() {
+                        String::new()
+                    } else {
+                        format!("  \n  {}", extra.join(" | "))
+                    };
                     cal_lines.push(format!(
                         "- `{} {}` {} **[{}]** {}{}",
                         ev.date, ev.time, stars, ev.country, ev.name, tail
                     ));
                 }
-                sections.push(format!("### 📅 财经日历（金十，未来48h重要事件）\n{}", cal_lines.join("\n")));
+                sections.push(format!(
+                    "### 📅 财经日历（金十，未来48h重要事件）\n{}",
+                    cal_lines.join("\n")
+                ));
                 info!("[宏观新闻][jin10] 财经日历 {} 条", events.len());
             }
             Ok(_) => {
@@ -1426,29 +1641,66 @@ impl SearchService {
         // ── 第二步：搜索引擎多维度查询 ──
         // (维度key, 查询关键词, 展示标题)
         let search_dims: Vec<(&str, String, &str)> = vec![
-            ("a_market",    format!("{}A股 大盘 股市 最新动态", today),              "### 🇨🇳 A股市场动态"),
-            ("global",      format!("{}国际财经 地缘政治 最新消息", today),           "### 🌍 国际财经 / 地缘政治"),
-            ("us_market",   format!("{}美股 美联储 大宗商品 今日", today),            "### 🇺🇸 美股 / 大宗商品"),
-            ("cn_policy",   format!("{}中国 央行 财政 产业政策 重要新闻", today),     "### 📋 宏观政策"),
-            ("institution", format!("{}高盛 摩根 大摩 美银 JPMorgan 中国A股 市场观点 研报", today),
-                                                                                    "### 🏦 投行观点（高盛/摩根/美银）"),
-            ("fin_media",   format!("{}证券时报 第一财经 21世纪经济报道 重要财经", today),
-                                                                                    "### 📰 财经媒体要闻"),
+            (
+                "a_market",
+                format!("{}A股 大盘 股市 最新动态", today),
+                "### 🇨🇳 A股市场动态",
+            ),
+            (
+                "global",
+                format!("{}国际财经 地缘政治 最新消息", today),
+                "### 🌍 国际财经 / 地缘政治",
+            ),
+            (
+                "us_market",
+                format!("{}美股 美联储 大宗商品 今日", today),
+                "### 🇺🇸 美股 / 大宗商品",
+            ),
+            (
+                "cn_policy",
+                format!("{}中国 央行 财政 产业政策 重要新闻", today),
+                "### 📋 宏观政策",
+            ),
+            (
+                "institution",
+                format!(
+                    "{}高盛 摩根 大摩 美银 JPMorgan 中国A股 市场观点 研报",
+                    today
+                ),
+                "### 🏦 投行观点（高盛/摩根/美银）",
+            ),
+            (
+                "fin_media",
+                format!("{}证券时报 第一财经 21世纪经济报道 重要财经", today),
+                "### 📰 财经媒体要闻",
+            ),
         ];
 
         for (dim, query, header) in &search_dims {
             let mut found = false;
             for provider in &self.providers {
-                if !provider.is_available() { continue; }
+                if !provider.is_available() {
+                    continue;
+                }
                 let resp = provider.search(query, max_results.min(3)).await;
                 if resp.success && !resp.results.is_empty() {
-                    let lines: Vec<String> = resp.results.iter().take(3).map(|r| {
-                        let date_tag = r.published_date.as_deref().unwrap_or("");
-                        let snippet_short: String = r.snippet.chars().take(150).collect();
-                        format!("- **{}** {}  \n  {}", r.title, date_tag, snippet_short)
-                    }).collect();
+                    let lines: Vec<String> = resp
+                        .results
+                        .iter()
+                        .take(3)
+                        .map(|r| {
+                            let date_tag = r.published_date.as_deref().unwrap_or("");
+                            let snippet_short: String = r.snippet.chars().take(150).collect();
+                            format!("- **{}** {}  \n  {}", r.title, date_tag, snippet_short)
+                        })
+                        .collect();
                     sections.push(format!("{}\n{}", header, lines.join("\n")));
-                    info!("[宏观新闻][{}] {} 获取 {} 条", dim, resp.provider, resp.results.len());
+                    info!(
+                        "[宏观新闻][{}] {} 获取 {} 条",
+                        dim,
+                        resp.provider,
+                        resp.results.len()
+                    );
                     found = true;
                     break;
                 }
@@ -1463,7 +1715,11 @@ impl SearchService {
             return String::new();
         }
 
-        format!("## 📡 今日宏观 / 市场背景（{}）\n\n{}", today, sections.join("\n\n"))
+        format!(
+            "## 📡 今日宏观 / 市场背景（{}）\n\n{}",
+            today,
+            sections.join("\n\n")
+        )
     }
 
     /// 批量搜索多只股票新闻
@@ -1480,7 +1736,9 @@ impl SearchService {
                 tokio::time::sleep(delay_between).await;
             }
 
-            let response = self.search_stock_news(code, name, max_results_per_stock).await;
+            let response = self
+                .search_stock_news(code, name, max_results_per_stock)
+                .await;
             results.insert(code.to_string(), response);
         }
 
@@ -1501,12 +1759,30 @@ impl SearchService {
 /// 故**不**加 "美元", 仅保留 "美元指数" (避免假阳性, 详见 flash_filter.rs
 /// test_filter_macro_titles_dollar_keyword 注释).
 pub const MACRO_KEYWORDS: &[&str] = &[
-    "美联储", "鲍威尔", "FOMC",
-    "美股", "纳斯达克", "纳指", "标普", "道琼斯",
-    "汇率", "人民币兑", "美元指数",
-    "大宗商品", "原油", "黄金", "铜价",
-    "欧央行", "日银", "英国央行", "日股", "欧股",
-    "A50", "富时中国", "恒指", "恒生指数",
+    "美联储",
+    "鲍威尔",
+    "FOMC",
+    "美股",
+    "纳斯达克",
+    "纳指",
+    "标普",
+    "道琼斯",
+    "汇率",
+    "人民币兑",
+    "美元指数",
+    "大宗商品",
+    "原油",
+    "黄金",
+    "铜价",
+    "欧央行",
+    "日银",
+    "英国央行",
+    "日股",
+    "欧股",
+    "A50",
+    "富时中国",
+    "恒指",
+    "恒生指数",
 ];
 
 /// 修复 v9.2 M3 + BR-003: 纯函数过滤宏观新闻, 返回 (filtered_titles, macro_count).
@@ -1561,7 +1837,8 @@ pub fn get_search_service() -> &'static SearchService {
         // 东方财富默认启用（免费无限制）
         let enable_eastmoney = std::env::var("ENABLE_EASTMONEY_NEWS")
             .unwrap_or_else(|_| "true".to_string())
-            .to_lowercase() != "false";
+            .to_lowercase()
+            != "false";
 
         SearchService::new(bocha_keys, tavily_keys, serpapi_keys, enable_eastmoney)
     })
@@ -1580,7 +1857,10 @@ mod tests {
         if service.is_available() {
             println!("=== 测试股票新闻搜索 ===");
             let response = service.search_stock_news("300389", "艾比森", 5).await;
-            println!("搜索状态: {}", if response.success { "成功" } else { "失败" });
+            println!(
+                "搜索状态: {}",
+                if response.success { "成功" } else { "失败" }
+            );
             println!("搜索引擎: {}", response.provider);
             println!("结果数量: {}", response.results.len());
             println!("耗时: {:.2}s", response.search_time);

@@ -53,8 +53,8 @@ pub async fn fetch_ipo_date(code: &str) -> Result<NaiveDate> {
         .context("东方财富 f26 读取 body 失败")?;
 
     // 3. 解析 JSON: {"data": {"f26": "20010827"}}
-    let json: serde_json::Value = serde_json::from_str(&body)
-        .context("东方财富 f26 JSON 解析失败")?;
+    let json: serde_json::Value =
+        serde_json::from_str(&body).context("东方财富 f26 JSON 解析失败")?;
 
     let f26 = json["data"]["f26"]
         .as_str()

@@ -44,7 +44,11 @@ impl FinancialPeriod {
     pub fn equity_multiplier(&self) -> Option<f64> {
         self.debt_to_assets.and_then(|d| {
             let eq_ratio = 1.0 - d / 100.0;
-            if eq_ratio > 1e-6 { Some(1.0 / eq_ratio) } else { None }
+            if eq_ratio > 1e-6 {
+                Some(1.0 / eq_ratio)
+            } else {
+                None
+            }
         })
     }
 
@@ -119,9 +123,7 @@ pub fn assess_quality(history: &[FinancialPeriod]) -> Option<QualityReport> {
 
     // 3. 盈利质量突然恶化：上期健康，本期跌入风险区
     if history.len() >= 2 {
-        if let (Some(cur), Some(prev)) =
-            (latest.cfo_to_ni_ratio(), history[1].cfo_to_ni_ratio())
-        {
+        if let (Some(cur), Some(prev)) = (latest.cfo_to_ni_ratio(), history[1].cfo_to_ni_ratio()) {
             if prev >= 0.8 && cur < 0.3 {
                 flags.push(format!(
                     "CFO/NI 单期骤降 {:.2} → {:.2}（盈利含金量突恶化）",
@@ -135,13 +137,19 @@ pub fn assess_quality(history: &[FinancialPeriod]) -> Option<QualityReport> {
     // 4. 超高速增长可疑（基数效应/一次性损益）
     if let Some(np) = latest.net_profit_yoy {
         if np > 150.0 {
-            flags.push(format!("净利 YoY {:.1}% 过高 → 警惕基数效应/非经常性损益", np));
+            flags.push(format!(
+                "净利 YoY {:.1}% 过高 → 警惕基数效应/非经常性损益",
+                np
+            ));
             score += 10;
         }
     }
     if let Some(rev) = latest.revenue_yoy {
         if rev > 100.0 {
-            flags.push(format!("营收 YoY {:.1}% 过高 → 警惕一次性合并/口径调整", rev));
+            flags.push(format!(
+                "营收 YoY {:.1}% 过高 → 警惕一次性合并/口径调整",
+                rev
+            ));
             score += 10;
         }
     }
@@ -157,9 +165,7 @@ pub fn assess_quality(history: &[FinancialPeriod]) -> Option<QualityReport> {
             let eps_up = eps_chrono.windows(2).all(|w| w[1] >= w[0] - 0.001);
             let roe_down = roe_chrono.windows(2).all(|w| w[1] <= w[0] + 0.001);
             if eps_up && roe_down {
-                flags.push(
-                    "EPS 持续上行但 ROE 持续下行 → 可能股本扩张/资产堆积稀释回报".into(),
-                );
+                flags.push("EPS 持续上行但 ROE 持续下行 → 可能股本扩张/资产堆积稀释回报".into());
                 score += 15;
             }
         }
@@ -174,7 +180,11 @@ pub fn assess_quality(history: &[FinancialPeriod]) -> Option<QualityReport> {
     if ratios.len() >= 3 {
         let avg = ratios.iter().sum::<f64>() / ratios.len() as f64;
         if avg < 0.3 {
-            flags.push(format!("近{}期 CFO/NI 均值仅 {:.2} → 长期盈利质量低", ratios.len(), avg));
+            flags.push(format!(
+                "近{}期 CFO/NI 均值仅 {:.2} → 长期盈利质量低",
+                ratios.len(),
+                avg
+            ));
             score += 15;
         }
     }
@@ -230,10 +240,7 @@ fn to_em_secucode(code: &str) -> String {
         "SH"
     } else if code.starts_with("688") {
         "SH"
-    } else if code.starts_with('0')
-        || code.starts_with('3')
-        || code.starts_with("200")
-    {
+    } else if code.starts_with('0') || code.starts_with('3') || code.starts_with("200") {
         "SZ"
     } else if code.starts_with('8') || code.starts_with('4') {
         "BJ"
@@ -386,9 +393,7 @@ async fn fetch_from_eastmoney_datacenter(
         .and_then(|r| r.get("data"))
         .and_then(|v| v.as_array())
         .ok_or_else(|| anyhow!("EM-DC 无 result.data 数组"))?;
-    let latest = data
-        .first()
-        .ok_or_else(|| anyhow!("EM-DC data 为空"))?;
+    let latest = data.first().ok_or_else(|| anyhow!("EM-DC data 为空"))?;
 
     let period = FinancialPeriod {
         report_date: pick_string(latest, &["REPORTDATE"]),
@@ -457,7 +462,5 @@ pub fn fetch_with_fallback_blocking(client: &reqwest::Client, code: &str) -> Fin
     }
     let client = client.clone();
     let code_s = code.to_string();
-    crate::block_on_async(async move {
-        fetch_with_fallback_async(&client, &code_s).await
-    })
+    crate::block_on_async(async move { fetch_with_fallback_async(&client, &code_s).await })
 }

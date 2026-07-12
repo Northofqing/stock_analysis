@@ -8,7 +8,6 @@ use serde::Deserialize;
 
 use super::super::types::{SearchProvider, SearchResponse, SearchResult};
 
-
 // ============================================================================
 // 华尔街见闻 直连API
 // ============================================================================
@@ -60,13 +59,16 @@ impl WallStreetCnProvider {
             page_size
         );
 
-        let resp: LiveResp = self.client
+        let resp: LiveResp = self
+            .client
             .get(&url)
             .header("Origin", "https://wallstreetcn.com")
             .header("Referer", "https://wallstreetcn.com/")
-            .send().await
+            .send()
+            .await
             .context("华尔街见闻快讯请求失败")?
-            .json().await
+            .json()
+            .await
             .context("华尔街见闻快讯解析失败")?;
 
         if resp.code != Some(20000) {
@@ -76,7 +78,8 @@ impl WallStreetCnProvider {
         let items = resp.data.and_then(|d| d.items).unwrap_or_default();
         let now = chrono::Local::now().timestamp();
 
-        let results: Vec<SearchResult> = items.into_iter()
+        let results: Vec<SearchResult> = items
+            .into_iter()
             .filter_map(|item| {
                 let text = item.content_text.filter(|t| !t.is_empty())?;
                 // 过滤6小时以外的旧新闻
@@ -93,12 +96,15 @@ impl WallStreetCnProvider {
                 });
                 let title: String = text.chars().take(60).collect();
                 let snippet: String = text.chars().take(200).collect();
-                Some(SearchResult::new(
-                    title,
-                    snippet,
-                    format!("https://wallstreetcn.com/"),
-                    "华尔街见闻".to_string(),
-                ).with_date(date_tag.unwrap_or_default()))
+                Some(
+                    SearchResult::new(
+                        title,
+                        snippet,
+                        format!("https://wallstreetcn.com/"),
+                        "华尔街见闻".to_string(),
+                    )
+                    .with_date(date_tag.unwrap_or_default()),
+                )
             })
             .collect();
 
@@ -131,13 +137,16 @@ impl WallStreetCnProvider {
             page_size
         );
 
-        let resp: ArticleResp = self.client
+        let resp: ArticleResp = self
+            .client
             .get(&url)
             .header("Origin", "https://wallstreetcn.com")
             .header("Referer", "https://wallstreetcn.com/")
-            .send().await
+            .send()
+            .await
             .context("华尔街见闻文章请求失败")?
-            .json().await
+            .json()
+            .await
             .context("华尔街见闻文章解析失败")?;
 
         if resp.code != Some(20000) {
@@ -147,15 +156,20 @@ impl WallStreetCnProvider {
         let items = resp.data.and_then(|d| d.items).unwrap_or_default();
         let now = chrono::Local::now().timestamp();
 
-        let results: Vec<SearchResult> = items.into_iter()
+        let results: Vec<SearchResult> = items
+            .into_iter()
             .filter_map(|item| {
                 let title = item.title.filter(|t| !t.is_empty())?;
                 if let Some(ts) = item.display_time {
-                    if now - ts > 24 * 3600 { return None; }
+                    if now - ts > 24 * 3600 {
+                        return None;
+                    }
                 }
                 let snippet = item.summary.unwrap_or_default();
                 let uri = item.content_uri.unwrap_or_default();
-                let url = if uri.starts_with("http") { uri } else {
+                let url = if uri.starts_with("http") {
+                    uri
+                } else {
                     format!("https://wallstreetcn.com/articles/{}", uri)
                 };
                 let date_tag = item.display_time.map(|ts| {
@@ -164,8 +178,10 @@ impl WallStreetCnProvider {
                         .with_timezone(&chrono::Local);
                     dt.format("%H:%M").to_string()
                 });
-                Some(SearchResult::new(title, snippet, url, "华尔街见闻".to_string())
-                    .with_date(date_tag.unwrap_or_default()))
+                Some(
+                    SearchResult::new(title, snippet, url, "华尔街见闻".to_string())
+                        .with_date(date_tag.unwrap_or_default()),
+                )
             })
             .collect();
 
@@ -175,25 +191,32 @@ impl WallStreetCnProvider {
 
 #[async_trait]
 impl SearchProvider for WallStreetCnProvider {
-    fn name(&self) -> &str { &self.name }
-    fn is_available(&self) -> bool { true }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn is_available(&self) -> bool {
+        true
+    }
 
     async fn search(&self, query: &str, max_results: usize) -> SearchResponse {
         let start = Instant::now();
         // 搜索逻辑：同时拉快讯和文章，按标题/内容过滤关键词
-        let keywords: Vec<&str> = query.split_whitespace()
+        let keywords: Vec<&str> = query
+            .split_whitespace()
             .filter(|w| w.len() >= 2)
             .take(5)
             .collect();
 
-        let (live_res, article_res) = tokio::join!(
-            self.fetch_live_news(30),
-            self.fetch_articles(20),
-        );
+        let (live_res, article_res) =
+            tokio::join!(self.fetch_live_news(30), self.fetch_articles(20),);
 
         let mut all: Vec<SearchResult> = Vec::new();
-        if let Ok(items) = live_res { all.extend(items); }
-        if let Ok(items) = article_res { all.extend(items); }
+        if let Ok(items) = live_res {
+            all.extend(items);
+        }
+        if let Ok(items) = article_res {
+            all.extend(items);
+        }
 
         // 过滤相关条目
         let filtered: Vec<SearchResult> = if keywords.is_empty() {
@@ -214,9 +237,12 @@ impl SearchProvider for WallStreetCnProvider {
             results: filtered,
             provider: self.name.clone(),
             success,
-            error_message: if success { None } else { Some("无相关结果".to_string()) },
+            error_message: if success {
+                None
+            } else {
+                Some("无相关结果".to_string())
+            },
             search_time: start.elapsed().as_secs_f64(),
         }
     }
 }
-

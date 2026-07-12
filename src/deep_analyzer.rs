@@ -12,10 +12,8 @@
 //! - [`run_and_save`] 默认走多角色路径
 
 use crate::agent::{
-    AgentRunner, build_slices, Tool, Toolbelt,
-    FetchFinancialTool, FetchChipDistributionTool, FetchFundFlowTool,
-    FetchNewsTool, FetchResearchTool, FetchSectorTool,
-    ValidationEngine,
+    build_slices, AgentRunner, FetchChipDistributionTool, FetchFinancialTool, FetchFundFlowTool,
+    FetchNewsTool, FetchResearchTool, FetchSectorTool, Tool, Toolbelt, ValidationEngine,
 };
 use crate::analyzer::GeminiAnalyzer;
 use crate::data_provider::KlineData;
@@ -29,8 +27,8 @@ use std::sync::Arc;
 // 修复 P0-E (2026-06-30 codex review): 多 Agent 研判必须 freshness 校验 (AGENTS §2.4, BR-010).
 // 之前 deep_analyzer 走 service::get_kline 拿缓存, 无任何新鲜度检查.
 // 现在加 daily freshness gate: 日线数据超过 1 交易日 (= dq_daily_stale_sec, 默认 86400s) 直接 bail.
-use crate::monitor::data_quality::{validate_daily_freshness, DqStats, FreshnessConfig};
 use crate::config;
+use crate::monitor::data_quality::{validate_daily_freshness, DqStats, FreshnessConfig};
 
 /// 构造 freshness 配置 (从 monitor config 读 dq_daily_stale_sec).
 /// 单独提出便于测试 mock.
@@ -73,7 +71,10 @@ async fn fetch_kline_via_manager(code: &str, days: usize) -> Result<Vec<KlineDat
     let (kline, source) = manager
         .get_daily_data(code, days)
         .map_err(|e| anyhow::anyhow!("K 线获取失败: {e}"))?;
-    let first_date = kline.first().map(|k| k.date.to_string()).unwrap_or_default();
+    let first_date = kline
+        .first()
+        .map(|k| k.date.to_string())
+        .unwrap_or_default();
     let last_date = kline.last().map(|k| k.date.to_string()).unwrap_or_default();
     log::info!(
         "[MultiAgent] {} K 线来源: {}, {} 条, date_range: {}..{}",
@@ -102,19 +103,30 @@ struct ToolResult {
 
 impl ToolResult {
     fn ok(name: &str, data: String) -> Self {
-        Self { name: name.to_string(), ok: true, data, err: None }
+        Self {
+            name: name.to_string(),
+            ok: true,
+            data,
+            err: None,
+        }
     }
     fn missing(name: &str, err: String) -> Self {
         log::warn!("[MultiAgent] {} 工具失败/缺失: {}", name, err);
-        Self { name: name.to_string(), ok: false, data: String::new(), err: Some(err) }
+        Self {
+            name: name.to_string(),
+            ok: false,
+            data: String::new(),
+            err: Some(err),
+        }
     }
     /// 检测 Ok 但内容是错误 JSON 的"假成功"模式 (修复 P1-F 关键点).
     fn classify(label: &str, r: Result<String>) -> Self {
         match r {
             Ok(s) if s.trim().is_empty() => Self::missing(label, "返回空字符串".into()),
-            Ok(s) if s.contains("\"error\"") || s.contains("\"Error\"") => {
-                Self::missing(label, format!("假成功: {}", s.chars().take(120).collect::<String>()))
-            }
+            Ok(s) if s.contains("\"error\"") || s.contains("\"Error\"") => Self::missing(
+                label,
+                format!("假成功: {}", s.chars().take(120).collect::<String>()),
+            ),
             Ok(s) => Self::ok(label, s),
             Err(e) => Self::missing(label, format!("Err: {:#}", e)),
         }
@@ -124,9 +136,14 @@ impl ToolResult {
 /// 渲染 data_inventory 段 (注入 LLM prompt 头部).
 /// 格式: "[financials] OK\n[research] MISSING: ...\n...".
 fn render_data_inventory(results: &[ToolResult]) -> String {
-    results.iter()
+    results
+        .iter()
         .map(|r| match &r.err {
-            Some(e) => format!("[{}] MISSING: {}", r.name, e.chars().take(80).collect::<String>()),
+            Some(e) => format!(
+                "[{}] MISSING: {}",
+                r.name,
+                e.chars().take(80).collect::<String>()
+            ),
             None => format!("[{}] OK", r.name),
         })
         .collect::<Vec<_>>()
@@ -244,7 +261,9 @@ fn build_toolbelt() -> Toolbelt {
 pub async fn run_react_analysis(code: &str) -> Result<String> {
     let model_configs = collect_model_configs();
     if model_configs.is_empty() {
-        anyhow::bail!("未在 .env 中找到 DOUBAO_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY 任一有效配置");
+        anyhow::bail!(
+            "未在 .env 中找到 DOUBAO_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY 任一有效配置"
+        );
     }
     log::info!(
         "[DeepAnalyzer] 加载 {} 个模型配置，主模型: {}，fallback 链: {}",
@@ -341,7 +360,11 @@ pub async fn run_multi_agent_analysis(code: &str) -> Result<String> {
     let missing_count = tool_results.len() - ok_count;
     log::info!(
         "[MultiAgent] 数据抓取完成 — {}/{} OK, {}/{} MISSING\n{}",
-        ok_count, tool_results.len(), missing_count, tool_results.len(), data_inventory
+        ok_count,
+        tool_results.len(),
+        missing_count,
+        tool_results.len(),
+        data_inventory
     );
     let fin_str = &tool_results[0].data;
     let research_str = &tool_results[1].data;
@@ -416,7 +439,8 @@ pub async fn run_multi_agent_analysis(code: &str) -> Result<String> {
     if ok_count < 2 {
         log::warn!(
             "[MultiAgent] {} 数据源 OK={} 不足 2, 强制综合分 = N/A",
-            code, ok_count
+            code,
+            ok_count
         );
     }
 
@@ -474,7 +498,6 @@ pub async fn run_and_save(code: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-
 #[cfg(test)]
 mod tests_br006 {
     //! 修复 P0-E 业务规则 BR-010 单元测试:
@@ -482,6 +505,15 @@ mod tests_br006 {
     //! 注: 完整构造 KlineData 字段过多 (25+ 字段), 这里直接测 validate_daily_freshness
     //! 单元, check_kline_freshness 只多一层 Option/unwrap 包装, 编译时已覆盖.
     use super::*;
+
+    fn latest_effective_trading_day(now: chrono::DateTime<chrono::Local>) -> chrono::NaiveDate {
+        let today = now.date_naive();
+        if crate::calendar::is_trading_day(today) {
+            today
+        } else {
+            crate::calendar::prev_trading_day(today)
+        }
+    }
 
     /// 测试 1: build_freshness_config 不 panic, 4 个字段都填上 config 默认值
     #[test]
@@ -502,9 +534,14 @@ mod tests_br006 {
     fn test_fresh_kline_passes() {
         let freshness = build_freshness_config();
         let stats = DqStats::new();
-        let today = chrono::Local::now().date_naive();
-        let result = validate_daily_freshness(today, chrono::Local::now(), &freshness, &stats);
-        assert!(result.is_ok(), "今日 K 线应通过 freshness: {:?}", result.err());
+        let now = chrono::Local::now();
+        let latest_trading_day = latest_effective_trading_day(now);
+        let result = validate_daily_freshness(latest_trading_day, now, &freshness, &stats);
+        assert!(
+            result.is_ok(),
+            "今日 K 线应通过 freshness: {:?}",
+            result.err()
+        );
     }
 
     /// 测试 3: 5 天前 K 线 → freshness 拒绝 (Stale + age > 0 + max = 86400)
@@ -513,7 +550,8 @@ mod tests_br006 {
         let freshness = build_freshness_config();
         let stats = DqStats::new();
         let five_days_ago = chrono::Local::now().date_naive() - chrono::Duration::days(5);
-        let result = validate_daily_freshness(five_days_ago, chrono::Local::now(), &freshness, &stats);
+        let result =
+            validate_daily_freshness(five_days_ago, chrono::Local::now(), &freshness, &stats);
         assert!(result.is_err(), "5 天前 K 线应被拒绝");
         let reason = result.unwrap_err();
         match reason {
@@ -548,7 +586,7 @@ mod tests_br006 {
     #[test]
     fn test_check_kline_freshness_uses_latest_date_not_last() {
         use crate::data_provider::KlineData;
-        let today = chrono::Local::now().date_naive();
+        let today = latest_effective_trading_day(chrono::Local::now());
         let old_date = today - chrono::Duration::days(249);
         // 构造降序 K 线 (RustDX 默认顺序): 最新在前, 最旧在后
         let kline: Vec<KlineData> = (0..250)
@@ -660,10 +698,17 @@ mod tests_br011 {
     /// 测试 6: 6 tool 全部 Ok → inventory 6 个 OK
     #[test]
     fn test_render_data_inventory_all_ok() {
-        let results: Vec<ToolResult> = ["financials", "research", "news", "sector", "chip", "fund_flow"]
-            .iter()
-            .map(|n| ToolResult::ok(n, "data".to_string()))
-            .collect();
+        let results: Vec<ToolResult> = [
+            "financials",
+            "research",
+            "news",
+            "sector",
+            "chip",
+            "fund_flow",
+        ]
+        .iter()
+        .map(|n| ToolResult::ok(n, "data".to_string()))
+        .collect();
         let s = render_data_inventory(&results);
         let ok_count = s.matches(" OK").count();
         assert_eq!(ok_count, 6, "6 tool 全部 OK");
@@ -672,10 +717,17 @@ mod tests_br011 {
     /// 测试 7: 6 tool 全部失败 → inventory 6 个 MISSING
     #[test]
     fn test_render_data_inventory_all_missing() {
-        let results: Vec<ToolResult> = ["financials", "research", "news", "sector", "chip", "fund_flow"]
-            .iter()
-            .map(|n| ToolResult::missing(n, "失败".to_string()))
-            .collect();
+        let results: Vec<ToolResult> = [
+            "financials",
+            "research",
+            "news",
+            "sector",
+            "chip",
+            "fund_flow",
+        ]
+        .iter()
+        .map(|n| ToolResult::missing(n, "失败".to_string()))
+        .collect();
         let s = render_data_inventory(&results);
         let miss_count = s.matches("MISSING").count();
         assert_eq!(miss_count, 6, "6 tool 全部 MISSING");

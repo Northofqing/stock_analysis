@@ -8,26 +8,23 @@
 //! 输出: stdout + data/v13_diag_report.json (持久化)
 
 use std::time::Instant;
-use std::collections::HashMap;
 
 use serde::Serialize;
 
-use super::dryrun_report::KindStat;
 use super::push_templates::{
-    load_sector_snapshot_real, load_news_catalyst_snapshot_real,
-    load_industry_chain_snapshot_real, load_news_to_idea_snapshot_real,
-    load_paper_review_snapshot_real, load_auction_volume_snapshot_real,
-    load_catalyst_review_snapshot_real,
+    load_auction_volume_snapshot_real, load_catalyst_review_snapshot_real,
+    load_industry_chain_snapshot_real, load_news_catalyst_snapshot_real,
+    load_news_to_idea_snapshot_real, load_paper_review_snapshot_real, load_sector_snapshot_real,
 };
 
 /// 端到端诊断步骤
 #[derive(Debug, Clone, Serialize)]
 pub struct DiagStep {
-    pub step: String,           // e.g. "load_sector", "render_intraday", "dispatch"
-    pub dispatcher: String,     // e.g. "I-01", "T-07"
-    pub status: String,          // "ok" | "empty" | "error"
+    pub step: String,       // e.g. "load_sector", "render_intraday", "dispatch"
+    pub dispatcher: String, // e.g. "I-01", "T-07"
+    pub status: String,     // "ok" | "empty" | "error"
     pub duration_ms: u64,
-    pub detail: String,          // 错误信息 / 数据规模
+    pub detail: String, // 错误信息 / 数据规模
 }
 
 /// v13.27 整体诊断报告
@@ -65,7 +62,11 @@ pub async fn run_v13_diag() -> V13DiagReport {
         if snap.headline.is_empty() {
             "empty".into()
         } else {
-            format!("ok: headline={}, stocks={}", snap.headline, snap.stocks.len())
+            format!(
+                "ok: headline={}, stocks={}",
+                snap.headline,
+                snap.stocks.len()
+            )
         }
     }));
 
@@ -75,7 +76,11 @@ pub async fn run_v13_diag() -> V13DiagReport {
         if snap.chain.is_empty() {
             "empty".into()
         } else {
-            format!("ok: chain={}, supplements={}", snap.chain, snap.supplements.len())
+            format!(
+                "ok: chain={}, supplements={}",
+                snap.chain,
+                snap.supplements.len()
+            )
         }
     }));
 
@@ -115,7 +120,7 @@ pub async fn run_v13_diag() -> V13DiagReport {
 
     // v35: A-10 盘后催化复盘 (依赖 chain_daily cluster)
     steps.push(check_step("A-10", "load_catalyst_review", || {
-        let (date, score, persistent, started, pending, _) =
+        let (date, score, _persistent, started, _pending, _) =
             load_catalyst_review_snapshot_real("2026-07-07");
         if started.is_empty() {
             "empty".into()
@@ -145,39 +150,37 @@ pub async fn run_v13_diag() -> V13DiagReport {
 
     // v45: T-15 盘后固定价格成交 - 编译期 dispatcher 存在
     steps.push(check_step("T-15", "dispatcher_available", || {
-        use super::push_templates::PostFixedPriceFillParams;
+        
         "ok: dispatcher wired".to_string()
     }));
 
     // v46: T-16 ST 涨跌幅变更 - 编译期 dispatcher 存在
     steps.push(check_step("T-16", "dispatcher_available", || {
-        use super::push_templates::StPriceLimitChangedParams;
+        
         "ok: dispatcher wired (新规 5%→10%)".to_string()
     }));
 
     // v47: T-17 ETF 收盘集合竞价 - 编译期 dispatcher 存在
     steps.push(check_step("T-17", "dispatcher_available", || {
-        use super::push_templates::EtfClosingCallAuctionParams;
+        
         "ok: dispatcher wired (新规 14:57 集合竞价)".to_string()
     }));
 
     // v48: T-18 创业板大宗盘中确认 - 编译期 dispatcher 存在
     steps.push(check_step("T-18", "dispatcher_available", || {
-        use super::push_templates::BlockTradeIntradayConfirmParams;
+        
         "ok: dispatcher wired (新规 创业板盘中确认)".to_string()
     }));
 
     // v49: T-19 北交所大宗价格区间 - 编译期 dispatcher 存在
     steps.push(check_step("T-19", "dispatcher_available", || {
-        use super::push_templates::BlockTradePriceRangeParams;
+        
         "ok: dispatcher wired (新规 北交所均价口径)".to_string()
     }));
 
     // v58: P-05 虚拟观察仓 (开盘 9:30 推一次)
     steps.push(check_step("P-05", "render_template", || {
-        use super::push_templates::{
-            render_virtual_watch, VirtualWatchItem, VirtualWatchParams,
-        };
+        use super::push_templates::{render_virtual_watch, VirtualWatchItem, VirtualWatchParams};
         let items = vec![VirtualWatchItem {
             name: "测试股",
             code: "600000",
@@ -205,7 +208,7 @@ pub async fn run_v13_diag() -> V13DiagReport {
     let error_steps = steps.iter().filter(|s| s.status == "error").count();
     let total = steps.len();
 
-    let _ = started;  // 总耗时 (unused for now)
+    let _ = started; // 总耗时 (unused for now)
     V13DiagReport {
         generated_at: chrono::Local::now().to_rfc3339(),
         total_steps: total,
@@ -251,16 +254,20 @@ pub async fn report_v13_diag() -> anyhow::Result<()> {
     let report = run_v13_diag().await;
     println!("\n=== v13.27 端到端诊断 ===");
     println!("生成时间: {}", report.generated_at);
-    println!("总步骤: {}, OK: {}, 空: {}, 错: {}",
-        report.total_steps, report.ok_steps, report.empty_steps, report.error_steps);
+    println!(
+        "总步骤: {}, OK: {}, 空: {}, 错: {}",
+        report.total_steps, report.ok_steps, report.empty_steps, report.error_steps
+    );
     for s in &report.steps {
         let icon = match s.status.as_str() {
             "ok" => "✓",
             "empty" => "○",
             _ => "✗",
         };
-        println!("  {} {} {} ({}ms) {}",
-            icon, s.dispatcher, s.step, s.duration_ms, s.detail);
+        println!(
+            "  {} {} {} ({}ms) {}",
+            icon, s.dispatcher, s.step, s.duration_ms, s.detail
+        );
     }
     if report.error_steps > 0 {
         println!("\n⚠ 发现 {} 个错误环节, 检查上方 ✗ 行", report.error_steps);

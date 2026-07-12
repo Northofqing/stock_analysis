@@ -314,7 +314,11 @@ mod tests {
         });
         inputs.boll_buy_point = true; // 试图 WatchAdd, 但应被层1 压过
         let d = decide(inputs);
-        assert_eq!(d.action, Action::ReduceNow, "层1 一票否决, 即使层5 布林买点也应是 ReduceNow");
+        assert_eq!(
+            d.action,
+            Action::ReduceNow,
+            "层1 一票否决, 即使层5 布林买点也应是 ReduceNow"
+        );
         assert_eq!(d.priority, Priority::P0);
     }
 
@@ -355,7 +359,11 @@ mod tests {
         // 两个 reason (技术止损 + 风控超标), 但 action/priority 是层1 (P0)
         assert_eq!(d.action, Action::ReduceNow);
         assert_eq!(d.priority, Priority::P0);
-        assert_eq!(d.reasons.len(), 2, "两个 reason 都要保留: 技术止损 + 风控超标");
+        assert_eq!(
+            d.reasons.len(),
+            2,
+            "两个 reason 都要保留: 技术止损 + 风控超标"
+        );
     }
 }
 
@@ -374,8 +382,22 @@ static ACTION_AC: once_cell::sync::Lazy<aho_corasick::AhoCorasick> =
         aho_corasick::AhoCorasick::builder()
             .match_kind(aho_corasick::MatchKind::LeftmostLongest)
             .build([
-                "强烈卖出", "强烈看空", "卖出", "看空", "偏空", "减持", "规避", "降仓",
-                "观望", "中性", "看平", "增持", "加仓", "买入", "看多", "强烈看多",
+                "强烈卖出",
+                "强烈看空",
+                "卖出",
+                "看空",
+                "偏空",
+                "减持",
+                "规避",
+                "降仓",
+                "观望",
+                "中性",
+                "看平",
+                "增持",
+                "加仓",
+                "买入",
+                "看多",
+                "强烈看多",
             ])
             .expect("ACTION_KEYWORDS 是固定列表, build 不应失败")
     });
@@ -387,8 +409,22 @@ fn extract_advice_simple(md: &str) -> (String, Option<f64>) {
     // LeftmostLongest 模式 → "强烈卖出" 优先于 "卖出" 出现在同一位置时.
     // 由于 build 顺序就是优先级顺序, find_iter 第一个结果就是最高优先级匹配.
     const ACTION_KEYWORDS: &[&str] = &[
-        "强烈卖出", "强烈看空", "卖出", "看空", "偏空", "减持", "规避", "降仓",
-        "观望", "中性", "看平", "增持", "加仓", "买入", "看多", "强烈看多",
+        "强烈卖出",
+        "强烈看空",
+        "卖出",
+        "看空",
+        "偏空",
+        "减持",
+        "规避",
+        "降仓",
+        "观望",
+        "中性",
+        "看平",
+        "增持",
+        "加仓",
+        "买入",
+        "看多",
+        "强烈看多",
     ];
     let advice = ACTION_AC
         .find(md.as_bytes())
@@ -401,7 +437,8 @@ fn extract_advice_simple(md: &str) -> (String, Option<f64>) {
             break;
         }
         let t = line.trim();
-        if t.contains("综合分") || t.contains("composite_score") || t.contains("composite score") {
+        if t.contains("综合分") || t.contains("composite_score") || t.contains("composite score")
+        {
             for token in t.split(|c: char| !c.is_ascii_digit() && c != '.') {
                 if let Ok(v) = token.parse::<f64>() {
                     if (0.0..=100.0).contains(&v) {
@@ -451,10 +488,7 @@ fn action_priority_from_advice(advice: &str) -> (Action, Priority) {
         || advice.contains("强烈看多")
     {
         (Action::WatchAdd, Priority::P2)
-    } else if advice.contains("观望")
-        || advice.contains("中性")
-        || advice.contains("看平")
-    {
+    } else if advice.contains("观望") || advice.contains("中性") || advice.contains("看平") {
         (Action::Hold, Priority::P2)
     } else {
         // 兜底: 未知 action → Hold (P2) 诚实标注
@@ -511,7 +545,13 @@ pub fn decisions_from_llm(
         // v62: 用真报价填 current_price/change_pct
         let (current_price, change_pct) = quotes
             .get(&p.code)
-            .map(|(price, pct)| if *price > 0.0 { (*price, *pct) } else { (p.cost_price, 0.0) })
+            .map(|(price, pct)| {
+                if *price > 0.0 {
+                    (*price, *pct)
+                } else {
+                    (p.cost_price, 0.0)
+                }
+            })
             .unwrap_or((p.cost_price, 0.0));
         // review #15 简化: name 优先用 by_code 提供的 (LLM 视角的最新名字),
         // 没有则用 holdings p.name. 简化掉之前 name_owned 手工 lifetime 扩展.
@@ -559,7 +599,8 @@ mod tests_llm_parse {
             hard_stop: 9.0,
             added_at: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
             status: crate::portfolio::PositionStatus::Holding,
-            sector: "测试".to_string(), ..Default::default()
+            sector: "测试".to_string(),
+            ..Default::default()
         }
     }
 
@@ -568,7 +609,10 @@ mod tests_llm_parse {
     fn llm_advice_strong_sell() {
         let holdings = vec![make_position("000001", "测试")];
         let mut by_code = HashMap::new();
-        by_code.insert("000001".to_string(), ("测试".to_string(), Some(make_md("强烈卖出", Some(20.0)))));
+        by_code.insert(
+            "000001".to_string(),
+            ("测试".to_string(), Some(make_md("强烈卖出", Some(20.0)))),
+        );
         let quote_map: HashMap<String, (f64, f64)> = HashMap::new();
         let decisions = decisions_from_llm(&holdings, &by_code, &quote_map);
         assert_eq!(decisions.len(), 1);
@@ -581,7 +625,10 @@ mod tests_llm_parse {
     fn llm_advice_reduce() {
         let holdings = vec![make_position("000001", "测试")];
         let mut by_code = HashMap::new();
-        by_code.insert("000001".to_string(), ("测试".to_string(), Some(make_md("减持观望", Some(48.0)))));
+        by_code.insert(
+            "000001".to_string(),
+            ("测试".to_string(), Some(make_md("减持观望", Some(48.0)))),
+        );
         let quote_map: HashMap<String, (f64, f64)> = HashMap::new();
         let decisions = decisions_from_llm(&holdings, &by_code, &quote_map);
         assert_eq!(decisions[0].action, Action::Reduce);
@@ -593,8 +640,13 @@ mod tests_llm_parse {
     fn llm_advice_hold() {
         let holdings = vec![make_position("000001", "测试")];
         let mut by_code = HashMap::new();
-        by_code.insert("000001".to_string(), ("测试".to_string(), Some(make_md("观望", Some(50.0)))));
-        let quote_map: std::collections::HashMap<String, (f64, f64)> = std::collections::HashMap::new(); let decisions = decisions_from_llm(&holdings, &by_code, &quote_map);
+        by_code.insert(
+            "000001".to_string(),
+            ("测试".to_string(), Some(make_md("观望", Some(50.0)))),
+        );
+        let quote_map: std::collections::HashMap<String, (f64, f64)> =
+            std::collections::HashMap::new();
+        let decisions = decisions_from_llm(&holdings, &by_code, &quote_map);
         assert_eq!(decisions[0].action, Action::Hold);
         assert_eq!(decisions[0].priority, Priority::P2);
     }
@@ -604,8 +656,13 @@ mod tests_llm_parse {
     fn llm_advice_add() {
         let holdings = vec![make_position("000001", "测试")];
         let mut by_code = HashMap::new();
-        by_code.insert("000001".to_string(), ("测试".to_string(), Some(make_md("加仓", Some(80.0)))));
-        let quote_map: std::collections::HashMap<String, (f64, f64)> = std::collections::HashMap::new(); let decisions = decisions_from_llm(&holdings, &by_code, &quote_map);
+        by_code.insert(
+            "000001".to_string(),
+            ("测试".to_string(), Some(make_md("加仓", Some(80.0)))),
+        );
+        let quote_map: std::collections::HashMap<String, (f64, f64)> =
+            std::collections::HashMap::new();
+        let decisions = decisions_from_llm(&holdings, &by_code, &quote_map);
         assert_eq!(decisions[0].action, Action::WatchAdd);
         assert_eq!(decisions[0].priority, Priority::P2);
     }
@@ -615,7 +672,9 @@ mod tests_llm_parse {
     fn llm_missing_fallback_hold() {
         let holdings = vec![make_position("000001", "测试")];
         let by_code: HashMap<String, (String, Option<String>)> = HashMap::new(); // 缺失
-        let quote_map: std::collections::HashMap<String, (f64, f64)> = std::collections::HashMap::new(); let decisions = decisions_from_llm(&holdings, &by_code, &quote_map);
+        let quote_map: std::collections::HashMap<String, (f64, f64)> =
+            std::collections::HashMap::new();
+        let decisions = decisions_from_llm(&holdings, &by_code, &quote_map);
         assert_eq!(decisions[0].action, Action::Hold);
         assert_eq!(decisions[0].priority, Priority::P2);
         assert!(decisions[0].reasons[0].text.contains("默认 Hold"));
@@ -676,7 +735,10 @@ mod tests_llm_parse {
 ## 情景树
 - 乐观（P=15%）：主力连续两日净流入超1亿元"#;
         let (advice, _score) = extract_advice_simple(llm_md);
-        assert_eq!(advice, "强烈看空", "v14.4 修订: 从整个 md 找关键词, 不依赖'## 【操作建议】'段");
+        assert_eq!(
+            advice, "强烈看空",
+            "v14.4 修订: 从整个 md 找关键词, 不依赖'## 【操作建议】'段"
+        );
         let (action, priority) = action_priority_from_advice(&advice);
         assert_eq!(action, Action::ReduceNow);
         assert_eq!(priority, Priority::P0);
@@ -737,10 +799,16 @@ mod tests_llm_parse {
             ("合肥城建".to_string(), Some(llm_md.to_string())),
         );
         let holdings = vec![make_position("002208", "合肥城建")];
-        let quote_map: std::collections::HashMap<String, (f64, f64)> = std::collections::HashMap::new(); let decisions = decisions_from_llm(&holdings, &by_code, &quote_map);
+        let quote_map: std::collections::HashMap<String, (f64, f64)> =
+            std::collections::HashMap::new();
+        let decisions = decisions_from_llm(&holdings, &by_code, &quote_map);
         assert_eq!(decisions.len(), 1);
         // "偏空" 关键词命中 → Reduce + P1
-        assert_eq!(decisions[0].action, Action::Reduce, "LLM 真实输出 '偏空' 应映射到 Reduce");
+        assert_eq!(
+            decisions[0].action,
+            Action::Reduce,
+            "LLM 真实输出 '偏空' 应映射到 Reduce"
+        );
         assert_eq!(decisions[0].priority, Priority::P1);
         // reason 含 "偏空" 关键词 (兜底信息)
         assert!(decisions[0].reasons[0].text.contains("偏空"));
@@ -766,7 +834,9 @@ mod tests_llm_parse {
             ("利欧股份".to_string(), Some(llm_md.to_string())),
         );
         let holdings = vec![make_position("002131", "利欧股份")];
-        let quote_map: std::collections::HashMap<String, (f64, f64)> = std::collections::HashMap::new(); let decisions = decisions_from_llm(&holdings, &by_code, &quote_map);
+        let quote_map: std::collections::HashMap<String, (f64, f64)> =
+            std::collections::HashMap::new();
+        let decisions = decisions_from_llm(&holdings, &by_code, &quote_map);
         assert_eq!(decisions[0].action, Action::Reduce);
         assert_eq!(decisions[0].priority, Priority::P1);
     }

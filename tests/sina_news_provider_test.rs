@@ -4,7 +4,7 @@
 //! - URL 构造: 财经要闻 (lid=1686) + 个股新闻 (lid=2516, k=code)
 //! - parse_sina_news_body: JSON → Vec<NewsItem> (含 content_hash 长度)
 use stock_analysis::data_provider::sina_news_provider::{
-    build_top_news_url, build_stock_news_url, decode_sina_bytes, parse_sina_news_body,
+    build_stock_news_url, build_top_news_url, decode_sina_bytes, parse_sina_news_body,
 };
 
 #[test]

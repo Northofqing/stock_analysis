@@ -119,18 +119,25 @@ impl GateResult {
 /// | T0Positive   | Allow  | Deny(只允许减仓)          | Deny   |
 /// | T0Reverse    | Allow  | Allow                     | Deny   |
 pub fn authorize(action: ActionKind, mode: AccountMode) -> GateResult {
-    use ActionKind::*;
     use AccountMode::*;
+    use ActionKind::*;
 
     match (action, mode) {
         // ============ Normal: 全 Allow ============
-        (OpenNew, Normal) | (Add, Normal) | (Reduce, Normal) | (Clear, Normal)
-        | (Hold, Normal) | (T0Positive, Normal) | (T0Reverse, Normal) => GateResult::Allow,
+        (OpenNew, Normal)
+        | (Add, Normal)
+        | (Reduce, Normal)
+        | (Clear, Normal)
+        | (Hold, Normal)
+        | (T0Positive, Normal)
+        | (T0Reverse, Normal) => GateResult::Allow,
 
         // ============ ReduceOnly ============
         (OpenNew, ReduceOnly) => GateResult::Deny("账户降级 ReduceOnly, 禁止开新仓"),
         (Add, ReduceOnly) => GateResult::Deny("账户降级 ReduceOnly, 禁止加仓"),
-        (T0Positive, ReduceOnly) => GateResult::Deny("账户降级 ReduceOnly, 只允许减仓, 不允许做T加仓"),
+        (T0Positive, ReduceOnly) => {
+            GateResult::Deny("账户降级 ReduceOnly, 只允许减仓, 不允许做T加仓")
+        }
         (Reduce, ReduceOnly) => GateResult::Allow,
         (Clear, ReduceOnly) => GateResult::Allow,
         (Hold, ReduceOnly) => GateResult::Allow, // 持有观望永远允许
@@ -168,26 +175,116 @@ mod tests {
         }
         let matrix = [
             // Normal (6 格全 Allow)
-            Expectation { action: ActionKind::OpenNew, mode: AccountMode::Normal, allow: true, reason_contains: None },
-            Expectation { action: ActionKind::Add, mode: AccountMode::Normal, allow: true, reason_contains: None },
-            Expectation { action: ActionKind::Reduce, mode: AccountMode::Normal, allow: true, reason_contains: None },
-            Expectation { action: ActionKind::Clear, mode: AccountMode::Normal, allow: true, reason_contains: None },
-            Expectation { action: ActionKind::T0Positive, mode: AccountMode::Normal, allow: true, reason_contains: None },
-            Expectation { action: ActionKind::T0Reverse, mode: AccountMode::Normal, allow: true, reason_contains: None },
+            Expectation {
+                action: ActionKind::OpenNew,
+                mode: AccountMode::Normal,
+                allow: true,
+                reason_contains: None,
+            },
+            Expectation {
+                action: ActionKind::Add,
+                mode: AccountMode::Normal,
+                allow: true,
+                reason_contains: None,
+            },
+            Expectation {
+                action: ActionKind::Reduce,
+                mode: AccountMode::Normal,
+                allow: true,
+                reason_contains: None,
+            },
+            Expectation {
+                action: ActionKind::Clear,
+                mode: AccountMode::Normal,
+                allow: true,
+                reason_contains: None,
+            },
+            Expectation {
+                action: ActionKind::T0Positive,
+                mode: AccountMode::Normal,
+                allow: true,
+                reason_contains: None,
+            },
+            Expectation {
+                action: ActionKind::T0Reverse,
+                mode: AccountMode::Normal,
+                allow: true,
+                reason_contains: None,
+            },
             // ReduceOnly (3 Deny + 3 Allow)
-            Expectation { action: ActionKind::OpenNew, mode: AccountMode::ReduceOnly, allow: false, reason_contains: Some("开新仓") },
-            Expectation { action: ActionKind::Add, mode: AccountMode::ReduceOnly, allow: false, reason_contains: Some("加仓") },
-            Expectation { action: ActionKind::Reduce, mode: AccountMode::ReduceOnly, allow: true, reason_contains: None },
-            Expectation { action: ActionKind::Clear, mode: AccountMode::ReduceOnly, allow: true, reason_contains: None },
-            Expectation { action: ActionKind::T0Positive, mode: AccountMode::ReduceOnly, allow: false, reason_contains: Some("只允许减仓") },
-            Expectation { action: ActionKind::T0Reverse, mode: AccountMode::ReduceOnly, allow: true, reason_contains: None },
+            Expectation {
+                action: ActionKind::OpenNew,
+                mode: AccountMode::ReduceOnly,
+                allow: false,
+                reason_contains: Some("开新仓"),
+            },
+            Expectation {
+                action: ActionKind::Add,
+                mode: AccountMode::ReduceOnly,
+                allow: false,
+                reason_contains: Some("加仓"),
+            },
+            Expectation {
+                action: ActionKind::Reduce,
+                mode: AccountMode::ReduceOnly,
+                allow: true,
+                reason_contains: None,
+            },
+            Expectation {
+                action: ActionKind::Clear,
+                mode: AccountMode::ReduceOnly,
+                allow: true,
+                reason_contains: None,
+            },
+            Expectation {
+                action: ActionKind::T0Positive,
+                mode: AccountMode::ReduceOnly,
+                allow: false,
+                reason_contains: Some("只允许减仓"),
+            },
+            Expectation {
+                action: ActionKind::T0Reverse,
+                mode: AccountMode::ReduceOnly,
+                allow: true,
+                reason_contains: None,
+            },
             // Frozen (6 格全 Deny)
-            Expectation { action: ActionKind::OpenNew, mode: AccountMode::Frozen, allow: false, reason_contains: Some("熔断") },
-            Expectation { action: ActionKind::Add, mode: AccountMode::Frozen, allow: false, reason_contains: Some("熔断") },
-            Expectation { action: ActionKind::Reduce, mode: AccountMode::Frozen, allow: false, reason_contains: Some("熔断") },
-            Expectation { action: ActionKind::Clear, mode: AccountMode::Frozen, allow: false, reason_contains: Some("熔断") },
-            Expectation { action: ActionKind::T0Positive, mode: AccountMode::Frozen, allow: false, reason_contains: Some("熔断") },
-            Expectation { action: ActionKind::T0Reverse, mode: AccountMode::Frozen, allow: false, reason_contains: Some("熔断") },
+            Expectation {
+                action: ActionKind::OpenNew,
+                mode: AccountMode::Frozen,
+                allow: false,
+                reason_contains: Some("熔断"),
+            },
+            Expectation {
+                action: ActionKind::Add,
+                mode: AccountMode::Frozen,
+                allow: false,
+                reason_contains: Some("熔断"),
+            },
+            Expectation {
+                action: ActionKind::Reduce,
+                mode: AccountMode::Frozen,
+                allow: false,
+                reason_contains: Some("熔断"),
+            },
+            Expectation {
+                action: ActionKind::Clear,
+                mode: AccountMode::Frozen,
+                allow: false,
+                reason_contains: Some("熔断"),
+            },
+            Expectation {
+                action: ActionKind::T0Positive,
+                mode: AccountMode::Frozen,
+                allow: false,
+                reason_contains: Some("熔断"),
+            },
+            Expectation {
+                action: ActionKind::T0Reverse,
+                mode: AccountMode::Frozen,
+                allow: false,
+                reason_contains: Some("熔断"),
+            },
         ];
         assert_eq!(matrix.len(), 18, "18 格矩阵");
         for e in &matrix {
@@ -219,7 +316,10 @@ mod tests {
     #[test]
     fn frozen_blocks_reverse_t() {
         let r = authorize(ActionKind::T0Reverse, AccountMode::Frozen);
-        assert!(!r.is_allow(), "Frozen 下反T必须 Deny (与 Normal/ReduceOnly 反T 行为区分)");
+        assert!(
+            !r.is_allow(),
+            "Frozen 下反T必须 Deny (与 Normal/ReduceOnly 反T 行为区分)"
+        );
         assert!(r.blocked_reason().unwrap().contains("熔断"));
     }
 
@@ -234,7 +334,10 @@ mod tests {
     #[test]
     fn reduce_only_blocks_positive_t() {
         let r = authorize(ActionKind::T0Positive, AccountMode::ReduceOnly);
-        assert!(!r.is_allow(), "ReduceOnly 下正T必须 Deny (做T加仓违反降级精神)");
+        assert!(
+            !r.is_allow(),
+            "ReduceOnly 下正T必须 Deny (做T加仓违反降级精神)"
+        );
         assert!(r.blocked_reason().unwrap().contains("只允许减仓"));
     }
 

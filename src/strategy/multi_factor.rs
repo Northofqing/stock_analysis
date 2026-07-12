@@ -57,10 +57,10 @@ impl Default for MultiFactorConfig {
     fn default() -> Self {
         Self {
             factors: vec![
-                (Factor::MarketCap, FactorDirection::Ascending, 1.0),  // 小盘股
-                (Factor::ROE, FactorDirection::Descending, 1.0),       // 高ROE
-                (Factor::PE, FactorDirection::Ascending, 0.5),         // 低PE
-                (Factor::PB, FactorDirection::Ascending, 0.5),         // 低PB
+                (Factor::MarketCap, FactorDirection::Ascending, 1.0), // 小盘股
+                (Factor::ROE, FactorDirection::Descending, 1.0),      // 高ROE
+                (Factor::PE, FactorDirection::Ascending, 0.5),        // 低PE
+                (Factor::PB, FactorDirection::Ascending, 0.5),        // 低PB
             ],
             top_n: 20,
         }
@@ -89,11 +89,11 @@ impl MultiFactorEngine {
 
         // 1. 提取各因子的原始数据
         let mut factor_data: HashMap<String, Vec<(usize, f64)>> = HashMap::new();
-        
+
         for (factor, _, _) in &self.config.factors {
             let factor_name = self.get_factor_name(factor);
             let mut data = Vec::new();
-            
+
             for (idx, stock) in stocks.iter().enumerate() {
                 if let Some(value) = self.get_factor_value(stock, factor) {
                     if value.is_finite() && value > 0.0 {
@@ -101,16 +101,16 @@ impl MultiFactorEngine {
                     }
                 }
             }
-            
+
             factor_data.insert(factor_name, data);
         }
 
         // 2. 对每个因子进行排名
         let mut factor_ranks: HashMap<String, HashMap<usize, usize>> = HashMap::new();
-        
+
         for (factor, direction, _) in &self.config.factors {
             let factor_name = self.get_factor_name(factor);
-            
+
             if let Some(data) = factor_data.get_mut(&factor_name) {
                 // 根据方向排序
                 match direction {
@@ -123,28 +123,28 @@ impl MultiFactorEngine {
                         data.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
                     }
                 }
-                
+
                 // 记录排名（排名从1开始）
                 let mut ranks = HashMap::new();
                 for (rank, (idx, _)) in data.iter().enumerate() {
                     ranks.insert(*idx, rank + 1);
                 }
-                
+
                 factor_ranks.insert(factor_name, ranks);
             }
         }
 
         // 3. 计算综合得分
         let mut scores = Vec::new();
-        
+
         for (idx, stock) in stocks.iter().enumerate() {
             let mut total_score = 0.0;
             let mut stock_factor_ranks = HashMap::new();
             let mut valid_factors = 0;
-            
+
             for (factor, _, weight) in &self.config.factors {
                 let factor_name = self.get_factor_name(factor);
-                
+
                 if let Some(ranks) = factor_ranks.get(&factor_name) {
                     if let Some(&rank) = ranks.get(&idx) {
                         // 使用排名计算得分（排名越小得分越高）
@@ -154,7 +154,7 @@ impl MultiFactorEngine {
                     }
                 }
             }
-            
+
             // 只有至少有一半因子有效的股票才参与排名
             if valid_factors >= self.config.factors.len() / 2 {
                 scores.push(StockScore {
@@ -175,7 +175,7 @@ impl MultiFactorEngine {
     /// 选出得分最高的N只股票
     pub fn select_top_stocks(&self, stocks: &[StockFactors]) -> Result<Vec<String>> {
         let scores = self.calculate_scores(stocks)?;
-        
+
         Ok(scores
             .iter()
             .take(self.config.top_n)
@@ -275,7 +275,7 @@ mod tests {
 
         let mut config = MultiFactorConfig::default();
         config.top_n = 1;
-        
+
         let engine = MultiFactorEngine::new(config);
         let selected = engine.select_top_stocks(&stocks).unwrap();
 
@@ -313,10 +313,7 @@ impl super::FundamentalStrategy for MultiFactorStrategy {
         "基于市值、ROE、PE、PB等因子排名，综合评分选出得分最优的股票组合"
     }
 
-    fn select_stocks(
-        &self,
-        stocks: &[StockFactors],
-    ) -> Result<Vec<StockScore>> {
+    fn select_stocks(&self, stocks: &[StockFactors]) -> Result<Vec<StockScore>> {
         self.engine.calculate_scores(stocks)
     }
 }

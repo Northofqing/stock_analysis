@@ -76,12 +76,16 @@ pub async fn extract_tickers(
     } else if let Some(arr) = value.get("hits").and_then(|v| v.as_array()) {
         serde_json::from_value(serde_json::Value::Array(arr.clone())).unwrap_or_default()
     } else {
-        log::warn!("[LLM ticker] 响应无 hits 字段: {}", value.to_string().chars().take(200).collect::<String>());
+        log::warn!(
+            "[LLM ticker] 响应无 hits 字段: {}",
+            value.to_string().chars().take(200).collect::<String>()
+        );
         return Ok(Vec::new());
     };
 
     // 二次清洗: 6 位 code 校验, importance clamp, 同 code 取 importance 最高
-    let mut by_code: std::collections::HashMap<String, TickerHit> = std::collections::HashMap::new();
+    let mut by_code: std::collections::HashMap<String, TickerHit> =
+        std::collections::HashMap::new();
     for mut h in hits {
         if h.code.len() != 6 || !h.code.chars().all(|c| c.is_ascii_digit()) {
             continue;
@@ -93,7 +97,9 @@ pub async fn extract_tickers(
         // 同 code 多次出现, 保留 importance 最高
         match by_code.get(&h.code) {
             Some(existing) if existing.importance >= h.importance => {}
-            _ => { by_code.insert(h.code.clone(), h); }
+            _ => {
+                by_code.insert(h.code.clone(), h);
+            }
         }
     }
     let mut cleaned: Vec<TickerHit> = by_code.into_values().collect();
@@ -117,9 +123,17 @@ mod tests {
 
     #[async_trait::async_trait]
     impl LlmProvider for MockProvider {
-        fn name(&self) -> &'static str { "mock" }
-        fn model(&self) -> &str { "mock-v1" }
-        async fn chat_json(&self, _system: &str, _user: &str) -> Result<serde_json::Value, LlmError> {
+        fn name(&self) -> &'static str {
+            "mock"
+        }
+        fn model(&self) -> &str {
+            "mock-v1"
+        }
+        async fn chat_json(
+            &self,
+            _system: &str,
+            _user: &str,
+        ) -> Result<serde_json::Value, LlmError> {
             Ok(self.response.clone())
         }
     }
@@ -137,7 +151,9 @@ mod tests {
                 ]
             }),
         };
-        let hits = extract_tickers(Arc::new(mock), vec!["PCB 涨价 12%".into()]).await.unwrap();
+        let hits = extract_tickers(Arc::new(mock), vec!["PCB 涨价 12%".into()])
+            .await
+            .unwrap();
         // 期望: 002916 (clamp 15→10), 002463; 12345/999999/duplicate-002916 被过滤
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].code, "002916");
@@ -147,7 +163,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_extract_tickers_handles_empty_input() {
-        let mock = MockProvider { response: json!({"hits": []}) };
+        let mock = MockProvider {
+            response: json!({"hits": []}),
+        };
         let hits = extract_tickers(Arc::new(mock), vec![]).await.unwrap();
         assert!(hits.is_empty(), "空输入应短路返回");
     }
@@ -160,15 +178,21 @@ mod tests {
                 {"code": "002916", "name": "深南电路", "importance": 8, "reason": "PCB", "chain": "PCB"}
             ]),
         };
-        let hits = extract_tickers(Arc::new(mock), vec!["x".into()]).await.unwrap();
+        let hits = extract_tickers(Arc::new(mock), vec!["x".into()])
+            .await
+            .unwrap();
         assert_eq!(hits.len(), 1);
     }
 
     #[tokio::test]
     async fn test_extract_tickers_handles_bad_response() {
         // 响应无 hits 字段 → 返回空
-        let mock = MockProvider { response: json!({"unrelated": "data"}) };
-        let hits = extract_tickers(Arc::new(mock), vec!["x".into()]).await.unwrap();
+        let mock = MockProvider {
+            response: json!({"unrelated": "data"}),
+        };
+        let hits = extract_tickers(Arc::new(mock), vec!["x".into()])
+            .await
+            .unwrap();
         assert!(hits.is_empty());
     }
 
@@ -180,9 +204,9 @@ mod tests {
             return;
         }
         let p = super::super::providers::OpenAiCompatProvider::from_env().unwrap();
-        let hits = extract_tickers(Arc::new(p), vec![
-            "国务院印发低空经济发展规划".into(),
-        ]).await.unwrap();
+        let hits = extract_tickers(Arc::new(p), vec!["国务院印发低空经济发展规划".into()])
+            .await
+            .unwrap();
         // 至少不 panic, 输出 0~N 条
         assert!(hits.len() <= 20);
     }
@@ -190,7 +214,9 @@ mod tests {
     /// 避免 async-trait / OpenAIConfig unused import 警告
     #[allow(dead_code)]
     fn _check_imports() {
-        let _cfg = OpenAIConfig::new().with_api_key("x").with_api_base("http://localhost");
+        let _cfg = OpenAIConfig::new()
+            .with_api_key("x")
+            .with_api_base("http://localhost");
         let _c: Client<OpenAIConfig> = Client::with_config(_cfg);
     }
 }

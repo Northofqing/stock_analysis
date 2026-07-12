@@ -3,22 +3,34 @@
 //! Task 2 tests (3): URL builder, name.
 //! Task 3 tests (2): hq URL builder, hq_str parser.
 
-use stock_analysis::data_provider::sina_provider::{build_hq_url, build_kline_url, parse_hq_str};
 use stock_analysis::data_provider::sina_provider::SinaProvider;
+use stock_analysis::data_provider::sina_provider::{build_hq_url, build_kline_url, parse_hq_str};
 use stock_analysis::data_provider::DataProvider;
 
 #[test]
 fn build_kline_url_format() {
     let url = build_kline_url("600000", 5);
-    assert!(url.contains("sh600000"), "URL should include sh600000 symbol, got: {url}");
-    assert!(url.contains("scale=240"), "URL should request 240-min scale, got: {url}");
-    assert!(url.contains("datalen=5"), "URL should request 5 datalen, got: {url}");
+    assert!(
+        url.contains("sh600000"),
+        "URL should include sh600000 symbol, got: {url}"
+    );
+    assert!(
+        url.contains("scale=240"),
+        "URL should request 240-min scale, got: {url}"
+    );
+    assert!(
+        url.contains("datalen=5"),
+        "URL should request 5 datalen, got: {url}"
+    );
 }
 
 #[test]
 fn build_kline_url_sz_prefix() {
     let url = build_kline_url("000001", 30);
-    assert!(url.contains("sz000001"), "URL should include sz000001 symbol, got: {url}");
+    assert!(
+        url.contains("sz000001"),
+        "URL should include sz000001 symbol, got: {url}"
+    );
 }
 
 #[test]

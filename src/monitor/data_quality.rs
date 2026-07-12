@@ -225,8 +225,8 @@ pub fn mark_ipo(code: &str, date: NaiveDate) {
 /// 内部迭代 `next_trading_day` (calendar.rs) 算 5 个交易日窗口, 避免用 `recent_trading_days`
 /// (它是倒推, 语义不符). 缓存空 (没 IPO 日期数据) 返回 false, 兜底"按非新股处理".
 pub fn is_within_5_days_of_ipo(code: &str, date: NaiveDate) -> bool {
-    use crate::calendar::next_trading_day;
     use crate::calendar::is_trading_day;
+    use crate::calendar::next_trading_day;
     let ipo_date = match IPO_DATES.read() {
         Ok(g) => match g.get(code).copied() {
             Some(d) => d,
@@ -404,7 +404,12 @@ pub fn validate_daily_freshness(
 
 /// 主校验函数：对每个 tick 过五道门。
 /// 返回 Ok(()) 表示通过，Err(reason) 表示被拒绝。
-pub fn validate_tick(tick: &Tick, prev: Option<&PrevTick>, config: &DqConfig, stats: &DqStats) -> Result<(), DqRejectReason> {
+pub fn validate_tick(
+    tick: &Tick,
+    prev: Option<&PrevTick>,
+    config: &DqConfig,
+    stats: &DqStats,
+) -> Result<(), DqRejectReason> {
     stats.total_ticks.fetch_add(1, Ordering::Relaxed);
 
     // Gate 1: Staleness
@@ -519,7 +524,8 @@ pub fn validate_daily_kline_quality(
     // 1. 单条 skip
     let before = kline.len();
     kline.retain(|b| {
-        if !b.open.is_finite() || !b.high.is_finite() || !b.low.is_finite() || !b.close.is_finite() {
+        if !b.open.is_finite() || !b.high.is_finite() || !b.low.is_finite() || !b.close.is_finite()
+        {
             log::warn!("[{}] {} 单条 skip: NaN/Inf 价格", code, b.date);
             return false;
         }
@@ -532,7 +538,12 @@ pub fn validate_daily_kline_quality(
         if b.high + 1e-9 < max_oc || b.low - 1e-9 > min_oc || b.high + 1e-9 < b.low {
             log::warn!(
                 "[{}] {} 单条 skip: OHLC 不一致 open={:.3} high={:.3} low={:.3} close={:.3}",
-                code, b.date, b.open, b.high, b.low, b.close
+                code,
+                b.date,
+                b.open,
+                b.high,
+                b.low,
+                b.close
             );
             return false;
         }
@@ -544,7 +555,12 @@ pub fn validate_daily_kline_quality(
     });
     let skipped = before - kline.len();
     if skipped > 0 {
-        log::info!("[{}] 质检单条 skip: {} 条 (剩 {} 条)", code, skipped, kline.len());
+        log::info!(
+            "[{}] 质检单条 skip: {} 条 (剩 {} 条)",
+            code,
+            skipped,
+            kline.len()
+        );
     }
 
     // 2. Dedup: 重复日期保留先到的
@@ -553,11 +569,19 @@ pub fn validate_daily_kline_quality(
     kline.retain(|b| seen.insert(b.date));
     let deduped = before - kline.len();
     if deduped > 0 {
-        log::info!("[{}] 质检 dedup: {} 条 (剩 {} 条)", code, deduped, kline.len());
+        log::info!(
+            "[{}] 质检 dedup: {} 条 (剩 {} 条)",
+            code,
+            deduped,
+            kline.len()
+        );
     }
 
     if kline.is_empty() {
-        return Err(format!("[{}] 质检后日线数据为空 (全部 skip 或 dedup)", code));
+        return Err(format!(
+            "[{}] 质检后日线数据为空 (全部 skip 或 dedup)",
+            code
+        ));
     }
 
     // 3. 跳空检测 (按 max_gap_pct + is_ex_rights / is_within_5_days_of_ipo 豁免)
@@ -571,17 +595,16 @@ pub fn validate_daily_kline_quality(
         let gap_pct = ((cur.open - prev.close) / prev.close * 100.0).abs();
         if gap_pct > max_gap_pct {
             if is_ex_rights(code, cur.date) {
-                log::info!(
-                    "[{}] {} 跳空 {:.2}% 除权日豁免",
-                    code, cur.date, gap_pct
-                );
+                log::info!("[{}] {} 跳空 {:.2}% 除权日豁免", code, cur.date, gap_pct);
                 continue;
             }
             // v11-P0-3 commit 1: 新股前 5 日 (注册制创业板/科创板/北交所) 不设涨跌幅, 大跳空豁免
             if is_within_5_days_of_ipo(code, cur.date) {
                 log::info!(
                     "[{}] {} 跳空 {:.2}% 新股前 5 日豁免",
-                    code, cur.date, gap_pct
+                    code,
+                    cur.date,
+                    gap_pct
                 );
                 continue;
             }
@@ -890,7 +913,12 @@ mod tests {
             make_kline(d2, 10.3, 10.6, 10.1, 10.4),
         ];
         assert!(validate_daily_kline_quality(&mut bars, "000001", 20.0).is_ok());
-        assert!(bars[0].date > bars[1].date, "出参必须降序 (最新在前), 实际: {} vs {}", bars[0].date, bars[1].date);
+        assert!(
+            bars[0].date > bars[1].date,
+            "出参必须降序 (最新在前), 实际: {} vs {}",
+            bars[0].date,
+            bars[1].date
+        );
     }
 
     /// Codex review P0 #1 修复验证: 入参是降序, 质检后必须保持降序 (下游契约)
@@ -986,8 +1014,10 @@ mod tests {
         // 用独特 code 避免与其他测试污染
         let ipo_date = NaiveDate::from_ymd_opt(2026, 6, 22).unwrap(); // 周一
         let query_date = NaiveDate::from_ymd_opt(2026, 6, 23).unwrap(); // 周二
-        assert!(!is_within_5_days_of_ipo("999998", query_date),
-                "缓存空, 即使日期合理也应 false (兜底)");
+        assert!(
+            !is_within_5_days_of_ipo("999998", query_date),
+            "缓存空, 即使日期合理也应 false (兜底)"
+        );
         let _ = ipo_date;
     }
 
@@ -998,8 +1028,7 @@ mod tests {
         let ipo_date = NaiveDate::from_ymd_opt(2026, 6, 22).unwrap(); // 周一
         mark_ipo(code, ipo_date);
         // IPO 当天 (date == ipo_date) → true
-        assert!(is_within_5_days_of_ipo(code, ipo_date),
-                "IPO 当天应命中");
+        assert!(is_within_5_days_of_ipo(code, ipo_date), "IPO 当天应命中");
     }
 
     /// v11-P0-3 commit 1: `is_within_5_days_of_ipo` 跨周末 (5 自然日内只有 3 交易日)
@@ -1012,14 +1041,20 @@ mod tests {
 
         // 5 个交易日内: 周三/周四/周五/下周一/下周二 (跨周末)
         // 2026-06-29 (周一) → 在窗口内 → true
-        assert!(is_within_5_days_of_ipo(code, NaiveDate::from_ymd_opt(2026, 6, 29).unwrap()),
-                "IPO+5 自然日 (周一) 应在 5 交易日窗口内");
+        assert!(
+            is_within_5_days_of_ipo(code, NaiveDate::from_ymd_opt(2026, 6, 29).unwrap()),
+            "IPO+5 自然日 (周一) 应在 5 交易日窗口内"
+        );
         // 2026-06-30 (周二) → 在窗口内 → true
-        assert!(is_within_5_days_of_ipo(code, NaiveDate::from_ymd_opt(2026, 6, 30).unwrap()),
-                "IPO+6 自然日 (周二) 应在 5 交易日窗口内");
+        assert!(
+            is_within_5_days_of_ipo(code, NaiveDate::from_ymd_opt(2026, 6, 30).unwrap()),
+            "IPO+6 自然日 (周二) 应在 5 交易日窗口内"
+        );
         // 2026-07-01 (周三) → 超 5 交易日窗口 → false
-        assert!(!is_within_5_days_of_ipo(code, NaiveDate::from_ymd_opt(2026, 7, 1).unwrap()),
-                "IPO+7 自然日 (周三) 应超 5 交易日窗口");
+        assert!(
+            !is_within_5_days_of_ipo(code, NaiveDate::from_ymd_opt(2026, 7, 1).unwrap()),
+            "IPO+7 自然日 (周三) 应超 5 交易日窗口"
+        );
     }
 
     /// v11-P0-3 commit 1: `is_within_5_days_of_ipo` 早于 IPO
@@ -1029,7 +1064,9 @@ mod tests {
         let ipo_date = NaiveDate::from_ymd_opt(2026, 6, 22).unwrap(); // 周一
         mark_ipo(code, ipo_date);
         // date < ipo_date → false
-        assert!(!is_within_5_days_of_ipo(code, NaiveDate::from_ymd_opt(2026, 6, 19).unwrap()),
-                "date 早于 IPO 应 false");
+        assert!(
+            !is_within_5_days_of_ipo(code, NaiveDate::from_ymd_opt(2026, 6, 19).unwrap()),
+            "date 早于 IPO 应 false"
+        );
     }
 }

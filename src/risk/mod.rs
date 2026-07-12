@@ -13,13 +13,13 @@
 //! | `risk/veto_chain.rs` | 实时否决链框架: VetoRule trait + VetoChain |
 //! | `risk/veto_rules_live.rs` | 三条实时否决规则: 乖离率/资金面/基本面 |
 
-pub mod limits;
 pub mod cash_guard;
-pub mod stop_loss;
+pub mod env_guard;
+pub mod limits;
 pub mod sector_exit;
+pub mod stop_loss;
 pub mod veto_chain;
 pub mod veto_rules_live;
-pub mod env_guard;
 // v12 PR1: 动作门 (与 veto_chain 并存, 不替换)
-pub mod action_gate;
 pub mod account_mode;
+pub mod action_gate;

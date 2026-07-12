@@ -13,7 +13,7 @@ pub struct CapitalSignal {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VolumePhase {
-    LaunchBreakout,  // 首次放量启动
+    LaunchBreakout, // 首次放量启动
     Normal,
     TopDistribution, // 高位持续放量 → 警惕
 }
@@ -30,15 +30,23 @@ impl VolumePhase {
 
 /// 计算 RS 相对强度：个股 N 日收益 vs 指数 N 日收益
 /// 返回 -100~+100，正数 = 跑赢指数
-pub fn compute_rs(stock_kline: &[KlineData], index_kline: &[KlineData], days: usize) -> Option<f64> {
-    if stock_kline.len() < days || index_kline.len() < days { return None; }
+pub fn compute_rs(
+    stock_kline: &[KlineData],
+    index_kline: &[KlineData],
+    days: usize,
+) -> Option<f64> {
+    if stock_kline.len() < days || index_kline.len() < days {
+        return None;
+    }
 
     let stock_start = stock_kline[stock_kline.len() - days].close;
     let stock_end = stock_kline.last()?.close;
     let index_start = index_kline[index_kline.len() - days].close;
     let index_end = index_kline.last()?.close;
 
-    if stock_start <= 0.0 || index_start <= 0.0 { return None; }
+    if stock_start <= 0.0 || index_start <= 0.0 {
+        return None;
+    }
 
     let stock_ret = (stock_end - stock_start) / stock_start * 100.0;
     let index_ret = (index_end - index_start) / index_start * 100.0;
@@ -47,21 +55,36 @@ pub fn compute_rs(stock_kline: &[KlineData], index_kline: &[KlineData], days: us
 
 /// 判断量能所处阶段
 pub fn classify_volume(kline: &[KlineData]) -> VolumePhase {
-    if kline.len() < 20 { return VolumePhase::Normal; }
+    if kline.len() < 20 {
+        return VolumePhase::Normal;
+    }
 
     let recent_vol: f64 = kline.iter().rev().take(5).map(|k| k.volume).sum::<f64>() / 5.0;
-    let old_vol: f64 = kline.iter().rev().skip(5).take(15).map(|k| k.volume).sum::<f64>() / 15.0;
+    let old_vol: f64 = kline
+        .iter()
+        .rev()
+        .skip(5)
+        .take(15)
+        .map(|k| k.volume)
+        .sum::<f64>()
+        / 15.0;
 
-    if old_vol <= 0.0 { return VolumePhase::Normal; }
+    if old_vol <= 0.0 {
+        return VolumePhase::Normal;
+    }
     let ratio = recent_vol / old_vol;
 
     // 最近价格走势
     let recent_price: f64 = kline.iter().rev().take(5).map(|k| k.close).sum::<f64>() / 5.0;
     let mid_price: f64 = kline.iter().rev().take(20).map(|k| k.close).sum::<f64>() / 20.0;
-    let price_position = if mid_price > 0.0 { (recent_price - mid_price) / mid_price * 100.0 } else { 0.0 };
+    let price_position = if mid_price > 0.0 {
+        (recent_price - mid_price) / mid_price * 100.0
+    } else {
+        0.0
+    };
 
     if ratio > 2.0 && price_position < 10.0 {
-        VolumePhase::LaunchBreakout  // 放量但价格未远离均线 → 启动
+        VolumePhase::LaunchBreakout // 放量但价格未远离均线 → 启动
     } else if ratio > 2.0 && price_position > 20.0 {
         VolumePhase::TopDistribution // 放量且价格已大幅高于均线 → 警惕
     } else {
@@ -75,21 +98,26 @@ pub fn verify_holdings(
     stock_klines: &std::collections::HashMap<String, Vec<KlineData>>,
     index_kline: &[KlineData],
 ) -> Vec<CapitalSignal> {
-    holdings.iter().filter_map(|p| {
-        let kline = stock_klines.get(&p.code)?;
-        Some(CapitalSignal {
-            code: p.code.clone(),
-            name: p.name.clone(),
-            rs_vs_index: compute_rs(kline, index_kline, 10),
-            volume_phase: classify_volume(kline),
-            note: String::new(),
+    holdings
+        .iter()
+        .filter_map(|p| {
+            let kline = stock_klines.get(&p.code)?;
+            Some(CapitalSignal {
+                code: p.code.clone(),
+                name: p.name.clone(),
+                rs_vs_index: compute_rs(kline, index_kline, 10),
+                volume_phase: classify_volume(kline),
+                note: String::new(),
+            })
         })
-    }).collect()
+        .collect()
 }
 
 /// 格式化资金验证结果
 pub fn format_capital_signals(signals: &[CapitalSignal]) -> String {
-    if signals.is_empty() { return String::new(); }
+    if signals.is_empty() {
+        return String::new();
+    }
     let mut lines = vec!["💰 资金验证".to_string()];
     for s in signals {
         let rs_str = match s.rs_vs_index {
@@ -97,8 +125,19 @@ pub fn format_capital_signals(signals: &[CapitalSignal]) -> String {
             Some(v) => format!("RS{:.1}", v),
             None => "RS——".to_string(),
         };
-        let warn = if s.volume_phase == VolumePhase::TopDistribution { " ⚠️追高风险" } else { "" };
-        lines.push(format!("  {}({}) {} {}{}", s.name, s.code, rs_str, s.volume_phase.label(), warn));
+        let warn = if s.volume_phase == VolumePhase::TopDistribution {
+            " ⚠️追高风险"
+        } else {
+            ""
+        };
+        lines.push(format!(
+            "  {}({}) {} {}{}",
+            s.name,
+            s.code,
+            rs_str,
+            s.volume_phase.label(),
+            warn
+        ));
     }
     lines.join("\n")
 }
@@ -111,15 +150,34 @@ mod tests {
     fn kline(close: f64, volume: f64) -> KlineData {
         KlineData {
             date: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
-            open: close, high: close, low: close, close, volume,
-            amount: 0.0, pct_chg: 0.0, intraday_price: None, settled: true,
-            pe_ratio: None, pb_ratio: None, turnover_rate: None,
-            market_cap: None, circulating_cap: None,
-            eps: None, roe: None, revenue_yoy: None, net_profit_yoy: None,
-            gross_margin: None, net_margin: None, sharpe_ratio: None,
-            financials_history: None, valuation_history: None,
-            consensus: None, industry: None,
-            is_limit_up: false, is_limit_down: false, is_suspended: false,
+            open: close,
+            high: close,
+            low: close,
+            close,
+            volume,
+            amount: 0.0,
+            pct_chg: 0.0,
+            intraday_price: None,
+            settled: true,
+            pe_ratio: None,
+            pb_ratio: None,
+            turnover_rate: None,
+            market_cap: None,
+            circulating_cap: None,
+            eps: None,
+            roe: None,
+            revenue_yoy: None,
+            net_profit_yoy: None,
+            gross_margin: None,
+            net_margin: None,
+            sharpe_ratio: None,
+            financials_history: None,
+            valuation_history: None,
+            consensus: None,
+            industry: None,
+            is_limit_up: false,
+            is_limit_down: false,
+            is_suspended: false,
             adjust: crate::data_provider::AdjustType::None,
         }
     }

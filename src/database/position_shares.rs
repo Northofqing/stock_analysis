@@ -13,9 +13,9 @@
 
 use diesel::prelude::*;
 
+use super::DatabaseManager;
 use crate::risk::env_guard::current_env;
 use crate::schema::{position_adjustments, stock_position};
-use super::DatabaseManager;
 
 /// 计算某 code 当前可用股数 (可卖数).
 ///
@@ -85,14 +85,18 @@ pub fn insert_position_adjustment(
         return Err("delta 不能为 0".to_string());
     }
     if !matches!(source, "manual_confirm" | "import") {
-        return Err(format!("source 必须 ∈ manual_confirm|import, 实得 {}", source));
+        return Err(format!(
+            "source 必须 ∈ manual_confirm|import, 实得 {}",
+            source
+        ));
     }
 
     // env_guard: 测试环境拦截 (对齐 positions.rs:21)
     if matches!(current_env(), crate::risk::env_guard::TradingEnv::Test) {
         log::warn!(
             "[ENV_GUARD] position_adjustments: 测试环境拦截写入 code={} delta={}",
-            code, delta
+            code,
+            delta
         );
         return Err("测试环境不允许写入 position_adjustments".to_string());
     }
@@ -106,7 +110,9 @@ pub fn insert_position_adjustment(
         today.format("%Y-%m-%d").to_string()
     } else {
         // 加仓 T+1 生效
-        (today + chrono::Duration::days(1)).format("%Y-%m-%d").to_string()
+        (today + chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string()
     };
     let applied_immediately = if delta < 0 { 1 } else { 0 };
 
@@ -124,7 +130,10 @@ pub fn insert_position_adjustment(
 
     // 取 last_insert_rowid
     #[derive(diesel::QueryableByName)]
-    struct IdRow { #[diesel(sql_type = diesel::sql_types::BigInt)] id: i64 }
+    struct IdRow {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        id: i64,
+    }
     let row: IdRow = diesel::sql_query("SELECT last_insert_rowid() AS id")
         .get_result(&mut conn)
         .map_err(|e| format!("last_insert_rowid: {}", e))?;

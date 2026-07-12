@@ -3,13 +3,16 @@
 use chrono::Local;
 use diesel::prelude::*;
 
-use crate::models::{NewLhbDaily, LhbDaily};
+use crate::models::{LhbDaily, NewLhbDaily};
 use crate::schema::lhb_daily;
 
 use super::DatabaseManager;
 
 impl DatabaseManager {
-    pub fn save_lhb_records(&self, records: &[NewLhbDaily]) -> Result<usize, Box<dyn std::error::Error>> {
+    pub fn save_lhb_records(
+        &self,
+        records: &[NewLhbDaily],
+    ) -> Result<usize, Box<dyn std::error::Error>> {
         if records.is_empty() {
             return Ok(0);
         }
@@ -34,7 +37,10 @@ impl DatabaseManager {
     }
 
     /// 检查指定日期的龙虎榜数据是否已缓存
-    pub fn has_lhb_data_for_date(&self, trade_date: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    pub fn has_lhb_data_for_date(
+        &self,
+        trade_date: &str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
         let mut conn = self.get_conn()?;
 
         let count: i64 = lhb_daily::table
@@ -46,12 +52,15 @@ impl DatabaseManager {
     }
 
     /// 从数据库获取指定日期的龙虎榜数据（支持模糊匹配）
-    pub fn get_lhb_by_date(&self, trade_date: &str) -> Result<Vec<LhbDaily>, Box<dyn std::error::Error>> {
+    pub fn get_lhb_by_date(
+        &self,
+        trade_date: &str,
+    ) -> Result<Vec<LhbDaily>, Box<dyn std::error::Error>> {
         let mut conn = self.get_conn()?;
 
         // 支持日期模糊匹配：2026-01-29 可以匹配 2026-01-29%
         let date_pattern = format!("{}%", trade_date);
-        
+
         let records = lhb_daily::table
             .filter(lhb_daily::trade_date.like(date_pattern))
             .order(lhb_daily::net_amount.desc())
@@ -82,7 +91,7 @@ impl DatabaseManager {
     /// 清除过期的龙虎榜缓存数据（保留最近N天）
     pub fn clean_old_lhb_data(&self, keep_days: i64) -> Result<usize, Box<dyn std::error::Error>> {
         let mut conn = self.get_conn()?;
-        
+
         let cutoff_date = Local::now()
             .date_naive()
             .checked_sub_signed(chrono::Duration::days(keep_days))
@@ -90,10 +99,9 @@ impl DatabaseManager {
             .format("%Y%m%d")
             .to_string();
 
-        let deleted = diesel::delete(
-            lhb_daily::table.filter(lhb_daily::trade_date.lt(cutoff_date))
-        )
-        .execute(&mut conn)?;
+        let deleted =
+            diesel::delete(lhb_daily::table.filter(lhb_daily::trade_date.lt(cutoff_date)))
+                .execute(&mut conn)?;
 
         Ok(deleted)
     }
@@ -120,5 +128,4 @@ impl DatabaseManager {
     // ========================================================================
     // 模拟持仓操作
     // ========================================================================
-
 }

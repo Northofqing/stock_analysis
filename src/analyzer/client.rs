@@ -71,7 +71,8 @@ impl GeminiAnalyzer {
 
     /// 调用 API（带重试和故障转移，使用默认系统提示词，Quick 模式）
     pub(super) async fn call_api_with_retry(&self, prompt: &str) -> Result<String> {
-        self.call_api_with_retry_ex(prompt, Self::SYSTEM_PROMPT).await
+        self.call_api_with_retry_ex(prompt, Self::SYSTEM_PROMPT)
+            .await
     }
 
     /// 调用 API（带重试和故障转移，自定义系统提示词，Quick 模式 + 全局 thinking 配置）
@@ -128,7 +129,11 @@ impl GeminiAnalyzer {
             if attempt > 0 {
                 let delay = self.config.retry_delay * 2_f64.powi(attempt as i32 - 1);
                 let delay = delay.min(60.0);
-                info!("[Gemini] 第 {} 次重试，等待 {:.1} 秒...", attempt + 1, delay);
+                info!(
+                    "[Gemini] 第 {} 次重试，等待 {:.1} 秒...",
+                    attempt + 1,
+                    delay
+                );
                 tokio::time::sleep(Duration::from_secs_f64(delay)).await;
             }
 
@@ -153,7 +158,8 @@ impl GeminiAnalyzer {
                             self.config.max_retries
                         );
 
-                        if attempt >= self.config.max_retries / 2 && !*self.using_fallback.borrow() {
+                        if attempt >= self.config.max_retries / 2 && !*self.using_fallback.borrow()
+                        {
                             self.switch_to_fallback();
                         }
                     } else {
@@ -334,7 +340,11 @@ impl GeminiAnalyzer {
                     .map(|p| p.text.as_str())
                     .collect::<Vec<_>>()
                     .join("");
-                if combined.is_empty() { None } else { Some(combined) }
+                if combined.is_empty() {
+                    None
+                } else {
+                    Some(combined)
+                }
             })
             .ok_or_else(|| anyhow!("Gemini 返回空响应"))
     }
@@ -429,8 +439,8 @@ impl GeminiAnalyzer {
         }
 
         let response_text = response.text().await.context("读取 OpenAI 响应失败")?;
-        let openai_response: OpenAIResponse = serde_json::from_str(&response_text)
-            .with_context(|| {
+        let openai_response: OpenAIResponse =
+            serde_json::from_str(&response_text).with_context(|| {
                 let snippet = response_text.chars().take(1000).collect::<String>();
                 format!("解析 OpenAI 响应失败，原始响应片段: {}", snippet)
             })?;
@@ -552,8 +562,8 @@ impl GeminiAnalyzer {
         }
 
         let response_text = response.text().await.context("读取豆包响应失败")?;
-        let doubao_response: DoubaoResponse = serde_json::from_str(&response_text)
-            .with_context(|| {
+        let doubao_response: DoubaoResponse =
+            serde_json::from_str(&response_text).with_context(|| {
                 let snippet = response_text.chars().take(1000).collect::<String>();
                 format!("解析豆包响应失败，原始响应片段: {}", snippet)
             })?;

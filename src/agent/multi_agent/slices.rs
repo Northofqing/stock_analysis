@@ -78,9 +78,7 @@ pub fn build_slices(
 
 /// 渲染系统趋势快照（参考证据型，不含最终评分/买入信号）。
 fn render_trend_snapshot(ts: &TrendSnapshot) -> String {
-    let mut s = String::from(
-        "\n【系统趋势快照（参考证据，请独立判断，勿照搬系统结论）】\n",
-    );
+    let mut s = String::from("\n【系统趋势快照（参考证据，请独立判断，勿照搬系统结论）】\n");
     s.push_str(&format!(
         "趋势状态: {} | 均线排列: {} | 趋势强度: {:.1}\n",
         ts.trend_status, ts.ma_alignment, ts.trend_strength
@@ -90,11 +88,19 @@ fn render_trend_snapshot(ts: &TrendSnapshot) -> String {
         ts.bias_ma5, ts.volume_status, ts.volume_ratio_5d
     ));
     if !ts.support_levels.is_empty() {
-        let lv: Vec<String> = ts.support_levels.iter().map(|v| format!("{:.2}", v)).collect();
+        let lv: Vec<String> = ts
+            .support_levels
+            .iter()
+            .map(|v| format!("{:.2}", v))
+            .collect();
         s.push_str(&format!("支撑位: {}\n", lv.join(" / ")));
     }
     if !ts.resistance_levels.is_empty() {
-        let lv: Vec<String> = ts.resistance_levels.iter().map(|v| format!("{:.2}", v)).collect();
+        let lv: Vec<String> = ts
+            .resistance_levels
+            .iter()
+            .map(|v| format!("{:.2}", v))
+            .collect();
         s.push_str(&format!("压力位: {}\n", lv.join(" / ")));
     }
     if !ts.evidence_reasons.is_empty() {
@@ -175,12 +181,18 @@ fn build_technical_slice(
     }
     if let Some(m10) = ma10 {
         if m10 > 0.0 {
-            s.push_str(&format!("MA10乖离率: {:.2}%\n", (latest.close - m10) / m10 * 100.0));
+            s.push_str(&format!(
+                "MA10乖离率: {:.2}%\n",
+                (latest.close - m10) / m10 * 100.0
+            ));
         }
     }
     if let Some(m20) = ma20 {
         if m20 > 0.0 {
-            s.push_str(&format!("MA20乖离率: {:.2}%\n", (latest.close - m20) / m20 * 100.0));
+            s.push_str(&format!(
+                "MA20乖离率: {:.2}%\n",
+                (latest.close - m20) / m20 * 100.0
+            ));
         }
     }
 
@@ -371,7 +383,10 @@ fn build_technical_slice(
     if r >= 2 {
         s.push_str("【近期走势(近10日)】\n");
         for k in &kline_data[..r] {
-            s.push_str(&format!("  {} | 收 {:.2} | {:.2}%\n", k.date, k.close, k.pct_chg));
+            s.push_str(&format!(
+                "  {} | 收 {:.2} | {:.2}%\n",
+                k.date, k.close, k.pct_chg
+            ));
         }
         let chg5: f64 = kline_data[..n.min(5)].iter().map(|k| k.pct_chg).sum();
         s.push_str(&format!("近5日累计: {:.2}%\n", chg5));
@@ -391,12 +406,20 @@ fn build_technical_slice(
         s.push_str("【布林+MACD 共振信号（强约束）】\n");
         s.push_str(&format!(
             "动作: {} | 收盘 ¥{:.2} | 上轨 ¥{:.2} / 中轨 ¥{:.2} / 下轨 ¥{:.2}\n",
-            bm.action.name(), bm.close, bm.upper, bm.middle, bm.lower
+            bm.action.name(),
+            bm.close,
+            bm.upper,
+            bm.middle,
+            bm.lower
         ));
         s.push_str(&format!(
             "带宽 {:.2}% (5日变化 {:+.2}%) | DIF/DEA/HIST = {:.3}/{:.3}/{:.3} | 背离: {:?}\n",
-            bm.band_width_pct, bm.band_change_pct,
-            bm.macd_dif, bm.macd_dea, bm.macd_hist, bm.macd_div
+            bm.band_width_pct,
+            bm.band_change_pct,
+            bm.macd_dif,
+            bm.macd_dea,
+            bm.macd_hist,
+            bm.macd_div
         ));
         s.push_str(&format!("解读: {}\n", bm.reason));
         s.push_str("规则: TopSell→禁止买入；BottomBuy→可小仓<30%；UptrendStart→可加仓至60%；PreReversal→仅观察。\n");
@@ -443,7 +466,11 @@ fn build_capital_slice(
     s.push_str("【主力资金（代理推断）】\n");
     if n >= 5 {
         let avg5 = kline_data[..5].iter().map(|k| k.volume).sum::<f64>() / 5.0;
-        let r = if avg5 > 0.0 { latest.volume / avg5 } else { 1.0 };
+        let r = if avg5 > 0.0 {
+            latest.volume / avg5
+        } else {
+            1.0
+        };
         let mf = if r > 1.5 && latest.pct_chg > 1.0 {
             "🔥 放量上涨 — 主力介入迹象"
         } else if r > 1.5 && latest.pct_chg < -1.0 {
@@ -460,10 +487,7 @@ fn build_capital_slice(
         s.push_str(&format!("代理判断: {}\n", mf));
     }
     if let Some(t) = latest.turnover_rate {
-        s.push_str(&format!(
-            "换手率: {:.2}%（>7%活跃，>15%火热）\n",
-            t
-        ));
+        s.push_str(&format!("换手率: {:.2}%（>7%活跃，>15%火热）\n", t));
     }
 
     // 真实资金/分时/龙虎榜/筹码（外部注入）
@@ -530,18 +554,34 @@ fn build_fundamental_slice(latest: &KlineData) -> String {
     if let Some(vh) = latest.valuation_history.as_ref() {
         if vh.sample_days >= 30 {
             let label = |pct: f64| -> &'static str {
-                if pct < 20.0 { "极低估⭐" }
-                else if pct < 40.0 { "低估" }
-                else if pct < 60.0 { "中位" }
-                else if pct < 80.0 { "高估" }
-                else { "极高估⚠️" }
+                if pct < 20.0 {
+                    "极低估⭐"
+                } else if pct < 40.0 {
+                    "低估"
+                } else if pct < 60.0 {
+                    "中位"
+                } else if pct < 80.0 {
+                    "高估"
+                } else {
+                    "极高估⚠️"
+                }
             };
             s.push_str(&format!("【估值分位】近{}日\n", vh.sample_days));
             if let (Some(cur), Some(pct)) = (vh.current_pe, vh.pe_percentile) {
-                s.push_str(&format!("PE TTM {:.2} → 分位 {:.1}% ({})\n", cur, pct, label(pct)));
+                s.push_str(&format!(
+                    "PE TTM {:.2} → 分位 {:.1}% ({})\n",
+                    cur,
+                    pct,
+                    label(pct)
+                ));
             }
             if let (Some(cur), Some(pct)) = (vh.current_pb, vh.pb_percentile) {
-                s.push_str(&format!("PB MRQ {:.2} → 分位 {:.1}% ({})\n", cur, pct, label(pct)));
+                s.push_str(&format!(
+                    "PB MRQ {:.2} → 分位 {:.1}% ({})\n",
+                    cur,
+                    pct,
+                    label(pct)
+                ));
             }
         }
     }
@@ -589,12 +629,24 @@ fn build_fundamental_slice(latest: &KlineData) -> String {
             for p in &show {
                 let date = p.report_date.as_deref().unwrap_or("-");
                 let mut parts: Vec<String> = Vec::new();
-                if let Some(v) = p.eps { parts.push(format!("EPS {:.3}", v)); }
-                if let Some(v) = p.roe { parts.push(format!("ROE {:.2}%", v)); }
-                if let Some(v) = p.gross_margin { parts.push(format!("毛利 {:.2}%", v)); }
-                if let Some(v) = p.revenue_yoy { parts.push(format!("营收YoY {:.2}%", v)); }
-                if let Some(v) = p.net_profit_yoy { parts.push(format!("净利YoY {:.2}%", v)); }
-                if let Some(v) = p.op_cash_flow_ps { parts.push(format!("每股CFO {:.3}", v)); }
+                if let Some(v) = p.eps {
+                    parts.push(format!("EPS {:.3}", v));
+                }
+                if let Some(v) = p.roe {
+                    parts.push(format!("ROE {:.2}%", v));
+                }
+                if let Some(v) = p.gross_margin {
+                    parts.push(format!("毛利 {:.2}%", v));
+                }
+                if let Some(v) = p.revenue_yoy {
+                    parts.push(format!("营收YoY {:.2}%", v));
+                }
+                if let Some(v) = p.net_profit_yoy {
+                    parts.push(format!("净利YoY {:.2}%", v));
+                }
+                if let Some(v) = p.op_cash_flow_ps {
+                    parts.push(format!("每股CFO {:.3}", v));
+                }
                 s.push_str(&format!("{}: {}\n", date, parts.join(" | ")));
             }
         }
@@ -603,11 +655,21 @@ fn build_fundamental_slice(latest: &KlineData) -> String {
         let ratios: Vec<f64> = show.iter().filter_map(|p| p.cfo_to_ni_ratio()).collect();
         if !ratios.is_empty() {
             let avg = ratios.iter().sum::<f64>() / ratios.len() as f64;
-            let tag = if avg <= 0.0 { "风险⚠️" }
-                      else if avg < 0.5 { "偏弱" }
-                      else if avg < 1.0 { "健康" }
-                      else { "优秀" };
-            s.push_str(&format!("盈利质量(CFO/NI 近{}期均值): {:.2} ({})\n", ratios.len(), avg, tag));
+            let tag = if avg <= 0.0 {
+                "风险⚠️"
+            } else if avg < 0.5 {
+                "偏弱"
+            } else if avg < 1.0 {
+                "健康"
+            } else {
+                "优秀"
+            };
+            s.push_str(&format!(
+                "盈利质量(CFO/NI 近{}期均值): {:.2} ({})\n",
+                ratios.len(),
+                avg,
+                tag
+            ));
             if avg < 0.3 {
                 s.push_str("⚠️ 盈利质量风险：CFO 长期低于净利润，疑似应收堆积\n");
             }
@@ -616,7 +678,10 @@ fn build_fundamental_slice(latest: &KlineData) -> String {
         // 财务异常信号
         if let Some(q) = crate::data_provider::assess_quality(hist) {
             if !q.flags.is_empty() {
-                s.push_str(&format!("【财务异常】评分 {}/100 ({})\n", q.risk_score, q.level));
+                s.push_str(&format!(
+                    "【财务异常】评分 {}/100 ({})\n",
+                    q.risk_score, q.level
+                ));
                 for f in &q.flags {
                     s.push_str(&format!("• {}\n", f));
                 }
@@ -666,15 +731,26 @@ fn build_fundamental_slice(latest: &KlineData) -> String {
     if let Some(ib) = latest.industry.as_ref() {
         if ib.peer_count >= 3 {
             let mut parts: Vec<String> = Vec::new();
-            parts.push(format!("【行业对标】{}({}家同业)", ib.industry_name, ib.peer_count));
-            if let (Some(s_pe), Some(m_pe), Some(p)) = (ib.stock_pe, ib.median_pe, ib.pe_percentile) {
+            parts.push(format!(
+                "【行业对标】{}({}家同业)",
+                ib.industry_name, ib.peer_count
+            ));
+            if let (Some(s_pe), Some(m_pe), Some(p)) = (ib.stock_pe, ib.median_pe, ib.pe_percentile)
+            {
                 parts.push(format!("PE {:.1} vs 中位 {:.1} (P{:.0})", s_pe, m_pe, p));
             }
-            if let (Some(s_roe), Some(m_roe), Some(p)) = (ib.stock_roe, ib.median_roe, ib.roe_percentile) {
+            if let (Some(s_roe), Some(m_roe), Some(p)) =
+                (ib.stock_roe, ib.median_roe, ib.roe_percentile)
+            {
                 parts.push(format!("ROE {:.2} vs 中位 {:.2} (P{:.0})", s_roe, m_roe, p));
             }
-            if let (Some(s_g), Some(m_g), Some(p)) = (ib.stock_growth, ib.median_growth, ib.growth_percentile) {
-                parts.push(format!("净利同比 {:.0}% vs 中位 {:.0}% (P{:.0})", s_g, m_g, p));
+            if let (Some(s_g), Some(m_g), Some(p)) =
+                (ib.stock_growth, ib.median_growth, ib.growth_percentile)
+            {
+                parts.push(format!(
+                    "净利同比 {:.0}% vs 中位 {:.0}% (P{:.0})",
+                    s_g, m_g, p
+                ));
             }
             s.push_str(&parts.join(" | "));
             s.push('\n');

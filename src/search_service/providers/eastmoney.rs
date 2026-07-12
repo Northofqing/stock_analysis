@@ -9,7 +9,6 @@ use serde::Deserialize;
 
 use super::super::types::{NewsType, SearchProvider, SearchResponse, SearchResult, Sentiment};
 
-
 // ============================================================================
 // 东方财富 新闻API
 // ============================================================================
@@ -42,7 +41,7 @@ impl EastmoneyNewsProvider {
     async fn do_search(&self, query: &str, max_results: usize) -> Result<SearchResponse> {
         // 从查询中提取股票代码和名称
         let (_stock_code, stock_name) = Self::parse_query(query);
-        
+
         // 东方财富支持纯关键词搜索，不强制要求股票代码
         let search_keyword = if !stock_name.is_empty() {
             stock_name
@@ -60,7 +59,7 @@ impl EastmoneyNewsProvider {
         }
 
         let start = Instant::now();
-        
+
         // 东方财富新闻搜索API
         // 示例: http://search-api-web.eastmoney.com/search/jsonp?cb=jQuery&param=...
         let url = format!(
@@ -72,7 +71,10 @@ impl EastmoneyNewsProvider {
         let response_text = self
             .client
             .get(&url)
-            .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+            )
             .header("Referer", "http://so.eastmoney.com/")
             .send()
             .await
@@ -111,8 +113,8 @@ impl EastmoneyNewsProvider {
             result: Option<EastmoneyResult>,
         }
 
-        let parsed: EastmoneyResponse = serde_json::from_str(json_text)
-            .context("解析东方财富响应失败")?;
+        let parsed: EastmoneyResponse =
+            serde_json::from_str(json_text).context("解析东方财富响应失败")?;
 
         if parsed.code != 0 {
             return Ok(SearchResponse::error(
@@ -137,7 +139,8 @@ impl EastmoneyNewsProvider {
             .into_iter()
             .map(|item| {
                 let source = item.media_name.unwrap_or_else(|| "东方财富".to_string());
-                let snippet = item.content
+                let snippet = item
+                    .content
                     .unwrap_or_else(|| item.title.clone())
                     .chars()
                     .take(500)
@@ -151,7 +154,7 @@ impl EastmoneyNewsProvider {
                     published_date: item.date,
                     news_type: NewsType::Other,
                     sentiment: Sentiment::Unknown,
-                    importance: 6, // 东方财富权威性较高
+                    importance: 6,  // 东方财富权威性较高
                     relevance: 0.8, // A股专业平台，相关性高
                     keywords: Vec::new(),
                 };
@@ -176,11 +179,11 @@ impl EastmoneyNewsProvider {
     /// 也支持: "金风 持股 投资 收购 参股" -> ("", "金风 持股 投资 收购 参股")
     fn parse_query(query: &str) -> (String, String) {
         let parts: Vec<&str> = query.split_whitespace().collect();
-        
+
         let mut code = String::new();
         let mut name_parts: Vec<String> = Vec::new();
         let stop_words = ["股票", "最新", "消息", "新闻"];
-        
+
         for part in &parts {
             // 匹配6位数字的股票代码
             if part.len() == 6 && part.chars().all(|c| c.is_ascii_digit()) {
@@ -190,7 +193,7 @@ impl EastmoneyNewsProvider {
                 name_parts.push(part.to_string());
             }
         }
-        
+
         (code, name_parts.join(" "))
     }
 }
@@ -223,4 +226,3 @@ impl SearchProvider for EastmoneyNewsProvider {
         }
     }
 }
-

@@ -22,8 +22,12 @@ impl StockCode {
         }
     }
 
-    pub fn as_str(&self) -> &str { &self.0 }
-    pub fn market_prefix(&self) -> char { self.0.chars().next().unwrap() }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+    pub fn market_prefix(&self) -> char {
+        self.0.chars().next().unwrap()
+    }
 }
 
 impl fmt::Display for StockCode {
@@ -37,8 +41,12 @@ impl fmt::Display for StockCode {
 pub struct Price(f64);
 
 impl Price {
-    pub fn new(value: f64) -> Self { Self(value) }
-    pub fn value(&self) -> f64 { self.0 }
+    pub fn new(value: f64) -> Self {
+        Self(value)
+    }
+    pub fn value(&self) -> f64 {
+        self.0
+    }
 }
 
 /// 百分比（例如 5.0 表示 5%）
@@ -46,8 +54,12 @@ impl Price {
 pub struct Percent(f64);
 
 impl Percent {
-    pub fn new(value: f64) -> Self { Self(value) }
-    pub fn value(&self) -> f64 { self.0 }
+    pub fn new(value: f64) -> Self {
+        Self(value)
+    }
+    pub fn value(&self) -> f64 {
+        self.0
+    }
 }
 
 impl fmt::Display for Percent {

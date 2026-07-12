@@ -10,8 +10,7 @@
 //!
 //! v12 §2.3 + BR-022 衍生.
 
-use crate::risk::account_mode::PortfolioMetrics;
-use crate::risk::action_gate::{authorize, ActionKind, AccountMode, GateResult};
+use crate::risk::action_gate::{authorize, AccountMode, ActionKind, GateResult};
 
 /// 数据模式 (复用 push_templates::DataMode, 简化为本地枚举避免跨 crate 依赖)
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -99,7 +98,8 @@ pub fn evaluate(input: &LivePlanInput) -> LivePlanResult {
             rationale,
         })
     } else {
-        let reason = build_downgrade_reason(gate, input.data_mode, input.available_shares, needs_shares);
+        let reason =
+            build_downgrade_reason(gate, input.data_mode, input.available_shares, needs_shares);
         LivePlanResult::Advice(Advice {
             code: input.code.clone(),
             name: input.name.clone(),
@@ -198,7 +198,11 @@ mod tests {
         let r = evaluate(&input_normal());
         if let LivePlanResult::Executable(e) = r {
             // pnl = (12/11 - 1) * 100 ≈ 9.09
-            assert!((e.pnl_pct - 9.09).abs() < 0.5, "pnl_pct 计算错误: {}", e.pnl_pct);
+            assert!(
+                (e.pnl_pct - 9.09).abs() < 0.5,
+                "pnl_pct 计算错误: {}",
+                e.pnl_pct
+            );
         } else {
             panic!("应返回 ExecutablePlan");
         }

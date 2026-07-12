@@ -1,8 +1,12 @@
-use chrono::{DateTime, Local, NaiveDateTime};
 use crate::search_service::SearchResult;
+use chrono::{DateTime, Local, NaiveDateTime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SourceType { Flash, Search, Announcement }
+pub enum SourceType {
+    Flash,
+    Search,
+    Announcement,
+}
 
 #[derive(Debug, Clone)]
 pub struct RawNewsItem {
@@ -19,13 +23,17 @@ pub struct SearchResultAdapter;
 
 impl SearchResultAdapter {
     pub fn to_raw(sr: &SearchResult) -> Result<RawNewsItem, String> {
-        let date_str = sr.published_date.as_deref()
-            .ok_or_else(|| format!("E_INVALID_PUBLISHED_AT: published_date 缺失 (source={}, title={})",
-                sr.source, sr.title))?;
+        let date_str = sr.published_date.as_deref().ok_or_else(|| {
+            format!(
+                "E_INVALID_PUBLISHED_AT: published_date 缺失 (source={}, title={})",
+                sr.source, sr.title
+            )
+        })?;
         let naive = NaiveDateTime::parse_from_str(date_str, "%Y-%m-%d %H:%M:%S")
             .or_else(|_| NaiveDateTime::parse_from_str(date_str, "%Y-%m-%d"))
             .map_err(|e| format!("E_INVALID_PUBLISHED_AT: 无法解析 '{}': {}", date_str, e))?;
-        let published_at: DateTime<Local> = DateTime::from_naive_utc_and_offset(naive, *Local::now().offset());
+        let published_at: DateTime<Local> =
+            DateTime::from_naive_utc_and_offset(naive, *Local::now().offset());
 
         let (source_priority, source_type) = match sr.source.as_str() {
             "巨潮" | "cninfo" => (4, SourceType::Announcement),
@@ -44,7 +52,11 @@ impl SearchResultAdapter {
             source_priority,
             source_type,
             published_at,
-            url: if sr.url.is_empty() { None } else { Some(sr.url.clone()) },
+            url: if sr.url.is_empty() {
+                None
+            } else {
+                Some(sr.url.clone())
+            },
         })
     }
 }

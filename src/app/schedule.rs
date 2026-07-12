@@ -28,11 +28,7 @@ pub async fn run_scheduled_analysis(args: &Args) -> Result<()> {
 }
 
 /// 间隔执行模式：每 N 分钟执行一次。
-async fn run_interval_schedule(
-    args: &Args,
-    interval_minutes: u64,
-    run_now: bool,
-) -> Result<()> {
+async fn run_interval_schedule(args: &Args, interval_minutes: u64, run_now: bool) -> Result<()> {
     info!("定时模式: 每 {} 分钟执行一次", interval_minutes);
 
     if run_now {
@@ -59,11 +55,7 @@ async fn run_interval_schedule(
 }
 
 /// 指定时间点执行模式：支持多时间点与星期过滤。
-async fn run_time_schedule(
-    args: &Args,
-    schedule_time: &str,
-    run_now: bool,
-) -> Result<()> {
+async fn run_time_schedule(args: &Args, schedule_time: &str, run_now: bool) -> Result<()> {
     let weekdays = args.weekdays.as_deref();
     let time_points: Vec<(u32, u32)> = schedule_time
         .split(',')
@@ -79,7 +71,9 @@ async fn run_time_schedule(
         .collect();
 
     if time_points.is_empty() {
-        return Err(anyhow::anyhow!("无效的定时时间格式，应为 HH:MM 或 HH:MM,HH:MM"));
+        return Err(anyhow::anyhow!(
+            "无效的定时时间格式，应为 HH:MM 或 HH:MM,HH:MM"
+        ));
     }
 
     let weekdays_str = if let Some(days) = weekdays {
@@ -154,7 +148,10 @@ async fn run_time_schedule(
         let wait_duration = min_wait.to_std()?;
         let hours = wait_duration.as_secs_f64() / 3600.0;
 
-        info!("\n下次执行时间: {}", next_time.format("%Y-%m-%d %H:%M:%S (%A)"));
+        info!(
+            "\n下次执行时间: {}",
+            next_time.format("%Y-%m-%d %H:%M:%S (%A)")
+        );
         if hours >= 24.0 {
             info!("等待 {:.1} 天...", hours / 24.0);
         } else if hours >= 1.0 {
@@ -213,14 +210,13 @@ async fn execute_once(args: &Args) {
     // 重新装配股票列表。
     info!("本次定时任务类型: 个股分析（重新装配股票列表）");
     let args_clone = args.clone();
-    let stock_codes =
-        match crate::app::build_stock_list(&args_clone).await {
-            Ok((codes, _limit_up, _macro_ctx)) => codes,
-            Err(e) => {
-                error!("装配股票列表失败: {}", e);
-                return;
-            }
-        };
+    let stock_codes = match crate::app::build_stock_list(&args_clone).await {
+        Ok((codes, _limit_up, _macro_ctx)) => codes,
+        Err(e) => {
+            error!("装配股票列表失败: {}", e);
+            return;
+        }
+    };
 
     info!("本次待分析股票（共 {} 只）", stock_codes.len());
 

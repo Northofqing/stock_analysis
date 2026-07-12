@@ -15,7 +15,7 @@ impl MarketAnalyzer {
         info!("[大盘] 获取市场涨跌统计...");
 
         let url = "http://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData";
-        
+
         let mut up = 0;
         let mut down = 0;
         let mut flat = 0;
@@ -39,19 +39,24 @@ impl MarketAnalyzer {
                 ("_s_r_a", "page"),
             ];
 
-            let data = self.call_api_with_retry(&format!("A股实时行情-第{}页", page), 1, || {
-                let response = self.client
-                    .get(url)
-                    .query(&params)
-                    .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
-                    .timeout(Duration::from_secs(10))
-                    .send()
-                    .context("请求失败")?;
+            let data =
+                self.call_api_with_retry(&format!("A股实时行情-第{}页", page), 1, || {
+                    let response = self
+                        .client
+                        .get(url)
+                        .query(&params)
+                        .header(
+                            "User-Agent",
+                            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                        )
+                        .timeout(Duration::from_secs(10))
+                        .send()
+                        .context("请求失败")?;
 
-                let text = response.text().context("读取响应失败")?;
-                let json: Value = serde_json::from_str(&text).context("解析JSON失败")?;
-                Ok(json)
-            });
+                    let text = response.text().context("读取响应失败")?;
+                    let json: Value = serde_json::from_str(&text).context("解析JSON失败")?;
+                    Ok(json)
+                });
 
             if let Some(json_data) = data {
                 if let Some(stocks) = json_data.as_array() {
@@ -62,12 +67,16 @@ impl MarketAnalyzer {
 
                     for item in stocks {
                         total_stocks += 1;
-                        
-                        if let Some(change_pct) = item.get("changepercent").and_then(|v| v.as_f64()) {
+
+                        if let Some(change_pct) = item.get("changepercent").and_then(|v| v.as_f64())
+                        {
                             // 提取股票代码和名称，用于判断涨跌停阈值
-                            let stock_name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                            let raw_code = item.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
-                            let code = raw_code.trim_start_matches("sh")
+                            let stock_name =
+                                item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                            let raw_code =
+                                item.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
+                            let code = raw_code
+                                .trim_start_matches("sh")
                                 .trim_start_matches("sz")
                                 .trim_start_matches("bj");
                             let limit_pct = Self::get_limit_pct(code, stock_name);
@@ -87,12 +96,26 @@ impl MarketAnalyzer {
                             }
 
                             // 收集股票信息用于排序
-                            if let Some(price) = item.get("trade").and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()) {
+                            if let Some(price) = item
+                                .get("trade")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| s.parse::<f64>().ok())
+                            {
                                 // 收集涨停股票
                                 if change_pct >= limit_pct - 0.1 {
-                                    limit_up_stocks.push((code.to_string(), stock_name.to_string(), change_pct, price));
+                                    limit_up_stocks.push((
+                                        code.to_string(),
+                                        stock_name.to_string(),
+                                        change_pct,
+                                        price,
+                                    ));
                                 }
-                                all_stocks.push((code.to_string(), stock_name.to_string(), change_pct, price));
+                                all_stocks.push((
+                                    code.to_string(),
+                                    stock_name.to_string(),
+                                    change_pct,
+                                    price,
+                                ));
                             }
                         }
 
@@ -116,27 +139,34 @@ impl MarketAnalyzer {
 
         // 按涨跌幅排序并取前10
         all_stocks.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
-        overview.top_stocks = all_stocks.iter().take(10).map(|(code, name, change_pct, price)| {
-            use crate::market_data::TopStock;
-            TopStock {
-                code: code.clone(),
-                name: name.clone(),
-                change_pct: *change_pct,
-                price: *price,
-                ..Default::default()
-            }
-        }).collect();
+        overview.top_stocks = all_stocks
+            .iter()
+            .take(10)
+            .map(|(code, name, change_pct, price)| {
+                use crate::market_data::TopStock;
+                TopStock {
+                    code: code.clone(),
+                    name: name.clone(),
+                    change_pct: *change_pct,
+                    price: *price,
+                    ..Default::default()
+                }
+            })
+            .collect();
 
-        overview.limit_up_stocks = limit_up_stocks.iter().map(|(code, name, change_pct, price)| {
-            use crate::market_data::TopStock;
-            TopStock {
-                code: code.clone(),
-                name: name.clone(),
-                change_pct: *change_pct,
-                price: *price,
-                ..Default::default()
-            }
-        }).collect();
+        overview.limit_up_stocks = limit_up_stocks
+            .iter()
+            .map(|(code, name, change_pct, price)| {
+                use crate::market_data::TopStock;
+                TopStock {
+                    code: code.clone(),
+                    name: name.clone(),
+                    change_pct: *change_pct,
+                    price: *price,
+                    ..Default::default()
+                }
+            })
+            .collect();
 
         info!(
             "[大盘] 统计完成: 共{}只股票 涨:{} 跌:{} 平:{} 涨停:{} 跌停:{} 成交额:{:.0}亿",
@@ -198,67 +228,69 @@ impl MarketAnalyzer {
     fn fetch_real_sector_rankings(&self, top_n: usize) -> Result<Vec<(String, f64)>> {
         fetch_sector_rankings_impl(top_n)
     }
-
 }
 
 fn fetch_sector_rankings_impl(top_n: usize) -> Result<Vec<(String, f64)>> {
-        let url = "https://push2.eastmoney.com/api/qt/clist/get";
-        let params: &[(&str, &str)] = &[
-            ("pn", "1"),
-            ("pz", &top_n.to_string()),
-            ("po", "1"),  // 降序
-            ("np", "1"),
-            ("fltt", "2"),
-            ("invt", "2"),
-            ("fid", "f3"),
-            ("fs", "m:90+t:2"),  // 行业板块
-            ("fields", "f1,f2,f3,f4,f12,f14"),
-            ("_", "0"),
-        ];
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(8))
-            .build()
-            .context("创建 HTTP 客户端失败 (sector)")?;
-        // 修复 Top10#5 (2026-06-29 audit): 用统一 block_on_async 替代 block_in_place + Handle::current().block_on
-        let resp_text = crate::block_on_async(async {
-            client
-                .get(url)
-                .query(params)
-                .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
-                .header("Referer", "https://quote.eastmoney.com/")
-                .send()
-                .await?
-                .text()
-                .await
-        })
-        .map_err(|e: reqwest::Error| anyhow::anyhow!("板块接口 HTTP 失败: {e}"))?;
+    let url = "https://push2.eastmoney.com/api/qt/clist/get";
+    let params: &[(&str, &str)] = &[
+        ("pn", "1"),
+        ("pz", &top_n.to_string()),
+        ("po", "1"), // 降序
+        ("np", "1"),
+        ("fltt", "2"),
+        ("invt", "2"),
+        ("fid", "f3"),
+        ("fs", "m:90+t:2"), // 行业板块
+        ("fields", "f1,f2,f3,f4,f12,f14"),
+        ("_", "0"),
+    ];
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .context("创建 HTTP 客户端失败 (sector)")?;
+    // 修复 Top10#5 (2026-06-29 audit): 用统一 block_on_async 替代 block_in_place + Handle::current().block_on
+    let resp_text = crate::block_on_async(async {
+        client
+            .get(url)
+            .query(params)
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+            )
+            .header("Referer", "https://quote.eastmoney.com/")
+            .send()
+            .await?
+            .text()
+            .await
+    })
+    .map_err(|e: reqwest::Error| anyhow::anyhow!("板块接口 HTTP 失败: {e}"))?;
 
-        let json: Value = serde_json::from_str(&resp_text)
-            .map_err(|e| anyhow::anyhow!("板块响应非 JSON: {e}"))?;
-        let diff = json
-            .get("data")
-            .and_then(|d| d.get("diff"))
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| anyhow::anyhow!("板块响应无 data.diff 数组"))?;
-        if diff.is_empty() {
-            anyhow::bail!("板块响应 diff 数组为空");
-        }
-        let mut out: Vec<(String, f64)> = Vec::with_capacity(diff.len());
-        for item in diff {
-            let name = item
-                .get("f14")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("板块项缺少 f14 (name)"))?
-                .to_string();
-            let change_pct = item
-                .get("f3")
-                .and_then(|v| v.as_f64())
-                .ok_or_else(|| anyhow::anyhow!("板块项缺少 f3 (change_pct)"))?;
-            out.push((name, change_pct));
-        }
-        // 按 f3 降序（接口已 po=1, 这里再保险排一次）
-        out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        Ok(out)
+    let json: Value =
+        serde_json::from_str(&resp_text).map_err(|e| anyhow::anyhow!("板块响应非 JSON: {e}"))?;
+    let diff = json
+        .get("data")
+        .and_then(|d| d.get("diff"))
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow::anyhow!("板块响应无 data.diff 数组"))?;
+    if diff.is_empty() {
+        anyhow::bail!("板块响应 diff 数组为空");
+    }
+    let mut out: Vec<(String, f64)> = Vec::with_capacity(diff.len());
+    for item in diff {
+        let name = item
+            .get("f14")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("板块项缺少 f14 (name)"))?
+            .to_string();
+        let change_pct = item
+            .get("f3")
+            .and_then(|v| v.as_f64())
+            .ok_or_else(|| anyhow::anyhow!("板块项缺少 f3 (change_pct)"))?;
+        out.push((name, change_pct));
+    }
+    // 按 f3 降序（接口已 po=1, 这里再保险排一次）
+    out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -271,8 +303,7 @@ mod tests {
     #[test]
     fn no_mock_random_in_sector_data() {
         let src = include_str!("statistics.rs");
-        let test_mod_start = src.find("#[cfg(test)]\nmod tests {")
-            .unwrap_or(src.len());
+        let test_mod_start = src.find("#[cfg(test)]\nmod tests {").unwrap_or(src.len());
         let production_src = &src[..test_mod_start];
         // 真正禁止的伪随机模式
         assert!(

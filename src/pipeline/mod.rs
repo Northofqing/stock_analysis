@@ -21,27 +21,22 @@ pub(super) mod technical_report;
 mod trade_type;
 pub mod veto_rules;
 
+pub use position_tracker::RiskContext;
 pub use score_breakdown::ScoreBreakdown;
 pub use veto_rules::VetoOutcome;
-pub use position_tracker::RiskContext;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use futures::stream::{self, StreamExt};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::analyzer::GeminiAnalyzer;
-use crate::data_provider::{DataFetcherManager, KlineData};
-use crate::data_provider::financials::FinancialPeriod;
-use crate::search_service::get_search_service;
-use crate::database::DatabaseManager;
+use crate::data_provider::DataFetcherManager;
 use crate::notification::NotificationService;
-use crate::trend_analyzer::StockTrendAnalyzer;
+use crate::search_service::get_search_service;
 use crate::traits::ScoreDisplay;
-use crate::monitor::data_quality::{
-    validate_daily_freshness, validate_daily_kline_quality, DqStats, FreshnessConfig,
-};
+use crate::trend_analyzer::StockTrendAnalyzer;
 
 /// 股票综合分析结果
 ///
@@ -197,8 +192,12 @@ pub struct AnalysisResult {
 }
 
 impl ScoreDisplay for AnalysisResult {
-    fn sentiment_score(&self) -> i32 { self.sentiment_score }
-    fn operation_advice(&self) -> &str { &self.operation_advice }
+    fn sentiment_score(&self) -> i32 {
+        self.sentiment_score
+    }
+    fn operation_advice(&self) -> &str {
+        &self.operation_advice
+    }
 }
 
 impl AnalysisResult {
@@ -281,7 +280,11 @@ fn score_to_advice(score: i32) -> &'static str {
 fn key_stock_priority(r: &AnalysisResult) -> Option<i32> {
     let mut p = 0;
     let mut hit = false;
-    if r.veto_flags.as_ref().map(|v| !v.is_empty()).unwrap_or(false) {
+    if r.veto_flags
+        .as_ref()
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
         p += 100;
         hit = true;
     }
@@ -382,7 +385,11 @@ impl AnalysisPipeline {
         candidates.sort_by(|a, b| b.1.cmp(&a.1));
         candidates.truncate(max);
 
-        info!("[深度研判] 命中重点股 {} 只（上限 {}）", candidates.len(), max);
+        info!(
+            "[深度研判] 命中重点股 {} 只（上限 {}）",
+            candidates.len(),
+            max
+        );
 
         // 深度研判并发度（LLM 密集，默认 3，单独控制避免叠加放大限流）
         let concurrency = std::env::var("DEEP_ANALYSIS_CONCURRENCY")
@@ -401,16 +408,20 @@ impl AnalysisPipeline {
                     info!("[深度研判] ▶ {} {}", code, name);
                     // 优先复用主流程数据种子（避免重复抓取）；缺失时回退到现抓路径。
                     let deep = match &seed_opt {
-                        Some(seed) => tokio::time::timeout(
-                            std::time::Duration::from_secs(300),
-                            crate::deep_analyzer::run_multi_agent_analysis_with_seed(seed),
-                        )
-                        .await,
-                        None => tokio::time::timeout(
-                            std::time::Duration::from_secs(300),
-                            crate::deep_analyzer::run_multi_agent_analysis(&code),
-                        )
-                        .await,
+                        Some(seed) => {
+                            tokio::time::timeout(
+                                std::time::Duration::from_secs(300),
+                                crate::deep_analyzer::run_multi_agent_analysis_with_seed(seed),
+                            )
+                            .await
+                        }
+                        None => {
+                            tokio::time::timeout(
+                                std::time::Duration::from_secs(300),
+                                crate::deep_analyzer::run_multi_agent_analysis(&code),
+                            )
+                            .await
+                        }
                     };
                     let md = match deep {
                         Ok(Ok(md)) if !md.trim().is_empty() => Some(md),
@@ -440,14 +451,20 @@ impl AnalysisPipeline {
             let code = results[idx].code.clone();
             results[idx].analysis_summary =
                 self::section_utils::merge_deep_analysis(&results[idx].analysis_summary, &md);
-            if let Err(e) = self::section_utils::save_deep_report(&code, &results[idx].analysis_summary) {
+            if let Err(e) =
+                self::section_utils::save_deep_report(&code, &results[idx].analysis_summary)
+            {
                 warn!("[深度研判] {} 落盘失败: {}", code, e);
             }
             info!("[深度研判] ✓ {} 已合并进报告", code);
         }
     }
 
-    pub async fn run(&self, stock_codes: &[String], prefetched_macro: Option<String>) -> Result<Vec<AnalysisResult>> {
+    pub async fn run(
+        &self,
+        stock_codes: &[String],
+        prefetched_macro: Option<String>,
+    ) -> Result<Vec<AnalysisResult>> {
         if stock_codes.is_empty() {
             warn!("股票列表为空");
             return Ok(Vec::new());
@@ -472,9 +489,14 @@ impl AnalysisPipeline {
 
         // 并发处理股票（使用配置的最大并发数）
         info!("使用 {} 个并发任务处理股票", self.config.max_workers);
-        let macro_context = macro_news::resolve_macro_context(prefetched_macro, self.use_news_search).await;
+        let macro_context =
+            macro_news::resolve_macro_context(prefetched_macro, self.use_news_search).await;
 
-        info!("📋 分析股票列表（{} 只）: {:?}", stock_codes.len(), stock_codes);
+        info!(
+            "📋 分析股票列表（{} 只）: {:?}",
+            stock_codes.len(),
+            stock_codes
+        );
         let mut results: Vec<AnalysisResult> = stream::iter(stock_codes.iter())
             .map(|code| self.process_stock(code.clone(), macro_context.clone()))
             .buffer_unordered(self.config.max_workers)
@@ -498,7 +520,8 @@ impl AnalysisPipeline {
         // 仅对评分极端 / 反向信号 / 风险否决 / 涨停 等重点股启用，结果合并进
         // analysis_summary，使最终通知报告即体现深度研判内容；标准股维持现状。
         if !self.config.dry_run && self.ai_analyzer.is_some() {
-            self.enrich_key_stocks_with_deep_analysis(&mut results).await;
+            self.enrich_key_stocks_with_deep_analysis(&mut results)
+                .await;
         }
 
         // 运行多因子回测
@@ -506,7 +529,8 @@ impl AnalysisPipeline {
             info!("===== 开始多因子回测 =====");
             match self.run_multi_factor_backtest(&results).await {
                 Ok(summary) => {
-                    info!("回测完成: 总收益 {:.2}%, 年化收益 {:.2}%, 最大回撤 {:.2}%, 夏普比率 {:.2}",
+                    info!(
+                        "回测完成: 总收益 {:.2}%, 年化收益 {:.2}%, 最大回撤 {:.2}%, 夏普比率 {:.2}",
                         summary.total_return * 100.0,
                         summary.annual_return * 100.0,
                         summary.max_drawdown * 100.0,
@@ -575,28 +599,32 @@ impl AnalysisPipeline {
             // 产业链联动分析：仅在当日有涨停数据时执行，作为报告第一部分
             // MarketAnalyzer 使用阻塞 HTTP，必须在 spawn_blocking 中执行
             let chain_section = {
-                let limit_up_stocks = tokio::task::spawn_blocking(|| {
-                    match crate::market_analyzer::MarketAnalyzer::new(None) {
-                        Ok(analyzer) => match analyzer.get_limit_up_stocks() {
-                            Ok(stocks) => stocks,
+                let limit_up_stocks =
+                    tokio::task::spawn_blocking(
+                        || match crate::market_analyzer::MarketAnalyzer::new(None) {
+                            Ok(analyzer) => match analyzer.get_limit_up_stocks() {
+                                Ok(stocks) => stocks,
+                                Err(e) => {
+                                    log::warn!("[产业链] 获取涨停股列表失败: {}", e);
+                                    Vec::new()
+                                }
+                            },
                             Err(e) => {
-                                log::warn!("[产业链] 获取涨停股列表失败: {}", e);
+                                log::warn!("[产业链] 创建 MarketAnalyzer 失败: {}", e);
                                 Vec::new()
                             }
                         },
-                        Err(e) => {
-                            log::warn!("[产业链] 创建 MarketAnalyzer 失败: {}", e);
-                            Vec::new()
-                        }
-                    }
-                })
-                .await
-                .unwrap_or_default();
+                    )
+                    .await
+                    .unwrap_or_default();
                 if limit_up_stocks.is_empty() {
                     info!("[产业链] 今日无涨停数据，跳过产业链分析");
                     None
                 } else {
-                    info!("[产业链] 获取到 {} 只涨停股，开始联动分析...", limit_up_stocks.len());
+                    info!(
+                        "[产业链] 获取到 {} 只涨停股，开始联动分析...",
+                        limit_up_stocks.len()
+                    );
                     match chain_analysis::run_chain_analysis(limit_up_stocks, None).await {
                         Ok(report) if !report.trim().is_empty() => {
                             info!("[产业链] 联动分析完成，将并入主报告");
@@ -634,7 +662,6 @@ impl AnalysisPipeline {
         reporting::generate_single_report(result)
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -687,10 +714,7 @@ mod tests {
         // 只保留一个标题
         assert_eq!(got.matches("## 【宏观影响】").count(), 1, "got: {got}");
         // 正文被还原为普通段落（不带 ## 前缀）
-        assert!(
-            got.contains("\n地缘政治紧张，影响中性偏空。"),
-            "got: {got}"
-        );
+        assert!(got.contains("\n地缘政治紧张，影响中性偏空。"), "got: {got}");
     }
 
     #[test]

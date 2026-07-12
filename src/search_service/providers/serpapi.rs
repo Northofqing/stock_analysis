@@ -8,8 +8,10 @@ use async_trait::async_trait;
 use log::debug;
 use serde::Deserialize;
 
-use super::super::types::{extract_domain, ApiKeyManager, NewsType, SearchProvider, SearchResponse, SearchResult, Sentiment};
-
+use super::super::types::{
+    extract_domain, ApiKeyManager, NewsType, SearchProvider, SearchResponse, SearchResult,
+    Sentiment,
+};
 
 // ============================================================================
 // SerpAPI 搜索引擎
@@ -38,7 +40,12 @@ impl SerpAPISearchProvider {
         }
     }
 
-    async fn do_search(&self, query: &str, api_key: &str, max_results: usize) -> Result<SearchResponse> {
+    async fn do_search(
+        &self,
+        query: &str,
+        api_key: &str,
+        max_results: usize,
+    ) -> Result<SearchResponse> {
         #[derive(Deserialize, Debug)]
         struct OrganicResult {
             title: String,
@@ -56,11 +63,7 @@ impl SerpAPISearchProvider {
         let response = self
             .client
             .get("https://serpapi.com/search")
-            .query(&[
-                ("engine", "baidu"),
-                ("q", query),
-                ("api_key", api_key),
-            ])
+            .query(&[("engine", "baidu"), ("q", query), ("api_key", api_key)])
             .timeout(Duration::from_secs(10))
             .send()
             .await
@@ -76,7 +79,8 @@ impl SerpAPISearchProvider {
             ));
         }
 
-        let serp_response: SerpAPIResponse = response.json().await.context("解析 SerpAPI 响应失败")?;
+        let serp_response: SerpAPIResponse =
+            response.json().await.context("解析 SerpAPI 响应失败")?;
 
         debug!("[SerpAPI] 原始响应: {:?}", serp_response);
 
@@ -136,4 +140,3 @@ impl SearchProvider for SerpAPISearchProvider {
         .await
     }
 }
-

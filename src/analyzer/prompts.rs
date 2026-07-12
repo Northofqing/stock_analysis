@@ -15,8 +15,14 @@ impl GeminiAnalyzer {
         name: &str,
         news_context: Option<&str>,
     ) -> String {
-        let code = context.get("code").and_then(|v| v.as_str()).unwrap_or("Unknown");
-        let date = context.get("date").and_then(|v| v.as_str()).unwrap_or("未知");
+        let code = context
+            .get("code")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Unknown");
+        let date = context
+            .get("date")
+            .and_then(|v| v.as_str())
+            .unwrap_or("未知");
 
         let mut prompt = format!(
             r#"# 决策仪表盘分析请求
@@ -56,16 +62,18 @@ impl GeminiAnalyzer {
                 today.get("ma10").and_then(|v| v.as_f64()).unwrap_or(0.0),
                 today.get("ma20").and_then(|v| v.as_f64()).unwrap_or(0.0),
             ));
-            
+
             // 添加盈利指标（基本面数据）
-            let has_profitability = today.get("pe_ratio").is_some() 
+            let has_profitability = today.get("pe_ratio").is_some()
                 || today.get("pb_ratio").is_some()
                 || today.get("turnover_rate").is_some()
                 || today.get("market_cap").is_some();
-                
+
             if has_profitability {
-                prompt.push_str("\n### 盈利水平指标\n| 指标 | 数值 | 评估 |\n|------|------|------|\n");
-                
+                prompt.push_str(
+                    "\n### 盈利水平指标\n| 指标 | 数值 | 评估 |\n|------|------|------|\n",
+                );
+
                 if let Some(pe) = today.get("pe_ratio").and_then(|v| v.as_f64()) {
                     let pe_assessment = if pe < 0.0 {
                         "亏损"
@@ -78,7 +86,7 @@ impl GeminiAnalyzer {
                     };
                     prompt.push_str(&format!("| 市盈率(PE) | {:.2} | {} |\n", pe, pe_assessment));
                 }
-                
+
                 if let Some(pb) = today.get("pb_ratio").and_then(|v| v.as_f64()) {
                     let pb_assessment = if pb < 1.0 {
                         "可能被低估 ✅"
@@ -89,7 +97,7 @@ impl GeminiAnalyzer {
                     };
                     prompt.push_str(&format!("| 市净率(PB) | {:.2} | {} |\n", pb, pb_assessment));
                 }
-                
+
                 if let Some(turnover) = today.get("turnover_rate").and_then(|v| v.as_f64()) {
                     let turnover_assessment = if turnover < 3.0 {
                         "交投清淡"
@@ -98,13 +106,16 @@ impl GeminiAnalyzer {
                     } else {
                         "活跃交易"
                     };
-                    prompt.push_str(&format!("| 换手率 | {:.2}% | {} |\n", turnover, turnover_assessment));
+                    prompt.push_str(&format!(
+                        "| 换手率 | {:.2}% | {} |\n",
+                        turnover, turnover_assessment
+                    ));
                 }
-                
+
                 if let Some(market_cap) = today.get("market_cap").and_then(|v| v.as_f64()) {
                     prompt.push_str(&format!("| 总市值 | {:.2}亿元 | - |\n", market_cap));
                 }
-                
+
                 if let Some(circ_cap) = today.get("circulating_cap").and_then(|v| v.as_f64()) {
                     prompt.push_str(&format!("| 流通市值 | {:.2}亿元 | - |\n", circ_cap));
                 }
@@ -152,7 +163,12 @@ analysis_summary, key_points, risk_warning, buy_reason
     }
 
     /// 解析响应
-    pub(super) fn parse_response(&self, response_text: &str, code: &str, name: &str) -> AnalysisResult {
+    pub(super) fn parse_response(
+        &self,
+        response_text: &str,
+        code: &str,
+        name: &str,
+    ) -> AnalysisResult {
         // 清理响应文本
         let cleaned = response_text
             .replace("```json", "")
@@ -171,18 +187,22 @@ analysis_summary, key_points, risk_warning, buy_reason
                         return AnalysisResult {
                             code: code.to_string(),
                             name: name.to_string(),
-                            sentiment_score: data.get("sentiment_score")
+                            sentiment_score: data
+                                .get("sentiment_score")
                                 .and_then(|v| v.as_i64())
                                 .unwrap_or(50) as i32,
-                            trend_prediction: data.get("trend_prediction")
+                            trend_prediction: data
+                                .get("trend_prediction")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("震荡")
                                 .to_string(),
-                            operation_advice: data.get("operation_advice")
+                            operation_advice: data
+                                .get("operation_advice")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("持有")
                                 .to_string(),
-                            confidence_level: data.get("confidence_level")
+                            confidence_level: data
+                                .get("confidence_level")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("中")
                                 .to_string(),
@@ -205,7 +225,8 @@ analysis_summary, key_points, risk_warning, buy_reason
                             risk_warning: get_string(&data, "risk_warning"),
                             buy_reason: get_string(&data, "buy_reason"),
                             raw_response: None,
-                            search_performed: data.get("search_performed")
+                            search_performed: data
+                                .get("search_performed")
                                 .and_then(|v| v.as_bool())
                                 .unwrap_or(false),
                             data_sources: get_string(&data, "data_sources"),
@@ -231,8 +252,14 @@ analysis_summary, key_points, risk_warning, buy_reason
         let positive_keywords = ["看多", "买入", "上涨", "突破", "强势", "利好", "加仓"];
         let negative_keywords = ["看空", "卖出", "下跌", "跌破", "弱势", "利空", "减仓"];
 
-        let positive_count = positive_keywords.iter().filter(|&&kw| text_lower.contains(kw)).count();
-        let negative_count = negative_keywords.iter().filter(|&&kw| text_lower.contains(kw)).count();
+        let positive_count = positive_keywords
+            .iter()
+            .filter(|&&kw| text_lower.contains(kw))
+            .count();
+        let negative_count = negative_keywords
+            .iter()
+            .filter(|&&kw| text_lower.contains(kw))
+            .count();
 
         let (sentiment_score, trend, advice) = if positive_count > negative_count + 1 {
             (65, "看多", "买入")
@@ -280,5 +307,4 @@ analysis_summary, key_points, risk_warning, buy_reason
             error_message: None,
         }
     }
-
 }

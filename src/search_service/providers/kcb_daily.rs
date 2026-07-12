@@ -10,13 +10,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use log::info;
+use log::{info, warn};
 use serde::Deserialize;
 
 use super::super::types::{SearchProvider, SearchResponse, SearchResult};
+use super::cls_sign::build_signed_params;
 
 #[derive(Debug, Deserialize)]
 struct ClsArticleResp {
+    errno: Option<i64>,
     data: Option<ClsArticleData>,
 }
 
@@ -54,33 +56,43 @@ impl KcbDailyProvider {
     }
 
     /// 修复 B-002: 拉取科创板日报最新文章
+    /// BR-037: 与 CLS 共用签名算法，但仅在快讯池抓取，不进入主题池。
     pub async fn fetch_latest(&self, limit: usize) -> Result<Vec<SearchResult>> {
-        // CLS 科创板日报频道: 用 search API 搜 "科创板" 在 CLS 站内
-        let url = "https://www.cls.cn/api/cache";
+        let params = build_signed_params(&[("category", "kcb".to_string())]);
 
-        let params = [
-            ("name", "refreshRollList"),
-            ("channel", "kcb"),  // 科创板频道
-            ("lastTime", &chrono::Local::now().timestamp().to_string()),
-        ];
-
-        let resp: ClsArticleResp = self
+        let http_resp = self
             .client
-            .get(url)
+            .get("https://www.cls.cn/v1/roll/get_roll_list")
             .query(&params)
             .header("Origin", "https://www.cls.cn")
             .header("Referer", "https://www.cls.cn/kcb")
             .send()
             .await
-            .context("科创板日报请求失败")?
-            .json()
-            .await
-            .context("科创板日报解析失败")?;
+            .context("科创板日报请求失败")?;
 
-        let items = resp
-            .data
-            .and_then(|d| d.roll_data)
-            .unwrap_or_default();
+        let status = http_resp.status();
+        let body = http_resp.text().await.context("科创板日报响应读取失败")?;
+
+        if !status.is_success() {
+            let preview = body.chars().take(200).collect::<String>();
+            return Err(anyhow::anyhow!(
+                "科创板日报HTTP失败 status={} body={}...",
+                status,
+                preview
+            ));
+        }
+
+        let resp: ClsArticleResp = serde_json::from_str(&body).map_err(|e| {
+            let preview = body.chars().take(200).collect::<String>();
+            warn!("[科创板日报] JSON 解析失败: {} | body={}...", e, preview);
+            anyhow::anyhow!("科创板日报解析失败: {}", e)
+        })?;
+
+        if resp.errno != Some(0) {
+            return Err(anyhow::anyhow!("科创板日报API返回错误码: {:?}", resp.errno));
+        }
+
+        let items = resp.data.and_then(|d| d.roll_data).unwrap_or_default();
 
         let now = chrono::Local::now().timestamp();
         let mut results = Vec::new();
@@ -117,9 +129,19 @@ impl KcbDailyProvider {
 
 #[async_trait]
 impl SearchProvider for KcbDailyProvider {
-    fn name(&self) -> &str { &self.name }
+    fn name(&self) -> &str {
+        &self.name
+    }
 
-    fn is_available(&self) -> bool { true }
+    fn is_available(&self) -> bool {
+        true
+    }
+
+    fn supports_topic_search(&self) -> bool {
+        // CLS kcb 频道端点当前需签名 (sign/app/os), 裸请求失败; 且本 provider 忽略 query 只拉最新.
+        // 暂排除出主题搜索, 待 RSSHub 签名方案修复后再启用.
+        false
+    }
 
     async fn search(&self, _query: &str, max_results: usize) -> SearchResponse {
         let start = Instant::now();

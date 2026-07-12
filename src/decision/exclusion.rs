@@ -22,9 +22,15 @@ const DEFAULT_EXCLUDED_BOARDS: &[(&str, &str)] = &[
 
 fn excluded_boards() -> Vec<(String, String)> {
     if let Some(config_boards) = crate::config::get_exclusion_boards() {
-        return config_boards.iter().map(|b| (b.name.clone(), b.reason.clone())).collect();
+        return config_boards
+            .iter()
+            .map(|b| (b.name.clone(), b.reason.clone()))
+            .collect();
     }
-    DEFAULT_EXCLUDED_BOARDS.iter().map(|(n, r)| (n.to_string(), r.to_string())).collect()
+    DEFAULT_EXCLUDED_BOARDS
+        .iter()
+        .map(|(n, r)| (n.to_string(), r.to_string()))
+        .collect()
 }
 
 /// 缓存的 (日期, 映射) — 同一天复用, 避免每次 review 600 次 HTTP (review #14 修复).
@@ -34,7 +40,8 @@ struct CachedExclusionMap {
     map: std::collections::HashMap<String, (String, String)>,
 }
 
-static EXCLUSION_MAP_CACHE: OnceLock<std::sync::Mutex<Option<CachedExclusionMap>>> = OnceLock::new();
+static EXCLUSION_MAP_CACHE: OnceLock<std::sync::Mutex<Option<CachedExclusionMap>>> =
+    OnceLock::new();
 
 fn cached_exclusion_map() -> std::collections::HashMap<String, (String, String)> {
     let cell = EXCLUSION_MAP_CACHE.get_or_init(|| std::sync::Mutex::new(None));
@@ -48,7 +55,10 @@ fn cached_exclusion_map() -> std::collections::HashMap<String, (String, String)>
         }
     }
     let map = build_exclusion_map();
-    *cell.lock().unwrap() = Some(CachedExclusionMap { date: today, map: map.clone() });
+    *cell.lock().unwrap() = Some(CachedExclusionMap {
+        date: today,
+        map: map.clone(),
+    });
     map
 }
 
@@ -94,16 +104,17 @@ pub struct ExclusionHit {
 /// 一次拉取所有排除板块的成份股，构建 code→board 映射
 fn build_exclusion_map() -> std::collections::HashMap<String, (String, String)> {
     let mut map = std::collections::HashMap::new();
-    let boards_listing = match crate::market_analyzer::sector_monitor::fetch_board_ranking("f3", 100) {
-        Ok(b) => b,
-        Err(e) => {
-            log::warn!(
-                "exclusion: 板块排名拉取失败 ({}), 跳过本次排除扫描 — 风险板块可能漏检",
-                e
-            );
-            return map;
-        }
-    };
+    let boards_listing =
+        match crate::market_analyzer::sector_monitor::fetch_board_ranking("f3", 100) {
+            Ok(b) => b,
+            Err(e) => {
+                log::warn!(
+                    "exclusion: 板块排名拉取失败 ({}), 跳过本次排除扫描 — 风险板块可能漏检",
+                    e
+                );
+                return map;
+            }
+        };
     let mut failed_boards: Vec<&str> = Vec::new();
     let excluded = excluded_boards();
     for (board_name, reason) in &excluded {
@@ -137,7 +148,9 @@ fn build_exclusion_map() -> std::collections::HashMap<String, (String, String)> 
 /// 扫描持仓和自选，返回命中排除板块的标的
 pub fn scan_exclusions(holdings: &[Position], watchlist: &[Position]) -> Vec<ExclusionHit> {
     let exclusion_map = cached_exclusion_map();
-    if exclusion_map.is_empty() { return vec![]; }
+    if exclusion_map.is_empty() {
+        return vec![];
+    }
 
     let mut hits = Vec::new();
     for p in holdings {
@@ -167,7 +180,9 @@ pub fn scan_exclusions(holdings: &[Position], watchlist: &[Position]) -> Vec<Exc
 
 /// 格式化排除告警
 pub fn format_exclusion_alert(hits: &[ExclusionHit]) -> String {
-    if hits.is_empty() { return String::new(); }
+    if hits.is_empty() {
+        return String::new();
+    }
     use std::fmt::Write;
     let mut out = String::with_capacity(64 + hits.len() * 40);
     out.push_str("🛑 排除板块命中\n");
@@ -176,7 +191,10 @@ pub fn format_exclusion_alert(hits: &[ExclusionHit]) -> String {
             out,
             "  {} {}({}) — {}: {}",
             h.source.emoji(),
-            h.name, h.code, h.matched_board, h.reason,
+            h.name,
+            h.code,
+            h.matched_board,
+            h.reason,
         );
     }
     out
@@ -194,8 +212,10 @@ mod tests {
     #[test]
     fn test_format_with_hits() {
         let hits = vec![ExclusionHit {
-            code: "000858".into(), name: "五粮液".into(),
-            matched_board: "白酒".into(), reason: "成熟天花板".into(),
+            code: "000858".into(),
+            name: "五粮液".into(),
+            matched_board: "白酒".into(),
+            reason: "成熟天花板".into(),
             source: ExclusionSource::Holding,
         }];
         let text = format_exclusion_alert(&hits);

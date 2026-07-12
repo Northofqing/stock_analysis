@@ -25,7 +25,10 @@ static CONFIG_LOCK: Mutex<()> = Mutex::new(());
 /// 容忍 poison (e.into_inner()) 让后续 test 仍能拿锁串行, 不让测试间级联失败.
 fn acquire_config_lock() -> std::sync::MutexGuard<'static, ()> {
     CONFIG_LOCK.lock().unwrap_or_else(|e| {
-        log::warn!("[test_design_contradiction] CONFIG_LOCK poisoned, recovering: {}", e);
+        log::warn!(
+            "[test_design_contradiction] CONFIG_LOCK poisoned, recovering: {}",
+            e
+        );
         e.into_inner()
     })
 }
@@ -106,7 +109,7 @@ fn test_design_contradiction_passes_current_config() {
 use serial_test::serial;
 // (注: 保留 acquire_config_lock() 作为同 binary 内串行保护, 双重保险)
 #[test]
-#[serial]  // 跨 test binary 串行, 防止 race
+#[serial] // 跨 test binary 串行, 防止 race
 fn test_design_contradiction_fails_on_threshold_exceeding_clamp() {
     // 故意制造矛盾: 临时把 threshold 改到 80 (> clamp 70)
     // 用 RAII guard 保证 panic / 早返回时**自动恢复** config.
@@ -135,10 +138,16 @@ fn test_design_contradiction_fails_on_threshold_exceeding_clamp() {
 
     // 修复 v9.4.3: 在 run_check 之前打印 cfg 状态, 排查 --test-threads=2 并行跑时偶发 "stderr 空"
     if std::env::var("TEST_VERBOSE").is_ok() {
-        eprintln!("TEST (before run_check): cfg threshold line = {}",
-            std::fs::read_to_string(&cfg).ok()
-                .and_then(|s| s.lines().find(|l| l.contains("event_risk_score_threshold")).map(String::from))
-                .unwrap_or_else(|| "NOT FOUND".to_string()));
+        eprintln!(
+            "TEST (before run_check): cfg threshold line = {}",
+            std::fs::read_to_string(&cfg)
+                .ok()
+                .and_then(|s| s
+                    .lines()
+                    .find(|l| l.contains("event_risk_score_threshold"))
+                    .map(String::from))
+                .unwrap_or_else(|| "NOT FOUND".to_string())
+        );
     }
     let output = run_check();
     // 显式 restore (Drop 也会跑, 这里提前清理让 backup 早释放)
@@ -191,8 +200,5 @@ fn test_config_backup_restores_on_panic() {
     // 验证 config 已恢复
     let after = std::fs::read_to_string(&cfg).expect("应能再读 config");
     assert_eq!(after, original, "RAII guard 应在 panic 后恢复 config");
-    assert!(
-        !after.contains("999"),
-        "config 不应残留改坏的值"
-    );
+    assert!(!after.contains("999"), "config 不应残留改坏的值");
 }

@@ -22,9 +22,9 @@ pub fn calc_kdj(
     highs: &[f64],
     lows: &[f64],
     closes: &[f64],
-    n: usize,   // RSV 周期，默认 9
-    m1: usize,  // K 平滑周期，默认 3
-    m2: usize,  // D 平滑周期，默认 3
+    n: usize,  // RSV 周期，默认 9
+    m1: usize, // K 平滑周期，默认 3
+    m2: usize, // D 平滑周期，默认 3
 ) -> Vec<KdjPoint> {
     let len = closes.len();
     if len == 0 {
@@ -40,15 +40,23 @@ pub fn calc_kdj(
 
     for i in 0..len {
         // 移除窗口外元素
-        while max_q.front().map_or(false, |&(idx, _)| idx + n <= i) { max_q.pop_front(); }
-        while min_q.front().map_or(false, |&(idx, _)| idx + n <= i) { min_q.pop_front(); }
+        while max_q.front().map_or(false, |&(idx, _)| idx + n <= i) {
+            max_q.pop_front();
+        }
+        while min_q.front().map_or(false, |&(idx, _)| idx + n <= i) {
+            min_q.pop_front();
+        }
 
         // 维护递减性质：弹出队尾 ≤ 当前值的元素
-        while max_q.back().map_or(false, |&(_, v)| v <= highs[i]) { max_q.pop_back(); }
+        while max_q.back().map_or(false, |&(_, v)| v <= highs[i]) {
+            max_q.pop_back();
+        }
         max_q.push_back((i, highs[i]));
 
         // 维护递增性质：弹出队尾 ≥ 当前值的元素
-        while min_q.back().map_or(false, |&(_, v)| v >= lows[i]) { min_q.pop_back(); }
+        while min_q.back().map_or(false, |&(_, v)| v >= lows[i]) {
+            min_q.pop_back();
+        }
         min_q.push_back((i, lows[i]));
 
         let hh = max_q.front().map_or(highs[i], |&(_, v)| v);
@@ -68,8 +76,7 @@ pub fn calc_kdj(
         if i == 0 {
             k_vals[i] = rsv[i];
         } else {
-            k_vals[i] = k_vals[i - 1] * (m1 as f64 - 1.0) / m1 as f64
-                + rsv[i] / m1 as f64;
+            k_vals[i] = k_vals[i - 1] * (m1 as f64 - 1.0) / m1 as f64 + rsv[i] / m1 as f64;
         }
     }
 
@@ -77,8 +84,7 @@ pub fn calc_kdj(
         if i == 0 {
             d_vals[i] = k_vals[i];
         } else {
-            d_vals[i] = d_vals[i - 1] * (m2 as f64 - 1.0) / m2 as f64
-                + k_vals[i] / m2 as f64;
+            d_vals[i] = d_vals[i - 1] * (m2 as f64 - 1.0) / m2 as f64 + k_vals[i] / m2 as f64;
         }
     }
 
@@ -94,4 +100,3 @@ pub fn calc_kdj(
         })
         .collect()
 }
-

@@ -120,7 +120,10 @@ mod tests {
         let periods = infer_halt_from_kline_gaps(code, &klines);
         // d1→d8 = 8 天 → 中间 7 天 (1/21~1/27) 停牌 (春节只有 7 天, 8 天间隔意味着更长停牌)
         assert_eq!(periods.len(), 1, "8 天间隔应识别为停牌");
-        assert!(is_halted_period(code, NaiveDate::from_ymd_opt(2026, 1, 25).unwrap()));
+        assert!(is_halted_period(
+            code,
+            NaiveDate::from_ymd_opt(2026, 1, 25).unwrap()
+        ));
     }
 
     /// v11-P0-3 commit 2: 7 天间隔 (春节正常) 不算停牌
@@ -146,9 +149,17 @@ mod tests {
         ];
         let periods = infer_halt_from_kline_gaps(code, &klines);
         assert_eq!(periods.len(), 2, "应识别 2 段停牌");
-        assert!(is_halted_period(code, NaiveDate::from_ymd_opt(2026, 3, 5).unwrap()));
-        assert!(is_halted_period(code, NaiveDate::from_ymd_opt(2026, 3, 20).unwrap()));
-        assert!(!is_halted_period(code, NaiveDate::from_ymd_opt(2026, 3, 11).unwrap()),
-                "3/11 是 K 线日, 不是停牌日");
+        assert!(is_halted_period(
+            code,
+            NaiveDate::from_ymd_opt(2026, 3, 5).unwrap()
+        ));
+        assert!(is_halted_period(
+            code,
+            NaiveDate::from_ymd_opt(2026, 3, 20).unwrap()
+        ));
+        assert!(
+            !is_halted_period(code, NaiveDate::from_ymd_opt(2026, 3, 11).unwrap()),
+            "3/11 是 K 线日, 不是停牌日"
+        );
     }
 }

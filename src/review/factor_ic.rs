@@ -94,15 +94,12 @@ pub fn compute_spearman_ic(factor_values: &[f64], forward_returns: &[f64]) -> Op
     let n = factor_values.len().min(forward_returns.len());
     // Spearman Rank IC 在 15+ 样本时即可靠
     if n < 15 {
-        warn!(
-            "样本量不足 {} (需要 ≥15)，无法可靠计算 IC",
-            n
-        );
+        warn!("样本量不足 {} (需要 ≥15)，无法可靠计算 IC", n);
         return None;
     }
 
     // 去除 NaN/Inf
-    let mut pairs: Vec<(f64, f64)> = factor_values
+    let pairs: Vec<(f64, f64)> = factor_values
         .iter()
         .zip(forward_returns.iter())
         .take(n)
@@ -117,7 +114,11 @@ pub fn compute_spearman_ic(factor_values: &[f64], forward_returns: &[f64]) -> Op
     let m = pairs.len();
 
     // Rank the factor values
-    let mut factor_ranked: Vec<(usize, f64)> = pairs.iter().enumerate().map(|(i, (f, _))| (i, *f)).collect();
+    let mut factor_ranked: Vec<(usize, f64)> = pairs
+        .iter()
+        .enumerate()
+        .map(|(i, (f, _))| (i, *f))
+        .collect();
     factor_ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     let mut factor_ranks = vec![0.0; m];
     for (rank, (orig_idx, _)) in factor_ranked.iter().enumerate() {
@@ -131,9 +132,12 @@ pub fn compute_spearman_ic(factor_values: &[f64], forward_returns: &[f64]) -> Op
             j += 1;
         }
         if j > i + 1 {
-            let avg_rank: f64 = factor_ranked[i..j].iter().enumerate()
-                .map(|(k, (orig_idx, _))| factor_ranks[*orig_idx])
-                .sum::<f64>() / (j - i) as f64;
+            let avg_rank: f64 = factor_ranked[i..j]
+                .iter()
+                .enumerate()
+                .map(|(_k, (orig_idx, _))| factor_ranks[*orig_idx])
+                .sum::<f64>()
+                / (j - i) as f64;
             for (_, (orig_idx, _)) in factor_ranked[i..j].iter().enumerate() {
                 factor_ranks[*orig_idx] = avg_rank;
             }
@@ -142,7 +146,11 @@ pub fn compute_spearman_ic(factor_values: &[f64], forward_returns: &[f64]) -> Op
     }
 
     // Rank the returns
-    let mut return_ranked: Vec<(usize, f64)> = pairs.iter().enumerate().map(|(i, (_, r))| (i, *r)).collect();
+    let mut return_ranked: Vec<(usize, f64)> = pairs
+        .iter()
+        .enumerate()
+        .map(|(i, (_, r))| (i, *r))
+        .collect();
     return_ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     let mut return_ranks = vec![0.0; m];
     for (rank, (orig_idx, _)) in return_ranked.iter().enumerate() {
@@ -156,9 +164,12 @@ pub fn compute_spearman_ic(factor_values: &[f64], forward_returns: &[f64]) -> Op
             j += 1;
         }
         if j > i + 1 {
-            let avg_rank: f64 = return_ranked[i..j].iter().enumerate()
-                .map(|(k, (orig_idx, _))| return_ranks[*orig_idx])
-                .sum::<f64>() / (j - i) as f64;
+            let avg_rank: f64 = return_ranked[i..j]
+                .iter()
+                .enumerate()
+                .map(|(_k, (orig_idx, _))| return_ranks[*orig_idx])
+                .sum::<f64>()
+                / (j - i) as f64;
             for (_, (orig_idx, _)) in return_ranked[i..j].iter().enumerate() {
                 return_ranks[*orig_idx] = avg_rank;
             }
@@ -170,16 +181,19 @@ pub fn compute_spearman_ic(factor_values: &[f64], forward_returns: &[f64]) -> Op
     let mean_fr = factor_ranks.iter().sum::<f64>() / m as f64;
     let mean_rr = return_ranks.iter().sum::<f64>() / m as f64;
 
-    let cov: f64 = factor_ranks.iter()
+    let cov: f64 = factor_ranks
+        .iter()
         .zip(return_ranks.iter())
         .map(|(f, r)| (f - mean_fr) * (r - mean_rr))
         .sum();
 
-    let std_f: f64 = factor_ranks.iter()
+    let std_f: f64 = factor_ranks
+        .iter()
         .map(|f| (f - mean_fr).powi(2))
         .sum::<f64>()
         .sqrt();
-    let std_r: f64 = return_ranks.iter()
+    let std_r: f64 = return_ranks
+        .iter()
         .map(|r| (r - mean_rr).powi(2))
         .sum::<f64>()
         .sqrt();
@@ -212,7 +226,8 @@ pub fn compute_rolling_ic(
     }
 
     // 过滤 NaN/Inf, 保留有效的 (factor, return) 配对
-    let clean: Vec<(f64, f64)> = factor_values.iter()
+    let clean: Vec<(f64, f64)> = factor_values
+        .iter()
         .zip(forward_returns.iter())
         .take(n)
         .filter(|(f, r)| f.is_finite() && r.is_finite())
@@ -250,9 +265,10 @@ pub fn compute_rolling_ic(
         let offset = lag + 1;
         if clean.len() > offset {
             let lag_factors: Vec<f64> = clean[..clean.len() - offset]
-                .iter().map(|(f, _)| *f).collect();
-            let lag_returns: Vec<f64> = clean[offset..]
-                .iter().map(|(_, r)| *r).collect();
+                .iter()
+                .map(|(f, _)| *f)
+                .collect();
+            let lag_returns: Vec<f64> = clean[offset..].iter().map(|(_, r)| *r).collect();
             let m = lag_factors.len().min(lag_returns.len());
             if m >= 15 {
                 if let Some(ic) = compute_spearman_ic(&lag_factors[..m], &lag_returns[..m]) {
@@ -277,7 +293,10 @@ pub fn run_diagnostic() -> Option<String> {
     let rows = db.get_factor_ic_data().ok()?;
 
     if rows.len() < 30 {
-        info!("[FactorIC] 有效已平仓交易 {} 笔 < 30，样本不足，跳过分析", rows.len());
+        info!(
+            "[FactorIC] 有效已平仓交易 {} 笔 < 30，样本不足，跳过分析",
+            rows.len()
+        );
         return None;
     }
 
@@ -304,10 +323,22 @@ pub fn run_diagnostic() -> Option<String> {
                 flow_vals.push(sb.capital_flow as f64);
                 growth_vals.push(sb.growth_sustainability as f64);
             } else {
-                push_neutral(&mut technical_vals, &mut quality_vals, &mut valuation_vals, &mut flow_vals, &mut growth_vals);
+                push_neutral(
+                    &mut technical_vals,
+                    &mut quality_vals,
+                    &mut valuation_vals,
+                    &mut flow_vals,
+                    &mut growth_vals,
+                );
             }
         } else {
-            push_neutral(&mut technical_vals, &mut quality_vals, &mut valuation_vals, &mut flow_vals, &mut growth_vals);
+            push_neutral(
+                &mut technical_vals,
+                &mut quality_vals,
+                &mut valuation_vals,
+                &mut flow_vals,
+                &mut growth_vals,
+            );
         }
     }
 
@@ -327,15 +358,37 @@ pub fn run_diagnostic() -> Option<String> {
     .filter_map(|(name, vals)| analyze_factor(name, vals, &returns[..n]))
     .collect();
 
-    let sentiment_ic = analyze_factor("AI综合评分(sentiment_score)", &sentiment_vals[..n], &returns[..n]);
+    let sentiment_ic = analyze_factor(
+        "AI综合评分(sentiment_score)",
+        &sentiment_vals[..n],
+        &returns[..n],
+    );
 
-    let samples = build_factor_samples(&technical_vals, &quality_vals, &valuation_vals, &flow_vals, &growth_vals, &returns, n);
+    let samples = build_factor_samples(
+        &technical_vals,
+        &quality_vals,
+        &valuation_vals,
+        &flow_vals,
+        &growth_vals,
+        &returns,
+        n,
+    );
     let corr_matrix = factor_correlation_matrix(&samples);
 
-    Some(generate_report(&analyses, &corr_matrix, sentiment_ic.as_ref()))
+    Some(generate_report(
+        &analyses,
+        &corr_matrix,
+        sentiment_ic.as_ref(),
+    ))
 }
 
-fn push_neutral(t: &mut Vec<f64>, q: &mut Vec<f64>, v: &mut Vec<f64>, f: &mut Vec<f64>, g: &mut Vec<f64>) {
+fn push_neutral(
+    t: &mut Vec<f64>,
+    q: &mut Vec<f64>,
+    v: &mut Vec<f64>,
+    f: &mut Vec<f64>,
+    g: &mut Vec<f64>,
+) {
     t.push(50.0);
     q.push(50.0);
     v.push(50.0);
@@ -344,15 +397,40 @@ fn push_neutral(t: &mut Vec<f64>, q: &mut Vec<f64>, v: &mut Vec<f64>, f: &mut Ve
 }
 
 fn build_factor_samples(
-    technical: &[f64], quality: &[f64], valuation: &[f64],
-    flow: &[f64], growth: &[f64], returns: &[f64], n: usize,
+    technical: &[f64],
+    quality: &[f64],
+    valuation: &[f64],
+    flow: &[f64],
+    growth: &[f64],
+    returns: &[f64],
+    n: usize,
 ) -> Vec<FactorSample> {
     vec![
-        FactorSample { factor_name: "技术面".to_string(), factor_values: technical[..n].to_vec(), forward_returns: returns[..n].to_vec() },
-        FactorSample { factor_name: "盈利质量".to_string(), factor_values: quality[..n].to_vec(), forward_returns: returns[..n].to_vec() },
-        FactorSample { factor_name: "估值安全边际".to_string(), factor_values: valuation[..n].to_vec(), forward_returns: returns[..n].to_vec() },
-        FactorSample { factor_name: "资金面".to_string(), factor_values: flow[..n].to_vec(), forward_returns: returns[..n].to_vec() },
-        FactorSample { factor_name: "增长可持续".to_string(), factor_values: growth[..n].to_vec(), forward_returns: returns[..n].to_vec() },
+        FactorSample {
+            factor_name: "技术面".to_string(),
+            factor_values: technical[..n].to_vec(),
+            forward_returns: returns[..n].to_vec(),
+        },
+        FactorSample {
+            factor_name: "盈利质量".to_string(),
+            factor_values: quality[..n].to_vec(),
+            forward_returns: returns[..n].to_vec(),
+        },
+        FactorSample {
+            factor_name: "估值安全边际".to_string(),
+            factor_values: valuation[..n].to_vec(),
+            forward_returns: returns[..n].to_vec(),
+        },
+        FactorSample {
+            factor_name: "资金面".to_string(),
+            factor_values: flow[..n].to_vec(),
+            forward_returns: returns[..n].to_vec(),
+        },
+        FactorSample {
+            factor_name: "增长可持续".to_string(),
+            factor_values: growth[..n].to_vec(),
+            forward_returns: returns[..n].to_vec(),
+        },
     ]
 }
 
@@ -368,27 +446,26 @@ pub fn analyze_factor(
 ) -> Option<FactorIC> {
     let n = factor_values.len().min(forward_returns.len());
     if n < 15 {
-        info!(
-            "因子 '{}' 样本量 {} < 15，跳过分析",
-            factor_name, n
-        );
+        info!("因子 '{}' 样本量 {} < 15，跳过分析", factor_name, n);
         return None;
     }
 
     let (ic_series, ic_decay) = compute_rolling_ic(factor_values, forward_returns)?;
 
     let mean_ic = ic_series.iter().sum::<f64>() / ic_series.len() as f64;
-    let ic_std = (ic_series.iter()
+    let ic_std = (ic_series
+        .iter()
         .map(|ic| (ic - mean_ic).powi(2))
-        .sum::<f64>() / ic_series.len() as f64)
+        .sum::<f64>()
+        / ic_series.len() as f64)
         .sqrt();
     let information_ratio = if ic_std > 1e-10 {
         mean_ic / ic_std
     } else {
         0.0
     };
-    let ic_win_rate = ic_series.iter().filter(|&&ic| ic > 0.0).count() as f64
-        / ic_series.len() as f64;
+    let ic_win_rate =
+        ic_series.iter().filter(|&&ic| ic > 0.0).count() as f64 / ic_series.len() as f64;
     let t_stat = if ic_std > 1e-10 {
         mean_ic / (ic_std / (ic_series.len() as f64).sqrt())
     } else {
@@ -504,8 +581,12 @@ mod tests {
 
     #[test]
     fn test_factor_verdict_labels() {
-        assert!(FactorVerdict::Positive { significant: true }.label().contains("显著正向"));
-        assert!(FactorVerdict::Negative { significant: true }.label().contains("显著反向"));
+        assert!(FactorVerdict::Positive { significant: true }
+            .label()
+            .contains("显著正向"));
+        assert!(FactorVerdict::Negative { significant: true }
+            .label()
+            .contains("显著反向"));
         assert!(FactorVerdict::Neutral.label().contains("无效"));
     }
 }

@@ -66,7 +66,14 @@ fn parse_csv(path: &str) -> Result<Vec<ClosedTrade>> {
         let hold_days = fields[7].parse::<i32>().unwrap_or(0);
         let ai_score = fields[8].parse::<i32>().unwrap_or(0);
         out.push(ClosedTrade {
-            code, name, buy_date, sell_date, buy_price, return_pct, hold_days, ai_score,
+            code,
+            name,
+            buy_date,
+            sell_date,
+            buy_price,
+            return_pct,
+            hold_days,
+            ai_score,
         });
     }
     Ok(out)
@@ -98,20 +105,40 @@ impl ActionStats {
     }
 
     fn win_rate(&self) -> f64 {
-        if self.count == 0 { 0.0 } else { self.wins as f64 / self.count as f64 * 100.0 }
+        if self.count == 0 {
+            0.0
+        } else {
+            self.wins as f64 / self.count as f64 * 100.0
+        }
     }
     fn avg_return(&self) -> f64 {
-        if self.count == 0 { 0.0 } else { self.sum_return / self.count as f64 }
+        if self.count == 0 {
+            0.0
+        } else {
+            self.sum_return / self.count as f64
+        }
     }
     fn avg_win(&self) -> f64 {
-        if self.win_count == 0 { 0.0 } else { self.sum_win_return / self.win_count as f64 }
+        if self.win_count == 0 {
+            0.0
+        } else {
+            self.sum_win_return / self.win_count as f64
+        }
     }
     fn avg_loss(&self) -> f64 {
-        if self.loss_count == 0 { 0.0 } else { self.sum_loss_return / self.loss_count as f64 }
+        if self.loss_count == 0 {
+            0.0
+        } else {
+            self.sum_loss_return / self.loss_count as f64
+        }
     }
     fn profit_loss_ratio(&self) -> f64 {
         let l = self.avg_loss().abs();
-        if l == 0.0 { 0.0 } else { self.avg_win() / l }
+        if l == 0.0 {
+            0.0
+        } else {
+            self.avg_win() / l
+        }
     }
 }
 
@@ -148,8 +175,15 @@ fn main() -> Result<()> {
         // 拉取足够历史：从今天回看到 buy_date 之前 60 天，足以做布林20+背离30
         let today = chrono::Local::now().date_naive();
         let need_days = (today - t.buy_date).num_days() as usize + 80;
-        print!("[{}/{}] {} {} buy@{} ret={:+.2}% ... ",
-               i + 1, trades.len(), t.code, t.name, t.buy_date, t.return_pct);
+        print!(
+            "[{}/{}] {} {} buy@{} ret={:+.2}% ... ",
+            i + 1,
+            trades.len(),
+            t.code,
+            t.name,
+            t.buy_date,
+            t.return_pct
+        );
 
         let data = match manager.get_daily_data(&t.code, need_days) {
             Ok((d, _)) => d,
@@ -182,22 +216,30 @@ fn main() -> Result<()> {
         let label = action_label(sig.action);
         let entry = stats.entry(label).or_default();
         entry.add(t.return_pct);
-        returns_by_action.entry(label).or_default().push(t.return_pct);
+        returns_by_action
+            .entry(label)
+            .or_default()
+            .push(t.return_pct);
         overall.add(t.return_pct);
         if t.ai_score >= 60 {
             high_score_block_stats.add(t.return_pct);
         }
-        by_action_examples
-            .entry(label)
-            .or_default()
-            .push(format!("{} {} ret={:+.2}% AI={} {}d", t.code, t.name, t.return_pct, t.ai_score, t.hold_days));
+        by_action_examples.entry(label).or_default().push(format!(
+            "{} {} ret={:+.2}% AI={} {}d",
+            t.code, t.name, t.return_pct, t.ai_score, t.hold_days
+        ));
 
-        println!("{} (DIF={:.3} hist={:+.3} bw={:.1}% Δbw={:+.1}%)",
-                 label, sig.macd_dif, sig.macd_hist, sig.band_width_pct, sig.band_change_pct);
+        println!(
+            "{} (DIF={:.3} hist={:+.3} bw={:.1}% Δbw={:+.1}%)",
+            label, sig.macd_dif, sig.macd_hist, sig.band_width_pct, sig.band_change_pct
+        );
     }
 
     println!("\n========== 回测结果 ==========");
-    println!("数据失败: {} 笔，买入日缺失: {} 笔\n", data_failures, date_misses);
+    println!(
+        "数据失败: {} 笔，买入日缺失: {} 笔\n",
+        data_failures, date_misses
+    );
 
     let header = format!(
         "{:<22} | {:>5} | {:>7} | {:>9} | {:>8} | {:>8} | {:>5}",

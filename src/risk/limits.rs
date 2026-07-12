@@ -45,7 +45,9 @@ pub fn check_position_limits(
     prices: &std::collections::HashMap<String, f64>,
     limits: &HardLimits,
 ) -> Vec<LimitViolation> {
-    if positions.is_empty() { return vec![]; }
+    if positions.is_empty() {
+        return vec![];
+    }
 
     // 单次遍历: 收集 (position, price) 列表 + sector 总市值 + 总市值
     // 同时识别缺价持仓 (review #14: 不再 fallback 到 cost_price).
@@ -54,8 +56,7 @@ pub fn check_position_limits(
         price: Option<f64>,
     }
     let mut valued: Vec<ValuedPos<'_>> = Vec::with_capacity(positions.len());
-    let mut sector_totals: std::collections::HashMap<&str, f64> =
-        std::collections::HashMap::new();
+    let mut sector_totals: std::collections::HashMap<&str, f64> = std::collections::HashMap::new();
     let mut total_value = 0.0;
     for p in positions {
         let price = prices.get(&p.code).copied();
@@ -84,7 +85,9 @@ pub fn check_position_limits(
             });
             continue;
         };
-        if total_value <= 0.0 { continue; }
+        if total_value <= 0.0 {
+            continue;
+        }
 
         let market_value = p.shares as f64 * price;
         let pct = market_value / total_value * 100.0;
@@ -92,7 +95,8 @@ pub fn check_position_limits(
         // 单票上限
         if pct > limits.single_stock_max_pct {
             violations.push(LimitViolation {
-                code: p.code.clone(), name: p.name.clone(),
+                code: p.code.clone(),
+                name: p.name.clone(),
                 rule: "单票仓位上限".to_string(),
                 current: format!("{:.1}%", pct),
                 limit: format!("≤{:.0}%", limits.single_stock_max_pct),
@@ -102,15 +106,12 @@ pub fn check_position_limits(
         // 修复 P1.6: 板块集中度检查 (review #14: 用预计算的 sector_totals,
         // O(1) lookup, 不再 O(N) filter)
         if !p.sector.is_empty() && p.sector != "其他" {
-            let sector_pct = sector_totals
-                .get(p.sector.as_str())
-                .copied()
-                .unwrap_or(0.0)
-                / total_value
-                * 100.0;
+            let sector_pct =
+                sector_totals.get(p.sector.as_str()).copied().unwrap_or(0.0) / total_value * 100.0;
             if sector_pct > limits.single_sector_max_pct {
                 violations.push(LimitViolation {
-                    code: p.sector.clone(), name: format!("板块 {}", p.sector),
+                    code: p.sector.clone(),
+                    name: format!("板块 {}", p.sector),
                     rule: "板块集中度上限".to_string(),
                     current: format!("{:.1}%", sector_pct),
                     limit: format!("≤{:.0}%", limits.single_sector_max_pct),
@@ -123,7 +124,8 @@ pub fn check_position_limits(
             let loss_pct = (price - p.cost_price) / p.cost_price * 100.0;
             if loss_pct <= limits.stop_loss_pct {
                 violations.push(LimitViolation {
-                    code: p.code.clone(), name: p.name.clone(),
+                    code: p.code.clone(),
+                    name: p.name.clone(),
                     rule: "止损线".to_string(),
                     current: format!("{:.1}%", loss_pct),
                     limit: format!(">{:.0}%", limits.stop_loss_pct),
@@ -137,7 +139,9 @@ pub fn check_position_limits(
 
 /// 格式化风控告警
 pub fn format_limit_alert(violations: &[LimitViolation]) -> String {
-    if violations.is_empty() { return String::new(); }
+    if violations.is_empty() {
+        return String::new();
+    }
     let mut lines = vec!["🚨 风控超标".to_string()];
     for v in violations {
         lines.push(format!(
@@ -155,11 +159,15 @@ mod tests {
 
     fn pos(code: &str, cost: f64, shares: u64) -> Position {
         Position {
-            code: code.into(), name: code.into(), shares,
-            cost_price: cost, hard_stop: cost * 0.9,
+            code: code.into(),
+            name: code.into(),
+            shares,
+            cost_price: cost,
+            hard_stop: cost * 0.9,
             added_at: NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
             status: crate::portfolio::PositionStatus::Holding,
-            sector: "其他".into(), ..Default::default()
+            sector: "其他".into(),
+            ..Default::default()
         }
     }
 

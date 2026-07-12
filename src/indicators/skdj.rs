@@ -46,13 +46,21 @@ pub fn calc_skdj(
     let mut min_q: VecDeque<(usize, f64)> = VecDeque::new();
 
     for i in 0..len {
-        while max_q.front().map_or(false, |&(idx, _)| idx + n <= i) { max_q.pop_front(); }
-        while min_q.front().map_or(false, |&(idx, _)| idx + n <= i) { min_q.pop_front(); }
+        while max_q.front().map_or(false, |&(idx, _)| idx + n <= i) {
+            max_q.pop_front();
+        }
+        while min_q.front().map_or(false, |&(idx, _)| idx + n <= i) {
+            min_q.pop_front();
+        }
 
-        while max_q.back().map_or(false, |&(_, v)| v <= highs[i]) { max_q.pop_back(); }
+        while max_q.back().map_or(false, |&(_, v)| v <= highs[i]) {
+            max_q.pop_back();
+        }
         max_q.push_back((i, highs[i]));
 
-        while min_q.back().map_or(false, |&(_, v)| v >= lows[i]) { min_q.pop_back(); }
+        while min_q.back().map_or(false, |&(_, v)| v >= lows[i]) {
+            min_q.pop_back();
+        }
         min_q.push_back((i, lows[i]));
 
         let hh = max_q.front().map_or(highs[i], |&(_, v)| v);
@@ -72,8 +80,16 @@ pub fn calc_skdj(
     let mut k_prev = rsv[0];
     let mut d_prev = k_prev;
     for (i, &r) in rsv.iter().enumerate() {
-        let k = if i == 0 { r } else { alpha * r + (1.0 - alpha) * k_prev };
-        let d = if i == 0 { k } else { alpha * k + (1.0 - alpha) * d_prev };
+        let k = if i == 0 {
+            r
+        } else {
+            alpha * r + (1.0 - alpha) * k_prev
+        };
+        let d = if i == 0 {
+            k
+        } else {
+            alpha * k + (1.0 - alpha) * d_prev
+        };
         let j = 3.0 * k - 2.0 * d;
         out.push(SkdjPoint { k, d, j });
         k_prev = k;

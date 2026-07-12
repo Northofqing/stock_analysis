@@ -68,7 +68,7 @@ impl<'a> FactorSnapshotDao<'a> {
         diesel::sql_query(
             "INSERT OR REPLACE INTO factor_snapshot \
              (code, snapshot_date, pe_ttm, pb, roe, market_cap, turnover_rate, source, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))"
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))",
         )
         .bind::<diesel::sql_types::Text, _>(code)
         .bind::<diesel::sql_types::Text, _>(snapshot_date)
@@ -94,7 +94,7 @@ impl<'a> FactorSnapshotDao<'a> {
             "SELECT code, snapshot_date, pe_ttm, pb, roe, market_cap, turnover_rate, source \
              FROM factor_snapshot \
              WHERE code = ? AND snapshot_date <= ? \
-             ORDER BY snapshot_date DESC LIMIT 1"
+             ORDER BY snapshot_date DESC LIMIT 1",
         )
         .bind::<diesel::sql_types::Text, _>(code)
         .bind::<diesel::sql_types::Text, _>(as_of)
@@ -123,8 +123,10 @@ impl<'a> FactorSnapshotDao<'a> {
             "#,
         )
         .execute(self.conn)?;
-        diesel::sql_query("CREATE INDEX IF NOT EXISTS idx_factor_snapshot_date ON factor_snapshot(snapshot_date)")
-            .execute(self.conn)?;
+        diesel::sql_query(
+            "CREATE INDEX IF NOT EXISTS idx_factor_snapshot_date ON factor_snapshot(snapshot_date)",
+        )
+        .execute(self.conn)?;
         Ok(())
     }
 }
@@ -147,8 +149,7 @@ mod tests {
             n,
         ));
         let path = temp.to_str().unwrap();
-        let mut conn =
-            SqliteConnection::establish(path).expect("failed to open temp sqlite");
+        let mut conn = SqliteConnection::establish(path).expect("failed to open temp sqlite");
         let mut dao = FactorSnapshotDao::new(&mut conn);
         dao.create_table().expect("create_table failed");
         std::mem::forget(temp);
@@ -160,10 +161,28 @@ mod tests {
         let mut conn = in_memory_conn();
         {
             let mut dao = FactorSnapshotDao::new(&mut conn);
-            dao.upsert("600000", "2026-06-01", Some(12.5), Some(1.2), Some(0.18), Some(1e10), Some(0.02), "test")
-                .unwrap();
-            dao.upsert("600000", "2026-06-02", Some(13.0), Some(1.3), Some(0.18), Some(1.01e10), Some(0.025), "test")
-                .unwrap();
+            dao.upsert(
+                "600000",
+                "2026-06-01",
+                Some(12.5),
+                Some(1.2),
+                Some(0.18),
+                Some(1e10),
+                Some(0.02),
+                "test",
+            )
+            .unwrap();
+            dao.upsert(
+                "600000",
+                "2026-06-02",
+                Some(13.0),
+                Some(1.3),
+                Some(0.18),
+                Some(1.01e10),
+                Some(0.025),
+                "test",
+            )
+            .unwrap();
         }
         {
             let mut dao = FactorSnapshotDao::new(&mut conn);
@@ -182,8 +201,17 @@ mod tests {
         let mut conn = in_memory_conn();
         {
             let mut dao = FactorSnapshotDao::new(&mut conn);
-            dao.upsert("600000", "2026-06-01", Some(12.5), None, None, None, None, "test")
-                .unwrap();
+            dao.upsert(
+                "600000",
+                "2026-06-01",
+                Some(12.5),
+                None,
+                None,
+                None,
+                None,
+                "test",
+            )
+            .unwrap();
         }
         {
             let mut dao = FactorSnapshotDao::new(&mut conn);
@@ -198,11 +226,29 @@ mod tests {
         let mut conn = in_memory_conn();
         {
             let mut dao = FactorSnapshotDao::new(&mut conn);
-            dao.upsert("600000", "2026-06-01", Some(12.5), None, None, None, None, "test")
-                .unwrap();
+            dao.upsert(
+                "600000",
+                "2026-06-01",
+                Some(12.5),
+                None,
+                None,
+                None,
+                None,
+                "test",
+            )
+            .unwrap();
             // 事后填入的"未来"快照
-            dao.upsert("600000", "2026-06-10", Some(99.9), None, None, None, None, "test")
-                .unwrap();
+            dao.upsert(
+                "600000",
+                "2026-06-10",
+                Some(99.9),
+                None,
+                None,
+                None,
+                None,
+                "test",
+            )
+            .unwrap();
         }
         {
             let mut dao = FactorSnapshotDao::new(&mut conn);

@@ -231,6 +231,10 @@ impl SearchProvider for CninfoProvider {
         true // 巨潮资讯公开接口，免费可用
     }
 
+    fn supports_topic_search(&self) -> bool {
+        false // 法定公告全文检索, 宽泛主题词几乎无匹配, 保留给按代码查公告
+    }
+
     async fn search(&self, query: &str, max_results: usize) -> SearchResponse {
         match self.do_search(query, max_results).await {
             Ok(response) => {

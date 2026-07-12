@@ -1,7 +1,7 @@
 //! review（从 market_analyzer.rs 拆分）
 
-use log::{error, info, warn};
 use chrono::Local;
+use log::{error, info, warn};
 
 use crate::market_data::MarketOverview;
 use crate::search_service::SearchResponse;
@@ -94,7 +94,10 @@ impl MarketAnalyzer {
             overview.limit_down_count,
             overview.total_amount,
             // 修复 P1-3: None 时打 [数据缺失], 禁止 0.00 假数据 (BR-012)
-            overview.north_flow.map(|v| format!("{:+.2}亿", v)).unwrap_or_else(|| "[数据缺失]".to_string()),
+            overview
+                .north_flow
+                .map(|v| format!("{:+.2}亿", v))
+                .unwrap_or_else(|| "[数据缺失]".to_string()),
             top_text,
             bottom_text,
             self.format_top_stocks(&overview.top_stocks),
@@ -103,7 +106,11 @@ impl MarketAnalyzer {
     }
 
     /// 构建复盘报告 Prompt
-    pub(super) fn build_review_prompt(&self, overview: &MarketOverview, news: &[SearchResponse]) -> String {
+    pub(super) fn build_review_prompt(
+        &self,
+        overview: &MarketOverview,
+        news: &[SearchResponse],
+    ) -> String {
         // 指数行情信息（简洁格式，不用emoji）
         let mut indices_text = String::new();
         for idx in &overview.indices {
@@ -231,7 +238,10 @@ impl MarketAnalyzer {
             overview.limit_down_count,
             overview.total_amount,
             // 修复 P1-3: None → [数据缺失] (BR-012)
-            overview.north_flow.map(|v| format!("{:+.2} 亿元", v)).unwrap_or_else(|| "[数据缺失]".to_string()),
+            overview
+                .north_flow
+                .map(|v| format!("{:+.2} 亿元", v))
+                .unwrap_or_else(|| "[数据缺失]".to_string()),
             top_sectors_text,
             bottom_sectors_text,
             news_text,
@@ -240,7 +250,11 @@ impl MarketAnalyzer {
     }
 
     /// 使用AI生成大盘复盘报告
-    pub fn generate_market_review(&self, overview: &MarketOverview, news: &[SearchResponse]) -> String {
+    pub fn generate_market_review(
+        &self,
+        overview: &MarketOverview,
+        news: &[SearchResponse],
+    ) -> String {
         // 如果没有AI分析器，使用模板
         if self.ai_analyzer.is_none() {
             warn!("[大盘] AI分析器未配置，使用模板生成报告");
@@ -269,5 +283,4 @@ impl MarketAnalyzer {
             }
         }
     }
-
 }

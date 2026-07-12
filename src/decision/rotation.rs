@@ -1,7 +1,6 @@
 //! 轮动判断 — 健康回调 vs 趋势结束交叉验证。
 
 use crate::data_provider::KlineData;
-use log::debug;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrendStatus {
@@ -51,7 +50,14 @@ pub fn judge_trend(kline: &[KlineData]) -> RotationSignal {
 
     // 1. 缩量回调检查（最近5日均量 vs 前15日均量）
     let recent_vol: f64 = kline.iter().rev().take(5).map(|k| k.volume).sum::<f64>() / 5.0;
-    let old_vol: f64 = kline.iter().rev().skip(5).take(15).map(|k| k.volume).sum::<f64>() / 15.0;
+    let old_vol: f64 = kline
+        .iter()
+        .rev()
+        .skip(5)
+        .take(15)
+        .map(|k| k.volume)
+        .sum::<f64>()
+        / 15.0;
     if old_vol > 0.0 && recent_vol < old_vol * 0.7 {
         reasons.push("缩量".to_string());
         healthy_score += 1;
@@ -111,7 +117,11 @@ pub fn judge_trend(kline: &[KlineData]) -> RotationSignal {
     // 量化分析师要求: 决策必须带回置信度
     log::debug!(
         "[P2.7] 轮动决策: healthy={} ending={} p(healthy)={:.2} confidence={:.2} status={:?}",
-        healthy_score, ending_score, healthy_p, confidence, status
+        healthy_score,
+        ending_score,
+        healthy_p,
+        confidence,
+        status
     );
 
     RotationSignal {
@@ -126,17 +136,22 @@ pub fn judge_holdings(
     holdings: &[crate::portfolio::Position],
     klines: &std::collections::HashMap<String, Vec<KlineData>>,
 ) -> Vec<RotationSignal> {
-    holdings.iter().filter_map(|p| {
-        let kline = klines.get(&p.code)?;
-        let mut signal = judge_trend(kline);
-        signal.code = p.code.clone();
-        Some(signal)
-    }).collect()
+    holdings
+        .iter()
+        .filter_map(|p| {
+            let kline = klines.get(&p.code)?;
+            let mut signal = judge_trend(kline);
+            signal.code = p.code.clone();
+            Some(signal)
+        })
+        .collect()
 }
 
 /// 格式化轮动信号
 pub fn format_rotation_signals(signals: &[RotationSignal]) -> String {
-    if signals.is_empty() { return String::new(); }
+    if signals.is_empty() {
+        return String::new();
+    }
 
     let has_warning = signals.iter().any(|s| s.status == TrendStatus::TrendEnding);
     let mut lines = vec![if has_warning {
@@ -148,7 +163,11 @@ pub fn format_rotation_signals(signals: &[RotationSignal]) -> String {
     for s in signals {
         lines.push(format!(
             "  {} {}({}) {} — {}",
-            s.status.emoji(), s.code, s.code, s.status.label(), s.reasons.join("、"),
+            s.status.emoji(),
+            s.code,
+            s.code,
+            s.status.label(),
+            s.reasons.join("、"),
         ));
     }
     lines.join("\n")
@@ -162,14 +181,34 @@ mod tests {
     fn k(close: f64, vol: f64) -> KlineData {
         KlineData {
             date: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
-            open: close, high: close, low: close, close, volume: vol,
-            amount: 0.0, pct_chg: 0.0, intraday_price: None, settled: true, pe_ratio: None, pb_ratio: None,
-            turnover_rate: None, market_cap: None, circulating_cap: None,
-            eps: None, roe: None, revenue_yoy: None, net_profit_yoy: None,
-            gross_margin: None, net_margin: None, sharpe_ratio: None,
-            financials_history: None, valuation_history: None,
-            consensus: None, industry: None,
-            is_limit_up: false, is_limit_down: false, is_suspended: false,
+            open: close,
+            high: close,
+            low: close,
+            close,
+            volume: vol,
+            amount: 0.0,
+            pct_chg: 0.0,
+            intraday_price: None,
+            settled: true,
+            pe_ratio: None,
+            pb_ratio: None,
+            turnover_rate: None,
+            market_cap: None,
+            circulating_cap: None,
+            eps: None,
+            roe: None,
+            revenue_yoy: None,
+            net_profit_yoy: None,
+            gross_margin: None,
+            net_margin: None,
+            sharpe_ratio: None,
+            financials_history: None,
+            valuation_history: None,
+            consensus: None,
+            industry: None,
+            is_limit_up: false,
+            is_limit_down: false,
+            is_suspended: false,
             adjust: crate::data_provider::AdjustType::None,
         }
     }
@@ -188,6 +227,9 @@ mod tests {
             data.push(k(100.0 + i as f64, 1e6 * 0.5)); // 缩量上涨
         }
         let result = judge_trend(&data);
-        assert!(matches!(result.status, TrendStatus::HealthyPullback | TrendStatus::Uncertain));
+        assert!(matches!(
+            result.status,
+            TrendStatus::HealthyPullback | TrendStatus::Uncertain
+        ));
     }
 }

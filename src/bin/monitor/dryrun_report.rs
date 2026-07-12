@@ -13,19 +13,18 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
-
 use serde::Serialize;
 
 /// 报告数据 (整体序列化)
 #[derive(Debug, Serialize)]
 pub struct DryRunReport {
-    pub generated_at: String,        // ISO8601 时间戳
-    pub window_hours: u64,           // 报告时间窗口 (默认 24h)
-    pub total_attempts: u64,         // 总推送尝试
-    pub success_rate: f64,           // 成功率 (0.0-1.0)
-    pub by_kind: Vec<KindStat>,       // 按模板统计
+    pub generated_at: String,   // ISO8601 时间戳
+    pub window_hours: u64,      // 报告时间窗口 (默认 24h)
+    pub total_attempts: u64,    // 总推送尝试
+    pub success_rate: f64,      // 成功率 (0.0-1.0)
+    pub by_kind: Vec<KindStat>, // 按模板统计
     pub source_health: Vec<SourceStat>,
-    pub top_topics: Vec<TopicStat>,   // top 5 主题命中
+    pub top_topics: Vec<TopicStat>, // top 5 主题命中
 }
 
 /// 按模板统计
@@ -67,7 +66,10 @@ pub fn spawn_dryrun_reporter(interval_secs: u64) {
             }
         }
     });
-    log::info!("[v26 dryrun] 后台报告生成器已启动 (interval: {}s)", interval_secs);
+    log::info!(
+        "[v26 dryrun] 后台报告生成器已启动 (interval: {}s)",
+        interval_secs
+    );
 }
 
 /// v14.1 task #162 / review #12: 启动后台 backfill 调度器
@@ -114,8 +116,15 @@ pub fn spawn_outcome_backfill_scheduler() {
             let yesterday = crate::calendar::prev_trading_day(today);
             let date_str = yesterday.format("%Y-%m-%d").to_string();
             log::info!("[v14.1 #162] 自动 backfill outcome | 日期 = {}", date_str);
-            let updated = stock_analysis::opportunity::news_outcome::backfill_recommendations_outcome(&date_str);
-            log::info!("[v14.1 #162] 自动 backfill 完成 | {} | 更新 {} 条", date_str, updated);
+            let updated =
+                stock_analysis::opportunity::news_outcome::backfill_recommendations_outcome(
+                    &date_str,
+                );
+            log::info!(
+                "[v14.1 #162] 自动 backfill 完成 | {} | 更新 {} 条",
+                date_str,
+                updated
+            );
             last_run_date = Some(today_str);
         }
     });
@@ -137,9 +146,7 @@ fn scan_and_backfill_pending() -> Result<usize, Box<dyn std::error::Error>> {
     let mut count = 0;
     let mut entries: Vec<_> = fs::read_dir(&dir)?
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path().extension().and_then(|x| x.to_str()) == Some("jsonl")
-        })
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("jsonl"))
         .collect();
     // 按文件名 (日期) 排序, 早的先补
     entries.sort_by_key(|e| e.file_name());
@@ -167,8 +174,13 @@ fn scan_and_backfill_pending() -> Result<usize, Box<dyn std::error::Error>> {
             continue;
         }
         log::info!("[v14.1 #162] 历史补单 backfill | {}", date_str);
-        let updated = stock_analysis::opportunity::news_outcome::backfill_recommendations_outcome(&date_str);
-        log::info!("[v14.1 #162] 历史补单完成 | {} | 更新 {} 条", date_str, updated);
+        let updated =
+            stock_analysis::opportunity::news_outcome::backfill_recommendations_outcome(&date_str);
+        log::info!(
+            "[v14.1 #162] 历史补单完成 | {} | 更新 {} 条",
+            date_str,
+            updated
+        );
         count += 1;
     }
     Ok(count)
@@ -213,10 +225,21 @@ mod tests {
         let path = dir.join("2026-07-01.jsonl");
         let mut f = std::fs::File::create(&path).unwrap();
         // 2 行 outcome=null (待 backfill)
-        writeln!(f, r#"{{"code":"002916","outcome":null,"ts":"2026-07-01 09:00:00"}}"#).unwrap();
-        writeln!(f, r#"{{"code":"002463","outcome":null,"ts":"2026-07-01 09:00:01"}}"#).unwrap();
+        writeln!(
+            f,
+            r#"{{"code":"002916","outcome":null,"ts":"2026-07-01 09:00:00"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"code":"002463","outcome":null,"ts":"2026-07-01 09:00:01"}}"#
+        )
+        .unwrap();
         f.sync_all().unwrap();
-        assert!(is_outcome_all_null(&path), "outcome 全 null 应识别为待 backfill");
+        assert!(
+            is_outcome_all_null(&path),
+            "outcome 全 null 应识别为待 backfill"
+        );
         std::fs::remove_file(&path).unwrap();
     }
 
@@ -227,7 +250,11 @@ mod tests {
         let path = dir.join("2026-07-02.jsonl");
         let mut f = std::fs::File::create(&path).unwrap();
         // 1 行 outcome 已有 d1_pct, 已 backfill 过
-        writeln!(f, r#"{{"code":"002916","outcome":{{"d1_pct":0.05}},"ts":"2026-07-02 09:00:00"}}"#).unwrap();
+        writeln!(
+            f,
+            r#"{{"code":"002916","outcome":{{"d1_pct":0.05}},"ts":"2026-07-02 09:00:00"}}"#
+        )
+        .unwrap();
         f.sync_all().unwrap();
         assert!(!is_outcome_all_null(&path), "outcome 已填不应再 backfill");
         std::fs::remove_file(&path).unwrap();
@@ -240,8 +267,16 @@ mod tests {
         let path = dir.join("2026-07-03.jsonl");
         let mut f = std::fs::File::create(&path).unwrap();
         // 1 行已填, 1 行 null → 仍需 backfill (has_any_pending)
-        writeln!(f, r#"{{"code":"002916","outcome":{{"d1_pct":0.05}},"ts":"2026-07-03 09:00:00"}}"#).unwrap();
-        writeln!(f, r#"{{"code":"002463","outcome":null,"ts":"2026-07-03 09:00:01"}}"#).unwrap();
+        writeln!(
+            f,
+            r#"{{"code":"002916","outcome":{{"d1_pct":0.05}},"ts":"2026-07-03 09:00:00"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"code":"002463","outcome":null,"ts":"2026-07-03 09:00:01"}}"#
+        )
+        .unwrap();
         f.sync_all().unwrap();
         assert!(is_outcome_all_null(&path), "部分 null 也应 backfill");
         std::fs::remove_file(&path).unwrap();
@@ -280,8 +315,15 @@ async fn collect_report() -> anyhow::Result<DryRunReport> {
             let content = tokio::fs::read_to_string(&path).await?;
             for line in content.lines() {
                 if let Ok(record) = serde_json::from_str::<serde_json::Value>(line) {
-                    let kind = record.get("kind").and_then(|k| k.as_str()).unwrap_or("").to_string();
-                    let success = record.get("success").and_then(|s| s.as_bool()).unwrap_or(false);
+                    let kind = record
+                        .get("kind")
+                        .and_then(|k| k.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let success = record
+                        .get("success")
+                        .and_then(|s| s.as_bool())
+                        .unwrap_or(false);
                     let error = record.get("error").and_then(|e| e.as_str()).unwrap_or("");
 
                     total_attempts += 1;
@@ -291,16 +333,24 @@ async fn collect_report() -> anyhow::Result<DryRunReport> {
 
                     let stat = by_kind_map.entry(kind.clone()).or_insert(KindStat {
                         kind: kind.clone(),
-                        total: 0, success: 0, failed: 0,
+                        total: 0,
+                        success: 0,
+                        failed: 0,
                     });
                     stat.total += 1;
-                    if success { stat.success += 1; } else { stat.failed += 1; }
+                    if success {
+                        stat.success += 1;
+                    } else {
+                        stat.failed += 1;
+                    }
 
                     // 数据源 health: 从 kind 前缀推断 (e.g. "P-01-dry" → dryrun, "I-02" → news)
                     if let Some(source) = source_from_kind(&kind) {
                         let s = by_source_map.entry(source.clone()).or_insert(SourceStat {
                             source: source.clone(),
-                            attempts: 0, empty: 0, errors: 0,
+                            attempts: 0,
+                            empty: 0,
+                            errors: 0,
                         });
                         s.attempts += 1;
                         if error.contains("空") || error.contains("无数据") {

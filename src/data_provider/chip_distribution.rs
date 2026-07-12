@@ -98,10 +98,7 @@ pub fn compute_chip_distribution(kline_data: &[KlineData]) -> ChipDistribution {
     }
 
     // 价格区间
-    let min_p = chron
-        .iter()
-        .map(|k| k.low)
-        .fold(f64::INFINITY, f64::min);
+    let min_p = chron.iter().map(|k| k.low).fold(f64::INFINITY, f64::min);
     let max_p = chron
         .iter()
         .map(|k| k.high)
@@ -138,10 +135,10 @@ pub fn compute_chip_distribution(kline_data: &[KlineData]) -> ChipDistribution {
         }
 
         // 2) 今日新增筹码：在 [low, high] 均匀分布
-        let low_idx = (((k.low - lo) / step).floor() as isize)
-            .clamp(0, BUCKETS as isize - 1) as usize;
-        let high_idx = (((k.high - lo) / step).floor() as isize)
-            .clamp(0, BUCKETS as isize - 1) as usize;
+        let low_idx =
+            (((k.low - lo) / step).floor() as isize).clamp(0, BUCKETS as isize - 1) as usize;
+        let high_idx =
+            (((k.high - lo) / step).floor() as isize).clamp(0, BUCKETS as isize - 1) as usize;
         let band = high_idx.saturating_sub(low_idx) + 1;
         let per_bucket = turnover / band as f64;
         for i in low_idx..=high_idx {
@@ -168,12 +165,17 @@ pub fn compute_chip_distribution(kline_data: &[KlineData]) -> ChipDistribution {
         .sum();
 
     // 主力成本（峰值桶）
-    let (peak_idx, _) = chips
-        .iter()
-        .enumerate()
-        .fold((0usize, 0f64), |(pi, pv), (i, &v)| {
-            if v > pv { (i, v) } else { (pi, pv) }
-        });
+    let (peak_idx, _) =
+        chips.iter().enumerate().fold(
+            (0usize, 0f64),
+            |(pi, pv), (i, &v)| {
+                if v > pv {
+                    (i, v)
+                } else {
+                    (pi, pv)
+                }
+            },
+        );
     let main_cost = price_mid(peak_idx);
 
     // 当前价（最新收盘）
@@ -287,7 +289,11 @@ pub fn format_for_prompt(chip: &ChipDistribution) -> String {
         "⚠️ 当前价远低于主力成本，主力深套"
     };
 
-    let est_tag = if chip.turnover_estimated { "（换手率部分估算）" } else { "" };
+    let est_tag = if chip.turnover_estimated {
+        "（换手率部分估算）"
+    } else {
+        ""
+    };
 
     let mut s = String::new();
     s.push_str(&format!(
@@ -296,18 +302,9 @@ pub fn format_for_prompt(chip: &ChipDistribution) -> String {
     ));
     // 以表格形式输出，方便 Markdown 渲染时统一为表格
     s.push_str("指标 | 数值 | 解读\n");
-    s.push_str(&format!(
-        "平均成本 | ¥{:.2} | -\n",
-        chip.avg_cost
-    ));
-    s.push_str(&format!(
-        "主力成本(峰值) | ¥{:.2} | -\n",
-        chip.main_cost
-    ));
-    s.push_str(&format!(
-        "当前价 | ¥{:.2} | -\n",
-        chip.current_price
-    ));
+    s.push_str(&format!("平均成本 | ¥{:.2} | -\n", chip.avg_cost));
+    s.push_str(&format!("主力成本(峰值) | ¥{:.2} | -\n", chip.main_cost));
+    s.push_str(&format!("当前价 | ¥{:.2} | -\n", chip.current_price));
     s.push_str(&format!(
         "获利盘比例 | {:.1}% | {}\n",
         chip.profit_ratio * 100.0,

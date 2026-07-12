@@ -18,19 +18,28 @@ pub struct DeepSeekProvider {
 
 impl DeepSeekProvider {
     pub fn from_env() -> Option<Self> {
-        let key = std::env::var("DEEPSEEK_API_KEY").ok().filter(|k| !k.is_empty())?;
+        let key = std::env::var("DEEPSEEK_API_KEY")
+            .ok()
+            .filter(|k| !k.is_empty())?;
         let base = std::env::var("DEEPSEEK_BASE_URL")
             .unwrap_or_else(|_| "https://api.deepseek.com/v1".to_string());
         let model = std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-chat".to_string());
         let cfg = OpenAIConfig::new().with_api_key(key).with_api_base(base);
-        Some(Self { client: Client::with_config(cfg), model })
+        Some(Self {
+            client: Client::with_config(cfg),
+            model,
+        })
     }
 }
 
 #[async_trait::async_trait]
 impl LlmProvider for DeepSeekProvider {
-    fn name(&self) -> &'static str { "deepseek" }
-    fn model(&self) -> &str { &self.model }
+    fn name(&self) -> &'static str {
+        "deepseek"
+    }
+    fn model(&self) -> &str {
+        &self.model
+    }
     async fn chat_json(&self, system: &str, user: &str) -> Result<serde_json::Value, LlmError> {
         openai_compatible_chat_json(&self.client, &self.model, system, user).await
     }
@@ -50,19 +59,29 @@ pub struct MiniMaxProvider {
 
 impl MiniMaxProvider {
     pub fn from_env() -> Option<Self> {
-        let key = std::env::var("MiniMax_API_KEY").ok().filter(|k| !k.is_empty())?;
+        let key = std::env::var("MiniMax_API_KEY")
+            .ok()
+            .filter(|k| !k.is_empty())?;
         let base = std::env::var("MiniMax_BASE_URL")
             .unwrap_or_else(|_| "https://api.minimaxi.com/v1".to_string());
-        let model = std::env::var("MiniMax_MODEL").unwrap_or_else(|_| "MiniMax-Text-01".to_string());
+        let model =
+            std::env::var("MiniMax_MODEL").unwrap_or_else(|_| "MiniMax-Text-01".to_string());
         let cfg = OpenAIConfig::new().with_api_key(key).with_api_base(base);
-        Some(Self { client: Client::with_config(cfg), model })
+        Some(Self {
+            client: Client::with_config(cfg),
+            model,
+        })
     }
 }
 
 #[async_trait::async_trait]
 impl LlmProvider for MiniMaxProvider {
-    fn name(&self) -> &'static str { "minimax" }
-    fn model(&self) -> &str { &self.model }
+    fn name(&self) -> &'static str {
+        "minimax"
+    }
+    fn model(&self) -> &str {
+        &self.model
+    }
     async fn chat_json(&self, system: &str, user: &str) -> Result<serde_json::Value, LlmError> {
         openai_compatible_chat_json(&self.client, &self.model, system, user).await
     }
@@ -85,12 +104,15 @@ pub struct OpenAiCompatProvider {
 
 impl OpenAiCompatProvider {
     pub fn from_env() -> Option<Self> {
-        let key = std::env::var("OPENAI_COMPAT_API_KEY").ok().filter(|k| !k.is_empty())?;
+        let key = std::env::var("OPENAI_COMPAT_API_KEY")
+            .ok()
+            .filter(|k| !k.is_empty())?;
         let base = std::env::var("OPENAI_COMPAT_BASE_URL")
             .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-        let model = std::env::var("OPENAI_COMPAT_MODEL")
-            .unwrap_or_else(|_| "gpt-4o-mini".to_string());
-        let provider_name = std::env::var("OPENAI_COMPAT_NAME").unwrap_or_else(|_| "openai_compat".to_string());
+        let model =
+            std::env::var("OPENAI_COMPAT_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
+        let provider_name =
+            std::env::var("OPENAI_COMPAT_NAME").unwrap_or_else(|_| "openai_compat".to_string());
         // 注意: 静态生命周期限制, 这里只把常见名字放常量池
         let name_static: &'static str = match provider_name.as_str() {
             "openai" => "openai",
@@ -100,14 +122,22 @@ impl OpenAiCompatProvider {
             _ => "openai_compat",
         };
         let cfg = OpenAIConfig::new().with_api_key(key).with_api_base(base);
-        Some(Self { provider_name: name_static, client: Client::with_config(cfg), model })
+        Some(Self {
+            provider_name: name_static,
+            client: Client::with_config(cfg),
+            model,
+        })
     }
 }
 
 #[async_trait::async_trait]
 impl LlmProvider for OpenAiCompatProvider {
-    fn name(&self) -> &'static str { self.provider_name }
-    fn model(&self) -> &str { &self.model }
+    fn name(&self) -> &'static str {
+        self.provider_name
+    }
+    fn model(&self) -> &str {
+        &self.model
+    }
     async fn chat_json(&self, system: &str, user: &str) -> Result<serde_json::Value, LlmError> {
         openai_compatible_chat_json(&self.client, &self.model, system, user).await
     }

@@ -26,12 +26,24 @@ pub enum MonitorEvent {
     /// 机会扫描完成，附候选数量
     OpportunityScan { candidates: usize },
     /// 修复 P3.6: 订单状态变化 (持仓建立/平仓/止损触发)
-    OrderUpdate { code: String, action: String, shares: u64 },
+    OrderUpdate {
+        code: String,
+        action: String,
+        shares: u64,
+    },
     /// 修复 P3.6: 价格异常变动 (涨跌停/异动/突破)
-    PriceUpdate { code: String, change_pct: f64, reason: String },
+    PriceUpdate {
+        code: String,
+        change_pct: f64,
+        reason: String,
+    },
     /// 修复 P3.6: 数据质量事件 (陈旧/缺失/异常)
     /// 用于 P3.5 之后的"指数 ATR 缺失"等数据降级告警
-    DataQuality { source: String, issue: String, severity: DataQualityLevel },
+    DataQuality {
+        source: String,
+        issue: String,
+        severity: DataQualityLevel,
+    },
     /// 通用信息事件
     Info(String),
 }
@@ -39,9 +51,9 @@ pub enum MonitorEvent {
 /// 数据质量严重度
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataQualityLevel {
-    Warn,   // 数据可用但有偏差 (e.g. ATR 缺失用静态回退)
-    Error,  // 数据不可用, 功能降级
-    Fatal,  // 数据源全挂, 必须停机
+    Warn,  // 数据可用但有偏差 (e.g. ATR 缺失用静态回退)
+    Error, // 数据不可用, 功能降级
+    Fatal, // 数据源全挂, 必须停机
 }
 
 impl MonitorEvent {

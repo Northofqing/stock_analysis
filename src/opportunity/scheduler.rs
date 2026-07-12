@@ -5,8 +5,8 @@
 //!
 //! v22: 增加 push 调度字段 (替代 v17.6 写死的 09:00-19:00 窗口)
 
-use std::time::Duration;
 use chrono::{Local, NaiveTime, Timelike};
+use std::time::Duration;
 
 /// 修复 v9.1 §1.3 + v22: 触发时刻表
 #[derive(Debug, Clone)]
@@ -63,9 +63,19 @@ impl OpportunitySchedule {
             } else {
                 trigger_secs + 86400 - now_secs
             };
-            if diff < best { best = diff; }
+            if diff < best {
+                best = diff;
+            }
         }
         best
+    }
+
+    /// CR-10 (review): 算到指定 target 时间的等待秒数 (0 表示已过 target).
+    ///   之前 main.rs:5148 用 format+split+parse 算秒数, 繁琐且绕过了现成 helper.
+    pub fn seconds_until(&self, target: NaiveTime, now: NaiveTime) -> u64 {
+        let target_secs = target.num_seconds_from_midnight() as i64;
+        let now_secs = now.num_seconds_from_midnight() as i64;
+        (target_secs - now_secs).max(0) as u64
     }
 
     /// 修复 v9.1 §1.3: 距下次 incremental 的秒数 (固定间隔)
@@ -211,9 +221,21 @@ mod tests {
             push_intraday: vec![NaiveTime::from_hms_opt(10, 0, 0).unwrap()],
             push_evening: NaiveTime::from_hms_opt(20, 0, 0).unwrap(),
         };
-        assert_eq!(s.push_window(NaiveTime::from_hms_opt(8, 0, 0).unwrap()), PushWindow::Preopen);
-        assert_eq!(s.push_window(NaiveTime::from_hms_opt(10, 0, 0).unwrap()), PushWindow::Intraday);
-        assert_eq!(s.push_window(NaiveTime::from_hms_opt(20, 0, 0).unwrap()), PushWindow::Evening);
-        assert_eq!(s.push_window(NaiveTime::from_hms_opt(8, 30, 0).unwrap()), PushWindow::Outside);
+        assert_eq!(
+            s.push_window(NaiveTime::from_hms_opt(8, 0, 0).unwrap()),
+            PushWindow::Preopen
+        );
+        assert_eq!(
+            s.push_window(NaiveTime::from_hms_opt(10, 0, 0).unwrap()),
+            PushWindow::Intraday
+        );
+        assert_eq!(
+            s.push_window(NaiveTime::from_hms_opt(20, 0, 0).unwrap()),
+            PushWindow::Evening
+        );
+        assert_eq!(
+            s.push_window(NaiveTime::from_hms_opt(8, 30, 0).unwrap()),
+            PushWindow::Outside
+        );
     }
 }

@@ -46,7 +46,12 @@ impl fmt::Display for LlmError {
             LlmError::Http(e) => write!(f, "[LLM] HTTP 错误: {}", e),
             LlmError::Parse(e) => write!(f, "[LLM] 响应解析失败: {}", e),
             LlmError::Api { status, body } => {
-                write!(f, "[LLM] API 错误 (status={}): {}", status, body.chars().take(200).collect::<String>())
+                write!(
+                    f,
+                    "[LLM] API 错误 (status={}): {}",
+                    status,
+                    body.chars().take(200).collect::<String>()
+                )
             }
         }
     }
@@ -115,17 +120,13 @@ pub(crate) async fn openai_compatible_chat_json(
         .build()
         .map_err(|e| LlmError::Http(format!("req build: {}", e)))?;
 
-    let resp = client
-        .chat()
-        .create(req)
-        .await
-        .map_err(|e| match &e {
-            async_openai::error::OpenAIError::ApiError(api) => LlmError::Api {
-                status: 0, // async_openai 0.19 不暴露 status code
-                body: format!("{} | {:?}", api.message, api.code),
-            },
-            other => LlmError::Http(format!("{:#}", other)),
-        })?;
+    let resp = client.chat().create(req).await.map_err(|e| match &e {
+        async_openai::error::OpenAIError::ApiError(api) => LlmError::Api {
+            status: 0, // async_openai 0.19 不暴露 status code
+            body: format!("{} | {:?}", api.message, api.code),
+        },
+        other => LlmError::Http(format!("{:#}", other)),
+    })?;
 
     let content = resp
         .choices
@@ -133,6 +134,11 @@ pub(crate) async fn openai_compatible_chat_json(
         .and_then(|c| c.message.content.clone())
         .ok_or_else(|| LlmError::Parse("响应无 content".into()))?;
 
-    serde_json::from_str::<Value>(&content)
-        .map_err(|e| LlmError::Parse(format!("JSON 解析失败: {} | content={}", e, content.chars().take(200).collect::<String>())))
+    serde_json::from_str::<Value>(&content).map_err(|e| {
+        LlmError::Parse(format!(
+            "JSON 解析失败: {} | content={}",
+            e,
+            content.chars().take(200).collect::<String>()
+        ))
+    })
 }

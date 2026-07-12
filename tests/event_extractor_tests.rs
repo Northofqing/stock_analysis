@@ -1,13 +1,18 @@
 use stock_analysis::opportunity::event_extractor::adapter::*;
-use stock_analysis::search_service::{SearchResult, NewsType, Sentiment};
+use stock_analysis::search_service::{NewsType, SearchResult, Sentiment};
 
 fn minimal_sr() -> SearchResult {
     SearchResult {
-        title: "".into(), snippet: "".into(), url: "".into(),
-        source: "".into(), published_date: Some("2026-06-27 10:30:00".into()),
+        title: "".into(),
+        snippet: "".into(),
+        url: "".into(),
+        source: "".into(),
+        published_date: Some("2026-06-27 10:30:00".into()),
         news_type: NewsType::Other,
         sentiment: Sentiment::Neutral,
-        importance: 0, relevance: 0.0, keywords: vec![],
+        importance: 0,
+        relevance: 0.0,
+        keywords: vec![],
     }
 }
 
@@ -21,7 +26,9 @@ fn test_adapter_search_result_to_raw() {
         published_date: Some("2026-06-27 10:30:00".into()),
         news_type: NewsType::Industry,
         sentiment: Sentiment::Positive,
-        importance: 8, relevance: 0.9, keywords: vec![],
+        importance: 8,
+        relevance: 0.9,
+        keywords: vec![],
     };
     let raw = SearchResultAdapter::to_raw(&sr).unwrap();
     assert_eq!(raw.title, "CO2激光突破");
@@ -68,9 +75,13 @@ use stock_analysis::opportunity::event_extractor::rule_filter::*;
 
 fn raw_item(title: &str) -> RawNewsItem {
     RawNewsItem {
-        title: title.into(), body: "".into(), source: "test".into(),
-        source_priority: 1, source_type: SourceType::Search,
-        published_at: chrono::Local::now(), url: None,
+        title: title.into(),
+        body: "".into(),
+        source: "test".into(),
+        source_priority: 1,
+        source_type: SourceType::Search,
+        published_at: chrono::Local::now(),
+        url: None,
     }
 }
 
@@ -123,7 +134,8 @@ fn test_classifier_parse_valid_json() {
 
 #[test]
 fn test_classifier_parse_non_event() {
-    let json = r#"{"is_event":false,"event_type":null,"direction":null,"subject":null,"confidence":0.3}"#;
+    let json =
+        r#"{"is_event":false,"event_type":null,"direction":null,"subject":null,"confidence":0.3}"#;
     let out = EventClassifier::parse_response(json).unwrap();
     assert!(!out.is_event);
     assert!(out.event_type.is_none());
@@ -145,14 +157,33 @@ fn test_classifier_build_prompt_uses_first_100_chars() {
 
 use stock_analysis::opportunity::event_extractor::core::*;
 use stock_analysis::opportunity::event_extractor::*;
-use stock_analysis::signal::market_event::{EventType, Direction};
+use stock_analysis::signal::market_event::{Direction, EventType};
 
 fn raw_t(title: &str, source: &str, st: SourceType) -> RawNewsItem {
-    RawNewsItem { title: title.into(), body: "".into(), source: source.into(), source_priority: 1, source_type: st, published_at: chrono::Local::now(), url: None }
+    RawNewsItem {
+        title: title.into(),
+        body: "".into(),
+        source: source.into(),
+        source_priority: 1,
+        source_type: st,
+        published_at: chrono::Local::now(),
+        url: None,
+    }
 }
 
 fn search_result(title: &str, date: &str) -> SearchResult {
-    SearchResult { title: title.into(), snippet: "".into(), url: "".into(), source: "test".into(), published_date: Some(date.into()), news_type: NewsType::Other, sentiment: Sentiment::Neutral, importance: 0, relevance: 0.0, keywords: vec![] }
+    SearchResult {
+        title: title.into(),
+        snippet: "".into(),
+        url: "".into(),
+        source: "test".into(),
+        published_date: Some(date.into()),
+        news_type: NewsType::Other,
+        sentiment: Sentiment::Neutral,
+        importance: 0,
+        relevance: 0.0,
+        keywords: vec![],
+    }
 }
 
 #[test]
@@ -195,8 +226,11 @@ fn test_core_certainty_calibration_ranges() {
 fn test_core_quick_only_yields_market_event() {
     let raw = raw_t("工信部政策", "cls", SourceType::Flash);
     let co = stock_analysis::opportunity::event_extractor::classifier::ClassifierOutput {
-        is_event: true, event_type: Some(EventType::Policy),
-        direction: Some(Direction::Bull), subject: Some("工信部".into()), confidence: 0.9,
+        is_event: true,
+        event_type: Some(EventType::Policy),
+        direction: Some(Direction::Bull),
+        subject: Some("工信部".into()),
+        confidence: 0.9,
     };
     let me = EventExtractorCore::from_quick_only(&raw, &co);
     assert_eq!(me.event_type, EventType::Policy);
@@ -223,7 +257,9 @@ fn test_extract_batch_rules_only() {
 #[test]
 fn test_extract_incremental_filters_stale() {
     let now = chrono::Local::now();
-    let old_time = (now - chrono::Duration::hours(10)).format("%Y-%m-%d %H:%M:%S").to_string();
+    let old_time = (now - chrono::Duration::hours(10))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
     let old = search_result("旧快讯", &old_time);
     let (fresh, stale) = extract_incremental_rules_only(&[old], chrono::Duration::minutes(5));
     assert!(fresh.is_empty(), "stale > 5min 必入 stale 桶");
@@ -242,7 +278,9 @@ fn test_extract_batch_empty_input() {
 fn test_extract_batch_marks_stale_events() {
     // 修复 P0-2: batch 路径 > 1 个交易日的事件必标记 stale=true
     let now = chrono::Local::now();
-    let old_time = (now - chrono::Duration::days(3)).format("%Y-%m-%d %H:%M:%S").to_string();
+    let old_time = (now - chrono::Duration::days(3))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
     let old = search_result("旧闻：碳酸锂价格大幅上涨", &old_time);
     let (fresh, stale) = extract_batch_rules_only(&[old]);
     assert!(fresh.is_empty(), "3 日前 batch 必入 stale 桶");
@@ -254,7 +292,9 @@ fn test_extract_batch_marks_stale_events() {
 fn test_extract_batch_with_custom_max_age() {
     // 修复 P0-2: 1 日前的新闻, 阈值设 5 天应入 fresh
     let now = chrono::Local::now();
-    let one_day_ago = (now - chrono::Duration::days(1)).format("%Y-%m-%d %H:%M:%S").to_string();
+    let one_day_ago = (now - chrono::Duration::days(1))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
     let item = search_result("5G-A 商用新进展", &one_day_ago);
     let (fresh, _stale) = extract_batch_rules_only_with_max_age(&[item], chrono::Duration::days(5));
     assert_eq!(fresh.len(), 1, "1 日前新闻 + 5 天阈值 → fresh");

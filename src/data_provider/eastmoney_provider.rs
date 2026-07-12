@@ -1,12 +1,12 @@
 //! HTTP数据提供者
-//! 
+//!
 //! 通过HTTP API直接获取股票数据
 //! 参考market_analyzer的实现，使用东方财富API
 
 use super::limit_status::apply_limit_flags_inplace;
 use super::{DataProvider, KlineData};
 use crate::errors::ProviderError;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use chrono::NaiveDate;
 use serde::Deserialize;
 
@@ -55,14 +55,20 @@ impl HttpProvider {
     pub fn new() -> Result<Self> {
         // 修复 Top10#7 (2026-06-29 audit): 用 crate::http_client::SHARED_HTTP_CLIENT 共享 client
         // 替代每次 new() 新建. 4 个 HttpProvider 实例共享同一个 client, 节省 4 倍握手.
-        Ok(Self { client: crate::http_client::SHARED_HTTP_CLIENT.clone() })
+        Ok(Self {
+            client: crate::http_client::SHARED_HTTP_CLIENT.clone(),
+        })
     }
-    
+
     /// 从东方财富API获取K线数据（异步版本）
     ///
     /// 网络层错误（DNS/连接/超时/对端 RST）会做最多 2 次重试，500ms / 1000ms 退避；
     /// HTTP 4xx 等业务错误不重试，直接返回。
-    pub async fn fetch_kline_data_internal(client: &reqwest::Client, code: &str, days: usize) -> Result<Vec<KlineData>> {
+    pub async fn fetch_kline_data_internal(
+        client: &reqwest::Client,
+        code: &str,
+        days: usize,
+    ) -> Result<Vec<KlineData>> {
         const KLINE_HOSTS: [&str; 3] = [
             "push2his.eastmoney.com",
             "push2his-bak.eastmoney.com",
@@ -72,7 +78,11 @@ impl HttpProvider {
         // 转换股票代码格式 (600519 -> 1.600519 for Shanghai, 000001 -> 0.000001 for Shenzhen)
         let market_code = if code.starts_with('6') {
             format!("1.{}", code) // 上海
-        } else if code.starts_with("00") || code.starts_with("30") || code.starts_with("15") || code.starts_with("16") {
+        } else if code.starts_with("00")
+            || code.starts_with("30")
+            || code.starts_with("15")
+            || code.starts_with("16")
+        {
             format!("0.{}", code) // 深圳及深交所基金
         } else if code.starts_with("68") || code.starts_with("51") || code.starts_with("58") {
             format!("1.{}", code) // 科创板及上交所基金
@@ -121,11 +131,19 @@ impl HttpProvider {
                     // 网络层错误 → 重试
                     log::warn!(
                         "[HTTP] 请求失败 (attempt {}/{} host={} code={}): {}",
-                        attempt, max_attempts, host, code, brief(e.to_string())
+                        attempt,
+                        max_attempts,
+                        host,
+                        code,
+                        brief(e.to_string())
                     );
-                    last_err = Some(ProviderError::Other { provider: "eastmoney".into(), detail: format!("HTTP请求失败: {}", brief(e.to_string())) });
+                    last_err = Some(ProviderError::Other {
+                        provider: "eastmoney".into(),
+                        detail: format!("HTTP请求失败: {}", brief(e.to_string())),
+                    });
                     if attempt < max_attempts {
-                        tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64))
+                            .await;
                     }
                     continue;
                 }
@@ -141,11 +159,19 @@ impl HttpProvider {
                 // 5xx：可能瞬时，重试
                 log::warn!(
                     "[HTTP] 响应状态 {} (attempt {}/{} host={} code={})",
-                    status, attempt, max_attempts, host, code
+                    status,
+                    attempt,
+                    max_attempts,
+                    host,
+                    code
                 );
-                last_err = Some(ProviderError::Other { provider: "eastmoney".into(), detail: format!("HTTP请求返回错误状态: {}", status) });
+                last_err = Some(ProviderError::Other {
+                    provider: "eastmoney".into(),
+                    detail: format!("HTTP请求返回错误状态: {}", status),
+                });
                 if attempt < max_attempts {
-                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64))
+                        .await;
                 }
                 continue;
             }
@@ -155,11 +181,18 @@ impl HttpProvider {
                 Err(e) => {
                     log::warn!(
                         "[HTTP] 读取响应失败 (attempt {}/{} host={} code={}): {}",
-                        attempt, max_attempts, host, code, brief(e.to_string())
+                        attempt,
+                        max_attempts,
+                        host,
+                        code,
+                        brief(e.to_string())
                     );
-                    last_err = Some(ProviderError::ParseError { detail: format!("读取响应失败: {}", brief(e.to_string())) });
+                    last_err = Some(ProviderError::ParseError {
+                        detail: format!("读取响应失败: {}", brief(e.to_string())),
+                    });
                     if attempt < max_attempts {
-                        tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64))
+                            .await;
                     }
                     continue;
                 }
@@ -168,11 +201,17 @@ impl HttpProvider {
             if text.is_empty() {
                 log::warn!(
                     "[HTTP] 响应为空 (attempt {}/{} host={} code={})",
-                    attempt, max_attempts, host, code
+                    attempt,
+                    max_attempts,
+                    host,
+                    code
                 );
-                last_err = Some(ProviderError::ParseError { detail: format!("所有 host 返回空响应, code={}", code) });
+                last_err = Some(ProviderError::ParseError {
+                    detail: format!("所有 host 返回空响应, code={}", code),
+                });
                 if attempt < max_attempts {
-                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64))
+                        .await;
                 }
                 continue;
             }
@@ -194,9 +233,12 @@ impl HttpProvider {
                         e,
                         brief(text.clone())
                     );
-                    last_err = Some(ProviderError::ParseError { detail: format!("解析失败: {} - {}", e, brief(text.clone())) });
+                    last_err = Some(ProviderError::ParseError {
+                        detail: format!("解析失败: {} - {}", e, brief(text.clone())),
+                    });
                     if attempt < max_attempts {
-                        tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64)).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64))
+                            .await;
                     }
                     continue;
                 }
@@ -204,40 +246,42 @@ impl HttpProvider {
         }
 
         // 所有重试都失败：打印一次终态错误，避免上游再次重复输出
-        let err = last_err.map(|e| anyhow::Error::from(e)).unwrap_or_else(|| anyhow!("HTTP请求失败（未知错误）"));
+        let err = last_err
+            .map(|e| anyhow::Error::from(e))
+            .unwrap_or_else(|| anyhow!("HTTP请求失败（未知错误）"));
         log::error!("[HTTP] 重试 {} 次后仍失败: {}", max_attempts, err);
         Err(err)
     }
-    
+
     /// 解析K线响应（静态方法）
     fn parse_kline_response_internal(text: &str) -> Result<Vec<KlineData>> {
         use serde_json::Value;
-        
-        let json: Value = serde_json::from_str(text)
-            .context("解析JSON失败")?;
-        
+
+        let json: Value = serde_json::from_str(text).context("解析JSON失败")?;
+
         let klines = json["data"]["klines"]
             .as_array()
             .ok_or_else(|| anyhow!("未找到klines数据"))?;
-        
+
         let mut result = Vec::with_capacity(klines.len());
 
         for kline_str in klines {
-            let kline_str = kline_str.as_str()
+            let kline_str = kline_str
+                .as_str()
                 .ok_or_else(|| anyhow!("kline不是字符串"))?;
 
             // review #14: splitn(8, ',') 限制切分数量, 11 字段也只切 8 个 Vec 元素.
             // 格式: "2026-01-22,10.0,10.5,9.8,10.3,1000000,10000000,2.5,0,0,0"
             let parts: Vec<&str> = kline_str.splitn(8, ',').collect();
-            
+
             if parts.len() < 8 {
                 log::warn!("[HTTP] K线数据格式错误: {}", kline_str);
                 continue;
             }
-            
+
             let date = NaiveDate::parse_from_str(parts[0], "%Y-%m-%d")
                 .context(format!("解析日期失败: {}", parts[0]))?;
-            
+
             let kline = KlineData {
                 date,
                 open: parts[1].parse()?,
@@ -247,8 +291,9 @@ impl HttpProvider {
                 volume: parts[5].parse()?,
                 amount: parts[6].parse()?,
                 pct_chg: parts[7].parse()?,
-                intraday_price: None, settled: true,
-                pe_ratio: None,        // K线数据中不包含，需要从实时行情获取
+                intraday_price: None,
+                settled: true,
+                pe_ratio: None, // K线数据中不包含，需要从实时行情获取
                 pb_ratio: None,
                 turnover_rate: None,
                 market_cap: None,
@@ -269,16 +314,16 @@ impl HttpProvider {
                 is_suspended: false,
                 adjust: crate::data_provider::AdjustType::Qfq, // 东财 URL fqt=1 前复权
             };
-            
+
             result.push(kline);
         }
-        
+
         // 按日期降序排序（最新的在前）
         result.sort_by(|a, b| b.date.cmp(&a.date));
-        
+
         Ok(result)
     }
-    
+
     /// 获取股票名称（静态异步方法）
     async fn fetch_stock_name_internal(client: &reqwest::Client, code: &str) -> Option<String> {
         const QUOTE_HOSTS: [&str; 3] = [
@@ -314,7 +359,12 @@ impl HttpProvider {
                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
                             if let Some(name) = json["data"]["f58"].as_str() {
                                 if !name.is_empty() {
-                                    log::debug!("[HTTP] 获取股票名称(host={}): {} -> {}", host, code, name);
+                                    log::debug!(
+                                        "[HTTP] 获取股票名称(host={}): {} -> {}",
+                                        host,
+                                        code,
+                                        name
+                                    );
                                     return Some(name.to_string());
                                 }
                             }
@@ -411,18 +461,16 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_get_daily_data() {
-        with_provider(|p| {
-            match p.get_daily_data("600519", 30) {
-                Ok(data) => {
-                    assert!(!data.is_empty(), "数据不应为空");
-                    println!("获取到 {} 条数据", data.len());
-                    if let Some(first) = data.first() {
-                        assert!(first.close > 0.0, "收盘价应大于0");
-                    }
+        with_provider(|p| match p.get_daily_data("600519", 30) {
+            Ok(data) => {
+                assert!(!data.is_empty(), "数据不应为空");
+                println!("获取到 {} 条数据", data.len());
+                if let Some(first) = data.first() {
+                    assert!(first.close > 0.0, "收盘价应大于0");
                 }
-                Err(e) => {
-                    println!("获取数据失败（可能是网络问题）: {}", e);
-                }
+            }
+            Err(e) => {
+                println!("获取数据失败（可能是网络问题）: {}", e);
             }
         })
         .await;
@@ -431,7 +479,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_different_markets() {
         with_provider(|p| {
-            for (code, market) in [("600519", "上海"), ("000001", "深圳"), ("300750", "创业板")] {
+            for (code, market) in [("600519", "上海"), ("000001", "深圳"), ("300750", "创业板")]
+            {
                 println!("\n测试 {} 市场股票: {}", market, code);
                 match p.get_daily_data(code, 5) {
                     Ok(data) => {

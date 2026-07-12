@@ -179,9 +179,7 @@ fn fetch_sectors_blocking() -> Result<(Vec<SectorInfo>, Vec<SectorInfo>)> {
         .header("Referer", "https://quote.eastmoney.com/")
         .send()
         .context("板块 HTTP 请求失败")?;
-    let json: serde_json::Value = resp
-        .json()
-        .context("板块响应非 JSON")?;
+    let json: serde_json::Value = resp.json().context("板块响应非 JSON")?;
     let diff = json
         .get("data")
         .and_then(|d| d.get("diff"))
@@ -241,9 +239,7 @@ fn fetch_market_stats_blocking() -> Result<(i32, i32, i32, i32, i32, f64)> {
         ])
         .send()
         .context("涨跌统计 HTTP 请求失败")?;
-    let json: serde_json::Value = resp
-        .json()
-        .context("涨跌统计响应非 JSON")?;
+    let json: serde_json::Value = resp.json().context("涨跌统计响应非 JSON")?;
     let arr = json
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("涨跌统计响应不是数组"))?;
@@ -270,10 +266,7 @@ fn fetch_market_stats_blocking() -> Result<(i32, i32, i32, i32, i32, f64)> {
         } else if change_pct <= -9.9 {
             lim_down += 1;
         }
-        let a: f64 = stock
-            .get("amount")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
+        let a: f64 = stock.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
         amount += a;
     }
     Ok((up, down, flat, lim_up, lim_down, amount / 1e8))
@@ -304,11 +297,19 @@ fn format_market_report(overview: &MarketOverview) -> String {
     let _ = writeln!(s, "| 涨停 | {} |", overview.limit_up_count);
     let _ = writeln!(s, "| 跌停 | {} |", overview.limit_down_count);
     // v19.12 修复: 500 只样本累加 ≠ 沪深两市真实成交额, 显式标注 "样本估算" 防误导
-    let _ = writeln!(s, "| 两市成交额 (涨幅榜500只样本估算) | {:.0}亿 |", overview.total_amount);
+    let _ = writeln!(
+        s,
+        "| 两市成交额 (涨幅榜500只样本估算) | {:.0}亿 |",
+        overview.total_amount
+    );
     // 修复 P1-3 (2026-06-30 codex review, BR-012): None 时显式打 -, 禁止显示 0.00.
     match overview.north_flow {
-        Some(v) => { let _ = writeln!(s, "| 北向资金 | {:+.2}亿 |", v); }
-        None => { let _ = writeln!(s, "| 北向资金 | - (数据源缺失) |"); }
+        Some(v) => {
+            let _ = writeln!(s, "| 北向资金 | {:+.2}亿 |", v);
+        }
+        None => {
+            let _ = writeln!(s, "| 北向资金 | - (数据源缺失) |");
+        }
     }
     let _ = writeln!(s);
     if !overview.top_sectors.is_empty() {
@@ -364,16 +365,30 @@ fn judge_market_sentiment(overview: &MarketOverview) -> MarketSentiment {
         let up_ratio = overview.up_count as f64 / total as f64;
         if up_ratio >= 0.7 {
             score += 30;
-            bullets.push(format!("📈 普涨 ({} 上 / {} 下, {:.0}%)", overview.up_count, overview.down_count, up_ratio * 100.0));
+            bullets.push(format!(
+                "📈 普涨 ({} 上 / {} 下, {:.0}%)",
+                overview.up_count,
+                overview.down_count,
+                up_ratio * 100.0
+            ));
         } else if up_ratio >= 0.5 {
             score += 10;
-            bullets.push(format!("📊 涨多跌少 ({} / {})", overview.up_count, overview.down_count));
+            bullets.push(format!(
+                "📊 涨多跌少 ({} / {})",
+                overview.up_count, overview.down_count
+            ));
         } else if up_ratio >= 0.3 {
             score -= 10;
-            bullets.push(format!("📉 跌多涨少 ({} / {})", overview.up_count, overview.down_count));
+            bullets.push(format!(
+                "📉 跌多涨少 ({} / {})",
+                overview.up_count, overview.down_count
+            ));
         } else {
             score -= 30;
-            bullets.push(format!("💀 普跌 ({} 上 / {} 下)", overview.up_count, overview.down_count));
+            bullets.push(format!(
+                "💀 普跌 ({} 上 / {} 下)",
+                overview.up_count, overview.down_count
+            ));
         }
     }
 
@@ -383,10 +398,16 @@ fn judge_market_sentiment(overview: &MarketOverview) -> MarketSentiment {
         let ratio = overview.limit_up_count as f64 / total_limit as f64;
         if ratio >= 0.8 && overview.limit_up_count >= 30 {
             score += 20;
-            bullets.push(format!("🚀 投机热 (涨停 {} / 跌停 {})", overview.limit_up_count, overview.limit_down_count));
+            bullets.push(format!(
+                "🚀 投机热 (涨停 {} / 跌停 {})",
+                overview.limit_up_count, overview.limit_down_count
+            ));
         } else if ratio <= 0.3 {
             score -= 20;
-            bullets.push(format!("🥶 投机冷 (涨停 {} / 跌停 {})", overview.limit_up_count, overview.limit_down_count));
+            bullets.push(format!(
+                "🥶 投机冷 (涨停 {} / 跌停 {})",
+                overview.limit_up_count, overview.limit_down_count
+            ));
         }
     }
 
@@ -415,24 +436,47 @@ fn judge_market_sentiment(overview: &MarketOverview) -> MarketSentiment {
     if let (Some(sh), Some(sz)) = (sh_index, sz_index) {
         if sh.change_pct > 0.5 && sz.change_pct > 0.5 {
             score += 10;
-            bullets.push(format!("💪 沪深双涨 (上证 {:+.2}%, 深证 {:+.2}%)", sh.change_pct, sz.change_pct));
+            bullets.push(format!(
+                "💪 沪深双涨 (上证 {:+.2}%, 深证 {:+.2}%)",
+                sh.change_pct, sz.change_pct
+            ));
         } else if sh.change_pct < -0.5 && sz.change_pct < -0.5 {
             score -= 10;
-            bullets.push(format!("😰 沪深双跌 (上证 {:+.2}%, 深证 {:+.2}%)", sh.change_pct, sz.change_pct));
+            bullets.push(format!(
+                "😰 沪深双跌 (上证 {:+.2}%, 深证 {:+.2}%)",
+                sh.change_pct, sz.change_pct
+            ));
         } else {
-            bullets.push(format!("😐 沪深分化 (上证 {:+.2}%, 深证 {:+.2}%)", sh.change_pct, sz.change_pct));
+            bullets.push(format!(
+                "😐 沪深分化 (上证 {:+.2}%, 深证 {:+.2}%)",
+                sh.change_pct, sz.change_pct
+            ));
         }
     }
 
     // 5. 板块普涨普跌
     if !overview.top_sectors.is_empty() && !overview.bottom_sectors.is_empty() {
-        let avg_top: f64 = overview.top_sectors.iter().map(|s| s.change_pct).sum::<f64>() / overview.top_sectors.len() as f64;
-        let avg_bottom: f64 = overview.bottom_sectors.iter().map(|s| s.change_pct).sum::<f64>() / overview.bottom_sectors.len() as f64;
+        let avg_top: f64 = overview
+            .top_sectors
+            .iter()
+            .map(|s| s.change_pct)
+            .sum::<f64>()
+            / overview.top_sectors.len() as f64;
+        let avg_bottom: f64 = overview
+            .bottom_sectors
+            .iter()
+            .map(|s| s.change_pct)
+            .sum::<f64>()
+            / overview.bottom_sectors.len() as f64;
         if avg_top > 3.0 && avg_bottom < 0.0 {
             score += 10;
-            bullets.push(format!("🎯 板块轮动明显 (领涨均 {avg_top:+.1}% / 涨幅靠后均 {avg_bottom:+.1}%)"));
+            bullets.push(format!(
+                "🎯 板块轮动明显 (领涨均 {avg_top:+.1}% / 涨幅靠后均 {avg_bottom:+.1}%)"
+            ));
         } else if avg_top < 1.0 && avg_bottom > -1.0 {
-            bullets.push(format!("🌀 板块分化弱 (领涨均 {avg_top:+.1}% / 靠后均 {avg_bottom:+.1}%)"));
+            bullets.push(format!(
+                "🌀 板块分化弱 (领涨均 {avg_top:+.1}% / 靠后均 {avg_bottom:+.1}%)"
+            ));
             score -= 5;
         }
     }
@@ -450,7 +494,10 @@ fn judge_market_sentiment(overview: &MarketOverview) -> MarketSentiment {
         "🔴 极弱: 系统性风险, 防御为主"
     };
 
-    MarketSentiment { headline: headline.to_string(), bullets }
+    MarketSentiment {
+        headline: headline.to_string(),
+        bullets,
+    }
 }
 
 // =============================================================================

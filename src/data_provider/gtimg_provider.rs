@@ -1,10 +1,10 @@
 //! 腾讯财经数据提供者
-//! 
+//!
 //! 通过腾讯财经API获取股票数据
 //! API文档: http://qt.gtimg.cn
 
 use super::{DataProvider, KlineData, RealtimeQuote};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use chrono::NaiveDate;
 use std::future::Future;
 
@@ -74,9 +74,11 @@ impl GtimgProvider {
     /// 创建新的提供者
     pub fn new() -> Result<Self> {
         // 修复 Top10#7 (2026-06-29 audit): 用 SHARED_TENCENT_HTTP_CLIENT 共享 client
-        Ok(Self { client: crate::http_client::SHARED_TENCENT_HTTP_CLIENT.clone() })
+        Ok(Self {
+            client: crate::http_client::SHARED_TENCENT_HTTP_CLIENT.clone(),
+        })
     }
-    
+
     /// 公开方法：获取实时行情（用于其他数据提供者调用）
     pub fn fetch_realtime_quote(&self, code: &str) -> Result<Option<RealtimeQuote>> {
         self.get_realtime_quote(code)
@@ -102,12 +104,16 @@ impl GtimgProvider {
         // F::Output = T, block_on_async 返回 T, 用 Ok() 包装
         Ok(crate::block_on_async::<F, T>(fut))
     }
-    
+
     /// 从腾讯财经API获取K线数据（异步版本）
-    pub(crate) async fn fetch_kline_data_internal(client: &reqwest::Client, code: &str, days: usize) -> Result<Vec<KlineData>> {
+    pub(crate) async fn fetch_kline_data_internal(
+        client: &reqwest::Client,
+        code: &str,
+        days: usize,
+    ) -> Result<Vec<KlineData>> {
         let (normalized_code, market_code) = Self::normalize_for_tencent(code)
             .ok_or_else(|| anyhow!("无效股票代码格式: {}", code))?;
-        
+
         // 腾讯财经K线API
         // ktype: day(日线), week(周线), month(月线)
         // 优先 HTTPS，避免部分网络环境下 HTTP 被网关重定向/拦截返回 HTML。
@@ -115,16 +121,16 @@ impl GtimgProvider {
             "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={},day,,,{},qfq",
             market_code, days
         );
-        
+
         log::debug!("[腾讯] 请求URL: {}", url);
-        
+
         // 发送请求
         let response = client
             .get(&url)
             .header("Referer", "http://gu.qq.com/")
             .send()
             .await;
-        
+
         let response = match response {
             Ok(resp) => resp,
             Err(e) => {
@@ -132,14 +138,14 @@ impl GtimgProvider {
                 return Err(anyhow!("HTTP请求失败: {}", e));
             }
         };
-        
+
         if !response.status().is_success() {
             log::error!("[腾讯] 响应状态码: {} (code={})", response.status(), code);
             return Err(anyhow!("HTTP请求返回错误状态: {}", response.status()));
         }
-        
+
         let text = response.text().await.context("读取响应失败")?;
-        
+
         if text.is_empty() {
             log::error!("[腾讯] 响应为空 (code={})", code);
             return Err(anyhow!("API返回空响应"));
@@ -153,18 +159,25 @@ impl GtimgProvider {
                 preview
             ));
         }
-        
+
         log::debug!("[腾讯] 响应前200字符: {}", &text[..text.len().min(200)]);
-        
+
         // 解析JSON
         let mut klines = Self::parse_kline_response_internal(&text, &normalized_code)?;
-        
+
         // 获取实时行情数据，补充盈利指标到最新K线
         if !klines.is_empty() {
-            log::info!("[腾讯] {} K线数据条数: {}, 最新K线日期: {}, 收盘价: {:.2}元", 
-                code, klines.len(), klines[0].date, klines[0].close);
-            
-            if let Ok(Some(quote)) = Self::fetch_realtime_quote_internal(client, &normalized_code).await {
+            log::info!(
+                "[腾讯] {} K线数据条数: {}, 最新K线日期: {}, 收盘价: {:.2}元",
+                code,
+                klines.len(),
+                klines[0].date,
+                klines[0].close
+            );
+
+            if let Ok(Some(quote)) =
+                Self::fetch_realtime_quote_internal(client, &normalized_code).await
+            {
                 // v11 P0-2 (commit 2): 修复盘中价污染
                 // 之前: latest.close = quote.price → Sharpe 等指标用盘中价滚动算
                 // 现在: 盘中价放 intraday_price, close 保持日线 settled 值
@@ -186,61 +199,65 @@ impl GtimgProvider {
                 log::warn!("[腾讯] {} 无法获取实时行情数据", code);
             }
         }
-        
+
         Ok(klines)
     }
-    
+
     /// 解析K线响应
     fn parse_kline_response_internal(text: &str, code: &str) -> Result<Vec<KlineData>> {
         use serde_json::Value;
-        
-        let json: Value = serde_json::from_str(text)
-            .context("解析JSON失败")?;
-        
+
+        let json: Value = serde_json::from_str(text).context("解析JSON失败")?;
+
         // 获取K线数据数组
         // 数据路径: data.{market_code}.day 或 data.{market_code}.qfqday
         let (_, market_code) = Self::normalize_for_tencent(code)
             .ok_or_else(|| anyhow!("无效股票代码格式: {}", code))?;
-        
+
         let klines = json["data"][&market_code]["qfqday"]
             .as_array()
             .or_else(|| json["data"][&market_code]["day"].as_array())
             .ok_or_else(|| anyhow!("未找到K线数据"))?;
-        
+
         let mut result: Vec<KlineData> = Vec::with_capacity(klines.len());
-        
+
         for kline in klines {
-            let kline_array = kline.as_array()
-                .ok_or_else(|| anyhow!("K线数据格式错误"))?;
-            
+            let kline_array = kline.as_array().ok_or_else(|| anyhow!("K线数据格式错误"))?;
+
             if kline_array.len() < 6 {
                 log::warn!("[腾讯] K线数据字段不足: {:?}", kline_array);
                 continue;
             }
-            
+
             // 腾讯K线格式: [日期, 开, 收, 高, 低, 成交量]
             // 例: ["2026-01-23", "14.22", "15.00", "15.49", "14.22", "335918000"]
-            let date_str = kline_array[0].as_str()
+            let date_str = kline_array[0]
+                .as_str()
                 .ok_or_else(|| anyhow!("日期格式错误"))?;
             let date = NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
                 .context(format!("解析日期失败: {}", date_str))?;
-            
-            let open: f64 = kline_array[1].as_str()
+
+            let open: f64 = kline_array[1]
+                .as_str()
                 .ok_or_else(|| anyhow!("开盘价格式错误"))?
                 .parse()?;
-            let close: f64 = kline_array[2].as_str()
+            let close: f64 = kline_array[2]
+                .as_str()
                 .ok_or_else(|| anyhow!("收盘价格式错误"))?
                 .parse()?;
-            let high: f64 = kline_array[3].as_str()
+            let high: f64 = kline_array[3]
+                .as_str()
                 .ok_or_else(|| anyhow!("最高价格式错误"))?
                 .parse()?;
-            let low: f64 = kline_array[4].as_str()
+            let low: f64 = kline_array[4]
+                .as_str()
                 .ok_or_else(|| anyhow!("最低价格式错误"))?
                 .parse()?;
-            let volume: f64 = kline_array[5].as_str()
+            let volume: f64 = kline_array[5]
+                .as_str()
                 .ok_or_else(|| anyhow!("成交量格式错误"))?
                 .parse()?;
-            
+
             // 计算涨跌幅和成交额
             let pct_chg = if result.is_empty() {
                 0.0
@@ -248,9 +265,9 @@ impl GtimgProvider {
                 let prev_close = result.last().unwrap().close;
                 ((close - prev_close) / prev_close) * 100.0
             };
-            
+
             let amount = volume * close; // 简单估算成交额
-            
+
             let kline_data = KlineData {
                 date,
                 open,
@@ -260,8 +277,9 @@ impl GtimgProvider {
                 volume,
                 amount,
                 pct_chg,
-                intraday_price: None, settled: true,
-                pe_ratio: None,        // K线数据中不包含，需要从实时行情获取
+                intraday_price: None,
+                settled: true,
+                pe_ratio: None, // K线数据中不包含，需要从实时行情获取
                 pb_ratio: None,
                 turnover_rate: None,
                 market_cap: None,
@@ -282,16 +300,16 @@ impl GtimgProvider {
                 is_suspended: false,
                 adjust: crate::data_provider::AdjustType::Qfq, // 腾讯 URL ,qfq 前复权
             };
-            
+
             result.push(kline_data);
         }
-        
+
         // 按日期降序排序（最新的在前）
         result.sort_by(|a, b| b.date.cmp(&a.date));
-        
+
         Ok(result)
     }
-    
+
     /// 获取股票名称（静态异步方法）
     async fn fetch_stock_name_internal(client: &reqwest::Client, code: &str) -> Option<String> {
         let (_, market_code) = Self::normalize_for_tencent(code)?;
@@ -299,7 +317,8 @@ impl GtimgProvider {
         // 使用腾讯实时行情接口获取股票名称
         let url = format!("http://qt.gtimg.cn/q={}", market_code);
 
-        match client.get(&url)
+        match client
+            .get(&url)
             .header("Referer", "http://gu.qq.com/")
             .timeout(std::time::Duration::from_secs(5))
             .send()
@@ -324,7 +343,11 @@ impl GtimgProvider {
                                     log::debug!("[腾讯] 获取股票名称: {} -> {}", code, name);
                                     return Some(name);
                                 }
-                                log::debug!("[腾讯] 股票名称解析失败: code={}, text={}", code, text);
+                                log::debug!(
+                                    "[腾讯] 股票名称解析失败: code={}, text={}",
+                                    code,
+                                    text
+                                );
                             }
                         }
                     }
@@ -336,15 +359,19 @@ impl GtimgProvider {
         }
         None
     }
-    
+
     /// 获取实时行情（包含盈利指标）
-    async fn fetch_realtime_quote_internal(client: &reqwest::Client, code: &str) -> Result<Option<RealtimeQuote>> {
+    async fn fetch_realtime_quote_internal(
+        client: &reqwest::Client,
+        code: &str,
+    ) -> Result<Option<RealtimeQuote>> {
         let (normalized_code, market_code) = Self::normalize_for_tencent(code)
             .ok_or_else(|| anyhow!("无效股票代码格式: {}", code))?;
-        
+
         let url = format!("http://qt.gtimg.cn/q={}", market_code);
-        
-        match client.get(&url)
+
+        match client
+            .get(&url)
             .header("Referer", "http://gu.qq.com/")
             .timeout(std::time::Duration::from_secs(5))
             .send()
@@ -365,7 +392,7 @@ impl GtimgProvider {
                                 // 0: 未知 1: 名称 2: 代码 3: 当前价 4: 昨收 5: 今开
                                 // 6: 成交量(手) 7: 外盘 8: 内盘 9: 买一 10: 买一量
                                 // ...
-                                // 33: 涨跌幅% 
+                                // 33: 涨跌幅%
                                 // 38: 换手率%
                                 // 39: 市盈率(PE)
                                 // 40: (空)
@@ -381,7 +408,7 @@ impl GtimgProvider {
                                 // 50-52: 未知
                                 // 53: 市盈率(TTM)
                                 // ...更多字段待研究
-                                
+
                                 if parts.len() >= 47 {
                                     let price = parts[3].parse::<f64>().unwrap_or(0.0);
                                     let prev_close = parts[4].parse::<f64>().unwrap_or(0.0);
@@ -390,7 +417,7 @@ impl GtimgProvider {
                                     } else {
                                         0.0
                                     };
-                                    
+
                                     let quote = RealtimeQuote {
                                         code: normalized_code,
                                         name: parts[1].to_string(),
@@ -400,7 +427,9 @@ impl GtimgProvider {
                                         // parts[39] 是动态市盈率/TTM，某些股容易飘
                                         // parts[52] 是静态（部分软件展示的TTM或东财展示的值更接近这个）或者 TTM的另一种算法。
                                         // 东财对于大港显示 69.29，而部分[52]下恰好就是 69.29 (参考打印日志)
-                                        pe_ratio: parts[52].parse::<f64>().unwrap_or_else(|_| parts[39].parse::<f64>().unwrap_or(0.0)),
+                                        pe_ratio: parts[52].parse::<f64>().unwrap_or_else(|_| {
+                                            parts[39].parse::<f64>().unwrap_or(0.0)
+                                        }),
                                         pb_ratio: parts[46].parse::<f64>().unwrap_or(0.0),
                                         turnover_rate: parts[38].parse::<f64>().unwrap_or(0.0),
                                         market_cap: parts[45].parse::<f64>().unwrap_or(0.0), // 已经是亿为单位
@@ -408,7 +437,7 @@ impl GtimgProvider {
                                         volume: parts[6].parse::<f64>().unwrap_or(0.0) * 100.0, // 手 -> 股
                                         amount: parts[37].parse::<f64>().unwrap_or(0.0) * 10000.0, // 万 -> 元
                                     };
-                                    
+
                                     return Ok(Some(quote));
                                 }
                             }
@@ -452,20 +481,20 @@ impl DataProvider for GtimgProvider {
 
         Ok(data)
     }
-    
+
     fn get_stock_name(&self, code: &str) -> Option<String> {
         let client = self.client.clone();
         let code_str = code.to_string();
-        
+
         let result = Self::run_async_blocking_value(async move {
             Self::fetch_stock_name_internal(&client, &code_str).await
         })
         .ok()
         .flatten();
-        
+
         result.or_else(|| Some(format!("股票{}", code)))
     }
-    
+
     fn get_realtime_quote(&self, code: &str) -> Result<Option<RealtimeQuote>> {
         let client = self.client.clone();
         let code_str = code.to_string();
@@ -474,7 +503,7 @@ impl DataProvider for GtimgProvider {
             Self::fetch_realtime_quote_internal(&client, &code_str).await
         })
     }
-    
+
     fn name(&self) -> &'static str {
         "腾讯财经"
     }
@@ -496,23 +525,23 @@ mod tests {
         ];
 
         for (input, expected_code, expected_market_code) in cases {
-            let (code, market_code) = GtimgProvider::normalize_for_tencent(input)
-                .expect("规范化不应失败");
+            let (code, market_code) =
+                GtimgProvider::normalize_for_tencent(input).expect("规范化不应失败");
             assert_eq!(code, expected_code);
             assert_eq!(market_code, expected_market_code);
         }
     }
-    
+
     #[test]
     fn test_get_stock_name() {
         let provider = GtimgProvider::new().unwrap();
-        
+
         let test_codes = vec![
             "600519", // 贵州茅台
             "000001", // 平安银行
             "002413", // 雷科防务
         ];
-        
+
         for code in test_codes {
             if let Some(name) = provider.get_stock_name(code) {
                 println!("{} -> {}", code, name);
@@ -520,12 +549,12 @@ mod tests {
             }
         }
     }
-    
+
     #[test]
     fn test_get_daily_data() {
         let provider = GtimgProvider::new().unwrap();
         let result = provider.get_daily_data("600519", 30);
-        
+
         match result {
             Ok(data) => {
                 assert!(!data.is_empty(), "数据不应为空");
@@ -567,18 +596,14 @@ mod tests {
             .filter(|s| !s.is_empty());
         assert!(name.is_none(), "单元素应返回 None (避免空 name)");
     }
-    
+
     #[test]
     fn test_different_markets() {
         let provider = GtimgProvider::new().unwrap();
-        
+
         // 测试不同市场的股票
-        let test_codes = vec![
-            ("600519", "上海"),
-            ("000001", "深圳"),
-            ("300750", "创业板"),
-        ];
-        
+        let test_codes = vec![("600519", "上海"), ("000001", "深圳"), ("300750", "创业板")];
+
         for (code, market) in test_codes {
             println!("\n测试 {} 市场股票: {}", market, code);
             match provider.get_daily_data(code, 5) {

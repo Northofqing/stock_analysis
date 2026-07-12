@@ -10,7 +10,7 @@
 
 use chrono::NaiveDate;
 use diesel::prelude::*;
-use diesel::r2d2::{ConnectionManager, Pool, PooledConnection};
+use diesel::r2d2::{ConnectionManager, CustomizeConnection, Pool, PooledConnection};
 use log::info;
 use once_cell::sync::OnceCell;
 use std::collections::HashMap;
@@ -37,11 +37,32 @@ pub struct DatabaseManager {
 
 static DB_INSTANCE: OnceCell<DatabaseManager> = OnceCell::new();
 
+#[derive(Debug)]
+struct SqlitePragmaCustomizer;
+
+impl CustomizeConnection<SqliteConnection, diesel::r2d2::Error> for SqlitePragmaCustomizer {
+    fn on_acquire(&self, conn: &mut SqliteConnection) -> Result<(), diesel::r2d2::Error> {
+        diesel::sql_query("PRAGMA journal_mode = WAL")
+            .execute(conn)
+            .map_err(diesel::r2d2::Error::QueryError)?;
+        diesel::sql_query("PRAGMA synchronous = NORMAL")
+            .execute(conn)
+            .map_err(diesel::r2d2::Error::QueryError)?;
+        diesel::sql_query("PRAGMA busy_timeout = 5000")
+            .execute(conn)
+            .map_err(diesel::r2d2::Error::QueryError)?;
+        diesel::sql_query("PRAGMA wal_autocheckpoint = 1000")
+            .execute(conn)
+            .map_err(diesel::r2d2::Error::QueryError)?;
+        Ok(())
+    }
+}
+
 pub mod factor_snapshot;
 pub mod repository;
 // v12 MVP-5 §8.1
 pub(crate) mod agent_logs;
-pub mod concepts;  // v15.1: 公开供 push_templates 集成使用
+pub mod concepts; // v15.1: 公开供 push_templates 集成使用
 pub mod execution_tracking;
 mod kline;
 mod lhb;
@@ -73,7 +94,10 @@ impl DatabaseManager {
         info!("初始化数据库: {}", database_url);
 
         let manager = ConnectionManager::<SqliteConnection>::new(database_url);
-        let pool = Pool::builder().max_size(10).build(manager)?;
+        let pool = Pool::builder()
+            .max_size(10)
+            .connection_customizer(Box::new(SqlitePragmaCustomizer))
+            .build(manager)?;
 
         // 运行迁移
         let mut conn = pool.get()?;
@@ -134,6 +158,46 @@ impl DatabaseManager {
                 PRIMARY KEY (date, concept)
             )
             "#,
+        )
+        .execute(&mut *conn)?;
+
+        // B-002 板块联动归因 (Board hit) 落库表 — 与 chain_daily 并列,
+        //       供 NewsCatalyst 推送读取今日 top cluster.
+        diesel::sql_query(
+            r#"
+            CREATE TABLE IF NOT EXISTS board_rotation_daily (
+                date TEXT NOT NULL,
+                board_code TEXT NOT NULL,
+                board_name TEXT NOT NULL,
+                news_title TEXT NOT NULL,
+                board_change_pct REAL NOT NULL DEFAULT 0,
+                board_main_net_pct REAL NOT NULL DEFAULT 0,
+                stocks TEXT NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (date, board_code)
+            )
+            "#,
+        )
+        .execute(&mut *conn)?;
+
+        // B-003 事件抽取去重 (simhash + LCS) — 跨批次跨日去重,
+        //       防「苹果折叠屏」类事件在 3+ 天内重复推送.
+        diesel::sql_query(
+            r#"
+            CREATE TABLE IF NOT EXISTS event_seen_simhash (
+                simhash INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                seen_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (simhash)
+            )
+            "#,
+        )
+        .execute(&mut *conn)?;
+        // CR-8 (review): get_recent_event_seen 用 `WHERE seen_at >= ?` 全表扫,
+        //              表行数 > 5000 时变慢. 加 (seen_at) 索引.
+        diesel::sql_query(
+            "CREATE INDEX IF NOT EXISTS idx_event_seen_simhash_seen_at \
+             ON event_seen_simhash (seen_at)",
         )
         .execute(&mut *conn)?;
 
@@ -446,8 +510,11 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         // T-16 ST 涨跌幅变更 dispatcher 数据源. 由 --backfill-st-type 从 name 字段回填,
         // 后续 broker/exchange 推送时更新. 无 CHECK 约束 (SQLite ALTER ADD COLUMN 不支持)
         Self::add_column_if_missing(conn, "stock_position", "st_type", "TEXT")?;
-        diesel::sql_query("CREATE INDEX IF NOT EXISTS idx_stock_position_st_type ON stock_position(st_type)")
-            .execute(&mut *conn).ok();
+        diesel::sql_query(
+            "CREATE INDEX IF NOT EXISTS idx_stock_position_st_type ON stock_position(st_type)",
+        )
+        .execute(&mut *conn)
+        .ok();
 
         // trades 表（v3 每笔买卖独立记录，与 stock_position 互补）
         diesel::sql_query(
@@ -740,7 +807,7 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         &self,
         item: &crate::data_provider::news_item::NewsItem,
     ) -> Result<(), String> {
-        use crate::data_provider::news_item::NewsItem;
+        
         use diesel::sql_types::{BigInt, Text};
         let mut conn = self.get_conn().map_err(|e| e.to_string())?;
         diesel::sql_query(
@@ -1014,11 +1081,15 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         //    防护失效. 改为返回 Result 错误, 调用方决定如何处理.
         // 2. 用 diesel prepared statement + ? bind 走参数化, 彻底消除字符串拼接风险.
         for c in stock_codes {
-            if !c.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-') {
+            if !c
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+            {
                 return Err(format!(
                     "count_recent_pushes_batch: stock_code must be alphanumeric/_/-, got {:?}",
                     c
-                ).into());
+                )
+                .into());
             }
         }
         let mut conn = self.get_conn()?;
@@ -1335,7 +1406,11 @@ mod tests {
             .filter(stock_position::code.eq("600090"))
             .first(&mut conn)
             .expect("query 失败");
-        assert_eq!(row.st_type.as_deref(), Some("*ST"), "st_type 写入/读出不一致");
+        assert_eq!(
+            row.st_type.as_deref(),
+            Some("*ST"),
+            "st_type 写入/读出不一致"
+        );
         assert_eq!(row.code, "600090");
         assert_eq!(row.name, "*ST测试");
         assert_eq!(row.quantity, 1000);
@@ -1358,7 +1433,11 @@ mod tests {
             .first(&mut conn)
             .expect("re-query 失败");
         assert_eq!(row2.st_type.as_deref(), Some("ST"), "upsert st_type 未同步");
-        assert_eq!(row2.chain_name.as_deref(), Some("化工"), "upsert chain_name 未同步");
+        assert_eq!(
+            row2.chain_name.as_deref(),
+            Some("化工"),
+            "upsert chain_name 未同步"
+        );
         assert_eq!(row2.name, "*ST测试改名", "upsert name 未同步");
 
         // 4. 清理
@@ -1386,9 +1465,9 @@ mod tests {
         let cases = vec![
             ("TEST001", "ST康美", Some("ST")),
             ("TEST002", "*ST华微", Some("*ST")),
-            ("TEST003", "BEST新材", None),    // 子串含 ST 但不是 ST 类
-            ("TEST004", "GST电子", None),     // 子串含 ST 但不是 ST 类
-            ("TEST005", "浦发银行", None),    // 普通
+            ("TEST003", "BEST新材", None), // 子串含 ST 但不是 ST 类
+            ("TEST004", "GST电子", None),  // 子串含 ST 但不是 ST 类
+            ("TEST005", "浦发银行", None), // 普通
             ("TEST006", "SST集成", Some("ST")),
             ("TEST007", "S*ST海伦", Some("*ST")),
         ];
@@ -1402,7 +1481,8 @@ mod tests {
                 status: "open".to_string(),
                 st_type: None,
                 chain_name: None,
-            }).expect("save 失败");
+            })
+            .expect("save 失败");
         }
 
         // 跑 backfill
@@ -1417,7 +1497,8 @@ mod tests {
                 .first(&mut conn)
                 .expect("query 失败");
             assert_eq!(
-                row.st_type.as_deref(), *expected,
+                row.st_type.as_deref(),
+                *expected,
                 "code={code} name={name} expected={expected:?} got={:?}",
                 row.st_type
             );
@@ -1454,32 +1535,38 @@ mod tests {
             status: "open".to_string(),
             st_type: None,
             chain_name: None,
-        }).expect("save 1 失败");
+        })
+        .expect("save 1 失败");
 
         // 2. 模拟 broker 推送 *ST (用 raw SQL 写, 模拟 broker update path)
         let mut conn = db.get_conn().unwrap();
         diesel::sql_query("UPDATE stock_position SET st_type = '*ST' WHERE code = '600519'")
-            .execute(&mut conn).expect("st_type set 失败");
+            .execute(&mut conn)
+            .expect("st_type set 失败");
 
         // 3. trading::open_position re-buy 同 (code, buy_date) — 传 None
         db.save_position(&NewStockPosition {
             code: "600519".to_string(),
             name: "贵州茅台".to_string(),
             buy_date: "2026-07-01".to_string(),
-            buy_price: 1850.0,  // 价格变 (新买入)
-            quantity: 200,       // 数量变
+            buy_price: 1850.0, // 价格变 (新买入)
+            quantity: 200,     // 数量变
             status: "open".to_string(),
-            st_type: None,        // 重买不带 st_type
-            chain_name: None,     // 重买不带 chain
-        }).expect("save 2 失败");
+            st_type: None,    // 重买不带 st_type
+            chain_name: None, // 重买不带 chain
+        })
+        .expect("save 2 失败");
 
         // 4. 验证: st_type 应保持 '*ST' (COALESCE 保 NULL 时不覆盖), 价格/数量更新
         let row: StockPosition = stock_position::table
             .filter(stock_position::code.eq("600519"))
             .first(&mut conn)
             .expect("re-query 失败");
-        assert_eq!(row.st_type.as_deref(), Some("*ST"),
-            "st_type 应保持 broker 推送的 *ST, 不应被 re-buy NULL 覆盖");
+        assert_eq!(
+            row.st_type.as_deref(),
+            Some("*ST"),
+            "st_type 应保持 broker 推送的 *ST, 不应被 re-buy NULL 覆盖"
+        );
         assert_eq!(row.buy_price, 1850.0, "价格应更新");
         assert_eq!(row.quantity, 200, "数量应更新");
 

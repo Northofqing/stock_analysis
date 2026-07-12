@@ -2,18 +2,18 @@
 //!
 //! 设计: 胜率/盈亏比/最大回撤/MFE/MAE/执行率. 样本不足显式标注.
 
-use chrono::Local;
 use crate::opportunity::news_ranker::HeatStage;
+use chrono::Local;
 
 /// 三维分组
 #[derive(Debug, Clone)]
 pub struct PerformanceGroup {
     pub sample_count: usize,
-    pub win_rate: Option<f64>,       // None = 样本不足不出结论
+    pub win_rate: Option<f64>, // None = 样本不足不出结论
     pub avg_pnl_pct: Option<f64>,
     pub max_drawdown_pct: Option<f64>,
-    pub mfe: Option<f64>,            // Max Favorable Excursion
-    pub mae: Option<f64>,            // Max Adverse Excursion
+    pub mfe: Option<f64>, // Max Favorable Excursion
+    pub mae: Option<f64>, // Max Adverse Excursion
 }
 
 impl PerformanceGroup {
@@ -51,7 +51,10 @@ pub struct PerformanceReport {
 /// 渲染报告
 pub fn render_performance(report: &PerformanceReport) -> String {
     let mut s = String::new();
-    s.push_str(&format!("📊 性能反馈报告（{}）\n", Local::now().format("%Y-%m-%d")));
+    s.push_str(&format!(
+        "📊 性能反馈报告（{}）\n",
+        Local::now().format("%Y-%m-%d")
+    ));
     if report.by_reason.is_empty() && report.by_failure.is_empty() && report.by_stage.is_empty() {
         s.push_str("样本不足 (三维分组都为空), 不出结论\n");
         return s;
@@ -73,10 +76,22 @@ fn render_group(s: &mut String, key: &str, g: &PerformanceGroup) {
         s.push_str(&format!("  {}: 样本不足 ({})\n", key, g.sample_count));
         return;
     }
-    let win = g.win_rate.map(|w| format!("{:.1}%", w * 100.0)).unwrap_or_else(|| "N/A".into());
-    let avg = g.avg_pnl_pct.map(|p| format!("{:+.2}%", p)).unwrap_or_else(|| "N/A".into());
-    let mfe = g.mfe.map(|m| format!("{:+.2}%", m)).unwrap_or_else(|| "N/A".into());
-    let mae = g.mae.map(|m| format!("{:+.2}%", m)).unwrap_or_else(|| "N/A".into());
+    let win = g
+        .win_rate
+        .map(|w| format!("{:.1}%", w * 100.0))
+        .unwrap_or_else(|| "N/A".into());
+    let avg = g
+        .avg_pnl_pct
+        .map(|p| format!("{:+.2}%", p))
+        .unwrap_or_else(|| "N/A".into());
+    let mfe = g
+        .mfe
+        .map(|m| format!("{:+.2}%", m))
+        .unwrap_or_else(|| "N/A".into());
+    let mae = g
+        .mae
+        .map(|m| format!("{:+.2}%", m))
+        .unwrap_or_else(|| "N/A".into());
     s.push_str(&format!(
         "  {}: 样本{} 胜率{} 均收益{} MFE{} MAE{}\n",
         key, g.sample_count, win, avg, mfe, mae,
@@ -84,8 +99,7 @@ fn render_group(s: &mut String, key: &str, g: &PerformanceGroup) {
 }
 
 /// 聚合: 计算胜率/均收益 (从 paper_trades 历史 + prediction_tracker)
-pub fn compute_group(
-    pnls: &[f64],   // 每笔虚拟腿的盈亏 (%)
+pub fn compute_group(pnls: &[f64], // 每笔虚拟腿的盈亏 (%)
 ) -> PerformanceGroup {
     let sample_count = pnls.len();
     if sample_count == 0 {
@@ -109,9 +123,13 @@ pub fn compute_group(
     let mut max_dd = 0.0;
     for p in pnls {
         cumulative += p;
-        if cumulative > peak { peak = cumulative; }
+        if cumulative > peak {
+            peak = cumulative;
+        }
         let dd = peak - cumulative;
-        if dd > max_dd { max_dd = dd; }
+        if dd > max_dd {
+            max_dd = dd;
+        }
     }
     PerformanceGroup {
         sample_count,
@@ -139,7 +157,7 @@ mod tests {
         let pnls = vec![1.0, 2.0, -1.0, 3.0, -2.0];
         let g = compute_group(&pnls);
         assert_eq!(g.sample_count, 5);
-        assert_eq!(g.win_rate, Some(0.6));  // 3/5
+        assert_eq!(g.win_rate, Some(0.6)); // 3/5
         assert!(g.mfe.unwrap() >= 3.0);
         assert!(g.mae.unwrap() <= -2.0);
         assert!(g.is_under_sampled());

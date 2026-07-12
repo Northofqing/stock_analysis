@@ -37,7 +37,7 @@ impl GeminiAnalyzer {
 
         // 构建简化的分析上下文
         let latest = &kline_data[0];
-        
+
         // 基础行情数据
         let mut context = format!(
             "股票代码: {}\n\
@@ -76,10 +76,18 @@ impl GeminiAnalyzer {
         let ma60 = calc_ma(60);
 
         context.push_str("\n【均线系统】\n");
-        if let Some(v) = ma5 { context.push_str(&format!("MA5: {:.2}\n", v)); }
-        if let Some(v) = ma10 { context.push_str(&format!("MA10: {:.2}\n", v)); }
-        if let Some(v) = ma20 { context.push_str(&format!("MA20: {:.2}\n", v)); }
-        if let Some(v) = ma60 { context.push_str(&format!("MA60: {:.2}\n", v)); }
+        if let Some(v) = ma5 {
+            context.push_str(&format!("MA5: {:.2}\n", v));
+        }
+        if let Some(v) = ma10 {
+            context.push_str(&format!("MA10: {:.2}\n", v));
+        }
+        if let Some(v) = ma20 {
+            context.push_str(&format!("MA20: {:.2}\n", v));
+        }
+        if let Some(v) = ma60 {
+            context.push_str(&format!("MA60: {:.2}\n", v));
+        }
 
         // 乖离率（仅数字）
         if let Some(m5) = ma5 {
@@ -123,19 +131,33 @@ impl GeminiAnalyzer {
         let is_gem = code.starts_with("300") || code.starts_with("301");
         let is_star = code.starts_with("688");
         let is_bj = code.starts_with("8") || code.starts_with("9") || code.starts_with("4");
-        let limit_pct = if is_gem || is_star { 20.0 }
-            else if is_bj { 30.0 }
-            else { 10.0 };
+        let limit_pct = if is_gem || is_star {
+            20.0
+        } else if is_bj {
+            30.0
+        } else {
+            10.0
+        };
         if latest.pct_chg >= limit_pct - 0.3 {
             let mut consec = 1;
             for k in kline_data[1..].iter().take(10) {
-                if k.pct_chg >= limit_pct - 0.3 { consec += 1; } else { break; }
+                if k.pct_chg >= limit_pct - 0.3 {
+                    consec += 1;
+                } else {
+                    break;
+                }
             }
-            context.push_str(&format!("\n【涨跌停】涨停 {}板 (涨停阈值 {}%)\n", consec, limit_pct));
+            context.push_str(&format!(
+                "\n【涨跌停】涨停 {}板 (涨停阈值 {}%)\n",
+                consec, limit_pct
+            ));
         } else if latest.pct_chg <= -(limit_pct - 0.3) {
             context.push_str(&format!("\n【涨跌停】跌停 (跌幅 {:.2}%)\n", latest.pct_chg));
         } else if latest.pct_chg >= 5.0 {
-            context.push_str(&format!("\n【涨跌停】大涨 {:.2}%（未涨停）\n", latest.pct_chg));
+            context.push_str(&format!(
+                "\n【涨跌停】大涨 {:.2}%（未涨停）\n",
+                latest.pct_chg
+            ));
         }
 
         // ========== MACD (6,13,5) ==========
@@ -143,7 +165,9 @@ impl GeminiAnalyzer {
             // 注意：kline_data[0] 是最新，计算 EMA 需要按时间顺序（旧→新）
             let mut chron: Vec<f64> = closes.iter().rev().copied().collect();
             // 仅取最近 60 根以提升效率（足够让 EMA 收敛）
-            if chron.len() > 120 { chron = chron[chron.len()-120..].to_vec(); }
+            if chron.len() > 120 {
+                chron = chron[chron.len() - 120..].to_vec();
+            }
             let ema = |period: usize, src: &[f64]| -> Vec<f64> {
                 let alpha = 2.0 / (period as f64 + 1.0);
                 let mut out = Vec::with_capacity(src.len());
@@ -157,22 +181,25 @@ impl GeminiAnalyzer {
             };
             let ema6 = ema(6, &chron);
             let ema13 = ema(13, &chron);
-            let diff: Vec<f64> = ema6.iter().zip(ema13.iter()).map(|(a,b)| a-b).collect();
+            let diff: Vec<f64> = ema6.iter().zip(ema13.iter()).map(|(a, b)| a - b).collect();
             let dea = ema(5, &diff);
             let n = diff.len();
-            let macd = 2.0 * (diff[n-1] - dea[n-1]);
-            let macd_signal = if diff[n-1] > dea[n-1] && n >= 2 && diff[n-2] <= dea[n-2] {
+            let macd = 2.0 * (diff[n - 1] - dea[n - 1]);
+            let macd_signal = if diff[n - 1] > dea[n - 1] && n >= 2 && diff[n - 2] <= dea[n - 2] {
                 "金叉"
-            } else if diff[n-1] < dea[n-1] && n >= 2 && diff[n-2] >= dea[n-2] {
+            } else if diff[n - 1] < dea[n - 1] && n >= 2 && diff[n - 2] >= dea[n - 2] {
                 "死叉"
-            } else if diff[n-1] > dea[n-1] {
+            } else if diff[n - 1] > dea[n - 1] {
                 "多头"
             } else {
                 "空头"
             };
             context.push_str(&format!(
                 "\n【MACD】DIF={:.3} DEA={:.3} HIST={:.3} {}\n",
-                diff[n-1], dea[n-1], macd, macd_signal
+                diff[n - 1],
+                dea[n - 1],
+                macd,
+                macd_signal
             ));
         }
 
@@ -182,18 +209,28 @@ impl GeminiAnalyzer {
             let mut gains = 0.0;
             let mut losses = 0.0;
             for i in 1..=14 {
-                let diff = chron[i] - chron[i-1];
-                if diff > 0.0 { gains += diff; } else { losses -= diff; }
+                let diff = chron[i] - chron[i - 1];
+                if diff > 0.0 {
+                    gains += diff;
+                } else {
+                    losses -= diff;
+                }
             }
             let mut avg_gain = gains / 14.0;
             let mut avg_loss = losses / 14.0;
             for i in 15..chron.len() {
-                let diff = chron[i] - chron[i-1];
-                let (g, l) = if diff > 0.0 { (diff, 0.0) } else { (0.0, -diff) };
+                let diff = chron[i] - chron[i - 1];
+                let (g, l) = if diff > 0.0 {
+                    (diff, 0.0)
+                } else {
+                    (0.0, -diff)
+                };
                 avg_gain = (avg_gain * 13.0 + g) / 14.0;
                 avg_loss = (avg_loss * 13.0 + l) / 14.0;
             }
-            let rsi = if avg_loss.abs() < 1e-9 { 100.0 } else {
+            let rsi = if avg_loss.abs() < 1e-9 {
+                100.0
+            } else {
                 100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
             };
             context.push_str(&format!("【RSI14】{:.2}\n", rsi));
@@ -218,26 +255,47 @@ impl GeminiAnalyzer {
                 let bar = chron[i];
                 // push bar 到 max_q (维护递减)
                 while let Some(&f) = max_q.front() {
-                    if chron[f].high <= bar.high { max_q.pop_front(); } else { break; }
+                    if chron[f].high <= bar.high {
+                        max_q.pop_front();
+                    } else {
+                        break;
+                    }
                 }
                 max_q.push_back(i);
                 // push bar 到 min_q (维护递增)
                 while let Some(&f) = min_q.front() {
-                    if chron[f].low >= bar.low { min_q.pop_front(); } else { break; }
+                    if chron[f].low >= bar.low {
+                        min_q.pop_front();
+                    } else {
+                        break;
+                    }
                 }
                 min_q.push_back(i);
                 // 弹出窗口外元素 (i - 40 之前)
                 while let Some(&f) = max_q.front() {
-                    if f < i.saturating_sub(39) { max_q.pop_front(); } else { break; }
+                    if f < i.saturating_sub(39) {
+                        max_q.pop_front();
+                    } else {
+                        break;
+                    }
                 }
                 while let Some(&f) = min_q.front() {
-                    if f < i.saturating_sub(39) { min_q.pop_front(); } else { break; }
+                    if f < i.saturating_sub(39) {
+                        min_q.pop_front();
+                    } else {
+                        break;
+                    }
                 }
-                if i < start { continue; }
+                if i < start {
+                    continue;
+                }
                 let hh = chron[max_q[0]].high;
                 let ll = chron[min_q[0]].low;
-                let rsv = if (hh - ll).abs() < 1e-9 { 50.0 }
-                    else { (bar.close - ll) / (hh - ll) * 100.0 };
+                let rsv = if (hh - ll).abs() < 1e-9 {
+                    50.0
+                } else {
+                    (bar.close - ll) / (hh - ll) * 100.0
+                };
                 k_val = alpha * rsv + (1.0 - alpha) * k_val;
                 d_val = alpha * k_val + (1.0 - alpha) * d_val;
             }
@@ -253,11 +311,19 @@ impl GeminiAnalyzer {
         let week52_len = data_len.min(250);
         if week52_len >= 5 {
             let week52_data = &kline_data[..week52_len];
-            let high_52w = week52_data.iter().map(|k| k.high).fold(f64::NEG_INFINITY, f64::max);
-            let low_52w = week52_data.iter().map(|k| k.low).fold(f64::INFINITY, f64::min);
+            let high_52w = week52_data
+                .iter()
+                .map(|k| k.high)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let low_52w = week52_data
+                .iter()
+                .map(|k| k.low)
+                .fold(f64::INFINITY, f64::min);
             let pos_in_range = if (high_52w - low_52w).abs() > 0.001 {
                 (latest.close - low_52w) / (high_52w - low_52w) * 100.0
-            } else { 50.0 };
+            } else {
+                50.0
+            };
             context.push_str(&format!(
                 "52周: H {:.2} / L {:.2} / 位置 {:.1}%\n",
                 high_52w, low_52w, pos_in_range
@@ -266,11 +332,19 @@ impl GeminiAnalyzer {
         let quarter_len = data_len.min(60);
         if quarter_len >= 5 {
             let quarter_data = &kline_data[..quarter_len];
-            let high_q = quarter_data.iter().map(|k| k.high).fold(f64::NEG_INFINITY, f64::max);
-            let low_q = quarter_data.iter().map(|k| k.low).fold(f64::INFINITY, f64::min);
+            let high_q = quarter_data
+                .iter()
+                .map(|k| k.high)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let low_q = quarter_data
+                .iter()
+                .map(|k| k.low)
+                .fold(f64::INFINITY, f64::min);
             let pos_q = if (high_q - low_q).abs() > 0.001 {
                 (latest.close - low_q) / (high_q - low_q) * 100.0
-            } else { 50.0 };
+            } else {
+                50.0
+            };
             context.push_str(&format!(
                 "季度: H {:.2} / L {:.2} / 位置 {:.1}%\n",
                 high_q, low_q, pos_q
@@ -281,7 +355,10 @@ impl GeminiAnalyzer {
         let recent_len = data_len.min(10);
         if recent_len >= 2 {
             context.push_str("\n【近期走势】\n");
-            let chg_5d: f64 = kline_data[..data_len.min(5)].iter().map(|k| k.pct_chg).sum();
+            let chg_5d: f64 = kline_data[..data_len.min(5)]
+                .iter()
+                .map(|k| k.pct_chg)
+                .sum();
             context.push_str(&format!("近5日累计涨幅: {:.2}%\n", chg_5d));
             if recent_len >= 10 {
                 let chg_10d: f64 = kline_data[..10].iter().map(|k| k.pct_chg).sum();
@@ -289,7 +366,8 @@ impl GeminiAnalyzer {
             }
             let returns: Vec<f64> = kline_data[..recent_len].iter().map(|k| k.pct_chg).collect();
             let mean_ret = returns.iter().sum::<f64>() / returns.len() as f64;
-            let variance = returns.iter().map(|r| (r - mean_ret).powi(2)).sum::<f64>() / returns.len() as f64;
+            let variance =
+                returns.iter().map(|r| (r - mean_ret).powi(2)).sum::<f64>() / returns.len() as f64;
             context.push_str(&format!("近期日波动率: {:.2}%\n", variance.sqrt()));
         }
 
@@ -306,8 +384,10 @@ impl GeminiAnalyzer {
                 context.push_str(&format!("总市值: {:.2}亿\n", market_cap));
                 if let Some(circ_cap) = latest.circulating_cap {
                     let circulation_ratio = (circ_cap / market_cap) * 100.0;
-                    context.push_str(&format!("流通市值: {:.2}亿 (流通比 {:.1}%)\n",
-                        circ_cap, circulation_ratio));
+                    context.push_str(&format!(
+                        "流通市值: {:.2}亿 (流通比 {:.1}%)\n",
+                        circ_cap, circulation_ratio
+                    ));
                 }
             }
         }
@@ -322,16 +402,24 @@ impl GeminiAnalyzer {
                     vh.newest_date.as_deref().unwrap_or("-"),
                 ));
                 let label = |pct: f64| -> &'static str {
-                    if pct < 20.0 { "极低估⭐" }
-                    else if pct < 40.0 { "低估" }
-                    else if pct < 60.0 { "中位" }
-                    else if pct < 80.0 { "高估" }
-                    else { "极高估⚠️" }
+                    if pct < 20.0 {
+                        "极低估⭐"
+                    } else if pct < 40.0 {
+                        "低估"
+                    } else if pct < 60.0 {
+                        "中位"
+                    } else if pct < 80.0 {
+                        "高估"
+                    } else {
+                        "极高估⚠️"
+                    }
                 };
                 if let (Some(cur), Some(pct)) = (vh.current_pe, vh.pe_percentile) {
                     context.push_str(&format!(
                         "PE TTM: {:.2}  历史分位 {:.1}% ({})  区间 [{:.2}, {:.2}] 中位 {:.2}\n",
-                        cur, pct, label(pct),
+                        cur,
+                        pct,
+                        label(pct),
                         vh.pe_min.unwrap_or(f64::NAN),
                         vh.pe_max.unwrap_or(f64::NAN),
                         vh.pe_median.unwrap_or(f64::NAN),
@@ -340,7 +428,9 @@ impl GeminiAnalyzer {
                 if let (Some(cur), Some(pct)) = (vh.current_pb, vh.pb_percentile) {
                     context.push_str(&format!(
                         "PB MRQ: {:.2}  历史分位 {:.1}% ({})  区间 [{:.2}, {:.2}] 中位 {:.2}\n",
-                        cur, pct, label(pct),
+                        cur,
+                        pct,
+                        label(pct),
                         vh.pb_min.unwrap_or(f64::NAN),
                         vh.pb_max.unwrap_or(f64::NAN),
                         vh.pb_median.unwrap_or(f64::NAN),
@@ -350,8 +440,10 @@ impl GeminiAnalyzer {
         }
 
         // ========== 财务指标（仅数字） ==========
-        let has_financials = latest.eps.is_some() || latest.roe.is_some()
-            || latest.gross_margin.is_some() || latest.revenue_yoy.is_some();
+        let has_financials = latest.eps.is_some()
+            || latest.roe.is_some()
+            || latest.gross_margin.is_some()
+            || latest.revenue_yoy.is_some();
         if has_financials {
             context.push_str("\n【财务】\n");
             if let Some(eps) = latest.eps {
@@ -383,13 +475,27 @@ impl GeminiAnalyzer {
                 for p in &show {
                     let date = p.report_date.as_deref().unwrap_or("-");
                     let mut parts: Vec<String> = Vec::new();
-                    if let Some(v) = p.eps { parts.push(format!("EPS {:.3}", v)); }
-                    if let Some(v) = p.roe { parts.push(format!("ROE {:.2}%", v)); }
-                    if let Some(v) = p.gross_margin { parts.push(format!("毛利 {:.2}%", v)); }
-                    if let Some(v) = p.net_margin { parts.push(format!("净利 {:.2}%", v)); }
-                    if let Some(v) = p.revenue_yoy { parts.push(format!("营收YoY {:.2}%", v)); }
-                    if let Some(v) = p.net_profit_yoy { parts.push(format!("净利YoY {:.2}%", v)); }
-                    if let Some(v) = p.op_cash_flow_ps { parts.push(format!("每股CFO {:.3}", v)); }
+                    if let Some(v) = p.eps {
+                        parts.push(format!("EPS {:.3}", v));
+                    }
+                    if let Some(v) = p.roe {
+                        parts.push(format!("ROE {:.2}%", v));
+                    }
+                    if let Some(v) = p.gross_margin {
+                        parts.push(format!("毛利 {:.2}%", v));
+                    }
+                    if let Some(v) = p.net_margin {
+                        parts.push(format!("净利 {:.2}%", v));
+                    }
+                    if let Some(v) = p.revenue_yoy {
+                        parts.push(format!("营收YoY {:.2}%", v));
+                    }
+                    if let Some(v) = p.net_profit_yoy {
+                        parts.push(format!("净利YoY {:.2}%", v));
+                    }
+                    if let Some(v) = p.op_cash_flow_ps {
+                        parts.push(format!("每股CFO {:.3}", v));
+                    }
                     context.push_str(&format!("{}: {}\n", date, parts.join(" | ")));
                 }
 
@@ -425,18 +531,27 @@ impl GeminiAnalyzer {
                 })
                 .collect();
             if !ratios.is_empty() {
-                context.push_str("\n【盈利质量】（CFO/净利润，>=1 优秀 / 0.5-1 健康 / <0.5 偏弱 / <=0 风险）\n");
+                context.push_str(
+                    "\n【盈利质量】（CFO/净利润，>=1 优秀 / 0.5-1 健康 / <0.5 偏弱 / <=0 风险）\n",
+                );
                 for (date, r) in &ratios {
-                    let tag = if *r <= 0.0 { "风险⚠️" }
-                              else if *r < 0.5 { "偏弱" }
-                              else if *r < 1.0 { "健康" }
-                              else { "优秀" };
+                    let tag = if *r <= 0.0 {
+                        "风险⚠️"
+                    } else if *r < 0.5 {
+                        "偏弱"
+                    } else if *r < 1.0 {
+                        "健康"
+                    } else {
+                        "优秀"
+                    };
                     context.push_str(&format!("{}: {:.2} ({})\n", date, r, tag));
                 }
                 let avg = ratios.iter().map(|(_, r)| r).sum::<f64>() / ratios.len() as f64;
                 context.push_str(&format!("近{}期均值: {:.2}\n", ratios.len(), avg));
                 if avg < 0.3 {
-                    context.push_str("⚠️ 盈利质量风险：CFO/净利润长期偏低，需警惕应收账款堆积或利润含金量不足\n");
+                    context.push_str(
+                        "⚠️ 盈利质量风险：CFO/净利润长期偏低，需警惕应收账款堆积或利润含金量不足\n",
+                    );
                 } else if avg < 0.6 {
                     context.push_str("提示：CFO/净利润偏弱，建议关注应收/存货周转是否恶化\n");
                 }
@@ -449,13 +564,18 @@ impl GeminiAnalyzer {
                     let (nm, at, em, theo) = p.dupont()?;
                     Some((
                         p.report_date.clone().unwrap_or_else(|| "-".into()),
-                        nm, at, em, theo, p.roe,
+                        nm,
+                        at,
+                        em,
+                        theo,
+                        p.roe,
                     ))
                 })
                 .collect();
             if !dupont_rows.is_empty() {
                 context.push_str("\n【杜邦分解】ROE = 净利率 × 总资产周转率 × 权益乘数\n");
-                context.push_str("报告期 | 净利率% | 周转率(次) | 权益乘数 | 理论ROE% | 实际ROE%\n");
+                context
+                    .push_str("报告期 | 净利率% | 周转率(次) | 权益乘数 | 理论ROE% | 实际ROE%\n");
                 for (date, nm, at, em, theo, actual) in &dupont_rows {
                     let actual_str = actual
                         .map(|v| format!("{:.2}", v))
@@ -545,10 +665,8 @@ impl GeminiAnalyzer {
                         .map(|(k, v)| (k.clone(), *v))
                         .collect();
                     parts.sort_by(|a, b| b.1.cmp(&a.1));
-                    let dist_str: Vec<String> = parts
-                        .iter()
-                        .map(|(k, v)| format!("{} {}", k, v))
-                        .collect();
+                    let dist_str: Vec<String> =
+                        parts.iter().map(|(k, v)| format!("{} {}", k, v)).collect();
                     let bull = cs.bullish_ratio().unwrap_or(0.0);
                     context.push_str(&format!(
                         "评级分布: {} | 看多比例: {:.0}%\n",
@@ -556,8 +674,7 @@ impl GeminiAnalyzer {
                         bull
                     ));
                 }
-                if let (Some(low), Some(high)) =
-                    (cs.target_price_low_avg, cs.target_price_high_avg)
+                if let (Some(low), Some(high)) = (cs.target_price_low_avg, cs.target_price_high_avg)
                 {
                     let cur = latest.close;
                     let upside = cs.upside_pct(cur).unwrap_or(0.0);
@@ -680,7 +797,11 @@ impl GeminiAnalyzer {
             context.push_str("\n【布林+MACD 共振信号（强约束）】\n");
             context.push_str(&format!(
                 "动作: {} | 收盘 ¥{:.2} | 上轨 ¥{:.2} / 中轨 ¥{:.2} / 下轨 ¥{:.2}\n",
-                bm.action.name(), bm.close, bm.upper, bm.middle, bm.lower
+                bm.action.name(),
+                bm.close,
+                bm.upper,
+                bm.middle,
+                bm.lower
             ));
             context.push_str(&format!(
                 "带宽 {:.2}% (5日变化 {:+.2}%) | MACD DIF/DEA/HIST = {:.3}/{:.3}/{:.3} | 背离: {:?}\n",
@@ -705,12 +826,20 @@ impl GeminiAnalyzer {
                 let reasons = if ta.reasons.is_empty() {
                     "（无显著加分项）".to_string()
                 } else {
-                    ta.reasons.iter().map(|s| format!("  · {}", s)).collect::<Vec<_>>().join("\n")
+                    ta.reasons
+                        .iter()
+                        .map(|s| format!("  · {}", s))
+                        .collect::<Vec<_>>()
+                        .join("\n")
                 };
                 let risks = if ta.risks.is_empty() {
                     "（无显著扣分项）".to_string()
                 } else {
-                    ta.risks.iter().map(|s| format!("  · {}", s)).collect::<Vec<_>>().join("\n")
+                    ta.risks
+                        .iter()
+                        .map(|s| format!("  · {}", s))
+                        .collect::<Vec<_>>()
+                        .join("\n")
                 };
                 let breakdown_line = match ta.score_breakdown {
                     Some(sb) => format!(
@@ -730,12 +859,16 @@ impl GeminiAnalyzer {
                 let veto_line = if ta.veto_flags.is_empty() {
                     String::new()
                 } else {
-                    let flags = ta.veto_flags
+                    let flags = ta
+                        .veto_flags
                         .iter()
                         .map(|s| format!("  · {}", s))
                         .collect::<Vec<_>>()
                         .join("\n");
-                    format!("  已触发风险否决信号（必须在【风险提示】段中逐条覆盖）:\n{}\n", flags)
+                    format!(
+                        "  已触发风险否决信号（必须在【风险提示】段中逐条覆盖）:\n{}\n",
+                        flags
+                    )
                 };
                 format!(
                     "\n\n[系统技术评分 - 你与系统共用同一把尺子]\n\
@@ -768,7 +901,9 @@ impl GeminiAnalyzer {
             let bullish_advice = advice.contains("买入") || advice.contains("加仓");
             let bullish_trend = trend.contains("多头") || trend.contains("上涨");
             let bearish_advice = advice.contains("卖出") || advice.contains("减仓");
-            let contrarian_clause = if (bearish_trend && bullish_advice) || (bullish_trend && bearish_advice) {
+            let contrarian_clause = if (bearish_trend && bullish_advice)
+                || (bullish_trend && bearish_advice)
+            {
                 format!(
                     "\n【一致性强制规则 - 触发】系统趋势状态为『{trend}』但操作建议为『{advice}』，方向相反。\n\
                     必须在分析的开头（【技术面】之前）插入一个独立段落 ##【⚠️ 逆势布局逻辑】，明确说明：\n\
@@ -785,7 +920,8 @@ impl GeminiAnalyzer {
             let veto_clause = if ta.veto_flags.is_empty() {
                 String::new()
             } else {
-                let bulleted = ta.veto_flags
+                let bulleted = ta
+                    .veto_flags
                     .iter()
                     .map(|s| format!("  · {}", s))
                     .collect::<Vec<_>>()
@@ -808,7 +944,9 @@ impl GeminiAnalyzer {
                 contrarian = contrarian_clause,
                 veto = veto_clause,
             )
-        } else { String::new() };
+        } else {
+            String::new()
+        };
 
         let prompt = format!(
             "请基于以下数据分析该股，仅输出【宏观影响】【消息面】【技术面】【主力资金】【基本面】【操作建议（含买入价/目标价/止损位）】【风险提示】七段，每段不超过 3 句。\n\
@@ -822,6 +960,7 @@ impl GeminiAnalyzer {
 
         // 标准模式：单次 LLM 调用，不触发工具循环（深度多智能体走 deep_analyzer 路径）
         info!(">>> [{}] 标准模式：单次 LLM 调用", code);
-        self.call_api_with_retry_ex(&prompt, Self::TEXT_SYSTEM_PROMPT).await
+        self.call_api_with_retry_ex(&prompt, Self::TEXT_SYSTEM_PROMPT)
+            .await
     }
 }

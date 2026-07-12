@@ -52,10 +52,22 @@ const SENTIMENT_SYS: &str = r#"你是 A 股**市场情绪与风险专家**。只
 要求：客观冷静，给出可操作的仓位倾向；只输出 Markdown 要点，不超过 350 字。"#;
 
 const MACRO_SPECIALISTS: &[MacroSpecialist] = &[
-    MacroSpecialist { role: "产业链推演专家", sys: INDUSTRY_CHAIN_SYS },
-    MacroSpecialist { role: "政策解读专家", sys: POLICY_SYS },
-    MacroSpecialist { role: "板块轮动专家", sys: ROTATION_SYS },
-    MacroSpecialist { role: "情绪与风险专家", sys: SENTIMENT_SYS },
+    MacroSpecialist {
+        role: "产业链推演专家",
+        sys: INDUSTRY_CHAIN_SYS,
+    },
+    MacroSpecialist {
+        role: "政策解读专家",
+        sys: POLICY_SYS,
+    },
+    MacroSpecialist {
+        role: "板块轮动专家",
+        sys: ROTATION_SYS,
+    },
+    MacroSpecialist {
+        role: "情绪与风险专家",
+        sys: SENTIMENT_SYS,
+    },
 ];
 
 impl GeminiAnalyzer {
@@ -87,7 +99,10 @@ impl GeminiAnalyzer {
     /// 多 Agent 路径：4 位宏观专家并行 → 首席策略师融合终稿。
     async fn analyze_macro_recommendations_multi(&self, macro_news: &str) -> Result<String> {
         let today = chrono::Local::now().format("%Y年%m月%d日").to_string();
-        info!("🤝 宏观多 Agent 流水线启动（{} 位专家并行）", MACRO_SPECIALISTS.len());
+        info!(
+            "🤝 宏观多 Agent 流水线启动（{} 位专家并行）",
+            MACRO_SPECIALISTS.len()
+        );
 
         // 1. 4 位专家并行，各自只输出本领域要点（best-effort，失败不阻断）
         let futures = MACRO_SPECIALISTS
@@ -107,10 +122,15 @@ impl GeminiAnalyzer {
         if ok_count == 0 {
             return Err(anyhow!("全部宏观专家 Agent 失败"));
         }
-        info!("✅ 宏观专家完成 {}/{}，进入首席策略师融合", ok_count, MACRO_SPECIALISTS.len());
+        info!(
+            "✅ 宏观专家完成 {}/{}，进入首席策略师融合",
+            ok_count,
+            MACRO_SPECIALISTS.len()
+        );
 
         // 3. 首席策略师融合终稿
-        self.run_macro_synthesis(macro_news, Some(&specialist_ctx)).await
+        self.run_macro_synthesis(macro_news, Some(&specialist_ctx))
+            .await
     }
 
     /// 单个宏观专家 Agent（Quick 模式）。失败返回 None，不阻断流水线。
@@ -157,7 +177,7 @@ impl GeminiAnalyzer {
         };
 
         let prompt = format!(
-r#"今天是 {today}。
+            r#"今天是 {today}。
 
 以下是今日宏观市场最新新闻：
 <macro_news>

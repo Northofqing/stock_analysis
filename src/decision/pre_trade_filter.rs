@@ -26,11 +26,19 @@ pub struct FilterResult {
 
 impl FilterResult {
     pub fn pass() -> Self {
-        Self { pass: true, reasons: vec![], warnings: vec![] }
+        Self {
+            pass: true,
+            reasons: vec![],
+            warnings: vec![],
+        }
     }
 
     pub fn reject(reason: impl Into<String>) -> Self {
-        Self { pass: false, reasons: vec![reason.into()], warnings: vec![] }
+        Self {
+            pass: false,
+            reasons: vec![reason.into()],
+            warnings: vec![],
+        }
     }
 
     pub fn with_warning(mut self, w: impl Into<String>) -> Self {
@@ -68,10 +76,7 @@ pub fn evaluate(input: &StockFilterInput, now_date: &str) -> FilterResult {
 
     // 1. 停牌 → 拒绝
     if matches!(input.is_suspended, Some(true)) {
-        return FilterResult::reject(format!(
-            "停牌 (code={}) — 不可交易",
-            input.code
-        ));
+        return FilterResult::reject(format!("停牌 (code={}) — 不可交易", input.code));
     }
 
     // 2. 涨停一字板 → 拒绝 (不可买入)
@@ -84,16 +89,10 @@ pub fn evaluate(input: &StockFilterInput, now_date: &str) -> FilterResult {
 
     // 3. 业绩雷 (同比已亏 / 公告预减) → 拒绝
     if matches!(input.yoy_loss, Some(true)) {
-        return FilterResult::reject(format!(
-            "业绩雷: 同比已亏 (code={})",
-            input.code
-        ));
+        return FilterResult::reject(format!("业绩雷: 同比已亏 (code={})", input.code));
     }
     if matches!(input.announced_pre_cut, Some(true)) {
-        return FilterResult::reject(format!(
-            "业绩雷: 公告预减 (code={})",
-            input.code
-        ));
+        return FilterResult::reject(format!("业绩雷: 公告预减 (code={})", input.code));
     }
 
     // 4. 解禁 N 日内 → 标注风险
@@ -167,7 +166,11 @@ pub fn filter_batch(inputs: &[StockFilterInput], now_date: &str) -> FilterBatch 
             reject.push((inp.code.clone(), r.reasons.join("; ")));
         }
     }
-    FilterBatch { pass, reject, warnings: warned.into_iter().collect() }
+    FilterBatch {
+        pass,
+        reject,
+        warnings: warned.into_iter().collect(),
+    }
 }
 
 #[derive(Debug, Default)]
@@ -182,7 +185,11 @@ mod tests {
     use super::*;
 
     fn base(code: &str) -> StockFilterInput {
-        StockFilterInput { code: code.to_string(), name: format!("测试{}", code), ..Default::default() }
+        StockFilterInput {
+            code: code.to_string(),
+            name: format!("测试{}", code),
+            ..Default::default()
+        }
     }
 
     // ---- 通过场景 ----
@@ -250,7 +257,10 @@ mod tests {
         inp.unlock_date = Some("2026-07-08".to_string());
         let r = evaluate(&inp, "2026-07-05");
         assert!(r.pass);
-        assert!(r.warnings.iter().any(|w| w.contains("解禁")), "未来 3 日解禁应标注");
+        assert!(
+            r.warnings.iter().any(|w| w.contains("解禁")),
+            "未来 3 日解禁应标注"
+        );
     }
 
     #[test]

@@ -16,10 +16,14 @@ static RE_H3: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)^###\s+(.+)$").unwrap(
 static RE_H2: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)^##\s+(.+)$").unwrap());
 static RE_H1: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)^#\s+(.+)$").unwrap());
 static RE_BOLD: Lazy<Regex> = Lazy::new(|| Regex::new(r"\*\*(.+?)\*\*").unwrap());
-static RE_CLEAN_BEFORE_TAGS: Lazy<Regex> = Lazy::new(|| Regex::new(r"\n+(<(?:table|h[1-4]|ul|div|hr))").unwrap());
-static RE_CLEAN_AFTER_TAGS: Lazy<Regex> = Lazy::new(|| Regex::new(r"(</(?:table|h[1-4]|ul|div)>)\n+").unwrap());
-static RE_EMPTY_LINES_IN_BLOCKS: Lazy<Regex> = Lazy::new(|| Regex::new(r"(<(?:table|thead|tbody|tr|ul)>)\n+").unwrap());
-static RE_EMPTY_LINES_AFTER_BLOCKS: Lazy<Regex> = Lazy::new(|| Regex::new(r"\n+(</(?:table|thead|tbody|tr|ul)>)").unwrap());
+static RE_CLEAN_BEFORE_TAGS: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\n+(<(?:table|h[1-4]|ul|div|hr))").unwrap());
+static RE_CLEAN_AFTER_TAGS: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(</(?:table|h[1-4]|ul|div)>)\n+").unwrap());
+static RE_EMPTY_LINES_IN_BLOCKS: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(<(?:table|thead|tbody|tr|ul)>)\n+").unwrap());
+static RE_EMPTY_LINES_AFTER_BLOCKS: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"\n+(</(?:table|thead|tbody|tr|ul)>)").unwrap());
 
 impl NotificationService {
     /// 发送到飞书
@@ -91,7 +95,12 @@ impl NotificationService {
         Ok(response.status().is_success())
     }
 
-    pub(super) async fn send_feishu_chunked(&self, url: &str, content: &str, max_bytes: usize) -> Result<bool> {
+    pub(super) async fn send_feishu_chunked(
+        &self,
+        url: &str,
+        content: &str,
+        max_bytes: usize,
+    ) -> Result<bool> {
         let chunks = self.chunk_by_sections(content, max_bytes);
         let total = chunks.len();
         let mut success = 0;
@@ -103,7 +112,10 @@ impl NotificationService {
                 String::new()
             };
 
-            if self.send_feishu_message(url, &format!("{}{}", chunk, marker)).await? {
+            if self
+                .send_feishu_message(url, &format!("{}{}", chunk, marker))
+                .await?
+            {
                 success += 1;
             }
 
@@ -116,14 +128,16 @@ impl NotificationService {
     }
 
     pub(super) fn format_feishu_markdown(&self, content: &str) -> String {
-        use regex::Regex;
+        
 
         let mut result = content.to_string();
 
         // 标题转加粗
         let re_h = &RE_HEADING;
         result = re_h
-            .replace_all(&result, |caps: &regex::Captures| format!("**{}**", &caps[1]))
+            .replace_all(&result, |caps: &regex::Captures| {
+                format!("**{}**", &caps[1])
+            })
             .to_string();
 
         // 引用转前缀
@@ -141,25 +155,37 @@ impl NotificationService {
     /// 将 Markdown 转换为 HTML（优化邮件客户端兼容性）
     pub(super) fn markdown_to_html(&self, markdown: &str) -> String {
         let mut html = markdown.to_string();
-        
+
         // 清理多余的空行（3个以上连续换行合并为2个）
         let re_multiple_newlines = &RE_MULTI_NEWLINES;
         html = re_multiple_newlines.replace_all(&html, "\n\n").to_string();
-        
+
         // 先处理表格（最重要的部分）
         html = self.convert_markdown_tables_enhanced(&html);
-        
+
         // 处理引用块
         let re_quote = &RE_QUOTE;
-        html = re_quote.replace_all(&html, 
-            "<div style='border-left: 4px solid #3498db; padding: 10px 15px; margin: 15px 0; background-color: #f8f9fa; color: #555;'>$1</div>").to_string();
-        
-        // 处理标题（从小到大避免冲突）
-        html = RE_H4.replace_all(&html,
-            "<h4 style='color: #666; margin: 15px 0 10px 0; font-size: 16px;'>$1</h4>").to_string();
+        html = re_quote
+            .replace_all(
+                &html,
+                "<div style='border-left: 4px solid #3498db; padding: 10px 15px; margin: 15px 0; background-color: #f8f9fa; color: #555;'>$1</div>",
+            )
+            .to_string();
 
-        html = RE_H3.replace_all(&html,
-            "<h3 style='color: #555; margin: 20px 0 10px 0; font-size: 18px;'>$1</h3>").to_string();
+        // 处理标题（从小到大避免冲突）
+        html = RE_H4
+            .replace_all(
+                &html,
+                "<h4 style='color: #666; margin: 15px 0 10px 0; font-size: 16px;'>$1</h4>",
+            )
+            .to_string();
+
+        html = RE_H3
+            .replace_all(
+                &html,
+                "<h3 style='color: #555; margin: 20px 0 10px 0; font-size: 18px;'>$1</h3>",
+            )
+            .to_string();
 
         html = RE_H2.replace_all(&html,
             "<h2 style='color: #34495e; margin: 25px 0 15px 0; padding-left: 10px; border-left: 4px solid #3498db; font-size: 20px;'>$1</h2>").to_string();
@@ -168,14 +194,22 @@ impl NotificationService {
             "<h1 style='color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; margin: 30px 0 20px 0; font-size: 24px;'>$1</h1>").to_string();
 
         // 处理粗体
-        html = RE_BOLD.replace_all(&html, "<strong style='color: #e74c3c; font-weight: bold;'>$1</strong>").to_string();
-        
+        html = RE_BOLD
+            .replace_all(
+                &html,
+                "<strong style='color: #e74c3c; font-weight: bold;'>$1</strong>",
+            )
+            .to_string();
+
         // 处理分隔线
-        html = html.replace("\n---\n", "\n<hr style='border: none; border-top: 2px solid #ecf0f1; margin: 20px 0;'/>\n");
-        
+        html = html.replace(
+            "\n---\n",
+            "\n<hr style='border: none; border-top: 2px solid #ecf0f1; margin: 20px 0;'/>\n",
+        );
+
         // 处理列表
         html = self.convert_markdown_lists(&html);
-        
+
         // 清理HTML标签周围的多余换行
         // 移除标签前后的空白行
         html = RE_CLEAN_BEFORE_TAGS.replace_all(&html, "\n$1").to_string();
@@ -183,15 +217,19 @@ impl NotificationService {
         html = RE_CLEAN_AFTER_TAGS.replace_all(&html, "$1\n").to_string();
 
         // 移除表格、列表等块级元素内部的单独换行符（但保留有内容的行）
-        html = RE_EMPTY_LINES_IN_BLOCKS.replace_all(&html, "$1").to_string();
+        html = RE_EMPTY_LINES_IN_BLOCKS
+            .replace_all(&html, "$1")
+            .to_string();
 
-        html = RE_EMPTY_LINES_AFTER_BLOCKS.replace_all(&html, "$1").to_string();
-        
+        html = RE_EMPTY_LINES_AFTER_BLOCKS
+            .replace_all(&html, "$1")
+            .to_string();
+
         // 最后处理剩余的文本换行
         // 只对纯文本段落添加 <br/>，而不是所有换行
         let lines: Vec<&str> = html.lines().collect();
         let mut final_lines = Vec::new();
-        
+
         for line in lines {
             let trimmed = line.trim();
             // 跳过空行
@@ -213,7 +251,7 @@ impl NotificationService {
             }
         }
         html = final_lines.join("\n");
-        
+
         // 包装完整HTML
         format!(
             "<!DOCTYPE html>
@@ -238,7 +276,7 @@ impl NotificationService {
         let lines: Vec<&str> = content.lines().collect();
         let mut result = Vec::new();
         let mut in_list = false;
-        
+
         for line in lines {
             if line.trim().starts_with("- ") {
                 if !in_list {
@@ -266,10 +304,10 @@ impl NotificationService {
         let lines: Vec<&str> = content.lines().collect();
         let mut result = Vec::new();
         let mut i = 0;
-        
+
         while i < lines.len() {
             let line = lines[i];
-            
+
             // 检测表格开始
             if line.contains('|') && line.split('|').filter(|s| !s.trim().is_empty()).count() >= 2 {
                 // 检查下一行是否是分隔符
@@ -278,21 +316,23 @@ impl NotificationService {
                 } else {
                     false
                 };
-                
+
                 if is_table_start {
                     // 表格样式（内联）
                     let table_style = "width: 100%; border-collapse: collapse; margin: 15px 0; background-color: #ffffff; box-shadow: 0 1px 3px rgba(0,0,0,0.1);";
                     let th_style = "background-color: #3498db; color: #ffffff; padding: 12px; text-align: left; font-weight: bold; border: 1px solid #2980b9;";
-                    let td_style = "padding: 10px 12px; border: 1px solid #ecf0f1; background-color: #ffffff;";
-                    
+                    let td_style =
+                        "padding: 10px 12px; border: 1px solid #ecf0f1; background-color: #ffffff;";
+
                     result.push(format!("<table style='{}'>", table_style));
-                    
+
                     // 处理表头
-                    let headers: Vec<&str> = line.split('|')
+                    let headers: Vec<&str> = line
+                        .split('|')
                         .map(|s| s.trim())
                         .filter(|s| !s.is_empty())
                         .collect();
-                    
+
                     result.push("<thead>".to_string());
                     result.push("<tr>".to_string());
                     for header in headers {
@@ -300,10 +340,10 @@ impl NotificationService {
                     }
                     result.push("</tr>".to_string());
                     result.push("</thead>".to_string());
-                    
+
                     // 跳过分隔符行
                     i += 2;
-                    
+
                     // 处理表格数据行
                     result.push("<tbody>".to_string());
                     let mut row_index = 0;
@@ -312,20 +352,28 @@ impl NotificationService {
                         if !data_line.contains('|') || data_line.trim().is_empty() {
                             break;
                         }
-                        
-                        let cells: Vec<&str> = data_line.split('|')
+
+                        let cells: Vec<&str> = data_line
+                            .split('|')
                             .map(|s| s.trim())
                             .filter(|s| !s.is_empty())
                             .collect();
-                        
+
                         if !cells.is_empty() {
                             // 交替行背景色
-                            let row_bg = if row_index % 2 == 0 { "#ffffff" } else { "#f8f9fa" };
+                            let row_bg = if row_index % 2 == 0 {
+                                "#ffffff"
+                            } else {
+                                "#f8f9fa"
+                            };
                             result.push(format!("<tr style='background-color: {};'>", row_bg));
                             for cell in cells {
                                 // 处理单元格内容中的emoji和颜色标记
                                 let cell_content = self.enhance_cell_content(cell);
-                                result.push(format!("<td style='{}'>{}</td>", td_style, cell_content));
+                                result.push(format!(
+                                    "<td style='{}'>{}</td>",
+                                    td_style, cell_content
+                                ));
                             }
                             result.push("</tr>".to_string());
                             row_index += 1;
@@ -337,18 +385,18 @@ impl NotificationService {
                     continue;
                 }
             }
-            
+
             result.push(line.to_string());
             i += 1;
         }
-        
+
         result.join("\n")
     }
 
     /// 增强单元格内容显示（处理emoji和特殊标记）
     pub(super) fn enhance_cell_content(&self, content: &str) -> String {
         let mut enhanced = content.to_string();
-        
+
         // 处理emoji - 使用更兼容的方式
         enhanced = enhanced.replace("✅", "<span style='color: #27ae60;'>✅</span>");
         enhanced = enhanced.replace("⚠️", "<span style='color: #f39c12;'>⚠️</span>");
@@ -359,16 +407,20 @@ impl NotificationService {
         enhanced = enhanced.replace("📈", "📈");
         enhanced = enhanced.replace("💰", "💰");
         enhanced = enhanced.replace("🎯", "🎯");
-        
+
         // 处理评估标签的颜色
-        if enhanced.contains("合理") || enhanced.contains("正常") || enhanced.contains("低估") {
+        if enhanced.contains("合理") || enhanced.contains("正常") || enhanced.contains("低估")
+        {
             enhanced = format!("<span style='color: #27ae60;'>{}</span>", enhanced);
-        } else if enhanced.contains("偏高") || enhanced.contains("较高") || enhanced.contains("亏损") {
+        } else if enhanced.contains("偏高")
+            || enhanced.contains("较高")
+            || enhanced.contains("亏损")
+        {
             enhanced = format!("<span style='color: #e74c3c;'>{}</span>", enhanced);
         } else if enhanced.contains("适中") || enhanced.contains("中性") {
             enhanced = format!("<span style='color: #f39c12;'>{}</span>", enhanced);
         }
-        
+
         enhanced
     }
 }

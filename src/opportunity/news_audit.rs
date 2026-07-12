@@ -142,11 +142,7 @@ pub fn write_audit_jsonl_at(ranked: &[RankedNews], path: &Path) -> usize {
             Err(e) => log::warn!("[NEWS_AUDIT] 序列化失败: {:#}", e),
         }
     }
-    log::info!(
-        "[NEWS_AUDIT] 落 {} 条到 {}",
-        written,
-        path.display()
-    );
+    log::info!("[NEWS_AUDIT] 落 {} 条到 {}", written, path.display());
     written
 }
 
@@ -221,6 +217,8 @@ mod tests {
                     source: ChainSource::Rule,
                     board_keyword: "测试".into(),
                     fund_flow_pct: None,
+                    board_code: None,
+                    board_change_pct: None,
                 }],
                 board_code: None,
             },
@@ -247,7 +245,12 @@ mod tests {
     fn disabled_no_op() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         env::set_var("NEWS_RANK_AUDIT", "false");
-        let r = vec![mock_ranked("t1", "国务院印发规划", crate::opportunity::news_ranker::NewsRankBucket::PushNow, 75)];
+        let r = vec![mock_ranked(
+            "t1",
+            "国务院印发规划",
+            crate::opportunity::news_ranker::NewsRankBucket::PushNow,
+            75,
+        )];
         assert_eq!(write_audit_jsonl(&r), 0);
         env::remove_var("NEWS_RANK_AUDIT");
     }
@@ -268,8 +271,18 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         let r = vec![
-            mock_ranked("a", "国务院印发低空经济规划", crate::opportunity::news_ranker::NewsRankBucket::PushNow, 75),
-            mock_ranked("b", "证监会立案调查某公司", crate::opportunity::news_ranker::NewsRankBucket::Drop, 10),
+            mock_ranked(
+                "a",
+                "国务院印发低空经济规划",
+                crate::opportunity::news_ranker::NewsRankBucket::PushNow,
+                75,
+            ),
+            mock_ranked(
+                "b",
+                "证监会立案调查某公司",
+                crate::opportunity::news_ranker::NewsRankBucket::Drop,
+                10,
+            ),
         ];
         let n = write_audit_jsonl_at(&r, &path);
         assert_eq!(n, 2, "应落 2 条");
@@ -277,7 +290,11 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 2, "文件应 2 行");
-        assert!(lines[0].contains("PushNow"), "第一行应 PushNow: {}", lines[0]);
+        assert!(
+            lines[0].contains("PushNow"),
+            "第一行应 PushNow: {}",
+            lines[0]
+        );
         assert!(lines[1].contains("Drop"), "第二行应 Drop: {}", lines[1]);
 
         let _ = std::fs::remove_file(&path);
@@ -290,7 +307,12 @@ mod tests {
         env::set_var("NEWS_RANK_AUDIT", "false");
         let path = unique_tmp("default");
         let _ = std::fs::remove_file(&path);
-        let r = vec![mock_ranked("x", "test", crate::opportunity::news_ranker::NewsRankBucket::LogOnly, 30)];
+        let r = vec![mock_ranked(
+            "x",
+            "test",
+            crate::opportunity::news_ranker::NewsRankBucket::LogOnly,
+            30,
+        )];
         let n = write_audit_jsonl(&r);
         assert_eq!(n, 0, "env=false 应不写");
         assert!(!path.exists(), "默认路径不应被写");
@@ -308,7 +330,12 @@ mod tests {
         env::set_var("DATABASE_PATH", &tmp_db);
         env::set_var("NEWS_RANK_AUDIT", "true");
 
-        let r = vec![mock_ranked("y", "test", crate::opportunity::news_ranker::NewsRankBucket::PushNow, 70)];
+        let r = vec![mock_ranked(
+            "y",
+            "test",
+            crate::opportunity::news_ranker::NewsRankBucket::PushNow,
+            70,
+        )];
         let n = write_audit_jsonl(&r);
         assert_eq!(n, 1, "应落 1 条");
 

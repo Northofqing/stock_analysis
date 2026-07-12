@@ -51,25 +51,43 @@ pub struct ContrarianSignal {
 pub fn detect_contrarian_signal(data: &[KlineData], sentiment_score: i32) -> ContrarianSignal {
     // 基本门槛：评分 < 40 且数据充足
     if sentiment_score >= 40 || data.len() < 20 {
-        return ContrarianSignal { triggered: false, reason: String::new() };
+        return ContrarianSignal {
+            triggered: false,
+            reason: String::new(),
+        };
     }
 
     let latest = &data[0];
 
     // ---- 条件 1：超跌 ----
     let ma20: f64 = data[..20].iter().map(|k| k.close).sum::<f64>() / 20.0;
-    let bias_ma20 = if ma20 > 0.0 { (latest.close - ma20) / ma20 * 100.0 } else { 0.0 };
+    let bias_ma20 = if ma20 > 0.0 {
+        (latest.close - ma20) / ma20 * 100.0
+    } else {
+        0.0
+    };
 
     let week52_len = data.len().min(250);
-    let low_52w = data[..week52_len].iter().map(|k| k.low).fold(f64::INFINITY, f64::min);
-    let high_52w = data[..week52_len].iter().map(|k| k.high).fold(f64::NEG_INFINITY, f64::max);
+    let low_52w = data[..week52_len]
+        .iter()
+        .map(|k| k.low)
+        .fold(f64::INFINITY, f64::min);
+    let high_52w = data[..week52_len]
+        .iter()
+        .map(|k| k.high)
+        .fold(f64::NEG_INFINITY, f64::max);
     let pos_52w = if (high_52w - low_52w).abs() > 0.001 {
         (latest.close - low_52w) / (high_52w - low_52w) * 100.0
-    } else { 50.0 };
+    } else {
+        50.0
+    };
 
     let is_oversold = bias_ma20 < -8.0 || pos_52w < 20.0;
     if !is_oversold {
-        return ContrarianSignal { triggered: false, reason: String::new() };
+        return ContrarianSignal {
+            triggered: false,
+            reason: String::new(),
+        };
     }
 
     // ---- 条件 2：最近 3 日企稳 ----
@@ -79,28 +97,46 @@ pub fn detect_contrarian_signal(data: &[KlineData], sentiment_score: i32) -> Con
     let recent3_chg: f64 = recent3.iter().map(|k| k.pct_chg).sum();
     let is_stabilizing = (has_green && recent3_chg > -5.0) && latest.pct_chg > -2.0;
     if !is_stabilizing {
-        return ContrarianSignal { triggered: false, reason: String::new() };
+        return ContrarianSignal {
+            triggered: false,
+            reason: String::new(),
+        };
     }
 
     // ---- 条件 3：近 3 日无跌停（-9.5% 阈值）----
     let no_limit_down = !recent3.iter().any(|k| k.pct_chg <= -9.5);
     if !no_limit_down {
-        return ContrarianSignal { triggered: false, reason: String::new() };
+        return ContrarianSignal {
+            triggered: false,
+            reason: String::new(),
+        };
     }
 
     // ---- 条件 4：非恐慌放量下跌 ----
     let vol_5d_avg = if data.len() >= 5 {
         data[..5].iter().map(|k| k.volume).sum::<f64>() / 5.0
-    } else { latest.volume };
-    let vol_ratio = if vol_5d_avg > 0.0 { latest.volume / vol_5d_avg } else { 1.0 };
+    } else {
+        latest.volume
+    };
+    let vol_ratio = if vol_5d_avg > 0.0 {
+        latest.volume / vol_5d_avg
+    } else {
+        1.0
+    };
     let no_panic = !(vol_ratio > 2.0 && latest.pct_chg < -3.0);
     if !no_panic {
-        return ContrarianSignal { triggered: false, reason: String::new() };
+        return ContrarianSignal {
+            triggered: false,
+            reason: String::new(),
+        };
     }
 
     let reason = format!(
         "🔄反向信号：评分{} | MA20乖离{:+.1}% | 52周位{:.0}% | 近3日累计{:+.2}% | 量比{:.2} | 今日{:+.2}%",
         sentiment_score, bias_ma20, pos_52w, recent3_chg, vol_ratio, latest.pct_chg
     );
-    ContrarianSignal { triggered: true, reason }
+    ContrarianSignal {
+        triggered: true,
+        reason,
+    }
 }

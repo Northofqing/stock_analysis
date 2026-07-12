@@ -1,7 +1,7 @@
-use async_trait::async_trait;
-use serde_json::json;
 use crate::agent::tool::Tool;
 use crate::search_service::get_search_service;
+use async_trait::async_trait;
+use serde_json::json;
 
 pub struct FetchNewsTool;
 
@@ -39,22 +39,23 @@ impl Tool for FetchNewsTool {
     }
 
     async fn call(&self, input: serde_json::Value) -> anyhow::Result<String> {
-        let code = input.get("code")
+        let code = input
+            .get("code")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'code' parameter"))?;
-        let name = input.get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-            
+        let name = input.get("name").and_then(|v| v.as_str()).unwrap_or("");
+
         let max_results = 5;
-        let response = get_search_service().search_stock_news(code, name, max_results).await;
-        
+        let response = get_search_service()
+            .search_stock_news(code, name, max_results)
+            .await;
+
         let news_str = response.to_context(max_results);
-        
+
         if news_str.is_empty() || news_str.contains("未找到相关结果") {
-             Ok(json!({"error": "No recent news found for this stock."}).to_string())
+            Ok(json!({"error": "No recent news found for this stock."}).to_string())
         } else {
-             Ok(news_str)
+            Ok(news_str)
         }
     }
 }

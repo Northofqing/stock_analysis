@@ -79,8 +79,7 @@ pub fn fill_limit_flags(
     k.is_limit_down = s.limit_down_price > 0.0 && (k.close - s.limit_down_price).abs() < 0.005;
     // v11-P0-3 commit 2 修订: 查 HALTED_PERIODS 缓存 (K 线缺口推断 / 公告),
     // 不再永远 false (limit_status.rs:60 之前). 解决"幸存者偏差".
-    k.is_suspended = s.is_suspended
-        || crate::monitor::data_quality::is_halted_period(code, k.date);
+    k.is_suspended = s.is_suspended || crate::monitor::data_quality::is_halted_period(code, k.date);
 }
 
 /// 批量为 K 线列表（按日期降序）填涨跌停标记。
@@ -92,11 +91,7 @@ pub fn fill_limit_flags(
 /// 可得收盘价，作为今日的"昨日收盘"是合理的近似。
 ///
 /// `name` 可为 None（非 ST 假设）；如有 name 应调用方提供。
-pub fn apply_limit_flags_inplace(
-    code: &str,
-    name: Option<&str>,
-    klines: &mut [KlineData],
-) {
+pub fn apply_limit_flags_inplace(code: &str, name: Option<&str>, klines: &mut [KlineData]) {
     if klines.is_empty() {
         return;
     }
@@ -224,7 +219,9 @@ mod tests {
             close,
             volume: 1_000_000.0,
             amount: 10_000_000.0,
-            pct_chg: 0.0, intraday_price: None, settled: true,
+            pct_chg: 0.0,
+            intraday_price: None,
+            settled: true,
             pe_ratio: None,
             pb_ratio: None,
             turnover_rate: None,
@@ -395,9 +392,21 @@ mod tests {
         // 昨天 close=10.0, prev=9.5, limit_down=9.5*0.9=8.55, 在范围内, 无标记
         // 前天 close=9.5, 没有 prev, 不填
         let mut klines = vec![
-            { let mut k = kline("600000", 11.0); k.date = NaiveDate::from_ymd_opt(2026, 6, 27).unwrap(); k },
-            { let mut k = kline("600000", 10.0); k.date = NaiveDate::from_ymd_opt(2026, 6, 26).unwrap(); k },
-            { let mut k = kline("600000", 9.5);  k.date = NaiveDate::from_ymd_opt(2026, 6, 25).unwrap(); k },
+            {
+                let mut k = kline("600000", 11.0);
+                k.date = NaiveDate::from_ymd_opt(2026, 6, 27).unwrap();
+                k
+            },
+            {
+                let mut k = kline("600000", 10.0);
+                k.date = NaiveDate::from_ymd_opt(2026, 6, 26).unwrap();
+                k
+            },
+            {
+                let mut k = kline("600000", 9.5);
+                k.date = NaiveDate::from_ymd_opt(2026, 6, 25).unwrap();
+                k
+            },
         ];
         apply_limit_flags_inplace("600000", Some("浦发银行"), &mut klines);
         assert!(klines[0].is_limit_up, "今天 close=11.0 = 10*1.1, 应是涨停");

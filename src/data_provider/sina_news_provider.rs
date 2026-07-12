@@ -21,16 +21,12 @@ pub const SINA_NEWS_API_BASE: &str = "https://feed.mix.sina.com.cn/api/roll/get"
 
 /// 财经要闻 URL (lid=1686, pageid=155).
 pub fn build_top_news_url(num: usize) -> String {
-    format!(
-        "{SINA_NEWS_API_BASE}?pageid=155&lid=1686&k=&num={num}&page=1"
-    )
+    format!("{SINA_NEWS_API_BASE}?pageid=155&lid=1686&k=&num={num}&page=1")
 }
 
 /// 个股新闻 URL (lid=2516, pageid=155, k=code).
 pub fn build_stock_news_url(code: &str, num: usize) -> String {
-    format!(
-        "{SINA_NEWS_API_BASE}?pageid=155&lid=2516&k={code}&num={num}&page=1"
-    )
+    format!("{SINA_NEWS_API_BASE}?pageid=155&lid=2516&k={code}&num={num}&page=1")
 }
 
 /// 解析 Sina 新闻 body → `Vec<NewsItem>`.
@@ -43,9 +39,13 @@ pub fn build_stock_news_url(code: &str, num: usize) -> String {
 /// - `media_name` → `source_name`
 ///
 /// `category` 与 `code` 由调用方注入 (区分财经要闻/个股新闻).
-pub fn parse_sina_news_body(body: &str, category: &str, code: Option<&str>) -> Result<Vec<NewsItem>> {
-    let v: serde_json::Value = serde_json::from_str(body)
-        .map_err(|e| anyhow!("Sina news JSON parse: {e}"))?;
+pub fn parse_sina_news_body(
+    body: &str,
+    category: &str,
+    code: Option<&str>,
+) -> Result<Vec<NewsItem>> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| anyhow!("Sina news JSON parse: {e}"))?;
     let data = v
         .get("result")
         .and_then(|r| r.get("data"))
@@ -53,7 +53,11 @@ pub fn parse_sina_news_body(body: &str, category: &str, code: Option<&str>) -> R
         .ok_or_else(|| anyhow!("Sina news: 无 result.data 数组"))?;
 
     let now = Utc::now();
-    let source = if code.is_some() { "sina_stock" } else { "sina_financial" };
+    let source = if code.is_some() {
+        "sina_stock"
+    } else {
+        "sina_financial"
+    };
     let mut items = Vec::with_capacity(data.len());
     for entry in data {
         let url = entry

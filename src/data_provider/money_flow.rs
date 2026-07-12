@@ -21,11 +21,11 @@ struct SinaMoneyflowRow {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MoneyFlowDay {
     pub date: String,
-    pub main_net: f64,       // 主力净流入（元）
-    pub xl_net: f64,         // 超大单净流入
-    pub big_net: f64,        // 大单净流入
-    pub main_pct: f64,       // 主力净占比 (%)
-    pub pct_chg: f64,        // 当日涨跌幅
+    pub main_net: f64, // 主力净流入（元）
+    pub xl_net: f64,   // 超大单净流入
+    pub big_net: f64,  // 大单净流入
+    pub main_pct: f64, // 主力净占比 (%)
+    pub pct_chg: f64,  // 当日涨跌幅
 }
 
 /// 近期资金流汇总
@@ -86,24 +86,21 @@ impl MoneyFlowSummary {
 /// 日内分时形态
 #[derive(Debug, Clone, Default)]
 pub struct IntradayShape {
-    pub date: String,          // 交易日
-    pub pre_close: f64,        // 昨收
-    pub open_pct: f64,         // 开盘涨幅 (%)
-    pub high_pct: f64,         // 日内最高涨幅 (%)
-    pub low_pct: f64,          // 日内最低涨幅 (%)
-    pub close_pct: f64,        // 收盘涨幅 (%)
-    pub amplitude: f64,        // 日内振幅 = (high-low)/pre_close (%)
-    pub tail_30m_pct: f64,     // 尾盘 30 分钟涨幅（14:30→15:00）
+    pub date: String,              // 交易日
+    pub pre_close: f64,            // 昨收
+    pub open_pct: f64,             // 开盘涨幅 (%)
+    pub high_pct: f64,             // 日内最高涨幅 (%)
+    pub low_pct: f64,              // 日内最低涨幅 (%)
+    pub close_pct: f64,            // 收盘涨幅 (%)
+    pub amplitude: f64,            // 日内振幅 = (high-low)/pre_close (%)
+    pub tail_30m_pct: f64,         // 尾盘 30 分钟涨幅（14:30→15:00）
     pub shape_label: &'static str, // 形态标签（中文描述）
-    pub present: bool,         // 是否成功获取数据
+    pub present: bool,             // 是否成功获取数据
 }
 
 /// 转 A 股代码为 EM 数字市场前缀
 fn to_em_numeric_secid(code: &str) -> String {
-    let market = if code.starts_with('6')
-        || code.starts_with("900")
-        || code.starts_with("688")
-    {
+    let market = if code.starts_with('6') || code.starts_with("900") || code.starts_with("688") {
         "1" // 沪市
     } else if code.starts_with('8') || code.starts_with('4') {
         "0" // 北交所实际是 0（EM 约定），但 push2his 对北交所资金流无数据，保持一致
@@ -148,11 +145,7 @@ async fn fetch_flow_history_sina_async(
         "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/MoneyFlow.ssl_qsfx_zjlrqs?page=1&num={}&sort=opendate&asc=0&daima={}",
         lmt.max(5), symbol
     );
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .context("Sina HTTP请求失败")?;
+    let response = client.get(&url).send().await.context("Sina HTTP请求失败")?;
     if !response.status().is_success() {
         return Err(anyhow!("Sina 状态码 {}", response.status()));
     }
@@ -161,8 +154,7 @@ async fn fetch_flow_history_sina_async(
     if text.trim().is_empty() {
         return Err(anyhow!("Sina 返回空响应"));
     }
-    let rows: Vec<SinaMoneyflowRow> = serde_json::from_str(&text)
-        .context("Sina JSON解析失败")?;
+    let rows: Vec<SinaMoneyflowRow> = serde_json::from_str(&text).context("Sina JSON解析失败")?;
     if rows.is_empty() {
         return Ok(MoneyFlowSummary::default());
     }
@@ -275,15 +267,13 @@ pub async fn fetch_flow_history_async(
             };
             // review #14: splitn(13, ',') 限制切分数量, 避免 15 字段时分配 15 元素 Vec.
             let parts: Vec<&str> = s.splitn(13, ',').collect();
-            if parts.len() < 13 { continue; }
+            if parts.len() < 13 {
+                continue;
+            }
             let parse_f = |i: usize| parts.get(i).and_then(|p| p.parse::<f64>().ok());
-            let (Some(main_net), Some(big_net), Some(xl_net), Some(main_pct), Some(pct_chg)) = (
-                parse_f(1),
-                parse_f(4),
-                parse_f(5),
-                parse_f(6),
-                parse_f(12),
-            ) else {
+            let (Some(main_net), Some(big_net), Some(xl_net), Some(main_pct), Some(pct_chg)) =
+                (parse_f(1), parse_f(4), parse_f(5), parse_f(6), parse_f(12))
+            else {
                 continue;
             };
             days.push(MoneyFlowDay {
@@ -307,7 +297,10 @@ pub async fn fetch_flow_history_async(
             log::info!("[资金流][Sina] {} 取得 {} 天数据", code, summary.days.len());
             Ok(summary)
         }
-        Ok(_) => Err(anyhow!("资金流历史全部主机失败: {}；Sina 返回空数据", east_err)),
+        Ok(_) => Err(anyhow!(
+            "资金流历史全部主机失败: {}；Sina 返回空数据",
+            east_err
+        )),
         Err(sina_err) => Err(anyhow!(
             "资金流历史全部主机失败: {}；Sina fallback失败: {}",
             east_err,
@@ -335,9 +328,17 @@ pub async fn fetch_intraday_shape_async(
         );
         log::debug!("[分时] host={} {}", host, url);
 
-        let resp = match client.get(&url).header("Referer", "https://quote.eastmoney.com/").send().await {
+        let resp = match client
+            .get(&url)
+            .header("Referer", "https://quote.eastmoney.com/")
+            .send()
+            .await
+        {
             Ok(r) => r,
-            Err(e) => { last_err = format!("{}: {}", host, e); continue; }
+            Err(e) => {
+                last_err = format!("{}: {}", host, e);
+                continue;
+            }
         };
         if !resp.status().is_success() {
             last_err = format!("{}: 状态码 {}", host, resp.status());
@@ -345,7 +346,10 @@ pub async fn fetch_intraday_shape_async(
         }
         let text = match resp.text().await {
             Ok(t) => t,
-            Err(e) => { last_err = format!("{}: 读取失败 {}", host, e); continue; }
+            Err(e) => {
+                last_err = format!("{}: 读取失败 {}", host, e);
+                continue;
+            }
         };
         let body = text.trim_start();
         if body.starts_with('<') {
@@ -353,16 +357,20 @@ pub async fn fetch_intraday_shape_async(
             continue;
         }
         match serde_json::from_str::<Value>(&text) {
-            Ok(v) => { json_opt = Some(v); break; }
-            Err(e) => { last_err = format!("{}: JSON解析失败 {}", host, e); continue; }
+            Ok(v) => {
+                json_opt = Some(v);
+                break;
+            }
+            Err(e) => {
+                last_err = format!("{}: JSON解析失败 {}", host, e);
+                continue;
+            }
         }
     }
 
     let json = json_opt.ok_or_else(|| anyhow!("分时全部主机失败: {}", last_err))?;
 
-    let data = json
-        .get("data")
-        .ok_or_else(|| anyhow!("分时 无 data"))?;
+    let data = json.get("data").ok_or_else(|| anyhow!("分时 无 data"))?;
     let pre_close = data
         .get("preClose")
         .and_then(as_f64)
@@ -439,7 +447,7 @@ pub async fn fetch_intraday_shape_async(
         return Err(anyhow!("分时 高低价未找到"));
     }
 
-    let open_pct = (first.1 / pre_close - 1.0) * 100.0;     // 首根 open
+    let open_pct = (first.1 / pre_close - 1.0) * 100.0; // 首根 open
     let high_pct = (day_high / pre_close - 1.0) * 100.0;
     let low_pct = (day_low / pre_close - 1.0) * 100.0;
     let close_pct = (last.2 / pre_close - 1.0) * 100.0;
@@ -451,7 +459,7 @@ pub async fn fetch_intraday_shape_async(
 
     // 形态识别
     let gap_from_high = high_pct - close_pct; // 收盘距日内最高回落幅度
-    let gap_from_low = close_pct - low_pct;   // 收盘距日内最低拉升幅度
+    let gap_from_low = close_pct - low_pct; // 收盘距日内最低拉升幅度
     let shape_label = if high_pct >= 2.0 && gap_from_high >= 2.0 && close_pct < high_pct * 0.5 {
         "⚠️ 冲高回落（尾盘跳水风险大）"
     } else if tail_30m_pct <= -1.5 {
@@ -531,7 +539,13 @@ pub fn fetch_intraday_shape_blocking(client: &reqwest::Client, code: &str) -> In
             Ok(s) => {
                 log::info!(
                     "[分时] {} {} open={:+.2}% high={:+.2}% close={:+.2}% tail30={:+.2}% 形态={}",
-                    code_s, s.date, s.open_pct, s.high_pct, s.close_pct, s.tail_30m_pct, s.shape_label
+                    code_s,
+                    s.date,
+                    s.open_pct,
+                    s.high_pct,
+                    s.close_pct,
+                    s.tail_30m_pct,
+                    s.shape_label
                 );
                 s
             }
@@ -551,7 +565,15 @@ pub fn format_for_prompt(flow: &MoneyFlowSummary, shape: &IntradayShape) -> Stri
     if !flow.is_empty() {
         out.push_str("\n【主力资金流向（真实口径，单位：亿元）】\n");
         out.push_str("日期 | 涨跌幅% | 主力净流入 | 主力占比% | 超大单 | 大单\n");
-        for d in flow.days.iter().rev().take(5).collect::<Vec<_>>().iter().rev() {
+        for d in flow
+            .days
+            .iter()
+            .rev()
+            .take(5)
+            .collect::<Vec<_>>()
+            .iter()
+            .rev()
+        {
             out.push_str(&format!(
                 "{} | {:+.2}% | {:+.2} | {:+.2}% | {:+.2} | {:+.2}\n",
                 d.date,

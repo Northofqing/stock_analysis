@@ -308,6 +308,10 @@ impl SearchProvider for SseSzseProvider {
         true // 交易所公开接口，免费可用
     }
 
+    fn supports_topic_search(&self) -> bool {
+        false // 按 6 位股票代码查公告, 无法做主题词搜索
+    }
+
     async fn search(&self, query: &str, max_results: usize) -> SearchResponse {
         match self.do_search(query, max_results).await {
             Ok(response) => {
@@ -333,16 +337,34 @@ mod tests {
 
     #[test]
     fn test_classify_market_sse() {
-        assert_eq!(SseSzseProvider::classify_market("600519"), Some(Market::Sse));
-        assert_eq!(SseSzseProvider::classify_market("688981"), Some(Market::Sse));
-        assert_eq!(SseSzseProvider::classify_market("900957"), Some(Market::Sse));
+        assert_eq!(
+            SseSzseProvider::classify_market("600519"),
+            Some(Market::Sse)
+        );
+        assert_eq!(
+            SseSzseProvider::classify_market("688981"),
+            Some(Market::Sse)
+        );
+        assert_eq!(
+            SseSzseProvider::classify_market("900957"),
+            Some(Market::Sse)
+        );
     }
 
     #[test]
     fn test_classify_market_szse() {
-        assert_eq!(SseSzseProvider::classify_market("000001"), Some(Market::Szse));
-        assert_eq!(SseSzseProvider::classify_market("002594"), Some(Market::Szse));
-        assert_eq!(SseSzseProvider::classify_market("300750"), Some(Market::Szse));
+        assert_eq!(
+            SseSzseProvider::classify_market("000001"),
+            Some(Market::Szse)
+        );
+        assert_eq!(
+            SseSzseProvider::classify_market("002594"),
+            Some(Market::Szse)
+        );
+        assert_eq!(
+            SseSzseProvider::classify_market("300750"),
+            Some(Market::Szse)
+        );
     }
 
     #[test]

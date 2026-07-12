@@ -167,9 +167,21 @@ mod tests {
     #[test]
     fn merge_same_code_multiple_sources() {
         let items = vec![
-            (CandidateSource::StockPick, "000001".to_string(), "测试A".to_string()),
-            (CandidateSource::OptimalClose, "000001".to_string(), "测试A".to_string()),
-            (CandidateSource::IndustryChain, "000001".to_string(), "测试A".to_string()),
+            (
+                CandidateSource::StockPick,
+                "000001".to_string(),
+                "测试A".to_string(),
+            ),
+            (
+                CandidateSource::OptimalClose,
+                "000001".to_string(),
+                "测试A".to_string(),
+            ),
+            (
+                CandidateSource::IndustryChain,
+                "000001".to_string(),
+                "测试A".to_string(),
+            ),
         ];
         let result = merge_candidates(items);
         assert_eq!(result.len(), 1);
@@ -200,9 +212,21 @@ mod tests {
     #[test]
     fn merge_different_codes() {
         let items = vec![
-            (CandidateSource::StockPick, "000001".to_string(), "A".to_string()),
-            (CandidateSource::OptimalClose, "000002".to_string(), "B".to_string()),
-            (CandidateSource::IndustryChain, "000003".to_string(), "C".to_string()),
+            (
+                CandidateSource::StockPick,
+                "000001".to_string(),
+                "A".to_string(),
+            ),
+            (
+                CandidateSource::OptimalClose,
+                "000002".to_string(),
+                "B".to_string(),
+            ),
+            (
+                CandidateSource::IndustryChain,
+                "000003".to_string(),
+                "C".to_string(),
+            ),
         ];
         let result = merge_candidates(items);
         assert_eq!(result.len(), 3);
@@ -212,9 +236,21 @@ mod tests {
     #[test]
     fn merge_dedup_same_source() {
         let items = vec![
-            (CandidateSource::StockPick, "000001".to_string(), "测试".to_string()),
-            (CandidateSource::StockPick, "000001".to_string(), "测试".to_string()),
-            (CandidateSource::StockPick, "000001".to_string(), "测试".to_string()),
+            (
+                CandidateSource::StockPick,
+                "000001".to_string(),
+                "测试".to_string(),
+            ),
+            (
+                CandidateSource::StockPick,
+                "000001".to_string(),
+                "测试".to_string(),
+            ),
+            (
+                CandidateSource::StockPick,
+                "000001".to_string(),
+                "测试".to_string(),
+            ),
         ];
         let result = merge_candidates(items);
         assert_eq!(result.len(), 1);
@@ -225,14 +261,26 @@ mod tests {
     #[test]
     fn merge_sort_by_source_count() {
         let items = vec![
-            (CandidateSource::StockPick, "000001".to_string(), "A".to_string()),
-            (CandidateSource::OptimalClose, "000002".to_string(), "B".to_string()),
+            (
+                CandidateSource::StockPick,
+                "000001".to_string(),
+                "A".to_string(),
+            ),
+            (
+                CandidateSource::OptimalClose,
+                "000002".to_string(),
+                "B".to_string(),
+            ),
             (
                 CandidateSource::StockPick,
                 "000003".to_string(),
                 "C".to_string(),
             ),
-            (CandidateSource::IndustryChain, "000003".to_string(), "C".to_string()),
+            (
+                CandidateSource::IndustryChain,
+                "000003".to_string(),
+                "C".to_string(),
+            ),
         ];
         let result = merge_candidates(items);
         assert_eq!(result[0].code, "000003", "2-source 票应排第一");
@@ -256,12 +304,25 @@ mod tests {
 pub fn classify_tier(evidence: &[String]) -> EvidenceTier {
     let combined = evidence.join(" ");
     // 唯一 Strong: 布林+MACD (P5 §3.2 唯一能进强证据, 强证据的"已验证"标签来自 v11 factor_ic 认可 B 方案)
-    let strong_keywords = ["布林+MACD", "B方案", "主升浪启动", "B方案(已验证)", "布林+MACD主升浪"];
+    let strong_keywords = [
+        "布林+MACD",
+        "B方案",
+        "主升浪启动",
+        "B方案(已验证)",
+        "布林+MACD主升浪",
+    ];
     if strong_keywords.iter().any(|kw| combined.contains(kw)) {
         return EvidenceTier::Strong;
     }
     // Reference: breakout / 空中加油 / 放量 / 资金 (未验证, P5 §3.2 强制不进 Strong)
-    let reference_keywords = ["breakout", "空中加油", "放量", "资金净流入", "MACD金叉", "RSI"];
+    let reference_keywords = [
+        "breakout",
+        "空中加油",
+        "放量",
+        "资金净流入",
+        "MACD金叉",
+        "RSI",
+    ];
     if reference_keywords.iter().any(|kw| combined.contains(kw)) {
         return EvidenceTier::Reference;
     }
@@ -299,10 +360,7 @@ pub fn filter_hard_gates(
                 return false;
             }
             // 4. 剔除北交所/科创板 (8/4/688 开头, 承接现有过滤)
-            if e.code.starts_with('8')
-                || e.code.starts_with('4')
-                || e.code.starts_with("688")
-            {
+            if e.code.starts_with('8') || e.code.starts_with('4') || e.code.starts_with("688") {
                 return false;
             }
             // 5. 剔除已涨停 (change_pct >= 9.9%)
@@ -516,7 +574,11 @@ pub fn format_candidate_board(entries: &[CandidateEntry]) -> String {
             out.push_str("   ⚠️ 无强证据, 仅参考\n");
         }
         // 来源
-        out.push_str(&format!("   来源: {} ({} 路指向)\n", e.sources_label(), e.source_count()));
+        out.push_str(&format!(
+            "   来源: {} ({} 路指向)\n",
+            e.sources_label(),
+            e.source_count()
+        ));
     }
     out.push_str("━━━━━━━━━━━\n");
     out.push_str("💡 强证据票排前; \"参考\" 类需你自行判断, 系统不下买入指令\n");
@@ -543,9 +605,21 @@ mod tests_c {
     #[test]
     fn sort_strong_before_reference() {
         let entries = vec![
-            make_entry("000001", EvidenceTier::Theme, vec![CandidateSource::StockPick]),
-            make_entry("000002", EvidenceTier::Reference, vec![CandidateSource::StockPick]),
-            make_entry("000003", EvidenceTier::Strong, vec![CandidateSource::StockPick]),
+            make_entry(
+                "000001",
+                EvidenceTier::Theme,
+                vec![CandidateSource::StockPick],
+            ),
+            make_entry(
+                "000002",
+                EvidenceTier::Reference,
+                vec![CandidateSource::StockPick],
+            ),
+            make_entry(
+                "000003",
+                EvidenceTier::Strong,
+                vec![CandidateSource::StockPick],
+            ),
         ];
         let sorted = sort_candidates(entries);
         assert_eq!(sorted[0].code, "000003", "Strong 排第一");
@@ -557,7 +631,11 @@ mod tests_c {
     #[test]
     fn sort_multi_source_first_in_same_tier() {
         let entries = vec![
-            make_entry("000001", EvidenceTier::Strong, vec![CandidateSource::StockPick]),
+            make_entry(
+                "000001",
+                EvidenceTier::Strong,
+                vec![CandidateSource::StockPick],
+            ),
             make_entry(
                 "000002",
                 EvidenceTier::Strong,
@@ -649,9 +727,9 @@ pub fn parse_text_to_raw(text: &str) -> Vec<(String, String)> {
                         count += 1;
                         if count == 6 {
                             break;
-                    }
-                } else {
-                    break;
+                        }
+                    } else {
+                        break;
                     }
                 }
                 if count == 6 {
@@ -677,9 +755,58 @@ pub fn parse_text_to_raw(text: &str) -> Vec<(String, String)> {
             //       (推荐格式 "600519 贵州茅台 +3.2%" → "贵州茅台")
             let name_after: String = after
                 .trim_start()
-                .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | '（' | '）' | '【' | '】' | '[' | ']' | ',' | '，' | '.' | '。' | ':' | '：'))
+                .trim_start_matches(|c: char| {
+                    c.is_whitespace()
+                        || matches!(
+                            c,
+                            '(' | ')'
+                                | '（'
+                                | '）'
+                                | '【'
+                                | '】'
+                                | '['
+                                | ']'
+                                | ','
+                                | '，'
+                                | '.'
+                                | '。'
+                                | ':'
+                                | '：'
+                        )
+                })
                 .chars()
-                .take_while(|c| !matches!(c, ' ' | '\t' | '+' | '-' | '%' | '|' | '（' | '(' | ')' | '）' | '[' | ']' | '【' | '】' | ',' | '，' | '.' | '。' | '!' | '?' | '$' | '—' | '·' | '、' | '：' | ':' | '；' | ';'))
+                .take_while(|c| {
+                    !matches!(
+                        c,
+                        ' ' | '\t'
+                            | '+'
+                            | '-'
+                            | '%'
+                            | '|'
+                            | '（'
+                            | '('
+                            | ')'
+                            | '）'
+                            | '['
+                            | ']'
+                            | '【'
+                            | '】'
+                            | ','
+                            | '，'
+                            | '.'
+                            | '。'
+                            | '!'
+                            | '?'
+                            | '$'
+                            | '—'
+                            | '·'
+                            | '、'
+                            | '：'
+                            | ':'
+                            | '；'
+                            | ';'
+                    )
+                })
                 .collect();
             // 退化: code 前最近的 CJK 连续段
             //       (放量格式 "纳微科技(688690) — ..." → "纳微科技")
@@ -696,7 +823,11 @@ pub fn parse_text_to_raw(text: &str) -> Vec<(String, String)> {
             } else {
                 String::new()
             };
-            let name = if !name_after.is_empty() { name_after } else { name_before };
+            let name = if !name_after.is_empty() {
+                name_after
+            } else {
+                name_before
+            };
             let name = name.trim().to_string();
             if !name.is_empty() && seen.insert(code.to_string()) {
                 out.push((code.to_string(), name));
@@ -803,9 +934,7 @@ pub fn heat_score(change_pct: f64, main_inflow: f64) -> f64 {
 ///
 /// 热度数据: P5 §四 红线"热度分用于排序" — 当前 main.rs 没接 heat_score, 留 0 占位.
 /// main.rs 调用时填 e.heat_score (后续 commit 加 CandidateEntry.heat_score 字段).
-pub fn sort_candidates_by_heat(
-    mut entries: Vec<CandidateEntry>,
-) -> Vec<CandidateEntry> {
+pub fn sort_candidates_by_heat(mut entries: Vec<CandidateEntry>) -> Vec<CandidateEntry> {
     entries.sort_by(|a, b| {
         let tier_a = match a.tier {
             EvidenceTier::Strong => 0,
@@ -825,7 +954,9 @@ pub fn sort_candidates_by_heat(
                 // 当前 heat_score 字段不存在, 用 change_pct 临时替代 (后续 commit 改)
                 let heat_a = a.change_pct; // 占位
                 let heat_b = b.change_pct;
-                heat_b.partial_cmp(&heat_a).unwrap_or(std::cmp::Ordering::Equal)
+                heat_b
+                    .partial_cmp(&heat_a)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             })
             .then_with(|| a.code.cmp(&b.code))
     });
@@ -863,30 +994,57 @@ mod tests_heat {
     #[test]
     fn heat_change_pct_dominates() {
         let s = heat_score(10.0, 0.0);
-        assert!((s - 6.0).abs() < 1e-6, "涨幅 10% + 流入 0 = 6 分, 实际 {}", s);
+        assert!(
+            (s - 6.0).abs() < 1e-6,
+            "涨幅 10% + 流入 0 = 6 分, 实际 {}",
+            s
+        );
     }
 
     /// heat_score 主力净流入 1 亿 = 0.4 分 (太低, 不显著)
     #[test]
     fn heat_main_inflow_small() {
         let s = heat_score(0.0, 1e8);
-        assert!((s - 0.4).abs() < 1e-6, "涨幅 0 + 流入 1亿 = 0.4 分, 实际 {}", s);
+        assert!(
+            (s - 0.4).abs() < 1e-6,
+            "涨幅 0 + 流入 1亿 = 0.4 分, 实际 {}",
+            s
+        );
     }
 
     /// heat_score 主力净流入 100 亿 = 40 分 (封顶)
     #[test]
     fn heat_main_inflow_capped() {
         let s = heat_score(0.0, 100.0 * 1e8);
-        assert!((s - 40.0).abs() < 1e-6, "涨幅 0 + 流入 100亿 = 40 分, 实际 {}", s);
+        assert!(
+            (s - 40.0).abs() < 1e-6,
+            "涨幅 0 + 流入 100亿 = 40 分, 实际 {}",
+            s
+        );
     }
 
     /// 排序: 同 tier 同 source 时, 涨幅高排前
     #[test]
     fn sort_by_heat_same_tier_source() {
         let entries = vec![
-            make_entry("000001", EvidenceTier::Reference, vec![CandidateSource::StockPick], 0.0),
-            make_entry("000002", EvidenceTier::Reference, vec![CandidateSource::StockPick], 5.0),
-            make_entry("000003", EvidenceTier::Reference, vec![CandidateSource::StockPick], 3.0),
+            make_entry(
+                "000001",
+                EvidenceTier::Reference,
+                vec![CandidateSource::StockPick],
+                0.0,
+            ),
+            make_entry(
+                "000002",
+                EvidenceTier::Reference,
+                vec![CandidateSource::StockPick],
+                5.0,
+            ),
+            make_entry(
+                "000003",
+                EvidenceTier::Reference,
+                vec![CandidateSource::StockPick],
+                3.0,
+            ),
         ];
         let sorted = sort_candidates_by_heat(entries);
         // 涨幅 desc: 5.0 (000002), 3.0 (000003), 0.0 (000001)

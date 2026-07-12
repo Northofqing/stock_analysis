@@ -35,12 +35,12 @@ pub fn build_kline_url(code: &str, days: usize) -> String {
 /// Sina K线 JSON 数组中的一条 (JSONP body 内的 `[ ... ]` 元素).
 #[derive(Debug, Deserialize)]
 pub struct SinaKlineRow {
-    pub day: String,        // "2024-01-15"
-    pub open: String,       // 字符串数字
+    pub day: String,  // "2024-01-15"
+    pub open: String, // 字符串数字
     pub high: String,
     pub low: String,
     pub close: String,
-    pub volume: String,     // 手
+    pub volume: String, // 手
 }
 
 /// 构造 Sina 实时行情 URL.
@@ -49,10 +49,7 @@ pub struct SinaKlineRow {
 ///
 /// 多个 code 用逗号分隔, 一次请求拿多个. 内部自动 `to_sina` 加前缀.
 pub fn build_hq_url(codes: &str) -> String {
-    let sina_codes: Vec<String> = codes
-        .split(',')
-        .map(|c| to_sina(c.trim()))
-        .collect();
+    let sina_codes: Vec<String> = codes.split(',').map(|c| to_sina(c.trim())).collect();
     format!("https://hq.sinajs.cn/list={}", sina_codes.join(","))
 }
 
@@ -77,9 +74,7 @@ pub struct SinaHqQuote {
 /// 至少需要 10 个字段 (含 name + 9 个数值), 少于则报错.
 pub fn parse_hq_str(body: &str, code: &str) -> Result<SinaHqQuote> {
     // 提取第一对 `"..."` 内的 CSV.
-    let start = body
-        .find('"')
-        .ok_or_else(|| anyhow!("Sina hq: 无引号"))?;
+    let start = body.find('"').ok_or_else(|| anyhow!("Sina hq: 无引号"))?;
     let end = body
         .rfind('"')
         .ok_or_else(|| anyhow!("Sina hq: 引号不闭合"))?;
@@ -117,7 +112,8 @@ impl SinaProvider {
     /// 抓取 Sina K线 (GBK → UTF-8 decode).
     pub async fn fetch_kline_raw(&self, code: &str, days: usize) -> Result<Vec<KlineData>> {
         let url = build_kline_url(code, days);
-        let bytes = self.client
+        let bytes = self
+            .client
             .get(&url)
             .header("Referer", "https://finance.sina.com.cn")
             .send()
@@ -137,7 +133,8 @@ impl SinaProvider {
     /// 抓取 Sina 实时行情 (单只, GBK → UTF-8 decode).
     pub async fn fetch_hq_async(&self, code: &str) -> Result<SinaHqQuote> {
         let url = build_hq_url(code);
-        let bytes = self.client
+        let bytes = self
+            .client
             .get(&url)
             .header("Referer", "https://finance.sina.com.cn")
             .send()
@@ -163,8 +160,8 @@ pub fn parse_kline_body(body: &str, code: &str) -> Result<Vec<KlineData>> {
         .rfind(']')
         .ok_or_else(|| anyhow!("Sina K线: JSON 不完整"))?;
     let json = &body[start..=end];
-    let rows: Vec<SinaKlineRow> = serde_json::from_str(json)
-        .map_err(|e| anyhow!("Sina K线 JSON parse 失败: {e}"))?;
+    let rows: Vec<SinaKlineRow> =
+        serde_json::from_str(json).map_err(|e| anyhow!("Sina K线 JSON parse 失败: {e}"))?;
     Ok(rows.into_iter().map(|r| map_kline_row(r, code)).collect())
 }
 
@@ -178,10 +175,19 @@ fn map_kline_row(r: SinaKlineRow, _code: &str) -> KlineData {
     let low = r.low.parse().unwrap_or(0.0);
     let close = r.close.parse().unwrap_or(0.0);
     let volume = r.volume.parse().unwrap_or(0.0);
-    let pct_chg = if open > 0.0 { (close - open) / open * 100.0 } else { 0.0 };
+    let pct_chg = if open > 0.0 {
+        (close - open) / open * 100.0
+    } else {
+        0.0
+    };
     KlineData {
-        date, open, high, low, close, volume,
-        amount: 0.0,  // Sina K线 API 不直接给 amount
+        date,
+        open,
+        high,
+        low,
+        close,
+        volume,
+        amount: 0.0, // Sina K线 API 不直接给 amount
         pct_chg,
         intraday_price: None,
         settled: true,

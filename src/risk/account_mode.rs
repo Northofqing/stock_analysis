@@ -360,7 +360,11 @@ mod tests {
         assert_eq!(r.mode, AccountMode::Normal, "3% 亏损在宽松阈值下应 Normal");
 
         let r = evaluate(&m(-6.0, 0, 5), Some(AccountMode::Normal), &custom);
-        assert_eq!(r.mode, AccountMode::ReduceOnly, "6% 亏损在宽松阈值下应 ReduceOnly");
+        assert_eq!(
+            r.mode,
+            AccountMode::ReduceOnly,
+            "6% 亏损在宽松阈值下应 ReduceOnly"
+        );
     }
 
     // ---- 默认阈值常量稳定性 ----

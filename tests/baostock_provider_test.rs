@@ -24,13 +24,17 @@ fn parse_kline_body_format() {
     let body = "code,date,open,high,low,close,volume,amount\n\
                 sh.600000,2024-01-15,13.50,13.60,13.45,13.55,12345,16789.50\n\
                 sh.600000,2024-01-16,13.55,13.70,13.50,13.65,15000,20000.00\n";
-    let klines = stock_analysis::data_provider::baostock_provider::parse_kline_body(body, "600000").unwrap();
+    let klines =
+        stock_analysis::data_provider::baostock_provider::parse_kline_body(body, "600000").unwrap();
     assert_eq!(klines.len(), 2);
     assert_eq!(klines[0].open, 13.50);
     assert_eq!(klines[0].close, 13.55);
     assert_eq!(klines[0].volume, 12345.0);
     assert_eq!(klines[0].amount, 16789.50);
-    assert_eq!(klines[1].date, chrono::NaiveDate::from_ymd_opt(2024, 1, 16).unwrap());
+    assert_eq!(
+        klines[1].date,
+        chrono::NaiveDate::from_ymd_opt(2024, 1, 16).unwrap()
+    );
 }
 
 #[test]
@@ -69,10 +73,7 @@ fn parse_baostock_response_extracts_field() {
         parse_baostock_response(body, "ErrorCode").unwrap(),
         Some("0".to_string())
     );
-    assert_eq!(
-        parse_baostock_response(body, "Missing").unwrap(),
-        None
-    );
+    assert_eq!(parse_baostock_response(body, "Missing").unwrap(), None);
 }
 
 // ============================================================================
@@ -199,7 +200,9 @@ fn test_parse_kline_response_decompresses() {
 
     let parsed = parse_baostock_tcp_response(&msg).expect("parse compressed kline response");
     assert_eq!(parsed.msg_type, "96");
-    assert!(parsed.body.contains("date,open,high,low,close,volume,amount"));
+    assert!(parsed
+        .body
+        .contains("date,open,high,low,close,volume,amount"));
     assert!(parsed.body.contains("13.50"));
     assert!(parsed.body.contains("2024-01-16"));
 
@@ -207,7 +210,10 @@ fn test_parse_kline_response_decompresses() {
         .expect("parse_kline_response_kline should succeed");
     assert_eq!(klines.len(), 2);
     assert_eq!(klines[0].open, 13.50);
-    assert_eq!(klines[1].date, chrono::NaiveDate::from_ymd_opt(2024, 1, 16).unwrap());
+    assert_eq!(
+        klines[1].date,
+        chrono::NaiveDate::from_ymd_opt(2024, 1, 16).unwrap()
+    );
 }
 
 // ============================================================================
@@ -223,11 +229,7 @@ fn baostock_crc32(buf: &[u8]) -> u32 {
     for i in 0..256u32 {
         let mut c = i;
         for _ in 0..8 {
-            c = if c & 1 != 0 {
-                POLY ^ (c >> 1)
-            } else {
-                c >> 1
-            };
+            c = if c & 1 != 0 { POLY ^ (c >> 1) } else { c >> 1 };
         }
         table[i as usize] = c;
     }
@@ -307,8 +309,7 @@ async fn test_read_tcp_response_times_out_on_hang() {
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
 
     // 用 500ms timeout, 服务端挂起, 应返 Err (而不是永久 await)
-    let result =
-        read_tcp_response(&mut stream, std::time::Duration::from_millis(500)).await;
+    let result = read_tcp_response(&mut stream, std::time::Duration::from_millis(500)).await;
 
     assert!(
         result.is_err(),

@@ -95,7 +95,10 @@ pub struct NewsOutcome {
 /// review #14: 原本 iter().rev().find() 调用 8+ 次 (evaluate_audit 一次评估内).
 /// 改 rposition 一次扫, 同时配合 evaluate_audit 入口的 push_idx 缓存,
 /// 整体评估从 O(n × k_calls) 降到 O(n) + O(1) 索引.
-fn kline_at_or_before(klines: &[crate::data_provider::KlineData], date: NaiveDate) -> Option<&crate::data_provider::KlineData> {
+fn kline_at_or_before(
+    klines: &[crate::data_provider::KlineData],
+    date: NaiveDate,
+) -> Option<&crate::data_provider::KlineData> {
     klines
         .iter()
         .rposition(|k| k.date <= date)
@@ -105,7 +108,10 @@ fn kline_at_or_before(klines: &[crate::data_provider::KlineData], date: NaiveDat
 /// 推送日 idx 缓存 (review #14 新增). evaluate_audit 入口算一次,
 /// 所有 helper 走 push_idx + 切片偏移, 不再每次都反扫.
 /// 假设 K 线按日期**降序**(最新在前), push_idx+1 之后是推送后窗口.
-fn locate_push_idx(klines: &[crate::data_provider::KlineData], push_date: NaiveDate) -> Option<usize> {
+fn locate_push_idx(
+    klines: &[crate::data_provider::KlineData],
+    push_date: NaiveDate,
+) -> Option<usize> {
     klines.iter().rposition(|k| k.date <= push_date)
 }
 
@@ -145,19 +151,31 @@ fn mfe_mae_idx(
     let mut mae = f64::INFINITY;
     for k in window {
         let r = (k.close - push_k.close) / push_k.close * 100.0;
-        if r > mfe { mfe = r; }
-        if r < mae { mae = r; }
+        if r > mfe {
+            mfe = r;
+        }
+        if r < mae {
+            mae = r;
+        }
     }
     (Some(mfe), Some(mae))
 }
 
 // ===== 兼容 wrapper: 旧 API (klines + push_date) 走新 idx 实现 =====
-fn pct_change_at(klines: &[crate::data_provider::KlineData], push_date: NaiveDate, n_days: usize) -> Option<f64> {
+fn pct_change_at(
+    klines: &[crate::data_provider::KlineData],
+    push_date: NaiveDate,
+    n_days: usize,
+) -> Option<f64> {
     let push_idx = locate_push_idx(klines, push_date)?;
     pct_change_at_idx(klines, push_idx, n_days)
 }
 
-fn mfe_mae(klines: &[crate::data_provider::KlineData], push_date: NaiveDate, n_days: usize) -> (Option<f64>, Option<f64>) {
+fn mfe_mae(
+    klines: &[crate::data_provider::KlineData],
+    push_date: NaiveDate,
+    n_days: usize,
+) -> (Option<f64>, Option<f64>) {
     match locate_push_idx(klines, push_date) {
         Some(idx) => mfe_mae_idx(klines, idx, n_days),
         None => (None, None),
@@ -209,31 +227,40 @@ pub fn evaluate_audit(
         .as_ref()
         .and_then(|ks| locate_push_idx(ks, push_date));
 
-    let push_price = push_idx_opt
-        .and_then(|idx| klines_opt.as_ref().and_then(|ks| ks.get(idx).map(|k| k.close)));
+    let push_price = push_idx_opt.and_then(|idx| {
+        klines_opt
+            .as_ref()
+            .and_then(|ks| ks.get(idx).map(|k| k.close))
+    });
 
     // 涨幅 (走 *_idx, push_idx 复用)
     let d1_pct = push_idx_opt.and_then(|idx| {
-        klines_opt.as_ref().and_then(|ks| pct_change_at_idx(ks, idx, 1))
+        klines_opt
+            .as_ref()
+            .and_then(|ks| pct_change_at_idx(ks, idx, 1))
     });
     let d3_pct = push_idx_opt.and_then(|idx| {
-        klines_opt.as_ref().and_then(|ks| pct_change_at_idx(ks, idx, 3))
+        klines_opt
+            .as_ref()
+            .and_then(|ks| pct_change_at_idx(ks, idx, 3))
     });
     let d5_pct = push_idx_opt.and_then(|idx| {
-        klines_opt.as_ref().and_then(|ks| pct_change_at_idx(ks, idx, 5))
+        klines_opt
+            .as_ref()
+            .and_then(|ks| pct_change_at_idx(ks, idx, 5))
     });
 
     // MFE/MAE (D+1~D+5 5 日窗口)
     let (mfe, mae) = push_idx_opt
-        .and_then(|idx| {
-            klines_opt.as_ref().map(|ks| mfe_mae_idx(ks, idx, 5))
-        })
+        .and_then(|idx| klines_opt.as_ref().map(|ks| mfe_mae_idx(ks, idx, 5)))
         .unwrap_or((None, None));
 
     // 5 维度
     // 1. 涨停买不到: push 当日 pct_chg >= 9.5%
     let limit_up_unbuyable = push_idx_opt.and_then(|idx| {
-        klines_opt.as_ref().and_then(|ks| ks.get(idx).map(|k| k.pct_chg >= 9.5))
+        klines_opt
+            .as_ref()
+            .and_then(|ks| ks.get(idx).map(|k| k.pct_chg >= 9.5))
     });
     // 2. 高开低走 D+1: D+1 open > D+1 prev_close*1.01 AND D+1 close < D+1 open
     //    push_idx+1 直接拿 D+1 K 线, 不再 filter+collect Vec.
@@ -307,7 +334,11 @@ fn judge_verdict(
         return "涨停买不到 (无法兑现)".to_string();
     }
     if d5 >= 3.0 && mae > -3.0 {
-        let suffix = if sector_driven == Some(true) { " (板块普涨带动)" } else { "" };
+        let suffix = if sector_driven == Some(true) {
+            " (板块普涨带动)"
+        } else {
+            ""
+        };
         return format!("有兑现 (D+5 ≥ 3%, 回撤可控){}", suffix);
     }
     if d5 >= 0.0 && mae > -5.0 {
@@ -340,8 +371,8 @@ fn compute_sector_driven(
     stock_klines: Option<&[crate::data_provider::KlineData]>,
     push_date: NaiveDate,
 ) -> Option<bool> {
-    use crate::market_analyzer::sector_monitor;
     use crate::data_provider::DataFetcherManager;
+    use crate::market_analyzer::sector_monitor;
     // 1. 个股 D+1 涨幅
     let stock_d1 = pct_change_at(stock_klines?, push_date, 1)?;
     // 2. chain → board_code → 5 支成份股
@@ -394,10 +425,7 @@ pub fn load_audit(path: &Path) -> Vec<AuditRowRead> {
 }
 
 /// 跑一批 outcome 评估 (read-only, 不写盘)
-pub fn evaluate_batch(
-    rows: Vec<AuditRowRead>,
-    push_date: NaiveDate,
-) -> Vec<NewsOutcome> {
+pub fn evaluate_batch(rows: Vec<AuditRowRead>, push_date: NaiveDate) -> Vec<NewsOutcome> {
     let fetcher = match crate::data_provider::DataFetcherManager::new() {
         Ok(f) => f,
         Err(e) => {
@@ -428,7 +456,9 @@ pub fn evaluate_batch(
                 .collect();
         }
     };
-    rows.iter().map(|r| evaluate_audit(r, push_date, &fetcher)).collect()
+    rows.iter()
+        .map(|r| evaluate_audit(r, push_date, &fetcher))
+        .collect()
 }
 
 /// 渲染 outcome 报告 (markdown 表格)
@@ -440,7 +470,10 @@ pub fn format_outcome_report(outcomes: &[NewsOutcome]) -> String {
     ));
     let total = outcomes.len();
     let a_count = outcomes.iter().filter(|o| o.bucket == "PushNow").count();
-    let b_count = outcomes.iter().filter(|o| o.bucket == "WatchCandidate").count();
+    let b_count = outcomes
+        .iter()
+        .filter(|o| o.bucket == "WatchCandidate")
+        .count();
     let c_count = outcomes.iter().filter(|o| o.bucket == "LogOnly").count();
     let d_count = outcomes.iter().filter(|o| o.bucket == "Drop").count();
     out.push_str(&format!(
@@ -448,9 +481,18 @@ pub fn format_outcome_report(outcomes: &[NewsOutcome]) -> String {
         total, a_count, b_count, c_count, d_count
     ));
     // 兑现统计
-    let realized = outcomes.iter().filter(|o| o.verdict.starts_with("有兑现")).count();
-    let neutral = outcomes.iter().filter(|o| o.verdict.starts_with("中性") || o.verdict.starts_with("观察")).count();
-    let missed = outcomes.iter().filter(|o| o.verdict.starts_with("未兑现") || o.verdict.starts_with("高回撤")).count();
+    let realized = outcomes
+        .iter()
+        .filter(|o| o.verdict.starts_with("有兑现"))
+        .count();
+    let neutral = outcomes
+        .iter()
+        .filter(|o| o.verdict.starts_with("中性") || o.verdict.starts_with("观察"))
+        .count();
+    let missed = outcomes
+        .iter()
+        .filter(|o| o.verdict.starts_with("未兑现") || o.verdict.starts_with("高回撤"))
+        .count();
     out.push_str(&format!(
         "## 兑现统计: 有兑现 {} | 中性/观察 {} | 未兑现/高回撤 {}\n\n",
         realized, neutral, missed
@@ -488,7 +530,8 @@ pub fn format_outcome_report(outcomes: &[NewsOutcome]) -> String {
 }
 
 fn fmt_opt(v: Option<f64>) -> String {
-    v.map(|x| format!("{:.1}", x)).unwrap_or_else(|| "-".to_string())
+    v.map(|x| format!("{:.1}", x))
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn fmt_opt_bool(v: Option<bool>) -> String {
@@ -584,7 +627,13 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        env::temp_dir().join(format!("news_outcome_{}_{}_{}_{}.jsonl", tag, std::process::id(), nanos, n))
+        env::temp_dir().join(format!(
+            "news_outcome_{}_{}_{}_{}.jsonl",
+            tag,
+            std::process::id(),
+            nanos,
+            n
+        ))
     }
 
     fn write_audit(path: &Path, lines: &[&str]) {
@@ -746,7 +795,11 @@ pub fn backfill_recommendations_outcome(date: &str) -> usize {
         }
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
             if let Some(obj) = v.as_object() {
-                rows.push(obj.iter().map(|(k, val)| (k.clone(), val.clone())).collect());
+                rows.push(
+                    obj.iter()
+                        .map(|(k, val)| (k.clone(), val.clone()))
+                        .collect(),
+                );
             }
         }
     }
@@ -764,7 +817,8 @@ pub fn backfill_recommendations_outcome(date: &str) -> usize {
         }
         // 拉 K 线 (推送日 + 5 天)
         // v14.1 review fix: `&ts[..10]` 字节切片在 ts < 10 字节时 panic, 改 ts.get(..10) + warn log
-        let push_date = match ts.get(..10)
+        let push_date = match ts
+            .get(..10)
             .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
         {
             Some(d) => d,
@@ -807,7 +861,7 @@ pub fn backfill_recommendations_outcome(date: &str) -> usize {
         let mut writer = BufWriter::new(file);
         for row in &rows {
             let json = serde_json::Value::Object(
-                row.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                row.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             );
             // review fix: writeln 错误传播, 第一个错误即 abort, 不继续写损坏 jsonl
             writeln!(writer, "{}", json)?;
@@ -820,10 +874,19 @@ pub fn backfill_recommendations_outcome(date: &str) -> usize {
         Ok(())
     })();
     if let Err(e) = write_result {
-        log::error!("[v70+] 写 {} 失败: {} (保留原文件, 清理 .tmp)", path.display(), e);
+        log::error!(
+            "[v70+] 写 {} 失败: {} (保留原文件, 清理 .tmp)",
+            path.display(),
+            e
+        );
         let _ = fs::remove_file(&tmp_path);
         return 0;
     }
-    log::info!("[v70+] backfill {} 写回 {} 条 (date={})", path.display(), updated, date);
+    log::info!(
+        "[v70+] backfill {} 写回 {} 条 (date={})",
+        path.display(),
+        updated,
+        date
+    );
     updated
 }

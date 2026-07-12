@@ -9,15 +9,15 @@ pub mod chip_distribution;
 pub mod consensus;
 pub mod eastmoney_provider;
 pub mod fallback;
-pub mod halt_status;
-pub mod ipo_date;
-pub mod limit_status;
-pub mod north_flow;
 pub mod financials;
 pub mod gtimg_provider;
+pub mod halt_status;
 pub mod industry;
 pub mod intraday_kline;
+pub mod ipo_date;
+pub mod limit_status;
 pub mod money_flow;
+pub mod north_flow;
 pub mod rustdx_provider;
 pub mod service;
 pub mod sina_news_provider;
@@ -31,18 +31,21 @@ pub mod news_item;
 pub use chip_distribution::{
     compute_chip_distribution, format_for_prompt as format_chip_prompt, ChipDistribution,
 };
+pub use consensus::{fetch_blocking as fetch_consensus, ConsensusData, RecentReport};
 pub use eastmoney_provider::HttpProvider;
-pub use financials::{fetch_with_fallback_blocking as fetch_financials, assess_quality, FinancialPeriod, Financials, QualityReport};
+pub use financials::{
+    assess_quality, fetch_with_fallback_blocking as fetch_financials, FinancialPeriod, Financials,
+    QualityReport,
+};
 pub use gtimg_provider::GtimgProvider;
+pub use industry::{fetch_blocking as fetch_industry, IndustryBenchmark};
 pub use money_flow::{
-    fetch_intraday_shape_blocking, fetch_money_flow_blocking, format_for_prompt as format_flow_prompt,
-    IntradayShape, MoneyFlowSummary,
+    fetch_intraday_shape_blocking, fetch_money_flow_blocking,
+    format_for_prompt as format_flow_prompt, IntradayShape, MoneyFlowSummary,
 };
 pub use rustdx_provider::RustdxProvider;
 pub use sina_provider::SinaProvider;
 pub use valuation_history::{fetch_blocking as fetch_valuation_history, ValuationHistory};
-pub use consensus::{fetch_blocking as fetch_consensus, ConsensusData, RecentReport};
-pub use industry::{fetch_blocking as fetch_industry, IndustryBenchmark};
 
 use anyhow::Result;
 use chrono::NaiveDate;
@@ -147,13 +150,13 @@ pub struct KlineData {
     pub market_cap: Option<f64>,      // 总市值（亿元）
     pub circulating_cap: Option<f64>, // 流通市值（亿元）
     // 新增财务指标
-    pub eps: Option<f64>,             // 每股收益（元）
-    pub roe: Option<f64>,             // 净资产收益率(%)
-    pub revenue_yoy: Option<f64>,     // 营业收入同比增长率(%)
-    pub net_profit_yoy: Option<f64>,  // 净利润同比增长率(%)
-    pub gross_margin: Option<f64>,    // 毛利率(%)
-    pub net_margin: Option<f64>,      // 净利率(%)
-    pub sharpe_ratio: Option<f64>,    // 夏普比率（风险调整后收益）
+    pub eps: Option<f64>,            // 每股收益（元）
+    pub roe: Option<f64>,            // 净资产收益率(%)
+    pub revenue_yoy: Option<f64>,    // 营业收入同比增长率(%)
+    pub net_profit_yoy: Option<f64>, // 净利润同比增长率(%)
+    pub gross_margin: Option<f64>,   // 毛利率(%)
+    pub net_margin: Option<f64>,     // 净利率(%)
+    pub sharpe_ratio: Option<f64>,   // 夏普比率（风险调整后收益）
     /// 多期财务历史序列（按报告期从新到旧），仅填充到 data[0]（最新一根 K 线）
     pub financials_history: Option<Vec<FinancialPeriod>>,
     /// PE/PB 历史分位（近 3 年），仅填充到 data[0]
@@ -163,11 +166,11 @@ pub struct KlineData {
     /// 行业横向对标（同业 PE/PB/ROE 中位数 + 个股百分位），仅填充到 data[0]
     pub industry: Option<IndustryBenchmark>,
     // NEW: 涨跌停标记
-    pub is_limit_up: bool,            // 是否涨停
-    pub is_limit_down: bool,          // 是否跌停
-    pub is_suspended: bool,           // 是否停牌
+    pub is_limit_up: bool,   // 是否涨停
+    pub is_limit_down: bool, // 是否跌停
+    pub is_suspended: bool,  // 是否停牌
     // v11 P0-2: 复权方式标注
-    pub adjust: AdjustType,           // 该 K 线价格是前复权 (Qfq) 还是不复权 (None)
+    pub adjust: AdjustType, // 该 K 线价格是前复权 (Qfq) 还是不复权 (None)
 }
 
 /// 数据提供者接口
@@ -181,16 +184,16 @@ pub trait DataProvider: Send + Sync {
     /// # 返回
     /// - Result<Vec<KlineData>>
     fn get_daily_data(&self, code: &str, days: usize) -> Result<Vec<KlineData>>;
-    
+
     /// 获取股票名称
     fn get_stock_name(&self, code: &str) -> Option<String>;
-    
+
     /// 获取实时行情（包含盈利指标）
     fn get_realtime_quote(&self, _code: &str) -> Result<Option<RealtimeQuote>> {
         // 默认实现返回 None
         Ok(None)
     }
-    
+
     /// 获取数据源名称
     fn name(&self) -> &'static str;
 }
@@ -241,7 +244,10 @@ impl DataFetcherManager {
         }
         for provider in &self.providers {
             if let Some(name) = provider.get_stock_name(code) {
-                self.stock_name_cache.write().unwrap().insert(code.to_string(), name.clone());
+                self.stock_name_cache
+                    .write()
+                    .unwrap()
+                    .insert(code.to_string(), name.clone());
                 return Some(name);
             }
         }
@@ -263,13 +269,11 @@ impl DataFetcherManager {
         // 1. 走共享 fallback (腾讯 → 东财 → RustDX)
         // block_on_async_with_timeout 把 future 输出包装成 Result<_, String>,
         // future 本身又是 anyhow::Result, 故嵌套为 Result<Result<_>, String>. 两个 ? 解嵌套.
-        let timeout_result = block_on_async_with_timeout(
-            fallback::fetch_kline_with_fallback(code, days),
-            30,
-        )
-        .map_err(|e| anyhow::anyhow!("fallback 超时: {}", e))?;
-        let (mut data, source_name) = timeout_result
-            .map_err(|e| anyhow::anyhow!("fallback 失败: {}", e))?;
+        let timeout_result =
+            block_on_async_with_timeout(fallback::fetch_kline_with_fallback(code, days), 30)
+                .map_err(|e| anyhow::anyhow!("fallback 超时: {}", e))?;
+        let (mut data, source_name) =
+            timeout_result.map_err(|e| anyhow::anyhow!("fallback 失败: {}", e))?;
 
         log::info!("成功从 {} 获取到 {} 条数据", source_name, data.len());
 
@@ -370,7 +374,10 @@ mod tests {
                 println!("spawn_blocking did not panic (outcome: data fetched or network err)");
             }
             Err(join_err) => {
-                panic!("spawn_blocking panic'd: {} — sync 入口在 spawn_blocking 上下文不安全", join_err);
+                panic!(
+                    "spawn_blocking panic'd: {} — sync 入口在 spawn_blocking 上下文不安全",
+                    join_err
+                );
             }
         }
     }

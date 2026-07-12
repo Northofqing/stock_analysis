@@ -12,8 +12,8 @@
 
 use std::env;
 use std::path::PathBuf;
-use stock_analysis::database::DatabaseManager;
 use stock_analysis::data_provider::DataFetcherManager;
+use stock_analysis::database::DatabaseManager;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -59,19 +59,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for code in &stock_codes {
         match fetcher.get_daily_data(code, days) {
-            Ok((data, _src)) if !data.is_empty() => {
-                match db.save_kline_data(code, &data, source) {
-                    Ok(n) => {
-                        ok_count += 1;
-                        println!("[backfill_daily] {} OK: 写入 {} 条 (latest={})",
-                            code, n, data.first().map(|k| k.date.to_string()).unwrap_or_default());
-                    }
-                    Err(e) => {
-                        fail_count += 1;
-                        eprintln!("[backfill_daily] {} 写入失败: {}", code, e);
-                    }
+            Ok((data, _src)) if !data.is_empty() => match db.save_kline_data(code, &data, source) {
+                Ok(n) => {
+                    ok_count += 1;
+                    println!(
+                        "[backfill_daily] {} OK: 写入 {} 条 (latest={})",
+                        code,
+                        n,
+                        data.first().map(|k| k.date.to_string()).unwrap_or_default()
+                    );
                 }
-            }
+                Err(e) => {
+                    fail_count += 1;
+                    eprintln!("[backfill_daily] {} 写入失败: {}", code, e);
+                }
+            },
             Ok((_, _)) => {
                 fail_count += 1;
                 eprintln!("[backfill_daily] {} 数据为空", code);
@@ -83,11 +85,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!("\n[backfill_daily] 完成: 成功 {} 只, 失败 {} 只, 共 {} 只",
-        ok_count, fail_count, stock_codes.len());
+    println!(
+        "\n[backfill_daily] 完成: 成功 {} 只, 失败 {} 只, 共 {} 只",
+        ok_count,
+        fail_count,
+        stock_codes.len()
+    );
 
     // 5. 验证 (用 sqlite3 直接查, 避免 async 嵌套)
-    if let Some(path) = db_path.as_ref().or(Some(&PathBuf::from("data/stock_analysis.db"))) {
+    if let Some(path) = db_path
+        .as_ref()
+        .or(Some(&PathBuf::from("data/stock_analysis.db")))
+    {
         if let Ok(output) = std::process::Command::new("sqlite3")
             .arg(path)
             .arg("SELECT MAX(date), COUNT(*) FROM stock_daily;")
@@ -95,7 +104,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                println!("[backfill_daily] stock_daily MAX(date)|COUNT(*) = {}", stdout.trim());
+                println!(
+                    "[backfill_daily] stock_daily MAX(date)|COUNT(*) = {}",
+                    stdout.trim()
+                );
             }
         }
     }

@@ -1,5 +1,6 @@
 //! v21: 雪球 (xueqiu.com) 实时新闻数据源
 //!
+//! BR-036: 无 XUEQIU_COOKIE 时降级为不可用，避免主题池噪声与伪失败。
 //! 数据源: https://xueqiu.com/
 //! - 公共时间线 API: /v4/statuses/public_timeline_by_category.json
 //! - category=6 A股 / category=12 港股 / category=0 全部
@@ -35,7 +36,7 @@ pub struct XueqiuProvider {
 
 impl XueqiuProvider {
     pub fn new() -> Self {
-        Self::with_categories(vec![6, 0])  // 默认 A股 + 全部
+        Self::with_categories(vec![6, 0]) // 默认 A股 + 全部
     }
 
     /// 自定义 categories (测试或单类目部署用)
@@ -63,9 +64,9 @@ impl XueqiuProvider {
         #[derive(Deserialize, Debug)]
         struct StatusItem {
             #[serde(rename = "text")]
-            text: Option<String>,  // 雪球 API 实际用 text 字段 (不是 title)
+            text: Option<String>, // 雪球 API 实际用 text 字段 (不是 title)
             #[serde(rename = "data")]
-            data: Option<String>,   // JSON 字符串, 含 status_id
+            data: Option<String>, // JSON 字符串, 含 status_id
             #[serde(rename = "target")]
             target: Option<String>,
             #[serde(rename = "created_at")]
@@ -80,7 +81,7 @@ impl XueqiuProvider {
 
         #[derive(Deserialize, Debug)]
         struct Resp {
-            #[serde(rename = "list")]  // 雪球 API 用 list 不是 statuses
+            #[serde(rename = "list")] // 雪球 API 用 list 不是 statuses
             list: Option<Vec<StatusItem>>,
         }
 
@@ -211,17 +212,7 @@ impl XueqiuProvider {
 
 /// 简单 HTML 标签清理 (用于 description)
 fn strip_html_tags(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut in_tag = false;
-    for ch in s.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(ch),
-            _ => {}
-        }
-    }
-    out
+    crate::util::strip_html_tags(s)
 }
 
 #[async_trait]
@@ -230,7 +221,10 @@ impl SearchProvider for XueqiuProvider {
         &self.name
     }
     fn is_available(&self) -> bool {
-        true
+        // 雪球公共 timeline 实际需 cookie, 未设置时直接不可用 (避免反爬空结果噪声).
+        std::env::var("XUEQIU_COOKIE")
+            .map(|c| !c.trim().is_empty())
+            .unwrap_or(false)
     }
 
     async fn search(&self, query: &str, max_results: usize) -> SearchResponse {
@@ -260,8 +254,13 @@ mod tests {
     #[test]
     fn test_default_categories() {
         let p = XueqiuProvider::new();
-        assert_eq!(p.categories, vec![6, 0]);  // A股 + 全部
-        assert!(p.is_available());
+        assert_eq!(p.categories, vec![6, 0]); // A股 + 全部
+        assert_eq!(
+            p.is_available(),
+            std::env::var("XUEQIU_COOKIE")
+                .map(|c| !c.trim().is_empty())
+                .unwrap_or(false)
+        );
         assert_eq!(p.name, "雪球");
     }
 

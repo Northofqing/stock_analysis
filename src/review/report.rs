@@ -1,8 +1,8 @@
 //! 复盘报告格式化 — 生成微信推送文本。
 
-use crate::portfolio::Position;
-use super::journal::TradeReview;
 use super::equity::EquityStats;
+use super::journal::TradeReview;
+use crate::portfolio::Position;
 
 /// 生成每日复盘报告。`prices` 为 code→当前价 映射，用于计算持仓浮盈。
 pub fn generate_daily_report(
@@ -39,8 +39,7 @@ pub fn generate_daily_report_with_ledger(
     ));
     lines.push(format!(
         "🛡️ 风险值：VaR95={:.2}% | CVaR95={:.2}%（日度）",
-        stats.var95_pct,
-        stats.cvar95_pct,
+        stats.var95_pct, stats.cvar95_pct,
     ));
 
     // ── 交易统计 ──
@@ -66,9 +65,7 @@ pub fn generate_daily_report_with_ledger(
             let emoji = if r.pnl_pct > 0.0 { "🟢" } else { "🔴" };
             let mut detail = format!(
                 "  {} {}({}) 持{}天 {:+.1}%  ¥{:.2}→¥{:.2}",
-                emoji, r.name, r.code,
-                r.holding_days, r.pnl_pct,
-                r.buy_price, r.sell_price,
+                emoji, r.name, r.code, r.holding_days, r.pnl_pct, r.buy_price, r.sell_price,
             );
 
             // 卖出后走势
@@ -105,11 +102,29 @@ pub fn generate_daily_report_with_ledger(
                 Some(v) if (v - p.cost_price).abs() > 0.001 || v == 0.0 => (v, String::new()),
                 _ => (p.cost_price, " 数据不足".to_string()),
             };
-            let pnl_pct = if p.cost_price > 0.0 { (price - p.cost_price) / p.cost_price * 100.0 } else { 0.0 };
-            let emoji = if pnl_pct > 0.0 { "🔺" } else if pnl_pct < -5.0 { "🔻" } else { "→" };
+            let pnl_pct = if p.cost_price > 0.0 {
+                (price - p.cost_price) / p.cost_price * 100.0
+            } else {
+                0.0
+            };
+            let emoji = if pnl_pct > 0.0 {
+                "🔺"
+            } else if pnl_pct < -5.0 {
+                "🔻"
+            } else {
+                "→"
+            };
             lines.push(format!(
                 "  {} {}({}) 持{}天 {:+.1}%  ¥{:.2}→¥{:.2}  {}股{}",
-                emoji, p.name, p.code, holding_days, pnl_pct, p.cost_price, price, p.shares, price_note,
+                emoji,
+                p.name,
+                p.code,
+                holding_days,
+                pnl_pct,
+                p.cost_price,
+                price,
+                p.shares,
+                price_note,
             ));
         }
     }
@@ -137,41 +152,63 @@ pub fn generate_daily_report_with_ledger(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use chrono::NaiveDate;
-    use crate::portfolio::{Position, PositionStatus};
     use super::super::journal::TradeReview;
+    use super::*;
+    use crate::portfolio::{Position, PositionStatus};
+    use chrono::NaiveDate;
 
-    fn date(d: &str) -> NaiveDate { NaiveDate::parse_from_str(d, "%Y-%m-%d").unwrap() }
+    fn date(d: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(d, "%Y-%m-%d").unwrap()
+    }
     fn ndt(d: &str) -> chrono::NaiveDateTime {
-        chrono::NaiveDateTime::parse_from_str(&format!("{} 10:00:00", d), "%Y-%m-%d %H:%M:%S").unwrap()
+        chrono::NaiveDateTime::parse_from_str(&format!("{} 10:00:00", d), "%Y-%m-%d %H:%M:%S")
+            .unwrap()
     }
 
     #[test]
     fn test_report_formatting() {
         let reviews = vec![TradeReview {
-            code: "000547".into(), name: "航天发展".into(),
-            buy_date: date("2026-06-01"), sell_date: date("2026-06-10"),
-            buy_datetime: ndt("2026-06-01"), sell_datetime: ndt("2026-06-10"),
-            buy_price: 10.0, sell_price: 12.0, holding_days: 9,
-            pnl_pct: 20.0, post_exit_chg_5d: Some(2.1),
-            post_exit_chg_20d: None, self_rating: Some(4),
+            code: "000547".into(),
+            name: "航天发展".into(),
+            buy_date: date("2026-06-01"),
+            sell_date: date("2026-06-10"),
+            buy_datetime: ndt("2026-06-01"),
+            sell_datetime: ndt("2026-06-10"),
+            buy_price: 10.0,
+            sell_price: 12.0,
+            holding_days: 9,
+            pnl_pct: 20.0,
+            post_exit_chg_5d: Some(2.1),
+            post_exit_chg_20d: None,
+            self_rating: Some(4),
             lesson: Some("买点可再等一天".into()),
         }];
 
         let stats = EquityStats {
-            total_return_pct: 8.4, annualized_return_pct: 12.0,
-            max_drawdown_pct: 5.2, sharpe_ratio: 0.92,
-            win_rate: 58.0, total_trades: 12, winning_trades: 7,
-            avg_win_pct: 8.2, avg_loss_pct: -4.1, profit_factor: 2.1,
-            var95_pct: 1.8, cvar95_pct: 2.4,
+            total_return_pct: 8.4,
+            annualized_return_pct: 12.0,
+            max_drawdown_pct: 5.2,
+            sharpe_ratio: 0.92,
+            win_rate: 58.0,
+            total_trades: 12,
+            winning_trades: 7,
+            avg_win_pct: 8.2,
+            avg_loss_pct: -4.1,
+            profit_factor: 2.1,
+            var95_pct: 1.8,
+            cvar95_pct: 2.4,
         };
 
         let holdings = vec![Position {
-            code: "603618".into(), name: "杭电股份".into(),
-            shares: 1000, cost_price: 8.2, hard_stop: 7.5,
-            added_at: date("2026-06-05"), status: PositionStatus::Holding,
-            sector: "其他".into(), ..Default::default()
+            code: "603618".into(),
+            name: "杭电股份".into(),
+            shares: 1000,
+            cost_price: 8.2,
+            hard_stop: 7.5,
+            added_at: date("2026-06-05"),
+            status: PositionStatus::Holding,
+            sector: "其他".into(),
+            ..Default::default()
         }];
 
         let mut prices = std::collections::HashMap::new();

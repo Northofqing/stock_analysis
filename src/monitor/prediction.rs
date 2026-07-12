@@ -17,17 +17,26 @@ pub fn save_prediction(
     detail: Option<&str>,
 ) {
     let today = Local::now().format("%Y-%m-%d").to_string();
-    let tomorrow = (Local::now() + chrono::Duration::days(1)).format("%Y-%m-%d").to_string();
+    let tomorrow = (Local::now() + chrono::Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
 
     let Some(db) = DatabaseManager::try_get() else {
         log::warn!("[Prediction] DB 未初始化");
         return;
     };
 
-    if let Err(e) = db.save_prediction_legacy(&today, &tomorrow, theme, stock, direction, score, detail) {
+    if let Err(e) =
+        db.save_prediction_legacy(&today, &tomorrow, theme, stock, direction, score, detail)
+    {
         log::warn!("[Prediction] 保存失败: {}", e);
     } else {
-        log::info!("[Prediction] ✓ {} {} {}分", direction, stock.unwrap_or(theme.unwrap_or("?")), score);
+        log::info!(
+            "[Prediction] ✓ {} {} {}分",
+            direction,
+            stock.unwrap_or(theme.unwrap_or("?")),
+            score
+        );
     }
 }
 
@@ -71,14 +80,23 @@ pub async fn verify_predictions() {
         let pending = match db.get_pending_predictions(&pred_date_s) {
             Ok(v) => v,
             Err(e) => {
-                log::warn!("[Prediction] 查 pending ({} → {}) 失败: {}", pred_date_s, target_date_s, e);
+                log::warn!(
+                    "[Prediction] 查 pending ({} → {}) 失败: {}",
+                    pred_date_s,
+                    target_date_s,
+                    e
+                );
                 continue;
             }
         };
 
-        if pending.is_empty() { continue; }
+        if pending.is_empty() {
+            continue;
+        }
         total_pending += pending.len();
-        if oldest_pred_date.is_empty() { oldest_pred_date = pred_date_s.clone(); }
+        if oldest_pred_date.is_empty() {
+            oldest_pred_date = pred_date_s.clone();
+        }
 
         for pred in pending {
             let Some(code) = pred.stock_code.as_deref() else {
@@ -93,18 +111,29 @@ pub async fn verify_predictions() {
 
             // 2-4. 共享 verify 逻辑: 读 close + 算 actual_change + 判定 hit
             // verify_one 内部向前找最近交易日 (修复 C-1: 周末/节假日不静默 skip)
-            let outcome = match verify_one(&db, code, &pred_date_s, &target_date_s, direction).await {
+            let outcome = match verify_one(&db, code, &pred_date_s, &target_date_s, direction).await
+            {
                 Some(o) => o,
                 None => {
                     // 真正缺数据 (7 天内都没 close), 不能算 verify 失败, 计入 skipped
-                    log::debug!("[Prediction] {} {} → {} 7 天内无可用 close, skip", code, pred_date_s, target_date_s);
+                    log::debug!(
+                        "[Prediction] {} {} → {} 7 天内无可用 close, skip",
+                        code,
+                        pred_date_s,
+                        target_date_s
+                    );
                     skipped += 1;
                     continue;
                 }
             };
 
             // 5. 写回
-            if let Err(e) = db.update_prediction_result(&pred_date_s, Some(code), outcome.actual_change, outcome.hit) {
+            if let Err(e) = db.update_prediction_result(
+                &pred_date_s,
+                Some(code),
+                outcome.actual_change,
+                outcome.hit,
+            ) {
                 log::warn!("[Prediction] {} {} 写回失败: {}", code, pred_date_s, e);
                 skipped += 1;
                 continue;
@@ -119,8 +148,11 @@ pub async fn verify_predictions() {
     } else {
         log::info!(
             "[Prediction] 本轮 verify: pending={} verified={} skipped={} (range: {} → {})",
-            total_pending, verified, skipped,
-            oldest_pred_date, today
+            total_pending,
+            verified,
+            skipped,
+            oldest_pred_date,
+            today
         );
         if total_pending > 0 && verified == 0 {
             log::warn!(
@@ -165,7 +197,9 @@ pub async fn verify_one(
 ) -> Option<VerifyOutcome> {
     let prev_close = read_stock_daily_close_with_offset(db, code, pred_date)?;
     let target_close = read_stock_daily_close_with_offset(db, code, target_date)?;
-    if prev_close <= 0.0 { return None; }
+    if prev_close <= 0.0 {
+        return None;
+    }
 
     let actual_change = (target_close - prev_close) / prev_close * 100.0;
     let hit_threshold = 0.5_f64;
@@ -176,7 +210,10 @@ pub async fn verify_one(
         // |actual| > 0.5 的子句原本冗余 (direction_match 已经隐含), 现在删掉.
         _ => false,
     };
-    Some(VerifyOutcome { actual_change, hit: direction_match })
+    Some(VerifyOutcome {
+        actual_change,
+        hit: direction_match,
+    })
 }
 
 /// 修复 C-1 (2026-06-29 codex review): 向前找最近的有 close 数据的交易日 (最多 7 天 offset)。
@@ -188,11 +225,7 @@ pub async fn verify_one(
 /// - pred_date 是周五, 实际推送日 = 周五 (有数据)
 /// - target_date 是 "next trading day", 通常是推送后第 1 个交易日, 但 verify 跨周末跑
 ///   时可能还没数据 (target_date=周一 verify 在周一晚上跑, 有数据; verify 在周日跑, 无数据)
-fn read_stock_daily_close_with_offset(
-    db: &DatabaseManager,
-    code: &str,
-    date: &str,
-) -> Option<f64> {
+fn read_stock_daily_close_with_offset(db: &DatabaseManager, code: &str, date: &str) -> Option<f64> {
     use diesel::RunQueryDsl;
     #[derive(diesel::QueryableByName, Debug)]
     struct CloseRow {
@@ -221,7 +254,9 @@ fn read_stock_daily_close_with_offset(
 
 /// 获取近期命中率
 pub fn recent_hit_rate(days: i32) -> f64 {
-    let Some(db) = DatabaseManager::try_get() else { return 0.0; };
+    let Some(db) = DatabaseManager::try_get() else {
+        return 0.0;
+    };
     db.get_prediction_hit_rate(days).unwrap_or(0.0)
 }
 

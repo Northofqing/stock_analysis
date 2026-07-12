@@ -18,15 +18,19 @@ fn test_market_event_default_strength_certainty() {
     );
     assert_eq!(e.strength, 80);
     assert_eq!(e.certainty, 0);
-    assert!(!e.ai_degraded);  // 默认 false
+    assert!(!e.ai_degraded); // 默认 false
 }
 
 #[test]
 fn test_event_id_format() {
     // event_id = sha256 hex (64 字符)
     let e = MarketEvent::new(
-        EventType::Policy, "test".to_string(), None,
-        Direction::Bull, 50, 50,
+        EventType::Policy,
+        "test".to_string(),
+        None,
+        Direction::Bull,
+        50,
+        50,
     );
     assert_eq!(e.event_id.len(), 64);
     assert!(e.event_id.chars().all(|c| c.is_ascii_hexdigit()));
@@ -35,27 +39,41 @@ fn test_event_id_format() {
 #[test]
 fn test_event_id_distinct_by_subject() {
     // 同样 EventType + Direction, subject 不同 → event_id 不同
-    let a = MarketEvent::new(EventType::Policy, "A".to_string(), None, Direction::Bull, 50, 50);
-    let b = MarketEvent::new(EventType::Policy, "B".to_string(), None, Direction::Bull, 50, 50);
+    let a = MarketEvent::new(
+        EventType::Policy,
+        "A".to_string(),
+        None,
+        Direction::Bull,
+        50,
+        50,
+    );
+    let b = MarketEvent::new(
+        EventType::Policy,
+        "B".to_string(),
+        None,
+        Direction::Bull,
+        50,
+        50,
+    );
     assert_ne!(a.event_id, b.event_id);
 }
 
 #[test]
 fn test_strength_certainty_bounded() {
     // 修复: 超过 100 必 clamp (u8 不能负, 用 saturating_sub 模拟)
-    let e = MarketEvent::new(
-        EventType::Policy, "x".into(), None, Direction::Bull, 255, 5,
+    let e = MarketEvent::new(EventType::Policy, "x".into(), None, Direction::Bull, 255, 5);
+    assert!(
+        e.strength <= 100,
+        "strength {} 必 clamp 到 ≤100",
+        e.strength
     );
-    assert!(e.strength <= 100, "strength {} 必 clamp 到 ≤100", e.strength);
     assert_eq!(e.strength, 100);
     assert_eq!(e.certainty, 5);
 }
 
 #[test]
 fn test_ai_degraded_flag_persists() {
-    let mut e = MarketEvent::new(
-        EventType::Policy, "x".into(), None, Direction::Bull, 50, 50,
-    );
+    let mut e = MarketEvent::new(EventType::Policy, "x".into(), None, Direction::Bull, 50, 50);
     e.ai_degraded = true;
     assert!(e.ai_degraded);
     // 量化产品经理要求: ai_degraded=true 时下游必须降权, 不能编造
@@ -65,7 +83,12 @@ fn test_ai_degraded_flag_persists() {
 fn test_stale_flag_defaults_false() {
     // 修复 P0-2: MarketEvent::new 必 stale=false, 由 event_extractor 按新鲜度设置
     let e = MarketEvent::new(
-        EventType::Policy, "test".into(), None, Direction::Bull, 50, 50,
+        EventType::Policy,
+        "test".into(),
+        None,
+        Direction::Bull,
+        50,
+        50,
     );
     assert!(!e.stale, "新建事件默认 fresh, stale=false");
 }
@@ -73,18 +96,17 @@ fn test_stale_flag_defaults_false() {
 #[test]
 fn test_chains_initially_empty() {
     // 修复 P0-1 职责切分: ② 抽取阶段 chains 恒为空, 由 ③ 映射填充
-    let e = MarketEvent::new(
-        EventType::Policy, "x".into(), None, Direction::Bull, 50, 50,
+    let e = MarketEvent::new(EventType::Policy, "x".into(), None, Direction::Bull, 50, 50);
+    assert!(
+        e.chains.is_empty(),
+        "MarketEvent 构造时 chains 必为空, 由 ③ 阶段填充"
     );
-    assert!(e.chains.is_empty(), "MarketEvent 构造时 chains 必为空, 由 ③ 阶段填充");
 }
 
 #[test]
 fn test_source_ref_provenance() {
     // 修复 P0-1: provenance 落审计 (跨源验证)
-    let mut e = MarketEvent::new(
-        EventType::Policy, "x".into(), None, Direction::Bull, 50, 50,
-    );
+    let mut e = MarketEvent::new(EventType::Policy, "x".into(), None, Direction::Bull, 50, 50);
     e.provenance.push(SourceRef {
         provider: "东财".into(),
         url: Some("https://example.com/a".into()),
@@ -104,8 +126,12 @@ fn test_source_ref_provenance() {
 fn test_event_type_classification() {
     // 修复 P0-1: EventType 枚举化, 不允许字符串乱填
     let e = MarketEvent::new(
-        EventType::Mna, "公司A".into(), Some("公司B".into()),
-        Direction::Bull, 70, 80,
+        EventType::Mna,
+        "公司A".into(),
+        Some("公司B".into()),
+        Direction::Bull,
+        70,
+        80,
     );
     assert_eq!(e.event_type, EventType::Mna);
     assert_eq!(e.object, Some("公司B".into()));
@@ -136,7 +162,7 @@ fn test_simhash_punctuation_normalize() {
     // 修复 P1-1: 中英标点差异必 normalize (财联社 "5G-A:" vs 新浪 "5G-A：")
     // normalize 后同 token, simhash 应相同
     let a = compute_simhash("工信部:5G-A 商用", "");
-    let b = compute_simhash("工信部:5G-A 商用", "");  // 相同文本
+    let b = compute_simhash("工信部:5G-A 商用", ""); // 相同文本
     assert_eq!(a, b, "同文本必同 simhash");
 }
 
@@ -144,7 +170,12 @@ fn test_simhash_punctuation_normalize() {
 fn test_simhash_in_market_event() {
     // 修复 P1-1: MarketEvent::new 必填 simhash 字段
     let e = MarketEvent::new(
-        EventType::Policy, "test".into(), None, Direction::Bull, 50, 50,
+        EventType::Policy,
+        "test".into(),
+        None,
+        Direction::Bull,
+        50,
+        50,
     );
     // simhash 64 bit 必有效
     assert!(e.simhash <= u64::MAX, "simhash 必有效");
@@ -164,19 +195,22 @@ fn test_simhash_cross_process_stable() {
     // 验证方法: 单 bigram 输入时, simhash 每个 bit = sha256(token) 对应 bit
     // (单 token 累加和 = +1/-1, 符号 = token hash bit)
     use sha2::{Digest, Sha256};
-    let title = "工信";  // 单 bigram
+    let title = "工信"; // 单 bigram
     let mut hasher = Sha256::new();
     hasher.update(title.as_bytes());
     let result = hasher.finalize();
     let expected_hash = u64::from_le_bytes([
-        result[0], result[1], result[2], result[3],
-        result[4], result[5], result[6], result[7],
+        result[0], result[1], result[2], result[3], result[4], result[5], result[6], result[7],
     ]);
     let sim = compute_simhash(title, "");
     for bit in 0..64 {
         let sim_bit = (sim >> bit) & 1;
         let expected_bit = (expected_hash >> bit) & 1;
-        assert_eq!(sim_bit, expected_bit, "bit {} 应等于 sha256(token) bit", bit);
+        assert_eq!(
+            sim_bit, expected_bit,
+            "bit {} 应等于 sha256(token) bit",
+            bit
+        );
     }
 }
 
@@ -188,7 +222,11 @@ fn test_simhash_punctuation_not_poluted() {
     let a = compute_simhash("工信部:5G商用", "");
     let b = compute_simhash("工信部 5G 商用", "");
     let dist = hamming_distance(a, b);
-    assert_eq!(dist, 0, "normalize + 标点过滤后两文本必同 simhash, 实际距离 {}", dist);
+    assert_eq!(
+        dist, 0,
+        "normalize + 标点过滤后两文本必同 simhash, 实际距离 {}",
+        dist
+    );
 }
 
 #[test]
@@ -199,7 +237,11 @@ fn test_simhash_noise_tokens_filtered() {
     let clean = compute_simhash("工信部半导体", "");
     let dist = hamming_distance(with_noise, clean);
     // 允许少量 bit 差异 (噪声过滤不是 100% 完美), 但距离应该较小
-    assert!(dist <= 15, "停用词过滤后近重复事件距离应较小, 实际 {}", dist);
+    assert!(
+        dist <= 15,
+        "停用词过滤后近重复事件距离应较小, 实际 {}",
+        dist
+    );
 }
 
 #[test]

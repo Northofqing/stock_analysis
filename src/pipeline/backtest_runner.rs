@@ -31,7 +31,13 @@ impl AnalysisPipeline {
     fn run_multi_factor_with_snapshots(
         history: &[(String, String, Vec<crate::data_provider::KlineData>)],
         factor_cfg: &MultiFactorConfig,
-        snapshots: &std::collections::HashMap<String, std::collections::BTreeMap<chrono::NaiveDate, crate::database::factor_snapshot::FactorSnapshotRow>>,
+        snapshots: &std::collections::HashMap<
+            String,
+            std::collections::BTreeMap<
+                chrono::NaiveDate,
+                crate::database::factor_snapshot::FactorSnapshotRow,
+            >,
+        >,
     ) -> Option<(BacktestSummary, BacktestState)> {
         if history.len() < 3 {
             return None;
@@ -246,7 +252,9 @@ impl AnalysisPipeline {
 
         for page in 0..max_pages {
             let chunk_days = (days - page * chunk_size).min(chunk_size);
-            if chunk_days == 0 { break; }
+            if chunk_days == 0 {
+                break;
+            }
             match self.data_manager.get_daily_data(code, chunk_days) {
                 Ok((data, _)) if !data.is_empty() => {
                     for k in &data {
@@ -255,17 +263,31 @@ impl AnalysisPipeline {
                     total_loaded += data.len();
                 }
                 _ => {
-                    warn!("基准 {}({}) 第 {} 页数据获取失败, 继续下一页", name, code, page + 1);
+                    warn!(
+                        "基准 {}({}) 第 {} 页数据获取失败, 继续下一页",
+                        name,
+                        code,
+                        page + 1
+                    );
                     // 不中断, 继续下一页
                 }
             }
         }
 
         if all_closes.is_empty() {
-            warn!("基准 {}({}) 全部 {} 页数据获取均失败, 回测报告将标注'基准数据缺失'", name, code, max_pages);
+            warn!(
+                "基准 {}({}) 全部 {} 页数据获取均失败, 回测报告将标注'基准数据缺失'",
+                name, code, max_pages
+            );
             None
         } else {
-            info!("✓ 基准 {} ({}) 已加载 {} 个交易日 ({} 页)", name, code, all_closes.len(), max_pages);
+            info!(
+                "✓ 基准 {} ({}) 已加载 {} 个交易日 ({} 页)",
+                name,
+                code,
+                all_closes.len(),
+                max_pages
+            );
             Some(BenchmarkSeries::new(name, all_closes))
         }
     }
@@ -380,7 +402,10 @@ impl AnalysisPipeline {
         folds: usize,
     ) -> Option<WalkForwardReport>
     where
-        F: Fn(&C, &[(String, String, Vec<crate::data_provider::KlineData>)]) -> Option<BacktestSummary>,
+        F: Fn(
+            &C,
+            &[(String, String, Vec<crate::data_provider::KlineData>)],
+        ) -> Option<BacktestSummary>,
     {
         use std::collections::BTreeSet;
         if candidates.is_empty() || folds == 0 {
@@ -430,7 +455,9 @@ impl AnalysisPipeline {
                     }
                 }
             }
-            let Some((best_label, _)) = best else { continue };
+            let Some((best_label, _)) = best else {
+                continue;
+            };
 
             // 用最优参数在测试段评估
             let chosen_cfg = candidates
@@ -443,8 +470,16 @@ impl AnalysisPipeline {
 
             fold_results.push(WalkForwardFold {
                 fold: f + 1,
-                train_label: format!("{}~{}", train_start.format("%Y-%m-%d"), train_end.format("%Y-%m-%d")),
-                test_label: format!("{}~{}", test_start.format("%Y-%m-%d"), test_end.format("%Y-%m-%d")),
+                train_label: format!(
+                    "{}~{}",
+                    train_start.format("%Y-%m-%d"),
+                    train_end.format("%Y-%m-%d")
+                ),
+                test_label: format!(
+                    "{}~{}",
+                    test_start.format("%Y-%m-%d"),
+                    test_end.format("%Y-%m-%d")
+                ),
                 chosen_param: best_label.to_string(),
                 test_return: test_sum.total_return,
                 test_sharpe: test_sum.sharpe_ratio,
@@ -524,7 +559,9 @@ impl AnalysisPipeline {
             .ok_or_else(|| anyhow::anyhow!("多因子 OOS 失败：样本内段无法完成回测"))?;
         let out_sum = Self::run_multi_factor_summary_on_history(&out_h, &base_cfg)
             .ok_or_else(|| anyhow::anyhow!("多因子 OOS 失败：样本外段无法完成回测"))?;
-        report.push_str(&super::reporting::build_oos_section(&cutoff, &in_sum, &out_sum));
+        report.push_str(&super::reporting::build_oos_section(
+            &cutoff, &in_sum, &out_sum,
+        ));
 
         // B. Walk-Forward 滚动优化（参数网格寻优 + 样本外验证）
         let mk_cfg = |top_n: usize, pe_w: f64, pb_w: f64| MultiFactorConfig {
@@ -575,7 +612,8 @@ impl AnalysisPipeline {
         report.push_str(&super::reporting::build_walk_forward_section(&wf));
 
         let filename = format!("multi_factor_backtest_{}.md", date_str);
-        self.notifier.save_report_to_file(&report, Some(&filename))?;
+        self.notifier
+            .save_report_to_file(&report, Some(&filename))?;
         self.export_audit_csv(
             "multi_factor",
             &date_str,
@@ -651,9 +689,10 @@ impl AnalysisPipeline {
         // A. 时间样本外切分（前 60% 样本内 / 后 40% 样本外，参数固定做一致性检验）
         if let Some((cutoff, in_h, out_h)) = Self::split_history_by_date(&stocks_data, 0.6) {
             let oos_engine = BollingerZScoreBacktest::new(BollingerZScoreConfig::default());
-            if let (Ok(mut r_in), Ok(mut r_out)) =
-                (oos_engine.run_portfolio(&in_h), oos_engine.run_portfolio(&out_h))
-            {
+            if let (Ok(mut r_in), Ok(mut r_out)) = (
+                oos_engine.run_portfolio(&in_h),
+                oos_engine.run_portfolio(&out_h),
+            ) {
                 r_in.benchmark = result.benchmark.clone();
                 r_out.benchmark = result.benchmark.clone();
                 report.push_str(&super::reporting::build_oos_section(
@@ -701,8 +740,12 @@ impl AnalysisPipeline {
         }
 
         let report_filename = format!("bollinger_zscore_backtest_{}.md", date_str);
-        self.notifier.save_report_to_file(&report, Some(&report_filename))?;
-        info!("✓ 布林带+Z-Score回测报告已保存: reports/{}", report_filename);
+        self.notifier
+            .save_report_to_file(&report, Some(&report_filename))?;
+        info!(
+            "✓ 布林带+Z-Score回测报告已保存: reports/{}",
+            report_filename
+        );
 
         // 生成图表
         let chart_path = format!("reports/bollinger_zscore_chart_{}.png", date_str);
@@ -766,9 +809,10 @@ impl AnalysisPipeline {
         // A. 时间样本外切分（前 60% 样本内 / 后 40% 样本外，参数固定做一致性检验）
         if let Some((cutoff, in_h, out_h)) = Self::split_history_by_date(&stocks_data, 0.6) {
             let oos_engine = RsiBacktest::new(RsiConfig::preset_daily_v10_no_stop());
-            if let (Ok(mut r_in), Ok(mut r_out)) =
-                (oos_engine.run_portfolio(&in_h), oos_engine.run_portfolio(&out_h))
-            {
+            if let (Ok(mut r_in), Ok(mut r_out)) = (
+                oos_engine.run_portfolio(&in_h),
+                oos_engine.run_portfolio(&out_h),
+            ) {
                 r_in.benchmark = result.benchmark.clone();
                 r_out.benchmark = result.benchmark.clone();
                 report.push_str(&super::reporting::build_oos_section(
@@ -884,7 +928,12 @@ mod tests {
     fn history(n: usize) -> Vec<(String, String, Vec<KlineData>)> {
         let base = chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
         let ks: Vec<KlineData> = (0..n)
-            .map(|i| kl(base + chrono::Duration::days(i as i64), 10.0 + i as f64 * 0.1))
+            .map(|i| {
+                kl(
+                    base + chrono::Duration::days(i as i64),
+                    10.0 + i as f64 * 0.1,
+                )
+            })
             .collect();
         vec![("000001".into(), "测试股".into(), ks)]
     }
@@ -946,9 +995,7 @@ mod tests {
 
         let cfg = MultiFactorConfig::default();
         // 在第 10 天(observe_days=10)开始调仓
-        let result = AnalysisPipeline::run_multi_factor_with_snapshots(
-            &h, &cfg, &snapshots,
-        );
+        let result = AnalysisPipeline::run_multi_factor_with_snapshots(&h, &cfg, &snapshots);
         assert!(result.is_some(), "回测应能跑出结果");
         // 检查不会因为看到第 15 天的 99.0 PE 而被影响
         // (具体数值难精确断言, 但只要能跑完即可)
@@ -1008,9 +1055,7 @@ mod tests {
         snapshots.insert("600000".into(), m);
 
         let cfg = MultiFactorConfig::default();
-        let result = AnalysisPipeline::run_multi_factor_with_snapshots(
-            &h, &cfg, &snapshots,
-        );
+        let result = AnalysisPipeline::run_multi_factor_with_snapshots(&h, &cfg, &snapshots);
         assert!(result.is_some());
         // 关键: 因为 600001/600002 没有快照, 调仓时只能用 600000 一只股票
         // 这就是修复后的正确行为 -- 不会"漏"到 K 线字段上去
@@ -1024,7 +1069,12 @@ mod tests {
         let in_len = in_h[0].2.len();
         let out_len = out_h[0].2.len();
         // 前段约 60%，后段非空，且无重叠（总数守恒）
-        assert!(in_len > out_len, "前段应大于后段: {} vs {}", in_len, out_len);
+        assert!(
+            in_len > out_len,
+            "前段应大于后段: {} vs {}",
+            in_len,
+            out_len
+        );
         assert_eq!(in_len + out_len, 100, "切分应无重叠且不丢数据");
         assert!(!cutoff.is_empty());
     }

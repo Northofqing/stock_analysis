@@ -22,15 +22,15 @@
 
 use log::{info, warn};
 
-use diesel::prelude::*;
-use crate::database::DatabaseManager;
 use crate::data_provider::KlineData;
+use crate::database::DatabaseManager;
 use crate::monitor::risk::{MarketRegime, PositionSizer, StopLoss};
 use crate::risk::stop_loss::check_stops;
 use crate::strategy::BollMacdAction;
 use crate::trading::{
     ClosePositionCmd, OpenPositionCmd, SimulatedExecutionGateway, TradeExecutionGateway,
 };
+use diesel::prelude::*;
 
 use super::AnalysisResult;
 
@@ -117,7 +117,9 @@ fn validate_trade_symbol_env(code: &str) -> Result<(), String> {
 /// Bug #3 fix (2026-07-05): 无 ORDER BY 的 LIMIT 1 在 SQLite 下非稳定,
 /// 同 code 多 chain 时不同时间查询可能返回不同 row. 加 ORDER BY 后取最新建仓.
 fn query_chain_held_count(code: &str) -> Result<i32, String> {
-    let mut conn = DatabaseManager::get().get_conn().map_err(|e| format!("DB: {}", e))?;
+    let mut conn = DatabaseManager::get()
+        .get_conn()
+        .map_err(|e| format!("DB: {}", e))?;
 
     // raw SQL 全部 (避免 diesel count/select trait bound 不稳定)
     let esc = |s: &str| s.replace('\'', "''");
@@ -225,8 +227,8 @@ pub(super) fn track_position(
 
             // 铁律2 盈利<20% 绝不主动止盈（不触发卖出）
             // 铁律3 盈利 ≥ 20% 后，跌破 5 日均线
-            let profit_trend_exit = return_rate >= 20.0
-                && result.ma5.map_or(false, |ma5| current_price < ma5);
+            let profit_trend_exit =
+                return_rate >= 20.0 && result.ma5.map_or(false, |ma5| current_price < ma5);
             // 铁律4 持仓 >14 天仍亏损
             let hold_days = {
                 let buy = chrono::NaiveDate::parse_from_str(&pos.buy_date, "%Y-%m-%d");
@@ -248,8 +250,11 @@ pub(super) fn track_position(
                 buy.is_ok() && buy.unwrap() == now
             };
 
-            let should_sell = stop_loss || !tiered_stops.is_empty()
-                || profit_trend_exit || timeout_loss || bm_top_sell;
+            let should_sell = stop_loss
+                || !tiered_stops.is_empty()
+                || profit_trend_exit
+                || timeout_loss
+                || bm_top_sell;
 
             if should_sell {
                 // T+1 锁仓: A股当日买入不可卖出, 阻止所有平仓操作
@@ -273,13 +278,15 @@ pub(super) fn track_position(
 
                 let reason = if stop_loss {
                     if risk_ctx.atr.unwrap_or(0.0) > 0.0 {
-                        let sl = StopLoss::new(pos.buy_price, risk_ctx.atr.unwrap_or(3.0), result.ma20);
+                        let sl =
+                            StopLoss::new(pos.buy_price, risk_ctx.atr.unwrap_or(3.0), result.ma20);
                         format!("ATR动态止损(有效止损价 {:.2})", sl.effective())
                     } else {
                         "铁律1:止损(-8%)".to_string()
                     }
                 } else if !tiered_stops.is_empty() {
-                    tiered_stops.iter()
+                    tiered_stops
+                        .iter()
                         .map(|s| s.level.label().to_string())
                         .collect::<Vec<_>>()
                         .join("+")
@@ -408,11 +415,7 @@ pub(super) fn track_position(
 
             let today = chrono::Local::now().format("%Y-%m-%d").to_string();
             let open_cmd = OpenPositionCmd {
-                business_order_id: format!(
-                    "SIM-BUY-{}-{}",
-                    code,
-                    chrono::Utc::now().timestamp()
-                ),
+                business_order_id: format!("SIM-BUY-{}-{}", code, chrono::Utc::now().timestamp()),
                 code: code.to_string(),
                 name: result.name.clone(),
                 trade_date: today.clone(),
@@ -428,7 +431,11 @@ pub(super) fn track_position(
                         _ => "其他",
                     };
                     let sizing_label = if risk_ctx.use_dynamic {
-                        format!("动态仓位({}股 ≈ {:.0}元)", shares, shares as f64 * current_price)
+                        format!(
+                            "动态仓位({}股 ≈ {:.0}元)",
+                            shares,
+                            shares as f64 * current_price
+                        )
                     } else {
                         format!("{}股", shares)
                     };
@@ -441,12 +448,7 @@ pub(super) fn track_position(
                     };
                     info!(
                         "[{}] 触发{}（AI 评分 {}），模拟买入 {} @ {:.2}{}",
-                        code,
-                        tag,
-                        result.sentiment_score,
-                        sizing_label,
-                        current_price,
-                        extra
+                        code, tag, result.sentiment_score, sizing_label, current_price, extra
                     );
                     result.position_buy_price = Some(current_price);
                     result.position_buy_date = Some(today);

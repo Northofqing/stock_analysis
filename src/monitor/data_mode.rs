@@ -84,11 +84,17 @@ pub struct CapabilityStatus {
 
 impl CapabilityStatus {
     pub fn missing(cap: Capability) -> Self {
-        Self { cap, staleness_secs: None }
+        Self {
+            cap,
+            staleness_secs: None,
+        }
     }
 
     pub fn fresh(cap: Capability, secs: u64) -> Self {
-        Self { cap, staleness_secs: Some(secs) }
+        Self {
+            cap,
+            staleness_secs: Some(secs),
+        }
     }
 
     /// 是否可用: 有数据且 staleness ≤ max_age_secs
@@ -113,7 +119,10 @@ pub struct DataHealthInput {
 impl Default for DataHealthInput {
     fn default() -> Self {
         Self {
-            capabilities: Capability::ALL.iter().map(|c| CapabilityStatus::missing(*c)).collect(),
+            capabilities: Capability::ALL
+                .iter()
+                .map(|c| CapabilityStatus::missing(*c))
+                .collect(),
             critical_max_age_secs: 120,
             orderbook_max_age_secs: 600,
         }
@@ -187,7 +196,10 @@ pub fn evaluate(input: &DataHealthInput, prev: Option<DataMode>) -> DataHealth {
 
     // 2. 关键能力降级 → Degraded
     if !critical_stale.is_empty() {
-        let caps: Vec<String> = critical_stale.iter().map(|c| c.label().to_string()).collect();
+        let caps: Vec<String> = critical_stale
+            .iter()
+            .map(|c| c.label().to_string())
+            .collect();
         let eta = format!("{} 刷新后", caps.join("/"));
         return DataHealth {
             mode: DataMode::Degraded,
@@ -207,7 +219,10 @@ pub fn evaluate(input: &DataHealthInput, prev: Option<DataMode>) -> DataHealth {
 }
 
 /// 便利: 构造 DataHealthInput from `(cap, last_update_secs_ago)` pairs
-pub fn input_from_pairs(critical_max_age_secs: u64, pairs: &[(Capability, Option<u64>)]) -> DataHealthInput {
+pub fn input_from_pairs(
+    critical_max_age_secs: u64,
+    pairs: &[(Capability, Option<u64>)],
+) -> DataHealthInput {
     DataHealthInput {
         capabilities: pairs
             .iter()
@@ -354,7 +369,10 @@ mod tests {
         assert!(Capability::Kline.is_critical());
         assert!(Capability::MoneyFlow.is_critical());
         assert!(Capability::News.is_critical());
-        assert!(!Capability::OrderBook.is_critical(), "OrderBook 辅助, 缺失不降级");
+        assert!(
+            !Capability::OrderBook.is_critical(),
+            "OrderBook 辅助, 缺失不降级"
+        );
     }
 
     #[test]
@@ -379,10 +397,7 @@ mod tests {
     fn input_from_pairs_basic() {
         let input = input_from_pairs(
             120,
-            &[
-                (Capability::Quote, Some(10)),
-                (Capability::OrderBook, None),
-            ],
+            &[(Capability::Quote, Some(10)), (Capability::OrderBook, None)],
         );
         assert_eq!(input.capabilities.len(), 2);
         assert!(input.capabilities[0].is_ok(120));
@@ -409,7 +424,11 @@ mod tests {
     fn all_missing_falls_to_unsafe() {
         let input = DataHealthInput::default(); // 5 个全 missing
         let h = evaluate(&input, None);
-        assert_eq!(h.mode, DataMode::Unsafe, "全 missing → Quote missing → Unsafe");
+        assert_eq!(
+            h.mode,
+            DataMode::Unsafe,
+            "全 missing → Quote missing → Unsafe"
+        );
         assert_eq!(h.missing.len(), 5);
     }
 }

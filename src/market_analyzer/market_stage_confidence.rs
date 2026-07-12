@@ -59,8 +59,8 @@ pub struct ExternalMetrics {
 /// 评估结果
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MarketStageConfidence {
-    pub heat_stage: String,         // "MainUp"/"HeatUp"/"Range"/"Fade"/"Climax"
-    pub conf_pct: u8,              // 0~100 综合置信度
+    pub heat_stage: String, // "MainUp"/"HeatUp"/"Range"/"Fade"/"Climax"
+    pub conf_pct: u8,       // 0~100 综合置信度
     /// 各维度分数 (0~100, None 表示数据缺失用 50 中性)
     pub dim_scores: DimScores,
     /// 数据完整维度数 (0~5)
@@ -101,7 +101,11 @@ pub fn evaluate(ev: &MarketStageEvidence) -> MarketStageConfidence {
         + (technical as u32) * 25
         + (policy as u32) * 10
         + (external as u32) * 10;
-    let total_weight = if degraded { 100 } else { 30 + 25 + 25 + 10 + 10 };
+    let total_weight = if degraded {
+        100
+    } else {
+        30 + 25 + 25 + 10 + 10
+    };
 
     let conf_pct = ((weighted_sum as f64 / total_weight as f64).round() as u8).min(100);
 
@@ -193,7 +197,7 @@ fn score_technical(m: Option<&TechnicalMetrics>) -> u8 {
     let Some(m) = m else { return 50 };
     let avg = (m.sh_chg + m.chinext_chg + m.star_chg) / 3.0;
     let mut score = 50.0 + avg * 10.0; // 涨幅 +1% 加 10 分
-    // 三指数共振加分
+                                       // 三指数共振加分
     if m.sh_chg > 0.5 && m.chinext_chg > 0.5 && m.star_chg > 0.5 {
         score += 10.0;
     }
@@ -240,10 +244,24 @@ mod tests {
                 broken_pct: 15.0,
                 consecutive_h: 5,
             }),
-            capital: Some(CapitalMetrics { main_flow_yi: 120.0, amount_yi: 8500.0, amount_delta_pct: 8.0 }),
-            technical: Some(TechnicalMetrics { sh_chg: 0.5, chinext_chg: 1.2, star_chg: 1.5 }),
-            policy: Some(PolicyMetrics { positive_hits: 5, negative_hits: 1 }),
-            external: Some(ExternalMetrics { us_chg: 0.8, fx_chg: 0.1 }),
+            capital: Some(CapitalMetrics {
+                main_flow_yi: 120.0,
+                amount_yi: 8500.0,
+                amount_delta_pct: 8.0,
+            }),
+            technical: Some(TechnicalMetrics {
+                sh_chg: 0.5,
+                chinext_chg: 1.2,
+                star_chg: 1.5,
+            }),
+            policy: Some(PolicyMetrics {
+                positive_hits: 5,
+                negative_hits: 1,
+            }),
+            external: Some(ExternalMetrics {
+                us_chg: 0.8,
+                fx_chg: 0.1,
+            }),
         }
     }
 
@@ -254,8 +272,8 @@ mod tests {
         assert!(!r.degraded);
         assert_eq!(r.data_complete_n, 5);
         assert_eq!(r.dim_scores.sentiment, 85); // 35*20/... let me check
-        // (35 涨停 +20, 3 跌停 = 0, 15% 炸板 = 0, 5 连板 = +15) = 50+20+15 = 85
-        // Actually let me just assert it's high
+                                                // (35 涨停 +20, 3 跌停 = 0, 15% 炸板 = 0, 5 连板 = +15) = 50+20+15 = 85
+                                                // Actually let me just assert it's high
         assert!(r.dim_scores.sentiment >= 70);
     }
 
@@ -322,7 +340,10 @@ mod tests {
     #[test]
     fn sentiment_high_limit_up() {
         let s = score_sentiment(Some(&SentimentMetrics {
-            limit_up_n: 60, limit_down_n: 0, broken_pct: 5.0, consecutive_h: 6,
+            limit_up_n: 60,
+            limit_down_n: 0,
+            broken_pct: 5.0,
+            consecutive_h: 6,
         }));
         assert!(s >= 90, "60 涨停 + 6 连板 应 ≥90, 实得 {}", s);
     }
@@ -330,32 +351,49 @@ mod tests {
     #[test]
     fn sentiment_many_limit_down() {
         let s = score_sentiment(Some(&SentimentMetrics {
-            limit_up_n: 0, limit_down_n: 30, broken_pct: 40.0, consecutive_h: 0,
+            limit_up_n: 0,
+            limit_down_n: 30,
+            broken_pct: 40.0,
+            consecutive_h: 0,
         }));
         assert!(s <= 10, "30 跌停 + 40% 炸板 应 ≤10, 实得 {}", s);
     }
 
     #[test]
     fn capital_main_flow_positive() {
-        let c = score_capital(Some(&CapitalMetrics { main_flow_yi: 150.0, amount_yi: 0.0, amount_delta_pct: 12.0 }));
+        let c = score_capital(Some(&CapitalMetrics {
+            main_flow_yi: 150.0,
+            amount_yi: 0.0,
+            amount_delta_pct: 12.0,
+        }));
         assert!(c >= 80);
     }
 
     #[test]
     fn technical_bear_market() {
-        let t = score_technical(Some(&TechnicalMetrics { sh_chg: -3.0, chinext_chg: -3.0, star_chg: -3.0 }));
+        let t = score_technical(Some(&TechnicalMetrics {
+            sh_chg: -3.0,
+            chinext_chg: -3.0,
+            star_chg: -3.0,
+        }));
         assert!(t <= 20, "三指数 -3% 应 ≤20, 实得 {}", t);
     }
 
     #[test]
     fn policy_positive_dominates() {
-        let p = score_policy(Some(&PolicyMetrics { positive_hits: 10, negative_hits: 1 }));
+        let p = score_policy(Some(&PolicyMetrics {
+            positive_hits: 10,
+            negative_hits: 1,
+        }));
         assert!(p >= 90);
     }
 
     #[test]
     fn external_us_up() {
-        let e = score_external(Some(&ExternalMetrics { us_chg: 2.0, fx_chg: 0.0 }));
+        let e = score_external(Some(&ExternalMetrics {
+            us_chg: 2.0,
+            fx_chg: 0.0,
+        }));
         assert!(e >= 60);
     }
 

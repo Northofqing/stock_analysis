@@ -319,8 +319,8 @@ impl GeminiAnalyzer {
         let doubao_base_url = std::env::var("DOUBAO_BASE_URL")
             .ok()
             .or_else(|| Some("https://ark.cn-beijing.volces.com/api/v3".to_string()));
-        let doubao_model = std::env::var("DOUBAO_MODEL")
-            .unwrap_or_else(|_| "ep-20241230184254-j6pvd".to_string());
+        let doubao_model =
+            std::env::var("DOUBAO_MODEL").unwrap_or_else(|_| "ep-20241230184254-j6pvd".to_string());
 
         // AI 深度思考（reasoning / thinking）开关
         let enable_thinking = std::env::var("AI_DEEP_THINKING")

@@ -15,10 +15,12 @@
 //! 校验失败 → 标记该源失败, 用剩余源中第一个 Ok 的.
 
 use anyhow::{anyhow, Result};
+use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::data_provider::baostock_provider::BaostockProvider;
 use crate::data_provider::{
-    DataProvider, GtimgProvider, HttpProvider, KlineData, RustdxProvider, SinaProvider, is_ban_error,
+    is_ban_error, DataProvider, GtimgProvider, HttpProvider, KlineData, RustdxProvider,
+    SinaProvider,
 };
 use crate::monitor::data_quality::{max_gap_for, validate_daily_kline_quality};
 
@@ -94,72 +96,55 @@ pub async fn fetch_kline_with_fallback(
     let client = crate::http_client::SHARED_HTTP_CLIENT.clone();
     let qc_threshold = max_gap_for(code);
 
-    // review #15 + Task 4: 4-way 并行竞速 (Sina priority 1 + 腾讯 + 东财 HTTP, RustDX spawn_blocking).
-    enum SourceResult {
-        Sina(Result<Vec<KlineData>>),
-        Tencent(Result<Vec<KlineData>>),
-        Eastmoney(Result<Vec<KlineData>>),
-        Rustdx(Result<Vec<KlineData>>),
-    }
+    // review #15 注释声称是竞速, 但旧实现用 tokio::join! 会等待所有源完成。
+    // 当 Eastmoney push2his 返回 HTML/网络黑洞时, 每只票会被它拖满 6 次重试,
+    // 即使 Sina 已经成功也要等 Eastmoney 结束, 最终 --test 盘后复盘被 300s cap 打爆。
+    // 这里改成真正的 first-valid-completion: 任一源返回 Ok 且质检通过即返回,
+    // 剩余 HTTP future 被 drop 取消；RustDX spawn_blocking 可能后台完成, 但不再阻塞主链路。
+    let mut candidates: FuturesUnordered<
+        futures::future::BoxFuture<'static, (&'static str, Result<Vec<KlineData>>)>,
+    > = FuturesUnordered::new();
 
-    let code_str = code.to_string();
-    // Task 4: Sina 加入 4-way 竞速 (priority 1 — HTTP 稳定 + GBK 内置反编码).
-    let sina_fut = {
-        let code = code.to_string();
-        async move {
-            // SinaProvider::fetch_kline_raw 已是 async, 直接 .await 而非 block_on,
-            // 否则 join! 内部嵌套 runtime 会 panic.
-            let r = SinaProvider::new().fetch_kline_raw(&code, days).await;
-            SourceResult::Sina(r)
-        }
-    };
-    let tencent_fut = {
-        let client = client.clone();
-        async move {
-            let r = GtimgProvider::fetch_kline_data_internal(&client, code, days).await;
-            SourceResult::Tencent(r)
-        }
-    };
-    let eastmoney_fut = {
-        let client = client.clone();
-        async move {
-            let r = HttpProvider::fetch_kline_data_internal(&client, code, days).await;
-            SourceResult::Eastmoney(r)
-        }
-    };
-    let rustdx_fut = async move {
-        let r: Result<Vec<KlineData>> = tokio::task::spawn_blocking(move || -> Result<Vec<KlineData>> {
-            let provider = RustdxProvider::new()?;
-            provider.get_daily_data(&code_str, days)
-        })
-        .await
-        .map_err(|e| anyhow!("RustDX 任务执行失败: {}", e))
-        .and_then(|inner| inner);
-        SourceResult::Rustdx(r)
-    };
+    let sina_code = code.to_string();
+    candidates.push(Box::pin(async move {
+        let r = SinaProvider::new().fetch_kline_raw(&sina_code, days).await;
+        ("sina_hq", r)
+    }));
 
-    // join! 4 源 (顺序无关, race)
-    let (s, t, e, r) = tokio::join!(sina_fut, tencent_fut, eastmoney_fut, rustdx_fut);
+    let tencent_client = client.clone();
+    let tencent_code = code.to_string();
+    candidates.push(Box::pin(async move {
+        let r =
+            GtimgProvider::fetch_kline_data_internal(&tencent_client, &tencent_code, days).await;
+        ("tencent_qfq", r)
+    }));
 
-    // 按优先级顺序处理 (sina > 腾讯 > 东财 > RustDX): 第一个 Ok+质检 通过即胜出.
-    let candidates: [(SourceResult, &'static str); 4] = [
-        (s, "sina_hq"),
-        (t, "tencent_qfq"),
-        (e, "eastmoney_qfq"),
-        (r, "rustdx_none"),
-    ];
+    let eastmoney_client = client.clone();
+    let eastmoney_code = code.to_string();
+    candidates.push(Box::pin(async move {
+        let r =
+            HttpProvider::fetch_kline_data_internal(&eastmoney_client, &eastmoney_code, days).await;
+        ("eastmoney_qfq", r)
+    }));
+
+    let rustdx_code = code.to_string();
+    candidates.push(Box::pin(async move {
+        let r: Result<Vec<KlineData>> =
+            tokio::task::spawn_blocking(move || -> Result<Vec<KlineData>> {
+                let provider = RustdxProvider::new()?;
+                provider.get_daily_data(&rustdx_code, days)
+            })
+            .await
+            .map_err(|e| anyhow!("RustDX 任务执行失败: {}", e))
+            .and_then(|inner| inner);
+        ("rustdx_none", r)
+    }));
 
     let mut last_err: Option<String> = None;
     let mut all_empty = true;
     let mut all_qc_reject = Vec::new();
 
-    for (res, src) in candidates {
-        let data = match res {
-            SourceResult::Sina(r) => r,
-            SourceResult::Tencent(r) => r,
-            SourceResult::Eastmoney(r) => r,
-            SourceResult::Rustdx(r) => r,
-        };
+    while let Some((src, data)) = candidates.next().await {
         match data {
             Ok(mut d) if !d.is_empty() => {
                 all_empty = false;

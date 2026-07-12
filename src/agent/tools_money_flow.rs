@@ -1,8 +1,8 @@
-use async_trait::async_trait;
-use serde_json::json;
 use crate::agent::tool::Tool;
 use crate::data_provider::money_flow::format_for_prompt;
 use crate::data_provider::service::service;
+use async_trait::async_trait;
+use serde_json::json;
 
 pub struct FetchFundFlowTool;
 
@@ -36,15 +36,14 @@ impl Tool for FetchFundFlowTool {
     }
 
     async fn call(&self, input: serde_json::Value) -> anyhow::Result<String> {
-        let code = input.get("code")
+        let code = input
+            .get("code")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'code' parameter"))?;
 
         let svc = service();
-        let (flow_arc, shape_arc) = tokio::join!(
-            svc.get_money_flow(code, 5),
-            svc.get_intraday_shape(code),
-        );
+        let (flow_arc, shape_arc) =
+            tokio::join!(svc.get_money_flow(code, 5), svc.get_intraday_shape(code),);
 
         let prompt_str = format_for_prompt(&flow_arc, &shape_arc);
         if prompt_str.trim().is_empty() {

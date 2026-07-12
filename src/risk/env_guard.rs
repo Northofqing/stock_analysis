@@ -24,14 +24,8 @@ pub fn is_test_code(code: &str) -> bool {
 pub fn validate_symbol_for_env(code: &str, env: TradingEnv) -> Result<(), String> {
     let test = is_test_code(code);
     match (env, test) {
-        (TradingEnv::Prod, true) => Err(format!(
-            "生产环境拒绝 TEST_CODE 标的: {}",
-            code
-        )),
-        (TradingEnv::Test, false) => Err(format!(
-            "测试环境拒绝真实标的下单: {}",
-            code
-        )),
+        (TradingEnv::Prod, true) => Err(format!("生产环境拒绝 TEST_CODE 标的: {}", code)),
+        (TradingEnv::Test, false) => Err(format!("测试环境拒绝真实标的下单: {}", code)),
         _ => Ok(()),
     }
 }

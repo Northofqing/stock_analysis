@@ -3,10 +3,10 @@
 //! 当前 `DatabaseManager` 是全局单例，所有模块直接调用 `DatabaseManager::get()`。
 //! Repository trait 允许通过注入 mock 实现进行单元测试。
 
+use crate::data_provider::KlineData;
+use crate::errors::DbError;
 use async_trait::async_trait;
 use chrono::NaiveDate;
-use crate::errors::DbError;
-use crate::data_provider::KlineData;
 
 /// 股票数据仓库（K 线存取）
 #[async_trait]
@@ -24,11 +24,20 @@ pub trait StockRepository: Send + Sync {
 pub trait TradeRepository: Send + Sync {
     /// 记录买入
     async fn record_buy(
-        &self, code: &str, name: &str, price: f64, shares: i64, date: NaiveDate,
+        &self,
+        code: &str,
+        name: &str,
+        price: f64,
+        shares: i64,
+        date: NaiveDate,
     ) -> Result<(), DbError>;
     /// 记录卖出
     async fn record_sell(
-        &self, code: &str, price: f64, shares: i64, date: NaiveDate,
+        &self,
+        code: &str,
+        price: f64,
+        shares: i64,
+        date: NaiveDate,
     ) -> Result<(), DbError>;
     /// 获取当前持仓
     async fn get_positions(&self) -> Result<Vec<(String, String, f64, i64)>, DbError>;
@@ -84,22 +93,27 @@ fn stock_daily_to_kline(r: StockDaily) -> KlineData {
 #[async_trait]
 impl StockRepository for DatabaseManager {
     async fn find_kline(&self, code: &str, limit: usize) -> Result<Vec<KlineData>, DbError> {
-        let rows = self.get_latest_data(code, limit as i64).map_err(|e| {
-            DbError::QueryFailed { sql: format!("get_latest_data({code}, {limit}): {e}") }
-        })?;
+        let rows = self
+            .get_latest_data(code, limit as i64)
+            .map_err(|e| DbError::QueryFailed {
+                sql: format!("get_latest_data({code}, {limit}): {e}"),
+            })?;
         Ok(rows.into_iter().map(stock_daily_to_kline).collect())
     }
 
     async fn save_kline(&self, code: &str, data: &[KlineData]) -> Result<usize, DbError> {
-        self.save_kline_data(code, data, "repository").map_err(|e| {
-            DbError::QueryFailed { sql: format!("save_kline_data({code}): {e}") }
-        })
+        self.save_kline_data(code, data, "repository")
+            .map_err(|e| DbError::QueryFailed {
+                sql: format!("save_kline_data({code}): {e}"),
+            })
     }
 
     async fn get_latest_date(&self, code: &str) -> Result<Option<NaiveDate>, DbError> {
-        let rows = self.get_latest_data(code, 1).map_err(|e| {
-            DbError::QueryFailed { sql: format!("get_latest_data({code}, 1): {e}") }
-        })?;
+        let rows = self
+            .get_latest_data(code, 1)
+            .map_err(|e| DbError::QueryFailed {
+                sql: format!("get_latest_data({code}, 1): {e}"),
+            })?;
         Ok(rows.first().map(|r| r.date))
     }
 }
@@ -107,21 +121,32 @@ impl StockRepository for DatabaseManager {
 #[async_trait]
 impl TradeRepository for DatabaseManager {
     async fn record_buy(
-        &self, code: &str, name: &str, price: f64, shares: i64, date: NaiveDate,
+        &self,
+        code: &str,
+        name: &str,
+        price: f64,
+        shares: i64,
+        date: NaiveDate,
     ) -> Result<(), DbError> {
         insert_trade(self, code, name, "buy", price, shares, date)
     }
 
     async fn record_sell(
-        &self, code: &str, price: f64, shares: i64, date: NaiveDate,
+        &self,
+        code: &str,
+        price: f64,
+        shares: i64,
+        date: NaiveDate,
     ) -> Result<(), DbError> {
         insert_trade(self, code, "", "sell", price, shares, date)
     }
 
     async fn get_positions(&self) -> Result<Vec<(String, String, f64, i64)>, DbError> {
-        let rows = self.get_all_open_positions().map_err(|e| {
-            DbError::QueryFailed { sql: format!("get_all_open_positions: {e}") }
-        })?;
+        let rows = self
+            .get_all_open_positions()
+            .map_err(|e| DbError::QueryFailed {
+                sql: format!("get_all_open_positions: {e}"),
+            })?;
         Ok(rows
             .into_iter()
             .map(|p| (p.code, p.name, p.buy_price, p.quantity as i64))
@@ -143,9 +168,9 @@ fn insert_trade(
     use diesel::sql_types::{BigInt, Double, Text};
 
     let amount = price * shares as f64;
-    let mut conn = db
-        .get_conn()
-        .map_err(|e| DbError::QueryFailed { sql: format!("get_conn: {e}") })?;
+    let mut conn = db.get_conn().map_err(|e| DbError::QueryFailed {
+        sql: format!("get_conn: {e}"),
+    })?;
     diesel::sql_query(
         "INSERT INTO trades (code, name, direction, price, shares, amount, reason, traded_at) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -159,7 +184,9 @@ fn insert_trade(
     .bind::<Text, _>("repository")
     .bind::<Text, _>(date.format("%Y-%m-%d").to_string())
     .execute(&mut *conn)
-    .map_err(|e| DbError::QueryFailed { sql: format!("insert trade {code}: {e}") })?;
+    .map_err(|e| DbError::QueryFailed {
+        sql: format!("insert trade {code}: {e}"),
+    })?;
     Ok(())
 }
 
@@ -177,7 +204,9 @@ mod tests {
             close,
             volume: 1000.0,
             amount: close * 1000.0,
-            pct_chg: 0.0, intraday_price: None, settled: true,
+            pct_chg: 0.0,
+            intraday_price: None,
+            settled: true,
             pe_ratio: None,
             pb_ratio: None,
             turnover_rate: None,

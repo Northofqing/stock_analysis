@@ -122,8 +122,16 @@ pub(super) async fn run_debate(
     let risk_prompt = format!(
         "# 风控审查任务\n\n## 标的\n{}\n## 多头最终论点\n{}\n\n## 空头最终论点\n{}\n",
         basics,
-        if bull.trim().is_empty() { "（无）" } else { &bull },
-        if bear.trim().is_empty() { "（无）" } else { &bear },
+        if bull.trim().is_empty() {
+            "（无）"
+        } else {
+            &bull
+        },
+        if bear.trim().is_empty() {
+            "（无）"
+        } else {
+            &bear
+        },
     );
     let risk = analyzer
         .call_api_mode(&risk_prompt, RISK_SYS, AgentMode::Quick)

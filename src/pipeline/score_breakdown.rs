@@ -80,7 +80,11 @@ fn quality_score(d: &KlineData) -> i32 {
     };
     let base = 100i32.saturating_sub(q.risk_score as i32);
     // CFO/NI 加成：取近 6 期均值
-    let ratios: Vec<f64> = hist.iter().take(6).filter_map(|p| p.cfo_to_ni_ratio()).collect();
+    let ratios: Vec<f64> = hist
+        .iter()
+        .take(6)
+        .filter_map(|p| p.cfo_to_ni_ratio())
+        .collect();
     let bonus = if ratios.is_empty() {
         0
     } else {
@@ -303,7 +307,8 @@ pub fn render_section(sb: &ScoreBreakdown) -> String {
 pub fn compute_ranking_score(sb: &ScoreBreakdown) -> i32 {
     let cfg = &crate::config::get_monitor_config().factor_feedback;
 
-    let (tech_action, quality_action, valuation_action, flow_action, growth_action) = if cfg.enabled {
+    let (tech_action, quality_action, valuation_action, flow_action, growth_action) = if cfg.enabled
+    {
         (
             parse_factor_action(&cfg.technical_action),
             parse_factor_action(&cfg.quality_action),
@@ -332,5 +337,7 @@ pub fn compute_ranking_score(sb: &ScoreBreakdown) -> i32 {
         apply_factor_action(sb.growth_sustainability, growth_action, scale),
     ];
 
-    (dims.iter().sum::<f64>() / dims.len() as f64).round().clamp(0.0, 100.0) as i32
+    (dims.iter().sum::<f64>() / dims.len() as f64)
+        .round()
+        .clamp(0.0, 100.0) as i32
 }

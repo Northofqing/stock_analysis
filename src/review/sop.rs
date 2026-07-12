@@ -18,7 +18,10 @@ pub fn weekly_sop(holdings_count: usize, exclusion_hits: usize, limit_violations
         lines.push("   ✅ 无污染源".to_string());
     }
 
-    lines.push(format!("☐ 2. 验虹吸：{} 只持仓成交额是否仍居全市场前列？", holdings_count));
+    lines.push(format!(
+        "☐ 2. 验虹吸：{} 只持仓成交额是否仍居全市场前列？",
+        holdings_count
+    ));
     lines.push("   → 萎缩为边缘跟风股则调仓到同板块领涨龙头".to_string());
 
     lines.push("☐ 3. 复核逻辑：最初的买入逻辑是否还在？".to_string());
@@ -26,7 +29,10 @@ pub fn weekly_sop(holdings_count: usize, exclusion_hits: usize, limit_violations
 
     lines.push("☐ 4. 调配现金：总趋势向上→现金可降至30%；市场风声鹤唳→锁死40%".to_string());
 
-    lines.push(format!("☐ 5. 检验止损线：本周 {} 项超标，触线的有没有执行？", limit_violations));
+    lines.push(format!(
+        "☐ 5. 检验止损线：本周 {} 项超标，触线的有没有执行？",
+        limit_violations
+    ));
     if limit_violations > 0 {
         lines.push(format!("   ⚠️ {} 项超标待处理", limit_violations));
     }

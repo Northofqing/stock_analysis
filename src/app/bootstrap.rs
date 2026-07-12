@@ -361,12 +361,27 @@ fn append_sector_resonance(stock_codes: &mut Vec<String>, macro_news: &str) {
         Ok(_) => info!("📋 今日板块共振未命中（涨幅榜与资金榜交集为空）"),
         Err(e) => info!("⚠️ 板块共振检测失败（不影响正常分析）: {:#}", e),
     }
+
+    // 2.6 量价反向发现（BR-021）：板块量价异动但无新闻归因 → 提示人工核查
+    // 兜底新闻源永远不全（如财经快讯漏掉"长十乙火箭回收"）：任何值钱的题材最终反映在成交量上。
+    match sector_monitor::detect_unexplained_moves(macro_news, rank_top) {
+        Ok(moves) if !moves.is_empty() => {
+            info!(
+                "🛰️ 反向发现：{} 个板块量价异动但无新闻归因（详见 [反向发现] warn 日志），建议人工核查",
+                moves.len()
+            );
+        }
+        Ok(_) => info!("📋 反向发现：无异动无归因板块"),
+        Err(e) => info!("⚠️ 反向发现失败（不影响正常分析）: {:#}", e),
+    }
 }
 
 fn append_open_positions(stock_codes: &mut Vec<String>) {
     use stock_analysis::database::DatabaseManager;
 
-    let Some(db) = DatabaseManager::try_get() else { return; };
+    let Some(db) = DatabaseManager::try_get() else {
+        return;
+    };
     match db.get_all_open_positions() {
         Ok(positions) if !positions.is_empty() => {
             let before = stock_codes.len();

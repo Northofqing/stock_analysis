@@ -5,8 +5,11 @@ use super::signal::*;
 
 /// 盘中模式：仅需东财 push2 数据 + ignition，不需要 K 线
 pub fn screen_intraday(
-    code: &str, name: &str,
-    vol_ratio: f64, change_pct: f64, main_net_yi: f64,
+    code: &str,
+    name: &str,
+    vol_ratio: f64,
+    change_pct: f64,
+    main_net_yi: f64,
     ignition_near_limit: usize,
 ) -> BreakoutSignal {
     let mut confidence: u8 = 0;
@@ -82,12 +85,21 @@ pub fn screen_intraday(
         BreakoutType::Uncertain
     };
 
-    let note = if data_degraded { " [数据源降级]" } else { "" };
+    let note = if data_degraded {
+        " [数据源降级]"
+    } else {
+        ""
+    };
     let description = format!("{}{}", desc_parts.join(" "), note);
 
     BreakoutSignal {
-        code: code.into(), name: name.into(),
-        volume_ratio: if vol_ratio > 0.0 { Some(vol_ratio) } else { None },
+        code: code.into(),
+        name: name.into(),
+        volume_ratio: if vol_ratio > 0.0 {
+            Some(vol_ratio)
+        } else {
+            None
+        },
         vol_vs_20d_avg: None,
         volume_pattern,
         change_pct,
@@ -103,18 +115,25 @@ pub fn screen_intraday(
 
 /// 盘后模式：需要 K 线数据，输出含启动 vs 出货判断
 pub fn analyze_postmarket(
-    code: &str, name: &str,
+    code: &str,
+    name: &str,
     kline: &[crate::data_provider::KlineData],
 ) -> BreakoutSignal {
     if kline.len() < 20 {
         return BreakoutSignal {
-            code: code.into(), name: name.into(),
-            volume_ratio: None, vol_vs_20d_avg: None,
+            code: code.into(),
+            name: name.into(),
+            volume_ratio: None,
+            vol_vs_20d_avg: None,
             volume_pattern: VolumePattern::Flat,
-            change_pct: 0.0, candle_strength: CandleStrength::Weak,
-            ma_break: None, price_position: PricePosition::Unknown,
-            breakout_type: BreakoutType::Uncertain, confidence: 0,
-            description: "K线数据不足".into(), data_degraded: true,
+            change_pct: 0.0,
+            candle_strength: CandleStrength::Weak,
+            ma_break: None,
+            price_position: PricePosition::Unknown,
+            breakout_type: BreakoutType::Uncertain,
+            confidence: 0,
+            description: "K线数据不足".into(),
+            data_degraded: true,
         };
     }
 
@@ -133,8 +152,14 @@ pub fn analyze_postmarket(
     desc.push(format!("距60均线{:+.1}%", dist));
 
     match price_position {
-        PricePosition::Low => { launch_score += 1; desc.push("低位".into()); }
-        PricePosition::High => { distribution_score += 1; desc.push("高位".into()); }
+        PricePosition::Low => {
+            launch_score += 1;
+            desc.push("低位".into());
+        }
+        PricePosition::High => {
+            distribution_score += 1;
+            desc.push("高位".into());
+        }
         _ => {}
     }
 
@@ -143,7 +168,14 @@ pub fn analyze_postmarket(
     let vol_20d: f64 = kline.iter().rev().take(20).map(|k| k.volume).sum::<f64>() / 20.0;
     let vol_ratio = if vol_20d > 0.0 { vol_5d / vol_20d } else { 1.0 };
 
-    let vol_10d_old: f64 = kline.iter().rev().skip(5).take(10).map(|k| k.volume).sum::<f64>() / 10.0;
+    let vol_10d_old: f64 = kline
+        .iter()
+        .rev()
+        .skip(5)
+        .take(10)
+        .map(|k| k.volume)
+        .sum::<f64>()
+        / 10.0;
     let was_shrinking = vol_10d_old > 0.0 && vol_10d_old < vol_20d * 0.7;
 
     let volume_pattern = if was_shrinking && vol_ratio >= 1.5 {
@@ -183,7 +215,8 @@ pub fn analyze_postmarket(
         is_bullish_alignment: ma5 > ma10 && ma10 > ma20,
     };
     if ma_info.is_bullish_alignment {
-        launch_score += 1; desc.push("多头排列".into());
+        launch_score += 1;
+        desc.push("多头排列".into());
     } else if ma20 > ma5 {
         distribution_score += 1;
     }
@@ -192,7 +225,8 @@ pub fn analyze_postmarket(
     let candle_strength = if latest.close > 0.0 && latest.open > 0.0 {
         let body_pct = (latest.close - latest.open) / latest.open * 100.0;
         if body_pct > 3.0 {
-            launch_score += 1; desc.push("强阳线".into());
+            launch_score += 1;
+            desc.push("强阳线".into());
             CandleStrength::Strong
         } else if body_pct > 1.0 {
             CandleStrength::Medium
@@ -201,7 +235,9 @@ pub fn analyze_postmarket(
         } else {
             CandleStrength::Bearish
         }
-    } else { CandleStrength::Weak };
+    } else {
+        CandleStrength::Weak
+    };
 
     // 6. 综合判定
     let (breakout_type, base_confidence) = if launch_score >= 4 && distribution_score <= 1 {
@@ -217,7 +253,8 @@ pub fn analyze_postmarket(
     confidence = base_confidence.min(95);
 
     BreakoutSignal {
-        code: code.into(), name: name.into(),
+        code: code.into(),
+        name: name.into(),
         volume_ratio: Some(vol_ratio),
         vol_vs_20d_avg: Some(vol_ratio),
         volume_pattern,
@@ -241,14 +278,34 @@ mod tests {
     fn k(date: &str, open: f64, close: f64, vol: f64, pct: f64) -> KlineData {
         KlineData {
             date: NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap(),
-            open, high: close.max(open), low: close.min(open), close, volume: vol,
-            amount: 0.0, pct_chg: pct, intraday_price: None, settled: true, pe_ratio: None, pb_ratio: None,
-            turnover_rate: None, market_cap: None, circulating_cap: None,
-            eps: None, roe: None, revenue_yoy: None, net_profit_yoy: None,
-            gross_margin: None, net_margin: None, sharpe_ratio: None,
-            financials_history: None, valuation_history: None,
-            consensus: None, industry: None,
-            is_limit_up: false, is_limit_down: false, is_suspended: false,
+            open,
+            high: close.max(open),
+            low: close.min(open),
+            close,
+            volume: vol,
+            amount: 0.0,
+            pct_chg: pct,
+            intraday_price: None,
+            settled: true,
+            pe_ratio: None,
+            pb_ratio: None,
+            turnover_rate: None,
+            market_cap: None,
+            circulating_cap: None,
+            eps: None,
+            roe: None,
+            revenue_yoy: None,
+            net_profit_yoy: None,
+            gross_margin: None,
+            net_margin: None,
+            sharpe_ratio: None,
+            financials_history: None,
+            valuation_history: None,
+            consensus: None,
+            industry: None,
+            is_limit_up: false,
+            is_limit_down: false,
+            is_suspended: false,
             adjust: crate::data_provider::AdjustType::None,
         }
     }
@@ -273,11 +330,20 @@ mod tests {
         for i in 0..30 {
             let price = 90.0 + i as f64 * 0.5; // 从 90 涨到 104.5
             let vol = if i < 25 { 0.5e6 } else { 2.0e6 }; // 前25天地量，近5天放量
-            data.push(k(&format!("2026-06-{:02}", i+1), price-0.5, price, vol, 1.0));
+            data.push(k(
+                &format!("2026-06-{:02}", i + 1),
+                price - 0.5,
+                price,
+                vol,
+                1.0,
+            ));
         }
         let s = analyze_postmarket("000001", "测试", &data);
         // 应该检测到地量后放量的特征
-        assert!(matches!(s.breakout_type, BreakoutType::Launch | BreakoutType::Uncertain));
+        assert!(matches!(
+            s.breakout_type,
+            BreakoutType::Launch | BreakoutType::Uncertain
+        ));
     }
 
     #[test]

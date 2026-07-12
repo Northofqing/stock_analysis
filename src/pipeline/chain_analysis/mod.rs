@@ -8,42 +8,115 @@
 //! - 主线生命周期通过簇内"昨日涨停/连板"标签数估算，警示高位接力风险。
 
 use anyhow::Result;
-use futures::stream::{self, StreamExt};
+use futures::stream::StreamExt;
 use log::{info, warn};
-use serde_json::json;
 use std::collections::{HashMap, HashSet};
 
 // 修复 Top10#3+#4 (2026-06-29 audit): chain_analysis.rs (1839 行) 拆子模块
 mod fetchers;
 // 兄弟模块 fetchers.rs 内 fetch_* 用 pub(super) 暴露, 这里 use 让 mod.rs 直接调用
 use fetchers::{
-    fetch_after_market_catalysts, fetch_board_code_map, fetch_cluster_news,
-    fetch_concepts_cached, fetch_laggard_candidates, fetch_lhb_map,
+    fetch_after_market_catalysts, fetch_board_code_map, fetch_cluster_news, fetch_concepts_cached,
+    fetch_laggard_candidates, fetch_lhb_map,
 };
 
 use crate::agent::tool::Tool;
-use crate::agent::tools_sector::FetchSectorTool;
 use crate::analyzer::{AgentMode, GeminiAnalyzer};
 use crate::database::DatabaseManager;
 use crate::market_data::TopStock;
 
 /// 泛指数/交易属性类板块黑名单（子串匹配）——不能作为产业链聚类键。
 const GENERIC_BOARD_PATTERNS: &[&str] = &[
-    "融资融券", "转融券", "沪股通", "深股通", "标准普尔", "标普", "MSCI", "富时罗素",
-    "沪深300", "中证500", "上证380", "上证180", "央视50", "创业板综", "创业成份",
-    "深成500", "深证100", "茅指数", "宁组合", "证金持股", "基金重仓", "机构重仓",
-    "预盈预增", "预亏预减", "昨日涨停", "昨日连板", "昨日触板", "次新股", "新股与次新股",
-    "ST股", "破净股", "低价股", "高送转", "股权激励", "AH股", "B股", "同花顺",
-    "举牌", "百元股", "QFII重仓", "社保重仓", "国家队", "GDR", "注册制次新股",
+    "融资融券",
+    "转融券",
+    "沪股通",
+    "深股通",
+    "标准普尔",
+    "标普",
+    "MSCI",
+    "富时罗素",
+    "沪深300",
+    "中证500",
+    "上证380",
+    "上证180",
+    "央视50",
+    "创业板综",
+    "创业成份",
+    "深成500",
+    "深证100",
+    "茅指数",
+    "宁组合",
+    "证金持股",
+    "基金重仓",
+    "机构重仓",
+    "预盈预增",
+    "预亏预减",
+    "昨日涨停",
+    "昨日连板",
+    "昨日触板",
+    "次新股",
+    "新股与次新股",
+    "ST股",
+    "破净股",
+    "低价股",
+    "高送转",
+    "股权激励",
+    "AH股",
+    "B股",
+    "同花顺",
+    "举牌",
+    "百元股",
+    "QFII重仓",
+    "社保重仓",
+    "国家队",
+    "GDR",
+    "注册制次新股",
     // 交易属性/形态/风格标签：会把整个涨停池聚成无意义大簇
-    "昨日高振幅", "昨日首板", "昨日炸板", "昨日高换手", "最近多板", "昨日打二板",
-    "东方财富热股", "近期新高", "历史新高", "百日新高", "趋势股", "题材股",
-    "小盘股", "中盘股", "大盘股", "小盘成长", "小盘价值", "中盘成长", "中盘价值",
-    "大盘成长", "大盘价值", "破发股", "破增发价股", "贬值受益", "HS300",
-    "年报预增", "年报预减", "年报扭亏", "并购重组概念", "先进制造风格",
-    "专精特新", "央国企改革", "中字头", "独角兽", "PPP模式", "参股银行",
+    "昨日高振幅",
+    "昨日首板",
+    "昨日炸板",
+    "昨日高换手",
+    "最近多板",
+    "昨日打二板",
+    "东方财富热股",
+    "近期新高",
+    "历史新高",
+    "百日新高",
+    "趋势股",
+    "题材股",
+    "小盘股",
+    "中盘股",
+    "大盘股",
+    "小盘成长",
+    "小盘价值",
+    "中盘成长",
+    "中盘价值",
+    "大盘成长",
+    "大盘价值",
+    "破发股",
+    "破增发价股",
+    "贬值受益",
+    "HS300",
+    "年报预增",
+    "年报预减",
+    "年报扭亏",
+    "并购重组概念",
+    "先进制造风格",
+    "专精特新",
+    "央国企改革",
+    "中字头",
+    "独角兽",
+    "PPP模式",
+    "参股银行",
     // 地域板块：不是产业链
-    "板块", "特区", "自贸", "一带一路", "西部大开发", "成渝", "长江三角", "粤港",
+    "板块",
+    "特区",
+    "自贸",
+    "一带一路",
+    "西部大开发",
+    "成渝",
+    "长江三角",
+    "粤港",
 ];
 
 /// 主线簇判定的最小涨停家数（可用 CHAIN_MIN_CLUSTER 环境变量覆盖）。
@@ -65,11 +138,11 @@ const MAX_SIMPLE_ANALYSIS: usize = 12;
 /// 五维主线量化评分（0-100）。
 #[derive(Debug, Clone, Default)]
 pub struct ChainScore {
-    pub logic_hardness: f64,   // 产业逻辑硬度 25%
+    pub logic_hardness: f64,     // 产业逻辑硬度 25%
     pub sentiment_position: f64, // 情绪位置 25%
-    pub fund_consensus: f64,   // 资金共识度 20%
-    pub chip_health: f64,      // 筹码健康度 15%
-    pub falsify_prob: f64,     // 证伪概率 15%（越低越好）
+    pub fund_consensus: f64,     // 资金共识度 20%
+    pub chip_health: f64,        // 筹码健康度 15%
+    pub falsify_prob: f64,       // 证伪概率 15%（越低越好）
 }
 
 impl ChainScore {
@@ -83,18 +156,28 @@ impl ChainScore {
 
     pub fn rating(&self) -> &'static str {
         let t = self.total();
-        if t >= 80.0 { "积极参与" }
-        else if t >= 60.0 { "适度参与" }
-        else if t >= 40.0 { "轻仓试探" }
-        else { "回避" }
+        if t >= 80.0 {
+            "积极参与"
+        } else if t >= 60.0 {
+            "适度参与"
+        } else if t >= 40.0 {
+            "轻仓试探"
+        } else {
+            "回避"
+        }
     }
 
     pub fn position_cap(&self) -> &'static str {
         let t = self.total();
-        if t >= 80.0 { "30%" }
-        else if t >= 60.0 { "15%" }
-        else if t >= 40.0 { "5%" }
-        else { "0%" }
+        if t >= 80.0 {
+            "30%"
+        } else if t >= 60.0 {
+            "15%"
+        } else if t >= 40.0 {
+            "5%"
+        } else {
+            "0%"
+        }
     }
 }
 
@@ -142,7 +225,10 @@ pub async fn run_chain_analysis(
             date
         ));
     }
-    info!("[产业链] 今日涨停池 {} 只，开始拉取概念标签...", limit_ups.len());
+    info!(
+        "[产业链] 今日涨停池 {} 只，开始拉取概念标签...",
+        limit_ups.len()
+    );
 
     // 1. 概念标签（带缓存）
     let codes: Vec<String> = limit_ups.iter().map(|s| s.code.clone()).collect();
@@ -180,7 +266,10 @@ pub async fn run_chain_analysis(
         let limit_codes: HashSet<String> = limit_ups.iter().map(|s| s.code.clone()).collect();
         let board_map = fetch_board_code_map().await;
         info!("[产业链] 概念板块索引 {} 个", board_map.len());
-        for c in clusters.iter_mut().take(MAX_DEEP_ANALYSIS + MAX_SIMPLE_ANALYSIS) {
+        for c in clusters
+            .iter_mut()
+            .take(MAX_DEEP_ANALYSIS + MAX_SIMPLE_ANALYSIS)
+        {
             let bk = c
                 .concept
                 .split_once('(')
@@ -355,8 +444,7 @@ fn cluster_by_concept(
         .collect();
     ranked.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(b.0)));
 
-    let code_map: HashMap<&str, &TopStock> =
-        stocks.iter().map(|s| (s.code.as_str(), s)).collect();
+    let code_map: HashMap<&str, &TopStock> = stocks.iter().map(|s| (s.code.as_str(), s)).collect();
 
     let mut picked: Vec<ChainCluster> = Vec::new();
     let mut covered: HashSet<String> = HashSet::new();
@@ -616,7 +704,9 @@ async fn analyze_cluster_deep(
     cluster_news: &str,
     date: &str,
 ) -> Result<String> {
-    let mut table = String::from("| 代码 | 名称 | 涨幅% | 龙虎榜净买入(万) | 其他概念标签 |\n|---|---|---|---|---|\n");
+    let mut table = String::from(
+        "| 代码 | 名称 | 涨幅% | 龙虎榜净买入(万) | 其他概念标签 |\n|---|---|---|---|---|\n",
+    );
     for s in &cluster.stocks {
         let lhb = lhb_map
             .get(&s.code)
@@ -668,7 +758,10 @@ async fn analyze_cluster_deep(
     } else {
         let mut b = String::from("| 代码 | 名称 | 今日涨幅% |\n|---|---|---|\n");
         for s in &cluster.candidates {
-            b.push_str(&format!("| {} | {} | {:.2} |\n", s.code, s.name, s.change_pct));
+            b.push_str(&format!(
+                "| {} | {} | {:.2} |\n",
+                s.code, s.name, s.change_pct
+            ));
         }
         b
     };
@@ -746,9 +839,9 @@ async fn analyze_cluster_simple(
         .stocks
         .iter()
         .filter_map(|s| {
-            lhb_map.get(&s.code).map(|v| {
-                format!("{}({}):龙虎榜净买入{}万", s.name, s.code, v)
-            })
+            lhb_map
+                .get(&s.code)
+                .map(|v| format!("{}({}):龙虎榜净买入{}万", s.name, s.code, v))
         })
         .take(3)
         .collect();
@@ -758,7 +851,10 @@ async fn analyze_cluster_simple(
     } else {
         let mut b = String::from("| 代码 | 名称 | 今日涨幅% |\n|---|---|---|\n");
         for s in cluster.candidates.iter().take(5) {
-            b.push_str(&format!("| {} | {} | {:.2} |\n", s.code, s.name, s.change_pct));
+            b.push_str(&format!(
+                "| {} | {} | {:.2} |\n",
+                s.code, s.name, s.change_pct
+            ));
         }
         b
     };
@@ -784,7 +880,11 @@ async fn analyze_cluster_simple(
         cont = cluster.continuation_count,
         streak = cluster.streak_days.max(1),
         candidates = candidate_block,
-        lhb = if lhb_note.is_empty() { "无".to_string() } else { lhb_note.join("；") },
+        lhb = if lhb_note.is_empty() {
+            "无".to_string()
+        } else {
+            lhb_note.join("；")
+        },
     );
 
     analyzer
@@ -869,7 +969,9 @@ async fn synthesize_overview(
     let position_block = if position_diags.is_empty() {
         String::from("（当前无持仓）")
     } else {
-        let mut b = String::from("| 代码 | 名称 | 持仓收益% | 主线归属 | 今日是否涨停 |\n|---|---|---|---|---|\n");
+        let mut b = String::from(
+            "| 代码 | 名称 | 持仓收益% | 主线归属 | 今日是否涨停 |\n|---|---|---|---|---|\n",
+        );
         for d in position_diags {
             let ml = d
                 .mainline
@@ -956,7 +1058,11 @@ fn parse_conclusion(analysis: &str) -> Option<(String, String, String)> {
         .lines()
         .map(|l| l.trim())
         .find(|l| l.starts_with("【结论】") || l.starts_with("【简评】"))?;
-    let prefix = if line.starts_with("【结论】") { "【结论】" } else { "【简评】" };
+    let prefix = if line.starts_with("【结论】") {
+        "【结论】"
+    } else {
+        "【简评】"
+    };
     let body = line.trim_start_matches(prefix);
     let mut stage = None;
     let mut rating = None;
@@ -993,11 +1099,7 @@ fn build_report(
     // 解析每条主线的评分
     let scores: Vec<Option<ChainScore>> = sections
         .iter()
-        .map(|(_, analysis)| {
-            analysis
-                .as_deref()
-                .and_then(parse_chain_score)
-        })
+        .map(|(_, analysis)| analysis.as_deref().and_then(parse_chain_score))
         .collect();
 
     let mut md = String::new();
@@ -1039,7 +1141,11 @@ fn build_report(
             score_str,
             stage,
             rating_display,
-            if cands == "-" || cands == "无" { "-".to_string() } else { cands }
+            if cands == "-" || cands == "无" {
+                "-".to_string()
+            } else {
+                cands
+            }
         ));
     }
     md.push('\n');
@@ -1146,21 +1252,14 @@ fn build_report(
         } else {
             format!("（同义概念：{}）", cluster.aliases.join("、"))
         };
-        md.push_str(&format!(
-            "## 主线{}：{}{}\n\n",
-            i + 1,
-            concept,
-            alias_note
-        ));
+        md.push_str(&format!("## 主线{}：{}{}\n\n", i + 1, concept, alias_note));
 
         // 展示评分卡
         if let Some(score) = scores.get(i).and_then(|s| s.as_ref()) {
             md.push_str(&format!(
                 "| 维度 | 产业逻辑 | 情绪位置 | 资金共识 | 筹码健康 | 证伪概率 | **总评分** |\n"
             ));
-            md.push_str(&format!(
-                "|---|---|---|---|---|---|---|\n"
-            ));
+            md.push_str(&format!("|---|---|---|---|---|---|---|\n"));
             md.push_str(&format!(
                 "| 得分 | {:.0}/100 | {:.0}/100 | {:.0}/100 | {:.0}/100 | {:.0}/100 | **{:.0}/100** |\n",
                 score.logic_hardness,
@@ -1268,16 +1367,40 @@ mod tests {
 
     #[test]
     fn test_chain_score_rating() {
-        let high = ChainScore { logic_hardness: 85.0, sentiment_position: 85.0, fund_consensus: 85.0, chip_health: 85.0, falsify_prob: 10.0 };
+        let high = ChainScore {
+            logic_hardness: 85.0,
+            sentiment_position: 85.0,
+            fund_consensus: 85.0,
+            chip_health: 85.0,
+            falsify_prob: 10.0,
+        };
         assert_eq!(high.rating(), "积极参与");
 
-        let mid = ChainScore { logic_hardness: 65.0, sentiment_position: 65.0, fund_consensus: 65.0, chip_health: 65.0, falsify_prob: 35.0 };
+        let mid = ChainScore {
+            logic_hardness: 65.0,
+            sentiment_position: 65.0,
+            fund_consensus: 65.0,
+            chip_health: 65.0,
+            falsify_prob: 35.0,
+        };
         assert_eq!(mid.rating(), "适度参与");
 
-        let low = ChainScore { logic_hardness: 45.0, sentiment_position: 45.0, fund_consensus: 45.0, chip_health: 45.0, falsify_prob: 55.0 };
+        let low = ChainScore {
+            logic_hardness: 45.0,
+            sentiment_position: 45.0,
+            fund_consensus: 45.0,
+            chip_health: 45.0,
+            falsify_prob: 55.0,
+        };
         assert_eq!(low.rating(), "轻仓试探");
 
-        let avoid = ChainScore { logic_hardness: 30.0, sentiment_position: 30.0, fund_consensus: 30.0, chip_health: 30.0, falsify_prob: 80.0 };
+        let avoid = ChainScore {
+            logic_hardness: 30.0,
+            sentiment_position: 30.0,
+            fund_consensus: 30.0,
+            chip_health: 30.0,
+            falsify_prob: 80.0,
+        };
         assert_eq!(avoid.rating(), "回避");
     }
 
@@ -1312,7 +1435,8 @@ mod tests {
     #[test]
     fn test_parse_conclusion_simple_format() {
         let analysis = "【简评】阶段=发酵中｜参与=可关注｜候选=600123\n催化...";
-        let (stage, rating, cands) = parse_conclusion(analysis).expect("should parse simple format");
+        let (stage, rating, cands) =
+            parse_conclusion(analysis).expect("should parse simple format");
         assert_eq!(stage, "发酵中");
         assert_eq!(rating, "可关注");
         assert_eq!(cands, "600123");
@@ -1320,7 +1444,8 @@ mod tests {
 
     #[test]
     fn test_parse_conclusion_with_candidates() {
-        let analysis = "【结论】阶段=首日启动｜参与=可关注｜候选=恩捷股份(002812)、雄韬股份(002733)\n内容";
+        let analysis =
+            "【结论】阶段=首日启动｜参与=可关注｜候选=恩捷股份(002812)、雄韬股份(002733)\n内容";
         let (stage, rating, cands) = parse_conclusion(analysis).expect("should parse");
         assert_eq!(stage, "首日启动");
         assert_eq!(rating, "可关注");
@@ -1353,16 +1478,40 @@ mod tests {
 
     #[test]
     fn test_chain_score_position_cap() {
-        let high = ChainScore { logic_hardness: 85.0, sentiment_position: 85.0, fund_consensus: 85.0, chip_health: 85.0, falsify_prob: 10.0 };
+        let high = ChainScore {
+            logic_hardness: 85.0,
+            sentiment_position: 85.0,
+            fund_consensus: 85.0,
+            chip_health: 85.0,
+            falsify_prob: 10.0,
+        };
         assert_eq!(high.position_cap(), "30%");
 
-        let mid = ChainScore { logic_hardness: 65.0, sentiment_position: 65.0, fund_consensus: 65.0, chip_health: 65.0, falsify_prob: 35.0 };
+        let mid = ChainScore {
+            logic_hardness: 65.0,
+            sentiment_position: 65.0,
+            fund_consensus: 65.0,
+            chip_health: 65.0,
+            falsify_prob: 35.0,
+        };
         assert_eq!(mid.position_cap(), "15%");
 
-        let low = ChainScore { logic_hardness: 45.0, sentiment_position: 45.0, fund_consensus: 45.0, chip_health: 45.0, falsify_prob: 55.0 };
+        let low = ChainScore {
+            logic_hardness: 45.0,
+            sentiment_position: 45.0,
+            fund_consensus: 45.0,
+            chip_health: 45.0,
+            falsify_prob: 55.0,
+        };
         assert_eq!(low.position_cap(), "5%");
 
-        let avoid = ChainScore { logic_hardness: 30.0, sentiment_position: 30.0, fund_consensus: 30.0, chip_health: 30.0, falsify_prob: 80.0 };
+        let avoid = ChainScore {
+            logic_hardness: 30.0,
+            sentiment_position: 30.0,
+            fund_consensus: 30.0,
+            chip_health: 30.0,
+            falsify_prob: 80.0,
+        };
         assert_eq!(avoid.position_cap(), "0%");
     }
 
@@ -1370,8 +1519,20 @@ mod tests {
     fn test_build_report_with_scores() {
         let date = "2026-06-13";
         let stocks = vec![
-            TopStock { code: "000001".into(), name: "测试A".into(), change_pct: 10.0, price: 10.0, ..Default::default() },
-            TopStock { code: "000002".into(), name: "测试B".into(), change_pct: 9.5, price: 20.0, ..Default::default() },
+            TopStock {
+                code: "000001".into(),
+                name: "测试A".into(),
+                change_pct: 10.0,
+                price: 10.0,
+                ..Default::default()
+            },
+            TopStock {
+                code: "000002".into(),
+                name: "测试B".into(),
+                change_pct: 9.5,
+                price: 20.0,
+                ..Default::default()
+            },
         ];
         let cluster = ChainCluster {
             concept: "测试概念".into(),
@@ -1380,7 +1541,13 @@ mod tests {
             continuation_count: 2,
             streak_days: 1,
             candidates: vec![],
-            score: Some(ChainScore { logic_hardness: 70.0, sentiment_position: 60.0, fund_consensus: 65.0, chip_health: 50.0, falsify_prob: 40.0 }),
+            score: Some(ChainScore {
+                logic_hardness: 70.0,
+                sentiment_position: 60.0,
+                fund_consensus: 65.0,
+                chip_health: 50.0,
+                falsify_prob: 40.0,
+            }),
             scenario: None,
         };
         let analysis = "【结论】阶段=高潮｜参与=谨慎｜候选=无\n【评分】产业逻辑=70/100｜情绪位置=60/100｜资金共识=65/100｜筹码健康=50/100｜证伪概率=40/100\n### 产业链图谱\n测试内容";
@@ -1388,7 +1555,17 @@ mod tests {
         let concepts: HashMap<String, Vec<String>> = HashMap::new();
         let diags: Vec<PositionDiag> = vec![];
 
-        let report = build_report(date, &stocks, &[cluster], &sections, &[], None, "", &concepts, &diags);
+        let report = build_report(
+            date,
+            &stocks,
+            &[cluster],
+            &sections,
+            &[],
+            None,
+            "",
+            &concepts,
+            &diags,
+        );
         assert!(report.contains("一页纸决策摘要"));
         assert!(report.contains("62")); // total = 70*0.25+60*0.25+65*0.2+50*0.15+60*0.15 = 62
         assert!(report.contains("适度参与"));
@@ -1400,9 +1577,27 @@ mod tests {
     fn test_build_report_tier3_hot_list() {
         let date = "2026-06-13";
         let stocks = vec![
-            TopStock { code: "000001".into(), name: "小概念A".into(), change_pct: 10.0, price: 10.0, ..Default::default() },
-            TopStock { code: "000002".into(), name: "小概念B".into(), change_pct: 9.0, price: 20.0, ..Default::default() },
-            TopStock { code: "000003".into(), name: "小概念C".into(), change_pct: 8.0, price: 30.0, ..Default::default() },
+            TopStock {
+                code: "000001".into(),
+                name: "小概念A".into(),
+                change_pct: 10.0,
+                price: 10.0,
+                ..Default::default()
+            },
+            TopStock {
+                code: "000002".into(),
+                name: "小概念B".into(),
+                change_pct: 9.0,
+                price: 20.0,
+                ..Default::default()
+            },
+            TopStock {
+                code: "000003".into(),
+                name: "小概念C".into(),
+                change_pct: 8.0,
+                price: 30.0,
+                ..Default::default()
+            },
         ];
         let cluster = ChainCluster {
             concept: "弱主线".into(),
@@ -1418,8 +1613,21 @@ mod tests {
         let concepts: HashMap<String, Vec<String>> = HashMap::new();
         let diags: Vec<PositionDiag> = vec![];
 
-        let report = build_report(date, &stocks, &[cluster], &sections, &[], None, "", &concepts, &diags);
-        assert!(report.contains("其他热点速览"), "should have hot list for unanalyzed clusters");
+        let report = build_report(
+            date,
+            &stocks,
+            &[cluster],
+            &sections,
+            &[],
+            None,
+            "",
+            &concepts,
+            &diags,
+        );
+        assert!(
+            report.contains("其他热点速览"),
+            "should have hot list for unanalyzed clusters"
+        );
         assert!(report.contains("弱主线"));
         assert!(report.contains("小概念A"));
     }
@@ -1427,9 +1635,13 @@ mod tests {
     #[test]
     fn test_build_report_position_diag_with_scores() {
         let date = "2026-06-13";
-        let stocks = vec![
-            TopStock { code: "000001".into(), name: "测试持仓".into(), change_pct: 10.0, price: 10.0, ..Default::default() },
-        ];
+        let stocks = vec![TopStock {
+            code: "000001".into(),
+            name: "测试持仓".into(),
+            change_pct: 10.0,
+            price: 10.0,
+            ..Default::default()
+        }];
         let cluster = ChainCluster {
             concept: "电池技术".into(),
             aliases: vec![],
@@ -1437,7 +1649,13 @@ mod tests {
             continuation_count: 1,
             streak_days: 2,
             candidates: vec![],
-            score: Some(ChainScore { logic_hardness: 70.0, sentiment_position: 60.0, fund_consensus: 65.0, chip_health: 50.0, falsify_prob: 40.0 }),
+            score: Some(ChainScore {
+                logic_hardness: 70.0,
+                sentiment_position: 60.0,
+                fund_consensus: 65.0,
+                chip_health: 50.0,
+                falsify_prob: 40.0,
+            }),
             scenario: None,
         };
         let analysis = "【结论】阶段=发酵中｜参与=可关注｜候选=无\n【评分】产业逻辑=70/100｜情绪位置=60/100｜资金共识=65/100｜筹码健康=50/100｜证伪概率=40/100\n### 产业链图谱\n测试";
@@ -1451,7 +1669,17 @@ mod tests {
             in_limit_pool: true,
         }];
 
-        let report = build_report(date, &stocks, &[cluster], &sections, &[], None, "", &concepts, &diags);
+        let report = build_report(
+            date,
+            &stocks,
+            &[cluster],
+            &sections,
+            &[],
+            None,
+            "",
+            &concepts,
+            &diags,
+        );
         assert!(report.contains("持仓主线诊断"));
         assert!(report.contains("测试持仓"));
         assert!(report.contains("62")); // total score from analysis text

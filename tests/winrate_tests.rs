@@ -2,8 +2,8 @@
 //! 之前: 占位 50 = 假装中性, 系统偏差 7.5 分
 //! 现在: 样本 < 200 = None, 无数据 = 0, 有数据 = 真实胜率
 
-use stock_analysis::opportunity::winrate::*;
 use chrono::NaiveDate;
+use stock_analysis::opportunity::winrate::*;
 
 fn sample(day_offset: i64, return_pct: f64) -> BacktestSample {
     BacktestSample {
@@ -32,7 +32,9 @@ fn test_winrate_at_threshold() {
 #[test]
 fn test_winrate_zero_clear_negative() {
     // 修复 P1-2: 真实胜率 < 50% → 0 (明确负信号, 允许 0.5 封顶)
-    let samples: Vec<_> = (0..200).map(|i| sample(i, if i % 2 == 0 { 0.01 } else { -0.01 })).collect();
+    let samples: Vec<_> = (0..200)
+        .map(|i| sample(i, if i % 2 == 0 { 0.01 } else { -0.01 }))
+        .collect();
     let score = calc_winrate_score(&samples).unwrap();
     // 100 涨 100 跌 = 50% 胜率, clamp 到 0.5
     assert_eq!(score, 0.5);
@@ -54,9 +56,9 @@ fn test_winrate_filter_zero_returns() {
     // 修复 P1-2: n_day_return=0 (中性) 不算胜负
     let samples = vec![
         sample(0, 0.05),
-        sample(1, 0.0),  // 中性
+        sample(1, 0.0), // 中性
         sample(2, -0.03),
-        sample(3, 0.0),  // 中性
+        sample(3, 0.0), // 中性
     ];
     let summary = compute_winrate_summary(&samples);
     // 只有 2 有效样本 (1 涨 1 跌), < 200 → insufficient

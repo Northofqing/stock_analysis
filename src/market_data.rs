@@ -207,7 +207,7 @@ mod tests {
         index.high = 3050.0;
         index.low = 2980.0;
         index.calculate_amplitude();
-        
+
         // 振幅 = (3050 - 2980) / 3000 * 100 = 2.33%
         assert!((index.amplitude - 2.33).abs() < 0.01);
     }
@@ -215,11 +215,11 @@ mod tests {
     #[test]
     fn test_market_mood() {
         let mut overview = MarketOverview::new("2026-01-22".to_string());
-        
+
         let mut index = MarketIndex::new("sh000001".to_string(), "上证指数".to_string());
         index.change_pct = 1.5;
         overview.indices.push(index);
-        
+
         assert_eq!(overview.market_mood(), "强势上涨");
     }
 }

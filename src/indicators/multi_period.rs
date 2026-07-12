@@ -51,12 +51,18 @@ pub fn trend_from_prices(prices: &[f64]) -> Trend {
 
 /// 聚合日线 → 周线 (5 日 = 1 周)
 pub fn aggregate_daily_to_weekly(daily: &[f64]) -> Vec<f64> {
-    daily.chunks(5).map(|w| w.iter().sum::<f64>() / w.len() as f64).collect()
+    daily
+        .chunks(5)
+        .map(|w| w.iter().sum::<f64>() / w.len() as f64)
+        .collect()
 }
 
 /// 聚合日线 → 月线 (20 日 = 1 月)
 pub fn aggregate_daily_to_monthly(daily: &[f64]) -> Vec<f64> {
-    daily.chunks(20).map(|m| m.iter().sum::<f64>() / m.len() as f64).collect()
+    daily
+        .chunks(20)
+        .map(|m| m.iter().sum::<f64>() / m.len() as f64)
+        .collect()
 }
 
 /// 多周期确认 (3 周期同向 = aligned)
@@ -71,9 +77,8 @@ pub fn confirm_multi_period(daily_prices: &[f64]) -> Option<MultiPeriodConfirm> 
     let monthly = trend_from_prices(&monthly_prices);
 
     // 判定 aligned: 3 期都不是 Sideways 且同向 (Sideways 不算 aligned, 避免误判)
-    let all_non_sideways = daily != Trend::Sideways
-        && weekly != Trend::Sideways
-        && monthly != Trend::Sideways;
+    let all_non_sideways =
+        daily != Trend::Sideways && weekly != Trend::Sideways && monthly != Trend::Sideways;
     let all_up = daily == Trend::Up && weekly == Trend::Up && monthly == Trend::Up;
     let all_down = daily == Trend::Down && weekly == Trend::Down && monthly == Trend::Down;
     let aligned = all_non_sideways && (all_up || all_down);
@@ -164,8 +169,10 @@ mod tests {
             }
         }
         let confirm = confirm_multi_period(&prices).unwrap();
-        eprintln!("DEBUG: daily={:?} weekly={:?} monthly={:?} aligned={}",
-            confirm.daily, confirm.weekly, confirm.monthly, confirm.aligned);
+        eprintln!(
+            "DEBUG: daily={:?} weekly={:?} monthly={:?} aligned={}",
+            confirm.daily, confirm.weekly, confirm.monthly, confirm.aligned
+        );
         // 锯齿+极小降 → daily Sideways, weekly Sideways, monthly 略 Down
         // 按 v10 §9 "aligned = 3 期都不是 Sideways 且同向", Sideways 排除 → aligned=false
         assert!(!confirm.aligned, "Sideways 不应 aligned, got {:?}", confirm);

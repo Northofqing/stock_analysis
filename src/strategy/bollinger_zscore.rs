@@ -7,15 +7,15 @@
 //! 4. 在历史K线上逐日回测，生成净值曲线和回测指标
 
 use anyhow::Result;
-use chrono::{Local, TimeZone, NaiveDate};
+use chrono::{Local, NaiveDate, TimeZone};
 use log::{info, warn};
 use polars::prelude::*;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use super::core::{BacktestSummary, BacktestState, Trade, TradeAction};
-use crate::data_provider::KlineData;
+use super::core::{BacktestState, BacktestSummary, Trade, TradeAction};
 use super::{KlineStrategy, StrategyResult};
+use crate::data_provider::KlineData;
 
 // ────────────────────────────── 策略参数 ──────────────────────────────
 
@@ -70,14 +70,24 @@ impl Default for BollingerZScoreConfig {
 // ────────────────────────────── Polars 指标计算 ──────────────────────────────
 
 /// 用 Polars 一次性计算所有技术指标列
-pub fn compute_indicators(klines: &[KlineData], config: &BollingerZScoreConfig) -> Result<DataFrame> {
+pub fn compute_indicators(
+    klines: &[KlineData],
+    config: &BollingerZScoreConfig,
+) -> Result<DataFrame> {
     let n = klines.len();
     if n < config.bb_window {
-        anyhow::bail!("K线数据不足 {} 条，无法计算 {} 日布林带", n, config.bb_window);
+        anyhow::bail!(
+            "K线数据不足 {} 条，无法计算 {} 日布林带",
+            n,
+            config.bb_window
+        );
     }
 
     // 构建基础列
-    let dates: Vec<String> = klines.iter().map(|k| k.date.format("%Y-%m-%d").to_string()).collect();
+    let dates: Vec<String> = klines
+        .iter()
+        .map(|k| k.date.format("%Y-%m-%d").to_string())
+        .collect();
     let close: Vec<f64> = klines.iter().map(|k| k.close).collect();
     let open: Vec<f64> = klines.iter().map(|k| k.open).collect();
     let high: Vec<f64> = klines.iter().map(|k| k.high).collect();
@@ -97,7 +107,8 @@ pub fn compute_indicators(klines: &[KlineData], config: &BollingerZScoreConfig) 
     ]?;
 
     // 用 Lazy API 一次计算布林带和 Z-Score
-    let df = df.lazy()
+    let df = df
+        .lazy()
         .with_columns([
             // 布林带中轨 = SMA(close, window)
             col("close")
@@ -159,7 +170,6 @@ fn add_trend_filter(df: &DataFrame) -> Result<DataFrame> {
 /// 策略交易信号（重新导出自 strategy 模块，此处保留以向后兼容）
 pub use super::Signal;
 
-
 // ────────────────────────────── 回测引擎 ──────────────────────────────
 
 /// 布林带 + Z-Score 均值回归回测引擎
@@ -175,7 +185,12 @@ impl BollingerZScoreBacktest {
     /// 对单只股票运行历史回测
     ///
     /// `klines` 应按**日期升序**排列（最早在前）
-    pub fn run_single(&self, code: &str, name: &str, klines: &[KlineData]) -> Result<SingleBacktestResult> {
+    pub fn run_single(
+        &self,
+        code: &str,
+        name: &str,
+        klines: &[KlineData],
+    ) -> Result<SingleBacktestResult> {
         let df = compute_indicators(klines, &self.config)?;
         let df = add_trend_filter(&df)?;
         let n = df.height();
@@ -183,7 +198,7 @@ impl BollingerZScoreBacktest {
         // 提取列
         let dates = df.column("date")?.str()?;
         let close_col = df.column("close")?.f64()?;
-        let open_col = df.column("open")?.f64()?;   // 以次日 open 成交，避免未来函数
+        let open_col = df.column("open")?.f64()?; // 以次日 open 成交，避免未来函数
         let bb_upper = df.column("bb_upper")?.f64()?;
         let bb_lower = df.column("bb_lower")?.f64()?;
         let bb_mid = df.column("bb_mid")?.f64()?;
@@ -200,7 +215,10 @@ impl BollingerZScoreBacktest {
         for i in 0..n {
             let close = match close_col.get(i) {
                 Some(v) => v,
-                None => { signals.push(Signal::Hold); continue; }
+                None => {
+                    signals.push(Signal::Hold);
+                    continue;
+                }
             };
             let z = zscore_col.get(i);
             let upper = bb_upper.get(i);
@@ -212,7 +230,8 @@ impl BollingerZScoreBacktest {
             let date_str = dates.get(i).unwrap_or("1970-01-01");
             let naive = NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
                 .unwrap_or(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap());
-            let dt = Local.from_local_datetime(&naive.and_hms_opt(15, 0, 0).unwrap())
+            let dt = Local
+                .from_local_datetime(&naive.and_hms_opt(15, 0, 0).unwrap())
                 .single()
                 .unwrap_or_else(|| Local::now());
 
@@ -284,9 +303,14 @@ impl BollingerZScoreBacktest {
                     shares += buy_shares;
                     avg_cost = (old_val + amount) / shares;
                     trades.push(Trade {
-                        date: next_dt, code: code.to_string(), name: name.to_string(),
-                        action: TradeAction::Buy, shares: buy_shares,
-                        price: buy_price, amount, commission: comm,
+                        date: next_dt,
+                        code: code.to_string(),
+                        name: name.to_string(),
+                        action: TradeAction::Buy,
+                        shares: buy_shares,
+                        price: buy_price,
+                        amount,
+                        commission: comm,
                     });
                     signals.push(Signal::Buy);
                     continue;
@@ -309,9 +333,14 @@ impl BollingerZScoreBacktest {
                     let comm = amount * (self.config.commission_rate + self.config.stamp_tax_rate);
                     cash += amount - comm;
                     trades.push(Trade {
-                        date: next_dt, code: code.to_string(), name: name.to_string(),
-                        action: TradeAction::Sell, shares,
-                        price: sell_price, amount, commission: comm,
+                        date: next_dt,
+                        code: code.to_string(),
+                        name: name.to_string(),
+                        action: TradeAction::Sell,
+                        shares,
+                        price: sell_price,
+                        amount,
+                        commission: comm,
                     });
                     shares = 0.0;
                     avg_cost = 0.0;
@@ -439,7 +468,11 @@ impl BollingerZScoreBacktest {
 
             let sum: f64 = maps
                 .iter()
-                .map(|m| m.get(date_str).copied().unwrap_or(self.config.initial_capital))
+                .map(|m| {
+                    m.get(date_str)
+                        .copied()
+                        .unwrap_or(self.config.initial_capital)
+                })
                 .sum();
             portfolio_values.push((dt, sum));
         }
@@ -519,27 +552,58 @@ impl BollingerZScoreResult {
         report.push_str("# 📊 布林带+Z-Score 均值回归策略回测报告\n\n");
         report.push_str(&format!("**生成时间**: {}\n\n", now));
         report.push_str("> ⚠️ **免责声明**\n");
-        report.push_str("> - 股票池为静态清单，存在**幸存者偏差**（未含历史退市 / ST / 被剔除标的）。\n");
-        report.push_str("> - 交易事件采用 **T 日信号 / T+1 日 open 成交** （已修复 look-ahead）。\n");
-        report.push_str("> - 费用说明：commission 字段含佣金+印花税（卖出）+滑点已仅反映在成交价中。\n\n");
+        report.push_str(
+            "> - 股票池为静态清单，存在**幸存者偏差**（未含历史退市 / ST / 被剔除标的）。\n",
+        );
+        report
+            .push_str("> - 交易事件采用 **T 日信号 / T+1 日 open 成交** （已修复 look-ahead）。\n");
+        report.push_str(
+            "> - 费用说明：commission 字段含佣金+印花税（卖出）+滑点已仅反映在成交价中。\n\n",
+        );
         report.push_str("---\n\n");
 
         // 策略参数
         report.push_str("## ⚙️ 策略参数\n\n");
         report.push_str("| 参数 | 值 |\n");
         report.push_str("|------|----|\n");
-        report.push_str(&format!("| 回测区间 | {} ~ {} |\n",
-            self.config.start_date.map_or("不限".to_string(), |d| d.format("%Y-%m-%d").to_string()),
-            self.config.end_date.map_or("不限".to_string(), |d| d.format("%Y-%m-%d").to_string()),
+        report.push_str(&format!(
+            "| 回测区间 | {} ~ {} |\n",
+            self.config
+                .start_date
+                .map_or("不限".to_string(), |d| d.format("%Y-%m-%d").to_string()),
+            self.config
+                .end_date
+                .map_or("不限".to_string(), |d| d.format("%Y-%m-%d").to_string()),
         ));
         report.push_str(&format!("| 布林带窗口 | {} 日 |\n", self.config.bb_window));
-        report.push_str(&format!("| 布林带倍数 | {:.1}σ |\n", self.config.bb_std_mult));
-        report.push_str(&format!("| Z-Score 买入阈值 | {:.1} |\n", self.config.zscore_buy));
-        report.push_str(&format!("| Z-Score 卖出阈值 | {:.1} |\n", self.config.zscore_sell));
-        report.push_str(&format!("| Z-Score 平仓阈值 | {:.1} |\n", self.config.zscore_exit));
-        report.push_str(&format!("| 单股最大仓位 | {:.0}% |\n", self.config.max_position_pct * 100.0));
-        report.push_str(&format!("| 手续费率 | {:.2}‰ |\n", self.config.commission_rate * 1000.0));
-        report.push_str(&format!("| 滑点率 | {:.1}‰ |\n", self.config.slippage_rate * 1000.0));
+        report.push_str(&format!(
+            "| 布林带倍数 | {:.1}σ |\n",
+            self.config.bb_std_mult
+        ));
+        report.push_str(&format!(
+            "| Z-Score 买入阈值 | {:.1} |\n",
+            self.config.zscore_buy
+        ));
+        report.push_str(&format!(
+            "| Z-Score 卖出阈值 | {:.1} |\n",
+            self.config.zscore_sell
+        ));
+        report.push_str(&format!(
+            "| Z-Score 平仓阈值 | {:.1} |\n",
+            self.config.zscore_exit
+        ));
+        report.push_str(&format!(
+            "| 单股最大仓位 | {:.0}% |\n",
+            self.config.max_position_pct * 100.0
+        ));
+        report.push_str(&format!(
+            "| 手续费率 | {:.2}‰ |\n",
+            self.config.commission_rate * 1000.0
+        ));
+        report.push_str(&format!(
+            "| 滑点率 | {:.1}‰ |\n",
+            self.config.slippage_rate * 1000.0
+        ));
         report.push_str("\n");
 
         // 组合汇总
@@ -556,10 +620,15 @@ impl BollingerZScoreResult {
             "| 期末资产 | ¥{:.2}万 | - |\n",
             summary.final_value / 10000.0
         ));
-        let ret_emoji = if summary.total_return > 0.0 { "📈" } else { "📉" };
+        let ret_emoji = if summary.total_return > 0.0 {
+            "📈"
+        } else {
+            "📉"
+        };
         report.push_str(&format!(
             "| 总收益率 | {:.2}% | {} |\n",
-            summary.total_return * 100.0, ret_emoji
+            summary.total_return * 100.0,
+            ret_emoji
         ));
         report.push_str(&format!(
             "| 年化收益率 | {:.2}% | - |\n",
@@ -574,7 +643,8 @@ impl BollingerZScoreResult {
         };
         report.push_str(&format!(
             "| 最大回撤 | {:.2}% | {} |\n",
-            summary.max_drawdown * 100.0, dd_emoji
+            summary.max_drawdown * 100.0,
+            dd_emoji
         ));
         let sr_emoji = if summary.sharpe_ratio > 1.0 {
             "优秀"
@@ -634,8 +704,12 @@ impl BollingerZScoreResult {
         report.push_str("## 📝 策略说明\n\n");
         report.push_str("**布林带 + Z-Score 均值回归策略**基于统计学均值回归原理：\n\n");
         report.push_str("1. **布林带(Bollinger Bands)**：以 N 日移动平均线为中轨，上下各加减 K 倍标准差，量化价格波动区间\n");
-        report.push_str("2. **Z-Score**：标准化衡量当前价格偏离均值的程度，`Z = (Price - Mean) / Std`\n");
-        report.push_str("3. **买入信号**：价格触及/跌破下轨 **且** Z-Score ≤ 买入阈值 → 超卖，看多回归\n");
+        report.push_str(
+            "2. **Z-Score**：标准化衡量当前价格偏离均值的程度，`Z = (Price - Mean) / Std`\n",
+        );
+        report.push_str(
+            "3. **买入信号**：价格触及/跌破下轨 **且** Z-Score ≤ 买入阈值 → 超卖，看多回归\n",
+        );
         report.push_str("4. **卖出信号**：价格触及/突破上轨 **且** Z-Score ≥ 卖出阈值 → 超买止盈；或 Z-Score 回归至 0 附近且盈利 → 均值回归平仓\n\n");
         report.push_str("> ⚠️ 本策略适合震荡市，趋势行情中可能频繁止损。\n\n");
 

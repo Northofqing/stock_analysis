@@ -39,18 +39,18 @@ pub struct ExecutionStats {
 /// MFE / MAE 统计
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct MfeMaeStats {
-    pub avg_mfe: f64,        // 平均最大有利偏移 (%)
-    pub avg_mae: f64,        // 平均最大不利偏移 (%)
-    pub capture_ratio: f64,  // 捕获率: avg_mfe / (avg_mfe - avg_mae), 越高越好
+    pub avg_mfe: f64,       // 平均最大有利偏移 (%)
+    pub avg_mae: f64,       // 平均最大不利偏移 (%)
+    pub capture_ratio: f64, // 捕获率: avg_mfe / (avg_mfe - avg_mae), 越高越好
 }
 
 /// 规则改动建议 (仅审计输出, 不自动改)
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RuleSuggestion {
-    pub rule_id: String,        // e.g. "BR-006"
-    pub issue: String,          // 问题描述
-    pub suggestion: String,     // 建议
-    pub confidence: f64,         // 0~1
+    pub rule_id: String,    // e.g. "BR-006"
+    pub issue: String,      // 问题描述
+    pub suggestion: String, // 建议
+    pub confidence: f64,    // 0~1
 }
 
 /// v12 MVP5 反馈报告
@@ -70,23 +70,56 @@ pub fn evaluate(rows: &[ExecutionRow], date: &str) -> FeedbackReport {
     let executed = rows.iter().filter(|r| r.actual_change_t1.is_some()).count() as u32;
     let not_executed = total - executed;
 
-    let t1_hits = rows.iter().filter(|r| r.actual_change_t1.map_or(false, |v| v > 0.0)).count();
-    let t3_hits = rows.iter().filter(|r| r.actual_change_t3.map_or(false, |v| v > 0.0)).count();
-    let t5_hits = rows.iter().filter(|r| r.actual_change_t5.map_or(false, |v| v > 0.0)).count();
+    let t1_hits = rows
+        .iter()
+        .filter(|r| r.actual_change_t1.map_or(false, |v| v > 0.0))
+        .count();
+    let t3_hits = rows
+        .iter()
+        .filter(|r| r.actual_change_t3.map_or(false, |v| v > 0.0))
+        .count();
+    let t5_hits = rows
+        .iter()
+        .filter(|r| r.actual_change_t5.map_or(false, |v| v > 0.0))
+        .count();
     let t1_total = rows.iter().filter(|r| r.actual_change_t1.is_some()).count();
     let t3_total = rows.iter().filter(|r| r.actual_change_t3.is_some()).count();
     let t5_total = rows.iter().filter(|r| r.actual_change_t5.is_some()).count();
 
-    let t1_hit_rate = if t1_total > 0 { t1_hits as f64 / t1_total as f64 } else { 0.0 };
-    let t3_hit_rate = if t3_total > 0 { t3_hits as f64 / t3_total as f64 } else { 0.0 };
-    let t5_hit_rate = if t5_total > 0 { t5_hits as f64 / t5_total as f64 } else { 0.0 };
+    let t1_hit_rate = if t1_total > 0 {
+        t1_hits as f64 / t1_total as f64
+    } else {
+        0.0
+    };
+    let t3_hit_rate = if t3_total > 0 {
+        t3_hits as f64 / t3_total as f64
+    } else {
+        0.0
+    };
+    let t5_hit_rate = if t5_total > 0 {
+        t5_hits as f64 / t5_total as f64
+    } else {
+        0.0
+    };
 
     // MFE / MAE
     let mfe_vals: Vec<f64> = rows.iter().filter_map(|r| r.mfe).collect();
     let mae_vals: Vec<f64> = rows.iter().filter_map(|r| r.mae).collect();
-    let avg_mfe = if !mfe_vals.is_empty() { mfe_vals.iter().sum::<f64>() / mfe_vals.len() as f64 } else { 0.0 };
-    let avg_mae = if !mae_vals.is_empty() { mae_vals.iter().sum::<f64>() / mae_vals.len() as f64 } else { 0.0 };
-    let capture_ratio = if avg_mfe > 0.0 { avg_mfe / (avg_mfe - avg_mae) } else { 0.0 };
+    let avg_mfe = if !mfe_vals.is_empty() {
+        mfe_vals.iter().sum::<f64>() / mfe_vals.len() as f64
+    } else {
+        0.0
+    };
+    let avg_mae = if !mae_vals.is_empty() {
+        mae_vals.iter().sum::<f64>() / mae_vals.len() as f64
+    } else {
+        0.0
+    };
+    let capture_ratio = if avg_mfe > 0.0 {
+        avg_mfe / (avg_mfe - avg_mae)
+    } else {
+        0.0
+    };
 
     // 规则改动建议
     let mut suggestions = Vec::new();
@@ -101,13 +134,20 @@ pub fn evaluate(rows: &[ExecutionRow], date: &str) -> FeedbackReport {
     if capture_ratio < 0.5 && mfe_vals.len() >= 10 {
         suggestions.push(RuleSuggestion {
             rule_id: "BR-020".to_string(),
-            issue: format!("捕获率 {:.2} < 0.5 (MFE={:.2}, MAE={:.2})", capture_ratio, avg_mfe, avg_mae),
+            issue: format!(
+                "捕获率 {:.2} < 0.5 (MFE={:.2}, MAE={:.2})",
+                capture_ratio, avg_mfe, avg_mae
+            ),
             suggestion: "考虑调高止盈阈值或调低止损阈值, 改善捕获率".to_string(),
             confidence: 0.6,
         });
     }
 
-    let data_completeness = if total > 0 { executed as f64 / total as f64 } else { 0.0 };
+    let data_completeness = if total > 0 {
+        executed as f64 / total as f64
+    } else {
+        0.0
+    };
 
     FeedbackReport {
         date: date.to_string(),
@@ -119,7 +159,11 @@ pub fn evaluate(rows: &[ExecutionRow], date: &str) -> FeedbackReport {
             t3_hit_rate,
             t5_hit_rate,
         },
-        mfe_mae: MfeMaeStats { avg_mfe, avg_mae, capture_ratio },
+        mfe_mae: MfeMaeStats {
+            avg_mfe,
+            avg_mae,
+            capture_ratio,
+        },
         suggestions,
         data_completeness,
     }
@@ -153,7 +197,9 @@ mod tests {
 
     #[test]
     fn high_win_rate_no_suggestion() {
-        let rows: Vec<ExecutionRow> = (0..30).map(|i| row_with_t1(&format!("{:06}", i), 1.0, 5.0, -2.0)).collect();
+        let rows: Vec<ExecutionRow> = (0..30)
+            .map(|i| row_with_t1(&format!("{:06}", i), 1.0, 5.0, -2.0))
+            .collect();
         let r = evaluate(&rows, "2026-07-05");
         assert_eq!(r.stats.t1_hit_rate, 1.0);
         assert!(r.suggestions.is_empty(), "高胜率不应有规则建议");
@@ -161,7 +207,9 @@ mod tests {
 
     #[test]
     fn low_win_rate_triggers_suggestion() {
-        let rows: Vec<ExecutionRow> = (0..30).map(|i| row_with_t1(&format!("{:06}", i), -1.0, 0.5, -3.0)).collect();
+        let rows: Vec<ExecutionRow> = (0..30)
+            .map(|i| row_with_t1(&format!("{:06}", i), -1.0, 0.5, -3.0))
+            .collect();
         let r = evaluate(&rows, "2026-07-05");
         assert!(r.stats.t1_hit_rate < 0.3);
         assert!(!r.suggestions.is_empty(), "低胜率应触发规则建议");
@@ -179,7 +227,9 @@ mod tests {
     #[test]
     fn low_capture_ratio_triggers_suggestion() {
         // MFE=2, MAE=-10 → capture_ratio = 2/12 ≈ 0.17 < 0.5
-        let rows: Vec<ExecutionRow> = (0..15).map(|i| row_with_t1(&format!("{:06}", i), -1.0, 2.0, -10.0)).collect();
+        let rows: Vec<ExecutionRow> = (0..15)
+            .map(|i| row_with_t1(&format!("{:06}", i), -1.0, 2.0, -10.0))
+            .collect();
         let r = evaluate(&rows, "2026-07-05");
         assert!(r.mfe_mae.capture_ratio < 0.5);
         // 应有 ≥1 个建议 (胜率低 + 捕获率低)
@@ -189,11 +239,16 @@ mod tests {
     #[test]
     fn suggestions_never_auto_apply() {
         // 验证 suggestions 仅审计, 不返回"applied" 字段
-        let rows: Vec<ExecutionRow> = (0..30).map(|i| row_with_t1(&format!("{:06}", i), -1.0, 0.5, -3.0)).collect();
+        let rows: Vec<ExecutionRow> = (0..30)
+            .map(|i| row_with_t1(&format!("{:06}", i), -1.0, 0.5, -3.0))
+            .collect();
         let r = evaluate(&rows, "2026-07-05");
         for s in &r.suggestions {
             assert!(s.confidence >= 0.0 && s.confidence <= 1.0);
-            assert!(!s.suggestion.contains("applied"), "suggestion 不应含 'applied'");
+            assert!(
+                !s.suggestion.contains("applied"),
+                "suggestion 不应含 'applied'"
+            );
         }
     }
 }

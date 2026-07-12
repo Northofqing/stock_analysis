@@ -12,7 +12,7 @@ pub struct StockLimitStats {
     pub code: String,
     pub name: String,
     pub chain: String,
-    pub board_level: u8,    // 1=首板, 2=二板, 3+=三板+
+    pub board_level: u8, // 1=首板, 2=二板, 3+=三板+
     pub is_limit_up_today: bool,
     pub is_first_board: bool,
     pub consecutive_days: u32, // 连续涨停天数
@@ -104,14 +104,24 @@ pub fn aggregate(input: &LimitChainInput) -> Vec<ChainAggregate> {
 
 /// 工具: 按 code 查 board_level
 pub fn get_board_level(stocks: &[StockLimitStats], code: &str) -> Option<u8> {
-    stocks.iter().find(|s| s.code == code).map(|s| s.board_level)
+    stocks
+        .iter()
+        .find(|s| s.code == code)
+        .map(|s| s.board_level)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn s(code: &str, name: &str, chain: &str, level: u8, consec: u32, first: bool) -> StockLimitStats {
+    fn s(
+        code: &str,
+        name: &str,
+        chain: &str,
+        level: u8,
+        consec: u32,
+        first: bool,
+    ) -> StockLimitStats {
         StockLimitStats {
             code: code.to_string(),
             name: name.to_string(),
@@ -219,9 +229,19 @@ mod tests {
     fn followers_capped_at_5() {
         let mut stocks = Vec::new();
         for i in 0..10 {
-            stocks.push(s(&format!("C{:03}", i), &format!("N{}", i), "X", 1, 1, true));
+            stocks.push(s(
+                &format!("C{:03}", i),
+                &format!("N{}", i),
+                "X",
+                1,
+                1,
+                true,
+            ));
         }
-        let input = LimitChainInput { stocks, source_complete: true };
+        let input = LimitChainInput {
+            stocks,
+            source_complete: true,
+        };
         let r = aggregate(&input);
         assert_eq!(r[0].followers.len(), 5, "followers 上限 5 个");
     }

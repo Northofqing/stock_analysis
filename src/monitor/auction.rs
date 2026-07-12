@@ -30,27 +30,50 @@ impl AuctionResult {
 
     /// 竞价方向
     pub fn direction(&self) -> &'static str {
-        if self.gap_pct > 0.0 { "高开" } else if self.gap_pct < 0.0 { "低开" } else { "平开" }
+        if self.gap_pct > 0.0 {
+            "高开"
+        } else if self.gap_pct < 0.0 {
+            "低开"
+        } else {
+            "平开"
+        }
     }
 }
 
 /// 从竞价结果生成告警事件
-pub fn classify_auction(r: &AuctionResult, t1_locked: bool, gap_pct: f64, vol_ratio: f64) -> Option<AlertEvent> {
+pub fn classify_auction(
+    r: &AuctionResult,
+    t1_locked: bool,
+    gap_pct: f64,
+    vol_ratio: f64,
+) -> Option<AlertEvent> {
     if !r.is_abnormal(gap_pct, vol_ratio) {
         return None;
     }
 
     let (level, mut msg) = if r.gap_pct > gap_pct {
         // 高开抢筹
-        (AlertLevel::Important, format!("{} 竞价高开 {:.1}%，量比 {:.1}，疑似抢筹",
-            r.name, r.gap_pct, r.vol_ratio))
+        (
+            AlertLevel::Important,
+            format!(
+                "{} 竞价高开 {:.1}%，量比 {:.1}，疑似抢筹",
+                r.name, r.gap_pct, r.vol_ratio
+            ),
+        )
     } else if r.gap_pct < -gap_pct {
         // 低开出逃
-        let lvl = if r.gap_pct < -5.0 && t1_locked { AlertLevel::Emergency }
-            else { AlertLevel::Important };
-        let mut m = format!("{} 竞价低开 {:.1}%，量比 {:.1}，疑似出逃",
-            r.name, r.gap_pct, r.vol_ratio);
-        if t1_locked { m.push_str(" ⚠️ T+1锁仓解禁日"); }
+        let lvl = if r.gap_pct < -5.0 && t1_locked {
+            AlertLevel::Emergency
+        } else {
+            AlertLevel::Important
+        };
+        let mut m = format!(
+            "{} 竞价低开 {:.1}%，量比 {:.1}，疑似出逃",
+            r.name, r.gap_pct, r.vol_ratio
+        );
+        if t1_locked {
+            m.push_str(" ⚠️ T+1锁仓解禁日");
+        }
         (lvl, m)
     } else {
         return None;
@@ -78,7 +101,9 @@ pub fn classify_auction(r: &AuctionResult, t1_locked: bool, gap_pct: f64, vol_ra
             t1_locked,
             extra: if r.suspected_fake {
                 Some("疑似虚假申报（诱多），该股买入信号降级".into())
-            } else { None },
+            } else {
+                None
+            },
         },
         triggered_at: Local::now(),
     })
@@ -96,8 +121,12 @@ mod tests {
     #[test]
     fn test_auction_abnormal_high_open() {
         let r = AuctionResult {
-            code: "000001".into(), name: "测试".into(),
-            gap_pct: 5.0, vol_ratio: 6.0, match_ratio: 80.0, suspected_fake: false,
+            code: "000001".into(),
+            name: "测试".into(),
+            gap_pct: 5.0,
+            vol_ratio: 6.0,
+            match_ratio: 80.0,
+            suspected_fake: false,
         };
         assert!(r.is_abnormal(3.0, 5.0));
         let event = classify_auction(&r, false, 3.0, 5.0).unwrap();
@@ -108,8 +137,12 @@ mod tests {
     #[test]
     fn test_auction_normal() {
         let r = AuctionResult {
-            code: "000001".into(), name: "测试".into(),
-            gap_pct: 1.0, vol_ratio: 2.0, match_ratio: 70.0, suspected_fake: false,
+            code: "000001".into(),
+            name: "测试".into(),
+            gap_pct: 1.0,
+            vol_ratio: 2.0,
+            match_ratio: 70.0,
+            suspected_fake: false,
         };
         assert!(!r.is_abnormal(3.0, 5.0));
     }
@@ -117,8 +150,12 @@ mod tests {
     #[test]
     fn test_auction_t1_locked_low_open() {
         let r = AuctionResult {
-            code: "000002".into(), name: "锁仓股".into(),
-            gap_pct: -6.0, vol_ratio: 8.0, match_ratio: 90.0, suspected_fake: false,
+            code: "000002".into(),
+            name: "锁仓股".into(),
+            gap_pct: -6.0,
+            vol_ratio: 8.0,
+            match_ratio: 90.0,
+            suspected_fake: false,
         };
         let event = classify_auction(&r, true, 3.0, 5.0).unwrap();
         assert_eq!(event.level, AlertLevel::Emergency);
@@ -128,8 +165,12 @@ mod tests {
     #[test]
     fn test_auction_suspected_fake() {
         let r = AuctionResult {
-            code: "000003".into(), name: "诱多股".into(),
-            gap_pct: 8.0, vol_ratio: 10.0, match_ratio: 30.0, suspected_fake: true,
+            code: "000003".into(),
+            name: "诱多股".into(),
+            gap_pct: 8.0,
+            vol_ratio: 10.0,
+            match_ratio: 30.0,
+            suspected_fake: true,
         };
         let event = classify_auction(&r, false, 3.0, 5.0).unwrap();
         assert!(event.message.contains("虚假申报"));
@@ -138,13 +179,21 @@ mod tests {
     #[test]
     fn test_direction_labels() {
         let high = AuctionResult {
-            code: "1".into(), name: "a".into(),
-            gap_pct: 5.0, vol_ratio: 1.0, match_ratio: 50.0, suspected_fake: false,
+            code: "1".into(),
+            name: "a".into(),
+            gap_pct: 5.0,
+            vol_ratio: 1.0,
+            match_ratio: 50.0,
+            suspected_fake: false,
         };
         assert_eq!(high.direction(), "高开");
         let low = AuctionResult {
-            code: "2".into(), name: "b".into(),
-            gap_pct: -2.0, vol_ratio: 1.0, match_ratio: 50.0, suspected_fake: false,
+            code: "2".into(),
+            name: "b".into(),
+            gap_pct: -2.0,
+            vol_ratio: 1.0,
+            match_ratio: 50.0,
+            suspected_fake: false,
         };
         assert_eq!(low.direction(), "低开");
     }

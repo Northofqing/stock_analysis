@@ -296,7 +296,9 @@ impl HostRotator {
 
     /// 检查是否所有 Host 均已熔断
     pub fn all_broken(&self) -> bool {
-        self.circuit_broken.iter().all(|b| b.load(Ordering::Relaxed))
+        self.circuit_broken
+            .iter()
+            .all(|b| b.load(Ordering::Relaxed))
     }
 }
 

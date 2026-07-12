@@ -36,7 +36,8 @@ pub fn format_alert(event: &AlertEvent) -> String {
         lines.push(format!("  涨跌：{:+.2}%", pct));
     }
     if let Some(flow) = d.main_flow_yi {
-        if flow.abs() > 0.001 {  // 0 表示数据缺失，不显示
+        if flow.abs() > 0.001 {
+            // 0 表示数据缺失，不显示
             lines.push(format!("  主力净流入：{:+.2}亿", flow));
         }
     }
@@ -59,17 +60,15 @@ pub fn format_alert(event: &AlertEvent) -> String {
     }
     // extra 字段：公告快讯的命中信息 / 涨停股的主力排名和共振得分
     if let Some(extra) = &d.extra {
-        if !extra.is_empty() && !extra.starts_with("AI推荐") && !extra.starts_with("AI影响评估") {
+        if !extra.is_empty() && !extra.starts_with("AI推荐") && !extra.starts_with("AI影响评估")
+        {
             lines.push(format!("  {}", extra));
         }
     }
     if d.t1_locked {
         lines.push("  ⚠️ T+1锁仓 — 次日09:25竞价卖出".to_string());
     }
-    lines.push(format!(
-        "  [{}]",
-        event.triggered_at.format("%H:%M:%S")
-    ));
+    lines.push(format!("  [{}]", event.triggered_at.format("%H:%M:%S")));
     lines.join("\n")
 }
 
@@ -91,10 +90,7 @@ pub fn format_t1_alert(event: &AlertEvent, sell_date: &str) -> String {
 }
 
 /// 向通知服务推送告警
-pub async fn push_alert(
-    event: &AlertEvent,
-    notifier: &NotificationService,
-) -> bool {
+pub async fn push_alert(event: &AlertEvent, notifier: &NotificationService) -> bool {
     let text = format_alert(event);
     match notifier.send_alert(&text, event.level).await {
         Ok(true) => {
@@ -117,14 +113,20 @@ pub fn aggregate_alerts(events: &[AlertEvent]) -> Option<String> {
     if events.is_empty() {
         return None;
     }
-    let emergency = events.iter().filter(|e| e.level == AlertLevel::Emergency).count();
-    let important = events.iter().filter(|e| e.level == AlertLevel::Important).count();
-    let info = events.iter().filter(|e| e.level == AlertLevel::Info).count();
+    let emergency = events
+        .iter()
+        .filter(|e| e.level == AlertLevel::Emergency)
+        .count();
+    let important = events
+        .iter()
+        .filter(|e| e.level == AlertLevel::Important)
+        .count();
+    let info = events
+        .iter()
+        .filter(|e| e.level == AlertLevel::Info)
+        .count();
 
-    let mut lines = vec![format!(
-        "📊 告警聚合摘要（共 {} 条）",
-        events.len()
-    )];
+    let mut lines = vec![format!("📊 告警聚合摘要（共 {} 条）", events.len())];
     if emergency > 0 {
         lines.push(format!("  🔴 紧急：{} 条", emergency));
     }
@@ -244,8 +246,11 @@ mod tests {
             name: "达实智能".into(),
             message: "[公告] 达实智能:关于股东股份解除质押的公告 | 标题含'质押'".into(),
             detail: AlertDetail {
-                price: None, change_pct: None, volume_ratio: None,
-                main_flow_yi: None, threshold: None,
+                price: None,
+                change_pct: None,
+                volume_ratio: None,
+                main_flow_yi: None,
+                threshold: None,
                 news_title: Some("达实智能:关于股东股份解除质押的公告".into()),
                 news_summary: Some("触发原因：标题含'质押'".into()),
                 ai_decision: None,
@@ -275,8 +280,11 @@ mod tests {
             name: "达实智能".into(),
             message: "快讯催化".into(),
             detail: AlertDetail {
-                price: None, change_pct: None, volume_ratio: None,
-                main_flow_yi: None, threshold: None,
+                price: None,
+                change_pct: None,
+                volume_ratio: None,
+                main_flow_yi: None,
+                threshold: None,
                 news_title: Some("低空经济新政发布".into()),
                 news_summary: None,
                 ai_decision: Some("关注低空产业链龙头".into()),

@@ -13,7 +13,7 @@
 //! - check_thresholds() 实时算
 //! - 触发回退时输出 alert (实际接 monitor 推送, 这里是 log)
 
-use log::{info, warn};
+use log::warn;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -137,12 +137,19 @@ impl CostBoard {
 
     /// 触发回退: 输出告警 log (参数注入)
     pub fn maybe_fallback_with(&self, cost_per_push: f64, fail_rate_th: f64) -> bool {
-        let (cost_exceeded, failure_exceeded) = self.check_thresholds_with(cost_per_push, fail_rate_th);
+        let (cost_exceeded, failure_exceeded) =
+            self.check_thresholds_with(cost_per_push, fail_rate_th);
         if cost_exceeded {
-            warn!("[CostBoard] ✗ 成本超阈 → 自动回退 G5a 规则快归因 (avg_cost={:.3})", self.avg_cost());
+            warn!(
+                "[CostBoard] ✗ 成本超阈 → 自动回退 G5a 规则快归因 (avg_cost={:.3})",
+                self.avg_cost()
+            );
         }
         if failure_exceeded {
-            warn!("[CostBoard] ✗ 失败率超阈 → 自动回退 G5a 规则快归因 (failure_rate={:.3})", self.failure_rate());
+            warn!(
+                "[CostBoard] ✗ 失败率超阈 → 自动回退 G5a 规则快归因 (failure_rate={:.3})",
+                self.failure_rate()
+            );
         }
         cost_exceeded || failure_exceeded
     }

@@ -71,8 +71,16 @@ if [ -z "$EXTRACTED" ]; then
   fail "§2.10.3 业务规则表无任何 BR 行可解析 (检查 markdown 格式)"
 fi
 
-# 决定 base ref (保留 I-7 修复)
-BASE_REF="${BASE_REF:-origin/master}"
+# 决定 base ref (保留 I-7 修复): 本仓库远端常用 stock_analysis/*, 不一定有 origin/*.
+BASE_REF="${BASE_REF:-}"
+if [ -z "$BASE_REF" ]; then
+  for candidate in origin/master origin/main stock_analysis/master stock_analysis/main master main HEAD; do
+    if git rev-parse --verify "$candidate" >/dev/null 2>&1; then
+      BASE_REF="$candidate"
+      break
+    fi
+  done
+fi
 if ! git rev-parse --verify "$BASE_REF" >/dev/null 2>&1; then
   warn "§2.10 BASE_REF '$BASE_REF' 不存在, 走 root commit fallback, 可能误判新增文件 (修复 I-7)"
   BASE_REF="$(git rev-list --max-parents=0 HEAD | tail -n1)"

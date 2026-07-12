@@ -172,20 +172,30 @@ pub fn assess_entry(h1: &[MinuteBar], m15: &[MinuteBar]) -> EntryAssessment {
                 last_rsi
             ));
         } else if last_rsi > 70.0 {
-            risks.push(format!("15min RSI6={:.1} 已进入超买区，警惕短线追高", last_rsi));
+            risks.push(format!(
+                "15min RSI6={:.1} 已进入超买区，警惕短线追高",
+                last_rsi
+            ));
         } else if !had_oversold {
             risks.push("15min RSI6 近期未出现超卖反弹".to_string());
         } else {
-            risks.push(format!("15min RSI6={:.1} 不在 30-50 反弹理想区间", last_rsi));
+            risks.push(format!(
+                "15min RSI6={:.1} 不在 30-50 反弹理想区间",
+                last_rsi
+            ));
         }
     }
 
     // ── 规则 3：60min 放量上涨 + 站上 60min MA10 ────────────────────
     {
-        let prev_close = h1_closes.get(h1_closes.len() - 2).copied().unwrap_or(f64::NAN);
+        let prev_close = h1_closes
+            .get(h1_closes.len() - 2)
+            .copied()
+            .unwrap_or(f64::NAN);
         let up = last_h1.close > prev_close;
-        let vol_expand =
-            last_h1_vol_ma5.is_finite() && last_h1_vol_ma5 > 0.0 && last_h1_vol > last_h1_vol_ma5 * 1.3;
+        let vol_expand = last_h1_vol_ma5.is_finite()
+            && last_h1_vol_ma5 > 0.0
+            && last_h1_vol > last_h1_vol_ma5 * 1.3;
         let above_ma10 = last_h1_ma10.is_finite() && last_h1.close > last_h1_ma10;
         if up && vol_expand && above_ma10 {
             let ratio = last_h1_vol / last_h1_vol_ma5;
@@ -218,7 +228,7 @@ pub fn assess_entry(h1: &[MinuteBar], m15: &[MinuteBar]) -> EntryAssessment {
         let last_m15_vol_ma5 = *m15_vol_ma5.last().unwrap_or(&f64::NAN);
         let pulled_back = last_h1_ma20.is_finite()
             && last_m15.low <= last_h1_ma20 * 1.005   // 触及 MA20（容差 0.5%）
-            && last_m15.close >= last_h1_ma20;        // 收回 MA20 上方
+            && last_m15.close >= last_h1_ma20; // 收回 MA20 上方
         let vol_shrink = last_m15_vol_ma5.is_finite()
             && last_m15_vol_ma5 > 0.0
             && last_m15_vol < last_m15_vol_ma5 * 0.8;

@@ -75,7 +75,8 @@ impl From<&AnalysisResult> for StockAnalysisOutput {
         // AnalysisResult 不保存独立的 buy/sell 布尔，从操作建议文本派生
         let advice = r.operation_advice.as_str();
         let buy_signal = advice.contains('买') || advice.contains("加仓");
-        let sell_signal = advice.contains('卖') || advice.contains("减仓") || advice.contains("止损");
+        let sell_signal =
+            advice.contains('卖') || advice.contains("减仓") || advice.contains("止损");
         let (fq, vs) = r
             .score_breakdown
             .as_ref()
@@ -127,4 +128,3 @@ impl From<&AnalysisResult> for StockNotificationPayload {
         }
     }
 }
-

@@ -64,7 +64,12 @@ pub struct MaBreakInfo {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PricePosition { Low, Mid, High, Unknown }
+pub enum PricePosition {
+    Low,
+    Mid,
+    High,
+    Unknown,
+}
 
 impl PricePosition {
     pub fn label(&self) -> &'static str {
@@ -78,7 +83,11 @@ impl PricePosition {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BreakoutType { Launch, Uncertain, Distribution }
+pub enum BreakoutType {
+    Launch,
+    Uncertain,
+    Distribution,
+}
 
 impl BreakoutType {
     pub fn label(&self) -> &'static str {

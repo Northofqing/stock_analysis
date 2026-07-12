@@ -1,13 +1,13 @@
 //! 龙虎榜数据查询工具
-//! 
+//!
 //! 用法:
 //! cargo run --bin lhb_query -- today              # 查看今日龙虎榜
 //! cargo run --bin lhb_query -- stock 600519       # 查看个股龙虎榜历史
 //! cargo run --bin lhb_query -- screen 60          # 筛选评分>=60的股票
 
-use stock_analysis::lhb_analyzer::LhbDataFetcher;
-use clap::{Parser, Subcommand};
 use anyhow::Result;
+use clap::{Parser, Subcommand};
+use stock_analysis::lhb_analyzer::LhbDataFetcher;
 
 #[derive(Parser)]
 #[command(name = "lhb_query")]
@@ -45,7 +45,7 @@ enum Commands {
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     env_logger::init();
-    
+
     let cli = Cli::parse();
     let fetcher = LhbDataFetcher::new()?;
 
@@ -53,19 +53,22 @@ async fn main() -> Result<()> {
         Commands::Today => {
             println!("📊 正在获取今日龙虎榜数据...\n");
             let records = fetcher.get_today_lhb().await?;
-            
+
             if records.is_empty() {
                 println!("今日暂无龙虎榜数据");
                 return Ok(());
             }
 
             println!("📈 今日龙虎榜 ({} 只股票)\n", records.len());
-            println!("{:<10} {:<12} {:<8} {:>12} {:>12} {:>12}", 
-                "代码", "名称", "涨跌幅%", "净买入(万)", "买入(万)", "卖出(万)");
+            println!(
+                "{:<10} {:<12} {:<8} {:>12} {:>12} {:>12}",
+                "代码", "名称", "涨跌幅%", "净买入(万)", "买入(万)", "卖出(万)"
+            );
             println!("{}", "-".repeat(80));
 
             for record in records.iter().take(50) {
-                println!("{:<10} {:<12} {:>7.2}% {:>12.0} {:>12.0} {:>12.0}",
+                println!(
+                    "{:<10} {:<12} {:>7.2}% {:>12.0} {:>12.0} {:>12.0}",
                     record.code,
                     record.name,
                     record.pct_change,
@@ -79,19 +82,22 @@ async fn main() -> Result<()> {
         Commands::Date { date } => {
             println!("📊 正在获取 {} 的龙虎榜数据...\n", date);
             let records = fetcher.get_lhb_by_date(&date).await?;
-            
+
             if records.is_empty() {
                 println!("{} 暂无龙虎榜数据", date);
                 return Ok(());
             }
 
             println!("📈 {} 龙虎榜 ({} 只股票)\n", date, records.len());
-            println!("{:<10} {:<12} {:<8} {:>12} {:>12} {:<30}", 
-                "代码", "名称", "涨跌幅%", "净买入(万)", "成交占比%", "上榜原因");
+            println!(
+                "{:<10} {:<12} {:<8} {:>12} {:>12} {:<30}",
+                "代码", "名称", "涨跌幅%", "净买入(万)", "成交占比%", "上榜原因"
+            );
             println!("{}", "-".repeat(100));
 
             for record in records {
-                println!("{:<10} {:<12} {:>7.2}% {:>12.0} {:>11.2}% {:<30}",
+                println!(
+                    "{:<10} {:<12} {:>7.2}% {:>12.0} {:>11.2}% {:<30}",
                     record.code,
                     record.name,
                     record.pct_change,
@@ -104,10 +110,10 @@ async fn main() -> Result<()> {
 
         Commands::Stock { code, days } => {
             println!("📊 正在分析 {} 的龙虎榜数据...\n", code);
-            
+
             // 获取历史记录
             let records = fetcher.get_stock_lhb_history(&code, days).await?;
-            
+
             if records.is_empty() {
                 println!("{} 最近{}天未上榜龙虎榜", code, days);
                 return Ok(());
@@ -125,7 +131,7 @@ async fn main() -> Result<()> {
             println!("   机构参与度评分: {} 分", analysis.inst_score);
             println!("   游资活跃度评分: {} 分", analysis.hot_money_score);
             println!("   综合评分: {} 分", analysis.total_score);
-            
+
             // 评级
             let rating = if analysis.total_score >= 80 {
                 "⭐⭐⭐⭐⭐ 强烈推荐"
@@ -149,12 +155,15 @@ async fn main() -> Result<()> {
             }
 
             println!("📋 上榜明细:\n");
-            println!("{:<12} {:<8} {:>12} {:>12} {:>12} {:<30}", 
-                "日期", "涨跌幅%", "净买入(万)", "买入(万)", "卖出(万)", "上榜原因");
+            println!(
+                "{:<12} {:<8} {:>12} {:>12} {:>12} {:<30}",
+                "日期", "涨跌幅%", "净买入(万)", "买入(万)", "卖出(万)", "上榜原因"
+            );
             println!("{}", "-".repeat(100));
 
             for record in records {
-                println!("{:<12} {:>7.2}% {:>12.0} {:>12.0} {:>12.0} {:<30}",
+                println!(
+                    "{:<12} {:>7.2}% {:>12.0} {:>12.0} {:>12.0} {:<30}",
                     record.trade_date,
                     record.pct_change,
                     record.net_amount,
@@ -167,21 +176,24 @@ async fn main() -> Result<()> {
 
         Commands::Screen { min_score } => {
             println!("🔍 正在筛选龙虎榜优质股票（评分>={})...\n", min_score);
-            
+
             let results = fetcher.screen_lhb_stocks(min_score).await?;
-            
+
             if results.is_empty() {
                 println!("未找到符合条件的股票");
                 return Ok(());
             }
 
             println!("✅ 找到 {} 只优质股票\n", results.len());
-            println!("{:<10} {:<12} {:>8} {:>8} {:>8} {:<40}", 
-                "代码", "名称", "综合分", "机构分", "游资分", "推荐理由");
+            println!(
+                "{:<10} {:<12} {:>8} {:>8} {:>8} {:<40}",
+                "代码", "名称", "综合分", "机构分", "游资分", "推荐理由"
+            );
             println!("{}", "-".repeat(110));
 
             for analysis in results {
-                println!("{:<10} {:<12} {:>8} {:>8} {:>8} {:<40}",
+                println!(
+                    "{:<10} {:<12} {:>8} {:>8} {:>8} {:<40}",
                     analysis.code,
                     analysis.name,
                     analysis.total_score,

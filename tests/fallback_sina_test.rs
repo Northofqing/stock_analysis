@@ -18,7 +18,10 @@ async fn fallback_returns_data_with_sina_in_chain() {
         data.len()
     );
     assert!(
-        matches!(src, "sina_hq" | "tencent_qfq" | "eastmoney_qfq" | "rustdx_none"),
+        matches!(
+            src,
+            "sina_hq" | "tencent_qfq" | "eastmoney_qfq" | "rustdx_none"
+        ),
         "source 必须是 4-way 链中之一, 实际={}",
         src
     );

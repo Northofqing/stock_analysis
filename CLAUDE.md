@@ -39,6 +39,60 @@ The system is an **event-driven live trading monitor** for A-share (Chinese stoc
 
 **When new capability is added**: Check whether existing old modules should upgrade to use it. Document the decision for each.
 
+## Completion Rule (Hard Constraint) — Prevents "Code Without Integration" Hallucination
+
+**Module code + unit tests passing ≠ completion.** This rule exists because an assistant can write 2700 lines of new modules with 1058 passing tests while the production binary (`src/bin/monitor/`) still uses the old path entirely. Both the module-level work and the integration into the live binary must be verified before claiming completion.
+
+Every new capability, refactor, or module addition MUST satisfy ALL THREE conditions before any assistant says "✅ done":
+
+### 1. Module layer
+- Module code exists in the expected path (e.g. `src/push_l4/dispatcher.rs`).
+- Unit tests in that module pass (`cargo test --lib <module>::`).
+- `cargo build --lib` exits 0.
+
+### 2. Integration into `src/bin/monitor/`
+- The module is actually used by the production binary. Verify with:
+
+  ```bash
+  grep -RInE 'use stock_analysis::push_l[1-7]::|<module>::' src/bin/monitor/ \
+      --include="*.rs"
+  ```
+
+  Result MUST show ≥ 1 import + ≥ 1 call site in `main.rs` / `push_templates.rs` / `notify.rs`. Zero hits = integration 0% = NOT complete.
+
+- The old call path (`notify::push_governor(&text, PushKind::X)` etc.) that the new module replaces must be either removed or explicitly bridged. Stale dual paths are NOT acceptable.
+
+### 3. Live-binary verification
+- `cargo build --release --bin monitor` exits 0.
+- `cargo run --release --bin monitor -- --test` runs end-to-end and the resulting push goes through the new module's path (visible in logs: `dispatcher.dispatch`, `governance.check`, `sink.route`, `analytics.record`, etc.).
+- If the new module is supposed to gate or transform a push, the live test MUST show it did so (e.g. governance Deny actually blocks a push, dispatcher dedup actually skips a duplicate, analytics row actually written).
+
+### Anti-patterns (auto-reject)
+- "✅ W{N} done" when `src/bin/monitor/` has 0 references to the new module.
+- "✅ integration complete" based only on `v14_e2e.rs` (an isolated test binary, not the production monitor).
+- Reporting `cargo test --lib` as proof of completion without checking integration.
+- "The release binary pushed successfully" without confirming the new module was on the path of that push.
+
+### How to verify before claiming completion
+Run this checklist and paste results in the summary:
+
+```bash
+# 1. Module layer
+cargo test --lib <module_path>::                  # must pass
+cargo build --lib                                  # must exit 0
+
+# 2. Integration grep (zero hits = NOT complete)
+grep -RInE 'use stock_analysis::<module>|<module>::' src/bin/monitor/ \
+    --include="*.rs" | wc -l
+
+# 3. Live binary
+cargo build --release --bin monitor                # must exit 0
+./target/release/monitor --test 2>&1 | grep -E \
+    '<new_module_keywords>' | head -5               # must show ≥ 1 hit
+```
+
+If any of the three checks fails, the work is **not complete**, regardless of how many unit tests passed.
+
 ## Configuration
 
 - `.env`: `STOCK_LIST` (watchlist codes), `WECHAT_SEND_SCRIPT`, `DATABASE_PATH`

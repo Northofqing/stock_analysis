@@ -34,10 +34,7 @@ mod tests {
 
         // 2. 状态机去重
         let mut sm = SignalStateMachine::default();
-        let filtered: Vec<_> = events
-            .into_iter()
-            .filter_map(|e| sm.process(e))
-            .collect();
+        let filtered: Vec<_> = events.into_iter().filter_map(|e| sm.process(e)).collect();
         assert!(!filtered.is_empty());
 
         // 3. 格式化
@@ -60,8 +57,14 @@ mod tests {
 
         let mut sm = SignalStateMachine::default();
         // 同一事件连续发两次 → 第二次被静默
-        let first: Vec<_> = events.iter().filter_map(|e| sm.process(e.clone())).collect();
-        let second: Vec<_> = events.iter().filter_map(|e| sm.process(e.clone())).collect();
+        let first: Vec<_> = events
+            .iter()
+            .filter_map(|e| sm.process(e.clone()))
+            .collect();
+        let second: Vec<_> = events
+            .iter()
+            .filter_map(|e| sm.process(e.clone()))
+            .collect();
         assert!(!first.is_empty());
         assert!(second.is_empty(), "重复告警应被状态机静默");
     }

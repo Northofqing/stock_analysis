@@ -22,10 +22,7 @@ pub async fn run_analysis(
             Some(s) if !s.is_empty() => s.clone(),
             _ => stock_codes.to_vec(),
         };
-        info!(
-            "模式: Multi-Agent 深度分析（共 {} 只）",
-            deep_targets.len()
-        );
+        info!("模式: Multi-Agent 深度分析（共 {} 只）", deep_targets.len());
         for code in &deep_targets {
             info!("[DeepAnalysis] 开始 {}", code);
             match stock_analysis::deep_analyzer::run_and_save(code).await {
@@ -61,8 +58,10 @@ pub async fn run_analysis(
     let results = pipeline.run(stock_codes, mc).await?;
 
     if !results.is_empty() {
-        info!("
-===== 分析结果摘要 =====");
+        info!(
+            "
+===== 分析结果摘要 ====="
+        );
         let mut sorted_results = results;
         sorted_results.sort_by(|a, b| b.sentiment_score.cmp(&a.sentiment_score));
         for r in sorted_results.iter() {
@@ -88,7 +87,8 @@ pub async fn run_market_review_only() -> Result<()> {
         let analyzer = MarketAnalyzer::new(None)?;
         let overview = analyzer.get_market_overview()?;
         Ok::<(MarketAnalyzer, _), anyhow::Error>((analyzer, overview))
-    }).await??;
+    })
+    .await??;
 
     info!("市场概览: {:?}", overview);
 
@@ -113,10 +113,12 @@ pub async fn run_chain_analysis_mode(send_notify: bool) -> Result<()> {
         let analyzer = MarketAnalyzer::new(None)?;
         let limit_ups = analyzer.get_limit_up_stocks()?;
         Ok::<(MarketAnalyzer, Vec<_>), anyhow::Error>((analyzer, limit_ups))
-    }).await??;
+    })
+    .await??;
     info!("今日涨停池共 {} 只", limit_ups.len());
 
-    let report = stock_analysis::pipeline::chain_analysis::run_chain_analysis(limit_ups, None).await?;
+    let report =
+        stock_analysis::pipeline::chain_analysis::run_chain_analysis(limit_ups, None).await?;
 
     let notifier = NotificationService::from_env();
     let filename = format!("chain_analysis_{}.md", Local::now().format("%Y%m%d"));
@@ -153,7 +155,9 @@ pub async fn run_lhb_analysis(args: &Args) -> Result<()> {
     info!("开始获取龙虎榜数据...");
 
     let lhb_date = args.lhb_date.clone().or_else(|| {
-        std::env::var("LHB_DATE").ok().filter(|s| !s.trim().is_empty())
+        std::env::var("LHB_DATE")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
     });
     let lhb_min_score = if args.lhb_min_score != 60 {
         args.lhb_min_score

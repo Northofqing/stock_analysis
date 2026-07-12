@@ -184,7 +184,11 @@ mod tests {
     #[test]
     fn test_boundary_4_high_open_low_close_below_threshold() {
         let input = HitCaseInput::normal(10.0, 9.99); // -0.1%
-        assert_eq!(compute_hit_t1(&input), Some(false), "高开低走 < 阈值算 miss");
+        assert_eq!(
+            compute_hit_t1(&input),
+            Some(false),
+            "高开低走 < 阈值算 miss"
+        );
     }
 
     /// 边界 5a: 低开高走 (实际赚 > 阈值) → hit
@@ -198,20 +202,29 @@ mod tests {
     #[test]
     fn test_boundary_5b_low_open_high_close_below_threshold() {
         let input = HitCaseInput::normal(10.0, 10.04); // +0.4% < 0.5% 阈值
-        assert_eq!(compute_hit_t1(&input), Some(false), "低开高走 < 阈值算 miss (默认 0.5%)");
+        assert_eq!(
+            compute_hit_t1(&input),
+            Some(false),
+            "低开高走 < 阈值算 miss (默认 0.5%)"
+        );
     }
 
     /// 价格校验: 0 / 负数 → None
     #[test]
     fn test_invalid_price_returns_none() {
         let cases = [
-            HitCaseInput::normal(0.0, 10.0),       // buy_price=0
-            HitCaseInput::normal(10.0, 0.0),       // actual_close=0
-            HitCaseInput::normal(-10.0, 10.0),     // buy_price 负
-            HitCaseInput::normal(10.0, -5.0),      // actual_close 负
+            HitCaseInput::normal(0.0, 10.0),   // buy_price=0
+            HitCaseInput::normal(10.0, 0.0),   // actual_close=0
+            HitCaseInput::normal(-10.0, 10.0), // buy_price 负
+            HitCaseInput::normal(10.0, -5.0),  // actual_close 负
         ];
         for input in &cases {
-            assert_eq!(compute_hit_t1(input), None, "无效价格应返回 None: {:?}", input);
+            assert_eq!(
+                compute_hit_t1(input),
+                None,
+                "无效价格应返回 None: {:?}",
+                input
+            );
         }
     }
 

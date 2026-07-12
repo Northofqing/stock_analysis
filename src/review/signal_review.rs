@@ -27,14 +27,20 @@ pub struct SignalReviewStats {
 /// R-05 全版渲染 (v19.12 修复: 样本不足时显式标注, 不再显示 0 当数字)
 pub fn render_r05_full(stats: &SignalReviewStats) -> String {
     let mut s = String::new();
-    s.push_str(&format!("🤖 信号复盘（{}）\n", Local::now().format("%Y-%m-%d")));
+    s.push_str(&format!(
+        "🤖 信号复盘（{}）\n",
+        Local::now().format("%Y-%m-%d")
+    ));
     // 持仓建议
     if stats.holding_recommendations_pushed == 0 {
         s.push_str("持仓建议: 推 0 条 (今日无推送)\n");
     } else {
         let eff_pct = if stats.holding_recommendations_executed > 0 {
-            stats.holding_recommendations_effective as f64 * 100.0 / stats.holding_recommendations_executed as f64
-        } else { 0.0 };
+            stats.holding_recommendations_effective as f64 * 100.0
+                / stats.holding_recommendations_executed as f64
+        } else {
+            0.0
+        };
         s.push_str(&format!(
             "持仓建议: 推 {} 条 / 执行 {} 条 / 有效 {} 条 ({:.1}%)\n",
             stats.holding_recommendations_pushed,
@@ -45,12 +51,13 @@ pub fn render_r05_full(stats: &SignalReviewStats) -> String {
     }
     // 做T建议
     if stats.t0_recommendations_pushed == 0 {
-        s.push_str("做T建议: 推 0 条 (v19.15+ 启用 — 详见 docs/architecture/v12-dev-plan.md §MVP-2)\n");
+        s.push_str(
+            "做T建议: 推 0 条 (v19.15+ 启用 — 详见 docs/architecture/v12-dev-plan.md §MVP-2)\n",
+        );
     } else {
         s.push_str(&format!(
             "做T建议: 推 {} 条 / 有效 {} 条\n",
-            stats.t0_recommendations_pushed,
-            stats.t0_recommendations_effective,
+            stats.t0_recommendations_pushed, stats.t0_recommendations_effective,
         ));
     }
     // 候选(影子) — v19.12: 样本 < 30 显式标注, 不报 "0"
@@ -87,7 +94,8 @@ pub fn render_r05_full(stats: &SignalReviewStats) -> String {
         let hit_rate = stats.news_pushed as f64 - stats.news_d1_realized as f64;
         s.push_str(&format!(
             "新闻兑现: 推送 {} 条 / D+1 兑现 {} 条 (命中率 {:.1}%)\n",
-            stats.news_pushed, stats.news_d1_realized,
+            stats.news_pushed,
+            stats.news_d1_realized,
             (stats.news_d1_realized as f64 / stats.news_pushed as f64) * 100.0,
         ));
         let _ = hit_rate;

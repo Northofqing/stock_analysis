@@ -75,7 +75,11 @@ mod inline_tests {
     #[test]
     fn qmt_roundtrip() {
         for c in ["600000", "000001", "688001", "301000", "900900"] {
-            assert_eq!(from_qmt_symbol(&to_qmt_symbol(c)), c, "roundtrip failed for {c}");
+            assert_eq!(
+                from_qmt_symbol(&to_qmt_symbol(c)),
+                c,
+                "roundtrip failed for {c}"
+            );
         }
     }
 
@@ -90,7 +94,11 @@ mod inline_tests {
     #[test]
     fn baostock_roundtrip() {
         for c in ["600000", "000001", "688001", "301000"] {
-            assert_eq!(from_baostock(&to_baostock(c)), c, "roundtrip failed for {c}");
+            assert_eq!(
+                from_baostock(&to_baostock(c)),
+                c,
+                "roundtrip failed for {c}"
+            );
         }
     }
 }

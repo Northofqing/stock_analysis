@@ -9,12 +9,12 @@ use std::collections::HashMap;
 /// 单条建议执行追踪
 #[derive(Debug, Clone)]
 pub struct ExecutionRecord {
-    pub date: NaiveDateLite,           // 简化版日期 (避免 chrono 依赖)
+    pub date: NaiveDateLite, // 简化版日期 (避免 chrono 依赖)
     pub code: String,
-    pub push_kind: String,              // e.g. HoldingPlan/T0Advice/CandidateTriggered
-    pub executed: bool,                // 是否实际执行
+    pub push_kind: String, // e.g. HoldingPlan/T0Advice/CandidateTriggered
+    pub executed: bool,    // 是否实际执行
     pub execution_source: Option<String>, // manual_confirm / paper_trade / None
-    pub pnl_pct: Option<f64>,          // 执行后盈亏 (%)
+    pub pnl_pct: Option<f64>, // 执行后盈亏 (%)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -27,7 +27,11 @@ pub struct NaiveDateLite {
 impl NaiveDateLite {
     pub fn today() -> Self {
         let now = Local::now();
-        Self { year: now.format("%Y").to_string().parse().unwrap_or(2026), month: now.format("%m").to_string().parse().unwrap_or(7), day: now.format("%d").to_string().parse().unwrap_or(5) }
+        Self {
+            year: now.format("%Y").to_string().parse().unwrap_or(2026),
+            month: now.format("%m").to_string().parse().unwrap_or(7),
+            day: now.format("%d").to_string().parse().unwrap_or(5),
+        }
     }
     pub fn to_string_zh(&self) -> String {
         format!("{:04}-{:02}-{:02}", self.year, self.month, self.day)
@@ -39,7 +43,7 @@ impl NaiveDateLite {
 pub struct ExecutionStats {
     pub pushed: u32,
     pub executed: u32,
-    pub by_kind: HashMap<String, (u32, u32)>,   // (pushed, executed)
+    pub by_kind: HashMap<String, (u32, u32)>, // (pushed, executed)
     pub not_executed_reasons: HashMap<String, u32>, // HumanNotExecuted 等
 }
 
@@ -55,29 +59,47 @@ impl ExecutionStats {
             entry.1 += 1;
         }
         if !r.executed {
-            *self.not_executed_reasons
-                .entry(r.execution_source.clone().unwrap_or_else(|| "HumanNotExecuted".into()))
+            *self
+                .not_executed_reasons
+                .entry(
+                    r.execution_source
+                        .clone()
+                        .unwrap_or_else(|| "HumanNotExecuted".into()),
+                )
                 .or_insert(0) += 1;
         }
     }
 
     pub fn execution_rate(&self) -> f64 {
-        if self.pushed == 0 { 0.0 } else { self.executed as f64 / self.pushed as f64 }
+        if self.pushed == 0 {
+            0.0
+        } else {
+            self.executed as f64 / self.pushed as f64
+        }
     }
 }
 
 /// 周报告渲染
 pub fn render_weekly(stats: &ExecutionStats) -> String {
     let mut s = String::new();
-    s.push_str(&format!("📊 周执行率报告（{}）\n", Local::now().format("%Y-%m-%d")));
+    s.push_str(&format!(
+        "📊 周执行率报告（{}）\n",
+        Local::now().format("%Y-%m-%d")
+    ));
     s.push_str(&format!(
         "本周推送: {}条, 执行: {}条 ({:.1}%)\n",
-        stats.pushed, stats.executed, stats.execution_rate() * 100.0,
+        stats.pushed,
+        stats.executed,
+        stats.execution_rate() * 100.0,
     ));
     if !stats.by_kind.is_empty() {
         s.push_str("\n按 PushKind:\n");
         for (kind, (p, e)) in &stats.by_kind {
-            let rate = if *p > 0 { *e as f64 / *p as f64 * 100.0 } else { 0.0 };
+            let rate = if *p > 0 {
+                *e as f64 / *p as f64 * 100.0
+            } else {
+                0.0
+            };
             s.push_str(&format!("  {}: 推{}条 执{}条 ({:.1}%)\n", kind, p, e, rate));
         }
     }
@@ -100,7 +122,11 @@ mod tests {
             code: "600519".into(),
             push_kind: "HoldingPlan".into(),
             executed,
-            execution_source: if executed { Some("manual_confirm".into()) } else { None },
+            execution_source: if executed {
+                Some("manual_confirm".into())
+            } else {
+                None
+            },
             pnl_pct: if executed { Some(1.5) } else { None },
         }
     }
@@ -138,7 +164,11 @@ mod tests {
 
     #[test]
     fn naive_date_format() {
-        let d = NaiveDateLite { year: 2026, month: 7, day: 5 };
+        let d = NaiveDateLite {
+            year: 2026,
+            month: 7,
+            day: 5,
+        };
         assert_eq!(d.to_string_zh(), "2026-07-05");
     }
 }

@@ -1,11 +1,11 @@
 //! 枚举类型定义
-//! 
+//!
 //! 集中管理系统中使用的枚举类型，提供类型安全和代码可读性。
 
 use serde::{Deserialize, Serialize};
 
 /// 报告类型枚举
-/// 
+///
 /// 用于 API 触发分析时选择推送的报告格式
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

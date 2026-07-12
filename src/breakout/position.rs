@@ -15,7 +15,9 @@ pub fn classify_position(distance_from_ma60_pct: f64) -> PricePosition {
 
 /// 计算距均线偏离百分比
 pub fn distance_from_ma(price: f64, ma: f64) -> f64 {
-    if ma <= 0.0 { return 0.0; }
+    if ma <= 0.0 {
+        return 0.0;
+    }
     (price - ma) / ma * 100.0
 }
 

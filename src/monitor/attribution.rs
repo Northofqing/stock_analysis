@@ -51,7 +51,11 @@ pub struct FourViews {
 
 /// 判定"查到催化" 阈值 (v10 §4.5 BC-2)
 /// news_ai importance≥3 **或** chain_mapper 命中非 generic 链
-pub fn has_strong_evidence(news_ai_importance: Option<u8>, chain_hits: &[String], is_generic: &[bool]) -> bool {
+pub fn has_strong_evidence(
+    news_ai_importance: Option<u8>,
+    chain_hits: &[String],
+    is_generic: &[bool],
+) -> bool {
     // 来源 1: news_ai importance ≥ 3
     if let Some(imp) = news_ai_importance {
         if imp >= 3 {
@@ -70,13 +74,20 @@ pub fn has_strong_evidence(news_ai_importance: Option<u8>, chain_hits: &[String]
 
 /// 1.5s timeout 包装 (chain_mapper 规则路径)
 /// 返回: Ok(Vec<ChainHit>) 或 Err (超时)
-pub fn chain_mapper_with_timeout(title: &str, timeout_ms: u64) -> Result<Vec<crate::opportunity::chain_mapper::ChainHit>, String> {
+pub fn chain_mapper_with_timeout(
+    title: &str,
+    timeout_ms: u64,
+) -> Result<Vec<crate::opportunity::chain_mapper::ChainHit>, String> {
     use std::time::{Duration, Instant};
     let start = Instant::now();
     let hits = map_news_to_chains(title);
     let elapsed = start.elapsed();
     if elapsed > Duration::from_millis(timeout_ms) {
-        return Err(format!("chain_mapper 超时: {}ms > {}ms", elapsed.as_millis(), timeout_ms));
+        return Err(format!(
+            "chain_mapper 超时: {}ms > {}ms",
+            elapsed.as_millis(),
+            timeout_ms
+        ));
     }
     Ok(hits)
 }
@@ -121,7 +132,8 @@ pub fn attribute_event(event: &AlertEvent) -> AttributionResult {
     let main_reason = if has_catalyst {
         if !chain_hits.is_empty() {
             // 取第一条非 generic chain
-            let first_hit = chain_hits.iter()
+            let first_hit = chain_hits
+                .iter()
                 .zip(chain_generic.iter())
                 .find(|(_, g)| !**g)
                 .map(|(c, _)| c.clone())
@@ -148,9 +160,17 @@ pub fn attribute_event(event: &AlertEvent) -> AttributionResult {
 
     // 6. 4 视角 (简化, 实际从各模块拉数据)
     let four_views = FourViews {
-        company: if !chain_hits.is_empty() { format!("链: {}", chain_hits.join(", ")) } else { "无链命中".into() },
+        company: if !chain_hits.is_empty() {
+            format!("链: {}", chain_hits.join(", "))
+        } else {
+            "无链命中".into()
+        },
         fund: "[未接 fund_flow]".into(),
-        technical: format!("gap={:.2}% vol={:.2}", event.detail.change_pct.unwrap_or(0.0), event.detail.volume_ratio.unwrap_or(0.0)),
+        technical: format!(
+            "gap={:.2}% vol={:.2}",
+            event.detail.change_pct.unwrap_or(0.0),
+            event.detail.volume_ratio.unwrap_or(0.0)
+        ),
         sentiment: format!("alert_level={:?}", event.level),
     };
 

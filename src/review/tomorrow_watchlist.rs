@@ -41,7 +41,10 @@ pub struct WatchItem {
 /// R-07 渲染
 pub fn render_r07(items: &[WatchItem]) -> String {
     let mut s = String::new();
-    s.push_str(&format!("📌 明日观察池（{}）\n", Local::now().format("%Y-%m-%d")));
+    s.push_str(&format!(
+        "📌 明日观察池（{}）\n",
+        Local::now().format("%Y-%m-%d")
+    ));
     for (i, it) in items.iter().enumerate() {
         s.push_str(&format!(
             "{}. {}({}) [{}] 来源: {}\n   触发{} | 低吸{:.2}~{:.2} | 止损{:.2}\n   理由: {}\n─────\n",
@@ -65,7 +68,10 @@ pub fn render_r07(items: &[WatchItem]) -> String {
 pub fn dedup(items: Vec<WatchItem>) -> Vec<WatchItem> {
     use std::collections::HashSet;
     let mut seen = HashSet::new();
-    items.into_iter().filter(|i| seen.insert(i.code.clone())).collect()
+    items
+        .into_iter()
+        .filter(|i| seen.insert(i.code.clone()))
+        .collect()
 }
 
 #[cfg(test)]

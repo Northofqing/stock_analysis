@@ -16,7 +16,12 @@ pub(super) fn trace_enabled(analyzer: &GeminiAnalyzer) -> bool {
 }
 
 fn banner(title: &str) {
-    info!("\n{}\n[Agent追踪] {}\n{}", "=".repeat(60), title, "=".repeat(60));
+    info!(
+        "\n{}\n[Agent追踪] {}\n{}",
+        "=".repeat(60),
+        title,
+        "=".repeat(60)
+    );
 }
 
 /// 打印各领域数据切片（仅 trace 模式）
@@ -60,11 +65,32 @@ pub(super) fn print_analyst(analyzer: &GeminiAnalyzer, role: &str, v: &AnalystVi
 pub(super) fn print_debate(analyzer: &GeminiAnalyzer, d: &DebateOutput) {
     if trace_enabled(analyzer) {
         banner("🐂 多头研究员最终论点");
-        info!("\n{}", if d.bull.is_empty() { "（无）" } else { d.bull.as_str() });
+        info!(
+            "\n{}",
+            if d.bull.is_empty() {
+                "（无）"
+            } else {
+                d.bull.as_str()
+            }
+        );
         banner("🐻 空头研究员最终论点");
-        info!("\n{}", if d.bear.is_empty() { "（无）" } else { d.bear.as_str() });
+        info!(
+            "\n{}",
+            if d.bear.is_empty() {
+                "（无）"
+            } else {
+                d.bear.as_str()
+            }
+        );
         banner("🛡️ 风控官清单");
-        info!("\n{}", if d.risk.is_empty() { "（无）" } else { d.risk.as_str() });
+        info!(
+            "\n{}",
+            if d.risk.is_empty() {
+                "（无）"
+            } else {
+                d.risk.as_str()
+            }
+        );
     } else {
         info!(
             "[Agent结果] 多空辩论 — 多头长度={} 空头长度={} 风控长度={}",

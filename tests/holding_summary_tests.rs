@@ -96,8 +96,13 @@ fn extract_advice_test(md: &str) -> String {
             continue;
         }
         if in_section {
-            if t.is_empty() { continue; }
-            if t.starts_with('#') { in_section = false; continue; }
+            if t.is_empty() {
+                continue;
+            }
+            if t.starts_with('#') {
+                in_section = false;
+                continue;
+            }
             advice = t.to_string();
             in_section = false;
         }
@@ -109,7 +114,9 @@ fn extract_score_test(md: &str) -> Option<f64> {
     let mut score: Option<f64> = None;
     for line in md.lines() {
         let t = line.trim();
-        if !t.contains("综合分") { continue; }
+        if !t.contains("综合分") {
+            continue;
+        }
         for token in t.split(|c: char| !c.is_ascii_digit() && c != '.') {
             if let Ok(v) = token.parse::<f64>() {
                 if (0.0..=100.0).contains(&v) {
@@ -118,7 +125,9 @@ fn extract_score_test(md: &str) -> Option<f64> {
                 }
             }
         }
-        if score.is_some() { break; }
+        if score.is_some() {
+            break;
+        }
     }
     score
 }
@@ -126,7 +135,9 @@ fn extract_score_test(md: &str) -> Option<f64> {
 fn first_meaningful_line_test(md: &str) -> String {
     for line in md.lines() {
         let t = line.trim();
-        if t.is_empty() || t.starts_with('#') { continue; }
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
         return t.to_string();
     }
     String::new()
@@ -177,12 +188,26 @@ fn test_priority_handles_zengchi() {
 }
 
 fn priority_test(k: &str) -> i32 {
-    if k.contains("强烈卖出") { return 0; }
-    if k.contains("卖出") { return 1; }
-    if k.contains("减持") || k.contains("规避") || k.contains("降仓") { return 2; }
-    if k.contains("观望") { return 3; }
-    if k.contains("增持") || k.contains("加仓") { return 4; }
-    if k.contains("买入") { return 5; }
-    if k.contains("强烈买入") { return 6; }
+    if k.contains("强烈卖出") {
+        return 0;
+    }
+    if k.contains("卖出") {
+        return 1;
+    }
+    if k.contains("减持") || k.contains("规避") || k.contains("降仓") {
+        return 2;
+    }
+    if k.contains("观望") {
+        return 3;
+    }
+    if k.contains("增持") || k.contains("加仓") {
+        return 4;
+    }
+    if k.contains("买入") {
+        return 5;
+    }
+    if k.contains("强烈买入") {
+        return 6;
+    }
     99
 }

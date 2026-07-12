@@ -22,7 +22,6 @@
 //! 失败时返回 Err, 绝不静默填充 (符合 AGENTS.md)。
 
 use serde::Deserialize;
-use std::time::Duration;
 
 /// 单日北向资金净额
 #[derive(Debug, Clone)]
@@ -85,9 +84,11 @@ impl NorthFlowClient {
 
     /// 解析响应（可单测）
     pub fn parse(json: &str) -> Result<NorthFlowSeries, String> {
-        let resp: RawResp = serde_json::from_str(json)
-            .map_err(|e| format!("北向资金响应非 JSON: {e}"))?;
-        let data = resp.data.ok_or_else(|| "北向资金响应 data 字段为空".to_string())?;
+        let resp: RawResp =
+            serde_json::from_str(json).map_err(|e| format!("北向资金响应非 JSON: {e}"))?;
+        let data = resp
+            .data
+            .ok_or_else(|| "北向资金响应 data 字段为空".to_string())?;
         let hk2sh = data
             .hk2sh
             .ok_or_else(|| "北向资金响应 hk2sh 字段为空".to_string())?;
@@ -103,8 +104,8 @@ impl NorthFlowClient {
         } else {
             return Err("北向资金响应无 date2 字段".to_string());
         };
-        let date = parse_date(&date_str)
-            .ok_or_else(|| format!("北向资金日期无法解析: {date_str}"))?;
+        let date =
+            parse_date(&date_str).ok_or_else(|| format!("北向资金日期无法解析: {date_str}"))?;
 
         // 元 → 亿元（1e8）
         let hk2sh_yi = hk2sh.day_net_amt_in / 1e8;
@@ -112,9 +113,18 @@ impl NorthFlowClient {
         let total_yi = hk2sh_yi + hk2sz_yi;
 
         Ok(NorthFlowSeries {
-            hk2sh_net: vec![NorthFlowPoint { date, net_buy_amt: hk2sh_yi }],
-            hk2sz_net: vec![NorthFlowPoint { date, net_buy_amt: hk2sz_yi }],
-            total_net: vec![NorthFlowPoint { date, net_buy_amt: total_yi }],
+            hk2sh_net: vec![NorthFlowPoint {
+                date,
+                net_buy_amt: hk2sh_yi,
+            }],
+            hk2sz_net: vec![NorthFlowPoint {
+                date,
+                net_buy_amt: hk2sz_yi,
+            }],
+            total_net: vec![NorthFlowPoint {
+                date,
+                net_buy_amt: total_yi,
+            }],
         })
     }
 
@@ -141,8 +151,8 @@ impl NorthFlowClient {
     /// 用法与 `fetch` 相同, 只是不返回 Future.
     pub fn fetch_blocking(&self) -> Result<NorthFlowSeries, String> {
         let url = "https://push2.eastmoney.com/api/qt/kamt/get?fields1=f1,f2,f3,f4&fields2=f51,f52,f53,f54,f55,f56&klt=1&lmt=1&fields=f51,f52,f54";
-        let resp = reqwest::blocking::get(url)
-            .map_err(|e| format!("北向资金 HTTP 请求失败: {e}"))?;
+        let resp =
+            reqwest::blocking::get(url).map_err(|e| format!("北向资金 HTTP 请求失败: {e}"))?;
         let text = resp
             .text()
             .map_err(|e| format!("北向资金响应文本读取失败: {e}"))?;

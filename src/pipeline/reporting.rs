@@ -8,8 +8,16 @@ use super::AnalysisResult;
 
 /// 生成单股通知文案（单股推送模式使用）。
 pub(super) fn generate_single_report(result: &AnalysisResult) -> String {
-    let limit_up_tag = if result.is_limit_up { " 🔥涨停" } else { "" };
-    let contrarian_tag = if result.contrarian_signal { " 🔄反向信号" } else { "" };
+    let limit_up_tag = if result.is_limit_up {
+        " 🔥涨停"
+    } else {
+        ""
+    };
+    let contrarian_tag = if result.contrarian_signal {
+        " 🔄反向信号"
+    } else {
+        ""
+    };
     let contrarian_line = result
         .contrarian_reason
         .as_ref()
@@ -56,7 +64,11 @@ pub(super) fn build_backtest_report(summary: &BacktestSummary) -> String {
     s.push_str(&format!(
         "| 总收益率 | {:.2}% | {} |\n",
         summary.total_return * 100.0,
-        if summary.total_return > 0.0 { "盈利" } else { "亏损" }
+        if summary.total_return > 0.0 {
+            "盈利"
+        } else {
+            "亏损"
+        }
     ));
     s.push_str(&format!(
         "| 年化收益率 | {:.2}% | 折算成年化收益 |\n",
@@ -124,10 +136,7 @@ pub(super) fn build_backtest_report(summary: &BacktestSummary) -> String {
                 ));
             }
             if let Some(beta) = summary.beta {
-                s.push_str(&format!(
-                    "| Beta | {:.3} | 相对基准的系统性敞口 |\n",
-                    beta
-                ));
+                s.push_str(&format!("| Beta | {:.3} | 相对基准的系统性敞口 |\n", beta));
             }
             if let Some(ir) = summary.information_ratio {
                 s.push_str(&format!(
@@ -205,7 +214,9 @@ pub(super) fn build_oos_section(
         "> 以交易日 **{}** 为界，将历史拆为前段（样本内）与后段（样本外）各自独立回测。\n",
         cutoff
     ));
-    s.push_str("> 策略参数固定（未在前段寻优），此处用于检验**业绩在两段时间内的一致性/衰减**。\n\n");
+    s.push_str(
+        "> 策略参数固定（未在前段寻优），此处用于检验**业绩在两段时间内的一致性/衰减**。\n\n",
+    );
     s.push_str("| 指标 | 前段(样本内) | 后段(样本外) | 衰减 |\n");
     s.push_str("|------|--------------|--------------|------|\n");
     let row = |name: &str, a: f64, b: f64, pct: bool| -> String {
@@ -221,10 +232,30 @@ pub(super) fn build_oos_section(
             format!("| {} | {:.3} | {:.3} | {:+.3} |\n", name, a, b, b - a)
         }
     };
-    s.push_str(&row("总收益率", in_sample.total_return, out_sample.total_return, true));
-    s.push_str(&row("年化收益率", in_sample.annual_return, out_sample.annual_return, true));
-    s.push_str(&row("最大回撤", in_sample.max_drawdown, out_sample.max_drawdown, true));
-    s.push_str(&row("夏普比率", in_sample.sharpe_ratio, out_sample.sharpe_ratio, false));
+    s.push_str(&row(
+        "总收益率",
+        in_sample.total_return,
+        out_sample.total_return,
+        true,
+    ));
+    s.push_str(&row(
+        "年化收益率",
+        in_sample.annual_return,
+        out_sample.annual_return,
+        true,
+    ));
+    s.push_str(&row(
+        "最大回撤",
+        in_sample.max_drawdown,
+        out_sample.max_drawdown,
+        true,
+    ));
+    s.push_str(&row(
+        "夏普比率",
+        in_sample.sharpe_ratio,
+        out_sample.sharpe_ratio,
+        false,
+    ));
     s.push_str(&row("胜率", in_sample.win_rate, out_sample.win_rate, true));
     s.push_str(&format!(
         "| 交易次数 | {} | {} | {:+} |\n",
@@ -237,10 +268,14 @@ pub(super) fn build_oos_section(
 }
 
 /// 渲染「Walk-Forward 滚动优化」Markdown 区块（B）。
-pub(super) fn build_walk_forward_section(report: &crate::strategy::core::WalkForwardReport) -> String {
+pub(super) fn build_walk_forward_section(
+    report: &crate::strategy::core::WalkForwardReport,
+) -> String {
     let mut s = String::new();
     s.push_str("\n## 🔁 Walk-Forward 滚动优化（B）\n\n");
-    s.push_str("> 扩张窗口（anchored）：每折在历史样本内做参数寻优，再前推到下一段**未见数据**上验证。\n");
+    s.push_str(
+        "> 扩张窗口（anchored）：每折在历史样本内做参数寻优，再前推到下一段**未见数据**上验证。\n",
+    );
     s.push_str("> 仅统计样本外（test）业绩，避免参数过拟合带来的虚高收益。\n\n");
     s.push_str("| 折 | 训练区间(样本内) | 测试区间(样本外) | 选中参数 | 样本外收益 | 样本外夏普 | 样本外交易 |\n");
     s.push_str("|----|------------------|------------------|----------|------------|------------|------------|\n");

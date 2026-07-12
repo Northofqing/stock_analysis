@@ -1,8 +1,8 @@
-use crate::analyzer::{AgentMode, GeminiAnalyzer};
-use crate::signal::market_event::{MarketEvent, EventType, Direction, compute_event_id};
-use crate::signal::market_event::SourceRef;
 use super::adapter::{RawNewsItem, SourceType};
 use super::classifier::ClassifierOutput;
+use crate::analyzer::{AgentMode, GeminiAnalyzer};
+use crate::signal::market_event::SourceRef;
+use crate::signal::market_event::{compute_event_id, Direction, EventType, MarketEvent};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -33,12 +33,21 @@ impl EventExtractorCore {
     }
 
     pub fn parse_deep_response(item: &RawNewsItem, response: &str) -> Option<MarketEvent> {
-        let cleaned = response.trim().trim_start_matches("```json").trim_end_matches("```").trim();
+        let cleaned = response
+            .trim()
+            .trim_start_matches("```json")
+            .trim_end_matches("```")
+            .trim();
         let dr: DeepResponse = serde_json::from_str(cleaned).ok()?;
         let event_id = compute_event_id(&item.title, &item.published_at);
-        let mut me = MarketEvent::new(
-            dr.event_type, dr.subject, dr.object,
-            dr.direction, dr.strength, dr.certainty,
+        let mut me = MarketEvent::new_with_title(
+            dr.event_type,
+            dr.subject,
+            item.title.clone(), // FIX-1: full_title 用完整 title
+            dr.object,
+            dr.direction,
+            dr.strength,
+            dr.certainty,
         );
         me.event_id = event_id;
         me.provenance.push(SourceRef {
@@ -54,9 +63,10 @@ impl EventExtractorCore {
         let strength = strength_for_event_type(event_type, co.confidence);
         let certainty = certainty_for_source(item.source_type, co.confidence);
         let event_id = compute_event_id(&item.title, &item.published_at);
-        let mut me = MarketEvent::new(
+        let mut me = MarketEvent::new_with_title(
             event_type,
             co.subject.clone().unwrap_or_default(),
+            item.title.clone(), // FIX-1: full_title 用完整 title
             None,
             co.direction.unwrap_or(Direction::Neutral),
             strength,
@@ -73,9 +83,10 @@ impl EventExtractorCore {
 
     pub fn build_degraded(item: &RawNewsItem, event_type: Option<EventType>) -> MarketEvent {
         let event_id = compute_event_id(&item.title, &item.published_at);
-        let mut me = MarketEvent::new(
+        let mut me = MarketEvent::new_with_title(
             event_type.unwrap_or(EventType::Other),
             item.title.chars().take(30).collect(),
+            item.title.clone(), // FIX-1: full_title 用完整 title 而非 30 字符截断
             None,
             Direction::Neutral,
             30,
@@ -88,13 +99,14 @@ impl EventExtractorCore {
 
     /// 修复 v9.1 集成: 真接 AI (Deep 模式)
     /// 失败 → 退化为 build_degraded + ai_degraded=true
-    pub async fn extract_with(
-        gemini: &GeminiAnalyzer,
-        item: &RawNewsItem,
-    ) -> MarketEvent {
+    pub async fn extract_with(gemini: &GeminiAnalyzer, item: &RawNewsItem) -> MarketEvent {
         let prompt = Self::build_prompt(&item.title, &item.body);
         match gemini
-            .call_api_mode(&prompt, "你是 A 股量化事件抽取专家。只输出 JSON。", AgentMode::Deep)
+            .call_api_mode(
+                &prompt,
+                "你是 A 股量化事件抽取专家。只输出 JSON。",
+                AgentMode::Deep,
+            )
             .await
         {
             Ok(text) => Self::parse_deep_response(item, &text)
@@ -106,11 +118,15 @@ impl EventExtractorCore {
 
 pub fn strength_for_event_type(et: EventType, confidence: f64) -> u8 {
     let base = match et {
-        EventType::Policy => 75, EventType::TechBreak => 65,
-        EventType::OrderWin => 60, EventType::Capacity => 55,
+        EventType::Policy => 75,
+        EventType::TechBreak => 65,
+        EventType::OrderWin => 60,
+        EventType::Capacity => 55,
         EventType::PriceUp | EventType::PriceDown => 50,
-        EventType::Mna => 60, EventType::Accident => 70,
-        EventType::Overseas => 60, EventType::Other => 40,
+        EventType::Mna => 60,
+        EventType::Accident => 70,
+        EventType::Overseas => 60,
+        EventType::Other => 40,
     };
     let raw = (base as f64 * confidence).round() as u8;
     raw.clamp(20, 80)
@@ -125,9 +141,9 @@ pub fn certainty_for_source(st: SourceType, confidence: f64) -> u8 {
     // 之前: factor × confidence, 落到 40-85 区间, 与 spec 不符 (Flash 应该 ≤49)
     // 现在: linear map 让 confidence ∈ [0.5, 1.0] 落到对应区间
     let raw = match st {
-        SourceType::Announcement => 60.0 + 40.0 * confidence,   // [80, 100]
-        SourceType::Search => 21.0 + 58.0 * confidence,        // [50, 79]
-        SourceType::Flash => -9.0 + 58.0 * confidence,         // [20, 49]
+        SourceType::Announcement => 60.0 + 40.0 * confidence, // [80, 100]
+        SourceType::Search => 21.0 + 58.0 * confidence,       // [50, 79]
+        SourceType::Flash => -9.0 + 58.0 * confidence,        // [20, 49]
     };
     raw.clamp(0.0, 100.0).round() as u8
 }

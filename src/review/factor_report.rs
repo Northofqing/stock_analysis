@@ -5,7 +5,11 @@
 use super::factor_ic::{FactorIC, FactorVerdict};
 
 /// 生成因子 IC 分析 Markdown 报告。
-pub fn generate_report(analyses: &[FactorIC], corr_matrix: &[Vec<f64>], sentiment_score_ic: Option<&FactorIC>) -> String {
+pub fn generate_report(
+    analyses: &[FactorIC],
+    corr_matrix: &[Vec<f64>],
+    sentiment_score_ic: Option<&FactorIC>,
+) -> String {
     let mut s = String::new();
 
     s.push_str("## 🔬 AI 评分因子 IC 诊断报告\n\n");
@@ -21,7 +25,9 @@ pub fn generate_report(analyses: &[FactorIC], corr_matrix: &[Vec<f64>], sentimen
                     sent_ic.mean_ic, sent_ic.information_ratio, sent_ic.t_stat
                 ));
                 s.push_str("> AI 评分与未来收益 **系统性反向** — 高评分对应低收益。\n");
-                s.push_str("> **建议**: 继续使用 B 方案（布林+MACD 共振 + 反向信号）作为买入触发。\n\n");
+                s.push_str(
+                    "> **建议**: 继续使用 B 方案（布林+MACD 共振 + 反向信号）作为买入触发。\n\n",
+                );
             }
             FactorVerdict::Neutral => {
                 s.push_str("> AI 综合评分方向性不显著，无法有效预测未来收益。\n\n");
@@ -60,8 +66,7 @@ pub fn generate_report(analyses: &[FactorIC], corr_matrix: &[Vec<f64>], sentimen
     for fa in analyses {
         s.push_str(&format!(
             "| {} | {:.4} | {:.4} | {:.4} | {:.4} |\n",
-            fa.factor_name,
-            fa.ic_decay[0], fa.ic_decay[1], fa.ic_decay[2], fa.ic_decay[3],
+            fa.factor_name, fa.ic_decay[0], fa.ic_decay[1], fa.ic_decay[2], fa.ic_decay[3],
         ));
     }
 
@@ -81,11 +86,20 @@ pub fn generate_report(analyses: &[FactorIC], corr_matrix: &[Vec<f64>], sentimen
         s.push('\n');
 
         for i in 0..analyses.len() {
-            s.push_str(&format!("| {} | ", truncate_name(&analyses[i].factor_name, 8)));
+            s.push_str(&format!(
+                "| {} | ",
+                truncate_name(&analyses[i].factor_name, 8)
+            ));
             for j in 0..analyses.len() {
                 if i < corr_matrix.len() && j < corr_matrix[i].len() {
                     let v = corr_matrix[i][j];
-                    let icon = if v.abs() > 0.7 { "🔴" } else if v.abs() > 0.4 { "🟡" } else { "🟢" };
+                    let icon = if v.abs() > 0.7 {
+                        "🔴"
+                    } else if v.abs() > 0.4 {
+                        "🟡"
+                    } else {
+                        "🟢"
+                    };
                     s.push_str(&format!("{:.3} {} | ", v, icon));
                 } else {
                     s.push_str("- | ");
@@ -98,10 +112,12 @@ pub fn generate_report(analyses: &[FactorIC], corr_matrix: &[Vec<f64>], sentimen
     // ── 诊断建议 ──
     s.push_str("\n### 诊断建议\n\n");
 
-    let negative_factors: Vec<&FactorIC> = analyses.iter()
+    let negative_factors: Vec<&FactorIC> = analyses
+        .iter()
         .filter(|fa| matches!(fa.verdict, FactorVerdict::Negative { .. }))
         .collect();
-    let positive_factors: Vec<&FactorIC> = analyses.iter()
+    let positive_factors: Vec<&FactorIC> = analyses
+        .iter()
         .filter(|fa| matches!(fa.verdict, FactorVerdict::Positive { significant: true }))
         .collect();
 
@@ -169,8 +185,18 @@ mod tests {
     #[test]
     fn test_report_generation_no_panic() {
         let factors = vec![
-            make_factor("技术面", 0.05, 0.5, FactorVerdict::Positive { significant: false }),
-            make_factor("盈利质量", -0.03, -0.3, FactorVerdict::Negative { significant: false }),
+            make_factor(
+                "技术面",
+                0.05,
+                0.5,
+                FactorVerdict::Positive { significant: false },
+            ),
+            make_factor(
+                "盈利质量",
+                -0.03,
+                -0.3,
+                FactorVerdict::Negative { significant: false },
+            ),
             make_factor("估值安全边际", 0.02, 0.2, FactorVerdict::Neutral),
         ];
         let corr = vec![
@@ -178,7 +204,12 @@ mod tests {
             vec![0.3, 1.0, 0.2],
             vec![-0.1, 0.2, 1.0],
         ];
-        let sent_ic = make_factor("AI综合评分", -0.08, -0.8, FactorVerdict::Negative { significant: true });
+        let sent_ic = make_factor(
+            "AI综合评分",
+            -0.08,
+            -0.8,
+            FactorVerdict::Negative { significant: true },
+        );
         let report = generate_report(&factors, &corr, Some(&sent_ic));
         assert!(report.contains("方向性错误"));
         assert!(report.contains("IC 均值"));

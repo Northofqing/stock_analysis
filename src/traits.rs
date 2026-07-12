@@ -90,5 +90,6 @@ pub trait AiContentGenerator: Send + Sync {
     /// - `prompt`      — 输入提示词
     /// - `temperature` — 生成温度（0.0 = 确定性，1.0 = 随机）
     /// - `max_tokens`  — 最大输出 token 数
-    fn generate_content(&self, prompt: &str, temperature: f32, max_tokens: usize) -> Result<String>;
+    fn generate_content(&self, prompt: &str, temperature: f32, max_tokens: usize)
+        -> Result<String>;
 }

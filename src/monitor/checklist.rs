@@ -39,8 +39,13 @@ pub fn build_pre_market_checklist(
         lines.push("|------|------|------|------|------|------|------|".into());
         for p in positions {
             let dist = if p.hard_stop > 0.0 && p.cost_price > 0.0 {
-                format!("{:.1}%", (p.cost_price - p.hard_stop) / p.cost_price * 100.0)
-            } else { "-".into() };
+                format!(
+                    "{:.1}%",
+                    (p.cost_price - p.hard_stop) / p.cost_price * 100.0
+                )
+            } else {
+                "-".into()
+            };
             // review #14: DB 失败时不再静默 "可用", 而是显示警告, 让 operator 知道有异常.
             let status = match crate::portfolio::is_t1_locked(&p.code) {
                 Ok(true) => "🔒 T+1",
@@ -100,7 +105,10 @@ pub fn build_close_summary(
         String::new(),
         "## 📈 市场概况".into(),
         format!("- 沪指：{:+.2}%", market_pct),
-        format!("- 涨停 {} 只 | 跌停 {} 只 | 炸板率 {:.0}%", limit_up_count, limit_down_count, break_rate),
+        format!(
+            "- 涨停 {} 只 | 跌停 {} 只 | 炸板率 {:.0}%",
+            limit_up_count, limit_down_count, break_rate
+        ),
         String::new(),
         "## 📡 今日信号统计".into(),
         format!("- 触发信号：{} 条", signals_today),
@@ -163,16 +171,22 @@ mod tests {
     use chrono::NaiveDate;
 
     fn init_db() {
-        let _ = crate::database::DatabaseManager::init(Some(std::path::PathBuf::from("./test_data/test.db")));
+        let _ = crate::database::DatabaseManager::init(Some(std::path::PathBuf::from(
+            "./test_data/test.db",
+        )));
     }
 
     fn pos(code: &str, name: &str, cost: f64, stop: f64) -> Position {
         Position {
-            code: code.into(), name: name.into(), shares: 1000,
-            cost_price: cost, hard_stop: stop,
+            code: code.into(),
+            name: name.into(),
+            shares: 1000,
+            cost_price: cost,
+            hard_stop: stop,
             added_at: NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
             status: crate::portfolio::PositionStatus::Holding,
-            sector: "其他".into(), ..Default::default()
+            sector: "其他".into(),
+            ..Default::default()
         }
     }
 

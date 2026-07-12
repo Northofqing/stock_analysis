@@ -179,10 +179,10 @@ mod tests {
 
     #[test]
     fn test_real_alpha_boundary() {
-        assert_eq!(compute_real_alpha(0.0, 0.0), Some(0.0));   // 0% 边界
-        assert_eq!(compute_real_alpha(1.0, 1.0), Some(0.0));   // 100% 边界
-        assert_eq!(compute_real_alpha(0.0, 1.0), Some(-1.0));  // 最大负
-        assert_eq!(compute_real_alpha(1.0, 0.0), Some(1.0));   // 最大正
+        assert_eq!(compute_real_alpha(0.0, 0.0), Some(0.0)); // 0% 边界
+        assert_eq!(compute_real_alpha(1.0, 1.0), Some(0.0)); // 100% 边界
+        assert_eq!(compute_real_alpha(0.0, 1.0), Some(-1.0)); // 最大负
+        assert_eq!(compute_real_alpha(1.0, 0.0), Some(1.0)); // 最大正
     }
 
     #[test]
@@ -194,9 +194,9 @@ mod tests {
 
     #[test]
     fn test_real_alpha_out_of_range_returns_none() {
-        assert_eq!(compute_real_alpha(-0.1, 0.5), None);  // push < 0
-        assert_eq!(compute_real_alpha(0.5, 1.1), None);   // market > 1
-        assert_eq!(compute_real_alpha(1.5, 0.5), None);   // push > 1
+        assert_eq!(compute_real_alpha(-0.1, 0.5), None); // push < 0
+        assert_eq!(compute_real_alpha(0.5, 1.1), None); // market > 1
+        assert_eq!(compute_real_alpha(1.5, 0.5), None); // push > 1
     }
 
     // ===== market_up_rate =====
@@ -224,15 +224,15 @@ mod tests {
 
     #[test]
     fn test_confidence_b_medium_quality() {
-        assert_eq!(Confidence::from_sources(1, 2.0), Confidence::B);  // 单源
+        assert_eq!(Confidence::from_sources(1, 2.0), Confidence::B); // 单源
         assert_eq!(Confidence::from_sources(2, 3.0), Confidence::B); // 2 源但误差 3%
     }
 
     #[test]
     fn test_confidence_c_low_quality() {
-        assert_eq!(Confidence::from_sources(0, 0.0), Confidence::C);   // 0 源
-        assert_eq!(Confidence::from_sources(2, 6.0), Confidence::C);   // 误差 > 5%
-        assert_eq!(Confidence::from_sources(1, 10.0), Confidence::C);  // 单源 + 误差大
+        assert_eq!(Confidence::from_sources(0, 0.0), Confidence::C); // 0 源
+        assert_eq!(Confidence::from_sources(2, 6.0), Confidence::C); // 误差 > 5%
+        assert_eq!(Confidence::from_sources(1, 10.0), Confidence::C); // 单源 + 误差大
         assert_eq!(Confidence::from_sources(2, f64::NAN), Confidence::C); // NaN
     }
 

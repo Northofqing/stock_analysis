@@ -4,8 +4,8 @@ use chrono::{Local, NaiveDate};
 use diesel::prelude::*;
 use log::{info, warn};
 
-use crate::models::{NewStockDaily, StockDaily, NewAnalysisResult, AnalysisResultRecord};
-use crate::schema::{stock_daily, analysis_result};
+use crate::models::{AnalysisResultRecord, NewAnalysisResult, NewStockDaily, StockDaily};
+use crate::schema::{analysis_result, stock_daily};
 
 use super::DatabaseManager;
 use super::{AnalysisContext, DbConnection, StockDailyRecord};
@@ -92,7 +92,23 @@ impl DatabaseManager {
         data_source: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut conn = self.get_conn()?;
-        Self::upsert_daily_record(&mut conn, code, date, open, high, low, close, volume, amount, pct_chg, ma5, ma10, ma20, volume_ratio, data_source)
+        Self::upsert_daily_record(
+            &mut conn,
+            code,
+            date,
+            open,
+            high,
+            low,
+            close,
+            volume,
+            amount,
+            pct_chg,
+            ma5,
+            ma10,
+            ma20,
+            volume_ratio,
+            data_source,
+        )
     }
 
     /// 内部 UPSERT 方法，接受已有连接（避免批量操作时重复获取连接）
@@ -232,13 +248,13 @@ impl DatabaseManager {
             // 计算成交量变化
             if let (Some(today_vol), Some(yesterday_vol)) = (today_data.volume, yesterday.volume) {
                 if yesterday_vol > 0.0 {
-                    context.volume_change_ratio = Some((today_vol / yesterday_vol * 100.0).round() / 100.0);
+                    context.volume_change_ratio =
+                        Some((today_vol / yesterday_vol * 100.0).round() / 100.0);
                 }
             }
 
             // 计算价格变化
-            if let (Some(today_close), Some(yesterday_close)) =
-                (today_data.close, yesterday.close)
+            if let (Some(today_close), Some(yesterday_close)) = (today_data.close, yesterday.close)
             {
                 if yesterday_close > 0.0 {
                     context.price_change_ratio = Some(
@@ -289,7 +305,10 @@ impl DatabaseManager {
             Ok(data.len())
         })?;
 
-        info!("[{}] 已保存 {} 条K线数据到数据库（数据源: {}）", code, saved, source);
+        info!(
+            "[{}] 已保存 {} 条K线数据到数据库（数据源: {}）",
+            code, saved, source
+        );
         Ok(saved)
     }
 
@@ -326,7 +345,10 @@ impl DatabaseManager {
             ))
             .execute(&mut conn)?;
 
-        info!("[{}] 保存/更新分析结果（评分: {}）", result.code, result.sentiment_score);
+        info!(
+            "[{}] 保存/更新分析结果（评分: {}）",
+            result.code, result.sentiment_score
+        );
         Ok(())
     }
 

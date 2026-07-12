@@ -10,7 +10,7 @@
 //!
 //! 所有测试使用 TEST_CODE 前缀 (AGENTS.md 2.5)
 
-use stock_analysis::monitor::risk::{MarketRegime, PositionSizer, StopLoss, PositionType};
+use stock_analysis::monitor::risk::{MarketRegime, PositionSizer, PositionType, StopLoss};
 use stock_analysis::pipeline::RiskContext;
 
 // ============================================================================
@@ -59,7 +59,7 @@ fn test_stop_loss_triggered_with_atr() {
     // hard = 10 * 0.92 = 9.2
     // effective = max(9.4, 9.31, 9.2) = 9.4 (tightest)
     assert!((sl.effective() - 9.4).abs() < 0.01);
-    assert!(sl.triggered(9.0));  // below effective
+    assert!(sl.triggered(9.0)); // below effective
     assert!(!sl.triggered(9.5)); // above effective
 }
 
@@ -106,8 +106,16 @@ fn test_stop_loss_t1_locked_advice() {
         unlock_date: chrono::NaiveDate::from_ymd_opt(2026, 6, 22).unwrap(),
     };
     let advice = sl.advice(9.5, locked);
-    assert!(advice.contains("T+1"), "Expected T+1 warning in: {}", advice);
-    assert!(advice.contains("锁仓"), "Expected lock warning in: {}", advice);
+    assert!(
+        advice.contains("T+1"),
+        "Expected T+1 warning in: {}",
+        advice
+    );
+    assert!(
+        advice.contains("锁仓"),
+        "Expected lock warning in: {}",
+        advice
+    );
 }
 
 #[test]
@@ -143,7 +151,10 @@ fn test_position_sizer_base() {
 fn test_position_sizer_crash_zero() {
     let sizer = PositionSizer::default();
     let max_amt = sizer.max_position(MarketRegime::Crash, 3.0, 0, 0, false);
-    assert!((max_amt - 0.0).abs() < 0.01, "Crash should block all new buys");
+    assert!(
+        (max_amt - 0.0).abs() < 0.01,
+        "Crash should block all new buys"
+    );
 }
 
 #[test]
@@ -158,7 +169,10 @@ fn test_position_sizer_bear_reduced() {
     let sizer = PositionSizer::default();
     let bull_max = sizer.max_position(MarketRegime::BullRally, 3.0, 0, 0, false);
     let bear_max = sizer.max_position(MarketRegime::BearDecline, 3.0, 0, 0, false);
-    assert!(bear_max < bull_max, "Bear regime should reduce position size");
+    assert!(
+        bear_max < bull_max,
+        "Bear regime should reduce position size"
+    );
     assert!(bear_max > 0.0, "Bear should still allow some buying");
 }
 
@@ -167,7 +181,10 @@ fn test_position_sizer_chain_penalty() {
     let sizer = PositionSizer::default();
     let no_chain = sizer.max_position(MarketRegime::Structural, 3.0, 0, 0, false);
     let with_chain = sizer.max_position(MarketRegime::Structural, 3.0, 3, 0, false);
-    assert!(with_chain < no_chain, "Chain concentration should reduce position");
+    assert!(
+        with_chain < no_chain,
+        "Chain concentration should reduce position"
+    );
 }
 
 #[test]
@@ -176,7 +193,10 @@ fn test_position_sizer_frozen_penalty() {
     let no_frozen = sizer.max_position(MarketRegime::Structural, 3.0, 0, 0, false);
     let with_frozen = sizer.max_position(MarketRegime::Structural, 3.0, 0, 2, false);
     // Frozen positions penalize 1.5x
-    assert!(with_frozen < no_frozen, "Frozen positions should reduce capacity");
+    assert!(
+        with_frozen < no_frozen,
+        "Frozen positions should reduce capacity"
+    );
 }
 
 #[test]
@@ -185,8 +205,12 @@ fn test_position_sizer_high_volatility() {
     let low_vol = sizer.max_position(MarketRegime::Structural, 2.0, 0, 0, false);
     let high_vol = sizer.max_position(MarketRegime::Structural, 10.0, 0, 0, false);
     // Higher volatility → smaller position
-    assert!(high_vol < low_vol,
-        "High vol {} should be less than low vol {}", high_vol, low_vol);
+    assert!(
+        high_vol < low_vol,
+        "High vol {} should be less than low vol {}",
+        high_vol,
+        low_vol
+    );
 }
 
 #[test]
@@ -250,7 +274,10 @@ fn test_position_sizer_min_volatility_clamped() {
     let sizer = PositionSizer::default();
     let max_amt = sizer.max_position(MarketRegime::Structural, 0.1, 0, 0, false);
     // volatility clamps to max(1.0, 0.1) = 1.0
-    assert!(max_amt > 0.0, "Very low vol should still work (clamped to 1.0)");
+    assert!(
+        max_amt > 0.0,
+        "Very low vol should still work (clamped to 1.0)"
+    );
 }
 
 #[test]
@@ -296,7 +323,11 @@ fn test_t1_warning_in_stop_loss_advice() {
     let advice = sl.advice(9.0, locked);
     assert!(advice.contains("锁仓"));
     assert!(advice.contains("T+1"));
-    assert!(advice.contains("次日"), "Expected suggestion for next day in: {}", advice);
+    assert!(
+        advice.contains("次日"),
+        "Expected suggestion for next day in: {}",
+        advice
+    );
 }
 
 // ============================================================================
@@ -310,8 +341,14 @@ fn test_t1_risk_warning_triggers() {
         t1_frozen_warn_ratio: 30.0,
         ..Default::default()
     };
-    assert!(sizer.check_t1_risk(35_000.0).is_some(), "35% frozen should warn");
-    assert!(sizer.check_t1_risk(10_000.0).is_none(), "10% frozen should be ok");
+    assert!(
+        sizer.check_t1_risk(35_000.0).is_some(),
+        "35% frozen should warn"
+    );
+    assert!(
+        sizer.check_t1_risk(10_000.0).is_none(),
+        "10% frozen should be ok"
+    );
 }
 
 #[test]

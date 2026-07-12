@@ -24,6 +24,13 @@ use std::io::Write;
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
+
+    // CR-AUTH: live 模式启动前 operator 认证 (BR-028)
+    if let Err(e) = stock_analysis::auth::operator::require_monitor_operator_auth() {
+        eprintln!("[CR-AUTH] 认证失败: {:?} 拒绝启动", e);
+        std::process::exit(1);
+    }
+
     let args = cli::Args::parse();
 
     // 日志初始化（时间戳使用本地时区）

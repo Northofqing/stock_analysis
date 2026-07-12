@@ -15,8 +15,10 @@ pub trait Validator: Send + Sync {
 
 pub struct GrossMarginValidator;
 impl Validator for GrossMarginValidator {
-    fn name(&self) -> &str { "GrossMarginValidator" }
-    fn validate(&self, context: &ContextManager) -> Result<(), ValidationError> { 
+    fn name(&self) -> &str {
+        "GrossMarginValidator"
+    }
+    fn validate(&self, context: &ContextManager) -> Result<(), ValidationError> {
         if let Some(financials) = context.get_fact("fetch_financials") {
             if let Some(gm) = financials.get("gross_margin").and_then(|v| v.as_f64()) {
                 if gm < -500.0 {
@@ -24,14 +26,16 @@ impl Validator for GrossMarginValidator {
                 }
             }
         }
-        Ok(()) 
+        Ok(())
     }
 }
 
 pub struct ConsensusDeviationValidator;
 impl Validator for ConsensusDeviationValidator {
-    fn name(&self) -> &str { "ConsensusDeviationValidator" }
-    fn validate(&self, context: &ContextManager) -> Result<(), ValidationError> { 
+    fn name(&self) -> &str {
+        "ConsensusDeviationValidator"
+    }
+    fn validate(&self, context: &ContextManager) -> Result<(), ValidationError> {
         if let Some(research) = context.get_fact("fetch_research") {
             if let Some(arr) = research.as_array() {
                 if arr.is_empty() {
@@ -39,7 +43,7 @@ impl Validator for ConsensusDeviationValidator {
                 }
             }
         }
-        Ok(()) 
+        Ok(())
     }
 }
 
@@ -48,8 +52,12 @@ impl Validator for ConsensusDeviationValidator {
 /// 假实现禁令风险. 外部可通过 add_validator(ConceptLinkageValidator) opt-in.
 pub struct ConceptLinkageValidator;
 impl Validator for ConceptLinkageValidator {
-    fn name(&self) -> &str { "ConceptLinkageValidator" }
-    fn validate(&self, _context: &ContextManager) -> Result<(), ValidationError> { Ok(()) }
+    fn name(&self) -> &str {
+        "ConceptLinkageValidator"
+    }
+    fn validate(&self, _context: &ContextManager) -> Result<(), ValidationError> {
+        Ok(())
+    }
 }
 
 /// Stub: no-op. Awaiting fact-source wiring (dividend yield/schedule).
@@ -57,8 +65,12 @@ impl Validator for ConceptLinkageValidator {
 /// 假实现禁令风险. 外部可通过 add_validator(DividendTaxValidator) opt-in.
 pub struct DividendTaxValidator;
 impl Validator for DividendTaxValidator {
-    fn name(&self) -> &str { "DividendTaxValidator" }
-    fn validate(&self, _context: &ContextManager) -> Result<(), ValidationError> { Ok(()) }
+    fn name(&self) -> &str {
+        "DividendTaxValidator"
+    }
+    fn validate(&self, _context: &ContextManager) -> Result<(), ValidationError> {
+        Ok(())
+    }
 }
 
 pub struct ValidationEngine {
@@ -67,7 +79,9 @@ pub struct ValidationEngine {
 
 impl ValidationEngine {
     pub fn new() -> Self {
-        Self { validators: Vec::new() }
+        Self {
+            validators: Vec::new(),
+        }
     }
 
     /// 默认只装两个真实 validator. 修复 (2026-06-30 codex review): 之前装的
@@ -91,7 +105,9 @@ impl ValidationEngine {
     pub fn run_all(&self, context: &ContextManager) -> Vec<ValidationError> {
         let mut errors = Vec::new();
         for validator in &self.validators {
-            if let Err(e) = validator.validate(context) { errors.push(e); }
+            if let Err(e) = validator.validate(context) {
+                errors.push(e);
+            }
         }
         errors
     }
@@ -119,6 +135,9 @@ mod tests {
         // (因为 financials/research 都不在 context 里, 走 default Ok 路径)
         let ctx = crate::agent::context::ContextManager::new();
         let errors = engine.run_all(&ctx);
-        assert!(errors.is_empty(), "default validators must pass on empty context");
+        assert!(
+            errors.is_empty(),
+            "default validators must pass on empty context"
+        );
     }
 }

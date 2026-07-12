@@ -5,10 +5,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::Local;
-use log::{info, warn};
-use lettre::{Message, SmtpTransport, Transport};
 use lettre::message::{header, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
+use lettre::{Message, SmtpTransport, Transport};
+use log::{info, warn};
 
 use super::service::NotificationService;
 
@@ -32,7 +32,10 @@ fn archive_email(subject: &str, markdown: &str, html: &str, image_path: Option<&
 
     let mut header_lines = vec![
         format!("<!-- subject: {} -->", subject),
-        format!("<!-- sent_at: {} -->", Local::now().format("%Y-%m-%d %H:%M:%S")),
+        format!(
+            "<!-- sent_at: {} -->",
+            Local::now().format("%Y-%m-%d %H:%M:%S")
+        ),
     ];
     if let Some(p) = image_path {
         header_lines.push(format!("<!-- image: {} -->", p.display()));
@@ -66,28 +69,44 @@ fn html_escape(s: &str) -> String {
 impl NotificationService {
     /// 发送邮件
     pub fn send_to_email(&self, content: &str) -> Result<bool> {
-        let sender = self.config.email_sender.as_ref()
+        let sender = self
+            .config
+            .email_sender
+            .as_ref()
             .context("邮件发送者未配置 (EMAIL_SENDER)")?;
-        let password = self.config.email_password.as_ref()
+        let password = self
+            .config
+            .email_password
+            .as_ref()
             .context("邮件密码未配置 (EMAIL_PASSWORD)")?;
-        let smtp_server = self.config.smtp_server.as_ref()
+        let smtp_server = self
+            .config
+            .smtp_server
+            .as_ref()
             .context("SMTP服务器未配置 (SMTP_SERVER)")?;
-        let smtp_port = self.config.smtp_port
+        let smtp_port = self
+            .config
+            .smtp_port
             .context("SMTP端口未配置 (SMTP_PORT)")?;
-        
+
         if self.config.email_receivers.is_empty() {
             return Err(anyhow::anyhow!("邮件接收者列表为空 (EMAIL_RECEIVERS)"));
         }
-        
+
         let primary = &self.config.email_receivers[0];
         let cc_list: Vec<&String> = self.config.email_receivers.iter().skip(1).collect();
-        
-        info!("准备发送邮件到主收件人: {}，抄送 {} 位，SMTP: {}:{}", 
-            primary, cc_list.len(), smtp_server, smtp_port);
-        
+
+        info!(
+            "准备发送邮件到主收件人: {}，抄送 {} 位，SMTP: {}:{}",
+            primary,
+            cc_list.len(),
+            smtp_server,
+            smtp_port
+        );
+
         // 转换 Markdown 为 HTML
         let html_content = self.markdown_to_html(content);
-        
+
         // 构建邮件主题
         let subject = format!("A股分析日报 - {}", Local::now().format("%Y-%m-%d"));
 
@@ -95,21 +114,25 @@ impl NotificationService {
         archive_email(&subject, content, &html_content, None);
 
         self.send_single_email(
-            sender, 
+            sender,
             primary,
             &cc_list,
-            &subject, 
-            content, 
+            &subject,
+            content,
             &html_content,
             smtp_server,
             smtp_port,
-            password
+            password,
         )?;
-        
-        info!("邮件发送成功: 主收件人 {}，抄送 {} 位", primary, cc_list.len());
+
+        info!(
+            "邮件发送成功: 主收件人 {}，抄送 {} 位",
+            primary,
+            cc_list.len()
+        );
         Ok(true)
     }
-    
+
     /// 发送单封邮件（第一个收件人为主地址，其余为抄送）
     pub(super) fn send_single_email(
         &self,
@@ -124,33 +147,29 @@ impl NotificationService {
         password: &str,
     ) -> Result<()> {
         // 构建邮件
-        let mut builder = Message::builder()
-            .from(from.parse()?)
-            .to(to.parse()?);
-        
+        let mut builder = Message::builder().from(from.parse()?).to(to.parse()?);
+
         for cc in cc_list {
             builder = builder.cc(cc.parse()?);
         }
-        
-        let email = builder
-            .subject(subject)
-            .multipart(
-                MultiPart::alternative()
-                    .singlepart(
-                        SinglePart::builder()
-                            .header(header::ContentType::TEXT_PLAIN)
-                            .body(text_content.to_string())
-                    )
-                    .singlepart(
-                        SinglePart::builder()
-                            .header(header::ContentType::TEXT_HTML)
-                            .body(html_content.to_string())
-                    )
-            )?;
-        
+
+        let email = builder.subject(subject).multipart(
+            MultiPart::alternative()
+                .singlepart(
+                    SinglePart::builder()
+                        .header(header::ContentType::TEXT_PLAIN)
+                        .body(text_content.to_string()),
+                )
+                .singlepart(
+                    SinglePart::builder()
+                        .header(header::ContentType::TEXT_HTML)
+                        .body(html_content.to_string()),
+                ),
+        )?;
+
         // 配置 SMTP
         let creds = Credentials::new(from.to_string(), password.to_string());
-        
+
         let mailer = if smtp_port == 465 {
             SmtpTransport::relay(smtp_server)?
                 .credentials(creds)
@@ -163,7 +182,7 @@ impl NotificationService {
                 .timeout(Some(Duration::from_secs(120)))
                 .build()
         };
-        
+
         // 发送（带重试）
         let max_retries = 3;
         let mut last_err = None;
@@ -179,42 +198,60 @@ impl NotificationService {
                 }
             }
         }
-        
+
         Err(last_err.unwrap().into())
     }
 
     /// 发送带图片的邮件
     pub(super) fn send_email_with_image(&self, content: &str, image_path: &Path) -> Result<bool> {
-        let sender = self.config.email_sender.as_ref()
+        let sender = self
+            .config
+            .email_sender
+            .as_ref()
             .context("邮件发送者未配置 (EMAIL_SENDER)")?;
-        let password = self.config.email_password.as_ref()
+        let password = self
+            .config
+            .email_password
+            .as_ref()
             .context("邮件密码未配置 (EMAIL_PASSWORD)")?;
-        let smtp_server = self.config.smtp_server.as_ref()
+        let smtp_server = self
+            .config
+            .smtp_server
+            .as_ref()
             .context("SMTP服务器未配置 (SMTP_SERVER)")?;
-        let smtp_port = self.config.smtp_port
+        let smtp_port = self
+            .config
+            .smtp_port
             .context("SMTP端口未配置 (SMTP_PORT)")?;
-        
+
         if self.config.email_receivers.is_empty() {
             return Err(anyhow::anyhow!("邮件接收者列表为空 (EMAIL_RECEIVERS)"));
         }
-        
+
         let primary = &self.config.email_receivers[0];
         let cc_list: Vec<&String> = self.config.email_receivers.iter().skip(1).collect();
-        
-        info!("准备发送带图片的邮件到主收件人: {}，抄送 {} 位", primary, cc_list.len());
-        
+
+        info!(
+            "准备发送带图片的邮件到主收件人: {}，抄送 {} 位",
+            primary,
+            cc_list.len()
+        );
+
         // 转换 Markdown 为 HTML
         let html_content = self.markdown_to_html(content);
-        
+
         // 读取图片
-        let image_data = std::fs::read(image_path)
-            .context("读取图片文件失败")?;
-        let image_filename = image_path.file_name()
+        let image_data = std::fs::read(image_path).context("读取图片文件失败")?;
+        let image_filename = image_path
+            .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("chart.png");
-        
+
         // 构建邮件主题
-        let subject = format!("A股分析日报（含图表） - {}", Local::now().format("%Y-%m-%d"));
+        let subject = format!(
+            "A股分析日报（含图表） - {}",
+            Local::now().format("%Y-%m-%d")
+        );
 
         // 发送前先把内容落盘归档（即使后续发送失败也有备份）
         archive_email(&subject, content, &html_content, Some(image_path));
@@ -230,10 +267,14 @@ impl NotificationService {
             image_filename,
             smtp_server,
             smtp_port,
-            password
+            password,
         )?;
-        
-        info!("邮件（含图表）发送成功: 主收件人 {}，抄送 {} 位", primary, cc_list.len());
+
+        info!(
+            "邮件（含图表）发送成功: 主收件人 {}，抄送 {} 位",
+            primary,
+            cc_list.len()
+        );
         Ok(true)
     }
 
@@ -253,49 +294,45 @@ impl NotificationService {
         password: &str,
     ) -> Result<()> {
         use lettre::message::Attachment;
-        
+
         // 在 HTML 中嵌入图片引用
         let html_with_image = format!(
             "{}<br/><br/><img src=\"cid:{}\" alt=\"分析图表\" style=\"max-width:100%; height:auto;\"/>",
             html_content,
             image_filename
         );
-        
+
         // 构建邮件
-        let mut builder = Message::builder()
-            .from(from.parse()?)
-            .to(to.parse()?);
-        
+        let mut builder = Message::builder().from(from.parse()?).to(to.parse()?);
+
         for cc in cc_list {
             builder = builder.cc(cc.parse()?);
         }
-        
-        let email = builder
-            .subject(subject)
-            .multipart(
-                MultiPart::mixed()
-                    .multipart(
-                        MultiPart::alternative()
-                            .singlepart(
-                                SinglePart::builder()
-                                    .header(header::ContentType::TEXT_PLAIN)
-                                    .body(text_content.to_string())
-                            )
-                            .singlepart(
-                                SinglePart::builder()
-                                    .header(header::ContentType::TEXT_HTML)
-                                    .body(html_with_image)
-                            )
-                    )
-                    .singlepart(
-                        Attachment::new_inline(image_filename.to_string())
-                            .body(image_data.to_vec(), "image/png".parse()?)
-                    )
-            )?;
-        
+
+        let email = builder.subject(subject).multipart(
+            MultiPart::mixed()
+                .multipart(
+                    MultiPart::alternative()
+                        .singlepart(
+                            SinglePart::builder()
+                                .header(header::ContentType::TEXT_PLAIN)
+                                .body(text_content.to_string()),
+                        )
+                        .singlepart(
+                            SinglePart::builder()
+                                .header(header::ContentType::TEXT_HTML)
+                                .body(html_with_image),
+                        ),
+                )
+                .singlepart(
+                    Attachment::new_inline(image_filename.to_string())
+                        .body(image_data.to_vec(), "image/png".parse()?),
+                ),
+        )?;
+
         // 配置 SMTP
         let creds = Credentials::new(from.to_string(), password.to_string());
-        
+
         let mailer = if smtp_port == 465 {
             SmtpTransport::relay(smtp_server)?
                 .credentials(creds)
@@ -308,7 +345,7 @@ impl NotificationService {
                 .timeout(Some(Duration::from_secs(120)))
                 .build()
         };
-        
+
         // 发送邮件（带重试）
         let max_retries = 3;
         let mut last_err = None;
@@ -324,7 +361,7 @@ impl NotificationService {
                 }
             }
         }
-        
+
         Err(last_err.unwrap().into())
     }
 }

@@ -1,7 +1,7 @@
-use diesel::prelude::*;
-use log::error;
 use crate::database::DatabaseManager;
 use chrono::Local;
+use diesel::prelude::*;
+use log::error;
 
 pub struct AgentLogDao;
 
@@ -14,9 +14,9 @@ impl AgentLogDao {
                 INSERT INTO agent_scratchpad (session_id, step, log_type, content, created_at)
                 VALUES ('{}', {}, '{}', '{}', '{}')
                 "#,
-                session_id.replace("'", "''"), 
-                step, 
-                log_type.replace("'", "''"), 
+                session_id.replace("'", "''"),
+                step,
+                log_type.replace("'", "''"),
                 content.replace("'", "''"),
                 Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
             );

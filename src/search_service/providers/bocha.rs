@@ -8,8 +8,10 @@ use async_trait::async_trait;
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 
-use super::super::types::{extract_domain, ApiKeyManager, NewsType, SearchProvider, SearchResponse, SearchResult, Sentiment};
-
+use super::super::types::{
+    extract_domain, ApiKeyManager, NewsType, SearchProvider, SearchResponse, SearchResult,
+    Sentiment,
+};
 
 // ============================================================================
 // Bocha 搜索引擎
@@ -39,7 +41,12 @@ impl BochaSearchProvider {
         }
     }
 
-    async fn do_search(&self, query: &str, api_key: &str, max_results: usize) -> Result<SearchResponse> {
+    async fn do_search(
+        &self,
+        query: &str,
+        api_key: &str,
+        max_results: usize,
+    ) -> Result<SearchResponse> {
         #[derive(Serialize)]
         struct BochaRequest {
             query: String,
@@ -100,7 +107,7 @@ impl BochaSearchProvider {
         let status = response.status();
         if !status.is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            
+
             let error_msg = match status.as_u16() {
                 403 => format!("余额不足: {}", error_text),
                 401 => format!("API KEY无效: {}", error_text),
@@ -108,7 +115,7 @@ impl BochaSearchProvider {
                 429 => format!("请求频率达到限制: {}", error_text),
                 _ => format!("HTTP {}: {}", status, error_text),
             };
-            
+
             warn!("[Bocha] 搜索失败: {}", error_msg);
             return Ok(SearchResponse::error(
                 query.to_string(),
@@ -117,10 +124,7 @@ impl BochaSearchProvider {
             ));
         }
 
-        let bocha_response: BochaResponse = response
-            .json()
-            .await
-            .context("解析 Bocha 响应失败")?;
+        let bocha_response: BochaResponse = response.json().await.context("解析 Bocha 响应失败")?;
 
         if bocha_response.code != 200 {
             let error_msg = bocha_response
@@ -152,9 +156,7 @@ impl BochaSearchProvider {
                     .take(500)
                     .collect();
 
-                let source = item
-                    .site_name
-                    .unwrap_or_else(|| extract_domain(&item.url));
+                let source = item.site_name.unwrap_or_else(|| extract_domain(&item.url));
 
                 let mut result = SearchResult {
                     title: item.name,
@@ -205,4 +207,3 @@ impl SearchProvider for BochaSearchProvider {
         .await
     }
 }
-

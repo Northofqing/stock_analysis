@@ -15,7 +15,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::data_provider::KlineData;
-use crate::indicators::{calc_macd, detect_divergence, DivergenceType, MACD_FAST, MACD_SIGNAL, MACD_SLOW};
+use crate::indicators::{
+    calc_macd, detect_divergence, DivergenceType, MACD_FAST, MACD_SIGNAL, MACD_SLOW,
+};
 
 /// 布林+MACD 综合信号建议动作
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,8 +101,8 @@ pub fn detect_boll_macd_signal(data: &[KlineData]) -> BollMacdSignal {
     }
 
     // 转为时间正序（最旧 → 最新）
-    let (closes, volumes): (Vec<f64>, Vec<f64>) = data.iter().rev()
-        .map(|k| (k.close, k.volume)).unzip();
+    let (closes, volumes): (Vec<f64>, Vec<f64>) =
+        data.iter().rev().map(|k| (k.close, k.volume)).unzip();
     let n = closes.len();
 
     // ============ 布林带 (20, 2σ) ============
@@ -114,7 +116,11 @@ pub fn detect_boll_macd_signal(data: &[KlineData]) -> BollMacdSignal {
     let upper = mid + STDEV_MUL * stdev;
     let lower = mid - STDEV_MUL * stdev;
     let band_width = upper - lower;
-    let band_width_pct = if mid > 0.0 { band_width / mid * 100.0 } else { 0.0 };
+    let band_width_pct = if mid > 0.0 {
+        band_width / mid * 100.0
+    } else {
+        0.0
+    };
 
     // 5 日前的带宽（用来判断张口/收口趋势）
     let band_change_pct = if n >= PERIOD + 5 {
@@ -167,7 +173,11 @@ pub fn detect_boll_macd_signal(data: &[KlineData]) -> BollMacdSignal {
     let vol_ratio = if n >= 6 {
         let prev5: f64 = volumes[n - 6..n - 1].iter().sum::<f64>() / 5.0;
         let today_vol = volumes[n - 1];
-        if prev5 > 0.0 { today_vol / prev5 } else { 0.0 }
+        if prev5 > 0.0 {
+            today_vol / prev5
+        } else {
+            0.0
+        }
     } else {
         0.0
     };
@@ -175,13 +185,11 @@ pub fn detect_boll_macd_signal(data: &[KlineData]) -> BollMacdSignal {
     const UPTREND_VOL_RATIO: f64 = 1.2;
 
     // 红柱缩短（连续 2 根减小，hist > 0）→ 顶部动能衰竭
-    let hist_shrinking_red = m_pp.histogram > m_prev.histogram
-        && m_prev.histogram > m.histogram
-        && m.histogram > 0.0;
+    let hist_shrinking_red =
+        m_pp.histogram > m_prev.histogram && m_prev.histogram > m.histogram && m.histogram > 0.0;
     // 绿柱缩短（连续 2 根负值绝对值减小，即 hist < 0 但越来越接近 0）→ 底部动能衰竭
-    let hist_shrinking_green = m_pp.histogram < m_prev.histogram
-        && m_prev.histogram < m.histogram
-        && m.histogram < 0.0;
+    let hist_shrinking_green =
+        m_pp.histogram < m_prev.histogram && m_prev.histogram < m.histogram && m.histogram < 0.0;
 
     // ============ 应用规则（优先级：强买 > 抄底 > 卖出 > 变盘提示）============
 
@@ -204,7 +212,10 @@ pub fn detect_boll_macd_signal(data: &[KlineData]) -> BollMacdSignal {
         && (div == DivergenceType::BullishBottom || (m.dif < 0.0 && hist_shrinking_green))
     {
         let reason = if div == DivergenceType::BullishBottom {
-            format!("下轨抄底：触下轨 ({:.2} ≤ {:.2}) + MACD 底背离", close, lower)
+            format!(
+                "下轨抄底：触下轨 ({:.2} ≤ {:.2}) + MACD 底背离",
+                close, lower
+            )
         } else {
             format!(
                 "下轨抄底：触下轨 ({:.2} ≤ {:.2}) + MACD 绿柱缩短 (hist {:+.3})",
@@ -214,18 +225,27 @@ pub fn detect_boll_macd_signal(data: &[KlineData]) -> BollMacdSignal {
         return BollMacdSignal {
             action: BollMacdAction::BottomBuy,
             reason,
-            close, upper, middle: mid, lower, band_width_pct, band_change_pct,
-            macd_dif: m.dif, macd_dea: m.dea, macd_hist: m.histogram, macd_div: div,
+            close,
+            upper,
+            middle: mid,
+            lower,
+            band_width_pct,
+            band_change_pct,
+            macd_dif: m.dif,
+            macd_dea: m.dea,
+            macd_hist: m.histogram,
+            macd_div: div,
             vol_ratio,
         };
     }
 
     // 规则 3：上轨减仓（必须配合 顶背离 / 红柱缩短 / 死叉）
-    if touch_upper
-        && (div == DivergenceType::BearishTop || hist_shrinking_red || death_cross)
-    {
+    if touch_upper && (div == DivergenceType::BearishTop || hist_shrinking_red || death_cross) {
         let reason = if div == DivergenceType::BearishTop {
-            format!("上轨减仓：触上轨 ({:.2} ≥ {:.2}) + MACD 顶背离", close, upper)
+            format!(
+                "上轨减仓：触上轨 ({:.2} ≥ {:.2}) + MACD 顶背离",
+                close, upper
+            )
         } else if death_cross {
             format!(
                 "上轨减仓：触上轨 + MACD 死叉 (DIF {:.3} < DEA {:.3})",
@@ -240,8 +260,16 @@ pub fn detect_boll_macd_signal(data: &[KlineData]) -> BollMacdSignal {
         return BollMacdSignal {
             action: BollMacdAction::TopSell,
             reason,
-            close, upper, middle: mid, lower, band_width_pct, band_change_pct,
-            macd_dif: m.dif, macd_dea: m.dea, macd_hist: m.histogram, macd_div: div,
+            close,
+            upper,
+            middle: mid,
+            lower,
+            band_width_pct,
+            band_change_pct,
+            macd_dif: m.dif,
+            macd_dea: m.dea,
+            macd_hist: m.histogram,
+            macd_div: div,
             vol_ratio,
         };
     }
@@ -254,8 +282,16 @@ pub fn detect_boll_macd_signal(data: &[KlineData]) -> BollMacdSignal {
                 "准备变盘：布林收口({:+.1}%) + MACD 0 轴附近 (DIF={:.3})",
                 band_change_pct, m.dif
             ),
-            close, upper, middle: mid, lower, band_width_pct, band_change_pct,
-            macd_dif: m.dif, macd_dea: m.dea, macd_hist: m.histogram, macd_div: div,
+            close,
+            upper,
+            middle: mid,
+            lower,
+            band_width_pct,
+            band_change_pct,
+            macd_dif: m.dif,
+            macd_dea: m.dea,
+            macd_hist: m.histogram,
+            macd_div: div,
             vol_ratio,
         };
     }
@@ -263,8 +299,16 @@ pub fn detect_boll_macd_signal(data: &[KlineData]) -> BollMacdSignal {
     BollMacdSignal {
         action: BollMacdAction::None,
         reason: String::new(),
-        close, upper, middle: mid, lower, band_width_pct, band_change_pct,
-        macd_dif: m.dif, macd_dea: m.dea, macd_hist: m.histogram, macd_div: div,
+        close,
+        upper,
+        middle: mid,
+        lower,
+        band_width_pct,
+        band_change_pct,
+        macd_dif: m.dif,
+        macd_dea: m.dea,
+        macd_hist: m.histogram,
+        macd_div: div,
         vol_ratio,
     }
 }

@@ -91,7 +91,9 @@ pub trait BrokerPush: Send + Sync {
 pub struct QmtBroker;
 
 impl BrokerPush for QmtBroker {
-    fn source(&self) -> BrokerSource { BrokerSource::Qmt }
+    fn source(&self) -> BrokerSource {
+        BrokerSource::Qmt
+    }
 
     fn push_st_type(&self, code: &str, st: BrokerStType) {
         log::warn!(
@@ -110,7 +112,9 @@ impl BrokerPush for QmtBroker {
 pub struct PublicDataBroker;
 
 impl BrokerPush for PublicDataBroker {
-    fn source(&self) -> BrokerSource { BrokerSource::PublicData }
+    fn source(&self) -> BrokerSource {
+        BrokerSource::PublicData
+    }
 
     fn push_st_type(&self, code: &str, st: BrokerStType) {
         // 公开数据: 调 DataFetcherManager 拉股票 name, 用 is_st_stock 推断
@@ -133,7 +137,9 @@ impl BrokerPush for PublicDataBroker {
 pub struct NoopBroker;
 
 impl BrokerPush for NoopBroker {
-    fn source(&self) -> BrokerSource { BrokerSource::Noop }
+    fn source(&self) -> BrokerSource {
+        BrokerSource::Noop
+    }
 
     fn push_st_type(&self, code: &str, st: BrokerStType) {
         log::warn!(
@@ -160,7 +166,10 @@ pub fn register(broker: Box<dyn BrokerPush>) {
     let src = broker.source();
     match BROKER.set(broker) {
         Ok(()) => log::info!("[broker] 已注册实现: {}", src.label()),
-        Err(_) => log::warn!("[broker] 重复 register({}) — 保留首次注册, 忽略", src.label()),
+        Err(_) => log::warn!(
+            "[broker] 重复 register({}) — 保留首次注册, 忽略",
+            src.label()
+        ),
     }
 }
 
@@ -171,7 +180,10 @@ pub fn with<F, R>(f: F) -> R
 where
     F: FnOnce(&dyn BrokerPush) -> R,
 {
-    let b: &dyn BrokerPush = BROKER.get().map(|b| &**b as &dyn BrokerPush).unwrap_or(&NOOP_REF);
+    let b: &dyn BrokerPush = BROKER
+        .get()
+        .map(|b| &**b as &dyn BrokerPush)
+        .unwrap_or(&NOOP_REF);
     f(b)
 }
 
@@ -228,9 +240,7 @@ pub fn detect_and_register() -> BrokerSource {
             BrokerSource::Noop
         }
         other => {
-            log::warn!(
-                "[broker] 未知 BROKER_SOURCE={other}, 降级到 public (东财/雅虎公开数据)"
-            );
+            log::warn!("[broker] 未知 BROKER_SOURCE={other}, 降级到 public (东财/雅虎公开数据)");
             register(Box::new(PublicDataBroker));
             BrokerSource::PublicData
         }

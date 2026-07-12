@@ -23,8 +23,14 @@ pub(super) fn compute_price_stats(data: &[KlineData]) -> PriceStats {
         if w < 5 {
             return (None, None, None);
         }
-        let h = data[..w].iter().map(|k| k.high).fold(f64::NEG_INFINITY, f64::max);
-        let l = data[..w].iter().map(|k| k.low).fold(f64::INFINITY, f64::min);
+        let h = data[..w]
+            .iter()
+            .map(|k| k.high)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let l = data[..w]
+            .iter()
+            .map(|k| k.low)
+            .fold(f64::INFINITY, f64::min);
         let pos = if (h - l).abs() > 0.001 {
             (data[0].close - l) / (h - l) * 100.0
         } else {

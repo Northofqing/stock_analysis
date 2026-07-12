@@ -138,7 +138,10 @@ pub fn simulate(signal: &PaperSignal) -> Result<PaperOutcome, String> {
         .map_err(|e| format!("DB 连接失败: {}", e))?;
 
     let esc = |s: &str| s.replace('\'', "''");
-    let fill_price = result.fill_price.map(|v| v.to_string()).unwrap_or_else(|| "NULL".to_string());
+    let fill_price = result
+        .fill_price
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "NULL".to_string());
     let not_fill_reason = result
         .not_fill_reason
         .as_deref()
@@ -250,7 +253,10 @@ mod tests {
         assert_eq!(PaperTradeStatus::Filled.as_str(), "Filled");
         assert_eq!(PaperTradeStatus::NotFilled.as_str(), "NotFilled");
         assert_eq!(PaperTradeStatus::Invalidated.as_str(), "Invalidated");
-        assert_eq!(PaperTradeStatus::SignalTriggered.as_str(), "SignalTriggered");
+        assert_eq!(
+            PaperTradeStatus::SignalTriggered.as_str(),
+            "SignalTriggered"
+        );
     }
 
     #[test]
@@ -282,14 +288,25 @@ mod tests {
         // inserted=false: plan_id 已存在 (rows_affected = 0, INSERT OR IGNORE 跳过)
         // 调用方: inserted=true 才启动 execution_tracking
         let inserted_true = PaperOutcome {
-            result: PaperResult { status: PaperTradeStatus::Filled, fill_price: Some(10.0), not_fill_reason: None },
+            result: PaperResult {
+                status: PaperTradeStatus::Filled,
+                fill_price: Some(10.0),
+                not_fill_reason: None,
+            },
             inserted: true,
         };
         let inserted_false = PaperOutcome {
-            result: PaperResult { status: PaperTradeStatus::NotFilled, fill_price: None, not_fill_reason: Some("涨停不可买".to_string()) },
+            result: PaperResult {
+                status: PaperTradeStatus::NotFilled,
+                fill_price: None,
+                not_fill_reason: Some("涨停不可买".to_string()),
+            },
             inserted: false,
         };
         assert!(inserted_true.inserted, "新建场景应 inserted=true");
-        assert!(!inserted_false.inserted, "重复 plan_id 应 inserted=false (避免假成功)");
+        assert!(
+            !inserted_false.inserted,
+            "重复 plan_id 应 inserted=false (避免假成功)"
+        );
     }
 }

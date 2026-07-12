@@ -11,11 +11,13 @@ use stock_analysis::opportunity::discover::Candidate;
 
 /// 修复 F15 (2026-06-29 BR-004): final_score 降序测试.
 /// 模拟 run_post_close_candidates 的 sort_by 逻辑, 验证排序正确性.
-fn sort_by_final_score_and_push_time(mut candidates: Vec<(Candidate, f64)>) -> Vec<(Candidate, f64)> {
+fn sort_by_final_score_and_push_time(
+    mut candidates: Vec<(Candidate, f64)>,
+) -> Vec<(Candidate, f64)> {
     candidates.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)  // final_score 降序
+        b.1.partial_cmp(&a.1) // final_score 降序
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.0.push_time.cmp(&b.0.push_time))  // 同分 push_time 升序
+            .then_with(|| a.0.push_time.cmp(&b.0.push_time)) // 同分 push_time 升序
     });
     candidates
 }
@@ -55,9 +57,15 @@ fn test_br004_tie_breaker_push_time_ascending() {
         (make_candidate("middle", 200), 50.0),
     ];
     let sorted = sort_by_final_score_and_push_time(candidates);
-    assert_eq!(sorted[0].0.code, "early", "同分时 push_time=100 (最早) 排第一");
+    assert_eq!(
+        sorted[0].0.code, "early",
+        "同分时 push_time=100 (最早) 排第一"
+    );
     assert_eq!(sorted[1].0.code, "middle");
-    assert_eq!(sorted[2].0.code, "late", "同分时 push_time=300 (最晚) 排最后");
+    assert_eq!(
+        sorted[2].0.code, "late",
+        "同分时 push_time=300 (最晚) 排最后"
+    );
 }
 
 #[test]
@@ -99,18 +107,14 @@ fn evaluate_opportunity_push_skip_reason(opp_text: &str) -> Option<&'static str>
 
 #[test]
 fn test_br005_skip_when_no_flash_news() {
-    let reason = evaluate_opportunity_push_skip_reason(
-        "📡 产业链扫描\n暂无最新快讯"
-    );
+    let reason = evaluate_opportunity_push_skip_reason("📡 产业链扫描\n暂无最新快讯");
     assert!(reason.is_some(), "无快讯应跳过推送");
     assert!(reason.unwrap().contains("暂无最新快讯"));
 }
 
 #[test]
 fn test_br005_skip_when_no_chain_match() {
-    let reason = evaluate_opportunity_push_skip_reason(
-        "📡 产业链扫描\n当前快讯未命中已知产业链"
-    );
+    let reason = evaluate_opportunity_push_skip_reason("📡 产业链扫描\n当前快讯未命中已知产业链");
     assert!(reason.is_some(), "未命中产业链应跳过推送");
     assert!(reason.unwrap().contains("当前快讯未命中已知产业链"));
 }
@@ -118,7 +122,7 @@ fn test_br005_skip_when_no_chain_match() {
 #[test]
 fn test_br005_skip_when_low_confidence() {
     let reason = evaluate_opportunity_push_skip_reason(
-        "📡 产业链扫描\n当前产业链信号可信度不足（已降级观察）"
+        "📡 产业链扫描\n当前产业链信号可信度不足（已降级观察）",
     );
     assert!(reason.is_some(), "可信度不足应跳过推送");
     assert!(reason.unwrap().contains("可信度不足"));
@@ -127,7 +131,7 @@ fn test_br005_skip_when_low_confidence() {
 #[test]
 fn test_br005_no_skip_when_normal_output() {
     let reason = evaluate_opportunity_push_skip_reason(
-        "📡 产业链扫描\n━━━━━━━━━━━━━━━━━━━━━━━━\n🔗 AI硬件-PCB\n受益标的：广立微(688214) +5.2%\n"
+        "📡 产业链扫描\n━━━━━━━━━━━━━━━━━━━━━━━━\n🔗 AI硬件-PCB\n受益标的：广立微(688214) +5.2%\n",
     );
     assert!(reason.is_none(), "正常产业链输出不应跳过推送");
 }
@@ -151,5 +155,8 @@ fn test_br005_daily_limit_5_NOT_IMPLEMENTED_placeholder() {
     //
     // 本测试作为 placeholder, 标记 BR-005 半完成. 真正实现后改为真测试.
     let limit_implemented = false;
-    assert!(!limit_implemented, "BR-005 每日 ≤5 限额当前未实现, 等 v9.4+");
+    assert!(
+        !limit_implemented,
+        "BR-005 每日 ≤5 限额当前未实现, 等 v9.4+"
+    );
 }

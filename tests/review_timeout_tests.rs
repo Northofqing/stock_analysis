@@ -27,11 +27,12 @@ async fn test_timeout_triggers_when_task_too_slow() {
 /// 验证正常任务不被 timeout 误杀.
 #[tokio::test]
 async fn test_normal_completion_under_timeout() {
-    let outcome: Result<&str, tokio::time::error::Elapsed> = tokio::time::timeout(
-        Duration::from_secs(5),
-        async { tokio::time::sleep(Duration::from_millis(50)).await; "ok" },
-    )
-    .await;
+    let outcome: Result<&str, tokio::time::error::Elapsed> =
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            "ok"
+        })
+        .await;
     assert_eq!(outcome.unwrap(), "ok");
 }
 
@@ -46,27 +47,39 @@ fn test_env_parsing_all_cases() {
     // Case 1: env 未设置 → 默认 300
     std::env::remove_var("MONITOR_REVIEW_TIMEOUT_SECS");
     let parsed: u64 = std::env::var("MONITOR_REVIEW_TIMEOUT_SECS")
-        .ok().and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(300);
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(300);
     assert_eq!(parsed, 300, "unset 应 fallback 到 300");
 
     // Case 2: env 覆盖 → 60
     std::env::set_var("MONITOR_REVIEW_TIMEOUT_SECS", "60");
     let parsed: u64 = std::env::var("MONITOR_REVIEW_TIMEOUT_SECS")
-        .ok().and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(300);
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(300);
     assert_eq!(parsed, 60, "env 覆盖应生效");
     std::env::remove_var("MONITOR_REVIEW_TIMEOUT_SECS");
 
     // Case 3: env 非法值 → 默认 300
     std::env::set_var("MONITOR_REVIEW_TIMEOUT_SECS", "abc");
     let parsed: u64 = std::env::var("MONITOR_REVIEW_TIMEOUT_SECS")
-        .ok().and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(300);
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(300);
     assert_eq!(parsed, 300, "非法值应 fallback");
     std::env::remove_var("MONITOR_REVIEW_TIMEOUT_SECS");
 
     // Case 4: env "0" → 默认 300 (filter n>0 兜底)
     std::env::set_var("MONITOR_REVIEW_TIMEOUT_SECS", "0");
     let parsed: u64 = std::env::var("MONITOR_REVIEW_TIMEOUT_SECS")
-        .ok().and_then(|s| s.parse().ok()).filter(|&n| n > 0).unwrap_or(300);
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(300);
     assert_eq!(parsed, 300, "0 应 fallback");
     std::env::remove_var("MONITOR_REVIEW_TIMEOUT_SECS");
 }

@@ -42,9 +42,23 @@ CLAMP_MAX=""
 CLAMP_A=$(grep -rn "event_risk_score" "$REPO_ROOT/src/" 2>/dev/null | \
   grep -oE "min\([0-9.]+\)" | grep -oE "[0-9.]+" | sort -rn | head -1 || echo "")
 
-# (b) 抓 clamp_max = ... { 数字 } else 模式
-CLAMP_B=$(grep -rn "clamp_max\s*=" "$SRC_DIR" 2>/dev/null | \
-  grep -oE "\{\s*[0-9.]+\s*\}" | grep -oE "[0-9.]+" | sort -rn | head -1 || echo "")
+# (b) 抓 clamp_max = ... 的完整表达式块, 支持多行 if/else:
+#     let clamp_max = if gray_open {
+#         70.0
+#     } else {
+#         (THRESHOLD_FALLBACK - 1.0).max(0.0)
+#     };
+CLAMP_B=$(awk '
+  /clamp_max[[:space:]]*=/ { in_block=1 }
+  in_block {
+    line=$0
+    while (match(line, /[0-9]+(\.[0-9]+)?/)) {
+      print substr(line, RSTART, RLENGTH)
+      line=substr(line, RSTART + RLENGTH)
+    }
+    if (line ~ /;/) { in_block=0 }
+  }
+' "$SRC_DIR"/*.rs 2>/dev/null | sort -rn | head -1 || echo "")
 
 # (c) 兜底: 抓注释 // 封顶 数字
 #     限制: 数字后必须接非数字 (避免抓到行号 "line 647")

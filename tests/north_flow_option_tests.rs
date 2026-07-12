@@ -2,7 +2,7 @@
 //! BR-012: 北向资金缺失必须显式标注, 禁止隐式 0.0.
 
 use stock_analysis::market_analyzer::async_overview::{
-    get_market_overview_blocking, generate_market_overview_text_blocking,
+    generate_market_overview_text_blocking, get_market_overview_blocking,
 };
 use stock_analysis::market_data::MarketOverview;
 
@@ -10,7 +10,10 @@ use stock_analysis::market_data::MarketOverview;
 #[test]
 fn test_market_overview_new_default_is_none() {
     let o = MarketOverview::new("2026-06-30".to_string());
-    assert!(o.north_flow.is_none(), "new() 应默认 None 而非 0.0 (BR-012)");
+    assert!(
+        o.north_flow.is_none(),
+        "new() 应默认 None 而非 0.0 (BR-012)"
+    );
 }
 
 /// 测试 2: get_market_overview_blocking 失败时, north_flow 仍保持 None (Err 路径)
@@ -22,7 +25,11 @@ fn test_blocking_overview_none_on_network_failure() {
         Ok(overview) => {
             // 成功: 检查 0.0 已被处理为 None
             if let Some(v) = overview.north_flow {
-                assert!(v.abs() > 0.001, "0.0 已被挡, 不应出现 Some(0.0): {:?}", overview.north_flow);
+                assert!(
+                    v.abs() > 0.001,
+                    "0.0 已被挡, 不应出现 Some(0.0): {:?}",
+                    overview.north_flow
+                );
             }
             // Some(正/负) 或 None 都接受
         }

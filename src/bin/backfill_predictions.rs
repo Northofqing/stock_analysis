@@ -50,17 +50,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
 
         for pred in pending {
-            let Some(code) = pred.stock_code.as_deref() else { continue; };
-            if code.is_empty() { continue; }
+            let Some(code) = pred.stock_code.as_deref() else {
+                continue;
+            };
+            if code.is_empty() {
+                continue;
+            }
 
             // 复用共享 verify 逻辑 (与生产盘后回填 verify_predictions 完全一致)
             let Some(outcome) = prediction::verify_one(
-                &db, code, &pred_date_s, &target_date_s, &pred.pred_direction,
-            ).await else { continue; };
+                db,
+                code,
+                &pred_date_s,
+                &target_date_s,
+                &pred.pred_direction,
+            )
+            .await
+            else {
+                continue;
+            };
 
-            db.update_prediction_result(&pred_date_s, Some(code), outcome.actual_change, outcome.hit)?;
+            db.update_prediction_result(
+                &pred_date_s,
+                Some(code),
+                outcome.actual_change,
+                outcome.hit,
+            )?;
             total += 1;
-            if outcome.hit { hit_count += 1; }
+            if outcome.hit {
+                hit_count += 1;
+            }
         }
     }
 
@@ -68,7 +87,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "[backfill] 完成: {} 条已 verify, 命中 {} 条 ({:.0}%)",
         total,
         hit_count,
-        if total > 0 { hit_count as f64 / total as f64 * 100.0 } else { 0.0 }
+        if total > 0 {
+            hit_count as f64 / total as f64 * 100.0
+        } else {
+            0.0
+        }
     );
 
     Ok(())

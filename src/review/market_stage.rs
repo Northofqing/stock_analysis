@@ -75,19 +75,28 @@ mod tests {
 
     #[test]
     fn effective_stage_high_confidence_unchanged() {
-        let m = MarketStage { stage: HeatStage::Climax, confidence: 0.8 };
+        let m = MarketStage {
+            stage: HeatStage::Climax,
+            confidence: 0.8,
+        };
         assert_eq!(m.effective_stage(), HeatStage::Climax);
     }
 
     #[test]
     fn effective_stage_low_confidence_climax_becomes_ferment() {
-        let m = MarketStage { stage: HeatStage::Climax, confidence: 0.4 };
+        let m = MarketStage {
+            stage: HeatStage::Climax,
+            confidence: 0.4,
+        };
         assert_eq!(m.effective_stage(), HeatStage::Ferment);
     }
 
     #[test]
     fn effective_stage_low_confidence_unknown_becomes_cold() {
-        let m = MarketStage { stage: HeatStage::Unknown, confidence: 0.3 };
+        let m = MarketStage {
+            stage: HeatStage::Unknown,
+            confidence: 0.3,
+        };
         assert_eq!(m.effective_stage(), HeatStage::Cold);
     }
 

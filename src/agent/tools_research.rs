@@ -1,3 +1,4 @@
+use crate::agent::tool::Tool;
 use async_trait::async_trait;
 use chrono::{Duration, Local};
 use futures::future::join_all;
@@ -5,7 +6,6 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use crate::agent::tool::Tool;
 
 /// 详情页最多并发拉取条数（接口比较慢，控制一下）
 const DETAIL_FETCH_TOP_N: usize = 5;
@@ -83,7 +83,8 @@ impl Tool for FetchResearchTool {
     }
 
     async fn call(&self, input: serde_json::Value) -> anyhow::Result<String> {
-        let code = input.get("code")
+        let code = input
+            .get("code")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'code' parameter"))?;
 
@@ -98,7 +99,10 @@ impl Tool for FetchResearchTool {
             begin,
             end,
             code,
-            end.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis()
+            end.and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp_millis()
         );
         log::debug!("[研报] {}", url);
 
@@ -112,7 +116,11 @@ impl Tool for FetchResearchTool {
         let body: EmReportResponse = match resp {
             Ok(r) => match r.json().await {
                 Ok(v) => v,
-                Err(e) => return Ok(json!({"error": format!("研报接口 JSON 解析失败: {}", e)}).to_string()),
+                Err(e) => {
+                    return Ok(
+                        json!({"error": format!("研报接口 JSON 解析失败: {}", e)}).to_string()
+                    )
+                }
             },
             Err(e) => return Ok(json!({"error": format!("研报接口请求失败: {}", e)}).to_string()),
         };
@@ -122,7 +130,8 @@ impl Tool for FetchResearchTool {
         }
 
         // 评级分布统计
-        let mut rating_counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        let mut rating_counts: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
         for r in &body.data {
             if !r.em_rating_name.is_empty() {
                 *rating_counts.entry(r.em_rating_name.clone()).or_insert(0) += 1;
@@ -152,7 +161,12 @@ impl Tool for FetchResearchTool {
             .data
             .iter()
             .map(|r| {
-                let date = r.publish_date.split(' ').next().unwrap_or(&r.publish_date).to_string();
+                let date = r
+                    .publish_date
+                    .split(' ')
+                    .next()
+                    .unwrap_or(&r.publish_date)
+                    .to_string();
                 let institution = if !r.org_short_name.is_empty() {
                     r.org_short_name.clone()
                 } else {
@@ -206,9 +220,7 @@ async fn fetch_report_summary(client: &reqwest::Client, info_code: &str) -> Opti
     let content_html = body
         .pointer("/data/content")
         .and_then(|v| v.as_str())
-        .or_else(|| {
-            body.pointer("/data/0/content").and_then(|v| v.as_str())
-        })
+        .or_else(|| body.pointer("/data/0/content").and_then(|v| v.as_str()))
         .unwrap_or("");
     if content_html.is_empty() {
         return None;
@@ -217,7 +229,8 @@ async fn fetch_report_summary(client: &reqwest::Client, info_code: &str) -> Opti
     Some(html_to_plain_text(content_html, SUMMARY_MAX_CHARS))
 }
 
-static RE_BLOCK: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?is)<(script|style)[^>]*>.*?</\1>").unwrap());
+static RE_BLOCK: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?is)<(script|style)[^>]*>.*?</\1>").unwrap());
 static RE_TAG: Lazy<Regex> = Lazy::new(|| Regex::new(r"<[^>]+>").unwrap());
 static RE_WS: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").unwrap());
 

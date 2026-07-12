@@ -23,23 +23,34 @@ use std::path::PathBuf;
 
 use crate::data_provider::KlineData;
 
-pub mod core;
+pub mod boll_macd;
 pub mod bollinger_zscore;
+pub mod contrarian;
+pub mod core;
 pub mod lot;
 pub mod multi_factor;
-pub mod rsi;
-pub mod contrarian;
-pub mod boll_macd;
 pub mod multi_timeframe;
+pub mod rsi;
 
-pub use rsi::{RsiStrategy, RsiConfig, RsiBacktest, RsiResult, SingleRsiResult};
-pub use rsi::{PrecisionRsiStrategy, PrecisionRsiConfig, PrecisionRsiBacktest, PrecisionRsiResult, SinglePrecisionRsiResult};
-pub use bollinger_zscore::{BollingerZScoreStrategy, BollingerZScoreConfig, BollingerZScoreBacktest, BollingerZScoreResult, SingleBacktestResult};
-pub use multi_factor::{MultiFactorStrategy, MultiFactorEngine, MultiFactorConfig, StockFactors, StockScore, Factor, FactorDirection};
-pub use core::{BacktestSummary, BacktestState, BacktestEngine, BacktestConfig, Trade, TradeAction, Position};
-pub use contrarian::{detect_contrarian_signal, ContrarianSignal};
 pub use boll_macd::{detect_boll_macd_signal, BollMacdAction, BollMacdSignal};
+pub use bollinger_zscore::{
+    BollingerZScoreBacktest, BollingerZScoreConfig, BollingerZScoreResult, BollingerZScoreStrategy,
+    SingleBacktestResult,
+};
+pub use contrarian::{detect_contrarian_signal, ContrarianSignal};
+pub use core::{
+    BacktestConfig, BacktestEngine, BacktestState, BacktestSummary, Position, Trade, TradeAction,
+};
+pub use multi_factor::{
+    Factor, FactorDirection, MultiFactorConfig, MultiFactorEngine, MultiFactorStrategy,
+    StockFactors, StockScore,
+};
 pub use multi_timeframe::{assess_entry as assess_multi_timeframe_entry, EntryAssessment};
+pub use rsi::{
+    PrecisionRsiBacktest, PrecisionRsiConfig, PrecisionRsiResult, PrecisionRsiStrategy,
+    SinglePrecisionRsiResult,
+};
+pub use rsi::{RsiBacktest, RsiConfig, RsiResult, RsiStrategy, SingleRsiResult};
 
 // ────────────────────────────── 通用信号类型 ──────────────────────────────
 

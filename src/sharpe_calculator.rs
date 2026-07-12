@@ -95,7 +95,7 @@ pub fn calculate_rolling_sharpe(
     risk_free_rate: Option<f64>,
 ) -> Option<f64> {
     let window = window_size.unwrap_or(60);
-    
+
     if kline_data.len() < window {
         // 数据不足，使用全部数据计算
         return calculate_sharpe_ratio(kline_data, risk_free_rate, None);
@@ -130,11 +130,7 @@ pub fn update_sharpe_ratios(
 
         let start_idx = if i + 1 >= window { i + 1 - window } else { 0 };
         let window_data = &kline_data[start_idx..=i];
-        
-        kline_data[i].sharpe_ratio = calculate_sharpe_ratio(
-            window_data,
-            Some(risk_free),
-            None,
-        );
+
+        kline_data[i].sharpe_ratio = calculate_sharpe_ratio(window_data, Some(risk_free), None);
     }
 }

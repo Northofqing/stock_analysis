@@ -24,11 +24,7 @@ async fn post_close_prefers_baostock() {
     assert!(
         matches!(
             src,
-            "baostock"
-                | "sina_hq"
-                | "tencent_qfq"
-                | "eastmoney_qfq"
-                | "rustdx_none"
+            "baostock" | "sina_hq" | "tencent_qfq" | "eastmoney_qfq" | "rustdx_none"
         ),
         "source 必须在盘后链或 5-way 链中, 实际={}",
         src
@@ -38,7 +34,9 @@ async fn post_close_prefers_baostock() {
 
 /// 回归保护: BaostockProvider 单独能拉数据 (Task 6 已测, 这里测 round-trip).
 /// 若此测试 PASS 但上条 FAIL, 说明 fallback 链未集成 Baostock.
+/// 网络依赖, 默认跳过; 手动跑: cargo test --test fallback_post_close_test -- --ignored
 #[tokio::test]
+#[ignore]
 async fn baostock_provider_direct_fetch_works() {
     let data = BaostockProvider::new()
         .fetch_kline_async("600000", 5)

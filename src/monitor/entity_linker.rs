@@ -36,9 +36,15 @@ impl EntityLinker {
             name_index: HashMap::new(),
             concept_index: HashMap::new(),
             noise_patterns: vec![
-                "供应商".into(), "客户".into(), "竞争对手".into(),
-                "合作方".into(), "参股".into(), "关联方".into(),
-                "行业".into(), "板块".into(), "概念股".into(),
+                "供应商".into(),
+                "客户".into(),
+                "竞争对手".into(),
+                "合作方".into(),
+                "参股".into(),
+                "关联方".into(),
+                "行业".into(),
+                "板块".into(),
+                "概念股".into(),
             ],
             name_to_code: HashMap::new(),
         };
@@ -50,7 +56,8 @@ impl EntityLinker {
     fn load_from_env(&mut self) {
         if let Ok(codes) = crate::portfolio::get_all_codes() {
             for code in codes {
-                self.code_to_name.insert(code.clone(), format!("股票{}", code));
+                self.code_to_name
+                    .insert(code.clone(), format!("股票{}", code));
             }
         }
     }
@@ -61,17 +68,26 @@ impl EntityLinker {
         // 全名→代码反向索引
         self.name_to_code.insert(name.to_string(), code.to_string());
         // 全名索引
-        self.name_index.entry(name.to_string()).or_default().push(code.to_string());
+        self.name_index
+            .entry(name.to_string())
+            .or_default()
+            .push(code.to_string());
         // 简称（去后缀/前缀）
         let short = shorten_name(name);
         if short != name && short.chars().count() >= 2 {
-            self.name_index.entry(short).or_default().push(code.to_string());
+            self.name_index
+                .entry(short)
+                .or_default()
+                .push(code.to_string());
         }
         // 前2字片段（最简匹配，仅短名生效）
         if name.chars().count() >= 3 {
             let prefix: String = name.chars().take(3).collect();
             if !self.name_index.contains_key(&prefix) {
-                self.name_index.entry(prefix).or_default().push(code.to_string());
+                self.name_index
+                    .entry(prefix)
+                    .or_default()
+                    .push(code.to_string());
             }
         }
     }
@@ -110,7 +126,8 @@ impl EntityLinker {
 
     /// 注册概念关联
     pub fn register_concept(&mut self, concept: &str, codes: &[String]) {
-        self.concept_index.insert(concept.to_string(), codes.to_vec());
+        self.concept_index
+            .insert(concept.to_string(), codes.to_vec());
     }
 
     /// 检查股票是否在持仓/自选池中（L1 硬匹配）
@@ -146,8 +163,10 @@ impl EntityLinker {
                 let conf = self.check_noise(text, name);
                 if conf > 0.0 {
                     hits.push(EntityHit {
-                        code: code.clone(), name: name.clone(),
-                        confidence: conf, reason: "全名匹配".into(),
+                        code: code.clone(),
+                        name: name.clone(),
+                        confidence: conf,
+                        reason: "全名匹配".into(),
                     });
                 }
             }
@@ -157,7 +176,9 @@ impl EntityLinker {
         let mut keys: Vec<&String> = self.name_index.keys().collect();
         keys.sort_by(|a, b| b.chars().count().cmp(&a.chars().count()));
         for short in keys {
-            if short.chars().count() < 2 { continue; }
+            if short.chars().count() < 2 {
+                continue;
+            }
             if text.contains(short.as_str()) {
                 for code in &self.name_index[short] {
                     if seen.insert(code.clone()) {
@@ -165,8 +186,10 @@ impl EntityLinker {
                         let conf = self.check_noise(text, &name) * 0.85;
                         if conf > 0.0 {
                             hits.push(EntityHit {
-                                code: code.clone(), name,
-                                confidence: conf, reason: format!("片段'{}'匹配", short),
+                                code: code.clone(),
+                                name,
+                                confidence: conf,
+                                reason: format!("片段'{}'匹配", short),
                             });
                         }
                         break; // 一个片段只匹配一次
@@ -182,8 +205,10 @@ impl EntityLinker {
                     if seen.insert(code.clone()) {
                         let name = self.code_to_name.get(code).cloned().unwrap_or_default();
                         hits.push(EntityHit {
-                            code: code.clone(), name,
-                            confidence: 0.4, reason: format!("概念'{}'关联", concept),
+                            code: code.clone(),
+                            name,
+                            confidence: 0.4,
+                            reason: format!("概念'{}'关联", concept),
                         });
                     }
                 }
@@ -229,16 +254,33 @@ impl EntityLinker {
 }
 
 impl Default for EntityLinker {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// 提取简称（去后缀/前缀）
 fn shorten_name(name: &str) -> String {
-    let suffixes = ["科技", "集团", "股份", "控股", "实业", "产业", "电子", "医药", "电气", "汽车", "通信", "传媒"];
-    let prefixes = ["贵州", "云南", "四川", "山东", "江苏", "浙江", "广东", "福建", "深圳", "上海", "北京"];
+    let suffixes = [
+        "科技", "集团", "股份", "控股", "实业", "产业", "电子", "医药", "电气", "汽车", "通信",
+        "传媒",
+    ];
+    let prefixes = [
+        "贵州", "云南", "四川", "山东", "江苏", "浙江", "广东", "福建", "深圳", "上海", "北京",
+    ];
     let mut s = name.to_string();
-    for sfx in &suffixes { if s.ends_with(sfx) && s.len() > sfx.len() + 2 { s = s[..s.len()-sfx.len()].into(); break; } }
-    for pfx in &prefixes { if s.starts_with(pfx) && s.len() > pfx.len() + 1 { s = s[pfx.len()..].into(); break; } }
+    for sfx in &suffixes {
+        if s.ends_with(sfx) && s.len() > sfx.len() + 2 {
+            s = s[..s.len() - sfx.len()].into();
+            break;
+        }
+    }
+    for pfx in &prefixes {
+        if s.starts_with(pfx) && s.len() > pfx.len() + 1 {
+            s = s[pfx.len()..].into();
+            break;
+        }
+    }
     s
 }
 

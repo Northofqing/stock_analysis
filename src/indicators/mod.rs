@@ -33,7 +33,7 @@ mod cross;
 mod divergence;
 mod kdj;
 mod macd;
-mod multi_period;  // v10 P3 G1: 多周期确认 (日/周/月本地聚合, 不新数据源)
+mod multi_period; // v10 P3 G1: 多周期确认 (日/周/月本地聚合, 不新数据源)
 mod rsi;
 mod skdj;
 
@@ -139,11 +139,7 @@ impl Default for IndicatorAnalysis {
 /// 运行完整的指标分析
 ///
 /// `highs`, `lows`, `closes` 按时间升序排列，长度一致。
-pub fn analyze_indicators(
-    highs: &[f64],
-    lows: &[f64],
-    closes: &[f64],
-) -> IndicatorAnalysis {
+pub fn analyze_indicators(highs: &[f64], lows: &[f64], closes: &[f64]) -> IndicatorAnalysis {
     let mut result = IndicatorAnalysis::default();
     let len = closes.len();
     if len < 30 {
@@ -330,17 +326,11 @@ pub fn analyze_indicators(
     // 共振加分（重要信号）
     if result.golden_cross_resonance {
         score += 15;
-        signals.push(format!(
-            "🚀 金叉共振！{}指标同时金叉",
-            golden_count
-        ));
+        signals.push(format!("🚀 金叉共振！{}指标同时金叉", golden_count));
     }
     if result.death_cross_resonance {
         score -= 15;
-        signals.push(format!(
-            "💀 死叉共振！{}指标同时死叉",
-            death_count
-        ));
+        signals.push(format!("💀 死叉共振！{}指标同时死叉", death_count));
     }
     if result.bottom_divergence_resonance {
         score += 15;
@@ -368,20 +358,41 @@ pub fn format_indicator_analysis(a: &IndicatorAnalysis) -> String {
         "=== 技术指标分析 ===".to_string(),
         String::new(),
         "📊 MACD:".to_string(),
-        format!("   DIF: {:.4}  DEA: {:.4}  柱: {:.4}", a.macd_dif, a.macd_dea, a.macd_histogram),
-        format!("   交叉: {}  背离: {}", a.macd_cross, a.macd_divergence.divergence),
+        format!(
+            "   DIF: {:.4}  DEA: {:.4}  柱: {:.4}",
+            a.macd_dif, a.macd_dea, a.macd_histogram
+        ),
+        format!(
+            "   交叉: {}  背离: {}",
+            a.macd_cross, a.macd_divergence.divergence
+        ),
         String::new(),
         "📊 KDJ:".to_string(),
         format!("   K: {:.1}  D: {:.1}  J: {:.1}", a.kdj_k, a.kdj_d, a.kdj_j),
-        format!("   交叉: {}  背离: {}", a.kdj_cross, a.kdj_divergence.divergence),
+        format!(
+            "   交叉: {}  背离: {}",
+            a.kdj_cross, a.kdj_divergence.divergence
+        ),
         String::new(),
         "📊 RSI:".to_string(),
-        format!("   RSI6: {:.1}  RSI12: {:.1}  RSI24: {:.1}", a.rsi6, a.rsi12, a.rsi24),
-        format!("   交叉: {}  背离: {}", a.rsi_cross, a.rsi_divergence.divergence),
+        format!(
+            "   RSI6: {:.1}  RSI12: {:.1}  RSI24: {:.1}",
+            a.rsi6, a.rsi12, a.rsi24
+        ),
+        format!(
+            "   交叉: {}  背离: {}",
+            a.rsi_cross, a.rsi_divergence.divergence
+        ),
         String::new(),
         "🎯 共振判断:".to_string(),
-        format!("   金叉共振: {}  死叉共振: {}", a.golden_cross_resonance, a.death_cross_resonance),
-        format!("   底背离共振: {}  顶背离共振: {}", a.bottom_divergence_resonance, a.top_divergence_resonance),
+        format!(
+            "   金叉共振: {}  死叉共振: {}",
+            a.golden_cross_resonance, a.death_cross_resonance
+        ),
+        format!(
+            "   底背离共振: {}  顶背离共振: {}",
+            a.bottom_divergence_resonance, a.top_divergence_resonance
+        ),
         format!("   指标评分: {}/100", a.indicator_score),
     ];
 

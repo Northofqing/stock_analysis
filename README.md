@@ -127,6 +127,15 @@ cargo run --bin monitor
 # --review 盘后复盘模式
 ```
 
+**启动前 operator 认证 (CR-AUTH / BR-028, 默认禁用)**: 监控启动时通过系统 PAM 验证当前 Unix 用户的密码.
+- **默认禁用**: `MONITOR_AUTH_REQUIRED` 未设或 != "1" → 跳过认证 (单机 single-user 不打扰)
+- **opt-in 启用**: `MONITOR_AUTH_REQUIRED=1` 启用 PAM 认证闸
+- 默认用户名 = `MONITOR_OPERATOR` env (或当前 Unix user via `whoami` crate)
+- 密码不回显 (用 `rpassword` crate)
+- 3 次密码错 → `exit 1` 拒绝启动 (PAM 系统级 `fail_delay` 锁定阈值对齐)
+- 非 TTY (CI/CD / cron) → 拒绝启动 (fail closed), 须 `MONITOR_AUTH_REQUIRED=0` 跳过 (默认即跳过)
+- 后台部署示例: `MONITOR_AUTH_REQUIRED=1 MONITOR_OPERATOR=trader ssh -t user@host cargo run --bin monitor` (ssh -t 强制 TTY)
+
 实时检测：
 - **涨跌停**（含 ST 严格正则 + 新股 5 日识别）
 - **资金异常**（主力单日净流出 > 5000 万）

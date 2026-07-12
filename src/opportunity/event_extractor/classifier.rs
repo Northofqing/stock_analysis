@@ -1,5 +1,5 @@
 use crate::analyzer::{AgentMode, GeminiAnalyzer};
-use crate::signal::market_event::{EventType, Direction};
+use crate::signal::market_event::{Direction, EventType};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -49,7 +49,11 @@ impl EventClassifier {
     ) -> ClassifierOutput {
         let prompt = Self::build_prompt(title, body);
         match gemini
-            .call_api_mode(&prompt, "你是 A 股事件分类专家。只输出 JSON。", AgentMode::Quick)
+            .call_api_mode(
+                &prompt,
+                "你是 A 股事件分类专家。只输出 JSON。",
+                AgentMode::Quick,
+            )
             .await
         {
             Ok(text) => Self::parse_response(&text).unwrap_or(ClassifierOutput {

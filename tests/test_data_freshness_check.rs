@@ -68,9 +68,11 @@ fn test_data_freshness_check_fails_on_stale_data() {
     // 输出 status 必须检查 — 否则 sqlite3 不可用时静默跳过会让测试误通过.
     let create_output = Command::new("sqlite3")
         .arg(&fixture_db)
-        .arg("CREATE TABLE IF NOT EXISTS stock_daily (date TEXT); \
+        .arg(
+            "CREATE TABLE IF NOT EXISTS stock_daily (date TEXT); \
               DELETE FROM stock_daily; \
-              INSERT INTO stock_daily VALUES ('2026-01-01');")
+              INSERT INTO stock_daily VALUES ('2026-01-01');",
+        )
         .output()
         .expect("应能跑 sqlite3 (测试前置条件)");
 

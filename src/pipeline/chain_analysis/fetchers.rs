@@ -7,7 +7,6 @@
 
 //! 子模块互见: 在 mod.rs 把 fetchers 声明为 super 模块, 这里用 super::xxx 调入 fetchers.
 
-use anyhow::Result;
 use futures::stream::{self, StreamExt};
 use log::{info, warn};
 use serde_json::json;
@@ -17,9 +16,7 @@ use crate::agent::tool::Tool;
 use crate::agent::tools_sector::FetchSectorTool;
 use crate::analyzer::{AgentMode, GeminiAnalyzer};
 use crate::database::DatabaseManager;
-use crate::lhb_analyzer::LhbDataFetcher;
 use crate::market_data::TopStock;
-use crate::search_service::{SearchResult, SearchService};
 
 use super::ChainCluster;
 // PUSH2_HOSTS 在 mod.rs 用 pub(crate) 暴露
@@ -153,7 +150,10 @@ pub(super) async fn push2_get(
         let resp = client
             .get(&url)
             .query(params)
-            .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+            )
             .header("Referer", "https://quote.eastmoney.com/")
             .send()
             .await;
@@ -239,7 +239,11 @@ pub(super) async fn fetch_laggard_candidates(
             ..Default::default()
         });
     }
-    out.sort_by(|a, b| b.change_pct.partial_cmp(&a.change_pct).unwrap_or(std::cmp::Ordering::Equal));
+    out.sort_by(|a, b| {
+        b.change_pct
+            .partial_cmp(&a.change_pct)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     out.truncate(8);
     out
 }
@@ -279,14 +283,14 @@ pub(super) async fn fetch_after_market_catalysts(top_themes: &[&str]) -> String 
 
     // 对TOP主线逐个搜最新催化
     for theme in top_themes.iter().take(5) {
-        if items.len() >= 10 { break; }
+        if items.len() >= 10 {
+            break;
+        }
         let q = format!("{} {} 最新 突发 催化", today_str, theme);
-        let results = tokio::time::timeout(
-            std::time::Duration::from_secs(8),
-            svc.search_topic(&q, 2),
-        )
-        .await
-        .unwrap_or_default();
+        let results =
+            tokio::time::timeout(std::time::Duration::from_secs(8), svc.search_topic(&q, 2))
+                .await
+                .unwrap_or_default();
         for r in results {
             let date = r.published_date.as_deref().unwrap_or("");
             let snippet: String = r.snippet.chars().take(100).collect();
@@ -391,7 +395,10 @@ pub(super) async fn fetch_cluster_news(
                 }
             }
         }
-        Err(e) => warn!("[产业链] 主线「{}」催化搜索词生成失败: {}", cluster.concept, e),
+        Err(e) => warn!(
+            "[产业链] 主线「{}」催化搜索词生成失败: {}",
+            cluster.concept, e
+        ),
     }
     log::debug!("[产业链] 主线「{}」检索词: {:?}", cluster.concept, queries);
 
@@ -429,4 +436,3 @@ pub(super) async fn fetch_cluster_news(
     }
     items.join("\n")
 }
-

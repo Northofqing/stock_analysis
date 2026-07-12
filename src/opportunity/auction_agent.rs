@@ -145,7 +145,10 @@ pub fn run_auction_agent(
         // 当前 P0 阶段 dry-run, 但结构上必须有 veto 钩子 (切换实盘时无需重构)
         // BUG FIX (codex B2): 之前直接调 save_prediction, 违反 §2.6 MUST
         if !veto_check_auction_anomaly(r) {
-            warn!("[AuctionAgent] veto_chain 拒绝: {} (BR-005/006/008 等)", r.code);
+            warn!(
+                "[AuctionAgent] veto_chain 拒绝: {} (BR-005/006/008 等)",
+                r.code
+            );
             record.error = Some("veto_chain 拒绝".to_string());
             record.written = false;
             report.records.push(record);
@@ -162,7 +165,9 @@ pub fn run_auction_agent(
 
         // 3. 调 save_prediction, reason = AuctionAnomaly
         let today = Local::now().format("%Y-%m-%d").to_string();
-        let tomorrow = (Local::now() + chrono::Duration::days(1)).format("%Y-%m-%d").to_string();
+        let tomorrow = (Local::now() + chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
         let direction = if r.gap_pct > 0.0 { "看多" } else { "看空" };
         // 简单 score: 高开 + 量比 加权 (与 v9 类似)
         let score = (r.gap_pct.abs() * 10.0 + r.vol_ratio * 5.0).min(100.0);
@@ -173,12 +178,15 @@ pub fn run_auction_agent(
                 &today,
                 &tomorrow,
                 Some("auction"), // theme_name
-                Some(&r.code),    // stock_code
+                Some(&r.code),   // stock_code
                 direction,
                 score,
-                Some(&format!("auction gap={:.2}% vol={:.2}", r.gap_pct, r.vol_ratio)),
+                Some(&format!(
+                    "auction gap={:.2}% vol={:.2}",
+                    r.gap_pct, r.vol_ratio
+                )),
                 Some(VirtualReason::AuctionAnomaly.as_str()), // reason (主)
-                None,                                          // reason_secondary
+                None,                                         // reason_secondary
             )
         });
 
@@ -207,7 +215,9 @@ pub fn run_auction_agent(
     let total = report.written as usize;
     if total > 0 {
         let sample_check = DatabaseManager::try_get().map(|db| {
-            let reason_count = db.count_predictions_by_reason("AuctionAnomaly").unwrap_or(0) as usize;
+            let reason_count = db
+                .count_predictions_by_reason("AuctionAnomaly")
+                .unwrap_or(0) as usize;
             let total_pred = db.count_predictions().unwrap_or(0) as usize;
             (reason_count, total_pred)
         });
@@ -297,7 +307,10 @@ mod tests {
         };
         let report = run_auction_agent(&results, &cfg);
         assert_eq!(report.scanned, 3);
-        assert_eq!(report.abnormal, 2, "应识别 2 个异常 (000001 高开 + 000003 低开)");
+        assert_eq!(
+            report.abnormal, 2,
+            "应识别 2 个异常 (000001 高开 + 000003 低开)"
+        );
         assert_eq!(report.written, 0, "dry_run 不写 DB");
         let abnormal_records: Vec<&AuctionAgentRecord> =
             report.records.iter().filter(|r| r.abnormal).collect();
