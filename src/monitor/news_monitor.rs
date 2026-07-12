@@ -16,17 +16,32 @@ use std::collections::HashSet;
 // ── 消息类型 ──
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NewsType { Flash, Policy, Announcement, Research }
+pub enum NewsType {
+    Flash,
+    Policy,
+    Announcement,
+    Research,
+}
 
 impl NewsType {
     /// 衰减策略：快讯正常衰减，政策/公告开盘前不衰减
     pub fn decay_lambda(&self) -> f64 {
-        match self { NewsType::Flash => 0.05, NewsType::Policy => 0.0, NewsType::Announcement => 0.0, NewsType::Research => 0.005 }
+        match self {
+            NewsType::Flash => 0.05,
+            NewsType::Policy => 0.0,
+            NewsType::Announcement => 0.0,
+            NewsType::Research => 0.005,
+        }
     }
 
     /// 开盘后衰减系数（政策/公告在 09:30 后切换到正常衰减）
     pub fn post_open_lambda(&self) -> f64 {
-        match self { NewsType::Flash => 0.05, NewsType::Policy => 0.01, NewsType::Announcement => 0.01, NewsType::Research => 0.005 }
+        match self {
+            NewsType::Flash => 0.05,
+            NewsType::Policy => 0.01,
+            NewsType::Announcement => 0.01,
+            NewsType::Research => 0.005,
+        }
     }
 }
 
@@ -83,8 +98,13 @@ impl NewsMonitor {
             info!("[NewsMonitor] 注册 {} 只自选股", watchlist_count);
         }
         Self {
-            linker, seen_titles: HashSet::new(), passive_count_today: 0,
-            active_count_today: 0, emergency_count: 0, important_count: 0, info_count: 0,
+            linker,
+            seen_titles: HashSet::new(),
+            passive_count_today: 0,
+            active_count_today: 0,
+            emergency_count: 0,
+            important_count: 0,
+            info_count: 0,
         }
     }
 
@@ -117,35 +137,35 @@ impl NewsMonitor {
     ) -> Vec<AlertEvent> {
         let mut events = Vec::new();
         self.passive_count_today += anns.len() as u64;
+        // b011 P1-1: 漏斗计数 — 每级过滤器输出 进N→出M|丢弃原因分布
+        let mut drop_seen_dup: usize = 0;
+        let mut drop_no_match: usize = 0;
 
         for ann in anns {
             // review #14: char_indices().nth() 找第 40 字符的 byte 边界, 一次性扫描,
             // 避免 chars().take(40).collect::<String>() + format! 双重分配.
-            let title_prefix: &str = ann.title
+            let title_prefix: &str = ann
+                .title
                 .char_indices()
                 .nth(40)
                 .map(|(i, _)| &ann.title[..i])
                 .unwrap_or(&ann.title);
             let key = format!("ann:{title_prefix}");
-            if !self.seen_titles.insert(key) { continue; }
+            if !self.seen_titles.insert(key) {
+                drop_seen_dup += 1;
+                continue;
+            }
 
             // 实体关联（纯 CPU 计算，但输入短不需要 spawn_blocking）
             let hits = self.linker.link(&ann.title);
 
-            // 分级（L1/L2 匹配后再决定级别，Skip 不再提前过滤）
+            // 分级 (b013 P1-12: 计数移到 L1/L2 通过之后, 之前丢弃的公告不再膨胀 stats)
             let (level, cat) = match ann.level {
                 AnnLevel::Emergency => (AlertLevel::Emergency, AlertCategory::ChainRisk),
                 AnnLevel::Important => (AlertLevel::Important, AlertCategory::ChainRisk),
                 AnnLevel::Info => (AlertLevel::Info, AlertCategory::FlashNews),
-                AnnLevel::Skip => (AlertLevel::Info, AlertCategory::FlashNews), // L2匹配的公告用Info级
+                AnnLevel::Skip => (AlertLevel::Info, AlertCategory::FlashNews),
             };
-
-            match level {
-                AlertLevel::Emergency => self.emergency_count += 1,
-                AlertLevel::Important => self.important_count += 1,
-                AlertLevel::Info => self.info_count += 1,
-                // AlertLevel 只有 3 个变体, _ 分支不可达
-            }
 
             // 名称/代码兜底：API 有时返回空，从标题解析
             let name = if ann.name.is_empty() {
@@ -155,7 +175,9 @@ impl NewsMonitor {
             };
             let code = if ann.code.is_empty() {
                 // 层级1: 反向索引查全名（已缓存过的 name→code）
-                self.linker.lookup_code_by_name(&name).map(|s| s.to_string())
+                self.linker
+                    .lookup_code_by_name(&name)
+                    .map(|s| s.to_string())
                     // 层级2: entity_linker 模糊匹配（简称/片段）
                     .or_else(|| self.linker.link(&name).first().map(|h| h.code.clone()))
                     // 层级3: 外部预解析的 name→code（异步反查结果）
@@ -171,8 +193,8 @@ impl NewsMonitor {
             }
 
             // L1 实体过滤：代码/名称精确匹配持仓自选
-            let l1_match = self.linker.is_registered(&code, &name)
-                || hits.iter().any(|h| h.confidence > 0.8);
+            let l1_match =
+                self.linker.is_registered(&code, &name) || hits.iter().any(|h| h.confidence > 0.8);
 
             // L2 概念匹配：公告标题命中板块名 → 成份股里有我们的标的
             let mut l2_concept = String::new();
@@ -188,6 +210,7 @@ impl NewsMonitor {
             }
 
             if !l1_match && l2_concept.is_empty() {
+                drop_no_match += 1;
                 continue; // L1和L2都不匹配 → 丢弃
             }
 
@@ -195,7 +218,9 @@ impl NewsMonitor {
             // 先预算容量 (人均 ~30 字节), 减少 grow.
             let mut hit_summary = String::with_capacity(hits.len() * 32);
             for (i, h) in hits.iter().enumerate() {
-                if i > 0 { hit_summary.push_str(", "); }
+                if i > 0 {
+                    hit_summary.push_str(", ");
+                }
                 let _ = std::fmt::Write::write_fmt(
                     &mut hit_summary,
                     format_args!("{}({})", h.name, h.code),
@@ -211,6 +236,11 @@ impl NewsMonitor {
             // 标题中剥离公司名前缀（避免和header的公司名重复）
             let short_title = strip_company_prefix(&ann.title, &name);
 
+            match level {
+                AlertLevel::Emergency => self.emergency_count += 1,
+                AlertLevel::Important => self.important_count += 1,
+                AlertLevel::Info => self.info_count += 1,
+            }
             events.push(AlertEvent {
                 level,
                 category: cat,
@@ -218,8 +248,11 @@ impl NewsMonitor {
                 name,
                 message: format!("[公告] {} | {}", short_title, ann.reason),
                 detail: AlertDetail {
-                    price: None, change_pct: None, volume_ratio: None,
-                    main_flow_yi: None, threshold: None,
+                    price: None,
+                    change_pct: None,
+                    volume_ratio: None,
+                    main_flow_yi: None,
+                    threshold: None,
                     news_title: Some(ann.title.clone()),
                     news_summary: {
                         // 回退链：正文 → API摘要 → 标题内容
@@ -234,7 +267,9 @@ impl NewsMonitor {
                     },
                     ai_decision: None,
                     t1_locked: false,
-                    extra: if hit_summary.is_empty() { None } else {
+                    extra: if hit_summary.is_empty() {
+                        None
+                    } else {
                         Some(format!("命中: {hit_summary}"))
                     },
                 },
@@ -242,17 +277,36 @@ impl NewsMonitor {
             });
         }
 
+        // b011 P1-1: 漏斗可观测 — 32 条进 0 条出这类"静默归零"必须能一眼看出丢在哪级
+        if !anns.is_empty() {
+            log::info!(
+                "[公告漏斗] 实体关联: 进{} → 出{} | 已见重复={} L1/L2未命中={}",
+                anns.len(),
+                events.len(),
+                drop_seen_dup,
+                drop_no_match
+            );
+        }
         events
     }
 
     /// 对快讯文本做关联+分级（供外部轮询调用）。
     /// 支持重要性跳跃击穿：官方公告/标星快讯可突破30分钟去重缓存。
-    pub fn process_flash(&mut self, title: &str, source: &str, importance: u8) -> Option<AlertEvent> {
+    pub fn process_flash(
+        &mut self,
+        title: &str,
+        source: &str,
+        importance: u8,
+    ) -> Option<AlertEvent> {
         let key = format!("flash:{}", &title.chars().take(40).collect::<String>());
         // 击穿检测：来源升级或重要级跳跃
         let should_bypass = source.contains("公告") || importance >= 4;
-        if !should_bypass && !self.seen_titles.insert(key.clone()) { return None; }
-        if should_bypass { self.seen_titles.insert(key); }
+        if !should_bypass && !self.seen_titles.insert(key.clone()) {
+            return None;
+        }
+        if should_bypass {
+            self.seen_titles.insert(key);
+        }
         self.passive_count_today += 1;
 
         let hits = self.linker.link(title);
@@ -267,7 +321,10 @@ impl NewsMonitor {
             _ => return None,
         };
 
-        let hit_names: Vec<String> = hits.iter().map(|h| format!("{}({})", h.name, h.code)).collect();
+        let hit_names: Vec<String> = hits
+            .iter()
+            .map(|h| format!("{}({})", h.name, h.code))
+            .collect();
 
         Some(AlertEvent {
             level,
@@ -276,13 +333,20 @@ impl NewsMonitor {
             name: hits.first().map(|h| h.name.clone()).unwrap_or_default(),
             message: format!("[{}] {}", source, title),
             detail: AlertDetail {
-                price: None, change_pct: None, volume_ratio: None,
-                main_flow_yi: None, threshold: None,
+                price: None,
+                change_pct: None,
+                volume_ratio: None,
+                main_flow_yi: None,
+                threshold: None,
                 news_title: Some(title.to_string()),
                 news_summary: None,
                 ai_decision: None,
                 t1_locked: false,
-                extra: if hit_names.is_empty() { None } else { Some(format!("命中: {}", hit_names.join(", "))) },
+                extra: if hit_names.is_empty() {
+                    None
+                } else {
+                    Some(format!("命中: {}", hit_names.join(", ")))
+                },
             },
             triggered_at: Local::now(),
         })
@@ -292,8 +356,11 @@ impl NewsMonitor {
     pub fn stats(&self) -> String {
         format!(
             "被动{}条/主动{}条 | 🔴{} 🟠{} 🟡{}",
-            self.passive_count_today, self.active_count_today,
-            self.emergency_count, self.important_count, self.info_count
+            self.passive_count_today,
+            self.active_count_today,
+            self.emergency_count,
+            self.important_count,
+            self.info_count
         )
     }
 
@@ -314,7 +381,9 @@ impl NewsMonitor {
 
     /// 将 seen_titles 批量写入 news_dedup 表，每 5 分钟调用一次
     pub fn flush_dedup(&self) {
-        let Some(db) = crate::database::DatabaseManager::try_get() else { return; };
+        let Some(db) = crate::database::DatabaseManager::try_get() else {
+            return;
+        };
         let mut conn = match db.get_conn() {
             Ok(c) => c,
             Err(_) => return,
@@ -340,7 +409,9 @@ impl NewsMonitor {
 
     /// 启动时从 news_dedup 恢复今天的 seen_titles，清理过期 key
     pub fn restore_dedup(&mut self) {
-        let Some(db) = crate::database::DatabaseManager::try_get() else { return; };
+        let Some(db) = crate::database::DatabaseManager::try_get() else {
+            return;
+        };
         let mut conn = match db.get_conn() {
             Ok(c) => c,
             Err(_) => return,
@@ -348,14 +419,22 @@ impl NewsMonitor {
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         // 恢复今天的 key
         #[derive(QueryableByName, Debug)]
-        struct DedupKey { #[diesel(sql_type = diesel::sql_types::Text)] key: String }
+        struct DedupKey {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            key: String,
+        }
         let sql = format!("SELECT key FROM news_dedup WHERE created_at >= '{}'", today);
         if let Ok(rows) = diesel::sql_query(&sql).load::<DedupKey>(&mut *conn) {
-            for r in rows { self.seen_titles.insert(r.key); }
+            for r in rows {
+                self.seen_titles.insert(r.key);
+            }
         }
         // 清理非今天的过期 key
-        let _ = diesel::sql_query(&format!("DELETE FROM news_dedup WHERE created_at < '{}'", today))
-            .execute(&mut *conn);
+        let _ = diesel::sql_query(&format!(
+            "DELETE FROM news_dedup WHERE created_at < '{}'",
+            today
+        ))
+        .execute(&mut *conn);
     }
 }
 
@@ -365,25 +444,45 @@ pub fn refresh_concept_index_blocking(
     our_codes: &std::collections::HashSet<String>,
 ) -> Option<std::collections::HashMap<String, Vec<String>>> {
     use crate::market_analyzer::sector_monitor;
-    let mut new_index: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let mut new_index: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
 
     let boards = match sector_monitor::fetch_board_ranking("f3", 15) {
         Ok(b) => b,
-        Err(e) => { log::warn!("[NewsMonitor] 概念板块拉取失败: {}", e); return None; }
+        Err(e) => {
+            log::warn!("[NewsMonitor] 概念板块拉取失败: {}", e);
+            return None;
+        }
     };
-    if boards.is_empty() { return None; }
-    log::info!("[NewsMonitor] L2 拉取 {} 个概念板块，构建反向索引...", boards.len());
+    if boards.is_empty() {
+        return None;
+    }
+    log::info!(
+        "[NewsMonitor] L2 拉取 {} 个概念板块，构建反向索引...",
+        boards.len()
+    );
 
     for board in &boards {
         let stocks = match sector_monitor::fetch_board_components(&board.code, 30) {
             Ok(s) => s,
             Err(_) => continue,
         };
-        let matched: Vec<String> = stocks.iter()
-            .filter_map(|s| if our_codes.contains(&s.code) { Some(s.code.clone()) } else { None })
+        let matched: Vec<String> = stocks
+            .iter()
+            .filter_map(|s| {
+                if our_codes.contains(&s.code) {
+                    Some(s.code.clone())
+                } else {
+                    None
+                }
+            })
             .collect();
         if !matched.is_empty() {
-            log::info!("[NewsMonitor] L2 板块'{}'命中 {} 只标的", board.name, matched.len());
+            log::info!(
+                "[NewsMonitor] L2 板块'{}'命中 {} 只标的",
+                board.name,
+                matched.len()
+            );
             new_index.insert(board.name.clone(), matched);
         }
     }
@@ -391,7 +490,9 @@ pub fn refresh_concept_index_blocking(
 }
 
 impl Default for NewsMonitor {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // review #15: 委托给 util::truncate_chars (DRY, 之前 news_monitor + notification
@@ -421,7 +522,9 @@ fn parse_company_from_title(title: &str) -> String {
 
 /// 从标题中剥离公司名前缀（"达实智能:关于XXX" → "关于XXX"）
 fn strip_company_prefix(title: &str, name: &str) -> String {
-    if name.is_empty() { return title.to_string(); }
+    if name.is_empty() {
+        return title.to_string();
+    }
     // "公司名:内容" 或 "公司名：内容"
     for sep in [":", "："] {
         if let Some(rest) = title.strip_prefix(&format!("{}{}", name, sep)) {
@@ -437,7 +540,9 @@ fn strip_company_prefix(title: &str, name: &str) -> String {
 
 /// 通过东方财富搜索 API 反查股票代码（公司名 → 代码），异步版本
 pub async fn resolve_code_by_name(name: &str, client: &reqwest::Client) -> Option<String> {
-    if name.is_empty() || name.chars().count() < 2 { return None; }
+    if name.is_empty() || name.chars().count() < 2 {
+        return None;
+    }
     let url = format!(
         "https://searchapi.eastmoney.com/api/suggest/get?input={}&type=14&token=D43BF722C8E33BDC906FB84D85E326E8&count=3",
         urlencoding::encode(name)
@@ -446,7 +551,9 @@ pub async fn resolve_code_by_name(name: &str, client: &reqwest::Client) -> Optio
         .get(&url)
         .header("User-Agent", "Mozilla/5.0")
         .timeout(std::time::Duration::from_secs(3))
-        .send().await.ok()?;
+        .send()
+        .await
+        .ok()?;
     let body: serde_json::Value = resp.json().await.ok()?;
     body["Result"]["QuotationCodeTable"]["Data"]
         .as_array()?
@@ -454,12 +561,17 @@ pub async fn resolve_code_by_name(name: &str, client: &reqwest::Client) -> Optio
         .filter_map(|item| {
             let code = item["Code"].as_str()?;
             let market = item["MarketId"].as_str()?;
-            if code.len() == 6 && code.chars().all(|c| c.is_ascii_digit())
-                && !code.starts_with('8') && !code.starts_with('4') && !code.starts_with('9')
+            if code.len() == 6
+                && code.chars().all(|c| c.is_ascii_digit())
+                && !code.starts_with('8')
+                && !code.starts_with('4')
+                && !code.starts_with('9')
             {
                 let _ = market; // 仅保留A股
                 Some(code.to_string())
-            } else { None }
+            } else {
+                None
+            }
         })
         .next()
 }
@@ -471,7 +583,7 @@ mod tests {
     #[test]
     fn test_news_type_decay() {
         assert!((NewsType::Flash.decay_lambda() - 0.05).abs() < 0.01);
-        assert!((NewsType::Policy.decay_lambda() - 0.0).abs() < 0.01);  // 开盘前不衰减
+        assert!((NewsType::Policy.decay_lambda() - 0.0).abs() < 0.01); // 开盘前不衰减
         assert!((NewsType::Announcement.decay_lambda() - 0.0).abs() < 0.01);
         assert!((NewsType::Policy.post_open_lambda() - 0.01).abs() < 0.01); // 开盘后恢复
     }
@@ -525,12 +637,18 @@ mod tests {
 
     #[test]
     fn test_parse_company_from_colon_title() {
-        assert_eq!(parse_company_from_title("达实智能:关于控股股东及实际控制人股份解除质押的公告"), "达实智能");
+        assert_eq!(
+            parse_company_from_title("达实智能:关于控股股东及实际控制人股份解除质押的公告"),
+            "达实智能"
+        );
     }
 
     #[test]
     fn test_parse_company_from_guanyu_title() {
-        assert_eq!(parse_company_from_title("航天发展关于收到中标通知书的公告"), "航天发展");
+        assert_eq!(
+            parse_company_from_title("航天发展关于收到中标通知书的公告"),
+            "航天发展"
+        );
     }
 
     #[test]
@@ -540,32 +658,43 @@ mod tests {
 
     #[test]
     fn test_strip_company_colon_prefix() {
-        assert_eq!(strip_company_prefix("达实智能:关于股东股份解除质押的公告", "达实智能"), "关于股东股份解除质押的公告");
+        assert_eq!(
+            strip_company_prefix("达实智能:关于股东股份解除质押的公告", "达实智能"),
+            "关于股东股份解除质押的公告"
+        );
     }
 
     #[test]
     fn test_strip_company_guanyu_prefix() {
-        assert_eq!(strip_company_prefix("航天发展关于收到中标通知书的公告", "航天发展"), "关于收到中标通知书的公告");
+        assert_eq!(
+            strip_company_prefix("航天发展关于收到中标通知书的公告", "航天发展"),
+            "关于收到中标通知书的公告"
+        );
     }
 
     #[test]
     fn test_strip_company_no_match() {
-        assert_eq!(strip_company_prefix("关于召开股东大会的通知", "某公司"), "关于召开股东大会的通知");
+        assert_eq!(
+            strip_company_prefix("关于召开股东大会的通知", "某公司"),
+            "关于召开股东大会的通知"
+        );
     }
 
     #[test]
     fn test_process_ann_with_empty_code_name_parses_title() {
-        let _ = crate::database::DatabaseManager::init(Some(std::path::PathBuf::from("./test_data/test_ai.db")));
+        let _ = crate::database::DatabaseManager::init(Some(std::path::PathBuf::from(
+            "./test_data/test_ai.db",
+        )));
         let mut nm = NewsMonitor::new();
         nm.linker.register_position("002421", "达实智能"); // L1过滤需要
-        // 模拟API返回空code/name，但标题含公司名
+                                                           // 模拟API返回空code/name，但标题含公司名
         let ann = announcement::Announcement {
             code: String::new(),
             name: String::new(),
             title: "达实智能:关于股东股份解除质押的公告".into(),
             date: "2026-06-14".into(),
             summary: "编辑摘要内容".into(),
-            content: String::new(),  // 正文为空，回退到summary
+            content: String::new(), // 正文为空，回退到summary
             level: announcement::AnnLevel::Important,
             reason: "标题含'质押'".into(),
         };
@@ -580,7 +709,9 @@ mod tests {
 
     #[test]
     fn test_unrelated_stock_filtered_out() {
-        let _ = crate::database::DatabaseManager::init(Some(std::path::PathBuf::from("./test_data/test_ai.db")));
+        let _ = crate::database::DatabaseManager::init(Some(std::path::PathBuf::from(
+            "./test_data/test_ai.db",
+        )));
         let mut nm = NewsMonitor::new();
         // 科森科技不在持仓/自选 → L1过滤
         let ann = announcement::Announcement {

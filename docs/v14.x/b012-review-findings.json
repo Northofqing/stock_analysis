@@ -1,0 +1,122 @@
+[
+  {
+    "file": "src/bin/monitor/notify.rs",
+    "line": 541,
+    "summary": "push_governor 2-arg shim always passes code=None; collapses PerTicket L4 dedup keys for ALL production callers",
+    "failure_scenario": "PushKind::T0Advice/HoldingPlan/NewsToIdea/ForbiddenOps/PaperTrade etc. called via push_governor(text, kind) (30+ sites in main.rs + push_templates.rs) → push_governor_inner(text, kind, None) → v14_gate → CooldownScope::PerTicket + code=None → cooldown=None. Combined with deleted COOLDOWN_MEMO, per-ticket cooldowns (1800s HoldingPlan / 300s PaperTrade / 1200s NewsToIdea) are SILENTLY DISABLED in production. Rapid same-ticket re-pushes not blocked.",
+    "verdict": "CONFIRMED",
+    "category": "correctness"
+  },
+  {
+    "file": "src/bin/monitor/push_templates.rs",
+    "line": 5130,
+    "summary": "Shared template dispatch(kind, code, ...) receives stock code but never forwards it into v14_gate",
+    "failure_scenario": "push_holding_plan_recommendation(\"000001\", ...) and similar per-ticket templates enforce only local COOLDOWN_TABLE; v14 receives code=None, so L4 dedup + L7 analytics collapse to global (kind, \"\") key. Per-ticket event_id dedup impossible. Confirmed at lines 4227, 4286, 4368, 4428, 4487, 5130, 9365, 9516 etc.",
+    "verdict": "CONFIRMED",
+    "category": "correctness"
+  },
+  {
+    "file": "src/bin/monitor/v14_adapter.rs",
+    "line": 105,
+    "summary": "L4 dedup state recorded BEFORE L5 governance and BEFORE sink delivery; denied/failed attempts block later real pushes",
+    "failure_scenario": "DailyReport at 05:59 enters dispatcher.dispatch first → inserts cooldown key. Then governance denies quiet_hour OR sink returns false. Later retry at 06:01 with a valid sender is Deduped until full 86400s cooldown expires.",
+    "verdict": "CONFIRMED",
+    "category": "correctness"
+  },
+  {
+    "file": "src/bin/monitor/notify.rs",
+    "line": 520,
+    "summary": "v14 governor path bypasses monitor::launch_gate wrapper; Gray-stage non-critical pushes still sent",
+    "failure_scenario": "In Stage=gray, notify::push_governor_v3 calls notify::push_wechat directly (not main::push_wechat_with_kind), so launch_gate::should_push_user(stage, false) is never evaluated. b011 noted 17 legacy sites have LaunchGate; v14 path has none.",
+    "verdict": "CONFIRMED",
+    "category": "correctness"
+  },
+  {
+    "file": "src/bin/monitor/v14_adapter.rs",
+    "line": 108,
+    "summary": "Mutex.lock().expect() poisoning — any panic while holding V14Stack.dispatcher/store kills ALL future gate/record",
+    "failure_scenario": "OOM during format!() in dispatcher.rs Deduped(format!(...)) or build_analytics panics while holding dispatcher/store mutex → Mutex poisoned → next push: stack.dispatcher.lock().expect(\"dispatcher lock\") panics → all subsequent pushes silently die. No recovery without process restart.",
+    "verdict": "CONFIRMED",
+    "category": "correctness"
+  },
+  {
+    "file": "src/bin/monitor/v14_adapter.rs",
+    "line": 63,
+    "summary": "SqliteStore::open_in_memory().expect() panics poison OnceLock forever on first init failure",
+    "failure_scenario": "SQLite memory alloc failure / schema init bug at first call panics inside V14_STACK.get_or_init closure. OnceLock poisoned. Every subsequent v14_gate() call panics. Entire monitor binary loses push capability permanently.",
+    "verdict": "CONFIRMED",
+    "category": "correctness"
+  },
+  {
+    "file": "src/bin/monitor/v14_adapter.rs",
+    "line": 280,
+    "summary": "L5 governance always sees DataMode::Full + is_frozen=false; data-quality + frozen denies invisible on v14 path",
+    "failure_scenario": "Even when monitor::data_mode::evaluate has degraded (Unsafe) or account_mode is Frozen, v14_gate builds GovernanceContext with Full/false → governance.check() Approves templates that should have been Denied. b011 audit L5 ⚠️ unaddressed.",
+    "verdict": "CONFIRMED",
+    "category": "correctness"
+  },
+  {
+    "file": "src/bin/monitor/main.rs",
+    "line": 3017,
+    "summary": "17 legacy direct push_wechat sites bypass v14 L4/L5/L7 gate and analytics entirely",
+    "failure_scenario": "Pre-market checklist (main.rs:3017), volume breakout push (main.rs:2941/2950/2961), summary (main.rs:5147), review report (main.rs:5170) call push_wechat directly. No dispatcher dedup, no governance check, no analytics row.",
+    "verdict": "CONFIRMED",
+    "category": "conventions"
+  },
+  {
+    "file": "src/monitor/signal_state.rs",
+    "line": 97,
+    "summary": "Daily alert budgets incremented BEFORE cooldown/dedup checks; suppressed repeats consume the daily quota",
+    "failure_scenario": "Important alerts for same stock during cooldown each run daily_important_count += 1 then later return Err(\"冷却中\"). After 30 such suppressed repeats, daily_important_max budget gone → real new alerts blocked.",
+    "verdict": "CONFIRMED",
+    "category": "correctness"
+  },
+  {
+    "file": "src/bin/monitor/main.rs",
+    "line": 3887,
+    "summary": "Intraday market-view block reuses last_sector_push timer reset immediately above; block unreachable on 5-min cadence",
+    "failure_scenario": "When last_sector_push elapsed >= 300s, sector-leaders block runs first and resets last_sector_push to now; the following 盘面走向+涨停产业链 check then sees elapsed < 300 and skips every cycle.",
+    "verdict": "CONFIRMED",
+    "category": "correctness"
+  },
+  {
+    "file": "src/bin/monitor/v14_adapter.rs",
+    "line": 110,
+    "summary": "Deduped attempts return without writing any L7 analytics row; dedup activity invisible",
+    "failure_scenario": "A duplicate PushKind::DailyReport within its cooldown returns V14Gate::Deduped at line 110-112 and exits before build_analytics/record. No pushed=false, no dedup row. L7 cannot answer 'how many pushes were suppressed by cooldown today'.",
+    "verdict": "CONFIRMED",
+    "category": "correctness"
+  },
+  {
+    "file": "src/monitor/news_monitor.rs",
+    "line": 170,
+    "summary": "Announcement severity counters incremented BEFORE L1/L2 match filter; dropped announcements inflate stats",
+    "failure_scenario": "An unrelated Important announcement increments important_count (line 170) then fails L1/L2 matching and is discarded at line 219 (continue). stats() reports important alerts that were never emitted.",
+    "verdict": "CONFIRMED",
+    "category": "correctness"
+  },
+  {
+    "file": "src/push_l4/dispatcher.rs",
+    "line": 61,
+    "summary": "&mut self on Dispatcher serializes all dispatches onto single Mutex<Dispatcher> in v14_adapter; DashMap's lock-free shard access wasted",
+    "failure_scenario": "During R-08 (--review) loop calls push_governor for 5 holdings + 5 paper reviews + fund inflow top 10 rapidly → each v14_gate serializes on same Mutex. Perf cliff hides bugs.",
+    "verdict": "PLAUSIBLE",
+    "category": "correctness"
+  },
+  {
+    "file": "src/push_l4/dispatcher.rs",
+    "line": 84,
+    "summary": "TOCTOU between dedup_table.len() check and retain()/insert(); concurrent dispatchers defeat soft-cap invariant",
+    "failure_scenario": "Two threads near soft-cap 4096 each pass len() check, each call retain()+insert() — DashMap sharded retain and insert can run concurrently on different shards; dedup_table temporarily exceeds 4096.",
+    "verdict": "PLAUSIBLE",
+    "category": "correctness"
+  },
+  {
+    "file": "src/bin/monitor/notify.rs",
+    "line": 521,
+    "summary": "current_send_channel() re-reads V10_DRY_RUN_PUSH AFTER push_wechat() await; analytics sink_name mismatch possible",
+    "failure_scenario": "If V10_DRY_RUN_PUSH is 1 when push_wechat starts (returns true, logs dry_run) but env is removed before v14_record_delivery reads it via current_send_channel(), analytics records feishu/wechat with pushed=true — direct contradiction of b011 P0-1 fix goal.",
+    "verdict": "PLAUSIBLE",
+    "category": "correctness"
+  }
+]

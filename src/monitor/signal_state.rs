@@ -65,6 +65,12 @@ impl SignalStateMachine {
     /// 核心方法：接收原始告警事件，返回应该推送的事件（去重后）。
     /// 返回 None 表示被静默（冷却中 / 超预算 / 状态未变化）。
     pub fn process(&mut self, event: AlertEvent) -> Option<AlertEvent> {
+        self.process_traced(event).ok()
+    }
+
+    /// b011 P1-1: 带丢弃原因的版本 — 漏斗可观测性 (进N→出M|丢弃原因分布).
+    /// Err(原因) = 被静默; 调用方聚合原因计数后输出漏斗日志.
+    pub fn process_traced(&mut self, event: AlertEvent) -> Result<AlertEvent, &'static str> {
         let key = make_key(&event.code, event.category);
         let now = Local::now();
         let today = now.date_naive();
@@ -74,7 +80,7 @@ impl SignalStateMachine {
         if event.category == AlertCategory::LimitDown {
             if let Some(prev) = self.once_per_day.get(&key) {
                 if *prev == today {
-                    return None; // 当日已推过, 静默
+                    return Err("跌停当日已推"); // 当日已推过, 静默
                 }
             }
             self.once_per_day.insert(key.clone(), today);
@@ -86,42 +92,52 @@ impl SignalStateMachine {
             AlertLevel::Emergency => true, // 紧急无限制
             AlertLevel::Important => {
                 if self.daily_important_count >= self.daily_important_max {
-                    return None;
+                    return Err("重要级当日预算耗尽");
                 }
-                self.daily_important_count += 1;
+                // b013 P1-9: budget 自增移到 Ok 返回路径 (避免冷却中重试吃光预算)
                 true
             }
             AlertLevel::Info => {
                 if self.daily_info_count >= self.daily_info_max {
-                    return None;
+                    return Err("参考级当日预算耗尽");
                 }
-                self.daily_info_count += 1;
                 true
             }
         };
 
         if !budget_ok {
-            return None;
+            return Err("预算不足");
+        }
+        // b013 P1-9: budget 在 Ok 返回前再自增 (冷却中重试不再吃光预算)
+        fn _charge_budget(sm: &mut SignalStateMachine, level: AlertLevel) {
+            match level {
+                AlertLevel::Important => sm.daily_important_count += 1,
+                AlertLevel::Info => sm.daily_info_count += 1,
+                AlertLevel::Emergency => {}
+            }
         }
 
         // 紧急级别：1分钟内不重复，首次直接放行
         if event.level == AlertLevel::Emergency {
             let is_new = !self.entries.contains_key(&key);
             if is_new {
-                self.entries.insert(key.clone(), SignalEntry {
-                    state: SignalState::Firing,
-                    last_alert: now,
-                    last_change: now,
-                });
-                return Some(event);
+                self.entries.insert(
+                    key.clone(),
+                    SignalEntry {
+                        state: SignalState::Firing,
+                        last_alert: now,
+                        last_change: now,
+                    },
+                );
+                return Ok(event);
             }
             let entry = self.entries.get_mut(&key).unwrap();
             if now - entry.last_alert < Duration::seconds(60) {
-                return None;
+                return Err("紧急级60s冷却");
             }
             entry.last_alert = now;
             entry.state = SignalState::Firing;
-            return Some(event);
+            return Ok(event);
         }
 
         // 非紧急：冷却检查
@@ -137,27 +153,30 @@ impl SignalStateMachine {
                 match entry.state {
                     SignalState::Cooldown => {
                         if elapsed < cooldown {
-                            return None; // 冷却中，静默
+                            return Err("冷却中"); // 冷却中，静默
                         }
                         // 冷却期满，信号仍在 → 重新触发
                         entry.state = SignalState::Firing;
                         entry.last_alert = now;
                         entry.last_change = now;
-                        Some(event)
+                        _charge_budget(self, event.level);
+                        Ok(event)
                     }
                     SignalState::Firing => {
                         // 仍在触发，但刚发过 → 静默
                         if elapsed < cooldown {
-                            return None;
+                            return Err("冷却中");
                         }
                         entry.last_alert = now;
-                        Some(event)
+                        _charge_budget(self, event.level);
+                        Ok(event)
                     }
                     SignalState::Idle => {
                         entry.state = SignalState::Firing;
                         entry.last_alert = now;
                         entry.last_change = now;
-                        Some(event)
+                        _charge_budget(self, event.level);
+                        Ok(event)
                     }
                 }
             }
@@ -170,7 +189,8 @@ impl SignalStateMachine {
                         last_change: now,
                     },
                 );
-                Some(event)
+                _charge_budget(self, event.level);
+                Ok(event)
             }
         }
     }
@@ -204,14 +224,17 @@ impl SignalStateMachine {
 
     pub fn budget_remaining(&self) -> (usize, usize) {
         (
-            self.daily_important_max.saturating_sub(self.daily_important_count),
+            self.daily_important_max
+                .saturating_sub(self.daily_important_count),
             self.daily_info_max.saturating_sub(self.daily_info_count),
         )
     }
 
     /// 每 5 分钟将当前状态写入 signal_state 表
     pub fn flush_state(&self) {
-        let Some(db) = crate::database::DatabaseManager::try_get() else { return; };
+        let Some(db) = crate::database::DatabaseManager::try_get() else {
+            return;
+        };
         let mut conn = match db.get_conn() {
             Ok(c) => c,
             Err(_) => return,
@@ -232,7 +255,9 @@ impl SignalStateMachine {
 
     /// 启动时从 signal_state 恢复状态，清理过期数据
     pub fn restore_state(&mut self) {
-        let Some(db) = crate::database::DatabaseManager::try_get() else { return; };
+        let Some(db) = crate::database::DatabaseManager::try_get() else {
+            return;
+        };
         let mut conn = match db.get_conn() {
             Ok(c) => c,
             Err(_) => return,
@@ -240,12 +265,18 @@ impl SignalStateMachine {
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         #[derive(QueryableByName, Debug)]
         struct StateRow {
-            #[diesel(sql_type = diesel::sql_types::Text)] key: String,
-            #[diesel(sql_type = diesel::sql_types::Text)] state: String,
-            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)] last_alert: Option<String>,
-            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)] last_change: Option<String>,
-            #[diesel(sql_type = diesel::sql_types::Integer)] daily_important_count: i32,
-            #[diesel(sql_type = diesel::sql_types::Integer)] daily_info_count: i32,
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            key: String,
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            state: String,
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+            last_alert: Option<String>,
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+            last_change: Option<String>,
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            daily_important_count: i32,
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            daily_info_count: i32,
         }
         let sql = format!("SELECT key, state, last_alert, last_change, daily_important_count, daily_info_count FROM signal_state");
         if let Ok(rows) = diesel::sql_query(&sql).load::<StateRow>(&mut *conn) {
@@ -261,24 +292,39 @@ impl SignalStateMachine {
                         let now = chrono::Local::now();
                         let entry = SignalEntry {
                             state,
-                            last_alert: r.last_alert.as_ref().and_then(|s| {
-                                chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok()
-                                    .and_then(|t| t.and_local_timezone(chrono::Local).latest())
-                            }).unwrap_or(now),
-                            last_change: chrono::NaiveDateTime::parse_from_str(lc, "%Y-%m-%d %H:%M:%S").ok()
-                                .and_then(|t| t.and_local_timezone(chrono::Local).latest())
+                            last_alert: r
+                                .last_alert
+                                .as_ref()
+                                .and_then(|s| {
+                                    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+                                        .ok()
+                                        .and_then(|t| t.and_local_timezone(chrono::Local).latest())
+                                })
                                 .unwrap_or(now),
+                            last_change: chrono::NaiveDateTime::parse_from_str(
+                                lc,
+                                "%Y-%m-%d %H:%M:%S",
+                            )
+                            .ok()
+                            .and_then(|t| t.and_local_timezone(chrono::Local).latest())
+                            .unwrap_or(now),
                         };
                         self.entries.insert(r.key, entry);
-                        self.daily_important_count = self.daily_important_count.max(r.daily_important_count as usize);
-                        self.daily_info_count = self.daily_info_count.max(r.daily_info_count as usize);
+                        self.daily_important_count = self
+                            .daily_important_count
+                            .max(r.daily_important_count as usize);
+                        self.daily_info_count =
+                            self.daily_info_count.max(r.daily_info_count as usize);
                     }
                 }
             }
         }
         // 清理非今天的
-        let _ = diesel::sql_query(&format!("DELETE FROM signal_state WHERE last_change IS NULL OR last_change < '{}'", today))
-            .execute(&mut *conn);
+        let _ = diesel::sql_query(&format!(
+            "DELETE FROM signal_state WHERE last_change IS NULL OR last_change < '{}'",
+            today
+        ))
+        .execute(&mut *conn);
     }
 }
 
@@ -305,10 +351,16 @@ mod tests {
             name: "测试".into(),
             message: "test".into(),
             detail: AlertDetail {
-                price: None, change_pct: None, volume_ratio: None,
-                main_flow_yi: None, threshold: None, news_title: None,
-                news_summary: None, ai_decision: None,
-                t1_locked: false, extra: None,
+                price: None,
+                change_pct: None,
+                volume_ratio: None,
+                main_flow_yi: None,
+                threshold: None,
+                news_title: None,
+                news_summary: None,
+                ai_decision: None,
+                t1_locked: false,
+                extra: None,
             },
             triggered_at: Local::now(),
         }
@@ -317,7 +369,13 @@ mod tests {
     #[test]
     fn test_first_event_passes() {
         let mut sm = SignalStateMachine::default();
-        assert!(sm.process(event("000001", AlertLevel::Important, AlertCategory::MainOutflow)).is_some());
+        assert!(sm
+            .process(event(
+                "000001",
+                AlertLevel::Important,
+                AlertCategory::MainOutflow
+            ))
+            .is_some());
     }
 
     #[test]
@@ -380,22 +438,56 @@ mod tests {
     #[test]
     fn test_daily_reset_restores_budget() {
         let mut sm = SignalStateMachine::new(1, 1, 1, 1);
-        sm.process(event("000001", AlertLevel::Important, AlertCategory::MainInflow));
+        sm.process(event(
+            "000001",
+            AlertLevel::Important,
+            AlertCategory::MainInflow,
+        ));
         sm.daily_reset();
-        assert!(sm.process(event("000002", AlertLevel::Important, AlertCategory::MainInflow)).is_some());
+        assert!(sm
+            .process(event(
+                "000002",
+                AlertLevel::Important,
+                AlertCategory::MainInflow
+            ))
+            .is_some());
     }
 
     #[test]
     fn test_different_categories_independent() {
         let mut sm = SignalStateMachine::default();
-        assert!(sm.process(event("000001", AlertLevel::Important, AlertCategory::MainOutflow)).is_some());
-        assert!(sm.process(event("000001", AlertLevel::Important, AlertCategory::VolBurst)).is_some());
+        assert!(sm
+            .process(event(
+                "000001",
+                AlertLevel::Important,
+                AlertCategory::MainOutflow
+            ))
+            .is_some());
+        assert!(sm
+            .process(event(
+                "000001",
+                AlertLevel::Important,
+                AlertCategory::VolBurst
+            ))
+            .is_some());
     }
 
     #[test]
     fn test_different_codes_independent() {
         let mut sm = SignalStateMachine::default();
-        assert!(sm.process(event("000001", AlertLevel::Important, AlertCategory::MainOutflow)).is_some());
-        assert!(sm.process(event("000002", AlertLevel::Important, AlertCategory::MainOutflow)).is_some());
+        assert!(sm
+            .process(event(
+                "000001",
+                AlertLevel::Important,
+                AlertCategory::MainOutflow
+            ))
+            .is_some());
+        assert!(sm
+            .process(event(
+                "000002",
+                AlertLevel::Important,
+                AlertCategory::MainOutflow
+            ))
+            .is_some());
     }
 }

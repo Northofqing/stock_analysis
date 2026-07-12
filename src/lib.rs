@@ -1,94 +1,72 @@
 // A股自选股智能分析系统 - 库入口
 
-pub mod errors;
-pub mod util;
-pub mod broker;
-pub mod config;
+pub mod analyzer;
+pub mod auth;
 pub mod breakout;
+pub mod broker;
+pub mod calendar;
+pub mod chart_generator;
+pub mod config;
+pub mod data_provider;
+pub mod database;
+pub mod decision;
+pub mod enums;
+pub mod errors;
+pub mod indicators;
+pub mod lhb_analyzer;
+pub mod llm;
+pub mod market_analyzer;
+pub mod market_data;
+pub mod models;
+pub mod monitor;
+pub mod notification;
+pub mod opportunity;
+pub mod pipeline;
 pub mod portfolio;
 pub mod review;
-pub mod signal;
-pub mod opportunity;
-pub mod decision;
 pub mod risk;
-pub mod traits;
-pub mod strategy;
-pub mod search_service;
-pub mod analyzer;
-pub mod trend_analyzer;
-pub mod database;
-pub mod models;
-pub mod types;
 pub mod schema;
-pub mod calendar;
-pub mod market_data;
-pub mod market_analyzer;
-pub mod notification;
-pub mod enums;
-pub mod data_provider;
-pub mod indicators;
-pub mod pipeline;
-pub mod lhb_analyzer;
-pub mod monitor;
+pub mod search_service;
 pub mod sharpe_calculator;
-pub mod chart_generator;
-pub mod llm;
+pub mod signal;
+// v14.2 push 7 层 — 对齐 docs/v14.x/v14.x-master-development.md 的 Phase 2/3 W 周编号
+// (b011 P2-2: 此前注释用的 W2.2/W3.2/W4.1 与 master plan W11-W17 不通用, 已对齐)
+pub mod push_l1;  // Phase 2 W11: v14.2 L1 SignalEvent + event_id 派生
+pub mod push_l2;  // Phase 3 W13: v14.2 L2 TemplateMetadata + DataMode (L3 Render 暂缺, 渲染走 push_templates::render_xxx)
+pub mod push_l4;  // Phase 2 W12 + b011 P0-2: L4 Dispatcher (dedup 闭环已实装)
+pub mod push_l5;  // Phase 3 W15: L5 GovernanceEngine (quiet hours / frozen / data_mode)
+pub mod push_l6;  // Phase 3 W16: L6 Sink trait + ConsoleSink + SinkRouter
+pub mod push_l7;  // Phase 3 W17: L7 PushAnalytics + SqliteStore/InMemoryStore
+pub mod strategy;
+pub mod traits;
+pub mod trend_analyzer;
+pub mod types;
+pub mod util;
 
 // 向外兼容：旧模块路径指向新的 strategy 子模块
-pub use strategy::core as backtest;
 pub use strategy::bollinger_zscore as bollinger_zscore_strategy;
+pub use strategy::core as backtest;
 pub use strategy::multi_factor as multi_factor_strategy;
 
 pub use search_service::{
-    get_search_service, 
-    SearchProvider, 
-    SearchResult, 
-    SearchResponse, 
-    SearchService,
-    TavilySearchProvider,
-    SerpAPISearchProvider,
-    BochaSearchProvider,
+    get_search_service, BochaSearchProvider, SearchProvider, SearchResponse, SearchResult,
+    SearchService, SerpAPISearchProvider, TavilySearchProvider,
 };
 
-pub use analyzer::{
-    get_analyzer,
-    AnalysisResult,
-    GeminiAnalyzer,
-    GeminiConfig,
-};
+pub use analyzer::{get_analyzer, AnalysisResult, GeminiAnalyzer, GeminiConfig};
 
 pub use trend_analyzer::{
-    StockTrendAnalyzer,
-    TrendAnalysisResult,
-    StockData,
-    TrendStatus,
+    analyze_stock, BuySignal, StockData, StockTrendAnalyzer, TrendAnalysisResult, TrendStatus,
     VolumeStatus,
-    BuySignal,
-    analyze_stock,
 };
 
-pub use database::{
-    DatabaseManager,
-    get_db,
-    StockDailyRecord,
-    AnalysisContext,
-};
+pub use database::{get_db, AnalysisContext, DatabaseManager, StockDailyRecord};
 
 pub use models::{
-    StockDaily,
-    NewStockDaily,
-    UpdateStockDaily,
-    MaStatus,
-    NewAnalysisResult,
-    AnalysisResultRecord,
+    AnalysisResultRecord, MaStatus, NewAnalysisResult, NewStockDaily, StockDaily, UpdateStockDaily,
 };
 
-pub use lhb_analyzer::{
-    LhbDataFetcher,
-    LhbRecord,
-    LhbSeat,
-    LhbAnalysis,
-};
+pub use lhb_analyzer::{LhbAnalysis, LhbDataFetcher, LhbRecord, LhbSeat};
 pub mod agent;
 pub mod deep_analyzer;
 pub mod trading;
@@ -181,12 +159,7 @@ where
 {
     use tokio::runtime::Handle;
     let work = async move {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            fut,
-        )
-        .await
-        {
+        match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), fut).await {
             Ok(v) => Ok(v),
             Err(_) => Err(format!(
                 "block_on_async_with_timeout: 任务超过 {timeout_secs}s 超时"
@@ -270,10 +243,7 @@ mod tests {
     /// P0-5: `block_on_async_with_timeout` 在 multi_thread runtime 里正常工作.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn block_on_async_with_timeout_works_in_multi_thread() {
-        let result = block_on_async_with_timeout(
-            async { 42_u32 + 1 },
-            5,
-        );
+        let result = block_on_async_with_timeout(async { 42_u32 + 1 }, 5);
         assert_eq!(result.unwrap(), 43);
     }
 

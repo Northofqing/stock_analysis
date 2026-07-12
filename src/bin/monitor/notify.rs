@@ -2,15 +2,10 @@
 //!
 //! 从 main.rs 提取，减少单文件体积。
 
-use log;
-use reqwest;
-use serde::{Deserialize, Serialize};
-use serde_json;
+use serde::Deserialize;
 use std::io::Write;
 use std::process::Stdio;
 use std::sync::atomic::Ordering;
-use stock_analysis;
-use tokio;
 
 use crate::{
     ApiTokenSource, CachedApiToken, DaemonReadySource, MessageSendTransport, MessageSendType,
@@ -108,6 +103,8 @@ pub enum PushKind {
     IntradayMarket,
     /// v13 §14.2 I-02 新闻催化映射 (⚡ 10min 冷却)
     NewsCatalyst,
+    /// v13 §14.2 I-09 量价反向发现 (⚡ 10min 冷却)
+    SectorAnomaly,
     // ============= v13 §14.4 新增 PushKind (PR #2) =============
     /// v13 §14.4 D-01 新闻驱动个股 (⚡ 20min/票 冷却)
     NewsToIdea,
@@ -170,6 +167,7 @@ impl PushKind {
             | PushKind::PreopenNewsHot
             | PushKind::IntradayMarket
             | PushKind::NewsCatalyst
+            | PushKind::SectorAnomaly
             | PushKind::NewsToIdea
             | PushKind::CatalystReview
             | PushKind::IndustryChainIntraday
@@ -251,12 +249,13 @@ impl PushKind {
             PushKind::WeeklySOP => Some(86_400),
             // v13 §14.5 (Codex F5 修): TurnoverTop 显式 600s (原默认 1800s 与 spec 不符)
             // v14.5: TurnoverTop enum 已接通 (line 67), 启用该分支
-            PushKind::TurnoverTop => Some(600),                                // 10 min
+            PushKind::TurnoverTop => Some(600), // 10 min
             // v14.5 G-06: IndustryChain 显式 86400s (1次/日, vs 默认 1800s)
-            PushKind::IndustryChain => Some(86_400),                          // 1次/日
+            PushKind::IndustryChain => Some(86_400), // 1次/日
             // v13 新增
             PushKind::PreopenNewsHot | PushKind::IntradayMarket => Some(900), // 15 min
             PushKind::NewsCatalyst => Some(600),                              // 10 min
+            PushKind::SectorAnomaly => Some(600),                             // 10 min
             PushKind::NewsToIdea => Some(1200),                               // 20 min/票
             PushKind::CatalystReview => Some(86_400),                         // 1次/日
             PushKind::IndustryChainIntraday => Some(1800),                    // 30 min
@@ -266,11 +265,26 @@ impl PushKind {
             PushKind::EtfClosingCallAuction => Some(86_400),                  // 1次/日
             PushKind::BlockTradeIntradayConfirm => Some(300),                 // 5 min/票
             PushKind::BlockTradePriceRange => Some(3600),                     // 60 min/票
-            PushKind::PaperReview => Some(86_400),                             // 1次/日
-            PushKind::CandidateInvalidated => Some(1800),                      // 30 min
+            PushKind::PaperReview => Some(86_400),                            // 1次/日
+            PushKind::CandidateInvalidated => Some(1800),                     // 30 min
             // v58: P-05 虚拟观察仓 (开盘 9:30 推一次, 1次/日)
-            PushKind::VirtualWatch => Some(86_400),                           // 1次/日
-            _ => Some(1800),                                                  // 默认 30min
+            PushKind::VirtualWatch => Some(86_400), // 1次/日
+            _ => Some(1800),                        // 默认 30min
+        }
+    }
+
+    /// b011 P0-2: L4 dedup 冷却的键语义 (v14_adapter::v14_gate 用)
+    pub fn cooldown_scope(self) -> CooldownScope {
+        use PushKind::*;
+        match self {
+            // 公告冷却由 SignalStateMachine (per (code, category) + 每日预算) 专管,
+            // L4 若再按 kind 冷却会把同窗口内**不同**公告误杀 (b011 P0-2 评审决策)
+            Announcement => CooldownScope::External,
+            // §14.3 表中标 "/票" 的: 必须有 code 才能按票冷却
+            HoldingPlan | T0Advice | CandidateTriggered | ForbiddenOps | PaperTrade
+            | NewsToIdea | PostFixedPriceOrder | PostFixedPriceFill | StPriceLimitChanged
+            | BlockTradeIntradayConfirm | BlockTradePriceRange => CooldownScope::PerTicket,
+            _ => CooldownScope::Global,
         }
     }
 
@@ -318,6 +332,7 @@ impl PushKind {
             PushKind::PreopenNewsHot => "盘前热点",
             PushKind::IntradayMarket => "盘中轮动",
             PushKind::NewsCatalyst => "新闻催化",
+            PushKind::SectorAnomaly => "异动无归因",
             PushKind::NewsToIdea => "新闻驱动个股",
             PushKind::CatalystReview => "题材催化复盘",
             PushKind::IndustryChainIntraday => "盘中涨停扩散",
@@ -331,6 +346,17 @@ impl PushKind {
             PushKind::CandidateInvalidated => "候选失效",
         }
     }
+}
+
+/// b011 P0-2: L4 dedup 键语义 (与 PushKind::cooldown_secs 配套)
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CooldownScope {
+    /// 按 kind 全局冷却 (code 无关), 例: 盘后系列 1次/日
+    Global,
+    /// 按 (kind, code) 票级冷却; 未传 code 时 L4 不冷却 (归模板层 memo)
+    PerTicket,
+    /// 冷却由专门层管理 (公告=sm 状态机), L4 不重复治理
+    External,
 }
 
 /// v12 §14.3: 推送等级
@@ -358,12 +384,8 @@ impl PushLevel {
     }
 }
 
-/// v42: 推送冷却 memo (按 PushKind 维度, §14.5 治理强制)
-/// key = format!("{}_{}", kind, code) - 票级别冷却用 (e.g. T-07 1次/票/日)
-use std::sync::Mutex;
-use once_cell::sync::Lazy;
-static COOLDOWN_MEMO: Lazy<Mutex<std::collections::HashMap<String, std::time::Instant>>> =
-    Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
+// b011 P1-2: 旧 COOLDOWN_MEMO (v42/v59 票级冷却) 已删 —
+// 冷却统一收敛到 v14.2 L4 dispatcher ((kind, code) + PushKind::cooldown_secs 窗口).
 
 /// v69: 推送日志保存 — 把每条实际推送的内容按日期路径写到 data/push_log/
 ///   - 路径: data/push_log/YYYY-MM-DD/HHMMSS_<随机>.md
@@ -371,7 +393,10 @@ static COOLDOWN_MEMO: Lazy<Mutex<std::collections::HashMap<String, std::time::In
 ///   - 写失败不阻塞主流程 (warn log)
 fn save_push_log(text: &str) {
     use std::io::Write;
-    log::info!("[v69] save_push_log entered, text len={}", text.chars().count());
+    log::info!(
+        "[v69] save_push_log entered, text len={}",
+        text.chars().count()
+    );
     let now = chrono::Local::now();
     let date_dir = now.format("%Y-%m-%d").to_string();
     let time_prefix = now.format("%H%M%S").to_string();
@@ -379,7 +404,7 @@ fn save_push_log(text: &str) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
-    let rand_suffix = format!("{:08x}", nanos & 0xffffffff);
+    let rand_suffix = format!("{:08x}", nanos);
     let dir = std::path::PathBuf::from("data/push_log").join(&date_dir);
     if let Err(e) = std::fs::create_dir_all(&dir) {
         log::warn!("[v69] push_log 目录创建失败: {}", e);
@@ -431,7 +456,9 @@ pub fn record_news_recommendation(
         "theme": theme,
         "reason": reason_json,
         "action": action.unwrap_or(""),
-        "price": price.unwrap_or(0.0),
+        // W1.16 / B-010 P0-5: price 缺失必须显式为 null, 不允许 0.0 fallback
+        // 下游读取时用 .is_null() 判缺失, 避免被误认为合法报价
+        "price": price,
         "outcome": null, // 后续回填
     });
     match OpenOptions::new().create(true).append(true).open(&path) {
@@ -439,17 +466,16 @@ pub fn record_news_recommendation(
             if let Err(e) = writeln!(f, "{}", entry) {
                 log::warn!("[v70+] d01_recommendations 写入失败: {}", e);
             } else {
-                log::info!("[v70+] 落盘推荐: {} ({}) → {}", template, code, path.display());
+                log::info!(
+                    "[v70+] 落盘推荐: {} ({}) → {}",
+                    template,
+                    code,
+                    path.display()
+                );
             }
         }
         Err(e) => log::warn!("[v70+] d01_recommendations 创建文件失败: {}", e),
     }
-}
-
-/// v42: 测试用 — 重置冷却 memo
-#[cfg(test)]
-pub fn _reset_cooldown_memo_for_test() {
-    COOLDOWN_MEMO.lock().unwrap().clear();
 }
 
 /// v11-P0-4 commit D: 推送治理入口
@@ -460,42 +486,112 @@ pub fn _reset_cooldown_memo_for_test() {
 ///
 /// PUSH_VERBOSE=true 恢复旧行为 (留退路, shadow 切换验证用)
 /// v19.12: 全部保留 true (用户要求去掉条件限制, 所有模板都推送)
-/// PUSH_VERBOSE 已废: 之前用来切换 deprecated 模板, 现在 deprecated=0 所以无需开关
-///
-/// v42: 接入 §14.5 治理 — 按 cooldown_secs 强制冷却
-pub async fn push_governor(text: &str, kind: PushKind) -> bool {
-    push_wechat(text).await
+/// W9.3 桥接结果 (CRITICAL 修复: 区分 4 种 v14.2 结果)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushOutcome {
+    Pushed,             // v14.2 + v13 都成功
+    Deduped,            // v14.2 dedup hit, v13 未推送 (60s 内同 kind)
+    Denied(String),     // v14.2 governance 拦截
+    SinkError(String),   // v14.2 sink 失败
 }
 
-// v59: 旧 push_governor (kind-only cooldown) 已被 notify::push_governor_v2 替代 (F1 修复: key 改 (kind, code))
-//   - per-kind cooldown 用 NotifyKind::cooldown_secs() (旧 push_governor)
-//   - per-(kind,code) cooldown 由 dispatcher memo 负责 (D-01 / 旧 push_governor_v2 内部)
-//   - 注意: 当前 push_governor 已被 v59 改回最简 (无 memo 强制), 冷却由 dispatcher memo + push_governor_v2 兜底
-//
-// 保留 push_governor 函数 (向后兼容), 但内部不再做冷却检查
-//   - 旧: F1 bug (kind-only key 破坏 per-position 循环)
-//   - 新: 冷却由各 dispatcher 自己 memo (D-01, P-04 等) + push_governor_v2 兜底
-pub async fn push_governor_v2(text: &str, kind: PushKind, code: &str) -> bool {
-    // v59: 冷却检查 (按 (kind, code) 维度 — 票级冷却)
-    if let Some(cooldown_secs) = kind.cooldown_secs() {
-        let key = format!("{:?}_{}", kind, code);
-        let mut map = COOLDOWN_MEMO.lock().unwrap();
-        if let Some(last) = map.get(&key) {
-            let elapsed = last.elapsed().as_secs();
-            if elapsed < cooldown_secs as u64 {
-                log::debug!(
-                    "[v59 cooldown] {:?} code={} 冷却中, 跳过推送 (剩余 {}s / 总 {}s)",
-                    kind,
-                    code,
-                    cooldown_secs as u64 - elapsed,
-                    cooldown_secs
-                );
-                return false;
-            }
-        }
-        map.insert(key, std::time::Instant::now());
+impl PushOutcome {
+    pub fn is_pushed(&self) -> bool {
+        matches!(self, Self::Pushed)
     }
-    push_wechat(text).await
+}
+
+/// b011 P1-2: 推送**唯一**实现 — 全部 governor 入口收敛到这里.
+///
+/// 链路: v14_gate (L4 dedup + L5 governance) → push_wechat (真实投递, 含 dry-run)
+///       → v14_record_delivery (L7 记录真实 sink + 真实结果).
+///
+/// 与旧版差异:
+///   - V10_DRY_RUN_PUSH 不再绕过 v14.2 (dry-run 由 push_wechat 自身处理,
+///     gate/analytics 全链路照走 → --test 能测到完整推送治理路径)
+///   - sink_name 不再硬编码 "wechat" (b011 P0-1), 取实际通道
+async fn push_governor_inner(text: &str, kind: PushKind, code: Option<&str>) -> PushOutcome {
+    use crate::v14_adapter::{self, V14Gate};
+    // b013 review P0-4: v14 路径也走 LaunchGate (b011 漏: 17 处 main::push_wechat
+    // 走 launch_gate, v14 直连 push_wechat 不走 — Stage=gray 下非 critical 仍能推).
+    if !launch_gate_check(kind) {
+        return PushOutcome::Denied("launch_gate_stage".to_string());
+    }
+    let event = match v14_adapter::v14_gate(kind, code) {
+        V14Gate::Deduped => return PushOutcome::Deduped,
+        V14Gate::Denied(reason) => return PushOutcome::Denied(reason),
+        V14Gate::Approved(event) => event,
+    };
+    let delivered = push_wechat(text).await;
+    // b013 review P2-15: 入口取一次 channel (避免 push_wechat await 后 env 抖动)
+    let channel = current_send_channel();
+    v14_adapter::v14_record_delivery(&event, kind, text, delivered, channel);
+    if delivered {
+        PushOutcome::Pushed
+    } else {
+        PushOutcome::SinkError("push_wechat returned false".to_string())
+    }
+}
+
+/// b013 P0-4: LaunchGate 单点判定 — 与 main::push_wechat_with_kind 语义一致.
+/// Emergency 级 (`level().is_emergency()`) 永远放行 (critical alert);
+/// 其他走 `launch_gate::should_push_user(stage, false)`.
+fn launch_gate_check(kind: PushKind) -> bool {
+    if kind.level().is_emergency() {
+        return true;
+    }
+    use stock_analysis::opportunity::launch_gate;
+    let stage = launch_gate::current_stage();
+    launch_gate::should_push_user(stage, false)
+}
+
+/// 实际投递通道名 (L7 analytics 用, b011 P0-1):
+/// dry-run 显式记 "dry_run" (没有真实外发), 否则记配置的真实通道 ("feishu"/"wechat")
+fn current_send_channel() -> &'static str {
+    if std::env::var("V10_DRY_RUN_PUSH").ok().as_deref() == Some("1") {
+        "dry_run"
+    } else {
+        resolve_send_type().as_str()
+    }
+}
+
+/// b013 review P0-1: 兼容旧 2 参调用 + 自动给 default_code_for 兜底,
+/// 让 PerTicket kind 在旧 2 参调用下仍走 L4 dedup 路径 (而不是 PerTicket+None 直通放过).
+/// 真正票级隔离需 b014 把 caller 改成 push_governor_v3(text, kind, Some(code)).
+pub async fn push_governor(text: &str, kind: PushKind) -> bool {
+    push_governor_inner(text, kind, Some(default_code_for(kind)))
+        .await
+        .is_pushed()
+}
+
+/// v14.2 单入口 (b011 P1-2 收敛后 + b013 review P0-1): 返回 enum 区分 4 种结果.
+/// `code`: 票级冷却键 (§14.3 "/票" 类 kind 必传 real 票号, 否则 L4 不做票级冷却).
+pub async fn push_governor_v3(text: &str, kind: PushKind, code: Option<&str>) -> PushOutcome {
+    push_governor_inner(text, kind, code).await
+}
+
+/// b013 P0-1 兜底: PerTicket 类 kind 在缺 code 时塞占位, 让 L4 走全局 key,
+/// 至少防止"无限重发同一票"。b014 应把所有 caller 改成 push_governor_v3 显式传 code。
+fn default_code_for(kind: PushKind) -> &'static str {
+    use PushKind::*;
+    if matches!(
+        kind,
+        HoldingPlan
+            | T0Advice
+            | CandidateTriggered
+            | ForbiddenOps
+            | PaperTrade
+            | NewsToIdea
+            | PostFixedPriceOrder
+            | PostFixedPriceFill
+            | StPriceLimitChanged
+            | BlockTradeIntradayConfirm
+            | BlockTradePriceRange
+    ) {
+        "_per_ticket_unbound"
+    } else {
+        ""
+    }
 }
 
 pub async fn push_wechat(text: &str) -> bool {
@@ -1694,65 +1790,87 @@ mod tests {
 
     /// v19.12 起所有变体均保留, 此测试验证 push_governor 对保留的 AuctionVolume 返回 true
     /// (旧测试期望降级返回 false, 已废弃; commit 6cffecf fix(v19.12))
+    /// b011: 静默期 (02:00-06:00) 非紧急 kind 会被 L5 Deny — 测试对时钟做容错:
+    /// 非静默期断言 Pushed, 静默期断言 Denied (两者都证明链路走通且不假成功)
+    fn assert_pushed_or_quiet_denied(outcome: &PushOutcome, ctx: &str) {
+        let in_quiet = {
+            use chrono::Timelike;
+            (2..6).contains(&chrono::Local::now().hour())
+        };
+        if in_quiet {
+            assert!(
+                matches!(outcome, PushOutcome::Denied(r) if r == "quiet_hour"),
+                "{}: 静默期应 Denied(quiet_hour), got {:?}",
+                ctx,
+                outcome
+            );
+        } else {
+            assert!(outcome.is_pushed(), "{}: got {:?}", ctx, outcome);
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial(cooldown_memo)]
     async fn push_governor_deprecated_no_push() {
-        _reset_cooldown_memo_for_test(); // v42
+        crate::v14_adapter::_reset_dedup_for_test();
         std::env::set_var("V10_DRY_RUN_PUSH", "1"); // dry-run 模式返回 true
-        let r = push_governor("test kept", PushKind::AuctionVolume).await;
-        assert!(
-            r,
-            "v19.12 起 AuctionVolume 保留, push_governor 应返回 true (dry-run)"
-        );
+        let r = push_governor_v3("test kept auction", PushKind::AuctionVolume, None).await;
+        assert_pushed_or_quiet_denied(&r, "v19.12 起 AuctionVolume 保留 (dry-run)");
+        std::env::remove_var("V10_DRY_RUN_PUSH");
     }
 
     /// push_governor 保留时调 push_wechat (返回 V10_DRY_RUN_PUSH=true 时为 true)
+    /// HoldingEvent 是紧急级 (静默期豁免) → 与时钟无关恒 true
     #[tokio::test]
     #[serial_test::serial(cooldown_memo)]
     async fn push_governor_kept_calls_push_wechat() {
-        _reset_cooldown_memo_for_test(); // v42
+        crate::v14_adapter::_reset_dedup_for_test();
         std::env::set_var("V10_DRY_RUN_PUSH", "1"); // push_wechat 走 dry-run 返回 true
-        let r = push_governor("test kept", PushKind::HoldingEvent).await;
+        let r = push_governor("test kept holding", PushKind::HoldingEvent).await;
         assert!(r, "保留应调 push_wechat (V10_DRY_RUN_PUSH=true 返回 true)");
         std::env::remove_var("V10_DRY_RUN_PUSH");
     }
 
-    // v42: 冷却强制 — 同一 PushKind 第二次立即调应被冷却挡
+    // b011 P1-2: (kind, code) 票级冷却收敛到 L4 后语义不变 — 同票重复被挡
     #[tokio::test]
     #[serial_test::serial(cooldown_memo)]
     async fn push_governor_cooldown_blocks_rapid_repeat() {
         use std::env;
-        _reset_cooldown_memo_for_test();
+        crate::v14_adapter::_reset_dedup_for_test();
         env::set_var("V10_DRY_RUN_PUSH", "1");
-        // v59: push_governor 改无冷却 (F1 修复), 改用 push_governor_v2 (有冷却)
-        //   - 用 HoldingPlan (30 min 冷却), 隔离度高
-        let r1 = push_governor_v2("first", PushKind::HoldingPlan, "000001").await;
-        assert!(r1, "首次应通过 (dry-run 返回 true)");
-        let r2 = push_governor_v2("second", PushKind::HoldingPlan, "000001").await;
-        assert!(
-            !r2,
-            "30 min 冷却内同票重复调应被挡 (cooldown memo 命中)"
-        );
+        let r1 = push_governor_v3("first", PushKind::HoldingPlan, Some("000001")).await;
+        if r1.is_pushed() {
+            let r2 = push_governor_v3("second", PushKind::HoldingPlan, Some("000001")).await;
+            assert_eq!(
+                r2,
+                PushOutcome::Deduped,
+                "30 min 冷却内同票重复调应被 L4 挡"
+            );
+        } else {
+            assert_pushed_or_quiet_denied(&r1, "首次");
+        }
         env::remove_var("V10_DRY_RUN_PUSH");
     }
 
-    // v59: F1 修复 — 不同 code 同一 PushKind 不应被 30 min 冷却挡
-    //   - 旧: key=format!("{:?}", kind) kind-only, 第二只票被挡
-    //   - 新: key=format!("{:?}_{}", kind, code) per-(kind,code), 不同 code 各自独立
+    // v59 F1 语义保持 — 不同 code 同一 PushKind 不应被 30 min 冷却挡
     #[tokio::test]
     #[serial_test::serial(cooldown_memo)]
-    async fn push_governor_v2_per_code_cooldown() {
+    async fn push_governor_v3_per_code_cooldown() {
         use std::env;
-        _reset_cooldown_memo_for_test();
+        crate::v14_adapter::_reset_dedup_for_test();
         env::set_var("V10_DRY_RUN_PUSH", "1");
         // 同一 kind (HoldingPlan 30 min) 不同 code
-        let r1 = push_governor_v2("first", PushKind::HoldingPlan, "000001").await;
-        assert!(r1, "000001 首次应通过");
-        let r2 = push_governor_v2("second", PushKind::HoldingPlan, "000002").await;
-        assert!(
-            r2,
-            "000002 不同 code 不应被 30 min 冷却挡 (F1 修复)"
-        );
+        let r1 = push_governor_v3("first", PushKind::HoldingPlan, Some("000001")).await;
+        if r1.is_pushed() {
+            let r2 = push_governor_v3("second", PushKind::HoldingPlan, Some("000002")).await;
+            assert!(
+                r2.is_pushed(),
+                "000002 不同 code 不应被 30 min 冷却挡 (F1 语义), got {:?}",
+                r2
+            );
+        } else {
+            assert_pushed_or_quiet_denied(&r1, "首次");
+        }
         env::remove_var("V10_DRY_RUN_PUSH");
     }
 
@@ -1760,15 +1878,11 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(cooldown_memo)]
     async fn push_verbose_true_overrides_deprecated() {
-        // v42: 重置冷却 memo 避免测试间污染
-        _reset_cooldown_memo_for_test();
+        crate::v14_adapter::_reset_dedup_for_test();
         std::env::set_var("V10_DRY_RUN_PUSH", "1");
         std::env::set_var("PUSH_VERBOSE", "true");
-        let r = push_governor("test verbose", PushKind::AuctionVolume).await;
-        assert!(
-            r,
-            "PUSH_VERBOSE=true 应覆盖降级, 调 push_wechat (dry-run 返回 true)"
-        );
+        let r = push_governor_v3("test verbose auction", PushKind::AuctionVolume, None).await;
+        assert_pushed_or_quiet_denied(&r, "PUSH_VERBOSE=true 应覆盖降级");
         std::env::remove_var("V10_DRY_RUN_PUSH");
         std::env::remove_var("PUSH_VERBOSE");
     }
