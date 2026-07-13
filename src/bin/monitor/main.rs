@@ -2348,7 +2348,9 @@ async fn main() {
 
         let main_loops = async {
 
-            tokio::join!(monitor_loop(), news_monitor_loop(), news_pipeline_loop_v15_3());
+            // Phase 3: 移除 news_pipeline_loop_v15_3 (#2) — sink/aggregator 仅 #2 自用,
+            //   #1 news_monitor_loop 已从同源 fetch_flash_titles 取快讯产候选, #2 重复取数且已停推
+            tokio::join!(monitor_loop(), news_monitor_loop());
 
         };
 
