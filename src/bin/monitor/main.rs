@@ -11790,11 +11790,11 @@ fn strip_v15_3_marker(text: &str) -> String {
 async fn news_push_loop_v15_3(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<stock_analysis::news::dispatcher::NewsPush>,
 ) {
-    log::info!("[v15.3 news_push_loop] 启动");
+    // Phase 3: 停止"📊 分数"独立推送 (新闻经 run_opportunity_scan → 候选票, 同源快讯不重复推)
+    //   只消费 sink channel (避免 sender 阻塞), 不再调 news_push_via_v14
+    log::info!("[v15.3 news_push_loop] 启动 (Phase3: 不推分数, 仅消费 channel)");
     while let Some(np) = rx.recv().await {
-        if !news_push_via_v14(np).await {
-            log::debug!("[v15.3 news_push_loop] push deduped or failed");
-        }
+        log::debug!("[v15.3 news_push_loop] 已停推(Phase3): {}", np.headline);
     }
     log::warn!("[v15.3 news_push_loop] channel closed, loop exit");
 }
