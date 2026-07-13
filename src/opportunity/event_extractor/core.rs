@@ -126,6 +126,11 @@ pub fn strength_for_event_type(et: EventType, confidence: f64) -> u8 {
         EventType::Mna => 60,
         EventType::Accident => 70,
         EventType::Overseas => 60,
+        // v15.3 D2.1: 4 路新源
+        EventType::Earnings => 70,
+        EventType::MarketAction => 80,
+        EventType::AnalystView => 60,
+        EventType::Announcement => 65,
         EventType::Other => 40,
     };
     let raw = (base as f64 * confidence).round() as u8;

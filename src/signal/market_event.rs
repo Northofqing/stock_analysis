@@ -38,6 +38,15 @@ pub enum EventType {
     Accident,
     /// 海外事件
     Overseas,
+    // v15.3 D2.1: 4 路新源 event type
+    /// 财报 (业绩超预期 / 季报 / 年报 / 预增 / 预减)
+    Earnings,
+    /// 实盘 (持仓变动 / 账户模式切换 / 止盈止损)
+    MarketAction,
+    /// 机构观点 (卖方评级 / 行业策略 / 目标价)
+    AnalystView,
+    /// 公告 (公告流, 复用)
+    Announcement,
     /// 其他
     Other,
 }
@@ -57,6 +66,10 @@ impl EventType {
             EventType::Mna => "并购重组",
             EventType::Accident => "事故利空",
             EventType::Overseas => "海外事件",
+            EventType::Earnings => "财报",
+            EventType::MarketAction => "实盘",
+            EventType::AnalystView => "机构观点",
+            EventType::Announcement => "公告",
             EventType::Other => "其他",
         }
     }

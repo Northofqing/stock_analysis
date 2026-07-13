@@ -16,3 +16,4 @@ pub mod aggregator;
 pub mod impact;
 pub mod dispatcher;
 pub mod sink;
+pub mod stock_mapper;
