@@ -154,7 +154,7 @@ fn validation_status_from_str(s: &str) -> ValidationStatus {
 
 impl AnalyticsStore for SqliteStore {
     fn record(&self, analytics: &PushAnalytics) {
-        let conn = self.conn.lock().unwrap();
+        let conn = crate::util::recover_lock_or_warn("sqlite_store::record", self.conn.lock());
         let validation_errors_json = serde_json::to_string(&analytics.validation_errors).unwrap_or_else(|_| "[]".to_string());
         let result = conn.execute(
             "INSERT INTO push_analytics
@@ -184,7 +184,7 @@ impl AnalyticsStore for SqliteStore {
     }
 
     fn get_by_event_id(&self, event_id: &str) -> Option<PushAnalytics> {
-        let conn = self.conn.lock().unwrap();
+        let conn = crate::util::recover_lock_or_warn("sqlite_store::get_by_event_id", self.conn.lock());
         let mut stmt = match conn.prepare(
             "SELECT event_id, template_id, template_version, ts, severity, data_mode,
                     validation_status, governance_decision, pushed, rendered_len,
@@ -212,7 +212,7 @@ impl AnalyticsStore for SqliteStore {
             event_id: row.get(0).unwrap_or_default(),
             template_id: row.get(1).unwrap_or_default(),
             template_version: row.get::<_, i64>(2).unwrap_or(0) as u32,
-            ts: parse_rfc3339(row.get::<_, String>(3).unwrap_or_default()),
+            ts: parse_rfc3339(&row.get::<_, String>(3).unwrap_or_default()).unwrap_or_else(|| Local::now()),
             severity: severity_from_str(&row.get::<_, String>(4).unwrap_or_default()),
             data_mode: data_mode_from_str(&row.get::<_, String>(5).unwrap_or_default()),
             validation_status: validation_status_from_str(&row.get::<_, String>(6).unwrap_or_default()),
@@ -226,7 +226,7 @@ impl AnalyticsStore for SqliteStore {
     }
 
     fn query_by_time_range(&self, from: DateTime<Local>, to: DateTime<Local>) -> Vec<PushAnalytics> {
-        let conn = self.conn.lock().unwrap();
+        let conn = crate::util::recover_lock_or_warn("sqlite_store::query_by_time_range", self.conn.lock());
         let mut stmt = match conn.prepare(
             "SELECT event_id, template_id, template_version, ts, severity, data_mode,
                     validation_status, governance_decision, pushed, rendered_len,
@@ -241,7 +241,7 @@ impl AnalyticsStore for SqliteStore {
                 event_id: row.get(0)?,
                 template_id: row.get(1)?,
                 template_version: row.get::<_, i64>(2)? as u32,
-                ts: parse_rfc3339(row.get::<_, String>(3)?),
+                ts: parse_rfc3339(&row.get::<_, String>(3)?).unwrap_or_else(|| Local::now()),
                 severity: severity_from_str(&row.get::<_, String>(4)?),
                 data_mode: data_mode_from_str(&row.get::<_, String>(5)?),
                 validation_status: validation_status_from_str(&row.get::<_, String>(6)?),
@@ -256,17 +256,23 @@ impl AnalyticsStore for SqliteStore {
             Ok(r) => r,
             Err(_) => return vec![],
         };
-        rows.filter_map(|r| r.ok()).collect()
+        rows.filter_map(|r| match r {
+            Ok(a) => Some(a),
+            Err(e) => {
+                log::warn!("[SqliteStore] row deserialize failed: {}", e);
+                None
+            }
+        }).collect()
     }
 
     fn count_total(&self) -> u64 {
-        let conn = self.conn.lock().unwrap();
+        let conn = crate::util::recover_lock_or_warn("sqlite_store::count_total", self.conn.lock());
         conn.query_row::<u64, _, _>("SELECT COUNT(*) FROM push_analytics", [], |row| row.get(0))
             .unwrap_or(0)
     }
 
     fn count_by_governance(&self, decision: &GovernanceDecision) -> u64 {
-        let conn = self.conn.lock().unwrap();
+        let conn = crate::util::recover_lock_or_warn("sqlite_store::count_by_governance", self.conn.lock());
         let pattern = match decision {
             GovernanceDecision::Approve => "Approve".to_string(),
             GovernanceDecision::Deny(r) => format!("Deny:{}", r),
@@ -280,25 +286,31 @@ impl AnalyticsStore for SqliteStore {
     }
 
     fn push_rate(&self) -> f64 {
-        let total = self.count_total();
+        let conn = crate::util::recover_lock_or_warn("sqlite_store::push_rate", self.conn.lock());
+        let total: u64 = conn
+            .query_row("SELECT COUNT(*) FROM push_analytics", [], |row| row.get(0))
+            .unwrap_or(0);
         if total == 0 {
             return 0.0;
         }
-        let conn = self.conn.lock().unwrap();
-        let pushed: u64 = conn.query_row(
-            "SELECT COUNT(*) FROM push_analytics WHERE pushed = 1",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
+        let pushed: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM push_analytics WHERE pushed = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
         pushed as f64 / total as f64
     }
 }
 
-fn parse_rfc3339(s: String) -> DateTime<Local> {
-    DateTime::parse_from_rfc3339(&s)
+/// Parse RFC3339 timestamp from DB. Returns `None` on parse failure (AGENTS.md §2.2 不静默填补).
+/// Callers should log + skip the row when this returns None.
+fn parse_rfc3339(s: &str) -> Option<DateTime<Local>> {
+    DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.with_timezone(&Local))
-        .unwrap_or_else(|_| Local::now())
+        .map_err(|e| log::warn!("[SqliteStore] corrupt ts '{}': {}", s, e))
+        .ok()
 }
 
 #[cfg(test)]

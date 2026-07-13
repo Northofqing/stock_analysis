@@ -209,11 +209,11 @@ pub fn v14_record_delivery(
 /// 测试辅助: 清空 L4 dedup 表 (V14_STACK 是 OnceLock 单例, 跨测试共享)
 #[cfg(test)]
 pub fn _reset_dedup_for_test() {
-    v14_stack()
-        .dispatcher
-        .lock()
-        .expect("dispatcher lock")
-        .clear_dedup();
+    let stack = v14_stack();
+    match stack.dispatcher.write() {
+        Ok(mut g) => g.clear_dedup(),
+        Err(poisoned) => poisoned.into_inner().clear_dedup(),
+    }
 }
 
 /// PushKind → SignalSource/kind_str/severity 映射

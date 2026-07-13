@@ -120,9 +120,6 @@ impl GovernanceEngine {
             }
         }
 
-        // Step 5: 类别豁免 (post_session / quiet_hour 不限 cooldown, 但本函数只做 governance, cooldown 在 dispatcher 单独判定)
-        let _ = event_kind_exempt_from_cooldown(profile.category);
-
         GovernanceDecision::Approve
     }
 }
@@ -133,28 +130,10 @@ impl Default for GovernanceEngine {
     }
 }
 
-/// 类别豁免 (用于 dispatcher.cooldown_table 的 bypass 逻辑)
-pub fn event_kind_exempt_from_cooldown(category: TemplateCategory) -> bool {
-    matches!(category, TemplateCategory::PostSession | TemplateCategory::QuietHour)
-}
-
 /// 静默期判定 (02:00-06:00)
 pub fn is_quiet_hour(ts: DateTime<Local>) -> bool {
     let hour = ts.hour();
     hour >= 2 && hour < 6
-}
-
-/// DataMode 严重度 (与 push_l2::DataMode PartialOrd 一致, 这里数值化便于比较)
-///
-/// 注: Push 的 DataMode 已有 PartialOrd, 这里是为了让 §3.5 的 "ctx.data_mode < profile.data_mode_min" 表述更明确
-/// (即: 当前数据质量比模板要求的最低质量还要差)
-pub fn data_mode_severity(mode: DataMode) -> u8 {
-    match mode {
-        DataMode::Full => 0,
-        DataMode::Degraded => 1,
-        DataMode::Unsafe => 2,
-        DataMode::Down => 3,
-    }
 }
 
 /// 从 SignalEvent 推断 payload 严重度 (用于 governance 优先级)
@@ -368,13 +347,6 @@ mod tests {
     }
 
     #[test]
-    fn data_mode_severity_ordering() {
-        assert!(data_mode_severity(DataMode::Down) > data_mode_severity(DataMode::Unsafe));
-        assert!(data_mode_severity(DataMode::Unsafe) > data_mode_severity(DataMode::Degraded));
-        assert!(data_mode_severity(DataMode::Degraded) > data_mode_severity(DataMode::Full));
-    }
-
-    #[test]
     fn event_severity_ordering() {
         assert!(event_severity(&make_event_with_severity(Severity::Emergency))
             > event_severity(&make_event_with_severity(Severity::High)));
@@ -399,14 +371,6 @@ mod tests {
         assert!(is_data_source_down_event(&event));
         let event = make_event(SignalSource::LimitUp);
         assert!(!is_data_source_down_event(&event));
-    }
-
-    #[test]
-    fn post_session_exempt_from_cooldown() {
-        assert!(event_kind_exempt_from_cooldown(TemplateCategory::PostSession));
-        assert!(event_kind_exempt_from_cooldown(TemplateCategory::QuietHour));
-        assert!(!event_kind_exempt_from_cooldown(TemplateCategory::LimitUp));
-        assert!(!event_kind_exempt_from_cooldown(TemplateCategory::Holding));
     }
 
     #[test]

@@ -29,3 +29,17 @@ pub fn strip_html_tags(s: &str) -> String {
     }
     out
 }
+
+/// Mutex poison recovery: `lock().unwrap()` 在 panic 后会留下 Poisoned lock,
+/// 直接 `unwrap()` 会 panic 二次. 用这个 helper 在 poison 后继续 (log warn + into_inner).
+///
+/// 用法: `let g = recover_lock_or_warn("ctx_name", mutex.lock());`
+pub fn recover_lock_or_warn<T>(ctx: &str, result: Result<T, std::sync::PoisonError<T>>) -> T {
+    match result {
+        Ok(g) => g,
+        Err(poisoned) => {
+            log::warn!("[lock-poison-recover] {ctx}: continuing with poisoned lock");
+            poisoned.into_inner()
+        }
+    }
+}

@@ -85,7 +85,6 @@ impl Dispatcher {
         // 导致首次调用被自己的冷却期拦截. 正确: 区分"刚插入"与"已存在".
         let now = Instant::now();
         use dashmap::mapref::entry::Entry;
-        let is_fresh = !self.dedup_table.contains_key(&key);
         match self.dedup_table.entry(key) {
             Entry::Vacant(v) => {
                 v.insert((now, window));
@@ -107,7 +106,6 @@ impl Dispatcher {
                 }
                 // 冷却已过 → 刷新时间戳
                 o.get_mut().0 = now;
-                let _ = is_fresh; // 显式标注未来扩展用
             }
         }
         self.stats.dispatched.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

@@ -120,17 +120,17 @@ impl InMemoryStore {
 
     /// 当前记录数 (调试用)
     pub fn len(&self) -> usize {
-        self.records.lock().unwrap().len()
+        crate::util::recover_lock_or_warn("InMemoryStore::len", self.records.lock()).len()
     }
 
     /// 是否为空
     pub fn is_empty(&self) -> bool {
-        self.records.lock().unwrap().is_empty()
+        crate::util::recover_lock_or_warn("InMemoryStore::is_empty", self.records.lock()).is_empty()
     }
 
     /// 清空 (测试用)
     pub fn clear(&self) {
-        self.records.lock().unwrap().clear();
+        crate::util::recover_lock_or_warn("InMemoryStore::clear", self.records.lock()).clear();
     }
 }
 
@@ -142,22 +142,18 @@ impl Default for InMemoryStore {
 
 impl AnalyticsStore for InMemoryStore {
     fn record(&self, analytics: &PushAnalytics) {
-        self.records.lock().unwrap().push(analytics.clone());
+        crate::util::recover_lock_or_warn("InMemoryStore::record", self.records.lock()).push(analytics.clone());
     }
 
     fn get_by_event_id(&self, event_id: &str) -> Option<PushAnalytics> {
-        self.records
-            .lock()
-            .unwrap()
+        crate::util::recover_lock_or_warn("InMemoryStore::get_by_event_id", self.records.lock())
             .iter()
             .find(|a| a.event_id == event_id)
             .cloned()
     }
 
     fn query_by_time_range(&self, from: DateTime<Local>, to: DateTime<Local>) -> Vec<PushAnalytics> {
-        self.records
-            .lock()
-            .unwrap()
+        crate::util::recover_lock_or_warn("InMemoryStore::query_by_time_range", self.records.lock())
             .iter()
             .filter(|a| a.ts >= from && a.ts <= to)
             .cloned()
@@ -165,20 +161,18 @@ impl AnalyticsStore for InMemoryStore {
     }
 
     fn count_total(&self) -> u64 {
-        self.records.lock().unwrap().len() as u64
+        crate::util::recover_lock_or_warn("InMemoryStore::count_total", self.records.lock()).len() as u64
     }
 
     fn count_by_governance(&self, decision: &GovernanceDecision) -> u64 {
-        self.records
-            .lock()
-            .unwrap()
+        crate::util::recover_lock_or_warn("InMemoryStore::count_by_governance", self.records.lock())
             .iter()
             .filter(|a| &a.governance_decision == decision)
             .count() as u64
     }
 
     fn push_rate(&self) -> f64 {
-        let records = self.records.lock().unwrap();
+        let records = crate::util::recover_lock_or_warn("InMemoryStore::push_rate", self.records.lock());
         if records.is_empty() {
             return 0.0;
         }
