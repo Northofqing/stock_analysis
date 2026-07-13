@@ -92,7 +92,7 @@ impl LaunchGate {
                 if m.gray_days >= 30 && m.winrate_pct >= 0.55 {
                     Some(LaunchStage::Live)
                 } else if m.winrate_pct < 0.50 {
-                    Some(LaunchStage::Shadow)
+                    Some(LaunchStage::Gray)
                 } else {
                     None
                 }
@@ -112,10 +112,10 @@ pub fn current_stage() -> LaunchStage {
             Ok(stage) => stage,
             Err(e) => {
                 log::warn!("[LaunchGate] {} — fallback to Shadow", e);
-                LaunchStage::Shadow
+                LaunchStage::Gray
             }
         },
-        Err(_) => LaunchStage::Shadow,
+        Err(_) => LaunchStage::Gray,
     }
 }
 
@@ -218,10 +218,10 @@ mod tests {
 
     #[test]
     fn test_should_push_user() {
-        // 修复 v9.4.23: Shadow 推全量 (之前返回 false 导致飞书推送静默)
-        assert!(should_push_user(LaunchStage::Shadow, false));
+        // v15.1 A2.4: Shadow 推全量 (默认行为), Gray 仅推 critical (默认 stage)
+        assert!(should_push_user(LaunchStage::Shadow, false));  // Shadow 推全量
         assert!(should_push_user(LaunchStage::Shadow, true));
-        assert!(!should_push_user(LaunchStage::Gray, false));
+        assert!(!should_push_user(LaunchStage::Gray, false));    // Gray 限 critical
         assert!(should_push_user(LaunchStage::Gray, true));
         assert!(should_push_user(LaunchStage::Live, false));
         assert!(should_push_user(LaunchStage::Live, true));
@@ -274,7 +274,7 @@ mod tests {
         };
         assert_eq!(
             LaunchGate::check_transition(LaunchStage::Gray, &m),
-            Some(LaunchStage::Shadow)
+            Some(LaunchStage::Gray)
         );
 
         let m = StageMetrics {
@@ -300,15 +300,16 @@ mod tests {
     }
 
     #[test]
-    fn test_current_stage_default_shadow() {
+    fn test_current_stage_default_gray() {
+        // v15.1 A2.4: 默认 Gray (更安全, 默认只推 critical alert)
         std::env::remove_var("STAGE");
-        assert_eq!(current_stage(), LaunchStage::Shadow);
+        assert_eq!(current_stage(), LaunchStage::Gray);
 
         std::env::set_var("STAGE", "Live");
         assert_eq!(current_stage(), LaunchStage::Live);
 
         std::env::set_var("STAGE", "bogus");
-        assert_eq!(current_stage(), LaunchStage::Shadow);
+        assert_eq!(current_stage(), LaunchStage::Gray);
 
         std::env::remove_var("STAGE");
     }
@@ -353,7 +354,7 @@ mod tests {
         m.winrate_pct = 0.45;
         assert_eq!(
             LaunchGate::check_transition(current, &m),
-            Some(LaunchStage::Shadow)
+            Some(LaunchStage::Gray)
         );
 
         // 6. 再 Gray, 满足 → Live
