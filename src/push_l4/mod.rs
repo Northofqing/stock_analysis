@@ -8,4 +8,4 @@
 pub mod dispatcher;
 
 // 重新导出
-pub use dispatcher::{DispatchOutcome, Dispatcher, DispatcherStats};
+pub use dispatcher::{DispatchOutcome, Dispatcher, DispatcherStats, ReserveOutcome};

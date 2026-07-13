@@ -56,12 +56,77 @@ pub enum DispatchOutcome {
     Deduped(String),
 }
 
+/// v15.1 A3: 新的 reserve/commit/rollback 三阶段 dedup API
+///
+/// 解决 c1a9cfd 引入的 dedup-before-delivery bug:
+/// 旧 dispatch() 在 governance 闸通过后立刻插入 dedup entry,
+/// 但若 push_wechat 失败 (sink 错误/网络), 该 entry 仍占满 cooldown 窗口
+/// (DailyReport 86400s = 24h 黑屏).
+///
+/// 新契约:
+/// - reserve() 只检查 dedup 不插入, 返回 Reserved | Deduped
+/// - 推送成功后 commit() 真正插入 entry
+/// - 推送失败 rollback() 是 no-op (reserve 没占位)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReserveOutcome {
+    /// 可以继续推送 (新事件或冷却窗口已过)
+    Reserved,
+    /// 在冷却窗口内, 不应推送
+    Deduped,
+}
+
 impl Dispatcher {
     pub fn new() -> Self {
         Self {
             dedup_table: DashMap::new(),
             stats: DispatcherStats::default(),
         }
+    }
+
+    /// v15.1 A3: 检查 dedup 但不插入 (新契约). 调用方在 push 成功后调 commit().
+    pub fn reserve(&self, event: &SignalEvent, cooldown: Option<Duration>) -> ReserveOutcome {
+        let Some(window) = cooldown.filter(|w| !w.is_zero()) else {
+            return ReserveOutcome::Reserved;
+        };
+        let key = (
+            event.kind.clone(),
+            event.code.clone().unwrap_or_default(),
+        );
+        match self.dedup_table.get(&key) {
+            Some(entry) => {
+                let (prev, w) = *entry.value();
+                if prev.elapsed() < w {
+                    self.stats.deduped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    ReserveOutcome::Deduped
+                } else {
+                    ReserveOutcome::Reserved
+                }
+            }
+            None => ReserveOutcome::Reserved,
+        }
+    }
+
+    /// v15.1 A3: 实际插入 dedup entry (push 成功后调用)
+    pub fn commit(&self, event: &SignalEvent, cooldown: Option<Duration>) {
+        let Some(window) = cooldown.filter(|w| !w.is_zero()) else {
+            return;
+        };
+        let key = (
+            event.kind.clone(),
+            event.code.clone().unwrap_or_default(),
+        );
+        let now = std::time::Instant::now();
+        self.dedup_table.insert(key, (now, window));
+        self.stats.dispatched.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.dedup_table.len() >= DEDUP_TABLE_SOFT_CAP {
+            self.dedup_table.retain(|_, (t, w)| t.elapsed() < *w);
+        }
+    }
+
+    /// v15.1 A3: 失败回滚 — 因为 reserve() 不占位, 此函数为 no-op
+    /// (保留 API 对称性, 让 push_governor_inner 显式调用)
+    pub fn rollback(&self, _event: &SignalEvent, _cooldown: Option<Duration>) {
+        // no-op: reserve 不留痕, 无需回滚
     }
 
     /// dispatch 入口 — W4.2: 按 (kind, code) + 冷却窗口做速率限制
@@ -71,6 +136,10 @@ impl Dispatcher {
     /// b013 P2-14: entry API 一次操作, 消除 len()/retain()/insert() TOCTOU.
     ///
     /// `cooldown = None` → 不做冷却直接放行 (调用方声明该 kind 无冷却或冷却归其他层)
+    ///
+    /// **v15.1 A3 DEPRECATED**: 用 reserve/commit 两阶段代替, 避免 delivery 失败
+    /// 后 cooldown 仍占用窗口 (DailyReport 86400s 黑屏).
+    #[deprecated(note = "v15.1 A3: use reserve() + commit() instead to allow rollback on delivery failure")]
     pub fn dispatch(&self, event: &SignalEvent, cooldown: Option<Duration>) -> DispatchOutcome {
         let Some(window) = cooldown.filter(|w| !w.is_zero()) else {
             self.stats.dispatched.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -256,5 +325,68 @@ mod tests {
         let d = dispatcher.lock().unwrap();
         assert_eq!(d.stats.dispatched.load(std::sync::atomic::Ordering::Relaxed), 10);
         assert_eq!(d.stats.deduped.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    // ============= v15.1 A3: reserve/commit/rollback 三阶段测试 =============
+
+    #[test]
+    fn reserve_first_call_succeeds() {
+        let d = Dispatcher::new();
+        let e = make_event("600519");
+        // reserve 不插入
+        assert_eq!(d.reserve(&e, WIN), ReserveOutcome::Reserved);
+        assert_eq!(d.dedup_size(), 0, "reserve() 不应插入");
+    }
+
+    #[test]
+    fn reserve_second_call_within_window_deduped() {
+        let d = Dispatcher::new();
+        let e = make_event("600519");
+        let _ = d.reserve(&e, WIN);
+        // reserve 没插, 再 reserve 还是 Reserved (这是 reserve 的特性)
+        // 但 commit() 之后再 reserve 才 Deduped
+        d.commit(&e, WIN);
+        assert_eq!(d.reserve(&e, WIN), ReserveOutcome::Deduped);
+    }
+
+    #[test]
+    fn delivery_failure_rolls_back_dedup() {
+        let d = Dispatcher::new();
+        let e = make_event("600519");
+
+        // 1. reserve (不插入)
+        assert_eq!(d.reserve(&e, WIN), ReserveOutcome::Reserved);
+        assert_eq!(d.dedup_size(), 0);
+
+        // 2. 模拟推送失败 → rollback (no-op, reserve 没占位)
+        d.rollback(&e, WIN);
+        assert_eq!(d.dedup_size(), 0, "rollback 后仍应没有 dedup entry");
+
+        // 3. 立即 retry 应该 Reserved (不 Deduped — 关键修复)
+        assert_eq!(d.reserve(&e, WIN), ReserveOutcome::Reserved);
+
+        // 4. 模拟推送成功 → commit (真正插入)
+        d.commit(&e, WIN);
+        assert_eq!(d.dedup_size(), 1);
+
+        // 5. 第三次再 reserve 应该 Deduped (因为 commit 过了)
+        assert_eq!(d.reserve(&e, WIN), ReserveOutcome::Deduped);
+    }
+
+    #[test]
+    fn commit_inserts_after_window_expiry() {
+        let d = Dispatcher::new();
+        let e = make_event("600519");
+        let win = Some(Duration::from_millis(50));
+
+        // 第一次 commit, 立即 reserve 应该是 Deduped
+        d.commit(&e, win);
+        assert_eq!(d.reserve(&e, win), ReserveOutcome::Deduped);
+
+        // 等窗口过期
+        std::thread::sleep(Duration::from_millis(80));
+
+        // 窗口过期后 reserve 应是 Reserved
+        assert_eq!(d.reserve(&e, win), ReserveOutcome::Reserved);
     }
 }

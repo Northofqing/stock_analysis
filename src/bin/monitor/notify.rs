@@ -522,7 +522,13 @@ async fn push_governor_inner(text: &str, kind: PushKind, code: Option<&str>) -> 
         V14Gate::Denied(reason) => return PushOutcome::Denied(reason),
         V14Gate::Approved(event) => event,
     };
+    // v15.1 A3: 把 reserve/commit 拆分, 失败时 rollback 不占 cooldown 窗口
     let delivered = push_wechat(text).await;
+    if delivered {
+        v14_adapter::commit_dedup_for_event(&event, kind);
+    } else {
+        v14_adapter::rollback_dedup_for_event(&event, kind);
+    }
     // b013 review P2-15: 入口取一次 channel (避免 push_wechat await 后 env 抖动)
     let channel = current_send_channel();
     v14_adapter::v14_record_delivery(&event, kind, text, delivered, channel);

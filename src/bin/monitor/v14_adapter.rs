@@ -29,7 +29,7 @@ use std::time::Duration;
 use chrono::{Local, Timelike};
 use stock_analysis::push_l1::{Severity, SignalEvent, SignalPayload, SignalSource};
 use stock_analysis::push_l2::{DataMode, RenderedText, TemplateMetadata};
-use stock_analysis::push_l4::{DispatchOutcome, Dispatcher};
+use stock_analysis::push_l4::{DispatchOutcome, Dispatcher, ReserveOutcome};
 use stock_analysis::push_l5::{GovernanceContext, GovernanceDecision, GovernanceEngine};
 use stock_analysis::push_l7::{build_analytics, AnalyticsStore, SqliteStore};
 
@@ -123,7 +123,7 @@ pub fn v14_gate(kind: PushKind, code: Option<&str>) -> V14Gate {
         return V14Gate::Denied(reason);
     }
 
-    // L4 dedup (Approved 后再做, 失败回滚见 push_governor_inner: dedup 状态在 record 之后才插)
+    // L4 dedup (v15.1 A3: 用 reserve() 只检查不插入, 投递成功后由 push_governor_inner 调 commit())
     let cooldown = match kind.cooldown_scope() {
         CooldownScope::External => None,
         CooldownScope::PerTicket if code.is_none() => None,
@@ -131,9 +131,9 @@ pub fn v14_gate(kind: PushKind, code: Option<&str>) -> V14Gate {
             .cooldown_secs()
             .map(|s| Duration::from_secs(u64::from(s))),
     };
-    let outcome = lock_dispatcher(&stack).dispatch(&event, cooldown);
-    if let DispatchOutcome::Deduped(detail) = outcome {
-        log::info!("[v14.2] L4 dedup: PushKind={:?} ({})", kind, detail);
+    let outcome = lock_dispatcher(&stack).reserve(&event, cooldown);
+    if let ReserveOutcome::Deduped = outcome {
+        log::info!("[v14.2] L4 dedup: PushKind={:?} (reserved-only, no insert yet)", kind);
         // b013 P1-11: dedup 留痕
         let analytics = build_analytics(
             &event, kind_str, 1, ctx.data_mode, GovernanceDecision::Approve, None, false,
@@ -157,6 +157,20 @@ fn lock_dispatcher(stack: &'static V14Stack) -> std::sync::RwLockReadGuard<'stat
             poisoned.into_inner()
         }
     }
+}
+
+/// v15.1 A3: push 成功后 commit dedup entry (由 push_governor_inner 调用)
+pub fn commit_dedup_for_event(event: &SignalEvent, kind: PushKind) {
+    let stack = v14_stack();
+    let cooldown = kind.cooldown_secs().map(|s| Duration::from_secs(u64::from(s)));
+    lock_dispatcher(&stack).commit(event, cooldown);
+}
+
+/// v15.1 A3: push 失败后 rollback (no-op, reserve 不留痕, 保留 API 对称)
+pub fn rollback_dedup_for_event(event: &SignalEvent, kind: PushKind) {
+    let stack = v14_stack();
+    let cooldown = kind.cooldown_secs().map(|s| Duration::from_secs(u64::from(s)));
+    lock_dispatcher(&stack).rollback(event, cooldown);
 }
 
 fn lock_store(
