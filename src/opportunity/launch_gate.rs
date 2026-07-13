@@ -112,10 +112,10 @@ pub fn current_stage() -> LaunchStage {
             Ok(stage) => stage,
             Err(e) => {
                 log::warn!("[LaunchGate] {} — fallback to Shadow", e);
-                LaunchStage::Gray
+                LaunchStage::Shadow
             }
         },
-        Err(_) => LaunchStage::Gray,
+        Err(_) => LaunchStage::Shadow,
     }
 }
 
@@ -300,16 +300,16 @@ mod tests {
     }
 
     #[test]
-    fn test_current_stage_default_gray() {
-        // v15.1 A2.4: 默认 Gray (更安全, 默认只推 critical alert)
+    fn test_current_stage_default_shadow() {
+        // v15.1.1: 默认 Shadow (Gray 默认会让生产静默, revert)
         std::env::remove_var("STAGE");
-        assert_eq!(current_stage(), LaunchStage::Gray);
+        assert_eq!(current_stage(), LaunchStage::Shadow);
 
         std::env::set_var("STAGE", "Live");
         assert_eq!(current_stage(), LaunchStage::Live);
 
         std::env::set_var("STAGE", "bogus");
-        assert_eq!(current_stage(), LaunchStage::Gray);
+        assert_eq!(current_stage(), LaunchStage::Shadow);
 
         std::env::remove_var("STAGE");
     }
