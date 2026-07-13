@@ -11546,28 +11546,51 @@ mod tests_wrapper_real_raw {
 // v15.3 D6.2: news_pipeline_loop + news_push_loop wire
 // ============================================================================
 
-/// 把 NewsPush 转 v14 push 调用
+/// v15.3 wire-aware push: 从 np.text 解析 marker [v15.3:status:source] 决定精确 PushKind
 async fn news_push_via_v14(np: stock_analysis::news::dispatcher::NewsPush) -> bool {
-    use stock_analysis::news::dispatcher::NewsPush as NP;
-    let kind = if np.score >= 90.0 {
-        PushKind::EarningsBeat
-    } else if np.score >= 70.0 {
-        if np.headline.contains("ipo_") || np.headline.contains("IPO") {
-            PushKind::IpoCatalyst
-        } else if np.headline.contains("policy_") || np.headline.contains("政策") {
-            PushKind::PolicyHit
-        } else if np.headline.contains("analyst_") || np.headline.contains("评级") {
-            PushKind::AnalystUpgrade
-        } else {
-            PushKind::PolicyHit
-        }
-    } else if np.score >= 40.0 {
-        PushKind::NewsCatalyst
-    } else {
-        PushKind::NewsRanked
+    // 解析 marker 例如 "[v15.3:beat:policy] ..." or "[v15.3:miss:earnings] ..."
+    let (status, source) = parse_v15_3_marker(&np.text);
+    let stripped = strip_v15_3_marker(&np.text);
+
+    let kind = match (status.as_str(), source.as_str()) {
+        // 财报 beat/miss 显式
+        ("miss", _) => PushKind::EarningsMiss,
+        ("beat_or_pos", "earnings") => PushKind::EarningsBeat,
+        // 政策类 (含政府文件 / 公告 / 通用政策)
+        (_, "policy") => PushKind::PolicyHit,
+        // 财报正向但不是显式 earnings 源 — 视作 beat/analyst/marketaction
+        ("beat_or_pos", "analyst") => PushKind::AnalystUpgrade,
+        ("beat_or_pos", "marketaction") => PushKind::MarketActionAlert,
+        ("beat_or_pos", _) => PushKind::EarningsBeat,
+        // 其他 → 默认 Info 级别
+        _ => PushKind::NewsRanked,
     };
-    let outcome = notify::push_governor_v3(&np.text, kind, np.code.as_deref()).await;
+    let outcome = notify::push_governor_v3(&stripped, kind, np.code.as_deref()).await;
     matches!(outcome, notify::PushOutcome::Pushed)
+}
+
+/// 从 "[v15.3:status:source] body" 提取 marker
+fn parse_v15_3_marker(text: &str) -> (String, String) {
+    if let Some(rest) = text.strip_prefix("[v15.3:") {
+        if let Some(colon) = rest.find(':') {
+            let status = rest[..colon].to_string();
+            let after_colon = &rest[colon + 1..];
+            if let Some(bracket) = after_colon.find(']') {
+                let source = after_colon[..bracket].to_string();
+                return (status, source);
+            }
+        }
+    }
+    ("unknown".to_string(), "unknown".to_string())
+}
+
+fn strip_v15_3_marker(text: &str) -> String {
+    if let Some(rest) = text.strip_prefix("[v15.3:") {
+        if let Some(bracket) = rest.find(']') {
+            return rest[bracket + 1..].trim_start().to_string();
+        }
+    }
+    text.to_string()
 }
 
 /// v15.3 D6.2 push_loop — recv from news::sink channel → push_governor_v3
@@ -11620,6 +11643,7 @@ async fn news_pipeline_loop_v15_3() {
         }
         log::info!("[v15.3 news_pipeline] tick -> {} events", events.len());
         for event in events {
+            use stock_analysis::signal::market_event::{Direction, EventType};
             let sm_relation = stock_analysis::news::stock_mapper::relation_for_event_type(event.event_type);
             let relation = match sm_relation {
                 stock_analysis::news::stock_mapper::Relation::SelfCode => stock_analysis::news::impact::RelationType::SelfCode,
@@ -11630,11 +11654,26 @@ async fn news_pipeline_loop_v15_3() {
                 stock_analysis::news::stock_mapper::Relation::EarningsRef => stock_analysis::news::impact::RelationType::EarningsRef,
             };
             let impact = stock_analysis::news::impact::score_event(&event, relation, 1);
-            if let Some(np) = stock_analysis::news::dispatcher::decide(&impact) {
-                let ok = sink::try_push(&np);
-                if !ok {
-                    log::debug!("[v15.3 news_pipeline] sink try_push 失败 (push_loop 未启)");
-                }
+            // 把 event_type 钉到 impact 上, 让 push_loop 能做精确 PushKind 选择
+            let mut np = match stock_analysis::news::dispatcher::decide(&impact) {
+                Some(p) => p,
+                None => continue,  // score < 40, skip
+            };
+            // 在 text 里塞个 marker 标记 event_type, push_loop 用它决定 PushKind
+            let et_label = match event.event_type {
+                EventType::Policy => "policy",
+                EventType::Earnings => "earnings",
+                EventType::AnalystView => "analyst",
+                EventType::MarketAction => "marketaction",
+                EventType::Announcement => "policy",  // 公告走低分 Info, 标 policy (兼容)
+                _ => "policy",
+            };
+            // 用 direction 控制 EarningsBeat vs EarningsMiss
+            let bear = matches!(event.direction, Direction::Bear);
+            np.text = format!("[v15.3:{}:{}] {}", if bear {"miss"} else {"beat_or_pos"}, et_label, np.text);
+            let ok = sink::try_push(&np);
+            if !ok {
+                log::debug!("[v15.3 news_pipeline] sink try_push 失败 (push_loop 未启)");
             }
         }
     }
