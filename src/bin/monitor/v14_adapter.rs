@@ -303,6 +303,16 @@ fn map_push_kind(kind: PushKind) -> (SignalSource, &'static str, Severity) {
         PushKind::IpoCatalyst => {
             (SignalSource::Ipo, "ipo_catalyst", Severity::Normal)
         }
+        // v15.3 D5.2: 4 路源 SignalSource 映射
+        PushKind::PolicyHit => (SignalSource::Policy, "policy_hit", Severity::High),
+        PushKind::EarningsBeat => (SignalSource::Earnings, "earnings_beat", Severity::High),
+        PushKind::EarningsMiss => (SignalSource::Earnings, "earnings_miss", Severity::High),
+        PushKind::AnalystUpgrade => {
+            (SignalSource::AnalystView, "analyst_upgrade", Severity::Normal)
+        }
+        PushKind::MarketActionAlert => {
+            (SignalSource::MarketAction, "market_action_alert", Severity::High)
+        }
     }
 }
 

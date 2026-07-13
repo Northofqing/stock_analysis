@@ -57,6 +57,15 @@ pub enum SignalSource {
     QuietHour,
     /// v15.1 C1.1: IPO 监测推送 (Ipo payload)
     Ipo,
+    // v15.3 D5.2: 4 路源 SignalSource
+    /// 政策催化 (PolicyHit payload)
+    Policy,
+    /// 财报超预期/低预期 (Earnings payload)
+    Earnings,
+    /// 实盘异常 (MarketAction payload)
+    MarketAction,
+    /// 卖方评级 / 行业策略 (AnalystView payload)
+    AnalystView,
 }
 
 /// 事件严重度

@@ -139,6 +139,17 @@ pub enum PushKind {
     IpoProspectus,
     /// IPO 阶段变化 / 供应链受益 (Info, 3600s)
     IpoCatalyst,
+    // ============= v15.3 D5.1: 4 路源新推送 =============
+    /// 政策催化（十五五规划 / 国务院 / 发改委）(Important, 86400s)
+    PolicyHit,
+    /// 业绩超预期 (Important, 43200s)
+    EarningsBeat,
+    /// 业绩低于预期 (Important, 43200s)
+    EarningsMiss,
+    /// 卖方评级上调 (Important, 86400s)
+    AnalystUpgrade,
+    /// 今日实盘异常 — 持仓变动 / 账户模式切换 (Emergency, 60s)
+    MarketActionAlert,
 }
 
 impl PushKind {
@@ -186,6 +197,13 @@ impl PushKind {
             | PushKind::BlockTradePriceRange => PushLevel::Important,
             // v14 PaperReview + CandidateInvalidated
             | PushKind::CandidateInvalidated => PushLevel::Important,
+            // v15.3 D5: 4 路源重要级 (PolicyHit/EarningsBeat/EarningsMiss/AnalystUpgrade)
+            | PushKind::PolicyHit
+            | PushKind::EarningsBeat
+            | PushKind::EarningsMiss
+            | PushKind::AnalystUpgrade => PushLevel::Important,
+            // v15.3 D5: 实盘异常是紧急级
+            | PushKind::MarketActionAlert => PushLevel::Emergency,
             // ℹ️参考 (降级 + ForbiddenOps/PaperTrade)
             _ => PushLevel::Info,
         }
@@ -276,7 +294,13 @@ impl PushKind {
             PushKind::CandidateInvalidated => Some(1800),                     // 30 min
             // v58: P-05 虚拟观察仓 (开盘 9:30 推一次, 1次/日)
             PushKind::VirtualWatch => Some(86_400), // 1次/日
-            _ => Some(1800),                        // 默认 30min
+            // v15.3 D5.1: 4 路源冷却
+            PushKind::PolicyHit => Some(86_400),       // 1次/日
+            PushKind::EarningsBeat => Some(43_200),    // 12h
+            PushKind::EarningsMiss => Some(43_200),     // 12h
+            PushKind::AnalystUpgrade => Some(86_400),   // 1次/日
+            PushKind::MarketActionAlert => Some(60),    // 1 min/票 (实盘异常需立即)
+            _ => Some(1800),                            // 默认 30min
         }
     }
 
@@ -355,6 +379,12 @@ impl PushKind {
             PushKind::IpoListingApproval => "IPO 过会",
             PushKind::IpoProspectus => "招股说明书",
             PushKind::IpoCatalyst => "IPO 阶段催化",
+            // v15.3 D5.1: 4 路源标题
+            PushKind::PolicyHit => "政策催化",
+            PushKind::EarningsBeat => "业绩超预期",
+            PushKind::EarningsMiss => "业绩低于预期",
+            PushKind::AnalystUpgrade => "卖方评级上调",
+            PushKind::MarketActionAlert => "实盘异常",
         }
     }
 }
