@@ -15,3 +15,4 @@ pub mod ipo;
 pub mod aggregator;
 pub mod impact;
 pub mod dispatcher;
+pub mod sink;

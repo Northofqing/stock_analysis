@@ -2222,7 +2222,7 @@ async fn main() {
 
         let main_loops = async {
 
-            tokio::join!(monitor_loop(), news_monitor_loop());
+            tokio::join!(monitor_loop(), news_monitor_loop(), news_pipeline_loop_v15_3());
 
         };
 
@@ -11540,4 +11540,69 @@ mod tests_wrapper_real_raw {
 
     }
 
+}
+
+// ============================================================================
+// v15.3 D6.2: news_pipeline_loop + news_push_loop wire
+// ============================================================================
+
+/// 把 NewsPush 转 v14 push 调用
+async fn news_push_via_v14(np: stock_analysis::news::dispatcher::NewsPush) -> bool {
+    use stock_analysis::news::dispatcher::NewsPush as NP;
+    let kind = if np.score >= 90.0 {
+        PushKind::EarningsBeat
+    } else if np.score >= 70.0 {
+        if np.headline.contains("ipo_") || np.headline.contains("IPO") {
+            PushKind::IpoCatalyst
+        } else if np.headline.contains("policy_") || np.headline.contains("政策") {
+            PushKind::PolicyHit
+        } else if np.headline.contains("analyst_") || np.headline.contains("评级") {
+            PushKind::AnalystUpgrade
+        } else {
+            PushKind::PolicyHit
+        }
+    } else if np.score >= 40.0 {
+        PushKind::NewsCatalyst
+    } else {
+        PushKind::NewsRanked
+    };
+    let outcome = notify::push_governor_v3(&np.text, kind, np.code.as_deref()).await;
+    matches!(outcome, notify::PushOutcome::Pushed)
+}
+
+/// v15.3 D6.2 push_loop — recv from news::sink channel → push_governor_v3
+async fn news_push_loop_v15_3(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<stock_analysis::news::dispatcher::NewsPush>,
+) {
+    log::info!("[v15.3 news_push_loop] 启动");
+    while let Some(np) = rx.recv().await {
+        if !news_push_via_v14(np).await {
+            log::debug!("[v15.3 news_push_loop] push deduped or failed");
+        }
+    }
+    log::warn!("[v15.3 news_push_loop] channel closed, loop exit");
+}
+
+/// v15.3 D6.2 pipeline_loop — 60s tick aggregator → score → decide → sink.send
+async fn news_pipeline_loop_v15_3() {
+    use stock_analysis::news::aggregator::{set_global as set_agg_global, NewsAggregator};
+    use stock_analysis::news::sink;
+    use std::sync::Arc;
+
+    // 1. 安装 sink channel 并 spawn push_loop
+    let rx = sink::install();
+    tokio::spawn(news_push_loop_v15_3(rx));
+    log::info!("[v15.3 news_pipeline] sink installed, push_loop spawned");
+
+    // 2. 注册空 aggregator (12 feeds 在 startup 由 feature 注册, 当前 no-op)
+    let agg = Arc::new(NewsAggregator::new(vec![]));
+    set_agg_global(agg);
+    log::info!("[v15.3 news_pipeline] aggregator empty (0 feeds), tick loop no-op source");
+
+    // 3. tick loop — 每 60s
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+    loop {
+        tick.tick().await;
+        log::trace!("[v15.3 news_pipeline] tick (skeleton)");
+    }
 }
