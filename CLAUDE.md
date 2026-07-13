@@ -99,6 +99,19 @@ If any of the three checks fails, the work is **not complete**, regardless of ho
 - `config/*.toml`: chain rules, exclusion boards, announcement keywords, monitor timers — SIGHUP hot-reloadable
 - All config files have code-level `const` fallbacks if toml is missing
 
+## v15.x Lessons Learned (post-mortem)
+
+**核心规则**: 默认值必须是"出声"的状态（推全量、记详细日志、显示警告）。任何"静默"默认值必须用 env var 显式声明才能生效。
+
+详细 post-mortem 见 `docs/v15.x/post-mortem-v15.1.1.md` (P0 推送静默事故)。
+
+**4 条硬规则**:
+
+1. **默认值原则** — 所有"行为开关"默认值 = 出声状态（推全量 / 详细日志 / 显示警告）。静默默认值需 env var 显式。
+2. **⚠️ BREAKING 标注** — 修改默认值时 commit msg 必须标 `BREAKING` + 写明回滚方法。
+3. **测试覆盖默认值** — 不允许默认值无测试断言。
+4. **静默路径可见** — 跳过推送/告警/任务的路径，启动时打印一次 mode + 每次跳过时 warn。
+
 # Tool Calling Rules
 When calling tools, follow these rules strictly. They override any conflicting habits from chat training.
 ## Argument formatting
