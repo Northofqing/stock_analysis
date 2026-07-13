@@ -335,6 +335,8 @@ fn current_governance_ctx() -> GovernanceContext {
         // b013 P0-7: Frozen 模式经 banner 进来, 治理能真正拦
         is_frozen: matches!(banner.account_mode, crate::push_templates::AccountMode::Frozen),
         now,
+        // v15.1 A2.1 TODO: 接线 count_today_for_user 需要 V14Stack.store 改 Arc<SqliteStore>
+        // (avoid unsafe transmute). 当前 daily_limit Deny 暂时仍不可达.
         today_pushed_count: 0,
     }
 }
