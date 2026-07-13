@@ -55,6 +55,8 @@ pub enum SignalSource {
     PostSessionReview,
     /// 静默时段自身治理 (QuietHour payload, b-008 §3.0 补充)
     QuietHour,
+    /// v15.1 C1.1: IPO 监测推送 (Ipo payload)
+    Ipo,
 }
 
 /// 事件严重度
@@ -82,6 +84,8 @@ pub enum SignalPayload {
     DataSourceDown(DataSourceDownPayload),
     PostSessionReview(PostSessionReviewPayload),
     QuietHour(QuietHourPayload),
+    // v15.1 C1.1: IPO 类型 (供 IPO 监测通道使用)
+    Ipo(IpoPayload),
 }
 
 // 各 payload 结构体 — 所有数值字段都是 Option<T>, 显式缺失
@@ -170,6 +174,23 @@ pub struct QuietHourPayload {
     pub hour: Option<u32>,
     pub expected_inhibit_count: Option<u32>,
     pub actual_inhibit_count: Option<u32>,
+}
+
+/// v15.1 C1.1: IPO 推送 payload
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IpoPayload {
+    /// pre-IPO 公司名 (如 "长鑫存储")
+    pub company: Option<String>,
+    /// 计划上市代码 (如有)
+    pub intended_code: Option<String>,
+    /// IPO 阶段 (PreSubmission/Submitted/InReview/Approved/Registered/Listed)
+    pub ipo_stage: Option<String>,
+    /// 关联的 A 股标的代码 (从 supply_chain::lookup 拿)
+    pub related_codes: Vec<String>,
+    /// 保荐机构
+    pub sponsor: Option<String>,
+    /// 催化强度 (0.0 - 1.0)
+    pub catalyst_score: Option<f64>,
 }
 
 // ============================================================================
