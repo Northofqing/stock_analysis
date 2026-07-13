@@ -7,6 +7,8 @@
 //!
 //! 复用现有: 不重建 NewsEvent, 不重建 dedup, 全部依赖 MarketEvent::simhash
 
+pub mod feed;
+
 use crate::signal::market_event::{EventType, MarketEvent};
 use anyhow::Result;
 use async_trait::async_trait;
