@@ -3866,9 +3866,12 @@ pub async fn dispatch_holding_plan_daily(hhmm: &str, banner: &BannerCtx) -> bool
         } else {
             0.0
         };
-        // 简单意图: >5% 减仓, <-3% 加仓, 否则持有
+        // 简单意图: >5% 减仓; -15% < pnl < -3% 加仓 (浅亏); 其它持有/alert
+        // 深度亏损 (< -15%) 不再推荐加仓 (v15.3 fix: 防止瀑布加仓)
         let intent = if pnl_pct > 5.0 {
             Intent::Reduce
+        } else if pnl_pct < -15.0 {
+            Intent::Hold  // 深度亏损不要再建议加仓 (除非用户主动)
         } else if pnl_pct < -3.0 {
             Intent::Add
         } else {
