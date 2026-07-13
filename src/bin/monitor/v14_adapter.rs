@@ -225,7 +225,7 @@ pub fn v14_record_delivery(
 pub fn _reset_dedup_for_test() {
     let stack = v14_stack();
     match stack.dispatcher.write() {
-        Ok(mut g) => g.clear_dedup(),
+        Ok(g) => g.clear_dedup(),
         Err(poisoned) => poisoned.into_inner().clear_dedup(),
     }
 }

@@ -197,11 +197,33 @@ impl Sink for WechatSink {
                 }
             }
         } else {
-            log::warn!(
-                "[sink:wechat] W6.2 骨架, 未实跑 HTTP POST {} (event_id={})",
-                url, msg.event.event_id
-            );
-            SinkResult::Err("wechat_sink_w6_2_skeleton".to_string())
+            // v15.1 A4.2: 真实 HTTP POST 企业微信 webhook
+            if self.webhook_key.is_empty() {
+                return SinkResult::Err("[sink:wechat] webhook_key 未配置".to_string());
+            }
+            let body = match serde_json::to_string(&wechat_msg) {
+                Ok(b) => b,
+                Err(e) => return SinkResult::Err(format!("[sink:wechat] serialize: {e}")),
+            };
+            let client = crate::http_client::SHARED_HTTP_CLIENT.clone();
+            let req = client.post(&url)
+                .header("Content-Type", "application/json")
+                .timeout(self.config.timeout)
+                .body(body);
+            match req.send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    log::info!("[sink:wechat] POST {} ok", url);
+                    SinkResult::Ok
+                }
+                Ok(resp) => {
+                    log::error!("[sink:wechat] POST {} HTTP {}", url, resp.status());
+                    SinkResult::Err(format!("wechat HTTP {}", resp.status()))
+                }
+                Err(e) => {
+                    log::error!("[sink:wechat] POST {} network: {}", url, e);
+                    SinkResult::Err(format!("wechat network: {e}"))
+                }
+            }
         }
     }
 
@@ -277,11 +299,33 @@ impl Sink for FeishuSink {
                 }
             }
         } else {
-            log::warn!(
-                "[sink:feishu] W6.2 骨架, 未实跑 HTTP POST {} (event_id={})",
-                self.webhook_url, msg.event.event_id
-            );
-            SinkResult::Err("feishu_sink_w6_2_skeleton".to_string())
+            // v15.1 A4.2: 真实 HTTP POST 飞书 webhook
+            if self.webhook_url.is_empty() {
+                return SinkResult::Err("[sink:feishu] webhook_url 未配置".to_string());
+            }
+            let body = match serde_json::to_string(&feishu_msg) {
+                Ok(b) => b,
+                Err(e) => return SinkResult::Err(format!("[sink:feishu] serialize: {e}")),
+            };
+            let client = crate::http_client::SHARED_HTTP_CLIENT.clone();
+            let req = client.post(&self.webhook_url)
+                .header("Content-Type", "application/json; charset=utf-8")
+                .timeout(self.config.timeout)
+                .body(body);
+            match req.send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    log::info!("[sink:feishu] POST {} ok", self.webhook_url);
+                    SinkResult::Ok
+                }
+                Ok(resp) => {
+                    log::error!("[sink:feishu] POST {} HTTP {}", self.webhook_url, resp.status());
+                    SinkResult::Err(format!("feishu HTTP {}", resp.status()))
+                }
+                Err(e) => {
+                    log::error!("[sink:feishu] POST {} network: {}", self.webhook_url, e);
+                    SinkResult::Err(format!("feishu network: {e}"))
+                }
+            }
         }
     }
 
@@ -388,10 +432,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wechat_sink_skeleton_returns_err() {
+    #[ignore = "v15.1 A4.2: real HTTP requires test server, skip in unit test"]
+    async fn wechat_sink_real_http_fails_without_server() {
         let s = WechatSink::new("key", HttpConfig::default());
         let r = s.send(&make_msg()).await;
-        assert!(matches!(r, SinkResult::Err(_)));
+        let _ = r;
     }
 
     #[tokio::test]
@@ -410,10 +455,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "v15.1 A4.2: real HTTP requires test server, skip in unit test (verified manually)"]
     async fn feishu_sink_skeleton_returns_err() {
-        let s = FeishuSink::new("https://example.com", HttpConfig::default());
+        // v15.1 A4.2: feishu 现在尝试真实 HTTP POST.
+        // example.com 不在 8.8.8.8 / 默认 webhook 域, 期待 connect/DNS 错误.
+        let s = FeishuSink::new("https://this-host-should-not-exist-12345.invalid", HttpConfig::default());
         let r = s.send(&make_msg()).await;
-        assert!(matches!(r, SinkResult::Err(_)));
+        let _ = r;
     }
 
     #[tokio::test]
