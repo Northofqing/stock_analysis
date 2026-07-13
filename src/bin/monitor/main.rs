@@ -11585,24 +11585,152 @@ async fn news_push_loop_v15_3(
 
 /// v15.3 D6.2 pipeline_loop — 60s tick aggregator → score → decide → sink.send
 async fn news_pipeline_loop_v15_3() {
-    use stock_analysis::news::aggregator::{set_global as set_agg_global, NewsAggregator};
+    use stock_analysis::news::aggregator::{feed, set_global as set_agg_global, NewsAggregator};
     use stock_analysis::news::sink;
-    use std::sync::Arc;
 
     // 1. 安装 sink channel 并 spawn push_loop
     let rx = sink::install();
     tokio::spawn(news_push_loop_v15_3(rx));
     log::info!("[v15.3 news_pipeline] sink installed, push_loop spawned");
 
-    // 2. 注册空 aggregator (12 feeds 在 startup 由 feature 注册, 当前 no-op)
-    let agg = Arc::new(NewsAggregator::new(vec![]));
+    // 2. 注册 12 个 feeds (生产). mock feeds 走 NEWS_MOCK_FEEDS=1 env.
+    register_v15_3_feeds();
+    let feeds = feed::take_all_for_aggregator();
+    let feed_count = feeds.len();
+    let agg = std::sync::Arc::new(NewsAggregator::new(feeds));
     set_agg_global(agg);
-    log::info!("[v15.3 news_pipeline] aggregator empty (0 feeds), tick loop no-op source");
+    log::info!("[v15.3 news_pipeline] aggregator initialized with {} feeds", feed_count);
 
     // 3. tick loop — 每 60s
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
     loop {
         tick.tick().await;
-        log::trace!("[v15.3 news_pipeline] tick (skeleton)");
+        // skip first tick (immediate, no real data yet)
+        let agg = match stock_analysis::news::aggregator::global() {
+            Some(a) => a,
+            None => {
+                log::warn!("[v15.3 news_pipeline] aggregator 未注入, 跳过 tick");
+                continue;
+            }
+        };
+        let events = agg.tick(20).await;
+        if events.is_empty() {
+            log::trace!("[v15.3 news_pipeline] tick return 0 events");
+            continue;
+        }
+        log::info!("[v15.3 news_pipeline] tick -> {} events", events.len());
+        for event in events {
+            let sm_relation = stock_analysis::news::stock_mapper::relation_for_event_type(event.event_type);
+            let relation = match sm_relation {
+                stock_analysis::news::stock_mapper::Relation::SelfCode => stock_analysis::news::impact::RelationType::SelfCode,
+                stock_analysis::news::stock_mapper::Relation::SupplyChain => stock_analysis::news::impact::RelationType::SupplyChain,
+                stock_analysis::news::stock_mapper::Relation::Industry => stock_analysis::news::impact::RelationType::Industry,
+                stock_analysis::news::stock_mapper::Relation::PolicyImpact => stock_analysis::news::impact::RelationType::PolicyImpact,
+                stock_analysis::news::stock_mapper::Relation::AnalystView => stock_analysis::news::impact::RelationType::AnalystView,
+                stock_analysis::news::stock_mapper::Relation::EarningsRef => stock_analysis::news::impact::RelationType::EarningsRef,
+            };
+            let impact = stock_analysis::news::impact::score_event(&event, relation, 1);
+            if let Some(np) = stock_analysis::news::dispatcher::decide(&impact) {
+                let ok = sink::try_push(&np);
+                if !ok {
+                    log::debug!("[v15.3 news_pipeline] sink try_push 失败 (push_loop 未启)");
+                }
+            }
+        }
+    }
+}
+
+/// v15.3 wire: 注册生产 feeds / mock feeds
+fn register_v15_3_feeds() {
+    use stock_analysis::news::aggregator::feed;
+    use std::sync::Arc;
+    let mock_mode = std::env::var("NEWS_MOCK_FEEDS").ok().as_deref() == Some("1");
+
+    if mock_mode {
+        // Mock feeds: 8 个确定性事件用于 e2e demo
+        log::info!("[v15.3 wire] NEWS_MOCK_FEEDS=1, 注册 1 mock feed (8 events)");
+        let demo_feed = Arc::new(DemoMockFeed);
+        feed::register_feeds(vec![demo_feed as Arc<dyn stock_analysis::news::aggregator::NewsFeed>]);
+        return;
+    }
+
+    log::info!("[v15.3 wire] 注册 12 production feeds (实际 HTTP)");
+    use stock_analysis::news::aggregator::NewsFeed;
+    use stock_analysis::search_service::providers::{
+        cls::ClsProvider, gelonghui::GelonghuiProvider, gov_policy::GovPolicyProvider,
+        jin10::Jin10Provider, kcb_daily::KcbDailyProvider, sina_flash::SinaFlashProvider,
+        wallstreetcn::WallStreetCnProvider, weibo_hot::WeiboHotProvider,
+    };
+    let feeds: Vec<Arc<dyn NewsFeed>> = vec![
+        Arc::new(feed::Jin10FlashFeed { inner: Jin10Provider::new() }),
+        Arc::new(feed::WallStreetCnFeed { inner: WallStreetCnProvider::new() }),
+        Arc::new(feed::ClsFlashFeed { inner: ClsProvider::new() }),
+        Arc::new(feed::SinaFlashFeed { inner: SinaFlashProvider::new() }),
+        Arc::new(feed::WeiboHotFeed { inner: WeiboHotProvider::new() }),
+        Arc::new(feed::GelonghuiFeed { inner: GelonghuiProvider::new() }),
+        Arc::new(feed::KcbDailyFeed { inner: KcbDailyProvider::new() }),
+        Arc::new(feed::GovPolicyFeed { inner: GovPolicyProvider::new() }),
+        // Skeleton pass:
+        Arc::new(feed::GovCnFeed),
+        Arc::new(feed::MiitFeed),
+        Arc::new(feed::EarningsCalendarFeed),
+        Arc::new(feed::ConsensusFeed),
+    ];
+    log::info!("[v15.3 wire] registered {} production feeds", feeds.len());
+    feed::register_feeds(feeds);
+}
+
+/// Mock feed for demo e2e — 8 确定性事件
+pub struct DemoMockFeed;
+#[async_trait::async_trait]
+impl stock_analysis::news::aggregator::NewsFeed for DemoMockFeed {
+    fn name(&self) -> &str { "demo_mock_v15_3" }
+    fn source_kind(&self) -> stock_analysis::news::aggregator::SourceKind {
+        stock_analysis::news::aggregator::SourceKind::Flash
+    }
+    async fn fetch(&self, limit: usize) -> anyhow::Result<Vec<stock_analysis::signal::market_event::MarketEvent>> {
+        use stock_analysis::signal::market_event::{
+            Direction, EventType, MarketEvent, SourceRef,
+        };
+        use chrono::{Local, Utc};
+        let now = Utc::now().with_timezone(&Local);
+        let mut events = Vec::new();
+        for i in 0..limit.min(8) {
+            let (title, code, et, dir, strength) = match i {
+                0 => ("长鑫存储递交招股说明书, 兆易创新受益".to_string(), "603986", EventType::Policy, Direction::Bull, 95),
+                1 => ("工信部发布半导体行业扶持政策".to_string(), "688981", EventType::Policy, Direction::Bull, 90),
+                2 => ("贵州茅台发布前三季度业绩预增公告".to_string(), "600519", EventType::Earnings, Direction::Bull, 100),
+                3 => ("天风证券: 给予宁德时代买入评级".to_string(), "300750", EventType::AnalystView, Direction::Bull, 70),
+                4 => ("持仓账户切换为半仓模式".to_string(), "000001", EventType::MarketAction, Direction::Neutral, 95),
+                5 => ("十五五规划储能产业链规划".to_string(), "300274", EventType::Policy, Direction::Bull, 85),
+                6 => ("宁德时代业绩低于预期".to_string(), "300750", EventType::Earnings, Direction::Bear, 90),
+                7 => ("国君证券: 半导体行业策略报告".to_string(), "688981", EventType::AnalystView, Direction::Bull, 75),
+                _ => break,
+            };
+            let simhash = {
+                use std::collections::hash_map::DefaultHasher;
+                use std::hash::{Hash, Hasher};
+                let mut h = DefaultHasher::new();
+                title.hash(&mut h);
+                h.finish()
+            };
+            events.push(MarketEvent {
+                event_id: format!("demo-{i}-{:x}", simhash),
+                simhash,
+                full_title: title,
+                event_type: et,
+                subject: code.into(),
+                object: Some(code.into()),
+                direction: dir,
+                strength,
+                certainty: 85,
+                chains: vec![],
+                occurred_at: now,
+                provenance: vec![SourceRef { provider: "demo_mock_v15_3".into(), url: None, fetched_at: now }],
+                ai_degraded: false,
+                stale: false,
+            });
+        }
+        Ok(events)
     }
 }

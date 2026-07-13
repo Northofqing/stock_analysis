@@ -11,7 +11,7 @@ use crate::util::recover_lock_or_warn;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{Local, Utc};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// 把任意 `SearchResult` (现有 search_service 类型) 转成 MarketEvent
 fn search_result_to_event(
@@ -285,17 +285,34 @@ impl NewsFeed for AnalystViewsFeed {
 // 全局注册 (D1.5 wire)
 // ============================================================================
 
-static ALL_FEEDS: once_cell::sync::OnceCell<std::sync::Arc<Mutex<Vec<Box<dyn NewsFeed>>>>> =
+static ALL_FEEDS: once_cell::sync::OnceCell<std::sync::Arc<Mutex<Vec<Arc<dyn NewsFeed>>>>> =
     once_cell::sync::OnceCell::new();
 
-pub fn all_feeds() -> Option<std::sync::Arc<Mutex<Vec<Box<dyn NewsFeed>>>>> {
+pub fn all_feeds() -> Option<std::sync::Arc<Mutex<Vec<Arc<dyn NewsFeed>>>>> {
     ALL_FEEDS.get().cloned()
 }
 
-pub fn register_feeds(feeds: Vec<Box<dyn NewsFeed>>) {
+pub fn register_feeds(feeds: Vec<Arc<dyn NewsFeed>>) {
     let g = ALL_FEEDS.get_or_init(|| std::sync::Arc::new(Mutex::new(Vec::new())));
     let mut g = recover_lock_or_warn("news::aggregator::register_feeds", g.lock());
     for f in feeds {
         g.push(f);
+    }
+}
+
+/// 一次性取出已注册 feeds → 喂给 NewsAggregator
+pub fn take_all_for_aggregator() -> Vec<Arc<dyn NewsFeed>> {
+    match ALL_FEEDS.get() {
+        Some(arc) => {
+            match arc.lock() {
+                Ok(mut g) => std::mem::take(&mut *g),
+                Err(p) => {
+                    log::warn!("[feed::take] lock poisoned, take inner");
+                    let mut inner = p.into_inner();
+                    std::mem::take(&mut *inner)
+                }
+            }
+        }
+        None => vec![],
     }
 }
