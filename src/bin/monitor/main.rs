@@ -1903,6 +1903,57 @@ async fn main() {
         }
     }
 
+    // --buy CODE:PRICE[:QTY] 手动记录虚拟盘买入 (对称 --sell, 复用 trades 表 + journal.rs 盈亏)
+    //   例: ./monitor --buy 603031:49.5:1000
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if let Some(spec) = args
+            .windows(2)
+            .find(|w| w[0] == "--buy")
+            .map(|w| w[1].clone())
+        {
+            let parts: Vec<&str> = spec.split(':').collect();
+            if parts.len() >= 2 {
+                let code = parts[0];
+                let price: f64 = parts[1].parse().unwrap_or(0.0);
+                let qty: u64 = parts
+                    .get(2)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1000);
+                let name = stock_analysis::portfolio::get_all_names()
+                    .ok()
+                    .and_then(|m| {
+                        m.into_iter()
+                            .find(|(c, _)| c == code)
+                            .map(|(_, n)| n)
+                    })
+                    .unwrap_or_else(|| code.to_string());
+                match stock_analysis::portfolio::record_virtual_trade(
+                    code,
+                    &name,
+                    stock_analysis::portfolio::TradeDirection::Buy,
+                    price,
+                    qty,
+                ) {
+                    Ok(_) => {
+                        println!(
+                            "[虚拟盘] 买入已记录: {}({}) {}股 @ {:.2}",
+                            name, code, qty, price
+                        );
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        eprintln!("[虚拟盘] 买入记录失败: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                eprintln!("用法: --buy CODE:PRICE[:QTY]  例: --buy 603031:49.5:1000");
+                std::process::exit(1);
+            }
+        }
+    }
+
     let test_mode = std::env::args().any(|a| a == "--test");
 
     let review_mode = std::env::args().any(|a| a == "--review");
