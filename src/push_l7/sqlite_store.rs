@@ -26,6 +26,41 @@ pub struct SqliteStore {
     conn: Arc<Mutex<Connection>>,
 }
 
+/// 全局 SqliteStore 单例 (v14_stack 初始化时 set, governance 查询时 get)
+static GLOBAL_STORE: once_cell::sync::OnceCell<SqliteStore> = once_cell::sync::OnceCell::new();
+
+impl SqliteStore {
+    /// 注册全局 SqliteStore (V14Stack init 时调用一次)
+    pub fn set_global(store: SqliteStore) {
+        if GLOBAL_STORE.set(store).is_err() {
+            log::warn!("[SqliteStore] set_global called twice, ignoring");
+        }
+    }
+
+    /// 获取全局 SqliteStore 引用 (governance 检查时调用)
+    pub fn global() -> Option<&'static SqliteStore> {
+        GLOBAL_STORE.get()
+    }
+
+    /// 统计今天 (本地时区) 该 user 推送数量 — governance daily_limit 检查用
+    pub fn count_today_for_user(
+        &self,
+        user_id: &str,
+        today: chrono::NaiveDate,
+    ) -> rusqlite::Result<i64> {
+        let conn = crate::util::recover_lock_or_warn(
+            "sqlite_store::count_today_for_user",
+            self.conn.lock(),
+        );
+        conn.query_row(
+            "SELECT COUNT(*) FROM push_analytics
+             WHERE user_id = ?1 AND date(ts) = ?2",
+            params![user_id, today.to_string()],
+            |row| row.get(0),
+        )
+    }
+}
+
 impl SqliteStore {
     /// 打开 / 创建 SQLite 数据库 + 表
     pub fn open<P: AsRef<Path>>(path: P) -> rusqlite::Result<Self> {
