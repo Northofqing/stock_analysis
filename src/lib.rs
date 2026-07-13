@@ -19,6 +19,7 @@ pub mod market_analyzer;
 pub mod market_data;
 pub mod models;
 pub mod monitor;
+pub mod news;  // v15.1 Phase B: 新闻监测 + IPO 监测 (BIPO 子集)
 pub mod notification;
 pub mod opportunity;
 pub mod pipeline;

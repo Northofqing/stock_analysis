@@ -41,6 +41,9 @@ pub const INDUSTRY_KEYWORDS: &[(&str, &str)] = &[
     ("计算机", "计算机/AI/软件/SaaS"),
     ("通信", "通信/光模块/运营商/卫星"),
     ("银行", "银行/保险/券商/金融"),
+    // v15.1 B2: 新增 (覆盖 IPO 监测场景)
+    ("存储", "存储/DRAM/NAND/内存/长鑫/长存/兆易"),
+    ("机器人", "机器人/人形机器人/宇树/优必选/智元"),
 ];
 
 /// 东财行业新闻流 provider
@@ -329,8 +332,8 @@ mod tests {
 
     #[test]
     fn test_industry_keywords_count() {
-        // 与 bom_kb.rs 10 个 chain 对齐
-        assert_eq!(INDUSTRY_KEYWORDS.len(), 10);
+        // v15.1 B2: 12 个 (10 原 + 存储 + 机器人)
+        assert_eq!(INDUSTRY_KEYWORDS.len(), 12);
     }
 
     #[test]
