@@ -329,3 +329,46 @@ pub fn fetch_sh_index_change() -> f64 {
     }
     0.0
 }
+
+/// P0-3: 批量取三大指数涨跌幅 (上证/创业板指/科创50), 来自 overview.indices 真实数据
+///   替代之前 chinext=sh*0.8 估算 / star=0.0 硬编码. 任一缺失 → 0.0 (调用方按"暂无"展示)
+///   返回 (sh_chg, chinext_chg, star_chg)
+pub fn fetch_index_changes() -> (f64, f64, f64) {
+    fn reasonable(x: f64) -> bool {
+        x.is_finite() && x.abs() <= 20.0
+    }
+    if let Ok(analyzer) = stock_analysis::market_analyzer::MarketAnalyzer::new(None) {
+        if let Ok(overview) = analyzer.get_market_overview() {
+            let mut sh = 0.0_f64;
+            let mut chinext = 0.0_f64;
+            let mut star = 0.0_f64;
+            for idx in &overview.indices {
+                if !reasonable(idx.change_pct) {
+                    continue;
+                }
+                if idx.code.ends_with("399006") {
+                    chinext = idx.change_pct;
+                } else if idx.code.ends_with("000688") {
+                    star = idx.change_pct;
+                } else if idx.code.ends_with("000001") {
+                    sh = idx.change_pct;
+                }
+            }
+            return (sh, chinext, star);
+        }
+    }
+    (0.0, 0.0, 0.0)
+}
+
+/// P0-3: 取两市成交额(亿), 来自 overview.total_amount 真实累加; 缺失 → 0.0 (按"暂无"展示)
+///   替代之前 amount_yi=0.0 占位 / 500只样本 r2_mv 误导
+pub fn fetch_market_amount_yi() -> f64 {
+    if let Ok(analyzer) = stock_analysis::market_analyzer::MarketAnalyzer::new(None) {
+        if let Ok(overview) = analyzer.get_market_overview() {
+            if overview.total_amount > 0.0 {
+                return overview.total_amount;
+            }
+        }
+    }
+    0.0
+}

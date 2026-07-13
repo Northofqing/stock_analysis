@@ -65,6 +65,13 @@ pub fn decide(impact: &NewsImpact) -> Option<NewsPush> {
     }
     let score_clipped = impact.score.min(100.0);
     let name = lookup_name(&impact.code);
+    // P1-2: 类别事件(政府监管/宏观)或未收录代码 → lookup_name 返回 "未知"
+    //   不再显示 "未知(政府监管)"; 直接用 code (类别名或裸代码) 作展示, 避免 d7c2360 格式回归
+    let name_display = if name == "未知" {
+        impact.code.clone()
+    } else {
+        format!("{}({})", name, impact.code)
+    };
     let age_str = if impact.age_hours < 0.5 {
         "新".to_string()
     } else {
@@ -72,9 +79,8 @@ pub fn decide(impact: &NewsImpact) -> Option<NewsPush> {
     };
     Some(NewsPush {
         text: format!(
-            "📊 {}({}) | 分数 {:.0} | {} {} | 多源×{} | {}",
-            name,
-            impact.code,
+            "📊 {} | 分数 {:.0} | {} {} | 多源×{} | {}",
+            name_display,
             score_clipped,
             match impact.direction {
                 Direction::Bull => "🟢",
@@ -148,5 +154,15 @@ mod tests {
         assert!(p.score >= 40.0, "score {} should be ≥ 40", p.score);
         assert!(p.score < 70.0, "score {} should be < 70 (info tier)", p.score);
         assert!(!is_important(&p));
+    }
+
+    #[test]
+    fn test_decide_category_event_no_unknown_label() {
+        // P1-2: 类别事件(政府监管, 非股票代码) 不应显示 "未知(政府监管)", 应直接 "政府监管"
+        let e = mk_event(Direction::Neutral, 30, "政府监管", "国家发展改革委公告");
+        let imp = score_event(&e, RelationType::PolicyImpact, 1);
+        let p = decide(&imp).expect("政策类应 ≥40 推送");
+        assert!(!p.text.contains("未知("), "类别事件不应出现 '未知(': {}", p.text);
+        assert!(p.text.contains("📊 政府监管 |"), "应直接显示类别名: {}", p.text);
     }
 }

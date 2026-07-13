@@ -3328,37 +3328,52 @@ async fn run_test_scan() {
 
             };
 
+            // P0-3: 真接三大指数 + 两市成交额 (替代 0.5/0.5/0.0 硬编码 + r2_mv 误当两市成交额)
+            let (r2_sh, r2_chinext, r2_star) = market_data::fetch_index_changes();
+
+            let r2_amount_yi = market_data::fetch_market_amount_yi();
+
+            let r2_limit_up = stock_analysis::market_analyzer::MarketAnalyzer::new(None)
+
+                .ok()
+
+                .and_then(|a| a.get_limit_up_stocks().ok())
+
+                .map(|s| s.len() as u32)
+
+                .unwrap_or(0);
+
             let mut ev = MarketStageEvidence::default();
 
             ev.technical = Some(TechnicalMetrics {
 
-                sh_chg: 0.5,
+                sh_chg: r2_sh,
 
-                chinext_chg: 0.5,
+                chinext_chg: r2_chinext,
 
-                star_chg: 0.0,
+                star_chg: r2_star,
 
             });
 
             ev.capital = Some(CapitalMetrics {
 
-                main_flow_yi: 50.0,
+                main_flow_yi: 0.0,
 
-                amount_yi: r2_mv,
+                amount_yi: r2_amount_yi,
 
-                amount_delta_pct: 5.0,
+                amount_delta_pct: 0.0,
 
             });
 
             ev.sentiment = Some(SentimentMetrics {
 
-                limit_up_n: 30,
+                limit_up_n: r2_limit_up,
 
-                limit_down_n: 5,
+                limit_down_n: 0,
 
-                broken_pct: 15.0,
+                broken_pct: 0.0,
 
-                consecutive_h: 4,
+                consecutive_h: 0,
 
             });
 
@@ -3366,27 +3381,27 @@ async fn run_test_scan() {
 
             let r = pt::MarketReview {
 
-                sh_chg: 0.5,
+                sh_chg: r2_sh,
 
-                chinext_chg: 0.5,
+                chinext_chg: r2_chinext,
 
-                star_chg: 0.0,
+                star_chg: r2_star,
 
-                limit_up_n: 30,
+                limit_up_n: r2_limit_up,
 
-                limit_down_n: 5,
+                limit_down_n: 0,
 
-                broken_pct: 15.0,
+                broken_pct: 0.0,
 
-                consecutive_h: 4,
+                consecutive_h: 0,
 
-                amount_yi: r2_mv,
+                amount_yi: r2_amount_yi,
 
-                amount_delta_pct: 5.0,
+                amount_delta_pct: 0.0,
 
-                amount_dir: "放量",
+                amount_dir: "",
 
-                main_flow_yi: 50.0,
+                main_flow_yi: 0.0,
 
                 money_effect: "中等",
 
@@ -4918,25 +4933,40 @@ async fn run_review_only_inner() {
 
             };
 
+            // P0-3: 真接三大指数 + 两市成交额 (替代 0.5/0.5/0.0 硬编码 + r_market_value 误当两市成交额)
+            let (rm_sh, rm_chinext, rm_star) = market_data::fetch_index_changes();
+
+            let rm_amount_yi = market_data::fetch_market_amount_yi();
+
+            let rm_limit_up = stock_analysis::market_analyzer::MarketAnalyzer::new(None)
+
+                .ok()
+
+                .and_then(|a| a.get_limit_up_stocks().ok())
+
+                .map(|s| s.len() as u32)
+
+                .unwrap_or(0);
+
             let mut ev = MarketStageEvidence::default();
 
-            ev.technical = Some(TechnicalMetrics { sh_chg: 0.5, chinext_chg: 0.5, star_chg: 0.0 });
+            ev.technical = Some(TechnicalMetrics { sh_chg: rm_sh, chinext_chg: rm_chinext, star_chg: rm_star });
 
-            ev.capital = Some(CapitalMetrics { main_flow_yi: 50.0, amount_yi: r_market_value, amount_delta_pct: 5.0 });
+            ev.capital = Some(CapitalMetrics { main_flow_yi: 0.0, amount_yi: rm_amount_yi, amount_delta_pct: 0.0 });
 
-            ev.sentiment = Some(SentimentMetrics { limit_up_n: 30, limit_down_n: 5, broken_pct: 15.0, consecutive_h: 4 });
+            ev.sentiment = Some(SentimentMetrics { limit_up_n: rm_limit_up, limit_down_n: 0, broken_pct: 0.0, consecutive_h: 0 });
 
             let conf = ms_evaluate(&ev);
 
             let r = pt::MarketReview {
 
-                sh_chg: 0.5, chinext_chg: 0.5, star_chg: 0.0,
+                sh_chg: rm_sh, chinext_chg: rm_chinext, star_chg: rm_star,
 
-                limit_up_n: 30, limit_down_n: 5, broken_pct: 15.0, consecutive_h: 4,
+                limit_up_n: rm_limit_up, limit_down_n: 0, broken_pct: 0.0, consecutive_h: 0,
 
-                amount_yi: r_market_value, amount_delta_pct: 5.0, amount_dir: "放量",
+                amount_yi: rm_amount_yi, amount_delta_pct: 0.0, amount_dir: "",
 
-                main_flow_yi: 50.0, money_effect: "中等",
+                main_flow_yi: 0.0, money_effect: "中等",
 
                 heat_stage: conf.heat_stage.as_str(), heat_conf_pct: conf.conf_pct,
 
@@ -5256,37 +5286,52 @@ async fn run_review_only_inner() {
 
             };
 
+            // P0-3: 真接三大指数 + 两市成交额 (替代 0.5/0.5/0.0 硬编码 + r2_mv 误当两市成交额)
+            let (r2_sh, r2_chinext, r2_star) = market_data::fetch_index_changes();
+
+            let r2_amount_yi = market_data::fetch_market_amount_yi();
+
+            let r2_limit_up = stock_analysis::market_analyzer::MarketAnalyzer::new(None)
+
+                .ok()
+
+                .and_then(|a| a.get_limit_up_stocks().ok())
+
+                .map(|s| s.len() as u32)
+
+                .unwrap_or(0);
+
             let mut ev = MarketStageEvidence::default();
 
             ev.technical = Some(TechnicalMetrics {
 
-                sh_chg: 0.5,
+                sh_chg: r2_sh,
 
-                chinext_chg: 0.5,
+                chinext_chg: r2_chinext,
 
-                star_chg: 0.0,
+                star_chg: r2_star,
 
             });
 
             ev.capital = Some(CapitalMetrics {
 
-                main_flow_yi: 50.0,
+                main_flow_yi: 0.0,
 
-                amount_yi: r2_mv,
+                amount_yi: r2_amount_yi,
 
-                amount_delta_pct: 5.0,
+                amount_delta_pct: 0.0,
 
             });
 
             ev.sentiment = Some(SentimentMetrics {
 
-                limit_up_n: 30,
+                limit_up_n: r2_limit_up,
 
-                limit_down_n: 5,
+                limit_down_n: 0,
 
-                broken_pct: 15.0,
+                broken_pct: 0.0,
 
-                consecutive_h: 4,
+                consecutive_h: 0,
 
             });
 
@@ -5294,27 +5339,27 @@ async fn run_review_only_inner() {
 
             let r = pt::MarketReview {
 
-                sh_chg: 0.5,
+                sh_chg: r2_sh,
 
-                chinext_chg: 0.5,
+                chinext_chg: r2_chinext,
 
-                star_chg: 0.0,
+                star_chg: r2_star,
 
-                limit_up_n: 30,
+                limit_up_n: r2_limit_up,
 
-                limit_down_n: 5,
+                limit_down_n: 0,
 
-                broken_pct: 15.0,
+                broken_pct: 0.0,
 
-                consecutive_h: 4,
+                consecutive_h: 0,
 
-                amount_yi: r2_mv,
+                amount_yi: r2_amount_yi,
 
-                amount_delta_pct: 5.0,
+                amount_delta_pct: 0.0,
 
-                amount_dir: "放量",
+                amount_dir: "",
 
-                main_flow_yi: 50.0,
+                main_flow_yi: 0.0,
 
                 money_effect: "中等",
 
@@ -5856,6 +5901,20 @@ async fn run_review_only_inner() {
 
     }
 
+    // 全模板覆盖: R-01~R-08 已由上方内联块推送, 这里调 dispatch_all_for_test 补齐
+    //   --test → All (再跑盘中模板); --review → Review (只补盘后复盘). R-02~R-08 已推 → dedup 跳过, 不重复
+    {
+        let hhmm_r = chrono::Local::now().format("%H:%M").to_string();
+        let date_r = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let banner_r = pt::BannerCtx::default();
+        let scope = if std::env::args().any(|a| a == "--test") {
+            pt::TestScope::All
+        } else {
+            pt::TestScope::Review
+        };
+        pt::dispatch_all_for_test(&hhmm_r, &date_r, &banner_r, scope).await;
+    }
+
 }
 
 
@@ -5931,6 +5990,14 @@ async fn e2e_all_templates_run() {
     push_e2e_t16_st_price_limit(&hhmm).await;
 
 
+
+    // --test 全模板覆盖: 调全部 dispatch_*_daily (真推, 只推有真数据的, 用户要求测试所有模板)
+    //   R-01~R-08 已由上方 run_review_only_inner 推过 → 这里 dedup 跳过; 盘中模板在此真推
+    {
+        use crate::push_templates as pt;
+        let banner_e2e = pt::BannerCtx::default();
+        pt::dispatch_all_for_test(&hhmm, &today_str, &banner_e2e, pt::TestScope::All).await;
+    }
 
     log::info!("[v70] E2E 完成 — 检查 data/push_log/{}/ 查所有推送", today_str);
 

@@ -976,15 +976,25 @@ pub struct MarketReview<'a> {
 /// v12 §14.2 R-02 ReviewMarket 模板渲染 — 字段顺序严格对齐 docs/architecture/v13-push-templates.md
 pub fn render_review_market(date: &str, m: &MarketReview<'_>) -> String {
     // W4.X: code-reviewer HIGH 修复 — sh_chg=0.0 时显示"暂无", 避免"+0.0%"误导
-    let sh_chg_display = if m.sh_chg.abs() < 0.01 { "暂无".to_string() } else { format!("{:+.1}", m.sh_chg) };
-    let chinext_display = if m.chinext_chg.abs() < 0.01 { "暂无".to_string() } else { format!("{:+.1}", m.chinext_chg) };
-    let star_display = if m.star_chg.abs() < 0.01 { "暂无".to_string() } else { format!("{:+.1}", m.star_chg) };
+    // P0-1: % 放进 display 串, 缺数据(0.0)时显示"暂无"而非"暂无%"(尾部多一个%)
+    let sh_chg_display = if m.sh_chg.abs() < 0.01 { "暂无".to_string() } else { format!("{:+.1}%", m.sh_chg) };
+    let chinext_display = if m.chinext_chg.abs() < 0.01 { "暂无".to_string() } else { format!("{:+.1}%", m.chinext_chg) };
+    let star_display = if m.star_chg.abs() < 0.01 { "暂无".to_string() } else { format!("{:+.1}%", m.star_chg) };
+    // P0-3: 资金/连板 缺数据(0)时显示"暂无", 不展示硬编码假数据 (主力净/成交额/连板高度无真源时)
+    let amount_display = if m.amount_yi.abs() < 0.5 { "暂无".to_string() } else { format!("{:.0}亿", m.amount_yi) };
+    let main_flow_display = if m.main_flow_yi.abs() < 0.5 { "暂无".to_string() } else { format!("{:+.0}亿", m.main_flow_yi) };
+    let consecutive_display = if m.consecutive_h == 0 { "暂无".to_string() } else { format!("{}板", m.consecutive_h) };
+    let amount_delta_display = if m.amount_delta_pct.abs() < 0.5 || m.amount_dir.is_empty() {
+        String::new()
+    } else {
+        format!("（{}{:+.0}%）", m.amount_dir, m.amount_delta_pct)
+    };
     let mut out = format!(
-        "📊 今日盘面（{}）\n指数: 上证{}% 创业{}% 科创{}%\n情绪: 涨停{}家 跌停{}家 炸板率{:.0}% 连板高度{}板\n资金: 两市{:.0}亿（{}{:+.0}%） 主力净{:+.0}亿\n赚钱效应: {}\n阶段判定: {}（置信度{}%）",
+        "📊 今日盘面（{}）\n指数: 上证{} 创业{} 科创{}\n情绪: 涨停{}家 跌停{}家 炸板率{:.0}% 连板高度{}\n资金: 两市{}{} 主力净{}\n赚钱效应: {}\n阶段判定: {}（置信度{}%）",
         date,
         sh_chg_display, chinext_display, star_display,
-        m.limit_up_n, m.limit_down_n, m.broken_pct, m.consecutive_h,
-        m.amount_yi, m.amount_dir, m.amount_delta_pct, m.main_flow_yi,
+        m.limit_up_n, m.limit_down_n, m.broken_pct, consecutive_display,
+        amount_display, amount_delta_display, main_flow_display,
         m.money_effect,
         m.heat_stage, m.heat_conf_pct,
     );
@@ -2559,18 +2569,33 @@ pub fn load_industry_chain_snapshot_real(hhmm: &str) -> IndustryChainSnapshot {
     let top = sorted[0];
 
     // 解析 followers → supplements (前 3)
-    // v13.10.3: followers 是 code 列表, 反查真名作 name (之前 name=code 会显示 002916(002916))
+    // P1-1: 修正 name/code 错位 + 用真价格算 lo/hi/stop (替代硬编码 0.0 → "低吸0.00~0.00 止损0.00")
+    //   followers 可能是 code 或 name: code→反查名, name→反查 code; 价格取 chg_map(实为 price_map)
+    let reverse_lookup_code = |nm: &str| -> Option<String> {
+        name_map.iter().find(|(_, n)| n == nm).map(|(c, _)| c.clone())
+    };
     let supplements: Vec<(String, String, String, f64, f64, f64)> = top
         .followers
         .iter()
         .take(3)
         .map(|c| {
-            let real_name = name_map
-                .iter()
-                .find(|(code, _)| code == c)
-                .map(|(_, n)| n.clone())
-                .unwrap_or_else(|| c.clone());
-            (real_name, c.clone(), "首板".to_string(), 0.0, 0.0, 0.0)
+            // c 可能是 code (纯数字) 或 name
+            let (name, code) = if c.chars().all(|ch| ch.is_ascii_digit()) {
+                (lookup_name(c), c.clone()) // code → 反查名
+            } else {
+                match reverse_lookup_code(c) {
+                    Some(code) => (c.clone(), code), // name → 反查 code
+                    None => (c.clone(), c.clone()),  // 都查不到, 两槽同名 (无法解析)
+                }
+            };
+            let price = chg_map.get(code.as_str()).copied().unwrap_or(0.0) as f64;
+            // P1-1: 用真价格算低吸区间/止损 (替代硬编码 0.0); 无价格时回落 0 (模板显示 0.00)
+            let (lo, hi, stop) = if price > 0.0 {
+                (price * 0.97, price * 1.03, price * 0.92)
+            } else {
+                (0.0, 0.0, 0.0)
+            };
+            (name, code, "首板".to_string(), lo, hi, stop)
         })
         .collect();
 
@@ -2578,7 +2603,7 @@ pub fn load_industry_chain_snapshot_real(hhmm: &str) -> IndustryChainSnapshot {
         hhmm: hhmm.to_string(),
         chain: top.chain.clone(),
         limit_count: top.limit_up_n,
-        leader_name: top.leader_name.clone(),
+        leader_name: lookup_name(&top.leader_name), // P1-1: leader_name 若是 code 则反查名 (避免 002938(002938))
         leader_code: top.leader_code.clone(),
         leader_height: top.leader_boards,
         supplements,
@@ -3906,12 +3931,24 @@ pub async fn dispatch_holding_plan_daily(hhmm: &str, banner: &BannerCtx) -> bool
             );
             continue;
         }
-        // v15.3 fix: 用真价格, fallback 到 cost (用真实价格字段, 不是 pct_chg)
-        let current_price = quotes
-            .get(&pos.code)
-            .copied()
-            .filter(|p| *p > 0.0)
-            .unwrap_or(pos.cost_price);
+        // P0-2: 报价缺失时跳过该票 + warn, 不再静默用 cost 顶替现价
+        //   (否则推 "现价==成本 盈亏+0.0%" 假推荐, 违反 no-mock / 不静默填默认值)
+        let current_price = match quotes.get(&pos.code).copied().filter(|p| *p > 0.0) {
+            Some(p) => p,
+            None => {
+                log::warn!(
+                    "[I-04] {}({}) 实时报价缺失, 跳过持仓建议 (不再用成本{:.2}顶替现价)",
+                    pos.name, pos.code, pos.cost_price
+                );
+                log_dispatcher_attempt(
+                    "I-04",
+                    false,
+                    0,
+                    &format!("{} no realtime quote, skip", pos.code),
+                );
+                continue;
+            }
+        };
         let pnl_pct = if pos.cost_price > 0.0 {
             (current_price - pos.cost_price) / pos.cost_price * 100.0
         } else {
@@ -4190,6 +4227,77 @@ pub async fn dispatch_post_session_review(date: &str, hhmm: &str, banner: &Banne
     true
 }
 
+/// --test/--review 全模板覆盖范围
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum TestScope {
+    /// 全部模板 (盘中 + 盘后)
+    All,
+    /// 仅盘后复盘模板
+    Review,
+}
+
+/// --test/--review 全模板覆盖 (用户要求: 测试所有模板, 真推, 只推有真数据的, 不关注时间)
+///
+/// - scope=Review → 盘后复盘子集 (R-02~R-08 + 催化/模拟复盘 + 盘后资金 + ETF尾盘)
+/// - scope=All → 额外跑盘中模板 (盘面/涨停扩散/持仓建议/选股/领涨/主力/轮动...)
+/// - 事件触发型 (broker成交/大宗/ST/T0/挂单) 需结构化事件, 测试环境无真事件 → 不造样本, 各 dispatcher 内部短路返回 false → 记 skipped
+/// - 真推 (不走 V10_DRY_RUN_PUSH), 每个模板走 push_governor 真发微信/飞书
+/// - 绕过 live-loop 5/15/30min 计时器 (直接调, 一次性)
+pub async fn dispatch_all_for_test(hhmm: &str, date: &str, banner: &BannerCtx, scope: TestScope) {
+    let mut fired = 0usize;
+    let mut skipped = 0usize;
+    macro_rules! run_disp {
+        ($name:expr, $call:expr) => {{
+            log::info!("[--test] === {} ===", $name);
+            let ok: bool = $call.await;
+            if ok {
+                fired += 1;
+                log::info!("[--test] {} → pushed", $name);
+            } else {
+                skipped += 1;
+                log::info!("[--test] {} → skipped (no data)", $name);
+            }
+        }};
+    }
+
+    // ---- 盘后复盘 (Review + All) ----
+    run_disp!("R-02今日盘面", dispatch_r02_review_market_real(date, banner));
+    run_disp!("R-03涨停产业链", dispatch_r03_industry_chain_real(date, banner));
+    run_disp!("R-04龙虎榜", dispatch_r04_lhb_real(date, banner));
+    run_disp!("R-05信号复盘", dispatch_r05_signal_review_real(date, banner));
+    run_disp!("R-06失败归因", dispatch_r06_failure_real(date, banner));
+    run_disp!("R-08明日事件", dispatch_r08_event_calendar_real(date, banner));
+    run_disp!("催化复盘", dispatch_catalyst_review_daily(date));
+    run_disp!("模拟复盘", dispatch_paper_review_daily(date));
+    run_disp!("盘后资金买入", dispatch_post_close_fund_inflow_buy(date, banner));
+    // 事件触发型 (无真事件, 不造样本)
+    log::info!("[--test] === 事件触发型 (broker成交/大宗/ST/T0/挂单) 无真事件, 跳过 ===");
+
+    if matches!(scope, TestScope::All) {
+        // ---- 盘中 (All only) ----
+        run_disp!("盘面盘中", dispatch_intraday_market_daily(hhmm, banner));
+        run_disp!("新闻催化", dispatch_news_catalyst_daily(hhmm, banner));
+        run_disp!("涨停扩散", dispatch_industry_chain_intraday_daily(hhmm, banner));
+        run_disp!("新闻驱动个股", dispatch_news_to_idea_daily(hhmm, banner));
+        run_disp!("持仓建议", dispatch_holding_plan_daily(hhmm, banner));
+        run_disp!("候选触发", dispatch_candidate_triggered_daily(hhmm, banner));
+        run_disp!("竞价量能P-02", dispatch_auction_volume_daily(hhmm, banner));
+        run_disp!("领涨板块Top", dispatch_sector_top_daily(hhmm));
+        run_disp!("板块异动", dispatch_sector_anomaly_daily(hhmm, ""));
+        run_disp!("主力净流入Top", dispatch_fund_inflow_top_daily(hhmm));
+        run_disp!("盘前新闻热点", dispatch_preopen_news_hot_daily());
+        run_disp!("模拟交易", dispatch_paper_trade_daily(hhmm, 3));
+        run_disp!("虚拟盯盘", dispatch_virtual_watch_daily(hhmm, &[], 0));
+        run_disp!("挂单管道", dispatch_trade_pipeline_orders(hhmm));
+        run_disp!("成交管道", dispatch_trade_pipeline_fills(hhmm));
+    }
+    log::info!(
+        "[--test] === 全模板覆盖完成: {} pushed, {} skipped ===",
+        fired,
+        skipped
+    );
+}
+
 // ============================================================================
 // CR-12 (review): R-02/R-08 真实 dispatcher (从 run_review_only_inner 抽取)
 // ============================================================================
@@ -4208,30 +4316,25 @@ pub async fn dispatch_r02_review_market_real(date: &str, banner: &BannerCtx) -> 
     // - amount_yi: 暂留 0 (无现成 fetch_market_amount_yi 函数, 避免 mock)
     // - limit_up_n: 真接 get_limit_up_stocks (之前已有, 但用 0 占位 limit_down_n + broken_pct)
     //   保留 0 占位 for limit_down/broken (没现成数据源, 不要 mock)
-    let sh_chg_result = tokio::task::spawn_blocking(super::market_data::fetch_sh_index_change)
-        .await;
-    // W4.3 / B-010 P1: spawn_blocking JoinError 不静默填 0.0, 显式区分错误
-    // 注: fetch_sh_index_change 返回纯 f64, 不会 Err (无 Result 包装).
-    //    JoinError 用 if let Some 捕获, 避免静默填 0.0
-    let sh_chg: f64 = if let Ok(v) = sh_chg_result {
-        v
-    } else {
-        log::warn!("[push] fetch_sh_index_change spawn_blocking JoinError, 跳过计算");
-        0.0  // 计算路径默认值, 不进入推送文本
-    };
-    let amount_yi = 0.0_f64;
-    let (_limit_up_n, _limit_down_n, _broken_pct): (u32, u32, f64) =
-        tokio::task::spawn_blocking(|| -> Result<(u32, u32, f64), String> {
-            let analyzer = MarketAnalyzer::new(None).map_err(|e| e.to_string())?;
-            let ups = analyzer
-                .get_limit_up_stocks()
-                .map_err(|e| e.to_string())?
-                .len() as u32;
-            Ok((ups, 0, 0.0))
+    // P0-3: 三大指数涨跌幅 + 两市成交额 一次性真接 (替代 chinext=sh*0.8 / star=0 / amount=0 硬编码)
+    let (sh_chg, chinext_chg, star_chg, amount_yi) =
+        match tokio::task::spawn_blocking(|| {
+            let (sh, chinext, star) = super::market_data::fetch_index_changes();
+            let amt = super::market_data::fetch_market_amount_yi();
+            (sh, chinext, star, amt)
         })
         .await
-        .unwrap_or(Ok((30, 5, 15.0)))
-        .unwrap_or((30, 5, 15.0));
+        {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("[R-02] fetch_index_changes JoinError: {}, 指数/成交额按暂无", e);
+                (0.0, 0.0, 0.0, 0.0)
+            }
+        };
+    if sh_chg.abs() < 0.01 && chinext_chg.abs() < 0.01 && star_chg.abs() < 0.01 {
+        log::warn!("[R-02] 三大指数涨跌幅全部缺失(0), 概览数据源可能异常");
+    }
+    // limit_up_n 真接; limit_down_n/broken_pct 无现成源 → 0 (跌停0家/炸板0% 为合法值, 非暂无)
     let (limit_up_n, limit_down_n, broken_pct): (u32, u32, f64) =
         tokio::task::spawn_blocking(|| -> Result<(u32, u32, f64), String> {
             let analyzer = MarketAnalyzer::new(None).map_err(|e| e.to_string())?;
@@ -4242,39 +4345,40 @@ pub async fn dispatch_r02_review_market_real(date: &str, banner: &BannerCtx) -> 
             Ok((ups, 0, 0.0))
         })
         .await
-        .unwrap_or(Ok((30, 5, 15.0)))
-        .unwrap_or((30, 5, 15.0));
+        .unwrap_or(Ok((0, 0, 0.0)))
+        .unwrap_or((0, 0, 0.0));
 
     let mut ev = MarketStageEvidence::default();
     ev.technical = Some(TechnicalMetrics {
         sh_chg,
-        chinext_chg: sh_chg * 0.8,
-        star_chg: 0.0,
+        chinext_chg,
+        star_chg,
     });
+    // P0-3: main_flow_yi / amount_delta_pct 无现成真源 → 0 (模板按"暂无"展示), 不再硬编码 50/5
     ev.capital = Some(CapitalMetrics {
-        main_flow_yi: 50.0,
+        main_flow_yi: 0.0,
         amount_yi,
-        amount_delta_pct: 5.0,
+        amount_delta_pct: 0.0,
     });
     ev.sentiment = Some(SentimentMetrics {
         limit_up_n,
         limit_down_n,
         broken_pct,
-        consecutive_h: 4,
+        consecutive_h: 0,
     });
     let conf = ms_evaluate(&ev);
     let r = MarketReview {
         sh_chg,
-        chinext_chg: sh_chg * 0.8,
-        star_chg: 0.0,
+        chinext_chg,
+        star_chg,
         limit_up_n,
         limit_down_n,
         broken_pct,
-        consecutive_h: 4,
+        consecutive_h: 0,
         amount_yi,
-        amount_delta_pct: 5.0,
-        amount_dir: "放量",
-        main_flow_yi: 50.0,
+        amount_delta_pct: 0.0,
+        amount_dir: "",
+        main_flow_yi: 0.0,
         money_effect: "中等",
         heat_stage: conf.heat_stage.as_str(),
         heat_conf_pct: conf.conf_pct,
@@ -6537,6 +6641,40 @@ mod tests {
         assert!(s.contains("阶段判定: MainUp（置信度80%）"));
         assert!(s.contains("→ 明日账户建议: Normal 仓位上限7成"));
         assert!(!s.contains("低置信"));
+    }
+
+    #[test]
+    fn r02_review_market_missing_index_no_stray_pct() {
+        // P0-1: 缺数据(0.0)时显示"暂无", 不应出现"暂无%"(尾部多一个%)
+        // P0-3: 资金/主力净/连板高度 无真源(0)时也显示"暂无", 不展示硬编码假数据
+        let s = render_review_market(
+            "2026-07-05",
+            &MarketReview {
+                sh_chg: 0.0,
+                chinext_chg: 0.0,
+                star_chg: 0.0,
+                limit_up_n: 30,
+                limit_down_n: 5,
+                broken_pct: 15.0,
+                consecutive_h: 0,
+                amount_yi: 0.0,
+                amount_delta_pct: 0.0,
+                amount_dir: "",
+                main_flow_yi: 0.0,
+                money_effect: "中等",
+                heat_stage: "HeatUp",
+                heat_conf_pct: 62,
+                low_conf: false,
+                low_conf_tier: None,
+                account_mode: AccountMode::Normal,
+                max_pos: 7,
+            },
+        );
+        assert!(s.contains("上证暂无 创业暂无 科创暂无"));
+        assert!(!s.contains("暂无%"), "缺数据不应出现 '暂无%' (尾部多余%)");
+        assert!(s.contains("连板高度暂无"), "连板高度无数据应显示暂无");
+        assert!(s.contains("两市暂无"), "成交额无数据应显示暂无");
+        assert!(s.contains("主力净暂无"), "主力净流入无数据应显示暂无");
     }
 
     #[test]
