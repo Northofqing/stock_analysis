@@ -28,12 +28,12 @@ impl RelationType {
     }
     pub fn label(&self) -> &'static str {
         match self {
-            Self::SelfCode => "self",
-            Self::AnalystView => "analyst_view",
-            Self::EarningsRef => "earnings",
-            Self::SupplyChain => "supply_chain",
-            Self::PolicyImpact => "policy_impact",
-            Self::Industry => "industry",
+            Self::SelfCode => "自身",
+            Self::AnalystView => "机构观点",
+            Self::EarningsRef => "财报",
+            Self::SupplyChain => "供应链",
+            Self::PolicyImpact => "政策催化",
+            Self::Industry => "行业板块",
         }
     }
 }
