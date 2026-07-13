@@ -2112,6 +2112,57 @@ pub fn fetch_realtime_quotes_batch(codes: &[&str]) -> std::collections::HashMap<
     result
 }
 
+/// v15.3 fix: fetch_realtime_prices_batch — 真价格 (RealtimeQuote.price), 不是 chg_pct
+/// 修复 I-04 持仓建议 push 用错字段 (之前误用 chg_pct 当 price)
+pub fn fetch_realtime_prices_batch(codes: &[&str]) -> std::collections::HashMap<String, f64> {
+    use stock_analysis::data_provider::GtimgProvider;
+    const MAX_CONCURRENT: usize = 32;
+    let provider = match GtimgProvider::new() {
+        Ok(p) => std::sync::Arc::new(p),
+        Err(e) => {
+            log::warn!("[v15.3 fix] GtimgProvider::new 失败: {}", e);
+            return std::collections::HashMap::new();
+        }
+    };
+    let mut result = std::collections::HashMap::new();
+    let codes_vec: Vec<String> = codes.iter().map(|c| c.to_string()).collect();
+    let total = codes_vec.len();
+    let queue: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(codes_vec.into()));
+    let result_mutex = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+        String, f64,
+    >::new()));
+    std::thread::scope(|s| {
+        let workers: Vec<_> = (0..MAX_CONCURRENT.min(total))
+            .map(|_| {
+                let queue = queue.clone();
+                let provider = provider.clone();
+                let result = result_mutex.clone();
+                s.spawn(move || {
+                    loop {
+                        let code_opt = queue.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+                        let code = match code_opt { Some(c) => c, None => break };
+                        let price = provider
+                            .fetch_realtime_quote(&code)
+                            .ok()
+                            .flatten()
+                            .map(|q| q.price as f64)
+                            .filter(|p| *p > 0.0);
+                        if let Some(p) = price {
+                            result.lock().unwrap_or_else(|e| e.into_inner()).insert(code, p);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for h in workers { h.join().ok(); }
+        result = std::sync::Arc::try_unwrap(result_mutex)
+            .map(|m| m.into_inner().unwrap_or_default())
+            .unwrap_or_default();
+    });
+    result
+}
+
 /// v17.2+v16.1 + B-002: 实时涨跌接入, 优先用 板块联动归因 (BoardRotationRow)
 /// 旧 chain_daily 链路作为 fallback.
 pub fn load_news_catalyst_snapshot_real(hhmm: &str) -> NewsCatalystSnapshot {
@@ -3820,16 +3871,16 @@ pub async fn dispatch_holding_plan_daily(hhmm: &str, banner: &BannerCtx) -> bool
         return false;
     }
 
-    // v43: 批量拉真实报价 (并行, 避免 N 次 HTTP)
+    // v43 + v15.3 fix: 批量拉真实价格 (not chg_pct!), 避免之前误用 chg_pct 当 price
     let codes: Vec<String> = positions.iter().map(|p| p.code.clone()).collect();
     let quotes = tokio::task::spawn_blocking(move || {
         let code_refs: Vec<&str> = codes.iter().map(|s| s.as_str()).collect();
-        fetch_realtime_quotes_batch(&code_refs)
+        fetch_realtime_prices_batch(&code_refs)
     })
     .await
     .unwrap_or_default();
     if quotes.is_empty() {
-        log_dispatcher_attempt("I-04", false, 0, "fetch_realtime_quotes empty");
+        log_dispatcher_attempt("I-04", false, 0, "fetch_realtime_prices empty");
         log::warn!("[I-04] 拉报价失败, 跳过推送 (沙箱无网络/数据源挂)");
         return false;
     }
@@ -3855,10 +3906,10 @@ pub async fn dispatch_holding_plan_daily(hhmm: &str, banner: &BannerCtx) -> bool
             );
             continue;
         }
-        // v43: 用真报价, fallback cost 价
+        // v15.3 fix: 用真价格, fallback 到 cost (用真实价格字段, 不是 pct_chg)
         let current_price = quotes
             .get(&pos.code)
-            .map(|p| *p as f64)
+            .copied()
             .filter(|p| *p > 0.0)
             .unwrap_or(pos.cost_price);
         let pnl_pct = if pos.cost_price > 0.0 {
