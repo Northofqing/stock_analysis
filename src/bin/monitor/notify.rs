@@ -132,6 +132,13 @@ pub enum PushKind {
     PaperReview,
     /// v14.3 F-12: T-08 候选失效 (从 CandidateBoard 拆出独立 PushKind, ℹ️参考)
     CandidateInvalidated,
+    // ============= v15.1 C1.2: IPO 监测推送 =============
+    /// IPO 过会 / 证监会注册 (Important 级别, 86400s cooldown)
+    IpoListingApproval,
+    /// IPO 招股说明书披露 (Important, 43200s)
+    IpoProspectus,
+    /// IPO 阶段变化 / 供应链受益 (Info, 3600s)
+    IpoCatalyst,
 }
 
 impl PushKind {
@@ -344,6 +351,10 @@ impl PushKind {
             PushKind::BlockTradePriceRange => "北交所大宗价格区间",
             PushKind::PaperReview => "虚拟仓复盘",
             PushKind::CandidateInvalidated => "候选失效",
+            // v15.1 C1.2: IPO 监测
+            PushKind::IpoListingApproval => "IPO 过会",
+            PushKind::IpoProspectus => "招股说明书",
+            PushKind::IpoCatalyst => "IPO 阶段催化",
         }
     }
 }

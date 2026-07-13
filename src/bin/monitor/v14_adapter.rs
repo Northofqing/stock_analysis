@@ -296,6 +296,13 @@ fn map_push_kind(kind: PushKind) -> (SignalSource, &'static str, Severity) {
         PushKind::CandidateInvalidated => {
             (HoldingHealth, "candidate_invalidated", Severity::Normal)
         }
+        // v15.1 C1.3: IPO PushKind 映射到 SignalSource::Ipo
+        PushKind::IpoListingApproval | PushKind::IpoProspectus => {
+            (SignalSource::Ipo, "ipo_official", Severity::High)
+        }
+        PushKind::IpoCatalyst => {
+            (SignalSource::Ipo, "ipo_catalyst", Severity::Normal)
+        }
     }
 }
 
