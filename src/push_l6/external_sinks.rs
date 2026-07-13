@@ -86,11 +86,40 @@ impl Sink for HttpSink {
                 }
             }
         } else {
-            log::warn!(
-                "[sink:{}] W6.2 骨架未实跑 HTTP (event_id={}, url={}). W8 集成时实现.",
-                self.name, msg.event.event_id, self.config.base_url
-            );
-            SinkResult::Err("http_sink_w6_2_skeleton_not_implemented".to_string())
+            // v15.1 A4.1: 真实 HTTP POST (之前是 w6_2_skeleton_not_implemented)
+            let url = self.config.base_url.clone();
+            if url.is_empty() {
+                return SinkResult::Err(format!("[sink:{}] base_url 未配置", self.name));
+            }
+            // PushMessage 不 impl Serialize, 用简化 JSON (template_id + text)
+            let body = serde_json::json!({
+                "template_id": msg.template_id,
+                "template_version": msg.template_version,
+                "user_id": msg.user_id,
+                "text": msg.text.body,
+            }).to_string();
+            let client = crate::http_client::SHARED_HTTP_CLIENT.clone();
+            let req = client.post(&url)
+                .header("Content-Type", "application/json")
+                .header("User-Agent", "stock-analysis-monitor/v15.1")
+                .timeout(self.config.timeout)
+                .body(body);
+            match req.send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    log::info!("[sink:{}] POST {} ok", self.name, url);
+                    SinkResult::Ok
+                }
+                Ok(resp) => {
+                    let status = resp.status();
+                    let reason = resp.status().canonical_reason().unwrap_or("").to_string();
+                    log::error!("[sink:{}] POST {} HTTP {} {}", self.name, url, status, reason);
+                    SinkResult::Err(format!("HTTP {} {}", status, reason))
+                }
+                Err(e) => {
+                    log::error!("[sink:{}] POST {} network: {}", self.name, url, e);
+                    SinkResult::Err(format!("network: {e}"))
+                }
+            }
         }
     }
 
