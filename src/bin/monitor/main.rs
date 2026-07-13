@@ -6048,6 +6048,8 @@ async fn push_e2e_news_modules(hhmm: &str) {
 
     log::info!("[v70] D-01 推 ({} 字)", d01.chars().count());
 
+    // v15.1 A2.2 TODO: 需要把 upstream 的 rec.code 传过来, 当前没拿到 (deferred to b014)
+    #[allow(deprecated)]
     let _ = notify::push_governor(&d01, notify::PushKind::NewsToIdea).await;
 
     // v70+: 落盘推荐记录 (供后续 D+1 兑现分析)

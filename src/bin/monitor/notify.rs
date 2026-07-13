@@ -558,6 +558,7 @@ fn current_send_channel() -> &'static str {
 /// b013 review P0-1: 兼容旧 2 参调用 + 自动给 default_code_for 兜底,
 /// 让 PerTicket kind 在旧 2 参调用下仍走 L4 dedup 路径 (而不是 PerTicket+None 直通放过).
 /// 真正票级隔离需 b014 把 caller 改成 push_governor_v3(text, kind, Some(code)).
+#[deprecated(since = "v15.1", note = "Use push_governor_v3 with explicit code; this shim collapses PerTicket dedup to '_per_ticket_unbound' global bucket")]
 pub async fn push_governor(text: &str, kind: PushKind) -> bool {
     push_governor_inner(text, kind, Some(default_code_for(kind)))
         .await
