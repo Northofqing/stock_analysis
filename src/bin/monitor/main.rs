@@ -2356,9 +2356,8 @@ async fn main() {
 
 
 
-        // v13.11 (Task 11): 独立轮询 Sina 财经要闻 (90s) → 双写 DB
-
-        tokio::spawn(poll_news_loop());
+        // Phase 3: 移除 poll_news_loop (#3) — news_items 表只写不读(无人 SELECT),
+        //   且 #1 news_monitor_loop 已从 search_service 取 Sina 快讯, #3 重复取数+写废表
 
         // v13.12 (Task 12): 盘后回溯调度 — 30 min tick, 15:30 后触发持仓个股近 30 天新闻回溯
 
