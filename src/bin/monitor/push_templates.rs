@@ -1587,12 +1587,36 @@ pub fn build_preopen_news_hot_from_db<'a>(
     let theme_2 = themes.get(1).copied();
     let theme_3 = themes.get(2).copied();
 
-    let watch_stocks: Vec<(&str, &str, &str)> = clusters
+    // P1: 反查真实股票名 (之前简化用 code 顶替 name → 推送显示 002916(002916))
+    // 三级降级: 持仓/自选名表 → 行情 provider 网络取名 → code
+    // catch_unwind 兜底: DB 未初始化(测试环境)时 get_all_names 会 panic → 降级空 map
+    let name_map = std::panic::catch_unwind(|| stock_analysis::portfolio::get_all_names())
+        .ok()
+        .and_then(|r| r.ok())
+        .unwrap_or_default();
+    let provider = std::panic::catch_unwind(|| stock_analysis::data_provider::GtimgProvider::new())
+        .ok()
+        .and_then(|r| r.ok());
+    let lookup_name = |code: &str| -> String {
+        // 1. 持仓/自选名表
+        if let Some(n) = name_map.iter().find(|(c, _)| c == code).map(|(_, n)| n.clone()) {
+            return n;
+        }
+        // 2. 行情 provider 取名 (preopen 热点票通常非持仓, 走网络)
+        if let Some(ref p) = provider {
+            if let Ok(Some(q)) = p.fetch_realtime_quote(code) {
+                if !q.name.is_empty() {
+                    return q.name;
+                }
+            }
+        }
+        code.to_string() // 3. 都没有 → code
+    };
+    let watch_stocks: Vec<(String, String, String)> = clusters
         .iter()
         .take(3)
         .filter_map(|c| {
             // stocks 是 JSON 数组字符串 ["code1","code2",...]
-            // 简化: 取前 3 个 code (无名称, 用 code 作为 reason)
             let codes: Vec<&str> = c
                 .stocks
                 .trim_matches(|c| c == '[' || c == ']')
@@ -1601,7 +1625,9 @@ pub fn build_preopen_news_hot_from_db<'a>(
                 .map(|s| s.trim_matches('"').trim())
                 .filter(|s| !s.is_empty())
                 .collect();
-            codes.first().map(|code| (*code, *code, c.concept.as_str()))
+            codes
+                .first()
+                .map(|code| (lookup_name(code), code.to_string(), c.concept.clone()))
         })
         .collect();
 
@@ -5325,7 +5351,7 @@ pub struct PreopenNewsHotParams<'a> {
     pub theme_2: Option<&'a str>,
     pub theme_3: Option<&'a str>,
     pub news_pairs: Vec<(&'a str, &'a str)>, // (news, chain)
-    pub watch_stocks: Vec<(&'a str, &'a str, &'a str)>, // (name, code, reason)
+    pub watch_stocks: Vec<(String, String, String)>, // (name, code, reason) — owned (name 反查, 不再用 code 顶替)
 }
 
 /// v13 §14.2 I-01 盘中轮动 — 板块状态
@@ -6922,8 +6948,8 @@ mod tests {
             theme_3: Some("消费电子"),
             news_pairs: vec![("英伟达新品", "GPU"), ("特斯拉FSD入华", "智驾")],
             watch_stocks: vec![
-                ("中科曙光", "603019", "AI算力龙头"),
-                ("绿的谐波", "688017", "减速器"),
+                ("中科曙光".to_string(), "603019".to_string(), "AI算力龙头".to_string()),
+                ("绿的谐波".to_string(), "688017".to_string(), "减速器".to_string()),
             ],
         };
         let out = render_preopen_news_hot(p);
@@ -6942,7 +6968,7 @@ mod tests {
             theme_2: None,
             theme_3: None,
             news_pairs: vec![],
-            watch_stocks: vec![("X", "000001", "r")],
+            watch_stocks: vec![("X".to_string(), "000001".to_string(), "r".to_string())],
         };
         let out = render_preopen_news_hot(p);
         assert!(!out.contains("主线:"));
@@ -7819,7 +7845,9 @@ mod tests {
         assert_eq!(p.theme_2, Some("机器人"));
         assert_eq!(p.theme_3, None); // 只有 2 cluster
         assert_eq!(p.watch_stocks.len(), 2);
-        assert_eq!(p.watch_stocks[0], ("600000", "600000", "AI算力"));
+        // name(.0) 走持仓名表+网络解析, 不固定; 只断言 code(.1) + reason(.2)
+        assert_eq!(p.watch_stocks[0].1, "600000");
+        assert_eq!(p.watch_stocks[0].2, "AI算力");
         assert_eq!(p.news_pairs.len(), 0); // TODO v15.1+
     }
 
@@ -8448,7 +8476,7 @@ mod tests {
             theme_2: Some("机器人"),
             theme_3: None,
             news_pairs: vec![("英伟达H200", "GPU")],
-            watch_stocks: vec![("中科曙光", "603019", "AI龙头")],
+            watch_stocks: vec![("中科曙光".to_string(), "603019".to_string(), "AI龙头".to_string())],
         });
         assert!(p1.contains("📰 盘前热点"));
         assert!(p1.contains("AI算力"));

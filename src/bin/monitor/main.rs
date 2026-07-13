@@ -6523,9 +6523,9 @@ async fn push_e2e_14x_templates(date: &str, hhmm: &str) {
 
         watch_stocks: vec![
 
-            ("深南电路", "002916", "PCB 量价齐升"),
+            ("深南电路".to_string(), "002916".to_string(), "PCB 量价齐升".to_string()),
 
-            ("天孚通信", "300394", "光模块订单回暖"),
+            ("天孚通信".to_string(), "300394".to_string(), "光模块订单回暖".to_string()),
 
         ],
 
