@@ -306,11 +306,41 @@ fn persist_virtual_observation_snapshot(records: &[VirtualObservationRecord]) {
 
     }
 
+    let today = chrono::Local::now().format("%Y%m%d").to_string();
+
+    let daily = dir.join(format!("{}.json", today));
+
+    let latest = dir.join("latest.json");
+
+    // P0 修复: 合并当日已有记录, 避免新买入覆盖老票 (旧逻辑 std::fs::write 直接覆盖丢老票)
+    //   同 code → 以新记录替换 (更新买入价/数量); 不同 code → 追加保留
+    let mut merged: Vec<VirtualObservationRecord> = match std::fs::read_to_string(&daily) {
+        Ok(raw) => serde_json::from_str::<VirtualObservationSnapshot>(&raw)
+            .map(|s| s.records)
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    for new_rec in records {
+        if let Some(slot) = merged.iter_mut().find(|r| r.code == new_rec.code) {
+            *slot = new_rec.clone(); // 已存在, 更新 (不重复记买入)
+        } else {
+            merged.push(new_rec.clone());
+            // 新买入 → 同步记 trades (strategy_tag='virtual'), 供 journal.rs FIFO 盈亏配对 --sell
+            let _ = stock_analysis::portfolio::record_virtual_trade(
+                &new_rec.code,
+                &new_rec.name,
+                stock_analysis::portfolio::TradeDirection::Buy,
+                new_rec.entry_price,
+                new_rec.shares as u64,
+            );
+        }
+    }
+
     let snapshot = VirtualObservationSnapshot {
 
         created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
 
-        records: records.to_vec(),
+        records: merged,
 
     };
 
@@ -327,12 +357,6 @@ fn persist_virtual_observation_snapshot(records: &[VirtualObservationRecord]) {
         }
 
     };
-
-    let today = chrono::Local::now().format("%Y%m%d").to_string();
-
-    let daily = dir.join(format!("{}.json", today));
-
-    let latest = dir.join("latest.json");
 
     if let Err(e) = std::fs::write(&daily, &json) {
 
@@ -356,7 +380,7 @@ fn persist_virtual_observation_snapshot(records: &[VirtualObservationRecord]) {
 
         daily.display(),
 
-        records.len()
+        snapshot.records.len()
 
     );
 
@@ -1827,6 +1851,57 @@ async fn main() {
     // 加载热配置
 
     stock_analysis::config::load_all();
+
+    // --sell CODE:PRICE[:QTY] 手动记录虚拟盘卖出 (复用 trades 表 + journal.rs FIFO 盈亏)
+    //   例: ./monitor --sell 603031:49.5:1000
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if let Some(spec) = args
+            .windows(2)
+            .find(|w| w[0] == "--sell")
+            .map(|w| w[1].clone())
+        {
+            let parts: Vec<&str> = spec.split(':').collect();
+            if parts.len() >= 2 {
+                let code = parts[0];
+                let price: f64 = parts[1].parse().unwrap_or(0.0);
+                let qty: u64 = parts
+                    .get(2)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1000);
+                let name = stock_analysis::portfolio::get_all_names()
+                    .ok()
+                    .and_then(|m| {
+                        m.into_iter()
+                            .find(|(c, _)| c == code)
+                            .map(|(_, n)| n)
+                    })
+                    .unwrap_or_else(|| code.to_string());
+                match stock_analysis::portfolio::record_virtual_trade(
+                    code,
+                    &name,
+                    stock_analysis::portfolio::TradeDirection::Sell,
+                    price,
+                    qty,
+                ) {
+                    Ok(_) => {
+                        println!(
+                            "[虚拟盘] 卖出已记录: {}({}) {}股 @ {:.2}",
+                            name, code, qty, price
+                        );
+                        std::process::exit(0);
+                    }
+                    Err(e) => {
+                        eprintln!("[虚拟盘] 卖出记录失败: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                eprintln!("用法: --sell CODE:PRICE[:QTY]  例: --sell 603031:49.5:1000");
+                std::process::exit(1);
+            }
+        }
+    }
 
     let test_mode = std::env::args().any(|a| a == "--test");
 

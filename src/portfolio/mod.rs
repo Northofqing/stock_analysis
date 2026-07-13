@@ -169,6 +169,51 @@ pub fn get_trade_history(days: u32) -> Result<Vec<Trade>, String> {
     crate::portfolio::store::load_trades_since(since)
 }
 
+/// 记录虚拟盘买卖 (复用现有 trades 表 + journal.rs FIFO 盈亏逻辑)
+///   strategy_tag='virtual' 标记, 与真实持仓交易区分, 不污染真实持仓 P&L
+///   buy: 虚拟建仓; sell: 手动命令触发卖出 (--sell CODE:PRICE[:QTY])
+pub fn record_virtual_trade(
+    code: &str,
+    name: &str,
+    direction: TradeDirection,
+    price: f64,
+    shares: u64,
+) -> Result<(), String> {
+    use diesel::prelude::*;
+    use diesel::sql_types::{BigInt, Double, Text};
+    let dir = match direction {
+        TradeDirection::Buy => "buy",
+        TradeDirection::Sell => "sell",
+    };
+    let amount = price * shares as f64;
+    let traded_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let db = crate::database::DatabaseManager::get();
+    let mut conn = db.get_conn().map_err(|e| format!("get_conn: {e}"))?;
+    diesel::sql_query(
+        "INSERT INTO trades (code, name, direction, price, shares, amount, reason, traded_at, strategy_tag) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'virtual')",
+    )
+    .bind::<Text, _>(code)
+    .bind::<Text, _>(name)
+    .bind::<Text, _>(dir)
+    .bind::<Double, _>(price)
+    .bind::<BigInt, _>(shares as i64)
+    .bind::<Double, _>(amount)
+    .bind::<Text, _>("virtual")
+    .bind::<Text, _>(&traded_at)
+    .execute(&mut *conn)
+    .map_err(|e| format!("insert virtual trade {code}: {e}"))?;
+    log::info!(
+        "[虚拟盘] 记录{}: {}({}) {}股 @ {:.2}",
+        dir,
+        name,
+        code,
+        shares,
+        price
+    );
+    Ok(())
+}
+
 /// 记录每日净值快照
 pub fn snapshot_ledger(entry: LedgerEntry) -> Result<(), String> {
     crate::portfolio::store::save_ledger(entry)
