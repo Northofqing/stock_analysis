@@ -3880,14 +3880,21 @@ pub async fn dispatch_holding_plan_daily(hhmm: &str, banner: &BannerCtx) -> bool
         } else {
             None
         };
+        // v60 F12+: hard_stop 默认 0 没设 — fallback 到现价 * 0.92 (8% 止损), 不显示 0.00
+        let effective_stop = if pos.hard_stop > 0.0 {
+            pos.hard_stop
+        } else {
+            current_price * 0.92
+        };
+        let stop_source = if pos.hard_stop > 0.0 { "硬止损" } else { "估算止损(-8%)" };
         let reasons_vec = vec![
             format!(
                 "成本{:.2} 现价{:.2} 盈亏{:+.1}%",
                 pos.cost_price, current_price, pnl_pct
             ),
-            format!("硬止损{:.2}", pos.hard_stop),
+            format!("{}{:.2}", stop_source, effective_stop),
         ];
-        let invalidations_vec = vec![format!("跌破{:.2}且放量", pos.hard_stop)];
+        let invalidations_vec = vec![format!("跌破{:.2}且放量", effective_stop)];
         let params = HoldingPlanParams {
             name: &pos.name,
             code: &pos.code,
@@ -3897,9 +3904,9 @@ pub async fn dispatch_holding_plan_daily(hhmm: &str, banner: &BannerCtx) -> bool
             cost: pos.cost_price,
             avail: pos.shares as u32,
             reduce_zone,
-            support: pos.hard_stop,
+            support: effective_stop,
             pressure: current_price * 1.10,
-            stop: pos.hard_stop,
+            stop: effective_stop,
             invalidations: &invalidations_vec,
             reasons: &reasons_vec,
         };
