@@ -7768,6 +7768,22 @@ async fn monitor_loop() {
                     log::warn!("[evening_review] 失败: {}", e);
                 }
             }
+            // Fix 4 (review): PerformanceEngine 15:05 cron 接入 (写 paper_performance_snapshot)
+            // 用 OnceLock<NaiveDate> 防当日重复, 失败可重试
+            if now.hour() == 15 && now.minute() == 5 {
+                use stock_analysis::performance::PerformanceEngine;
+                static PERF_LAST_RUN: std::sync::Mutex<Option<chrono::NaiveDate>> = std::sync::Mutex::new(None);
+                let today = now.date_naive();
+                let already_run = PERF_LAST_RUN.lock().unwrap_or_else(|e| e.into_inner()).map(|d| d == today).unwrap_or(false);
+                if !already_run {
+                    if let Ok(snap) = PerformanceEngine::daily_settlement() {
+                        log::info!("[v16.4] PerformanceEngine 15:05 跑完: total_pnl={} win_rate={:.2} sharpe={:.2}", snap.total_pnl, snap.win_rate, snap.sharpe_ratio);
+                        *PERF_LAST_RUN.lock().unwrap_or_else(|e| e.into_inner()) = Some(today);
+                    } else {
+                        log::warn!("[v16.4] PerformanceEngine.daily_settlement 失败 (允许 30s 后重试)");
+                    }
+                }
+            }
             tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
         }
     });

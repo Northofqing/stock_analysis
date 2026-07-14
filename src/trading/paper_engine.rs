@@ -27,6 +27,10 @@ pub struct PaperPositionSellCheck {
     pub name: String,
     pub avg_cost: f64,
     pub quantity: u32,
+    /// Fix 1 (review): 当前市价 (用于 emit_sell_signal, 避免 avg_cost 当 price 滑点 0%)
+    /// v16.4 #5 阶段: 暂无 broker API, 推 0.0 (emit_sell_signal 用 avg_cost fallback)
+    /// v16.7 接入 broker 后: 填真价
+    pub current_price: f64,
 }
 
 /// 4 铁律检查结果
@@ -34,9 +38,10 @@ pub struct SellDecision {
     pub code: String,
     pub name: String,
     pub reason: String,
-    pub price: f64,
-    /// Fix 3: 真实卖出数量 (来自 PaperPositionSellCheck.quantity, 不再硬编码 100)
+    /// Fix 3 (review): 真实卖出数量 (来自 PaperPositionSellCheck.quantity, 不再硬编码 100)
     pub quantity: u32,
+    /// 当前市价 (Fix 1: 之前用 avg_cost 当 price, 滑点 0 永远不 Invalidated; 现在用当前市价)
+    pub current_price: f64,
 }
 
 #[derive(diesel::QueryableByName, Debug, Clone)]
@@ -82,6 +87,7 @@ pub fn load_open_positions() -> Result<Vec<PaperPositionSellCheck>, String> {
             name: r.name,
             avg_cost: r.avg_cost,
             quantity: r.net_qty.max(0) as u32,
+            current_price: 0.0, // Fix 1: v16.4 #5 broker 接入前, emit_sell_signal fallback 到 avg_cost
         })
         .collect())
 }
@@ -116,7 +122,7 @@ pub fn check_4_iron_rules(checks: &[PaperPositionSellCheck]) -> Result<Vec<SellD
                     code: check.code.clone(),
                     name: check.name.clone(),
                     reason: reason.clone(),
-                    price: check.avg_cost,
+                    current_price: check.current_price, // Fix 1: 0.0 fallback avg_cost
                     quantity: check.quantity, // Fix 3: 真实数量
                 });
             }
@@ -129,17 +135,19 @@ pub fn check_4_iron_rules(checks: &[PaperPositionSellCheck]) -> Result<Vec<SellD
 /// 调 paper_trade::simulate(Sell) 写 paper_trades
 ///
 /// Fix 3: SellDecision 加 quantity 字段, 不再硬编码 100
+/// Fix 1: price 用 current_price (0.0 fallback avg_cost, 避免滑点 0 永远不 Invalidated)
 pub fn emit_sell_signal(decision: &SellDecision) -> Result<(), String> {
     let now = Local::now();
+    // Fix 1: effective_price = current_price (broker 未接入前 fallback 到 0.0 = 滑点检查跳过)
+    let effective_price = decision.current_price;
     let signal = PaperSignal {
-        // review fix Issue #2 (防重): plan_id 日级粒度 —— 30s tick 重复触发同一铁律时,
-        // INSERT OR IGNORE (uniq_paper_trades_plan_id) 保证同票同日只写 1 条卖单
-        plan_id: format!("exit-{}-{}", decision.code, now.format("%Y%m%d")),
+        // Fix 1: plan_id 含铁律 + ts (同 code 同日多铁律可各写 1 次)
+        plan_id: format!("exit-{}-{}-{}", decision.code, now.format("%Y%m%d"), decision.reason.replace(' ', "_").chars().take(16).collect::<String>()),
         code: decision.code.clone(),
         name: decision.name.clone(),
         direction: Direction::Sell,
-        price: decision.price,
-        quantity: decision.quantity.max(100), // 至少 1 手, 防 0
+        price: effective_price,
+        quantity: decision.quantity.max(100),
         virtual_reason: format!("4-IronRule:{}", decision.reason),
         is_limit_up: false,
         is_limit_down: false,
@@ -149,8 +157,8 @@ pub fn emit_sell_signal(decision: &SellDecision) -> Result<(), String> {
     };
 
     // review fix Issue #5: 传真实 portfolio state (Sell 路径 AccountMode/DataMode 检查仍生效)
-    let (cash, total, pos_pct) = paper_trade::portfolio_state(&decision.code, decision.price);
-    match paper_trade::simulate(&signal, decision.price, cash, total, pos_pct) {
+    let (cash, total, pos_pct) = paper_trade::portfolio_state(&decision.code, effective_price);
+    match paper_trade::simulate(&signal, effective_price, cash, total, pos_pct) {
         Ok(outcome) => {
             log::info!(
                 "[paper_engine] 4 铁律卖出 {}({}) status={} reason={}",
