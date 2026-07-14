@@ -128,7 +128,10 @@ impl IntradayMonitor {
                     code: cand.code.clone(),
                     name: cand.name.clone(),
                     direction: Direction::Buy,
-                    price: cand.push_price,
+                    price: crate::broker::quote_provider()
+                        .map(|p| p.get_quote_price(&cand.code))
+                        .filter(|&p| p > 0.0)
+                        .unwrap_or(cand.push_price), // v16.5 #3: 真价, 0.0 fallback
                     quantity: 100,
                     virtual_reason: signal.source.to_string(),
                     is_limit_up: false,
@@ -311,7 +314,10 @@ pub fn evening_review(today: NaiveDate) -> Result<usize, String> {
             code: cand.code.clone(),
             name: cand.name.clone(),
             direction: Direction::Buy,
-            price: cand.push_price,
+            price: crate::broker::quote_provider()
+                .map(|p| p.get_quote_price(&cand.code))
+                .filter(|&p| p > 0.0)
+                .unwrap_or(cand.push_price), // v16.5 #3: 真价
             quantity: 100,
             virtual_reason: "Momentum".to_string(),
             is_limit_up: false,

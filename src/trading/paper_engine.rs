@@ -165,12 +165,31 @@ pub fn emit_sell_signal(decision: &SellDecision) -> Result<(), String> {
 
     // review fix Issue #5: 传真实 portfolio state (Sell 路径 AccountMode/DataMode 检查仍生效)
     let (cash, total, pos_pct) = paper_trade::portfolio_state(&decision.code, effective_price);
+    // v16.5 #4: 预生成 order_id/exec_id/decision_id, simulate 后 publish TradingBus (2 emit)
+    let order_id = crate::bus::new_order_id();
+    let exec_id = crate::bus::new_execution_id();
+    let decision_id = crate::bus::new_decision_id();
+    let plan_id_for_event = order_id.clone(); // emit 用 (不暴露 plan_id 给 TradingEvent)
     match paper_trade::simulate(&signal, effective_price, cash, total, pos_pct) {
         Ok(outcome) => {
             log::info!(
                 "[paper_engine] 4 铁律卖出 {}({}) status={} reason={}",
                 decision.name, decision.code, outcome.result.status.as_str(), decision.reason
             );
+            // v16.5 #4: TradingBus 2 emit (OrderCreated + ExecutionFilled, 真价)
+            crate::bus::TradingBus::global().publish(crate::bus::TradingEvent::OrderCreated {
+                decision_id: decision_id.clone(),
+                order_id: order_id.clone(),
+                code: decision.code.clone(),
+                side: "sell".to_string(),
+            });
+            crate::bus::TradingBus::global().publish(crate::bus::TradingEvent::ExecutionFilled {
+                order_id: order_id.clone(),
+                execution_id: exec_id.clone(),
+                fill_price: effective_price,
+            });
+            // suppress unused warning
+            let _ = plan_id_for_event;
             Ok(())
         }
         Err(e) => {
