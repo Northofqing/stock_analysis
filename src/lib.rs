@@ -24,6 +24,7 @@ pub mod monitor;
 pub mod news;  // v15.1 Phase B: 新闻监测 + IPO 监测 (BIPO 子集)
 pub mod notification;
 pub mod opportunity;
+pub mod performance; // v16.4 #4: PerformanceSnapshot 独立表
 pub mod pipeline;
 pub mod portfolio;
 pub mod review;
