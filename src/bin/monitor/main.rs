@@ -1765,13 +1765,12 @@ fn count_paper_trades_today(today: chrono::NaiveDate) -> Result<i64, String> {
         #[diesel(sql_type = diesel::sql_types::BigInt)]
         cnt: i64,
     }
-    diesel::sql_query(format!(
-        "SELECT COUNT(*) AS cnt FROM paper_trades WHERE date(ts) = '{}'",
-        today
-    ))
-    .get_result::<CountRow>(&mut conn)
-    .map(|r| r.cnt)
-    .map_err(|e| format!("COUNT paper_trades: {}", e))
+    // review fix Issue #4: 参数化绑定替代 format! 拼接
+    diesel::sql_query("SELECT COUNT(*) AS cnt FROM paper_trades WHERE date(ts) = ?")
+        .bind::<diesel::sql_types::Text, _>(today.to_string())
+        .get_result::<CountRow>(&mut conn)
+        .map(|r| r.cnt)
+        .map_err(|e| format!("COUNT paper_trades: {}", e))
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -7731,9 +7730,11 @@ async fn monitor_loop() {
     // v16.3 Commit 5: 接入 v16.3 4 模块 (verify finding 修复: main_loop 0 调用)
     // - IntradayMonitor::tick  盘中: 每 30s 扫推送票池 + 4 步过滤 + 调 paper_trade::simulate
     // - evening_review       盘后: 15:30 整盘 Momentum 整盘扫 (Fix 5: 不限 1h 时间窗)
-    // - paper_engine 4 铁律循环暂不启 (v16.3 checks 空, 等 v16.4 接真 paper_positions)
+    // - paper_engine         review fix Issue #2: 4 铁律卖出闭环 — 真持仓从 paper_trades 聚合,
+    //                        铁律触发 → simulate(Sell), plan_id 日级幂等防 30s tick 重复卖
     let _intraday_handle = tokio::spawn(async {
         use stock_analysis::decision::intraday_monitor::{IntradayMonitor, evening_review};
+        use stock_analysis::trading::paper_engine;
         use chrono::Timelike;
         let monitor = IntradayMonitor;
         loop {
@@ -7742,7 +7743,24 @@ async fn monitor_loop() {
                 Ok(_) => log::debug!("[v16.3] intraday_monitor tick: 0 候选"),
                 Err(e) => log::warn!("[v16.3] intraday_monitor tick 失败: {}", e),
             }
-            // 15:30 整盘扫 (R5) — minute==30 严格匹配防 30s tick 跨多分钟重复触发
+            // 4 铁律卖出检查 (review fix Issue #2: 之前是 dead code "暂不启")
+            match paper_engine::load_open_positions() {
+                Ok(checks) if !checks.is_empty() => {
+                    match paper_engine::check_4_iron_rules(&checks) {
+                        Ok(decisions) => {
+                            for d in decisions {
+                                if let Err(e) = paper_engine::emit_sell_signal(&d) {
+                                    log::warn!("[paper_engine] emit_sell_signal 失败 {}: {}", d.code, e);
+                                }
+                            }
+                        }
+                        Err(e) => log::warn!("[paper_engine] check_4_iron_rules 失败: {}", e),
+                    }
+                }
+                Ok(_) => {} // 无未平仓虚拟持仓
+                Err(e) => log::warn!("[paper_engine] load_open_positions 失败: {}", e),
+            }
+            // 15:30 整盘扫 (R5) — evening_review 内部有当日防重入 (review fix Issue #7)
             let now = chrono::Local::now();
             if now.hour() == 15 && now.minute() == 30 {
                 let today = now.date_naive();

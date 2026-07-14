@@ -6,6 +6,14 @@
 //!                          DecisionPolicy) 拆分层.
 //!
 //! v16.4 Commit 2 注: 8 impl 文件拆独立, 不动 v16.3 evaluate_candidate 评分表.
+//!
+//! # FIXME(红线 2.1) — Phase 1 stub, 禁止直接接入生产决策路径
+//!
+//! 当前 8 个 impl 的 `score()` 返回**硬编码分数** (与 v16.3 evaluate_candidate 评分表对齐),
+//! 不读真实行情/资金/情绪数据. 在 v16.4 Commit #6 把 intraday_monitor 接到
+//! ScoreCalculator.aggregate(8 strategy.score()) 之前, **必须**把每个 score() 换成
+//! 真实数据计算 (sector_monitor / limit_up_stocks / auction_volume / main_net_inflow 等),
+//! 否则触发 AGENTS.md 红线 2.1 (生产路径 mock 数据) — 屏蔽 merge.
 
 use crate::bus::StrategyId;
 

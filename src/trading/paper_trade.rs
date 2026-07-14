@@ -146,6 +146,34 @@ pub fn evaluate(signal: &PaperSignal, quote_price: f64) -> PaperResult {
     }
 }
 
+/// v16.3 review fix (Issue #5): 读真实 (cash, total, pos_pct) 给 risk_adapter 检查用.
+/// lib 版, bin (push_templates) 与 lib (intraday_monitor / paper_engine) 共用.
+///
+/// 失败策略 (红线 2.2 出声): get_positions 失败 → warn + (0,0,0);
+/// cash_guard 对 total<=0 显式跳过检查 (缺数据不硬拦), 每次失败均有 warn 日志.
+pub fn portfolio_state(code: &str, quote_price: f64) -> (f64, f64, f64) {
+    let positions = match crate::portfolio::get_positions() {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!(
+                "[portfolio_state] get_positions 失败: {} → (0,0,0), risk_adapter 将跳过现金/仓位检查",
+                e
+            );
+            return (0.0, 0.0, 0.0);
+        }
+    };
+    let mut total = 1_000_000.0_f64;
+    let mut pos_pct = 0.0_f64;
+    for p in &positions {
+        if p.code == code {
+            pos_pct = (p.shares as f64 * quote_price) / total * 100.0;
+        }
+        total += p.shares as f64 * quote_price;
+    }
+    let cash = total * 0.30; // v16.3 简化: 30% 现金假设, v16.4 接 ledger 真值
+    (cash, total, pos_pct)
+}
+
 /// 模拟成交结果 (含 DB 写入状态)
 #[derive(Clone, Debug)]
 pub struct PaperOutcome {

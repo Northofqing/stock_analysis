@@ -42,22 +42,20 @@ pub fn record(meta: &PushRecordMeta) -> Result<i64, String> {
         .get_conn()
         .map_err(|e| format!("DB 连接失败: {}", e))?;
 
-    let esc = |s: &str| s.replace('\'', "''");
     let now = Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
 
-    let sql = format!(
+    // v16.3 review fix (Issue #4): 参数化绑定替代 format! 拼接 (name 来自网络行情数据)
+    diesel::sql_query(
         "INSERT INTO pushed_stocks (push_time, push_kind, code, name, push_price, metric_json, source) \
-         VALUES ('{}', '{}', '{}', '{}', {}, '{}', '{}')",
-        now,
-        esc(&meta.push_kind),
-        esc(&meta.code),
-        esc(&meta.name),
-        meta.push_price,
-        esc(&meta.metric_json),
-        esc(&meta.source),
-    );
-
-    diesel::sql_query(sql)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind::<diesel::sql_types::Text, _>(&now)
+    .bind::<diesel::sql_types::Text, _>(&meta.push_kind)
+    .bind::<diesel::sql_types::Text, _>(&meta.code)
+    .bind::<diesel::sql_types::Text, _>(&meta.name)
+    .bind::<diesel::sql_types::Double, _>(meta.push_price)
+    .bind::<diesel::sql_types::Text, _>(&meta.metric_json)
+    .bind::<diesel::sql_types::Text, _>(&meta.source)
         .execute(&mut conn)
         .map_err(|e| {
             log::warn!(

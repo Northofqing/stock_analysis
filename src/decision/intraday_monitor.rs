@@ -22,6 +22,8 @@ const PUSH_AGE_MAX_HOURS: i64 = 1;
 const DECISION_SCORE_THRESHOLD: f64 = 6.0;
 const VOLUME_SURGE_THRESHOLD: f64 = 5.0;
 const MAX_CANDIDATES: i64 = 50;
+/// 盘后整盘扫候选上限 (review fix: 消除魔数, 与 MAX_CANDIDATES 区分)
+const MAX_EVENING_CANDIDATES: i64 = 100;
 
 /// 综合分评分
 #[derive(Debug, Clone, PartialEq)]
@@ -87,17 +89,17 @@ impl IntradayMonitor {
             .get_conn()
             .map_err(|e| format!("DB 连接失败: {}", e))?;
 
-        // 1. 扫推送票池
-        let candidates: Vec<Candidate> = diesel::sql_query(format!(
+        // 1. 扫推送票池 (review fix Issue #4: 参数化绑定替代 format! 拼接)
+        let candidates: Vec<Candidate> = diesel::sql_query(
             "SELECT id, push_time, push_kind, code, name, push_price, metric_json, source \
              FROM pushed_stocks \
-             WHERE consumed_at IS NULL AND push_time < '{}' \
-             AND push_time > '{}' \
-             ORDER BY push_time DESC LIMIT {}",
-            now.format("%Y-%m-%d %H:%M:%S%.3f"),
-            cutoff.format("%Y-%m-%d %H:%M:%S%.3f"),
-            MAX_CANDIDATES
-        ))
+             WHERE consumed_at IS NULL AND push_time < ? \
+             AND push_time > ? \
+             ORDER BY push_time DESC LIMIT ?",
+        )
+        .bind::<diesel::sql_types::Text, _>(now.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
+        .bind::<diesel::sql_types::Text, _>(cutoff.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
+        .bind::<diesel::sql_types::BigInt, _>(MAX_CANDIDATES)
         .load::<Candidate>(&mut conn)
         .map_err(|e| format!("query pushed_stocks: {}", e))?;
 
@@ -135,17 +137,20 @@ impl IntradayMonitor {
                     account_mode: "Normal".to_string(),
                     data_mode: "Full".to_string(),
                 };
-                match paper_trade::simulate(&paper_signal, cand.push_price, 0.0, 0.0, 0.0) {
+                // review fix Issue #5: 传真实 portfolio state (之前传 0,0,0 静默旁路现金/仓位检查)
+                let (cash, total, pos_pct) =
+                    paper_trade::portfolio_state(&cand.code, cand.push_price);
+                match paper_trade::simulate(&paper_signal, cand.push_price, cash, total, pos_pct) {
                     Ok(_) => {
-                        // 4. 标记 consumed
+                        // 4. 标记 consumed (review fix Issue #4: 参数化绑定)
                         let outcome = signal.source;
-                        diesel::sql_query(format!(
-                            "UPDATE pushed_stocks SET consumed_at = '{}', consumed_by = 'intraday_monitor', outcome = '{}' \
-                             WHERE id = {}",
-                            now.format("%Y-%m-%d %H:%M:%S%.3f"),
-                            outcome.replace('\'', "''"),
-                            cand.id
-                        ))
+                        diesel::sql_query(
+                            "UPDATE pushed_stocks SET consumed_at = ?, consumed_by = 'intraday_monitor', outcome = ? \
+                             WHERE id = ?",
+                        )
+                        .bind::<diesel::sql_types::Text, _>(now.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
+                        .bind::<diesel::sql_types::Text, _>(outcome)
+                        .bind::<diesel::sql_types::Integer, _>(cand.id)
                         .execute(&mut conn)
                         .map_err(|e| format!("update consumed_at: {}", e))?;
                         emitted += 1;
@@ -228,8 +233,19 @@ impl IntradayMonitor {
     }
 }
 
+/// review fix Issue #7: evening_review 当日防重入 (30s tick 在 15:30 分钟内会触发 2 次)
+/// 只在成功跑完后记 date, 失败可重试 (consumed_at 标记保证重试幂等)
+static EVENING_LAST_RUN: std::sync::Mutex<Option<NaiveDate>> = std::sync::Mutex::new(None);
+
 /// 盘后 15:30 整盘扫 (R5) — 复用 evaluate_candidate 评分, 跑 Momentum 整合
 pub fn evening_review(today: NaiveDate) -> Result<usize, String> {
+    {
+        let last = EVENING_LAST_RUN.lock().unwrap_or_else(|e| e.into_inner());
+        if *last == Some(today) {
+            log::info!("[evening_review] {} 已跑过, 跳过 (当日防重入)", today);
+            return Ok(0);
+        }
+    }
     let now = Local::now();
     let cutoff = today
         .and_hms_opt(15, 30, 0)
@@ -240,15 +256,17 @@ pub fn evening_review(today: NaiveDate) -> Result<usize, String> {
         .get_conn()
         .map_err(|e| format!("DB 连接失败: {}", e))?;
 
-    let candidates: Vec<Candidate> = diesel::sql_query(format!(
+    // review fix Issue #4: 参数化绑定
+    let candidates: Vec<Candidate> = diesel::sql_query(
         "SELECT id, push_time, push_kind, code, name, push_price, metric_json, source \
          FROM pushed_stocks \
-         WHERE consumed_at IS NULL AND push_time <= '{}' \
-         AND date(push_time) = '{}' \
-         ORDER BY push_time DESC LIMIT 100",
-        cutoff.format("%Y-%m-%d %H:%M:%S"),
-        today
-    ))
+         WHERE consumed_at IS NULL AND push_time <= ? \
+         AND date(push_time) = ? \
+         ORDER BY push_time DESC LIMIT ?",
+    )
+    .bind::<diesel::sql_types::Text, _>(cutoff.format("%Y-%m-%d %H:%M:%S").to_string())
+    .bind::<diesel::sql_types::Text, _>(today.to_string())
+    .bind::<diesel::sql_types::BigInt, _>(MAX_EVENING_CANDIDATES)
     .load::<Candidate>(&mut conn)
     .map_err(|e| format!("evening query: {}", e))?;
 
@@ -290,14 +308,17 @@ pub fn evening_review(today: NaiveDate) -> Result<usize, String> {
             account_mode: "Normal".to_string(),
             data_mode: "Full".to_string(),
         };
-        match paper_trade::simulate(&paper_signal, cand.push_price, 0.0, 0.0, 0.0) {
+        // review fix Issue #5: 传真实 portfolio state
+        let (cash, total, pos_pct) = paper_trade::portfolio_state(&cand.code, cand.push_price);
+        match paper_trade::simulate(&paper_signal, cand.push_price, cash, total, pos_pct) {
             Ok(_) => {
-                diesel::sql_query(format!(
-                    "UPDATE pushed_stocks SET consumed_at = '{}', consumed_by = 'evening_review', outcome = 'Momentum' \
-                     WHERE id = {}",
-                    now.format("%Y-%m-%d %H:%M:%S%.3f"),
-                    cand.id
-                ))
+                // review fix Issue #4: 参数化绑定
+                diesel::sql_query(
+                    "UPDATE pushed_stocks SET consumed_at = ?, consumed_by = 'evening_review', outcome = 'Momentum' \
+                     WHERE id = ?",
+                )
+                .bind::<diesel::sql_types::Text, _>(now.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
+                .bind::<diesel::sql_types::Integer, _>(cand.id)
                 .execute(&mut conn)
                 .map_err(|e| format!("evening update: {}", e))?;
                 emitted += 1;
@@ -320,6 +341,8 @@ pub fn evening_review(today: NaiveDate) -> Result<usize, String> {
         today,
         emitted
     );
+    // 成功跑完才记 date (失败可重试)
+    *EVENING_LAST_RUN.lock().unwrap_or_else(|e| e.into_inner()) = Some(today);
     Ok(emitted)
 }
 

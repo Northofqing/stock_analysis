@@ -45,6 +45,47 @@ struct AdviceRow {
     operation_advice: String,
 }
 
+#[derive(diesel::QueryableByName, Debug)]
+struct OpenPosRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    code: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    name: String,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    net_qty: i64,
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    avg_cost: f64,
+}
+
+/// review fix Issue #2: 从 paper_trades 聚合真实未平仓虚拟持仓 (Filled buy - Filled sell > 0).
+/// 替代之前 "checks 永远空, 等 v16.4" 的 dead code 状态, 让 4 铁律卖出闭环上线.
+pub fn load_open_positions() -> Result<Vec<PaperPositionSellCheck>, String> {
+    let mut conn = DatabaseManager::get()
+        .get_conn()
+        .map_err(|e| format!("DB 连接失败: {}", e))?;
+    let rows: Vec<OpenPosRow> = diesel::sql_query(
+        "SELECT code, MAX(name) AS name, \
+         SUM(CASE WHEN direction = 'buy' THEN quantity ELSE -quantity END) AS net_qty, \
+         COALESCE( \
+           SUM(CASE WHEN direction = 'buy' THEN COALESCE(fill_price, price) * quantity ELSE 0 END) * 1.0 \
+           / NULLIF(SUM(CASE WHEN direction = 'buy' THEN quantity ELSE 0 END), 0), 0.0) AS avg_cost \
+         FROM paper_trades WHERE status = 'Filled' \
+         GROUP BY code HAVING net_qty > 0",
+    )
+    .load::<OpenPosRow>(&mut conn)
+    .map_err(|e| format!("query open paper positions: {}", e))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| PaperPositionSellCheck {
+            code: r.code,
+            name: r.name,
+            avg_cost: r.avg_cost,
+            quantity: r.net_qty.max(0) as u32,
+        })
+        .collect())
+}
+
 /// 4 铁律检查入口 — 读 analysis_result 表 (由 position_tracker::track_position 写)
 pub fn check_4_iron_rules(checks: &[PaperPositionSellCheck]) -> Result<Vec<SellDecision>, String> {
     let mut decisions = Vec::new();
@@ -54,11 +95,12 @@ pub fn check_4_iron_rules(checks: &[PaperPositionSellCheck]) -> Result<Vec<SellD
 
     for check in checks {
         // 1. 读 analysis_result 最新条 (track_position 在 monitor_loop 跑, 写进 DB)
-        let advice: Option<String> = diesel::sql_query(format!(
-            "SELECT operation_advice FROM analysis_result WHERE code = '{}' \
+        // review fix Issue #4: 参数化绑定替代 format! 拼接
+        let advice: Option<String> = diesel::sql_query(
+            "SELECT operation_advice FROM analysis_result WHERE code = ? \
              ORDER BY id DESC LIMIT 1",
-            check.code.replace('\'', "''")
-        ))
+        )
+        .bind::<diesel::sql_types::Text, _>(&check.code)
         .get_result::<AdviceRow>(&mut conn)
         .ok()
         .map(|r| r.operation_advice);
@@ -90,11 +132,9 @@ pub fn check_4_iron_rules(checks: &[PaperPositionSellCheck]) -> Result<Vec<SellD
 pub fn emit_sell_signal(decision: &SellDecision) -> Result<(), String> {
     let now = Local::now();
     let signal = PaperSignal {
-        plan_id: format!(
-            "exit-{}-{}",
-            decision.code,
-            now.format("%Y%m%d%H%M%S%3f")
-        ),
+        // review fix Issue #2 (防重): plan_id 日级粒度 —— 30s tick 重复触发同一铁律时,
+        // INSERT OR IGNORE (uniq_paper_trades_plan_id) 保证同票同日只写 1 条卖单
+        plan_id: format!("exit-{}-{}", decision.code, now.format("%Y%m%d")),
         code: decision.code.clone(),
         name: decision.name.clone(),
         direction: Direction::Sell,
@@ -108,7 +148,9 @@ pub fn emit_sell_signal(decision: &SellDecision) -> Result<(), String> {
         data_mode: "Full".to_string(),
     };
 
-    match paper_trade::simulate(&signal, decision.price, 0.0, 0.0, 0.0) {
+    // review fix Issue #5: 传真实 portfolio state (Sell 路径 AccountMode/DataMode 检查仍生效)
+    let (cash, total, pos_pct) = paper_trade::portfolio_state(&decision.code, decision.price);
+    match paper_trade::simulate(&signal, decision.price, cash, total, pos_pct) {
         Ok(outcome) => {
             log::info!(
                 "[paper_engine] 4 铁律卖出 {}({}) status={} reason={}",

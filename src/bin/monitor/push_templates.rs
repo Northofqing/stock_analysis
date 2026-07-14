@@ -1963,6 +1963,9 @@ pub fn load_sector_snapshot(hhmm: &str) -> SectorSnapshot {
 }
 
 /// v15.2 业务层入口 — 10/11/13/14 盘中调用 (v16.1 改用真实数据)
+///
+/// 注 (review Issue #6): I-01 是板块级推送 (无个股 code/price), 无法入 pushed_stocks 票池;
+/// 若造个股数据入池则违红线 2.2, 故 I-01 不接 push_recorder (设计决策, 非遗漏)
 pub async fn dispatch_intraday_market_daily(hhmm: &str, banner: &BannerCtx) -> bool {
     let snapshot = load_sector_snapshot_real(hhmm);
     // v-fix: 只要有领涨板块 (main_attack 非空) 就推, 不再因 tech/power/robot 3 家族全空而跳过。
@@ -2442,6 +2445,8 @@ pub struct IndustryChainSnapshot {
     pub leader_height: u32,
     /// (name, code, trigger, lo, hi, stop)
     pub supplements: Vec<(String, String, String, f64, f64, f64)>,
+    /// review fix Issue #6: 供 push_recorder 入池 (name, code, 真实 price) — 仅含有真实价格的候选
+    pub record_candidates: Vec<(String, String, f64)>,
     /// v13.10.5: LLM 生成的补涨 trigger 文案 (替代 "首板" 硬编码)
     /// key: code, value: 真实触发原因 (e.g. "PCB 龙头首板, 800G 订单")
     pub llm_triggers: std::collections::HashMap<String, String>,
@@ -2600,7 +2605,9 @@ pub fn load_industry_chain_snapshot_real(hhmm: &str) -> IndustryChainSnapshot {
     let reverse_lookup_code = |nm: &str| -> Option<String> {
         name_map.iter().find(|(_, n)| n == nm).map(|(c, _)| c.clone())
     };
-    let supplements: Vec<(String, String, String, f64, f64, f64)> = top
+    // review fix Issue #6: 两段构建 — 先解析 (name, code, 真实 price), 再派生 supplements,
+    // 同时留 record_candidates 供 push_recorder 入池 (仅 price > 0 的候选, 红线 2.2 不造价)
+    let supplement_data: Vec<(String, String, f64)> = top
         .followers
         .iter()
         .take(3)
@@ -2615,14 +2622,24 @@ pub fn load_industry_chain_snapshot_real(hhmm: &str) -> IndustryChainSnapshot {
                 }
             };
             let price = chg_map.get(code.as_str()).copied().unwrap_or(0.0) as f64;
+            (name, code, price)
+        })
+        .collect();
+    let supplements: Vec<(String, String, String, f64, f64, f64)> = supplement_data
+        .iter()
+        .map(|(name, code, price)| {
             // P1-1: 用真价格算低吸区间/止损 (替代硬编码 0.0); 无价格时回落 0 (模板显示 0.00)
-            let (lo, hi, stop) = if price > 0.0 {
+            let (lo, hi, stop) = if *price > 0.0 {
                 (price * 0.97, price * 1.03, price * 0.92)
             } else {
                 (0.0, 0.0, 0.0)
             };
-            (name, code, "首板".to_string(), lo, hi, stop)
+            (name.clone(), code.clone(), "首板".to_string(), lo, hi, stop)
         })
+        .collect();
+    let record_candidates: Vec<(String, String, f64)> = supplement_data
+        .into_iter()
+        .filter(|(_, _, p)| *p > 0.0)
         .collect();
 
     IndustryChainSnapshot {
@@ -2633,6 +2650,7 @@ pub fn load_industry_chain_snapshot_real(hhmm: &str) -> IndustryChainSnapshot {
         leader_code: top.leader_code.clone(),
         leader_height: top.leader_boards,
         supplements,
+        record_candidates,
         llm_triggers: std::collections::HashMap::new(),
     }
 }
@@ -2674,6 +2692,7 @@ fn load_industry_chain_snapshot_real_fallback(hhmm: &str) -> IndustryChainSnapsh
         leader_code,
         leader_height: top.continuation_count as u32,
         supplements,
+        record_candidates: Vec::new(), // fallback 路径无真实价格, 不入池 (红线 2.2)
         llm_triggers: std::collections::HashMap::new(),
     }
 }
@@ -2753,6 +2772,29 @@ pub async fn dispatch_industry_chain_intraday_daily(hhmm: &str, banner: &BannerC
     let snap_size = snapshot.supplements.len() + 1; // +1 leader
     let result = push_industry_chain_intraday("", Some(banner), params).await;
     log_dispatcher_attempt("I-03", result, snap_size, "");
+    // review fix Issue #6: I-03 推送成功后, 补涨候选 (含真实价格) 入 pushed_stocks 票池 (R3)
+    if result {
+        for (n, c, p) in &snapshot.record_candidates {
+            let metric_json = truncate_metric_json(
+                serde_json::json!({
+                    "chain": snapshot.chain,
+                    "limit_count": snapshot.limit_count,
+                    "push_subkind": "Breakout",
+                })
+                .to_string(),
+            );
+            let _ = stock_analysis::signal::push_recorder::record(
+                &stock_analysis::signal::push_recorder::PushRecordMeta {
+                    code: c.clone(),
+                    name: n.clone(),
+                    push_kind: "I-03".to_string(),
+                    push_price: *p,
+                    metric_json,
+                    source: "intraday".to_string(),
+                },
+            );
+        }
+    }
     result
 }
 
@@ -4079,7 +4121,7 @@ pub async fn dispatch_holding_plan_daily(hhmm: &str, banner: &BannerCtx) -> bool
 #[derive(Debug, Clone, Default)]
 pub struct AuctionVolumeSnapshot {
     pub hhmm: String,
-    pub items: Vec<(String, String, f64, f64)>, // (name, code, gap_pct, vol_ratio)
+    pub items: Vec<(String, String, f64, f64, f64)>, // (name, code, gap_pct, vol_ratio, price) — review fix Issue #6: 加 price 供 push_recorder 入池
     pub sentiment: String,                      // "强承接" | "一般" | "弱承接"
     pub watch_status: String,                   // 观察状态描述
 }
@@ -4105,14 +4147,14 @@ pub fn load_auction_volume_snapshot_real(hhmm: &str) -> AuctionVolumeSnapshot {
             .partial_cmp(&a.volume_ratio)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    let items: Vec<(String, String, f64, f64)> = sorted
+    let items: Vec<(String, String, f64, f64, f64)> = sorted
         .iter()
         .take(10)
-        .map(|s| (s.name.clone(), s.code.clone(), s.change_pct, s.volume_ratio))
+        .map(|s| (s.name.clone(), s.code.clone(), s.change_pct, s.volume_ratio, s.price))
         .collect();
 
     // sentiment: 平均量比 >= 3 强承接, >= 1 一般, < 1 弱承接
-    let avg_vr: f64 = items.iter().map(|(_, _, _, vr)| vr).sum::<f64>() / items.len() as f64;
+    let avg_vr: f64 = items.iter().map(|(_, _, _, vr, _)| vr).sum::<f64>() / items.len() as f64;
     let sentiment = if avg_vr >= 3.0 {
         "强承接"
     } else if avg_vr >= 1.0 {
@@ -4141,7 +4183,7 @@ pub async fn dispatch_auction_volume_daily(hhmm: &str, banner: &BannerCtx) -> bo
     let auction_items: Vec<AuctionItem<'_>> = snapshot
         .items
         .iter()
-        .map(|(n, c, g, v)| AuctionItem {
+        .map(|(n, c, g, v, _p)| AuctionItem {
             name: n,
             code: c,
             gap_pct: *g,
@@ -4164,6 +4206,34 @@ pub async fn dispatch_auction_volume_daily(hhmm: &str, banner: &BannerCtx) -> bo
     )
     .await;
     log_dispatcher_attempt("P-02", result, snapshot.items.len(), "");
+    // review fix Issue #6: P-02 推送成功后入 pushed_stocks 票池 (R3)
+    // 红线 2.2: price <= 0 (缺数据) 的票不入池, 不造价格
+    if result {
+        for (n, c, g, v, p) in &snapshot.items {
+            if *p <= 0.0 {
+                log::warn!("[P-02] {}({}) 无真实价格, 跳过入池 (红线 2.2)", n, c);
+                continue;
+            }
+            let metric_json = truncate_metric_json(
+                serde_json::json!({
+                    "vol_ratio": v,
+                    "price_chg_pct": g,
+                    "push_subkind": "AuctionVolume",
+                })
+                .to_string(),
+            );
+            let _ = stock_analysis::signal::push_recorder::record(
+                &stock_analysis::signal::push_recorder::PushRecordMeta {
+                    code: c.clone(),
+                    name: n.clone(),
+                    push_kind: "P-02".to_string(),
+                    push_price: *p,
+                    metric_json,
+                    source: "preopen".to_string(),
+                },
+            );
+        }
+    }
     result
 }
 
@@ -8076,6 +8146,7 @@ mod tests {
                 12.0,
                 9.0,
             )],
+            record_candidates: Vec::new(),
             llm_triggers: std::collections::HashMap::new(),
         };
         let p = build_industry_chain_intraday_from_snapshot(&s);
@@ -8103,6 +8174,7 @@ mod tests {
                 12.0,
                 9.0,
             )],
+            record_candidates: Vec::new(),
             llm_triggers: std::collections::HashMap::new(),
         };
         // 注入 LLM trigger
@@ -8134,6 +8206,7 @@ mod tests {
                 12.0,
                 9.0,
             )],
+            record_candidates: Vec::new(),
             llm_triggers: Default::default(), // 空 — 回退
         };
         let p = build_industry_chain_intraday_from_snapshot(&s);
@@ -10708,42 +10781,23 @@ mod tests {
 // ===== v16.3 review fixes: helper fns =====
 
 /// v16.3 Commit 2 Fix 2: paper_portfolio_state — 读真实 (cash, total, pos_pct) 给 risk_adapter 4 项检查用
-/// Fallback (0,0,0): 异常时 (DB 锁 / 持仓表无), 不阻塞业务流
-pub fn paper_portfolio_state(code: &str, _quote_price: f64) -> (f64, f64, f64) {
-    use stock_analysis::portfolio::get_positions;
-    let positions = match get_positions() {
-        Ok(p) => p,
-        Err(e) => {
-            log::warn!("[paper_portfolio_state] get_positions 失败: {} → fallback (0,0,0)", e);
-            return (0.0, 0.0, 0.0);
-        }
-    };
-    let mut total = 1000000.0_f64;
-    let mut pos_pct = 0.0_f64;
-    for p in &positions {
-        if p.code == code {
-            let qty = p.shares as f64;
-            pos_pct = (qty * _quote_price) / total * 100.0;
-        }
-        total += p.shares as f64 * _quote_price;
-    }
-    let cash = total * 0.30; // 假设 30% 现金, v16.4 接 ledger 真值
-    (cash, total, pos_pct)
+/// review fix Issue #5: 逻辑下沉 lib (trading::paper_trade::portfolio_state), bin/lib 共用同一实现
+pub fn paper_portfolio_state(code: &str, quote_price: f64) -> (f64, f64, f64) {
+    stock_analysis::trading::paper_trade::portfolio_state(code, quote_price)
 }
 
-/// v16.3 Commit 2 Fix 8: DoS 防护 — metric_json > 4KB 截断
+/// v16.3 Commit 2 Fix 8: DoS 防护 — metric_json > 4KB 时替换为截断标记
+/// review fix Issue #8: 之前 String::truncate(4096) 会产生非法 JSON (且非 char 边界会 panic),
+/// 改为返回合法的最小 JSON, 下游 serde_json::from_str 不会静默失败
 pub fn truncate_metric_json(s: String) -> String {
     const MAX_BYTES: usize = 4096;
-    if s.len() > MAX_BYTES {
-        log::warn!(
-            "[truncate_metric_json] 截断: {} bytes → {} bytes",
-            s.len(),
-            MAX_BYTES
-        );
-        let mut t = s;
-        t.truncate(MAX_BYTES);
-        t
-    } else {
-        s
+    if s.len() <= MAX_BYTES {
+        return s;
     }
+    log::warn!(
+        "[truncate_metric_json] metric_json {} bytes > {} 上限 → 替换为截断标记 (保 JSON 合法)",
+        s.len(),
+        MAX_BYTES
+    );
+    serde_json::json!({ "truncated": true, "orig_bytes": s.len() }).to_string()
 }
