@@ -5,7 +5,9 @@
 //!
 //! v12 PR3-3.5: 新增 paper_trade 模块, 虚拟腿只写 paper_trades, 零写 stock_position (BR-023).
 
+pub mod paper_engine; // v16.3 Commit 4a: 4 铁律接入 paper_trade 卖出
 pub mod paper_trade; // v12 PR3-3.5
+pub mod risk_adapter; // v16.3 Commit 1: pre-trade gate (4 项硬检查)
 
 use crate::database::DatabaseManager;
 use crate::errors::TradeError;

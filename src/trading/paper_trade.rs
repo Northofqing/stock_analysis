@@ -7,15 +7,19 @@
 //!   - 涨停买 → NotFilled ("涨停不可买")
 //!   - 跌停卖 → NotFilled ("跌停不可卖")
 //!   - 停牌 → NotFilled ("停牌拒绝")
+//!   - 滑点超 MAX_SLIPPAGE_PCT → Invalidated (v16.3 R2)
 //!   - 正常 → Filled (fill_price = signal_price)
 //!
 //! plan_id 幂等: 用 plan_id 作为唯一键, 重复调用不重复插入.
 //!
 //! 费率/滑点复用 position_tracker const (:37-42) — 本 PR 不调, 仅写 signal_price.
+//!
+//! v16.3 Commit 1: evaluate 改签名接 quote_price, 加 5 态 Invalidated (滑点 > MAX_SLIPPAGE_PCT=2%)
 
 use diesel::prelude::*;
 
 use crate::database::DatabaseManager;
+use crate::trading::risk_adapter::MAX_SLIPPAGE_PCT;
 
 /// 虚拟盘状态
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -81,8 +85,13 @@ pub struct PaperResult {
     pub not_fill_reason: Option<String>,
 }
 
-/// PR3-3.5 主评估: 涨停买/跌停卖/停牌 → NotFilled; 否则 Filled
-pub fn evaluate(signal: &PaperSignal) -> PaperResult {
+/// PR3-3.5 主评估: 涨停买/跌停卖/停牌 → NotFilled; v16.3 加滑点 → Invalidated; 否则 Filled
+///
+/// v16.3 R2 (滑点保护): quote_price > 0 时, |quote_price - signal.price| / signal.price > MAX_SLIPPAGE_PCT
+/// → Invalidated (挂单价 vs 实际成交价不一致, 信号失真)
+///
+/// v16.3 R1 (集合竞价期挂单): 9:15-9:25 期间 quote_price=0 (无成交) → Filled (挂单簿等成交)
+pub fn evaluate(signal: &PaperSignal, quote_price: f64) -> PaperResult {
     // 1. 停牌 → NotFilled
     if signal.is_suspended {
         return PaperResult {
@@ -110,7 +119,26 @@ pub fn evaluate(signal: &PaperSignal) -> PaperResult {
         };
     }
 
-    // 4. 正常 → Filled (以信号价成交, 暂不计滑点)
+    // 4. v16.3 R2: 滑点保护 (quote_price > 0 时才检查; 0 表示缺数据, 兼容早盘)
+    if quote_price > 0.0 && signal.price > 0.0 {
+        let slippage = (quote_price - signal.price).abs() / signal.price * 100.0;
+        if slippage > *MAX_SLIPPAGE_PCT {
+            log::warn!(
+                "[paper_trade] 滑点 {:.2}% 超过 MAX_SLIPPAGE_PCT={:.1}% (signal={}, quote={})",
+                slippage, *MAX_SLIPPAGE_PCT, signal.price, quote_price
+            );
+            return PaperResult {
+                status: PaperTradeStatus::Invalidated,
+                fill_price: None,
+                not_fill_reason: Some(format!(
+                    "滑点 {:.2}% 超过 {:.1}%",
+                    slippage, *MAX_SLIPPAGE_PCT
+                )),
+            };
+        }
+    }
+
+    // 5. 正常 → Filled (以信号价成交)
     PaperResult {
         status: PaperTradeStatus::Filled,
         fill_price: Some(signal.price),
@@ -131,8 +159,26 @@ pub struct PaperOutcome {
 ///
 /// 返回 `PaperOutcome::inserted` 区分新建 vs 跳过 (plan_id 已存在).
 /// 调用方据此决定是否启动 execution_tracking 跟踪 (PR3-3.5 fix).
-pub fn simulate(signal: &PaperSignal) -> Result<PaperOutcome, String> {
-    let result = evaluate(signal);
+///
+/// v16.3 Commit 1 BREAKING: 签名加 4 参数 (quote_price, current_cash, total_value, current_position_pct)
+/// 调用方: push_templates:3073 (D-01), push_templates:6223 (盘后资金)
+pub fn simulate(
+    signal: &PaperSignal,
+    quote_price: f64,
+    current_cash: f64,
+    total_value: f64,
+    current_position_pct: f64,
+) -> Result<PaperOutcome, String> {
+    // v16.3 R1+R2: pre-trade gate 4 项硬检查 (拒 → 不入 paper_trades, 不调 evaluate)
+    crate::trading::risk_adapter::pre_trade_check(
+        signal,
+        quote_price,
+        current_cash,
+        total_value,
+        current_position_pct,
+    )?;
+
+    let result = evaluate(signal, quote_price);
     let mut conn = DatabaseManager::get()
         .get_conn()
         .map_err(|e| format!("DB 连接失败: {}", e))?;
@@ -201,7 +247,7 @@ mod tests {
 
     #[test]
     fn limit_up_buy_returns_not_filled() {
-        let r = evaluate(&signal_default(true, false, false));
+        let r = evaluate(&signal_default(true, false, false), 50.0);
         assert_eq!(r.status, PaperTradeStatus::NotFilled);
         assert_eq!(r.not_fill_reason.as_deref(), Some("涨停不可买"));
         assert!(r.fill_price.is_none());
@@ -213,7 +259,7 @@ mod tests {
     fn limit_down_sell_returns_not_filled() {
         let mut s = signal_default(false, true, false);
         s.direction = Direction::Sell;
-        let r = evaluate(&s);
+        let r = evaluate(&s, 50.0);
         assert_eq!(r.status, PaperTradeStatus::NotFilled);
         assert_eq!(r.not_fill_reason.as_deref(), Some("跌停不可卖"));
     }
@@ -222,7 +268,7 @@ mod tests {
 
     #[test]
     fn suspended_returns_not_filled() {
-        let r = evaluate(&signal_default(false, false, true));
+        let r = evaluate(&signal_default(false, false, true), 50.0);
         assert_eq!(r.status, PaperTradeStatus::NotFilled);
         assert_eq!(r.not_fill_reason.as_deref(), Some("停牌拒绝"));
     }
@@ -231,7 +277,7 @@ mod tests {
 
     #[test]
     fn normal_returns_filled() {
-        let r = evaluate(&signal_default(false, false, false));
+        let r = evaluate(&signal_default(false, false, false), 50.0);
         assert_eq!(r.status, PaperTradeStatus::Filled);
         assert_eq!(r.fill_price, Some(50.0));
         assert!(r.not_fill_reason.is_none());
@@ -242,8 +288,55 @@ mod tests {
     #[test]
     fn suspended_takes_priority() {
         // 同时: 停牌 + 涨停买 → NotFilled("停牌拒绝")
-        let r = evaluate(&signal_default(true, false, true));
+        let r = evaluate(&signal_default(true, false, true), 50.0);
         assert_eq!(r.not_fill_reason.as_deref(), Some("停牌拒绝"));
+    }
+
+    // ---- v16.3 R2: 滑点边界 case ----
+
+    #[test]
+    fn invalidated_when_slippage_exceeds_2pct() {
+        // signal=50, quote=51.5 → 滑点 3% → Invalidated
+        let r = evaluate(&signal_default(false, false, false), 51.5);
+        assert_eq!(r.status, PaperTradeStatus::Invalidated);
+        assert!(r.not_fill_reason.as_deref().unwrap().contains("滑点"));
+    }
+
+    #[test]
+    fn filled_when_slippage_within_2pct() {
+        // signal=50, quote=50.25 → 滑点 0.5% → Filled
+        let r = evaluate(&signal_default(false, false, false), 50.25);
+        assert_eq!(r.status, PaperTradeStatus::Filled);
+    }
+
+    #[test]
+    fn filled_at_slippage_boundary_2pct() {
+        // signal=50, quote=51.0 → 滑点 2.0% → Filled (边界 ≤ 不 >)
+        let r = evaluate(&signal_default(false, false, false), 51.0);
+        assert_eq!(r.status, PaperTradeStatus::Filled);
+    }
+
+    #[test]
+    fn invalidated_at_slippage_2_5pct() {
+        // signal=50, quote=51.25 → 滑点 2.5% → Invalidated
+        let r = evaluate(&signal_default(false, false, false), 51.25);
+        assert_eq!(r.status, PaperTradeStatus::Invalidated);
+    }
+
+    #[test]
+    fn filled_when_quote_price_zero() {
+        // 9:15-9:25 集合竞价, quote_price=0 (无成交) → Filled (挂单簿等成交)
+        let r = evaluate(&signal_default(false, false, false), 0.0);
+        assert_eq!(r.status, PaperTradeStatus::Filled);
+    }
+
+    #[test]
+    fn filled_sell_with_low_slippage() {
+        // 卖出方向, 滑点 0.3% (downward, quote < signal)
+        let mut s = signal_default(false, false, false);
+        s.direction = Direction::Sell;
+        let r = evaluate(&s, 49.85); // |49.85-50|/50 = 0.3%
+        assert_eq!(r.status, PaperTradeStatus::Filled);
     }
 
     // ---- 状态字符串 ----
