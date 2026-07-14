@@ -28,11 +28,16 @@ pub enum VirtualReason {
     NewsCatalyst,
     /// 竞价量能异动 (P0.2 竞价 Agent 专用)
     AuctionAnomaly,
+    // v16.3 Commit 4: 扩 6→8, 加 LLMSelect + Momentum
+    /// LLM 选股 (Gemini 6 分析师多空辩论 → 仲裁看多)
+    LLMSelect,
+    /// 动量整合 (air_refuel 形态分 ≥ 7 AND 3 指标金叉共振)
+    Momentum,
 }
 
 impl VirtualReason {
-    /// 枚举值数量 (用于硬约束测试)
-    pub const COUNT: usize = 6;
+    /// 枚举值数量 (用于硬约束测试, v16.3 改 6→8)
+    pub const COUNT: usize = 8;
 
     /// 转字符串 (snapshot 用, 禁止自由文本)
     pub fn as_str(&self) -> &'static str {
@@ -43,6 +48,8 @@ impl VirtualReason {
             VirtualReason::SectorLeader => "SectorLeader",
             VirtualReason::NewsCatalyst => "NewsCatalyst",
             VirtualReason::AuctionAnomaly => "AuctionAnomaly",
+            VirtualReason::LLMSelect => "LLMSelect",
+            VirtualReason::Momentum => "Momentum",
         }
     }
 
@@ -55,20 +62,25 @@ impl VirtualReason {
             "SectorLeader" => Some(VirtualReason::SectorLeader),
             "NewsCatalyst" => Some(VirtualReason::NewsCatalyst),
             "AuctionAnomaly" => Some(VirtualReason::AuctionAnomaly),
+            "LLMSelect" => Some(VirtualReason::LLMSelect),
+            "Momentum" => Some(VirtualReason::Momentum),
             _ => None,
         }
     }
 
     /// 优先级 (BC-6 优先级表, 数字越小优先级越高, 用于 pick_primary)
     /// v10 §10.3 + BC-6: NewsCatalyst > AuctionAnomaly > MainNetInflow > SectorLeader > Breakout > VolumeSurge
+    /// v16.3 加 LLMSelect (7) + Momentum (8)
     pub fn priority(&self) -> u8 {
         match self {
-            VirtualReason::NewsCatalyst => 1, // 最高优先
+            VirtualReason::NewsCatalyst => 1,
             VirtualReason::AuctionAnomaly => 2,
             VirtualReason::MainNetInflow => 3,
             VirtualReason::SectorLeader => 4,
             VirtualReason::Breakout => 5,
-            VirtualReason::VolumeSurge => 6, // 最低
+            VirtualReason::VolumeSurge => 6,
+            VirtualReason::LLMSelect => 7,
+            VirtualReason::Momentum => 8,
         }
     }
 
@@ -81,6 +93,8 @@ impl VirtualReason {
             VirtualReason::SectorLeader,
             VirtualReason::NewsCatalyst,
             VirtualReason::AuctionAnomaly,
+            VirtualReason::LLMSelect,
+            VirtualReason::Momentum,
         ]
     }
 }
@@ -146,8 +160,9 @@ mod tests {
     // ===== VirtualReason enum 测试 =====
 
     #[test]
-    fn test_count_is_six() {
-        assert_eq!(VirtualReason::COUNT, 6, "v10 §10.3 规定 6 个枚举值");
+    fn test_count_is_eight() {
+        // v16.3 Commit 4: 扩 6→8 (加 LLMSelect + Momentum)
+        assert_eq!(VirtualReason::COUNT, 8);
     }
 
     #[test]

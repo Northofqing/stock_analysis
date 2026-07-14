@@ -1,0 +1,225 @@
+//! v16.3 Commit 4a — 4 铁律 + 1 bonus 接入 paper_trade 卖出路径.
+//!
+//! 业务: position_tracker::track_position 已在 line 200-257 实现 4 铁律 (StopLoss/TakeProfit/
+//!        TimeExit/BollingTop), 但只写 analysis_result 表, **不调 paper_trade::simulate(Sell)**.
+//!        本模块把 4 铁律的卖出动作也写到 paper_trades 表, 让虚拟盘卖出路径完整.
+//!
+//! 复用策略 (leverage, 不重造):
+//!   - position_tracker::RiskContext: 已 pub (Commit 4a 改 track_position 可见性为 pub(crate))
+//!   - 副作用: 调 track_position 后, paper_engine 读 analysis_result 最新条 operation_advice
+//!             是否含"铁律"/"止盈"/"止损" → paper_trade::simulate(Direction=Sell)
+//!   - 不调 ClosePositionCmd (写 stock_position), 因 BR-023 隔离虚拟腿
+//!
+//! Commit 4a 注: track_position 需要 AnalysisResult 实例, 但 AnalysisResult 没 derive Default
+//! 且 ~50 字段, Commit 4a 用 *只读 analysis_result 表* 方式, 不调 track_position
+//! (主循环在 main.rs 调 track_position 已有, 写 analysis_result)
+//! → paper_engine 只读 analysis_result, 0 调 track_position, 0 重造 4 铁律
+
+use crate::database::DatabaseManager;
+use crate::trading::paper_trade::{self, Direction, PaperSignal};
+use chrono::Local;
+use diesel::prelude::*;
+
+/// 单个 active paper position 卖出检查输入
+#[derive(Debug, Clone)]
+pub struct PaperPositionSellCheck {
+    pub code: String,
+    pub name: String,
+    pub avg_cost: f64,
+    pub quantity: u32,
+}
+
+/// 4 铁律检查结果
+pub struct SellDecision {
+    pub code: String,
+    pub name: String,
+    pub reason: String,
+    pub price: f64,
+    /// Fix 3: 真实卖出数量 (来自 PaperPositionSellCheck.quantity, 不再硬编码 100)
+    pub quantity: u32,
+}
+
+#[derive(diesel::QueryableByName, Debug, Clone)]
+struct AdviceRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    operation_advice: String,
+}
+
+/// 4 铁律检查入口 — 读 analysis_result 表 (由 position_tracker::track_position 写)
+pub fn check_4_iron_rules(checks: &[PaperPositionSellCheck]) -> Result<Vec<SellDecision>, String> {
+    let mut decisions = Vec::new();
+    let mut conn = DatabaseManager::get()
+        .get_conn()
+        .map_err(|e| format!("DB 连接失败: {}", e))?;
+
+    for check in checks {
+        // 1. 读 analysis_result 最新条 (track_position 在 monitor_loop 跑, 写进 DB)
+        let advice: Option<String> = diesel::sql_query(format!(
+            "SELECT operation_advice FROM analysis_result WHERE code = '{}' \
+             ORDER BY id DESC LIMIT 1",
+            check.code.replace('\'', "''")
+        ))
+        .get_result::<AdviceRow>(&mut conn)
+        .ok()
+        .map(|r| r.operation_advice);
+
+        if let Some(advice) = advice {
+            if is_iron_rule_triggered(&advice) {
+                let reason = extract_reason(&advice);
+                log::warn!(
+                    "[paper_engine] 4 铁律触发 {}({}): {}",
+                    check.name, check.code, reason
+                );
+                decisions.push(SellDecision {
+                    code: check.code.clone(),
+                    name: check.name.clone(),
+                    reason: reason.clone(),
+                    price: check.avg_cost,
+                    quantity: check.quantity, // Fix 3: 真实数量
+                });
+            }
+        }
+    }
+
+    Ok(decisions)
+}
+
+/// 调 paper_trade::simulate(Sell) 写 paper_trades
+///
+/// Fix 3: SellDecision 加 quantity 字段, 不再硬编码 100
+pub fn emit_sell_signal(decision: &SellDecision) -> Result<(), String> {
+    let now = Local::now();
+    let signal = PaperSignal {
+        plan_id: format!(
+            "exit-{}-{}",
+            decision.code,
+            now.format("%Y%m%d%H%M%S%3f")
+        ),
+        code: decision.code.clone(),
+        name: decision.name.clone(),
+        direction: Direction::Sell,
+        price: decision.price,
+        quantity: decision.quantity.max(100), // 至少 1 手, 防 0
+        virtual_reason: format!("4-IronRule:{}", decision.reason),
+        is_limit_up: false,
+        is_limit_down: false,
+        is_suspended: false,
+        account_mode: "Normal".to_string(),
+        data_mode: "Full".to_string(),
+    };
+
+    match paper_trade::simulate(&signal, decision.price, 0.0, 0.0, 0.0) {
+        Ok(outcome) => {
+            log::info!(
+                "[paper_engine] 4 铁律卖出 {}({}) status={} reason={}",
+                decision.name, decision.code, outcome.result.status.as_str(), decision.reason
+            );
+            Ok(())
+        }
+        Err(e) => {
+            log::warn!(
+                "[paper_engine] 4 铁律卖出失败 {}({}): {}",
+                decision.name, decision.code, e
+            );
+            Err(e)
+        }
+    }
+}
+
+/// 判断 operation_advice 是否含 4 铁律关键词
+fn is_iron_rule_triggered(advice: &str) -> bool {
+    advice.contains("铁律")
+        || advice.contains("止损")
+        || advice.contains("止盈")
+        || advice.contains("14天")
+        || advice.contains("ATR动态止损")
+}
+
+/// 提取具体原因
+fn extract_reason(advice: &str) -> String {
+    if advice.contains("铁律1") {
+        "铁律1:止损(-8%)".to_string()
+    } else if advice.contains("铁律3") {
+        "铁律3:跌破5日线止盈".to_string()
+    } else if advice.contains("铁律4") {
+        "铁律4:14天不涨换股".to_string()
+    } else if advice.contains("铁律5") {
+        "铁律5:布林上轨+MACD顶背离".to_string()
+    } else if advice.contains("ATR动态止损") {
+        "ATR动态止损".to_string()
+    } else {
+        advice.chars().take(30).collect()
+    }
+}
+
+// ============ Unit tests (≥ 4) ============
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_iron_rule_1_stop_loss() {
+        assert!(is_iron_rule_triggered("铁律1:止损(-8%)"));
+        assert!(is_iron_rule_triggered("操作建议: 触发铁律1止损"));
+    }
+
+    #[test]
+    fn detects_iron_rule_3_take_profit() {
+        assert!(is_iron_rule_triggered("铁律3:跌破5日线止盈"));
+    }
+
+    #[test]
+    fn detects_iron_rule_4_time_exit() {
+        assert!(is_iron_rule_triggered("铁律4:14天不涨换股"));
+    }
+
+    #[test]
+    fn detects_atr_stop_loss() {
+        assert!(is_iron_rule_triggered("ATR动态止损(有效止损价 9.20)"));
+    }
+
+    #[test]
+    fn does_not_detect_hold_advice() {
+        assert!(!is_iron_rule_triggered("持有观望"));
+        assert!(!is_iron_rule_triggered("加仓"));
+    }
+
+    #[test]
+    fn extracts_iron_rule_1_reason() {
+        let r = extract_reason("操作: 铁律1:止损(-8%) 触发");
+        assert_eq!(r, "铁律1:止损(-8%)");
+    }
+
+    #[test]
+    fn extracts_iron_rule_3_reason() {
+        let r = extract_reason("铁律3:跌破5日线止盈");
+        assert_eq!(r, "铁律3:跌破5日线止盈");
+    }
+
+    #[test]
+    fn extracts_iron_rule_4_reason() {
+        let r = extract_reason("铁律4:14天不涨换股");
+        assert_eq!(r, "铁律4:14天不涨换股");
+    }
+
+    #[test]
+    fn extracts_iron_rule_5_reason() {
+        let r = extract_reason("铁律5:布林上轨+MACD顶背离");
+        assert_eq!(r, "铁律5:布林上轨+MACD顶背离");
+    }
+
+    #[test]
+    fn extracts_atr_reason() {
+        let r = extract_reason("ATR动态止损(有效止损价 9.20)");
+        assert_eq!(r, "ATR动态止损");
+    }
+
+    #[test]
+    fn extracts_unknown_reason_truncates_30_chars() {
+        let input = "其他原因: 1234567890123456789012345678901234567890";
+        let r = extract_reason(input);
+        eprintln!("DEBUG: input len={}, r len={}, r={}", input.len(), r.len(), r);
+        assert_eq!(r.chars().count(), 30);
+    }
+}

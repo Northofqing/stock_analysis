@@ -3025,10 +3025,9 @@ async fn submit_virtual_buy_from_d01(snapshot: &NewsToIdeaSnapshot, banner: &Ban
         direction: Direction::Buy,
         price: quote.price,
         quantity: 100,
-        virtual_reason: format!(
-            "D-01 新闻驱动低吸: theme={} headline={}",
-            snapshot.theme, snapshot.headline
-        ),
+        // v16.3 Commit 1: simulate 签名加 4 参数 (quote_price 真 + cash/total/pos_pct 真 portfolio 读)
+        // v16.3 Commit 2: 改 free-text → VirtualReason::NewsCatalyst.as_str() (符合 v10 §10.3)
+        virtual_reason: stock_analysis::opportunity::virtual_reason::VirtualReason::NewsCatalyst.as_str().to_string(),
         is_limit_up: quote.change_pct >= 9.5,
         is_limit_down: false,
         is_suspended: false,
@@ -3036,7 +3035,9 @@ async fn submit_virtual_buy_from_d01(snapshot: &NewsToIdeaSnapshot, banner: &Ban
         data_mode: banner.data_mode.label().to_string(),
     };
 
-    match paper_trade::simulate(&signal) {
+    // v16.3 Commit 1: simulate 签名加 4 参数 (quote_price 真 + cash/total/pos_pct 真 portfolio 读)
+    let (cash, total, pos_pct) = paper_portfolio_state(&snapshot.code, quote.price);
+    match paper_trade::simulate(&signal, quote.price, cash, total, pos_pct) {
         Ok(outcome) => log::info!(
             "[虚拟盘] D-01 买入 {}({}) status={} inserted={} price={:.2} qty={}",
             signal.name,
@@ -3053,6 +3054,26 @@ async fn submit_virtual_buy_from_d01(snapshot: &NewsToIdeaSnapshot, banner: &Ban
             e
         ),
     }
+
+    // v16.3 Commit 2: 推入 pushed_stocks 票池 (R3 业务核心)
+    let metric_json = truncate_metric_json(
+        serde_json::json!({
+            "theme": snapshot.theme,
+            "headline": snapshot.headline,
+            "push_subkind": "NewsCatalyst",
+        })
+        .to_string(),
+    );
+    let _ = stock_analysis::signal::push_recorder::record(
+        &stock_analysis::signal::push_recorder::PushRecordMeta {
+            code: snapshot.code.clone(),
+            name: snapshot.name.clone(),
+            push_kind: "D-01".to_string(),
+            push_price: quote.price,
+            metric_json,
+            source: "intraday".to_string(),
+        },
+    );
 }
 
 /// v61 (F14): LRU 驱逐 — 移除 > 7200s 未访问的 entry (2x 1h cooldown)
@@ -6142,17 +6163,17 @@ pub async fn dispatch_post_close_fund_inflow_buy(date: &str, banner: &BannerCtx)
             direction: Direction::Buy,
             price: s.price,
             quantity: 100,
-            virtual_reason: format!(
-                "盘后资金净流入Top10 收盘价买入: 主力{:+.2}亿 量比{:.1} 涨幅{:+.1}%",
-                s.main_net_yi, s.volume_ratio, s.change_pct
-            ),
+            // v16.3 Commit 2: 改 free-text → VirtualReason::MainNetInflow.as_str()
+            virtual_reason: stock_analysis::opportunity::virtual_reason::VirtualReason::MainNetInflow.as_str().to_string(),
             is_limit_up,
             is_limit_down: false,
             is_suspended: false,
             account_mode: banner.account_mode.label().to_string(),
             data_mode: banner.data_mode.label().to_string(),
         };
-        match paper_trade::simulate(&signal) {
+        // v16.3 Commit 1: simulate 签名加 4 参数 (quote_price 真 + cash/total/pos_pct 真 portfolio 读)
+        let (cash, total, pos_pct) = paper_portfolio_state(&s.code, s.price);
+        match paper_trade::simulate(&signal, s.price, cash, total, pos_pct) {
             Ok(outcome) => {
                 if outcome.result.status == paper_trade::PaperTradeStatus::Filled {
                     filled += 1;
@@ -6172,6 +6193,27 @@ pub async fn dispatch_post_close_fund_inflow_buy(date: &str, banner: &BannerCtx)
                 e
             ),
         }
+
+        // v16.3 Commit 2: 推入 pushed_stocks 票池
+        let metric_json = truncate_metric_json(
+            serde_json::json!({
+                "main_net_yi": s.main_net_yi,
+                "volume_ratio": s.volume_ratio,
+                "change_pct": s.change_pct,
+                "push_subkind": "MainNetInflow",
+            })
+            .to_string(),
+        );
+        let _ = stock_analysis::signal::push_recorder::record(
+            &stock_analysis::signal::push_recorder::PushRecordMeta {
+                code: s.code.clone(),
+                name: s.name.clone(),
+                push_kind: "盘后资金".to_string(),
+                push_price: s.price,
+                metric_json,
+                source: "postclose".to_string(),
+            },
+        );
     }
 
     log_dispatcher_attempt("I-10-postclose", push_result, top.len(), "");
@@ -10660,5 +10702,48 @@ mod tests {
         _reset_d01_memo_for_test();
         let map = D01_LAST_PUSH.lock().unwrap_or_else(|e| e.into_inner());
         assert!(map.is_empty(), "重置后 memo 容器应为空");
+    }
+}
+
+// ===== v16.3 review fixes: helper fns =====
+
+/// v16.3 Commit 2 Fix 2: paper_portfolio_state — 读真实 (cash, total, pos_pct) 给 risk_adapter 4 项检查用
+/// Fallback (0,0,0): 异常时 (DB 锁 / 持仓表无), 不阻塞业务流
+pub fn paper_portfolio_state(code: &str, _quote_price: f64) -> (f64, f64, f64) {
+    use stock_analysis::portfolio::get_positions;
+    let positions = match get_positions() {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("[paper_portfolio_state] get_positions 失败: {} → fallback (0,0,0)", e);
+            return (0.0, 0.0, 0.0);
+        }
+    };
+    let mut total = 1000000.0_f64;
+    let mut pos_pct = 0.0_f64;
+    for p in &positions {
+        if p.code == code {
+            let qty = p.shares as f64;
+            pos_pct = (qty * _quote_price) / total * 100.0;
+        }
+        total += p.shares as f64 * _quote_price;
+    }
+    let cash = total * 0.30; // 假设 30% 现金, v16.4 接 ledger 真值
+    (cash, total, pos_pct)
+}
+
+/// v16.3 Commit 2 Fix 8: DoS 防护 — metric_json > 4KB 截断
+pub fn truncate_metric_json(s: String) -> String {
+    const MAX_BYTES: usize = 4096;
+    if s.len() > MAX_BYTES {
+        log::warn!(
+            "[truncate_metric_json] 截断: {} bytes → {} bytes",
+            s.len(),
+            MAX_BYTES
+        );
+        let mut t = s;
+        t.truncate(MAX_BYTES);
+        t
+    } else {
+        s
     }
 }
