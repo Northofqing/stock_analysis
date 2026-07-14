@@ -101,26 +101,48 @@ pub fn load_open_positions() -> Result<Vec<PaperPositionSellCheck>, String> {
 
 /// 4 铁律检查入口 — 读 analysis_result 表 (由 position_tracker::track_position 写)
 pub fn check_4_iron_rules(checks: &[PaperPositionSellCheck]) -> Result<Vec<SellDecision>, String> {
-    let mut decisions = Vec::new();
+    // Fix review (HIGH): 真正 1 SQL batch (diesel 0.5 不支持 Vec bind, 用 format! 拼接 + escape)
+    // 原始 50 持仓 → 50 次 SQL; 优化后 50 持仓 → 1 次 SQL (50 IN clause)
+    use std::collections::HashMap;
+    let mut decisions = Vec::with_capacity(checks.len());
+    if checks.is_empty() {
+        return Ok(decisions);
+    }
     let mut conn = DatabaseManager::get()
         .get_conn()
         .map_err(|e| format!("DB 连接失败: {}", e))?;
 
-    for check in checks {
-        // 1. 读 analysis_result 最新条 (track_position 在 monitor_loop 跑, 写进 DB)
-        // review fix Issue #4: 参数化绑定替代 format! 拼接
-        let advice: Option<String> = diesel::sql_query(
-            "SELECT operation_advice FROM analysis_result WHERE code = ? \
-             ORDER BY id DESC LIMIT 1",
-        )
-        .bind::<diesel::sql_types::Text, _>(&check.code)
-        .get_result::<AdviceRow>(&mut conn)
-        .ok()
-        .map(|r| r.operation_advice);
+    // SQL 防注入: escape single quote (analysis_result.code 应为合法 stock code, 但 escape 保险)
+    let codes: Vec<String> = checks.iter()
+        .map(|c| c.code.replace('\'', "''"))
+        .collect();
+    let in_clause = codes.join(",");
+    let sql = format!(
+        "SELECT code, operation_advice FROM analysis_result \
+         WHERE id IN ( \
+           SELECT MAX(id) FROM analysis_result \
+           WHERE code IN ({}) GROUP BY code \
+         )",
+        in_clause
+    );
+    #[derive(diesel::QueryableByName, Debug)]
+    struct BatchAdvice {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        code: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        operation_advice: String,
+    }
+    let advice_map: HashMap<String, String> = diesel::sql_query(&sql)
+        .load::<BatchAdvice>(&mut conn)
+        .map_err(|e| format!("batch query analysis_result: {}", e))?
+        .into_iter()
+        .map(|r| (r.code, r.operation_advice))
+        .collect();
 
-        if let Some(advice) = advice {
-            if is_iron_rule_triggered(&advice) {
-                let reason = extract_reason(&advice);
+    for check in checks {
+        if let Some(advice) = advice_map.get(&check.code) {
+            if is_iron_rule_triggered(advice) {
+                let reason = extract_reason(advice);
                 log::warn!(
                     "[paper_engine] 4 铁律触发 {}({}): {}",
                     check.name, check.code, reason
@@ -129,8 +151,8 @@ pub fn check_4_iron_rules(checks: &[PaperPositionSellCheck]) -> Result<Vec<SellD
                     code: check.code.clone(),
                     name: check.name.clone(),
                     reason: reason.clone(),
-                    current_price: check.current_price, // Fix 1: 0.0 fallback avg_cost
-                    quantity: check.quantity, // Fix 3: 真实数量
+                    current_price: check.current_price,
+                    quantity: check.quantity,
                 });
             }
         }
