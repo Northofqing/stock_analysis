@@ -1,0 +1,176 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": "-- Grafana --",
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "v16.6 虚拟盘业务监控 (8 strategy + 4 铁律 + PerformanceSnapshot + QuoteProvider)",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "id": 1,
+      "title": "v16.6 #1: intraday_monitor 30s tick 候选数",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+      "targets": [
+        {
+          "expr": "intraday_monitor_candidates_total",
+          "legendFormat": "30s tick 候选数",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 5},
+              {"color": "red", "value": 20}
+            ]
+          },
+          "unit": "short"
+        }
+      },
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}
+      }
+    },
+    {
+      "id": 2,
+      "title": "v16.6 #1: intraday_monitor tick 耗时 (秒)",
+      "type": "graph",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 8, "w": 12, "x": 6, "y": 0},
+      "targets": [
+        {
+          "expr": "rate(intraday_monitor_tick_duration_seconds_sum[1m]) / rate(intraday_monitor_tick_duration_seconds_count[1m])",
+          "legendFormat": "tick p99 耗时",
+          "refId": "A"
+        },
+        {
+          "expr": "intraday_monitor_tick_duration_seconds_bucket{le=\"0.5\"}",
+          "legendFormat": "<0.5s",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "s"}}
+    },
+    {
+      "id": 3,
+      "title": "v16.4 #2: 8 strategy 评分次数 (30m 累计)",
+      "type": "bargauge",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+      "targets": [
+        {
+          "expr": "increase(strategy_score_total[30m])",
+          "legendFormat": "{{strategy}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    },
+    {
+      "id": 4,
+      "title": "v16.4 #4: 4 铁律 触发次数 (24h 累计)",
+      "type": "bargauge",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "targets": [
+        {
+          "expr": "increase(paper_engine_sell_total[24h])",
+          "legendFormat": "{{reason}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    },
+    {
+      "id": 5,
+      "title": "v16.4 #4: PerformanceSnapshot 距上次 (秒)",
+      "type": "stat",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+      "targets": [
+        {
+          "expr": "performance_snapshot_age_seconds",
+          "legendFormat": "距上次 snapshot (秒)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 86400},
+              {"color": "red", "value": 172800}
+            ]
+          },
+          "unit": "s"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "title": "v16.5 #1: QuoteProvider 当前价 (60s TTL)",
+      "type": "table",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+      "targets": [
+        {
+          "expr": "quote_provider_price",
+          "legendFormat": "{{code}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {"defaults": {"unit": "currencyCNY"}}
+    },
+    {
+      "id": 7,
+      "title": "v16.6 #2: 健康检查 (5 项)",
+      "type": "table",
+      "datasource": "Prometheus",
+      "gridPos": {"h": 4, "w": 12, "x": 12, "y": 12},
+      "targets": [
+        {
+          "expr": "up",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ]
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "tags": ["v16.6", "virtual-trade", "monitoring"],
+  "templating": {"list": []},
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "v16.6 Virtual Trade Monitoring",
+  "uid": "v16-6-virtual-trade",
+  "version": 1,
+  "weekStart": ""
+}
