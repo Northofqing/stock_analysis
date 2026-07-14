@@ -31,6 +31,8 @@ pub mod lot;
 pub mod multi_factor;
 pub mod multi_timeframe;
 pub mod rsi;
+// v16.4 Commit 2: 8 Strategy trait impl (替代 v16.3 8 enum 硬编码)
+pub mod v16_4;
 
 pub use boll_macd::{detect_boll_macd_signal, BollMacdAction, BollMacdSignal};
 pub use bollinger_zscore::{
