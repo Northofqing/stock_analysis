@@ -85,14 +85,16 @@ pub fn load_open_positions() -> Result<Vec<PaperPositionSellCheck>, String> {
     Ok(rows
         .into_iter()
         .map(|r| PaperPositionSellCheck {
-            code: r.code,
+            code: r.code.clone(),
             name: r.name,
             avg_cost: r.avg_cost,
             quantity: r.net_qty.max(0) as u32,
-            // Fix v16.4 完整化: current_price 推 fill_price (已成交均价, 替代 0.0 fallback)
-            // 业务: 滑点检查用真实已成交价, 0 持仓时不通过 risk_adapter 滑点检测
-            // v16.7 broker 接入后: 替换为 get_quote_price(&r.code) 当前市价
-            current_price: r.avg_cost,
+            // v16.5: current_price 调 quote_provider() 拿真市价 (broker SDK 未接入时 MockQuoteProvider 返 0.0, fallback 到 avg_cost)
+            // 业务: broker 接入后, 真市价 → 滑点真检测, 4 铁律卖出 PnL 真计算
+            current_price: crate::broker::quote_provider()
+                .map(|p| p.get_quote_price(&r.code))
+                .filter(|&p| p > 0.0)
+                .unwrap_or(r.avg_cost),
         })
         .collect())
 }

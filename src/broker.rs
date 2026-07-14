@@ -86,6 +86,52 @@ pub trait BrokerPush: Send + Sync {
 }
 
 // ============================================================
+// v16.5: QuoteProvider trait — 业务调 broker 拿当前市价
+// ============================================================
+
+/// v16.5 broker API 抽象: 业务调 broker 拿当前市价 (反方向, 之前 BrokerPush 是 broker → 我们)
+/// 8 strategy score + paper_engine emit_sell_signal 用 quote_provider() 拿价
+/// 替代 v16.4 完整化的 push_price fallback (broker 未接入时 get_quote_price 返 0.0)
+pub trait QuoteProvider: Send + Sync {
+    /// 当前市价 (元), 0.0 = 数据缺失 / 未连接
+    fn get_quote_price(&self, code: &str) -> f64;
+
+    /// 当前板块 (e.g. "AI硬件-MLCC"), 空 = 数据缺失
+    fn get_sector(&self, code: &str) -> String;
+}
+
+/// v16.5 stub impl: MockQuoteProvider (broker SDK 未接入, 全返 0.0 / "")
+/// 业务: 0.0 fallback avg_cost (paper_engine emit_sell_signal 已实现)
+pub struct MockQuoteProvider;
+
+impl QuoteProvider for MockQuoteProvider {
+    fn get_quote_price(&self, _code: &str) -> f64 { 0.0 }
+    fn get_sector(&self, _code: &str) -> String { String::new() }
+}
+
+static QUOTE_PROVIDER: OnceLock<Box<dyn QuoteProvider>> = OnceLock::new();
+
+/// 注册 QuoteProvider (启动时调一次). v16.7 broker SDK 接入后改成具体 impl.
+pub fn register_quote_provider(provider: Box<dyn QuoteProvider>) {
+    match QUOTE_PROVIDER.set(provider) {
+        Ok(()) => log::info!("[broker] QuoteProvider 已注册"),
+        Err(_) => log::warn!("[broker] QuoteProvider 重复 register — 保留首次"),
+    }
+}
+
+/// 业务: quote_provider().get_quote_price(code)
+pub fn quote_provider() -> Option<&'static dyn QuoteProvider> {
+    QUOTE_PROVIDER.get().map(|b| b.as_ref())
+}
+
+/// 默认 QuoteProvider: MockQuoteProvider (broker SDK 未接入, 业务 0.0 fallback)
+pub fn ensure_default_quote_provider() {
+    if QUOTE_PROVIDER.get().is_none() {
+        register_quote_provider(Box::new(MockQuoteProvider));
+    }
+}
+
+// ============================================================
 // 实现 1: QmtBroker (占位 — 真实 SDK 未装, 自动降级)
 // ============================================================
 pub struct QmtBroker;

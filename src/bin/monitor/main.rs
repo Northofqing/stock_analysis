@@ -7727,6 +7727,9 @@ async fn monitor_loop() {
 
     // 全天候循环：非交易日等待，交易日自动进入扫描
 
+    // v16.5: broker QuoteProvider 默认注册 (MockQuoteProvider, broker SDK 未接入时 0.0 fallback)
+    stock_analysis::broker::ensure_default_quote_provider();
+
     // v16.3 Commit 5: 接入 v16.3 4 模块 (verify finding 修复: main_loop 0 调用)
     // - IntradayMonitor::tick  盘中: 每 30s 扫推送票池 + 4 步过滤 + 调 paper_trade::simulate
     // - evening_review       盘后: 15:30 整盘 Momentum 整盘扫 (Fix 5: 不限 1h 时间窗)
