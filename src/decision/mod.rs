@@ -8,6 +8,7 @@ pub mod decision_panel;
 pub mod decision_render;
 pub mod exclusion;
 pub mod holding_plan; // v12 PR4-4.1
+pub mod intraday_monitor; // v16.3 Commit 3: 盘中监控 + 盘后整盘 (R4+R5)
 pub mod leader;
 pub mod live_plan; // v12 PR4-4.2
 pub mod pre_trade_filter; // v12 PR2-2.3
