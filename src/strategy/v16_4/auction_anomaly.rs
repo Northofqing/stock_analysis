@@ -1,11 +1,12 @@
 //! v16.4 #2: AuctionAnomalyStrategy — 竞价量能异动 (P-02 推送, score 6.5, vol_ratio ≥ 5)
 
 use super::{Strategy, StrategyInput, StrategyOutput};
+use crate::impl_strategy_id;
 
 pub struct AuctionAnomalyStrategy;
 
 impl Strategy for AuctionAnomalyStrategy {
-    fn id(&self) -> crate::bus::StrategyId { crate::bus::new_strategy_id("AuctionAnomaly", "v1") }
+    impl_strategy_id!(AuctionAnomalyStrategy, "AuctionAnomaly");
     fn virtual_reason(&self) -> &'static str { "AuctionAnomaly" }
     fn description(&self) -> &'static str { "竞价量能异动 (P-02 推送)" }
     fn score(&self, input: &StrategyInput) -> Option<StrategyOutput> {

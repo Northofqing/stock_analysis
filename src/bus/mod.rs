@@ -12,7 +12,9 @@
 //! 复用: `tokio::sync::broadcast` (项目已依赖, 1 emit → N consumer 并行).
 //! 单例: `OnceCell<SignalBus/TradingBus/SystemBus>` 全局 3 个.
 //!
-//! v16.4 Commit 1 注: 仅落地 3 Bus 骨架 + 6 单测. 业务模块接入推 v16.4 后续 commit.
+//! v16.4 Commit 1 注: 仅落地 3 Bus 骨架 + 6 单测.
+//! Fix review #14: 业务模块接入推 v16.4 #5 (SignalBus 接入 intraday_monitor,
+//!                  TradingBus 接入 paper_trade, SystemBus 接入 PerformanceEngine).
 
 use serde::{Deserialize, Serialize};
 use once_cell::sync::OnceCell;

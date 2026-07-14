@@ -17,6 +17,7 @@ pub struct Features {
     pub price_chg_pct: f64,
     pub sector: String,
     pub push_subkind: String,
+    pub push_kind: String, // Fix review #15: 加 push_kind 让 Layer 3 用 features 而非 input.push_kind
     pub push_age_hours: f64,
 }
 
@@ -29,12 +30,14 @@ impl FeatureBuilder {
         let chg = m.get("price_chg_pct").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let sector = m.get("sector").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let sub = m.get("push_subkind").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let kind = m.get("push_kind").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let age = (now - push_time).num_seconds() as f64 / 3600.0;
         Features {
             vol_ratio: vol,
             price_chg_pct: chg,
             sector,
             push_subkind: sub,
+            push_kind: kind,
             push_age_hours: age.max(0.0),
         }
     }
@@ -95,7 +98,7 @@ mod tests {
     use chrono::Local;
 
     fn make_features(vol: f64, age: f64, sub: &str) -> Features {
-        Features { vol_ratio: vol, price_chg_pct: 0.0, sector: "test".to_string(), push_subkind: sub.to_string(), push_age_hours: age }
+        Features { vol_ratio: vol, price_chg_pct: 0.0, sector: "test".to_string(), push_subkind: sub.to_string(), push_kind: "Momentum".to_string(), push_age_hours: age }
     }
 
     fn make_scored(score: f64) -> ScoredStrategy {

@@ -1,11 +1,12 @@
 //! v16.4 #2: VolumeSurgeStrategy — 放量 (P-02 推送, score 6.5)
 
 use super::{Strategy, StrategyInput, StrategyOutput};
+use crate::impl_strategy_id;
 
 pub struct VolumeSurgeStrategy;
 
 impl Strategy for VolumeSurgeStrategy {
-    fn id(&self) -> crate::bus::StrategyId { crate::bus::new_strategy_id("VolumeSurge", "v1") }
+    impl_strategy_id!(VolumeSurgeStrategy, "VolumeSurge");
     fn virtual_reason(&self) -> &'static str { "VolumeSurge" }
     fn description(&self) -> &'static str { "放量 (P-02 推送)" }
     fn score(&self, input: &StrategyInput) -> Option<StrategyOutput> {

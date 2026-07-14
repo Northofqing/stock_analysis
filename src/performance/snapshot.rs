@@ -65,15 +65,19 @@ pub fn ensure_table() -> Result<(), String> {
 pub fn compute_snapshot(date: NaiveDate) -> Result<PerformanceSnapshot, String> {
     let mut conn = DatabaseManager::get().get_conn().map_err(|e| format!("DB: {}", e))?;
     let date_str = date.format("%Y-%m-%d").to_string();
+    // Fix review #3 (HIGH): 拉 quantity, PnL = (sell - buy) * quantity
     let pnl_rows: Vec<PnLRow> = diesel::sql_query(format!(
-        "SELECT direction, price, fill_price FROM paper_trades \
+        "SELECT direction, price, fill_price, quantity FROM paper_trades \
          WHERE date(ts) = '{}' AND status = 'Filled'",
         date_str
     ))
     .load::<PnLRow>(&mut conn)
     .map_err(|e| format!("query paper_trades: {}", e))?;
 
-    let total_trades = pnl_rows.len() as i32;
+    // Fix review #7 (MEDIUM): total_trades = buy + sell 配对 (1 buy + 1 sell = 1 trade)
+    let buy_count = pnl_rows.iter().filter(|r| r.direction == "buy").count() as i32;
+    let sell_count = pnl_rows.iter().filter(|r| r.direction == "sell").count() as i32;
+    let total_trades = buy_count.min(sell_count); // 配对 trade 数
     let (winning, losing, total_pnl) = compute_pnl_stats(&pnl_rows);
     let win_rate = if total_trades > 0 { winning as f64 / total_trades as f64 } else { 0.0 };
     let sharpe = compute_sharpe(&pnl_rows);
@@ -82,6 +86,7 @@ pub fn compute_snapshot(date: NaiveDate) -> Result<PerformanceSnapshot, String> 
     let ir = compute_info_ratio(&pnl_rows);
 
     diesel::sql_query(format!(
+        // Fix review #13: INSERT 9 显式字段对齐 schema 11 字段 (id AUTO + created_at DEFAULT)
         "INSERT OR REPLACE INTO paper_performance_snapshot \
          (date, total_trades, winning_trades, losing_trades, total_pnl, \
           sharpe_ratio, sortino_ratio, win_rate, max_drawdown, info_ratio) \
@@ -111,6 +116,13 @@ struct PnLRow {
     price: f64,
     #[diesel(sql_type = diesel::sql_types::Double)]
     fill_price: f64,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    quantity: i32,
+}
+
+/// 单 trade pnl = (sell - buy) * quantity (Fix review #3 HIGH)
+fn single_trade_pnl(r: &PnLRow) -> f64 {
+    (r.fill_price - r.price) * (r.quantity as f64)
 }
 
 fn compute_pnl_stats(rows: &[PnLRow]) -> (i32, i32, f64) {
@@ -119,7 +131,7 @@ fn compute_pnl_stats(rows: &[PnLRow]) -> (i32, i32, f64) {
     let mut total = 0.0;
     for r in rows {
         if r.direction == "sell" {
-            let pnl = r.fill_price - r.price;
+            let pnl = single_trade_pnl(r);
             total += pnl;
             if pnl > 0.0 { winning += 1; } else { losing += 1; }
         }
@@ -128,21 +140,32 @@ fn compute_pnl_stats(rows: &[PnLRow]) -> (i32, i32, f64) {
 }
 
 fn compute_sharpe(rows: &[PnLRow]) -> f64 {
-    let pnls: Vec<f64> = rows.iter().filter(|r| r.direction == "sell").map(|r| r.fill_price - r.price).collect();
+    let pnls: Vec<f64> = rows.iter().filter(|r| r.direction == "sell").map(single_trade_pnl).collect();
     if pnls.is_empty() { return 0.0; }
     let mean = pnls.iter().sum::<f64>() / pnls.len() as f64;
     let var = pnls.iter().map(|p| (p - mean).powi(2)).sum::<f64>() / pnls.len() as f64;
     if var > 0.0 { mean / var.sqrt() } else { 0.0 }
 }
 
-fn compute_sortino(rows: &[PnLRow]) -> f64 { compute_sharpe(rows) }
+/// Fix review #4 (HIGH) + #S1 (MEDIUM): Sortino = mean / downside_dev (只算负收益 stddev)
+fn compute_sortino(rows: &[PnLRow]) -> f64 {
+    let pnls: Vec<f64> = rows.iter().filter(|r| r.direction == "sell").map(single_trade_pnl).collect();
+    if pnls.is_empty() { return 0.0; }
+    let mean = pnls.iter().sum::<f64>() / pnls.len() as f64;
+    let neg_pnls: Vec<f64> = pnls.iter().filter(|&&p| p < 0.0).copied().collect();
+    if neg_pnls.is_empty() {
+        return if mean > 0.0 { 10.0 } else { 0.0 }; // 全正: Sortino 满分占位
+    }
+    let neg_var = neg_pnls.iter().map(|p| p.powi(2)).sum::<f64>() / neg_pnls.len() as f64;
+    if neg_var > 0.0 { mean / neg_var.sqrt() } else { 0.0 }
+}
 
 fn compute_max_drawdown(rows: &[PnLRow]) -> f64 {
     let mut cum = 0.0;
     let mut peak = 0.0;
     let mut max_dd: f64 = 0.0;
     for r in rows.iter().filter(|r| r.direction == "sell") {
-        cum += r.fill_price - r.price;
+        cum += single_trade_pnl(r);
         if cum > peak { peak = cum; }
         let dd = peak - cum;
         if dd > max_dd { max_dd = dd; }
@@ -176,35 +199,50 @@ mod tests {
     }
 
     #[test]
-    fn compute_pnl_stats_winning_sell() {
+    fn compute_pnl_stats_winning_sell_quantity_1000() {
+        // Fix review #3: PnL = (12 - 10) * 1000 = 2000 (不是 2)
         let rows = vec![
-            PnLRow { direction: "sell".to_string(), price: 10.0, fill_price: 12.0 },
+            PnLRow { direction: "sell".to_string(), price: 10.0, fill_price: 12.0, quantity: 1000 },
         ];
         let (w, l, t) = compute_pnl_stats(&rows);
         assert_eq!(w, 1);
         assert_eq!(l, 0);
-        assert_eq!(t, 2.0);
+        assert_eq!(t, 2000.0, "PnL = (sell-buy) * quantity, 1000 股");
     }
 
     #[test]
     fn compute_pnl_stats_losing_sell() {
+        // (8 - 10) * 500 = -1000
         let rows = vec![
-            PnLRow { direction: "sell".to_string(), price: 10.0, fill_price: 8.0 },
+            PnLRow { direction: "sell".to_string(), price: 10.0, fill_price: 8.0, quantity: 500 },
         ];
-        let (w, l, _) = compute_pnl_stats(&rows);
+        let (w, l, t) = compute_pnl_stats(&rows);
         assert_eq!(w, 0);
         assert_eq!(l, 1);
+        assert_eq!(t, -1000.0);
     }
 
     #[test]
     fn compute_pnl_stats_buy_ignored() {
         let rows = vec![
-            PnLRow { direction: "buy".to_string(), price: 10.0, fill_price: 11.0 },
+            PnLRow { direction: "buy".to_string(), price: 10.0, fill_price: 11.0, quantity: 100 },
         ];
         let (w, l, t) = compute_pnl_stats(&rows);
         assert_eq!(w, 0);
         assert_eq!(l, 0);
         assert_eq!(t, 0.0);
+    }
+
+    #[test]
+    fn sortino_differs_from_sharpe() {
+        // Fix review #4: Sortino 应 != Sharpe (downside dev)
+        let rows = vec![
+            PnLRow { direction: "sell".to_string(), price: 10.0, fill_price: 15.0, quantity: 100 }, // +500
+            PnLRow { direction: "sell".to_string(), price: 15.0, fill_price: 12.0, quantity: 100 }, // -300
+        ];
+        let sharpe = compute_sharpe(&rows);
+        let sortino = compute_sortino(&rows);
+        assert_ne!(sharpe, sortino, "Sortino 应 != Sharpe (downside dev 不同)");
     }
 
     #[test]

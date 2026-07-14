@@ -1,11 +1,12 @@
 //! v16.4 #2: MomentumStrategy — 动量整合 (score 8.0, vol_ratio ≥ 5)
 
 use super::{Strategy, StrategyInput, StrategyOutput};
+use crate::impl_strategy_id;
 
 pub struct MomentumStrategy;
 
 impl Strategy for MomentumStrategy {
-    fn id(&self) -> crate::bus::StrategyId { crate::bus::new_strategy_id("Momentum", "v1") }
+    impl_strategy_id!(MomentumStrategy, "Momentum");
     fn virtual_reason(&self) -> &'static str { "Momentum" }
     fn description(&self) -> &'static str { "动量整合 (air_refuel 形态分 ≥ 7 AND 3 指标金叉共振)" }
     fn score(&self, input: &StrategyInput) -> Option<StrategyOutput> {

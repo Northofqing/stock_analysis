@@ -1,11 +1,12 @@
 //! v16.4 #2: NewsCatalystStrategy — 新闻/公告催化 (D-01 推送, score 7.0)
 
 use super::{Strategy, StrategyInput, StrategyOutput};
+use crate::impl_strategy_id;
 
 pub struct NewsCatalystStrategy;
 
 impl Strategy for NewsCatalystStrategy {
-    fn id(&self) -> crate::bus::StrategyId { crate::bus::new_strategy_id("NewsCatalyst", "v1") }
+    impl_strategy_id!(NewsCatalystStrategy, "NewsCatalyst");
     fn virtual_reason(&self) -> &'static str { "NewsCatalyst" }
     fn description(&self) -> &'static str { "新闻/公告催化 (D-01 推送)" }
     fn score(&self, input: &StrategyInput) -> Option<StrategyOutput> {

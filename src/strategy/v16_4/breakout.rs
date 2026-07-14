@@ -1,11 +1,12 @@
 //! v16.4 #2: BreakoutStrategy — 突破 (I-03 推送, score 7.5)
 
 use super::{Strategy, StrategyInput, StrategyOutput};
+use crate::impl_strategy_id;
 
 pub struct BreakoutStrategy;
 
 impl Strategy for BreakoutStrategy {
-    fn id(&self) -> crate::bus::StrategyId { crate::bus::new_strategy_id("Breakout", "v1") }
+    impl_strategy_id!(BreakoutStrategy, "Breakout");
     fn virtual_reason(&self) -> &'static str { "Breakout" }
     fn description(&self) -> &'static str { "突破 (I-03 涨停扩散)" }
     fn score(&self, input: &StrategyInput) -> Option<StrategyOutput> {

@@ -39,7 +39,26 @@ impl StrategyRegistry {
         REGISTRY.get_or_init(|| Self { map: DashMap::new() })
     }
 
+    /// Fix review #2 (HIGH): 同 (name, version) 注册覆盖 (复用首次 id, 避免累积多 entry)
+    ///
+    /// 避免 iter + insert 死锁: 先查 (无写锁), 再 insert (写锁). DashMap iter 不持写锁,
+    /// insert 持桶锁, 但单次操作不嵌套, 0 死锁.
     pub fn register(&self, name: &str, version: &str, description: &str, virtual_reason: &str) -> StrategyId {
+        // 1. 查同 (name, version) 现有 entry, 复用其 id
+        let existing_id: Option<String> = self.map.iter()
+            .find(|e| e.value().name == name && e.value().version == version)
+            .map(|e| e.value().id.clone());
+        if let Some(id) = existing_id {
+            // 2. 找到 → update description / virtual_reason / active
+            if let Some(mut e) = self.map.get_mut(&id) {
+                e.description = description.to_string();
+                e.virtual_reason = virtual_reason.to_string();
+                e.active = true;
+            }
+            log::info!("[StrategyRegistry] 覆盖 {}/{}/{}", id, name, version);
+            return id;
+        }
+        // 3. 首次注册, 生成新 id
         let id = crate::bus::new_strategy_id(name, version);
         let meta = StrategyMeta {
             id: id.clone(),
