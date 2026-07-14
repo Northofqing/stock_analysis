@@ -1754,8 +1754,27 @@ async fn evaluate_data_mode_hook(prev: Option<stock_analysis::monitor::data_mode
 
 // 改 multi_thread 让 block_in_place 安全让出 worker.
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+/// v16.3 Commit 4c: 读 paper_trades 今日成交数 (T-10 推送用)
+fn count_paper_trades_today(today: chrono::NaiveDate) -> Result<i64, String> {
+    use diesel::prelude::*;
+    let mut conn = stock_analysis::database::DatabaseManager::get()
+        .get_conn()
+        .map_err(|e| format!("DB 连接失败: {}", e))?;
+    #[derive(diesel::QueryableByName)]
+    struct CountRow {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        cnt: i64,
+    }
+    diesel::sql_query(format!(
+        "SELECT COUNT(*) AS cnt FROM paper_trades WHERE date(ts) = '{}'",
+        today
+    ))
+    .get_result::<CountRow>(&mut conn)
+    .map(|r| r.cnt)
+    .map_err(|e| format!("COUNT paper_trades: {}", e))
+}
 
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
 
     dotenvy::dotenv().ok();
@@ -1793,6 +1812,9 @@ async fn main() {
     let stage = launch_gate::current_stage();
 
     log::info!("═══════════════════════════════════════════════════════════════");
+
+    // v16.3 Commit 1: 启动 banner 打印 v16.3 paper_trade 默认值 (v15.1.1 硬规则 1)
+    stock_analysis::trading::risk_adapter::print_startup_banner();
 
     log::info!(
 
@@ -4368,15 +4390,23 @@ async fn run_test_scan() {
 
 
 
-    // T-10 虚拟盘成交回报 (一期: paper_trade 持久化未接, 显示 0 笔 + 不自动改规则)
+    // T-10 虚拟盘成交回报 (v16.3 Commit 4: 改 DB 读真实成交数)
+    let today = chrono::Local::now().date_naive();
+    let t10_count: i64 = match count_paper_trades_today(today) {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("[T-10] DB 读失败: {}", e);
+            0
+        }
+    };
 
-    let t10_text = format!("🧪 虚拟盘（{}）\n今日 0 笔成交 (paper_trades 持久化待 PR3-3.5 落地后接入)\n辅助建议, 非下单指令",
-
+    let t10_text = format!(
+        "🧪 虚拟盘（{}）\n今日 {} 笔成交 (paper_trades 真实读)\n辅助建议, 非下单指令",
         chrono::Local::now().format("%H:%M"),
-
+        t10_count,
     );
 
-    log::info!("[测试 T-10] 虚拟盘: 0 笔 (持久化待 PR3-3.5)");
+    log::info!("[测试 T-10] 虚拟盘: {} 笔 (DB 读真实)", t10_count);
 
 
 
@@ -7697,6 +7727,32 @@ async fn news_monitor_loop() {
 async fn monitor_loop() {
 
     // 全天候循环：非交易日等待，交易日自动进入扫描
+
+    // v16.3 Commit 5: 接入 v16.3 4 模块 (verify finding 修复: main_loop 0 调用)
+    // - IntradayMonitor::tick  盘中: 每 30s 扫推送票池 + 4 步过滤 + 调 paper_trade::simulate
+    // - evening_review       盘后: 15:30 整盘 Momentum 整盘扫 (Fix 5: 不限 1h 时间窗)
+    // - paper_engine 4 铁律循环暂不启 (v16.3 checks 空, 等 v16.4 接真 paper_positions)
+    let _intraday_handle = tokio::spawn(async {
+        use stock_analysis::decision::intraday_monitor::{IntradayMonitor, evening_review};
+        use chrono::Timelike;
+        let monitor = IntradayMonitor;
+        loop {
+            match monitor.tick() {
+                Ok(n) if n > 0 => log::info!("[v16.3] intraday_monitor tick: 消费 {} 条", n),
+                Ok(_) => log::debug!("[v16.3] intraday_monitor tick: 0 候选"),
+                Err(e) => log::warn!("[v16.3] intraday_monitor tick 失败: {}", e),
+            }
+            // 15:30 整盘扫 (R5) — minute==30 严格匹配防 30s tick 跨多分钟重复触发
+            let now = chrono::Local::now();
+            if now.hour() == 15 && now.minute() == 30 {
+                let today = now.date_naive();
+                if let Err(e) = evening_review(today) {
+                    log::warn!("[evening_review] 失败: {}", e);
+                }
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+        }
+    });
 
     loop {
 
