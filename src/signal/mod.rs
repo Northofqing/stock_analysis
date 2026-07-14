@@ -10,3 +10,4 @@
 //! market_event 可移到 src/event/mod.rs 顶层, 不再藏在 "signal/" 名下.
 
 pub mod market_event;
+pub mod push_recorder; // v16.3 Commit 2: pushed_stocks 入池
