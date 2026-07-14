@@ -7744,7 +7744,18 @@ async fn monitor_loop() {
                 Err(e) => log::warn!("[v16.3] intraday_monitor tick 失败: {}", e),
             }
             // 4 铁律卖出检查 (review fix Issue #2: 之前是 dead code "暂不启")
-            match paper_engine::load_open_positions() {
+            // Fix MEDIUM 4: 5 分钟 debounce (analysis_result 1 日最多变 1-2 次, 30s tick 是浪费)
+            // 用 static Mutex<Option<Instant>> 记录 last_run, 5 分钟内跳过
+            static PAPER_ENGINE_LAST_RUN: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+            let should_run_4_iron = {
+                let last = PAPER_ENGINE_LAST_RUN.lock().unwrap_or_else(|e| e.into_inner());
+                match *last {
+                    Some(t) if t.elapsed() < std::time::Duration::from_secs(300) => false,
+                    _ => true,
+                }
+            };
+            if should_run_4_iron {
+                match paper_engine::load_open_positions() {
                 Ok(checks) if !checks.is_empty() => {
                     match paper_engine::check_4_iron_rules(&checks) {
                         Ok(decisions) => {
@@ -7759,6 +7770,11 @@ async fn monitor_loop() {
                 }
                 Ok(_) => {} // 无未平仓虚拟持仓
                 Err(e) => log::warn!("[paper_engine] load_open_positions 失败: {}", e),
+            }
+            // Fix MEDIUM 4: 跑完记 last_run
+            *PAPER_ENGINE_LAST_RUN.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+            } else {
+                log::debug!("[paper_engine] 4 铁律 5 分钟 debounce 中, 跳过");
             }
             // 15:30 整盘扫 (R5) — evening_review 内部有当日防重入 (review fix Issue #7)
             let now = chrono::Local::now();

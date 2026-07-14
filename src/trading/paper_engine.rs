@@ -69,7 +69,9 @@ pub fn load_open_positions() -> Result<Vec<PaperPositionSellCheck>, String> {
         .get_conn()
         .map_err(|e| format!("DB 连接失败: {}", e))?;
     let rows: Vec<OpenPosRow> = diesel::sql_query(
-        "SELECT code, MAX(name) AS name, \
+        // Fix review (MEDIUM): MIN(name) 替代 MAX(name) — 同 code 多名(改名/复牌)取最早,
+        //                   COALESCE(fill_price, price) 兼容 SignalTriggered/NotFilled 部分成交
+        "SELECT code, MIN(name) AS name, \
          SUM(CASE WHEN direction = 'buy' THEN quantity ELSE -quantity END) AS net_qty, \
          COALESCE( \
            SUM(CASE WHEN direction = 'buy' THEN COALESCE(fill_price, price) * quantity ELSE 0 END) * 1.0 \

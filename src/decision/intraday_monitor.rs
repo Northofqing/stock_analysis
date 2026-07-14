@@ -234,8 +234,9 @@ impl IntradayMonitor {
 }
 
 /// review fix Issue #7: evening_review 当日防重入 (30s tick 在 15:30 分钟内会触发 2 次)
-/// 只在成功跑完后记 date, 失败可重试 (consumed_at 标记保证重试幂等)
+/// Fix review (MEDIUM): 失败路径 5 分钟 debounce, 避免 DB 锁时 30s tick × N 次失败
 static EVENING_LAST_RUN: std::sync::Mutex<Option<NaiveDate>> = std::sync::Mutex::new(None);
+static EVENING_LAST_FAIL: std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>> = std::sync::Mutex::new(None);
 
 /// 盘后 15:30 整盘扫 (R5) — 复用 evaluate_candidate 评分, 跑 Momentum 整合
 pub fn evening_review(today: NaiveDate) -> Result<usize, String> {
@@ -244,6 +245,17 @@ pub fn evening_review(today: NaiveDate) -> Result<usize, String> {
         if *last == Some(today) {
             log::info!("[evening_review] {} 已跑过, 跳过 (当日防重入)", today);
             return Ok(0);
+        }
+    }
+    {
+        // Fix MEDIUM: 失败 5 分钟内不重试 (DB 锁时 30s tick 反复失败)
+        let now = chrono::Utc::now();
+        let last_fail = EVENING_LAST_FAIL.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(t) = *last_fail {
+            if now - t < chrono::Duration::minutes(5) {
+                log::warn!("[evening_review] 上次失败 5 分钟内, 跳过 (防重试风暴)");
+                return Err("evening_review 失败 5 分钟 debounce 中".to_string());
+            }
         }
     }
     let now = Local::now();
