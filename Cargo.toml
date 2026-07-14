@@ -81,3 +81,4 @@ qmt-parser = "=0.2.1"
 # serial_test 0.10+ 用 process-wide mutex (std Mutex 跨 test binary 不可见)
 [dev-dependencies]
 serial_test = "0.10"
+criterion = { version = "0.5", features = ["html_reports"] } # v16.8 #1: benchmark 套件
