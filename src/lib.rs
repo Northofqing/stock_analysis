@@ -4,6 +4,8 @@ pub mod analyzer;
 pub mod auth;
 pub mod breakout;
 pub mod broker;
+// v16.4 Commit 1: 3 Bus 拆分 (SignalBus/TradingBus/SystemBus) + UUID ID
+pub mod bus;
 pub mod calendar;
 pub mod chart_generator;
 pub mod config;
@@ -25,6 +27,8 @@ pub mod opportunity;
 pub mod pipeline;
 pub mod portfolio;
 pub mod review;
+// v16.4 Commit 1: StrategyRegistry 动态注册 (替代 v16.3 8 enum 硬编码)
+pub mod registry;
 pub mod risk;
 pub mod schema;
 pub mod search_service;
