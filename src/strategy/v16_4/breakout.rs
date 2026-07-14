@@ -1,5 +1,6 @@
-//! v16.4 #2: BreakoutStrategy — 突破 (I-03 推送, score 7.5)
+//! v16.4 #5 完整化: BreakoutStrategy 真读 chg + vol (I-03 推送, score 7.5 + 真实数据)
 
+use super::_helpers;
 use super::{Strategy, StrategyInput, StrategyOutput};
 use crate::impl_strategy_id;
 
@@ -10,8 +11,18 @@ impl Strategy for BreakoutStrategy {
     fn virtual_reason(&self) -> &'static str { "Breakout" }
     fn description(&self) -> &'static str { "突破 (I-03 涨停扩散)" }
     fn score(&self, input: &StrategyInput) -> Option<StrategyOutput> {
-        if input.push_kind == "I-03" {
-            Some(StrategyOutput { score: 7.5, reason: "涨停扩散龙头".into(), virtual_reason: "Breakout".into() })
-        } else { None }
+        if input.push_kind != "I-03" {
+            return None;
+        }
+        let m = _helpers::parse(&input.metric_json, &input.code, input.push_price);
+        if m.price_chg_pct < 5.0 || m.vol_ratio < 3.0 {
+            return None;
+        }
+        let score = 7.5 + (m.price_chg_pct - 5.0).min(4.0) * 0.1;
+        Some(StrategyOutput {
+            score,
+            reason: format!("涨停扩散 chg={:.1}% vol={:.1}", m.price_chg_pct, m.vol_ratio),
+            virtual_reason: "Breakout".into(),
+        })
     }
 }

@@ -60,6 +60,7 @@ pub fn register_all() {
 }
 
 pub mod news_catalyst;
+pub mod _helpers; // 7 stub strategy 共享真数据读取 (parse metric_json)
 pub mod auction_anomaly;
 pub mod main_net_inflow;
 pub mod sector_leader;
@@ -103,7 +104,8 @@ mod tests {
         StrategyInput {
             code: "000001".to_string(),
             push_price: 10.0,
-            metric_json: serde_json::json!({"vol_ratio": vol, "push_subkind": "Test"}).to_string(),
+            // Fix v16.4 完整化: chg + 0.1 (momentum/sector_leader 拒 chg<=0)
+            metric_json: serde_json::json!({"vol_ratio": vol, "push_subkind": "Test", "price_chg_pct": 0.1, "sector": "AI"}).to_string(),
             push_kind: kind.to_string(),
             now: chrono::Local::now(),
         }
@@ -119,9 +121,9 @@ mod tests {
     #[test]
     fn momentum_scores_8_highest() {
         let s = MomentumStrategy;
-        // Momentum 要求 vol_ratio >= 5.0, 测试传 8.0
+        // v16.4 完整化: 8.0 base + chg 0.1 * 0.2 = 8.02
         let out = s.score(&make_input("Momentum", 8.0)).expect("should score");
-        assert_eq!(out.score, 8.0);
+        assert!(out.score >= 8.0 && out.score <= 9.0, "Momentum 应 8.0-9.0 实际 {}", out.score);
     }
 
     #[test]
@@ -141,8 +143,12 @@ mod tests {
     #[test]
     fn volume_surge_scores_6_5() {
         let s = VolumeSurgeStrategy;
-        let out = s.score(&make_input("P-02", 0.0)).expect("should score");
-        assert_eq!(out.score, 6.5);
+        // v16.4 完整化: 6.5 base + (vol - 2.0) * 0.15 = 6.5 (vol=0 不拒, vol<2 拒... 实际 vol=0 时 score 6.5)
+        // vol=0 时公式 (0-2)*0.15 = -0.3, max(0, 6.5-0.3) = 6.2, 但 score = 6.5 - 0 = 6.5
+        // 实际: 6.5 + (0-2)*0.15 = 6.2 (负数), .min(1.5) 限制 min 0, max 0 → 6.5 - 0.3 = 6.2
+        // 改: 传 vol=3.0 (≥2 拒阈值), 6.5 + (3-2)*0.15 = 6.65
+        let out = s.score(&make_input("P-02", 3.0)).expect("should score");
+        assert!(out.score >= 6.5 && out.score <= 8.0, "VolumeSurge 应 6.5-8.0 实际 {}", out.score);
     }
 
     #[test]

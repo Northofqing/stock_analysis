@@ -1,5 +1,6 @@
-//! v16.4 #2: VolumeSurgeStrategy — 放量 (P-02 推送, score 6.5)
+//! v16.4 #5 完整化: VolumeSurgeStrategy 真读 vol (P-02 推送, score 6.5 + 真实数据)
 
+use super::_helpers;
 use super::{Strategy, StrategyInput, StrategyOutput};
 use crate::impl_strategy_id;
 
@@ -10,8 +11,18 @@ impl Strategy for VolumeSurgeStrategy {
     fn virtual_reason(&self) -> &'static str { "VolumeSurge" }
     fn description(&self) -> &'static str { "放量 (P-02 推送)" }
     fn score(&self, input: &StrategyInput) -> Option<StrategyOutput> {
-        if input.push_kind == "P-02" {
-            Some(StrategyOutput { score: 6.5, reason: "量比异动".into(), virtual_reason: "VolumeSurge".into() })
-        } else { None }
+        if input.push_kind != "P-02" {
+            return None;
+        }
+        let m = _helpers::parse(&input.metric_json, &input.code, input.push_price);
+        if m.vol_ratio < 2.0 {
+            return None;
+        }
+        let score = 6.5 + ((m.vol_ratio - 2.0) * 0.15).min(1.5);
+        Some(StrategyOutput {
+            score,
+            reason: format!("量比异动 vol={:.1}", m.vol_ratio),
+            virtual_reason: "VolumeSurge".into(),
+        })
     }
 }

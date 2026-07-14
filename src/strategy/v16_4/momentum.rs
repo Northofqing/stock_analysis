@@ -1,5 +1,6 @@
-//! v16.4 #2: MomentumStrategy — 动量整合 (score 8.0, vol_ratio ≥ 5)
+//! v16.4 #5 完整化: MomentumStrategy 真读 vol + chg (Momentum 推送, score 8.0 + 真实数据)
 
+use super::_helpers;
 use super::{Strategy, StrategyInput, StrategyOutput};
 use crate::impl_strategy_id;
 
@@ -13,14 +14,14 @@ impl Strategy for MomentumStrategy {
         if input.push_kind != "Momentum" {
             return None;
         }
-        let m: serde_json::Value = serde_json::from_str(&input.metric_json).unwrap_or_default();
-        let vol = m.get("vol_ratio").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        if vol < 5.0 {
+        let m = _helpers::parse(&input.metric_json, &input.code, input.push_price);
+        if m.vol_ratio < 5.0 || m.price_chg_pct <= 0.0 || m.push_price <= 0.0 {
             return None;
         }
+        let score = 8.0 + m.price_chg_pct.min(5.0) * 0.2;
         Some(StrategyOutput {
-            score: 8.0,
-            reason: format!("Momentum 强共振 vol={}", vol),
+            score: score.min(9.5),
+            reason: format!("Momentum 强共振 vol={:.1} chg={:.1}%", m.vol_ratio, m.price_chg_pct),
             virtual_reason: "Momentum".into(),
         })
     }
