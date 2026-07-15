@@ -289,9 +289,6 @@ fn map_push_kind(kind: PushKind) -> (SignalSource, &'static str, Severity) {
         PushKind::CapitalVerify => (HoldingHealth, "capital_verify", Severity::High),
         PushKind::WeeklySOP => (HoldingHealth, "weekly_sop", Severity::Normal),
         PushKind::StockPick => (HoldingHealth, "stock_pick", Severity::Normal),
-        PushKind::OptimalClose => (HoldingHealth, "optimal_close", Severity::Normal),
-        PushKind::VolumeWatchlist => (HoldingHealth, "volume_watchlist", Severity::Normal),
-        PushKind::VolumeRealTrade => (HoldingHealth, "volume_real_trade", Severity::High),
         PushKind::IndustryChain => (SectorRotation, "industry_chain", Severity::Normal),
         PushKind::TurnoverTop => (SectorRotation, "turnover_top", Severity::Normal),
         PushKind::CandidateBoard => (HoldingHealth, "candidate_board", Severity::Normal),
@@ -326,12 +323,6 @@ fn map_push_kind(kind: PushKind) -> (SignalSource, &'static str, Severity) {
         }
         PushKind::EtfClosingCallAuction => {
             (SectorRotation, "etf_closing_call_auction", Severity::Normal)
-        }
-        PushKind::BlockTradeIntradayConfirm => {
-            (HoldingHealth, "block_trade_intraday_confirm", Severity::High)
-        }
-        PushKind::BlockTradePriceRange => {
-            (HoldingHealth, "block_trade_price_range", Severity::Normal)
         }
         PushKind::PaperReview => (HoldingHealth, "paper_review", Severity::Normal),
         PushKind::CandidateInvalidated => {

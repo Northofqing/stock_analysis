@@ -50,12 +50,8 @@ pub enum PushKind {
     // v11-P0-5+ Commit 4 加: 5 个候选源 (P5 §六 验收, 默认降级, 候选台统一推 1 条)
     /// 降级: A10 选股推荐 (移交候选台)
     StockPick,
-    /// 降级: B3 优选候选 (移交候选台)
-    OptimalClose,
-    /// 降级: B6 放量·自选 (移交候选台)
-    VolumeWatchlist,
-    /// 降级: B7 放量·实盘优选 (移交候选台)
-    VolumeRealTrade,
+    // v17.5 审计删除 (2026-07-16): OptimalClose / VolumeWatchlist / VolumeRealTrade
+    //   逐变体调用链审计确认 0 生产 caller, 归档 docs/v15.x/dead-pushkinds.md
     /// 降级: C4 产业链扫描 (移交候选台)
     IndustryChain,
     /// v14.5 G-05: T-13 盘中换手率 Top10 (ℹ️ 1次/日, 10min 冷却)
@@ -123,10 +119,8 @@ pub enum PushKind {
     StPriceLimitChanged,
     /// v13.1 §5.5 T-17 ETF 收盘集合竞价 (ℹ️ 1次/日, 仅沪市 ETF)
     EtfClosingCallAuction,
-    /// v13.1 §5.6 T-18 创业板协议大宗盘中确认 (ℹ️ 5min/票)
-    BlockTradeIntradayConfirm,
-    /// v13.1 §5.7 T-19 北交所大宗价格区间 (ℹ️ 60min/票)
-    BlockTradePriceRange,
+    // v17.8 审计删除 (2026-07-16): BlockTradeIntradayConfirm (T-18) / BlockTradePriceRange (T-19)
+    //   dispatch fn 存在但 0 调用者 (死链路), 归档 docs/v15.x/dead-pushkinds.md
     // ============= v14 新增 (原 A-01, 复用 T-11) =============
     /// v13 §14.3 A-01 虚拟仓复盘 (ℹ️ 1次/日, 盘后参考)
     PaperReview,
@@ -166,15 +160,13 @@ impl PushKind {
     /// 走 Ipo* precedent: enum 变体**保留** (不改 level/cooldown_secs/label match),
     /// 仅在此方法中"标 legacy", 在 push_governor_inner 中按 env 控制可见性.
     ///
-    /// 7 个 variants: AuctionRepush, OptimalClose, VolumeWatchlist,
-    /// VolumeRealTrade, CandidateTriggered, CandidateInvalidated, VirtualWatch.
+    /// 4 个 variants: AuctionRepush, CandidateTriggered, CandidateInvalidated, VirtualWatch.
+    /// (2026-07-16 审计: OptimalClose/VolumeWatchlist/VolumeRealTrade 已删;
+    ///  CandidateTriggered/VirtualWatch 实为活链路, 仅保留 legacy 标记待后续迁移评估)
     pub fn is_legacy_v17_5(self) -> bool {
         matches!(
             self,
             Self::AuctionRepush
-                | Self::OptimalClose
-                | Self::VolumeWatchlist
-                | Self::VolumeRealTrade
                 | Self::CandidateTriggered
                 | Self::CandidateInvalidated
                 | Self::VirtualWatch
@@ -204,8 +196,8 @@ impl PushKind {
     ///   - v17.7: Announcement, PolicyHit, EarningsBeat, EarningsMiss,
     ///     AnalystUpgrade, MarketActionAlert (6 个, 全部 active)
     ///   - v17.8: PostFixedPriceOrder, PostFixedPriceFill, StPriceLimitChanged,
-    ///     EtfClosingCallAuction, BlockTradeIntradayConfirm, BlockTradePriceRange
-    ///     (6 个, 全部 active)
+    ///     EtfClosingCallAuction (4 个, 全部 active — main.rs T-14/T-15 管道 + v59 F2 修复);
+    ///     BlockTradeIntradayConfirm/BlockTradePriceRange 已删 (2026-07-16 审计: 死链路)
     ///
     /// 本方法标 `is_active_spec_target` — 命中时 info log 跟踪 audit surface,
     /// 后续 dev plan v2 §3.7/§3.8 sub_kind / DispatchTable 决策点.
@@ -219,13 +211,11 @@ impl PushKind {
                 | Self::EarningsMiss
                 | Self::AnalystUpgrade
                 | Self::MarketActionAlert
-            // v17.8 (6 个交易类)
+            // v17.8 (4 个交易类, BlockTrade* 已删)
             | Self::PostFixedPriceOrder
                 | Self::PostFixedPriceFill
                 | Self::StPriceLimitChanged
                 | Self::EtfClosingCallAuction
-                | Self::BlockTradeIntradayConfirm
-                | Self::BlockTradePriceRange
         )
     }
 
@@ -277,9 +267,7 @@ impl PushKind {
             | PushKind::PostFixedPriceOrder
             | PushKind::PostFixedPriceFill
             | PushKind::StPriceLimitChanged
-            | PushKind::EtfClosingCallAuction
-            | PushKind::BlockTradeIntradayConfirm
-            | PushKind::BlockTradePriceRange => PushLevel::Important,
+            | PushKind::EtfClosingCallAuction => PushLevel::Important,
             // v14 PaperReview + CandidateInvalidated
             | PushKind::CandidateInvalidated => PushLevel::Important,
             // v15.3 D5: 4 路源重要级 (PolicyHit/EarningsBeat/EarningsMiss/AnalystUpgrade)
@@ -373,8 +361,6 @@ impl PushKind {
             PushKind::PostFixedPriceFill => Some(300),                        // 5 min/票
             PushKind::StPriceLimitChanged => Some(86_400),                    // 1次/票/日
             PushKind::EtfClosingCallAuction => Some(86_400),                  // 1次/日
-            PushKind::BlockTradeIntradayConfirm => Some(300),                 // 5 min/票
-            PushKind::BlockTradePriceRange => Some(3600),                     // 60 min/票
             PushKind::PaperReview => Some(86_400),                            // 1次/日
             PushKind::CandidateInvalidated => Some(1800),                     // 30 min
             // v58: P-05 虚拟观察仓 (开盘 9:30 推一次, 1次/日)
@@ -398,8 +384,9 @@ impl PushKind {
             Announcement => CooldownScope::External,
             // §14.3 表中标 "/票" 的: 必须有 code 才能按票冷却
             HoldingPlan | T0Advice | CandidateTriggered | ForbiddenOps | PaperTrade
-            | NewsToIdea | PostFixedPriceOrder | PostFixedPriceFill | StPriceLimitChanged
-            | BlockTradeIntradayConfirm | BlockTradePriceRange => CooldownScope::PerTicket,
+            | NewsToIdea | PostFixedPriceOrder | PostFixedPriceFill | StPriceLimitChanged => {
+                CooldownScope::PerTicket
+            }
             _ => CooldownScope::Global,
         }
     }
@@ -421,9 +408,6 @@ impl PushKind {
             PushKind::CapitalVerify => "资金验证",
             PushKind::WeeklySOP => "周度SOP",
             PushKind::StockPick => "选股",
-            PushKind::OptimalClose => "优选",
-            PushKind::VolumeWatchlist => "放量自选",
-            PushKind::VolumeRealTrade => "放量实盘",
             PushKind::IndustryChain => "产业链",
             // v14.5 G-05
             PushKind::TurnoverTop => "盘中换手率 Top10",
@@ -456,8 +440,6 @@ impl PushKind {
             PushKind::PostFixedPriceFill => "盘后固定价格成交",
             PushKind::StPriceLimitChanged => "ST 涨跌幅变更",
             PushKind::EtfClosingCallAuction => "ETF 集合竞价尾盘",
-            PushKind::BlockTradeIntradayConfirm => "大宗盘中确认",
-            PushKind::BlockTradePriceRange => "北交所大宗价格区间",
             PushKind::PaperReview => "虚拟仓复盘",
             PushKind::CandidateInvalidated => "候选失效",
             // v15.1 C1.2: IPO 监测
@@ -563,15 +545,15 @@ impl PushKind {
     }
 }
 
-/// v17.x DispatchTable: 15 audit-marked PushKind 的元数据集中表.
+/// v17.x DispatchTable: 13 audit-marked PushKind 的元数据集中表.
 ///
 /// 整合:
 /// - v17.6 §2.2: 3 个 low-priority variants (FactorIC / SectorTier / CapitalVerify)
-/// - v17.7 + v17.8: 12 个 active spec targets
+/// - v17.7 + v17.8: 10 个 active spec targets
 ///   (Announcement, PolicyHit, EarningsBeat, EarningsMiss, AnalystUpgrade,
 ///    MarketActionAlert, PostFixedPriceOrder, PostFixedPriceFill,
-///    StPriceLimitChanged, EtfClosingCallAuction, BlockTradeIntradayConfirm,
-///    BlockTradePriceRange)
+///    StPriceLimitChanged, EtfClosingCallAuction)
+///   注: BlockTradeIntradayConfirm/BlockTradePriceRange 已删 (2026-07-16 审计, 死链路)
 ///
 /// 设计 (Path D 一致): 不替换现有 `PushKind::level/cooldown_secs/cooldown_scope/
 /// label/stable_template_id` 5 个 match 块 — 仅作 audit 跟踪 + 后续 spec 治理
@@ -590,7 +572,7 @@ pub struct DispatchRow {
     pub stable_template_id: &'static str,
 }
 
-/// v17.x 集中 Dispatch 表 — 15 audit-marked variants 的元数据.
+/// v17.x 集中 Dispatch 表 — 13 audit-marked variants 的元数据.
 ///
 /// 顺序: 先 v17.6 (3 个 low-priority), 再 v17.7 (6 active), 最后 v17.8 (6 active).
 /// 总数 = 3 + 6 + 6 = 15 (跟 spec 字面一致).
@@ -729,26 +711,6 @@ pub const DISPATCH_TABLE: &[(PushKind, DispatchRow)] = &[
             cooldown_scope: CooldownScope::Global,
             label: "ETF 集合竞价尾盘",
             stable_template_id: "etfclosingcallauction_v1",
-        },
-    ),
-    (
-        PushKind::BlockTradeIntradayConfirm,
-        DispatchRow {
-            level: PushLevel::Important,
-            cooldown_secs: Some(300),
-            cooldown_scope: CooldownScope::PerTicket,
-            label: "大宗盘中确认",
-            stable_template_id: "blocktradeintradayconfirm_v1",
-        },
-    ),
-    (
-        PushKind::BlockTradePriceRange,
-        DispatchRow {
-            level: PushLevel::Important,
-            cooldown_secs: Some(3600),
-            cooldown_scope: CooldownScope::PerTicket,
-            label: "北交所大宗价格区间",
-            stable_template_id: "blocktradepricerange_v1",
         },
     ),
 ];
@@ -1140,8 +1102,6 @@ fn default_code_for(kind: PushKind) -> &'static str {
             | PostFixedPriceOrder
             | PostFixedPriceFill
             | StPriceLimitChanged
-            | BlockTradeIntradayConfirm
-            | BlockTradePriceRange
     ) {
         "_per_ticket_unbound"
     } else {
@@ -2364,23 +2324,20 @@ mod tests {
         }
     }
 
-    // ============== v17.5 §2.2: is_legacy_v17_5 标 7 variants ==============
+    // ============== v17.5 §2.2: is_legacy_v17_5 标 4 variants (2026-07-16 审计后) ==============
 
     #[test]
-    fn is_legacy_v17_5_marks_seven_spec_only_variants() {
+    fn is_legacy_v17_5_marks_four_remaining_variants() {
         let legacy_variants = [
             PushKind::AuctionRepush,
-            PushKind::OptimalClose,
-            PushKind::VolumeWatchlist,
-            PushKind::VolumeRealTrade,
             PushKind::CandidateTriggered,
             PushKind::CandidateInvalidated,
             PushKind::VirtualWatch,
         ];
         assert_eq!(
             legacy_variants.len(),
-            7,
-            "v17.5 §2.2 list 应 7 个 variants"
+            4,
+            "v17.5 §2.2 审计后应剩 4 个 variants (3 项已删)"
         );
         for k in legacy_variants {
             assert!(k.is_legacy_v17_5(), "{:?} 应被标为 legacy", k);
@@ -2422,15 +2379,11 @@ mod tests {
     /// 同步单步跳邡, 完整 audit 路径靠 monitor --test smoke (Commit 4).
     #[test]
     fn is_legacy_v17_5_count_matches_v17_5_spec_section_2_2() {
-        // v17.5 §2.2 "6 个 0-caller" (含 AuctionRepush + OptimalClose +
-        // VolumeWatchlist + VolumeRealTrade + CandidateTriggered +
-        // CandidateInvalidated + VirtualWatch) → 总 7 (spec 实际表 7 行
-        // 包括 AuctionRepush, 主文"6"为 typo, 本 impl 以 7 为准)
+        // v17.5 §2.2 (2026-07-16 勘误后): OptimalClose/VolumeWatchlist/VolumeRealTrade
+        // 已经过调用链审计确认删除; 剩余 4 项 legacy 标记
+        // (AuctionRepush + CandidateTriggered + CandidateInvalidated + VirtualWatch)
         let all_legacy_hits: Vec<PushKind> = [
             PushKind::AuctionRepush,
-            PushKind::OptimalClose,
-            PushKind::VolumeWatchlist,
-            PushKind::VolumeRealTrade,
             PushKind::CandidateTriggered,
             PushKind::CandidateInvalidated,
             PushKind::VirtualWatch,
@@ -2438,7 +2391,7 @@ mod tests {
         .into_iter()
         .filter(|k| k.is_legacy_v17_5())
         .collect();
-        assert_eq!(all_legacy_hits.len(), 7);
+        assert_eq!(all_legacy_hits.len(), 4);
     }
 
     // ============== v17.6 §2.2: is_low_priority_v17_6 标 3 variants ==============
@@ -2461,9 +2414,6 @@ mod tests {
     fn is_low_priority_v17_6_false_for_v17_5_legacy_variants() {
         for k in [
             PushKind::AuctionRepush,
-            PushKind::OptimalClose,
-            PushKind::VolumeWatchlist,
-            PushKind::VolumeRealTrade,
             PushKind::CandidateTriggered,
             PushKind::CandidateInvalidated,
             PushKind::VirtualWatch,
@@ -2479,7 +2429,7 @@ mod tests {
     // ============== v17.7 + v17.8: 12 active spec targets audit ==============
 
     #[test]
-    fn is_active_spec_target_v17_7_v17_8_marks_twelve_active_variants() {
+    fn is_active_spec_target_v17_7_v17_8_marks_ten_active_variants() {
         // v17.7: 6 个 (公告/政策/业绩/研报/紧急告警)
         let v17_7_active = [
             PushKind::Announcement,
@@ -2489,26 +2439,24 @@ mod tests {
             PushKind::AnalystUpgrade,
             PushKind::MarketActionAlert,
         ];
-        // v17.8: 6 个 (交易类: 盘后固定价 + ST 涨幅 + ETF 收盘竞价 + 大宗)
+        // v17.8: 4 个 (交易类: 盘后固定价 + ST 涨幅 + ETF 收盘竞价; BlockTrade* 已删)
         let v17_8_active = [
             PushKind::PostFixedPriceOrder,
             PushKind::PostFixedPriceFill,
             PushKind::StPriceLimitChanged,
             PushKind::EtfClosingCallAuction,
-            PushKind::BlockTradeIntradayConfirm,
-            PushKind::BlockTradePriceRange,
         ];
-        let all_twelve = v17_7_active
+        let all_ten = v17_7_active
             .iter()
             .chain(v17_8_active.iter())
             .copied()
             .collect::<Vec<_>>();
         assert_eq!(
-            all_twelve.len(),
-            12,
-            "v17.7+v17.8 spec targets 应 12 个"
+            all_ten.len(),
+            10,
+            "v17.7+v17.8 spec targets 审计后应 10 个"
         );
-        for k in all_twelve {
+        for k in all_ten {
             assert!(
                 k.is_active_spec_target_v17_7_v17_8(),
                 "{:?} 应被标 active spec target",
@@ -2520,12 +2468,9 @@ mod tests {
     /// v17.5/v17.6 已经标过的 variants 不应在 v17.7/v17.8 audit 重复标
     #[test]
     fn is_active_spec_target_v17_7_v17_8_false_for_v17_5_v17_6() {
-        // v17.5 7 个 legacy
+        // v17.5 4 个 legacy (审计后)
         for k in [
             PushKind::AuctionRepush,
-            PushKind::OptimalClose,
-            PushKind::VolumeWatchlist,
-            PushKind::VolumeRealTrade,
             PushKind::CandidateTriggered,
             PushKind::CandidateInvalidated,
             PushKind::VirtualWatch,
@@ -2589,14 +2534,14 @@ mod tests {
         }
     }
 
-    // ============== v17.x: DISPATCH_TABLE 15 rows 完整性 ==============
+    // ============== v17.x: DISPATCH_TABLE 13 rows 完整性 (2026-07-16 审计后) ==============
 
     #[test]
-    fn dispatch_table_size_is_fifteen() {
+    fn dispatch_table_size_is_thirteen() {
         assert_eq!(
             DISPATCH_TABLE.len(),
-            15,
-            "v17.x DISPATCH_TABLE 应 15 rows (3 v17.6 + 6 v17.7 + 6 v17.8)"
+            13,
+            "v17.x DISPATCH_TABLE 应 13 rows (3 v17.6 + 6 v17.7 + 4 v17.8; BlockTrade* 已删)"
         );
     }
 
@@ -2611,7 +2556,7 @@ mod tests {
 
     #[test]
     fn dispatch_table_covers_all_audit_marked() {
-        // v17.6 low-priority 3 + v17.7 6 + v17.8 6 = 15
+        // v17.6 low-priority 3 + v17.7 6 + v17.8 4 = 13 (BlockTrade* 已删)
         let expected: Vec<PushKind> = vec![
             PushKind::FactorIC,
             PushKind::SectorTier,
@@ -2626,10 +2571,8 @@ mod tests {
             PushKind::PostFixedPriceFill,
             PushKind::StPriceLimitChanged,
             PushKind::EtfClosingCallAuction,
-            PushKind::BlockTradeIntradayConfirm,
-            PushKind::BlockTradePriceRange,
         ];
-        assert_eq!(expected.len(), 15);
+        assert_eq!(expected.len(), 13);
         for k in expected {
             assert!(
                 k.dispatch_row().is_some(),

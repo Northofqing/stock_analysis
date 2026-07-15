@@ -3731,82 +3731,8 @@ pub async fn dispatch_etf_closing_call_auction(
     result
 }
 
-/// v48: T-18 创业板大宗盘中确认 dispatcher
-///   - 新规 2026-07-06: 创业板大宗盘中实时确认 (与科创板一致)
-///   - 触发: 大宗成交回报 event
-///   - 数据源: 大宗成交回报
-pub async fn dispatch_block_trade_intraday_confirm(
-    hhmm: &str,
-    name: &str,
-    code: &str,
-    qty: u32,
-    price: f64,
-    block_type: BlockType,
-    board: Board,
-    real_time_confirm: bool,
-    next_session_settle: SettleType,
-) -> bool {
-    let params = BlockTradeIntradayConfirmParams {
-        hhmm,
-        name,
-        code,
-        qty,
-        price,
-        block_type,
-        board,
-        real_time_confirm,
-        next_session_settle,
-    };
-    let text = render_block_trade_intraday_confirm(params);
-    let result = dispatch(
-        crate::notify::PushKind::BlockTradeIntradayConfirm,
-        code,
-        None,
-        text,
-    )
-    .await;
-    log_dispatcher_attempt(
-        "T-18",
-        result,
-        1,
-        &format!("board={:?} block={:?}", board, block_type),
-    );
-    result
-}
-
-/// v49: T-19 北交所大宗价格区间 dispatcher
-///   - 新规 2026-07-06: 北交所大宗价格范围改为"当日竞价实时成交均价"
-///   - 触发: 大宗事件
-///   - 数据源: 北交所大宗成交回报
-pub async fn dispatch_block_trade_price_range(
-    hhmm: &str,
-    name: &str,
-    code: &str,
-    prev_close: Option<f64>,
-    today_avg_price: f64,
-    block_price_range: Option<&str>,
-    note: &str,
-) -> bool {
-    let params = BlockTradePriceRangeParams {
-        hhmm,
-        name,
-        code,
-        prev_close,
-        today_avg_price,
-        block_price_range,
-        note,
-    };
-    let text = render_block_trade_price_range(params);
-    let result = dispatch(
-        crate::notify::PushKind::BlockTradePriceRange,
-        code,
-        None,
-        text,
-    )
-    .await;
-    log_dispatcher_attempt("T-19", result, 1, &format!("code={}", code));
-    result
-}
+// v17.8 审计删除 (2026-07-16): dispatch_block_trade_intraday_confirm (T-18) /
+//   dispatch_block_trade_price_range (T-19) — 0 调用者死链路, 归档 docs/v15.x/dead-pushkinds.md
 
 /// v40: P-04 虚拟盘成交 dispatcher 包装
 pub async fn push_paper_trade(code: &str, params: PaperTradeParams<'_>) -> bool {
@@ -5941,90 +5867,10 @@ pub fn render_etf_closing_call_auction(p: EtfClosingCallAuctionParams<'_>) -> St
     )
 }
 
-/// v13.1 §5.6 大宗类型
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BlockType {
-    Agreed,      // 协议大宗
-    Competitive, // 竞价大宗
-}
-
-/// v13.1 §5.6 板块
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Board {
-    GEM,  // 创业板
-    STAR, // 科创板
-    Main, // 主板
-}
-
-/// v13.1 §5.6 清算节奏
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SettleType {
-    NextSession, // 次日
-    RealTime,    // 实时
-}
-
-/// v13.1 §5.6 T-18 创业板协议大宗盘中确认
-pub struct BlockTradeIntradayConfirmParams<'a> {
-    pub hhmm: &'a str,
-    pub name: &'a str,
-    pub code: &'a str,
-    pub qty: u32,
-    pub price: f64,
-    pub block_type: BlockType,
-    pub board: Board,
-    pub real_time_confirm: bool,
-    pub next_session_settle: SettleType,
-}
-
-/// v13.1 §5.6 T-18 创业板协议大宗盘中确认（盘后参考, 无 banner）
-pub fn render_block_trade_intraday_confirm(p: BlockTradeIntradayConfirmParams<'_>) -> String {
-    let bt = match p.block_type {
-        BlockType::Agreed => "协议大宗",
-        BlockType::Competitive => "竞价大宗",
-    };
-    let bd = match p.board {
-        Board::GEM => "创业板",
-        Board::STAR => "科创板",
-        Board::Main => "主板",
-    };
-    let settle = match p.next_session_settle {
-        SettleType::NextSession => "次日清算",
-        SettleType::RealTime => "实时清算",
-    };
-    let confirm = if p.real_time_confirm {
-        "✅ 盘中实时确认"
-    } else {
-        "⏳ 等待确认"
-    };
-    format!(
-        "📋 大宗交易盘中确认（{}）\n{}({}) {} {}\n数量: {} 价格: {:.2}\n板块: {} | 清算: {}",
-        p.hhmm, p.name, p.code, bt, confirm, p.qty, p.price, bd, settle
-    )
-}
-
-/// v13.1 §5.7 T-19 北交所大宗价格区间
-pub struct BlockTradePriceRangeParams<'a> {
-    pub hhmm: &'a str,
-    pub name: &'a str,
-    pub code: &'a str,
-    pub prev_close: Option<f64>,
-    pub today_avg_price: f64,
-    pub block_price_range: Option<&'a str>,
-    pub note: &'a str,
-}
-
-/// v13.1 §5.7 T-19 北交所大宗价格区间（盘后参考, 无 banner）
-pub fn render_block_trade_price_range(p: BlockTradePriceRangeParams<'_>) -> String {
-    let prev = p
-        .prev_close
-        .map(|v| format!("{:.2}", v))
-        .unwrap_or_else(|| "N/A".to_string());
-    let range = p.block_price_range.unwrap_or("暂无");
-    format!(
-        "📊 北交所大宗价格区间（{}）\n{}({})\n前收盘价: {} (原口径)\n当日实时均价: {:.2} (新口径)\n价格区间: {}\n注: {}",
-        p.hhmm, p.name, p.code, prev, p.today_avg_price, range, p.note
-    )
-}
+// v17.8 审计删除 (2026-07-16): BlockType / Board / SettleType 枚举 +
+//   BlockTradeIntradayConfirmParams / render_block_trade_intraday_confirm (T-18) +
+//   BlockTradePriceRangeParams / render_block_trade_price_range (T-19)
+//   — 仅被已删的死 dispatch fn 使用, 归档 docs/v15.x/dead-pushkinds.md
 
 /// v13 §14.3 A-01 虚拟仓复盘 (P1, 复用 T-11 竞价复算通路)
 pub struct PaperReviewParams<'a> {
@@ -7777,45 +7623,8 @@ mod tests {
         assert!(out.contains("14:57-15:00 集合竞价形成收盘价"));
     }
 
-    #[test]
-    fn block_trade_intraday_confirm_gem() {
-        let p = BlockTradeIntradayConfirmParams {
-            hhmm: "11:15",
-            name: "A",
-            code: "300750",
-            qty: 1000,
-            price: 50.0,
-            block_type: BlockType::Agreed,
-            board: Board::GEM,
-            real_time_confirm: true,
-            next_session_settle: SettleType::NextSession,
-        };
-        let out = render_block_trade_intraday_confirm(p);
-        assert!(out.contains("📋 大宗交易盘中确认（11:15）"));
-        assert!(out.contains("A(300750) 协议大宗 ✅ 盘中实时确认"));
-        assert!(out.contains("数量: 1000 价格: 50.00"));
-        assert!(out.contains("板块: 创业板"));
-        assert!(out.contains("清算: 次日清算"));
-    }
-
-    #[test]
-    fn block_trade_price_range_bj() {
-        let p = BlockTradePriceRangeParams {
-            hhmm: "14:30",
-            name: "A",
-            code: "830001",
-            prev_close: Some(10.50),
-            today_avg_price: 10.80,
-            block_price_range: Some("10.50~11.10"),
-            note: "原口径为前收盘价, 新口径为当日均价",
-        };
-        let out = render_block_trade_price_range(p);
-        assert!(out.contains("📊 北交所大宗价格区间（14:30）"));
-        assert!(out.contains("A(830001)"));
-        assert!(out.contains("前收盘价: 10.50 (原口径)"));
-        assert!(out.contains("当日实时均价: 10.80 (新口径)"));
-        assert!(out.contains("价格区间: 10.50~11.10"));
-    }
+    // v17.8 审计删除 (2026-07-16): block_trade_intraday_confirm_gem / block_trade_price_range_bj
+    //   测试随 T-18/T-19 render fn 一同删除
 
     // ====== v13.1 治理元信息测试 (T-17/T-18/T-19) ======
     #[test]
@@ -7826,49 +7635,13 @@ mod tests {
         );
     }
     #[test]
-    fn gov_block_trade_intraday_confirm_cooldown() {
-        assert_eq!(
-            crate::notify::PushKind::BlockTradeIntradayConfirm.cooldown_secs(),
-            Some(300)
-        );
-    }
-    #[test]
-    fn gov_block_trade_price_range_cooldown() {
-        assert_eq!(
-            crate::notify::PushKind::BlockTradePriceRange.cooldown_secs(),
-            Some(3600)
-        );
-    }
-    #[test]
     fn gov_etf_closing_call_auction_no_banner() {
         assert!(!crate::notify::PushKind::EtfClosingCallAuction.requires_banner());
-    }
-    #[test]
-    fn gov_block_trade_intraday_confirm_no_banner() {
-        assert!(!crate::notify::PushKind::BlockTradeIntradayConfirm.requires_banner());
-    }
-    #[test]
-    fn gov_block_trade_price_range_no_banner() {
-        assert!(!crate::notify::PushKind::BlockTradePriceRange.requires_banner());
     }
     #[test]
     fn gov_etf_closing_call_auction_level() {
         assert_eq!(
             crate::notify::PushKind::EtfClosingCallAuction.level(),
-            crate::notify::PushLevel::Important
-        );
-    }
-    #[test]
-    fn gov_block_trade_intraday_confirm_level() {
-        assert_eq!(
-            crate::notify::PushKind::BlockTradeIntradayConfirm.level(),
-            crate::notify::PushLevel::Important
-        );
-    }
-    #[test]
-    fn gov_block_trade_price_range_level() {
-        assert_eq!(
-            crate::notify::PushKind::BlockTradePriceRange.level(),
             crate::notify::PushLevel::Important
         );
     }
@@ -8778,35 +8551,9 @@ mod tests {
         assert!(t17.contains("📊 ETF 集合竞价尾盘"));
         assert!(t17.contains("沪市 ETF"));
 
-        // 12. T-18
-        let t18 = render_block_trade_intraday_confirm(BlockTradeIntradayConfirmParams {
-            hhmm: "11:15",
-            name: "A",
-            code: "300750",
-            qty: 1000,
-            price: 50.0,
-            block_type: BlockType::Agreed,
-            board: Board::GEM,
-            real_time_confirm: true,
-            next_session_settle: SettleType::NextSession,
-        });
-        assert!(t18.contains("📋 大宗交易盘中确认"));
-        assert!(t18.contains("创业板"));
+        // 12-13. T-18/T-19: v17.8 审计删除 (2026-07-16), 随 render fn 一同移除
 
-        // 13. T-19
-        let t19 = render_block_trade_price_range(BlockTradePriceRangeParams {
-            hhmm: "14:30",
-            name: "A",
-            code: "830001",
-            prev_close: Some(10.50),
-            today_avg_price: 10.80,
-            block_price_range: Some("10.50~11.10"),
-            note: "原口径为前收盘价, 新口径为当日均价",
-        });
-        assert!(t19.contains("📊 北交所大宗价格区间"));
-        assert!(t19.contains("北交所"));
-
-        // 全部 13 个模板 + 辅助行 ("辅助建议, 非下单指令" 等)
+        // 全部 11 个模板 + 辅助行 ("辅助建议, 非下单指令" 等)
         assert!(p1.contains("辅助建议, 非下单指令"));
         assert!(i1.contains("辅助建议, 非下单指令"));
         assert!(i2.contains("辅助建议, 非下单指令"));
@@ -8815,9 +8562,9 @@ mod tests {
         assert!(a10.contains("辅助建议, 非下单指令"));
         assert!(a01.contains("辅助建议, 非下单指令"));
 
-        // 打印所有 13 个模板样例 (v19 任务: 用户要看每个模板输出)
+        // 打印所有 11 个模板样例 (v19 任务: 用户要看每个模板输出; T-18/T-19 已删)
         eprintln!("\n╔══════════════════════════════════════════════════════════════════╗");
-        eprintln!("║ 13 个新模板 render 输出 (v13/v13.1)                              ║");
+        eprintln!("║ 11 个新模板 render 输出 (v13/v13.1)                              ║");
         eprintln!("╚══════════════════════════════════════════════════════════════════╝\n");
         eprintln!("────── 1. P-01 盘前新闻热点 ──────\n{}\n", p1);
         eprintln!("────── 2. I-01 盘中轮动总览 ──────\n{}\n", i1);
@@ -8830,8 +8577,7 @@ mod tests {
         eprintln!("────── 9. T-15 盘后固定价格成交 ──────\n{}\n", t15);
         eprintln!("────── 10. T-16 ST 涨跌幅变更 ──────\n{}\n", t16);
         eprintln!("────── 11. T-17 ETF 集合竞价尾盘 ──────\n{}\n", t17);
-        eprintln!("────── 12. T-18 创业板大宗盘中确认 ──────\n{}\n", t18);
-        eprintln!("────── 13. T-19 北交所大宗价格区间 ──────\n{}\n", t19);
+        // T-18/T-19: v17.8 审计删除 (2026-07-16)
         eprintln!("═══════════════════════════════════════════════════════════════════\n");
     }
 
