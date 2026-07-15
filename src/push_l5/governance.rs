@@ -13,9 +13,53 @@
 //!   - b-008 §4.1: data_mode = Down 时, 仅 always_send_on_data_source_down=true 且 event_kind=data_source_down 才放行
 
 use chrono::{DateTime, Local, Timelike};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::push_l1::{SignalEvent, SignalPayload, SignalSource};
 use crate::push_l2::{DataMode, TemplateCategory, TemplateMetadata};
+
+/// v17.1 review F8 fix: Frozen warn 节流.
+///
+/// 每条 push 都打 "Frozen 上下文 + frozen_mode_respect=true → 放行" 在 frozen_mode_respect
+/// 启用场景下形成日志噪声 (默认 false, 但逃生路径仍可能启用). 节流到 60s 一次.
+///
+/// 实现: 进程级 AtomicU64 (上次 warn 的 UNIX 秒); 距上次 ≥ 60s 才打 warn.
+const FROZEN_WARN_THROTTLE_SECS: u64 = 60;
+static LAST_FROZEN_WARN_TS: AtomicU64 = AtomicU64::new(0);
+
+/// 当前时间 (UNIX seconds). 测试可替换.
+#[cfg(not(test))]
+fn now_unix_secs() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+fn now_unix_secs() -> u64 {
+    0 // 测试场景用确定性 0; 节流 helper 走测试 helper 自己 mock
+}
+
+/// 节流打 Frozen warn: 距上次 ≥ 60s 才打, 否则 silent.
+fn throttled_frozen_warn() {
+    let now = now_unix_secs();
+    let last = LAST_FROZEN_WARN_TS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < FROZEN_WARN_THROTTLE_SECS {
+        return;
+    }
+    LAST_FROZEN_WARN_TS.store(now, Ordering::Relaxed);
+    log::warn!(
+        "[v17.1-F8] Frozen 上下文 + frozen_mode_respect=true → 放行, 模板应渲染 ⚠️ 警告 (节流 60s/次)"
+    );
+}
+
+/// 测试用: 重置节流 timestamp, 让下次 warn 可通过.
+#[cfg(test)]
+fn reset_frozen_warn_throttle_for_test() {
+    LAST_FROZEN_WARN_TS.store(0, Ordering::Relaxed);
+}
 
 /// Governance 决策
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -99,11 +143,10 @@ impl GovernanceEngine {
         // Step 2: 冻结模式
         // v17.1 治本: Frozen 状态不再 Deny, 模板从 ctx.is_frozen 读后渲染 ⚠️ 警告
         // 仓位风险控制应在 broker 下单层, 通知层应保持出声 (4 铁律)
-        // 字段保留用于日志/审计
+        // 字段保留用于日志/审计.
+        // F8 fix: 节流到 60s 一次, 避免 frozen_mode_respect=true 启用时每条 push 都 warn.
         if profile.frozen_mode_respect && ctx.is_frozen {
-            log::warn!(
-                "[v17.1] Frozen 上下文 + frozen_mode_respect=true → 放行, 模板应渲染 ⚠️ 警告"
-            );
+            throttled_frozen_warn();
             // 故意 fall through, 不 return Deny
         }
 
@@ -395,5 +438,27 @@ mod tests {
         let d = GovernanceDecision::Approve;
         assert_eq!(d.deny_reason(), None);
         assert!(d.is_approve());
+    }
+
+    // ============== F8: Frozen warn 节流测试 ==============
+    //
+    // 注: cfg(test) 下 now_unix_secs() 返回 0, 节流窗口 = [0, 60).
+    // 第一次 throttled_frozen_warn() → 0.saturating_sub(0)=0 < 60 → 静默 (不更新 last_ts).
+    // 第二次在窗口内 → 静默.
+    // reset_frozen_warn_throttle_for_test 不改语义, 仅给 multi-test 隔离用.
+
+    #[test]
+    fn throttled_frozen_warn_helper_callable() {
+        // 不 panic + 不 log error (cfg(test) 下 now_unix_secs=0 走节流路径).
+        reset_frozen_warn_throttle_for_test();
+        throttled_frozen_warn();
+        throttled_frozen_warn();
+        // 测试不依赖 log capture — 仅验证 helper 不 panic.
+    }
+
+    #[test]
+    fn frozen_warn_throttle_constant_in_range() {
+        // 文档化窗口: 60s 一次. 防止后续修改默认值.
+        assert_eq!(FROZEN_WARN_THROTTLE_SECS, 60);
     }
 }
