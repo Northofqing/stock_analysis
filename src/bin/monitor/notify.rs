@@ -456,6 +456,30 @@ impl PushKind {
             PushKind::MarketActionAlert => "实盘异常",
         }
     }
+
+    /// v17.1 review F10 fix: 稳定 template_id (PascalCase → snake_case + _v1 后缀).
+    ///
+    /// 之前 `l6_sink::build_push_message` 用 `format!("{kind:?}")` 直接拿 Debug 输出,
+    /// 这会让 template_id 跟 enum 变体名强耦合 — 任何 rename 都破坏 L7 analytics 历史数据.
+    ///
+    /// 本方法返回稳定 snake_case ID: `HoldingEvent → "holding_event_v1"`,
+    /// `PostFixedPriceOrder → "post_fixed_price_order_v1"` 等. 即使将来变体
+    /// rename, 旧 template_id 仍可作 alias 兼容 (commit 不改 enum 变体字符串).
+    ///
+    /// 设计取舍: 0 cache (compute on demand). PushKind 是 Copy enum, format + 字符遍历
+    /// < 1µs. 60+ variants 不需要 lazy_static HashMap (Path D 一致: 不重写 L7 analytics).
+    pub fn stable_template_id(self) -> String {
+        let pascal = format!("{self:?}");
+        let mut snake = String::with_capacity(pascal.len() + 3);
+        for (i, c) in pascal.chars().enumerate() {
+            if i > 0 && c.is_ascii_uppercase() {
+                snake.push('_');
+            }
+            snake.push(c.to_ascii_lowercase());
+        }
+        snake.push_str("_v1");
+        snake
+    }
 }
 
 /// b011 P0-2: L4 dedup 键语义 (与 PushKind::cooldown_secs 配套)

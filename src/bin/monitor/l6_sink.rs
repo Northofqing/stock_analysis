@@ -92,14 +92,14 @@ impl Sink for MagiclawSink {
 // ============================================================================
 
 /// 把 (SignalEvent, 渲染后文本, PushKind) 装成 PushMessage.
-/// template_id 用 push kind 的字符串名 (调试 + analytics 友好);
+/// template_id 走 `PushKind::stable_template_id()` (snake_case + _v1 后缀, F10 fix);
 /// template_version 永远 1 (当前 v14.2 单版本);
 /// user_id 永远 "default" (单用户场景).
 pub fn build_push_message(event: &SignalEvent, text: &str, kind: PushKind) -> PushMessage {
     PushMessage {
         event: event.clone(),
         text: RenderedText::new(text),
-        template_id: format!("{kind:?}"),
+        template_id: kind.stable_template_id(),
         template_version: 1,
         user_id: "default".to_string(),
     }
@@ -251,12 +251,31 @@ mod tests {
     }
 
     #[test]
-    fn build_push_message_uses_debug_str_as_template_id() {
+    fn build_push_message_uses_stable_snake_case_template_id() {
+        // F10 fix: template_id 不再用 Debug "HoldingEvent", 改 stable snake_case "_v1".
         let ev = make_test_event();
         let pm = build_push_message(&ev, "hello", PushKind::HoldingEvent);
-        assert!(pm.template_id.contains("HoldingEvent"));
+        assert_eq!(
+            pm.template_id, "holding_event_v1",
+            "HoldingEvent 应映射到 stable snake_case_v1"
+        );
+        assert!(!pm.template_id.contains("HoldingEvent"), "不再含 PascalCase");
         assert_eq!(pm.text.body, "hello");
         assert_eq!(pm.user_id, "default");
         assert_eq!(pm.template_version, 1);
+    }
+
+    #[test]
+    fn build_push_message_stable_id_across_kinds() {
+        // 多 variant smoke: 每个 kind 都应生成 *snake_case*_v1.
+        let ev = make_test_event();
+        for (kind, expected) in [
+            (PushKind::HoldingEvent, "holding_event_v1"),
+            (PushKind::PostFixedPriceOrder, "post_fixed_price_order_v1"),
+            (PushKind::DailyReport, "daily_report_v1"),
+        ] {
+            let pm = build_push_message(&ev, "x", kind);
+            assert_eq!(pm.template_id, expected, "kind {:?} stable id", kind);
+        }
     }
 }
