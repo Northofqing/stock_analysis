@@ -1413,7 +1413,21 @@ pub async fn push_account_mode_change(
     use stock_analysis::risk::action_gate::AccountMode as LibAM;
 
     let thresholds: ModeThresholds = get_risk_config().account_mode.to_thresholds();
-    let eval = evaluate(metrics, prev, &thresholds);
+    // BR-021 caller wire: 8:30 盘前重置信号 (commit 08cca47 helper + 当前 commit 集成).
+    // 当 prev=Frozen 且当前时间落在 8:30 窗口 → 强制 prev=None 让 evaluate 基于 metrics
+    // 重判, Frozen 自动落到 Normal (或仍 Frozen 如 metrics 仍超限, 都由 evaluate 决定).
+    // 注意: 此分支不修改 prev_for_eval 的 type, 仅在 should_reset=true 时把 Option 转 None.
+    let now_local = chrono::Local::now().time();
+    let prev_for_eval =
+        if stock_analysis::risk::account_mode::should_reset_at_8_30(prev, now_local) {
+            log::warn!(
+                "[BR-021] 8:30 盘前重置信号命中: prev=Frozen → 强制 prev=None 让 evaluate 重判"
+            );
+            None
+        } else {
+            prev
+        };
+    let eval = evaluate(metrics, prev_for_eval, &thresholds);
 
     if !eval.is_changed() {
         return Ok(false);

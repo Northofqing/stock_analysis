@@ -7833,6 +7833,27 @@ async fn monitor_loop() {
                     }
                 }
             }
+            // BR-021 §5.10 / commit 08cca47 + caller wire: 8:30 盘前重置 cron.
+            // 调一次 push_account_mode_change 触发 evaluate(), 内部 should_reset_at_8_30
+            // (Frozen + 8:30 窗口) → 强制 prev=None → evaluate 重判 → 落库 + 推 T-01.
+            // 用 Mutex<Option<NaiveDate>> 防当日重复 (跟 15:05 / 15:30 同 pattern).
+            if now.hour() == 8 && now.minute() == 30 {
+                static BR021_LAST_RUN: std::sync::Mutex<Option<chrono::NaiveDate>> = std::sync::Mutex::new(None);
+                let today = now.date_naive();
+                let already_run = BR021_LAST_RUN.lock().unwrap_or_else(|e| e.into_inner()).map(|d| d == today).unwrap_or(false);
+                if !already_run {
+                    log::info!("[BR-021] 8:30 cron 触发 → push_account_mode_change 评估盘前重置");
+                    // 调 push_account_mode_change (内部 detect 8:30 窗口 + Frozen → reset)
+                    // 用空 metrics 让 prev 检测到 Frozen 后走 should_reset 信号路径
+                    let empty_metrics = stock_analysis::risk::account_mode::PortfolioMetrics::default();
+                    let _ = crate::push_templates::push_account_mode_change(
+                        &empty_metrics,
+                        None, // prev 由 push_account_mode_change 自己从 DB latest_account_mode_change() 拉 (line 1401)
+                        None,
+                    ).await;
+                    *BR021_LAST_RUN.lock().unwrap_or_else(|e| e.into_inner()) = Some(today);
+                }
+            }
             tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
         }
     });
