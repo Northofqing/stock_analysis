@@ -2635,7 +2635,14 @@ pub fn load_industry_chain_snapshot_real(hhmm: &str) -> IndustryChainSnapshot {
                     None => (c.clone(), c.clone()),  // 都查不到, 两槽同名 (无法解析)
                 }
             };
-            let price = chg_map.get(code.as_str()).copied().unwrap_or(0.0) as f64;
+            // 红线 2.2: 缺涨跌幅数据时 warn 出声, 不静默填 0.0
+            let price = match chg_map.get(code.as_str()).copied() {
+                Some(v) => v as f64,
+                None => {
+                    log::warn!("[补充榜] {} 缺涨跌幅数据 (按 0.0 展示)", code);
+                    0.0
+                }
+            };
             (name, code, price)
         })
         .collect();

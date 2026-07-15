@@ -1920,7 +1920,14 @@ async fn main() {
             let parts: Vec<&str> = spec.split(':').collect();
             if parts.len() >= 2 {
                 let code = parts[0];
-                let price: f64 = parts[1].parse().unwrap_or(0.0);
+                // 红线 2.3: price > 0 必验; 非法输入显式报错, 不静默填 0.0
+                let price: f64 = match parts[1].parse() {
+                    Ok(p) if p > 0.0 => p,
+                    _ => {
+                        eprintln!("[虚拟盘] 非法卖出价格 {:?} (需 > 0)", parts[1]);
+                        std::process::exit(1);
+                    }
+                };
                 let qty: u64 = parts
                     .get(2)
                     .and_then(|s| s.parse().ok())
@@ -1971,7 +1978,14 @@ async fn main() {
             let parts: Vec<&str> = spec.split(':').collect();
             if parts.len() >= 2 {
                 let code = parts[0];
-                let price: f64 = parts[1].parse().unwrap_or(0.0);
+                // 红线 2.3: price > 0 必验; 非法输入显式报错, 不静默填 0.0
+                let price: f64 = match parts[1].parse() {
+                    Ok(p) if p > 0.0 => p,
+                    _ => {
+                        eprintln!("[虚拟盘] 非法买入价格 {:?} (需 > 0)", parts[1]);
+                        std::process::exit(1);
+                    }
+                };
                 let qty: u64 = parts
                     .get(2)
                     .and_then(|s| s.parse().ok())
@@ -3353,7 +3367,14 @@ async fn run_test_scan() {
 
         let r2_ledger = r2_equity.last().cloned();
 
-        let r2_mv = r2_ledger.as_ref().map(|e| e.market_value).unwrap_or(0.0);
+        // 红线 2.2: equity_curve 空时 market_value 缺数据, warn 出声后按 0.0 展示
+        let r2_mv = match r2_ledger.as_ref() {
+            Some(e) => e.market_value,
+            None => {
+                log::warn!("[R2] equity_curve 空, market_value 缺数据 (按 0.0 展示)");
+                0.0
+            }
+        };
 
         // review #15: fetch_announcements 改 async. 外层已经在 spawn_blocking closure
 
@@ -3397,7 +3418,14 @@ async fn run_test_scan() {
 
                 // 价格源: 1) 实时 quote 2) K 线 (v12 spawn_blocking 已拉) 3) cost_price
 
-                let mut cur = r2_prices.get(&p.code).copied().unwrap_or(0.0);
+                // 红线 2.2: 无实时价时出声降级, 不静默填 0.0
+                let mut cur = match r2_prices.get(&p.code).copied() {
+                    Some(v) => v,
+                    None => {
+                        log::info!("[R-01] {} 无实时价, 降级 cost_price", p.code);
+                        0.0
+                    }
+                };
 
                 if cur <= 0.0 {
 
@@ -4324,13 +4352,14 @@ async fn run_test_scan() {
 
         for p in &holdings_inner {
 
-            let cur = price_map.get(&p.code).copied().unwrap_or(0.0);
-
-            if cur <= 0.0 {
-
-                continue;
-
-            }
+            // 红线 2.2 + v15.x 静默路径可见: 缺实时价跳过本轮时 warn 出声
+            let cur = match price_map.get(&p.code).copied() {
+                Some(v) if v > 0.0 => v,
+                _ => {
+                    log::warn!("[止损扫描] {} 缺实时价, 跳过本轮计算", p.code);
+                    continue;
+                }
+            };
 
             let kline = stock_analysis::data_provider::DataFetcherManager::new()
 
@@ -5377,7 +5406,14 @@ async fn run_review_only_inner() {
 
             let r2_ledger = r2_equity.last().cloned();
 
-            let r2_mv = r2_ledger.as_ref().map(|e| e.market_value).unwrap_or(0.0);
+            // 红线 2.2: equity_curve 空时 market_value 缺数据, warn 出声后按 0.0 展示
+            let r2_mv = match r2_ledger.as_ref() {
+                Some(e) => e.market_value,
+                None => {
+                    log::warn!("[R2] equity_curve 空, market_value 缺数据 (按 0.0 展示)");
+                    0.0
+                }
+            };
 
             (r2, r2_prices, r2_mv)
 
@@ -10238,11 +10274,16 @@ async fn monitor_loop() {
 
         // 拉上证指数（新浪 API）：阻塞 I/O 放到 blocking 线程，避免在 async 上下文创建/销毁 blocking runtime。
 
-        let index_change = tokio::task::spawn_blocking(market_data::fetch_sh_index_change)
-
+        // 红线 2.2: join 失败时 warn 出声, 不静默填 0.0
+        let index_change = match tokio::task::spawn_blocking(market_data::fetch_sh_index_change)
             .await
-
-            .unwrap_or(0.0);
+        {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("[大盘] 上证指数任务 join 失败: {} (涨跌幅按 0.0 展示)", e);
+                0.0
+            }
+        };
 
         let up_count = total_limit_ups.len();
 
