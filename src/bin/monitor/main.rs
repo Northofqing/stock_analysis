@@ -94,6 +94,8 @@ mod v14_adapter;
 
 mod l6_sink;
 
+mod news_aggregator_init;
+
 // 修复 Top10#3+#4 (2026-06-29 audit): 拆大文件
 
 mod freshness;
@@ -1830,6 +1832,14 @@ async fn main() {
         } else {
             "默认 push_wechat (L5 未切到 L6, 回滚 env: STOCK_ANALYSIS_PUSH_V6_ENABLE=1 才走 L6)"
         }
+    );
+
+    // v17.4: NewsAggregator 全局初始化 (13 个 NewsFeed 适配注册到 aggregator)
+    // 调用方: news_monitor_loop 每 tick 调 tick_news_aggregator(20) 拿 dedup 后 events
+    let news_feed_count = news_aggregator_init::init_news_aggregator();
+    log::info!(
+        "[v17.4] NewsAggregator 已初始化 ({} feeds registered)",
+        news_feed_count
     );
 
     log::info!(
@@ -7090,7 +7100,10 @@ async fn news_monitor_loop() {
 
         }
 
-
+        // v17.4: NewsAggregator tick 入口 — 每轮调一次, 拿 dedup 后 Vec<MarketEvent>
+        // 后续接入 news_ranker / news_outcome / news_catalyst 时把 events 直接喂过去
+        let _news_events = news_aggregator_init::tick_news_aggregator(20).await;
+        let _ = _news_events; // 暂不消费, 仅 log + dedup
 
         // L2 概念索引刷新（每5分钟一次）
 
