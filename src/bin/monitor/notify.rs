@@ -229,6 +229,22 @@ impl PushKind {
         )
     }
 
+    /// v17.6 §5.1: 3 个 low-priority variants (FactorIC / SectorTier / CapitalVerify)
+    /// 现在是 DailyReport 的"子段" — 推送时通过 `DailyReportSubKind` 标识子类型.
+    ///
+    /// 设计取舍: 不删 enum 变体 (向后兼容 + 现有 9 callsite 不破), 仅在 metadata
+    /// 层 (本方法) 标"它们是 DailyReport 的子段". 后续 `daily_report_router` 模块
+    /// 用本方法分流, 推送时仍走 PushKind::DailyReport 主路径 (cooldown 24h),
+    /// 但 sub_kind 在 title prefix 区分 (e.g. "[FactorIC] ...") 避免合并后丢失语义.
+    pub fn daily_report_sub_kind(self) -> Option<DailyReportSubKind> {
+        match self {
+            Self::FactorIC => Some(DailyReportSubKind::FactorIC),
+            Self::SectorTier => Some(DailyReportSubKind::SectorTier),
+            Self::CapitalVerify => Some(DailyReportSubKind::CapitalVerify),
+            _ => None,
+        }
+    }
+
     /// v12 §14.3 等级: 🚨紧急 / ⚡重要 / ℹ️参考
     pub fn level(self) -> PushLevel {
         match self {
@@ -479,6 +495,60 @@ impl PushKind {
         }
         snake.push_str("_v1");
         snake
+    }
+}
+
+/// v17.6 §5.1: DailyReport 子段枚举.
+///
+/// 收纳原 PushKind 中 3 个 low-priority variants (FactorIC / SectorTier / CapitalVerify).
+/// 它们都归属于"日报类"推送 (DailyReport), 但语义不同需在 title 区分, 因此引入子枚举.
+///
+/// 用法: `daily_report_router::push_factor_ic(text)` 内部走 `PushKind::DailyReport` 主路径
+/// + title prefix "[FactorIC] ..." 标识子类型. cooldown 复用 `PushKind::DailyReport` 的 24h.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum DailyReportSubKind {
+    /// 因子 IC (grill Q6 改)
+    FactorIC,
+    /// v4 赛道分档
+    SectorTier,
+    /// v4 资金验证
+    CapitalVerify,
+}
+
+impl DailyReportSubKind {
+    /// 简短标签 (log + title prefix 用)
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FactorIC => "FactorIC",
+            Self::SectorTier => "SectorTier",
+            Self::CapitalVerify => "CapitalVerify",
+        }
+    }
+
+    /// 对应原 PushKind variant (用于 audit / 回退路径)
+    pub fn legacy_kind(self) -> PushKind {
+        match self {
+            Self::FactorIC => PushKind::FactorIC,
+            Self::SectorTier => PushKind::SectorTier,
+            Self::CapitalVerify => PushKind::CapitalVerify,
+        }
+    }
+
+    /// 子段独立冷却 (秒). None = 跟随 DailyReport 主 24h.
+    /// 设计: 默认 None, 让 sub_kind 共享 DailyReport 1次/日窗口 (避免重复噪声).
+    /// 个别场景可 override: SectorTier/CapitalVerify 偏实时 → 30min 独立窗口.
+    pub fn cooldown_secs(self) -> Option<u32> {
+        match self {
+            Self::FactorIC => None,
+            Self::SectorTier => Some(1800), // 30min
+            Self::CapitalVerify => Some(1800),
+        }
+    }
+
+    /// 稳定 template_id (snake_case + _v1, 跟 PushKind 一致规则)
+    pub fn stable_template_id(self) -> String {
+        // DailyReport 主路径是 daily_report_v1, 子段加 _sub suffix
+        format!("daily_report_{}_v1", self.label().to_ascii_lowercase())
     }
 }
 
@@ -2173,6 +2243,49 @@ mod tests {
             assert!(
                 !k.is_active_spec_target_v17_7_v17_8(),
                 "{:?} low-priority 不应再标 active spec target",
+                k
+            );
+        }
+    }
+
+    // ============== v17.6 §5.1: daily_report_sub_kind 标 3 variants ==============
+
+    #[test]
+    fn daily_report_sub_kind_marks_three_low_priority_variants() {
+        let mappings = [
+            (PushKind::FactorIC, DailyReportSubKind::FactorIC),
+            (PushKind::SectorTier, DailyReportSubKind::SectorTier),
+            (PushKind::CapitalVerify, DailyReportSubKind::CapitalVerify),
+        ];
+        assert_eq!(mappings.len(), 3);
+        for (kind, expected_sub) in mappings {
+            assert_eq!(
+                kind.daily_report_sub_kind(),
+                Some(expected_sub),
+                "{:?} 应映射到 sub_kind {:?}",
+                kind,
+                expected_sub
+            );
+        }
+    }
+
+    /// v17.6 §5.1: 非 low-priority variants 不应被标 sub_kind (向后兼容)
+    #[test]
+    fn daily_report_sub_kind_none_for_other_variants() {
+        for k in [
+            PushKind::DailyReport,
+            PushKind::HoldingEvent,
+            PushKind::Announcement,
+            PushKind::AuctionVolume,
+            PushKind::LimitBoards,
+            PushKind::SectorTop,
+            PushKind::FundInflow,
+            PushKind::HoldingPlan,
+            PushKind::AccountMode,
+        ] {
+            assert!(
+                k.daily_report_sub_kind().is_none(),
+                "{:?} 不应是 DailyReport sub_kind",
                 k
             );
         }

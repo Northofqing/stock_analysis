@@ -96,6 +96,8 @@ mod l6_sink;
 
 mod news_aggregator_init;
 
+mod daily_report_router;  // v17.6 §5.1: DailyReport SubKind 拆分 (3 variants → DailyReport 主路径)
+
 // 修复 Top10#3+#4 (2026-06-29 audit): 拆大文件
 
 mod freshness;
@@ -1841,6 +1843,9 @@ async fn main() {
         "[v17.4] NewsAggregator 已初始化 ({} feeds registered)",
         news_feed_count
     );
+
+    // v17.6 §5.1: daily_report_router 启动 audit (3 sub_kinds + legacy 映射表)
+    daily_report_router::init_audit();
 
     log::info!(
 
@@ -8537,11 +8542,11 @@ async fn monitor_loop() {
 
                                 virtual_snapshot_persisted = true;
 
-                                notify::push_governor(
+                                // v17.6 §5.1: FactorIC → daily_report_router (demo migration)
+                                // 走 DailyReport 主路径 + [FactorIC] prefix, 不再用旧 PushKind 直推
+                                crate::daily_report_router::route_factor_ic(
 
                                     &lines.join("\n"),
-
-                                    notify::PushKind::FactorIC,
 
                                 )
 

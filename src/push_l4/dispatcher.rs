@@ -23,6 +23,23 @@ use crate::push_l1::SignalEvent;
 /// dedup 表容量阈值: 超过则先清理过期项 (防常驻进程无界增长)
 const DEDUP_TABLE_SOFT_CAP: usize = 4096;
 
+/// v17.6 §5.1: DailyReport sub_kind 标识符 — 拼到 dedup key 实现 per-sub_kind 隔离.
+///
+/// 用法: `sub_kind_dedup_key("daily_report", Some("FactorIC"), "2026-07-16")` →
+///   `"daily_report|sub_kind=FactorIC|date=2026-07-16"`.
+///
+/// 设计 (Path D 一致): 不改现有 `(kind, code)` 键空间, 仅在调用方传入 sub_kind 时
+/// 把它加入键的 suffix. 调用方不传 sub_kind → 返回原 kind 字符串, 向后兼容.
+///
+/// 当前用在 daily_report_router 三个公开函数 (route_factor_ic / route_sector_tier /
+/// route_capital_verify) 让同一 DailyReport 主路径下 3 个 sub_kind 互不抢窗口.
+pub fn sub_kind_dedup_key(kind: &str, sub_kind: Option<&str>, date: &str) -> String {
+    match sub_kind {
+        Some(s) => format!("{}|sub_kind={}|date={}", kind, s, date),
+        None => kind.to_string(),
+    }
+}
+
 /// Dispatcher — v14.2 L4 仲裁层 (单实例, 全局共享)
 pub struct Dispatcher {
     /// dedup 表: (kind, code) → (上次放行时间, 该键冷却窗口)
@@ -85,7 +102,7 @@ impl Dispatcher {
 
     /// v15.1 A3: 检查 dedup 但不插入 (新契约). 调用方在 push 成功后调 commit().
     pub fn reserve(&self, event: &SignalEvent, cooldown: Option<Duration>) -> ReserveOutcome {
-        let Some(window) = cooldown.filter(|w| !w.is_zero()) else {
+        let Some(_window) = cooldown.filter(|w| !w.is_zero()) else {
             return ReserveOutcome::Reserved;
         };
         let key = (
