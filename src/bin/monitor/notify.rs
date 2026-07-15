@@ -564,7 +564,17 @@ async fn push_governor_inner(text: &str, kind: PushKind, code: Option<&str>) -> 
         V14Gate::Approved(event) => event,
     };
     // v15.1 A3: 把 reserve/commit 拆分, 失败时 rollback 不占 cooldown 窗口
-    let delivered = push_wechat(text).await;
+    // v17.1-r2 §3.6: env opt-in 走 L6 SinkRouter (env=STOCK_ANALYSIS_PUSH_V6_ENABLE=1).
+    // 默认仍走 push_wechat (L5 → L6 真路径尚未启用, l6_sink.rs 已注册 ConsoleSink + MagiclawSink 等待).
+    let delivered = if std::env::var("STOCK_ANALYSIS_PUSH_V6_ENABLE").ok().as_deref() == Some("1") {
+        let msg = crate::l6_sink::build_push_message(&event, text, kind);
+        matches!(
+            crate::l6_sink::sink_router().route(&msg).await,
+            stock_analysis::push_l6::SinkResult::Ok
+        )
+    } else {
+        push_wechat(text).await
+    };
     if delivered {
         v14_adapter::commit_dedup_for_event(&event, kind);
     } else {

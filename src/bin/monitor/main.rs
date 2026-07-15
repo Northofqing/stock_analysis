@@ -92,7 +92,7 @@ mod market_data;
 
 mod v14_adapter;
 
-
+mod l6_sink;
 
 // 修复 Top10#3+#4 (2026-06-29 audit): 拆大文件
 
@@ -1814,6 +1814,23 @@ async fn main() {
 
     // v16.3 Commit 1: 启动 banner 打印 v16.3 paper_trade 默认值 (v15.1.1 硬规则 1)
     stock_analysis::trading::risk_adapter::print_startup_banner();
+
+    // v17.1-r2 §3.6: L6 SinkRouter 暖身 (默认行为不变, 仅注册 ConsoleSink + MagiclawSink)
+    // env opt-in 触发: STOCK_ANALYSIS_PUSH_V6_ENABLE=1 后 notify::push_governor_inner 才走 L6.route().
+    let _sink_count = l6_sink::sink_count();
+    let push_v6_enabled = std::env::var("STOCK_ANALYSIS_PUSH_V6_ENABLE")
+        .ok()
+        .as_deref()
+        == Some("1");
+    log::info!(
+        "[v17.1-r2 §3.6] L6 SinkRouter 已就绪 ({} sinks); 推送路径 = {}",
+        _sink_count,
+        if push_v6_enabled {
+            "L6 SinkRouter (env opt-in 启用)"
+        } else {
+            "默认 push_wechat (L5 未切到 L6, 回滚 env: STOCK_ANALYSIS_PUSH_V6_ENABLE=1 才走 L6)"
+        }
+    );
 
     log::info!(
 
