@@ -29,7 +29,7 @@ use std::time::Duration;
 use chrono::{Local, Timelike};
 use stock_analysis::push_l1::{Severity, SignalEvent, SignalPayload, SignalSource};
 use stock_analysis::push_l2::{DataMode, RenderedText, TemplateMetadata};
-use stock_analysis::push_l4::{DispatchOutcome, Dispatcher, ReserveOutcome};
+use stock_analysis::push_l4::{Dispatcher, ReserveOutcome};
 use stock_analysis::push_l5::{GovernanceContext, GovernanceDecision, GovernanceEngine};
 use stock_analysis::push_l7::{build_analytics, AnalyticsStore, SqliteStore};
 
@@ -230,6 +230,33 @@ pub fn _reset_dedup_for_test() {
     }
 }
 
+/// 测试辅助: 模拟 push 成功后调 dispatcher.commit() 插入 dedup entry.
+/// v15.1 A3 后 reserve() 不占位, 必须 commit() 才会让后续 reserve 看到 Deduped.
+#[cfg(test)]
+pub fn _commit_dedup_for_test(kind: PushKind, code: Option<&str>) {
+    let stack = v14_stack();
+    let (source, kind_str, severity) = map_push_kind(kind);
+    let event = SignalEvent::new(
+        source,
+        kind_str,
+        code.map(str::to_string),
+        Local::now(),
+        SignalPayload::HoldingHealth(Default::default()),
+        severity,
+    );
+    let cooldown = match kind.cooldown_scope() {
+        CooldownScope::External => None,
+        CooldownScope::PerTicket if code.is_none() => None,
+        _ => kind
+            .cooldown_secs()
+            .map(|s| Duration::from_secs(u64::from(s))),
+    };
+    match stack.dispatcher.write() {
+        Ok(g) => g.commit(&event, cooldown),
+        Err(poisoned) => poisoned.into_inner().commit(&event, cooldown),
+    }
+}
+
 /// PushKind → SignalSource/kind_str/severity 映射
 fn map_push_kind(kind: PushKind) -> (SignalSource, &'static str, Severity) {
     use SignalSource::*;
@@ -408,6 +435,8 @@ mod tests {
         // FactorIC: Global 3600s. 静默期 (02:00-06:00) 会 Denied, 其余时段走 dedup 断言
         let first = v14_gate(PushKind::FactorIC, None);
         if matches!(first, V14Gate::Approved(_)) {
+            // v15.1 A3: reserve 不占位, 模拟 push 成功后 commit, 第二次 reserve 才返 Deduped
+            _commit_dedup_for_test(PushKind::FactorIC, None);
             let second = v14_gate(PushKind::FactorIC, None);
             assert!(matches!(second, V14Gate::Deduped), "second: {:?}", second);
         } else {
@@ -435,6 +464,8 @@ mod tests {
         _reset_dedup_for_test();
         let a1 = v14_gate(PushKind::HoldingPlan, Some("000001"));
         if matches!(a1, V14Gate::Approved(_)) {
+            // v15.1 A3: 模拟 push 成功后 commit
+            _commit_dedup_for_test(PushKind::HoldingPlan, Some("000001"));
             assert!(matches!(
                 v14_gate(PushKind::HoldingPlan, Some("000001")),
                 V14Gate::Deduped
