@@ -332,7 +332,10 @@ fn default_profile_for_kind(kind: PushKind) -> TemplateMetadata {
         category,
         // 🚨紧急类 (风控/持仓事件) 不受静默期抑制, 其余尊重 02:00-06:00 静默
         quiet_hours_respect: !kind.level().is_emergency(),
-        frozen_mode_respect: true,
+        // v17.1 治本: frozen_mode_respect 改为 false (L5 governance 不再 Deny Frozen)
+        // Frozen 状态保留在 ctx.is_frozen, 模板自行渲染 ⚠️ 警告
+        // 4 铁律: 通知层保持出声, 仓位风险控制在 broker 下单层
+        frozen_mode_respect: false,
         data_mode_min: DataMode::Degraded,
         // b011: 不再硬编码 60, 与 §14.3 治理表一致 (0 = 无冷却)
         cooldown_secs: kind.cooldown_secs().map(u64::from).unwrap_or(0),

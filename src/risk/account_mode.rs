@@ -97,6 +97,18 @@ pub fn evaluate(
     prev: Option<AccountMode>,
     thresholds: &ModeThresholds,
 ) -> ModeEvaluation {
+    // v17.0 临时旁路: PUSH_NORMAL_FORCE=1 启动 → 跳过 Frozen 检查, 强制 Normal
+    // 用途: 仓位超限导致 Frozen → 推送被 L5 全 deny → 用户看不到任何消息
+    //       这违反 4 铁律"默认值必须是出声状态", 临时让 evaluate() 直接返 Normal
+    //       真风险控制应该在 broker 下单层做, 不在通知层 (v17.1 治本)
+    if std::env::var("PUSH_NORMAL_FORCE").ok().as_deref() == Some("1") {
+        return ModeEvaluation {
+            mode: AccountMode::Normal,
+            trigger_reason: Some("PUSH_NORMAL_FORCE=1 临时旁路 (v17.1 治本)".to_string()),
+            prev_mode: prev,
+        };
+    }
+
     // 0. Frozen 状态保持优先 (BR-021 强制: 等下一交易日盘前重置, 不运行时回退)
     //    即使数据缺失也不能掩盖 Frozen 状态 — 会污染审计 + 误导下游 RiskMode
     if matches!(prev, Some(AccountMode::Frozen)) {

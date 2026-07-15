@@ -97,8 +97,14 @@ impl GovernanceEngine {
         }
 
         // Step 2: 冻结模式
+        // v17.1 治本: Frozen 状态不再 Deny, 模板从 ctx.is_frozen 读后渲染 ⚠️ 警告
+        // 仓位风险控制应在 broker 下单层, 通知层应保持出声 (4 铁律)
+        // 字段保留用于日志/审计
         if profile.frozen_mode_respect && ctx.is_frozen {
-            return GovernanceDecision::Deny("frozen".to_string());
+            log::warn!(
+                "[v17.1] Frozen 上下文 + frozen_mode_respect=true → 放行, 模板应渲染 ⚠️ 警告"
+            );
+            // 故意 fall through, 不 return Deny
         }
 
         // Step 3: 数据质量 (b-008 §4.1: data_source_down 主动告警可豁免)
@@ -229,6 +235,10 @@ mod tests {
 
     #[test]
     fn deny_in_frozen_mode_when_respect_enabled() {
+        // v17.1 治本: Frozen 状态不再 Deny, 而是由模板在 banner 渲染 ⚠️ 警告
+        // 旧行为: assert_eq!(...Deny("frozen"...))  - 违反 4 铁律"默认值出声"
+        // 新行为: Approve (放行), ctx.is_frozen 保留给模板做警告
+        // 仓位风险控制应在 broker 下单层, 不在通知层 (v17.1 决策)
         let engine = GovernanceEngine::new();
         let profile = make_profile(true, true, DataMode::Full, false);
         let event = make_event(SignalSource::LimitUp);
@@ -236,7 +246,10 @@ mod tests {
             is_frozen: true,
             ..Default::default()
         };
-        assert_eq!(engine.check(&profile, &event, &ctx), GovernanceDecision::Deny("frozen".to_string()));
+        assert!(
+            engine.check(&profile, &event, &ctx).is_approve(),
+            "v17.1: Frozen 状态必须放行 (banner 警告), 不能 Deny"
+        );
     }
 
     #[test]
