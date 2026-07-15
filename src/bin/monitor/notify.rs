@@ -552,6 +552,227 @@ impl DailyReportSubKind {
     }
 }
 
+impl PushKind {
+    /// v17.x DispatchTable: 查表拿元数据 (audit 用, 后续 spec 治理阶段统一迁).
+    /// 不在表内 → None (现有 5 个 match 块仍兜底).
+    pub fn dispatch_row(self) -> Option<DispatchRow> {
+        DISPATCH_TABLE
+            .iter()
+            .find(|(k, _)| *k == self)
+            .map(|(_, row)| *row)
+    }
+}
+
+/// v17.x DispatchTable: 15 audit-marked PushKind 的元数据集中表.
+///
+/// 整合:
+/// - v17.6 §2.2: 3 个 low-priority variants (FactorIC / SectorTier / CapitalVerify)
+/// - v17.7 + v17.8: 12 个 active spec targets
+///   (Announcement, PolicyHit, EarningsBeat, EarningsMiss, AnalystUpgrade,
+///    MarketActionAlert, PostFixedPriceOrder, PostFixedPriceFill,
+///    StPriceLimitChanged, EtfClosingCallAuction, BlockTradeIntradayConfirm,
+///    BlockTradePriceRange)
+///
+/// 设计 (Path D 一致): 不替换现有 `PushKind::level/cooldown_secs/cooldown_scope/
+/// label/stable_template_id` 5 个 match 块 — 仅作 audit 跟踪 + 后续 spec 治理
+/// 的 single source of truth. 调用方仍走原方法, 改动最小.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct DispatchRow {
+    /// 等级 (Emergency / Important / Info)
+    pub level: PushLevel,
+    /// 冷却秒数 (None = 无冷却)
+    pub cooldown_secs: Option<u32>,
+    /// L4 dedup 键语义
+    pub cooldown_scope: CooldownScope,
+    /// log + UI 简短标签
+    pub label: &'static str,
+    /// 稳定 template_id (snake_case + _v1)
+    pub stable_template_id: &'static str,
+}
+
+/// v17.x 集中 Dispatch 表 — 15 audit-marked variants 的元数据.
+///
+/// 顺序: 先 v17.6 (3 个 low-priority), 再 v17.7 (6 active), 最后 v17.8 (6 active).
+/// 总数 = 3 + 6 + 6 = 15 (跟 spec 字面一致).
+///
+/// 字段值跟现有 match 块当前实现保持一致 — 本表是"快照", 后续如要修改某 variant
+/// 的 level/cooldown, 必须**同步**改 match 块 (留待 spec 治理阶段统一迁).
+pub const DISPATCH_TABLE: &[(PushKind, DispatchRow)] = &[
+    // ============== v17.6 §2.2: 3 low-priority (现 DailyReportSubKind 收纳) ==============
+    (
+        PushKind::FactorIC,
+        DispatchRow {
+            level: PushLevel::Info,
+            cooldown_secs: Some(3600),
+            cooldown_scope: CooldownScope::Global,
+            label: "因子IC",
+            stable_template_id: "factoric_v1",
+        },
+    ),
+    (
+        PushKind::SectorTier,
+        DispatchRow {
+            level: PushLevel::Info,
+            cooldown_secs: Some(1800),
+            cooldown_scope: CooldownScope::Global,
+            label: "赛道分档",
+            stable_template_id: "sectortier_v1",
+        },
+    ),
+    (
+        PushKind::CapitalVerify,
+        DispatchRow {
+            level: PushLevel::Info,
+            cooldown_secs: Some(1800),
+            cooldown_scope: CooldownScope::Global,
+            label: "资金验证",
+            stable_template_id: "capitalverify_v1",
+        },
+    ),
+    // ============== v17.7: 6 active (Announcement + 政策 + 业绩 + 评级 + 实盘异常) ==============
+    (
+        PushKind::Announcement,
+        DispatchRow {
+            level: PushLevel::Important,
+            cooldown_secs: Some(1800), // 默认 30min, 由 sm 状态机治理实际节流
+            cooldown_scope: CooldownScope::External,
+            label: "公告",
+            stable_template_id: "announcement_v1",
+        },
+    ),
+    (
+        PushKind::PolicyHit,
+        DispatchRow {
+            level: PushLevel::Important,
+            cooldown_secs: Some(86_400),
+            cooldown_scope: CooldownScope::Global,
+            label: "政策催化",
+            stable_template_id: "policyhit_v1",
+        },
+    ),
+    (
+        PushKind::EarningsBeat,
+        DispatchRow {
+            level: PushLevel::Important,
+            cooldown_secs: Some(43_200),
+            cooldown_scope: CooldownScope::Global,
+            label: "业绩超预期",
+            stable_template_id: "earningsbeat_v1",
+        },
+    ),
+    (
+        PushKind::EarningsMiss,
+        DispatchRow {
+            level: PushLevel::Important,
+            cooldown_secs: Some(43_200),
+            cooldown_scope: CooldownScope::Global,
+            label: "业绩低于预期",
+            stable_template_id: "earningsmiss_v1",
+        },
+    ),
+    (
+        PushKind::AnalystUpgrade,
+        DispatchRow {
+            level: PushLevel::Important,
+            cooldown_secs: Some(86_400),
+            cooldown_scope: CooldownScope::Global,
+            label: "卖方评级上调",
+            stable_template_id: "analystupgrade_v1",
+        },
+    ),
+    (
+        PushKind::MarketActionAlert,
+        DispatchRow {
+            level: PushLevel::Emergency,
+            cooldown_secs: Some(60),
+            cooldown_scope: CooldownScope::Global,
+            label: "实盘异常",
+            stable_template_id: "marketactionalert_v1",
+        },
+    ),
+    // ============== v17.8: 6 active (盘后固定价 + ST + ETF + 大宗) ==============
+    (
+        PushKind::PostFixedPriceOrder,
+        DispatchRow {
+            level: PushLevel::Important,
+            cooldown_secs: Some(60),
+            cooldown_scope: CooldownScope::PerTicket,
+            label: "盘后固定价格申报",
+            stable_template_id: "postfixedpriceorder_v1",
+        },
+    ),
+    (
+        PushKind::PostFixedPriceFill,
+        DispatchRow {
+            level: PushLevel::Important,
+            cooldown_secs: Some(300),
+            cooldown_scope: CooldownScope::PerTicket,
+            label: "盘后固定价格成交",
+            stable_template_id: "postfixedpricefill_v1",
+        },
+    ),
+    (
+        PushKind::StPriceLimitChanged,
+        DispatchRow {
+            level: PushLevel::Important,
+            cooldown_secs: Some(86_400),
+            cooldown_scope: CooldownScope::PerTicket,
+            label: "ST 涨跌幅变更",
+            stable_template_id: "stpricelimitchanged_v1",
+        },
+    ),
+    (
+        PushKind::EtfClosingCallAuction,
+        DispatchRow {
+            level: PushLevel::Important,
+            cooldown_secs: Some(86_400),
+            cooldown_scope: CooldownScope::Global,
+            label: "ETF 集合竞价尾盘",
+            stable_template_id: "etfclosingcallauction_v1",
+        },
+    ),
+    (
+        PushKind::BlockTradeIntradayConfirm,
+        DispatchRow {
+            level: PushLevel::Important,
+            cooldown_secs: Some(300),
+            cooldown_scope: CooldownScope::PerTicket,
+            label: "大宗盘中确认",
+            stable_template_id: "blocktradeintradayconfirm_v1",
+        },
+    ),
+    (
+        PushKind::BlockTradePriceRange,
+        DispatchRow {
+            level: PushLevel::Important,
+            cooldown_secs: Some(3600),
+            cooldown_scope: CooldownScope::PerTicket,
+            label: "北交所大宗价格区间",
+            stable_template_id: "blocktradepricerange_v1",
+        },
+    ),
+];
+
+/// 启动时 audit — 打印 15 行 Dispatch 表 (默认出声, v15.x 4 铁律).
+pub fn dispatch_table_init_audit() {
+    log::info!(
+        "[v17.x] DISPATCH_TABLE init: {} rows (v17.6=3 + v17.7=6 + v17.8=6)",
+        DISPATCH_TABLE.len()
+    );
+    for (i, (kind, row)) in DISPATCH_TABLE.iter().enumerate() {
+        log::info!(
+            "[v17.x] DISPATCH_TABLE[{}] {:?} level={:?} cd={:?}s scope={:?} label={:?} tid={:?}",
+            i,
+            kind,
+            row.level,
+            row.cooldown_secs,
+            row.cooldown_scope,
+            row.label,
+            row.stable_template_id
+        );
+    }
+}
+
 /// b011 P0-2: L4 dedup 键语义 (与 PushKind::cooldown_secs 配套)
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum CooldownScope {
@@ -2286,6 +2507,121 @@ mod tests {
             assert!(
                 k.daily_report_sub_kind().is_none(),
                 "{:?} 不应是 DailyReport sub_kind",
+                k
+            );
+        }
+    }
+
+    // ============== v17.x: DISPATCH_TABLE 15 rows 完整性 ==============
+
+    #[test]
+    fn dispatch_table_size_is_fifteen() {
+        assert_eq!(
+            DISPATCH_TABLE.len(),
+            15,
+            "v17.x DISPATCH_TABLE 应 15 rows (3 v17.6 + 6 v17.7 + 6 v17.8)"
+        );
+    }
+
+    #[test]
+    fn dispatch_table_all_unique_kinds() {
+        let mut kinds: Vec<PushKind> = DISPATCH_TABLE.iter().map(|(k, _)| *k).collect();
+        let total = kinds.len();
+        kinds.sort_by_key(|k| format!("{:?}", k));
+        kinds.dedup();
+        assert_eq!(kinds.len(), total, "DISPATCH_TABLE kinds 必须唯一");
+    }
+
+    #[test]
+    fn dispatch_table_covers_all_audit_marked() {
+        // v17.6 low-priority 3 + v17.7 6 + v17.8 6 = 15
+        let expected: Vec<PushKind> = vec![
+            PushKind::FactorIC,
+            PushKind::SectorTier,
+            PushKind::CapitalVerify,
+            PushKind::Announcement,
+            PushKind::PolicyHit,
+            PushKind::EarningsBeat,
+            PushKind::EarningsMiss,
+            PushKind::AnalystUpgrade,
+            PushKind::MarketActionAlert,
+            PushKind::PostFixedPriceOrder,
+            PushKind::PostFixedPriceFill,
+            PushKind::StPriceLimitChanged,
+            PushKind::EtfClosingCallAuction,
+            PushKind::BlockTradeIntradayConfirm,
+            PushKind::BlockTradePriceRange,
+        ];
+        assert_eq!(expected.len(), 15);
+        for k in expected {
+            assert!(
+                k.dispatch_row().is_some(),
+                "{:?} 应在 DISPATCH_TABLE 内",
+                k
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_table_row_matches_existing_match_methods() {
+        // spot-check: 表内值跟现有 match 块一致 (audit 验证)
+        let factoric = PushKind::FactorIC.dispatch_row().unwrap();
+        assert_eq!(factoric.level, PushKind::FactorIC.level());
+        assert_eq!(factoric.cooldown_secs, PushKind::FactorIC.cooldown_secs());
+        assert_eq!(factoric.cooldown_scope, PushKind::FactorIC.cooldown_scope());
+        assert_eq!(factoric.label, PushKind::FactorIC.label());
+
+        let announcement = PushKind::Announcement.dispatch_row().unwrap();
+        assert_eq!(announcement.level, PushKind::Announcement.level());
+        assert_eq!(
+            announcement.cooldown_secs,
+            PushKind::Announcement.cooldown_secs()
+        );
+        assert_eq!(
+            announcement.cooldown_scope,
+            PushKind::Announcement.cooldown_scope()
+        );
+        assert_eq!(announcement.label, PushKind::Announcement.label());
+
+        let market_alert = PushKind::MarketActionAlert.dispatch_row().unwrap();
+        assert_eq!(market_alert.level, PushLevel::Emergency);
+        assert_eq!(market_alert.cooldown_secs, Some(60));
+    }
+
+    #[test]
+    fn dispatch_table_label_no_collision() {
+        let labels: Vec<&str> = DISPATCH_TABLE.iter().map(|(_, r)| r.label).collect();
+        let mut sorted = labels.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), labels.len(), "DISPATCH_TABLE label 应唯一");
+    }
+
+    #[test]
+    fn dispatch_table_stable_id_format_v1_suffix() {
+        for (kind, row) in DISPATCH_TABLE.iter() {
+            assert!(
+                row.stable_template_id.ends_with("_v1"),
+                "{:?} stable_template_id {:?} 应以 _v1 结尾",
+                kind,
+                row.stable_template_id
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_table_non_audit_kind_returns_none() {
+        // 现有 5 个 match 块覆盖的 kind (不在 v17.x audit 列表内) 应返回 None
+        for k in [
+            PushKind::DailyReport,
+            PushKind::HoldingEvent,
+            PushKind::AuctionVolume,
+            PushKind::HoldingPlan,
+            PushKind::AccountMode,
+        ] {
+            assert!(
+                k.dispatch_row().is_none(),
+                "{:?} 不在 DISPATCH_TABLE 内 (走原 match 块)",
                 k
             );
         }

@@ -1847,6 +1847,9 @@ async fn main() {
     // v17.6 §5.1: daily_report_router 启动 audit (3 sub_kinds + legacy 映射表)
     daily_report_router::init_audit();
 
+    // v17.x: DispatchTable 启动 audit (15 audit-marked rows: v17.6=3 + v17.7=6 + v17.8=6)
+    notify::dispatch_table_init_audit();
+
     log::info!(
 
         "🚀 Stock Monitor 启动 | LaunchStage = {} | 推送策略 = {}",
