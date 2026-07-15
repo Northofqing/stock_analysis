@@ -131,7 +131,7 @@ async fn main() {
     let mut deduped = 0;
     let win = Some(std::time::Duration::from_secs(60));
     for e in &events {
-        match dispatcher.dispatch(e, win) {
+        match dispatcher.dispatch(e, win, None) {
             DispatchOutcome::Pushed => dispatched += 1,
             DispatchOutcome::Deduped(_) => deduped += 1,
         }
@@ -141,7 +141,7 @@ async fn main() {
 
     println!("  重发前 3 个 (应 dedup):");
     for e in events.iter().take(3) {
-        match dispatcher.dispatch(e, win) {
+        match dispatcher.dispatch(e, win, None) {
             DispatchOutcome::Deduped(detail) => println!("    [dedup] {}", detail),
             _ => println!("    [unexpected_pushed]"),
         }

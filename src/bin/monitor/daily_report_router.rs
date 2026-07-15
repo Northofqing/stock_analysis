@@ -22,7 +22,7 @@
 //! 改回旧路径: 把 `route_*` 调用换回 `notify::push_governor(&text, PushKind::FactorIC)` 等.
 //! `PushKind` 三个 variants 仍存在, 不破坏 type system.
 
-use crate::notify::{push_governor_v3, DailyReportSubKind, PushKind, PushOutcome};
+use crate::notify::{push_governor_v3_with_sub_kind, DailyReportSubKind, PushKind, PushOutcome};
 use chrono::Local;
 use stock_analysis::push_l4::dispatcher::sub_kind_dedup_key;
 
@@ -54,11 +54,12 @@ fn with_sub_kind_prefix(sub_kind: DailyReportSubKind, text: &str) -> String {
     format!("[{}] {}", sub_kind.label(), text)
 }
 
-/// 内部统一调度: 走 push_governor_v3(PushKind::DailyReport) + sub_kind prefix + audit log.
+/// 内部统一调度: 走 push_governor_v3_with_sub_kind (PushKind::DailyReport + sub_kind)
+/// + sub_kind prefix + audit log.
 async fn route(sub_kind: DailyReportSubKind, text: &str) -> PushOutcome {
     let prefixed = with_sub_kind_prefix(sub_kind, text);
-    // v17.6 §5.1: 计算 sub_kind-aware dedup key (audit-only — 当前 dispatcher 走的是
-    // (kind, code) 旧键, 此 key 留在日志供后续 L4 hash 接入时直接接上).
+    // v17.6 §5.1: 计算 sub_kind-aware dedup key (audit 字符串表示; 实际 dedup 由
+    // Dispatcher 第三元组 sub_kind 在 reserve/commit 时生效).
     let today = Local::now().format("%Y-%m-%d").to_string();
     let dedup_key = sub_kind_dedup_key("daily_report", Some(sub_kind.label()), &today);
     log::info!(
@@ -67,7 +68,7 @@ async fn route(sub_kind: DailyReportSubKind, text: &str) -> PushOutcome {
         prefixed.chars().count(),
         dedup_key
     );
-    push_governor_v3(&prefixed, PushKind::DailyReport, None).await
+    push_governor_v3_with_sub_kind(&prefixed, PushKind::DailyReport, None, Some(sub_kind)).await
 }
 
 /// 公开: FactorIC (因子 IC 排行) → DailyReport 主路径 + [FactorIC] prefix

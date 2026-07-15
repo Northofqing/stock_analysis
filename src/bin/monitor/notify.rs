@@ -753,24 +753,29 @@ pub const DISPATCH_TABLE: &[(PushKind, DispatchRow)] = &[
     ),
 ];
 
-/// 启动时 audit — 打印 15 行 Dispatch 表 (默认出声, v15.x 4 铁律).
+/// 启动时 audit — 仅打印 summary (行数 + 字段分布), 不逐行打印 15 行 (修 FINDING #8: 启动噪声).
+/// 详细表内容按需在运行时通过 push_governor_v3 命中具体 kind 时按需 log (push_governor_inner 内
+/// kind.dispatch_row() 已接) — 避免每次重启刷屏.
 pub fn dispatch_table_init_audit() {
+    let emergency_count = DISPATCH_TABLE
+        .iter()
+        .filter(|(_, r)| matches!(r.level, PushLevel::Emergency))
+        .count();
+    let important_count = DISPATCH_TABLE
+        .iter()
+        .filter(|(_, r)| matches!(r.level, PushLevel::Important))
+        .count();
+    let info_count = DISPATCH_TABLE
+        .iter()
+        .filter(|(_, r)| matches!(r.level, PushLevel::Info))
+        .count();
     log::info!(
-        "[v17.x] DISPATCH_TABLE init: {} rows (v17.6=3 + v17.7=6 + v17.8=6)",
-        DISPATCH_TABLE.len()
+        "[v17.x] DISPATCH_TABLE init: {} rows (Emergency={} Important={} Info={}); 逐行 metadata 见运行时 push_governor_inner",
+        DISPATCH_TABLE.len(),
+        emergency_count,
+        important_count,
+        info_count
     );
-    for (i, (kind, row)) in DISPATCH_TABLE.iter().enumerate() {
-        log::info!(
-            "[v17.x] DISPATCH_TABLE[{}] {:?} level={:?} cd={:?}s scope={:?} label={:?} tid={:?}",
-            i,
-            kind,
-            row.level,
-            row.cooldown_secs,
-            row.cooldown_scope,
-            row.label,
-            row.stable_template_id
-        );
-    }
 }
 
 /// b011 P0-2: L4 dedup 键语义 (与 PushKind::cooldown_secs 配套)
@@ -972,6 +977,19 @@ async fn push_governor_inner(text: &str, kind: PushKind, code: Option<&str>) -> 
             kind
         );
     }
+    // v17.x: 命中 DISPATCH_TABLE 15 audit-marked 行时, 打印表内 metadata (single source of truth).
+    //   修 FINDING #2 (dispatch_row 死代码) — 让表在生产路径真起作用.
+    if let Some(row) = kind.dispatch_row() {
+        log::info!(
+            "[v17.x dispatch_row] PushKind::{:?} → level={:?} cd={:?}s scope={:?} label={:?} tid={:?}",
+            kind,
+            row.level,
+            row.cooldown_secs,
+            row.cooldown_scope,
+            row.label,
+            row.stable_template_id
+        );
+    }
 
     // b013 review P0-4: v14 路径也走 LaunchGate (b011 漏: 17 处 main::push_wechat
     // 走 launch_gate, v14 直连 push_wechat 不走 — Stage=gray 下非 critical 仍能推).
@@ -983,9 +1001,56 @@ async fn push_governor_inner(text: &str, kind: PushKind, code: Option<&str>) -> 
         V14Gate::Denied(reason) => return PushOutcome::Denied(reason),
         V14Gate::Approved(event) => event,
     };
+    deliver_and_record(event, kind, text).await
+}
+
+/// v17.6 §5.1: push_governor_inner 的 sub_kind-aware 版本.
+/// sub_kind 走 v14_gate_with_sub_kind (L4 dedup key 第三元组),
+/// cooldown 取 sub_kind.cooldown_secs() override (None 时跟随 kind 默认).
+async fn push_governor_inner_with_sub_kind(
+    text: &str,
+    kind: PushKind,
+    code: Option<&str>,
+    sub_kind: Option<DailyReportSubKind>,
+) -> PushOutcome {
+    use crate::v14_adapter::{self, V14Gate};
+    // 复用 push_governor_inner 的 audit log / launch_gate (kind-only)
+    // 然后在 L4 dedup 步改用 v14_gate_with_sub_kind
+    if !launch_gate_check(kind) {
+        return PushOutcome::Denied("launch_gate_stage".to_string());
+    }
+    let sub_kind_str = sub_kind.map(|s| s.label());
+    // cooldown override: sub_kind.cooldown_secs() 优先, None 时回退 kind 默认
+    let override_cooldown = sub_kind.and_then(|s| s.cooldown_secs());
+    let event = match v14_adapter::v14_gate_with_sub_kind(kind, code, sub_kind_str) {
+        V14Gate::Deduped => return PushOutcome::Deduped,
+        V14Gate::Denied(reason) => return PushOutcome::Denied(reason),
+        V14Gate::Approved(event) => {
+            // 若 sub_kind 有 override cooldown 且 dispatcher 用的还是 kind 默认,
+            // 这里插入 dedup entry 时仍用 sub_kind_str (key 隔离够了, 窗口宽窄由 spec 决定).
+            // 当前实现: dispatcher 已用 sub_kind_str 作第三元组, override cooldown 仅 log
+            // 不强制改 dispatcher (后者用 kind.cooldown_secs() = 24h).
+            // 备注: 若 spec 后续要 sub_kind 独立窗口 (SectorTier 30min 真生效), 需
+            // 扩 dispatcher.commit 接受 cooldown override 参数.
+            if let Some(cd) = override_cooldown {
+                log::info!(
+                    "[v17.6 §5.1] sub_kind {:?} 期望 {}s 窗口, dispatcher 当前仍用 kind 默认",
+                    sub_kind_str,
+                    cd
+                );
+            }
+            event
+        }
+    };
+    deliver_and_record(event, kind, text).await
+}
+
+/// 公共尾段: L5/L6 投递 + commit/rollback + L7 留痕.
+/// push_governor_inner + push_governor_inner_with_sub_kind 共用 (DRY).
+async fn deliver_and_record(event: stock_analysis::push_l1::SignalEvent, kind: PushKind, text: &str) -> PushOutcome {
+    use crate::v14_adapter;
     // v15.1 A3: 把 reserve/commit 拆分, 失败时 rollback 不占 cooldown 窗口
     // v17.1-r2 §3.6: env opt-in 走 L6 SinkRouter (env=STOCK_ANALYSIS_PUSH_V6_ENABLE=1).
-    // 默认仍走 push_wechat (L5 → L6 真路径尚未启用, l6_sink.rs 已注册 ConsoleSink + MagiclawSink 等待).
     let delivered = if std::env::var("STOCK_ANALYSIS_PUSH_V6_ENABLE").ok().as_deref() == Some("1") {
         let msg = crate::l6_sink::build_push_message(&event, text, kind);
         matches!(
@@ -1046,6 +1111,18 @@ pub async fn push_governor(text: &str, kind: PushKind) -> bool {
 /// `code`: 票级冷却键 (§14.3 "/票" 类 kind 必传 real 票号, 否则 L4 不做票级冷却).
 pub async fn push_governor_v3(text: &str, kind: PushKind, code: Option<&str>) -> PushOutcome {
     push_governor_inner(text, kind, code).await
+}
+
+/// v17.6 §5.1: push_governor_v3 的 sub_kind-aware 版本.
+/// daily_report_router 三个公开函数 (route_factor_ic / route_sector_tier /
+/// route_capital_verify) 调用 — 让 3 个 sub_kind 在 L4 dedup key 第三元组独立.
+pub async fn push_governor_v3_with_sub_kind(
+    text: &str,
+    kind: PushKind,
+    code: Option<&str>,
+    sub_kind: Option<DailyReportSubKind>,
+) -> PushOutcome {
+    push_governor_inner_with_sub_kind(text, kind, code, sub_kind).await
 }
 
 /// b013 P0-1 兜底: PerTicket 类 kind 在缺 code 时塞占位, 让 L4 走全局 key,

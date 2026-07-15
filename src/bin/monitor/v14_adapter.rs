@@ -91,7 +91,19 @@ pub enum V14Gate {
 /// 投递前闸门: L4 dedup + L5 governance (b011 P0-2)
 ///
 /// `code`: 票级冷却键; None 时 PerTicket 类 kind 的冷却归模板层 memo, L4 不拦.
+/// `sub_kind`: v17.6 §5.1 — DailyReport 子段 (FactorIC/SectorTier/CapitalVerify) 推送时
+/// 传入 Some("FactorIC") 让 dedup key 加上第三元组, 实现 per-sub_kind 隔离.
+/// None 时 sub_kind="" (向后兼容, 不破坏现有 caller).
 pub fn v14_gate(kind: PushKind, code: Option<&str>) -> V14Gate {
+    v14_gate_with_sub_kind(kind, code, None)
+}
+
+/// v17.6 §5.1: v14_gate 的 sub_kind-aware 版本. daily_report_router 三个公开函数调用.
+pub fn v14_gate_with_sub_kind(
+    kind: PushKind,
+    code: Option<&str>,
+    sub_kind: Option<&str>,
+) -> V14Gate {
     let stack = v14_stack();
     let (source, kind_str, severity) = map_push_kind(kind);
     let event = SignalEvent::new(
@@ -124,6 +136,7 @@ pub fn v14_gate(kind: PushKind, code: Option<&str>) -> V14Gate {
     }
 
     // L4 dedup (v15.1 A3: 用 reserve() 只检查不插入, 投递成功后由 push_governor_inner 调 commit())
+    // v17.6 §5.1: sub_kind 参与 dedup key (per-sub_kind 独立窗口)
     let cooldown = match kind.cooldown_scope() {
         CooldownScope::External => None,
         CooldownScope::PerTicket if code.is_none() => None,
@@ -131,9 +144,9 @@ pub fn v14_gate(kind: PushKind, code: Option<&str>) -> V14Gate {
             .cooldown_secs()
             .map(|s| Duration::from_secs(u64::from(s))),
     };
-    let outcome = lock_dispatcher(&stack).reserve(&event, cooldown);
+    let outcome = lock_dispatcher(&stack).reserve(&event, cooldown, sub_kind);
     if let ReserveOutcome::Deduped = outcome {
-        log::info!("[v14.2] L4 dedup: PushKind={:?} (reserved-only, no insert yet)", kind);
+        log::info!("[v14.2] L4 dedup: PushKind={:?} sub_kind={:?} (reserved-only, no insert yet)", kind, sub_kind);
         // b013 P1-11: dedup 留痕
         let analytics = build_analytics(
             &event, kind_str, 1, ctx.data_mode, GovernanceDecision::Approve, None, false,
@@ -163,14 +176,14 @@ fn lock_dispatcher(stack: &'static V14Stack) -> std::sync::RwLockReadGuard<'stat
 pub fn commit_dedup_for_event(event: &SignalEvent, kind: PushKind) {
     let stack = v14_stack();
     let cooldown = kind.cooldown_secs().map(|s| Duration::from_secs(u64::from(s)));
-    lock_dispatcher(&stack).commit(event, cooldown);
+    lock_dispatcher(&stack).commit(event, cooldown, None);
 }
 
 /// v15.1 A3: push 失败后 rollback (no-op, reserve 不留痕, 保留 API 对称)
 pub fn rollback_dedup_for_event(event: &SignalEvent, kind: PushKind) {
     let stack = v14_stack();
     let cooldown = kind.cooldown_secs().map(|s| Duration::from_secs(u64::from(s)));
-    lock_dispatcher(&stack).rollback(event, cooldown);
+    lock_dispatcher(&stack).rollback(event, cooldown, None);
 }
 
 fn lock_store(
@@ -232,6 +245,7 @@ pub fn _reset_dedup_for_test() {
 
 /// 测试辅助: 模拟 push 成功后调 dispatcher.commit() 插入 dedup entry.
 /// v15.1 A3 后 reserve() 不占位, 必须 commit() 才会让后续 reserve 看到 Deduped.
+/// v17.6 §5.1: sub_kind 参与 dedup key, 测试场景默认 None.
 #[cfg(test)]
 pub fn _commit_dedup_for_test(kind: PushKind, code: Option<&str>) {
     let stack = v14_stack();
@@ -252,8 +266,8 @@ pub fn _commit_dedup_for_test(kind: PushKind, code: Option<&str>) {
             .map(|s| Duration::from_secs(u64::from(s))),
     };
     match stack.dispatcher.write() {
-        Ok(g) => g.commit(&event, cooldown),
-        Err(poisoned) => poisoned.into_inner().commit(&event, cooldown),
+        Ok(g) => g.commit(&event, cooldown, None),
+        Err(poisoned) => poisoned.into_inner().commit(&event, cooldown, None),
     }
 }
 

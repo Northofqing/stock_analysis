@@ -23,16 +23,12 @@ use crate::push_l1::SignalEvent;
 /// dedup 表容量阈值: 超过则先清理过期项 (防常驻进程无界增长)
 const DEDUP_TABLE_SOFT_CAP: usize = 4096;
 
-/// v17.6 §5.1: DailyReport sub_kind 标识符 — 拼到 dedup key 实现 per-sub_kind 隔离.
+/// v17.6 §5.1: 拼出 (kind, code, sub_kind) dedup 三元组的字符串表示, 给
+/// dispatch_row / 启动 audit log 看. 实际 dedup key 由 Dispatcher::reserve/commit
+/// 内部用 `(String, String, String)` 三元组, 本函数仅做字符串格式化输出.
 ///
 /// 用法: `sub_kind_dedup_key("daily_report", Some("FactorIC"), "2026-07-16")` →
 ///   `"daily_report|sub_kind=FactorIC|date=2026-07-16"`.
-///
-/// 设计 (Path D 一致): 不改现有 `(kind, code)` 键空间, 仅在调用方传入 sub_kind 时
-/// 把它加入键的 suffix. 调用方不传 sub_kind → 返回原 kind 字符串, 向后兼容.
-///
-/// 当前用在 daily_report_router 三个公开函数 (route_factor_ic / route_sector_tier /
-/// route_capital_verify) 让同一 DailyReport 主路径下 3 个 sub_kind 互不抢窗口.
 pub fn sub_kind_dedup_key(kind: &str, sub_kind: Option<&str>, date: &str) -> String {
     match sub_kind {
         Some(s) => format!("{}|sub_kind={}|date={}", kind, s, date),
@@ -42,8 +38,10 @@ pub fn sub_kind_dedup_key(kind: &str, sub_kind: Option<&str>, date: &str) -> Str
 
 /// Dispatcher — v14.2 L4 仲裁层 (单实例, 全局共享)
 pub struct Dispatcher {
-    /// dedup 表: (kind, code) → (上次放行时间, 该键冷却窗口)
-    dedup_table: DashMap<(String, String), (Instant, Duration)>,
+    /// dedup 表: (kind, code, sub_kind) → (上次放行时间, 该键冷却窗口).
+    /// sub_kind="" (空字符串) 表示无 sub_kind (向后兼容原 `(kind, code)` 键空间).
+    /// v17.6 §5.1 引入第三元组让 DailyReport 下 3 个 sub_kind 独立 dedup 窗口.
+    dedup_table: DashMap<(String, String, String), (Instant, Duration)>,
     /// 派发计数 (调试/analytics)
     pub stats: DispatcherStats,
 }
@@ -101,13 +99,23 @@ impl Dispatcher {
     }
 
     /// v15.1 A3: 检查 dedup 但不插入 (新契约). 调用方在 push 成功后调 commit().
-    pub fn reserve(&self, event: &SignalEvent, cooldown: Option<Duration>) -> ReserveOutcome {
+    ///
+    /// `sub_kind`: v17.6 §5.1 — 当 DailyReport 子段 (FactorIC/SectorTier/CapitalVerify)
+    /// 推送时传入 Some("FactorIC") 让 dedup key 加上第三元组, 实现 per-sub_kind 隔离.
+    /// None 时 sub_kind="" (向后兼容).
+    pub fn reserve(
+        &self,
+        event: &SignalEvent,
+        cooldown: Option<Duration>,
+        sub_kind: Option<&str>,
+    ) -> ReserveOutcome {
         let Some(_window) = cooldown.filter(|w| !w.is_zero()) else {
             return ReserveOutcome::Reserved;
         };
         let key = (
             event.kind.clone(),
             event.code.clone().unwrap_or_default(),
+            sub_kind.unwrap_or("").to_string(),
         );
         match self.dedup_table.get(&key) {
             Some(entry) => {
@@ -123,14 +131,21 @@ impl Dispatcher {
         }
     }
 
-    /// v15.1 A3: 实际插入 dedup entry (push 成功后调用)
-    pub fn commit(&self, event: &SignalEvent, cooldown: Option<Duration>) {
+    /// v15.1 A3: 实际插入 dedup entry (push 成功后调用).
+    /// sub_kind 语义同 reserve().
+    pub fn commit(
+        &self,
+        event: &SignalEvent,
+        cooldown: Option<Duration>,
+        sub_kind: Option<&str>,
+    ) {
         let Some(window) = cooldown.filter(|w| !w.is_zero()) else {
             return;
         };
         let key = (
             event.kind.clone(),
             event.code.clone().unwrap_or_default(),
+            sub_kind.unwrap_or("").to_string(),
         );
         let now = std::time::Instant::now();
         self.dedup_table.insert(key, (now, window));
@@ -142,11 +157,16 @@ impl Dispatcher {
 
     /// v15.1 A3: 失败回滚 — 因为 reserve() 不占位, 此函数为 no-op
     /// (保留 API 对称性, 让 push_governor_inner 显式调用)
-    pub fn rollback(&self, _event: &SignalEvent, _cooldown: Option<Duration>) {
+    pub fn rollback(
+        &self,
+        _event: &SignalEvent,
+        _cooldown: Option<Duration>,
+        _sub_kind: Option<&str>,
+    ) {
         // no-op: reserve 不留痕, 无需回滚
     }
 
-    /// dispatch 入口 — W4.2: 按 (kind, code) + 冷却窗口做速率限制
+    /// dispatch 入口 — W4.2: 按 (kind, code, sub_kind) + 冷却窗口做速率限制
     ///
     /// b013 P2-13: 改 &self (DashMap 内部 shard lock), v14_adapter 的外部
     /// Mutex<Dispatcher> 可放宽 → 推送热路径减少序列化.
@@ -157,7 +177,12 @@ impl Dispatcher {
     /// **v15.1 A3 DEPRECATED**: 用 reserve/commit 两阶段代替, 避免 delivery 失败
     /// 后 cooldown 仍占用窗口 (DailyReport 86400s 黑屏).
     #[deprecated(note = "v15.1 A3: use reserve() + commit() instead to allow rollback on delivery failure")]
-    pub fn dispatch(&self, event: &SignalEvent, cooldown: Option<Duration>) -> DispatchOutcome {
+    pub fn dispatch(
+        &self,
+        event: &SignalEvent,
+        cooldown: Option<Duration>,
+        sub_kind: Option<&str>,
+    ) -> DispatchOutcome {
         let Some(window) = cooldown.filter(|w| !w.is_zero()) else {
             self.stats.dispatched.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return DispatchOutcome::Pushed;
@@ -166,6 +191,7 @@ impl Dispatcher {
         let key = (
             event.kind.clone(),
             event.code.clone().unwrap_or_default(),
+            sub_kind.unwrap_or("").to_string(),
         );
         // b013 N-7 (P0): entry().or_insert() 让首次插入立即触发 elapsed=0 < window,
         // 导致首次调用被自己的冷却期拦截. 正确: 区分"刚插入"与"已存在".
@@ -257,7 +283,7 @@ mod tests {
     fn first_dispatch_succeeds() {
         let d = Dispatcher::new();
         let e = make_event("600519");
-        assert_eq!(d.dispatch(&e, WIN), DispatchOutcome::Pushed);
+        assert_eq!(d.dispatch(&e, WIN, None), DispatchOutcome::Pushed);
         assert_eq!(d.stats.dispatched.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert_eq!(d.stats.deduped.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
@@ -265,9 +291,9 @@ mod tests {
     #[test]
     fn same_kind_code_deduped_within_window() {
         let d = Dispatcher::new();
-        let _ = d.dispatch(&make_event("600519"), WIN);
+        let _ = d.dispatch(&make_event("600519"), WIN, None);
         // 同 (kind, code), 即使 event_id/时间不同也要被冷却挡住 (b011 P0-2)
-        let outcome = d.dispatch(&make_event("600519"), WIN);
+        let outcome = d.dispatch(&make_event("600519"), WIN, None);
         assert!(matches!(outcome, DispatchOutcome::Deduped(_)));
         assert_eq!(d.stats.dispatched.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert_eq!(d.stats.deduped.load(std::sync::atomic::Ordering::Relaxed), 1);
@@ -276,8 +302,8 @@ mod tests {
     #[test]
     fn different_codes_not_deduped() {
         let d = Dispatcher::new();
-        let _ = d.dispatch(&make_event("600519"), WIN);
-        assert_eq!(d.dispatch(&make_event("000001"), WIN), DispatchOutcome::Pushed);
+        let _ = d.dispatch(&make_event("600519"), WIN, None);
+        assert_eq!(d.dispatch(&make_event("000001"), WIN, None), DispatchOutcome::Pushed);
         assert_eq!(d.stats.dispatched.load(std::sync::atomic::Ordering::Relaxed), 2);
         assert_eq!(d.stats.deduped.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
@@ -285,8 +311,8 @@ mod tests {
     #[test]
     fn none_cooldown_never_dedups() {
         let d = Dispatcher::new();
-        assert_eq!(d.dispatch(&make_event("600519"), None), DispatchOutcome::Pushed);
-        assert_eq!(d.dispatch(&make_event("600519"), None), DispatchOutcome::Pushed);
+        assert_eq!(d.dispatch(&make_event("600519"), None, None), DispatchOutcome::Pushed);
+        assert_eq!(d.dispatch(&make_event("600519"), None, None), DispatchOutcome::Pushed);
         assert_eq!(d.stats.dispatched.load(std::sync::atomic::Ordering::Relaxed), 2);
         assert_eq!(d.dedup_size(), 0, "无冷却不登记 dedup 表");
     }
@@ -295,27 +321,27 @@ mod tests {
     fn zero_cooldown_treated_as_none() {
         let d = Dispatcher::new();
         let zero = Some(Duration::ZERO);
-        assert_eq!(d.dispatch(&make_event("600519"), zero), DispatchOutcome::Pushed);
-        assert_eq!(d.dispatch(&make_event("600519"), zero), DispatchOutcome::Pushed);
+        assert_eq!(d.dispatch(&make_event("600519"), zero, None), DispatchOutcome::Pushed);
+        assert_eq!(d.dispatch(&make_event("600519"), zero, None), DispatchOutcome::Pushed);
     }
 
     #[test]
     fn window_expiry_allows_re_dispatch() {
         let d = Dispatcher::new();
         let win = Some(Duration::from_millis(50));
-        let _ = d.dispatch(&make_event("600519"), win);
+        let _ = d.dispatch(&make_event("600519"), win, None);
         std::thread::sleep(Duration::from_millis(80));
-        assert_eq!(d.dispatch(&make_event("600519"), win), DispatchOutcome::Pushed);
+        assert_eq!(d.dispatch(&make_event("600519"), win, None), DispatchOutcome::Pushed);
     }
 
     #[test]
     fn clear_dedup_resets_table() {
         let d = Dispatcher::new();
-        let _ = d.dispatch(&make_event("600519"), WIN);
+        let _ = d.dispatch(&make_event("600519"), WIN, None);
         assert_eq!(d.dedup_size(), 1);
         d.clear_dedup();
         assert_eq!(d.dedup_size(), 0);
-        assert_eq!(d.dispatch(&make_event("600519"), WIN), DispatchOutcome::Pushed);
+        assert_eq!(d.dispatch(&make_event("600519"), WIN, None), DispatchOutcome::Pushed);
     }
 
     #[test]
@@ -330,7 +356,7 @@ mod tests {
             let handle = std::thread::spawn(move || {
                 let code = format!("60000{}", i);
                 let d = d.lock().unwrap();
-                let _ = d.dispatch(&make_event(&code), WIN);
+                let _ = d.dispatch(&make_event(&code), WIN, None);
             });
             handles.push(handle);
         }
@@ -351,7 +377,7 @@ mod tests {
         let d = Dispatcher::new();
         let e = make_event("600519");
         // reserve 不插入
-        assert_eq!(d.reserve(&e, WIN), ReserveOutcome::Reserved);
+        assert_eq!(d.reserve(&e, WIN, None), ReserveOutcome::Reserved);
         assert_eq!(d.dedup_size(), 0, "reserve() 不应插入");
     }
 
@@ -359,11 +385,11 @@ mod tests {
     fn reserve_second_call_within_window_deduped() {
         let d = Dispatcher::new();
         let e = make_event("600519");
-        let _ = d.reserve(&e, WIN);
+        let _ = d.reserve(&e, WIN, None);
         // reserve 没插, 再 reserve 还是 Reserved (这是 reserve 的特性)
         // 但 commit() 之后再 reserve 才 Deduped
-        d.commit(&e, WIN);
-        assert_eq!(d.reserve(&e, WIN), ReserveOutcome::Deduped);
+        d.commit(&e, WIN, None);
+        assert_eq!(d.reserve(&e, WIN, None), ReserveOutcome::Deduped);
     }
 
     #[test]
@@ -372,22 +398,22 @@ mod tests {
         let e = make_event("600519");
 
         // 1. reserve (不插入)
-        assert_eq!(d.reserve(&e, WIN), ReserveOutcome::Reserved);
+        assert_eq!(d.reserve(&e, WIN, None), ReserveOutcome::Reserved);
         assert_eq!(d.dedup_size(), 0);
 
         // 2. 模拟推送失败 → rollback (no-op, reserve 没占位)
-        d.rollback(&e, WIN);
+        d.rollback(&e, WIN, None);
         assert_eq!(d.dedup_size(), 0, "rollback 后仍应没有 dedup entry");
 
         // 3. 立即 retry 应该 Reserved (不 Deduped — 关键修复)
-        assert_eq!(d.reserve(&e, WIN), ReserveOutcome::Reserved);
+        assert_eq!(d.reserve(&e, WIN, None), ReserveOutcome::Reserved);
 
         // 4. 模拟推送成功 → commit (真正插入)
-        d.commit(&e, WIN);
+        d.commit(&e, WIN, None);
         assert_eq!(d.dedup_size(), 1);
 
         // 5. 第三次再 reserve 应该 Deduped (因为 commit 过了)
-        assert_eq!(d.reserve(&e, WIN), ReserveOutcome::Deduped);
+        assert_eq!(d.reserve(&e, WIN, None), ReserveOutcome::Deduped);
     }
 
     #[test]
@@ -397,13 +423,35 @@ mod tests {
         let win = Some(Duration::from_millis(50));
 
         // 第一次 commit, 立即 reserve 应该是 Deduped
-        d.commit(&e, win);
-        assert_eq!(d.reserve(&e, win), ReserveOutcome::Deduped);
+        d.commit(&e, win, None);
+        assert_eq!(d.reserve(&e, win, None), ReserveOutcome::Deduped);
 
         // 等窗口过期
         std::thread::sleep(Duration::from_millis(80));
 
         // 窗口过期后 reserve 应是 Reserved
-        assert_eq!(d.reserve(&e, win), ReserveOutcome::Reserved);
+        assert_eq!(d.reserve(&e, win, None), ReserveOutcome::Reserved);
+    }
+
+    // ============== v17.6 §5.1: 3 sub_kind dedup key 独立 (修 FINDING #1) ==============
+
+    #[test]
+    fn sub_kind_three_paths_dedup_independent() {
+        let d = Dispatcher::new();
+        let e1 = make_event("600519");
+        let e2 = make_event("600519");
+        let e3 = make_event("600519");
+        // 第一次 reserve: 都 Reserved (无 prior entry)
+        assert_eq!(d.reserve(&e1, WIN, Some("FactorIC")), ReserveOutcome::Reserved);
+        assert_eq!(d.reserve(&e2, WIN, Some("SectorTier")), ReserveOutcome::Reserved);
+        assert_eq!(d.reserve(&e3, WIN, Some("CapitalVerify")), ReserveOutcome::Reserved);
+        // commit 各自
+        d.commit(&e1, WIN, Some("FactorIC"));
+        d.commit(&e2, WIN, Some("SectorTier"));
+        d.commit(&e3, WIN, Some("CapitalVerify"));
+        // 第二次 reserve: 各自应被自己 sub_kind dedup (Deduped), 互不影响
+        assert_eq!(d.reserve(&e1, WIN, Some("FactorIC")), ReserveOutcome::Deduped);
+        assert_eq!(d.reserve(&e2, WIN, Some("SectorTier")), ReserveOutcome::Deduped);
+        assert_eq!(d.reserve(&e3, WIN, Some("CapitalVerify")), ReserveOutcome::Deduped);
     }
 }

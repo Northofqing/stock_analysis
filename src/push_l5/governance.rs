@@ -43,16 +43,37 @@ fn now_unix_secs() -> u64 {
 }
 
 /// 节流打 Frozen warn: 距上次 ≥ 60s 才打, 否则 silent.
+///
+/// 修 FINDING #5+#6 (review F8):
+/// - 修 race: 用 compare_exchange 循环保证多个并发线程只有 1 个能更新 timestamp
+///   (原 load-then-store 允许多个线程都看到 stale last_ts 后都打 warn).
+/// - 修 clock skew: 时钟回退时 saturating_sub 返 0 → 持续静默; 改用 max(now, last)
+///   保证 timestamp 单调不减, 时钟回退后下次 warn 仍能 fire (但保持 60s 间隔).
 fn throttled_frozen_warn() {
     let now = now_unix_secs();
-    let last = LAST_FROZEN_WARN_TS.load(Ordering::Relaxed);
-    if now.saturating_sub(last) < FROZEN_WARN_THROTTLE_SECS {
-        return;
+    loop {
+        let last = LAST_FROZEN_WARN_TS.load(Ordering::Relaxed);
+        // monotonic timestamp: max(now, last) 保证不回退
+        let new_ts = now.max(last);
+        if new_ts.saturating_sub(last) < FROZEN_WARN_THROTTLE_SECS {
+            return;
+        }
+        // compare_exchange: 仅当 last 仍是当前值才更新, 否则重试
+        match LAST_FROZEN_WARN_TS.compare_exchange(
+            last,
+            new_ts,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => {
+                log::warn!(
+                    "[v17.1-F8] Frozen 上下文 + frozen_mode_respect=true → 放行, 模板应渲染 ⚠️ 警告 (节流 60s/次)"
+                );
+                return;
+            }
+            Err(_) => continue, // 其他线程抢先更新, 重读
+        }
     }
-    LAST_FROZEN_WARN_TS.store(now, Ordering::Relaxed);
-    log::warn!(
-        "[v17.1-F8] Frozen 上下文 + frozen_mode_respect=true → 放行, 模板应渲染 ⚠️ 警告 (节流 60s/次)"
-    );
 }
 
 /// 测试用: 重置节流 timestamp, 让下次 warn 可通过.

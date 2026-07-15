@@ -468,10 +468,15 @@ mod tests {
 
     #[test]
     fn is_push_normal_forced_default_false_when_env_unset() {
-        // cargo test process 在未污染环境下, 默认 false (PUSH_NORMAL_FORCE 未 set).
-        // 若测试运行环境 set 了 PUSH_NORMAL_FORCE=1, 假设测试编排已确保隔离.
-        // 此测试仅验证 helper callable + 返回 bool, 不依赖具体值.
-        let _: bool = is_push_normal_forced();
+        // 验证: helper() == std::env::var("PUSH_NORMAL_FORCE").map(|v| v == "1").unwrap_or(false)
+        // 即 helper 与直接读 env 一致 (OnceLock 缓存等于首次读值). 不假设测试环境
+        // 是否 set 了 env — 任何状态下都应一致 (Path D: 不依赖外部副作用).
+        let expected = std::env::var("PUSH_NORMAL_FORCE")
+            .ok()
+            .as_deref()
+            == Some("1");
+        let actual = is_push_normal_forced();
+        assert_eq!(actual, expected, "helper 必须等于直接 env 读取结果");
     }
 
     #[test]
