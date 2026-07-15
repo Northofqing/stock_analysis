@@ -197,6 +197,38 @@ impl PushKind {
         )
     }
 
+    /// v17.7 + v17.8: 12 个 spec 标的"待清理"变体实际是 active
+    /// (有 production caller + metadata getter, 跟 v17.6 同样 gap).
+    ///
+    /// spec 字面写"6 项 0-caller" / "8 项交易类清理" — 实证不符:
+    ///   - v17.7: Announcement, PolicyHit, EarningsBeat, EarningsMiss,
+    ///     AnalystUpgrade, MarketActionAlert (6 个, 全部 active)
+    ///   - v17.8: PostFixedPriceOrder, PostFixedPriceFill, StPriceLimitChanged,
+    ///     EtfClosingCallAuction, BlockTradeIntradayConfirm, BlockTradePriceRange
+    ///     (6 个, 全部 active)
+    ///
+    /// 本方法标 `is_active_spec_target` — 命中时 info log 跟踪 audit surface,
+    /// 后续 dev plan v2 §3.7/§3.8 sub_kind / DispatchTable 决策点.
+    pub fn is_active_spec_target_v17_7_v17_8(self) -> bool {
+        matches!(
+            self,
+            // v17.7
+            Self::Announcement
+                | Self::PolicyHit
+                | Self::EarningsBeat
+                | Self::EarningsMiss
+                | Self::AnalystUpgrade
+                | Self::MarketActionAlert
+            // v17.8 (6 个交易类)
+            | Self::PostFixedPriceOrder
+                | Self::PostFixedPriceFill
+                | Self::StPriceLimitChanged
+                | Self::EtfClosingCallAuction
+                | Self::BlockTradeIntradayConfirm
+                | Self::BlockTradePriceRange
+        )
+    }
+
     /// v12 §14.3 等级: 🚨紧急 / ⚡重要 / ℹ️参考
     pub fn level(self) -> PushLevel {
         match self {
@@ -614,6 +646,14 @@ async fn push_governor_inner(text: &str, kind: PushKind, code: Option<&str>) -> 
     if kind.is_low_priority_v17_6() {
         log::info!(
             "[v17.6-low-priority] PushKind::{:?} 命中 (子段治理候选, dev plan §3.7 follow-up)",
+            kind
+        );
+    }
+    // v17.7 + v17.8: 命中 active spec target (12 variants) 时 info log audit
+    //   跟踪后续 §3.7/§3.8 sub_kind/DispatchTable 决策面 (不强制出声)
+    if kind.is_active_spec_target_v17_7_v17_8() {
+        log::info!(
+            "[v17.7-v17.8-active-target] PushKind::{:?} 命中 (active spec target, dev plan §3.7-§3.8 follow-up)",
             kind
         );
     }
@@ -2039,6 +2079,76 @@ mod tests {
             assert!(
                 !k.is_low_priority_v17_6(),
                 "{:?} legacy variant 不应标 low-priority",
+                k
+            );
+        }
+    }
+
+    // ============== v17.7 + v17.8: 12 active spec targets audit ==============
+
+    #[test]
+    fn is_active_spec_target_v17_7_v17_8_marks_twelve_active_variants() {
+        // v17.7: 6 个 (公告/政策/业绩/研报/紧急告警)
+        let v17_7_active = [
+            PushKind::Announcement,
+            PushKind::PolicyHit,
+            PushKind::EarningsBeat,
+            PushKind::EarningsMiss,
+            PushKind::AnalystUpgrade,
+            PushKind::MarketActionAlert,
+        ];
+        // v17.8: 6 个 (交易类: 盘后固定价 + ST 涨幅 + ETF 收盘竞价 + 大宗)
+        let v17_8_active = [
+            PushKind::PostFixedPriceOrder,
+            PushKind::PostFixedPriceFill,
+            PushKind::StPriceLimitChanged,
+            PushKind::EtfClosingCallAuction,
+            PushKind::BlockTradeIntradayConfirm,
+            PushKind::BlockTradePriceRange,
+        ];
+        let all_twelve = v17_7_active
+            .iter()
+            .chain(v17_8_active.iter())
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            all_twelve.len(),
+            12,
+            "v17.7+v17.8 spec targets 应 12 个"
+        );
+        for k in all_twelve {
+            assert!(
+                k.is_active_spec_target_v17_7_v17_8(),
+                "{:?} 应被标 active spec target",
+                k
+            );
+        }
+    }
+
+    /// v17.5/v17.6 已经标过的 variants 不应在 v17.7/v17.8 audit 重复标
+    #[test]
+    fn is_active_spec_target_v17_7_v17_8_false_for_v17_5_v17_6() {
+        // v17.5 7 个 legacy
+        for k in [
+            PushKind::AuctionRepush,
+            PushKind::OptimalClose,
+            PushKind::VolumeWatchlist,
+            PushKind::VolumeRealTrade,
+            PushKind::CandidateTriggered,
+            PushKind::CandidateInvalidated,
+            PushKind::VirtualWatch,
+        ] {
+            assert!(
+                !k.is_active_spec_target_v17_7_v17_8(),
+                "{:?} legacy 不应再标 active spec target",
+                k
+            );
+        }
+        // v17.6 3 个 low-priority
+        for k in [PushKind::FactorIC, PushKind::SectorTier, PushKind::CapitalVerify] {
+            assert!(
+                !k.is_active_spec_target_v17_7_v17_8(),
+                "{:?} low-priority 不应再标 active spec target",
                 k
             );
         }
