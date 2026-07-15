@@ -181,6 +181,22 @@ impl PushKind {
         )
     }
 
+    /// v17.6 §2.2: 3 个 spec 标记为低优 / 子段治理候选.
+    ///
+    /// 注: 这 3 个 variants **与 v17.5 不同** — 它们仍有 production caller
+    /// (main.rs:8523 FactorIC). 因此本方法不标 legacy, 而是标 `is_low_priority_v17_6`
+    /// — 在 push_governor_inner 命中时给 info log 但不强制出声 warn.
+    ///
+    /// 3 个 variants: FactorIC, SectorTier, CapitalVerify.
+    /// 后续 (dev plan v2 §3.7): DailyReport 子段拆分时把这些 variants
+    /// 收纳进 DailyReportSubKind 子枚举.
+    pub fn is_low_priority_v17_6(self) -> bool {
+        matches!(
+            self,
+            Self::FactorIC | Self::SectorTier | Self::CapitalVerify
+        )
+    }
+
     /// v12 §14.3 等级: 🚨紧急 / ⚡重要 / ℹ️参考
     pub fn level(self) -> PushLevel {
         match self {
@@ -591,6 +607,13 @@ async fn push_governor_inner(text: &str, kind: PushKind, code: Option<&str>) -> 
         log::warn!(
             "[v17.5-legacy] PushKind::{:?} 在 production push 命中 (默认出声); \
              env STOCK_ANALYSIS_PUSH_KIND_LEGACY=silent 可静默",
+            kind
+        );
+    }
+    // v17.6: 命中低优 variants 时 info log (低优 ≠ legacy, 仍有 caller)
+    if kind.is_low_priority_v17_6() {
+        log::info!(
+            "[v17.6-low-priority] PushKind::{:?} 命中 (子段治理候选, dev plan §3.7 follow-up)",
             kind
         );
     }
@@ -1984,6 +2007,41 @@ mod tests {
         .filter(|k| k.is_legacy_v17_5())
         .collect();
         assert_eq!(all_legacy_hits.len(), 7);
+    }
+
+    // ============== v17.6 §2.2: is_low_priority_v17_6 标 3 variants ==============
+
+    #[test]
+    fn is_low_priority_v17_6_marks_three_spec_variants() {
+        let low_priority = [
+            PushKind::FactorIC,
+            PushKind::SectorTier,
+            PushKind::CapitalVerify,
+        ];
+        assert_eq!(low_priority.len(), 3, "v17.6 §2.2 应 3 个 variants");
+        for k in low_priority {
+            assert!(k.is_low_priority_v17_6(), "{:?} 应被标 low-priority", k);
+        }
+    }
+
+    /// v17.5 legacy variants 不应被误标为 low-priority (low ≠ legacy)
+    #[test]
+    fn is_low_priority_v17_6_false_for_v17_5_legacy_variants() {
+        for k in [
+            PushKind::AuctionRepush,
+            PushKind::OptimalClose,
+            PushKind::VolumeWatchlist,
+            PushKind::VolumeRealTrade,
+            PushKind::CandidateTriggered,
+            PushKind::CandidateInvalidated,
+            PushKind::VirtualWatch,
+        ] {
+            assert!(
+                !k.is_low_priority_v17_6(),
+                "{:?} legacy variant 不应标 low-priority",
+                k
+            );
+        }
     }
 
     #[tokio::test]
