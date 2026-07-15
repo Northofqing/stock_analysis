@@ -138,6 +138,22 @@ pub fn sink_count() -> usize {
     sink_router().len()
 }
 
+/// 已注册 Sink 名字列表 (供单测断言具体 sink 名, F6 fix).
+///
+/// 通过 `health_check_all` 间接拿 names (避免给 SinkRouter 加新 public API).
+/// 同步版本 — 仅测试用 (生产用 health_check_all async).
+pub fn sink_names() -> Vec<&'static str> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let report = rt.block_on(async {
+        let r = sink_router();
+        r.health_check_all().await
+    });
+    report.into_iter().map(|(n, _)| n).collect()
+}
+
 /// 给定制初始化场景: 在 router 首次创建时插入额外 sinks.
 ///
 /// 用法: `l6_sink::init_with_extra_sinks(|r| r.register(...))` 必须在任何 `sink_router()` 调用之前.
@@ -211,12 +227,24 @@ mod tests {
 
     #[test]
     fn sink_router_singleton_has_console_and_magiclaw() {
-        // OnceLock 是进程级, 跨 test 共享. 这里只断言 ≥2 (默认值, 不会多也不会少).
+        // F6 fix: 收紧断言, 不再用 `count >= 2` 弱断言.
+        // 默认 2 个 sink (ConsoleSink + MagiclawSink) 应精确断言 + 名字验证.
         let count = sink_count();
-        assert!(
-            count >= 2,
-            "默认 SinkRouter 应至少含 ConsoleSink + MagiclawSink, 实际 {}",
+        assert_eq!(
+            count, 2,
+            "默认 SinkRouter 应精确 2 个 sink (ConsoleSink + MagiclawSink), 实际 {}",
             count
+        );
+        let names = sink_names();
+        assert!(
+            names.iter().any(|n| *n == "console"),
+            "router 含 console: {:?}",
+            names
+        );
+        assert!(
+            names.iter().any(|n| *n == "magiclaw"),
+            "router 含 magiclaw: {:?}",
+            names
         );
     }
 
