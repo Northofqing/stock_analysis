@@ -397,7 +397,15 @@ fn current_governance_ctx() -> GovernanceContext {
             crate::push_templates::DataMode::Degraded => DataMode::Degraded,
             _ => DataMode::Down,
         },
-        is_quiet_hour: (2..6).contains(&now.hour()),
+        is_quiet_hour: match std::env::var("STOCK_ANALYSIS_QUIET_HOUR_OVERRIDE").ok().as_deref() {
+            // 显式 override (仅测试/运维用): "0"/"false" 强制非静默, "1"/"true" 强制静默
+            // 默认 (未设): 墙钟 02:00-06:00 静默, 行为不变 (v15.x 静默默认值需显式声明才生效)
+            // 背景: e2e_t01/t02 断言"推送成功", 凌晨 02-06 点跑必挂 (墙钟依赖),
+            //   测试内设 override=0 变时间无关 (2026-07-16 诊断)
+            Some("0") | Some("false") => false,
+            Some("1") | Some("true") => true,
+            _ => (2..6).contains(&now.hour()),
+        },
         // b013 P0-7: Frozen 模式经 banner 进来, 治理能真正拦
         is_frozen: matches!(banner.account_mode, crate::push_templates::AccountMode::Frozen),
         now,

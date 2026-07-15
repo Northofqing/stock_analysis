@@ -9010,7 +9010,10 @@ mod tests {
     /// 重置全局 DAILY_BUDGET_COUNT 计数 + 清空 COOLDOWN_TABLE (修复 4 个 e2e 并行测试隔离 bug)
     /// 测试间共享的全局状态 (account_mode_log 表, 预算 counter, 冷却表) 必须全部重置
     /// 才能保证 67 个并行测试互不干扰。
+    /// 2026-07-16: 另设 QUIET_HOUR_OVERRIDE=0 — e2e 断言"推送成功"不应依赖墙钟
+    /// (凌晨 02:00-06:00 跑测试时 L5 governance quiet_hour Deny 导致假失败)
     fn reset_daily_budget_for_test() {
+        std::env::set_var("STOCK_ANALYSIS_QUIET_HOUR_OVERRIDE", "0");
         DAILY_BUDGET_COUNT.store(0, Ordering::Relaxed);
         let mut table = COOLDOWN_TABLE.lock().expect("cooldown table poisoned");
         table.clear();
