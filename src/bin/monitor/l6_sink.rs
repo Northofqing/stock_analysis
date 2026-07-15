@@ -83,7 +83,23 @@ impl Sink for MagiclawSink {
     }
 
     async fn health_check(&self) -> bool {
-        true // notify::push_wechat 内部有完整 daemon 启停 + token 鉴权, 视为健康
+        // F4 fix: 真探活 — 不再总是 true stub.
+        // notify::push_wechat 内部确实有 daemon 启停 + token 鉴权, 但 health_check
+        // 应反映"现在能不能推送", 而非"系统设计的鲁棒性". 实际检查:
+        //   1. dry-run 模式 (V10_DRY_RUN_PUSH=1) → true (无 daemon 也行, 测试用)
+        //   2. MAGICLAW_BIN 配置 → 检查 binary 路径存在 (Linux/macOS std::path::Path)
+        //   3. MAGICLAW_API_ADDR 配置 → true (assume daemon running, 真 HTTP probe 留给 health_check_all)
+        //   4. 兜底: 未配置任何 daemon 入口 → false (跟生产推送路径不一致, 应报警)
+        if std::env::var("V10_DRY_RUN_PUSH").ok().as_deref() == Some("1") {
+            return true;
+        }
+        if let Ok(bin) = std::env::var("MAGICLAW_BIN") {
+            return std::path::Path::new(&bin).exists();
+        }
+        if std::env::var("MAGICLAW_API_ADDR").is_ok() {
+            return true;
+        }
+        false // 未配置任何 daemon 入口 → 不健康 (告知 caller 切换 dry-run 或配 MAGICLAW_*)
     }
 }
 
@@ -216,13 +232,36 @@ mod tests {
     }
 
     #[test]
-    fn magiclaw_sink_health_default_ok() {
+    fn magiclaw_sink_health_probes_three_env_paths() {
+        // F4 fix: 真探活 — 不再总是 true stub. 三种 env 路径在一个 #[test] 里
+        // sequential 执行, 避免 std::env::set_var 在 parallel test runner 下的
+        // data race (rust 2021 edition set_var 是 safe 但跨 test 共享污染).
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
+
+        // Case 1: dry-run 模式 → true (即使没真 daemon)
+        std::env::set_var("V10_DRY_RUN_PUSH", "1");
+        std::env::remove_var("MAGICLAW_BIN");
+        std::env::remove_var("MAGICLAW_API_ADDR");
         let ok = rt.block_on(async { MagiclawSink.health_check().await });
-        assert!(ok, "MagiclawSink 默认 health_check 应为 true");
+        assert!(ok, "dry-run 模式 health_check 应为 true");
+
+        // Case 2: 兜底 — 无任何 env 配置 → false (提醒 caller 配 daemon)
+        std::env::remove_var("V10_DRY_RUN_PUSH");
+        std::env::remove_var("MAGICLAW_BIN");
+        std::env::remove_var("MAGICLAW_API_ADDR");
+        let ok = rt.block_on(async { MagiclawSink.health_check().await });
+        assert!(!ok, "无 env 配置时 health_check 应为 false");
+
+        // Case 3: MAGICLAW_BIN 指向不存在路径 → false (精确性 vs stub)
+        std::env::remove_var("V10_DRY_RUN_PUSH");
+        std::env::set_var("MAGICLAW_BIN", "/nonexistent/magiclaw_daemon_path_test");
+        std::env::remove_var("MAGICLAW_API_ADDR");
+        let ok = rt.block_on(async { MagiclawSink.health_check().await });
+        std::env::remove_var("MAGICLAW_BIN");
+        assert!(!ok, "MAGICLAW_BIN 不存在时 health_check 应为 false");
     }
 
     #[test]
