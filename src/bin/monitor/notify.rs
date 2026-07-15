@@ -160,6 +160,27 @@ impl PushKind {
         false
     }
 
+    /// v17.5 §2.2: 7 个 spec 标记为 0-caller (实际 metadata getter 仍在用,
+    /// production push caller 已注释/删除 (main.rs:8313 AuctionRepush)).
+    ///
+    /// 走 Ipo* precedent: enum 变体**保留** (不改 level/cooldown_secs/label match),
+    /// 仅在此方法中"标 legacy", 在 push_governor_inner 中按 env 控制可见性.
+    ///
+    /// 7 个 variants: AuctionRepush, OptimalClose, VolumeWatchlist,
+    /// VolumeRealTrade, CandidateTriggered, CandidateInvalidated, VirtualWatch.
+    pub fn is_legacy_v17_5(self) -> bool {
+        matches!(
+            self,
+            Self::AuctionRepush
+                | Self::OptimalClose
+                | Self::VolumeWatchlist
+                | Self::VolumeRealTrade
+                | Self::CandidateTriggered
+                | Self::CandidateInvalidated
+                | Self::VirtualWatch
+        )
+    }
+
     /// v12 §14.3 等级: 🚨紧急 / ⚡重要 / ℹ️参考
     pub fn level(self) -> PushLevel {
         match self {
@@ -553,6 +574,27 @@ impl PushOutcome {
 ///   - sink_name 不再硬编码 "wechat" (b011 P0-1), 取实际通道
 async fn push_governor_inner(text: &str, kind: PushKind, code: Option<&str>) -> PushOutcome {
     use crate::v14_adapter::{self, V14Gate};
+
+    // v17.5 §2.2: 命中 v17.5-legacy variants 时按 env 控制可见性
+    //   默认 warn 出声 (v15.x 4 铁律 — 默认值必须出声状态);
+    //   显式 STOCK_ANALYSIS_PUSH_KIND_LEGACY=silent 可静默.
+    // 7 variants 标 legacy: is_legacy_v17_5() 见 impl PushKind.
+    use std::sync::OnceLock;
+    static LEGACY_AUDIT_DEFAULT_VISIBLE: OnceLock<bool> = OnceLock::new();
+    let audit_legacy_visible = *LEGACY_AUDIT_DEFAULT_VISIBLE.get_or_init(|| {
+        std::env::var("STOCK_ANALYSIS_PUSH_KIND_LEGACY")
+            .ok()
+            .as_deref()
+            != Some("silent")
+    });
+    if audit_legacy_visible && kind.is_legacy_v17_5() {
+        log::warn!(
+            "[v17.5-legacy] PushKind::{:?} 在 production push 命中 (默认出声); \
+             env STOCK_ANALYSIS_PUSH_KIND_LEGACY=silent 可静默",
+            kind
+        );
+    }
+
     // b013 review P0-4: v14 路径也走 LaunchGate (b011 漏: 17 处 main::push_wechat
     // 走 launch_gate, v14 直连 push_wechat 不走 — Stage=gray 下非 critical 仍能推).
     if !launch_gate_check(kind) {
@@ -1865,6 +1907,83 @@ mod tests {
         } else {
             assert!(outcome.is_pushed(), "{}: got {:?}", ctx, outcome);
         }
+    }
+
+    // ============== v17.5 §2.2: is_legacy_v17_5 标 7 variants ==============
+
+    #[test]
+    fn is_legacy_v17_5_marks_seven_spec_only_variants() {
+        let legacy_variants = [
+            PushKind::AuctionRepush,
+            PushKind::OptimalClose,
+            PushKind::VolumeWatchlist,
+            PushKind::VolumeRealTrade,
+            PushKind::CandidateTriggered,
+            PushKind::CandidateInvalidated,
+            PushKind::VirtualWatch,
+        ];
+        assert_eq!(
+            legacy_variants.len(),
+            7,
+            "v17.5 §2.2 list 应 7 个 variants"
+        );
+        for k in legacy_variants {
+            assert!(k.is_legacy_v17_5(), "{:?} 应被标为 legacy", k);
+        }
+    }
+
+    /// v17.5 §1.2 active 10 个 PushKind 不应被误标为 legacy
+    #[test]
+    fn is_legacy_v17_5_not_marked_for_active_variants() {
+        let active_v17_5 = [
+            PushKind::AuctionVolume,
+            PushKind::LimitBoards,
+            PushKind::CandidateBoard,
+            PushKind::HoldingPlan,
+            PushKind::T0Advice,
+            PushKind::ForbiddenOps,
+            PushKind::PaperTrade,
+            PushKind::CloseCall,
+            PushKind::AccountMode,
+            PushKind::DataMode,
+        ];
+        assert_eq!(
+            active_v17_5.len(),
+            10,
+            "v17.5 §1.2 active 应 10 个 variants"
+        );
+        for k in active_v17_5 {
+            assert!(
+                !k.is_legacy_v17_5(),
+                "{:?} 活动 variant 不应被标 legacy",
+                k
+            );
+        }
+    }
+
+    /// v15.x 4 铁律承偌: 默认出声 (env 未设/silent 以外)。
+    /// 本测试只验证 is_legacy_v17_5 谓词本身不漏;
+    /// env 控制可见性逻辑 (OnceLock 缓存 env var) 在 push_governor_inner
+    /// 同步单步跳邡, 完整 audit 路径靠 monitor --test smoke (Commit 4).
+    #[test]
+    fn is_legacy_v17_5_count_matches_v17_5_spec_section_2_2() {
+        // v17.5 §2.2 "6 个 0-caller" (含 AuctionRepush + OptimalClose +
+        // VolumeWatchlist + VolumeRealTrade + CandidateTriggered +
+        // CandidateInvalidated + VirtualWatch) → 总 7 (spec 实际表 7 行
+        // 包括 AuctionRepush, 主文"6"为 typo, 本 impl 以 7 为准)
+        let all_legacy_hits: Vec<PushKind> = [
+            PushKind::AuctionRepush,
+            PushKind::OptimalClose,
+            PushKind::VolumeWatchlist,
+            PushKind::VolumeRealTrade,
+            PushKind::CandidateTriggered,
+            PushKind::CandidateInvalidated,
+            PushKind::VirtualWatch,
+        ]
+        .into_iter()
+        .filter(|k| k.is_legacy_v17_5())
+        .collect();
+        assert_eq!(all_legacy_hits.len(), 7);
     }
 
     #[tokio::test]
