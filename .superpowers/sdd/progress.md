@@ -11,7 +11,7 @@
 ## Status
 
 - [x] r2-A Task 1 (envelope contract)
-- [ ] r2-A Task 2 (EventBus)
+- [x] r2-A Task 2 (EventBus)
 - [ ] r2-A Task 3 (DispatcherRegistry)
 - [ ] r2-A Task 4 (production bridge)
 - [ ] r2-A Task 5 (Gate B verification)
@@ -21,4 +21,7 @@
 ## Commits Ledger
 
 ### r2-A Task 1
-- d3fd0df — feat(v17.1-r2): add event envelope contract (reviewer approved, 0 Critical/Important, 1 Minor — error label drift on serialization failure, no action)
+- d3fd0df — feat(v17.1-r2): add event envelope contract (reviewer approved, 0 Critical/Important, 1 Minor error-label drift)
+
+### r2-A Task 2
+- c3ee6fd — feat(v17.1-r2): add bounded event bus (reviewer approved, 0 Critical/Important, 2 Minor — dead-code `record_lagged`, best-effort serialization scope)
