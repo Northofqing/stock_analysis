@@ -202,7 +202,17 @@ impl NewsFeed for EmAnnouncementFeed {
     fn name(&self) -> &str { "em_announcement" }
     fn source_kind(&self) -> SourceKind { SourceKind::Earnings }
     async fn fetch(&self, _limit: usize) -> Result<Vec<MarketEvent>> {
-        let anns = crate::data_provider::announcement::fetch_announcements(None).await.unwrap_or_default();
+        let anns = match crate::data_provider::announcement::fetch_announcements(None).await {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("[EmAnnouncementFeed] fetch failed: {}", e);
+                return Ok(vec![]);
+            }
+        };
+        if anns.is_empty() {
+            log::info!("[EmAnnouncementFeed] no announcements this cycle");
+            return Ok(vec![]);
+        }
         let now = Utc::now().with_timezone(&Local);
         Ok(anns.iter().map(|a| {
             let simhash = {
@@ -217,7 +227,7 @@ impl NewsFeed for EmAnnouncementFeed {
                 event_id: format!("earnings-{:x}", simhash),
                 simhash,
                 full_title: a.title.clone(),
-                event_type: EventType::Policy,  // D2 will add Earnings variant
+                event_type: EventType::Announcement,  // truthful category
                 subject: a.code.clone(),
                 object: Some(a.code.clone()),
                 direction: Direction::Neutral,
@@ -227,7 +237,7 @@ impl NewsFeed for EmAnnouncementFeed {
                 occurred_at: now,
                 provenance: vec![SourceRef {
                     provider: "em_announcement".to_string(),
-                    url: None,
+                    url: a.url.clone(),
                     fetched_at: now,
                 }],
                 ai_degraded: false,

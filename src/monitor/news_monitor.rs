@@ -697,6 +697,8 @@ mod tests {
             content: String::new(), // 正文为空，回退到summary
             level: announcement::AnnLevel::Important,
             reason: "标题含'质押'".into(),
+            external_id: None,
+            url: None,
         };
         let events = nm.process_announcements(&[ann], &std::collections::HashMap::new());
         assert_eq!(events.len(), 1);
@@ -723,6 +725,8 @@ mod tests {
             content: String::new(),
             level: announcement::AnnLevel::Important,
             reason: "标题含'质押'".into(),
+            external_id: None,
+            url: None,
         };
         let events = nm.process_announcements(&[ann], &std::collections::HashMap::new());
         assert!(events.is_empty()); // L1过滤器拦截

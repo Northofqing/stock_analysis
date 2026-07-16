@@ -64,6 +64,10 @@ pub struct Announcement {
     pub content: String,
     pub level: AnnLevel,
     pub reason: String,
+    /// 外部唯一标识（来源于 art_code）
+    pub external_id: Option<String>,
+    /// 东方财富公告详情页 URL
+    pub url: Option<String>,
 }
 
 // ── 标题关键词哨兵 ──
@@ -511,6 +515,21 @@ pub async fn fetch_announcements(date: Option<&str>) -> Result<Vec<Announcement>
                 String::new()
             };
 
+        // 外部标识：从 art_code 来，非空时构建东方财富 URL
+        let external_id = if art_code.is_empty() {
+            None
+        } else {
+            Some(art_code.to_string())
+        };
+        let url = if art_code.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "https://data.eastmoney.com/notices/detail/{}.html",
+                art_code
+            ))
+        };
+
         results.push(Announcement {
             code: code.to_string(),
             name: name.to_string(),
@@ -520,6 +539,8 @@ pub async fn fetch_announcements(date: Option<&str>) -> Result<Vec<Announcement>
             content,
             level,
             reason,
+            external_id,
+            url,
         });
     }
 
