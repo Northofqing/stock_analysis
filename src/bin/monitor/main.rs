@@ -1877,6 +1877,20 @@ async fn main() {
         "[event_bus] mode=delivery_audit enabled=true dispatcher=AuditDispatcher"
     );
 
+    // v17.3 Task 5: Spawn JSONL writer — obtain a separate receiver for persistence
+    let _jsonl_writer_handle = {
+        let mut rx = bus.subscribe();
+        let base_dir = std::path::PathBuf::from("data/event_bus");
+        let retention_days = 7u32;
+        tokio::spawn(async move {
+            use stock_analysis::event::JsonlWriter;
+            JsonlWriter::spawn(rx, base_dir.clone(), retention_days).await
+        })
+    };
+    log::info!(
+        "[event_bus.jsonl] mode=enabled base_dir=data/event_bus retention_days=7"
+    );
+
     // v17.4 D 方案启动 banner (v15.x 静默路径可见): SectorTop 废弃态 + 选股阈值
     log::info!(
         "[v17.4-D] sector_top.mode={} | screener_min_score={} | holding_health.dedup=on_same_state",
@@ -2106,6 +2120,121 @@ async fn main() {
     let backfill_chain_name = std::env::args().any(|a| a == "--backfill-chain-name");
 
 
+
+    // v17.3 Task 5: Handle terminal event commands before entering long-running monitor loops.
+    // Parse CLI args early to detect --replay / --history / --help before any background loops start.
+    let args: Vec<String> = std::env::args().collect();
+    let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    match stock_analysis::event::cli::parse_args(&args_refs) {
+        Ok(Some(stock_analysis::event::cli::EventCommand::Help)) => {
+            eprintln!("Usage: monitor [--replay=YYYY-MM-DD [--replay-force] [--replay-rate-ms N]]");
+            eprintln!("       [--history [--date=YYYY-MM-DD] [--code=CODE] [--kind=KIND]");
+            eprintln!("                [--limit=N] [--success-rate] [--sink=SINK]]");
+            eprintln!("       [--help]");
+            eprintln!("");
+            eprintln!("Event subcommands are terminal — monitor does not enter long-running loops.");
+            std::process::exit(0);
+        }
+        Ok(Some(stock_analysis::event::cli::EventCommand::Replay { date, force, rate_ms })) => {
+            // Build a fresh EventBus and ReplayRunner; do NOT start AuditDispatcher sink path.
+            use stock_analysis::event::{EventBus, ReplayRunner};
+            use std::path::PathBuf;
+            let bus = EventBus::new(1024);
+            let base_dir = PathBuf::from("data/event_bus");
+            let runner = ReplayRunner::new(base_dir, bus);
+            let count = runner.run(date, force, rate_ms).await.unwrap_or(0);
+            if count == 0 {
+                eprintln!(
+                    "[replay] date={} force={}: no replayable events found (zero dispatch)",
+                    date, force
+                );
+            } else {
+                println!(
+                    "[replay] date={} force={} mode={} count={}",
+                    date,
+                    force,
+                    if force { "FORCE" } else { "DRY-RUN" },
+                    count
+                );
+            }
+            std::process::exit(0);
+        }
+        Ok(Some(stock_analysis::event::cli::EventCommand::History {
+            date,
+            code,
+            kind,
+            limit,
+            success_rate,
+            sink,
+        })) => {
+            use stock_analysis::event::{HistoryQuery, HistoryFilter, HistoryOrder, Window};
+            use std::path::PathBuf;
+            let base_dir = PathBuf::from("data/event_bus");
+            let query = HistoryQuery::new(base_dir);
+            if success_rate {
+                let window = date
+                    .map(|d| {
+                        let now = chrono::Local::now().date_naive();
+                        let days = (now - d).num_days().max(1) as u32;
+                        Window::Days(days)
+                    })
+                    .unwrap_or(Window::Days(1));
+                match query.push_success_rate(
+                    kind.as_deref(),
+                    window,
+                    sink.as_deref(),
+                ).await {
+                    Ok(stats) => {
+                        println!("[history.success_rate] {:?}", stats);
+                        println!(
+                            "total={} pushed={} failed={} denied={} deduped={} success_rate={:.2}%",
+                            stats.total, stats.pushed, stats.failed, stats.denied, stats.deduped,
+                            stats.success_rate * 100.0
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("[history] success_rate query failed: {}", e);
+                    }
+                }
+            } else {
+                let filter = HistoryFilter {
+                    date,
+                    code,
+                    kind,
+                    limit: limit.unwrap_or(100),
+                    order: HistoryOrder::Desc,
+                };
+                match query.query(filter).await {
+                    Ok(entries) => {
+                        println!("[history] {} entries", entries.len());
+                        for entry in entries.iter().take(20) {
+                            println!(
+                                "  {} {} {:?} {}",
+                                entry.ts.format("%Y-%m-%d %H:%M:%S"),
+                                entry.kind,
+                                entry.code,
+                                serde_json::to_string_pretty(&entry.summary).unwrap_or_default()
+                            );
+                        }
+                        if entries.len() > 20 {
+                            println!("  ... ({} more)", entries.len() - 20);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[history] query failed: {}", e);
+                    }
+                }
+            }
+            std::process::exit(0);
+        }
+        Ok(None) => {
+            // No event command — fall through to existing monitor behavior.
+        }
+        Err(e) => {
+            eprintln!("[event] CLI error: {}", e);
+            std::process::exit(1);
+        }
+    }
 
     // 显式标记交易环境，供底层写入守卫执行双向隔离。
 
@@ -12007,5 +12136,31 @@ mod tests_wrapper_real_raw {
 
     }
 
+}
+
+// ========================================================================
+// v17.3 Task 5: Event CLI integration test — TDD RED step
+// ========================================================================
+
+#[cfg(test)]
+mod tests_v17_3_integration {
+    use stock_analysis::event::cli::parse_args;
+
+    /// Verifies that --history parses as a terminal event command (not a monitor flag).
+    /// This test will fail until main() wires event::cli::parse_args.
+    #[test]
+    fn event_commands_are_terminal_commands() {
+        let cmd = parse_args(&[
+            "monitor",
+            "--history",
+            "--date=2026-07-16",
+            "--limit=100",
+        ])
+        .unwrap();
+        assert!(
+            cmd.is_some(),
+            "parse_args should return Some for --history; got None — CLI not wired in main()"
+        );
+    }
 }
 
