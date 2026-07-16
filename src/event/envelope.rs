@@ -157,7 +157,7 @@ impl PushDeliveryEvent {
 
 impl DomainEvent for PushDeliveryEvent {
     fn event_type(&self) -> &'static str {
-        "push.delivery"
+        "push.delivery.audit"
     }
 
     fn source(&self) -> &'static str {
@@ -205,7 +205,7 @@ mod tests {
             chrono::Local::now(),
         )
         .unwrap();
-        assert_eq!(env.event_type, "push.delivery");
+        assert_eq!(env.event_type, "push.delivery.audit");
         assert_eq!(env.entity_key.as_deref(), Some("600519"));
         assert_eq!(env.payload["outcome"], "Pushed");
         assert_eq!(env.version, 1);

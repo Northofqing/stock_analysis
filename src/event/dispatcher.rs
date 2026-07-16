@@ -161,7 +161,7 @@ impl Dispatcher for AuditDispatcher {
     }
 
     fn event_type(&self) -> &'static str {
-        "push.delivery"
+        "push.delivery.audit"
     }
 
     fn dispatch(&self, envelope: EventEnvelope) -> DispatchResult {
@@ -288,12 +288,12 @@ mod tests {
     #[test]
     fn registry_routes_only_exact_event_type() {
         let mut registry = DispatcherRegistry::new();
-        registry.register(Arc::new(RecordingDispatcher::for_type("push.delivery")));
+        registry.register(Arc::new(RecordingDispatcher::for_type("push.delivery.audit")));
         registry.register(Arc::new(RecordingDispatcher::for_type("push.delivery.retry")));
         registry.validate().unwrap();
 
         assert_eq!(
-            registry.dispatch(test_envelope_type("push.delivery")),
+            registry.dispatch(test_envelope_type("push.delivery.audit")),
             DispatchResult::Handled
         );
         assert_eq!(
@@ -309,18 +309,18 @@ mod tests {
     #[test]
     fn duplicate_exact_types_are_rejected_at_validation() {
         let mut registry = DispatcherRegistry::new();
-        registry.register(Arc::new(RecordingDispatcher::for_type("push.delivery")));
-        registry.register(Arc::new(RecordingDispatcher::for_type("push.delivery")));
+        registry.register(Arc::new(RecordingDispatcher::for_type("push.delivery.audit")));
+        registry.register(Arc::new(RecordingDispatcher::for_type("push.delivery.audit")));
         assert!(registry.validate().is_err());
     }
 
     #[test]
     fn duplicate_error_names_the_offending_event_type() {
         let mut registry = DispatcherRegistry::new();
-        registry.register(Arc::new(RecordingDispatcher::for_type("push.delivery")));
-        registry.register(Arc::new(RecordingDispatcher::for_type("push.delivery")));
+        registry.register(Arc::new(RecordingDispatcher::for_type("push.delivery.audit")));
+        registry.register(Arc::new(RecordingDispatcher::for_type("push.delivery.audit")));
         let err = registry.validate().unwrap_err();
-        assert!(err.to_string().contains("push.delivery"));
+        assert!(err.to_string().contains("push.delivery.audit"));
     }
 
     #[test]
@@ -338,7 +338,7 @@ mod tests {
                 "FailingDispatcher"
             }
             fn event_type(&self) -> &'static str {
-                "push.delivery"
+                "push.delivery.audit"
             }
             fn dispatch(&self, _envelope: EventEnvelope) -> DispatchResult {
                 DispatchResult::Failed("sink unavailable".into())
@@ -347,7 +347,7 @@ mod tests {
 
         let mut registry = DispatcherRegistry::new();
         registry.register(Arc::new(FailingDispatcher));
-        let result = registry.dispatch(test_envelope_type("push.delivery"));
+        let result = registry.dispatch(test_envelope_type("push.delivery.audit"));
         assert_eq!(result, DispatchResult::Failed("sink unavailable".into()));
     }
 
@@ -362,7 +362,7 @@ mod tests {
                 "SinkSpy"
             }
             fn event_type(&self) -> &'static str {
-                "push.delivery"
+                "push.delivery.audit"
             }
             fn dispatch(&self, _envelope: EventEnvelope) -> DispatchResult {
                 CALLED.store(true, Ordering::SeqCst);
@@ -371,7 +371,7 @@ mod tests {
         }
 
         let dispatcher = AuditDispatcher::new();
-        let envelope = test_envelope_type("push.delivery");
+        let envelope = test_envelope_type("push.delivery.audit");
         dispatcher.dispatch(envelope);
 
         // The dispatcher never calls the spy — it only logs.
@@ -383,8 +383,8 @@ mod tests {
         let dispatcher = AuditDispatcher::new();
         assert_eq!(dispatcher.handled_count(), 0);
 
-        dispatcher.dispatch(test_envelope_type("push.delivery"));
-        dispatcher.dispatch(test_envelope_type("push.delivery"));
+        dispatcher.dispatch(test_envelope_type("push.delivery.audit"));
+        dispatcher.dispatch(test_envelope_type("push.delivery.audit"));
 
         assert_eq!(dispatcher.handled_count(), 2);
     }

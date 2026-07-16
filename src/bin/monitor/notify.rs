@@ -975,11 +975,11 @@ async fn push_governor_inner(text: &str, kind: PushKind, code: Option<&str>) -> 
         V14Gate::Denied(reason) => return PushOutcome::Denied(reason),
         V14Gate::Approved(event) => event,
     };
-    deliver_and_record(event, kind, text).await
+    let start = std::time::Instant::now();
+    deliver_and_record(event, kind, text, start).await
 }
 
 /// v17.6 §5.1: push_governor_inner 的 sub_kind-aware 版本.
-/// sub_kind 走 v14_gate_with_sub_kind (L4 dedup key 第三元组),
 /// cooldown 取 sub_kind.cooldown_secs() override (None 时跟随 kind 默认).
 async fn push_governor_inner_with_sub_kind(
     text: &str,
@@ -1016,12 +1016,18 @@ async fn push_governor_inner_with_sub_kind(
             event
         }
     };
-    deliver_and_record(event, kind, text).await
+    let start = std::time::Instant::now();
+    deliver_and_record(event, kind, text, start).await
 }
 
 /// 公共尾段: L5/L6 投递 + commit/rollback + L7 留痕.
 /// push_governor_inner + push_governor_inner_with_sub_kind 共用 (DRY).
-async fn deliver_and_record(event: stock_analysis::push_l1::SignalEvent, kind: PushKind, text: &str) -> PushOutcome {
+async fn deliver_and_record(
+    event: stock_analysis::push_l1::SignalEvent,
+    kind: PushKind,
+    text: &str,
+    start: std::time::Instant,
+) -> PushOutcome {
     use crate::v14_adapter;
     // v15.1 A3: 把 reserve/commit 拆分, 失败时 rollback 不占 cooldown 窗口
     // v17.1-r2 §3.6: env opt-in 走 L6 SinkRouter (env=STOCK_ANALYSIS_PUSH_V6_ENABLE=1).
@@ -1049,13 +1055,15 @@ async fn deliver_and_record(event: stock_analysis::push_l1::SignalEvent, kind: P
         false => "SinkError",
     };
     // channel 已在上方取过: let channel = current_send_channel();
+    // v17.3 Task 1 F1: 用实际投递耗时 (从 deliver_and_record 入口的 Instant 计算)
+    let latency_ms = start.elapsed().as_millis() as u64;
     stock_analysis::event::publish_delivery(
         &kind.stable_template_id(),
         event.code.as_deref(),
         outcome_str,
         channel,
         text.len(),
-        0, // latency_ms: deliver_and_record 不持有开始时间, 传入 0
+        latency_ms,
     );
 
     if delivered {

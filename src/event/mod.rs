@@ -7,12 +7,14 @@
 pub mod bus;
 pub mod dispatcher;
 pub mod envelope;
+pub mod push_record;
 
 pub use bus::{EventBus, EventBusMetrics, PublishOutcome, RejectReason};
 pub use dispatcher::{
     AuditDispatcher, DispatchResult, Dispatcher, DispatcherRegistry, RegistryError,
 };
 pub use envelope::{DomainEvent, EnvelopeError, EventEnvelope, PushDeliveryEvent};
+pub use push_record::{PushOutcomeLabel, PushRecord, PushRecordError, ReplayablePushEvent, ReplayablePushEventError};
 
 // ========================================================================
 // Global bus singleton
@@ -138,7 +140,7 @@ mod delivery_observation_tests {
             37,
         );
         let env = rx.recv().await.unwrap();
-        assert_eq!(env.event_type, "push.delivery");
+        assert_eq!(env.event_type, "push.delivery.audit");
         assert_eq!(env.payload["outcome"], "Pushed");
         assert_eq!(env.payload["code"], "600519");
     }
