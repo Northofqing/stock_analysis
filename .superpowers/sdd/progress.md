@@ -11,18 +11,16 @@
 ## Status
 
 - [x] r2-A Tasks 1-5 (Gate B GREEN)
-- [x] v17.3 Task 1 (push records + latency thread-through) — F1 ✅
-- [x] v17.3 Task 2 (JSONL writer)
-- [ ] v17.3 Task 3 (history filtering + success rate)
+- [x] v17.3 Tasks 1-2 (push records + JSONL writer)
+- [x] v17.3 Task 3 (history + success rate)
 - [ ] v17.3 Task 4 (replay + CLI parser)
 - [ ] v17.3 Task 5 (Gate C verification)
 - [ ] v17.7 (after Gate C)
 
 ## Commits Ledger
 
-### v17.3 Task 2
-- 92a08f4 — feat(v17.3): persist event envelopes as daily JSONL (reviewer approved)
-  - 3/3 tests pass against real filesystem; cleanup never touches today; replay filtering correct
-  - Out-of-scope fix: `bus.rs:138` `shutdown()` now drops the Sender so `Closed` reaches receivers (correct, minimal, required for graceful-shutdown test path; pre-existing bug)
-  - Minor (logged): `create_dir_all` on every write; `chrono::Duration::days` deprecation
+### v17.3 Task 3
+- affe306 — feat(v17.3): add event history and delivery rates (reviewer approved)
+  - 2/2 tests pass; typed `HistoryError`; per-sink/per-kind rates correct; `Denied`/`Deduped` excluded from rate denominator
+  - Minor (logged, not fixed): silent `Err(_) => continue` in `push_success_rate` file-open path (history.rs:298-300) — should log warn per global constraint
 
