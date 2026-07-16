@@ -8,6 +8,11 @@
 //! 复用现有: 不重建 NewsEvent, 不重建 dedup, 全部依赖 MarketEvent::simhash
 
 pub mod feed;
+pub mod source_event;
+pub mod classifier;
+
+// Re-export for convenience
+pub use source_event::{NormalizedSourceEvent, NormalizedSourceError, SourcePushKind};
 
 use crate::signal::market_event::{EventType, MarketEvent};
 use anyhow::Result;
