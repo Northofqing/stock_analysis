@@ -10,13 +10,9 @@
 
 ## Status
 
-- [x] r2-A Task 1 (envelope contract)
-- [x] r2-A Task 2 (EventBus)
-- [x] r2-A Task 3 (DispatcherRegistry)
-- [x] r2-A Task 4 (production bridge)
-- [x] r2-A Task 5 (Gate B verification — GREEN)
+- [x] r2-A Tasks 1-5 (Gate B GREEN)
 - [x] v17.3 Task 1 (push records + latency thread-through) — F1 ✅
-- [ ] v17.3 Task 2 (JSONL writer)
+- [x] v17.3 Task 2 (JSONL writer)
 - [ ] v17.3 Task 3 (history filtering + success rate)
 - [ ] v17.3 Task 4 (replay + CLI parser)
 - [ ] v17.3 Task 5 (Gate C verification)
@@ -24,23 +20,9 @@
 
 ## Commits Ledger
 
-### r2-A Task 1
-- d3fd0df — feat(v17.1-r2): add event envelope contract (reviewer approved)
+### v17.3 Task 2
+- 92a08f4 — feat(v17.3): persist event envelopes as daily JSONL (reviewer approved)
+  - 3/3 tests pass against real filesystem; cleanup never touches today; replay filtering correct
+  - Out-of-scope fix: `bus.rs:138` `shutdown()` now drops the Sender so `Closed` reaches receivers (correct, minimal, required for graceful-shutdown test path; pre-existing bug)
+  - Minor (logged): `create_dir_all` on every write; `chrono::Duration::days` deprecation
 
-### r2-A Task 2
-- c3ee6fd — feat(v17.1-r2): add bounded event bus (reviewer approved)
-
-### r2-A Task 3
-- 5942e9b — feat(v17.1-r2): add exact event dispatcher registry (reviewer approved)
-
-### r2-A Task 4
-- 155a866 — feat(v17.1-r2): observe production deliveries on event bus (reviewer approved)
-
-### r2-A Task 5 (Gate B verification)
-- GREEN at `0d85dc5`
-
-### v17.3 Task 1
-- a8173e2 — feat(v17.3): normalize delivery and replay records (reviewer approved)
-  - Audit event renamed: `push.delivery` → `push.delivery.audit` (avoids collision with new `PushRecord`)
-  - F1 ✅: `Instant::now()` captured at both `push_governor_inner` and `_with_sub_kind` entry points, elapsed passed to `publish_delivery`
-  - Minor (logged, not fixed): stale `传入 0` comment at notify.rs:1078
