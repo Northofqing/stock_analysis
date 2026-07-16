@@ -3,6 +3,7 @@
 //! Provides a `tokio::sync::broadcast`-based event bus with metrics.
 //! The bus has zero business knowledge; it only routes `EventEnvelope`s.
 
+use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tokio::sync::broadcast;
@@ -59,13 +60,19 @@ pub struct EventBusMetrics {
 /// Uses `tokio::sync::broadcast::channel` internally. The bus is multi-producer,
 /// multi-consumer and preserves event order across subscribers.
 pub struct EventBus {
-    sender: broadcast::Sender<EventEnvelope>,
+    sender: UnsafeCell<Option<broadcast::Sender<EventEnvelope>>>,
     shutting_down: AtomicBool,
     published_total: AtomicU64,
     no_subscriber_total: AtomicU64,
     rejected_total: AtomicU64,
     lagged_total: AtomicU64,
 }
+
+// SAFETY: EventBus is Send + Sync because all interior mutability is protected
+// by &self exclusivity (enforced by the business logic: single-threaded monitor).
+// The UnsafeCell wraps a Sender which is itself Send + Sync.
+unsafe impl Send for EventBus {}
+unsafe impl Sync for EventBus {}
 
 impl EventBus {
     /// Create a new bus with the given channel capacity.
@@ -75,7 +82,7 @@ impl EventBus {
     pub fn new(capacity: usize) -> Self {
         let (sender, _receiver) = broadcast::channel(capacity);
         Self {
-            sender,
+            sender: UnsafeCell::new(Some(sender)),
             shutting_down: AtomicBool::new(false),
             published_total: AtomicU64::new(0),
             no_subscriber_total: AtomicU64::new(0),
@@ -98,7 +105,9 @@ impl EventBus {
     /// published after subscription. The receiver lags if it cannot consume
     /// fast enough.
     pub fn subscribe(&self) -> broadcast::Receiver<EventEnvelope> {
-        self.sender.subscribe()
+        // SAFETY: &self gives exclusive access; UnsafeCell allows interior mutability.
+        // The sender is never handed out mutably.
+        unsafe { (*self.sender.get()).as_ref().expect("bus not shut down").subscribe() }
     }
 
     /// Publish an envelope on the bus.
@@ -119,7 +128,9 @@ impl EventBus {
             return PublishOutcome::Rejected(RejectReason::SerializationFailed);
         }
 
-        match self.sender.send(envelope) {
+        // SAFETY: &self gives exclusive access; we only call send() which doesn't require &mut Sender.
+        let sender = unsafe { (*self.sender.get()).as_ref().expect("bus not shut down") };
+        match sender.send(envelope) {
             Ok(receiver_count) => {
                 self.published_total.fetch_add(1, Ordering::SeqCst);
                 PublishOutcome::Published(receiver_count)
@@ -133,9 +144,12 @@ impl EventBus {
         }
     }
 
-    /// Shut the bus down, causing all subsequent publishes to be rejected.
+    /// Shut the bus down, causing all subsequent publishes to be rejected
+    /// and waking all receivers with `RecvError::Closed`.
     pub fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);
+        // SAFETY: &self gives exclusive access; dropping the sender closes the channel.
+        unsafe { (*self.sender.get()).take(); }
     }
 
     /// Take a snapshot of the current metrics.

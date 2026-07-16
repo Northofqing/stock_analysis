@@ -7,6 +7,7 @@
 pub mod bus;
 pub mod dispatcher;
 pub mod envelope;
+pub mod jsonl_writer;
 pub mod push_record;
 
 pub use bus::{EventBus, EventBusMetrics, PublishOutcome, RejectReason};
@@ -14,6 +15,7 @@ pub use dispatcher::{
     AuditDispatcher, DispatchResult, Dispatcher, DispatcherRegistry, RegistryError,
 };
 pub use envelope::{DomainEvent, EnvelopeError, EventEnvelope, PushDeliveryEvent};
+pub use jsonl_writer::{JsonlError, JsonlWriter};
 pub use push_record::{PushOutcomeLabel, PushRecord, PushRecordError, ReplayablePushEvent, ReplayablePushEventError};
 
 // ========================================================================
