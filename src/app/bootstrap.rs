@@ -20,7 +20,7 @@ pub fn validate_startup_config() {
     let mut errors: Vec<String> = Vec::new();
 
     // AI 模型：至少配置一个有效 Key
-    let has_any_ai = ["GEMINI_API_KEY", "OPENAI_API_KEY", "DOUBAO_API_KEY"]
+    let has_any_ai = ["GEMINI_API_KEY", "DEEPSEEK_API_KEY", "DOUBAO_API_KEY"]
         .iter()
         .any(|k| {
             std::env::var(k)
@@ -30,7 +30,8 @@ pub fn validate_startup_config() {
         });
     if !has_any_ai {
         errors.push(
-            "未配置任何 AI 模型：请在 .env 至少填写 GEMINI_API_KEY / OPENAI_API_KEY / DOUBAO_API_KEY 中的一个".to_string()
+            "未配置任何 AI 模型：请在 .env 至少填写 GEMINI_API_KEY / DEEPSEEK_API_KEY / DOUBAO_API_KEY 中的一个"
+                .to_string()
         );
     }
 
