@@ -102,6 +102,8 @@ mod daily_report_router;  // v17.6 §5.1: DailyReport SubKind 拆分 (3 variants
 
 mod freshness;
 
+mod v17_sources;  // v17.7 Task 5: six-source monitor push adapter
+
 pub use freshness::{
 
     monitor_freshness_config, validate_nav_freshness, validate_position_freshness,
