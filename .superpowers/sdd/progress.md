@@ -10,12 +10,15 @@
 
 ## Status
 
-- [ ] r2-A Tasks 1-5
-- [ ] v17.3 Tasks 1-5 (after Gate B)
-- [ ] v17.7 Tasks 1-9 (after Gate C)
+- [x] r2-A Task 1 (envelope contract)
+- [ ] r2-A Task 2 (EventBus)
+- [ ] r2-A Task 3 (DispatcherRegistry)
+- [ ] r2-A Task 4 (production bridge)
+- [ ] r2-A Task 5 (Gate B verification)
+- [ ] v17.3 (after Gate B)
+- [ ] v17.7 (after Gate C)
 
 ## Commits Ledger
 
-### r2-A Task 1 (envelope contract)
-(pending)
-
+### r2-A Task 1
+- d3fd0df — feat(v17.1-r2): add event envelope contract (reviewer approved, 0 Critical/Important, 1 Minor — error label drift on serialization failure, no action)
