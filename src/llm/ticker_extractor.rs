@@ -111,8 +111,6 @@ pub async fn extract_tickers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_openai::config::OpenAIConfig;
-    use async_openai::Client;
     use serde_json::json;
     use std::sync::Arc;
 
@@ -196,27 +194,18 @@ mod tests {
         assert!(hits.is_empty());
     }
 
-    /// 集成测试占位: 真实调 OpenAI 兼容, 默认 ignore 避免 CI 跑
+    /// 集成测试占位: 真实调 DeepSeek, 默认 ignore 避免 CI 跑
     #[tokio::test]
-    #[ignore = "需 OPENAI_COMPAT_API_KEY, 本地手动跑"]
+    #[ignore = "需 DEEPSEEK_API_KEY, 本地手动跑"]
     async fn test_extract_tickers_real_api() {
-        if std::env::var("OPENAI_COMPAT_API_KEY").is_err() {
+        if std::env::var("DEEPSEEK_API_KEY").is_err() {
             return;
         }
-        let p = super::super::providers::OpenAiCompatProvider::from_env().unwrap();
+        let p = super::super::providers::DeepSeekProvider::from_env().unwrap();
         let hits = extract_tickers(Arc::new(p), vec!["国务院印发低空经济发展规划".into()])
             .await
             .unwrap();
         // 至少不 panic, 输出 0~N 条
         assert!(hits.len() <= 20);
-    }
-
-    /// 避免 async-trait / OpenAIConfig unused import 警告
-    #[allow(dead_code)]
-    fn _check_imports() {
-        let _cfg = OpenAIConfig::new()
-            .with_api_key("x")
-            .with_api_base("http://localhost");
-        let _c: Client<OpenAIConfig> = Client::with_config(_cfg);
     }
 }
