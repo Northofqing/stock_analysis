@@ -5,11 +5,13 @@
 //! `EventBus` for broadcast distribution.
 
 pub mod bus;
+pub mod cli;
 pub mod dispatcher;
 pub mod envelope;
 pub mod history;
 pub mod jsonl_writer;
 pub mod push_record;
+pub mod replay;
 
 pub use bus::{EventBus, EventBusMetrics, PublishOutcome, RejectReason};
 pub use dispatcher::{
@@ -19,6 +21,8 @@ pub use envelope::{DomainEvent, EnvelopeError, EventEnvelope, PushDeliveryEvent}
 pub use jsonl_writer::{JsonlError, JsonlWriter};
 pub use push_record::{PushOutcomeLabel, PushRecord, PushRecordError, ReplayablePushEvent, ReplayablePushEventError};
 pub use history::{HistoryEntry, HistoryError, HistoryFilter, HistoryOrder, HistoryQuery, RateStats, Window};
+pub use cli::{CliError, EventCommand};
+pub use replay::{ReplayError, ReplayRunner};
 
 // ========================================================================
 // Global bus singleton
