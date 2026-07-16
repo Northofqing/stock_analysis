@@ -7308,6 +7308,15 @@ async fn news_monitor_loop() {
     let mut news_flash_gate =
         news_aggregator_init::NewsFlashGate::new(chrono::Local::now().date_naive());
 
+    // v17.7 Task 7: AnalystStateStore for per-(code, broker) rating tracking
+    let analyst_store = stock_analysis::news::aggregator::analyst_state::AnalystStateStore::new(10_000);
+
+    // v17.7 Task 7: Last poll timestamps for earnings and analyst data (per code)
+    let last_poll_earnings: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let last_poll_analyst: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
     loop {
         if !NewsMonitor::should_run() {
             tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
@@ -7327,6 +7336,34 @@ async fn news_monitor_loop() {
             if !decisions.is_empty() {
                 let (nc, na) = news_aggregator_init::push_flash_decisions(decisions).await;
                 log::info!("[v17.4] news_flash push: critical={} aggregated={}", nc, na);
+            }
+        }
+
+        // v17.7 Task 7: Poll earnings and analyst upgrades for watchlist
+        {
+            let earnings_cfg = stock_analysis::config::get_monitor_config().v17_7_earnings.clone();
+            let poll_secs = earnings_cfg.poll_interval_secs;
+            // Convert from config::EarningsConfig to classifier::EarningsConfig
+            let classifier_cfg = stock_analysis::news::aggregator::classifier::EarningsConfig {
+                metric: earnings_cfg.metric,
+                beat_threshold_pct: earnings_cfg.beat_threshold_pct,
+                miss_threshold_pct: earnings_cfg.miss_threshold_pct,
+                poll_interval_secs: earnings_cfg.poll_interval_secs,
+            };
+            let report = v17_sources::poll_earnings_and_analyst(
+                &our_codes,
+                &classifier_cfg,
+                &analyst_store,
+                std::sync::Arc::clone(&last_poll_earnings),
+                std::sync::Arc::clone(&last_poll_analyst),
+                poll_secs,
+                poll_secs,
+            ).await;
+            if report.attempted > 0 {
+                log::info!(
+                    "[v17.7] earnings/analyst poll: attempted={} classified={} pushed={} skipped={} failed={}",
+                    report.attempted, report.classified, report.pushed, report.skipped, report.failed
+                );
             }
         }
 
