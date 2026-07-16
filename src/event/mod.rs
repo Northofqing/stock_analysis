@@ -5,7 +5,11 @@
 //! `EventBus` for broadcast distribution.
 
 pub mod bus;
+pub mod dispatcher;
 pub mod envelope;
 
 pub use bus::{EventBus, EventBusMetrics, PublishOutcome, RejectReason};
+pub use dispatcher::{
+    AuditDispatcher, DispatchResult, Dispatcher, DispatcherRegistry, RegistryError,
+};
 pub use envelope::{DomainEvent, EnvelopeError, EventEnvelope, PushDeliveryEvent};
