@@ -9,12 +9,72 @@ use crate::notify::{self, PushKind, PushOutcome};
 use chrono::Local;
 use stock_analysis::data_provider::consensus;
 use stock_analysis::data_provider::financials;
+use stock_analysis::monitor::event_bus::MonitorEvent;
 use stock_analysis::news::aggregator::analyst_state::{AnalystKey, AnalystObservation, AnalystStateStore};
 use stock_analysis::news::aggregator::classifier::{classify_earnings, EarningsClassification, EarningsConfig, EarningsKind};
 use stock_analysis::news::aggregator::{NormalizedSourceEvent, SourcePushKind};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+
+/// Bounded state map for deduping OrderUpdate events.
+/// Tracks (action, shares) per code; only emits if the tuple changes.
+#[derive(Debug, Default)]
+pub struct MarketActionState {
+    seen: HashMap<String, (String, u64)>, // code → (action, shares)
+}
+
+impl MarketActionState {
+    /// Returns true if this is a new state (code/action/shares combination is different
+    /// from the last time we saw this code), false if unchanged.
+    pub fn accept(&mut self, event: &MonitorEvent) -> bool {
+        if let MonitorEvent::OrderUpdate { code, action, shares } = event {
+            let prev = self.seen.get(code).cloned();
+            let is_new = prev.as_ref() != Some(&(action.clone(), *shares));
+            self.seen.insert(code.clone(), (action.clone(), *shares));
+            is_new
+        } else {
+            false
+        }
+    }
+}
+
+/// Build a MarketActionAlert NormalizedSourceEvent from an OrderUpdate MonitorEvent.
+pub fn normalize_market_action(event: &MonitorEvent) -> Option<NormalizedSourceEvent> {
+    if let MonitorEvent::OrderUpdate { code, action, shares } = event {
+        NormalizedSourceEvent::new(
+            SourcePushKind::MarketActionAlert,
+            format!("order:{}:{}:{}", code, action, shares),
+            Some(code.clone()),
+            format!("OrderUpdate: {} {} shares", action, shares),
+            format!("Order action {} for {}", action, code),
+            stock_analysis::signal::market_event::Direction::Neutral,
+            70,
+            90,
+            "monitor".into(),
+            None,
+        )
+        .ok()
+    } else {
+        None
+    }
+}
+
+/// Handle a MonitorEvent: dedup via MarketActionState, then push via push_normalized_event.
+pub async fn handle_monitor_event(
+    event: &MonitorEvent,
+    state: &Mutex<MarketActionState>,
+) -> Option<PushAttempt> {
+    let is_new = {
+        let mut s = state.lock().ok()?;
+        s.accept(event)
+    }; // MutexGuard dropped here, before any await
+    if !is_new {
+        return None; // unchanged, skip
+    }
+    let normalized = normalize_market_action(event)?;
+    Some(push_normalized_event(normalized).await)
+}
 
 #[derive(Debug, Clone)]
 pub struct PushAttempt {
@@ -599,5 +659,68 @@ mod tests {
             stock_analysis::news::aggregator::analyst_state::ObservationDecision::Duplicate => {}
             _ => panic!("Expected Duplicate, got {:?}", second_decision),
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 8: MarketActionAlert transition tests
+    // -------------------------------------------------------------------------
+
+    /// Helper: build an OrderUpdate MonitorEvent.
+    fn order_update(code: &str, action: &str, shares: u64) -> MonitorEvent {
+        MonitorEvent::OrderUpdate {
+            code: code.into(),
+            action: action.into(),
+            shares,
+        }
+    }
+
+    #[test]
+    fn order_update_maps_to_emergency_market_action() {
+        let event = order_update("600519", "sell", 100);
+        let normalized = normalize_market_action(&event).unwrap();
+        assert_eq!(normalized.push_kind, SourcePushKind::MarketActionAlert);
+        assert_eq!(normalized.code.as_deref(), Some("600519"));
+        assert!(normalized.title.contains("sell"));
+    }
+
+    #[test]
+    fn unchanged_order_state_is_not_re_emitted() {
+        let mut state = MarketActionState::default();
+        let event = order_update("600519", "sell", 100);
+        assert!(state.accept(&event), "first emission should be accepted");
+        assert!(!state.accept(&event), "identical state should be rejected");
+    }
+
+    #[test]
+    fn market_action_state_dedup_within_capacity() {
+        let mut state = MarketActionState::default();
+        // Different codes are independent
+        let e1 = order_update("600519", "buy", 100);
+        let e2 = order_update("000858", "sell", 200);
+        assert!(state.accept(&e1));
+        assert!(state.accept(&e2));
+        // Same code/action/shares again is rejected
+        assert!(!state.accept(&e1));
+        assert!(!state.accept(&e2));
+        // Different action for same code is accepted
+        let e3 = order_update("600519", "sell", 100); // same code but different action
+        assert!(state.accept(&e3), "different action should be new state");
+        let e4 = order_update("600519", "buy", 200); // different shares
+        assert!(state.accept(&e4), "different shares should be new");
+    }
+
+    #[test]
+    fn handle_monitor_event_non_order_returns_none() {
+        use stock_analysis::monitor::event_bus::MonitorEvent;
+        let state = Mutex::new(MarketActionState::default());
+        // Alert event should return None
+        let alert = MonitorEvent::Alert {
+            title: "test".into(),
+            success: true,
+        };
+        // This is a compile-time check that non-OrderUpdate variants type-check
+        // Actual runtime behavior: the function returns None for non-OrderUpdate
+        let result = futures::executor::block_on(handle_monitor_event(&alert, &state));
+        assert!(result.is_none());
     }
 }

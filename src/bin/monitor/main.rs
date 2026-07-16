@@ -2467,6 +2467,9 @@ async fn main() {
         // 与告警推送（生产者）完全解耦——新增消费者无需改动 push_wechat。
 
         let mut event_rx = EventBus::global().subscribe();
+        let market_action_state = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::v17_sources::MarketActionState::default(),
+        ));
 
         let event_consumer = tokio::spawn(async move {
 
@@ -2499,9 +2502,13 @@ async fn main() {
                             shares,
 
                         } => {
-
-                            log::info!("[event_bus] 订单 {} {}({})", action, code, shares);
-
+                            let state = market_action_state.clone();
+                            let ev_clone = ev.clone();
+                            tokio::spawn(async move {
+                                if let Some(attempt) = crate::v17_sources::handle_monitor_event(&ev_clone, &state).await {
+                                    log::info!("[event_bus] OrderUpdate → MarketActionAlert pushed={:?} len={}", attempt.outcome, attempt.rendered_len);
+                                }
+                            });
                         }
 
                         MonitorEvent::PriceUpdate {

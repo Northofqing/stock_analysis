@@ -1488,6 +1488,30 @@ pub async fn push_account_mode_change(
     )
     .await;
 
+    // 3a. Frozen transition: also emit one MarketActionAlert (NOT for initial eval, NOT for unchanged)
+    if new_mode == LibAM::Frozen {
+        use stock_analysis::news::aggregator::{NormalizedSourceEvent, SourcePushKind};
+        let trigger = eval.trigger_reason.as_deref().unwrap_or("account frozen");
+        let event_id = format!("frozen:{:?}:{:?}", prev_mode, new_mode);
+        let title = format!("账户冻结: {}", trigger);
+        let summary = format!("trigger={}", trigger);
+        if let Ok(maa_event) = NormalizedSourceEvent::new(
+            SourcePushKind::MarketActionAlert,
+            event_id,
+            Some("FROZEN".into()),
+            title,
+            summary,
+            stock_analysis::signal::market_event::Direction::Bear,
+            90,
+            95,
+            "monitor".into(),
+            None,
+        ) {
+            log::warn!("[AccountMode] Frozen transition → MarketActionAlert: {}", trigger);
+            let _ = crate::v17_sources::push_normalized_event(maa_event).await;
+        }
+    }
+
     // 4. 标记 pushed
     if ok {
         if let Err(e) = stock_analysis::database::account_mode_log::mark_account_mode_pushed(log_id)
