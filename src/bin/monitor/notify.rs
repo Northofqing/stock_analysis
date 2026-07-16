@@ -144,6 +144,11 @@ pub enum PushKind {
     AnalystUpgrade,
     /// 今日实盘异常 — 持仓变动 / 账户模式切换 (Emergency, 60s)
     MarketActionAlert,
+    // ============= v17.4 §5.1 能力1: 全天新闻聚合 (BR-033) =============
+    /// v17.4: 高分新闻即时推 (strength≥80 且 certainty≥60, ⚡ 5min/事件)
+    NewsFlashCritical,
+    /// v17.4: 4 时段 (9:30/11:30/13:00/15:00) 聚合 Top3 (ℹ️ 1次/窗口/日)
+    NewsFlashAggregated,
 }
 
 impl PushKind {
@@ -275,6 +280,8 @@ impl PushKind {
             | PushKind::EarningsBeat
             | PushKind::EarningsMiss
             | PushKind::AnalystUpgrade => PushLevel::Important,
+            // v17.4 能力1: 高分新闻即时推重要级 (聚合 NewsFlashAggregated 走默认 Info)
+            | PushKind::NewsFlashCritical => PushLevel::Important,
             // v15.3 D5: 实盘异常是紧急级
             | PushKind::MarketActionAlert => PushLevel::Emergency,
             // ℹ️参考 (降级 + ForbiddenOps/PaperTrade)
@@ -371,6 +378,9 @@ impl PushKind {
             PushKind::EarningsMiss => Some(43_200),     // 12h
             PushKind::AnalystUpgrade => Some(86_400),   // 1次/日
             PushKind::MarketActionAlert => Some(60),    // 1 min/票 (实盘异常需立即)
+            // v17.4 能力1 (BR-033)
+            PushKind::NewsFlashCritical => Some(300),   // 5 min/事件 (code=event_id 前缀)
+            PushKind::NewsFlashAggregated => Some(3600), // 1h/窗口 (code=窗口标签)
             _ => Some(1800),                            // 默认 30min
         }
     }
@@ -442,6 +452,8 @@ impl PushKind {
             PushKind::EtfClosingCallAuction => "ETF 集合竞价尾盘",
             PushKind::PaperReview => "虚拟仓复盘",
             PushKind::CandidateInvalidated => "候选失效",
+            PushKind::NewsFlashCritical => "新闻快讯",
+            PushKind::NewsFlashAggregated => "新闻时段聚合",
             // v15.1 C1.2: IPO 监测
             PushKind::IpoListingApproval => "IPO 过会",
             PushKind::IpoProspectus => "招股说明书",

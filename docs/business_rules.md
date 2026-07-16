@@ -35,6 +35,8 @@
 | BR-030 | 🟡 spec-only (v17.1-r2 未实施) | 推送 L4 (kind, code) 冷却窗 dedup — Reservation token 原子 reserve/commit/rollback: 时间窗内 (不论 committed) 一律 Deduped; 投递失败 rollback 删占位, 避免"失败占满 24h"; expires_at 用 Option<Instant> (None = 已过期) | spec: `docs/v17.x/v17.1-r2-event-infrastructure.md §5.6`; 计划落点 `src/push_l4/dispatcher.rs` |
 | BR-031 | 🟡 spec-only (v17.3 未实施) | 推送 daily_limit 限速 — 全局桶 200/天 + per-kind 二级 (KBuy/KSell 20, KStopLoss 30); fetch_add 单步原子 check+increment (超限回退), 本地时区 day_key 跨天整体 reset (顺带防内存增长); 默认开启 (v15.x 出声), env `PUSH_DISABLE_DAILY_LIMIT=true` 仅调试关闭且 banner 可见 | spec: `docs/v17.x/v17.3-migration-and-persistence.md §5.5`; 计划落点 `src/event/l5_limit.rs` |
 | BR-032 | 🟡 spec-only (v17.1-r2 未实施) | DispatcherRegistry 路由早退 — Vec 按注册顺序遍历, accepts() 首个 true 即处理并停止; 启动 validate() 对 2+ dispatcher 覆盖同 event_type 输出 warn (不阻断) | spec: `docs/v17.x/v17.1-r2-event-infrastructure.md §5.4 + §13.4 决策 #12`; 计划落点 `src/event/dispatcher.rs` |
+| BR-033 | ✅ registered | v17.4 能力1 新闻推送门 (filter+limit): critical 即时推 = strength≥threshold(默认80) 且 certainty≥60, event_id 当日去重, 每日上限 max_critical_per_day(默认20, 超限 warn 出声); 4 时段聚合 = 09:30/11:30/13:00/15:00 ±90s 各触发 1 次/日, 取当日 buffer 按 strength 降序 Top3; 全部阈值走 MonitorConfig (红线2.9 与 v17.4 §5.1/§6 互引) | `src/bin/monitor/news_aggregator_init.rs` (NewsFlashGate) + `src/bin/monitor/main.rs::news_monitor_loop` |
+| BR-034 | ✅ registered | v17.4 能力2 虚拟仓复盘双窗 dedup: 13:00 快照与 evening 全量复盘共用 PushKind::PaperReview (cooldown 86400/票), 快照用 "noon-{code}" 作 dedup code 前缀隔离两窗口; 13:00±90s 当日一次门控 (Mutex<Option<NaiveDate>>) | `src/bin/monitor/main.rs` (noon snapshot cron) + `src/bin/monitor/push_templates.rs::dispatch_paper_review_noon` |
 
 ---
 

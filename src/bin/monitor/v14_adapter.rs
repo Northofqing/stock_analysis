@@ -325,6 +325,9 @@ fn map_push_kind(kind: PushKind) -> (SignalSource, &'static str, Severity) {
             (SectorRotation, "etf_closing_call_auction", Severity::Normal)
         }
         PushKind::PaperReview => (HoldingHealth, "paper_review", Severity::Normal),
+        // v17.4 能力1 (BR-033)
+        PushKind::NewsFlashCritical => (NewsCatalyst, "news_flash_critical", Severity::High),
+        PushKind::NewsFlashAggregated => (NewsCatalyst, "news_flash_aggregated", Severity::Normal),
         PushKind::CandidateInvalidated => {
             (HoldingHealth, "candidate_invalidated", Severity::Normal)
         }

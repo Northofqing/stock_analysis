@@ -71,6 +71,12 @@ pub struct MonitorConfig {
     /// Threshold-Proof (红线 2.9): 与 docs/v17.x/v17.4-news-and-review.md §5.3.2/§6 互为引用
     #[serde(default = "default_screener_min_score")]
     pub screener_min_score: u8,
+    /// v17.4 §5.1 (BR-033): 新闻 critical 即时推强度阈值 (默认 80, 与 spec §6 互引)
+    #[serde(default = "default_news_critical_score_threshold")]
+    pub news_critical_score_threshold: u8,
+    /// v17.4 §5.1 (BR-033): critical 每日上限 (防刷屏, 默认 20, 超限 warn 出声)
+    #[serde(default = "default_news_max_critical_per_day")]
+    pub news_max_critical_per_day: u32,
     #[serde(default = "default_opp_interval")]
     pub opportunity_scan_interval_min: u64,
     #[serde(default = "default_news_window_start_hour")]
@@ -139,6 +145,12 @@ fn default_screener_interval() -> u64 {
 }
 fn default_screener_min_score() -> u8 {
     75
+}
+fn default_news_critical_score_threshold() -> u8 {
+    80
+}
+fn default_news_max_critical_per_day() -> u32 {
+    20
 }
 fn default_opp_interval() -> u64 {
     60
@@ -349,6 +361,8 @@ impl Default for MonitorConfig {
         Self {
             screener_interval_min: 30,
             screener_min_score: 75,
+            news_critical_score_threshold: 80,
+            news_max_critical_per_day: 20,
             opportunity_scan_interval_min: 60,
             news_window_start_hour: 8,
             news_window_end_hour: 22,

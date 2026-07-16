@@ -7143,22 +7143,31 @@ async fn news_monitor_loop() {
 
     log::info!("[NewsMonitor] L2 标的池: {} 只", our_codes.len());
 
-
+    // v17.4 §5.1 (BR-033): NewsFlashGate — critical 即时推 + 4 时段聚合 Top3
+    let mut news_flash_gate =
+        news_aggregator_init::NewsFlashGate::new(chrono::Local::now().date_naive());
 
     loop {
-
         if !NewsMonitor::should_run() {
-
             tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-
             continue;
-
         }
-
         // v17.4: NewsAggregator tick 入口 — 每轮调一次, 拿 dedup 后 Vec<MarketEvent>
-        // 后续接入 news_ranker / news_outcome / news_catalyst 时把 events 直接喂过去
-        let _news_events = news_aggregator_init::tick_news_aggregator(20).await;
-        let _ = _news_events; // 暂不消费, 仅 log + dedup
+        // v17.4 §5.1: 事件喂 NewsFlashGate → critical 即时推 + 4 时段聚合 (AC34/AC35)
+        let news_events = news_aggregator_init::tick_news_aggregator(20).await;
+        {
+            let mcfg = stock_analysis::config::get_monitor_config();
+            let decisions = news_flash_gate.process(
+                &news_events,
+                chrono::Local::now(),
+                mcfg.news_critical_score_threshold,
+                mcfg.news_max_critical_per_day,
+            );
+            if !decisions.is_empty() {
+                let (nc, na) = news_aggregator_init::push_flash_decisions(decisions).await;
+                log::info!("[v17.4] news_flash push: critical={} aggregated={}", nc, na);
+            }
+        }
 
         // L2 概念索引刷新（每5分钟一次）
 
@@ -7874,6 +7883,23 @@ async fn monitor_loop() {
             }
             // Fix 4 (review): PerformanceEngine 15:05 cron 接入 (写 paper_performance_snapshot)
             // 用 OnceLock<NaiveDate> 防当日重复, 失败可重试
+            // v17.4 §5.2 (BR-034): 13:00 午盘虚拟仓快照 (AC38) — 当日一次, 13:00-13:05 首个 tick 触发
+            if now.hour() == 13 && now.minute() < 5 {
+                static NOON_SNAP_LAST: std::sync::Mutex<Option<chrono::NaiveDate>> =
+                    std::sync::Mutex::new(None);
+                let today = now.date_naive();
+                let already = NOON_SNAP_LAST
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .map(|d| d == today)
+                    .unwrap_or(false);
+                if !already {
+                    let date_str = today.format("%Y-%m-%d").to_string();
+                    let ok = push_templates::dispatch_paper_review_noon(&date_str).await;
+                    log::info!("[v17.4 §5.2] 13:00 虚拟仓午盘快照: pushed={}", ok);
+                    *NOON_SNAP_LAST.lock().unwrap_or_else(|e| e.into_inner()) = Some(today);
+                }
+            }
             if now.hour() == 15 && now.minute() == 5 {
                 use stock_analysis::performance::PerformanceEngine;
                 static PERF_LAST_RUN: std::sync::Mutex<Option<chrono::NaiveDate>> = std::sync::Mutex::new(None);

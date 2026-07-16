@@ -3382,6 +3382,29 @@ pub async fn dispatch_paper_review_daily(date: &str) -> bool {
     result
 }
 
+/// v17.4 §5.2 (BR-034): 13:00 午盘虚拟仓快照 (AC38).
+/// 与 evening 全量复盘共用 PushKind::PaperReview (cooldown 86400/票),
+/// dedup code 用 "noon-{code}" 前缀隔离两窗口 (否则午盘推完 evening 被 L4 拦).
+pub async fn dispatch_paper_review_noon(date: &str) -> bool {
+    let snapshot = load_paper_review_snapshot_real(date);
+    if snapshot.name.is_empty() {
+        // 红线 2.2: 无数据显式说明, 不臆造
+        log_dispatcher_attempt("A-01-noon", false, 0, "paper_review_snapshot empty");
+        log::info!("[A-01-noon] 13:00 快照: virtual_observation 无数据, 跳过");
+        return false;
+    }
+    let params = build_paper_review_from_snapshot(&snapshot);
+    let noon_code = noon_dedup_code(&snapshot.code);
+    let result = push_paper_review(&noon_code, params).await;
+    log_dispatcher_attempt("A-01-noon", result, 1, "");
+    result
+}
+
+/// BR-034: 午盘快照 dedup code (纯函数, 供单测)
+pub fn noon_dedup_code(code: &str) -> String {
+    format!("noon-{}", code)
+}
+
 // ============================================================================
 // v35: A-10 盘后题材催化复盘 dispatcher
 // ============================================================================

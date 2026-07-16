@@ -155,12 +155,286 @@ pub async fn tick_news_aggregator(per_feed_limit: usize) -> Vec<MarketEvent> {
 }
 
 // ============================================================================
+// v17.4 §5.1 能力1: NewsFlashGate — critical 即时推 + 4 时段聚合 Top3
+// 业务规则登记: BR-033 (docs/business_rules.md, 红线 2.10)
+// ============================================================================
+
+/// 4 个聚合窗口 (开盘/午盘收/午盘开/收盘)
+const AGG_WINDOWS: [(u32, u32); 4] = [(9, 30), (11, 30), (13, 0), (15, 0)];
+
+/// 窗口触发容差: 窗口时刻起 5 分钟内首个 tick 触发 (news_monitor_loop 轮询默认
+/// 120s, spec ±1min 会漏; 加宽到 5min + 当日一次门控, 偏差已在 spec 回填注明)
+const AGG_WINDOW_TOLERANCE_SECS: i64 = 300;
+
+/// 聚合决策 (纯数据, 供单测断言)
+#[derive(Debug, PartialEq)]
+pub enum FlashDecision {
+    /// 即时推 (critical): (event_id, 渲染文本)
+    Critical(String, String),
+    /// 时段聚合推: (窗口标签, 渲染文本)
+    Aggregated(String, String),
+}
+
+/// v17.4 §5.1 门控状态机 (纯逻辑, 不做 IO — 推送由 caller 处理)
+pub struct NewsFlashGate {
+    day: chrono::NaiveDate,
+    seen_today: std::collections::HashSet<String>,
+    critical_pushed_today: u32,
+    /// 每窗口当日是否已触发
+    window_fired: [bool; 4],
+    /// 当日事件缓冲 (strength, 标题行) — 聚合 Top3 用, 上限 200
+    buffer: Vec<(u8, String)>,
+}
+
+impl NewsFlashGate {
+    pub fn new(today: chrono::NaiveDate) -> Self {
+        Self {
+            day: today,
+            seen_today: std::collections::HashSet::new(),
+            critical_pushed_today: 0,
+            window_fired: [false; 4],
+            buffer: Vec::new(),
+        }
+    }
+
+    /// 跨天重置 (BR-033: 日桶清零, 防内存增长)
+    fn rollover(&mut self, today: chrono::NaiveDate) {
+        if self.day != today {
+            self.day = today;
+            self.seen_today.clear();
+            self.critical_pushed_today = 0;
+            self.window_fired = [false; 4];
+            self.buffer.clear();
+            log::info!("[NewsFlashGate] day rollover → {} (buckets reset)", today);
+        }
+    }
+
+    /// 每 tick 调用: 喂入 dedup 后事件 + 当前时间 → 产出推送决策 (BR-033)
+    ///
+    /// critical 判定: strength ≥ threshold 且 certainty ≥ 60 (官方性门槛);
+    /// 每日上限 max_per_day, 超限 warn 出声 (v15.x 静默路径可见)。
+    pub fn process(
+        &mut self,
+        events: &[MarketEvent],
+        now: chrono::DateTime<chrono::Local>,
+        critical_threshold: u8,
+        max_critical_per_day: u32,
+    ) -> Vec<FlashDecision> {
+        self.rollover(now.date_naive());
+        let mut out = Vec::new();
+
+        // 1. 事件驱动: critical 即时推 (AC34)
+        for e in events {
+            if !self.seen_today.insert(e.event_id.clone()) {
+                continue; // event_id 当日去重
+            }
+            // buffer 收集 (聚合用, 上限 200)
+            if self.buffer.len() < 200 {
+                self.buffer.push((
+                    e.strength,
+                    format!(
+                        "[{}] {} (强度{} 确定性{})",
+                        e.event_type.label(),
+                        if e.full_title.is_empty() { &e.subject } else { &e.full_title },
+                        e.strength,
+                        e.certainty
+                    ),
+                ));
+            }
+            if e.strength >= critical_threshold && e.certainty >= 60 {
+                if self.critical_pushed_today >= max_critical_per_day {
+                    log::warn!(
+                        "[NewsFlashGate] critical 日上限已满 ({}/{}), 跳过: {}",
+                        self.critical_pushed_today, max_critical_per_day, e.subject
+                    );
+                    continue;
+                }
+                self.critical_pushed_today += 1;
+                out.push(FlashDecision::Critical(
+                    e.event_id.clone(),
+                    format!(
+                        "🚨 高分新闻快讯 ({})\n[{}] {}\n强度 {} | 确定性 {} | 今日第 {}/{} 条",
+                        now.format("%H:%M"),
+                        e.event_type.label(),
+                        if e.full_title.is_empty() { &e.subject } else { &e.full_title },
+                        e.strength,
+                        e.certainty,
+                        self.critical_pushed_today,
+                        max_critical_per_day
+                    ),
+                ));
+            }
+        }
+
+        // 2. 4 时段聚合 Top3 (AC35): 窗口时刻起 5min 内首个 tick 触发, 当日一次
+        for (i, (h, m)) in AGG_WINDOWS.iter().enumerate() {
+            if self.window_fired[i] {
+                continue;
+            }
+            let target = now
+                .date_naive()
+                .and_hms_opt(*h, *m, 0)
+                .expect("valid window time")
+                .and_local_timezone(chrono::Local)
+                .single();
+            let Some(target) = target else { continue };
+            let delta = (now - target).num_seconds();
+            if (0..AGG_WINDOW_TOLERANCE_SECS).contains(&delta) {
+                self.window_fired[i] = true;
+                let label = format!("{:02}:{:02}", h, m);
+                if self.buffer.is_empty() {
+                    // 红线 2.2: 无数据显式说明, 不臆造
+                    log::info!("[NewsFlashGate] {} 窗口无事件, 跳过聚合推送", label);
+                    continue;
+                }
+                let mut sorted: Vec<&(u8, String)> = self.buffer.iter().collect();
+                sorted.sort_by(|a, b| b.0.cmp(&a.0));
+                let mut text = format!("📰 新闻时段聚合 ({}) Top3:\n", label);
+                for (rank, (_, line)) in sorted.iter().take(3).enumerate() {
+                    text.push_str(&format!("{}. {}\n", rank + 1, line));
+                }
+                out.push(FlashDecision::Aggregated(label, text));
+            }
+        }
+
+        out
+    }
+}
+
+/// 推送包装: 把 FlashDecision 走现有 push_governor_v3 (L4 dedup: critical 按
+/// event_id, 聚合按窗口标签 — 见 BR-033)。返回 (critical 推送数, 聚合推送数)。
+pub async fn push_flash_decisions(decisions: Vec<FlashDecision>) -> (usize, usize) {
+    let mut n_critical = 0usize;
+    let mut n_agg = 0usize;
+    for d in decisions {
+        match d {
+            FlashDecision::Critical(event_id, text) => {
+                let outcome = crate::notify::push_governor_v3(
+                    &text,
+                    crate::notify::PushKind::NewsFlashCritical,
+                    Some(&event_id[..event_id.len().min(16)]),
+                )
+                .await;
+                if outcome.is_pushed() {
+                    n_critical += 1;
+                } else {
+                    log::info!("[NewsFlashGate] critical 未推 (治理): {:?}", outcome);
+                }
+            }
+            FlashDecision::Aggregated(window, text) => {
+                let outcome = crate::notify::push_governor_v3(
+                    &text,
+                    crate::notify::PushKind::NewsFlashAggregated,
+                    Some(&window),
+                )
+                .await;
+                if outcome.is_pushed() {
+                    n_agg += 1;
+                } else {
+                    log::info!("[NewsFlashGate] {} 聚合未推 (治理): {:?}", window, outcome);
+                }
+            }
+        }
+    }
+    (n_critical, n_agg)
+}
+
+// ============================================================================
 // 单元测试
 // ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use stock_analysis::signal::market_event::{Direction, EventType};
+
+    fn ev(id_seed: &str, strength: u8, certainty: u8) -> MarketEvent {
+        let mut e = MarketEvent::new(
+            EventType::Policy,
+            format!("测试事件-{}", id_seed),
+            None,
+            Direction::Bull,
+            strength,
+            certainty,
+        );
+        e.event_id = format!("eid-{}", id_seed); // 固定 id 便于断言
+        e
+    }
+
+    fn at(h: u32, m: u32) -> chrono::DateTime<chrono::Local> {
+        chrono::Local::now()
+            .date_naive()
+            .and_hms_opt(h, m, 0)
+            .unwrap()
+            .and_local_timezone(chrono::Local)
+            .single()
+            .unwrap()
+    }
+
+    /// AC34 + AC46: 阈值默认 80/certainty 60 门; 低分不推
+    #[test]
+    fn gate_critical_threshold_and_certainty() {
+        let mut g = NewsFlashGate::new(at(10, 0).date_naive());
+        let d = g.process(&[ev("a", 85, 70), ev("b", 85, 30), ev("c", 60, 90)], at(10, 0), 80, 20);
+        assert_eq!(d.len(), 1, "仅 strength≥80 且 certainty≥60 推");
+        assert!(matches!(&d[0], FlashDecision::Critical(id, _) if id == "eid-a"));
+    }
+
+    /// BR-033: event_id 当日去重
+    #[test]
+    fn gate_dedup_same_event_id() {
+        let mut g = NewsFlashGate::new(at(10, 0).date_naive());
+        let e = ev("dup", 90, 90);
+        assert_eq!(g.process(&[e.clone()], at(10, 0), 80, 20).len(), 1);
+        assert_eq!(g.process(&[e], at(10, 1), 80, 20).len(), 0, "同 event_id 当日不重推");
+    }
+
+    /// BR-033: 每日上限
+    #[test]
+    fn gate_daily_cap() {
+        let mut g = NewsFlashGate::new(at(10, 0).date_naive());
+        let events: Vec<MarketEvent> = (0..5).map(|i| ev(&format!("cap{}", i), 90, 90)).collect();
+        let d = g.process(&events, at(10, 0), 80, 3);
+        assert_eq!(d.len(), 3, "超 max_critical_per_day=3 截断");
+    }
+
+    /// AC35: 窗口触发一次/日 + Top3 按 strength 降序
+    #[test]
+    fn gate_window_fires_once_with_top3() {
+        let mut g = NewsFlashGate::new(at(9, 0).date_naive());
+        // 9:00 喂 4 条低分事件 (进 buffer, 不 critical)
+        let events: Vec<MarketEvent> =
+            [40u8, 70, 55, 60].iter().enumerate().map(|(i, &s)| ev(&format!("w{}", i), s, 50)).collect();
+        assert!(g.process(&events, at(9, 0), 80, 20).is_empty());
+        // 9:31 → 触发 09:30 窗口
+        let d1 = g.process(&[], at(9, 31), 80, 20);
+        assert_eq!(d1.len(), 1);
+        match &d1[0] {
+            FlashDecision::Aggregated(w, text) => {
+                assert_eq!(w, "09:30");
+                assert!(text.contains("强度70"), "Top1 应是 strength=70: {}", text);
+                assert_eq!(text.matches("测试事件").count(), 3, "只取 Top3");
+            }
+            other => panic!("应为 Aggregated, got {:?}", other),
+        }
+        // 9:33 再 tick → 同窗口不重复触发
+        assert!(g.process(&[], at(9, 33), 80, 20).is_empty(), "窗口当日一次");
+    }
+
+    /// 红线 2.2: 窗口无事件不臆造推送
+    #[test]
+    fn gate_window_empty_buffer_no_push() {
+        let mut g = NewsFlashGate::new(at(11, 0).date_naive());
+        assert!(g.process(&[], at(11, 30), 80, 20).is_empty());
+    }
+
+    /// AC46: config 默认值
+    #[test]
+    fn news_config_defaults() {
+        let cfg = stock_analysis::config::MonitorConfig::default();
+        assert_eq!(cfg.news_critical_score_threshold, 80);
+        assert_eq!(cfg.news_max_critical_per_day, 20);
+    }
 
     #[test]
     fn init_news_aggregator_short_circuits_when_global_set() {
