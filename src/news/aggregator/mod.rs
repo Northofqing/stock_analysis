@@ -10,9 +10,11 @@
 pub mod feed;
 pub mod source_event;
 pub mod classifier;
+pub mod analyst_state;
 
 // Re-export for convenience
 pub use source_event::{NormalizedSourceEvent, NormalizedSourceError, SourcePushKind};
+pub use analyst_state::{AnalystStateStore, AnalystKey, AnalystObservation, ObservationDecision};
 
 use crate::signal::market_event::{EventType, MarketEvent};
 use anyhow::Result;
