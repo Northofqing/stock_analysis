@@ -1847,6 +1847,17 @@ async fn main() {
     // v17.6 §5.1: daily_report_router 启动 audit (3 sub_kinds + legacy 映射表)
     daily_report_router::init_audit();
 
+    // v17.4 D 方案启动 banner (v15.x 静默路径可见): SectorTop 废弃态 + 选股阈值
+    log::info!(
+        "[v17.4-D] sector_top.mode={} | screener_min_score={} | holding_health.dedup=on_same_state",
+        if sector_top_kept() {
+            "kept (env STOCK_ANALYSIS_KEEP_SECTOR_TOP 显式保留)"
+        } else {
+            "deprecated (I-01 覆盖; 回滚 env STOCK_ANALYSIS_KEEP_SECTOR_TOP=1)"
+        },
+        stock_analysis::config::get_monitor_config().screener_min_score,
+    );
+
     // v17.x: DispatchTable 启动 audit (13 audit-marked rows: v17.6=3 + v17.7=6 + v17.8=4; BlockTrade* 已删)
     notify::dispatch_table_init_audit();
 
@@ -9523,30 +9534,28 @@ async fn monitor_loop() {
 
 
 
-                    // v19.12: 持仓健康度 → 每 5 分钟硬推 (去掉条件限制, 用户要求全推)
-
+                    // v19.12: 持仓健康度 → 每 5 分钟推 (用户要求全推)
+                    // v17.4 §5.3.3 (D 方案): state 未变 → dedup 跳过 (内容相同无信息增量, 非降级);
+                    //   state 变化立即推, 5min 节奏保留 (AC44). 跳过时 info 出声 (AC47).
                     if last_health_summary.elapsed().as_secs() >= 300 && !health_lines.is_empty() {
-
                         last_health_summary = std::time::Instant::now();
-
-                        let mut summary = vec![format!(
-
-                            "📊 持仓健康度 ({})",
-
-                            chrono::Local::now().format("%H:%M")
-
-                        )];
-
-                        summary.append(&mut health_lines);
-
-                        summary.push("─────".into());
-
-                        summary.push("💡 T-04 持仓监控 (5min 周期, 全推)".into());
-
-                        notify::push_governor(&summary.join("\n"), notify::PushKind::HoldingEvent)
-
-                            .await;
-
+                        let state_hash = health_state_hash(&health_lines);
+                        if holding_health_state_unchanged(state_hash) {
+                            log::info!(
+                                "[v17.4-D] [dedup] holding.health state 未变 (hash={:x}), 跳过本轮 T-04 推送",
+                                state_hash
+                            );
+                        } else {
+                            let mut summary = vec![format!(
+                                "📊 持仓健康度 ({})",
+                                chrono::Local::now().format("%H:%M")
+                            )];
+                            summary.append(&mut health_lines);
+                            summary.push("─────".into());
+                            summary.push("💡 T-04 持仓监控 (5min 周期, state 变化时推)".into());
+                            notify::push_governor(&summary.join("\n"), notify::PushKind::HoldingEvent)
+                                .await;
+                        }
                     }
 
 
@@ -9703,14 +9712,19 @@ async fn monitor_loop() {
 
 
 
-                    // 领涨板块（独立计时器，每5分钟）
-
+                    // v17.4 §5.3.1 (⚠️ BREAKING): 领涨板块 SectorTop 5min 推送废弃 —
+                    // I-01 盘中轮动总览 (10min, main.rs v31) 已覆盖同类信息且带 chain 热度.
+                    // 回滚: env STOCK_ANALYSIS_KEEP_SECTOR_TOP=1 恢复 5min 推送 (无需重启以外操作).
+                    // v15.x 静默路径可见: 启动 banner 打 mode + 每次跳过 info (AC47).
                     if last_sector_push.elapsed().as_secs() >= 300 {
-
                         last_sector_push = std::time::Instant::now();
-
-                        push_sector_leaders().await;
-
+                        if sector_top_kept() {
+                            push_sector_leaders().await;
+                        } else {
+                            log::info!(
+                                "[v17.4-D] SectorTop 已废弃, 跳过 5min 推送 (I-01 覆盖; 回滚 env STOCK_ANALYSIS_KEEP_SECTOR_TOP=1)"
+                            );
+                        }
                     }
 
 
@@ -10639,18 +10653,23 @@ fn run_stock_screener() -> Option<Vec<String>> {
 
 
 
-    // 5. 按置信度降序，取置信度达阈值（≥50）的 Top 3
-
-    // v13.10.1 P1-#7: 阈值 20→50. 修复前 30-40 置信度全推, 用户反馈"只推送无意义".
-
+    // 5. 按置信度降序, 取置信度达阈值的 Top 3
+    // v13.10.1 P1-#7: 阈值 20→50. v17.4 §5.3.2: 阈值改走 config (默认 75, 与 launch_gate 语义自洽),
+    //   低于阈值静默时 info 出声 (AC43/AC47).
+    let min_score = stock_analysis::config::get_monitor_config().screener_min_score;
     signals.sort_by(|a, b| b.0.confidence.cmp(&a.0.confidence));
-
+    for (s, _) in signals.iter().filter(|(s, _)| s.confidence < min_score) {
+        if s.confidence >= 50 {
+            // 旧阈值会推、新阈值静默的区间 — 逐条出声, 方便回滚对照
+            log::info!(
+                "[选股] {}({}) score={} < {}, 静默 (config screener_min_score={})",
+                s.name, s.code, s.confidence, min_score, min_score
+            );
+        }
+    }
     let recs: Vec<String> = signals
-
         .iter()
-
-        .filter(|(s, _)| s.confidence >= 50)
-
+        .filter(|(s, _)| s.confidence >= min_score)
         .take(3)
 
         .map(|(s, board)| {
@@ -10694,6 +10713,44 @@ fn run_stock_screener() -> Option<Vec<String>> {
 }
 
 
+
+/// v17.4 §5.3.1: SectorTop 废弃回滚判定 (纯函数, 供单测).
+/// 默认 (env 未设/其他值) = false = 不推 (BREAKING, v17.4 D 方案);
+/// 显式 "1"/"true" = 保留旧 5min 推送。
+fn sector_top_kept_from(val: Option<&str>) -> bool {
+    matches!(val, Some("1") | Some("true"))
+}
+
+/// 运行时读 env (OnceLock 缓存, 每 5min 调一次不值得重复 syscall)
+fn sector_top_kept() -> bool {
+    static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *KEPT.get_or_init(|| {
+        sector_top_kept_from(
+            std::env::var("STOCK_ANALYSIS_KEEP_SECTOR_TOP")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// v17.4 §5.3.3: 持仓健康度 state 哈希 (纯函数, 供单测).
+/// 只哈希内容行 (不含时间戳行), 同 state 同 hash。
+fn health_state_hash(lines: &[String]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for l in lines {
+        l.hash(&mut h);
+    }
+    h.finish()
+}
+
+/// v17.4 §5.3.3: 与上轮 state 比较; 相同返 true (调用方跳推), 不同则更新并返 false。
+fn holding_health_state_unchanged(hash: u64) -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // 0 作哨兵 (DefaultHasher 几乎不会产 0; 真碰上也只多推一次, 无安全风险)
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    LAST.swap(hash, Ordering::Relaxed) == hash
+}
 
 /// 持仓实时行情：东财 push2 为主（多主机轮询），新浪兜底
 
@@ -11394,6 +11451,49 @@ fn run_candidate_panel_from_review(
 }
 
 
+
+#[cfg(test)]
+mod tests_v17_4_d {
+    use super::*;
+
+    /// AC45/AC46: SectorTop 默认废弃 (env 未设 = 不推), 显式 1/true 才保留
+    #[test]
+    fn sector_top_default_deprecated() {
+        assert!(!sector_top_kept_from(None), "默认必须废弃 (BREAKING 默认态)");
+        assert!(!sector_top_kept_from(Some("0")));
+        assert!(!sector_top_kept_from(Some("")));
+        assert!(sector_top_kept_from(Some("1")), "回滚 env=1 必须恢复");
+        assert!(sector_top_kept_from(Some("true")));
+    }
+
+    /// AC46: config 默认值 screener_min_score = 75
+    #[test]
+    fn screener_min_score_default_is_75() {
+        let cfg = stock_analysis::config::MonitorConfig::default();
+        assert_eq!(cfg.screener_min_score, 75, "v17.4 §5.3.2 默认 75");
+    }
+
+    /// AC44: state 哈希 — 同内容同 hash, 变更后不同
+    #[test]
+    fn health_state_hash_stable_and_sensitive() {
+        let a = vec!["600519 正常".to_string(), "000001 预警".to_string()];
+        let b = a.clone();
+        let c = vec!["600519 正常".to_string(), "000001 止损".to_string()];
+        assert_eq!(health_state_hash(&a), health_state_hash(&b));
+        assert_ne!(health_state_hash(&a), health_state_hash(&c));
+    }
+
+    /// AC44: 首次不拦, 同 state 拦, 变 state 放行
+    #[test]
+    fn holding_health_dedup_sequence() {
+        // 注: 共享全局 AtomicU64, 用本测试专属的不会与其他测试碰撞的 hash 序列
+        let h1 = health_state_hash(&["tests_v17_4_d-seq-A".to_string()]);
+        let h2 = health_state_hash(&["tests_v17_4_d-seq-B".to_string()]);
+        assert!(!holding_health_state_unchanged(h1), "首次 h1 应放行");
+        assert!(holding_health_state_unchanged(h1), "重复 h1 应拦");
+        assert!(!holding_health_state_unchanged(h2), "变更为 h2 应放行");
+    }
+}
 
 #[cfg(test)]
 

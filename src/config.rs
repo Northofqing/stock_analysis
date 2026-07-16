@@ -67,6 +67,10 @@ pub struct AnnounceKeywordsFile {
 pub struct MonitorConfig {
     #[serde(default = "default_screener_interval")]
     pub screener_interval_min: u64,
+    /// v17.4 §5.3.2 (D 方案): 选股推荐最低置信度, 低于该值静默 (info log 出声)
+    /// Threshold-Proof (红线 2.9): 与 docs/v17.x/v17.4-news-and-review.md §5.3.2/§6 互为引用
+    #[serde(default = "default_screener_min_score")]
+    pub screener_min_score: u8,
     #[serde(default = "default_opp_interval")]
     pub opportunity_scan_interval_min: u64,
     #[serde(default = "default_news_window_start_hour")]
@@ -132,6 +136,9 @@ pub struct MonitorConfig {
 
 fn default_screener_interval() -> u64 {
     30
+}
+fn default_screener_min_score() -> u8 {
+    75
 }
 fn default_opp_interval() -> u64 {
     60
@@ -341,6 +348,7 @@ impl Default for MonitorConfig {
     fn default() -> Self {
         Self {
             screener_interval_min: 30,
+            screener_min_score: 75,
             opportunity_scan_interval_min: 60,
             news_window_start_hour: 8,
             news_window_end_hour: 22,
