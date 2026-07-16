@@ -11,16 +11,14 @@
 ## Status
 
 - [x] r2-A Tasks 1-5 (Gate B GREEN)
-- [x] v17.3 Tasks 1-2 (push records + JSONL writer)
-- [x] v17.3 Task 3 (history + success rate)
-- [ ] v17.3 Task 4 (replay + CLI parser)
+- [x] v17.3 Tasks 1-4 (push records + JSONL writer + history + replay/CLI)
 - [ ] v17.3 Task 5 (Gate C verification)
 - [ ] v17.7 (after Gate C)
 
 ## Commits Ledger
 
-### v17.3 Task 3
-- affe306 — feat(v17.3): add event history and delivery rates (reviewer approved)
-  - 2/2 tests pass; typed `HistoryError`; per-sink/per-kind rates correct; `Denied`/`Deduped` excluded from rate denominator
-  - Minor (logged, not fixed): silent `Err(_) => continue` in `push_success_rate` file-open path (history.rs:298-300) — should log warn per global constraint
+### v17.3 Task 4
+- ff96eed — feat(v17.3): add safe replay and history CLI (reviewer approved)
+  - 16/16 tests pass; typed errors; dry-run never publishes; force-replay only `push.source`
+  - Minor (logged): `rate_ms` parameter accepted but not throttled; `count` overcounts when all publishes rejected; text-prefix not directly asserted in test
 
