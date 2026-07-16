@@ -217,6 +217,7 @@ mod tests {
                 extra: None,
             },
             triggered_at: chrono::Local::now(),
+            routed_external_id: None,
         }
     }
 

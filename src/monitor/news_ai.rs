@@ -192,6 +192,7 @@ impl NewsAIAnalyzer {
                 extra: Some(format!("AI影响评估:{},置信度:{}%", impact, confidence)),
             },
             triggered_at: Local::now(),
+            routed_external_id: None,
         })
     }
 

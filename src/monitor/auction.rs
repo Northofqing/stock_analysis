@@ -106,6 +106,7 @@ pub fn classify_auction(
             },
         },
         triggered_at: Local::now(),
+        routed_external_id: None,
     })
 }
 

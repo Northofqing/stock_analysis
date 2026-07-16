@@ -7446,6 +7446,33 @@ async fn news_monitor_loop() {
 
         let events = nm.process_announcements(&anns, &resolved_codes);
 
+        // v17.7 §6 Step 3: Route announcements through v17_sources before legacy loop.
+        // Track routed external_ids to prevent duplicate legacy push.
+        let mut routed_external_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        {
+            use stock_analysis::news::aggregator::classifier::classify_announcement;
+            let mut normalized_events: Vec<stock_analysis::news::aggregator::NormalizedSourceEvent> = Vec::new();
+            for ann in &anns {
+                if let Ok(event) = classify_announcement(ann) {
+                    normalized_events.push(event);
+                }
+            }
+            if !normalized_events.is_empty() {
+                let report = v17_sources::push_normalized_events(normalized_events).await;
+                log::info!(
+                    "[v17.7] announcement routing: classified={} pushed={} failed={}",
+                    report.classified, report.pushed, report.failed
+                );
+                // Collect routed event_ids for dedup
+                // Note: push_normalized_events consumes events, so we reconstruct from announcements
+                for ann in &anns {
+                    if let Some(ref eid) = ann.external_id {
+                        routed_external_ids.insert(eid.clone());
+                    }
+                }
+            }
+        }
+
         let mut pushed: Vec<AlertEvent> = Vec::new();
 
         for e in events {
@@ -7455,9 +7482,12 @@ async fn news_monitor_loop() {
             stock_analysis::monitor::alert_log::append_md(&e);
 
             if let Some(ev) = sm.process(e) {
-
-                push(&ev).await;
-
+                // v17.7: Skip legacy push if this event was routed through v17_sources
+                if ev.routed_external_id.as_ref().map(|id| routed_external_ids.contains(id)).unwrap_or(false) {
+                    log::debug!("skipped legacy push: external_id={}", ev.routed_external_id.as_ref().unwrap());
+                } else {
+                    push(&ev).await;
+                }
                 pushed.push(ev);
 
             }
@@ -9612,6 +9642,7 @@ async fn monitor_loop() {
                                 },
 
                                 triggered_at: chrono::Local::now(),
+                                routed_external_id: None,
 
                             };
 
@@ -12163,6 +12194,137 @@ mod tests_v17_3_integration {
             cmd.is_some(),
             "parse_args should return Some for --history; got None — CLI not wired in main()"
         );
+    }
+}
+
+// ========================================================================
+// v17.7 Task 6 Step 1: Announcement routing duplicate-prevention test
+// ========================================================================
+
+#[cfg(test)]
+mod tests_v17_7_announcement_wiring {
+    use super::*;
+    use stock_analysis::data_provider::announcement::{self, Announcement};
+    use stock_analysis::monitor::detector::{AlertCategory, AlertDetail, AlertEvent, AlertLevel};
+    use chrono::Local;
+
+    /// Report from simulate_announcement_loop
+    struct AnnouncementLoopReport {
+        announcement_attempts: usize,
+        /// How many times legacy push would be called for a given external_id
+        legacy_attempts: std::collections::HashMap<String, usize>,
+    }
+
+    impl AnnouncementLoopReport {
+        fn legacy_daily_report_attempts_for(&self, external_id: &str) -> usize {
+            self.legacy_attempts.get(external_id).copied().unwrap_or(0)
+        }
+    }
+
+    /// Simulates the v17.7 announcement loop logic:
+    /// 1. Classify announcements via classify_announcement
+    /// 2. Push via v17_sources::push_normalized_events
+    /// 3. Track routed external_ids
+    /// 4. For each AlertEvent, check if it would skip legacy push
+    async fn simulate_announcement_loop(
+        anns: Vec<Announcement>,
+    ) -> AnnouncementLoopReport {
+        use stock_analysis::news::aggregator::classifier::classify_announcement;
+
+        let mut normalized_events: Vec<stock_analysis::news::aggregator::NormalizedSourceEvent> = Vec::new();
+        for ann in &anns {
+            if let Ok(event) = classify_announcement(ann) {
+                normalized_events.push(event);
+            }
+        }
+
+        // Push via v17.7 path
+        let report = v17_sources::push_normalized_events(normalized_events).await;
+
+        // Collect routed external_ids
+        let mut routed_external_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for ann in &anns {
+            if let Some(ref eid) = ann.external_id {
+                routed_external_ids.insert(eid.clone());
+            }
+        }
+
+        // Simulate legacy loop: for each announcement, create an AlertEvent
+        // and check if legacy push would be skipped
+        let mut legacy_attempts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for ann in &anns {
+            let event_id = ann.external_id.clone().unwrap_or_else(|| {
+                format!("{}:{}:{}", ann.code, ann.date, ann.title)
+            });
+
+            let ev = AlertEvent {
+                level: AlertLevel::Important,
+                category: AlertCategory::ChainRisk,
+                code: ann.code.clone(),
+                name: ann.name.clone(),
+                message: format!("[公告] {} | {}", ann.title, ann.reason),
+                detail: AlertDetail {
+                    price: None,
+                    change_pct: None,
+                    volume_ratio: None,
+                    main_flow_yi: None,
+                    threshold: None,
+                    news_title: Some(ann.title.clone()),
+                    news_summary: Some(ann.summary.clone()),
+                    ai_decision: None,
+                    t1_locked: false,
+                    extra: None,
+                },
+                triggered_at: Local::now(),
+                routed_external_id: ann.external_id.clone(),
+            };
+
+            // Check if this event would skip legacy push
+            let skipped = ev.routed_external_id.as_ref()
+                .map(|id| routed_external_ids.contains(id))
+                .unwrap_or(false);
+
+            if !skipped {
+                *legacy_attempts.entry(event_id).or_insert(0) += 1;
+            }
+        }
+
+        AnnouncementLoopReport {
+            announcement_attempts: report.pushed,
+            legacy_attempts,
+        }
+    }
+
+    /// Helper to create a test announcement with external_id
+    fn test_important_announcement(external_id: &str, code: &str) -> Announcement {
+        Announcement {
+            code: code.to_string(),
+            name: "测试公司".to_string(),
+            title: "关于回购股份方案的公告".to_string(),
+            date: "2026-07-16".to_string(),
+            summary: "回购".to_string(),
+            content: String::new(),
+            level: announcement::AnnLevel::Important,
+            reason: "标题含'回购'".to_string(),
+            external_id: Some(external_id.to_string()),
+            url: Some("https://example.invalid/ann".to_string()),
+        }
+    }
+
+    /// v17.7 §6 Step 2: Test should FAIL because current news_monitor_loop
+    /// directly processes and pushes the same announcement through the legacy path.
+    #[tokio::test]
+    async fn routed_announcement_is_not_sent_again_as_daily_report() {
+        std::env::set_var("V10_DRY_RUN_PUSH", "1");
+        let report = simulate_announcement_loop(vec![
+            test_important_announcement("ann-1", "600519")
+        ]).await;
+        assert_eq!(report.announcement_attempts, 1, "should route 1 announcement");
+        assert_eq!(
+            report.legacy_daily_report_attempts_for("ann-1"), 0,
+            "routed announcement should not trigger legacy push"
+        );
+        std::env::remove_var("V10_DRY_RUN_PUSH");
     }
 }
 

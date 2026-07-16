@@ -18,6 +18,9 @@ pub struct AlertEvent {
     pub message: String,
     pub detail: AlertDetail,
     pub triggered_at: DateTime<Local>,
+    /// Source external ID if this event was routed through v17_sources::push_normalized_events.
+    /// Used by news_monitor_loop to skip duplicate legacy push.
+    pub routed_external_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -329,6 +332,7 @@ impl Detector {
                     )),
                 },
                 triggered_at: Local::now(),
+                routed_external_id: None,
             })
         } else {
             None
@@ -397,6 +401,7 @@ impl Detector {
                     extra: Some(format!("来源: {}", news.source)),
                 },
                 triggered_at: Local::now(),
+                routed_external_id: None,
             })
         } else {
             None
@@ -431,6 +436,7 @@ impl Detector {
                     extra: None,
                 },
                 triggered_at: Local::now(),
+                routed_external_id: None,
             })
         } else {
             None
@@ -465,6 +471,7 @@ impl Detector {
                 extra: None,
             },
             triggered_at: Local::now(),
+            routed_external_id: None,
         }
     }
 

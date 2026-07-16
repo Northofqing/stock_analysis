@@ -81,9 +81,7 @@ pub fn init_news_aggregator() -> usize {
         Arc::new(feed::GovPolicyFeed {
             inner: stock_analysis::search_service::providers::gov_policy::GovPolicyProvider::new(),
         }),
-        // ===== 政策源 (GovCn / MIIT; unit struct 占位 stub) =====
-        Arc::new(feed::GovCnFeed),
-        Arc::new(feed::MiitFeed),
+        // v17.7 §6 Step 5: gov_cn=disabled(parser_not_implemented) miit=disabled(parser_not_implemented)
         // ===== 公告 / 财报源 (unit stub) =====
         Arc::new(feed::EmAnnouncementFeed),
         Arc::new(feed::EarningsCalendarFeed),
@@ -93,6 +91,9 @@ pub fn init_news_aggregator() -> usize {
         Arc::new(feed::AnalystViewsFeed),
     ];
     let count = feeds.len();
+    log::info!(
+        "[v17.7 sources] gov_cn=disabled(parser_not_implemented) miit=disabled(parser_not_implemented)"
+    );
 
     feed::register_feeds(feeds);
     let drained = feed::take_all_for_aggregator();

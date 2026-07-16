@@ -136,6 +136,7 @@ mod tests {
                 extra: None,
             },
             triggered_at: Local::now(),
+            routed_external_id: None,
         }
     }
 

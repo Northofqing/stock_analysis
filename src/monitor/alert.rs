@@ -206,6 +206,7 @@ mod tests {
                 extra: None,
             },
             triggered_at: Local::now(),
+            routed_external_id: None,
         }
     }
 
@@ -258,6 +259,7 @@ mod tests {
                 extra: Some("命中: 达实智能(002421)".into()),
             },
             triggered_at: Local::now(),
+            routed_external_id: None,
         };
         let text = format_alert(&e);
         // 不应出现"快讯"标签
@@ -292,6 +294,7 @@ mod tests {
                 extra: None,
             },
             triggered_at: Local::now(),
+            routed_external_id: None,
         };
         let text = format_alert(&e);
         // 快讯应有"快讯"标签

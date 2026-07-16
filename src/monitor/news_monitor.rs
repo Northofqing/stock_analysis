@@ -274,6 +274,7 @@ impl NewsMonitor {
                     },
                 },
                 triggered_at: Local::now(),
+                routed_external_id: ann.external_id.clone(),
             });
         }
 
@@ -349,6 +350,7 @@ impl NewsMonitor {
                 },
             },
             triggered_at: Local::now(),
+            routed_external_id: None,
         })
     }
 
