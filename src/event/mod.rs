@@ -7,6 +7,7 @@
 pub mod bus;
 pub mod dispatcher;
 pub mod envelope;
+pub mod history;
 pub mod jsonl_writer;
 pub mod push_record;
 
@@ -17,6 +18,7 @@ pub use dispatcher::{
 pub use envelope::{DomainEvent, EnvelopeError, EventEnvelope, PushDeliveryEvent};
 pub use jsonl_writer::{JsonlError, JsonlWriter};
 pub use push_record::{PushOutcomeLabel, PushRecord, PushRecordError, ReplayablePushEvent, ReplayablePushEventError};
+pub use history::{HistoryEntry, HistoryError, HistoryFilter, HistoryOrder, HistoryQuery, RateStats, Window};
 
 // ========================================================================
 // Global bus singleton
