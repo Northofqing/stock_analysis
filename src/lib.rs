@@ -43,6 +43,7 @@ pub mod push_l4;  // Phase 2 W12 + b011 P0-2: L4 Dispatcher (dedup 闭环已实�
 pub mod push_l5;  // Phase 3 W15: L5 GovernanceEngine (quiet hours / frozen / data_mode)
 pub mod push_l6;  // Phase 3 W16: L6 Sink trait + ConsoleSink + SinkRouter
 pub mod push_l7;  // Phase 3 W17: L7 PushAnalytics + SqliteStore/InMemoryStore
+pub mod event;    // v17.1-r2: event envelope contract + PushDeliveryEvent
 pub mod strategy;
 pub mod traits;
 pub mod trend_analyzer;
