@@ -3,6 +3,62 @@
 //! SIGHUP 信号触发 reload。toml 缺失或格式错误 → 用代码默认值，不崩溃。
 
 use serde::{Deserialize, Serialize};
+
+/// v17.7 earnings classification config, loaded from [v17_7_sources.earnings] in strategy.toml.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EarningsConfig {
+    #[serde(default = "default_earnings_metric")]
+    pub metric: String,
+    #[serde(default = "default_beat_threshold")]
+    pub beat_threshold_pct: f64,
+    #[serde(default = "default_miss_threshold")]
+    pub miss_threshold_pct: f64,
+    #[serde(default = "default_poll_interval")]
+    pub poll_interval_secs: u64,
+}
+
+fn default_earnings_metric() -> String {
+    "eps".to_string()
+}
+fn default_beat_threshold() -> f64 {
+    10.0
+}
+fn default_miss_threshold() -> f64 {
+    -10.0
+}
+fn default_poll_interval() -> u64 {
+    900
+}
+
+impl Default for EarningsConfig {
+    fn default() -> Self {
+        Self {
+            metric: default_earnings_metric(),
+            beat_threshold_pct: default_beat_threshold(),
+            miss_threshold_pct: default_miss_threshold(),
+            poll_interval_secs: default_poll_interval(),
+        }
+    }
+}
+
+impl EarningsConfig {
+    /// Validate that thresholds are correctly signed.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.beat_threshold_pct.is_finite() || self.beat_threshold_pct <= 0.0 {
+            return Err(format!(
+                "beat_threshold_pct must be finite and > 0, got {}",
+                self.beat_threshold_pct
+            ));
+        }
+        if !self.miss_threshold_pct.is_finite() || self.miss_threshold_pct >= 0.0 {
+            return Err(format!(
+                "miss_threshold_pct must be finite and < 0, got {}",
+                self.miss_threshold_pct
+            ));
+        }
+        Ok(())
+    }
+}
 use std::sync::{Arc, LazyLock, RwLock};
 
 // ── 产业链规则 ──
@@ -138,6 +194,9 @@ pub struct MonitorConfig {
     /// 空中加油执行配置（可选 section [air_refuel]）
     #[serde(default)]
     pub air_refuel: AirRefuelConfig,
+    /// v17.7 earnings classification config.
+    #[serde(default)]
+    pub v17_7_earnings: EarningsConfig,
 }
 
 fn default_screener_interval() -> u64 {
@@ -387,6 +446,7 @@ impl Default for MonitorConfig {
             position_sizing: PositionSizingConfig::default(),
             factor_feedback: FactorFeedbackConfig::default(),
             air_refuel: AirRefuelConfig::default(),
+            v17_7_earnings: EarningsConfig::default(),
         }
     }
 }

@@ -169,3 +169,10 @@ st_daily_limit = 0.10      # 主板 ST/*ST 涨跌幅上限 (新规 5%→10%, 202
 liquidity_threshold = 0.65 # 创业板做市商流动性阈值 (原 0.50 + 0.15 校准)
 # v23: small_cap_lookback 字段废弃 (代码硬编码 20 日)
 # 注: 2026-07-06 创业板引入做市商制度生效, 中小盘流动性增强, 阈值上修 15%
+
+# ── v17.7 earnings classification ──
+[v17_7_sources.earnings]
+metric = "eps"
+beat_threshold_pct = 10.0
+miss_threshold_pct = -10.0
+poll_interval_secs = 900

@@ -5,7 +5,7 @@
 //! and Task 4 (analyst). These types provide the data contracts that downstream
 //! code (Task 5 adapter) will consume.
 
-use chrono::NaiveDate;
+use chrono::{NaiveDate, Datelike};
 use crate::data_provider::announcement::Announcement;
 use crate::search_service::SearchResult;
 use super::{NormalizedSourceEvent, NormalizedSourceError, SourcePushKind};
@@ -34,11 +34,10 @@ pub enum EarningsKind {
     /// Unclassified / not yet determined.
     #[default]
     Unclassified,
-    // Additional variants will be added by Task 3:
-    // Beat,
-    // Miss,
-    // InLine,
-    // PreAnnounced,
+    /// Actual EPS beat the consensus forecast by >= beat_threshold_pct.
+    Beat,
+    /// Actual EPS missed the consensus forecast by <= miss_threshold_pct.
+    Miss,
 }
 
 impl EarningsClassification {
@@ -87,6 +86,125 @@ impl RatingClassification {
 // ============================================================================
 
 use crate::signal::market_event::Direction;
+
+// ============================================================================
+// Earnings classifier (v17.7 Task 3)
+// ============================================================================
+
+/// Configuration for earnings classification thresholds.
+#[derive(Debug, Clone)]
+pub struct EarningsConfig {
+    /// Metric to compare (e.g. "eps").
+    pub metric: String,
+    /// Beat threshold: delta_pct >= this value → EarningsBeat.
+    pub beat_threshold_pct: f64,
+    /// Miss threshold: delta_pct <= this value → EarningsMiss.
+    pub miss_threshold_pct: f64,
+    /// Poll interval in seconds for earnings data.
+    pub poll_interval_secs: u64,
+}
+
+impl Default for EarningsConfig {
+    fn default() -> Self {
+        Self {
+            metric: "eps".into(),
+            beat_threshold_pct: 10.0,
+            miss_threshold_pct: -10.0,
+            poll_interval_secs: 900,
+        }
+    }
+}
+
+impl EarningsConfig {
+    /// Validate that thresholds are finite and correctly signed.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.beat_threshold_pct.is_finite() || self.beat_threshold_pct <= 0.0 {
+            return Err(format!(
+                "beat_threshold_pct must be finite and > 0, got {}",
+                self.beat_threshold_pct
+            ));
+        }
+        if !self.miss_threshold_pct.is_finite() || self.miss_threshold_pct >= 0.0 {
+            return Err(format!(
+                "miss_threshold_pct must be finite and < 0, got {}",
+                self.miss_threshold_pct
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Classify an earnings period as Beat, Miss, or None.
+///
+/// Returns `None` if:
+/// - The report year does not match the current year.
+/// - The consensus reference is missing, non-finite, or zero.
+/// - The delta is within the no-push zone (between miss and beat thresholds).
+pub fn classify_earnings(
+    actual: &crate::data_provider::financials::FinancialPeriod,
+    consensus: &crate::data_provider::consensus::ConsensusData,
+    config: &EarningsConfig,
+) -> Option<EarningsClassification> {
+    use chrono::NaiveDate;
+
+    // Parse report_date → year
+    let report_date = actual.report_date.as_ref()?;
+    let date = NaiveDate::parse_from_str(report_date, "%Y-%m-%d").ok()?;
+    let actual_year = date.year();
+
+    // Must be current year
+    let current_year = chrono::Local::now().year();
+    if actual_year != current_year {
+        log::debug!(
+            "[classify_earnings] report year {} != current year {}, skipping",
+            actual_year,
+            current_year
+        );
+        return None;
+    }
+
+    // Reference EPS from consensus
+    let reference = consensus.eps_this_year_avg?;
+    if !reference.is_finite() || reference.abs() < 1e-9 {
+        log::debug!(
+            "[classify_earnings] reference EPS not finite or zero: {:?}",
+            consensus.eps_this_year_avg
+        );
+        return None;
+    }
+
+    // Actual EPS
+    let actual_eps = actual.eps?;
+    if !actual_eps.is_finite() {
+        log::debug!("[classify_earnings] actual EPS not finite: {:?}", actual.eps);
+        return None;
+    }
+
+    // Delta percentage
+    let delta_pct = (actual_eps - reference) / reference.abs() * 100.0;
+
+    // Determine classification
+    if delta_pct >= config.beat_threshold_pct {
+        Some(EarningsClassification {
+            kind: EarningsKind::Beat,
+            delta_pct,
+            actual: actual_eps,
+            reference,
+            report_date: date,
+        })
+    } else if delta_pct <= config.miss_threshold_pct {
+        Some(EarningsClassification {
+            kind: EarningsKind::Miss,
+            delta_pct,
+            actual: actual_eps,
+            reference,
+            report_date: date,
+        })
+    } else {
+        // In-range: no push
+        None
+    }
+}
 
 /// Classify an `Announcement` into a `NormalizedSourceEvent`.
 ///
@@ -273,5 +391,103 @@ mod tests {
         let default = RatingClassification::unclassified();
         assert!(default.previous.is_empty());
         assert!(default.current.is_empty());
+    }
+
+    // =========================================================================
+    // Earnings classification tests (v17.7 Task 3)
+    // =========================================================================
+
+    /// Test helper: build a FinancialPeriod with given report_date and EPS.
+    fn financial_period(date_str: &str, eps: f64) -> crate::data_provider::financials::FinancialPeriod {
+        crate::data_provider::financials::FinancialPeriod {
+            report_date: Some(date_str.to_string()),
+            eps: Some(eps),
+            roe: None,
+            revenue_yoy: None,
+            net_profit_yoy: None,
+            gross_margin: None,
+            net_margin: None,
+            op_cash_flow_ps: None,
+            total_asset_turnover: None,
+            debt_to_assets: None,
+        }
+    }
+
+    /// Test helper: build a ConsensusData with given eps_this_year_avg.
+    fn consensus_with_eps_this_year(eps: f64) -> crate::data_provider::consensus::ConsensusData {
+        crate::data_provider::consensus::ConsensusData {
+            report_count: 1,
+            broker_count: 1,
+            eps_this_year_avg: Some(eps),
+            eps_next_year_avg: None,
+            eps_next2_year_avg: None,
+            rating_distribution: Default::default(),
+            target_price_high_avg: None,
+            target_price_low_avg: None,
+            latest_report_date: None,
+            recent_reports: vec![],
+        }
+    }
+
+    #[test]
+    fn eps_ten_percent_above_same_year_forecast_is_beat() {
+        let actual = financial_period("2026-06-30", 1.10);
+        let consensus = consensus_with_eps_this_year(1.00);
+        let result = classify_earnings(&actual, &consensus, &EarningsConfig::default()).unwrap();
+        assert_eq!(result.kind, EarningsKind::Beat);
+        assert!((result.delta_pct - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn eps_ten_percent_below_same_year_forecast_is_miss() {
+        let actual = financial_period("2026-06-30", 0.89);
+        let consensus = consensus_with_eps_this_year(1.00);
+        let result = classify_earnings(&actual, &consensus, &EarningsConfig::default()).unwrap();
+        assert_eq!(result.kind, EarningsKind::Miss);
+    }
+
+    #[test]
+    fn mismatched_year_or_missing_forecast_emits_no_classification() {
+        let actual = financial_period("2025-12-31", 1.50);
+        let consensus = consensus_with_eps_this_year(1.00);
+        assert!(classify_earnings(&actual, &consensus, &EarningsConfig::default()).is_none());
+        // Missing consensus EPS
+        assert!(classify_earnings(
+            &financial_period("2026-06-30", 1.10),
+            &crate::data_provider::consensus::ConsensusData::default(),
+            &EarningsConfig::default()
+        ).is_none());
+    }
+
+    #[test]
+    fn eps_within_threshold_emits_no_classification() {
+        // 1.05 vs 1.00 = +5%, which is within [-10%, +10%] band
+        let actual = financial_period("2026-06-30", 1.05);
+        let consensus = consensus_with_eps_this_year(1.00);
+        assert!(classify_earnings(&actual, &consensus, &EarningsConfig::default()).is_none());
+    }
+
+    #[test]
+    fn earnings_config_validate_rejects_inverted_thresholds() {
+        // beat <= 0 is invalid
+        let bad_beat = EarningsConfig {
+            metric: "eps".into(),
+            beat_threshold_pct: 0.0,
+            miss_threshold_pct: -10.0,
+            poll_interval_secs: 900,
+        };
+        assert!(bad_beat.validate().is_err());
+
+        // miss >= 0 is invalid
+        let bad_miss = EarningsConfig {
+            metric: "eps".into(),
+            beat_threshold_pct: 10.0,
+            miss_threshold_pct: 0.0,
+            poll_interval_secs: 900,
+        };
+        assert!(bad_miss.validate().is_err());
+
+        // valid config
+        assert!(EarningsConfig::default().validate().is_ok());
     }
 }
