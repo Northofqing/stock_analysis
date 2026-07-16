@@ -1,8 +1,8 @@
 # docs/ — 文档总索引
 
 > **归档规范**: BR-029 文档演进路线归档规范（2026-07-11 落地）
-> **结构**: 6 个版本文件夹（按演进顺序）+ 1 个演进前史归档目录 + 7 份根级文档
-> **总文件数**: 122（不含 `.DS_Store` / `.pdf`）
+> **结构**: 10 个版本文件夹（按演进顺序）+ 1 个演进前史归档目录 + 7 份根级文档
+> **总文件数**: 168（不含 `.DS_Store` / `.pdf`）
 
 ---
 
@@ -15,7 +15,11 @@
 | **v11** | 2026-07-02 ~ 07-04 | 口径不一致 / P0 系列改造 | 15 | [README](v11/README.md) |
 | **v12** | 2026-07-02 ~ 07-06 | Trading Assistant + Push Templates 雏形 + 模板验证 | 12 | [README](v12/README.md) |
 | **v13** | 2026-07-06 ~ 07-09 | Push Templates 实施发布 + B-002~B-007 bug 诊断 | 20 | [README](v13/README.md) |
-| **v14.x** | 2026-07-08 ~ 07-11 | 数据源扩展（Sina/Baostock/QMT）+ v14.2 推送架构 + B-008~B-010 | 15 | [README](v14.x/README.md) |
+| **v14.x** | 2026-07-08 ~ 07-11 | 数据源扩展（Sina/Baostock/QMT）+ v14.2 推送架构 + B-008~B-010 | 19 | [README](v14.x/README.md) |
+| **v15.x** | 2026-07-11 ~ 07-12 | 推送治理与演进设计 | 5 | [README](v15.x/README.md) |
+| **v16.x** | 2026-07-12 ~ 07-14 | 工程规则、风险与数据治理 | 14 | [README](v16.x/README.md) |
+| **v17.x** | 2026-07-14 ~ 07-16 | 事件/推送迁移与持久化 | 11 | [README](v17.x/README.md) |
+| **v18.x** | 2026-07-16 起 | 研究—模拟交易—复盘闭环与受控实盘准备 | 5 | [README](v18.x/README.md) |
 
 ## 演进前史归档
 
@@ -28,7 +32,7 @@
 | 文件 | 用途 |
 |---|---|
 | `ENGINEERING_RULES_V2.md` | 工程规则 v2 |
-| `business_rules.md` | 业务规则注册表（BR-001 ~ BR-029，含归档规范 BR-029） |
+| `business_rules.md` | 业务规则注册表（含文档归档 BR-029 与 v18 闭环规则 BR-038 ~ BR-042） |
 | `业务规则清单-registry.md` | 业务规则中文清单 |
 | `crontab.example` | crontab 模板 |
 | `sina_baostock_integration.md` | Sina + Baostock 数据源接入文档 |

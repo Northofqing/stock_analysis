@@ -13,6 +13,7 @@ v17.x continues the push/event migration. v18.x does not replace that work. It e
 | --- | --- | --- |
 | `v18.0-2026-07-16-review-quant-platform-assessment.md` | Evidence-based engineering, data, product, and institutional-practice assessment | complete |
 | `v18.0-2026-07-16-brainstorming-quant-platform-closure-design-active.md` | Active architecture and acceptance design | active |
+| `v18.0-2026-07-16-codebase-design-four-core-modules.md` | Four core modules: interfaces, state machines, persistence, failure semantics, and test seams | active companion |
 | `v18.0-2026-07-16-writing-plans-implementation-roadmap.md` | Sequenced implementation roadmap and merge gates | ready for approval by workstream |
 
 ## Non-negotiable boundary

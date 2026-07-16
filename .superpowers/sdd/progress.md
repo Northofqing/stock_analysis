@@ -319,3 +319,56 @@ ab4e246 fix(v9.2): §2.8 门禁脚本 + verify_one DRY 重构 (R-1 fix review fi
 - 5 tests pass (含实测 JSON 验证)
 - Files: sina_news_provider.rs (pageid 153→155 + media_name fallback), tests/sina_news_provider_test.rs
 - Concern: 1 个测试用硬编码 JSON 不需网络, 未标 #[ignore]
+
+# NEW: Remove direct OpenAI configuration and standardize DeepSeek (2026-07-16)
+
+**Plan**: `docs/superpowers/plans/2026-07-16-remove-openai-config-plan.md`
+**Base commit**: `a81af2c`
+**Branch**: `master` (user explicitly authorized subagent-driven execution; no commits without separate authorization)
+
+## Tasks
+- [ ] Task 1: canonical DeepSeek provider contract
+- [ ] Task 2: legacy GeminiAnalyzer DeepSeek migration
+- [ ] Task 3: legacy ReAct/test/startup migration
+- [ ] Task 4: active/example config cleanup
+- [ ] Task 5: full module/integration/live verification
+
+## Pre-Flight Review
+- No plan contradiction found. Retain `async-openai` as protocol transport while removing direct OpenAI service/configuration entrances.
+- Preserve pre-existing untracked `.planning/`; it is outside this plan.
+
+## Commits Ledger
+
+
+### Task 1: ✅ DONE (reviewer approved)
+- Canonical DEEPSEEK_* lookup seam (`from_lookup`); `OpenAiCompatProvider` removed; default fallback `deepseek,minimax`; ticker live test migrated.
+- 12 files in cumulative diff set; LLM/registry/ticker tests + analyzer + deep_analyzer tests pass; release `monitor` builds; `monitor --test` log shows `[LLM] 加载 1 个 provider: ["deepseek"]` and live `provider=deepseek model=deepseek-chat` calls producing LLM output (PCB / 800G reasons). No `OpenAI兼容` / `无可用 provider` warning emitted.
+
+### Task 2: ✅ DONE (reviewer approved)
+- `GeminiAnalyzer` openai_* fields/flags/routes renamed to deepseek_*; multi-agent reports "DeepSeek"; post-Gemini OpenAI fallback removed.
+
+### Task 3: ✅ DONE (reviewer approved)
+- `collect_model_configs_from<F>` extracted; OPENAI_* branch in deep_analyzer / agent_test replaced; startup validator updated to DEEPSEEK_API_KEY.
+
+### Task 4: ✅ DONE (manual)
+- .env active DeepSeek values migrated OPENAI_*→DEEPSEEK_* without printing secrets; OPENAI template + `OPENAI_QUICK_MODEL` removed; .env.example updated to DeepSeek template + DEEPSEEK_QUICK/DEEP_MODEL.
+
+### Task 5: ✅ DONE (parent session)
+- `cargo test --lib llm::` 8/0/1 ignored; `cargo test --lib analyzer::` 85/0; `cargo test --lib deep_analyzer::` 15/0; `cargo build --lib` OK; `cargo build --bin agent_test` OK; `cargo build --release --bin monitor` OK; `monitor --test` 0→OK with deepseek provider and live LLM output.
+
+### All Tasks Status
+
+| Task | Status |
+|------|--------|
+| Task 1 (canonical DeepSeek provider) | ✅ DONE |
+| Task 2 (GeminiAnalyzer DeepSeek migration) | ✅ DONE |
+| Task 3 (legacy analysis paths) | ✅ DONE |
+| Task 4 (env config cleanup) | ✅ DONE |
+| Task 5 (full verification) | ✅ DONE |
+
+### Uncommitted Files (12)
+.env.example, .superpowers/sdd/progress.md, src/agent/multi_agent/mod.rs, src/analyzer/client.rs, src/analyzer/mod.rs, src/analyzer/types.rs, src/app/bootstrap.rs, src/bin/agent_test.rs, src/deep_analyzer.rs, src/llm/providers.rs, src/llm/registry.rs, src/llm/ticker_extractor.rs
+
+### Branch State
+- 12 files modified (225 insertions, 186 deletions) since base `a81af2c`; no commits made (parent session has explicit no-commit constraint).
+- .env migrated locally and remains ignored; user has been shown redacted snapshots only.

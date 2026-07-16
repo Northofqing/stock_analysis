@@ -84,7 +84,7 @@ When adding ArcSwap / DashMap / AhoCorasick / SHARED_HTTP_CLIENT patterns, the f
 
 | 项 | 规范 |
 |---|---|
-| **演进版本文件夹** | `docs/v9.x/`、`v10/`、`v11/`、`v12/`、`v13/`、`v14.x/` 六个；按文档内容的"所属版本时代"归位，与代码版本基线对齐 |
+| **演进版本文件夹** | `docs/v9.x/`、`v10/`、`v11/`、`v12/`、`v13/`、`v14.x/`、`v15.x/`、`v16.x/`、`v17.x/`、`v18.x/` 十个；按文档内容的"所属版本时代"归位，与代码版本基线对齐 |
 | **pre-v9 前史** | 所有 v2-v8、optimization_report-06-22 之前的"演进前史"文档统一归档到 `docs/_archive/pre-v9-history/`，git 历史可恢复 |
 | **命名格式** | `<版本>-<日期 YYYY-MM-DD>-<skill>-<作用>.md`（两段式 skill = 实际产出所用 skill 名，取自 `.agents/skills/`） |
 | **skill 推断原则** | spec/设计类 → `brainstorming`；实施类 → `implement`；审计/评审 → `grill-with-docs` 或 `review`；bug 诊断 → `diagnosing-bugs`；实施计划 → `writing-plans`；实施日志 → `executing-plans` |
@@ -98,3 +98,13 @@ When adding ArcSwap / DashMap / AhoCorasick / SHARED_HTTP_CLIENT patterns, the f
 - 总索引：`docs/README.md`
 - 版本索引：各 `docs/v*/README.md`
 - 归档索引：`docs/_archive/pre-v9-history/README.md`（待补）
+
+## v18 闭环规则（设计已登记，实施前必须引用）
+
+| Rule ID | 状态 | 规则 | 计划落点 |
+|---|---|---|---|
+| BR-038 | 🟡 spec-only | 行动数据可用性闸：任何开仓/加仓/调仓的纸面或未来实盘动作，行情、账户及必需特征都必须为 `Available`；`Unavailable`、`Stale`、`Invalid`、`Conflicted` 一律产出可审计拒绝，禁止默认值、降级数值或旁路。减仓/平仓的例外只能由版本化风险策略显式定义。 | `src/data_contract/`、`src/risk/` |
+| BR-039 | 🟡 spec-only | 决策批次完整性：同一 strategy/model/config/universe/data-health/portfolio revision 的候选集只能形成一个确定性 `candidate_batch_id`；批次内保留所有候选、排序、入选和拒绝原因，重复提交返回原决定而非重算或新增订单。 | `src/decision/` |
+| BR-040 | 🟡 spec-only | 纸面订单幂等：`paper_order_key = decision_id + target_revision + side`；同一 key 的重试只返回既有订单。订单必须先取得风险结果与不可变审计回执，才可进入 `Submitted`。 | `src/paper_ledger/` |
+| BR-041 | 🟡 spec-only | 纸面账本对账闸：日内或日终重放事件所得现金、可卖数量、持仓和费用与投影不一致时，账本状态为 `ReconciliationBlocked`，拒绝新纸面订单，直至以纠正事件完成对账；不得直接修改汇总行。 | `src/paper_ledger/` |
+| BR-042 | 🟡 spec-only | 模型迭代双账本：Champion 与 Challenger 使用同一时间对齐的输入、各自独立的虚拟资金账本和版本化策略；复盘只能生成 `ModelChangeProposal`，不得直接改生产配置、权重或模型状态。晋升需样本充分性、成本后表现、风险/覆盖证据及人工审批。 | `src/review/`、`src/research/` |
