@@ -93,6 +93,33 @@ cargo build --release --bin monitor                # must exit 0
 
 If any of the three checks fails, the work is **not complete**, regardless of how many unit tests passed.
 
+## Spec Evidence Rule (Hard Constraint) — Prevents "Spec Divorced From Code" Hallucination
+
+**This rule exists because of the v17.x post-mortem (2026-07-16)**: five specs (v17.4-v17.8) were written in bulk on one day, each citing the previous spec's unverified claims instead of code. Single-line grep produced false "0-caller" evidence for 7+ PushKind variants that were live production paths (multiline `dispatch(\n  PushKind::X` calls are invisible to single-line grep); v17.8 declared "收官 100% 覆盖" while the promised enum deletions were 0% executed; spec code sketches called APIs that did not exist (`push_application_service`, `history_query::winrate`). Executing those specs as written would have severed live trading pushes.
+
+Every spec/design doc MUST satisfy ALL of the following before it is citable or implementable:
+
+### 1. Code-fact claims need reproducible evidence
+Any claim about the codebase (0-caller, line numbers, variant counts, "API X exists", "module Y is unused") MUST be accompanied by the exact command used and its output, pasted into the spec. Single-line grep is **not acceptable evidence for call-site claims** — trace call chains from `dispatch`/`push_governor` arguments backwards to `main.rs` (multiline-aware).
+
+### 2. No spec-on-spec chaining past an unverified gate
+A new batch spec MUST NOT be written while the previous batch's Acceptance Criteria are unverified (Gate C not passed = no new Gate A). Derived numbers (e.g. "variant count = 36 after deletion") MUST be recomputed against HEAD, not against another spec's promises.
+
+### 3. AC must be machine-checkable and physically possible
+Every AC needs a concrete command + expected output. Reject ACs that are impossible as stated (e.g. "env var restores deleted enum variants" — compile-time constructs cannot be restored at runtime; rollback for code deletion is `git revert`).
+
+### 4. Completion claims follow the Completion Rule
+"收官 / 100% / complete" statements in docs are held to the same three-layer standard as code: paste the verification commands and outputs. A spec claiming completion without evidence is treated as **In Progress**.
+
+### 5. No speculative infrastructure without a consumer
+Do not design infrastructure layers (buses, registries, replay, ACK protocols) in implementation-level detail until at least one real consumer is being built against them. Prefer the smallest change that solves the user's stated problem (v17.4-D solved the actual pain in ~200 lines; the planned 6-layer event stack was ~6400 lines with zero consumers).
+
+### Anti-patterns (auto-reject)
+- "0-caller, 可直接删除" backed only by single-line grep.
+- AC numbers computed from another spec instead of from HEAD.
+- Writing spec N+1 while spec N's ACs are unverified.
+- Code sketches in specs calling functions that `grep` cannot find in the repo, without an explicit "TO BE BUILT" marker.
+
 ## Configuration
 
 - `.env`: `STOCK_LIST` (watchlist codes), `WECHAT_SEND_SCRIPT`, `DATABASE_PATH`
