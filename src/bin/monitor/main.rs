@@ -1847,6 +1847,36 @@ async fn main() {
     // v17.6 §5.1: daily_report_router 启动 audit (3 sub_kinds + legacy 映射表)
     daily_report_router::init_audit();
 
+    // v17.1-r2 §3.6: 全局事件总线初始化 + AuditDispatcher 注册
+    use stock_analysis::event::{global_bus, AuditDispatcher, DispatcherRegistry};
+    let bus = global_bus();
+    let mut registry = DispatcherRegistry::new();
+    registry.register(std::sync::Arc::new(AuditDispatcher::new()));
+    if let Err(e) = registry.validate() {
+        log::error!("[event_bus] registry validate failed: {}", e);
+    }
+    let _consumer_handle = {
+        let mut rx = bus.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(env) => {
+                        let _ = registry.dispatch(env);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Subscriber lagged; continue.
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        break;
+                    }
+                }
+            }
+        })
+    };
+    log::info!(
+        "[event_bus] mode=delivery_audit enabled=true dispatcher=AuditDispatcher"
+    );
+
     // v17.4 D 方案启动 banner (v15.x 静默路径可见): SectorTop 废弃态 + 选股阈值
     log::info!(
         "[v17.4-D] sector_top.mode={} | screener_min_score={} | holding_health.dedup=on_same_state",

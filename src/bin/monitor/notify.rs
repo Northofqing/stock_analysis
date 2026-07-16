@@ -1042,6 +1042,22 @@ async fn deliver_and_record(event: stock_analysis::push_l1::SignalEvent, kind: P
     // b013 review P2-15: 入口取一次 channel (避免 push_wechat await 后 env 抖动)
     let channel = current_send_channel();
     v14_adapter::v14_record_delivery(&event, kind, text, delivered, channel);
+
+    // v17.1-r2 §3.6: 发布投递审计事件 (观察路径, 不干预推送)
+    let outcome_str = match delivered {
+        true => "Pushed",
+        false => "SinkError",
+    };
+    // channel 已在上方取过: let channel = current_send_channel();
+    stock_analysis::event::publish_delivery(
+        &kind.stable_template_id(),
+        event.code.as_deref(),
+        outcome_str,
+        channel,
+        text.len(),
+        0, // latency_ms: deliver_and_record 不持有开始时间, 传入 0
+    );
+
     if delivered {
         PushOutcome::Pushed
     } else {
