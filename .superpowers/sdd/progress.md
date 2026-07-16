@@ -14,8 +14,9 @@
 - [x] r2-A Task 2 (EventBus)
 - [x] r2-A Task 3 (DispatcherRegistry)
 - [x] r2-A Task 4 (production bridge)
-- [ ] r2-A Task 5 (Gate B verification)
-- [ ] v17.3 (after Gate B)
+- [x] r2-A Task 5 (Gate B verification) — GREEN
+- [ ] v17.3 Task 1 (push records + latency thread-through)
+- [ ] v17.3 Tasks 2-5
 - [ ] v17.7 (after Gate C)
 
 ## Commits Ledger
@@ -31,11 +32,16 @@
 
 ### r2-A Task 4
 - 155a866 — feat(v17.1-r2): observe production deliveries on event bus (reviewer approved)
-  - Deferred: `latency_ms=0` until `Instant` is threaded through `push_governor_inner` → `deliver_and_record`
-  - Deferred: `NoSubscribers` log level (warn vs debug) for early-startup noise
 
-## Deferred Items (carry-over into v17.3 or later)
+### r2-A Task 5 (Gate B verification)
+- Module layer: 26/26 event tests passing
+- Library build: exits 0
+- Production integration grep: 6 hits (notify.rs:1052, main.rs:1850/1851/1854/1877, daily_report_router.rs:6)
+- Release binary: built
+- Live `--test` path: banner printed, 24 AuditDispatcher observations, 0 double-send
+- All three Completion Rule layers PASS
+
+## Deferred Items (carry-over into v17.3)
 
 - F1: Thread `Instant::now()` through `push_governor_inner` so the production bridge passes real `latency_ms`. v17.3 plan Task 1 explicitly requires this; it is the natural home for the fix.
 - F2: Lower `NoSubscribers` log to `debug` in `publish_delivery` to silence early-startup noise.
-
