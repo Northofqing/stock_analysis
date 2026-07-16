@@ -4,6 +4,9 @@
 //! 模块代码保留供后续改造为**新闻/宏观分析**专属多 Agent 使用：
 //! 待新增产业链推演 / 政策解读 / 板块轮动 / 情绪师等宏观维度 agents 后再启用。
 //!
+//! 支持的 AI Provider（按优先级）：
+//!   豆包 > DeepSeek > Gemini
+//!
 //! 旧流程（仅文档保留）：
 //!   1. 数据切片：build_slices 把行情/资金/财务/新闻/板块按领域切开
 //!   2. 6 个领域分析师（Quick）并行 → 结构化 JSON（AnalystView）
@@ -40,11 +43,11 @@ impl GeminiAnalyzer {
                 self.doubao_model_for(AgentMode::Quick),
                 self.doubao_model_for(AgentMode::Deep),
             )
-        } else if self.use_openai {
+        } else if self.use_deepseek {
             (
-                "OpenAI兼容",
-                self.openai_model_for(AgentMode::Quick),
-                self.openai_model_for(AgentMode::Deep),
+                "DeepSeek",
+                self.deepseek_model_for(AgentMode::Quick),
+                self.deepseek_model_for(AgentMode::Deep),
             )
         } else {
             (

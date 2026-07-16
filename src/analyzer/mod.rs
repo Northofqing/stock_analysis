@@ -4,13 +4,13 @@
 //! ===================================
 //!
 //! 职责：
-//! 1. 封装 Gemini/OpenAI/豆包 API 调用逻辑
+//! 1. 封装 Gemini/DeepSeek/豆包 API 调用逻辑
 //! 2. 利用搜索服务获取实时新闻
 //! 3. 结合技术面和消息面生成分析报告
 //!
 //! 支持的AI模型（按优先级）：
 //! - 豆包 (Doubao) - 字节跳动AI模型
-//! - OpenAI - GPT系列模型
+//! - DeepSeek - DeepSeek系列模型
 //! - Gemini - Google AI模型
 
 mod analyze;
@@ -73,7 +73,7 @@ lazy_static! {
 /// Gemini AI 分析器
 ///
 /// 职责：
-/// 1. 调用 Google Gemini API、OpenAI 兼容 API 或豆包 API 进行股票分析
+/// 1. 调用 Google Gemini API、DeepSeek API 或豆包 API 进行股票分析
 /// 2. 结合预先搜索的新闻和技术面数据生成分析报告
 /// 3. 解析 AI 返回的 JSON 格式结果
 #[derive(Clone)]
@@ -82,7 +82,7 @@ pub struct GeminiAnalyzer {
     pub(super) client: reqwest::Client,
     pub(super) current_model: RefCell<String>,
     pub(super) using_fallback: RefCell<bool>,
-    pub(super) use_openai: bool,
+    pub(super) use_deepseek: bool,
     pub(super) use_doubao: bool,
 }
 
@@ -253,8 +253,8 @@ impl GeminiAnalyzer {
 
         // 判断是否使用豆包 API
         let use_doubao = config.doubao_api_key.is_some();
-        // 判断是否使用 OpenAI 兼容 API
-        let use_openai = !use_doubao && config.openai_api_key.is_some();
+        // 判断是否使用 DeepSeek API
+        let use_deepseek = !use_doubao && config.deepseek_api_key.is_some();
 
         if use_doubao {
             info!(
@@ -265,11 +265,11 @@ impl GeminiAnalyzer {
                     .as_deref()
                     .unwrap_or("https://ark.cn-beijing.volces.com/api/v3")
             );
-        } else if use_openai {
+        } else if use_deepseek {
             info!(
-                "✓ 使用 OpenAI 兼容 API: {} ({})",
-                config.openai_model,
-                config.openai_base_url.as_deref().unwrap_or("官方 API")
+                "✓ 使用 DeepSeek API: {} ({})",
+                config.deepseek_model,
+                config.deepseek_base_url.as_deref().unwrap_or("https://api.deepseek.com/v1")
             );
         } else {
             info!("✓ 使用 Gemini API: {}", current_model);
@@ -280,7 +280,7 @@ impl GeminiAnalyzer {
             client,
             current_model: RefCell::new(current_model),
             using_fallback: RefCell::new(false),
-            use_openai,
+            use_deepseek,
             use_doubao,
         }
     }
@@ -308,11 +308,11 @@ impl GeminiAnalyzer {
             .and_then(|s| s.parse().ok())
             .unwrap_or(0.0);
 
-        // OpenAI 兼容 API 配置
-        let openai_api_key = std::env::var("OPENAI_API_KEY").ok();
-        let openai_base_url = std::env::var("OPENAI_BASE_URL").ok();
-        let openai_model =
-            std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
+        // DeepSeek API 配置
+        let deepseek_api_key = std::env::var("DEEPSEEK_API_KEY").ok();
+        let deepseek_base_url = std::env::var("DEEPSEEK_BASE_URL").ok();
+        let deepseek_model =
+            std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-chat".to_string());
 
         // 豆包 API 配置
         let doubao_api_key = std::env::var("DOUBAO_API_KEY").ok();
@@ -339,8 +339,8 @@ impl GeminiAnalyzer {
         let gemini_deep_model = std::env::var("AI_DEEP_MODEL").ok();
         let doubao_quick_model = std::env::var("DOUBAO_QUICK_MODEL").ok();
         let doubao_deep_model = std::env::var("DOUBAO_DEEP_MODEL").ok();
-        let openai_quick_model = std::env::var("OPENAI_QUICK_MODEL").ok();
-        let openai_deep_model = std::env::var("OPENAI_DEEP_MODEL").ok();
+        let deepseek_quick_model = std::env::var("DEEPSEEK_QUICK_MODEL").ok();
+        let deepseek_deep_model = std::env::var("DEEPSEEK_DEEP_MODEL").ok();
 
         // 多空辩论轮数（1-3，默认 2）
         let debate_rounds = std::env::var("AI_DEBATE_ROUNDS")
@@ -362,9 +362,9 @@ impl GeminiAnalyzer {
             max_retries,
             retry_delay,
             request_delay,
-            openai_api_key,
-            openai_base_url,
-            openai_model,
+            deepseek_api_key,
+            deepseek_base_url,
+            deepseek_model,
             doubao_api_key,
             doubao_base_url,
             doubao_model,
@@ -374,8 +374,8 @@ impl GeminiAnalyzer {
             gemini_deep_model,
             doubao_quick_model,
             doubao_deep_model,
-            openai_quick_model,
-            openai_deep_model,
+            deepseek_quick_model,
+            deepseek_deep_model,
             debate_rounds,
             agent_trace,
         };
@@ -386,7 +386,7 @@ impl GeminiAnalyzer {
     /// 检查分析器是否可用
     pub fn is_available(&self) -> bool {
         self.config.api_key.is_some()
-            || self.config.openai_api_key.is_some()
+            || self.config.deepseek_api_key.is_some()
             || self.config.doubao_api_key.is_some()
     }
 
@@ -470,5 +470,21 @@ mod tests {
         let analyzer = GeminiAnalyzer::new(config);
         // 没有配置 API Key，应该不可用
         assert!(!analyzer.is_available());
+    }
+
+    #[test]
+    fn deepseek_config_selects_deepseek_without_openai_fields() {
+        let mut config = GeminiConfig::default();
+        config.deepseek_api_key = Some("test-key".into());
+        config.deepseek_base_url = Some("https://example.invalid/v1".into());
+        config.deepseek_model = "deepseek-chat".into();
+        config.deepseek_quick_model = Some("deepseek-chat".into());
+        config.deepseek_deep_model = Some("deepseek-reasoner".into());
+
+        let analyzer = GeminiAnalyzer::new(config);
+
+        assert!(analyzer.use_deepseek);
+        assert_eq!(analyzer.deepseek_model_for(AgentMode::Quick), "deepseek-chat");
+        assert_eq!(analyzer.deepseek_model_for(AgentMode::Deep), "deepseek-reasoner");
     }
 }
