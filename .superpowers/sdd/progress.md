@@ -13,7 +13,7 @@
 - [x] r2-A Task 1 (envelope contract)
 - [x] r2-A Task 2 (EventBus)
 - [x] r2-A Task 3 (DispatcherRegistry)
-- [ ] r2-A Task 4 (production bridge — includes production-binary verification)
+- [x] r2-A Task 4 (production bridge)
 - [ ] r2-A Task 5 (Gate B verification)
 - [ ] v17.3 (after Gate B)
 - [ ] v17.7 (after Gate C)
@@ -28,3 +28,14 @@
 
 ### r2-A Task 3
 - 5942e9b — feat(v17.1-r2): add exact event dispatcher registry (reviewer approved)
+
+### r2-A Task 4
+- 155a866 — feat(v17.1-r2): observe production deliveries on event bus (reviewer approved)
+  - Deferred: `latency_ms=0` until `Instant` is threaded through `push_governor_inner` → `deliver_and_record`
+  - Deferred: `NoSubscribers` log level (warn vs debug) for early-startup noise
+
+## Deferred Items (carry-over into v17.3 or later)
+
+- F1: Thread `Instant::now()` through `push_governor_inner` so the production bridge passes real `latency_ms`. v17.3 plan Task 1 explicitly requires this; it is the natural home for the fix.
+- F2: Lower `NoSubscribers` log to `debug` in `publish_delivery` to silence early-startup noise.
+
