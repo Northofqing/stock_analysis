@@ -83,7 +83,9 @@ pub fn init_news_aggregator() -> usize {
         }),
         // v17.7 §6 Step 5: gov_cn=disabled(parser_not_implemented) miit=disabled(parser_not_implemented)
         // ===== 公告 / 财报源 (unit stub) =====
-        Arc::new(feed::EmAnnouncementFeed),
+        // NOTE: EmAnnouncementFeed 已从 feed vector 中移除 (v17.7 Task 6 fix).
+        // 公告直接来自 news_monitor_loop 中的 nm.process_announcements()，
+        // 通过 v17_sources::push_normalized_events 推送，绕过 NewsFlash 二次缓冲。
         Arc::new(feed::EarningsCalendarFeed),
         Arc::new(feed::ConsensusFeed),
         // ===== 实盘 + 机构观点 (unit stub) =====
