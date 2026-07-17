@@ -17,7 +17,7 @@ pub enum CliError {
     #[error("malformed date '{0}': expected YYYY-MM-DD")]
     MalformedDate(String),
 
-    #[error("negative or zero limit is not allowed: {0}")]
+    #[error("negative limit is not allowed: {0}")]
     InvalidLimit(i64),
 
     #[error("'{0}' is not a valid non-negative integer")]
@@ -94,8 +94,8 @@ pub fn parse_args(args: &[&str]) -> Result<Option<EventCommand>, CliError> {
                 help_requested = true;
             }
             "--test" | "--review" | "--push" | "--e2e" => {
-                // Known monitor flags — return None so caller uses existing behavior.
-                return Ok(None);
+                // Known monitor flags may be combined with terminal event commands.
+                // Ignore them here; if no event command is present we still return None.
             }
             "--replay" => {
                 has_replay = true;
@@ -117,6 +117,16 @@ pub fn parse_args(args: &[&str]) -> Result<Option<EventCommand>, CliError> {
                 let ms: u32 = val
                     .parse()
                     .map_err(|_| CliError::InvalidInteger(val.to_string()))?;
+                replay_rate_ms = Some(ms);
+            }
+            s if s.starts_with("--replay-rate-ms=") => {
+                if !has_replay {
+                    return Err(CliError::ReplayRateWithoutReplay);
+                }
+                let value = &s["--replay-rate-ms=".len()..];
+                let ms: u32 = value
+                    .parse()
+                    .map_err(|_| CliError::InvalidInteger(value.to_string()))?;
                 replay_rate_ms = Some(ms);
             }
             s if s.starts_with("--replay=") => {
@@ -161,7 +171,7 @@ pub fn parse_args(args: &[&str]) -> Result<Option<EventCommand>, CliError> {
                 let limit: i64 = limit_str
                     .parse()
                     .map_err(|_| CliError::InvalidInteger(limit_str.to_string()))?;
-                if limit <= 0 {
+                if limit < 0 {
                     return Err(CliError::InvalidLimit(limit));
                 }
                 history_limit = Some(limit as usize);
@@ -262,6 +272,37 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_documented_replay_rate_equals_form() {
+        let cmd = parse_args(&[
+            "monitor",
+            "--replay=2026-07-16",
+            "--replay-rate-ms=100",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cmd,
+            Some(EventCommand::Replay { rate_ms: 100, .. })
+        ));
+    }
+
+    #[test]
+    fn cli_keeps_history_command_when_monitor_flags_are_present() {
+        for args in [
+            vec!["monitor", "--test", "--history", "--success-rate"],
+            vec!["monitor", "--history", "--success-rate", "--test"],
+        ] {
+            let cmd = parse_args(&args).unwrap();
+            assert!(matches!(
+                cmd,
+                Some(EventCommand::History {
+                    success_rate: true,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
     fn cli_parses_history_with_filters() {
         let cmd = parse_args(&[
             "monitor",
@@ -353,6 +394,15 @@ mod tests {
         ])
         .unwrap_err();
         assert!(err.to_string().contains("limit"));
+    }
+
+    #[test]
+    fn cli_preserves_zero_as_explicit_unbounded_history_limit() {
+        let cmd = parse_args(&["monitor", "--history", "--limit=0"]).unwrap();
+        assert!(matches!(
+            cmd,
+            Some(EventCommand::History { limit: Some(0), .. })
+        ));
     }
 
     #[test]

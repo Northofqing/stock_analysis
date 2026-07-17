@@ -95,6 +95,27 @@ pub struct HistoryEntry {
     pub summary: serde_json::Value,
 }
 
+/// Format every queried history entry for terminal output.
+///
+/// Keeping formatting here makes the `limit=0` (unbounded) contract testable
+/// across query and presentation instead of adding a second hidden CLI cap.
+pub fn format_history_lines(entries: &[HistoryEntry]) -> Vec<String> {
+    entries
+        .iter()
+        .map(|entry| {
+            let summary = serde_json::to_string_pretty(&entry.summary)
+                .unwrap_or_else(|error| format!("<summary serialization failed: {error}>"));
+            format!(
+                "  {} {} {:?} {}",
+                entry.ts.format("%Y-%m-%d %H:%M:%S"),
+                entry.kind,
+                entry.code,
+                summary
+            )
+        })
+        .collect()
+}
+
 // ========================================================================
 // RateStats
 // ========================================================================
@@ -147,7 +168,6 @@ impl HistoryQuery {
     /// sorts by `ts` descending (default), and returns up to `limit` entries.
     pub async fn query(&self, filter: HistoryFilter) -> Result<Vec<HistoryEntry>, HistoryError> {
         let mut entries = Vec::new();
-        let limit = if filter.limit > 0 { filter.limit } else { 100 };
 
         // Collect files to read based on date filter
         let files_to_read = if let Some(date) = filter.date {
@@ -244,7 +264,9 @@ impl HistoryQuery {
         }
 
         // Apply limit after sort
-        entries.truncate(limit);
+        if filter.limit > 0 {
+            entries.truncate(filter.limit);
+        }
         Ok(entries)
     }
 
@@ -433,16 +455,21 @@ impl HistoryQuery {
 mod tests {
     use super::*;
     use crate::event::envelope::{DomainEvent, EventEnvelope, PushDeliveryEvent};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     // ---------------------------------------------------------------------------
     // Test helpers
     // ---------------------------------------------------------------------------
 
     fn test_dir(name: &str) -> PathBuf {
+        let sequence = TEST_DIR_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "history-test-{}-{}",
+            "history-test-{}-{}-{}",
             name,
-            std::process::id()
+            std::process::id(),
+            sequence
         ))
     }
 
@@ -541,6 +568,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn zero_limit_returns_and_formats_all_matching_history_entries() {
+        let records = (0..101)
+            .map(|index| {
+                (
+                    format!("id-{index:03}"),
+                    "Announcement".into(),
+                    Some("600519".into()),
+                    "Pushed".into(),
+                )
+            })
+            .collect();
+        let dir = test_history_dir_with_records(records).await;
+
+        let result = HistoryQuery::new(dir.clone())
+            .query(HistoryFilter {
+                date: Some(today()),
+                code: None,
+                kind: None,
+                limit: 0,
+                order: HistoryOrder::Desc,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 101);
+        assert_eq!(format_history_lines(&result).len(), 101);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
     async fn success_rate_excludes_denied_and_deduped_from_denominator() {
         let dir = test_dir("rate");
         tokio::fs::create_dir_all(&dir).await.unwrap();
@@ -556,11 +613,7 @@ mod tests {
         for (id, outcome) in ids.into_iter().zip(outcomes.into_iter()) {
             let env = super::super::envelope::EventEnvelope {
                 id: id.to_string(),
-                ts: today
-                    .and_hms_opt(12, 0, 0)
-                    .unwrap()
-                    .and_local_timezone(Local)
-                    .unwrap(),
+                ts: Local::now(),
                 trace_id: format!("trace-{}", id),
                 source: "push_l4".to_string(),
                 event_type: "push.delivery".to_string(),

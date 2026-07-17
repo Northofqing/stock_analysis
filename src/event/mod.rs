@@ -20,9 +20,9 @@ pub use dispatcher::{
 pub use envelope::{DomainEvent, EnvelopeError, EventEnvelope, PushDeliveryEvent};
 pub use jsonl_writer::{JsonlError, JsonlWriter};
 pub use push_record::{PushOutcomeLabel, PushRecord, PushRecordError, ReplayablePushEvent, ReplayablePushEventError};
-pub use history::{HistoryEntry, HistoryError, HistoryFilter, HistoryOrder, HistoryQuery, RateStats, Window};
+pub use history::{format_history_lines, HistoryEntry, HistoryError, HistoryFilter, HistoryOrder, HistoryQuery, RateStats, Window};
 pub use cli::{CliError, EventCommand};
-pub use replay::{ReplayError, ReplayRunner};
+pub use replay::{ReplayError, ReplayPublishError, ReplayPublisher, ReplayRunner, ReplaySummary};
 
 // ========================================================================
 // Global bus singleton

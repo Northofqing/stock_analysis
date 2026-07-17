@@ -1779,6 +1779,395 @@ fn count_paper_trades_today(today: chrono::NaiveDate) -> Result<i64, String> {
         .map_err(|e| format!("COUNT paper_trades: {}", e))
 }
 
+#[async_trait::async_trait]
+trait ReplayNotificationSink: Send + Sync {
+    async fn send(&self, text: &str) -> bool;
+}
+
+struct RealReplayNotificationSink;
+
+#[async_trait::async_trait]
+impl ReplayNotificationSink for RealReplayNotificationSink {
+    async fn send(&self, text: &str) -> bool {
+        notify::push_wechat(text).await
+    }
+}
+
+#[async_trait::async_trait]
+trait ReplayAuditSink: Send + Sync {
+    async fn record(
+        &self,
+        envelope: &stock_analysis::event::EventEnvelope,
+        phase: &str,
+        outcome: &str,
+    ) -> Result<(), String>;
+}
+
+struct FileReplayAuditSink {
+    base_dir: std::path::PathBuf,
+    previous_hash: tokio::sync::Mutex<Option<String>>,
+}
+
+impl FileReplayAuditSink {
+    fn new(base_dir: std::path::PathBuf) -> Self {
+        Self {
+            base_dir,
+            previous_hash: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    fn validate_chain(existing: &str) -> Result<Option<String>, String> {
+        use sha2::{Digest, Sha256};
+
+        let mut expected_parent = "GENESIS".to_string();
+        let mut last_hash = None;
+        for (index, line) in existing.lines().enumerate() {
+            if line.trim().is_empty() {
+                return Err(format!("replay audit line {} is blank", index + 1));
+            }
+            let mut record: serde_json::Value = serde_json::from_str(line)
+                .map_err(|error| format!("parse replay audit line {}: {error}", index + 1))?;
+            let record_hash = record
+                .get("record_hash")
+                .and_then(serde_json::Value::as_str)
+                .filter(|hash| !hash.is_empty())
+                .ok_or_else(|| format!("replay audit line {} has no valid record_hash", index + 1))?
+                .to_string();
+            let parent = record
+                .get("previous_hash")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("replay audit line {} has no previous_hash", index + 1))?;
+            if parent != expected_parent {
+                return Err(format!(
+                    "replay audit chain mismatch at line {}: expected parent {}",
+                    index + 1,
+                    expected_parent
+                ));
+            }
+            record
+                .as_object_mut()
+                .ok_or_else(|| format!("replay audit line {} is not an object", index + 1))?
+                .remove("record_hash");
+            let canonical = serde_json::to_vec(&record)
+                .map_err(|error| format!("serialize replay audit line {}: {error}", index + 1))?;
+            let calculated = format!("{:x}", Sha256::digest(&canonical));
+            if calculated != record_hash {
+                return Err(format!("replay audit hash mismatch at line {}", index + 1));
+            }
+            expected_parent = record_hash.clone();
+            last_hash = Some(record_hash);
+        }
+        Ok(last_hash)
+    }
+}
+
+#[async_trait::async_trait]
+impl ReplayAuditSink for FileReplayAuditSink {
+    async fn record(
+        &self,
+        envelope: &stock_analysis::event::EventEnvelope,
+        phase: &str,
+        outcome: &str,
+    ) -> Result<(), String> {
+        use sha2::{Digest, Sha256};
+        use tokio::io::AsyncWriteExt;
+
+        tokio::fs::create_dir_all(&self.base_dir)
+            .await
+            .map_err(|error| format!("create replay audit directory: {error}"))?;
+        let now = chrono::Local::now();
+        let path = self.base_dir.join(format!("{}.jsonl", now.format("%Y")));
+        let mut previous_hash = self.previous_hash.lock().await;
+        if previous_hash.is_none() {
+            let existing = match tokio::fs::read_to_string(&path).await {
+                Ok(existing) => existing,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(error) => return Err(format!("read replay audit {}: {error}", path.display())),
+            };
+            *previous_hash = Self::validate_chain(&existing)?;
+        }
+        let chain_parent = previous_hash.as_deref().unwrap_or("GENESIS");
+        let mut record = serde_json::json!({
+            "audit_ts": now.to_rfc3339(),
+            "envelope_id": envelope.id,
+            "replay_of": envelope.replay_of,
+            "event_ts": envelope.ts.to_rfc3339(),
+            "source": envelope.source,
+            "event_type": envelope.event_type,
+            "phase": phase,
+            "outcome": outcome,
+            "decision_basis": "explicit --replay-force; validated push.source body and replay marker",
+            "previous_hash": chain_parent,
+        });
+        let canonical = serde_json::to_vec(&record)
+            .map_err(|error| format!("serialize replay audit: {error}"))?;
+        let record_hash = format!("{:x}", Sha256::digest(&canonical));
+        record["record_hash"] = serde_json::Value::String(record_hash.clone());
+        let mut line = serde_json::to_vec(&record)
+            .map_err(|error| format!("serialize replay audit hash: {error}"))?;
+        line.push(b'\n');
+
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await
+            .map_err(|error| format!("open replay audit {}: {error}", path.display()))?;
+        file.write_all(&line)
+            .await
+            .map_err(|error| format!("append replay audit {}: {error}", path.display()))?;
+        file.sync_data()
+            .await
+            .map_err(|error| format!("sync replay audit {}: {error}", path.display()))?;
+        *previous_hash = Some(record_hash);
+        Ok(())
+    }
+}
+
+struct MonitorReplayPublisher<N, A> {
+    notification: N,
+    audit: A,
+    dry_run_active: bool,
+}
+
+#[async_trait::async_trait]
+impl<N, A> stock_analysis::event::ReplayPublisher for MonitorReplayPublisher<N, A>
+where
+    N: ReplayNotificationSink,
+    A: ReplayAuditSink,
+{
+    async fn publish(
+        &self,
+        envelope: stock_analysis::event::EventEnvelope,
+    ) -> Result<(), stock_analysis::event::ReplayPublishError> {
+        use stock_analysis::event::ReplayPublishError;
+
+        if self.dry_run_active {
+            return Err(ReplayPublishError::Environment(
+                "V10_DRY_RUN_PUSH=1 is active".into(),
+            ));
+        }
+        if envelope.event_type != "push.source" || envelope.replay_of.is_none() {
+            return Err(ReplayPublishError::InvalidEnvelope(
+                "publisher requires a marked push.source envelope".into(),
+            ));
+        }
+        let text = envelope
+            .payload
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| text.starts_with("[REPLAY "))
+            .ok_or_else(|| {
+                ReplayPublishError::InvalidEnvelope(
+                    "publisher requires an explicit replay marker".into(),
+                )
+            })?;
+
+        self.audit
+            .record(&envelope, "attempt", "authorized")
+            .await
+            .map_err(ReplayPublishError::Audit)?;
+        let delivered = self.notification.send(text).await;
+        self.audit
+            .record(
+                &envelope,
+                "result",
+                if delivered { "published" } else { "sink_failed" },
+            )
+            .await
+            .map_err(ReplayPublishError::Audit)?;
+        if delivered {
+            Ok(())
+        } else {
+            Err(ReplayPublishError::Sink(
+                "notification sink rejected replay".into(),
+            ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod monitor_replay_publisher_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+    use stock_analysis::event::{EventEnvelope, ReplayPublishError, ReplayPublisher};
+
+    #[derive(Clone)]
+    struct FakeNotificationSink {
+        delivered: bool,
+        calls: Arc<AtomicU64>,
+    }
+
+    #[async_trait::async_trait]
+    impl ReplayNotificationSink for FakeNotificationSink {
+        async fn send(&self, _text: &str) -> bool {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.delivered
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeAuditSink {
+        records: Arc<Mutex<Vec<(String, String)>>>,
+        fail_phase: Option<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl ReplayAuditSink for FakeAuditSink {
+        async fn record(
+            &self,
+            _envelope: &EventEnvelope,
+            phase: &str,
+            outcome: &str,
+        ) -> Result<(), String> {
+            if self.fail_phase == Some(phase) {
+                return Err(format!("{phase} audit failed"));
+            }
+            self.records
+                .lock()
+                .unwrap()
+                .push((phase.to_string(), outcome.to_string()));
+            Ok(())
+        }
+    }
+
+    fn replay_envelope(text: serde_json::Value) -> EventEnvelope {
+        EventEnvelope {
+            id: "replay-source-1".into(),
+            ts: chrono::Local::now(),
+            trace_id: "trace-1".into(),
+            source: "monitor".into(),
+            event_type: "push.source".into(),
+            entity_key: Some("600519".into()),
+            payload: serde_json::json!({"text": text, "kind": "Announcement"}),
+            version: 1,
+            replay_of: Some("source-1".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn monitor_replay_publisher_records_attempt_and_result() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let audit = FakeAuditSink::default();
+        let publisher = MonitorReplayPublisher {
+            notification: FakeNotificationSink { delivered: true, calls: calls.clone() },
+            audit: audit.clone(),
+            dry_run_active: false,
+        };
+        publisher
+            .publish(replay_envelope(serde_json::json!("[REPLAY 2026-07-16] body")))
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *audit.records.lock().unwrap(),
+            vec![("attempt".into(), "authorized".into()), ("result".into(), "published".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn monitor_replay_publisher_rejects_dry_run_invalid_and_sink_failure() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let publisher = MonitorReplayPublisher {
+            notification: FakeNotificationSink { delivered: true, calls: calls.clone() },
+            audit: FakeAuditSink::default(),
+            dry_run_active: true,
+        };
+        assert!(matches!(
+            publisher.publish(replay_envelope(serde_json::json!("[REPLAY 2026-07-16] body"))).await,
+            Err(ReplayPublishError::Environment(_))
+        ));
+        let publisher = MonitorReplayPublisher {
+            notification: FakeNotificationSink { delivered: true, calls: calls.clone() },
+            audit: FakeAuditSink::default(),
+            dry_run_active: false,
+        };
+        assert!(matches!(
+            publisher.publish(replay_envelope(serde_json::json!("body"))).await,
+            Err(ReplayPublishError::InvalidEnvelope(_))
+        ));
+        let publisher = MonitorReplayPublisher {
+            notification: FakeNotificationSink { delivered: false, calls: calls.clone() },
+            audit: FakeAuditSink::default(),
+            dry_run_active: false,
+        };
+        assert!(matches!(
+            publisher.publish(replay_envelope(serde_json::json!("[REPLAY 2026-07-16] body"))).await,
+            Err(ReplayPublishError::Sink(_))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn monitor_replay_publisher_blocks_delivery_when_attempt_audit_fails() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let publisher = MonitorReplayPublisher {
+            notification: FakeNotificationSink { delivered: true, calls: calls.clone() },
+            audit: FakeAuditSink { fail_phase: Some("attempt"), ..Default::default() },
+            dry_run_active: false,
+        };
+        assert!(matches!(
+            publisher.publish(replay_envelope(serde_json::json!("[REPLAY 2026-07-16] body"))).await,
+            Err(ReplayPublishError::Audit(_))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    fn audit_test_dir(name: &str) -> std::path::PathBuf {
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "monitor-replay-audit-{name}-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[tokio::test]
+    async fn file_replay_audit_persists_traceable_hash_chain() {
+        let dir = audit_test_dir("valid");
+        let audit = FileReplayAuditSink::new(dir.clone());
+        let envelope = replay_envelope(serde_json::json!("[REPLAY 2026-07-16] body"));
+        audit.record(&envelope, "attempt", "authorized").await.unwrap();
+        audit.record(&envelope, "result", "published").await.unwrap();
+        let reopened = FileReplayAuditSink::new(dir.clone());
+        reopened
+            .record(&envelope, "attempt", "authorized")
+            .await
+            .unwrap();
+        let path = dir.join(format!("{}.jsonl", chrono::Local::now().format("%Y")));
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        let records: Vec<serde_json::Value> = content.lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0]["envelope_id"], "replay-source-1");
+        assert_eq!(records[0]["replay_of"], "source-1");
+        assert_eq!(records[1]["previous_hash"], records[0]["record_hash"]);
+        assert_eq!(records[2]["previous_hash"], records[1]["record_hash"]);
+        tokio::fs::remove_dir_all(dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn file_replay_audit_rejects_corrupt_existing_tail() {
+        let dir = audit_test_dir("corrupt");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join(format!("{}.jsonl", chrono::Local::now().format("%Y")));
+        tokio::fs::write(&path, "{not-json}\n").await.unwrap();
+        let audit = FileReplayAuditSink::new(dir.clone());
+        let result = audit
+            .record(
+                &replay_envelope(serde_json::json!("[REPLAY 2026-07-16] body")),
+                "attempt",
+                "authorized",
+            )
+            .await;
+        assert!(result.unwrap_err().contains("parse replay audit line 1"));
+        assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), "{not-json}\n");
+        tokio::fs::remove_dir_all(dir).await.unwrap();
+    }
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
 
@@ -2129,7 +2518,7 @@ async fn main() {
     let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     match stock_analysis::event::cli::parse_args(&args_refs) {
         Ok(Some(stock_analysis::event::cli::EventCommand::Help)) => {
-            eprintln!("Usage: monitor [--replay=YYYY-MM-DD [--replay-force] [--replay-rate-ms N]]");
+            eprintln!("Usage: monitor [--replay=YYYY-MM-DD [--replay-force] [--replay-rate-ms=N]]");
             eprintln!("       [--history [--date=YYYY-MM-DD] [--code=CODE] [--kind=KIND]");
             eprintln!("                [--limit=N] [--success-rate] [--sink=SINK]]");
             eprintln!("       [--help]");
@@ -2138,28 +2527,35 @@ async fn main() {
             std::process::exit(0);
         }
         Ok(Some(stock_analysis::event::cli::EventCommand::Replay { date, force, rate_ms })) => {
-            // Build a fresh EventBus and ReplayRunner; do NOT start AuditDispatcher sink path.
-            use stock_analysis::event::{EventBus, ReplayRunner};
+            use stock_analysis::event::ReplayRunner;
             use std::path::PathBuf;
-            let bus = EventBus::new(1024);
+            let publisher = MonitorReplayPublisher {
+                notification: RealReplayNotificationSink,
+                audit: FileReplayAuditSink::new(PathBuf::from("data/replay_audit")),
+                dry_run_active: std::env::var("V10_DRY_RUN_PUSH").as_deref() == Ok("1"),
+            };
             let base_dir = PathBuf::from("data/event_bus");
-            let runner = ReplayRunner::new(base_dir, bus);
-            let count = runner.run(date, force, rate_ms).await.unwrap_or(0);
-            if count == 0 {
-                eprintln!(
-                    "[replay] date={} force={}: no replayable events found (zero dispatch)",
-                    date, force
-                );
-            } else {
-                println!(
-                    "[replay] date={} force={} mode={} count={}",
-                    date,
-                    force,
-                    if force { "FORCE" } else { "DRY-RUN" },
-                    count
-                );
+            let runner = ReplayRunner::new(base_dir, publisher);
+            match runner.run(date, force, rate_ms).await {
+                Ok(summary) => {
+                    println!(
+                        "[replay] date={} force={} mode={} attempted={} replayable={} published={} skipped={} failed={}",
+                        date,
+                        force,
+                        if force { "FORCE" } else { "DRY-RUN" },
+                        summary.attempted,
+                        summary.replayable,
+                        summary.published,
+                        summary.skipped,
+                        summary.failed
+                    );
+                    std::process::exit(if summary.has_failures() { 1 } else { 0 });
+                }
+                Err(error) => {
+                    eprintln!("[replay] failed: {error}");
+                    std::process::exit(1);
+                }
             }
-            std::process::exit(0);
         }
         Ok(Some(stock_analysis::event::cli::EventCommand::History {
             date,
@@ -2169,7 +2565,7 @@ async fn main() {
             success_rate,
             sink,
         })) => {
-            use stock_analysis::event::{HistoryQuery, HistoryFilter, HistoryOrder, Window};
+            use stock_analysis::event::{format_history_lines, HistoryQuery, HistoryFilter, HistoryOrder, Window};
             use std::path::PathBuf;
             let base_dir = PathBuf::from("data/event_bus");
             let query = HistoryQuery::new(base_dir);
@@ -2209,17 +2605,8 @@ async fn main() {
                 match query.query(filter).await {
                     Ok(entries) => {
                         println!("[history] {} entries", entries.len());
-                        for entry in entries.iter().take(20) {
-                            println!(
-                                "  {} {} {:?} {}",
-                                entry.ts.format("%Y-%m-%d %H:%M:%S"),
-                                entry.kind,
-                                entry.code,
-                                serde_json::to_string_pretty(&entry.summary).unwrap_or_default()
-                            );
-                        }
-                        if entries.len() > 20 {
-                            println!("  ... ({} more)", entries.len() - 20);
+                        for line in format_history_lines(&entries) {
+                            println!("{line}");
                         }
                     }
                     Err(e) => {
@@ -12371,4 +12758,3 @@ mod tests_v17_7_announcement_wiring {
         std::env::remove_var("V10_DRY_RUN_PUSH");
     }
 }
-

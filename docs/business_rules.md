@@ -37,6 +37,7 @@
 | BR-032 | 🟡 spec-only (v17.1-r2 未实施) | DispatcherRegistry 路由早退 — Vec 按注册顺序遍历, accepts() 首个 true 即处理并停止; 启动 validate() 对 2+ dispatcher 覆盖同 event_type 输出 warn (不阻断) | spec: `docs/v17.x/v17.1-r2-event-infrastructure.md §5.4 + §13.4 决策 #12`; 计划落点 `src/event/dispatcher.rs` |
 | BR-033 | ✅ registered | v17.4 能力1 新闻推送门 (filter+limit): critical 即时推 = strength≥threshold(默认80) 且 certainty≥60, event_id 当日去重, 每日上限 max_critical_per_day(默认20, 超限 warn 出声); 4 时段聚合 = 09:30/11:30/13:00/15:00 ±90s 各触发 1 次/日, 取当日 buffer 按 strength 降序 Top3; 全部阈值走 MonitorConfig (红线2.9 与 v17.4 §5.1/§6 互引) | `src/bin/monitor/news_aggregator_init.rs` (NewsFlashGate) + `src/bin/monitor/main.rs::news_monitor_loop` |
 | BR-034 | ✅ registered | v17.4 能力2 虚拟仓复盘双窗 dedup: 13:00 快照与 evening 全量复盘共用 PushKind::PaperReview (cooldown 86400/票), 快照用 "noon-{code}" 作 dedup code 前缀隔离两窗口; 13:00±90s 当日一次门控 (Mutex<Option<NaiveDate>>) | `src/bin/monitor/main.rs` (noon snapshot cron) + `src/bin/monitor/push_templates.rs::dispatch_paper_review_noon` |
+| BR-043 | ✅ registered | v17.3 Replay/History CLI 安全契约：已知 monitor flags 与 event command 可组合且参数顺序不吞命令；`--replay-rate-ms=N` 与双参数形式等价；force replay 仅发布含非空字符串 `payload.text` 且已加 `[REPLAY YYYY-MM-DD]` 的 `push.source`；相邻发布尝试按 `rate_ms` 节流；每次 replay envelope ID 进程内唯一；真实 sink 接受且 attempt/result 哈希链审计持久化后才统计发布成功，任一失败令 CLI 非零退出；history `limit=0` 显式表示不截断并输出全部结果，负数拒绝。 | `src/event/cli.rs`, `src/event/history.rs`, `src/event/replay.rs`, `src/bin/monitor/main.rs` |
 
 ---
 
