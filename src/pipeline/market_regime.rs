@@ -54,24 +54,56 @@ impl RegimeKind {
 pub(super) fn apply(
     data_manager: &DataFetcherManager,
     results: &mut [AnalysisResult],
-) -> Option<String> {
+) -> Result<Option<String>, String> {
+    apply_with_index_change(results, || {
+        data_manager
+            .get_daily_data(INDEX_CODE, 5)
+            .map(|(data, _)| data.first().map(|row| row.pct_chg))
+            .map_err(|error| {
+                format!(
+                    "BR-122 {}({}) data source failed: {error:#}",
+                    INDEX_NAME, INDEX_CODE
+                )
+            })
+    })
+}
+
+/// BR-122: separate real index acquisition from deterministic validation and gating.
+fn apply_with_index_change<F>(
+    results: &mut [AnalysisResult],
+    fetch_index_change: F,
+) -> Result<Option<String>, String>
+where
+    F: FnOnce() -> Result<Option<f64>, String>,
+{
     if results.is_empty() {
-        return None;
+        return Ok(None);
+    }
+    let index_chg = fetch_index_change()?.ok_or_else(|| {
+        format!(
+            "BR-122 {}({}) data source returned empty",
+            INDEX_NAME, INDEX_CODE
+        )
+    })?;
+    if !index_chg.is_finite() || index_chg.abs() > 20.0 {
+        return Err(format!(
+            "BR-122 {} change is invalid: {index_chg}",
+            INDEX_NAME
+        ));
     }
 
-    // 1. 指数当日涨跌幅
-    let index_chg = match data_manager.get_daily_data(INDEX_CODE, 5) {
-        Ok((data, _)) if !data.is_empty() => data[0].pct_chg,
-        _ => {
-            warn!(
-                "[大盘门控] {}({}) 数据获取失败，跳过大盘状态门控",
-                INDEX_NAME, INDEX_CODE
-            );
-            return None;
-        }
-    };
-
     // 2. 自选股广度
+    for result in results.iter() {
+        if result
+            .chg_1d
+            .is_some_and(|change| !change.is_finite() || change.abs() > 20.0)
+        {
+            return Err(format!(
+                "BR-122 {} {} daily change is invalid: {:?}",
+                result.name, result.code, result.chg_1d
+            ));
+        }
+    }
     let known: Vec<f64> = results.iter().filter_map(|r| r.chg_1d).collect();
     if known.is_empty() || known.len() * 2 < results.len() {
         warn!(
@@ -79,7 +111,7 @@ pub(super) fn apply(
             known.len(),
             results.len()
         );
-        return None;
+        return Ok(None);
     }
     let up = known.iter().filter(|c| **c > 0.0).count();
     let down = known.iter().filter(|c| **c < 0.0).count();
@@ -126,7 +158,7 @@ pub(super) fn apply(
         }
     }
 
-    Some(render_section(kind, index_chg, up, down, &adjusted))
+    Ok(Some(render_section(kind, index_chg, up, down, &adjusted)))
 }
 
 fn render_section(
@@ -180,4 +212,121 @@ fn render_section(
         }
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_with_index_change;
+    use crate::pipeline::AnalysisResult;
+
+    fn result(code: &str, advice: &str, change: Option<f64>) -> AnalysisResult {
+        let mut result: AnalysisResult = serde_json::from_value(serde_json::json!({
+            "code": code,
+            "name": format!("TEST_CODE_{code}"),
+            "sentiment_score": 50,
+            "ranking_score": 50,
+            "operation_advice": advice,
+            "trend_prediction": "TEST_CODE_盘整",
+            "analysis_summary": "TEST_CODE_正文",
+            "is_limit_up": false,
+            "contrarian_signal": false
+        }))
+        .expect("valid result fixture");
+        result.chg_1d = change;
+        result
+    }
+
+    #[test]
+    fn source_errors_empty_index_and_incomplete_breadth_are_explicit() {
+        let mut results = vec![result("A", "观望", Some(1.0))];
+        assert!(
+            apply_with_index_change(&mut results, || Err("TEST_CODE_source".to_string()))
+                .unwrap_err()
+                .contains("TEST_CODE_source")
+        );
+        assert!(apply_with_index_change(&mut results, || Ok(None))
+            .unwrap_err()
+            .contains("empty"));
+        assert!(apply_with_index_change(&mut [], || Ok(Some(0.0)))
+            .unwrap()
+            .is_none());
+
+        let mut incomplete = vec![
+            result("A", "观望", Some(1.0)),
+            result("B", "观望", None),
+            result("C", "观望", None),
+        ];
+        assert!(apply_with_index_change(&mut incomplete, || Ok(Some(0.0)))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn invalid_index_or_present_stock_change_rejects_complete_batch() {
+        for index in [f64::NAN, 20.1] {
+            let mut results = vec![result("A", "观望", Some(1.0))];
+            assert!(apply_with_index_change(&mut results, || Ok(Some(index)))
+                .unwrap_err()
+                .contains("BR-122"));
+        }
+        for change in [f64::INFINITY, -20.1] {
+            let mut results = vec![result("A", "观望", Some(change))];
+            assert!(apply_with_index_change(&mut results, || Ok(Some(0.0)))
+                .unwrap_err()
+                .contains("BR-122"));
+        }
+    }
+
+    #[test]
+    fn broad_decline_adjusts_only_registered_reduce_advice_branches() {
+        let mut results = vec![
+            result("POSITIVE", "建议减仓", Some(0.1)),
+            result("OUTPERFORM", "建议减仓", Some(-1.0)),
+            result("WEAK", "建议减仓", Some(-2.5)),
+            result("SELL", "建议卖出", Some(-3.0)),
+            result("MISSING", "建议减仓", None),
+        ];
+        results[1].original_advice = Some("TEST_CODE_既有原建议".to_string());
+        let rendered = apply_with_index_change(&mut results, || Ok(Some(-3.0)))
+            .unwrap()
+            .expect("complete decline section");
+        assert_eq!(results[0].operation_advice, "观望");
+        assert_eq!(results[0].original_advice.as_deref(), Some("建议减仓"));
+        assert_eq!(results[1].operation_advice, "观望");
+        assert_eq!(
+            results[1].original_advice.as_deref(),
+            Some("TEST_CODE_既有原建议")
+        );
+        assert_eq!(results[2].operation_advice, "建议减仓");
+        assert_eq!(results[3].operation_advice, "建议卖出");
+        assert_eq!(results[4].operation_advice, "建议减仓");
+        for expected in ["普跌", "已豁免 2 只", "POSITIVE", "OUTPERFORM", "+3.10pp"] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn all_three_regimes_and_no_adjustment_render_their_registered_guidance() {
+        for (index, changes, expected) in [
+            (1.5, vec![1.0, 2.0, 3.0, -1.0], "普涨日"),
+            (0.0, vec![1.0, -1.0, 0.0, 0.0], "结构性行情"),
+            (-1.5, vec![-2.0, -2.0, -2.0, 1.0], "无个股触发普跌豁免"),
+        ] {
+            let mut results: Vec<_> = changes
+                .into_iter()
+                .enumerate()
+                .map(|(idx, change)| result(&idx.to_string(), "观望", Some(change)))
+                .collect();
+            let rendered = apply_with_index_change(&mut results, || Ok(Some(index)))
+                .unwrap()
+                .expect("complete section");
+            assert!(
+                rendered.contains(expected),
+                "missing {expected}: {rendered}"
+            );
+        }
+    }
 }

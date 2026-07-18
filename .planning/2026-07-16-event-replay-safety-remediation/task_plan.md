@@ -162,6 +162,8 @@ Phase 12 (Gate D coverage and live-account release closure)
 | Task-9 strict Clippy found the connection-level ID query used only by unit tests | 1 | Complete the repository interface with a public fail-closed `get_account_snapshot(id)` wrapper so the tested real-SQL path is also reachable by production consumers. |
 | Task-9 public repository fixture used a hand-counted evidence string longer than 64 hex characters | 1 | Generate the independent synthetic digest as exactly 64 lowercase `f` characters; retain strict digest validation. |
 | First focused cargo-llvm-cov command placed the test filter before `--` | 1 | Re-run using Cargo's required `-- database::account_snapshot::tests` separator; do not discard or rewrite the completed aggregate report. |
+| First Task-10 focused `cargo test` supplied two positional filters | 1 | Re-run with the single shared `pipeline::` filter; Cargo accepts only one positional TESTNAME and the intended RED assertions then compiled against both modules. |
+| Task-10 RED compilation found the planned market seam absent and every nullable projection still concrete/defaulted | 1 | Implement BR-122: route production through deterministic validation/gating and change unavailable narrow-projection facts to `Option` without adding fallback values. |
 ## Follow-up review slice (2026-07-18)
 
 - [x] Add RED test for `:memory:` journal-mode failure.

@@ -661,8 +661,9 @@ impl AnalysisPipeline {
                 }
             };
 
-            // 大盘状态门控：普跌日豁免跑赢指数个股的机械减仓建议，并在日报头部输出市场定性
-            let regime_section = market_regime::apply(&self.data_manager, &mut results);
+            // BR-122 大盘状态门控：普跌日豁免跑赢指数个股的机械减仓建议，并在日报头部输出市场定性
+            let regime_section = market_regime::apply(&self.data_manager, &mut results)
+                .map_err(anyhow::Error::msg)?;
             summary_notify::send_summary_notification(
                 &self.notifier,
                 &results,
