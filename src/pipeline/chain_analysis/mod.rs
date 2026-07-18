@@ -1377,6 +1377,15 @@ mod tests {
         }
     }
 
+    fn unavailable_analyzer() -> GeminiAnalyzer {
+        GeminiAnalyzer::new(crate::analyzer::GeminiConfig {
+            max_retries: 1,
+            retry_delay: 0.0,
+            request_delay: 0.0,
+            ..crate::analyzer::GeminiConfig::default()
+        })
+    }
+
     #[test]
     fn test_chain_score_total() {
         let score = ChainScore {
@@ -1849,5 +1858,117 @@ mod tests {
         assert!(report.contains("孤立涨停"));
         assert!(report.contains("独立逻辑"));
         assert!(!report.contains("融资融券、独立逻辑"));
+    }
+
+    #[tokio::test]
+    async fn llm_prompt_paths_preserve_evidence_and_fail_closed_without_a_provider() {
+        let analyzer = unavailable_analyzer();
+        assert!(!analyzer.is_available());
+        let concepts = HashMap::from([
+            (
+                "TEST_CODE_000001".to_string(),
+                vec!["测试主线".to_string(), "相关设备".to_string()],
+            ),
+            (
+                "TEST_CODE_000002".to_string(),
+                vec!["测试主线".to_string(), "昨日涨停".to_string()],
+            ),
+        ]);
+        let cluster = ChainCluster {
+            concept: "测试主线".to_string(),
+            aliases: vec!["测试别名".to_string()],
+            stocks: vec![
+                top("TEST_CODE_000001", "甲", 10.0),
+                top("TEST_CODE_000002", "乙", 9.8),
+            ],
+            continuation_count: 1,
+            streak_days: 2,
+            candidates: vec![top("TEST_CODE_000003", "候选", 3.0)],
+            score: None,
+            scenario: None,
+        };
+        let lhb = HashMap::from([("TEST_CODE_000001".to_string(), 1234.0)]);
+
+        let deep_error = analyze_cluster_deep(
+            &analyzer,
+            &cluster,
+            &concepts,
+            &lhb,
+            "真实宏观上下文",
+            "真实主线新闻",
+            "2026-07-18",
+        )
+        .await
+        .expect_err("missing provider must be explicit");
+        assert!(deep_error.to_string().contains("API Key 未配置"));
+
+        let simple_error =
+            analyze_cluster_simple(&analyzer, &cluster, &concepts, &lhb, "2026-07-18")
+                .await
+                .expect_err("missing provider must be explicit");
+        assert!(simple_error.to_string().contains("API Key 未配置"));
+
+        let positions = vec![PositionDiag {
+            code: "TEST_CODE_000001".to_string(),
+            name: "甲".to_string(),
+            return_rate: None,
+            mainline: Some(("测试主线".to_string(), 2)),
+            in_limit_pool: true,
+        }];
+        assert!(synthesize_overview(
+            &analyzer,
+            &[cluster],
+            &[("测试主线".to_string(), Some("已验证分析".to_string()))],
+            &positions,
+            "2026-07-18",
+            "盘后真实催化",
+        )
+        .await
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn llm_prompt_empty_optional_evidence_stays_explicitly_missing() {
+        let analyzer = unavailable_analyzer();
+        let cluster = ChainCluster {
+            concept: "测试主线".to_string(),
+            aliases: Vec::new(),
+            stocks: vec![top("TEST_CODE_000001", "甲", 10.0)],
+            continuation_count: 0,
+            streak_days: 0,
+            candidates: Vec::new(),
+            score: None,
+            scenario: None,
+        };
+        assert!(analyze_cluster_deep(
+            &analyzer,
+            &cluster,
+            &HashMap::new(),
+            &HashMap::new(),
+            "",
+            "",
+            "2026-07-18",
+        )
+        .await
+        .is_err());
+        assert!(analyze_cluster_simple(
+            &analyzer,
+            &cluster,
+            &HashMap::new(),
+            &HashMap::new(),
+            "2026-07-18",
+        )
+        .await
+        .is_err());
+        assert!(synthesize_overview(
+            &analyzer,
+            &[cluster],
+            &[("测试主线".to_string(), None)],
+            &[],
+            "2026-07-18",
+            "",
+        )
+        .await
+        .is_none());
     }
 }

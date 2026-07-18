@@ -257,6 +257,7 @@
 ## 2026-07-18 Gate D continuation
 
 - User directed autonomous continuation until completion and merge.
+- 2026-07-18 Gate D Task 15: generated the first CI-equivalent workspace baseline (60.26% global / 82.79% core), extracted real-benchmark→resolved Bollinger/RSI execution, made trade/NAV audit writes fail closed, covered chain prompt construction without a provider, and split push2 status/body validation from transport. Focused backtest 11/11 and chain 27/27 passed; full instrumented library 1,507 passed / 10 ignored / 0 failed. Library coverage is now 67.04% global / 83.06% core. Gate D remains in progress.
 - Restored mandatory rules, design, handoff, plan, findings, progress, Git state, and coverage-gate context.
 - Confirmed `codex/repository-safety-closure-20260718` is clean and synchronized at `9198f82`, eight commits ahead of local `master`.
 - Updated the active persistent plan to Phase 12: core coverage, global coverage, nullable same-day account evidence, full Gate A-D validation, independent audit, and final merge.

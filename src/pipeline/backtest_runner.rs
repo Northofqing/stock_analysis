@@ -3,17 +3,21 @@
 //! 纯粹承载三种回测流程的方法：多因子、布林带+Z-Score、RSI。
 //! 保持 `impl AnalysisPipeline`，调用方无感知。
 
-use anyhow::Result;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
 use log::{info, warn};
 
 use super::{AnalysisPipeline, AnalysisResult};
-use crate::strategy::bollinger_zscore::{BollingerZScoreBacktest, BollingerZScoreConfig};
+use crate::strategy::bollinger_zscore::{
+    BollingerZScoreBacktest, BollingerZScoreConfig, BollingerZScoreResult,
+};
 use crate::strategy::core::{
     write_daily_values_csv, write_trades_csv, BacktestConfig, BacktestEngine, BacktestState,
     BacktestSummary, BenchmarkSeries, WalkForwardFold, WalkForwardReport,
 };
 use crate::strategy::multi_factor::{MultiFactorConfig, MultiFactorEngine, StockFactors};
-use crate::strategy::rsi::{RsiBacktest, RsiConfig};
+use crate::strategy::rsi::{RsiBacktest, RsiConfig, RsiResult};
 
 type StockHistory = (String, String, Vec<crate::data_provider::KlineData>);
 type HistorySplit = (String, Vec<StockHistory>, Vec<StockHistory>);
@@ -294,7 +298,10 @@ impl AnalysisPipeline {
         }
     }
 
-    /// 将组合的每日净值与交易明细落盘到 reports/details/ 作为审计留痕。失败仅告警，不阻断主流程。
+    /// 将组合的每日净值与交易明细落盘到 reports/details/ 作为审计留痕。
+    ///
+    /// 审计是发布红线（2.7），任何创建目录或写文件失败都必须显式返回，
+    /// 不允许把缺失审计降级为成功回测。
     fn export_audit_csv(
         &self,
         strategy_tag: &str,
@@ -302,29 +309,48 @@ impl AnalysisPipeline {
         daily_values: &[(chrono::DateTime<chrono::Local>, f64)],
         trades: &[crate::strategy::core::Trade],
         initial_capital: f64,
-    ) {
-        let dir = "reports/details";
-        if let Err(e) = std::fs::create_dir_all(dir) {
-            warn!("创建审计目录 {} 失败: {}", dir, e);
-            return;
-        }
+    ) -> Result<(PathBuf, PathBuf)> {
+        Self::export_audit_csv_to(
+            Path::new("reports/details"),
+            strategy_tag,
+            date_str,
+            daily_values,
+            trades,
+            initial_capital,
+        )
+    }
+
+    fn export_audit_csv_to(
+        dir: &Path,
+        strategy_tag: &str,
+        date_str: &str,
+        daily_values: &[(chrono::DateTime<chrono::Local>, f64)],
+        trades: &[crate::strategy::core::Trade],
+        initial_capital: f64,
+    ) -> Result<(PathBuf, PathBuf)> {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("创建回测审计目录失败: {}", dir.display()))?;
         let mut state = BacktestState::new(initial_capital);
         state.daily_values = daily_values.to_vec();
         state.trades = trades.to_vec();
 
-        let trades_path = format!("{}/{}_trades_{}.csv", dir, strategy_tag, date_str);
-        if let Err(e) = write_trades_csv(&state, &trades_path) {
-            warn!("导出交易明细CSV失败 ({}): {}", trades_path, e);
-        } else {
-            info!("✓ 交易明细已留痕: {}", trades_path);
-        }
+        let trades_path = dir.join(format!("{}_trades_{}.csv", strategy_tag, date_str));
+        let trades_path_str = trades_path.to_str().ok_or_else(|| {
+            anyhow::anyhow!("回测交易审计路径不是 UTF-8: {}", trades_path.display())
+        })?;
+        write_trades_csv(&state, trades_path_str)
+            .with_context(|| format!("导出交易明细 CSV 失败: {}", trades_path.display()))?;
+        info!("✓ 交易明细已留痕: {}", trades_path.display());
 
-        let nav_path = format!("{}/{}_nav_{}.csv", dir, strategy_tag, date_str);
-        if let Err(e) = write_daily_values_csv(&state, &nav_path, initial_capital) {
-            warn!("导出每日净值CSV失败 ({}): {}", nav_path, e);
-        } else {
-            info!("✓ 每日净值已留痕: {}", nav_path);
-        }
+        let nav_path = dir.join(format!("{}_nav_{}.csv", strategy_tag, date_str));
+        let nav_path_str = nav_path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("回测净值审计路径不是 UTF-8: {}", nav_path.display()))?;
+        write_daily_values_csv(&state, nav_path_str, initial_capital)
+            .with_context(|| format!("导出每日净值 CSV 失败: {}", nav_path.display()))?;
+        info!("✓ 每日净值已留痕: {}", nav_path.display());
+
+        Ok((trades_path, nav_path))
     }
 
     /// 按全局交易日期把组合历史切成 前段(样本内)/后段(样本外) 两份。
@@ -615,7 +641,7 @@ impl AnalysisPipeline {
             &base_state.daily_values,
             &base_state.trades,
             summary.initial_capital,
-        );
+        )?;
 
         Ok(summary)
     }
@@ -648,92 +674,12 @@ impl AnalysisPipeline {
         &self,
         history: &[(String, String, Vec<crate::data_provider::KlineData>)],
     ) -> Result<BacktestSummary> {
-        let config = BollingerZScoreConfig::default();
-        let engine = BollingerZScoreBacktest::new(config);
+        // 生产入口只负责取得真实基准；确定性计算由 resolved seam 完成。
+        let benchmark = self.fetch_benchmark_series(7000).await;
+        let (result, report) = Self::run_bollinger_zscore_resolved(history, benchmark)?;
 
-        // 布林带需要至少 30 条K线
-        let stocks_data: Vec<_> = history
-            .iter()
-            .filter(|(_, _, d)| d.len() >= 30)
-            .cloned()
-            .collect();
-
-        if stocks_data.is_empty() {
-            anyhow::bail!("无有效股票数据用于布林带回测");
-        }
-
-        info!("布林带回测：共 {} 只股票参与", stocks_data.len());
-        let mut result = engine.run_portfolio(&stocks_data)?;
-
-        // 注入真实基准（沪深300），失败则为 None，报告如实标注
-        result.benchmark = self.fetch_benchmark_series(7000).await;
-
-        // 生成并保存报告
+        // 保存报告
         let date_str = chrono::Local::now().format("%Y%m%d").to_string();
-        let mut report = result.generate_report();
-
-        // C. 分市场状态拆解（需基准）
-        if let Some(bench) = &result.benchmark {
-            if let Some(rep) =
-                crate::strategy::core::regime_breakdown(&result.portfolio_daily_values, bench)
-            {
-                report.push_str(&super::reporting::build_regime_section(&rep));
-            }
-        }
-
-        // A. 时间样本外切分（前 60% 样本内 / 后 40% 样本外，参数固定做一致性检验）
-        if let Some((cutoff, in_h, out_h)) = Self::split_history_by_date(&stocks_data, 0.6) {
-            let oos_engine = BollingerZScoreBacktest::new(BollingerZScoreConfig::default());
-            if let (Ok(mut r_in), Ok(mut r_out)) = (
-                oos_engine.run_portfolio(&in_h),
-                oos_engine.run_portfolio(&out_h),
-            ) {
-                r_in.benchmark = result.benchmark.clone();
-                r_out.benchmark = result.benchmark.clone();
-                report.push_str(&super::reporting::build_oos_section(
-                    &cutoff,
-                    &r_in.to_summary(),
-                    &r_out.to_summary(),
-                ));
-            }
-        }
-
-        // B. Walk-Forward 滚动优化（参数网格寻优 + 样本外验证）
-        let bb_grid: Vec<(String, BollingerZScoreConfig)> = [
-            ("zbuy-2.0/x2.0", -2.0_f64, 2.0_f64),
-            ("zbuy-1.5/x2.0", -1.5, 2.0),
-            ("zbuy-2.5/x2.0", -2.5, 2.0),
-            ("zbuy-2.0/x2.5", -2.0, 2.5),
-            ("zbuy-2.0/x1.5", -2.0, 1.5),
-            ("zbuy-1.8/x2.2", -1.8, 2.2),
-        ]
-        .iter()
-        .map(|(label, zbuy, mult)| {
-            (
-                label.to_string(),
-                BollingerZScoreConfig {
-                    zscore_buy: *zbuy,
-                    zscore_sell: -*zbuy,
-                    bb_std_mult: *mult,
-                    ..BollingerZScoreConfig::default()
-                },
-            )
-        })
-        .collect();
-        if let Some(wf) = Self::walk_forward(
-            &stocks_data,
-            &bb_grid,
-            |cfg, slice| {
-                BollingerZScoreBacktest::new(cfg.clone())
-                    .run_portfolio(slice)
-                    .ok()
-                    .map(|r| r.to_summary())
-            },
-            4,
-        ) {
-            report.push_str(&super::reporting::build_walk_forward_section(&wf));
-        }
-
         let report_filename = format!("bollinger_zscore_backtest_{}.md", date_str);
         self.notifier
             .save_report_to_file(&report, Some(&report_filename))?;
@@ -757,9 +703,91 @@ impl AnalysisPipeline {
             &result.portfolio_daily_values,
             &result.portfolio_trades,
             initial_capital,
-        );
+        )?;
 
         Ok(result.to_summary())
+    }
+
+    fn run_bollinger_zscore_resolved(
+        history: &[StockHistory],
+        benchmark: Option<BenchmarkSeries>,
+    ) -> Result<(BollingerZScoreResult, String)> {
+        let config = BollingerZScoreConfig::default();
+        let engine = BollingerZScoreBacktest::new(config);
+        let stocks_data: Vec<_> = history
+            .iter()
+            .filter(|(_, _, data)| data.len() >= 30)
+            .cloned()
+            .collect();
+        if stocks_data.is_empty() {
+            anyhow::bail!("无有效股票数据用于布林带回测");
+        }
+
+        info!("布林带回测：共 {} 只股票参与", stocks_data.len());
+        let mut result = engine.run_portfolio(&stocks_data)?;
+        result.benchmark = benchmark;
+        let mut report = result.generate_report();
+
+        if let Some(bench) = &result.benchmark {
+            if let Some(regime) =
+                crate::strategy::core::regime_breakdown(&result.portfolio_daily_values, bench)
+            {
+                report.push_str(&super::reporting::build_regime_section(&regime));
+            }
+        }
+        if let Some((cutoff, in_sample, out_sample)) =
+            Self::split_history_by_date(&stocks_data, 0.6)
+        {
+            let oos_engine = BollingerZScoreBacktest::new(BollingerZScoreConfig::default());
+            if let (Ok(mut in_result), Ok(mut out_result)) = (
+                oos_engine.run_portfolio(&in_sample),
+                oos_engine.run_portfolio(&out_sample),
+            ) {
+                in_result.benchmark = result.benchmark.clone();
+                out_result.benchmark = result.benchmark.clone();
+                report.push_str(&super::reporting::build_oos_section(
+                    &cutoff,
+                    &in_result.to_summary(),
+                    &out_result.to_summary(),
+                ));
+            }
+        }
+
+        let grid: Vec<(String, BollingerZScoreConfig)> = [
+            ("zbuy-2.0/x2.0", -2.0_f64, 2.0_f64),
+            ("zbuy-1.5/x2.0", -1.5, 2.0),
+            ("zbuy-2.5/x2.0", -2.5, 2.0),
+            ("zbuy-2.0/x2.5", -2.0, 2.5),
+            ("zbuy-2.0/x1.5", -2.0, 1.5),
+            ("zbuy-1.8/x2.2", -1.8, 2.2),
+        ]
+        .iter()
+        .map(|(label, zbuy, multiplier)| {
+            (
+                label.to_string(),
+                BollingerZScoreConfig {
+                    zscore_buy: *zbuy,
+                    zscore_sell: -*zbuy,
+                    bb_std_mult: *multiplier,
+                    ..BollingerZScoreConfig::default()
+                },
+            )
+        })
+        .collect();
+        if let Some(walk_forward) = Self::walk_forward(
+            &stocks_data,
+            &grid,
+            |cfg, slice| {
+                BollingerZScoreBacktest::new(cfg.clone())
+                    .run_portfolio(slice)
+                    .ok()
+                    .map(|run| run.to_summary())
+            },
+            4,
+        ) {
+            report.push_str(&super::reporting::build_walk_forward_section(&walk_forward));
+        }
+        Ok((result, report))
     }
 
     /// 运行 RSI 超买超卖策略回测
@@ -767,92 +795,11 @@ impl AnalysisPipeline {
         &self,
         history: &[(String, String, Vec<crate::data_provider::KlineData>)],
     ) -> Result<BacktestSummary> {
-        // 使用 2026-04-18 优化定稿的 v10 配置（93.75% 胜率）；见 reports/rsi_optimization_log.md
-        let config = RsiConfig::preset_daily_v10_no_stop();
-        let engine = RsiBacktest::new(config);
-
-        // RSI 需要至少 20 条K线
-        let stocks_data: Vec<_> = history
-            .iter()
-            .filter(|(_, _, d)| d.len() >= 20)
-            .cloned()
-            .collect();
-
-        if stocks_data.is_empty() {
-            anyhow::bail!("无有效股票数据用于RSI回测");
-        }
-
-        info!("RSI 回测：共 {} 只股票参与", stocks_data.len());
-        let mut result = engine.run_portfolio(&stocks_data)?;
-
-        // 注入真实基准（沪深300），失败则为 None，报告如实标注
-        result.benchmark = self.fetch_benchmark_series(7000).await;
+        let benchmark = self.fetch_benchmark_series(7000).await;
+        let (result, report) = Self::run_rsi_resolved(history, benchmark)?;
 
         // 保存报告
         let date_str = chrono::Local::now().format("%Y%m%d").to_string();
-        let mut report = result.generate_report();
-
-        // C. 分市场状态拆解（需基准）
-        if let Some(bench) = &result.benchmark {
-            if let Some(rep) =
-                crate::strategy::core::regime_breakdown(&result.portfolio_daily_values, bench)
-            {
-                report.push_str(&super::reporting::build_regime_section(&rep));
-            }
-        }
-
-        // A. 时间样本外切分（前 60% 样本内 / 后 40% 样本外，参数固定做一致性检验）
-        if let Some((cutoff, in_h, out_h)) = Self::split_history_by_date(&stocks_data, 0.6) {
-            let oos_engine = RsiBacktest::new(RsiConfig::preset_daily_v10_no_stop());
-            if let (Ok(mut r_in), Ok(mut r_out)) = (
-                oos_engine.run_portfolio(&in_h),
-                oos_engine.run_portfolio(&out_h),
-            ) {
-                r_in.benchmark = result.benchmark.clone();
-                r_out.benchmark = result.benchmark.clone();
-                report.push_str(&super::reporting::build_oos_section(
-                    &cutoff,
-                    &r_in.to_summary(),
-                    &r_out.to_summary(),
-                ));
-            }
-        }
-
-        // B. Walk-Forward 滚动优化（参数网格寻优 + 样本外验证）
-        let rsi_grid: Vec<(String, RsiConfig)> = [
-            ("os25/tp0.08", 25.0_f64, 0.08_f64),
-            ("os22/tp0.10", 22.0, 0.10),
-            ("os28/tp0.06", 28.0, 0.06),
-            ("os25/tp0.06", 25.0, 0.06),
-            ("os22/tp0.08", 22.0, 0.08),
-            ("os30/tp0.08", 30.0, 0.08),
-        ]
-        .iter()
-        .map(|(label, os, tp)| {
-            (
-                label.to_string(),
-                RsiConfig {
-                    oversold: *os,
-                    take_profit_pct: *tp,
-                    ..RsiConfig::preset_daily_v10_no_stop()
-                },
-            )
-        })
-        .collect();
-        if let Some(wf) = Self::walk_forward(
-            &stocks_data,
-            &rsi_grid,
-            |cfg, slice| {
-                RsiBacktest::new(cfg.clone())
-                    .run_portfolio(slice)
-                    .ok()
-                    .map(|r| r.to_summary())
-            },
-            4,
-        ) {
-            report.push_str(&super::reporting::build_walk_forward_section(&wf));
-        }
-
         let report_filename = format!("rsi_strategy_backtest_{}.md", date_str);
         self.notifier
             .save_report_to_file(&report, Some(&report_filename))?;
@@ -873,9 +820,90 @@ impl AnalysisPipeline {
             &result.portfolio_daily_values,
             &result.portfolio_trades,
             initial_capital,
-        );
+        )?;
 
         Ok(result.to_summary())
+    }
+
+    fn run_rsi_resolved(
+        history: &[StockHistory],
+        benchmark: Option<BenchmarkSeries>,
+    ) -> Result<(RsiResult, String)> {
+        let config = RsiConfig::preset_daily_v10_no_stop();
+        let engine = RsiBacktest::new(config);
+        let stocks_data: Vec<_> = history
+            .iter()
+            .filter(|(_, _, data)| data.len() >= 20)
+            .cloned()
+            .collect();
+        if stocks_data.is_empty() {
+            anyhow::bail!("无有效股票数据用于RSI回测");
+        }
+
+        info!("RSI 回测：共 {} 只股票参与", stocks_data.len());
+        let mut result = engine.run_portfolio(&stocks_data)?;
+        result.benchmark = benchmark;
+        let mut report = result.generate_report();
+
+        if let Some(bench) = &result.benchmark {
+            if let Some(regime) =
+                crate::strategy::core::regime_breakdown(&result.portfolio_daily_values, bench)
+            {
+                report.push_str(&super::reporting::build_regime_section(&regime));
+            }
+        }
+        if let Some((cutoff, in_sample, out_sample)) =
+            Self::split_history_by_date(&stocks_data, 0.6)
+        {
+            let oos_engine = RsiBacktest::new(RsiConfig::preset_daily_v10_no_stop());
+            if let (Ok(mut in_result), Ok(mut out_result)) = (
+                oos_engine.run_portfolio(&in_sample),
+                oos_engine.run_portfolio(&out_sample),
+            ) {
+                in_result.benchmark = result.benchmark.clone();
+                out_result.benchmark = result.benchmark.clone();
+                report.push_str(&super::reporting::build_oos_section(
+                    &cutoff,
+                    &in_result.to_summary(),
+                    &out_result.to_summary(),
+                ));
+            }
+        }
+
+        let grid: Vec<(String, RsiConfig)> = [
+            ("os25/tp0.08", 25.0_f64, 0.08_f64),
+            ("os22/tp0.10", 22.0, 0.10),
+            ("os28/tp0.06", 28.0, 0.06),
+            ("os25/tp0.06", 25.0, 0.06),
+            ("os22/tp0.08", 22.0, 0.08),
+            ("os30/tp0.08", 30.0, 0.08),
+        ]
+        .iter()
+        .map(|(label, oversold, take_profit)| {
+            (
+                label.to_string(),
+                RsiConfig {
+                    oversold: *oversold,
+                    take_profit_pct: *take_profit,
+                    ..RsiConfig::preset_daily_v10_no_stop()
+                },
+            )
+        })
+        .collect();
+        if let Some(walk_forward) = Self::walk_forward(
+            &stocks_data,
+            &grid,
+            |cfg, slice| {
+                RsiBacktest::new(cfg.clone())
+                    .run_portfolio(slice)
+                    .ok()
+                    .map(|run| run.to_summary())
+            },
+            4,
+        ) {
+            report.push_str(&super::reporting::build_walk_forward_section(&walk_forward));
+        }
+        Ok((result, report))
     }
 }
 
@@ -884,6 +912,30 @@ mod tests {
     use super::*;
     use crate::data_provider::KlineData;
     use crate::strategy::core::{BacktestState, BacktestSummary};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TempAuditDir(PathBuf);
+
+    impl TempAuditDir {
+        fn new(label: &str) -> Self {
+            let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "stock_analysis_{label}_{}_{}",
+                std::process::id(),
+                id
+            ));
+            Self(path)
+        }
+    }
+
+    impl Drop for TempAuditDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn kl(date: chrono::NaiveDate, close: f64) -> KlineData {
         KlineData {
@@ -931,6 +983,35 @@ mod tests {
             })
             .collect();
         vec![("TEST_CODE_000001".into(), "测试股".into(), ks)]
+    }
+
+    fn oscillating_history(days: usize) -> Vec<StockHistory> {
+        let base = chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
+        let klines = (0..days)
+            .map(|day| {
+                let cycle = day % 20;
+                let close = if cycle < 10 {
+                    12.0 - cycle as f64 * 0.35
+                } else {
+                    8.5 + (cycle - 10) as f64 * 0.4
+                };
+                kl(base + chrono::Duration::days(day as i64), close)
+            })
+            .collect();
+        vec![(
+            "TEST_CODE_000001".to_string(),
+            "隔离回测标的".to_string(),
+            klines,
+        )]
+    }
+
+    fn benchmark_for(history: &[StockHistory]) -> BenchmarkSeries {
+        let closes: HashMap<chrono::NaiveDate, f64> = history[0]
+            .2
+            .iter()
+            .map(|kline| (kline.date, kline.close * 100.0))
+            .collect();
+        BenchmarkSeries::new("TEST_CODE_基准", closes)
     }
 
     /// 修复：QUANT_ANALYST_REVIEW §1.5
@@ -1212,5 +1293,59 @@ mod tests {
                 .is_none()
         );
         assert!(AnalysisPipeline::walk_forward(&h, &[("x".into(), 1.0)], |_, _| None, 4).is_none());
+    }
+
+    #[test]
+    fn resolved_backtests_reject_short_batches_and_render_local_history() {
+        assert!(AnalysisPipeline::run_bollinger_zscore_resolved(&history(29), None).is_err());
+        assert!(AnalysisPipeline::run_rsi_resolved(&history(19), None).is_err());
+
+        let local = oscillating_history(160);
+        let (bollinger, bollinger_report) =
+            AnalysisPipeline::run_bollinger_zscore_resolved(&local, Some(benchmark_for(&local)))
+                .expect("validated local Bollinger execution");
+        assert_eq!(bollinger.single_results.len(), 1);
+        assert!(bollinger.to_summary().final_value.is_finite());
+        assert!(bollinger_report.contains("布林"));
+
+        let (rsi, rsi_report) =
+            AnalysisPipeline::run_rsi_resolved(&local, Some(benchmark_for(&local)))
+                .expect("validated local RSI execution");
+        assert_eq!(rsi.single_results.len(), 1);
+        assert!(rsi.to_summary().final_value.is_finite());
+        assert!(rsi_report.contains("RSI"));
+    }
+
+    #[test]
+    fn audit_csv_is_traceable_and_write_failures_are_explicit() {
+        let temp = TempAuditDir::new("backtest_audit");
+        let observed_at = chrono::Local::now();
+        let (trades, nav) = AnalysisPipeline::export_audit_csv_to(
+            &temp.0,
+            "TEST_CODE_strategy",
+            "20260718",
+            &[(observed_at, 100_000.0)],
+            &[],
+            100_000.0,
+        )
+        .expect("isolated audit files");
+        assert!(trades.is_file());
+        assert!(nav.is_file());
+        assert!(std::fs::read_to_string(nav)
+            .expect("NAV audit")
+            .contains("2026"));
+
+        let blocking_file = temp.0.join("not_a_directory");
+        std::fs::write(&blocking_file, b"occupied").expect("blocking file");
+        let error = AnalysisPipeline::export_audit_csv_to(
+            &blocking_file,
+            "TEST_CODE_strategy",
+            "20260718",
+            &[],
+            &[],
+            100_000.0,
+        )
+        .expect_err("audit path failure must block");
+        assert!(error.to_string().contains("创建回测审计目录失败"));
     }
 }

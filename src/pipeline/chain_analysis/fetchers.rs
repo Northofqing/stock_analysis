@@ -144,6 +144,12 @@ fn merge_board_code_page(
 
 /// 拉取东财全部概念板块列表，返回 板块名 -> 板块代码(BKxxxx)。
 pub(super) async fn fetch_board_code_map() -> Result<HashMap<String, String>, String> {
+    fetch_board_code_map_from_hosts(PUSH2_HOSTS).await
+}
+
+async fn fetch_board_code_map_from_hosts(
+    hosts: &[&str],
+) -> Result<HashMap<String, String>, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
@@ -165,7 +171,7 @@ pub(super) async fn fetch_board_code_map() -> Result<HashMap<String, String>, St
             ("fs", "m:90+t:3"),
             ("fields", "f12,f14"),
         ];
-        let json = push2_get(&client, &params).await?;
+        let json = push2_get_from_hosts(&client, &params, hosts).await?;
         let page_len = merge_board_code_page(&mut map, &mut codes, &json, page)?;
         if page_len == 0 {
             terminal_seen = true;
@@ -185,13 +191,13 @@ pub(super) async fn fetch_board_code_map() -> Result<HashMap<String, String>, St
     Ok(map)
 }
 
-/// 带多主机回退的 push2 clist 请求。
-pub(super) async fn push2_get(
+async fn push2_get_from_hosts(
     client: &reqwest::Client,
     params: &[(&str, &str)],
+    hosts: &[&str],
 ) -> Result<serde_json::Value, String> {
     let mut errors = Vec::new();
-    for host in PUSH2_HOSTS {
+    for host in hosts {
         let url = format!("{}/api/qt/clist/get", host);
         let resp = client
             .get(&url)
@@ -204,18 +210,36 @@ pub(super) async fn push2_get(
             .send()
             .await;
         match resp {
-            Ok(response) => match response.error_for_status() {
-                Ok(response) => match response.json::<serde_json::Value>().await {
-                    Ok(json) if json.get("data").is_some() => return Ok(json),
-                    Ok(_) => errors.push(format!("{host}: missing data")),
-                    Err(error) => errors.push(format!("{host}: invalid JSON: {error}")),
-                },
-                Err(error) => errors.push(format!("{host}: HTTP error: {error}")),
-            },
+            Ok(response) => {
+                let status = response.status().as_u16();
+                match response.text().await {
+                    Ok(body) => match parse_push2_http_payload(host, status, &body) {
+                        Ok(json) => return Ok(json),
+                        Err(error) => errors.push(error),
+                    },
+                    Err(error) => errors.push(format!("{host}: response body error: {error}")),
+                }
+            }
             Err(error) => errors.push(format!("{host}: request error: {error}")),
         }
     }
     Err(format!("产业链 push2 所有主机失败: {}", errors.join(" | ")))
+}
+
+fn parse_push2_http_payload(
+    host: &str,
+    status: u16,
+    body: &str,
+) -> Result<serde_json::Value, String> {
+    if !(200..300).contains(&status) {
+        return Err(format!("{host}: HTTP status {status}"));
+    }
+    let json: serde_json::Value =
+        serde_json::from_str(body).map_err(|error| format!("{host}: invalid JSON: {error}"))?;
+    if json.get("data").is_none() {
+        return Err(format!("{host}: missing data"));
+    }
+    Ok(json)
 }
 
 /// 拉取某概念板块成分股，筛选补涨候选：未涨停、今日涨幅 -3%~+7%、非 ST、非北交所。
@@ -223,6 +247,14 @@ pub(super) async fn push2_get(
 pub(super) async fn fetch_laggard_candidates(
     board_code: &str,
     limit_codes: &HashSet<String>,
+) -> Result<Vec<TopStock>, String> {
+    fetch_laggard_candidates_from_hosts(board_code, limit_codes, PUSH2_HOSTS).await
+}
+
+async fn fetch_laggard_candidates_from_hosts(
+    board_code: &str,
+    limit_codes: &HashSet<String>,
+    hosts: &[&str],
 ) -> Result<Vec<TopStock>, String> {
     if !board_code.starts_with("BK") {
         return Err(format!("产业链板块代码非法: {board_code}"));
@@ -244,7 +276,7 @@ pub(super) async fn fetch_laggard_candidates(
         ("fs", fs.as_str()),
         ("fields", "f2,f3,f12,f14"),
     ];
-    let json = push2_get(&client, &params).await?;
+    let json = push2_get_from_hosts(&client, &params, hosts).await?;
     parse_laggard_candidates(&json, board_code, limit_codes)
 }
 
@@ -516,7 +548,11 @@ pub(super) async fn fetch_cluster_news(
 
 #[cfg(test)]
 mod tests {
-    use super::{merge_board_code_page, parse_laggard_candidates, parse_tool_boards};
+    use super::{
+        fetch_board_code_map_from_hosts, fetch_laggard_candidates_from_hosts,
+        merge_board_code_page, parse_laggard_candidates, parse_push2_http_payload,
+        parse_tool_boards,
+    };
     use serde_json::json;
     use std::collections::{HashMap, HashSet};
 
@@ -649,5 +685,40 @@ mod tests {
             .is_err());
         }
         assert!(parse_laggard_candidates(&json!({}), "BK0001", &HashSet::new()).is_err());
+    }
+
+    #[test]
+    fn push2_http_payload_requires_success_json_and_complete_data() {
+        assert!(
+            parse_push2_http_payload("TEST_CODE_host", 503, r#"{"data":{}}"#)
+                .expect_err("non-success status")
+                .contains("HTTP status 503")
+        );
+        assert!(parse_push2_http_payload("TEST_CODE_host", 200, "not-json")
+            .expect_err("invalid JSON")
+            .contains("invalid JSON"));
+        assert!(
+            parse_push2_http_payload("TEST_CODE_host", 200, r#"{"rc":0}"#)
+                .expect_err("missing complete data")
+                .contains("missing data")
+        );
+        let parsed = parse_push2_http_payload("TEST_CODE_host", 200, r#"{"data":{"diff":[]}}"#)
+            .expect("complete response");
+        assert_eq!(parsed["data"]["diff"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn transport_entrypoints_reject_invalid_or_unavailable_sources() {
+        assert!(
+            fetch_laggard_candidates_from_hosts("INVALID", &HashSet::new(), &[])
+                .await
+                .is_err()
+        );
+        assert!(fetch_board_code_map_from_hosts(&[]).await.is_err());
+        assert!(
+            fetch_laggard_candidates_from_hosts("BK0001", &HashSet::new(), &[])
+                .await
+                .is_err()
+        );
     }
 }

@@ -158,6 +158,14 @@ Expected: all PASS. Commit only the two modules plus design/plan/progress eviden
 - [x] Cover paper-engine open-position/advice decisions and failure boundaries; preserve real quote/account requirements and do not add production mocks.
 - [x] Run focused tests, full instrumented library suite, fmt, strict all-target Clippy and compliance; commit independently.
 
+### Task 4B: Cover backtest execution and chain-analysis prompt/protocol boundaries
+
+- [x] Extract deterministic Bollinger/RSI execution after real benchmark acquisition; cover validated `TEST_CODE_` histories, OOS, walk-forward, report generation and insufficient batches.
+- [x] Make required backtest trade/NAV audit writes fail closed and cover successful isolated files plus an unwritable target.
+- [x] Execute deep/simple/overview chain prompts with present and missing optional evidence against an explicitly unavailable analyzer; assert no generated fallback.
+- [x] Split push2 status/body validation from transport and cover status, JSON, missing-data and complete-response contracts without sockets or external network.
+- [x] Run focused tests and full instrumented library coverage; record 1,507 pass / 10 ignored / 0 failed, global 67.04% and registered core 83.06%.
+
 ### Task 6: Raise repository-wide coverage to 80%
 
 **Files:**
