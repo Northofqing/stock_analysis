@@ -157,6 +157,7 @@ Phase 12 (Gate D coverage and live-account release closure)
 | Task-7 process RED test found the isolated fetched-batch field absent at every intended call site | 1 | Expected TDD failure; add the cfg(test)-only fetch result field and make `process_stock_inner` prefer it only in test builds while production still calls `fetch_and_save_data`. |
 | First Task-7 live-veto fixture ended at score 55 before VetoChain and therefore did not expose a buy signal/risk flag | 1 | Strengthen the still-valid adjacent-price fixture into a sustained uptrend so the registered live fundamental veto, not the baseline trend score, performs the hold downgrade. |
 | Strengthened Veto fixture produced score 60 because the loaded test/default monitor config is `dry_run`, not `live` | 1 | Characterize the actual safe default: assert dry-run mode evaluates bad evidence without mutating score or propagating live risk flags; live rule effects remain covered in `veto_rules_live` unit tests. |
+| Task-8 RED suite could not import the planned supplemental-context composer or strict chain matcher | 1 | Expected TDD compile failure; extract BR-114/BR-115 composition and JSON matching from live transport, then route production through both helpers. |
 ## Follow-up review slice (2026-07-18)
 
 - [x] Add RED test for `:memory:` journal-mode failure.

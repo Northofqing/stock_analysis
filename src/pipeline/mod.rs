@@ -685,6 +685,136 @@ impl AnalysisPipeline {
 #[cfg(test)]
 mod tests {
     use super::section_utils::normalize_ai_sections;
+    use super::{
+        key_stock_priority, score_to_advice, AnalysisPipeline, AnalysisResult, PipelineConfig,
+    };
+    use crate::data_provider::{AdjustType, KlineData};
+    use crate::notification::{NotificationConfig, NotificationService};
+    use chrono::NaiveDate;
+    use std::sync::Arc;
+
+    fn result() -> AnalysisResult {
+        serde_json::from_value(serde_json::json!({
+            "code": "TEST_CODE_000001",
+            "name": "TEST_CODE_示例",
+            "sentiment_score": 50,
+            "ranking_score": 50,
+            "operation_advice": "观望",
+            "trend_prediction": "盘整",
+            "analysis_summary": "TEST_CODE_分析正文",
+            "is_limit_up": false,
+            "contrarian_signal": false
+        }))
+        .expect("valid public AnalysisResult fixture")
+    }
+
+    fn kline() -> KlineData {
+        KlineData {
+            date: NaiveDate::from_ymd_opt(2026, 7, 18).expect("valid fixture date"),
+            open: 10.0,
+            high: 10.5,
+            low: 9.5,
+            close: 10.0,
+            volume: 1_000.0,
+            amount: 10_000.0,
+            pct_chg: 1.0,
+            intraday_price: None,
+            settled: true,
+            pe_ratio: None,
+            pb_ratio: None,
+            turnover_rate: None,
+            market_cap: None,
+            circulating_cap: None,
+            eps: None,
+            roe: None,
+            revenue_yoy: None,
+            net_profit_yoy: None,
+            gross_margin: None,
+            net_margin: None,
+            sharpe_ratio: None,
+            financials_history: None,
+            valuation_history: None,
+            consensus: None,
+            industry: None,
+            is_limit_up: false,
+            is_limit_down: false,
+            is_suspended: false,
+            adjust: AdjustType::None,
+        }
+    }
+
+    #[test]
+    fn advice_and_key_stock_priority_cover_all_registered_bands() {
+        for (score, expected) in [
+            (100, "技术面偏多"),
+            (80, "技术面偏多"),
+            (79, "技术面中性"),
+            (60, "技术面中性"),
+            (59, "观望"),
+            (40, "观望"),
+            (39, "技术面偏空"),
+            (20, "技术面偏空"),
+            (19, "建议卖出"),
+        ] {
+            assert!(score_to_advice(score).starts_with(expected));
+        }
+
+        let neutral = result();
+        assert_eq!(key_stock_priority(&neutral), None);
+        let mut low = neutral.clone();
+        low.ranking_score = 25;
+        assert_eq!(key_stock_priority(&low), Some(70));
+        let mut combined = neutral;
+        combined.ranking_score = 75;
+        combined.veto_flags = Some(vec!["TEST_CODE_否决".to_string()]);
+        combined.contrarian_signal = true;
+        combined.is_limit_up = true;
+        assert_eq!(key_stock_priority(&combined), Some(280));
+        combined.veto_flags = Some(Vec::new());
+        assert_eq!(key_stock_priority(&combined), Some(180));
+    }
+
+    #[tokio::test]
+    async fn pipeline_constructor_empty_run_and_dry_run_are_side_effect_free() {
+        let config = PipelineConfig {
+            max_workers: 1,
+            dry_run: true,
+            send_notification: false,
+            single_notify: false,
+            ..Default::default()
+        };
+        let mut pipeline = AnalysisPipeline::new(config.clone()).expect("pipeline constructor");
+        pipeline.ai_analyzer = None;
+        pipeline.use_news_search = false;
+        pipeline.notifier = Arc::new(NotificationService::new(NotificationConfig::default()));
+        pipeline =
+            pipeline.with_limit_up_codes(["TEST_CODE_000001".to_string()].into_iter().collect());
+        assert!(pipeline.limit_up_codes.contains("TEST_CODE_000001"));
+        assert_eq!(pipeline.config.dq_quote_stale_sec, 5);
+        assert_eq!(pipeline.config.dq_position_stale_sec, 30);
+        assert_eq!(pipeline.config.dq_nav_stale_sec, 24 * 3600);
+        assert_eq!(pipeline.config.dq_daily_stale_sec, 24 * 3600);
+
+        assert!(pipeline
+            .run(&[], Some("TEST_CODE_宏观证据".to_string()))
+            .await
+            .expect("empty run")
+            .is_empty());
+
+        pipeline.test_fetched_data = Some(Ok(vec![kline()]));
+        let results = pipeline
+            .run(
+                &["TEST_CODE_000001".to_string()],
+                Some("TEST_CODE_宏观证据".to_string()),
+            )
+            .await
+            .expect("dry run");
+        assert!(results.is_empty());
+
+        let report = pipeline.generate_single_report(&result());
+        assert!(report.contains("TEST_CODE_示例(TEST_CODE_000001)"));
+        assert!(report.contains("TEST_CODE_分析正文"));
+    }
 
     #[test]
     fn normalize_bare_headings_into_brackets() {
