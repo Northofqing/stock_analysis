@@ -135,11 +135,11 @@ Expected: all PASS. Commit only the two modules plus design/plan/progress eviden
 - Modify: `docs/business_rules.md` (BR-103)
 - Test: owning database module tests
 
-- [ ] Add a RED repository test proving a same-day account snapshot stores `daily_pnl=None` with total assets, market value, cash, source, source timestamp, observed-at timestamp, and account mode.
-- [ ] Add RED validation tests rejecting non-finite/impossible negative values, inconsistent totals beyond documented tolerance, stale source timestamps, and missing provenance.
-- [ ] Implement the smallest idempotent migration and repository interface; keep legacy ledger reads compatible and never coerce `None` to zero.
-- [ ] Back up the ignored local database, migrate locally, persist only user-attested fields, and revalidate integrity/totals. Private values/evidence remain outside Git.
-- [ ] Update BR-103, design, handoff, and rollback commands; run focused tests, database tests, and compliance.
+- [x] Add a RED repository test proving a same-day account snapshot stores `daily_pnl=None` with total assets, market value, cash, source, source timestamp, observed-at timestamp, and nullable account mode.
+- [x] Add RED validation tests rejecting non-finite/impossible negative values, inconsistent totals beyond documented tolerance, stale source timestamps, and missing provenance.
+- [x] Implement the smallest idempotent migration and repository interface; keep legacy ledger reads compatible and never coerce `None` to zero.
+- [x] Back up the ignored local database, migrate locally, persist only user-attested fields, and revalidate integrity/totals. Private values/evidence remain outside Git.
+- [x] Update BR-103, design, handoff, and rollback commands; run focused tests, database tests, and compliance.
 
 ### Task 8: Full release validation, review, and merge
 

@@ -158,6 +158,10 @@ Phase 12 (Gate D coverage and live-account release closure)
 | First Task-7 live-veto fixture ended at score 55 before VetoChain and therefore did not expose a buy signal/risk flag | 1 | Strengthen the still-valid adjacent-price fixture into a sustained uptrend so the registered live fundamental veto, not the baseline trend score, performs the hold downgrade. |
 | Strengthened Veto fixture produced score 60 because the loaded test/default monitor config is `dry_run`, not `live` | 1 | Characterize the actual safe default: assert dry-run mode evaluates bad evidence without mutating score or propagating live risk flags; live rule effects remain covered in `veto_rules_live` unit tests. |
 | Task-8 RED suite could not import the planned supplemental-context composer or strict chain matcher | 1 | Expected TDD compile failure; extract BR-114/BR-115 composition and JSON matching from live transport, then route production through both helpers. |
+| Task-9 account snapshot validation expected the permitted 0.01 RMB withdrawable/cash tolerance boundary to fail | 1 | Correct the independent fixture to exceed the documented tolerance at 0.02 RMB; keep the implementation inclusive at exactly 0.01. |
+| Task-9 strict Clippy found the connection-level ID query used only by unit tests | 1 | Complete the repository interface with a public fail-closed `get_account_snapshot(id)` wrapper so the tested real-SQL path is also reachable by production consumers. |
+| Task-9 public repository fixture used a hand-counted evidence string longer than 64 hex characters | 1 | Generate the independent synthetic digest as exactly 64 lowercase `f` characters; retain strict digest validation. |
+| First focused cargo-llvm-cov command placed the test filter before `--` | 1 | Re-run using Cargo's required `-- database::account_snapshot::tests` separator; do not discard or rewrite the completed aggregate report. |
 ## Follow-up review slice (2026-07-18)
 
 - [x] Add RED test for `:memory:` journal-mode failure.

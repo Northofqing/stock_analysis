@@ -103,6 +103,8 @@ pub mod order_audit;
 mod positions;
 // v12 PR1-1.5 (BR-021)
 pub mod account_mode_log;
+/// BR-103 real-account evidence boundary; nullable fields stay nullable.
+pub mod account_snapshot;
 // v12 PR3-3.2/3.3 (BR-023/024)
 pub mod position_shares;
 
@@ -759,6 +761,9 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
             "#,
         )
         .execute(&mut *conn)?;
+
+        // BR-103: real-account facts are append-only and preserve nullable P&L.
+        account_snapshot::create_schema(conn)?;
 
         // v5 状态持久化：新闻去重
         diesel::sql_query(
