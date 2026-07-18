@@ -149,6 +149,10 @@ Phase 12 (Gate D coverage and live-account release closure)
 | Industry benchmark test compared a repeating floating percentile exactly | 1 | Use a tight tolerance for 100/3 while retaining exact assertions for integer/half statistics. |
 | Financial response extraction patch used stale/whitespace-mismatched datacenter context | 3 | Split insertion and each transport replacement, inspect exact numbered lines, then apply the final block with byte-matching field punctuation. |
 | Chain conclusion test assumed a missing candidate invalidates the display parser | 1 | Preserve the existing report-only compatibility contract: recognized conclusion lines return `-` for a missing field; only absence of a conclusion line is unavailable. |
+| Task-6 first RED test could not import the planned Boll/MACD adjustment seam | 1 | Expected TDD compile failure; implement the BR-121 pure helper and route production through it before rerunning. |
+| Task-6 renderer/fundamental RED suite could not import six planned pure seams | 1 | Expected TDD compile failure; extract the existing BR-121 scoring and Markdown branches verbatim, route production through them, then run the full module suite. |
+| Task-6 staging stopped because repository ignore rules match tracked `docs/` paths | 1 | Re-stage the exact reviewed documentation paths with `git add -f`; do not broaden the force-add target or include private evidence. |
+| Combined Task-6 stage/commit/push command hit the managed read-only `.git/index.lock` boundary | 1 | Run the already approved Git operations as separate exact commands so each receives the repository-write permission; retain the reviewed index/worktree state. |
 ## Follow-up review slice (2026-07-18)
 
 - [x] Add RED test for `:memory:` journal-mode failure.
