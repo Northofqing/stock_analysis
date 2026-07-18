@@ -139,3 +139,6 @@ Phase 11 (commit all remaining workspace changes and evaluate the final merge ga
 - [ ] Run full Gate B/C/D evidence and request final fixed-SHA review.
 - [x] Run full Gate B/C and regenerate Gate D coverage evidence.
 - [ ] Commit/push and request final fixed-SHA review.
+- [x] Commit/push and request final fixed-SHA review.
+- [x] Close final review Important findings and rerun Gate B/C.
+- [ ] Push final follow-up and keep merge blocked on Gate D coverage.

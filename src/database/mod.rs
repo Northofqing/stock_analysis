@@ -1521,7 +1521,7 @@ impl DatabaseManager {
     /// 获取已平仓交易的因子分析数据。
     /// 最多 500 条, 用于 `--review` 路径的因子 IC 诊断。
     pub fn get_factor_ic_data(&self) -> Result<Vec<FactorIcRow>, Box<dyn std::error::Error>> {
-        let mut conn = self.pool.get()?;
+        let mut conn = self.get_conn()?;
         let rows = diesel::sql_query(
             "SELECT sp.buy_price, sp.sell_price, ar.sentiment_score, ar.score_breakdown_json
              FROM stock_position sp
@@ -1590,7 +1590,7 @@ mod tests {
     fn test_database_init() {
         init_db_for_test();
         let db = DatabaseManager::get();
-        assert!(db.pool.get().is_ok());
+        assert!(db.get_conn().is_ok());
     }
 
     #[test]

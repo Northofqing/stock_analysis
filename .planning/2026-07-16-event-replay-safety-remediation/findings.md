@@ -172,3 +172,4 @@
 - Fixed-SHA review found r2d2 retries `CustomizeConnection::on_acquire` failures, so a transient PRAGMA error could be logged and later reported healthy. Connection PRAGMAs now execute directly in `DatabaseManager`: all ten initial connections are held and verified before migrations, and every later `get_conn` propagates configuration failures.
 - Added a process regression proving an invalid DB parent exits 2, and strengthened the fresh-DB regression to require the BR-108 same-day-ledger failure rather than accepting any exit 2.
 - Added the mandatory `.github/copilot-instructions.md` Gate-0 input.
+- Final fixed-SHA review found one production `get_factor_ic_data` checkout still bypassed `get_conn`; it now uses the configured/error-propagating seam. All five process tests now remove `ALERT_WEBHOOK_URL` explicitly.

@@ -19,6 +19,7 @@ fn help_exits_without_creating_runtime_state() {
         .env_remove("DATABASE_PATH")
         .env_remove("EVENT_AUDIT_DIR")
         .env_remove("PUSH_LOG_DIR")
+        .env_remove("ALERT_WEBHOOK_URL")
         .output()
         .expect("run monitor --help");
 
@@ -55,6 +56,7 @@ fn test_mode_rejects_production_database_with_nonzero_exit() {
         .args(["--test", "--review"])
         .current_dir(&root)
         .env("DATABASE_PATH", "./data/stock_analysis.db")
+        .env_remove("ALERT_WEBHOOK_URL")
         .env("STOCK_ENV_MODE", "test")
         .env("MONITOR_ENABLED", "true")
         .env("V10_DRY_RUN_PUSH", "1")

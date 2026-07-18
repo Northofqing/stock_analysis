@@ -252,3 +252,4 @@
 - Focused public process tests: 5/5 PASS. Connection PRAGMA unit regression: PASS.
 - Final Gate B/C rerun: fmt, diff-check, all-target check, strict Clippy, all-target tests, compliance, and release build PASS. Library tests are 1337 passed/10 ignored; monitor tests are 293/293; process isolation is 5/5.
 - Fresh fixed-tree coverage: global 43129/84231 = 51.20% (<80%); core 11834/21342 = 55.45% (<95%, 94 files). Gate D remains blocked despite the local user-attested live-position snapshot.
+- Closed final review Important findings: no production direct pool checkout remains outside `get_conn`, and webhook isolation is explicit in 5/5 process tests. Full fmt/check/clippy/all-target tests/compliance rerun PASS.
