@@ -45,27 +45,14 @@ pub fn identify_leaders(board: &ConceptBoard, components: &[BoardStock]) -> Vec<
 }
 
 pub async fn enrich_bom(leaders: &mut [LeaderRank], sector_name: &str) {
+    if leaders.is_empty() {
+        return;
+    }
     let analyzer = crate::analyzer::GeminiAnalyzer::from_env();
     if !analyzer.is_available() {
         return;
     }
-    if leaders.is_empty() {
-        return;
-    }
-
-    let codes: Vec<String> = leaders
-        .iter()
-        .map(|l| format!("{}({})", l.name, l.code))
-        .collect();
-    let prompt = format!(
-        "你是A股产业链分析师。请为以下{}板块的龙头标的标注其在产业链BOM中的核心环节。\n\
-         板块：{}\n龙头：{}\n\
-         输出格式（每行）：代码|BOM环节|一句话理由\n\
-         只输出每行，不要额外解释。",
-        sector_name,
-        sector_name,
-        codes.join("、"),
-    );
+    let prompt = build_bom_prompt(leaders, sector_name);
 
     match tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -77,25 +64,7 @@ pub async fn enrich_bom(leaders: &mut [LeaderRank], sector_name: &str) {
     )
     .await
     {
-        Ok(Ok(text)) => {
-            for line in text.lines().take(leaders.len()) {
-                let parts: Vec<&str> = line.split('|').collect();
-                if parts.len() >= 2 {
-                    let code = parts[0].trim();
-                    let bom = parts[1].trim();
-                    let reason = parts.get(2).map(|s| s.trim()).unwrap_or("");
-                    if let Some(leader) = leaders
-                        .iter_mut()
-                        .find(|l| l.code == code || line.contains(&l.code))
-                    {
-                        leader.bom_position = Some(bom.to_string());
-                        if !reason.is_empty() {
-                            leader.reason = reason.to_string();
-                        }
-                    }
-                }
-            }
-        }
+        Ok(Ok(text)) => apply_bom_response(leaders, &text),
         Ok(Err(e)) => {
             // 修复 P2.3: 之前 silent (let _ = ..), 现在显式 warn
             log::warn!(
@@ -111,6 +80,42 @@ pub async fn enrich_bom(leaders: &mut [LeaderRank], sector_name: &str) {
                 sector_name,
                 leaders.len()
             );
+        }
+    }
+}
+
+fn build_bom_prompt(leaders: &[LeaderRank], sector_name: &str) -> String {
+    let codes: Vec<String> = leaders
+        .iter()
+        .map(|leader| format!("{}({})", leader.name, leader.code))
+        .collect();
+    format!(
+        "你是A股产业链分析师。请为以下{}板块的龙头标的标注其在产业链BOM中的核心环节。\n\
+         板块：{}\n龙头：{}\n\
+         输出格式（每行）：代码|BOM环节|一句话理由\n\
+         只输出每行，不要额外解释。",
+        sector_name,
+        sector_name,
+        codes.join("、"),
+    )
+}
+
+fn apply_bom_response(leaders: &mut [LeaderRank], text: &str) {
+    for line in text.lines().take(leaders.len()) {
+        let parts: Vec<&str> = line.split('|').collect();
+        if parts.len() >= 2 {
+            let code = parts[0].trim();
+            let bom = parts[1].trim();
+            let reason = parts.get(2).map(|part| part.trim()).unwrap_or("");
+            if let Some(leader) = leaders
+                .iter_mut()
+                .find(|leader| leader.code == code || line.contains(&leader.code))
+            {
+                leader.bom_position = Some(bom.to_string());
+                if !reason.is_empty() {
+                    leader.reason = reason.to_string();
+                }
+            }
         }
     }
 }
@@ -210,5 +215,43 @@ mod tests {
         leaders.clear();
         enrich_bom(&mut leaders, "测试板块").await;
         assert!(leaders.is_empty());
+    }
+
+    #[test]
+    fn bom_prompt_and_response_apply_only_matching_protocol_rows() {
+        let mut leaders = vec![
+            LeaderRank {
+                code: "TEST_CODE_000001".to_string(),
+                name: "测试龙头甲".to_string(),
+                rank: 1,
+                bom_position: None,
+                reason: "原原因甲".to_string(),
+            },
+            LeaderRank {
+                code: "TEST_CODE_000002".to_string(),
+                name: "测试龙头乙".to_string(),
+                rank: 2,
+                bom_position: None,
+                reason: "原原因乙".to_string(),
+            },
+        ];
+        let prompt = build_bom_prompt(&leaders, "测试产业链");
+        assert!(prompt.contains("测试产业链"));
+        assert!(prompt.contains("测试龙头甲(TEST_CODE_000001)"));
+        assert!(prompt.contains("测试龙头乙(TEST_CODE_000002)"));
+
+        apply_bom_response(
+            &mut leaders,
+            "TEST_CODE_000001|上游设备|订单证据\n前缀TEST_CODE_000002后缀|中游制造|",
+        );
+        assert_eq!(leaders[0].bom_position.as_deref(), Some("上游设备"));
+        assert_eq!(leaders[0].reason, "订单证据");
+        assert_eq!(leaders[1].bom_position.as_deref(), Some("中游制造"));
+        assert_eq!(leaders[1].reason, "原原因乙");
+
+        let before = leaders.clone();
+        apply_bom_response(&mut leaders, "坏协议行\nTEST_CODE_999999|未知环节|无关");
+        assert_eq!(leaders[0].bom_position, before[0].bom_position);
+        assert_eq!(leaders[1].bom_position, before[1].bom_position);
     }
 }

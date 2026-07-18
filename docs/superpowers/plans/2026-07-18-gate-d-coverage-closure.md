@@ -287,3 +287,9 @@ Expected: all PASS. Commit only the two modules plus design/plan/progress eviden
 - [x] Keep the three real Eastmoney hosts and endpoint fields unchanged; require 2xx plus a readable complete JSON body before parsing.
 - [x] Cover map-page termination/conflict, missing board mapping, complete constituent resolution and all response failures with local facts.
 - [x] Run industry tests, formatter, strict Clippy and core coverage; never cache a partial map or infer a default industry.
+
+### Task 30: Exercise small core state and cache commit boundaries
+
+- [x] Cover same-day exclusion cache reuse, resolved component mapping, empty scans, leader prompt/result application and unavailable analysis without external calls.
+- [x] Route successful provider results through validation-before-cache helpers; cover complete/empty/error money-flow and intraday states plus unreachable financial transport.
+- [x] Exercise present/absent mainline parsing and rendering from local `TEST_CODE_` protocol rows; run focused tests, formatter, strict Clippy and core coverage.

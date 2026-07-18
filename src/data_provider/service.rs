@@ -60,6 +60,10 @@ impl DataFetchService {
         // review #15: 复用 SHARED_HTTP_CLIENT (30s timeout + Arc 内核),
         // 替代每次 new Client. 多 DataFetchService 实例 + 频繁 new 会浪费 TLS handshake.
         let client = crate::http_client::SHARED_HTTP_CLIENT.clone();
+        Self::with_client(client)
+    }
+
+    fn with_client(client: reqwest::Client) -> Self {
         Self {
             client,
             klines: DashMap::new(),
@@ -106,6 +110,43 @@ impl DataFetchService {
         *cell.write().await = Some((Instant::now(), value));
     }
 
+    async fn cache_financial_result(
+        cell: &CachedSlot<Financials>,
+        result: Result<Financials>,
+    ) -> Result<Arc<Financials>> {
+        let value = Arc::new(result?);
+        Self::write_cache(cell, value.clone()).await;
+        Ok(value)
+    }
+
+    async fn cache_money_flow_result(
+        cell: &CachedSlot<MoneyFlowSummary>,
+        code: &str,
+        result: Result<MoneyFlowSummary>,
+    ) -> Result<Arc<MoneyFlowSummary>> {
+        let value = result?;
+        if value.is_empty() {
+            anyhow::bail!("[{code}] 资金流来源成功但返回空批次");
+        }
+        let value = Arc::new(value);
+        Self::write_cache(cell, value.clone()).await;
+        Ok(value)
+    }
+
+    async fn cache_intraday_result(
+        cell: &CachedSlot<IntradayShape>,
+        code: &str,
+        result: Result<IntradayShape>,
+    ) -> Result<Arc<IntradayShape>> {
+        let value = result?;
+        if !value.present {
+            anyhow::bail!("[{code}] 分时来源未提供有效形态");
+        }
+        let value = Arc::new(value);
+        Self::write_cache(cell, value.clone()).await;
+        Ok(value)
+    }
+
     /// 获取 K 线数据（缓存 by `(code, days)`，带 TTL).
     ///
     /// P1: 盘内 5min / 盘后 1day, 过期自动 invalidate 重抓.
@@ -141,10 +182,8 @@ impl DataFetchService {
         let code_owned = code.to_string();
         let client = self.client.clone();
         let cell_for_write = cell.clone();
-        let fin = fetch_with_fallback_async(&client, &code_owned).await?;
-        let fin_arc = Arc::new(fin);
-        Self::write_cache(&cell_for_write, fin_arc.clone()).await;
-        Ok(fin_arc)
+        let result = fetch_with_fallback_async(&client, &code_owned).await;
+        Self::cache_financial_result(&cell_for_write, result).await
     }
 
     /// 获取近 `lmt` 日资金流（缓存 by `(code, lmt)`，带 TTL).
@@ -156,13 +195,8 @@ impl DataFetchService {
         let code_owned = code.to_string();
         let client = self.client.clone();
         let cell_for_write = cell.clone();
-        let flow = fetch_flow_history_async(&client, &code_owned, lmt).await?;
-        if flow.is_empty() {
-            anyhow::bail!("[{code}] 资金流来源成功但返回空批次");
-        }
-        let flow_arc = Arc::new(flow);
-        Self::write_cache(&cell_for_write, flow_arc.clone()).await;
-        Ok(flow_arc)
+        let result = fetch_flow_history_async(&client, &code_owned, lmt).await;
+        Self::cache_money_flow_result(&cell_for_write, code, result).await
     }
 
     /// 获取今日日内分时形态（缓存 by `code`，带 TTL).
@@ -174,13 +208,8 @@ impl DataFetchService {
         let code_owned = code.to_string();
         let client = self.client.clone();
         let cell_for_write = cell.clone();
-        let shape = fetch_intraday_shape_async(&client, &code_owned).await?;
-        if !shape.present {
-            anyhow::bail!("[{code}] 分时来源未提供有效形态");
-        }
-        let shape_arc = Arc::new(shape);
-        Self::write_cache(&cell_for_write, shape_arc.clone()).await;
-        Ok(shape_arc)
+        let result = fetch_intraday_shape_async(&client, &code_owned).await;
+        Self::cache_intraday_result(&cell_for_write, code, result).await
     }
 }
 
@@ -364,6 +393,128 @@ mod tests {
         assert!(expired.read().await.is_none());
 
         assert!(std::ptr::eq(service(), service()));
+    }
+
+    #[tokio::test]
+    async fn resolved_provider_results_validate_before_cache_commit() {
+        let financial_cell: CachedSlot<Financials> = Arc::new(RwLock::new(None));
+        let financial = DataFetchService::cache_financial_result(
+            &financial_cell,
+            Ok(Financials {
+                report_date: Some("2026-06-30".to_string()),
+                eps: Some(1.0),
+                source: Some("TEST_CODE_真实协议解析"),
+                ..Financials::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(financial.eps, Some(1.0));
+        assert!(financial_cell.read().await.is_some());
+
+        let failed_financial: CachedSlot<Financials> = Arc::new(RwLock::new(None));
+        assert!(DataFetchService::cache_financial_result(
+            &failed_financial,
+            Err(anyhow::anyhow!("TEST_CODE_财务来源失败")),
+        )
+        .await
+        .is_err());
+        assert!(failed_financial.read().await.is_none());
+
+        let flow_cell: CachedSlot<MoneyFlowSummary> = Arc::new(RwLock::new(None));
+        assert!(DataFetchService::cache_money_flow_result(
+            &flow_cell,
+            "TEST_CODE_000001",
+            Ok(MoneyFlowSummary::default()),
+        )
+        .await
+        .is_err());
+        assert!(flow_cell.read().await.is_none());
+        let flow = MoneyFlowSummary {
+            days: vec![crate::data_provider::money_flow::MoneyFlowDay {
+                date: "2026-07-18".to_string(),
+                main_net: 10.0,
+                xl_net: 4.0,
+                big_net: 6.0,
+                main_pct: 1.0,
+                pct_chg: 2.0,
+            }],
+        };
+        assert_eq!(
+            DataFetchService::cache_money_flow_result(&flow_cell, "TEST_CODE_000001", Ok(flow),)
+                .await
+                .unwrap()
+                .days
+                .len(),
+            1
+        );
+
+        let intraday_cell: CachedSlot<IntradayShape> = Arc::new(RwLock::new(None));
+        assert!(DataFetchService::cache_intraday_result(
+            &intraday_cell,
+            "TEST_CODE_000001",
+            Ok(IntradayShape::default()),
+        )
+        .await
+        .is_err());
+        assert!(intraday_cell.read().await.is_none());
+        let present = IntradayShape {
+            date: "2026-07-18".to_string(),
+            pre_close: 10.0,
+            open_pct: 1.0,
+            high_pct: 2.0,
+            low_pct: -1.0,
+            close_pct: 1.5,
+            amplitude: 3.0,
+            tail_30m_pct: Some(0.5),
+            shape_label: "TEST_CODE_完整形态",
+            present: true,
+        };
+        assert!(
+            DataFetchService::cache_intraday_result(
+                &intraday_cell,
+                "TEST_CODE_000001",
+                Ok(present),
+            )
+            .await
+            .unwrap()
+            .present
+        );
+    }
+
+    #[tokio::test]
+    async fn unreachable_real_provider_transports_do_not_populate_caches() {
+        let fetch_service = DataFetchService::with_client(super::super::unreachable_http_client());
+        assert!(fetch_service
+            .get_financials("TEST_CODE_000001")
+            .await
+            .is_err());
+        assert!(fetch_service
+            .get_money_flow("TEST_CODE_000001", 1)
+            .await
+            .is_err());
+        assert!(fetch_service
+            .get_intraday_shape("TEST_CODE_000001")
+            .await
+            .is_err());
+        let financial_slot = fetch_service
+            .financials
+            .get("TEST_CODE_000001")
+            .expect("failed request still owns an empty single-flight slot")
+            .clone();
+        let flow_slot = fetch_service
+            .money_flow
+            .get(&("TEST_CODE_000001".to_string(), 1))
+            .expect("failed request still owns an empty single-flight slot")
+            .clone();
+        let intraday_slot = fetch_service
+            .intraday
+            .get("TEST_CODE_000001")
+            .expect("failed request still owns an empty single-flight slot")
+            .clone();
+        assert!(financial_slot.read().await.is_none());
+        assert!(flow_slot.read().await.is_none());
+        assert!(intraday_slot.read().await.is_none());
     }
 
     /// 测试用的 ttl 决策函数 (接受时间参数避免依赖 chrono::Local::now()).

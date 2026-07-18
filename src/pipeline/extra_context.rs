@@ -111,16 +111,24 @@ fn chain_mainline_note(code: &str) -> Result<Option<String>, String> {
         return Ok(None);
     };
     let streak = db.get_chain_streak_days_strict(&row.concept, 10)?;
-    Ok(Some(format!(
+    Ok(Some(render_chain_mainline_note(row, cluster_size, streak)))
+}
+
+fn render_chain_mainline_note(
+    row: &crate::database::concepts::ChainDailyRow,
+    cluster_size: usize,
+    streak: i64,
+) -> String {
+    format!(
         "\n【产业链主线归属】该股属于 {} 涨停主线「{}」（簇内 {} 只涨停，近10日该主线上榜 {} 天）。\
          主线发酵期个股动量通常更强，但主线退潮时会被联动补跌，研判时请结合主线生命周期。\n",
         row.date, row.concept, cluster_size, streak
-    )))
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{compose_extra_context, find_chain_mainline};
+    use super::{compose_extra_context, find_chain_mainline, render_chain_mainline_note};
     use crate::data_provider::money_flow::{IntradayShape, MoneyFlowDay, MoneyFlowSummary};
     use crate::database::concepts::ChainDailyRow;
     use crate::lhb_analyzer::LhbAnalysis;
@@ -251,5 +259,11 @@ mod tests {
         assert!(find_chain_mainline("TEST_CODE_123456", &rows)
             .expect("valid rows")
             .is_none());
+
+        let note = render_chain_mainline_note(row, count, 3);
+        assert!(note.contains("2026-07-18"));
+        assert!(note.contains("TEST_CODE_匹配主线"));
+        assert!(note.contains("簇内 2 只涨停"));
+        assert!(note.contains("上榜 3 天"));
     }
 }
