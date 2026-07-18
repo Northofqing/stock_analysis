@@ -535,6 +535,7 @@ pub fn fetch_intraday_shape_blocking(
 }
 
 /// 将资金流 + 分时形态格式化为 prompt 片段
+/// BR-118: `近5日:` 标签是旧评分兼容路径的稳定字段边界。
 pub fn format_for_prompt(flow: &MoneyFlowSummary, shape: &IntradayShape) -> String {
     let mut out = String::new();
 

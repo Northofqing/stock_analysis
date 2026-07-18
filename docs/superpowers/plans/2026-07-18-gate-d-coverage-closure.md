@@ -24,7 +24,7 @@
 - Modify: `src/pipeline/score_breakdown.rs`
 - Modify: `src/pipeline/veto_rules.rs`
 
-- [ ] **Step 1: Add one score tracer bullet**
+- [x] **Step 1: Add one score tracer bullet**
 
 Add a `#[cfg(test)]` module with a complete deterministic `KlineData` builder and assert missing optional evidence remains neutral while sentiment is clamped:
 
@@ -45,21 +45,21 @@ assert_eq!(score.capital_flow, 50);
 assert_eq!(score.growth_sustainability, 50);
 ```
 
-- [ ] **Step 2: Run the tracer bullet**
+- [x] **Step 2: Run the tracer bullet**
 
 Run: `cargo test --lib pipeline::score_breakdown::tests::missing_evidence_is_neutral_and_sentiment_is_clamped -- --exact`
 
 Expected: PASS. This is a characterization slice and should require no production behavior change.
 
-- [ ] **Step 3: Add score behaviors vertically**
+- [x] **Step 3: Add score behaviors vertically**
 
 Cover independently worked outcomes for factor actions/clamps, valuation percentile and target-price bands, raw money-flow bands, one-day bounce cap, legacy section parsing, volume-ratio adjustment, financial quality, growth bands/ROE trend, Markdown traffic-light rendering, and default equal-weight ranking. Run the named test after each addition.
 
-- [ ] **Step 4: Add veto behaviors vertically**
+- [x] **Step 4: Add veto behaviors vertically**
 
 Assert exact outcomes for no signal, three negative revenue periods, low CFO/NI divergence, target-price overvaluation, P99/P99 and P95/P95 and P80/P90 tiers, one-day bounce, strictest cap precedence, downgrade precedence, and rendered advice/cap/flag text. Use a five-day flow whose sum is `-40e8` and latest inflow is `2e8` for the documented bounce condition.
 
-- [ ] **Step 5: Validate and commit the pure-core batch**
+- [x] **Step 5: Validate and commit the pure-core batch**
 
 ```bash
 cargo fmt --all -- --check

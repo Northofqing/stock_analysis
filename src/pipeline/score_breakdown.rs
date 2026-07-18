@@ -199,16 +199,15 @@ fn capital_flow_score(r: &ScoreInputs<'_>) -> i32 {
 }
 
 /// 从 money_flow_section 字符串里解析"近5日"主力累计净流入（单位：亿）。
+/// BR-118: 只接受标签后、`亿` 前的完整有限浮点文本。
 fn parse_5d_net_yi(s: &str) -> Option<f64> {
-    let idx = s.find("近5日:").or_else(|| s.find("近5日："))?;
-    let rest = &s[idx..];
-    let end = rest.find('亿')?;
-    let segment = &rest[..end];
-    let num: String = segment
-        .chars()
-        .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '+' || *c == '-')
-        .collect();
-    num.parse::<f64>().ok()
+    let rest = s
+        .split_once("近5日:")
+        .map(|(_, rest)| rest)
+        .or_else(|| s.split_once("近5日：").map(|(_, rest)| rest))?;
+    let value_text = rest.split_once('亿')?.0.trim();
+    let value = value_text.parse::<f64>().ok()?;
+    value.is_finite().then_some(value)
 }
 
 fn growth_score(d: &KlineData) -> i32 {
@@ -340,4 +339,383 @@ pub fn compute_ranking_score(sb: &ScoreBreakdown) -> i32 {
     (dims.iter().sum::<f64>() / dims.len() as f64)
         .round()
         .clamp(0.0, 100.0) as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data_provider::consensus::ConsensusData;
+    use crate::data_provider::financials::FinancialPeriod;
+    use crate::data_provider::industry::IndustryBenchmark;
+    use crate::data_provider::money_flow::{MoneyFlowDay, MoneyFlowSummary};
+    use crate::data_provider::valuation_history::ValuationHistory;
+    use crate::data_provider::{AdjustType, KlineData};
+    use chrono::NaiveDate;
+
+    fn kline(close: f64) -> KlineData {
+        KlineData {
+            date: NaiveDate::from_ymd_opt(2026, 7, 18).expect("valid fixture date"),
+            open: close,
+            high: close,
+            low: close,
+            close,
+            volume: 1_000.0,
+            amount: close * 1_000.0,
+            pct_chg: 0.0,
+            intraday_price: None,
+            settled: true,
+            pe_ratio: None,
+            pb_ratio: None,
+            turnover_rate: None,
+            market_cap: None,
+            circulating_cap: None,
+            eps: None,
+            roe: None,
+            revenue_yoy: None,
+            net_profit_yoy: None,
+            gross_margin: None,
+            net_margin: None,
+            sharpe_ratio: None,
+            financials_history: None,
+            valuation_history: None,
+            consensus: None,
+            industry: None,
+            is_limit_up: false,
+            is_limit_down: false,
+            is_suspended: false,
+            adjust: AdjustType::None,
+        }
+    }
+
+    fn valuation_history(pe_percentile: f64, pb_percentile: f64) -> ValuationHistory {
+        ValuationHistory {
+            current_pe: Some(20.0),
+            current_pb: Some(2.0),
+            pe_percentile: Some(pe_percentile),
+            pb_percentile: Some(pb_percentile),
+            pe_min: Some(10.0),
+            pe_max: Some(30.0),
+            pe_median: Some(20.0),
+            pb_min: Some(1.0),
+            pb_max: Some(3.0),
+            pb_median: Some(2.0),
+            sample_days: 3,
+            oldest_date: Some("2026-07-16".into()),
+            newest_date: Some("2026-07-18".into()),
+        }
+    }
+
+    fn one_day_flow(main_net: f64) -> MoneyFlowSummary {
+        MoneyFlowSummary {
+            days: vec![MoneyFlowDay {
+                date: "2026-07-18".into(),
+                main_net,
+                xl_net: 0.0,
+                big_net: 0.0,
+                main_pct: 0.0,
+                pct_chg: 0.0,
+            }],
+        }
+    }
+
+    #[test]
+    fn missing_evidence_is_neutral_and_sentiment_is_clamped() {
+        let score = compute(
+            &ScoreInputs {
+                sentiment_score: 120,
+                money_flow: None,
+                money_flow_section: None,
+                volume_ratio_5d: None,
+            },
+            &kline(10.0),
+        );
+
+        assert_eq!(score.technical, 100);
+        assert_eq!(score.fundamental_quality, 50);
+        assert_eq!(score.valuation_safety, 50);
+        assert_eq!(score.capital_flow, 50);
+        assert_eq!(score.growth_sustainability, 50);
+    }
+
+    #[test]
+    fn factor_feedback_actions_transform_clamped_scores() {
+        assert_eq!(parse_factor_action(" disable "), FactorAction::Disable);
+        assert_eq!(parse_factor_action("INVERT"), FactorAction::Invert);
+        assert_eq!(parse_factor_action("down_weight"), FactorAction::DownWeight);
+        assert_eq!(parse_factor_action("unknown"), FactorAction::Normal);
+
+        assert_eq!(apply_factor_action(120, FactorAction::Normal, 0.5), 100.0);
+        assert_eq!(apply_factor_action(80, FactorAction::Disable, 0.5), 0.0);
+        assert_eq!(apply_factor_action(-10, FactorAction::Invert, 0.5), 100.0);
+        assert_eq!(apply_factor_action(80, FactorAction::DownWeight, 0.5), 40.0);
+        assert_eq!(apply_factor_action(80, FactorAction::DownWeight, 2.0), 80.0);
+        assert_eq!(apply_factor_action(80, FactorAction::DownWeight, -1.0), 0.0);
+    }
+
+    #[test]
+    fn legacy_money_flow_text_scores_the_value_after_the_label() {
+        let score = compute(
+            &ScoreInputs {
+                sentiment_score: 50,
+                money_flow: None,
+                money_flow_section: Some("主力资金近5日: +2.50亿"),
+                volume_ratio_5d: Some(1.6),
+            },
+            &kline(10.0),
+        );
+
+        assert_eq!(score.capital_flow, 95);
+    }
+
+    #[test]
+    fn legacy_money_flow_text_accepts_chinese_colon_and_rejects_bad_values() {
+        let capital_score = |section: &str| {
+            compute(
+                &ScoreInputs {
+                    sentiment_score: 50,
+                    money_flow: None,
+                    money_flow_section: Some(section),
+                    volume_ratio_5d: None,
+                },
+                &kline(10.0),
+            )
+            .capital_flow
+        };
+
+        assert_eq!(capital_score("近5日：-1.25亿"), 25);
+        assert_eq!(capital_score("近5日: NaN亿"), 50);
+        assert_eq!(capital_score("近5日: +2.00说明亿"), 50);
+        assert_eq!(capital_score("近5日: +2.00"), 50);
+        assert_eq!(capital_score("近3日: +2.00亿"), 50);
+    }
+
+    #[test]
+    fn valuation_score_combines_history_industry_and_consensus_evidence() {
+        let mut data = kline(10.0);
+        data.valuation_history = Some(valuation_history(20.0, 40.0));
+        data.industry = Some(IndustryBenchmark {
+            pe_percentile: Some(60.0),
+            ..IndustryBenchmark::default()
+        });
+        data.consensus = Some(ConsensusData {
+            target_price_high_avg: Some(13.1),
+            ..ConsensusData::default()
+        });
+
+        let score = compute(
+            &ScoreInputs {
+                sentiment_score: 50,
+                money_flow: None,
+                money_flow_section: None,
+                volume_ratio_5d: None,
+            },
+            &data,
+        );
+
+        assert_eq!(score.valuation_safety, 67);
+    }
+
+    #[test]
+    fn valuation_target_price_bands_are_deterministic() {
+        let cases = [
+            (13.1, 90),
+            (11.1, 75),
+            (10.1, 60),
+            (9.5, 40),
+            (8.5, 20),
+            (7.0, 10),
+        ];
+
+        for (target_price, expected) in cases {
+            let mut data = kline(10.0);
+            data.consensus = Some(ConsensusData {
+                target_price_high_avg: Some(target_price),
+                ..ConsensusData::default()
+            });
+            let actual = compute(
+                &ScoreInputs {
+                    sentiment_score: 50,
+                    money_flow: None,
+                    money_flow_section: None,
+                    volume_ratio_5d: None,
+                },
+                &data,
+            );
+
+            assert_eq!(actual.valuation_safety, expected, "target={target_price}");
+        }
+    }
+
+    #[test]
+    fn financial_quality_rewards_cash_coverage_and_penalizes_accrual_risk() {
+        let mut healthy = kline(10.0);
+        healthy.financials_history = Some(vec![FinancialPeriod {
+            eps: Some(1.0),
+            op_cash_flow_ps: Some(1.2),
+            revenue_yoy: Some(10.0),
+            net_profit_yoy: Some(12.0),
+            ..FinancialPeriod::default()
+        }]);
+        let mut risky = kline(10.0);
+        risky.financials_history = Some(vec![FinancialPeriod {
+            eps: Some(1.0),
+            op_cash_flow_ps: Some(0.2),
+            revenue_yoy: Some(10.0),
+            net_profit_yoy: Some(50.0),
+            ..FinancialPeriod::default()
+        }]);
+        let inputs = ScoreInputs {
+            sentiment_score: 50,
+            money_flow: None,
+            money_flow_section: None,
+            volume_ratio_5d: None,
+        };
+
+        assert_eq!(compute(&inputs, &healthy).fundamental_quality, 100);
+        assert_eq!(compute(&inputs, &risky).fundamental_quality, 65);
+    }
+
+    #[test]
+    fn growth_revenue_bands_use_independent_literal_scores() {
+        let inputs = ScoreInputs {
+            sentiment_score: 50,
+            money_flow: None,
+            money_flow_section: None,
+            volume_ratio_5d: None,
+        };
+        for (revenue_yoy, expected) in [(31.0, 85), (11.0, 70), (1.0, 55), (-5.0, 35), (-11.0, 15)]
+        {
+            let mut data = kline(10.0);
+            data.financials_history = Some(vec![FinancialPeriod {
+                revenue_yoy: Some(revenue_yoy),
+                ..FinancialPeriod::default()
+            }]);
+
+            assert_eq!(
+                compute(&inputs, &data).growth_sustainability,
+                expected,
+                "revenue_yoy={revenue_yoy}"
+            );
+        }
+    }
+
+    #[test]
+    fn profit_and_roe_trends_adjust_growth_score() {
+        let inputs = ScoreInputs {
+            sentiment_score: 50,
+            money_flow: None,
+            money_flow_section: None,
+            volume_ratio_5d: None,
+        };
+        let mut improving = kline(10.0);
+        improving.financials_history = Some(vec![
+            FinancialPeriod {
+                revenue_yoy: Some(31.0),
+                net_profit_yoy: Some(31.0),
+                roe: Some(15.0),
+                ..FinancialPeriod::default()
+            },
+            FinancialPeriod {
+                revenue_yoy: Some(31.0),
+                net_profit_yoy: Some(31.0),
+                roe: Some(12.0),
+                ..FinancialPeriod::default()
+            },
+            FinancialPeriod {
+                revenue_yoy: Some(31.0),
+                net_profit_yoy: Some(31.0),
+                roe: Some(10.0),
+                ..FinancialPeriod::default()
+            },
+        ]);
+        let mut deteriorating = kline(10.0);
+        deteriorating.financials_history = Some(vec![
+            FinancialPeriod {
+                revenue_yoy: Some(-5.0),
+                net_profit_yoy: Some(-30.0),
+                roe: Some(8.0),
+                ..FinancialPeriod::default()
+            },
+            FinancialPeriod {
+                revenue_yoy: Some(-5.0),
+                net_profit_yoy: Some(-30.0),
+                roe: Some(10.0),
+                ..FinancialPeriod::default()
+            },
+            FinancialPeriod {
+                revenue_yoy: Some(-5.0),
+                net_profit_yoy: Some(-30.0),
+                roe: Some(12.0),
+                ..FinancialPeriod::default()
+            },
+        ]);
+
+        assert_eq!(compute(&inputs, &improving).growth_sustainability, 100);
+        assert_eq!(compute(&inputs, &deteriorating).growth_sustainability, 15);
+    }
+
+    #[test]
+    fn raw_money_flow_ewma_bands_are_deterministic() {
+        for (main_net, expected) in [
+            (2.1e8, 90),
+            (1.0e8, 75),
+            (0.1e8, 60),
+            (-0.1e8, 40),
+            (-1.0e8, 25),
+            (-3.0e8, 10),
+        ] {
+            let flow = one_day_flow(main_net);
+            let actual = compute(
+                &ScoreInputs {
+                    sentiment_score: 50,
+                    money_flow: Some(&flow),
+                    money_flow_section: Some("近5日: +99.00亿"),
+                    volume_ratio_5d: None,
+                },
+                &kline(10.0),
+            );
+
+            assert_eq!(actual.capital_flow, expected, "main_net={main_net}");
+        }
+    }
+
+    #[test]
+    fn volume_ratio_adjusts_capital_score_without_fabricating_flow() {
+        let capital_score = |volume_ratio_5d| {
+            compute(
+                &ScoreInputs {
+                    sentiment_score: 50,
+                    money_flow: None,
+                    money_flow_section: None,
+                    volume_ratio_5d,
+                },
+                &kline(10.0),
+            )
+            .capital_flow
+        };
+
+        assert_eq!(capital_score(Some(1.6)), 55);
+        assert_eq!(capital_score(Some(1.0)), 50);
+        assert_eq!(capital_score(Some(0.6)), 45);
+        assert_eq!(capital_score(None), 50);
+    }
+
+    #[test]
+    fn score_rendering_and_default_ranking_expose_all_dimensions() {
+        let score = ScoreBreakdown {
+            technical: 70,
+            fundamental_quality: 40,
+            valuation_safety: 39,
+            capital_flow: 100,
+            growth_sustainability: 0,
+        };
+
+        let rendered = render_section(&score);
+        assert!(rendered.contains("| 技术面 | 70 | 🟢 |"));
+        assert!(rendered.contains("| 盈利质量 | 40 | 🟡 |"));
+        assert!(rendered.contains("| 估值安全边际 | 39 | 🔴 |"));
+        assert!(rendered.contains("| 资金面 | 100 | 🟢 |"));
+        assert!(rendered.contains("| 增长可持续 | 0 | 🔴 |"));
+        assert_eq!(compute_ranking_score(&score), 50);
+    }
 }

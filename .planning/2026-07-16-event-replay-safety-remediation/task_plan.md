@@ -135,6 +135,7 @@ Phase 12 (Gate D coverage and live-account release closure)
 | Fixed-SHA review found WAL return-mode/customizer retry ambiguity and inherited webhook configuration in process tests | 1 | Add public process RED cases, make bootstrap and pooled customization fail closed, remove outbound webhook configuration from child environments, then re-review the follow-up SHA. |
 | First Phase-12 multi-file planning patch used a findings line that existed only in progress | 1 | Re-read the exact tails, split the patch around stable anchors, and record the Gate D continuation successfully. |
 | First Gate-D design/plan patch expected a blank line absent from the historical design | 1 | Inspect the exact rollback/addendum boundary and apply the design and new plan as separate patches. |
+| Task-1 format check found only rustfmt layout drift in new tests | 1 | Run repository formatter once, then rerun the check; the pre-existing tree was already format-clean. |
 ## Follow-up review slice (2026-07-18)
 
 - [x] Add RED test for `:memory:` journal-mode failure.

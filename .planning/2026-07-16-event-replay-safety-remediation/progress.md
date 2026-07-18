@@ -266,3 +266,9 @@
 - Committed Gate A coverage design/plan as `7c722e1`.
 - Added two passing score characterization tests, then reproduced BR-118 as a public RED test: legacy `近5日: +2.50亿` scores 55 instead of 95 because the label digit enters parsing.
 - Completed root-cause/history/pattern analysis and registered BR-118 before touching production parsing logic.
+- Implemented the single BR-118 root-cause fix; the RED public score test is GREEN and strict Chinese-colon/invalid-value cases pass.
+- Added behavior coverage for factor feedback actions, neutral missing evidence, valuation/target bands, raw/legacy money flow, volume adjustment, financial quality, growth/ROE trends, ranking, and score rendering.
+- Added veto coverage for no evidence, negative revenue, low CFO/NI, target-price overvaluation, three valuation tiers, money-flow bounce, downgrade precedence, strictest cap, and Markdown rendering.
+- Task-1 validation: fmt PASS; score tests 12/12 PASS; veto tests 7/7 PASS; strict library Clippy PASS; instrumented library suite 1,356 passed / 10 ignored / 0 failed.
+- Task-1 coverage: `score_breakdown.rs` 551/571 = 96.50%; `veto_rules.rs` 299/305 = 98.03%. Tests are included in the denominator, and both files exceed the 95% core target.
+- Full compliance PASS after BR-118; explicit comments reduced business-rule warnings from 67 to 65 by closing both BR-118 citation warnings. `git diff --check` remains PASS.
