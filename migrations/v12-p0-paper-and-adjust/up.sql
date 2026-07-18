@@ -10,10 +10,10 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     code            TEXT NOT NULL,
     name            TEXT NOT NULL,
     direction       TEXT NOT NULL CHECK(direction IN ('buy', 'sell')),
-    price           REAL NOT NULL,
-    quantity        INTEGER NOT NULL,
+    price           REAL NOT NULL CHECK(price > 0),
+    quantity        INTEGER NOT NULL CHECK(quantity > 0 AND quantity % 100 = 0),
     status          TEXT NOT NULL CHECK(status IN ('SignalTriggered', 'Filled', 'NotFilled', 'Invalidated')),
-    fill_price      REAL,                 -- 实际成交价 (Filled 时填)
+    fill_price      REAL CHECK(fill_price IS NULL OR fill_price > 0), -- 实际成交价 (Filled 时填)
     not_fill_reason TEXT,                 -- NotFilled 时填 (涨停不可买 / 跌停不可卖 / N 分钟未触达)
     virtual_reason  TEXT NOT NULL,        -- 主理由 (BR-016 枚举)
     account_mode    TEXT NOT NULL,        -- 触发时的账户模式快照
@@ -29,6 +29,20 @@ CREATE UNIQUE INDEX IF NOT EXISTS uniq_paper_trades_plan_id
 CREATE INDEX IF NOT EXISTS idx_paper_trades_code ON paper_trades(code);
 CREATE INDEX IF NOT EXISTS idx_paper_trades_status ON paper_trades(status);
 CREATE INDEX IF NOT EXISTS idx_paper_trades_ts ON paper_trades(ts);
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_trades_order_safety_insert
+BEFORE INSERT ON paper_trades
+WHEN NEW.price <= 0 OR NEW.quantity <= 0 OR NEW.quantity % 100 != 0
+  OR NEW.price * NEW.quantity > 1000000
+  OR (NEW.fill_price IS NOT NULL AND NEW.fill_price <= 0)
+BEGIN SELECT RAISE(ABORT, 'BR-084 invalid paper trade order'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_paper_trades_order_safety_update
+BEFORE UPDATE OF price, quantity, fill_price ON paper_trades
+WHEN NEW.price <= 0 OR NEW.quantity <= 0 OR NEW.quantity % 100 != 0
+  OR NEW.price * NEW.quantity > 1000000
+  OR (NEW.fill_price IS NOT NULL AND NEW.fill_price <= 0)
+BEGIN SELECT RAISE(ABORT, 'BR-084 invalid paper trade order'); END;
 
 -- ============ 2. execution_tracking ============
 -- 跟踪每条建议的执行情况 (T+1/T+3/T+5 实际涨跌)
@@ -77,6 +91,20 @@ CREATE INDEX IF NOT EXISTS idx_position_adjustments_effective ON position_adjust
 ALTER TABLE stock_position ADD COLUMN chain_name TEXT DEFAULT '其他';
 
 CREATE INDEX IF NOT EXISTS idx_stock_position_chain_name ON stock_position(chain_name);
+
+CREATE TRIGGER IF NOT EXISTS trg_stock_position_order_safety_insert
+BEFORE INSERT ON stock_position
+WHEN NEW.buy_price <= 0 OR NEW.quantity <= 0 OR NEW.quantity % 100 != 0
+  OR NEW.buy_price * NEW.quantity > 1000000
+  OR (NEW.sell_price IS NOT NULL AND NEW.sell_price <= 0)
+BEGIN SELECT RAISE(ABORT, 'BR-084 invalid stock_position order'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_stock_position_order_safety_update
+BEFORE UPDATE OF buy_price, quantity, sell_price ON stock_position
+WHEN NEW.buy_price <= 0 OR NEW.quantity <= 0 OR NEW.quantity % 100 != 0
+  OR NEW.buy_price * NEW.quantity > 1000000
+  OR (NEW.sell_price IS NOT NULL AND NEW.sell_price <= 0)
+BEGIN SELECT RAISE(ABORT, 'BR-084 invalid stock_position order'); END;
 
 -- ============ 注释 (字段语义) ============
 -- paper_trades.virtual_reason: VirtualReason 枚举值 (Breakout/VolumeSurge/MainNetInflow/SectorLeader/NewsCatalyst/AuctionAnomaly, BR-016)

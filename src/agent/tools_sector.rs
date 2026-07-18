@@ -1,9 +1,16 @@
 use crate::agent::tool::Tool;
+use anyhow::Context;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
 pub struct FetchSectorTool {
     client: reqwest::Client,
+}
+
+impl Default for FetchSectorTool {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FetchSectorTool {
@@ -75,49 +82,42 @@ impl Tool for FetchSectorTool {
         );
         log::debug!("[板块] {}", url);
 
-        let resp = self
+        let response = self
             .client
             .get(&url)
             .header("Referer", "https://emweb.securities.eastmoney.com/")
             .send()
-            .await;
-        let body: Value = match resp {
-            Ok(r) => match r.json().await {
-                Ok(v) => v,
-                Err(e) => {
-                    return Ok(
-                        json!({"error": format!("板块接口 JSON 解析失败: {}", e)}).to_string()
-                    )
-                }
-            },
-            Err(e) => return Ok(json!({"error": format!("板块接口请求失败: {}", e)}).to_string()),
-        };
+            .await
+            .context("板块接口请求失败")?
+            .error_for_status()
+            .context("板块接口 HTTP 状态失败")?;
+        let body: Value = response.json().await.context("板块接口 JSON 解析失败")?;
 
         let arr = body
             .pointer("/result/data")
             .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
+            .ok_or_else(|| anyhow::anyhow!("板块接口缺少 result.data 数组"))?;
 
         if arr.is_empty() {
-            return Ok(json!({"error": "未查询到板块数据", "secucode": secucode}).to_string());
+            anyhow::bail!("未查询到板块数据: {secucode}");
         }
 
         // 按 BOARD_RANK 升序：rank 越小越"主营"。该接口 BOARD_TYPE 当前返回 null，
         // 暂不区分行业/概念，直接平铺成 boards 列表，再标注 rank。
         let mut boards: Vec<(i64, String)> = Vec::new();
-        for item in &arr {
+        for (index, item) in arr.iter().enumerate() {
             let name = item
                 .get("BOARD_NAME")
                 .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if name.is_empty() {
-                continue;
-            }
+                .filter(|name| !name.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("板块第 {index} 行缺少 BOARD_NAME"))?;
             let rank = item
                 .get("BOARD_RANK")
                 .and_then(|v| v.as_i64())
-                .unwrap_or(99);
+                .ok_or_else(|| anyhow::anyhow!("板块第 {index} 行缺少 BOARD_RANK"))?;
+            if rank < 0 {
+                anyhow::bail!("板块第 {index} 行 BOARD_RANK 非法: {rank}");
+            }
             boards.push((rank, name.to_string()));
         }
         boards.sort_by_key(|(r, _)| *r);

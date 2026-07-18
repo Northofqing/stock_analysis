@@ -70,6 +70,10 @@ impl GeminiAnalyzer {
     // ========== 调用入口 ==========
 
     /// 调用 API（带重试和故障转移，使用默认系统提示词，Quick 模式）
+    #[allow(
+        dead_code,
+        reason = "legacy JSON dashboard request entry retained for archived integrations"
+    )]
     pub(super) async fn call_api_with_retry(&self, prompt: &str) -> Result<String> {
         self.call_api_with_retry_ex(prompt, Self::SYSTEM_PROMPT)
             .await
@@ -314,7 +318,7 @@ impl GeminiAnalyzer {
 
         gemini_response
             .candidates
-            .get(0)
+            .first()
             .and_then(|c| {
                 // v17.3 (P2 fix): 拼接所有 parts, 不仅是第一个 (Gemini multi-part response)
                 // includeThoughts + chain-of-thought 都会产生多个 part
@@ -424,15 +428,15 @@ impl GeminiAnalyzer {
         }
 
         let response_text = response.text().await.context("读取 DeepSeek 响应失败")?;
-        let deepseek_response: DeepSeekResponse =
-            serde_json::from_str(&response_text).with_context(|| {
+        let deepseek_response: DeepSeekResponse = serde_json::from_str(&response_text)
+            .with_context(|| {
                 let snippet = response_text.chars().take(1000).collect::<String>();
                 format!("解析 DeepSeek 响应失败，原始响应片段: {}", snippet)
             })?;
 
         deepseek_response
             .choices
-            .get(0)
+            .first()
             .and_then(|c| {
                 c.message
                     .content
@@ -555,7 +559,7 @@ impl GeminiAnalyzer {
 
         doubao_response
             .choices
-            .get(0)
+            .first()
             .and_then(|c| {
                 c.message
                     .content

@@ -234,7 +234,7 @@ mod tests {
     #[test]
     fn final_decision_serde_roundtrip() {
         let original = FinalDecision::new(
-            "000001",
+            "TEST_CODE_000001",
             "平安银行",
             12.30,
             -1.5,
@@ -251,7 +251,7 @@ mod tests {
         let json = serde_json::to_string(&original).expect("serialize");
         let parsed: FinalDecision = serde_json::from_str(&json).expect("deserialize");
 
-        assert_eq!(parsed.code, "000001");
+        assert_eq!(parsed.code, "TEST_CODE_000001");
         assert_eq!(parsed.action, Action::Reduce);
         assert_eq!(parsed.priority, Priority::P1);
         assert_eq!(parsed.reasons.len(), 2);
@@ -267,7 +267,7 @@ mod tests {
     #[test]
     fn final_decision_builder() {
         let d = FinalDecision::new(
-            "600519",
+            "TEST_CODE_600519",
             "贵州茅台",
             1500.0,
             0.5,
@@ -284,7 +284,7 @@ mod tests {
     #[test]
     fn ai_summary_none_skipped_in_json() {
         let d = FinalDecision::new(
-            "000001",
+            "TEST_CODE_000001",
             "test",
             10.0,
             0.0,

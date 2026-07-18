@@ -149,8 +149,13 @@ mod tests {
     #[test]
     fn insert_position_adjustment_validates_source() {
         // 测试参数校验 (不依赖 DB)
-        assert!(insert_position_adjustment("000001", 0, "manual_confirm", "", None).is_err());
-        assert!(insert_position_adjustment("000001", 100, "invalid_source", "", None).is_err());
+        assert!(
+            insert_position_adjustment("TEST_CODE_000001", 0, "manual_confirm", "", None).is_err()
+        );
+        assert!(
+            insert_position_adjustment("TEST_CODE_000001", 100, "invalid_source", "", None)
+                .is_err()
+        );
         assert!(insert_position_adjustment("", 100, "manual_confirm", "", None).is_err());
     }
 
@@ -158,7 +163,8 @@ mod tests {
     fn insert_position_adjustment_blocked_in_test_env() {
         // 显式设测试环境, 验证 env_guard
         std::env::set_var("STOCK_ENV_MODE", "test");
-        let result = insert_position_adjustment("000001", -100, "manual_confirm", "test", None);
+        let result =
+            insert_position_adjustment("TEST_CODE_000001", -100, "manual_confirm", "test", None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("测试环境"));
         std::env::remove_var("STOCK_ENV_MODE");

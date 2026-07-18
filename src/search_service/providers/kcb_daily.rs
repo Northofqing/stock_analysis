@@ -40,6 +40,12 @@ pub struct KcbDailyProvider {
     client: reqwest::Client,
 }
 
+impl Default for KcbDailyProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KcbDailyProvider {
     pub fn new() -> Self {
         Self {

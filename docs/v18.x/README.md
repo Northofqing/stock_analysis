@@ -1,27 +1,32 @@
-# v18.x — Quant Platform Closure
+# v18.x — 量化平台闭环
 
-> **Status**: design approved; implementation not started
-> **Theme**: make the existing A-share monitor a reproducible research-to-paper-trading platform, then earn the right to enable controlled live execution.
+> **状态：** 设计已进入规划，尚未开始实现
+>
+> **主轴：** 把现有 A 股监控系统闭合为可复现的研究—模拟交易平台，再以独立证据申请受控实盘能力。
 
-## Position in the evolution
+## 推荐入口
 
-v17.x continues the push/event migration. v18.x does not replace that work. It establishes the safety and product contracts that every signal, push, virtual trade, and future broker order must share.
+[v18.0 量化平台闭环中文整合设计](v18.0-2026-07-16-brainstorming-quant-platform-closure-design-active.md) 是当前中文权威入口。它统一了评估结论、总体架构、四核心模块、实施路线、Gate 和回滚要求。
 
-## Documents
+## 演进位置
 
-| Document | Role | Status |
+v17.x 继续完成事件与推送迁移；v18.x 不替代该工作。v18.x 为信号、推送、模拟交易及未来券商订单建立共同的数据、决策、风控、账本和审计契约。
+
+## 文档清单
+
+| 文档 | 作用 | 状态 |
 | --- | --- | --- |
-| `v18.0-2026-07-16-review-quant-platform-assessment.md` | Evidence-based engineering, data, product, and institutional-practice assessment | complete |
-| `v18.0-2026-07-16-brainstorming-quant-platform-closure-design-active.md` | Active architecture and acceptance design | active |
-| `v18.0-2026-07-16-codebase-design-four-core-modules.md` | Four core modules: interfaces, state machines, persistence, failure semantics, and test seams | active companion |
-| `v18.0-2026-07-16-writing-plans-implementation-roadmap.md` | Sequenced implementation roadmap and merge gates | ready for approval by workstream |
+| [中文整合设计](v18.0-2026-07-16-brainstorming-quant-platform-closure-design-active.md) | 推荐入口；统一架构、模块、路线与门禁 | 活跃 |
+| [平台评估](v18.0-2026-07-16-review-quant-platform-assessment.md) | 工程、数据、产品与公开实践评估来源 | 来源文档 |
+| [四核心模块详细设计](v18.0-2026-07-16-codebase-design-four-core-modules.md) | 接口、状态机、持久化、失败语义与测试 seam | 活跃来源 |
+| [实施路线图](v18.0-2026-07-16-writing-plans-implementation-roadmap.md) | 工作流顺序与合并门禁来源 | 待逐工作流批准 |
 
-## Non-negotiable boundary
+## 不可妥协的边界
 
-Until the Live Execution Gate in the active design is satisfied, this system is a **research, monitoring, notification, and paper-trading platform**. It must not represent simulated orders, manually entered position adjustments, or notification delivery as broker-confirmed live execution.
+Gate L 通过前，本系统只能表述为研究、监控、通知与模拟交易平台。模拟订单、人工持仓调整或通知送达都不得被表述为券商确认的真实成交。
 
-## Relationship to prior work
+## 与既有工作的关系
 
-- Adopt v17.x L1/L4/L5/L6/L7 push migration as the notification transport baseline.
-- Reuse existing daily-bar quality validation, paper-trade isolation, risk checks, portfolio persistence, and post-close review where their contracts meet v18 requirements.
-- Replace synthetic data-health construction and error-to-default decision inputs before they can influence an actionable recommendation or paper order.
+- 采用 v17.x L1/L4/L5/L6/L7 迁移作为通知传输基线。
+- 复用符合 v18 契约的日线质量校验、模拟/实盘隔离、风控、组合持久化与盘后复盘。
+- 在数据影响可行动建议或模拟订单前，替换合成健康状态与错误转默认值路径。

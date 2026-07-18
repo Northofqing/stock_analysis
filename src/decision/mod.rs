@@ -9,7 +9,7 @@ pub mod decision_render;
 pub mod exclusion;
 pub mod holding_plan; // v12 PR4-4.1
 pub mod intraday_monitor; // v16.3 Commit 3: 盘中监控 + 盘后整盘 (R4+R5)
-// v16.4 #3: Decision Engine 3 子层 (FeatureBuilder + ScoreCalculator + DecisionPolicy)
+                          // v16.4 #3: Decision Engine 3 子层 (FeatureBuilder + ScoreCalculator + DecisionPolicy)
 pub mod layers;
 pub mod leader;
 pub mod live_plan; // v12 PR4-4.2

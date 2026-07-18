@@ -36,7 +36,7 @@ pub fn detect_cross(fast: &[f64], slow: &[f64], lookback: usize) -> CrossType {
     if len < 2 {
         return CrossType::None;
     }
-    let start = if len > lookback { len - lookback } else { 0 };
+    let start = len.saturating_sub(lookback);
 
     for i in (start + 1..len).rev() {
         let prev_diff = fast[i - 1] - slow[i - 1];

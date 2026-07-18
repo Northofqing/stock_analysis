@@ -1,27 +1,27 @@
+//! Registered business rules: BR-078, BR-082.
 //! `news::aggregator` 在 monitor 主路径的初始化 + tick 接入
 //!
 //! ## 目标 (v15.3 Phase D 收尾)
 //!
-//! 把 `src/news/aggregator/feed.rs` 的 15 个 `NewsFeed` 适配 (Jin10 / WSCN / CLS / Sina /
-//! Weibo / Gel / 科创板日报 / GovPolicy = 8 个真 HTTP;GovCn / MIIT / EmAnnouncement /
-//! Earnings / Consensus / MarketAction / AnalystViews = 7 个 unit stub) 注册到全局
+//! 把 `src/news/aggregator/feed.rs` 的 8 个真实轮询 `NewsFeed` 适配 (Jin10 / WSCN /
+//! CLS / Sina / Weibo / Gel / 科创板日报 / GovPolicy) 注册到全局
 //! `NewsAggregator`, 然后在 `news_monitor_loop` 每 tick 调一次 `tick_news_aggregator(20)`,
-//! 把 dedup 后的 `Vec<MarketEvent>` 喂给现有产出器 (本期仅 log + count).
+//! 把 dedup 后的 `Vec<MarketEvent>` 喂给 BR-082 NewsFlashGate 与推送治理链.
 //!
 //! ## 调用链
 //!
 //! ```text
 //! monitor::main()
 //!   └─ init_news_aggregator()  ← 本文件
-//!        ├─ register_feeds(13 × Arc<dyn NewsFeed>)
+//!        ├─ register_feeds(8 × Arc<dyn NewsFeed>)
 //!        ├─ take_all_for_aggregator()
 //!        └─ NewsAggregator::new(...).set_global()
 //!
 //! monitor::main()
 //!   └─ news_monitor_loop()
 //!        └─ tick_news_aggregator(20).await  ← 本文件
-//!             └─ NewsAggregator::global().tick(20) → 13 feed 并发取数 + simhash 去重
-//!                  → Vec<MarketEvent> (本期 log event 数, 后续接入 news_ranker)
+//!             └─ NewsAggregator::global().tick(20) → 8 feed 取数 + simhash 去重
+//!                  → Vec<MarketEvent> → BR-082 NewsFlashGate
 //! ```
 //!
 //! ## Idempotent
@@ -43,7 +43,7 @@ use stock_analysis::news::aggregator::{
 };
 use stock_analysis::signal::market_event::MarketEvent;
 
-/// 注册 13 个 NewsFeed 适配到全局 NewsAggregator.
+/// 注册 8 个真实轮询 NewsFeed 适配到全局 NewsAggregator.
 ///
 /// 在 monitor 启动早期调一次 (main() 里 spawn task 之前). 重复调 no-op.
 ///
@@ -61,7 +61,8 @@ pub fn init_news_aggregator() -> usize {
             inner: stock_analysis::search_service::providers::jin10::Jin10Provider::new(),
         }),
         Arc::new(feed::WallStreetCnFeed {
-            inner: stock_analysis::search_service::providers::wallstreetcn::WallStreetCnProvider::new(),
+            inner:
+                stock_analysis::search_service::providers::wallstreetcn::WallStreetCnProvider::new(),
         }),
         Arc::new(feed::ClsFlashFeed {
             inner: stock_analysis::search_service::providers::cls::ClsProvider::new(),
@@ -81,16 +82,11 @@ pub fn init_news_aggregator() -> usize {
         Arc::new(feed::GovPolicyFeed {
             inner: stock_analysis::search_service::providers::gov_policy::GovPolicyProvider::new(),
         }),
-        // v17.7 §6 Step 5: gov_cn=disabled(parser_not_implemented) miit=disabled(parser_not_implemented)
-        // ===== 公告 / 财报源 (unit stub) =====
-        // NOTE: EmAnnouncementFeed 已从 feed vector 中移除 (v17.7 Task 6 fix).
+        // BR-078: 未实现/主动触发型 feed 不得伪装成成功轮询源。
+        // GovCn/MIIT/EarningsCalendar/Consensus/MarketAction/AnalystViews 不注册。
+        // EmAnnouncementFeed 也不注册，公告由下面说明的既有主路径消费。
         // 公告直接来自 news_monitor_loop 中的 nm.process_announcements()，
         // 通过 v17_sources::push_normalized_events 推送，绕过 NewsFlash 二次缓冲。
-        Arc::new(feed::EarningsCalendarFeed),
-        Arc::new(feed::ConsensusFeed),
-        // ===== 实盘 + 机构观点 (unit stub) =====
-        Arc::new(feed::MarketActionFeed),
-        Arc::new(feed::AnalystViewsFeed),
     ];
     let count = feeds.len();
     log::info!(
@@ -105,7 +101,8 @@ pub fn init_news_aggregator() -> usize {
 
     log::info!(
         "[NewsAggregator] init 完成: {} feeds registered, {} 喂入 aggregator",
-        count, real_count
+        count,
+        real_count
     );
     real_count
 }
@@ -119,8 +116,7 @@ fn feed_count_global() -> usize {
 
 /// 在 `news_monitor_loop` 中每 tick 调一次, 拿到 dedup 后的 `Vec<MarketEvent>`.
 ///
-/// 本期仅 log event 数 + 按事件类型分布统计; 后续接入 news_ranker /
-/// news_outcome / news_catalyst 时把 events 喂过去.
+/// 调用方把返回事件交给 BR-082 NewsFlashGate 和现有推送治理链。
 pub async fn tick_news_aggregator(per_feed_limit: usize) -> Vec<MarketEvent> {
     match aggregator::global() {
         Some(agg) => {
@@ -145,7 +141,6 @@ pub async fn tick_news_aggregator(per_feed_limit: usize) -> Vec<MarketEvent> {
                 counts_by_type,
                 per_feed_limit
             );
-            // future: news_ranker::rank_events(&events) → 候选 → 推 v14 push 栈
             events
         }
         None => {
@@ -159,7 +154,7 @@ pub async fn tick_news_aggregator(per_feed_limit: usize) -> Vec<MarketEvent> {
 
 // ============================================================================
 // v17.4 §5.1 能力1: NewsFlashGate — critical 即时推 + 4 时段聚合 Top3
-// 业务规则登记: BR-033 (docs/business_rules.md, 红线 2.10)
+// 业务规则登记: BR-082 (docs/business_rules.md, 红线 2.10)
 // ============================================================================
 
 /// 4 个聚合窗口 (开盘/午盘收/午盘开/收盘)
@@ -200,7 +195,7 @@ impl NewsFlashGate {
         }
     }
 
-    /// 跨天重置 (BR-033: 日桶清零, 防内存增长)
+    /// 跨天重置 (BR-082: 日桶清零, 防内存增长)
     fn rollover(&mut self, today: chrono::NaiveDate) {
         if self.day != today {
             self.day = today;
@@ -212,7 +207,7 @@ impl NewsFlashGate {
         }
     }
 
-    /// 每 tick 调用: 喂入 dedup 后事件 + 当前时间 → 产出推送决策 (BR-033)
+    /// 每 tick 调用: 喂入 dedup 后事件 + 当前时间 → 产出推送决策 (BR-082)
     ///
     /// critical 判定: strength ≥ threshold 且 certainty ≥ 60 (官方性门槛);
     /// 每日上限 max_per_day, 超限 warn 出声 (v15.x 静默路径可见)。
@@ -238,7 +233,11 @@ impl NewsFlashGate {
                     format!(
                         "[{}] {} (强度{} 确定性{})",
                         e.event_type.label(),
-                        if e.full_title.is_empty() { &e.subject } else { &e.full_title },
+                        if e.full_title.is_empty() {
+                            &e.subject
+                        } else {
+                            &e.full_title
+                        },
                         e.strength,
                         e.certainty
                     ),
@@ -248,7 +247,9 @@ impl NewsFlashGate {
                 if self.critical_pushed_today >= max_critical_per_day {
                     log::warn!(
                         "[NewsFlashGate] critical 日上限已满 ({}/{}), 跳过: {}",
-                        self.critical_pushed_today, max_critical_per_day, e.subject
+                        self.critical_pushed_today,
+                        max_critical_per_day,
+                        e.subject
                     );
                     continue;
                 }
@@ -259,7 +260,11 @@ impl NewsFlashGate {
                         "🚨 高分新闻快讯 ({})\n[{}] {}\n强度 {} | 确定性 {} | 今日第 {}/{} 条",
                         now.format("%H:%M"),
                         e.event_type.label(),
-                        if e.full_title.is_empty() { &e.subject } else { &e.full_title },
+                        if e.full_title.is_empty() {
+                            &e.subject
+                        } else {
+                            &e.full_title
+                        },
                         e.strength,
                         e.certainty,
                         self.critical_pushed_today,
@@ -291,7 +296,7 @@ impl NewsFlashGate {
                     continue;
                 }
                 let mut sorted: Vec<&(u8, String)> = self.buffer.iter().collect();
-                sorted.sort_by(|a, b| b.0.cmp(&a.0));
+                sorted.sort_by_key(|item| std::cmp::Reverse(item.0));
                 let mut text = format!("📰 新闻时段聚合 ({}) Top3:\n", label);
                 for (rank, (_, line)) in sorted.iter().take(3).enumerate() {
                     text.push_str(&format!("{}. {}\n", rank + 1, line));
@@ -305,7 +310,7 @@ impl NewsFlashGate {
 }
 
 /// 推送包装: 把 FlashDecision 走现有 push_governor_v3 (L4 dedup: critical 按
-/// event_id, 聚合按窗口标签 — 见 BR-033)。返回 (critical 推送数, 聚合推送数)。
+/// event_id, 聚合按窗口标签 — 见 BR-082)。返回 (critical 推送数, 聚合推送数)。
 pub async fn push_flash_decisions(decisions: Vec<FlashDecision>) -> (usize, usize) {
     let mut n_critical = 0usize;
     let mut n_agg = 0usize;
@@ -378,21 +383,33 @@ mod tests {
     #[test]
     fn gate_critical_threshold_and_certainty() {
         let mut g = NewsFlashGate::new(at(10, 0).date_naive());
-        let d = g.process(&[ev("a", 85, 70), ev("b", 85, 30), ev("c", 60, 90)], at(10, 0), 80, 20);
+        let d = g.process(
+            &[ev("a", 85, 70), ev("b", 85, 30), ev("c", 60, 90)],
+            at(10, 0),
+            80,
+            20,
+        );
         assert_eq!(d.len(), 1, "仅 strength≥80 且 certainty≥60 推");
         assert!(matches!(&d[0], FlashDecision::Critical(id, _) if id == "eid-a"));
     }
 
-    /// BR-033: event_id 当日去重
+    /// BR-082: event_id 当日去重
     #[test]
     fn gate_dedup_same_event_id() {
         let mut g = NewsFlashGate::new(at(10, 0).date_naive());
         let e = ev("dup", 90, 90);
-        assert_eq!(g.process(&[e.clone()], at(10, 0), 80, 20).len(), 1);
-        assert_eq!(g.process(&[e], at(10, 1), 80, 20).len(), 0, "同 event_id 当日不重推");
+        assert_eq!(
+            g.process(std::slice::from_ref(&e), at(10, 0), 80, 20).len(),
+            1
+        );
+        assert_eq!(
+            g.process(&[e], at(10, 1), 80, 20).len(),
+            0,
+            "同 event_id 当日不重推"
+        );
     }
 
-    /// BR-033: 每日上限
+    /// BR-082: 每日上限
     #[test]
     fn gate_daily_cap() {
         let mut g = NewsFlashGate::new(at(10, 0).date_naive());
@@ -406,8 +423,11 @@ mod tests {
     fn gate_window_fires_once_with_top3() {
         let mut g = NewsFlashGate::new(at(9, 0).date_naive());
         // 9:00 喂 4 条低分事件 (进 buffer, 不 critical)
-        let events: Vec<MarketEvent> =
-            [40u8, 70, 55, 60].iter().enumerate().map(|(i, &s)| ev(&format!("w{}", i), s, 50)).collect();
+        let events: Vec<MarketEvent> = [40u8, 70, 55, 60]
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| ev(&format!("w{}", i), s, 50))
+            .collect();
         assert!(g.process(&events, at(9, 0), 80, 20).is_empty());
         // 9:31 → 触发 09:30 窗口
         let d1 = g.process(&[], at(9, 31), 80, 20);

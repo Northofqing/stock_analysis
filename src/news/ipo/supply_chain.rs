@@ -89,42 +89,32 @@ pub fn ipo_companies() -> &'static [IpoCompany] {
         IpoCompany {
             pre_ipo_name: "阶跃星辰",
             ipo_stage: PreSubmission,
-            related_stocks: &[
-                ("603019", "中科曙光", Partner),
-            ],
+            related_stocks: &[("603019", "中科曙光", Partner)],
         },
         IpoCompany {
             pre_ipo_name: "壁仞科技",
             ipo_stage: Listed,
-            related_stocks: &[
-                ("002230", "科大讯飞", Partner),
-            ],
+            related_stocks: &[("002230", "科大讯飞", Partner)],
         },
         IpoCompany {
             pre_ipo_name: "燧原科技",
             ipo_stage: PreSubmission,
-            related_stocks: &[
-                ("603019", "中科曙光", Partner),
-            ],
+            related_stocks: &[("603019", "中科曙光", Partner)],
         },
         IpoCompany {
             pre_ipo_name: "黑芝麻智能",
             ipo_stage: Listed,
-            related_stocks: &[
-                ("002230", "科大讯飞", Partner),
-            ],
+            related_stocks: &[("002230", "科大讯飞", Partner)],
         },
         IpoCompany {
             pre_ipo_name: "地平线",
             ipo_stage: Listed,
-            related_stocks: &[
-                ("002230", "科大讯飞", Partner),
-            ],
+            related_stocks: &[("002230", "科大讯飞", Partner)],
         },
     ]
 }
 
-pub fn first_seen_for(company: &IpoCompany) -> NaiveDate {
+pub fn first_seen_for(_company: &IpoCompany) -> NaiveDate {
     FIRST_SEEN
 }
 
@@ -140,7 +130,10 @@ mod tests {
     fn test_lookup_changxin() {
         let c = lookup("长鑫存储").unwrap();
         assert_eq!(c.ipo_stage, IpoStage::Submitted);
-        assert!(c.related_stocks.iter().any(|(code, name, _)| *code == "603986" && *name == "兆易创新"));
+        assert!(c
+            .related_stocks
+            .iter()
+            .any(|(code, name, _)| *code == "603986" && *name == "兆易创新"));
     }
 
     #[test]
@@ -164,8 +157,19 @@ mod tests {
     fn test_all_stocks_are_6_digits() {
         for c in ipo_companies() {
             for (code, _, _) in c.related_stocks {
-                assert_eq!(code.len(), 6, "{} stock code {} invalid", c.pre_ipo_name, code);
-                assert!(code.chars().all(|c| c.is_ascii_digit()), "{} stock {} non-digit", c.pre_ipo_name, code);
+                assert_eq!(
+                    code.len(),
+                    6,
+                    "{} stock code {} invalid",
+                    c.pre_ipo_name,
+                    code
+                );
+                assert!(
+                    code.chars().all(|c| c.is_ascii_digit()),
+                    "{} stock {} non-digit",
+                    c.pre_ipo_name,
+                    code
+                );
             }
         }
     }
@@ -176,7 +180,12 @@ mod tests {
             let mut codes: Vec<&str> = c.related_stocks.iter().map(|(c, _, _)| *c).collect();
             codes.sort();
             codes.dedup();
-            assert_eq!(codes.len(), c.related_stocks.len(), "{} has duplicate stocks", c.pre_ipo_name);
+            assert_eq!(
+                codes.len(),
+                c.related_stocks.len(),
+                "{} has duplicate stocks",
+                c.pre_ipo_name
+            );
         }
     }
 }

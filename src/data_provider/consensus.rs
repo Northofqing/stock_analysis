@@ -46,19 +46,44 @@ pub struct RecentReport {
     pub rating: String,
 }
 
-fn as_f64(v: &Value) -> Option<f64> {
+fn optional_finite_f64(item: &Value, field: &str) -> Result<Option<f64>> {
+    let Some(v) = item.get(field) else {
+        return Ok(None);
+    };
     match v {
-        Value::Number(n) => n.as_f64(),
-        Value::String(s) => {
-            let s = s.trim();
-            if s.is_empty() {
-                None
-            } else {
-                s.parse::<f64>().ok()
-            }
-        }
-        _ => None,
+        Value::Null => Ok(None),
+        Value::Number(n) => n
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .map(Some)
+            .ok_or_else(|| anyhow!("一致预期字段 {field} 不是有限数字: {v}")),
+        Value::String(s) if s.trim().is_empty() => Ok(None),
+        Value::String(s) => s
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite())
+            .map(Some)
+            .ok_or_else(|| anyhow!("一致预期字段 {field} 非法: {s:?}")),
+        _ => Err(anyhow!("一致预期字段 {field} 类型非法: {v}")),
     }
+}
+
+fn required_text(item: &Value, field: &str) -> Result<String> {
+    item.get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("一致预期记录缺少非空字段 {field}"))
+}
+
+fn required_publish_date(item: &Value) -> Result<(String, chrono::NaiveDate)> {
+    let raw = required_text(item, "publishDate")?;
+    let date_text = raw.split_whitespace().next().unwrap_or(&raw);
+    let date = chrono::NaiveDate::parse_from_str(date_text, "%Y-%m-%d")
+        .map_err(|error| anyhow!("一致预期 publishDate 非法 {date_text:?}: {error}"))?;
+    Ok((date_text.to_string(), date))
 }
 
 fn avg(values: &[f64]) -> Option<f64> {
@@ -114,72 +139,72 @@ pub async fn fetch_async(client: &reqwest::Client, code: &str) -> Result<Consens
     let mut brokers: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut latest_report_date: Option<String> = None;
     let mut recent_reports: Vec<RecentReport> = Vec::new();
+    let mut previous_publish_date: Option<chrono::NaiveDate> = None;
 
     for (i, item) in arr.iter().enumerate() {
-        if let Some(v) = item.get("predictThisYearEps").and_then(as_f64) {
-            if v.is_finite() && v.abs() > 1e-9 {
-                eps_this.push(v);
+        let (pub_date, parsed_pub_date) = required_publish_date(item)?;
+        if parsed_pub_date < begin || parsed_pub_date > today {
+            return Err(anyhow!(
+                "一致预期 publishDate 超出请求窗口: {parsed_pub_date} not in {begin}..={today}"
+            ));
+        }
+        if let Some(previous) = previous_publish_date {
+            if parsed_pub_date > previous {
+                return Err(anyhow!(
+                    "一致预期记录时间顺序错误: {parsed_pub_date} 晚于前一条 {previous}"
+                ));
             }
         }
-        if let Some(v) = item.get("predictNextYearEps").and_then(as_f64) {
-            if v.is_finite() && v.abs() > 1e-9 {
-                eps_next.push(v);
+        previous_publish_date = Some(parsed_pub_date);
+
+        if let Some(v) = optional_finite_f64(item, "predictThisYearEps")? {
+            eps_this.push(v);
+        }
+        if let Some(v) = optional_finite_f64(item, "predictNextYearEps")? {
+            eps_next.push(v);
+        }
+        if let Some(v) = optional_finite_f64(item, "predictNextTwoYearEps")? {
+            eps_next2.push(v);
+        }
+        let high = optional_finite_f64(item, "indvAimPriceT")?;
+        let low = optional_finite_f64(item, "indvAimPriceL")?;
+        for (field, value) in [("indvAimPriceT", high), ("indvAimPriceL", low)] {
+            if value.is_some_and(|price| price <= 0.0) {
+                return Err(anyhow!("一致预期字段 {field} 必须 > 0"));
             }
         }
-        if let Some(v) = item.get("predictNextTwoYearEps").and_then(as_f64) {
-            if v.is_finite() && v.abs() > 1e-9 {
-                eps_next2.push(v);
-            }
+        if high.zip(low).is_some_and(|(high, low)| low > high) {
+            return Err(anyhow!(
+                "一致预期目标价上下限颠倒: low={low:?} high={high:?}"
+            ));
         }
-        if let Some(v) = item.get("indvAimPriceT").and_then(as_f64) {
-            if v.is_finite() && v > 0.0 {
-                tp_high.push(v);
-            }
+        if let Some(value) = high {
+            tp_high.push(value);
         }
-        if let Some(v) = item.get("indvAimPriceL").and_then(as_f64) {
-            if v.is_finite() && v > 0.0 {
-                tp_low.push(v);
-            }
+        if let Some(value) = low {
+            tp_low.push(value);
         }
-        if let Some(r) = item.get("emRatingName").and_then(|v| v.as_str()) {
-            let r = r.trim();
-            if !r.is_empty() {
-                *rating_dist.entry(r.to_string()).or_insert(0) += 1;
-            }
-        }
-        if let Some(org) = item.get("orgSName").and_then(|v| v.as_str()) {
-            let org = org.trim();
-            if !org.is_empty() {
-                brokers.insert(org.to_string());
-            }
-        }
-        let pub_date = item
-            .get("publishDate")
-            .and_then(|v| v.as_str())
-            .map(|s| s.split_whitespace().next().unwrap_or(s).to_string());
+
+        let rating = required_text(item, "emRatingName")?;
+        *rating_dist.entry(rating.clone()).or_insert(0) += 1;
+        let org_name = required_text(item, "orgSName")?;
+        brokers.insert(org_name.clone());
+        let title = required_text(item, "title")?;
         if i == 0 {
-            latest_report_date = pub_date.clone();
+            latest_report_date = Some(pub_date.clone());
         }
         if recent_reports.len() < 3 {
             recent_reports.push(RecentReport {
-                title: item
-                    .get("title")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                org_name: item
-                    .get("orgSName")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                publish_date: pub_date.unwrap_or_default(),
-                rating: item
-                    .get("emRatingName")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
+                title,
+                org_name,
+                publish_date: pub_date,
+                rating,
             });
         }
+    }
+
+    if eps_this.is_empty() && eps_next.is_empty() && eps_next2.is_empty() {
+        return Err(anyhow!("一致预期批次不含任何 EPS 预测"));
     }
 
     Ok(ConsensusData {
@@ -197,22 +222,14 @@ pub async fn fetch_async(client: &reqwest::Client, code: &str) -> Result<Consens
 }
 
 /// 同步包装：在已有 tokio runtime 上下文内调用
-pub fn fetch_blocking(client: &reqwest::Client, code: &str) -> Option<ConsensusData> {
+pub fn fetch_blocking(client: &reqwest::Client, code: &str) -> Result<ConsensusData> {
     // 修复 Top10#5 (2026-06-29 audit): 用 crate::block_on_async 统一替代
     if tokio::runtime::Handle::try_current().is_err() {
-        return None;
+        return Err(anyhow!("[一致预期] 无 tokio runtime，无法抓取 {code}"));
     }
     let client = client.clone();
     let code_s = code.to_string();
-    crate::block_on_async(async move {
-        match fetch_async(&client, &code_s).await {
-            Ok(v) => Some(v),
-            Err(e) => {
-                log::warn!("[一致预期] {} 拉取失败: {}", code_s, e);
-                None
-            }
-        }
-    })
+    crate::block_on_async(async move { fetch_async(&client, &code_s).await })
 }
 
 impl ConsensusData {
@@ -238,5 +255,37 @@ impl ConsensusData {
         }
         let high = self.target_price_high_avg?;
         Some((high - current_price) / current_price * 100.0)
+    }
+}
+
+#[cfg(test)]
+mod strict_contract_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_present_consensus_number_is_an_error() {
+        let item = serde_json::json!({"predictThisYearEps": "not-a-number"});
+        assert!(optional_finite_f64(&item, "predictThisYearEps").is_err());
+        let missing = serde_json::json!({"predictThisYearEps": ""});
+        assert_eq!(
+            optional_finite_f64(&missing, "predictThisYearEps").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn consensus_report_requires_valid_date_and_nonempty_identity_fields() {
+        let valid = serde_json::json!({
+            "publishDate": "2026-07-18 00:00:00",
+            "title": "测试研报",
+            "orgSName": "测试券商",
+            "emRatingName": "买入"
+        });
+        assert_eq!(required_publish_date(&valid).unwrap().0, "2026-07-18");
+        assert!(required_text(&valid, "title").is_ok());
+
+        let bad_date = serde_json::json!({"publishDate": "2026-99-99"});
+        assert!(required_publish_date(&bad_date).is_err());
+        assert!(required_text(&serde_json::json!({"title": ""}), "title").is_err());
     }
 }

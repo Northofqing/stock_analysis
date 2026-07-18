@@ -129,12 +129,15 @@ pub(crate) fn compute_sma_vec(close: &[f64], period: usize) -> Vec<Option<f64>> 
 }
 
 /// 计算 MACD (返回 macd_line, signal_line, histogram)
+pub(super) type IndicatorSeries = Vec<Option<f64>>;
+pub(super) type MacdSeries = (IndicatorSeries, IndicatorSeries, IndicatorSeries);
+
 pub(super) fn compute_macd_vec(
     close: &[f64],
     fast: usize,
     slow: usize,
     signal_period: usize,
-) -> (Vec<Option<f64>>, Vec<Option<f64>>, Vec<Option<f64>>) {
+) -> MacdSeries {
     let n = close.len();
     let ema_fast = compute_ema_vec(close, fast);
     let ema_slow = compute_ema_vec(close, slow);

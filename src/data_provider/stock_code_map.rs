@@ -1,3 +1,4 @@
+//! Registered business rules: BR-064.
 //! Stock code format conversion helpers.
 //!
 //! Provides bidirectional mapping between our 6-digit internal stock codes

@@ -68,18 +68,7 @@ impl RiskContext {
     }
 }
 
-/// 模拟账户总本金（元），由 `TOTAL_CAPITAL` 配置，默认 10 万。
-/// 保留用于 fallback 路径。
-fn total_capital() -> f64 {
-    std::env::var("TOTAL_CAPITAL")
-        .ok()
-        .and_then(|v| v.trim().parse::<f64>().ok())
-        .filter(|v| *v > 0.0)
-        .unwrap_or(100_000.0)
-}
-
 /// 最多同时持有的仓位数（决定单笔仓位预算），由 `MAX_POSITIONS` 配置，默认 5。
-/// 保留用于 fallback 路径。
 fn max_positions() -> usize {
     std::env::var("MAX_POSITIONS")
         .ok()
@@ -88,15 +77,21 @@ fn max_positions() -> usize {
         .unwrap_or(5)
 }
 
-/// [fallback] 按本金计算买入股数：单笔预算 = 总本金 / 最大仓位数。
-/// use_dynamic=false 时使用此函数。
-fn position_shares(price: f64) -> i32 {
-    if price <= 0.0 {
-        return 100;
+/// 非动态模式也只允许使用真实账户现金，不得构造默认本金。
+fn position_shares(price: f64, available_cash: f64) -> Result<i32, String> {
+    if !price.is_finite() || price <= 0.0 || !available_cash.is_finite() || available_cash < 0.0 {
+        return Err(format!(
+            "BR-085 invalid sizing evidence: price={price} available_cash={available_cash}"
+        ));
     }
-    let budget = total_capital() / max_positions() as f64;
+    let budget = available_cash / max_positions() as f64;
     let lots = (budget / price / 100.0).floor() as i32;
-    lots.max(1) * 100
+    if lots < 1 {
+        return Err(format!(
+            "BR-085 available cash cannot fund one lot: cash={available_cash} price={price}"
+        ));
+    }
+    Ok(lots * 100)
 }
 
 /// 毛收益率 → 净收益率（扣往返交易成本）。
@@ -108,62 +103,68 @@ fn validate_trade_symbol_env(code: &str) -> Result<(), String> {
     crate::risk::env_guard::validate_symbol_for_current_env(code)
 }
 
-/// v12 PR3-3.6 (BR-015 偿还): 查同 chain 已持仓数 (open status).
-///
-/// 实现: 先取本标的**最近建仓**的 chain_name (ORDER BY buy_date DESC, id DESC),
-///       再数同 chain 的 open 持仓数.
-/// DB 错误时返回 0 (不阻断, 走 fallback 旧 hardcoded 行为).
-///
-/// Bug #3 fix (2026-07-05): 无 ORDER BY 的 LIMIT 1 在 SQLite 下非稳定,
-/// 同 code 多 chain 时不同时间查询可能返回不同 row. 加 ORDER BY 后取最新建仓.
-fn query_chain_held_count(code: &str) -> Result<i32, String> {
+/// BR-085: resolve a current chain classification and its real open/frozen exposure.
+fn query_chain_exposure(code: &str) -> Result<(String, usize, usize), String> {
     let mut conn = DatabaseManager::get()
         .get_conn()
         .map_err(|e| format!("DB: {}", e))?;
 
-    // raw SQL 全部 (避免 diesel count/select trait bound 不稳定)
-    let esc = |s: &str| s.replace('\'', "''");
-    // 取最新建仓的 chain_name (排除 '其他' 占位 + NULL)
-    // ORDER BY buy_date DESC, id DESC 保证稳定性 (id 是 rowid 唯一)
-    let sql_chain = format!(
-        "SELECT chain_name FROM stock_position \
-         WHERE code = '{}' AND status = 'open' \
-           AND chain_name IS NOT NULL AND chain_name != '' AND chain_name != '其他' \
-         ORDER BY buy_date DESC, id DESC LIMIT 1",
-        esc(code)
-    );
-    let chain_row: Option<ChainNameRow> = diesel::sql_query(sql_chain)
-        .get_result(&mut conn)
-        .optional()
-        .map_err(|e| format!("query chain_name: {}", e))?;
+    #[derive(diesel::QueryableByName)]
+    struct ConceptCacheRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        concepts: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        updated_at: String,
+    }
+    let cache: Option<ConceptCacheRow> =
+        diesel::sql_query("SELECT concepts, updated_at FROM stock_concepts WHERE code = ? LIMIT 1")
+            .bind::<diesel::sql_types::Text, _>(code)
+            .get_result(&mut conn)
+            .optional()
+            .map_err(|e| format!("query stock_concepts: {e}"))?;
 
-    let chain = match chain_row {
-        Some(r) if !r.chain_name.is_empty() && r.chain_name != "其他" => r.chain_name,
-        _ => return Ok(0),
+    let effective_today = if crate::calendar::is_trading_day(chrono::Local::now().date_naive()) {
+        chrono::Local::now().date_naive()
+    } else {
+        crate::calendar::prev_trading_day(chrono::Local::now().date_naive())
     };
+    let allowed_dates = crate::calendar::recent_trading_days(effective_today, 2);
+    let cached_chain = cache.and_then(|row| {
+        let updated_date =
+            chrono::NaiveDateTime::parse_from_str(&row.updated_at, "%Y-%m-%d %H:%M:%S")
+                .ok()
+                .map(|value| value.date());
+        if updated_date.is_some_and(|date| allowed_dates.contains(&date)) {
+            serde_json::from_str::<Vec<String>>(&row.concepts)
+                .ok()
+                .and_then(|values| values.into_iter().find(|value| !value.trim().is_empty()))
+        } else {
+            None
+        }
+    });
+    let chain = cached_chain
+        .or_else(|| crate::data_provider::chain_registry::lookup(code).map(str::to_string))
+        .filter(|value| value != "其他")
+        .ok_or_else(|| format!("BR-085 chain classification unavailable for {code}"))?;
 
-    let count_sql = format!(
-        "SELECT COUNT(*) AS cnt FROM stock_position WHERE chain_name = '{}' AND status = 'open'",
-        esc(&chain)
-    );
-    let count: i64 = diesel::sql_query(count_sql)
-        .get_result::<CountRow>(&mut conn)
-        .map(|r| r.cnt)
-        .map_err(|e| format!("count chain: {}", e))?;
-
-    Ok(count as i32)
-}
-
-#[derive(diesel::QueryableByName)]
-struct CountRow {
-    #[diesel(sql_type = diesel::sql_types::BigInt)]
-    cnt: i64,
-}
-
-#[derive(diesel::QueryableByName)]
-struct ChainNameRow {
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    chain_name: String,
+    #[derive(diesel::QueryableByName)]
+    struct ExposureRow {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        held: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        frozen: i64,
+    }
+    let today = chrono::Local::now().date_naive().to_string();
+    let exposure: ExposureRow = diesel::sql_query(
+        "SELECT COUNT(*) AS held,
+                COALESCE(SUM(CASE WHEN buy_date = ? THEN 1 ELSE 0 END), 0) AS frozen
+         FROM stock_position WHERE chain_name = ? AND status = 'open'",
+    )
+    .bind::<diesel::sql_types::Text, _>(&today)
+    .bind::<diesel::sql_types::Text, _>(&chain)
+    .get_result(&mut conn)
+    .map_err(|e| format!("query chain exposure: {e}"))?;
+    Ok((chain, exposure.held as usize, exposure.frozen as usize))
 }
 
 /// 对单只股票跟踪模拟持仓并在满足条件时开/平仓。
@@ -187,7 +188,17 @@ pub(super) fn track_position(
         return;
     }
 
-    let current_price = result.current_price.unwrap_or(data[0].close);
+    let current_price = match result
+        .current_price
+        .or_else(|| data.first().map(|bar| bar.close))
+        .filter(|price| price.is_finite() && *price > 0.0)
+    {
+        Some(price) => price,
+        None => {
+            warn!("[{}] BR-084 当前价格缺失或非法，拒绝持仓操作", code);
+            return;
+        }
+    };
 
     match gateway.get_open_position(code) {
         Ok(Some(pos)) => {
@@ -220,7 +231,7 @@ pub(super) fn track_position(
                 &result.name,
                 current_price,
                 pos.buy_price,
-                pos.buy_price * 0.92, // hard stop = 买入价 × 0.92
+                Some(pos.buy_price * 0.92), // strategy-derived hard stop
                 result.ma20,
                 result.ma60,
             );
@@ -228,7 +239,7 @@ pub(super) fn track_position(
             // 铁律2 盈利<20% 绝不主动止盈（不触发卖出）
             // 铁律3 盈利 ≥ 20% 后，跌破 5 日均线
             let profit_trend_exit =
-                return_rate >= 20.0 && result.ma5.map_or(false, |ma5| current_price < ma5);
+                return_rate >= 20.0 && result.ma5.is_some_and(|ma5| current_price < ma5);
             // 铁律4 持仓 >14 天仍亏损
             let hold_days = {
                 let buy = chrono::NaiveDate::parse_from_str(&pos.buy_date, "%Y-%m-%d");
@@ -310,15 +321,17 @@ pub(super) fn track_position(
                     trade_date: today.clone(),
                     price: current_price,
                     quantity: pos.quantity,
+                    secondary_confirmed: false,
+                    decision_basis: reason.clone(),
                 };
                 match gateway.close_position(&close_cmd) {
-                    Ok(_) => {
+                    Ok(receipt) => {
                         info!(
                             "[{}] 触发平仓 [{}]，@ {:.2}，收益率: {:+.2}%",
-                            code, reason, current_price, return_rate
+                            code, reason, receipt.price, return_rate
                         );
                         result.position_status = Some("closed".to_string());
-                        result.position_sell_price = Some(current_price);
+                        result.position_sell_price = Some(receipt.price);
                         result.position_sell_date = Some(today);
                     }
                     Err(e) => {
@@ -384,18 +397,34 @@ pub(super) fn track_position(
                 return;
             }
 
+            let (chain_name, chain_held, chain_frozen) = match query_chain_exposure(code) {
+                Ok(exposure) => exposure,
+                Err(error) => {
+                    warn!(
+                        "[{}] BR-085 产业链风险证据不可用，拒绝建仓: {}",
+                        code, error
+                    );
+                    return;
+                }
+            };
+            let (available_cash, _, _) =
+                match crate::trading::paper_trade::portfolio_state(code, current_price) {
+                    Ok(state) => state,
+                    Err(error) => {
+                        warn!("[{}] BR-085 真实账户快照不可用，拒绝建仓: {}", code, error);
+                        return;
+                    }
+                };
+
             // P0-2: 动态仓位计算 (PositionSizer 替代固定 position_shares)
             let shares = if risk_ctx.use_dynamic {
-                let volatility = result.volatility.unwrap_or(3.0);
-                // 修复 B6 + BR-015 + v12 PR3-3.6 (2026-07-05):
-                // stock_position 表已加 chain_name 列 (migration v12-p0-paper-and-adjust)
-                // 现在可以查同 chain 持仓数, 接真值替换之前的 hardcoded 0.
-                if !risk_ctx.use_dynamic {
-                    warn!("[{}] chain 集中度检查暂未启用 (BR-015), max_position 用 base × vol × regime", code);
-                }
-                // PR3-3.6: 接入真值 (DB 查同 chain 持仓数). 失败时 fallback 0 (不阻断).
-                let chain_held = query_chain_held_count(code).unwrap_or(0) as usize;
-                let chain_frozen: usize = 0; // T+1 冻结数: 后续 PR 接入 buy_date 索引 + 同 chain 查
+                let volatility = match result.volatility {
+                    Some(value) if value.is_finite() && value > 0.0 => value,
+                    _ => {
+                        warn!("[{}] BR-085 波动率缺失或非法，拒绝动态建仓", code);
+                        return;
+                    }
+                };
                 let max_amount = risk_ctx.sizer.max_position(
                     risk_ctx.regime,
                     volatility,
@@ -408,9 +437,19 @@ pub(super) fn track_position(
                     return;
                 }
                 let lots = (max_amount / current_price / 100.0).floor() as i32;
-                lots.max(1) * 100
+                if lots < 1 {
+                    warn!("[{}] BR-085 动态仓位不足一手，拒绝建仓", code);
+                    return;
+                }
+                lots * 100
             } else {
-                position_shares(current_price)
+                match position_shares(current_price, available_cash) {
+                    Ok(shares) => shares,
+                    Err(error) => {
+                        warn!("[{}] 非动态仓位计算失败，拒绝建仓: {}", code, error);
+                        return;
+                    }
+                }
             };
 
             let today = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -421,9 +460,19 @@ pub(super) fn track_position(
                 trade_date: today.clone(),
                 price: current_price,
                 quantity: shares,
+                secondary_confirmed: false,
+                chain_name,
+                decision_basis: if !bm_reason.is_empty() {
+                    bm_reason.clone()
+                } else {
+                    result
+                        .contrarian_reason
+                        .clone()
+                        .unwrap_or_else(|| "BollMacd/Contrarian trigger".to_string())
+                },
             };
             match gateway.open_position(&open_cmd) {
-                Ok(_) => {
+                Ok(receipt) => {
                     let tag = match (bm_action, result.contrarian_signal) {
                         (BollMacdAction::UptrendStart, _) => "主升浪启动",
                         (BollMacdAction::BottomBuy, _) => "下轨抄底",
@@ -448,9 +497,9 @@ pub(super) fn track_position(
                     };
                     info!(
                         "[{}] 触发{}（AI 评分 {}），模拟买入 {} @ {:.2}{}",
-                        code, tag, result.sentiment_score, sizing_label, current_price, extra
+                        code, tag, result.sentiment_score, sizing_label, receipt.price, extra
                     );
-                    result.position_buy_price = Some(current_price);
+                    result.position_buy_price = Some(receipt.price);
                     result.position_buy_date = Some(today);
                     result.position_return = Some(0.0);
                     result.position_quantity = Some(shares);
@@ -460,54 +509,6 @@ pub(super) fn track_position(
             }
         }
         Err(e) => warn!("[{}] 查询持仓失败: {}", code, e),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::validate_trade_symbol_env;
-    use once_cell::sync::Lazy;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
-
-    fn with_env_mode<T>(mode: &str, f: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().expect("env lock poisoned");
-        let prev = std::env::var("STOCK_ENV_MODE").ok();
-        std::env::set_var("STOCK_ENV_MODE", mode);
-        let out = f();
-        if let Some(v) = prev {
-            std::env::set_var("STOCK_ENV_MODE", v);
-        } else {
-            std::env::remove_var("STOCK_ENV_MODE");
-        }
-        out
-    }
-
-    #[test]
-    fn test_prod_rejects_test_code() {
-        with_env_mode("prod", || {
-            let r = validate_trade_symbol_env("TEST_CODE_000001");
-            assert!(r.is_err());
-        });
-    }
-
-    #[test]
-    fn test_test_rejects_real_code() {
-        with_env_mode("test", || {
-            let r = validate_trade_symbol_env("600519");
-            assert!(r.is_err());
-        });
-    }
-
-    #[test]
-    fn test_legal_symbol_matrix_passes() {
-        with_env_mode("prod", || {
-            assert!(validate_trade_symbol_env("600519").is_ok());
-        });
-        with_env_mode("test", || {
-            assert!(validate_trade_symbol_env("TEST_CODE_600519").is_ok());
-        });
     }
 }
 
@@ -547,5 +548,71 @@ pub(super) fn save_analysis_result(code: &str, data: &[KlineData], result: &Anal
     match db.save_analysis_result(&new_result) {
         Ok(_) => info!("[{}] 分析结果已保存到数据库", code),
         Err(e) => warn!("[{}] 保存分析结果失败: {}", code, e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{position_shares, validate_trade_symbol_env};
+    use once_cell::sync::Lazy;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+    struct EnvModeGuard(Option<String>);
+
+    impl Drop for EnvModeGuard {
+        fn drop(&mut self) {
+            if let Some(value) = self.0.take() {
+                std::env::set_var("STOCK_ENV_MODE", value);
+            } else {
+                std::env::remove_var("STOCK_ENV_MODE");
+            }
+        }
+    }
+
+    fn with_env_mode<T>(mode: &str, f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let prev = std::env::var("STOCK_ENV_MODE").ok();
+        std::env::set_var("STOCK_ENV_MODE", mode);
+        let _mode_guard = EnvModeGuard(prev);
+        f()
+    }
+
+    #[test]
+    fn test_prod_rejects_test_code() {
+        with_env_mode("prod", || {
+            let r = validate_trade_symbol_env("TEST_CODE_000001");
+            assert!(r.is_err());
+        });
+    }
+
+    #[test]
+    fn test_test_rejects_real_code() {
+        with_env_mode("test", || {
+            // Environment-isolation exception: a native production symbol is
+            // the invalid input this negative test must reject.
+            let r = validate_trade_symbol_env("600519");
+            assert!(r.is_err());
+        });
+    }
+
+    #[test]
+    fn test_legal_symbol_matrix_passes() {
+        with_env_mode("prod", || {
+            // Environment-isolation exception: production must accept only the
+            // native six-digit representation.
+            assert!(validate_trade_symbol_env("600519").is_ok());
+        });
+        with_env_mode("test", || {
+            assert!(validate_trade_symbol_env("TEST_CODE_600519").is_ok());
+        });
+    }
+
+    #[test]
+    fn non_dynamic_sizing_uses_real_cash_without_forcing_a_lot() {
+        assert_eq!(position_shares(10.0, 100_000.0), Ok(2_000));
+        assert!(position_shares(100.0, 100.0).is_err());
+        assert!(position_shares(0.0, 100_000.0).is_err());
     }
 }

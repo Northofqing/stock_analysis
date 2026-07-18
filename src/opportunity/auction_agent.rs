@@ -7,36 +7,19 @@
 //! - 样本 < 阈值警告 (Q4=C 动态阈值, 避免 3/3=100% 假胜率)
 //!
 //! 实施路径:
-//! 1. run_auction_agent() 在 09:25 跑 (calendar::is_auction_now)
-//! 2. 收集 AuctionResult, 调 classify_auction 判定是否异常
+//! 1. 调用方在 09:25 提供来自真实竞价源的 AuctionResult
+//! 2. 严格校验 AuctionResult 后判定是否异常
 //! 3. 异常的票调 save_prediction 写盘口, reason = AuctionAnomaly
 //! 4. 写完调 check_sample_sufficiency 检查 reason 样本, 不足时 log warn
 //!
 //! 替代 v9 路径: monitor::prediction::save_prediction 仍走 _legacy (reason=None)
 
-use crate::calendar::is_auction_now;
+use crate::calendar::{is_auction_now, next_trading_day};
 use crate::database::DatabaseManager;
 use crate::monitor::auction::AuctionResult;
 use crate::opportunity::virtual_reason::{is_sample_sufficient, VirtualReason};
 use chrono::Local;
 use log::{info, warn};
-
-/// AGENTS §2.6 MUST: veto_chain 钩子 (P0 dry-run 占位实现)
-///
-/// 当前 P0 阶段是 dry-run, 但结构上必须有 veto 钩子, 切换实盘时无需重构。
-/// 完整 veto_chain 见 `src/risk/veto_chain.rs` + `veto_rules_live.rs`。
-///
-/// 此处实现 P0 阶段简化版 veto: 检查 BR-005 (≤5/日), BR-006 (0% 关停),
-/// BR-008 (priority 加权)。实际 veto 应在 risk/veto_chain.rs 调, 这里只是
-/// 保证结构上 save_prediction 之前有 veto 占位。
-pub fn veto_check_auction_anomaly(_r: &AuctionResult) -> bool {
-    // P0 阶段: dry-run, veto 永远通过
-    // P1 阶段: 接入真实 veto_chain, 检查 BR-005/006/008 + 新规则
-    //
-    // v17.5 (P3 fix): dry-run stub 显式 warn (生产可识别)
-    warn!("[AUCTION] veto_check_auction_anomaly STUB 模式 (P0 dry-run), 实际 veto 未触发 (P1 接入真实 veto_chain)");
-    true
-}
 
 /// 竞价 Agent 配置 (env 覆盖)
 #[derive(Debug, Clone)]
@@ -59,6 +42,71 @@ impl Default for AuctionAgentConfig {
             dry_run: false,
             force: false,
         }
+    }
+}
+
+fn validate_config(config: &AuctionAgentConfig) -> Result<(), String> {
+    if !config.gap_pct_threshold.is_finite()
+        || config.gap_pct_threshold <= 0.0
+        || config.gap_pct_threshold > 20.0
+    {
+        return Err(format!(
+            "gap_pct_threshold 必须在 (0, 20]，实际 {}",
+            config.gap_pct_threshold
+        ));
+    }
+    if !config.vol_ratio_threshold.is_finite() || config.vol_ratio_threshold <= 0.0 {
+        return Err(format!(
+            "vol_ratio_threshold 必须为正有限值，实际 {}",
+            config.vol_ratio_threshold
+        ));
+    }
+    Ok(())
+}
+
+fn validate_auction_result(result: &AuctionResult) -> Result<(), String> {
+    if !valid_source_stock_code(&result.code) {
+        return Err(format!("股票代码无效: {}", result.code));
+    }
+    if result.name.trim().is_empty() {
+        return Err(format!("{} 股票名称缺失", result.code));
+    }
+    if !result.gap_pct.is_finite() || result.gap_pct.abs() > 20.0 {
+        return Err(format!(
+            "{} 竞价涨跌幅无效: {}",
+            result.code, result.gap_pct
+        ));
+    }
+    if !result.vol_ratio.is_finite() || result.vol_ratio <= 0.0 {
+        return Err(format!(
+            "{} 竞价量比无效: {}",
+            result.code, result.vol_ratio
+        ));
+    }
+    if !result.match_ratio.is_finite() || !(0.0..=100.0).contains(&result.match_ratio) {
+        return Err(format!(
+            "{} 匹配量占比无效: {}",
+            result.code, result.match_ratio
+        ));
+    }
+    if result.suspected_fake {
+        return Err(format!("{} 疑似虚假申报，拒绝写入影子预测", result.code));
+    }
+    Ok(())
+}
+
+fn valid_source_stock_code(code: &str) -> bool {
+    if code.len() == 6 && code.bytes().all(|byte| byte.is_ascii_digit()) {
+        return true;
+    }
+    #[cfg(test)]
+    {
+        code.strip_prefix("TEST_CODE_")
+            .is_some_and(|raw| raw.len() == 6 && raw.bytes().all(|byte| byte.is_ascii_digit()))
+    }
+    #[cfg(not(test))]
+    {
+        false
     }
 }
 
@@ -101,14 +149,28 @@ pub fn run_auction_agent(
     results: &[AuctionResult],
     config: &AuctionAgentConfig,
 ) -> AuctionAgentReport {
+    run_auction_agent_for_session(results, config, is_auction_now())
+}
+
+fn run_auction_agent_for_session(
+    results: &[AuctionResult],
+    config: &AuctionAgentConfig,
+    auction_now: bool,
+) -> AuctionAgentReport {
     let mut report = AuctionAgentReport {
         scanned: results.len(),
         ..Default::default()
     };
 
+    if let Err(error) = validate_config(config) {
+        report.errors = 1;
+        warn!("[AuctionAgent] 配置无效，拒绝处理: {}", error);
+        return report;
+    }
+
     // 时段检查: 不在 09:15-09:25 → 跳过 (除非 cfg.force = true)
     // cfg.force 由调用方 (main 入口) 从 env V10_AUCTION_FORCE 读取, 测试可显式传
-    if !is_auction_now() && !config.force {
+    if !auction_now && !config.force {
         warn!("[AuctionAgent] 当前不在竞价时段 (09:15-09:25), 跳过 (设 cfg.force=true 强制)");
         return report;
     }
@@ -122,7 +184,6 @@ pub fn run_auction_agent(
     );
 
     for r in results {
-        // 1. 判定异常 (复用 auction.rs::classify_auction 逻辑, 这里只看 is_abnormal)
         let abnormal = r.is_abnormal(config.gap_pct_threshold, config.vol_ratio_threshold);
         let mut record = AuctionAgentRecord {
             code: r.code.clone(),
@@ -135,25 +196,19 @@ pub fn run_auction_agent(
             error: None,
         };
 
+        if let Err(error) = validate_auction_result(r) {
+            warn!("[AuctionAgent] 无效竞价快照: {}", error);
+            record.error = Some(error);
+            report.errors += 1;
+            report.records.push(record);
+            continue;
+        }
+
         if !abnormal {
             report.records.push(record);
             continue;
         }
         report.abnormal += 1;
-
-        // AGENTS §2.6 MUST: 写盘口前过 veto_chain
-        // 当前 P0 阶段 dry-run, 但结构上必须有 veto 钩子 (切换实盘时无需重构)
-        // BUG FIX (codex B2): 之前直接调 save_prediction, 违反 §2.6 MUST
-        if !veto_check_auction_anomaly(r) {
-            warn!(
-                "[AuctionAgent] veto_chain 拒绝: {} (BR-005/006/008 等)",
-                r.code
-            );
-            record.error = Some("veto_chain 拒绝".to_string());
-            record.written = false;
-            report.records.push(record);
-            continue;
-        }
 
         // 2. 写盘口 (dry-run 跳过)
         if config.dry_run {
@@ -165,7 +220,7 @@ pub fn run_auction_agent(
 
         // 3. 调 save_prediction, reason = AuctionAnomaly
         let today = Local::now().format("%Y-%m-%d").to_string();
-        let tomorrow = (Local::now() + chrono::Duration::days(1))
+        let target_date = next_trading_day(Local::now().date_naive())
             .format("%Y-%m-%d")
             .to_string();
         let direction = if r.gap_pct > 0.0 { "看多" } else { "看空" };
@@ -176,7 +231,7 @@ pub fn run_auction_agent(
         let db_result = DatabaseManager::try_get().map(|db| {
             db.save_prediction(
                 &today,
-                &tomorrow,
+                &target_date,
                 Some("auction"), // theme_name
                 Some(&r.code),   // stock_code
                 direction,
@@ -212,17 +267,21 @@ pub fn run_auction_agent(
 
     // 4. 样本 < 阈值检查 (Q4=C, 警告而非阻断)
     // review #14: try_get() 不 panic, None 路径走 DB 未初始化分支
-    let total = report.written as usize;
+    let total = report.written;
     if total > 0 {
         let sample_check = DatabaseManager::try_get().map(|db| {
             let reason_count = db
                 .count_predictions_by_reason("AuctionAnomaly")
-                .unwrap_or(0) as usize;
-            let total_pred = db.count_predictions().unwrap_or(0) as usize;
-            (reason_count, total_pred)
+                .map_err(|error| format!("统计 AuctionAnomaly 样本失败: {error}"))?
+                as usize;
+            let total_pred = db
+                .count_predictions()
+                .map_err(|error| format!("统计 prediction_tracker 总样本失败: {error}"))?
+                as usize;
+            Ok::<_, String>((reason_count, total_pred))
         });
         match sample_check {
-            Some((reason_count, total_pred)) => {
+            Some(Ok((reason_count, total_pred))) => {
                 if !is_sample_sufficient(reason_count, total_pred) {
                     report.sample_warnings += 1;
                     warn!(
@@ -233,7 +292,12 @@ pub fn run_auction_agent(
                     );
                 }
             }
+            Some(Err(error)) => {
+                report.errors += 1;
+                warn!("[AuctionAgent] {}", error);
+            }
             None => {
+                report.errors += 1;
                 warn!("[AuctionAgent] DB 未初始化, 跳过样本检查");
             }
         }
@@ -274,10 +338,10 @@ mod tests {
 
     #[test]
     fn test_run_auction_agent_filters_normal() {
-        // 时段外 (16:45 不在 09:15-09:25), cfg.force = false → 时段检查拦截
+        // 显式注入时段外状态，避免测试结果依赖真实墙钟。
         let results = vec![
-            make_result("000001", 5.0, 6.0, false), // 异常
-            make_result("000002", 1.0, 2.0, false), // 正常
+            make_result("TEST_CODE_000001", 5.0, 6.0, false), // 异常
+            make_result("TEST_CODE_000002", 1.0, 2.0, false), // 正常
         ];
         let cfg = AuctionAgentConfig {
             gap_pct_threshold: 3.0,
@@ -285,7 +349,7 @@ mod tests {
             dry_run: false,
             force: false,
         };
-        let report = run_auction_agent(&results, &cfg);
+        let report = run_auction_agent_for_session(&results, &cfg, false);
         assert_eq!(report.scanned, 2);
         assert_eq!(report.abnormal, 0);
         assert_eq!(report.written, 0);
@@ -295,9 +359,9 @@ mod tests {
     fn test_run_auction_agent_force_mode_filters_correctly() {
         // cfg.force = true 强制跑 (绕时段检查) + dry_run=true 不写 DB
         let results = vec![
-            make_result("000001", 5.0, 6.0, false), // 异常 (高开 + 量比足)
-            make_result("000002", 1.0, 2.0, false), // 正常
-            make_result("000003", -5.0, 6.0, false), // 异常 (低开 + 量比足)
+            make_result("TEST_CODE_000001", 5.0, 6.0, false), // 异常 (高开 + 量比足)
+            make_result("TEST_CODE_000002", 1.0, 2.0, false), // 正常
+            make_result("TEST_CODE_000003", -5.0, 6.0, false), // 异常 (低开 + 量比足)
         ];
         let cfg = AuctionAgentConfig {
             gap_pct_threshold: 3.0,
@@ -333,5 +397,54 @@ mod tests {
         assert_eq!(report.scanned, 0);
         assert_eq!(report.abnormal, 0);
         assert_eq!(report.written, 0);
+    }
+
+    #[test]
+    fn test_suspected_fake_snapshot_is_rejected_before_prediction() {
+        let results = vec![make_result("TEST_CODE_000001", 5.0, 6.0, true)];
+        let cfg = AuctionAgentConfig {
+            dry_run: true,
+            force: true,
+            ..Default::default()
+        };
+        let report = run_auction_agent(&results, &cfg);
+        assert_eq!(report.written, 0);
+        assert_eq!(report.errors, 1);
+        assert!(report.records[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("虚假申报")));
+    }
+
+    #[test]
+    fn test_invalid_snapshot_value_is_rejected() {
+        let results = vec![make_result("TEST_CODE_000001", f64::NAN, 6.0, false)];
+        let cfg = AuctionAgentConfig {
+            dry_run: true,
+            force: true,
+            ..Default::default()
+        };
+        let report = run_auction_agent(&results, &cfg);
+        assert_eq!(report.written, 0);
+        assert_eq!(report.errors, 1);
+        assert!(report.records[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("涨跌幅无效")));
+    }
+
+    #[test]
+    fn test_invalid_threshold_rejects_whole_batch() {
+        let results = vec![make_result("TEST_CODE_000001", 5.0, 6.0, false)];
+        let cfg = AuctionAgentConfig {
+            gap_pct_threshold: 25.0,
+            dry_run: true,
+            force: true,
+            ..Default::default()
+        };
+        let report = run_auction_agent(&results, &cfg);
+        assert_eq!(report.written, 0);
+        assert_eq!(report.errors, 1);
+        assert!(report.records.is_empty());
     }
 }

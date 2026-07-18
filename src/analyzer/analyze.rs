@@ -1,3 +1,4 @@
+//! Registered business rules: BR-060.
 //! 单股分析入口（从 analyzer.rs 拆分）。
 //!
 //! 仅保留 `analyze_stock` / `analyze_stock_with_extras` 两个对外方法。
@@ -21,6 +22,10 @@ impl GeminiAnalyzer {
 
     /// 扩展版：允许调用方注入真实口径的资金流 / 分时 / 龙虎榜席位等额外 prompt 片段。
     /// 当 `tech_assessment` 提供时，AI 必须按系统评分规则解释同一份评分（同一把尺子，不同表述）。
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "stable prompt-enrichment boundary; optional evidence channels remain explicit"
+    )]
     pub async fn analyze_stock_with_extras(
         &self,
         code: &str,
@@ -664,7 +669,7 @@ impl GeminiAnalyzer {
                         .iter()
                         .map(|(k, v)| (k.clone(), *v))
                         .collect();
-                    parts.sort_by(|a, b| b.1.cmp(&a.1));
+                    parts.sort_by_key(|part| std::cmp::Reverse(part.1));
                     let dist_str: Vec<String> =
                         parts.iter().map(|(k, v)| format!("{} {}", k, v)).collect();
                     let bull = cs.bullish_ratio().unwrap_or(0.0);

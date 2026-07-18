@@ -1,3 +1,4 @@
+//! Registered business rules: BR-058.
 //! v11-P0-4 commit B: 持仓决策台 — 裁决层
 //!
 //! ## 背景
@@ -196,7 +197,7 @@ mod tests {
 
     fn default_inputs() -> DecisionInputs {
         DecisionInputs {
-            code: "000001".to_string(),
+            code: "TEST_CODE_000001".to_string(),
             name: "test".to_string(),
             current_price: 10.0,
             change_pct: 0.0,
@@ -225,7 +226,7 @@ mod tests {
     fn layer1_hard_stop_reduce_now() {
         let mut inputs = default_inputs();
         inputs.stop_signals.push(StopSignal {
-            code: "000001".to_string(),
+            code: "TEST_CODE_000001".to_string(),
             name: "test".to_string(),
             level: StopLevel::Hard,
             current_price: 10.0,
@@ -242,7 +243,7 @@ mod tests {
     fn layer1_limit_violation_reduce_now() {
         let mut inputs = default_inputs();
         inputs.limit_violations.push(LimitViolation {
-            code: "000001".to_string(),
+            code: "TEST_CODE_000001".to_string(),
             name: "test".to_string(),
             rule: "单票仓位上限".to_string(),
             current: "15.0%".to_string(),
@@ -258,7 +259,7 @@ mod tests {
     fn layer2_tech_stop_reduce() {
         let mut inputs = default_inputs();
         inputs.stop_signals.push(StopSignal {
-            code: "000001".to_string(),
+            code: "TEST_CODE_000001".to_string(),
             name: "test".to_string(),
             level: StopLevel::Technical,
             current_price: 10.0,
@@ -305,7 +306,7 @@ mod tests {
     fn layer1_overrides_layer5() {
         let mut inputs = default_inputs();
         inputs.stop_signals.push(StopSignal {
-            code: "000001".to_string(),
+            code: "TEST_CODE_000001".to_string(),
             name: "test".to_string(),
             level: StopLevel::Hard,
             current_price: 10.0,
@@ -341,7 +342,7 @@ mod tests {
     fn priority_layer1_beats_layer2() {
         let mut inputs = default_inputs();
         inputs.stop_signals.push(StopSignal {
-            code: "000001".to_string(),
+            code: "TEST_CODE_000001".to_string(),
             name: "test".to_string(),
             level: StopLevel::Technical, // 层2
             current_price: 10.0,
@@ -349,7 +350,7 @@ mod tests {
             reason: "技术".to_string(),
         });
         inputs.limit_violations.push(LimitViolation {
-            code: "000001".to_string(),
+            code: "TEST_CODE_000001".to_string(),
             name: "test".to_string(),
             rule: "单票仓位上限".to_string(),
             current: "15%".to_string(),
@@ -564,8 +565,10 @@ pub fn decisions_from_llm(
             action,
             priority,
             reasons,
-        )
-        .with_stop_loss(p.hard_stop);
+        );
+        if let Some(hard_stop) = p.hard_stop {
+            d = d.with_stop_loss(hard_stop);
+        }
         if !ai_summary.is_empty() {
             d = d.with_ai_summary(ai_summary);
         }
@@ -596,7 +599,7 @@ mod tests_llm_parse {
             name: name.to_string(),
             shares: 1000,
             cost_price: 10.0,
-            hard_stop: 9.0,
+            hard_stop: Some(9.0),
             added_at: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
             status: crate::portfolio::PositionStatus::Holding,
             sector: "测试".to_string(),
@@ -607,10 +610,10 @@ mod tests_llm_parse {
     /// 强烈卖出 → ReduceNow (P0)
     #[test]
     fn llm_advice_strong_sell() {
-        let holdings = vec![make_position("000001", "测试")];
+        let holdings = vec![make_position("TEST_CODE_000001", "测试")];
         let mut by_code = HashMap::new();
         by_code.insert(
-            "000001".to_string(),
+            "TEST_CODE_000001".to_string(),
             ("测试".to_string(), Some(make_md("强烈卖出", Some(20.0)))),
         );
         let quote_map: HashMap<String, (f64, f64)> = HashMap::new();
@@ -623,10 +626,10 @@ mod tests_llm_parse {
     /// 减持 → Reduce (P1)
     #[test]
     fn llm_advice_reduce() {
-        let holdings = vec![make_position("000001", "测试")];
+        let holdings = vec![make_position("TEST_CODE_000001", "测试")];
         let mut by_code = HashMap::new();
         by_code.insert(
-            "000001".to_string(),
+            "TEST_CODE_000001".to_string(),
             ("测试".to_string(), Some(make_md("减持观望", Some(48.0)))),
         );
         let quote_map: HashMap<String, (f64, f64)> = HashMap::new();
@@ -638,10 +641,10 @@ mod tests_llm_parse {
     /// 观望 → Hold (P2)
     #[test]
     fn llm_advice_hold() {
-        let holdings = vec![make_position("000001", "测试")];
+        let holdings = vec![make_position("TEST_CODE_000001", "测试")];
         let mut by_code = HashMap::new();
         by_code.insert(
-            "000001".to_string(),
+            "TEST_CODE_000001".to_string(),
             ("测试".to_string(), Some(make_md("观望", Some(50.0)))),
         );
         let quote_map: std::collections::HashMap<String, (f64, f64)> =
@@ -654,10 +657,10 @@ mod tests_llm_parse {
     /// 增持 → WatchAdd (P2)
     #[test]
     fn llm_advice_add() {
-        let holdings = vec![make_position("000001", "测试")];
+        let holdings = vec![make_position("TEST_CODE_000001", "测试")];
         let mut by_code = HashMap::new();
         by_code.insert(
-            "000001".to_string(),
+            "TEST_CODE_000001".to_string(),
             ("测试".to_string(), Some(make_md("加仓", Some(80.0)))),
         );
         let quote_map: std::collections::HashMap<String, (f64, f64)> =
@@ -670,7 +673,7 @@ mod tests_llm_parse {
     /// LLM 失败/数据缺失 → Hold (P2) 兜底, 明确标注"无可靠信号"
     #[test]
     fn llm_missing_fallback_hold() {
-        let holdings = vec![make_position("000001", "测试")];
+        let holdings = vec![make_position("TEST_CODE_000001", "测试")];
         let by_code: HashMap<String, (String, Option<String>)> = HashMap::new(); // 缺失
         let quote_map: std::collections::HashMap<String, (f64, f64)> =
             std::collections::HashMap::new();
@@ -795,10 +798,10 @@ mod tests_llm_parse {
 "#;
         let mut by_code = HashMap::new();
         by_code.insert(
-            "002208".to_string(),
+            "TEST_CODE_002208".to_string(),
             ("合肥城建".to_string(), Some(llm_md.to_string())),
         );
-        let holdings = vec![make_position("002208", "合肥城建")];
+        let holdings = vec![make_position("TEST_CODE_002208", "合肥城建")];
         let quote_map: std::collections::HashMap<String, (f64, f64)> =
             std::collections::HashMap::new();
         let decisions = decisions_from_llm(&holdings, &by_code, &quote_map);
@@ -830,10 +833,10 @@ mod tests_llm_parse {
 "#;
         let mut by_code = HashMap::new();
         by_code.insert(
-            "002131".to_string(),
+            "TEST_CODE_002131".to_string(),
             ("利欧股份".to_string(), Some(llm_md.to_string())),
         );
-        let holdings = vec![make_position("002131", "利欧股份")];
+        let holdings = vec![make_position("TEST_CODE_002131", "利欧股份")];
         let quote_map: std::collections::HashMap<String, (f64, f64)> =
             std::collections::HashMap::new();
         let decisions = decisions_from_llm(&holdings, &by_code, &quote_map);

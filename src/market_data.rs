@@ -20,19 +20,19 @@ pub struct MarketIndex {
     /// 涨跌幅(%)
     pub change_pct: f64,
     /// 开盘点位
-    pub open: f64,
+    pub open: Option<f64>,
     /// 最高点位
-    pub high: f64,
+    pub high: Option<f64>,
     /// 最低点位
-    pub low: f64,
+    pub low: Option<f64>,
     /// 昨收点位
     pub prev_close: f64,
     /// 成交量（手）
-    pub volume: f64,
+    pub volume: Option<f64>,
     /// 成交额（元）
-    pub amount: f64,
+    pub amount: Option<f64>,
     /// 振幅(%)
-    pub amplitude: f64,
+    pub amplitude: Option<f64>,
 }
 
 impl MarketIndex {
@@ -44,13 +44,13 @@ impl MarketIndex {
             current: 0.0,
             change: 0.0,
             change_pct: 0.0,
-            open: 0.0,
-            high: 0.0,
-            low: 0.0,
+            open: None,
+            high: None,
+            low: None,
             prev_close: 0.0,
-            volume: 0.0,
-            amount: 0.0,
-            amplitude: 0.0,
+            volume: None,
+            amount: None,
+            amplitude: None,
         }
     }
 
@@ -62,20 +62,35 @@ impl MarketIndex {
         map.insert("current".to_string(), self.current.to_string());
         map.insert("change".to_string(), self.change.to_string());
         map.insert("change_pct".to_string(), self.change_pct.to_string());
-        map.insert("open".to_string(), self.open.to_string());
-        map.insert("high".to_string(), self.high.to_string());
-        map.insert("low".to_string(), self.low.to_string());
-        map.insert("volume".to_string(), self.volume.to_string());
-        map.insert("amount".to_string(), self.amount.to_string());
-        map.insert("amplitude".to_string(), self.amplitude.to_string());
+        if let Some(value) = self.open {
+            map.insert("open".to_string(), value.to_string());
+        }
+        if let Some(value) = self.high {
+            map.insert("high".to_string(), value.to_string());
+        }
+        if let Some(value) = self.low {
+            map.insert("low".to_string(), value.to_string());
+        }
+        if let Some(value) = self.volume {
+            map.insert("volume".to_string(), value.to_string());
+        }
+        if let Some(value) = self.amount {
+            map.insert("amount".to_string(), value.to_string());
+        }
+        if let Some(value) = self.amplitude {
+            map.insert("amplitude".to_string(), value.to_string());
+        }
         map
     }
 
     /// 计算振幅
     pub fn calculate_amplitude(&mut self) {
-        if self.prev_close > 0.0 {
-            self.amplitude = (self.high - self.low) / self.prev_close * 100.0;
-        }
+        self.amplitude = match (self.high, self.low) {
+            (Some(high), Some(low)) if self.prev_close > 0.0 => {
+                Some((high - low) / self.prev_close * 100.0)
+            }
+            _ => None,
+        };
     }
 }
 
@@ -134,10 +149,10 @@ pub struct TopStock {
     pub price: f64,
     /// 量比（f10，>1表示放量）
     #[serde(default)]
-    pub volume_ratio: f64,
+    pub volume_ratio: Option<f64>,
     /// 主力净流入 亿元（f62）
     #[serde(default)]
-    pub main_net_yi: f64,
+    pub main_net_yi: Option<f64>,
 }
 
 impl Default for TopStock {
@@ -147,8 +162,8 @@ impl Default for TopStock {
             name: String::new(),
             change_pct: 0.0,
             price: 0.0,
-            volume_ratio: 0.0,
-            main_net_yi: 0.0,
+            volume_ratio: None,
+            main_net_yi: None,
         }
     }
 }
@@ -204,12 +219,12 @@ mod tests {
     fn test_market_index_amplitude() {
         let mut index = MarketIndex::new("sh000001".to_string(), "上证指数".to_string());
         index.prev_close = 3000.0;
-        index.high = 3050.0;
-        index.low = 2980.0;
+        index.high = Some(3050.0);
+        index.low = Some(2980.0);
         index.calculate_amplitude();
 
         // 振幅 = (3050 - 2980) / 3000 * 100 = 2.33%
-        assert!((index.amplitude - 2.33).abs() < 0.01);
+        assert!((index.amplitude.expect("应可计算振幅") - 2.33).abs() < 0.01);
     }
 
     #[test]

@@ -25,6 +25,22 @@ static RE_EMPTY_LINES_IN_BLOCKS: Lazy<Regex> =
 static RE_EMPTY_LINES_AFTER_BLOCKS: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\n+(</(?:table|thead|tbody|tr|ul)>)").unwrap());
 
+fn feishu_business_accepted(body: &serde_json::Value) -> Result<bool> {
+    let field = if body.get("code").is_some() {
+        "code"
+    } else if body.get("StatusCode").is_some() {
+        "StatusCode"
+    } else {
+        return Err(anyhow::anyhow!(
+            "飞书响应缺少 code/StatusCode，不能确认投递成功: {body}"
+        ));
+    };
+    body.get(field)
+        .and_then(serde_json::Value::as_i64)
+        .map(|code| code == 0)
+        .ok_or_else(|| anyhow::anyhow!("飞书响应 {field} 不是整数: {body}"))
+}
+
 impl NotificationService {
     /// 发送到飞书
     pub async fn send_to_feishu(&self, content: &str) -> Result<bool> {
@@ -37,7 +53,7 @@ impl NotificationService {
         let formatted = self.format_feishu_markdown(content);
         let max_bytes = self.config.feishu_max_bytes;
 
-        if formatted.as_bytes().len() > max_bytes {
+        if formatted.len() > max_bytes {
             info!("飞书消息内容超长，将分批发送");
             return self.send_feishu_chunked(url, &formatted, max_bytes).await;
         }
@@ -71,13 +87,7 @@ impl NotificationService {
 
         if response.status().is_success() {
             let result: serde_json::Value = response.json().await?;
-            let code = result
-                .get("code")
-                .or_else(|| result.get("StatusCode"))
-                .and_then(|v| v.as_i64())
-                .unwrap_or(-1);
-
-            if code == 0 {
+            if feishu_business_accepted(&result)? {
                 info!("飞书消息发送成功");
                 return Ok(true);
             }
@@ -92,7 +102,9 @@ impl NotificationService {
         });
 
         let response = self.client.post(url).json(&text_payload).send().await?;
-        Ok(response.status().is_success())
+        let status = response.status();
+        let body: serde_json::Value = response.json().await?;
+        Ok(status.is_success() && feishu_business_accepted(&body)?)
     }
 
     pub(super) async fn send_feishu_chunked(
@@ -128,8 +140,6 @@ impl NotificationService {
     }
 
     pub(super) fn format_feishu_markdown(&self, content: &str) -> String {
-        
-
         let mut result = content.to_string();
 
         // 标题转加粗
@@ -403,11 +413,6 @@ impl NotificationService {
         enhanced = enhanced.replace("🔴", "<span style='color: #e74c3c;'>🔴</span>");
         enhanced = enhanced.replace("🟢", "<span style='color: #27ae60;'>●</span>");
         enhanced = enhanced.replace("🟡", "<span style='color: #f39c12;'>●</span>");
-        enhanced = enhanced.replace("📊", "📊");
-        enhanced = enhanced.replace("📈", "📈");
-        enhanced = enhanced.replace("💰", "💰");
-        enhanced = enhanced.replace("🎯", "🎯");
-
         // 处理评估标签的颜色
         if enhanced.contains("合理") || enhanced.contains("正常") || enhanced.contains("低估")
         {
@@ -422,5 +427,19 @@ impl NotificationService {
         }
 
         enhanced
+    }
+}
+
+#[cfg(test)]
+mod delivery_contract_tests {
+    use super::*;
+
+    #[test]
+    fn br111_feishu_requires_explicit_integer_success_code() {
+        assert!(feishu_business_accepted(&json!({"code": 0})).unwrap());
+        assert!(feishu_business_accepted(&json!({"StatusCode": 0})).unwrap());
+        assert!(!feishu_business_accepted(&json!({"code": 19001})).unwrap());
+        assert!(feishu_business_accepted(&json!({})).is_err());
+        assert!(feishu_business_accepted(&json!({"code": "0"})).is_err());
     }
 }

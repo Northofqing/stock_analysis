@@ -6,10 +6,9 @@
 
 use std::path::{Path, PathBuf};
 
-use serde_json::Value;
 use thiserror::Error;
 use tokio::fs::{self, OpenOptions};
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
@@ -71,7 +70,8 @@ impl JsonlWriter {
     /// Never removes the current day's file. Files are identified by the
     /// `YYYY-MM-DD` prefix in the filename.
     pub async fn cleanup_expired(base_dir: &Path, retention_days: u32) -> Result<(), JsonlError> {
-        let cutoff = chrono::Local::now().date_naive() - chrono::Duration::days(retention_days as i64);
+        let cutoff =
+            chrono::Local::now().date_naive() - chrono::Duration::days(retention_days as i64);
         let mut entries = fs::read_dir(base_dir).await?;
         let mut to_delete = Vec::new();
 
@@ -100,6 +100,10 @@ impl JsonlWriter {
     }
 
     async fn run(&self, mut rx: broadcast::Receiver<EventEnvelope>) -> Result<(), JsonlError> {
+        fs::create_dir_all(&self.base_dir).await?;
+        if let Err(error) = Self::cleanup_expired(&self.base_dir, self.retention_days).await {
+            log::warn!("[jsonl_writer] retention cleanup failed: {}", error);
+        }
         loop {
             match rx.recv().await {
                 Ok(env) => {
@@ -152,7 +156,8 @@ impl JsonlWriter {
 mod tests {
     use super::*;
     use crate::event::bus::EventBus;
-    use crate::event::envelope::{DomainEvent, EventEnvelope, PushDeliveryEvent};
+    use crate::event::envelope::{EventEnvelope, PushDeliveryEvent};
+    use serde_json::Value;
     use std::sync::Arc;
 
     // ---------------------------------------------------------------------------
@@ -160,11 +165,7 @@ mod tests {
     // ---------------------------------------------------------------------------
 
     fn test_dir(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "jsonl-writer-test-{}-{}",
-            name,
-            std::process::id()
-        ))
+        std::env::temp_dir().join(format!("jsonl-writer-test-{}-{}", name, std::process::id()))
     }
 
     fn today_string() -> String {
@@ -181,7 +182,7 @@ mod tests {
         EventEnvelope::from_event(
             &PushDeliveryEvent::new(
                 "announcement_v1".into(),
-                Some("600519".into()),
+                Some("TEST_CODE_600519".into()),
                 "Pushed".into(),
                 "dry_run".into(),
                 12,
@@ -287,8 +288,16 @@ mod tests {
         let _ = handle.await;
 
         let text = read_today_text(&dir).await;
-        assert!(text.contains("\"id\":\"live\""), "file should contain 'live' id: {:?}", text);
-        assert!(!text.contains("\"id\":\"replay\""), "file should NOT contain 'replay' id: {:?}", text);
+        assert!(
+            text.contains("\"id\":\"live\""),
+            "file should contain 'live' id: {:?}",
+            text
+        );
+        assert!(
+            !text.contains("\"id\":\"replay\""),
+            "file should NOT contain 'replay' id: {:?}",
+            text
+        );
 
         // Cleanup
         let _ = tokio::fs::remove_dir_all(&dir).await;

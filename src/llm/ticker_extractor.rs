@@ -103,7 +103,7 @@ pub async fn extract_tickers(
         }
     }
     let mut cleaned: Vec<TickerHit> = by_code.into_values().collect();
-    cleaned.sort_by(|a, b| b.importance.cmp(&a.importance));
+    cleaned.sort_by_key(|item| std::cmp::Reverse(item.importance));
 
     Ok(cleaned)
 }

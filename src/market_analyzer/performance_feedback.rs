@@ -72,15 +72,15 @@ pub fn evaluate(rows: &[ExecutionRow], date: &str) -> FeedbackReport {
 
     let t1_hits = rows
         .iter()
-        .filter(|r| r.actual_change_t1.map_or(false, |v| v > 0.0))
+        .filter(|r| r.actual_change_t1.is_some_and(|v| v > 0.0))
         .count();
     let t3_hits = rows
         .iter()
-        .filter(|r| r.actual_change_t3.map_or(false, |v| v > 0.0))
+        .filter(|r| r.actual_change_t3.is_some_and(|v| v > 0.0))
         .count();
     let t5_hits = rows
         .iter()
-        .filter(|r| r.actual_change_t5.map_or(false, |v| v > 0.0))
+        .filter(|r| r.actual_change_t5.is_some_and(|v| v > 0.0))
         .count();
     let t1_total = rows.iter().filter(|r| r.actual_change_t1.is_some()).count();
     let t3_total = rows.iter().filter(|r| r.actual_change_t3.is_some()).count();
@@ -233,7 +233,7 @@ mod tests {
         let r = evaluate(&rows, "2026-07-05");
         assert!(r.mfe_mae.capture_ratio < 0.5);
         // 应有 ≥1 个建议 (胜率低 + 捕获率低)
-        assert!(r.suggestions.len() >= 1);
+        assert!(!r.suggestions.is_empty());
     }
 
     #[test]

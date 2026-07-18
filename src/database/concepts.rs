@@ -1,3 +1,4 @@
+//! Registered business rules: BR-068.
 //! 股票概念板块标签缓存。
 //!
 //! 概念标签（东财 F10 核心题材）变化缓慢，落库缓存避免每日重复请求。
@@ -93,117 +94,158 @@ pub struct EventSeenRow {
 impl DatabaseManager {
     /// 读取未过期的概念标签缓存（concepts 为 JSON 数组字符串）。
     ///
-    /// 返回 `code -> 概念列表` 映射；任何错误均降级为空映射（缓存失效不阻断主流程）。
-    pub fn get_cached_concepts(&self, max_age_days: i64) -> HashMap<String, Vec<String>> {
+    /// 返回 `code -> 概念列表` 映射；数据库或坏缓存行使整批失败。
+    pub fn get_cached_concepts(
+        &self,
+        max_age_days: i64,
+    ) -> Result<HashMap<String, Vec<String>>, String> {
+        if max_age_days <= 0 {
+            return Err(format!("概念缓存 max_age_days 非法: {max_age_days}"));
+        }
         let mut map = HashMap::new();
         let cutoff = (Local::now() - Duration::days(max_age_days))
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
 
-        let mut conn = match self.get_conn() {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("[概念缓存] 获取数据库连接失败: {}", e);
-                return map;
-            }
-        };
+        let mut conn = self
+            .get_conn()
+            .map_err(|error| format!("概念缓存获取数据库连接失败: {error}"))?;
 
-        let rows: Vec<ConceptRow> = match diesel::sql_query(
-            "SELECT code, concepts FROM stock_concepts WHERE updated_at >= ?",
-        )
-        .bind::<Text, _>(&cutoff)
-        .load(&mut conn)
-        {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("[概念缓存] 查询失败: {}", e);
-                return map;
-            }
-        };
+        let rows: Vec<ConceptRow> =
+            diesel::sql_query("SELECT code, concepts FROM stock_concepts WHERE updated_at >= ?")
+                .bind::<Text, _>(&cutoff)
+                .load(&mut conn)
+                .map_err(|error| format!("概念缓存查询失败: {error}"))?;
 
         for row in rows {
-            if let Ok(list) = serde_json::from_str::<Vec<String>>(&row.concepts) {
-                map.insert(row.code, list);
+            if row.code.trim().is_empty() {
+                return Err("概念缓存存在空 code".to_string());
             }
+            let list = serde_json::from_str::<Vec<String>>(&row.concepts)
+                .map_err(|error| format!("概念缓存 {} JSON 非法: {error}", row.code))?;
+            if list.is_empty() || list.iter().any(|concept| concept.trim().is_empty()) {
+                return Err(format!("概念缓存 {} 含空概念列表/字段", row.code));
+            }
+            map.insert(row.code, list);
         }
-        map
+        Ok(map)
     }
 
     /// 写入/覆盖某只股票的概念标签缓存。
-    pub fn save_stock_concepts(&self, code: &str, concepts: &[String]) {
-        let json = match serde_json::to_string(concepts) {
-            Ok(j) => j,
-            Err(_) => return,
-        };
+    pub fn save_stock_concepts(&self, code: &str, concepts: &[String]) -> Result<(), String> {
+        if code.trim().is_empty()
+            || concepts.is_empty()
+            || concepts.iter().any(|concept| concept.trim().is_empty())
+        {
+            return Err(format!("概念缓存写入参数非法: code={code:?}"));
+        }
+        let json = serde_json::to_string(concepts)
+            .map_err(|error| format!("序列化 {code} 概念失败: {error}"))?;
         let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
-        let mut conn = match self.get_conn() {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("[概念缓存] 获取数据库连接失败: {}", e);
-                return;
-            }
-        };
+        let mut conn = self
+            .get_conn()
+            .map_err(|error| format!("概念缓存写入获取数据库连接失败: {error}"))?;
 
-        if let Err(e) = diesel::sql_query(
+        diesel::sql_query(
             "INSERT OR REPLACE INTO stock_concepts (code, concepts, updated_at) VALUES (?, ?, ?)",
         )
         .bind::<Text, _>(code)
         .bind::<Text, _>(&json)
         .bind::<Text, _>(&now)
         .execute(&mut conn)
-        {
-            warn!("[概念缓存] 写入 {} 失败: {}", code, e);
-        }
+        .map_err(|error| format!("概念缓存写入 {code} 失败: {error}"))?;
+        Ok(())
     }
 
     /// 保存某日的主线簇结果（覆盖同日同概念）。
-    pub fn save_chain_clusters(&self, date: &str, clusters: &[(String, Vec<String>, i32)]) {
-        let mut conn = match self.get_conn() {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("[主线落库] 获取连接失败: {}", e);
-                return;
-            }
-        };
+    pub fn save_chain_clusters(
+        &self,
+        date: &str,
+        clusters: &[(String, Vec<String>, i32)],
+    ) -> Result<(), String> {
+        chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+            .map_err(|error| format!("主线落库日期非法: {error}"))?;
+        let mut encoded = Vec::with_capacity(clusters.len());
         for (concept, codes, cont) in clusters {
-            let json = match serde_json::to_string(codes) {
-                Ok(j) => j,
-                Err(_) => continue,
-            };
-            if let Err(e) = diesel::sql_query(
+            if concept.trim().is_empty()
+                || codes.is_empty()
+                || codes.iter().any(|code| code.trim().is_empty())
+                || *cont < 0
+            {
+                return Err(format!("主线落库行非法: concept={concept:?} cont={cont}"));
+            }
+            let json = serde_json::to_string(codes)
+                .map_err(|error| format!("序列化主线 {concept} 失败: {error}"))?;
+            encoded.push((concept, json, *cont));
+        }
+        let mut conn = self
+            .get_conn()
+            .map_err(|error| format!("主线落库获取连接失败: {error}"))?;
+        conn.transaction::<_, diesel::result::Error, _>(|tx| {
+            for (concept, json, cont) in &encoded {
+                diesel::sql_query(
                 "INSERT OR REPLACE INTO chain_daily (date, concept, stocks, continuation_count) VALUES (?, ?, ?, ?)",
             )
             .bind::<Text, _>(date)
             .bind::<Text, _>(concept)
-            .bind::<Text, _>(&json)
+            .bind::<Text, _>(json)
             .bind::<Integer, _>(*cont)
-            .execute(&mut conn)
-            {
-                warn!("[主线落库] 写入 {} 失败: {}", concept, e);
+            .execute(tx)?;
             }
-        }
+            Ok(())
+        })
+        .map_err(|error| format!("主线批量落库失败: {error}"))
     }
 
     /// 读取最近一个有记录日期的主线簇（含当天）。
     pub fn get_latest_chain_clusters(&self) -> Vec<ChainDailyRow> {
+        match self.get_latest_chain_clusters_strict() {
+            Ok(rows) => rows,
+            Err(error) => {
+                warn!("[主线读取] {}", error);
+                Vec::new()
+            }
+        }
+    }
+
+    /// 读取最近一个有记录日期的主线簇，并向严格数据链路传递失败。
+    ///
+    /// 新的推送/决策路径必须调用此方法，避免把数据库失败伪装成“没有主线”。
+    pub fn get_latest_chain_clusters_strict(&self) -> Result<Vec<ChainDailyRow>, String> {
         let mut conn = match self.get_conn() {
-            Ok(c) => c,
-            Err(_) => return Vec::new(),
+            Ok(connection) => connection,
+            Err(error) => return Err(format!("获取 chain_daily 数据库连接失败: {error}")),
         };
         diesel::sql_query(
             "SELECT date, concept, stocks, continuation_count FROM chain_daily \
              WHERE date = (SELECT MAX(date) FROM chain_daily)",
         )
         .load(&mut conn)
-        .unwrap_or_default()
+        .map_err(|error| format!("查询 chain_daily 失败: {error}"))
     }
 
     /// 查某概念主线在最近 N 天内出现的天数（生命周期参考）。
     pub fn get_chain_streak_days(&self, concept: &str, days: i64) -> i64 {
+        match self.get_chain_streak_days_strict(concept, days) {
+            Ok(days) => days,
+            Err(error) => {
+                warn!("[主线生命周期] {}", error);
+                0
+            }
+        }
+    }
+
+    /// 严格查询某概念主线在最近 N 天内出现的天数。
+    pub fn get_chain_streak_days_strict(&self, concept: &str, days: i64) -> Result<i64, String> {
+        if concept.trim().is_empty() || days <= 0 {
+            return Err(format!(
+                "主线生命周期参数非法: concept={concept:?} days={days}"
+            ));
+        }
         let mut conn = match self.get_conn() {
-            Ok(c) => c,
-            Err(_) => return 0,
+            Ok(connection) => connection,
+            Err(error) => return Err(format!("获取 chain_daily 连接失败: {error}")),
         };
         #[derive(QueryableByName)]
         struct CountRow {
@@ -219,8 +261,10 @@ impl DatabaseManager {
         .bind::<Text, _>(concept)
         .bind::<Text, _>(&cutoff)
         .load(&mut conn)
-        .unwrap_or_default();
-        rows.first().map(|r| r.n).unwrap_or(0)
+        .map_err(|error| format!("查询 chain_daily 主线生命周期失败: {error}"))?;
+        rows.first()
+            .map(|row| row.n)
+            .ok_or_else(|| "chain_daily 主线生命周期聚合结果缺失".to_string())
     }
 
     // ===== B-003 事件抽取去重 (simhash) DAO =====
@@ -229,22 +273,20 @@ impl DatabaseManager {
     /// CR-7 (review): 用 conn.transaction 包裹循环, N 条事件 1 次 fsync 而非 N 次.
     ///                之前: 5min 一次 run_opportunity_scan, 100 条事件 → 100 次 INSERT + 100 次 lock.
     ///                现在: 1 个事务批量提交, 减少 100x fsync.
-    pub fn save_event_seen(&self, entries: &[EventSeenEntry]) {
+    pub fn save_event_seen(&self, entries: &[EventSeenEntry]) -> Result<(), String> {
         if entries.is_empty() {
-            return;
+            return Ok(());
         }
-        let mut conn = match self.get_conn() {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("[EventSeen] 获取连接失败: {}", e);
-                return;
-            }
-        };
+        let mut conn = self
+            .get_conn()
+            .map_err(|error| format!("EventSeen 获取连接失败: {error}"))?;
         let result: Result<(), diesel::result::Error> = conn.transaction(|tx| {
             for entry in entries {
-                // CR-26 (review): u64 → i64 裸 as cast 会在 >i64::MAX 时变负, 改用 try_from
-                // 显式截断为 i64::MAX (防御性, 实际 simhash 64-bit 不应到这么大量级).
-                let simhash_i64 = i64::try_from(entry.simhash).unwrap_or(i64::MAX);
+                let simhash_i64 = i64::try_from(entry.simhash)
+                    .map_err(|_| diesel::result::Error::RollbackTransaction)?;
+                if entry.title.trim().is_empty() {
+                    return Err(diesel::result::Error::RollbackTransaction);
+                }
                 diesel::sql_query(
                     "INSERT OR REPLACE INTO event_seen_simhash (simhash, title) VALUES (?, ?)",
                 )
@@ -254,18 +296,18 @@ impl DatabaseManager {
             }
             Ok(())
         });
-        if let Err(e) = result {
-            warn!("[EventSeen] 批量写入 {} 条失败: {}", entries.len(), e);
-        }
+        result.map_err(|error| format!("EventSeen 批量写入 {} 条失败: {error}", entries.len()))
     }
 
     /// 读取所有近 N 天内的事件去重条目 (供 extract_batch_rules_only_with_seen 跨日去重).
     /// B-003 默认 N=2 (与 max_age 对齐, 不留太久).
-    pub fn get_recent_event_seen(&self, max_age_days: i64) -> Vec<EventSeenEntry> {
-        let mut conn = match self.get_conn() {
-            Ok(c) => c,
-            Err(_) => return Vec::new(),
-        };
+    pub fn get_recent_event_seen(&self, max_age_days: i64) -> Result<Vec<EventSeenEntry>, String> {
+        if max_age_days <= 0 {
+            return Err(format!("EventSeen max_age_days 非法: {max_age_days}"));
+        }
+        let mut conn = self
+            .get_conn()
+            .map_err(|error| format!("EventSeen 获取连接失败: {error}"))?;
         // CR-21 (review): 改用 Utc::now() 与 seen_at CURRENT_TIMESTAMP (UTC) 一致.
         // 之前用 Local::now() 在 TZ 边界 (e.g. Asia/Shanghai UTC+8) 错配, 字符串 lexical 比较
         // 表面上 OK 但语义错位 — Asia/Shanghai 09:00 拉的 cutoff 与 DB UTC 时间错开最多 8h,
@@ -273,55 +315,85 @@ impl DatabaseManager {
         let cutoff = (chrono::Utc::now() - chrono::Duration::days(max_age_days))
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
-        let rows: Vec<EventSeenRow> = match diesel::sql_query(
-            "SELECT simhash, title FROM event_seen_simhash WHERE seen_at >= ?",
-        )
-        .bind::<Text, _>(&cutoff)
-        .load(&mut conn)
-        {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("[EventSeen] 查询失败: {}", e);
-                return Vec::new();
+        let rows: Vec<EventSeenRow> =
+            diesel::sql_query("SELECT simhash, title FROM event_seen_simhash WHERE seen_at >= ?")
+                .bind::<Text, _>(&cutoff)
+                .load(&mut conn)
+                .map_err(|error| format!("EventSeen 查询失败: {error}"))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let simhash = u64::try_from(row.simhash)
+                .map_err(|_| format!("EventSeen simhash 非法: {}", row.simhash))?;
+            if row.title.trim().is_empty() {
+                return Err("EventSeen 存在空 title".to_string());
             }
-        };
-        rows.into_iter()
-            .map(|r| EventSeenEntry {
-                simhash: r.simhash as u64,
-                title: r.title,
-            })
-            .collect()
+            out.push(EventSeenEntry {
+                simhash,
+                title: row.title,
+            });
+        }
+        Ok(out)
     }
 
     /// 清理过期事件去重条目 (cron 入口, 默认保留 7 天).
-    pub fn cleanup_old_event_seen(&self, max_age_days: i64) {
-        let mut conn = match self.get_conn() {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        let cutoff = (Local::now() - Duration::days(max_age_days))
+    pub fn cleanup_old_event_seen(&self, max_age_days: i64) -> Result<usize, String> {
+        if max_age_days <= 0 {
+            return Err(format!(
+                "EventSeen cleanup max_age_days 非法: {max_age_days}"
+            ));
+        }
+        let mut conn = self
+            .get_conn()
+            .map_err(|error| format!("EventSeen cleanup 获取连接失败: {error}"))?;
+        let cutoff = (chrono::Utc::now() - Duration::days(max_age_days))
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
-        let _ = diesel::sql_query("DELETE FROM event_seen_simhash WHERE seen_at < ?")
+        diesel::sql_query("DELETE FROM event_seen_simhash WHERE seen_at < ?")
             .bind::<Text, _>(&cutoff)
-            .execute(&mut conn);
+            .execute(&mut conn)
+            .map_err(|error| format!("EventSeen cleanup 失败: {error}"))
     }
 
     // ===== B-002 板块联动归因 (Board hit) DAO =====
 
     /// 保存某日的板块联动归因条目 (覆盖同日同 board_code).
     /// CR-7 (review): 用 conn.transaction 批量提交, N 条 1 次 fsync.
-    pub fn save_board_rotations(&self, date: &str, entries: &[BoardRotationEntry]) {
+    pub fn save_board_rotations(
+        &self,
+        date: &str,
+        entries: &[BoardRotationEntry],
+    ) -> Result<(), String> {
         if entries.is_empty() {
-            return;
+            return Ok(());
         }
-        let mut conn = match self.get_conn() {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("[BoardRotation] 获取连接失败: {}", e);
-                return;
+        chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+            .map_err(|error| format!("BoardRotation 日期非法: {error}"))?;
+        for entry in entries {
+            if entry.board_code.trim().is_empty()
+                || entry.board_name.trim().is_empty()
+                || entry.news_title.trim().is_empty()
+                || !entry.board_change_pct.is_finite()
+                || !entry.board_main_net_pct.is_finite()
+            {
+                return Err(format!("BoardRotation 行非法: {}", entry.board_code));
             }
-        };
+            let stocks: serde_json::Value =
+                serde_json::from_str(&entry.stocks_json).map_err(|error| {
+                    format!(
+                        "BoardRotation {} stocks JSON 非法: {error}",
+                        entry.board_code
+                    )
+                })?;
+            if !stocks.is_array() {
+                return Err(format!(
+                    "BoardRotation {} stocks 不是数组",
+                    entry.board_code
+                ));
+            }
+        }
+        let mut conn = self
+            .get_conn()
+            .map_err(|error| format!("BoardRotation 获取连接失败: {error}"))?;
         let result: Result<(), diesel::result::Error> = conn.transaction(|tx| {
             for entry in entries {
                 diesel::sql_query(
@@ -340,17 +412,28 @@ impl DatabaseManager {
             }
             Ok(())
         });
-        if let Err(e) = result {
-            warn!("[BoardRotation] 批量写入 {} 条失败: {}", entries.len(), e);
-        }
+        result.map_err(|error| format!("BoardRotation 批量写入 {} 条失败: {error}", entries.len()))
     }
 
     /// 读取最近一天的所有板块联动归因条目 (含今天).
     /// 按 board_change_pct 降序排列 (最强板块在前), 供 NewsCatalyst 选 top cluster.
     pub fn get_latest_board_rotations(&self) -> Vec<BoardRotationRow> {
+        match self.get_latest_board_rotations_strict() {
+            Ok(rows) => rows,
+            Err(error) => {
+                warn!("[BoardRotation] {}", error);
+                Vec::new()
+            }
+        }
+    }
+
+    /// 严格读取最近一天的板块联动归因条目。
+    pub fn get_latest_board_rotations_strict(&self) -> Result<Vec<BoardRotationRow>, String> {
         let mut conn = match self.get_conn() {
-            Ok(c) => c,
-            Err(_) => return Vec::new(),
+            Ok(connection) => connection,
+            Err(error) => {
+                return Err(format!("获取 board_rotation_daily 数据库连接失败: {error}"));
+            }
         };
         let rows: Vec<BoardRotationQueryRow> = diesel::sql_query(
             "SELECT date, board_code, board_name, news_title, board_change_pct, board_main_net_pct, stocks \
@@ -359,8 +442,9 @@ impl DatabaseManager {
              ORDER BY board_change_pct DESC, board_main_net_pct DESC",
         )
         .load(&mut conn)
-        .unwrap_or_default();
-        rows.into_iter()
+        .map_err(|error| format!("查询 board_rotation_daily 失败: {error}"))?;
+        Ok(rows
+            .into_iter()
             .map(|r| BoardRotationRow {
                 date: r.date,
                 board_code: r.board_code,
@@ -370,7 +454,7 @@ impl DatabaseManager {
                 board_main_net_pct: r.board_main_net_pct,
                 stocks_json: r.stocks,
             })
-            .collect()
+            .collect())
     }
 }
 
@@ -404,8 +488,9 @@ mod tests {
                     news_title: "房地产板块短线拉升，合肥城建涨停".to_string(),
                     board_change_pct: 2.5,
                     board_main_net_pct: 1.5,
-                    stocks_json: r#"[{"code":"002208","name":"合肥城建","change_pct":10.0}]"#
-                        .to_string(),
+                    stocks_json:
+                        r#"[{"code":"TEST_CODE_002208","name":"合肥城建","change_pct":10.0}]"#
+                            .to_string(),
                 },
                 BoardRotationEntry {
                     board_code: "B002_BANK".to_string(),
@@ -413,11 +498,13 @@ mod tests {
                     news_title: "银行板块异动拉升".to_string(),
                     board_change_pct: 1.8,
                     board_main_net_pct: 0.8,
-                    stocks_json: r#"[{"code":"600036","name":"招商银行","change_pct":5.5}]"#
-                        .to_string(),
+                    stocks_json:
+                        r#"[{"code":"TEST_CODE_600036","name":"招商银行","change_pct":5.5}]"#
+                            .to_string(),
                 },
             ],
-        );
+        )
+        .unwrap();
 
         let got = db.get_latest_board_rotations();
         let our_rows: Vec<_> = got.iter().filter(|r| r.date == TEST_DATE).collect();
@@ -428,7 +515,7 @@ mod tests {
         assert_eq!(our_rows[0].board_name, "[板块联动] 房地产开发");
         assert_eq!(our_rows[0].board_change_pct, 2.5);
         assert_eq!(our_rows[0].board_main_net_pct, 1.5);
-        assert!(our_rows[0].stocks_json.contains("002208"));
+        assert!(our_rows[0].stocks_json.contains("TEST_CODE_002208"));
         assert!(our_rows[0].news_title.contains("房地产板块短线拉升"));
 
         assert_eq!(our_rows[1].board_code, "B002_BANK");
@@ -444,7 +531,8 @@ mod tests {
                 board_main_net_pct: 3.0,
                 stocks_json: "[]".to_string(),
             }],
-        );
+        )
+        .unwrap();
         let got = db.get_latest_board_rotations();
         let our_rows: Vec<_> = got.iter().filter(|r| r.date == TEST_DATE).collect();
         assert_eq!(our_rows.len(), 2, "覆盖后应仍 2 条");
@@ -469,7 +557,8 @@ mod tests {
                 board_main_net_pct: 99.0,
                 stocks_json: "[]".to_string(),
             }],
-        );
+        )
+        .unwrap();
         let got = db.get_latest_board_rotations();
         // MAX(date) 应是 TEST_DATE (2099-01-01 > 2020-01-01)
         assert!(

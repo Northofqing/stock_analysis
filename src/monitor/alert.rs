@@ -201,6 +201,7 @@ mod tests {
                 threshold: None,
                 news_title: None,
                 news_summary: None,
+                news_importance: None,
                 ai_decision: None,
                 t1_locked: t1,
                 extra: None,
@@ -212,7 +213,12 @@ mod tests {
 
     #[test]
     fn test_format_alert_normal() {
-        let e = make_event(AlertLevel::Important, "000001", "主力出逃 0.5亿", false);
+        let e = make_event(
+            AlertLevel::Important,
+            "TEST_CODE_000001",
+            "主力出逃 0.5亿",
+            false,
+        );
         let text = format_alert(&e);
         assert!(text.contains("测试股"));
         assert!(text.contains("10.50"));
@@ -221,7 +227,7 @@ mod tests {
 
     #[test]
     fn test_format_alert_t1() {
-        let e = make_event(AlertLevel::Emergency, "000001", "跌停", true);
+        let e = make_event(AlertLevel::Emergency, "TEST_CODE_000001", "跌停", true);
         let text = format_alert(&e);
         assert!(text.contains("T+1锁仓"));
     }
@@ -243,7 +249,7 @@ mod tests {
         let e = AlertEvent {
             level: AlertLevel::Important,
             category: AlertCategory::ChainRisk,
-            code: "002421".into(),
+            code: "TEST_CODE_002421".into(),
             name: "达实智能".into(),
             message: "[公告] 达实智能:关于股东股份解除质押的公告 | 标题含'质押'".into(),
             detail: AlertDetail {
@@ -254,6 +260,7 @@ mod tests {
                 threshold: None,
                 news_title: Some("达实智能:关于股东股份解除质押的公告".into()),
                 news_summary: Some("触发原因：标题含'质押'".into()),
+                news_importance: None,
                 ai_decision: None,
                 t1_locked: false,
                 extra: Some("命中: 达实智能(002421)".into()),
@@ -270,7 +277,7 @@ mod tests {
         assert!(text.contains("命中:"));
         // 应有公司名和代码
         assert!(text.contains("达实智能"));
-        assert!(text.contains("002421"));
+        assert!(text.contains("TEST_CODE_002421"));
     }
 
     #[test]
@@ -278,7 +285,7 @@ mod tests {
         let e = AlertEvent {
             level: AlertLevel::Info,
             category: AlertCategory::FlashNews,
-            code: "002421".into(),
+            code: "TEST_CODE_002421".into(),
             name: "达实智能".into(),
             message: "快讯催化".into(),
             detail: AlertDetail {
@@ -289,6 +296,7 @@ mod tests {
                 threshold: None,
                 news_title: Some("低空经济新政发布".into()),
                 news_summary: None,
+                news_importance: Some(4),
                 ai_decision: Some("关注低空产业链龙头".into()),
                 t1_locked: false,
                 extra: None,
@@ -306,8 +314,8 @@ mod tests {
     #[test]
     fn test_aggregate_summary() {
         let events = vec![
-            make_event(AlertLevel::Emergency, "000001", "跌停", true),
-            make_event(AlertLevel::Important, "000002", "主力出逃", false),
+            make_event(AlertLevel::Emergency, "TEST_CODE_000001", "跌停", true),
+            make_event(AlertLevel::Important, "TEST_CODE_000002", "主力出逃", false),
         ];
         let summary = aggregate_alerts(&events).unwrap();
         assert!(summary.contains("紧急：1"));

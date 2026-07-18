@@ -1,5 +1,7 @@
 # Dead PushKinds 归档 (v17.x 清理批)
 
+> **2026-07-17 勘误**：本审计把已登记为 BR-033/BR-034、仍受业务规格约束的大宗交易能力误判为可删除死代码。两项能力已恢复，`DISPATCH_TABLE` 恢复为 15 行；真实事件源未注册或失败时按 BR-087 显式不可用，不再把“零调用者”直接等同为“无业务承诺”。下文保留为当时审计记录。
+
 > 按 v17.7 §2.4 / v17.8 AC90 要求建立的单一事实源。
 > 恢复方式: `git log --all --oneline -- docs/v15.x/dead-pushkinds.md` 找到删除 commit 后 `git revert`。
 > 前置: 每项删除前均通过"逐变体调用链审计"(从 dispatch/push_governor 实参反向追到 main.rs), 单行 grep 不作为证据 (v17.5 §2.2 勘误教训)。

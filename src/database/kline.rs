@@ -74,6 +74,10 @@ impl DatabaseManager {
     /// 保存单条日线数据
     ///
     /// 策略：使用 ON CONFLICT DO UPDATE（单条 SQL 完成 UPSERT）
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "stable database boundary mirrors the stock_daily row schema"
+    )]
     pub fn save_daily_record(
         &self,
         code: &str,
@@ -112,6 +116,10 @@ impl DatabaseManager {
     }
 
     /// 内部 UPSERT 方法，接受已有连接（避免批量操作时重复获取连接）
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "internal UPSERT boundary mirrors the stock_daily row schema"
+    )]
     fn upsert_daily_record(
         conn: &mut DbConnection,
         code: &str,

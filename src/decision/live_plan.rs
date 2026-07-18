@@ -174,7 +174,7 @@ mod tests {
 
     fn input_normal() -> LivePlanInput {
         LivePlanInput {
-            code: "000001".to_string(),
+            code: "TEST_CODE_000001".to_string(),
             name: "测试".to_string(),
             action: ActionKind::Hold,
             account_mode: AccountMode::Normal,
@@ -308,6 +308,6 @@ mod tests {
     #[test]
     fn code_passthrough() {
         let r = evaluate(&input_normal());
-        assert_eq!(r.code(), "000001");
+        assert_eq!(r.code(), "TEST_CODE_000001");
     }
 }

@@ -7,6 +7,12 @@ pub struct Toolbelt {
     tools: HashMap<String, Arc<dyn Tool>>,
 }
 
+impl Default for Toolbelt {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Toolbelt {
     pub fn new() -> Self {
         Self {

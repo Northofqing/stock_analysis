@@ -7,14 +7,14 @@
 //!
 //! 复用现有: 不重建 NewsEvent, 不重建 dedup, 全部依赖 MarketEvent::simhash
 
+pub mod analyst_state;
+pub mod classifier;
 pub mod feed;
 pub mod source_event;
-pub mod classifier;
-pub mod analyst_state;
 
 // Re-export for convenience
-pub use source_event::{NormalizedSourceEvent, NormalizedSourceError, SourcePushKind};
-pub use analyst_state::{AnalystStateStore, AnalystKey, AnalystObservation, ObservationDecision};
+pub use analyst_state::{AnalystKey, AnalystObservation, AnalystStateStore, ObservationDecision};
+pub use source_event::{NormalizedSourceError, NormalizedSourceEvent, SourcePushKind};
 
 use crate::signal::market_event::{EventType, MarketEvent};
 use anyhow::Result;
@@ -93,7 +93,7 @@ impl NewsAggregator {
             }
         });
         // 按时间倒序
-        all_events.sort_by(|a, b| b.occurred_at.cmp(&a.occurred_at));
+        all_events.sort_by_key(|event| std::cmp::Reverse(event.occurred_at));
         all_events
     }
 

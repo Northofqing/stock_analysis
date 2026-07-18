@@ -52,18 +52,16 @@ impl NorthFlowSeries {
 /// dayNetAmtIn 单位是元，要除以 1e8 转 亿元
 #[derive(Deserialize, Debug)]
 struct RawFlow {
-    #[serde(default, rename = "dayNetAmtIn")]
+    #[serde(rename = "dayNetAmtIn")]
     day_net_amt_in: f64,
-    #[serde(default, rename = "date2")]
+    #[serde(rename = "date2")]
     date2: String,
 }
 
 #[derive(Deserialize, Debug)]
 struct RawData {
-    #[serde(default)]
-    hk2sh: Option<RawFlow>,
-    #[serde(default)]
-    hk2sz: Option<RawFlow>,
+    hk2sh: RawFlow,
+    hk2sz: RawFlow,
 }
 
 #[derive(Deserialize, Debug)]
@@ -89,12 +87,8 @@ impl NorthFlowClient {
         let data = resp
             .data
             .ok_or_else(|| "北向资金响应 data 字段为空".to_string())?;
-        let hk2sh = data
-            .hk2sh
-            .ok_or_else(|| "北向资金响应 hk2sh 字段为空".to_string())?;
-        let hk2sz = data
-            .hk2sz
-            .ok_or_else(|| "北向资金响应 hk2sz 字段为空".to_string())?;
+        let hk2sh = data.hk2sh;
+        let hk2sz = data.hk2sz;
 
         // date2 格式 "2026-06-26" 或空（盘中可能为空）
         let date_str = if !hk2sh.date2.is_empty() {

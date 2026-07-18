@@ -250,7 +250,7 @@ impl Default for PipelineConfig {
 pub struct AnalysisPipeline {
     data_manager: Arc<DataFetcherManager>,
     trend_analyzer: Arc<StockTrendAnalyzer>,
-    ai_analyzer: Option<Arc<GeminiAnalyzer>>,
+    ai_analyzer: Option<GeminiAnalyzer>,
     use_news_search: bool, // 是否使用新闻搜索
     notifier: Arc<NotificationService>,
     config: PipelineConfig,
@@ -324,7 +324,7 @@ impl AnalysisPipeline {
         // 初始化AI分析器（如果有配置）
         let ai_analyzer = std::env::var("GEMINI_API_KEY").ok().and_then(|key| {
             if !key.is_empty() {
-                Some(Arc::new(GeminiAnalyzer::from_env()))
+                Some(GeminiAnalyzer::from_env())
             } else {
                 None
             }
@@ -382,7 +382,7 @@ impl AnalysisPipeline {
             info!("[深度研判] 无重点股命中，跳过");
             return;
         }
-        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+        candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.1));
         candidates.truncate(max);
 
         info!(

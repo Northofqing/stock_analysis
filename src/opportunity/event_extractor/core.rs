@@ -14,8 +14,8 @@ struct DeepResponse {
     object: Option<String>,
     strength: u8,
     certainty: u8,
-    #[serde(default)]
-    reason: Option<String>,
+    #[serde(default, rename = "reason")]
+    _reason: Option<String>,
 }
 
 pub struct EventExtractorCore;

@@ -7,65 +7,120 @@ use super::{LedgerEntry, Position, PositionStatus, Trade, TradeDirection};
 
 /// 从 stock_position 表加载持仓
 pub fn load_positions() -> Result<Vec<Position>, String> {
-    let db = crate::database::DatabaseManager::get();
+    load_positions_with_source_time().map(|(positions, _)| positions)
+}
+
+/// 加载持仓及整批最旧的来源更新时间；调用方据此执行 30 秒账户新鲜度门。
+pub fn load_positions_with_source_time(
+) -> Result<(Vec<Position>, Option<chrono::DateTime<chrono::Local>>), String> {
+    let db = crate::database::DatabaseManager::try_get()
+        .ok_or_else(|| "DB 未初始化，无法加载持仓".to_string())?;
     let records = db.get_all_open_positions().map_err(|e| e.to_string())?;
-    Ok(records
+    let oldest_source_time = records
+        .iter()
+        .map(|record| record.updated_at)
+        .min()
+        .map(|time| {
+            chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(time, chrono::Utc)
+                .with_timezone(&chrono::Local)
+        });
+    let positions = records
         .into_iter()
-        .map(|r| {
+        .map(|r| -> Result<Position, String> {
+            crate::risk::env_guard::validate_symbol_for_current_env(&r.code)?;
+            if r.name.trim().is_empty() {
+                return Err(format!("持仓 {} 名称为空", r.code));
+            }
+            if !r.buy_price.is_finite() || r.buy_price <= 0.0 {
+                return Err(format!("持仓 {} buy_price 非法: {}", r.code, r.buy_price));
+            }
+            let shares = u64::try_from(r.quantity)
+                .ok()
+                .filter(|quantity| *quantity > 0 && quantity.is_multiple_of(100))
+                .ok_or_else(|| format!("持仓 {} quantity 非法: {}", r.code, r.quantity))?;
+            let added_at = NaiveDate::parse_from_str(&r.buy_date, "%Y-%m-%d")
+                .map_err(|error| format!("持仓 {} buy_date 非法: {error}", r.code))?;
             // v14.1 F7: 从 stock_position.st_type 列派生 is_st/star_st
             //   "ST" → is_st, "*ST" → star_st, NULL → 都是 false
             let (is_st, star_st) = match r.st_type.as_deref() {
                 Some("ST") => (true, false),
                 Some("*ST") => (false, true),
-                _ => (false, false),
+                None => (false, false),
+                Some(other) => {
+                    return Err(format!("持仓 {} st_type 非法: {other:?}", r.code));
+                }
             };
-            Position {
+            let sector = r.chain_name.unwrap_or_default();
+            if sector.trim().is_empty() {
+                log::warn!("[portfolio] 持仓 {} 产业链缺失，保留空值", r.code);
+            }
+            Ok(Position {
                 code: r.code,
                 name: r.name,
-                shares: r.quantity.max(0) as u64,
+                shares,
                 cost_price: r.buy_price,
-                hard_stop: 0.0,
-                added_at: NaiveDate::parse_from_str(&r.buy_date, "%Y-%m-%d")
-                    .unwrap_or_else(|_| NaiveDate::from_ymd_opt(2025, 1, 1).unwrap()),
+                hard_stop: None,
+                added_at,
                 status: PositionStatus::Holding,
-                sector: r.chain_name.unwrap_or_else(|| "其他".into()),
+                sector,
                 is_st,
                 star_st,
-            }
+            })
         })
-        .collect())
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok((positions, oldest_source_time))
 }
 
 /// 从环境变量加载自选（尝试解析真实名称）
 pub fn load_watchlist() -> Result<Vec<Position>, String> {
-    let list = std::env::var("STOCK_LIST").unwrap_or_default();
-    let name_fetcher = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::data_provider::DataFetcherManager::new().ok()
-    }))
-    .unwrap_or(None);
-    Ok(list
+    let list = match std::env::var("STOCK_LIST") {
+        Ok(list) => list,
+        Err(std::env::VarError::NotPresent) => return Ok(Vec::new()),
+        Err(error) => return Err(format!("STOCK_LIST 不是有效 Unicode: {error}")),
+    };
+    let codes: Vec<&str> = list
         .split(',')
-        .map(|s| s.trim())
-        .filter(|s| s.len() == 6)
-        .map(|code| {
-            let name = name_fetcher
-                .as_ref()
-                .and_then(|f| f.get_stock_name(code))
-                .filter(|n| !n.is_empty())
-                .unwrap_or_else(|| format!("股票{}", code));
-            Position {
-                code: code.to_string(),
-                name,
-                shares: 0,
-                cost_price: 0.0,
-                hard_stop: 0.0,
-                added_at: NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
-                status: PositionStatus::Watching,
-                sector: "其他".into(),
-                ..Default::default()
-            }
-        })
-        .collect())
+        .map(str::trim)
+        .filter(|code| !code.is_empty())
+        .collect();
+    if codes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let name_fetcher = crate::data_provider::DataFetcherManager::new()
+        .map_err(|error| format!("初始化自选名称数据源失败: {error:#}"))?;
+    let today = chrono::Local::now().date_naive();
+    let mut seen = std::collections::HashSet::new();
+    let mut positions = Vec::with_capacity(codes.len());
+    for code in codes {
+        crate::risk::env_guard::validate_symbol_for_current_env(code)?;
+        let valid_shape = if crate::risk::env_guard::is_test_code(code) {
+            code.len() > "TEST_CODE".len()
+        } else {
+            code.len() == 6 && code.bytes().all(|byte| byte.is_ascii_digit())
+        };
+        if !valid_shape {
+            return Err(format!("STOCK_LIST code 非法: {code:?}"));
+        }
+        if !seen.insert(code) {
+            continue;
+        }
+        let name = name_fetcher
+            .get_stock_name(code)
+            .filter(|name| !name.trim().is_empty())
+            .ok_or_else(|| format!("自选 {code} 缺少真实名称证据"))?;
+        positions.push(Position {
+            code: code.to_string(),
+            name,
+            shares: 0,
+            cost_price: 0.0,
+            hard_stop: None,
+            added_at: today,
+            status: PositionStatus::Watching,
+            sector: String::new(),
+            ..Default::default()
+        });
+    }
+    Ok(positions)
 }
 
 /// 从 trades 表加载交易记录
@@ -74,7 +129,8 @@ pub fn load_watchlist() -> Result<Vec<Position>, String> {
 /// 改用 ? 占位符 + bind 绑定, Diesel 自动转义
 pub fn load_trades_since(since: NaiveDate) -> Result<Vec<Trade>, String> {
     use diesel::sql_types::Date;
-    let db = crate::database::DatabaseManager::get();
+    let db = crate::database::DatabaseManager::try_get()
+        .ok_or_else(|| "DB 未初始化，无法加载交易记录".to_string())?;
     let mut conn = db.get_conn().map_err(|e| e.to_string())?;
     let rows: Vec<TradeRow> = diesel::sql_query(
         "SELECT id, code, name, direction, price, shares, amount, reason, traded_at \
@@ -83,30 +139,47 @@ pub fn load_trades_since(since: NaiveDate) -> Result<Vec<Trade>, String> {
     .bind::<Date, _>(since)
     .load(&mut *conn)
     .map_err(|e| e.to_string())?;
-    Ok(rows
-        .into_iter()
-        .map(|r| Trade {
-            id: Some(r.id.to_string()),
-            code: r.code,
-            name: r.name,
-            direction: if r.direction == "buy" {
-                TradeDirection::Buy
-            } else {
-                TradeDirection::Sell
-            },
-            price: r.price,
-            shares: r.shares.max(0) as u64,
-            amount: r.amount,
-            reason: r.reason,
-            traded_at: NaiveDateTime::parse_from_str(
-                &format!("{} 00:00:00", r.traded_at),
-                "%Y-%m-%d %H:%M:%S",
-            )
-            .unwrap_or_else(|_| {
-                NaiveDateTime::parse_from_str("2025-01-01 00:00:00", "%Y-%m-%d %H:%M:%S").unwrap()
-            }),
+    rows.into_iter()
+        .map(|r| {
+            let direction = match r.direction.as_str() {
+                "buy" => TradeDirection::Buy,
+                "sell" => TradeDirection::Sell,
+                other => return Err(format!("交易 {} direction 非法: {other:?}", r.id)),
+            };
+            if r.code.trim().is_empty() || r.name.trim().is_empty() {
+                return Err(format!("交易 {} code/name 缺失", r.id));
+            }
+            if !r.price.is_finite() || r.price <= 0.0 {
+                return Err(format!("交易 {} price 非法: {}", r.id, r.price));
+            }
+            let shares = u64::try_from(r.shares)
+                .ok()
+                .filter(|shares| *shares > 0)
+                .ok_or_else(|| format!("交易 {} shares 非法: {}", r.id, r.shares))?;
+            if !r.amount.is_finite() {
+                return Err(format!("交易 {} amount 非法: {}", r.id, r.amount));
+            }
+            let traded_at = NaiveDateTime::parse_from_str(&r.traded_at, "%Y-%m-%d %H:%M:%S")
+                .or_else(|_| {
+                    NaiveDate::parse_from_str(&r.traded_at, "%Y-%m-%d").map(|date| {
+                        date.and_hms_opt(0, 0, 0)
+                            .expect("midnight is a valid NaiveTime")
+                    })
+                })
+                .map_err(|error| format!("交易 {} traded_at 非法: {error}", r.id))?;
+            Ok(Trade {
+                id: Some(r.id.to_string()),
+                code: r.code,
+                name: r.name,
+                direction,
+                price: r.price,
+                shares,
+                amount: r.amount,
+                reason: r.reason,
+                traded_at,
+            })
         })
-        .collect())
+        .collect()
 }
 
 /// 检查今日是否有买入（DB 未初始化时返回 false）
@@ -137,10 +210,36 @@ pub fn has_buy_today(code: &str, today: NaiveDate) -> Result<bool, String> {
 /// 修复 P1.1: SQL 注入风险
 pub fn save_ledger(entry: LedgerEntry) -> Result<(), String> {
     use diesel::sql_types::{Date, Double};
-    let db = crate::database::DatabaseManager::get();
+    if !entry.total_value.is_finite()
+        || !entry.cash.is_finite()
+        || !entry.market_value.is_finite()
+        || !entry.daily_pnl.is_finite()
+        || entry.total_value <= 0.0
+        || entry.cash < 0.0
+        || entry.market_value < 0.0
+    {
+        return Err("ledger contains invalid numeric fields".to_string());
+    }
+    let accounted = entry.cash + entry.market_value;
+    if (entry.total_value - accounted).abs() > accounted.abs().max(1.0) * 1e-6 {
+        return Err(format!(
+            "ledger accounting mismatch: total={} cash={} market={}",
+            entry.total_value, entry.cash, entry.market_value
+        ));
+    }
+    if !crate::calendar::is_trading_day(entry.date)
+        || entry.date > chrono::Local::now().date_naive()
+    {
+        return Err(format!(
+            "ledger date is not a completed trading day: {}",
+            entry.date
+        ));
+    }
+    let db = crate::database::DatabaseManager::try_get()
+        .ok_or_else(|| "DB 未初始化，无法保存净值快照".to_string())?;
     let mut conn = db.get_conn().map_err(|e| e.to_string())?;
     diesel::sql_query(
-        "INSERT OR REPLACE INTO ledger (date, total_value, cash, market_value, daily_pnl) \
+        "INSERT INTO ledger (date, total_value, cash, market_value, daily_pnl) \
          VALUES (?, ?, ?, ?, ?)",
     )
     .bind::<Date, _>(entry.date)
@@ -157,7 +256,8 @@ pub fn save_ledger(entry: LedgerEntry) -> Result<(), String> {
 /// 修复 P1.1: SQL 注入风险
 pub fn load_ledger(since: NaiveDate) -> Result<Vec<LedgerEntry>, String> {
     use diesel::sql_types::Date;
-    let db = crate::database::DatabaseManager::get();
+    let db = crate::database::DatabaseManager::try_get()
+        .ok_or_else(|| "DB 未初始化，无法加载净值序列".to_string())?;
     let mut conn = db.get_conn().map_err(|e| e.to_string())?;
     let rows: Vec<LedgerRow> = diesel::sql_query(
         "SELECT date, total_value, cash, market_value, daily_pnl \
@@ -166,16 +266,61 @@ pub fn load_ledger(since: NaiveDate) -> Result<Vec<LedgerEntry>, String> {
     .bind::<Date, _>(since)
     .load(&mut *conn)
     .map_err(|e| e.to_string())?;
-    Ok(rows
+    let entries: Vec<LedgerEntry> = rows
         .into_iter()
-        .map(|r| LedgerEntry {
-            date: NaiveDate::parse_from_str(&r.date, "%Y-%m-%d").unwrap_or(since),
-            total_value: r.total_value,
-            cash: r.cash,
-            market_value: r.market_value,
-            daily_pnl: r.daily_pnl,
+        .map(|r| {
+            let date = NaiveDate::parse_from_str(&r.date, "%Y-%m-%d")
+                .map_err(|error| format!("ledger date 非法 {:?}: {error}", r.date))?;
+            for (field, value) in [
+                ("total_value", r.total_value),
+                ("cash", r.cash),
+                ("market_value", r.market_value),
+                ("daily_pnl", r.daily_pnl),
+            ] {
+                if !value.is_finite() {
+                    return Err(format!("ledger {date} {field} 非有限: {value}"));
+                }
+            }
+            if r.total_value < 0.0 || r.cash < 0.0 || r.market_value < 0.0 {
+                return Err(format!("ledger {date} 资产字段为负"));
+            }
+            let accounted = r.cash + r.market_value;
+            if r.total_value <= 0.0
+                || (r.total_value - accounted).abs() > accounted.abs().max(1.0) * 1e-6
+            {
+                return Err(format!(
+                    "ledger {date} 会计恒等式不成立: total={} cash={} market={}",
+                    r.total_value, r.cash, r.market_value
+                ));
+            }
+            if !crate::calendar::is_trading_day(date) {
+                return Err(format!("ledger {date} 不是交易日"));
+            }
+            Ok(LedgerEntry {
+                date,
+                total_value: r.total_value,
+                cash: r.cash,
+                market_value: r.market_value,
+                daily_pnl: r.daily_pnl,
+            })
         })
-        .collect())
+        .collect::<Result<Vec<_>, String>>()?;
+    for pair in entries.windows(2) {
+        if pair[1].date <= pair[0].date {
+            return Err(format!(
+                "ledger 日期无序或重复: {} -> {}",
+                pair[0].date, pair[1].date
+            ));
+        }
+        let expected = crate::calendar::next_trading_day(pair[0].date);
+        if pair[1].date != expected {
+            return Err(format!(
+                "ledger 交易日断档: {} 后应为 {}, 实际为 {}",
+                pair[0].date, expected, pair[1].date
+            ));
+        }
+    }
+    Ok(entries)
 }
 
 /// 修复 P3.9: 实盘 rolling Sharpe (基于 ledger 净值)
@@ -367,7 +512,7 @@ mod tests {
         init();
         let today = NaiveDate::from_ymd_opt(2026, 6, 16).unwrap();
         // 测试 DB 里没有今天的买入 → false
-        let result = has_buy_today("000000", today);
+        let result = has_buy_today("TEST_CODE_000000", today);
         assert!(result.is_ok());
         assert!(!result.unwrap());
     }

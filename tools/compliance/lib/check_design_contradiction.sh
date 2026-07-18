@@ -1,89 +1,112 @@
 #!/usr/bin/env bash
-#
-# check_design_contradiction.sh — AGENTS.md §2.9 设计矛盾门禁 (R-2 修复新增)
-#
-# 目的: 拦截"推送门 > 评分封顶"这类上下游配置矛盾。
-# 原理: 从 config/strategy.toml 读 event_risk_score_threshold (v12 重构后从 opportunity.toml 合并),
-#       从 src/opportunity/ 源码里 grep 出最大的 min(N.0) 封顶值,
-#       若 threshold > clamp_max 即 fail。
-#
-# 退出码:
-#   0 = pass (已对齐, 或缺配置 skip)
-#   1 = fail (设计矛盾)
-#
-# 配套:
-#   AGENTS.md §2.9 设计矛盾禁令
-#   tests/test_design_contradiction.rs
+# AGENTS.md §2.9 / BR-014 / BR-096: fail-closed threshold contract check.
 
-set -uo pipefail
+set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-CONFIG="$REPO_ROOT/config/strategy.toml"  # v12 重构后从 opportunity.toml 合并
-SRC_DIR="$REPO_ROOT/src/opportunity"
+CONTRACT_PATH="${DESIGN_CONTRACT_PATH:-$REPO_ROOT/config/design_contracts.toml}"
 
-FAIL=0
+python3 - "$REPO_ROOT" "$CONTRACT_PATH" <<'PY'
+import pathlib
+import re
+import sys
+import tomllib
 
-# 1. 提取 toml 里 event_risk_score_threshold
-THRESHOLD=$(grep -E "^\s*event_risk_score_threshold\s*=" "$CONFIG" 2>/dev/null | \
-  grep -oE "[0-9]+" | head -1 || echo "")
-if [ -z "$THRESHOLD" ]; then
-  echo "[check_design_contradiction] SKIP: 未找到 event_risk_score_threshold 配置"
-  exit 0
-fi
+repo = pathlib.Path(sys.argv[1]).resolve()
+contract_path = pathlib.Path(sys.argv[2]).resolve()
 
-# 2. 提取 rust 源码里 event_risk_score 的最大封顶值
-#    适配 3 种模式 (R-2 修复后):
-#    (a) 直接: min(70.0)
-#    (b) 变量: clamp_max = 70.0 (let clamp_max = if gray_open { 70.0 } else { ... })
-#    (c) 注释: // 封顶 70
-CLAMP_MAX=""
 
-# (a) 抓 min(数字) 字面量
-CLAMP_A=$(grep -rn "event_risk_score" "$REPO_ROOT/src/" 2>/dev/null | \
-  grep -oE "min\([0-9.]+\)" | grep -oE "[0-9.]+" | sort -rn | head -1 || echo "")
+def fail(message: str) -> None:
+    print(f"✗ §2.9 设计矛盾: {message}", file=sys.stderr)
+    raise SystemExit(1)
 
-# (b) 抓 clamp_max = ... 的完整表达式块, 支持多行 if/else:
-#     let clamp_max = if gray_open {
-#         70.0
-#     } else {
-#         (THRESHOLD_FALLBACK - 1.0).max(0.0)
-#     };
-CLAMP_B=$(awk '
-  /clamp_max[[:space:]]*=/ { in_block=1 }
-  in_block {
-    line=$0
-    while (match(line, /[0-9]+(\.[0-9]+)?/)) {
-      print substr(line, RSTART, RLENGTH)
-      line=substr(line, RSTART + RLENGTH)
-    }
-    if (line ~ /;/) { in_block=0 }
-  }
-' "$SRC_DIR"/*.rs 2>/dev/null | sort -rn | head -1 || echo "")
 
-# (c) 兜底: 抓注释 // 封顶 数字
-#     限制: 数字后必须接非数字 (避免抓到行号 "line 647")
-CLAMP_C=$(grep -rn "event_risk_score" "$REPO_ROOT/src/" 2>/dev/null | \
-  grep -E "封顶\s*[0-9]+\.[0-9]+|[0-9]+\s*分" 2>/dev/null | \
-  grep -oE "[0-9]+\.[0-9]+" | sort -rn | head -1 || echo "")
+def load_toml(path: pathlib.Path, label: str) -> dict:
+    try:
+        with path.open("rb") as handle:
+            return tomllib.load(handle)
+    except FileNotFoundError:
+        fail(f"缺少{label}: {path}")
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        fail(f"{label}无法解析: {path}: {exc}")
 
-# 取三路中最大值 (灰度期的 70 是设计意图, 应被检测)
-CLAMP_MAX=$(printf "%s\n%s\n%s\n" "$CLAMP_A" "$CLAMP_B" "$CLAMP_C" | sort -rn | head -1)
-if [ -z "$CLAMP_MAX" ]; then
-  CLAMP_MAX="0.0"
-fi
 
-# 4. 矛盾检测
-if [ -n "$CLAMP_MAX" ]; then
-  if python3 -c "import sys; sys.exit(0 if $THRESHOLD > $CLAMP_MAX else 1)" 2>/dev/null; then
-    echo "✗ §2.9 设计矛盾: 推送门 ($THRESHOLD) > 评分封顶 ($CLAMP_MAX)" >&2
-    echo "    来源: config/opportunity.toml vs src/opportunity/score.rs" >&2
-    echo "    修复: 调低 threshold 或调高 clamp, 或补 winrate 数据让 NS3 解除" >&2
-    FAIL=1
-  else
-    echo "✓ §2.9 阈值对齐: threshold ($THRESHOLD) ≤ clamp ($CLAMP_MAX)"
-  fi
-else
-  echo "[check_design_contradiction] SKIP: 未找到 event_risk 封顶值"
-fi
+contract_doc = load_toml(contract_path, "机器合同")
+contract = contract_doc.get("opportunity_event_risk")
+if not isinstance(contract, dict):
+    fail("机器合同缺少 [opportunity_event_risk]")
 
-exit $FAIL
+required = (
+    "threshold_file",
+    "threshold_field",
+    "rust_source",
+    "rust_score_max_constant",
+    "score_min",
+    "score_max",
+    "insufficient_cap_relation",
+)
+missing = [name for name in required if name not in contract]
+if missing:
+    fail(f"机器合同缺少字段: {', '.join(missing)}")
+
+config_path = pathlib.Path(
+    __import__("os").environ.get(
+        "DESIGN_THRESHOLD_CONFIG", str(repo / str(contract["threshold_file"]))
+    )
+).resolve()
+source_path = pathlib.Path(
+    __import__("os").environ.get(
+        "DESIGN_SCORE_SOURCE", str(repo / str(contract["rust_source"]))
+    )
+).resolve()
+config = load_toml(config_path, "阈值配置")
+
+field = contract["threshold_field"]
+if not isinstance(field, str) or not field:
+    fail("threshold_field 必须是非空字符串")
+threshold = config.get(field)
+if isinstance(threshold, bool) or not isinstance(threshold, int):
+    fail(f"配置根级缺少整数字段 {field}")
+
+score_min = contract["score_min"]
+score_max = contract["score_max"]
+if any(isinstance(value, bool) or not isinstance(value, int) for value in (score_min, score_max)):
+    fail("score_min/score_max 必须是整数")
+if score_min != 0 or score_max <= score_min:
+    fail(f"非法总分值域: {score_min}..={score_max}")
+if not 1 <= threshold <= score_max:
+    fail(f"推送门 {threshold} 必须位于 1..={score_max}")
+if threshold > score_max:
+    fail(f"推送门 ({threshold}) > 总分封顶 ({score_max})")
+
+try:
+    source = source_path.read_text(encoding="utf-8")
+except FileNotFoundError:
+    fail(f"缺少 Rust 评分实现: {source_path}")
+except OSError as exc:
+    fail(f"Rust 评分实现不可读: {source_path}: {exc}")
+
+constant = contract["rust_score_max_constant"]
+if not isinstance(constant, str) or not constant:
+    fail("rust_score_max_constant 必须是非空字符串")
+match = re.search(
+    rf"\b(?:pub\s+)?const\s+{re.escape(constant)}\s*:\s*u8\s*=\s*(\d+)\s*;",
+    source,
+)
+if match is None:
+    fail(f"Rust 实现缺少常量 {constant}")
+rust_score_max = int(match.group(1))
+if rust_score_max != score_max:
+    fail(f"合同 score_max={score_max} 与 Rust {constant}={rust_score_max} 不一致")
+
+relation = contract["insufficient_cap_relation"]
+if relation != "threshold_minus_one":
+    fail(f"不支持的数据不足封顶关系: {relation!r}")
+if ".checked_sub(1)" not in source or "valid_push_threshold(push_threshold)" not in source:
+    fail("Rust 实现未显式实现 threshold_minus_one 与阈值有效性门")
+
+print(
+    f"✓ §2.9 阈值合同对齐: {field}={threshold}, "
+    f"score={score_min}..={score_max}, insufficient_cap={threshold - 1}"
+)
+PY

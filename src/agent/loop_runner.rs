@@ -126,7 +126,7 @@ impl AgentRunner {
             // 将 AI 的回复存回历史
             if let Some(ref content) = message.content {
                 self.context.log_event(&format!("AI Thought: {}", content));
-                AgentLogDao::insert_log(&self.session_id, step as i32, "thought", content);
+                AgentLogDao::insert_log(&self.session_id, step as i32, "thought", content)?;
             }
 
             // 为规避 Deepseek/Doubao 等模型强制校验推理内容（reasoning_content）的问题，
@@ -157,7 +157,7 @@ impl AgentRunner {
                         step as i32,
                         "tool_call",
                         &format!("{} - {}", tool_name, arguments),
-                    );
+                    )?;
 
                     info!(
                         "[执行智能体 Action Agent] 决定调用工具：{}，参数：{}",
@@ -176,6 +176,7 @@ impl AgentRunner {
                         let err_msg =
                             format!("Loop Detection Triggered: Repeated call {} times", count);
                         warn!("{}", err_msg);
+                        self.context.remove_fact(tool_name);
                         tool_result = format!("【安全拦截】系统检测到你连续 {} 次使用完全相同的参数调用了该工具！为了防止死循环，本次调用被阻断。请立即停止重复毫无意义的操作！如无法获取数据，请改用其他工具，或直接根据现有上下文汇总结论。", count);
                         self.context.log_event(&err_msg);
                         AgentLogDao::insert_log(
@@ -183,26 +184,38 @@ impl AgentRunner {
                             step as i32,
                             "loop_detection",
                             &err_msg,
-                        );
+                        )?;
                     } else {
                         // 执行 Tool
-                        tool_result =
-                            match self.toolbelt.execute(tool_name, arguments.clone()).await {
-                                Ok(res) => res,
-                                Err(e) => format!("Error executing tool: {}", e),
-                            };
-
-                        // 获取的数据尝试解析为 JSON 并存入 ContextManager 进行后续校验
-                        if let Ok(json_val) =
-                            serde_json::from_str::<serde_json::Value>(&tool_result)
-                        {
-                            self.context.insert_fact(tool_name, json_val);
-                        } else {
-                            // If it's pure text, wrap it into a json value
-                            self.context.insert_fact(
-                                tool_name,
-                                serde_json::Value::String(tool_result.clone()),
-                            );
+                        match self.toolbelt.execute(tool_name, arguments.clone()).await {
+                            Ok(result) => {
+                                tool_result = result;
+                                // 只有成功结果可以成为事实；纯文本以 String 保存。
+                                if let Ok(json_val) =
+                                    serde_json::from_str::<serde_json::Value>(&tool_result)
+                                {
+                                    self.context.insert_fact(tool_name, json_val);
+                                } else {
+                                    self.context.insert_fact(
+                                        tool_name,
+                                        serde_json::Value::String(tool_result.clone()),
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                self.context.remove_fact(tool_name);
+                                tool_result = format!(
+                                    "【数据不可用】工具 `{tool_name}` 执行失败: {error:#}。不得把缺失字段补成事实。"
+                                );
+                                self.context
+                                    .log_event(&format!("Tool Error: {tool_name}: {error:#}"));
+                                AgentLogDao::insert_log(
+                                    &self.session_id,
+                                    step as i32,
+                                    "tool_error",
+                                    &format!("{tool_name}: {error:#}"),
+                                )?;
+                            }
                         }
                     }
 
@@ -213,7 +226,7 @@ impl AgentRunner {
                         step as i32,
                         "tool_result",
                         &tool_result,
-                    );
+                    )?;
 
                     // 将工具调用和结果以 User 视角压入历史（替代原有的 ToolMessage）
                     let observation = format!(
@@ -255,7 +268,7 @@ impl AgentRunner {
                         step as i32,
                         "validation_error",
                         &feedback,
-                    );
+                    )?;
 
                     messages.push(
                         ChatCompletionRequestUserMessageArgs::default()
@@ -273,7 +286,7 @@ impl AgentRunner {
             if let Some(final_content) = &message.content {
                 info!("[审查智能体 Critic Agent] 正在对初稿进行盲审和逻辑对抗校验...");
 
-                let fact_sheet = serde_json::to_string(&self.context.facts).unwrap_or_default();
+                let fact_sheet = serde_json::to_string(&self.context.facts)?;
                 let available_tools = self
                     .toolbelt
                     .as_openai_tools()
@@ -310,7 +323,7 @@ impl AgentRunner {
                     .message
                     .content
                     .clone()
-                    .unwrap_or_default();
+                    .ok_or_else(|| anyhow::anyhow!("Critic returned no content"))?;
 
                 let cleaned_json = critic_text
                     .trim_start_matches("```json")
@@ -348,7 +361,7 @@ impl AgentRunner {
                             step as i32,
                             "final_answer",
                             final_content,
-                        );
+                        )?;
                         return Ok(final_content.to_string());
                     }
                     s => {
@@ -375,7 +388,7 @@ impl AgentRunner {
                             step as i32,
                             "critic_feedback",
                             &feedback,
-                        );
+                        )?;
 
                         // 动态清理 Context (Memory Compaction), 防止 Token 爆炸
                         if messages.len() > 40 {
@@ -417,7 +430,7 @@ impl AgentRunner {
                 max_iterations as i32,
                 "final_answer_fallback",
                 &draft,
-            );
+            )?;
             return Ok(format!("{}{}", draft, warning_block));
         }
 

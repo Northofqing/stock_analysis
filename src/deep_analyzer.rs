@@ -71,11 +71,14 @@ async fn fetch_kline_via_manager(code: &str, days: usize) -> Result<Vec<KlineDat
     let (kline, source) = manager
         .get_daily_data(code, days)
         .map_err(|e| anyhow::anyhow!("K 线获取失败: {e}"))?;
-    let first_date = kline
-        .first()
-        .map(|k| k.date.to_string())
-        .unwrap_or_default();
-    let last_date = kline.last().map(|k| k.date.to_string()).unwrap_or_default();
+    let Some(first) = kline.first() else {
+        anyhow::bail!("K 线数据源 {source} 返回空序列: {code}");
+    };
+    let Some(last) = kline.last() else {
+        anyhow::bail!("K 线数据源 {source} 返回空序列: {code}");
+    };
+    let first_date = first.date;
+    let last_date = last.date;
     log::info!(
         "[MultiAgent] {} K 线来源: {}, {} 条, date_range: {}..{}",
         code,
@@ -216,8 +219,7 @@ where
             api_key: key,
             api_base: get("DOUBAO_BASE_URL")
                 .unwrap_or_else(|| "https://ark.cn-beijing.volces.com/api/v3".to_string()),
-            model: get("DOUBAO_MODEL")
-                .unwrap_or_else(|| "doubao-seed-2-0-pro-260215".to_string()),
+            model: get("DOUBAO_MODEL").unwrap_or_else(|| "doubao-seed-2-0-pro-260215".to_string()),
         });
     }
     if let Some(key) = get("DEEPSEEK_API_KEY").filter(|value| !value.is_empty()) {
@@ -225,8 +227,7 @@ where
             api_key: key,
             api_base: get("DEEPSEEK_BASE_URL")
                 .unwrap_or_else(|| "https://api.deepseek.com/v1".to_string()),
-            model: get("DEEPSEEK_MODEL")
-                .unwrap_or_else(|| "deepseek-chat".to_string()),
+            model: get("DEEPSEEK_MODEL").unwrap_or_else(|| "deepseek-chat".to_string()),
         });
     }
     if let Some(key) = get("GEMINI_API_KEY").filter(|value| !value.is_empty()) {
@@ -235,8 +236,7 @@ where
             api_base: get("GEMINI_BASE_URL").unwrap_or_else(|| {
                 "https://generativelanguage.googleapis.com/v1beta/openai/".to_string()
             }),
-            model: get("GEMINI_MODEL")
-                .unwrap_or_else(|| "gemini-2.5-flash".to_string()),
+            model: get("GEMINI_MODEL").unwrap_or_else(|| "gemini-2.5-flash".to_string()),
         });
     }
 
@@ -262,8 +262,7 @@ mod tests {
             ("GEMINI_API_KEY", "gemini-key"),
             ("GEMINI_MODEL", "gemini-test"),
         ]);
-        let configs =
-            collect_model_configs_from(|name| values.get(name).map(|v| (*v).to_string()));
+        let configs = collect_model_configs_from(|name| values.get(name).map(|v| (*v).to_string()));
         assert_eq!(configs[0].model, "doubao-test");
         assert_eq!(configs[1].model, "deepseek-test");
         assert_eq!(configs[2].model, "gemini-test");
@@ -423,12 +422,12 @@ pub async fn run_multi_agent_analysis(code: &str) -> Result<String> {
     // 3. 拼装 extra_context（资金面分析师读取）= 资金流 + 筹码
     let mut extra = String::new();
     if !flow_str.is_empty() {
-        extra.push_str(&flow_str);
-        extra.push_str("\n");
+        extra.push_str(flow_str);
+        extra.push('\n');
     }
     if !chip_str.is_empty() {
-        extra.push_str(&chip_str);
-        extra.push_str("\n");
+        extra.push_str(chip_str);
+        extra.push('\n');
     }
     let extra_ctx = if extra.trim().is_empty() {
         None
@@ -440,18 +439,18 @@ pub async fn run_multi_agent_analysis(code: &str) -> Result<String> {
     let mut news_ctx = String::new();
     if !news_str_raw.is_empty() {
         news_ctx.push_str("【新闻舆情】\n");
-        news_ctx.push_str(&news_str_raw);
+        news_ctx.push_str(news_str_raw);
         news_ctx.push_str("\n\n");
     }
     if !sector_str.is_empty() {
         news_ctx.push_str("【板块/概念】\n");
-        news_ctx.push_str(&sector_str);
+        news_ctx.push_str(sector_str);
         news_ctx.push_str("\n\n");
     }
     if !research_str.is_empty() {
         news_ctx.push_str("【机构研报】\n");
-        news_ctx.push_str(&research_str);
-        news_ctx.push_str("\n");
+        news_ctx.push_str(research_str);
+        news_ctx.push('\n');
     }
     let news_ctx_opt = if news_ctx.trim().is_empty() {
         None
@@ -739,7 +738,7 @@ mod tests_br011 {
         assert!(s.contains("[news] MISSING:"));
         assert!(s.contains("网络超时"));
         assert!(s.contains("[sector] OK"));
-        assert!(s.contains("[chip]") == false, "不应含未提供的 tool");
+        assert!(!s.contains("[chip]"), "不应含未提供的 tool");
     }
 
     /// 测试 6: 6 tool 全部 Ok → inventory 6 个 OK

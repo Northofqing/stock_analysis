@@ -134,11 +134,10 @@ pub fn compute_spearman_ic(factor_values: &[f64], forward_returns: &[f64]) -> Op
         if j > i + 1 {
             let avg_rank: f64 = factor_ranked[i..j]
                 .iter()
-                .enumerate()
-                .map(|(_k, (orig_idx, _))| factor_ranks[*orig_idx])
+                .map(|(orig_idx, _)| factor_ranks[*orig_idx])
                 .sum::<f64>()
                 / (j - i) as f64;
-            for (_, (orig_idx, _)) in factor_ranked[i..j].iter().enumerate() {
+            for (orig_idx, _) in factor_ranked[i..j].iter() {
                 factor_ranks[*orig_idx] = avg_rank;
             }
         }
@@ -166,11 +165,10 @@ pub fn compute_spearman_ic(factor_values: &[f64], forward_returns: &[f64]) -> Op
         if j > i + 1 {
             let avg_rank: f64 = return_ranked[i..j]
                 .iter()
-                .enumerate()
-                .map(|(_k, (orig_idx, _))| return_ranks[*orig_idx])
+                .map(|(orig_idx, _)| return_ranks[*orig_idx])
                 .sum::<f64>()
                 / (j - i) as f64;
-            for (_, (orig_idx, _)) in return_ranked[i..j].iter().enumerate() {
+            for (orig_idx, _) in return_ranked[i..j].iter() {
                 return_ranks[*orig_idx] = avg_rank;
             }
         }
@@ -261,7 +259,7 @@ pub fn compute_rolling_ic(
 
     // IC 衰减: lag 1-4 (因子值超前于收益的滞后期)
     let mut decay = [0.0; 4];
-    for lag in 0..4 {
+    for (lag, decay_at_lag) in decay.iter_mut().enumerate() {
         let offset = lag + 1;
         if clean.len() > offset {
             let lag_factors: Vec<f64> = clean[..clean.len() - offset]
@@ -272,7 +270,7 @@ pub fn compute_rolling_ic(
             let m = lag_factors.len().min(lag_returns.len());
             if m >= 15 {
                 if let Some(ic) = compute_spearman_ic(&lag_factors[..m], &lag_returns[..m]) {
-                    decay[lag] = ic;
+                    *decay_at_lag = ic;
                 }
             }
         }

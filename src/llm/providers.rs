@@ -16,21 +16,37 @@ pub struct DeepSeekProvider {
     model: String,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct DeepSeekSettings {
+    key: String,
+    base: String,
+    model: String,
+}
+
 impl DeepSeekProvider {
+    fn settings_from_lookup<F>(get: F) -> Option<DeepSeekSettings>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let key = get("DEEPSEEK_API_KEY").filter(|value| !value.is_empty())?;
+        let base =
+            get("DEEPSEEK_BASE_URL").unwrap_or_else(|| "https://api.deepseek.com/v1".to_string());
+        let model = get("DEEPSEEK_MODEL").unwrap_or_else(|| "deepseek-chat".to_string());
+        Some(DeepSeekSettings { key, base, model })
+    }
+
     /// 从 key-value lookup 构造. 用于 from_env 和单测.
     fn from_lookup<F>(get: F) -> Option<Self>
     where
         F: Fn(&str) -> Option<String>,
     {
-        let key = get("DEEPSEEK_API_KEY").filter(|value| !value.is_empty())?;
-        let base = get("DEEPSEEK_BASE_URL")
-            .unwrap_or_else(|| "https://api.deepseek.com/v1".to_string());
-        let model = get("DEEPSEEK_MODEL")
-            .unwrap_or_else(|| "deepseek-chat".to_string());
-        let cfg = OpenAIConfig::new().with_api_key(key).with_api_base(base);
+        let settings = Self::settings_from_lookup(get)?;
+        let cfg = OpenAIConfig::new()
+            .with_api_key(settings.key)
+            .with_api_base(settings.base);
         Some(Self {
             client: Client::with_config(cfg),
-            model,
+            model: settings.model,
         })
     }
 
@@ -100,16 +116,17 @@ mod tests {
 
     #[test]
     fn deepseek_provider_reads_canonical_names_only() {
-        let provider = DeepSeekProvider::from_lookup(|name| match name {
+        let settings = DeepSeekProvider::settings_from_lookup(|name| match name {
             "DEEPSEEK_API_KEY" => Some("test-key".into()),
             "DEEPSEEK_BASE_URL" => Some("https://example.invalid/v1".into()),
             "DEEPSEEK_MODEL" => Some("deepseek-reasoner".into()),
             _ => None,
         })
-        .expect("canonical DeepSeek key should create provider");
+        .expect("canonical DeepSeek key should create settings");
 
-        assert_eq!(provider.name(), "deepseek");
-        assert_eq!(provider.model(), "deepseek-reasoner");
+        assert_eq!(settings.key, "test-key");
+        assert_eq!(settings.base, "https://example.invalid/v1");
+        assert_eq!(settings.model, "deepseek-reasoner");
     }
 
     #[test]

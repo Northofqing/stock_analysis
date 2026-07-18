@@ -13,6 +13,11 @@
 //! (按 plan review 修复: signal_sources 改 None, 4 步过滤用 v16.2 6 函数直接调)
 
 use crate::database::DatabaseManager;
+use crate::strategy::v16_4::{
+    AuctionAnomalyStrategy, BreakoutStrategy, LLMSelectStrategy, MainNetInflowStrategy,
+    MomentumStrategy, NewsCatalystStrategy, SectorLeaderStrategy, Strategy, StrategyInput,
+    StrategyOutput, VolumeSurgeStrategy,
+};
 use crate::trading::paper_trade::{self, Direction, PaperSignal};
 use chrono::{DateTime, Duration, Local, NaiveDate};
 use diesel::prelude::*;
@@ -49,17 +54,19 @@ struct Candidate {
     push_price: f64,
     #[diesel(sql_type = diesel::sql_types::Text)]
     metric_json: String,
-    #[diesel(sql_type = diesel::sql_types::Text)]
-    source: String,
 }
 
 impl Candidate {
-    fn push_time_parsed(&self) -> DateTime<Local> {
+    fn push_time_parsed(&self) -> Result<DateTime<Local>, String> {
         // 字符串无时区, 用 NaiveDateTime 解析 + assume_local (避免 UTC→+08:00 偏移 8h)
         chrono::NaiveDateTime::parse_from_str(&self.push_time, "%Y-%m-%d %H:%M:%S%.3f")
-            .or_else(|_| chrono::NaiveDateTime::parse_from_str(&self.push_time, "%Y-%m-%d %H:%M:%S"))
-            .map(|ndt| ndt.and_local_timezone(Local).unwrap())
-            .unwrap_or_else(|_| Local::now())
+            .or_else(|_| {
+                chrono::NaiveDateTime::parse_from_str(&self.push_time, "%Y-%m-%d %H:%M:%S")
+            })
+            .map_err(|error| format!("{} push_time 解析失败: {error}", self.code))?
+            .and_local_timezone(Local)
+            .single()
+            .ok_or_else(|| format!("{} push_time 本地时区不唯一: {}", self.code, self.push_time))
     }
 
     fn push_kind_label(&self) -> &'static str {
@@ -91,7 +98,7 @@ impl IntradayMonitor {
 
         // 1. 扫推送票池 (review fix Issue #4: 参数化绑定替代 format! 拼接)
         let candidates: Vec<Candidate> = diesel::sql_query(
-            "SELECT id, push_time, push_kind, code, name, push_price, metric_json, source \
+            "SELECT id, push_time, push_kind, code, name, push_price, metric_json \
              FROM pushed_stocks \
              WHERE consumed_at IS NULL AND push_time < ? \
              AND push_time > ? \
@@ -108,42 +115,81 @@ impl IntradayMonitor {
 
         // 2. 4 步过滤
         for cand in candidates {
-            let cand_time = cand.push_time_parsed();
-            if let Some(signal) = self.evaluate_candidate(&cand, cand_time) {
+            let signal = match self.evaluate_candidate(&cand, now) {
+                Ok(signal) => signal,
+                Err(error) => {
+                    log::error!(
+                        "[intraday_monitor][BR-098] 拒绝坏候选 {}({}): {}",
+                        cand.name,
+                        cand.code,
+                        error
+                    );
+                    continue;
+                }
+            };
+            if let Some(signal) = signal {
                 if signal.score < DECISION_SCORE_THRESHOLD {
                     log::debug!(
                         "[intraday_monitor] 跳过 {}({}): 综合分 {:.1} < 阈值 {:.1}",
-                        cand.name, cand.code, signal.score, DECISION_SCORE_THRESHOLD
+                        cand.name,
+                        cand.code,
+                        signal.score,
+                        DECISION_SCORE_THRESHOLD
                     );
                     continue;
                 }
 
                 // 3. risk_adapter 4 项检查 (复用 Commit 1)
+                let execution_quote = match crate::broker::execution_quote(&cand.code) {
+                    Ok(quote) => quote,
+                    Err(error) => {
+                        log::warn!(
+                            "[intraday_monitor] 跳过 {}({}): 实时报价不可用: {}",
+                            cand.name,
+                            cand.code,
+                            error
+                        );
+                        continue;
+                    }
+                };
                 let paper_signal = PaperSignal {
-                    plan_id: format!(
-                        "intraday-{}-{}",
-                        cand.code,
-                        now.format("%Y%m%d%H%M%S%3f")
-                    ),
+                    plan_id: format!("intraday-{}-{}", cand.code, now.format("%Y%m%d%H%M%S%3f")),
                     code: cand.code.clone(),
                     name: cand.name.clone(),
                     direction: Direction::Buy,
-                    price: crate::broker::quote_provider()
-                        .map(|p| p.get_quote_price(&cand.code))
-                        .filter(|&p| p > 0.0)
-                        .unwrap_or(cand.push_price), // v16.5 #3: 真价, 0.0 fallback
+                    price: execution_quote.price,
                     quantity: 100,
                     virtual_reason: signal.source.to_string(),
                     is_limit_up: false,
                     is_limit_down: false,
                     is_suspended: false,
+                    limit_up_price: Some(execution_quote.limit_up_price),
+                    limit_down_price: Some(execution_quote.limit_down_price),
+                    secondary_confirmed: false,
+                    quote_observed_at: execution_quote.observed_at,
                     account_mode: "Normal".to_string(),
                     data_mode: "Full".to_string(),
                 };
-                // review fix Issue #5: 传真实 portfolio state (之前传 0,0,0 静默旁路现金/仓位检查)
                 let (cash, total, pos_pct) =
-                    paper_trade::portfolio_state(&cand.code, cand.push_price);
-                match paper_trade::simulate(&paper_signal, cand.push_price, cash, total, pos_pct) {
+                    match paper_trade::portfolio_state(&cand.code, execution_quote.price) {
+                        Ok(state) => state,
+                        Err(error) => {
+                            log::warn!(
+                                "[intraday_monitor] 跳过 {}({}): 账户快照不可用: {}",
+                                cand.name,
+                                cand.code,
+                                error
+                            );
+                            continue;
+                        }
+                    };
+                match paper_trade::simulate(
+                    &paper_signal,
+                    execution_quote.price,
+                    cash,
+                    total,
+                    pos_pct,
+                ) {
                     Ok(_) => {
                         // 4. 标记 consumed (review fix Issue #4: 参数化绑定)
                         let outcome = signal.source;
@@ -165,7 +211,9 @@ impl IntradayMonitor {
                     Err(e) => {
                         log::warn!(
                             "[intraday_monitor] risk_adapter 拒 {}({}): {}",
-                            cand.name, cand.code, e
+                            cand.name,
+                            cand.code,
+                            e
                         );
                     }
                 }
@@ -186,60 +234,121 @@ impl IntradayMonitor {
     }
 
     /// 4 步过滤: (a) metric_json (b) 时间窗 (c) VirtualReason 命中 (d) 计算综合分
-    fn evaluate_candidate(&self, cand: &Candidate, now: DateTime<Local>) -> Option<Signal> {
-        // (a) 解析 metric_json
-        let metrics: serde_json::Value =
-            serde_json::from_str(&cand.metric_json).unwrap_or_default();
-        let vol_ratio = metrics
-            .get("vol_ratio")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
-        let push_subkind = metrics
-            .get("push_subkind")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
-        // 早盘量能: AuctionVolume 子类需 vol_ratio ≥ 5
-        if push_subkind == "AuctionVolume" && vol_ratio < VOLUME_SURGE_THRESHOLD {
-            return None;
+    fn evaluate_candidate(
+        &self,
+        cand: &Candidate,
+        now: DateTime<Local>,
+    ) -> Result<Option<Signal>, String> {
+        let push_time = cand.push_time_parsed()?;
+        if now < push_time {
+            return Err(format!(
+                "push_time 位于未来: push_time={push_time} now={now}"
+            ));
         }
-
-        // (b) 时间窗
-        let push_age = now - cand.push_time_parsed();
+        let push_age = now - push_time;
         if push_age > Duration::hours(PUSH_AGE_MAX_HOURS) {
-            return None;
+            return Ok(None);
         }
 
-        // (c) VirtualReason 命中 (按 push_kind_label 分, v16.4 再走 trait)
         let label = cand.push_kind_label();
-        let score = match label {
-            "SectorLeader" => 7.0,
-            "Breakout" => 7.5,
-            "VolumeSurge" => 6.5,
-            "AuctionAnomaly" => 6.5,
-            "MainNetInflow" => 6.0,
-            "NewsCatalyst" => 7.0,
-            "LLMSelect" => 6.5,
-            "Momentum" => 8.0,
-            _ => 0.0,
+        let Some(output) = Self::score_candidate(cand)? else {
+            return Ok(None);
         };
 
-        if score == 0.0 {
-            return None;
+        Ok(Some(Signal {
+            source: label,
+            code: cand.code.clone(),
+            score: output.score,
+        }))
+    }
+
+    fn score_candidate(cand: &Candidate) -> Result<Option<StrategyOutput>, String> {
+        let label = cand.push_kind_label();
+        if label == "Unknown" {
+            return Ok(None);
         }
 
-        Some(Signal {
-            source: cand.push_kind_label(),
+        let metrics = crate::strategy::v16_4::_helpers::parse(
+            &cand.metric_json,
+            &cand.code,
+            cand.push_price,
+        )?;
+        if metrics.push_subkind.as_deref() == Some("AuctionVolume")
+            && metrics
+                .vol_ratio
+                .is_some_and(|value| value < VOLUME_SURGE_THRESHOLD)
+        {
+            return Ok(None);
+        }
+        let require_number = |value: Option<f64>, field: &str| {
+            value.ok_or_else(|| format!("{} 缺少必需指标 {field}", cand.code))
+        };
+        match label {
+            "VolumeSurge" | "AuctionAnomaly" => {
+                require_number(metrics.vol_ratio, "vol_ratio")?;
+            }
+            "Breakout" | "Momentum" => {
+                require_number(metrics.vol_ratio, "vol_ratio")?;
+                require_number(metrics.price_chg_pct, "price_chg_pct")?;
+            }
+            "MainNetInflow" => {
+                require_number(metrics.main_net_yi, "main_net_yi")?;
+                require_number(metrics.price_chg_pct, "price_chg_pct")?;
+            }
+            "SectorLeader" => {
+                require_number(metrics.price_chg_pct, "price_chg_pct")?;
+                if metrics.sector.is_none() {
+                    return Err(format!("{} 缺少必需指标 sector", cand.code));
+                }
+            }
+            "LLMSelect" => {
+                let value: serde_json::Value = serde_json::from_str(&cand.metric_json)
+                    .map_err(|error| format!("{} metric_json 解析失败: {error}", cand.code))?;
+                let confidence = value
+                    .get("llm_confidence")
+                    .and_then(serde_json::Value::as_f64)
+                    .filter(|number| number.is_finite())
+                    .ok_or_else(|| format!("{} 缺少有效 llm_confidence", cand.code))?;
+                if !(0.0..=1.0).contains(&confidence) {
+                    return Err(format!("{} llm_confidence 越界: {confidence}", cand.code));
+                }
+                value
+                    .get("llm_verdict")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|text| !text.trim().is_empty())
+                    .ok_or_else(|| format!("{} 缺少有效 llm_verdict", cand.code))?;
+            }
+            "NewsCatalyst" => {}
+            _ => return Ok(None),
+        }
+
+        let input = StrategyInput {
             code: cand.code.clone(),
-            score,
-        })
+            push_price: cand.push_price,
+            metric_json: cand.metric_json.clone(),
+            push_kind: cand.push_kind.clone(),
+            now: Local::now(),
+        };
+        let output = match label {
+            "SectorLeader" => SectorLeaderStrategy.score(&input),
+            "Breakout" => BreakoutStrategy.score(&input),
+            "VolumeSurge" => VolumeSurgeStrategy.score(&input),
+            "AuctionAnomaly" => AuctionAnomalyStrategy.score(&input),
+            "MainNetInflow" => MainNetInflowStrategy.score(&input),
+            "NewsCatalyst" => NewsCatalystStrategy.score(&input),
+            "LLMSelect" => LLMSelectStrategy.score(&input),
+            "Momentum" => MomentumStrategy.score(&input),
+            _ => None,
+        };
+        Ok(output)
     }
 }
 
 /// review fix Issue #7: evening_review 当日防重入 (30s tick 在 15:30 分钟内会触发 2 次)
 /// Fix review (MEDIUM): 失败路径 5 分钟 debounce, 避免 DB 锁时 30s tick × N 次失败
 static EVENING_LAST_RUN: std::sync::Mutex<Option<NaiveDate>> = std::sync::Mutex::new(None);
-static EVENING_LAST_FAIL: std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>> = std::sync::Mutex::new(None);
+static EVENING_LAST_FAIL: std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>> =
+    std::sync::Mutex::new(None);
 
 /// 盘后 15:30 整盘扫 (R5) — 复用 evaluate_candidate 评分, 跑 Momentum 整合
 pub fn evening_review(today: NaiveDate) -> Result<usize, String> {
@@ -273,7 +382,7 @@ pub fn evening_review(today: NaiveDate) -> Result<usize, String> {
 
     // review fix Issue #4: 参数化绑定
     let candidates: Vec<Candidate> = diesel::sql_query(
-        "SELECT id, push_time, push_kind, code, name, push_price, metric_json, source \
+        "SELECT id, push_time, push_kind, code, name, push_price, metric_json \
          FROM pushed_stocks \
          WHERE consumed_at IS NULL AND push_time <= ? \
          AND date(push_time) = ? \
@@ -292,43 +401,67 @@ pub fn evening_review(today: NaiveDate) -> Result<usize, String> {
         if cand.push_kind != "Momentum" {
             continue;
         }
-        let m: serde_json::Value =
-            serde_json::from_str(&cand.metric_json).unwrap_or_default();
-        let vol = m.get("vol_ratio").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let sub = m.get("push_subkind").and_then(|v| v.as_str()).unwrap_or("");
-        // 早盘量能仍过滤 (防早盘低量能票入盘后)
-        if sub == "AuctionVolume" && vol < 5.0 {
-            continue;
-        }
-        // Momentum 评分 = 8.0, 但需 vol_ratio ≥ 阈值
-        if vol < 5.0 {
+        let scored = match IntradayMonitor::score_candidate(&cand) {
+            Ok(Some(scored)) => scored,
+            Ok(None) => continue,
+            Err(error) => {
+                log::error!(
+                    "[evening_review][BR-098] 拒绝坏候选 {}({}): {}",
+                    cand.name,
+                    cand.code,
+                    error
+                );
+                continue;
+            }
+        };
+        if scored.score < 8.0 {
             continue;
         }
 
+        let execution_quote = match crate::broker::execution_quote(&cand.code) {
+            Ok(quote) => quote,
+            Err(error) => {
+                log::warn!(
+                    "[evening_review] 跳过 {}({}): 实时报价不可用: {}",
+                    cand.name,
+                    cand.code,
+                    error
+                );
+                continue;
+            }
+        };
         let paper_signal = PaperSignal {
-            plan_id: format!(
-                "evening-{}-{}",
-                cand.code,
-                now.format("%Y%m%d%H%M%S%3f")
-            ),
+            plan_id: format!("evening-{}-{}", cand.code, now.format("%Y%m%d%H%M%S%3f")),
             code: cand.code.clone(),
             name: cand.name.clone(),
             direction: Direction::Buy,
-            price: crate::broker::quote_provider()
-                .map(|p| p.get_quote_price(&cand.code))
-                .filter(|&p| p > 0.0)
-                .unwrap_or(cand.push_price), // v16.5 #3: 真价
+            price: execution_quote.price,
             quantity: 100,
             virtual_reason: "Momentum".to_string(),
             is_limit_up: false,
             is_limit_down: false,
             is_suspended: false,
+            limit_up_price: Some(execution_quote.limit_up_price),
+            limit_down_price: Some(execution_quote.limit_down_price),
+            secondary_confirmed: false,
+            quote_observed_at: execution_quote.observed_at,
             account_mode: "Normal".to_string(),
             data_mode: "Full".to_string(),
         };
-        // review fix Issue #5: 传真实 portfolio state
-        let (cash, total, pos_pct) = paper_trade::portfolio_state(&cand.code, cand.push_price);
-        match paper_trade::simulate(&paper_signal, cand.push_price, cash, total, pos_pct) {
+        let (cash, total, pos_pct) =
+            match paper_trade::portfolio_state(&cand.code, execution_quote.price) {
+                Ok(state) => state,
+                Err(error) => {
+                    log::warn!(
+                        "[evening_review] 跳过 {}({}): 账户快照不可用: {}",
+                        cand.name,
+                        cand.code,
+                        error
+                    );
+                    continue;
+                }
+            };
+        match paper_trade::simulate(&paper_signal, execution_quote.price, cash, total, pos_pct) {
             Ok(_) => {
                 // review fix Issue #4: 参数化绑定
                 diesel::sql_query(
@@ -342,14 +475,12 @@ pub fn evening_review(today: NaiveDate) -> Result<usize, String> {
                 emitted += 1;
                 log::info!(
                     "[evening_review] Momentum 命中 {}({}) → 推 paper_trade",
-                    cand.name, cand.code
+                    cand.name,
+                    cand.code
                 );
             }
             Err(e) => {
-                log::warn!(
-                    "[evening_review] 拒 {}({}): {}",
-                    cand.name, cand.code, e
-                );
+                log::warn!("[evening_review] 拒 {}({}): {}", cand.name, cand.code, e);
             }
         }
     }
@@ -373,6 +504,9 @@ mod tests {
     fn candidate(kind: &str, subkind: &str, vol_ratio: f64) -> Candidate {
         let json = serde_json::json!({
             "vol_ratio": vol_ratio,
+            "price_chg_pct": 0.1,
+            "main_net_yi": 1.0,
+            "sector": "测试板块",
             "push_subkind": subkind,
         })
         .to_string();
@@ -380,11 +514,10 @@ mod tests {
             id: 1,
             push_time: Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
             push_kind: kind.to_string(),
-            code: "000001".to_string(),
+            code: "TEST_CODE_000001".to_string(),
             name: "测试".to_string(),
             push_price: 10.0,
             metric_json: json,
-            source: "intraday".to_string(),
         }
     }
 
@@ -392,7 +525,9 @@ mod tests {
     fn skips_auction_volume_with_low_vol_ratio() {
         let monitor = IntradayMonitor;
         let c = candidate("P-02", "AuctionVolume", 2.0);
-        let s = monitor.evaluate_candidate(&c, Local::now());
+        let s = monitor
+            .evaluate_candidate(&c, Local::now())
+            .expect("valid candidate");
         assert!(s.is_none(), "vol_ratio 2.0 < 5.0 应跳过");
     }
 
@@ -401,10 +536,12 @@ mod tests {
         let monitor = IntradayMonitor;
         let c = candidate("P-02", "AuctionVolume", 8.0);
         // 传 push_time 自身作为 now, 避开精度差
-        let now = c.push_time_parsed();
-        let s = monitor.evaluate_candidate(&c, now);
+        let now = c.push_time_parsed().expect("valid time");
+        let s = monitor
+            .evaluate_candidate(&c, now)
+            .expect("valid candidate");
         assert!(s.is_some());
-        assert_eq!(s.unwrap().source, "VolumeSurge");
+        assert_eq!(s.expect("signal").source, "VolumeSurge");
     }
 
     #[test]
@@ -414,7 +551,9 @@ mod tests {
         c.push_time = (Local::now() - Duration::hours(2))
             .format("%Y-%m-%d %H:%M:%S%.3f")
             .to_string();
-        let s = monitor.evaluate_candidate(&c, Local::now());
+        let s = monitor
+            .evaluate_candidate(&c, Local::now())
+            .expect("valid candidate");
         assert!(s.is_none(), "推送 2h 前应跳过");
     }
 
@@ -423,26 +562,40 @@ mod tests {
         let monitor = IntradayMonitor;
         let c = candidate("D-01", "NewsCatalyst", 0.0);
         // 传 push_time 自身作为 now, 避开精度差
-        let now = c.push_time_parsed();
-        let s = monitor.evaluate_candidate(&c, now);
+        let now = c.push_time_parsed().expect("valid time");
+        let s = monitor
+            .evaluate_candidate(&c, now)
+            .expect("valid candidate");
         assert!(s.is_some());
     }
 
     #[test]
     fn momentum_gets_highest_score() {
         let monitor = IntradayMonitor;
-        let c = candidate("Momentum", "Momentum", 0.0);
-        let now = c.push_time_parsed();
-        let s = monitor.evaluate_candidate(&c, now).unwrap();
-        assert_eq!(s.score, 8.0, "Momentum 应得 8.0 最高分");
+        let c = candidate("Momentum", "Momentum", 6.0);
+        let now = c.push_time_parsed().expect("valid time");
+        let s = monitor
+            .evaluate_candidate(&c, now)
+            .expect("valid candidate")
+            .expect("signal");
+        assert!((s.score - 8.02).abs() < 1e-9, "Momentum 应使用真实指标评分");
     }
 
     #[test]
     fn breakout_score_is_7_5() {
         let monitor = IntradayMonitor;
-        let c = candidate("I-03", "Breakout", 0.0);
-        let now = c.push_time_parsed();
-        let s = monitor.evaluate_candidate(&c, now).unwrap();
+        let mut c = candidate("I-03", "Breakout", 4.0);
+        c.metric_json = serde_json::json!({
+            "vol_ratio": 4.0,
+            "price_chg_pct": 5.0,
+            "push_subkind": "Breakout"
+        })
+        .to_string();
+        let now = c.push_time_parsed().expect("valid time");
+        let s = monitor
+            .evaluate_candidate(&c, now)
+            .expect("valid candidate")
+            .expect("signal");
         assert_eq!(s.score, 7.5);
     }
 
@@ -450,8 +603,34 @@ mod tests {
     fn unknown_kind_returns_none() {
         let monitor = IntradayMonitor;
         let c = candidate("UnknownKind", "UnknownSubkind", 0.0);
-        let s = monitor.evaluate_candidate(&c, Local::now());
+        let s = monitor
+            .evaluate_candidate(&c, Local::now())
+            .expect("valid candidate");
         assert!(s.is_none());
+    }
+
+    #[test]
+    fn rejects_invalid_metric_json_explicitly() {
+        let monitor = IntradayMonitor;
+        let mut c = candidate("P-02", "AuctionVolume", 8.0);
+        c.metric_json = "not-json".to_string();
+        let error = monitor
+            .evaluate_candidate(&c, Local::now())
+            .expect_err("invalid JSON must fail");
+        assert!(error.contains("metric_json 解析失败"));
+    }
+
+    #[test]
+    fn rejects_future_push_time_explicitly() {
+        let monitor = IntradayMonitor;
+        let mut c = candidate("D-01", "NewsCatalyst", 1.0);
+        c.push_time = (Local::now() + Duration::minutes(5))
+            .format("%Y-%m-%d %H:%M:%S%.3f")
+            .to_string();
+        let error = monitor
+            .evaluate_candidate(&c, Local::now())
+            .expect_err("future row must fail");
+        assert!(error.contains("位于未来"));
     }
 
     #[test]

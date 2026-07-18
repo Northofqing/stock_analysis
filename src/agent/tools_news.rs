@@ -5,6 +5,12 @@ use serde_json::json;
 
 pub struct FetchNewsTool;
 
+impl Default for FetchNewsTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FetchNewsTool {
     pub fn new() -> Self {
         Self
@@ -53,7 +59,7 @@ impl Tool for FetchNewsTool {
         let news_str = response.to_context(max_results);
 
         if news_str.is_empty() || news_str.contains("未找到相关结果") {
-            Ok(json!({"error": "No recent news found for this stock."}).to_string())
+            anyhow::bail!("No recent news found for stock {code}")
         } else {
             Ok(news_str)
         }

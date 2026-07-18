@@ -1,3 +1,4 @@
+//! Registered business rules: BR-059.
 //! A股公告抓取（东方财富公告API）。
 //!
 //! 策略：标题即风控——含关键词直接告警，不等正文。
@@ -19,24 +20,24 @@ struct AnnResponse {
 
 #[derive(Debug, Deserialize)]
 struct AnnData {
-    list: Option<Vec<AnnItem>>,
+    list: Vec<AnnItem>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 struct AnnItem {
-    art_code: Option<String>,
-    title: Option<String>,
-    notice_date: Option<String>,
+    art_code: String,
+    title: String,
+    notice_date: String,
     /// 关联股票列表（codes[0] 通常是主股票）
-    codes: Option<Vec<AnnCode>>,
+    codes: Vec<AnnCode>,
     /// 公告分类（columns[0].column_name 如"召开股东大会通知"）
     columns: Option<Vec<AnnColumn>>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
 struct AnnCode {
-    stock_code: Option<String>,
-    short_name: Option<String>,
+    stock_code: String,
+    short_name: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -315,7 +316,7 @@ fn classify_title(title: &str, _code: &str, _name: &str) -> (AnnLevel, String) {
         fn first_match(&self, s: &str) -> Option<String> {
             match self {
                 KwList::Static(v) => v.iter().find(|k| s.contains(**k)).map(|k| k.to_string()),
-                KwList::Owned(v) => v.iter().find(|k| s.contains(k.as_str())).map(|k| k.clone()),
+                KwList::Owned(v) => v.iter().find(|k| s.contains(k.as_str())).cloned(),
             }
         }
         /// review #14: 跳过指定 keyword, 找下一个匹配 (用于减持 <1% 降级场景).
@@ -328,7 +329,7 @@ fn classify_title(title: &str, _code: &str, _name: &str) -> (AnnLevel, String) {
                 KwList::Owned(v) => v
                     .iter()
                     .find(|k| k.as_str() != skip && s.contains(k.as_str()))
-                    .map(|k| k.clone()),
+                    .cloned(),
             }
         }
     }
@@ -337,8 +338,8 @@ fn classify_title(title: &str, _code: &str, _name: &str) -> (AnnLevel, String) {
     // 和"配置加载但 Vec 为空". 用 OnceLock<Option<(Vec,Vec,Vec)>> 显式区分.
     // 同时去掉冗余的 `|| get_announce_keywords().is_some()` (每次 classify_title
     // 调一次 ArcSwap load + Arc clone, 完全违背零分配意图).
-    static CACHED_CFG: std::sync::OnceLock<Option<(Vec<String>, Vec<String>, Vec<String>)>> =
-        std::sync::OnceLock::new();
+    type KeywordGroups = (Vec<String>, Vec<String>, Vec<String>);
+    static CACHED_CFG: std::sync::OnceLock<Option<KeywordGroups>> = std::sync::OnceLock::new();
     // review #15 改进: 首次 init 时如果 config 缺失 (None), 显式 log warn.
     // AGENTS.md §2.2 要求 "missing data fields MUST be left blank or logged as warnings;
     // MUST NOT be silently filled" — config 缺失 = 走 const fallback 是 silent fill.
@@ -383,8 +384,7 @@ fn classify_title(title: &str, _code: &str, _name: &str) -> (AnnLevel, String) {
     // review #14: 改 first_match_skip 替代之前的 inner-loop continue.
     let important_kw = if let Some(pct) = title
         .find("减持")
-        .map(|_| extract_reduction_pct(title))
-        .flatten()
+        .and_then(|_| extract_reduction_pct(title))
     {
         if pct < 1.0 {
             important.first_match_skip(title, "减持")
@@ -421,6 +421,8 @@ fn extract_reduction_pct(title: &str) -> Option<f64> {
 pub async fn fetch_announcements(date: Option<&str>) -> Result<Vec<Announcement>> {
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let date_str = date.unwrap_or(&today);
+    chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
+        .map_err(|error| anyhow::anyhow!("公告查询日期非法 {date_str:?}: {error}"))?;
 
     let client = crate::http_client::SHARED_HTTP_CLIENT.clone();
 
@@ -439,7 +441,37 @@ pub async fn fetch_announcements(date: Option<&str>) -> Result<Vec<Announcement>
         .json()
         .await?;
 
-    let list = resp.data.and_then(|d| d.list).unwrap_or_default();
+    let list = resp
+        .data
+        .ok_or_else(|| anyhow::anyhow!("公告响应缺少 data"))?
+        .list;
+    for (index, item) in list.iter().enumerate() {
+        if item.art_code.trim().is_empty() || item.title.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "公告第 {} 行 art_code/title 缺失",
+                index + 1
+            ));
+        }
+        let notice_date = item
+            .notice_date
+            .get(..10)
+            .ok_or_else(|| anyhow::anyhow!("公告 {} notice_date 字段不足", item.art_code))?;
+        chrono::NaiveDate::parse_from_str(notice_date, "%Y-%m-%d")
+            .map_err(|error| anyhow::anyhow!("公告 {} notice_date 非法: {error}", item.art_code))?;
+        let code = item
+            .codes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("公告 {} 缺少关联股票", item.art_code))?;
+        if code.stock_code.len() != 6
+            || !code.stock_code.bytes().all(|byte| byte.is_ascii_digit())
+            || code.short_name.trim().is_empty()
+        {
+            return Err(anyhow::anyhow!(
+                "公告 {} 股票 code/name 非法",
+                item.art_code
+            ));
+        }
+    }
     info!("[公告] {} 获取 {} 条", date_str, list.len());
 
     // 熔断：超 200 条仅标题扫描
@@ -452,46 +484,43 @@ pub async fn fetch_announcements(date: Option<&str>) -> Result<Vec<Announcement>
     let detail_futures = list
         .iter()
         .filter_map(|item| {
-            let title = item.title.as_deref().unwrap_or("");
-            let (level, _reason) = classify_title(title, "", "");
-            let art_code = item.art_code.as_deref().unwrap_or("");
-            if matches!(level, AnnLevel::Emergency | AnnLevel::Important) && !art_code.is_empty() {
-                Some(art_code.to_string())
+            let (level, _reason) = classify_title(&item.title, "", "");
+            if matches!(level, AnnLevel::Emergency | AnnLevel::Important) {
+                Some(item.art_code.clone())
             } else {
                 None
             }
         })
         .collect::<Vec<_>>();
-    let detail_results: Vec<(String, String)> =
-        futures::future::join_all(detail_futures.iter().map(|art_code| {
-            let c = Arc::clone(&client_arc);
-            let ac = art_code.clone();
-            async move {
-                let content = fetch_ann_detail(&c, &ac).await.unwrap_or_default();
-                (ac, content)
-            }
-        }))
-        .await;
+    let detail_results = futures::future::join_all(detail_futures.iter().map(|art_code| {
+        let c = Arc::clone(&client_arc);
+        let ac = art_code.clone();
+        async move {
+            let content = fetch_ann_detail(&c, &ac).await?;
+            Ok::<_, anyhow::Error>((ac, content))
+        }
+    }))
+    .await
+    .into_iter()
+    .collect::<Result<Vec<_>>>()?;
     let detail_map: std::collections::HashMap<String, String> =
         detail_results.into_iter().collect();
 
     let mut results = Vec::new();
     for item in list {
-        let title = item.title.as_deref().unwrap_or("");
+        let title = item.title.as_str();
 
         // 从 codes[0] 提取股票信息
         let code = item
             .codes
-            .as_ref()
-            .and_then(|c| c.first())
-            .and_then(|c| c.stock_code.as_deref())
-            .unwrap_or("");
+            .first()
+            .map(|code| code.stock_code.as_str())
+            .expect("announcement stock evidence was validated");
         let name = item
             .codes
-            .as_ref()
-            .and_then(|c| c.first())
-            .and_then(|c| c.short_name.as_deref())
-            .unwrap_or("");
+            .first()
+            .map(|code| code.short_name.as_str())
+            .expect("announcement stock evidence was validated");
 
         let (level, reason) = classify_title(title, code, name);
         if matches!(level, AnnLevel::Skip) {
@@ -507,34 +536,28 @@ pub async fn fetch_announcements(date: Option<&str>) -> Result<Vec<Announcement>
             .unwrap_or("");
 
         // 高危公告从预取的 detail_map 取正文
-        let art_code = item.art_code.as_deref().unwrap_or("");
-        let content =
-            if matches!(level, AnnLevel::Emergency | AnnLevel::Important) && !art_code.is_empty() {
-                detail_map.get(art_code).cloned().unwrap_or_default()
-            } else {
-                String::new()
-            };
+        let art_code = item.art_code.as_str();
+        let content = if matches!(level, AnnLevel::Emergency | AnnLevel::Important) {
+            detail_map
+                .get(art_code)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("公告 {art_code} 正文批次缺失"))?
+        } else {
+            String::new()
+        };
 
         // 外部标识：从 art_code 来，非空时构建东方财富 URL
-        let external_id = if art_code.is_empty() {
-            None
-        } else {
-            Some(art_code.to_string())
-        };
-        let url = if art_code.is_empty() {
-            None
-        } else {
-            Some(format!(
-                "https://data.eastmoney.com/notices/detail/{}.html",
-                art_code
-            ))
-        };
+        let external_id = Some(art_code.to_string());
+        let url = Some(format!(
+            "https://data.eastmoney.com/notices/detail/{}.html",
+            art_code
+        ));
 
         results.push(Announcement {
             code: code.to_string(),
             name: name.to_string(),
             title: title.to_string(),
-            date: item.notice_date.as_deref().unwrap_or(date_str).to_string(),
+            date: item.notice_date,
             summary: column_desc.to_string(),
             content,
             level,
@@ -545,6 +568,8 @@ pub async fn fetch_announcements(date: Option<&str>) -> Result<Vec<Announcement>
     }
 
     info!("[公告] 过滤后 {} 条需告警", results.len());
+    crate::monitor::data_mode::mark_capability_success(crate::monitor::data_mode::Capability::News)
+        .map_err(anyhow::Error::msg)?;
     Ok(results)
 }
 
@@ -575,7 +600,10 @@ async fn fetch_ann_detail(client: &reqwest::Client, art_code: &str) -> Result<St
         .await
         .map_err(|e| anyhow::anyhow!("ann detail json: {}", e))?;
 
-    Ok(resp.data.and_then(|d| d.content).unwrap_or_default())
+    resp.data
+        .and_then(|data| data.content)
+        .filter(|content| !content.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("ann detail {art_code} missing content"))
 }
 
 #[cfg(test)]
@@ -583,28 +611,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn br105_announcement_protocol_requires_list_and_row_fields() {
+        assert!(serde_json::from_str::<AnnResponse>(r#"{"data":{}}"#).is_err());
+        assert!(serde_json::from_str::<AnnResponse>(
+            r#"{"data":{"list":[{"art_code":"A1","title":"测试","notice_date":"2026-07-18","codes":[{}]}]}}"#
+        )
+        .is_err());
+    }
+
+    #[test]
     fn test_classify_emergency() {
-        let (lvl, reason) =
-            classify_title("关于收到中国证监会立案调查通知书的公告", "000001", "测试");
+        let (lvl, reason) = classify_title(
+            "关于收到中国证监会立案调查通知书的公告",
+            "TEST_CODE_000001",
+            "测试",
+        );
         assert_eq!(lvl, AnnLevel::Emergency);
         assert!(reason.contains("立案调查"));
     }
 
     #[test]
     fn test_classify_important() {
-        let (lvl, _) = classify_title("关于持股5%以上股东减持股份超过1%的公告", "000002", "测试");
+        let (lvl, _) = classify_title(
+            "关于持股5%以上股东减持股份超过1%的公告",
+            "TEST_CODE_000002",
+            "测试",
+        );
         assert_eq!(lvl, AnnLevel::Important);
     }
 
     #[test]
     fn test_classify_positive() {
-        let (lvl, _) = classify_title("关于回购公司股份方案的公告", "000003", "测试");
+        let (lvl, _) = classify_title("关于回购公司股份方案的公告", "TEST_CODE_000003", "测试");
         assert_eq!(lvl, AnnLevel::Info);
     }
 
     #[test]
     fn test_classify_normal_skip() {
-        let (lvl, _) = classify_title("2025年第三次临时股东大会决议公告", "000004", "测试");
+        let (lvl, _) = classify_title(
+            "2025年第三次临时股东大会决议公告",
+            "TEST_CODE_000004",
+            "测试",
+        );
         assert_eq!(lvl, AnnLevel::Skip);
     }
 
@@ -617,7 +665,11 @@ mod tests {
 
     #[test]
     fn test_small_reduction_downgraded() {
-        let (lvl, _) = classify_title("关于股东减持股份不超过0.5%的提示性公告", "000005", "测试");
+        let (lvl, _) = classify_title(
+            "关于股东减持股份不超过0.5%的提示性公告",
+            "TEST_CODE_000005",
+            "测试",
+        );
         assert_eq!(lvl, AnnLevel::Skip); // <1% 不告警
     }
 
@@ -625,7 +677,7 @@ mod tests {
     fn test_financial_fraud_emergency() {
         let (lvl, _) = classify_title(
             "关于收到证监会涉嫌财务造假立案调查通知书的公告",
-            "000006",
+            "TEST_CODE_000006",
             "测试",
         );
         assert_eq!(lvl, AnnLevel::Emergency);
@@ -633,14 +685,19 @@ mod tests {
 
     #[test]
     fn test_audit_denial_emergency() {
-        let (lvl, _) = classify_title("公司2025年度审计报告被出具否定意见", "000007", "测试");
+        let (lvl, _) = classify_title(
+            "公司2025年度审计报告被出具否定意见",
+            "TEST_CODE_000007",
+            "测试",
+        );
         assert_eq!(lvl, AnnLevel::Emergency);
     }
 
     #[test]
     fn test_restructure_failure_important() {
         // "重组终止" 必须在 Important 中被捕获，不能被 Positive 的 "重组" 误命中
-        let (lvl, reason) = classify_title("关于终止重大资产重组事项的公告", "000008", "测试");
+        let (lvl, reason) =
+            classify_title("关于终止重大资产重组事项的公告", "TEST_CODE_000008", "测试");
         assert_eq!(lvl, AnnLevel::Important);
         assert!(reason.contains("重组"));
     }
@@ -648,7 +705,11 @@ mod tests {
     #[test]
     fn test_restructure_plan_positive() {
         // 真正的重组利好仍应命中 Positive
-        let (lvl, _) = classify_title("关于重大资产重组预案暨关联交易的公告", "000009", "测试");
+        let (lvl, _) = classify_title(
+            "关于重大资产重组预案暨关联交易的公告",
+            "TEST_CODE_000009",
+            "测试",
+        );
         assert_eq!(lvl, AnnLevel::Info);
     }
 
@@ -656,7 +717,7 @@ mod tests {
     fn test_merger_failure_important() {
         let (lvl, _) = classify_title(
             "关于终止发行股份购买资产暨并购重组事项的公告",
-            "000010",
+            "TEST_CODE_000010",
             "测试",
         );
         assert_eq!(lvl, AnnLevel::Important);
@@ -664,37 +725,61 @@ mod tests {
 
     #[test]
     fn test_equity_incentive_positive() {
-        let (lvl, _) = classify_title("关于向激励对象授予限制性股票的公告", "000011", "测试");
+        let (lvl, _) = classify_title(
+            "关于向激励对象授予限制性股票的公告",
+            "TEST_CODE_000011",
+            "测试",
+        );
         assert_eq!(lvl, AnnLevel::Info);
     }
 
     #[test]
     fn test_dividend_positive() {
-        let (lvl, _) = classify_title("2025年度利润分配及高比例现金分红方案公告", "000012", "测试");
+        let (lvl, _) = classify_title(
+            "2025年度利润分配及高比例现金分红方案公告",
+            "TEST_CODE_000012",
+            "测试",
+        );
         assert_eq!(lvl, AnnLevel::Info);
     }
 
     #[test]
     fn test_debt_default_emergency() {
-        let (lvl, _) = classify_title("关于公司债券发生实质性违约的公告", "000013", "测试");
+        let (lvl, _) = classify_title(
+            "关于公司债券发生实质性违约的公告",
+            "TEST_CODE_000013",
+            "测试",
+        );
         assert_eq!(lvl, AnnLevel::Emergency);
     }
 
     #[test]
     fn test_stake_acquisition_positive() {
-        let (lvl, _) = classify_title("关于股东权益变动暨举牌的提示性公告", "000014", "测试");
+        let (lvl, _) = classify_title(
+            "关于股东权益变动暨举牌的提示性公告",
+            "TEST_CODE_000014",
+            "测试",
+        );
         assert_eq!(lvl, AnnLevel::Info);
     }
 
     #[test]
     fn test_executive_resign_important() {
-        let (lvl, _) = classify_title("关于公司总经理及财务负责人辞职的公告", "000015", "测试");
+        let (lvl, _) = classify_title(
+            "关于公司总经理及财务负责人辞职的公告",
+            "TEST_CODE_000015",
+            "测试",
+        );
         assert_eq!(lvl, AnnLevel::Important);
     }
 
     #[test]
     fn test_production_halt_important() {
-        let (lvl, _) = classify_title("关于子公司发生安全事故暂停生产的公告", "000016", "测试");
+        let (lvl, _) = classify_title(
+            "关于子公司发生安全事故暂停生产的公告",
+            "TEST_CODE_000016",
+            "测试",
+        );
         assert_eq!(lvl, AnnLevel::Important);
     }
 }

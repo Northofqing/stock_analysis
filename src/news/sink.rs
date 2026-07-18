@@ -27,7 +27,7 @@ pub fn try_push(np: &NewsPush) -> bool {
         },
         Err(p) => {
             log::warn!("[news::sink] PUSH_TX lock poisoned, push dropped");
-            p.into_inner();
+            drop(p.into_inner());
             false
         }
     }
@@ -42,19 +42,23 @@ mod tests {
     use super::*;
     use crate::signal::market_event::Direction;
 
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_install_creates_pair() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let _rx = install();
         assert!(is_installed());
     }
 
     #[test]
     fn test_try_push_succeeds() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let _rx = install();
         let ok = try_push(&NewsPush {
             text: "abc".into(),
             headline: "h".into(),
-            code: Some("000001".into()),
+            code: Some("TEST_CODE_000001".into()),
             score: 80.0,
             direction: Direction::Bull,
         });

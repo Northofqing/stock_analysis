@@ -36,16 +36,26 @@ static REGISTRY: OnceLock<StrategyRegistry> = OnceLock::new();
 
 impl StrategyRegistry {
     pub fn global() -> &'static Self {
-        REGISTRY.get_or_init(|| Self { map: DashMap::new() })
+        REGISTRY.get_or_init(|| Self {
+            map: DashMap::new(),
+        })
     }
 
     /// Fix review #2 (HIGH): 同 (name, version) 注册覆盖 (复用首次 id, 避免累积多 entry)
     ///
     /// 避免 iter + insert 死锁: 先查 (无写锁), 再 insert (写锁). DashMap iter 不持写锁,
     /// insert 持桶锁, 但单次操作不嵌套, 0 死锁.
-    pub fn register(&self, name: &str, version: &str, description: &str, virtual_reason: &str) -> StrategyId {
+    pub fn register(
+        &self,
+        name: &str,
+        version: &str,
+        description: &str,
+        virtual_reason: &str,
+    ) -> StrategyId {
         // 1. 查同 (name, version) 现有 entry, 复用其 id
-        let existing_id: Option<String> = self.map.iter()
+        let existing_id: Option<String> = self
+            .map
+            .iter()
             .find(|e| e.value().name == name && e.value().version == version)
             .map(|e| e.value().id.clone());
         if let Some(id) = existing_id {
@@ -78,7 +88,11 @@ impl StrategyRegistry {
     }
 
     pub fn list_active(&self) -> Vec<StrategyMeta> {
-        self.map.iter().filter(|e| e.value().active).map(|e| e.value().clone()).collect()
+        self.map
+            .iter()
+            .filter(|e| e.value().active)
+            .map(|e| e.value().clone())
+            .collect()
     }
 
     pub fn list_all(&self) -> Vec<StrategyMeta> {
@@ -110,7 +124,12 @@ pub fn register_v16_3_strategies() {
     r.register("Breakout", "v1", "突破", "Breakout");
     r.register("VolumeSurge", "v1", "放量", "VolumeSurge");
     r.register("LLMSelect", "v1", "LLM 选股 (Gemini 6 分析师)", "LLMSelect");
-    r.register("Momentum", "v1", "动量整合 (air_refuel + cross_resonance)", "Momentum");
+    r.register(
+        "Momentum",
+        "v1",
+        "动量整合 (air_refuel + cross_resonance)",
+        "Momentum",
+    );
 }
 
 #[cfg(test)]
@@ -161,7 +180,10 @@ mod tests {
         register_v16_3_strategies();
         let r = StrategyRegistry::global();
         let all = r.list_all();
-        let count = all.iter().filter(|m| m.name == "NewsCatalyst" || m.name == "Momentum").count();
+        let count = all
+            .iter()
+            .filter(|m| m.name == "NewsCatalyst" || m.name == "Momentum")
+            .count();
         assert!(count >= 2);
     }
 }

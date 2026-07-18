@@ -141,8 +141,8 @@ pub fn compute_chip_distribution(kline_data: &[KlineData]) -> ChipDistribution {
             (((k.high - lo) / step).floor() as isize).clamp(0, BUCKETS as isize - 1) as usize;
         let band = high_idx.saturating_sub(low_idx) + 1;
         let per_bucket = turnover / band as f64;
-        for i in low_idx..=high_idx {
-            chips[i] += per_bucket;
+        for chip in &mut chips[low_idx..=high_idx] {
+            *chip += per_bucket;
         }
     }
 
@@ -196,8 +196,8 @@ pub fn compute_chip_distribution(kline_data: &[KlineData]) -> ChipDistribution {
         let mut low_px = price_mid(0);
         let mut high_px = price_mid(BUCKETS - 1);
         let mut low_done = false;
-        for i in 0..BUCKETS {
-            cum += chips[i];
+        for (i, chip) in chips.iter().enumerate() {
+            cum += chip;
             if !low_done && cum >= tail {
                 low_px = price_mid(i);
                 low_done = true;

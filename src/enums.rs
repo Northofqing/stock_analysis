@@ -9,22 +9,28 @@ use serde::{Deserialize, Serialize};
 /// 用于 API 触发分析时选择推送的报告格式
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum ReportType {
     /// 精简报告
+    #[default]
     Simple,
     /// 完整报告
     Full,
 }
 
-impl ReportType {
-    /// 从字符串安全地转换为枚举值
-    pub fn from_str(value: &str) -> Self {
+impl std::str::FromStr for ReportType {
+    type Err = std::convert::Infallible;
+
+    /// 从字符串安全地转换为枚举值；未知值保持历史默认值 `Simple`。
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.to_lowercase().trim() {
-            "full" => Self::Full,
-            _ => Self::Simple,
+            "full" => Ok(Self::Full),
+            _ => Ok(Self::Simple),
         }
     }
+}
 
+impl ReportType {
     /// 获取用于显示的名称
     pub fn display_name(&self) -> &'static str {
         match self {
@@ -34,22 +40,16 @@ impl ReportType {
     }
 }
 
-impl Default for ReportType {
-    fn default() -> Self {
-        Self::Simple
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_report_type_from_str() {
-        assert_eq!(ReportType::from_str("simple"), ReportType::Simple);
-        assert_eq!(ReportType::from_str("SIMPLE"), ReportType::Simple);
-        assert_eq!(ReportType::from_str("full"), ReportType::Full);
-        assert_eq!(ReportType::from_str("invalid"), ReportType::Simple);
+        assert_eq!("simple".parse(), Ok(ReportType::Simple));
+        assert_eq!("SIMPLE".parse(), Ok(ReportType::Simple));
+        assert_eq!("full".parse(), Ok(ReportType::Full));
+        assert_eq!("invalid".parse(), Ok(ReportType::Simple));
     }
 
     #[test]

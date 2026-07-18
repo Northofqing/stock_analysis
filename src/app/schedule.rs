@@ -241,7 +241,7 @@ async fn execute_analysis(stock_codes: &[String], config: &PipelineConfig) {
                 info!("分析完成，成功 {} 只股票", results.len());
                 if !results.is_empty() {
                     let mut sorted = results.clone();
-                    sorted.sort_by(|a, b| b.sentiment_score.cmp(&a.sentiment_score));
+                    sorted.sort_by_key(|result| std::cmp::Reverse(result.sentiment_score));
                     for r in sorted.iter().take(5) {
                         info!(
                             "  {} {}({}) - {} (评分: {})",

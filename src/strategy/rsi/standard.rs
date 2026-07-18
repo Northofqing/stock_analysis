@@ -590,7 +590,7 @@ impl RsiResult {
                 r.trades.len()
             ));
         }
-        report.push_str("\n");
+        report.push('\n');
 
         // 策略说明
         report.push_str("## 📝 策略说明\n\n");
@@ -726,7 +726,7 @@ impl RsiBacktest {
             let dt = Local
                 .from_local_datetime(&naive.and_hms_opt(15, 0, 0).unwrap())
                 .single()
-                .unwrap_or_else(|| Local::now());
+                .unwrap_or_else(Local::now);
 
             // 成交价：次日 open（避免 look-ahead）。末根信号丢弃
             // 检查次日是否涨跌停/停牌 - 无法成交
@@ -743,7 +743,7 @@ impl RsiBacktest {
                             let dt_next = Local
                                 .from_local_datetime(&d.and_hms_opt(15, 0, 0).unwrap())
                                 .single()
-                                .unwrap_or_else(|| Local::now());
+                                .unwrap_or_else(Local::now);
                             Some((p, dt_next))
                         }
                         _ => None,
@@ -754,8 +754,8 @@ impl RsiBacktest {
             };
 
             // 日期范围过滤：仅在范围内记录净值和交易
-            let in_date_range = self.config.start_date.map_or(true, |s| naive >= s)
-                && self.config.end_date.map_or(true, |e| naive <= e);
+            let in_date_range = self.config.start_date.is_none_or(|s| naive >= s)
+                && self.config.end_date.is_none_or(|e| naive <= e);
 
             if in_date_range {
                 daily_values.push((dt, cash + shares * close));
@@ -822,14 +822,14 @@ impl RsiBacktest {
             // EMA20 + SMA20: 价格接近或触及均线（跌势支撑位确认，而非必须在上方）
             if self.config.use_ema_sma_filter {
                 buy_filter_total += 1;
-                let near_ema = ema20.get(i).copied().flatten().map_or(false, |v| {
+                let near_ema = ema20.get(i).copied().flatten().is_some_and(|v| {
                     close >= v * 0.97 // 在 EMA 下方 3% 以内即可
                 });
                 let near_sma = sma20
                     .get(i)
                     .copied()
                     .flatten()
-                    .map_or(false, |v| close >= v * 0.97);
+                    .is_some_and(|v| close >= v * 0.97);
                 if near_ema || near_sma {
                     buy_filter_score += 1;
                 }
@@ -1037,8 +1037,8 @@ impl RsiBacktest {
 
                 // 价格同时跌破 EMA20 和 SMA20 → 短期趋势破位
                 if self.config.use_ema_sma_filter && !should_sell {
-                    let below_ema = ema20.get(i).copied().flatten().map_or(false, |v| close < v);
-                    let below_sma = sma20.get(i).copied().flatten().map_or(false, |v| close < v);
+                    let below_ema = ema20.get(i).copied().flatten().is_some_and(|v| close < v);
+                    let below_sma = sma20.get(i).copied().flatten().is_some_and(|v| close < v);
                     if below_ema && below_sma {
                         should_sell = true;
                     }
@@ -1106,7 +1106,7 @@ impl RsiBacktest {
             } else {
                 owned = {
                     let mut s = klines.clone();
-                    s.sort_unstable_by(|a, b| a.date.cmp(&b.date));
+                    s.sort_unstable_by_key(|a| a.date);
                     s
                 };
                 &owned
@@ -1177,7 +1177,7 @@ impl RsiBacktest {
                 let dt = Local
                     .from_local_datetime(&naive.and_hms_opt(15, 0, 0).unwrap())
                     .single()
-                    .unwrap_or_else(|| Local::now());
+                    .unwrap_or_else(Local::now);
                 let sum: f64 = maps
                     .iter()
                     .map(|m| {

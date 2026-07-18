@@ -8,7 +8,6 @@
 //! - 主线生命周期通过簇内"昨日涨停/连板"标签数估算，警示高位接力风险。
 
 use anyhow::Result;
-use futures::stream::StreamExt;
 use log::{info, warn};
 use std::collections::{HashMap, HashSet};
 
@@ -20,7 +19,6 @@ use fetchers::{
     fetch_laggard_candidates, fetch_lhb_map,
 };
 
-use crate::agent::tool::Tool;
 use crate::analyzer::{AgentMode, GeminiAnalyzer};
 use crate::database::DatabaseManager;
 use crate::market_data::TopStock;
@@ -221,7 +219,7 @@ pub async fn run_chain_analysis(
 
     if limit_ups.is_empty() {
         return Ok(format!(
-            "# 产业链联动分析报告 {}\n\n今日无涨停股票（或数据获取失败），无可分析内容。\n",
+            "# 产业链联动分析报告 {}\n\n涨停池批次成功返回 0 只，无可分析内容。\n",
             date
         ));
     }
@@ -232,7 +230,9 @@ pub async fn run_chain_analysis(
 
     // 1. 概念标签（带缓存）
     let codes: Vec<String> = limit_ups.iter().map(|s| s.code.clone()).collect();
-    let concepts = fetch_concepts_cached(&codes).await;
+    let concepts = fetch_concepts_cached(&codes)
+        .await
+        .map_err(anyhow::Error::msg)?;
 
     // 2. 概念共现聚类
     let (mut clusters, isolated) = cluster_by_concept(&limit_ups, &concepts, min_cluster_size());
@@ -244,27 +244,33 @@ pub async fn run_chain_analysis(
 
     // 2.5 主线落库 + 生命周期（连续上榜天数）
     {
-        let db = DatabaseManager::get();
+        let db = DatabaseManager::try_get()
+            .ok_or_else(|| anyhow::anyhow!("产业链主线数据库未初始化"))?;
         let rows: Vec<(String, Vec<String>, i32)> = clusters
             .iter()
             .map(|c| {
-                (
+                Ok((
                     c.concept.clone(),
                     c.stocks.iter().map(|s| s.code.clone()).collect(),
-                    c.continuation_count as i32,
-                )
+                    i32::try_from(c.continuation_count).map_err(|error| {
+                        anyhow::anyhow!("主线 {} continuation_count 溢出: {error}", c.concept)
+                    })?,
+                ))
             })
-            .collect();
-        db.save_chain_clusters(&date, &rows);
+            .collect::<Result<Vec<_>>>()?;
+        db.save_chain_clusters(&date, &rows)
+            .map_err(anyhow::Error::msg)?;
         for c in clusters.iter_mut() {
-            c.streak_days = db.get_chain_streak_days(&c.concept, 10);
+            c.streak_days = db
+                .get_chain_streak_days_strict(&c.concept, 10)
+                .map_err(anyhow::Error::msg)?;
         }
     }
 
     // 2.6 补涨候选：从东财概念板块成分股中找未涨停、涨幅适中的标的
     {
         let limit_codes: HashSet<String> = limit_ups.iter().map(|s| s.code.clone()).collect();
-        let board_map = fetch_board_code_map().await;
+        let board_map = fetch_board_code_map().await.map_err(anyhow::Error::msg)?;
         info!("[产业链] 概念板块索引 {} 个", board_map.len());
         for c in clusters
             .iter_mut()
@@ -289,19 +295,20 @@ pub async fn run_chain_analysis(
                     })
                 })
                 .or_else(|| resolve_concept_alias(&c.concept, &board_map));
-            if let Some(code) = board_code {
-                c.candidates = fetch_laggard_candidates(code, &limit_codes).await;
-            } else {
-                warn!("[产业链] 主线「{}」未匹配到概念板块代码", c.concept);
-            }
+            let code = board_code.ok_or_else(|| {
+                anyhow::anyhow!("产业链主线「{}」未匹配到概念板块代码", c.concept)
+            })?;
+            c.candidates = fetch_laggard_candidates(code, &limit_codes)
+                .await
+                .map_err(anyhow::Error::msg)?;
         }
     }
 
     // 2.7 持仓主线诊断
-    let position_diags = diagnose_positions(&clusters).await;
+    let position_diags = diagnose_positions(&clusters).await?;
 
-    // 3. 龙虎榜净买入（best-effort）
-    let lhb_map = fetch_lhb_map().await;
+    // 3. 龙虎榜净买入（完整真实批次，空集合仅表示今日确无记录）
+    let lhb_map = fetch_lhb_map().await.map_err(anyhow::Error::msg)?;
 
     // 4. 宏观新闻（未传入则 best-effort 在线搜索）
     let macro_ctx = resolve_macro_news(macro_news).await;
@@ -316,7 +323,7 @@ pub async fn run_chain_analysis(
     let mut cluster_sections: Vec<(String, Option<String>)> = Vec::new();
     let mut deep_count = 0;
     let mut simple_count = 0;
-    for (_i, cluster) in clusters.iter().enumerate() {
+    for cluster in clusters.iter() {
         let stock_count = cluster.stocks.len();
         let analysis = if stock_count >= TIER1_MIN && llm_ok && deep_count < MAX_DEEP_ANALYSIS {
             deep_count += 1;
@@ -480,7 +487,7 @@ fn cluster_by_concept(
         let continuation_count = cluster_stocks
             .iter()
             .filter(|s| {
-                concepts.get(&s.code).map_or(false, |bs| {
+                concepts.get(&s.code).is_some_and(|bs| {
                     bs.iter()
                         .any(|b| b.contains("昨日涨停") || b.contains("昨日连板"))
                 })
@@ -597,7 +604,7 @@ fn resolve_concept_alias<'a>(
 pub struct PositionDiag {
     pub code: String,
     pub name: String,
-    pub return_rate: f64,
+    pub return_rate: Option<f64>,
     /// 命中的主线概念（含 streak 天数），无则为空
     pub mainline: Option<(String, i64)>,
     /// 今日是否涨停（在主线簇成员中）
@@ -605,20 +612,22 @@ pub struct PositionDiag {
 }
 
 /// 持仓股与今日主线的归属诊断（确定性本地匹配，不依赖 LLM）。
-async fn diagnose_positions(clusters: &[ChainCluster]) -> Vec<PositionDiag> {
-    let db = DatabaseManager::get();
-    let positions = match db.get_all_open_positions() {
-        Ok(p) => p,
-        Err(_) => return Vec::new(),
-    };
+async fn diagnose_positions(clusters: &[ChainCluster]) -> Result<Vec<PositionDiag>> {
+    let db =
+        DatabaseManager::try_get().ok_or_else(|| anyhow::anyhow!("持仓主线诊断数据库未初始化"))?;
+    let positions = db
+        .get_all_open_positions()
+        .map_err(|error| anyhow::anyhow!("持仓主线诊断查询失败: {error}"))?;
     if positions.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     // 持仓股的概念标签（带缓存）
     let codes: Vec<String> = positions.iter().map(|p| p.code.clone()).collect();
-    let concept_map = fetch_concepts_cached(&codes).await;
+    let concept_map = fetch_concepts_cached(&codes)
+        .await
+        .map_err(anyhow::Error::msg)?;
 
-    positions
+    Ok(positions
         .iter()
         .map(|p| {
             let in_limit_pool = clusters
@@ -629,7 +638,7 @@ async fn diagnose_positions(clusters: &[ChainCluster]) -> Vec<PositionDiag> {
                 .iter()
                 .find(|c| {
                     c.stocks.iter().any(|s| s.code == p.code)
-                        || concept_map.get(&p.code).map_or(false, |tags| {
+                        || concept_map.get(&p.code).is_some_and(|tags| {
                             tags.iter()
                                 .any(|t| t == &c.concept || c.aliases.contains(t))
                         })
@@ -638,12 +647,12 @@ async fn diagnose_positions(clusters: &[ChainCluster]) -> Vec<PositionDiag> {
             PositionDiag {
                 code: p.code.clone(),
                 name: p.name.clone(),
-                return_rate: p.return_rate.unwrap_or(0.0),
+                return_rate: p.return_rate,
                 mainline,
                 in_limit_pool,
             }
         })
-        .collect()
+        .collect())
 }
 
 // fetch_lhb_map 已抽到 chain_analysis/fetchers.rs (修复 Top10#3+#4)
@@ -906,8 +915,7 @@ fn parse_chain_score(analysis: &str) -> Option<ChainScore> {
         // 找下一行
         analysis
             .lines()
-            .skip_while(|l| !l.trim().starts_with("【评分】"))
-            .next()?
+            .find(|l| l.trim().starts_with("【评分】"))?
             .trim()
     };
 
@@ -973,16 +981,20 @@ async fn synthesize_overview(
             "| 代码 | 名称 | 持仓收益% | 主线归属 | 今日是否涨停 |\n|---|---|---|---|---|\n",
         );
         for d in position_diags {
+            let return_rate = d
+                .return_rate
+                .map(|value| format!("{value:.2}"))
+                .unwrap_or_else(|| "暂无".to_string());
             let ml = d
                 .mainline
                 .as_ref()
                 .map(|(c, days)| format!("{}（上榜{}天）", c, days.max(&1)))
                 .unwrap_or_else(|| "无（不在今日任何主线）".to_string());
             b.push_str(&format!(
-                "| {} | {} | {:.2} | {} | {} |\n",
+                "| {} | {} | {} | {} | {} |\n",
                 d.code,
                 d.name,
-                d.return_rate,
+                return_rate,
                 ml,
                 if d.in_limit_pool { "是" } else { "否" }
             ));
@@ -1108,8 +1120,8 @@ fn build_report(
         "> 涨停 **{}** 只｜主线 **{}** 条（深度分析 {} 条 + 简化分析 {} 条）｜孤立 **{}** 只。概念标签来自东财 F10 存在蹭概念污染，结论为倾向性参考而非交易指令。\n\n",
         limit_ups.len(),
         clusters.len(),
-        sections.iter().filter(|(_, a)| a.is_some() && a.as_ref().map_or(false, |t| t.contains("【结论】"))).count(),
-        sections.iter().filter(|(_, a)| a.is_some() && a.as_ref().map_or(false, |t| t.contains("【简评】"))).count(),
+        sections.iter().filter(|(_, a)| a.is_some() && a.as_ref().is_some_and(|t| t.contains("【结论】"))).count(),
+        sections.iter().filter(|(_, a)| a.is_some() && a.as_ref().is_some_and(|t| t.contains("【简评】"))).count(),
         isolated.len()
     ));
 
@@ -1174,6 +1186,10 @@ fn build_report(
         md.push_str("## 持仓主线诊断\n\n");
         md.push_str("| 持仓 | 收益% | 今日涨停 | 主线归属 | 主线评分 | 上榜天数 |\n|---|---|---|---|---|---|\n");
         for d in position_diags {
+            let return_rate = d
+                .return_rate
+                .map(|value| format!("{value:.2}"))
+                .unwrap_or_else(|| "暂无".to_string());
             let (ml, score_str, days) = match &d.mainline {
                 Some((c, days)) => {
                     let sc = clusters
@@ -1188,10 +1204,10 @@ fn build_report(
                 None => ("无（不在今日主线）", "-".to_string(), "-".to_string()),
             };
             md.push_str(&format!(
-                "| {}({}) | {:.2} | {} | {} | {} | {} |\n",
+                "| {}({}) | {} | {} | {} | {} | {} |\n",
                 d.name,
                 d.code,
-                d.return_rate,
+                return_rate,
                 if d.in_limit_pool { "✅" } else { "—" },
                 ml,
                 score_str,
@@ -1256,10 +1272,10 @@ fn build_report(
 
         // 展示评分卡
         if let Some(score) = scores.get(i).and_then(|s| s.as_ref()) {
-            md.push_str(&format!(
-                "| 维度 | 产业逻辑 | 情绪位置 | 资金共识 | 筹码健康 | 证伪概率 | **总评分** |\n"
-            ));
-            md.push_str(&format!("|---|---|---|---|---|---|---|\n"));
+            md.push_str(
+                "| 维度 | 产业逻辑 | 情绪位置 | 资金共识 | 筹码健康 | 证伪概率 | **总评分** |\n",
+            );
+            md.push_str("|---|---|---|---|---|---|---|\n");
             md.push_str(&format!(
                 "| 得分 | {:.0}/100 | {:.0}/100 | {:.0}/100 | {:.0}/100 | {:.0}/100 | **{:.0}/100** |\n",
                 score.logic_hardness,
@@ -1276,21 +1292,18 @@ fn build_report(
             ));
         }
 
-        match analysis {
-            Some(a) => {
-                // 去掉评分行避免在正文中重复显示（已在表格中展示）
-                let cleaned_analysis: String = a
-                    .lines()
-                    .filter(|l| {
-                        let t = l.trim();
-                        !t.starts_with("【评分】") && !t.starts_with("【结论】")
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                md.push_str(cleaned_analysis.trim());
-                md.push_str("\n\n");
-            }
-            None => {}
+        if let Some(a) = analysis {
+            // 去掉评分行避免在正文中重复显示（已在表格中展示）
+            let cleaned_analysis: String = a
+                .lines()
+                .filter(|l| {
+                    let t = l.trim();
+                    !t.starts_with("【评分】") && !t.starts_with("【结论】")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            md.push_str(cleaned_analysis.trim());
+            md.push_str("\n\n");
         }
     }
 
@@ -1434,6 +1447,8 @@ mod tests {
 
     #[test]
     fn test_parse_conclusion_simple_format() {
+        // Protocol-format exception: this parser consumes provider text whose
+        // stock symbols are native six-digit values.
         let analysis = "【简评】阶段=发酵中｜参与=可关注｜候选=600123\n催化...";
         let (stage, rating, cands) =
             parse_conclusion(analysis).expect("should parse simple format");
@@ -1520,14 +1535,14 @@ mod tests {
         let date = "2026-06-13";
         let stocks = vec![
             TopStock {
-                code: "000001".into(),
+                code: "TEST_CODE_000001".into(),
                 name: "测试A".into(),
                 change_pct: 10.0,
                 price: 10.0,
                 ..Default::default()
             },
             TopStock {
-                code: "000002".into(),
+                code: "TEST_CODE_000002".into(),
                 name: "测试B".into(),
                 change_pct: 9.5,
                 price: 20.0,
@@ -1578,21 +1593,21 @@ mod tests {
         let date = "2026-06-13";
         let stocks = vec![
             TopStock {
-                code: "000001".into(),
+                code: "TEST_CODE_000001".into(),
                 name: "小概念A".into(),
                 change_pct: 10.0,
                 price: 10.0,
                 ..Default::default()
             },
             TopStock {
-                code: "000002".into(),
+                code: "TEST_CODE_000002".into(),
                 name: "小概念B".into(),
                 change_pct: 9.0,
                 price: 20.0,
                 ..Default::default()
             },
             TopStock {
-                code: "000003".into(),
+                code: "TEST_CODE_000003".into(),
                 name: "小概念C".into(),
                 change_pct: 8.0,
                 price: 30.0,
@@ -1636,7 +1651,7 @@ mod tests {
     fn test_build_report_position_diag_with_scores() {
         let date = "2026-06-13";
         let stocks = vec![TopStock {
-            code: "000001".into(),
+            code: "TEST_CODE_000001".into(),
             name: "测试持仓".into(),
             change_pct: 10.0,
             price: 10.0,
@@ -1662,9 +1677,9 @@ mod tests {
         let sections = vec![("电池技术".into(), Some(analysis.to_string()))];
         let concepts: HashMap<String, Vec<String>> = HashMap::new();
         let diags = vec![PositionDiag {
-            code: "000001".into(),
+            code: "TEST_CODE_000001".into(),
             name: "测试持仓".into(),
-            return_rate: 5.0,
+            return_rate: Some(5.0),
             mainline: Some(("电池技术".into(), 2)),
             in_limit_pool: true,
         }];

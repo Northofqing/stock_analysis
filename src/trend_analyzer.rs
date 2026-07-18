@@ -712,11 +712,9 @@ impl StockTrendAnalyzer {
                     score = 55;
                     risks.push("❌ 触发顶背离共振，强制降级至观望档位".to_string());
                 }
-            } else if ind.death_cross_resonance {
-                if score >= 65 {
-                    score = 59;
-                    risks.push("❌ 触发死叉共振，强制降级至观望档位".to_string());
-                }
+            } else if ind.death_cross_resonance && score >= 65 {
+                score = 59;
+                risks.push("❌ 触发死叉共振，强制降级至观望档位".to_string());
             }
         }
 
@@ -848,9 +846,9 @@ mod tests {
     fn test_trend_analyzer() {
         let data = create_test_data(60);
         let analyzer = StockTrendAnalyzer::new();
-        let result = analyzer.analyze(&data, "000001");
+        let result = analyzer.analyze(&data, "TEST_CODE_000001");
 
-        assert_eq!(result.code, "000001");
+        assert_eq!(result.code, "TEST_CODE_000001");
         assert!(result.current_price > 0.0);
         assert!(result.ma5 > 0.0);
         assert!(result.signal_score >= 0 && result.signal_score <= 100);

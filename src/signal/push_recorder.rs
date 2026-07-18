@@ -71,7 +71,11 @@ pub fn record(meta: &PushRecordMeta) -> Result<i64, String> {
 
     log::info!(
         "[push_recorder] 入池 {}({}) kind={} source={} → pushed_stocks#{}",
-        meta.name, meta.code, meta.push_kind, meta.source, row.id
+        meta.name,
+        meta.code,
+        meta.push_kind,
+        meta.source,
+        row.id
     );
     Ok(row.id)
 }
@@ -85,7 +89,7 @@ mod tests {
     #[test]
     fn push_record_meta_clone() {
         let m = PushRecordMeta {
-            code: "000001".to_string(),
+            code: "TEST_CODE_000001".to_string(),
             name: "测试".to_string(),
             push_kind: "D-01".to_string(),
             push_price: 10.5,
@@ -100,7 +104,7 @@ mod tests {
     #[test]
     fn push_record_meta_debug() {
         let m = PushRecordMeta {
-            code: "000001".to_string(),
+            code: "TEST_CODE_000001".to_string(),
             name: "测试".to_string(),
             push_kind: "D-01".to_string(),
             push_price: 10.5,
@@ -109,6 +113,6 @@ mod tests {
         };
         let s = format!("{:?}", m);
         assert!(s.contains("D-01"));
-        assert!(s.contains("000001"));
+        assert!(s.contains("TEST_CODE_000001"));
     }
 }

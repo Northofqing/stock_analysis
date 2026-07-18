@@ -1,3 +1,4 @@
+//! Registered business rules: BR-043.
 //! Replay infrastructure — v17.3 Task 4.
 
 use std::path::PathBuf;
@@ -237,7 +238,7 @@ mod tests {
             trace_id: format!("trace-{id}"),
             source: "monitor".into(),
             event_type: "push.source".into(),
-            entity_key: Some("600519".into()),
+            entity_key: Some("TEST_CODE_600519".into()),
             payload: serde_json::json!({"kind": "Announcement", "text": text}),
             version: 1,
             replay_of: None,
@@ -307,7 +308,7 @@ mod tests {
     async fn force_replay_skips_delivery_events() {
         let event = ReplayablePushEvent::new(
             "Announcement".into(),
-            Some("600519".into()),
+            Some("TEST_CODE_600519".into()),
             "Test".into(),
             "monitor".into(),
         );

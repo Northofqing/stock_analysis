@@ -15,6 +15,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y sqlite3 python3
+      - name: Build live daily-data freshness evidence
+        run: |
+          mkdir -p data
+          STOCK_DB="$PWD/data/stock_analysis.db" \
+            cargo run --quiet --bin backfill_daily -- 000001
       - name: AGENTS.md 合规门禁
         run: bash tools/compliance/check.sh
       - name: 单元测试 + e2e
@@ -36,7 +41,10 @@ jobs:
           cargo test --test test_design_contradiction -- --test-threads=1
       - name: PR commits spec 引用检查 (PR 触发时)
         if: github.event_name == 'pull_request'
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
         run: |
+          bash tools/compliance/lib/check_pr_evidence.sh
           BASE="${{ github.event.pull_request.base.sha }}"
           HEAD="${{ github.event.pull_request.head.sha }}"
           # 检查 PR 里的 commits 至少有一条含 Refs: 引用

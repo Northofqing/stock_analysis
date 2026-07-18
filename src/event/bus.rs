@@ -107,7 +107,12 @@ impl EventBus {
     pub fn subscribe(&self) -> broadcast::Receiver<EventEnvelope> {
         // SAFETY: &self gives exclusive access; UnsafeCell allows interior mutability.
         // The sender is never handed out mutably.
-        unsafe { (*self.sender.get()).as_ref().expect("bus not shut down").subscribe() }
+        unsafe {
+            (*self.sender.get())
+                .as_ref()
+                .expect("bus not shut down")
+                .subscribe()
+        }
     }
 
     /// Publish an envelope on the bus.
@@ -149,7 +154,9 @@ impl EventBus {
     pub fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);
         // SAFETY: &self gives exclusive access; dropping the sender closes the channel.
-        unsafe { (*self.sender.get()).take(); }
+        unsafe {
+            (*self.sender.get()).take();
+        }
     }
 
     /// Take a snapshot of the current metrics.
@@ -159,6 +166,20 @@ impl EventBus {
             no_subscriber_total: self.no_subscriber_total.load(Ordering::SeqCst),
             rejected_total: self.rejected_total.load(Ordering::SeqCst),
             lagged_total: self.lagged_total.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Number of receivers currently attached to the live sender.
+    pub fn receiver_count(&self) -> usize {
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return 0;
+        }
+        // SAFETY: the option is only removed by `shutdown`; sender itself is
+        // thread-safe and `receiver_count` is read-only.
+        unsafe {
+            (*self.sender.get())
+                .as_ref()
+                .map_or(0, broadcast::Sender::receiver_count)
         }
     }
 
@@ -178,13 +199,13 @@ impl EventBus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::envelope::{DomainEvent, EventEnvelope, PushDeliveryEvent};
+    use crate::event::envelope::{EventEnvelope, PushDeliveryEvent};
 
     fn test_envelope() -> EventEnvelope {
         EventEnvelope::from_event(
             &PushDeliveryEvent::new(
                 "announcement_v1".into(),
-                Some("600519".into()),
+                Some("TEST_CODE_600519".into()),
                 "Pushed".into(),
                 "wechat".into(),
                 42,
@@ -220,7 +241,10 @@ mod tests {
         let mut rx1 = bus.subscribe();
         let mut rx2 = bus.subscribe();
         let env = test_envelope();
-        assert!(matches!(bus.publish(env.clone()), PublishOutcome::Published(2)));
+        assert!(matches!(
+            bus.publish(env.clone()),
+            PublishOutcome::Published(2)
+        ));
         assert_eq!(rx1.recv().await.unwrap().id, env.id);
         assert_eq!(rx2.recv().await.unwrap().id, env.id);
     }
@@ -228,7 +252,10 @@ mod tests {
     #[test]
     fn publish_without_subscribers_is_visible_not_a_panic() {
         let bus = EventBus::new_for_test(8);
-        assert!(matches!(bus.publish(test_envelope()), PublishOutcome::NoSubscribers));
+        assert!(matches!(
+            bus.publish(test_envelope()),
+            PublishOutcome::NoSubscribers
+        ));
         assert_eq!(bus.metrics().no_subscriber_total, 1);
     }
 
@@ -250,13 +277,16 @@ mod tests {
     #[test]
     fn published_total_increments_on_success() {
         let bus = EventBus::new_for_test(8);
-        let mut rx = bus.subscribe();
+        let rx = bus.subscribe();
         bus.publish(test_envelope_with_id("1"));
         bus.publish(test_envelope_with_id("2"));
         assert_eq!(bus.metrics().published_total, 2);
         drop(rx);
         // After dropping the only subscriber, next publish should be NoSubscribers.
-        assert!(matches!(bus.publish(test_envelope()), PublishOutcome::NoSubscribers));
+        assert!(matches!(
+            bus.publish(test_envelope()),
+            PublishOutcome::NoSubscribers
+        ));
         assert_eq!(bus.metrics().no_subscriber_total, 1);
     }
 
@@ -265,14 +295,17 @@ mod tests {
         let bus = EventBus::new_for_test(8);
         bus.shutdown();
         let result = bus.publish(test_envelope());
-        assert!(matches!(result, PublishOutcome::Rejected(RejectReason::ShuttingDown)));
+        assert!(matches!(
+            result,
+            PublishOutcome::Rejected(RejectReason::ShuttingDown)
+        ));
         assert_eq!(bus.metrics().rejected_total, 1);
     }
 
     #[test]
     fn metrics_snapshot_is_consistent_with_active_subscriber() {
         let bus = EventBus::new_for_test(4);
-        let mut rx = bus.subscribe();
+        let rx = bus.subscribe();
         let env = test_envelope();
         bus.publish(env.clone());
         bus.publish(env.clone());
@@ -283,5 +316,15 @@ mod tests {
         assert_eq!(metrics.no_subscriber_total, 0);
         // Drain the channel so the test doesn't warn about the dropped receiver.
         let _ = rx;
+    }
+
+    #[test]
+    fn receiver_count_tracks_live_subscriptions() {
+        let bus = EventBus::new_for_test(4);
+        assert_eq!(bus.receiver_count(), 0);
+        let receiver = bus.subscribe();
+        assert_eq!(bus.receiver_count(), 1);
+        drop(receiver);
+        assert_eq!(bus.receiver_count(), 0);
     }
 }

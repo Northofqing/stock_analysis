@@ -1,3 +1,4 @@
+//! Registered business rules: BR-053.
 //! 消息监控中枢（Phase 1.5 独立子系统）。
 //!
 //! 与价格扫描器平级，共用 SignalStateMachine + AlertRouter。
@@ -265,6 +266,7 @@ impl NewsMonitor {
                             Some(truncate_str(&short_title, 100))
                         }
                     },
+                    news_importance: None,
                     ai_decision: None,
                     t1_locked: false,
                     extra: if hit_summary.is_empty() {
@@ -341,6 +343,7 @@ impl NewsMonitor {
                 threshold: None,
                 news_title: Some(title.to_string()),
                 news_summary: None,
+                news_importance: Some(importance),
                 ai_decision: None,
                 t1_locked: false,
                 extra: if hit_names.is_empty() {
@@ -394,8 +397,7 @@ impl NewsMonitor {
         let keys: Vec<&String> = self.seen_titles.iter().collect();
         let _ = conn.transaction::<_, diesel::result::Error, _>(|conn| {
             for chunk in keys.chunks(200) {
-                let placeholders = std::iter::repeat("(?)")
-                    .take(chunk.len())
+                let placeholders = std::iter::repeat_n("(?)", chunk.len())
                     .collect::<Vec<_>>()
                     .join(",");
                 let sql = format!("INSERT OR IGNORE INTO news_dedup(key) VALUES {placeholders}");
@@ -432,7 +434,7 @@ impl NewsMonitor {
             }
         }
         // 清理非今天的过期 key
-        let _ = diesel::sql_query(&format!(
+        let _ = diesel::sql_query(format!(
             "DELETE FROM news_dedup WHERE created_at < '{}'",
             today
         ))
@@ -606,7 +608,7 @@ mod tests {
     #[test]
     fn test_process_flash_with_hit() {
         let mut nm = NewsMonitor::new();
-        nm.linker.register_position("000547", "航天发展");
+        nm.linker.register_position("TEST_CODE_000547", "航天发展");
         let event = nm.process_flash("航天发展获大额订单", "金十", 4);
         assert!(event.is_some());
         assert_eq!(event.unwrap().level, AlertLevel::Emergency); // 重要+命中持仓=紧急
@@ -622,7 +624,7 @@ mod tests {
     #[test]
     fn test_dedup_blocks_duplicate() {
         let mut nm = NewsMonitor::new();
-        nm.linker.register_position("000547", "航天发展");
+        nm.linker.register_position("TEST_CODE_000547", "航天发展");
         let first = nm.process_flash("航天发展中标大单", "金十", 4);
         let second = nm.process_flash("航天发展中标大单", "见闻", 3);
         assert!(first.is_some());
@@ -688,8 +690,8 @@ mod tests {
             "./test_data/test_ai.db",
         )));
         let mut nm = NewsMonitor::new();
-        nm.linker.register_position("002421", "达实智能"); // L1过滤需要
-                                                           // 模拟API返回空code/name，但标题含公司名
+        nm.linker.register_position("TEST_CODE_002421", "达实智能"); // L1过滤需要
+                                                                     // 模拟API返回空code/name，但标题含公司名
         let ann = announcement::Announcement {
             code: String::new(),
             name: String::new(),
@@ -719,7 +721,7 @@ mod tests {
         let mut nm = NewsMonitor::new();
         // 科森科技不在持仓/自选 → L1过滤
         let ann = announcement::Announcement {
-            code: "603626".into(),
+            code: "TEST_CODE_603626".into(),
             name: "科森科技".into(),
             title: "科森科技:关于控股股东部分股份质押的公告".into(),
             date: "2026-06-15".into(),

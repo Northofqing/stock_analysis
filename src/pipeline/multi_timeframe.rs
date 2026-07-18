@@ -2,12 +2,12 @@
 //!
 //! 触发条件由调用方判定（评分≥60 / BB+MACD BottomBuy/UptrendStart / RSI Buy 任一）。
 //! 本模块只负责在 blocking 线程池抓取 60min+15min K 线并跑入场点评估，返回可注入
-//! AI prompt 的 Markdown 片段。失败或数据不足时返回 `None`。
+//! AI prompt 的 Markdown 片段。数据不足返回 `Ok(None)`，来源失败显式返回 `Err`。
 
-pub(super) async fn fetch_multi_timeframe_section(code: &str) -> Option<String> {
+pub(super) async fn fetch_multi_timeframe_section(code: &str) -> Result<Option<String>, String> {
     use once_cell::sync::Lazy;
     // 复用单个 HTTP client，避免每次调用都重建连接池
-    static MTF_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+    static MTF_CLIENT: Lazy<Result<reqwest::Client, String>> = Lazy::new(|| {
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(8))
             .user_agent(
@@ -15,27 +15,21 @@ pub(super) async fn fetch_multi_timeframe_section(code: &str) -> Option<String> 
                  AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             )
             .build()
-            .unwrap_or_default()
+            .map_err(|error| format!("创建多周期 HTTP client 失败: {error}"))
     });
 
-    let code_owned = code.to_string();
-    tokio::task::spawn_blocking(move || {
-        let client = &*MTF_CLIENT;
-        // 60min 拉 120 根（约 30 个交易日，足够算 MA20/MACD），15min 拉 80 根
-        let h1 = crate::data_provider::intraday_kline::fetch_blocking(client, &code_owned, 60, 120);
-        let m15 = crate::data_provider::intraday_kline::fetch_blocking(client, &code_owned, 15, 80);
-        if h1.is_empty() || m15.is_empty() {
-            return None;
-        }
-        let assess = crate::strategy::assess_multi_timeframe_entry(&h1, &m15);
-        let section = assess.to_prompt_section();
-        if section.trim().is_empty() {
-            None
-        } else {
-            Some(section)
-        }
-    })
-    .await
-    .ok()
-    .flatten()
+    let client = MTF_CLIENT.as_ref().map_err(Clone::clone)?;
+    let (h1_result, m15_result) = tokio::join!(
+        crate::data_provider::intraday_kline::fetch_async(client, code, 60, 120),
+        crate::data_provider::intraday_kline::fetch_async(client, code, 15, 80)
+    );
+    let h1 = h1_result.map_err(|error| format!("[{code}] 60min K线不可用: {error}"))?;
+    let m15 = m15_result.map_err(|error| format!("[{code}] 15min K线不可用: {error}"))?;
+    let assess = crate::strategy::assess_multi_timeframe_entry(&h1, &m15);
+    let section = assess.to_prompt_section();
+    if section.trim().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(section))
+    }
 }

@@ -65,6 +65,10 @@ fn analyst_summary(
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "fixed analyst-panel boundary keeps each role visible in the debate audit trail"
+)]
 pub(super) async fn run_debate(
     analyzer: &GeminiAnalyzer,
     basics: &str,

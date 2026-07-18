@@ -20,15 +20,20 @@ pub(super) struct ExtraContext {
 ///
 /// 资金流 / 分时 走 [`crate::data_provider::service`] 缓存层，
 /// 与 ReAct Agent 的 `fetch_fund_flow` 工具共享同一份结果，避免重复抓取。
-pub(super) async fn fetch_extra_context(code: &str, kline_data: &[KlineData]) -> ExtraContext {
+pub(super) async fn fetch_extra_context(
+    code: &str,
+    kline_data: &[KlineData],
+) -> Result<ExtraContext, String> {
     // 筹码分布（纯本地计算）
     let chip = crate::data_provider::compute_chip_distribution(kline_data);
     let chip_section = crate::data_provider::format_chip_prompt(&chip);
 
     // 资金流 + 日内分时（缓存复用）
     let svc = crate::data_provider::service::service();
-    let (flow_arc, shape_arc) =
+    let (flow_result, shape_result) =
         tokio::join!(svc.get_money_flow(code, 10), svc.get_intraday_shape(code));
+    let flow_arc = flow_result.map_err(|error| format!("[{code}] 资金流不可用: {error}"))?;
+    let shape_arc = shape_result.map_err(|error| format!("[{code}] 分时不可用: {error}"))?;
     let mut s = crate::data_provider::format_flow_prompt(&flow_arc, &shape_arc);
 
     if !chip_section.is_empty() {
@@ -55,48 +60,54 @@ pub(super) async fn fetch_extra_context(code: &str, kline_data: &[KlineData]) ->
     }
 
     // 产业链主线归属（来自最近一次涨停主线聚类，chain_daily 表）
-    if let Some(chain_note) = chain_mainline_note(code) {
-        s.push_str(&chain_note);
+    match chain_mainline_note(code) {
+        Ok(Some(chain_note)) => s.push_str(&chain_note),
+        Ok(None) => {}
+        Err(error) => {
+            s.push_str(&format!("\n【产业链主线归属不可用】{error}\n"));
+        }
     }
 
     if s.trim().is_empty() {
-        ExtraContext {
+        Ok(ExtraContext {
             section: None,
             money_flow: if flow_arc.is_empty() {
                 None
             } else {
                 Some((*flow_arc).clone())
             },
-        }
+        })
     } else {
-        ExtraContext {
+        Ok(ExtraContext {
             section: Some(s),
             money_flow: if flow_arc.is_empty() {
                 None
             } else {
                 Some((*flow_arc).clone())
             },
-        }
+        })
     }
 }
 
 /// 查询该股是否属于最近一次涨停主线聚类（chain_daily 表），是则返回提示片段。
-fn chain_mainline_note(code: &str) -> Option<String> {
-    let db = crate::database::DatabaseManager::get();
-    let rows = db.get_latest_chain_clusters();
+fn chain_mainline_note(code: &str) -> Result<Option<String>, String> {
+    let db =
+        crate::database::DatabaseManager::try_get().ok_or_else(|| "数据库未初始化".to_string())?;
+    let rows = db.get_latest_chain_clusters_strict()?;
     for row in rows {
-        let codes: Vec<String> = serde_json::from_str(&row.stocks).unwrap_or_default();
+        let codes: Vec<String> = serde_json::from_str(&row.stocks)
+            .map_err(|error| format!("chain_daily {} stocks JSON 非法: {error}", row.concept))?;
         if codes.iter().any(|c| c == code) {
-            let streak = db.get_chain_streak_days(&row.concept, 10).max(1);
-            return Some(format!(
+            let streak = db.get_chain_streak_days_strict(&row.concept, 10)?;
+            return Ok(Some(format!(
                 "\n【产业链主线归属】该股属于 {} 涨停主线「{}」（簇内 {} 只涨停，近10日该主线上榜 {} 天）。\
                  主线发酵期个股动量通常更强，但主线退潮时会被联动补跌，研判时请结合主线生命周期。\n",
                 row.date,
                 row.concept,
                 codes.len(),
                 streak
-            ));
+            )));
         }
     }
-    None
+    Ok(None)
 }

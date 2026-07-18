@@ -1,3 +1,4 @@
+//! Registered business rules: BR-077.
 //! L6 接入层 (push_l6 v14.2 §3.6)
 //!
 //! 把 `notify::push_wechat` 包成 `Sink` 实现, 在全局 `SinkRouter` 中注册.
@@ -158,6 +159,7 @@ pub fn sink_count() -> usize {
 ///
 /// 通过 `health_check_all` 间接拿 names (避免给 SinkRouter 加新 public API).
 /// 同步版本 — 仅测试用 (生产用 health_check_all async).
+#[cfg(test)]
 pub fn sink_names() -> Vec<&'static str> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -209,7 +211,7 @@ mod tests {
         SignalEvent::new(
             SignalSource::HoldingHealth,
             "holding_health",
-            Some("600519".into()),
+            Some("TEST_CODE_600519".into()),
             Local::now(),
             SignalPayload::HoldingHealth(Default::default()),
             Severity::High,
@@ -275,13 +277,9 @@ mod tests {
             count
         );
         let names = sink_names();
+        assert!(names.contains(&"console"), "router 含 console: {:?}", names);
         assert!(
-            names.iter().any(|n| *n == "console"),
-            "router 含 console: {:?}",
-            names
-        );
-        assert!(
-            names.iter().any(|n| *n == "magiclaw"),
+            names.contains(&"magiclaw"),
             "router 含 magiclaw: {:?}",
             names
         );
@@ -326,7 +324,10 @@ mod tests {
             pm.template_id, "holding_event_v1",
             "HoldingEvent 应映射到 stable snake_case_v1"
         );
-        assert!(!pm.template_id.contains("HoldingEvent"), "不再含 PascalCase");
+        assert!(
+            !pm.template_id.contains("HoldingEvent"),
+            "不再含 PascalCase"
+        );
         assert_eq!(pm.text.body, "hello");
         assert_eq!(pm.user_id, "default");
         assert_eq!(pm.template_version, 1);

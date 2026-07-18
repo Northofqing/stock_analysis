@@ -5,10 +5,10 @@
 //! and Task 4 (analyst). These types provide the data contracts that downstream
 //! code (Task 5 adapter) will consume.
 
-use chrono::{NaiveDate, Datelike};
+use super::{NormalizedSourceError, NormalizedSourceEvent, SourcePushKind};
 use crate::data_provider::announcement::Announcement;
 use crate::search_service::SearchResult;
-use super::{NormalizedSourceEvent, NormalizedSourceError, SourcePushKind};
+use chrono::{Datelike, NaiveDate};
 
 /// Result of earnings classification (actual vs reference).
 ///
@@ -176,7 +176,10 @@ pub fn classify_earnings(
     // Actual EPS
     let actual_eps = actual.eps?;
     if !actual_eps.is_finite() {
-        log::debug!("[classify_earnings] actual EPS not finite: {:?}", actual.eps);
+        log::debug!(
+            "[classify_earnings] actual EPS not finite: {:?}",
+            actual.eps
+        );
         return None;
     }
 
@@ -212,7 +215,9 @@ pub fn classify_earnings(
 /// Uses `a.external_id` for event_id if present, otherwise a deterministic
 /// fallback. Direction is derived from `a.level` (Emergency/Important → Bull,
 /// Info → Neutral, Skip → reject).
-pub fn classify_announcement(a: &Announcement) -> Result<NormalizedSourceEvent, NormalizedSourceError> {
+pub fn classify_announcement(
+    a: &Announcement,
+) -> Result<NormalizedSourceEvent, NormalizedSourceError> {
     if a.title.is_empty() {
         return Err(NormalizedSourceError::EmptyTitle);
     }
@@ -298,11 +303,7 @@ mod tests {
     // Test helpers (production code does not use these)
     // -------------------------------------------------------------------------
 
-    fn test_important_announcement(
-        external_id: &str,
-        code: &str,
-        title: &str,
-    ) -> Announcement {
+    fn test_important_announcement(external_id: &str, code: &str, title: &str) -> Announcement {
         Announcement {
             code: code.to_string(),
             name: "测试股票".to_string(),
@@ -341,16 +342,24 @@ mod tests {
 
     #[test]
     fn announcement_maps_to_announcement_not_policy() {
-        let a = test_important_announcement("ann-1", "600519", "关于回购公司股份方案的公告");
+        let a = test_important_announcement(
+            "ann-1",
+            "TEST_CODE_ANNOUNCEMENT",
+            "关于回购公司股份方案的公告",
+        );
         let event = classify_announcement(&a).unwrap();
         assert_eq!(event.push_kind, SourcePushKind::Announcement);
         assert_eq!(event.event_id, "ann-1");
-        assert_eq!(event.code.as_deref(), Some("600519"));
+        assert_eq!(event.code.as_deref(), Some("TEST_CODE_ANNOUNCEMENT"));
     }
 
     #[test]
     fn policy_result_requires_source_and_title() {
-        let result = test_search_result("国务院发布产业政策", "发改委通知公告", "https://example.invalid/policy");
+        let result = test_search_result(
+            "国务院发布产业政策",
+            "发改委通知公告",
+            "https://example.invalid/policy",
+        );
         let event = classify_policy(&result).unwrap();
         assert_eq!(event.push_kind, SourcePushKind::PolicyHit);
         assert_eq!(event.url.as_deref(), Some("https://example.invalid/policy"));
@@ -362,14 +371,14 @@ mod tests {
 
     #[test]
     fn announcement_with_empty_title_is_rejected() {
-        let a = test_important_announcement("ann-x", "600519", "");
+        let a = test_important_announcement("ann-x", "TEST_CODE_EMPTY_TITLE", "");
         let err = classify_announcement(&a).unwrap_err();
         assert!(matches!(err, NormalizedSourceError::EmptyTitle));
     }
 
     #[test]
     fn announcement_external_id_is_preserved() {
-        let a = test_important_announcement("art-12345", "600519", "回购公告");
+        let a = test_important_announcement("art-12345", "TEST_CODE_FALLBACK_ID", "回购公告");
         let event = classify_announcement(&a).unwrap();
         // url should reflect the external_id
         assert!(event.url.is_some());
@@ -398,7 +407,10 @@ mod tests {
     // =========================================================================
 
     /// Test helper: build a FinancialPeriod with given report_date and EPS.
-    fn financial_period(date_str: &str, eps: f64) -> crate::data_provider::financials::FinancialPeriod {
+    fn financial_period(
+        date_str: &str,
+        eps: f64,
+    ) -> crate::data_provider::financials::FinancialPeriod {
         crate::data_provider::financials::FinancialPeriod {
             report_date: Some(date_str.to_string()),
             eps: Some(eps),
@@ -456,7 +468,8 @@ mod tests {
             &financial_period("2026-06-30", 1.10),
             &crate::data_provider::consensus::ConsensusData::default(),
             &EarningsConfig::default()
-        ).is_none());
+        )
+        .is_none());
     }
 
     #[test]

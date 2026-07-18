@@ -1,12 +1,13 @@
+//! Registered business rules: BR-005, BR-048.
 //! v14_adapter.rs — v14.2 七层架构与 v13 推送链路的桥接层 (b011 修复版)
 //!
 //! 严格按 `docs/architecture/v14.2-push-architecture.md` v14.2 §3.4 + b-009 R-4 落地.
 //!
 //! b011 P0-1/P0-2/P1-2 修复后的职责 (两段式, 取代旧 v14_dispatch 单函数):
 //!   1. `v14_gate`   — 投递前闸门: L4 dedup (真实 (kind,code)+冷却窗口) + L5 governance.
-//!                     Deny 也写 L7 留痕 (sink="none", pushed=false).
+//!      Deny 也写 L7 留痕 (sink="none", pushed=false).
 //!   2. `v14_record_delivery` — 投递后记录: 把**真实**投递结果 (成功与否 + 实际通道)
-//!                     写入 L7 push_analytics. sink_name 不再是入口硬编码字面量.
+//!      写入 L7 push_analytics. sink_name 不再是入口硬编码字面量.
 //!
 //! 旧版问题 (b011 实证, 已修):
 //!   - sink_name 入口硬编码 "wechat", 实际走飞书 → analytics 全表假数据
@@ -43,47 +44,40 @@ pub struct V14Stack {
     pub store: Mutex<SqliteStore>,
 }
 
-static V14_STACK: OnceLock<V14Stack> = OnceLock::new();
+static V14_STACK: OnceLock<Result<V14Stack, String>> = OnceLock::new();
 
 /// 构造（或获取）全局 v14.2 stack 单例
-pub fn v14_stack() -> &'static V14Stack {
-    V14_STACK.get_or_init(|| {
-        // W11: SqliteStore 接文件路径 (data/push_analytics.db), 跨进程持久化.
-        //      失败 fallback 到内存模式 (不阻断启动).
-        let store_path = std::path::Path::new("data/push_analytics.db");
-        // b013 review P0-6: 即使内存模式也失败, 也不能 panic (否则 OnceLock poison 永久断推).
-        // 退化: 跑一个 no-op store, 让 L4/L5 仍能跑, L7 仅丢 (降级日志明示).
-        let store = match SqliteStore::open(store_path) {
-            Ok(s) => {
-                log::info!("[v14.2] SqliteStore 持久化到 {:?}", store_path);
-                s
-            }
-            Err(e) => {
-                log::warn!("[v14.2] SqliteStore 文件打开失败 ({}), 试内存模式", e);
-                match SqliteStore::open_in_memory() {
-                    Ok(s) => s,
-                    Err(e2) => {
-                        log::error!("[v14.2] SqliteStore 内存模式也失败 ({}), L7 留痕降级为 no-op", e2);
-                        SqliteStore::open_in_memory().unwrap_or_else(|_| {
-                            // 最后兜底: 直接放弃 store (后续 record 会 no-op)
-                            panic!("v14.2 SqliteStore 三次失败, 需排查环境")
-                        })
-                    }
-                }
-            }
+pub fn v14_stack() -> Result<&'static V14Stack, String> {
+    let initialized = V14_STACK.get_or_init(|| {
+        let test_mode = stock_analysis::risk::env_guard::current_env()
+            == stock_analysis::risk::env_guard::TradingEnv::Test;
+        let store_path = if test_mode {
+            std::path::PathBuf::from("data/test/push_analytics.db")
+        } else {
+            std::path::PathBuf::from("data/push_analytics.db")
         };
-        V14Stack {
+        let parent = store_path
+            .parent()
+            .ok_or_else(|| format!("L7 store path has no parent: {}", store_path.display()))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("create L7 directory {}: {error}", parent.display()))?;
+        let store = SqliteStore::open(&store_path).map_err(|error| {
+            format!("open persistent L7 store {}: {error}", store_path.display())
+        })?;
+        log::info!("[v14.2][BR-113] SqliteStore={}", store_path.display());
+        Ok(V14Stack {
             dispatcher: std::sync::RwLock::new(Dispatcher::new()),
             governance: GovernanceEngine::new(),
             store: Mutex::new(store),
-        }
-    })
+        })
+    });
+    initialized.as_ref().map_err(Clone::clone)
 }
 
 /// 闸门结果 — Approved 携带 event 供投递后 v14_record_delivery 关联
 #[derive(Debug, Clone)]
 pub enum V14Gate {
-    Approved(SignalEvent),
+    Approved(Box<SignalEvent>),
     Deduped,
     Denied(String),
 }
@@ -95,7 +89,7 @@ pub enum V14Gate {
 /// 传入 Some("FactorIC") 让 dedup key 加上第三元组, 实现 per-sub_kind 隔离.
 /// None 时 sub_kind="" (向后兼容, 不破坏现有 caller).
 pub fn v14_gate(kind: PushKind, code: Option<&str>) -> V14Gate {
-    v14_gate_with_sub_kind(kind, code, None)
+    v14_gate_with_sub_kind(kind, code, None, None)
 }
 
 /// v17.6 §5.1: v14_gate 的 sub_kind-aware 版本. daily_report_router 三个公开函数调用.
@@ -103,8 +97,15 @@ pub fn v14_gate_with_sub_kind(
     kind: PushKind,
     code: Option<&str>,
     sub_kind: Option<&str>,
+    cooldown_override_secs: Option<u32>,
 ) -> V14Gate {
-    let stack = v14_stack();
+    let stack = match v14_stack() {
+        Ok(stack) => stack,
+        Err(error) => {
+            log::error!("[v14.2][BR-113] {error}");
+            return V14Gate::Denied("analytics_store_unavailable".to_string());
+        }
+    };
     let (source, kind_str, severity) = map_push_kind(kind);
     let event = SignalEvent::new(
         source,
@@ -121,79 +122,209 @@ pub fn v14_gate_with_sub_kind(
 
     // L5 governance 先判 (data_mode/frozen/quiet_hour/daily_limit)
     let profile = default_profile_for_kind(kind);
-    let ctx = current_governance_ctx();
+    let mut ctx = match current_governance_ctx() {
+        Ok(ctx) => ctx,
+        Err(error) => {
+            log::error!("[v14.2][BR-113] {error}");
+            return V14Gate::Denied("governance_context_unavailable".to_string());
+        }
+    };
+    if profile.max_per_user_per_day.is_some() {
+        let count_result = {
+            let store = match lock_store(stack) {
+                Ok(store) => store,
+                Err(error) => {
+                    log::error!("[v14.2][BR-113] {error}");
+                    return V14Gate::Denied("analytics_store_lock_unavailable".to_string());
+                }
+            };
+            store.count_today_pushed_for_user_and_template(
+                "default",
+                kind_str,
+                ctx.now.date_naive(),
+            )
+        };
+        match count_result {
+            Ok(count) => match u32::try_from(count) {
+                Ok(count) => ctx.today_pushed_count = count,
+                Err(_) => {
+                    return deny_for_unavailable_daily_count(
+                        stack,
+                        &event,
+                        kind_str,
+                        &ctx,
+                        format!("invalid daily count {count}"),
+                    );
+                }
+            },
+            Err(error) => {
+                return deny_for_unavailable_daily_count(
+                    stack,
+                    &event,
+                    kind_str,
+                    &ctx,
+                    error.to_string(),
+                );
+            }
+        }
+    }
     let decision = stack.governance.check(&profile, &event, &ctx);
     if !decision.is_approve() {
         let reason = decision.deny_reason().unwrap_or("unknown").to_string();
         log::info!("[v14.2] L5 deny: PushKind={:?} reason={}", kind, reason);
         // L7 留痕
         let analytics = build_analytics(
-            &event, kind_str, 1, ctx.data_mode, decision, None, false, "none", "default",
+            &event,
+            kind_str,
+            1,
+            ctx.data_mode,
+            decision,
+            None,
+            false,
+            "none",
+            "default",
             vec![],
         );
-        lock_store(&stack).record(&analytics);
+        if let Err(error) = lock_store(stack)
+            .and_then(|store| store.record(&analytics).map_err(|error| error.to_string()))
+        {
+            log::error!("[v14.2][BR-113] L5 deny audit failed: {error}");
+            return V14Gate::Denied("analytics_audit_unavailable".to_string());
+        }
         return V14Gate::Denied(reason);
     }
 
     // L4 dedup (v15.1 A3: 用 reserve() 只检查不插入, 投递成功后由 push_governor_inner 调 commit())
     // v17.6 §5.1: sub_kind 参与 dedup key (per-sub_kind 独立窗口)
-    let cooldown = match kind.cooldown_scope() {
-        CooldownScope::External => None,
-        CooldownScope::PerTicket if code.is_none() => None,
-        _ => kind
-            .cooldown_secs()
-            .map(|s| Duration::from_secs(u64::from(s))),
+    let cooldown = dedup_cooldown(kind, code.is_some(), cooldown_override_secs);
+    let outcome = match lock_dispatcher(stack) {
+        Ok(dispatcher) => dispatcher.reserve(&event, cooldown, sub_kind),
+        Err(error) => {
+            log::error!("[v14.2][BR-113] {error}");
+            return V14Gate::Denied("dedup_lock_unavailable".to_string());
+        }
     };
-    let outcome = lock_dispatcher(&stack).reserve(&event, cooldown, sub_kind);
     if let ReserveOutcome::Deduped = outcome {
-        log::info!("[v14.2] L4 dedup: PushKind={:?} sub_kind={:?} (reserved-only, no insert yet)", kind, sub_kind);
+        log::info!(
+            "[v14.2] L4 dedup: PushKind={:?} sub_kind={:?} (reserved-only, no insert yet)",
+            kind,
+            sub_kind
+        );
         // b013 P1-11: dedup 留痕
         let analytics = build_analytics(
-            &event, kind_str, 1, ctx.data_mode, GovernanceDecision::Approve, None, false,
-            "deduped", "default", vec![],
+            &event,
+            kind_str,
+            1,
+            ctx.data_mode,
+            GovernanceDecision::Approve,
+            None,
+            false,
+            "deduped",
+            "default",
+            vec![],
         );
-        lock_store(&stack).record(&analytics);
+        if let Err(error) = lock_store(stack)
+            .and_then(|store| store.record(&analytics).map_err(|error| error.to_string()))
+        {
+            log::error!("[v14.2][BR-113] L4 dedup audit failed: {error}");
+            return V14Gate::Denied("analytics_audit_unavailable".to_string());
+        }
         return V14Gate::Deduped;
     }
 
-    V14Gate::Approved(event)
+    V14Gate::Approved(Box::new(event))
 }
 
-/// b013 review P0-5: Mutex.lock().expect() poisoning 风险 → 改用 recover_or_panic:
-/// 拿到被 poison 的锁时 .into_inner() 取出内部值继续跑 (poison 只标记历史 panic,
-/// 数据可能不一致但本次 push 必须能完成, 不然整个推送链路死掉).
-fn lock_dispatcher(stack: &'static V14Stack) -> std::sync::RwLockReadGuard<'static, Dispatcher> {
-    match stack.dispatcher.read() {
-        Ok(g) => g,
-        Err(poisoned) => {
-            log::warn!("[v14.2] dispatcher RwLock poisoned, recovering (data may be inconsistent)");
-            poisoned.into_inner()
-        }
+fn lock_dispatcher(
+    stack: &'static V14Stack,
+) -> Result<std::sync::RwLockReadGuard<'static, Dispatcher>, String> {
+    stack
+        .dispatcher
+        .read()
+        .map_err(|_| "dispatcher RwLock poisoned; governance rejected".to_string())
+}
+
+fn dedup_cooldown(
+    kind: PushKind,
+    has_code: bool,
+    cooldown_override_secs: Option<u32>,
+) -> Option<Duration> {
+    match kind.cooldown_scope() {
+        CooldownScope::External => None,
+        CooldownScope::PerTicket if !has_code => None,
+        _ => cooldown_override_secs
+            .or_else(|| kind.cooldown_secs())
+            .map(|secs| Duration::from_secs(u64::from(secs))),
     }
 }
 
 /// v15.1 A3: push 成功后 commit dedup entry (由 push_governor_inner 调用)
-pub fn commit_dedup_for_event(event: &SignalEvent, kind: PushKind) {
-    let stack = v14_stack();
-    let cooldown = kind.cooldown_secs().map(|s| Duration::from_secs(u64::from(s)));
-    lock_dispatcher(&stack).commit(event, cooldown, None);
+pub fn commit_dedup_for_event(
+    event: &SignalEvent,
+    kind: PushKind,
+    sub_kind: Option<&str>,
+    cooldown_override_secs: Option<u32>,
+) -> Result<(), String> {
+    let stack = v14_stack()?;
+    let cooldown = dedup_cooldown(kind, event.code.is_some(), cooldown_override_secs);
+    lock_dispatcher(stack)?.commit(event, cooldown, sub_kind);
+    Ok(())
 }
 
 /// v15.1 A3: push 失败后 rollback (no-op, reserve 不留痕, 保留 API 对称)
-pub fn rollback_dedup_for_event(event: &SignalEvent, kind: PushKind) {
-    let stack = v14_stack();
-    let cooldown = kind.cooldown_secs().map(|s| Duration::from_secs(u64::from(s)));
-    lock_dispatcher(&stack).rollback(event, cooldown, None);
+pub fn rollback_dedup_for_event(
+    event: &SignalEvent,
+    kind: PushKind,
+    sub_kind: Option<&str>,
+    cooldown_override_secs: Option<u32>,
+) -> Result<(), String> {
+    let stack = v14_stack()?;
+    let cooldown = dedup_cooldown(kind, event.code.is_some(), cooldown_override_secs);
+    lock_dispatcher(stack)?.rollback(event, cooldown, sub_kind);
+    Ok(())
 }
 
 fn lock_store(
     stack: &'static V14Stack,
-) -> std::sync::MutexGuard<'static, SqliteStore> {
-    match stack.store.lock() {
-        Ok(g) => g,
-        Err(poisoned) => {
-            log::warn!("[v14.2] store Mutex poisoned, recovering");
-            poisoned.into_inner()
+) -> Result<std::sync::MutexGuard<'static, SqliteStore>, String> {
+    stack
+        .store
+        .lock()
+        .map_err(|_| "L7 store Mutex poisoned; analytics rejected".to_string())
+}
+
+fn deny_for_unavailable_daily_count(
+    stack: &'static V14Stack,
+    event: &SignalEvent,
+    kind_str: &str,
+    ctx: &GovernanceContext,
+    error: String,
+) -> V14Gate {
+    log::error!(
+        "[v14.2][BR-005] daily push count unavailable for {}: {}",
+        kind_str,
+        error
+    );
+    let reason = "daily_limit_count_unavailable".to_string();
+    let analytics = build_analytics(
+        event,
+        kind_str,
+        1,
+        ctx.data_mode,
+        GovernanceDecision::Deny(reason.clone()),
+        None,
+        false,
+        "none",
+        "default",
+        vec![error],
+    );
+    match lock_store(stack)
+        .and_then(|store| store.record(&analytics).map_err(|error| error.to_string()))
+    {
+        Ok(()) => V14Gate::Denied(reason),
+        Err(record_error) => {
+            log::error!("[v14.2][BR-113] daily-count failure audit failed: {record_error}");
+            V14Gate::Denied("analytics_audit_unavailable".to_string())
         }
     }
 }
@@ -207,10 +338,10 @@ pub fn v14_record_delivery(
     text: &str,
     delivered: bool,
     sink_name: &str,
-) {
-    let stack = v14_stack();
+) -> Result<(), String> {
+    let stack = v14_stack()?;
     let (_, kind_str, _) = map_push_kind(kind);
-    let ctx = current_governance_ctx();
+    let ctx = current_governance_ctx()?;
     let analytics = build_analytics(
         event,
         kind_str,
@@ -223,7 +354,9 @@ pub fn v14_record_delivery(
         "default",
         vec![],
     );
-    lock_store(stack).record(&analytics);
+    lock_store(stack)?
+        .record(&analytics)
+        .map_err(|error| error.to_string())?;
     log::info!(
         "[v14.2] L7 record: PushKind={:?} pushed={} sink={} event={}",
         kind,
@@ -231,12 +364,18 @@ pub fn v14_record_delivery(
         sink_name,
         event.event_id
     );
+    Ok(())
 }
 
 /// 测试辅助: 清空 L4 dedup 表 (V14_STACK 是 OnceLock 单例, 跨测试共享)
 #[cfg(test)]
 pub fn _reset_dedup_for_test() {
-    let stack = v14_stack();
+    let mut banner = crate::LATEST_BANNER
+        .lock()
+        .expect("test banner lock must be available");
+    *banner = Some(crate::push_templates::BannerCtx::default());
+    drop(banner);
+    let stack = v14_stack().expect("test L7 store must initialize");
     match stack.dispatcher.write() {
         Ok(g) => g.clear_dedup(),
         Err(poisoned) => poisoned.into_inner().clear_dedup(),
@@ -248,7 +387,7 @@ pub fn _reset_dedup_for_test() {
 /// v17.6 §5.1: sub_kind 参与 dedup key, 测试场景默认 None.
 #[cfg(test)]
 pub fn _commit_dedup_for_test(kind: PushKind, code: Option<&str>) {
-    let stack = v14_stack();
+    let stack = v14_stack().expect("test L7 store must initialize");
     let (source, kind_str, severity) = map_push_kind(kind);
     let event = SignalEvent::new(
         source,
@@ -318,14 +457,20 @@ fn map_push_kind(kind: PushKind) -> (SignalSource, &'static str, Severity) {
         }
         PushKind::PostFixedPriceOrder => (HoldingHealth, "post_fixed_price_order", Severity::High),
         PushKind::PostFixedPriceFill => (HoldingHealth, "post_fixed_price_fill", Severity::High),
-        PushKind::StPriceLimitChanged => {
-            (HoldingHealth, "st_price_limit_changed", Severity::High)
-        }
+        PushKind::StPriceLimitChanged => (HoldingHealth, "st_price_limit_changed", Severity::High),
         PushKind::EtfClosingCallAuction => {
             (SectorRotation, "etf_closing_call_auction", Severity::Normal)
         }
+        PushKind::BlockTradeIntradayConfirm => (
+            HoldingHealth,
+            "block_trade_intraday_confirm",
+            Severity::High,
+        ),
+        PushKind::BlockTradePriceRange => {
+            (HoldingHealth, "block_trade_price_range", Severity::Normal)
+        }
         PushKind::PaperReview => (HoldingHealth, "paper_review", Severity::Normal),
-        // v17.4 能力1 (BR-033)
+        // v17.4 能力1 (BR-082)
         PushKind::NewsFlashCritical => (NewsCatalyst, "news_flash_critical", Severity::High),
         PushKind::NewsFlashAggregated => (NewsCatalyst, "news_flash_aggregated", Severity::Normal),
         PushKind::CandidateInvalidated => {
@@ -335,19 +480,21 @@ fn map_push_kind(kind: PushKind) -> (SignalSource, &'static str, Severity) {
         PushKind::IpoListingApproval | PushKind::IpoProspectus => {
             (SignalSource::Ipo, "ipo_official", Severity::High)
         }
-        PushKind::IpoCatalyst => {
-            (SignalSource::Ipo, "ipo_catalyst", Severity::Normal)
-        }
+        PushKind::IpoCatalyst => (SignalSource::Ipo, "ipo_catalyst", Severity::Normal),
         // v15.3 D5.2: 4 路源 SignalSource 映射
         PushKind::PolicyHit => (SignalSource::Policy, "policy_hit", Severity::High),
         PushKind::EarningsBeat => (SignalSource::Earnings, "earnings_beat", Severity::High),
         PushKind::EarningsMiss => (SignalSource::Earnings, "earnings_miss", Severity::High),
-        PushKind::AnalystUpgrade => {
-            (SignalSource::AnalystView, "analyst_upgrade", Severity::Normal)
-        }
-        PushKind::MarketActionAlert => {
-            (SignalSource::MarketAction, "market_action_alert", Severity::High)
-        }
+        PushKind::AnalystUpgrade => (
+            SignalSource::AnalystView,
+            "analyst_upgrade",
+            Severity::Normal,
+        ),
+        PushKind::MarketActionAlert => (
+            SignalSource::MarketAction,
+            "market_action_alert",
+            Severity::High,
+        ),
     }
 }
 
@@ -374,7 +521,7 @@ fn default_profile_for_kind(kind: PushKind) -> TemplateMetadata {
         data_mode_min: DataMode::Degraded,
         // b011: 不再硬编码 60, 与 §14.3 治理表一致 (0 = 无冷却)
         cooldown_secs: kind.cooldown_secs().map(u64::from).unwrap_or(0),
-        max_per_user_per_day: None,
+        max_per_user_per_day: matches!(kind, PushKind::CandidateBoard).then_some(5),
         always_send_on_data_source_down: false,
     }
 }
@@ -385,22 +532,25 @@ fn default_profile_for_kind(kind: PushKind) -> TemplateMetadata {
 /// `evaluate_data_mode_hook` + `evaluate_account_mode_hook` 周期刷, v41 LATEST_BANNER).
 /// 真实 data_mode (Degraded/Full) + account_mode (Frozen/ReduceOnly/Normal) 真正进 L5.
 /// `is_quiet_hour` 仍接本地时钟 (§3.5 02:00-06:00).
-fn current_governance_ctx() -> GovernanceContext {
+fn current_governance_ctx() -> Result<GovernanceContext, String> {
     let now = Local::now();
     // b013 P0-7: 直接读 LATEST_BANNER (main.rs 顶层 pub static, 由
     // evaluate_account_mode_hook + evaluate_data_mode_hook 周期刷)
     let banner = crate::LATEST_BANNER
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
+        .map_err(|_| "governance banner lock poisoned".to_string())?
         .clone()
-        .unwrap_or_default();
-    GovernanceContext {
+        .ok_or_else(|| "governance banner unavailable".to_string())?;
+    Ok(GovernanceContext {
         data_mode: match banner.data_mode {
             crate::push_templates::DataMode::Full => DataMode::Full,
             crate::push_templates::DataMode::Degraded => DataMode::Degraded,
             _ => DataMode::Down,
         },
-        is_quiet_hour: match std::env::var("STOCK_ANALYSIS_QUIET_HOUR_OVERRIDE").ok().as_deref() {
+        is_quiet_hour: match std::env::var("STOCK_ANALYSIS_QUIET_HOUR_OVERRIDE")
+            .ok()
+            .as_deref()
+        {
             // 显式 override (仅测试/运维用): "0"/"false" 强制非静默, "1"/"true" 强制静默
             // 默认 (未设): 墙钟 02:00-06:00 静默, 行为不变 (v15.x 静默默认值需显式声明才生效)
             // 背景: e2e_t01/t02 断言"推送成功", 凌晨 02-06 点跑必挂 (墙钟依赖),
@@ -410,12 +560,14 @@ fn current_governance_ctx() -> GovernanceContext {
             _ => (2..6).contains(&now.hour()),
         },
         // b013 P0-7: Frozen 模式经 banner 进来, 治理能真正拦
-        is_frozen: matches!(banner.account_mode, crate::push_templates::AccountMode::Frozen),
+        is_frozen: matches!(
+            banner.account_mode,
+            crate::push_templates::AccountMode::Frozen
+        ),
         now,
-        // v15.1 A2.1 TODO: 接线 count_today_for_user 需要 V14Stack.store 改 Arc<SqliteStore>
-        // (avoid unsafe transmute). 当前 daily_limit Deny 暂时仍不可达.
+        // BR-005: 有日上限的模板由 v14_gate 在 L5 检查前从 L7 注入真实成功数。
         today_pushed_count: 0,
-    }
+    })
 }
 
 // ============================================================================
@@ -426,10 +578,50 @@ fn current_governance_ctx() -> GovernanceContext {
 mod tests {
     use super::*;
 
+    fn isolated_stack() -> &'static V14Stack {
+        Box::leak(Box::new(V14Stack {
+            dispatcher: std::sync::RwLock::new(Dispatcher::new()),
+            governance: GovernanceEngine::new(),
+            store: Mutex::new(SqliteStore::open_in_memory().expect("test L7 store")),
+        }))
+    }
+
+    #[test]
+    fn br113_poisoned_dispatcher_lock_is_rejected() {
+        let stack = isolated_stack();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = stack.dispatcher.write().expect("fresh dispatcher lock");
+            panic!("TEST_CODE poison dispatcher");
+        }));
+        assert!(lock_dispatcher(stack).is_err());
+    }
+
+    #[test]
+    fn br113_poisoned_store_lock_is_rejected() {
+        let stack = isolated_stack();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = stack.store.lock().expect("fresh store lock");
+            panic!("TEST_CODE poison store");
+        }));
+        assert!(lock_store(stack).is_err());
+    }
+
     #[test]
     fn v14_stack_init() {
         // v14_stack 是 OnceLock 单例, 跨测试共享, 仅验证可访问.
-        let _stack = v14_stack();
+        let _stack = v14_stack().unwrap();
+    }
+
+    #[test]
+    fn br005_candidate_board_profile_has_daily_limit_five() {
+        assert_eq!(
+            default_profile_for_kind(PushKind::CandidateBoard).max_per_user_per_day,
+            Some(5)
+        );
+        assert_eq!(
+            default_profile_for_kind(PushKind::HoldingEvent).max_per_user_per_day,
+            None
+        );
     }
 
     #[test]
@@ -438,8 +630,8 @@ mod tests {
         _reset_dedup_for_test();
         // HoldingEvent: cooldown=None + Emergency level (quiet_hours_respect=false)
         // → 与时钟无关, 连续两次都应 Approved
-        let g1 = v14_gate(PushKind::HoldingEvent, Some("600519"));
-        let g2 = v14_gate(PushKind::HoldingEvent, Some("600519"));
+        let g1 = v14_gate(PushKind::HoldingEvent, Some("TEST_CODE_600519"));
+        let g2 = v14_gate(PushKind::HoldingEvent, Some("TEST_CODE_600519"));
         assert!(matches!(g1, V14Gate::Approved(_)), "first: {:?}", g1);
         assert!(matches!(g2, V14Gate::Approved(_)), "second: {:?}", g2);
     }
@@ -462,6 +654,50 @@ mod tests {
 
     #[test]
     #[serial_test::serial(cooldown_memo)]
+    fn daily_report_sub_kind_commit_uses_same_key_and_override_window() {
+        _reset_dedup_for_test();
+        let event = SignalEvent::new(
+            SignalSource::HoldingHealth,
+            "daily_report",
+            None,
+            Local::now(),
+            SignalPayload::HoldingHealth(Default::default()),
+            Severity::Normal,
+        );
+        let override_secs = Some(1_800);
+
+        assert_eq!(
+            dedup_cooldown(PushKind::DailyReport, false, override_secs),
+            Some(Duration::from_secs(1_800))
+        );
+        commit_dedup_for_event(
+            &event,
+            PushKind::DailyReport,
+            Some("SectorTier"),
+            override_secs,
+        )
+        .unwrap();
+
+        assert_eq!(
+            lock_dispatcher(v14_stack().unwrap()).unwrap().reserve(
+                &event,
+                Some(Duration::from_secs(1_800)),
+                Some("SectorTier"),
+            ),
+            ReserveOutcome::Deduped
+        );
+        assert_eq!(
+            lock_dispatcher(v14_stack().unwrap()).unwrap().reserve(
+                &event,
+                Some(Duration::from_secs(1_800)),
+                Some("CapitalVerify"),
+            ),
+            ReserveOutcome::Reserved
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(cooldown_memo)]
     fn gate_per_ticket_without_code_skips_l4_cooldown() {
         _reset_dedup_for_test();
         // HoldingPlan (PerTicket 1800s) 不带 code → L4 不冷却 (模板层 memo 负责)
@@ -478,17 +714,17 @@ mod tests {
     #[serial_test::serial(cooldown_memo)]
     fn gate_per_ticket_with_code_dedups_same_code_only() {
         _reset_dedup_for_test();
-        let a1 = v14_gate(PushKind::HoldingPlan, Some("000001"));
+        let a1 = v14_gate(PushKind::HoldingPlan, Some("TEST_CODE_000001"));
         if matches!(a1, V14Gate::Approved(_)) {
             // v15.1 A3: 模拟 push 成功后 commit
-            _commit_dedup_for_test(PushKind::HoldingPlan, Some("000001"));
+            _commit_dedup_for_test(PushKind::HoldingPlan, Some("TEST_CODE_000001"));
             assert!(matches!(
-                v14_gate(PushKind::HoldingPlan, Some("000001")),
+                v14_gate(PushKind::HoldingPlan, Some("TEST_CODE_000001")),
                 V14Gate::Deduped
             ));
             // 不同 code 不受影响 (v59 F1 语义保持)
             assert!(matches!(
-                v14_gate(PushKind::HoldingPlan, Some("000002")),
+                v14_gate(PushKind::HoldingPlan, Some("TEST_CODE_000002")),
                 V14Gate::Approved(_)
             ));
         }

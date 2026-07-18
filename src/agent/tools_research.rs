@@ -1,4 +1,5 @@
 use crate::agent::tool::Tool;
+use anyhow::Context;
 use async_trait::async_trait;
 use chrono::{Duration, Local};
 use futures::future::join_all;
@@ -14,6 +15,12 @@ const SUMMARY_MAX_CHARS: usize = 600;
 
 pub struct FetchResearchTool {
     client: reqwest::Client,
+}
+
+impl Default for FetchResearchTool {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FetchResearchTool {
@@ -106,27 +113,19 @@ impl Tool for FetchResearchTool {
         );
         log::debug!("[研报] {}", url);
 
-        let resp = self
+        let response = self
             .client
             .get(&url)
             .header("Referer", "https://data.eastmoney.com/")
             .send()
-            .await;
-
-        let body: EmReportResponse = match resp {
-            Ok(r) => match r.json().await {
-                Ok(v) => v,
-                Err(e) => {
-                    return Ok(
-                        json!({"error": format!("研报接口 JSON 解析失败: {}", e)}).to_string()
-                    )
-                }
-            },
-            Err(e) => return Ok(json!({"error": format!("研报接口请求失败: {}", e)}).to_string()),
-        };
+            .await
+            .context("研报接口请求失败")?
+            .error_for_status()
+            .context("研报接口 HTTP 状态失败")?;
+        let body: EmReportResponse = response.json().await.context("研报接口 JSON 解析失败")?;
 
         if body.data.is_empty() {
-            return Ok(json!({"error": "近 180 天未查询到机构研报", "code": code}).to_string());
+            anyhow::bail!("近 365 天未查询到机构研报: {code}");
         }
 
         // 评级分布统计
@@ -151,7 +150,7 @@ impl Tool for FetchResearchTool {
         let summaries: Vec<Option<String>> = join_all(detail_futs).await;
         let mut summary_map: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
-        for (r, s) in detail_targets.iter().zip(summaries.into_iter()) {
+        for (r, s) in detail_targets.iter().zip(summaries) {
             if let Some(text) = s {
                 summary_map.insert(r.info_code.clone(), text);
             }
@@ -172,7 +171,7 @@ impl Tool for FetchResearchTool {
                 } else {
                     r.org_name.clone()
                 };
-                let summary = summary_map.get(&r.info_code).cloned().unwrap_or_default();
+                let summary = summary_map.get(&r.info_code).cloned();
                 json!({
                     "title": r.title,
                     "institution": institution,
@@ -229,8 +228,9 @@ async fn fetch_report_summary(client: &reqwest::Client, info_code: &str) -> Opti
     Some(html_to_plain_text(content_html, SUMMARY_MAX_CHARS))
 }
 
-static RE_BLOCK: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?is)<(script|style)[^>]*>.*?</\1>").unwrap());
+static RE_BLOCK: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?is)<script\b[^>]*>.*?</script\s*>|<style\b[^>]*>.*?</style\s*>").unwrap()
+});
 static RE_TAG: Lazy<Regex> = Lazy::new(|| Regex::new(r"<[^>]+>").unwrap());
 static RE_WS: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").unwrap());
 
@@ -256,5 +256,16 @@ fn html_to_plain_text(html: &str, max_chars: usize) -> String {
     } else {
         let truncated: String = compact.chars().take(max_chars).collect();
         format!("{}…", truncated)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::html_to_plain_text;
+
+    #[test]
+    fn html_to_plain_text_removes_script_and_style_blocks() {
+        let html = "<style>.secret{display:none}</style><p>正文</p><script>alert('x')</script>尾部";
+        assert_eq!(html_to_plain_text(html, 100), "正文 尾部");
     }
 }

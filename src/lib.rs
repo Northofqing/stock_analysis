@@ -21,7 +21,7 @@ pub mod market_analyzer;
 pub mod market_data;
 pub mod models;
 pub mod monitor;
-pub mod news;  // v15.1 Phase B: 新闻监测 + IPO 监测 (BIPO 子集)
+pub mod news; // v15.1 Phase B: 新闻监测 + IPO 监测 (BIPO 子集)
 pub mod notification;
 pub mod opportunity;
 pub mod performance; // v16.4 #4: PerformanceSnapshot 独立表
@@ -37,13 +37,13 @@ pub mod sharpe_calculator;
 pub mod signal;
 // v14.2 push 7 层 — 对齐 docs/v14.x/v14.x-master-development.md 的 Phase 2/3 W 周编号
 // (b011 P2-2: 此前注释用的 W2.2/W3.2/W4.1 与 master plan W11-W17 不通用, 已对齐)
-pub mod push_l1;  // Phase 2 W11: v14.2 L1 SignalEvent + event_id 派生
-pub mod push_l2;  // Phase 3 W13: v14.2 L2 TemplateMetadata + DataMode (L3 Render 暂缺, 渲染走 push_templates::render_xxx)
-pub mod push_l4;  // Phase 2 W12 + b011 P0-2: L4 Dispatcher (dedup 闭环已实装)
-pub mod push_l5;  // Phase 3 W15: L5 GovernanceEngine (quiet hours / frozen / data_mode)
-pub mod push_l6;  // Phase 3 W16: L6 Sink trait + ConsoleSink + SinkRouter
-pub mod push_l7;  // Phase 3 W17: L7 PushAnalytics + SqliteStore/InMemoryStore
-pub mod event;    // v17.1-r2: event envelope contract + PushDeliveryEvent
+pub mod event; // v17.1-r2: event envelope contract + PushDeliveryEvent
+pub mod push_l1; // Phase 2 W11: v14.2 L1 SignalEvent + event_id 派生
+pub mod push_l2; // Phase 3 W13: v14.2 L2 TemplateMetadata + DataMode (L3 Render 暂缺, 渲染走 push_templates::render_xxx)
+pub mod push_l4; // Phase 2 W12 + b011 P0-2: L4 Dispatcher (dedup 闭环已实装)
+pub mod push_l5; // Phase 3 W15: L5 GovernanceEngine (quiet hours / frozen / data_mode)
+pub mod push_l6; // Phase 3 W16: L6 Sink trait + ConsoleSink + SinkRouter
+pub mod push_l7; // Phase 3 W17: L7 PushAnalytics + SqliteStore/InMemoryStore
 pub mod strategy;
 pub mod traits;
 pub mod trend_analyzer;
@@ -233,7 +233,7 @@ mod tests {
                 block_on_async_with_timeout(async {}, 1).unwrap();
             });
         });
-        let panic_payload = unwind.err().expect("current_thread runtime 内调应 panic");
+        let panic_payload = unwind.expect_err("current_thread runtime 内调应 panic");
         let panic_msg = extract_panic_message(&panic_payload);
         assert!(
             panic_msg.contains("BLOCK_ON_ASYNC_FLAVOR_ERROR"),

@@ -77,11 +77,19 @@ pub async fn route_factor_ic(text: &str) -> PushOutcome {
 }
 
 /// 公开: SectorTier (v4 赛道分档) → DailyReport 主路径 + [SectorTier] prefix
+#[allow(
+    dead_code,
+    reason = "v17.6 retains this typed migration route while its report producer remains version-gated"
+)]
 pub async fn route_sector_tier(text: &str) -> PushOutcome {
     route(DailyReportSubKind::SectorTier, text).await
 }
 
 /// 公开: CapitalVerify (v4 资金验证) → DailyReport 主路径 + [CapitalVerify] prefix
+#[allow(
+    dead_code,
+    reason = "v17.6 retains this typed migration route while its report producer remains version-gated"
+)]
 pub async fn route_capital_verify(text: &str) -> PushOutcome {
     route(DailyReportSubKind::CapitalVerify, text).await
 }

@@ -28,7 +28,9 @@ pub enum NormalizedSourceError {
     EmptyTitle,
     EmptySource,
     /// code=None is only permitted for PolicyHit
-    CodeRequired { kind: SourcePushKind },
+    CodeRequired {
+        kind: SourcePushKind,
+    },
 }
 
 impl fmt::Display for NormalizedSourceError {
@@ -38,7 +40,11 @@ impl fmt::Display for NormalizedSourceError {
             NormalizedSourceError::EmptyTitle => write!(f, "title must not be empty"),
             NormalizedSourceError::EmptySource => write!(f, "source must not be empty"),
             NormalizedSourceError::CodeRequired { kind } => {
-                write!(f, "{:?} requires a stock code (code=None not permitted)", kind)
+                write!(
+                    f,
+                    "{:?} requires a stock code (code=None not permitted)",
+                    kind
+                )
             }
         }
     }
@@ -85,6 +91,10 @@ impl NormalizedSourceEvent {
     /// - `title` is empty
     /// - `source` is empty
     /// - `code` is `None` for any variant other than `PolicyHit`
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "validated source-event constructor mirrors the normalized event envelope"
+    )]
     pub fn new(
         push_kind: SourcePushKind,
         event_id: String,
@@ -142,7 +152,7 @@ mod tests {
         let event = NormalizedSourceEvent::new(
             SourcePushKind::Announcement,
             "ann-1".into(),
-            Some("600519".into()),
+            Some("TEST_CODE_SOURCE_EVENT".into()),
             "关于回购股份方案的公告".into(),
             "回购".into(),
             Direction::Bull,
@@ -153,11 +163,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(event.event_id, "ann-1");
-        assert_eq!(event.code.as_deref(), Some("600519"));
-        assert_eq!(
-            event.url.as_deref(),
-            Some("https://example.invalid/ann-1")
-        );
+        assert_eq!(event.code.as_deref(), Some("TEST_CODE_SOURCE_EVENT"));
+        assert_eq!(event.url.as_deref(), Some("https://example.invalid/ann-1"));
     }
 
     #[test]
@@ -215,7 +222,7 @@ mod tests {
         let event = NormalizedSourceEvent::new(
             SourcePushKind::Announcement,
             "evt-1".into(),
-            Some("600519".into()),
+            Some("TEST_CODE_METADATA".into()),
             "Test Event".into(),
             "summary".into(),
             Direction::Bull,
@@ -276,7 +283,7 @@ mod tests {
         let err = NormalizedSourceEvent::new(
             SourcePushKind::Announcement,
             "ann-1".into(),
-            Some("600519".into()),
+            Some("TEST_CODE_EMPTY_SOURCE".into()),
             "Title".into(),
             "summary".into(),
             Direction::Bull,

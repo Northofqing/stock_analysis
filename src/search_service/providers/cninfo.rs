@@ -110,7 +110,7 @@ impl CninfoProvider {
 
         let results: Vec<SearchResult> = announcements
             .into_iter()
-            .filter_map(|a| Self::to_result(a))
+            .filter_map(Self::to_result)
             .take(max_results)
             .collect();
 

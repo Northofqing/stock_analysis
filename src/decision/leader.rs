@@ -44,7 +44,6 @@ pub fn identify_leaders(board: &ConceptBoard, components: &[BoardStock]) -> Vec<
         .collect()
 }
 
-
 pub async fn enrich_bom(leaders: &mut [LeaderRank], sector_name: &str) {
     let analyzer = crate::analyzer::GeminiAnalyzer::from_env();
     if !analyzer.is_available() {
@@ -140,6 +139,7 @@ mod tests {
         BoardStock {
             code: code.to_string(),
             name: name.to_string(),
+            price: 10.0,
             change_pct: 0.0,
             amount,
             vol_ratio: 0.0,
@@ -161,15 +161,15 @@ mod tests {
             main_net_pct_5d: 0.0,
         };
         let components = vec![
-            stock("000001", "龙头A", 50e8),
-            stock("000002", "龙头B", 30e8),
-            stock("000003", "龙头C", 20e8),
-            stock("000004", "杂毛D", 1e8),
+            stock("TEST_CODE_000001", "龙头A", 50e8),
+            stock("TEST_CODE_000002", "龙头B", 30e8),
+            stock("TEST_CODE_000003", "龙头C", 20e8),
+            stock("TEST_CODE_000004", "杂毛D", 1e8),
         ];
         let leaders = identify_leaders(&board, &components);
         assert_eq!(leaders.len(), 3);
-        assert_eq!(leaders[0].code, "000001");
+        assert_eq!(leaders[0].code, "TEST_CODE_000001");
         assert_eq!(leaders[0].rank, 1);
-        assert_eq!(leaders[2].code, "000003");
+        assert_eq!(leaders[2].code, "TEST_CODE_000003");
     }
 }

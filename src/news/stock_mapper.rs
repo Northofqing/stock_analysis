@@ -67,7 +67,10 @@ pub fn map_industry_by_keyword(title: &str) -> Vec<StockHit> {
             ("机器人".into(), "机器人/人形机器人/宇树/优必选/智元".into()),
             ("半导体".into(), "半导体/芯片/晶圆/封测/HBM/先进封装".into()),
             ("光伏".into(), "光伏/硅料/硅片/电池片/组件".into()),
-            ("新能源车".into(), "新能源车/锂电池/正极材料/隔膜/电解液".into()),
+            (
+                "新能源车".into(),
+                "新能源车/锂电池/正极材料/隔膜/电解液".into(),
+            ),
         ]
     };
     for (name, kws) in &kw_pairs {
@@ -85,7 +88,10 @@ pub fn map_industry_by_keyword(title: &str) -> Vec<StockHit> {
 }
 
 pub fn map_subject(event: &MarketEvent) -> Vec<StockHit> {
-    if event.subject.is_empty() || event.subject.len() != 6 || !event.subject.chars().all(|c| c.is_ascii_digit()) {
+    if event.subject.is_empty()
+        || event.subject.len() != 6
+        || !event.subject.chars().all(|c| c.is_ascii_digit())
+    {
         return vec![];
     }
     vec![StockHit {
@@ -101,7 +107,11 @@ pub fn map_all(event: &MarketEvent) -> Vec<StockHit> {
     let mut hits = map_subject(event);
     hits.extend(map_unlisted_to_listed(&event.full_title));
     hits.extend(map_industry_by_keyword(&event.full_title));
-    hits.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap_or(std::cmp::Ordering::Equal));
+    hits.sort_by(|a, b| {
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     hits.dedup_by(|a, b| a.code == b.code && a.relation == b.relation);
     hits
 }
@@ -126,7 +136,11 @@ mod tests {
             certainty: 80,
             chains: vec![],
             occurred_at: now,
-            provenance: vec![SourceRef { provider: "test".into(), url: None, fetched_at: now }],
+            provenance: vec![SourceRef {
+                provider: "test".into(),
+                url: None,
+                fetched_at: now,
+            }],
             ai_degraded: false,
             stale: false,
         }
@@ -134,16 +148,28 @@ mod tests {
 
     #[test]
     fn test_relation_for_event_type() {
-        assert_eq!(relation_for_event_type(EventType::Earnings), Relation::EarningsRef);
-        assert_eq!(relation_for_event_type(EventType::AnalystView), Relation::AnalystView);
-        assert_eq!(relation_for_event_type(EventType::Policy), Relation::PolicyImpact);
+        assert_eq!(
+            relation_for_event_type(EventType::Earnings),
+            Relation::EarningsRef
+        );
+        assert_eq!(
+            relation_for_event_type(EventType::AnalystView),
+            Relation::AnalystView
+        );
+        assert_eq!(
+            relation_for_event_type(EventType::Policy),
+            Relation::PolicyImpact
+        );
     }
 
     #[test]
     fn test_map_unlisted_changxin_to_zhaoyi() {
         let hits = map_unlisted_to_listed("长鑫存储递交招股说明书");
         assert!(!hits.is_empty());
-        let zhao = hits.iter().find(|h| h.name == "兆易创新").expect("兆易创新必须命中");
+        let zhao = hits
+            .iter()
+            .find(|h| h.name == "兆易创新")
+            .expect("兆易创新必须命中");
         assert_eq!(zhao.relation, Relation::SupplyChain);
         assert!(zhao.confidence >= 0.7);
     }

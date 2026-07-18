@@ -2,4 +2,4 @@
 
 pub mod snapshot;
 
-pub use snapshot::{PerformanceSnapshot, PerformanceEngine, compute_snapshot, ensure_table};
+pub use snapshot::{compute_snapshot, ensure_table, PerformanceEngine, PerformanceSnapshot};

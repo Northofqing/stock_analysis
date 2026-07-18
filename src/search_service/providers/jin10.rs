@@ -46,6 +46,12 @@ pub struct Jin10Provider {
     client: reqwest::Client,
 }
 
+impl Default for Jin10Provider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Jin10Provider {
     pub fn new() -> Self {
         Self {

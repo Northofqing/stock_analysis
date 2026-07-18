@@ -1,16 +1,11 @@
 //! 真正的 sync 版 get_market_overview (P1.1 真正修复 v4)
 //!
-//! 与 `MarketAnalyzer::get_market_overview` 的区别:
-//!   - 所有 HTTP 用 `reqwest::blocking`, 完全不用 tokio machinery
-//!   - 不需要 async runtime 上下文, 不需要 block_in_place
-//!   - 在 --review 这种"调一次就退出"的场景下 100% 安全
+//! 与 `MarketAnalyzer::get_market_overview` 的区别：所有 HTTP 用
+//! `reqwest::blocking`，完全不用 Tokio machinery；不需要 async runtime 上下文或
+//! `block_in_place`，在 `--review` 这种“调一次就退出”的场景下安全。
 //!
-//! 历史:
-//!   - v1: 用 reqwest::Client (async) + .await, 触发 tokio runtime drop panic
-//!   - v2: 改成 reqwest::blocking, 仍 panic (MarketAnalyzer::new 用 reqwest::blocking::Client
-//!         builder().build() 内部创建 tokio runtime, 在 async context 里 drop 触发 panic)
-//!   - v3 (本版): 彻底不要 MarketAnalyzer 引用, 直接 free function, 只用 reqwest::blocking
-//!         不创建任何 tokio runtime, 安全
+//! 历史：v1 用 async client 触发 runtime drop panic；v2 改 blocking 后，构造器仍会
+//! 间接创建 runtime；v3 改为不引用 `MarketAnalyzer` 的 free function，只用 blocking client。
 
 use crate::data_provider::north_flow::NorthFlowClient;
 use crate::market_data::{MarketIndex, MarketOverview, SectorInfo};
@@ -110,31 +105,70 @@ fn parse_tencent_indices(text: &str) -> Result<Vec<MarketIndex>> {
                 if start < end {
                     let data = &line[start + 1..end];
                     let parts: Vec<&str> = data.split('~').collect();
-                    if parts.len() >= 6 {
-                        let name = parts.get(1).unwrap_or(&"").to_string();
-                        let code = parts.get(2).unwrap_or(&"").to_string();
-                        let current: f64 = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-                        let prev: f64 = parts.get(4).and_then(|s| s.parse().ok()).unwrap_or(0.0);
-                        let pct = if prev > 0.0 {
-                            (current - prev) / prev * 100.0
-                        } else {
-                            0.0
-                        };
-                        out.push(MarketIndex {
-                            code,
-                            name,
-                            current,
-                            change: current - prev,
-                            change_pct: pct,
-                            open: parts.get(5).and_then(|s| s.parse().ok()).unwrap_or(0.0),
-                            high: 0.0,
-                            low: 0.0,
-                            prev_close: prev,
-                            volume: 0.0,
-                            amount: 0.0,
-                            amplitude: 0.0,
-                        });
+                    if parts.len() < 5 {
+                        anyhow::bail!("腾讯指数字段不足: {}", parts.len());
                     }
+                    let required_text = |index: usize, label: &str| -> Result<&str> {
+                        parts
+                            .get(index)
+                            .copied()
+                            .filter(|value| !value.trim().is_empty())
+                            .ok_or_else(|| anyhow::anyhow!("腾讯指数缺少 {label}"))
+                    };
+                    let required_positive = |index: usize, label: &str| -> Result<f64> {
+                        let value = required_text(index, label)?
+                            .parse::<f64>()
+                            .with_context(|| format!("腾讯指数 {label} 无法解析"))?;
+                        if !value.is_finite() || value <= 0.0 {
+                            anyhow::bail!("腾讯指数 {label} 非法: {value}");
+                        }
+                        Ok(value)
+                    };
+                    let optional_non_negative =
+                        |index: usize, label: &str| -> Result<Option<f64>> {
+                            let Some(raw) = parts
+                                .get(index)
+                                .copied()
+                                .filter(|value| !value.trim().is_empty())
+                            else {
+                                return Ok(None);
+                            };
+                            let value = raw
+                                .parse::<f64>()
+                                .with_context(|| format!("腾讯指数 {label} 无法解析"))?;
+                            if !value.is_finite() || value < 0.0 {
+                                anyhow::bail!("腾讯指数 {label} 非法: {value}");
+                            }
+                            Ok(Some(value))
+                        };
+
+                    let name = required_text(1, "name")?.to_string();
+                    let code = required_text(2, "code")?.to_string();
+                    let current = required_positive(3, "current")?;
+                    let prev = required_positive(4, "prev_close")?;
+                    let open = optional_non_negative(5, "open")?;
+                    let volume = optional_non_negative(6, "volume")?;
+                    let amount = optional_non_negative(7, "amount")?;
+                    let high = optional_non_negative(33, "high")?;
+                    let low = optional_non_negative(34, "low")?;
+                    let pct = (current - prev) / prev * 100.0;
+                    out.push(MarketIndex {
+                        code,
+                        name,
+                        current,
+                        change: current - prev,
+                        change_pct: pct,
+                        open,
+                        high,
+                        low,
+                        prev_close: prev,
+                        volume,
+                        amount,
+                        amplitude: match (high, low) {
+                            (Some(high), Some(low)) => Some((high - low) / prev * 100.0),
+                            _ => None,
+                        },
+                    });
                 }
             }
         }
@@ -360,7 +394,7 @@ fn judge_market_sentiment(overview: &MarketOverview) -> MarketSentiment {
     let mut bullets: Vec<String> = Vec::new();
 
     // 1. 涨跌家数 (up_count vs down_count)
-    let total = (overview.up_count + overview.down_count) as i32;
+    let total = overview.up_count + overview.down_count;
     if total > 0 {
         let up_ratio = overview.up_count as f64 / total as f64;
         if up_ratio >= 0.7 {
@@ -510,6 +544,8 @@ mod tests {
 
     #[test]
     fn parse_tencent_indices_basic() {
+        // Provider-protocol exception: Tencent responses contain native
+        // six-digit index identifiers, which must round-trip unchanged.
         let text = r#"v_sh000001="1~上证指数~000001~4139.90~4132.61~4125.22~50000000~5000000000";
 v_sz399001="1~深证成指~399001~12500.00~12450.00~12400.00~80000000~9000000000";"#;
         let indices = parse_tencent_indices(text).unwrap();
@@ -538,18 +574,18 @@ v_sz399001="1~深证成指~399001~12500.00~12450.00~12400.00~80000000~9000000000
     fn format_market_report_basic() {
         let mut overview = MarketOverview::new("2026-06-27".to_string());
         overview.indices = vec![MarketIndex {
-            code: "000001".into(),
+            code: "TEST_CODE_000001".into(),
             name: "上证指数".into(),
             current: 4139.90,
             change: 7.29,
             change_pct: 0.18,
-            open: 4132.61,
-            high: 4140.0,
-            low: 4125.0,
+            open: Some(4132.61),
+            high: Some(4140.0),
+            low: Some(4125.0),
             prev_close: 4132.61,
-            volume: 0.0,
-            amount: 0.0,
-            amplitude: 0.0,
+            volume: None,
+            amount: None,
+            amplitude: None,
         }];
         overview.up_count = 2500;
         overview.down_count = 2000;

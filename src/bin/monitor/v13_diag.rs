@@ -45,7 +45,10 @@ pub async fn run_v13_diag() -> V13DiagReport {
 
     // I-01 盘中轮动 (依赖 sector_monitor)
     steps.push(check_step("I-01", "load_sector", || {
-        let snap = load_sector_snapshot_real("10:30");
+        let snap = match load_sector_snapshot_real("10:30") {
+            Ok(snapshot) => snapshot,
+            Err(error) => return format!("error: {error}"),
+        };
         if snap.tech_sub.is_empty() && snap.power_sub.is_empty() && snap.robot_sub.is_empty() {
             "empty".into()
         } else {
@@ -58,7 +61,10 @@ pub async fn run_v13_diag() -> V13DiagReport {
 
     // I-02 新闻催化 (依赖 chain_daily)
     steps.push(check_step("I-02", "load_news_catalyst", || {
-        let snap = load_news_catalyst_snapshot_real("10:30");
+        let snap = match load_news_catalyst_snapshot_real("10:30") {
+            Ok(snapshot) => snapshot,
+            Err(error) => return format!("error: {error}"),
+        };
         if snap.headline.is_empty() {
             "empty".into()
         } else {
@@ -72,7 +78,10 @@ pub async fn run_v13_diag() -> V13DiagReport {
 
     // I-03 涨停扩散 (依赖 chain_daily)
     steps.push(check_step("I-03", "load_industry_chain", || {
-        let snap = load_industry_chain_snapshot_real("10:30");
+        let snap = match load_industry_chain_snapshot_real("10:30") {
+            Ok(snapshot) => snapshot,
+            Err(error) => return format!("error: {error}"),
+        };
         if snap.chain.is_empty() {
             "empty".into()
         } else {
@@ -86,7 +95,10 @@ pub async fn run_v13_diag() -> V13DiagReport {
 
     // D-01 新闻驱动个股 (依赖 chain_daily)
     steps.push(check_step("D-01", "load_news_to_idea", || {
-        let snap = load_news_to_idea_snapshot_real("10:30");
+        let snap = match load_news_to_idea_snapshot_real("10:30") {
+            Ok(snapshot) => snapshot,
+            Err(error) => return format!("error: {error}"),
+        };
         if snap.headline.is_empty() {
             "empty".into()
         } else {
@@ -95,41 +107,46 @@ pub async fn run_v13_diag() -> V13DiagReport {
     }));
 
     // A-01 虚拟仓复盘 (依赖 virtual_observation JSON)
-    steps.push(check_step("A-01", "load_paper_review", || {
-        let snap = load_paper_review_snapshot_real("2026-07-07");
-        if snap.name.is_empty() {
-            "empty".into()
-        } else {
-            format!("ok: name={}, pnl={:?}", snap.name, snap.pnl)
-        }
-    }));
+    steps.push(check_step(
+        "A-01",
+        "load_paper_review",
+        || match load_paper_review_snapshot_real("2026-07-07") {
+            Ok(Some(snapshot)) => {
+                format!("ok: name={}, pnl={:?}", snapshot.name, snapshot.pnl)
+            }
+            Ok(None) => "empty".into(),
+            Err(error) => format!("error: {error}"),
+        },
+    ));
 
     // v37: P-02 竞价热点量能 (依赖 limit_up_stocks)
-    steps.push(check_step("P-02", "load_auction_volume", || {
-        let snap = load_auction_volume_snapshot_real("09:25");
-        if snap.items.is_empty() {
-            "empty".into()
-        } else {
-            format!(
+    steps.push(check_step(
+        "P-02",
+        "load_auction_volume",
+        || match load_auction_volume_snapshot_real("09:25") {
+            Ok(snap) => format!(
                 "ok: items={}, sentiment={}",
                 snap.items.len(),
                 snap.sentiment
-            )
-        }
-    }));
+            ),
+            Err(error) => format!("unavailable: {error}"),
+        },
+    ));
 
     // v35: A-10 盘后催化复盘 (依赖 chain_daily cluster)
     steps.push(check_step("A-10", "load_catalyst_review", || {
-        let (date, score, _persistent, started, _pending, _) =
-            load_catalyst_review_snapshot_real("2026-07-07");
-        if started.is_empty() {
+        let snapshot = match load_catalyst_review_snapshot_real("2026-07-07") {
+            Ok(snapshot) => snapshot,
+            Err(error) => return format!("error: {error}"),
+        };
+        if snapshot.started.is_empty() {
             "empty".into()
         } else {
             format!(
                 "ok: date={}, score={:?}, started={}",
-                date,
-                score,
-                started.len()
+                snapshot.date,
+                snapshot.score,
+                snapshot.started.len()
             )
         }
     }));
@@ -150,31 +167,26 @@ pub async fn run_v13_diag() -> V13DiagReport {
 
     // v45: T-15 盘后固定价格成交 - 编译期 dispatcher 存在
     steps.push(check_step("T-15", "dispatcher_available", || {
-        
         "ok: dispatcher wired".to_string()
     }));
 
     // v46: T-16 ST 涨跌幅变更 - 编译期 dispatcher 存在
     steps.push(check_step("T-16", "dispatcher_available", || {
-        
         "ok: dispatcher wired (新规 5%→10%)".to_string()
     }));
 
     // v47: T-17 ETF 收盘集合竞价 - 编译期 dispatcher 存在
     steps.push(check_step("T-17", "dispatcher_available", || {
-        
         "ok: dispatcher wired (新规 14:57 集合竞价)".to_string()
     }));
 
     // v48: T-18 创业板大宗盘中确认 - 编译期 dispatcher 存在
     steps.push(check_step("T-18", "dispatcher_available", || {
-        
         "ok: dispatcher wired (新规 创业板盘中确认)".to_string()
     }));
 
     // v49: T-19 北交所大宗价格区间 - 编译期 dispatcher 存在
     steps.push(check_step("T-19", "dispatcher_available", || {
-        
         "ok: dispatcher wired (新规 北交所均价口径)".to_string()
     }));
 
@@ -183,7 +195,7 @@ pub async fn run_v13_diag() -> V13DiagReport {
         use super::push_templates::{render_virtual_watch, VirtualWatchItem, VirtualWatchParams};
         let items = vec![VirtualWatchItem {
             name: "测试股",
-            code: "600000",
+            code: "TEST_CODE_600000",
             open_price: 10.0,
             shares: 1000,
             estimated_amount: 10000.0,
@@ -195,7 +207,8 @@ pub async fn run_v13_diag() -> V13DiagReport {
             total_amount: 10000.0,
             item_count: 1,
         });
-        if text.contains("🔍 虚拟观察仓位") && text.contains("测试股(600000)") {
+        if text.contains("🔍 虚拟观察仓位") && text.contains("测试股(TEST_CODE_600000)")
+        {
             "ok: template wired (P-05 v12 §14.5)".to_string()
         } else {
             "error: template format wrong".to_string()
@@ -242,8 +255,6 @@ fn classify(s: &str) -> String {
         "ok".to_string()
     } else if s.starts_with("empty") {
         "empty".to_string()
-    } else if s.starts_with("panic") {
-        "error".to_string()
     } else {
         "error".to_string()
     }

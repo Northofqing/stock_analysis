@@ -76,16 +76,12 @@ impl HttpProvider {
         ];
 
         // 转换股票代码格式 (600519 -> 1.600519 for Shanghai, 000001 -> 0.000001 for Shenzhen)
-        let market_code = if code.starts_with('6') {
-            format!("1.{}", code) // 上海
-        } else if code.starts_with("00")
+        let market_code = if code.starts_with("00")
             || code.starts_with("30")
             || code.starts_with("15")
             || code.starts_with("16")
         {
             format!("0.{}", code) // 深圳及深交所基金
-        } else if code.starts_with("68") || code.starts_with("51") || code.starts_with("58") {
-            format!("1.{}", code) // 科创板及上交所基金
         } else {
             format!("1.{}", code) // 默认上海
         };
@@ -247,7 +243,7 @@ impl HttpProvider {
 
         // 所有重试都失败：打印一次终态错误，避免上游再次重复输出
         let err = last_err
-            .map(|e| anyhow::Error::from(e))
+            .map(anyhow::Error::from)
             .unwrap_or_else(|| anyhow!("HTTP请求失败（未知错误）"));
         log::error!("[HTTP] 重试 {} 次后仍失败: {}", max_attempts, err);
         Err(err)
@@ -265,18 +261,22 @@ impl HttpProvider {
 
         let mut result = Vec::with_capacity(klines.len());
 
-        for kline_str in klines {
+        for (index, kline_str) in klines.iter().enumerate() {
             let kline_str = kline_str
                 .as_str()
-                .ok_or_else(|| anyhow!("kline不是字符串"))?;
+                .ok_or_else(|| anyhow!("K线第 {} 行不是字符串", index + 1))?;
 
             // review #14: splitn(8, ',') 限制切分数量, 11 字段也只切 8 个 Vec 元素.
             // 格式: "2026-01-22,10.0,10.5,9.8,10.3,1000000,10000000,2.5,0,0,0"
             let parts: Vec<&str> = kline_str.splitn(8, ',').collect();
 
             if parts.len() < 8 {
-                log::warn!("[HTTP] K线数据格式错误: {}", kline_str);
-                continue;
+                return Err(anyhow!(
+                    "K线第 {} 行字段不足: expected>=8 actual={} raw={}",
+                    index + 1,
+                    parts.len(),
+                    kline_str
+                ));
             }
 
             let date = NaiveDate::parse_from_str(parts[0], "%Y-%m-%d")
@@ -319,7 +319,7 @@ impl HttpProvider {
         }
 
         // 按日期降序排序（最新的在前）
-        result.sort_by(|a, b| b.date.cmp(&a.date));
+        result.sort_by_key(|item| std::cmp::Reverse(item.date));
 
         Ok(result)
     }
@@ -421,7 +421,7 @@ impl DataProvider for HttpProvider {
             Self::fetch_stock_name_internal(&client, &code_str).await
         });
 
-        result.or_else(|| Some(format!("股票{}", code)))
+        result
     }
     fn name(&self) -> &'static str {
         "HTTP(东方财富)"
@@ -431,6 +431,14 @@ impl DataProvider for HttpProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn br092_kline_parser_rejects_any_short_row() {
+        let body = r#"{"data":{"klines":["2026-07-16,10,10.2,10.3,9.9,1000,10000,2.0","2026-07-17,10,10.2"]}}"#;
+        let error = HttpProvider::parse_kline_response_internal(body)
+            .expect_err("a malformed row must reject the complete provider batch");
+        assert!(error.to_string().contains("第 2 行"));
+    }
 
     /// 在 tokio runtime 的 spawn_blocking 中执行阻塞调用
     async fn with_provider<F, T>(f: F) -> T

@@ -46,19 +46,19 @@ pub fn calc_skdj(
     let mut min_q: VecDeque<(usize, f64)> = VecDeque::new();
 
     for i in 0..len {
-        while max_q.front().map_or(false, |&(idx, _)| idx + n <= i) {
+        while max_q.front().is_some_and(|&(idx, _)| idx + n <= i) {
             max_q.pop_front();
         }
-        while min_q.front().map_or(false, |&(idx, _)| idx + n <= i) {
+        while min_q.front().is_some_and(|&(idx, _)| idx + n <= i) {
             min_q.pop_front();
         }
 
-        while max_q.back().map_or(false, |&(_, v)| v <= highs[i]) {
+        while max_q.back().is_some_and(|&(_, v)| v <= highs[i]) {
             max_q.pop_back();
         }
         max_q.push_back((i, highs[i]));
 
-        while min_q.back().map_or(false, |&(_, v)| v >= lows[i]) {
+        while min_q.back().is_some_and(|&(_, v)| v >= lows[i]) {
             min_q.pop_back();
         }
         min_q.push_back((i, lows[i]));

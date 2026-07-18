@@ -19,6 +19,12 @@ pub struct GovPolicyProvider {
     client: reqwest::Client,
 }
 
+impl Default for GovPolicyProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GovPolicyProvider {
     pub fn new() -> Self {
         Self {

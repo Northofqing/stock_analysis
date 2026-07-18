@@ -70,7 +70,7 @@ mod tests {
 
     fn mock_item() -> LhbTop5Item {
         LhbTop5Item {
-            code: "600519".into(),
+            code: "TEST_CODE_600519".into(),
             name: "XX".into(),
             net_buy_yi: 2.5,
             reason: "涨幅偏离值达7%".into(),

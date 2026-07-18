@@ -1,4 +1,4 @@
-//! 验证 check_data_freshness.sh 的 fail 模式 + skip 行为
+//! 验证 check_data_freshness.sh 的 fail-closed 模式与 fresh 行为
 //! 用 process::Command 跑脚本, 断言退出码。
 //!
 //! AGENTS.md §2.4 数据时效门禁 (PR-2).
@@ -25,12 +25,17 @@ fn run_with_db(db: Option<&str>) -> std::process::Output {
 }
 
 #[test]
-fn test_data_freshness_check_exits_zero_on_missing_db() {
-    // 缺失 DB -> skip (exit 0), 不算 fail
+fn test_data_freshness_check_fails_on_missing_db() {
+    // 缺失 DB 是合规前置缺失，必须 fail closed。
     let output = run_with_db(Some("/nonexistent/path/fake.db"));
     assert!(
-        output.status.success(),
-        "missing db 应 skip (exit 0), stderr: {}",
+        !output.status.success(),
+        "missing db 应 FAIL (exit != 0), stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("数据库不存在"),
+        "stderr 应说明缺失前置: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 }

@@ -720,8 +720,10 @@ fn build_fundamental_slice(latest: &KlineData) -> String {
                 s.push_str(&format!(" | 看多 {:.0}%", b));
             }
             if let Some(high) = cs.target_price_high_avg {
-                let up = cs.upside_pct(latest.close).unwrap_or(0.0);
-                s.push_str(&format!(" | 目标价均值 ¥{:.2} ({:+.1}%)", high, up));
+                s.push_str(&format!(" | 目标价均值 ¥{:.2}", high));
+                if let Some(up) = cs.upside_pct(latest.close) {
+                    s.push_str(&format!(" ({:+.1}%)", up));
+                }
             }
             s.push('\n');
         }

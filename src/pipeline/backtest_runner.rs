@@ -15,6 +15,9 @@ use crate::strategy::core::{
 use crate::strategy::multi_factor::{MultiFactorConfig, MultiFactorEngine, StockFactors};
 use crate::strategy::rsi::{RsiBacktest, RsiConfig};
 
+type StockHistory = (String, String, Vec<crate::data_provider::KlineData>);
+type HistorySplit = (String, Vec<StockHistory>, Vec<StockHistory>);
+
 impl AnalysisPipeline {
     /// 多因子回测（使用真正的日频因子快照，无 look-ahead）
     ///
@@ -28,6 +31,7 @@ impl AnalysisPipeline {
     /// 是实时刷新的，理论上包含当前值，存在 look-ahead 风险。
     /// 推荐：新场景使用 `run_multi_factor_with_snapshots`；老路径保留作兼容。
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     fn run_multi_factor_with_snapshots(
         history: &[(String, String, Vec<crate::data_provider::KlineData>)],
         factor_cfg: &MultiFactorConfig,
@@ -246,9 +250,8 @@ impl AnalysisPipeline {
         // 之前: 单次请求 7000 天, 可能超时被 fail-through
         // 现在: 365 天/页, 最多 20 页
         let chunk_size = 365usize;
-        let max_pages = ((days + chunk_size - 1) / chunk_size).min(20);
+        let max_pages = days.div_ceil(chunk_size).min(20);
         let mut all_closes = std::collections::HashMap::new();
-        let mut total_loaded = 0usize;
 
         for page in 0..max_pages {
             let chunk_days = (days - page * chunk_size).min(chunk_size);
@@ -260,7 +263,6 @@ impl AnalysisPipeline {
                     for k in &data {
                         all_closes.insert(k.date, k.close);
                     }
-                    total_loaded += data.len();
                 }
                 _ => {
                     warn!(
@@ -328,14 +330,7 @@ impl AnalysisPipeline {
     /// 按全局交易日期把组合历史切成 前段(样本内)/后段(样本外) 两份。
     /// `ratio` 为前段占比（如 0.6）。数据不足无法切分时返回 None。
     /// 返回 (切分日期字符串, 前段, 后段)。
-    fn split_history_by_date(
-        history: &[(String, String, Vec<crate::data_provider::KlineData>)],
-        ratio: f64,
-    ) -> Option<(
-        String,
-        Vec<(String, String, Vec<crate::data_provider::KlineData>)>,
-        Vec<(String, String, Vec<crate::data_provider::KlineData>)>,
-    )> {
+    fn split_history_by_date(history: &[StockHistory], ratio: f64) -> Option<HistorySplit> {
         use std::collections::BTreeSet;
         let mut dates: BTreeSet<chrono::NaiveDate> = BTreeSet::new();
         for (_, _, ks) in history {
@@ -450,7 +445,7 @@ impl AnalysisPipeline {
             for (label, cfg) in candidates {
                 if let Some(sum) = run(cfg, &train_slice) {
                     let score = sum.total_return;
-                    if best.map_or(true, |(_, b)| score > b) {
+                    if best.is_none_or(|(_, b)| score > b) {
                         best = Some((label.as_str(), score));
                     }
                 }
@@ -515,7 +510,7 @@ impl AnalysisPipeline {
     ) -> Result<BacktestSummary> {
         // 1. 拉取评分前 N 只股票的历史K线（至少 60 天）
         let mut sorted = results.to_vec();
-        sorted.sort_by(|a, b| b.ranking_score.cmp(&a.ranking_score));
+        sorted.sort_by_key(|item| std::cmp::Reverse(item.ranking_score));
         let top_n = 10;
         let mut stocks_data = Vec::new();
         for r in sorted.iter().take(top_n) {
@@ -634,7 +629,7 @@ impl AnalysisPipeline {
         days: usize,
     ) -> Vec<(String, String, Vec<crate::data_provider::KlineData>)> {
         let mut sorted = results.to_vec();
-        sorted.sort_by(|a, b| b.ranking_score.cmp(&a.ranking_score));
+        sorted.sort_by_key(|item| std::cmp::Reverse(item.ranking_score));
 
         let mut stocks_data = Vec::new();
         for r in sorted.iter().take(top_n) {
@@ -935,7 +930,7 @@ mod tests {
                 )
             })
             .collect();
-        vec![("000001".into(), "测试股".into(), ks)]
+        vec![("TEST_CODE_000001".into(), "测试股".into(), ks)]
     }
 
     /// 修复：QUANT_ANALYST_REVIEW §1.5
@@ -949,7 +944,7 @@ mod tests {
 
         // 3 只股票 30 天历史
         let base = chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
-        let codes = ["600000", "600001", "600002"];
+        let codes = ["TEST_CODE_600000", "TEST_CODE_600001", "TEST_CODE_600002"];
         let mut h: Vec<(String, String, Vec<KlineData>)> = codes
             .iter()
             .enumerate()
@@ -1012,7 +1007,7 @@ mod tests {
 
         let base = chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
         // 准备 3 只股票, 但只给 1 只股票有快照
-        let codes = ["600000", "600001", "600002"];
+        let codes = ["TEST_CODE_600000", "TEST_CODE_600001", "TEST_CODE_600002"];
         let h: Vec<(String, String, Vec<KlineData>)> = codes
             .iter()
             .enumerate()
@@ -1041,7 +1036,7 @@ mod tests {
             m.insert(
                 date,
                 FactorSnapshotRow {
-                    code: "600000".into(),
+                    code: "TEST_CODE_600000".into(),
                     snapshot_date: date.to_string(),
                     pe_ttm: Some(5.0), // 明显优于 600001/600002
                     pb: Some(0.5),
@@ -1052,7 +1047,7 @@ mod tests {
                 },
             );
         }
-        snapshots.insert("600000".into(), m);
+        snapshots.insert("TEST_CODE_600000".into(), m);
 
         let cfg = MultiFactorConfig::default();
         let result = AnalysisPipeline::run_multi_factor_with_snapshots(&h, &cfg, &snapshots);

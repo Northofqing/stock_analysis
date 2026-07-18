@@ -8,7 +8,7 @@ use super::{DataProvider, KlineData, RealtimeQuote};
 use anyhow::{anyhow, Context, Result};
 use chrono::NaiveDate;
 use log::{debug, error, info, warn};
-use rustdx_complete::tcp::stock::{Kline, SecurityQuotes};
+use rustdx_complete::tcp::stock::Kline;
 use rustdx_complete::tcp::{Tcp, Tdx};
 
 /// RustDX 数据提供者
@@ -41,7 +41,7 @@ impl RustdxProvider {
     /// 转换股票代码格式
     /// 600000 -> 1 (上海)
     /// 000001 -> 0 (深圳)
-    fn parse_market(&self, code: &str) -> u8 {
+    fn parse_market(code: &str) -> u8 {
         if code.starts_with('6') {
             1 // 上海
         } else {
@@ -50,7 +50,7 @@ impl RustdxProvider {
     }
 
     /// 规范化股票代码（补全为6位）
-    fn normalize_code(&self, code: &str) -> Result<String> {
+    fn normalize_code(code: &str) -> Result<String> {
         // 移除空格和特殊字符
         let code = code.trim();
 
@@ -79,9 +79,9 @@ impl RustdxProvider {
     /// 获取K线数据（内部方法）
     fn fetch_kline_internal(&self, code: &str, days: usize) -> Result<Vec<KlineData>> {
         // 规范化股票代码
-        let code = self.normalize_code(code)?;
+        let code = Self::normalize_code(code)?;
 
-        let market = self.parse_market(&code) as u16;
+        let market = Self::parse_market(&code) as u16;
 
         // 通达信每次请求最多返回约 800 条K线，需要分页获取
         const BATCH_SIZE: u16 = 800;
@@ -126,30 +126,21 @@ impl RustdxProvider {
                     }
                 }
                 Ok(Err(e)) => {
-                    if all_bars.is_empty() {
-                        return Err(anyhow!("获取股票 {} K线数据失败: {}", code, e));
-                    }
-                    warn!(
-                        "[通达信] {} 分页获取中断: {}, 已获取 {} 条",
+                    return Err(anyhow!(
+                        "获取股票 {} K线第 {} 页失败（已取 {} 条，整批拒绝）: {}",
                         code,
-                        e,
-                        all_bars.len()
-                    );
-                    break;
+                        u32::from(offset) / u32::from(BATCH_SIZE) + 1,
+                        all_bars.len(),
+                        e
+                    ));
                 }
                 Err(_) => {
-                    if all_bars.is_empty() {
-                        return Err(anyhow!(
-                            "获取股票 {} K线数据时底层库 panic（可能该股票已停牌/退市或代码无效）",
-                            code
-                        ));
-                    }
-                    warn!(
-                        "[通达信] {} 分页获取中断(panic), 已获取 {} 条",
+                    return Err(anyhow!(
+                        "获取股票 {} K线第 {} 页时底层库 panic（已取 {} 条，整批拒绝）",
                         code,
+                        u32::from(offset) / u32::from(BATCH_SIZE) + 1,
                         all_bars.len()
-                    );
-                    break;
+                    ));
                 }
             }
         }
@@ -158,29 +149,27 @@ impl RustdxProvider {
             return Err(anyhow!("股票 {} 没有返回K线数据", code));
         }
 
-        // v11 P0-1 commit 3 (Step 1.3): 坏日期 skip + warn, 不塞假日期
-        // 之前: unwrap_or_else(|| now) 把坏日期当今天 → 脏数据污染整批
-        // 现在: NaiveDate::from_ymd_opt 返回 None 时 skip 该 bar (return None)
         let mut kline_data: Vec<KlineData> = all_bars
             .iter()
-            .filter_map(|bar| {
+            .enumerate()
+            .map(|(index, bar)| {
                 let date = NaiveDate::from_ymd_opt(
                     bar.dt.year as i32,
                     bar.dt.month as u32,
                     bar.dt.day as u32,
-                );
-                let date = match date {
-                    Some(d) => d,
-                    None => {
-                        warn!(
-                            "[通达信] {} 跳过 bar: 坏日期 year={} month={} day={}",
-                            code, bar.dt.year, bar.dt.month, bar.dt.day
-                        );
-                        return None;
-                    }
-                };
+                )
+                .ok_or_else(|| {
+                    anyhow!(
+                        "通达信 {} 第 {} 行日期非法: year={} month={} day={}（整批拒绝）",
+                        code,
+                        index + 1,
+                        bar.dt.year,
+                        bar.dt.month,
+                        bar.dt.day
+                    )
+                })?;
 
-                Some(KlineData {
+                Ok(KlineData {
                     date,
                     open: bar.open,
                     high: bar.high,
@@ -214,9 +203,9 @@ impl RustdxProvider {
                     adjust: crate::data_provider::AdjustType::None,
                 })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
-        // 计算涨跌幅
+        kline_data.sort_by_key(|item| item.date);
         for i in 1..kline_data.len() {
             let prev_close = kline_data[i - 1].close;
             if prev_close > 0.0 {
@@ -225,7 +214,7 @@ impl RustdxProvider {
         }
 
         // 按日期降序排序（最新在前）
-        kline_data.sort_by(|a, b| b.date.cmp(&a.date));
+        kline_data.sort_by_key(|item| std::cmp::Reverse(item.date));
 
         info!("[通达信] {} 成功获取 {} 条K线数据", code, kline_data.len());
 
@@ -234,60 +223,10 @@ impl RustdxProvider {
 
     /// 获取实时行情（内部方法）
     fn fetch_realtime_internal(&self, code: &str) -> Result<Option<RealtimeQuote>> {
-        // 规范化股票代码
-        let code = self.normalize_code(code)?;
-
-        let mut tcp = Self::new_connection()?;
-
-        let market = self.parse_market(&code) as u16;
-
-        // 创建行情查询请求
-        let mut quotes = SecurityQuotes::new(vec![(market, &code as &str)]);
-
-        quotes
-            .recv_parsed(&mut tcp)
-            .context(format!("获取股票 {} 实时行情失败", code))?;
-
-        let result = quotes.result();
-
-        if result.is_empty() {
-            warn!("[通达信] {} 没有返回实时行情数据", code);
-            return Ok(None);
-        }
-
-        let quote = &result[0];
-
-        // 通达信返回的数据中已经有涨跌幅字段
-        let pct_chg = quote.change_percent;
-
-        // 市值计算（通达信没有直接返回市值，这里暂时不计算）
-        // 需要额外的接口获取股本数据
-        let market_cap = 0.0;
-        let circulating_cap = 0.0;
-
-        // 换手率计算（通达信没有直接返回，需要成交量/流通股本）
-        let turnover_rate = 0.0;
-
-        let realtime_quote = RealtimeQuote {
-            code: code.to_string(),
-            name: quote.name.clone(),
-            price: quote.price,
-            pct_chg,
-            pe_ratio: 0.0, // 通达信基础行情不包含PE
-            pb_ratio: 0.0, // 通达信基础行情不包含PB
-            turnover_rate,
-            market_cap,
-            circulating_cap,
-            volume: quote.vol,
-            amount: quote.amount,
-        };
-
-        debug!(
-            "[通达信] {} 实时行情: {:.2}元, 涨跌幅: {:.2}%, 成交量: {:.0}, 名称: {}",
-            code, realtime_quote.price, pct_chg, quote.vol, quote.name
-        );
-
-        Ok(Some(realtime_quote))
+        // rustdx-complete 1.0.0 decodes the realtime timestamp as zero. It
+        // therefore cannot satisfy BR-097, so use the real Tencent source that
+        // carries an upstream-observed timestamp.
+        self.gtimg_provider.fetch_realtime_quote(code)
     }
 }
 
@@ -337,13 +276,13 @@ impl DataProvider for RustdxProvider {
                         latest.settled = false; // 盘中期, 不是 settled close
 
                         // 补充盈利指标
-                        latest.pe_ratio = Some(quote.pe_ratio);
-                        latest.pb_ratio = Some(quote.pb_ratio);
-                        latest.turnover_rate = Some(quote.turnover_rate);
-                        latest.market_cap = Some(quote.market_cap);
-                        latest.circulating_cap = Some(quote.circulating_cap);
+                        latest.pe_ratio = latest.pe_ratio.or(quote.pe_ratio);
+                        latest.pb_ratio = latest.pb_ratio.or(quote.pb_ratio);
+                        latest.turnover_rate = latest.turnover_rate.or(quote.turnover_rate);
+                        latest.market_cap = latest.market_cap.or(quote.market_cap);
+                        latest.circulating_cap = latest.circulating_cap.or(quote.circulating_cap);
 
-                        info!("[通达信+腾讯] {} 价格: close={:.2}元 (盘中={:.2}元), PE={:.2}, PB={:.2}, 换手率={:.2}%, 总市值={:.2}亿, 流通市值={:.2}亿",
+                        info!("[通达信+腾讯] {} 价格: close={:.2}元 (盘中={:.2}元), PE={:?}, PB={:?}, 换手率={:?}%, 总市值={:?}亿, 流通市值={:?}亿",
                             code, old_close, quote.price, quote.pe_ratio, quote.pb_ratio,
                             quote.turnover_rate, quote.market_cap, quote.circulating_cap);
                     }
@@ -390,12 +329,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_normalize_code_and_market_without_network() {
+        assert_eq!(RustdxProvider::normalize_code("1").unwrap(), "000001");
+        assert_eq!(
+            RustdxProvider::normalize_code(" 600000 ").unwrap(),
+            "600000"
+        );
+        assert_eq!(RustdxProvider::parse_market("600000"), 1);
+        assert_eq!(RustdxProvider::parse_market("000001"), 0);
+        assert!(RustdxProvider::normalize_code("").is_err());
+        assert!(RustdxProvider::normalize_code("600000.SH").is_err());
+    }
+
+    #[test]
+    #[ignore = "live RustDX TCP integration test; run explicitly with --ignored"]
     fn test_rustdx_connection() {
         let _provider = RustdxProvider::new().unwrap();
         assert!(RustdxProvider::new_connection().is_ok());
     }
 
     #[test]
+    #[ignore = "live RustDX and Tencent integration test; run explicitly with --ignored"]
     fn test_fetch_kline() {
         let provider = RustdxProvider::new().unwrap();
         let result = provider.get_daily_data("600000", 10);
@@ -406,6 +360,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "live RustDX TCP integration test; run explicitly with --ignored"]
     fn test_fetch_realtime() {
         let provider = RustdxProvider::new().unwrap();
         let result = provider.get_realtime_quote("600000");

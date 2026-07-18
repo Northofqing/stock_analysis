@@ -44,6 +44,16 @@ fn parse_sina_news_body_with_code() {
     assert_eq!(items[0].code, Some("600000".to_string()));
 }
 
+#[test]
+fn parse_sina_news_rejects_missing_or_invalid_source_time() {
+    let missing = r#"{"result":{"data":[{"url":"https://example.com/a","title":"测试"}]}}"#;
+    assert!(parse_sina_news_body(missing, "财经要闻", None).is_err());
+
+    let invalid =
+        r#"{"result":{"data":[{"url":"https://example.com/a","title":"测试","ctime":0}]}}"#;
+    assert!(parse_sina_news_body(invalid, "财经要闻", None).is_err());
+}
+
 /// Task 14: 解析 Sina 财经要闻 (pageid=155, lid=1686) 实测响应.
 ///
 /// 真实响应 (curl 抓取):
@@ -54,22 +64,27 @@ fn parse_sina_news_body_with_code() {
 /// 验证 media_name 缺失时, source_name fallback 仍为非空.
 #[test]
 fn parse_sina_top_news_real_response() {
-    let body = r#"{
-        "result": {
-            "status": {"code": 0, "msg": "succ"},
+    // Keep the captured payload shape, but anchor ctime to the test process clock so the
+    // future-timestamp guard remains deterministic on every execution date.
+    let ctime = chrono::Utc::now().timestamp() - 60;
+    let body = format!(
+        r#"{{
+        "result": {{
+            "status": {{"code": 0, "msg": "succ"}},
             "timestamp": "Thu Jul 09 10:45:30 +0800 2026",
             "data": [
-                {
+                {{
                     "url": "https://finance.sina.com.cn/jjxw/2026-07-09/doc-inihenaz1479043.shtml",
                     "title": "巴中平昌：打通乡镇线上水费缴纳'最后一公里'",
                     "intro": "新华社客户端...",
-                    "ctime": 1783564792,
+                    "ctime": {ctime},
                     "media_name": ""
-                }
+                }}
             ]
-        }
-    }"#;
-    let items = parse_sina_news_body(body, "财经要闻", None).unwrap();
+        }}
+    }}"#
+    );
+    let items = parse_sina_news_body(&body, "财经要闻", None).unwrap();
     assert_eq!(items.len(), 1);
     assert!(items[0].title.contains("巴中平昌"));
     assert!(items[0].url.contains("doc-inihenaz1479043"));

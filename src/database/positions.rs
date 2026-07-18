@@ -191,6 +191,7 @@ impl DatabaseManager {
     ///   - name 含 "*ST" → "*ST"
     ///   - name 以 "ST" / "SST" / "S*ST" 开头 → "ST"
     ///   - 其他保持 NULL
+    ///
     /// 返回更新的行数. 只在 st_type IS NULL 时更新, 重复跑幂等.
     pub fn backfill_st_type(&self) -> Result<usize, Box<dyn std::error::Error>> {
         let mut conn = self.get_conn()?;
@@ -217,6 +218,7 @@ impl DatabaseManager {
     ///   1. 优先查 stock_concepts 缓存 (东财/同花顺拉过)
     ///   2. 回退到 chain_registry 静态映射 (80+ 龙头股)
     ///   3. 都查不到保持 NULL/其他 (不强行填)
+    ///
     ///   只在 chain_name IS NULL OR '' OR '其他' 时更新, 重复跑幂等.
     ///   返回 (updated, missing_after) — 更新行数 + 仍缺失数.
     pub fn backfill_chain_name(&self) -> Result<(usize, i64), Box<dyn std::error::Error>> {

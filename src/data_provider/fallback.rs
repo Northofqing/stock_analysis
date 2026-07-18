@@ -1,3 +1,4 @@
+//! Registered business rules: BR-065.
 //! v11 P0-2: 共享 fallback 函数
 //!
 //! 两个 K 线入口 (`DataFetcherManager::get_daily_data` sync + `service::get_kline` async)
@@ -101,9 +102,9 @@ pub async fn fetch_kline_with_fallback(
     // 即使 Sina 已经成功也要等 Eastmoney 结束, 最终 --test 盘后复盘被 300s cap 打爆。
     // 这里改成真正的 first-valid-completion: 任一源返回 Ok 且质检通过即返回,
     // 剩余 HTTP future 被 drop 取消；RustDX spawn_blocking 可能后台完成, 但不再阻塞主链路。
-    let mut candidates: FuturesUnordered<
-        futures::future::BoxFuture<'static, (&'static str, Result<Vec<KlineData>>)>,
-    > = FuturesUnordered::new();
+    type ProviderResult = (&'static str, Result<Vec<KlineData>>);
+    type ProviderFuture = futures::future::BoxFuture<'static, ProviderResult>;
+    let mut candidates: FuturesUnordered<ProviderFuture> = FuturesUnordered::new();
 
     let sina_code = code.to_string();
     candidates.push(Box::pin(async move {
@@ -151,6 +152,10 @@ pub async fn fetch_kline_with_fallback(
                 match validate_daily_kline_quality(&mut d, code, qc_threshold) {
                     Ok(()) => {
                         log::info!("[fallback] {} {} OK + 质检通过, {} 条", code, src, d.len());
+                        crate::monitor::data_mode::mark_capability_success(
+                            crate::monitor::data_mode::Capability::Kline,
+                        )
+                        .map_err(anyhow::Error::msg)?;
                         return Ok((d, src));
                     }
                     Err(e) => {

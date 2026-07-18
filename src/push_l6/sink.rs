@@ -63,7 +63,7 @@ pub trait Sink: Send + Sync {
 
     /// 健康检查 (可选实现)
     async fn health_check(&self) -> bool {
-        true  // 默认健康
+        true // 默认健康
     }
 }
 
@@ -72,15 +72,10 @@ pub trait Sink: Send + Sync {
 // ============================================================================
 
 /// ConsoleSink — 输出到 stdout + 日志 (开发/调试用)
+#[derive(Default)]
 pub struct ConsoleSink {
     /// 是否同时打印到 stdout (生产环境通常 false)
     pub print_to_stdout: bool,
-}
-
-impl Default for ConsoleSink {
-    fn default() -> Self {
-        Self { print_to_stdout: false }
-    }
 }
 
 impl ConsoleSink {
@@ -98,7 +93,10 @@ impl Sink for ConsoleSink {
     async fn send(&self, msg: &PushMessage) -> SinkResult {
         log::info!(
             "[sink:console] template={} v{} user={} event_id={} body_len={}",
-            msg.template_id, msg.template_version, msg.user_id, msg.event.event_id,
+            msg.template_id,
+            msg.template_version,
+            msg.user_id,
+            msg.event.event_id,
             msg.text.body.len()
         );
         if self.print_to_stdout {
@@ -108,7 +106,7 @@ impl Sink for ConsoleSink {
     }
 
     async fn health_check(&self) -> bool {
-        true  // stdout 始终可用
+        true // stdout 始终可用
     }
 }
 
@@ -163,14 +161,14 @@ impl SinkRouter {
                             attempt += 1;
                             log::warn!(
                                 "[sink:{}] send 失败 (尝试 {}/{}): {}, 重试中",
-                                sink.name(), attempt, self.max_retries, e
+                                sink.name(),
+                                attempt,
+                                self.max_retries,
+                                e
                             );
                             tokio::time::sleep(self.retry_interval).await;
                         } else {
-                            log::error!(
-                                "[sink:{}] send 失败 (放弃): {}",
-                                sink.name(), e
-                            );
+                            log::error!("[sink:{}] send 失败 (放弃): {}", sink.name(), e);
                             errors.push(format!("{}: {}", sink.name(), e));
                             break;
                         }
@@ -223,14 +221,14 @@ impl Default for SinkRouter {
 mod tests {
     use super::*;
     use crate::push_l1::{LimitUpPayload, Severity, SignalPayload};
-    use crate::push_l2::{DataMode, TemplateMetadata};
+
     use chrono::Local;
 
     fn make_msg() -> PushMessage {
         let event = SignalEvent::new(
             crate::push_l1::SignalSource::LimitUp,
             "limit_up",
-            Some("600519".to_string()),
+            Some("TEST_CODE_600519".to_string()),
             Local::now(),
             SignalPayload::LimitUp(LimitUpPayload::default()),
             Severity::High,
@@ -263,7 +261,9 @@ mod tests {
 
     #[async_trait]
     impl Sink for MockSink {
-        fn name(&self) -> &'static str { self.name }
+        fn name(&self) -> &'static str {
+            self.name
+        }
 
         async fn send(&self, _msg: &PushMessage) -> SinkResult {
             let mut f = self.failures_remaining.lock().unwrap();
@@ -335,7 +335,7 @@ mod tests {
     async fn sink_router_failure_isolation() {
         // 一个 sink 失败不应影响另一个
         let mut r = SinkRouter::new();
-        r.register(Arc::new(MockSink::new("failing", 100, false)));  // 永远失败
+        r.register(Arc::new(MockSink::new("failing", 100, false))); // 永远失败
         r.register(Arc::new(MockSink::new("ok", 0, true)));
         let result = r.route(&make_msg()).await;
         assert!(matches!(result, SinkResult::Err(_)));
@@ -349,7 +349,7 @@ mod tests {
     async fn sink_router_retry_then_success() {
         let mut r = SinkRouter::new();
         r.max_retries = 2;
-        r.register(Arc::new(MockSink::new("flaky", 2, true)));  // 前 2 次失败, 第 3 次成功
+        r.register(Arc::new(MockSink::new("flaky", 2, true))); // 前 2 次失败, 第 3 次成功
         let result = r.route(&make_msg()).await;
         assert_eq!(result, SinkResult::Ok);
     }

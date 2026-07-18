@@ -25,6 +25,8 @@ impl MarketAnalyzer {
         let mut total_stocks = 0;
         let mut all_stocks: Vec<(String, String, f64, f64)> = Vec::with_capacity(5500); // (code, name, change_pct, price)
         let mut limit_up_stocks: Vec<(String, String, f64, f64)> = Vec::new(); // 涨停股票列表
+        let mut seen_codes = std::collections::HashSet::new();
+        let mut saw_terminal_page = false;
 
         // 新浪API每次最多返回500条，A股约5000只，分页获取
         for page in 1..=20 {
@@ -51,83 +53,98 @@ impl MarketAnalyzer {
                         )
                         .timeout(Duration::from_secs(10))
                         .send()
-                        .context("请求失败")?;
+                        .context("请求失败")?
+                        .error_for_status()
+                        .context("HTTP 状态失败")?;
 
                     let text = response.text().context("读取响应失败")?;
                     let json: Value = serde_json::from_str(&text).context("解析JSON失败")?;
                     Ok(json)
                 });
 
-            if let Some(json_data) = data {
-                if let Some(stocks) = json_data.as_array() {
-                    if stocks.is_empty() {
-                        // 没有更多数据了，退出循环
-                        break;
-                    }
-
-                    for item in stocks {
-                        total_stocks += 1;
-
-                        if let Some(change_pct) = item.get("changepercent").and_then(|v| v.as_f64())
-                        {
-                            // 提取股票代码和名称，用于判断涨跌停阈值
-                            let stock_name =
-                                item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                            let raw_code =
-                                item.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
-                            let code = raw_code
-                                .trim_start_matches("sh")
-                                .trim_start_matches("sz")
-                                .trim_start_matches("bj");
-                            let limit_pct = Self::get_limit_pct(code, stock_name);
-
-                            if change_pct > 0.0 {
-                                up += 1;
-                                if change_pct >= limit_pct - 0.1 {
-                                    limit_up += 1;
-                                }
-                            } else if change_pct < 0.0 {
-                                down += 1;
-                                if change_pct <= -(limit_pct - 0.1) {
-                                    limit_down += 1;
-                                }
-                            } else {
-                                flat += 1;
-                            }
-
-                            // 收集股票信息用于排序
-                            if let Some(price) = item
-                                .get("trade")
-                                .and_then(|v| v.as_str())
-                                .and_then(|s| s.parse::<f64>().ok())
-                            {
-                                // 收集涨停股票
-                                if change_pct >= limit_pct - 0.1 {
-                                    limit_up_stocks.push((
-                                        code.to_string(),
-                                        stock_name.to_string(),
-                                        change_pct,
-                                        price,
-                                    ));
-                                }
-                                all_stocks.push((
-                                    code.to_string(),
-                                    stock_name.to_string(),
-                                    change_pct,
-                                    price,
-                                ));
-                            }
-                        }
-
-                        if let Some(amount) = item.get("amount").and_then(|v| v.as_f64()) {
-                            total_amount += amount;
-                        }
-                    }
-                }
-            } else {
-                // API失败，跳出循环
+            let json_data = data
+                .ok_or_else(|| anyhow::anyhow!("A股实时行情第 {page} 页请求/解析失败，整批拒绝"))?;
+            let stocks = json_data
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("A股实时行情第 {page} 页不是数组"))?;
+            if stocks.is_empty() {
+                saw_terminal_page = true;
                 break;
             }
+
+            for (row_index, item) in stocks.iter().enumerate() {
+                let raw_code = item.get("symbol").and_then(Value::as_str).ok_or_else(|| {
+                    anyhow::anyhow!("第 {page} 页第 {} 行缺 symbol", row_index + 1)
+                })?;
+                let code = raw_code
+                    .strip_prefix("sh")
+                    .or_else(|| raw_code.strip_prefix("sz"))
+                    .or_else(|| raw_code.strip_prefix("bj"))
+                    .unwrap_or(raw_code);
+                let stock_name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("行情 {code} 缺 name"))?;
+                if code.len() != 6 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
+                    anyhow::bail!("行情 code 非法: {code:?}");
+                }
+                if !seen_codes.insert(code.to_string()) {
+                    anyhow::bail!("行情 code 重复: {code}");
+                }
+                let change_pct = item
+                    .get("changepercent")
+                    .and_then(Value::as_f64)
+                    .filter(|value| value.is_finite() && value.abs() <= 30.0)
+                    .ok_or_else(|| anyhow::anyhow!("行情 {code} changepercent 缺失/非法"))?;
+                let price = item
+                    .get("trade")
+                    .and_then(Value::as_str)
+                    .and_then(|value| value.parse::<f64>().ok())
+                    .filter(|value| value.is_finite() && *value > 0.0)
+                    .ok_or_else(|| anyhow::anyhow!("行情 {code} trade 缺失/非法"))?;
+                let amount = item
+                    .get("amount")
+                    .and_then(Value::as_f64)
+                    .filter(|value| value.is_finite() && *value >= 0.0)
+                    .ok_or_else(|| anyhow::anyhow!("行情 {code} amount 缺失/非法"))?;
+
+                total_stocks += 1;
+                total_amount += amount;
+                let limit_pct = Self::get_limit_pct(code, stock_name);
+                if change_pct > 0.0 {
+                    up += 1;
+                    if change_pct >= limit_pct - 0.1 {
+                        limit_up += 1;
+                    }
+                } else if change_pct < 0.0 {
+                    down += 1;
+                    if change_pct <= -(limit_pct - 0.1) {
+                        limit_down += 1;
+                    }
+                } else {
+                    flat += 1;
+                }
+                if change_pct >= limit_pct - 0.1 {
+                    limit_up_stocks.push((
+                        code.to_string(),
+                        stock_name.to_string(),
+                        change_pct,
+                        price,
+                    ));
+                }
+                all_stocks.push((code.to_string(), stock_name.to_string(), change_pct, price));
+            }
+        }
+
+        if !saw_terminal_page
+            || total_stocks == 0
+            || !total_amount.is_finite()
+            || total_amount <= 0.0
+        {
+            anyhow::bail!(
+                "A股行情批次不完整: terminal_page={saw_terminal_page} rows={total_stocks} amount={total_amount}"
+            );
         }
 
         overview.up_count = up;
@@ -138,7 +155,7 @@ impl MarketAnalyzer {
         overview.total_amount = total_amount / 1e8; // 转为亿元
 
         // 按涨跌幅排序并取前10
-        all_stocks.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+        all_stocks.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
         overview.top_stocks = all_stocks
             .iter()
             .take(10)
@@ -149,7 +166,8 @@ impl MarketAnalyzer {
                     name: name.clone(),
                     change_pct: *change_pct,
                     price: *price,
-                    ..Default::default()
+                    volume_ratio: None,
+                    main_net_yi: None,
                 }
             })
             .collect();
@@ -163,7 +181,8 @@ impl MarketAnalyzer {
                     name: name.clone(),
                     change_pct: *change_pct,
                     price: *price,
-                    ..Default::default()
+                    volume_ratio: None,
+                    main_net_yi: None,
                 }
             })
             .collect();

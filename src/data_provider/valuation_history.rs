@@ -58,7 +58,7 @@ fn min_max_median(values: &[f64]) -> (Option<f64>, Option<f64>, Option<f64>) {
     let min = sorted.first().copied();
     let max = sorted.last().copied();
     let mid = sorted.len() / 2;
-    let median = if sorted.len() % 2 == 0 {
+    let median = if sorted.len().is_multiple_of(2) {
         Some((sorted[mid - 1] + sorted[mid]) / 2.0)
     } else {
         Some(sorted[mid])

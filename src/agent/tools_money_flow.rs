@@ -6,6 +6,12 @@ use serde_json::json;
 
 pub struct FetchFundFlowTool;
 
+impl Default for FetchFundFlowTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FetchFundFlowTool {
     pub fn new() -> Self {
         Self
@@ -42,12 +48,14 @@ impl Tool for FetchFundFlowTool {
             .ok_or_else(|| anyhow::anyhow!("Missing 'code' parameter"))?;
 
         let svc = service();
-        let (flow_arc, shape_arc) =
+        let (flow_result, shape_result) =
             tokio::join!(svc.get_money_flow(code, 5), svc.get_intraday_shape(code),);
+        let flow_arc = flow_result?;
+        let shape_arc = shape_result?;
 
         let prompt_str = format_for_prompt(&flow_arc, &shape_arc);
         if prompt_str.trim().is_empty() {
-            Ok(json!({"error": "No fund flow data found"}).to_string())
+            anyhow::bail!("No fund flow data found for {code}")
         } else {
             Ok(prompt_str)
         }

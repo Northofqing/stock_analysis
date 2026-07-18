@@ -20,7 +20,10 @@ use std::sync::OnceLock;
 /// Fix 6: 读 env 覆盖 (v15.1.1 硬规则 1: 默认出声 + env 显式覆盖)
 /// 默认值常量化 (编译期 fallback), 运行时读 env 覆盖.
 fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
-    std::env::var(key).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
 }
 
 /// 最大滑点 (%), 超过则 evaluate 返回 Invalidated
@@ -62,13 +65,44 @@ pub fn print_startup_banner() {
 /// - `current_position_pct`: 当前单票已占仓位 (%)
 pub fn pre_trade_check(
     signal: &PaperSignal,
-    _quote_price: f64,
+    quote_price: f64,
     current_cash: f64,
     total_value: f64,
     current_position_pct: f64,
 ) -> Result<(), String> {
+    use crate::trading::order_safety::{OrderSafetyInput, SafetySide};
+
+    crate::trading::order_safety::validate(&OrderSafetyInput {
+        code: &signal.code,
+        side: match signal.direction {
+            Direction::Buy => SafetySide::Buy,
+            Direction::Sell => SafetySide::Sell,
+        },
+        order_price: signal.price,
+        quantity: signal.quantity as u64,
+        available_cash: (signal.direction == Direction::Buy).then_some(current_cash),
+        limit_down_price: signal.limit_down_price,
+        limit_up_price: signal.limit_up_price,
+        secondary_confirmed: signal.secondary_confirmed,
+    })?;
+    if !quote_price.is_finite() || quote_price <= 0.0 {
+        return Err(format!("BR-084 invalid realtime quote: {quote_price}"));
+    }
+    if !current_cash.is_finite()
+        || current_cash < 0.0
+        || !total_value.is_finite()
+        || total_value <= 0.0
+        || current_cash > total_value
+        || !current_position_pct.is_finite()
+        || current_position_pct < 0.0
+    {
+        return Err(format!(
+            "BR-084 invalid account state: cash={current_cash} total={total_value} position_pct={current_position_pct}"
+        ));
+    }
+
     // 1. AccountMode 行动授权
-    let mode = parse_account_mode(&signal.account_mode);
+    let mode = parse_account_mode(&signal.account_mode)?;
     let action = match signal.direction {
         Direction::Buy => ActionKind::OpenNew,
         Direction::Sell => ActionKind::Reduce,
@@ -78,7 +112,11 @@ pub fn pre_trade_check(
         GateResult::Deny(reason) => {
             log::warn!(
                 "[risk_adapter] 拒 {}({}): account_mode={} action={} 原因={}",
-                signal.name, signal.code, signal.account_mode, action.label(), reason
+                signal.name,
+                signal.code,
+                signal.account_mode,
+                action.label(),
+                reason
             );
             return Err(format!(
                 "account_mode {} 拒 {}: {}",
@@ -93,7 +131,10 @@ pub fn pre_trade_check(
     if signal.direction == Direction::Buy && current_position_pct > *MAX_POSITION_PCT {
         log::warn!(
             "[risk_adapter] 拒 {}({}): 单票仓位 {:.1}% > 限 {}%",
-            signal.name, signal.code, current_position_pct, *MAX_POSITION_PCT
+            signal.name,
+            signal.code,
+            current_position_pct,
+            *MAX_POSITION_PCT
         );
         return Err(format!(
             "单票仓位 {:.1}% 超限 {}%",
@@ -102,12 +143,17 @@ pub fn pre_trade_check(
     }
 
     // 3. 现金底
-    let guard = CashGuard { floor_pct: *CASH_FLOOR_PCT };
+    let guard = CashGuard {
+        floor_pct: *CASH_FLOOR_PCT,
+    };
     if let Some(alert) = check_cash(current_cash, total_value, &guard) {
         if alert.below_floor {
             log::warn!(
                 "[risk_adapter] 拒 {}({}): 现金占比 {:.1}% < 底 {}%",
-                signal.name, signal.code, alert.cash_pct, *CASH_FLOOR_PCT
+                signal.name,
+                signal.code,
+                alert.cash_pct,
+                *CASH_FLOOR_PCT
             );
             return Err(format!(
                 "现金占比 {:.1}% 不足底限 {}%",
@@ -122,7 +168,8 @@ pub fn pre_trade_check(
         "Degraded" if signal.direction == Direction::Buy => {
             log::warn!(
                 "[risk_adapter] 拒 {}({}): data_mode=Degraded 禁开仓",
-                signal.name, signal.code
+                signal.name,
+                signal.code
             );
             return Err("data_mode=Degraded 禁开仓".to_string());
         }
@@ -130,14 +177,17 @@ pub fn pre_trade_check(
         "Unsafe" => {
             log::warn!(
                 "[risk_adapter] 拒 {}({}): data_mode=Unsafe 拒所有交易",
-                signal.name, signal.code
+                signal.name,
+                signal.code
             );
             return Err("data_mode=Unsafe 拒所有交易".to_string());
         }
         other => {
             log::warn!(
                 "[risk_adapter] 拒 {}({}): 未知 data_mode '{}'",
-                signal.name, signal.code, other
+                signal.name,
+                signal.code,
+                other
             );
             return Err(format!("未知 data_mode '{}'", other));
         }
@@ -148,11 +198,12 @@ pub fn pre_trade_check(
 
 /// 解析 account_mode 字符串 → AccountMode enum
 /// 不依赖 push_templates::AccountMode (跨 bin/lib 边界), 与 action_gate 同源
-fn parse_account_mode(s: &str) -> AccountMode {
+fn parse_account_mode(s: &str) -> Result<AccountMode, String> {
     match s {
-        "ReduceOnly" => AccountMode::ReduceOnly,
-        "Frozen" => AccountMode::Frozen,
-        _ => AccountMode::Normal,
+        "Normal" => Ok(AccountMode::Normal),
+        "ReduceOnly" => Ok(AccountMode::ReduceOnly),
+        "Frozen" => Ok(AccountMode::Frozen),
+        other => Err(format!("未知 account_mode '{other}'")),
     }
 }
 
@@ -165,7 +216,7 @@ mod tests {
     fn signal(account_mode: &str, data_mode: &str, direction: Direction) -> PaperSignal {
         PaperSignal {
             plan_id: "plan-test-001".to_string(),
-            code: "688001".to_string(),
+            code: "TEST_CODE_688001".to_string(),
             name: "测试".to_string(),
             direction,
             price: 50.0,
@@ -174,6 +225,10 @@ mod tests {
             is_limit_up: false,
             is_limit_down: false,
             is_suspended: false,
+            limit_up_price: Some(55.0),
+            limit_down_price: Some(45.0),
+            secondary_confirmed: false,
+            quote_observed_at: chrono::Utc::now(),
             account_mode: account_mode.to_string(),
             data_mode: data_mode.to_string(),
         }
@@ -303,12 +358,21 @@ mod tests {
         assert!(r.unwrap_err().contains("Frozen"));
     }
 
-    // ---- 6. 边界: total_value=0 不触发 cash 检查 (避免除零) ----
+    // ---- 6. 非法账户状态必须 fail closed ----
 
     #[test]
-    fn handles_zero_total_value() {
+    fn rejects_zero_total_value() {
         let s = signal("Normal", "Full", Direction::Buy);
         let r = pre_trade_check(&s, 50.0, 0.0, 0.0, 0.0);
-        assert!(r.is_ok());
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("BR-084"));
+    }
+
+    #[test]
+    fn rejects_unknown_account_mode() {
+        let s = signal("Unexpected", "Full", Direction::Buy);
+        let r = pre_trade_check(&s, 50.0, 50_000.0, 100_000.0, 0.0);
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("未知 account_mode"));
     }
 }

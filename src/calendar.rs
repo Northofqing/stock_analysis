@@ -81,6 +81,23 @@ impl MarketSession {
 
 static HOLIDAYS: Lazy<RwLock<HashSet<NaiveDate>>> = Lazy::new(|| {
     let mut set = HashSet::new();
+    // 仓库内经交易所公告核对的休市日是默认事实源；环境变量只用于追加临时调整。
+    for line in include_str!("../config/a_share_market_holidays.csv").lines() {
+        let value = line.trim();
+        if value.is_empty() || value.starts_with('#') {
+            continue;
+        }
+        match NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+            Ok(date) => {
+                set.insert(date);
+            }
+            Err(error) => log::error!(
+                "[calendar] checked-in holiday '{}' is invalid: {}",
+                value,
+                error
+            ),
+        }
+    }
     // 从环境变量加载
     if let Ok(raw) = std::env::var("TRADING_HOLIDAYS") {
         for s in raw.split(',') {

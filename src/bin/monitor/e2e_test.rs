@@ -22,7 +22,7 @@ mod e2e {
     fn e2e_full_pipeline_smoke() {
         use crate::trading::paper_engine::{PaperPositionSellCheck, load_open_positions};
         let check = PaperPositionSellCheck {
-            code: "600519".to_string(),
+            code: "TEST_CODE_600519".to_string(),
             name: "贵州茅台".to_string(),
             avg_cost: 1680.0,
             quantity: 1000,
@@ -68,7 +68,7 @@ mod e2e {
         let mut hit_count = 0;
         for (kind, metric) in &kinds {
             let input = StrategyInput {
-                code: "600519".to_string(),
+                code: "TEST_CODE_600519".to_string(),
                 push_price: 1680.0,
                 metric_json: metric.to_string(),
                 push_kind: kind.to_string(),

@@ -89,14 +89,14 @@ mod tests {
     fn render_basic() {
         let anomalies = vec![
             AuctionAnomaly {
-                code: "600519".into(),
+                code: "TEST_CODE_600519".into(),
                 name: "XX".into(),
                 gap_pct: 2.5,
                 vol_ratio: 3.2,
                 tag: AuctionTag::YesterdayLimitUp,
             },
             AuctionAnomaly {
-                code: "000001".into(),
+                code: "TEST_CODE_000001".into(),
                 name: "YY".into(),
                 gap_pct: 5.1,
                 vol_ratio: 8.0,

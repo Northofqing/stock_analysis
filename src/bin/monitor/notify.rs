@@ -1,9 +1,9 @@
+//! Registered business rules: BR-047, BR-048, BR-077.
 //! 通知推送 + MagicLaw 守护进程 + Token 管理
 //!
 //! 从 main.rs 提取，减少单文件体积。
 
 use serde::Deserialize;
-use std::io::Write;
 use std::process::Stdio;
 use std::sync::atomic::Ordering;
 
@@ -20,6 +20,10 @@ use crate::{
 /// 35 条推送盘点的"默认降级 vs 保留 vs 移交" 由 `push_governor` 函数根据 `PushKind` 决定.
 /// grill Q2 修订: 12 条降级 (A2/A3/A4/A5/A6/A11/A12/B4/B10/B11/B12/B13) / 9 保留 (A1/A7/A8/A13/A14/A15/B1/B2/C1).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[allow(
+    dead_code,
+    reason = "PushKind is a versioned wire/governance catalog and retains compatibility variants across staged migrations"
+)]
 pub enum PushKind {
     /// 保留: 持仓事件告警 (涨跌停突变/炸板/排除/风控/现金预警)
     HoldingEvent,
@@ -119,8 +123,10 @@ pub enum PushKind {
     StPriceLimitChanged,
     /// v13.1 §5.5 T-17 ETF 收盘集合竞价 (ℹ️ 1次/日, 仅沪市 ETF)
     EtfClosingCallAuction,
-    // v17.8 审计删除 (2026-07-16): BlockTradeIntradayConfirm (T-18) / BlockTradePriceRange (T-19)
-    //   dispatch fn 存在但 0 调用者 (死链路), 归档 docs/v15.x/dead-pushkinds.md
+    /// v13.1 §5.6 / BR-033 创业板协议大宗盘中实时确认
+    BlockTradeIntradayConfirm,
+    /// v13.1 §5.7 / BR-034 北交所大宗价格区间
+    BlockTradePriceRange,
     // ============= v14 新增 (原 A-01, 复用 T-11) =============
     /// v13 §14.3 A-01 虚拟仓复盘 (ℹ️ 1次/日, 盘后参考)
     PaperReview,
@@ -151,6 +157,10 @@ pub enum PushKind {
     NewsFlashAggregated,
 }
 
+#[allow(
+    dead_code,
+    reason = "catalog metadata is independently audited and not every query is used by the production binary"
+)]
 impl PushKind {
     /// v19.12: 全部保留 false (用户要求去掉条件限制, 所有模板都推送)
     /// 旧: 11 保留 + 19 deprecated 降级 (P0-4 commit D 默认行为, PUSH_VERBOSE=true 时无效)
@@ -194,15 +204,14 @@ impl PushKind {
         )
     }
 
-    /// v17.7 + v17.8: 12 个 spec 标的"待清理"变体实际是 active
+    /// v17.7 + v17.8: 12 个 spec 标的变体保持 active
     /// (有 production caller + metadata getter, 跟 v17.6 同样 gap).
     ///
     /// spec 字面写"6 项 0-caller" / "8 项交易类清理" — 实证不符:
     ///   - v17.7: Announcement, PolicyHit, EarningsBeat, EarningsMiss,
     ///     AnalystUpgrade, MarketActionAlert (6 个, 全部 active)
     ///   - v17.8: PostFixedPriceOrder, PostFixedPriceFill, StPriceLimitChanged,
-    ///     EtfClosingCallAuction (4 个, 全部 active — main.rs T-14/T-15 管道 + v59 F2 修复);
-    ///     BlockTradeIntradayConfirm/BlockTradePriceRange 已删 (2026-07-16 审计: 死链路)
+    ///     EtfClosingCallAuction, BlockTradeIntradayConfirm, BlockTradePriceRange.
     ///
     /// 本方法标 `is_active_spec_target` — 命中时 info log 跟踪 audit surface,
     /// 后续 dev plan v2 §3.7/§3.8 sub_kind / DispatchTable 决策点.
@@ -216,11 +225,13 @@ impl PushKind {
                 | Self::EarningsMiss
                 | Self::AnalystUpgrade
                 | Self::MarketActionAlert
-            // v17.8 (4 个交易类, BlockTrade* 已删)
+            // v17.8 (6 个交易类)
             | Self::PostFixedPriceOrder
                 | Self::PostFixedPriceFill
                 | Self::StPriceLimitChanged
                 | Self::EtfClosingCallAuction
+                | Self::BlockTradeIntradayConfirm
+                | Self::BlockTradePriceRange
         )
     }
 
@@ -272,7 +283,9 @@ impl PushKind {
             | PushKind::PostFixedPriceOrder
             | PushKind::PostFixedPriceFill
             | PushKind::StPriceLimitChanged
-            | PushKind::EtfClosingCallAuction => PushLevel::Important,
+            | PushKind::EtfClosingCallAuction
+            | PushKind::BlockTradeIntradayConfirm
+            | PushKind::BlockTradePriceRange => PushLevel::Important,
             // v14 PaperReview + CandidateInvalidated
             | PushKind::CandidateInvalidated => PushLevel::Important,
             // v15.3 D5: 4 路源重要级 (PolicyHit/EarningsBeat/EarningsMiss/AnalystUpgrade)
@@ -368,20 +381,22 @@ impl PushKind {
             PushKind::PostFixedPriceFill => Some(300),                        // 5 min/票
             PushKind::StPriceLimitChanged => Some(86_400),                    // 1次/票/日
             PushKind::EtfClosingCallAuction => Some(86_400),                  // 1次/日
+            PushKind::BlockTradeIntradayConfirm => Some(300),                 // 5 min/票
+            PushKind::BlockTradePriceRange => Some(3600),                     // 60 min/票
             PushKind::PaperReview => Some(86_400),                            // 1次/日
             PushKind::CandidateInvalidated => Some(1800),                     // 30 min
             // v58: P-05 虚拟观察仓 (开盘 9:30 推一次, 1次/日)
             PushKind::VirtualWatch => Some(86_400), // 1次/日
             // v15.3 D5.1: 4 路源冷却
-            PushKind::PolicyHit => Some(86_400),       // 1次/日
-            PushKind::EarningsBeat => Some(43_200),    // 12h
-            PushKind::EarningsMiss => Some(43_200),     // 12h
-            PushKind::AnalystUpgrade => Some(86_400),   // 1次/日
-            PushKind::MarketActionAlert => Some(60),    // 1 min/票 (实盘异常需立即)
-            // v17.4 能力1 (BR-033)
-            PushKind::NewsFlashCritical => Some(300),   // 5 min/事件 (code=event_id 前缀)
+            PushKind::PolicyHit => Some(86_400),      // 1次/日
+            PushKind::EarningsBeat => Some(43_200),   // 12h
+            PushKind::EarningsMiss => Some(43_200),   // 12h
+            PushKind::AnalystUpgrade => Some(86_400), // 1次/日
+            PushKind::MarketActionAlert => Some(60),  // 1 min/票 (实盘异常需立即)
+            // v17.4 能力1 (BR-082)
+            PushKind::NewsFlashCritical => Some(300), // 5 min/事件 (code=event_id 前缀)
             PushKind::NewsFlashAggregated => Some(3600), // 1h/窗口 (code=窗口标签)
-            _ => Some(1800),                            // 默认 30min
+            _ => Some(1800),                          // 默认 30min
         }
     }
 
@@ -393,10 +408,17 @@ impl PushKind {
             // L4 若再按 kind 冷却会把同窗口内**不同**公告误杀 (b011 P0-2 评审决策)
             Announcement => CooldownScope::External,
             // §14.3 表中标 "/票" 的: 必须有 code 才能按票冷却
-            HoldingPlan | T0Advice | CandidateTriggered | ForbiddenOps | PaperTrade
-            | NewsToIdea | PostFixedPriceOrder | PostFixedPriceFill | StPriceLimitChanged => {
-                CooldownScope::PerTicket
-            }
+            HoldingPlan
+            | T0Advice
+            | CandidateTriggered
+            | ForbiddenOps
+            | PaperTrade
+            | NewsToIdea
+            | PostFixedPriceOrder
+            | PostFixedPriceFill
+            | StPriceLimitChanged
+            | BlockTradeIntradayConfirm
+            | BlockTradePriceRange => CooldownScope::PerTicket,
             _ => CooldownScope::Global,
         }
     }
@@ -450,6 +472,8 @@ impl PushKind {
             PushKind::PostFixedPriceFill => "盘后固定价格成交",
             PushKind::StPriceLimitChanged => "ST 涨跌幅变更",
             PushKind::EtfClosingCallAuction => "ETF 集合竞价尾盘",
+            PushKind::BlockTradeIntradayConfirm => "大宗盘中确认",
+            PushKind::BlockTradePriceRange => "北交所大宗价格区间",
             PushKind::PaperReview => "虚拟仓复盘",
             PushKind::CandidateInvalidated => "候选失效",
             PushKind::NewsFlashCritical => "新闻快讯",
@@ -509,6 +533,10 @@ pub enum DailyReportSubKind {
     CapitalVerify,
 }
 
+#[allow(
+    dead_code,
+    reason = "stable template metadata is part of the versioned audit contract and is also exercised by tests"
+)]
 impl DailyReportSubKind {
     /// 简短标签 (log + title prefix 用)
     pub fn label(self) -> &'static str {
@@ -557,15 +585,15 @@ impl PushKind {
     }
 }
 
-/// v17.x DispatchTable: 13 audit-marked PushKind 的元数据集中表.
+/// v17.x DispatchTable: 15 audit-marked PushKind 的元数据集中表.
 ///
 /// 整合:
 /// - v17.6 §2.2: 3 个 low-priority variants (FactorIC / SectorTier / CapitalVerify)
 /// - v17.7 + v17.8: 10 个 active spec targets
 ///   (Announcement, PolicyHit, EarningsBeat, EarningsMiss, AnalystUpgrade,
-///    MarketActionAlert, PostFixedPriceOrder, PostFixedPriceFill,
-///    StPriceLimitChanged, EtfClosingCallAuction)
-///   注: BlockTradeIntradayConfirm/BlockTradePriceRange 已删 (2026-07-16 审计, 死链路)
+///   MarketActionAlert, PostFixedPriceOrder, PostFixedPriceFill,
+///   StPriceLimitChanged, EtfClosingCallAuction,
+///   BlockTradeIntradayConfirm, BlockTradePriceRange)
 ///
 /// 设计 (Path D 一致): 不替换现有 `PushKind::level/cooldown_secs/cooldown_scope/
 /// label/stable_template_id` 5 个 match 块 — 仅作 audit 跟踪 + 后续 spec 治理
@@ -584,7 +612,7 @@ pub struct DispatchRow {
     pub stable_template_id: &'static str,
 }
 
-/// v17.x 集中 Dispatch 表 — 13 audit-marked variants 的元数据.
+/// v17.x 集中 Dispatch 表 — 15 audit-marked variants 的元数据.
 ///
 /// 顺序: 先 v17.6 (3 个 low-priority), 再 v17.7 (6 active), 最后 v17.8 (6 active).
 /// 总数 = 3 + 6 + 6 = 15 (跟 spec 字面一致).
@@ -725,6 +753,26 @@ pub const DISPATCH_TABLE: &[(PushKind, DispatchRow)] = &[
             stable_template_id: "etfclosingcallauction_v1",
         },
     ),
+    (
+        PushKind::BlockTradeIntradayConfirm,
+        DispatchRow {
+            level: PushLevel::Important,
+            cooldown_secs: Some(300),
+            cooldown_scope: CooldownScope::PerTicket,
+            label: "大宗盘中确认",
+            stable_template_id: "blocktradeintradayconfirm_v1",
+        },
+    ),
+    (
+        PushKind::BlockTradePriceRange,
+        DispatchRow {
+            level: PushLevel::Important,
+            cooldown_secs: Some(3600),
+            cooldown_scope: CooldownScope::PerTicket,
+            label: "北交所大宗价格区间",
+            stable_template_id: "blocktradepricerange_v1",
+        },
+    ),
 ];
 
 /// 启动时 audit — 仅打印 summary (行数 + 字段分布), 不逐行打印 15 行 (修 FINDING #8: 启动噪声).
@@ -774,6 +822,10 @@ pub enum PushLevel {
     Info,
 }
 
+#[allow(
+    dead_code,
+    reason = "human-readable level labels are retained for audit and diagnostic consumers"
+)]
 impl PushLevel {
     pub fn label(self) -> &'static str {
         match self {
@@ -794,8 +846,8 @@ impl PushLevel {
 /// v69: 推送日志保存 — 把每条实际推送的内容按日期路径写到 data/push_log/
 ///   - 路径: data/push_log/YYYY-MM-DD/HHMMSS_<随机>.md
 ///   - 沙箱 V10_DRY_RUN_PUSH=1 也保存 (用户能查测试推送)
-///   - 写失败不阻塞主流程 (warn log)
-fn save_push_log(text: &str) {
+///   - 写失败显式返回，禁止在审计证据缺失时继续确认投递
+fn save_push_log(text: &str) -> Result<std::path::PathBuf, String> {
     use std::io::Write;
     log::info!(
         "[v69] save_push_log entered, text len={}",
@@ -809,22 +861,27 @@ fn save_push_log(text: &str) {
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
     let rand_suffix = format!("{:08x}", nanos);
-    let dir = std::path::PathBuf::from("data/push_log").join(&date_dir);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        log::warn!("[v69] push_log 目录创建失败: {}", e);
-        return;
-    }
-    let path = dir.join(format!("{}_{}.md", time_prefix, &rand_suffix[..6]));
-    match std::fs::File::create(&path) {
-        Ok(mut f) => {
-            if let Err(e) = f.write_all(text.as_bytes()) {
-                log::warn!("[v69] push_log 写入失败: {}", e);
+    let root = std::env::var("PUSH_LOG_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            if cfg!(test) || std::env::var("STOCK_ENV_MODE").ok().as_deref() == Some("test") {
+                std::path::PathBuf::from("data/test/push_log")
             } else {
-                log::info!("[v69] push_log 写入: {}", path.display());
+                std::path::PathBuf::from("data/push_log")
             }
-        }
-        Err(e) => log::warn!("[v69] push_log 创建文件失败: {}", e),
-    }
+        });
+    let dir = root.join(&date_dir);
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("push_log 目录创建失败 {}: {error}", dir.display()))?;
+    let path = dir.join(format!("{}_{}.md", time_prefix, &rand_suffix[..6]));
+    let mut file = std::fs::File::create(&path)
+        .map_err(|error| format!("push_log 创建文件失败 {}: {error}", path.display()))?;
+    file.write_all(text.as_bytes())
+        .map_err(|error| format!("push_log 写入失败 {}: {error}", path.display()))?;
+    file.sync_data()
+        .map_err(|error| format!("push_log fsync 失败 {}: {error}", path.display()))?;
+    log::info!("[v69] push_log 写入: {}", path.display());
+    Ok(path)
 }
 
 /// v70+: 新闻推荐落盘 (D-01 / I-02 推荐时 → D+1 兑现 关联)
@@ -893,10 +950,10 @@ pub fn record_news_recommendation(
 /// W9.3 桥接结果 (CRITICAL 修复: 区分 4 种 v14.2 结果)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PushOutcome {
-    Pushed,             // v14.2 + v13 都成功
-    Deduped,            // v14.2 dedup hit, v13 未推送 (60s 内同 kind)
-    Denied(String),     // v14.2 governance 拦截
-    SinkError(String),   // v14.2 sink 失败
+    Pushed,            // v14.2 + v13 都成功
+    Deduped,           // v14.2 dedup hit, v13 未推送 (60s 内同 kind)
+    Denied(String),    // v14.2 governance 拦截
+    SinkError(String), // v14.2 sink 失败
 }
 
 impl PushOutcome {
@@ -973,10 +1030,10 @@ async fn push_governor_inner(text: &str, kind: PushKind, code: Option<&str>) -> 
     let event = match v14_adapter::v14_gate(kind, code) {
         V14Gate::Deduped => return PushOutcome::Deduped,
         V14Gate::Denied(reason) => return PushOutcome::Denied(reason),
-        V14Gate::Approved(event) => event,
+        V14Gate::Approved(event) => *event,
     };
     let start = std::time::Instant::now();
-    deliver_and_record(event, kind, text, start).await
+    deliver_and_record(event, kind, text, start, None, None).await
 }
 
 /// v17.6 §5.1: push_governor_inner 的 sub_kind-aware 版本.
@@ -996,28 +1053,23 @@ async fn push_governor_inner_with_sub_kind(
     let sub_kind_str = sub_kind.map(|s| s.label());
     // cooldown override: sub_kind.cooldown_secs() 优先, None 时回退 kind 默认
     let override_cooldown = sub_kind.and_then(|s| s.cooldown_secs());
-    let event = match v14_adapter::v14_gate_with_sub_kind(kind, code, sub_kind_str) {
-        V14Gate::Deduped => return PushOutcome::Deduped,
-        V14Gate::Denied(reason) => return PushOutcome::Denied(reason),
-        V14Gate::Approved(event) => {
-            // 若 sub_kind 有 override cooldown 且 dispatcher 用的还是 kind 默认,
-            // 这里插入 dedup entry 时仍用 sub_kind_str (key 隔离够了, 窗口宽窄由 spec 决定).
-            // 当前实现: dispatcher 已用 sub_kind_str 作第三元组, override cooldown 仅 log
-            // 不强制改 dispatcher (后者用 kind.cooldown_secs() = 24h).
-            // 备注: 若 spec 后续要 sub_kind 独立窗口 (SectorTier 30min 真生效), 需
-            // 扩 dispatcher.commit 接受 cooldown override 参数.
-            if let Some(cd) = override_cooldown {
-                log::info!(
-                    "[v17.6 §5.1] sub_kind {:?} 期望 {}s 窗口, dispatcher 当前仍用 kind 默认",
-                    sub_kind_str,
-                    cd
-                );
+    let event =
+        match v14_adapter::v14_gate_with_sub_kind(kind, code, sub_kind_str, override_cooldown) {
+            V14Gate::Deduped => return PushOutcome::Deduped,
+            V14Gate::Denied(reason) => return PushOutcome::Denied(reason),
+            V14Gate::Approved(event) => {
+                if let Some(cd) = override_cooldown {
+                    log::info!(
+                        "[v17.6 §5.1] sub_kind {:?} 使用 {}s 独立冷却窗口",
+                        sub_kind_str,
+                        cd
+                    );
+                }
+                *event
             }
-            event
-        }
-    };
+        };
     let start = std::time::Instant::now();
-    deliver_and_record(event, kind, text, start).await
+    deliver_and_record(event, kind, text, start, sub_kind_str, override_cooldown).await
 }
 
 /// 公共尾段: L5/L6 投递 + commit/rollback + L7 留痕.
@@ -1027,11 +1079,17 @@ async fn deliver_and_record(
     kind: PushKind,
     text: &str,
     start: std::time::Instant,
+    sub_kind: Option<&str>,
+    cooldown_override_secs: Option<u32>,
 ) -> PushOutcome {
     use crate::v14_adapter;
     // v15.1 A3: 把 reserve/commit 拆分, 失败时 rollback 不占 cooldown 窗口
     // v17.1-r2 §3.6: env opt-in 走 L6 SinkRouter (env=STOCK_ANALYSIS_PUSH_V6_ENABLE=1).
-    let delivered = if std::env::var("STOCK_ANALYSIS_PUSH_V6_ENABLE").ok().as_deref() == Some("1") {
+    let delivered = if std::env::var("STOCK_ANALYSIS_PUSH_V6_ENABLE")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         let msg = crate::l6_sink::build_push_message(&event, text, kind);
         matches!(
             crate::l6_sink::sink_router().route(&msg).await,
@@ -1040,14 +1098,14 @@ async fn deliver_and_record(
     } else {
         push_wechat(text).await
     };
-    if delivered {
-        v14_adapter::commit_dedup_for_event(&event, kind);
+    let dedup_result = if delivered {
+        v14_adapter::commit_dedup_for_event(&event, kind, sub_kind, cooldown_override_secs)
     } else {
-        v14_adapter::rollback_dedup_for_event(&event, kind);
-    }
+        v14_adapter::rollback_dedup_for_event(&event, kind, sub_kind, cooldown_override_secs)
+    };
     // b013 review P2-15: 入口取一次 channel (避免 push_wechat await 后 env 抖动)
     let channel = current_send_channel();
-    v14_adapter::v14_record_delivery(&event, kind, text, delivered, channel);
+    let l7_result = v14_adapter::v14_record_delivery(&event, kind, text, delivered, channel);
 
     // v17.1-r2 §3.6: 发布投递审计事件 (观察路径, 不干预推送)
     let outcome_str = match delivered {
@@ -1057,7 +1115,7 @@ async fn deliver_and_record(
     // channel 已在上方取过: let channel = current_send_channel();
     // v17.3 Task 1 F1: 用实际投递耗时 (从 deliver_and_record 入口的 Instant 计算)
     let latency_ms = start.elapsed().as_millis() as u64;
-    stock_analysis::event::publish_delivery(
+    let audit_result = stock_analysis::event::publish_delivery(
         &kind.stable_template_id(),
         event.code.as_deref(),
         outcome_str,
@@ -1065,6 +1123,24 @@ async fn deliver_and_record(
         text.len(),
         latency_ms,
     );
+
+    let mut audit_errors = Vec::new();
+    if let Err(error) = dedup_result {
+        audit_errors.push(format!("dedup state: {error}"));
+    }
+    if let Err(error) = l7_result {
+        audit_errors.push(format!("L7 analytics: {error}"));
+    }
+    if let Err(error) = audit_result {
+        audit_errors.push(format!("delivery hash-chain: {error}"));
+    }
+    if !audit_errors.is_empty() {
+        let error = audit_errors.join("; ");
+        log::error!("[push.delivery.audit][BR-091/BR-113] {error}");
+        return PushOutcome::SinkError(format!(
+            "delivery audit failed after sink outcome={outcome_str}: {error}"
+        ));
+    }
 
     if delivered {
         PushOutcome::Pushed
@@ -1088,21 +1164,24 @@ fn launch_gate_check(kind: PushKind) -> bool {
 /// 实际投递通道名 (L7 analytics 用, b011 P0-1):
 /// dry-run 显式记 "dry_run" (没有真实外发), 否则记配置的真实通道 ("feishu"/"wechat")
 fn current_send_channel() -> &'static str {
-    if std::env::var("V10_DRY_RUN_PUSH").ok().as_deref() == Some("1") {
+    if dry_run_push_active() {
         "dry_run"
     } else {
         resolve_send_type().as_str()
     }
 }
 
-/// b013 review P0-1: 兼容旧 2 参调用 + 自动给 default_code_for 兜底,
-/// 让 PerTicket kind 在旧 2 参调用下仍走 L4 dedup 路径 (而不是 PerTicket+None 直通放过).
-/// 真正票级隔离需 b014 把 caller 改成 push_governor_v3(text, kind, Some(code)).
-#[deprecated(since = "v15.1", note = "Use push_governor_v3 with explicit code; this shim collapses PerTicket dedup to '_per_ticket_unbound' global bucket")]
+/// 无票号的全局模板入口。票级模板必须使用 `push_governor_v3` 并传真实代码；
+/// 若误用本入口会显式拒绝，避免不同股票共享一个伪代码冷却桶。
 pub async fn push_governor(text: &str, kind: PushKind) -> bool {
-    push_governor_inner(text, kind, Some(default_code_for(kind)))
-        .await
-        .is_pushed()
+    if requires_ticket_code(kind) {
+        log::error!(
+            "[push_governor] {:?} 需要真实 code，拒绝无票号兼容调用",
+            kind
+        );
+        return false;
+    }
+    push_governor_inner(text, kind, None).await.is_pushed()
 }
 
 /// v14.2 单入口 (b011 P1-2 收敛后 + b013 review P0-1): 返回 enum 区分 4 种结果.
@@ -1125,9 +1204,9 @@ pub async fn push_governor_v3_with_sub_kind(
 
 /// b013 P0-1 兜底: PerTicket 类 kind 在缺 code 时塞占位, 让 L4 走全局 key,
 /// 至少防止"无限重发同一票"。b014 应把所有 caller 改成 push_governor_v3 显式传 code。
-fn default_code_for(kind: PushKind) -> &'static str {
+fn requires_ticket_code(kind: PushKind) -> bool {
     use PushKind::*;
-    if matches!(
+    matches!(
         kind,
         HoldingPlan
             | T0Advice
@@ -1138,25 +1217,29 @@ fn default_code_for(kind: PushKind) -> &'static str {
             | PostFixedPriceOrder
             | PostFixedPriceFill
             | StPriceLimitChanged
-    ) {
-        "_per_ticket_unbound"
-    } else {
-        ""
-    }
+            | BlockTradeIntradayConfirm
+            | BlockTradePriceRange
+    )
 }
 
 pub async fn push_wechat(text: &str) -> bool {
     // v10 P6 5 要素接入: V10_DRY_RUN_PUSH=1 时跳过实际推送, 仅 log
     // 用于开发/验证推送内容变化, 不骚扰飞书
-    if std::env::var("V10_DRY_RUN_PUSH").ok().as_deref() == Some("1") {
+    if dry_run_push_active() {
         log::info!("[V10_DRY_RUN_PUSH] 跳过飞书推送, 内容预览:\n{}", text);
         // v69: 沙箱 dry-run 也保存 push_log
-        save_push_log(text);
+        if let Err(error) = save_push_log(text) {
+            log::error!("[BR-086] dry-run push audit failed: {error}");
+            return false;
+        }
         return true;
     }
 
     // v69: 不管走哪条推送路径 (magiclaw cli / feishu http / 后续), 都先保存 push_log
-    save_push_log(text);
+    if let Err(error) = save_push_log(text) {
+        log::error!("[BR-086] push audit failed; delivery blocked: {error}");
+        return false;
+    }
 
     let send_type = resolve_send_type();
     let send_transport = resolve_send_transport(send_type);
@@ -1342,6 +1425,10 @@ pub async fn push_wechat(text: &str) -> bool {
     }
 }
 
+fn dry_run_push_active() -> bool {
+    cfg!(test) || std::env::var("V10_DRY_RUN_PUSH").ok().as_deref() == Some("1")
+}
+
 pub async fn push_feishu_via_http(text: &str) -> bool {
     let url = match resolve_feishu_webhook_url() {
         Some(v) => v,
@@ -1383,7 +1470,13 @@ pub async fn push_feishu_via_http(text: &str) -> bool {
     };
 
     let status = resp.status();
-    let body_text = resp.text().await.unwrap_or_default();
+    let body_text = match resp.text().await {
+        Ok(body) => body,
+        Err(error) => {
+            log::error!("[飞书] 推送失败: 读取 webhook 响应失败: {}", error);
+            return false;
+        }
+    };
     if !status.is_success() {
         log::error!("[飞书] 推送失败: webhook HTTP {}: {}", status, body_text);
         return false;
@@ -1536,39 +1629,6 @@ pub async fn push_via_magiclaw_cli(send_type: MessageSendType, text: &str) -> bo
         }
     );
     false
-}
-
-pub fn summarize_push_text(text: &str, max_chars: usize) -> String {
-    let one_line = text.replace('\n', " | ");
-    let mut out = String::new();
-    let mut count = 0usize;
-    for ch in one_line.chars() {
-        if count >= max_chars {
-            out.push_str("...");
-            break;
-        }
-        out.push(ch);
-        count += 1;
-    }
-    out
-}
-
-pub fn evaluate_opportunity_push_skip_reason(opp_text: &str) -> Option<&'static str> {
-    // 只对“整轮无有效产业链输出”的明确文案做跳过，避免
-    // “值得关注：暂无通过量能/趋势确认候选”这类正常结果被误判为应跳过。
-    if opp_text.contains("暂无最新快讯") {
-        return Some("contains:暂无最新快讯");
-    }
-    if opp_text.contains("当前快讯未命中已知产业链") {
-        return Some("contains:当前快讯未命中已知产业链");
-    }
-    if opp_text.contains("当前产业链信号可信度不足（已降级观察）") {
-        return Some("contains:当前产业链信号可信度不足");
-    }
-    if opp_text.contains("无可用标的") {
-        return Some("contains:无可用标的");
-    }
-    None
 }
 
 pub fn resolve_send_type() -> MessageSendType {
@@ -2211,7 +2271,10 @@ pub async fn send_via_magiclaw_daemon(
     .and_then(|r| r.map_err(|e| format!("调用 /api/send 失败: {}", e)))?;
 
     let status = resp.status();
-    let text_body = resp.text().await.unwrap_or_default();
+    let text_body = resp
+        .text()
+        .await
+        .map_err(|error| format!("读取 /api/send 响应失败: {error}"))?;
     if status.is_success() {
         let ok = serde_json::from_str::<serde_json::Value>(&text_body)
             .ok()
@@ -2263,7 +2326,10 @@ pub async fn verify_daemon_auth(
     .and_then(|r| r.map_err(|e| format!("调用 /api/window_status 失败: {}", e)))?;
 
     let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
+    let body = resp
+        .text()
+        .await
+        .map_err(|error| format!("读取 /api/window_status 响应失败: {error}"))?;
 
     if status.is_success() {
         // 窗口可用性预检已移除。ilink 的 ret=-2 不是“窗口用尽/会话过期”的致命信号:
@@ -2401,11 +2467,7 @@ mod tests {
             "v17.5 §1.2 active 应 10 个 variants"
         );
         for k in active_v17_5 {
-            assert!(
-                !k.is_legacy_v17_5(),
-                "{:?} 活动 variant 不应被标 legacy",
-                k
-            );
+            assert!(!k.is_legacy_v17_5(), "{:?} 活动 variant 不应被标 legacy", k);
         }
     }
 
@@ -2465,7 +2527,7 @@ mod tests {
     // ============== v17.7 + v17.8: 12 active spec targets audit ==============
 
     #[test]
-    fn is_active_spec_target_v17_7_v17_8_marks_ten_active_variants() {
+    fn is_active_spec_target_v17_7_v17_8_marks_twelve_active_variants() {
         // v17.7: 6 个 (公告/政策/业绩/研报/紧急告警)
         let v17_7_active = [
             PushKind::Announcement,
@@ -2475,24 +2537,26 @@ mod tests {
             PushKind::AnalystUpgrade,
             PushKind::MarketActionAlert,
         ];
-        // v17.8: 4 个 (交易类: 盘后固定价 + ST 涨幅 + ETF 收盘竞价; BlockTrade* 已删)
+        // v17.8: 6 个 (交易类: 盘后固定价 + ST 涨幅 + ETF 收盘竞价 + 大宗交易)
         let v17_8_active = [
             PushKind::PostFixedPriceOrder,
             PushKind::PostFixedPriceFill,
             PushKind::StPriceLimitChanged,
             PushKind::EtfClosingCallAuction,
+            PushKind::BlockTradeIntradayConfirm,
+            PushKind::BlockTradePriceRange,
         ];
-        let all_ten = v17_7_active
+        let all_twelve = v17_7_active
             .iter()
             .chain(v17_8_active.iter())
             .copied()
             .collect::<Vec<_>>();
         assert_eq!(
-            all_ten.len(),
-            10,
-            "v17.7+v17.8 spec targets 审计后应 10 个"
+            all_twelve.len(),
+            12,
+            "v17.7+v17.8 spec targets 应包含 12 个"
         );
-        for k in all_ten {
+        for k in all_twelve {
             assert!(
                 k.is_active_spec_target_v17_7_v17_8(),
                 "{:?} 应被标 active spec target",
@@ -2518,7 +2582,11 @@ mod tests {
             );
         }
         // v17.6 3 个 low-priority
-        for k in [PushKind::FactorIC, PushKind::SectorTier, PushKind::CapitalVerify] {
+        for k in [
+            PushKind::FactorIC,
+            PushKind::SectorTier,
+            PushKind::CapitalVerify,
+        ] {
             assert!(
                 !k.is_active_spec_target_v17_7_v17_8(),
                 "{:?} low-priority 不应再标 active spec target",
@@ -2570,14 +2638,14 @@ mod tests {
         }
     }
 
-    // ============== v17.x: DISPATCH_TABLE 13 rows 完整性 (2026-07-16 审计后) ==============
+    // ============== v17.x: DISPATCH_TABLE 15 rows 完整性 ==============
 
     #[test]
-    fn dispatch_table_size_is_thirteen() {
+    fn dispatch_table_size_is_fifteen() {
         assert_eq!(
             DISPATCH_TABLE.len(),
-            13,
-            "v17.x DISPATCH_TABLE 应 13 rows (3 v17.6 + 6 v17.7 + 4 v17.8; BlockTrade* 已删)"
+            15,
+            "v17.x DISPATCH_TABLE 应 15 rows (3 v17.6 + 6 v17.7 + 6 v17.8)"
         );
     }
 
@@ -2592,7 +2660,7 @@ mod tests {
 
     #[test]
     fn dispatch_table_covers_all_audit_marked() {
-        // v17.6 low-priority 3 + v17.7 6 + v17.8 4 = 13 (BlockTrade* 已删)
+        // v17.6 low-priority 3 + v17.7 6 + v17.8 6 = 15
         let expected: Vec<PushKind> = vec![
             PushKind::FactorIC,
             PushKind::SectorTier,
@@ -2607,14 +2675,12 @@ mod tests {
             PushKind::PostFixedPriceFill,
             PushKind::StPriceLimitChanged,
             PushKind::EtfClosingCallAuction,
+            PushKind::BlockTradeIntradayConfirm,
+            PushKind::BlockTradePriceRange,
         ];
-        assert_eq!(expected.len(), 13);
+        assert_eq!(expected.len(), 15);
         for k in expected {
-            assert!(
-                k.dispatch_row().is_some(),
-                "{:?} 应在 DISPATCH_TABLE 内",
-                k
-            );
+            assert!(k.dispatch_row().is_some(), "{:?} 应在 DISPATCH_TABLE 内", k);
         }
     }
 
@@ -2712,9 +2778,10 @@ mod tests {
         use std::env;
         crate::v14_adapter::_reset_dedup_for_test();
         env::set_var("V10_DRY_RUN_PUSH", "1");
-        let r1 = push_governor_v3("first", PushKind::HoldingPlan, Some("000001")).await;
+        let r1 = push_governor_v3("first", PushKind::HoldingPlan, Some("TEST_CODE_000001")).await;
         if r1.is_pushed() {
-            let r2 = push_governor_v3("second", PushKind::HoldingPlan, Some("000001")).await;
+            let r2 =
+                push_governor_v3("second", PushKind::HoldingPlan, Some("TEST_CODE_000001")).await;
             assert_eq!(
                 r2,
                 PushOutcome::Deduped,
@@ -2734,9 +2801,10 @@ mod tests {
         crate::v14_adapter::_reset_dedup_for_test();
         env::set_var("V10_DRY_RUN_PUSH", "1");
         // 同一 kind (HoldingPlan 30 min) 不同 code
-        let r1 = push_governor_v3("first", PushKind::HoldingPlan, Some("000001")).await;
+        let r1 = push_governor_v3("first", PushKind::HoldingPlan, Some("TEST_CODE_000001")).await;
         if r1.is_pushed() {
-            let r2 = push_governor_v3("second", PushKind::HoldingPlan, Some("000002")).await;
+            let r2 =
+                push_governor_v3("second", PushKind::HoldingPlan, Some("TEST_CODE_000002")).await;
             assert!(
                 r2.is_pushed(),
                 "000002 不同 code 不应被 30 min 冷却挡 (F1 语义), got {:?}",

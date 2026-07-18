@@ -1,3 +1,4 @@
+//! Registered business rules: BR-052.
 //! 排除引擎 — 扫描持仓/自选，标记命中排除板块的标的。
 //!
 //! 匹配方式：拉取排除板块的成份股 → 交叉比对持仓代码。
@@ -212,7 +213,7 @@ mod tests {
     #[test]
     fn test_format_with_hits() {
         let hits = vec![ExclusionHit {
-            code: "000858".into(),
+            code: "TEST_CODE_000858".into(),
             name: "五粮液".into(),
             matched_board: "白酒".into(),
             reason: "成熟天花板".into(),

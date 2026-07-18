@@ -35,22 +35,24 @@ pub fn check_stops(
     name: &str,
     current_price: f64,
     cost_price: f64,
-    hard_stop: f64,
+    hard_stop: Option<f64>,
     ma20: Option<f64>,
     ma60: Option<f64>,
 ) -> Vec<StopSignal> {
     let mut signals = Vec::new();
 
     // 硬止损：跌破用户设定的硬止损价
-    if hard_stop > 0.0 && current_price <= hard_stop {
-        signals.push(StopSignal {
-            code: code.to_string(),
-            name: name.to_string(),
-            level: StopLevel::Hard,
-            current_price,
-            trigger_price: hard_stop,
-            reason: format!("跌破硬止损价 ¥{:.2}", hard_stop),
-        });
+    if let Some(hard_stop) = hard_stop {
+        if hard_stop.is_finite() && hard_stop > 0.0 && current_price <= hard_stop {
+            signals.push(StopSignal {
+                code: code.to_string(),
+                name: name.to_string(),
+                level: StopLevel::Hard,
+                current_price,
+                trigger_price: hard_stop,
+                reason: format!("跌破硬止损价 ¥{:.2}", hard_stop),
+            });
+        }
     }
 
     // 技术止损：亏损超 -10%
@@ -114,21 +116,29 @@ mod tests {
 
     #[test]
     fn test_hard_stop_triggered() {
-        let signals = check_stops("000001", "测试", 8.5, 10.0, 9.0, None, None);
+        let signals = check_stops("TEST_CODE_000001", "测试", 8.5, 10.0, Some(9.0), None, None);
         assert_eq!(signals.len(), 2); // hard + technical
         assert!(signals.iter().any(|s| s.level == StopLevel::Hard));
     }
 
     #[test]
     fn test_technical_stop() {
-        let signals = check_stops("000001", "测试", 8.9, 10.0, 7.0, None, None);
+        let signals = check_stops("TEST_CODE_000001", "测试", 8.9, 10.0, Some(7.0), None, None);
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].level, StopLevel::Technical);
     }
 
     #[test]
     fn test_no_stop() {
-        let signals = check_stops("000001", "测试", 10.5, 10.0, 9.0, Some(10.0), Some(9.5));
+        let signals = check_stops(
+            "TEST_CODE_000001",
+            "测试",
+            10.5,
+            10.0,
+            Some(9.0),
+            Some(10.0),
+            Some(9.5),
+        );
         assert!(signals.is_empty());
     }
 }

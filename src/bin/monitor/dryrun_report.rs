@@ -212,77 +212,6 @@ fn is_outcome_all_null(path: &std::path::Path) -> bool {
     has_any_pending
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Write;
-
-    /// v14.1 review #12: is_outcome_all_null 识别待 backfill 文件
-    #[test]
-    fn test_is_outcome_all_null_pending() {
-        let dir = std::env::temp_dir().join("test_d01_backfill");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("2026-07-01.jsonl");
-        let mut f = std::fs::File::create(&path).unwrap();
-        // 2 行 outcome=null (待 backfill)
-        writeln!(
-            f,
-            r#"{{"code":"002916","outcome":null,"ts":"2026-07-01 09:00:00"}}"#
-        )
-        .unwrap();
-        writeln!(
-            f,
-            r#"{{"code":"002463","outcome":null,"ts":"2026-07-01 09:00:01"}}"#
-        )
-        .unwrap();
-        f.sync_all().unwrap();
-        assert!(
-            is_outcome_all_null(&path),
-            "outcome 全 null 应识别为待 backfill"
-        );
-        std::fs::remove_file(&path).unwrap();
-    }
-
-    #[test]
-    fn test_is_outcome_all_null_already_done() {
-        let dir = std::env::temp_dir().join("test_d01_backfill");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("2026-07-02.jsonl");
-        let mut f = std::fs::File::create(&path).unwrap();
-        // 1 行 outcome 已有 d1_pct, 已 backfill 过
-        writeln!(
-            f,
-            r#"{{"code":"002916","outcome":{{"d1_pct":0.05}},"ts":"2026-07-02 09:00:00"}}"#
-        )
-        .unwrap();
-        f.sync_all().unwrap();
-        assert!(!is_outcome_all_null(&path), "outcome 已填不应再 backfill");
-        std::fs::remove_file(&path).unwrap();
-    }
-
-    #[test]
-    fn test_is_outcome_all_null_mixed() {
-        let dir = std::env::temp_dir().join("test_d01_backfill");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("2026-07-03.jsonl");
-        let mut f = std::fs::File::create(&path).unwrap();
-        // 1 行已填, 1 行 null → 仍需 backfill (has_any_pending)
-        writeln!(
-            f,
-            r#"{{"code":"002916","outcome":{{"d1_pct":0.05}},"ts":"2026-07-03 09:00:00"}}"#
-        )
-        .unwrap();
-        writeln!(
-            f,
-            r#"{{"code":"002463","outcome":null,"ts":"2026-07-03 09:00:01"}}"#
-        )
-        .unwrap();
-        f.sync_all().unwrap();
-        assert!(is_outcome_all_null(&path), "部分 null 也应 backfill");
-        std::fs::remove_file(&path).unwrap();
-    }
-}
-
 /// 生成一次报告 (立即调用, 也被后台 task 调用)
 pub async fn generate_report() -> anyhow::Result<()> {
     let report = collect_report().await?;
@@ -378,14 +307,14 @@ async fn collect_report() -> anyhow::Result<DryRunReport> {
         .into_iter()
         .map(|(t, c)| TopicStat { topic: t, count: c })
         .collect();
-    top_topics.sort_by(|a, b| b.count.cmp(&a.count));
+    top_topics.sort_by_key(|item| std::cmp::Reverse(item.count));
     top_topics.truncate(5);
 
     let mut by_kind: Vec<KindStat> = by_kind_map.into_values().collect();
-    by_kind.sort_by(|a, b| b.total.cmp(&a.total));
+    by_kind.sort_by_key(|item| std::cmp::Reverse(item.total));
 
     let mut source_health: Vec<SourceStat> = by_source_map.into_values().collect();
-    source_health.sort_by(|a, b| b.attempts.cmp(&a.attempts));
+    source_health.sort_by_key(|item| std::cmp::Reverse(item.attempts));
 
     let success_rate = if total_attempts > 0 {
         total_success as f64 / total_attempts as f64
@@ -416,5 +345,76 @@ fn source_from_kind(kind: &str) -> Option<String> {
         Some("search_service".to_string())
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// v14.1 review #12: is_outcome_all_null 识别待 backfill 文件
+    #[test]
+    fn test_is_outcome_all_null_pending() {
+        let dir = std::env::temp_dir().join("test_d01_backfill");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("2026-07-01.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // 2 行 outcome=null (待 backfill)
+        writeln!(
+            f,
+            r#"{{"code":"TEST_CODE_002916","outcome":null,"ts":"2026-07-01 09:00:00"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"code":"TEST_CODE_002463","outcome":null,"ts":"2026-07-01 09:00:01"}}"#
+        )
+        .unwrap();
+        f.sync_all().unwrap();
+        assert!(
+            is_outcome_all_null(&path),
+            "outcome 全 null 应识别为待 backfill"
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_is_outcome_all_null_already_done() {
+        let dir = std::env::temp_dir().join("test_d01_backfill");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("2026-07-02.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // 1 行 outcome 已有 d1_pct, 已 backfill 过
+        writeln!(
+            f,
+            r#"{{"code":"TEST_CODE_002916","outcome":{{"d1_pct":0.05}},"ts":"2026-07-02 09:00:00"}}"#
+        )
+        .unwrap();
+        f.sync_all().unwrap();
+        assert!(!is_outcome_all_null(&path), "outcome 已填不应再 backfill");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_is_outcome_all_null_mixed() {
+        let dir = std::env::temp_dir().join("test_d01_backfill");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("2026-07-03.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // 1 行已填, 1 行 null → 仍需 backfill (has_any_pending)
+        writeln!(
+            f,
+            r#"{{"code":"TEST_CODE_002916","outcome":{{"d1_pct":0.05}},"ts":"2026-07-03 09:00:00"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"code":"TEST_CODE_002463","outcome":null,"ts":"2026-07-03 09:00:01"}}"#
+        )
+        .unwrap();
+        f.sync_all().unwrap();
+        assert!(is_outcome_all_null(&path), "部分 null 也应 backfill");
+        std::fs::remove_file(&path).unwrap();
     }
 }

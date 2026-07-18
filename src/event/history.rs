@@ -1,3 +1,4 @@
+//! Registered business rules: BR-043.
 //! History query and success-rate aggregation — v17.3 Task 3
 //!
 //! Reads persisted JSONL event files and provides:
@@ -5,9 +6,9 @@
 //! - `HistoryQuery::push_success_rate()` — delivery success rate stats
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use chrono::{DateTime, Datelike, Local, NaiveDate};
+use chrono::{DateTime, Local, NaiveDate};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::fs::{self, File};
@@ -259,8 +260,12 @@ impl HistoryQuery {
 
         // Sort by ts, then by id for stable ordering
         match filter.order {
-            HistoryOrder::Desc => entries.sort_by(|a, b| b.ts.cmp(&a.ts).then_with(|| b.id.cmp(&a.id))),
-            HistoryOrder::Asc => entries.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp(&b.id))),
+            HistoryOrder::Desc => {
+                entries.sort_by(|a, b| b.ts.cmp(&a.ts).then_with(|| b.id.cmp(&a.id)))
+            }
+            HistoryOrder::Asc => {
+                entries.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp(&b.id)))
+            }
         }
 
         // Apply limit after sort
@@ -409,7 +414,11 @@ impl HistoryQuery {
             .into_iter()
             .map(|(channel, (p, f, _))| {
                 let denom = p.saturating_add(f);
-                let rate = if denom > 0 { p as f64 / denom as f64 } else { f64::NAN };
+                let rate = if denom > 0 {
+                    p as f64 / denom as f64
+                } else {
+                    f64::NAN
+                };
                 (channel, rate)
             })
             .collect();
@@ -419,7 +428,11 @@ impl HistoryQuery {
             .into_iter()
             .map(|(kind, (p, f, _))| {
                 let denom = p.saturating_add(f);
-                let rate = if denom > 0 { p as f64 / denom as f64 } else { f64::NAN };
+                let rate = if denom > 0 {
+                    p as f64 / denom as f64
+                } else {
+                    f64::NAN
+                };
                 (kind, rate)
             })
             .collect();
@@ -454,7 +467,8 @@ impl HistoryQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::envelope::{DomainEvent, EventEnvelope, PushDeliveryEvent};
+    use crate::event::envelope::{EventEnvelope, PushDeliveryEvent};
+    use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -513,7 +527,9 @@ mod tests {
     }
 
     /// Create a test directory with given delivery lines.
-    async fn test_history_dir_with_records(records: Vec<(String, String, Option<String>, String)>) -> PathBuf {
+    async fn test_history_dir_with_records(
+        records: Vec<(String, String, Option<String>, String)>,
+    ) -> PathBuf {
         let dir = test_dir("query");
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
@@ -528,7 +544,11 @@ mod tests {
                 &outcome,
                 "dry_run",
                 37,
-                today.and_hms_opt(12, 0, 0).unwrap().and_local_timezone(Local).unwrap(),
+                today
+                    .and_hms_opt(12, 0, 0)
+                    .unwrap()
+                    .and_local_timezone(Local)
+                    .unwrap(),
             );
             let json = serde_json::to_string(&env).unwrap();
             write_envelope_line(&dir, &date_str, &json).await;
@@ -544,16 +564,31 @@ mod tests {
     #[tokio::test]
     async fn history_filters_code_kind_and_desc_limit() {
         let dir = test_history_dir_with_records(vec![
-            ("a".into(), "Announcement".into(), Some("600519".into()), "Pushed".into()),
-            ("b".into(), "PolicyHit".into(), Some("000001".into()), "Failed".into()),
-            ("c".into(), "Announcement".into(), Some("600519".into()), "Denied".into()),
+            (
+                "a".into(),
+                "Announcement".into(),
+                Some("TEST_CODE_600519".into()),
+                "Pushed".into(),
+            ),
+            (
+                "b".into(),
+                "PolicyHit".into(),
+                Some("TEST_CODE_000001".into()),
+                "Failed".into(),
+            ),
+            (
+                "c".into(),
+                "Announcement".into(),
+                Some("TEST_CODE_600519".into()),
+                "Denied".into(),
+            ),
         ])
         .await;
 
         let result = HistoryQuery::new(dir.clone())
             .query(HistoryFilter {
                 date: Some(today()),
-                code: Some("600519".into()),
+                code: Some("TEST_CODE_600519".into()),
                 kind: Some("Announcement".into()),
                 limit: 1,
                 order: HistoryOrder::Desc,
@@ -574,7 +609,7 @@ mod tests {
                 (
                     format!("id-{index:03}"),
                     "Announcement".into(),
-                    Some("600519".into()),
+                    Some("TEST_CODE_600519".into()),
                     "Pushed".into(),
                 )
             })
@@ -617,10 +652,10 @@ mod tests {
                 trace_id: format!("trace-{}", id),
                 source: "push_l4".to_string(),
                 event_type: "push.delivery".to_string(),
-                entity_key: Some("600519".to_string()),
+                entity_key: Some("TEST_CODE_600519".to_string()),
                 payload: serde_json::json!({
                     "kind": "Announcement",
-                    "code": "600519",
+                    "code": "TEST_CODE_600519",
                     "outcome": outcome,
                     "channel": "dry_run",
                     "rendered_len": 12,

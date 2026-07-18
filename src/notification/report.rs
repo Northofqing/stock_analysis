@@ -39,7 +39,7 @@ impl NotificationService {
 
         // 按评分排序
         let mut sorted_results = results.to_vec();
-        sorted_results.sort_by(|a, b| b.ranking_score.cmp(&a.ranking_score));
+        sorted_results.sort_by_key(|item| std::cmp::Reverse(item.ranking_score));
 
         // 统计信息
         let buy_count = results
@@ -730,7 +730,7 @@ impl NotificationService {
         let report_date = Local::now().format("%Y-%m-%d").to_string();
 
         let mut sorted_results = results.to_vec();
-        sorted_results.sort_by(|b, a| a.ranking_score.cmp(&b.ranking_score));
+        sorted_results.sort_by_key(|item| std::cmp::Reverse(item.ranking_score));
 
         let buy_count = results
             .iter()

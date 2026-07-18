@@ -12,9 +12,9 @@ pub fn screen_intraday(
     main_net_yi: f64,
     ignition_near_limit: usize,
 ) -> BreakoutSignal {
-    let mut confidence: u8 = 0;
     let mut desc_parts: Vec<String> = Vec::new();
     let mut data_degraded = false;
+    let mut confidence: u8 = 0;
 
     // 1. 量能模式
     let volume_pattern = if vol_ratio <= 0.0 {
@@ -73,17 +73,14 @@ pub fn screen_intraday(
     }
 
     // 5. 综合判定
-    let breakout_type = if vol_ratio >= 2.5 && change_pct <= 0.5 {
-        BreakoutType::Distribution
-    } else if vol_ratio >= 1.5 && change_pct < 0.0 {
-        BreakoutType::Distribution
-    } else if confidence >= 50 {
-        BreakoutType::Launch
-    } else if confidence >= 20 {
-        BreakoutType::Uncertain
-    } else {
-        BreakoutType::Uncertain
-    };
+    let breakout_type =
+        if (vol_ratio >= 2.5 && change_pct <= 0.5) || (vol_ratio >= 1.5 && change_pct < 0.0) {
+            BreakoutType::Distribution
+        } else if confidence >= 50 {
+            BreakoutType::Launch
+        } else {
+            BreakoutType::Uncertain
+        };
 
     let note = if data_degraded {
         " [数据源降级]"
@@ -139,7 +136,6 @@ pub fn analyze_postmarket(
 
     let latest = kline.last().unwrap();
     let change_pct = latest.pct_chg;
-    let mut confidence: u8 = 0;
     let mut launch_score: u8 = 0;
     let mut distribution_score: u8 = 0;
     let mut desc: Vec<String> = Vec::new();
@@ -250,7 +246,7 @@ pub fn analyze_postmarket(
         (BreakoutType::Uncertain, 30u8)
     };
 
-    confidence = base_confidence.min(95);
+    let confidence = base_confidence.min(95);
 
     BreakoutSignal {
         code: code.into(),
@@ -312,14 +308,14 @@ mod tests {
 
     #[test]
     fn test_intraday_launch() {
-        let s = screen_intraday("000001", "测试", 2.5, 5.2, 0.8, 4);
+        let s = screen_intraday("TEST_CODE_000001", "测试", 2.5, 5.2, 0.8, 4);
         assert_eq!(s.breakout_type, BreakoutType::Launch);
         assert!(s.confidence >= 50);
     }
 
     #[test]
     fn test_intraday_degraded() {
-        let s = screen_intraday("000001", "测试", 0.0, 1.0, 0.0, 0);
+        let s = screen_intraday("TEST_CODE_000001", "测试", 0.0, 1.0, 0.0, 0);
         assert!(s.data_degraded);
     }
 
@@ -338,7 +334,7 @@ mod tests {
                 1.0,
             ));
         }
-        let s = analyze_postmarket("000001", "测试", &data);
+        let s = analyze_postmarket("TEST_CODE_000001", "测试", &data);
         // 应该检测到地量后放量的特征
         assert!(matches!(
             s.breakout_type,
@@ -349,7 +345,7 @@ mod tests {
     #[test]
     fn test_insufficient_data() {
         let data = vec![k("2026-06-01", 10.0, 10.5, 1e6, 5.0)];
-        let s = analyze_postmarket("000001", "测试", &data);
+        let s = analyze_postmarket("TEST_CODE_000001", "测试", &data);
         assert!(s.data_degraded);
     }
 }

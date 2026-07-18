@@ -10,22 +10,36 @@ pub struct NewsCatalystStrategy;
 
 impl Strategy for NewsCatalystStrategy {
     impl_strategy_id!(NewsCatalystStrategy, "NewsCatalyst");
-    fn virtual_reason(&self) -> &'static str { "NewsCatalyst" }
-    fn description(&self) -> &'static str { "新闻/公告催化 (D-01 推送)" }
+    fn virtual_reason(&self) -> &'static str {
+        "NewsCatalyst"
+    }
+    fn description(&self) -> &'static str {
+        "新闻/公告催化 (D-01 推送)"
+    }
     fn score(&self, input: &StrategyInput) -> Option<StrategyOutput> {
         if input.push_kind != "D-01" {
             return None;
         }
-        let m: serde_json::Value = serde_json::from_str(&input.metric_json).unwrap_or_default();
-        let chg = m.get("price_chg_pct").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let metrics =
+            super::_helpers::parse(&input.metric_json, &input.code, input.push_price).ok()?;
         // Fix 2: 真读 price_chg_pct 算 score
         let mut score: f64 = 7.0;
-        if chg < 0.0 { score += (-chg).min(2.0) * 0.3; }
-        if chg < -2.0 { score += 0.5; }
+        if let Some(change_pct) = metrics.price_chg_pct {
+            if change_pct < 0.0 {
+                score += (-change_pct).min(2.0) * 0.3;
+            }
+            if change_pct < -2.0 {
+                score += 0.5;
+            }
+        }
         score = score.min(9.0);
+        let change = metrics
+            .price_chg_pct
+            .map(|value| format!("{value:.1}%"))
+            .unwrap_or_else(|| "暂无".to_string());
         Some(StrategyOutput {
             score,
-            reason: format!("新闻驱动 chg={:.1}%", chg),
+            reason: format!("新闻驱动 chg={change}"),
             virtual_reason: "NewsCatalyst".into(),
         })
     }

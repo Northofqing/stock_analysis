@@ -25,9 +25,15 @@ use crate::pipeline::chain_analysis::PUSH2_HOSTS;
 use super::is_generic_board;
 
 /// 获取指定代码集的概念标签：优先 7 天内缓存，缺失的并发拉取并落库。
-pub(super) async fn fetch_concepts_cached(codes: &[String]) -> HashMap<String, Vec<String>> {
-    let db = DatabaseManager::get();
-    let mut map = db.get_cached_concepts(7);
+pub(super) async fn fetch_concepts_cached(
+    codes: &[String],
+) -> Result<HashMap<String, Vec<String>>, String> {
+    if codes.is_empty() || codes.iter().any(|code| code.trim().is_empty()) {
+        return Err("产业链概念批次代码为空".to_string());
+    }
+    let db =
+        DatabaseManager::try_get().ok_or_else(|| "产业链概念缓存数据库未初始化".to_string())?;
+    let mut map = db.get_cached_concepts(7)?;
 
     let missing: Vec<String> = codes
         .iter()
@@ -43,7 +49,7 @@ pub(super) async fn fetch_concepts_cached(codes: &[String]) -> HashMap<String, V
             missing.len()
         );
         let tool = FetchSectorTool::new();
-        let fetched: Vec<(String, Vec<String>)> = stream::iter(missing)
+        let fetched: Vec<(String, Result<Vec<String>, String>)> = stream::iter(missing)
             .map(|code| {
                 let tool = &tool;
                 async move {
@@ -56,48 +62,58 @@ pub(super) async fn fetch_concepts_cached(codes: &[String]) -> HashMap<String, V
             .await;
 
         for (code, boards) in fetched {
-            if !boards.is_empty() {
-                db.save_stock_concepts(&code, &boards);
-            }
+            let boards = boards?;
+            db.save_stock_concepts(&code, &boards)?;
             map.insert(code, boards);
         }
     }
-    map
+    if codes.iter().any(|code| !map.contains_key(code)) {
+        return Err("产业链概念批次未覆盖全部股票代码".to_string());
+    }
+    Ok(map)
 }
 
-/// 调 FetchSectorTool 拉单只股票的板块列表；失败返回空列表。
-pub(super) async fn fetch_boards_via_tool(tool: &FetchSectorTool, code: &str) -> Vec<String> {
-    match tool.call(json!({ "code": code })).await {
-        Ok(raw) => serde_json::from_str::<serde_json::Value>(&raw)
-            .ok()
-            .and_then(|v| {
-                v.get("all_boards").and_then(|b| {
-                    b.as_array().map(|arr| {
-                        arr.iter()
-                            .filter_map(|x| x.as_str().map(String::from))
-                            .collect()
-                    })
-                })
-            })
-            .unwrap_or_default(),
-        Err(e) => {
-            warn!("[产业链] {} 板块拉取失败: {}", code, e);
-            Vec::new()
+/// 调 FetchSectorTool 拉单只股票的完整板块列表。
+pub(super) async fn fetch_boards_via_tool(
+    tool: &FetchSectorTool,
+    code: &str,
+) -> Result<Vec<String>, String> {
+    let raw = tool
+        .call(json!({ "code": code }))
+        .await
+        .map_err(|error| format!("产业链 {code} 板块拉取失败: {error}"))?;
+    let value: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|error| format!("产业链 {code} 板块 JSON 非法: {error}"))?;
+    let rows = value
+        .get("all_boards")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("产业链 {code} 缺少 all_boards 数组"))?;
+    if rows.is_empty() {
+        return Err(format!("产业链 {code} all_boards 为空"));
+    }
+    let mut boards = Vec::with_capacity(rows.len());
+    for (index, row) in rows.iter().enumerate() {
+        let board = row
+            .as_str()
+            .filter(|board| !board.trim().is_empty())
+            .ok_or_else(|| format!("产业链 {code} all_boards[{index}] 非法"))?;
+        if !boards.iter().any(|existing| existing == board) {
+            boards.push(board.to_string());
         }
     }
+    Ok(boards)
 }
 
 /// 拉取东财全部概念板块列表，返回 板块名 -> 板块代码(BKxxxx)。
-pub(super) async fn fetch_board_code_map() -> HashMap<String, String> {
-    let client = match reqwest::Client::builder()
+pub(super) async fn fetch_board_code_map() -> Result<HashMap<String, String>, String> {
+    let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
-    {
-        Ok(c) => c,
-        Err(_) => return HashMap::new(),
-    };
+        .map_err(|error| format!("产业链板块 HTTP client 初始化失败: {error}"))?;
     let mut map = HashMap::new();
-    'pages: for page in 1..=2 {
+    let mut codes = HashSet::new();
+    let mut terminal_seen = false;
+    for page in 1..=20 {
         let pn = page.to_string();
         let params = [
             ("pn", pn.as_str()),
@@ -111,40 +127,54 @@ pub(super) async fn fetch_board_code_map() -> HashMap<String, String> {
             ("fs", "m:90+t:3"),
             ("fields", "f12,f14"),
         ];
-        let json = match push2_get(&client, &params).await {
-            Some(j) => j,
-            None => {
-                warn!("[产业链] 概念板块列表获取失败（所有主机）");
-                break 'pages;
-            }
-        };
-        let diff = match json
+        let json = push2_get(&client, &params).await?;
+        let diff = json
             .get("data")
             .and_then(|d| d.get("diff"))
             .and_then(|d| d.as_array())
-        {
-            Some(arr) if !arr.is_empty() => arr,
-            _ => break,
-        };
-        for item in diff {
-            let code = item.get("f12").and_then(|v| v.as_str()).unwrap_or("");
-            let name = item.get("f14").and_then(|v| v.as_str()).unwrap_or("");
-            if !code.is_empty() && !name.is_empty() {
-                map.insert(name.to_string(), code.to_string());
+            .ok_or_else(|| format!("产业链板块第 {page} 页缺少 data.diff"))?;
+        if diff.is_empty() {
+            terminal_seen = true;
+            break;
+        }
+        for (index, item) in diff.iter().enumerate() {
+            let code = item
+                .get("f12")
+                .and_then(|value| value.as_str())
+                .filter(|value| value.starts_with("BK") && value.len() > 2)
+                .ok_or_else(|| format!("产业链板块第 {page} 页第 {index} 行 code 非法"))?;
+            let name = item
+                .get("f14")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| format!("产业链板块第 {page} 页第 {index} 行 name 非法"))?;
+            if !codes.insert(code.to_string()) {
+                return Err(format!("产业链板块代码重复: {code}"));
+            }
+            if map.insert(name.to_string(), code.to_string()).is_some() {
+                return Err(format!("产业链板块名称重复: {name}"));
             }
         }
         if diff.len() < 500 {
+            terminal_seen = true;
             break;
         }
     }
-    map
+    if !terminal_seen {
+        return Err("产业链板块分页超过 20 页，批次完整性未知".to_string());
+    }
+    if map.is_empty() {
+        return Err("产业链板块批次为空".to_string());
+    }
+    Ok(map)
 }
 
 /// 带多主机回退的 push2 clist 请求。
 pub(super) async fn push2_get(
     client: &reqwest::Client,
     params: &[(&str, &str)],
-) -> Option<serde_json::Value> {
+) -> Result<serde_json::Value, String> {
+    let mut errors = Vec::new();
     for host in PUSH2_HOSTS {
         let url = format!("{}/api/qt/clist/get", host);
         let resp = client
@@ -158,14 +188,18 @@ pub(super) async fn push2_get(
             .send()
             .await;
         match resp {
-            Ok(r) => match r.json::<serde_json::Value>().await {
-                Ok(j) if j.get("data").is_some() => return Some(j),
-                _ => continue,
+            Ok(response) => match response.error_for_status() {
+                Ok(response) => match response.json::<serde_json::Value>().await {
+                    Ok(json) if json.get("data").is_some() => return Ok(json),
+                    Ok(_) => errors.push(format!("{host}: missing data")),
+                    Err(error) => errors.push(format!("{host}: invalid JSON: {error}")),
+                },
+                Err(error) => errors.push(format!("{host}: HTTP error: {error}")),
             },
-            Err(_) => continue,
+            Err(error) => errors.push(format!("{host}: request error: {error}")),
         }
     }
-    None
+    Err(format!("产业链 push2 所有主机失败: {}", errors.join(" | ")))
 }
 
 /// 拉取某概念板块成分股，筛选补涨候选：未涨停、今日涨幅 -3%~+7%、非 ST、非北交所。
@@ -173,14 +207,14 @@ pub(super) async fn push2_get(
 pub(super) async fn fetch_laggard_candidates(
     board_code: &str,
     limit_codes: &HashSet<String>,
-) -> Vec<TopStock> {
-    let client = match reqwest::Client::builder()
+) -> Result<Vec<TopStock>, String> {
+    if !board_code.starts_with("BK") {
+        return Err(format!("产业链板块代码非法: {board_code}"));
+    }
+    let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .build()
-    {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
+        .map_err(|error| format!("产业链成份 HTTP client 初始化失败: {error}"))?;
     let fs = format!("b:{}", board_code);
     let params = [
         ("pn", "1"),
@@ -194,29 +228,40 @@ pub(super) async fn fetch_laggard_candidates(
         ("fs", fs.as_str()),
         ("fields", "f2,f3,f12,f14"),
     ];
-    let json = match push2_get(&client, &params).await {
-        Some(j) => j,
-        None => {
-            warn!("[产业链] 板块 {} 成分股获取失败（所有主机）", board_code);
-            return Vec::new();
-        }
-    };
-    let diff = match json
+    let json = push2_get(&client, &params).await?;
+    let diff = json
         .get("data")
         .and_then(|d| d.get("diff"))
         .and_then(|d| d.as_array())
-    {
-        Some(arr) => arr,
-        None => return Vec::new(),
-    };
+        .ok_or_else(|| format!("产业链板块 {board_code} 缺少 data.diff"))?;
+    if diff.is_empty() {
+        return Err(format!("产业链板块 {board_code} 成份股为空"));
+    }
     let mut out = Vec::new();
-    for item in diff {
-        let code = item.get("f12").and_then(|v| v.as_str()).unwrap_or("");
-        let name = item.get("f14").and_then(|v| v.as_str()).unwrap_or("");
-        let pct = item.get("f3").and_then(|v| v.as_f64()).unwrap_or(f64::NAN);
-        let price = item.get("f2").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        if code.is_empty() || pct.is_nan() {
-            continue;
+    let mut seen = HashSet::new();
+    for (index, item) in diff.iter().enumerate() {
+        let code = item
+            .get("f12")
+            .and_then(|value| value.as_str())
+            .filter(|value| value.len() == 6 && value.bytes().all(|byte| byte.is_ascii_digit()))
+            .ok_or_else(|| format!("产业链板块 {board_code} 第 {index} 行 code 非法"))?;
+        let name = item
+            .get("f14")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| format!("产业链板块 {board_code} 第 {index} 行 name 非法"))?;
+        let pct = item
+            .get("f3")
+            .and_then(|value| value.as_f64())
+            .filter(|value| value.is_finite() && value.abs() <= 20.0)
+            .ok_or_else(|| format!("产业链板块 {board_code} 第 {index} 行 pct 非法"))?;
+        let price = item
+            .get("f2")
+            .and_then(|value| value.as_f64())
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .ok_or_else(|| format!("产业链板块 {board_code} 第 {index} 行 price 非法"))?;
+        if !seen.insert(code.to_string()) {
+            return Err(format!("产业链板块 {board_code} code 重复: {code}"));
         }
         if limit_codes.contains(code) {
             continue;
@@ -239,30 +284,34 @@ pub(super) async fn fetch_laggard_candidates(
             ..Default::default()
         });
     }
-    out.sort_by(|a, b| {
-        b.change_pct
-            .partial_cmp(&a.change_pct)
-            .unwrap_or(std::cmp::Ordering::Equal)
+    out.sort_by(|left, right| {
+        right
+            .change_pct
+            .total_cmp(&left.change_pct)
+            .then_with(|| left.code.cmp(&right.code))
     });
     out.truncate(8);
-    out
+    Ok(out)
 }
 
 /// 今日龙虎榜净买入映射 code -> 净买额(万元)，失败返回空。
-pub(super) async fn fetch_lhb_map() -> HashMap<String, f64> {
-    match crate::lhb_analyzer::LhbDataFetcher::new() {
-        Ok(fetcher) => match fetcher.get_today_lhb().await {
-            Ok(records) => records
-                .into_iter()
-                .map(|r| (r.code, r.net_amount))
-                .collect(),
-            Err(e) => {
-                warn!("[产业链] 龙虎榜获取失败: {}", e);
-                HashMap::new()
-            }
-        },
-        Err(_) => HashMap::new(),
+pub(super) async fn fetch_lhb_map() -> Result<HashMap<String, f64>, String> {
+    let fetcher = crate::lhb_analyzer::LhbDataFetcher::new()
+        .map_err(|error| format!("产业链龙虎榜抓取器初始化失败: {error}"))?;
+    let records = fetcher
+        .get_today_lhb()
+        .await
+        .map_err(|error| format!("产业链龙虎榜获取失败: {error}"))?;
+    let mut out = HashMap::new();
+    for record in records {
+        if record.code.trim().is_empty() || !record.net_amount.is_finite() {
+            return Err(format!("产业链龙虎榜行非法: code={:?}", record.code));
+        }
+        if out.insert(record.code.clone(), record.net_amount).is_some() {
+            return Err(format!("产业链龙虎榜 code 重复: {}", record.code));
+        }
     }
+    Ok(out)
 }
 
 /// 拉取盘后催化快讯，专门用于更新报告时效性。

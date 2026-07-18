@@ -43,10 +43,8 @@ pub struct IndustryBenchmark {
 }
 
 fn secid_for(code: &str) -> String {
-    let market = if code.starts_with('6') || code.starts_with("688") || code.starts_with("900") {
+    let market = if code.starts_with('6') || code.starts_with("900") {
         1
-    } else if code.starts_with('8') || code.starts_with('4') {
-        0 // 北交所归 0 市场
     } else {
         0
     };

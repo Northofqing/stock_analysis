@@ -139,10 +139,8 @@ impl LhbDataFetcher {
 
         // 3. 保存到数据库缓存
         if let Some(db) = DatabaseManager::try_get() {
-            let new_records: Vec<NewLhbDaily> = records
-                .iter()
-                .map(|r| Self::convert_record_to_db(r))
-                .collect();
+            let new_records: Vec<NewLhbDaily> =
+                records.iter().map(Self::convert_record_to_db).collect();
 
             if let Ok(saved) = db.save_lhb_records(&new_records) {
                 log::info!("[龙虎榜] 已缓存 {} 条记录到数据库", saved);
@@ -517,7 +515,7 @@ impl LhbDataFetcher {
         }
 
         // 按评分排序
-        results.sort_by(|a, b| b.total_score.cmp(&a.total_score));
+        results.sort_by_key(|item| std::cmp::Reverse(item.total_score));
 
         Ok(results)
     }
@@ -562,7 +560,7 @@ mod tests {
         let fetcher = LhbDataFetcher::new().unwrap();
 
         // 测试一个股票代码
-        let code = "600519";
+        let code = "TEST_CODE_600519";
         let result = fetcher.analyze_stock_lhb(code).await;
 
         match result {

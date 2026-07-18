@@ -1,3 +1,4 @@
+//! Registered business rules: BR-043.
 //! Event subcommand CLI parser — v17.3 Task 4
 //!
 //! Parses `--replay`, `--history`, and related flags from the monitor's
@@ -111,9 +112,9 @@ pub fn parse_args(args: &[&str]) -> Result<Option<EventCommand>, CliError> {
                     return Err(CliError::ReplayRateWithoutReplay);
                 }
                 // Grab the next positional arg as the value
-                let (_, val) = args_iter
-                    .next()
-                    .ok_or_else(|| CliError::InvalidInteger("missing value after --replay-rate-ms".into()))?;
+                let (_, val) = args_iter.next().ok_or_else(|| {
+                    CliError::InvalidInteger("missing value after --replay-rate-ms".into())
+                })?;
                 let ms: u32 = val
                     .parse()
                     .map_err(|_| CliError::InvalidInteger(val.to_string()))?;
@@ -188,7 +189,11 @@ pub fn parse_args(args: &[&str]) -> Result<Option<EventCommand>, CliError> {
             _ => {
                 // Allow the program name (e.g. "monitor") as the first positional arg.
                 // Only reject truly unexpected positional arguments.
-                if idx == 0 && (arg == &"monitor" || arg.ends_with("/monitor") || arg.ends_with("\\monitor")) {
+                if idx == 0
+                    && (arg == &"monitor"
+                        || arg.ends_with("/monitor")
+                        || arg.ends_with("\\monitor"))
+                {
                     // skip program name
                 } else {
                     return Err(CliError::UnrecognizedArg(idx, arg.to_string()));
@@ -231,8 +236,7 @@ pub fn parse_args(args: &[&str]) -> Result<Option<EventCommand>, CliError> {
 // ========================================================================
 
 fn parse_date(s: &str) -> Result<NaiveDate, CliError> {
-    NaiveDate::parse_from_str(s, "%Y-%m-%d")
-        .map_err(|_| CliError::MalformedDate(s.to_string()))
+    NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|_| CliError::MalformedDate(s.to_string()))
 }
 
 // ========================================================================
@@ -264,7 +268,8 @@ mod tests {
 
     #[test]
     fn cli_parses_replay_with_rate_ms() {
-        let cmd = parse_args(&["monitor", "--replay=2026-07-16", "--replay-rate-ms", "100"]).unwrap();
+        let cmd =
+            parse_args(&["monitor", "--replay=2026-07-16", "--replay-rate-ms", "100"]).unwrap();
         assert!(matches!(
             cmd,
             Some(EventCommand::Replay { rate_ms: 100, .. })
@@ -273,12 +278,7 @@ mod tests {
 
     #[test]
     fn cli_parses_documented_replay_rate_equals_form() {
-        let cmd = parse_args(&[
-            "monitor",
-            "--replay=2026-07-16",
-            "--replay-rate-ms=100",
-        ])
-        .unwrap();
+        let cmd = parse_args(&["monitor", "--replay=2026-07-16", "--replay-rate-ms=100"]).unwrap();
         assert!(matches!(
             cmd,
             Some(EventCommand::Replay { rate_ms: 100, .. })
@@ -304,6 +304,8 @@ mod tests {
 
     #[test]
     fn cli_parses_history_with_filters() {
+        // Protocol-format exception: CLI history filters intentionally accept
+        // the documented native six-digit stock-code syntax.
         let cmd = parse_args(&[
             "monitor",
             "--history",
@@ -387,12 +389,7 @@ mod tests {
 
     #[test]
     fn cli_rejects_negative_limit() {
-        let err = parse_args(&[
-            "monitor",
-            "--history",
-            "--limit=-5",
-        ])
-        .unwrap_err();
+        let err = parse_args(&["monitor", "--history", "--limit=-5"]).unwrap_err();
         assert!(err.to_string().contains("limit"));
     }
 

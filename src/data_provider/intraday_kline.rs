@@ -35,8 +35,115 @@ const PUSH2HIS_HOSTS: [&str; 3] = [
     "82.push2his.eastmoney.com",
 ];
 
+fn minute_transition_is_continuous(
+    previous: chrono::NaiveDateTime,
+    current: chrono::NaiveDateTime,
+    klt: u8,
+) -> bool {
+    if !matches!(klt, 15 | 60) {
+        return false;
+    }
+    let interval = chrono::Duration::minutes(i64::from(klt));
+    if current.date() == previous.date() {
+        if current - previous == interval {
+            return true;
+        }
+        let morning_end = chrono::NaiveTime::from_hms_opt(11, 30, 0).unwrap();
+        let afternoon_first = chrono::NaiveTime::from_hms_opt(13, 0, 0)
+            .unwrap()
+            .overflowing_add_signed(interval)
+            .0;
+        return previous.time() == morning_end && current.time() == afternoon_first;
+    }
+    let close = chrono::NaiveTime::from_hms_opt(15, 0, 0).unwrap();
+    let first = chrono::NaiveTime::from_hms_opt(9, 30, 0)
+        .unwrap()
+        .overflowing_add_signed(interval)
+        .0;
+    previous.time() == close
+        && current.time() == first
+        && current.date() == crate::calendar::next_trading_day(previous.date())
+}
+
+fn parse_minute_rows(rows: &[serde_json::Value], klt: u8) -> Result<Vec<MinuteBar>> {
+    let mut bars: Vec<MinuteBar> = Vec::with_capacity(rows.len());
+    let mut previous_ts: Option<chrono::NaiveDateTime> = None;
+    for (index, row) in rows.iter().enumerate() {
+        let raw = row
+            .as_str()
+            .ok_or_else(|| anyhow!("分钟K线第 {} 行不是字符串", index + 1))?;
+        let parts: Vec<&str> = raw.split(',').collect();
+        if parts.len() < 6 {
+            return Err(anyhow!(
+                "分钟K线第 {} 行字段不足: expected>=6 actual={}",
+                index + 1,
+                parts.len()
+            ));
+        }
+        let ts = chrono::NaiveDateTime::parse_from_str(parts[0], "%Y-%m-%d %H:%M")
+            .map_err(|error| anyhow!("分钟K线第 {} 行时间非法: {error}", index + 1))?;
+        if let Some(previous) = previous_ts {
+            if ts <= previous || !minute_transition_is_continuous(previous, ts, klt) {
+                return Err(anyhow!(
+                    "分钟K线时间重复、倒序或缺口: {} -> {} (klt={klt})",
+                    previous,
+                    parts[0]
+                ));
+            }
+        }
+        previous_ts = Some(ts);
+        let parse = |field: usize, name: &str| -> Result<f64> {
+            let value = parts[field]
+                .parse::<f64>()
+                .map_err(|error| anyhow!("分钟K线第 {} 行 {name} 解析失败: {error}", index + 1))?;
+            if !value.is_finite() {
+                return Err(anyhow!("分钟K线第 {} 行 {name} 非有限", index + 1));
+            }
+            Ok(value)
+        };
+        let open = parse(1, "open")?;
+        let close = parse(2, "close")?;
+        let high = parse(3, "high")?;
+        let low = parse(4, "low")?;
+        let volume = parse(5, "volume")?;
+        if open <= 0.0
+            || close <= 0.0
+            || high <= 0.0
+            || low <= 0.0
+            || volume < 0.0
+            || high < open.max(close)
+            || low > open.min(close)
+            || high < low
+        {
+            return Err(anyhow!("分钟K线第 {} 行 OHLCV 非法", index + 1));
+        }
+        if let Some(previous) = bars.last() {
+            let change = (close / previous.close - 1.0).abs();
+            if change > 0.20 {
+                return Err(anyhow!(
+                    "分钟K线相邻收盘变化超过 ±20%: {} -> {}",
+                    previous.close,
+                    close
+                ));
+            }
+        }
+        bars.push(MinuteBar {
+            timestamp: parts[0].to_string(),
+            open,
+            close,
+            high,
+            low,
+            volume,
+        });
+    }
+    if bars.is_empty() {
+        return Err(anyhow!("分钟K线批次为空"));
+    }
+    Ok(bars)
+}
+
 /// 抓取分钟 K 线（异步内部实现）。
-async fn fetch_async(
+pub(crate) async fn fetch_async(
     client: &reqwest::Client,
     code: &str,
     klt: u8,
@@ -100,59 +207,57 @@ async fn fetch_async(
             continue;
         };
 
-        let mut bars = Vec::with_capacity(klines.len());
-        for k in klines {
-            let s = match k.as_str() {
-                Some(s) => s,
-                None => continue,
-            };
-            // 格式: "2026-04-30 14:00,open,close,high,low,volume,amount,amplitude"
-            let parts: Vec<&str> = s.split(',').collect();
-            if parts.len() < 6 {
-                continue;
+        match parse_minute_rows(klines, klt) {
+            Ok(bars) => return Ok(bars),
+            Err(error) => {
+                last_err = format!("{host}: 分钟K线批次校验失败: {error}");
             }
-            let parse = |i: usize| parts.get(i).and_then(|p| p.parse::<f64>().ok());
-            let (Some(open), Some(close), Some(high), Some(low), Some(volume)) =
-                (parse(1), parse(2), parse(3), parse(4), parse(5))
-            else {
-                continue;
-            };
-            bars.push(MinuteBar {
-                timestamp: parts[0].to_string(),
-                open,
-                close,
-                high,
-                low,
-                volume,
-            });
         }
-        // EM 返回已是升序，但稳妥起见显式断言：若发现倒序则 reverse。
-        if bars.len() >= 2 && bars.first().unwrap().timestamp > bars.last().unwrap().timestamp {
-            bars.reverse();
-        }
-        return Ok(bars);
     }
     Err(anyhow!("分钟K线全部主机失败: {}", last_err))
 }
 
 /// 同步阻塞包装（在 tokio runtime 上下文调用）。
-pub fn fetch_blocking(client: &reqwest::Client, code: &str, klt: u8, lmt: usize) -> Vec<MinuteBar> {
+pub fn fetch_blocking(
+    client: &reqwest::Client,
+    code: &str,
+    klt: u8,
+    lmt: usize,
+) -> Result<Vec<MinuteBar>> {
     // 修复 Top10#5 (2026-06-29 audit): 用 crate::block_on_async 统一替代
     if tokio::runtime::Handle::try_current().is_err() {
-        return Vec::new();
+        return Err(anyhow!("[分钟K线] 无 tokio runtime，无法抓取 {code}"));
     }
     let client = client.clone();
     let code_s = code.to_string();
-    crate::block_on_async(async move {
-        match fetch_async(&client, &code_s, klt, lmt).await {
-            Ok(b) => {
-                log::info!("[分钟K线] {} klt={} 取得 {} 根", code_s, klt, b.len());
-                b
-            }
-            Err(e) => {
-                log::warn!("[分钟K线] {} klt={} 抓取失败: {}", code_s, klt, e);
-                Vec::new()
-            }
-        }
-    })
+    crate::block_on_async(async move { fetch_async(&client, &code_s, klt, lmt).await })
+}
+
+#[cfg(test)]
+mod br115_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_minute_row_rejects_entire_batch() {
+        let rows = vec![
+            serde_json::Value::String("2026-07-18 09:30,10,10.1,10.2,9.9,100,1000,3".to_string()),
+            serde_json::Value::String("broken".to_string()),
+        ];
+        assert!(parse_minute_rows(&rows, 15).is_err());
+    }
+
+    #[test]
+    fn minute_batch_rejects_time_gap_and_adjacent_price_jump() {
+        let gap = vec![
+            serde_json::Value::String("2026-07-17 09:45,10,10,10.1,9.9,100".to_string()),
+            serde_json::Value::String("2026-07-17 10:15,10,10.1,10.2,9.9,100".to_string()),
+        ];
+        assert!(parse_minute_rows(&gap, 15).is_err());
+
+        let jump = vec![
+            serde_json::Value::String("2026-07-17 09:45,10,10,10.1,9.9,100".to_string()),
+            serde_json::Value::String("2026-07-17 10:00,13,13,13.1,12.9,100".to_string()),
+        ];
+        assert!(parse_minute_rows(&jump, 15).is_err());
+    }
 }

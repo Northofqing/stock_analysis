@@ -203,7 +203,7 @@ impl super::envelope::DomainEvent for ReplayablePushEvent {
 
     fn validate(&self) -> Result<(), super::envelope::EnvelopeError> {
         self.validate()
-            .map_err(|e| super::envelope::EnvelopeError::BlankEventType)
+            .map_err(|_e| super::envelope::EnvelopeError::BlankEventType)
     }
 }
 
@@ -214,7 +214,7 @@ impl super::envelope::DomainEvent for ReplayablePushEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::envelope::{DomainEvent, EventEnvelope};
+    use crate::event::envelope::EventEnvelope;
 
     fn make_delivery_envelope(event_type: &str) -> EventEnvelope {
         EventEnvelope {
@@ -223,10 +223,10 @@ mod tests {
             trace_id: "trace-1".into(),
             source: "push_l4".into(),
             event_type: event_type.into(),
-            entity_key: Some("600519".into()),
+            entity_key: Some("TEST_CODE_600519".into()),
             payload: serde_json::json!({
                 "kind": "announcement_v1",
-                "code": "600519",
+                "code": "TEST_CODE_600519",
                 "outcome": "Pushed",
                 "channel": "dry_run",
                 "rendered_len": 12,
@@ -244,7 +244,7 @@ mod tests {
         assert_eq!(record.kind, "announcement_v1");
         assert_eq!(record.latency_ms, 37);
         assert_eq!(record.outcome, PushOutcomeLabel::Pushed);
-        assert_eq!(record.code.as_deref(), Some("600519"));
+        assert_eq!(record.code.as_deref(), Some("TEST_CODE_600519"));
         assert_eq!(record.channel, "dry_run");
     }
 
@@ -256,40 +256,27 @@ mod tests {
 
     #[test]
     fn replayable_event_rejects_empty_body() {
-        let err = ReplayablePushEvent::new(
-            "Announcement".into(),
-            None,
-            "".into(),
-            "monitor".into(),
-        )
-        .validate()
-        .unwrap_err();
+        let err =
+            ReplayablePushEvent::new("Announcement".into(), None, "".into(), "monitor".into())
+                .validate()
+                .unwrap_err();
         assert!(err.to_string().contains("text"));
     }
 
     #[test]
     fn replayable_event_rejects_blank_kind() {
-        let err = ReplayablePushEvent::new(
-            "  ".into(),
-            None,
-            "hello".into(),
-            "monitor".into(),
-        )
-        .validate()
-        .unwrap_err();
+        let err = ReplayablePushEvent::new("  ".into(), None, "hello".into(), "monitor".into())
+            .validate()
+            .unwrap_err();
         assert!(err.to_string().contains("kind"));
     }
 
     #[test]
     fn replayable_event_rejects_blank_source() {
-        let err = ReplayablePushEvent::new(
-            "Announcement".into(),
-            None,
-            "hello".into(),
-            "  ".into(),
-        )
-        .validate()
-        .unwrap_err();
+        let err =
+            ReplayablePushEvent::new("Announcement".into(), None, "hello".into(), "  ".into())
+                .validate()
+                .unwrap_err();
         assert!(err.to_string().contains("source"));
     }
 
@@ -303,7 +290,7 @@ mod tests {
             event_type: "push.delivery".into(),
             entity_key: None,
             payload: serde_json::json!({
-                "code": "600519",
+                "code": "TEST_CODE_600519",
                 "outcome": "Pushed",
                 "channel": "dry_run",
                 "latency_ms": 37,
@@ -325,7 +312,7 @@ mod tests {
             entity_key: None,
             payload: serde_json::json!({
                 "kind": "announcement_v1",
-                "code": "600519",
+                "code": "TEST_CODE_600519",
                 "outcome": "Pushed",
                 "channel": "dry_run",
             }),
@@ -346,7 +333,7 @@ mod tests {
             entity_key: None,
             payload: serde_json::json!({
                 "kind": "announcement_v1",
-                "code": "600519",
+                "code": "TEST_CODE_600519",
                 "outcome": "SinkError",
                 "channel": "dry_run",
                 "latency_ms": 37,
@@ -362,7 +349,7 @@ mod tests {
     fn replayable_push_event_round_trips() {
         let event = ReplayablePushEvent::new(
             "Announcement".into(),
-            Some("600519".into()),
+            Some("TEST_CODE_600519".into()),
             "Test message".into(),
             "monitor".into(),
         );
@@ -376,6 +363,6 @@ mod tests {
         .unwrap();
         assert_eq!(env.event_type, "push.source");
         assert_eq!(env.payload["kind"], "Announcement");
-        assert_eq!(env.payload["code"], "600519");
+        assert_eq!(env.payload["code"], "TEST_CODE_600519");
     }
 }

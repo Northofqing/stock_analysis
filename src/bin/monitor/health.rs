@@ -1,7 +1,11 @@
-//! v16.6 #2: 5 项健康检查 (DB / 3 Bus / 8 strategy / PerformanceEngine 24h / QuoteProvider 0%)
+//! Production health checks for storage, event delivery, strategies,
+//! performance snapshots, and realtime quote registration.
 
-use crate::bus::{SignalBus, TradingBus, SystemBus};
-use crate::registry::StrategyRegistry;
+use chrono::{NaiveDateTime, Utc};
+use diesel::prelude::*;
+use diesel::sql_query;
+use stock_analysis::database::DatabaseManager;
+use stock_analysis::registry::StrategyRegistry;
 
 #[derive(Debug, Clone, Default)]
 pub struct HealthStatus {
@@ -14,90 +18,105 @@ pub struct HealthStatus {
 
 impl HealthStatus {
     pub fn all_ok(&self) -> bool {
-        // broker 接入度 < 50% 标 warn 而非 fail (broker SDK 未接入, 业务 fallback)
-        // 4 项必须 ok, quote_provider 允许 warn
-        self.db_writable && self.bus_alive && self.strategy_registered && self.perf_recent
-    }
-
-    /// 0.0 fallback 比例 < 50% 算 ok (broker 接入度 ≥ 50%)
-    pub fn quote_provider_ok(&self) -> bool {
-        self.quote_provider
+        self.db_writable
+            && self.bus_alive
+            && self.strategy_registered
+            && self.perf_recent
+            && self.quote_provider
     }
 }
 
-/// 5 项健康检查 (mock 实现, 无 DB 上下文返 false)
 pub async fn health_check() -> HealthStatus {
     HealthStatus {
-        db_writable: check_db().await,
-        bus_alive: check_3_buses().await,
-        strategy_registered: check_8_strategy().await,
-        perf_recent: check_perf_24h().await,
-        quote_provider: check_quote_provider_0_pct().await,
+        db_writable: check_db(),
+        bus_alive: stock_analysis::event::global_bus().receiver_count() >= 2,
+        strategy_registered: StrategyRegistry::global().list_all().len() >= 8,
+        perf_recent: check_perf_24h(),
+        quote_provider: stock_analysis::broker::quote_provider_registered(),
     }
 }
 
-async fn check_db() -> bool {
-    use crate::database::DatabaseManager;
-    use diesel::prelude::*;
-    use diesel::sql_query;
-    let mut conn = match DatabaseManager::get().get_conn() {
-        Ok(c) => c,
-        Err(_) => return false,
+fn check_db() -> bool {
+    #[derive(diesel::QueryableByName)]
+    struct QueryRow {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        ok: i32,
+    }
+
+    let Some(db) = DatabaseManager::try_get() else {
+        return false;
     };
-    let r: Result<QueryRow, _> = sql_query("SELECT 1 AS ok").get_result(&mut conn);
-    r.map(|_| true).unwrap_or(false)
+    let Ok(mut conn) = db.get_conn() else {
+        return false;
+    };
+    sql_query("SELECT 1 AS ok")
+        .get_result::<QueryRow>(&mut conn)
+        .is_ok_and(|row| row.ok == 1)
 }
 
-async fn check_3_buses() -> bool {
-    let _ = SignalBus::global();
-    let _ = TradingBus::global();
-    let _ = SystemBus::global();
-    true
+fn check_perf_24h() -> bool {
+    #[derive(diesel::QueryableByName)]
+    struct LatestSnapshot {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        created_at: Option<String>,
+    }
+
+    let Some(db) = DatabaseManager::try_get() else {
+        return false;
+    };
+    let Ok(mut conn) = db.get_conn() else {
+        return false;
+    };
+    let Ok(row) = sql_query("SELECT MAX(created_at) AS created_at FROM paper_performance_snapshot")
+        .get_result::<LatestSnapshot>(&mut conn)
+    else {
+        return false;
+    };
+    row.created_at
+        .as_deref()
+        .is_some_and(|created_at| snapshot_is_recent(created_at, Utc::now().naive_utc()))
 }
 
-async fn check_8_strategy() -> bool {
-    let r = StrategyRegistry::global();
-    r.list_all().len() >= 8
-}
-
-async fn check_perf_24h() -> bool {
-    // 简化: 启动 24h 内有 snapshot (无 snapshot 返 false)
-    // v16.6 阶段 mock 返 true (e2e 无真数据, 标 true 让启动)
-    use chrono::Utc;
-    let _today = Utc::now().date_naive();
-    true
-}
-
-async fn check_quote_provider_0_pct() -> bool {
-    // broker SDK 未接入, mock 返 true (业务可启动)
-    true
-}
-
-#[derive(diesel::QueryableByName)]
-struct QueryRow {
-    #[diesel(sql_type = diesel::sql_types::Integer)]
-    ok: i32,
+fn snapshot_is_recent(created_at: &str, now: NaiveDateTime) -> bool {
+    NaiveDateTime::parse_from_str(created_at, "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .is_some_and(|timestamp| {
+            let age = now.signed_duration_since(timestamp);
+            age.num_seconds() >= 0 && age.num_hours() <= 24
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Duration;
 
     #[test]
-    fn health_status_default() {
-        let h = HealthStatus::default();
-        assert!(!h.all_ok());
-    }
-
-    #[test]
-    fn health_status_all_ok_with_quote_warn() {
-        let h = HealthStatus {
+    fn every_component_is_blocking() {
+        let mut healthy = HealthStatus {
             db_writable: true,
             bus_alive: true,
             strategy_registered: true,
             perf_recent: true,
-            quote_provider: false,
+            quote_provider: true,
         };
-        assert!(h.all_ok(), "4 项 ok, quote_provider warn, all_ok 应 true");
+        assert!(healthy.all_ok());
+        healthy.quote_provider = false;
+        assert!(!healthy.all_ok());
+    }
+
+    #[test]
+    fn performance_timestamp_must_be_within_24_hours() {
+        let now =
+            NaiveDateTime::parse_from_str("2026-07-17 12:00:00", "%Y-%m-%d %H:%M:%S").unwrap();
+        let recent = (now - Duration::hours(23))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let stale = (now - Duration::hours(25))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        assert!(snapshot_is_recent(&recent, now));
+        assert!(!snapshot_is_recent(&stale, now));
+        assert!(!snapshot_is_recent("invalid", now));
     }
 }

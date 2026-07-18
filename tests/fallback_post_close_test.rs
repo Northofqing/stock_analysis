@@ -12,6 +12,7 @@ use stock_analysis::data_provider::fallback::fetch_kline_post_close;
 /// Task 7 主断言: fetch_kline_post_close 至少能从一条链拿到数据.
 /// 期望 Baostock 胜出 (盘后窗口), 但允许 fallthrough 到 5-way 任一源.
 #[tokio::test]
+#[ignore = "live five-provider market-data integration test; run explicitly with --ignored"]
 async fn post_close_prefers_baostock() {
     let (data, src) = fetch_kline_post_close("600000", 30)
         .await
@@ -36,7 +37,7 @@ async fn post_close_prefers_baostock() {
 /// 若此测试 PASS 但上条 FAIL, 说明 fallback 链未集成 Baostock.
 /// 网络依赖, 默认跳过; 手动跑: cargo test --test fallback_post_close_test -- --ignored
 #[tokio::test]
-#[ignore]
+#[ignore = "live Baostock TCP integration test; run explicitly with --ignored"]
 async fn baostock_provider_direct_fetch_works() {
     let data = BaostockProvider::new()
         .fetch_kline_async("600000", 5)

@@ -1,3 +1,4 @@
+//! Registered business rules: BR-056.
 //! 热加载配置 — toml 文件读取 + 默认值 fallback。
 //!
 //! SIGHUP 信号触发 reload。toml 缺失或格式错误 → 用代码默认值，不崩溃。
@@ -474,7 +475,7 @@ static RISK_CONFIG: LazyLock<RwLock<RiskConfig>> =
     LazyLock::new(|| RwLock::new(RiskConfig::default()));
 
 /// 修复 P3.1: 集中风险/费用常量
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RiskConfig {
     pub trading: TradingConfig,
     pub slippage: SlippageConfig,
@@ -485,20 +486,6 @@ pub struct RiskConfig {
     /// v12 PR1: 账户模式三态判定阈值 (BR-021)
     #[serde(default)]
     pub account_mode: AccountModeConfig,
-}
-
-impl Default for RiskConfig {
-    fn default() -> Self {
-        Self {
-            trading: TradingConfig::default(),
-            slippage: SlippageConfig::default(),
-            performance: PerformanceConfig::default(),
-            regime: RegimeConfig::default(),
-            exposure: ExposureConfig::default(),
-            alert: AlertConfig::default(),
-            account_mode: AccountModeConfig::default(),
-        }
-    }
 }
 
 /// v12 PR1-1.4: 账户模式阈值配置 (对齐 `risk::account_mode::thresholds` const fallback)

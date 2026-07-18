@@ -1,7 +1,7 @@
 //! limit_up（从 market_analyzer.rs 拆分）
 
 use anyhow::Result;
-use log::{info, warn};
+use log::info;
 use serde_json::Value;
 use std::time::Duration;
 
@@ -39,29 +39,15 @@ impl MarketAnalyzer {
                 .timeout(Duration::from_secs(15))
                 .send();
 
-            let response = match response {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!("[大盘] 新浪API第{}页请求失败: {}", page, e);
-                    break;
-                }
-            };
+            let response =
+                response.map_err(|e| anyhow::anyhow!("新浪 API 第{page}页请求失败: {e}"))?;
 
-            let text = match response.text() {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!("[大盘] 新浪API第{}页读取失败: {}", page, e);
-                    break;
-                }
-            };
+            let text = response
+                .text()
+                .map_err(|e| anyhow::anyhow!("新浪 API 第{page}页读取失败: {e}"))?;
 
-            let json: Value = match serde_json::from_str(&text) {
-                Ok(j) => j,
-                Err(e) => {
-                    warn!("[大盘] 新浪API第{}页解析失败: {}", page, e);
-                    break;
-                }
-            };
+            let json: Value = serde_json::from_str(&text)
+                .map_err(|e| anyhow::anyhow!("新浪 API 第{page}页 JSON 解析失败: {e}"))?;
 
             let items = match json.as_array() {
                 Some(arr) if !arr.is_empty() => arr,
@@ -70,13 +56,31 @@ impl MarketAnalyzer {
 
             let mut min_pct = f64::MAX;
 
-            for item in items {
+            for (row_index, item) in items.iter().enumerate() {
                 let change_pct = item
                     .get("changepercent")
                     .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0);
-                let stock_name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let raw_code = item.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
+                    .filter(|value| value.is_finite() && value.abs() <= 20.0)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "新浪涨停榜第{page}页第{}行 changepercent 缺失/超过±20%",
+                            row_index + 1
+                        )
+                    })?;
+                let stock_name = item
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("新浪涨停榜第{page}页第{}行缺少 name", row_index + 1)
+                    })?;
+                let raw_code = item
+                    .get("symbol")
+                    .and_then(|v| v.as_str())
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("新浪涨停榜第{page}页第{}行缺少 symbol", row_index + 1)
+                    })?;
                 let code = raw_code
                     .trim_start_matches("sh")
                     .trim_start_matches("sz")
@@ -85,7 +89,8 @@ impl MarketAnalyzer {
                     .get("trade")
                     .and_then(|v| v.as_str())
                     .and_then(|s| s.parse::<f64>().ok())
-                    .unwrap_or(0.0);
+                    .filter(|value| value.is_finite() && *value > 0.0)
+                    .ok_or_else(|| anyhow::anyhow!("新浪涨停榜 {code} trade 缺失/非法"))?;
 
                 if change_pct < min_pct {
                     min_pct = change_pct;
@@ -107,8 +112,8 @@ impl MarketAnalyzer {
                         name: stock_name.to_string(),
                         change_pct,
                         price,
-                        volume_ratio: 0.0, // 新浪API无此字段
-                        main_net_yi: 0.0,
+                        volume_ratio: None, // 新浪API无此字段
+                        main_net_yi: None,
                     });
                 }
             }
@@ -196,13 +201,38 @@ impl MarketAnalyzer {
             };
 
             let mut min_pct = f64::MAX;
-            for item in diff {
-                let code = item.get("f12").and_then(|v| v.as_str()).unwrap_or("");
-                let name = item.get("f14").and_then(|v| v.as_str()).unwrap_or("");
-                let change_pct = item.get("f3").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let price = item.get("f2").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let volume_ratio = item.get("f10").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let main_net_yi = item.get("f62").and_then(|v| v.as_f64()).unwrap_or(0.0) / 1e8;
+            for (row_index, item) in diff.iter().enumerate() {
+                let code = item
+                    .get("f12")
+                    .and_then(|v| v.as_str())
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("东财涨停榜第{page}页第{}行缺少 code", row_index + 1)
+                    })?;
+                let name = item
+                    .get("f14")
+                    .and_then(|v| v.as_str())
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("东财涨停榜 {code} 缺少 name"))?;
+                let change_pct = item
+                    .get("f3")
+                    .and_then(|v| v.as_f64())
+                    .filter(|value| value.is_finite() && value.abs() <= 20.0)
+                    .ok_or_else(|| anyhow::anyhow!("东财涨停榜 {code} change_pct 缺失/超过±20%"))?;
+                let price = item
+                    .get("f2")
+                    .and_then(|v| v.as_f64())
+                    .filter(|value| value.is_finite() && *value > 0.0)
+                    .ok_or_else(|| anyhow::anyhow!("东财涨停榜 {code} price 缺失/非法"))?;
+                let volume_ratio = item
+                    .get("f10")
+                    .and_then(|v| v.as_f64())
+                    .filter(|value| value.is_finite() && *value >= 0.0);
+                let main_net_yi = item
+                    .get("f62")
+                    .and_then(|v| v.as_f64())
+                    .filter(|value| value.is_finite())
+                    .map(|value| value / 1e8);
 
                 if change_pct < min_pct {
                     min_pct = change_pct;

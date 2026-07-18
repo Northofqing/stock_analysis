@@ -8,7 +8,7 @@
 use super::{NewsFeed, SourceKind};
 use crate::signal::market_event::{Direction, EventType, MarketEvent, SourceRef};
 use crate::util::recover_lock_or_warn;
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use chrono::{Local, Utc};
 use std::sync::{Arc, Mutex};
@@ -50,7 +50,11 @@ fn search_result_to_event(
         occurred_at: now.with_timezone(&Local),
         provenance: vec![SourceRef {
             provider: source_kind.label().to_string(),
-            url: if r.url.is_empty() { None } else { Some(r.url.clone()) },
+            url: if r.url.is_empty() {
+                None
+            } else {
+                Some(r.url.clone())
+            },
             fetched_at: now.with_timezone(&Local),
         }],
         ai_degraded: false,
@@ -67,11 +71,21 @@ pub struct Jin10FlashFeed {
 }
 #[async_trait]
 impl NewsFeed for Jin10FlashFeed {
-    fn name(&self) -> &str { "jin10_flash" }
-    fn source_kind(&self) -> SourceKind { SourceKind::Flash }
+    fn name(&self) -> &str {
+        "jin10_flash"
+    }
+    fn source_kind(&self) -> SourceKind {
+        SourceKind::Flash
+    }
     async fn fetch(&self, limit: usize) -> Result<Vec<MarketEvent>> {
-        let v = self.inner.fetch_flash_news(limit, false).await.unwrap_or_default();
-        Ok(v.iter().map(|r| search_result_to_event(r, SourceKind::Flash, EventType::Other)).collect())
+        let v = self
+            .inner
+            .fetch_flash_news(limit, false)
+            .await
+            .context("jin10_flash fetch failed")?;
+        Ok(v.iter()
+            .map(|r| search_result_to_event(r, SourceKind::Flash, EventType::Other))
+            .collect())
     }
 }
 
@@ -80,11 +94,21 @@ pub struct WallStreetCnFeed {
 }
 #[async_trait]
 impl NewsFeed for WallStreetCnFeed {
-    fn name(&self) -> &str { "wallstreetcn_flash" }
-    fn source_kind(&self) -> SourceKind { SourceKind::Flash }
+    fn name(&self) -> &str {
+        "wallstreetcn_flash"
+    }
+    fn source_kind(&self) -> SourceKind {
+        SourceKind::Flash
+    }
     async fn fetch(&self, limit: usize) -> Result<Vec<MarketEvent>> {
-        let v = self.inner.fetch_live_news(limit).await.unwrap_or_default();
-        Ok(v.iter().map(|r| search_result_to_event(r, SourceKind::Flash, EventType::Other)).collect())
+        let v = self
+            .inner
+            .fetch_live_news(limit)
+            .await
+            .context("wallstreetcn_flash fetch failed")?;
+        Ok(v.iter()
+            .map(|r| search_result_to_event(r, SourceKind::Flash, EventType::Other))
+            .collect())
     }
 }
 
@@ -93,11 +117,21 @@ pub struct ClsFlashFeed {
 }
 #[async_trait]
 impl NewsFeed for ClsFlashFeed {
-    fn name(&self) -> &str { "cls_flash" }
-    fn source_kind(&self) -> SourceKind { SourceKind::Flash }
+    fn name(&self) -> &str {
+        "cls_flash"
+    }
+    fn source_kind(&self) -> SourceKind {
+        SourceKind::Flash
+    }
     async fn fetch(&self, limit: usize) -> Result<Vec<MarketEvent>> {
-        let v = self.inner.fetch_live_news(limit).await.unwrap_or_default();
-        Ok(v.iter().map(|r| search_result_to_event(r, SourceKind::Flash, EventType::Other)).collect())
+        let v = self
+            .inner
+            .fetch_live_news(limit)
+            .await
+            .context("cls_flash fetch failed")?;
+        Ok(v.iter()
+            .map(|r| search_result_to_event(r, SourceKind::Flash, EventType::Other))
+            .collect())
     }
 }
 
@@ -106,11 +140,17 @@ pub struct SinaFlashFeed {
 }
 #[async_trait]
 impl NewsFeed for SinaFlashFeed {
-    fn name(&self) -> &str { "sina_flash" }
-    fn source_kind(&self) -> SourceKind { SourceKind::Flash }
+    fn name(&self) -> &str {
+        "sina_flash"
+    }
+    fn source_kind(&self) -> SourceKind {
+        SourceKind::Flash
+    }
     async fn fetch(&self, limit: usize) -> Result<Vec<MarketEvent>> {
         let v = self.inner.fetch_flash_news(limit).await;
-        Ok(v.iter().map(|r| search_result_to_event(r, SourceKind::Flash, EventType::Other)).collect())
+        Ok(v.iter()
+            .map(|r| search_result_to_event(r, SourceKind::Flash, EventType::Other))
+            .collect())
     }
 }
 
@@ -119,11 +159,21 @@ pub struct WeiboHotFeed {
 }
 #[async_trait]
 impl NewsFeed for WeiboHotFeed {
-    fn name(&self) -> &str { "weibo_hot" }
-    fn source_kind(&self) -> SourceKind { SourceKind::Flash }
+    fn name(&self) -> &str {
+        "weibo_hot"
+    }
+    fn source_kind(&self) -> SourceKind {
+        SourceKind::Flash
+    }
     async fn fetch(&self, limit: usize) -> Result<Vec<MarketEvent>> {
-        let v = self.inner.fetch_hot_search(limit).await.unwrap_or_default();
-        Ok(v.iter().map(|r| search_result_to_event(r, SourceKind::Flash, EventType::Other)).collect())
+        let v = self
+            .inner
+            .fetch_hot_search(limit)
+            .await
+            .context("weibo_hot fetch failed")?;
+        Ok(v.iter()
+            .map(|r| search_result_to_event(r, SourceKind::Flash, EventType::Other))
+            .collect())
     }
 }
 
@@ -132,11 +182,21 @@ pub struct GelonghuiFeed {
 }
 #[async_trait]
 impl NewsFeed for GelonghuiFeed {
-    fn name(&self) -> &str { "gelonghui" }
-    fn source_kind(&self) -> SourceKind { SourceKind::Flash }
+    fn name(&self) -> &str {
+        "gelonghui"
+    }
+    fn source_kind(&self) -> SourceKind {
+        SourceKind::Flash
+    }
     async fn fetch(&self, limit: usize) -> Result<Vec<MarketEvent>> {
-        let v = self.inner.fetch_live(limit).await.unwrap_or_default();
-        Ok(v.iter().map(|r| search_result_to_event(r, SourceKind::Flash, EventType::Other)).collect())
+        let v = self
+            .inner
+            .fetch_live(limit)
+            .await
+            .context("gelonghui fetch failed")?;
+        Ok(v.iter()
+            .map(|r| search_result_to_event(r, SourceKind::Flash, EventType::Other))
+            .collect())
     }
 }
 
@@ -145,11 +205,21 @@ pub struct KcbDailyFeed {
 }
 #[async_trait]
 impl NewsFeed for KcbDailyFeed {
-    fn name(&self) -> &str { "kcb_daily" }
-    fn source_kind(&self) -> SourceKind { SourceKind::ActiveSearch }
+    fn name(&self) -> &str {
+        "kcb_daily"
+    }
+    fn source_kind(&self) -> SourceKind {
+        SourceKind::ActiveSearch
+    }
     async fn fetch(&self, limit: usize) -> Result<Vec<MarketEvent>> {
-        let v = self.inner.fetch_latest(limit).await.unwrap_or_default();
-        Ok(v.iter().map(|r| search_result_to_event(r, SourceKind::ActiveSearch, EventType::Other)).collect())
+        let v = self
+            .inner
+            .fetch_latest(limit)
+            .await
+            .context("kcb_daily fetch failed")?;
+        Ok(v.iter()
+            .map(|r| search_result_to_event(r, SourceKind::ActiveSearch, EventType::Other))
+            .collect())
     }
 }
 
@@ -158,37 +228,53 @@ pub struct GovPolicyFeed {
 }
 #[async_trait]
 impl NewsFeed for GovPolicyFeed {
-    fn name(&self) -> &str { "gov_policy" }
-    fn source_kind(&self) -> SourceKind { SourceKind::Policy }
+    fn name(&self) -> &str {
+        "gov_policy"
+    }
+    fn source_kind(&self) -> SourceKind {
+        SourceKind::Policy
+    }
     async fn fetch(&self, limit: usize) -> Result<Vec<MarketEvent>> {
-        let v = self.inner.fetch_latest(limit).await.unwrap_or_default();
-        Ok(v.iter().map(|r| search_result_to_event(r, SourceKind::Policy, EventType::Policy)).collect())
+        let v = self
+            .inner
+            .fetch_latest(limit)
+            .await
+            .context("gov_policy fetch failed")?;
+        Ok(v.iter()
+            .map(|r| search_result_to_event(r, SourceKind::Policy, EventType::Policy))
+            .collect())
     }
 }
 
 // ============================================================================
-// 新建 2 个政策 feed (gov.cn RSS / miit.gov.cn 栏目) — skeleton, 待真实 HTML 解析
+// 未实现的政策 feed：不进入生产注册表，误调用显式 unavailable
 // ============================================================================
 
 pub struct GovCnFeed;
 #[async_trait]
 impl NewsFeed for GovCnFeed {
-    fn name(&self) -> &str { "gov_cn_yaowen" }
-    fn source_kind(&self) -> SourceKind { SourceKind::Policy }
+    fn name(&self) -> &str {
+        "gov_cn_yaowen"
+    }
+    fn source_kind(&self) -> SourceKind {
+        SourceKind::Policy
+    }
     async fn fetch(&self, _limit: usize) -> Result<Vec<MarketEvent>> {
-        log::debug!("[GovCnFeed] skeleton — 国务院栏目 RSS 待实现");
-        Ok(vec![])
+        bail!("gov_cn_yaowen unavailable: parser not implemented")
     }
 }
 
 pub struct MiitFeed;
 #[async_trait]
 impl NewsFeed for MiitFeed {
-    fn name(&self) -> &str { "miit_policy" }
-    fn source_kind(&self) -> SourceKind { SourceKind::Policy }
+    fn name(&self) -> &str {
+        "miit_policy"
+    }
+    fn source_kind(&self) -> SourceKind {
+        SourceKind::Policy
+    }
     async fn fetch(&self, _limit: usize) -> Result<Vec<MarketEvent>> {
-        log::debug!("[MiitFeed] skeleton — 工信部栏目 RSS 待实现");
-        Ok(vec![])
+        bail!("miit_policy unavailable: parser not implemented")
     }
 }
 
@@ -199,95 +285,114 @@ impl NewsFeed for MiitFeed {
 pub struct EmAnnouncementFeed;
 #[async_trait]
 impl NewsFeed for EmAnnouncementFeed {
-    fn name(&self) -> &str { "em_announcement" }
-    fn source_kind(&self) -> SourceKind { SourceKind::Earnings }
+    fn name(&self) -> &str {
+        "em_announcement"
+    }
+    fn source_kind(&self) -> SourceKind {
+        SourceKind::Earnings
+    }
     async fn fetch(&self, _limit: usize) -> Result<Vec<MarketEvent>> {
-        let anns = match crate::data_provider::announcement::fetch_announcements(None).await {
-            Ok(v) => v,
-            Err(e) => {
-                log::warn!("[EmAnnouncementFeed] fetch failed: {}", e);
-                return Ok(vec![]);
-            }
-        };
+        let anns = crate::data_provider::announcement::fetch_announcements(None)
+            .await
+            .context("em_announcement fetch failed")?;
         if anns.is_empty() {
             log::info!("[EmAnnouncementFeed] no announcements this cycle");
             return Ok(vec![]);
         }
         let now = Utc::now().with_timezone(&Local);
-        Ok(anns.iter().map(|a| {
-            let simhash = {
-                use std::collections::hash_map::DefaultHasher;
-                use std::hash::{Hash, Hasher};
-                let mut h = DefaultHasher::new();
-                a.code.hash(&mut h);
-                a.title.hash(&mut h);
-                h.finish()
-            };
-            MarketEvent {
-                event_id: format!("earnings-{:x}", simhash),
-                simhash,
-                full_title: a.title.clone(),
-                event_type: EventType::Announcement,  // truthful category
-                subject: a.code.clone(),
-                object: Some(a.code.clone()),
-                direction: Direction::Neutral,
-                strength: 70,
-                certainty: 80,
-                chains: vec![],
-                occurred_at: now,
-                provenance: vec![SourceRef {
-                    provider: "em_announcement".to_string(),
-                    url: a.url.clone(),
-                    fetched_at: now,
-                }],
-                ai_degraded: false,
-                stale: false,
-            }
-        }).collect())
+        Ok(anns
+            .iter()
+            .map(|a| {
+                let simhash = {
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut h = DefaultHasher::new();
+                    a.code.hash(&mut h);
+                    a.title.hash(&mut h);
+                    h.finish()
+                };
+                MarketEvent {
+                    event_id: format!("earnings-{:x}", simhash),
+                    simhash,
+                    full_title: a.title.clone(),
+                    event_type: EventType::Announcement, // truthful category
+                    subject: a.code.clone(),
+                    object: Some(a.code.clone()),
+                    direction: Direction::Neutral,
+                    strength: 70,
+                    certainty: 80,
+                    chains: vec![],
+                    occurred_at: now,
+                    provenance: vec![SourceRef {
+                        provider: "em_announcement".to_string(),
+                        url: a.url.clone(),
+                        fetched_at: now,
+                    }],
+                    ai_degraded: false,
+                    stale: false,
+                }
+            })
+            .collect())
     }
 }
 
 pub struct EarningsCalendarFeed;
 #[async_trait]
 impl NewsFeed for EarningsCalendarFeed {
-    fn name(&self) -> &str { "earnings_calendar" }
-    fn source_kind(&self) -> SourceKind { SourceKind::Earnings }
+    fn name(&self) -> &str {
+        "earnings_calendar"
+    }
+    fn source_kind(&self) -> SourceKind {
+        SourceKind::Earnings
+    }
     async fn fetch(&self, _limit: usize) -> Result<Vec<MarketEvent>> {
-        Ok(vec![])
+        bail!("earnings_calendar unavailable: polling source not implemented")
     }
 }
 
 pub struct ConsensusFeed;
 #[async_trait]
 impl NewsFeed for ConsensusFeed {
-    fn name(&self) -> &str { "consensus" }
-    fn source_kind(&self) -> SourceKind { SourceKind::AnalystView }
+    fn name(&self) -> &str {
+        "consensus"
+    }
+    fn source_kind(&self) -> SourceKind {
+        SourceKind::AnalystView
+    }
     async fn fetch(&self, _limit: usize) -> Result<Vec<MarketEvent>> {
-        Ok(vec![])
+        bail!("consensus unavailable: polling source not implemented")
     }
 }
 
 // ============================================================================
-// D1.4: MarketActionFeed + AnalystViewsFeed (主动触发, 被动 feed 返回空)
+// D1.4: MarketActionFeed + AnalystViewsFeed (主动触发，禁止按轮询源调用)
 // ============================================================================
 
 pub struct MarketActionFeed;
 #[async_trait]
 impl NewsFeed for MarketActionFeed {
-    fn name(&self) -> &str { "market_action" }
-    fn source_kind(&self) -> SourceKind { SourceKind::MarketAction }
+    fn name(&self) -> &str {
+        "market_action"
+    }
+    fn source_kind(&self) -> SourceKind {
+        SourceKind::MarketAction
+    }
     async fn fetch(&self, _limit: usize) -> Result<Vec<MarketEvent>> {
-        Ok(vec![])  // 主动路径: portfolio::market_action 触发
+        bail!("market_action is push-driven and cannot be polled")
     }
 }
 
 pub struct AnalystViewsFeed;
 #[async_trait]
 impl NewsFeed for AnalystViewsFeed {
-    fn name(&self) -> &str { "analyst_views" }
-    fn source_kind(&self) -> SourceKind { SourceKind::AnalystView }
+    fn name(&self) -> &str {
+        "analyst_views"
+    }
+    fn source_kind(&self) -> SourceKind {
+        SourceKind::AnalystView
+    }
     async fn fetch(&self, _limit: usize) -> Result<Vec<MarketEvent>> {
-        Ok(vec![])  // 被动: 卖方研报由 D1.4 主动 xueqiu 触发
+        bail!("analyst_views is push-driven and cannot be polled")
     }
 }
 
@@ -295,10 +400,10 @@ impl NewsFeed for AnalystViewsFeed {
 // 全局注册 (D1.5 wire)
 // ============================================================================
 
-static ALL_FEEDS: once_cell::sync::OnceCell<std::sync::Arc<Mutex<Vec<Arc<dyn NewsFeed>>>>> =
-    once_cell::sync::OnceCell::new();
+pub type RegisteredFeeds = std::sync::Arc<Mutex<Vec<Arc<dyn NewsFeed>>>>;
+static ALL_FEEDS: once_cell::sync::OnceCell<RegisteredFeeds> = once_cell::sync::OnceCell::new();
 
-pub fn all_feeds() -> Option<std::sync::Arc<Mutex<Vec<Arc<dyn NewsFeed>>>>> {
+pub fn all_feeds() -> Option<RegisteredFeeds> {
     ALL_FEEDS.get().cloned()
 }
 
@@ -313,16 +418,40 @@ pub fn register_feeds(feeds: Vec<Arc<dyn NewsFeed>>) {
 /// 一次性取出已注册 feeds → 喂给 NewsAggregator
 pub fn take_all_for_aggregator() -> Vec<Arc<dyn NewsFeed>> {
     match ALL_FEEDS.get() {
-        Some(arc) => {
-            match arc.lock() {
-                Ok(mut g) => std::mem::take(&mut *g),
-                Err(p) => {
-                    log::warn!("[feed::take] lock poisoned, take inner");
-                    let mut inner = p.into_inner();
-                    std::mem::take(&mut *inner)
-                }
+        Some(arc) => match arc.lock() {
+            Ok(mut g) => std::mem::take(&mut *g),
+            Err(p) => {
+                log::warn!("[feed::take] lock poisoned, take inner");
+                let mut inner = p.into_inner();
+                std::mem::take(&mut *inner)
             }
-        }
+        },
         None => vec![],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unimplemented_and_push_driven_feeds_fail_explicitly() {
+        let feeds: Vec<Box<dyn NewsFeed>> = vec![
+            Box::new(GovCnFeed),
+            Box::new(MiitFeed),
+            Box::new(EarningsCalendarFeed),
+            Box::new(ConsensusFeed),
+            Box::new(MarketActionFeed),
+            Box::new(AnalystViewsFeed),
+        ];
+
+        for feed in feeds {
+            let result = feed.fetch(10).await;
+            assert!(
+                result.is_err(),
+                "{} must not masquerade as an empty successful polling source",
+                feed.name()
+            );
+        }
     }
 }

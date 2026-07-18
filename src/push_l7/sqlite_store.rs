@@ -14,7 +14,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Local};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::push_l1::Severity;
 use crate::push_l2::DataMode;
@@ -59,6 +59,27 @@ impl SqliteStore {
             |row| row.get(0),
         )
     }
+
+    /// BR-005: 统计本地日期内指定用户、指定模板的真实成功投递数。
+    ///
+    /// 治理拒绝、去重和 sink 失败记录都带 `pushed=0`，不得消耗日配额。
+    pub fn count_today_pushed_for_user_and_template(
+        &self,
+        user_id: &str,
+        template_id: &str,
+        today: chrono::NaiveDate,
+    ) -> rusqlite::Result<i64> {
+        let conn = crate::util::recover_lock_or_warn(
+            "sqlite_store::count_today_pushed_for_user_and_template",
+            self.conn.lock(),
+        );
+        conn.query_row(
+            "SELECT COUNT(*) FROM push_analytics
+             WHERE user_id = ?1 AND template_id = ?2 AND pushed = 1 AND date(ts) = ?3",
+            params![user_id, template_id, today.to_string()],
+            |row| row.get(0),
+        )
+    }
 }
 
 impl SqliteStore {
@@ -88,7 +109,9 @@ impl SqliteStore {
             CREATE INDEX IF NOT EXISTS idx_push_analytics_template_id ON push_analytics(template_id);
             "#,
         )?;
-        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 
     /// 打开内存数据库 (测试用)
@@ -114,7 +137,9 @@ impl SqliteStore {
             );
             "#,
         )?;
-        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 }
 
@@ -127,13 +152,13 @@ fn severity_to_str(s: Severity) -> &'static str {
     }
 }
 
-fn severity_from_str(s: &str) -> Severity {
+fn severity_from_str(s: &str) -> Result<Severity, String> {
     match s {
-        "emergency" => Severity::Emergency,
-        "high" => Severity::High,
-        "normal" => Severity::Normal,
-        "info" => Severity::Info,
-        _ => Severity::Normal,
+        "emergency" => Ok(Severity::Emergency),
+        "high" => Ok(Severity::High),
+        "normal" => Ok(Severity::Normal),
+        "info" => Ok(Severity::Info),
+        _ => Err(format!("unknown severity {s:?}")),
     }
 }
 
@@ -146,13 +171,13 @@ fn data_mode_to_str(m: DataMode) -> &'static str {
     }
 }
 
-fn data_mode_from_str(s: &str) -> DataMode {
+fn data_mode_from_str(s: &str) -> Result<DataMode, String> {
     match s {
-        "full" => DataMode::Full,
-        "degraded" => DataMode::Degraded,
-        "unsafe" => DataMode::Unsafe,
-        "down" => DataMode::Down,
-        _ => DataMode::Full,
+        "full" => Ok(DataMode::Full),
+        "degraded" => Ok(DataMode::Degraded),
+        "unsafe" => Ok(DataMode::Unsafe),
+        "down" => Ok(DataMode::Down),
+        _ => Err(format!("unknown data_mode {s:?}")),
     }
 }
 
@@ -163,13 +188,13 @@ fn governance_to_str(d: &GovernanceDecision) -> String {
     }
 }
 
-fn governance_from_str(s: &str) -> GovernanceDecision {
+fn governance_from_str(s: &str) -> Result<GovernanceDecision, String> {
     if s == "Approve" {
-        GovernanceDecision::Approve
-    } else if let Some(reason) = s.strip_prefix("Deny:") {
-        GovernanceDecision::Deny(reason.to_string())
+        Ok(GovernanceDecision::Approve)
+    } else if let Some(reason) = s.strip_prefix("Deny:").filter(|reason| !reason.is_empty()) {
+        Ok(GovernanceDecision::Deny(reason.to_string()))
     } else {
-        GovernanceDecision::Approve
+        Err(format!("unknown governance_decision {s:?}"))
     }
 }
 
@@ -177,21 +202,93 @@ fn validation_status_to_str(v: ValidationStatus) -> &'static str {
     v.as_str()
 }
 
-fn validation_status_from_str(s: &str) -> ValidationStatus {
+fn validation_status_from_str(s: &str) -> Result<ValidationStatus, String> {
     match s {
-        "passed" => ValidationStatus::Passed,
-        "degraded" => ValidationStatus::Degraded,
-        "retried" => ValidationStatus::Retried,
-        "dropped" => ValidationStatus::Dropped,
-        _ => ValidationStatus::Passed,
+        "passed" => Ok(ValidationStatus::Passed),
+        "degraded" => Ok(ValidationStatus::Degraded),
+        "retried" => Ok(ValidationStatus::Retried),
+        "dropped" => Ok(ValidationStatus::Dropped),
+        _ => Err(format!("unknown validation_status {s:?}")),
     }
 }
 
+struct RawAnalytics {
+    event_id: String,
+    template_id: String,
+    template_version: i64,
+    ts: String,
+    severity: String,
+    data_mode: String,
+    validation_status: String,
+    governance_decision: String,
+    pushed: i64,
+    rendered_len: i64,
+    sink_name: String,
+    user_id: String,
+    validation_errors: String,
+}
+
+fn read_raw_analytics(row: &Row<'_>) -> rusqlite::Result<RawAnalytics> {
+    Ok(RawAnalytics {
+        event_id: row.get(0)?,
+        template_id: row.get(1)?,
+        template_version: row.get(2)?,
+        ts: row.get(3)?,
+        severity: row.get(4)?,
+        data_mode: row.get(5)?,
+        validation_status: row.get(6)?,
+        governance_decision: row.get(7)?,
+        pushed: row.get(8)?,
+        rendered_len: row.get(9)?,
+        sink_name: row.get(10)?,
+        user_id: row.get(11)?,
+        validation_errors: row.get(12)?,
+    })
+}
+
+fn decode_analytics(raw: RawAnalytics) -> Result<PushAnalytics, String> {
+    if raw.event_id.trim().is_empty()
+        || raw.template_id.trim().is_empty()
+        || raw.sink_name.trim().is_empty()
+        || raw.user_id.trim().is_empty()
+    {
+        return Err("analytics row contains an empty identity field".to_string());
+    }
+    let template_version = u32::try_from(raw.template_version)
+        .map_err(|error| format!("invalid template_version: {error}"))?;
+    let rendered_len = usize::try_from(raw.rendered_len)
+        .map_err(|error| format!("invalid rendered_len: {error}"))?;
+    let pushed = match raw.pushed {
+        0 => false,
+        1 => true,
+        value => return Err(format!("invalid pushed flag: {value}")),
+    };
+    let ts = parse_rfc3339(&raw.ts)?;
+    let validation_errors = serde_json::from_str::<Vec<String>>(&raw.validation_errors)
+        .map_err(|error| format!("invalid validation_errors JSON: {error}"))?;
+    Ok(PushAnalytics {
+        event_id: raw.event_id,
+        template_id: raw.template_id,
+        template_version,
+        ts,
+        severity: severity_from_str(&raw.severity)?,
+        data_mode: data_mode_from_str(&raw.data_mode)?,
+        validation_status: validation_status_from_str(&raw.validation_status)?,
+        governance_decision: governance_from_str(&raw.governance_decision)?,
+        pushed,
+        rendered_len,
+        sink_name: raw.sink_name,
+        user_id: raw.user_id,
+        validation_errors,
+    })
+}
+
 impl AnalyticsStore for SqliteStore {
-    fn record(&self, analytics: &PushAnalytics) {
+    fn record(&self, analytics: &PushAnalytics) -> Result<(), String> {
         let conn = crate::util::recover_lock_or_warn("sqlite_store::record", self.conn.lock());
-        let validation_errors_json = serde_json::to_string(&analytics.validation_errors).unwrap_or_else(|_| "[]".to_string());
-        let result = conn.execute(
+        let validation_errors_json = serde_json::to_string(&analytics.validation_errors)
+            .map_err(|error| format!("serialize analytics validation errors: {error}"))?;
+        conn.execute(
             "INSERT INTO push_analytics
              (event_id, template_id, template_version, ts, severity, data_mode,
               validation_status, governance_decision, pushed, rendered_len,
@@ -212,102 +309,71 @@ impl AnalyticsStore for SqliteStore {
                 analytics.user_id,
                 validation_errors_json,
             ],
+        )
+        .map_err(|error| format!("record push_analytics: {error}"))?;
+        Ok(())
+    }
+
+    fn get_by_event_id(&self, event_id: &str) -> Result<Option<PushAnalytics>, String> {
+        let conn =
+            crate::util::recover_lock_or_warn("sqlite_store::get_by_event_id", self.conn.lock());
+        let mut stmt = conn
+            .prepare(
+                "SELECT event_id, template_id, template_version, ts, severity, data_mode,
+                    validation_status, governance_decision, pushed, rendered_len,
+                    sink_name, user_id, validation_errors
+             FROM push_analytics WHERE event_id = ?1 LIMIT 1",
+            )
+            .map_err(|error| format!("prepare get push_analytics: {error}"))?;
+        let raw = stmt
+            .query_row(params![event_id], read_raw_analytics)
+            .optional()
+            .map_err(|error| format!("query push_analytics by event_id: {error}"))?;
+        raw.map(decode_analytics).transpose()
+    }
+
+    fn query_by_time_range(
+        &self,
+        from: DateTime<Local>,
+        to: DateTime<Local>,
+    ) -> Result<Vec<PushAnalytics>, String> {
+        let conn = crate::util::recover_lock_or_warn(
+            "sqlite_store::query_by_time_range",
+            self.conn.lock(),
         );
-        if let Err(e) = result {
-            log::error!("[SqliteStore] record 失败: {}", e);
+        let mut stmt = conn
+            .prepare(
+                "SELECT event_id, template_id, template_version, ts, severity, data_mode,
+                    validation_status, governance_decision, pushed, rendered_len,
+                    sink_name, user_id, validation_errors
+             FROM push_analytics WHERE ts >= ?1 AND ts <= ?2 ORDER BY ts",
+            )
+            .map_err(|error| format!("prepare push_analytics range query: {error}"))?;
+        let rows = stmt
+            .query_map(
+                params![from.to_rfc3339(), to.to_rfc3339()],
+                read_raw_analytics,
+            )
+            .map_err(|error| format!("query push_analytics range: {error}"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let raw = row.map_err(|error| format!("read push_analytics row: {error}"))?;
+            out.push(decode_analytics(raw)?);
         }
+        Ok(out)
     }
 
-    fn get_by_event_id(&self, event_id: &str) -> Option<PushAnalytics> {
-        let conn = crate::util::recover_lock_or_warn("sqlite_store::get_by_event_id", self.conn.lock());
-        let mut stmt = match conn.prepare(
-            "SELECT event_id, template_id, template_version, ts, severity, data_mode,
-                    validation_status, governance_decision, pushed, rendered_len,
-                    sink_name, user_id, validation_errors
-             FROM push_analytics WHERE event_id = ?1 LIMIT 1"
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                log::error!("[SqliteStore] prepare failed: {}", e);
-                return None;
-            }
-        };
-        let mut rows = match stmt.query(params![event_id]) {
-            Ok(r) => r,
-            Err(e) => {
-                log::error!("[SqliteStore] query failed: {}", e);
-                return None;
-            }
-        };
-        let row = match rows.next() {
-            Ok(Some(r)) => r,
-            _ => return None,
-        };
-        Some(PushAnalytics {
-            event_id: row.get(0).unwrap_or_default(),
-            template_id: row.get(1).unwrap_or_default(),
-            template_version: row.get::<_, i64>(2).unwrap_or(0) as u32,
-            ts: parse_rfc3339(&row.get::<_, String>(3).unwrap_or_default()).unwrap_or_else(|| Local::now()),
-            severity: severity_from_str(&row.get::<_, String>(4).unwrap_or_default()),
-            data_mode: data_mode_from_str(&row.get::<_, String>(5).unwrap_or_default()),
-            validation_status: validation_status_from_str(&row.get::<_, String>(6).unwrap_or_default()),
-            governance_decision: governance_from_str(&row.get::<_, String>(7).unwrap_or_default()),
-            pushed: row.get::<_, i64>(8).unwrap_or(0) != 0,
-            rendered_len: row.get::<_, i64>(9).unwrap_or(0) as usize,
-            sink_name: row.get(10).unwrap_or_default(),
-            user_id: row.get(11).unwrap_or_default(),
-            validation_errors: serde_json::from_str(&row.get::<_, String>(12).unwrap_or_default()).unwrap_or_default(),
-        })
-    }
-
-    fn query_by_time_range(&self, from: DateTime<Local>, to: DateTime<Local>) -> Vec<PushAnalytics> {
-        let conn = crate::util::recover_lock_or_warn("sqlite_store::query_by_time_range", self.conn.lock());
-        let mut stmt = match conn.prepare(
-            "SELECT event_id, template_id, template_version, ts, severity, data_mode,
-                    validation_status, governance_decision, pushed, rendered_len,
-                    sink_name, user_id, validation_errors
-             FROM push_analytics WHERE ts >= ?1 AND ts <= ?2 ORDER BY ts"
-        ) {
-            Ok(s) => s,
-            Err(_) => return vec![],
-        };
-        let rows = match stmt.query_map(params![from.to_rfc3339(), to.to_rfc3339()], |row| {
-            Ok(PushAnalytics {
-                event_id: row.get(0)?,
-                template_id: row.get(1)?,
-                template_version: row.get::<_, i64>(2)? as u32,
-                ts: parse_rfc3339(&row.get::<_, String>(3)?).unwrap_or_else(|| Local::now()),
-                severity: severity_from_str(&row.get::<_, String>(4)?),
-                data_mode: data_mode_from_str(&row.get::<_, String>(5)?),
-                validation_status: validation_status_from_str(&row.get::<_, String>(6)?),
-                governance_decision: governance_from_str(&row.get::<_, String>(7)?),
-                pushed: row.get::<_, i64>(8)? != 0,
-                rendered_len: row.get::<_, i64>(9)? as usize,
-                sink_name: row.get(10)?,
-                user_id: row.get(11)?,
-                validation_errors: serde_json::from_str(&row.get::<_, String>(12)?).unwrap_or_default(),
-            })
-        }) {
-            Ok(r) => r,
-            Err(_) => return vec![],
-        };
-        rows.filter_map(|r| match r {
-            Ok(a) => Some(a),
-            Err(e) => {
-                log::warn!("[SqliteStore] row deserialize failed: {}", e);
-                None
-            }
-        }).collect()
-    }
-
-    fn count_total(&self) -> u64 {
+    fn count_total(&self) -> Result<u64, String> {
         let conn = crate::util::recover_lock_or_warn("sqlite_store::count_total", self.conn.lock());
         conn.query_row::<u64, _, _>("SELECT COUNT(*) FROM push_analytics", [], |row| row.get(0))
-            .unwrap_or(0)
+            .map_err(|error| format!("count push_analytics: {error}"))
     }
 
-    fn count_by_governance(&self, decision: &GovernanceDecision) -> u64 {
-        let conn = crate::util::recover_lock_or_warn("sqlite_store::count_by_governance", self.conn.lock());
+    fn count_by_governance(&self, decision: &GovernanceDecision) -> Result<u64, String> {
+        let conn = crate::util::recover_lock_or_warn(
+            "sqlite_store::count_by_governance",
+            self.conn.lock(),
+        );
         let pattern = match decision {
             GovernanceDecision::Approve => "Approve".to_string(),
             GovernanceDecision::Deny(r) => format!("Deny:{}", r),
@@ -317,16 +383,16 @@ impl AnalyticsStore for SqliteStore {
             params![pattern],
             |row| row.get(0),
         )
-        .unwrap_or(0)
+        .map_err(|error| format!("count push_analytics by governance: {error}"))
     }
 
-    fn push_rate(&self) -> f64 {
+    fn push_rate(&self) -> Result<Option<f64>, String> {
         let conn = crate::util::recover_lock_or_warn("sqlite_store::push_rate", self.conn.lock());
         let total: u64 = conn
             .query_row("SELECT COUNT(*) FROM push_analytics", [], |row| row.get(0))
-            .unwrap_or(0);
+            .map_err(|error| format!("count push_analytics for rate: {error}"))?;
         if total == 0 {
-            return 0.0;
+            return Ok(None);
         }
         let pushed: u64 = conn
             .query_row(
@@ -334,18 +400,16 @@ impl AnalyticsStore for SqliteStore {
                 [],
                 |row| row.get(0),
             )
-            .unwrap_or(0);
-        pushed as f64 / total as f64
+            .map_err(|error| format!("count pushed analytics for rate: {error}"))?;
+        Ok(Some(pushed as f64 / total as f64))
     }
 }
 
-/// Parse RFC3339 timestamp from DB. Returns `None` on parse failure (AGENTS.md §2.2 不静默填补).
-/// Callers should log + skip the row when this returns None.
-fn parse_rfc3339(s: &str) -> Option<DateTime<Local>> {
+/// Parse an RFC3339 timestamp without substituting the current time.
+fn parse_rfc3339(s: &str) -> Result<DateTime<Local>, String> {
     DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.with_timezone(&Local))
-        .map_err(|e| log::warn!("[SqliteStore] corrupt ts '{}': {}", s, e))
-        .ok()
+        .map_err(|error| format!("invalid analytics timestamp {s:?}: {error}"))
 }
 
 #[cfg(test)]
@@ -360,14 +424,18 @@ mod tests {
         SignalEvent::new(
             crate::push_l1::SignalSource::LimitUp,
             "limit_up",
-            Some("600519".to_string()),
+            Some("TEST_CODE_600519".to_string()),
             Local::now(),
             SignalPayload::LimitUp(LimitUpPayload::default()),
             Severity::High,
         )
     }
 
-    fn make_analytics(pushed: bool, decision: GovernanceDecision, errors: Vec<String>) -> PushAnalytics {
+    fn make_analytics(
+        pushed: bool,
+        decision: GovernanceDecision,
+        errors: Vec<String>,
+    ) -> PushAnalytics {
         let event = make_event();
         build_analytics(
             &event,
@@ -386,7 +454,7 @@ mod tests {
     #[test]
     fn sqlite_store_open_in_memory() {
         let store = SqliteStore::open_in_memory().unwrap();
-        assert_eq!(store.count_total(), 0);
+        assert_eq!(store.count_total().unwrap(), 0);
     }
 
     #[test]
@@ -394,32 +462,107 @@ mod tests {
         let store = SqliteStore::open_in_memory().unwrap();
         let a = make_analytics(true, GovernanceDecision::Approve, vec![]);
         let event_id = a.event_id.clone();
-        store.record(&a);
-        assert_eq!(store.count_total(), 1);
-        let got = store.get_by_event_id(&event_id).unwrap();
+        store.record(&a).unwrap();
+        assert_eq!(store.count_total().unwrap(), 1);
+        let got = store.get_by_event_id(&event_id).unwrap().unwrap();
         assert_eq!(got.event_id, event_id);
         assert_eq!(got.template_id, "limit_up_v1");
         assert!(got.pushed);
     }
 
     #[test]
+    fn br113_record_failure_is_returned_to_caller() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute("DROP TABLE push_analytics", []).unwrap();
+        }
+        let error = store
+            .record(&make_analytics(true, GovernanceDecision::Approve, vec![]))
+            .expect_err("missing audit table must reject the write");
+        assert!(error.contains("record"));
+    }
+
+    #[test]
     fn sqlite_store_count_by_governance() {
         let store = SqliteStore::open_in_memory().unwrap();
-        store.record(&make_analytics(true, GovernanceDecision::Approve, vec![]));
-        store.record(&make_analytics(false, GovernanceDecision::Deny("frozen".to_string()), vec![]));
-        store.record(&make_analytics(false, GovernanceDecision::Deny("quiet_hour".to_string()), vec![]));
-        assert_eq!(store.count_by_governance(&GovernanceDecision::Approve), 1);
-        assert_eq!(store.count_by_governance(&GovernanceDecision::Deny("quiet_hour".to_string())), 1);
+        store
+            .record(&make_analytics(true, GovernanceDecision::Approve, vec![]))
+            .unwrap();
+        store
+            .record(&make_analytics(
+                false,
+                GovernanceDecision::Deny("frozen".to_string()),
+                vec![],
+            ))
+            .unwrap();
+        store
+            .record(&make_analytics(
+                false,
+                GovernanceDecision::Deny("quiet_hour".to_string()),
+                vec![],
+            ))
+            .unwrap();
+        assert_eq!(
+            store
+                .count_by_governance(&GovernanceDecision::Approve)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .count_by_governance(&GovernanceDecision::Deny("quiet_hour".to_string()))
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
     fn sqlite_store_push_rate() {
         let store = SqliteStore::open_in_memory().unwrap();
-        store.record(&make_analytics(true, GovernanceDecision::Approve, vec![]));
-        store.record(&make_analytics(true, GovernanceDecision::Approve, vec![]));
-        store.record(&make_analytics(false, GovernanceDecision::Deny("frozen".to_string()), vec![]));
-        let rate = store.push_rate();
+        store
+            .record(&make_analytics(true, GovernanceDecision::Approve, vec![]))
+            .unwrap();
+        store
+            .record(&make_analytics(true, GovernanceDecision::Approve, vec![]))
+            .unwrap();
+        store
+            .record(&make_analytics(
+                false,
+                GovernanceDecision::Deny("frozen".to_string()),
+                vec![],
+            ))
+            .unwrap();
+        let rate = store.push_rate().unwrap().unwrap();
         assert!((rate - 0.6666).abs() < 0.01);
+    }
+
+    #[test]
+    fn br005_daily_template_count_only_includes_successful_deliveries() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut successful = make_analytics(true, GovernanceDecision::Approve, vec![]);
+        successful.template_id = "candidate_board".to_string();
+        let mut failed = successful.clone();
+        failed.event_id = "failed-event".to_string();
+        failed.pushed = false;
+        let mut other = successful.clone();
+        other.event_id = "other-event".to_string();
+        other.template_id = "holding_event".to_string();
+
+        store.record(&successful).unwrap();
+        store.record(&failed).unwrap();
+        store.record(&other).unwrap();
+
+        assert_eq!(
+            store
+                .count_today_pushed_for_user_and_template(
+                    "default",
+                    "candidate_board",
+                    Local::now().date_naive(),
+                )
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -430,9 +573,11 @@ mod tests {
         a1.ts = now - chrono::Duration::hours(2);
         let mut a2 = make_analytics(true, GovernanceDecision::Approve, vec![]);
         a2.ts = now;
-        store.record(&a1);
-        store.record(&a2);
-        let recent = store.query_by_time_range(now - chrono::Duration::hours(1), now);
+        store.record(&a1).unwrap();
+        store.record(&a2).unwrap();
+        let recent = store
+            .query_by_time_range(now - chrono::Duration::hours(1), now)
+            .unwrap();
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].event_id, a2.event_id);
     }
@@ -441,24 +586,30 @@ mod tests {
     fn sqlite_store_severity_serialization() {
         assert_eq!(severity_to_str(Severity::Emergency), "emergency");
         assert_eq!(severity_to_str(Severity::High), "high");
-        assert_eq!(severity_from_str("emergency"), Severity::Emergency);
-        assert_eq!(severity_from_str("unknown"), Severity::Normal);
+        assert_eq!(severity_from_str("emergency").unwrap(), Severity::Emergency);
+        assert!(severity_from_str("unknown").is_err());
     }
 
     #[test]
     fn sqlite_store_data_mode_serialization() {
         assert_eq!(data_mode_to_str(DataMode::Down), "down");
         assert_eq!(data_mode_to_str(DataMode::Full), "full");
-        assert_eq!(data_mode_from_str("unsafe"), DataMode::Unsafe);
+        assert_eq!(data_mode_from_str("unsafe").unwrap(), DataMode::Unsafe);
     }
 
     #[test]
     fn sqlite_store_governance_serialization() {
         assert_eq!(governance_to_str(&GovernanceDecision::Approve), "Approve");
-        assert_eq!(governance_to_str(&GovernanceDecision::Deny("quiet_hour".to_string())), "Deny:quiet_hour");
-        assert_eq!(governance_from_str("Approve"), GovernanceDecision::Approve);
         assert_eq!(
-            governance_from_str("Deny:data_quality"),
+            governance_to_str(&GovernanceDecision::Deny("quiet_hour".to_string())),
+            "Deny:quiet_hour"
+        );
+        assert_eq!(
+            governance_from_str("Approve").unwrap(),
+            GovernanceDecision::Approve
+        );
+        assert_eq!(
+            governance_from_str("Deny:data_quality").unwrap(),
             GovernanceDecision::Deny("data_quality".to_string())
         );
     }
@@ -466,7 +617,13 @@ mod tests {
     #[test]
     fn sqlite_store_validation_status_serialization() {
         assert_eq!(validation_status_to_str(ValidationStatus::Passed), "passed");
-        assert_eq!(validation_status_to_str(ValidationStatus::Dropped), "dropped");
-        assert_eq!(validation_status_from_str("dropped"), ValidationStatus::Dropped);
+        assert_eq!(
+            validation_status_to_str(ValidationStatus::Dropped),
+            "dropped"
+        );
+        assert_eq!(
+            validation_status_from_str("dropped").unwrap(),
+            ValidationStatus::Dropped
+        );
     }
 }

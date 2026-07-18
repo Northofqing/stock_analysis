@@ -71,7 +71,7 @@ pub fn infer_halt_from_kline_gaps(code: &str, klines: &[KlineData]) -> Vec<(Naiv
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::monitor::data_quality::{is_halted_period, mark_halted_period};
+    use crate::monitor::data_quality::is_halted_period;
 
     fn make_kline(date: NaiveDate) -> KlineData {
         KlineData {

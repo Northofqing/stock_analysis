@@ -96,7 +96,9 @@ impl AnalystStateStore {
             }
             Some(existing) => {
                 // 4. Duplicate: same report_id AND same publish_date
-                if existing.report_id == value.report_id && existing.publish_date == value.publish_date {
+                if existing.report_id == value.report_id
+                    && existing.publish_date == value.publish_date
+                {
                     return ObservationDecision::Duplicate;
                 }
 
@@ -120,7 +122,9 @@ impl AnalystStateStore {
                 }
 
                 // 6. Upgrade: existing rank < incoming rank AND date not earlier
-                if existing.rating_rank < incoming_rank && value.publish_date >= existing.publish_date {
+                if existing.rating_rank < incoming_rank
+                    && value.publish_date >= existing.publish_date
+                {
                     let from_label = existing.rating_label.clone();
                     let to_label = value.rating.clone();
                     let stored = StoredObservation {
@@ -135,7 +139,10 @@ impl AnalystStateStore {
                     }
                     inner.order.push_back(key);
                     Self::evict_if_needed(&mut inner, self.capacity);
-                    return ObservationDecision::Upgrade { from: from_label, to: to_label };
+                    return ObservationDecision::Upgrade {
+                        from: from_label,
+                        to: to_label,
+                    };
                 }
 
                 // 7. Downgrade: existing rank > incoming rank
@@ -154,7 +161,10 @@ impl AnalystStateStore {
                 }
                 inner.order.push_back(key);
                 Self::evict_if_needed(&mut inner, self.capacity);
-                ObservationDecision::Downgrade { from: from_label, to: to_label }
+                ObservationDecision::Downgrade {
+                    from: from_label,
+                    to: to_label,
+                }
             }
         }
     }
@@ -206,8 +216,7 @@ mod tests {
     fn observation(rating: &str, date: &str) -> AnalystObservation {
         AnalystObservation {
             rating: rating.to_string(),
-            publish_date: chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
-                .expect("valid date"),
+            publish_date: chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").expect("valid date"),
             report_id: format!("report-{}-{}", date, rating),
         }
     }
@@ -219,8 +228,10 @@ mod tests {
     #[test]
     fn first_rating_is_observation_not_upgrade() {
         let state = AnalystStateStore::new(10_000);
-        let decision =
-            state.observe(key("600519", "券商A"), observation("增持", "2026-07-16"));
+        let decision = state.observe(
+            key("TEST_CODE_600519", "券商A"),
+            observation("增持", "2026-07-16"),
+        );
         assert_eq!(decision, ObservationDecision::Observed);
     }
 
@@ -228,15 +239,21 @@ mod tests {
     fn buy_after_hold_is_upgrade_once() {
         let state = AnalystStateStore::new(10_000);
         state.observe(
-            key("600519", "券商A"),
+            key("TEST_CODE_600519", "券商A"),
             observation("中性", "2026-07-15"),
         );
         assert!(matches!(
-            state.observe(key("600519", "券商A"), observation("买入", "2026-07-16")),
+            state.observe(
+                key("TEST_CODE_600519", "券商A"),
+                observation("买入", "2026-07-16")
+            ),
             ObservationDecision::Upgrade { .. }
         ));
         assert_eq!(
-            state.observe(key("600519", "券商A"), observation("买入", "2026-07-16")),
+            state.observe(
+                key("TEST_CODE_600519", "券商A"),
+                observation("买入", "2026-07-16")
+            ),
             ObservationDecision::Duplicate
         );
     }
@@ -245,22 +262,25 @@ mod tests {
     fn unknown_rating_and_downgrade_do_not_trigger() {
         let state = AnalystStateStore::new(10_000);
         state.observe(
-            key("600519", "券商A"),
+            key("TEST_CODE_600519", "券商A"),
             observation("买入", "2026-07-15"),
         );
         assert_eq!(
             state.observe(
-                key("600519", "券商A"),
+                key("TEST_CODE_600519", "券商A"),
                 observation("推荐", "2026-07-16")
             ),
             ObservationDecision::UnknownRating
         );
         assert_eq!(
             state.observe(
-                key("600519", "券商A"),
+                key("TEST_CODE_600519", "券商A"),
                 observation("增持", "2026-07-17")
             ),
-            ObservationDecision::Downgrade { from: "买入".to_string(), to: "增持".to_string() }
+            ObservationDecision::Downgrade {
+                from: "买入".to_string(),
+                to: "增持".to_string()
+            }
         );
     }
 
@@ -272,9 +292,14 @@ mod tests {
     fn downgrade_does_not_push() {
         // Start with 买入, observe 减持 → Downgrade, no Upgrade path
         let state = AnalystStateStore::new(10_000);
-        state.observe(key("600519", "券商A"), observation("买入", "2026-07-15"));
-        let decision =
-            state.observe(key("600519", "券商A"), observation("减持", "2026-07-16"));
+        state.observe(
+            key("TEST_CODE_600519", "券商A"),
+            observation("买入", "2026-07-15"),
+        );
+        let decision = state.observe(
+            key("TEST_CODE_600519", "券商A"),
+            observation("减持", "2026-07-16"),
+        );
         assert!(matches!(decision, ObservationDecision::Downgrade { .. }));
         // Verify it was NOT an Upgrade
         assert!(!matches!(decision, ObservationDecision::Upgrade { .. }));
@@ -323,7 +348,7 @@ mod tests {
     fn duplicate_requires_both_report_id_and_date() {
         // Same rating, same date but different report_id → NOT a duplicate
         let state = AnalystStateStore::new(10_000);
-        let key = key("600519", "券商A");
+        let key = key("TEST_CODE_600519", "券商A");
 
         state.observe(key.clone(), observation("增持", "2026-07-16"));
 
@@ -342,7 +367,7 @@ mod tests {
     fn upgrade_requires_not_earlier_date() {
         // 中性 (rank 3) on 7/15, then 买入 (rank 5) on 7/10 (earlier) → NOT an upgrade
         let state = AnalystStateStore::new(10_000);
-        let key = key("600519", "券商A");
+        let key = key("TEST_CODE_600519", "券商A");
 
         state.observe(key.clone(), observation("中性", "2026-07-15"));
 
@@ -354,7 +379,7 @@ mod tests {
     #[test]
     fn same_rank_stores_newer_date() {
         let state = AnalystStateStore::new(10_000);
-        let key = key("600519", "券商A");
+        let key = key("TEST_CODE_600519", "券商A");
 
         state.observe(key.clone(), observation("增持", "2026-07-15"));
         let decision = state.observe(key.clone(), observation("增持", "2026-07-16"));

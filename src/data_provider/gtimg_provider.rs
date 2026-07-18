@@ -5,8 +5,20 @@
 
 use super::{DataProvider, KlineData, RealtimeQuote};
 use anyhow::{anyhow, Context, Result};
-use chrono::NaiveDate;
+use chrono::{FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use std::future::Future;
+
+fn parse_tencent_source_time(raw: &str, code: &str) -> Result<chrono::DateTime<Utc>> {
+    let local = NaiveDateTime::parse_from_str(raw, "%Y%m%d%H%M%S")
+        .map_err(|error| anyhow!("腾讯实时行情 {code}: source_time 非法 {raw:?}: {error}"))?;
+    let shanghai = FixedOffset::east_opt(8 * 60 * 60)
+        .ok_or_else(|| anyhow!("腾讯实时行情 {code}: 无法构造 UTC+8 时区"))?;
+    shanghai
+        .from_local_datetime(&local)
+        .single()
+        .map(|value| value.with_timezone(&Utc))
+        .ok_or_else(|| anyhow!("腾讯实时行情 {code}: source_time 不唯一 {raw:?}"))
+}
 
 /// 腾讯财经数据提供者
 pub struct GtimgProvider {
@@ -185,13 +197,13 @@ impl GtimgProvider {
                     let _old_close = latest.close; // 保留日志用
                     latest.intraday_price = Some(quote.price);
                     latest.settled = false;
-                    latest.pe_ratio = Some(quote.pe_ratio);
-                    latest.pb_ratio = Some(quote.pb_ratio);
-                    latest.turnover_rate = Some(quote.turnover_rate);
-                    latest.market_cap = Some(quote.market_cap);
-                    latest.circulating_cap = Some(quote.circulating_cap);
+                    latest.pe_ratio = latest.pe_ratio.or(quote.pe_ratio);
+                    latest.pb_ratio = latest.pb_ratio.or(quote.pb_ratio);
+                    latest.turnover_rate = latest.turnover_rate.or(quote.turnover_rate);
+                    latest.market_cap = latest.market_cap.or(quote.market_cap);
+                    latest.circulating_cap = latest.circulating_cap.or(quote.circulating_cap);
 
-                    log::info!("[腾讯] {} 盘中价 {:.2}元 (close 保持日线 settled {:.2}元), PE={:.2}, PB={:.2}, 换手率={:.2}%, 总市值={:.2}亿, 流通市值={:.2}亿",
+                    log::info!("[腾讯] {} 盘中价 {:.2}元 (close 保持日线 settled {:.2}元), PE={:?}, PB={:?}, 换手率={:?}%, 总市值={:?}亿, 流通市值={:?}亿",
                         code, quote.price, _old_close, quote.pe_ratio, quote.pb_ratio, quote.turnover_rate,
                         quote.market_cap, quote.circulating_cap);
                 }
@@ -221,12 +233,15 @@ impl GtimgProvider {
 
         let mut result: Vec<KlineData> = Vec::with_capacity(klines.len());
 
-        for kline in klines {
+        for (index, kline) in klines.iter().enumerate() {
             let kline_array = kline.as_array().ok_or_else(|| anyhow!("K线数据格式错误"))?;
 
-            if kline_array.len() < 6 {
-                log::warn!("[腾讯] K线数据字段不足: {:?}", kline_array);
-                continue;
+            if kline_array.len() < 7 {
+                return Err(anyhow!(
+                    "腾讯K线 {code} 第 {} 行缺真实 amount 字段: expected>=7 actual={}",
+                    index + 1,
+                    kline_array.len()
+                ));
             }
 
             // 腾讯K线格式: [日期, 开, 收, 高, 低, 成交量]
@@ -257,16 +272,10 @@ impl GtimgProvider {
                 .as_str()
                 .ok_or_else(|| anyhow!("成交量格式错误"))?
                 .parse()?;
-
-            // 计算涨跌幅和成交额
-            let pct_chg = if result.is_empty() {
-                0.0
-            } else {
-                let prev_close = result.last().unwrap().close;
-                ((close - prev_close) / prev_close) * 100.0
-            };
-
-            let amount = volume * close; // 简单估算成交额
+            let amount: f64 = kline_array[6]
+                .as_str()
+                .ok_or_else(|| anyhow!("成交额格式错误"))?
+                .parse()?;
 
             let kline_data = KlineData {
                 date,
@@ -276,7 +285,7 @@ impl GtimgProvider {
                 low,
                 volume,
                 amount,
-                pct_chg,
+                pct_chg: 0.0,
                 intraday_price: None,
                 settled: true,
                 pe_ratio: None, // K线数据中不包含，需要从实时行情获取
@@ -304,8 +313,16 @@ impl GtimgProvider {
             result.push(kline_data);
         }
 
+        result.sort_by_key(|item| item.date);
+        for index in 1..result.len() {
+            let prev_close = result[index - 1].close;
+            if prev_close.is_finite() && prev_close > 0.0 {
+                result[index].pct_chg = ((result[index].close - prev_close) / prev_close) * 100.0;
+            }
+        }
+
         // 按日期降序排序（最新的在前）
-        result.sort_by(|a, b| b.date.cmp(&a.date));
+        result.sort_by_key(|item| std::cmp::Reverse(item.date));
 
         Ok(result)
     }
@@ -335,7 +352,7 @@ impl GtimgProvider {
                                 //   旧: splitn(2, '~') → parts[1] = "雷科防务~002413~15.00~..." (整个尾部)
                                 //   新: splitn(3, '~').nth(1) = "雷科防务" (第二个字段, 即股票名)
                                 let name = data
-                                    .splitn(3, '~')
+                                    .split('~')
                                     .nth(1)
                                     .map(|s| s.trim().to_string())
                                     .filter(|s| !s.is_empty());
@@ -370,86 +387,77 @@ impl GtimgProvider {
 
         let url = format!("http://qt.gtimg.cn/q={}", market_code);
 
-        match client
+        let response = client
             .get(&url)
             .header("Referer", "http://gu.qq.com/")
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
-        {
-            Ok(response) => {
-                if let Ok(text) = response.text().await {
-                    // 解析格式: v_sz002413="51~雷科防务~002413~15.00~14.80~14.85~335918~167675~..."
-                    if let Some(start) = text.find('"') {
-                        if let Some(end) = text.rfind('"') {
-                            if start < end {
-                                let data = &text[start + 1..end];
-                                // review #14: splitn(60, '~') 限制切分数量. 实测 parts[52] 仍要访问,
-                                // 60 留足 buffer, 避免 100+ 元素 Vec 完整分配.
-                                let parts: Vec<&str> = data.splitn(60, '~').collect();
-
-                                // 腾讯API字段说明（索引，实际验证）：
-                                // 0: 未知 1: 名称 2: 代码 3: 当前价 4: 昨收 5: 今开
-                                // 6: 成交量(手) 7: 外盘 8: 内盘 9: 买一 10: 买一量
-                                // ...
-                                // 33: 涨跌幅%
-                                // 38: 换手率%
-                                // 39: 市盈率(PE)
-                                // 40: (空)
-                                // 41: 最高
-                                // 42: 最低
-                                // 43: 成交量/成交额/换手率(组合字段)
-                                // 44: 流通市值(亿)
-                                // 45: 总市值(亿)
-                                // 46: 市净率(PB)
-                                // 47: 涨停价
-                                // 48: 跌停价
-                                // 49: 量比
-                                // 50-52: 未知
-                                // 53: 市盈率(TTM)
-                                // ...更多字段待研究
-
-                                if parts.len() >= 47 {
-                                    let price = parts[3].parse::<f64>().unwrap_or(0.0);
-                                    let prev_close = parts[4].parse::<f64>().unwrap_or(0.0);
-                                    let pct_chg = if prev_close > 0.0 {
-                                        ((price - prev_close) / prev_close) * 100.0
-                                    } else {
-                                        0.0
-                                    };
-
-                                    let quote = RealtimeQuote {
-                                        code: normalized_code,
-                                        name: parts[1].to_string(),
-                                        price,
-                                        pct_chg,
-                                        // 【修改】腾讯接口的PE有两个：
-                                        // parts[39] 是动态市盈率/TTM，某些股容易飘
-                                        // parts[52] 是静态（部分软件展示的TTM或东财展示的值更接近这个）或者 TTM的另一种算法。
-                                        // 东财对于大港显示 69.29，而部分[52]下恰好就是 69.29 (参考打印日志)
-                                        pe_ratio: parts[52].parse::<f64>().unwrap_or_else(|_| {
-                                            parts[39].parse::<f64>().unwrap_or(0.0)
-                                        }),
-                                        pb_ratio: parts[46].parse::<f64>().unwrap_or(0.0),
-                                        turnover_rate: parts[38].parse::<f64>().unwrap_or(0.0),
-                                        market_cap: parts[45].parse::<f64>().unwrap_or(0.0), // 已经是亿为单位
-                                        circulating_cap: parts[44].parse::<f64>().unwrap_or(0.0), // 已经是亿为单位
-                                        volume: parts[6].parse::<f64>().unwrap_or(0.0) * 100.0, // 手 -> 股
-                                        amount: parts[37].parse::<f64>().unwrap_or(0.0) * 10000.0, // 万 -> 元
-                                    };
-
-                                    return Ok(Some(quote));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                log::warn!("[腾讯] 获取实时行情失败: {}", e);
-            }
+            .map_err(|error| anyhow!("腾讯实时行情 {code} 请求失败: {error}"))?
+            .error_for_status()
+            .map_err(|error| anyhow!("腾讯实时行情 {code} HTTP 失败: {error}"))?;
+        let text = response
+            .text()
+            .await
+            .map_err(|error| anyhow!("腾讯实时行情 {code} 响应读取失败: {error}"))?;
+        let start = text
+            .find('"')
+            .ok_or_else(|| anyhow!("腾讯实时行情 {code}: 响应缺少起始引号"))?;
+        let end = text
+            .rfind('"')
+            .filter(|end| *end > start)
+            .ok_or_else(|| anyhow!("腾讯实时行情 {code}: 响应缺少结束引号"))?;
+        let parts: Vec<&str> = text[start + 1..end].splitn(60, '~').collect();
+        if parts.len() < 54 {
+            return Err(anyhow!("腾讯实时行情 {code}: 字段数 {} < 54", parts.len()));
         }
-        Ok(None)
+
+        let required_positive = |index: usize, field: &str| -> Result<f64> {
+            let value = parts[index]
+                .parse::<f64>()
+                .map_err(|error| anyhow!("腾讯实时行情 {code}: {field} 非法: {error}"))?;
+            if value.is_finite() && value > 0.0 {
+                Ok(value)
+            } else {
+                Err(anyhow!(
+                    "腾讯实时行情 {code}: {field} 必须 > 0, got {value}"
+                ))
+            }
+        };
+        let optional_non_negative = |index: usize| -> Option<f64> {
+            parts[index]
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite() && *value >= 0.0)
+        };
+
+        let price = required_positive(3, "price")?;
+        let prev_close = required_positive(4, "prev_close")?;
+        let limit_up_price = required_positive(47, "limit_up_price")?;
+        let limit_down_price = required_positive(48, "limit_down_price")?;
+        let source_time = parse_tencent_source_time(parts[30], code)?;
+        if limit_down_price > limit_up_price {
+            return Err(anyhow!(
+                "腾讯实时行情 {code}: 跌停价 {limit_down_price} > 涨停价 {limit_up_price}"
+            ));
+        }
+
+        Ok(Some(RealtimeQuote {
+            code: normalized_code,
+            name: parts[1].to_string(),
+            price,
+            pct_chg: ((price - prev_close) / prev_close) * 100.0,
+            pe_ratio: optional_non_negative(52).or_else(|| optional_non_negative(39)),
+            pb_ratio: optional_non_negative(46),
+            turnover_rate: optional_non_negative(38),
+            market_cap: optional_non_negative(45),
+            circulating_cap: optional_non_negative(44),
+            volume: optional_non_negative(6).map(|value| value * 100.0),
+            amount: optional_non_negative(37).map(|value| value * 10_000.0),
+            limit_up_price: Some(limit_up_price),
+            limit_down_price: Some(limit_down_price),
+            source_time,
+        }))
     }
 }
 
@@ -492,7 +500,7 @@ impl DataProvider for GtimgProvider {
         .ok()
         .flatten();
 
-        result.or_else(|| Some(format!("股票{}", code)))
+        result
     }
 
     fn get_realtime_quote(&self, code: &str) -> Result<Option<RealtimeQuote>> {
@@ -512,6 +520,19 @@ impl DataProvider for GtimgProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn br097_tencent_source_timestamp_is_parsed_as_shanghai_time() {
+        let observed_at = parse_tencent_source_time("20260718101530", "TEST_CODE_000001")
+            .expect("source timestamp must parse");
+        assert_eq!(observed_at.to_rfc3339(), "2026-07-18T02:15:30+00:00");
+    }
+
+    #[test]
+    fn br097_tencent_source_timestamp_rejects_missing_or_invalid_values() {
+        assert!(parse_tencent_source_time("", "TEST_CODE_000001").is_err());
+        assert!(parse_tencent_source_time("20260718999999", "TEST_CODE_000001").is_err());
+    }
 
     #[test]
     fn test_normalize_for_tencent_formats() {
@@ -578,7 +599,7 @@ mod tests {
     fn test_parse_name_does_not_inject_quote_data() {
         let data = "51~雷科防务~002413~15.00~15.50~52080~24286~27817";
         let name: Option<String> = data
-            .splitn(3, '~')
+            .split('~')
             .nth(1)
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
@@ -590,7 +611,7 @@ mod tests {
     fn test_parse_name_handles_short_response() {
         let data = "51";
         let name: Option<String> = data
-            .splitn(3, '~')
+            .split('~')
             .nth(1)
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());

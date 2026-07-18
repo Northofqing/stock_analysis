@@ -1,3 +1,4 @@
+//! Registered business rules: BR-057.
 //! 数据获取服务（进程级缓存，单飞抓取，带 TTL）
 //!
 //! 目标：消除"快速分析流水线"与"ReAct Agent 工具"之间对同一只股票同一份数据的重复抓取。
@@ -132,53 +133,54 @@ impl DataFetchService {
     }
 
     /// 获取最新一期核心财务指标（缓存 by `code`，带 TTL).
-    pub async fn get_financials(&self, code: &str) -> Arc<Financials> {
+    pub async fn get_financials(&self, code: &str) -> Result<Arc<Financials>> {
         let cell = Self::slot(&self.financials, code.to_string()).await;
         if let Some(cached) = Self::read_cache(&cell).await {
-            return Arc::new(cached);
+            return Ok(Arc::new(cached));
         }
         let code_owned = code.to_string();
         let client = self.client.clone();
         let cell_for_write = cell.clone();
-        // fetch_with_fallback_async 内部已 swallow error，返回空 Financials
-        let fin = fetch_with_fallback_async(&client, &code_owned).await;
+        let fin = fetch_with_fallback_async(&client, &code_owned).await?;
         let fin_arc = Arc::new(fin);
         Self::write_cache(&cell_for_write, fin_arc.clone()).await;
-        fin_arc
+        Ok(fin_arc)
     }
 
     /// 获取近 `lmt` 日资金流（缓存 by `(code, lmt)`，带 TTL).
-    pub async fn get_money_flow(&self, code: &str, lmt: usize) -> Arc<MoneyFlowSummary> {
+    pub async fn get_money_flow(&self, code: &str, lmt: usize) -> Result<Arc<MoneyFlowSummary>> {
         let cell = Self::slot(&self.money_flow, (code.to_string(), lmt)).await;
         if let Some(cached) = Self::read_cache(&cell).await {
-            return Arc::new(cached);
+            return Ok(Arc::new(cached));
         }
         let code_owned = code.to_string();
         let client = self.client.clone();
         let cell_for_write = cell.clone();
-        let flow = fetch_flow_history_async(&client, &code_owned, lmt)
-            .await
-            .unwrap_or_default();
+        let flow = fetch_flow_history_async(&client, &code_owned, lmt).await?;
+        if flow.is_empty() {
+            anyhow::bail!("[{code}] 资金流来源成功但返回空批次");
+        }
         let flow_arc = Arc::new(flow);
         Self::write_cache(&cell_for_write, flow_arc.clone()).await;
-        flow_arc
+        Ok(flow_arc)
     }
 
     /// 获取今日日内分时形态（缓存 by `code`，带 TTL).
-    pub async fn get_intraday_shape(&self, code: &str) -> Arc<IntradayShape> {
+    pub async fn get_intraday_shape(&self, code: &str) -> Result<Arc<IntradayShape>> {
         let cell = Self::slot(&self.intraday, code.to_string()).await;
         if let Some(cached) = Self::read_cache(&cell).await {
-            return Arc::new(cached);
+            return Ok(Arc::new(cached));
         }
         let code_owned = code.to_string();
         let client = self.client.clone();
         let cell_for_write = cell.clone();
-        let shape = fetch_intraday_shape_async(&client, &code_owned)
-            .await
-            .unwrap_or_default();
+        let shape = fetch_intraday_shape_async(&client, &code_owned).await?;
+        if !shape.present {
+            anyhow::bail!("[{code}] 分时来源未提供有效形态");
+        }
         let shape_arc = Arc::new(shape);
         Self::write_cache(&cell_for_write, shape_arc.clone()).await;
-        shape_arc
+        Ok(shape_arc)
     }
 }
 

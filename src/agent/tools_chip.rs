@@ -6,6 +6,12 @@ use serde_json::json;
 
 pub struct FetchChipDistributionTool;
 
+impl Default for FetchChipDistributionTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FetchChipDistributionTool {
     pub fn new() -> Self {
         Self
@@ -44,22 +50,18 @@ impl Tool for FetchChipDistributionTool {
         // 经 DataFetchService 缓存：与 pipeline 共享 250 日 K 线
         let daily_data = match service().get_kline(code, 250).await {
             Ok(d) => d,
-            Err(e) => {
-                return Ok(
-                    json!({"error": format!("Failed to fetch daily data: {}", e)}).to_string(),
-                )
-            }
+            Err(e) => anyhow::bail!("Failed to fetch daily data for {code}: {e}"),
         };
 
         if daily_data.is_empty() {
-            return Ok(json!({"error": "No K-line data for chip distribution."}).to_string());
+            anyhow::bail!("No K-line data for chip distribution: {code}");
         }
 
         let chip_dist = compute_chip_distribution(&daily_data);
         if chip_dist.present {
             Ok(format_for_prompt(&chip_dist))
         } else {
-            Ok(json!({"error": "Failed to compute chip distribution."}).to_string())
+            anyhow::bail!("Failed to compute chip distribution for {code}")
         }
     }
 }

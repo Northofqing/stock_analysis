@@ -24,8 +24,7 @@
 //! - 项目默认参数：N=40, M=5（对齐东方财富客户端 SKDJ 设置）
 //!
 //! ### RSI（相对强弱指标）
-//! - RSI(N) = SMA(max(close−prev_close, 0), N) /
-//!            SMA(abs(close−prev_close), N) × 100
+//! - RSI(N) = SMA(max(close−prev_close, 0), N) / SMA(abs(close−prev_close), N) × 100
 
 use serde::{Deserialize, Serialize};
 
@@ -33,7 +32,7 @@ mod cross;
 mod divergence;
 mod kdj;
 mod macd;
-mod multi_period; // v10 P3 G1: 多周期确认 (日/周/月本地聚合, 不新数据源)
+pub mod multi_period; // v10 P3 G1: 多周期确认 (日/周/月本地聚合, 不新数据源)
 mod rsi;
 mod skdj;
 

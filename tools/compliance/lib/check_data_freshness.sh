@@ -1,77 +1,87 @@
 #!/usr/bin/env bash
-#
-# check_data_freshness.sh — AGENTS.md §2.4 数据时效门禁 (R-3 修复新增)
-#
-# 目的: 拦截 stock_daily 等时间序列表停更超过 1 个交易日 (周末/节假日除外)。
-# 原理: 读 SQLite 中 stock_daily.MAX(date), 与今日对比。
-#
-# 退出码:
-#   0 = pass (DB 不存在 -> skip, 数据新鲜, 或在 1 个交易日内)
-#   1 = fail (数据断层超过 1 个交易日)
-#
-# 配套:
-#   AGENTS.md §2.4 数据时效 — 强化条款 (PR-2)
-#   tools/one_shot/backfill_daily.sh — 修复手段
+# AGENTS §2.4 — stock_daily must be no more than one A-share trading day stale.
 
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 DB_PATH="${STOCK_DB:-$REPO_ROOT/data/stock_analysis.db}"
+CALENDAR_PATH="${TRADING_CALENDAR:-$REPO_ROOT/config/a_share_market_holidays.csv}"
+TODAY="${FRESHNESS_TODAY:-$(date +%Y-%m-%d)}"
 
-# 1. DB 不存在 -> skip (新环境/沙箱, 不阻断)
-if [ ! -f "$DB_PATH" ]; then
-    echo "[check_data_freshness] SKIP: DB 不存在 ($DB_PATH)"
-    exit 0
-fi
-
-# 2. sqlite3 不可用 -> skip
-if ! command -v sqlite3 >/dev/null 2>&1; then
-    echo "[check_data_freshness] SKIP: sqlite3 命令不可用"
-    exit 0
-fi
-
-LATEST=$(sqlite3 "$DB_PATH" "SELECT MAX(date) FROM stock_daily;" 2>/dev/null || echo "")
-if [ -z "$LATEST" ] || [ "$LATEST" = "" ]; then
-    echo "[check_data_freshness] FAIL: stock_daily 表为空" >&2
-    echo "    修复: bash tools/one_shot/backfill_daily.sh" >&2
+fail() {
+    echo "[check_data_freshness] FAIL: $*" >&2
+    echo "    修复数据: bash tools/one_shot/backfill_daily.sh" >&2
     exit 1
-fi
+}
 
-TODAY=$(date +%Y-%m-%d)
+[ -f "$DB_PATH" ] || fail "生产数据库不存在 ($DB_PATH)"
+command -v sqlite3 >/dev/null 2>&1 || fail "sqlite3 命令不可用"
+command -v python3 >/dev/null 2>&1 || fail "python3 命令不可用，无法计算交易日"
+[ -f "$CALENDAR_PATH" ] || fail "交易日历不存在 ($CALENDAR_PATH)"
 
-# 3. 用 Python 算天数差 (无 python3 则回退到 date 命令)
-if command -v python3 >/dev/null 2>&1; then
-    STALE_DAYS=$(python3 -c "
-from datetime import date
+LATEST_QUERY=$(sqlite3 "$DB_PATH" "SELECT MAX(date) FROM stock_daily;" 2>&1)
+QUERY_STATUS=$?
+[ "$QUERY_STATUS" -eq 0 ] || fail "无法读取 stock_daily: $LATEST_QUERY"
+[ -n "$LATEST_QUERY" ] || fail "stock_daily 表为空"
+LATEST="$LATEST_QUERY"
+
+RESULT=$(python3 - "$LATEST" "$TODAY" "$CALENDAR_PATH" <<'PY'
+from datetime import date, timedelta
+from pathlib import Path
+import sys
+
+latest_raw, today_raw, calendar_raw = sys.argv[1:]
 try:
-    print((date.fromisoformat('$TODAY') - date.fromisoformat('$LATEST')).days)
-except Exception:
-    print('error')
-" 2>/dev/null || echo "error")
-else
-    # Fallback: 用 %s 算秒数差
-    LATEST_TS=$(date -j -f "%Y-%m-%d" "$LATEST" "+%s" 2>/dev/null || date -d "$LATEST" "+%s" 2>/dev/null || echo "")
-    TODAY_TS=$(date -j -f "%Y-%m-%d" "$TODAY" "+%s" 2>/dev/null || date -d "$TODAY" "+%s" 2>/dev/null || echo "")
-    if [ -z "$LATEST_TS" ] || [ -z "$TODAY_TS" ]; then
-        STALE_DAYS="error"
-    else
-        STALE_DAYS=$(( (TODAY_TS - LATEST_TS) / 86400 ))
-    fi
+    latest = date.fromisoformat(latest_raw)
+    today = date.fromisoformat(today_raw)
+except ValueError as error:
+    print(f"ERROR:日期解析失败: {error}")
+    raise SystemExit(0)
+
+if latest > today:
+    print(f"ERROR:stock_daily 最新日期 {latest} 晚于检查日期 {today}")
+    raise SystemExit(0)
+
+years = set()
+holidays = set()
+for raw in Path(calendar_raw).read_text(encoding="utf-8").splitlines():
+    line = raw.strip()
+    if line.startswith("# year="):
+        try:
+            years.add(int(line.split("=", 1)[1]))
+        except ValueError:
+            print(f"ERROR:非法 calendar year 标记: {line}")
+            raise SystemExit(0)
+    elif line and not line.startswith("#"):
+        try:
+            holidays.add(date.fromisoformat(line))
+        except ValueError:
+            print(f"ERROR:非法休市日期: {line}")
+            raise SystemExit(0)
+
+for year in range(latest.year, today.year + 1):
+    if year not in years:
+        print(f"ERROR:交易日历缺少 year={year} 覆盖")
+        raise SystemExit(0)
+
+trading_days = 0
+cursor = latest + timedelta(days=1)
+while cursor <= today:
+    if cursor.weekday() < 5 and cursor not in holidays:
+        trading_days += 1
+    cursor += timedelta(days=1)
+print(f"OK:{trading_days}")
+PY
+)
+
+case "$RESULT" in
+    ERROR:*) fail "${RESULT#ERROR:}" ;;
+    OK:*) STALE_TRADING_DAYS="${RESULT#OK:}" ;;
+    *) fail "交易日计算返回未知结果: $RESULT" ;;
+esac
+
+if [ "$STALE_TRADING_DAYS" -gt 1 ]; then
+    fail "§2.4 stock_daily 已滞后 $STALE_TRADING_DAYS 个交易日 (latest=$LATEST today=$TODAY)"
 fi
 
-if [ "$STALE_DAYS" = "error" ]; then
-    echo "[check_data_freshness] FAIL: 日期解析失败 (latest=$LATEST today=$TODAY)" >&2
-    exit 1
-fi
-
-# 4. 允许 1 个交易日滞后 (周末/节假日缓冲)
-if [ "$STALE_DAYS" -gt 1 ]; then
-    echo "[check_data_freshness] FAIL: §2.4 数据断层 — stock_daily 停更 $STALE_DAYS 天" >&2
-    echo "    最新日期: $LATEST" >&2
-    echo "    今日: $TODAY" >&2
-    echo "    修复: bash tools/one_shot/backfill_daily.sh" >&2
-    exit 1
-fi
-
-echo "[check_data_freshness] PASS: stock_daily 最新 $LATEST (滞后 $STALE_DAYS 天)"
-exit 0
+echo "[check_data_freshness] PASS: stock_daily 最新 $LATEST (滞后 $STALE_TRADING_DAYS 个交易日)"

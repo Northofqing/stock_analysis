@@ -1,7 +1,7 @@
 //! v12 PR2-2.1: 数据模式三态判定 (DataHealth ∈ {Full, Degraded, Unsafe}).
 //!
 //! 设计: 与 `risk::account_mode` 对齐 — 纯函数 + 数据入参, 不直接读行情 DB.
-//!       Capability 各自维护 last_update_ts, 主循环 (PR4 live_plan 时接入) 周期性刷新.
+//!       Capability 各自维护真实成功时间；从未成功的能力保持 Missing.
 //!
 //! 状态机:
 //!   Full --(任一关键 Capability staleness > 120s)--> Degraded
@@ -12,6 +12,10 @@
 //!   - OrderBook Missing → 计入 `missing_capabilities`, 但 DataMode 仍可 Full
 //!   - 只有缺盘口时, 推送横幅显示 "[⚠️ 缺盘口深度: 本条不含承接判断]"
 //!   - 业务侧 (T-07 候选触发) 缺盘口时 EvidenceQuality=Missing, 但不阻塞触发
+
+use std::collections::HashMap;
+use std::sync::{OnceLock, RwLock};
+use std::time::Instant;
 
 /// v12 §2.4 数据能力枚举
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -188,7 +192,7 @@ pub fn evaluate(input: &DataHealthInput, prev: Option<DataMode>) -> DataHealth {
     if quote_stale {
         return DataHealth {
             mode: DataMode::Unsafe,
-            missing: missing,
+            missing,
             prev_mode: prev,
             eta: Some("Quote 恢复后".to_string()),
         };
@@ -234,6 +238,62 @@ pub fn input_from_pairs(
         critical_max_age_secs,
         orderbook_max_age_secs: 600,
     }
+}
+
+static LAST_CAPABILITY_SUCCESS: OnceLock<RwLock<HashMap<Capability, Instant>>> = OnceLock::new();
+
+fn capability_successes() -> &'static RwLock<HashMap<Capability, Instant>> {
+    LAST_CAPABILITY_SUCCESS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Record a capability only after its production source and quality checks succeed.
+pub fn mark_capability_success(capability: Capability) -> Result<(), String> {
+    capability_successes()
+        .write()
+        .map_err(|_| "capability success tracker write lock poisoned".to_string())?
+        .insert(capability, Instant::now());
+    Ok(())
+}
+
+fn input_from_successes_at(
+    successes: &HashMap<Capability, Instant>,
+    now: Instant,
+    critical_max_age_secs: u64,
+    orderbook_max_age_secs: u64,
+) -> DataHealthInput {
+    DataHealthInput {
+        capabilities: Capability::ALL
+            .iter()
+            .map(|capability| CapabilityStatus {
+                cap: *capability,
+                staleness_secs: successes
+                    .get(capability)
+                    .map(|last_success| now.saturating_duration_since(*last_success).as_secs()),
+            })
+            .collect(),
+        critical_max_age_secs,
+        orderbook_max_age_secs,
+    }
+}
+
+/// Build a health snapshot from actual process-local source successes.
+///
+/// A capability absent from the tracker has never succeeded in this process and
+/// is therefore reported as Missing. OrderBook is intentionally never marked by
+/// current production code because no real depth source is wired yet.
+pub fn current_data_health_input(
+    critical_max_age_secs: u64,
+    orderbook_max_age_secs: u64,
+) -> Result<DataHealthInput, String> {
+    let successes = capability_successes()
+        .read()
+        .map_err(|_| "capability success tracker read lock poisoned".to_string())?;
+    Ok(input_from_successes_at(
+        &successes,
+        Instant::now(),
+        critical_max_age_secs,
+        orderbook_max_age_secs,
+    ))
 }
 
 #[cfg(test)]
@@ -402,6 +462,42 @@ mod tests {
         assert_eq!(input.capabilities.len(), 2);
         assert!(input.capabilities[0].is_ok(120));
         assert!(!input.capabilities[1].is_ok(600));
+    }
+
+    #[test]
+    fn tracker_input_keeps_never_successful_capabilities_missing() {
+        let now = Instant::now();
+        let mut successes = HashMap::new();
+        successes.insert(Capability::Quote, now);
+
+        let input = input_from_successes_at(&successes, now, 120, 600);
+
+        assert_eq!(input.capabilities.len(), Capability::ALL.len());
+        assert_eq!(input.capabilities[0].staleness_secs, Some(0));
+        assert!(input.capabilities[1..]
+            .iter()
+            .all(|status| status.staleness_secs.is_none()));
+    }
+
+    #[test]
+    fn tracker_input_uses_elapsed_time_since_success() {
+        let now = Instant::now();
+        let mut successes = HashMap::new();
+        successes.insert(
+            Capability::Kline,
+            now.checked_sub(std::time::Duration::from_secs(121))
+                .expect("test instant must support a short subtraction"),
+        );
+
+        let input = input_from_successes_at(&successes, now, 120, 600);
+        let kline = input
+            .capabilities
+            .iter()
+            .find(|status| status.cap == Capability::Kline)
+            .expect("Kline status must exist");
+
+        assert_eq!(kline.staleness_secs, Some(121));
+        assert!(!kline.is_ok(input.critical_max_age_secs));
     }
 
     // ---- 边界 ----

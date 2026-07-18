@@ -16,7 +16,7 @@ impl NotificationService {
             .context("企业微信 Webhook 未配置")?;
 
         let max_bytes = self.config.wechat_max_bytes;
-        let content_bytes = content.as_bytes().len();
+        let content_bytes = content.len();
 
         if content_bytes > max_bytes {
             info!("消息内容超长({}字节)，将分批发送", content_bytes);
@@ -113,7 +113,7 @@ impl NotificationService {
         let mut current_bytes = 0;
 
         for section in sections {
-            let section_bytes = section.as_bytes().len();
+            let section_bytes = section.len();
 
             if section_bytes > max_bytes {
                 if !current_chunk.is_empty() {
@@ -147,7 +147,7 @@ impl NotificationService {
     }
 
     pub(super) fn truncate_to_bytes(&self, text: &str, max_bytes: usize) -> String {
-        if text.as_bytes().len() <= max_bytes {
+        if text.len() <= max_bytes {
             return text.to_string();
         }
 

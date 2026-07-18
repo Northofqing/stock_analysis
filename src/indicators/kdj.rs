@@ -40,21 +40,21 @@ pub fn calc_kdj(
 
     for i in 0..len {
         // 移除窗口外元素
-        while max_q.front().map_or(false, |&(idx, _)| idx + n <= i) {
+        while max_q.front().is_some_and(|&(idx, _)| idx + n <= i) {
             max_q.pop_front();
         }
-        while min_q.front().map_or(false, |&(idx, _)| idx + n <= i) {
+        while min_q.front().is_some_and(|&(idx, _)| idx + n <= i) {
             min_q.pop_front();
         }
 
         // 维护递减性质：弹出队尾 ≤ 当前值的元素
-        while max_q.back().map_or(false, |&(_, v)| v <= highs[i]) {
+        while max_q.back().is_some_and(|&(_, v)| v <= highs[i]) {
             max_q.pop_back();
         }
         max_q.push_back((i, highs[i]));
 
         // 维护递增性质：弹出队尾 ≥ 当前值的元素
-        while min_q.back().map_or(false, |&(_, v)| v >= lows[i]) {
+        while min_q.back().is_some_and(|&(_, v)| v >= lows[i]) {
             min_q.pop_back();
         }
         min_q.push_back((i, lows[i]));

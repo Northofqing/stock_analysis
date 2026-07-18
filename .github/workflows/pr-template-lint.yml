@@ -1,0 +1,58 @@
+name: PR Template Lint
+
+# b-009 R-6 + code-reviewer F1 修订 (W1.10):
+# 当 PR 触及 main.rs / push_templates.rs / notify.rs 时，
+# 强制 PR body 含 "v13 修复 PR" 和 "v14.2 改造 PR" 两个 Refs 字段
+# (或显式 "N/A" 兜底)。
+
+on:
+  pull_request:
+    paths:
+      - 'src/bin/monitor/main.rs'
+      - 'src/bin/monitor/push_templates.rs'
+      - 'src/bin/monitor/notify.rs'
+      - 'config/push_templates/**'
+      - '.github/pull_request_template.md'
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 检查 PR body 含双 Refs 字段
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -uo pipefail
+
+          if [ -z "$PR_BODY" ]; then
+            echo "FAIL: PR body 为空，必须填 .github/pull_request_template.md 模板"
+            exit 1
+          fi
+
+          # 必须含 v13 修复 PR 字段
+          if ! echo "$PR_BODY" | grep -qE '^v13 修复 PR.*:.*(#xxx|N/A|#[0-9]+)'; then
+              echo "FAIL: PR body 缺 'v13 修复 PR' Refs 字段"
+              echo "模板要求: 'v13 修复 PR: #xxx 或 N/A（独立修复）'"
+              exit 1
+          fi
+
+          # 必须含 v14.2 改造 PR 字段
+          if ! echo "$PR_BODY" | grep -qE '^v14\.2 改造 PR.*:.*(#xxx|N/A|#[0-9]+)'; then
+              echo "FAIL: PR body 缺 'v14.2 改造 PR' Refs 字段"
+              echo "模板要求: 'v14.2 改造 PR: #xxx 或 N/A'"
+              exit 1
+          fi
+
+          echo "PASS: PR body 含双 Refs 字段"
+
+      - name: 交叉引用 .github/pull_request_template.md 注释
+        run: |
+          # 提醒 reviewer: 改这些文件的 PR 必须引用 v13 修复 + v14.2 改造 (b-009 R-6)
+          echo "::notice::本 PR 触及 main.rs/push_templates.rs/notify.rs。请确认:"
+          echo "::notice::- v13 修复 PR 字段 (若与 v14.2 改造交叉)"
+          echo "::notice::- v14.2 改造 PR 字段 (若改 main.rs 顶层循环 / push_templates.rs / notify.rs)"
+          echo "::notice::详见 .github/pull_request_template.md 和 docs/architecture/v14.2-push-architecture.md §9.1"

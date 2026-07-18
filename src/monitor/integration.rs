@@ -4,9 +4,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::monitor::detector::{
-        AlertCategory, AlertEvent, AlertLevel, Detector, DetectorConfig, StockSnapshot,
-    };
+    use crate::monitor::detector::{AlertLevel, Detector, DetectorConfig, StockSnapshot};
     use crate::monitor::signal_state::SignalStateMachine;
     use crate::monitor::{alert, auction};
 
@@ -28,7 +26,7 @@ mod tests {
     fn test_full_pipeline_limit_down() {
         // 1. 检测
         let detector = Detector::new(DetectorConfig::default());
-        let s = stock("000001", "测试股", -10.0);
+        let s = stock("TEST_CODE_000001", "测试股", -10.0);
         let events = detector.scan_stock(&s);
         assert!(!events.is_empty());
 
@@ -41,7 +39,7 @@ mod tests {
         for e in &filtered {
             let text = alert::format_alert(e);
             assert!(text.contains("测试股"));
-            assert!(text.contains("000001"));
+            assert!(text.contains("TEST_CODE_000001"));
             // 紧急级别应该有 emoji
             if e.level == AlertLevel::Emergency {
                 assert!(text.contains("🔴"));
@@ -52,7 +50,7 @@ mod tests {
     #[test]
     fn test_pipeline_dedup() {
         let detector = Detector::new(DetectorConfig::default());
-        let s = stock("000002", "重复股", -10.0);
+        let s = stock("TEST_CODE_000002", "重复股", -10.0);
         let events = detector.scan_stock(&s);
 
         let mut sm = SignalStateMachine::default();
@@ -74,8 +72,8 @@ mod tests {
         let detector = Detector::new(DetectorConfig::default());
         let mut sm = SignalStateMachine::default();
 
-        let e1 = detector.scan_stock(&stock("000003", "A股", -10.0));
-        let e2 = detector.scan_stock(&stock("000004", "B股", -10.0));
+        let e1 = detector.scan_stock(&stock("TEST_CODE_000003", "A股", -10.0));
+        let e2 = detector.scan_stock(&stock("TEST_CODE_000004", "B股", -10.0));
 
         let r1: Vec<_> = e1.into_iter().filter_map(|e| sm.process(e)).collect();
         let r2: Vec<_> = e2.into_iter().filter_map(|e| sm.process(e)).collect();
@@ -87,7 +85,7 @@ mod tests {
     #[test]
     fn test_auction_classification_flows() {
         let r = auction::AuctionResult {
-            code: "000005".into(),
+            code: "TEST_CODE_000005".into(),
             name: "竞价股".into(),
             gap_pct: -6.0,
             vol_ratio: 8.0,
@@ -110,9 +108,9 @@ mod tests {
         let mut sm = SignalStateMachine::default();
 
         let stocks = [
-            ("000006", "股1", -10.0),
-            ("000007", "股2", 9.8),
-            ("000008", "股3", -5.0),
+            ("TEST_CODE_000006", "股1", -10.0),
+            ("TEST_CODE_000007", "股2", 9.8),
+            ("TEST_CODE_000008", "股3", -5.0),
         ];
 
         let mut alerts = Vec::new();

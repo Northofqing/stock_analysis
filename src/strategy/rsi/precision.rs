@@ -271,7 +271,7 @@ impl PrecisionRsiResult {
                 r.trades.len()
             ));
         }
-        report.push_str("\n");
+        report.push('\n');
 
         report.push_str("> ⚠️ 本策略要求至少 205 日K线（200日均线预热），适合中长期持仓的均值回归波段操作。\n\n");
         report
@@ -343,7 +343,7 @@ impl PrecisionRsiBacktest {
             let dt = Local
                 .from_local_datetime(&naive.and_hms_opt(15, 0, 0).unwrap())
                 .single()
-                .unwrap_or_else(|| Local::now());
+                .unwrap_or_else(Local::now);
 
             // 成交价：次日 open。末根信号丢弃
             let next_exec = if i + 1 < n {
@@ -359,7 +359,7 @@ impl PrecisionRsiBacktest {
                             let dt_next = Local
                                 .from_local_datetime(&d.and_hms_opt(15, 0, 0).unwrap())
                                 .single()
-                                .unwrap_or_else(|| Local::now());
+                                .unwrap_or_else(Local::now);
                             Some((p, dt_next))
                         }
                         _ => None,
@@ -370,8 +370,8 @@ impl PrecisionRsiBacktest {
             };
 
             // 日期范围过滤：仅在范围内记录净值和交易
-            let in_date_range = self.config.start_date.map_or(true, |s| naive >= s)
-                && self.config.end_date.map_or(true, |e| naive <= e);
+            let in_date_range = self.config.start_date.is_none_or(|s| naive >= s)
+                && self.config.end_date.is_none_or(|e| naive <= e);
 
             if in_date_range {
                 daily_values.push((dt, cash + shares * close));
@@ -529,7 +529,7 @@ impl PrecisionRsiBacktest {
             } else {
                 owned = {
                     let mut s = klines.clone();
-                    s.sort_unstable_by(|a, b| a.date.cmp(&b.date));
+                    s.sort_unstable_by_key(|a| a.date);
                     s
                 };
                 &owned
@@ -587,7 +587,7 @@ impl PrecisionRsiBacktest {
                     let dt = Local
                         .from_local_datetime(&naive.and_hms_opt(15, 0, 0).unwrap())
                         .single()
-                        .unwrap_or_else(|| Local::now());
+                        .unwrap_or_else(Local::now);
                     let sum: f64 = maps
                         .iter()
                         .map(|m| m.get(ds).copied().unwrap_or(self.config.initial_capital))

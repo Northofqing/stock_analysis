@@ -233,11 +233,13 @@ pub enum VetoMode {
     Live,
 }
 
-impl VetoMode {
-    pub fn from_str(s: &str) -> Self {
+impl std::str::FromStr for VetoMode {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "live" => VetoMode::Live,
-            _ => VetoMode::DryRun, // 默认安全
+            "live" => Ok(VetoMode::Live),
+            _ => Ok(VetoMode::DryRun), // 默认安全
         }
     }
 }
@@ -356,9 +358,9 @@ mod tests {
 
     #[test]
     fn test_veto_mode_from_str() {
-        assert_eq!(VetoMode::from_str("live"), VetoMode::Live);
-        assert_eq!(VetoMode::from_str("dry_run"), VetoMode::DryRun);
-        assert_eq!(VetoMode::from_str("unknown"), VetoMode::DryRun); // 默认安全
+        assert_eq!("live".parse(), Ok(VetoMode::Live));
+        assert_eq!("dry_run".parse(), Ok(VetoMode::DryRun));
+        assert_eq!("unknown".parse(), Ok(VetoMode::DryRun)); // 默认安全
     }
 
     #[test]

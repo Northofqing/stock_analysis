@@ -16,6 +16,10 @@
 mod analyze;
 mod client;
 mod macro_rec;
+#[allow(
+    dead_code,
+    reason = "legacy JSON dashboard parser retained for archived response compatibility"
+)]
 mod prompts;
 pub(crate) mod types;
 
@@ -88,6 +92,10 @@ pub struct GeminiAnalyzer {
 
 impl GeminiAnalyzer {
     /// 系统提示词 - 决策仪表盘 v2.0
+    #[allow(
+        dead_code,
+        reason = "paired with the retained legacy JSON dashboard request path"
+    )]
     pub(super) const SYSTEM_PROMPT: &'static str = r#"你现在是一位有着20年A股经验的资深技术分析师，同时结合宏观分析研究员的政策解读，负责生成专业的【决策仪表盘】分析报告。
 
 ## 核心交易理念（必须严格遵守）
@@ -269,7 +277,10 @@ impl GeminiAnalyzer {
             info!(
                 "✓ 使用 DeepSeek API: {} ({})",
                 config.deepseek_model,
-                config.deepseek_base_url.as_deref().unwrap_or("https://api.deepseek.com/v1")
+                config
+                    .deepseek_base_url
+                    .as_deref()
+                    .unwrap_or("https://api.deepseek.com/v1")
             );
         } else {
             info!("✓ 使用 Gemini API: {}", current_model);
@@ -391,6 +402,10 @@ impl GeminiAnalyzer {
     }
 
     /// 获取股票名称
+    #[allow(
+        dead_code,
+        reason = "legacy JSON dashboard prompt compatibility helper"
+    )]
     pub(super) fn get_stock_name(&self, context: &HashMap<String, Value>, code: &str) -> String {
         // 优先使用 context 中的 name
         if let Some(name) = context.get("name").and_then(|v| v.as_str()) {
@@ -428,6 +443,10 @@ impl GeminiAnalyzer {
 // 辅助函数
 // ============================================================================
 
+#[allow(
+    dead_code,
+    reason = "legacy JSON dashboard response compatibility helper"
+)]
 pub(super) fn get_string(value: &Value, key: &str) -> String {
     value
         .get(key)
@@ -436,6 +455,10 @@ pub(super) fn get_string(value: &Value, key: &str) -> String {
         .to_string()
 }
 
+#[allow(
+    dead_code,
+    reason = "legacy JSON dashboard prompt compatibility helper"
+)]
 pub(super) fn format_volume(volume: Option<f64>) -> String {
     match volume {
         Some(v) if v >= 1e8 => format!("{:.2} 亿股", v / 1e8),
@@ -474,17 +497,25 @@ mod tests {
 
     #[test]
     fn deepseek_config_selects_deepseek_without_openai_fields() {
-        let mut config = GeminiConfig::default();
-        config.deepseek_api_key = Some("test-key".into());
-        config.deepseek_base_url = Some("https://example.invalid/v1".into());
-        config.deepseek_model = "deepseek-chat".into();
-        config.deepseek_quick_model = Some("deepseek-chat".into());
-        config.deepseek_deep_model = Some("deepseek-reasoner".into());
+        let config = GeminiConfig {
+            deepseek_api_key: Some("test-key".into()),
+            deepseek_base_url: Some("https://example.invalid/v1".into()),
+            deepseek_model: "deepseek-chat".into(),
+            deepseek_quick_model: Some("deepseek-chat".into()),
+            deepseek_deep_model: Some("deepseek-reasoner".into()),
+            ..GeminiConfig::default()
+        };
 
         let analyzer = GeminiAnalyzer::new(config);
 
         assert!(analyzer.use_deepseek);
-        assert_eq!(analyzer.deepseek_model_for(AgentMode::Quick), "deepseek-chat");
-        assert_eq!(analyzer.deepseek_model_for(AgentMode::Deep), "deepseek-reasoner");
+        assert_eq!(
+            analyzer.deepseek_model_for(AgentMode::Quick),
+            "deepseek-chat"
+        );
+        assert_eq!(
+            analyzer.deepseek_model_for(AgentMode::Deep),
+            "deepseek-reasoner"
+        );
     }
 }

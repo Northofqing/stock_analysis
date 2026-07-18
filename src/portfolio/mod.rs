@@ -4,7 +4,7 @@
 //! API 是纯函数，不定义 trait（单用户，单实现）。
 
 mod store;
-pub use store::live_rolling_sharpe;
+pub use store::{live_rolling_sharpe, strategy_correlation_matrix};
 
 use chrono::{NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
@@ -19,7 +19,8 @@ pub struct Position {
     pub name: String,
     pub shares: u64,
     pub cost_price: f64,
-    pub hard_stop: f64,
+    /// User-/strategy-established hard stop. Missing until persisted evidence exists.
+    pub hard_stop: Option<f64>,
     pub added_at: NaiveDate,
     pub status: PositionStatus,
     /// 修复 P1.6: 板块字段 (用于板块集中度检查)
@@ -93,6 +94,23 @@ pub fn get_positions() -> Result<Vec<Position>, String> {
     crate::portfolio::store::load_positions()
 }
 
+/// 获取真实持仓批次及最旧来源时间，用于 30 秒新鲜度门。
+pub fn get_positions_with_source_time(
+) -> Result<(Vec<Position>, Option<chrono::DateTime<chrono::Local>>), String> {
+    crate::portfolio::store::load_positions_with_source_time()
+}
+
+/// BR-097: position/account snapshots are valid for at most 30 seconds.
+pub fn position_source_is_fresh(
+    source_time: chrono::DateTime<chrono::Local>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let age_ms = now
+        .signed_duration_since(source_time.with_timezone(&chrono::Utc))
+        .num_milliseconds();
+    (0..=30_000).contains(&age_ms)
+}
+
 /// 获取自选列表（来自环境变量 STOCK_LIST，用于向后兼容）
 pub fn get_watchlist() -> Result<Vec<Position>, String> {
     crate::portfolio::store::load_watchlist()
@@ -127,9 +145,9 @@ pub fn get_all_names() -> Result<Vec<(String, String)>, String> {
     Ok(result)
 }
 
-/// 获取指定 code 的持仓（None = 不在持仓中）
-pub fn find_position(code: &str) -> Option<Position> {
-    get_positions().ok()?.into_iter().find(|p| p.code == code)
+/// 获取指定 code 的持仓（`Ok(None)` = 成功查询且不在持仓中）。
+pub fn find_position(code: &str) -> Result<Option<Position>, String> {
+    Ok(get_positions()?.into_iter().find(|p| p.code == code))
 }
 
 /// v53: 获取 ST/*ST 持仓 (T-16 ST 涨跌幅变更 dispatcher 数据源)
@@ -138,13 +156,11 @@ pub fn find_position(code: &str) -> Option<Position> {
 ///
 /// 修复 review #14: 只返回 code 列表, 避免 50 × Position (含 3 个 String)
 /// deep clone. 调用方按需 find_position(code) 取单只详情.
-pub fn get_st_positions() -> Vec<String> {
-    get_positions()
-        .unwrap_or_default()
-        .iter()
-        .filter(|p| p.is_st || p.star_st)
-        .map(|p| p.code.clone())
-        .collect()
+pub fn get_st_positions() -> Result<Vec<Position>, String> {
+    Ok(get_positions()?
+        .into_iter()
+        .filter(|position| position.is_st || position.star_st)
+        .collect())
 }
 
 /// 判断是否 T+1 锁仓（今日买入的不可卖出）
@@ -169,51 +185,6 @@ pub fn get_trade_history(days: u32) -> Result<Vec<Trade>, String> {
     crate::portfolio::store::load_trades_since(since)
 }
 
-/// 记录虚拟盘买卖 (复用现有 trades 表 + journal.rs FIFO 盈亏逻辑)
-///   strategy_tag='virtual' 标记, 与真实持仓交易区分, 不污染真实持仓 P&L
-///   buy: 虚拟建仓; sell: 手动命令触发卖出 (--sell CODE:PRICE[:QTY])
-pub fn record_virtual_trade(
-    code: &str,
-    name: &str,
-    direction: TradeDirection,
-    price: f64,
-    shares: u64,
-) -> Result<(), String> {
-    use diesel::prelude::*;
-    use diesel::sql_types::{BigInt, Double, Text};
-    let dir = match direction {
-        TradeDirection::Buy => "buy",
-        TradeDirection::Sell => "sell",
-    };
-    let amount = price * shares as f64;
-    let traded_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    let db = crate::database::DatabaseManager::get();
-    let mut conn = db.get_conn().map_err(|e| format!("get_conn: {e}"))?;
-    diesel::sql_query(
-        "INSERT INTO trades (code, name, direction, price, shares, amount, reason, traded_at, strategy_tag) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'virtual')",
-    )
-    .bind::<Text, _>(code)
-    .bind::<Text, _>(name)
-    .bind::<Text, _>(dir)
-    .bind::<Double, _>(price)
-    .bind::<BigInt, _>(shares as i64)
-    .bind::<Double, _>(amount)
-    .bind::<Text, _>("virtual")
-    .bind::<Text, _>(&traded_at)
-    .execute(&mut *conn)
-    .map_err(|e| format!("insert virtual trade {code}: {e}"))?;
-    log::info!(
-        "[虚拟盘] 记录{}: {}({}) {}股 @ {:.2}",
-        dir,
-        name,
-        code,
-        shares,
-        price
-    );
-    Ok(())
-}
-
 /// 记录每日净值快照
 pub fn snapshot_ledger(entry: LedgerEntry) -> Result<(), String> {
     crate::portfolio::store::save_ledger(entry)
@@ -223,4 +194,70 @@ pub fn snapshot_ledger(entry: LedgerEntry) -> Result<(), String> {
 pub fn get_equity_curve(days: u32) -> Result<Vec<LedgerEntry>, String> {
     let since = chrono::Local::now().date_naive() - chrono::Duration::days(days as i64);
     crate::portfolio::store::load_ledger(since)
+}
+
+/// BR-103/2.4: load a ledger curve only when its newest row is the required
+/// report date. Historical rows must never masquerade as today's account NAV.
+pub fn get_equity_curve_as_of(
+    days: u32,
+    required_as_of: chrono::NaiveDate,
+) -> Result<Vec<LedgerEntry>, String> {
+    let curve = get_equity_curve(days)?;
+    validate_equity_curve_as_of(&curve, required_as_of)?;
+    Ok(curve)
+}
+
+fn validate_equity_curve_as_of(
+    curve: &[LedgerEntry],
+    required_as_of: chrono::NaiveDate,
+) -> Result<(), String> {
+    let latest = curve
+        .last()
+        .ok_or_else(|| format!("ledger 当日净值缺失: required={required_as_of}"))?;
+    if latest.date != required_as_of {
+        return Err(format!(
+            "ledger 净值已过期: latest={} required={required_as_of}",
+            latest.date
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod freshness_tests {
+    use super::*;
+
+    #[test]
+    fn br097_position_source_freshness_has_exact_thirty_second_boundary() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-18T02:15:35Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(position_source_is_fresh(
+            (now - chrono::Duration::seconds(30)).with_timezone(&chrono::Local),
+            now
+        ));
+        assert!(!position_source_is_fresh(
+            (now - chrono::Duration::milliseconds(30_001)).with_timezone(&chrono::Local),
+            now
+        ));
+    }
+
+    #[test]
+    fn br103_equity_curve_requires_the_report_date() {
+        let latest = chrono::NaiveDate::from_ymd_opt(2026, 7, 17).unwrap();
+        let curve = vec![LedgerEntry {
+            date: latest,
+            total_value: 100.0,
+            cash: 40.0,
+            market_value: 60.0,
+            daily_pnl: 1.0,
+        }];
+        assert!(validate_equity_curve_as_of(&curve, latest).is_ok());
+        assert!(validate_equity_curve_as_of(
+            &curve,
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 18).unwrap()
+        )
+        .is_err());
+        assert!(validate_equity_curve_as_of(&[], latest).is_err());
+    }
 }

@@ -134,6 +134,10 @@ impl NotificationService {
     }
 
     /// 发送单封邮件（第一个收件人为主地址，其余为抄送）
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "SMTP assembly boundary keeps recipients, content, and transport inputs explicit"
+    )]
     pub(super) fn send_single_email(
         &self,
         from: &str,
@@ -279,6 +283,10 @@ impl NotificationService {
     }
 
     /// 发送单封带图片的邮件（第一个收件人为主地址，其余为抄送）
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "SMTP multipart boundary keeps attachment and transport inputs explicit"
+    )]
     pub(super) fn send_single_email_with_image(
         &self,
         from: &str,

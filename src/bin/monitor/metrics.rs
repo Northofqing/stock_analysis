@@ -90,7 +90,7 @@ mod tests {
         m.strategy_score.with_label_values(&["Momentum"]).inc();
         m.paper_engine_sell.with_label_values(&["铁律1:止损(-8%)"]).inc();
         m.perf_snapshot_age.set(3600);
-        m.quote_price.with_label_values(&["600519"]).set(1700);
+        m.quote_price.with_label_values(&["TEST_CODE_600519"]).set(1700);
         let s = m.expose().unwrap();
         assert!(s.contains("42"));
         assert!(s.contains("3600"));

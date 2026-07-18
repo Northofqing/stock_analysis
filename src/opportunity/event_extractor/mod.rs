@@ -1,3 +1,4 @@
+//! Registered business rules: BR-068.
 pub mod adapter;
 pub mod classifier;
 pub mod core;
@@ -235,8 +236,8 @@ pub async fn extract_batch(
         }
         let mut me = EventExtractorCore::extract_with(gemini, &raw).await;
         // 覆盖 classifier 判定的 event_type (Quick AI 更准)
-        if co.is_event && co.event_type.is_some() {
-            me.event_type = co.event_type.unwrap();
+        if let Some(event_type) = co.event_type {
+            me.event_type = event_type;
         }
         if let Some(d) = co.direction {
             me.direction = d;

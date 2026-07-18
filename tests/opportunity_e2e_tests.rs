@@ -38,15 +38,15 @@ fn test_e2e_full_pipeline_smoke() {
 fn test_e2e_with_winrate_qualifies_for_gray() {
     // 修复 P0-1: 端到端: 有 winrate + 沙盘运行足够, 可以升级
     let samples: Vec<_> = (0..200)
-        .map(|i| stock_analysis::opportunity::winrate::BacktestSample {
-            event_id: "evt1".into(),
-            n_day_return: if i < 130 { 0.02 } else { -0.01 },
-            day: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap() + chrono::Duration::days(i),
+        .map(|i| VerifiedOutcome {
+            hit: Some(i < 130),
+            actual_change: Some(if i < 130 { 2.0 } else { -1.0 }),
+            special_case: None,
         })
         .collect();
-    let winrate_summary = compute_winrate_summary(&samples);
+    let winrate_summary = summarize_verified_rows(&samples);
     assert!(winrate_summary.sufficient);
-    let winrate_score = winrate_summary.score;
+    let winrate_score = winrate_summary.winrate.expect("verified winrate");
     assert!(winrate_score >= 0.60, "130/200 涨 = 0.65 ≥ 0.60");
 
     // 修复 P0-3: 沙盘 → 灰度 (v14.9: shadow_days 70 → 84, 对齐 codex 修复的 12 周阈值)
@@ -108,15 +108,12 @@ fn test_e2e_weight_version_propagates() {
 fn test_e2e_neg_signal_clamps_to_zero() {
     // 修复 P0-1 + P1-2: winrate < 50% → 0, event_risk 与 winrate 解耦
     let samples: Vec<_> = (0..200)
-        .map(|i| {
-            stock_analysis::opportunity::winrate::BacktestSample {
-                event_id: "evt".into(),
-                n_day_return: if i < 80 { 0.02 } else { -0.01 }, // 80 涨 120 跌 = 40% < 50%
-                day: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()
-                    + chrono::Duration::days(i),
-            }
+        .map(|i| VerifiedOutcome {
+            hit: Some(i < 80),
+            actual_change: Some(if i < 80 { 2.0 } else { -1.0 }),
+            special_case: None,
         })
         .collect();
-    let winrate = calc_winrate_score(&samples).unwrap();
+    let winrate = summarize_verified_rows(&samples).gated_score().unwrap();
     assert_eq!(winrate, 0.0, "明确负信号 winrate 必为 0 (P1-2 修复)");
 }

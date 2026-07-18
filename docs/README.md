@@ -72,7 +72,7 @@
 | **v13.10.1** | 推送数据修正 + 降噪 release | `docs/v13/v13.10.1-2026-07-08-operations-release-notes.md` |
 | **v14.2** | 推送架构 spec（当前活跃，2026-07-11） | `docs/v14.x/v14.2-2026-07-11-brainstorming-push-architecture-active.md` |
 | **v14.x** | 主开发计划 | `docs/v14.x/v14.x-2026-07-11-writing-plans-master-development.md` |
-| **v18.x** | 量化平台闭环设计（当前活跃） | `docs/v18.x/v18.0-2026-07-16-brainstorming-quant-platform-closure-design-active.md` |
+| **v18.x** | 量化平台闭环中文整合设计（当前活跃） | `docs/v18.x/v18.0-2026-07-16-brainstorming-quant-platform-closure-design-active.md` |
 
 ## 整理动作记录
 

@@ -58,12 +58,19 @@ fn build_hq_url_format() {
 fn parse_hq_str_format() {
     // Sina 真实响应格式 (实测):
     // var hq_str_sh600519="平安银行,13.50,13.45,13.48,13.52,13.40,13.47,13.49,12345,16789,...";
-    let body = r###"var hq_str_sh600519="平安银行,13.50,13.45,13.48,13.52,13.40,13.47,13.49,12345,16789,100,500,...";"###;
-    let quote = parse_hq_str(body, "600519").expect("parse hq_str");
+    let body = r###"var hq_str_sh600519="测试股票,13.50,13.45,13.48,13.52,13.40,13.47,13.49,12345,16789,100,500,100,500,100,500,100,500,100,500,100,500,100,500,100,500,100,500,100,500,2026-07-18,10:15:30,00";"###;
+    let quote = parse_hq_str(body, "TEST_CODE_600519").expect("parse hq_str");
     assert_eq!(quote.current, 13.48);
     assert_eq!(quote.open, 13.50);
     assert_eq!(quote.yesterday_close, 13.45);
     assert_eq!(quote.high, 13.52);
     assert_eq!(quote.low, 13.40);
     assert!(quote.volume > 0.0);
+    assert_eq!(quote.source_time.to_rfc3339(), "2026-07-18T02:15:30+00:00");
+}
+
+#[test]
+fn br097_sina_quote_without_source_timestamp_is_rejected() {
+    let body = r###"var hq_str_sh600519="测试股票,13.50,13.45,13.48,13.52,13.40,13.47,13.49,12345,16789";"###;
+    assert!(parse_hq_str(body, "TEST_CODE_600519").is_err());
 }

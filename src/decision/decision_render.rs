@@ -121,6 +121,10 @@ mod tests {
     use super::*;
     use crate::decision::decision_panel::{Action, DecisionReason, DecisionReasonKind, Priority};
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "test fixture exposes every rendered decision dimension explicitly"
+    )]
     fn make_decision(
         code: &str,
         name: &str,
@@ -150,7 +154,7 @@ mod tests {
     #[test]
     fn single_decision_full() {
         let d = make_decision(
-            "000001",
+            "TEST_CODE_000001",
             "平安银行",
             Action::ReduceNow,
             Priority::P0,
@@ -168,7 +172,7 @@ mod tests {
         assert!(s.contains("🔴"), "P0 必有 🔴 emoji");
         assert!(s.contains("[P0]"), "P0 标签");
         assert!(s.contains("立即减仓"), "P0 必有 立即减仓");
-        assert!(s.contains("平安银行(000001)"), "名称+代码");
+        assert!(s.contains("平安银行(TEST_CODE_000001)"), "名称+测试代码");
         assert!(s.contains("¥12.30"), "现价");
         assert!(s.contains("止损¥12.10"), "止损价");
         assert!(s.contains("-3.20%"), "涨跌幅");
@@ -184,7 +188,7 @@ mod tests {
     #[test]
     fn single_decision_no_ai_summary() {
         let d = make_decision(
-            "000002",
+            "TEST_CODE_000002",
             "万科A",
             Action::Hold,
             Priority::P2,
@@ -207,7 +211,7 @@ mod tests {
     fn decision_board_stats() {
         let decisions = vec![
             make_decision(
-                "000001",
+                "TEST_CODE_000001",
                 "P0票",
                 Action::ReduceNow,
                 Priority::P0,
@@ -217,7 +221,7 @@ mod tests {
                 None,
             ),
             make_decision(
-                "000002",
+                "TEST_CODE_000002",
                 "P0票2",
                 Action::ReduceNow,
                 Priority::P0,
@@ -227,7 +231,7 @@ mod tests {
                 None,
             ),
             make_decision(
-                "000003",
+                "TEST_CODE_000003",
                 "P1票",
                 Action::Reduce,
                 Priority::P1,
@@ -237,7 +241,7 @@ mod tests {
                 None,
             ),
             make_decision(
-                "000004",
+                "TEST_CODE_000004",
                 "P2票",
                 Action::WatchAdd,
                 Priority::P2,
@@ -247,7 +251,7 @@ mod tests {
                 None,
             ),
             make_decision(
-                "000005",
+                "TEST_CODE_000005",
                 "Hold票",
                 Action::Hold,
                 Priority::P2,
@@ -268,7 +272,7 @@ mod tests {
     fn decision_board_sorted_by_priority() {
         let decisions = vec![
             make_decision(
-                "000005",
+                "TEST_CODE_000005",
                 "Hold票",
                 Action::Hold,
                 Priority::P2,
@@ -278,7 +282,7 @@ mod tests {
                 None,
             ),
             make_decision(
-                "000001",
+                "TEST_CODE_000001",
                 "P0票",
                 Action::ReduceNow,
                 Priority::P0,
@@ -288,7 +292,7 @@ mod tests {
                 None,
             ),
             make_decision(
-                "000003",
+                "TEST_CODE_000003",
                 "P1票",
                 Action::Reduce,
                 Priority::P1,

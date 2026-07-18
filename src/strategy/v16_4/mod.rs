@@ -7,13 +7,8 @@
 //!
 //! v16.4 Commit 2 注: 8 impl 文件拆独立, 不动 v16.3 evaluate_candidate 评分表.
 //!
-//! # FIXME(红线 2.1) — Phase 1 stub, 禁止直接接入生产决策路径
-//!
-//! 当前 8 个 impl 的 `score()` 返回**硬编码分数** (与 v16.3 evaluate_candidate 评分表对齐),
-//! 不读真实行情/资金/情绪数据. 在 v16.4 Commit #6 把 intraday_monitor 接到
-//! ScoreCalculator.aggregate(8 strategy.score()) 之前, **必须**把每个 score() 换成
-//! 真实数据计算 (sector_monitor / limit_up_stocks / auction_volume / main_net_inflow 等),
-//! 否则触发 AGENTS.md 红线 2.1 (生产路径 mock 数据) — 屏蔽 merge.
+//! BR-098: 8 个实现只消费结构化真实指标；生产 `intraday_monitor` 直接调用
+//! `Strategy::score`，缺失/坏指标返回 `None`，不再按 push_kind 使用固定分数。
 
 use crate::bus::StrategyId;
 
@@ -38,7 +33,9 @@ pub trait Strategy: Send + Sync {
     fn virtual_reason(&self) -> &'static str;
     fn score(&self, input: &StrategyInput) -> Option<StrategyOutput>;
     fn description(&self) -> &'static str;
-    fn is_active(&self) -> bool { true }
+    fn is_active(&self) -> bool {
+        true
+    }
 }
 
 pub fn register_all() {
@@ -55,28 +52,33 @@ pub fn register_all() {
         Box::new(MomentumStrategy),
     ];
     for s in all {
-        r.register(s.virtual_reason(), "v1", s.description(), s.virtual_reason());
+        r.register(
+            s.virtual_reason(),
+            "v1",
+            s.description(),
+            s.virtual_reason(),
+        );
     }
 }
 
-pub mod news_catalyst;
-pub mod _helpers; // 7 stub strategy 共享真数据读取 (parse metric_json)
+pub mod _helpers;
 pub mod auction_anomaly;
-pub mod main_net_inflow;
-pub mod sector_leader;
 pub mod breakout;
-pub mod volume_surge;
 pub mod llm_select;
+pub mod main_net_inflow;
 pub mod momentum;
+pub mod news_catalyst;
+pub mod sector_leader;
+pub mod volume_surge;
 
-pub use news_catalyst::NewsCatalystStrategy;
 pub use auction_anomaly::AuctionAnomalyStrategy;
-pub use main_net_inflow::MainNetInflowStrategy;
-pub use sector_leader::SectorLeaderStrategy;
 pub use breakout::BreakoutStrategy;
-pub use volume_surge::VolumeSurgeStrategy;
 pub use llm_select::LLMSelectStrategy;
+pub use main_net_inflow::MainNetInflowStrategy;
 pub use momentum::MomentumStrategy;
+pub use news_catalyst::NewsCatalystStrategy;
+pub use sector_leader::SectorLeaderStrategy;
+pub use volume_surge::VolumeSurgeStrategy;
 
 /// Fix review #1 (HIGH): Strategy::id() 稳定
 ///
@@ -89,9 +91,7 @@ macro_rules! impl_strategy_id {
             use ::std::sync::OnceLock;
             use $crate::bus::new_strategy_id;
             static CACHED: OnceLock<$crate::bus::StrategyId> = OnceLock::new();
-            CACHED
-                .get_or_init(|| new_strategy_id($name, "v1"))
-                .clone()
+            CACHED.get_or_init(|| new_strategy_id($name, "v1")).clone()
         }
     };
 }
@@ -102,7 +102,7 @@ mod tests {
 
     fn make_input(kind: &str, vol: f64) -> StrategyInput {
         StrategyInput {
-            code: "000001".to_string(),
+            code: "TEST_CODE_000001".to_string(),
             push_price: 10.0,
             // Fix v16.4 完整化: chg + 0.1 (momentum/sector_leader 拒 chg<=0)
             metric_json: serde_json::json!({"vol_ratio": vol, "push_subkind": "Test", "price_chg_pct": 0.1, "sector": "AI"}).to_string(),
@@ -123,7 +123,11 @@ mod tests {
         let s = MomentumStrategy;
         // v16.4 完整化: 8.0 base + chg 0.1 * 0.2 = 8.02
         let out = s.score(&make_input("Momentum", 8.0)).expect("should score");
-        assert!(out.score >= 8.0 && out.score <= 9.0, "Momentum 应 8.0-9.0 实际 {}", out.score);
+        assert!(
+            out.score >= 8.0 && out.score <= 9.0,
+            "Momentum 应 8.0-9.0 实际 {}",
+            out.score
+        );
     }
 
     #[test]
@@ -148,7 +152,11 @@ mod tests {
         // 实际: 6.5 + (0-2)*0.15 = 6.2 (负数), .min(1.5) 限制 min 0, max 0 → 6.5 - 0.3 = 6.2
         // 改: 传 vol=3.0 (≥2 拒阈值), 6.5 + (3-2)*0.15 = 6.65
         let out = s.score(&make_input("P-02", 3.0)).expect("should score");
-        assert!(out.score >= 6.5 && out.score <= 8.0, "VolumeSurge 应 6.5-8.0 实际 {}", out.score);
+        assert!(
+            out.score >= 6.5 && out.score <= 8.0,
+            "VolumeSurge 应 6.5-8.0 实际 {}",
+            out.score
+        );
     }
 
     #[test]
@@ -163,7 +171,12 @@ mod tests {
         register_all();
         let r = crate::registry::StrategyRegistry::global();
         let all = r.list_all();
-        let count = all.iter().filter(|m| m.name != "Overwrite" && m.name != "TestActive" && m.name != "TestReactivate").count();
+        let count = all
+            .iter()
+            .filter(|m| {
+                m.name != "Overwrite" && m.name != "TestActive" && m.name != "TestReactivate"
+            })
+            .count();
         assert!(count >= 8, "8 strategy 应注册, 实际 {}", count);
     }
 
@@ -186,7 +199,11 @@ mod tests {
         assert_eq!(id1, id2, "同 (name, version) 覆盖应复用首次 id");
         let meta = r.lookup(&id1).expect("应找到");
         assert_eq!(meta.description, "second", "应覆盖 description");
-        let count = r.list_all().iter().filter(|m| m.name == "TestOverwriteUnique" && m.version == "v9").count();
+        let count = r
+            .list_all()
+            .iter()
+            .filter(|m| m.name == "TestOverwriteUnique" && m.version == "v9")
+            .count();
         assert_eq!(count, 1, "同 (name, version) 应只 1 entry, 不累积");
     }
 }

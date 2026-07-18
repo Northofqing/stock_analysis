@@ -278,7 +278,7 @@ impl SignalStateMachine {
             #[diesel(sql_type = diesel::sql_types::Integer)]
             daily_info_count: i32,
         }
-        let sql = format!("SELECT key, state, last_alert, last_change, daily_important_count, daily_info_count FROM signal_state");
+        let sql = "SELECT key, state, last_alert, last_change, daily_important_count, daily_info_count FROM signal_state".to_string();
         if let Ok(rows) = diesel::sql_query(&sql).load::<StateRow>(&mut *conn) {
             for r in rows {
                 // 只恢复有 last_change 且是今天的
@@ -320,7 +320,7 @@ impl SignalStateMachine {
             }
         }
         // 清理非今天的
-        let _ = diesel::sql_query(&format!(
+        let _ = diesel::sql_query(format!(
             "DELETE FROM signal_state WHERE last_change IS NULL OR last_change < '{}'",
             today
         ))
@@ -358,6 +358,7 @@ mod tests {
                 threshold: None,
                 news_title: None,
                 news_summary: None,
+                news_importance: None,
                 ai_decision: None,
                 t1_locked: false,
                 extra: None,
@@ -372,7 +373,7 @@ mod tests {
         let mut sm = SignalStateMachine::default();
         assert!(sm
             .process(event(
-                "000001",
+                "TEST_CODE_000001",
                 AlertLevel::Important,
                 AlertCategory::MainOutflow
             ))
@@ -382,7 +383,11 @@ mod tests {
     #[test]
     fn test_duplicate_within_cooldown_blocked() {
         let mut sm = SignalStateMachine::new(300, 900, 30, 15);
-        let e = event("000001", AlertLevel::Important, AlertCategory::MainOutflow);
+        let e = event(
+            "TEST_CODE_000001",
+            AlertLevel::Important,
+            AlertCategory::MainOutflow,
+        );
         assert!(sm.process(e.clone()).is_some());
         assert!(sm.process(e.clone()).is_none()); // 立即重复 → 静默
     }
@@ -390,7 +395,11 @@ mod tests {
     #[test]
     fn test_emergency_passes_then_cooldown() {
         let mut sm = SignalStateMachine::new(300, 900, 30, 15);
-        let e = event("000001", AlertLevel::Emergency, AlertCategory::LimitDown);
+        let e = event(
+            "TEST_CODE_000001",
+            AlertLevel::Emergency,
+            AlertCategory::LimitDown,
+        );
         assert!(sm.process(e.clone()).is_some());
         // 紧急级别60秒内不重复
         assert!(sm.process(e.clone()).is_none());
@@ -399,9 +408,13 @@ mod tests {
     #[test]
     fn test_mark_resolved_then_re_trigger() {
         let mut sm = SignalStateMachine::new(1, 1, 30, 15); // 1秒冷却用于测试
-        let e = event("000001", AlertLevel::Important, AlertCategory::MainOutflow);
+        let e = event(
+            "TEST_CODE_000001",
+            AlertLevel::Important,
+            AlertCategory::MainOutflow,
+        );
         assert!(sm.process(e.clone()).is_some());
-        sm.mark_resolved("000001", AlertCategory::MainOutflow);
+        sm.mark_resolved("TEST_CODE_000001", AlertCategory::MainOutflow);
         std::thread::sleep(std::time::Duration::from_secs(2));
         assert!(sm.process(e).is_some()); // 冷却期满，重新触发
     }
@@ -409,8 +422,16 @@ mod tests {
     #[test]
     fn test_daily_budget_enforced() {
         let mut sm = SignalStateMachine::new(1, 1, 1, 1); // 预算各1条
-        let e1 = event("000001", AlertLevel::Important, AlertCategory::MainInflow);
-        let e2 = event("000002", AlertLevel::Important, AlertCategory::VolBurst);
+        let e1 = event(
+            "TEST_CODE_000001",
+            AlertLevel::Important,
+            AlertCategory::MainInflow,
+        );
+        let e2 = event(
+            "TEST_CODE_000002",
+            AlertLevel::Important,
+            AlertCategory::VolBurst,
+        );
         assert!(sm.process(e1).is_some());
         assert!(sm.process(e2).is_none()); // 超出预算
     }
@@ -419,7 +440,11 @@ mod tests {
     #[test]
     fn test_limit_down_once_per_day() {
         let mut sm = SignalStateMachine::new(300, 900, 30, 15);
-        let e1 = event("600641", AlertLevel::Emergency, AlertCategory::LimitDown);
+        let e1 = event(
+            "TEST_CODE_600641",
+            AlertLevel::Emergency,
+            AlertCategory::LimitDown,
+        );
         // 首次触发: 放行
         assert!(sm.process(e1.clone()).is_some(), "首次跌停应放行");
         // 60秒内重复: 60s 冷却 (原有行为)
@@ -440,14 +465,14 @@ mod tests {
     fn test_daily_reset_restores_budget() {
         let mut sm = SignalStateMachine::new(1, 1, 1, 1);
         sm.process(event(
-            "000001",
+            "TEST_CODE_000001",
             AlertLevel::Important,
             AlertCategory::MainInflow,
         ));
         sm.daily_reset();
         assert!(sm
             .process(event(
-                "000002",
+                "TEST_CODE_000002",
                 AlertLevel::Important,
                 AlertCategory::MainInflow
             ))
@@ -459,14 +484,14 @@ mod tests {
         let mut sm = SignalStateMachine::default();
         assert!(sm
             .process(event(
-                "000001",
+                "TEST_CODE_000001",
                 AlertLevel::Important,
                 AlertCategory::MainOutflow
             ))
             .is_some());
         assert!(sm
             .process(event(
-                "000001",
+                "TEST_CODE_000001",
                 AlertLevel::Important,
                 AlertCategory::VolBurst
             ))
@@ -478,14 +503,14 @@ mod tests {
         let mut sm = SignalStateMachine::default();
         assert!(sm
             .process(event(
-                "000001",
+                "TEST_CODE_000001",
                 AlertLevel::Important,
                 AlertCategory::MainOutflow
             ))
             .is_some());
         assert!(sm
             .process(event(
-                "000002",
+                "TEST_CODE_000002",
                 AlertLevel::Important,
                 AlertCategory::MainOutflow
             ))

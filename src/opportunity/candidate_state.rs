@@ -79,6 +79,49 @@ pub fn should_promote_to_live(sample_count: u32, win_rate_strong: f64, win_rate_
     win_rate_strong >= 0.30 && (win_rate_weak > 0.0 || sample_count >= 100)
 }
 
+/// 候选转正的可审计性能证据。
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct PromotionEvidence {
+    pub sample_count: u32,
+    pub win_rate_strong: f64,
+    pub win_rate_weak: f64,
+}
+
+/// BR-100: 人工开关和分层样本门必须同时通过。
+///
+/// `None` 表示尚未从持久化样本库取得证据，必须显式拒绝，不得把环境变量
+/// 当成胜率证明。
+pub fn require_live_promotion(
+    evidence: Option<PromotionEvidence>,
+    explicit_override: Option<bool>,
+) -> Result<PromotionEvidence, String> {
+    if !is_candidate_live_enabled(explicit_override) {
+        return Err("候选人工转正开关未开启".to_string());
+    }
+    let evidence = evidence.ok_or_else(|| "候选分层样本证据源未接入".to_string())?;
+    if !evidence.win_rate_strong.is_finite()
+        || !evidence.win_rate_weak.is_finite()
+        || !(0.0..=1.0).contains(&evidence.win_rate_strong)
+        || !(0.0..=1.0).contains(&evidence.win_rate_weak)
+    {
+        return Err(format!(
+            "候选分层胜率证据非法: strong={} weak={}",
+            evidence.win_rate_strong, evidence.win_rate_weak
+        ));
+    }
+    if !should_promote_to_live(
+        evidence.sample_count,
+        evidence.win_rate_strong,
+        evidence.win_rate_weak,
+    ) {
+        return Err(format!(
+            "候选分层样本门未通过: samples={} strong={:.3} weak={:.3}",
+            evidence.sample_count, evidence.win_rate_strong, evidence.win_rate_weak
+        ));
+    }
+    Ok(evidence)
+}
+
 /// MVP3-3.1: 人工转正开关.
 ///
 /// 三种开启方式:
@@ -181,10 +224,38 @@ mod tests {
     }
 
     #[test]
+    fn manual_switch_cannot_bypass_missing_promotion_evidence() {
+        let error = require_live_promotion(None, Some(true)).expect_err("missing evidence blocks");
+        assert!(error.contains("证据源未接入"));
+    }
+
+    #[test]
+    fn live_promotion_requires_switch_and_valid_thresholds() {
+        let evidence = PromotionEvidence {
+            sample_count: 30,
+            win_rate_strong: 0.30,
+            win_rate_weak: 0.50,
+        };
+        assert!(require_live_promotion(Some(evidence), Some(false)).is_err());
+        assert_eq!(
+            require_live_promotion(Some(evidence), Some(true)).expect("promotion passes"),
+            evidence
+        );
+        assert!(require_live_promotion(
+            Some(PromotionEvidence {
+                win_rate_strong: f64::NAN,
+                ..evidence
+            }),
+            Some(true)
+        )
+        .is_err());
+    }
+
+    #[test]
     fn candidate_record_serializes() {
         let r = CandidateRecord {
             ts: "2026-07-05T10:00:00".to_string(),
-            code: "688001".to_string(),
+            code: "TEST_CODE_688001".to_string(),
             name: "测试".to_string(),
             state: CandidateState::Shadow,
             rank_hits: 5,
@@ -195,7 +266,7 @@ mod tests {
         };
         let s = serde_json::to_string(&r).unwrap();
         assert!(s.contains("\"state\":\"shadow\""));
-        assert!(s.contains("\"code\":\"688001\""));
+        assert!(s.contains("\"code\":\"TEST_CODE_688001\""));
     }
 
     // ---- MVP3-3.1 人工开关 ----

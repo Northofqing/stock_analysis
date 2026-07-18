@@ -65,18 +65,10 @@ impl XueqiuProvider {
         struct StatusItem {
             #[serde(rename = "text")]
             text: Option<String>, // 雪球 API 实际用 text 字段 (不是 title)
-            #[serde(rename = "data")]
-            data: Option<String>, // JSON 字符串, 含 status_id
             #[serde(rename = "target")]
             target: Option<String>,
             #[serde(rename = "created_at")]
             created_at: Option<i64>,
-        }
-
-        #[derive(Deserialize, Debug)]
-        struct StatusUser {
-            #[serde(rename = "screen_name")]
-            screen_name: Option<String>,
         }
 
         #[derive(Deserialize, Debug)]
@@ -211,6 +203,7 @@ impl XueqiuProvider {
 }
 
 /// 简单 HTML 标签清理 (用于 description)
+#[cfg(test)]
 fn strip_html_tags(s: &str) -> String {
     crate::util::strip_html_tags(s)
 }

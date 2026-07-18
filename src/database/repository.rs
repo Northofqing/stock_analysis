@@ -54,16 +54,22 @@ pub trait TradeRepository: Send + Sync {
 use crate::database::DatabaseManager;
 use crate::models::StockDaily;
 
-fn stock_daily_to_kline(r: StockDaily) -> KlineData {
-    KlineData {
+fn required_daily_value(date: NaiveDate, field: &str, value: Option<f64>) -> Result<f64, DbError> {
+    value.ok_or_else(|| DbError::QueryFailed {
+        sql: format!("stock_daily {date} missing required field {field}"),
+    })
+}
+
+fn stock_daily_to_kline(r: StockDaily) -> Result<KlineData, DbError> {
+    Ok(KlineData {
         date: r.date,
-        open: r.open.unwrap_or(0.0),
-        high: r.high.unwrap_or(0.0),
-        low: r.low.unwrap_or(0.0),
-        close: r.close.unwrap_or(0.0),
-        volume: r.volume.unwrap_or(0.0),
-        amount: r.amount.unwrap_or(0.0),
-        pct_chg: r.pct_chg.unwrap_or(0.0),
+        open: required_daily_value(r.date, "open", r.open)?,
+        high: required_daily_value(r.date, "high", r.high)?,
+        low: required_daily_value(r.date, "low", r.low)?,
+        close: required_daily_value(r.date, "close", r.close)?,
+        volume: required_daily_value(r.date, "volume", r.volume)?,
+        amount: required_daily_value(r.date, "amount", r.amount)?,
+        pct_chg: required_daily_value(r.date, "pct_chg", r.pct_chg)?,
         intraday_price: None,
         settled: true,
         pe_ratio: None,
@@ -87,7 +93,7 @@ fn stock_daily_to_kline(r: StockDaily) -> KlineData {
         is_suspended: false,
         // DB 反序列化: schema 不存 adjust, 字段值不可知. 语义为"上游假定 Qfq".
         adjust: crate::data_provider::AdjustType::None,
-    }
+    })
 }
 
 #[async_trait]
@@ -98,7 +104,16 @@ impl StockRepository for DatabaseManager {
             .map_err(|e| DbError::QueryFailed {
                 sql: format!("get_latest_data({code}, {limit}): {e}"),
             })?;
-        Ok(rows.into_iter().map(stock_daily_to_kline).collect())
+        let mut data: Vec<KlineData> = rows
+            .into_iter()
+            .map(stock_daily_to_kline)
+            .collect::<Result<_, _>>()?;
+        crate::data_provider::validate_kline_series_strict(&mut data, code).map_err(|error| {
+            DbError::QueryFailed {
+                sql: format!("validate stock_daily({code}): {error}"),
+            }
+        })?;
+        Ok(data)
     }
 
     async fn save_kline(&self, code: &str, data: &[KlineData]) -> Result<usize, DbError> {

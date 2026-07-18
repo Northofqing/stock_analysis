@@ -1,0 +1,12 @@
+# Machine-readable bounds checked by tools/compliance/lib/check_design_contradiction.sh.
+# BR-014 / BR-096: the production threshold comes from strategy.toml; incomplete
+# data is capped one point below it, while the complete score domain remains 0..=100.
+
+[opportunity_event_risk]
+threshold_file = "config/strategy.toml"
+threshold_field = "opportunity_push_threshold"
+rust_source = "src/opportunity/score.rs"
+rust_score_max_constant = "EVENT_RISK_SCORE_MAX"
+score_min = 0
+score_max = 100
+insufficient_cap_relation = "threshold_minus_one"

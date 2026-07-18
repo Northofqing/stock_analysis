@@ -6,7 +6,6 @@
 //! - [`schedule`]：定时任务调度
 
 pub mod bootstrap;
-pub mod context;
 pub mod modes;
 pub mod schedule;
 

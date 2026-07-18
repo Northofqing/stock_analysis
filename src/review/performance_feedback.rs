@@ -6,7 +6,7 @@ use crate::opportunity::news_ranker::HeatStage;
 use chrono::Local;
 
 /// 三维分组
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct PerformanceGroup {
     pub sample_count: usize,
     pub win_rate: Option<f64>, // None = 样本不足不出结论
@@ -24,19 +24,6 @@ impl PerformanceGroup {
     /// 样本 < 20 标"样本不足"
     pub fn is_under_sampled(&self) -> bool {
         self.sample_count < 20
-    }
-}
-
-impl Default for PerformanceGroup {
-    fn default() -> Self {
-        Self {
-            sample_count: 0,
-            win_rate: None,
-            avg_pnl_pct: None,
-            max_drawdown_pct: None,
-            mfe: None,
-            mae: None,
-        }
     }
 }
 
@@ -165,8 +152,10 @@ mod tests {
 
     #[test]
     fn is_decidable_threshold() {
-        let mut g = PerformanceGroup::default();
-        g.sample_count = 5;
+        let mut g = PerformanceGroup {
+            sample_count: 5,
+            ..PerformanceGroup::default()
+        };
         assert!(!g.is_decidable());
         g.sample_count = 10;
         assert!(g.is_decidable());

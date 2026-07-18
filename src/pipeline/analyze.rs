@@ -7,14 +7,12 @@
 //! Rust 允许跨模块 impl, 所以这里直接 `impl AnalysisPipeline { ... }`.
 
 use anyhow::Result;
-use futures::stream::StreamExt;
 use log::{error, info, warn};
 use std::sync::Arc;
 
 use crate::data_provider::financials::FinancialPeriod;
 use crate::data_provider::KlineData;
 use crate::search_service::get_search_service;
-use crate::traits::ScoreDisplay;
 
 use super::score_to_advice;
 use super::section_utils;
@@ -332,7 +330,7 @@ impl AnalysisPipeline {
                 info!("[{}] 触发多周期下钻（60min/15min 寻找精准入场点）", code);
                 multi_timeframe::fetch_multi_timeframe_section(code).await
             } else {
-                None
+                Ok(None)
             }
         };
 
@@ -342,9 +340,11 @@ impl AnalysisPipeline {
             mtf_fut
         );
 
+        let extra = extra.map_err(anyhow::Error::msg)?;
         let mut extra_context = extra.section;
         let money_flow_raw = extra.money_flow;
 
+        let mtf_section_opt = mtf_section_opt.map_err(anyhow::Error::msg)?;
         if let Some(mtf_section) = mtf_section_opt {
             extra_context = match extra_context {
                 Some(mut s) => {
@@ -364,7 +364,10 @@ impl AnalysisPipeline {
             if let Some(chain) = crate::risk::veto_rules_live::build_chain(
                 &crate::risk::veto_chain::VetoChainConfig {
                     enabled: veto_config.enabled,
-                    mode: crate::risk::veto_chain::VetoMode::from_str(&veto_config.mode),
+                    mode: veto_config
+                        .mode
+                        .parse()
+                        .unwrap_or(crate::risk::veto_chain::VetoMode::DryRun),
                     bias_rate_enabled: veto_config.bias_rate_enabled,
                     bearish_alignment_enabled: veto_config.bearish_alignment_enabled,
                     main_flow_enabled: veto_config.main_flow_enabled,
@@ -665,7 +668,7 @@ impl AnalysisPipeline {
                     .iter()
                     .map(|(k, v)| (k.clone(), *v))
                     .collect();
-                parts.sort_by(|a, b| b.1.cmp(&a.1));
+                parts.sort_by_key(|part| std::cmp::Reverse(part.1));
                 let dist: Vec<String> = parts.iter().map(|(k, v)| format!("{} {}", k, v)).collect();
                 let bull = cs.bullish_ratio().unwrap_or(0.0);
                 s.push_str(&format!(

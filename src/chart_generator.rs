@@ -69,7 +69,7 @@ impl ChartGenerator {
             .x_labels(results.len())
             .x_label_formatter(&|x| {
                 if *x < results.len() {
-                    format!("{}", results[*x].code)
+                    results[*x].code.to_string()
                 } else {
                     String::new()
                 }
@@ -128,7 +128,7 @@ impl ChartGenerator {
         ))?;
 
         // 绘制统计条
-        let stats = vec![
+        let stats = [
             ("买入/加仓", buy_count, &GREEN),
             ("持有/观望", hold_count, &BLUE),
             ("卖出/减仓", sell_count, &RED),

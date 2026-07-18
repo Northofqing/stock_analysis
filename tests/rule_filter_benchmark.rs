@@ -624,6 +624,10 @@ fn classify_category(expected: Option<EventType>) -> &'static str {
         Some(EventType::Policy) => "Policy",
         Some(EventType::Accident) => "Accident",
         Some(EventType::Overseas) => "Overseas",
+        Some(EventType::Earnings) => "Earnings",
+        Some(EventType::MarketAction) => "MarketAction",
+        Some(EventType::AnalystView) => "AnalystView",
+        Some(EventType::Announcement) => "Announcement",
         Some(EventType::Other) => "Other",
     }
 }

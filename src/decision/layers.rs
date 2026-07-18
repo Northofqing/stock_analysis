@@ -24,22 +24,54 @@ pub struct Features {
 pub struct FeatureBuilder;
 
 impl FeatureBuilder {
-    pub fn build(metric_json: &str, push_time: DateTime<Local>, now: DateTime<Local>) -> Features {
-        let m: serde_json::Value = serde_json::from_str(metric_json).unwrap_or_default();
-        let vol = m.get("vol_ratio").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let chg = m.get("price_chg_pct").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let sector = m.get("sector").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let sub = m.get("push_subkind").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let kind = m.get("push_kind").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    pub fn build(
+        metric_json: &str,
+        push_time: DateTime<Local>,
+        now: DateTime<Local>,
+    ) -> Result<Features, String> {
+        if now < push_time {
+            return Err("push_time 位于未来".to_string());
+        }
+        let m: serde_json::Value = serde_json::from_str(metric_json)
+            .map_err(|error| format!("metric_json 解析失败: {error}"))?;
+        if !m.is_object() {
+            return Err("metric_json 必须是对象".to_string());
+        }
+        let finite_number = |field: &str| {
+            m.get(field)
+                .and_then(serde_json::Value::as_f64)
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| format!("缺少有效指标 {field}"))
+        };
+        let optional_string = |field: &str| -> Result<String, String> {
+            match m.get(field) {
+                None | Some(serde_json::Value::Null) => Ok(String::new()),
+                Some(value) => value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("指标 {field} 必须是非空字符串")),
+            }
+        };
+        let vol = finite_number("vol_ratio")?;
+        let chg = m
+            .get("price_chg_pct")
+            .and_then(serde_json::Value::as_f64)
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| "缺少有效指标 price_chg_pct".to_string())?;
+        let sector = optional_string("sector")?;
+        let sub = optional_string("push_subkind")?;
+        let kind = optional_string("push_kind")?;
         let age = (now - push_time).num_seconds() as f64 / 3600.0;
-        Features {
+        Ok(Features {
             vol_ratio: vol,
             price_chg_pct: chg,
             sector,
             push_subkind: sub,
             push_kind: kind,
-            push_age_hours: age.max(0.0),
-        }
+            push_age_hours: age,
+        })
     }
 }
 
@@ -55,7 +87,11 @@ pub struct ScoredStrategy {
 
 impl ScoreCalculator {
     pub fn aggregate(scores: Vec<ScoredStrategy>) -> Option<ScoredStrategy> {
-        scores.into_iter().max_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal))
+        scores.into_iter().max_by(|a, b| {
+            a.score
+                .partial_cmp(&b.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
     }
 }
 
@@ -64,8 +100,14 @@ pub struct DecisionPolicy;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Decision {
-    Approve { score: f64, strategy: String, reason: String },
-    Reject { reason: String },
+    Approve {
+        score: f64,
+        strategy: String,
+        reason: String,
+    },
+    Reject {
+        reason: String,
+    },
 }
 
 pub const DECISION_SCORE_THRESHOLD: f64 = 6.0;
@@ -75,10 +117,17 @@ pub const VOLUME_SURGE_MIN: f64 = 5.0;
 impl DecisionPolicy {
     pub fn decide(features: &Features, scored: Option<ScoredStrategy>) -> Decision {
         if features.push_subkind == "AuctionVolume" && features.vol_ratio < VOLUME_SURGE_MIN {
-            return Decision::Reject { reason: format!("早盘量能不足 vol={}", features.vol_ratio) };
+            return Decision::Reject {
+                reason: format!("早盘量能不足 vol={}", features.vol_ratio),
+            };
         }
         if features.push_age_hours > PUSH_AGE_MAX_HOURS {
-            return Decision::Reject { reason: format!("推送超 {}h (实际 {:.1}h)", PUSH_AGE_MAX_HOURS, features.push_age_hours) };
+            return Decision::Reject {
+                reason: format!(
+                    "推送超 {}h (实际 {:.1}h)",
+                    PUSH_AGE_MAX_HOURS, features.push_age_hours
+                ),
+            };
         }
         match scored {
             Some(s) if s.score >= DECISION_SCORE_THRESHOLD => Decision::Approve {
@@ -86,8 +135,15 @@ impl DecisionPolicy {
                 strategy: s.strategy_id,
                 reason: s.reason,
             },
-            Some(s) => Decision::Reject { reason: format!("综合分 {:.1} < 阈值 {:.1}", s.score, DECISION_SCORE_THRESHOLD) },
-            None => Decision::Reject { reason: "无 strategy 命中".to_string() },
+            Some(s) => Decision::Reject {
+                reason: format!(
+                    "综合分 {:.1} < 阈值 {:.1}",
+                    s.score, DECISION_SCORE_THRESHOLD
+                ),
+            },
+            None => Decision::Reject {
+                reason: "无 strategy 命中".to_string(),
+            },
         }
     }
 }
@@ -98,18 +154,29 @@ mod tests {
     use chrono::Local;
 
     fn make_features(vol: f64, age: f64, sub: &str) -> Features {
-        Features { vol_ratio: vol, price_chg_pct: 0.0, sector: "test".to_string(), push_subkind: sub.to_string(), push_kind: "Momentum".to_string(), push_age_hours: age }
+        Features {
+            vol_ratio: vol,
+            price_chg_pct: 0.0,
+            sector: "test".to_string(),
+            push_subkind: sub.to_string(),
+            push_kind: "Momentum".to_string(),
+            push_age_hours: age,
+        }
     }
 
     fn make_scored(score: f64) -> ScoredStrategy {
-        ScoredStrategy { strategy_id: "Momentum".to_string(), score, reason: "test".to_string() }
+        ScoredStrategy {
+            strategy_id: "Momentum".to_string(),
+            score,
+            reason: "test".to_string(),
+        }
     }
 
     #[test]
     fn feature_builder_parses_metric_json() {
         let now = Local::now();
         let metric = r#"{"vol_ratio": 6.5, "price_chg_pct": 1.5, "sector": "AI", "push_subkind": "Momentum"}"#;
-        let f = FeatureBuilder::build(metric, now, now);
+        let f = FeatureBuilder::build(metric, now, now).expect("valid metrics");
         assert_eq!(f.vol_ratio, 6.5);
         assert_eq!(f.push_subkind, "Momentum");
     }
@@ -117,8 +184,8 @@ mod tests {
     #[test]
     fn feature_builder_handles_bad_json() {
         let now = Local::now();
-        let f = FeatureBuilder::build("not json", now, now);
-        assert_eq!(f.vol_ratio, 0.0);
+        let error = FeatureBuilder::build("not json", now, now).expect_err("invalid JSON");
+        assert!(error.contains("metric_json 解析失败"));
     }
 
     #[test]

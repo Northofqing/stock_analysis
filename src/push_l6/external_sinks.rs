@@ -57,6 +57,8 @@ impl std::fmt::Display for HttpError {
 // HttpSink — 通用 HTTP 推送骨架
 // ============================================================================
 
+pub type MockSender = Arc<dyn Fn(&PushMessage) -> Result<(), HttpError> + Send + Sync>;
+
 /// HttpSink — 通过 HTTP POST 推送消息 (W6.2 骨架)
 ///
 /// 实际 W6.2 不实跑 HTTP (无 reqwest 调用), 留给 W8 集成
@@ -64,7 +66,7 @@ pub struct HttpSink {
     pub name: &'static str,
     pub config: HttpConfig,
     /// mock send_fn (测试用), None 表示真实 HTTP 推送
-    pub mock_send: Option<Arc<dyn Fn(&PushMessage) -> Result<(), HttpError> + Send + Sync>>,
+    pub mock_send: Option<MockSender>,
 }
 
 #[async_trait]
@@ -77,7 +79,11 @@ impl Sink for HttpSink {
         if let Some(mock) = &self.mock_send {
             match mock(msg) {
                 Ok(()) => {
-                    log::info!("[sink:{}] mock send ok: event_id={}", self.name, msg.event.event_id);
+                    log::info!(
+                        "[sink:{}] mock send ok: event_id={}",
+                        self.name,
+                        msg.event.event_id
+                    );
                     SinkResult::Ok
                 }
                 Err(e) => {
@@ -97,9 +103,11 @@ impl Sink for HttpSink {
                 "template_version": msg.template_version,
                 "user_id": msg.user_id,
                 "text": msg.text.body,
-            }).to_string();
+            })
+            .to_string();
             let client = crate::http_client::SHARED_HTTP_CLIENT.clone();
-            let req = client.post(&url)
+            let req = client
+                .post(&url)
                 .header("Content-Type", "application/json")
                 .header("User-Agent", "stock-analysis-monitor/v15.1")
                 .timeout(self.config.timeout)
@@ -112,7 +120,13 @@ impl Sink for HttpSink {
                 Ok(resp) => {
                     let status = resp.status();
                     let reason = resp.status().canonical_reason().unwrap_or("").to_string();
-                    log::error!("[sink:{}] POST {} HTTP {} {}", self.name, url, status, reason);
+                    log::error!(
+                        "[sink:{}] POST {} HTTP {} {}",
+                        self.name,
+                        url,
+                        status,
+                        reason
+                    );
                     SinkResult::Err(format!("HTTP {} {}", status, reason))
                 }
                 Err(e) => {
@@ -138,7 +152,7 @@ impl Sink for HttpSink {
 pub struct WechatSink {
     pub config: HttpConfig,
     pub webhook_key: String,
-    pub mock_send: Option<Arc<dyn Fn(&PushMessage) -> Result<(), HttpError> + Send + Sync>>,
+    pub mock_send: Option<MockSender>,
 }
 
 impl WechatSink {
@@ -153,7 +167,7 @@ impl WechatSink {
     pub fn with_mock(
         webhook_key: impl Into<String>,
         config: HttpConfig,
-        mock_send: Arc<dyn Fn(&PushMessage) -> Result<(), HttpError> + Send + Sync>,
+        mock_send: MockSender,
     ) -> Self {
         Self {
             config,
@@ -182,13 +196,20 @@ impl Sink for WechatSink {
             self.webhook_key
         );
 
-        log::debug!("[sink:wechat] 推送到 {}, body_len={}, event_id={}",
-            url, wechat_msg.to_string().len(), msg.event.event_id);
+        log::debug!(
+            "[sink:wechat] 推送到 {}, body_len={}, event_id={}",
+            url,
+            wechat_msg.to_string().len(),
+            msg.event.event_id
+        );
 
         if let Some(mock) = &self.mock_send {
             match mock(msg) {
                 Ok(()) => {
-                    log::info!("[sink:wechat] mock send ok: event_id={}", msg.event.event_id);
+                    log::info!(
+                        "[sink:wechat] mock send ok: event_id={}",
+                        msg.event.event_id
+                    );
                     SinkResult::Ok
                 }
                 Err(e) => {
@@ -206,7 +227,8 @@ impl Sink for WechatSink {
                 Err(e) => return SinkResult::Err(format!("[sink:wechat] serialize: {e}")),
             };
             let client = crate::http_client::SHARED_HTTP_CLIENT.clone();
-            let req = client.post(&url)
+            let req = client
+                .post(&url)
                 .header("Content-Type", "application/json")
                 .timeout(self.config.timeout)
                 .body(body);
@@ -242,7 +264,7 @@ impl Sink for WechatSink {
 pub struct FeishuSink {
     pub config: HttpConfig,
     pub webhook_url: String,
-    pub mock_send: Option<Arc<dyn Fn(&PushMessage) -> Result<(), HttpError> + Send + Sync>>,
+    pub mock_send: Option<MockSender>,
 }
 
 impl FeishuSink {
@@ -257,7 +279,7 @@ impl FeishuSink {
     pub fn with_mock(
         webhook_url: impl Into<String>,
         config: HttpConfig,
-        mock_send: Arc<dyn Fn(&PushMessage) -> Result<(), HttpError> + Send + Sync>,
+        mock_send: MockSender,
     ) -> Self {
         Self {
             config,
@@ -284,13 +306,20 @@ impl Sink for FeishuSink {
             }
         });
 
-        log::debug!("[sink:feishu] 推送到 {}, body_len={}, event_id={}",
-            self.webhook_url, feishu_msg.to_string().len(), msg.event.event_id);
+        log::debug!(
+            "[sink:feishu] 推送到 {}, body_len={}, event_id={}",
+            self.webhook_url,
+            feishu_msg.to_string().len(),
+            msg.event.event_id
+        );
 
         if let Some(mock) = &self.mock_send {
             match mock(msg) {
                 Ok(()) => {
-                    log::info!("[sink:feishu] mock send ok: event_id={}", msg.event.event_id);
+                    log::info!(
+                        "[sink:feishu] mock send ok: event_id={}",
+                        msg.event.event_id
+                    );
                     SinkResult::Ok
                 }
                 Err(e) => {
@@ -308,7 +337,8 @@ impl Sink for FeishuSink {
                 Err(e) => return SinkResult::Err(format!("[sink:feishu] serialize: {e}")),
             };
             let client = crate::http_client::SHARED_HTTP_CLIENT.clone();
-            let req = client.post(&self.webhook_url)
+            let req = client
+                .post(&self.webhook_url)
                 .header("Content-Type", "application/json; charset=utf-8")
                 .timeout(self.config.timeout)
                 .body(body);
@@ -318,7 +348,11 @@ impl Sink for FeishuSink {
                     SinkResult::Ok
                 }
                 Ok(resp) => {
-                    log::error!("[sink:feishu] POST {} HTTP {}", self.webhook_url, resp.status());
+                    log::error!(
+                        "[sink:feishu] POST {} HTTP {}",
+                        self.webhook_url,
+                        resp.status()
+                    );
                     SinkResult::Err(format!("feishu HTTP {}", resp.status()))
                 }
                 Err(e) => {
@@ -349,7 +383,7 @@ mod tests {
         let event = SignalEvent::new(
             crate::push_l1::SignalSource::LimitUp,
             "limit_up",
-            Some("600519".to_string()),
+            Some("TEST_CODE_600519".to_string()),
             Local::now(),
             SignalPayload::LimitUp(LimitUpPayload::default()),
             Severity::High,
@@ -363,12 +397,17 @@ mod tests {
         }
     }
 
-    fn success_mock() -> Arc<dyn Fn(&PushMessage) -> Result<(), HttpError> + Send + Sync> {
+    fn success_mock() -> MockSender {
         Arc::new(|_| Ok(()))
     }
 
-    fn fail_mock() -> Arc<dyn Fn(&PushMessage) -> Result<(), HttpError> + Send + Sync> {
-        Arc::new(|_| Err(HttpError { status: 500, message: "internal error".to_string() }))
+    fn fail_mock() -> MockSender {
+        Arc::new(|_| {
+            Err(HttpError {
+                status: 500,
+                message: "internal error".to_string(),
+            })
+        })
     }
 
     #[test]
@@ -459,7 +498,10 @@ mod tests {
     async fn feishu_sink_skeleton_returns_err() {
         // v15.1 A4.2: feishu 现在尝试真实 HTTP POST.
         // example.com 不在 8.8.8.8 / 默认 webhook 域, 期待 connect/DNS 错误.
-        let s = FeishuSink::new("https://this-host-should-not-exist-12345.invalid", HttpConfig::default());
+        let s = FeishuSink::new(
+            "https://this-host-should-not-exist-12345.invalid",
+            HttpConfig::default(),
+        );
         let r = s.send(&make_msg()).await;
         let _ = r;
     }
@@ -485,7 +527,10 @@ mod tests {
 
     #[test]
     fn http_error_display() {
-        let e = HttpError { status: 404, message: "not found".to_string() };
+        let e = HttpError {
+            status: 404,
+            message: "not found".to_string(),
+        };
         assert_eq!(format!("{}", e), "HTTP 404: not found");
     }
 }

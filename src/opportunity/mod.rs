@@ -1,3 +1,4 @@
+//! Registered business rules: BR-062, BR-069.
 //! Opportunity Context — 产业链挖掘 + 机会发现。
 //!
 //! 新闻事件 → 产业链映射 → 持仓影响评估 → 新标的推荐。
@@ -21,10 +22,12 @@ pub mod score; // 修复 P0-1: dual_score 评分模型
 pub mod virtual_reason; // v10 P0.2 BR-016: VirtualReason 枚举 + 主理由优先级
 pub mod winrate; // 修复 P1-2: winrate 二元化 // v10 P0.3 BC-1: real_alpha + A/B/C 置信度 + 5 要素信封
 
-use crate::data_provider::service;
 use crate::data_provider::assess_quality;
+use crate::data_provider::service;
 use crate::indicators::{calc_macd, MACD_FAST, MACD_SIGNAL, MACD_SLOW};
-use crate::opportunity::score::{compute_dual_score, ScoreInputs, ScorePart};
+use crate::opportunity::score::{
+    compute_dual_score_with_threshold, valid_push_threshold, ScoreInputs, ScorePart,
+};
 use crate::portfolio;
 use crate::search_service::SearchResult;
 
@@ -654,13 +657,19 @@ pub fn evaluate_hit_for_push(
     web_results: &[SearchResult],
 ) -> (u8, Option<u8>, Vec<ScorePart>, bool, String) {
     let inputs = build_score_inputs_from_hit(hit, flash_titles, web_results);
-    let score = compute_dual_score(&inputs, "v9.1-push-gate");
     let cfg = crate::config::get_monitor_config();
     let threshold = cfg.opportunity_push_threshold;
-    let passed = score.event_risk_score >= threshold;
+    let score = compute_dual_score_with_threshold(&inputs, "v9.1-push-gate", threshold);
+    let threshold_valid = valid_push_threshold(threshold);
+    let passed = threshold_valid && score.event_risk_score >= threshold;
     let reason = format!(
-        "event_risk={}/{} trade_signal={:?} passed={} notes={:?}",
-        score.event_risk_score, threshold, score.trade_signal_score, passed, score.notes,
+        "event_risk={}/{} threshold_valid={} trade_signal={:?} passed={} notes={:?}",
+        score.event_risk_score,
+        threshold,
+        threshold_valid,
+        score.trade_signal_score,
+        passed,
+        score.notes,
     );
     (
         score.event_risk_score,
@@ -675,6 +684,7 @@ pub fn evaluate_hit_for_push(
 /// - final >= 75: 实时推送 (realtime)
 /// - 60 <= final < 75: 入候选池 (candidate pool, 复盘查阅)
 /// - final < 60: 不推 (suppressed)
+///
 /// 注意: NS3 约束 event_risk_score 是唯一"风险评估"维度; trade_signal_score 触发 [实盘信号] 标签需另行评估
 pub fn push_tier(event_risk_score: u8, push_threshold: u8) -> &'static str {
     if event_risk_score >= push_threshold {
@@ -876,7 +886,7 @@ pub struct OpportunityScan {
     pub news_ranked_text: String,
 }
 
-/// 运行一次产业链扫描，返回「产业链」与「持仓影响」分离的结果
+// 运行一次产业链扫描会返回产业链正文与持仓影响分离的结果。
 // ═══════════════════════════════════════════════════════════
 // v9.4.24: 事件抽取公共逻辑 — rules-only 路径
 // ═══════════════════════════════════════════════════════════
@@ -892,9 +902,19 @@ fn collect_events_from_web(
     // B-003: 跨批次去重 — 从 DB 加载最近 2 天的事件 (simhash + title),
     // 用于 simhash 汉明距 / LCS 去重. 防止「苹果折叠屏」类事件跨日重复推送.
     let seen_events: Vec<crate::database::concepts::EventSeenEntry> =
-        crate::database::DatabaseManager::try_get()
-            .map(|db| db.get_recent_event_seen(2))
-            .unwrap_or_default();
+        match crate::database::DatabaseManager::try_get() {
+            Some(db) => match db.get_recent_event_seen(2) {
+                Ok(events) => events,
+                Err(error) => {
+                    log::error!("[Opportunity][BR-112] EventSeen read rejected: {error}");
+                    Vec::new()
+                }
+            },
+            None => {
+                log::error!("[Opportunity][BR-112] EventSeen database unavailable");
+                Vec::new()
+            }
+        };
     let seen_pairs: Vec<(u64, String)> = seen_events
         .iter()
         .map(|e| (e.simhash, e.title.clone()))
@@ -929,7 +949,11 @@ fn collect_events_from_web(
         .collect();
     if !detected_for_db.is_empty() {
         if let Some(db) = crate::database::DatabaseManager::try_get() {
-            db.save_event_seen(&detected_for_db);
+            if let Err(error) = db.save_event_seen(&detected_for_db) {
+                log::error!("[Opportunity][BR-112] EventSeen write rejected: {error}");
+            }
+        } else {
+            log::error!("[Opportunity][BR-112] EventSeen write database unavailable");
         }
     }
 
@@ -1099,7 +1123,11 @@ pub async fn run_opportunity_scan() -> OpportunityScan {
             })
             .collect();
         if let Some(db) = crate::database::DatabaseManager::try_get() {
-            db.save_board_rotations(&today, &entries);
+            if let Err(error) = db.save_board_rotations(&today, &entries) {
+                log::error!("[Opportunity][BR-112] board rotation write rejected: {error}");
+            }
+        } else {
+            log::error!("[Opportunity][BR-112] board rotation database unavailable");
         }
     }
     // P2-News Commit 3: 影子模式跑新 ranker, log 对比 + 收集 ranked 列表
@@ -1319,7 +1347,7 @@ pub async fn run_post_close_candidates(top_n: usize) -> String {
     // 失败 / 离线 / 无 provider → 降级到 chain_mapper, 路径信息写入推送文本.
     //
     // path_status: 写到推送文本头部, 让用户看到本轮走的是 AI 还是降级
-    let mut path_status: String = "🔧 降级 chain_mapper".to_string();
+    let path_status: String;
     {
         let llm_registry = crate::llm::LlmRegistry::from_env();
         if let Some(provider) = llm_registry.select("ticker_extraction") {
@@ -1467,7 +1495,17 @@ pub async fn run_post_close_candidates(top_n: usize) -> String {
             crate::data_provider::money_flow::fetch_flow_history_async(&client, &code, 8),
             service::service().get_kline(&code, 80),
         );
-        let fin = fin_result;
+        let fin = match fin_result {
+            Ok(financials) => financials,
+            Err(error) => {
+                log::warn!(
+                    "[PostClose][BR-115] {} 财务来源失败，拒绝候选: {}",
+                    code,
+                    error
+                );
+                continue;
+            }
+        };
         let (flow, flow_fetch_error) = match flow_result {
             Ok(s) => {
                 flow_ok_count += 1;
@@ -1816,33 +1854,33 @@ mod tests {
         use crate::portfolio::Position;
         let positions = vec![
             Position {
-                code: "600703".into(),
+                code: "TEST_CODE_600703".into(),
                 name: "三安光电".into(),
                 shares: 1000,
                 cost_price: 10.0,
-                hard_stop: 9.0,
+                hard_stop: Some(9.0),
                 added_at: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
                 status: crate::portfolio::PositionStatus::Holding,
                 sector: "半导体".into(),
                 ..Default::default()
             },
             Position {
-                code: "002049".into(),
+                code: "TEST_CODE_002049".into(),
                 name: "紫光国微".into(),
                 shares: 500,
                 cost_price: 100.0,
-                hard_stop: 90.0,
+                hard_stop: Some(90.0),
                 added_at: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
                 status: crate::portfolio::PositionStatus::Holding,
                 sector: "半导体".into(),
                 ..Default::default()
             },
             Position {
-                code: "600276".into(),
+                code: "TEST_CODE_600276".into(),
                 name: "恒瑞医药".into(),
                 shares: 800,
                 cost_price: 50.0,
-                hard_stop: 45.0,
+                hard_stop: Some(45.0),
                 added_at: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
                 status: crate::portfolio::PositionStatus::Holding,
                 sector: "医药".into(),
@@ -1864,11 +1902,11 @@ mod tests {
         // 修复: "其他" sector 必过滤, 不产生查询
         use crate::portfolio::Position;
         let positions = vec![Position {
-            code: "600000".into(),
+            code: "TEST_CODE_600000".into(),
             name: "浦发银行".into(),
             shares: 1000,
             cost_price: 10.0,
-            hard_stop: 9.0,
+            hard_stop: Some(9.0),
             added_at: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
             status: crate::portfolio::PositionStatus::Watching,
             sector: "其他".into(),
@@ -1890,7 +1928,7 @@ mod tests {
                 name: format!("测试{}", i),
                 shares: 100,
                 cost_price: 10.0,
-                hard_stop: 9.0,
+                hard_stop: Some(9.0),
                 added_at: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
                 status: crate::portfolio::PositionStatus::Holding,
                 sector: format!("行业{}", i),

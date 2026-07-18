@@ -11,9 +11,9 @@
 //! - impact: 影响打分 (Phase D4)
 //! - dispatcher: 推 v14 (Phase D5)
 
-pub mod ipo;
 pub mod aggregator;
-pub mod impact;
 pub mod dispatcher;
+pub mod impact;
+pub mod ipo;
 pub mod sink;
 pub mod stock_mapper;

@@ -143,9 +143,9 @@ mod tests {
     fn single_chain_aggregate() {
         let input = LimitChainInput {
             stocks: vec![
-                s("688001", "龙头", "AI算力", 4, 4, false),
-                s("688002", "次龙", "AI算力", 2, 2, false),
-                s("688003", "首板", "AI算力", 1, 1, true),
+                s("TEST_CODE_688001", "龙头", "AI算力", 4, 4, false),
+                s("TEST_CODE_688002", "次龙", "AI算力", 2, 2, false),
+                s("TEST_CODE_688003", "首板", "AI算力", 1, 1, true),
             ],
             source_complete: true,
         };
@@ -165,8 +165,8 @@ mod tests {
     fn multiple_chains_split() {
         let input = LimitChainInput {
             stocks: vec![
-                s("000001", "A1", "AI", 3, 3, false),
-                s("000002", "B1", "机器人", 2, 2, false),
+                s("TEST_CODE_000001", "A1", "AI", 3, 3, false),
+                s("TEST_CODE_000002", "B1", "机器人", 2, 2, false),
             ],
             source_complete: true,
         };
@@ -182,8 +182,8 @@ mod tests {
     fn leader_selection_higher_board_wins() {
         let input = LimitChainInput {
             stocks: vec![
-                s("000001", "A", "X", 1, 1, true),
-                s("000002", "B", "X", 3, 3, false),
+                s("TEST_CODE_000001", "A", "X", 1, 1, true),
+                s("TEST_CODE_000002", "B", "X", 3, 3, false),
             ],
             source_complete: true,
         };

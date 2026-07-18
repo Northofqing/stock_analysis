@@ -1,3 +1,4 @@
+//! Registered business rules: BR-067.
 //! 新闻 → 产业链映射。
 //!
 //! 关键词规则表（优先）+ AI 推理兜底（规则未命中时）+ 动态板块成份股解析。
@@ -68,7 +69,7 @@ const DEFAULT_CHAIN_RULES_TOML: &str = include_str!("../../config/chain.toml");
 fn normalize_chain_rules(
     mut rules: Vec<(Vec<String>, String, String, String, u32, bool)>,
 ) -> Vec<(Vec<String>, String, String, String, u32, bool)> {
-    rules.sort_by(|a, b| b.4.cmp(&a.4));
+    rules.sort_by_key(|rule| std::cmp::Reverse(rule.4));
     rules
 }
 
@@ -93,9 +94,9 @@ fn map_chain_rules(
         .collect()
 }
 
-fn parse_chain_rules_toml(
-    toml_text: &str,
-) -> Option<Vec<(Vec<String>, String, String, String, u32, bool)>> {
+type ChainRuleTuple = (Vec<String>, String, String, String, u32, bool);
+
+fn parse_chain_rules_toml(toml_text: &str) -> Option<Vec<ChainRuleTuple>> {
     let file_cfg = toml::from_str::<crate::config::ChainRulesFile>(toml_text).ok()?;
     Some(normalize_chain_rules(map_chain_rules(Arc::new(
         file_cfg.rules,
@@ -103,7 +104,7 @@ fn parse_chain_rules_toml(
 }
 
 /// 加载规则：优先 toml，不可用则回退编译期内嵌 toml。按 priority 降序返回。
-fn chain_rules() -> Vec<(Vec<String>, String, String, String, u32, bool)> {
+fn chain_rules() -> Vec<ChainRuleTuple> {
     // 1) 优先使用已热加载进内存的配置（通常由 config::load_all 填充）
     if let Some(config_rules) = crate::config::get_chain_rules() {
         log_disabled_themes(&config_rules);
@@ -187,6 +188,19 @@ pub fn map_news_to_chains(title: &str) -> Vec<ChainHit> {
         });
     }
     hits
+}
+
+/// Returns whether a deterministic rule hit came from a generic fallback rule.
+///
+/// `ChainHit` predates the `generic` configuration flag, so resolve it against
+/// the same canonical rule table instead of guessing from display text.
+pub fn is_generic_rule_hit(hit: &ChainHit) -> bool {
+    hit.source == ChainSource::Rule
+        && chain_rules()
+            .iter()
+            .find(|(_, chain, _, _, _, _)| chain == &hit.chain)
+            .map(|(_, _, _, _, _, generic)| *generic)
+            .unwrap_or(false)
 }
 
 /// 新闻 → 产业链（规则优先，未命中则 AI 兜底）。
@@ -360,10 +374,7 @@ fn title_has_trigger_word(title: &str) -> bool {
 ///
 /// 用 6 位 A 股代码 regex + component name 子串匹配. 任一命中即真相关.
 /// 例: "2025年报预减: Meta..." 找不到 "600879" 等 → 排除, 不再误中 "2025年报预减" 板块.
-fn news_relevant_to_board(
-    title: &str,
-    movers: &[StockInfo],
-) -> bool {
+fn news_relevant_to_board(title: &str, movers: &[StockInfo]) -> bool {
     // 1) 6 位 A 股代码 regex (避开 "2025" / "11" 这类年份数字)
     // 用 chars() 避免 UTF-8 边界 panic
     let chars: Vec<char> = title.chars().collect();
@@ -388,11 +399,9 @@ fn news_relevant_to_board(
 /// 检查标题是否提及某板块 (支持 "房地产板块..." 命中 "房地产开发" 板块).
 ///
 /// 匹配规则 (按板块名长度分支):
-/// - ≥3 字符 (e.g. "房地产开发", "PCB", "机器人概念"):
-///     1) 直接包含 (normalized), 或
-///     2) 标题含板块名前缀 (≥3 字符), e.g. "房地产板块短线拉升" 命中 "房地产开发" (前缀 "房地产")
+/// - ≥3 字符：直接包含 normalized 名称，或标题包含至少 3 字符的板块名前缀。
 /// - 2 字符 (e.g. "银行", "白酒", "地产"):
-///     必须紧邻 "板块" 词 (e.g. "银行板块拉升" 命中, "房地产板块拉升" 不命中 "地产")
+///   必须紧邻 "板块" 词 (e.g. "银行板块拉升" 命中, "房地产板块拉升" 不命中 "地产")
 /// - 1 字符: 拒绝匹配 (噪声太大)
 ///
 /// 返回 true 表示标题提到该板块.
@@ -492,7 +501,8 @@ where
             if !news_relevant_to_board(title, &movers) {
                 log::debug!(
                     "[FIX-B-002] skip board '{}' for title '{}' (no stock relevance)",
-                    board.name, title
+                    board.name,
+                    title
                 );
                 continue;
             }
@@ -826,14 +836,7 @@ pub fn resolve_stocks(hits: &mut [ChainHit]) {
 
 fn normalize_board_text(text: &str) -> String {
     text.to_lowercase()
-        .replace(' ', "")
-        .replace('-', "")
-        .replace('_', "")
-        .replace('/', "")
-        .replace('（', "")
-        .replace('）', "")
-        .replace('(', "")
-        .replace(')', "")
+        .replace([' ', '-', '_', '/', '（', '）', '(', ')'], "")
 }
 
 fn matches_keyword_synonym(board_name: &str, keyword: &str) -> bool {
@@ -1157,6 +1160,7 @@ mod tests {
         BoardStock {
             code: code.to_string(),
             name: name.to_string(),
+            price: 10.0,
             change_pct,
             amount: 0.0,
             vol_ratio: 1.0,
@@ -1170,8 +1174,8 @@ mod tests {
         let titles = vec!["房地产板块短线拉升，合肥城建涨停成交额3.24亿元".to_string()];
         let boards = vec![make_board("房地产开发", 2.5, 1.5)];
         let components = vec![
-            make_stock("002208", "合肥城建", 10.0), // 异动股, 纳入
-            make_stock("000002", "万科A", 2.0),     // 涨幅不足, 过滤
+            make_stock("TEST_CODE_002208", "合肥城建", 10.0), // 异动股, 纳入
+            make_stock("TEST_CODE_000002", "万科A", 2.0),     // 涨幅不足, 过滤
         ];
         let components_for = |code: &str| -> Vec<BoardStock> {
             if code == "BK_房地产开发" {
@@ -1204,7 +1208,7 @@ mod tests {
             "logic 应保留原始新闻标题"
         );
         assert_eq!(hit.stocks.len(), 1, "涨幅 >= 5% 的只有 002208 一只");
-        assert_eq!(hit.stocks[0].code, "002208");
+        assert_eq!(hit.stocks[0].code, "TEST_CODE_002208");
         assert_eq!(
             hit.fund_flow_pct,
             Some(1.5),
@@ -1217,7 +1221,7 @@ mod tests {
     fn test_extract_board_rotation_filters_negative_board() {
         let titles = vec!["房地产板块短线拉升，合肥城建涨停".to_string()];
         let boards = vec![make_board("房地产开发", -1.5, 2.0)]; // 下跌
-        let components = vec![make_stock("002208", "合肥城建", 10.0)];
+        let components = vec![make_stock("TEST_CODE_002208", "合肥城建", 10.0)];
         let components_for = |_: &str| components.clone();
 
         let hits = extract_board_rotation_with(&titles, &boards, components_for);
@@ -1229,7 +1233,7 @@ mod tests {
     fn test_extract_board_rotation_filters_zero_main_net() {
         let titles = vec!["房地产板块短线拉升".to_string()];
         let boards = vec![make_board("房地产开发", 2.0, 0.0)]; // 主力未流入
-        let components = vec![make_stock("002208", "合肥城建", 10.0)];
+        let components = vec![make_stock("TEST_CODE_002208", "合肥城建", 10.0)];
         let components_for = |_: &str| components.clone();
 
         let hits = extract_board_rotation_with(&titles, &boards, components_for);
@@ -1244,7 +1248,7 @@ mod tests {
             "房地产板块下跌 3%".to_string(),      // 下跌
         ];
         let boards = vec![make_board("房地产开发", 2.0, 1.0)];
-        let components = vec![make_stock("002208", "合肥城建", 10.0)];
+        let components = vec![make_stock("TEST_CODE_002208", "合肥城建", 10.0)];
         let components_for = |_: &str| components.clone();
 
         let hits = extract_board_rotation_with(&titles, &boards, components_for);
@@ -1260,7 +1264,7 @@ mod tests {
             "房地产开发今日表现强势".to_string(),
         ];
         let boards = vec![make_board("房地产开发", 2.5, 1.5)];
-        let components = vec![make_stock("002208", "合肥城建", 10.0)];
+        let components = vec![make_stock("TEST_CODE_002208", "合肥城建", 10.0)];
         let components_for = |_: &str| components.clone();
 
         let hits = extract_board_rotation_with(&titles, &boards, components_for);
@@ -1279,8 +1283,8 @@ mod tests {
             make_board("房地产开发", 2.5, 1.5),
             make_board("银行", 1.8, 0.8),
         ];
-        let components_1 = vec![make_stock("002208", "合肥城建", 10.0)];
-        let components_2 = vec![make_stock("600036", "招商银行", 5.5)];
+        let components_1 = vec![make_stock("TEST_CODE_002208", "合肥城建", 10.0)];
+        let components_2 = vec![make_stock("TEST_CODE_600036", "招商银行", 5.5)];
         let components_for = |code: &str| -> Vec<BoardStock> {
             if code == "BK_房地产开发" {
                 components_1.clone()
@@ -1304,8 +1308,8 @@ mod tests {
         let titles = vec!["房地产板块短线拉升".to_string()];
         let boards = vec![make_board("房地产开发", 2.5, 1.5)];
         let components = vec![
-            make_stock("000002", "万科A", 2.0), // 全部 < 5%
-            make_stock("600048", "保利发展", 3.5),
+            make_stock("TEST_CODE_000002", "万科A", 2.0), // 全部 < 5%
+            make_stock("TEST_CODE_600048", "保利发展", 3.5),
         ];
         let components_for = |_: &str| components.clone();
 
@@ -1335,7 +1339,7 @@ mod tests {
             "强势",
         ];
         let boards = vec![make_board("房地产开发", 2.0, 1.0)];
-        let components = vec![make_stock("002208", "合肥城建", 10.0)];
+        let components = vec![make_stock("TEST_CODE_002208", "合肥城建", 10.0)];
         let components_for = |_: &str| components.clone();
 
         for trig in triggers {
@@ -1354,7 +1358,7 @@ mod tests {
     fn test_extract_board_rotation_short_board_name_skipped() {
         let titles = vec!["房地产板块短线拉升".to_string()];
         let boards = vec![make_board("地产", 2.5, 1.5)]; // 仅 2 字, 应被跳过
-        let components = vec![make_stock("002208", "合肥城建", 10.0)];
+        let components = vec![make_stock("TEST_CODE_002208", "合肥城建", 10.0)];
         let components_for = |_: &str| components.clone();
 
         let hits = extract_board_rotation_with(&titles, &boards, components_for);
@@ -1369,7 +1373,7 @@ mod tests {
     fn test_extract_board_rotation_board_not_in_list() {
         let titles = vec!["房地产板块短线拉升".to_string()];
         let boards = vec![make_board("机器人概念", 2.5, 1.5)]; // 列表里没有房地产
-        let components = vec![make_stock("002208", "合肥城建", 10.0)];
+        let components = vec![make_stock("TEST_CODE_002208", "合肥城建", 10.0)];
         let components_for = |_: &str| components.clone();
 
         let hits = extract_board_rotation_with(&titles, &boards, components_for);

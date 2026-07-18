@@ -1,3 +1,4 @@
+//! Registered business rules: BR-064.
 //! Sina 财经数据提供者 (骨架版, Task 2)
 //!
 //! 通过 Sina JSONP 接口抓取日 K 线数据.
@@ -6,6 +7,7 @@
 //! 实时行情 (hq_str) 与股票名解析在后续 Task 中实现.
 
 use anyhow::{anyhow, Result};
+use chrono::{FixedOffset, NaiveDateTime, TimeZone, Utc};
 use encoding_rs::GBK;
 use serde::Deserialize;
 
@@ -67,11 +69,12 @@ pub struct SinaHqQuote {
     pub low: f64,
     pub volume: f64,
     pub amount: f64,
+    pub source_time: chrono::DateTime<Utc>,
 }
 
 /// 解析 `var hq_str_xx="name,open,prev_close,current,high,low,bid,ask,volume,amount,...";`
 ///
-/// 至少需要 10 个字段 (含 name + 9 个数值), 少于则报错.
+/// 至少需要 32 个字段，字段 30/31 是来源日期和时间；少于则报错。
 pub fn parse_hq_str(body: &str, code: &str) -> Result<SinaHqQuote> {
     // 提取第一对 `"..."` 内的 CSV.
     let start = body.find('"').ok_or_else(|| anyhow!("Sina hq: 无引号"))?;
@@ -83,19 +86,50 @@ pub fn parse_hq_str(body: &str, code: &str) -> Result<SinaHqQuote> {
     }
     let csv = &body[start + 1..end];
     let fields: Vec<&str> = csv.split(',').collect();
-    if fields.len() < 10 {
-        return Err(anyhow!("Sina hq {}: 字段数 {} < 10", code, fields.len()));
+    if fields.len() < 32 {
+        return Err(anyhow!("Sina hq {}: 字段数 {} < 32", code, fields.len()));
     }
-    Ok(SinaHqQuote {
+    let parse = |index: usize, field: &str| -> Result<f64> {
+        let value = fields[index]
+            .parse::<f64>()
+            .map_err(|error| anyhow!("Sina hq {code}: {field} 非法: {error}"))?;
+        if value.is_finite() && value >= 0.0 {
+            Ok(value)
+        } else {
+            Err(anyhow!("Sina hq {code}: {field} 非法值 {value}"))
+        }
+    };
+    let source_local = NaiveDateTime::parse_from_str(
+        &format!("{} {}", fields[30], fields[31]),
+        "%Y-%m-%d %H:%M:%S",
+    )
+    .map_err(|error| anyhow!("Sina hq {code}: source_time 非法: {error}"))?;
+    let shanghai = FixedOffset::east_opt(8 * 60 * 60)
+        .ok_or_else(|| anyhow!("Sina hq {code}: 无法构造 UTC+8 时区"))?;
+    let source_time = shanghai
+        .from_local_datetime(&source_local)
+        .single()
+        .map(|value| value.with_timezone(&Utc))
+        .ok_or_else(|| anyhow!("Sina hq {code}: source_time 不唯一"))?;
+    let quote = SinaHqQuote {
         name: fields[0].to_string(),
-        open: fields[1].parse().unwrap_or(0.0),
-        yesterday_close: fields[2].parse().unwrap_or(0.0),
-        current: fields[3].parse().unwrap_or(0.0),
-        high: fields[4].parse().unwrap_or(0.0),
-        low: fields[5].parse().unwrap_or(0.0),
-        volume: fields[8].parse().unwrap_or(0.0),
-        amount: fields[9].parse().unwrap_or(0.0),
-    })
+        open: parse(1, "open")?,
+        yesterday_close: parse(2, "yesterday_close")?,
+        current: parse(3, "current")?,
+        high: parse(4, "high")?,
+        low: parse(5, "low")?,
+        volume: parse(8, "volume")?,
+        amount: parse(9, "amount")?,
+        source_time,
+    };
+    if quote.yesterday_close <= 0.0 || quote.current <= 0.0 {
+        return Err(anyhow!(
+            "Sina hq {code}: required prices must be positive (prev={}, current={})",
+            quote.yesterday_close,
+            quote.current
+        ));
+    }
+    Ok(quote)
 }
 
 impl SinaProvider {
@@ -162,56 +196,12 @@ pub fn parse_kline_body(body: &str, code: &str) -> Result<Vec<KlineData>> {
     let json = &body[start..=end];
     let rows: Vec<SinaKlineRow> =
         serde_json::from_str(json).map_err(|e| anyhow!("Sina K线 JSON parse 失败: {e}"))?;
-    Ok(rows.into_iter().map(|r| map_kline_row(r, code)).collect())
-}
-
-/// 将单条 Sina K线行映射到标准 `KlineData` 结构.
-fn map_kline_row(r: SinaKlineRow, _code: &str) -> KlineData {
-    use chrono::NaiveDate;
-    let date = NaiveDate::parse_from_str(&r.day, "%Y-%m-%d")
-        .unwrap_or_else(|_| chrono::Local::now().date_naive());
-    let open = r.open.parse().unwrap_or(0.0);
-    let high = r.high.parse().unwrap_or(0.0);
-    let low = r.low.parse().unwrap_or(0.0);
-    let close = r.close.parse().unwrap_or(0.0);
-    let volume = r.volume.parse().unwrap_or(0.0);
-    let pct_chg = if open > 0.0 {
-        (close - open) / open * 100.0
-    } else {
-        0.0
-    };
-    KlineData {
-        date,
-        open,
-        high,
-        low,
-        close,
-        volume,
-        amount: 0.0, // Sina K线 API 不直接给 amount
-        pct_chg,
-        intraday_price: None,
-        settled: true,
-        pe_ratio: None,
-        pb_ratio: None,
-        turnover_rate: None,
-        market_cap: None,
-        circulating_cap: None,
-        eps: None,
-        roe: None,
-        revenue_yoy: None,
-        net_profit_yoy: None,
-        gross_margin: None,
-        net_margin: None,
-        sharpe_ratio: None,
-        financials_history: None,
-        valuation_history: None,
-        consensus: None,
-        industry: None,
-        is_limit_up: false,
-        is_limit_down: false,
-        is_suspended: false,
-        adjust: super::AdjustType::None,
+    if rows.is_empty() {
+        return Ok(Vec::new());
     }
+    Err(anyhow!(
+        "Sina K线 {code}: 协议不提供必填 amount 字段，BR-092 禁止补零或估算"
+    ))
 }
 
 impl DataProvider for SinaProvider {
@@ -233,23 +223,27 @@ impl DataProvider for SinaProvider {
     fn get_realtime_quote(&self, code: &str) -> Result<Option<RealtimeQuote>> {
         // sync DataProvider trait 内部跑 async — 用 crate 共享 helper
         let hq = crate::block_on_async(self.fetch_hq_async(code))?;
-        let pct_chg = if hq.yesterday_close > 0.0 {
-            (hq.current - hq.yesterday_close) / hq.yesterday_close * 100.0
-        } else {
-            0.0
-        };
+        let pct_chg = (hq.current - hq.yesterday_close) / hq.yesterday_close * 100.0;
+        let limits = super::limit_status::LimitStatusCalculator::new().calculate(
+            code,
+            hq.yesterday_close,
+            &hq.name,
+        );
         Ok(Some(RealtimeQuote {
             code: code.to_string(),
             name: hq.name,
             price: hq.current,
             pct_chg,
-            pe_ratio: 0.0,
-            pb_ratio: 0.0,
-            turnover_rate: 0.0,
-            market_cap: 0.0,
-            circulating_cap: 0.0,
-            volume: hq.volume,
-            amount: hq.amount,
+            pe_ratio: None,
+            pb_ratio: None,
+            turnover_rate: None,
+            market_cap: None,
+            circulating_cap: None,
+            volume: Some(hq.volume),
+            amount: Some(hq.amount),
+            limit_up_price: Some(limits.limit_up_price),
+            limit_down_price: Some(limits.limit_down_price),
+            source_time: hq.source_time,
         }))
     }
 }
@@ -257,5 +251,18 @@ impl DataProvider for SinaProvider {
 impl Default for SinaProvider {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod strict_kline_tests {
+    use super::*;
+
+    #[test]
+    fn br092_daily_kline_is_unavailable_without_source_amount() {
+        let body = r#"callback([{"day":"2026-07-16","open":"10","high":"10.2","low":"9.8","close":"10.1","volume":"1000"}])"#;
+        let error = parse_kline_body(body, "000001")
+            .expect_err("Sina daily rows do not carry a real amount field");
+        assert!(error.to_string().contains("amount"));
     }
 }

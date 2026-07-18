@@ -1,3 +1,4 @@
+//! Registered business rules: BR-076.
 //! v12 PR1 账户模式三态判定 (AccountState).
 //!
 //! 设计: 纯函数 + 数据入参, 不直接读 portfolio DB.
@@ -15,25 +16,6 @@
 
 use super::action_gate::AccountMode;
 use chrono::NaiveTime;
-use std::sync::OnceLock;
-
-/// v17.1 review F9 fix: `PUSH_NORMAL_FORCE` env 缓存, 避免每次 `evaluate()`
-/// syscall getenv (热路径).
-///
-/// 一次性 read, OnceLock 后 O(1) bool 查询. v15.x 4 铁律: 默认出声 — 此 helper
-/// 仅在显式 `PUSH_NORMAL_FORCE=1` 时返回 `true`, 未设置时 `false` 走正常评估.
-static PUSH_NORMAL_FORCE_ENABLED: OnceLock<bool> = OnceLock::new();
-
-/// 检查是否启用了 PUSH_NORMAL_FORCE 临时旁路 (env-var 一次性 read).
-///
-/// **真风险控制应该在 broker 下单层做, 不在通知层** — 本 helper 仅服务于
-/// v17.0 临时旁路: 仓位超限导致 Frozen → 推送被 L5 全 deny → 用户看不到消息.
-/// 治本已在 commit 460ab25 (frozen_mode_respect) 落地; 本 helper 保留逃生口.
-pub fn is_push_normal_forced() -> bool {
-    *PUSH_NORMAL_FORCE_ENABLED.get_or_init(|| {
-        std::env::var("PUSH_NORMAL_FORCE").ok().as_deref() == Some("1")
-    })
-}
 
 /// 评估阈值 (code-level const fallback, 可被 config 覆盖)
 pub mod thresholds {
@@ -117,19 +99,6 @@ pub fn evaluate(
     prev: Option<AccountMode>,
     thresholds: &ModeThresholds,
 ) -> ModeEvaluation {
-    // v17.0 临时旁路: PUSH_NORMAL_FORCE=1 启动 → 跳过 Frozen 检查, 强制 Normal
-    // 用途: 仓位超限导致 Frozen → 推送被 L5 全 deny → 用户看不到任何消息
-    //       这违反 4 铁律"默认值必须是出声状态", 临时让 evaluate() 直接返 Normal
-    //       真风险控制应该在 broker 下单层做, 不在通知层 (v17.1 治本)
-    // F9 fix: 用 OnceLock 缓存的 helper 代替每次 syscall getenv (热路径优化).
-    if is_push_normal_forced() {
-        return ModeEvaluation {
-            mode: AccountMode::Normal,
-            trigger_reason: Some("PUSH_NORMAL_FORCE=1 临时旁路 (v17.1 治本)".to_string()),
-            prev_mode: prev,
-        };
-    }
-
     // 0. Frozen 状态保持优先 (BR-021 强制: 等下一交易日盘前重置, 不运行时回退)
     //    即使数据缺失也不能掩盖 Frozen 状态 — 会污染审计 + 误导下游 RiskMode
     if matches!(prev, Some(AccountMode::Frozen)) {
@@ -460,33 +429,10 @@ mod tests {
         let at_8_30 = NaiveTime::from_hms_opt(8, 30, 0).unwrap();
         // 窗口内, 但 prev 是 Normal / ReduceOnly / None → 都 false
         assert!(!should_reset_at_8_30(Some(AccountMode::Normal), at_8_30));
-        assert!(!should_reset_at_8_30(Some(AccountMode::ReduceOnly), at_8_30));
+        assert!(!should_reset_at_8_30(
+            Some(AccountMode::ReduceOnly),
+            at_8_30
+        ));
         assert!(!should_reset_at_8_30(None, at_8_30));
-    }
-
-    // ============== F9: PUSH_NORMAL_FORCE OnceLock 缓存测试 ==============
-
-    #[test]
-    fn is_push_normal_forced_default_false_when_env_unset() {
-        // 验证: helper() == std::env::var("PUSH_NORMAL_FORCE").map(|v| v == "1").unwrap_or(false)
-        // 即 helper 与直接读 env 一致 (OnceLock 缓存等于首次读值). 不假设测试环境
-        // 是否 set 了 env — 任何状态下都应一致 (Path D: 不依赖外部副作用).
-        let expected = std::env::var("PUSH_NORMAL_FORCE")
-            .ok()
-            .as_deref()
-            == Some("1");
-        let actual = is_push_normal_forced();
-        assert_eq!(actual, expected, "helper 必须等于直接 env 读取结果");
-    }
-
-    #[test]
-    fn is_push_normal_forced_cached_idempotent() {
-        // OnceLock 保证多次调用结果一致 (无需 syscall).
-        // 任何环境下, helper 是 stable boolean (process-global cache).
-        let first = is_push_normal_forced();
-        let second = is_push_normal_forced();
-        let third = is_push_normal_forced();
-        assert_eq!(first, second);
-        assert_eq!(second, third);
     }
 }

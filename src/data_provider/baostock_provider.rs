@@ -1,3 +1,4 @@
+//! Registered business rules: BR-065.
 //! Baostock 数据源实现 (Task 13 — TCP 协议重写, 修复 C1 critical bug).
 //!
 //! **协议**: TCP socket 自定义协议, 不是 HTTP!
@@ -24,7 +25,7 @@ use chrono::NaiveDate;
 use flate2::read::ZlibDecoder;
 use std::io::Read;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
@@ -40,7 +41,7 @@ pub const BAOSTOCK_VERSION: &str = "00.9.20";
 pub const BAOSTOCK_USER: &str = "anonymous";
 pub const BAOSTOCK_PASS: &str = "888888";
 /// 默认查询 K 线 fields (跟 Task 6 保持一致).
-pub const BAOSTOCK_KLINE_FIELDS: &str = "date,open,high,low,close,volume,amount";
+pub const BAOSTOCK_KLINE_FIELDS: &str = "date,open,high,low,close,volume,amount,pctChg";
 /// 复权 flag: 2 = 前复权 (跟 Task 6 build_kline_query_body 一致).
 pub const BAOSTOCK_ADJUST_FLAG_QFQ: &str = "2";
 /// 默认频率 (日线).
@@ -269,10 +270,10 @@ pub fn parse_baostock_tcp_response(buf: &[u8]) -> Result<BaostockTcpMessage> {
 ///
 /// review #16 P0 #3: 之前无 timeout, 服务端挂起会永久 await 任务泄漏.
 /// 现 wrap 在 `tokio::time::timeout` 里, 超时返 Err 让上层重连.
-pub async fn read_tcp_response(
-    stream: &mut TcpStream,
-    timeout: std::time::Duration,
-) -> Result<Vec<u8>> {
+pub async fn read_tcp_response<R>(stream: &mut R, timeout: std::time::Duration) -> Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
     let read = async {
         let mut buf = Vec::with_capacity(4096);
         let mut chunk = [0u8; 4096];
@@ -331,14 +332,14 @@ pub fn parse_baostock_response_kline(body: &str, our_code: &str) -> Result<Vec<K
 ///
 /// 输入格式 (实测):
 /// ```text
-/// code,date,open,high,low,close,volume,amount
-/// sh.600000,2024-01-15,13.50,13.60,13.45,13.55,12345,16789.50
+/// date,open,high,low,close,volume,amount,pctChg
+/// 2024-01-15,13.50,13.60,13.45,13.55,12345,16789.50,0.37
 /// ```
 ///
 /// - 第 1 行是表头, 后续每行 1 条 K线.
 /// - `date` 格式 `"YYYY-MM-DD"`.
-/// - 解析失败的字段回退为 0.0 / 今天 (不抛 Err, 保证解析容错).
-pub fn parse_kline_body(body: &str, _our_code: &str) -> Result<Vec<KlineData>> {
+/// - 任一必填字段解析失败或整批质检失败都显式返回错误 (BR-092).
+pub fn parse_kline_body(body: &str, our_code: &str) -> Result<Vec<KlineData>> {
     let mut lines = body.lines();
     let header_line = lines
         .next()
@@ -358,30 +359,50 @@ pub fn parse_kline_body(body: &str, _our_code: &str) -> Result<Vec<KlineData>> {
     let i_close = idx("close")?;
     let i_volume = idx("volume")?;
     let i_amount = idx("amount")?;
+    let i_pct_chg = idx("pctChg")?;
 
     let mut result = Vec::new();
-    for line in lines {
+    for (line_index, line) in lines.enumerate() {
         if line.trim().is_empty() {
             continue;
         }
         let fields: Vec<&str> = line.split(',').collect();
-        if fields.len() < 7 {
-            continue;
-        }
-
-        let date = NaiveDate::parse_from_str(fields[i_date], "%Y-%m-%d")
-            .unwrap_or_else(|_| chrono::Local::now().date_naive());
-        let open: f64 = fields[i_open].parse().unwrap_or(0.0);
-        let high: f64 = fields[i_high].parse().unwrap_or(0.0);
-        let low: f64 = fields[i_low].parse().unwrap_or(0.0);
-        let close: f64 = fields[i_close].parse().unwrap_or(0.0);
-        let volume: f64 = fields[i_volume].parse().unwrap_or(0.0);
-        let amount: f64 = fields[i_amount].parse().unwrap_or(0.0);
-        let pct_chg = if open > 0.0 {
-            (close - open) / open * 100.0
-        } else {
-            0.0
+        let field = |index: usize, name: &str| -> Result<&str> {
+            fields
+                .get(index)
+                .copied()
+                .map(str::trim)
+                .ok_or_else(|| anyhow!("Baostock K线第 {} 行缺 {} 字段", line_index + 2, name))
         };
+        let parse_number = |index: usize, name: &str| -> Result<f64> {
+            let raw = field(index, name)?;
+            raw.parse::<f64>().map_err(|error| {
+                anyhow!(
+                    "Baostock K线第 {} 行 {}='{}' 解析失败: {}",
+                    line_index + 2,
+                    name,
+                    raw,
+                    error
+                )
+            })
+        };
+
+        let raw_date = field(i_date, "date")?;
+        let date = NaiveDate::parse_from_str(raw_date, "%Y-%m-%d").map_err(|error| {
+            anyhow!(
+                "Baostock K线第 {} 行 date='{}' 解析失败: {}",
+                line_index + 2,
+                raw_date,
+                error
+            )
+        })?;
+        let open = parse_number(i_open, "open")?;
+        let high = parse_number(i_high, "high")?;
+        let low = parse_number(i_low, "low")?;
+        let close = parse_number(i_close, "close")?;
+        let volume = parse_number(i_volume, "volume")?;
+        let amount = parse_number(i_amount, "amount")?;
+        let pct_chg = parse_number(i_pct_chg, "pctChg")?;
 
         result.push(KlineData {
             date,
@@ -416,7 +437,7 @@ pub fn parse_kline_body(body: &str, _our_code: &str) -> Result<Vec<KlineData>> {
             adjust: AdjustType::Qfq,
         });
     }
-    let _ = _our_code;
+    super::validate_kline_series_strict(&mut result, our_code)?;
     Ok(result)
 }
 
@@ -594,13 +615,13 @@ pub const BAOSTOCK_DEFAULT_BASE: &str = "http://baostock.com/baostock";
 /// 兼容名: 构造登录 URL (Task 5 HTTP 误实现的痕迹, 不再使用).
 #[deprecated(note = "Baostock 协议是 TCP; 用 build_login_msg")]
 pub fn build_login_url() -> String {
-    format!("{BAOSTOCK_DEFAULT_BASE}/Login")
+    "http://baostock.com/baostock/Login".to_string()
 }
 
 /// 兼容名: 构造登出 URL (Task 5 HTTP 误实现的痕迹, 不再使用).
 #[deprecated(note = "Baostock 协议是 TCP; 用 build_login_msg")]
 pub fn build_logout_url() -> String {
-    format!("{BAOSTOCK_DEFAULT_BASE}/Logout")
+    "http://baostock.com/baostock/Logout".to_string()
 }
 
 /// 兼容名: 构造 K线查询 body (HTTP form-encoded 风格, 不再使用).

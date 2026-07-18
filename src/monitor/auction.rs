@@ -97,6 +97,7 @@ pub fn classify_auction(
             threshold: Some(gap_pct),
             news_title: None,
             news_summary: None,
+            news_importance: None,
             ai_decision: None,
             t1_locked,
             extra: if r.suspected_fake {
@@ -122,7 +123,7 @@ mod tests {
     #[test]
     fn test_auction_abnormal_high_open() {
         let r = AuctionResult {
-            code: "000001".into(),
+            code: "TEST_CODE_000001".into(),
             name: "测试".into(),
             gap_pct: 5.0,
             vol_ratio: 6.0,
@@ -138,7 +139,7 @@ mod tests {
     #[test]
     fn test_auction_normal() {
         let r = AuctionResult {
-            code: "000001".into(),
+            code: "TEST_CODE_000001".into(),
             name: "测试".into(),
             gap_pct: 1.0,
             vol_ratio: 2.0,
@@ -151,7 +152,7 @@ mod tests {
     #[test]
     fn test_auction_t1_locked_low_open() {
         let r = AuctionResult {
-            code: "000002".into(),
+            code: "TEST_CODE_000002".into(),
             name: "锁仓股".into(),
             gap_pct: -6.0,
             vol_ratio: 8.0,
@@ -166,7 +167,7 @@ mod tests {
     #[test]
     fn test_auction_suspected_fake() {
         let r = AuctionResult {
-            code: "000003".into(),
+            code: "TEST_CODE_000003".into(),
             name: "诱多股".into(),
             gap_pct: 8.0,
             vol_ratio: 10.0,

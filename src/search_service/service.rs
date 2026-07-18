@@ -43,8 +43,6 @@ pub struct SearchService {
     jin10: Jin10Provider,
     /// 新浪财经全球快讯（免费，4 lid 并发: 国际/国内/A股/港股）
     sina_flash: SinaFlashProvider,
-    /// 雪球 (xueqiu) 公共时间线 (v21: A股 + 全部 category, 用户/机构观点聚合)
-    xueqiu: XueqiuProvider,
     /// 微博热搜榜（正交源：全民级突发/科技/政策热点，补财经快讯的盲区）
     weibo_hot: WeiboHotProvider,
     /// 格隆汇快讯（市场与公司层面高频资讯）
@@ -175,7 +173,6 @@ impl SearchService {
             kcb: KcbDailyProvider::new(),
             jin10: Jin10Provider::new(),
             sina_flash: SinaFlashProvider::new(),
-            xueqiu: XueqiuProvider::new(),
             weibo_hot: WeiboHotProvider::new(),
             gelonghui: GelonghuiProvider::new(),
             gov_policy: GovPolicyProvider::new(),
@@ -711,7 +708,7 @@ impl SearchService {
         let rerank_params = Self::topic_rerank_params();
 
         let expanded_queries = Self::build_topic_queries(query, max_results, intent_cap);
-        let per_provider_max = (max_results / 2).max(2).min(4);
+        let per_provider_max = (max_results / 2).clamp(2, 4);
 
         let mut aggregated: Vec<SearchResult> = Vec::new();
         for q in &expanded_queries {
@@ -1352,8 +1349,6 @@ impl SearchService {
         max_searches: usize,
     ) -> HashMap<String, SearchResponse> {
         let mut results = HashMap::new();
-        let mut search_count = 0;
-
         // 定义搜索维度
         let search_dimensions = vec![
             (
@@ -1375,7 +1370,6 @@ impl SearchService {
 
         info!("开始多维度情报搜索: {}({})", stock_name, stock_code);
 
-        let mut provider_index = 0;
         let available_providers: Vec<_> =
             self.providers.iter().filter(|p| p.is_available()).collect();
 
@@ -1383,13 +1377,10 @@ impl SearchService {
             return results;
         }
 
-        for (dim_name, query, desc) in search_dimensions {
-            if search_count >= max_searches {
-                break;
-            }
-
+        for (provider_index, (dim_name, query, desc)) in
+            search_dimensions.into_iter().take(max_searches).enumerate()
+        {
             let provider = available_providers[provider_index % available_providers.len()];
-            provider_index += 1;
 
             info!("[情报搜索] {}: 使用 {}", desc, provider.name());
 
@@ -1410,8 +1401,6 @@ impl SearchService {
             }
 
             results.insert(dim_name.to_string(), response);
-            search_count += 1;
-
             // 短暂延迟避免请求过快
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
@@ -1856,7 +1845,9 @@ mod tests {
 
         if service.is_available() {
             println!("=== 测试股票新闻搜索 ===");
-            let response = service.search_stock_news("300389", "艾比森", 5).await;
+            let response = service
+                .search_stock_news("TEST_CODE_300389", "艾比森", 5)
+                .await;
             println!(
                 "搜索状态: {}",
                 if response.success { "成功" } else { "失败" }

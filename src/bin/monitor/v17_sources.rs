@@ -7,15 +7,19 @@
 
 use crate::notify::{self, PushKind, PushOutcome};
 use chrono::Local;
-use stock_analysis::data_provider::consensus;
-use stock_analysis::data_provider::financials;
-use stock_analysis::monitor::event_bus::MonitorEvent;
-use stock_analysis::news::aggregator::analyst_state::{AnalystKey, AnalystObservation, AnalystStateStore};
-use stock_analysis::news::aggregator::classifier::{classify_earnings, EarningsClassification, EarningsConfig, EarningsKind};
-use stock_analysis::news::aggregator::{NormalizedSourceEvent, SourcePushKind};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use stock_analysis::data_provider::consensus;
+use stock_analysis::data_provider::financials;
+use stock_analysis::monitor::event_bus::MonitorEvent;
+use stock_analysis::news::aggregator::analyst_state::{
+    AnalystKey, AnalystObservation, AnalystStateStore,
+};
+use stock_analysis::news::aggregator::classifier::{
+    classify_earnings, EarningsClassification, EarningsConfig, EarningsKind,
+};
+use stock_analysis::news::aggregator::{NormalizedSourceEvent, SourcePushKind};
 
 /// Bounded state map for deduping OrderUpdate events.
 /// Tracks (action, shares) per code; only emits if the tuple changes.
@@ -28,7 +32,12 @@ impl MarketActionState {
     /// Returns true if this is a new state (code/action/shares combination is different
     /// from the last time we saw this code), false if unchanged.
     pub fn accept(&mut self, event: &MonitorEvent) -> bool {
-        if let MonitorEvent::OrderUpdate { code, action, shares } = event {
+        if let MonitorEvent::OrderUpdate {
+            code,
+            action,
+            shares,
+        } = event
+        {
             let prev = self.seen.get(code).cloned();
             let is_new = prev.as_ref() != Some(&(action.clone(), *shares));
             self.seen.insert(code.clone(), (action.clone(), *shares));
@@ -41,7 +50,12 @@ impl MarketActionState {
 
 /// Build a MarketActionAlert NormalizedSourceEvent from an OrderUpdate MonitorEvent.
 pub fn normalize_market_action(event: &MonitorEvent) -> Option<NormalizedSourceEvent> {
-    if let MonitorEvent::OrderUpdate { code, action, shares } = event {
+    if let MonitorEvent::OrderUpdate {
+        code,
+        action,
+        shares,
+    } = event
+    {
         NormalizedSourceEvent::new(
             SourcePushKind::MarketActionAlert,
             format!("order:{}:{}:{}", code, action, shares),
@@ -184,9 +198,18 @@ fn earnings_classification_to_event(
         EarningsKind::Unclassified => SourcePushKind::EarningsBeat, // Should not happen
     };
     let (direction, title_prefix) = match classification.kind {
-        EarningsKind::Beat => (stock_analysis::signal::market_event::Direction::Bull, "超预期"),
-        EarningsKind::Miss => (stock_analysis::signal::market_event::Direction::Bear, "低于预期"),
-        EarningsKind::Unclassified => (stock_analysis::signal::market_event::Direction::Neutral, "未分类"),
+        EarningsKind::Beat => (
+            stock_analysis::signal::market_event::Direction::Bull,
+            "超预期",
+        ),
+        EarningsKind::Miss => (
+            stock_analysis::signal::market_event::Direction::Bear,
+            "低于预期",
+        ),
+        EarningsKind::Unclassified => (
+            stock_analysis::signal::market_event::Direction::Neutral,
+            "未分类",
+        ),
     };
     let title = format!(
         "{} 业绩{} (实际EPS {} vs 预期 {})",
@@ -200,8 +223,14 @@ fn earnings_classification_to_event(
     );
     let mut metadata = std::collections::BTreeMap::new();
     metadata.insert("actual".to_string(), classification.actual.to_string());
-    metadata.insert("reference".to_string(), classification.reference.to_string());
-    metadata.insert("delta_pct".to_string(), classification.delta_pct.to_string());
+    metadata.insert(
+        "reference".to_string(),
+        classification.reference.to_string(),
+    );
+    metadata.insert(
+        "delta_pct".to_string(),
+        classification.delta_pct.to_string(),
+    );
 
     NormalizedSourceEvent {
         push_kind,
@@ -254,18 +283,34 @@ fn analyst_upgrade_event(
 /// Trait for fetching earnings and consensus data.
 /// Allows test stubs without real HTTP calls.
 pub trait EarningsFetcher: Send + Sync {
-    async fn fetch_financials(&self, client: &reqwest::Client, code: &str) -> stock_analysis::data_provider::financials::Financials;
-    async fn fetch_consensus(&self, client: &reqwest::Client, code: &str) -> anyhow::Result<consensus::ConsensusData>;
+    async fn fetch_financials(
+        &self,
+        client: &reqwest::Client,
+        code: &str,
+    ) -> anyhow::Result<stock_analysis::data_provider::financials::Financials>;
+    async fn fetch_consensus(
+        &self,
+        client: &reqwest::Client,
+        code: &str,
+    ) -> anyhow::Result<consensus::ConsensusData>;
 }
 
 /// Real fetcher using the existing data providers.
 pub struct RealEarningsFetcher;
 
 impl EarningsFetcher for RealEarningsFetcher {
-    async fn fetch_financials(&self, client: &reqwest::Client, code: &str) -> stock_analysis::data_provider::financials::Financials {
+    async fn fetch_financials(
+        &self,
+        client: &reqwest::Client,
+        code: &str,
+    ) -> anyhow::Result<stock_analysis::data_provider::financials::Financials> {
         financials::fetch_with_fallback_async(client, code).await
     }
-    async fn fetch_consensus(&self, client: &reqwest::Client, code: &str) -> anyhow::Result<consensus::ConsensusData> {
+    async fn fetch_consensus(
+        &self,
+        client: &reqwest::Client,
+        code: &str,
+    ) -> anyhow::Result<consensus::ConsensusData> {
         consensus::fetch_async(client, code).await
     }
 }
@@ -299,12 +344,16 @@ pub async fn poll_earnings_and_analyst(
         Ok(c) => c,
         Err(e) => {
             log::warn!("[v17_sources] failed to build HTTP client: {}", e);
-            return SourcePollReport::default();
+            return SourcePollReport {
+                failed: 1,
+                ..SourcePollReport::default()
+            };
         }
     };
 
     let fetcher = RealEarningsFetcher;
     let mut events: Vec<NormalizedSourceEvent> = Vec::new();
+    let mut source_failures = 0usize;
     let now = Instant::now();
 
     // Track poll times for this iteration
@@ -318,44 +367,46 @@ pub async fn poll_earnings_and_analyst(
         {
             let should_poll = {
                 let last_polls = last_poll_earnings.lock().unwrap();
-                last_polls.get(code_str)
+                last_polls
+                    .get(code_str)
                     .map(|last| last.elapsed() >= poll_secs_earnings_duration)
                     .unwrap_or(true) // Never polled = poll now
             };
 
             if should_poll {
-                // Fetch both financials and consensus
-                let financials = fetcher.fetch_financials(&http, code_str).await;
-                let consensus_result = fetcher.fetch_consensus(&http, code_str).await;
-
-                // Proceed if we have financial data or consensus data
-                let has_data = financials.any() || consensus_result.is_ok();
-
-                if has_data {
-                    let consensus = match consensus_result {
-                        Ok(c) => c,
-                        Err(e) => {
-                            log::warn!(
-                                "[v17_sources] {} consensus fetch failed: {}",
-                                code_str, e
-                            );
-                            consensus::ConsensusData::default()
+                let (financials_result, consensus_result) = tokio::join!(
+                    fetcher.fetch_financials(&http, code_str),
+                    fetcher.fetch_consensus(&http, code_str)
+                );
+                match (financials_result, consensus_result) {
+                    (Ok(financials), Ok(consensus)) => {
+                        if let Some(latest_period) = financials.history.first() {
+                            if let Some(classification) =
+                                classify_earnings(latest_period, &consensus, earnings_cfg)
+                            {
+                                events.push(earnings_classification_to_event(
+                                    code_str,
+                                    &classification,
+                                ));
+                            }
                         }
-                    };
-
-                    // Get latest financial period from history
-                    if let Some(latest_period) = financials.history.first() {
-                        if let Some(classification) =
-                            classify_earnings(latest_period, &consensus, earnings_cfg)
-                        {
-                            events.push(earnings_classification_to_event(code_str, &classification));
-                        }
-                    }
-
-                    // Update last poll time
-                    {
                         let mut last_polls = last_poll_earnings.lock().unwrap();
                         last_polls.insert(code_str.to_string(), now);
+                    }
+                    (financials_result, consensus_result) => {
+                        source_failures += 1;
+                        log::warn!(
+                            "[v17_sources][BR-115] {} earnings batch rejected: financials={}; consensus={}",
+                            code_str,
+                            financials_result
+                                .err()
+                                .map(|error| error.to_string())
+                                .unwrap_or_else(|| "ok".to_string()),
+                            consensus_result
+                                .err()
+                                .map(|error| error.to_string())
+                                .unwrap_or_else(|| "ok".to_string())
+                        );
                     }
                 }
             }
@@ -365,7 +416,8 @@ pub async fn poll_earnings_and_analyst(
         {
             let should_poll = {
                 let last_polls = last_poll_analyst.lock().unwrap();
-                last_polls.get(code_str)
+                last_polls
+                    .get(code_str)
                     .map(|last| last.elapsed() >= poll_secs_analyst_duration)
                     .unwrap_or(true)
             };
@@ -378,27 +430,36 @@ pub async fn poll_earnings_and_analyst(
                                 code: code_str.to_string(),
                                 broker: report.org_name.clone(),
                             };
+                            let publish_date = match chrono::NaiveDate::parse_from_str(
+                                &report.publish_date,
+                                "%Y-%m-%d",
+                            ) {
+                                Ok(date) => date,
+                                Err(error) => {
+                                    source_failures += 1;
+                                    log::warn!(
+                                        "[v17_sources][BR-115] {} analyst report date invalid ({}): {}",
+                                        code_str,
+                                        report.publish_date,
+                                        error
+                                    );
+                                    continue;
+                                }
+                            };
                             let obs = AnalystObservation {
                                 rating: report.rating.clone(),
-                                publish_date: chrono::NaiveDate::parse_from_str(
-                                    &report.publish_date,
-                                    "%Y-%m-%d",
-                                )
-                                .unwrap_or_else(|_| chrono::Local::now().date_naive()),
+                                publish_date,
                                 report_id: report.title.clone(), // Use title as report_id proxy
                             };
 
-                            match analyst_store.observe(key.clone(), obs) {
-                                stock_analysis::news::aggregator::analyst_state::ObservationDecision::Upgrade { from, to } => {
-                                    events.push(analyst_upgrade_event(
-                                        code_str,
-                                        &report.org_name,
-                                        &from,
-                                        &to,
-                                        &report.title,
-                                    ));
-                                }
-                                _ => {}
+                            if let stock_analysis::news::aggregator::analyst_state::ObservationDecision::Upgrade { from, to } = analyst_store.observe(key.clone(), obs) {
+                                events.push(analyst_upgrade_event(
+                                    code_str,
+                                    &report.org_name,
+                                    &from,
+                                    &to,
+                                    &report.title,
+                                ));
                             }
                         }
 
@@ -409,9 +470,11 @@ pub async fn poll_earnings_and_analyst(
                         }
                     }
                     Err(e) => {
+                        source_failures += 1;
                         log::warn!(
                             "[v17_sources] {} analyst consensus fetch failed: {}",
-                            code_str, e
+                            code_str,
+                            e
                         );
                     }
                 }
@@ -420,25 +483,27 @@ pub async fn poll_earnings_and_analyst(
     }
 
     // Push all collected events
-    if events.is_empty() {
+    let mut report = if events.is_empty() {
         SourcePollReport::default()
     } else {
         push_normalized_events(events).await
-    }
+    };
+    report.failed += source_failures;
+    report
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stock_analysis::signal::market_event::Direction;
     use chrono::Local;
+    use stock_analysis::signal::market_event::Direction;
 
     /// Returns a valid announcement event for testing.
     fn test_announcement_event() -> NormalizedSourceEvent {
         NormalizedSourceEvent {
             push_kind: SourcePushKind::Announcement,
             event_id: "ann-1".into(),
-            code: Some("600519".into()),
+            code: Some("TEST_CODE_ANNOUNCEMENT".into()),
             title: "关于回购股份方案的公告".into(),
             summary: "回购".into(),
             direction: Direction::Neutral,
@@ -457,7 +522,7 @@ mod tests {
         NormalizedSourceEvent {
             push_kind: SourcePushKind::Announcement,
             event_id: "ann-empty".into(),
-            code: Some("600519".into()),
+            code: Some("TEST_CODE_EMPTY_TITLE".into()),
             title: "".into(),
             summary: "".into(),
             direction: Direction::Neutral,
@@ -472,6 +537,7 @@ mod tests {
 
     #[tokio::test]
     async fn announcement_adapter_calls_only_announcement_kind() {
+        crate::v14_adapter::_reset_dedup_for_test();
         std::env::set_var("V10_DRY_RUN_PUSH", "1");
         let report = push_normalized_events(vec![test_announcement_event()]).await;
         assert_eq!(report.attempted, 1);
@@ -489,11 +555,12 @@ mod tests {
 
     #[tokio::test]
     async fn analyst_upgrade_maps_to_analyst_upgrade_kind() {
+        crate::v14_adapter::_reset_dedup_for_test();
         std::env::set_var("V10_DRY_RUN_PUSH", "1");
         let event = NormalizedSourceEvent {
             push_kind: SourcePushKind::AnalystUpgrade,
             event_id: "analyst-1".into(),
-            code: Some("000858".into()),
+            code: Some("TEST_CODE_ANALYST".into()),
             title: "券商上调评级".into(),
             summary: "上调至买入".into(),
             direction: Direction::Bull,
@@ -512,6 +579,7 @@ mod tests {
 
     #[tokio::test]
     async fn policy_hit_with_no_code_is_pushed_as_policy() {
+        crate::v14_adapter::_reset_dedup_for_test();
         std::env::set_var("V10_DRY_RUN_PUSH", "1");
         let event = NormalizedSourceEvent {
             push_kind: SourcePushKind::PolicyHit,
@@ -535,8 +603,11 @@ mod tests {
     }
 
     /// Helper: build a FinancialPeriod for testing.
-    fn test_financial_period(code: &str, eps: f64, report_date: &str) -> stock_analysis::data_provider::financials::FinancialPeriod {
-        use chrono::NaiveDate;
+    fn test_financial_period(
+        _code: &str,
+        eps: f64,
+        report_date: &str,
+    ) -> stock_analysis::data_provider::financials::FinancialPeriod {
         stock_analysis::data_provider::financials::FinancialPeriod {
             report_date: Some(report_date.to_string()),
             eps: Some(eps),
@@ -552,7 +623,12 @@ mod tests {
     }
 
     /// Helper: build a ConsensusData for testing with a single recent report.
-    fn test_consensus_data(code: &str, broker: &str, rating: &str, eps_avg: f64) -> stock_analysis::data_provider::consensus::ConsensusData {
+    fn test_consensus_data(
+        code: &str,
+        broker: &str,
+        rating: &str,
+        eps_avg: f64,
+    ) -> stock_analysis::data_provider::consensus::ConsensusData {
         use std::collections::HashMap;
         let mut rating_dist = HashMap::new();
         rating_dist.insert(rating.to_string(), 1);
@@ -587,23 +663,41 @@ mod tests {
         };
 
         // Beat case: actual EPS 1.10, consensus 1.00 → delta +10% → Beat
-        let beat_actual = test_financial_period("600519", 1.10, "2026-04-20");
-        let beat_consensus = test_consensus_data("600519", "券商A", "买入", 1.00);
+        let beat_actual = test_financial_period("TEST_CODE_EARNINGS_BEAT", 1.10, "2026-04-20");
+        let beat_consensus = test_consensus_data("TEST_CODE_EARNINGS_BEAT", "券商A", "买入", 1.00);
         let beat_classification = classify_earnings(&beat_actual, &beat_consensus, &earnings_cfg);
-        assert!(beat_classification.is_some(), "Beat classification should not be None");
-        assert_eq!(beat_classification.as_ref().unwrap().kind, EarningsKind::Beat);
+        assert!(
+            beat_classification.is_some(),
+            "Beat classification should not be None"
+        );
+        assert_eq!(
+            beat_classification.as_ref().unwrap().kind,
+            EarningsKind::Beat
+        );
 
-        let beat_event = earnings_classification_to_event("600519", beat_classification.as_ref().unwrap());
+        let beat_event = earnings_classification_to_event(
+            "TEST_CODE_EARNINGS_BEAT",
+            beat_classification.as_ref().unwrap(),
+        );
         assert_eq!(beat_event.push_kind, SourcePushKind::EarningsBeat);
 
         // Miss case: actual EPS 0.89, consensus 1.00 → delta -11% → Miss
-        let miss_actual = test_financial_period("000001", 0.89, "2026-04-20");
-        let miss_consensus = test_consensus_data("000001", "券商B", "中性", 1.00);
+        let miss_actual = test_financial_period("TEST_CODE_EARNINGS_MISS", 0.89, "2026-04-20");
+        let miss_consensus = test_consensus_data("TEST_CODE_EARNINGS_MISS", "券商B", "中性", 1.00);
         let miss_classification = classify_earnings(&miss_actual, &miss_consensus, &earnings_cfg);
-        assert!(miss_classification.is_some(), "Miss classification should not be None");
-        assert_eq!(miss_classification.as_ref().unwrap().kind, EarningsKind::Miss);
+        assert!(
+            miss_classification.is_some(),
+            "Miss classification should not be None"
+        );
+        assert_eq!(
+            miss_classification.as_ref().unwrap().kind,
+            EarningsKind::Miss
+        );
 
-        let miss_event = earnings_classification_to_event("000001", miss_classification.as_ref().unwrap());
+        let miss_event = earnings_classification_to_event(
+            "TEST_CODE_EARNINGS_MISS",
+            miss_classification.as_ref().unwrap(),
+        );
         assert_eq!(miss_event.push_kind, SourcePushKind::EarningsMiss);
 
         // Verify beat and miss map to different PushKinds
@@ -625,18 +719,17 @@ mod tests {
 
     #[tokio::test]
     async fn repeated_analyst_report_is_not_pushed_twice() {
-        let mut analyst_store = AnalystStateStore::new(10_000);
+        let analyst_store = AnalystStateStore::new(10_000);
 
         let key = AnalystKey {
-            code: "600519".to_string(),
+            code: "TEST_CODE_ANALYST_STATE".to_string(),
             broker: "券商A".to_string(),
         };
 
         let obs = AnalystObservation {
             rating: "中性".to_string(),
-            publish_date: chrono::NaiveDate::parse_from_str("2026-07-15", "%Y-%m-%d")
-                .unwrap(),
-            report_id: "研报-600519-2026-07-15".to_string(),
+            publish_date: chrono::NaiveDate::parse_from_str("2026-07-15", "%Y-%m-%d").unwrap(),
+            report_id: "研报-TEST_CODE_ANALYST_STATE-2026-07-15".to_string(),
         };
 
         // First observation: should be Observed (new entry)
@@ -676,17 +769,17 @@ mod tests {
 
     #[test]
     fn order_update_maps_to_emergency_market_action() {
-        let event = order_update("600519", "sell", 100);
+        let event = order_update("TEST_CODE_MARKET_ACTION", "sell", 100);
         let normalized = normalize_market_action(&event).unwrap();
         assert_eq!(normalized.push_kind, SourcePushKind::MarketActionAlert);
-        assert_eq!(normalized.code.as_deref(), Some("600519"));
+        assert_eq!(normalized.code.as_deref(), Some("TEST_CODE_MARKET_ACTION"));
         assert!(normalized.title.contains("sell"));
     }
 
     #[test]
     fn unchanged_order_state_is_not_re_emitted() {
         let mut state = MarketActionState::default();
-        let event = order_update("600519", "sell", 100);
+        let event = order_update("TEST_CODE_MARKET_ACTION", "sell", 100);
         assert!(state.accept(&event), "first emission should be accepted");
         assert!(!state.accept(&event), "identical state should be rejected");
     }
@@ -695,17 +788,17 @@ mod tests {
     fn market_action_state_dedup_within_capacity() {
         let mut state = MarketActionState::default();
         // Different codes are independent
-        let e1 = order_update("600519", "buy", 100);
-        let e2 = order_update("000858", "sell", 200);
+        let e1 = order_update("TEST_CODE_MARKET_ACTION_1", "buy", 100);
+        let e2 = order_update("TEST_CODE_MARKET_ACTION_2", "sell", 200);
         assert!(state.accept(&e1));
         assert!(state.accept(&e2));
         // Same code/action/shares again is rejected
         assert!(!state.accept(&e1));
         assert!(!state.accept(&e2));
         // Different action for same code is accepted
-        let e3 = order_update("600519", "sell", 100); // same code but different action
+        let e3 = order_update("TEST_CODE_MARKET_ACTION_1", "sell", 100); // same code but different action
         assert!(state.accept(&e3), "different action should be new state");
-        let e4 = order_update("600519", "buy", 200); // different shares
+        let e4 = order_update("TEST_CODE_MARKET_ACTION_1", "buy", 200); // different shares
         assert!(state.accept(&e4), "different shares should be new");
     }
 

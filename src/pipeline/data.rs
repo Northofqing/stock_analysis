@@ -75,7 +75,7 @@ impl AnalysisPipeline {
 
         // 保存到数据库
         if let Some(db) = DatabaseManager::try_get() {
-            match db.save_kline_data(code, &data, &source) {
+            match db.save_kline_data(code, &data, source) {
                 Ok(count) => info!("[{}] 已保存 {} 条K线数据到数据库", code, count),
                 Err(e) => warn!("[{}] 保存K线数据到数据库失败: {}", code, e),
             }

@@ -4,8 +4,11 @@
 //! and `AuditDispatcher` for observing `push.delivery` without producing side-effects.
 
 use std::collections::HashSet;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
 
@@ -126,33 +129,177 @@ impl DispatcherRegistry {
 // AuditDispatcher
 // ========================================================================
 
-/// A dispatcher for `"push.delivery"` that only logs and increments a counter.
-///
-/// This dispatcher NEVER calls `push_governor_v3`, `push_wechat`, or any external
-/// sink — it purely observes the delivery path for audit purposes.
+/// BR-091 durable audit dispatcher for `push.delivery.audit`.
 #[derive(Debug)]
 pub struct AuditDispatcher {
     handled_count: AtomicU64,
+    base_dir: PathBuf,
+    chain_state: Mutex<AuditChainState>,
+}
+
+#[derive(Debug, Default)]
+struct AuditChainState {
+    year: Option<String>,
+    last_hash: Option<String>,
+    poisoned: Option<String>,
 }
 
 impl AuditDispatcher {
-    /// Create a new `AuditDispatcher`.
-    pub fn new() -> Self {
+    /// Create an audit dispatcher rooted at an explicit durable directory.
+    pub fn new(base_dir: impl Into<PathBuf>) -> Self {
         Self {
             handled_count: AtomicU64::new(0),
+            base_dir: base_dir.into(),
+            chain_state: Mutex::new(AuditChainState::default()),
         }
+    }
+
+    /// Runtime constructor with BR-051 test/prod path isolation.
+    pub fn for_runtime() -> Self {
+        #[cfg(test)]
+        let base_dir = PathBuf::from("data/test/event_audit");
+        #[cfg(not(test))]
+        let base_dir = std::env::var("EVENT_AUDIT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                if crate::risk::env_guard::current_env() == crate::risk::env_guard::TradingEnv::Test
+                {
+                    PathBuf::from("data/test/event_audit")
+                } else {
+                    PathBuf::from("data/event_audit")
+                }
+            });
+        Self::new(base_dir)
     }
 
     /// Returns the number of envelopes this dispatcher has handled.
     pub fn handled_count(&self) -> u64 {
         self.handled_count.load(Ordering::SeqCst)
     }
+
+    fn persist(&self, envelope: &EventEnvelope) -> Result<(), String> {
+        use sha2::{Digest, Sha256};
+
+        fs::create_dir_all(&self.base_dir)
+            .map_err(|error| format!("create {}: {error}", self.base_dir.display()))?;
+        let year = envelope.ts.format("%Y").to_string();
+        let path = self.base_dir.join(format!("{year}.jsonl"));
+        let mut state = self
+            .chain_state
+            .lock()
+            .map_err(|_| "audit chain state lock poisoned".to_string())?;
+        if let Some(reason) = state.poisoned.as_deref() {
+            return Err(format!(
+                "audit chain is poisoned after an earlier persistence failure: {reason}"
+            ));
+        }
+        if state.year.as_deref() != Some(&year) {
+            state.last_hash = match validate_existing_chain(&path) {
+                Ok(last_hash) => last_hash,
+                Err(error) => {
+                    state.poisoned = Some(error.clone());
+                    return Err(error);
+                }
+            };
+            state.year = Some(year);
+        }
+
+        let previous_hash = state
+            .last_hash
+            .clone()
+            .unwrap_or_else(|| "GENESIS".to_string());
+        let mut record = serde_json::json!({
+            "envelope": envelope,
+            "previous_hash": previous_hash,
+        });
+        let canonical = serde_json::to_vec(&record)
+            .map_err(|error| format!("serialize audit record: {error}"))?;
+        let record_hash = format!("{:x}", Sha256::digest(&canonical));
+        record.as_object_mut().expect("json object literal").insert(
+            "record_hash".to_string(),
+            serde_json::Value::String(record_hash.clone()),
+        );
+        let mut line = serde_json::to_vec(&record)
+            .map_err(|error| format!("serialize audit line: {error}"))?;
+        line.push(b'\n');
+
+        let persistence_result = (|| -> Result<(), String> {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .map_err(|error| format!("open {}: {error}", path.display()))?;
+            file.write_all(&line)
+                .map_err(|error| format!("append {}: {error}", path.display()))?;
+            file.flush()
+                .map_err(|error| format!("flush {}: {error}", path.display()))?;
+            file.sync_data()
+                .map_err(|error| format!("sync {}: {error}", path.display()))?;
+            Ok(())
+        })();
+        if let Err(error) = persistence_result {
+            state.poisoned = Some(error.clone());
+            return Err(error);
+        }
+        state.last_hash = Some(record_hash);
+        Ok(())
+    }
 }
 
 impl Default for AuditDispatcher {
     fn default() -> Self {
-        Self::new()
+        Self::for_runtime()
     }
+}
+
+fn validate_existing_chain(path: &Path) -> Result<Option<String>, String> {
+    use sha2::{Digest, Sha256};
+
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(path)
+        .map_err(|error| format!("read existing audit {}: {error}", path.display()))?;
+    let mut expected_parent = "GENESIS".to_string();
+    let mut last_hash = None;
+    for (index, line) in content.lines().enumerate() {
+        if line.trim().is_empty() {
+            return Err(format!("audit line {} is blank", index + 1));
+        }
+        let mut record: serde_json::Value = serde_json::from_str(line)
+            .map_err(|error| format!("parse audit line {}: {error}", index + 1))?;
+        let record_hash = record
+            .get("record_hash")
+            .and_then(serde_json::Value::as_str)
+            .filter(|hash| !hash.is_empty())
+            .ok_or_else(|| format!("audit line {} has no record_hash", index + 1))?
+            .to_string();
+        let parent = record
+            .get("previous_hash")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("audit line {} has no previous_hash", index + 1))?;
+        if parent != expected_parent {
+            return Err(format!(
+                "audit chain mismatch at line {}: expected {}, found {}",
+                index + 1,
+                expected_parent,
+                parent
+            ));
+        }
+        record
+            .as_object_mut()
+            .ok_or_else(|| format!("audit line {} is not an object", index + 1))?
+            .remove("record_hash");
+        let canonical = serde_json::to_vec(&record)
+            .map_err(|error| format!("serialize audit line {}: {error}", index + 1))?;
+        let calculated = format!("{:x}", Sha256::digest(&canonical));
+        if calculated != record_hash {
+            return Err(format!("audit hash mismatch at line {}", index + 1));
+        }
+        expected_parent = record_hash.clone();
+        last_hash = Some(record_hash);
+    }
+    Ok(last_hash)
 }
 
 impl Dispatcher for AuditDispatcher {
@@ -170,20 +317,35 @@ impl Dispatcher for AuditDispatcher {
             return DispatchResult::Skipped("no_dispatcher".into());
         }
 
-        // Extract fields for logging — do NOT call any sink.
+        if let Err(error) = self.persist(&envelope) {
+            return DispatchResult::Failed(error);
+        }
+
+        // Extract fields for operational logging after durable persistence.
         let id = &envelope.id;
         let event_type = &envelope.event_type;
         let source = &envelope.source;
-        let kind = envelope.payload.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
-        let outcome = envelope.payload.get("outcome").and_then(|v| v.as_str()).unwrap_or("?");
-        let channel = envelope.payload.get("channel").and_then(|v| v.as_str()).unwrap_or("?");
+        let kind = envelope
+            .payload
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let outcome = envelope
+            .payload
+            .get("outcome")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let channel = envelope
+            .payload
+            .get("channel")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
         let code = envelope
             .payload
             .get("code")
             .and_then(|v| v.as_str())
             .map(String::from);
 
-        // Log to stdout — this is the ONLY side-effect of AuditDispatcher.
         if let Some(ref c) = code {
             println!(
                 "[AuditDispatcher] id={} event_type={} source={} kind={} outcome={} channel={} code={}",
@@ -208,7 +370,7 @@ impl Dispatcher for AuditDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::envelope::{DomainEvent, EventEnvelope, PushDeliveryEvent};
+    use crate::event::envelope::EventEnvelope;
 
     /// A dispatcher that records every dispatch for inspection in tests.
     #[derive(Debug, Default)]
@@ -225,10 +387,6 @@ mod tests {
                 name_: event_type,
                 calls: std::sync::Mutex::new(Vec::new()),
             }
-        }
-
-        fn take_calls(&self) -> Vec<EventEnvelope> {
-            self.calls.lock().unwrap().drain(..).collect()
         }
     }
 
@@ -247,23 +405,6 @@ mod tests {
         }
     }
 
-    fn make_envelope(event_type: &str) -> EventEnvelope {
-        EventEnvelope::from_event(
-            &PushDeliveryEvent::new(
-                "test_kind".into(),
-                Some("600519".into()),
-                "Pushed".into(),
-                "wechat".into(),
-                42,
-                10,
-            ),
-            format!("evt-{}", event_type),
-            "trace-1".into(),
-            chrono::Local::now(),
-        )
-        .unwrap()
-    }
-
     fn test_envelope_type(event_type: &str) -> EventEnvelope {
         EventEnvelope {
             id: format!("evt-{}", event_type),
@@ -271,10 +412,10 @@ mod tests {
             trace_id: "trace-1".into(),
             source: "push_l4".into(),
             event_type: event_type.into(),
-            entity_key: Some("600519".into()),
+            entity_key: Some("TEST_CODE_AUDIT".into()),
             payload: serde_json::json!({
                 "kind": "test_kind",
-                "code": "600519",
+                "code": "TEST_CODE_AUDIT",
                 "outcome": "Pushed",
                 "channel": "wechat",
                 "rendered_len": 42,
@@ -288,8 +429,12 @@ mod tests {
     #[test]
     fn registry_routes_only_exact_event_type() {
         let mut registry = DispatcherRegistry::new();
-        registry.register(Arc::new(RecordingDispatcher::for_type("push.delivery.audit")));
-        registry.register(Arc::new(RecordingDispatcher::for_type("push.delivery.retry")));
+        registry.register(Arc::new(RecordingDispatcher::for_type(
+            "push.delivery.audit",
+        )));
+        registry.register(Arc::new(RecordingDispatcher::for_type(
+            "push.delivery.retry",
+        )));
         registry.validate().unwrap();
 
         assert_eq!(
@@ -309,16 +454,24 @@ mod tests {
     #[test]
     fn duplicate_exact_types_are_rejected_at_validation() {
         let mut registry = DispatcherRegistry::new();
-        registry.register(Arc::new(RecordingDispatcher::for_type("push.delivery.audit")));
-        registry.register(Arc::new(RecordingDispatcher::for_type("push.delivery.audit")));
+        registry.register(Arc::new(RecordingDispatcher::for_type(
+            "push.delivery.audit",
+        )));
+        registry.register(Arc::new(RecordingDispatcher::for_type(
+            "push.delivery.audit",
+        )));
         assert!(registry.validate().is_err());
     }
 
     #[test]
     fn duplicate_error_names_the_offending_event_type() {
         let mut registry = DispatcherRegistry::new();
-        registry.register(Arc::new(RecordingDispatcher::for_type("push.delivery.audit")));
-        registry.register(Arc::new(RecordingDispatcher::for_type("push.delivery.audit")));
+        registry.register(Arc::new(RecordingDispatcher::for_type(
+            "push.delivery.audit",
+        )));
+        registry.register(Arc::new(RecordingDispatcher::for_type(
+            "push.delivery.audit",
+        )));
         let err = registry.validate().unwrap_err();
         assert!(err.to_string().contains("push.delivery.audit"));
     }
@@ -352,48 +505,74 @@ mod tests {
     }
 
     #[test]
-    fn audit_dispatcher_does_not_call_sinks() {
-        use std::sync::atomic::AtomicBool;
-        static CALLED: AtomicBool = AtomicBool::new(false);
-
-        struct SinkSpy;
-        impl Dispatcher for SinkSpy {
-            fn name(&self) -> &'static str {
-                "SinkSpy"
-            }
-            fn event_type(&self) -> &'static str {
-                "push.delivery.audit"
-            }
-            fn dispatch(&self, _envelope: EventEnvelope) -> DispatchResult {
-                CALLED.store(true, Ordering::SeqCst);
-                DispatchResult::Handled
-            }
-        }
-
-        let dispatcher = AuditDispatcher::new();
-        let envelope = test_envelope_type("push.delivery.audit");
-        dispatcher.dispatch(envelope);
-
-        // The dispatcher never calls the spy — it only logs.
-        assert!(!CALLED.load(Ordering::SeqCst));
-    }
-
-    #[test]
     fn audit_dispatcher_increments_counter() {
-        let dispatcher = AuditDispatcher::new();
+        let dir =
+            std::env::temp_dir().join(format!("audit-dispatcher-count-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let dispatcher = AuditDispatcher::new(&dir);
         assert_eq!(dispatcher.handled_count(), 0);
 
         dispatcher.dispatch(test_envelope_type("push.delivery.audit"));
         dispatcher.dispatch(test_envelope_type("push.delivery.audit"));
 
         assert_eq!(dispatcher.handled_count(), 2);
+        let path = dir.join(format!("{}.jsonl", chrono::Local::now().format("%Y")));
+        let content = fs::read_to_string(path).unwrap();
+        assert_eq!(content.lines().count(), 2);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn audit_dispatcher_rejects_non_push_delivery() {
-        let dispatcher = AuditDispatcher::new();
+        let dispatcher = AuditDispatcher::new(
+            std::env::temp_dir().join(format!("audit-dispatcher-reject-{}", std::process::id())),
+        );
         let envelope = test_envelope_type("announcement.new");
         let result = dispatcher.dispatch(envelope);
         assert_eq!(result, DispatchResult::Skipped("no_dispatcher".into()));
+    }
+
+    #[test]
+    fn audit_dispatcher_rejects_tampered_existing_chain() {
+        let dir =
+            std::env::temp_dir().join(format!("audit-dispatcher-tamper-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{}.jsonl", chrono::Local::now().format("%Y")));
+        fs::write(&path, "{not-json}\n").unwrap();
+        let dispatcher = AuditDispatcher::new(&dir);
+
+        let result = dispatcher.dispatch(test_envelope_type("push.delivery.audit"));
+
+        assert!(
+            matches!(result, DispatchResult::Failed(error) if error.contains("parse audit line 1"))
+        );
+        assert_eq!(dispatcher.handled_count(), 0);
+        assert_eq!(fs::read_to_string(path).unwrap(), "{not-json}\n");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn br091_persistence_failure_poisons_followup_writes() {
+        let dir =
+            std::env::temp_dir().join(format!("audit-dispatcher-poison-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{}.jsonl", chrono::Local::now().format("%Y")));
+        fs::create_dir_all(&path).unwrap();
+        let dispatcher = AuditDispatcher::new(&dir);
+
+        let first = dispatcher.dispatch(test_envelope_type("push.delivery.audit"));
+        assert!(matches!(first, DispatchResult::Failed(_)));
+        assert_eq!(dispatcher.handled_count(), 0);
+
+        fs::remove_dir_all(&path).unwrap();
+        let second = dispatcher.dispatch(test_envelope_type("push.delivery.audit"));
+        assert!(
+            matches!(second, DispatchResult::Failed(error) if error.contains("audit chain is poisoned"))
+        );
+        assert_eq!(dispatcher.handled_count(), 0);
+        assert!(!path.exists(), "poisoned dispatcher must not retry writing");
+        fs::remove_dir_all(dir).unwrap();
     }
 }

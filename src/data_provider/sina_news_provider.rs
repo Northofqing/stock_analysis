@@ -1,3 +1,4 @@
+//! Registered business rules: BR-066.
 //! Sina 新闻数据提供者 (Task 10)
 //!
 //! 财经要闻 + 个股新闻 + 历史回溯 (按时间范围客户端过滤).
@@ -53,29 +54,48 @@ pub fn parse_sina_news_body(
         .ok_or_else(|| anyhow!("Sina news: 无 result.data 数组"))?;
 
     let now = Utc::now();
+    if category.trim().is_empty() {
+        return Err(anyhow!("Sina news: category 不能为空"));
+    }
+    if let Some(code) = code {
+        if code.len() != 6 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(anyhow!("Sina news: 非法股票代码 {code:?}"));
+        }
+    }
     let source = if code.is_some() {
         "sina_stock"
     } else {
         "sina_financial"
     };
     let mut items = Vec::with_capacity(data.len());
-    for entry in data {
+    for (index, entry) in data.iter().enumerate() {
         let url = entry
             .get("url")
             .and_then(|x| x.as_str())
-            .unwrap_or("")
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow!("Sina news 第 {} 行缺少 url", index + 1))?
             .to_string();
         let title = entry
             .get("title")
             .and_then(|x| x.as_str())
-            .unwrap_or("")
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow!("Sina news 第 {} 行缺少 title", index + 1))?
             .to_string();
         let intro = entry
             .get("intro")
             .and_then(|x| x.as_str())
             .unwrap_or("")
             .to_string();
-        let ctime = entry.get("ctime").and_then(|x| x.as_i64()).unwrap_or(0);
+        let ctime = entry
+            .get("ctime")
+            .and_then(|x| x.as_i64())
+            .ok_or_else(|| anyhow!("Sina news 第 {} 行缺少整数 ctime", index + 1))?;
+        if ctime < 946_684_800 {
+            return Err(anyhow!(
+                "Sina news 第 {} 行 ctime 早于 2000-01-01: {ctime}",
+                index + 1
+            ));
+        }
         // Sina 财经要闻响应中 `media_name` 经常为空字符串.
         // Fallback 顺序: media_name 非空 -> oid/docid 字段 -> 默认 "新浪财经".
         let media_name = {
@@ -107,7 +127,14 @@ pub fn parse_sina_news_body(
                 }
             }
         };
-        let published_at = chrono::DateTime::from_timestamp(ctime, 0).unwrap_or_else(|| now);
+        let published_at = chrono::DateTime::from_timestamp(ctime, 0)
+            .ok_or_else(|| anyhow!("Sina news 第 {} 行 ctime 非法: {ctime}", index + 1))?;
+        if published_at > now + chrono::Duration::minutes(5) {
+            return Err(anyhow!(
+                "Sina news 第 {} 行发布时间在未来: {published_at}",
+                index + 1
+            ));
+        }
         let hash = content_hash(&title, &intro);
         items.push(NewsItem {
             source: source.to_string(),

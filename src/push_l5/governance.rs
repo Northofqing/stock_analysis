@@ -16,7 +16,7 @@ use chrono::{DateTime, Local, Timelike};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::push_l1::{SignalEvent, SignalPayload, SignalSource};
-use crate::push_l2::{DataMode, TemplateCategory, TemplateMetadata};
+use crate::push_l2::{DataMode, TemplateMetadata};
 
 /// v17.1 review F8 fix: Frozen warn 节流.
 ///
@@ -203,7 +203,7 @@ impl Default for GovernanceEngine {
 /// 静默期判定 (02:00-06:00)
 pub fn is_quiet_hour(ts: DateTime<Local>) -> bool {
     let hour = ts.hour();
-    hour >= 2 && hour < 6
+    (2..6).contains(&hour)
 }
 
 /// 从 SignalEvent 推断 payload 严重度 (用于 governance 优先级)
@@ -230,17 +230,20 @@ pub fn is_data_source_down_event(event: &SignalEvent) -> bool {
 mod tests {
     use super::*;
     use crate::push_l1::{DataSourceDownPayload, LimitUpPayload, Severity};
+    use crate::push_l2::TemplateCategory;
     use chrono::TimeZone;
 
     fn make_event(source: SignalSource) -> SignalEvent {
         let payload = match source {
-            SignalSource::DataSourceDown => SignalPayload::DataSourceDown(DataSourceDownPayload::default()),
+            SignalSource::DataSourceDown => {
+                SignalPayload::DataSourceDown(DataSourceDownPayload::default())
+            }
             _ => SignalPayload::LimitUp(LimitUpPayload::default()),
         };
         SignalEvent::new(
             source,
             "test",
-            Some("600519".to_string()),
+            Some("TEST_CODE_600519".to_string()),
             Local::now(),
             payload,
             Severity::High,
@@ -270,7 +273,10 @@ mod tests {
         let profile = make_profile(true, true, DataMode::Full, false);
         let event = make_event(SignalSource::LimitUp);
         let ctx = GovernanceContext::default();
-        assert_eq!(engine.check(&profile, &event, &ctx), GovernanceDecision::Approve);
+        assert_eq!(
+            engine.check(&profile, &event, &ctx),
+            GovernanceDecision::Approve
+        );
     }
 
     #[test]
@@ -282,7 +288,10 @@ mod tests {
             is_quiet_hour: true,
             ..Default::default()
         };
-        assert_eq!(engine.check(&profile, &event, &ctx), GovernanceDecision::Deny("quiet_hour".to_string()));
+        assert_eq!(
+            engine.check(&profile, &event, &ctx),
+            GovernanceDecision::Deny("quiet_hour".to_string())
+        );
     }
 
     #[test]
@@ -327,7 +336,10 @@ mod tests {
             data_mode: DataMode::Degraded,
             ..Default::default()
         };
-        assert_eq!(engine.check(&profile, &event, &ctx), GovernanceDecision::Deny("data_quality".to_string()));
+        assert_eq!(
+            engine.check(&profile, &event, &ctx),
+            GovernanceDecision::Deny("data_quality".to_string())
+        );
     }
 
     // W5.X 新增: QuietHour 事件在静默期仍应放行 (自身治理事件, b-008 §3.0)
@@ -340,8 +352,10 @@ mod tests {
             is_quiet_hour: true,
             ..Default::default()
         };
-        assert!(engine.check(&profile, &event, &ctx).is_approve(),
-            "QuietHour 事件在静默期应放行 (自身治理观察)");
+        assert!(
+            engine.check(&profile, &event, &ctx).is_approve(),
+            "QuietHour 事件在静默期应放行 (自身治理观察)"
+        );
     }
 
     #[test]
@@ -371,8 +385,10 @@ mod tests {
             data_mode: DataMode::Down,
             ..Default::default()
         };
-        assert!(engine.check(&profile, &event, &ctx).is_approve(),
-            "b-008 §4.1: DataSourceDown 在 data_mode=Down 时应放行");
+        assert!(
+            engine.check(&profile, &event, &ctx).is_approve(),
+            "b-008 §4.1: DataSourceDown 在 data_mode=Down 时应放行"
+        );
     }
 
     #[test]
@@ -385,7 +401,10 @@ mod tests {
             data_mode: DataMode::Down,
             ..Default::default()
         };
-        assert_eq!(engine.check(&profile, &event, &ctx), GovernanceDecision::Deny("data_quality".to_string()));
+        assert_eq!(
+            engine.check(&profile, &event, &ctx),
+            GovernanceDecision::Deny("data_quality".to_string())
+        );
     }
 
     #[test]
@@ -398,7 +417,10 @@ mod tests {
             today_pushed_count: 3,
             ..Default::default()
         };
-        assert_eq!(engine.check(&profile, &event, &ctx), GovernanceDecision::Deny("daily_limit".to_string()));
+        assert_eq!(
+            engine.check(&profile, &event, &ctx),
+            GovernanceDecision::Deny("daily_limit".to_string())
+        );
     }
 
     #[test]
@@ -416,26 +438,40 @@ mod tests {
 
     #[test]
     fn quiet_hour_detection_2am_to_6am() {
-        assert!(is_quiet_hour(Local.with_ymd_and_hms(2026, 7, 11, 2, 0, 0).unwrap()));
-        assert!(is_quiet_hour(Local.with_ymd_and_hms(2026, 7, 11, 5, 59, 0).unwrap()));
-        assert!(!is_quiet_hour(Local.with_ymd_and_hms(2026, 7, 11, 6, 0, 0).unwrap()));
-        assert!(!is_quiet_hour(Local.with_ymd_and_hms(2026, 7, 11, 1, 59, 0).unwrap()));
-        assert!(!is_quiet_hour(Local.with_ymd_and_hms(2026, 7, 11, 23, 0, 0).unwrap()));
+        assert!(is_quiet_hour(
+            Local.with_ymd_and_hms(2026, 7, 11, 2, 0, 0).unwrap()
+        ));
+        assert!(is_quiet_hour(
+            Local.with_ymd_and_hms(2026, 7, 11, 5, 59, 0).unwrap()
+        ));
+        assert!(!is_quiet_hour(
+            Local.with_ymd_and_hms(2026, 7, 11, 6, 0, 0).unwrap()
+        ));
+        assert!(!is_quiet_hour(
+            Local.with_ymd_and_hms(2026, 7, 11, 1, 59, 0).unwrap()
+        ));
+        assert!(!is_quiet_hour(
+            Local.with_ymd_and_hms(2026, 7, 11, 23, 0, 0).unwrap()
+        ));
     }
 
     #[test]
     fn event_severity_ordering() {
-        assert!(event_severity(&make_event_with_severity(Severity::Emergency))
-            > event_severity(&make_event_with_severity(Severity::High)));
-        assert!(event_severity(&make_event_with_severity(Severity::High))
-            > event_severity(&make_event_with_severity(Severity::Normal)));
+        assert!(
+            event_severity(&make_event_with_severity(Severity::Emergency))
+                > event_severity(&make_event_with_severity(Severity::High))
+        );
+        assert!(
+            event_severity(&make_event_with_severity(Severity::High))
+                > event_severity(&make_event_with_severity(Severity::Normal))
+        );
     }
 
     fn make_event_with_severity(sev: Severity) -> SignalEvent {
         SignalEvent::new(
             SignalSource::LimitUp,
             "test",
-            Some("000001".to_string()),
+            Some("TEST_CODE_000001".to_string()),
             Local::now(),
             SignalPayload::LimitUp(LimitUpPayload::default()),
             sev,

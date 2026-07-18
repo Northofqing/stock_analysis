@@ -38,13 +38,12 @@ pub fn build_pre_market_checklist(
         lines.push("| 代码 | 名称 | 成本 | 止损 | 距离 | 股数 | 状态 |".into());
         lines.push("|------|------|------|------|------|------|------|".into());
         for p in positions {
-            let dist = if p.hard_stop > 0.0 && p.cost_price > 0.0 {
-                format!(
-                    "{:.1}%",
-                    (p.cost_price - p.hard_stop) / p.cost_price * 100.0
-                )
-            } else {
-                "-".into()
+            let (stop, dist) = match p.hard_stop {
+                Some(stop) if stop.is_finite() && stop > 0.0 && p.cost_price > 0.0 => (
+                    format!("{stop:.2}"),
+                    format!("{:.1}%", (p.cost_price - stop) / p.cost_price * 100.0),
+                ),
+                _ => ("未设".to_string(), "-".to_string()),
             };
             // review #14: DB 失败时不再静默 "可用", 而是显示警告, 让 operator 知道有异常.
             let status = match crate::portfolio::is_t1_locked(&p.code) {
@@ -53,8 +52,8 @@ pub fn build_pre_market_checklist(
                 Err(_) => "⚠️ DB",
             };
             lines.push(format!(
-                "| {} | {} | {:.2} | {:.2} | {} | {} | {} |",
-                p.code, p.name, p.cost_price, p.hard_stop, dist, p.shares, status
+                "| {} | {} | {:.2} | {} | {} | {} | {} |",
+                p.code, p.name, p.cost_price, stop, dist, p.shares, status
             ));
         }
         lines.push(String::new());
@@ -64,9 +63,13 @@ pub fn build_pre_market_checklist(
     if !t1_unlocks.is_empty() {
         lines.push("## ⚠️ T+1 解禁预警（今日可卖）".into());
         for p in t1_unlocks {
+            let stop = p
+                .hard_stop
+                .map(|value| format!("{value:.2}"))
+                .unwrap_or_else(|| "未设".to_string());
             lines.push(format!(
-                "- **{}({})** 成本 {:.2}，止损 {:.2}。今日竞价关注，如低开 >2% 建议挂单",
-                p.name, p.code, p.cost_price, p.hard_stop
+                "- **{}({})** 成本 {:.2}，止损 {}。今日竞价关注，如低开 >2% 建议挂单",
+                p.name, p.code, p.cost_price, stop
             ));
         }
         lines.push(String::new());
@@ -88,7 +91,12 @@ pub fn build_pre_market_checklist(
 /// v13.10.1 P0-#5: 区分两种语义, 不再混用:
 /// - `t1_frozen`: 今日买入, 明日解禁可卖 (持仓快照, 标 "T+1 冻结")
 /// - `tomorrow_unlocks`: 今日解禁, 明日可卖 (现持仓, 标 "明日可卖")
+///
 /// 同时止损为 0 时不写 "止损 0.00" 误导.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "report assembly boundary keeps independently audited market counters explicit"
+)]
 pub fn build_close_summary(
     market_pct: f64,
     limit_up_count: usize,
@@ -119,11 +127,11 @@ pub fn build_close_summary(
     if !t1_frozen.is_empty() {
         lines.push("## 🔒 T+1 冻结股（明日解禁可卖）".into());
         for p in t1_frozen {
-            let stop = if p.hard_stop > 0.0 {
-                format!("止损 {:.2}", p.hard_stop)
-            } else {
-                "止损未设".to_string()
-            };
+            let stop = p
+                .hard_stop
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .map(|value| format!("止损 {value:.2}"))
+                .unwrap_or_else(|| "止损未设".to_string());
             lines.push(format!(
                 "- **{}({})** 成本 {:.2}, {}. 明日解禁, 竞价关注",
                 p.name, p.code, p.cost_price, stop
@@ -135,11 +143,11 @@ pub fn build_close_summary(
     if !tomorrow_unlocks.is_empty() {
         lines.push("## ✅ 明日可卖（今日已解禁）".into());
         for p in tomorrow_unlocks {
-            let stop = if p.hard_stop > 0.0 {
-                format!("止损 {:.2}", p.hard_stop)
-            } else {
-                "止损未设".to_string()
-            };
+            let stop = p
+                .hard_stop
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .map(|value| format!("止损 {value:.2}"))
+                .unwrap_or_else(|| "止损未设".to_string());
             lines.push(format!(
                 "- **{}({})** 成本 {:.2}, {}. 明日可自由买卖",
                 p.name, p.code, p.cost_price, stop
@@ -182,7 +190,7 @@ mod tests {
             name: name.into(),
             shares: 1000,
             cost_price: cost,
-            hard_stop: stop,
+            hard_stop: Some(stop),
             added_at: NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
             status: crate::portfolio::PositionStatus::Holding,
             sector: "其他".into(),
@@ -200,9 +208,9 @@ mod tests {
     #[test]
     fn test_pre_market_with_positions() {
         init_db();
-        let positions = vec![pos("000001", "测试", 10.0, 9.2)];
+        let positions = vec![pos("TEST_CODE_000001", "测试", 10.0, 9.2)];
         let text = build_pre_market_checklist(&positions, &[], &[]);
-        assert!(text.contains("000001"));
+        assert!(text.contains("TEST_CODE_000001"));
         assert!(text.contains("10.00"));
         assert!(text.contains("9.20"));
     }
@@ -210,7 +218,7 @@ mod tests {
     #[test]
     fn test_pre_market_with_t1_unlocks() {
         init_db();
-        let t1 = vec![pos("000002", "解禁股", 10.0, 9.0)];
+        let t1 = vec![pos("TEST_CODE_000002", "解禁股", 10.0, 9.0)];
         let text = build_pre_market_checklist(&[], &t1, &[]);
         assert!(text.contains("T+1 解禁预警"));
         assert!(text.contains("解禁股"));
@@ -227,7 +235,7 @@ mod tests {
     #[test]
     fn test_close_summary_with_t1_frozen() {
         init_db();
-        let t1 = vec![pos("000001", "冻结股", 10.0, 9.0)];
+        let t1 = vec![pos("TEST_CODE_000001", "冻结股", 10.0, 9.0)];
         let text = build_close_summary(0.0, 0, 0, 0.0, 0, 0, &t1, &[]);
         assert!(text.contains("T+1 冻结股"));
         assert!(text.contains("明日解禁"));
@@ -236,7 +244,7 @@ mod tests {
     #[test]
     fn test_close_summary_with_tomorrow_unlocks() {
         init_db();
-        let unlocks = vec![pos("000002", "可卖", 10.0, 9.0)];
+        let unlocks = vec![pos("TEST_CODE_000002", "可卖", 10.0, 9.0)];
         let text = build_close_summary(0.0, 0, 0, 0.0, 0, 0, &[], &unlocks);
         assert!(text.contains("明日可卖"));
         assert!(text.contains("可自由买卖"));
@@ -245,7 +253,7 @@ mod tests {
     #[test]
     fn test_close_summary_hides_zero_stop() {
         // 止损为 0 时不应显示 "止损 0.00"
-        let t1 = vec![pos("000003", "无止损", 10.0, 0.0)];
+        let t1 = vec![pos("TEST_CODE_000003", "无止损", 10.0, 0.0)];
         let text = build_close_summary(0.0, 0, 0, 0.0, 0, 0, &t1, &[]);
         assert!(text.contains("止损未设"));
         assert!(!text.contains("止损 0.00"));

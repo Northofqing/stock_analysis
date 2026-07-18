@@ -101,8 +101,7 @@ impl EventEnvelope {
             return Err(EnvelopeError::BlankEventType);
         }
 
-        let payload = serde_json::to_value(event)
-            .map_err(|_| EnvelopeError::BlankEventType)?;
+        let payload = serde_json::to_value(event).map_err(|_| EnvelopeError::BlankEventType)?;
 
         event.validate()?;
 
@@ -192,7 +191,7 @@ mod tests {
     fn envelope_captures_event_metadata_and_payload() {
         let event = PushDeliveryEvent::new(
             "announcement_v1".into(),
-            Some("600519".into()),
+            Some("TEST_CODE_600519".into()),
             "Pushed".into(),
             "dry_run".into(),
             42,
@@ -206,21 +205,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(env.event_type, "push.delivery.audit");
-        assert_eq!(env.entity_key.as_deref(), Some("600519"));
+        assert_eq!(env.entity_key.as_deref(), Some("TEST_CODE_600519"));
         assert_eq!(env.payload["outcome"], "Pushed");
         assert_eq!(env.version, 1);
     }
 
     #[test]
     fn envelope_rejects_empty_identity_fields() {
-        let event = PushDeliveryEvent::new(
-            "".into(),
-            None,
-            "Pushed".into(),
-            "dry_run".into(),
-            0,
-            0,
-        );
+        let event =
+            PushDeliveryEvent::new("".into(), None, "Pushed".into(), "dry_run".into(), 0, 0);
         let err = EventEnvelope::from_event(
             &event,
             "evt-1".into(),

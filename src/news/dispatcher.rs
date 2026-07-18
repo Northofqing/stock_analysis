@@ -105,7 +105,7 @@ pub fn is_important(p: &NewsPush) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::news::impact::{RelationType, score_event};
+    use crate::news::impact::{score_event, RelationType};
     use crate::signal::market_event::{Direction, EventType, MarketEvent, SourceRef};
     use chrono::{Local, Utc};
 
@@ -123,7 +123,11 @@ mod tests {
             certainty: 80,
             chains: vec![],
             occurred_at: now,
-            provenance: vec![SourceRef { provider: "test".into(), url: None, fetched_at: now }],
+            provenance: vec![SourceRef {
+                provider: "test".into(),
+                url: None,
+                fetched_at: now,
+            }],
             ai_degraded: false,
             stale: false,
         }
@@ -131,7 +135,7 @@ mod tests {
 
     #[test]
     fn test_decide_high_score_pushed() {
-        let e = mk_event(Direction::Bull, 100, "000001", "长鑫 IPO");
+        let e = mk_event(Direction::Bull, 100, "TEST_CODE_000001", "长鑫 IPO");
         let imp = score_event(&e, RelationType::SelfCode, 2);
         assert!(imp.score > 70.0);
         assert!(decide(&imp).is_some());
@@ -140,7 +144,7 @@ mod tests {
 
     #[test]
     fn test_decide_low_score_dropped() {
-        let e = mk_event(Direction::Neutral, 10, "600519", "弱产业传闻");
+        let e = mk_event(Direction::Neutral, 10, "TEST_CODE_600519", "弱产业传闻");
         let imp = score_event(&e, RelationType::Industry, 1);
         assert!(imp.score < 40.0, "low score {}, should be < 40", imp.score);
         assert!(decide(&imp).is_none());
@@ -148,11 +152,15 @@ mod tests {
 
     #[test]
     fn test_decide_mid_score_pushed_not_important() {
-        let e = mk_event(Direction::Bear, 30, "300750", "新能源车政策微调");
+        let e = mk_event(Direction::Bear, 30, "TEST_CODE_300750", "新能源车政策微调");
         let imp = score_event(&e, RelationType::PolicyImpact, 1);
         let p = decide(&imp).expect("should be decided above 40 threshold");
         assert!(p.score >= 40.0, "score {} should be ≥ 40", p.score);
-        assert!(p.score < 70.0, "score {} should be < 70 (info tier)", p.score);
+        assert!(
+            p.score < 70.0,
+            "score {} should be < 70 (info tier)",
+            p.score
+        );
         assert!(!is_important(&p));
     }
 
@@ -162,7 +170,15 @@ mod tests {
         let e = mk_event(Direction::Neutral, 30, "政府监管", "国家发展改革委公告");
         let imp = score_event(&e, RelationType::PolicyImpact, 1);
         let p = decide(&imp).expect("政策类应 ≥40 推送");
-        assert!(!p.text.contains("未知("), "类别事件不应出现 '未知(': {}", p.text);
-        assert!(p.text.contains("📊 政府监管 |"), "应直接显示类别名: {}", p.text);
+        assert!(
+            !p.text.contains("未知("),
+            "类别事件不应出现 '未知(': {}",
+            p.text
+        );
+        assert!(
+            p.text.contains("📊 政府监管 |"),
+            "应直接显示类别名: {}",
+            p.text
+        );
     }
 }
