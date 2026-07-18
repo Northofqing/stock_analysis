@@ -218,3 +218,11 @@ Expected: all PASS. Commit only the two modules plus design/plan/progress eviden
 - [ ] Validate the local real-account/account-audit trail without printing or uploading private values.
 - [ ] Run independent Standards, Spec, and Audit reviews against a fixed SHA; resolve every Critical/Important finding and repeat.
 - [ ] Complete the PR checklist, mark PR #2 Ready, merge through GitHub into `master`, update local `master`, and verify the merge commit plus clean worktree.
+
+### Task 19: Cover deterministic data, timeframe, quote, and report boundaries
+
+- [x] Route the real post-fetch pipeline batch through one strict persistence/freshness boundary and cover empty, stale, and valid isolated batches.
+- [x] Separate real 60/15-minute acquisition from deterministic multi-timeframe resolution and exercise insufficient and complete evidence.
+- [x] Route Tencent name/realtime HTTP bodies and Eastmoney minute bodies through private strict parsers; cover protocol, field, price, time, continuity, and runtime failures with `TEST_CODE_` fixtures only.
+- [x] Exercise daily/WeChat report construction with complete nullable domain evidence and exact output assertions; no network or production fallback is introduced.
+- [x] Run focused tests, formatter, strict library Clippy, and full instrumented library coverage: 1,561 passed / 10 ignored / 0 failed; library global 51,018/72,142 = 70.72%, registered core 26,010/29,655 = 87.71%.

@@ -662,3 +662,10 @@ Failure handling:
 - 数据流：生产 envelope 类型统一为 `push.delivery.audit`；事件构造先校验非空 kind/channel 和登记 outcome，`PushRecord` 对相同字段、类型及 latency 做严格读取。模板层用于全局冷却的空字符串键在进入事件链前规范化为 `None`，不伪造证券身份。历史查询对 JSONL 每一非缺失分片执行完整解析，非投递事件只在成功解析且明确类型不匹配时排除；投递审计字段错误必须传播。成功率继续使用既有时间窗、sink/kind 筛选和 `Pushed/(Pushed+Failed)` 公式。
 - 失败模式与测试：不存在的日期文件表达零记录；目录权限、文件读取、空行、坏 JSON、缺 kind、未知/缺失/错类型 outcome/channel/latency 都不得跳过。测试写入唯一临时 JSONL，覆盖生产事件 round-trip、全局事件空键规范化、筛选、零分母和损坏文件，不调用外部 sink、不写真实审计目录。所有修改推送环境变量的测试共用同一串行域，并在 Drop 时恢复原值，防止静默时段判定串扰。
 - 旧模块与回滚：采用现有 `PushDeliveryEvent`、`PushRecord`、`HistoryQuery`、BR-043 排序/限制和 BR-091 hash-chain，不引入兼容别名或第二套统计。整体回退 BR-130 代码、测试和文档；不得只恢复测试专用事件类型或损坏行跳过。
+
+## Addendum: Gate-D 确定性执行边界（2026-07-19）
+
+- 目标：CI 等价基线只有全局 63.77% / 核心 87.62%。优先让生产已有的“获取后校验/组装”步骤通过无网络的本地协议事实执行，再处理 transport 失败边界。覆盖率仍由工作流原命令计算，不排除文件、不降低阈值。
+- 模块边界：`pipeline::data` 保留真实 `DataFetcherManager` 负责获取，新的私有 resolved 步骤只负责空批、日线新鲜度和已有 SQLite 持久化；多周期入口保留真实 60/15 分钟请求，resolved 步骤只消费已校验的两个完整批次。腾讯名称/实时行情从 HTTP 状态与 body 解析中拆出私有纯解析边界，生产请求继续调用同一解析器。
+- 失败模式：空/过期日线、缺失多周期批次、腾讯缺引号/短行/坏时间/非正价/颠倒涨跌停价仍显式失败；不得由测试注入伪行情到生产路径。汇总通知的文件和发送失败继续按现有语义传播/记录，不伪报推送成功。
+- 旧模块与回滚：采用现有 `DataFetcherManager`、`validate_daily_freshness`、`assess_multi_timeframe_entry`、`NotificationService` 和腾讯协议字段，拒绝第二套阈值或 mock provider。整批回退 resolved/parser 提取及测试；不能只恢复静默空值或跳过坏批次。

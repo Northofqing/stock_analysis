@@ -39,6 +39,11 @@ impl GtimgProvider {
         }
 
         let lower = raw.to_ascii_lowercase();
+        #[cfg(test)]
+        let lower = lower
+            .strip_prefix("test_code_")
+            .unwrap_or(&lower)
+            .to_string();
 
         // 1) 先处理显式前缀
         if let Some(rest) = lower.strip_prefix("sh") {
@@ -343,31 +348,11 @@ impl GtimgProvider {
         {
             Ok(response) => {
                 if let Ok(text) = response.text().await {
-                    // 解析格式: v_sz002413="51~雷科防务~002413~15.00~..."
-                    if let Some(start) = text.find('"') {
-                        if let Some(end) = text.rfind('"') {
-                            if start < end {
-                                let data = &text[start + 1..end];
-                                // v13.10.6: 修复 review #14 引入的 bug
-                                //   旧: splitn(2, '~') → parts[1] = "雷科防务~002413~15.00~..." (整个尾部)
-                                //   新: splitn(3, '~').nth(1) = "雷科防务" (第二个字段, 即股票名)
-                                let name = data
-                                    .split('~')
-                                    .nth(1)
-                                    .map(|s| s.trim().to_string())
-                                    .filter(|s| !s.is_empty());
-                                if let Some(name) = name {
-                                    log::debug!("[腾讯] 获取股票名称: {} -> {}", code, name);
-                                    return Some(name);
-                                }
-                                log::debug!(
-                                    "[腾讯] 股票名称解析失败: code={}, text={}",
-                                    code,
-                                    text
-                                );
-                            }
-                        }
+                    if let Some(name) = Self::parse_stock_name_response(&text) {
+                        log::debug!("[腾讯] 获取股票名称: {} -> {}", code, name);
+                        return Some(name);
                     }
+                    log::debug!("[腾讯] 股票名称解析失败: code={}, text={}", code, text);
                 }
             }
             Err(e) => {
@@ -377,12 +362,25 @@ impl GtimgProvider {
         None
     }
 
+    fn parse_stock_name_response(text: &str) -> Option<String> {
+        // 解析格式: v_sz002413="51~雷科防务~002413~15.00~..."
+        let start = text.find('"')?;
+        let end = text.rfind('"').filter(|end| *end > start)?;
+        // v13.10.6: 只取第二个 `~` 字段，不把后续行情注入名称。
+        text[start + 1..end]
+            .split('~')
+            .nth(1)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+    }
+
     /// 获取实时行情（包含盈利指标）
     async fn fetch_realtime_quote_internal(
         client: &reqwest::Client,
         code: &str,
     ) -> Result<Option<RealtimeQuote>> {
-        let (normalized_code, market_code) = Self::normalize_for_tencent(code)
+        let (_, market_code) = Self::normalize_for_tencent(code)
             .ok_or_else(|| anyhow!("无效股票代码格式: {}", code))?;
 
         let url = format!("http://qt.gtimg.cn/q={}", market_code);
@@ -400,6 +398,12 @@ impl GtimgProvider {
             .text()
             .await
             .map_err(|error| anyhow!("腾讯实时行情 {code} 响应读取失败: {error}"))?;
+        Self::parse_realtime_quote_response(&text, code)
+    }
+
+    fn parse_realtime_quote_response(text: &str, code: &str) -> Result<Option<RealtimeQuote>> {
+        let (normalized_code, _) = Self::normalize_for_tencent(code)
+            .ok_or_else(|| anyhow!("无效股票代码格式: {}", code))?;
         let start = text
             .find('"')
             .ok_or_else(|| anyhow!("腾讯实时行情 {code}: 响应缺少起始引号"))?;
@@ -714,25 +718,107 @@ mod tests {
     /// 新 splitn(3, '~').nth(1) = "雷科防务" (第二个字段)
     #[test]
     fn test_parse_name_does_not_inject_quote_data() {
-        let data = "51~雷科防务~002413~15.00~15.50~52080~24286~27817";
-        let name: Option<String> = data
-            .split('~')
-            .nth(1)
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
+        let data = "v_sz002413=\"51~雷科防务~002413~15.00~15.50~52080~24286~27817\";";
+        let name = GtimgProvider::parse_stock_name_response(data);
         assert_eq!(name.as_deref(), Some("雷科防务"), "应只取第二个字段");
     }
 
     /// v13.10.6: 单元素 (异常格式) 应返回 None
     #[test]
     fn test_parse_name_handles_short_response() {
-        let data = "51";
-        let name: Option<String> = data
-            .split('~')
-            .nth(1)
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        assert!(name.is_none(), "单元素应返回 None (避免空 name)");
+        for data in ["51", "v=\"51\";", "v=\"51~~002413\";", "v=\"51~name"] {
+            assert!(
+                GtimgProvider::parse_stock_name_response(data).is_none(),
+                "异常格式应返回 None: {data}"
+            );
+        }
+    }
+
+    fn realtime_body(overrides: &[(usize, &str)]) -> String {
+        let mut parts = vec!["0".to_string(); 54];
+        parts[1] = "测试股票".to_string();
+        parts[3] = "10.10".to_string();
+        parts[4] = "10.00".to_string();
+        parts[6] = "1234".to_string();
+        parts[30] = "20260718101530".to_string();
+        parts[37] = "12.5".to_string();
+        parts[38] = "2.5".to_string();
+        parts[39] = "15.0".to_string();
+        parts[44] = "100.0".to_string();
+        parts[45] = "120.0".to_string();
+        parts[46] = "2.0".to_string();
+        parts[47] = "11.00".to_string();
+        parts[48] = "9.00".to_string();
+        parts[52] = "16.0".to_string();
+        for (index, value) in overrides {
+            parts[*index] = (*value).to_string();
+        }
+        format!("v_sz000001=\"{}\";", parts.join("~"))
+    }
+
+    #[test]
+    fn realtime_response_preserves_complete_quote_evidence() {
+        let quote =
+            GtimgProvider::parse_realtime_quote_response(&realtime_body(&[]), "TEST_CODE_000001")
+                .unwrap()
+                .unwrap();
+        assert_eq!(quote.code, "000001");
+        assert_eq!(quote.name, "测试股票");
+        assert_eq!(quote.price, 10.10);
+        assert!((quote.pct_chg - 1.0).abs() < 1e-12);
+        assert_eq!(quote.volume, Some(123_400.0));
+        assert_eq!(quote.amount, Some(125_000.0));
+        assert_eq!(quote.pe_ratio, Some(16.0));
+        assert_eq!(quote.pb_ratio, Some(2.0));
+        assert_eq!(quote.limit_up_price, Some(11.0));
+        assert_eq!(quote.limit_down_price, Some(9.0));
+        assert_eq!(quote.source_time.to_rfc3339(), "2026-07-18T02:15:30+00:00");
+    }
+
+    #[test]
+    fn realtime_response_rejects_protocol_and_price_failures() {
+        for body in [
+            "no quotes".to_string(),
+            "v=\"short\";".to_string(),
+            realtime_body(&[(3, "0")]),
+            realtime_body(&[(4, "NaN")]),
+            realtime_body(&[(30, "bad")]),
+            realtime_body(&[(47, "8.00"), (48, "9.00")]),
+        ] {
+            assert!(
+                GtimgProvider::parse_realtime_quote_response(&body, "TEST_CODE_000001").is_err(),
+                "body={body}"
+            );
+        }
+        assert!(
+            GtimgProvider::parse_realtime_quote_response(&realtime_body(&[]), "bad-code").is_err()
+        );
+    }
+
+    #[test]
+    fn realtime_optional_metrics_remain_absent_when_invalid() {
+        let quote = GtimgProvider::parse_realtime_quote_response(
+            &realtime_body(&[
+                (6, "bad"),
+                (37, "-1"),
+                (38, "NaN"),
+                (39, "-1"),
+                (44, "bad"),
+                (45, "-1"),
+                (46, "bad"),
+                (52, "-1"),
+            ]),
+            "TEST_CODE_000001",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(quote.volume, None);
+        assert_eq!(quote.amount, None);
+        assert_eq!(quote.turnover_rate, None);
+        assert_eq!(quote.market_cap, None);
+        assert_eq!(quote.circulating_cap, None);
+        assert_eq!(quote.pb_ratio, None);
+        assert_eq!(quote.pe_ratio, None);
     }
 
     #[test]

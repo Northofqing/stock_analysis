@@ -21,6 +21,8 @@ pub struct MinuteBar {
 }
 
 fn to_secid(code: &str) -> String {
+    #[cfg(test)]
+    let code = code.strip_prefix("TEST_CODE_").unwrap_or(code);
     let market = if code.starts_with('6') || code.starts_with("688") || code.starts_with("900") {
         "1"
     } else {
@@ -142,6 +144,20 @@ fn parse_minute_rows(rows: &[serde_json::Value], klt: u8) -> Result<Vec<MinuteBa
     Ok(bars)
 }
 
+fn parse_minute_response(text: &str, klt: u8) -> Result<Vec<MinuteBar>> {
+    if text.trim_start().starts_with('<') {
+        return Err(anyhow!("非JSON回包（网关拦截）"));
+    }
+    let json: serde_json::Value =
+        serde_json::from_str(text).map_err(|error| anyhow!("JSON解析失败: {error}"))?;
+    let klines = json
+        .get("data")
+        .and_then(|data| data.get("klines"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow!("分钟K线无 klines 数组"))?;
+    parse_minute_rows(klines, klt).map_err(|error| anyhow!("分钟K线批次校验失败: {error}"))
+}
+
 /// 抓取分钟 K 线（异步内部实现）。
 pub(crate) async fn fetch_async(
     client: &reqwest::Client,
@@ -185,32 +201,10 @@ pub(crate) async fn fetch_async(
                 continue;
             }
         };
-        let body = text.trim_start();
-        if body.starts_with('<') {
-            last_err = format!("{}: 非JSON回包（网关拦截）", host);
-            continue;
-        }
-        let json: serde_json::Value = match serde_json::from_str(&text) {
-            Ok(v) => v,
-            Err(e) => {
-                last_err = format!("{}: JSON解析失败 {}", host, e);
-                continue;
-            }
-        };
-
-        let Some(klines) = json
-            .get("data")
-            .and_then(|d| d.get("klines"))
-            .and_then(|v| v.as_array())
-        else {
-            last_err = format!("{}: 分钟K线无 klines 数组", host);
-            continue;
-        };
-
-        match parse_minute_rows(klines, klt) {
+        match parse_minute_response(&text, klt) {
             Ok(bars) => return Ok(bars),
             Err(error) => {
-                last_err = format!("{host}: 分钟K线批次校验失败: {error}");
+                last_err = format!("{host}: {error}");
             }
         }
     }
@@ -237,6 +231,39 @@ pub fn fetch_blocking(
 mod br115_tests {
     use super::*;
 
+    fn row(timestamp: &str, values: &str) -> serde_json::Value {
+        serde_json::Value::String(format!("{timestamp},{values}"))
+    }
+
+    #[test]
+    fn secid_and_session_transitions_are_deterministic() {
+        assert_eq!(to_secid("TEST_CODE_600000"), "1.600000");
+        assert_eq!(to_secid("TEST_CODE_000001"), "0.000001");
+
+        let parse =
+            |value: &str| chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M").unwrap();
+        assert!(minute_transition_is_continuous(
+            parse("2026-07-17 10:00"),
+            parse("2026-07-17 10:15"),
+            15,
+        ));
+        assert!(minute_transition_is_continuous(
+            parse("2026-07-17 11:30"),
+            parse("2026-07-17 13:15"),
+            15,
+        ));
+        assert!(minute_transition_is_continuous(
+            parse("2026-07-17 15:00"),
+            parse("2026-07-20 09:45"),
+            15,
+        ));
+        assert!(!minute_transition_is_continuous(
+            parse("2026-07-17 10:00"),
+            parse("2026-07-17 10:15"),
+            5,
+        ));
+    }
+
     #[test]
     fn malformed_minute_row_rejects_entire_batch() {
         let rows = vec![
@@ -259,5 +286,57 @@ mod br115_tests {
             serde_json::Value::String("2026-07-17 10:00,13,13,13.1,12.9,100".to_string()),
         ];
         assert!(parse_minute_rows(&jump, 15).is_err());
+    }
+
+    #[test]
+    fn minute_rows_accept_valid_batch_and_reject_every_invalid_field_class() {
+        let valid = vec![
+            row("2026-07-17 09:45", "10,10.1,10.2,9.9,100"),
+            row("2026-07-17 10:00", "10.1,10.2,10.3,10,120"),
+        ];
+        let bars = parse_minute_rows(&valid, 15).unwrap();
+        assert_eq!(bars.len(), 2);
+        assert_eq!(bars[1].timestamp, "2026-07-17 10:00");
+        assert_eq!(bars[1].open, 10.1);
+        assert_eq!(bars[1].high, 10.3);
+        assert_eq!(bars[1].low, 10.0);
+        assert_eq!(bars[1].volume, 120.0);
+
+        let invalid_batches = [
+            vec![serde_json::json!({"not": "a row"})],
+            vec![row("invalid-time", "10,10,10,10,1")],
+            vec![row("2026-07-17 09:45", "bad,10,10,10,1")],
+            vec![row("2026-07-17 09:45", "NaN,10,10,10,1")],
+            vec![row("2026-07-17 09:45", "0,10,10,10,1")],
+            vec![row("2026-07-17 09:45", "10,10,9,10,1")],
+            vec![row("2026-07-17 09:45", "10,10,10,11,1")],
+            vec![row("2026-07-17 09:45", "10,10,10,10,-1")],
+        ];
+        for batch in invalid_batches {
+            assert!(parse_minute_rows(&batch, 15).is_err());
+        }
+        assert!(parse_minute_rows(&[], 15).is_err());
+    }
+
+    #[test]
+    fn minute_response_requires_json_klines_and_validated_rows() {
+        let valid = r#"{"data":{"klines":["2026-07-17 09:45,10,10.1,10.2,9.9,100"]}}"#;
+        assert_eq!(parse_minute_response(valid, 15).unwrap().len(), 1);
+
+        for invalid in [
+            " <html>blocked</html>",
+            "not-json",
+            r#"{"data":null}"#,
+            r#"{"data":{"klines":[]}}"#,
+        ] {
+            assert!(parse_minute_response(invalid, 15).is_err());
+        }
+    }
+
+    #[test]
+    fn blocking_fetch_requires_an_existing_runtime() {
+        let client = reqwest::Client::new();
+        let error = fetch_blocking(&client, "TEST_CODE_600000", 15, 1).unwrap_err();
+        assert!(error.to_string().contains("无 tokio runtime"));
     }
 }

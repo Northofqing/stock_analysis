@@ -25,11 +25,56 @@ pub(super) async fn fetch_multi_timeframe_section(code: &str) -> Result<Option<S
     );
     let h1 = h1_result.map_err(|error| format!("[{code}] 60min K线不可用: {error}"))?;
     let m15 = m15_result.map_err(|error| format!("[{code}] 15min K线不可用: {error}"))?;
-    let assess = crate::strategy::assess_multi_timeframe_entry(&h1, &m15);
+    Ok(resolve_multi_timeframe_section(&h1, &m15))
+}
+
+fn resolve_multi_timeframe_section(
+    h1: &[crate::data_provider::intraday_kline::MinuteBar],
+    m15: &[crate::data_provider::intraday_kline::MinuteBar],
+) -> Option<String> {
+    let assess = crate::strategy::assess_multi_timeframe_entry(h1, m15);
     let section = assess.to_prompt_section();
     if section.trim().is_empty() {
-        Ok(None)
+        None
     } else {
-        Ok(Some(section))
+        Some(section)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data_provider::intraday_kline::MinuteBar;
+
+    fn bars(count: usize, step_minutes: i64) -> Vec<MinuteBar> {
+        let start = chrono::NaiveDate::from_ymd_opt(2026, 7, 16)
+            .unwrap()
+            .and_hms_opt(9, 30, 0)
+            .unwrap();
+        (0..count)
+            .map(|index| {
+                let close = 10.0 + index as f64 * 0.01;
+                MinuteBar {
+                    timestamp: (start + chrono::Duration::minutes(step_minutes * index as i64))
+                        .format("%Y-%m-%d %H:%M")
+                        .to_string(),
+                    open: close - 0.01,
+                    close,
+                    high: close + 0.05,
+                    low: close - 0.05,
+                    volume: 1_000.0 + index as f64 * 10.0,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn resolved_multi_timeframe_distinguishes_insufficient_and_present_batches() {
+        assert!(resolve_multi_timeframe_section(&bars(29, 60), &bars(20, 15)).is_none());
+        let section = resolve_multi_timeframe_section(&bars(40, 60), &bars(30, 15))
+            .expect("complete validated bars must render an assessment");
+        assert!(section.contains("多周期入场点"));
+        assert!(section.contains("命中入场规则:"));
+        assert!(section.contains("结论:"));
     }
 }

@@ -940,3 +940,157 @@ fn format_money_flow_section(raw: &str) -> Vec<String> {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::notification::NotificationConfig;
+    use crate::pipeline::ScoreBreakdown;
+
+    fn result(code: &str, advice: &str, ranking_score: i32) -> AnalysisResult {
+        let mut result: AnalysisResult = serde_json::from_value(serde_json::json!({
+            "code": code,
+            "name": format!("{code}_NAME"),
+            "sentiment_score": ranking_score,
+            "ranking_score": ranking_score,
+            "operation_advice": advice,
+            "trend_prediction": "强势多头 多头排列",
+            "analysis_summary": "TEST_CODE 综合分析",
+            "is_limit_up": false,
+            "contrarian_signal": false
+        }))
+        .unwrap();
+        result.technical_analysis = Some("放量突破".into());
+        result.volume_analysis = Some("量价配合".into());
+        result.news_summary = Some("真实公告摘要".into());
+        result.buy_reason = Some("趋势与资金共振".into());
+        result.risk_warning = Some("不追高".into());
+        result.pe_ratio = Some(12.0);
+        result.pb_ratio = Some(0.8);
+        result.turnover_rate = Some(8.0);
+        result.market_cap = Some(120.0);
+        result.circulating_cap = Some(100.0);
+        result.current_price = Some(10.5);
+        result.ma_alignment = Some("多头排列".into());
+        result.bias_ma5 = Some(4.2);
+        result.volume_ratio_5d = Some(2.5);
+        result.pos_52w = Some(62.0);
+        result.chg_5d = Some(16.0);
+        result.chg_10d = Some(26.0);
+        result.volatility = Some(5.5);
+        result.eps = Some(2.2);
+        result.roe = Some(26.0);
+        result.gross_margin = Some(45.0);
+        result.net_margin = Some(18.0);
+        result.revenue_yoy = Some(32.0);
+        result.net_profit_yoy = Some(25.0);
+        result.sharpe_ratio = Some(2.1);
+        result.industry_section = Some("同业中位数已验证".into());
+        result.valuation_history_section = Some("PE 分位 20%".into());
+        result.consensus_section = Some("一致预期上调".into());
+        result.fin_history_section = Some("近三期增长".into());
+        result.quality_section = Some("CFO/NI 完整".into());
+        result.money_flow_section = Some(
+            "【主力资金】\n日期|净额\n2026-07-18|+1.2亿\n结论为净流入\n【龙虎榜】\n机构净买入"
+                .into(),
+        );
+        result.score_breakdown = Some(ScoreBreakdown {
+            technical: 90,
+            fundamental_quality: 85,
+            valuation_safety: 70,
+            capital_flow: 65,
+            growth_sustainability: 88,
+        });
+        result
+    }
+
+    #[test]
+    fn rich_daily_report_executes_registered_sections_and_stable_sorting() {
+        let service = NotificationService::new(NotificationConfig::default());
+        let mut buy = result("TEST_CODE_BUY", "建议买入", 90);
+        buy.is_limit_up = true;
+        buy.position_buy_price = Some(10.0);
+        buy.position_quantity = Some(1_000);
+        buy.position_return = Some(5.0);
+        buy.position_buy_date = Some("2026-07-16".into());
+        buy.position_status = Some("new".into());
+
+        let mut sell = result("TEST_CODE_SELL", "建议卖出", 20);
+        sell.contrarian_signal = true;
+        sell.contrarian_reason = Some("超跌企稳".into());
+        sell.position_buy_price = Some(12.0);
+        sell.position_quantity = Some(500);
+        sell.position_return = Some(-3.0);
+        sell.position_buy_date = Some("2026-07-15".into());
+        sell.position_status = Some("closed".into());
+        sell.position_sell_price = Some(11.64);
+        sell.position_sell_date = Some("2026-07-18".into());
+        sell.pe_ratio = Some(-1.0);
+        sell.pb_ratio = Some(4.0);
+        sell.turnover_rate = Some(0.5);
+        sell.market_cap = Some(1_500.0);
+        sell.eps = Some(-0.2);
+        sell.roe = Some(3.0);
+        sell.gross_margin = Some(10.0);
+        sell.revenue_yoy = Some(-2.0);
+        sell.net_profit_yoy = Some(-25.0);
+        sell.sharpe_ratio = Some(-0.5);
+
+        let hold = result("TEST_CODE_HOLD", "观望", 50);
+        let report =
+            service.generate_daily_report(&[hold, sell, buy], Some("## 大盘状态\n结构性行情"));
+        for expected in [
+            "操作建议汇总",
+            "大盘状态",
+            "当日涨停股票",
+            "反向择时信号",
+            "趋势成长强势票",
+            "模拟持仓跟踪",
+            "行业横向对标",
+            "资金面（真实口径）",
+            "| 日期 | 净额 |",
+            "综合分析",
+        ] {
+            assert!(report.contains(expected), "missing {expected}");
+        }
+        assert!(report.find("TEST_CODE_BUY").unwrap() < report.find("TEST_CODE_HOLD").unwrap());
+    }
+
+    #[test]
+    fn wechat_summary_covers_compact_indicator_bands_and_truncation() {
+        let service = NotificationService::new(NotificationConfig::default());
+        let mut high = result("TEST_CODE_HIGH", "强烈买入", 95);
+        high.buy_reason = Some("A".repeat(100));
+        high.risk_warning = Some("B".repeat(70));
+        let mut low = result("TEST_CODE_LOW", "卖出", 10);
+        low.volume_ratio_5d = Some(0.5);
+        low.bias_ma5 = Some(1.0);
+        let mut hold = result("TEST_CODE_HOLD", "持有", 50);
+        hold.volume_ratio_5d = Some(1.0);
+        hold.current_price = None;
+        hold.ma_alignment = None;
+        hold.pos_52w = None;
+        let report = service.generate_wechat_summary(&[low, hold, high]);
+        assert!(report.contains("买入:1 🟡持有:1 🔴卖出:1"));
+        assert!(report.contains("量比2.5(放量)"));
+        assert!(report.contains("量比0.5(缩量)"));
+        assert!(report.contains("..."));
+        assert!(report.find("TEST_CODE_HIGH").unwrap() < report.find("TEST_CODE_LOW").unwrap());
+    }
+
+    #[test]
+    fn focus_and_money_flow_helpers_keep_missing_and_malformed_evidence_explicit() {
+        let mut candidate = result("TEST_CODE_FOCUS", "观望", 50);
+        assert!(is_trend_growth_focus(&candidate));
+        candidate.score_breakdown = None;
+        assert!(!is_trend_growth_focus(&candidate));
+        assert!(format_money_flow_section("没有标题的文本").is_empty());
+        let rendered = format_money_flow_section(
+            "【空段】\n【表格】\nA|B\n1|2\n不是表格\n【列表】\n结论一\n结论二",
+        );
+        assert!(rendered.contains(&"**表格**".to_string()));
+        assert!(rendered.contains(&"| A | B |".to_string()));
+        assert!(rendered.contains(&"- 不是表格".to_string()));
+        assert!(rendered.contains(&"- 结论二".to_string()));
+    }
+}

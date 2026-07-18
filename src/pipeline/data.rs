@@ -40,6 +40,16 @@ impl AnalysisPipeline {
                 .context("spawn_blocking panicked")?
                 .context("获取数据失败")?;
 
+        self.finalize_fetched_data(code, data, source, chrono::Local::now())
+    }
+
+    fn finalize_fetched_data(
+        &self,
+        code: &str,
+        data: Vec<KlineData>,
+        source: &str,
+        observed_at: chrono::DateTime<chrono::Local>,
+    ) -> Result<Vec<KlineData>> {
         if data.is_empty() {
             warn!("[{}] 获取到的数据为空", code);
             return Ok(data);
@@ -55,7 +65,7 @@ impl AnalysisPipeline {
         };
         let dq_stats = DqStats::new();
         if let Err(reason) =
-            validate_daily_freshness(latest_date, chrono::Local::now(), &freshness, &dq_stats)
+            validate_daily_freshness(latest_date, observed_at, &freshness, &dq_stats)
         {
             anyhow::bail!(
                 "[{}] 日线新鲜度校验失败: {} (latest_date={})",
@@ -82,5 +92,82 @@ impl AnalysisPipeline {
         }
 
         Ok(data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data_provider::AdjustType;
+
+    fn kline(date: chrono::NaiveDate) -> KlineData {
+        KlineData {
+            date,
+            open: 10.0,
+            high: 10.2,
+            low: 9.9,
+            close: 10.1,
+            volume: 1_000.0,
+            amount: 10_000.0,
+            pct_chg: 1.0,
+            intraday_price: None,
+            settled: true,
+            pe_ratio: None,
+            pb_ratio: None,
+            turnover_rate: None,
+            market_cap: None,
+            circulating_cap: None,
+            eps: None,
+            roe: None,
+            revenue_yoy: None,
+            net_profit_yoy: None,
+            gross_margin: None,
+            net_margin: None,
+            sharpe_ratio: None,
+            financials_history: None,
+            valuation_history: None,
+            consensus: None,
+            industry: None,
+            is_limit_up: false,
+            is_limit_down: false,
+            is_suspended: false,
+            adjust: AdjustType::Qfq,
+        }
+    }
+
+    #[tokio::test]
+    async fn resolved_daily_batch_preserves_empty_and_rejects_stale_evidence() {
+        let pipeline = AnalysisPipeline::new(super::super::PipelineConfig::default()).unwrap();
+        let now = chrono::Local::now();
+        assert!(pipeline
+            .finalize_fetched_data("TEST_CODE_EMPTY", Vec::new(), "test", now)
+            .unwrap()
+            .is_empty());
+
+        let stale = now.date_naive() - chrono::Duration::days(30);
+        assert!(pipeline
+            .finalize_fetched_data("TEST_CODE_STALE", vec![kline(stale)], "test", now)
+            .unwrap_err()
+            .to_string()
+            .contains("日线新鲜度校验失败"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(database)]
+    async fn resolved_fresh_daily_batch_reaches_existing_persistence_boundary() {
+        let pipeline = AnalysisPipeline::new(super::super::PipelineConfig::default()).unwrap();
+        let now = chrono::Local::now();
+        let latest = crate::calendar::recent_trading_days(now.date_naive(), 1)[0];
+        let data = vec![kline(latest)];
+        let resolved = pipeline
+            .finalize_fetched_data(
+                "TEST_CODE_PIPELINE_DATA",
+                data.clone(),
+                "test_provider",
+                now,
+            )
+            .unwrap();
+        assert_eq!(resolved[0].date, data[0].date);
+        assert_eq!(resolved[0].close, 10.1);
     }
 }
