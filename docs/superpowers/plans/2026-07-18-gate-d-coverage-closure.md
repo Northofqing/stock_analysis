@@ -173,6 +173,13 @@ Expected: all PASS. Commit only the two modules plus design/plan/progress eviden
 - [x] Cover exclusion, leader, rotation, sector score and capital verification public states; reject zero-window and invalid RS endpoints without changing registered thresholds.
 - [x] Run focused suites and full instrumented library coverage; record 1,521 pass / 10 ignored / 0 failed, global 67.77% and registered core 84.64%.
 
+### Task 4D: Close auxiliary database audit and LHB evidence gaps
+
+- [x] Register BR-127 before changing account-mode or LHB behavior; require exact affected-row audit marking and complete LHB API/cache batches.
+- [x] Replace LHB missing-field/zero fallback parsing with strict local protocol parsing, trading-day/domain validation, batch duplicate rejection and propagated cache read/write failures.
+- [x] Cover account-mode audit, LHB persistence/query/cleanup, position available-share composition, Stock/Trade repositories and DataFetchService cache-hit/expiry paths with isolated `TEST_CODE_` facts.
+- [x] Run focused tests, strict all-target Clippy, full library regression and instrumented coverage; record 1,529 pass / 10 ignored / 0 failed, global 68.62% and registered core 85.86%.
+
 ### Task 6: Raise repository-wide coverage to 80%
 
 **Files:**

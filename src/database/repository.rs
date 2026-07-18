@@ -1,3 +1,4 @@
+//! Registered business rules: BR-092.
 //! Repository pattern — 解耦数据访问与业务逻辑。
 //!
 //! 当前 `DatabaseManager` 是全局单例，所有模块直接调用 `DatabaseManager::get()`。
@@ -208,7 +209,20 @@ fn insert_trade(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::NewStockPosition;
+    use diesel::prelude::*;
     use std::path::PathBuf;
+
+    fn unique_code(label: &str) -> String {
+        format!(
+            "TEST_CODE_REPOSITORY_{label}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        )
+    }
 
     fn make_kline(date: NaiveDate, close: f64) -> KlineData {
         KlineData {
@@ -246,28 +260,159 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn test_stock_repository_roundtrip() {
         std::fs::create_dir_all("./test_data").ok();
         let _ = DatabaseManager::init(Some(PathBuf::from("./test_data/test.db")));
         let db = DatabaseManager::get();
 
         // 使用 TEST_ 前缀代码与真实标的硬隔离（AGENTS.md 2.5）
-        let code = "TEST_REPO";
+        let code = unique_code("KLINE");
         let d = NaiveDate::from_ymd_opt(2026, 1, 2).unwrap();
-        let saved = StockRepository::save_kline(db, code, &[make_kline(d, 12.34)])
+        let saved = StockRepository::save_kline(db, &code, &[make_kline(d, 12.34)])
             .await
             .expect("save_kline 应成功");
         assert_eq!(saved, 1);
 
-        let got = StockRepository::find_kline(db, code, 5)
+        let got = StockRepository::find_kline(db, &code, 5)
             .await
             .expect("find_kline 应成功");
         assert!(!got.is_empty());
         assert_eq!(got[0].close, 12.34);
 
-        let latest = StockRepository::get_latest_date(db, code)
+        let latest = StockRepository::get_latest_date(db, &code)
             .await
             .expect("get_latest_date 应成功");
         assert_eq!(latest, Some(d));
+        assert_eq!(
+            StockRepository::save_kline(db, &code, &[]).await.unwrap(),
+            0
+        );
+        assert!(
+            StockRepository::save_kline(db, &code, &[make_kline(d, -1.0)])
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            StockRepository::get_latest_date(db, &unique_code("MISSING"))
+                .await
+                .unwrap(),
+            None
+        );
+        db.delete_stock_data(&code).expect("clean kline fixture");
+    }
+
+    #[test]
+    fn br092_stock_daily_projection_requires_all_source_values() {
+        let date = NaiveDate::from_ymd_opt(2026, 7, 18).unwrap();
+        let timestamp = date.and_hms_opt(12, 0, 0).unwrap();
+        let complete = StockDaily {
+            id: 1,
+            code: "TEST_CODE_PROJECTION".to_string(),
+            date,
+            open: Some(10.0),
+            high: Some(11.0),
+            low: Some(9.0),
+            close: Some(10.5),
+            volume: Some(1_000.0),
+            amount: Some(10_500.0),
+            pct_chg: Some(5.0),
+            ma5: None,
+            ma10: None,
+            ma20: None,
+            volume_ratio: None,
+            data_source: Some("TEST_CODE_SOURCE".to_string()),
+            created_at: timestamp,
+            updated_at: timestamp,
+        };
+        let projected = stock_daily_to_kline(complete.clone()).expect("complete row projects");
+        assert_eq!(projected.open, 10.0);
+        assert_eq!(projected.high, 11.0);
+        assert_eq!(projected.low, 9.0);
+        assert_eq!(projected.close, 10.5);
+        assert_eq!(projected.volume, 1_000.0);
+        assert_eq!(projected.amount, 10_500.0);
+        assert_eq!(projected.pct_chg, 5.0);
+        assert!(projected.settled);
+        assert_eq!(projected.adjust, crate::data_provider::AdjustType::None);
+
+        let mut missing = complete;
+        missing.amount = None;
+        let error = stock_daily_to_kline(missing).expect_err("missing amount must reject");
+        assert!(error.to_string().contains("missing required field amount"));
+        assert_eq!(required_daily_value(date, "close", Some(9.5)).unwrap(), 9.5);
+        assert!(required_daily_value(date, "close", None).is_err());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn trade_repository_persists_buy_sell_and_projects_open_positions() {
+        #[derive(QueryableByName)]
+        struct StoredTrade {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            direction: String,
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            name: String,
+            #[diesel(sql_type = diesel::sql_types::Double)]
+            amount: f64,
+        }
+
+        DatabaseManager::init(None).expect("test database init");
+        let db = DatabaseManager::get();
+        let code = unique_code("TRADE");
+        let date = NaiveDate::from_ymd_opt(2026, 7, 18).unwrap();
+        TradeRepository::record_buy(db, &code, "测试交易", 10.0, 200, date)
+            .await
+            .expect("record buy");
+        TradeRepository::record_sell(db, &code, 12.0, 100, date)
+            .await
+            .expect("record sell");
+
+        db.save_position(&NewStockPosition {
+            code: code.clone(),
+            name: "测试交易".to_string(),
+            buy_date: "2026-07-01".to_string(),
+            buy_price: 10.0,
+            quantity: 200,
+            status: "open".to_string(),
+            st_type: None,
+            chain_name: None,
+        })
+        .expect("save open position");
+        let positions = TradeRepository::get_positions(db)
+            .await
+            .expect("project open positions");
+        assert!(positions.iter().any(|position| {
+            position.0 == code
+                && position.1 == "测试交易"
+                && position.2 == 10.0
+                && position.3 == 200
+        }));
+
+        let mut conn = db.get_conn().expect("test database connection");
+        let trades = diesel::sql_query(
+            "SELECT direction, name, amount FROM trades WHERE code = ? ORDER BY id",
+        )
+        .bind::<diesel::sql_types::Text, _>(&code)
+        .load::<StoredTrade>(&mut conn)
+        .expect("load stored trades");
+        assert_eq!(trades.len(), 2);
+        assert_eq!(trades[0].direction, "buy");
+        assert_eq!(trades[0].name, "测试交易");
+        assert_eq!(trades[0].amount, 2_000.0);
+        assert_eq!(trades[1].direction, "sell");
+        assert!(trades[1].name.is_empty());
+        assert_eq!(trades[1].amount, 1_200.0);
+
+        diesel::sql_query("DELETE FROM trades WHERE code = ?")
+            .bind::<diesel::sql_types::Text, _>(&code)
+            .execute(&mut conn)
+            .expect("clean trade fixtures");
+        diesel::delete(
+            crate::schema::stock_position::table
+                .filter(crate::schema::stock_position::code.eq(&code)),
+        )
+        .execute(&mut conn)
+        .expect("clean position fixture");
     }
 }

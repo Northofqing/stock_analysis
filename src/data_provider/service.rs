@@ -1,4 +1,4 @@
-//! Registered business rules: BR-057.
+//! Registered business rules: BR-057, BR-115.
 //! 数据获取服务（进程级缓存，单飞抓取，带 TTL）
 //!
 //! 目标：消除"快速分析流水线"与"ReAct Agent 工具"之间对同一只股票同一份数据的重复抓取。
@@ -200,6 +200,41 @@ mod tests {
     use crate::data_provider::brief;
     use crate::data_provider::is_ban_error;
 
+    fn kline() -> KlineData {
+        KlineData {
+            date: chrono::NaiveDate::from_ymd_opt(2026, 7, 18).unwrap(),
+            open: 10.0,
+            high: 10.5,
+            low: 9.8,
+            close: 10.2,
+            volume: 1_000.0,
+            amount: 10_200.0,
+            pct_chg: 2.0,
+            intraday_price: None,
+            settled: true,
+            pe_ratio: None,
+            pb_ratio: None,
+            turnover_rate: None,
+            market_cap: None,
+            circulating_cap: None,
+            eps: None,
+            roe: None,
+            revenue_yoy: None,
+            net_profit_yoy: None,
+            gross_margin: None,
+            net_margin: None,
+            sharpe_ratio: None,
+            financials_history: None,
+            valuation_history: None,
+            consensus: None,
+            industry: None,
+            is_limit_up: false,
+            is_limit_down: false,
+            is_suspended: false,
+            adjust: crate::data_provider::AdjustType::Qfq,
+        }
+    }
+
     #[test]
     fn test_ttl_for_now_outside_trading_hours_is_long() {
         // 周日中午 → 隔夜/盘后 → 24h TTL
@@ -241,6 +276,94 @@ mod tests {
         assert!(truncated.contains("截断"));
         let short = "short";
         assert_eq!(brief(short), "short");
+    }
+
+    #[tokio::test]
+    async fn br115_cache_hit_paths_share_values_and_expire_without_transport() {
+        let fetch_service = DataFetchService::new();
+
+        let kline_key = ("TEST_CODE_CACHE_KLINE".to_string(), 1);
+        let kline_cell = DataFetchService::slot(&fetch_service.klines, kline_key.clone()).await;
+        let same_cell = DataFetchService::slot(&fetch_service.klines, kline_key.clone()).await;
+        assert!(Arc::ptr_eq(&kline_cell, &same_cell));
+        DataFetchService::write_cache(&kline_cell, Arc::new(vec![kline()])).await;
+        let klines = fetch_service
+            .get_kline(&kline_key.0, kline_key.1)
+            .await
+            .expect("cached kline must not open transport");
+        assert_eq!(klines.len(), 1);
+        assert_eq!(klines[0].close, 10.2);
+
+        let finance_code = "TEST_CODE_CACHE_FINANCE".to_string();
+        let finance_cell =
+            DataFetchService::slot(&fetch_service.financials, finance_code.clone()).await;
+        let finance = Financials {
+            report_date: Some("2026-06-30".to_string()),
+            eps: Some(1.25),
+            source: Some("TEST_CODE_LOCAL_PROTOCOL"),
+            ..Financials::default()
+        };
+        DataFetchService::write_cache(&finance_cell, Arc::new(finance)).await;
+        let finance = fetch_service
+            .get_financials(&finance_code)
+            .await
+            .expect("cached financials must not open transport");
+        assert_eq!(finance.eps, Some(1.25));
+
+        let flow_key = ("TEST_CODE_CACHE_FLOW".to_string(), 1);
+        let flow_cell = DataFetchService::slot(&fetch_service.money_flow, flow_key.clone()).await;
+        let flow = MoneyFlowSummary {
+            days: vec![crate::data_provider::money_flow::MoneyFlowDay {
+                date: "2026-07-18".to_string(),
+                main_net: 10.0,
+                xl_net: 4.0,
+                big_net: 6.0,
+                main_pct: 1.0,
+                pct_chg: 2.0,
+            }],
+        };
+        DataFetchService::write_cache(&flow_cell, Arc::new(flow)).await;
+        let flow = fetch_service
+            .get_money_flow(&flow_key.0, flow_key.1)
+            .await
+            .expect("cached money flow must not open transport");
+        assert_eq!(flow.days.len(), 1);
+
+        let intraday_code = "TEST_CODE_CACHE_INTRADAY".to_string();
+        let intraday_cell =
+            DataFetchService::slot(&fetch_service.intraday, intraday_code.clone()).await;
+        let intraday = IntradayShape {
+            date: "2026-07-18".to_string(),
+            pre_close: 10.0,
+            open_pct: 1.0,
+            high_pct: 3.0,
+            low_pct: -1.0,
+            close_pct: 2.0,
+            amplitude: 4.0,
+            tail_30m_pct: Some(0.5),
+            shape_label: "TEST_CODE 本地形态",
+            present: true,
+        };
+        DataFetchService::write_cache(&intraday_cell, Arc::new(intraday)).await;
+        let intraday = fetch_service
+            .get_intraday_shape(&intraday_code)
+            .await
+            .expect("cached intraday shape must not open transport");
+        assert!(intraday.present);
+        assert_eq!(intraday.tail_30m_pct, Some(0.5));
+
+        let empty: CachedSlot<i32> = Arc::new(RwLock::new(None));
+        assert_eq!(DataFetchService::read_cache(&empty).await, None);
+        let expired: CachedSlot<i32> = Arc::new(RwLock::new(Some((
+            Instant::now()
+                .checked_sub(ttl_for_now() + Duration::from_secs(1))
+                .expect("TTL fits Instant range"),
+            Arc::new(7),
+        ))));
+        assert_eq!(DataFetchService::read_cache(&expired).await, None);
+        assert!(expired.read().await.is_none());
+
+        assert!(std::ptr::eq(service(), service()));
     }
 
     /// 测试用的 ttl 决策函数 (接受时间参数避免依赖 chrono::Local::now()).

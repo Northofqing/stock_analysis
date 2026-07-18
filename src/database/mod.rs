@@ -99,6 +99,7 @@ pub mod concepts; // v15.1: 公开供 push_templates 集成使用
 pub mod execution_tracking;
 mod kline;
 mod lhb;
+pub(crate) use lhb::validate_lhb_records;
 pub mod order_audit;
 mod positions;
 // v12 PR1-1.5 (BR-021)

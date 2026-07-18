@@ -1,3 +1,4 @@
+//! Registered business rules: BR-127.
 //! v12 PR1-1.5: account_mode_log 表 DB 访问层 (纯 I/O).
 //!
 //! 不依赖 push / template / bin 模块. 调用方 (push_templates 或 monitor) 自行拼 T-01 + dispatch.
@@ -106,9 +107,14 @@ pub fn mark_account_mode_pushed(log_id: i64) -> Result<(), String> {
         "UPDATE account_mode_log SET pushed = 1, push_attempted_at = '{}' WHERE id = {}",
         ts, log_id
     );
-    diesel::sql_query(sql)
+    let affected = diesel::sql_query(sql)
         .execute(&mut conn)
         .map_err(|e| format!("mark_account_mode_pushed: {}", e))?;
+    if affected != 1 {
+        return Err(format!(
+            "mark_account_mode_pushed: expected 1 affected row for id {log_id}, got {affected}"
+        ));
+    }
     Ok(())
 }
 
@@ -146,6 +152,10 @@ fn mode_label(m: AccountMode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn init_test_db() -> &'static DatabaseManager {
+        DatabaseManager::init(None).expect("test database init");
+        DatabaseManager::get()
+    }
 
     #[test]
     fn mode_label_strings() {
@@ -173,5 +183,73 @@ mod tests {
         assert_eq!(esc("O'Brien"), "O''Brien");
         assert_eq!(esc("a'b'c"), "a''b''c");
         assert_eq!(esc(""), "");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn account_mode_audit_round_trip_requires_an_existing_mark_target() {
+        let db = init_test_db();
+        let marker = format!(
+            "TEST_CODE_ACCOUNT_MODE_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        );
+        let first = insert_account_mode_change(
+            AccountMode::Normal,
+            AccountMode::ReduceOnly,
+            &format!("{marker}'first"),
+            Some(-1.25),
+            Some(2),
+            Some(7),
+            true,
+        )
+        .expect("insert complete audit row");
+        let second = insert_account_mode_change(
+            AccountMode::ReduceOnly,
+            AccountMode::Frozen,
+            &format!("{marker}-second"),
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect("insert nullable audit row");
+
+        let rows = recent_account_mode_changes(2).expect("query recent audit rows");
+        assert_eq!(rows[0].id as i64, second);
+        assert_eq!(rows[0].prev_mode, "ReduceOnly");
+        assert_eq!(rows[0].new_mode, "Frozen");
+        assert!(rows[0].today_pnl_pct.is_none());
+        assert!(rows[0].consecutive_n.is_none());
+        assert!(rows[0].total_pos_cheng.is_none());
+        assert_eq!(rows[0].data_complete, 0);
+        assert_eq!(rows[0].pushed, 0);
+        assert!(rows[0].push_attempted_at.is_none());
+        assert_eq!(rows[1].id as i64, first);
+        assert_eq!(rows[1].today_pnl_pct, Some(-1.25));
+        assert_eq!(rows[1].consecutive_n, Some(2));
+        assert_eq!(rows[1].total_pos_cheng, Some(7));
+        assert_eq!(rows[1].data_complete, 1);
+
+        let latest = latest_account_mode_change()
+            .expect("query latest audit row")
+            .expect("latest audit row exists");
+        assert_eq!(latest.id as i64, second);
+        mark_account_mode_pushed(second).expect("mark existing audit row");
+        let marked = latest_account_mode_change()
+            .expect("query marked audit row")
+            .expect("marked audit row exists");
+        assert_eq!(marked.pushed, 1);
+        assert!(marked.push_attempted_at.is_some());
+        assert!(mark_account_mode_pushed(i64::MAX).is_err());
+
+        let mut conn = db.get_conn().expect("test database connection");
+        diesel::sql_query("DELETE FROM account_mode_log WHERE trigger_reason LIKE ?")
+            .bind::<diesel::sql_types::Text, _>(format!("{marker}%"))
+            .execute(&mut conn)
+            .expect("clean account audit fixtures");
     }
 }
