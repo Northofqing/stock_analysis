@@ -4,7 +4,7 @@
 Fix the reviewed v17.3 replay defects, then continue through the repository's remaining documented/code/test debt until historical claims are reconciled and all achievable gates pass with explicit evidence.
 
 ## Current Phase
-Phase 11 (commit all remaining workspace changes and evaluate the final merge gate)
+Phase 12 (Gate D coverage and live-account release closure)
 
 ## Phases
 
@@ -83,9 +83,18 @@ Phase 11 (commit all remaining workspace changes and evaluate the final merge ga
 - [x] Audit every remaining worktree change and its impact on live-data/fund-safety paths
 - [x] Restore Gate B/C validation after including the remaining changes
 - [x] Commit and push all authorized worktree changes to PR #2
-- [ ] Resolve fixed-SHA review findings and obtain a clean independent re-review
+- [x] Resolve fixed-SHA review findings and obtain a clean independent re-review
 - [x] Re-run Gate D evidence checks; keep merge blocked unless every mandatory item passes
-- **Status:** in progress / review remediation underway; merge blocked by Gate D coverage, real-account evidence, and auditor sign-off
+- **Status:** complete; clean fixed-SHA follow-up review recorded, merge remains blocked by Gate D
+
+### Phase 12: Gate D coverage and live-account release closure
+- [x] Write and commit the coverage-closure design addendum and executable implementation plan
+- [ ] Raise registered core trading/data line coverage from 55.45% to at least 95%
+- [ ] Raise repository-wide line coverage from 51.20% to at least 80%
+- [ ] Add a nullable, source-traceable same-day real-account P&L/NAV persistence path without fabricating unavailable values
+- [ ] Re-run Gate A-D validation, live-data validation, and independent auditor review
+- [ ] Mark PR #2 Ready and merge through GitHub only after every mandatory checkbox passes
+- **Status:** in progress; user authorized autonomous continuation until all merge gates pass
 
 ## Decisions
 
@@ -95,6 +104,7 @@ Phase 11 (commit all remaining workspace changes and evaluate the final merge ga
 | Preserve existing event modules | The bugs are contract violations, not evidence that another event architecture is needed. |
 | Skip user confirmation gates | The user explicitly authorized completing all fixes without confirmation. |
 | Include the four formerly out-of-scope worktree changes | The user explicitly directed that all code be committed and merged on 2026-07-18; each change still requires safety review and gate validation. |
+| Close coverage core-first, then global | Gate D requires both thresholds; core paths carry the highest data/fund risk and must reach 95% before low-risk global modules. |
 
 ## Constraints
 
@@ -123,6 +133,8 @@ Phase 11 (commit all remaining workspace changes and evaluate the final merge ga
 | First WAL-bootstrap fix reduced fresh-DB lock errors from nine to one but did not make the RED test green | 1 | Do not stack another guess; return to root-cause evidence gathering and label each remaining customizer failure stage. |
 | PR-body shell argument interpreted Markdown backticks as command substitutions | 1 | Interrupted the process before later substitutions, audited HEAD/index/worktree/PR, confirmed no history or PR-body change, and switch to an apply-patch-created temporary body file for `gh pr edit --body-file`. |
 | Fixed-SHA review found WAL return-mode/customizer retry ambiguity and inherited webhook configuration in process tests | 1 | Add public process RED cases, make bootstrap and pooled customization fail closed, remove outbound webhook configuration from child environments, then re-review the follow-up SHA. |
+| First Phase-12 multi-file planning patch used a findings line that existed only in progress | 1 | Re-read the exact tails, split the patch around stable anchors, and record the Gate D continuation successfully. |
+| First Gate-D design/plan patch expected a blank line absent from the historical design | 1 | Inspect the exact rollback/addendum boundary and apply the design and new plan as separate patches. |
 ## Follow-up review slice (2026-07-18)
 
 - [x] Add RED test for `:memory:` journal-mode failure.
@@ -141,4 +153,4 @@ Phase 11 (commit all remaining workspace changes and evaluate the final merge ga
 - [ ] Commit/push and request final fixed-SHA review.
 - [x] Commit/push and request final fixed-SHA review.
 - [x] Close final review Important findings and rerun Gate B/C.
-- [ ] Push final follow-up and keep merge blocked on Gate D coverage.
+- [x] Push final follow-up and keep merge blocked on Gate D coverage.

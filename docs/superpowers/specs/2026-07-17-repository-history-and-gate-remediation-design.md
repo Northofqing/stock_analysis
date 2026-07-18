@@ -62,6 +62,62 @@ The order is deliberate: compilation and correctness failures are repaired befor
 ## Rollback
 
 Each repair batch is committed independently. Revert the affected batch with `git revert <sha>` and rerun the gate that motivated it. No database migration, live order, or real notification is authorized by this plan.
+
+# Gate D coverage-closure addendum (2026-07-18)
+
+## Status and authorization
+
+- The user authorized autonomous continuation until all mandatory gates pass and the PR is merged.
+- Fixed-tree baseline at `9198f82`: global line coverage 43,129/84,231 = 51.20%; registered core coverage 11,834/21,342 = 55.45% across 94 files.
+- The minimum no-growth gaps are 24,256 global lines and 8,441 core lines. Gate D remains blocking until the measured report reaches global >=80% and core >=95%.
+
+## Considered approaches
+
+1. **Behavior slices through existing interfaces (selected).** Cover deterministic pure modules first, then introduce only internal seams where an orchestration module currently creates its dependencies. Tests use worked literals, strict parser samples, isolated SQLite, and `TEST_CODE_` identities. This gives diagnostic failures and preserves production interfaces.
+2. **Whole-process integration only (rejected as the primary strategy).** It can cover broad happy paths but is slow, clock/network sensitive, and cannot reliably exercise bad-data and failure branches. Process tests remain a final integration layer.
+3. **Coverage exclusions, threshold reductions, assertion-free execution, or denominator deletion (rejected).** These would create a green metric without release confidence and violate AGENTS Gate D. Truly unreachable production code may be decommissioned only with independent call-chain evidence and a business reason, never to improve the percentage.
+
+## Module and seam design
+
+- Pure scoring, veto, formatting, parsing, and state-transition modules keep their current interfaces. Unit tests live beside the implementation so private parsing branches can be exercised without widening the production interface.
+- Orchestration modules keep the external interface used by `AnalysisPipeline`. If they instantiate clocks, transports, or stores internally, the implementation gains the smallest internal seam that accepts the dependency and returns an owned result. Production and tests cross the same behavioral interface; test adapters never enter production registration.
+- Network providers separate request/response transport from strict response parsing. Parser tests use deterministic protocol payloads labelled with `TEST_CODE_`; they are protocol fixtures, not fabricated production market/account data. Production fetch failures remain explicit and no fake fallback is introduced.
+- Database tests use unique `TEST_CODE_` rows and isolated temporary databases when the public singleton is not involved. They validate through repository interfaces and audit records, not by weakening schema constraints.
+- Process tests remove notification credentials, use test environment guards, and must not place real orders or send real messages.
+
+## Coverage batch order
+
+1. Pure zero-coverage core modules: score breakdown, veto, report/technical renderers, result types, market regime, price statistics, trade type, multi-timeframe, summary helpers.
+2. Strict provider parsing and missing/bad-data paths: money flow, financials, valuation, consensus, industry, chip distribution, GTIMG/Eastmoney/Baostock/Sina/RustDX adapters.
+3. Pipeline orchestration: position tracker, backtest runner, chain analysis/fetchers, main analysis pipeline, reporting.
+4. Remaining registered core deficits in database, trading, decision, risk, and event modules.
+5. Repository-wide deficits, prioritizing pure notification/report/search/strategy code before decomposing the monitor process entry point.
+6. Recompute coverage after every batch; the JSON report, not test count, decides the next target.
+
+## Failure modes and data red lines
+
+| Failure | Required behavior |
+|---|---|
+| Fixture represents a live order/account | Reject; use `TEST_CODE_` and test mode or locally attested private evidence outside Git. |
+| Missing provider/account field | Assert `None`, warning, or explicit error; never use zero/default to make a test pass (2.2). |
+| Bad price/time/continuity payload | Assert whole-batch rejection before computation (2.3/2.4). |
+| Test would need a production webhook/broker credential | Remove the credential and exercise a dry-run/test adapter or explicit unavailable error (2.5). |
+| Refactor changes order or data semantics | Return to Gate A, register/update the relevant BR, and add a RED public behavior test before implementation. |
+| Coverage rises but assertions do not prove outcomes | Reject the test as evidence and replace it with independent expected literals. |
+| Threshold still fails | Record exact numerator/denominator and continue from the largest safe uncovered behavior cluster. |
+
+## Same-day real-account evidence boundary
+
+- The local 2026-07-18 attested snapshot proves seven positions, cash, market value, total assets, and holding P&L at its capture time. It does not provide daily P&L; the source displayed that field as unavailable.
+- Same-day account persistence must therefore represent daily P&L as nullable and store source, source timestamp, observed-at timestamp, and account-mode provenance. It must not insert zero into the current non-null ledger field.
+- A schema/data-flow change requires an idempotent migration, compatibility read path, BR-103 documentation, isolated database tests, and a backup/rollback procedure before the private local database is migrated.
+
+## Release and rollback
+
+- Every batch is a small commit with its focused test and refreshed coverage evidence. A failing batch is reverted with `git revert <batch-sha>` and the relevant gate is rerun.
+- Schema migration rollback restores the pre-migration local database backup and reverts the migration commit; private evidence and account values remain ignored and are never uploaded.
+- PR #2 stays Draft until all Gate B/C checks, both coverage thresholds, live-data validation, audit trace validation, and independent Standards/Spec/Audit review pass. Only then may it become Ready and merge into `master`.
+
 # External integration test isolation addendum
 
 - Default `cargo test --all-targets --all-features` must not require a live quote server, API key, system proxy, or production account.

@@ -253,3 +253,13 @@
 - Final Gate B/C rerun: fmt, diff-check, all-target check, strict Clippy, all-target tests, compliance, and release build PASS. Library tests are 1337 passed/10 ignored; monitor tests are 293/293; process isolation is 5/5.
 - Fresh fixed-tree coverage: global 43129/84231 = 51.20% (<80%); core 11834/21342 = 55.45% (<95%, 94 files). Gate D remains blocked despite the local user-attested live-position snapshot.
 - Closed final review Important findings: no production direct pool checkout remains outside `get_conn`, and webhook isolation is explicit in 5/5 process tests. Full fmt/check/clippy/all-target tests/compliance rerun PASS.
+
+## 2026-07-18 Gate D continuation
+
+- User directed autonomous continuation until completion and merge.
+- Restored mandatory rules, design, handoff, plan, findings, progress, Git state, and coverage-gate context.
+- Confirmed `codex/repository-safety-closure-20260718` is clean and synchronized at `9198f82`, eight commits ahead of local `master`.
+- Updated the active persistent plan to Phase 12: core coverage, global coverage, nullable same-day account evidence, full Gate A-D validation, independent audit, and final merge.
+- No production code has been changed in this phase yet.
+- Added and self-reviewed the Gate D coverage-closure design addendum and executable implementation plan. The selected approach is core-first behavior testing through existing interfaces, with internal seams only where orchestration currently creates dependencies.
+- The plan explicitly rejects threshold reduction, coverage exclusion, assertion-free execution, live production test credentials, missing-value fabrication, and denominator deletion for metric gain.

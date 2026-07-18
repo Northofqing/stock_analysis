@@ -173,3 +173,19 @@
 - Added a process regression proving an invalid DB parent exits 2, and strengthened the fresh-DB regression to require the BR-108 same-day-ledger failure rather than accepting any exit 2.
 - Added the mandatory `.github/copilot-instructions.md` Gate-0 input.
 - Final fixed-SHA review found one production `get_factor_ic_data` checkout still bypassed `get_conn`; it now uses the configured/error-propagating seam. All five process tests now remove `ALERT_WEBHOOK_URL` explicitly.
+
+## Gate D autonomous continuation (2026-07-18)
+
+- The user explicitly authorized continuing without further confirmation until the work is complete and merged; repository safety gates still cannot be bypassed.
+- Fixed-tree coverage is global 43,129/84,231 = 51.20% and registered core 11,834/21,342 = 55.45%.
+- The minimum arithmetic gaps are 24,256 additionally covered global lines and 8,441 additionally covered core lines, assuming no denominator growth.
+- Core closure must precede global closure. The largest current core missed-line targets are `pipeline/analyze.rs`, `pipeline/chain_analysis/{mod,fetchers}.rs`, `pipeline/backtest_runner.rs`, `data_provider/money_flow.rs`, and `pipeline/position_tracker.rs`.
+- Coverage tests must exercise public behavior and explicit failures with deterministic `TEST_CODE_` fixtures and isolated local data stores; lowering thresholds, excluding core files, assertion-free execution, or production mock/fallback paths are prohibited.
+- The existing repository-safety design already authorizes autonomous Gate remediation and prioritizes critical trading/data tests. A focused coverage addendum and implementation plan will make this continuation executable and auditable.
+- The 9,508 currently uncovered core lines are concentrated but not limited to pipeline code. The threshold script also registers `risk`, `trading`, `database`, `decision`, and `event`.
+- Two safe tracer-bullet modules are `pipeline/score_breakdown.rs` (258 missed lines) and `pipeline/veto_rules.rs` (112 missed lines): both expose pure public behavior over deterministic domain values and currently contain no test module.
+- Their production interfaces are already deep enough for behavior tests (`compute`/`render_section`/`compute_ranking_score` and `evaluate`/`render_section`); no new adapter or network seam is required for this first slice.
+- Later high-cost modules (`pipeline/analyze.rs`, chain fetchers, HTTP providers) need internal seams that accept dependencies and return validated results; testing should cross those seams without teaching callers about transport details.
+- `ScoreBreakdown` can cover all scoring branches through real domain structures already owned by the crate: `FinancialPeriod`, `ValuationHistory`, `ConsensusData`, `IndustryBenchmark`, `MoneyFlowSummary`, and `KlineData`. No mock transport or production fallback is needed.
+- `VetoOutcome` can cover revenue decline, CFO/NI divergence, target-price overvaluation, three valuation tiers, one-day money-flow bounce, cap precedence, no-signal behavior, and Markdown rendering through its existing two public functions.
+- These tests should use independently worked expected literals (scores, downgraded advice, cap percentages, required rendered phrases), not recompute implementation formulas inside assertions.
