@@ -321,8 +321,8 @@ impl GtimgProvider {
             }
         }
 
-        // 按日期降序排序（最新的在前）
-        result.sort_by_key(|item| std::cmp::Reverse(item.date));
+        // BR-125: complete-batch validation also restores newest-first order.
+        super::validate_kline_series_strict(&mut result, code)?;
 
         Ok(result)
     }
@@ -520,6 +520,123 @@ impl DataProvider for GtimgProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn kline_body(field: &str, rows: serde_json::Value) -> String {
+        serde_json::json!({"data": {"sh600519": {field: rows}}}).to_string()
+    }
+
+    #[test]
+    fn br125_complete_tencent_batch_is_newest_first_with_real_pct() {
+        let rows = serde_json::json!([
+            [
+                "2026-07-15",
+                "10.00",
+                "10.00",
+                "10.20",
+                "9.90",
+                "1000",
+                "100000"
+            ],
+            [
+                "2026-07-16",
+                "10.00",
+                "10.10",
+                "10.20",
+                "9.95",
+                "1100",
+                "101000"
+            ]
+        ]);
+        for field in ["qfqday", "day"] {
+            let parsed = GtimgProvider::parse_kline_response_internal(
+                &kline_body(field, rows.clone()),
+                "600519",
+            )
+            .unwrap();
+            assert_eq!(parsed.len(), 2);
+            assert_eq!(
+                parsed[0].date,
+                NaiveDate::from_ymd_opt(2026, 7, 16).unwrap()
+            );
+            assert_eq!(parsed[0].amount, 101_000.0);
+            assert!((parsed[0].pct_chg - 1.0).abs() < 1e-12);
+            assert_eq!(parsed[0].adjust, crate::data_provider::AdjustType::Qfq);
+        }
+    }
+
+    #[test]
+    fn br125_tencent_parser_rejects_incomplete_or_bad_batches() {
+        let cases = [
+            kline_body("qfqday", serde_json::json!([])),
+            "{}".to_string(),
+            kline_body("qfqday", serde_json::json!(["not-array"])),
+            kline_body("qfqday", serde_json::json!([["2026-07-16", "10"]])),
+            kline_body(
+                "qfqday",
+                serde_json::json!([[1, "10", "10", "10", "10", "1", "1"]]),
+            ),
+            kline_body(
+                "qfqday",
+                serde_json::json!([["bad", "10", "10", "10", "10", "1", "1"]]),
+            ),
+            kline_body(
+                "qfqday",
+                serde_json::json!([["2026-07-16", 10, "10", "10", "10", "1", "1"]]),
+            ),
+            kline_body(
+                "qfqday",
+                serde_json::json!([["2026-07-16", "bad", "10", "10", "10", "1", "1"]]),
+            ),
+            kline_body(
+                "qfqday",
+                serde_json::json!([["2026-07-16", "10", "10", "9", "10", "1", "1"]]),
+            ),
+            kline_body(
+                "qfqday",
+                serde_json::json!([["2026-07-16", "10", "10", "10", "10", "-1", "1"]]),
+            ),
+            kline_body(
+                "qfqday",
+                serde_json::json!([["2026-07-16", "10", "10", "10", "10", "1", "NaN"]]),
+            ),
+            kline_body(
+                "qfqday",
+                serde_json::json!([
+                    ["2026-07-16", "10", "10", "10", "10", "1", "1"],
+                    ["2026-07-16", "10", "10", "10", "10", "1", "1"]
+                ]),
+            ),
+            kline_body(
+                "qfqday",
+                serde_json::json!([
+                    ["2026-07-14", "10", "10", "10", "10", "1", "1"],
+                    ["2026-07-16", "10", "10", "10", "10", "1", "1"]
+                ]),
+            ),
+            kline_body(
+                "qfqday",
+                serde_json::json!([
+                    ["2026-07-15", "10", "10", "10", "10", "1", "1"],
+                    ["2026-07-16", "13", "13", "13", "13", "1", "1"]
+                ]),
+            ),
+        ];
+        for body in cases {
+            assert!(
+                GtimgProvider::parse_kline_response_internal(&body, "600519").is_err(),
+                "body={body}"
+            );
+        }
+        assert!(GtimgProvider::parse_kline_response_internal("not-json", "600519").is_err());
+        assert!(GtimgProvider::parse_kline_response_internal(
+            &kline_body(
+                "qfqday",
+                serde_json::json!([["2026-07-16", "10", "10", "10", "10", "1", "1"]])
+            ),
+            "bad-code",
+        )
+        .is_err());
+    }
 
     #[test]
     fn br097_tencent_source_timestamp_is_parsed_as_shanghai_time() {

@@ -217,7 +217,7 @@ impl HttpProvider {
             // 解析JSON (简单的字符串解析，因为API返回的是字符串数组)。
             // 200 但非 JSON（反爬/限流 HTML 页）视为可重试错误：换 host 再试，
             // 而非立刻放弃整个东方财富源。
-            match Self::parse_kline_response_internal(&text) {
+            match Self::parse_kline_response_internal(&text, code) {
                 Ok(data) => return Ok(data),
                 Err(e) => {
                     log::warn!(
@@ -250,7 +250,7 @@ impl HttpProvider {
     }
 
     /// 解析K线响应（静态方法）
-    fn parse_kline_response_internal(text: &str) -> Result<Vec<KlineData>> {
+    fn parse_kline_response_internal(text: &str, code: &str) -> Result<Vec<KlineData>> {
         use serde_json::Value;
 
         let json: Value = serde_json::from_str(text).context("解析JSON失败")?;
@@ -318,8 +318,9 @@ impl HttpProvider {
             result.push(kline);
         }
 
-        // 按日期降序排序（最新的在前）
-        result.sort_by_key(|item| std::cmp::Reverse(item.date));
+        // BR-125: reject the complete batch on any price/date/continuity failure;
+        // the shared validator restores newest-first order.
+        super::validate_kline_series_strict(&mut result, code)?;
 
         Ok(result)
     }
@@ -432,10 +433,66 @@ impl DataProvider for HttpProvider {
 mod tests {
     use super::*;
 
+    fn kline_body(rows: serde_json::Value) -> String {
+        serde_json::json!({"data": {"klines": rows}}).to_string()
+    }
+
+    #[test]
+    fn br125_complete_eastmoney_batch_is_strict_and_newest_first() {
+        let body = kline_body(serde_json::json!([
+            "2026-07-15,10.00,10.00,10.20,9.90,1000,100000,0.0",
+            "2026-07-16,10.00,10.10,10.20,9.95,1100,101000,1.0"
+        ]));
+        let parsed = HttpProvider::parse_kline_response_internal(&body, "600519").unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(
+            parsed[0].date,
+            NaiveDate::from_ymd_opt(2026, 7, 16).unwrap()
+        );
+        assert_eq!(parsed[0].close, 10.1);
+        assert_eq!(parsed[0].amount, 101_000.0);
+        assert_eq!(parsed[0].pct_chg, 1.0);
+        assert_eq!(parsed[0].adjust, crate::data_provider::AdjustType::Qfq);
+    }
+
+    #[test]
+    fn br125_eastmoney_parser_rejects_incomplete_or_bad_batches() {
+        let cases = [
+            kline_body(serde_json::json!([])),
+            "{}".to_string(),
+            kline_body(serde_json::json!([1])),
+            kline_body(serde_json::json!(["bad-date,10,10,10,10,1,1,0"])),
+            kline_body(serde_json::json!(["2026-07-16,bad,10,10,10,1,1,0"])),
+            kline_body(serde_json::json!(["2026-07-16,10,10,9,10,1,1,0"])),
+            kline_body(serde_json::json!(["2026-07-16,10,10,10,10,-1,1,0"])),
+            kline_body(serde_json::json!(["2026-07-16,10,10,10,10,1,-1,0"])),
+            kline_body(serde_json::json!(["2026-07-16,10,10,10,10,1,1,20.1"])),
+            kline_body(serde_json::json!([
+                "2026-07-16,10,10,10,10,1,1,0",
+                "2026-07-16,10,10,10,10,1,1,0"
+            ])),
+            kline_body(serde_json::json!([
+                "2026-07-14,10,10,10,10,1,1,0",
+                "2026-07-16,10,10,10,10,1,1,0"
+            ])),
+            kline_body(serde_json::json!([
+                "2026-07-15,10,10,10,10,1,1,0",
+                "2026-07-16,13,13,13,13,1,1,0"
+            ])),
+        ];
+        for body in cases {
+            assert!(
+                HttpProvider::parse_kline_response_internal(&body, "600519").is_err(),
+                "body={body}"
+            );
+        }
+        assert!(HttpProvider::parse_kline_response_internal("not-json", "600519").is_err());
+    }
+
     #[test]
     fn br092_kline_parser_rejects_any_short_row() {
         let body = r#"{"data":{"klines":["2026-07-16,10,10.2,10.3,9.9,1000,10000,2.0","2026-07-17,10,10.2"]}}"#;
-        let error = HttpProvider::parse_kline_response_internal(body)
+        let error = HttpProvider::parse_kline_response_internal(body, "600519")
             .expect_err("a malformed row must reject the complete provider batch");
         assert!(error.to_string().contains("第 2 行"));
     }

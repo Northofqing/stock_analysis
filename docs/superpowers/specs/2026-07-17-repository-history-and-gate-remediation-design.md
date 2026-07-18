@@ -584,3 +584,10 @@ Failure handling:
 - 完整性：BaoStock 同时覆盖非压缩登录响应、zlib K 线响应、分块读取/EOF/timeout/上限、CDATA 和 BR-092 K 线批次；Sina hq 覆盖 32 字段与来源时间，K 线继续因缺真实 amount 而拒绝；Sina 新闻覆盖 URL、UTF-8/GBK、来源名分支、未来/过早时间、坏身份和完整批次拒绝。
 - 失败模式：短帧、坏 header/body length/zlib、缺列/字段、坏日期/数值/连续性、坏 JSON/时间/代码均必须保持显式错误；禁止为了覆盖率增加默认行情、金额、新闻字段或网络 fallback。
 - 回滚：整体回退 Task 13A 测试与文档即可；生产代码预期不变。若测试暴露现有红线缺陷，先登记新 BR 和设计修正，再进入独立实现提交。
+
+## Addendum: BR-125 Tencent/Eastmoney 日 K 完整批次校验（2026-07-18）
+
+- 根因：两个真实 HTTP provider 的解析器逐字段转换并排序后直接返回，没有进入 `validate_kline_series_strict`。因此 JSON 结构完整不等于业务批次有效，空数组、坏价格关系、非有限值、交易日缺口/重复或相邻跳变可能绕过 2.3。
+- 数据流：完整 JSON → provider 字段解析 → Tencent 按升序真实收盘计算 pct_chg / Eastmoney 保留来源 pct_chg → 统一 BR-092 批次校验 → 最新日期在前返回。校验失败整批拒绝，不改变 HTTP host/retry、复权口径或 provider 顺序。
+- 测试 seam：模块内本地 JSON 同时覆盖 qfqday/day、成功排序/涨跌幅、空/缺数组、非数组行、短行、坏日期/类型/数值、OHLC、量额、涨跌幅、日期缺口/重复和 >20% 跳变。原生六位代码只作为协议路由参数，不进入订单。
+- 回滚：整体回退 BR-125 代码和测试；不得只移除严格校验而保留“已满足 2.3”的声明。

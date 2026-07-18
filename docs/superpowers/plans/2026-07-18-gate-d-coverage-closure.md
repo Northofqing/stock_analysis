@@ -132,6 +132,18 @@ Expected: all PASS. Commit only the two modules plus design/plan/progress eviden
 - [ ] Event tests preserve immutable audit/hash-chain behavior and explicit sink outcomes.
 - [ ] Repeat until `python3 tools/coverage/check_thresholds.py target/coverage/coverage.json --global-min 0 --core-min 95` exits 0.
 
+### Task 3B: Close Tencent/Eastmoney K-line batch validation
+
+**Files:**
+- Modify: `src/data_provider/gtimg_provider.rs`
+- Modify: `src/data_provider/eastmoney_provider.rs`
+- Modify: `docs/business_rules.md`
+
+- [x] Add RED local JSON tests proving both parsers reject empty batches, invalid OHLC/volume/amount/pct, duplicate/gapped dates and adjacent close changes above 20%; Tencent also covers qfqday/day and every typed field error.
+- [x] Route each completed parsed vector through `validate_kline_series_strict`; Tencent computes pct from ascending real closes before the shared call. Do not add network fixtures or fallback values.
+- [x] Assert complete two-day batches return newest-first, QFQ, exact amount and independently expected pct values.
+- [x] Run both provider test modules, full data-provider/library tests, focused coverage, fmt, strict all-target Clippy and compliance; commit independently.
+
 ### Task 6: Raise repository-wide coverage to 80%
 
 **Files:**

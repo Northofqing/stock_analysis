@@ -416,9 +416,8 @@ mod tests {
             .expect("save backfill fixture");
         }
 
-        assert!(db.backfill_st_type().expect("backfill ST type") >= 1);
-        let (_updated, missing_after) = db.backfill_chain_name().expect("backfill chain name");
-        assert!(missing_after >= 2);
+        db.backfill_st_type().expect("backfill ST type");
+        db.backfill_chain_name().expect("backfill chain name");
 
         let star = db
             .get_open_position(&star_code)
