@@ -552,12 +552,37 @@ impl AnalysisPipeline {
             anyhow::bail!("多因子回测需要至少3只股票，实际仅 {} 只", stocks_data.len());
         }
 
-        let base_cfg = MultiFactorConfig::default();
-        let (mut summary, base_state) = Self::run_multi_factor_on_history(&stocks_data, &base_cfg)
-            .ok_or_else(|| anyhow::anyhow!("多因子基础回测失败：样本或因子不足，无法生成汇总"))?;
+        let benchmark = self.fetch_benchmark_series(60).await;
+        let (summary, base_state, report) =
+            Self::run_multi_factor_resolved(&stocks_data, benchmark)?;
+        let date_str = chrono::Local::now().format("%Y%m%d").to_string();
+        let filename = format!("multi_factor_backtest_{}.md", date_str);
+        self.notifier
+            .save_report_to_file(&report, Some(&filename))?;
+        self.export_audit_csv(
+            "multi_factor",
+            &date_str,
+            &base_state.daily_values,
+            &base_state.trades,
+            summary.initial_capital,
+        )?;
 
-        // 注入基准（可用时）
-        if let Some(bench) = self.fetch_benchmark_series(60).await {
+        Ok(summary)
+    }
+
+    fn run_multi_factor_resolved(
+        stocks_data: &[StockHistory],
+        benchmark: Option<BenchmarkSeries>,
+    ) -> Result<(BacktestSummary, BacktestState, String)> {
+        if stocks_data.len() < 3 {
+            anyhow::bail!("多因子回测需要至少3只股票，实际仅 {} 只", stocks_data.len());
+        }
+        let base_cfg = MultiFactorConfig::default();
+        let (mut summary, base_state) = Self::run_multi_factor_on_history(stocks_data, &base_cfg)
+            .ok_or_else(|| {
+            anyhow::anyhow!("多因子基础回测失败：样本或因子不足，无法生成汇总")
+        })?;
+        if let Some(bench) = benchmark {
             summary.benchmark_name = Some(bench.name);
         }
 
@@ -570,11 +595,10 @@ impl AnalysisPipeline {
             summary.total_trades,
         );
 
-        let date_str = chrono::Local::now().format("%Y%m%d").to_string();
         let mut report = super::reporting::build_backtest_report(&summary);
 
         // A. 时间样本外切分（前 60% 样本内 / 后 40% 样本外）
-        let (cutoff, in_h, out_h) = Self::split_history_by_date(&stocks_data, 0.6)
+        let (cutoff, in_h, out_h) = Self::split_history_by_date(stocks_data, 0.6)
             .ok_or_else(|| anyhow::anyhow!("多因子 OOS 切分失败：交易日不足或切分后样本为空"))?;
         let in_sum = Self::run_multi_factor_summary_on_history(&in_h, &base_cfg)
             .ok_or_else(|| anyhow::anyhow!("多因子 OOS 失败：样本内段无法完成回测"))?;
@@ -624,26 +648,14 @@ impl AnalysisPipeline {
             ("top12/pe0.7/pb0.7".to_string(), mk_cfg(12, 0.7, 0.7)),
         ];
         let wf = Self::walk_forward(
-            &stocks_data,
+            stocks_data,
             &wf_grid,
             |cfg, slice| Self::run_multi_factor_summary_on_history(slice, cfg),
             4,
         )
         .ok_or_else(|| anyhow::anyhow!("多因子 Walk-Forward 失败：样本不足或候选参数无有效结果"))?;
         report.push_str(&super::reporting::build_walk_forward_section(&wf));
-
-        let filename = format!("multi_factor_backtest_{}.md", date_str);
-        self.notifier
-            .save_report_to_file(&report, Some(&filename))?;
-        self.export_audit_csv(
-            "multi_factor",
-            &date_str,
-            &base_state.daily_values,
-            &base_state.trades,
-            summary.initial_capital,
-        )?;
-
-        Ok(summary)
+        Ok((summary, base_state, report))
     }
 
     /// 运行布林带+Z-Score 均值回归策略回测
@@ -1260,6 +1272,29 @@ mod tests {
             AnalysisPipeline::run_multi_factor_summary_on_history(&factor_history(30), &config)
                 .expect("summary wrapper");
         assert_eq!(summary_only.total_trades, summary.total_trades);
+    }
+
+    #[test]
+    fn multi_factor_resolved_requires_complete_history_and_renders_oos_evidence() {
+        assert!(
+            AnalysisPipeline::run_multi_factor_resolved(&factor_history(30)[..2], None).is_err()
+        );
+        assert!(AnalysisPipeline::run_multi_factor_resolved(&factor_history(9), None).is_err());
+
+        let complete = factor_history(120);
+        let benchmark = benchmark_for(&complete);
+        let benchmark_name = benchmark.name.clone();
+        let (summary, state, report) =
+            AnalysisPipeline::run_multi_factor_resolved(&complete, Some(benchmark))
+                .expect("complete validated multi-factor history");
+        assert_eq!(
+            summary.benchmark_name.as_deref(),
+            Some(benchmark_name.as_str())
+        );
+        assert!(!state.daily_values.is_empty());
+        assert!(summary.final_value.is_finite());
+        assert!(report.contains("时间样本外切分"));
+        assert!(report.contains("Walk-Forward 滚动优化"));
     }
 
     #[test]

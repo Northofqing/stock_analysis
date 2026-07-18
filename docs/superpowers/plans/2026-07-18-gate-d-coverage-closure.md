@@ -226,3 +226,9 @@ Expected: all PASS. Commit only the two modules plus design/plan/progress eviden
 - [x] Route Tencent name/realtime HTTP bodies and Eastmoney minute bodies through private strict parsers; cover protocol, field, price, time, continuity, and runtime failures with `TEST_CODE_` fixtures only.
 - [x] Exercise daily/WeChat report construction with complete nullable domain evidence and exact output assertions; no network or production fallback is introduced.
 - [x] Run focused tests, formatter, strict library Clippy, and full instrumented library coverage: 1,561 passed / 10 ignored / 0 failed; library global 51,018/72,142 = 70.72%, registered core 26,010/29,655 = 87.71%.
+
+### Task 20: Cover deterministic multi-factor backtest execution
+
+- [x] Keep production ranking and real daily-history acquisition in the existing wrapper; pass only the complete history batch and nullable real benchmark into an internal resolved executor.
+- [x] Exercise explicit insufficient-stock/short-history failures plus a complete 120-day, three-stock base/OOS/walk-forward report with `TEST_CODE_` identities.
+- [x] Run the exact focused test, formatter, strict library Clippy, and focused instrumented coverage; `backtest_runner.rs` reaches 915/1,111 = 82.36%.

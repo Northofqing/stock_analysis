@@ -669,3 +669,9 @@ Failure handling:
 - 模块边界：`pipeline::data` 保留真实 `DataFetcherManager` 负责获取，新的私有 resolved 步骤只负责空批、日线新鲜度和已有 SQLite 持久化；多周期入口保留真实 60/15 分钟请求，resolved 步骤只消费已校验的两个完整批次。腾讯名称/实时行情从 HTTP 状态与 body 解析中拆出私有纯解析边界，生产请求继续调用同一解析器。
 - 失败模式：空/过期日线、缺失多周期批次、腾讯缺引号/短行/坏时间/非正价/颠倒涨跌停价仍显式失败；不得由测试注入伪行情到生产路径。汇总通知的文件和发送失败继续按现有语义传播/记录，不伪报推送成功。
 - 旧模块与回滚：采用现有 `DataFetcherManager`、`validate_daily_freshness`、`assess_multi_timeframe_entry`、`NotificationService` 和腾讯协议字段，拒绝第二套阈值或 mock provider。整批回退 resolved/parser 提取及测试；不能只恢复静默空值或跳过坏批次。
+
+## Addendum: Gate-D 多因子回测执行边界（2026-07-19）
+
+- 数据流：生产入口仍按排名从 `DataFetcherManager` 获取真实日线并要求至少三只、每只至少 30 条；只有该完整历史批次与可空真实基准进入 resolved 步骤。resolved 步骤复用既有基础回测、60/40 样本外切分、六组参数 walk-forward 与报告构造，不自行获取行情、不创建基准或因子 fallback。
+- 失败模式：不足三只、短批次、因子无法评分、切分失败或任一段无法回测都返回显式错误。生产包装层仍负责报告文件和交易/NAV 审计，任何写入失败阻断成功；测试只用 `TEST_CODE_` 完整历史直接执行 resolved 步骤。
+- 旧模块与回滚：保留 `MultiFactorEngine`、`BacktestEngine`、现有排序/Top-10 和参数网格语义，不修改阈值、业务规则或公共接口。整体回退 resolved 提取和测试；不得把缺少真实历史降级为合成数据或空报告成功。
