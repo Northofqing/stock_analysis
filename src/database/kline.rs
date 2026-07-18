@@ -1,4 +1,5 @@
 //! kline（从 database.rs 拆分）
+//! Registered business rule: BR-092.
 
 use chrono::{Local, NaiveDate};
 use diesel::prelude::*;
@@ -288,10 +289,19 @@ impl DatabaseManager {
         if data.is_empty() {
             return Ok(0);
         }
+        if code.trim().is_empty() || source.trim().is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("BR-092 K 线批次代码/来源不能为空: code={code:?} source={source:?}"),
+            )
+            .into());
+        }
+        let mut checked = data.to_vec();
+        crate::data_provider::validate_kline_series_strict(&mut checked, code)?;
 
         let mut conn = self.get_conn()?;
         let saved = conn.transaction::<usize, Box<dyn std::error::Error>, _>(|conn| {
-            for kline in data {
+            for kline in &checked {
                 Self::upsert_daily_record(
                     conn,
                     code,
@@ -310,7 +320,7 @@ impl DatabaseManager {
                     Some(source),
                 )?;
             }
-            Ok(data.len())
+            Ok(checked.len())
         })?;
 
         info!(
@@ -403,5 +413,212 @@ impl DatabaseManager {
             .execute(&mut conn)?;
 
         Ok(deleted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data_provider::{AdjustType, KlineData};
+
+    fn unique_code(label: &str) -> String {
+        format!(
+            "TEST_CODE_KLINE_{label}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        )
+    }
+
+    fn kline(date: NaiveDate, close: f64, pct_chg: f64) -> KlineData {
+        KlineData {
+            date,
+            open: close,
+            high: close,
+            low: close,
+            close,
+            volume: 1_000.0,
+            amount: close * 1_000.0,
+            pct_chg,
+            intraday_price: None,
+            settled: true,
+            pe_ratio: None,
+            pb_ratio: None,
+            turnover_rate: None,
+            market_cap: None,
+            circulating_cap: None,
+            eps: None,
+            roe: None,
+            revenue_yoy: None,
+            net_profit_yoy: None,
+            gross_margin: None,
+            net_margin: None,
+            sharpe_ratio: None,
+            financials_history: None,
+            valuation_history: None,
+            consensus: None,
+            industry: None,
+            is_limit_up: false,
+            is_limit_down: false,
+            is_suspended: false,
+            adjust: AdjustType::Qfq,
+        }
+    }
+
+    struct KlineGuard(Vec<String>);
+
+    impl Drop for KlineGuard {
+        fn drop(&mut self) {
+            if let Ok(mut conn) = DatabaseManager::get().get_conn() {
+                for code in &self.0 {
+                    let _ = diesel::delete(stock_daily::table.filter(stock_daily::code.eq(code)))
+                        .execute(&mut conn);
+                    let _ = diesel::delete(
+                        analysis_result::table.filter(analysis_result::code.eq(code)),
+                    )
+                    .execute(&mut conn);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn br092_kline_repository_roundtrip_and_analysis_context() {
+        DatabaseManager::init(None).expect("test database init");
+        let code = unique_code("DAILY");
+        let provider_code = unique_code("PROVIDER");
+        let _guard = KlineGuard(vec![code.clone(), provider_code.clone()]);
+        let db = DatabaseManager::get();
+        let day1 = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
+        let day2 = NaiveDate::from_ymd_opt(2026, 7, 16).unwrap();
+
+        assert_eq!(db.save_daily_batch(&[]).unwrap(), 0);
+        assert_eq!(
+            db.save_kline_data(&provider_code, &[], "TEST_SOURCE")
+                .unwrap(),
+            0
+        );
+        assert!(!db.has_data_for_date(&code, day1).unwrap());
+        assert!(db.get_analysis_context(&code, None).unwrap().is_none());
+
+        db.save_daily_record(
+            &code,
+            day1,
+            Some(10.0),
+            Some(10.2),
+            Some(9.8),
+            Some(10.0),
+            Some(100.0),
+            Some(1_000.0),
+            Some(0.0),
+            Some(9.9),
+            Some(9.8),
+            Some(9.7),
+            Some(1.0),
+            Some("TEST_SOURCE"),
+        )
+        .expect("save daily row");
+        db.save_daily_record(
+            &code,
+            day1,
+            Some(10.0),
+            Some(10.3),
+            Some(9.8),
+            Some(10.0),
+            Some(100.0),
+            Some(1_100.0),
+            Some(0.0),
+            Some(9.9),
+            Some(9.8),
+            Some(9.7),
+            Some(1.1),
+            Some("TEST_SOURCE_V2"),
+        )
+        .expect("upsert daily row");
+        assert!(db.has_data_for_date(&code, day1).unwrap());
+        let record = StockDailyRecord {
+            code: code.clone(),
+            date: day2,
+            open: Some(10.0),
+            high: Some(11.2),
+            low: Some(9.9),
+            close: Some(11.0),
+            volume: Some(200.0),
+            amount: Some(2_200.0),
+            pct_chg: Some(10.0),
+            ma5: Some(10.5),
+            ma10: Some(10.0),
+            ma20: Some(9.5),
+            volume_ratio: Some(2.0),
+            data_source: Some("TEST_BATCH".to_string()),
+        };
+        assert_eq!(db.save_daily_batch(&[record]).unwrap(), 1);
+        let latest = db.get_latest_data(&code, 1).unwrap();
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].date, day2);
+        assert_eq!(latest[0].close, Some(11.0));
+        let range = db.get_data_range(&code, day1, day2).unwrap();
+        assert_eq!(range.len(), 2);
+        assert_eq!(range[0].date, day1);
+        let context = db
+            .get_analysis_context(&code, None)
+            .unwrap()
+            .expect("analysis context");
+        assert_eq!(context.code, code);
+        assert_eq!(context.date, day2);
+        assert_eq!(context.volume_change_ratio, Some(2.0));
+        assert_eq!(context.price_change_ratio, Some(10.0));
+        assert!(context.yesterday.is_some());
+
+        let valid = vec![kline(day1, 10.0, 0.0), kline(day2, 11.0, 10.0)];
+        assert!(db.save_kline_data("", &valid, "TEST_PROVIDER").is_err());
+        assert!(db.save_kline_data(&provider_code, &valid, " ").is_err());
+        assert_eq!(
+            db.save_kline_data(&provider_code, &valid, "TEST_PROVIDER")
+                .expect("save validated provider batch"),
+            2
+        );
+        let mut invalid = kline(day2, 11.0, 0.0);
+        invalid.low = -1.0;
+        assert!(db
+            .save_kline_data(&provider_code, &[invalid], "TEST_PROVIDER")
+            .is_err());
+
+        let mut result = NewAnalysisResult {
+            code: code.clone(),
+            name: "K线测试".to_string(),
+            date: day2,
+            sentiment_score: 70,
+            operation_advice: "观望".to_string(),
+            trend_prediction: "震荡".to_string(),
+            pe_ratio: Some(10.0),
+            pb_ratio: None,
+            turnover_rate: None,
+            market_cap: None,
+            circulating_cap: None,
+            close_price: Some(11.0),
+            pct_chg: Some(10.0),
+            data_source: Some("TEST_SOURCE".to_string()),
+            score_breakdown_json: None,
+            original_advice: None,
+            veto_flags_json: None,
+        };
+        db.save_analysis_result(&result)
+            .expect("save analysis result");
+        result.sentiment_score = 80;
+        result.operation_advice = "持有".to_string();
+        db.save_analysis_result(&result)
+            .expect("upsert analysis result");
+        let by_date = db.get_analysis_results_by_date(day2).unwrap();
+        let stored = by_date.iter().find(|row| row.code == code).unwrap();
+        assert_eq!(stored.sentiment_score, 80);
+        assert_eq!(stored.operation_advice, "持有");
+        let latest_results = db.get_latest_analysis_results(&code, 1).unwrap();
+        assert_eq!(latest_results.len(), 1);
+        assert_eq!(db.delete_stock_data(&code).unwrap(), 2);
+        assert!(db.get_latest_data(&code, 1).unwrap().is_empty());
     }
 }

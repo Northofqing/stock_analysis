@@ -144,6 +144,20 @@ Expected: all PASS. Commit only the two modules plus design/plan/progress eviden
 - [x] Assert complete two-day batches return newest-first, QFQ, exact amount and independently expected pct values.
 - [x] Run both provider test modules, full data-provider/library tests, focused coverage, fmt, strict all-target Clippy and compliance; commit independently.
 
+### Task 4A: Restore v16.x pushed_stocks and cover local core execution
+
+**Files:**
+- Modify: `src/database/mod.rs`
+- Modify: `src/signal/push_recorder.rs`
+- Modify tests: `src/decision/intraday_monitor.rs`, `src/database/{concepts,kline}.rs`, `src/trading/paper_engine.rs`
+- Modify: `docs/business_rules.md`
+
+- [x] Add a RED fresh-database contract proving the v16.x `pushed_stocks` table and its three registered indexes are absent, then add the exact idempotent DDL from v16.3 under BR-126.
+- [x] Exercise `push_recorder` → intraday/evening consumption with unique `TEST_CODE_` rows, test-only fresh quote/account evidence, explicit bad-candidate non-consumption, successful audit fields and same-day re-entry prevention.
+- [x] Cover concept/chain/event/board repository validation and lifecycle through real isolated SQLite; cover K-line upsert/range/context/result lifecycle without touching the ignored live account database.
+- [x] Cover paper-engine open-position/advice decisions and failure boundaries; preserve real quote/account requirements and do not add production mocks.
+- [x] Run focused tests, full instrumented library suite, fmt, strict all-target Clippy and compliance; commit independently.
+
 ### Task 6: Raise repository-wide coverage to 80%
 
 **Files:**

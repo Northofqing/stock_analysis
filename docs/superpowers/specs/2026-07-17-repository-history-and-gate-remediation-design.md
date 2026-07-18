@@ -591,3 +591,31 @@ Failure handling:
 - 数据流：完整 JSON → provider 字段解析 → Tencent 按升序真实收盘计算 pct_chg / Eastmoney 保留来源 pct_chg → 统一 BR-092 批次校验 → 最新日期在前返回。校验失败整批拒绝，不改变 HTTP host/retry、复权口径或 provider 顺序。
 - 测试 seam：模块内本地 JSON 同时覆盖 qfqday/day、成功排序/涨跌幅、空/缺数组、非数组行、短行、坏日期/类型/数值、OHLC、量额、涨跌幅、日期缺口/重复和 >20% 跳变。原生六位代码只作为协议路由参数，不进入订单。
 - 回滚：整体回退 BR-125 代码和测试；不得只移除严格校验而保留“已满足 2.3”的声明。
+
+## Addendum: BR-126 v16.x pushed_stocks 初始化与消费合同（2026-07-18）
+
+- 根因：v16.1/v16.3 设计、`push_recorder` 和 `intraday_monitor` 都依赖 `pushed_stocks`，但当前 `DatabaseManager::init` 没有创建该表或三个查询索引。新数据库上的首条推送和每次盘中/盘后扫描都会显式失败，R3→R4→R5 数据流实际上不可用。
+- 数据流：数据库初始化原子创建 12 字段表和三个登记索引 → `push_recorder` 拒绝空身份/来源、非有限正价格或非对象 JSON → 真实推送先入池 → 盘中按一小时窗口/50 条上限或盘后按当日 15:30/100 条上限稳定读取 → BR-098 严格解析评分 → 报价/账户/风控/成交均成功后更新消费审计字段。任何前置失败保留未消费事实并返回/记录显式错误。
+- 测试隔离：RED 数据库合同先证明全新初始化缺表；GREEN 后用 SQLite 元数据验证精确字段与索引，再用唯一 `TEST_CODE_` 行验证坏数据不消费、成功消费审计和盘后防重入。测试报价与账户只存在于 `cfg(test)`，不进入生产 fallback。
+- 旧模块关系：采用 v16.x 文档中的表结构、`signal::push_recorder` 写路径和 `decision::intraday_monitor` 消费路径；拒绝新增第二张队列表或内存 fallback，以免绕过审计。
+- 回滚：整体回退 BR-126 DDL、测试和文档。若生产数据库已创建空表，`CREATE TABLE/INDEX IF NOT EXISTS` 的回退不删除用户数据；禁止用 `DROP TABLE` 回滚。
+
+## Addendum: BR-098 AuctionAnomaly 可达性修正（2026-07-18）
+
+- 根因：`Candidate::push_kind_label` 已把显式 `AuctionAnomaly` 路由到同名策略，但 `AuctionAnomalyStrategy::score` 只接受 `P-02`，导致已登记类型必然返回 `None`。这是路由/策略协议不一致，不是低分或缺数据。
+- 修正：策略接受 v16.x 登记的 `AuctionAnomaly` 显式类型，同时保留原有 `P-02` 兼容入口；盘中路由继续保持 `P-02 → VolumeSurge`，不根据猜测重写已有来源类型。评分公式、5 倍量比门和所有其他策略不变。
+- 验证与回滚：八种登记 push kind 均必须到达各自真实策略输出，缺字段/LLM 越界继续显式失败；整体回退这一协议兼容改动即可。
+
+## Addendum: BR-092 数据库 K 线写前完整批次校验（2026-07-18）
+
+- 根因：`StockRepository::find_kline` 在读取时执行严格校验，但其最终写入口 `DatabaseManager::save_kline_data` 直接 UPSERT。任何绕过具体 provider 的调用都能把负/非有限价格、坏 OHLC、量额、涨跌幅、缺口/重复或 >20% 跳变写入 `stock_daily`。
+- 修正：非空 provider 批次先检查非空代码/来源，再克隆并调用统一 `validate_kline_series_strict`；只有完整批次通过才获取连接并进入事务。校验器的排序只作用于克隆，数据库按日期键 UPSERT 的结果不变；空批次继续返回 0，表达调用方确实没有提交任何行。
+- 失败模式：任一坏行使写入前返回错误，旧数据不变；事务/连接错误保持显式传播。旧的可空 `save_daily_record/save_daily_batch` 是分阶段字段存储接口，不被伪装成已完成 provider 批次，严格计算读取仍由 repository 拒绝缺必填字段。
+- 回滚：整体回退写前校验和测试；不得只删除校验却保留 BR-092 数据库写边界声明。
+
+## Addendum: BR-005 RFC3339 本地日配额边界（2026-07-19）
+
+- 根因：analytics 以 `DateTime<Local>::to_rfc3339()` 持久化真实时区，但两个日计数 SQL 使用 `date(ts)`。SQLite 会把 `+08:00` 转成 UTC 后再取日期，因此上海 00:00–07:59 的成功投递被归到前一天，日配额被低估。
+- 修正：记录格式不变，日计数比较 RFC3339 的前 10 个字符（来源本地民用 `YYYY-MM-DD`）与调用方明确传入的本地日期；用户/模板/`pushed=1` 条件不变。此查询此前已经使用 SQL 函数，改用 `substr` 不新增索引退化。
+- 验证：固定存入 `2026-07-19T00:30:00+08:00`，7 月 19 日必须计 1、7 月 18 日必须计 0；治理拒绝和其他模板仍不计。告警统计测试同时移除对并行测试先写文件的顺序依赖。
+- 回滚：整体回退 SQL 和测试；不重写历史 analytics 行，不删除真实推送或告警记录。

@@ -201,8 +201,8 @@ mod tests {
 
     #[test]
     fn test_today_stats() {
+        append_md(&e()).unwrap();
         let (em, im, inf) = today_stats();
-        // At least one important alert from previous test
         assert!(em + im + inf > 0);
     }
 }

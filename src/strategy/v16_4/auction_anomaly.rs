@@ -1,4 +1,5 @@
-//! v16.4 #5 完整化: AuctionAnomalyStrategy 真读 vol_ratio (P-02 推送, score 6.5 + 真实数据)
+//! v16.4 #5 完整化: AuctionAnomalyStrategy 真读 vol_ratio (P-02/AuctionAnomaly 推送).
+//! Registered business rule: BR-098.
 
 use super::_helpers;
 use super::{Strategy, StrategyInput, StrategyOutput};
@@ -15,7 +16,7 @@ impl Strategy for AuctionAnomalyStrategy {
         "竞价量能异动 (P-02 推送)"
     }
     fn score(&self, input: &StrategyInput) -> Option<StrategyOutput> {
-        if input.push_kind != "P-02" {
+        if input.push_kind != "P-02" && input.push_kind != "AuctionAnomaly" {
             return None;
         }
         let m = _helpers::parse(&input.metric_json, &input.code, input.push_price).ok()?;

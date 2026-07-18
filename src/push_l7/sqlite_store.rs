@@ -1,4 +1,5 @@
 //! push_l7/sqlite_store.rs — SQLiteStore (W7.2)
+//! Registered business rule: BR-005.
 //!
 //! 严格按 `docs/architecture/v14.2-push-architecture.md` v14.2 §3.7 落地.
 //!
@@ -54,7 +55,7 @@ impl SqliteStore {
         );
         conn.query_row(
             "SELECT COUNT(*) FROM push_analytics
-             WHERE user_id = ?1 AND date(ts) = ?2",
+             WHERE user_id = ?1 AND substr(ts, 1, 10) = ?2",
             params![user_id, today.to_string()],
             |row| row.get(0),
         )
@@ -75,7 +76,8 @@ impl SqliteStore {
         );
         conn.query_row(
             "SELECT COUNT(*) FROM push_analytics
-             WHERE user_id = ?1 AND template_id = ?2 AND pushed = 1 AND date(ts) = ?3",
+             WHERE user_id = ?1 AND template_id = ?2 AND pushed = 1
+             AND substr(ts, 1, 10) = ?3",
             params![user_id, template_id, today.to_string()],
             |row| row.get(0),
         )
@@ -552,16 +554,43 @@ mod tests {
         store.record(&successful).unwrap();
         store.record(&failed).unwrap();
         store.record(&other).unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE push_analytics SET ts = '2026-07-19T00:30:00+08:00'",
+                [],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            store
+                .count_today_for_user(
+                    "default",
+                    chrono::NaiveDate::from_ymd_opt(2026, 7, 19).unwrap(),
+                )
+                .unwrap(),
+            3
+        );
 
         assert_eq!(
             store
                 .count_today_pushed_for_user_and_template(
                     "default",
                     "candidate_board",
-                    Local::now().date_naive(),
+                    chrono::NaiveDate::from_ymd_opt(2026, 7, 19).unwrap(),
                 )
                 .unwrap(),
             1
+        );
+        assert_eq!(
+            store
+                .count_today_pushed_for_user_and_template(
+                    "default",
+                    "candidate_board",
+                    chrono::NaiveDate::from_ymd_opt(2026, 7, 18).unwrap(),
+                )
+                .unwrap(),
+            0
         );
     }
 

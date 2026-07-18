@@ -281,6 +281,68 @@ fn extract_reason(advice: &str) -> String {
 mod tests {
     use super::*;
 
+    fn unique_code(label: &str) -> String {
+        format!(
+            "TEST_CODE_PAPER_ENGINE_{label}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        )
+    }
+
+    struct PaperEngineGuard {
+        codes: Vec<String>,
+        ledger_date: String,
+    }
+
+    impl Drop for PaperEngineGuard {
+        fn drop(&mut self) {
+            if let Ok(mut conn) = DatabaseManager::get().get_conn() {
+                for code in &self.codes {
+                    let _ = diesel::sql_query("DELETE FROM paper_trades WHERE code = ?")
+                        .bind::<diesel::sql_types::Text, _>(code)
+                        .execute(&mut conn);
+                    let _ = diesel::sql_query("DELETE FROM analysis_result WHERE code = ?")
+                        .bind::<diesel::sql_types::Text, _>(code)
+                        .execute(&mut conn);
+                }
+                let _ = diesel::sql_query("DELETE FROM ledger WHERE date = ?")
+                    .bind::<diesel::sql_types::Text, _>(&self.ledger_date)
+                    .execute(&mut conn);
+            }
+        }
+    }
+
+    fn prepare_account(codes: Vec<String>) -> PaperEngineGuard {
+        DatabaseManager::init(None).expect("test database init");
+        crate::broker::ensure_test_quote_provider();
+        let ledger_date = Local::now().date_naive().to_string();
+        let mut conn = DatabaseManager::get()
+            .get_conn()
+            .expect("test database connection");
+        diesel::sql_query(
+            "INSERT INTO ledger (date, total_value, cash, market_value, daily_pnl, created_at)
+             VALUES (?, 100000.0, 100000.0, 0.0, 0.0, CURRENT_TIMESTAMP)
+             ON CONFLICT(date) DO UPDATE SET
+                 total_value = excluded.total_value,
+                 cash = excluded.cash,
+                 market_value = excluded.market_value,
+                 daily_pnl = excluded.daily_pnl,
+                 created_at = CURRENT_TIMESTAMP",
+        )
+        .bind::<diesel::sql_types::Text, _>(&ledger_date)
+        .execute(&mut conn)
+        .expect("prepare same-day ledger");
+        diesel::sql_query(
+            "UPDATE stock_position SET updated_at = CURRENT_TIMESTAMP WHERE status = 'open'",
+        )
+        .execute(&mut conn)
+        .expect("refresh test position evidence");
+        PaperEngineGuard { codes, ledger_date }
+    }
+
     #[test]
     fn detects_iron_rule_1_stop_loss() {
         assert!(is_iron_rule_triggered("铁律1:止损(-8%)"));
@@ -357,5 +419,111 @@ mod tests {
             r
         );
         assert_eq!(r.chars().count(), 30);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn paper_engine_round_trips_open_positions_decisions_and_sell_execution() {
+        let code = unique_code("TRIGGER");
+        let hold_code = unique_code("HOLD");
+        let _guard = prepare_account(vec![code.clone(), hold_code.clone()]);
+        let mut conn = DatabaseManager::get()
+            .get_conn()
+            .expect("test database connection");
+        for (plan, direction, price, quantity, status) in [
+            ("BUY_A", "buy", 10.0, 200_i64, "Filled"),
+            ("BUY_B", "buy", 12.0, 100_i64, "Filled"),
+            ("SELL_A", "sell", 11.0, 100_i64, "Filled"),
+            ("IGNORED", "buy", 9.0, 500_i64, "NotFilled"),
+        ] {
+            diesel::sql_query(
+                "INSERT INTO paper_trades
+                 (plan_id, code, name, direction, price, quantity, status, fill_price,
+                  virtual_reason, account_mode, data_mode)
+                 VALUES (?, ?, '虚拟持仓', ?, ?, ?, ?, ?, 'TEST_REASON', 'Normal', 'Full')",
+            )
+            .bind::<diesel::sql_types::Text, _>(format!("{plan}_{code}"))
+            .bind::<diesel::sql_types::Text, _>(&code)
+            .bind::<diesel::sql_types::Text, _>(direction)
+            .bind::<diesel::sql_types::Double, _>(price)
+            .bind::<diesel::sql_types::BigInt, _>(quantity)
+            .bind::<diesel::sql_types::Text, _>(status)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>, _>(
+                (status == "Filled").then_some(price),
+            )
+            .execute(&mut conn)
+            .expect("insert isolated paper trade");
+        }
+        let positions = load_open_positions().expect("aggregate open paper positions");
+        let position = positions
+            .iter()
+            .find(|position| position.code == code)
+            .expect("isolated open paper position");
+        assert_eq!(position.name, "虚拟持仓");
+        assert_eq!(position.quantity, 200);
+        assert!((position.avg_cost - (3_200.0 / 300.0)).abs() < 1e-9);
+        assert_eq!(position.current_price, 10.0);
+        assert_eq!(position.limit_down_price, 9.0);
+        assert_eq!(position.limit_up_price, 11.0);
+
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 7, 18).unwrap();
+        for (target, advice) in [
+            (&code, "操作建议：触发铁律3，执行止盈"),
+            (&hold_code, "持有观望"),
+        ] {
+            DatabaseManager::get()
+                .save_analysis_result(&crate::models::NewAnalysisResult {
+                    code: target.clone(),
+                    name: "纸面引擎".to_string(),
+                    date: day,
+                    sentiment_score: 70,
+                    operation_advice: advice.to_string(),
+                    trend_prediction: "测试".to_string(),
+                    pe_ratio: None,
+                    pb_ratio: None,
+                    turnover_rate: None,
+                    market_cap: None,
+                    circulating_cap: None,
+                    close_price: Some(10.0),
+                    pct_chg: Some(0.0),
+                    data_source: Some("TEST_SOURCE".to_string()),
+                    score_breakdown_json: None,
+                    original_advice: None,
+                    veto_flags_json: None,
+                })
+                .expect("save decision evidence");
+        }
+        let mut checks = vec![position.clone()];
+        checks.push(PaperPositionSellCheck {
+            code: hold_code,
+            name: "未触发".to_string(),
+            avg_cost: 10.0,
+            quantity: 100,
+            current_price: 10.0,
+            limit_up_price: 11.0,
+            limit_down_price: 9.0,
+            quote_observed_at: chrono::Utc::now(),
+        });
+        assert!(check_4_iron_rules(&[]).unwrap().is_empty());
+        let decisions = check_4_iron_rules(&checks).expect("batch iron-rule decision");
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].code, code);
+        assert_eq!(decisions[0].quantity, 200);
+        assert_eq!(decisions[0].reason, "铁律3:跌破5日线止盈");
+        emit_sell_signal(&decisions[0]).expect("audited paper sell");
+
+        let mut invalid = SellDecision {
+            code: unique_code("INVALID"),
+            name: "坏手数".to_string(),
+            reason: "铁律1:止损(-8%)".to_string(),
+            quantity: 0,
+            current_price: 10.0,
+            limit_up_price: 11.0,
+            limit_down_price: 9.0,
+            quote_observed_at: chrono::Utc::now(),
+        };
+        assert!(emit_sell_signal(&invalid).is_err());
+        invalid.current_price = f64::NAN;
+        assert!(emit_sell_signal(&invalid).is_err());
     }
 }

@@ -1,4 +1,4 @@
-//! Registered business rules: BR-068.
+//! Registered business rules: BR-068, BR-101, BR-102.
 //! 股票概念板块标签缓存。
 //!
 //! 概念标签（东财 F10 核心题材）变化缓慢，落库缓存避免每日重复请求。
@@ -462,6 +462,37 @@ impl DatabaseManager {
 mod tests {
     use super::*;
 
+    struct ConceptsGuard {
+        code: String,
+        chain_date: String,
+        simhashes: Vec<i64>,
+    }
+
+    impl Drop for ConceptsGuard {
+        fn drop(&mut self) {
+            if let Ok(mut conn) = DatabaseManager::get().get_conn() {
+                let _ = diesel::sql_query("DELETE FROM stock_concepts WHERE code = ?")
+                    .bind::<Text, _>(&self.code)
+                    .execute(&mut conn);
+                let _ = diesel::sql_query("DELETE FROM chain_daily WHERE date = ?")
+                    .bind::<Text, _>(&self.chain_date)
+                    .execute(&mut conn);
+                for simhash in &self.simhashes {
+                    let _ = diesel::sql_query("DELETE FROM event_seen_simhash WHERE simhash = ?")
+                        .bind::<diesel::sql_types::BigInt, _>(*simhash)
+                        .execute(&mut conn);
+                }
+            }
+        }
+    }
+
+    fn unique_suffix() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos()
+    }
+
     // B-002 DAO 测试约束: DatabaseManager 是 OnceCell 单例, init() 仅生效一次.
     // 全部 DAO 测试共用同一份 ./test_data/test.db, 用唯一 date 隔离, 不假定空表.
     const TEST_DATE: &str = "2099-01-01"; // 远期日期, 不与生产 / 其他测试冲突
@@ -565,5 +596,180 @@ mod tests {
             !got.iter().any(|r| r.board_code == "B002_OLD"),
             "get_latest 应只返回最新 date 的 row, 不返 2020 的 stale 数据"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn br101_concept_and_chain_repository_lifecycle_is_strict() {
+        DatabaseManager::init(None).expect("test database init");
+        let suffix = unique_suffix();
+        let code = format!("TEST_CODE_CONCEPT_{suffix}");
+        let chain_date = "2199-01-01".to_string();
+        let _guard = ConceptsGuard {
+            code: code.clone(),
+            chain_date: chain_date.clone(),
+            simhashes: Vec::new(),
+        };
+        let db = DatabaseManager::get();
+
+        assert!(db.get_cached_concepts(0).is_err());
+        for (bad_code, concepts) in [
+            ("", vec!["算力".to_string()]),
+            ("TEST_CODE_BAD", Vec::new()),
+            ("TEST_CODE_BAD", vec![" ".to_string()]),
+        ] {
+            assert!(db.save_stock_concepts(bad_code, &concepts).is_err());
+        }
+        let concepts = vec!["算力".to_string(), "液冷".to_string()];
+        db.save_stock_concepts(&code, &concepts)
+            .expect("save complete concept evidence");
+        let cached = db.get_cached_concepts(1).expect("fresh concept cache");
+        assert_eq!(cached.get(&code), Some(&concepts));
+
+        assert!(db
+            .save_chain_clusters("bad-date", &[("算力".to_string(), vec![code.clone()], 1)])
+            .is_err());
+        for bad in [
+            ("".to_string(), vec![code.clone()], 1),
+            ("算力".to_string(), Vec::new(), 1),
+            ("算力".to_string(), vec![" ".to_string()], 1),
+            ("算力".to_string(), vec![code.clone()], -1),
+        ] {
+            assert!(db.save_chain_clusters(&chain_date, &[bad]).is_err());
+        }
+        db.save_chain_clusters(
+            &chain_date,
+            &[
+                ("算力".to_string(), vec![code.clone()], 2),
+                ("液冷".to_string(), vec![code.clone()], 1),
+            ],
+        )
+        .expect("save complete chain batch");
+        let latest = db
+            .get_latest_chain_clusters_strict()
+            .expect("latest chain batch");
+        assert_eq!(latest.len(), 2);
+        assert!(latest.iter().all(|row| row.date == chain_date));
+        assert!(latest.iter().any(|row| {
+            row.concept == "算力"
+                && row.continuation_count == 2
+                && serde_json::from_str::<Vec<String>>(&row.stocks).unwrap() == vec![code.clone()]
+        }));
+        assert_eq!(db.get_latest_chain_clusters().len(), 2);
+        assert_eq!(
+            db.get_chain_streak_days_strict("算力", 1)
+                .expect("chain streak"),
+            1
+        );
+        assert_eq!(db.get_chain_streak_days("算力", 1), 1);
+        assert_eq!(db.get_chain_streak_days("", 0), 0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn br068_event_seen_repository_validates_transactions_and_retention() {
+        DatabaseManager::init(None).expect("test database init");
+        let base = (unique_suffix() % 1_000_000_000) as i64 + 1_000_000_000;
+        let first = base;
+        let second = base + 1;
+        let _guard = ConceptsGuard {
+            code: format!("TEST_CODE_UNUSED_{base}"),
+            chain_date: "2199-12-31".to_string(),
+            simhashes: vec![first, second],
+        };
+        let db = DatabaseManager::get();
+        assert!(db.save_event_seen(&[]).is_ok());
+        assert!(db.get_recent_event_seen(0).is_err());
+        assert!(db.cleanup_old_event_seen(0).is_err());
+        assert!(db
+            .save_event_seen(&[EventSeenEntry {
+                simhash: u64::MAX,
+                title: "越界".to_string(),
+            }])
+            .is_err());
+        assert!(db
+            .save_event_seen(&[
+                EventSeenEntry {
+                    simhash: first as u64,
+                    title: "有效但应回滚".to_string(),
+                },
+                EventSeenEntry {
+                    simhash: second as u64,
+                    title: " ".to_string(),
+                },
+            ])
+            .is_err());
+        let recent = db.get_recent_event_seen(2).expect("recent event evidence");
+        assert!(!recent.iter().any(|entry| entry.simhash == first as u64));
+
+        db.save_event_seen(&[
+            EventSeenEntry {
+                simhash: first as u64,
+                title: "算力服务器订单增长".to_string(),
+            },
+            EventSeenEntry {
+                simhash: second as u64,
+                title: "液冷产业链扩产".to_string(),
+            },
+        ])
+        .expect("save event evidence batch");
+        let recent = db.get_recent_event_seen(2).expect("recent event evidence");
+        assert!(recent.iter().any(|entry| {
+            entry.simhash == first as u64 && entry.title == "算力服务器订单增长"
+        }));
+        let mut conn = db.get_conn().expect("test database connection");
+        diesel::sql_query(
+            "UPDATE event_seen_simhash SET seen_at = '2000-01-01 00:00:00' WHERE simhash = ?",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(first)
+        .execute(&mut conn)
+        .expect("age exact test event");
+        assert!(
+            db.cleanup_old_event_seen(7)
+                .expect("event retention cleanup")
+                >= 1
+        );
+        let recent = db
+            .get_recent_event_seen(7)
+            .expect("retained event evidence");
+        assert!(!recent.iter().any(|entry| entry.simhash == first as u64));
+        assert!(recent.iter().any(|entry| entry.simhash == second as u64));
+    }
+
+    #[test]
+    fn br101_board_rotation_rejects_bad_batches_before_writing() {
+        DatabaseManager::init(None).expect("test database init");
+        let db = DatabaseManager::get();
+        let valid = BoardRotationEntry {
+            board_code: "TEST_BOARD".to_string(),
+            board_name: "测试板块".to_string(),
+            news_title: "测试催化".to_string(),
+            board_change_pct: 1.0,
+            board_main_net_pct: 0.5,
+            stocks_json: "[]".to_string(),
+        };
+        assert!(db
+            .save_board_rotations("bad-date", std::slice::from_ref(&valid))
+            .is_err());
+        let mut empty_code = valid.clone();
+        empty_code.board_code.clear();
+        let mut empty_name = valid.clone();
+        empty_name.board_name.clear();
+        let mut empty_title = valid.clone();
+        empty_title.news_title.clear();
+        let mut bad_net = valid.clone();
+        bad_net.board_main_net_pct = f64::INFINITY;
+        for bad in [empty_code, empty_name, empty_title, bad_net] {
+            assert!(db.save_board_rotations("2199-01-02", &[bad]).is_err());
+        }
+        let mut bad = valid.clone();
+        bad.board_change_pct = f64::NAN;
+        assert!(db.save_board_rotations("2199-01-02", &[bad]).is_err());
+        let mut bad = valid.clone();
+        bad.stocks_json = "not-json".to_string();
+        assert!(db.save_board_rotations("2199-01-02", &[bad]).is_err());
+        let mut bad = valid;
+        bad.stocks_json = "{}".to_string();
+        assert!(db.save_board_rotations("2199-01-02", &[bad]).is_err());
     }
 }

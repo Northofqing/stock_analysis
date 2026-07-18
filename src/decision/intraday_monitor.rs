@@ -1,4 +1,5 @@
 //! v16.3 Commit 3 — 盘中监控 + 盘后整盘扫描 (R4 + R5 业务核心).
+//! Registered business rules: BR-098, BR-126.
 //!
 //! 业务流:
 //!   1. intraday_monitor.tick() 每 30s 跑一次
@@ -501,6 +502,97 @@ pub fn evening_review(today: NaiveDate) -> Result<usize, String> {
 mod tests {
     use super::*;
 
+    fn unique_code(label: &str) -> String {
+        format!(
+            "TEST_CODE_{label}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        )
+    }
+
+    struct IntradayDbGuard {
+        push_ids: Vec<i64>,
+        codes: Vec<String>,
+        ledger_date: String,
+    }
+
+    impl Drop for IntradayDbGuard {
+        fn drop(&mut self) {
+            if let Ok(mut conn) = DatabaseManager::get().get_conn() {
+                for id in &self.push_ids {
+                    let _ = diesel::sql_query("DELETE FROM pushed_stocks WHERE id = ?")
+                        .bind::<diesel::sql_types::BigInt, _>(*id)
+                        .execute(&mut conn);
+                }
+                for code in &self.codes {
+                    let _ = diesel::sql_query("DELETE FROM paper_trades WHERE code = ?")
+                        .bind::<diesel::sql_types::Text, _>(code)
+                        .execute(&mut conn);
+                }
+                let _ = diesel::sql_query("DELETE FROM ledger WHERE date = ?")
+                    .bind::<diesel::sql_types::Text, _>(&self.ledger_date)
+                    .execute(&mut conn);
+            }
+        }
+    }
+
+    fn prepare_execution_account() -> IntradayDbGuard {
+        DatabaseManager::init(None).expect("test database init");
+        crate::broker::ensure_test_quote_provider();
+        let ledger_date = Local::now().date_naive().to_string();
+        let mut conn = DatabaseManager::get()
+            .get_conn()
+            .expect("test database connection");
+        diesel::sql_query(
+            "INSERT INTO ledger (date, total_value, cash, market_value, daily_pnl, created_at)
+             VALUES (?, 100000.0, 100000.0, 0.0, 0.0, CURRENT_TIMESTAMP)
+             ON CONFLICT(date) DO UPDATE SET
+                 total_value = excluded.total_value,
+                 cash = excluded.cash,
+                 market_value = excluded.market_value,
+                 daily_pnl = excluded.daily_pnl,
+                 created_at = CURRENT_TIMESTAMP",
+        )
+        .bind::<diesel::sql_types::Text, _>(&ledger_date)
+        .execute(&mut conn)
+        .expect("prepare same-day test ledger");
+        diesel::sql_query(
+            "UPDATE stock_position SET updated_at = CURRENT_TIMESTAMP WHERE status = 'open'",
+        )
+        .execute(&mut conn)
+        .expect("refresh isolated test position evidence");
+        IntradayDbGuard {
+            push_ids: Vec::new(),
+            codes: Vec::new(),
+            ledger_date,
+        }
+    }
+
+    #[derive(QueryableByName)]
+    struct ConsumptionRow {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        consumed_at: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        consumed_by: Option<String>,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        outcome: Option<String>,
+    }
+
+    fn consumption(id: i64) -> ConsumptionRow {
+        let mut conn = DatabaseManager::get()
+            .get_conn()
+            .expect("test database connection");
+        diesel::sql_query(
+            "SELECT consumed_at, consumed_by, outcome FROM pushed_stocks WHERE id = ?",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .get_result::<ConsumptionRow>(&mut conn)
+        .expect("push consumption audit")
+    }
+
     fn candidate(kind: &str, subkind: &str, vol_ratio: f64) -> Candidate {
         let json = serde_json::json!({
             "vol_ratio": vol_ratio,
@@ -643,5 +735,172 @@ mod tests {
     fn push_kind_label_maps_postclose() {
         let c = candidate("盘后资金", "MainNetInflow", 0.0);
         assert_eq!(c.push_kind_label(), "MainNetInflow");
+    }
+
+    #[test]
+    fn br098_every_registered_push_kind_reaches_its_real_strategy() {
+        let successful = [
+            ("D-01", "NewsCatalyst", 6.0, 0.1, 1.0),
+            ("盘后资金", "MainNetInflow", 6.0, 0.1, 1.0),
+            ("I-01", "SectorLeader", 6.0, 1.0, 1.0),
+            ("I-03", "Breakout", 6.0, 5.0, 1.0),
+            ("P-02", "VolumeSurge", 6.0, 1.0, 1.0),
+            ("AuctionAnomaly", "AuctionAnomaly", 6.0, 1.0, 1.0),
+            ("Momentum", "Momentum", 6.0, 1.0, 1.0),
+        ];
+        for (kind, expected_reason, vol_ratio, price_chg_pct, main_net_yi) in successful {
+            let mut cand = candidate(kind, expected_reason, vol_ratio);
+            cand.metric_json = serde_json::json!({
+                "vol_ratio": vol_ratio,
+                "price_chg_pct": price_chg_pct,
+                "main_net_yi": main_net_yi,
+                "sector": "测试板块",
+                "push_subkind": expected_reason,
+            })
+            .to_string();
+            let output = IntradayMonitor::score_candidate(&cand)
+                .unwrap_or_else(|error| panic!("kind={kind}: {error}"))
+                .unwrap_or_else(|| panic!("kind={kind} must reach its strategy"));
+            assert_eq!(output.virtual_reason, expected_reason, "kind={kind}");
+        }
+
+        let mut llm = candidate("LLMSelect", "LLMSelect", 1.0);
+        llm.metric_json = serde_json::json!({
+            "llm_confidence": 0.8,
+            "llm_verdict": "看多"
+        })
+        .to_string();
+        let output = IntradayMonitor::score_candidate(&llm)
+            .expect("valid LLM fields")
+            .expect("LLMSelect strategy output");
+        assert_eq!(output.virtual_reason, "LLMSelect");
+    }
+
+    #[test]
+    fn br098_required_fields_and_llm_bounds_fail_explicitly() {
+        for (kind, json, expected) in [
+            ("P-02", "{}", "vol_ratio"),
+            ("I-03", r#"{"vol_ratio":3.0}"#, "price_chg_pct"),
+            ("盘后资金", r#"{"price_chg_pct":1.0}"#, "main_net_yi"),
+            ("I-01", r#"{"price_chg_pct":1.0}"#, "sector"),
+            (
+                "LLMSelect",
+                r#"{"llm_confidence":1.1,"llm_verdict":"看多"}"#,
+                "越界",
+            ),
+            (
+                "LLMSelect",
+                r#"{"llm_confidence":0.8,"llm_verdict":" "}"#,
+                "llm_verdict",
+            ),
+        ] {
+            let mut cand = candidate(kind, kind, 1.0);
+            cand.metric_json = json.to_string();
+            let error = IntradayMonitor::score_candidate(&cand)
+                .expect_err("missing/malformed required evidence must fail");
+            assert!(error.contains(expected), "kind={kind} error={error}");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn br126_intraday_tick_consumes_only_audited_valid_candidate() {
+        let mut guard = prepare_execution_account();
+        let good_code = unique_code("INTRADAY_GOOD");
+        let bad_code = unique_code("INTRADAY_BAD");
+        guard.codes.extend([good_code.clone(), bad_code.clone()]);
+        let good_id =
+            crate::signal::push_recorder::record(&crate::signal::push_recorder::PushRecordMeta {
+                code: good_code,
+                name: "盘中有效候选".to_string(),
+                push_kind: "P-02".to_string(),
+                push_price: 10.0,
+                metric_json: serde_json::json!({
+                    "vol_ratio": 6.0,
+                    "price_chg_pct": 1.0,
+                    "push_subkind": "VolumeSurge"
+                })
+                .to_string(),
+                source: "preopen".to_string(),
+            })
+            .expect("record valid candidate");
+        let bad_id =
+            crate::signal::push_recorder::record(&crate::signal::push_recorder::PushRecordMeta {
+                code: bad_code,
+                name: "盘中坏候选".to_string(),
+                push_kind: "P-02".to_string(),
+                push_price: 10.0,
+                metric_json: serde_json::json!({"price_chg_pct": 1.0}).to_string(),
+                source: "preopen".to_string(),
+            })
+            .expect("record structurally valid candidate for decision rejection");
+        guard.push_ids.extend([good_id, bad_id]);
+        let eligible_time = (Local::now() - Duration::minutes(1))
+            .format("%Y-%m-%d %H:%M:%S%.3f")
+            .to_string();
+        let mut conn = DatabaseManager::get()
+            .get_conn()
+            .expect("test database connection");
+        for id in [good_id, bad_id] {
+            diesel::sql_query("UPDATE pushed_stocks SET push_time = ? WHERE id = ?")
+                .bind::<diesel::sql_types::Text, _>(&eligible_time)
+                .bind::<diesel::sql_types::BigInt, _>(id)
+                .execute(&mut conn)
+                .expect("place test candidate inside strict one-hour window");
+        }
+
+        assert_eq!(IntradayMonitor.tick().expect("intraday tick"), 1);
+        let good = consumption(good_id);
+        assert!(good.consumed_at.is_some());
+        assert_eq!(good.consumed_by.as_deref(), Some("intraday_monitor"));
+        assert_eq!(good.outcome.as_deref(), Some("VolumeSurge"));
+        let bad = consumption(bad_id);
+        assert!(bad.consumed_at.is_none());
+        assert!(bad.consumed_by.is_none());
+        assert!(bad.outcome.is_none());
+        assert_eq!(
+            IntradayMonitor.tick().expect("idempotent follow-up tick"),
+            0
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn br126_evening_review_consumes_momentum_once_per_day() {
+        let mut guard = prepare_execution_account();
+        let code = unique_code("EVENING");
+        guard.codes.push(code.clone());
+        let id =
+            crate::signal::push_recorder::record(&crate::signal::push_recorder::PushRecordMeta {
+                code,
+                name: "盘后动量候选".to_string(),
+                push_kind: "Momentum".to_string(),
+                push_price: 10.0,
+                metric_json: serde_json::json!({
+                    "vol_ratio": 6.0,
+                    "price_chg_pct": 1.0,
+                    "push_subkind": "Momentum"
+                })
+                .to_string(),
+                source: "postclose".to_string(),
+            })
+            .expect("record evening candidate");
+        guard.push_ids.push(id);
+        let review_date = NaiveDate::from_ymd_opt(2098, 1, 2).unwrap();
+        let mut conn = DatabaseManager::get()
+            .get_conn()
+            .expect("test database connection");
+        diesel::sql_query("UPDATE pushed_stocks SET push_time = ? WHERE id = ?")
+            .bind::<diesel::sql_types::Text, _>(format!("{review_date} 15:00:00.000"))
+            .bind::<diesel::sql_types::BigInt, _>(id)
+            .execute(&mut conn)
+            .expect("place candidate before evening cutoff");
+
+        assert_eq!(evening_review(review_date).expect("evening review"), 1);
+        let row = consumption(id);
+        assert!(row.consumed_at.is_some());
+        assert_eq!(row.consumed_by.as_deref(), Some("evening_review"));
+        assert_eq!(row.outcome.as_deref(), Some("Momentum"));
+        assert_eq!(evening_review(review_date).expect("same-day reentry"), 0);
     }
 }

@@ -218,6 +218,36 @@ impl DatabaseManager {
         )
         .execute(&mut *conn)?;
 
+        // BR-126 / v16.x R3: the push pool is a durable audit boundary shared by
+        // push_recorder and both intraday/evening consumers. Initialization must
+        // fail if any part of the table/index contract cannot be installed.
+        diesel::sql_query(
+            r#"
+            CREATE TABLE IF NOT EXISTS pushed_stocks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                push_time TIMESTAMP NOT NULL,
+                push_kind TEXT NOT NULL,
+                code TEXT NOT NULL,
+                name TEXT NOT NULL,
+                push_price REAL NOT NULL,
+                metric_json TEXT NOT NULL,
+                source TEXT NOT NULL,
+                consumed_at TIMESTAMP,
+                consumed_by TEXT,
+                outcome TEXT,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            "#,
+        )
+        .execute(&mut *conn)?;
+        for statement in [
+            "CREATE INDEX IF NOT EXISTS idx_pushed_stocks_time ON pushed_stocks (push_time, push_kind)",
+            "CREATE INDEX IF NOT EXISTS idx_pushed_stocks_code ON pushed_stocks (code, push_time)",
+            "CREATE INDEX IF NOT EXISTS idx_pushed_stocks_uncon ON pushed_stocks (consumed_at) WHERE consumed_at IS NULL",
+        ] {
+            diesel::sql_query(statement).execute(&mut *conn)?;
+        }
+
         // 创建 stock_concepts 表（概念板块标签缓存，产业链聚类用）
         diesel::sql_query(
             r#"
@@ -1602,6 +1632,63 @@ mod tests {
         init_db_for_test();
         let db = DatabaseManager::get();
         assert!(db.get_conn().is_ok());
+    }
+
+    #[test]
+    fn br126_database_init_creates_complete_pushed_stocks_contract() {
+        #[derive(QueryableByName)]
+        struct TableInfoRow {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            name: String,
+        }
+        #[derive(QueryableByName)]
+        struct IndexRow {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            name: String,
+        }
+
+        init_db_for_test();
+        let mut conn = DatabaseManager::get()
+            .get_conn()
+            .expect("test database connection");
+        let columns = diesel::sql_query("PRAGMA table_info(pushed_stocks)")
+            .load::<TableInfoRow>(&mut conn)
+            .expect("read pushed_stocks columns")
+            .into_iter()
+            .map(|row| row.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            columns,
+            [
+                "id",
+                "push_time",
+                "push_kind",
+                "code",
+                "name",
+                "push_price",
+                "metric_json",
+                "source",
+                "consumed_at",
+                "consumed_by",
+                "outcome",
+                "created_at",
+            ]
+        );
+        let mut indexes = diesel::sql_query("PRAGMA index_list(pushed_stocks)")
+            .load::<IndexRow>(&mut conn)
+            .expect("read pushed_stocks indexes")
+            .into_iter()
+            .map(|row| row.name)
+            .collect::<Vec<_>>();
+        indexes.sort();
+        assert_eq!(
+            indexes,
+            [
+                "idx_pushed_stocks_code",
+                "idx_pushed_stocks_time",
+                "idx_pushed_stocks_uncon",
+            ]
+        );
     }
 
     #[test]
