@@ -1131,4 +1131,86 @@ mod tests {
         assert!((wf.avg_test_return - 0.05).abs() < 1e-6);
         assert!((wf.positive_fold_rate - 1.0).abs() < 1e-9);
     }
+
+    fn factor_history(days: usize) -> Vec<StockHistory> {
+        let base = chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap();
+        (0..3)
+            .map(|stock| {
+                let klines = (0..days)
+                    .map(|day| {
+                        let mut value = kl(
+                            base + chrono::Duration::days(day as i64),
+                            10.0 + stock as f64 + day as f64 * 0.02,
+                        );
+                        value.market_cap = Some(100.0 + stock as f64 * 10.0);
+                        value.roe = Some(10.0 + stock as f64);
+                        value.pe_ratio = Some(15.0 + stock as f64);
+                        value.pb_ratio = Some(2.0 + stock as f64 * 0.1);
+                        value.turnover_rate = Some(3.0 + stock as f64);
+                        value
+                    })
+                    .collect();
+                (
+                    format!("TEST_CODE_60000{stock}"),
+                    format!("测试股{stock}"),
+                    klines,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn multi_factor_history_covers_guards_and_real_daily_rebalancing() {
+        let config = MultiFactorConfig::default();
+        assert!(
+            AnalysisPipeline::run_multi_factor_on_history(&factor_history(30)[..2], &config)
+                .is_none()
+        );
+        assert!(
+            AnalysisPipeline::run_multi_factor_on_history(&factor_history(9), &config).is_none()
+        );
+
+        let (summary, state) =
+            AnalysisPipeline::run_multi_factor_on_history(&factor_history(30), &config)
+                .expect("three-stock real factor history");
+        assert!(!state.daily_values.is_empty());
+        assert!(summary.final_value.is_finite());
+        let summary_only =
+            AnalysisPipeline::run_multi_factor_summary_on_history(&factor_history(30), &config)
+                .expect("summary wrapper");
+        assert_eq!(summary_only.total_trades, summary.total_trades);
+    }
+
+    #[test]
+    fn snapshot_history_guards_reject_insufficient_stock_or_date_evidence() {
+        let config = MultiFactorConfig::default();
+        let snapshots = std::collections::HashMap::new();
+        assert!(AnalysisPipeline::run_multi_factor_with_snapshots(
+            &factor_history(30)[..2],
+            &config,
+            &snapshots
+        )
+        .is_none());
+        assert!(AnalysisPipeline::run_multi_factor_with_snapshots(
+            &factor_history(9),
+            &config,
+            &snapshots
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn history_helpers_cover_empty_windows_and_walk_forward_guards() {
+        let h = history(120);
+        let start = chrono::NaiveDate::from_ymd_opt(2030, 1, 1).unwrap();
+        let end = chrono::NaiveDate::from_ymd_opt(2030, 2, 1).unwrap();
+        assert!(AnalysisPipeline::slice_history(&h, start, end).is_empty());
+        assert!(AnalysisPipeline::walk_forward::<f64, _>(&h, &[], |_, _| None, 4).is_none());
+        assert!(AnalysisPipeline::walk_forward(&h, &[("x".into(), 1.0)], |_, _| None, 0).is_none());
+        assert!(
+            AnalysisPipeline::walk_forward(&history(20), &[("x".into(), 1.0)], |_, _| None, 4)
+                .is_none()
+        );
+        assert!(AnalysisPipeline::walk_forward(&h, &[("x".into(), 1.0)], |_, _| None, 4).is_none());
+    }
 }

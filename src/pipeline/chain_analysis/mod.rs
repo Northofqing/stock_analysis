@@ -1362,6 +1362,20 @@ fn build_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use once_cell::sync::Lazy;
+    use std::sync::Mutex;
+
+    static CHAIN_ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+    fn top(code: &str, name: &str, change_pct: f64) -> TopStock {
+        TopStock {
+            code: code.into(),
+            name: name.into(),
+            change_pct,
+            price: 10.0,
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn test_chain_score_total() {
@@ -1699,5 +1713,141 @@ mod tests {
         assert!(report.contains("测试持仓"));
         assert!(report.contains("62")); // total score from analysis text
         assert!(report.contains("2天"));
+    }
+
+    #[test]
+    fn cluster_size_env_and_generic_board_contract_are_deterministic() {
+        let _guard = CHAIN_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous = std::env::var("CHAIN_MIN_CLUSTER").ok();
+        std::env::set_var("CHAIN_MIN_CLUSTER", "4");
+        assert_eq!(min_cluster_size(), 4);
+        std::env::set_var("CHAIN_MIN_CLUSTER", "bad");
+        assert_eq!(min_cluster_size(), 3);
+        if let Some(value) = previous {
+            std::env::set_var("CHAIN_MIN_CLUSTER", value);
+        } else {
+            std::env::remove_var("CHAIN_MIN_CLUSTER");
+        }
+
+        assert!(is_generic_board("沪深300成份"));
+        assert!(is_generic_board("广东板块"));
+        assert!(!is_generic_board("固态电池"));
+    }
+
+    #[test]
+    fn concept_clustering_filters_generic_tags_merges_aliases_and_keeps_isolated_stocks() {
+        let stocks = vec![
+            top("TEST_CODE_000001", "甲", 10.0),
+            top("TEST_CODE_000002", "乙", 9.0),
+            top("TEST_CODE_000003", "丙", 8.0),
+            top("TEST_CODE_000004", "丁", 7.0),
+            top("TEST_CODE_000005", "戊", 6.0),
+        ];
+        let concepts = HashMap::from([
+            (
+                "TEST_CODE_000001".into(),
+                vec!["固态电池".into(), "电池技术".into(), "昨日涨停".into()],
+            ),
+            (
+                "TEST_CODE_000002".into(),
+                vec!["固态电池".into(), "电池技术".into()],
+            ),
+            (
+                "TEST_CODE_000003".into(),
+                vec!["固态电池".into(), "电池技术".into(), "储能".into()],
+            ),
+            (
+                "TEST_CODE_000004".into(),
+                vec!["储能".into(), "融资融券".into()],
+            ),
+            ("TEST_CODE_000005".into(), vec!["融资融券".into()]),
+        ]);
+
+        let (clusters, isolated) = cluster_by_concept(&stocks, &concepts, 2);
+
+        assert_eq!(clusters.len(), 2);
+        let battery = clusters
+            .iter()
+            .find(|cluster| cluster.concept == "固态电池" || cluster.concept == "电池技术")
+            .expect("battery cluster");
+        assert_eq!(battery.stocks.len(), 3);
+        assert_eq!(battery.aliases.len(), 1);
+        assert_eq!(battery.continuation_count, 1);
+        assert_eq!(battery.stocks[0].code, "TEST_CODE_000001");
+        assert_eq!(isolated.len(), 1);
+        assert_eq!(isolated[0].code, "TEST_CODE_000005");
+    }
+
+    #[tokio::test]
+    async fn empty_limit_up_batch_returns_explicit_empty_report_without_external_calls() {
+        let report = run_chain_analysis(Vec::new(), Some("本地宏观上下文".into()))
+            .await
+            .expect("empty complete batch");
+        assert!(report.contains("涨停池批次成功返回 0 只"));
+    }
+
+    #[test]
+    fn malformed_score_and_conclusion_protocols_remain_unavailable() {
+        assert!(parse_chain_score("无评分").is_none());
+        assert!(parse_chain_score("【评分】产业逻辑=bad/100").is_none());
+        assert!(parse_conclusion("无结论").is_none());
+        assert_eq!(
+            parse_conclusion("【结论】阶段=启动｜参与=谨慎"),
+            Some(("启动".into(), "谨慎".into(), "-".into()))
+        );
+    }
+
+    #[test]
+    fn report_covers_catalyst_overview_alias_isolated_and_unmapped_position_branches() {
+        let clustered = top("TEST_CODE_000001", "主线股", 10.0);
+        let isolated = top("TEST_CODE_000002", "孤立股", 9.0);
+        let cluster = ChainCluster {
+            concept: "固态电池".into(),
+            aliases: vec!["电池技术".into()],
+            stocks: vec![clustered.clone()],
+            continuation_count: 0,
+            streak_days: 0,
+            candidates: vec![],
+            score: None,
+            scenario: None,
+        };
+        let sections = vec![(
+            "固态电池".into(),
+            Some("【简评】阶段=启动｜参与=谨慎｜候选=无\n正文".into()),
+        )];
+        let concepts = HashMap::from([(
+            isolated.code.clone(),
+            vec!["融资融券".into(), "独立逻辑".into()],
+        )]);
+        let positions = vec![PositionDiag {
+            code: "TEST_CODE_000009".into(),
+            name: "未映射持仓".into(),
+            return_rate: None,
+            mainline: None,
+            in_limit_pool: false,
+        }];
+
+        let report = build_report(
+            "2026-07-18",
+            &[clustered, isolated.clone()],
+            &[cluster],
+            &sections,
+            &[isolated],
+            Some("# 今日主线全景研判\n\n全景正文"),
+            "## 盘后催化\n真实催化",
+            &concepts,
+            &positions,
+        );
+
+        assert!(report.contains("盘后催化"));
+        assert!(report.contains("全景正文"));
+        assert!(report.contains("同义概念：电池技术"));
+        assert!(report.contains("无（不在今日主线）"));
+        assert!(report.contains("暂无"));
+        assert!(report.contains("孤立涨停"));
+        assert!(report.contains("独立逻辑"));
+        assert!(!report.contains("融资融券、独立逻辑"));
     }
 }

@@ -148,6 +148,7 @@ Phase 12 (Gate D coverage and live-account release closure)
 | Extreme financial fixture totaled 95 because its three-period CFO/NI average was 0.4 | 1 | Add a fourth low-ratio period and set the previous ratio at the exact 0.8 sudden-drop boundary so both documented rules apply and score clamping is exercised. |
 | Industry benchmark test compared a repeating floating percentile exactly | 1 | Use a tight tolerance for 100/3 while retaining exact assertions for integer/half statistics. |
 | Financial response extraction patch used stale/whitespace-mismatched datacenter context | 3 | Split insertion and each transport replacement, inspect exact numbered lines, then apply the final block with byte-matching field punctuation. |
+| Chain conclusion test assumed a missing candidate invalidates the display parser | 1 | Preserve the existing report-only compatibility contract: recognized conclusion lines return `-` for a missing field; only absence of a conclusion line is unavailable. |
 ## Follow-up review slice (2026-07-18)
 
 - [x] Add RED test for `:memory:` journal-mode failure.

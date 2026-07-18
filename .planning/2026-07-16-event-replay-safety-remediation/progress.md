@@ -287,3 +287,8 @@
 - Industry pages now reject missing arrays, bad/empty identity fields, duplicate/conflicting names or codes, and malformed/non-finite optional metrics. Missing metrics remain explicit `None`; no `NaN` sentinel or row skipping remains in the benchmark batch.
 - F10 parsing now validates the complete response and descending report order before retaining the newest 20 periods; datacenter parsing shares a strict real-period constructor. Focused industry 7/7 and financial 11/11 tests PASS; strict library Clippy, format and diff checks PASS.
 - Task-4 instrumented library suite: 1,409 passed / 10 ignored / 0 failed. Coverage: financials 573/637 = 89.95%; industry 281/390 = 72.05%. Intermediate library aggregate is global 56.43%, core 63.56%; Gate D remains open.
+- Completed the fifth pure-core coverage slice for historical multi-factor backtesting and industry-chain clustering/reporting.
+- Backtest tests now cover insufficient stock/date guards, real day-by-day factor recalculation and rebalance, snapshot guards, empty slices, all walk-forward early exits, deterministic candidate selection and summary wrapping.
+- Chain tests now cover configurable cluster minimum, generic-board filtering, stable cluster sorting, 70% alias merging, continuation labels, isolated stocks, empty complete limit-up batches without external calls, malformed display protocols, and catalyst/overview/alias/unmapped-position/isolated report branches.
+- Focused backtest 9/9 and chain 19/19 PASS; strict library Clippy, format and diff checks PASS. Instrumented library suite: 1,417 passed / 10 ignored / 0 failed.
+- Task-5 coverage: backtest runner 560/947 = 59.13%; chain analysis 902/1292 = 69.81%. Intermediate library aggregate is global 56.91%, core 64.87%; Gate D remains open.
