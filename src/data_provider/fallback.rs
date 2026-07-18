@@ -25,6 +25,9 @@ use crate::data_provider::{
 };
 use crate::monitor::data_quality::{max_gap_for, validate_daily_kline_quality};
 
+type ProviderResult = (&'static str, Result<Vec<KlineData>>);
+type ProviderFuture = futures::future::BoxFuture<'static, ProviderResult>;
+
 /// 截断超长错误信息, 避免日志刷屏 (reqwest 错误会内嵌完整 URL)。
 fn brief(s: &str) -> String {
     const MAX: usize = 120;
@@ -102,9 +105,7 @@ pub async fn fetch_kline_with_fallback(
     // 即使 Sina 已经成功也要等 Eastmoney 结束, 最终 --test 盘后复盘被 300s cap 打爆。
     // 这里改成真正的 first-valid-completion: 任一源返回 Ok 且质检通过即返回,
     // 剩余 HTTP future 被 drop 取消；RustDX spawn_blocking 可能后台完成, 但不再阻塞主链路。
-    type ProviderResult = (&'static str, Result<Vec<KlineData>>);
-    type ProviderFuture = futures::future::BoxFuture<'static, ProviderResult>;
-    let mut candidates: FuturesUnordered<ProviderFuture> = FuturesUnordered::new();
+    let candidates: FuturesUnordered<ProviderFuture> = FuturesUnordered::new();
 
     let sina_code = code.to_string();
     candidates.push(Box::pin(async move {
@@ -141,33 +142,45 @@ pub async fn fetch_kline_with_fallback(
         ("rustdx_none", r)
     }));
 
-    let mut last_err: Option<String> = None;
-    let mut all_empty = true;
-    let mut all_qc_reject = Vec::new();
+    let (data, source) = resolve_kline_candidates(candidates, code, qc_threshold).await?;
+    crate::monitor::data_mode::mark_capability_success(
+        crate::monitor::data_mode::Capability::Kline,
+    )
+    .map_err(anyhow::Error::msg)?;
+    Ok((data, source))
+}
+
+/// BR-128: converge completed real-provider results without hiding source failures.
+///
+/// Transport construction stays in `fetch_kline_with_fallback`; this seam only
+/// applies the production BR-092 quality gate and selects the first valid batch.
+async fn resolve_kline_candidates(
+    mut candidates: FuturesUnordered<ProviderFuture>,
+    code: &str,
+    qc_threshold: f64,
+) -> Result<(Vec<KlineData>, &'static str)> {
+    let mut empty_sources = Vec::new();
+    let mut source_errors = Vec::new();
+    let mut qc_rejections = Vec::new();
 
     while let Some((src, data)) = candidates.next().await {
         match data {
             Ok(mut d) if !d.is_empty() => {
-                all_empty = false;
                 match validate_daily_kline_quality(&mut d, code, qc_threshold) {
                     Ok(()) => {
                         log::info!("[fallback] {} {} OK + 质检通过, {} 条", code, src, d.len());
-                        crate::monitor::data_mode::mark_capability_success(
-                            crate::monitor::data_mode::Capability::Kline,
-                        )
-                        .map_err(anyhow::Error::msg)?;
                         return Ok((d, src));
                     }
                     Err(e) => {
                         let msg = brief(&format!("{:#}", e));
-                        all_qc_reject.push(format!("{}={}", src, msg));
+                        qc_rejections.push(format!("{}={}", src, msg));
                         log::warn!("[fallback] {} {} 质检 reject: {}", code, src, msg);
                     }
                 }
             }
             Ok(_) => {
                 log::warn!("[fallback] {} {} 返回空数据", code, src);
-                last_err = Some(format!("{} 返回空", src));
+                empty_sources.push(src);
             }
             Err(e) => {
                 let msg = brief(&format!("{:#}", e));
@@ -176,27 +189,25 @@ pub async fn fetch_kline_with_fallback(
                 } else {
                     log::warn!("[fallback] {} {} 失败 (non-ban error): {}", code, src, msg);
                 }
-                last_err = Some(format!("{}={}", src, msg));
+                source_errors.push(format!("{}={}", src, msg));
             }
         }
     }
 
-    Err(if all_empty {
+    Err(if !qc_rejections.is_empty() {
+        anyhow!("数据源质检 reject ({}): {}", code, qc_rejections.join(", "))
+    } else if !source_errors.is_empty() {
         anyhow!(
-            "所有数据源均返回空: sina=空, 腾讯=空, 东财=空, RustDX=空 ({})",
-            code
-        )
-    } else if !all_qc_reject.is_empty() {
-        anyhow!(
-            "所有数据源质检均 reject ({}): {}",
+            "未取得有效 K 线 ({}); 数据源失败: {}; 空结果源: {}",
             code,
-            all_qc_reject.join(", ")
+            source_errors.join(", "),
+            empty_sources.join(", ")
         )
     } else {
         anyhow!(
-            "所有数据源均获取失败 ({}): {}",
+            "所有数据源均返回空 ({}): {}",
             code,
-            last_err.unwrap_or_default()
+            empty_sources.join(", ")
         )
     })
 }
@@ -204,6 +215,48 @@ pub async fn fetch_kline_with_fallback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn kline(close: f64) -> KlineData {
+        KlineData {
+            date: chrono::NaiveDate::from_ymd_opt(2026, 7, 16).unwrap(),
+            open: close,
+            high: close,
+            low: close,
+            close,
+            volume: 1_000.0,
+            amount: close * 1_000.0,
+            pct_chg: 0.0,
+            intraday_price: None,
+            settled: true,
+            pe_ratio: None,
+            pb_ratio: None,
+            turnover_rate: None,
+            market_cap: None,
+            circulating_cap: None,
+            eps: None,
+            roe: None,
+            revenue_yoy: None,
+            net_profit_yoy: None,
+            gross_margin: None,
+            net_margin: None,
+            sharpe_ratio: None,
+            financials_history: None,
+            valuation_history: None,
+            consensus: None,
+            industry: None,
+            is_limit_up: false,
+            is_limit_down: false,
+            is_suspended: false,
+            adjust: crate::data_provider::AdjustType::Qfq,
+        }
+    }
+
+    fn candidates(results: Vec<ProviderResult>) -> FuturesUnordered<ProviderFuture> {
+        results
+            .into_iter()
+            .map(|result| Box::pin(async move { result }) as ProviderFuture)
+            .collect()
+    }
 
     /// brief 截断函数: 短字符串原样返回
     #[test]
@@ -219,5 +272,98 @@ mod tests {
         let out = brief(&s);
         assert!(out.ends_with("…(截断)"), "long string should be truncated");
         assert_eq!(out.chars().count(), 120 + "…(截断)".chars().count());
+    }
+
+    #[tokio::test]
+    async fn br128_first_quality_passed_batch_wins() {
+        let batch = vec![kline(10.0)];
+        let (data, source) = resolve_kline_candidates(
+            candidates(vec![
+                ("empty", Ok(Vec::new())),
+                ("valid", Ok(batch.clone())),
+            ]),
+            "TEST_CODE_000001",
+            20.0,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(source, "valid");
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].close, 10.0);
+    }
+
+    #[tokio::test]
+    async fn br128_quality_rejection_has_priority_over_transport_failure() {
+        let mut invalid = kline(10.0);
+        invalid.close = 0.0;
+        let err = resolve_kline_candidates(
+            candidates(vec![
+                ("bad_batch", Ok(vec![invalid])),
+                ("offline", Err(anyhow!("connection refused"))),
+            ]),
+            "TEST_CODE_000001",
+            20.0,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("数据源质检 reject"));
+        assert!(err.contains("bad_batch"));
+        assert!(!err.contains("所有数据源均返回空"));
+    }
+
+    #[tokio::test]
+    async fn br128_mixed_failure_and_empty_is_not_reported_as_all_empty() {
+        let err = resolve_kline_candidates(
+            candidates(vec![
+                ("empty", Ok(Vec::new())),
+                ("offline", Err(anyhow!("transport unavailable"))),
+            ]),
+            "TEST_CODE_000001",
+            20.0,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("数据源失败: offline=transport unavailable"));
+        assert!(err.contains("空结果源: empty"));
+        assert!(!err.contains("所有数据源均返回空"));
+    }
+
+    #[tokio::test]
+    async fn br128_all_empty_is_reported_only_when_every_source_is_empty() {
+        let err = resolve_kline_candidates(
+            candidates(vec![("one", Ok(Vec::new())), ("two", Ok(Vec::new()))]),
+            "TEST_CODE_000001",
+            20.0,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("所有数据源均返回空"));
+        assert!(err.contains("one"));
+        assert!(err.contains("two"));
+    }
+
+    #[tokio::test]
+    async fn br128_ban_and_non_ban_failures_remain_explicit() {
+        let err = resolve_kline_candidates(
+            candidates(vec![
+                ("limited", Err(anyhow!("403 forbidden"))),
+                ("broken", Err(anyhow!("protocol error"))),
+            ]),
+            "TEST_CODE_000001",
+            20.0,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("limited=403 forbidden"));
+        assert!(err.contains("broken=protocol error"));
     }
 }
