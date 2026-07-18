@@ -1,7 +1,8 @@
+//! Registered business rules: BR-043, BR-091, BR-111, BR-130.
 //! Exact-match dispatcher registry — v17.1-r2 Task 3
 //!
 //! Provides a `Dispatcher` trait, `DispatcherRegistry` with exact-match routing,
-//! and `AuditDispatcher` for observing `push.delivery` without producing side-effects.
+//! and `AuditDispatcher` for observing `push.delivery.audit` without producing side-effects.
 
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
@@ -52,7 +53,7 @@ pub trait Dispatcher: Send + Sync {
     /// Human-readable name of this dispatcher.
     fn name(&self) -> &'static str;
 
-    /// The event type this dispatcher handles, e.g. `"push.delivery"`.
+    /// The event type this dispatcher handles, e.g. `"push.delivery.audit"`.
     fn event_type(&self) -> &'static str;
 
     /// Returns true when this dispatcher can handle the given envelope.
@@ -157,7 +158,14 @@ impl AuditDispatcher {
     /// Runtime constructor with BR-051 test/prod path isolation.
     pub fn for_runtime() -> Self {
         #[cfg(test)]
-        let base_dir = PathBuf::from("data/test/event_audit");
+        let base_dir = {
+            static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+            std::env::temp_dir().join(format!(
+                "stock-analysis-event-audit-test-{}-{}",
+                std::process::id(),
+                SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ))
+        };
         #[cfg(not(test))]
         let base_dir = std::env::var("EVENT_AUDIT_DIR")
             .map(PathBuf::from)
@@ -317,6 +325,13 @@ impl Dispatcher for AuditDispatcher {
             return DispatchResult::Skipped("no_dispatcher".into());
         }
 
+        let record = match super::push_record::PushRecord::try_from(&envelope) {
+            Ok(record) => record,
+            Err(error) => {
+                return DispatchResult::Failed(format!("invalid delivery audit: {error}"));
+            }
+        };
+
         if let Err(error) = self.persist(&envelope) {
             return DispatchResult::Failed(error);
         }
@@ -325,36 +340,21 @@ impl Dispatcher for AuditDispatcher {
         let id = &envelope.id;
         let event_type = &envelope.event_type;
         let source = &envelope.source;
-        let kind = envelope
-            .payload
-            .get("kind")
-            .and_then(|v| v.as_str())
-            .unwrap_or("?");
         let outcome = envelope
             .payload
             .get("outcome")
             .and_then(|v| v.as_str())
-            .unwrap_or("?");
-        let channel = envelope
-            .payload
-            .get("channel")
-            .and_then(|v| v.as_str())
-            .unwrap_or("?");
-        let code = envelope
-            .payload
-            .get("code")
-            .and_then(|v| v.as_str())
-            .map(String::from);
+            .expect("PushRecord validation requires string outcome");
 
-        if let Some(ref c) = code {
+        if let Some(ref code) = record.code {
             println!(
                 "[AuditDispatcher] id={} event_type={} source={} kind={} outcome={} channel={} code={}",
-                id, event_type, source, kind, outcome, channel, c
+                id, event_type, source, record.kind, outcome, record.channel, code
             );
         } else {
             println!(
                 "[AuditDispatcher] id={} event_type={} source={} kind={} outcome={} channel={}",
-                id, event_type, source, kind, outcome, channel
+                id, event_type, source, record.kind, outcome, record.channel
             );
         }
 
@@ -533,6 +533,30 @@ mod tests {
     }
 
     #[test]
+    fn br130_audit_dispatcher_rejects_invalid_payload_before_persistence() {
+        let dir = std::env::temp_dir().join(format!(
+            "audit-dispatcher-invalid-payload-{}-{}",
+            std::process::id(),
+            chrono::Local::now().timestamp_nanos_opt().unwrap()
+        ));
+        let dispatcher = AuditDispatcher::new(&dir);
+        let mut envelope = test_envelope_type("push.delivery.audit");
+        envelope.payload["outcome"] = serde_json::json!("Unknown");
+
+        let result = dispatcher.dispatch(envelope);
+
+        assert!(matches!(
+            result,
+            DispatchResult::Failed(error) if error.contains("outcome=Unknown")
+        ));
+        assert_eq!(dispatcher.handled_count(), 0);
+        assert!(
+            !dir.exists(),
+            "invalid audit must not create persistence output"
+        );
+    }
+
+    #[test]
     fn audit_dispatcher_rejects_tampered_existing_chain() {
         let dir =
             std::env::temp_dir().join(format!("audit-dispatcher-tamper-{}", std::process::id()));
@@ -574,5 +598,93 @@ mod tests {
         assert_eq!(dispatcher.handled_count(), 0);
         assert!(!path.exists(), "poisoned dispatcher must not retry writing");
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn br091_existing_valid_chain_is_verified_and_extended() {
+        let dir = std::env::temp_dir().join(format!(
+            "audit-dispatcher-resume-{}-{}",
+            std::process::id(),
+            chrono::Local::now().timestamp_nanos_opt().unwrap()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+
+        let first = AuditDispatcher::new(&dir);
+        assert_eq!(
+            first.dispatch(test_envelope_type("push.delivery.audit")),
+            DispatchResult::Handled
+        );
+        drop(first);
+
+        let second = AuditDispatcher::new(&dir);
+        let mut without_code = test_envelope_type("push.delivery.audit");
+        without_code.entity_key = None;
+        without_code.payload["code"] = serde_json::Value::Null;
+        assert_eq!(second.name(), "AuditDispatcher");
+        assert_eq!(second.dispatch(without_code), DispatchResult::Handled);
+
+        let path = dir.join(format!("{}.jsonl", chrono::Local::now().format("%Y")));
+        assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 2);
+        assert!(validate_existing_chain(&path).unwrap().is_some());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn br091_existing_chain_rejects_every_structural_corruption_class() {
+        let dir = std::env::temp_dir().join(format!(
+            "audit-chain-invalid-{}-{}",
+            std::process::id(),
+            chrono::Local::now().timestamp_nanos_opt().unwrap()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.jsonl");
+
+        for (line, expected) in [
+            ("\n", "is blank"),
+            (
+                "{\"previous_hash\":\"GENESIS\",\"envelope\":{}}\n",
+                "no record_hash",
+            ),
+            (
+                "{\"record_hash\":\"x\",\"envelope\":{}}\n",
+                "no previous_hash",
+            ),
+            (
+                "{\"record_hash\":\"x\",\"previous_hash\":\"WRONG\",\"envelope\":{}}\n",
+                "chain mismatch",
+            ),
+            (
+                "{\"record_hash\":\"deadbeef\",\"previous_hash\":\"GENESIS\",\"envelope\":{}}\n",
+                "hash mismatch",
+            ),
+        ] {
+            fs::write(&path, line).unwrap();
+            let error = validate_existing_chain(&path).unwrap_err();
+            assert!(error.contains(expected), "{error}");
+        }
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn audit_runtime_constructor_and_directory_failure_are_explicit() {
+        let runtime = AuditDispatcher::default();
+        assert_eq!(runtime.name(), "AuditDispatcher");
+        assert_eq!(runtime.event_type(), "push.delivery.audit");
+
+        let base_file = std::env::temp_dir().join(format!(
+            "audit-base-file-{}-{}",
+            std::process::id(),
+            chrono::Local::now().timestamp_nanos_opt().unwrap()
+        ));
+        fs::write(&base_file, "TEST_CODE not a directory").unwrap();
+        let dispatcher = AuditDispatcher::new(&base_file);
+        let result = dispatcher.dispatch(test_envelope_type("push.delivery.audit"));
+        assert!(
+            matches!(result, DispatchResult::Failed(error) if error.contains("create")),
+            "directory creation failure must be visible"
+        );
+        assert_eq!(dispatcher.handled_count(), 0);
+        fs::remove_file(base_file).unwrap();
     }
 }

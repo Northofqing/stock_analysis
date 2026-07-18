@@ -1,4 +1,4 @@
-//! Registered business rules: BR-043.
+//! Registered business rules: BR-043, BR-091, BR-130.
 //! History query and success-rate aggregation — v17.3 Task 3
 //!
 //! Reads persisted JSONL event files and provides:
@@ -124,7 +124,7 @@ pub fn format_history_lines(entries: &[HistoryEntry]) -> Vec<String> {
 /// Delivery success-rate statistics over a time window.
 #[derive(Debug, Clone)]
 pub struct RateStats {
-    /// Total number of push.delivery envelopes seen.
+    /// Total number of push.delivery.audit envelopes seen.
     pub total: u64,
     /// Envelopes with outcome = Pushed.
     pub pushed: u64,
@@ -191,34 +191,46 @@ impl HistoryQuery {
         for file_path in files_to_read {
             let file = match File::open(&file_path).await {
                 Ok(f) => f,
-                Err(e) => {
-                    log::warn!(
-                        "[history] could not open file {}: {}",
-                        file_path.display(),
-                        e
-                    );
-                    continue;
-                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(HistoryError::Io(error)),
             };
             let mut reader = BufReader::new(file).lines();
+            let mut line_number = 0usize;
 
             while let Some(line) = reader.next_line().await? {
+                line_number += 1;
                 let line = line.trim();
                 if line.is_empty() {
-                    continue;
+                    return Err(HistoryError::Record(format!(
+                        "{} line {} is blank",
+                        file_path.display(),
+                        line_number
+                    )));
                 }
 
-                let env: super::envelope::EventEnvelope = match serde_json::from_str(line) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        log::warn!(
-                            "[history] skipping malformed JSON line in {}: {}",
+                let env: super::envelope::EventEnvelope =
+                    serde_json::from_str(line).map_err(|error| {
+                        HistoryError::Record(format!(
+                            "{} line {} JSON: {}",
                             file_path.display(),
-                            e
-                        );
-                        continue;
-                    }
-                };
+                            line_number,
+                            error
+                        ))
+                    })?;
+                validate_history_envelope(&env, &file_path, line_number)?;
+                let entry_kind = env
+                    .payload
+                    .get("kind")
+                    .and_then(|v| v.as_str())
+                    .filter(|kind| !kind.trim().is_empty())
+                    .ok_or_else(|| {
+                        HistoryError::Record(format!(
+                            "{} line {} has no valid kind",
+                            file_path.display(),
+                            line_number
+                        ))
+                    })?
+                    .to_string();
 
                 // Filter by code (entity_key)
                 if let Some(ref code) = filter.code {
@@ -229,7 +241,7 @@ impl HistoryQuery {
 
                 // Filter by kind (payload.kind)
                 if let Some(ref kind) = filter.kind {
-                    if env.payload.get("kind").and_then(|v| v.as_str()) != Some(kind.as_str()) {
+                    if entry_kind != *kind {
                         continue;
                     }
                 }
@@ -241,16 +253,9 @@ impl HistoryQuery {
                     }
                 }
 
-                let kind = env
-                    .payload
-                    .get("kind")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-
                 entries.push(HistoryEntry {
                     id: env.id,
-                    kind,
+                    kind: entry_kind,
                     code: env.entity_key,
                     ts: env.ts,
                     summary: env.payload,
@@ -277,7 +282,7 @@ impl HistoryQuery {
 
     /// Compute push delivery success rates over a time window.
     ///
-    /// Parses only `push.delivery` envelopes via `PushRecord::try_from`.
+    /// Parses only `push.delivery.audit` envelopes via `PushRecord::try_from`.
     /// Denominator = Pushed + Failed; Deduped and Denied are counted but
     /// do not affect the success rate.
     pub async fn push_success_rate(
@@ -307,29 +312,35 @@ impl HistoryQuery {
         for file_path in files_to_read {
             let file = match File::open(&file_path).await {
                 Ok(f) => f,
-                Err(_) => continue, // File doesn't exist, skip
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(HistoryError::Io(error)),
             };
             let mut reader = BufReader::new(file).lines();
+            let mut line_number = 0usize;
 
             while let Some(line) = reader.next_line().await? {
+                line_number += 1;
                 let line = line.trim();
                 if line.is_empty() {
-                    continue;
+                    return Err(HistoryError::Record(format!(
+                        "{} line {} is blank",
+                        file_path.display(),
+                        line_number
+                    )));
                 }
 
-                let env: super::envelope::EventEnvelope = match serde_json::from_str(line) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        log::warn!(
-                            "[history] skipping malformed JSON line in {}: {}",
+                let env: super::envelope::EventEnvelope =
+                    serde_json::from_str(line).map_err(|error| {
+                        HistoryError::Record(format!(
+                            "{} line {} JSON: {}",
                             file_path.display(),
-                            e
-                        );
-                        continue;
-                    }
-                };
+                            line_number,
+                            error
+                        ))
+                    })?;
+                validate_history_envelope(&env, &file_path, line_number)?;
 
-                // Try to extract PushRecord (only for push.delivery event type)
+                // Try to extract PushRecord (only for push.delivery.audit event type)
                 match super::push_record::PushRecord::try_from(&env) {
                     Ok(record) => {
                         // Filter by window
@@ -350,8 +361,14 @@ impl HistoryQuery {
                         }
                         all_records.push(record);
                     }
-                    Err(_) => {
-                        // Not a push.delivery envelope, skip silently
+                    Err(super::push_record::PushRecordError::EventTypeMismatch(_)) => {}
+                    Err(error) => {
+                        return Err(HistoryError::Record(format!(
+                            "{} line {} invalid delivery audit: {}",
+                            file_path.display(),
+                            line_number,
+                            error
+                        )));
                     }
                 }
             }
@@ -458,6 +475,44 @@ impl HistoryQuery {
             window_end,
         })
     }
+}
+
+fn validate_history_envelope(
+    envelope: &super::envelope::EventEnvelope,
+    path: &std::path::Path,
+    line_number: usize,
+) -> Result<(), HistoryError> {
+    for (field, value) in [
+        ("id", envelope.id.as_str()),
+        ("trace_id", envelope.trace_id.as_str()),
+        ("source", envelope.source.as_str()),
+        ("event_type", envelope.event_type.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(HistoryError::Record(format!(
+                "{} line {} has blank {}",
+                path.display(),
+                line_number,
+                field
+            )));
+        }
+    }
+    if envelope.version != 1 {
+        return Err(HistoryError::Record(format!(
+            "{} line {} has unsupported version {}",
+            path.display(),
+            line_number,
+            envelope.version
+        )));
+    }
+    if !envelope.payload.is_object() {
+        return Err(HistoryError::Record(format!(
+            "{} line {} payload is not an object",
+            path.display(),
+            line_number
+        )));
+    }
+    Ok(())
 }
 
 // ========================================================================
@@ -599,6 +654,24 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, "c"); // Most recent first (desc)
 
+        let ascending = HistoryQuery::new(dir.clone())
+            .query(HistoryFilter {
+                date: None,
+                code: Some("TEST_CODE_600519".into()),
+                kind: Some("Announcement".into()),
+                limit: 0,
+                order: HistoryOrder::Asc,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            ascending
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "c"]
+        );
+
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
@@ -641,7 +714,7 @@ mod tests {
         let date_str = today.format("%Y-%m-%d").to_string();
 
         // Create 4 records: 1 Pushed, 1 Failed, 1 Denied, 1 Deduped
-        // Use push.delivery event_type for PushRecord compatibility
+        // Use the same authoritative event_type emitted by production.
         let outcomes = vec!["Pushed", "Failed", "Denied", "Deduped"];
         let ids = vec!["a", "b", "c", "d"];
 
@@ -651,7 +724,7 @@ mod tests {
                 ts: Local::now(),
                 trace_id: format!("trace-{}", id),
                 source: "push_l4".to_string(),
-                event_type: "push.delivery".to_string(),
+                event_type: "push.delivery.audit".to_string(),
                 entity_key: Some("TEST_CODE_600519".to_string()),
                 payload: serde_json::json!({
                     "kind": "Announcement",
@@ -676,8 +749,152 @@ mod tests {
         assert_eq!(stats.total, 4);
         assert_eq!(stats.pushed, 1);
         assert_eq!(stats.failed, 1);
+        assert_eq!(stats.denied, 1);
+        assert_eq!(stats.deduped, 1);
         assert!((stats.success_rate - 0.5).abs() < f64::EPSILON);
+        assert!((stats.avg_latency_ms - 37.0).abs() < f64::EPSILON);
+        assert_eq!(stats.per_sink_rate.get("dry_run"), Some(&0.5));
+        assert_eq!(stats.per_kind_rate.get("Announcement"), Some(&0.5));
+
+        let filtered = HistoryQuery::new(dir.clone())
+            .push_success_rate(Some("OtherKind"), Window::Days(1), Some("missing"))
+            .await
+            .unwrap();
+        assert_eq!(filtered.total, 0);
+        assert!(filtered.success_rate.is_nan());
+        assert!(filtered.avg_latency_ms.is_nan());
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn br130_missing_partitions_are_empty_but_other_io_errors_propagate() {
+        let dir = test_dir("missing");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let query = HistoryQuery::new(dir.clone());
+        assert!(query
+            .query(HistoryFilter {
+                date: Some(today()),
+                ..HistoryFilter::default()
+            })
+            .await
+            .unwrap()
+            .is_empty());
+        let stats = query
+            .push_success_rate(None, Window::Hours(24), None)
+            .await
+            .unwrap();
+        assert_eq!(stats.total, 0);
+        assert!(stats.success_rate.is_nan());
+
+        let not_a_directory = test_dir("not-directory");
+        tokio::fs::write(&not_a_directory, b"TEST_CODE history path failure")
+            .await
+            .unwrap();
+        assert!(matches!(
+            HistoryQuery::new(not_a_directory.clone())
+                .query(HistoryFilter::default())
+                .await,
+            Err(HistoryError::Io(_))
+        ));
+        assert!(matches!(
+            HistoryQuery::new(not_a_directory.clone())
+                .push_success_rate(None, Window::Hours(1), None)
+                .await,
+            Err(HistoryError::Io(_))
+        ));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        let _ = tokio::fs::remove_file(&not_a_directory).await;
+    }
+
+    #[tokio::test]
+    async fn br130_history_rejects_blank_malformed_and_missing_kind_lines() {
+        let date = today().format("%Y-%m-%d").to_string();
+        for (label, line, expected) in [
+            ("blank", "".to_string(), "is blank"),
+            ("json", "{not-json}".to_string(), "JSON"),
+        ] {
+            let dir = test_dir(label);
+            tokio::fs::create_dir_all(&dir).await.unwrap();
+            write_envelope_line(&dir, &date, &line).await;
+            let error = HistoryQuery::new(dir.clone())
+                .query(HistoryFilter {
+                    date: Some(today()),
+                    ..HistoryFilter::default()
+                })
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+            tokio::fs::remove_dir_all(dir).await.unwrap();
+        }
+
+        let dir = test_dir("missing-kind");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let mut envelope = make_delivery_envelope(
+            "missing-kind",
+            "Announcement",
+            Some("TEST_CODE_600519"),
+            "Pushed",
+            "dry_run",
+            1,
+            Local::now(),
+        );
+        envelope.payload.as_object_mut().unwrap().remove("kind");
+        write_envelope_line(&dir, &date, &serde_json::to_string(&envelope).unwrap()).await;
+        let error = HistoryQuery::new(dir.clone())
+            .query(HistoryFilter {
+                date: Some(today()),
+                kind: Some("OtherKind".into()),
+                ..HistoryFilter::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("valid kind"), "{error}");
+        tokio::fs::remove_dir_all(dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn br130_rate_rejects_corrupt_audit_but_skips_other_valid_event_types() {
+        let dir = test_dir("strict-rate");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let date = today().format("%Y-%m-%d").to_string();
+
+        let unrelated = EventEnvelope {
+            id: "unrelated".into(),
+            ts: Local::now(),
+            trace_id: "trace-unrelated".into(),
+            source: "TEST_CODE_policy".into(),
+            event_type: "market.policy".into(),
+            entity_key: None,
+            payload: serde_json::json!({"kind": "Policy"}),
+            version: 1,
+            replay_of: None,
+        };
+        write_envelope_line(&dir, &date, &serde_json::to_string(&unrelated).unwrap()).await;
+        let empty = HistoryQuery::new(dir.clone())
+            .push_success_rate(None, Window::Hours(1), None)
+            .await
+            .unwrap();
+        assert_eq!(empty.total, 0);
+
+        let mut invalid = make_delivery_envelope(
+            "invalid-outcome",
+            "Announcement",
+            Some("TEST_CODE_600519"),
+            "Pushed",
+            "dry_run",
+            1,
+            Local::now(),
+        );
+        invalid.payload["outcome"] = serde_json::json!("Unknown");
+        write_envelope_line(&dir, &date, &serde_json::to_string(&invalid).unwrap()).await;
+        let error = HistoryQuery::new(dir.clone())
+            .push_success_rate(None, Window::Hours(1), None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("outcome=Unknown"), "{error}");
+
+        tokio::fs::remove_dir_all(dir).await.unwrap();
     }
 }

@@ -655,3 +655,10 @@ Failure handling:
 - 数据流：新闻条目先校验必填身份、时间顺序、当前环境代码和由标题+摘要重算的 SHA-256，再以 nullable bind 写入既有 `(source,external_id)` 幂等表。预测保存、计数、查找、待结算和更新统一使用 Diesel 参数绑定，日期与有限数值在获取连接前校验；原有 reason、日期窗口、hit 和最新 ID 语义不变。主题签名整批预检后在既有事务内 UPSERT，保留 `created_at` 倒序读取和至少 50 条的既有保留口径。
 - 失败模式与测试：坏日期、NaN/Inf、空身份、哈希不一致、环境混用、空签名或 SQL 引号都必须显式失败或按字面值处理，失败批次不得留下部分记录。测试只使用唯一 `TEST_CODE_` 新闻/预测和共享测试 SQLite，不读取真实账户、不访问公网。
 - 旧模块与回滚：采用现有 `NewsItem`、`prediction_tracker`、`topic_novelty_history` 表及 BR-016/017/066 语义，不创建替代表或内存 fallback。整体回退 BR-129 代码、测试和文档；不得只恢复 SQL 拼接、NULL 空串替换或坏行跳过。
+
+## Addendum: BR-130 真实投递历史完整性（2026-07-18）
+
+- 根因：生产 `PushDeliveryEvent` 持久化 `push.delivery.audit`，但 `PushRecord` 和成功率测试只接受手造的 `push.delivery`，导致真实投递全部被静默排除；未知 outcome 被改写成 Failed，历史读取还会跳过坏 JSON/坏记录，统计可以在证据损坏时仍报告成功。
+- 数据流：生产 envelope 类型统一为 `push.delivery.audit`；事件构造先校验非空 kind/channel 和登记 outcome，`PushRecord` 对相同字段、类型及 latency 做严格读取。模板层用于全局冷却的空字符串键在进入事件链前规范化为 `None`，不伪造证券身份。历史查询对 JSONL 每一非缺失分片执行完整解析，非投递事件只在成功解析且明确类型不匹配时排除；投递审计字段错误必须传播。成功率继续使用既有时间窗、sink/kind 筛选和 `Pushed/(Pushed+Failed)` 公式。
+- 失败模式与测试：不存在的日期文件表达零记录；目录权限、文件读取、空行、坏 JSON、缺 kind、未知/缺失/错类型 outcome/channel/latency 都不得跳过。测试写入唯一临时 JSONL，覆盖生产事件 round-trip、全局事件空键规范化、筛选、零分母和损坏文件，不调用外部 sink、不写真实审计目录。所有修改推送环境变量的测试共用同一串行域，并在 Drop 时恢复原值，防止静默时段判定串扰。
+- 旧模块与回滚：采用现有 `PushDeliveryEvent`、`PushRecord`、`HistoryQuery`、BR-043 排序/限制和 BR-091 hash-chain，不引入兼容别名或第二套统计。整体回退 BR-130 代码、测试和文档；不得只恢复测试专用事件类型或损坏行跳过。

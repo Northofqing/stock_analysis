@@ -63,6 +63,47 @@ pub static MAGICLAW_TOKEN_ISSUE_LOCK: Lazy<tokio::sync::Mutex<()>> =
 
 pub static MAGICLAW_DISABLE_ENV_TOKEN: AtomicBool = AtomicBool::new(false);
 
+#[cfg(test)]
+pub(crate) struct TestEnvGuard {
+    previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+#[cfg(test)]
+impl TestEnvGuard {
+    pub(crate) fn capture(keys: &[&'static str]) -> Self {
+        Self {
+            previous: keys
+                .iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect(),
+        }
+    }
+
+    pub(crate) fn dry_run_non_quiet() -> Self {
+        let guard = Self::capture(&[
+            "V10_DRY_RUN_PUSH",
+            "PUSH_VERBOSE",
+            "STOCK_ANALYSIS_QUIET_HOUR_OVERRIDE",
+        ]);
+        std::env::set_var("V10_DRY_RUN_PUSH", "1");
+        std::env::set_var("PUSH_VERBOSE", "true");
+        std::env::set_var("STOCK_ANALYSIS_QUIET_HOUR_OVERRIDE", "0");
+        guard
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestEnvGuard {
+    fn drop(&mut self) {
+        for (key, value) in self.previous.drain(..) {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
 mod notify;
 
 use crate::notify::{push_governor_v3, PushKind};
@@ -8315,11 +8356,12 @@ mod tests_v17_7_announcement_wiring {
     /// v17.7 §6 Step 2: Test should FAIL because current news_monitor_loop
     /// directly processes and pushes the same announcement through the legacy path.
     #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
     async fn routed_announcement_is_not_sent_again_as_daily_report() {
         // The production path initializes LATEST_BANNER before dispatch. This isolated
         // test must do the same explicitly; relying on another test's global setup is flaky.
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         crate::v14_adapter::_reset_dedup_for_test();
-        std::env::set_var("V10_DRY_RUN_PUSH", "1");
         let report = simulate_announcement_loop(vec![test_important_announcement(
             "ann-1",
             "TEST_CODE_ANNOUNCEMENT_1",
@@ -8334,7 +8376,6 @@ mod tests_v17_7_announcement_wiring {
             0,
             "routed announcement should not trigger legacy push"
         );
-        std::env::remove_var("V10_DRY_RUN_PUSH");
     }
 
     #[test]

@@ -536,14 +536,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
     async fn announcement_adapter_calls_only_announcement_kind() {
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         crate::v14_adapter::_reset_dedup_for_test();
-        std::env::set_var("V10_DRY_RUN_PUSH", "1");
         let report = push_normalized_events(vec![test_announcement_event()]).await;
         assert_eq!(report.attempted, 1);
         assert_eq!(report.pushed, 1);
         assert_eq!(report.failed, 0);
-        std::env::remove_var("V10_DRY_RUN_PUSH");
     }
 
     #[tokio::test]
@@ -554,9 +554,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
     async fn analyst_upgrade_maps_to_analyst_upgrade_kind() {
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         crate::v14_adapter::_reset_dedup_for_test();
-        std::env::set_var("V10_DRY_RUN_PUSH", "1");
         let event = NormalizedSourceEvent {
             push_kind: SourcePushKind::AnalystUpgrade,
             event_id: "analyst-1".into(),
@@ -574,13 +575,13 @@ mod tests {
         let attempt = push_normalized_event(event).await;
         assert_eq!(attempt.kind, PushKind::AnalystUpgrade);
         assert_eq!(attempt.outcome, PushOutcome::Pushed);
-        std::env::remove_var("V10_DRY_RUN_PUSH");
     }
 
     #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
     async fn policy_hit_with_no_code_is_pushed_as_policy() {
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         crate::v14_adapter::_reset_dedup_for_test();
-        std::env::set_var("V10_DRY_RUN_PUSH", "1");
         let event = NormalizedSourceEvent {
             push_kind: SourcePushKind::PolicyHit,
             event_id: "pol-1".into(),
@@ -599,7 +600,6 @@ mod tests {
         assert_eq!(attempt.kind, PushKind::PolicyHit);
         assert!(attempt.code.is_none());
         assert_eq!(attempt.outcome, PushOutcome::Pushed);
-        std::env::remove_var("V10_DRY_RUN_PUSH");
     }
 
     /// Helper: build a FinancialPeriod for testing.
@@ -653,8 +653,6 @@ mod tests {
 
     #[tokio::test]
     async fn earnings_beat_and_miss_map_to_distinct_push_kinds() {
-        std::env::set_var("V10_DRY_RUN_PUSH", "1");
-
         let earnings_cfg = EarningsConfig {
             metric: "eps".to_string(),
             beat_threshold_pct: 10.0,
@@ -713,8 +711,6 @@ mod tests {
             source_push_kind_to_push_kind(miss_event.push_kind),
             PushKind::EarningsMiss
         );
-
-        std::env::remove_var("V10_DRY_RUN_PUSH");
     }
 
     #[tokio::test]

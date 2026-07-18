@@ -1,3 +1,4 @@
+//! Registered business rules: BR-043, BR-091, BR-111, BR-130.
 //! Event infrastructure — v17.1-r2 Task 1+2
 //!
 //! Provides the `DomainEvent` trait, `EventEnvelope` wrapper, and
@@ -236,5 +237,29 @@ mod delivery_observation_tests {
         let content = std::fs::read_to_string(&path).unwrap();
         assert_eq!(content.lines().count(), 1);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn br130_global_delivery_uses_production_audit_type_and_reaches_observers() {
+        let bus = global_bus();
+        let mut receiver = bus.subscribe();
+
+        publish_delivery(
+            "announcement_v1",
+            Some("TEST_CODE_GLOBAL_AUDIT"),
+            "SinkError",
+            "dry_run",
+            12,
+            37,
+        )
+        .unwrap();
+
+        let envelope = receiver.recv().await.unwrap();
+        assert_eq!(envelope.event_type, "push.delivery.audit");
+        assert_eq!(envelope.payload["outcome"], "SinkError");
+        assert!(publish_delivery("", None, "Pushed", "dry_run", 0, 0).is_err());
+
+        let local = EventBus::new_for_test(1);
+        publish_delivery_on(&local, "announcement_v1", None, "Pushed", "dry_run", 1, 1);
     }
 }

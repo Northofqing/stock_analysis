@@ -317,7 +317,7 @@ mod tests {
                 .unwrap();
         let mut delivery = source.clone();
         delivery.id = "delivery".into();
-        delivery.event_type = "push.delivery".into();
+        delivery.event_type = "push.delivery.audit".into();
         let bus = EventBus::new_for_test(8);
         let mut rx = bus.subscribe();
         let summary =

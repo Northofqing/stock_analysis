@@ -5677,9 +5677,6 @@ mod tests_r_dispatchers {
     ///       只验证函数不 panic (这才是真实回归保护点).
     #[tokio::test]
     async fn test_dispatch_r02_review_market_no_panic() {
-        unsafe {
-            std::env::set_var("V10_DRY_RUN_PUSH", "1");
-        }
         let banner = BannerCtx {
             account_mode: AccountMode::Normal,
             total_pos: 5,
@@ -5690,18 +5687,12 @@ mod tests_r_dispatchers {
         // 用过去日期避免数据查不到. 不验证 return value (依赖 transport),
         // 只验证函数不 panic — 这就是真正的回归保护点.
         let _ = dispatch_r02_review_market_real("2026-01-01", &banner).await;
-        unsafe {
-            std::env::remove_var("V10_DRY_RUN_PUSH");
-        }
     }
 
     /// FIX-3: R-02 缺数据时仍能渲染 (用 fallback 30, 5, 15.0).
     /// 验证降级路径不 panic.
     #[tokio::test]
     async fn test_dispatch_r02_fallback_renders() {
-        unsafe {
-            std::env::set_var("V10_DRY_RUN_PUSH", "1");
-        }
         let banner = BannerCtx {
             account_mode: AccountMode::Normal,
             total_pos: 0,
@@ -5711,9 +5702,6 @@ mod tests_r_dispatchers {
         };
         // 缺数据日 (2010-01-01) 走 fallback (30, 5, 15.0)
         let _ = dispatch_r02_review_market_real("2010-01-01", &banner).await;
-        unsafe {
-            std::env::remove_var("V10_DRY_RUN_PUSH");
-        }
     }
 
     /// FIX-3: R-03 真实 dispatcher, 无 cluster 时静默跳过 (返回 false, 不推).
@@ -5745,9 +5733,6 @@ mod tests_r_dispatchers {
     /// 验证: 不 init DB 时, dispatcher 走 try_get → None → false (不推).
     #[tokio::test]
     async fn test_dispatch_r05_skips_when_no_db() {
-        unsafe {
-            std::env::set_var("V10_DRY_RUN_PUSH", "1");
-        }
         let banner = BannerCtx {
             account_mode: AccountMode::Normal,
             total_pos: 0,
@@ -5762,9 +5747,6 @@ mod tests_r_dispatchers {
             !result,
             "R-05 缺 closed trades 应返回 false (不推), 不应 panic"
         );
-        unsafe {
-            std::env::remove_var("V10_DRY_RUN_PUSH");
-        }
     }
 }
 
@@ -6331,9 +6313,11 @@ async fn dispatch_outcome(
         }
     }
 
-    // 4. 推 — b013 review P0-2: 显式传 code, 让 v14_gate L4 dedup 真正按 (kind,code) 工作.
+    // 4. 推 — b013 review P0-2: 票级事件显式传 code, 让 v14_gate L4 dedup 真正按
+    //    (kind,code) 工作。全局事件沿用模板层的空字符串键，但进入事件 envelope 前必须
+    //    规范化为 None；空字符串不是一个真实证券身份，也不能写入 BR-130 审计字段。
     //    模板层 record_cooldown + v14 L4 共存, 冗余安全 (后者兜前者漏判).
-    let outcome = crate::notify::push_governor_v3(&text, kind, Some(code)).await;
+    let outcome = crate::notify::push_governor_v3(&text, kind, optional_dispatch_code(code)).await;
     if outcome.is_pushed() {
         record_cooldown(kind, code);
         if counts_against_daily_budget(kind) {
@@ -6341,6 +6325,10 @@ async fn dispatch_outcome(
         }
     }
     outcome
+}
+
+fn optional_dispatch_code(code: &str) -> Option<&str> {
+    (!code.trim().is_empty()).then_some(code)
 }
 
 pub async fn dispatch(
@@ -10487,13 +10475,13 @@ mod tests {
     /// 重置全局 DAILY_BUDGET_COUNT 计数 + 清空 COOLDOWN_TABLE (修复 4 个 e2e 并行测试隔离 bug)
     /// 测试间共享的全局状态 (account_mode_log 表, 预算 counter, 冷却表) 必须全部重置
     /// 才能保证 67 个并行测试互不干扰。
-    /// 2026-07-16: 另设 QUIET_HOUR_OVERRIDE=0 — e2e 断言"推送成功"不应依赖墙钟
-    /// (凌晨 02:00-06:00 跑测试时 L5 governance quiet_hour Deny 导致假失败)
+    /// 环境变量由 `TestEnvGuard` 负责隔离；这里仅重置业务状态。
     fn reset_daily_budget_for_test() {
-        std::env::set_var("STOCK_ANALYSIS_QUIET_HOUR_OVERRIDE", "0");
         DAILY_BUDGET_COUNT.store(0, Ordering::Relaxed);
         let mut table = COOLDOWN_TABLE.lock().expect("cooldown table poisoned");
         table.clear();
+        drop(table);
+        crate::v14_adapter::_reset_dedup_for_test();
         // 清空 account_mode_log (并行测试可能插入行, 影响 e2e_t01_no_change 的 count 断言)
         use diesel::prelude::*;
         if let Ok(mut conn) = stock_analysis::database::DatabaseManager::get().get_conn() {
@@ -10501,6 +10489,16 @@ mod tests {
                 .execute(&mut conn)
                 .ok();
         }
+    }
+
+    #[test]
+    fn br130_global_dispatch_key_is_absent_from_delivery_identity() {
+        assert_eq!(optional_dispatch_code(""), None);
+        assert_eq!(optional_dispatch_code("   "), None);
+        assert_eq!(
+            optional_dispatch_code("TEST_CODE_600519"),
+            Some("TEST_CODE_600519")
+        );
     }
 
     fn init_test_db() {
@@ -10562,12 +10560,12 @@ mod tests {
 
     /// T-01 E2E: Normal → ReduceOnly. 验证 DB 写 + 推送路径
     #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
     async fn e2e_t01_normal_to_reduce_only_db_and_push() {
         let _e2e_guard = E2E_MUTEX.lock().await;
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         init_test_db();
         reset_daily_budget_for_test();
-        std::env::set_var("V10_DRY_RUN_PUSH", "1");
-        std::env::set_var("PUSH_VERBOSE", "true");
 
         use stock_analysis::database::account_mode_log;
         use stock_analysis::risk::account_mode::PortfolioMetrics;
@@ -10606,19 +10604,16 @@ mod tests {
         assert!(row.trigger_reason.contains("当日亏损"));
         assert!(row.trigger_reason.contains("降级线"));
         assert!(row.trigger_reason.contains("-1.50%"));
-
-        std::env::remove_var("V10_DRY_RUN_PUSH");
-        std::env::remove_var("PUSH_VERBOSE");
     }
 
     /// T-01 E2E: 无变更 → 不推送不写库
     #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
     async fn e2e_t01_no_change_no_push_no_db_write() {
         let _e2e_guard = E2E_MUTEX.lock().await;
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         init_test_db();
         reset_daily_budget_for_test();
-        std::env::set_var("V10_DRY_RUN_PUSH", "1");
-        std::env::set_var("PUSH_VERBOSE", "true");
 
         use stock_analysis::database::account_mode_log;
         use stock_analysis::risk::account_mode::PortfolioMetrics;
@@ -10648,20 +10643,17 @@ mod tests {
             .map(|r| r.len())
             .unwrap_or(0);
         assert_eq!(before, after, "无变更不应写库");
-
-        std::env::remove_var("V10_DRY_RUN_PUSH");
-        std::env::remove_var("PUSH_VERBOSE");
     }
 
     /// BR-108: the first real evaluation must establish an auditable state
     /// instead of silently assuming Normal.
     #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
     async fn e2e_t01_initial_evaluation_is_persisted_without_invented_predecessor() {
         let _e2e_guard = E2E_MUTEX.lock().await;
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         init_test_db();
         reset_daily_budget_for_test();
-        std::env::set_var("V10_DRY_RUN_PUSH", "1");
-        std::env::set_var("PUSH_VERBOSE", "true");
 
         use stock_analysis::database::account_mode_log;
         use stock_analysis::risk::account_mode::PortfolioMetrics;
@@ -10684,19 +10676,16 @@ mod tests {
         assert_eq!(rows[0].new_mode, "Normal");
         assert_eq!(rows[0].trigger_reason, "initial account mode evaluation");
         assert_eq!(rows[0].pushed, 1);
-
-        std::env::remove_var("V10_DRY_RUN_PUSH");
-        std::env::remove_var("PUSH_VERBOSE");
     }
 
     /// T-01 E2E: ReduceOnly → Frozen. 数据准确
     #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
     async fn e2e_t01_reduce_only_to_frozen_circuit_breaker() {
         let _e2e_guard = E2E_MUTEX.lock().await;
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         init_test_db();
         reset_daily_budget_for_test();
-        std::env::set_var("V10_DRY_RUN_PUSH", "1");
-        std::env::set_var("PUSH_VERBOSE", "true");
 
         use stock_analysis::database::account_mode_log;
         use stock_analysis::risk::account_mode::PortfolioMetrics;
@@ -10723,19 +10712,16 @@ mod tests {
         assert!(rows[0].trigger_reason.contains("熔断"));
         assert!(rows[0].trigger_reason.contains("-2.00%"));
         assert_eq!(rows[0].pushed, 1);
-
-        std::env::remove_var("V10_DRY_RUN_PUSH");
-        std::env::remove_var("PUSH_VERBOSE");
     }
 
     /// T-01 E2E: 数据缺失 → 保守 ReduceOnly
     #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
     async fn e2e_t01_data_missing_conservative_reduce_only() {
         let _e2e_guard = E2E_MUTEX.lock().await;
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         init_test_db();
         reset_daily_budget_for_test();
-        std::env::set_var("V10_DRY_RUN_PUSH", "1");
-        std::env::set_var("PUSH_VERBOSE", "true");
 
         use stock_analysis::database::account_mode_log;
         use stock_analysis::risk::account_mode::PortfolioMetrics;
@@ -10757,19 +10743,16 @@ mod tests {
         assert_eq!(rows[0].new_mode, "ReduceOnly");
         assert!(rows[0].trigger_reason.contains("数据缺失"));
         assert_eq!(rows[0].data_complete, 0);
-
-        std::env::remove_var("V10_DRY_RUN_PUSH");
-        std::env::remove_var("PUSH_VERBOSE");
     }
 
     /// T-02 E2E: Full → Degraded (Kline 过期)
     #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
     async fn e2e_t02_full_to_degraded_kline_stale() {
         let _e2e_guard = E2E_MUTEX.lock().await;
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         init_test_db();
         reset_daily_budget_for_test();
-        std::env::set_var("V10_DRY_RUN_PUSH", "1");
-        std::env::set_var("PUSH_VERBOSE", "true");
 
         use stock_analysis::monitor::data_mode::{
             Capability, CapabilityStatus, DataHealthInput, DataMode as LibDM,
@@ -10791,19 +10774,16 @@ mod tests {
             push_data_mode_change(&input, Some(LibDM::Full), Some(&banner_normal_full())).await;
         assert!(result.is_ok(), "T-02 orchestrator: {:?}", result);
         assert!(result.unwrap(), "T-02 应推送成功");
-
-        std::env::remove_var("V10_DRY_RUN_PUSH");
-        std::env::remove_var("PUSH_VERBOSE");
     }
 
     /// T-02 E2E: 无变更 → no-op
     #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
     async fn e2e_t02_no_change_no_push() {
         let _e2e_guard = E2E_MUTEX.lock().await;
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         init_test_db();
         reset_daily_budget_for_test();
-        std::env::set_var("V10_DRY_RUN_PUSH", "1");
-        std::env::set_var("PUSH_VERBOSE", "true");
 
         use stock_analysis::monitor::data_mode::{
             Capability, CapabilityStatus, DataHealthInput, DataMode as LibDM,
@@ -10822,9 +10802,6 @@ mod tests {
             push_data_mode_change(&input, Some(LibDM::Full), Some(&banner_normal_full())).await;
         assert!(result.is_ok());
         assert!(!result.unwrap(), "Full → Full 应 no-op");
-
-        std::env::remove_var("V10_DRY_RUN_PUSH");
-        std::env::remove_var("PUSH_VERBOSE");
     }
 
     /// T-02 模板精确内容验证: 文本必须与 §14.1 T-02 模板逐字符一致

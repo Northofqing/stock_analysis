@@ -234,6 +234,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(cooldown_memo)]
     fn magiclaw_sink_health_probes_three_env_paths() {
         // F4 fix: 真探活 — 不再总是 true stub. 三种 env 路径在一个 #[test] 里
         // sequential 执行, 避免 std::env::set_var 在 parallel test runner 下的
@@ -242,6 +243,11 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
+        let _env_guard = crate::TestEnvGuard::capture(&[
+            "V10_DRY_RUN_PUSH",
+            "MAGICLAW_BIN",
+            "MAGICLAW_API_ADDR",
+        ]);
 
         // Case 1: dry-run 模式 → true (即使没真 daemon)
         std::env::set_var("V10_DRY_RUN_PUSH", "1");

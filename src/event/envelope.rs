@@ -1,3 +1,4 @@
+//! Registered business rules: BR-091, BR-130.
 //! Event envelope contract — v17.1-r2 Task 1
 //!
 //! Defines `DomainEvent`, `EventEnvelope`, and `PushDeliveryEvent` for the
@@ -13,7 +14,7 @@ use thiserror::Error;
 
 /// Trait implemented by all domain events that can be wrapped in an `EventEnvelope`.
 pub trait DomainEvent: Send + Sync + 'static {
-    /// The event type string, e.g. `"push.delivery"`.
+    /// The event type string, e.g. `"push.delivery.audit"`.
     fn event_type(&self) -> &'static str;
     /// The source subsystem that produced this event, e.g. `"push_l4"`.
     fn source(&self) -> &'static str;
@@ -48,6 +49,15 @@ pub enum EnvelopeError {
 
     #[error("delivery kind cannot be blank")]
     BlankDeliveryKind,
+
+    #[error("delivery outcome cannot be blank")]
+    BlankDeliveryOutcome,
+
+    #[error("unsupported delivery outcome: {0}")]
+    InvalidDeliveryOutcome(String),
+
+    #[error("delivery channel cannot be blank")]
+    BlankDeliveryChannel,
 }
 
 // ========================================================================
@@ -175,6 +185,18 @@ impl DomainEvent for PushDeliveryEvent {
         if self.kind.trim().is_empty() {
             return Err(EnvelopeError::BlankDeliveryKind);
         }
+        if self.outcome.trim().is_empty() {
+            return Err(EnvelopeError::BlankDeliveryOutcome);
+        }
+        if !matches!(
+            self.outcome.as_str(),
+            "Pushed" | "SinkError" | "Failed" | "Deduped" | "Denied"
+        ) {
+            return Err(EnvelopeError::InvalidDeliveryOutcome(self.outcome.clone()));
+        }
+        if self.channel.trim().is_empty() {
+            return Err(EnvelopeError::BlankDeliveryChannel);
+        }
         Ok(())
     }
 }
@@ -222,6 +244,32 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("kind"));
+    }
+
+    #[test]
+    fn br130_delivery_rejects_blank_or_unknown_audit_fields() {
+        for (outcome, channel, expected) in [
+            ("", "dry_run", "outcome"),
+            ("Unknown", "dry_run", "unsupported"),
+            ("Pushed", " ", "channel"),
+        ] {
+            let event = PushDeliveryEvent::new(
+                "announcement_v1".into(),
+                Some("TEST_CODE_600519".into()),
+                outcome.into(),
+                channel.into(),
+                1,
+                1,
+            );
+            let error = EventEnvelope::from_event(
+                &event,
+                "evt-invalid".into(),
+                "trace-invalid".into(),
+                chrono::Local::now(),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
     }
 
     #[test]
