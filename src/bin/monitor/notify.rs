@@ -2828,4 +2828,214 @@ mod tests {
         std::env::remove_var("V10_DRY_RUN_PUSH");
         std::env::remove_var("PUSH_VERBOSE");
     }
+
+    fn notify_temp_dir(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "stock_analysis_notify_{label}_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path).expect("create isolated notify directory");
+        path
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(notify_env)]
+    async fn send_type_transport_and_target_resolution_are_explicit() {
+        let _env = crate::TestEnvGuard::capture(&[
+            "MAGICLAW_SEND_TYPE",
+            "SEND_TYPE",
+            "FEISHU_WEBHOOK_URL",
+            "MAGICLAW_FEISHU_WEBHOOK_URL",
+            "MAGICLAW_BIN",
+            "MAGICLAW_HOME",
+            "MAGICLAW_API_ADDR",
+            "FEISHU_TO",
+            "MAGICLAW_FEISHU_TO",
+            "FEISHU_CHAT_ID",
+            "FEISHU_OPEN_ID",
+            "FEISHU_USER_ID",
+            "FEISHU_EMAIL",
+        ]);
+        for key in [
+            "MAGICLAW_SEND_TYPE",
+            "SEND_TYPE",
+            "FEISHU_WEBHOOK_URL",
+            "MAGICLAW_FEISHU_WEBHOOK_URL",
+            "FEISHU_TO",
+            "MAGICLAW_FEISHU_TO",
+            "FEISHU_CHAT_ID",
+            "FEISHU_OPEN_ID",
+            "FEISHU_USER_ID",
+            "FEISHU_EMAIL",
+        ] {
+            std::env::remove_var(key);
+        }
+
+        assert!(matches!(resolve_send_type(), MessageSendType::Feishu));
+        std::env::set_var("SEND_TYPE", " wx ");
+        assert!(matches!(resolve_send_type(), MessageSendType::Wechat));
+        std::env::set_var("MAGICLAW_SEND_TYPE", "unknown");
+        assert!(matches!(resolve_send_type(), MessageSendType::Feishu));
+
+        assert!(matches!(
+            resolve_send_transport(MessageSendType::Wechat),
+            MessageSendTransport::Http
+        ));
+        assert!(matches!(
+            resolve_send_transport(MessageSendType::Feishu),
+            MessageSendTransport::Cli
+        ));
+        std::env::set_var("FEISHU_WEBHOOK_URL", " https://example.invalid/hook ");
+        assert_eq!(
+            resolve_feishu_webhook_url().as_deref(),
+            Some("https://example.invalid/hook")
+        );
+        assert!(matches!(
+            resolve_send_transport(MessageSendType::Feishu),
+            MessageSendTransport::Http
+        ));
+
+        std::env::set_var("MAGICLAW_BIN", "/TEST_CODE/bin/magiclaw");
+        assert_eq!(resolve_magiclaw_bin(), "/TEST_CODE/bin/magiclaw");
+        std::env::set_var("MAGICLAW_HOME", "/TEST_CODE/home");
+        assert_eq!(
+            resolve_magiclaw_home("/ignored/target/release/magiclaw").unwrap(),
+            std::path::PathBuf::from("/TEST_CODE/home")
+        );
+        std::env::set_var("MAGICLAW_API_ADDR", " 127.0.0.1:9999 ");
+        assert_eq!(resolve_api_addr(), "127.0.0.1:9999");
+
+        let client = reqwest::Client::new();
+        assert!(resolve_send_target(
+            MessageSendType::Feishu,
+            &client,
+            "http://127.0.0.1:1",
+            "TEST_CODE_token"
+        )
+        .await
+        .is_err());
+        std::env::set_var("FEISHU_TO", " TEST_CODE_chat ");
+        assert_eq!(resolve_feishu_target().as_deref(), Some("TEST_CODE_chat"));
+        assert_eq!(
+            resolve_send_target(
+                MessageSendType::Feishu,
+                &client,
+                "http://127.0.0.1:1",
+                "TEST_CODE_token"
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+            Some("TEST_CODE_chat")
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(notify_env)]
+    async fn dynamic_token_parsing_and_caches_preserve_expiry_and_permissions() {
+        let _env = crate::TestEnvGuard::capture(&[
+            "DATABASE_PATH",
+            "MAGICLAW_API_TOKEN",
+            "MAGICLAW_TOKEN_REFRESH_AHEAD_SECS",
+        ]);
+        let dir = notify_temp_dir("token");
+        let database = dir.join("TEST_CODE.db");
+        std::env::set_var("DATABASE_PATH", &database);
+        std::env::set_var("MAGICLAW_TOKEN_REFRESH_AHEAD_SECS", "0");
+        clear_dynamic_token_cache().await;
+
+        let future = now_epoch_secs() + 3_600;
+        let parsed = parse_issue_token_output(&format!(
+            "issued\ntoken=TEST_CODE_dynamic\nscopes=send expires_at={future}"
+        ))
+        .unwrap();
+        assert_eq!(parsed.token, "TEST_CODE_dynamic");
+        assert_eq!(parsed.expires_at, Some(future));
+        assert!(!is_cached_token_expired(&parsed));
+        assert!(parse_issue_token_output("expires_at=1").is_err());
+
+        let expired = CachedApiToken {
+            token: "TEST_CODE_expired".to_string(),
+            expires_at: Some(now_epoch_secs() - 1),
+        };
+        assert!(is_cached_token_expired(&expired));
+        cache_dynamic_token_in_mem(&expired).await;
+        assert!(load_dynamic_token_from_mem_cache().await.is_none());
+
+        cache_dynamic_token_in_file(&parsed).unwrap();
+        assert_eq!(
+            api_token_cache_file_path(),
+            dir.join("magiclaw_api_token_cache.json")
+        );
+        assert_eq!(
+            load_dynamic_token_from_file_cache().unwrap().token,
+            "TEST_CODE_dynamic"
+        );
+        cache_dynamic_token_in_mem(&parsed).await;
+        assert_eq!(
+            load_dynamic_token_from_mem_cache().await.unwrap().token,
+            "TEST_CODE_dynamic"
+        );
+
+        std::env::set_var("MAGICLAW_API_TOKEN", " TEST_CODE_env_token ");
+        MAGICLAW_DISABLE_ENV_TOKEN.store(false, Ordering::Relaxed);
+        let (token, source) = resolve_or_issue_api_token("/does/not/run").await.unwrap();
+        assert_eq!(token, "TEST_CODE_env_token");
+        assert!(matches!(source, ApiTokenSource::Env));
+        assert!(is_unauthorized_error("HTTP 401"));
+        assert!(is_unauthorized_error("Unauthorized"));
+        assert!(!is_unauthorized_error("timeout"));
+
+        clear_dynamic_token_cache().await;
+        assert!(!api_token_cache_file_path().exists());
+        std::fs::remove_dir_all(dir).expect("remove isolated token directory");
+    }
+
+    #[test]
+    #[serial_test::serial(notify_env)]
+    fn local_target_and_log_parsers_never_invent_recipient_identity() {
+        let _env = crate::TestEnvGuard::capture(&[
+            "MAGICLAW_DB_PATH",
+            "DATABASE_PATH",
+            "WECHAT_CHANNEL_DIR",
+        ]);
+        let dir = notify_temp_dir("logs");
+        let database = dir.join("TEST_CODE.db");
+        std::env::set_var("MAGICLAW_DB_PATH", &database);
+        std::env::set_var("WECHAT_CHANNEL_DIR", dir.join("wechat"));
+
+        assert_eq!(to_api_base_url("127.0.0.1:8080"), "http://127.0.0.1:8080");
+        assert_eq!(
+            to_api_base_url("https://example.invalid/"),
+            "https://example.invalid"
+        );
+        assert_eq!(
+            parse_first_peer_id_from_window_status(
+                r#"{"peers":[{"peer_id":" "},{"peer_id":"TEST_CODE_peer"}]}"#
+            )
+            .as_deref(),
+            Some("TEST_CODE_peer")
+        );
+        assert!(parse_first_peer_id_from_window_status("not-json").is_none());
+        assert!(parse_first_peer_id_from_window_status(r#"{"peers":[]}"#).is_none());
+
+        let log_dir = resolve_magiclaw_log_dir();
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(log_dir.join("ignored.txt"), "peer_id=WRONG").unwrap();
+        std::fs::write(
+            log_dir.join("magiclaw-20260718.log"),
+            "older peer_id=TEST_CODE_old\nnew peer_id=TEST_CODE_latest state=ready\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_wechat_target_from_magiclaw_logs().as_deref(),
+            Some("TEST_CODE_latest")
+        );
+        assert_eq!(resolve_wechat_data_dir(), dir.join("wechat"));
+        assert_eq!(tail_lines("one\ntwo\nthree", 2), "two | three");
+        std::fs::remove_dir_all(dir).expect("remove isolated log directory");
+    }
 }

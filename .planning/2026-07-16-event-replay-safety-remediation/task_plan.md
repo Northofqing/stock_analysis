@@ -190,3 +190,10 @@ Phase 12 (Gate D coverage and live-account release closure)
 - [x] Commit/push and request final fixed-SHA review.
 - [x] Close final review Important findings and rerun Gate B/C.
 - [x] Push final follow-up and keep merge blocked on Gate D coverage.
+
+## Gate-D Task 21: monitor protocol and local-delivery coverage (2026-07-18)
+
+- [x] Register BR-131 before correcting the North Exchange `92` price-limit prefix.
+- [x] Cover deterministic delivery configuration, token/cache/file parsing, ranking and announcement renderers without live sinks.
+- [x] Run formatter, 301 monitor tests, strict monitor Clippy, diff check, and focused llvm-cov.
+- [ ] Commit/push the fixed slice and continue largest-first coverage closure.

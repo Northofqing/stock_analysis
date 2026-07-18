@@ -232,3 +232,10 @@ Expected: all PASS. Commit only the two modules plus design/plan/progress eviden
 - [x] Keep production ranking and real daily-history acquisition in the existing wrapper; pass only the complete history batch and nullable real benchmark into an internal resolved executor.
 - [x] Exercise explicit insufficient-stock/short-history failures plus a complete 120-day, three-stock base/OOS/walk-forward report with `TEST_CODE_` identities.
 - [x] Run the exact focused test, formatter, strict library Clippy, and focused instrumented coverage; `backtest_runner.rs` reaches 915/1,111 = 82.36%.
+
+### Task 21: Cover monitor protocol, rendering, and local-delivery boundaries
+
+- [x] Register BR-131 and correct the North Exchange `92` prefix to the documented 30% price-limit profile while preserving ST precedence.
+- [x] Exercise monitor delivery type/target resolution, token parsing and caches, file permissions, local peer/log parsing, and missing-recipient failure behavior without sending a message.
+- [x] Exercise ranking, fund-flow, turnover, announcement-summary, source-wrapper, and UTF-8 truncation renderers with complete and explicitly missing facts.
+- [x] Run all 301 monitor tests, strict monitor Clippy, formatter, and focused coverage; `notify.rs` reaches 985/1,811 = 54.39%, `push_templates.rs` 4,643/8,660 = 53.61%, and `market_data.rs` 85/582 = 14.60%.

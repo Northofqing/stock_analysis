@@ -12064,6 +12064,130 @@ mod tests {
         let map = D01_LAST_PUSH.lock().unwrap_or_else(|e| e.into_inner());
         assert!(map.is_empty(), "重置后 memo 容器应为空");
     }
+
+    #[test]
+    fn ranking_renderers_preserve_missing_values_and_rank_overflow() {
+        let sectors = render_sector_top(
+            "10:30",
+            &[
+                ("TEST_CODE_板块1".to_string(), 3.2, 1.5),
+                ("TEST_CODE_板块2".to_string(), 2.8, 1.2),
+                ("TEST_CODE_板块3".to_string(), 2.1, 0.9),
+                ("TEST_CODE_板块4".to_string(), 1.9, 0.8),
+                ("TEST_CODE_板块5".to_string(), 1.7, 0.7),
+                ("TEST_CODE_板块6".to_string(), 1.5, 0.6),
+            ],
+        );
+        assert!(sectors.contains("🥇 TEST_CODE_板块1 +3.2%"));
+        assert!(sectors.contains("5️⃣ TEST_CODE_板块6 +1.5%"));
+
+        let flows = render_fund_inflow_top(
+            "10:31",
+            &[
+                (
+                    "测试股A".to_string(),
+                    "TEST_CODE_600000".to_string(),
+                    2.5,
+                    Some(1.8),
+                    1.2,
+                ),
+                (
+                    "测试股B".to_string(),
+                    "TEST_CODE_000001".to_string(),
+                    -0.2,
+                    None,
+                    -1.1,
+                ),
+            ],
+        );
+        assert!(flows.contains("量比1.8"));
+        assert!(flows.contains("量比暂无"));
+
+        let empty = render_turnover_top("10:32", &[]);
+        assert!(empty.contains("数据源不稳定"));
+        let turnover = render_turnover_top(
+            "10:32",
+            &[
+                TurnoverEntry {
+                    name: "测试股A".to_string(),
+                    code: "TEST_CODE_600000".to_string(),
+                    price: 10.25,
+                    change_pct: 2.0,
+                    turnover_pct: 12.5,
+                    main_flow_yi: Some(1.25),
+                },
+                TurnoverEntry {
+                    name: "测试股B".to_string(),
+                    code: "TEST_CODE_000001".to_string(),
+                    price: 8.0,
+                    change_pct: -1.0,
+                    turnover_pct: 9.0,
+                    main_flow_yi: None,
+                },
+            ],
+        );
+        assert!(turnover.contains("主力1.25亿"));
+        assert!(turnover.contains("主力暂无"));
+        assert!(turnover.contains("非龙虎榜"));
+    }
+
+    #[test]
+    fn event_macro_summary_separates_held_and_other_complete_announcements() {
+        use stock_analysis::data_provider::announcement::{AnnLevel, Announcement};
+        let announcement = |code: &str, name: &str, title: &str, level: AnnLevel| Announcement {
+            code: code.to_string(),
+            name: name.to_string(),
+            title: title.to_string(),
+            date: "2026-07-18".to_string(),
+            summary: "TEST_CODE_摘要".to_string(),
+            content: "TEST_CODE_正文".to_string(),
+            level,
+            reason: "TEST_CODE_原因".to_string(),
+            external_id: Some(format!("TEST_CODE_{code}")),
+            url: Some("https://example.invalid/announcement".to_string()),
+        };
+        assert_eq!(
+            build_event_calendar_macro_summary(&[], &Default::default()),
+            "今日公告批次成功返回 0 条"
+        );
+        let rows = vec![
+            announcement(
+                "TEST_CODE_600000",
+                "测试持仓",
+                "持仓公告",
+                AnnLevel::Important,
+            ),
+            announcement("TEST_CODE_000001", "", "其他公告1", AnnLevel::Info),
+            announcement(
+                "TEST_CODE_000002",
+                "测试二",
+                "其他公告2",
+                AnnLevel::Emergency,
+            ),
+            announcement("TEST_CODE_000003", "测试三", "其他公告3", AnnLevel::Info),
+            announcement("TEST_CODE_000004", "测试四", "其他公告4", AnnLevel::Info),
+        ];
+        let held = std::collections::HashSet::from(["TEST_CODE_600000".to_string()]);
+        let summary = build_event_calendar_macro_summary(&rows, &held);
+        assert!(summary.contains("今日共 5 条公告"));
+        assert!(summary.contains("持仓相关 (TOP 1)"));
+        assert!(summary.contains("测试持仓(TEST_CODE_600000)"));
+        assert!(summary.contains("TEST_CODE_000001 (Info): 其他公告1"));
+        assert!(summary.contains("非持仓 (TOP 3)"));
+        assert!(!summary.contains("其他公告4"));
+    }
+
+    #[test]
+    fn source_wrapper_and_metric_json_fail_closed_without_external_io() {
+        assert!(load_p5_source_items("TEST_CODE_unknown_source").is_err());
+        let short = serde_json::json!({"code":"TEST_CODE_600000"}).to_string();
+        assert_eq!(truncate_metric_json(short.clone()), short);
+        let long = serde_json::json!({"text":"测".repeat(2_000)}).to_string();
+        let truncated = truncate_metric_json(long);
+        let value: serde_json::Value = serde_json::from_str(&truncated).unwrap();
+        assert_eq!(value.get("truncated").and_then(|v| v.as_bool()), Some(true));
+        assert!(value.get("orig_bytes").and_then(|v| v.as_u64()).unwrap() > 4_096);
+    }
 }
 
 // ===== v16.3 review fixes: helper fns =====

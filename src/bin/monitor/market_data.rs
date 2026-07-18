@@ -191,11 +191,13 @@ pub fn fetch_eastmoney_quotes(
 }
 
 pub fn infer_limit_pct(code: &str, name: &str) -> f64 {
+    #[cfg(test)]
+    let code = code.strip_prefix("TEST_CODE_").unwrap_or(code);
     if name.contains("ST") || name.contains("st") {
         5.0
     } else if code.starts_with("30") || code.starts_with("688") {
         20.0
-    } else if code.starts_with('8') || code.starts_with('4') {
+    } else if code.starts_with('8') || code.starts_with('4') || code.starts_with("92") {
         30.0
     } else {
         10.0
@@ -556,6 +558,16 @@ mod quote_batch_tests {
             "test"
         )
         .is_err());
+    }
+
+    #[test]
+    fn limit_percent_inference_covers_st_and_all_registered_boards() {
+        assert_eq!(infer_limit_pct("TEST_CODE_600000", "普通测试股"), 10.0);
+        assert_eq!(infer_limit_pct("TEST_CODE_300001", "创业板测试股"), 20.0);
+        assert_eq!(infer_limit_pct("TEST_CODE_688001", "科创板测试股"), 20.0);
+        assert_eq!(infer_limit_pct("TEST_CODE_830001", "北交所测试股"), 30.0);
+        assert_eq!(infer_limit_pct("TEST_CODE_920001", "北交所测试股"), 30.0);
+        assert_eq!(infer_limit_pct("TEST_CODE_600001", "*ST测试"), 5.0);
     }
 }
 
