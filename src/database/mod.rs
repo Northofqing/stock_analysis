@@ -11,7 +11,7 @@
 
 use chrono::NaiveDate;
 use diesel::prelude::*;
-use diesel::r2d2::{ConnectionManager, CustomizeConnection, Pool, PooledConnection};
+use diesel::r2d2::{ConnectionManager, Pool, PooledConnection};
 use log::info;
 use once_cell::sync::OnceCell;
 use std::collections::HashMap;
@@ -63,37 +63,32 @@ fn unit_test_init_lock() -> &'static std::sync::Mutex<()> {
     &LOCK
 }
 
-#[derive(Debug)]
-struct SqlitePragmaCustomizer;
-
 #[derive(QueryableByName)]
 struct JournalModeRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     journal_mode: String,
 }
 
-impl CustomizeConnection<SqliteConnection, diesel::r2d2::Error> for SqlitePragmaCustomizer {
-    fn on_acquire(&self, conn: &mut SqliteConnection) -> Result<(), diesel::r2d2::Error> {
-        diesel::sql_query("PRAGMA busy_timeout = 5000")
+const SQLITE_POOL_SIZE: u32 = 10;
+
+fn configure_sqlite_connection(
+    conn: &mut SqliteConnection,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (label, statement) in [
+        ("busy_timeout=5000", "PRAGMA busy_timeout = 5000"),
+        ("synchronous=NORMAL", "PRAGMA synchronous = NORMAL"),
+        (
+            "wal_autocheckpoint=1000",
+            "PRAGMA wal_autocheckpoint = 1000",
+        ),
+    ] {
+        diesel::sql_query(statement)
             .execute(conn)
             .map_err(|error| {
-                log::error!("[DB pool init] PRAGMA busy_timeout=5000 failed: {error}");
-                diesel::r2d2::Error::QueryError(error)
+                std::io::Error::other(format!("SQLite PRAGMA {label} failed: {error}"))
             })?;
-        diesel::sql_query("PRAGMA synchronous = NORMAL")
-            .execute(conn)
-            .map_err(|error| {
-                log::error!("[DB pool init] PRAGMA synchronous=NORMAL failed: {error}");
-                diesel::r2d2::Error::QueryError(error)
-            })?;
-        diesel::sql_query("PRAGMA wal_autocheckpoint = 1000")
-            .execute(conn)
-            .map_err(|error| {
-                log::error!("[DB pool init] PRAGMA wal_autocheckpoint=1000 failed: {error}");
-                diesel::r2d2::Error::QueryError(error)
-            })?;
-        Ok(())
     }
+    Ok(())
 }
 
 pub mod factor_snapshot;
@@ -150,8 +145,7 @@ impl DatabaseManager {
         info!("初始化数据库: {}", database_url);
 
         // WAL is database-wide and requires a lock. Configure it once before
-        // r2d2 opens connections concurrently; pooled connections apply only
-        // connection-local PRAGMAs in `SqlitePragmaCustomizer`.
+        // r2d2 opens connections concurrently.
         let mut bootstrap_conn = SqliteConnection::establish(&database_url)?;
         diesel::sql_query("PRAGMA busy_timeout = 5000").execute(&mut bootstrap_conn)?;
         let journal_mode = diesel::sql_query("PRAGMA journal_mode = WAL")
@@ -165,13 +159,24 @@ impl DatabaseManager {
         drop(bootstrap_conn);
 
         let manager = ConnectionManager::<SqliteConnection>::new(database_url);
-        let pool = Pool::builder()
-            .max_size(10)
-            .connection_customizer(Box::new(SqlitePragmaCustomizer))
-            .build(manager)?;
+        let pool = Pool::builder().max_size(SQLITE_POOL_SIZE).build(manager)?;
+
+        // r2d2 retries `CustomizeConnection::on_acquire` errors. Configure
+        // every initial connection directly instead, keeping all of them
+        // checked out so each of the ten distinct connections is verified.
+        // Any PRAGMA failure therefore propagates from `init` immediately.
+        let mut initial_connections = Vec::with_capacity(SQLITE_POOL_SIZE as usize);
+        for _ in 0..SQLITE_POOL_SIZE {
+            let mut conn = pool.get()?;
+            configure_sqlite_connection(&mut conn)?;
+            initial_connections.push(conn);
+        }
 
         // 运行迁移
-        let mut conn = pool.get()?;
+        let mut conn = initial_connections
+            .pop()
+            .ok_or_else(|| std::io::Error::other("SQLite pool initialized without connections"))?;
+        drop(initial_connections);
         Self::run_migrations(&mut conn)?;
 
         info!("SQLite PRAGMAs 已设置: WAL + busy_timeout=5000");
@@ -345,7 +350,9 @@ impl DatabaseManager {
 
     /// 获取数据库连接
     pub fn get_conn(&self) -> Result<DbConnection, Box<dyn std::error::Error>> {
-        Ok(self.pool.get()?)
+        let mut conn = self.pool.get()?;
+        configure_sqlite_connection(&mut conn)?;
+        Ok(conn)
     }
 
     /// 给已存在的表增量添加列（如果列不存在）。
@@ -1545,6 +1552,24 @@ mod tests {
     use crate::models::StockPosition;
     use chrono::NaiveDate;
 
+    #[derive(QueryableByName)]
+    struct BusyTimeoutValue {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        timeout: i32,
+    }
+
+    #[derive(QueryableByName)]
+    struct SynchronousValue {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        synchronous: i32,
+    }
+
+    #[derive(QueryableByName)]
+    struct WalAutocheckpointValue {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        wal_autocheckpoint: i32,
+    }
+
     // v14.1 review fix: RAII test DB guard, panic 时 Drop 兜底清理
     struct TestDbGuard(&'static str);
     impl Drop for TestDbGuard {
@@ -1566,6 +1591,31 @@ mod tests {
         init_db_for_test();
         let db = DatabaseManager::get();
         assert!(db.pool.get().is_ok());
+    }
+
+    #[test]
+    fn checked_out_connections_have_required_sqlite_pragmas() {
+        init_db_for_test();
+        let mut conn = DatabaseManager::get()
+            .get_conn()
+            .expect("configured SQLite connection");
+
+        let busy_timeout = diesel::sql_query("PRAGMA busy_timeout")
+            .get_result::<BusyTimeoutValue>(&mut conn)
+            .expect("read configured busy_timeout")
+            .timeout;
+        let synchronous = diesel::sql_query("PRAGMA synchronous")
+            .get_result::<SynchronousValue>(&mut conn)
+            .expect("read configured synchronous")
+            .synchronous;
+        let wal_autocheckpoint = diesel::sql_query("PRAGMA wal_autocheckpoint")
+            .get_result::<WalAutocheckpointValue>(&mut conn)
+            .expect("read configured wal_autocheckpoint")
+            .wal_autocheckpoint;
+
+        assert_eq!(busy_timeout, 5000);
+        assert_eq!(synchronous, 1);
+        assert_eq!(wal_autocheckpoint, 1000);
     }
 
     #[test]

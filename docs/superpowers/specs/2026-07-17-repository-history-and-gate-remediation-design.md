@@ -451,8 +451,8 @@ Failure handling:
 
 ## Addendum: SQLite 启动 WAL 顺序与锁错误闭环（2026-07-18）
 
-- 数据流：`DatabaseManager::init(path)` 先用单一 bootstrap 连接请求数据库级 journal mode 切换为 WAL，并读取 SQLite 返回的实际模式；只有返回值严格为 `wal` 才关闭 bootstrap 连接并创建 r2d2 pool。池中每条连接先设置 `busy_timeout`，再设置 connection-local 的 `synchronous` 与 `wal_autocheckpoint`，随后由单一池连接执行既有 migrations/schema 初始化。
-- 失败模式：bootstrap 建连、WAL 请求、返回模式非 WAL、池连接定制、迁移或 schema 初始化任一步失败都必须使 `init` 返回错误；monitor 启动入口记录具体错误并以 2 退出。不得由 r2d2 记录若干 `database is locked` 后重试成功，也不得因 PRAGMA SQL 执行成功就假定 WAL 已生效。
+- 数据流：`DatabaseManager::init(path)` 先用单一 bootstrap 连接请求数据库级 journal mode 切换为 WAL，并读取 SQLite 返回的实际模式；只有返回值严格为 `wal` 才关闭 bootstrap 连接并创建 10 连接 r2d2 pool。初始化代码同时持有并逐条配置全部 10 个连接，依次设置 `busy_timeout`、connection-local `synchronous` 与 `wal_autocheckpoint`；全部成功后才由其中一条连接执行既有 migrations/schema 初始化。运行期 `get_conn` 在返回连接前重复这一幂等配置并直接传播错误。
+- 失败模式：bootstrap 建连、WAL 请求、返回模式非 WAL、10 条初始池连接中的任一 PRAGMA、迁移或 schema 初始化任一步失败都必须使 `init` 返回错误；运行期连接配置失败必须使 `get_conn` 返回错误。禁止把 PRAGMA 放在 r2d2 `CustomizeConnection::on_acquire` 中，因为 r2d2 会指数退避重试并可能掩盖首次失败。monitor 的目录创建和数据库初始化入口都记录具体错误并以 2 退出；不得因 PRAGMA SQL 执行成功就假定 WAL 已生效。
 - 测试 seam：通过编译后的 monitor 进程对全新隔离 SQLite 文件执行 `--test --review`。缺少当日真实 ledger 仍应以 2 fail-closed，但完整输出不得包含 `database is locked`。另以 SQLite `:memory:` 作为公开进程级非 WAL 反例，必须显示实际返回模式并以 2 退出。测试不调用私有 helper，也不暴露新的调用接口。
-- 旧模块关系：保留 `DatabaseManager::init`、现有 migrations、10 连接 pool 与每连接 timeout 设置；只把数据库级 WAL 切换从并发 customizer 移到串行 bootstrap。被删除的孤立 `src/broker/ib.rs` 与 `src/app/context.rs` 不参与数据库初始化。
+- 旧模块关系：保留 `DatabaseManager::init`、`get_conn`、现有 migrations、10 连接 pool 与每连接 timeout 设置；数据库级 WAL 切换位于串行 bootstrap，连接级 PRAGMA 位于数据库管理模块自身，不依赖 r2d2 隐式重试定制器。被删除的孤立 `src/broker/ib.rs` 与 `src/app/context.rs` 不参与数据库初始化。
 - 回滚：`git revert` 本批并重跑 fresh-DB 进程测试；不执行 schema down migration、不删除数据库，也不得用忽略日志或字符串过滤掩盖锁错误。

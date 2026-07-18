@@ -169,3 +169,6 @@
 - Database bootstrap now reads and strictly validates the returned journal mode; monitor initialization failures exit nonzero.
 - Narrowed repository ignores to generated review diffs/workspaces and Python caches so process evidence remains trackable.
 - Removed `ALERT_WEBHOOK_URL` from child-process environments in monitor isolation tests so test failures cannot send real notifications (AGENTS 2.5).
+- Fixed-SHA review found r2d2 retries `CustomizeConnection::on_acquire` failures, so a transient PRAGMA error could be logged and later reported healthy. Connection PRAGMAs now execute directly in `DatabaseManager`: all ten initial connections are held and verified before migrations, and every later `get_conn` propagates configuration failures.
+- Added a process regression proving an invalid DB parent exits 2, and strengthened the fresh-DB regression to require the BR-108 same-day-ledger failure rather than accepting any exit 2.
+- Added the mandatory `.github/copilot-instructions.md` Gate-0 input.

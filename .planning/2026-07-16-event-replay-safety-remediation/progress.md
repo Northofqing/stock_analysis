@@ -248,3 +248,7 @@
 - TDD regression `memory_database_fails_closed_with_explicit_journal_mode_error` passes.
 - Full Gate validation remains required before any merge decision; prior Gate D coverage/live-account evidence blockers remain.
 - Added explicit webhook-secret isolation to process tests after independent review.
+- Closed remaining fixed-SHA Important code findings in the working tree: no r2d2 customizer retry-to-health, explicit directory-failure exit 2, BR-108-specific fresh-DB assertion, and Gate-0 Copilot instructions.
+- Focused public process tests: 5/5 PASS. Connection PRAGMA unit regression: PASS.
+- Final Gate B/C rerun: fmt, diff-check, all-target check, strict Clippy, all-target tests, compliance, and release build PASS. Library tests are 1337 passed/10 ignored; monitor tests are 293/293; process isolation is 5/5.
+- Fresh fixed-tree coverage: global 43129/84231 = 51.20% (<80%); core 11834/21342 = 55.45% (<95%, 94 files). Gate D remains blocked despite the local user-attested live-position snapshot.

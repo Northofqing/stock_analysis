@@ -117,6 +117,11 @@ fn fresh_test_database_starts_without_lock_errors() {
         !combined_output.contains("database is locked"),
         "fresh database startup must not race WAL initialization; output={combined_output}"
     );
+    assert!(
+        combined_output.contains("[复盘][BR-108]")
+            && combined_output.contains("ledger 当日净值缺失"),
+        "fresh database must reach the expected same-day ledger boundary; output={combined_output}"
+    );
 
     std::fs::remove_dir_all(&root).expect("remove isolated working directory");
 }
@@ -156,6 +161,49 @@ fn memory_database_fails_closed_with_explicit_journal_mode_error() {
     assert!(
         combined_output.contains("journal_mode") && combined_output.contains("memory"),
         "non-WAL journal mode must be explicit; output={combined_output}"
+    );
+
+    std::fs::remove_dir_all(&root).expect("remove isolated working directory");
+}
+
+#[test]
+fn database_parent_creation_failure_exits_nonzero() {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let root = std::env::temp_dir().join(format!(
+        "monitor-db-parent-failure-{}-{}",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&root).expect("create isolated working directory");
+    let blocker = root.join("not-a-directory");
+    std::fs::write(&blocker, b"blocks create_dir_all").expect("create blocking regular file");
+    let database_path = blocker.join("fresh.db");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_monitor"))
+        .args(["--test", "--review"])
+        .current_dir(&root)
+        .env("DATABASE_PATH", &database_path)
+        .env_remove("ALERT_WEBHOOK_URL")
+        .env("STOCK_LIST", "TEST_CODE_000001")
+        .env("STOCK_ENV_MODE", "test")
+        .env("MONITOR_ENABLED", "true")
+        .env("V10_DRY_RUN_PUSH", "1")
+        .output()
+        .expect("run monitor with an invalid database parent");
+
+    let combined_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "database parent creation failure must fail closed; output={combined_output}"
+    );
+    assert!(
+        combined_output.contains("[DB init] 创建目录") && combined_output.contains("失败"),
+        "database parent failure must be explicit; output={combined_output}"
     );
 
     std::fs::remove_dir_all(&root).expect("remove isolated working directory");

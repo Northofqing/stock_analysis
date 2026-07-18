@@ -2221,7 +2221,7 @@ async fn main() {
     if let Some(parent) = std::path::Path::new(&db_path).parent() {
         if let Err(error) = std::fs::create_dir_all(parent) {
             log::error!("[DB init] 创建目录 {:?} 失败: {}", parent, error);
-            return;
+            std::process::exit(2);
         }
     }
 

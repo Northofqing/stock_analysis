@@ -129,3 +129,13 @@ Phase 11 (commit all remaining workspace changes and evaluate the final merge ga
 - [x] Implement strict WAL result validation and nonzero DB-init exit.
 - [x] Narrow ignores so process evidence is not hidden.
 - [ ] Re-run full gates and obtain fixed-SHA independent review.
+
+## Final fixed-SHA review closure (2026-07-18)
+
+- [x] Reproduce and fix DB parent creation success-exit bug.
+- [x] Assert the expected BR-108 ledger boundary for fresh DB startup.
+- [x] Remove r2d2 customizer retry-to-health from connection PRAGMAs.
+- [x] Add mandatory Gate-0 Copilot instructions.
+- [ ] Run full Gate B/C/D evidence and request final fixed-SHA review.
+- [x] Run full Gate B/C and regenerate Gate D coverage evidence.
+- [ ] Commit/push and request final fixed-SHA review.
