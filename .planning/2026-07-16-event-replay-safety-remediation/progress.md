@@ -263,3 +263,6 @@
 - No production code has been changed in this phase yet.
 - Added and self-reviewed the Gate D coverage-closure design addendum and executable implementation plan. The selected approach is core-first behavior testing through existing interfaces, with internal seams only where orchestration currently creates dependencies.
 - The plan explicitly rejects threshold reduction, coverage exclusion, assertion-free execution, live production test credentials, missing-value fabrication, and denominator deletion for metric gain.
+- Committed Gate A coverage design/plan as `7c722e1`.
+- Added two passing score characterization tests, then reproduced BR-118 as a public RED test: legacy `近5日: +2.50亿` scores 55 instead of 95 because the label digit enters parsing.
+- Completed root-cause/history/pattern analysis and registered BR-118 before touching production parsing logic.

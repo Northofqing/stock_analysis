@@ -189,3 +189,6 @@
 - `ScoreBreakdown` can cover all scoring branches through real domain structures already owned by the crate: `FinancialPeriod`, `ValuationHistory`, `ConsensusData`, `IndustryBenchmark`, `MoneyFlowSummary`, and `KlineData`. No mock transport or production fallback is needed.
 - `VetoOutcome` can cover revenue decline, CFO/NI divergence, target-price overvaluation, three valuation tiers, one-day money-flow bounce, cap precedence, no-signal behavior, and Markdown rendering through its existing two public functions.
 - These tests should use independently worked expected literals (scores, downgraded advice, cap percentages, required rendered phrases), not recompute implementation formulas inside assertions.
+- Coverage tracer-bullet debugging found a real legacy-path defect: `format_for_prompt` emits `近5日: +2.50亿`, while `parse_5d_net_yi` starts extraction at the label and attempts to parse `5+2.50`. Public `compute` RED evidence is capital-flow 55 instead of the independently expected 95.
+- Git history shows the parser and score bands arrived together in `0d527ea3`; no later regression introduced it. The raw `MoneyFlowSummary` path is unaffected.
+- BR-118 registers the strict correction: parse the complete finite value only after the matched colon and before `亿`; malformed legacy text remains unavailable/neutral rather than extracting arbitrary digits.

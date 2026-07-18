@@ -512,3 +512,10 @@ Failure handling:
 - 测试 seam：通过编译后的 monitor 进程对全新隔离 SQLite 文件执行 `--test --review`。缺少当日真实 ledger 仍应以 2 fail-closed，但完整输出不得包含 `database is locked`。另以 SQLite `:memory:` 作为公开进程级非 WAL 反例，必须显示实际返回模式并以 2 退出。测试不调用私有 helper，也不暴露新的调用接口。
 - 旧模块关系：保留 `DatabaseManager::init`、`get_conn`、现有 migrations、10 连接 pool 与每连接 timeout 设置；数据库级 WAL 切换位于串行 bootstrap，连接级 PRAGMA 位于数据库管理模块自身，不依赖 r2d2 隐式重试定制器。被删除的孤立 `src/broker/ib.rs` 与 `src/app/context.rs` 不参与数据库初始化。
 - 回滚：`git revert` 本批并重跑 fresh-DB 进程测试；不执行 schema down migration、不删除数据库，也不得用忽略日志或字符串过滤掩盖锁错误。
+
+## Addendum: BR-118 旧资金流文本数值边界（2026-07-18）
+
+- 数据流：原始 `MoneyFlowSummary` 保持首选；只有旧调用方仅提供 `format_for_prompt` Markdown 时，评分兼容路径才读取“近5日”字段。解析从 ASCII/中文冒号之后开始，到首个“亿”之前结束，整段必须能严格解析为有限 `f64`。
+- 失败模式：标签中的数字 5、其他段落数字、缺单位、空值、NaN/Inf、尾随说明或非法字符都不得混入数值。解析失败保持资金面中性分，并由上游缺失语义处理，不抽取任意数字、不补 0。
+- 测试 seam：通过公开 `compute(ScoreInputs, KlineData)` 输入生产格式 `主力资金近5日: +2.50亿`，独立断言资金流档位 90 加量比 5 后等于 95；同时覆盖中文冒号和非法输入。
+- 回滚：只可整体回退 BR-118 代码/测试；不得恢复把标签数字送入浮点解析的旧逻辑。
