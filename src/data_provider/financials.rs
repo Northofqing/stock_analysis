@@ -807,4 +807,15 @@ mod br115_tests {
             .is_err()
         );
     }
+
+    #[tokio::test]
+    async fn real_financial_sources_preserve_both_transport_failures() {
+        let client = super::super::unreachable_http_client();
+        let error = fetch_with_fallback_async(&client, "TEST_CODE_000001")
+            .await
+            .expect_err("both real sources are unreachable");
+        let message = error.to_string();
+        assert!(message.contains("EM-F10"));
+        assert!(message.contains("EM-DC"));
+    }
 }

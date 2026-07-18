@@ -362,6 +362,12 @@ pub(super) async fn fetch_lhb_map() -> Result<HashMap<String, f64>, String> {
         .get_today_lhb()
         .await
         .map_err(|error| format!("产业链龙虎榜获取失败: {error}"))?;
+    map_lhb_records(records)
+}
+
+fn map_lhb_records(
+    records: Vec<crate::lhb_analyzer::LhbRecord>,
+) -> Result<HashMap<String, f64>, String> {
     let mut out = HashMap::new();
     for record in records {
         if record.code.trim().is_empty() || !record.net_amount.is_finite() {
@@ -372,6 +378,40 @@ pub(super) async fn fetch_lhb_map() -> Result<HashMap<String, f64>, String> {
         }
     }
     Ok(out)
+}
+
+fn append_after_market_items(
+    items: &mut Vec<String>,
+    theme: &str,
+    results: Vec<crate::search_service::SearchResult>,
+) {
+    for result in results {
+        let date = result.published_date.as_deref().unwrap_or("");
+        let snippet: String = result.snippet.chars().take(100).collect();
+        let item = format!(
+            "- 🔥 **{}** [{}] {}\n  {}",
+            result.title, theme, date, snippet
+        );
+        if !items
+            .iter()
+            .any(|existing| existing.contains(&result.title))
+        {
+            items.push(item);
+        }
+    }
+}
+
+fn render_after_market_section(today: &str, time_label: &str, items: &[String]) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
+    format!(
+        "## 🚨 盘后催化追踪（{} {} 最新动态，{} 条）\n\n{}\n",
+        today,
+        time_label,
+        items.len(),
+        items.join("\n")
+    )
 }
 
 /// 拉取盘后催化快讯，专门用于更新报告时效性。
@@ -400,27 +440,101 @@ pub(super) async fn fetch_after_market_catalysts(top_themes: &[&str]) -> String 
             tokio::time::timeout(std::time::Duration::from_secs(8), svc.search_topic(&q, 2))
                 .await
                 .unwrap_or_default();
-        for r in results {
-            let date = r.published_date.as_deref().unwrap_or("");
-            let snippet: String = r.snippet.chars().take(100).collect();
-            let item = format!("- 🔥 **{}** [{}] {}\n  {}", r.title, theme, date, snippet);
-            if !items.iter().any(|i| i.contains(&r.title)) {
-                items.push(item);
-            }
+        append_after_market_items(&mut items, theme, results);
+    }
+    render_after_market_section(&today_str, time_label, &items)
+}
+
+fn build_cluster_query_context(
+    cluster: &ChainCluster,
+    concepts: &HashMap<String, Vec<String>>,
+) -> (Vec<String>, String) {
+    let leaders: Vec<&str> = cluster
+        .stocks
+        .iter()
+        .take(2)
+        .map(|stock| stock.name.as_str())
+        .collect();
+    let queries = vec![format!(
+        "{} 板块 集体涨停 原因 {}",
+        cluster.concept,
+        leaders.join(" ")
+    )];
+
+    let mut stock_lines = String::new();
+    for stock in cluster.stocks.iter().take(10) {
+        let tags: Vec<&str> = concepts
+            .get(&stock.code)
+            .map(|boards| {
+                boards
+                    .iter()
+                    .filter(|board| !is_generic_board(board))
+                    .map(|board| board.as_str())
+                    .take(6)
+                    .collect()
+            })
+            .unwrap_or_default();
+        stock_lines.push_str(&format!("- {}：{}\n", stock.name, tags.join("、")));
+    }
+    let prompt = format!(
+        r#"今日 A 股「{}」概念 {} 只股票集体涨停（股票及其概念标签）：
+{}
+请推测最可能驱动这次集体涨停的催化事件方向，输出 2-3 条具体的中文新闻搜索词，每行一条，不要编号、不要解释。
+要求：
+- 搜索词必须指向具体事件/商品价格/供给变化/政策/赛事（例："钨 出口管制 价格上涨"、"世界杯 转播权 广告 概念股"、"六氟化钨 停产"）
+- 禁止使用"板块 涨停 原因"这类泛词
+- 从股票组合的共性倒推：这些公司共同的上游、下游或终端场景最近可能发生了什么"#,
+        cluster.concept,
+        cluster.stocks.len(),
+        stock_lines
+    );
+    (queries, prompt)
+}
+
+fn append_generated_cluster_queries(queries: &mut Vec<String>, text: &str) {
+    for line in text.lines() {
+        let query = line
+            .trim()
+            .trim_start_matches(|character: char| {
+                character.is_ascii_digit()
+                    || character == '.'
+                    || character == '-'
+                    || character == '、'
+                    || character == '*'
+            })
+            .trim()
+            .trim_matches('"');
+        let len = query.chars().count();
+        let looks_like_sentence = query.contains('。')
+            || query.contains('，')
+            || query.contains('；')
+            || query.contains('？');
+        if (4..=40).contains(&len) && !looks_like_sentence && queries.len() < 4 {
+            queries.push(query.to_string());
         }
     }
+}
 
-    if items.is_empty() {
-        return String::new();
+fn append_cluster_news_items(
+    seen: &mut HashSet<String>,
+    items: &mut Vec<String>,
+    results: Vec<crate::search_service::SearchResult>,
+) {
+    for result in results {
+        let key: String = result.title.chars().take(20).collect();
+        if !seen.insert(key) {
+            continue;
+        }
+        let published = result.published_date.as_deref().unwrap_or("");
+        let snippet: String = result.snippet.chars().take(150).collect();
+        items.push(format!(
+            "- **{}** {}\n  {}",
+            result.title, published, snippet
+        ));
+        if items.len() >= 10 {
+            break;
+        }
     }
-
-    format!(
-        "## 🚨 盘后催化追踪（{} {} 最新动态，{} 条）\n\n{}\n",
-        today_str,
-        time_label,
-        items.len(),
-        items.join("\n")
-    )
 }
 
 /// 定向检索某主线簇的产业催化新闻（主线级，区别于通用宏观头条）。
@@ -438,46 +552,7 @@ pub(super) async fn fetch_cluster_news(
         return String::new();
     }
 
-    // 默认检索词：板块集体涨停原因
-    let leaders: Vec<&str> = cluster
-        .stocks
-        .iter()
-        .take(2)
-        .map(|s| s.name.as_str())
-        .collect();
-    let mut queries = vec![format!(
-        "{} 板块 集体涨停 原因 {}",
-        cluster.concept,
-        leaders.join(" ")
-    )];
-
-    // LLM 推测催化方向 → 生成事件级搜索词
-    let mut stock_lines = String::new();
-    for s in cluster.stocks.iter().take(10) {
-        let tags: Vec<&str> = concepts
-            .get(&s.code)
-            .map(|bs| {
-                bs.iter()
-                    .filter(|b| !is_generic_board(b))
-                    .map(|b| b.as_str())
-                    .take(6)
-                    .collect()
-            })
-            .unwrap_or_default();
-        stock_lines.push_str(&format!("- {}：{}\n", s.name, tags.join("、")));
-    }
-    let q_prompt = format!(
-        r#"今日 A 股「{}」概念 {} 只股票集体涨停（股票及其概念标签）：
-{}
-请推测最可能驱动这次集体涨停的催化事件方向，输出 2-3 条具体的中文新闻搜索词，每行一条，不要编号、不要解释。
-要求：
-- 搜索词必须指向具体事件/商品价格/供给变化/政策/赛事（例："钨 出口管制 价格上涨"、"世界杯 转播权 广告 概念股"、"六氟化钨 停产"）
-- 禁止使用"板块 涨停 原因"这类泛词
-- 从股票组合的共性倒推：这些公司共同的上游、下游或终端场景最近可能发生了什么"#,
-        cluster.concept,
-        cluster.stocks.len(),
-        stock_lines
-    );
+    let (mut queries, q_prompt) = build_cluster_query_context(cluster, concepts);
     match analyzer
         .call_api_mode(
             &q_prompt,
@@ -486,24 +561,7 @@ pub(super) async fn fetch_cluster_news(
         )
         .await
     {
-        Ok(text) => {
-            for line in text.lines() {
-                let q = line
-                    .trim()
-                    .trim_start_matches(|c: char| {
-                        c.is_ascii_digit() || c == '.' || c == '-' || c == '、' || c == '*'
-                    })
-                    .trim()
-                    .trim_matches('"');
-                // 过滤思考过程泄漏：合法搜索词应当短小、不含句子标点
-                let len = q.chars().count();
-                let looks_like_sentence =
-                    q.contains('。') || q.contains('，') || q.contains('；') || q.contains('？');
-                if (4..=40).contains(&len) && !looks_like_sentence && queries.len() < 4 {
-                    queries.push(q.to_string());
-                }
-            }
-        }
+        Ok(text) => append_generated_cluster_queries(&mut queries, &text),
         Err(e) => warn!(
             "[产业链] 主线「{}」催化搜索词生成失败: {}",
             cluster.concept, e
@@ -527,18 +585,7 @@ pub(super) async fn fetch_cluster_news(
                 continue;
             }
         };
-        for r in results {
-            let key: String = r.title.chars().take(20).collect();
-            if !seen.insert(key) {
-                continue;
-            }
-            let t = r.published_date.as_deref().unwrap_or("");
-            let snippet: String = r.snippet.chars().take(150).collect();
-            items.push(format!("- **{}** {}\n  {}", r.title, t, snippet));
-            if items.len() >= 10 {
-                break;
-            }
-        }
+        append_cluster_news_items(&mut seen, &mut items, results);
         if items.len() >= 10 {
             break;
         }
@@ -549,12 +596,149 @@ pub(super) async fn fetch_cluster_news(
 #[cfg(test)]
 mod tests {
     use super::{
-        fetch_board_code_map_from_hosts, fetch_laggard_candidates_from_hosts,
-        merge_board_code_page, parse_laggard_candidates, parse_push2_http_payload,
-        parse_tool_boards,
+        append_after_market_items, append_cluster_news_items, append_generated_cluster_queries,
+        build_cluster_query_context, fetch_after_market_catalysts, fetch_board_code_map_from_hosts,
+        fetch_cluster_news, fetch_concepts_cached, fetch_laggard_candidates_from_hosts,
+        map_lhb_records, merge_board_code_page, parse_laggard_candidates, parse_push2_http_payload,
+        parse_tool_boards, push2_get_from_hosts, render_after_market_section,
     };
     use serde_json::json;
     use std::collections::{HashMap, HashSet};
+
+    fn search_result(
+        title: impl Into<String>,
+        snippet: impl Into<String>,
+        published_date: Option<&str>,
+    ) -> crate::search_service::SearchResult {
+        crate::search_service::SearchResult {
+            title: title.into(),
+            snippet: snippet.into(),
+            url: "https://example.invalid/test".to_string(),
+            source: "TEST_CODE_SOURCE".to_string(),
+            published_date: published_date.map(str::to_string),
+            news_type: crate::search_service::NewsType::Industry,
+            sentiment: crate::search_service::Sentiment::Neutral,
+            importance: 5,
+            relevance: 1.0,
+            keywords: Vec::new(),
+        }
+    }
+
+    fn lhb(code: &str, net_amount: f64) -> crate::lhb_analyzer::LhbRecord {
+        crate::lhb_analyzer::LhbRecord {
+            code: code.to_string(),
+            name: "测试龙虎榜".to_string(),
+            trade_date: "2026-07-18".to_string(),
+            reason: "测试原因".to_string(),
+            pct_change: 1.0,
+            close_price: 10.0,
+            buy_amount: 2.0,
+            sell_amount: 1.0,
+            net_amount,
+            total_amount: 3.0,
+            lhb_ratio: 10.0,
+            inst_buy_seats: 1,
+            inst_sell_seats: 0,
+            inst_net_amount: 1.0,
+        }
+    }
+
+    #[test]
+    fn lhb_mapping_rejects_bad_or_duplicate_complete_records() {
+        let mapped = map_lhb_records(vec![
+            lhb("TEST_CODE_000001", 12.5),
+            lhb("TEST_CODE_000002", -3.0),
+        ])
+        .expect("complete LHB batch");
+        assert_eq!(mapped["TEST_CODE_000001"], 12.5);
+        assert_eq!(mapped["TEST_CODE_000002"], -3.0);
+        assert!(map_lhb_records(vec![lhb("", 1.0)]).is_err());
+        assert!(map_lhb_records(vec![lhb("TEST_CODE_000001", f64::NAN)]).is_err());
+        assert!(map_lhb_records(vec![
+            lhb("TEST_CODE_000001", 1.0),
+            lhb("TEST_CODE_000001", 2.0),
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn resolved_catalyst_results_deduplicate_truncate_and_render() {
+        let mut items = Vec::new();
+        append_after_market_items(
+            &mut items,
+            "测试主线",
+            vec![
+                search_result("真实催化A", "甲".repeat(120), Some("2026-07-18")),
+                search_result("真实催化A", "重复", None),
+                search_result("真实催化B", "乙", None),
+            ],
+        );
+        assert_eq!(items.len(), 2);
+        assert!(items[0].contains("测试主线"));
+        assert!(!items[0].contains(&"甲".repeat(101)));
+        assert!(render_after_market_section("07月18日", "盘后", &[]).is_empty());
+        let section = render_after_market_section("07月18日", "盘后", &items);
+        assert!(section.contains("2 条"));
+        assert!(section.contains("真实催化A"));
+    }
+
+    #[test]
+    fn cluster_query_protocol_and_result_dedup_keep_registered_limits() {
+        let cluster = super::super::ChainCluster {
+            concept: "TEST_CODE_固态电池".to_string(),
+            aliases: Vec::new(),
+            stocks: vec![
+                crate::market_data::TopStock {
+                    code: "TEST_CODE_000001".to_string(),
+                    name: "测试甲".to_string(),
+                    ..Default::default()
+                },
+                crate::market_data::TopStock {
+                    code: "TEST_CODE_000002".to_string(),
+                    name: "测试乙".to_string(),
+                    ..Default::default()
+                },
+            ],
+            continuation_count: 0,
+            streak_days: 0,
+            candidates: Vec::new(),
+            score: None,
+            scenario: None,
+        };
+        let concepts = HashMap::from([
+            (
+                "TEST_CODE_000001".to_string(),
+                vec!["融资融券".to_string(), "固态电池设备".to_string()],
+            ),
+            ("TEST_CODE_000002".to_string(), vec!["电解质".to_string()]),
+        ]);
+        let (mut queries, prompt) = build_cluster_query_context(&cluster, &concepts);
+        assert_eq!(queries.len(), 1);
+        assert!(queries[0].contains("测试甲 测试乙"));
+        assert!(prompt.contains("固态电池设备"));
+        assert!(!prompt.contains("融资融券、固态电池设备"));
+        append_generated_cluster_queries(
+            &mut queries,
+            "1. 电解质 扩产\n- 固态电池 政策\n这是完整句子，应该被拒绝。\nx\n* 原材料 涨价",
+        );
+        assert_eq!(queries.len(), 4);
+        assert!(queries.iter().any(|query| query == "电解质 扩产"));
+        assert!(!queries.iter().any(|query| query.contains("应该被拒绝")));
+
+        let mut seen = HashSet::new();
+        let mut items = Vec::new();
+        let mut results: Vec<_> = (0..12)
+            .map(|index| search_result(format!("真实产业新闻{index}"), "摘要".repeat(100), None))
+            .collect();
+        results.insert(
+            1,
+            search_result("真实产业新闻0", "重复", Some("2026-07-18")),
+        );
+        append_cluster_news_items(&mut seen, &mut items, results);
+        assert_eq!(items.len(), 10);
+        assert_eq!(seen.len(), 10);
+        assert!(!items[0].contains(&"摘要".repeat(76)));
+    }
 
     #[test]
     fn tool_board_batch_deduplicates_only_complete_nonempty_strings() {
@@ -720,5 +904,84 @@ mod tests {
                 .await
                 .is_err()
         );
+
+        let hosts = ["http://127.0.0.1:9"];
+        let client = crate::data_provider::unreachable_http_client();
+        let push_error = push2_get_from_hosts(&client, &[], &hosts)
+            .await
+            .expect_err("unreachable push2 transport must fail explicitly");
+        assert!(push_error.contains("所有主机失败"));
+        assert!(push_error.contains("request error"));
+        assert!(fetch_board_code_map_from_hosts(&hosts).await.is_err());
+        assert!(
+            fetch_laggard_candidates_from_hosts("BK0001", &HashSet::new(), &hosts)
+                .await
+                .is_err()
+        );
+        assert!(fetch_concepts_cached(&[]).await.is_err());
+        assert!(fetch_concepts_cached(&[String::new()]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cached_concepts_and_parsed_protocols_cover_success_boundaries() {
+        crate::database::DatabaseManager::init(None).expect("test database initialization");
+        let db = crate::database::DatabaseManager::try_get().expect("test database");
+        let cached_code = "TEST_CODE_CHAIN_CACHE_000001";
+        let cached = vec!["TEST_CODE_固态电池".to_string()];
+        db.save_stock_concepts(cached_code, &cached)
+            .expect("cache isolated concepts");
+        let concepts = fetch_concepts_cached(&[cached_code.to_string()])
+            .await
+            .expect("complete cache hit must avoid external transport");
+        assert_eq!(concepts.get(cached_code), Some(&cached));
+
+        let board_page = json!({"data":{"diff":[
+            {"f12":"BK0001","f14":"TEST_CODE_板块0001"},
+            {"f12":"BK0002","f14":"TEST_CODE_板块0002"}
+        ]}});
+        let mut board_map = HashMap::new();
+        let mut board_codes = HashSet::new();
+        assert_eq!(
+            merge_board_code_page(&mut board_map, &mut board_codes, &board_page, 1),
+            Ok(2)
+        );
+        assert_eq!(board_map.len(), 2);
+
+        let constituent_body = json!({"data":{"diff":[
+            {"f12":"100001","f14":"测试候选","f3":3.0,"f2":10.0}
+        ]}});
+        let candidates = parse_laggard_candidates(&constituent_body, "BK0500", &HashSet::new())
+            .expect("complete constituent protocol");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].code, "100001");
+    }
+
+    #[tokio::test]
+    async fn unavailable_search_service_returns_no_catalyst_or_cluster_news() {
+        if crate::search_service::get_search_service().is_available() {
+            return;
+        }
+        assert!(fetch_after_market_catalysts(&["TEST_CODE_主题"])
+            .await
+            .is_empty());
+        let analyzer = crate::analyzer::GeminiAnalyzer::new(crate::analyzer::GeminiConfig {
+            max_retries: 1,
+            retry_delay: 0.0,
+            request_delay: 0.0,
+            ..crate::analyzer::GeminiConfig::default()
+        });
+        let cluster = super::super::ChainCluster {
+            concept: "TEST_CODE_主题".to_string(),
+            aliases: Vec::new(),
+            stocks: Vec::new(),
+            continuation_count: 0,
+            streak_days: 0,
+            candidates: Vec::new(),
+            score: None,
+            scenario: None,
+        };
+        assert!(fetch_cluster_news(&analyzer, &cluster, &HashMap::new())
+            .await
+            .is_empty());
     }
 }

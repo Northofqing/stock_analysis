@@ -308,3 +308,140 @@ analysis_summary, key_points, risk_warning, buy_reason
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn analyzer() -> GeminiAnalyzer {
+        GeminiAnalyzer::new(crate::analyzer::GeminiConfig {
+            max_retries: 1,
+            retry_delay: 0.0,
+            request_delay: 0.0,
+            ..crate::analyzer::GeminiConfig::default()
+        })
+    }
+
+    fn context(pe: f64, pb: f64, turnover: f64) -> HashMap<String, Value> {
+        HashMap::from([
+            ("code".to_string(), json!("TEST_CODE_000001")),
+            ("date".to_string(), json!("2026-07-18")),
+            (
+                "today".to_string(),
+                json!({
+                    "close": 10.5,
+                    "pct_chg": 1.5,
+                    "volume": 123456.0,
+                    "ma5": 10.0,
+                    "ma10": 9.8,
+                    "ma20": 9.5,
+                    "pe_ratio": pe,
+                    "pb_ratio": pb,
+                    "turnover_rate": turnover,
+                    "market_cap": 200.0,
+                    "circulating_cap": 150.0
+                }),
+            ),
+        ])
+    }
+
+    #[test]
+    fn prompt_renders_all_profitability_bands_and_missing_news() {
+        let analyzer = analyzer();
+        for (pe, pb, turnover, expected) in [
+            (-1.0, 0.5, 2.0, "亏损"),
+            (10.0, 2.0, 5.0, "估值合理"),
+            (20.0, 4.0, 11.0, "估值适中"),
+            (40.0, 4.0, 11.0, "估值偏高"),
+        ] {
+            let prompt = analyzer.format_prompt(&context(pe, pb, turnover), "测试股票", None);
+            assert!(prompt.contains("TEST_CODE_000001"));
+            assert!(prompt.contains(expected));
+            assert!(prompt.contains("未搜索到该股票近期"));
+            assert!(prompt.contains("决策仪表盘"));
+        }
+
+        let prompt = analyzer.format_prompt(
+            &context(10.0, 2.0, 5.0),
+            "测试股票",
+            Some("TEST_CODE_真实新闻上下文"),
+        );
+        assert!(prompt.contains("TEST_CODE_真实新闻上下文"));
+
+        let minimal = HashMap::new();
+        let prompt = analyzer.format_prompt(&minimal, "未知股票", None);
+        assert!(prompt.contains("Unknown"));
+        assert!(prompt.contains("未知"));
+        assert!(!prompt.contains("今日行情"));
+    }
+
+    #[test]
+    fn response_parser_accepts_fenced_json_and_preserves_all_fields() {
+        let response = r#"```json
+        {
+          "sentiment_score": 88,
+          "trend_prediction": "看多",
+          "operation_advice": "观望",
+          "confidence_level": "高",
+          "dashboard": {"risk":"medium"},
+          "trend_analysis": "趋势",
+          "short_term_outlook": "短期",
+          "medium_term_outlook": "中期",
+          "technical_analysis": "技术",
+          "ma_analysis": "均线",
+          "volume_analysis": "量能",
+          "pattern_analysis": "形态",
+          "fundamental_analysis": "基本面",
+          "sector_position": "板块",
+          "company_highlights": "亮点",
+          "news_summary": "新闻",
+          "market_sentiment": "情绪",
+          "hot_topics": "热点",
+          "analysis_summary": "总结",
+          "key_points": "要点",
+          "risk_warning": "风险",
+          "buy_reason": "理由",
+          "search_performed": true,
+          "data_sources": "真实来源"
+        }
+        ```"#;
+        let result = analyzer().parse_response(response, "TEST_CODE_000001", "测试股票");
+        assert_eq!(result.sentiment_score, 88);
+        assert_eq!(result.trend_prediction, "看多");
+        assert_eq!(result.analysis_summary, "总结");
+        assert_eq!(result.dashboard, Some(json!({"risk":"medium"})));
+        assert!(result.search_performed);
+        assert!(result.success);
+
+        let defaults = analyzer().parse_response("{}", "TEST_CODE_000002", "默认股票");
+        assert_eq!(defaults.sentiment_score, 50);
+        assert_eq!(defaults.trend_prediction, "震荡");
+        assert_eq!(defaults.operation_advice, "持有");
+        assert_eq!(defaults.confidence_level, "中");
+    }
+
+    #[test]
+    fn text_fallback_classifies_positive_negative_neutral_and_bounds_summary() {
+        let analyzer = analyzer();
+        let positive =
+            analyzer.parse_response("非 JSON：看多 买入 上涨 突破", "TEST_CODE_000001", "正面");
+        assert_eq!(positive.sentiment_score, 65);
+        assert_eq!(positive.operation_advice, "买入");
+
+        let negative =
+            analyzer.parse_response("{bad json} 看空 卖出 下跌 跌破", "TEST_CODE_000002", "负面");
+        assert_eq!(negative.sentiment_score, 35);
+        assert_eq!(negative.operation_advice, "卖出");
+
+        let neutral = analyzer.parse_response("信息有限", "TEST_CODE_000003", "中性");
+        assert_eq!(neutral.sentiment_score, 50);
+        assert_eq!(neutral.operation_advice, "持有");
+
+        let long = "x".repeat(600);
+        let bounded = analyzer.parse_response(&long, "TEST_CODE_000004", "长文本");
+        assert_eq!(bounded.analysis_summary.len(), 500);
+        assert_eq!(bounded.confidence_level, "低");
+        assert!(bounded.key_points.contains("JSON解析失败"));
+    }
+}

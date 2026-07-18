@@ -251,6 +251,40 @@ impl RustdxProvider {
         Ok(kline_data)
     }
 
+    fn assemble_daily_data(
+        code: &str,
+        mut kline_data: Vec<KlineData>,
+        quote_result: std::result::Result<Option<RealtimeQuote>, String>,
+    ) -> Vec<KlineData> {
+        super::halt_status::infer_halt_from_kline_gaps(code, &kline_data);
+        super::limit_status::apply_limit_flags_inplace(code, None, &mut kline_data);
+
+        if !kline_data.is_empty() {
+            use crate::sharpe_calculator;
+
+            kline_data.reverse();
+            sharpe_calculator::update_sharpe_ratios(&mut kline_data, Some(60), Some(0.03));
+            kline_data.reverse();
+        }
+
+        match quote_result {
+            Ok(Some(quote)) => {
+                if let Some(latest) = kline_data.first_mut() {
+                    latest.intraday_price = Some(quote.price);
+                    latest.settled = false;
+                    latest.pe_ratio = latest.pe_ratio.or(quote.pe_ratio);
+                    latest.pb_ratio = latest.pb_ratio.or(quote.pb_ratio);
+                    latest.turnover_rate = latest.turnover_rate.or(quote.turnover_rate);
+                    latest.market_cap = latest.market_cap.or(quote.market_cap);
+                    latest.circulating_cap = latest.circulating_cap.or(quote.circulating_cap);
+                }
+            }
+            Err(error) => warn!("[通达信] 无法从腾讯财经获取 {code} 的盈利指标: {error}"),
+            Ok(None) => warn!("[通达信] 腾讯财经未返回 {code} 的盈利指标"),
+        }
+        kline_data
+    }
+
     /// 获取实时行情（内部方法）
     fn fetch_realtime_internal(&self, code: &str) -> Result<Option<RealtimeQuote>> {
         // rustdx-complete 1.0.0 decodes the realtime timestamp as zero. It
@@ -264,69 +298,12 @@ impl DataProvider for RustdxProvider {
     fn get_daily_data(&self, code: &str, days: usize) -> Result<Vec<KlineData>> {
         info!("[通达信] 获取股票 {} 最近 {} 天数据", code, days);
 
-        let mut kline_data = self.fetch_kline_internal(code, days)?;
-
-        // v11-P0-3 commit 2: K 线缺口推断 → 喂入 HALTED_PERIODS, 供 is_halted_period 查询
-        super::halt_status::infer_halt_from_kline_gaps(code, &kline_data);
-
-        // 填涨跌停 / 停牌标记（在夏普和实时报价前先填，因为夏普的 close 改写可能影响）
-        super::limit_status::apply_limit_flags_inplace(code, None, &mut kline_data);
-
-        // 计算夏普比率（使用60天滚动窗口）
-        if !kline_data.is_empty() {
-            use crate::sharpe_calculator;
-
-            // 数据是降序的（最新在前），反转来计算，原地反转避免 clone
-            kline_data.reverse();
-            sharpe_calculator::update_sharpe_ratios(&mut kline_data, Some(60), Some(0.03));
-            kline_data.reverse();
-
-            if let Some(latest) = kline_data.first() {
-                if let Some(sharpe) = latest.sharpe_ratio {
-                    debug!("[通达信] {} 夏普比率: {:.4}", code, sharpe);
-                }
-            }
-        }
-
-        // 尝试从腾讯财经获取实时行情补充盈利指标
-        // 因为通达信不提供PE、PB、换手率、市值等财务指标
-        if !kline_data.is_empty() {
-            info!("[通达信] 尝试从腾讯财经补充盈利指标");
-            match self.gtimg_provider.fetch_realtime_quote(code) {
-                Ok(Some(quote)) => {
-                    if let Some(latest) = kline_data.first_mut() {
-                        // 修复 P1.8: 不再覆盖 latest.close (会污染 Sharpe 计算)
-                        // 之前: latest.close = quote.price (盘中价覆盖 settled close)
-                        //       → sharpe_calculator 用盘中价当 settled close 计算
-                        //       → 60 日 Sharpe 实际是盘中波动率, 不是日线收益
-                        // 现在: 盘中价存在 intraday_price, close 保持日线 settled
-                        // 标记 settled=false (盘中期)
-                        let old_close = latest.close;
-                        latest.intraday_price = Some(quote.price);
-                        latest.settled = false; // 盘中期, 不是 settled close
-
-                        // 补充盈利指标
-                        latest.pe_ratio = latest.pe_ratio.or(quote.pe_ratio);
-                        latest.pb_ratio = latest.pb_ratio.or(quote.pb_ratio);
-                        latest.turnover_rate = latest.turnover_rate.or(quote.turnover_rate);
-                        latest.market_cap = latest.market_cap.or(quote.market_cap);
-                        latest.circulating_cap = latest.circulating_cap.or(quote.circulating_cap);
-
-                        info!("[通达信+腾讯] {} 价格: close={:.2}元 (盘中={:.2}元), PE={:?}, PB={:?}, 换手率={:?}%, 总市值={:?}亿, 流通市值={:?}亿",
-                            code, old_close, quote.price, quote.pe_ratio, quote.pb_ratio,
-                            quote.turnover_rate, quote.market_cap, quote.circulating_cap);
-                    }
-                }
-                Err(e) => {
-                    warn!("[通达信] 无法从腾讯财经获取 {} 的盈利指标: {}", code, e);
-                }
-                Ok(None) => {
-                    warn!("[通达信] 腾讯财经未返回 {} 的盈利指标", code);
-                }
-            }
-        }
-
-        Ok(kline_data)
+        let kline_data = self.fetch_kline_internal(code, days)?;
+        let quote_result = self
+            .gtimg_provider
+            .fetch_realtime_quote(code)
+            .map_err(|error| error.to_string());
+        Ok(Self::assemble_daily_data(code, kline_data, quote_result))
     }
 
     fn get_stock_name(&self, _code: &str) -> Option<String> {
@@ -452,6 +429,100 @@ mod tests {
         assert!(error.to_string().contains("没有返回K线数据"));
         assert_eq!(provider.get_stock_name("TEST_CODE_000001"), None);
         assert_eq!(provider.name(), "通达信");
+    }
+
+    fn quote() -> RealtimeQuote {
+        RealtimeQuote {
+            code: "TEST_CODE_600000".to_string(),
+            name: "测试行情".to_string(),
+            price: 12.5,
+            pct_chg: 1.0,
+            pe_ratio: Some(15.0),
+            pb_ratio: Some(2.0),
+            turnover_rate: Some(3.0),
+            market_cap: Some(100.0),
+            circulating_cap: Some(80.0),
+            volume: Some(1_000.0),
+            amount: Some(12_500.0),
+            limit_up_price: Some(13.0),
+            limit_down_price: Some(10.0),
+            source_time: chrono::Utc::now(),
+        }
+    }
+
+    fn settled_history(days: usize) -> Vec<KlineData> {
+        let base = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        (0..days)
+            .rev()
+            .map(|day| {
+                let close = 10.0 + day as f64 * 0.02;
+                KlineData {
+                    date: base + chrono::Duration::days(day as i64),
+                    open: close,
+                    high: close + 0.1,
+                    low: close - 0.1,
+                    close,
+                    volume: 1_000.0,
+                    amount: close * 1_000.0,
+                    pct_chg: 0.2,
+                    intraday_price: None,
+                    settled: true,
+                    pe_ratio: None,
+                    pb_ratio: None,
+                    turnover_rate: None,
+                    market_cap: None,
+                    circulating_cap: None,
+                    eps: None,
+                    roe: None,
+                    revenue_yoy: None,
+                    net_profit_yoy: None,
+                    gross_margin: None,
+                    net_margin: None,
+                    sharpe_ratio: None,
+                    financials_history: None,
+                    valuation_history: None,
+                    consensus: None,
+                    industry: None,
+                    is_limit_up: false,
+                    is_limit_down: false,
+                    is_suspended: false,
+                    adjust: crate::data_provider::AdjustType::None,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn resolved_daily_assembly_preserves_settled_close_and_nullable_quote_evidence() {
+        let mut history = settled_history(65);
+        history[0].pe_ratio = Some(99.0);
+        let settled_close = history[0].close;
+        let complete =
+            RustdxProvider::assemble_daily_data("TEST_CODE_600000", history, Ok(Some(quote())));
+        assert_eq!(complete[0].close, settled_close);
+        assert_eq!(complete[0].intraday_price, Some(12.5));
+        assert!(!complete[0].settled);
+        assert_eq!(complete[0].pe_ratio, Some(99.0));
+        assert_eq!(complete[0].pb_ratio, Some(2.0));
+        assert!(complete[0].sharpe_ratio.is_some());
+
+        let absent =
+            RustdxProvider::assemble_daily_data("TEST_CODE_600001", settled_history(2), Ok(None));
+        assert!(absent[0].intraday_price.is_none());
+        assert!(absent[0].settled);
+
+        let failed = RustdxProvider::assemble_daily_data(
+            "TEST_CODE_600002",
+            settled_history(2),
+            Err("TEST_CODE_quote_source_failed".to_string()),
+        );
+        assert!(failed[0].intraday_price.is_none());
+        assert!(RustdxProvider::assemble_daily_data(
+            "TEST_CODE_600003",
+            Vec::new(),
+            Ok(Some(quote()))
+        )
+        .is_empty());
     }
 
     #[test]

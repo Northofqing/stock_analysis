@@ -23,6 +23,16 @@ struct AnnData {
     list: Vec<AnnItem>,
 }
 
+#[derive(Debug, Deserialize)]
+struct DetailResponse {
+    data: Option<DetailData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DetailData {
+    content: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 struct AnnItem {
     art_code: String,
@@ -450,6 +460,45 @@ fn validate_announcement_response(resp: AnnResponse) -> Result<Vec<AnnItem>> {
     Ok(list)
 }
 
+fn parse_announcement_http_response(
+    status: u16,
+    body: std::result::Result<String, String>,
+) -> Result<Vec<AnnItem>> {
+    if !(200..300).contains(&status) {
+        return Err(anyhow::anyhow!("公告 HTTP 状态异常: {status}"));
+    }
+    let body = body.map_err(|error| anyhow::anyhow!("公告正文读取失败: {error}"))?;
+    if body.trim().is_empty() {
+        return Err(anyhow::anyhow!("公告响应正文为空"));
+    }
+    let response: AnnResponse = serde_json::from_str(&body)
+        .map_err(|error| anyhow::anyhow!("公告响应 JSON 非法: {error}"))?;
+    validate_announcement_response(response)
+}
+
+fn parse_announcement_detail_http_response(
+    status: u16,
+    body: std::result::Result<String, String>,
+    art_code: &str,
+) -> Result<String> {
+    if !(200..300).contains(&status) {
+        return Err(anyhow::anyhow!(
+            "ann detail {art_code} HTTP status {status}"
+        ));
+    }
+    let body = body.map_err(|error| anyhow::anyhow!("ann detail {art_code} read: {error}"))?;
+    if body.trim().is_empty() {
+        return Err(anyhow::anyhow!("ann detail {art_code} empty body"));
+    }
+    let response: DetailResponse = serde_json::from_str(&body)
+        .map_err(|error| anyhow::anyhow!("ann detail {art_code} json: {error}"))?;
+    response
+        .data
+        .and_then(|data| data.content)
+        .filter(|content| !content.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("ann detail {art_code} missing content"))
+}
+
 fn detail_art_codes(list: &[AnnItem]) -> Vec<String> {
     list.iter()
         .filter_map(|item| {
@@ -515,29 +564,34 @@ fn assemble_announcements(
 
 /// review #15: 改 async + FuturesUnordered 并发 fetch_ann_detail.
 pub async fn fetch_announcements(date: Option<&str>) -> Result<Vec<Announcement>> {
+    let client = crate::http_client::SHARED_HTTP_CLIENT.clone();
+    fetch_announcements_with_client(&client, date).await
+}
+
+async fn fetch_announcements_with_client(
+    client: &reqwest::Client,
+    date: Option<&str>,
+) -> Result<Vec<Announcement>> {
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let date_str = date.unwrap_or(&today);
     chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
         .map_err(|error| anyhow::anyhow!("公告查询日期非法 {date_str:?}: {error}"))?;
-
-    let client = crate::http_client::SHARED_HTTP_CLIENT.clone();
 
     let url = format!(
         "{}?page_size={}&page_index=1&ann_type=SHA,SZA&start_date={}&end_date={}",
         ANNOUNCE_URL, MAX_PER_FETCH, date_str, date_str
     );
 
-    let resp: AnnResponse = client
+    let response = client
         .get(&url)
         .header("User-Agent", "Mozilla/5.0")
         .header("Referer", "https://data.eastmoney.com/")
         .send()
-        .await?
-        .error_for_status()?
-        .json()
         .await?;
+    let status = response.status().as_u16();
+    let body = response.text().await.map_err(|error| error.to_string());
 
-    let list = validate_announcement_response(resp)?;
+    let list = parse_announcement_http_response(status, body)?;
     info!("[公告] {} 获取 {} 条", date_str, list.len());
 
     // 熔断：超 200 条仅标题扫描
@@ -546,7 +600,7 @@ pub async fn fetch_announcements(date: Option<&str>) -> Result<Vec<Announcement>
     }
 
     // review #15: 高危公告 body 拉取改成 FuturesUnordered 并发, 不再串行 N × 10s.
-    let client_arc = Arc::new(client);
+    let client_arc = Arc::new(client.clone());
     let detail_futures = detail_art_codes(&list);
     let detail_results = futures::future::join_all(detail_futures.iter().map(|art_code| {
         let c = Arc::clone(&client_arc);
@@ -576,31 +630,15 @@ async fn fetch_ann_detail(client: &reqwest::Client, art_code: &str) -> Result<St
         "https://np-anotice-stock.eastmoney.com/api/security/ann/detail?art_code={}",
         art_code
     );
-    #[derive(Deserialize)]
-    struct DetailResp {
-        data: Option<DetailData>,
-    }
-    #[derive(Deserialize)]
-    struct DetailData {
-        content: Option<String>,
-    }
-
-    let resp: DetailResp = client
+    let response = client
         .get(&url)
         .header("User-Agent", "Mozilla/5.0")
         .header("Referer", "https://data.eastmoney.com/")
         .send()
-        .await?
-        .error_for_status()
-        .map_err(|e| anyhow::anyhow!("ann detail HTTP error: {}", e))?
-        .json()
-        .await
-        .map_err(|e| anyhow::anyhow!("ann detail json: {}", e))?;
-
-    resp.data
-        .and_then(|data| data.content)
-        .filter(|content| !content.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("ann detail {art_code} missing content"))
+        .await?;
+    let status = response.status().as_u16();
+    let body = response.text().await.map_err(|error| error.to_string());
+    parse_announcement_detail_http_response(status, body, art_code)
 }
 
 #[cfg(test)]
@@ -673,6 +711,64 @@ mod tests {
             r#"{"data":{"list":[{"art_code":"A1","title":"公告","notice_date":"2026-07-18","codes":[{"stock_code":"000001","short_name":" "}]}]}}"#,
         ] {
             assert!(validated(raw).is_err(), "unexpectedly accepted {raw}");
+        }
+    }
+
+    #[test]
+    fn announcement_http_response_requires_complete_success_body() {
+        let complete = r#"{"data":{"list":[{"art_code":"AN-HTTP","title":"关于回购股份的公告","notice_date":"2026-07-18","codes":[{"stock_code":"000001","short_name":"协议样本"}],"columns":null}]}}"#;
+        let rows = parse_announcement_http_response(200, Ok(complete.to_string())).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].art_code, "AN-HTTP");
+
+        for result in [
+            parse_announcement_http_response(503, Ok(complete.to_string())),
+            parse_announcement_http_response(200, Err("断流".to_string())),
+            parse_announcement_http_response(200, Ok(String::new())),
+            parse_announcement_http_response(200, Ok("<html>限流</html>".to_string())),
+            parse_announcement_http_response(200, Ok(r#"{"data":null}"#.to_string())),
+        ] {
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn announcement_detail_http_response_requires_non_empty_content() {
+        assert_eq!(
+            parse_announcement_detail_http_response(
+                200,
+                Ok(r#"{"data":{"content":"完整公告正文"}}"#.to_string()),
+                "AN-DETAIL",
+            )
+            .unwrap(),
+            "完整公告正文"
+        );
+
+        for result in [
+            parse_announcement_detail_http_response(
+                404,
+                Ok(r#"{"data":{"content":"正文"}}"#.to_string()),
+                "AN-DETAIL",
+            ),
+            parse_announcement_detail_http_response(200, Err("断流".to_string()), "AN-DETAIL"),
+            parse_announcement_detail_http_response(200, Ok(String::new()), "AN-DETAIL"),
+            parse_announcement_detail_http_response(
+                200,
+                Ok("<html>错误</html>".to_string()),
+                "AN-DETAIL",
+            ),
+            parse_announcement_detail_http_response(
+                200,
+                Ok(r#"{"data":null}"#.to_string()),
+                "AN-DETAIL",
+            ),
+            parse_announcement_detail_http_response(
+                200,
+                Ok(r#"{"data":{"content":" "}}"#.to_string()),
+                "AN-DETAIL",
+            ),
+        ] {
+            assert!(result.is_err());
         }
     }
 
@@ -880,5 +976,21 @@ mod tests {
             "测试",
         );
         assert_eq!(lvl, AnnLevel::Important);
+    }
+
+    #[tokio::test]
+    async fn announcement_transport_and_query_date_fail_closed() {
+        let client = super::super::unreachable_http_client();
+        assert!(fetch_announcements_with_client(&client, Some("bad-date"))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("日期非法"));
+        assert!(fetch_announcements_with_client(&client, Some("2026-07-18"))
+            .await
+            .is_err());
+        assert!(fetch_ann_detail(&client, "TEST_CODE_ARTICLE")
+            .await
+            .is_err());
     }
 }

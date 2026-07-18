@@ -691,8 +691,12 @@ mod tests {
     };
     use crate::data_provider::{AdjustType, KlineData};
     use crate::notification::{NotificationConfig, NotificationService};
+    use crate::traits::ScoreDisplay;
     use chrono::NaiveDate;
+    use once_cell::sync::Lazy;
     use std::sync::Arc;
+
+    static DEEP_ENV_LOCK: Lazy<std::sync::Mutex<()>> = Lazy::new(|| std::sync::Mutex::new(()));
 
     fn result() -> AnalysisResult {
         serde_json::from_value(serde_json::json!({
@@ -815,6 +819,82 @@ mod tests {
         let report = pipeline.generate_single_report(&result());
         assert!(report.contains("TEST_CODE_示例(TEST_CODE_000001)"));
         assert!(report.contains("TEST_CODE_分析正文"));
+    }
+
+    #[tokio::test]
+    async fn deep_enrichment_guards_do_not_start_external_analysis() {
+        let _guard = DEEP_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = PipelineConfig {
+            max_workers: 1,
+            dry_run: false,
+            send_notification: false,
+            single_notify: false,
+            ..Default::default()
+        };
+        let pipeline = AnalysisPipeline::new(config).expect("pipeline constructor");
+
+        let previous = std::env::var("DEEP_ANALYSIS_MAX").ok();
+        let previous_concurrency = std::env::var("DEEP_ANALYSIS_CONCURRENCY").ok();
+        std::env::remove_var("DEEP_ANALYSIS_MAX");
+        let mut empty = Vec::new();
+        pipeline
+            .enrich_key_stocks_with_deep_analysis(&mut empty)
+            .await;
+
+        std::env::set_var("DEEP_ANALYSIS_MAX", "0");
+        let mut guarded = vec![result()];
+        guarded[0].ranking_score = 100;
+        pipeline
+            .enrich_key_stocks_with_deep_analysis(&mut guarded)
+            .await;
+
+        std::env::set_var("DEEP_ANALYSIS_MAX", "1");
+        std::env::set_var("DEEP_ANALYSIS_CONCURRENCY", "1");
+        guarded[0].deep_seed = Some(crate::deep_analyzer::DeepAnalysisSeed {
+            code: "TEST_CODE_000001".to_string(),
+            name: "TEST_CODE_示例".to_string(),
+            kline: Arc::new(Vec::new()),
+            extra_context: None,
+            news_context: None,
+            macro_context: None,
+            fundamental_ctx: None,
+            trend_snapshot: crate::deep_analyzer::TrendSnapshot {
+                trend_status: "TEST_CODE_缺失批次".to_string(),
+                ma_alignment: "TEST_CODE_缺失".to_string(),
+                trend_strength: 0.0,
+                bias_ma5: 0.0,
+                volume_status: "TEST_CODE_缺失".to_string(),
+                volume_ratio_5d: 0.0,
+                support_levels: Vec::new(),
+                resistance_levels: Vec::new(),
+                evidence_reasons: Vec::new(),
+                risk_factors: Vec::new(),
+            },
+        });
+        pipeline
+            .enrich_key_stocks_with_deep_analysis(&mut guarded)
+            .await;
+        if let Some(value) = previous {
+            std::env::set_var("DEEP_ANALYSIS_MAX", value);
+        } else {
+            std::env::remove_var("DEEP_ANALYSIS_MAX");
+        }
+        if let Some(value) = previous_concurrency {
+            std::env::set_var("DEEP_ANALYSIS_CONCURRENCY", value);
+        } else {
+            std::env::remove_var("DEEP_ANALYSIS_CONCURRENCY");
+        }
+        assert_eq!(guarded[0].analysis_summary, "TEST_CODE_分析正文");
+    }
+
+    #[test]
+    fn analysis_result_score_display_delegation_is_stable() {
+        let value = result();
+        assert_eq!(value.sentiment_score(), 50);
+        assert_eq!(value.operation_advice(), "观望");
+        assert_eq!(value.get_emoji(), value.score_emoji());
     }
 
     #[test]

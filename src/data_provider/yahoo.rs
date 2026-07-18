@@ -119,6 +119,21 @@ pub fn fetch_quotes(codes: &[String]) -> Result<Vec<YahooQuote>, String> {
         return Ok(vec![]);
     }
 
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .map_err(|error| format!("build Yahoo client: {error}"))?;
+    fetch_quotes_with_client(&client, codes)
+}
+
+fn fetch_quotes_with_client(
+    client: &reqwest::blocking::Client,
+    codes: &[String],
+) -> Result<Vec<YahooQuote>, String> {
+    if codes.is_empty() {
+        return Ok(vec![]);
+    }
+
     // 构建符号列表和反向映射
     let mut symbol_map: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
@@ -135,14 +150,6 @@ pub fn fetch_quotes(codes: &[String]) -> Result<Vec<YahooQuote>, String> {
         "https://query1.finance.yahoo.com/v7/finance/quote?symbols={}",
         symbols.join(",")
     );
-
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
-        .build()
-    {
-        Ok(c) => c,
-        Err(error) => return Err(format!("build Yahoo client: {error}")),
-    };
 
     let response = client
         .get(&url)
@@ -262,6 +269,10 @@ mod tests {
     #[test]
     fn test_fetch_empty() {
         assert!(fetch_quotes(&[]).expect("empty request").is_empty());
+        let client = reqwest::blocking::Client::new();
+        assert!(fetch_quotes_with_client(&client, &[])
+            .expect("empty injected request")
+            .is_empty());
     }
 
     #[test]
@@ -325,5 +336,18 @@ mod tests {
             format_overnight_data(&quotes).expect("complete flat snapshot"),
             ("持平".to_string(), "持平".to_string())
         );
+    }
+
+    #[test]
+    fn yahoo_transport_failure_is_not_an_empty_quote_batch() {
+        let client = reqwest::blocking::Client::builder()
+            .proxy(reqwest::Proxy::all("http://127.0.0.1:9").unwrap())
+            .connect_timeout(std::time::Duration::from_millis(25))
+            .timeout(std::time::Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let error = fetch_quotes_with_client(&client, &["TEST_CODE_000001".to_string()])
+            .expect_err("unreachable Yahoo transport must fail");
+        assert!(error.contains("request failed"));
     }
 }

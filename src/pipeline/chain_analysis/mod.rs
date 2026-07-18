@@ -210,6 +210,180 @@ pub struct ChainCluster {
     pub scenario: Option<ScenarioAnalysis>,
 }
 
+fn cluster_and_persist(
+    date: &str,
+    limit_ups: &[TopStock],
+    concepts: &HashMap<String, Vec<String>>,
+    min_size: usize,
+) -> Result<(Vec<ChainCluster>, Vec<TopStock>)> {
+    let (mut clusters, isolated) = cluster_by_concept(limit_ups, concepts, min_size);
+    info!(
+        "[产业链] 识别主线簇 {} 个，孤立涨停 {} 只",
+        clusters.len(),
+        isolated.len()
+    );
+
+    let db =
+        DatabaseManager::try_get().ok_or_else(|| anyhow::anyhow!("产业链主线数据库未初始化"))?;
+    let rows: Vec<(String, Vec<String>, i32)> = clusters
+        .iter()
+        .map(|cluster| {
+            Ok((
+                cluster.concept.clone(),
+                cluster
+                    .stocks
+                    .iter()
+                    .map(|stock| stock.code.clone())
+                    .collect(),
+                i32::try_from(cluster.continuation_count).map_err(|error| {
+                    anyhow::anyhow!("主线 {} continuation_count 溢出: {error}", cluster.concept)
+                })?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    db.save_chain_clusters(date, &rows)
+        .map_err(anyhow::Error::msg)?;
+    for cluster in &mut clusters {
+        cluster.streak_days = db
+            .get_chain_streak_days_strict(&cluster.concept, 10)
+            .map_err(anyhow::Error::msg)?;
+    }
+    Ok((clusters, isolated))
+}
+
+fn resolve_cluster_board_code<'a>(
+    cluster: &ChainCluster,
+    board_map: &'a HashMap<String, String>,
+) -> Result<&'a str> {
+    let concept_head = cluster
+        .concept
+        .split_once('(')
+        .map(|(head, _)| head)
+        .unwrap_or(&cluster.concept);
+    board_map
+        .get(cluster.concept.as_str())
+        .or_else(|| board_map.get(concept_head))
+        .or_else(|| {
+            board_map.iter().find_map(|(name, code)| {
+                if name.contains(concept_head) || concept_head.contains(name.as_str()) {
+                    Some(code)
+                } else {
+                    None
+                }
+            })
+        })
+        .or_else(|| resolve_concept_alias(&cluster.concept, board_map))
+        .map(String::as_str)
+        .ok_or_else(|| anyhow::anyhow!("产业链主线「{}」未匹配到概念板块代码", cluster.concept))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn render_resolved_chain_analysis(
+    analyzer: &GeminiAnalyzer,
+    date: &str,
+    limit_ups: &[TopStock],
+    concepts: &HashMap<String, Vec<String>>,
+    clusters: &[ChainCluster],
+    isolated: &[TopStock],
+    position_diags: &[PositionDiag],
+    lhb_map: &HashMap<String, f64>,
+    macro_ctx: &str,
+) -> Result<String> {
+    let llm_ok = analyzer.is_available();
+    if !llm_ok {
+        warn!("[产业链] AI 模型未配置，仅输出聚类结果");
+    }
+
+    let mut cluster_sections: Vec<(String, Option<String>)> = Vec::new();
+    let mut deep_count = 0;
+    let mut simple_count = 0;
+    for cluster in clusters.iter() {
+        let stock_count = cluster.stocks.len();
+        let analysis = if stock_count >= TIER1_MIN && llm_ok && deep_count < MAX_DEEP_ANALYSIS {
+            deep_count += 1;
+            let cluster_news = fetch_cluster_news(analyzer, cluster, concepts).await;
+            match analyze_cluster_deep(
+                analyzer,
+                cluster,
+                concepts,
+                lhb_map,
+                macro_ctx,
+                &cluster_news,
+                date,
+            )
+            .await
+            {
+                Ok(text) => Some(text),
+                Err(error) => {
+                    warn!(
+                        "[产业链] 主线「{}」深度分析失败: {}",
+                        cluster.concept, error
+                    );
+                    None
+                }
+            }
+        } else if stock_count >= TIER2_MIN && llm_ok && simple_count < MAX_SIMPLE_ANALYSIS {
+            simple_count += 1;
+            match analyze_cluster_simple(analyzer, cluster, concepts, lhb_map, date).await {
+                Ok(text) => Some(text),
+                Err(error) => {
+                    warn!(
+                        "[产业链] 主线「{}」简化分析失败: {}",
+                        cluster.concept, error
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        cluster_sections.push((cluster.concept.clone(), analysis));
+    }
+    info!(
+        "[产业链] LLM 分析: 深度={} 简化={} 仅聚类={}",
+        deep_count,
+        simple_count,
+        clusters.len().saturating_sub(deep_count + simple_count)
+    );
+
+    let top_theme_names: Vec<&str> = clusters
+        .iter()
+        .take(5)
+        .map(|cluster| cluster.concept.as_str())
+        .collect();
+    let after_market_section = if llm_ok {
+        fetch_after_market_catalysts(&top_theme_names).await
+    } else {
+        String::new()
+    };
+
+    let overview = if llm_ok && !cluster_sections.is_empty() {
+        synthesize_overview(
+            analyzer,
+            clusters,
+            &cluster_sections,
+            position_diags,
+            date,
+            &after_market_section,
+        )
+        .await
+    } else {
+        None
+    };
+
+    Ok(build_report(
+        date,
+        limit_ups,
+        clusters,
+        &cluster_sections,
+        isolated,
+        overview.as_deref(),
+        &after_market_section,
+        concepts,
+        position_diags,
+    ))
+}
+
 /// 入口：对当日涨停池做产业链联动分析，返回完整 Markdown 报告。
 pub async fn run_chain_analysis(
     limit_ups: Vec<TopStock>,
@@ -234,38 +408,9 @@ pub async fn run_chain_analysis(
         .await
         .map_err(anyhow::Error::msg)?;
 
-    // 2. 概念共现聚类
-    let (mut clusters, isolated) = cluster_by_concept(&limit_ups, &concepts, min_cluster_size());
-    info!(
-        "[产业链] 识别主线簇 {} 个，孤立涨停 {} 只",
-        clusters.len(),
-        isolated.len()
-    );
-
-    // 2.5 主线落库 + 生命周期（连续上榜天数）
-    {
-        let db = DatabaseManager::try_get()
-            .ok_or_else(|| anyhow::anyhow!("产业链主线数据库未初始化"))?;
-        let rows: Vec<(String, Vec<String>, i32)> = clusters
-            .iter()
-            .map(|c| {
-                Ok((
-                    c.concept.clone(),
-                    c.stocks.iter().map(|s| s.code.clone()).collect(),
-                    i32::try_from(c.continuation_count).map_err(|error| {
-                        anyhow::anyhow!("主线 {} continuation_count 溢出: {error}", c.concept)
-                    })?,
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        db.save_chain_clusters(&date, &rows)
-            .map_err(anyhow::Error::msg)?;
-        for c in clusters.iter_mut() {
-            c.streak_days = db
-                .get_chain_streak_days_strict(&c.concept, 10)
-                .map_err(anyhow::Error::msg)?;
-        }
-    }
+    // 2. 概念共现聚类 + 2.5 主线落库/生命周期
+    let (mut clusters, isolated) =
+        cluster_and_persist(&date, &limit_ups, &concepts, min_cluster_size())?;
 
     // 2.6 补涨候选：从东财概念板块成分股中找未涨停、涨幅适中的标的
     {
@@ -276,28 +421,7 @@ pub async fn run_chain_analysis(
             .iter_mut()
             .take(MAX_DEEP_ANALYSIS + MAX_SIMPLE_ANALYSIS)
         {
-            let bk = c
-                .concept
-                .split_once('(')
-                .map(|(head, _)| head)
-                .unwrap_or(&c.concept);
-            // 多级匹配：精确匹配 → 去除后缀匹配 → 子串匹配 → 同义词映射
-            let board_code = board_map
-                .get(c.concept.as_str())
-                .or_else(|| board_map.get(bk))
-                .or_else(|| {
-                    board_map.iter().find_map(|(k, v)| {
-                        if k.contains(bk) || bk.contains(k.as_str()) {
-                            Some(v)
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .or_else(|| resolve_concept_alias(&c.concept, &board_map));
-            let code = board_code.ok_or_else(|| {
-                anyhow::anyhow!("产业链主线「{}」未匹配到概念板块代码", c.concept)
-            })?;
+            let code = resolve_cluster_board_code(c, &board_map)?;
             c.candidates = fetch_laggard_candidates(code, &limit_codes)
                 .await
                 .map_err(anyhow::Error::msg)?;
@@ -313,97 +437,20 @@ pub async fn run_chain_analysis(
     // 4. 宏观新闻（未传入则 best-effort 在线搜索）
     let macro_ctx = resolve_macro_news(macro_news).await;
 
-    // 5. LLM 逐簇分析 + 全景研判
+    // 5. LLM 逐簇分析 + 5.5 盘后催化 + 6. 报告组装
     let analyzer = GeminiAnalyzer::from_env();
-    let llm_ok = analyzer.is_available();
-    if !llm_ok {
-        warn!("[产业链] AI 模型未配置，仅输出聚类结果");
-    }
-
-    let mut cluster_sections: Vec<(String, Option<String>)> = Vec::new();
-    let mut deep_count = 0;
-    let mut simple_count = 0;
-    for cluster in clusters.iter() {
-        let stock_count = cluster.stocks.len();
-        let analysis = if stock_count >= TIER1_MIN && llm_ok && deep_count < MAX_DEEP_ANALYSIS {
-            deep_count += 1;
-            let cluster_news = fetch_cluster_news(&analyzer, cluster, &concepts).await;
-            match analyze_cluster_deep(
-                &analyzer,
-                cluster,
-                &concepts,
-                &lhb_map,
-                &macro_ctx,
-                &cluster_news,
-                &date,
-            )
-            .await
-            {
-                Ok(text) => Some(text),
-                Err(e) => {
-                    warn!("[产业链] 主线「{}」深度分析失败: {}", cluster.concept, e);
-                    None
-                }
-            }
-        } else if stock_count >= TIER2_MIN && llm_ok && simple_count < MAX_SIMPLE_ANALYSIS {
-            simple_count += 1;
-            match analyze_cluster_simple(&analyzer, cluster, &concepts, &lhb_map, &date).await {
-                Ok(text) => Some(text),
-                Err(e) => {
-                    warn!("[产业链] 主线「{}」简化分析失败: {}", cluster.concept, e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        cluster_sections.push((cluster.concept.clone(), analysis));
-    }
-    info!(
-        "[产业链] LLM 分析: 深度={} 简化={} 仅聚类={}",
-        deep_count,
-        simple_count,
-        clusters.len().saturating_sub(deep_count + simple_count)
-    );
-
-    // 5.5 盘后催化追踪：对TOP主线搜最新消息，注入时效性
-    let top_theme_names: Vec<&str> = clusters
-        .iter()
-        .take(5)
-        .map(|c| c.concept.as_str())
-        .collect();
-    let after_market_section = if llm_ok {
-        fetch_after_market_catalysts(&top_theme_names).await
-    } else {
-        String::new()
-    };
-
-    let overview = if llm_ok && !cluster_sections.is_empty() {
-        synthesize_overview(
-            &analyzer,
-            &clusters,
-            &cluster_sections,
-            &position_diags,
-            &date,
-            &after_market_section,
-        )
-        .await
-    } else {
-        None
-    };
-
-    // 6. 组装报告
-    Ok(build_report(
+    render_resolved_chain_analysis(
+        &analyzer,
         &date,
         &limit_ups,
-        &clusters,
-        &cluster_sections,
-        &isolated,
-        overview.as_deref(),
-        &after_market_section,
         &concepts,
+        &clusters,
+        &isolated,
         &position_diags,
-    ))
+        &lhb_map,
+        &macro_ctx,
+    )
+    .await
 }
 
 // ============================================================================
@@ -1515,6 +1562,58 @@ mod tests {
     }
 
     #[test]
+    fn all_registered_concept_alias_families_resolve_without_network() {
+        for (concept, board) in [
+            ("电池技术", "电池"),
+            ("有色金属", "有色金属"),
+            ("军工", "军工"),
+            ("新材料", "新材料"),
+            ("低空经济", "低空经济"),
+            ("基础化工", "基础化工"),
+            ("机器人概念", "机器人"),
+            ("华为概念", "华为"),
+            ("5G概念", "5G"),
+            ("节能环保", "环保"),
+            ("人工智能", "人工智能"),
+            ("半导体概念", "半导体"),
+            ("国产芯片", "国产芯片"),
+            ("汽车", "汽车"),
+            ("电商概念", "电商"),
+            ("电子", "电子"),
+            ("电网概念", "电网"),
+            ("第三代半导体", "第三代半导体"),
+            ("互联网金融", "互联网金融"),
+            ("光伏概念", "光伏"),
+            ("商贸零售", "商贸零售"),
+            ("建筑装饰", "建筑装饰"),
+            ("机械设备", "机械设备"),
+            ("核能核电", "核电"),
+            ("油气资源", "油气"),
+            ("网红经济", "网红经济"),
+            ("轻工制造", "轻工制造"),
+            ("PCB", "PCB"),
+            ("信创", "信创"),
+            ("光刻机(胶)", "光刻机"),
+            ("农业种植", "农业"),
+            ("医药生物", "医药"),
+            ("大数据", "大数据"),
+            ("影视概念", "影视"),
+            ("数据中心", "数据中心"),
+            ("新能源", "新能源"),
+            ("智慧城市", "智慧城市"),
+            ("特斯拉概念", "特斯拉"),
+            ("铁路基建", "铁路基建"),
+        ] {
+            let board_map = HashMap::from([(board.to_string(), "BK_TEST".to_string())]);
+            assert_eq!(
+                resolve_concept_alias(concept, &board_map).map(String::as_str),
+                Some("BK_TEST"),
+                "{concept}"
+            );
+        }
+    }
+
+    #[test]
     fn test_chain_score_position_cap() {
         let high = ChainScore {
             logic_hardness: 85.0,
@@ -1795,6 +1894,86 @@ mod tests {
             .await
             .expect("empty complete batch");
         assert!(report.contains("涨停池批次成功返回 0 只"));
+    }
+
+    #[tokio::test]
+    async fn prefetched_macro_context_is_preserved_without_search() {
+        let context = resolve_macro_news(Some("  TEST_CODE_真实宏观上下文  ".to_string())).await;
+        assert_eq!(context, "  TEST_CODE_真实宏观上下文  ");
+    }
+
+    #[tokio::test]
+    async fn resolved_chain_facts_persist_match_and_render_without_external_sources() {
+        crate::database::DatabaseManager::init(None).expect("isolated test database");
+        let stocks = vec![
+            top("TEST_CODE_CHAIN_230001", "测试链甲", 10.0),
+            top("TEST_CODE_CHAIN_230002", "测试链乙", 9.9),
+            top("TEST_CODE_CHAIN_230003", "测试孤立", 9.8),
+        ];
+        let concepts = HashMap::from([
+            (
+                "TEST_CODE_CHAIN_230001".to_string(),
+                vec!["TEST_CODE_固态电池".to_string(), "昨日涨停".to_string()],
+            ),
+            (
+                "TEST_CODE_CHAIN_230002".to_string(),
+                vec!["TEST_CODE_固态电池".to_string()],
+            ),
+            (
+                "TEST_CODE_CHAIN_230003".to_string(),
+                vec!["TEST_CODE_独立逻辑".to_string()],
+            ),
+        ]);
+        let (mut clusters, isolated) = cluster_and_persist("2026-07-19", &stocks, &concepts, 2)
+            .expect("complete parsed cluster facts");
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(isolated.len(), 1);
+        assert_eq!(clusters[0].streak_days, 1);
+
+        let exact = HashMap::from([(
+            "TEST_CODE_固态电池".to_string(),
+            "BK_TEST_230001".to_string(),
+        )]);
+        assert_eq!(
+            resolve_cluster_board_code(&clusters[0], &exact).expect("exact board match"),
+            "BK_TEST_230001"
+        );
+        let substring = HashMap::from([(
+            "TEST_CODE_固态电池概念".to_string(),
+            "BK_TEST_230002".to_string(),
+        )]);
+        assert_eq!(
+            resolve_cluster_board_code(&clusters[0], &substring).expect("substring board match"),
+            "BK_TEST_230002"
+        );
+        assert!(resolve_cluster_board_code(&clusters[0], &HashMap::new()).is_err());
+
+        clusters[0].candidates = vec![top("TEST_CODE_CHAIN_230004", "测试补涨候选", 3.0)];
+        assert_eq!(clusters[0].candidates.len(), 1);
+        let positions = vec![PositionDiag {
+            code: "TEST_CODE_CHAIN_230001".to_string(),
+            name: "测试链甲".to_string(),
+            return_rate: Some(1.5),
+            mainline: Some(("TEST_CODE_固态电池".to_string(), 1)),
+            in_limit_pool: true,
+        }];
+        let report = render_resolved_chain_analysis(
+            &unavailable_analyzer(),
+            "2026-07-19",
+            &stocks,
+            &concepts,
+            &clusters,
+            &isolated,
+            &positions,
+            &HashMap::from([("TEST_CODE_CHAIN_230001".to_string(), 100.0)]),
+            "TEST_CODE_真实宏观事实",
+        )
+        .await
+        .expect("resolved report without model");
+        assert!(report.contains("TEST_CODE_固态电池"));
+        assert!(report.contains("测试链甲"));
+        assert!(report.contains("持仓主线诊断"));
+        assert!(report.contains("其他热点速览"));
     }
 
     #[test]

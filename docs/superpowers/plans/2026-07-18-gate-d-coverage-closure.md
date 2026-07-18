@@ -239,3 +239,51 @@ Expected: all PASS. Commit only the two modules plus design/plan/progress eviden
 - [x] Exercise monitor delivery type/target resolution, token parsing and caches, file permissions, local peer/log parsing, and missing-recipient failure behavior without sending a message.
 - [x] Exercise ranking, fund-flow, turnover, announcement-summary, source-wrapper, and UTF-8 truncation renderers with complete and explicitly missing facts.
 - [x] Run all 301 monitor tests, strict monitor Clippy, formatter, and focused coverage; `notify.rs` reaches 985/1,811 = 54.39%, `push_templates.rs` 4,643/8,660 = 53.61%, and `market_data.rs` 85/582 = 14.60%.
+
+### Task 22: Exercise core real-source failures and parsed pipeline boundaries
+
+- [x] Execute existing provider request construction against a test-only unreachable proxy with strict short timeouts; require explicit all-source errors and no empty/default downgrade.
+- [x] Complete deterministic parser/selector/error tests for the largest remaining `data_provider/`, `pipeline/`, `decision/`, `risk/`, and database gaps using only `TEST_CODE_` facts.
+- [ ] Run focused suites, full strict Clippy/compliance, then regenerate CI-equivalent workspace coverage and continue until registered core reaches 95%.
+
+### Task 23: Execute chain analysis from already validated facts
+
+- [x] Keep every real acquisition call in `run_chain_analysis`, then move cluster persistence, board resolution and final report orchestration behind private resolved helpers.
+- [x] Cover successful `TEST_CODE_` cluster lifecycle, board matching/candidate attachment and unavailable-model report output with an isolated database only.
+- [x] Re-run chain tests and coverage; reject any implementation that creates a source fake, fallback fact, external request, notification or order.
+
+### Task 24: Exercise real-provider HTTP outcome decisions
+
+- [x] Keep Eastmoney/Tencent real hosts, request construction and retry ordering unchanged; route completed status/body facts through private deterministic outcome helpers.
+- [x] Cover 2xx complete data, empty/bad bodies, 4xx terminal failures, 5xx retry failures and strict parser rejection without sockets or external requests.
+- [x] Run both provider suites, formatter, strict Clippy and instrumented core coverage; reject any fake success payload in a production transport path.
+
+### Task 25: Exercise RustDX post-fetch assembly
+
+- [x] Keep real TCP pagination and BR-092 parsing unchanged; move only already validated K-line decoration and nullable real Tencent enrichment to a private resolved helper.
+- [x] Cover complete quote, absent quote and explicit quote-source failure with local `TEST_CODE_` histories; settled close must never be overwritten.
+- [x] Run RustDX tests, formatter, strict Clippy and core coverage.
+
+### Task 26: Exercise resolved chain-search evidence
+
+- [x] Keep real search/LHB acquisition unchanged; extract only generated-query protocol parsing, result dedup/truncation/rendering and strict LHB mapping.
+- [x] Cover query limits, sentence rejection, duplicate titles, absent dates, result caps and invalid/duplicate LHB records with local facts.
+- [x] Run chain fetcher tests, formatter, strict Clippy and core coverage.
+
+### Task 27: Exercise money-flow and intraday HTTP responses
+
+- [x] Keep the three real push2his hosts and request order unchanged; route completed status/body facts through strict private parsers.
+- [x] Cover non-2xx, read failure, empty/HTML, bad JSON, missing arrays, complete flow rows and complete intraday shape locally.
+- [x] Run money-flow tests, formatter, strict Clippy and core coverage.
+
+### Task 28: Exercise announcement list and detail HTTP responses
+
+- [x] Keep the real Eastmoney announcement endpoints, request headers and high-risk detail selection unchanged; route completed status/body facts through strict private parsers.
+- [x] Cover non-2xx, read failure, empty/HTML/bad JSON, missing list/content and complete list/detail responses locally without sockets.
+- [x] Run announcement tests, formatter, strict Clippy and core coverage; reject any title/summary fallback for required detail content.
+
+### Task 29: Exercise industry HTTP, pagination, and resolved benchmark decisions
+
+- [x] Keep the three real Eastmoney hosts and endpoint fields unchanged; require 2xx plus a readable complete JSON body before parsing.
+- [x] Cover map-page termination/conflict, missing board mapping, complete constituent resolution and all response failures with local facts.
+- [x] Run industry tests, formatter, strict Clippy and core coverage; never cache a partial map or infer a default industry.

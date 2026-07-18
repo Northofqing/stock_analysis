@@ -70,14 +70,33 @@ async fn try_get(client: &reqwest::Client, path: &str) -> Result<Value> {
             .send()
             .await
         {
-            Ok(resp) => match resp.json::<Value>().await {
-                Ok(v) => return Ok(v),
-                Err(e) => last_err = Some(anyhow!("{}: parse {}", host, e)),
-            },
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let body = resp.text().await.map_err(|error| error.to_string());
+                match parse_industry_http_response(host, status, body) {
+                    Ok(value) => return Ok(value),
+                    Err(error) => last_err = Some(error),
+                }
+            }
             Err(e) => last_err = Some(anyhow!("{}: {}", host, e)),
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow!("all hosts failed")))
+}
+
+fn parse_industry_http_response(
+    host: &str,
+    status: u16,
+    body: std::result::Result<String, String>,
+) -> Result<Value> {
+    if !(200..300).contains(&status) {
+        return Err(anyhow!("{host}: HTTP status {status}"));
+    }
+    let body = body.map_err(|error| anyhow!("{host}: response body {error}"))?;
+    if body.trim().is_empty() {
+        return Err(anyhow!("{host}: empty response body"));
+    }
+    serde_json::from_str(&body).map_err(|error| anyhow!("{host}: parse {error}"))
 }
 
 fn required_nonempty_text(row: &Value, field: &str) -> Result<String> {
@@ -162,6 +181,21 @@ fn parse_constituents_page(value: &Value) -> Result<Vec<IndustryConstituent>> {
 /// 进程内缓存的 `行业名 -> BK代码` 映射
 static INDUSTRY_MAP: OnceLock<Mutex<Option<HashMap<String, String>>>> = OnceLock::new();
 
+fn merge_industry_map_page(out: &mut HashMap<String, String>, value: &Value) -> Result<bool> {
+    let page = parse_industry_map_page(value)?;
+    if page.is_empty() {
+        return Ok(true);
+    }
+    let page_len = page.len();
+    for (name, code) in &page {
+        if let Some(previous) = out.get(name) {
+            return Err(anyhow!("行业列表跨页名称重复: {name} -> {previous}/{code}"));
+        }
+    }
+    out.extend(page);
+    Ok(page_len < 100)
+}
+
 async fn load_industry_map(client: &reqwest::Client) -> Result<HashMap<String, String>> {
     let mut out: HashMap<String, String> = HashMap::new();
     for pn in 1..=5 {
@@ -170,17 +204,7 @@ async fn load_industry_map(client: &reqwest::Client) -> Result<HashMap<String, S
             pn
         );
         let v = try_get(client, &path).await?;
-        let page = parse_industry_map_page(&v)?;
-        if page.is_empty() {
-            break;
-        }
-        let page_len = page.len();
-        for (name, code) in page {
-            if let Some(previous) = out.insert(name.clone(), code.clone()) {
-                return Err(anyhow!("行业列表跨页名称重复: {name} -> {previous}/{code}"));
-            }
-        }
-        if page_len < 100 {
+        if merge_industry_map_page(&mut out, &v)? {
             break;
         }
     }
@@ -212,9 +236,15 @@ async fn fetch_industry_name(client: &reqwest::Client, code: &str) -> Result<Str
         secid_for(code)
     );
     let v = try_get(client, &path).await?;
-    let name = v
+    parse_industry_name(&v)
+}
+
+fn parse_industry_name(value: &Value) -> Result<String> {
+    let name = value
         .pointer("/data/f127")
         .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
         .ok_or_else(|| anyhow!("缺少 f127 行业字段"))?;
     Ok(name.to_string())
 }
@@ -327,15 +357,20 @@ pub async fn fetch_async(client: &reqwest::Client, code: &str) -> Result<Industr
         .await
         .context("取行业名")?;
     let map = get_industry_map(client).await.context("加载行业列表")?;
-    let bk_code = map
-        .get(&industry_name)
-        .cloned()
-        .ok_or_else(|| anyhow!("行业名未匹配到 BK 代码: {}", industry_name))?;
-
+    let bk_code = resolve_industry_board_code(&map, &industry_name)?;
     let rows = fetch_constituents(client, &bk_code)
         .await
         .context("取成份股")?;
     build_industry_benchmark(industry_name, bk_code, code, &rows)
+}
+
+fn resolve_industry_board_code(
+    map: &HashMap<String, String>,
+    industry_name: &str,
+) -> Result<String> {
+    map.get(industry_name)
+        .cloned()
+        .ok_or_else(|| anyhow!("行业名未匹配到 BK 代码: {industry_name}"))
 }
 
 /// 同步包装：在已有 tokio runtime 上下文内调用
@@ -419,6 +454,76 @@ mod tests {
     }
 
     #[test]
+    fn industry_http_and_name_parsers_require_complete_protocol_facts() {
+        let value = parse_industry_http_response(
+            "TEST_CODE_host",
+            200,
+            Ok(r#"{"data":{"f127":"测试行业"}}"#.to_string()),
+        )
+        .expect("complete response");
+        assert_eq!(parse_industry_name(&value).unwrap(), "测试行业");
+
+        for result in [
+            parse_industry_http_response("TEST_CODE_host", 503, Ok("{}".to_string())),
+            parse_industry_http_response("TEST_CODE_host", 200, Err("断流".to_string())),
+            parse_industry_http_response("TEST_CODE_host", 200, Ok(String::new())),
+            parse_industry_http_response(
+                "TEST_CODE_host",
+                200,
+                Ok("<html>限流</html>".to_string()),
+            ),
+        ] {
+            assert!(result.is_err());
+        }
+        assert!(parse_industry_name(&serde_json::json!({})).is_err());
+        assert!(parse_industry_name(&serde_json::json!({"data":{"f127":" "}})).is_err());
+    }
+
+    #[test]
+    fn industry_map_pages_and_resolved_benchmark_are_atomic() {
+        let mut map = HashMap::new();
+        assert!(merge_industry_map_page(
+            &mut map,
+            &serde_json::json!({"data":{"diff":[
+                {"f12":"BK0001","f14":"测试行业"}
+            ]}}),
+        )
+        .unwrap());
+        assert_eq!(map.get("测试行业").map(String::as_str), Some("BK0001"));
+        assert!(merge_industry_map_page(
+            &mut map,
+            &serde_json::json!({"data":{"diff":[
+                {"f12":"BK9999","f14":"测试行业"}
+            ]}}),
+        )
+        .is_err());
+
+        let mut full_page = Vec::new();
+        for index in 0..100 {
+            full_page.push(serde_json::json!({
+                "f12": format!("BK{index:04}"),
+                "f14": format!("TEST_CODE_行业{index:03}"),
+            }));
+        }
+        let mut full_map = HashMap::new();
+        assert!(!merge_industry_map_page(
+            &mut full_map,
+            &serde_json::json!({"data":{"diff":full_page}}),
+        )
+        .unwrap());
+        assert!(
+            merge_industry_map_page(&mut full_map, &serde_json::json!({"data":{"diff":[]}}),)
+                .unwrap()
+        );
+
+        assert_eq!(
+            resolve_industry_board_code(&map, "测试行业").unwrap(),
+            "BK0001"
+        );
+        assert!(resolve_industry_board_code(&map, "不存在行业").is_err());
+    }
+
+    #[test]
     fn constituent_page_preserves_missing_values_and_rejects_bad_or_duplicate_rows() {
         let page = serde_json::json!({"data": {"diff": [
             {"f12": "TEST_CODE_000001", "f9": 10.0, "f23": "2.0", "f37": 12.0, "f129": -5.0},
@@ -492,5 +597,12 @@ mod tests {
             &[]
         )
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn real_industry_hosts_fail_without_creating_a_benchmark() {
+        let client = super::super::unreachable_http_client();
+        assert!(fetch_async(&client, "TEST_CODE_000001").await.is_err());
+        assert!(try_get(&client, "/api/qt/stock/get").await.is_err());
     }
 }

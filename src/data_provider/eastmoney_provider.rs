@@ -10,6 +10,41 @@ use anyhow::{anyhow, Context, Result};
 use chrono::NaiveDate;
 use serde::Deserialize;
 
+fn kline_retry_delay(attempt: u32) -> std::time::Duration {
+    if cfg!(test) {
+        std::time::Duration::from_millis(1)
+    } else {
+        std::time::Duration::from_millis(500 * u64::from(attempt))
+    }
+}
+
+fn eastmoney_market_code(code: &str) -> String {
+    if code.starts_with("00")
+        || code.starts_with("30")
+        || code.starts_with("15")
+        || code.starts_with("16")
+    {
+        format!("0.{code}")
+    } else {
+        format!("1.{code}")
+    }
+}
+
+fn brief_provider_error(text: String) -> String {
+    const MAX: usize = 120;
+    if text.chars().count() <= MAX {
+        text
+    } else {
+        format!("{}…(截断)", text.chars().take(MAX).collect::<String>())
+    }
+}
+
+enum KlineAttemptOutcome {
+    Complete(Vec<KlineData>),
+    Retry(ProviderError),
+    Fatal(anyhow::Error),
+}
+
 /// HTTP数据提供者
 pub struct HttpProvider {
     client: reqwest::Client,
@@ -51,6 +86,51 @@ struct ApiDataWrapper {
 }
 
 impl HttpProvider {
+    fn parse_stock_name_response(text: &str) -> Option<String> {
+        serde_json::from_str::<serde_json::Value>(text)
+            .ok()?
+            .get("data")?
+            .get("f58")?
+            .as_str()
+            .filter(|name| !name.trim().is_empty())
+            .map(str::to_string)
+    }
+
+    fn decide_kline_attempt(
+        status: u16,
+        body: std::result::Result<String, String>,
+        code: &str,
+    ) -> KlineAttemptOutcome {
+        if (400..500).contains(&status) {
+            return KlineAttemptOutcome::Fatal(anyhow!("HTTP请求返回错误状态: {status}"));
+        }
+        if !(200..300).contains(&status) {
+            return KlineAttemptOutcome::Retry(ProviderError::Other {
+                provider: "eastmoney".into(),
+                detail: format!("HTTP请求返回错误状态: {status}"),
+            });
+        }
+        let text = match body {
+            Ok(text) => text,
+            Err(error) => {
+                return KlineAttemptOutcome::Retry(ProviderError::ParseError {
+                    detail: format!("读取响应失败: {}", brief_provider_error(error)),
+                });
+            }
+        };
+        if text.is_empty() {
+            return KlineAttemptOutcome::Retry(ProviderError::ParseError {
+                detail: format!("所有 host 返回空响应, code={code}"),
+            });
+        }
+        match Self::parse_kline_response_internal(&text, code) {
+            Ok(data) => KlineAttemptOutcome::Complete(data),
+            Err(error) => KlineAttemptOutcome::Retry(ProviderError::ParseError {
+                detail: format!("解析失败: {error} - {}", brief_provider_error(text)),
+            }),
+        }
+    }
+
     /// 创建新的提供者
     pub fn new() -> Result<Self> {
         // 修复 Top10#7 (2026-06-29 audit): 用 crate::http_client::SHARED_HTTP_CLIENT 共享 client
@@ -76,31 +156,12 @@ impl HttpProvider {
         ];
 
         // 转换股票代码格式 (600519 -> 1.600519 for Shanghai, 000001 -> 0.000001 for Shenzhen)
-        let market_code = if code.starts_with("00")
-            || code.starts_with("30")
-            || code.starts_with("15")
-            || code.starts_with("16")
-        {
-            format!("0.{}", code) // 深圳及深交所基金
-        } else {
-            format!("1.{}", code) // 默认上海
-        };
+        let market_code = eastmoney_market_code(code);
 
         // 每个 host 最多尝试 2 次，总尝试数 = host 数 * 2。
         const MAX_ATTEMPTS_PER_HOST: u32 = 2;
         let max_attempts: u32 = (KLINE_HOSTS.len() as u32) * MAX_ATTEMPTS_PER_HOST;
         let mut last_err: Option<ProviderError> = None;
-
-        // 截断超长错误信息（reqwest 错误会内嵌完整 URL），避免日志刷屏。
-        fn brief(s: String) -> String {
-            const MAX: usize = 120;
-            if s.chars().count() <= MAX {
-                s
-            } else {
-                let head: String = s.chars().take(MAX).collect();
-                format!("{head}…(截断)")
-            }
-        }
 
         for attempt in 1..=max_attempts {
             let host = KLINE_HOSTS[((attempt - 1) as usize) % KLINE_HOSTS.len()];
@@ -131,112 +192,37 @@ impl HttpProvider {
                         max_attempts,
                         host,
                         code,
-                        brief(e.to_string())
+                        brief_provider_error(e.to_string())
                     );
                     last_err = Some(ProviderError::Other {
                         provider: "eastmoney".into(),
-                        detail: format!("HTTP请求失败: {}", brief(e.to_string())),
+                        detail: format!("HTTP请求失败: {}", brief_provider_error(e.to_string())),
                     });
                     if attempt < max_attempts {
-                        tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64))
-                            .await;
+                        tokio::time::sleep(kline_retry_delay(attempt)).await;
                     }
                     continue;
                 }
             };
 
-            let status = response.status();
-            if !status.is_success() {
-                // 4xx：客户端错误（URL/参数问题），重试也不会变好，直接失败
-                if status.is_client_error() {
-                    log::error!("[HTTP] 客户端错误 {} (host={} code={})", status, host, code);
-                    return Err(anyhow!("HTTP请求返回错误状态: {}", status));
-                }
-                // 5xx：可能瞬时，重试
-                log::warn!(
-                    "[HTTP] 响应状态 {} (attempt {}/{} host={} code={})",
-                    status,
-                    attempt,
-                    max_attempts,
-                    host,
-                    code
-                );
-                last_err = Some(ProviderError::Other {
-                    provider: "eastmoney".into(),
-                    detail: format!("HTTP请求返回错误状态: {}", status),
-                });
-                if attempt < max_attempts {
-                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64))
-                        .await;
-                }
-                continue;
-            }
-
-            let text = match response.text().await {
-                Ok(t) => t,
-                Err(e) => {
-                    log::warn!(
-                        "[HTTP] 读取响应失败 (attempt {}/{} host={} code={}): {}",
-                        attempt,
-                        max_attempts,
-                        host,
-                        code,
-                        brief(e.to_string())
+            let status = response.status().as_u16();
+            let body = response.text().await.map_err(|error| error.to_string());
+            match Self::decide_kline_attempt(status, body, code) {
+                KlineAttemptOutcome::Complete(data) => return Ok(data),
+                KlineAttemptOutcome::Fatal(error) => {
+                    log::error!(
+                        "[HTTP] 不可重试响应 (attempt {attempt}/{max_attempts} host={host} code={code}): {error}"
                     );
-                    last_err = Some(ProviderError::ParseError {
-                        detail: format!("读取响应失败: {}", brief(e.to_string())),
-                    });
-                    if attempt < max_attempts {
-                        tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64))
-                            .await;
-                    }
-                    continue;
+                    return Err(error);
                 }
-            };
-
-            if text.is_empty() {
-                log::warn!(
-                    "[HTTP] 响应为空 (attempt {}/{} host={} code={})",
-                    attempt,
-                    max_attempts,
-                    host,
-                    code
-                );
-                last_err = Some(ProviderError::ParseError {
-                    detail: format!("所有 host 返回空响应, code={}", code),
-                });
-                if attempt < max_attempts {
-                    tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64))
-                        .await;
-                }
-                continue;
-            }
-
-            log::debug!("[HTTP] 响应前200字符: {}", &text[..text.len().min(200)]);
-
-            // 解析JSON (简单的字符串解析，因为API返回的是字符串数组)。
-            // 200 但非 JSON（反爬/限流 HTML 页）视为可重试错误：换 host 再试，
-            // 而非立刻放弃整个东方财富源。
-            match Self::parse_kline_response_internal(&text, code) {
-                Ok(data) => return Ok(data),
-                Err(e) => {
+                KlineAttemptOutcome::Retry(error) => {
                     log::warn!(
-                        "[HTTP] 解析失败 (attempt {}/{} host={} code={}): {} - 响应前120字符: {}",
-                        attempt,
-                        max_attempts,
-                        host,
-                        code,
-                        e,
-                        brief(text.clone())
+                        "[HTTP] 可重试响应失败 (attempt {attempt}/{max_attempts} host={host} code={code}): {error}"
                     );
-                    last_err = Some(ProviderError::ParseError {
-                        detail: format!("解析失败: {} - {}", e, brief(text.clone())),
-                    });
+                    last_err = Some(error);
                     if attempt < max_attempts {
-                        tokio::time::sleep(std::time::Duration::from_millis(500 * attempt as u64))
-                            .await;
+                        tokio::time::sleep(kline_retry_delay(attempt)).await;
                     }
-                    continue;
                 }
             }
         }
@@ -356,19 +342,9 @@ impl HttpProvider {
             {
                 Ok(response) => {
                     if let Ok(text) = response.text().await {
-                        // 解析JSON获取名称 {"data":{"f58":"贵州茅台"}}
-                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
-                            if let Some(name) = json["data"]["f58"].as_str() {
-                                if !name.is_empty() {
-                                    log::debug!(
-                                        "[HTTP] 获取股票名称(host={}): {} -> {}",
-                                        host,
-                                        code,
-                                        name
-                                    );
-                                    return Some(name.to_string());
-                                }
-                            }
+                        if let Some(name) = Self::parse_stock_name_response(&text) {
+                            log::debug!("[HTTP] 获取股票名称(host={}): {} -> {}", host, code, name);
+                            return Some(name);
                         }
                     }
                 }
@@ -435,6 +411,65 @@ mod tests {
 
     fn kline_body(rows: serde_json::Value) -> String {
         serde_json::json!({"data": {"klines": rows}}).to_string()
+    }
+
+    #[test]
+    fn real_http_attempt_decision_preserves_terminal_retry_and_complete_states() {
+        assert_eq!(eastmoney_market_code("000001"), "0.000001");
+        assert_eq!(eastmoney_market_code("300001"), "0.300001");
+        assert_eq!(eastmoney_market_code("150001"), "0.150001");
+        assert_eq!(eastmoney_market_code("160001"), "0.160001");
+        assert_eq!(eastmoney_market_code("600519"), "1.600519");
+        assert!(brief_provider_error("x".repeat(121)).contains("截断"));
+        assert_eq!(brief_provider_error("short".into()), "short");
+
+        match HttpProvider::decide_kline_attempt(404, Ok(String::new()), "600519") {
+            KlineAttemptOutcome::Fatal(error) => assert!(error.to_string().contains("404")),
+            _ => panic!("4xx must be terminal"),
+        }
+        for (status, body, expected) in [
+            (503, Ok("ignored".to_string()), "503"),
+            (200, Err("body failed".to_string()), "读取响应失败"),
+            (200, Ok(String::new()), "空响应"),
+            (200, Ok("not-json".to_string()), "解析失败"),
+        ] {
+            match HttpProvider::decide_kline_attempt(status, body, "600519") {
+                KlineAttemptOutcome::Retry(error) => {
+                    assert!(error.to_string().contains(expected), "{error}")
+                }
+                _ => panic!("status/body should remain retryable"),
+            }
+        }
+
+        let complete = kline_body(serde_json::json!([
+            "2026-07-15,10.00,10.00,10.20,9.90,1000,100000,0.0",
+            "2026-07-16,10.00,10.10,10.20,9.95,1100,101000,1.0"
+        ]));
+        match HttpProvider::decide_kline_attempt(200, Ok(complete), "600519") {
+            KlineAttemptOutcome::Complete(data) => assert_eq!(data.len(), 2),
+            _ => panic!("complete strict body must succeed"),
+        }
+    }
+
+    #[test]
+    fn stock_name_parser_requires_complete_nonempty_protocol_identity() {
+        assert_eq!(
+            HttpProvider::parse_stock_name_response(r#"{"data":{"f58":"贵州茅台"}}"#),
+            Some("贵州茅台".to_string())
+        );
+        for body in [
+            "not-json",
+            r#"{}"#,
+            r#"{"data":{}}"#,
+            r#"{"data":{"f58":null}}"#,
+            r#"{"data":{"f58":"  "}}"#,
+        ] {
+            assert_eq!(
+                HttpProvider::parse_stock_name_response(body),
+                None,
+                "{body}"
+            );
+        }
     }
 
     #[test]
@@ -522,6 +557,20 @@ mod tests {
             }
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn real_eastmoney_transports_exhaust_hosts_without_default_data() {
+        let client = super::super::unreachable_http_client();
+        let error = HttpProvider::fetch_kline_data_internal(&client, "TEST_CODE_000001", 5)
+            .await
+            .expect_err("all real K-line hosts are unreachable");
+        assert!(error.to_string().contains("HTTP请求失败"));
+        assert_eq!(
+            HttpProvider::fetch_stock_name_internal(&client, "TEST_CODE_000001").await,
+            None
+        );
+        assert_eq!(kline_retry_delay(3), std::time::Duration::from_millis(1));
     }
 
     #[ignore = "b013 异常处理: 实机调 eastmoney HTTP, 沙箱环境必失败 (非 deterministic)"]

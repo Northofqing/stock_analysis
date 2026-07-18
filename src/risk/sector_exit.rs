@@ -78,4 +78,16 @@ mod tests {
     fn test_empty_flow() {
         assert!(check_sector_exit("测试板块", &[], 3).is_none());
     }
+
+    #[test]
+    fn test_recent_inflow_breaks_sequence_and_alert_formatting() {
+        assert!(check_sector_exit("测试板块", &[-3.0, -2.0, 1.0, -1.0], 2).is_none());
+        assert_eq!(format_sector_exit(&[]), "");
+
+        let signal = check_sector_exit("测试板块", &[-3.0, -2.0], 2).unwrap();
+        let alert = format_sector_exit(&[signal]);
+        assert!(alert.starts_with("🔻 板块退潮预警"));
+        assert!(alert.contains("测试板块"));
+        assert!(alert.contains("连续 2 周主力净流出"));
+    }
 }

@@ -141,4 +141,53 @@ mod tests {
         );
         assert!(signals.is_empty());
     }
+
+    #[test]
+    fn test_structural_stop_and_labels() {
+        let signals = check_stops(
+            "TEST_CODE_000001",
+            "测试",
+            8.0,
+            0.0,
+            None,
+            Some(8.5),
+            Some(9.0),
+        );
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].level, StopLevel::Structural);
+        assert_eq!(signals[0].trigger_price, 9.0);
+        assert_eq!(StopLevel::Technical.label(), "技术止损（破短期均线）");
+        assert_eq!(StopLevel::Structural.label(), "结构止损（破中期趋势）");
+        assert_eq!(StopLevel::Hard.label(), "硬止损（绝对亏损线）");
+    }
+
+    #[test]
+    fn test_invalid_hard_stop_is_ignored_and_alerts_are_formatted() {
+        let signals = check_stops(
+            "TEST_CODE_000001",
+            "测试",
+            8.0,
+            10.0,
+            Some(f64::NAN),
+            None,
+            None,
+        );
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].level, StopLevel::Technical);
+        assert_eq!(format_stop_alerts(&[]), "");
+        let alert = format_stop_alerts(&signals);
+        assert!(alert.starts_with("🛑 止损触发"));
+        assert!(alert.contains("⚠️ 测试(TEST_CODE_000001)"));
+
+        let hard = check_stops(
+            "TEST_CODE_000002",
+            "硬止损测试",
+            8.0,
+            10.0,
+            Some(9.0),
+            None,
+            None,
+        );
+        assert!(format_stop_alerts(&hard).contains("🔴 硬止损测试"));
+    }
 }

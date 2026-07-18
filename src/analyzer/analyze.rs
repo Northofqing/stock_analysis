@@ -969,3 +969,220 @@ impl GeminiAnalyzer {
             .await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data_provider::{
+        consensus::ConsensusData, financials::FinancialPeriod, industry::IndustryBenchmark,
+        valuation_history::ValuationHistory, AdjustType, KlineData,
+    };
+    use crate::pipeline::score_breakdown::ScoreBreakdown;
+    use std::collections::HashMap;
+
+    fn unavailable_analyzer() -> GeminiAnalyzer {
+        GeminiAnalyzer::new(crate::analyzer::GeminiConfig {
+            max_retries: 1,
+            retry_delay: 0.0,
+            request_delay: 0.0,
+            ..crate::analyzer::GeminiConfig::default()
+        })
+    }
+
+    fn history(days: usize) -> Vec<KlineData> {
+        let base = chrono::NaiveDate::from_ymd_opt(2026, 7, 18).unwrap();
+        let mut rows: Vec<KlineData> = (0..days)
+            .map(|index| {
+                let close = 12.0 - index as f64 * 0.02;
+                KlineData {
+                    date: base - chrono::Duration::days(index as i64),
+                    open: close - 0.1,
+                    high: close + 0.2,
+                    low: close - 0.2,
+                    close,
+                    volume: if index == 0 { 5_000.0 } else { 1_000.0 },
+                    amount: close * 1_000.0,
+                    pct_chg: if index < 2 { 10.0 } else { 0.5 },
+                    intraday_price: None,
+                    settled: true,
+                    pe_ratio: None,
+                    pb_ratio: None,
+                    turnover_rate: None,
+                    market_cap: None,
+                    circulating_cap: None,
+                    eps: None,
+                    roe: None,
+                    revenue_yoy: None,
+                    net_profit_yoy: None,
+                    gross_margin: None,
+                    net_margin: None,
+                    sharpe_ratio: None,
+                    financials_history: None,
+                    valuation_history: None,
+                    consensus: None,
+                    industry: None,
+                    is_limit_up: index < 2,
+                    is_limit_down: false,
+                    is_suspended: false,
+                    adjust: AdjustType::Qfq,
+                }
+            })
+            .collect();
+        let periods = vec![
+            FinancialPeriod {
+                report_date: Some("2026-06-30".to_string()),
+                eps: Some(1.0),
+                roe: Some(20.0),
+                revenue_yoy: Some(20.0),
+                net_profit_yoy: Some(20.0),
+                gross_margin: Some(45.0),
+                net_margin: Some(20.0),
+                op_cash_flow_ps: Some(1.2),
+                total_asset_turnover: Some(0.9),
+                debt_to_assets: Some(50.0),
+            },
+            FinancialPeriod {
+                report_date: Some("2025-12-31".to_string()),
+                eps: Some(0.8),
+                roe: Some(15.0),
+                revenue_yoy: Some(10.0),
+                net_profit_yoy: Some(10.0),
+                gross_margin: Some(40.0),
+                net_margin: Some(15.0),
+                op_cash_flow_ps: Some(0.5),
+                total_asset_turnover: Some(0.7),
+                debt_to_assets: Some(40.0),
+            },
+            FinancialPeriod {
+                report_date: Some("2024-12-31".to_string()),
+                eps: Some(0.6),
+                roe: Some(10.0),
+                revenue_yoy: Some(5.0),
+                net_profit_yoy: Some(5.0),
+                gross_margin: Some(35.0),
+                net_margin: Some(10.0),
+                op_cash_flow_ps: Some(0.1),
+                total_asset_turnover: Some(0.5),
+                debt_to_assets: Some(30.0),
+            },
+        ];
+        let latest = &mut rows[0];
+        latest.pe_ratio = Some(12.0);
+        latest.pb_ratio = Some(1.2);
+        latest.turnover_rate = Some(8.0);
+        latest.market_cap = Some(200.0);
+        latest.circulating_cap = Some(150.0);
+        latest.eps = Some(1.0);
+        latest.roe = Some(20.0);
+        latest.gross_margin = Some(45.0);
+        latest.net_margin = Some(20.0);
+        latest.revenue_yoy = Some(20.0);
+        latest.net_profit_yoy = Some(20.0);
+        latest.sharpe_ratio = Some(1.2);
+        latest.financials_history = Some(periods);
+        latest.valuation_history = Some(ValuationHistory {
+            current_pe: Some(12.0),
+            current_pb: Some(1.2),
+            pe_percentile: Some(10.0),
+            pb_percentile: Some(90.0),
+            pe_min: Some(8.0),
+            pe_max: Some(30.0),
+            pe_median: Some(18.0),
+            pb_min: Some(0.8),
+            pb_max: Some(4.0),
+            pb_median: Some(2.0),
+            sample_days: 60,
+            oldest_date: Some("2026-04-01".to_string()),
+            newest_date: Some("2026-07-18".to_string()),
+        });
+        latest.consensus = Some(ConsensusData {
+            report_count: 2,
+            broker_count: 2,
+            eps_this_year_avg: Some(1.0),
+            eps_next_year_avg: Some(1.2),
+            eps_next2_year_avg: Some(1.4),
+            rating_distribution: HashMap::from([("买入".to_string(), 2)]),
+            target_price_high_avg: Some(15.0),
+            target_price_low_avg: Some(13.0),
+            latest_report_date: Some("2026-07-01".to_string()),
+            recent_reports: vec![crate::data_provider::consensus::RecentReport {
+                title: "TEST_CODE_真实研报".to_string(),
+                org_name: "测试机构".to_string(),
+                publish_date: "2026-07-01".to_string(),
+                rating: "买入".to_string(),
+            }],
+        });
+        latest.industry = Some(IndustryBenchmark {
+            industry_name: "测试行业".to_string(),
+            board_code: "BK_TEST".to_string(),
+            peer_count: 5,
+            stock_pe: Some(12.0),
+            stock_pb: Some(1.2),
+            stock_roe: Some(20.0),
+            stock_growth: Some(20.0),
+            median_pe: Some(18.0),
+            median_pb: Some(2.0),
+            median_roe: Some(12.0),
+            median_growth: Some(8.0),
+            pe_percentile: Some(10.0),
+            pb_percentile: Some(20.0),
+            roe_percentile: Some(90.0),
+            growth_percentile: Some(90.0),
+        });
+        rows
+    }
+
+    #[tokio::test]
+    async fn analysis_prompt_builds_complete_evidence_then_fails_closed_without_model() {
+        let analyzer = unavailable_analyzer();
+        assert!(analyzer
+            .analyze_stock("TEST_CODE_000001", &[], None)
+            .await
+            .expect_err("empty data")
+            .to_string()
+            .contains("数据为空"));
+
+        let reasons = vec!["均线多头".to_string()];
+        let risks = vec!["短期涨幅偏高".to_string()];
+        let vetoes = vec!["TEST_CODE_风险否决".to_string()];
+        let breakdown = ScoreBreakdown {
+            technical: 80,
+            fundamental_quality: 70,
+            valuation_safety: 60,
+            capital_flow: 50,
+            growth_sustainability: 90,
+        };
+        let assessment = crate::analyzer::TechAssessment {
+            score: 80,
+            advice: "建议买入",
+            reasons: &reasons,
+            risks: &risks,
+            trend_status: "空头下跌",
+            score_breakdown: Some(&breakdown),
+            veto_flags: &vetoes,
+            trade_type: Some("逆向价值型"),
+        };
+        let error = analyzer
+            .analyze_stock_with_extras(
+                "TEST_CODE_000001",
+                Some("测试股票"),
+                &history(80),
+                Some("TEST_CODE_真实宏观证据"),
+                Some("\nTEST_CODE_真实资金证据\n"),
+                Some("TEST_CODE_真实新闻证据"),
+                Some(&assessment),
+            )
+            .await
+            .expect_err("missing model key must remain explicit");
+        assert!(error.to_string().contains("API Key 未配置"));
+    }
+
+    #[tokio::test]
+    async fn simple_analysis_wrapper_reaches_model_boundary_without_optional_evidence() {
+        let error = unavailable_analyzer()
+            .analyze_stock("TEST_CODE_000002", &history(20), None)
+            .await
+            .expect_err("missing model key must remain explicit");
+        assert!(error.to_string().contains("API Key 未配置"));
+    }
+}

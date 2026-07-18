@@ -253,4 +253,17 @@ mod tests {
         let s = NorthFlowClient::parse(json).unwrap();
         assert_eq!(s.latest_total(), Some(0.0));
     }
+
+    #[tokio::test]
+    async fn real_north_flow_transport_failure_remains_an_error() {
+        let client = NorthFlowClient {
+            http: super::super::unreachable_http_client(),
+        };
+        let error = client
+            .fetch()
+            .await
+            .expect_err("an unreachable real source must fail");
+        assert!(error.contains("HTTP 请求失败"));
+        let _default_client = NorthFlowClient::default();
+    }
 }

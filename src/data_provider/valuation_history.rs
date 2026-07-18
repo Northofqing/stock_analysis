@@ -310,4 +310,10 @@ mod tests {
     fn blocking_wrapper_without_runtime_returns_missing() {
         assert!(fetch_blocking(&reqwest::Client::new(), "TEST_CODE_000001").is_none());
     }
+
+    #[tokio::test]
+    async fn real_valuation_transport_failure_is_not_an_empty_history() {
+        let client = super::super::unreachable_http_client();
+        assert!(fetch_async(&client, "TEST_CODE_000001").await.is_err());
+    }
 }

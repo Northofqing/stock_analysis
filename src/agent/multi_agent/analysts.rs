@@ -324,3 +324,85 @@ pub(super) async fn run_timeframe(analyzer: &GeminiAnalyzer, slices: &DomainSlic
         AnalystView::empty("时间窗口 Agent 失败")
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn analyzer() -> GeminiAnalyzer {
+        GeminiAnalyzer::new(crate::analyzer::GeminiConfig {
+            max_retries: 1,
+            retry_delay: 0.0,
+            request_delay: 0.0,
+            ..crate::analyzer::GeminiConfig::default()
+        })
+    }
+
+    fn slices(news: Option<&str>, macro_ctx: Option<&str>) -> DomainSlices {
+        DomainSlices {
+            basics: "TEST_CODE_标的事实".to_string(),
+            technical: "TEST_CODE_技术事实".to_string(),
+            capital: "TEST_CODE_资金事实".to_string(),
+            fundamental: "TEST_CODE_基本面事实".to_string(),
+            news: news.map(str::to_string),
+            macro_ctx: macro_ctx.map(str::to_string),
+            sector: "TEST_CODE_板块事实".to_string(),
+        }
+    }
+
+    #[test]
+    fn analyst_view_parser_clamps_defaults_formats_and_rejects_bad_protocols() {
+        let empty = AnalystView::empty("TEST_CODE_无事实");
+        assert_eq!(empty.score, 50);
+        assert!(empty.to_markdown("测试分析师").contains("无关键信号"));
+
+        let parsed = parse_view(
+            r#"前缀```json
+            {"score":130,"stance":"","confidence":"","key_signals":["信号A"],"summary":"摘要"}
+            ```后缀"#,
+            "测试分析师",
+        )
+        .expect("complete analyst JSON");
+        assert_eq!(parsed.score, 100);
+        assert_eq!(parsed.stance, "bull");
+        assert_eq!(parsed.confidence, "medium");
+        assert!(parsed.to_markdown("测试分析师").contains("信号A"));
+
+        let bear = parse_view(r#"{"score":-5}"#, "测试分析师").unwrap();
+        assert_eq!(bear.score, 0);
+        assert_eq!(bear.stance, "bear");
+        let neutral = parse_view(r#"{"score":50}"#, "测试分析师").unwrap();
+        assert_eq!(neutral.stance, "neutral");
+        assert!(parse_view("no json", "测试分析师").is_err());
+        assert!(parse_view("{bad}", "测试分析师").is_err());
+        assert!(build_prompt("测试角色", "测试切片", "测试标的").contains(JSON_FORMAT_NOTE));
+    }
+
+    #[tokio::test]
+    async fn unavailable_model_returns_explicit_low_confidence_views_for_every_role() {
+        let analyzer = analyzer();
+        assert!(!analyzer.is_available());
+        let all = slices(Some("TEST_CODE_新闻"), Some("TEST_CODE_宏观"));
+        for view in [
+            run_fundamental(&analyzer, &all).await,
+            run_technical(&analyzer, &all).await,
+            run_capital(&analyzer, &all).await,
+            run_news(&analyzer, &all).await,
+            run_sector(&analyzer, &all).await,
+            run_timeframe(&analyzer, &all).await,
+        ] {
+            assert_eq!(view.score, 50);
+            assert_eq!(view.confidence, "low");
+        }
+
+        for partial in [
+            slices(Some("TEST_CODE_新闻"), None),
+            slices(None, Some("TEST_CODE_宏观")),
+            slices(None, None),
+        ] {
+            let view = run_news(&analyzer, &partial).await;
+            assert_eq!(view.score, 50);
+            assert_eq!(view.confidence, "low");
+        }
+    }
+}

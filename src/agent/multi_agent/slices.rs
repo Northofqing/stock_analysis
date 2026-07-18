@@ -878,3 +878,211 @@ fn build_sector_slice(
 
     s
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data_provider::{
+        consensus::ConsensusData, financials::FinancialPeriod, industry::IndustryBenchmark,
+        valuation_history::ValuationHistory, AdjustType,
+    };
+    use std::collections::HashMap;
+
+    fn rich_history(days: usize) -> Vec<KlineData> {
+        let base = chrono::NaiveDate::from_ymd_opt(2026, 7, 18).unwrap();
+        let mut history: Vec<KlineData> = (0..days)
+            .map(|index| {
+                let close = 12.0 - index as f64 * 0.03;
+                KlineData {
+                    date: base - chrono::Duration::days(index as i64),
+                    open: close - 0.1,
+                    high: close + 0.2,
+                    low: close - 0.2,
+                    close,
+                    volume: if index == 0 { 5_000.0 } else { 1_000.0 },
+                    amount: close * 1_000.0,
+                    pct_chg: if index < 2 { 10.0 } else { 0.5 },
+                    intraday_price: None,
+                    settled: true,
+                    pe_ratio: None,
+                    pb_ratio: None,
+                    turnover_rate: None,
+                    market_cap: None,
+                    circulating_cap: None,
+                    eps: None,
+                    roe: None,
+                    revenue_yoy: None,
+                    net_profit_yoy: None,
+                    gross_margin: None,
+                    net_margin: None,
+                    sharpe_ratio: None,
+                    financials_history: None,
+                    valuation_history: None,
+                    consensus: None,
+                    industry: None,
+                    is_limit_up: index < 2,
+                    is_limit_down: false,
+                    is_suspended: false,
+                    adjust: AdjustType::Qfq,
+                }
+            })
+            .collect();
+
+        let recent = FinancialPeriod {
+            report_date: Some("2026-06-30".to_string()),
+            eps: Some(1.0),
+            roe: Some(20.0),
+            revenue_yoy: Some(15.0),
+            net_profit_yoy: Some(18.0),
+            gross_margin: Some(45.0),
+            net_margin: Some(20.0),
+            op_cash_flow_ps: Some(1.2),
+            total_asset_turnover: Some(0.8),
+            debt_to_assets: Some(50.0),
+        };
+        let prior = FinancialPeriod {
+            report_date: Some("2025-12-31".to_string()),
+            eps: Some(0.8),
+            roe: Some(15.0),
+            revenue_yoy: Some(8.0),
+            net_profit_yoy: Some(9.0),
+            gross_margin: Some(40.0),
+            net_margin: Some(15.0),
+            op_cash_flow_ps: Some(0.6),
+            total_asset_turnover: Some(0.7),
+            debt_to_assets: Some(45.0),
+        };
+        let latest = &mut history[0];
+        latest.pe_ratio = Some(12.0);
+        latest.pb_ratio = Some(0.8);
+        latest.turnover_rate = Some(12.0);
+        latest.market_cap = Some(200.0);
+        latest.circulating_cap = Some(150.0);
+        latest.eps = Some(1.0);
+        latest.roe = Some(20.0);
+        latest.gross_margin = Some(45.0);
+        latest.net_margin = Some(20.0);
+        latest.revenue_yoy = Some(15.0);
+        latest.net_profit_yoy = Some(18.0);
+        latest.sharpe_ratio = Some(1.2);
+        latest.financials_history = Some(vec![recent, prior]);
+        latest.valuation_history = Some(ValuationHistory {
+            current_pe: Some(12.0),
+            current_pb: Some(0.8),
+            pe_percentile: Some(10.0),
+            pb_percentile: Some(90.0),
+            pe_min: Some(8.0),
+            pe_max: Some(30.0),
+            pe_median: Some(18.0),
+            pb_min: Some(0.5),
+            pb_max: Some(4.0),
+            pb_median: Some(2.0),
+            sample_days: 60,
+            oldest_date: Some("2026-04-01".to_string()),
+            newest_date: Some("2026-07-18".to_string()),
+        });
+        latest.consensus = Some(ConsensusData {
+            report_count: 3,
+            broker_count: 2,
+            eps_this_year_avg: Some(1.1),
+            eps_next_year_avg: Some(1.3),
+            eps_next2_year_avg: Some(1.5),
+            rating_distribution: HashMap::from([("买入".to_string(), 3)]),
+            target_price_high_avg: Some(15.0),
+            target_price_low_avg: Some(13.0),
+            latest_report_date: Some("2026-07-01".to_string()),
+            recent_reports: Vec::new(),
+        });
+        latest.industry = Some(IndustryBenchmark {
+            industry_name: "测试行业".to_string(),
+            board_code: "BK_TEST".to_string(),
+            peer_count: 5,
+            stock_pe: Some(12.0),
+            stock_pb: Some(0.8),
+            stock_roe: Some(20.0),
+            stock_growth: Some(18.0),
+            median_pe: Some(18.0),
+            median_pb: Some(2.0),
+            median_roe: Some(12.0),
+            median_growth: Some(8.0),
+            pe_percentile: Some(20.0),
+            pb_percentile: Some(10.0),
+            roe_percentile: Some(80.0),
+            growth_percentile: Some(90.0),
+        });
+        history
+    }
+
+    #[test]
+    fn rich_domain_slices_render_every_evidence_family() {
+        let trend = TrendSnapshot {
+            trend_status: "上升".to_string(),
+            ma_alignment: "多头".to_string(),
+            trend_strength: 80.0,
+            bias_ma5: 2.0,
+            volume_status: "放量".to_string(),
+            volume_ratio_5d: 2.5,
+            support_levels: vec![10.0, 11.0],
+            resistance_levels: vec![13.0],
+            evidence_reasons: vec!["均线向上".to_string()],
+            risk_factors: vec!["涨幅偏高".to_string()],
+        };
+        let slices = build_slices(
+            "TEST_CODE_688001",
+            Some("测试银行半导体新能源公司"),
+            &rich_history(80),
+            Some("TEST_CODE_真实资金证据"),
+            Some("TEST_CODE_真实新闻证据"),
+            Some("TEST_CODE_真实宏观证据"),
+            Some(&trend),
+        );
+        assert!(slices.basics.contains("TEST_CODE_688001"));
+        assert!(slices.technical.contains("系统趋势快照"));
+        assert!(slices.technical.contains("连续 2 板"));
+        assert!(slices.capital.contains("真实资金证据"));
+        assert!(slices.fundamental.contains("估值分位"));
+        assert!(slices.fundamental.contains("财务趋势"));
+        assert!(slices.fundamental.contains("一致预期"));
+        assert!(slices.fundamental.contains("行业对标"));
+        assert!(slices.sector.contains("行业启发性标签"));
+        assert!(slices.sector.contains("真实新闻证据"));
+        assert!(slices.sector.contains("真实宏观证据"));
+        assert_eq!(slices.news.as_deref(), Some("TEST_CODE_真实新闻证据"));
+        assert_eq!(slices.macro_ctx.as_deref(), Some("TEST_CODE_真实宏观证据"));
+    }
+
+    #[test]
+    fn minimal_domain_slices_keep_missing_evidence_explicit() {
+        let mut history = rich_history(4);
+        history[0].financials_history = None;
+        history[0].valuation_history = None;
+        history[0].consensus = None;
+        history[0].industry = None;
+        history[0].pe_ratio = None;
+        history[0].pb_ratio = None;
+        history[0].turnover_rate = None;
+        history[0].market_cap = None;
+        history[0].circulating_cap = None;
+        history[0].eps = None;
+        history[0].roe = None;
+        history[0].gross_margin = None;
+        history[0].net_margin = None;
+        history[0].revenue_yoy = None;
+        history[0].net_profit_yoy = None;
+        history[0].sharpe_ratio = None;
+        let slices = build_slices(
+            "TEST_CODE_UNKNOWN",
+            None,
+            &history,
+            Some("  "),
+            None,
+            None,
+            None,
+        );
+        assert!(slices.fundamental.contains("无估值与财务数据"));
+        assert!(slices.sector.contains("未知板块"));
+        assert!(slices.sector.contains("无新闻/宏观"));
+        assert!(slices.news.is_none());
+        assert!(slices.macro_ctx.is_none());
+    }
+}

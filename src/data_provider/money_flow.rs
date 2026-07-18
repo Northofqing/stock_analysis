@@ -183,6 +183,28 @@ const PUSH2HIS_HOSTS: [&str; 3] = [
     "82.push2his.eastmoney.com",
 ];
 
+fn parse_flow_http_response(
+    host: &str,
+    status: u16,
+    body: std::result::Result<String, String>,
+) -> Result<MoneyFlowSummary, String> {
+    if !(200..300).contains(&status) {
+        return Err(format!("{host}: 状态码 {status}"));
+    }
+    let text = body.map_err(|error| format!("{host}: 读取响应失败 {error}"))?;
+    if text.trim_start().starts_with('<') {
+        return Err(format!("{host}: 非JSON回包（网关拦截）"));
+    }
+    let json: Value =
+        serde_json::from_str(&text).map_err(|error| format!("{host}: JSON解析失败 {error}"))?;
+    let klines = json
+        .get("data")
+        .and_then(|data| data.get("klines"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("{host}: 资金流无 klines 数组"))?;
+    parse_em_money_flow_rows(klines).map_err(|error| format!("{host}: 资金流批次校验失败: {error}"))
+}
+
 /// 抓取近 `lmt` 天资金流（daykline）
 pub async fn fetch_flow_history_async(
     client: &reqwest::Client,
@@ -214,47 +236,11 @@ pub async fn fetch_flow_history_async(
                 continue;
             }
         };
-        if !resp.status().is_success() {
-            last_err = format!("{}: 状态码 {}", host, resp.status());
-            continue;
-        }
-        let text = match resp.text().await {
-            Ok(t) => t,
-            Err(e) => {
-                last_err = format!("{}: 读取响应失败 {}", host, e);
-                continue;
-            }
-        };
-        let body = text.trim_start();
-        if body.starts_with('<') {
-            last_err = format!("{}: 非JSON回包（网关拦截）", host);
-            continue;
-        }
-        let json: Value = match serde_json::from_str(&text) {
-            Ok(v) => v,
-            Err(e) => {
-                last_err = format!("{}: JSON解析失败 {}", host, e);
-                continue;
-            }
-        };
-
-        let Some(klines) = json
-            .get("data")
-            .and_then(|d| d.get("klines"))
-            .and_then(|v| v.as_array())
-        else {
-            last_err = format!("{}: 资金流无 klines 数组", host);
-            continue;
-        };
-
-        // 字段顺序（EM 实测）：date, f52(主力), f53(小单), f54(中单), f55(大单),
-        //                      f56(超大单), f57(主力%), f58(小单%), f59(中单%),
-        //                      f60(大单%), f61(超大单%), f62(收盘价), f63(涨跌幅%), _, _
-        match parse_em_money_flow_rows(klines) {
+        let status = resp.status().as_u16();
+        let body = resp.text().await.map_err(|error| error.to_string());
+        match parse_flow_http_response(host, status, body) {
             Ok(summary) => return Ok(summary),
-            Err(error) => {
-                last_err = format!("{host}: 资金流批次校验失败: {error}");
-            }
+            Err(error) => last_err = error,
         }
     }
 
@@ -450,6 +436,34 @@ fn build_intraday_shape(pre_close: f64, trends: &[Value]) -> Result<IntradayShap
     })
 }
 
+fn parse_intraday_http_response(
+    host: &str,
+    status: u16,
+    body: std::result::Result<String, String>,
+) -> Result<IntradayShape, String> {
+    if !(200..300).contains(&status) {
+        return Err(format!("{host}: 状态码 {status}"));
+    }
+    let text = body.map_err(|error| format!("{host}: 读取失败 {error}"))?;
+    if text.trim_start().starts_with('<') {
+        return Err(format!("{host}: 非JSON回包（网关拦截）"));
+    }
+    let json: Value =
+        serde_json::from_str(&text).map_err(|error| format!("{host}: JSON解析失败 {error}"))?;
+    let data = json
+        .get("data")
+        .ok_or_else(|| format!("{host}: 分时无 data"))?;
+    let pre_close = data
+        .get("preClose")
+        .and_then(as_f64)
+        .ok_or_else(|| format!("{host}: 分时无 preClose"))?;
+    let trends = data
+        .get("trends")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("{host}: 分时无 trends 数组"))?;
+    build_intraday_shape(pre_close, trends).map_err(|error| format!("{host}: {error}"))
+}
+
 /// 抓取当日分时（trends2）并计算形态
 pub async fn fetch_intraday_shape_async(
     client: &reqwest::Client,
@@ -457,7 +471,6 @@ pub async fn fetch_intraday_shape_async(
 ) -> Result<IntradayShape> {
     let secid = to_em_numeric_secid(code);
     let mut last_err = String::new();
-    let mut json_opt: Option<Value> = None;
 
     for host in PUSH2HIS_HOSTS {
         let url = format!(
@@ -481,46 +494,14 @@ pub async fn fetch_intraday_shape_async(
                 continue;
             }
         };
-        if !resp.status().is_success() {
-            last_err = format!("{}: 状态码 {}", host, resp.status());
-            continue;
-        }
-        let text = match resp.text().await {
-            Ok(t) => t,
-            Err(e) => {
-                last_err = format!("{}: 读取失败 {}", host, e);
-                continue;
-            }
-        };
-        let body = text.trim_start();
-        if body.starts_with('<') {
-            last_err = format!("{}: 非JSON回包（网关拦截）", host);
-            continue;
-        }
-        match serde_json::from_str::<Value>(&text) {
-            Ok(v) => {
-                json_opt = Some(v);
-                break;
-            }
-            Err(e) => {
-                last_err = format!("{}: JSON解析失败 {}", host, e);
-                continue;
-            }
+        let status = resp.status().as_u16();
+        let body = resp.text().await.map_err(|error| error.to_string());
+        match parse_intraday_http_response(host, status, body) {
+            Ok(shape) => return Ok(shape),
+            Err(error) => last_err = error,
         }
     }
-
-    let json = json_opt.ok_or_else(|| anyhow!("分时全部主机失败: {}", last_err))?;
-
-    let data = json.get("data").ok_or_else(|| anyhow!("分时 无 data"))?;
-    let pre_close = data
-        .get("preClose")
-        .and_then(as_f64)
-        .ok_or_else(|| anyhow!("分时 无 preClose"))?;
-    let trends = data
-        .get("trends")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| anyhow!("分时 无 trends 数组"))?;
-    build_intraday_shape(pre_close, trends)
+    Err(anyhow!("分时全部主机失败: {last_err}"))
 }
 
 /// 同步包装（在已有 tokio runtime 上下文调用）
@@ -859,5 +840,83 @@ mod br115_tests {
         assert!(build_intraday_shape(10.0, &[]).is_err());
         let too_far = vec![Value::String("2026-07-17 09:30,13,13,13,13,100".into())];
         assert!(build_intraday_shape(10.0, &too_far).is_err());
+    }
+
+    #[test]
+    fn flow_http_response_requires_complete_status_body_and_rows() {
+        for (status, body, expected) in [
+            (503, Ok(String::new()), "状态码 503"),
+            (200, Err("read failed".to_string()), "读取响应失败"),
+            (200, Ok("<html>blocked</html>".to_string()), "非JSON"),
+            (200, Ok("not-json".to_string()), "JSON解析失败"),
+            (200, Ok(r#"{"data":{}}"#.to_string()), "无 klines"),
+            (
+                200,
+                Ok(r#"{"data":{"klines":["bad"]}}"#.to_string()),
+                "批次校验失败",
+            ),
+        ] {
+            let error = parse_flow_http_response("TEST_CODE_host", status, body)
+                .expect_err("incomplete flow response");
+            assert!(error.contains(expected), "{error}");
+        }
+
+        let body = serde_json::json!({"data":{"klines":[
+            "2026-07-16,100,0,0,40,60,3.2,0,0,0,0,10,1.5",
+            "2026-07-17,200,0,0,80,120,4.2,0,0,0,0,10.1,1.0"
+        ]}})
+        .to_string();
+        let summary = parse_flow_http_response("TEST_CODE_host", 200, Ok(body))
+            .expect("complete flow protocol");
+        assert_eq!(summary.days.len(), 2);
+        assert_eq!(summary.latest().unwrap().main_net, 200.0);
+    }
+
+    #[test]
+    fn intraday_http_response_requires_complete_status_body_and_shape() {
+        for (status, body, expected) in [
+            (429, Ok(String::new()), "状态码 429"),
+            (200, Err("read failed".to_string()), "读取失败"),
+            (200, Ok(" <html>blocked</html>".to_string()), "非JSON"),
+            (200, Ok("not-json".to_string()), "JSON解析失败"),
+            (200, Ok(r#"{}"#.to_string()), "无 data"),
+            (200, Ok(r#"{"data":{}}"#.to_string()), "无 preClose"),
+            (
+                200,
+                Ok(r#"{"data":{"preClose":10}}"#.to_string()),
+                "无 trends",
+            ),
+        ] {
+            let error = parse_intraday_http_response("TEST_CODE_host", status, body)
+                .expect_err("incomplete intraday response");
+            assert!(error.contains(expected), "{error}");
+        }
+
+        let body = serde_json::json!({"data":{
+            "preClose":10.0,
+            "trends":[
+                "2026-07-17 14:30,10,10,10.2,9.8,100",
+                "2026-07-17 14:31,10,10.2,10.3,9.9,100"
+            ]
+        }})
+        .to_string();
+        let shape = parse_intraday_http_response("TEST_CODE_host", 200, Ok(body))
+            .expect("complete intraday protocol");
+        assert!(shape.present);
+        assert_eq!(shape.shape_label, "🔥 尾盘拉升（资金抢筹）");
+    }
+
+    #[tokio::test]
+    async fn real_money_flow_transports_fail_explicitly_when_every_host_is_unreachable() {
+        let client = super::super::unreachable_http_client();
+        let flow = fetch_flow_history_async(&client, "TEST_CODE_000001", 5)
+            .await
+            .expect_err("an unreachable real source must remain an error");
+        assert!(flow.to_string().contains("全部完整来源失败"));
+
+        let shape = fetch_intraday_shape_async(&client, "TEST_CODE_000001")
+            .await
+            .expect_err("an unreachable intraday source must remain an error");
+        assert!(shape.to_string().contains("全部主机失败"));
     }
 }

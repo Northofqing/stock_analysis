@@ -1778,8 +1778,19 @@ pub fn build_sector_queries_from_positions(
 
 #[cfg(test)]
 mod tests {
-    use super::score_air_refuel_pattern;
-    use crate::data_provider::KlineData;
+    use super::{
+        build_chain_event_evidence, classify_flow_error, is_uptrend_or_upturn, normalize_text,
+        score_air_refuel_pattern, score_breakout_structure, score_capital_consensus,
+        score_hit_confidence, score_profit_elasticity, sma_last, text_matches_hit,
+        truncate_for_prompt,
+    };
+    use crate::breakout::signal::{
+        BreakoutSignal, BreakoutType, CandleStrength, PricePosition, VolumePattern,
+    };
+    use crate::data_provider::money_flow::MoneyFlowDay;
+    use crate::data_provider::{FinancialPeriod, Financials, KlineData, MoneyFlowSummary};
+    use crate::opportunity::chain_mapper::{ChainHit, ChainSource};
+    use crate::search_service::{NewsType, SearchResult, Sentiment};
 
     fn kd(open: f64, high: f64, low: f64, close: f64, vol: f64, pct: f64) -> KlineData {
         KlineData {
@@ -1846,6 +1857,260 @@ mod tests {
             score < 5.0,
             "consolidation breakout should be penalized, got {score}"
         );
+    }
+
+    fn breakout(
+        breakout_type: BreakoutType,
+        volume_pattern: VolumePattern,
+        candle_strength: CandleStrength,
+        confidence: u8,
+    ) -> BreakoutSignal {
+        BreakoutSignal {
+            code: "TEST_CODE_600000".into(),
+            name: "测试标的".into(),
+            volume_ratio: None,
+            vol_vs_20d_avg: None,
+            volume_pattern,
+            change_pct: 0.0,
+            candle_strength,
+            ma_break: None,
+            price_position: PricePosition::Unknown,
+            breakout_type,
+            confidence,
+            description: String::new(),
+            data_degraded: false,
+        }
+    }
+
+    fn chain_hit(source: ChainSource) -> ChainHit {
+        ChainHit {
+            chain: "半导体".into(),
+            keywords: vec!["芯片".into(), "AI".into(), "x".into()],
+            logic: "测试逻辑".into(),
+            stocks: vec![],
+            source,
+            board_keyword: "集成电路".into(),
+            fund_flow_pct: Some(2.0),
+            board_code: None,
+            board_change_pct: None,
+        }
+    }
+
+    fn search_result(title: &str, snippet: &str, importance: u8) -> SearchResult {
+        SearchResult {
+            title: title.into(),
+            snippet: snippet.into(),
+            url: "https://example.invalid/test".into(),
+            source: "TEST_CODE_SOURCE".into(),
+            published_date: Some("2026-07-18".into()),
+            news_type: NewsType::Industry,
+            sentiment: Sentiment::Neutral,
+            importance,
+            relevance: 1.0,
+            keywords: vec![],
+        }
+    }
+
+    #[test]
+    fn deterministic_helpers_cover_boundaries() {
+        assert_eq!(classify_flow_error(None), "OK");
+        assert_eq!(classify_flow_error(Some("Sina unavailable")), "Sina");
+        assert_eq!(classify_flow_error(Some("非JSON回包")), "非JSON");
+        assert_eq!(classify_flow_error(Some("状态码 503")), "HTTP");
+        assert_eq!(classify_flow_error(Some("JSON解析失败")), "解析");
+        assert_eq!(classify_flow_error(Some("无 klines")), "解析");
+        assert_eq!(classify_flow_error(Some("timeout")), "其他");
+
+        assert_eq!(sma_last(&[1.0, 2.0], 3), None);
+        assert_eq!(sma_last(&[1.0, 2.0, 3.0, 4.0], 3), Some(3.0));
+        assert_eq!(normalize_text(" AI 芯片 "), "ai芯片");
+        assert_eq!(truncate_for_prompt("短文本", 10), "短文本");
+        assert_eq!(truncate_for_prompt("一二三四五", 3), "一二三...");
+    }
+
+    #[test]
+    fn long_air_refuel_series_covers_moving_average_and_macd_paths() {
+        let mut rising: Vec<KlineData> = (0..30)
+            .map(|i| {
+                let close = 10.0 + i as f64 * 0.1;
+                kd(close - 0.05, close + 0.1, close - 0.1, close, 1_000.0, 1.0)
+            })
+            .collect();
+        rising[27] = kd(13.2, 14.5, 13.1, 14.4, 3_000.0, 8.5);
+        rising[28] = kd(14.4, 14.6, 14.25, 14.45, 1_200.0, 0.3);
+        rising[29] = kd(14.5, 14.9, 14.4, 14.8, 1_800.0, 2.4);
+        let (positive, reason, stop) = score_air_refuel_pattern(&rising);
+        assert!(positive > 5.0, "{reason}");
+        assert!(reason.contains("DIF="));
+        assert!(stop.is_some());
+
+        let mut falling: Vec<KlineData> = (0..30)
+            .map(|i| {
+                let close = 20.0 - i as f64 * 0.2;
+                kd(close + 0.1, close + 0.2, close - 0.2, close, 2_000.0, -1.0)
+            })
+            .collect();
+        falling[27] = kd(14.6, 14.7, 14.0, 14.1, 500.0, 1.0);
+        falling[28] = kd(14.0, 14.1, 12.8, 13.0, 1_500.0, -7.0);
+        falling[29] = kd(12.9, 13.0, 12.4, 12.5, 1_400.0, -3.8);
+        let (negative, reason, _) = score_air_refuel_pattern(&falling);
+        assert!(negative < positive, "{reason}");
+    }
+
+    #[test]
+    fn breakout_scoring_and_upturn_gate_cover_all_signal_classes() {
+        let launch = breakout(
+            BreakoutType::Launch,
+            VolumePattern::PostShrinkBurst,
+            CandleStrength::Strong,
+            90,
+        );
+        let uncertain = breakout(
+            BreakoutType::Uncertain,
+            VolumePattern::GentleIncrease,
+            CandleStrength::Medium,
+            50,
+        );
+        let distribution = breakout(
+            BreakoutType::Distribution,
+            VolumePattern::SuddenSpike,
+            CandleStrength::Bearish,
+            10,
+        );
+        let flat = breakout(
+            BreakoutType::Uncertain,
+            VolumePattern::Flat,
+            CandleStrength::Weak,
+            40,
+        );
+
+        assert!(score_breakout_structure(&launch).0 > 0.0);
+        assert!(score_breakout_structure(&uncertain).0 > 0.0);
+        assert!(score_breakout_structure(&distribution).0 < 0.0);
+        assert!(score_breakout_structure(&flat).0 < 0.0);
+        assert!(is_uptrend_or_upturn(&launch));
+        assert!(is_uptrend_or_upturn(&uncertain));
+        assert!(!is_uptrend_or_upturn(&distribution));
+        assert!(!is_uptrend_or_upturn(&flat));
+    }
+
+    #[test]
+    fn profit_elasticity_covers_missing_growth_margin_roe_and_quality_risk() {
+        let (score, reason, quality) = score_profit_elasticity(&Financials::default());
+        assert_eq!(score, 0.0);
+        assert!(reason.contains("数据不足"));
+        assert!(quality.contains("未知"));
+
+        let healthy = Financials {
+            roe: Some(18.0),
+            revenue_yoy: Some(20.0),
+            net_profit_yoy: Some(40.0),
+            gross_margin: Some(30.0),
+            history: vec![FinancialPeriod {
+                eps: Some(1.0),
+                op_cash_flow_ps: Some(1.2),
+                revenue_yoy: Some(20.0),
+                net_profit_yoy: Some(40.0),
+                gross_margin: Some(30.0),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let (healthy_score, healthy_reason, _) = score_profit_elasticity(&healthy);
+        assert!(healthy_score >= 6.0, "{healthy_reason}");
+
+        let risky = Financials {
+            roe: Some(11.0),
+            revenue_yoy: Some(5.0),
+            net_profit_yoy: Some(30.0),
+            gross_margin: Some(18.0),
+            history: vec![
+                FinancialPeriod {
+                    eps: Some(1.0),
+                    op_cash_flow_ps: Some(0.1),
+                    revenue_yoy: Some(5.0),
+                    net_profit_yoy: Some(30.0),
+                    gross_margin: Some(30.0),
+                    debt_to_assets: Some(90.0),
+                    ..Default::default()
+                },
+                FinancialPeriod {
+                    gross_margin: Some(15.0),
+                    debt_to_assets: Some(50.0),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let (risky_score, risky_reason, risky_quality) = score_profit_elasticity(&risky);
+        assert!(risky_score < healthy_score, "{risky_reason}");
+        assert!(risky_quality.contains("风险分"));
+    }
+
+    fn flow(values: &[f64]) -> MoneyFlowSummary {
+        MoneyFlowSummary {
+            days: values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| MoneyFlowDay {
+                    date: format!("2026-07-{:02}", index + 1),
+                    main_net: value * 1e8,
+                    xl_net: 0.0,
+                    big_net: 0.0,
+                    main_pct: 0.0,
+                    pct_chg: 0.0,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn capital_consensus_covers_missing_positive_negative_and_bounce_flows() {
+        let (missing, reason) =
+            score_capital_consensus(&MoneyFlowSummary::default(), Some(&"x".repeat(90)));
+        assert_eq!(missing, 0.0);
+        assert!(reason.contains("..."));
+        assert!(score_capital_consensus(&MoneyFlowSummary::default(), None)
+            .1
+            .contains("未知原因"));
+
+        let (positive, _) = score_capital_consensus(&flow(&[1.0, 2.0, 3.0, 4.0, 5.0]), None);
+        let (negative, _) = score_capital_consensus(&flow(&[-1.0, -2.0, -3.0, -4.0, -5.0]), None);
+        let (bounce, bounce_reason) =
+            score_capital_consensus(&flow(&[-15.0, -15.0, -15.0, -15.0, 2.0]), None);
+        assert!(positive > 0.0);
+        assert!(negative < 0.0);
+        assert!(bounce < positive);
+        assert!(bounce_reason.contains("单日反弹"));
+    }
+
+    #[test]
+    fn chain_evidence_matching_and_confidence_cover_sources_and_cross_validation() {
+        let hit = chain_hit(ChainSource::Rule);
+        assert!(!text_matches_hit("", &hit));
+        assert!(text_matches_hit("集成电路扩产", &hit));
+        assert!(text_matches_hit("半导体景气", &hit));
+        assert!(text_matches_hit("AI 芯片订单", &hit));
+        assert!(!text_matches_hit("医药集采", &hit));
+
+        let titles = vec![
+            "集成电路扩产项目落地并带动芯片产业链景气".into(),
+            "半导体设备订单改善".into(),
+            "无关标题".into(),
+        ];
+        let evidence = build_chain_event_evidence(std::slice::from_ref(&hit), &titles);
+        assert!(evidence["半导体"].contains("事件样本"));
+        let no_evidence = build_chain_event_evidence(std::slice::from_ref(&hit), &[]);
+        assert!(no_evidence["半导体"].contains("未检索到"));
+
+        let web = vec![search_result("芯片产业升级", "集成电路", 12)];
+        let (rule_score, cross, reason) = score_hit_confidence(&hit, &titles, &web);
+        assert!(cross);
+        assert!(rule_score > 50, "{reason}");
+        for source in [ChainSource::Ai, ChainSource::AiDegraded, ChainSource::Board] {
+            let (score, _, _) = score_hit_confidence(&chain_hit(source), &[], &[]);
+            assert!(score <= rule_score);
+        }
     }
 
     #[test]

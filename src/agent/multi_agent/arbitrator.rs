@@ -206,3 +206,80 @@ pub(super) async fn run_arbitrator(
         composite_score: composite,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn view(score: i32) -> AnalystView {
+        AnalystView {
+            score,
+            stance: String::new(),
+            confidence: String::new(),
+            key_signals: Vec::new(),
+            summary: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn weighted_advice_bands_and_unavailable_arbitrator_are_deterministic() {
+        assert_eq!(
+            weighted_score(
+                &view(100),
+                &view(100),
+                &view(100),
+                &view(100),
+                &view(100),
+                &view(100)
+            ),
+            100
+        );
+        assert_eq!(
+            weighted_score(
+                &view(-100),
+                &view(-100),
+                &view(-100),
+                &view(-100),
+                &view(-100),
+                &view(-100)
+            ),
+            0
+        );
+        for (score, advice) in [
+            (70, "强烈买入"),
+            (55, "买入"),
+            (45, "观望"),
+            (30, "减持"),
+            (29, "强烈卖出"),
+        ] {
+            assert_eq!(preliminary_advice(score), advice);
+        }
+
+        let analyzer = GeminiAnalyzer::new(crate::analyzer::GeminiConfig {
+            max_retries: 1,
+            retry_delay: 0.0,
+            request_delay: 0.0,
+            ..crate::analyzer::GeminiConfig::default()
+        });
+        let neutral = view(50);
+        let error = run_arbitrator(
+            &analyzer,
+            "TEST_CODE_标的",
+            &neutral,
+            &neutral,
+            &neutral,
+            &neutral,
+            &neutral,
+            &neutral,
+            &DebateOutput {
+                bull: String::new(),
+                bear: String::new(),
+                risk: String::new(),
+            },
+        )
+        .await
+        .err()
+        .expect("missing model must remain explicit");
+        assert!(error.to_string().contains("API Key 未配置"));
+    }
+}

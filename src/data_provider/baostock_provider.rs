@@ -843,6 +843,34 @@ mod inline_tests {
         producer.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn tcp_provider_fails_closed_when_the_real_endpoint_is_unreachable() {
+        let provider = BaostockProvider {
+            stream: Arc::new(Mutex::new(None)),
+            session: Mutex::new(None),
+            host: "127.0.0.1".to_string(),
+            port: 9,
+        };
+        assert!(provider
+            .send_and_recv(b"TEST_CODE_FRAME")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("未连接"));
+        assert!(provider.ensure_session().await.is_err());
+        assert!(provider
+            .fetch_kline_async("TEST_CODE_000001", 5)
+            .await
+            .is_err());
+        provider.logout("TEST_CODE_SESSION").await;
+        assert_eq!(provider.name(), "baostock");
+        assert_eq!(provider.get_stock_name("TEST_CODE_000001"), None);
+        assert!(provider
+            .get_realtime_quote("TEST_CODE_000001")
+            .unwrap()
+            .is_none());
+    }
+
     #[test]
     fn cdata_and_kline_batch_round_trip_complete_values() {
         assert_eq!(strip_cdata("  plain  "), "plain");

@@ -26,6 +26,53 @@ pub struct GtimgProvider {
 }
 
 impl GtimgProvider {
+    fn parse_kline_http_response(
+        status: u16,
+        body: std::result::Result<String, String>,
+        code: &str,
+    ) -> Result<Vec<KlineData>> {
+        if !(200..300).contains(&status) {
+            return Err(anyhow!("HTTP请求返回错误状态: {status}"));
+        }
+        let text = body.map_err(|error| anyhow!("读取响应失败: {error}"))?;
+        if text.is_empty() {
+            return Err(anyhow!("API返回空响应"));
+        }
+        let trimmed = text.trim_start();
+        if trimmed.starts_with('<') {
+            let preview: String = trimmed.chars().take(120).collect();
+            return Err(anyhow!(
+                "腾讯K线接口返回非JSON内容（可能被网关重定向/拦截）: {preview}"
+            ));
+        }
+        Self::parse_kline_response_internal(&text, code)
+    }
+
+    fn enrich_latest_kline(klines: &mut [KlineData], quote: Option<&RealtimeQuote>) {
+        let (Some(latest), Some(quote)) = (klines.first_mut(), quote) else {
+            return;
+        };
+        latest.intraday_price = Some(quote.price);
+        latest.settled = false;
+        latest.pe_ratio = latest.pe_ratio.or(quote.pe_ratio);
+        latest.pb_ratio = latest.pb_ratio.or(quote.pb_ratio);
+        latest.turnover_rate = latest.turnover_rate.or(quote.turnover_rate);
+        latest.market_cap = latest.market_cap.or(quote.market_cap);
+        latest.circulating_cap = latest.circulating_cap.or(quote.circulating_cap);
+    }
+
+    fn parse_realtime_http_response(
+        status: u16,
+        body: std::result::Result<String, String>,
+        code: &str,
+    ) -> Result<Option<RealtimeQuote>> {
+        if !(200..300).contains(&status) {
+            return Err(anyhow!("腾讯实时行情 {code} HTTP 失败: status={status}"));
+        }
+        let text = body.map_err(|error| anyhow!("腾讯实时行情 {code} 响应读取失败: {error}"))?;
+        Self::parse_realtime_quote_response(&text, code)
+    }
+
     /// 统一规范化股票代码，并推导腾讯接口所需交易所前缀。
     ///
     /// 支持输入：
@@ -156,31 +203,9 @@ impl GtimgProvider {
             }
         };
 
-        if !response.status().is_success() {
-            log::error!("[腾讯] 响应状态码: {} (code={})", response.status(), code);
-            return Err(anyhow!("HTTP请求返回错误状态: {}", response.status()));
-        }
-
-        let text = response.text().await.context("读取响应失败")?;
-
-        if text.is_empty() {
-            log::error!("[腾讯] 响应为空 (code={})", code);
-            return Err(anyhow!("API返回空响应"));
-        }
-
-        let body = text.trim_start();
-        if body.starts_with('<') {
-            let preview: String = body.chars().take(120).collect();
-            return Err(anyhow!(
-                "腾讯K线接口返回非JSON内容（可能被网关重定向/拦截）: {}",
-                preview
-            ));
-        }
-
-        log::debug!("[腾讯] 响应前200字符: {}", &text[..text.len().min(200)]);
-
-        // 解析JSON
-        let mut klines = Self::parse_kline_response_internal(&text, &normalized_code)?;
+        let status = response.status().as_u16();
+        let body = response.text().await.map_err(|error| error.to_string());
+        let mut klines = Self::parse_kline_http_response(status, body, &normalized_code)?;
 
         // 获取实时行情数据，补充盈利指标到最新K线
         if !klines.is_empty() {
@@ -192,29 +217,14 @@ impl GtimgProvider {
                 klines[0].close
             );
 
-            if let Ok(Some(quote)) =
-                Self::fetch_realtime_quote_internal(client, &normalized_code).await
-            {
-                // v11 P0-2 (commit 2): 修复盘中价污染
-                // 之前: latest.close = quote.price → Sharpe 等指标用盘中价滚动算
-                // 现在: 盘中价放 intraday_price, close 保持日线 settled 值
-                if let Some(latest) = klines.first_mut() {
-                    let _old_close = latest.close; // 保留日志用
-                    latest.intraday_price = Some(quote.price);
-                    latest.settled = false;
-                    latest.pe_ratio = latest.pe_ratio.or(quote.pe_ratio);
-                    latest.pb_ratio = latest.pb_ratio.or(quote.pb_ratio);
-                    latest.turnover_rate = latest.turnover_rate.or(quote.turnover_rate);
-                    latest.market_cap = latest.market_cap.or(quote.market_cap);
-                    latest.circulating_cap = latest.circulating_cap.or(quote.circulating_cap);
-
-                    log::info!("[腾讯] {} 盘中价 {:.2}元 (close 保持日线 settled {:.2}元), PE={:?}, PB={:?}, 换手率={:?}%, 总市值={:?}亿, 流通市值={:?}亿",
-                        code, quote.price, _old_close, quote.pe_ratio, quote.pb_ratio, quote.turnover_rate,
-                        quote.market_cap, quote.circulating_cap);
-                }
-            } else {
+            let quote = Self::fetch_realtime_quote_internal(client, &normalized_code)
+                .await
+                .ok()
+                .flatten();
+            if quote.is_none() {
                 log::warn!("[腾讯] {} 无法获取实时行情数据", code);
             }
+            Self::enrich_latest_kline(&mut klines, quote.as_ref());
         }
 
         Ok(klines)
@@ -391,14 +401,10 @@ impl GtimgProvider {
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
-            .map_err(|error| anyhow!("腾讯实时行情 {code} 请求失败: {error}"))?
-            .error_for_status()
-            .map_err(|error| anyhow!("腾讯实时行情 {code} HTTP 失败: {error}"))?;
-        let text = response
-            .text()
-            .await
-            .map_err(|error| anyhow!("腾讯实时行情 {code} 响应读取失败: {error}"))?;
-        Self::parse_realtime_quote_response(&text, code)
+            .map_err(|error| anyhow!("腾讯实时行情 {code} 请求失败: {error}"))?;
+        let status = response.status().as_u16();
+        let body = response.text().await.map_err(|error| error.to_string());
+        Self::parse_realtime_http_response(status, body, code)
     }
 
     fn parse_realtime_quote_response(text: &str, code: &str) -> Result<Option<RealtimeQuote>> {
@@ -527,6 +533,95 @@ mod tests {
 
     fn kline_body(field: &str, rows: serde_json::Value) -> String {
         serde_json::json!({"data": {"sh600519": {field: rows}}}).to_string()
+    }
+
+    fn complete_kline_body() -> String {
+        kline_body(
+            "qfqday",
+            serde_json::json!([
+                [
+                    "2026-07-15",
+                    "10.00",
+                    "10.00",
+                    "10.20",
+                    "9.90",
+                    "1000",
+                    "100000"
+                ],
+                [
+                    "2026-07-16",
+                    "10.00",
+                    "10.10",
+                    "10.20",
+                    "9.95",
+                    "1100",
+                    "101000"
+                ]
+            ]),
+        )
+    }
+
+    #[test]
+    fn kline_http_decision_rejects_transport_protocol_and_bad_batches() {
+        for (status, body, expected) in [
+            (503, Ok(String::new()), "503"),
+            (200, Err("read failed".to_string()), "读取响应失败"),
+            (200, Ok(String::new()), "空响应"),
+            (200, Ok("  <html>blocked</html>".to_string()), "非JSON"),
+            (200, Ok("not-json".to_string()), "解析JSON失败"),
+        ] {
+            let error = GtimgProvider::parse_kline_http_response(status, body, "600519")
+                .expect_err("incomplete HTTP fact must fail");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+        let data =
+            GtimgProvider::parse_kline_http_response(200, Ok(complete_kline_body()), "600519")
+                .expect("complete strict HTTP body");
+        assert_eq!(data.len(), 2);
+    }
+
+    #[test]
+    fn realtime_http_decision_and_kline_enrichment_preserve_nullable_fields() {
+        assert!(GtimgProvider::parse_realtime_http_response(
+            429,
+            Ok(String::new()),
+            "TEST_CODE_000001"
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("429"));
+        assert!(GtimgProvider::parse_realtime_http_response(
+            200,
+            Err("read failed".to_string()),
+            "TEST_CODE_000001"
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("响应读取失败"));
+
+        let quote = GtimgProvider::parse_realtime_http_response(
+            200,
+            Ok(realtime_body(&[])),
+            "TEST_CODE_000001",
+        )
+        .expect("complete real-time protocol")
+        .expect("present quote");
+        let mut data =
+            GtimgProvider::parse_kline_http_response(200, Ok(complete_kline_body()), "600519")
+                .expect("complete daily batch");
+        data[0].pe_ratio = Some(99.0);
+        let settled_close = data[0].close;
+        GtimgProvider::enrich_latest_kline(&mut data, Some(&quote));
+        assert_eq!(data[0].close, settled_close);
+        assert_eq!(data[0].intraday_price, Some(10.10));
+        assert!(!data[0].settled);
+        assert_eq!(data[0].pe_ratio, Some(99.0));
+        assert_eq!(data[0].pb_ratio, Some(2.0));
+
+        let unchanged = data.clone();
+        GtimgProvider::enrich_latest_kline(&mut data, None);
+        assert_eq!(data[0].intraday_price, unchanged[0].intraday_price);
+        GtimgProvider::enrich_latest_kline(&mut [], Some(&quote));
     }
 
     #[test]
@@ -690,6 +785,25 @@ mod tests {
                 assert!(!name.is_empty());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn real_tencent_transports_fail_without_quote_or_kline_fallback() {
+        let client = super::super::unreachable_http_client();
+        assert!(
+            GtimgProvider::fetch_kline_data_internal(&client, "TEST_CODE_000001", 5)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            GtimgProvider::fetch_stock_name_internal(&client, "TEST_CODE_000001").await,
+            None
+        );
+        assert!(
+            GtimgProvider::fetch_realtime_quote_internal(&client, "TEST_CODE_000001")
+                .await
+                .is_err()
+        );
     }
 
     #[test]

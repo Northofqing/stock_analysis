@@ -1260,3 +1260,135 @@ impl KlineStrategy for RsiStrategy {
         Ok(Box::new(result))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data_provider::AdjustType;
+
+    fn history() -> Vec<KlineData> {
+        let start = NaiveDate::from_ymd_opt(2025, 11, 1).expect("valid fixture start");
+        (0..230)
+            .map(|index| {
+                let close = match index {
+                    0..=179 => 10.0 + index as f64 * 0.03,
+                    180..=194 => 15.5 - (index - 180) as f64 * 0.35,
+                    195..=210 => 10.6 + (index - 195) as f64 * 0.55,
+                    _ => 19.0 - (index - 211) as f64 * 0.08,
+                };
+                KlineData {
+                    date: start + chrono::Duration::days(index as i64),
+                    open: close + 0.05,
+                    high: close + 0.2,
+                    low: close - 0.2,
+                    close,
+                    volume: 10_000.0 + index as f64,
+                    amount: close * (10_000.0 + index as f64),
+                    pct_chg: 0.0,
+                    intraday_price: None,
+                    settled: true,
+                    pe_ratio: None,
+                    pb_ratio: None,
+                    turnover_rate: None,
+                    market_cap: None,
+                    circulating_cap: None,
+                    eps: None,
+                    roe: None,
+                    revenue_yoy: None,
+                    net_profit_yoy: None,
+                    gross_margin: None,
+                    net_margin: None,
+                    sharpe_ratio: None,
+                    financials_history: None,
+                    valuation_history: None,
+                    consensus: None,
+                    industry: None,
+                    is_limit_up: false,
+                    is_limit_down: false,
+                    is_suspended: false,
+                    adjust: AdjustType::Qfq,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn presets_indicators_engine_portfolio_and_report_execute_complete_history() {
+        let presets = [
+            RsiConfig::preset_baseline(),
+            RsiConfig::preset_daily_v1(),
+            RsiConfig::preset_daily_v2(),
+            RsiConfig::preset_daily_v3_strict(),
+            RsiConfig::preset_daily_v4_stop_take(),
+            RsiConfig::preset_daily_v5_high_winrate(),
+            RsiConfig::preset_daily_v6_clean(),
+            RsiConfig::preset_daily_v7_deeper(),
+            RsiConfig::preset_daily_v8_score2(),
+            RsiConfig::preset_daily_v9_reversal(),
+            RsiConfig::preset_daily_v10_no_stop(),
+            RsiConfig::preset_daily_v11_no_stop_rising(),
+            RsiConfig::preset_daily_v12_deep_no_stop(),
+            RsiConfig::preset_daily_v13_strict_rising(),
+        ];
+        assert_eq!(presets.len(), 14);
+        assert_eq!(presets[1].timeframe, "1d");
+        assert!(presets[3].require_all_filters);
+        assert_eq!(presets[13].rsi_rising_confirm_bars, 2);
+
+        let bars = history();
+        assert!(compute_rsi_indicators(&bars[..20], &RsiConfig::default()).is_err());
+        let mut config = RsiConfig::preset_daily_v1();
+        config.use_vwap_filter = false;
+        config.use_macd_filter = false;
+        config.use_ema_sma_filter = false;
+        config.min_buy_filters = 0;
+        config.start_date = None;
+        config.end_date = None;
+        let frame = compute_rsi_indicators(&bars, &config).expect("complete RSI indicators");
+        assert_eq!(frame.height(), bars.len());
+        assert!(frame.column("rsi").is_ok());
+
+        let engine = RsiBacktest::new(config.clone());
+        let single = engine
+            .run_single("TEST_CODE_RSI_000001", "测试RSI策略", &bars)
+            .expect("single RSI backtest");
+        assert_eq!(single.signals.len(), bars.len());
+        assert_eq!(single.rsi_values.len(), bars.len());
+        assert!(single.final_value.is_finite());
+
+        assert!(engine.run_portfolio(&[]).is_err());
+        assert!(engine
+            .run_portfolio(&[(
+                "TEST_CODE_RSI_SHORT".to_string(),
+                "测试短历史".to_string(),
+                bars[..10].to_vec(),
+            )])
+            .is_err());
+        let mut descending = bars.clone();
+        descending.reverse();
+        let portfolio = engine
+            .run_portfolio(&[
+                (
+                    "TEST_CODE_RSI_000001".to_string(),
+                    "测试RSI策略A".to_string(),
+                    bars,
+                ),
+                (
+                    "TEST_CODE_RSI_000002".to_string(),
+                    "测试RSI策略B".to_string(),
+                    descending,
+                ),
+            ])
+            .expect("complete RSI portfolio");
+        assert_eq!(portfolio.single_results.len(), 2);
+        assert!(!portfolio.portfolio_daily_values.is_empty());
+        assert!(portfolio.to_summary().final_value.is_finite());
+        let report = portfolio.generate_report();
+        assert!(report.contains("RSI 增强策略 v2 回测报告"));
+        assert!(report.contains("TEST_CODE_RSI_000001"));
+
+        let strategy = RsiStrategy::new(config);
+        assert!(strategy.name().contains("RSI增强策略"));
+        assert!(strategy.description().contains("Wilder RSI"));
+    }
+}

@@ -388,4 +388,10 @@ mod strict_contract_tests {
         assert_eq!(ConsensusData::default().bullish_ratio(), None);
         assert!(fetch_blocking(&reqwest::Client::new(), "TEST_CODE_000001").is_err());
     }
+
+    #[tokio::test]
+    async fn real_consensus_transport_failure_is_not_an_empty_consensus() {
+        let client = super::super::unreachable_http_client();
+        assert!(fetch_async(&client, "TEST_CODE_000001").await.is_err());
+    }
 }

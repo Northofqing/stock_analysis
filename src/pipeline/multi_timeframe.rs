@@ -23,6 +23,14 @@ pub(super) async fn fetch_multi_timeframe_section(code: &str) -> Result<Option<S
         crate::data_provider::intraday_kline::fetch_async(client, code, 60, 120),
         crate::data_provider::intraday_kline::fetch_async(client, code, 15, 80)
     );
+    resolve_multi_timeframe_results(code, h1_result, m15_result)
+}
+
+fn resolve_multi_timeframe_results(
+    code: &str,
+    h1_result: anyhow::Result<Vec<crate::data_provider::intraday_kline::MinuteBar>>,
+    m15_result: anyhow::Result<Vec<crate::data_provider::intraday_kline::MinuteBar>>,
+) -> Result<Option<String>, String> {
     let h1 = h1_result.map_err(|error| format!("[{code}] 60min K线不可用: {error}"))?;
     let m15 = m15_result.map_err(|error| format!("[{code}] 15min K线不可用: {error}"))?;
     Ok(resolve_multi_timeframe_section(&h1, &m15))
@@ -76,5 +84,26 @@ mod tests {
         assert!(section.contains("多周期入场点"));
         assert!(section.contains("命中入场规则:"));
         assert!(section.contains("结论:"));
+    }
+
+    #[test]
+    fn resolved_results_preserve_source_specific_failures() {
+        let h1_error = resolve_multi_timeframe_results(
+            "TEST_CODE_000001",
+            Err(anyhow::anyhow!("60min transport")),
+            Ok(bars(30, 15)),
+        )
+        .unwrap_err();
+        assert!(h1_error.contains("[TEST_CODE_000001] 60min K线不可用"));
+        assert!(h1_error.contains("60min transport"));
+
+        let m15_error = resolve_multi_timeframe_results(
+            "TEST_CODE_000001",
+            Ok(bars(40, 60)),
+            Err(anyhow::anyhow!("15min transport")),
+        )
+        .unwrap_err();
+        assert!(m15_error.contains("[TEST_CODE_000001] 15min K线不可用"));
+        assert!(m15_error.contains("15min transport"));
     }
 }

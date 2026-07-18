@@ -29,13 +29,36 @@ use crate::http_client::SHARED_HTTP_CLIENT;
 /// assert!(date.year() >= 2000);
 /// ```
 pub async fn fetch_ipo_date(code: &str) -> Result<NaiveDate> {
-    // 1. 6 位代码 → 1.600519 (沪) 或 0.000001 (深)
-    let secid = match code.chars().next() {
-        Some('6') => format!("1.{}", code),
-        Some('0') | Some('2') | Some('3') => format!("0.{}", code),
-        Some('8') | Some('9') => format!("0.{}", code), // 北交所: 8/92 都走 sz
+    fetch_ipo_date_with_client(&SHARED_HTTP_CLIENT, code).await
+}
+
+fn secid_for_code(code: &str) -> Result<String> {
+    #[cfg(not(test))]
+    let normalized = code;
+    #[cfg(test)]
+    let normalized = code.strip_prefix("TEST_CODE_").unwrap_or(code);
+    let secid = match normalized.chars().next() {
+        Some('6') => format!("1.{}", normalized),
+        Some('0') | Some('2') | Some('3') => format!("0.{}", normalized),
+        Some('8') | Some('9') => format!("0.{}", normalized), // 北交所: 8/92 都走 sz
         _ => anyhow::bail!("未知市场前缀: {}", code),
     };
+    Ok(secid)
+}
+
+fn parse_ipo_date_body(body: &str, code: &str) -> Result<NaiveDate> {
+    let json: serde_json::Value =
+        serde_json::from_str(body).context("东方财富 f26 JSON 解析失败")?;
+    let f26 = json["data"]["f26"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("东方财富 f26 字段缺失 (code={})", code))?;
+    NaiveDate::parse_from_str(f26, "%Y%m%d")
+        .with_context(|| format!("东方财富 f26 解析失败: '{}'", f26))
+}
+
+async fn fetch_ipo_date_with_client(client: &reqwest::Client, code: &str) -> Result<NaiveDate> {
+    // 1. 6 位代码 → 1.600519 (沪) 或 0.000001 (深)
+    let secid = secid_for_code(code)?;
 
     // 2. 东方财富 f26 = 上市日期 (YYYYMMDD, 8 位字符串)
     let url = format!(
@@ -43,7 +66,7 @@ pub async fn fetch_ipo_date(code: &str) -> Result<NaiveDate> {
         secid
     );
 
-    let body = SHARED_HTTP_CLIENT
+    let body = client
         .get(&url)
         .send()
         .await
@@ -53,15 +76,7 @@ pub async fn fetch_ipo_date(code: &str) -> Result<NaiveDate> {
         .context("东方财富 f26 读取 body 失败")?;
 
     // 3. 解析 JSON: {"data": {"f26": "20010827"}}
-    let json: serde_json::Value =
-        serde_json::from_str(&body).context("东方财富 f26 JSON 解析失败")?;
-
-    let f26 = json["data"]["f26"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("东方财富 f26 字段缺失 (code={})", code))?;
-
-    NaiveDate::parse_from_str(f26, "%Y%m%d")
-        .with_context(|| format!("东方财富 f26 解析失败: '{}'", f26))
+    parse_ipo_date_body(&body, code)
 }
 
 #[cfg(test)]
@@ -71,42 +86,32 @@ mod tests {
     /// v11-P0-3 commit 1: secid 路由正确
     #[test]
     fn test_secid_routing() {
-        assert_eq!(
-            secid_for_code("600519"),
-            "1.600519",
-            "沪市 (6开头) → secid=1"
-        );
-        assert_eq!(
-            secid_for_code("000001"),
-            "0.000001",
-            "深市主板 (0开头) → secid=0"
-        );
-        assert_eq!(
-            secid_for_code("300750"),
-            "0.300750",
-            "创业板 (3开头) → secid=0"
-        );
-        assert_eq!(
-            secid_for_code("688981"),
-            "1.688981",
-            "科创板 (6开头但 secid=1) → secid=1"
-        );
-        assert_eq!(
-            secid_for_code("830799"),
-            "0.830799",
-            "北交所 (8开头) → secid=0"
-        );
+        assert_eq!(secid_for_code("TEST_CODE_600519").unwrap(), "1.600519");
+        assert_eq!(secid_for_code("TEST_CODE_000001").unwrap(), "0.000001");
+        assert_eq!(secid_for_code("TEST_CODE_300750").unwrap(), "0.300750");
+        assert_eq!(secid_for_code("TEST_CODE_688981").unwrap(), "1.688981");
+        assert_eq!(secid_for_code("TEST_CODE_830799").unwrap(), "0.830799");
+        assert_eq!(secid_for_code("TEST_CODE_920001").unwrap(), "0.920001");
+        assert!(secid_for_code("TEST_CODE_BAD").is_err());
     }
 
-    /// secid 路由 (单元测试可见)
-    fn secid_for_code(code: &str) -> String {
-        match code.chars().next() {
-            Some('6') => format!("1.{}", code),
-            Some('0') | Some('2') | Some('3') | Some('8') | Some('9') => {
-                format!("0.{}", code)
-            }
-            _ => "unknown".to_string(),
-        }
+    #[test]
+    fn ipo_body_parser_requires_a_real_eight_digit_date() {
+        assert_eq!(
+            parse_ipo_date_body(r#"{"data":{"f26":"20010827"}}"#, "TEST_CODE_000001").unwrap(),
+            NaiveDate::from_ymd_opt(2001, 8, 27).unwrap()
+        );
+        assert!(parse_ipo_date_body("not-json", "TEST_CODE_000001").is_err());
+        assert!(parse_ipo_date_body(r#"{"data":{}}"#, "TEST_CODE_000001").is_err());
+        assert!(parse_ipo_date_body(r#"{"data":{"f26":"20260230"}}"#, "TEST_CODE_000001").is_err());
+    }
+
+    #[tokio::test]
+    async fn ipo_transport_failure_is_explicit() {
+        let client = super::super::unreachable_http_client();
+        assert!(fetch_ipo_date_with_client(&client, "TEST_CODE_920001")
+            .await
+            .is_err());
     }
 
     /// ⚠️ 网络依赖, `#[ignore]` 跳过 CI, 手动跑:

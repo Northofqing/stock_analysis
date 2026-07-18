@@ -382,9 +382,47 @@ impl Default for DataFetcherManager {
     }
 }
 
+/// Test-only transport that deterministically exercises real-source failure handling.
+/// It never exists in production and cannot return provider data.
+#[cfg(test)]
+pub(crate) fn unreachable_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .proxy(
+            reqwest::Proxy::all("http://127.0.0.1:9")
+                .expect("fixed unreachable test proxy must parse"),
+        )
+        .connect_timeout(std::time::Duration::from_millis(25))
+        .timeout(std::time::Duration::from_millis(100))
+        .build()
+        .expect("unreachable test client must build")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    struct NameOnlyProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl DataProvider for NameOnlyProvider {
+        fn get_daily_data(&self, _code: &str, _days: usize) -> Result<Vec<KlineData>> {
+            Err(anyhow!("test provider has no market data"))
+        }
+
+        fn get_stock_name(&self, code: &str) -> Option<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            (code == "TEST_CODE_000001").then(|| "测试股票".to_string())
+        }
+
+        fn name(&self) -> &'static str {
+            "test-name-only"
+        }
+    }
 
     /// v11 P0-2: AdjustType as_str 应返回稳定的小写字符串,用于 data_source 复合命名 (rustdx_qfq / tencent_qfq / eastmoney_qfq)
     #[test]
@@ -400,6 +438,70 @@ mod tests {
         let b = a; // Copy: a 仍然可用
         assert_eq!(a, b);
         assert_ne!(AdjustType::Qfq, AdjustType::None);
+    }
+
+    #[test]
+    fn error_classification_and_brief_are_bounded() {
+        for message in [
+            "empty reply",
+            "connection reset",
+            "connection refused",
+            "request TIMEOUT",
+            "HTTP 429",
+            "HTTP 403",
+            "HTTP 502",
+            "HTTP 503",
+            "HTTP 504",
+            "peer closed connection",
+        ] {
+            assert!(is_ban_error(message), "{message}");
+        }
+        assert!(!is_ban_error("invalid response schema"));
+        assert_eq!(brief("short"), "short");
+        let long = "数".repeat(121);
+        let bounded = brief(&long);
+        assert_eq!(bounded.chars().filter(|ch| *ch == '数').count(), 120);
+        assert!(bounded.ends_with("…(截断)"));
+    }
+
+    #[test]
+    fn provider_default_realtime_and_name_cache_are_explicit() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = NameOnlyProvider {
+            calls: Arc::clone(&calls),
+        };
+        assert_eq!(provider.name(), "test-name-only");
+        assert!(provider.get_daily_data("TEST_CODE_000001", 1).is_err());
+        assert!(provider
+            .get_realtime_quote("TEST_CODE_000001")
+            .expect("default realtime boundary")
+            .is_none());
+
+        let manager = DataFetcherManager {
+            providers: vec![Box::new(provider)],
+            stock_name_cache: RwLock::new(HashMap::new()),
+        };
+        assert_eq!(
+            manager.get_stock_name("TEST_CODE_000001").as_deref(),
+            Some("测试股票")
+        );
+        assert_eq!(
+            manager.get_stock_name("TEST_CODE_000001").as_deref(),
+            Some("测试股票")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(manager.get_stock_name("TEST_CODE_UNKNOWN"), None);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn manager_construction_keeps_only_available_real_providers() {
+        let manager = DataFetcherManager::new().expect("manager construction is local-only");
+        assert!(manager.stock_name_cache.read().unwrap().is_empty());
+        assert!(manager
+            .providers
+            .iter()
+            .all(|provider| !provider.name().trim().is_empty()));
     }
 
     /// v11 P0-2 commit 2: `DataFetcherManager::get_daily_data` (sync 入口) 在

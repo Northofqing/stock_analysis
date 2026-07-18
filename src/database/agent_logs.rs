@@ -29,3 +29,42 @@ impl AgentLogDao {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(QueryableByName)]
+    struct StoredLog {
+        #[diesel(sql_type = Text)]
+        session_id: String,
+        #[diesel(sql_type = Integer)]
+        step: i32,
+        #[diesel(sql_type = Text)]
+        log_type: String,
+        #[diesel(sql_type = Text)]
+        content: String,
+    }
+
+    #[test]
+    fn insert_log_persists_the_complete_audit_record() {
+        DatabaseManager::init(None).expect("test database initialization must succeed");
+        let session_id = "TEST_CODE_AGENT_LOG_SESSION";
+        AgentLogDao::insert_log(session_id, 7, "tool", "validated content")
+            .expect("agent audit log must persist");
+
+        let db = DatabaseManager::try_get().expect("test database must remain initialized");
+        let mut conn = db.get_conn().expect("test database connection");
+        let stored = diesel::sql_query(
+            "SELECT session_id, step, log_type, content FROM agent_scratchpad \
+             WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+        )
+        .bind::<Text, _>(session_id)
+        .get_result::<StoredLog>(&mut conn)
+        .expect("persisted agent audit row");
+        assert_eq!(stored.session_id, session_id);
+        assert_eq!(stored.step, 7);
+        assert_eq!(stored.log_type, "tool");
+        assert_eq!(stored.content, "validated content");
+    }
+}

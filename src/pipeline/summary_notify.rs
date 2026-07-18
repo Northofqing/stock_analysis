@@ -41,15 +41,7 @@ pub(super) async fn send_summary_notification(
     let stock_report = notifier.generate_daily_report(results, regime_section);
 
     // 合并产业链分析（如果有涨停数据）到报告头部
-    let report = if let Some(chain) = chain_analysis_section {
-        if chain.trim().is_empty() {
-            stock_report
-        } else {
-            format!("{}\n\n---\n\n{}", chain.trim(), stock_report)
-        }
-    } else {
-        stock_report
-    };
+    let report = compose_summary_report(stock_report, chain_analysis_section);
 
     if let Some(summary) = backtest_summary {
         let backtest_report = reporting::build_backtest_report(summary);
@@ -70,4 +62,34 @@ pub(super) async fn send_summary_notification(
     }
 
     Ok(())
+}
+
+fn compose_summary_report(stock_report: String, chain_analysis_section: Option<&str>) -> String {
+    if let Some(chain) = chain_analysis_section {
+        if chain.trim().is_empty() {
+            stock_report
+        } else {
+            format!("{}\n\n---\n\n{}", chain.trim(), stock_report)
+        }
+    } else {
+        stock_report
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compose_summary_report;
+
+    #[test]
+    fn summary_composition_preserves_stock_report_and_nonempty_chain() {
+        assert_eq!(compose_summary_report("stocks".into(), None), "stocks");
+        assert_eq!(
+            compose_summary_report("stocks".into(), Some(" \n")),
+            "stocks"
+        );
+        assert_eq!(
+            compose_summary_report("stocks".into(), Some("  chain  \n")),
+            "chain\n\n---\n\nstocks"
+        );
+    }
 }

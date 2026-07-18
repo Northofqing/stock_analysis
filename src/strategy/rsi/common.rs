@@ -210,3 +210,96 @@ pub(super) fn compute_vwap_monthly_vec(klines: &[KlineData]) -> Vec<Option<f64>>
 
     vwap
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data_provider::AdjustType;
+
+    #[test]
+    fn vector_indicators_cover_short_complete_flat_and_month_reset_inputs() {
+        assert!(compute_rsi_wilder(&[], 14).is_empty());
+        assert_eq!(compute_rsi_wilder(&[1.0], 14), vec![50.0]);
+        assert_eq!(compute_rsi_wilder(&[1.0, 2.0], 0), vec![50.0, 50.0]);
+        let closes: Vec<f64> = (0..40)
+            .map(|index| 10.0 + (index % 7) as f64 - (index % 3) as f64)
+            .collect();
+        let rsi = compute_rsi_wilder(&closes, 5);
+        assert_eq!(rsi.len(), closes.len());
+        assert!(rsi.iter().all(|value| (0.0..=100.0).contains(value)));
+
+        assert!(compute_ema_vec(&closes[..3], 5).iter().all(Option::is_none));
+        assert!(compute_ema_vec(&closes, 0).iter().all(Option::is_none));
+        let ema = compute_ema_vec(&closes, 5);
+        let sma = compute_sma_vec(&closes, 5);
+        assert!(ema[4].is_some());
+        assert!(sma[4].is_some());
+        let (macd, signal, histogram) = compute_macd_vec(&closes, 3, 6, 3);
+        assert_eq!(macd.len(), closes.len());
+        assert!(signal.iter().any(Option::is_some));
+        assert!(histogram.iter().any(Option::is_some));
+
+        assert!(compute_vwap_monthly_vec(&[]).is_empty());
+        let bars: Vec<KlineData> = [
+            (
+                chrono::NaiveDate::from_ymd_opt(2026, 1, 30).unwrap(),
+                10.0,
+                100.0,
+            ),
+            (
+                chrono::NaiveDate::from_ymd_opt(2026, 1, 31).unwrap(),
+                12.0,
+                100.0,
+            ),
+            (
+                chrono::NaiveDate::from_ymd_opt(2026, 2, 1).unwrap(),
+                20.0,
+                0.0,
+            ),
+            (
+                chrono::NaiveDate::from_ymd_opt(2026, 2, 2).unwrap(),
+                22.0,
+                100.0,
+            ),
+        ]
+        .into_iter()
+        .map(|(date, close, volume)| KlineData {
+            date,
+            open: close,
+            high: close + 1.0,
+            low: close - 1.0,
+            close,
+            volume,
+            amount: close * volume,
+            pct_chg: 0.0,
+            intraday_price: None,
+            settled: true,
+            pe_ratio: None,
+            pb_ratio: None,
+            turnover_rate: None,
+            market_cap: None,
+            circulating_cap: None,
+            eps: None,
+            roe: None,
+            revenue_yoy: None,
+            net_profit_yoy: None,
+            gross_margin: None,
+            net_margin: None,
+            sharpe_ratio: None,
+            financials_history: None,
+            valuation_history: None,
+            consensus: None,
+            industry: None,
+            is_limit_up: false,
+            is_limit_down: false,
+            is_suspended: false,
+            adjust: AdjustType::Qfq,
+        })
+        .collect();
+        let vwap = compute_vwap_monthly_vec(&bars);
+        assert_eq!(vwap[0], Some(10.0));
+        assert_eq!(vwap[1], Some(11.0));
+        assert_eq!(vwap[2], None);
+        assert_eq!(vwap[3], Some(22.0));
+    }
+}
