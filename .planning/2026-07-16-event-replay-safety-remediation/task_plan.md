@@ -136,6 +136,10 @@ Phase 12 (Gate D coverage and live-account release closure)
 | First Phase-12 multi-file planning patch used a findings line that existed only in progress | 1 | Re-read the exact tails, split the patch around stable anchors, and record the Gate D continuation successfully. |
 | First Gate-D design/plan patch expected a blank line absent from the historical design | 1 | Inspect the exact rollback/addendum boundary and apply the design and new plan as separate patches. |
 | Task-1 format check found only rustfmt layout drift in new tests | 1 | Run repository formatter once, then rerun the check; the pre-existing tree was already format-clean. |
+| Trend fixture lookup used an unmatched zsh glob | 1 | Read the known `src/trend_analyzer.rs` file directly and avoid unresolved globs in zsh commands. |
+| Task-2 format check found one long new fixture signature | 1 | Run rustfmt, then rerun the format gate before validation and commit. |
+| Section report test added one long assertion after the previous format pass | 1 | Run rustfmt again after the final Task-2 slice and keep the next check read-only. |
+| Strict Clippy rejected borrowing an already borrowed `&Path` | 1 | Remove the redundant borrow at the internal report-write seam and rerun focused test plus Clippy. |
 ## Follow-up review slice (2026-07-18)
 
 - [x] Add RED test for `:memory:` journal-mode failure.

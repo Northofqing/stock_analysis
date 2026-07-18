@@ -184,3 +184,121 @@ fn append_battle_plan(s: &mut String, t: &TrendAnalysisResult) {
     }
     s.push_str("- 严格执行止损，避免深套\n");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trend_analyzer::{BuySignal, TrendStatus, VolumeStatus};
+
+    fn trend(
+        signal_score: i32,
+        trend_strength: f64,
+        sharpe_ratio: Option<f64>,
+    ) -> TrendAnalysisResult {
+        TrendAnalysisResult {
+            code: "TEST_CODE_000001".into(),
+            trend_status: TrendStatus::Bull,
+            ma_alignment: "MA5>MA10>MA20".into(),
+            trend_strength,
+            ma5: 9.9,
+            ma10: 9.5,
+            ma20: 9.0,
+            ma60: 8.0,
+            current_price: 10.0,
+            bias_ma5: 1.0,
+            bias_ma10: 5.0,
+            bias_ma20: 10.0,
+            volume_status: VolumeStatus::HeavyVolumeUp,
+            volume_ratio_5d: 1.5,
+            volume_trend: "放量".into(),
+            support_ma5: false,
+            support_ma10: false,
+            resistance_levels: Vec::new(),
+            support_levels: Vec::new(),
+            buy_signal: BuySignal::Buy,
+            signal_score,
+            signal_reasons: Vec::new(),
+            risk_factors: Vec::new(),
+            sharpe_ratio,
+            indicator_analysis: None,
+        }
+    }
+
+    #[test]
+    fn weak_report_omits_optional_sections_and_battle_plan() {
+        let report = build_technical_markdown(&trend(49, 0.4, None));
+
+        assert!(report.contains("| 趋势状态 | 多头排列 | 🔴 偏弱 |"));
+        assert!(report.contains("| 趋势强度 | 40.0% | 较弱 |"));
+        assert!(!report.contains("夏普比率"));
+        assert!(!report.contains("关键价位"));
+        assert!(!report.contains("信号原因"));
+        assert!(!report.contains("风险因素"));
+        assert!(!report.contains("作战计划"));
+    }
+
+    #[test]
+    fn complete_strong_report_renders_levels_reasons_risks_and_ma_plan() {
+        let mut result = trend(70, 0.8, Some(2.0));
+        result.support_ma5 = true;
+        result.support_ma10 = true;
+        result.support_levels = vec![9.2];
+        result.resistance_levels = vec![11.5];
+        result.signal_reasons = vec!["均线多头".into()];
+        result.risk_factors = vec!["波动扩大".into()];
+
+        let report = build_technical_markdown(&result);
+
+        assert!(report.contains("| 趋势状态 | 多头排列 | ✅ 良好 |"));
+        assert!(report.contains("| 趋势强度 | 80.0% | 强势 |"));
+        assert!(report.contains("| 夏普比率 | 2.000 | 🌟 优秀 |"));
+        assert!(report.contains("| 🔴 压力位1 | 11.50 |"));
+        assert!(report.contains("| 🟢 支撑位1 | 9.20 |"));
+        assert!(report.contains("- 均线多头"));
+        assert!(report.contains("- 波动扩大"));
+        assert!(report.contains("**建议买入价**: 10.00元 (当前价位，接近MA5支撑)"));
+        assert!(report.contains("**止损价位**: 9.31元"));
+        assert!(report.contains("**目标价位**: 11.50元"));
+        assert!(report.contains("建议仓位: 30-50%"));
+        assert!(report.contains("当前在均线支撑位附近"));
+    }
+
+    #[test]
+    fn sharpe_bands_and_mid_strength_are_rendered_at_boundaries() {
+        let cases = [
+            (1.0, "✅ 良好"),
+            (0.5, "⚡ 一般"),
+            (0.0, "⚠️ 偏低"),
+            (-0.1, "🔴 风险大于收益"),
+        ];
+
+        for (sharpe, expected) in cases {
+            let report = build_technical_markdown(&trend(50, 0.5, Some(sharpe)));
+            assert!(report.contains("| 趋势状态 | 多头排列 | ⚠️ 中性 |"));
+            assert!(report.contains("| 趋势强度 | 50.0% | 中等 |"));
+            assert!(report.contains(expected), "sharpe={sharpe}: {report}");
+        }
+    }
+
+    #[test]
+    fn battle_plan_uses_support_or_market_fallbacks_and_score_position_bands() {
+        let mut supported = trend(80, 0.8, None);
+        supported.bias_ma5 = 4.0;
+        supported.support_levels = vec![9.0];
+        let supported_report = build_technical_markdown(&supported);
+        assert!(supported_report.contains("**建议买入价**: 9.00元 (等待回踩支撑位)"));
+        assert!(supported_report.contains("**止损价位**: 8.82元"));
+        assert!(supported_report.contains("**目标价位**: 11.20元"));
+        assert!(supported_report.contains("建议仓位: 50-70%"));
+        assert!(supported_report.contains("等待回踩均线支撑再介入"));
+        assert!(supported_report.contains("重要支撑位: 9.00元"));
+
+        let mut market = trend(60, 0.5, None);
+        market.bias_ma5 = 4.0;
+        let market_report = build_technical_markdown(&market);
+        assert!(market_report.contains("**建议买入价**: 10.00元 (当前价位)"));
+        assert!(market_report.contains("**止损价位**: 9.50元"));
+        assert!(market_report.contains("**目标价位**: 11.20元"));
+        assert!(market_report.contains("建议仓位: 20-30%"));
+    }
+}

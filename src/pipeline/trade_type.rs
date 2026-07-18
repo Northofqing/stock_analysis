@@ -48,3 +48,45 @@ pub fn infer_from_breakdown(sb: &ScoreBreakdown) -> Option<String> {
         val, tech, flow
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn score(technical: i32, valuation_safety: i32, capital_flow: i32) -> ScoreBreakdown {
+        ScoreBreakdown {
+            technical,
+            fundamental_quality: 50,
+            valuation_safety,
+            capital_flow,
+            growth_sustainability: 50,
+        }
+    }
+
+    #[test]
+    fn classification_covers_each_documented_trade_type() {
+        let cases = [
+            (score(65, 39, 55), "🚀 动量交易型"),
+            (score(54, 65, 50), "🔄 逆向价值型"),
+            (score(60, 40, 50), "📈 趋势跟随型"),
+            (score(60, 70, 50), "💎 价值-趋势共振型"),
+            (score(59, 50, 50), "⚖️ 综合配置型"),
+        ];
+
+        for (breakdown, expected_prefix) in cases {
+            let label = infer_from_breakdown(&breakdown).expect("trade type");
+            assert!(label.starts_with(expected_prefix), "{label}");
+        }
+    }
+
+    #[test]
+    fn momentum_requires_every_boundary_condition() {
+        let momentum = infer_from_breakdown(&score(65, 39, 55)).expect("momentum");
+        let low_flow = infer_from_breakdown(&score(65, 39, 54)).expect("fallback");
+        let neutral_value = infer_from_breakdown(&score(65, 40, 55)).expect("trend");
+
+        assert!(momentum.contains("动量交易型"));
+        assert!(low_flow.contains("综合配置型"));
+        assert!(neutral_value.contains("趋势跟随型"));
+    }
+}

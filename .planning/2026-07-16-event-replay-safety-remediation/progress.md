@@ -272,3 +272,8 @@
 - Task-1 validation: fmt PASS; score tests 12/12 PASS; veto tests 7/7 PASS; strict library Clippy PASS; instrumented library suite 1,356 passed / 10 ignored / 0 failed.
 - Task-1 coverage: `score_breakdown.rs` 551/571 = 96.50%; `veto_rules.rs` 299/305 = 98.03%. Tests are included in the denominator, and both files exceed the 95% core target.
 - Full compliance PASS after BR-118; explicit comments reduced business-rule warnings from 67 to 65 by closing both BR-118 citation warnings. `git diff --check` remains PASS.
+- Completed the second core-coverage slice with behavior tests for price statistics, trade-type classification, Markdown section normalization/merge and real isolated report backup, technical-report construction, and single/backtest/regime reporting.
+- Added an internal `save_deep_report_to` path seam so the production `save_deep_report` wrapper keeps its behavior while the real directory-create/write/read failure boundary is exercised in an isolated temporary directory.
+- Task-2 focused pipeline suite: 67/67 PASS; strict library Clippy PASS; instrumented library suite: 1,374 passed / 10 ignored / 0 failed.
+- Task-2 coverage: `price_stats.rs` 140/140 = 100%; `reporting.rs` 389/391 = 99.49%; `section_utils.rs` 116/122 = 95.08%; `technical_report.rs` 235/235 = 100%; `trade_type.rs` 62/62 = 100%.
+- The library-only aggregate remains below release thresholds (global 54.50%, core 58.09%); this is an intermediate diagnostic, not Gate-D evidence. Continue core-first coverage work before regenerating the required all-workspace report.
