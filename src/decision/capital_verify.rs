@@ -35,7 +35,7 @@ pub fn compute_rs(
     index_kline: &[KlineData],
     days: usize,
 ) -> Option<f64> {
-    if stock_kline.len() < days || index_kline.len() < days {
+    if days == 0 || stock_kline.len() < days || index_kline.len() < days {
         return None;
     }
 
@@ -44,7 +44,10 @@ pub fn compute_rs(
     let index_start = index_kline[index_kline.len() - days].close;
     let index_end = index_kline.last()?.close;
 
-    if stock_start <= 0.0 || index_start <= 0.0 {
+    if [stock_start, stock_end, index_start, index_end]
+        .iter()
+        .any(|value| !value.is_finite() || *value <= 0.0)
+    {
         return None;
     }
 
@@ -203,5 +206,84 @@ mod tests {
     fn test_volume_normal_when_flat() {
         let klines: Vec<KlineData> = (0..20).map(|_| kline(100.0, 1e6)).collect();
         assert_eq!(classify_volume(&klines), VolumePhase::Normal);
+    }
+
+    #[test]
+    fn rs_rejects_zero_window_and_invalid_endpoint_prices() {
+        let valid = vec![kline(100.0, 1e6), kline(101.0, 1e6)];
+        assert!(compute_rs(&valid, &valid, 0).is_none());
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let stock = vec![kline(100.0, 1e6), kline(bad, 1e6)];
+            assert!(compute_rs(&stock, &valid, 2).is_none());
+            let index = vec![kline(bad, 1e6), kline(101.0, 1e6)];
+            assert!(compute_rs(&valid, &index, 2).is_none());
+        }
+    }
+
+    #[test]
+    fn volume_phase_covers_launch_distribution_and_zero_baseline() {
+        let mut launch: Vec<_> = (0..15).map(|_| kline(10.0, 1.0)).collect();
+        launch.extend((0..5).map(|_| kline(10.2, 3.0)));
+        assert_eq!(classify_volume(&launch), VolumePhase::LaunchBreakout);
+
+        let mut distribution: Vec<_> = (0..15).map(|_| kline(10.0, 1.0)).collect();
+        distribution.extend((0..5).map(|_| kline(30.0, 3.0)));
+        assert_eq!(classify_volume(&distribution), VolumePhase::TopDistribution);
+
+        let zero_baseline: Vec<_> = (0..20).map(|_| kline(10.0, 0.0)).collect();
+        assert_eq!(classify_volume(&zero_baseline), VolumePhase::Normal);
+        assert_eq!(classify_volume(&launch[..19]), VolumePhase::Normal);
+    }
+
+    #[test]
+    fn holding_verification_filters_missing_kline_and_formats_all_rs_states() {
+        let holdings = vec![
+            crate::portfolio::Position {
+                code: "TEST_CODE_000001".to_string(),
+                name: "甲".to_string(),
+                ..Default::default()
+            },
+            crate::portfolio::Position {
+                code: "TEST_CODE_000002".to_string(),
+                name: "缺数据".to_string(),
+                ..Default::default()
+            },
+        ];
+        let stock = (0..20)
+            .map(|index| kline(100.0 + index as f64, 1e6))
+            .collect::<Vec<_>>();
+        let index = (0..20)
+            .map(|index| kline(100.0 + index as f64 * 0.2, 1e9))
+            .collect::<Vec<_>>();
+        let signals = verify_holdings(
+            &holdings,
+            &std::collections::HashMap::from([("TEST_CODE_000001".to_string(), stock)]),
+            &index,
+        );
+        assert_eq!(signals.len(), 1);
+        assert!(signals[0].rs_vs_index.is_some_and(|value| value > 0.0));
+        assert!(format_capital_signals(&signals).contains("RS+"));
+        assert!(format_capital_signals(&[]).is_empty());
+
+        let rendered = format_capital_signals(&[
+            CapitalSignal {
+                code: "TEST_CODE_000003".to_string(),
+                name: "乙".to_string(),
+                rs_vs_index: Some(-2.0),
+                volume_phase: VolumePhase::TopDistribution,
+                note: String::new(),
+            },
+            CapitalSignal {
+                code: "TEST_CODE_000004".to_string(),
+                name: "丙".to_string(),
+                rs_vs_index: None,
+                volume_phase: VolumePhase::LaunchBreakout,
+                note: String::new(),
+            },
+        ]);
+        assert!(rendered.contains("RS-2.0"));
+        assert!(rendered.contains("追高风险"));
+        assert!(rendered.contains("RS——"));
+        assert_eq!(VolumePhase::Normal.label(), "正常换手");
     }
 }

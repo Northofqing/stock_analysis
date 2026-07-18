@@ -152,7 +152,14 @@ pub fn scan_exclusions(holdings: &[Position], watchlist: &[Position]) -> Vec<Exc
     if exclusion_map.is_empty() {
         return vec![];
     }
+    scan_exclusions_with_map(&exclusion_map, holdings, watchlist)
+}
 
+fn scan_exclusions_with_map(
+    exclusion_map: &std::collections::HashMap<String, (String, String)>,
+    holdings: &[Position],
+    watchlist: &[Position],
+) -> Vec<ExclusionHit> {
     let mut hits = Vec::new();
     for p in holdings {
         if let Some((board, reason)) = exclusion_map.get(&p.code) {
@@ -222,6 +229,50 @@ mod tests {
         let text = format_exclusion_alert(&hits);
         assert!(text.contains("排除板块命中"));
         assert!(text.contains("白酒"));
+    }
+
+    #[test]
+    fn source_labels_and_isolated_map_scan_cover_holding_and_watchlist() {
+        assert_eq!(ExclusionSource::Holding.label(), "持仓");
+        assert_eq!(ExclusionSource::Watchlist.label(), "自选");
+        assert_eq!(ExclusionSource::Holding.emoji(), "⚠️");
+        assert_eq!(ExclusionSource::Watchlist.emoji(), "📌");
+
+        let map = std::collections::HashMap::from([
+            (
+                "TEST_CODE_000001".to_string(),
+                ("排除甲".to_string(), "原因甲".to_string()),
+            ),
+            (
+                "TEST_CODE_000002".to_string(),
+                ("排除乙".to_string(), "原因乙".to_string()),
+            ),
+        ]);
+        let holdings = vec![Position {
+            code: "TEST_CODE_000001".to_string(),
+            name: "持仓甲".to_string(),
+            ..Position::default()
+        }];
+        let watchlist = vec![
+            Position {
+                code: "TEST_CODE_000002".to_string(),
+                name: "观察乙".to_string(),
+                ..Position::default()
+            },
+            Position {
+                code: "TEST_CODE_000003".to_string(),
+                name: "未命中".to_string(),
+                ..Position::default()
+            },
+        ];
+        let hits = scan_exclusions_with_map(&map, &holdings, &watchlist);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].source, ExclusionSource::Holding);
+        assert_eq!(hits[1].source, ExclusionSource::Watchlist);
+        let rendered = format_exclusion_alert(&hits);
+        assert!(rendered.contains("持仓甲"));
+        assert!(rendered.contains("观察乙"));
+        assert!(!rendered.contains("未命中"));
     }
 
     #[test]

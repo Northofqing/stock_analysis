@@ -166,6 +166,13 @@ Expected: all PASS. Commit only the two modules plus design/plan/progress eviden
 - [x] Split push2 status/body validation from transport and cover status, JSON, missing-data and complete-response contracts without sockets or external network.
 - [x] Run focused tests and full instrumented library coverage; record 1,507 pass / 10 ignored / 0 failed, global 67.04% and registered core 83.06%.
 
+### Task 4C: Validate RustDX, announcements, and deterministic decision boundaries
+
+- [x] Route converted RustDX daily bars through BR-092 complete-batch validation and cover empty, field, continuity, jump, ordering, percentage, adjustment and pre-transport failure paths.
+- [x] Split announcement response validation, high-risk detail selection and result assembly from real HTTP transport; cover complete local provider protocol rows and every missing/bad-field class without fallback data.
+- [x] Cover exclusion, leader, rotation, sector score and capital verification public states; reject zero-window and invalid RS endpoints without changing registered thresholds.
+- [x] Run focused suites and full instrumented library coverage; record 1,521 pass / 10 ignored / 0 failed, global 67.77% and registered core 84.64%.
+
 ### Task 6: Raise repository-wide coverage to 80%
 
 **Files:**

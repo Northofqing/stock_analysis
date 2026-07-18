@@ -24,6 +24,19 @@ pub struct RustdxProvider {
     gtimg_provider: GtimgProvider,
 }
 
+#[derive(Debug, Clone)]
+struct RustdxBarInput {
+    year: i32,
+    month: u32,
+    day: u32,
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+    volume: f64,
+    amount: f64,
+}
+
 impl RustdxProvider {
     /// 创建新的 RustDxProvider 实例
     pub fn new() -> Result<Self> {
@@ -149,35 +162,57 @@ impl RustdxProvider {
             return Err(anyhow!("股票 {} 没有返回K线数据", code));
         }
 
-        let mut kline_data: Vec<KlineData> = all_bars
+        let raw_bars: Vec<RustdxBarInput> = all_bars
+            .iter()
+            .map(|bar| RustdxBarInput {
+                year: bar.dt.year as i32,
+                month: bar.dt.month as u32,
+                day: bar.dt.day as u32,
+                open: bar.open,
+                high: bar.high,
+                low: bar.low,
+                close: bar.close,
+                volume: bar.vol,
+                amount: bar.amount,
+            })
+            .collect();
+        let kline_data = Self::parse_kline_batch(&code, &raw_bars)?;
+
+        info!("[通达信] {} 成功获取 {} 条K线数据", code, kline_data.len());
+
+        Ok(kline_data)
+    }
+
+    /// BR-092: decode a complete RustDX batch, calculate real adjacent returns,
+    /// then apply the shared OHLCV/date/jump validation before any computation.
+    fn parse_kline_batch(code: &str, bars: &[RustdxBarInput]) -> Result<Vec<KlineData>> {
+        if bars.is_empty() {
+            return Err(anyhow!("股票 {} 没有返回K线数据", code));
+        }
+        let mut kline_data: Vec<KlineData> = bars
             .iter()
             .enumerate()
             .map(|(index, bar)| {
-                let date = NaiveDate::from_ymd_opt(
-                    bar.dt.year as i32,
-                    bar.dt.month as u32,
-                    bar.dt.day as u32,
-                )
-                .ok_or_else(|| {
-                    anyhow!(
-                        "通达信 {} 第 {} 行日期非法: year={} month={} day={}（整批拒绝）",
-                        code,
-                        index + 1,
-                        bar.dt.year,
-                        bar.dt.month,
-                        bar.dt.day
-                    )
-                })?;
-
+                let date =
+                    NaiveDate::from_ymd_opt(bar.year, bar.month, bar.day).ok_or_else(|| {
+                        anyhow!(
+                            "通达信 {} 第 {} 行日期非法: year={} month={} day={}（整批拒绝）",
+                            code,
+                            index + 1,
+                            bar.year,
+                            bar.month,
+                            bar.day
+                        )
+                    })?;
                 Ok(KlineData {
                     date,
                     open: bar.open,
                     high: bar.high,
                     low: bar.low,
                     close: bar.close,
-                    volume: bar.vol,
+                    volume: bar.volume,
                     amount: bar.amount,
-                    pct_chg: 0.0, // 稍后计算
+                    pct_chg: 0.0,
                     intraday_price: None,
                     settled: true,
                     pe_ratio: None,
@@ -199,7 +234,6 @@ impl RustdxProvider {
                     is_limit_up: false,
                     is_limit_down: false,
                     is_suspended: false,
-                    // v11 P0-2 commit 2 修订后: RustDX 不做复权 (gbbq 下载源不存在, B 方案回退)
                     adjust: crate::data_provider::AdjustType::None,
                 })
             })
@@ -213,11 +247,7 @@ impl RustdxProvider {
             }
         }
 
-        // 按日期降序排序（最新在前）
-        kline_data.sort_by_key(|item| std::cmp::Reverse(item.date));
-
-        info!("[通达信] {} 成功获取 {} 条K线数据", code, kline_data.len());
-
+        super::validate_kline_series_strict(&mut kline_data, code)?;
         Ok(kline_data)
     }
 
@@ -339,6 +369,89 @@ mod tests {
         assert_eq!(RustdxProvider::parse_market("000001"), 0);
         assert!(RustdxProvider::normalize_code("").is_err());
         assert!(RustdxProvider::normalize_code("600000.SH").is_err());
+        assert!(RustdxProvider::normalize_code("1234567").is_err());
+    }
+
+    fn raw(year: i32, month: u32, day: u32, close: f64) -> RustdxBarInput {
+        RustdxBarInput {
+            year,
+            month,
+            day,
+            open: close,
+            high: close + 0.2,
+            low: close - 0.2,
+            close,
+            volume: 1_000.0,
+            amount: close * 1_000.0,
+        }
+    }
+
+    #[test]
+    fn br092_complete_rustdx_batch_is_strict_and_newest_first() {
+        let batch = vec![raw(2026, 7, 17, 11.0), raw(2026, 7, 16, 10.0)];
+        let parsed = RustdxProvider::parse_kline_batch("TEST_CODE_000001", &batch)
+            .expect("complete RustDX batch");
+        assert_eq!(
+            parsed.iter().map(|bar| bar.date).collect::<Vec<_>>(),
+            [
+                NaiveDate::from_ymd_opt(2026, 7, 17).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 7, 16).unwrap(),
+            ]
+        );
+        assert!((parsed[0].pct_chg - 10.0).abs() < 1e-9);
+        assert_eq!(parsed[0].adjust, crate::data_provider::AdjustType::None);
+        assert!(parsed.iter().all(|bar| bar.settled));
+    }
+
+    #[test]
+    fn br092_rustdx_parser_rejects_incomplete_or_bad_batches() {
+        assert!(RustdxProvider::parse_kline_batch("TEST_CODE_000001", &[]).is_err());
+
+        let mut invalid_date = raw(2026, 2, 30, 10.0);
+        assert!(
+            RustdxProvider::parse_kline_batch("TEST_CODE_000001", &[invalid_date.clone()]).is_err()
+        );
+
+        invalid_date.year = 2026;
+        invalid_date.month = 7;
+        invalid_date.day = 16;
+        invalid_date.high = 9.0;
+        assert!(
+            RustdxProvider::parse_kline_batch("TEST_CODE_000001", &[invalid_date.clone()]).is_err()
+        );
+
+        let duplicate = raw(2026, 7, 16, 10.1);
+        assert!(RustdxProvider::parse_kline_batch(
+            "TEST_CODE_000001",
+            &[raw(2026, 7, 16, 10.0), duplicate],
+        )
+        .is_err());
+        assert!(RustdxProvider::parse_kline_batch(
+            "TEST_CODE_000001",
+            &[raw(2026, 7, 16, 10.0), raw(2026, 7, 20, 10.1)],
+        )
+        .is_err());
+        assert!(RustdxProvider::parse_kline_batch(
+            "TEST_CODE_000001",
+            &[raw(2026, 7, 16, 10.0), raw(2026, 7, 17, 13.0)],
+        )
+        .is_err());
+
+        let mut bad_amount = raw(2026, 7, 16, 10.0);
+        bad_amount.amount = f64::NAN;
+        assert!(RustdxProvider::parse_kline_batch("TEST_CODE_000001", &[bad_amount]).is_err());
+    }
+
+    #[test]
+    fn zero_day_request_fails_before_opening_a_transport() {
+        let provider = RustdxProvider::new().expect("provider construction has no network IO");
+        let error = provider
+            // Native code is a transport-protocol input only; no order or persistence occurs.
+            .fetch_kline_internal("000001", 0)
+            .expect_err("zero-day batch is unavailable");
+        assert!(error.to_string().contains("没有返回K线数据"));
+        assert_eq!(provider.get_stock_name("TEST_CODE_000001"), None);
+        assert_eq!(provider.name(), "通达信");
     }
 
     #[test]

@@ -172,4 +172,43 @@ mod tests {
         assert_eq!(leaders[0].rank, 1);
         assert_eq!(leaders[2].code, "TEST_CODE_000003");
     }
+
+    #[tokio::test]
+    async fn empty_and_formatted_leader_paths_preserve_missing_bom() {
+        let board = ConceptBoard {
+            code: "BK0001".into(),
+            name: "测试板块".into(),
+            change_pct: 1.0,
+            main_inflow: 1.0,
+            leader_name: String::new(),
+            vol_ratio: 1.0,
+            turnover: 1.0,
+            main_net_pct_today: 1.0,
+            main_net_pct_5d: 1.0,
+        };
+        assert!(identify_leaders(&board, &[]).is_empty());
+        assert!(format_leader_list(&[], "测试板块").is_empty());
+        let mut leaders = vec![
+            LeaderRank {
+                code: "TEST_CODE_000001".to_string(),
+                name: "甲".to_string(),
+                rank: 1,
+                bom_position: None,
+                reason: "成交额第一".to_string(),
+            },
+            LeaderRank {
+                code: "TEST_CODE_000002".to_string(),
+                name: "乙".to_string(),
+                rank: 2,
+                bom_position: Some("上游设备".to_string()),
+                reason: "成交额第二".to_string(),
+            },
+        ];
+        let rendered = format_leader_list(&leaders, "测试板块");
+        assert!(rendered.contains("BOM:——"));
+        assert!(rendered.contains("BOM:上游设备"));
+        leaders.clear();
+        enrich_bom(&mut leaders, "测试板块").await;
+        assert!(leaders.is_empty());
+    }
 }

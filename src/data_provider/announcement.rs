@@ -415,32 +415,7 @@ fn extract_reduction_pct(title: &str) -> Option<f64> {
     None
 }
 
-// ── API 拉取 ──
-
-/// review #15: 改 async + FuturesUnordered 并发 fetch_ann_detail.
-pub async fn fetch_announcements(date: Option<&str>) -> Result<Vec<Announcement>> {
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let date_str = date.unwrap_or(&today);
-    chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
-        .map_err(|error| anyhow::anyhow!("公告查询日期非法 {date_str:?}: {error}"))?;
-
-    let client = crate::http_client::SHARED_HTTP_CLIENT.clone();
-
-    let url = format!(
-        "{}?page_size={}&page_index=1&ann_type=SHA,SZA&start_date={}&end_date={}",
-        ANNOUNCE_URL, MAX_PER_FETCH, date_str, date_str
-    );
-
-    let resp: AnnResponse = client
-        .get(&url)
-        .header("User-Agent", "Mozilla/5.0")
-        .header("Referer", "https://data.eastmoney.com/")
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-
+fn validate_announcement_response(resp: AnnResponse) -> Result<Vec<AnnItem>> {
     let list = resp
         .data
         .ok_or_else(|| anyhow::anyhow!("公告响应缺少 data"))?
@@ -472,6 +447,97 @@ pub async fn fetch_announcements(date: Option<&str>) -> Result<Vec<Announcement>
             ));
         }
     }
+    Ok(list)
+}
+
+fn detail_art_codes(list: &[AnnItem]) -> Vec<String> {
+    list.iter()
+        .filter_map(|item| {
+            let (level, _) = classify_title(&item.title, "", "");
+            matches!(level, AnnLevel::Emergency | AnnLevel::Important)
+                .then(|| item.art_code.clone())
+        })
+        .collect()
+}
+
+fn assemble_announcements(
+    list: Vec<AnnItem>,
+    detail_map: &std::collections::HashMap<String, String>,
+) -> Result<Vec<Announcement>> {
+    let mut results = Vec::new();
+    for item in list {
+        let stock = item
+            .codes
+            .first()
+            .expect("announcement stock evidence was validated");
+        let (level, reason) = classify_title(&item.title, &stock.stock_code, &stock.short_name);
+        if matches!(level, AnnLevel::Skip) {
+            continue;
+        }
+
+        let summary = item
+            .columns
+            .as_ref()
+            .and_then(|columns| columns.first())
+            .and_then(|column| column.column_name.as_deref())
+            .unwrap_or("")
+            .to_string();
+        let art_code = item.art_code.clone();
+        let content = if matches!(level, AnnLevel::Emergency | AnnLevel::Important) {
+            detail_map
+                .get(&art_code)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("公告 {art_code} 正文批次缺失"))?
+        } else {
+            String::new()
+        };
+
+        results.push(Announcement {
+            code: stock.stock_code.clone(),
+            name: stock.short_name.clone(),
+            title: item.title,
+            date: item.notice_date,
+            summary,
+            content,
+            level,
+            reason,
+            external_id: Some(art_code.clone()),
+            url: Some(format!(
+                "https://data.eastmoney.com/notices/detail/{}.html",
+                art_code
+            )),
+        });
+    }
+    Ok(results)
+}
+
+// ── API 拉取 ──
+
+/// review #15: 改 async + FuturesUnordered 并发 fetch_ann_detail.
+pub async fn fetch_announcements(date: Option<&str>) -> Result<Vec<Announcement>> {
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let date_str = date.unwrap_or(&today);
+    chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
+        .map_err(|error| anyhow::anyhow!("公告查询日期非法 {date_str:?}: {error}"))?;
+
+    let client = crate::http_client::SHARED_HTTP_CLIENT.clone();
+
+    let url = format!(
+        "{}?page_size={}&page_index=1&ann_type=SHA,SZA&start_date={}&end_date={}",
+        ANNOUNCE_URL, MAX_PER_FETCH, date_str, date_str
+    );
+
+    let resp: AnnResponse = client
+        .get(&url)
+        .header("User-Agent", "Mozilla/5.0")
+        .header("Referer", "https://data.eastmoney.com/")
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    let list = validate_announcement_response(resp)?;
     info!("[公告] {} 获取 {} 条", date_str, list.len());
 
     // 熔断：超 200 条仅标题扫描
@@ -481,17 +547,7 @@ pub async fn fetch_announcements(date: Option<&str>) -> Result<Vec<Announcement>
 
     // review #15: 高危公告 body 拉取改成 FuturesUnordered 并发, 不再串行 N × 10s.
     let client_arc = Arc::new(client);
-    let detail_futures = list
-        .iter()
-        .filter_map(|item| {
-            let (level, _reason) = classify_title(&item.title, "", "");
-            if matches!(level, AnnLevel::Emergency | AnnLevel::Important) {
-                Some(item.art_code.clone())
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
+    let detail_futures = detail_art_codes(&list);
     let detail_results = futures::future::join_all(detail_futures.iter().map(|art_code| {
         let c = Arc::clone(&client_arc);
         let ac = art_code.clone();
@@ -506,66 +562,7 @@ pub async fn fetch_announcements(date: Option<&str>) -> Result<Vec<Announcement>
     let detail_map: std::collections::HashMap<String, String> =
         detail_results.into_iter().collect();
 
-    let mut results = Vec::new();
-    for item in list {
-        let title = item.title.as_str();
-
-        // 从 codes[0] 提取股票信息
-        let code = item
-            .codes
-            .first()
-            .map(|code| code.stock_code.as_str())
-            .expect("announcement stock evidence was validated");
-        let name = item
-            .codes
-            .first()
-            .map(|code| code.short_name.as_str())
-            .expect("announcement stock evidence was validated");
-
-        let (level, reason) = classify_title(title, code, name);
-        if matches!(level, AnnLevel::Skip) {
-            continue; // 非高危非利好，跳过
-        }
-
-        // 公告分类描述（如"召开股东大会通知"），用作摘要回退
-        let column_desc = item
-            .columns
-            .as_ref()
-            .and_then(|c| c.first())
-            .and_then(|c| c.column_name.as_deref())
-            .unwrap_or("");
-
-        // 高危公告从预取的 detail_map 取正文
-        let art_code = item.art_code.as_str();
-        let content = if matches!(level, AnnLevel::Emergency | AnnLevel::Important) {
-            detail_map
-                .get(art_code)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("公告 {art_code} 正文批次缺失"))?
-        } else {
-            String::new()
-        };
-
-        // 外部标识：从 art_code 来，非空时构建东方财富 URL
-        let external_id = Some(art_code.to_string());
-        let url = Some(format!(
-            "https://data.eastmoney.com/notices/detail/{}.html",
-            art_code
-        ));
-
-        results.push(Announcement {
-            code: code.to_string(),
-            name: name.to_string(),
-            title: title.to_string(),
-            date: item.notice_date,
-            summary: column_desc.to_string(),
-            content,
-            level,
-            reason,
-            external_id,
-            url,
-        });
-    }
+    let results = assemble_announcements(list, &detail_map)?;
 
     info!("[公告] 过滤后 {} 条需告警", results.len());
     crate::monitor::data_mode::mark_capability_success(crate::monitor::data_mode::Capability::News)
@@ -610,6 +607,49 @@ async fn fetch_ann_detail(client: &reqwest::Client, art_code: &str) -> Result<St
 mod tests {
     use super::*;
 
+    fn validated(raw: &str) -> Result<Vec<AnnItem>> {
+        validate_announcement_response(serde_json::from_str(raw)?)
+    }
+
+    fn protocol_fixture() -> Vec<AnnItem> {
+        validated(
+            r#"{
+                "data": {
+                    "list": [
+                        {
+                            "art_code": "AN-EMERGENCY",
+                            "title": "关于收到立案调查通知书的公告",
+                            "notice_date": "2026-07-18 09:30:00",
+                            "codes": [{"stock_code": "000001", "short_name": "协议样本甲"}],
+                            "columns": [{"column_name": "风险提示"}]
+                        },
+                        {
+                            "art_code": "AN-IMPORTANT",
+                            "title": "关于收到监管函的公告",
+                            "notice_date": "2026-07-18",
+                            "codes": [{"stock_code": "000002", "short_name": "协议样本乙"}],
+                            "columns": null
+                        },
+                        {
+                            "art_code": "AN-INFO",
+                            "title": "关于回购公司股份方案的公告",
+                            "notice_date": "2026-07-18",
+                            "codes": [{"stock_code": "000003", "short_name": "协议样本丙"}],
+                            "columns": [{"column_name": null}]
+                        },
+                        {
+                            "art_code": "AN-SKIP",
+                            "title": "股东大会决议公告",
+                            "notice_date": "2026-07-18",
+                            "codes": [{"stock_code": "000004", "short_name": "协议样本丁"}]
+                        }
+                    ]
+                }
+            }"#,
+        )
+        .expect("local provider protocol fixture must be valid")
+    }
+
     #[test]
     fn br105_announcement_protocol_requires_list_and_row_fields() {
         assert!(serde_json::from_str::<AnnResponse>(r#"{"data":{}}"#).is_err());
@@ -617,6 +657,65 @@ mod tests {
             r#"{"data":{"list":[{"art_code":"A1","title":"测试","notice_date":"2026-07-18","codes":[{}]}]}}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn br105_announcement_response_rejects_missing_or_bad_values() {
+        for raw in [
+            r#"{"data":null}"#,
+            r#"{"data":{"list":[{"art_code":"","title":"公告","notice_date":"2026-07-18","codes":[{"stock_code":"000001","short_name":"样本"}]}]}}"#,
+            r#"{"data":{"list":[{"art_code":"A1","title":" ","notice_date":"2026-07-18","codes":[{"stock_code":"000001","short_name":"样本"}]}]}}"#,
+            r#"{"data":{"list":[{"art_code":"A1","title":"公告","notice_date":"2026","codes":[{"stock_code":"000001","short_name":"样本"}]}]}}"#,
+            r#"{"data":{"list":[{"art_code":"A1","title":"公告","notice_date":"2026-02-30","codes":[{"stock_code":"000001","short_name":"样本"}]}]}}"#,
+            r#"{"data":{"list":[{"art_code":"A1","title":"公告","notice_date":"2026-07-18","codes":[]}]}}"#,
+            r#"{"data":{"list":[{"art_code":"A1","title":"公告","notice_date":"2026-07-18","codes":[{"stock_code":"00001","short_name":"样本"}]}]}}"#,
+            r#"{"data":{"list":[{"art_code":"A1","title":"公告","notice_date":"2026-07-18","codes":[{"stock_code":"00000A","short_name":"样本"}]}]}}"#,
+            r#"{"data":{"list":[{"art_code":"A1","title":"公告","notice_date":"2026-07-18","codes":[{"stock_code":"000001","short_name":" "}]}]}}"#,
+        ] {
+            assert!(validated(raw).is_err(), "unexpectedly accepted {raw}");
+        }
+    }
+
+    #[test]
+    fn br059_detail_selection_only_fetches_risk_announcements() {
+        let list = protocol_fixture();
+        assert_eq!(
+            detail_art_codes(&list),
+            vec!["AN-EMERGENCY".to_string(), "AN-IMPORTANT".to_string()]
+        );
+    }
+
+    #[test]
+    fn br059_announcement_assembly_requires_risk_details() {
+        let list = protocol_fixture();
+        let mut details = std::collections::HashMap::new();
+        details.insert("AN-EMERGENCY".to_string(), "立案正文".to_string());
+        assert!(assemble_announcements(list.clone(), &details).is_err());
+
+        details.insert("AN-IMPORTANT".to_string(), "监管正文".to_string());
+        let announcements = assemble_announcements(list, &details).unwrap();
+        assert_eq!(announcements.len(), 3);
+
+        let emergency = &announcements[0];
+        assert_eq!(emergency.code, "000001");
+        assert_eq!(emergency.name, "协议样本甲");
+        assert_eq!(emergency.title, "关于收到立案调查通知书的公告");
+        assert_eq!(emergency.date, "2026-07-18 09:30:00");
+        assert_eq!(emergency.summary, "风险提示");
+        assert_eq!(emergency.content, "立案正文");
+        assert_eq!(emergency.level, AnnLevel::Emergency);
+        assert!(emergency.reason.contains("立案调查"));
+        assert_eq!(emergency.external_id.as_deref(), Some("AN-EMERGENCY"));
+        assert_eq!(
+            emergency.url.as_deref(),
+            Some("https://data.eastmoney.com/notices/detail/AN-EMERGENCY.html")
+        );
+
+        let info = &announcements[2];
+        assert_eq!(info.level, AnnLevel::Info);
+        assert!(info.summary.is_empty());
+        assert!(info.content.is_empty());
+        assert_eq!(info.external_id.as_deref(), Some("AN-INFO"));
     }
 
     #[test]
