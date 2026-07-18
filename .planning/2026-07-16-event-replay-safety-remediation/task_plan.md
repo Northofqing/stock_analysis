@@ -140,6 +140,12 @@ Phase 12 (Gate D coverage and live-account release closure)
 | Task-2 format check found one long new fixture signature | 1 | Run rustfmt, then rerun the format gate before validation and commit. |
 | Section report test added one long assertion after the previous format pass | 1 | Run rustfmt again after the final Task-2 slice and keep the next check read-only. |
 | Strict Clippy rejected borrowing an already borrowed `&Path` | 1 | Remove the redundant borrow at the internal report-write seam and rerun focused test plus Clippy. |
+| Task-3 RED compile also found an invalid equality assertion on `Option<&MoneyFlowDay>` | 1 | Change the test-only assertion to `is_none`; keep the intended missing `build_intraday_shape` compile failure as the RED boundary. |
+| `cargo test` was given three positional filters | 1 | Run each exact module filter as its own Cargo command; Cargo accepts only one positional test filter. |
+| Task-3 first GREEN run exposed three incorrect test expectations | 1 | Recalculate the EWMA as -4.0亿元, expect the documented >=1.5% tail-lift label, and compare the repeating percentile with tolerance; production behavior was correct. |
+| Two intraday classifier fixtures were shadowed by the higher-priority surge-and-fall rule | 1 | Move the high-open fixture below the two-point pullback boundary and make the volatile fixture close at exactly half the high; also include the expected label in failures. |
+| Financial attention-level fixture also triggered the 20-point CFO/NI sudden-drop rule | 1 | Keep the prior ratio below the rule's 0.8 threshold so the fixture isolates the intended 40-point divergence-plus-margin band. |
+| Extreme financial fixture totaled 95 because its three-period CFO/NI average was 0.4 | 1 | Add a fourth low-ratio period and set the previous ratio at the exact 0.8 sudden-drop boundary so both documented rules apply and score clamping is exercised. |
 ## Follow-up review slice (2026-07-18)
 
 - [x] Add RED test for `:memory:` journal-mode failure.

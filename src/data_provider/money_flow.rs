@@ -338,6 +338,118 @@ fn parse_intraday_rows(rows: &[Value]) -> Result<Vec<IntradayRow>> {
     Ok(parsed)
 }
 
+fn classify_intraday_shape(
+    open_pct: f64,
+    high_pct: f64,
+    low_pct: f64,
+    close_pct: f64,
+    amplitude: f64,
+    tail_30m_pct: Option<f64>,
+) -> &'static str {
+    let gap_from_high = high_pct - close_pct;
+    let gap_from_low = close_pct - low_pct;
+    if high_pct >= 2.0 && gap_from_high >= 2.0 && close_pct < high_pct * 0.5 {
+        "⚠️ 冲高回落（尾盘跳水风险大）"
+    } else if tail_30m_pct.is_some_and(|value| value <= -1.5) {
+        "⚠️ 尾盘跳水"
+    } else if tail_30m_pct.is_some_and(|value| value >= 1.5) && close_pct > open_pct {
+        "🔥 尾盘拉升（资金抢筹）"
+    } else if open_pct >= 2.0 && close_pct <= open_pct - 1.5 {
+        "⚠️ 高开低走"
+    } else if open_pct <= -1.5 && close_pct >= open_pct + 2.0 {
+        "🔥 低开高走（空头回补）"
+    } else if close_pct >= high_pct - 0.5 && high_pct > 1.5 {
+        "✅ 稳步推高，收在日内高点"
+    } else if close_pct <= low_pct + 0.5 && low_pct < -1.5 {
+        "🔴 持续下行，收在日内低点"
+    } else if amplitude >= 4.0 && gap_from_low >= 2.0 && gap_from_high >= 2.0 {
+        "中阳/中阴，日内震荡剧烈"
+    } else {
+        "窄幅整理"
+    }
+}
+
+/// BR-115: build a shape only from a complete, locally validated intraday batch.
+fn build_intraday_shape(pre_close: f64, trends: &[Value]) -> Result<IntradayShape> {
+    if pre_close <= 0.0 || !pre_close.is_finite() {
+        return Err(anyhow!("分时 preClose 非法: {}", pre_close));
+    }
+    if trends.is_empty() {
+        return Err(anyhow!("分时 trends 为空"));
+    }
+
+    let parsed_rows = parse_intraday_rows(trends)?;
+    let first = parsed_rows
+        .first()
+        .ok_or_else(|| anyhow!("分时 首根缺失"))?;
+    let last = parsed_rows.last().ok_or_else(|| anyhow!("分时 尾根缺失"))?;
+
+    let date = last
+        .0
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| anyhow!("分时 尾根缺日期"))?
+        .to_string();
+
+    let mut day_high = f64::NEG_INFINITY;
+    let mut day_low = f64::INFINITY;
+    let mut tail_start_close: Option<f64> = None;
+    for (ts, _open, close, high, low) in &parsed_rows {
+        if *high > day_high {
+            day_high = *high;
+        }
+        if *low < day_low {
+            day_low = *low;
+        }
+        if tail_start_close.is_none() {
+            if let Some(hm) = ts.split_whitespace().nth(1) {
+                if hm >= "14:30" {
+                    tail_start_close = Some(*close);
+                }
+            }
+        }
+    }
+    if !day_high.is_finite() || !day_low.is_finite() {
+        return Err(anyhow!("分时 高低价未找到"));
+    }
+
+    let open_pct = (first.1 / pre_close - 1.0) * 100.0;
+    let high_pct = (day_high / pre_close - 1.0) * 100.0;
+    let low_pct = (day_low / pre_close - 1.0) * 100.0;
+    let close_pct = (last.2 / pre_close - 1.0) * 100.0;
+    let amplitude = (day_high - day_low) / pre_close * 100.0;
+    let tail_30m_pct = tail_start_close.map(|start| (last.2 / start - 1.0) * 100.0);
+    if [open_pct, high_pct, low_pct, close_pct]
+        .iter()
+        .any(|value| !value.is_finite() || value.abs() > 20.0)
+        || tail_30m_pct.is_some_and(|value| !value.is_finite() || value.abs() > 20.0)
+    {
+        return Err(anyhow!("分时涨跌幅非法或超过 ±20%，需要人工确认"));
+    }
+
+    let shape_label = classify_intraday_shape(
+        open_pct,
+        high_pct,
+        low_pct,
+        close_pct,
+        amplitude,
+        tail_30m_pct,
+    );
+
+    Ok(IntradayShape {
+        date,
+        pre_close,
+        open_pct,
+        high_pct,
+        low_pct,
+        close_pct,
+        amplitude,
+        tail_30m_pct,
+        shape_label,
+        present: true,
+    })
+}
+
 /// 抓取当日分时（trends2）并计算形态
 pub async fn fetch_intraday_shape_async(
     client: &reqwest::Client,
@@ -404,104 +516,11 @@ pub async fn fetch_intraday_shape_async(
         .get("preClose")
         .and_then(as_f64)
         .ok_or_else(|| anyhow!("分时 无 preClose"))?;
-    if pre_close <= 0.0 {
-        return Err(anyhow!("分时 preClose 非法: {}", pre_close));
-    }
     let trends = data
         .get("trends")
         .and_then(|v| v.as_array())
         .ok_or_else(|| anyhow!("分时 无 trends 数组"))?;
-    if trends.is_empty() {
-        return Err(anyhow!("分时 trends 为空"));
-    }
-
-    let parsed_rows = parse_intraday_rows(trends)?;
-    let first = parsed_rows
-        .first()
-        .ok_or_else(|| anyhow!("分时 首根缺失"))?;
-    let last = parsed_rows.last().ok_or_else(|| anyhow!("分时 尾根缺失"))?;
-
-    let date = last
-        .0
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| anyhow!("分时 尾根缺日期"))?
-        .to_string();
-
-    // 扫描所有分钟：最高/最低价（取日内最高 high 与最低 low）
-    let mut day_high = f64::NEG_INFINITY;
-    let mut day_low = f64::INFINITY;
-    // 尾盘定位：第一根 time >= 14:30 的 close 作为尾盘起始价
-    let mut tail_start_close: Option<f64> = None;
-    for (ts, _open, close, high, low) in &parsed_rows {
-        if *high > day_high {
-            day_high = *high;
-        }
-        if *low < day_low {
-            day_low = *low;
-        }
-        if tail_start_close.is_none() {
-            // ts 形如 "2026-04-22 14:30"
-            if let Some(hm) = ts.split_whitespace().nth(1) {
-                if hm >= "14:30" {
-                    tail_start_close = Some(*close);
-                }
-            }
-        }
-    }
-    if !day_high.is_finite() || !day_low.is_finite() {
-        return Err(anyhow!("分时 高低价未找到"));
-    }
-
-    let open_pct = (first.1 / pre_close - 1.0) * 100.0; // 首根 open
-    let high_pct = (day_high / pre_close - 1.0) * 100.0;
-    let low_pct = (day_low / pre_close - 1.0) * 100.0;
-    let close_pct = (last.2 / pre_close - 1.0) * 100.0;
-    let amplitude = (day_high - day_low) / pre_close * 100.0;
-    let tail_30m_pct = tail_start_close.map(|start| (last.2 / start - 1.0) * 100.0);
-    if [open_pct, high_pct, low_pct, close_pct]
-        .iter()
-        .any(|value| !value.is_finite() || value.abs() > 20.0)
-        || tail_30m_pct.is_some_and(|value| !value.is_finite() || value.abs() > 20.0)
-    {
-        return Err(anyhow!("分时涨跌幅非法或超过 ±20%，需要人工确认"));
-    }
-
-    // 形态识别
-    let gap_from_high = high_pct - close_pct; // 收盘距日内最高回落幅度
-    let gap_from_low = close_pct - low_pct; // 收盘距日内最低拉升幅度
-    let shape_label = if high_pct >= 2.0 && gap_from_high >= 2.0 && close_pct < high_pct * 0.5 {
-        "⚠️ 冲高回落（尾盘跳水风险大）"
-    } else if tail_30m_pct.is_some_and(|value| value <= -1.5) {
-        "⚠️ 尾盘跳水"
-    } else if tail_30m_pct.is_some_and(|value| value >= 1.5) && close_pct > open_pct {
-        "🔥 尾盘拉升（资金抢筹）"
-    } else if open_pct >= 2.0 && close_pct <= open_pct - 1.5 {
-        "⚠️ 高开低走"
-    } else if open_pct <= -1.5 && close_pct >= open_pct + 2.0 {
-        "🔥 低开高走（空头回补）"
-    } else if close_pct >= high_pct - 0.5 && high_pct > 1.5 {
-        "✅ 稳步推高，收在日内高点"
-    } else if close_pct <= low_pct + 0.5 && low_pct < -1.5 {
-        "🔴 持续下行，收在日内低点"
-    } else if amplitude >= 4.0 && gap_from_low >= 2.0 && gap_from_high >= 2.0 {
-        "中阳/中阴，日内震荡剧烈"
-    } else {
-        "窄幅整理"
-    };
-
-    Ok(IntradayShape {
-        date,
-        pre_close,
-        open_pct,
-        high_pct,
-        low_pct,
-        close_pct,
-        amplitude,
-        tail_30m_pct,
-        shape_label,
-        present: true,
-    })
+    build_intraday_shape(pre_close, trends)
 }
 
 /// 同步包装（在已有 tokio runtime 上下文调用）
@@ -648,5 +667,197 @@ mod br115_tests {
             Value::String("2026-07-17 09:31,13,13,13.1,12.9,100".to_string()),
         ];
         assert!(parse_intraday_rows(&jump).is_err());
+    }
+
+    fn flow_day(date: &str, main_net: f64, pct_chg: f64) -> MoneyFlowDay {
+        MoneyFlowDay {
+            date: date.into(),
+            main_net,
+            xl_net: main_net * 0.6,
+            big_net: main_net * 0.4,
+            main_pct: 3.0,
+            pct_chg,
+        }
+    }
+
+    #[test]
+    fn summary_math_and_bounce_detection_use_latest_five_real_days() {
+        let empty = MoneyFlowSummary::default();
+        assert!(empty.is_empty());
+        assert!(empty.latest().is_none());
+        assert_eq!(empty.recent_main_sum(5), 0.0);
+        assert_eq!(empty.ewma_main_net_yi(), None);
+        assert!(!empty.is_one_day_bounce());
+
+        let flow = MoneyFlowSummary {
+            days: vec![
+                flow_day("2026-07-13", -1_000_000_000.0, -1.0),
+                flow_day("2026-07-14", -1_000_000_000.0, -1.0),
+                flow_day("2026-07-15", -1_000_000_000.0, -1.0),
+                flow_day("2026-07-16", -1_000_000_000.0, -1.0),
+                flow_day("2026-07-17", 500_000_000.0, 1.0),
+            ],
+        };
+        assert_eq!(flow.latest().expect("latest").date, "2026-07-17");
+        assert_eq!(flow.recent_main_sum(3), -1_500_000_000.0);
+        assert!((flow.ewma_main_net_yi().expect("ewma") + 4.0).abs() < 1e-9);
+        assert!(flow.is_one_day_bounce());
+
+        let large_bounce = MoneyFlowSummary {
+            days: vec![flow_day("2026-07-17", 5_000_000_000.0, 1.0)],
+        };
+        assert!(!large_bounce.is_one_day_bounce());
+    }
+
+    #[test]
+    fn money_flow_parser_accepts_sorted_trading_days_and_rejects_each_bad_field_class() {
+        let row = |date: &str, main: &str, main_pct: &str, pct: &str| {
+            Value::String(format!(
+                "{date},{main},0,0,40,60,{main_pct},0,0,0,0,10,{pct}"
+            ))
+        };
+        let parsed = parse_em_money_flow_rows(&[
+            row("2026-07-17", "200", "3.2", "1.5"),
+            row("2026-07-16", "100", "2.2", "-1.0"),
+        ])
+        .expect("valid consecutive trading days");
+        assert_eq!(parsed.days[0].date, "2026-07-16");
+        assert_eq!(parsed.days[1].main_net, 200.0);
+
+        assert!(parse_em_money_flow_rows(&[]).is_err());
+        assert!(parse_em_money_flow_rows(&[Value::Bool(true)]).is_err());
+        assert!(parse_em_money_flow_rows(&[Value::String("short".into())]).is_err());
+        assert!(parse_em_money_flow_rows(&[row("bad-date", "1", "1", "1")]).is_err());
+        assert!(parse_em_money_flow_rows(&[row("2026-07-17", "NaN", "1", "1")]).is_err());
+        assert!(parse_em_money_flow_rows(&[row("2026-07-17", "1", "101", "1")]).is_err());
+        assert!(parse_em_money_flow_rows(&[row("2026-07-17", "1", "1", "21")]).is_err());
+    }
+
+    #[test]
+    fn intraday_parser_accepts_lunch_break_and_rejects_bad_protocol_rows() {
+        let lunch = vec![
+            Value::String("2026-07-17 11:30,10,10,10.1,9.9,100".into()),
+            Value::String("2026-07-17 13:00,10,10.1,10.2,9.9,0".into()),
+        ];
+        assert_eq!(parse_intraday_rows(&lunch).expect("lunch break").len(), 2);
+
+        let bad_rows = [
+            vec![],
+            vec![Value::Bool(true)],
+            vec![Value::String("2026-07-17 09:30,10".into())],
+            vec![Value::String("bad,10,10,10,10,1".into())],
+            vec![Value::String("2026-07-17 09:30,bad,10,10,10,1".into())],
+            vec![Value::String("2026-07-17 09:30,10,10,10,10,-1".into())],
+            vec![Value::String("2026-07-17 09:30,10,10,9,10,1".into())],
+            vec![Value::String("2026-07-17 09:30,10,10,10,11,1".into())],
+        ];
+        for rows in bad_rows {
+            assert!(parse_intraday_rows(&rows).is_err(), "rows={rows:?}");
+        }
+
+        let reversed = vec![
+            Value::String("2026-07-17 09:31,10,10,10,10,1".into()),
+            Value::String("2026-07-17 09:30,10,10,10,10,1".into()),
+        ];
+        assert!(parse_intraday_rows(&reversed).is_err());
+    }
+
+    #[test]
+    fn scalar_helpers_and_blocking_wrappers_fail_closed() {
+        assert_eq!(to_em_numeric_secid("600519"), "1.600519");
+        assert_eq!(to_em_numeric_secid("900901"), "1.900901");
+        assert_eq!(to_em_numeric_secid("000001"), "0.000001");
+        assert_eq!(as_f64(&serde_json::json!(1.25)), Some(1.25));
+        assert_eq!(as_f64(&serde_json::json!(" 2.5 ")), Some(2.5));
+        assert_eq!(as_f64(&Value::Bool(true)), None);
+
+        let client = reqwest::Client::new();
+        assert!(fetch_money_flow_blocking(&client, "TEST_CODE_000001", 5).is_err());
+        assert!(fetch_intraday_shape_blocking(&client, "TEST_CODE_000001").is_err());
+    }
+
+    #[test]
+    fn prompt_renders_each_money_direction_and_optional_intraday_tail() {
+        let shape = IntradayShape {
+            date: "2026-07-17".into(),
+            pre_close: 10.0,
+            open_pct: 0.5,
+            high_pct: 2.0,
+            low_pct: -1.0,
+            close_pct: 1.5,
+            amplitude: 3.0,
+            tail_30m_pct: None,
+            shape_label: "窄幅整理",
+            present: true,
+        };
+        let cases = [
+            (1.0, 2.0, "真金白银买入"),
+            (-1.0, 2.0, "诱多/拉高出货"),
+            (1.0, -2.0, "主力低吸"),
+            (-1.0, -2.0, "杀跌趋势"),
+            (1.0, 0.0, "方向基本一致"),
+        ];
+        for (main, pct, expected) in cases {
+            let flow = MoneyFlowSummary {
+                days: vec![flow_day("2026-07-17", main * 1e8, pct)],
+            };
+            let rendered = format_for_prompt(&flow, &shape);
+            assert!(rendered.contains(expected));
+            assert!(rendered.contains("暂无（未到14:30）"));
+        }
+
+        let tail = IntradayShape {
+            tail_30m_pct: Some(1.25),
+            ..shape
+        };
+        let rendered = format_for_prompt(&MoneyFlowSummary::default(), &tail);
+        assert!(!rendered.contains("主力资金流向"));
+        assert!(rendered.contains("+1.25%"));
+        assert!(
+            format_for_prompt(&MoneyFlowSummary::default(), &IntradayShape::default()).is_empty()
+        );
+    }
+
+    #[test]
+    fn intraday_shape_builder_classifies_validated_rows() {
+        let trends = vec![
+            Value::String("2026-07-17 14:30,10,10,10.2,9.8,100".into()),
+            Value::String("2026-07-17 14:31,10,10.2,10.3,9.9,100".into()),
+        ];
+        let shape = build_intraday_shape(10.0, &trends).expect("valid local protocol batch");
+        assert_eq!(shape.date, "2026-07-17");
+        assert!(shape.present);
+        assert_eq!(shape.shape_label, "🔥 尾盘拉升（资金抢筹）");
+        assert!(shape.tail_30m_pct.expect("tail") > 0.0);
+    }
+
+    #[test]
+    fn intraday_shape_classifier_covers_every_documented_band() {
+        let cases = [
+            ((0.0, 4.0, -1.0, 1.0, 5.0, None), "冲高回落"),
+            ((0.0, 1.0, -1.0, 0.0, 2.0, Some(-1.5)), "尾盘跳水"),
+            ((0.0, 1.0, -1.0, 0.5, 2.0, Some(1.5)), "尾盘拉升"),
+            ((2.0, 2.0, 0.0, 0.5, 2.0, None), "高开低走"),
+            ((-2.0, 0.5, -2.5, 0.0, 3.0, None), "低开高走"),
+            ((0.0, 2.0, -0.5, 1.8, 2.5, None), "稳步推高"),
+            ((0.0, 0.5, -2.0, -1.8, 2.5, None), "持续下行"),
+            ((0.0, 4.0, 0.0, 2.0, 4.0, None), "震荡剧烈"),
+            ((0.0, 1.0, -1.0, 0.0, 2.0, None), "窄幅整理"),
+        ];
+        for ((open, high, low, close, amplitude, tail), expected) in cases {
+            let label = classify_intraday_shape(open, high, low, close, amplitude, tail);
+            assert!(
+                label.contains(expected),
+                "expected={expected} label={label}"
+            );
+        }
+    }
+
+    #[test]
+    fn intraday_shape_builder_rejects_missing_or_out_of_range_evidence() {
+        assert!(build_intraday_shape(0.0, &[]).is_err());
+        assert!(build_intraday_shape(10.0, &[]).is_err());
+        let too_far = vec![Value::String("2026-07-17 09:30,13,13,13,13,100".into())];
+        assert!(build_intraday_shape(10.0, &too_far).is_err());
     }
 }

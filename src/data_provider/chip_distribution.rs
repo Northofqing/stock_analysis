@@ -325,3 +325,146 @@ pub fn format_for_prompt(chip: &ChipDistribution) -> String {
 
     s
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data_provider::AdjustType;
+    use chrono::{Duration, NaiveDate};
+
+    fn kline(index: i64, low: f64, high: f64, close: f64, turnover: Option<f64>) -> KlineData {
+        KlineData {
+            date: NaiveDate::from_ymd_opt(2026, 7, 18).expect("fixture date")
+                - Duration::days(index),
+            open: (low + high) / 2.0,
+            high,
+            low,
+            close,
+            volume: 1_000.0,
+            amount: close * 1_000.0,
+            pct_chg: 0.0,
+            intraday_price: None,
+            settled: true,
+            pe_ratio: None,
+            pb_ratio: None,
+            turnover_rate: turnover,
+            market_cap: None,
+            circulating_cap: None,
+            eps: None,
+            roe: None,
+            revenue_yoy: None,
+            net_profit_yoy: None,
+            gross_margin: None,
+            net_margin: None,
+            sharpe_ratio: None,
+            financials_history: None,
+            valuation_history: None,
+            consensus: None,
+            industry: None,
+            is_limit_up: false,
+            is_limit_down: false,
+            is_suspended: false,
+            adjust: AdjustType::None,
+        }
+    }
+
+    #[test]
+    fn compute_rejects_empty_short_flat_and_nonfinite_histories() {
+        assert!(!compute_chip_distribution(&[]).present);
+        let short = vec![kline(0, 9.0, 11.0, 10.0, Some(3.0)); 4];
+        assert!(!compute_chip_distribution(&short).present);
+        let flat = vec![kline(0, 10.0, 10.0, 10.0, Some(3.0)); 5];
+        assert!(!compute_chip_distribution(&flat).present);
+        let nonfinite = vec![kline(0, f64::NAN, 11.0, 10.0, Some(3.0)); 5];
+        assert!(!compute_chip_distribution(&nonfinite).present);
+    }
+
+    #[test]
+    fn compute_uses_latest_120_days_and_marks_turnover_estimation() {
+        let history: Vec<KlineData> = (0..130)
+            .map(|index| {
+                let center = 10.0 + index as f64 * 0.01;
+                let turnover = match index % 3 {
+                    0 => None,
+                    1 => Some(0.0),
+                    _ => Some(2.5),
+                };
+                kline(index, center - 0.4, center + 0.4, center, turnover)
+            })
+            .collect();
+
+        let chip = compute_chip_distribution(&history);
+
+        assert!(chip.present);
+        assert_eq!(chip.days_used, 120);
+        assert!(chip.turnover_estimated);
+        assert_eq!(chip.current_price, 10.0);
+        assert!(chip.avg_cost > 0.0);
+        assert!(chip.main_cost > 0.0);
+        assert!((0.0..=1.0).contains(&chip.profit_ratio));
+        assert!(chip.p90_low <= chip.p70_low);
+        assert!(chip.p70_high <= chip.p90_high);
+        assert!(chip.concentration_90 >= chip.concentration_70);
+        assert!(chip.price_vs_main_pct.is_finite());
+    }
+
+    fn rendered(profit: f64, concentration: f64, price_vs_main: f64, estimated: bool) -> String {
+        format_for_prompt(&ChipDistribution {
+            present: true,
+            days_used: 20,
+            turnover_estimated: estimated,
+            current_price: 10.0,
+            avg_cost: 9.5,
+            main_cost: 9.0,
+            profit_ratio: profit,
+            p90_low: 8.0,
+            p90_high: 11.0,
+            p70_low: 8.5,
+            p70_high: 10.5,
+            concentration_90: concentration,
+            concentration_70: concentration / 2.0,
+            price_vs_main_pct: price_vs_main,
+        })
+    }
+
+    #[test]
+    fn prompt_covers_profit_concentration_and_cost_position_bands() {
+        assert!(format_for_prompt(&ChipDistribution::default()).is_empty());
+
+        let profit_cases = [
+            (0.85, "高位获利盘密集"),
+            (0.60, "趋势健康"),
+            (0.30, "套牢盘仍占多数"),
+            (0.10, "深度套牢"),
+            (0.09, "几乎全线套牢"),
+        ];
+        for (value, expected) in profit_cases {
+            assert!(rendered(value, 14.0, 6.0, false).contains(expected));
+        }
+
+        let concentration_cases = [
+            (14.9, "筹码高度集中"),
+            (24.9, "筹码较为集中"),
+            (39.9, "筹码分散度中等"),
+            (40.0, "筹码高度分散"),
+        ];
+        for (value, expected) in concentration_cases {
+            assert!(rendered(0.5, value, 0.0, false).contains(expected));
+        }
+
+        let position_cases = [
+            (5.1, "显著高于主力成本"),
+            (-1.9, "贴近主力成本"),
+            (-7.9, "主力浅套"),
+            (-8.0, "主力深套"),
+        ];
+        for (value, expected) in position_cases {
+            assert!(rendered(0.5, 20.0, value, false).contains(expected));
+        }
+
+        let estimated = rendered(0.5, 20.0, 0.0, true);
+        assert!(estimated.contains("换手率部分估算"));
+        assert!(estimated.contains("90%成本区间"));
+        assert!(estimated.contains("70%成本区间"));
+    }
+}

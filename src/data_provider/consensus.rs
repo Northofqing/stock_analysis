@@ -94,6 +94,111 @@ fn avg(values: &[f64]) -> Option<f64> {
     }
 }
 
+/// BR-119: validate and aggregate one complete consensus protocol batch.
+fn parse_consensus_data(
+    json: &Value,
+    begin: chrono::NaiveDate,
+    today: chrono::NaiveDate,
+) -> Result<ConsensusData> {
+    let arr = json
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("一致预期无 data 数组"))?;
+    if arr.is_empty() {
+        return Err(anyhow!("一致预期 data 为空"));
+    }
+
+    let mut eps_this: Vec<f64> = Vec::new();
+    let mut eps_next: Vec<f64> = Vec::new();
+    let mut eps_next2: Vec<f64> = Vec::new();
+    let mut tp_high: Vec<f64> = Vec::new();
+    let mut tp_low: Vec<f64> = Vec::new();
+    let mut rating_dist: HashMap<String, u32> = HashMap::new();
+    let mut brokers: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut latest_report_date: Option<String> = None;
+    let mut recent_reports: Vec<RecentReport> = Vec::new();
+    let mut previous_publish_date: Option<chrono::NaiveDate> = None;
+
+    for (index, item) in arr.iter().enumerate() {
+        let (publish_date, parsed_publish_date) = required_publish_date(item)?;
+        if parsed_publish_date < begin || parsed_publish_date > today {
+            return Err(anyhow!(
+                "一致预期 publishDate 超出请求窗口: {parsed_publish_date} not in {begin}..={today}"
+            ));
+        }
+        if let Some(previous) = previous_publish_date {
+            if parsed_publish_date > previous {
+                return Err(anyhow!(
+                    "一致预期记录时间顺序错误: {parsed_publish_date} 晚于前一条 {previous}"
+                ));
+            }
+        }
+        previous_publish_date = Some(parsed_publish_date);
+
+        if let Some(value) = optional_finite_f64(item, "predictThisYearEps")? {
+            eps_this.push(value);
+        }
+        if let Some(value) = optional_finite_f64(item, "predictNextYearEps")? {
+            eps_next.push(value);
+        }
+        if let Some(value) = optional_finite_f64(item, "predictNextTwoYearEps")? {
+            eps_next2.push(value);
+        }
+        let high = optional_finite_f64(item, "indvAimPriceT")?;
+        let low = optional_finite_f64(item, "indvAimPriceL")?;
+        for (field, value) in [("indvAimPriceT", high), ("indvAimPriceL", low)] {
+            if value.is_some_and(|price| price <= 0.0) {
+                return Err(anyhow!("一致预期字段 {field} 必须 > 0"));
+            }
+        }
+        if high.zip(low).is_some_and(|(high, low)| low > high) {
+            return Err(anyhow!(
+                "一致预期目标价上下限颠倒: low={low:?} high={high:?}"
+            ));
+        }
+        if let Some(value) = high {
+            tp_high.push(value);
+        }
+        if let Some(value) = low {
+            tp_low.push(value);
+        }
+
+        let rating = required_text(item, "emRatingName")?;
+        *rating_dist.entry(rating.clone()).or_insert(0) += 1;
+        let org_name = required_text(item, "orgSName")?;
+        brokers.insert(org_name.clone());
+        let title = required_text(item, "title")?;
+        if index == 0 {
+            latest_report_date = Some(publish_date.clone());
+        }
+        if recent_reports.len() < 3 {
+            recent_reports.push(RecentReport {
+                title,
+                org_name,
+                publish_date,
+                rating,
+            });
+        }
+    }
+
+    if eps_this.is_empty() && eps_next.is_empty() && eps_next2.is_empty() {
+        return Err(anyhow!("一致预期批次不含任何 EPS 预测"));
+    }
+
+    Ok(ConsensusData {
+        report_count: arr.len(),
+        broker_count: brokers.len(),
+        eps_this_year_avg: avg(&eps_this),
+        eps_next_year_avg: avg(&eps_next),
+        eps_next2_year_avg: avg(&eps_next2),
+        rating_distribution: rating_dist,
+        target_price_high_avg: avg(&tp_high),
+        target_price_low_avg: avg(&tp_low),
+        latest_report_date,
+        recent_reports,
+    })
+}
+
 /// 异步拉取一致预期
 pub async fn fetch_async(client: &reqwest::Client, code: &str) -> Result<ConsensusData> {
     // 取最近 180 天研报
@@ -122,103 +227,7 @@ pub async fn fetch_async(client: &reqwest::Client, code: &str) -> Result<Consens
     let text = resp.text().await.context("一致预期读取响应失败")?;
     let json: Value = serde_json::from_str(&text).context("一致预期 JSON 解析失败")?;
 
-    let arr = json
-        .get("data")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| anyhow!("一致预期无 data 数组"))?;
-    if arr.is_empty() {
-        return Err(anyhow!("一致预期 data 为空"));
-    }
-
-    let mut eps_this: Vec<f64> = Vec::new();
-    let mut eps_next: Vec<f64> = Vec::new();
-    let mut eps_next2: Vec<f64> = Vec::new();
-    let mut tp_high: Vec<f64> = Vec::new();
-    let mut tp_low: Vec<f64> = Vec::new();
-    let mut rating_dist: HashMap<String, u32> = HashMap::new();
-    let mut brokers: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut latest_report_date: Option<String> = None;
-    let mut recent_reports: Vec<RecentReport> = Vec::new();
-    let mut previous_publish_date: Option<chrono::NaiveDate> = None;
-
-    for (i, item) in arr.iter().enumerate() {
-        let (pub_date, parsed_pub_date) = required_publish_date(item)?;
-        if parsed_pub_date < begin || parsed_pub_date > today {
-            return Err(anyhow!(
-                "一致预期 publishDate 超出请求窗口: {parsed_pub_date} not in {begin}..={today}"
-            ));
-        }
-        if let Some(previous) = previous_publish_date {
-            if parsed_pub_date > previous {
-                return Err(anyhow!(
-                    "一致预期记录时间顺序错误: {parsed_pub_date} 晚于前一条 {previous}"
-                ));
-            }
-        }
-        previous_publish_date = Some(parsed_pub_date);
-
-        if let Some(v) = optional_finite_f64(item, "predictThisYearEps")? {
-            eps_this.push(v);
-        }
-        if let Some(v) = optional_finite_f64(item, "predictNextYearEps")? {
-            eps_next.push(v);
-        }
-        if let Some(v) = optional_finite_f64(item, "predictNextTwoYearEps")? {
-            eps_next2.push(v);
-        }
-        let high = optional_finite_f64(item, "indvAimPriceT")?;
-        let low = optional_finite_f64(item, "indvAimPriceL")?;
-        for (field, value) in [("indvAimPriceT", high), ("indvAimPriceL", low)] {
-            if value.is_some_and(|price| price <= 0.0) {
-                return Err(anyhow!("一致预期字段 {field} 必须 > 0"));
-            }
-        }
-        if high.zip(low).is_some_and(|(high, low)| low > high) {
-            return Err(anyhow!(
-                "一致预期目标价上下限颠倒: low={low:?} high={high:?}"
-            ));
-        }
-        if let Some(value) = high {
-            tp_high.push(value);
-        }
-        if let Some(value) = low {
-            tp_low.push(value);
-        }
-
-        let rating = required_text(item, "emRatingName")?;
-        *rating_dist.entry(rating.clone()).or_insert(0) += 1;
-        let org_name = required_text(item, "orgSName")?;
-        brokers.insert(org_name.clone());
-        let title = required_text(item, "title")?;
-        if i == 0 {
-            latest_report_date = Some(pub_date.clone());
-        }
-        if recent_reports.len() < 3 {
-            recent_reports.push(RecentReport {
-                title,
-                org_name,
-                publish_date: pub_date,
-                rating,
-            });
-        }
-    }
-
-    if eps_this.is_empty() && eps_next.is_empty() && eps_next2.is_empty() {
-        return Err(anyhow!("一致预期批次不含任何 EPS 预测"));
-    }
-
-    Ok(ConsensusData {
-        report_count: arr.len(),
-        broker_count: brokers.len(),
-        eps_this_year_avg: avg(&eps_this),
-        eps_next_year_avg: avg(&eps_next),
-        eps_next2_year_avg: avg(&eps_next2),
-        rating_distribution: rating_dist,
-        target_price_high_avg: avg(&tp_high),
-        target_price_low_avg: avg(&tp_low),
-        latest_report_date,
-        recent_reports,
-    })
+    parse_consensus_data(&json, begin, today)
 }
 
 /// 同步包装：在已有 tokio runtime 上下文内调用
@@ -287,5 +296,96 @@ mod strict_contract_tests {
         let bad_date = serde_json::json!({"publishDate": "2026-99-99"});
         assert!(required_publish_date(&bad_date).is_err());
         assert!(required_text(&serde_json::json!({"title": ""}), "title").is_err());
+    }
+
+    fn report(date: &str, broker: &str, rating: &str, eps: Value) -> Value {
+        serde_json::json!({
+            "publishDate": date,
+            "title": format!("{broker}研报"),
+            "orgSName": broker,
+            "emRatingName": rating,
+            "predictThisYearEps": eps,
+            "predictNextYearEps": 2.0,
+            "predictNextTwoYearEps": 3.0,
+            "indvAimPriceT": 15.0,
+            "indvAimPriceL": 12.0
+        })
+    }
+
+    #[test]
+    fn local_consensus_batch_aggregates_only_complete_real_reports() {
+        let begin = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 18).unwrap();
+        let json = serde_json::json!({"data": [
+            report("2026-07-18", "甲券商", "买入", serde_json::json!(1.0)),
+            report("2026-07-17", "乙券商", "增持", serde_json::json!(1.5)),
+            report("2026-07-16", "甲券商", "中性", serde_json::json!(2.0)),
+            report("2026-07-15", "丙券商", "推荐", serde_json::json!(2.5))
+        ]});
+
+        let data = parse_consensus_data(&json, begin, today).expect("valid consensus batch");
+
+        assert_eq!(data.report_count, 4);
+        assert_eq!(data.broker_count, 3);
+        assert_eq!(data.eps_this_year_avg, Some(1.75));
+        assert_eq!(data.target_price_high_avg, Some(15.0));
+        assert_eq!(data.latest_report_date.as_deref(), Some("2026-07-18"));
+        assert_eq!(data.recent_reports.len(), 3);
+        assert_eq!(data.bullish_ratio(), Some(75.0));
+        assert_eq!(data.upside_pct(10.0), Some(50.0));
+        assert_eq!(data.upside_pct(0.0), None);
+    }
+
+    #[test]
+    fn local_consensus_batch_rejects_protocol_and_time_failures() {
+        let begin = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 18).unwrap();
+        assert!(parse_consensus_data(&serde_json::json!({}), begin, today).is_err());
+        assert!(parse_consensus_data(&serde_json::json!({"data": []}), begin, today).is_err());
+
+        let outside = serde_json::json!({"data": [report(
+            "2025-12-31", "甲券商", "买入", serde_json::json!(1.0)
+        )]});
+        assert!(parse_consensus_data(&outside, begin, today).is_err());
+
+        let out_of_order = serde_json::json!({"data": [
+            report("2026-07-17", "甲券商", "买入", serde_json::json!(1.0)),
+            report("2026-07-18", "乙券商", "买入", serde_json::json!(1.0))
+        ]});
+        assert!(parse_consensus_data(&out_of_order, begin, today).is_err());
+    }
+
+    #[test]
+    fn local_consensus_batch_rejects_bad_prices_and_missing_eps_evidence() {
+        let begin = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 18).unwrap();
+
+        let mut nonpositive = report("2026-07-18", "甲券商", "买入", serde_json::json!(1.0));
+        nonpositive["indvAimPriceT"] = serde_json::json!(0.0);
+        assert!(
+            parse_consensus_data(&serde_json::json!({"data": [nonpositive]}), begin, today)
+                .is_err()
+        );
+
+        let mut reversed = report("2026-07-18", "甲券商", "买入", serde_json::json!(1.0));
+        reversed["indvAimPriceT"] = serde_json::json!(10.0);
+        reversed["indvAimPriceL"] = serde_json::json!(12.0);
+        assert!(
+            parse_consensus_data(&serde_json::json!({"data": [reversed]}), begin, today).is_err()
+        );
+
+        let no_eps = report("2026-07-18", "甲券商", "买入", Value::Null);
+        let mut no_eps = no_eps;
+        no_eps["predictNextYearEps"] = Value::Null;
+        no_eps["predictNextTwoYearEps"] = Value::Null;
+        assert!(
+            parse_consensus_data(&serde_json::json!({"data": [no_eps]}), begin, today).is_err()
+        );
+    }
+
+    #[test]
+    fn empty_ratings_have_no_bullish_ratio_and_blocking_requires_runtime() {
+        assert_eq!(ConsensusData::default().bullish_ratio(), None);
+        assert!(fetch_blocking(&reqwest::Client::new(), "TEST_CODE_000001").is_err());
     }
 }

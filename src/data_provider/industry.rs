@@ -295,3 +295,40 @@ pub fn fetch_blocking(client: &reqwest::Client, code: &str) -> Option<IndustryBe
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secid_covers_shanghai_shenzhen_and_beijing_prefixes() {
+        assert_eq!(secid_for("600519"), "1.600519");
+        assert_eq!(secid_for("900901"), "1.900901");
+        assert_eq!(secid_for("000001"), "0.000001");
+        assert_eq!(secid_for("430047"), "0.430047");
+    }
+
+    #[test]
+    fn median_filters_nonfinite_values_and_handles_odd_even_sets() {
+        assert_eq!(median(&[]), None);
+        assert_eq!(median(&[f64::NAN, f64::INFINITY]), None);
+        assert_eq!(median(&[3.0, 1.0, 2.0]), Some(2.0));
+        assert_eq!(median(&[4.0, 1.0, 3.0, 2.0]), Some(2.5));
+        assert_eq!(median(&[f64::NAN, 4.0, 2.0]), Some(3.0));
+    }
+
+    #[test]
+    fn percentile_counts_only_finite_peers_strictly_below_target() {
+        assert_eq!(percentile_low(10.0, &[]), None);
+        assert_eq!(percentile_low(10.0, &[f64::NAN]), None);
+        let percentile =
+            percentile_low(10.0, &[5.0, 10.0, 15.0, f64::NAN]).expect("finite peer percentile");
+        assert!((percentile - 100.0 / 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn blocking_wrapper_without_runtime_returns_missing_instead_of_fake_data() {
+        let client = reqwest::Client::new();
+        assert!(fetch_blocking(&client, "TEST_CODE_000001").is_none());
+    }
+}

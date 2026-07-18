@@ -536,4 +536,202 @@ mod br115_tests {
         }))
         .is_err());
     }
+
+    #[test]
+    fn financial_period_ratios_are_available_only_from_valid_real_inputs() {
+        let empty = FinancialPeriod::default();
+        assert!(!empty.any());
+        assert_eq!(empty.equity_multiplier(), None);
+        assert_eq!(empty.dupont(), None);
+        assert_eq!(empty.cfo_to_ni_ratio(), None);
+
+        let period = FinancialPeriod {
+            eps: Some(2.0),
+            net_margin: Some(10.0),
+            op_cash_flow_ps: Some(3.0),
+            total_asset_turnover: Some(0.5),
+            debt_to_assets: Some(50.0),
+            ..Default::default()
+        };
+        assert!(period.any());
+        assert_eq!(period.equity_multiplier(), Some(2.0));
+        assert_eq!(period.dupont(), Some((10.0, 0.5, 2.0, 10.0)));
+        assert_eq!(period.cfo_to_ni_ratio(), Some(1.5));
+
+        let insolvent = FinancialPeriod {
+            debt_to_assets: Some(100.0),
+            eps: Some(0.0),
+            op_cash_flow_ps: Some(1.0),
+            ..Default::default()
+        };
+        assert_eq!(insolvent.equity_multiplier(), None);
+        assert_eq!(insolvent.cfo_to_ni_ratio(), None);
+    }
+
+    #[test]
+    fn quality_assessment_covers_all_risk_levels_and_caps_extreme_scores() {
+        assert!(assess_quality(&[]).is_none());
+        let clean = FinancialPeriod {
+            eps: Some(1.0),
+            roe: Some(10.0),
+            revenue_yoy: Some(5.0),
+            net_profit_yoy: Some(5.0),
+            gross_margin: Some(30.0),
+            op_cash_flow_ps: Some(1.0),
+            ..Default::default()
+        };
+        let clean_report = assess_quality(std::slice::from_ref(&clean)).expect("clean report");
+        assert_eq!(clean_report.risk_score, 0);
+        assert_eq!(clean_report.level, "无明显异常");
+
+        let light = FinancialPeriod {
+            net_profit_yoy: Some(151.0),
+            ..Default::default()
+        };
+        assert_eq!(assess_quality(&[light]).unwrap().level, "轻微提示");
+
+        let attention = FinancialPeriod {
+            eps: Some(1.0),
+            op_cash_flow_ps: Some(0.1),
+            revenue_yoy: Some(0.0),
+            net_profit_yoy: Some(30.0),
+            gross_margin: Some(50.0),
+            ..Default::default()
+        };
+        let previous = FinancialPeriod {
+            eps: Some(1.0),
+            op_cash_flow_ps: Some(0.5),
+            gross_margin: Some(40.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            assess_quality(&[attention, previous]).unwrap().level,
+            "需关注"
+        );
+
+        let extreme = vec![
+            FinancialPeriod {
+                eps: Some(3.0),
+                roe: Some(10.0),
+                revenue_yoy: Some(120.0),
+                net_profit_yoy: Some(200.0),
+                gross_margin: Some(50.0),
+                op_cash_flow_ps: Some(0.3),
+                ..Default::default()
+            },
+            FinancialPeriod {
+                eps: Some(2.0),
+                roe: Some(11.0),
+                gross_margin: Some(40.0),
+                op_cash_flow_ps: Some(1.6),
+                ..Default::default()
+            },
+            FinancialPeriod {
+                eps: Some(1.0),
+                roe: Some(12.0),
+                gross_margin: Some(39.0),
+                op_cash_flow_ps: Some(0.1),
+                ..Default::default()
+            },
+            FinancialPeriod {
+                eps: Some(0.5),
+                roe: Some(13.0),
+                gross_margin: Some(38.0),
+                op_cash_flow_ps: Some(0.0),
+                ..Default::default()
+            },
+        ];
+        let report = assess_quality(&extreme).expect("extreme report");
+        assert_eq!(report.risk_score, 100);
+        assert_eq!(report.level, "高风险⚠️");
+        assert!(report
+            .flags
+            .iter()
+            .any(|flag| flag.contains("应计利润可疑")));
+        assert!(report
+            .flags
+            .iter()
+            .any(|flag| flag.contains("毛利率单期突变")));
+        assert!(report
+            .flags
+            .iter()
+            .any(|flag| flag.contains("CFO/NI 单期骤降")));
+        assert!(report
+            .flags
+            .iter()
+            .any(|flag| flag.contains("EPS 持续上行")));
+        assert!(report
+            .flags
+            .iter()
+            .any(|flag| flag.contains("长期盈利质量低")));
+    }
+
+    #[test]
+    fn financial_protocol_helpers_cover_market_codes_aliases_and_strict_types() {
+        assert_eq!(to_em_secucode("600519"), "SH600519");
+        assert_eq!(to_em_secucode("900901"), "SH900901");
+        assert_eq!(to_em_secucode("000001"), "SZ000001");
+        assert_eq!(to_em_secucode("300750"), "SZ300750");
+        assert_eq!(to_em_secucode("430047"), "BJ430047");
+        assert_eq!(to_em_secucode("TEST_CODE_000001"), "SHTEST_CODE_000001");
+
+        assert_eq!(as_f64(&Value::Null, "x").unwrap(), None);
+        assert_eq!(as_f64(&serde_json::json!(1.5), "x").unwrap(), Some(1.5));
+        assert_eq!(as_f64(&serde_json::json!(" 2.5 "), "x").unwrap(), Some(2.5));
+        assert!(as_f64(&Value::Bool(true), "x").is_err());
+        assert_eq!(
+            pick_f64(
+                &serde_json::json!({"a": null, "b": "", "c": 3}),
+                &["a", "b", "c"]
+            )
+            .unwrap(),
+            Some(3.0)
+        );
+        assert_eq!(pick_f64(&serde_json::json!({}), &["x"]).unwrap(), None);
+    }
+
+    #[test]
+    fn complete_f10_period_uses_alias_fields_and_preserves_report_date() {
+        let period = parse_f10_period(&serde_json::json!({
+            "REPORT_DATE": "2026-06-30 00:00:00",
+            "EPSXS": "1.2",
+            "ROEKCJQ": 12.0,
+            "TOTALOPERATEREVETZ": 8.0,
+            "PARENTNETPROFITTZ": 9.0,
+            "XSMLL": 30.0,
+            "XSJLL": 10.0,
+            "MGJYXJL": 1.5,
+            "TOAZZL": 0.6,
+            "ZCFZL": 50.0
+        }))
+        .expect("complete F10 period");
+        assert_eq!(period.report_date.as_deref(), Some("2026-06-30"));
+        assert_eq!(period.eps, Some(1.2));
+        assert_eq!(period.roe, Some(12.0));
+        assert_eq!(period.op_cash_flow_ps, Some(1.5));
+        assert_eq!(period.total_asset_turnover, Some(0.6));
+        assert_eq!(period.debt_to_assets, Some(50.0));
+    }
+
+    #[test]
+    fn source_selector_returns_first_nonempty_real_financial_batch() {
+        let selected = Financials {
+            report_date: Some("2026-06-30".into()),
+            eps: Some(1.0),
+            source: Some("测试真实源"),
+            ..Default::default()
+        };
+        let result = select_financial_source_results(
+            "TEST_CODE_000001",
+            vec![("EMPTY", Ok(Financials::default())), ("REAL", Ok(selected))],
+        )
+        .expect("first nonempty source");
+        assert_eq!(result.eps, Some(1.0));
+        assert!(result.any());
+    }
+
+    #[test]
+    fn blocking_financial_fetch_requires_an_existing_runtime() {
+        assert!(fetch_with_fallback_blocking(&reqwest::Client::new(), "TEST_CODE_000001").is_err());
+    }
 }
