@@ -79,3 +79,43 @@ fn test_mode_rejects_production_database_with_nonzero_exit() {
 
     std::fs::remove_dir_all(&root).expect("remove isolated working directory");
 }
+
+#[test]
+fn fresh_test_database_starts_without_lock_errors() {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let root = std::env::temp_dir().join(format!(
+        "monitor-fresh-db-lock-check-{}-{}",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&root).expect("create isolated working directory");
+    let database_path = root.join("fresh.db");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_monitor"))
+        .args(["--test", "--review"])
+        .current_dir(&root)
+        .env("DATABASE_PATH", &database_path)
+        .env("STOCK_LIST", "TEST_CODE_000001")
+        .env("STOCK_ENV_MODE", "test")
+        .env("MONITOR_ENABLED", "true")
+        .env("V10_DRY_RUN_PUSH", "1")
+        .output()
+        .expect("run monitor with a fresh isolated database");
+
+    let combined_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "missing same-day real ledger must fail closed; output={combined_output}"
+    );
+    assert!(
+        !combined_output.contains("database is locked"),
+        "fresh database startup must not race WAL initialization; output={combined_output}"
+    );
+
+    std::fs::remove_dir_all(&root).expect("remove isolated working directory");
+}

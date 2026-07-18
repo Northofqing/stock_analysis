@@ -154,6 +154,30 @@
 - `cargo fmt --all -- --check`: PASS.
 - `cargo check --all-targets --all-features`: PASS.
 - `cargo clippy --all-targets --all-features -- -D warnings`: PASS.
+- `cargo test --all-targets --all-features`: PASS, exit 0. Library ran 1,346 tests (1,336 passed / 10 ignored); monitor 293/293 passed; every remaining binary, integration, and benchmark target had zero failures.
+- `bash tools/compliance/check.sh`: PASS. Freshness remains `stock_daily MAX(date)=2026-07-16`, one A-share trading day behind; fake implementation, contradiction, business-rule, and silent-fallback checks passed (documented nonblocking warnings unchanged).
+- `cargo build --release --bin monitor`: PASS.
+- Isolated dry-run smoke exited 2 on missing 2026-07-18 ledger NAV as designed, but also logged repeated `database is locked` errors during first-time DB initialization. Paused Gate D evidence collection to investigate systematically before proposing any fix.
+- Reproduced the same startup lock errors on a second unique database path; the symptom is deterministic for clean DB initialization. Began tracing `DatabaseManager::init`, pool customization, and migration ordering.
+- Traced the failure boundary to concurrent r2d2 connection customization: every newly opened connection attempts the database-wide WAL transition before migrations, so some acquisitions log `database is locked` and retry. No fix applied yet; proceeding to compare working initialization patterns and test the hypothesis minimally.
+- TDD/codebase-design decision: preserve `DatabaseManager::init` as the sole interface and test through the real monitor process. No new public seam; move only database-wide bootstrap work ahead of concurrent pool creation if the RED test confirms the hypothesis.
+- Located the existing process-level monitor test seam and the design section that must be amended before implementation. Next: write Gate-A addendum, then one RED integration test.
+- Gate-A addendum written for serial WAL bootstrap, explicit lock failure, process-level test seam, old-module relation, and rollback. `CONTEXT.md` is absent, consistent with the existing recorded repository gap.
+- TDD RED: added one process-level fresh-DB test; exact run failed as expected with nine `database is locked` messages and otherwise reached the existing exit-2 ledger boundary.
+- GREEN attempt 1 remained RED: serial WAL bootstrap reduced lock errors 9→1. Returned to diagnostic Phase 1; next run will label which per-connection PRAGMA still races.
+- Diagnostic run labeled the remaining failure as `synchronous=NORMAL`, executed before busy timeout. Proceeding with one-variable statement reordering as GREEN attempt 2.
+- TDD GREEN: `fresh_test_database_starts_without_lock_errors` PASS after serial WAL bootstrap plus busy-timeout-first pooled connection setup. The explicit PRAGMA-stage error labels remain as useful failure evidence.
+- Refactor verification: complete `monitor_help_isolation` suite 3/3 PASS; the fresh-DB test then passed three additional consecutive runs.
+- Post-fix diff review found the change remains localized to WAL bootstrap/customizer ordering plus the public process test and Gate-A addendum. `git diff --check` and `cargo fmt --all -- --check` PASS.
+- Post-fix `cargo check --all-targets --all-features`: PASS.
+- Post-fix `cargo clippy --all-targets --all-features -- -D warnings`: PASS.
+- Post-fix `cargo test --all-targets --all-features`: PASS, exit 0. Library 1,336 passed / 10 ignored; monitor 293/293; all remaining targets zero failures, including fresh-DB isolation 3/3.
+- Post-fix `bash tools/compliance/check.sh`: PASS with freshness at 2026-07-16 (one trading day behind) and the existing documented nonblocking warnings.
+- Post-fix `cargo build --release --bin monitor`: PASS.
+- Post-fix isolated release smoke on a unique fresh DB: no `database is locked`; expected exit 2 occurs only at missing same-day ledger NAV, with test environment and dry-run delivery.
+- `cargo llvm-cov --workspace --all-features --json --output-path target/coverage/coverage.json`: tests PASS and report written.
+- `python3 tools/coverage/check_thresholds.py target/coverage/coverage.json`: FAIL; global 51.18% < 80%, core 55.38% < 95% across 94 files. Gate D and merge remain blocked together with missing live-account evidence and auditor sign-off.
+- Final pre-stage inventory: ten tracked paths, 253 insertions / 142 deletions; includes the two authorized orphan deletions, WAL startup fix/test/design, historical progress evidence, and Phase-11 planning. `git diff --check` PASS.
 - `cargo test --all-targets --all-features`: PASS; lib 1311 passed / 10 ignored, monitor 284 passed, all integration targets zero failures.
 - `bash tools/compliance/check.sh`: PASS; freshness latest 2026-07-16, one trading day behind.
 - `cargo build --release --bin monitor`: PASS.
@@ -195,3 +219,19 @@
 - Refreshed coverage report: global 42895/84187 = 50.95% < 80%; core 11802/21298 = 55.41% < 95% across 94 files.
 - Gate D remains blocked by the measured coverage deficit, unavailable real-account current-day cash/position/NAV validation, and missing auditor sign-off. Final status remains **In Progress / Blocked**; the deliverable must stay a draft PR.
 - Scoped implementation commit `e7db307` was pushed on `codex/repository-safety-closure-20260718`; Draft PR #2: https://github.com/Northofqing/stock_analysis/pull/2. User-owned changes in `.gitignore`, `.superpowers/sdd/progress.md`, `src/app/context.rs`, and `src/broker/ib.rs` remain unstaged and outside the PR.
+
+## 2026-07-18 — Phase 11 commit-all / merge evaluation
+
+- User explicitly requested committing all remaining code and merging everything into `master`.
+- Activated the existing event-replay safety-remediation plan for continuation because `.planning/.active_plan` is absent.
+- Logged one failed multi-file patch caused by stale findings-tail context; re-read exact tails and switched to targeted patches.
+- Next: independently inspect all remaining diffs, run full gates, commit/push the authorized changes, request fixed-SHA code review, and merge only if Gate D is fully green.
+- Worktree inventory captured: seven changed files total after planning updates; the only Rust changes are deletion of `src/app/context.rs` and `src/broker/ib.rs` (132 lines combined).
+- Read both deleted modules and searched their callers: no references found; the IB file is a documented zero-price/empty-sector placeholder. Continue with module-export verification and add a supersession note to the historical progress ledger.
+- One inventory command assumed a nonexistent `src/broker/mod.rs`; logged the error and switched to inspecting `src/broker.rs` plus `src/app/mod.rs` directly.
+- Verified both deleted files are orphaned and annotated the historical v17.7 Gate D ledger as scoped/superseded.
+- Temporarily removing the planning/workspace ignores exposed extensive unrelated generated artifacts. Restored the user's ignore rules; current tracked plan/progress updates remain visible to Git.
+- Phase 11 audit complete: the two Rust deletions remove unexported orphan modules; the IB module is an explicit zero/empty fake provider superseded by active fail-closed `src/broker.rs`. Historical progress claims are now scoped, and generated workspaces remain ignored.
+- Phase 11 fast validation: `cargo fmt --all -- --check` PASS and `git diff --check` PASS; exact worktree remains the seven authorized tracked changes.
+- `cargo check --all-targets --all-features`: PASS.
+- `cargo clippy --all-targets --all-features -- -D warnings`: PASS.

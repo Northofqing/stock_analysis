@@ -68,18 +68,24 @@ struct SqlitePragmaCustomizer;
 
 impl CustomizeConnection<SqliteConnection, diesel::r2d2::Error> for SqlitePragmaCustomizer {
     fn on_acquire(&self, conn: &mut SqliteConnection) -> Result<(), diesel::r2d2::Error> {
-        diesel::sql_query("PRAGMA journal_mode = WAL")
-            .execute(conn)
-            .map_err(diesel::r2d2::Error::QueryError)?;
-        diesel::sql_query("PRAGMA synchronous = NORMAL")
-            .execute(conn)
-            .map_err(diesel::r2d2::Error::QueryError)?;
         diesel::sql_query("PRAGMA busy_timeout = 5000")
             .execute(conn)
-            .map_err(diesel::r2d2::Error::QueryError)?;
+            .map_err(|error| {
+                log::error!("[DB pool init] PRAGMA busy_timeout=5000 failed: {error}");
+                diesel::r2d2::Error::QueryError(error)
+            })?;
+        diesel::sql_query("PRAGMA synchronous = NORMAL")
+            .execute(conn)
+            .map_err(|error| {
+                log::error!("[DB pool init] PRAGMA synchronous=NORMAL failed: {error}");
+                diesel::r2d2::Error::QueryError(error)
+            })?;
         diesel::sql_query("PRAGMA wal_autocheckpoint = 1000")
             .execute(conn)
-            .map_err(diesel::r2d2::Error::QueryError)?;
+            .map_err(|error| {
+                log::error!("[DB pool init] PRAGMA wal_autocheckpoint=1000 failed: {error}");
+                diesel::r2d2::Error::QueryError(error)
+            })?;
         Ok(())
     }
 }
@@ -137,6 +143,14 @@ impl DatabaseManager {
         let database_url = path.to_string_lossy().to_string();
         info!("初始化数据库: {}", database_url);
 
+        // WAL is database-wide and requires a lock. Configure it once before
+        // r2d2 opens connections concurrently; pooled connections apply only
+        // connection-local PRAGMAs in `SqlitePragmaCustomizer`.
+        let mut bootstrap_conn = SqliteConnection::establish(&database_url)?;
+        diesel::sql_query("PRAGMA busy_timeout = 5000").execute(&mut bootstrap_conn)?;
+        diesel::sql_query("PRAGMA journal_mode = WAL").execute(&mut bootstrap_conn)?;
+        drop(bootstrap_conn);
+
         let manager = ConnectionManager::<SqliteConnection>::new(database_url);
         let pool = Pool::builder()
             .max_size(10)
@@ -151,7 +165,6 @@ impl DatabaseManager {
         // 之前: SQLite 默认 DELETE journal mode → 写锁整库, 并行测试同时写同一个 ./test_data/test.db → "database is locked"
         // 现在: WAL 模式让读写不互斥, busy_timeout 让等待锁的连接最多等 5s
         // 收益: (a) cargo test 默认并行度不再 flake, (b) 生产路径并发写也安全
-        diesel::sql_query("PRAGMA journal_mode = WAL").execute(&mut *conn)?;
         diesel::sql_query("PRAGMA synchronous = NORMAL").execute(&mut *conn)?;
         diesel::sql_query("PRAGMA busy_timeout = 5000").execute(&mut *conn)?;
         diesel::sql_query("PRAGMA wal_autocheckpoint = 1000").execute(&mut *conn)?;

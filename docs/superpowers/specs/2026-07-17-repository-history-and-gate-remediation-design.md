@@ -448,3 +448,11 @@ Failure handling:
 - 判定顺序保持业务优先级：当日下跌且主力流出为 Fade；当日极端上涨且涨停数达门槛为 Climax；当日上涨但资金加速度显著转弱为 Divergence；当日非正、零涨停且主力不流入为 Cold。上述结论不消费三日历史。
 - 只有累计高潮、Ferment 和 Start 分支读取三日板块历史；历史必须通过 BR-092 的日期唯一、连续和字段质量门。历史损坏或不可读时这些分支返回 Unknown 并记录错误，禁止用 0 代替。
 - 该拆分避免一个与当前分支无关的历史文件故障覆盖已具备完整当日证据的结论，同时不放宽任何需要历史的判定。
+
+## Addendum: SQLite 启动 WAL 顺序与锁错误闭环（2026-07-18）
+
+- 数据流：`DatabaseManager::init(path)` 先用单一 bootstrap 连接把数据库级 journal mode 切换为 WAL；该连接关闭后再创建 r2d2 pool。池中每条连接只设置 connection-local 的 `synchronous`、`busy_timeout` 与 `wal_autocheckpoint`，随后由单一池连接执行既有 migrations/schema 初始化。
+- 失败模式：bootstrap 建连、WAL 切换、池连接定制、迁移或 schema 初始化任一步失败都必须使 `init` 返回错误；不得由 r2d2 记录若干 `database is locked` 后重试成功并把初始化报告为健康。
+- 测试 seam：通过编译后的 monitor 进程对全新隔离 SQLite 路径执行 `--test --review`。缺少当日真实 ledger 仍应以 2 fail-closed，但完整输出不得包含 `database is locked`。测试不查询内部 PRAGMA，也不暴露新的调用接口。
+- 旧模块关系：保留 `DatabaseManager::init`、现有 migrations、10 连接 pool 与每连接 timeout 设置；只把数据库级 WAL 切换从并发 customizer 移到串行 bootstrap。被删除的孤立 `src/broker/ib.rs` 与 `src/app/context.rs` 不参与数据库初始化。
+- 回滚：`git revert` 本批并重跑 fresh-DB 进程测试；不执行 schema down migration、不删除数据库，也不得用忽略日志或字符串过滤掩盖锁错误。

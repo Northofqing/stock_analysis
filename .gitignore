@@ -5,6 +5,8 @@
 /target
 /.env
 /.vscode
+/.superpowers
+/.planning
 /data
 /reports
 /test_data

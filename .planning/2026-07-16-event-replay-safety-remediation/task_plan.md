@@ -4,7 +4,7 @@
 Fix the reviewed v17.3 replay defects, then continue through the repository's remaining documented/code/test debt until historical claims are reconciled and all achievable gates pass with explicit evidence.
 
 ## Current Phase
-Phase 10 (final independent re-review and draft PR; Gate D remains blocked)
+Phase 11 (commit all remaining workspace changes and evaluate the final merge gate)
 
 ## Phases
 
@@ -79,6 +79,14 @@ Phase 10 (final independent re-review and draft PR; Gate D remains blocked)
 - [x] Commit only scoped files/evidence and publish draft PR #2
 - **Status:** delivery complete; Gate B/C and independent reviews pass, Gate D coverage and real-account evidence remain blocked
 
+### Phase 11: Commit all remaining changes and merge evaluation
+- [x] Audit every remaining worktree change and its impact on live-data/fund-safety paths
+- [x] Restore Gate B/C validation after including the remaining changes
+- [ ] Commit and push all authorized worktree changes to PR #2
+- [ ] Obtain an independent pre-merge code review against fixed SHAs
+- [x] Re-run Gate D evidence checks; keep merge blocked unless every mandatory item passes
+- **Status:** in progress / merge blocked by Gate D coverage, real-account evidence, and auditor sign-off
+
 ## Decisions
 
 | Decision | Rationale |
@@ -86,10 +94,11 @@ Phase 10 (final independent re-review and draft PR; Gate D remains blocked)
 | Use `ReplaySummary` rather than `Result<usize>` | Separates attempted, published, skipped, and failed outcomes without aborting valid rows. |
 | Preserve existing event modules | The bugs are contract violations, not evidence that another event architecture is needed. |
 | Skip user confirmation gates | The user explicitly authorized completing all fixes without confirmation. |
+| Include the four formerly out-of-scope worktree changes | The user explicitly directed that all code be committed and merged on 2026-07-18; each change still requires safety review and gate validation. |
 
 ## Constraints
 
-- Do not modify existing dirty `.gitignore` or `.superpowers/sdd/progress.md`.
+- The existing `.gitignore`, `.superpowers/sdd/progress.md`, `src/app/context.rs`, and `src/broker/ib.rs` changes are now authorized for review and commit; do not alter their intent without evidence.
 - Do not run a real force replay or real push sink.
 - Project remains In Progress if global gates fail for unrelated pre-existing problems.
 
@@ -106,3 +115,9 @@ Phase 10 (final independent re-review and draft PR; Gate D remains blocked)
 | Repository rustfmt rewrote unrelated whitespace in the large monitor file | 1 | Reverted the formatting-only rewrite, reapplied only scoped semantic edits, and reran targeted plus integrated tests. |
 | Full regression returned `Unknown` for Cold/Fade because corrupt unrelated sector history was read first | 1 | Register BR-117 and evaluate complete single-day evidence before loading history required only by Start/Ferment/cumulative Climax. |
 | Full `cargo test` exposed a race between the two global news-sink sender tests | 1 | Serialize install/receiver lifetime with a test-only mutex; 10 consecutive parallel focused runs and the full suite pass. |
+| `.planning/.active_plan` is absent | 1 | Continue explicitly with `.planning/2026-07-16-event-replay-safety-remediation/`, the plan referenced by the current task handoff. |
+| Initial multi-file plan update used stale tail context | 1 | Re-read exact file tails and apply smaller targeted patches. |
+| Module inventory command assumed `src/broker/mod.rs` exists | 1 | Treat `src/broker.rs` as the likely crate module and inspect exact `rg --files` output before deciding deletion impact. |
+| Removing the broad planning/workspace ignores exposed many old generated review artifacts | 1 | Restore the user's ignore rules; existing tracked evidence files still remain tracked, while unrelated generated workspaces stay out of the PR. |
+| Isolated release smoke emitted repeated `database is locked` errors during first-time database initialization | 1 | Enter systematic root-cause investigation before treating the smoke as clean evidence or changing code. |
+| First WAL-bootstrap fix reduced fresh-DB lock errors from nine to one but did not make the RED test green | 1 | Do not stack another guess; return to root-cause evidence gathering and label each remaining customizer failure stage. |
