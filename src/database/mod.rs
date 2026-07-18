@@ -1,4 +1,4 @@
-//! Registered business rules: BR-050, BR-066.
+//! Registered business rules: BR-001, BR-016, BR-017, BR-050, BR-066, BR-129.
 // -*- coding: utf-8 -*-
 //! ===================================
 //! A股自选股智能分析系统 - 数据库管理
@@ -70,6 +70,36 @@ struct JournalModeRow {
 }
 
 const SQLITE_POOL_SIZE: u32 = 10;
+
+fn validate_required_text(field: &str, value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        Err(format!("{field} 不能为空"))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_date_text(field: &str, value: &str) -> Result<(), String> {
+    validate_required_text(field, value)?;
+    NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .map(|_| ())
+        .map_err(|error| format!("{field} 不是合法 YYYY-MM-DD 日期: {value}: {error}"))
+}
+
+fn validate_evidence_code(code: &str) -> Result<(), String> {
+    validate_required_text("stock_code", code)?;
+    if !code
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    {
+        return Err(format!("stock_code 含非法字符: {code:?}"));
+    }
+    crate::risk::env_guard::validate_symbol_for_current_env(code)
+}
+
+fn invalid_input(error: String) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
+}
 
 fn configure_sqlite_connection(
     conn: &mut SqliteConnection,
@@ -1073,7 +1103,33 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         &self,
         item: &crate::data_provider::news_item::NewsItem,
     ) -> Result<(), String> {
-        use diesel::sql_types::{BigInt, Text};
+        for (field, value) in [
+            ("source", item.source.as_str()),
+            ("external_id", item.external_id.as_str()),
+            ("category", item.category.as_str()),
+            ("title", item.title.as_str()),
+            ("url", item.url.as_str()),
+            ("source_name", item.source_name.as_str()),
+            ("content_hash", item.content_hash.as_str()),
+        ] {
+            validate_required_text(field, value)?;
+        }
+        if let Some(code) = item.code.as_deref() {
+            validate_evidence_code(code)?;
+        }
+        if item.fetched_at < item.published_at {
+            return Err("fetched_at 不能早于 published_at".to_string());
+        }
+        let expected_hash =
+            crate::data_provider::news_item::content_hash(&item.title, &item.summary);
+        if item.content_hash != expected_hash {
+            return Err(format!(
+                "content_hash 与标题/摘要不一致: expected={expected_hash}, actual={}",
+                item.content_hash
+            ));
+        }
+
+        use diesel::sql_types::{BigInt, Nullable, Text};
         let mut conn = self.get_conn().map_err(|e| e.to_string())?;
         diesel::sql_query(
             "INSERT OR IGNORE INTO news_items (source, external_id, category, code, title, summary, url, source_name, published_at, fetched_at, content_hash) \
@@ -1082,7 +1138,7 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         .bind::<Text, _>(&item.source)
         .bind::<Text, _>(&item.external_id)
         .bind::<Text, _>(&item.category)
-        .bind::<Text, _>(item.code.as_deref().unwrap_or(""))
+        .bind::<Nullable<Text>, _>(item.code.as_deref())
         .bind::<Text, _>(&item.title)
         .bind::<Text, _>(&item.summary)
         .bind::<Text, _>(&item.url)
@@ -1115,22 +1171,41 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         reason: Option<&str>,
         reason_secondary: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        validate_date_text("pred_date", pred_date).map_err(invalid_input)?;
+        validate_date_text("target_date", target_date).map_err(invalid_input)?;
+        validate_required_text("pred_direction", direction).map_err(invalid_input)?;
+        if !score.is_finite() || !(0.0..=100.0).contains(&score) {
+            return Err(invalid_input(format!("pred_score 超出 0..=100: {score}")).into());
+        }
+        if theme_name.is_none_or(|theme| theme.trim().is_empty())
+            && stock_code.is_none_or(|code| code.trim().is_empty())
+        {
+            return Err(invalid_input("theme_name 与 stock_code 不能同时缺失".to_string()).into());
+        }
+        if let Some(code) = stock_code {
+            validate_evidence_code(code).map_err(invalid_input)?;
+        }
+        if let Some(reason) = reason {
+            validate_required_text("reason", reason).map_err(invalid_input)?;
+        }
+        if let Some(reason_secondary) = reason_secondary {
+            validate_required_text("reason_secondary", reason_secondary).map_err(invalid_input)?;
+        }
+
+        use diesel::sql_types::{Double, Nullable, Text};
         let mut conn = self.get_conn()?;
-        // codex P0#3: escape 单引号 (`'` → `''`) 防 SQL injection
-        // 项目惯例: raw SQL 嵌入字符串, 标准 SQL escape 用双单引号
-        let esc = |s: &str| s.replace('\'', "''");
-        let tn = esc(theme_name.unwrap_or(""));
-        let sc = esc(stock_code.unwrap_or(""));
-        let det = esc(detail.unwrap_or(""));
-        let rsn = esc(reason.unwrap_or(""));
-        let rsn2 = esc(reason_secondary.unwrap_or(""));
-        let pd = esc(pred_date);
-        let td = esc(target_date);
-        let dir = esc(direction);
-        diesel::sql_query(format!(
-            "INSERT INTO prediction_tracker (pred_date, target_date, theme_name, stock_code, pred_direction, pred_score, pred_detail, reason, reason_secondary) VALUES ('{}', '{}', '{}', '{}', '{}', {}, '{}', '{}', '{}')",
-            pd, td, tn, sc, dir, score, det, rsn, rsn2
-        ))
+        diesel::sql_query(
+            "INSERT INTO prediction_tracker (pred_date, target_date, theme_name, stock_code, pred_direction, pred_score, pred_detail, reason, reason_secondary) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )
+        .bind::<Text, _>(pred_date)
+        .bind::<Text, _>(target_date)
+        .bind::<Nullable<Text>, _>(theme_name)
+        .bind::<Nullable<Text>, _>(stock_code)
+        .bind::<Text, _>(direction)
+        .bind::<Double, _>(score)
+        .bind::<Nullable<Text>, _>(detail)
+        .bind::<Nullable<Text>, _>(reason)
+        .bind::<Nullable<Text>, _>(reason_secondary)
         .execute(&mut *conn)?;
         Ok(())
     }
@@ -1181,19 +1256,17 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         &self,
         reason: &str,
     ) -> Result<i64, Box<dyn std::error::Error>> {
+        validate_required_text("reason", reason).map_err(invalid_input)?;
         let mut conn = self.get_conn()?;
         #[derive(diesel::QueryableByName)]
         struct PredReasonCountRow {
             #[diesel(sql_type = diesel::sql_types::BigInt)]
             cnt: i64,
         }
-        // codex P0#3: escape 单引号防 SQL injection
-        let rsn = reason.replace('\'', "''");
-        let result = diesel::sql_query(format!(
-            "SELECT COUNT(*) AS cnt FROM prediction_tracker WHERE reason = '{}'",
-            rsn
-        ))
-        .get_result::<PredReasonCountRow>(&mut *conn)?;
+        let result =
+            diesel::sql_query("SELECT COUNT(*) AS cnt FROM prediction_tracker WHERE reason = ?1")
+                .bind::<diesel::sql_types::Text, _>(reason)
+                .get_result::<PredReasonCountRow>(&mut *conn)?;
         Ok(result.cnt)
     }
 
@@ -1205,19 +1278,38 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         actual_change: f64,
         hit: bool,
     ) -> Result<usize, Box<dyn std::error::Error>> {
+        validate_date_text("pred_date", pred_date).map_err(invalid_input)?;
+        if !actual_change.is_finite() || actual_change.abs() > 20.0 {
+            return Err(invalid_input(format!(
+                "actual_change 必须有限且绝对值不超过 20%: {actual_change}"
+            ))
+            .into());
+        }
+        if let Some(code) = stock_code {
+            validate_evidence_code(code).map_err(invalid_input)?;
+        }
+
+        use diesel::sql_types::{Double, Integer, Text};
         let mut conn = self.get_conn()?;
         let result_text = if hit { "命中" } else { "未命中" };
         let rows = if let Some(code) = stock_code {
-            diesel::sql_query(format!(
-                "UPDATE prediction_tracker SET actual_change = {}, hit = {}, actual_result = '{}' WHERE pred_date = '{}' AND stock_code = '{}'",
-                actual_change, hit as i32, result_text, pred_date, code
-            ))
+            diesel::sql_query(
+                "UPDATE prediction_tracker SET actual_change = ?1, hit = ?2, actual_result = ?3 WHERE pred_date = ?4 AND stock_code = ?5",
+            )
+            .bind::<Double, _>(actual_change)
+            .bind::<Integer, _>(hit as i32)
+            .bind::<Text, _>(result_text)
+            .bind::<Text, _>(pred_date)
+            .bind::<Text, _>(code)
             .execute(&mut *conn)?
         } else {
-            diesel::sql_query(format!(
-                "UPDATE prediction_tracker SET actual_change = {}, hit = {}, actual_result = '{}' WHERE pred_date = '{}' AND theme_name != ''",
-                actual_change, hit as i32, result_text, pred_date
-            ))
+            diesel::sql_query(
+                "UPDATE prediction_tracker SET actual_change = ?1, hit = ?2, actual_result = ?3 WHERE pred_date = ?4 AND theme_name IS NOT NULL AND trim(theme_name) != ''",
+            )
+            .bind::<Double, _>(actual_change)
+            .bind::<Integer, _>(hit as i32)
+            .bind::<Text, _>(result_text)
+            .bind::<Text, _>(pred_date)
             .execute(&mut *conn)?
         };
         Ok(rows)
@@ -1232,11 +1324,14 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         stock_code: &str,
         pred_date: &str,
     ) -> Result<PredictionRow, Box<dyn std::error::Error>> {
+        validate_evidence_code(stock_code).map_err(invalid_input)?;
+        validate_date_text("pred_date", pred_date).map_err(invalid_input)?;
         let mut conn = self.get_conn()?;
-        let row = diesel::sql_query(format!(
-            "SELECT id, pred_date, target_date, stock_code, pred_direction, pred_score, actual_change, hit, actual_result FROM prediction_tracker WHERE stock_code = '{}' AND pred_date = '{}' ORDER BY id DESC LIMIT 1",
-            stock_code, pred_date
-        ))
+        let row = diesel::sql_query(
+            "SELECT id, pred_date, target_date, stock_code, pred_direction, pred_score, actual_change, hit, actual_result FROM prediction_tracker WHERE stock_code = ?1 AND pred_date = ?2 ORDER BY id DESC LIMIT 1",
+        )
+        .bind::<diesel::sql_types::Text, _>(stock_code)
+        .bind::<diesel::sql_types::Text, _>(pred_date)
         .get_result::<PredictionRow>(&mut *conn)?;
         Ok(row)
     }
@@ -1249,11 +1344,12 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         &self,
         pred_date: &str,
     ) -> Result<Vec<PredictionRow>, Box<dyn std::error::Error>> {
+        validate_date_text("pred_date", pred_date).map_err(invalid_input)?;
         let mut conn = self.get_conn()?;
-        let rows = diesel::sql_query(format!(
-            "SELECT id, pred_date, target_date, stock_code, pred_direction, pred_score, actual_change, hit, actual_result FROM prediction_tracker WHERE pred_date = '{}' AND hit IS NULL",
-            pred_date
-        ))
+        let rows = diesel::sql_query(
+            "SELECT id, pred_date, target_date, stock_code, pred_direction, pred_score, actual_change, hit, actual_result FROM prediction_tracker WHERE pred_date = ?1 AND hit IS NULL",
+        )
+        .bind::<diesel::sql_types::Text, _>(pred_date)
         .load::<PredictionRow>(&mut *conn)?;
         Ok(rows)
     }
@@ -1299,6 +1395,12 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         if signatures.is_empty() {
             return Ok(());
         }
+        if signatures
+            .iter()
+            .any(|signature| signature.trim().is_empty())
+        {
+            return Err(invalid_input("topic signature 批次包含空值".to_string()).into());
+        }
 
         let mut conn = self.get_conn()?;
         let now_ts = chrono::Local::now().timestamp();
@@ -1306,9 +1408,6 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         // 事务内批量写入，避免逐行 fsync
         conn.transaction::<_, Box<dyn std::error::Error>, _>(|conn| {
             for sig in signatures {
-                if sig.is_empty() {
-                    continue;
-                }
                 diesel::sql_query(
                     "INSERT INTO topic_novelty_history(signature, created_at) VALUES (?1, ?2) ON CONFLICT(signature) DO UPDATE SET created_at=excluded.created_at",
                 )
@@ -1335,6 +1434,10 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         stock_code: &str,
         days: i64,
     ) -> Result<i64, Box<dyn std::error::Error>> {
+        validate_evidence_code(stock_code).map_err(invalid_input)?;
+        if days <= 0 {
+            return Err(invalid_input("count_recent_pushes days 必须 > 0".to_string()).into());
+        }
         let mut conn = self.get_conn()?;
         let cutoff = (chrono::Local::now() - chrono::Duration::days(days))
             .format("%Y-%m-%d")
@@ -1344,11 +1447,12 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
             #[diesel(sql_type = diesel::sql_types::BigInt)]
             cnt: i64,
         }
-        let raw = format!(
-            "SELECT COUNT(*) as cnt FROM prediction_tracker WHERE stock_code = '{}' AND pred_date >= '{}'",
-            stock_code, cutoff
-        );
-        let row = diesel::sql_query(raw).get_result::<CountRow>(&mut *conn)?;
+        let row = diesel::sql_query(
+            "SELECT COUNT(*) as cnt FROM prediction_tracker WHERE stock_code = ?1 AND pred_date >= ?2",
+        )
+        .bind::<diesel::sql_types::Text, _>(stock_code)
+        .bind::<diesel::sql_types::Text, _>(&cutoff)
+        .get_result::<CountRow>(&mut *conn)?;
         Ok(row.cnt)
     }
 
@@ -1360,6 +1464,11 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         stock_codes: &[String],
         days: i64,
     ) -> Result<std::collections::HashSet<String>, Box<dyn std::error::Error>> {
+        if days <= 0 {
+            return Err(
+                invalid_input("count_recent_pushes_batch days 必须 > 0".to_string()).into(),
+            );
+        }
         if stock_codes.is_empty() {
             return Ok(std::collections::HashSet::new());
         }
@@ -1715,6 +1824,291 @@ mod tests {
         assert_eq!(busy_timeout, 5000);
         assert_eq!(synchronous, 1);
         assert_eq!(wal_autocheckpoint, 1000);
+    }
+
+    fn unique_test_label(prefix: &str) -> String {
+        format!(
+            "{prefix}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    #[test]
+    fn br129_news_items_preserve_nullable_identity_and_verified_hash() {
+        use crate::data_provider::news_item::{content_hash, NewsItem};
+        use chrono::{Duration, Utc};
+
+        #[derive(QueryableByName)]
+        struct StoredNews {
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+            code: Option<String>,
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            count: i64,
+        }
+
+        init_db_for_test();
+        let db = DatabaseManager::get();
+        let suffix = unique_test_label("NEWS");
+        let source = format!("TEST_SOURCE_{suffix}");
+        let external_id = format!("TEST_EXTERNAL_{suffix}");
+        let code = format!("TEST_CODE_{suffix}");
+        let title = "测试新闻标题".to_string();
+        let summary = "测试新闻摘要".to_string();
+        let fetched_at = Utc::now();
+        let item = NewsItem {
+            source: source.clone(),
+            external_id: external_id.clone(),
+            category: "测试分类".to_string(),
+            code: Some(code.clone()),
+            title: title.clone(),
+            summary: summary.clone(),
+            url: format!("https://example.invalid/{suffix}"),
+            source_name: "测试来源".to_string(),
+            published_at: fetched_at - Duration::seconds(1),
+            fetched_at,
+            content_hash: content_hash(&title, &summary),
+        };
+
+        db.insert_news_item(&item).unwrap();
+        db.insert_news_item(&item).unwrap();
+        let mut conn = db.get_conn().unwrap();
+        let stored = diesel::sql_query(
+            "SELECT code, COUNT(*) AS count FROM news_items WHERE source = ?1 AND external_id = ?2",
+        )
+        .bind::<diesel::sql_types::Text, _>(&source)
+        .bind::<diesel::sql_types::Text, _>(&external_id)
+        .get_result::<StoredNews>(&mut conn)
+        .unwrap();
+        assert_eq!(stored.code.as_deref(), Some(code.as_str()));
+        assert_eq!(
+            stored.count, 1,
+            "source/external_id duplicate is idempotent"
+        );
+
+        let mut without_code = item.clone();
+        without_code.external_id = format!("{external_id}_NULL");
+        without_code.code = None;
+        db.insert_news_item(&without_code).unwrap();
+        let stored_null = diesel::sql_query(
+            "SELECT code, COUNT(*) AS count FROM news_items WHERE source = ?1 AND external_id = ?2",
+        )
+        .bind::<diesel::sql_types::Text, _>(&source)
+        .bind::<diesel::sql_types::Text, _>(&without_code.external_id)
+        .get_result::<StoredNews>(&mut conn)
+        .unwrap();
+        assert_eq!(stored_null.code, None, "missing code must stay SQL NULL");
+        assert_eq!(stored_null.count, 1);
+
+        let mut bad_hash = item.clone();
+        bad_hash.external_id = format!("{external_id}_BAD_HASH");
+        bad_hash.content_hash = "0".repeat(64);
+        assert!(db.insert_news_item(&bad_hash).is_err());
+        let mut bad_time = item.clone();
+        bad_time.external_id = format!("{external_id}_BAD_TIME");
+        bad_time.fetched_at = bad_time.published_at - Duration::seconds(1);
+        assert!(db.insert_news_item(&bad_time).is_err());
+        let mut bad_identity = item.clone();
+        bad_identity.external_id.clear();
+        assert!(db.insert_news_item(&bad_identity).is_err());
+
+        diesel::sql_query("DELETE FROM news_items WHERE source = ?1")
+            .bind::<diesel::sql_types::Text, _>(&source)
+            .execute(&mut conn)
+            .unwrap();
+    }
+
+    #[test]
+    fn br129_prediction_round_trip_is_bound_validated_and_traceable() {
+        #[derive(QueryableByName)]
+        struct ThemeOutcome {
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+            actual_change: Option<f64>,
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
+            hit: Option<i32>,
+        }
+
+        init_db_for_test();
+        let db = DatabaseManager::get();
+        let suffix = unique_test_label("PREDICTION");
+        let code = format!("TEST_CODE_{suffix}");
+        let reason = format!("TEST_REASON_O'CLOCK_{suffix}");
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let target = (chrono::Local::now() + chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+
+        db.save_prediction(
+            &today,
+            &target,
+            Some("测试主题"),
+            Some(&code),
+            "看多",
+            75.0,
+            Some("完整预测证据"),
+            Some(&reason),
+            None,
+        )
+        .unwrap();
+        assert_eq!(db.count_predictions_by_reason(&reason).unwrap(), 1);
+        assert!(db.count_predictions().unwrap() >= 1);
+        assert!(db
+            .get_pending_predictions(&today)
+            .unwrap()
+            .iter()
+            .any(|row| row.stock_code.as_deref() == Some(code.as_str())));
+        assert_eq!(db.count_recent_pushes(&code, 1).unwrap(), 1);
+        assert!(db
+            .count_recent_pushes_batch(std::slice::from_ref(&code), 1)
+            .unwrap()
+            .contains(&code));
+
+        assert_eq!(
+            db.update_prediction_result(&today, Some(&code), 1.25, true)
+                .unwrap(),
+            1
+        );
+        let stored = db.get_prediction_by_code_date(&code, &today).unwrap();
+        assert_eq!(stored.actual_change, Some(1.25));
+        assert_eq!(stored.hit, Some(1));
+        assert_eq!(stored.actual_result.as_deref(), Some("命中"));
+        assert!((0.0..=1.0).contains(&db.get_prediction_hit_rate(1).unwrap()));
+        assert_eq!(
+            db.update_prediction_result(&today, Some("TEST_CODE_MISSING"), 0.5, false)
+                .unwrap(),
+            0
+        );
+
+        let theme = format!("TEST_THEME_{suffix}");
+        db.save_prediction(
+            "1999-01-04",
+            "1999-01-05",
+            Some(&theme),
+            None,
+            "看空",
+            60.0,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            db.update_prediction_result("1999-01-04", None, -0.75, false)
+                .unwrap(),
+            1
+        );
+        let mut conn = db.get_conn().unwrap();
+        let theme_outcome = diesel::sql_query(
+            "SELECT actual_change, hit FROM prediction_tracker WHERE pred_date = '1999-01-04' AND theme_name = ?1",
+        )
+        .bind::<diesel::sql_types::Text, _>(&theme)
+        .get_result::<ThemeOutcome>(&mut conn)
+        .unwrap();
+        assert_eq!(theme_outcome.actual_change, Some(-0.75));
+        assert_eq!(theme_outcome.hit, Some(0));
+
+        assert!(db
+            .save_prediction(
+                "bad-date",
+                &target,
+                Some("测试"),
+                Some(&code),
+                "看多",
+                75.0,
+                None,
+                None,
+                None,
+            )
+            .is_err());
+        assert!(db
+            .save_prediction(&today, &target, None, None, "看多", 75.0, None, None, None,)
+            .is_err());
+        assert!(db
+            .save_prediction(
+                &today,
+                &target,
+                Some("测试"),
+                Some(&code),
+                "看多",
+                f64::NAN,
+                None,
+                None,
+                None,
+            )
+            .is_err());
+        assert!(db
+            .update_prediction_result(&today, Some(&code), 20.01, true)
+            .is_err());
+        assert!(db.get_pending_predictions("x' OR 1=1 --").is_err());
+        assert!(db.count_recent_pushes(&code, 0).is_err());
+        assert!(db
+            .count_recent_pushes_batch(std::slice::from_ref(&code), 0)
+            .is_err());
+
+        diesel::sql_query(
+            "DELETE FROM prediction_tracker WHERE stock_code = ?1 OR theme_name = ?2",
+        )
+        .bind::<diesel::sql_types::Text, _>(&code)
+        .bind::<diesel::sql_types::Text, _>(&theme)
+        .execute(&mut conn)
+        .unwrap();
+    }
+
+    #[test]
+    fn br129_topic_history_rejects_partial_bad_batches_and_is_idempotent() {
+        #[derive(QueryableByName)]
+        struct Count {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            count: i64,
+        }
+
+        init_db_for_test();
+        let db = DatabaseManager::get();
+        let suffix = unique_test_label("TOPIC");
+        let first = format!("TEST_TOPIC_FIRST_{suffix}");
+        let second = format!("TEST_TOPIC_SECOND_{suffix}");
+        db.upsert_topic_history_signatures(&[first.clone(), second.clone()], 50)
+            .unwrap();
+        db.upsert_topic_history_signatures(std::slice::from_ref(&first), 50)
+            .unwrap();
+        let recent = db.get_recent_topic_history_signatures(1, 20).unwrap();
+        assert!(recent.contains(&first));
+        assert!(recent.contains(&second));
+
+        let rejected = format!("TEST_TOPIC_REJECTED_{suffix}");
+        assert!(db
+            .upsert_topic_history_signatures(&[rejected.clone(), " ".to_string()], 50)
+            .is_err());
+        let mut conn = db.get_conn().unwrap();
+        let rejected_count = diesel::sql_query(
+            "SELECT COUNT(*) AS count FROM topic_novelty_history WHERE signature = ?1",
+        )
+        .bind::<diesel::sql_types::Text, _>(&rejected)
+        .get_result::<Count>(&mut conn)
+        .unwrap();
+        assert_eq!(
+            rejected_count.count, 0,
+            "bad batch must not partially persist"
+        );
+
+        let persisted = diesel::sql_query(
+            "SELECT COUNT(*) AS count FROM topic_novelty_history WHERE signature IN (?1, ?2)",
+        )
+        .bind::<diesel::sql_types::Text, _>(&first)
+        .bind::<diesel::sql_types::Text, _>(&second)
+        .get_result::<Count>(&mut conn)
+        .unwrap();
+        assert_eq!(persisted.count, 2, "duplicate signature remains idempotent");
+
+        diesel::sql_query("DELETE FROM topic_novelty_history WHERE signature IN (?1, ?2, ?3)")
+            .bind::<diesel::sql_types::Text, _>(&first)
+            .bind::<diesel::sql_types::Text, _>(&second)
+            .bind::<diesel::sql_types::Text, _>(&rejected)
+            .execute(&mut conn)
+            .unwrap();
     }
 
     #[test]
