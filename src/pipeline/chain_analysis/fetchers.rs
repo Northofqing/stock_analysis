@@ -82,7 +82,12 @@ pub(super) async fn fetch_boards_via_tool(
         .call(json!({ "code": code }))
         .await
         .map_err(|error| format!("产业链 {code} 板块拉取失败: {error}"))?;
-    let value: serde_json::Value = serde_json::from_str(&raw)
+    parse_tool_boards(&raw, code)
+}
+
+/// BR-114: validate a complete sector-tool response before it enters the cache.
+fn parse_tool_boards(raw: &str, code: &str) -> Result<Vec<String>, String> {
+    let value: serde_json::Value = serde_json::from_str(raw)
         .map_err(|error| format!("产业链 {code} 板块 JSON 非法: {error}"))?;
     let rows = value
         .get("all_boards")
@@ -102,6 +107,39 @@ pub(super) async fn fetch_boards_via_tool(
         }
     }
     Ok(boards)
+}
+
+/// BR-114: merge one complete board page and reject duplicate identities.
+fn merge_board_code_page(
+    map: &mut HashMap<String, String>,
+    codes: &mut HashSet<String>,
+    json: &serde_json::Value,
+    page: usize,
+) -> Result<usize, String> {
+    let diff = json
+        .get("data")
+        .and_then(|data| data.get("diff"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("产业链板块第 {page} 页缺少 data.diff"))?;
+    for (index, item) in diff.iter().enumerate() {
+        let code = item
+            .get("f12")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| value.starts_with("BK") && value.len() > 2)
+            .ok_or_else(|| format!("产业链板块第 {page} 页第 {index} 行 code 非法"))?;
+        let name = item
+            .get("f14")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| format!("产业链板块第 {page} 页第 {index} 行 name 非法"))?;
+        if !codes.insert(code.to_string()) {
+            return Err(format!("产业链板块代码重复: {code}"));
+        }
+        if map.insert(name.to_string(), code.to_string()).is_some() {
+            return Err(format!("产业链板块名称重复: {name}"));
+        }
+    }
+    Ok(diff.len())
 }
 
 /// 拉取东财全部概念板块列表，返回 板块名 -> 板块代码(BKxxxx)。
@@ -128,34 +166,12 @@ pub(super) async fn fetch_board_code_map() -> Result<HashMap<String, String>, St
             ("fields", "f12,f14"),
         ];
         let json = push2_get(&client, &params).await?;
-        let diff = json
-            .get("data")
-            .and_then(|d| d.get("diff"))
-            .and_then(|d| d.as_array())
-            .ok_or_else(|| format!("产业链板块第 {page} 页缺少 data.diff"))?;
-        if diff.is_empty() {
+        let page_len = merge_board_code_page(&mut map, &mut codes, &json, page)?;
+        if page_len == 0 {
             terminal_seen = true;
             break;
         }
-        for (index, item) in diff.iter().enumerate() {
-            let code = item
-                .get("f12")
-                .and_then(|value| value.as_str())
-                .filter(|value| value.starts_with("BK") && value.len() > 2)
-                .ok_or_else(|| format!("产业链板块第 {page} 页第 {index} 行 code 非法"))?;
-            let name = item
-                .get("f14")
-                .and_then(|value| value.as_str())
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| format!("产业链板块第 {page} 页第 {index} 行 name 非法"))?;
-            if !codes.insert(code.to_string()) {
-                return Err(format!("产业链板块代码重复: {code}"));
-            }
-            if map.insert(name.to_string(), code.to_string()).is_some() {
-                return Err(format!("产业链板块名称重复: {name}"));
-            }
-        }
-        if diff.len() < 500 {
+        if page_len < 500 {
             terminal_seen = true;
             break;
         }
@@ -229,6 +245,18 @@ pub(super) async fn fetch_laggard_candidates(
         ("fields", "f2,f3,f12,f14"),
     ];
     let json = push2_get(&client, &params).await?;
+    parse_laggard_candidates(&json, board_code, limit_codes)
+}
+
+/// BR-114: validate the complete constituent batch before filtering and ranking.
+fn parse_laggard_candidates(
+    json: &serde_json::Value,
+    board_code: &str,
+    limit_codes: &HashSet<String>,
+) -> Result<Vec<TopStock>, String> {
+    if !board_code.starts_with("BK") {
+        return Err(format!("产业链板块代码非法: {board_code}"));
+    }
     let diff = json
         .get("data")
         .and_then(|d| d.get("diff"))
@@ -484,4 +512,142 @@ pub(super) async fn fetch_cluster_news(
         }
     }
     items.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{merge_board_code_page, parse_laggard_candidates, parse_tool_boards};
+    use serde_json::json;
+    use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn tool_board_batch_deduplicates_only_complete_nonempty_strings() {
+        let boards = parse_tool_boards(
+            r#"{"all_boards":["TEST_CODE_机器人","TEST_CODE_算力","TEST_CODE_机器人"]}"#,
+            "TEST_CODE_000001",
+        )
+        .expect("complete tool response");
+        assert_eq!(boards, ["TEST_CODE_机器人", "TEST_CODE_算力"]);
+
+        for raw in [
+            "not-json",
+            r#"{}"#,
+            r#"{"all_boards":[]}"#,
+            r#"{"all_boards":[""]}"#,
+            r#"{"all_boards":[1]}"#,
+        ] {
+            assert!(parse_tool_boards(raw, "TEST_CODE_000001").is_err(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn board_pages_merge_unique_identity_and_reject_protocol_conflicts() {
+        let mut map = HashMap::new();
+        let mut codes = HashSet::new();
+        let first = json!({"data":{"diff":[
+            {"f12":"BK0001","f14":"TEST_CODE_机器人"},
+            {"f12":"BK0002","f14":"TEST_CODE_算力"}
+        ]}});
+        assert_eq!(
+            merge_board_code_page(&mut map, &mut codes, &first, 1),
+            Ok(2)
+        );
+        assert_eq!(
+            map.get("TEST_CODE_机器人").map(String::as_str),
+            Some("BK0001")
+        );
+
+        for bad in [
+            json!({}),
+            json!({"data":{"diff":[{"f12":"0001","f14":"坏代码"}]}}),
+            json!({"data":{"diff":[{"f12":"BK0003","f14":""}]}}),
+            json!({"data":{"diff":[{"f12":"BK0001","f14":"重复代码"}]}}),
+            json!({"data":{"diff":[{"f12":"BK0004","f14":"TEST_CODE_机器人"}]}}),
+        ] {
+            let mut local_map = map.clone();
+            let mut local_codes = codes.clone();
+            assert!(merge_board_code_page(&mut local_map, &mut local_codes, &bad, 2).is_err());
+        }
+
+        assert_eq!(
+            merge_board_code_page(
+                &mut HashMap::new(),
+                &mut HashSet::new(),
+                &json!({"data":{"diff":[]}}),
+                3,
+            ),
+            Ok(0)
+        );
+    }
+
+    fn constituent(code: &str, name: &str, pct: f64, price: f64) -> serde_json::Value {
+        json!({"f12":code,"f14":name,"f3":pct,"f2":price})
+    }
+
+    #[test]
+    fn laggard_batch_filters_then_stably_ranks_top_eight() {
+        // Native six-digit shapes are protocol fixtures only; no order is placed.
+        let mut rows = vec![
+            constituent("100001", "候选A", 5.0, 10.0),
+            constituent("100002", "候选B", 5.0, 11.0),
+            constituent("100003", "候选C", 4.0, 12.0),
+            constituent("100004", "候选D", 3.0, 13.0),
+            constituent("100005", "候选E", 2.0, 14.0),
+            constituent("100006", "候选F", 1.0, 15.0),
+            constituent("100007", "候选G", 0.0, 16.0),
+            constituent("100008", "候选H", -1.0, 17.0),
+            constituent("100009", "候选I", -2.0, 18.0),
+            constituent("100010", "已涨停", 6.0, 19.0),
+            constituent("100011", "ST过滤", 6.0, 20.0),
+            constituent("800001", "北交过滤", 6.0, 21.0),
+            constituent("400001", "北交过滤2", 6.0, 22.0),
+            constituent("900001", "北交过滤3", 6.0, 23.0),
+            constituent("100012", "涨幅过高", 7.1, 24.0),
+            constituent("100013", "跌幅过低", -3.1, 25.0),
+        ];
+        rows.reverse();
+        let limit_codes = HashSet::from(["100010".to_string()]);
+        let result =
+            parse_laggard_candidates(&json!({"data":{"diff":rows}}), "BK0001", &limit_codes)
+                .expect("complete constituent batch");
+        assert_eq!(result.len(), 8);
+        assert_eq!(result[0].code, "100001");
+        assert_eq!(result[1].code, "100002");
+        assert_eq!(result[7].code, "100008");
+        assert!(result.iter().all(|stock| stock.price > 0.0));
+    }
+
+    #[test]
+    fn laggard_batch_rejects_any_bad_or_duplicate_row() {
+        let valid = constituent("100001", "候选", 1.0, 10.0);
+        for (board, rows) in [
+            ("INVALID", vec![valid.clone()]),
+            ("BK0001", Vec::new()),
+            (
+                "BK0001",
+                vec![json!({"f12":"BAD","f14":"候选","f3":1.0,"f2":10.0})],
+            ),
+            (
+                "BK0001",
+                vec![json!({"f12":"100001","f14":"","f3":1.0,"f2":10.0})],
+            ),
+            (
+                "BK0001",
+                vec![json!({"f12":"100001","f14":"候选","f3":21.0,"f2":10.0})],
+            ),
+            (
+                "BK0001",
+                vec![json!({"f12":"100001","f14":"候选","f3":1.0,"f2":0.0})],
+            ),
+            ("BK0001", vec![valid.clone(), valid.clone()]),
+        ] {
+            assert!(parse_laggard_candidates(
+                &json!({"data":{"diff":rows}}),
+                board,
+                &HashSet::new(),
+            )
+            .is_err());
+        }
+        assert!(parse_laggard_candidates(&json!({}), "BK0001", &HashSet::new()).is_err());
+    }
 }

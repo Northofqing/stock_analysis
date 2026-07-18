@@ -1143,12 +1143,20 @@ impl AnalysisPipeline {
         if position_tracking_enabled {
             if let Some((regime, atr)) = position_risk_evidence(&data) {
                 let risk_ctx = position_tracker::RiskContext::from_env(regime, atr);
-                position_tracker::track_position(&code, &data, &mut result, &risk_ctx);
+                if let Err(error) =
+                    position_tracker::track_position(&code, &data, &mut result, &risk_ctx)
+                {
+                    error!("[{}] BR-124 持仓跟踪失败: {}", code, error);
+                    return None;
+                }
             }
         }
 
         // 5. 保存分析结果到数据库
-        position_tracker::save_analysis_result(&code, &data, &result);
+        if let Err(error) = position_tracker::save_analysis_result(&code, &data, &result) {
+            error!("[{}] BR-124 分析结果保存失败: {}", code, error);
+            return None;
+        }
 
         // 6. 单股推送（如果启用）
         if self.config.single_notify && self.config.send_notification {
@@ -1882,6 +1890,7 @@ mod tests {
 
     #[tokio::test]
     async fn process_stock_uses_isolated_fetched_batch_and_covers_failure_gates() {
+        crate::database::DatabaseManager::init(None).expect("BR-124 test database init");
         let context = resolved_context(
             Ok(super::extra_context::ExtraContext {
                 section: None,

@@ -388,22 +388,6 @@ mod tests {
     use super::*;
     use diesel::prelude::*;
 
-    struct FreshTestQuoteProvider;
-
-    impl crate::broker::QuoteProvider for FreshTestQuoteProvider {
-        fn get_execution_quote(
-            &self,
-            _code: &str,
-        ) -> Result<crate::broker::ExecutionQuote, String> {
-            Ok(crate::broker::ExecutionQuote {
-                price: 10.0,
-                limit_down_price: 9.0,
-                limit_up_price: 11.0,
-                observed_at: chrono::Utc::now(),
-            })
-        }
-    }
-
     fn init_test_db() {
         DatabaseManager::init(None).expect("test database init");
     }
@@ -423,17 +407,23 @@ mod tests {
         unique_id(label).replace("TEST_ORDER", "TEST_CODE")
     }
 
-    fn install_test_quote_provider() {
-        static INSTALL: std::sync::Once = std::sync::Once::new();
-        INSTALL.call_once(|| {
-            crate::broker::register_quote_provider(Box::new(FreshTestQuoteProvider))
-                .expect("register one process-wide test quote provider");
-        });
+    struct TestLedgerGuard {
+        date: String,
     }
 
-    fn prepare_fresh_account_state() {
+    impl Drop for TestLedgerGuard {
+        fn drop(&mut self) {
+            if let Ok(mut conn) = DatabaseManager::get().get_conn() {
+                let _ = diesel::sql_query("DELETE FROM ledger WHERE date = ?")
+                    .bind::<diesel::sql_types::Text, _>(&self.date)
+                    .execute(&mut conn);
+            }
+        }
+    }
+
+    fn prepare_fresh_account_state() -> TestLedgerGuard {
         init_test_db();
-        install_test_quote_provider();
+        crate::broker::ensure_test_quote_provider();
         let today = chrono::Local::now().date_naive().to_string();
         let mut conn = DatabaseManager::get()
             .get_conn()
@@ -456,6 +446,7 @@ mod tests {
         )
         .execute(&mut conn)
         .expect("refresh isolated test-position evidence");
+        TestLedgerGuard { date: today }
     }
 
     fn audit_outcome(business_order_id: &str) -> String {
@@ -541,7 +532,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn gateway_fills_open_and_close_with_atomic_audit() {
-        prepare_fresh_account_state();
+        let _ledger = prepare_fresh_account_state();
         let gateway = SimulatedExecutionGateway::new();
         let code = unique_code("ROUND_TRIP");
         let open_id = unique_id("OPEN_FILL");
@@ -566,7 +557,7 @@ mod tests {
             .update_position_return(position.id, 10.5, 5.0)
             .expect("update return evidence");
 
-        prepare_fresh_account_state();
+        let _close_ledger = prepare_fresh_account_state();
         let close_id = unique_id("CLOSE_FILL");
         let closed = gateway
             .close_position(&ClosePositionCmd {
@@ -593,7 +584,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn gateway_rejections_are_explicit_and_audited() {
-        prepare_fresh_account_state();
+        let _ledger = prepare_fresh_account_state();
         let gateway = SimulatedExecutionGateway::new();
 
         let missing_chain_id = unique_id("MISSING_CHAIN");

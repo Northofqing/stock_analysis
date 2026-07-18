@@ -110,6 +110,32 @@ impl QuoteProvider for PublicQuoteProvider {
 
 static QUOTE_PROVIDER: OnceLock<Box<dyn QuoteProvider>> = OnceLock::new();
 
+#[cfg(test)]
+struct FreshTestQuoteProvider;
+
+#[cfg(test)]
+impl QuoteProvider for FreshTestQuoteProvider {
+    fn get_execution_quote(&self, _code: &str) -> Result<ExecutionQuote, String> {
+        Ok(ExecutionQuote {
+            price: 10.0,
+            limit_down_price: 9.0,
+            limit_up_price: 11.0,
+            observed_at: chrono::Utc::now(),
+        })
+    }
+}
+
+/// One shared test-only provider keeps execution tests deterministic without
+/// adding a mock/fallback registration path to production builds.
+#[cfg(test)]
+pub(crate) fn ensure_test_quote_provider() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        register_quote_provider(Box::new(FreshTestQuoteProvider))
+            .expect("register one process-wide test quote provider");
+    });
+}
+
 pub fn register_quote_provider(provider: Box<dyn QuoteProvider>) -> Result<(), String> {
     QUOTE_PROVIDER.set(provider).map_err(|_| {
         "QuoteProvider already registered; runtime replacement is forbidden".to_string()

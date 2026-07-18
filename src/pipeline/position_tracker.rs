@@ -173,35 +173,34 @@ pub(super) fn track_position(
     data: &[KlineData],
     result: &mut AnalysisResult,
     risk_ctx: &RiskContext,
-) {
+) -> Result<(), String> {
     let gateway = SimulatedExecutionGateway::new();
 
     // AGENTS 2.5: 双向硬隔离（生产拒绝 TEST_CODE，测试拒绝真实标的）
-    if let Err(reason) = validate_trade_symbol_env(code) {
-        warn!(
-            "[ENV_GUARD] rule_id=AGENTS-2.5 code={} env={:?} action=reject reason={} timestamp={}",
-            code,
-            crate::risk::env_guard::current_env(),
-            reason,
-            chrono::Utc::now().timestamp()
-        );
-        return;
-    }
+    validate_trade_symbol_env(code).map_err(|reason| {
+        format!(
+            "AGENTS-2.5 position tracking rejected code={code} env={:?}: {reason}",
+            crate::risk::env_guard::current_env()
+        )
+    })?;
 
-    let current_price = match result
+    let current_price = result
         .current_price
         .or_else(|| data.first().map(|bar| bar.close))
         .filter(|price| price.is_finite() && *price > 0.0)
-    {
-        Some(price) => price,
-        None => {
-            warn!("[{}] BR-084 当前价格缺失或非法，拒绝持仓操作", code);
-            return;
-        }
-    };
+        .ok_or_else(|| format!("BR-124 {code} current price is missing or invalid"))?;
 
     match gateway.get_open_position(code) {
         Ok(Some(pos)) => {
+            if !pos.buy_price.is_finite() || pos.buy_price <= 0.0 {
+                return Err(format!(
+                    "BR-124 {code} persisted buy price is invalid: {}",
+                    pos.buy_price
+                ));
+            }
+            let buy_date = chrono::NaiveDate::parse_from_str(&pos.buy_date, "%Y-%m-%d")
+                .map_err(|error| format!("BR-124 {code} persisted buy date is invalid: {error}"))?;
+            let today = chrono::Local::now().date_naive();
             let return_rate = net_return_rate((current_price / pos.buy_price - 1.0) * 100.0);
             result.position_buy_price = Some(pos.buy_price);
             result.position_buy_date = Some(pos.buy_date.clone());
@@ -241,11 +240,7 @@ pub(super) fn track_position(
             let profit_trend_exit =
                 return_rate >= 20.0 && result.ma5.is_some_and(|ma5| current_price < ma5);
             // 铁律4 持仓 >14 天仍亏损
-            let hold_days = {
-                let buy = chrono::NaiveDate::parse_from_str(&pos.buy_date, "%Y-%m-%d");
-                let now = chrono::Local::now().date_naive();
-                buy.map(|b| (now - b).num_days()).unwrap_or(0)
-            };
+            let hold_days = (today - buy_date).num_days();
             let timeout_loss = hold_days > 14 && return_rate < 0.0;
             // 铁律5 布林上轨减仓：触上轨 + MACD 顶背离/红柱缩短/死叉
             let bm_top_sell = matches!(
@@ -255,11 +250,7 @@ pub(super) fn track_position(
                 && hold_days >= 2;
 
             // P0-2: T+1 锁仓检查
-            let t1_locked = {
-                let buy = chrono::NaiveDate::parse_from_str(&pos.buy_date, "%Y-%m-%d");
-                let now = chrono::Local::now().date_naive();
-                buy.is_ok() && buy.unwrap() == now
-            };
+            let t1_locked = buy_date == today;
 
             let should_sell = stop_loss
                 || !tiered_stops.is_empty()
@@ -284,7 +275,7 @@ pub(super) fn track_position(
                         code, reason_str
                     );
                     result.position_status = Some("open".to_string());
-                    return;
+                    return Ok(());
                 }
 
                 let reason = if stop_loss {
@@ -335,8 +326,8 @@ pub(super) fn track_position(
                         result.position_sell_date = Some(today);
                     }
                     Err(e) => {
-                        warn!("[{}] 平仓失败: {}", code, e);
                         result.position_status = Some("open".to_string());
+                        return Err(format!("BR-124 {code} close position failed: {e}"));
                     }
                 }
             } else {
@@ -345,9 +336,11 @@ pub(super) fn track_position(
                     "[{}] 持仓中，收益率: {:+.2}%（买入价 {:.2} → 现价 {:.2}）",
                     code, return_rate, pos.buy_price, current_price
                 );
-                if let Err(e) = gateway.update_position_return(pos.id, current_price, return_rate) {
-                    warn!("[{}] 更新持仓收益率失败: {}", code, e);
-                }
+                gateway
+                    .update_position_return(pos.id, current_price, return_rate)
+                    .map_err(|error| {
+                        format!("BR-124 {code} update position return failed: {error}")
+                    })?;
             }
         }
         Ok(None) => {
@@ -368,7 +361,7 @@ pub(super) fn track_position(
                     "[{}] MarketRegime::{:?} 禁止新买入，跳过",
                     code, risk_ctx.regime
                 );
-                return;
+                return Ok(());
             }
 
             let bm_action = result
@@ -394,36 +387,21 @@ pub(super) fn track_position(
                         result.sentiment_score
                     );
                 }
-                return;
+                return Ok(());
             }
 
-            let (chain_name, chain_held, chain_frozen) = match query_chain_exposure(code) {
-                Ok(exposure) => exposure,
-                Err(error) => {
-                    warn!(
-                        "[{}] BR-085 产业链风险证据不可用，拒绝建仓: {}",
-                        code, error
-                    );
-                    return;
-                }
-            };
+            let (chain_name, chain_held, chain_frozen) = query_chain_exposure(code)
+                .map_err(|error| format!("BR-124 {code} chain exposure unavailable: {error}"))?;
             let (available_cash, _, _) =
-                match crate::trading::paper_trade::portfolio_state(code, current_price) {
-                    Ok(state) => state,
-                    Err(error) => {
-                        warn!("[{}] BR-085 真实账户快照不可用，拒绝建仓: {}", code, error);
-                        return;
-                    }
-                };
+                crate::trading::paper_trade::portfolio_state(code, current_price).map_err(
+                    |error| format!("BR-124 {code} account snapshot unavailable: {error}"),
+                )?;
 
             // P0-2: 动态仓位计算 (PositionSizer 替代固定 position_shares)
             let shares = if risk_ctx.use_dynamic {
                 let volatility = match result.volatility {
                     Some(value) if value.is_finite() && value > 0.0 => value,
-                    _ => {
-                        warn!("[{}] BR-085 波动率缺失或非法，拒绝动态建仓", code);
-                        return;
-                    }
+                    _ => return Err(format!("BR-124 {code} volatility is missing or invalid")),
                 };
                 let max_amount = risk_ctx.sizer.max_position(
                     risk_ctx.regime,
@@ -433,23 +411,18 @@ pub(super) fn track_position(
                     false, // already_held 在 DB 层已检查
                 );
                 if max_amount <= 0.0 {
-                    warn!("[{}] PositionSizer 返回 0 仓位，跳过买入", code);
-                    return;
+                    return Err(format!("BR-124 {code} position sizer returned zero"));
                 }
                 let lots = (max_amount / current_price / 100.0).floor() as i32;
                 if lots < 1 {
-                    warn!("[{}] BR-085 动态仓位不足一手，拒绝建仓", code);
-                    return;
+                    return Err(format!(
+                        "BR-124 {code} dynamic position cannot fund one lot"
+                    ));
                 }
                 lots * 100
             } else {
-                match position_shares(current_price, available_cash) {
-                    Ok(shares) => shares,
-                    Err(error) => {
-                        warn!("[{}] 非动态仓位计算失败，拒绝建仓: {}", code, error);
-                        return;
-                    }
-                }
+                position_shares(current_price, available_cash)
+                    .map_err(|error| format!("BR-124 {code} static sizing failed: {error}"))?
             };
 
             let today = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -505,27 +478,53 @@ pub(super) fn track_position(
                     result.position_quantity = Some(shares);
                     result.position_status = Some("new".to_string());
                 }
-                Err(e) => warn!("[{}] 记录模拟买入失败: {}", code, e),
+                Err(e) => return Err(format!("BR-124 {code} open position failed: {e}")),
             }
         }
-        Err(e) => warn!("[{}] 查询持仓失败: {}", code, e),
+        Err(e) => return Err(format!("BR-124 {code} query open position failed: {e}")),
     }
+    Ok(())
 }
 
 /// 保存当日分析结果到数据库。
-pub(super) fn save_analysis_result(code: &str, data: &[KlineData], result: &AnalysisResult) {
-    let Some(db) = DatabaseManager::try_get() else {
-        return;
-    };
-    let latest_kline = &data[0];
+pub(super) fn save_analysis_result(
+    code: &str,
+    data: &[KlineData],
+    result: &AnalysisResult,
+) -> Result<(), String> {
+    if code.trim().is_empty() || result.code != code {
+        return Err(format!(
+            "BR-124 analysis result code mismatch: argument={code:?} result={:?}",
+            result.code
+        ));
+    }
+    let latest_kline = data
+        .first()
+        .ok_or_else(|| format!("BR-124 {code} analysis result has no K-line evidence"))?;
+    if !latest_kline.close.is_finite()
+        || latest_kline.close <= 0.0
+        || !latest_kline.pct_chg.is_finite()
+        || latest_kline.pct_chg.abs() > 20.0
+    {
+        return Err(format!(
+            "BR-124 {code} latest K-line is invalid: close={} pct_chg={}",
+            latest_kline.close, latest_kline.pct_chg
+        ));
+    }
+    let db = DatabaseManager::try_get()
+        .ok_or_else(|| format!("BR-124 {code} analysis database is not initialized"))?;
     let score_breakdown_json = result
         .score_breakdown
         .as_ref()
-        .and_then(|sb| serde_json::to_string(sb).ok());
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| format!("BR-124 serialize {code} score breakdown: {error}"))?;
     let veto_flags_json = result
         .veto_flags
         .as_ref()
-        .and_then(|flags| serde_json::to_string(flags).ok());
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| format!("BR-124 serialize {code} veto flags: {error}"))?;
     let new_result = crate::models::NewAnalysisResult {
         code: result.code.clone(),
         name: result.name.clone(),
@@ -545,15 +544,25 @@ pub(super) fn save_analysis_result(code: &str, data: &[KlineData], result: &Anal
         original_advice: result.original_advice.clone(),
         veto_flags_json,
     };
-    match db.save_analysis_result(&new_result) {
-        Ok(_) => info!("[{}] 分析结果已保存到数据库", code),
-        Err(e) => warn!("[{}] 保存分析结果失败: {}", code, e),
-    }
+    db.save_analysis_result(&new_result)
+        .map_err(|error| format!("BR-124 save {code} analysis result: {error}"))?;
+    info!("[{}] 分析结果已保存到数据库", code);
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{position_shares, validate_trade_symbol_env};
+    use super::{
+        position_shares, query_chain_exposure, save_analysis_result, track_position,
+        validate_trade_symbol_env, AnalysisResult, RiskContext,
+    };
+    use crate::data_provider::{AdjustType, KlineData};
+    use crate::database::DatabaseManager;
+    use crate::models::{AnalysisResultRecord, NewStockPosition};
+    use crate::monitor::risk::{MarketRegime, PositionSizer};
+    use crate::schema::{analysis_result, stock_position};
+    use chrono::{Duration, Local, NaiveDate};
+    use diesel::prelude::*;
     use once_cell::sync::Lazy;
     use std::sync::Mutex;
 
@@ -577,6 +586,154 @@ mod tests {
         std::env::set_var("STOCK_ENV_MODE", mode);
         let _mode_guard = EnvModeGuard(prev);
         f()
+    }
+
+    fn init_test_db() -> &'static DatabaseManager {
+        DatabaseManager::init(None).expect("test database init");
+        DatabaseManager::get()
+    }
+
+    fn unique(label: &str) -> String {
+        format!(
+            "TEST_CODE_TRACK_{label}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        )
+    }
+
+    fn result(code: &str) -> AnalysisResult {
+        serde_json::from_value(serde_json::json!({
+            "code": code,
+            "name": "TEST_CODE_持仓测试",
+            "sentiment_score": 50,
+            "ranking_score": 50,
+            "operation_advice": "观望",
+            "trend_prediction": "TEST_CODE_盘整",
+            "analysis_summary": "TEST_CODE_正文",
+            "is_limit_up": false,
+            "contrarian_signal": false
+        }))
+        .expect("valid analysis result fixture")
+    }
+
+    fn kline(close: f64, pct_chg: f64) -> KlineData {
+        KlineData {
+            date: NaiveDate::from_ymd_opt(2026, 7, 17).expect("valid fixture date"),
+            open: close,
+            high: close,
+            low: close,
+            close,
+            volume: 1_000.0,
+            amount: 10_000.0,
+            pct_chg,
+            intraday_price: None,
+            settled: true,
+            pe_ratio: None,
+            pb_ratio: None,
+            turnover_rate: None,
+            market_cap: None,
+            circulating_cap: None,
+            eps: None,
+            roe: None,
+            revenue_yoy: None,
+            net_profit_yoy: None,
+            gross_margin: None,
+            net_margin: None,
+            sharpe_ratio: None,
+            financials_history: None,
+            valuation_history: None,
+            consensus: None,
+            industry: None,
+            is_limit_up: false,
+            is_limit_down: false,
+            is_suspended: false,
+            adjust: AdjustType::None,
+        }
+    }
+
+    fn risk(regime: MarketRegime) -> RiskContext {
+        RiskContext {
+            sizer: PositionSizer::default(),
+            regime,
+            atr: None,
+            use_dynamic: false,
+        }
+    }
+
+    fn save_position(code: &str, buy_date: String, buy_price: f64, chain: Option<String>) {
+        init_test_db()
+            .save_position(&NewStockPosition {
+                code: code.to_string(),
+                name: "TEST_CODE_持仓".to_string(),
+                buy_date,
+                buy_price,
+                quantity: 100,
+                status: "open".to_string(),
+                st_type: None,
+                chain_name: chain,
+            })
+            .expect("save test position");
+    }
+
+    fn save_fresh_chain(code: &str, chain: &str) {
+        let today = Local::now().date_naive();
+        let effective = if crate::calendar::is_trading_day(today) {
+            today
+        } else {
+            crate::calendar::prev_trading_day(today)
+        };
+        let mut conn = init_test_db().get_conn().expect("test database connection");
+        diesel::sql_query(
+            "INSERT OR REPLACE INTO stock_concepts (code, concepts, updated_at)
+             VALUES (?, ?, ?)",
+        )
+        .bind::<diesel::sql_types::Text, _>(code)
+        .bind::<diesel::sql_types::Text, _>(serde_json::json!([chain]).to_string())
+        .bind::<diesel::sql_types::Text, _>(format!("{effective} 12:00:00"))
+        .execute(&mut conn)
+        .expect("save fresh chain evidence");
+    }
+
+    struct TestLedgerGuard {
+        date: String,
+    }
+
+    impl Drop for TestLedgerGuard {
+        fn drop(&mut self) {
+            if let Ok(mut conn) = init_test_db().get_conn() {
+                let _ = diesel::sql_query("DELETE FROM ledger WHERE date = ?")
+                    .bind::<diesel::sql_types::Text, _>(&self.date)
+                    .execute(&mut conn);
+            }
+        }
+    }
+
+    fn prepare_execution_account() -> TestLedgerGuard {
+        crate::broker::ensure_test_quote_provider();
+        let today = Local::now().date_naive().to_string();
+        let mut conn = init_test_db().get_conn().expect("test database connection");
+        diesel::sql_query(
+            "INSERT INTO ledger (date, total_value, cash, market_value, daily_pnl, created_at)
+             VALUES (?, 100000.0, 100000.0, 0.0, 0.0, CURRENT_TIMESTAMP)
+             ON CONFLICT(date) DO UPDATE SET
+                 total_value = excluded.total_value,
+                 cash = excluded.cash,
+                 market_value = excluded.market_value,
+                 daily_pnl = excluded.daily_pnl,
+                 created_at = CURRENT_TIMESTAMP",
+        )
+        .bind::<diesel::sql_types::Text, _>(&today)
+        .execute(&mut conn)
+        .expect("prepare same-day test ledger");
+        diesel::sql_query(
+            "UPDATE stock_position SET updated_at = CURRENT_TIMESTAMP WHERE status = 'open'",
+        )
+        .execute(&mut conn)
+        .expect("refresh test position evidence");
+        TestLedgerGuard { date: today }
     }
 
     #[test]
@@ -614,5 +771,325 @@ mod tests {
         assert_eq!(position_shares(10.0, 100_000.0), Ok(2_000));
         assert!(position_shares(100.0, 100.0).is_err());
         assert!(position_shares(0.0, 100_000.0).is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn chain_exposure_uses_fresh_complete_cache_and_real_open_positions() {
+        let db = init_test_db();
+        let target = unique("CHAIN_TARGET");
+        let chain = unique("CHAIN");
+        let held_old = unique("CHAIN_OLD");
+        let held_today = unique("CHAIN_TODAY");
+        let today = Local::now().date_naive();
+        let effective = if crate::calendar::is_trading_day(today) {
+            today
+        } else {
+            crate::calendar::prev_trading_day(today)
+        };
+        let cache_time = format!("{effective} 12:00:00");
+        let mut conn = db.get_conn().expect("test database connection");
+        diesel::sql_query(
+            "INSERT OR REPLACE INTO stock_concepts (code, concepts, updated_at)
+             VALUES (?, ?, ?)",
+        )
+        .bind::<diesel::sql_types::Text, _>(&target)
+        .bind::<diesel::sql_types::Text, _>(serde_json::json!([chain]).to_string())
+        .bind::<diesel::sql_types::Text, _>(&cache_time)
+        .execute(&mut conn)
+        .expect("save fresh concept evidence");
+        drop(conn);
+        save_position(
+            &held_old,
+            (today - Duration::days(2)).to_string(),
+            10.0,
+            Some(chain.clone()),
+        );
+        save_position(&held_today, today.to_string(), 10.0, Some(chain.clone()));
+
+        assert_eq!(query_chain_exposure(&target), Ok((chain, 2, 1)));
+
+        let malformed = unique("CHAIN_BAD_JSON");
+        let mut conn = db.get_conn().expect("test database connection");
+        diesel::sql_query(
+            "INSERT OR REPLACE INTO stock_concepts (code, concepts, updated_at)
+             VALUES (?, 'not-json', ?)",
+        )
+        .bind::<diesel::sql_types::Text, _>(&malformed)
+        .bind::<diesel::sql_types::Text, _>(&cache_time)
+        .execute(&mut conn)
+        .expect("save malformed concept evidence");
+        assert!(query_chain_exposure(&malformed).is_err());
+
+        let stale = unique("CHAIN_STALE");
+        diesel::sql_query(
+            "INSERT OR REPLACE INTO stock_concepts (code, concepts, updated_at)
+             VALUES (?, '[\"TEST_CODE_STALE\"]', '2000-01-01 00:00:00')",
+        )
+        .bind::<diesel::sql_types::Text, _>(&stale)
+        .execute(&mut conn)
+        .expect("save stale concept evidence");
+        assert!(query_chain_exposure(&stale).is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn tracking_covers_no_action_hold_t1_and_bad_position_evidence() {
+        init_test_db();
+        let no_position = unique("NO_POSITION");
+        let mut missing_price = result(&no_position);
+        assert!(track_position(
+            &no_position,
+            &[],
+            &mut missing_price,
+            &risk(MarketRegime::Structural),
+        )
+        .unwrap_err()
+        .contains("current price"));
+
+        let mut crash = result(&no_position);
+        crash.current_price = Some(10.0);
+        assert!(track_position(
+            &no_position,
+            &[kline(10.0, 0.0)],
+            &mut crash,
+            &risk(MarketRegime::Crash),
+        )
+        .is_ok());
+        assert_eq!(crash.position_status, None);
+
+        let mut no_signal = result(&no_position);
+        no_signal.current_price = Some(10.0);
+        no_signal.operation_advice = "建议买入".to_string();
+        assert!(track_position(
+            &no_position,
+            &[kline(10.0, 0.0)],
+            &mut no_signal,
+            &risk(MarketRegime::Structural),
+        )
+        .is_ok());
+
+        let mut missing_chain = result(&no_position);
+        missing_chain.current_price = Some(10.0);
+        missing_chain.contrarian_signal = true;
+        assert!(track_position(
+            &no_position,
+            &[kline(10.0, 0.0)],
+            &mut missing_chain,
+            &risk(MarketRegime::Structural),
+        )
+        .unwrap_err()
+        .contains("chain exposure"));
+
+        let holding = unique("HOLDING");
+        save_position(
+            &holding,
+            (Local::now().date_naive() - Duration::days(2)).to_string(),
+            10.0,
+            Some(unique("HOLD_CHAIN")),
+        );
+        let mut held_result = result(&holding);
+        held_result.current_price = Some(10.0);
+        track_position(
+            &holding,
+            &[kline(10.0, 0.0)],
+            &mut held_result,
+            &risk(MarketRegime::Structural),
+        )
+        .expect("valid holding update");
+        assert_eq!(held_result.position_status.as_deref(), Some("open"));
+        assert_eq!(held_result.position_buy_price, Some(10.0));
+        assert!(held_result.position_return.expect("net return") < 0.0);
+
+        let locked = unique("T1_LOCKED");
+        save_position(
+            &locked,
+            Local::now().date_naive().to_string(),
+            12.0,
+            Some(unique("LOCKED_CHAIN")),
+        );
+        let mut locked_result = result(&locked);
+        locked_result.current_price = Some(10.0);
+        track_position(
+            &locked,
+            &[kline(10.0, -1.0)],
+            &mut locked_result,
+            &risk(MarketRegime::Structural),
+        )
+        .expect("T+1 is a verified no-action state");
+        assert_eq!(locked_result.position_status.as_deref(), Some("open"));
+
+        let invalid_date = unique("BAD_DATE");
+        save_position(
+            &invalid_date,
+            "not-a-date".to_string(),
+            10.0,
+            Some(unique("BAD_DATE_CHAIN")),
+        );
+        let mut invalid_result = result(&invalid_date);
+        invalid_result.current_price = Some(10.0);
+        assert!(track_position(
+            &invalid_date,
+            &[kline(10.0, 0.0)],
+            &mut invalid_result,
+            &risk(MarketRegime::Structural),
+        )
+        .unwrap_err()
+        .contains("buy date"));
+        let mut conn = DatabaseManager::get()
+            .get_conn()
+            .expect("test database connection");
+        diesel::delete(stock_position::table.filter(stock_position::code.eq(&invalid_date)))
+            .execute(&mut conn)
+            .expect("remove deliberately invalid test row");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn analysis_result_save_validates_then_persists_real_sql_row() {
+        let db = init_test_db();
+        let code = unique("ANALYSIS_SAVE");
+        let mut value = result(&code);
+        value.score_breakdown = Some(Default::default());
+        value.veto_flags = Some(vec!["TEST_CODE_VETO".to_string()]);
+        let bar = kline(10.5, 1.5);
+
+        save_analysis_result(&code, std::slice::from_ref(&bar), &value)
+            .expect("persist validated analysis result");
+        let mut conn = db.get_conn().expect("test database connection");
+        let saved = analysis_result::table
+            .filter(analysis_result::code.eq(&code))
+            .first::<AnalysisResultRecord>(&mut conn)
+            .expect("analysis result row");
+        assert_eq!(saved.name, value.name);
+        assert_eq!(saved.close_price, Some(10.5));
+        assert_eq!(saved.pct_chg, Some(1.5));
+        assert!(saved.score_breakdown_json.is_some());
+        assert!(saved
+            .veto_flags_json
+            .as_deref()
+            .is_some_and(|json| json.contains("TEST_CODE_VETO")));
+
+        assert!(save_analysis_result(&code, &[], &value).is_err());
+        assert!(
+            save_analysis_result("TEST_CODE_OTHER", std::slice::from_ref(&bar), &value).is_err()
+        );
+        assert!(save_analysis_result(&code, &[kline(0.0, 0.0)], &value).is_err());
+        assert!(save_analysis_result(&code, &[kline(10.0, 20.1)], &value).is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn tracking_executes_audited_close_and_static_open() {
+        let _ledger = prepare_execution_account();
+        let sell_code = unique("EXEC_SELL");
+        save_position(
+            &sell_code,
+            (Local::now().date_naive() - Duration::days(2)).to_string(),
+            12.0,
+            Some(unique("SELL_CHAIN")),
+        );
+        let _sell_ledger = prepare_execution_account();
+        let mut sell_result = result(&sell_code);
+        sell_result.current_price = Some(10.0);
+        track_position(
+            &sell_code,
+            &[kline(10.0, -1.0)],
+            &mut sell_result,
+            &risk(MarketRegime::Structural),
+        )
+        .expect("audited stop close");
+        assert_eq!(sell_result.position_status.as_deref(), Some("closed"));
+        assert_eq!(sell_result.position_sell_price, Some(10.0));
+        assert!(init_test_db()
+            .get_open_position(&sell_code)
+            .expect("query closed position")
+            .is_none());
+
+        let buy_code = unique("EXEC_BUY_STATIC");
+        let buy_chain = unique("BUY_CHAIN");
+        save_fresh_chain(&buy_code, &buy_chain);
+        let _buy_ledger = prepare_execution_account();
+        let mut buy_result = result(&buy_code);
+        buy_result.current_price = Some(10.0);
+        buy_result.contrarian_signal = true;
+        buy_result.contrarian_reason = Some("TEST_CODE_反向企稳".to_string());
+        track_position(
+            &buy_code,
+            &[kline(10.0, 1.0)],
+            &mut buy_result,
+            &risk(MarketRegime::Structural),
+        )
+        .expect("audited static open");
+        assert_eq!(buy_result.position_status.as_deref(), Some("new"));
+        assert_eq!(buy_result.position_buy_price, Some(10.0));
+        assert_eq!(buy_result.position_return, Some(0.0));
+        assert!(buy_result
+            .position_quantity
+            .is_some_and(|shares| shares >= 100));
+        assert_eq!(
+            init_test_db()
+                .get_open_position(&buy_code)
+                .expect("query opened position")
+                .expect("opened position exists")
+                .chain_name
+                .as_deref(),
+            Some(buy_chain.as_str())
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dynamic_tracking_requires_volatility_and_one_lot() {
+        let _ledger = prepare_execution_account();
+        let missing_vol_code = unique("DYNAMIC_MISSING_VOL");
+        save_fresh_chain(&missing_vol_code, &unique("DYNAMIC_CHAIN"));
+        let mut missing_vol = result(&missing_vol_code);
+        missing_vol.current_price = Some(10.0);
+        missing_vol.contrarian_signal = true;
+        let dynamic_risk = RiskContext {
+            use_dynamic: true,
+            ..risk(MarketRegime::Structural)
+        };
+        assert!(track_position(
+            &missing_vol_code,
+            &[kline(10.0, 0.0)],
+            &mut missing_vol,
+            &dynamic_risk,
+        )
+        .unwrap_err()
+        .contains("volatility"));
+
+        let tiny_code = unique("DYNAMIC_TINY");
+        save_fresh_chain(&tiny_code, &unique("TINY_CHAIN"));
+        let _tiny_ledger = prepare_execution_account();
+        let mut tiny = result(&tiny_code);
+        tiny.current_price = Some(10.0);
+        tiny.contrarian_signal = true;
+        tiny.volatility = Some(1_000_000.0);
+        assert!(
+            track_position(&tiny_code, &[kline(10.0, 0.0)], &mut tiny, &dynamic_risk,)
+                .unwrap_err()
+                .contains("one lot")
+        );
+
+        let dynamic_code = unique("DYNAMIC_OPEN");
+        save_fresh_chain(&dynamic_code, &unique("OPEN_CHAIN"));
+        let _dynamic_ledger = prepare_execution_account();
+        let mut dynamic = result(&dynamic_code);
+        dynamic.current_price = Some(10.0);
+        dynamic.contrarian_signal = true;
+        dynamic.volatility = Some(2.0);
+        track_position(
+            &dynamic_code,
+            &[kline(10.0, 0.0)],
+            &mut dynamic,
+            &dynamic_risk,
+        )
+        .expect("dynamic open");
+        assert_eq!(dynamic.position_status.as_deref(), Some("new"));
+        assert!(dynamic
+            .position_quantity
+            .is_some_and(|shares| shares >= 100));
     }
 }

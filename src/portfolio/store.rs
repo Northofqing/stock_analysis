@@ -477,9 +477,21 @@ mod tests {
     // ── save_ledger + load_ledger ──
 
     #[test]
+    #[serial_test::serial]
     fn test_ledger_roundtrip() {
         init();
         let date = NaiveDate::from_ymd_opt(2026, 6, 16).unwrap();
+        struct TestLedgerGuard(NaiveDate);
+        impl Drop for TestLedgerGuard {
+            fn drop(&mut self) {
+                if let Ok(mut conn) = crate::database::DatabaseManager::get().get_conn() {
+                    let _ = diesel::sql_query("DELETE FROM ledger WHERE date = ?")
+                        .bind::<diesel::sql_types::Date, _>(self.0)
+                        .execute(&mut conn);
+                }
+            }
+        }
+        let _ledger = TestLedgerGuard(date);
         let entry = LedgerEntry {
             date,
             total_value: 100_000.0,
