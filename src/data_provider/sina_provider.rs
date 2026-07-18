@@ -258,11 +258,106 @@ impl Default for SinaProvider {
 mod strict_kline_tests {
     use super::*;
 
+    fn hq_body(overrides: &[(usize, &str)]) -> String {
+        let mut fields = vec!["0"; 32];
+        fields[0] = "协议测试股票";
+        fields[1] = "10.00";
+        fields[2] = "9.80";
+        fields[3] = "10.10";
+        fields[4] = "10.20";
+        fields[5] = "9.70";
+        fields[8] = "123456";
+        fields[9] = "987654.50";
+        fields[30] = "2026-07-16";
+        fields[31] = "15:00:00";
+        for (index, value) in overrides {
+            fields[*index] = value;
+        }
+        format!("var hq_str_sh600519=\"{}\";", fields.join(","))
+    }
+
+    #[test]
+    fn url_builders_normalize_single_and_batch_symbols() {
+        assert_eq!(
+            build_kline_url("600519", 30),
+            "https://quotes.sina.cn/cn/api/jsonp_v2.php/=/CN_MarketDataService.getKLineData?symbol=sh600519&scale=240&datalen=30"
+        );
+        assert_eq!(
+            build_hq_url("600519, 000001"),
+            "https://hq.sinajs.cn/list=sh600519,sz000001"
+        );
+    }
+
+    #[test]
+    fn hq_parser_preserves_complete_prices_volume_and_source_time() {
+        let quote = parse_hq_str(&hq_body(&[]), "600519").unwrap();
+        assert_eq!(quote.name, "协议测试股票");
+        assert_eq!(quote.open, 10.0);
+        assert_eq!(quote.yesterday_close, 9.8);
+        assert_eq!(quote.current, 10.1);
+        assert_eq!(quote.high, 10.2);
+        assert_eq!(quote.low, 9.7);
+        assert_eq!(quote.volume, 123_456.0);
+        assert_eq!(quote.amount, 987_654.5);
+        assert_eq!(
+            quote.source_time,
+            Utc.with_ymd_and_hms(2026, 7, 16, 7, 0, 0).single().unwrap()
+        );
+    }
+
+    #[test]
+    fn hq_parser_rejects_protocol_numeric_and_time_failures() {
+        for (body, expected) in [
+            ("no quotes".to_string(), "无引号"),
+            ("var hq=\"".to_string(), "引号位置异常"),
+            ("var hq=\"a,b\";".to_string(), "字段数"),
+            (hq_body(&[(1, "bad")]), "open 非法"),
+            (hq_body(&[(8, "-1")]), "volume 非法值"),
+            (hq_body(&[(9, "NaN")]), "amount 非法值"),
+            (hq_body(&[(2, "0")]), "required prices"),
+            (hq_body(&[(3, "0")]), "required prices"),
+            (hq_body(&[(30, "bad-date")]), "source_time 非法"),
+            (hq_body(&[(31, "25:00:00")]), "source_time 非法"),
+        ] {
+            let error = parse_hq_str(&body, "600519").unwrap_err().to_string();
+            assert!(
+                error.contains(expected),
+                "expected={expected:?} error={error:?}"
+            );
+        }
+    }
+
     #[test]
     fn br092_daily_kline_is_unavailable_without_source_amount() {
         let body = r#"callback([{"day":"2026-07-16","open":"10","high":"10.2","low":"9.8","close":"10.1","volume":"1000"}])"#;
         let error = parse_kline_body(body, "000001")
             .expect_err("Sina daily rows do not carry a real amount field");
         assert!(error.to_string().contains("amount"));
+    }
+
+    #[test]
+    fn kline_jsonp_parser_distinguishes_empty_missing_and_malformed_batches() {
+        assert!(parse_kline_body("callback([])", "600519")
+            .unwrap()
+            .is_empty());
+        for (body, expected) in [
+            ("callback({})", "无 JSON 数组"),
+            ("callback([{})", "JSON 不完整"),
+            ("callback([bad])", "JSON parse"),
+            (r#"callback([{"day":"2026-07-16"}])"#, "JSON parse"),
+        ] {
+            let error = parse_kline_body(body, "600519").unwrap_err().to_string();
+            assert!(
+                error.contains(expected),
+                "expected={expected:?} error={error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_metadata_has_no_synthetic_name() {
+        let provider = SinaProvider::default();
+        assert_eq!(provider.name(), "sina_hq");
+        assert_eq!(provider.get_stock_name("600519"), None);
     }
 }

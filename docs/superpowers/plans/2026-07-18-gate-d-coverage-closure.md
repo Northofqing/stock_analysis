@@ -106,6 +106,20 @@ Expected: all PASS. Commit only the two modules plus design/plan/progress eviden
 - [ ] Drive `analyze` through the pipeline interface with validated K-lines and explicit unavailable optional sources. Assert result fields, veto/ranking application, and failure propagation; never register a production mock source.
 - [ ] Run `cargo test --lib pipeline::`, affected integration tests, and strict Clippy after every vertical slice.
 
+### Task 3A: Execute public provider protocol tracer bullets
+
+**Files:**
+- Modify: `src/data_provider/baostock_provider.rs`
+- Modify: `src/data_provider/sina_provider.rs`
+- Modify: `src/data_provider/sina_news_provider.rs`
+
+- [x] Add BaoStock tests beside the public functions. Build non-compressed and zlib frames with the documented 21-byte header, then assert version/type/body/CRC fields. Exercise `read_tcp_response` through `tokio::io::duplex` for chunked marker completion, EOF, timeout and the 1 MiB limit.
+- [x] Add a valid two-day CSV/CDATA batch whose independent expected values include `close=10.1`, `amount=101000.0`, `pct_chg=1.0`, `AdjustType::Qfq`; then reject missing headers/fields, bad date/number/OHLC, duplicate/gapped dates and an adjacent close jump above 20%.
+- [x] Add Sina hq tests using exactly 32 locally constructed fields and assert the UTC conversion of `2026-07-16 15:00:00` from Shanghai time plus price/volume/amount values. Reject missing quotes, short rows, bad/negative/zero prices and invalid source time. Characterize empty K-line arrays as empty and every present row as unavailable because the source protocol lacks real `amount`.
+- [x] Add Sina news tests with fixed epoch `1700000000`, covering financial/stock source labels, media/oid/docid/default source names, optional intro, stable content hash, UTF-8 and GBK decode. Reject invalid JSON/data/category/code, missing URL/title/integer time, pre-2000 and more-than-five-minute future times.
+- [x] Run `cargo test --lib data_provider::baostock_provider::inline_tests`, `cargo test --lib data_provider::sina_provider`, and `cargo test --lib data_provider::sina_news_provider`; each must pass without network access. Then regenerate focused coverage for the three files and run strict library Clippy.
+- [x] Commit the tests and exact coverage evidence independently before extracting any Tencent/Eastmoney private parser seam.
+
 ### Task 5: Close remaining registered core deficits
 
 **Files:**

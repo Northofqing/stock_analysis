@@ -248,3 +248,186 @@ impl Default for SinaNewsProvider {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_body() -> String {
+        serde_json::json!({
+            "result": {
+                "data": [
+                    {
+                        "url": "https://example.test/one",
+                        "title": "测试标题一",
+                        "intro": "测试摘要一",
+                        "ctime": 1_700_000_000_i64,
+                        "media_name": "测试媒体"
+                    },
+                    {
+                        "url": "https://example.test/two",
+                        "title": "测试标题二",
+                        "ctime": 1_700_000_001_i64,
+                        "media_name": "",
+                        "oid": "OID-2"
+                    },
+                    {
+                        "url": "https://example.test/three",
+                        "title": "测试标题三",
+                        "intro": "",
+                        "ctime": 1_700_000_002_i64,
+                        "media_name": "",
+                        "docid": "DOC-3"
+                    },
+                    {
+                        "url": "https://example.test/four",
+                        "title": "测试标题四",
+                        "ctime": 1_700_000_003_i64,
+                        "media_name": ""
+                    }
+                ]
+            }
+        })
+        .to_string()
+    }
+
+    fn body_with_row(row: serde_json::Value) -> String {
+        serde_json::json!({"result": {"data": [row]}}).to_string()
+    }
+
+    #[test]
+    fn urls_preserve_feed_identity_and_limits() {
+        assert_eq!(
+            build_top_news_url(20),
+            "https://feed.mix.sina.com.cn/api/roll/get?pageid=155&lid=1686&k=&num=20&page=1"
+        );
+        assert_eq!(
+            build_stock_news_url("600519", 7),
+            "https://feed.mix.sina.com.cn/api/roll/get?pageid=155&lid=2516&k=600519&num=7&page=1"
+        );
+    }
+
+    #[test]
+    fn complete_news_batch_preserves_sources_optional_intro_and_hashes() {
+        let financial = parse_sina_news_body(&valid_body(), "财经要闻", None).unwrap();
+        assert_eq!(financial.len(), 4);
+        assert!(financial.iter().all(|item| item.source == "sina_financial"));
+        assert!(financial.iter().all(|item| item.category == "财经要闻"));
+        assert!(financial.iter().all(|item| item.code.is_none()));
+        assert_eq!(financial[0].source_name, "测试媒体");
+        assert_eq!(financial[1].source_name, "sina:OID-2");
+        assert_eq!(financial[2].source_name, "sina:DOC-3");
+        assert_eq!(financial[3].source_name, "新浪财经");
+        assert_eq!(financial[1].summary, "");
+        assert_eq!(financial[0].external_id, "https://example.test/one");
+        assert_eq!(financial[0].url, financial[0].external_id);
+        assert_eq!(
+            financial[0].published_at,
+            chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap()
+        );
+        assert_eq!(
+            financial[0].content_hash,
+            content_hash("测试标题一", "测试摘要一")
+        );
+        assert!(financial
+            .iter()
+            .all(|item| item.fetched_at >= item.published_at));
+
+        let stock = parse_sina_news_body(&valid_body(), "个股新闻", Some("600519")).unwrap();
+        assert!(stock.iter().all(|item| item.source == "sina_stock"));
+        assert!(stock
+            .iter()
+            .all(|item| item.code.as_deref() == Some("600519")));
+    }
+
+    #[test]
+    fn parser_accepts_an_explicit_empty_batch() {
+        let items = parse_sina_news_body(r#"{"result":{"data":[]}}"#, "财经要闻", None).unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn parser_rejects_document_category_and_code_failures() {
+        for (body, category, code, expected) in [
+            ("not-json", "财经要闻", None, "JSON parse"),
+            ("{}", "财经要闻", None, "result.data"),
+            (r#"{"result":{"data":{}}}"#, "财经要闻", None, "result.data"),
+            (&valid_body(), " ", None, "category"),
+            (&valid_body(), "个股新闻", Some("60051"), "非法股票代码"),
+            (&valid_body(), "个股新闻", Some("ABCDEF"), "非法股票代码"),
+        ] {
+            let error = parse_sina_news_body(body, category, code)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(expected),
+                "expected={expected:?} error={error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parser_rejects_any_incomplete_or_invalid_row() {
+        let base = serde_json::json!({
+            "url": "https://example.test/news",
+            "title": "测试标题",
+            "intro": "摘要",
+            "ctime": 1_700_000_000_i64,
+            "media_name": "媒体"
+        });
+        let mut cases = Vec::new();
+        for (field, expected) in [
+            ("url", "缺少 url"),
+            ("title", "缺少 title"),
+            ("ctime", "整数 ctime"),
+        ] {
+            let mut row = base.clone();
+            row.as_object_mut().unwrap().remove(field);
+            cases.push((row, expected));
+        }
+        let mut empty_url = base.clone();
+        empty_url["url"] = serde_json::json!(" ");
+        cases.push((empty_url, "缺少 url"));
+        let mut empty_title = base.clone();
+        empty_title["title"] = serde_json::json!("");
+        cases.push((empty_title, "缺少 title"));
+        let mut string_time = base.clone();
+        string_time["ctime"] = serde_json::json!("1700000000");
+        cases.push((string_time, "整数 ctime"));
+        let mut ancient = base.clone();
+        ancient["ctime"] = serde_json::json!(946_684_799_i64);
+        cases.push((ancient, "早于 2000"));
+        let mut invalid_epoch = base.clone();
+        invalid_epoch["ctime"] = serde_json::json!(i64::MAX);
+        cases.push((invalid_epoch, "ctime 非法"));
+        let mut future = base;
+        future["ctime"] = serde_json::json!(Utc::now().timestamp() + 301);
+        cases.push((future, "发布时间在未来"));
+
+        for (row, expected) in cases {
+            let error = parse_sina_news_body(&body_with_row(row), "财经要闻", None)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(expected),
+                "expected={expected:?} error={error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decoder_prefers_utf8_and_falls_back_to_gbk() {
+        let utf8 = "新浪财经 UTF-8";
+        assert_eq!(decode_sina_bytes(utf8.as_bytes()), utf8);
+
+        let (encoded, _, had_errors) = GBK.encode("新浪财经 GBK");
+        assert!(!had_errors);
+        assert_eq!(decode_sina_bytes(encoded.as_ref()), "新浪财经 GBK");
+    }
+
+    #[test]
+    fn provider_default_keeps_real_api_base() {
+        let provider = SinaNewsProvider::default();
+        assert_eq!(provider.api_base, SINA_NEWS_API_BASE);
+    }
+}

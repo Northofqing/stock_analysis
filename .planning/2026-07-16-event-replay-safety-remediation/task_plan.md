@@ -91,10 +91,17 @@ Phase 12 (Gate D coverage and live-account release closure)
 - [x] Write and commit the coverage-closure design addendum and executable implementation plan
 - [ ] Raise registered core trading/data line coverage from 55.45% to at least 95%
 - [ ] Raise repository-wide line coverage from 51.20% to at least 80%
-- [ ] Add a nullable, source-traceable same-day real-account P&L/NAV persistence path without fabricating unavailable values
+- [x] Add a nullable, source-traceable same-day real-account P&L/NAV persistence path without fabricating unavailable values
 - [ ] Re-run Gate A-D validation, live-data validation, and independent auditor review
 - [ ] Mark PR #2 Ready and merge through GitHub only after every mandatory checkbox passes
 - **Status:** in progress; user authorized autonomous continuation until all merge gates pass
+
+### Phase 13: v16.x completion audit after Gate D merge
+- [ ] Inventory `docs/v16.x/` requirements, completion claims, linked code and open evidence gaps after Phase 12 is merged
+- [ ] Convert every confirmed incomplete v16.x requirement into a scoped design/plan slice with rule IDs and rollback
+- [ ] Implement and validate all repository-verifiable v16.x gaps; keep unavailable external dependencies explicit rather than fabricated
+- [ ] Commit, push, review and merge the v16.x closure through the same Gate A-D process
+- **Status:** queued by user; starts only after the current Gate-D/PR closure is complete
 
 ## Decisions
 

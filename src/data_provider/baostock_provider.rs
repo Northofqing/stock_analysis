@@ -654,6 +654,29 @@ pub fn parse_baostock_response(body: &str, key: &str) -> Result<Option<String>> 
 #[cfg(test)]
 mod inline_tests {
     use super::*;
+    use flate2::{write::ZlibEncoder, Compression};
+    use std::io::Write;
+
+    fn response_frame(msg_type: &str, body: &[u8], crc: Option<u32>) -> Vec<u8> {
+        let mut frame =
+            format!("{}\x01{}\x01{:010}", BAOSTOCK_VERSION, msg_type, body.len()).into_bytes();
+        frame.extend_from_slice(body);
+        if let Some(crc) = crc {
+            frame.push(b'\x01');
+            frame.extend_from_slice(crc.to_string().as_bytes());
+            frame.push(b'\n');
+            frame.extend_from_slice(RESPONSE_END_MARKER);
+        } else {
+            frame.push(b'\n');
+        }
+        frame
+    }
+
+    fn valid_csv() -> &'static str {
+        "date,open,high,low,close,volume,amount,pctChg\n\
+         2026-07-15,10.00,10.20,9.90,10.00,1000,100000,0.0\n\
+         2026-07-16,10.00,10.20,9.95,10.10,1100,101000,1.0"
+    }
 
     /// `BAOSTOCK_HOST` / `BAOSTOCK_PORT` 必须是稳定的 TCP endpoint.
     #[test]
@@ -685,6 +708,7 @@ mod inline_tests {
     #[test]
     fn crc32_empty_is_zero() {
         assert_eq!(baostock_crc32(b""), 0);
+        assert_eq!(baostock_crc32(b"123456789"), 0xcbf4_3926);
     }
 
     /// `parse_baostock_response` 容忍尾部空白和 `\r\n`.
@@ -695,5 +719,196 @@ mod inline_tests {
             parse_baostock_response(body, "session_id").unwrap(),
             Some("XYZ".to_string())
         );
+        assert_eq!(parse_baostock_response(body, "missing").unwrap(), None);
+    }
+
+    #[test]
+    fn request_builders_preserve_protocol_fields_and_character_length() {
+        let unicode = build_tcp_message(BAOSTOCK_VERSION, MSG_TYPE_LOGIN_REQ, "中");
+        assert_eq!(&unicode[11..21], b"0000000001");
+        assert!(build_login_msg("login").starts_with("00.9.20\x0100\x01"));
+        assert_eq!(
+            build_logout_body("anonymous", "888888", "ignored"),
+            "login\x01anonymous\x01888888\x011"
+        );
+
+        let body = build_kline_request_body(
+            "sh.600519",
+            BAOSTOCK_KLINE_FIELDS,
+            "2026-07-15",
+            "2026-07-16",
+            "SESSION",
+        );
+        assert_eq!(
+            body,
+            "query_history_k_data_plus\x01SESSION\x011\x01000\x01sh.600519\x01date,open,high,low,close,volume,amount,pctChg\x012026-07-15\x012026-07-16\x01d\x012"
+        );
+        let frame = build_kline_query_frame(
+            "sh.600519",
+            BAOSTOCK_KLINE_FIELDS,
+            "2026-07-15",
+            "2026-07-16",
+            "SESSION",
+        );
+        assert!(frame.starts_with(b"00.9.20\x0195\x01"));
+    }
+
+    #[test]
+    fn tcp_parser_handles_plain_and_zlib_responses() {
+        let plain = response_frame(MSG_TYPE_LOGIN_RESP, b"session_id=SESSION", None);
+        let parsed = parse_baostock_tcp_response(&plain).expect("plain login response");
+        assert_eq!(parsed.version, BAOSTOCK_VERSION);
+        assert_eq!(parsed.msg_type, MSG_TYPE_LOGIN_RESP);
+        assert_eq!(parsed.body, "session_id=SESSION");
+        assert_eq!(parsed.crc32, 0);
+
+        let raw = format!("<![CDATA[error_code=0\n{}]]>", valid_csv());
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(raw.as_bytes()).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let zipped = response_frame(MSG_TYPE_KLINE_RESP, &compressed, Some(12345));
+        let parsed = parse_baostock_tcp_response(&zipped).expect("zlib kline response");
+        assert_eq!(parsed.msg_type, MSG_TYPE_KLINE_RESP);
+        assert_eq!(parsed.body, raw);
+        assert_eq!(parsed.crc32, 12345);
+    }
+
+    #[test]
+    fn tcp_parser_rejects_bad_headers_lengths_and_compression() {
+        assert!(parse_baostock_tcp_response(b"short").is_err());
+
+        let mut bad_utf8 = vec![b'x'; 22];
+        bad_utf8[0] = 0xff;
+        assert!(parse_baostock_tcp_response(&bad_utf8).is_err());
+
+        let bad_fields = b"00.9.20xxxxxxxxxxxxx\n";
+        assert!(parse_baostock_tcp_response(bad_fields).is_err());
+
+        let bad_length = b"00.9.20\x0196\x01not-a-len!x\n";
+        assert!(parse_baostock_tcp_response(bad_length).is_err());
+
+        let truncated = format!("{}\x0196\x01{:010}", BAOSTOCK_VERSION, 20).into_bytes();
+        assert!(parse_baostock_tcp_response(&truncated).is_err());
+
+        let invalid_zlib = response_frame(MSG_TYPE_KLINE_RESP, b"not-zlib", Some(1));
+        assert!(parse_baostock_tcp_response(&invalid_zlib).is_err());
+    }
+
+    #[tokio::test]
+    async fn streaming_reader_covers_completion_eof_timeout_and_size_limit() {
+        let (mut reader, mut writer) = tokio::io::duplex(64);
+        let producer = tokio::spawn(async move {
+            writer.write_all(b"part-one").await.unwrap();
+            writer.write_all(b"part-two").await.unwrap();
+            writer.write_all(RESPONSE_END_MARKER).await.unwrap();
+        });
+        let bytes = read_tcp_response(&mut reader, std::time::Duration::from_secs(1))
+            .await
+            .expect("chunked response completes");
+        producer.await.unwrap();
+        assert!(bytes.starts_with(b"part-onepart-two"));
+        assert!(bytes.ends_with(RESPONSE_END_MARKER));
+
+        let (mut reader, mut writer) = tokio::io::duplex(16);
+        writer.write_all(b"partial").await.unwrap();
+        drop(writer);
+        assert!(
+            read_tcp_response(&mut reader, std::time::Duration::from_secs(1))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("中途关闭")
+        );
+
+        let (mut reader, _writer) = tokio::io::duplex(16);
+        assert!(
+            read_tcp_response(&mut reader, std::time::Duration::from_millis(1))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("读取超时")
+        );
+
+        let (mut reader, mut writer) = tokio::io::duplex(8192);
+        let producer = tokio::spawn(async move {
+            writer.write_all(&vec![b'x'; 1_048_577]).await.unwrap();
+        });
+        assert!(
+            read_tcp_response(&mut reader, std::time::Duration::from_secs(3))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("响应超")
+        );
+        producer.await.unwrap();
+    }
+
+    #[test]
+    fn cdata_and_kline_batch_round_trip_complete_values() {
+        assert_eq!(strip_cdata("  plain  "), "plain");
+        assert_eq!(strip_cdata("<![CDATA[value]]>"), "value");
+        assert_eq!(strip_cdata("<![CDATA[broken"), "<![CDATA[broken");
+
+        let body = format!(
+            "<![CDATA[error_code=0\nerror_msg=success\n{}]]>",
+            valid_csv()
+        );
+        let rows = parse_baostock_response_kline(&body, "600519").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].date, NaiveDate::from_ymd_opt(2026, 7, 16).unwrap());
+        assert_eq!(rows[0].close, 10.1);
+        assert_eq!(rows[0].amount, 101_000.0);
+        assert_eq!(rows[0].pct_chg, 1.0);
+        assert_eq!(rows[0].adjust, AdjustType::Qfq);
+        assert!(rows.iter().all(|row| row.settled));
+
+        let with_code = valid_csv()
+            .replacen("date,", "code,date,", 1)
+            .replace("2026-07-15,", "sh.600519,2026-07-15,")
+            .replace("2026-07-16,", "sh.600519,2026-07-16,");
+        let rows = parse_baostock_response_kline(&with_code, "600519").unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn kline_parser_rejects_incomplete_or_bad_complete_batches() {
+        for body in [
+            "",
+            "open,high,low,close,volume,amount,pctChg\n10,10,10,10,1,1,0",
+            "date,open,high,low,close,volume,amount,pctChg\n2026-07-16,10,10,10",
+            "date,open,high,low,close,volume,amount,pctChg\nbad,10,10,10,10,1,1,0",
+            "date,open,high,low,close,volume,amount,pctChg\n2026-07-16,bad,10,10,10,1,1,0",
+            "date,open,high,low,close,volume,amount,pctChg\n2026-07-16,10,9,8,10,1,1,0",
+            "date,open,high,low,close,volume,amount,pctChg\n2026-07-16,10,10,10,10,1,-1,0",
+            "date,open,high,low,close,volume,amount,pctChg\n2026-07-16,10,10,10,10,1,1,20.1",
+        ] {
+            assert!(parse_kline_body(body, "600519").is_err(), "body={body:?}");
+        }
+
+        let duplicate = format!("{}\n{}", valid_csv(), valid_csv().lines().nth(2).unwrap());
+        assert!(parse_kline_body(&duplicate, "600519").is_err());
+
+        let gap = "date,open,high,low,close,volume,amount,pctChg\n\
+                   2026-07-14,10,10,10,10,1,1,0\n\
+                   2026-07-16,10,10,10,10,1,1,0";
+        assert!(parse_kline_body(gap, "600519").is_err());
+
+        let jump = "date,open,high,low,close,volume,amount,pctChg\n\
+                    2026-07-15,10,10,10,10,1,1,0\n\
+                    2026-07-16,13,13,13,13,1,1,0";
+        assert!(parse_kline_body(jump, "600519").is_err());
+        assert!(parse_baostock_response_kline("error_code=0", "600519").is_err());
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn provider_metadata_and_legacy_builders_are_explicit() {
+        let provider = BaostockProvider::default();
+        assert_eq!(provider.name(), "baostock");
+        assert_eq!(provider.get_stock_name("600519"), None);
+        assert!(provider.get_realtime_quote("600519").unwrap().is_none());
+        assert_eq!(build_login_url(), "http://baostock.com/baostock/Login");
+        assert_eq!(build_logout_url(), "http://baostock.com/baostock/Logout");
+        assert!(build_kline_query_body("600519", "date", "a", "b", "s").contains("code=600519"));
     }
 }
