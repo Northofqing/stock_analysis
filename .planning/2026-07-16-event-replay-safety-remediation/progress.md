@@ -247,3 +247,4 @@
 - Fixed review Important findings in working tree: strict WAL result validation, fail-closed monitor exit, and precise process-artifact ignore rules.
 - TDD regression `memory_database_fails_closed_with_explicit_journal_mode_error` passes.
 - Full Gate validation remains required before any merge decision; prior Gate D coverage/live-account evidence blockers remain.
+- Added explicit webhook-secret isolation to process tests after independent review.

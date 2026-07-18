@@ -168,3 +168,4 @@
 - Added a public monitor-process regression for `DATABASE_PATH=:memory:`; it now requires exit code 2 and an explicit `journal_mode=memory` diagnostic.
 - Database bootstrap now reads and strictly validates the returned journal mode; monitor initialization failures exit nonzero.
 - Narrowed repository ignores to generated review diffs/workspaces and Python caches so process evidence remains trackable.
+- Removed `ALERT_WEBHOOK_URL` from child-process environments in monitor isolation tests so test failures cannot send real notifications (AGENTS 2.5).
