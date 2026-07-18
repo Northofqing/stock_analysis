@@ -9,6 +9,7 @@ use crate::data_provider::KlineData;
 /// `fetch_extra_context` 的产物：
 /// - `section`：用于通知 / AI prompt 的 Markdown 片段（与之前等价）。
 /// - `money_flow`：原始资金流时序，用于打分器做 EWMA / 单日反弹判定。
+#[derive(Clone)]
 pub(super) struct ExtraContext {
     pub section: Option<String>,
     pub money_flow: Option<MoneyFlowSummary>,

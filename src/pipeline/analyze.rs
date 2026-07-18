@@ -553,6 +553,26 @@ fn render_financial_history_section(hist: &[FinancialPeriod]) -> Option<String> 
     Some(s)
 }
 
+/// BR-085: derive risk inputs only from the validated K-line batch.
+fn position_risk_evidence(
+    data: &[KlineData],
+) -> Option<(crate::monitor::risk::MarketRegime, Option<f64>)> {
+    let latest = data.first()?;
+    let regime = crate::monitor::risk::classify_market(0.5, latest.pct_chg);
+    let ranges: Vec<f64> = data
+        .iter()
+        .take(14)
+        .map(|bar| bar.high - bar.low)
+        .filter(|range| range.is_finite() && *range > 0.0)
+        .collect();
+    let atr = if ranges.is_empty() {
+        None
+    } else {
+        Some(ranges.iter().sum::<f64>() / ranges.len() as f64)
+    };
+    Some((regime, atr))
+}
+
 impl AnalysisPipeline {
     /// 分析单只股票
     async fn analyze_stock(
@@ -657,6 +677,22 @@ impl AnalysisPipeline {
             }
         };
 
+        #[cfg(test)]
+        let ((stock_name, news_context), extra, mtf_section_opt) =
+            if let Some(context) = self.test_resolved_context.as_ref() {
+                (
+                    (context.stock_name.clone(), context.news_context.clone()),
+                    context.extra.clone(),
+                    context.mtf_section.clone(),
+                )
+            } else {
+                tokio::join!(
+                    name_news_fut,
+                    extra_context::fetch_extra_context(code, data),
+                    mtf_fut
+                )
+            };
+        #[cfg(not(test))]
         let ((stock_name, news_context), extra, mtf_section_opt) = tokio::join!(
             name_news_fut,
             extra_context::fetch_extra_context(code, data),
@@ -1039,7 +1075,14 @@ impl AnalysisPipeline {
         macro_context: Arc<str>,
     ) -> Option<AnalysisResult> {
         // 1. 获取数据
-        let data = match self.fetch_and_save_data(&code).await {
+        #[cfg(test)]
+        let fetched_data = match self.test_fetched_data.as_ref() {
+            Some(result) => result.clone().map_err(anyhow::Error::msg),
+            None => self.fetch_and_save_data(&code).await,
+        };
+        #[cfg(not(test))]
+        let fetched_data = self.fetch_and_save_data(&code).await;
+        let data = match fetched_data {
             Ok(d) => d,
             Err(e) => {
                 error!("[{}] 获取数据失败: {}", code, e);
@@ -1094,29 +1137,14 @@ impl AnalysisPipeline {
         let position_tracking_enabled = std::env::var("POSITION_TRACKING_ENABLED")
             .map(|v| v.to_lowercase() != "false")
             .unwrap_or(true);
+        #[cfg(test)]
+        let position_tracking_enabled =
+            position_tracking_enabled && self.test_fetched_data.is_none();
         if position_tracking_enabled {
-            // P0-2: 构建 RiskContext 注入风控组件
-            let regime = {
-                // 从市场广度数据判定当前市场状态
-                // 若无法获取上涨家数占比，默认 Structural (中性)
-                crate::monitor::risk::classify_market(0.5, data[0].pct_chg)
-            };
-            // ATR: 近 14 日真实波幅均值 (若数据不足则取可用天数)
-            let atr = {
-                let ranges: Vec<f64> = data
-                    .iter()
-                    .take(14)
-                    .map(|d| d.high - d.low)
-                    .filter(|r| r.is_finite() && *r > 0.0)
-                    .collect();
-                if ranges.is_empty() {
-                    None
-                } else {
-                    Some(ranges.iter().sum::<f64>() / ranges.len() as f64)
-                }
-            };
-            let risk_ctx = position_tracker::RiskContext::from_env(regime, atr);
-            position_tracker::track_position(&code, &data, &mut result, &risk_ctx);
+            if let Some((regime, atr)) = position_risk_evidence(&data) {
+                let risk_ctx = position_tracker::RiskContext::from_env(regime, atr);
+                position_tracker::track_position(&code, &data, &mut result, &risk_ctx);
+            }
         }
 
         // 5. 保存分析结果到数据库
@@ -1139,19 +1167,23 @@ impl AnalysisPipeline {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_boll_macd_adjustment, apply_fundamental_adjustments, render_consensus_section,
-        render_financial_history_section, render_industry_section, render_quality_report,
-        render_valuation_history_section,
+        apply_boll_macd_adjustment, apply_fundamental_adjustments, position_risk_evidence,
+        render_consensus_section, render_financial_history_section, render_industry_section,
+        render_quality_report, render_valuation_history_section,
     };
     use crate::data_provider::consensus::{ConsensusData, RecentReport};
     use crate::data_provider::financials::{FinancialPeriod, QualityReport};
     use crate::data_provider::industry::IndustryBenchmark;
     use crate::data_provider::valuation_history::ValuationHistory;
-    use crate::data_provider::{AdjustType, KlineData};
+    use crate::data_provider::{AdjustType, DataFetcherManager, KlineData};
     use crate::indicators::DivergenceType;
+    use crate::notification::NotificationService;
     use crate::strategy::{BollMacdAction, BollMacdSignal};
-    use crate::trend_analyzer::{BuySignal, TrendAnalysisResult};
+    use crate::trend_analyzer::{BuySignal, StockTrendAnalyzer, TrendAnalysisResult};
     use chrono::NaiveDate;
+    use std::sync::Arc;
+
+    use super::AnalysisPipeline;
 
     fn boll_signal(action: BollMacdAction) -> BollMacdSignal {
         BollMacdSignal {
@@ -1631,5 +1663,311 @@ mod tests {
             let rendered = render_financial_history_section(&history).expect("ratio evidence");
             assert!(rendered.contains(label), "ratio={ratio}: {rendered}");
         }
+    }
+
+    fn resolved_context(
+        extra: Result<super::extra_context::ExtraContext, String>,
+        mtf_section: Result<Option<String>, String>,
+    ) -> super::super::TestResolvedAnalysisContext {
+        super::super::TestResolvedAnalysisContext {
+            stock_name: "TEST_CODE_示例公司".to_string(),
+            news_context: Some("TEST_CODE_真实新闻证据".to_string()),
+            extra,
+            mtf_section,
+        }
+    }
+
+    fn test_pipeline(
+        context: super::super::TestResolvedAnalysisContext,
+        limit_up: bool,
+    ) -> AnalysisPipeline {
+        AnalysisPipeline {
+            data_manager: Arc::new(DataFetcherManager::new().expect("test data manager")),
+            trend_analyzer: Arc::new(StockTrendAnalyzer::new()),
+            ai_analyzer: None,
+            use_news_search: false,
+            notifier: Arc::new(NotificationService::new(Default::default())),
+            config: super::super::PipelineConfig {
+                send_notification: false,
+                single_notify: false,
+                ..Default::default()
+            },
+            limit_up_codes: Arc::new(if limit_up {
+                ["TEST_CODE_000001".to_string()].into_iter().collect()
+            } else {
+                Default::default()
+            }),
+            test_resolved_context: Some(context),
+            test_fetched_data: None,
+        }
+    }
+
+    fn analysis_bars() -> Vec<KlineData> {
+        (0..40)
+            .map(|index| {
+                let mut bar = kline();
+                bar.date = NaiveDate::from_ymd_opt(2026, 7, 18).expect("valid fixture date")
+                    - chrono::Duration::days(index);
+                bar.close = 10.0 - index as f64 * 0.01;
+                bar.open = bar.close;
+                bar.high = bar.close + 0.2;
+                bar.low = bar.close - 0.2;
+                bar
+            })
+            .collect()
+    }
+
+    #[test]
+    fn position_risk_inputs_use_only_positive_finite_ranges() {
+        assert!(position_risk_evidence(&[]).is_none());
+        let mut bars = analysis_bars();
+        bars[0].high = 10.5;
+        bars[0].low = 9.5;
+        bars[1].high = 10.0;
+        bars[1].low = 10.0;
+        bars[2].high = f64::NAN;
+        let (_, atr) = position_risk_evidence(&bars).expect("nonempty evidence");
+        assert!(atr.is_some_and(|value| value > 0.0 && value.is_finite()));
+
+        for bar in &mut bars {
+            bar.high = bar.low;
+        }
+        assert_eq!(position_risk_evidence(&bars).unwrap().1, None);
+    }
+
+    #[tokio::test]
+    async fn resolved_test_context_exercises_result_assembly_without_live_transport() {
+        let context = resolved_context(
+            Ok(super::extra_context::ExtraContext {
+                section: Some("TEST_CODE_真实资金证据".to_string()),
+                money_flow: None,
+            }),
+            Ok(Some("TEST_CODE_多周期证据".to_string())),
+        );
+        let pipeline = test_pipeline(context, true);
+        let mut values = analysis_bars();
+        values[0].financials_history = Some(vec![
+            FinancialPeriod {
+                eps: Some(1.0),
+                op_cash_flow_ps: Some(0.1),
+                revenue_yoy: Some(0.0),
+                net_profit_yoy: Some(30.0),
+                gross_margin: Some(50.0),
+                ..Default::default()
+            },
+            FinancialPeriod {
+                eps: Some(1.0),
+                op_cash_flow_ps: Some(0.5),
+                gross_margin: Some(40.0),
+                ..Default::default()
+            },
+        ]);
+        values[0].valuation_history = Some(valuation(Some(50.0), 60));
+        values[0].consensus = Some(consensus(&[("买入", 3)], 3, Some(11.0), Some(12.0)));
+        values[0].industry = Some(IndustryBenchmark {
+            industry_name: "TEST_CODE_行业".to_string(),
+            board_code: "TEST_CODE_BK001".to_string(),
+            peer_count: 8,
+            stock_pe: Some(10.0),
+            median_pe: Some(20.0),
+            roe_percentile: Some(50.0),
+            ..Default::default()
+        });
+        let bars = Arc::new(values);
+
+        let result = pipeline
+            .analyze_stock(
+                "TEST_CODE_000001",
+                bars.as_slice(),
+                bars.clone(),
+                Some("TEST_CODE_宏观证据"),
+            )
+            .await
+            .expect("resolved analysis");
+
+        assert_eq!(result.name, "TEST_CODE_示例公司");
+        assert!(result.is_limit_up);
+        assert!(result
+            .money_flow_section
+            .as_deref()
+            .is_some_and(|text| text.contains("真实资金证据") && text.contains("多周期证据")));
+        assert!(result.analysis_summary.contains("真实新闻证据"));
+        assert!(result.industry_section.is_some());
+        assert!(result.quality_section.is_some());
+        assert!(result.valuation_history_section.is_some());
+        assert!(result.consensus_section.is_some());
+        assert!(result.fin_history_section.is_some());
+        let seed = result.deep_seed.expect("deep-analysis seed");
+        assert_eq!(seed.kline.len(), 40);
+        assert_eq!(seed.macro_context.as_deref(), Some("TEST_CODE_宏观证据"));
+        assert!(seed
+            .fundamental_ctx
+            .as_deref()
+            .is_some_and(|text| text.contains("多期财务趋势") && text.contains("行业横向对标")));
+    }
+
+    #[tokio::test]
+    async fn resolved_context_failures_are_explicit_and_empty_input_is_rejected() {
+        let bars = Arc::new(analysis_bars());
+        let extra_failure = test_pipeline(
+            resolved_context(Err("TEST_CODE_资金源失败".to_string()), Ok(None)),
+            false,
+        )
+        .analyze_stock("TEST_CODE_000001", bars.as_slice(), bars.clone(), None)
+        .await
+        .expect_err("extra context failure");
+        assert!(extra_failure.to_string().contains("资金源失败"));
+
+        let mtf_failure = test_pipeline(
+            resolved_context(
+                Ok(super::extra_context::ExtraContext {
+                    section: None,
+                    money_flow: None,
+                }),
+                Err("TEST_CODE_多周期源失败".to_string()),
+            ),
+            false,
+        )
+        .analyze_stock("TEST_CODE_000001", bars.as_slice(), bars.clone(), None)
+        .await
+        .expect_err("multi-timeframe failure");
+        assert!(mtf_failure.to_string().contains("多周期源失败"));
+
+        let empty = Arc::new(Vec::new());
+        let empty_failure = test_pipeline(
+            resolved_context(
+                Ok(super::extra_context::ExtraContext {
+                    section: None,
+                    money_flow: None,
+                }),
+                Ok(None),
+            ),
+            false,
+        )
+        .analyze_stock("TEST_CODE_000001", empty.as_slice(), empty.clone(), None)
+        .await
+        .expect_err("empty K-line input");
+        assert_eq!(empty_failure.to_string(), "数据为空");
+    }
+
+    #[tokio::test]
+    async fn resolved_context_preserves_absent_optional_sections() {
+        let mut context = resolved_context(
+            Ok(super::extra_context::ExtraContext {
+                section: None,
+                money_flow: None,
+            }),
+            Ok(None),
+        );
+        context.news_context = None;
+        let pipeline = test_pipeline(context, false);
+        let bars = Arc::new(analysis_bars());
+        let result = pipeline
+            .analyze_stock("TEST_CODE_000001", bars.as_slice(), bars.clone(), None)
+            .await
+            .expect("analysis without optional evidence");
+
+        assert!(!result.is_limit_up);
+        assert_eq!(result.money_flow_section, None);
+        assert_eq!(result.industry_section, None);
+        assert_eq!(result.quality_section, None);
+        assert_eq!(result.valuation_history_section, None);
+        assert_eq!(result.consensus_section, None);
+        assert_eq!(result.fin_history_section, None);
+        let seed = result.deep_seed.expect("deep-analysis seed");
+        assert_eq!(seed.news_context, None);
+        assert_eq!(seed.macro_context, None);
+        assert_eq!(seed.fundamental_ctx, None);
+    }
+
+    #[tokio::test]
+    async fn process_stock_uses_isolated_fetched_batch_and_covers_failure_gates() {
+        let context = resolved_context(
+            Ok(super::extra_context::ExtraContext {
+                section: None,
+                money_flow: None,
+            }),
+            Ok(None),
+        );
+        let mut pipeline = test_pipeline(context.clone(), false);
+        pipeline.test_fetched_data = Some(Ok(analysis_bars()));
+        pipeline.config.single_notify = true;
+        pipeline.config.send_notification = true;
+        let result = pipeline
+            .process_stock("TEST_CODE_000001".to_string(), Arc::from(""))
+            .await
+            .expect("isolated process result");
+        assert_eq!(result.code, "TEST_CODE_000001");
+
+        let mut fetch_failure = test_pipeline(context.clone(), false);
+        fetch_failure.test_fetched_data = Some(Err("TEST_CODE_日线源失败".to_string()));
+        assert!(fetch_failure
+            .process_stock_inner("TEST_CODE_000001".to_string(), Arc::from("macro"))
+            .await
+            .is_none());
+
+        let mut empty = test_pipeline(context.clone(), false);
+        empty.test_fetched_data = Some(Ok(Vec::new()));
+        assert!(empty
+            .process_stock_inner("TEST_CODE_000001".to_string(), Arc::from("macro"))
+            .await
+            .is_none());
+
+        let mut dry_run = test_pipeline(context.clone(), false);
+        dry_run.test_fetched_data = Some(Ok(analysis_bars()));
+        dry_run.config.dry_run = true;
+        assert!(dry_run
+            .process_stock_inner("TEST_CODE_000001".to_string(), Arc::from("macro"))
+            .await
+            .is_none());
+
+        let mut analysis_failure = test_pipeline(
+            resolved_context(Err("TEST_CODE_上下文失败".to_string()), Ok(None)),
+            false,
+        );
+        analysis_failure.test_fetched_data = Some(Ok(analysis_bars()));
+        assert!(analysis_failure
+            .process_stock("TEST_CODE_000001".to_string(), Arc::from("macro"))
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn resolved_context_keeps_veto_dry_run_non_mutating() {
+        let mut context = resolved_context(
+            Ok(super::extra_context::ExtraContext {
+                section: None,
+                money_flow: None,
+            }),
+            Ok(None),
+        );
+        context.news_context = None;
+        let pipeline = test_pipeline(context, false);
+        let mut values = analysis_bars();
+        for (index, bar) in values.iter_mut().enumerate() {
+            let close = 20.0 * 0.985_f64.powi(index as i32);
+            bar.open = close;
+            bar.high = close + 0.2;
+            bar.low = close - 0.2;
+            bar.close = close;
+            bar.pct_chg = 1.5;
+        }
+        values[0].pe_ratio = Some(500.0);
+        values[0].net_profit_yoy = Some(-35.0);
+        let bars = Arc::new(values);
+
+        let result = pipeline
+            .analyze_stock("TEST_CODE_000001", bars.as_slice(), bars.clone(), None)
+            .await
+            .expect("analysis with complete veto evidence");
+
+        assert_eq!(crate::config::get_veto_config().mode, "dry_run");
+        assert_eq!(result.sentiment_score, 60);
+        let seed = result.deep_seed.expect("deep-analysis seed");
+        assert!(!seed
+            .trend_snapshot
+            .risk_factors
+            .iter()
+            .any(|flag| flag.contains("基本面极度恶化")));
     }
 }

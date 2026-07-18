@@ -153,6 +153,10 @@ Phase 12 (Gate D coverage and live-account release closure)
 | Task-6 renderer/fundamental RED suite could not import six planned pure seams | 1 | Expected TDD compile failure; extract the existing BR-121 scoring and Markdown branches verbatim, route production through them, then run the full module suite. |
 | Task-6 staging stopped because repository ignore rules match tracked `docs/` paths | 1 | Re-stage the exact reviewed documentation paths with `git add -f`; do not broaden the force-add target or include private evidence. |
 | Combined Task-6 stage/commit/push command hit the managed read-only `.git/index.lock` boundary | 1 | Run the already approved Git operations as separate exact commands so each receives the repository-write permission; retain the reviewed index/worktree state. |
+| Task-7 RED test found the resolved-context seam absent and `AnalysisPipeline` not imported into the nested test module | 1 | Expected missing-seam failure plus a test-scope import oversight; add the explicit import while implementing the cfg(test)-only isolated context path. |
+| Task-7 process RED test found the isolated fetched-batch field absent at every intended call site | 1 | Expected TDD failure; add the cfg(test)-only fetch result field and make `process_stock_inner` prefer it only in test builds while production still calls `fetch_and_save_data`. |
+| First Task-7 live-veto fixture ended at score 55 before VetoChain and therefore did not expose a buy signal/risk flag | 1 | Strengthen the still-valid adjacent-price fixture into a sustained uptrend so the registered live fundamental veto, not the baseline trend score, performs the hold downgrade. |
+| Strengthened Veto fixture produced score 60 because the loaded test/default monitor config is `dry_run`, not `live` | 1 | Characterize the actual safe default: assert dry-run mode evaluates bad evidence without mutating score or propagating live risk flags; live rule effects remain covered in `veto_rules_live` unit tests. |
 ## Follow-up review slice (2026-07-18)
 
 - [x] Add RED test for `:memory:` journal-mode failure.

@@ -256,6 +256,21 @@ pub struct AnalysisPipeline {
     config: PipelineConfig,
     /// 当日涨停股票代码集合
     limit_up_codes: Arc<std::collections::HashSet<String>>,
+    /// Test/live isolation (2.5): deterministic validated context exists only in test builds.
+    #[cfg(test)]
+    test_resolved_context: Option<TestResolvedAnalysisContext>,
+    /// Test/live isolation (2.5): injected K-lines never exist in production builds.
+    #[cfg(test)]
+    test_fetched_data: Option<std::result::Result<Vec<crate::data_provider::KlineData>, String>>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestResolvedAnalysisContext {
+    stock_name: String,
+    news_context: Option<String>,
+    extra: std::result::Result<extra_context::ExtraContext, String>,
+    mtf_section: std::result::Result<Option<String>, String>,
 }
 
 /// 评分 → 操作建议（系统与 AI 共用同一档位表，避免两套标准）
@@ -347,6 +362,10 @@ impl AnalysisPipeline {
             notifier,
             config,
             limit_up_codes: Arc::new(std::collections::HashSet::new()),
+            #[cfg(test)]
+            test_resolved_context: None,
+            #[cfg(test)]
+            test_fetched_data: None,
         })
     }
 
