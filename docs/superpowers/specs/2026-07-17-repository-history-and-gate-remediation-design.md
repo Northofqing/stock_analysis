@@ -560,3 +560,11 @@ Failure handling:
 - 缺失与坏值：指数或已存在个股涨跌非有限、绝对值超过 20% 时整批报错；缺失个股不进入分母也不补 0。`result_types` 的窄投影把没有来源证据的现价、涨跌幅、K线条数、均线排列、否决证据和评分保留为 `None`；空通知章节被过滤，但不得生成占位章节。
 - 测试 seam：传入确定性指数涨跌闭包与本地 `AnalysisResult`，覆盖来源错误/空批、缺失门、坏值、三态、每个豁免分支和渲染顺序；窄投影通过 Serde 构造的 `TEST_CODE_` 结果覆盖完整与缺失事实，不调用外网。
 - 回滚：整体回退 BR-122 代码与测试；不得恢复指数失败静默跳过或任何缺失字段补 0/空串/空数组。
+
+## Addendum: BR-123 持仓产业链缺失与 upsert 语义（2026-07-18）
+
+- 根因：`stock_position.chain_name` 的旧 SQLite 列定义带 `DEFAULT '其他'`；Diesel `Insertable` 默认把 `Option::None` 解释为使用列默认值。因此 upsert 的 `excluded.chain_name` 变成“其他”，现有 `COALESCE` 无法识别缺失并覆盖了此前已确认的产业链。
+- 数据合同：`NewStockPosition.chain_name=None` 必须显式绑定 SQL `NULL`。首次保存缺失产业链时数据库保留 `NULL`；同键 upsert 缺失时保留旧明确值，只有非空且不等于“其他”的新证据才更新。历史空串/“其他”仅表示旧缺失哨兵，初始化时幂等归一为 `NULL`；静态 registry 未命中不得制造分类。
+- 失败模式：测试环境继续拒绝真实代码；产业链缺失阻断 BR-085 建仓，不得按“其他”或零集中度继续。数据库写入、归一或回填失败均传播，禁止仅记录日志后宣称完成。
+- 测试 seam：使用唯一 `TEST_CODE_` 与真实测试 SQLite 执行首次保存、缺失 upsert、显式证据保留、历史 ST/产业链回填和 close round trip；不调用行情网络、不写真实账户数据库。
+- 旧模块与回滚：保留 `DatabaseManager`、`NewStockPosition`、静态 registry 和现有表；不新增第二套仓储。整体 `git revert` 本批并恢复数据库备份；不得只恢复“其他”默认填充而继续声称满足 2.2。

@@ -616,11 +616,17 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
         )
         .execute(&mut *conn)?;
 
-        // v12 PR3-3.6 (BR-015 偿还): stock_position 加 chain_name 列
+        // BR-123: stock_position.chain_name 缺失值必须保留为 NULL。
         // 旧库可能没有, 用 add_column_if_missing 包一层 (SQLite 1.06 无 ADD COLUMN IF NOT EXISTS)
-        Self::add_column_if_missing(conn, "stock_position", "chain_name", "TEXT DEFAULT '其他'")?;
+        Self::add_column_if_missing(conn, "stock_position", "chain_name", "TEXT")?;
+        diesel::sql_query(
+            "UPDATE stock_position SET chain_name = NULL
+             WHERE chain_name IS NOT NULL
+               AND (trim(chain_name) = '' OR chain_name = '其他')",
+        )
+        .execute(&mut *conn)?;
         diesel::sql_query("CREATE INDEX IF NOT EXISTS idx_stock_position_chain_name ON stock_position(chain_name)")
-            .execute(&mut *conn).ok();
+            .execute(&mut *conn)?;
 
         // v14.1 F7: stock_position 加 st_type 列 (TEXT: 'ST' / '*ST' / NULL)
         // T-16 ST 涨跌幅变更 dispatcher 数据源. 由 --backfill-st-type 从 name 字段回填,
