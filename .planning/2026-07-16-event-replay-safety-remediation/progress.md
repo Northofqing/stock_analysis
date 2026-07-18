@@ -194,3 +194,4 @@
 - Isolated smoke used `DATABASE_PATH=/private/tmp/stock_analysis_release_smoke_20260718_final.db`, `STOCK_ENV_MODE=test`, `STOCK_LIST=TEST_CODE_000001` and `V10_DRY_RUN_PUSH=1`. It exited 2 on missing required 2026-07-18 ledger NAV before strict review dispatch; no real order or real push occurred.
 - Refreshed coverage report: global 42895/84187 = 50.95% < 80%; core 11802/21298 = 55.41% < 95% across 94 files.
 - Gate D remains blocked by the measured coverage deficit, unavailable real-account current-day cash/position/NAV validation, and missing auditor sign-off. Final status remains **In Progress / Blocked**; the deliverable must stay a draft PR.
+- Scoped implementation commit `e7db307` was pushed on `codex/repository-safety-closure-20260718`; Draft PR #2: https://github.com/Northofqing/stock_analysis/pull/2. User-owned changes in `.gitignore`, `.superpowers/sdd/progress.md`, `src/app/context.rs`, and `src/broker/ib.rs` remain unstaged and outside the PR.

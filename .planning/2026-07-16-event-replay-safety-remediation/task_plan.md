@@ -76,8 +76,8 @@ Phase 10 (final independent re-review and draft PR; Gate D remains blocked)
 - [x] Run parallel Standards and Spec review against the fixed point
 - [x] Fix first-round review findings and rerun Gate B/C
 - [x] Complete final independent Standards/Spec/Audit re-review
-- [ ] Commit only scoped files/evidence and publish a draft PR
-- **Status:** in progress; Gate B/C and independent reviews pass, Gate D coverage and real-account evidence remain blocked
+- [x] Commit only scoped files/evidence and publish draft PR #2
+- **Status:** delivery complete; Gate B/C and independent reviews pass, Gate D coverage and real-account evidence remain blocked
 
 ## Decisions
 
