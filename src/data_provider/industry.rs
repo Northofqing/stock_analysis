@@ -42,6 +42,15 @@ pub struct IndustryBenchmark {
     pub growth_percentile: Option<f64>,
 }
 
+#[derive(Debug, Clone)]
+struct IndustryConstituent {
+    code: String,
+    pe: Option<f64>,
+    pb: Option<f64>,
+    roe: Option<f64>,
+    growth: Option<f64>,
+}
+
 fn secid_for(code: &str) -> String {
     let market = if code.starts_with('6') || code.starts_with("900") {
         1
@@ -71,6 +80,85 @@ async fn try_get(client: &reqwest::Client, path: &str) -> Result<Value> {
     Err(last_err.unwrap_or_else(|| anyhow!("all hosts failed")))
 }
 
+fn required_nonempty_text(row: &Value, field: &str) -> Result<String> {
+    row.get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("行业字段 {field} 缺失、类型非法或为空"))
+}
+
+fn optional_finite_number(row: &Value, field: &str) -> Result<Option<f64>> {
+    let Some(value) = row.get(field) else {
+        return Ok(None);
+    };
+    match value {
+        Value::Null => Ok(None),
+        Value::Number(number) => number
+            .as_f64()
+            .filter(|number| number.is_finite())
+            .map(Some)
+            .ok_or_else(|| anyhow!("行业字段 {field} 不是有限数字: {value}")),
+        Value::String(text) if text.trim().is_empty() => Ok(None),
+        Value::String(text) => text
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|number| number.is_finite())
+            .map(Some)
+            .ok_or_else(|| anyhow!("行业字段 {field} 非法: {text:?}")),
+        _ => Err(anyhow!("行业字段 {field} 类型非法: {value}")),
+    }
+}
+
+/// BR-120: parse one complete industry-name mapping page without row skipping.
+fn parse_industry_map_page(value: &Value) -> Result<HashMap<String, String>> {
+    let rows = value
+        .pointer("/data/diff")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("行业列表缺少 data.diff 数组"))?;
+    let mut page = HashMap::with_capacity(rows.len());
+    for (index, row) in rows.iter().enumerate() {
+        let code = required_nonempty_text(row, "f12")
+            .with_context(|| format!("行业列表第 {} 行", index + 1))?;
+        let name = required_nonempty_text(row, "f14")
+            .with_context(|| format!("行业列表第 {} 行", index + 1))?;
+        if let Some(previous) = page.insert(name.clone(), code.clone()) {
+            return Err(anyhow!(
+                "行业列表第 {} 行名称重复: {name} -> {previous}/{code}",
+                index + 1
+            ));
+        }
+    }
+    Ok(page)
+}
+
+/// BR-120: parse one complete constituent page with explicit missing values.
+fn parse_constituents_page(value: &Value) -> Result<Vec<IndustryConstituent>> {
+    let rows = value
+        .pointer("/data/diff")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("行业成份缺少 data.diff 数组"))?;
+    let mut seen = std::collections::HashSet::with_capacity(rows.len());
+    let mut parsed = Vec::with_capacity(rows.len());
+    for (index, row) in rows.iter().enumerate() {
+        let code = required_nonempty_text(row, "f12")
+            .with_context(|| format!("行业成份第 {} 行", index + 1))?;
+        if !seen.insert(code.clone()) {
+            return Err(anyhow!("行业成份代码重复: {code}"));
+        }
+        parsed.push(IndustryConstituent {
+            code,
+            pe: optional_finite_number(row, "f9")?,
+            pb: optional_finite_number(row, "f23")?,
+            roe: optional_finite_number(row, "f37")?,
+            growth: optional_finite_number(row, "f129")?,
+        });
+    }
+    Ok(parsed)
+}
+
 /// 进程内缓存的 `行业名 -> BK代码` 映射
 static INDUSTRY_MAP: OnceLock<Mutex<Option<HashMap<String, String>>>> = OnceLock::new();
 
@@ -82,22 +170,17 @@ async fn load_industry_map(client: &reqwest::Client) -> Result<HashMap<String, S
             pn
         );
         let v = try_get(client, &path).await?;
-        let rows = v
-            .pointer("/data/diff")
-            .and_then(|x| x.as_array())
-            .cloned()
-            .unwrap_or_default();
-        if rows.is_empty() {
+        let page = parse_industry_map_page(&v)?;
+        if page.is_empty() {
             break;
         }
-        for r in &rows {
-            let code = r.get("f12").and_then(|x| x.as_str()).unwrap_or("");
-            let name = r.get("f14").and_then(|x| x.as_str()).unwrap_or("");
-            if !code.is_empty() && !name.is_empty() {
-                out.insert(name.to_string(), code.to_string());
+        let page_len = page.len();
+        for (name, code) in page {
+            if let Some(previous) = out.insert(name.clone(), code.clone()) {
+                return Err(anyhow!("行业列表跨页名称重复: {name} -> {previous}/{code}"));
             }
         }
-        if rows.len() < 100 {
+        if page_len < 100 {
             break;
         }
     }
@@ -166,34 +249,77 @@ fn percentile_low(target: f64, peers: &[f64]) -> Option<f64> {
 async fn fetch_constituents(
     client: &reqwest::Client,
     bk_code: &str,
-) -> Result<Vec<(String, f64, f64, f64, f64)>> {
-    // 返回 (code, pe, pb, roe, growth)
+) -> Result<Vec<IndustryConstituent>> {
     let path = format!(
         "/api/qt/clist/get?pn=1&pz=200&po=1&np=1&fltt=2&invt=2&fid=f3&fs=b:{}&fields=f12,f9,f23,f37,f129",
         bk_code
     );
     let v = try_get(client, &path).await?;
-    let rows = v
-        .pointer("/data/diff")
-        .and_then(|x| x.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let mut out = Vec::with_capacity(rows.len());
-    for r in rows {
-        let code = r
-            .get("f12")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string();
-        let pe = r.get("f9").and_then(|x| x.as_f64()).unwrap_or(f64::NAN);
-        let pb = r.get("f23").and_then(|x| x.as_f64()).unwrap_or(f64::NAN);
-        let roe = r.get("f37").and_then(|x| x.as_f64()).unwrap_or(f64::NAN);
-        let growth = r.get("f129").and_then(|x| x.as_f64()).unwrap_or(f64::NAN);
-        if !code.is_empty() {
-            out.push((code, pe, pb, roe, growth));
+    parse_constituents_page(&v)
+}
+
+fn build_industry_benchmark(
+    industry_name: String,
+    board_code: String,
+    code: &str,
+    rows: &[IndustryConstituent],
+) -> Result<IndustryBenchmark> {
+    if rows.is_empty() {
+        return Err(anyhow!("行业 {board_code} 无成份股"));
+    }
+
+    let mut stock_pe = None;
+    let mut stock_pb = None;
+    let mut stock_roe = None;
+    let mut stock_growth = None;
+    let mut pes = Vec::new();
+    let mut pbs = Vec::new();
+    let mut roes = Vec::new();
+    let mut growths = Vec::new();
+
+    for row in rows {
+        if let Some(value) = row.pe.filter(|value| *value > 0.0) {
+            pes.push(value);
+        }
+        if let Some(value) = row.pb.filter(|value| *value > 0.0) {
+            pbs.push(value);
+        }
+        if let Some(value) = row.roe {
+            roes.push(value);
+        }
+        if let Some(value) = row.growth {
+            growths.push(value);
+        }
+        if row.code == code {
+            stock_pe = row.pe.filter(|value| *value > 0.0);
+            stock_pb = row.pb.filter(|value| *value > 0.0);
+            stock_roe = row.roe;
+            stock_growth = row.growth;
         }
     }
-    Ok(out)
+
+    let pe_percentile = stock_pe.and_then(|value| percentile_low(value, &pes));
+    let pb_percentile = stock_pb.and_then(|value| percentile_low(value, &pbs));
+    let roe_percentile = stock_roe.and_then(|value| percentile_low(value, &roes));
+    let growth_percentile = stock_growth.and_then(|value| percentile_low(value, &growths));
+
+    Ok(IndustryBenchmark {
+        industry_name,
+        board_code,
+        peer_count: rows.len(),
+        stock_pe,
+        stock_pb,
+        stock_roe,
+        stock_growth,
+        median_pe: median(&pes),
+        median_pb: median(&pbs),
+        median_roe: median(&roes),
+        median_growth: median(&growths),
+        pe_percentile,
+        pb_percentile,
+        roe_percentile,
+        growth_percentile,
+    })
 }
 
 pub async fn fetch_async(client: &reqwest::Client, code: &str) -> Result<IndustryBenchmark> {
@@ -209,72 +335,7 @@ pub async fn fetch_async(client: &reqwest::Client, code: &str) -> Result<Industr
     let rows = fetch_constituents(client, &bk_code)
         .await
         .context("取成份股")?;
-    if rows.is_empty() {
-        return Err(anyhow!("行业 {} 无成份股", bk_code));
-    }
-
-    let mut stock_pe = None;
-    let mut stock_pb = None;
-    let mut stock_roe = None;
-    let mut stock_growth = None;
-    let mut pes = Vec::new();
-    let mut pbs = Vec::new();
-    let mut roes = Vec::new();
-    let mut growths = Vec::new();
-
-    for (c, pe, pb, roe, gr) in &rows {
-        // PE 排除负值（亏损股不参与估值排名）
-        if pe.is_finite() && *pe > 0.0 {
-            pes.push(*pe);
-        }
-        if pb.is_finite() && *pb > 0.0 {
-            pbs.push(*pb);
-        }
-        if roe.is_finite() {
-            roes.push(*roe);
-        }
-        if gr.is_finite() {
-            growths.push(*gr);
-        }
-        if c == code {
-            if pe.is_finite() && *pe > 0.0 {
-                stock_pe = Some(*pe);
-            }
-            if pb.is_finite() && *pb > 0.0 {
-                stock_pb = Some(*pb);
-            }
-            if roe.is_finite() {
-                stock_roe = Some(*roe);
-            }
-            if gr.is_finite() {
-                stock_growth = Some(*gr);
-            }
-        }
-    }
-
-    let pe_percentile = stock_pe.and_then(|x| percentile_low(x, &pes));
-    let pb_percentile = stock_pb.and_then(|x| percentile_low(x, &pbs));
-    // ROE/增速 用"高于多少同业"的百分位
-    let roe_percentile = stock_roe.and_then(|x| percentile_low(x, &roes));
-    let growth_percentile = stock_growth.and_then(|x| percentile_low(x, &growths));
-
-    Ok(IndustryBenchmark {
-        industry_name,
-        board_code: bk_code,
-        peer_count: rows.len(),
-        stock_pe,
-        stock_pb,
-        stock_roe,
-        stock_growth,
-        median_pe: median(&pes),
-        median_pb: median(&pbs),
-        median_roe: median(&roes),
-        median_growth: median(&growths),
-        pe_percentile,
-        pb_percentile,
-        roe_percentile,
-        growth_percentile,
-    })
+    build_industry_benchmark(industry_name, bk_code, code, &rows)
 }
 
 /// 同步包装：在已有 tokio runtime 上下文内调用
@@ -330,5 +391,106 @@ mod tests {
     fn blocking_wrapper_without_runtime_returns_missing_instead_of_fake_data() {
         let client = reqwest::Client::new();
         assert!(fetch_blocking(&client, "TEST_CODE_000001").is_none());
+    }
+
+    #[test]
+    fn industry_map_page_requires_complete_nonconflicting_rows() {
+        let page = serde_json::json!({"data": {"diff": [
+            {"f12": "BK0001", "f14": "测试行业"},
+            {"f12": "BK0002", "f14": "第二行业"}
+        ]}});
+        let map = parse_industry_map_page(&page).expect("complete map page");
+        assert_eq!(map.get("测试行业").map(String::as_str), Some("BK0001"));
+
+        assert!(parse_industry_map_page(&serde_json::json!({})).is_err());
+        assert!(
+            parse_industry_map_page(&serde_json::json!({"data": {"diff": [
+                {"f12": 1, "f14": "测试行业"}
+            ]}}))
+            .is_err()
+        );
+        assert!(
+            parse_industry_map_page(&serde_json::json!({"data": {"diff": [
+                {"f12": "BK0001", "f14": "测试行业"},
+                {"f12": "BK9999", "f14": "测试行业"}
+            ]}}))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn constituent_page_preserves_missing_values_and_rejects_bad_or_duplicate_rows() {
+        let page = serde_json::json!({"data": {"diff": [
+            {"f12": "TEST_CODE_000001", "f9": 10.0, "f23": "2.0", "f37": 12.0, "f129": -5.0},
+            {"f12": "TEST_CODE_000002", "f9": null, "f23": "", "f37": 8.0, "f129": 10.0}
+        ]}});
+        let rows = parse_constituents_page(&page).expect("complete constituents");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].pe, Some(10.0));
+        assert_eq!(rows[0].pb, Some(2.0));
+        assert_eq!(rows[1].pe, None);
+        assert_eq!(rows[1].pb, None);
+
+        let malformed = serde_json::json!({"data": {"diff": [
+            {"f12": "TEST_CODE_000001", "f9": "bad"}
+        ]}});
+        assert!(parse_constituents_page(&malformed).is_err());
+
+        let duplicate = serde_json::json!({"data": {"diff": [
+            {"f12": "TEST_CODE_000001"}, {"f12": "TEST_CODE_000001"}
+        ]}});
+        assert!(parse_constituents_page(&duplicate).is_err());
+    }
+
+    #[test]
+    fn benchmark_uses_only_eligible_real_peer_values() {
+        let rows = vec![
+            IndustryConstituent {
+                code: "TEST_CODE_000001".into(),
+                pe: Some(10.0),
+                pb: Some(2.0),
+                roe: Some(12.0),
+                growth: Some(20.0),
+            },
+            IndustryConstituent {
+                code: "TEST_CODE_000002".into(),
+                pe: Some(20.0),
+                pb: Some(3.0),
+                roe: Some(8.0),
+                growth: Some(-10.0),
+            },
+            IndustryConstituent {
+                code: "TEST_CODE_000003".into(),
+                pe: Some(-5.0),
+                pb: None,
+                roe: Some(16.0),
+                growth: None,
+            },
+        ];
+
+        let benchmark = build_industry_benchmark(
+            "测试行业".into(),
+            "BK0001".into(),
+            "TEST_CODE_000001",
+            &rows,
+        )
+        .expect("valid benchmark");
+
+        assert_eq!(benchmark.peer_count, 3);
+        assert_eq!(benchmark.stock_pe, Some(10.0));
+        assert_eq!(benchmark.median_pe, Some(15.0));
+        assert_eq!(benchmark.median_pb, Some(2.5));
+        assert_eq!(benchmark.median_roe, Some(12.0));
+        assert_eq!(benchmark.median_growth, Some(5.0));
+        assert_eq!(benchmark.pe_percentile, Some(0.0));
+        assert!((benchmark.roe_percentile.expect("ROE percentile") - 100.0 / 3.0).abs() < 1e-12);
+
+        assert!(build_industry_benchmark(
+            "测试行业".into(),
+            "BK0001".into(),
+            "TEST_CODE_000001",
+            &[]
+        )
+        .is_err());
     }
 }

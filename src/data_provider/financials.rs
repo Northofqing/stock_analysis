@@ -322,6 +322,87 @@ fn parse_f10_period(item: &Value) -> Result<FinancialPeriod> {
     Ok(period)
 }
 
+/// BR-115: validate the complete F10 response before retaining the newest 20 periods.
+fn parse_f10_response(json: &Value) -> Result<Financials> {
+    let data = json
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("EM-F10 无 data 数组"))?;
+    if data.is_empty() {
+        return Err(anyhow!("EM-F10 data 为空"));
+    }
+
+    let mut parsed = data
+        .iter()
+        .map(parse_f10_period)
+        .collect::<Result<Vec<_>>>()?;
+    for pair in parsed.windows(2) {
+        let newer = pair[0]
+            .report_date
+            .as_deref()
+            .ok_or_else(|| anyhow!("EM-F10 新报告期缺失"))?;
+        let older = pair[1]
+            .report_date
+            .as_deref()
+            .ok_or_else(|| anyhow!("EM-F10 旧报告期缺失"))?;
+        if newer <= older {
+            return Err(anyhow!("EM-F10 报告期重复或非降序: {newer} -> {older}"));
+        }
+    }
+    parsed.truncate(20);
+    let latest = parsed
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow!("EM-F10 最新报告期缺失"))?;
+    Ok(Financials {
+        report_date: latest.report_date.clone(),
+        eps: latest.eps,
+        roe: latest.roe,
+        revenue_yoy: latest.revenue_yoy,
+        net_profit_yoy: latest.net_profit_yoy,
+        gross_margin: latest.gross_margin,
+        net_margin: latest.net_margin,
+        source: Some("东方财富F10"),
+        history: parsed,
+    })
+}
+
+/// BR-115: validate the complete datacenter response and its real latest period.
+fn parse_datacenter_response(json: &Value) -> Result<Financials> {
+    let data = json
+        .get("result")
+        .and_then(|result| result.get("data"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("EM-DC 无 result.data 数组"))?;
+    let latest = data.first().ok_or_else(|| anyhow!("EM-DC data 为空"))?;
+    let period = FinancialPeriod {
+        report_date: Some(required_report_date(latest, &["REPORTDATE"])?),
+        eps: pick_f64(latest, &["BASIC_EPS"])?,
+        roe: pick_f64(latest, &["WEIGHTAVG_ROE"])?,
+        revenue_yoy: pick_f64(latest, &["YSTZ"])?,
+        net_profit_yoy: pick_f64(latest, &["SJLTZ"])?,
+        gross_margin: pick_f64(latest, &["XSMLL"])?,
+        net_margin: None,
+        op_cash_flow_ps: None,
+        total_asset_turnover: None,
+        debt_to_assets: None,
+    };
+    if !period.any() {
+        return Err(anyhow!("EM-DC 最新报告期不含任何有效指标"));
+    }
+    Ok(Financials {
+        report_date: period.report_date.clone(),
+        eps: period.eps,
+        roe: period.roe,
+        revenue_yoy: period.revenue_yoy,
+        net_profit_yoy: period.net_profit_yoy,
+        gross_margin: period.gross_margin,
+        net_margin: None,
+        source: Some("东方财富DC"),
+        history: vec![period],
+    })
+}
+
 /// 主源：东方财富 F10 `ZYZBAjaxNew`（主要财务指标，字段最全）
 ///
 /// URL: https://emweb.eastmoney.com/PC_HSF10/NewFinanceAnalysis/ZYZBAjaxNew?type=0&code=SH600519
@@ -346,35 +427,7 @@ async fn fetch_from_eastmoney_f10(client: &reqwest::Client, code: &str) -> Resul
     let text = resp.text().await.context("EM-F10 读取响应失败")?;
     let json: Value = serde_json::from_str(&text).context("EM-F10 JSON 解析失败")?;
 
-    let data = json
-        .get("data")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| anyhow!("EM-F10 无 data 数组"))?;
-    if data.is_empty() {
-        return Err(anyhow!("EM-F10 data 为空"));
-    }
-
-    // 解析所有期（接口本身已按报告期从新到旧排列）；最多保留 20 期 (~5 年)
-    const MAX_PERIODS: usize = 20;
-    let history: Vec<FinancialPeriod> = data
-        .iter()
-        .take(MAX_PERIODS)
-        .map(parse_f10_period)
-        .collect::<Result<Vec<_>>>()?;
-
-    let latest_p = history.first().cloned().unwrap_or_default();
-    let f = Financials {
-        report_date: latest_p.report_date.clone(),
-        eps: latest_p.eps,
-        roe: latest_p.roe,
-        revenue_yoy: latest_p.revenue_yoy,
-        net_profit_yoy: latest_p.net_profit_yoy,
-        gross_margin: latest_p.gross_margin,
-        net_margin: latest_p.net_margin,
-        source: Some("东方财富F10"),
-        history,
-    };
-    Ok(f)
+    parse_f10_response(&json)
 }
 
 /// 备份源：东方财富 datacenter `RPT_LICO_FN_CPD`（业绩快报）
@@ -410,40 +463,7 @@ async fn fetch_from_eastmoney_datacenter(
     let text = resp.text().await.context("EM-DC 读取响应失败")?;
     let json: Value = serde_json::from_str(&text).context("EM-DC JSON 解析失败")?;
 
-    let data = json
-        .get("result")
-        .and_then(|r| r.get("data"))
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| anyhow!("EM-DC 无 result.data 数组"))?;
-    let latest = data.first().ok_or_else(|| anyhow!("EM-DC data 为空"))?;
-
-    let period = FinancialPeriod {
-        report_date: Some(required_report_date(latest, &["REPORTDATE"])?),
-        eps: pick_f64(latest, &["BASIC_EPS"])?,
-        roe: pick_f64(latest, &["WEIGHTAVG_ROE"])?,
-        revenue_yoy: pick_f64(latest, &["YSTZ"])?,
-        net_profit_yoy: pick_f64(latest, &["SJLTZ"])?,
-        gross_margin: pick_f64(latest, &["XSMLL"])?,
-        net_margin: None,
-        op_cash_flow_ps: None,
-        total_asset_turnover: None,
-        debt_to_assets: None,
-    };
-    if !period.any() {
-        return Err(anyhow!("EM-DC 最新报告期不含任何有效指标"));
-    }
-    let f = Financials {
-        report_date: period.report_date.clone(),
-        eps: period.eps,
-        roe: period.roe,
-        revenue_yoy: period.revenue_yoy,
-        net_profit_yoy: period.net_profit_yoy,
-        gross_margin: period.gross_margin,
-        net_margin: None, // 该报告不含净利率
-        source: Some("东方财富DC"),
-        history: vec![period],
-    };
-    Ok(f)
+    parse_datacenter_response(&json)
 }
 
 fn select_financial_source_results(
@@ -733,5 +753,58 @@ mod br115_tests {
     #[test]
     fn blocking_financial_fetch_requires_an_existing_runtime() {
         assert!(fetch_with_fallback_blocking(&reqwest::Client::new(), "TEST_CODE_000001").is_err());
+    }
+
+    #[test]
+    fn f10_document_parser_keeps_newest_twenty_strict_periods() {
+        let data: Vec<Value> = (0..21)
+            .map(|index| {
+                serde_json::json!({
+                    "REPORT_DATE": format!("{:04}-12-31", 2026 - index),
+                    "EPSJB": 1.0 + index as f64,
+                    "ROEJQ": 10.0
+                })
+            })
+            .collect();
+        let parsed = parse_f10_response(&serde_json::json!({"data": data}))
+            .expect("valid descending F10 response");
+        assert_eq!(parsed.source, Some("东方财富F10"));
+        assert_eq!(parsed.history.len(), 20);
+        assert_eq!(parsed.report_date.as_deref(), Some("2026-12-31"));
+        assert_eq!(parsed.eps, Some(1.0));
+
+        assert!(parse_f10_response(&serde_json::json!({})).is_err());
+        assert!(parse_f10_response(&serde_json::json!({"data": []})).is_err());
+        let wrong_order = serde_json::json!({"data": [
+            {"REPORT_DATE": "2025-12-31", "EPSJB": 1.0},
+            {"REPORT_DATE": "2026-12-31", "EPSJB": 2.0}
+        ]});
+        assert!(parse_f10_response(&wrong_order).is_err());
+    }
+
+    #[test]
+    fn datacenter_document_parser_requires_one_real_latest_period() {
+        let parsed = parse_datacenter_response(&serde_json::json!({"result": {"data": [{
+            "REPORTDATE": "2026-06-30 00:00:00",
+            "BASIC_EPS": "1.5",
+            "WEIGHTAVG_ROE": 12.0,
+            "YSTZ": 8.0,
+            "SJLTZ": 9.0,
+            "XSMLL": 30.0
+        }]}}))
+        .expect("valid datacenter response");
+        assert_eq!(parsed.source, Some("东方财富DC"));
+        assert_eq!(parsed.report_date.as_deref(), Some("2026-06-30"));
+        assert_eq!(parsed.history.len(), 1);
+        assert_eq!(parsed.net_margin, None);
+
+        assert!(parse_datacenter_response(&serde_json::json!({})).is_err());
+        assert!(parse_datacenter_response(&serde_json::json!({"result": {"data": []}})).is_err());
+        assert!(
+            parse_datacenter_response(&serde_json::json!({"result": {"data": [{
+                "REPORTDATE": "2026-06-30"
+            }]}}))
+            .is_err()
+        );
     }
 }

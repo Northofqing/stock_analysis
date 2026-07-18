@@ -146,6 +146,8 @@ Phase 12 (Gate D coverage and live-account release closure)
 | Two intraday classifier fixtures were shadowed by the higher-priority surge-and-fall rule | 1 | Move the high-open fixture below the two-point pullback boundary and make the volatile fixture close at exactly half the high; also include the expected label in failures. |
 | Financial attention-level fixture also triggered the 20-point CFO/NI sudden-drop rule | 1 | Keep the prior ratio below the rule's 0.8 threshold so the fixture isolates the intended 40-point divergence-plus-margin band. |
 | Extreme financial fixture totaled 95 because its three-period CFO/NI average was 0.4 | 1 | Add a fourth low-ratio period and set the previous ratio at the exact 0.8 sudden-drop boundary so both documented rules apply and score clamping is exercised. |
+| Industry benchmark test compared a repeating floating percentile exactly | 1 | Use a tight tolerance for 100/3 while retaining exact assertions for integer/half statistics. |
+| Financial response extraction patch used stale/whitespace-mismatched datacenter context | 3 | Split insertion and each transport replacement, inspect exact numbered lines, then apply the final block with byte-matching field punctuation. |
 ## Follow-up review slice (2026-07-18)
 
 - [x] Add RED test for `:memory:` journal-mode failure.

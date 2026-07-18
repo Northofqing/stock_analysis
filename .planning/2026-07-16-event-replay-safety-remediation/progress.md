@@ -283,3 +283,7 @@
 - Task-3 validation: strict library Clippy PASS; provider suite 128 passed / 7 explicit live-network tests ignored / 0 failed; instrumented library suite 1,404 passed / 10 ignored / 0 failed; format and diff checks PASS.
 - Task-3 coverage: chip 313/318 = 98.43%; consensus 252/284 = 88.73%; financials 450/572 = 78.67%; industry 60/259 = 23.17%; money flow 561/686 = 81.78%; valuation history 205/245 = 83.67%.
 - Intermediate library aggregate improved from 54.50%/58.09% to global 56.06% and core 62.60%. Gate D remains open; the required final report is still all-workspace, not this diagnostic.
+- Completed the fourth core-coverage slice by registering BR-120 and separating industry/financial protocol validation from real HTTP transport.
+- Industry pages now reject missing arrays, bad/empty identity fields, duplicate/conflicting names or codes, and malformed/non-finite optional metrics. Missing metrics remain explicit `None`; no `NaN` sentinel or row skipping remains in the benchmark batch.
+- F10 parsing now validates the complete response and descending report order before retaining the newest 20 periods; datacenter parsing shares a strict real-period constructor. Focused industry 7/7 and financial 11/11 tests PASS; strict library Clippy, format and diff checks PASS.
+- Task-4 instrumented library suite: 1,409 passed / 10 ignored / 0 failed. Coverage: financials 573/637 = 89.95%; industry 281/390 = 72.05%. Intermediate library aggregate is global 56.43%, core 63.56%; Gate D remains open.
