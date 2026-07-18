@@ -451,8 +451,8 @@ Failure handling:
 
 ## Addendum: SQLite 启动 WAL 顺序与锁错误闭环（2026-07-18）
 
-- 数据流：`DatabaseManager::init(path)` 先用单一 bootstrap 连接把数据库级 journal mode 切换为 WAL；该连接关闭后再创建 r2d2 pool。池中每条连接只设置 connection-local 的 `synchronous`、`busy_timeout` 与 `wal_autocheckpoint`，随后由单一池连接执行既有 migrations/schema 初始化。
-- 失败模式：bootstrap 建连、WAL 切换、池连接定制、迁移或 schema 初始化任一步失败都必须使 `init` 返回错误；不得由 r2d2 记录若干 `database is locked` 后重试成功并把初始化报告为健康。
-- 测试 seam：通过编译后的 monitor 进程对全新隔离 SQLite 路径执行 `--test --review`。缺少当日真实 ledger 仍应以 2 fail-closed，但完整输出不得包含 `database is locked`。测试不查询内部 PRAGMA，也不暴露新的调用接口。
+- 数据流：`DatabaseManager::init(path)` 先用单一 bootstrap 连接请求数据库级 journal mode 切换为 WAL，并读取 SQLite 返回的实际模式；只有返回值严格为 `wal` 才关闭 bootstrap 连接并创建 r2d2 pool。池中每条连接先设置 `busy_timeout`，再设置 connection-local 的 `synchronous` 与 `wal_autocheckpoint`，随后由单一池连接执行既有 migrations/schema 初始化。
+- 失败模式：bootstrap 建连、WAL 请求、返回模式非 WAL、池连接定制、迁移或 schema 初始化任一步失败都必须使 `init` 返回错误；monitor 启动入口记录具体错误并以 2 退出。不得由 r2d2 记录若干 `database is locked` 后重试成功，也不得因 PRAGMA SQL 执行成功就假定 WAL 已生效。
+- 测试 seam：通过编译后的 monitor 进程对全新隔离 SQLite 文件执行 `--test --review`。缺少当日真实 ledger 仍应以 2 fail-closed，但完整输出不得包含 `database is locked`。另以 SQLite `:memory:` 作为公开进程级非 WAL 反例，必须显示实际返回模式并以 2 退出。测试不调用私有 helper，也不暴露新的调用接口。
 - 旧模块关系：保留 `DatabaseManager::init`、现有 migrations、10 连接 pool 与每连接 timeout 设置；只把数据库级 WAL 切换从并发 customizer 移到串行 bootstrap。被删除的孤立 `src/broker/ib.rs` 与 `src/app/context.rs` 不参与数据库初始化。
 - 回滚：`git revert` 本批并重跑 fresh-DB 进程测试；不执行 schema down migration、不删除数据库，也不得用忽略日志或字符串过滤掩盖锁错误。

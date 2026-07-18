@@ -1,0 +1,244 @@
+path	present_workspace	present_snapshot	historical_only	tracked_snapshot	bytes	lines	sha256	content_kind	content_commit	last_touch_commit
+.planning/2026-07-16-quant-platform-assessment/findings.md	true	true	false	true	8722	65	5e091ac33ca40429a38d3d5120d8fcfef0926cb44c0c18f0aeb3232d4b27761b	text	workspace	2efa387f83543cbcd2d534e9ffd12961e35b83af
+.planning/2026-07-16-quant-platform-assessment/progress.md	true	true	false	true	3852	48	fc2aef387326db664d0f6c0d6712e9307a52edb7d0b5f6df4536178a206df059	text	workspace	2efa387f83543cbcd2d534e9ffd12961e35b83af
+.planning/2026-07-16-quant-platform-assessment/task_plan.md	true	true	false	true	4060	63	0ddac8162532cfbfd7aee3c45d9791f3d4df0095975ee9894e8da3a0d259389e	text	workspace	2efa387f83543cbcd2d534e9ffd12961e35b83af
+.superpowers/sdd/base.txt	false	false	true	false	41	1	ee69161d620566badfff391ec82412989dad0334dd0b3c8a4dcd6150d5295aef	text	56b4d3fac1eb1b1218d141fc0c7007b5f3916b58	8dc152cb413b58e755b310f9b4555895a0c8dd29
+.superpowers/sdd/final-review.md	true	true	false	true	7471	153	8e27332c4592127bee142079227b9fbf9820bb4c2f290f638217f0a9d68b4cab	text	workspace	e52fb743e313d117c6e2c32d1d7c6cde02401422
+.superpowers/sdd/progress.md	true	true	false	true	1959	46	634ecba5f5ded3962a7a0a77dbf57392da9e3e8855cfef092684513ebd7be78f	text	workspace	c1e53321b2f4fb5d1f21cc0baf7ff4ade1ffcb7b
+AGENTS.md	true	true	false	true	9381	247	a2da5eabe57cad1b3a86d4f18793f87af686fbb5018239499774f56c6eed77cc	text	workspace	a2b543ba60c3144376d426462522dcd4377e309b
+CHANGELOG.md	false	false	true	false	10125	337	900dbd44c9f61bb418e9ea5da8306d38f0333cb8e6b2a7efefb5dda54e261a6c	text	285a4c5c89946c3be755fc3781d4fb5038f14acf	c06a7dda2fa8b809516ec54ad050c3dd968bf30f
+CLAUDE.md	true	true	false	true	11092	159	b3dae7ceacd92f5aaacf35770941887385fa0bcd2b040383ba258bd57805e4b1	text	workspace	a81af2c5fca2043161c42e4e4e40b3f03fdce59a
+IMPROVEMENTS_SUMMARY.md	false	false	true	false	4573	134	ec8c2c667549398c03536e93f04ac8257e6cc2195a882e1b14518a487cc8839b	text	7cff4bc3bb3e23234bc85e4ae74d679dcc87d2ab	75cc280ea6ef5c13d0831b28ae8127dbd71cf78c
+README.md	true	true	false	true	14801	327	4d2d1b119f3b989dcdadc978c6180e968b460aae03dd0827aba7e38acf279703	text	workspace	c5ceb6bb99af13f63e2a3de2fc77a42ac8148aeb
+docs/CHANGELOG-v9.4.md	false	false	true	false	12901	317	c84a03c37fbb6022edc9e20987e246df9b601bad2906121f0dc8218f13134aa7	text	8ebc30c0a05fceec3bc062e1906ca2dd93696e98	c3ea02fd5ea845162c097e7e4d146890ce8ebcbb
+docs/EMQuantAPI_CPP_Mac.pdf	true	false	false	false	1164172		7f09f0cc85e115bb19668bd9d31a3ffd35b86488dbc34ab30a0a92d9836700ce	binary	workspace	
+docs/ENGINEERING_RULES_V2.md	true	false	false	false	5612	174	4ca7e9d679526b862011f94e3af3c2001dc2e69377cad0655493c08403e1bd85	text	workspace	
+docs/KNOWN_BUGS-2026-06-28.md	false	false	true	false	5943	148	2546b63bbcb816c72583f21182214a4d24f0b1d32d14b0fb02895b0c52fb7568	text	f8d933299393e6dba5d582e388c5f03ed13a78d4	c3ea02fd5ea845162c097e7e4d146890ce8ebcbb
+docs/README.md	true	true	false	true	4347	81	1247bee97aeacb8ff78d0022ac39ff085b2ab7f4ca89c78d8f3f41a72b5101cd	text	workspace	2efa387f83543cbcd2d534e9ffd12961e35b83af
+docs/_archive/pre-v9-history/README.md	true	false	false	false	3909	57	4487589808b79ee7f92124b049404e4bef3f85b8802131a7c78186166a694571	text	workspace	
+docs/_archive/pre-v9-history/architecture-overview-2026-06-16.md	true	false	false	false	13947	286	aabf7026d0795bc1d6f398fb7d43b67d1707728efde59fb356f8c5b8dfb3720c	text	workspace	
+docs/_archive/pre-v9-history/architecture-v2-2026-06-15.md	true	false	false	false	10899	266	9423ae7fc0a327353ca5867282412c26cc377a79674705a8355206f9a26c86f3	text	workspace	
+docs/_archive/pre-v9-history/architecture-v3-2026-06-15.md	true	false	false	false	18583	451	d70ed967a5697a3cbdab3f6a177978c73df06776d23ad676103f17567a4c2caa	text	workspace	
+docs/_archive/pre-v9-history/architecture-v4-2026-06-16.md	true	false	false	false	13824	384	943c28fffecb1cf70ac200f3b73e7b04eb835c2bdbe2f10d8df967afb66248db	text	workspace	
+docs/_archive/pre-v9-history/architecture-v5-2026-06-16.md	true	false	false	false	7415	223	1154b079ddefb64291ff9131a03ae6a647e0b32be218d4c1fb997e0fedcdee05	text	workspace	
+docs/_archive/pre-v9-history/architecture-v5.1-2026-06-16.md	true	false	false	false	5101	123	19eead0848732ce49f659d2dd4f24281186e06ce212930d1eb080decdc5bff79	text	workspace	
+docs/_archive/pre-v9-history/architecture-v6-2026-06-16.md	true	false	false	false	7928	192	19fd64c713e0735fd87eb1e071da2aca04711969a6c9fff63235a92ff7174ae0	text	workspace	
+docs/_archive/pre-v9-history/architecture-v7-2026-06-16.md	true	false	false	false	11708	183	a4822ebfd3401c4a81091e573aeaadf25b33d6870dc437b0c30379609e6bc8ef	text	workspace	
+docs/_archive/pre-v9-history/plans-README.md	true	false	false	false	1281	28	fa003956c47f0b63c758c80bb981429dc14163379bd61f283b7b5a5bfa98adc6	text	workspace	
+docs/_archive/pre-v9-history/v3-project-plan-2026-06-15.md	true	false	false	false	14076	357	9e231d6a77830226279478567ca652540d3fa5b50d0f28da4be503d40650e12c	text	workspace	
+docs/_archive/pre-v9-history/v4-project-plan-2026-06-16.md	true	false	false	false	3603	108	06f4ebfe6db9532d82f734d461169a486bb65f00c067e60f2d42ac9ad61b7cd0	text	workspace	
+docs/_archive/pre-v9-history/v5-project-plan-2026-06-16.md	true	false	false	false	3914	89	1feadc2e58df3872861b903d0c713941b87a3f07a688d2a9b4a668e6539167a6	text	workspace	
+docs/_archive/pre-v9-history/v6-project-plan-2026-06-16.md	true	false	false	false	2921	77	134abaf4223af62d88d9b0699e9daf6f6ee3c27fb2ee62700d265424c8dfbb6d	text	workspace	
+docs/analysis-2026-06-29-project-audit.md	false	false	true	false	22046	464	74ec218572b660e1af63b31dd627c6ea44b5d45e4bfe0d221478a0ce060878bd	text	f8d933299393e6dba5d582e388c5f03ed13a78d4	8452196167b5242c889335b9948c514f2ab5b559
+docs/architecture/v12-e2e-real-push-2026-07-05.md	false	false	true	false	7210	165	de65e70e7fd607219a23219b5c3d452e4ad6097e785905221b4242ce80eaf79d	text	a069eb305b110e9345fde82012166f3b730189b1	64dcc03e408e97faf9edbb5cc305a105035b11cd
+docs/architecture/v12-monitor-test-2026-07-05.md	false	false	true	false	9769	222	415fc2871eb02eaa3c0b37ae532e44bd6979ae8f7c813edbfb03c2541989c5cb	text	6b7db41b08fbe35b9a498cddb962369d7adeb46e	64dcc03e408e97faf9edbb5cc305a105035b11cd
+docs/architecture/v12-mvp-progress.md	false	false	true	false	8654	176	44bc544d248b0170d653cb4e2899aea9c9a2d342fb9e9bced6dda6c6dff936f4	text	de60016dc8d0cd56b430ab12b81de8e594b7a827	64dcc03e408e97faf9edbb5cc305a105035b11cd
+docs/architecture/v12-mvp0-acceptance-2026-07-05.md	false	false	true	false	7024	180	6e4c52499445999f2f303794bb12f82a4129ea6c9c4aab703c78a887db9cc528	text	26a2d8b46499c7d896a19f4ea66957478ba11db9	64dcc03e408e97faf9edbb5cc305a105035b11cd
+docs/architecture/v12-push-uncertainty-notes.md	false	false	true	false	10724	107	cfda0e174d5cba4ee7822e0192fbd4edfa4fbd0047bdb5aebdc95eb623957cae	text	ad85cb3b7adeeec2461656b3113fb60e418ac8a3	64dcc03e408e97faf9edbb5cc305a105035b11cd
+docs/architecture_p0_risk_unification.md	false	false	true	false	24923	560	2e2b41246b448deb0d134bd990d3dab4a1dc0ed68d61100fc453405be51939c0	text	e25f902f903843f10dc2781d290d2ac9ebfa9204	5b790899eb9e750a4c9f03c856a02138218b5b39
+docs/business_rules.md	true	true	false	true	19418	110	2d8742c9e3215906ddce76948c3452ce316c20e7e5e917ad5783a7c842b4c4ce	text	workspace	2efa387f83543cbcd2d534e9ffd12961e35b83af
+docs/code_review_p0_risk_unification.md	false	false	true	false	3074	73	917da71ce00ad606e1b6f09706e459580fad5a71835202fec2fc28d770094c81	text	e25f902f903843f10dc2781d290d2ac9ebfa9204	5b790899eb9e750a4c9f03c856a02138218b5b39
+docs/crontab.example	true	true	false	true	3758	116	39f7b85dc388942aa27b1cfb24b1e7d58e89d9ad7a729074d1876495c813f9c5	text	workspace	1f81e87fcfcb24b29831356e1297af8e69fdf3bd
+docs/emquant-api-integration-plan-调研-2026-06-05.md	true	false	false	false	15788	272	8bfff56c30d571e0dac20b223369ee2e807a68ff02cae42e9552ce2229225b32	text	workspace	
+docs/monitor-runs/2026-06-30/sandbox-blocked.log	false	false	true	false	20679	543	39222499e282b5eca859cdc2cde5512e166b82ca3cd68e513e5095e5ae785cab	text	998ae16ceb2f3d61e939be5c96e9f72499b6b9c8	5ca2d070abf325c89cbfc49fa498b9ebb8bdcc46
+docs/operations/broker-api-integration.md	false	false	true	false	4505	104	f224d4fa0b0f4281b2c9924c407a78feaaf51046a9a81e97d88bfc54cf1d5aa0	text	4f5efe120d332f635b633773f8ca98309584fe42	91e699d7101159a30697c231095ab36e3d7d60ad
+docs/operations/v13-push-templates-deployment.md	false	false	true	false	6622	251	d4a8ebf026fd792d2bbdb83635926ba3b37b5561487c9495c8c3f56610cc8177	text	7f6c9693977ca2b4c8bae20d22a5266e0cdfb5ad	91e699d7101159a30697c231095ab36e3d7d60ad
+docs/operations/v13-release-notes.md	false	false	true	false	8535	208	cb3662e5bc5c40d50d3819a213d5965ed5b57bbb6fed204de08a6cbe2b93fac8	text	5a822290021a10056c2f139a6315bae4dfeb1e97	91e699d7101159a30697c231095ab36e3d7d60ad
+docs/operations/v13.10.1-release-notes.md	false	false	true	false	4701	101	53746add2872b5f8ed72809e55f6ca4b939c3c60cfd2610f897cff6c83fc7aa4	text	45c2ca6a25cfc9ef8c59be5176b1daff67cb29ee	91e699d7101159a30697c231095ab36e3d7d60ad
+docs/p0-4-done.md	false	false	true	false	8900	188	6aeaa8babbb139ffa6b74be54d745aaeb64f10fbe5b6fdfea7387c2c78e26f07	text	28c5051f9eb03678be34b7a01dc5b1f4879be7c0	c3ea02fd5ea845162c097e7e4d146890ce8ebcbb
+docs/p0-5-done.md	false	false	true	false	8919	180	9ae093701c09b624c0db6429f195380af9885910d102afcc298f53154e681634	text	229b02013b01fdbfdb1d9de9ccc4750b6e169309	c3ea02fd5ea845162c097e7e4d146890ce8ebcbb
+docs/p0-5-plus-done.md	false	false	true	false	8439	198	950285ea19602251d93df9f1c082fab80abe2c6b15d0aaefa472372015880185	text	bc51fcfee655c63bfbcf032c6c96bd8c9d0d0ab7	c3ea02fd5ea845162c097e7e4d146890ce8ebcbb
+docs/p0-5-plus-v2-done.md	false	false	true	false	8803	183	b994d5990e18357d985d3955abf01b82e0287ab57773b0b54d79ed7ccdd58a30	text	a30de1d31f49c55c2451cca38bb7ee3c02959fb6	c3ea02fd5ea845162c097e7e4d146890ce8ebcbb
+docs/p0-5-plus-v3-done.md	false	false	true	false	7220	155	31c45e07477d82018428ae0872be91a2bc7f88e6d5a71176acb32267cfd82f73	text	43c36f139cc5deb7aae5e1b7c2cebf30803d67e5	c3ea02fd5ea845162c097e7e4d146890ce8ebcbb
+docs/p0-5-plus-v4-todo.md	false	false	true	false	5708	135	a7a676c50a54df6ab1de13b446752a7c87cdaf2f3ce0b76f39c92d7b5440d15b	text	387c6a14ed7199d945b018740e06f0c0160003ae	c3ea02fd5ea845162c097e7e4d146890ce8ebcbb
+docs/project_plan_p0_risk_unification.md	false	false	true	false	15996	394	ec0469a07def01390cfed7320f992aa3d10ad06b22deaee820d21ee7e72a8c12	text	e25f902f903843f10dc2781d290d2ac9ebfa9204	5b790899eb9e750a4c9f03c856a02138218b5b39
+docs/review-output-diagnosis-codex.md	false	false	true	false	18842	295	da7d00490c32c83e73c1e9818d3ed4fa7504de4f1a6207be173e3d4fe95daac1	text	998ae16ceb2f3d61e939be5c96e9f72499b6b9c8	c3ea02fd5ea845162c097e7e4d146890ce8ebcbb
+docs/root-causes/E-multi-agent-bypass-freshness.md	false	false	true	false	11187	298	556b3d4a8716a6d0c469b9644756338337206494025139f961253fe67d73b490	text	093507302097843cc6deb893aa4fc2f66467bf65	91e699d7101159a30697c231095ab36e3d7d60ad
+docs/root-causes/F-tool-silent-fallback.md	false	false	true	false	13140	333	e9f55143cb5b359107a815049337e85ff3daae9c8ea6682afb9572b301cb7281	text	093507302097843cc6deb893aa4fc2f66467bf65	91e699d7101159a30697c231095ab36e3d7d60ad
+docs/root-causes/G-no-fast-fail.md	false	false	true	false	17151	440	33adc833da650823233ca8968ea0d15f7df475b8b75d58e7b61cba2cd0c4598c	text	093507302097843cc6deb893aa4fc2f66467bf65	91e699d7101159a30697c231095ab36e3d7d60ad
+docs/root-causes/README.md	false	false	true	false	3891	92	fd5764ac59f41b78f5b1a44d80f96c991d137ea405caa41336d01b8f2bdff56a	text	093507302097843cc6deb893aa4fc2f66467bf65	91e699d7101159a30697c231095ab36e3d7d60ad
+docs/sina_baostock_integration.md	true	true	false	true	7286	160	7ddd10d5dcb51f29c68c7e7b2857d292c3d04d945ddb0da24b74f3fd5b9fed9d	text	workspace	3921c0d97f39a5a70afb2199af36eee1c88c62ca
+docs/superpowers/plans/2026-06-28-event-extractor.md	false	false	true	false	30715	886	0ef8c46ef9c59ff6c4706a6b8bb59d037d3d3d7b7b62e9bf210c3475499a7c51	text	f8d933299393e6dba5d582e388c5f03ed13a78d4	91e699d7101159a30697c231095ab36e3d7d60ad
+docs/superpowers/plans/2026-07-06-v13-push-templates-impl.md	false	false	true	false	61283	1783	980a829275453c0439bbaa85b37d5363d3b17c85f78d8e70782e5d7c5182a3d6	text	c1061344c4602f6673de9f8eb823d13e277e7fdb	91e699d7101159a30697c231095ab36e3d7d60ad
+docs/superpowers/plans/2026-07-07-v29-d01-dispatcher.md	false	false	true	false	17483	475	3b22ade58963c026d9e1b0f2de8872b2e57cf6d2b365a43c77e75703f2ad98f6	text	57f003e49e35c2cc920c6fe91d275dbaa764a90f	91e699d7101159a30697c231095ab36e3d7d60ad
+docs/superpowers/plans/2026-07-08-qmt-integration.md	false	false	true	false	27339	914	c7e4a322253664bd4a7069431fb981a936e1756494e1e23ff3a155c9adde59bc	text	bacad6cf04ce08075c11e3d4a1fdd74fcafba44f	91e699d7101159a30697c231095ab36e3d7d60ad
+docs/superpowers/plans/2026-07-08-sina-baostock-integration.md	false	false	true	false	51635	1664	c35cafcac0c62c80974c0113d5bdd40c1544bb17500dbfcd346bb763cf165742	text	fdb5582a8837442ef8dfef92d8e7951054008489	91e699d7101159a30697c231095ab36e3d7d60ad
+docs/superpowers/plans/2026-07-11-v13-push-templates-remediation.md	true	false	false	false	25571	731	b08447c261decf8ebf5c014f7bb9d511166fc086f60cf2296cf147a7caaff7f5	text	workspace	
+docs/superpowers/plans/2026-07-16-remove-openai-config-plan.md	true	false	false	false	26572	693	fbf16475f8f4f9894bf77707b69fefa36afa209cbfcb0c92941dd2b985aa90ad	text	workspace	
+docs/superpowers/plans/2026-07-16-v17-r2-a-event-seam.md	true	false	false	false	15559	421	297248415d61049e02cc1c18578466477bdea31cad40160da05377587d3a243a	text	workspace	
+docs/superpowers/plans/2026-07-16-v17.3-persistence-query.md	true	false	false	false	19660	498	9fe795aa41248f8337d1c6e69bf90b32dcea257ae9639518dcfd86835b752732	text	workspace	
+docs/superpowers/plans/2026-07-16-v17.7-source-pushes.md	true	false	false	false	29910	689	830cbe01c10718e848d5e141bf1ef2e45f03b913b8797cb2df509a22dc89ff1d	text	workspace	
+docs/superpowers/plans/compressed-wondering-parasol.md	true	false	false	false	10212	185	c8fc2ca6446ba5ffa84ff5727e1ebc9387ed20b67913ad8d308fc0db0cbdaa4b	text	workspace	
+docs/superpowers/plans/radiant-frolicking-starfish.md	true	false	false	false	20664	411	2677cf26b65c2bc65bc15fe247ea8d205c0b4d05159e52ec79b1a38009e9b2ea	text	workspace	
+docs/superpowers/plans/refactored-meandering-bird-agent-aa580bbef2a2358a9.md	true	false	false	false	13252	242	9aee5d97faaff21b819514f6747a9e8c5aeb69fa5d67c031656e45152955ec03	text	workspace	
+docs/superpowers/plans/refactored-meandering-bird.md	true	false	false	false	9648	181	f6c5436b2f7f287ae804cc6636a39f23608a0b2356ab1ce8042be34ee3efda8a	text	workspace	
+docs/superpowers/plans/unified-cooking-tulip-agent-a893df278aa4ff06a.md	true	false	false	false	22244	358	fef91c1ecbc7d0d3bedfa021bbe72518e682be56c0955d3775a2982517a07875	text	workspace	
+docs/superpowers/plans/unified-cooking-tulip.md	true	false	false	false	12979	392	2e661e451e80577cf067b589acf1de5fce1cd3ea6adc77599fbc34b76268647d	text	workspace	
+docs/superpowers/specs/2026-06-29-process-discipline-design.md	false	false	true	false	14410	366	329f5ef6b0afc9876aaaa71945fa445af8e61f3aa0ca3ac72b925ff55767a07b	text	093507302097843cc6deb893aa4fc2f66467bf65	91e699d7101159a30697c231095ab36e3d7d60ad
+docs/superpowers/specs/2026-07-06-v13-push-templates-audit.md	false	false	true	false	14116	192	2f8e47f3e5e71c3c339a7b0923cadbbde8ffbf1e4620cbd582991864f7ca3ac1	text	c1061344c4602f6673de9f8eb823d13e277e7fdb	91e699d7101159a30697c231095ab36e3d7d60ad
+docs/superpowers/specs/2026-07-06-v13-push-templates-design.md	false	false	true	false	43509	909	60a028fecc8aaae10ee20f382d00eb31a739e72edeb6f08cd62a8c072e542a00	text	d4bc061f2ef4735ae2f33759e0a5c95dc78cab44	91e699d7101159a30697c231095ab36e3d7d60ad
+docs/superpowers/specs/2026-07-06-v13-push-templates-impl-log.md	false	false	true	false	9111	199	4676e0132ba791a7f97701797069b32cacbc23c34f593e1ed7019bec2a493893	text	cf3b098f5f762142468533ee79ae75780a15ef89	91e699d7101159a30697c231095ab36e3d7d60ad
+docs/superpowers/specs/2026-07-06-v19-14-push-template-refactor-design.md	false	false	true	false	7617	156	801880ea866b9f65f0fb9c2d500007cb2833e3854a08d4e514c48365d65742f4	text	c3ea02fd5ea845162c097e7e4d146890ce8ebcbb	91e699d7101159a30697c231095ab36e3d7d60ad
+docs/superpowers/specs/2026-07-06-v19-15-push-simplify-design.md	false	false	true	false	6508	175	2823a83cfa879d95ccb5d80277a079246a9d1d78320e3d082b46b34aac2ee644	text	aa1cead418037bc59d928ecb54662e0894b4c693	91e699d7101159a30697c231095ab36e3d7d60ad
+docs/superpowers/specs/2026-07-06-v19-16-remove-demo-data-design.md	false	false	true	false	5985	184	5ea49f654f13bef8ab7034b1757805d2882faed42665f025fe6cf30be96b27d2	text	eed3f770d67d29513481ec112753ae7b588d7e6c	91e699d7101159a30697c231095ab36e3d7d60ad
+docs/superpowers/specs/2026-07-07-d01-dispatcher-design.md	false	false	true	false	17437	431	53a8f4061379a85d1d82f5b239c997ae2cc2e94849a4ec169b22558b7166b297	text	ad3a47fe527ab9da9be5100874734f000073d00b	91e699d7101159a30697c231095ab36e3d7d60ad
+docs/superpowers/specs/2026-07-08-qmt-integration-design.md	false	false	true	false	14428	441	c9928a255a39faef2de0079f467c1fb461e348198b6d842bdc14049fd8578670	text	d572fa6a4b1a7e54c2bb3b15a07716171d9bccdd	91e699d7101159a30697c231095ab36e3d7d60ad
+docs/superpowers/specs/2026-07-08-sina-baostock-integration-design.md	false	false	true	false	22289	635	5b990a451d4805dfa6f78d1102c92114edb5ea7dd6b6d4583b3e1e7a83b5f557	text	3bb3048682598d2c3ce3b63c621c3a72436a100d	91e699d7101159a30697c231095ab36e3d7d60ad
+docs/superpowers/specs/2026-07-16-remove-openai-config-design.md	true	false	false	false	12572	219	335e8526a058dc7a2fd7b774f8d9b5f01fcbdaea4f419a6af7040fc269d83c5e	text	workspace	
+docs/superpowers/specs/2026-07-16-v17-event-infrastructure-and-data-sources-design.md	true	false	false	false	24611	475	57524314dc2008f0c321a5e5d941d43d534b0f4ec1c10a407eceae8777eb9b53	text	workspace	
+docs/v10/README.md	true	false	false	false	1305	44	abd5acce1b7586dd9bf41bb27c03de3a4b5d2ab112985315126b242956de2f31	text	workspace	
+docs/v10/v10.0-2026-07-01-brainstorming-intraday-monitor-review.md	true	false	false	false	42079	487	bda205d952140ba7fd674ecdf60005d5e035fc75d92c93e555c667c26ab91f51	text	workspace	
+docs/v10/v10.0-2026-07-01-grill-with-docs-findings.md	true	false	false	false	12637	203	38dd1148f6085cac54543fa0699a7c3ff0ac0cc78b1e33e40b201ecfdb3f04a7	text	workspace	
+docs/v10/v10.0-2026-07-01-progress-working.md	true	false	false	false	18878	216	31816e41bd70ac1b33c092a7146b8113343b2a13dd48c7f3e3c32e479178a7fe	text	workspace	
+docs/v10/v10.0-2026-07-01-writing-plans-implementation.md	true	false	false	false	12334	201	ca9307de5fb2003de9d7d55244579b78b675f41cf282925ec179bad0d8e83e5c	text	workspace	
+docs/v10/v10.0-2026-07-01-writing-plans-task-plan.md	true	false	false	false	12893	174	46333439325baf38046626f45f8d4cd50ce508ff58dd359424f704bb0328b985	text	workspace	
+docs/v11-grill-decisions.md	false	false	true	false	7322	174	2fdb484475a9fa6b857adec3325ef86318ff05babfef02814d9f4c15dd2f46db	text	d0d5524dbc62027d42b63d494c77886c7fc1c79e	c3ea02fd5ea845162c097e7e4d146890ce8ebcbb
+docs/v11-grill-决策索引-2026-07-04.md	false	false	true	false	7322	174	2fdb484475a9fa6b857adec3325ef86318ff05babfef02814d9f4c15dd2f46db	text	c3ea02fd5ea845162c097e7e4d146890ce8ebcbb	093507302097843cc6deb893aa4fc2f66467bf65
+docs/v11-p0-4-持仓决策台-完成-2026-07-03.md	false	false	true	false	8900	188	6aeaa8babbb139ffa6b74be54d745aaeb64f10fbe5b6fdfea7387c2c78e26f07	text	c3ea02fd5ea845162c097e7e4d146890ce8ebcbb	093507302097843cc6deb893aa4fc2f66467bf65
+docs/v11-p0-5-plus-v2-收尾-2026-07-04.md	false	false	true	false	8803	183	b994d5990e18357d985d3955abf01b82e0287ab57773b0b54d79ed7ccdd58a30	text	c3ea02fd5ea845162c097e7e4d146890ce8ebcbb	093507302097843cc6deb893aa4fc2f66467bf65
+docs/v11-p0-5-plus-v3-收尾-2026-07-04.md	false	false	true	false	7220	155	31c45e07477d82018428ae0872be91a2bc7f88e6d5a71176acb32267cfd82f73	text	c3ea02fd5ea845162c097e7e4d146890ce8ebcbb	093507302097843cc6deb893aa4fc2f66467bf65
+docs/v11-p0-5-plus-v4-后续留事项-2026-07-04.md	false	false	true	false	5708	135	a7a676c50a54df6ab1de13b446752a7c87cdaf2f3ce0b76f39c92d7b5440d15b	text	c3ea02fd5ea845162c097e7e4d146890ce8ebcbb	093507302097843cc6deb893aa4fc2f66467bf65
+docs/v11-p0-5-plus-候选筛选台-完成-2026-07-04.md	false	false	true	false	8439	198	950285ea19602251d93df9f1c082fab80abe2c6b15d0aaefa472372015880185	text	c3ea02fd5ea845162c097e7e4d146890ce8ebcbb	093507302097843cc6deb893aa4fc2f66467bf65
+docs/v11-p0-5-候选筛选-完成-2026-07-03.md	false	false	true	false	8919	180	9ae093701c09b624c0db6429f195380af9885910d102afcc298f53154e681634	text	c3ea02fd5ea845162c097e7e4d146890ce8ebcbb	093507302097843cc6deb893aa4fc2f66467bf65
+docs/v11/README.md	true	false	false	false	2438	53	1546089118bf7344498cfc48c17c6cbe19c9393f503a677fa53a9897c87aab85	text	workspace	
+docs/v11/v11.0-2026-07-02-diagnosing-bugs-caliber-rootcause.md	true	false	false	false	10465	189	4ae2502184e3d12acbf1aa7d74406208b49f53eadc9e6df2b898ac9e30128ddb	text	workspace	
+docs/v11/v11.p01.p02-2026-07-02-brainstorming-design-v1.md	true	false	false	false	7936	196	d3aaaed0a562d43b0dd4e70a042b311da5ac85db66629025dda94befea74c5cc	text	workspace	
+docs/v11/v11.p01.p02-2026-07-02-brainstorming-design-v2.md	true	false	false	false	21602	459	d0d3021bfc36635ed7562f70373d94dc6254aae69a1ce4ef65ac8b049a9e9169	text	workspace	
+docs/v11/v11.p01.p02-2026-07-02-implement-completion.md	true	false	false	false	7705	159	de4242b915dee4ccbe189c2a376315e933f85a625256bc2478b230781196fd26	text	workspace	
+docs/v11/v11.p03-2026-07-02-brainstorming-caliber-inconsistency.md	true	false	false	false	15450	251	5f1b1811fda2404dda535b4e2492f463d0165c3b115700d12ee86b25f95069e4	text	workspace	
+docs/v11/v11.p04-2026-07-03-brainstorming-caliber-inconsistency.md	true	false	false	false	13646	266	9d69969919743857946606987a53e79463e5af50a4ff577b0b81bafc2fbe3057	text	workspace	
+docs/v11/v11.p04-2026-07-03-implement-position-decision.md	true	false	false	false	8920	188	0bcc29a1efd4f20d2d2f92649d93bc36967483127e3b8f84b445101fa49ca715	text	workspace	
+docs/v11/v11.p05-2026-07-03-implement-candidate-filter.md	true	false	false	false	8939	180	f7ece89933ef268bf0cc7e4d18d5e7afdfbe1e3e30688401213f67f74d82fcd8	text	workspace	
+docs/v11/v11.p05-2026-07-04-brainstorming-caliber-inconsistency.md	true	false	false	false	9895	212	a1483898bc0db046299642cff211a2d8b060850e4c003f874609d81cac2f4430	text	workspace	
+docs/v11/v11.p05p-2026-07-04-brainstorming-wrapup-v2.md	true	false	false	false	8823	183	7ffd0f8c94a74405bbbb3553e8d0c4d71832c600acf98a7fa1a92d6b6bce4593	text	workspace	
+docs/v11/v11.p05p-2026-07-04-brainstorming-wrapup-v3.md	true	false	false	false	7240	155	b309b24560cce2613cebadc7fe24ae9368d9f6b7d43bcd69a6710e8a6fecb90e	text	workspace	
+docs/v11/v11.p05p-2026-07-04-implement-candidate-screener.md	true	false	false	false	8459	198	7fa4f0d27e2de7add33e33a793c083287ff9b1f0de7f3d504d1d732518660d25	text	workspace	
+docs/v11/v11.p05p-2026-07-04-implement-followups-v4.md	true	false	false	false	5725	135	84de9f7db2ef84cdf5bba30a8ef80b9f8d10972bf7514fb91f0488476fcb78ca	text	workspace	
+docs/v11/v11.x-2026-07-04-grill-with-docs-decision-index.md	true	false	false	false	7588	174	d8759f91c206ee6be96d68924a83705cf511246e7a303708826443be911da162	text	workspace	
+docs/v12-template-verify-2026-07-05.md	false	false	true	false	2770	62	b0ee96f23e4dc0d894e4bd9ce6e939301f5c113050dadb2346e4c93b0c3074fd	text	7d8d60cb03f8afa2561263a9473b117a5862ecf7	c3ea02fd5ea845162c097e7e4d146890ce8ebcbb
+docs/v12-模板验证-2026-07-05.md	false	false	true	false	2770	62	b0ee96f23e4dc0d894e4bd9ce6e939301f5c113050dadb2346e4c93b0c3074fd	text	c3ea02fd5ea845162c097e7e4d146890ce8ebcbb	093507302097843cc6deb893aa4fc2f66467bf65
+docs/v12/README.md	true	false	false	false	2001	50	e6fc4c4a6ee0bcbce3b4a1885bfe849fe7d6204d6f7579bca71fe2a72a055c83	text	workspace	
+docs/v12/v12.0-2026-07-04-implement-trading-assistant.md	true	false	false	false	43707	948	fbeea24af4db5e090a3f19a589bd780a52631426f558d1316d1f4011f52cf11d	text	workspace	
+docs/v12/v12.0-2026-07-05-acceptance-mvp0.md	true	false	false	false	7036	180	30143453a084f208b0a7dc23ebf32af559068a5288810352df0c92833446b626	text	workspace	
+docs/v12/v12.0-2026-07-05-brainstorming-push-templates.md	true	false	false	false	11483	345	04ee4e779ab50228ea1f7ae642663dd7ff980cabf190c1c88f8e02bd375ecdba	text	workspace	
+docs/v12/v12.0-2026-07-05-implement-e2e-real-push.md	true	false	false	false	7210	165	de65e70e7fd607219a23219b5c3d452e4ad6097e785905221b4242ce80eaf79d	text	workspace	
+docs/v12/v12.0-2026-07-05-implement-monitor-test.md	true	false	false	false	9769	222	415fc2871eb02eaa3c0b37ae532e44bd6979ae8f7c813edbfb03c2541989c5cb	text	workspace	
+docs/v12/v12.0-2026-07-05-implement-template-validation.md	true	false	false	false	2770	62	b0ee96f23e4dc0d894e4bd9ce6e939301f5c113050dadb2346e4c93b0c3074fd	text	workspace	
+docs/v12/v12.0-2026-07-05-progress-mvp.md	true	false	false	false	8654	176	44bc544d248b0170d653cb4e2899aea9c9a2d342fb9e9bced6dda6c6dff936f4	text	workspace	
+docs/v12/v12.0-2026-07-05-review-push-uncertainty.md	true	false	false	false	10724	107	cfda0e174d5cba4ee7822e0192fbd4edfa4fbd0047bdb5aebdc95eb623957cae	text	workspace	
+docs/v12/v12.0-2026-07-05-writing-plans-dev-plan.md	true	false	false	false	22493	219	efc965130bc3ef628faae29c767a6050e412894472a4c50cec9eb77c29ae5140	text	workspace	
+docs/v12/v12.0-2026-07-06-grill-with-docs-audit-state.md	true	false	false	false	11175	163	070271c6b668df1647306cd525aceda68cddbfbfbb73747be6297542f93575e0	text	workspace	
+docs/v12/v12.p03fix-2026-07-02-changelog-ipos-suspension.md	true	false	false	false	7653	154	c033fd28b7f3ccb321f3ab256ba8a61ba24eefbba2222b19dbd1e017bb58beab	text	workspace	
+docs/v13/README.md	true	false	false	false	4162	76	5116fd6f99092d80985c9ff6cfae62c166246adfccf0ba93651a3fd6d08b187d	text	workspace	
+docs/v13/b002-2026-07-09-diagnosing-bugs-no-sector-attribution.md	true	false	false	false	6585	134	8b0607bc40720af28effd2c25e8b5c724354ac545f62592b974c4f8c41b2dfb4	text	workspace	
+docs/v13/b003-2026-07-09-diagnosing-bugs-event-extractor-dup.md	true	false	false	false	4887	104	81822f87e33d02c65dae6b518df38aba51bed68bcc00e1bc65f7364cd22b4b49	text	workspace	
+docs/v13/b004-2026-07-09-diagnosing-bugs-position-impact-noise.md	true	false	false	false	3536	87	bd38f5187941c1d7f5dab9553ef26c8b1764517258b7c92d86d2ff65ea292dfe	text	workspace	
+docs/v13/b005-2026-07-09-diagnosing-bugs-v13-templates-unfired.md	true	false	false	false	4245	86	4c0ea79b07c75f5059421e654486a1eeff35103eff5cf99e84def6204029f89e	text	workspace	
+docs/v13/b006-2026-07-11-grill-with-docs-v13-content-audit.md	true	false	false	false	27978	595	6ca3321c052aca26fcab537bd54f7baf1b8d5053a8f9fdc22872403fda602f3f	text	workspace	
+docs/v13/b007-2026-07-11-grill-with-docs-v13-e2e-audit.md	true	false	false	false	20211	399	d4ec477b42b3ea11101072aa1e0e72f4e6c075b3595f7bf38aead1109fc6d67e	text	workspace	
+docs/v13/v13.0-2026-07-05-brainstorming-push-templates-spec-active.md	true	false	false	false	15392	497	979bec41e6d923bb2da53e491f15404eca6b60c28abc80f423314dba2a02e65c	text	workspace	
+docs/v13/v13.0-2026-07-06-brainstorming-push-templates.md	true	false	false	false	43509	909	60a028fecc8aaae10ee20f382d00eb31a739e72edeb6f08cd62a8c072e542a00	text	workspace	
+docs/v13/v13.0-2026-07-06-executing-plans-push-templates-impl-log.md	true	false	false	false	9111	199	4676e0132ba791a7f97701797069b32cacbc23c34f593e1ed7019bec2a493893	text	workspace	
+docs/v13/v13.0-2026-07-06-grill-with-docs-push-templates-audit.md	true	false	false	false	14116	192	2f8e47f3e5e71c3c339a7b0923cadbbde8ffbf1e4620cbd582991864f7ca3ac1	text	workspace	
+docs/v13/v13.0-2026-07-06-implement-push-templates.md	true	false	false	false	61283	1783	980a829275453c0439bbaa85b37d5363d3b17c85f78d8e70782e5d7c5182a3d6	text	workspace	
+docs/v13/v13.0-2026-07-06-operations-release-notes.md	true	false	false	false	8535	208	cb3662e5bc5c40d50d3819a213d5965ed5b57bbb6fed204de08a6cbe2b93fac8	text	workspace	
+docs/v13/v13.0-2026-07-08-operations-push-templates-deployment.md	true	false	false	false	7015	260	1e031281c25f0430ffb7114c0af6dc078c87b3b604950b2df30b7582f1c1c1b4	text	workspace	
+docs/v13/v13.10.1-2026-07-08-operations-release-notes.md	true	false	false	false	4701	101	53746add2872b5f8ed72809e55f6ca4b939c3c60cfd2610f897cff6c83fc7aa4	text	workspace	
+docs/v13/v13.14-2026-07-06-brainstorming-push-template-refactor.md	true	false	false	false	7617	156	801880ea866b9f65f0fb9c2d500007cb2833e3854a08d4e514c48365d65742f4	text	workspace	
+docs/v13/v13.15-2026-07-06-brainstorming-push-simplify.md	true	false	false	false	6508	175	2823a83cfa879d95ccb5d80277a079246a9d1d78320e3d082b46b34aac2ee644	text	workspace	
+docs/v13/v13.16-2026-07-06-brainstorming-remove-demo-data.md	true	false	false	false	5985	184	5ea49f654f13bef8ab7034b1757805d2882faed42665f025fe6cf30be96b27d2	text	workspace	
+docs/v13/v13.29-2026-07-07-brainstorming-d01-dispatcher.md	true	false	false	false	17437	431	53a8f4061379a85d1d82f5b239c997ae2cc2e94849a4ec169b22558b7166b297	text	workspace	
+docs/v13/v13.29-2026-07-07-implement-d01-dispatcher.md	true	false	false	false	17483	475	3b22ade58963c026d9e1b0f2de8872b2e57cf6d2b365a43c77e75703f2ad98f6	text	workspace	
+docs/v14.x/README.md	true	false	false	false	4171	75	232763d16d8ee28b8d42fc82e72a54b0bcf050e5613bb634872f0052fdaaa5ff	text	workspace	
+docs/v14.x/b008-2026-07-11-review-v14.2-b007-resolution.md	true	false	false	false	24256	374	13b1690fa2e89391eeed5d3235447debd298b4e48d30833002030a2bb0c5c147	text	workspace	
+docs/v14.x/b009-2026-07-11-review-v14.2-r2.md	true	false	false	false	28078	564	a75278dc5f0b167e647bb31c95eaf52e9eedfb2a21af797a39b18e7ba6d4b92e	text	workspace	
+docs/v14.x/b010-2026-07-11-diagnosing-bugs-silent-fallback-plan.md	true	false	false	false	6349	118	e7672aea349093909464541e109f5d01da6cf8f47d2fadfb45e8a03737b5a106	text	workspace	
+docs/v14.x/b011-2026-07-11-review-v14.2-live-integration-audit.md	true	true	false	true	13668	269	48203615e70ccdf9152d75570437af6a710643a98257210efb8934df3bc5945b	text	workspace	c1a9cfdb53f8270ab543faf557003084553b2652
+docs/v14.x/b012-2026-07-12-fix-b011-live-integration.md	true	true	false	true	11355	199	a4de60b7e170961ea86aa5eca28a755b39709ea1a7e2105bfa3f42e5513b5d90	text	workspace	c1a9cfdb53f8270ab543faf557003084553b2652
+docs/v14.x/b012-review-findings.json	true	true	false	true	7900	122	62f8710bc499d90171ec5a9109238f1117e4d8a1f4b8aba854065c88af1bcb54	text	workspace	c1a9cfdb53f8270ab543faf557003084553b2652
+docs/v14.x/b013-2026-07-12-fix-b012-review.md	true	true	false	true	6558	88	9527637fdc0a4d6d05b0bf4c6c4da1a9757b45a62f034fd347adaf99a475533e	text	workspace	c1a9cfdb53f8270ab543faf557003084553b2652
+docs/v14.x/v14.0-2026-07-08-brainstorming-qmt-integration.md	true	false	false	false	14428	441	c9928a255a39faef2de0079f467c1fb461e348198b6d842bdc14049fd8578670	text	workspace	
+docs/v14.x/v14.0-2026-07-08-implement-qmt-integration.md	true	false	false	false	27339	914	c7e4a322253664bd4a7069431fb981a936e1756494e1e23ff3a155c9adde59bc	text	workspace	
+docs/v14.x/v14.1-2026-07-08-brainstorming-sina-baostock-integration.md	true	false	false	false	22289	635	5b990a451d4805dfa6f78d1102c92114edb5ea7dd6b6d4583b3e1e7a83b5f557	text	workspace	
+docs/v14.x/v14.1-2026-07-08-implement-sina-baostock-integration.md	true	false	false	false	51635	1664	c35cafcac0c62c80974c0113d5bdd40c1544bb17500dbfcd346bb763cf165742	text	workspace	
+docs/v14.x/v14.1-2026-07-08-operations-broker-api-integration.md	true	false	false	false	4505	104	f224d4fa0b0f4281b2c9924c407a78feaaf51046a9a81e97d88bfc54cf1d5aa0	text	workspace	
+docs/v14.x/v14.1-2026-07-10-brainstorming-news-aggregation-rsshub.md	true	false	false	false	15426	252	816c1f86ff0a335bcde11bdce924f5edf04417a76ec813459e1f98cc2525b269	text	workspace	
+docs/v14.x/v14.1-2026-07-11-writing-plans-dev-plan.md	true	false	false	false	22609	467	8896979df909cf41740621b3042f102bf5967d471388298680a3a28ce94c12a0	text	workspace	
+docs/v14.x/v14.2-2026-07-11-brainstorming-push-architecture-active.md	true	false	false	false	80560	1979	6e2336ab70cbb93ef394807415076f6b345383395f42e1e62016a0e0dacded56	text	workspace	
+docs/v14.x/v14.2-2026-07-11-brainstorming-push-postmortem.md	true	false	false	false	36828	1078	1cdd76a476a6218c5f5847ac45fda5014d6f0ae23d7bb67b32bc66f9da02d165	text	workspace	
+docs/v14.x/v14.2-2026-07-11-implement-push-templates-remediation.md	true	false	false	false	25520	680	99ea24734eff4cd5f76916380cbe9f010aa13d59e1870fbc48887096832f0179	text	workspace	
+docs/v14.x/v14.x-2026-07-11-writing-plans-master-development.md	true	false	false	false	19480	450	19067c2a6e447018ae0aba152839bd19d58e000219c2a68c2d4cbb6fcbde2a81	text	workspace	
+docs/v15.x/dead-pushkinds.md	true	true	false	true	2803	36	d2dcf4e835a86886abe6d8749591825369a47a8af0ea2749d9ab7bb5b12576de	text	workspace	84a612ec58061595dde990e5346c8293a92bda1e
+docs/v15.x/news-consolidation-plan.md	true	false	false	false	2855	57	6a21622f426ad046fe703add59e60705beb9663790fd07e3e9279c2ccbe87de9	text	workspace	
+docs/v15.x/post-mortem-v15.1.1.md	true	true	false	true	3098	63	64ef2bd4df98b4ca73961cecea410ddb06d16344a5f7bcee4d633bde35cbafce	text	workspace	8111b6e6cf408ba5f76048930d6b4d4e8752cd08
+docs/v15.x/v15-plan-news-stock-analysis.md	true	false	false	false	19729	504	1be655f213f8054a90dca28ff98bd182af2bce2c86d94a2661e4013e1391cfef	text	workspace	
+docs/v15.x/v15.3-phase-d-expansion.md	true	true	false	true	14461	346	9a6ef4c25be8f331cbe163d03c12cf37c7b2e6188342b57a70f688b432da0c15	text	workspace	759a2dc3ebd4cdf0bb93d939854560f34cd698a5
+docs/v16.x/v16.1-virtual-trading-redesign.md	true	false	false	false	54916	1030	46ea01767f5a43975b1782ad5e20a7f981000e1130913323b7c1557bd6b51268	text	workspace	
+docs/v16.x/v16.2-trading-kernel-redesign.md	true	false	false	false	45043	860	a57016805570dd88bc3e95768d375d9fcdfac0cc03645077aad6472bba525988	text	workspace	
+docs/v16.x/v16.3-development-plan.md	true	false	false	false	30180	678	b67c35a2149d08706cb57e2b9b186da8283b0f0709732c843e63a42db1945ea5	text	workspace	
+docs/v16.x/v16.3-domain-model-event-driven.md	true	false	false	false	63767	1384	78bb2fabfc95d96c045e153bcd17b138b1af964e22478f2eceaf091ec82a257a	text	workspace	
+docs/v16.x/v16.4-design.md	true	false	false	false	27264	537	0140f978c517da8199d248dde54c43e8079306847120421ee413a2138ee2e526	text	workspace	
+docs/v16.x/v16.4-development-plan.md	true	false	false	false	14444	352	20bb0dc3163ab3edf63180314ff1dbbdfe057d3554406a0287df9bcd12398cd1	text	workspace	
+docs/v16.x/v16.5-design.md	true	false	false	false	16477	345	f9cbbee7bf9805fcd7c451e5d7b35a3fde8bee2773a02f89ef2872444824b3bd	text	workspace	
+docs/v16.x/v16.5-development-plan.md	true	false	false	false	11726	303	7eb36d74ba75717363f37ae569f9f3329792ba2e2e62d61a531ff61dfd55b028	text	workspace	
+docs/v16.x/v16.6-design.md	true	false	false	false	16017	359	a19b226d2a1df29e56c9f42a08217a7fcc4b587adddb18825777611499f606a4	text	workspace	
+docs/v16.x/v16.6-development-plan.md	true	false	false	false	13527	384	803440ec83bd2dc3dec0b198772a1d717d1aa24a671f2ec0330382d6d2b1dc58	text	workspace	
+docs/v16.x/v16.7-design.md	true	false	false	false	16627	389	9fd71d2b29994b0fb2315f527bff9c325e3d0acd497af3890e2b14612a8ac2d6	text	workspace	
+docs/v16.x/v16.7-development-plan.md	true	false	false	false	12505	408	a4b84cbd1d72b16eab940b72fe9668974ac60e9936d62436feb83d12408b2b33	text	workspace	
+docs/v16.x/v16.8-design.md	true	false	false	false	15602	344	8c514a8511ff21f985abf211f40f3151fcb0db87651ed4362637bb0a2c903f88	text	workspace	
+docs/v16.x/v16.8-development-plan.md	true	false	false	false	13635	417	e52efe9ec9ec9e847e1d188413d39ec99fae3315594da230924b4ff524985349	text	workspace	
+docs/v17.x/v17.1-push-timing-redesign.md	true	false	false	false	20864	532	9820701bf8f2c8541aba30a6325f5fd7dbf7c41705bb393cc15812217e1e61ac	text	workspace	
+docs/v17.x/v17.1-r2-event-infrastructure.md	true	true	false	true	50269	1136	a36fb172d83bc935479926839b9d4081377adf8405227ec25e22517ce7d47fcb	text	workspace	ad24be935bbf9ca5ef97cbed847d18e8e619b2aa
+docs/v17.x/v17.2-eventbus-broadcast-persistence.md	true	false	false	false	30429	771	d021a417eef237b7eb7577f0fd42e76ad98d1368eda20dfd5107a571e45f8ff7	text	workspace	
+docs/v17.x/v17.3-migration-and-persistence.md	true	true	false	true	41062	907	48463521c703298f070abbb7888b82f08a142004fc5585f050279328f9179a16	text	workspace	ad24be935bbf9ca5ef97cbed847d18e8e619b2aa
+docs/v17.x/v17.4-news-and-review.md	true	true	false	true	34610	757	ac6f13b16e8fb27f72aa475f688eb5bc80f152f3dce2c05225882be061305fde	text	workspace	556aab2535e800badb3f50637ab5a98ae4a7b07e
+docs/v17.x/v17.5-batch2-push-migration.md	true	true	false	true	27346	609	b49142742be4d787d3268b16d9f7de5525809809ff8746a83d95e6e21fa2fce6	text	workspace	84a612ec58061595dde990e5346c8293a92bda1e
+docs/v17.x/v17.6-batch3-push-migration.md	true	true	false	true	20354	508	1b591576791057a08f07ec2bb343c75457a570dcbb7e2e87091490dd19a50b7f	text	workspace	b18511b700947578440b2875cfc049f21c87332a
+docs/v17.x/v17.7-batch4-dead-code-cleanup.md	true	true	false	true	16582	419	99c0d4fa548f23e3d990de926f77682be9ec6289d416aef12fc77a5542b5b346	text	workspace	84a612ec58061595dde990e5346c8293a92bda1e
+docs/v17.x/v17.8-final-batch-cleanup.md	true	true	false	true	18251	450	d5d0c3ece55ea45901d588a0732875767ebe16f01384007afe2ae792f93d9538	text	workspace	84a612ec58061595dde990e5346c8293a92bda1e
+docs/v17.x/v17.x-dev-plan-revised.md	true	true	false	true	7857	140	146245ad2d2eaab9f5cf7995992e535aac21cc5caf197e2a5a26b737c3515627	text	workspace	bf289ef7208b26b6adb9021af38cc7a80023abba
+docs/v17.x/v17.x-dev-plan.md	true	true	false	true	10807	268	156a5b77f968863123fc58a4fc08faf704a69aedf2f97a8674d259159c835e91	text	workspace	bf289ef7208b26b6adb9021af38cc7a80023abba
+docs/v18.x/README.md	true	true	false	true	1912	27	15baffcdb035d2dd108c8f6121fb86738f297bc2bfe5c9917f78aab762465bec	text	workspace	2efa387f83543cbcd2d534e9ffd12961e35b83af
+docs/v18.x/v18.0-2026-07-16-brainstorming-quant-platform-closure-design-active.md	true	true	false	true	13414	185	e7a8a2367805b7abddba7dcd677fd6f93adb182fba5c32811ac25c3cdb2605d1	text	workspace	2efa387f83543cbcd2d534e9ffd12961e35b83af
+docs/v18.x/v18.0-2026-07-16-codebase-design-four-core-modules.md	true	true	false	true	19876	301	2957130797624195a53f6577b4bdd479269dc7b00a38790cd8d0f55f0ee18c21	text	workspace	2efa387f83543cbcd2d534e9ffd12961e35b83af
+docs/v18.x/v18.0-2026-07-16-review-quant-platform-assessment.md	true	true	false	true	8749	88	454d6fcd529df40c2653baaed4d342ae0d75cf04cd4848ecb2bd4c3c0d199c96	text	workspace	6c3f469161c07e772e72077f0fe1aa351cd35900
+docs/v18.x/v18.0-2026-07-16-writing-plans-implementation-roadmap.md	true	true	false	true	8965	107	45bb0747715e71c97d98aaa35cdd05d8d67a40364c9d540d7782d8804fb8a7df	text	workspace	2efa387f83543cbcd2d534e9ffd12961e35b83af
+docs/v9-known-bugs-已知bug清单-2026-06-28.md	false	false	true	false	5943	148	2546b63bbcb816c72583f21182214a4d24f0b1d32d14b0fb02895b0c52fb7568	text	c3ea02fd5ea845162c097e7e4d146890ce8ebcbb	093507302097843cc6deb893aa4fc2f66467bf65
+docs/v9.4-changelog-流程纪律与审计-2026-06-30.md	false	false	true	false	12901	317	c84a03c37fbb6022edc9e20987e246df9b601bad2906121f0dc8218f13134aa7	text	c3ea02fd5ea845162c097e7e4d146890ce8ebcbb	093507302097843cc6deb893aa4fc2f66467bf65
+docs/v9.4-review-output-诊断-codex-2026-06-30.md	false	false	true	false	18842	295	da7d00490c32c83e73c1e9818d3ed4fa7504de4f1a6207be173e3d4fe95daac1	text	c3ea02fd5ea845162c097e7e4d146890ce8ebcbb	093507302097843cc6deb893aa4fc2f66467bf65
+docs/v9.x/README.md	true	false	false	false	4982	82	5208c26834c2fd0d4f48eb792bcaa842e3a5b9e2cd9c149e28a3105970827162	text	workspace	
+docs/v9.x/v8-2026-06-16-brainstorming-opportunity-regression.md	true	false	false	false	11111	171	c4b66d3b62db8b4d26e663c289c517875d7a32ce00adbf7d20d3bfa7928379af	text	workspace	
+docs/v9.x/v8-2026-06-16-implement-opportunity-regression.md	true	false	false	false	10365	166	ddf7b40ad01c900dc814df57c0b2f28e95e214d77550aebb2ae2dbbb8d1c6b37	text	workspace	
+docs/v9.x/v9.0-2026-06-21-brainstorming-p0-risk-unification.md	true	false	false	false	24923	560	2e2b41246b448deb0d134bd990d3dab4a1dc0ed68d61100fc453405be51939c0	text	workspace	
+docs/v9.x/v9.0-2026-06-21-implement-p0-risk-unification.md	true	false	false	false	15996	394	ec0469a07def01390cfed7320f992aa3d10ad06b22deaee820d21ee7e72a8c12	text	workspace	
+docs/v9.x/v9.0-2026-06-21-review-p0.md	true	false	false	false	3074	73	917da71ce00ad606e1b6f09706e459580fad5a71835202fec2fc28d770094c81	text	workspace	
+docs/v9.x/v9.0-2026-06-21-review-quant-institutional.md	true	false	false	false	38358	720	cb0cbe0fcf55f72001a51cae6d6c0d77fbd6836db64c35016cd2d632fa8268c4	text	workspace	
+docs/v9.x/v9.0-2026-06-25-executing-plans-codebase-optimization.md	true	false	false	false	68638	2218	b1168d658e3c8be883605f37b3d2ec9c2b39070b4e3ca471f0d62f153fa5e0db	text	workspace	
+docs/v9.x/v9.0-2026-06-27-brainstorming-opportunity-pipeline.md	true	false	false	false	26241	275	b77b7dc739489865ae828115f080d88ea35d5905e7ba0447142ddc876758646b	text	workspace	
+docs/v9.x/v9.0-2026-06-28-brainstorming-project-design.md	true	false	false	false	15724	332	3a7196062e272c53af799026253ef9107b9e6fe1f2b62b0616c7188e1769663e	text	workspace	
+docs/v9.x/v9.0-2026-06-28-diagnosing-bugs-known-bugs.md	true	false	false	false	5943	148	2546b63bbcb816c72583f21182214a4d24f0b1d32d14b0fb02895b0c52fb7568	text	workspace	
+docs/v9.x/v9.1-2026-06-28-benchmark-rule-filter.md	true	false	false	false	6162	157	31af4df7dd6698899c7079420ccd3d102321d958d375e4c1f790bcdb47e18dc1	text	workspace	
+docs/v9.x/v9.1-2026-06-28-brainstorming-event-extractor-design.md	true	false	false	false	14119	344	65d38c0b2059ac1406c745507798907e9ff638cf4915c74923740084a64c0b31	text	workspace	
+docs/v9.x/v9.1-2026-06-28-brainstorming-opportunity-pipeline-fix.md	true	false	false	false	13613	301	d8af3d3e9ae7d1a06cbc9e8888124709f0c3d07fac323322cffac5fcc72af2e8	text	workspace	
+docs/v9.x/v9.1-2026-06-28-implement-event-extractor.md	true	false	false	false	30715	886	0ef8c46ef9c59ff6c4706a6b8bb59d037d3d3d7b7b62e9bf210c3475499a7c51	text	workspace	
+docs/v9.x/v9.2-2026-06-29-grill-with-docs-project-audit.md	true	false	false	false	22122	464	06242111b115b259c5cd08a477dab846044f5ce76c0c65f347708606e233d2c2	text	workspace	
+docs/v9.x/v9.4-2026-06-22-grill-with-docs-optimization.md	true	false	false	false	21940	577	e6b79d93d4a135232de5e05a6f1126a3cafc55905aa93b218ddad9c5f4976d07	text	workspace	
+docs/v9.x/v9.4-2026-06-25-review-architecture.md	true	false	false	false	20186	487	db5751323f69672088ec92a6b120eb8f44b20914606a53e9c538017f510647d9	text	workspace	
+docs/v9.x/v9.4-2026-06-29-brainstorming-process-discipline.md	true	false	false	false	14410	366	329f5ef6b0afc9876aaaa71945fa445af8e61f3aa0ca3ac72b925ff55767a07b	text	workspace	
+docs/v9.x/v9.4-2026-06-29-implement-process-discipline.md	true	false	false	false	41745	1115	6447463213eec36f5d5098d549c7ba5aac8cc2f7a04a26b9b9000bfda630d14a	text	workspace	
+docs/v9.x/v9.4-2026-06-30-changelog-process-discipline.md	true	false	false	false	12939	317	babf2c632d520435311567cf2416573129842d6ea87aab3c917c9ea52277a803	text	workspace	
+docs/v9.x/v9.4-2026-06-30-grill-with-docs-review-output-codex.md	true	false	false	false	18881	295	4ea23c8c6cb6c1ff721daec398afa63b89015ef6cb48109e0ce955ebac15ae64	text	workspace	
+docs/v9.x/v9.4-2026-06-30-grill-with-docs-review-output.md	true	false	false	false	10192	229	6b87f0016abc46363e4b6b9106b7c9f0bfb7119013d7e04894d5148ceaba5e67	text	workspace	
+docs/v9.x/v9.4-2026-06-30-review-ai-berkshire.html	true	false	false	false	79694	1034	d61f4e5683ea591b316eff665b8edeb3b953e65ddf6ab74acba30e6a4ad4457b	text	workspace	
+docs/v9.x/v9.4-2026-06-30-review-remaining-issues.md	true	false	false	false	10760	180	161ae8907d3521347a136d45502bb7cb14dbffa2f9f54ef8382b5fcfb2fe4522	text	workspace	
+docs/v9.x/v9.4-2026-06-30-rootcause-E-freshness-bypass.md	true	false	false	false	11187	298	556b3d4a8716a6d0c469b9644756338337206494025139f961253fe67d73b490	text	workspace	
+docs/v9.x/v9.4-2026-06-30-rootcause-F-tool-silent-fallback.md	true	false	false	false	13140	333	e9f55143cb5b359107a815049337e85ff3daae9c8ea6682afb9572b301cb7281	text	workspace	
+docs/v9.x/v9.4-2026-06-30-rootcause-G-no-fast-fail.md	true	false	false	false	17151	440	33adc833da650823233ca8968ea0d15f7df475b8b75d58e7b61cba2cd0c4598c	text	workspace	
+docs/v9.x/v9.4-reports-README.md	true	false	false	false	812	24	360d92ec8500cfe652619e0d26e89b1bffd8429910becc9a7c4d1d9457f51300	text	workspace	
+docs/v9.x/v9.4-reviews-README.md	true	false	false	false	1184	26	7af935891dfe848247a663ae8c9d4bcc90a372bcb704e8b58ac3f17c21d1dd8d	text	workspace	
+docs/v9.x/v9.4-root-causes-README.md	true	false	false	false	3891	92	fd5764ac59f41b78f5b1a44d80f96c991d137ea405caa41336d01b8f2bdff56a	text	workspace	
+docs/业务规则清单-registry.md	true	false	false	false	23028	49	778717d02a4e069066b57278d070889207e9d953a6d66b4b175155e8e0740a7b	text	workspace	91e699d7101159a30697c231095ab36e3d7d60ad
+reports/backtest_report_20260305.md	false	false	true	false	755	25	e23c638cad19dac844cf4791dab79b36a84a00ac1cfb63ffffdcf02b6f142997	text	285a4c5c89946c3be755fc3781d4fb5038f14acf	45f7378f933ea301a15649708885f98ade911bde
+reports/macro_recommendations_20260305.md	false	false	true	false	13505	130	81558497d8c8f39a7023c0ff19162d5b420bdf83a0741d05cc859418b3751770	text	285a4c5c89946c3be755fc3781d4fb5038f14acf	45f7378f933ea301a15649708885f98ade911bde
+reports/sentiment_score_IC_IR_analysis-2026-06-29.md	false	false	true	false	6694	168	602cc897d62252b80cf06bd65e6ff864ab3c5ae7c9b36734706cd825aab9fad9	text	27d9b463992a77816f11cb438362f85c19ee017f	6c203904bce2774aa406d033ab162e5ab9d8efe6
+reports/stock_analysis_20260305.md	false	false	true	false	71123	2014	22d6b3164ec253b5b1adf8293ecb1b78e3dfb18b3e22af6d77cb621a577aae78	text	285a4c5c89946c3be755fc3781d4fb5038f14acf	45f7378f933ea301a15649708885f98ade911bde

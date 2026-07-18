@@ -154,6 +154,8 @@
 - `cargo fmt --all -- --check`: PASS.
 - `cargo check --all-targets --all-features`: PASS.
 - `cargo clippy --all-targets --all-features -- -D warnings`: PASS.
+- Independent fixed-SHA verdict: no Critical, Changes Requested. Remediation scope is WAL actual-mode validation, no retry-to-health for pooled PRAGMA failures, outbound-webhook isolation in process tests, exact BR-108 ledger evidence, narrow process-artifact ignores, and current PR evidence.
+- Re-read `DatabaseManager::init`, monitor startup, process tests, design addendum, and process artifact inventory. Next action is RED process coverage before changing implementation.
 - `cargo test --all-targets --all-features`: PASS, exit 0. Library ran 1,346 tests (1,336 passed / 10 ignored); monitor 293/293 passed; every remaining binary, integration, and benchmark target had zero failures.
 - `bash tools/compliance/check.sh`: PASS. Freshness remains `stock_daily MAX(date)=2026-07-16`, one A-share trading day behind; fake implementation, contradiction, business-rule, and silent-fallback checks passed (documented nonblocking warnings unchanged).
 - `cargo build --release --bin monitor`: PASS.
@@ -178,6 +180,11 @@
 - `cargo llvm-cov --workspace --all-features --json --output-path target/coverage/coverage.json`: tests PASS and report written.
 - `python3 tools/coverage/check_thresholds.py target/coverage/coverage.json`: FAIL; global 51.18% < 80%, core 55.38% < 95% across 94 files. Gate D and merge remain blocked together with missing live-account evidence and auditor sign-off.
 - Final pre-stage inventory: ten tracked paths, 253 insertions / 142 deletions; includes the two authorized orphan deletions, WAL startup fix/test/design, historical progress evidence, and Phase-11 planning. `git diff --check` PASS.
+- Committed all authorized tracked changes as `36f93b8` (`fix: close remaining workspace and database startup gaps`) and pushed to `stock_analysis/codex/repository-safety-closure-20260718`; upstream was updated successfully.
+- Dispatched independent fixed-SHA review for `4cea222..36f93b8` under `requesting-code-review`; awaiting findings before any further code change or merge decision.
+- PR-body update attempt failed due shell command substitution of Markdown backticks. Immediately interrupted it, then verified HEAD/log/upstream/worktree and remote PR body: no revert, commit, index, or PR mutation occurred. Future edit will use a temporary body file, never an interpolated shell argument.
+- Safely updated PR #2 via `/private/tmp` body file and `gh pr edit --body-file`; remote body now records commit `36f93b8`, SQLite fix/test, exact 51.18%/55.38% coverage blocker, mandatory fields, and complete newest-to-oldest rollback. PR remains OPEN Draft with CLEAN/MERGEABLE metadata.
+- Independent review standards axis returned FAIL with Important findings for unvalidated WAL return mode and broad evidence-directory ignores; the reported rollback omission was based on the old body and is already corrected remotely. Entering another TDD slice before asking for re-review.
 - `cargo test --all-targets --all-features`: PASS; lib 1311 passed / 10 ignored, monitor 284 passed, all integration targets zero failures.
 - `bash tools/compliance/check.sh`: PASS; freshness latest 2026-07-16, one trading day behind.
 - `cargo build --release --bin monitor`: PASS.
@@ -235,3 +242,8 @@
 - Phase 11 fast validation: `cargo fmt --all -- --check` PASS and `git diff --check` PASS; exact worktree remains the seven authorized tracked changes.
 - `cargo check --all-targets --all-features`: PASS.
 - `cargo clippy --all-targets --all-features -- -D warnings`: PASS.
+## 2026-07-18 follow-up review closure
+
+- Fixed review Important findings in working tree: strict WAL result validation, fail-closed monitor exit, and precise process-artifact ignore rules.
+- TDD regression `memory_database_fails_closed_with_explicit_journal_mode_error` passes.
+- Full Gate validation remains required before any merge decision; prior Gate D coverage/live-account evidence blockers remain.

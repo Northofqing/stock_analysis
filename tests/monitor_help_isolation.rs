@@ -119,3 +119,42 @@ fn fresh_test_database_starts_without_lock_errors() {
 
     std::fs::remove_dir_all(&root).expect("remove isolated working directory");
 }
+
+#[test]
+fn memory_database_fails_closed_with_explicit_journal_mode_error() {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let root = std::env::temp_dir().join(format!(
+        "monitor-memory-db-rejection-{}-{}",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&root).expect("create isolated working directory");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_monitor"))
+        .args(["--test", "--review"])
+        .current_dir(&root)
+        .env("DATABASE_PATH", ":memory:")
+        .env("STOCK_LIST", "TEST_CODE_000001")
+        .env("STOCK_ENV_MODE", "test")
+        .env("MONITOR_ENABLED", "true")
+        .env("V10_DRY_RUN_PUSH", "1")
+        .output()
+        .expect("run monitor with an in-memory database");
+
+    let combined_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "DB init must fail closed; output={combined_output}"
+    );
+    assert!(
+        combined_output.contains("journal_mode") && combined_output.contains("memory"),
+        "non-WAL journal mode must be explicit; output={combined_output}"
+    );
+
+    std::fs::remove_dir_all(&root).expect("remove isolated working directory");
+}

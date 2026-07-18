@@ -82,10 +82,10 @@ Phase 11 (commit all remaining workspace changes and evaluate the final merge ga
 ### Phase 11: Commit all remaining changes and merge evaluation
 - [x] Audit every remaining worktree change and its impact on live-data/fund-safety paths
 - [x] Restore Gate B/C validation after including the remaining changes
-- [ ] Commit and push all authorized worktree changes to PR #2
-- [ ] Obtain an independent pre-merge code review against fixed SHAs
+- [x] Commit and push all authorized worktree changes to PR #2
+- [ ] Resolve fixed-SHA review findings and obtain a clean independent re-review
 - [x] Re-run Gate D evidence checks; keep merge blocked unless every mandatory item passes
-- **Status:** in progress / merge blocked by Gate D coverage, real-account evidence, and auditor sign-off
+- **Status:** in progress / review remediation underway; merge blocked by Gate D coverage, real-account evidence, and auditor sign-off
 
 ## Decisions
 
@@ -121,3 +121,11 @@ Phase 11 (commit all remaining workspace changes and evaluate the final merge ga
 | Removing the broad planning/workspace ignores exposed many old generated review artifacts | 1 | Restore the user's ignore rules; existing tracked evidence files still remain tracked, while unrelated generated workspaces stay out of the PR. |
 | Isolated release smoke emitted repeated `database is locked` errors during first-time database initialization | 1 | Enter systematic root-cause investigation before treating the smoke as clean evidence or changing code. |
 | First WAL-bootstrap fix reduced fresh-DB lock errors from nine to one but did not make the RED test green | 1 | Do not stack another guess; return to root-cause evidence gathering and label each remaining customizer failure stage. |
+| PR-body shell argument interpreted Markdown backticks as command substitutions | 1 | Interrupted the process before later substitutions, audited HEAD/index/worktree/PR, confirmed no history or PR-body change, and switch to an apply-patch-created temporary body file for `gh pr edit --body-file`. |
+| Fixed-SHA review found WAL return-mode/customizer retry ambiguity and inherited webhook configuration in process tests | 1 | Add public process RED cases, make bootstrap and pooled customization fail closed, remove outbound webhook configuration from child environments, then re-review the follow-up SHA. |
+## Follow-up review slice (2026-07-18)
+
+- [x] Add RED test for `:memory:` journal-mode failure.
+- [x] Implement strict WAL result validation and nonzero DB-init exit.
+- [x] Narrow ignores so process evidence is not hidden.
+- [ ] Re-run full gates and obtain fixed-SHA independent review.

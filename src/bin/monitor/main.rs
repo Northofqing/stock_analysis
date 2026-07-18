@@ -2237,7 +2237,7 @@ async fn main() {
         stock_analysis::database::DatabaseManager::init(Some(std::path::PathBuf::from(&db_path)))
     {
         log::error!("[DB init] 失败: {}", error);
-        return;
+        std::process::exit(2);
     }
 
     // 加载热配置

@@ -156,3 +156,15 @@
 - Release binary confirmation matches the test: a third unique fresh SQLite path initializes with no lock errors, then exits 2 solely because the required 2026-07-18 ledger NAV is unavailable. This remains fail-closed smoke evidence, not live-account Gate D evidence.
 - Refreshed Phase-11 coverage remains blocking: global 43094/84202 = 51.18% versus 80%; core 11803/21313 = 55.38% versus 95% across 94 files. The new regression increases exercised lines but cannot close the repository-wide deficit.
 - Real-account same-day cash/position/NAV evidence and auditor sign-off remain unavailable. Committing and reviewing the branch is allowed; merging or marking Ready is prohibited.
+- A failed PR-body edit attempt passed Markdown backticks through a double-quoted shell argument, causing command substitution and an unintended partial test rerun. The process was interrupted before the rollback substitution; audit confirmed HEAD remains `36f93b8`, upstream is unchanged, only the two intended planning files are modified, and the PR body was not changed.
+- Independent standards review found two code/process Important issues: WAL mode is not read back and validated, so successful PRAGMA execution can still leave a non-WAL mode; and broad planning/workspace ignores hide new process evidence from ordinary Git tracking. It also saw the pre-update PR rollback, which has since been corrected remotely and requires recheck.
+- Final fixed-SHA review added two safety details: inherited `ALERT_WEBHOOK_URL` can bypass notification dry-run in child-process tests, and the fresh-file regression must assert the exact current-day-ledger rejection rather than any exit 2. All spawned monitor tests must explicitly remove the webhook variable.
+- SQLite `PRAGMA journal_mode=WAL` must validate the returned row, not only SQL execution. The public `:memory:` monitor case is a deterministic non-WAL negative path and must exit 2 with the actual `memory` mode in the diagnostic.
+- r2d2 0.8 customizer failures discard and retry connections, so a fallible PRAGMA customizer cannot itself prove fail-closed startup. The safe internal seam is explicit pool warm-up/configuration before migrations and singleton publication, with any setup error returned immediately.
+- Process evidence directories total about 4.5 MiB. Existing tracked planning/progress files are sparse while blanket ignores conceal new evidence. Narrow ignores to generated review diff/workspace artifacts and track legitimate plan/report Markdown/TSV/script evidence after a secret/size audit.
+## 2026-07-18 follow-up review closure
+
+- Reproduced the independent-review finding that `PRAGMA journal_mode = WAL` must validate SQLite's returned mode, not only SQL execution.
+- Added a public monitor-process regression for `DATABASE_PATH=:memory:`; it now requires exit code 2 and an explicit `journal_mode=memory` diagnostic.
+- Database bootstrap now reads and strictly validates the returned journal mode; monitor initialization failures exit nonzero.
+- Narrowed repository ignores to generated review diffs/workspaces and Python caches so process evidence remains trackable.

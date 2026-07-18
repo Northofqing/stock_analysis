@@ -66,6 +66,12 @@ fn unit_test_init_lock() -> &'static std::sync::Mutex<()> {
 #[derive(Debug)]
 struct SqlitePragmaCustomizer;
 
+#[derive(QueryableByName)]
+struct JournalModeRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    journal_mode: String,
+}
+
 impl CustomizeConnection<SqliteConnection, diesel::r2d2::Error> for SqlitePragmaCustomizer {
     fn on_acquire(&self, conn: &mut SqliteConnection) -> Result<(), diesel::r2d2::Error> {
         diesel::sql_query("PRAGMA busy_timeout = 5000")
@@ -148,7 +154,14 @@ impl DatabaseManager {
         // connection-local PRAGMAs in `SqlitePragmaCustomizer`.
         let mut bootstrap_conn = SqliteConnection::establish(&database_url)?;
         diesel::sql_query("PRAGMA busy_timeout = 5000").execute(&mut bootstrap_conn)?;
-        diesel::sql_query("PRAGMA journal_mode = WAL").execute(&mut bootstrap_conn)?;
+        let journal_mode = diesel::sql_query("PRAGMA journal_mode = WAL")
+            .get_result::<JournalModeRow>(&mut bootstrap_conn)?
+            .journal_mode;
+        if !journal_mode.eq_ignore_ascii_case("wal") {
+            return Err(
+                format!("SQLite journal_mode mismatch: expected WAL, got {journal_mode}").into(),
+            );
+        }
         drop(bootstrap_conn);
 
         let manager = ConnectionManager::<SqliteConnection>::new(database_url);
@@ -161,13 +174,6 @@ impl DatabaseManager {
         let mut conn = pool.get()?;
         Self::run_migrations(&mut conn)?;
 
-        // 修复 并行测试隔离: SQLite WAL 模式 + busy_timeout
-        // 之前: SQLite 默认 DELETE journal mode → 写锁整库, 并行测试同时写同一个 ./test_data/test.db → "database is locked"
-        // 现在: WAL 模式让读写不互斥, busy_timeout 让等待锁的连接最多等 5s
-        // 收益: (a) cargo test 默认并行度不再 flake, (b) 生产路径并发写也安全
-        diesel::sql_query("PRAGMA synchronous = NORMAL").execute(&mut *conn)?;
-        diesel::sql_query("PRAGMA busy_timeout = 5000").execute(&mut *conn)?;
-        diesel::sql_query("PRAGMA wal_autocheckpoint = 1000").execute(&mut *conn)?;
         info!("SQLite PRAGMAs 已设置: WAL + busy_timeout=5000");
 
         // 创建 agent_scratchpad 表 (Agent 内部思考和工具执行记录)
