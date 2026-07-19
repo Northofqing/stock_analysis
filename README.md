@@ -152,7 +152,9 @@ cargo run --bin rsi_optimize -- compare
 
 ### 3. 本地导入真实账户历史证据
 
-证据文件必须位于 Git 忽略路径。导入器不会打印账户金额或证券身份：
+证据文件必须位于 Git 忽略路径。成功摘要只输出记录 ID、插入状态和当日盈亏是否为空，不会
+输出账户金额或证券身份；校验失败信息可能包含输入的会计数值，只应在受保护的本地终端
+查看，不得复制到 Issue、PR 或公共日志：
 
 ```bash
 cargo run --bin import_real_account_snapshot -- \
