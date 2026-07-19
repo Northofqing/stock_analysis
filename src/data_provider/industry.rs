@@ -60,10 +60,14 @@ fn secid_for(code: &str) -> String {
     format!("{}.{}", market, code)
 }
 
-async fn try_get(client: &reqwest::Client, path: &str) -> Result<Value> {
+async fn try_get_from_hosts(client: &reqwest::Client, path: &str, hosts: &[&str]) -> Result<Value> {
     let mut last_err: Option<anyhow::Error> = None;
-    for host in HOSTS {
-        let url = format!("https://{}{}", host, path);
+    for host in hosts {
+        let url = if host.starts_with("http://") || host.starts_with("https://") {
+            format!("{host}{path}")
+        } else {
+            format!("https://{host}{path}")
+        };
         match client
             .get(&url)
             .header("Referer", "https://quote.eastmoney.com/")
@@ -197,13 +201,20 @@ fn merge_industry_map_page(out: &mut HashMap<String, String>, value: &Value) -> 
 }
 
 async fn load_industry_map(client: &reqwest::Client) -> Result<HashMap<String, String>> {
+    load_industry_map_from_hosts(client, HOSTS).await
+}
+
+async fn load_industry_map_from_hosts(
+    client: &reqwest::Client,
+    hosts: &[&str],
+) -> Result<HashMap<String, String>> {
     let mut out: HashMap<String, String> = HashMap::new();
     for pn in 1..=5 {
         let path = format!(
             "/api/qt/clist/get?pn={}&pz=100&po=1&np=1&fltt=2&invt=2&fid=f12&fs=m:90+t:2&fields=f12,f14",
             pn
         );
-        let v = try_get(client, &path).await?;
+        let v = try_get_from_hosts(client, &path, hosts).await?;
         if merge_industry_map_page(&mut out, &v)? {
             break;
         }
@@ -231,11 +242,19 @@ async fn get_industry_map(client: &reqwest::Client) -> Result<HashMap<String, St
 }
 
 async fn fetch_industry_name(client: &reqwest::Client, code: &str) -> Result<String> {
+    fetch_industry_name_from_hosts(client, code, HOSTS).await
+}
+
+async fn fetch_industry_name_from_hosts(
+    client: &reqwest::Client,
+    code: &str,
+    hosts: &[&str],
+) -> Result<String> {
     let path = format!(
         "/api/qt/stock/get?secid={}&fields=f127&invt=2",
         secid_for(code)
     );
-    let v = try_get(client, &path).await?;
+    let v = try_get_from_hosts(client, &path, hosts).await?;
     parse_industry_name(&v)
 }
 
@@ -280,11 +299,19 @@ async fn fetch_constituents(
     client: &reqwest::Client,
     bk_code: &str,
 ) -> Result<Vec<IndustryConstituent>> {
+    fetch_constituents_from_hosts(client, bk_code, HOSTS).await
+}
+
+async fn fetch_constituents_from_hosts(
+    client: &reqwest::Client,
+    bk_code: &str,
+    hosts: &[&str],
+) -> Result<Vec<IndustryConstituent>> {
     let path = format!(
         "/api/qt/clist/get?pn=1&pz=200&po=1&np=1&fltt=2&invt=2&fid=f3&fs=b:{}&fields=f12,f9,f23,f37,f129",
         bk_code
     );
-    let v = try_get(client, &path).await?;
+    let v = try_get_from_hosts(client, &path, hosts).await?;
     parse_constituents_page(&v)
 }
 
@@ -359,6 +386,25 @@ pub async fn fetch_async(client: &reqwest::Client, code: &str) -> Result<Industr
     let map = get_industry_map(client).await.context("加载行业列表")?;
     let bk_code = resolve_industry_board_code(&map, &industry_name)?;
     let rows = fetch_constituents(client, &bk_code)
+        .await
+        .context("取成份股")?;
+    build_industry_benchmark(industry_name, bk_code, code, &rows)
+}
+
+#[cfg(test)]
+async fn fetch_async_from_hosts(
+    client: &reqwest::Client,
+    code: &str,
+    hosts: &[&str],
+) -> Result<IndustryBenchmark> {
+    let industry_name = fetch_industry_name_from_hosts(client, code, hosts)
+        .await
+        .context("取行业名")?;
+    let map = load_industry_map_from_hosts(client, hosts)
+        .await
+        .context("加载行业列表")?;
+    let bk_code = resolve_industry_board_code(&map, &industry_name)?;
+    let rows = fetch_constituents_from_hosts(client, &bk_code, hosts)
         .await
         .context("取成份股")?;
     build_industry_benchmark(industry_name, bk_code, code, &rows)
@@ -603,6 +649,40 @@ mod tests {
     async fn real_industry_hosts_fail_without_creating_a_benchmark() {
         let client = super::super::unreachable_http_client();
         assert!(fetch_async(&client, "TEST_CODE_000001").await.is_err());
-        assert!(try_get(&client, "/api/qt/stock/get").await.is_err());
+        assert!(try_get_from_hosts(&client, "/api/qt/stock/get", HOSTS)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn loopback_transport_executes_name_map_and_constituent_acquisition() {
+        let server = super::super::TestHttpServer::new(vec![
+            super::super::TestHttpResponse::json(r#"{"data":{"f127":"TEST_CODE_测试行业"}}"#),
+            super::super::TestHttpResponse::json(
+                r#"{"data":{"diff":[{"f12":"BK0001","f14":"TEST_CODE_测试行业"}]}}"#,
+            ),
+            super::super::TestHttpResponse::json(
+                r#"{"data":{"diff":[{"f12":"TEST_CODE_000001","f9":10.0,"f23":2.0,"f37":12.0,"f129":20.0},{"f12":"TEST_CODE_000002","f9":20.0,"f23":3.0,"f37":8.0,"f129":-10.0}]}}"#,
+            ),
+        ]);
+        let hosts = [server.base_url()];
+        let benchmark = fetch_async_from_hosts(
+            &super::super::loopback_http_client(),
+            "TEST_CODE_000001",
+            &hosts,
+        )
+        .await
+        .expect("complete industry transport");
+        assert_eq!(benchmark.industry_name, "TEST_CODE_测试行业");
+        assert_eq!(benchmark.board_code, "BK0001");
+        assert_eq!(benchmark.peer_count, 2);
+        assert_eq!(benchmark.stock_pe, Some(10.0));
+        assert_eq!(benchmark.median_pe, Some(15.0));
+
+        let requests = server.finish();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].starts_with("/api/qt/stock/get?"));
+        assert!(requests[1].contains("fs=m:90+t:2") || requests[1].contains("fs=m%3A90%2Bt%3A2"));
+        assert!(requests[2].contains("fs=b:BK0001") || requests[2].contains("fs=b%3ABK0001"));
     }
 }

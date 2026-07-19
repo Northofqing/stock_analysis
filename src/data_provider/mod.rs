@@ -398,6 +398,161 @@ pub(crate) fn unreachable_http_client() -> reqwest::Client {
 }
 
 #[cfg(test)]
+pub(crate) fn loopback_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(std::time::Duration::from_secs(1))
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .expect("loopback test client must build")
+}
+
+#[cfg(test)]
+pub(crate) struct TestHttpResponse {
+    pub status: u16,
+    pub body: String,
+}
+
+#[cfg(test)]
+impl TestHttpResponse {
+    pub fn json(body: impl Into<String>) -> Self {
+        Self {
+            status: 200,
+            body: body.into(),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct TestHttpServer {
+    base_url: String,
+    expected: usize,
+    served: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(test)]
+impl TestHttpServer {
+    pub fn new(responses: Vec<TestHttpResponse>) -> Self {
+        use std::io::{Read, Write};
+        use std::sync::atomic::Ordering;
+
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("test loopback listener must bind");
+        listener
+            .set_nonblocking(true)
+            .expect("test loopback listener must be nonblocking");
+        let address = listener.local_addr().expect("test listener address");
+        let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let served_thread = std::sync::Arc::clone(&served);
+        let requests_thread = std::sync::Arc::clone(&requests);
+        let expected = responses.len();
+        let thread = std::thread::spawn(move || {
+            for response in responses {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(connection) => break connection,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "test HTTP request did not arrive before timeout"
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                        }
+                        Err(error) => panic!("test HTTP accept failed: {error}"),
+                    }
+                };
+                stream
+                    .set_nonblocking(false)
+                    .expect("test stream must use blocking reads");
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                    .expect("test stream read timeout");
+                let mut raw = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                loop {
+                    let count = stream.read(&mut chunk).expect("read test HTTP request");
+                    if count == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&chunk[..count]);
+                    if raw.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8(raw).expect("test HTTP request must be UTF-8");
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .expect("test HTTP request line must contain path")
+                    .to_string();
+                requests_thread.lock().unwrap().push(path);
+
+                let reason = match response.status {
+                    200 => "OK",
+                    400 => "Bad Request",
+                    404 => "Not Found",
+                    500 => "Internal Server Error",
+                    503 => "Service Unavailable",
+                    _ => "Test Status",
+                };
+                let head = format!(
+                    "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response.status,
+                    reason,
+                    response.body.len()
+                );
+                stream
+                    .write_all(head.as_bytes())
+                    .and_then(|_| stream.write_all(response.body.as_bytes()))
+                    .expect("write test HTTP response");
+                stream.flush().expect("flush test HTTP response");
+                stream
+                    .shutdown(std::net::Shutdown::Write)
+                    .expect("close test HTTP response body");
+                served_thread.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        Self {
+            base_url: format!("http://{address}"),
+            expected,
+            served,
+            requests,
+            thread: Some(thread),
+        }
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    pub fn finish(mut self) -> Vec<String> {
+        use std::sync::atomic::Ordering;
+
+        self.thread
+            .take()
+            .expect("test HTTP thread exists")
+            .join()
+            .expect("test HTTP responder must finish");
+        assert_eq!(self.served.load(Ordering::SeqCst), self.expected);
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestHttpServer {
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{
@@ -502,6 +657,37 @@ mod tests {
             .providers
             .iter()
             .all(|provider| !provider.name().trim().is_empty()));
+    }
+
+    #[tokio::test]
+    async fn loopback_http_server_serves_exact_response_sequence() {
+        let server = TestHttpServer::new(vec![
+            TestHttpResponse::json(r#"{"step":1}"#),
+            TestHttpResponse {
+                status: 503,
+                body: r#"{"step":2}"#.to_string(),
+            },
+        ]);
+        let client = loopback_http_client();
+        let first = client
+            .get(format!("{}/first", server.base_url()))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert_eq!(first, r#"{"step":1}"#);
+        let second = client
+            .get(format!("{}/second?query=1", server.base_url()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(second.status().as_u16(), 503);
+        assert_eq!(
+            server.finish(),
+            vec!["/first".to_string(), "/second?query=1".to_string()]
+        );
     }
 
     /// v11 P0-2 commit 2: `DataFetcherManager::get_daily_data` (sync 入口) 在

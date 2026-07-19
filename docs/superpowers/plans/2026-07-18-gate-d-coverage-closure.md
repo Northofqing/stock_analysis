@@ -293,3 +293,9 @@ Expected: all PASS. Commit only the two modules plus design/plan/progress eviden
 - [x] Cover same-day exclusion cache reuse, resolved component mapping, empty scans, leader prompt/result application and unavailable analysis without external calls.
 - [x] Route successful provider results through validation-before-cache helpers; cover complete/empty/error money-flow and intraday states plus unreachable financial transport.
 - [x] Exercise present/absent mainline parsing and rendering from local `TEST_CODE_` protocol rows; run focused tests, formatter, strict Clippy and core coverage.
+
+### Task 31: Exercise successful HTTP transport over a test-only loopback
+
+- [x] Add a `cfg(test)` loopback responder that serves exact status/body sequences on `127.0.0.1`, times out safely, and is absent from production builds.
+- [x] Route existing private host/base seams for chain pages, announcement list/detail and industry three-step acquisition to the loopback while preserving every production endpoint.
+- [x] Assert complete pagination/batch results and request completion with `TEST_CODE_` identities; run focused suites, formatter, strict Clippy and core coverage.

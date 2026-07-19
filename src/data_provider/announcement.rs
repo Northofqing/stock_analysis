@@ -572,6 +572,14 @@ async fn fetch_announcements_with_client(
     client: &reqwest::Client,
     date: Option<&str>,
 ) -> Result<Vec<Announcement>> {
+    fetch_announcements_from_url(client, date, ANNOUNCE_URL).await
+}
+
+async fn fetch_announcements_from_url(
+    client: &reqwest::Client,
+    date: Option<&str>,
+    announcement_url: &str,
+) -> Result<Vec<Announcement>> {
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let date_str = date.unwrap_or(&today);
     chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
@@ -579,7 +587,7 @@ async fn fetch_announcements_with_client(
 
     let url = format!(
         "{}?page_size={}&page_index=1&ann_type=SHA,SZA&start_date={}&end_date={}",
-        ANNOUNCE_URL, MAX_PER_FETCH, date_str, date_str
+        announcement_url, MAX_PER_FETCH, date_str, date_str
     );
 
     let response = client
@@ -605,8 +613,9 @@ async fn fetch_announcements_with_client(
     let detail_results = futures::future::join_all(detail_futures.iter().map(|art_code| {
         let c = Arc::clone(&client_arc);
         let ac = art_code.clone();
+        let detail_base = announcement_url.to_string();
         async move {
-            let content = fetch_ann_detail(&c, &ac).await?;
+            let content = fetch_ann_detail_from_url(&c, &ac, &detail_base).await?;
             Ok::<_, anyhow::Error>((ac, content))
         }
     }))
@@ -624,12 +633,12 @@ async fn fetch_announcements_with_client(
     Ok(results)
 }
 
-/// 获取公告正文（东方财富公告详情API，review #15 改 async）
-async fn fetch_ann_detail(client: &reqwest::Client, art_code: &str) -> Result<String> {
-    let url = format!(
-        "https://np-anotice-stock.eastmoney.com/api/security/ann/detail?art_code={}",
-        art_code
-    );
+async fn fetch_ann_detail_from_url(
+    client: &reqwest::Client,
+    art_code: &str,
+    announcement_url: &str,
+) -> Result<String> {
+    let url = format!("{announcement_url}/detail?art_code={art_code}");
     let response = client
         .get(&url)
         .header("User-Agent", "Mozilla/5.0")
@@ -989,8 +998,41 @@ mod tests {
         assert!(fetch_announcements_with_client(&client, Some("2026-07-18"))
             .await
             .is_err());
-        assert!(fetch_ann_detail(&client, "TEST_CODE_ARTICLE")
-            .await
-            .is_err());
+        assert!(
+            fetch_ann_detail_from_url(&client, "TEST_CODE_ARTICLE", ANNOUNCE_URL)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_transport_executes_list_detail_and_final_assembly() {
+        let list = r#"{"data":{"list":[{"art_code":"TEST_CODE_AN_EMERGENCY","title":"关于收到立案调查通知书的公告","notice_date":"2026-07-18","codes":[{"stock_code":"000001","short_name":"TEST_CODE_协议甲"}],"columns":[{"column_name":"风险提示"}]},{"art_code":"TEST_CODE_AN_IMPORTANT","title":"关于收到监管函的公告","notice_date":"2026-07-18","codes":[{"stock_code":"000002","short_name":"TEST_CODE_协议乙"}],"columns":null},{"art_code":"TEST_CODE_AN_INFO","title":"关于回购股份的公告","notice_date":"2026-07-18","codes":[{"stock_code":"000003","short_name":"TEST_CODE_协议丙"}],"columns":null}]}}"#;
+        let detail = r#"{"data":{"content":"TEST_CODE_完整公告正文"}}"#;
+        let server = super::super::TestHttpServer::new(vec![
+            super::super::TestHttpResponse::json(list),
+            super::super::TestHttpResponse::json(detail),
+            super::super::TestHttpResponse::json(detail),
+        ]);
+        let base = format!("{}/api/security/ann", server.base_url());
+        let announcements = fetch_announcements_from_url(
+            &super::super::loopback_http_client(),
+            Some("2026-07-18"),
+            &base,
+        )
+        .await
+        .expect("complete list and detail transport");
+        assert_eq!(announcements.len(), 3);
+        assert_eq!(announcements[0].level, AnnLevel::Emergency);
+        assert_eq!(announcements[0].content, "TEST_CODE_完整公告正文");
+        assert_eq!(announcements[2].level, AnnLevel::Info);
+        assert!(announcements[2].content.is_empty());
+
+        let requests = server.finish();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[0].starts_with("/api/security/ann?page_size=200"));
+        assert!(requests[1..]
+            .iter()
+            .all(|path| path.starts_with("/api/security/ann/detail?art_code=")));
     }
 }

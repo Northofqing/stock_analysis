@@ -154,6 +154,13 @@ async fn fetch_board_code_map_from_hosts(
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|error| format!("产业链板块 HTTP client 初始化失败: {error}"))?;
+    fetch_board_code_map_with_client(&client, hosts).await
+}
+
+async fn fetch_board_code_map_with_client(
+    client: &reqwest::Client,
+    hosts: &[&str],
+) -> Result<HashMap<String, String>, String> {
     let mut map = HashMap::new();
     let mut codes = HashSet::new();
     let mut terminal_seen = false;
@@ -171,7 +178,7 @@ async fn fetch_board_code_map_from_hosts(
             ("fs", "m:90+t:3"),
             ("fields", "f12,f14"),
         ];
-        let json = push2_get_from_hosts(&client, &params, hosts).await?;
+        let json = push2_get_from_hosts(client, &params, hosts).await?;
         let page_len = merge_board_code_page(&mut map, &mut codes, &json, page)?;
         if page_len == 0 {
             terminal_seen = true;
@@ -263,6 +270,18 @@ async fn fetch_laggard_candidates_from_hosts(
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|error| format!("产业链成份 HTTP client 初始化失败: {error}"))?;
+    fetch_laggard_candidates_with_client(&client, board_code, limit_codes, hosts).await
+}
+
+async fn fetch_laggard_candidates_with_client(
+    client: &reqwest::Client,
+    board_code: &str,
+    limit_codes: &HashSet<String>,
+    hosts: &[&str],
+) -> Result<Vec<TopStock>, String> {
+    if !board_code.starts_with("BK") {
+        return Err(format!("产业链板块代码非法: {board_code}"));
+    }
     let fs = format!("b:{}", board_code);
     let params = [
         ("pn", "1"),
@@ -276,7 +295,7 @@ async fn fetch_laggard_candidates_from_hosts(
         ("fs", fs.as_str()),
         ("fields", "f2,f3,f12,f14"),
     ];
-    let json = push2_get_from_hosts(&client, &params, hosts).await?;
+    let json = push2_get_from_hosts(client, &params, hosts).await?;
     parse_laggard_candidates(&json, board_code, limit_codes)
 }
 
@@ -598,8 +617,9 @@ mod tests {
     use super::{
         append_after_market_items, append_cluster_news_items, append_generated_cluster_queries,
         build_cluster_query_context, fetch_after_market_catalysts, fetch_board_code_map_from_hosts,
-        fetch_cluster_news, fetch_concepts_cached, fetch_laggard_candidates_from_hosts,
-        map_lhb_records, merge_board_code_page, parse_laggard_candidates, parse_push2_http_payload,
+        fetch_board_code_map_with_client, fetch_cluster_news, fetch_concepts_cached,
+        fetch_laggard_candidates_from_hosts, fetch_laggard_candidates_with_client, map_lhb_records,
+        merge_board_code_page, parse_laggard_candidates, parse_push2_http_payload,
         parse_tool_boards, push2_get_from_hosts, render_after_market_section,
     };
     use serde_json::json;
@@ -920,6 +940,45 @@ mod tests {
         );
         assert!(fetch_concepts_cached(&[]).await.is_err());
         assert!(fetch_concepts_cached(&[String::new()]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn loopback_transport_executes_board_pagination_and_constituent_batch() {
+        let server = crate::data_provider::TestHttpServer::new(vec![
+            crate::data_provider::TestHttpResponse::json(
+                r#"{"data":{"diff":[{"f12":"BK0001","f14":"TEST_CODE_板块甲"},{"f12":"BK0002","f14":"TEST_CODE_板块乙"}]}}"#,
+            ),
+            crate::data_provider::TestHttpResponse::json(
+                r#"{"data":{"diff":[{"f12":"100001","f14":"协议候选甲","f3":6.0,"f2":10.0},{"f12":"100002","f14":"协议候选乙","f3":2.0,"f2":8.0},{"f12":"100003","f14":"ST测试","f3":1.0,"f2":5.0}]}}"#,
+            ),
+        ]);
+        let hosts = [server.base_url()];
+        let client = crate::data_provider::loopback_http_client();
+        let board_map = fetch_board_code_map_with_client(&client, &hosts)
+            .await
+            .expect("complete board page");
+        assert_eq!(
+            board_map.get("TEST_CODE_板块甲").map(String::as_str),
+            Some("BK0001")
+        );
+
+        let candidates = fetch_laggard_candidates_with_client(
+            &client,
+            "BK0001",
+            &HashSet::from(["100002".to_string()]),
+            &hosts,
+        )
+        .await
+        .expect("complete constituent page");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].code, "100001");
+        assert_eq!(candidates[0].change_pct, 6.0);
+
+        let requests = server.finish();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("/api/qt/clist/get?"));
+        assert!(requests[0].contains("fs=m%3A90%2Bt%3A3"));
+        assert!(requests[1].contains("fs=b%3ABK0001"));
     }
 
     #[tokio::test]
