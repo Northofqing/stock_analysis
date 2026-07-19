@@ -22,6 +22,92 @@ use diesel::prelude::*;
 use crate::database::DatabaseManager;
 use crate::trading::risk_adapter::MAX_SLIPPAGE_PCT;
 
+#[derive(Clone, diesel::QueryableByName)]
+struct LedgerState {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    date: String,
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    total_value: f64,
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    cash: f64,
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    market_value: f64,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    created_at: String,
+}
+
+fn validate_ledger_state(
+    ledger: &LedgerState,
+    today: &str,
+    now: chrono::NaiveDateTime,
+) -> Result<(), String> {
+    if ledger.date != today {
+        return Err(format!(
+            "account ledger stale trading day: snapshot={} today={today}",
+            ledger.date
+        ));
+    }
+    let created_at = chrono::NaiveDateTime::parse_from_str(&ledger.created_at, "%Y-%m-%d %H:%M:%S")
+        .map_err(|error| format!("account ledger created_at invalid: {error}"))?;
+    let age = now.signed_duration_since(created_at).num_seconds();
+    if !(0..=30).contains(&age) {
+        return Err(format!("account ledger stale: age_seconds={age}"));
+    }
+    if !ledger.total_value.is_finite()
+        || ledger.total_value <= 0.0
+        || !ledger.cash.is_finite()
+        || ledger.cash < 0.0
+        || ledger.cash > ledger.total_value
+        || !ledger.market_value.is_finite()
+        || ledger.market_value < 0.0
+        || ledger.market_value > ledger.total_value
+    {
+        return Err(format!(
+            "account ledger invalid: cash={} market_value={} total_value={}",
+            ledger.cash, ledger.market_value, ledger.total_value
+        ));
+    }
+    Ok(())
+}
+
+fn validate_position_snapshot(
+    positions: &[crate::portfolio::Position],
+    position_source_time: Option<chrono::DateTime<chrono::Local>>,
+    ledger_market_value: f64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), String> {
+    if positions.is_empty() {
+        if ledger_market_value.abs() > 0.005 {
+            return Err(format!(
+                "position snapshot is empty but ledger market_value={ledger_market_value}"
+            ));
+        }
+    } else {
+        let position_source_time = position_source_time
+            .ok_or_else(|| "position snapshot is missing source time".to_string())?;
+        if !crate::portfolio::position_source_is_fresh(position_source_time, now) {
+            return Err(format!(
+                "position snapshot stale: oldest_source_time={position_source_time}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn position_pct(
+    positions: &[crate::portfolio::Position],
+    code: &str,
+    quote_price: f64,
+    total_value: f64,
+) -> f64 {
+    let shares = positions
+        .iter()
+        .filter(|position| position.code == code)
+        .map(|position| position.shares)
+        .sum::<u64>();
+    shares as f64 * quote_price / total_value * 100.0
+}
+
 /// 虚拟盘状态
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PaperTradeStatus {
@@ -169,25 +255,10 @@ pub fn evaluate(signal: &PaperSignal, quote_price: f64) -> PaperResult {
 ///
 /// Load a <=30-second account snapshot and derive the target position ratio.
 pub fn portfolio_state(code: &str, quote_price: f64) -> Result<(f64, f64, f64), String> {
-    use diesel::sql_types::{Double, Text};
-
     if !quote_price.is_finite() || quote_price <= 0.0 {
         return Err(format!(
             "invalid quote price for portfolio state: {quote_price}"
         ));
-    }
-    #[derive(diesel::QueryableByName)]
-    struct LedgerState {
-        #[diesel(sql_type = Text)]
-        date: String,
-        #[diesel(sql_type = Double)]
-        total_value: f64,
-        #[diesel(sql_type = Double)]
-        cash: f64,
-        #[diesel(sql_type = Double)]
-        market_value: f64,
-        #[diesel(sql_type = Text)]
-        created_at: String,
     }
 
     let db = DatabaseManager::try_get().ok_or_else(|| "DB 未初始化".to_string())?;
@@ -197,61 +268,18 @@ pub fn portfolio_state(code: &str, quote_price: f64) -> Result<(f64, f64, f64), 
     let ledger = diesel::sql_query(
         "SELECT date, total_value, cash, market_value, created_at FROM ledger ORDER BY date DESC LIMIT 1",
     )
-    .get_result::<LedgerState>(&mut conn)
-    .map_err(|error| format!("account ledger unavailable: {error}"))?;
+        .get_result::<LedgerState>(&mut conn)
+        .map_err(|error| format!("account ledger unavailable: {error}"))?;
     let today = chrono::Local::now().date_naive().to_string();
-    if ledger.date != today {
-        return Err(format!(
-            "account ledger stale trading day: snapshot={} today={today}",
-            ledger.date
-        ));
-    }
-    let created_at = chrono::NaiveDateTime::parse_from_str(&ledger.created_at, "%Y-%m-%d %H:%M:%S")
-        .map_err(|error| format!("account ledger created_at invalid: {error}"))?;
-    let age = chrono::Utc::now()
-        .naive_utc()
-        .signed_duration_since(created_at)
-        .num_seconds();
-    if !(0..=30).contains(&age) {
-        return Err(format!("account ledger stale: age_seconds={age}"));
-    }
-    if !ledger.total_value.is_finite()
-        || ledger.total_value <= 0.0
-        || !ledger.cash.is_finite()
-        || ledger.cash < 0.0
-        || ledger.cash > ledger.total_value
-        || !ledger.market_value.is_finite()
-        || ledger.market_value < 0.0
-        || ledger.market_value > ledger.total_value
-    {
-        return Err(format!(
-            "account ledger invalid: cash={} market_value={} total_value={}",
-            ledger.cash, ledger.market_value, ledger.total_value
-        ));
-    }
+    validate_ledger_state(&ledger, &today, chrono::Utc::now().naive_utc())?;
     let (positions, position_source_time) = crate::portfolio::get_positions_with_source_time()?;
-    if positions.is_empty() {
-        if !ledger.market_value.is_finite() || ledger.market_value.abs() > 0.005 {
-            return Err(format!(
-                "position snapshot is empty but ledger market_value={}",
-                ledger.market_value
-            ));
-        }
-    } else {
-        let position_source_time = position_source_time
-            .ok_or_else(|| "position snapshot is missing source time".to_string())?;
-        if !crate::portfolio::position_source_is_fresh(position_source_time, chrono::Utc::now()) {
-            return Err(format!(
-                "position snapshot stale: oldest_source_time={position_source_time}"
-            ));
-        }
-    }
-    let shares = positions
-        .iter()
-        .filter(|position| position.code == code)
-        .map(|position| position.shares)
-        .sum::<u64>();
-    let pos_pct = shares as f64 * quote_price / ledger.total_value * 100.0;
+    validate_position_snapshot(
+        &positions,
+        position_source_time,
+        ledger.market_value,
+        chrono::Utc::now(),
+    )?;
+    let pos_pct = position_pct(&positions, code, quote_price, ledger.total_value);
     Ok((ledger.cash, ledger.total_value, pos_pct))
 }
 
@@ -482,6 +510,122 @@ mod tests {
                 .count;
             assert_eq!(count, 0, "{table} must be rolled back");
         }
+    }
+
+    #[test]
+    fn portfolio_state_validators_reject_stale_or_inconsistent_account_evidence() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 7, 18)
+            .unwrap()
+            .and_hms_opt(2, 0, 30)
+            .unwrap();
+        let complete = LedgerState {
+            date: "2026-07-18".into(),
+            total_value: 100_000.0,
+            cash: 40_000.0,
+            market_value: 60_000.0,
+            created_at: "2026-07-18 02:00:00".into(),
+        };
+        validate_ledger_state(&complete, "2026-07-18", now).expect("30-second boundary");
+
+        let mut invalid = complete.clone();
+        invalid.date = "2026-07-17".into();
+        assert!(validate_ledger_state(&invalid, "2026-07-18", now)
+            .expect_err("previous trading day is stale")
+            .contains("stale trading day"));
+
+        invalid = complete.clone();
+        invalid.created_at = "not-a-time".into();
+        assert!(validate_ledger_state(&invalid, "2026-07-18", now)
+            .expect_err("invalid source time must fail")
+            .contains("created_at invalid"));
+
+        for created_at in ["2026-07-18 02:00:31", "2026-07-18 01:59:59"] {
+            invalid = complete.clone();
+            invalid.created_at = created_at.into();
+            assert!(validate_ledger_state(&invalid, "2026-07-18", now)
+                .expect_err("future or older-than-30-second ledger must fail")
+                .contains("ledger stale"));
+        }
+
+        let invalid_values = [
+            (f64::NAN, 40_000.0, 60_000.0),
+            (0.0, 0.0, 0.0),
+            (100_000.0, f64::NAN, 60_000.0),
+            (100_000.0, -1.0, 60_000.0),
+            (100_000.0, 100_001.0, 0.0),
+            (100_000.0, 40_000.0, f64::NAN),
+            (100_000.0, 40_000.0, -1.0),
+            (100_000.0, 40_000.0, 100_001.0),
+        ];
+        for (total_value, cash, market_value) in invalid_values {
+            invalid = complete.clone();
+            invalid.total_value = total_value;
+            invalid.cash = cash;
+            invalid.market_value = market_value;
+            assert!(validate_ledger_state(&invalid, "2026-07-18", now)
+                .expect_err("invalid account amount must fail")
+                .contains("ledger invalid"));
+        }
+
+        for quote in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(portfolio_state("TEST_CODE_600519", quote)
+                .expect_err("invalid quote must fail before database access")
+                .contains("invalid quote price"));
+        }
+    }
+
+    #[test]
+    fn portfolio_position_snapshot_requires_complete_fresh_source_evidence() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-18T02:00:30Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(validate_position_snapshot(&[], None, 0.0, now).is_ok());
+        assert!(validate_position_snapshot(&[], None, 0.006, now)
+            .expect_err("non-zero ledger market value needs positions")
+            .contains("snapshot is empty"));
+
+        let position = crate::portfolio::Position {
+            code: "TEST_CODE_600519".into(),
+            name: "测试持仓".into(),
+            shares: 1_000,
+            cost_price: 10.0,
+            hard_stop: None,
+            added_at: chrono::NaiveDate::from_ymd_opt(2026, 7, 17).unwrap(),
+            status: crate::portfolio::PositionStatus::Holding,
+            sector: "测试板块".into(),
+            is_st: false,
+            star_st: false,
+        };
+        assert!(
+            validate_position_snapshot(std::slice::from_ref(&position), None, 10_000.0, now)
+                .expect_err("non-empty snapshot requires source time")
+                .contains("missing source time")
+        );
+        assert!(validate_position_snapshot(
+            std::slice::from_ref(&position),
+            Some((now - chrono::Duration::milliseconds(30_001)).with_timezone(&chrono::Local)),
+            10_000.0,
+            now,
+        )
+        .expect_err("stale position evidence must fail")
+        .contains("snapshot stale"));
+        validate_position_snapshot(
+            std::slice::from_ref(&position),
+            Some((now - chrono::Duration::seconds(30)).with_timezone(&chrono::Local)),
+            10_000.0,
+            now,
+        )
+        .expect("30-second position boundary");
+
+        let mut second = position.clone();
+        second.shares = 500;
+        let unrelated = crate::portfolio::Position {
+            code: "TEST_CODE_000001".into(),
+            shares: 10_000,
+            ..position
+        };
+        let pct = position_pct(&[second, unrelated], "TEST_CODE_600519", 20.0, 100_000.0);
+        assert!((pct - 10.0).abs() < f64::EPSILON);
     }
 
     // ---- 涨停买必 NotFilled (PR3-3.5 硬性要求) ----

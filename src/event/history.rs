@@ -897,4 +897,49 @@ mod tests {
 
         tokio::fs::remove_dir_all(dir).await.unwrap();
     }
+
+    #[test]
+    fn br130_envelope_validator_rejects_every_incomplete_record_shape() {
+        let path = Path::new("TEST_CODE_history.jsonl");
+        let complete = make_delivery_envelope(
+            "complete",
+            "Announcement",
+            Some("TEST_CODE_600519"),
+            "Pushed",
+            "dry_run",
+            1,
+            Local::now(),
+        );
+        validate_history_envelope(&complete, path, 7).expect("complete envelope");
+
+        for field in ["id", "trace_id", "source", "event_type"] {
+            let mut envelope = complete.clone();
+            match field {
+                "id" => envelope.id = "  ".into(),
+                "trace_id" => envelope.trace_id = "\t".into(),
+                "source" => envelope.source.clear(),
+                "event_type" => envelope.event_type = "\n".into(),
+                _ => unreachable!(),
+            }
+            let error = validate_history_envelope(&envelope, path, 7)
+                .expect_err("blank required field must fail");
+            let message = error.to_string();
+            assert!(message.contains(field), "{message}");
+            assert!(message.contains("line 7"), "{message}");
+        }
+
+        let mut unsupported = complete.clone();
+        unsupported.version = 2;
+        assert!(validate_history_envelope(&unsupported, path, 8)
+            .expect_err("unsupported envelope version must fail")
+            .to_string()
+            .contains("unsupported version 2"));
+
+        let mut non_object = complete;
+        non_object.payload = serde_json::json!(["TEST_CODE_600519"]);
+        assert!(validate_history_envelope(&non_object, path, 9)
+            .expect_err("non-object payload must fail")
+            .to_string()
+            .contains("payload is not an object"));
+    }
 }

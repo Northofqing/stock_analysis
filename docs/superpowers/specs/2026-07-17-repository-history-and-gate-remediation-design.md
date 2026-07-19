@@ -770,3 +770,10 @@ Failure handling:
 - 产业链与持仓：产业链聚类、板块候选、龙虎榜和模型来源不变；新增测试只用现有真实 SQLite 仓储写入唯一 `TEST_CODE_` 持仓/概念缓存，再执行 `diagnose_positions` 的成员、别名和未命中决策。持仓跟踪继续经模拟交易网关、实时报价和账户快照门禁，测试只补齐无订单副作用的坏证据、T+1、止损原因与仓位计算分支。
 - 数据库：只执行现有参数绑定查询、空输入/坏输入拒绝、命中率和 factor IC 映射；不改 schema、不读取本人的账户库、不制造账户/持仓事实。共享测试数据库继续使用既有串行域和唯一身份，写入必须由 RAII 或显式清理回收。
 - 失败与回滚：真实来源错误、坏日期/价格、缺概念、缺账户快照和审计写失败仍显式返回；不得把测试数据槽编译进生产或用它注册 provider。整体回退 Task 35 私有适配和测试；不得回退 BR-092、BR-103、BR-124 或五年审计保护。
+
+## Addendum: Gate-D Task 36 深模块提交与确定性状态边界（2026-07-19）
+
+- RustDX seam：真实 `Tcp::new`、`Kline::recv_parsed` 和第三方帧结构保留在每页 adapter；私有分页模块只接收 `offset/count -> 完整 RustdxBarInput 批次`，负责页上限、空页/短页终止、错误/panic 整批拒绝和 BR-092 解析。测试 adapter 只返回本地 `TEST_CODE_` 协议记录，不注册 provider、不进入生产构建。
+- 回测提交 seam：多因子、Bollinger 和 RSI 的计算模块继续产生真实 summary/state/report；私有提交模块统一接收这些结果并执行报告、可空图表和强制交易/NAV 审计。生产 adapter 仍写现有 `reports/`，测试使用临时目录；报告或审计失败必须阻断，图表失败保持现有告警语义。
+- 状态模块：盘中监控、排除板块、概念/订单/持仓份额仓储、事件历史、账户组合校验和流水线补充上下文只通过现有确定性函数或临时 SQLite/文件系统执行。筛选/排序/限制继续引用已有 BR，不增加阈值或默认事实；任何坏时间、坏 JSON、坏金额、坏 hash 或审计链异常显式拒绝。
+- 旧模块与回滚：采用现有 RustDX、回测引擎、`DatabaseManager`、`HistoryStore`、`NotificationService` 与 test-only loopback；拒绝公共 mock provider、生产静态行情、覆盖率排除或阈值下调。整体回退 Task 36 seam 与测试；不得只留下测试 adapter 或恢复部分批次成功。

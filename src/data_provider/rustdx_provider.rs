@@ -91,39 +91,80 @@ impl RustdxProvider {
 
     /// 获取K线数据（内部方法）
     fn fetch_kline_internal(&self, code: &str, days: usize) -> Result<Vec<KlineData>> {
-        // 规范化股票代码
         let code = Self::normalize_code(code)?;
-
         let market = Self::parse_market(&code) as u16;
+        let raw_bars = Self::fetch_kline_pages(&code, days, |offset, count| {
+            let mut tcp = Self::new_connection()?;
+            let mut kline = Kline::new(market, &code, 9, offset, count);
+            kline.recv_parsed(&mut tcp).map_err(|e| anyhow!("{}", e))?;
+            Ok(kline
+                .result()
+                .iter()
+                .map(|bar| RustdxBarInput {
+                    year: bar.dt.year as i32,
+                    month: bar.dt.month as u32,
+                    day: bar.dt.day as u32,
+                    open: bar.open,
+                    high: bar.high,
+                    low: bar.low,
+                    close: bar.close,
+                    volume: bar.vol,
+                    amount: bar.amount,
+                })
+                .collect())
+        })?;
+        let kline_data = Self::parse_kline_batch(&code, &raw_bars)?;
 
-        // 通达信每次请求最多返回约 800 条K线，需要分页获取
+        info!("[通达信] {} 成功获取 {} 条K线数据", code, kline_data.len());
+
+        Ok(kline_data)
+    }
+
+    /// BR-092: resolve complete RustDX pages before parsing any row. The adapter
+    /// performs exactly one true external request per call; this module owns page
+    /// termination, protocol counts and whole-batch failure semantics.
+    fn fetch_kline_pages<F>(
+        code: &str,
+        days: usize,
+        mut fetch_page: F,
+    ) -> Result<Vec<RustdxBarInput>>
+    where
+        F: FnMut(u16, u16) -> Result<Vec<RustdxBarInput>>,
+    {
         const BATCH_SIZE: u16 = 800;
         let mut all_bars = Vec::new();
         let mut offset: u16 = 0;
-        let remaining = days;
 
         loop {
-            let count = BATCH_SIZE.min((remaining - all_bars.len()) as u16);
+            let remaining = days.saturating_sub(all_bars.len());
+            let count = remaining.min(usize::from(BATCH_SIZE)) as u16;
             if count == 0 {
                 break;
             }
 
-            let mut tcp = Self::new_connection()?;
-            let recv_result =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<Vec<_>> {
-                    let mut kline = Kline::new(market, &code, 9, offset, count);
-                    kline.recv_parsed(&mut tcp).map_err(|e| anyhow!("{}", e))?;
-                    Ok(kline.result().to_vec())
-                }));
+            let recv_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                fetch_page(offset, count)
+            }));
 
             match recv_result {
                 Ok(Ok(data)) => {
                     let fetched = data.len();
                     if fetched == 0 {
-                        break; // 服务器无更多数据
+                        break;
+                    }
+                    if fetched > usize::from(count) {
+                        return Err(anyhow!(
+                            "获取股票 {} K线第 {} 页返回 {} 条，超过请求 {} 条（整批拒绝）",
+                            code,
+                            u32::from(offset) / u32::from(BATCH_SIZE) + 1,
+                            fetched,
+                            count
+                        ));
                     }
                     all_bars.extend(data);
-                    offset += fetched as u16;
+                    offset = offset.checked_add(fetched as u16).ok_or_else(|| {
+                        anyhow!("获取股票 {} K线分页 offset 溢出（整批拒绝）", code)
+                    })?;
                     debug!(
                         "[通达信] {} 分页获取: offset={}, 本次={}, 累计={}",
                         code,
@@ -131,10 +172,10 @@ impl RustdxProvider {
                         fetched,
                         all_bars.len()
                     );
-                    if fetched < count as usize {
-                        break; // 已获取全部可用数据
+                    if fetched < usize::from(count) {
+                        break;
                     }
-                    if all_bars.len() >= remaining {
+                    if all_bars.len() >= days {
                         break;
                     }
                 }
@@ -161,26 +202,7 @@ impl RustdxProvider {
         if all_bars.is_empty() {
             return Err(anyhow!("股票 {} 没有返回K线数据", code));
         }
-
-        let raw_bars: Vec<RustdxBarInput> = all_bars
-            .iter()
-            .map(|bar| RustdxBarInput {
-                year: bar.dt.year as i32,
-                month: bar.dt.month as u32,
-                day: bar.dt.day as u32,
-                open: bar.open,
-                high: bar.high,
-                low: bar.low,
-                close: bar.close,
-                volume: bar.vol,
-                amount: bar.amount,
-            })
-            .collect();
-        let kline_data = Self::parse_kline_batch(&code, &raw_bars)?;
-
-        info!("[通达信] {} 成功获取 {} 条K线数据", code, kline_data.len());
-
-        Ok(kline_data)
+        Ok(all_bars)
     }
 
     /// BR-092: decode a complete RustDX batch, calculate real adjacent returns,
@@ -417,6 +439,65 @@ mod tests {
         let mut bad_amount = raw(2026, 7, 16, 10.0);
         bad_amount.amount = f64::NAN;
         assert!(RustdxProvider::parse_kline_batch("TEST_CODE_000001", &[bad_amount]).is_err());
+    }
+
+    #[test]
+    fn rustdx_page_module_rejects_partial_failures_and_resolves_complete_counts() {
+        let mut calls = Vec::new();
+        let complete =
+            RustdxProvider::fetch_kline_pages("TEST_CODE_000001", 1_600, |offset, count| {
+                calls.push((offset, count));
+                Ok(vec![raw(2026, 7, 17, 10.0); usize::from(count)])
+            })
+            .expect("two complete protocol pages");
+        assert_eq!(complete.len(), 1_600);
+        assert_eq!(calls, [(0, 800), (800, 800)]);
+
+        let short = RustdxProvider::fetch_kline_pages("TEST_CODE_000002", 10, |offset, count| {
+            assert_eq!((offset, count), (0, 10));
+            Ok(vec![raw(2026, 7, 17, 10.0); 3])
+        })
+        .expect("short page explicitly terminates the available batch");
+        assert_eq!(short.len(), 3);
+
+        assert!(
+            RustdxProvider::fetch_kline_pages("TEST_CODE_000003", 10, |_, _| Ok(Vec::new()))
+                .unwrap_err()
+                .to_string()
+                .contains("没有返回K线数据")
+        );
+        assert!(
+            RustdxProvider::fetch_kline_pages("TEST_CODE_000004", 10, |_, _| {
+                Err(anyhow!("TEST_CODE_分页源失败"))
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("整批拒绝")
+        );
+        assert!(
+            RustdxProvider::fetch_kline_pages("TEST_CODE_000005", 10, |_, _| {
+                panic!("TEST_CODE_底层解码 panic")
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("底层库 panic")
+        );
+        assert!(
+            RustdxProvider::fetch_kline_pages("TEST_CODE_000006", 2, |_, _| {
+                Ok(vec![raw(2026, 7, 17, 10.0); 3])
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("超过请求")
+        );
+        assert!(
+            RustdxProvider::fetch_kline_pages("TEST_CODE_000007", 66_000, |_, count| {
+                Ok(vec![raw(2026, 7, 17, 10.0); usize::from(count)])
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("offset 溢出")
+        );
     }
 
     #[test]

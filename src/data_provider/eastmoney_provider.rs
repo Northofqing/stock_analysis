@@ -48,6 +48,9 @@ enum KlineAttemptOutcome {
 /// HTTP数据提供者
 pub struct HttpProvider {
     client: reqwest::Client,
+    kline_bases: Vec<String>,
+    quote_bases: Vec<String>,
+    max_attempts_per_host: u32,
 }
 
 /// API返回的K线数据
@@ -137,7 +140,33 @@ impl HttpProvider {
         // 替代每次 new() 新建. 4 个 HttpProvider 实例共享同一个 client, 节省 4 倍握手.
         Ok(Self {
             client: crate::http_client::SHARED_HTTP_CLIENT.clone(),
+            kline_bases: vec![
+                "https://push2his.eastmoney.com".into(),
+                "https://push2his-bak.eastmoney.com".into(),
+                "https://82.push2his.eastmoney.com".into(),
+            ],
+            quote_bases: vec![
+                "https://push2.eastmoney.com".into(),
+                "https://push2delay.eastmoney.com".into(),
+                "https://82.push2.eastmoney.com".into(),
+            ],
+            max_attempts_per_host: 2,
         })
+    }
+
+    #[cfg(test)]
+    fn with_bases(
+        client: reqwest::Client,
+        kline_bases: Vec<String>,
+        quote_bases: Vec<String>,
+        max_attempts_per_host: u32,
+    ) -> Self {
+        Self {
+            client,
+            kline_bases,
+            quote_bases,
+            max_attempts_per_host,
+        }
     }
 
     /// 从东方财富API获取K线数据（异步版本）
@@ -326,13 +355,21 @@ impl HttpProvider {
     }
 
     /// 获取股票名称（静态异步方法）
+    #[cfg(test)]
     async fn fetch_stock_name_internal(client: &reqwest::Client, code: &str) -> Option<String> {
-        const QUOTE_HOSTS: [&str; 3] = [
-            "push2.eastmoney.com",
-            "push2delay.eastmoney.com",
-            "82.push2.eastmoney.com",
+        const QUOTE_BASES: [&str; 3] = [
+            "https://push2.eastmoney.com",
+            "https://push2delay.eastmoney.com",
+            "https://82.push2.eastmoney.com",
         ];
+        Self::fetch_stock_name_from_bases(client, code, &QUOTE_BASES).await
+    }
 
+    async fn fetch_stock_name_from_bases<S: AsRef<str>>(
+        client: &reqwest::Client,
+        code: &str,
+        quote_bases: &[S],
+    ) -> Option<String> {
         // 转换股票代码格式
         let market_code = if code.starts_with('6') {
             format!("1.{}", code) // 上海
@@ -340,11 +377,9 @@ impl HttpProvider {
             format!("0.{}", code) // 深圳/创业板/科创板
         };
 
-        for host in QUOTE_HOSTS {
-            let url = format!(
-                "https://{}/api/qt/stock/get?secid={}&fields=f58",
-                host, market_code
-            );
+        for base in quote_bases {
+            let base = base.as_ref().trim_end_matches('/');
+            let url = format!("{base}/api/qt/stock/get?secid={market_code}&fields=f58");
 
             match client
                 .get(&url)
@@ -357,13 +392,13 @@ impl HttpProvider {
                 Ok(response) => {
                     if let Ok(text) = response.text().await {
                         if let Some(name) = Self::parse_stock_name_response(&text) {
-                            log::debug!("[HTTP] 获取股票名称(host={}): {} -> {}", host, code, name);
+                            log::debug!("[HTTP] 获取股票名称(host={}): {} -> {}", base, code, name);
                             return Some(name);
                         }
                     }
                 }
                 Err(e) => {
-                    log::debug!("[HTTP] 获取股票名称失败(host={}): {}", host, e);
+                    log::debug!("[HTTP] 获取股票名称失败(host={}): {}", base, e);
                 }
             }
         }
@@ -385,11 +420,15 @@ impl DataProvider for HttpProvider {
         // 克隆必要的数据用于 async block
         let client = self.client.clone();
         let code = code.to_string();
+        let kline_bases = self.kline_bases.clone();
+        let max_attempts_per_host = self.max_attempts_per_host;
 
         // 修复 Top10#5 (2026-06-29 audit): 用统一 block_on_async 替代 block_in_place + Handle::current().block_on
         let code_for_apply = code.clone();
         let mut data = crate::block_on_async(async move {
-            Self::fetch_kline_data_internal(&client, &code, days).await
+            let bases = kline_bases.iter().map(String::as_str).collect::<Vec<_>>();
+            Self::fetch_kline_data_from_bases(&client, &code, days, &bases, max_attempts_per_host)
+                .await
         })?;
 
         // v11-P0-3 commit 2: K 线缺口推断 → 喂入 HALTED_PERIODS
@@ -406,10 +445,11 @@ impl DataProvider for HttpProvider {
     fn get_stock_name(&self, code: &str) -> Option<String> {
         let client = self.client.clone();
         let code_str = code.to_string();
+        let quote_bases = self.quote_bases.clone();
 
         // 修复 Top10#5: 用统一 block_on_async 替代
         let result = crate::block_on_async(async move {
-            Self::fetch_stock_name_internal(&client, &code_str).await
+            Self::fetch_stock_name_from_bases(&client, &code_str, &quote_bases).await
         });
 
         result
@@ -644,6 +684,43 @@ mod tests {
         )
         .await
         .is_err());
+    }
+
+    #[test]
+    fn loopback_provider_interface_uses_configured_strict_protocol_endpoints() {
+        use super::super::{loopback_http_client, TestHttpResponse, TestHttpServer};
+
+        let complete = kline_body(serde_json::json!([
+            "2026-07-15,10.00,10.00,10.20,9.90,1000,100000,0.0",
+            "2026-07-16,10.00,10.10,10.20,9.95,1100,101000,1.0"
+        ]));
+        let server = TestHttpServer::new(vec![
+            TestHttpResponse::json(complete),
+            TestHttpResponse::json(r#"{"data":{"f58":"接口股票"}}"#),
+        ]);
+        let base = server.base_url().to_string();
+        let provider =
+            HttpProvider::with_bases(loopback_http_client(), vec![base.clone()], vec![base], 1);
+
+        let data = provider
+            .get_daily_data("TEST_CODE_000001", 2)
+            .expect("provider interface must preserve the strict parsed batch");
+        assert_eq!(data.len(), 2);
+        assert_eq!(data[0].close, 10.10);
+        assert_eq!(
+            provider.get_stock_name("TEST_CODE_000001").as_deref(),
+            Some("接口股票")
+        );
+        assert_eq!(provider.name(), "HTTP(东方财富)");
+        let requests = server.finish();
+        assert!(requests[0].contains("secid=1.TEST_CODE_000001"));
+        assert!(requests[0].contains("lmt=2"));
+        assert!(requests[1].contains("fields=f58"));
+
+        let default = HttpProvider::default();
+        assert_eq!(default.kline_bases.len(), 3);
+        assert_eq!(default.quote_bases.len(), 3);
+        assert_eq!(default.max_attempts_per_host, 2);
     }
 
     #[ignore = "b013 异常处理: 实机调 eastmoney HTTP, 沙箱环境必失败 (非 deterministic)"]

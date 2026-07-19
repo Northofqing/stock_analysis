@@ -323,3 +323,10 @@ Expected: all PASS. Commit only the two modules plus design/plan/progress eviden
 - [x] Reuse the existing test-only fetched-data slot behind one private backtest adapter and cover benchmark paging, ranked history acquisition, empty/source failures and pre-output wrapper failures without changing production acquisition.
 - [x] Exercise chain position diagnosis and position-tracker decision failures with isolated `TEST_CODE_` SQLite evidence; no live quote, external analysis, notification or real-account read is permitted.
 - [x] Complete database root query/validation branches with parameter-bound real-SQL tests; formatter, all-target strict Clippy, compliance and 1,660-test instrumented library regression pass, raising global coverage to 60,656/76,393 = 79.40% and registered core to 30,188/32,415 = 93.13%.
+
+### Task 36: Deepen remaining transport, commit, and deterministic state modules
+
+- [x] Separate RustDX's true external page adapter from strict pagination/whole-batch resolution; cover short/empty pages, multiple pages, source error and panic without a live TCP dependency.
+- [x] Route the three backtest result types through a private filesystem commit seam and cover report, chart and mandatory audit outcomes in isolated directories.
+- [x] Exercise account-snapshot and event-envelope failure matrices plus Tencent/Eastmoney public provider interfaces with `TEST_CODE_`, pure state validation, temporary files and loopback transport.
+- [x] Run instrumented library regression: 1,667 pass / 10 explicit live integrations ignored / 0 failed; global coverage reaches 61,494/76,866 = 80.00%, while registered core reaches 30,792/32,888 = 93.63%, so Gate D remains open without threshold rounding or reduction.

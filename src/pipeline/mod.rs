@@ -262,6 +262,9 @@ pub struct AnalysisPipeline {
     /// Test/live isolation (2.5): injected K-lines never exist in production builds.
     #[cfg(test)]
     test_fetched_data: Option<std::result::Result<Vec<crate::data_provider::KlineData>, String>>,
+    /// Test/live isolation (2.5): backtest artifacts use an isolated filesystem root.
+    #[cfg(test)]
+    test_backtest_output_dir: Option<std::path::PathBuf>,
 }
 
 #[cfg(test)]
@@ -366,6 +369,8 @@ impl AnalysisPipeline {
             test_resolved_context: None,
             #[cfg(test)]
             test_fetched_data: None,
+            #[cfg(test)]
+            test_backtest_output_dir: None,
         })
     }
 

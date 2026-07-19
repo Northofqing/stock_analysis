@@ -23,6 +23,8 @@ fn parse_tencent_source_time(raw: &str, code: &str) -> Result<chrono::DateTime<U
 /// 腾讯财经数据提供者
 pub struct GtimgProvider {
     client: reqwest::Client,
+    kline_base: String,
+    quote_base: String,
 }
 
 impl GtimgProvider {
@@ -140,7 +142,18 @@ impl GtimgProvider {
         // 修复 Top10#7 (2026-06-29 audit): 用 SHARED_TENCENT_HTTP_CLIENT 共享 client
         Ok(Self {
             client: crate::http_client::SHARED_TENCENT_HTTP_CLIENT.clone(),
+            kline_base: "https://web.ifzq.gtimg.cn".to_string(),
+            quote_base: "http://qt.gtimg.cn".to_string(),
         })
+    }
+
+    #[cfg(test)]
+    fn with_bases(client: reqwest::Client, kline_base: String, quote_base: String) -> Self {
+        Self {
+            client,
+            kline_base,
+            quote_base,
+        }
     }
 
     /// 公开方法：获取实时行情（用于其他数据提供者调用）
@@ -362,6 +375,7 @@ impl GtimgProvider {
     }
 
     /// 获取股票名称（静态异步方法）
+    #[cfg(test)]
     async fn fetch_stock_name_internal(client: &reqwest::Client, code: &str) -> Option<String> {
         Self::fetch_stock_name_from_base(client, code, "http://qt.gtimg.cn").await
     }
@@ -413,6 +427,7 @@ impl GtimgProvider {
     }
 
     /// 获取实时行情（包含盈利指标）
+    #[cfg(test)]
     async fn fetch_realtime_quote_internal(
         client: &reqwest::Client,
         code: &str,
@@ -519,9 +534,12 @@ impl DataProvider for GtimgProvider {
         // 克隆必要的数据用于 async block
         let client = self.client.clone();
         let code_owned = code.to_string();
+        let kline_base = self.kline_base.clone();
+        let quote_base = self.quote_base.clone();
 
         let mut data = Self::run_async_blocking(async move {
-            Self::fetch_kline_data_internal(&client, &code_owned, days).await
+            Self::fetch_kline_data_from_bases(&client, &code_owned, days, &kline_base, &quote_base)
+                .await
         })?;
 
         // v11-P0-3 commit 2: K 线缺口推断 → 喂入 HALTED_PERIODS
@@ -538,9 +556,10 @@ impl DataProvider for GtimgProvider {
     fn get_stock_name(&self, code: &str) -> Option<String> {
         let client = self.client.clone();
         let code_str = code.to_string();
+        let quote_base = self.quote_base.clone();
 
         let result = Self::run_async_blocking_value(async move {
-            Self::fetch_stock_name_internal(&client, &code_str).await
+            Self::fetch_stock_name_from_base(&client, &code_str, &quote_base).await
         })
         .ok()
         .flatten();
@@ -551,9 +570,10 @@ impl DataProvider for GtimgProvider {
     fn get_realtime_quote(&self, code: &str) -> Result<Option<RealtimeQuote>> {
         let client = self.client.clone();
         let code_str = code.to_string();
+        let quote_base = self.quote_base.clone();
 
         Self::run_async_blocking(async move {
-            Self::fetch_realtime_quote_internal(&client, &code_str).await
+            Self::fetch_realtime_quote_from_base(&client, &code_str, &quote_base).await
         })
     }
 
@@ -793,7 +813,13 @@ mod tests {
             ("300114.SZ", "300114", "sz300114"),
             ("600519", "600519", "sh600519"),
             ("sh600519", "600519", "sh600519"),
+            ("600519.SH", "600519", "sh600519"),
+            ("bj430047", "430047", "bj430047"),
             ("430047.BJ", "430047", "bj430047"),
+            ("800001", "800001", "bj800001"),
+            ("500001", "500001", "sh500001"),
+            ("700001", "700001", "sz700001"),
+            (" TEST_CODE_000001 ", "000001", "sz000001"),
         ];
 
         for (input, expected_code, expected_market_code) in cases {
@@ -802,6 +828,64 @@ mod tests {
             assert_eq!(code, expected_code);
             assert_eq!(market_code, expected_market_code);
         }
+
+        for invalid in [
+            "",
+            " ",
+            "sh12345",
+            "sz12345x",
+            "bj1234567",
+            "12345",
+            "123456.HK",
+            "12345.SH",
+            "abcdef",
+        ] {
+            assert_eq!(GtimgProvider::normalize_for_tencent(invalid), None);
+        }
+    }
+
+    #[test]
+    fn loopback_provider_interface_uses_strict_real_protocol_adapters() {
+        use super::super::{loopback_http_client, TestHttpResponse, TestHttpServer};
+
+        let server = TestHttpServer::new(vec![
+            TestHttpResponse::json(complete_kline_body()),
+            TestHttpResponse::json(realtime_body(&[])),
+            TestHttpResponse::json("v_sh600519=\"51~接口股票~600519~10.10\";"),
+            TestHttpResponse::json(realtime_body(&[])),
+        ]);
+        let base = server.base_url().to_string();
+        let provider = GtimgProvider::with_bases(loopback_http_client(), base.clone(), base);
+
+        let data = provider
+            .get_daily_data("TEST_CODE_600519", 2)
+            .expect("provider must return the strictly parsed loopback batch");
+        assert_eq!(data.len(), 2);
+        assert_eq!(data[0].intraday_price, Some(10.10));
+        assert_eq!(
+            provider.get_stock_name("TEST_CODE_600519").as_deref(),
+            Some("接口股票")
+        );
+        let quote = provider
+            .fetch_realtime_quote("TEST_CODE_000001")
+            .expect("provider quote transport")
+            .expect("complete quote");
+        assert_eq!(quote.code, "000001");
+        assert_eq!(provider.name(), "腾讯财经");
+
+        assert_eq!(
+            server.finish(),
+            vec![
+                "/appstock/app/fqkline/get?param=sh600519,day,,,2,qfq",
+                "/q=sh600519",
+                "/q=sh600519",
+                "/q=sz000001",
+            ]
+        );
+
+        let default = GtimgProvider::default();
+        assert_eq!(default.kline_base, "https://web.ifzq.gtimg.cn");
+        assert_eq!(default.quote_base, "http://qt.gtimg.cn");
     }
 
     #[test]

@@ -1707,6 +1707,7 @@ mod tests {
             }),
             test_resolved_context: Some(context),
             test_fetched_data: None,
+            test_backtest_output_dir: None,
         }
     }
 

@@ -23,6 +23,31 @@ type StockHistory = (String, String, Vec<crate::data_provider::KlineData>);
 type HistorySplit = (String, Vec<StockHistory>, Vec<StockHistory>);
 
 impl AnalysisPipeline {
+    fn save_backtest_report(&self, content: &str, filename: &str) -> Result<PathBuf> {
+        #[cfg(test)]
+        if let Some(dir) = self.test_backtest_output_dir.as_ref() {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("创建隔离回测报告目录失败: {}", dir.display()))?;
+            let path = dir.join(filename);
+            std::fs::write(&path, content)
+                .with_context(|| format!("写入隔离回测报告失败: {}", path.display()))?;
+            return Ok(path);
+        }
+
+        self.notifier
+            .save_report_to_file(content, Some(filename))
+            .map(PathBuf::from)
+    }
+
+    fn backtest_chart_path(&self, filename: &str) -> PathBuf {
+        #[cfg(test)]
+        if let Some(dir) = self.test_backtest_output_dir.as_ref() {
+            return dir.join(filename);
+        }
+
+        Path::new("reports").join(filename)
+    }
+
     /// Read historical bars through the production manager. Test builds may reuse the
     /// pipeline's existing isolated fetched-data slot; that slot is not compiled into
     /// production and therefore cannot become a market-data fallback (AGENTS 2.1/2.5).
@@ -329,6 +354,18 @@ impl AnalysisPipeline {
         trades: &[crate::strategy::core::Trade],
         initial_capital: f64,
     ) -> Result<(PathBuf, PathBuf)> {
+        #[cfg(test)]
+        if let Some(dir) = self.test_backtest_output_dir.as_ref() {
+            return Self::export_audit_csv_to(
+                &dir.join("details"),
+                strategy_tag,
+                date_str,
+                daily_values,
+                trades,
+                initial_capital,
+            );
+        }
+
         Self::export_audit_csv_to(
             Path::new("reports/details"),
             strategy_tag,
@@ -576,8 +613,7 @@ impl AnalysisPipeline {
             Self::run_multi_factor_resolved(&stocks_data, benchmark)?;
         let date_str = chrono::Local::now().format("%Y%m%d").to_string();
         let filename = format!("multi_factor_backtest_{}.md", date_str);
-        self.notifier
-            .save_report_to_file(&report, Some(&filename))?;
+        self.save_backtest_report(&report, &filename)?;
         self.export_audit_csv(
             "multi_factor",
             &date_str,
@@ -712,16 +748,16 @@ impl AnalysisPipeline {
         // 保存报告
         let date_str = chrono::Local::now().format("%Y%m%d").to_string();
         let report_filename = format!("bollinger_zscore_backtest_{}.md", date_str);
-        self.notifier
-            .save_report_to_file(&report, Some(&report_filename))?;
+        self.save_backtest_report(&report, &report_filename)?;
         info!(
             "✓ 布林带+Z-Score回测报告已保存: reports/{}",
             report_filename
         );
 
         // 生成图表
-        let chart_path = format!("reports/bollinger_zscore_chart_{}.png", date_str);
-        match result.generate_chart(&chart_path) {
+        let chart_path =
+            self.backtest_chart_path(&format!("bollinger_zscore_chart_{}.png", date_str));
+        match result.generate_chart(&chart_path.to_string_lossy()) {
             Ok(path) => info!("✓ 布林带回测图表已生成: {}", path.display()),
             Err(e) => warn!("布林带回测图表生成失败: {}", e),
         }
@@ -832,13 +868,12 @@ impl AnalysisPipeline {
         // 保存报告
         let date_str = chrono::Local::now().format("%Y%m%d").to_string();
         let report_filename = format!("rsi_strategy_backtest_{}.md", date_str);
-        self.notifier
-            .save_report_to_file(&report, Some(&report_filename))?;
+        self.save_backtest_report(&report, &report_filename)?;
         info!("✓ RSI策略回测报告已保存: reports/{}", report_filename);
 
         // 生成图表
-        let chart_path = format!("reports/rsi_strategy_chart_{}.png", date_str);
-        match result.generate_chart(&chart_path) {
+        let chart_path = self.backtest_chart_path(&format!("rsi_strategy_chart_{}.png", date_str));
+        match result.generate_chart(&chart_path.to_string_lossy()) {
             Ok(path) => info!("✓ RSI回测图表已生成: {}", path.display()),
             Err(e) => warn!("RSI回测图表生成失败: {}", e),
         }
@@ -1115,6 +1150,78 @@ mod tests {
             .fetch_top_backtest_history(&ranked, 2, 30)
             .await
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn isolated_backtest_commit_writes_all_reports_and_mandatory_audits() {
+        let output = TempAuditDir::new("backtest_commit");
+        let mut pipeline = AnalysisPipeline::new(super::super::PipelineConfig {
+            max_workers: 1,
+            dry_run: true,
+            send_notification: false,
+            single_notify: false,
+            ..Default::default()
+        })
+        .expect("isolated pipeline");
+        pipeline.test_backtest_output_dir = Some(output.0.clone());
+        pipeline.test_fetched_data = Some(Ok(factor_history(120)[0].2.clone()));
+
+        let ranked = vec![
+            analysis_result("TEST_CODE_000001", 90),
+            analysis_result("TEST_CODE_000002", 80),
+            analysis_result("TEST_CODE_000003", 70),
+        ];
+        let multi = pipeline
+            .run_multi_factor_backtest(&ranked)
+            .await
+            .expect("complete multi-factor commit");
+        assert!(multi.final_value.is_finite());
+
+        let local = oscillating_history(160);
+        let bollinger = pipeline
+            .run_bollinger_zscore_backtest(&local)
+            .await
+            .expect("complete Bollinger commit");
+        let rsi = pipeline
+            .run_rsi_backtest(&local)
+            .await
+            .expect("complete RSI commit");
+        assert!(bollinger.final_value.is_finite());
+        assert!(rsi.final_value.is_finite());
+
+        let names = std::fs::read_dir(&output.0)
+            .expect("isolated report directory")
+            .map(|entry| entry.expect("report entry").file_name())
+            .collect::<Vec<_>>();
+        assert!(names
+            .iter()
+            .any(|name| name.to_string_lossy().starts_with("multi_factor_backtest_")));
+        assert!(names.iter().any(|name| name
+            .to_string_lossy()
+            .starts_with("bollinger_zscore_backtest_")));
+        assert!(names
+            .iter()
+            .any(|name| name.to_string_lossy().starts_with("rsi_strategy_backtest_")));
+        let audit_names = std::fs::read_dir(output.0.join("details"))
+            .expect("isolated audit directory")
+            .map(|entry| entry.expect("audit entry").file_name())
+            .collect::<Vec<_>>();
+        for prefix in ["multi_factor", "bollinger_zscore", "rsi_strategy"] {
+            assert!(audit_names.iter().any(|name| name
+                .to_string_lossy()
+                .starts_with(&format!("{prefix}_trades_"))));
+            assert!(audit_names.iter().any(|name| name
+                .to_string_lossy()
+                .starts_with(&format!("{prefix}_nav_"))));
+        }
+
+        let blocking = output.0.join("not-a-directory");
+        std::fs::write(&blocking, b"occupied").expect("blocking output file");
+        pipeline.test_backtest_output_dir = Some(blocking.clone());
+        assert!(pipeline
+            .save_backtest_report("TEST_CODE_报告", "blocked.md")
+            .is_err());
+        std::fs::remove_file(blocking).expect("remove blocking output file");
     }
 
     /// 修复：QUANT_ANALYST_REVIEW §1.5
