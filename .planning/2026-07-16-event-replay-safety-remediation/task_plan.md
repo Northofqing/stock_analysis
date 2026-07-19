@@ -4,7 +4,7 @@
 Fix the reviewed v17.3 replay defects, then continue through the repository's remaining documented/code/test debt until historical claims are reconciled and all achievable gates pass with explicit evidence.
 
 ## Current Phase
-Phase 12–13 release closure (all local gates pass; PR merge pending)
+Complete — Gate A–D and v16.x closure merged to `master`
 
 ## Phases
 
@@ -94,15 +94,15 @@ Phase 12–13 release closure (all local gates pass; PR merge pending)
 - [x] Add a nullable, source-traceable same-day real-account P&L/NAV persistence path without fabricating unavailable values
 - [x] Re-run Gate A-D validation and privacy-safe local real-account evidence validation
 - [x] Complete a separate Standards/Spec/Audit pass before the fixed-SHA release review
-- [ ] Mark PR #2 Ready and merge through GitHub only after every mandatory checkbox passes
-- **Status:** release evidence complete; fixed-SHA review, GitHub checks and merge pending
+- [x] Mark PR #2 Ready and merge through GitHub only after every mandatory checkbox passes
+- **Status:** complete; PR #2 merged to `master` as `fd0df463d1029f11eb23cd02f7200820821aa1d7`
 
 ### Phase 13: v16.x completion audit
 - [x] Inventory `docs/v16.x/` requirements, completion claims, linked code and open evidence gaps
 - [x] Convert every confirmed incomplete v16.x requirement into a scoped design/plan slice with rule IDs and rollback
 - [x] Implement and validate all repository-verifiable v16.x gaps; keep unavailable external dependencies explicit rather than fabricated
 - [x] Include the v16.x closure in the same Gate A-D evidence and release review
-- **Status:** implementation and local gates complete; included in the pending PR #2 merge
+- **Status:** complete; implementation, documentation and Gate A–D evidence merged through PR #2
 
 ## Decisions
 
