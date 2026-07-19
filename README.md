@@ -25,12 +25,15 @@
 ```mermaid
 flowchart LR
   S[真实公共行情与新闻] --> V[Provider 校验与新鲜度门]
-  A[本地真实账户快照] --> V
-  V --> D[(SQLite + JSONL 审计)]
-  D --> R[分析 / 机会 / 决策]
-  R --> G[风险门与订单安全]
+  A[本地真实账户快照] --> E[账户证据校验与新鲜度门]
+  V --> R[分析 / 机会 / 决策]
+  V -. 尽力缓存 .-> C[(SQLite 市场数据缓存)]
+  C --> R
+  E --> G[风险门与订单安全]
+  R --> G
   G --> P[纸面交易]
   G --> N[受治理的事件与通知]
+  E --> D[(SQLite + JSONL 强审计)]
   P --> D
   N --> D
   D --> Q[复盘 / 绩效 / 历史回放]
@@ -43,13 +46,15 @@ flowchart LR
 | --- | --- | --- |
 | 应用入口 | `src/main.rs`, `src/bin/monitor/`, `src/bin/*.rs` | 装配运行模式、一次性任务、监控、复盘、回测和数据导入 |
 | 数据接入 | `src/data_provider/`, `src/search_service/`, `src/news/`, `src/broker.rs` | 连接真实公共源，解析协议，校验完整批次、价格、时间与来源 |
-| 持久化与审计 | `src/database/`, `migrations/`, `src/event/`, `src/push_l7/` | SQLite 事实表、JSONL 历史、订单哈希链、投递结果和五年审计边界 |
+| 持久化与审计 | `src/database/`, `migrations/`, `src/event/`, `src/push_l7/` | SQLite 市场数据缓存，以及账户快照、JSONL 历史、订单哈希链、投递结果和五年强审计边界 |
 | 研究与决策 | `src/analyzer/`, `src/indicators/`, `src/strategy/`, `src/pipeline/`, `src/opportunity/`, `src/decision/`, `src/agent/` | 技术/基本面分析、策略回测、机会发现、多 Agent 研判与最终决策 |
 | 风险与纸面执行 | `src/risk/`, `src/trading/`, `src/portfolio/`, `src/performance/` | 环境隔离、订单安全、账户/数据模式、纸面成交、持仓和绩效 |
 | 事件、通知与复盘 | `src/bus/`, `src/push_l1/`, `src/push_l2/`, `src/push_l4/`–`push_l7/`, `src/notification/`, `src/review/` | 事件标准化、去重、治理、路由、通道确认、统计与事后复盘 |
 
-依赖方向以事实链为主：数据先验证并持久化，研究模块读取事实生成决策，风险层决定是否允许
-进入纸面执行或通知，结果再回写审计存储。调用方不能绕过风险层自行制造成交事实。
+依赖方向以事实链为主：公共数据先通过 Provider 校验；有效批次可以直接进入研究，写市场数据
+缓存失败时会告警但不会把事实替换成假数据。本地账户快照走独立证据校验，不经过 Provider。
+风险层决定决策能否进入纸面执行或通知；账户、订单、成交与投递结果则必须进入对应的强审计
+边界。调用方不能绕过风险层自行制造成交事实。
 
 ## 关键数据流
 

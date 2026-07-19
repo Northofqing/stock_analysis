@@ -84,12 +84,15 @@ Use this Mermaid flow, keeping the broker branch explicitly unavailable until a 
 ```mermaid
 flowchart LR
   S[Public market/news sources] --> V[Provider validation and freshness]
-  A[Local real-account snapshot] --> V
-  V --> D[(SQLite + JSONL audit)]
-  D --> R[Analysis / opportunity / decision]
-  R --> G[Risk and order safety]
+  A[Local real-account snapshot] --> E[Account evidence validation and freshness]
+  V --> R[Analysis / opportunity / decision]
+  V -. best-effort cache .-> C[(SQLite market-data cache)]
+  C --> R
+  E --> G[Risk and order safety]
+  R --> G
   G --> P[Paper trading]
   G --> N[Governed event and notification delivery]
+  E --> D[(SQLite + JSONL required audit)]
   P --> D
   N --> D
   D --> Q[Review / performance / replay]

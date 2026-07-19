@@ -42,12 +42,15 @@
 README 只描述当前可执行合同：
 
 ```text
-真实公共数据/本地账户证据
-  -> provider 与完整批次校验
-  -> SQLite/JSONL 审计存储
-  -> pipeline/opportunity/decision
+真实公共数据 -> provider 与完整批次校验
+  -> pipeline/opportunity/decision（市场缓存写失败可告警后继续）
   -> risk/order_safety
-  -> paper trading 或受治理的通知
+
+本地账户证据 -> 独立证据校验/不可变快照/30 秒新鲜度门
+  -> risk/order_safety
+
+risk/order_safety -> paper trading 或受治理的通知
+  -> 必须落盘的账户/订单/成交/投递审计
   -> review/performance/replay
 ```
 
