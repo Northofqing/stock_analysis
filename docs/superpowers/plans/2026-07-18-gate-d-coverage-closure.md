@@ -317,3 +317,9 @@ Expected: all PASS. Commit only the two modules plus design/plan/progress eviden
 - [x] Route Sina news top/stock/range pages, Yahoo blocking quotes and Eastmoney minute K-line through private base seams while preserving production URLs and strict parsing.
 - [x] Route North-flow async/blocking, IPO-date and valuation-history requests through private URL/base seams with explicit transport/protocol failures.
 - [x] Cover complete and failing real-client transport locally with `TEST_CODE_` identities; focused loopback tests pass 16/16, all-target strict Clippy and compliance pass, and full library coverage reaches 60,103/76,066 = 79.01% globally and 29,667/32,088 = 92.46% across the registered core.
+
+### Task 35: Exercise remaining core orchestration and real-SQL contracts
+
+- [x] Reuse the existing test-only fetched-data slot behind one private backtest adapter and cover benchmark paging, ranked history acquisition, empty/source failures and pre-output wrapper failures without changing production acquisition.
+- [x] Exercise chain position diagnosis and position-tracker decision failures with isolated `TEST_CODE_` SQLite evidence; no live quote, external analysis, notification or real-account read is permitted.
+- [x] Complete database root query/validation branches with parameter-bound real-SQL tests; formatter, all-target strict Clippy, compliance and 1,660-test instrumented library regression pass, raising global coverage to 60,656/76,393 = 79.40% and registered core to 30,188/32,415 = 93.13%.

@@ -2044,8 +2044,34 @@ mod tests {
             .is_err());
         assert!(db.get_pending_predictions("x' OR 1=1 --").is_err());
         assert!(db.count_recent_pushes(&code, 0).is_err());
+        assert!(db.count_predictions_by_reason(" ").is_err());
+        assert!(db.get_prediction_hit_rate(0).is_err());
+        assert!(db
+            .save_prediction(
+                &today,
+                &target,
+                Some("测试"),
+                Some("TEST_CODE_BAD'"),
+                "看多",
+                75.0,
+                None,
+                None,
+                Some(" "),
+            )
+            .is_err());
+        assert!(db
+            .update_prediction_result(&today, Some("TEST_CODE_BAD'"), 1.0, true)
+            .is_err());
+        assert!(db
+            .get_prediction_by_code_date("TEST_CODE_BAD'", &today)
+            .is_err());
+        assert!(db.count_recent_pushes("TEST_CODE_BAD'", 1).is_err());
         assert!(db
             .count_recent_pushes_batch(std::slice::from_ref(&code), 0)
+            .is_err());
+        assert!(db.count_recent_pushes_batch(&[], 1).unwrap().is_empty());
+        assert!(db
+            .count_recent_pushes_batch(&["TEST_CODE_BAD'".to_string()], 1)
             .is_err());
 
         diesel::sql_query(
@@ -2070,6 +2096,8 @@ mod tests {
         let suffix = unique_test_label("TOPIC");
         let first = format!("TEST_TOPIC_FIRST_{suffix}");
         let second = format!("TEST_TOPIC_SECOND_{suffix}");
+        db.upsert_topic_history_signatures(&[], 0)
+            .expect("empty complete batch is a no-op");
         db.upsert_topic_history_signatures(&[first.clone(), second.clone()], 50)
             .unwrap();
         db.upsert_topic_history_signatures(std::slice::from_ref(&first), 50)
@@ -2109,6 +2137,52 @@ mod tests {
             .bind::<diesel::sql_types::Text, _>(&rejected)
             .execute(&mut conn)
             .unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn remaining_root_accessors_and_factor_ic_query_use_real_sql_rows() {
+        init_db_for_test();
+        let db = DatabaseManager::get();
+        assert!(std::ptr::eq(get_db(), db));
+        assert_eq!(
+            DatabaseManager::with_db("TEST_CODE_ROOT", |_| Some(7)),
+            Some(7)
+        );
+
+        let suffix = unique_test_label("FACTOR_IC");
+        let code = format!("TEST_CODE_{suffix}");
+        let buy_price = 1234.567;
+        let sell_price = 1300.0;
+        let buy_date = "2198-01-02";
+        let mut conn = db.get_conn().expect("test database connection");
+        diesel::sql_query(
+            "INSERT INTO stock_position
+             (code, name, buy_date, buy_price, quantity, status, sell_date, sell_price, return_rate)
+             VALUES (?, 'TEST_CODE_因子样本', ?, ?, 100, 'closed', '2198-01-03', ?, 5.0)",
+        )
+        .bind::<diesel::sql_types::Text, _>(&code)
+        .bind::<diesel::sql_types::Text, _>(buy_date)
+        .bind::<diesel::sql_types::Double, _>(buy_price)
+        .bind::<diesel::sql_types::Double, _>(sell_price)
+        .execute(&mut conn)
+        .expect("insert complete closed position");
+        drop(conn);
+
+        let rows = db.get_factor_ic_data().expect("factor IC repository query");
+        let row = rows
+            .iter()
+            .find(|row| (row.buy_price - buy_price).abs() < f64::EPSILON)
+            .expect("inserted factor IC row");
+        assert_eq!(row.sell_price, sell_price);
+        assert_eq!(row.sentiment_score, None);
+        assert_eq!(row.score_breakdown_json, None);
+
+        let mut conn = db.get_conn().expect("cleanup database connection");
+        diesel::sql_query("DELETE FROM stock_position WHERE code = ?")
+            .bind::<diesel::sql_types::Text, _>(&code)
+            .execute(&mut conn)
+            .expect("cleanup factor IC row");
     }
 
     #[test]

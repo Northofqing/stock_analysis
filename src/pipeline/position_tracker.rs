@@ -558,9 +558,11 @@ mod tests {
     };
     use crate::data_provider::{AdjustType, KlineData};
     use crate::database::DatabaseManager;
+    use crate::indicators::DivergenceType;
     use crate::models::{AnalysisResultRecord, NewStockPosition};
     use crate::monitor::risk::{MarketRegime, PositionSizer};
     use crate::schema::{analysis_result, stock_position};
+    use crate::strategy::boll_macd::{BollMacdAction, BollMacdSignal};
     use chrono::{Duration, Local, NaiveDate};
     use diesel::prelude::*;
     use once_cell::sync::Lazy;
@@ -660,6 +662,24 @@ mod tests {
             regime,
             atr: None,
             use_dynamic: false,
+        }
+    }
+
+    fn boll_signal(action: BollMacdAction, reason: &str) -> BollMacdSignal {
+        BollMacdSignal {
+            action,
+            reason: reason.to_string(),
+            close: 10.0,
+            upper: 10.0,
+            middle: 9.0,
+            lower: 8.0,
+            band_width_pct: 20.0,
+            band_change_pct: 5.0,
+            macd_dif: 1.0,
+            macd_dea: 0.5,
+            macd_hist: 0.5,
+            macd_div: DivergenceType::None,
+            vol_ratio: 1.5,
         }
     }
 
@@ -768,6 +788,9 @@ mod tests {
 
     #[test]
     fn non_dynamic_sizing_uses_real_cash_without_forcing_a_lot() {
+        let from_env = RiskContext::from_env(MarketRegime::Structural, Some(1.0));
+        assert_eq!(from_env.regime, MarketRegime::Structural);
+        assert_eq!(from_env.atr, Some(1.0));
         assert_eq!(position_shares(10.0, 100_000.0), Ok(2_000));
         assert!(position_shares(100.0, 100.0).is_err());
         assert!(position_shares(0.0, 100_000.0).is_err());
@@ -1036,6 +1059,105 @@ mod tests {
                 .as_deref(),
             Some(buy_chain.as_str())
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn tracking_reason_matrix_preserves_t1_and_audited_signal_evidence() {
+        let _ledger = prepare_execution_account();
+        let today = Local::now().date_naive();
+
+        let invalid_atr = unique("INVALID_ATR_T1");
+        save_position(
+            &invalid_atr,
+            today.to_string(),
+            12.0,
+            Some(unique("INVALID_ATR_CHAIN")),
+        );
+        let mut invalid_atr_result = result(&invalid_atr);
+        invalid_atr_result.current_price = Some(10.0);
+        let mut invalid_atr_risk = risk(MarketRegime::Structural);
+        invalid_atr_risk.atr = Some(0.0);
+        track_position(
+            &invalid_atr,
+            &[kline(10.0, -1.0)],
+            &mut invalid_atr_result,
+            &invalid_atr_risk,
+        )
+        .expect("invalid ATR uses the registered fixed stop and remains T+1 locked");
+        assert_eq!(invalid_atr_result.position_status.as_deref(), Some("open"));
+
+        let profit_t1 = unique("PROFIT_T1");
+        save_position(
+            &profit_t1,
+            today.to_string(),
+            8.0,
+            Some(unique("PROFIT_T1_CHAIN")),
+        );
+        let mut profit_result = result(&profit_t1);
+        profit_result.current_price = Some(10.0);
+        profit_result.ma5 = Some(11.0);
+        track_position(
+            &profit_t1,
+            &[kline(10.0, 1.0)],
+            &mut profit_result,
+            &risk(MarketRegime::Structural),
+        )
+        .expect("profit trend exit remains T+1 locked");
+        assert_eq!(profit_result.position_status.as_deref(), Some("open"));
+
+        let top_t1 = unique("TOP_T1");
+        save_position(
+            &top_t1,
+            today.to_string(),
+            9.0,
+            Some(unique("TOP_T1_CHAIN")),
+        );
+        let mut top_result = result(&top_t1);
+        top_result.current_price = Some(10.0);
+        top_result.boll_macd = Some(boll_signal(BollMacdAction::TopSell, "TEST_CODE_顶部背离"));
+        track_position(
+            &top_t1,
+            &[kline(10.0, 1.0)],
+            &mut top_result,
+            &risk(MarketRegime::Structural),
+        )
+        .expect("top sell remains T+1 locked");
+        assert_eq!(top_result.position_status.as_deref(), Some("open"));
+
+        let atr_close = unique("ATR_CLOSE");
+        save_position(
+            &atr_close,
+            (today - Duration::days(2)).to_string(),
+            12.0,
+            Some(unique("ATR_CLOSE_CHAIN")),
+        );
+        let mut atr_result = result(&atr_close);
+        atr_result.current_price = Some(10.0);
+        let mut atr_risk = risk(MarketRegime::Structural);
+        atr_risk.atr = Some(1.0);
+        track_position(&atr_close, &[kline(10.0, -1.0)], &mut atr_result, &atr_risk)
+            .expect("positive ATR stop closes through audited gateway");
+        assert_eq!(atr_result.position_status.as_deref(), Some("closed"));
+
+        for (label, action) in [
+            ("UPTREND_OPEN", BollMacdAction::UptrendStart),
+            ("BOTTOM_OPEN", BollMacdAction::BottomBuy),
+        ] {
+            let code = unique(label);
+            save_fresh_chain(&code, &unique(&format!("{label}_CHAIN")));
+            let mut value = result(&code);
+            value.current_price = Some(10.0);
+            value.boll_macd = Some(boll_signal(action, "TEST_CODE_技术共振"));
+            track_position(
+                &code,
+                &[kline(10.0, 1.0)],
+                &mut value,
+                &risk(MarketRegime::Structural),
+            )
+            .expect("audited Bollinger/MACD open");
+            assert_eq!(value.position_status.as_deref(), Some("new"));
+        }
     }
 
     #[test]

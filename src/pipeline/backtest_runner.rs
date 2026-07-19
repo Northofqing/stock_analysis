@@ -23,6 +23,25 @@ type StockHistory = (String, String, Vec<crate::data_provider::KlineData>);
 type HistorySplit = (String, Vec<StockHistory>, Vec<StockHistory>);
 
 impl AnalysisPipeline {
+    /// Read historical bars through the production manager. Test builds may reuse the
+    /// pipeline's existing isolated fetched-data slot; that slot is not compiled into
+    /// production and therefore cannot become a market-data fallback (AGENTS 2.1/2.5).
+    fn get_backtest_daily_data(
+        &self,
+        code: &str,
+        days: usize,
+    ) -> Result<(Vec<crate::data_provider::KlineData>, &'static str)> {
+        #[cfg(test)]
+        if let Some(result) = self.test_fetched_data.as_ref() {
+            return result
+                .clone()
+                .map(|data| (data, "test-isolated"))
+                .map_err(anyhow::Error::msg);
+        }
+
+        self.data_manager.get_daily_data(code, days)
+    }
+
     /// 多因子回测（使用真正的日频因子快照，无 look-ahead）
     ///
     /// 修复：QUANT_ANALYST_REVIEW §1.5
@@ -262,7 +281,7 @@ impl AnalysisPipeline {
             if chunk_days == 0 {
                 break;
             }
-            match self.data_manager.get_daily_data(code, chunk_days) {
+            match self.get_backtest_daily_data(code, chunk_days) {
                 Ok((data, _)) if !data.is_empty() => {
                     for k in &data {
                         all_closes.insert(k.date, k.close);
@@ -540,7 +559,7 @@ impl AnalysisPipeline {
         let top_n = 10;
         let mut stocks_data = Vec::new();
         for r in sorted.iter().take(top_n) {
-            match self.data_manager.get_daily_data(&r.code, 60) {
+            match self.get_backtest_daily_data(&r.code, 60) {
                 Ok((data, _)) if data.len() >= 30 => {
                     stocks_data.push((r.code.clone(), r.name.clone(), data));
                 }
@@ -671,7 +690,7 @@ impl AnalysisPipeline {
 
         let mut stocks_data = Vec::new();
         for r in sorted.iter().take(top_n) {
-            match self.data_manager.get_daily_data(&r.code, days) {
+            match self.get_backtest_daily_data(&r.code, days) {
                 Ok((data, _)) if !data.is_empty() => {
                     stocks_data.push((r.code.clone(), r.name.clone(), data));
                 }
@@ -1024,6 +1043,78 @@ mod tests {
             .map(|kline| (kline.date, kline.close * 100.0))
             .collect();
         BenchmarkSeries::new("TEST_CODE_基准", closes)
+    }
+
+    fn analysis_result(code: &str, ranking_score: i32) -> AnalysisResult {
+        serde_json::from_value(serde_json::json!({
+            "code": code,
+            "name": format!("{code}_名称"),
+            "sentiment_score": 50,
+            "ranking_score": ranking_score,
+            "operation_advice": "观望",
+            "trend_prediction": "盘整",
+            "analysis_summary": "TEST_CODE_本地回测候选",
+            "is_limit_up": false,
+            "contrarian_signal": false
+        }))
+        .expect("valid analysis result")
+    }
+
+    #[tokio::test]
+    async fn isolated_backtest_acquisition_covers_paging_ranking_and_explicit_failures() {
+        let mut pipeline = AnalysisPipeline::new(super::super::PipelineConfig {
+            max_workers: 1,
+            dry_run: true,
+            send_notification: false,
+            single_notify: false,
+            ..Default::default()
+        })
+        .expect("isolated pipeline");
+        let bars = factor_history(30)[0].2.clone();
+        pipeline.test_fetched_data = Some(Ok(bars));
+
+        let benchmark = pipeline
+            .fetch_benchmark_series_with_code("TEST_CODE_000300", "TEST_CODE_基准", 366)
+            .await
+            .expect("two-page isolated benchmark");
+        assert_eq!(benchmark.name, "TEST_CODE_基准");
+        assert_eq!(benchmark.closes.len(), 30);
+        assert!(pipeline.fetch_benchmark_series(0).await.is_none());
+
+        let ranked = vec![
+            analysis_result("TEST_CODE_000001", 10),
+            analysis_result("TEST_CODE_000002", 90),
+            analysis_result("TEST_CODE_000003", 50),
+        ];
+        let selected = pipeline.fetch_top_backtest_history(&ranked, 2, 30).await;
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].0, "TEST_CODE_000002");
+        assert_eq!(selected[1].0, "TEST_CODE_000003");
+
+        let wrapper_error = pipeline
+            .run_multi_factor_backtest(&ranked[..2])
+            .await
+            .expect_err("fewer than three acquired stocks must block output");
+        assert!(wrapper_error.to_string().contains("至少3只股票"));
+        assert!(pipeline
+            .run_bollinger_zscore_backtest(&history(29))
+            .await
+            .is_err());
+        assert!(pipeline.run_rsi_backtest(&history(19)).await.is_err());
+
+        pipeline.test_fetched_data = Some(Ok(Vec::new()));
+        assert!(pipeline.fetch_benchmark_series(30).await.is_none());
+        assert!(pipeline
+            .fetch_top_backtest_history(&ranked, 2, 30)
+            .await
+            .is_empty());
+
+        pipeline.test_fetched_data = Some(Err("TEST_CODE_历史源失败".to_string()));
+        assert!(pipeline.fetch_benchmark_series(30).await.is_none());
+        assert!(pipeline
+            .fetch_top_backtest_history(&ranked, 2, 30)
+            .await
+            .is_empty());
     }
 
     /// 修复：QUANT_ANALYST_REVIEW §1.5

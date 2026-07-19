@@ -1409,6 +1409,7 @@ fn build_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use diesel::prelude::*;
     use once_cell::sync::Lazy;
     use std::sync::Mutex;
 
@@ -1974,6 +1975,104 @@ mod tests {
         assert!(report.contains("测试链甲"));
         assert!(report.contains("持仓主线诊断"));
         assert!(report.contains("其他热点速览"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn position_diagnosis_uses_complete_sqlite_positions_and_cached_concepts() {
+        crate::database::DatabaseManager::init(None).expect("isolated test database");
+        let db = crate::database::DatabaseManager::get();
+        let suffix = format!(
+            "{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        );
+        let member = format!("TEST_CODE_CHAIN_MEMBER_{suffix}");
+        let alias = format!("TEST_CODE_CHAIN_ALIAS_{suffix}");
+        let unrelated = format!("TEST_CODE_CHAIN_OTHER_{suffix}");
+        let codes = [&member, &alias, &unrelated];
+
+        let mut conn = db.get_conn().expect("test database connection");
+        // Previous isolated tests may deliberately leave a malformed cache row. It is
+        // not part of this complete input batch and must not trigger a real fetch here.
+        diesel::sql_query("DELETE FROM stock_concepts WHERE json_valid(concepts) = 0")
+            .execute(&mut conn)
+            .expect("remove deliberately malformed isolated fixture rows");
+        for existing in db
+            .get_all_open_positions()
+            .expect("existing isolated positions")
+        {
+            db.save_stock_concepts(&existing.code, &[format!("TEST_CODE_UNRELATED_{suffix}")])
+                .expect("complete cache for isolated existing position");
+        }
+        for (index, code) in codes.iter().enumerate() {
+            diesel::sql_query(
+                "INSERT INTO stock_position
+                 (code, name, buy_date, buy_price, quantity, status, chain_name)
+                 VALUES (?, ?, '2026-07-17', 10.0, 100, 'open', NULL)",
+            )
+            .bind::<diesel::sql_types::Text, _>(*code)
+            .bind::<diesel::sql_types::Text, _>(format!("TEST_CODE_持仓{index}"))
+            .execute(&mut conn)
+            .expect("insert isolated position evidence");
+        }
+        drop(conn);
+
+        db.save_stock_concepts(&member, &["TEST_CODE_主线".to_string()])
+            .expect("member concept cache");
+        db.save_stock_concepts(&alias, &["TEST_CODE_别名".to_string()])
+            .expect("alias concept cache");
+        db.save_stock_concepts(&unrelated, &["TEST_CODE_无关".to_string()])
+            .expect("unrelated concept cache");
+
+        let cluster = ChainCluster {
+            concept: "TEST_CODE_主线".to_string(),
+            aliases: vec!["TEST_CODE_别名".to_string()],
+            stocks: vec![top(&member, "TEST_CODE_成员", 10.0)],
+            continuation_count: 0,
+            streak_days: 3,
+            candidates: Vec::new(),
+            score: None,
+            scenario: None,
+        };
+        let diagnosed = diagnose_positions(&[cluster])
+            .await
+            .expect("complete cached position diagnosis");
+        let member_diag = diagnosed
+            .iter()
+            .find(|item| item.code == member)
+            .expect("member diagnosis");
+        assert!(member_diag.in_limit_pool);
+        assert_eq!(
+            member_diag.mainline,
+            Some(("TEST_CODE_主线".to_string(), 3))
+        );
+        let alias_diag = diagnosed
+            .iter()
+            .find(|item| item.code == alias)
+            .expect("alias diagnosis");
+        assert!(!alias_diag.in_limit_pool);
+        assert_eq!(alias_diag.mainline, Some(("TEST_CODE_主线".to_string(), 3)));
+        let other_diag = diagnosed
+            .iter()
+            .find(|item| item.code == unrelated)
+            .expect("unrelated diagnosis");
+        assert_eq!(other_diag.mainline, None);
+
+        let mut conn = db.get_conn().expect("cleanup database connection");
+        for code in codes {
+            diesel::sql_query("DELETE FROM stock_position WHERE code = ?")
+                .bind::<diesel::sql_types::Text, _>(code)
+                .execute(&mut conn)
+                .expect("cleanup isolated position");
+            diesel::sql_query("DELETE FROM stock_concepts WHERE code = ?")
+                .bind::<diesel::sql_types::Text, _>(code)
+                .execute(&mut conn)
+                .expect("cleanup isolated concept cache");
+        }
     }
 
     #[test]
