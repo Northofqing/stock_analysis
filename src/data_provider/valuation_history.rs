@@ -173,13 +173,22 @@ fn parse_valuation_history(json: &Value) -> Result<ValuationHistory> {
 
 /// 异步拉取并计算分位
 pub async fn fetch_async(client: &reqwest::Client, code: &str) -> Result<ValuationHistory> {
+    fetch_async_from_base(client, code, "https://datacenter-web.eastmoney.com").await
+}
+
+async fn fetch_async_from_base(
+    client: &reqwest::Client,
+    code: &str,
+    base: &str,
+) -> Result<ValuationHistory> {
     let filter = format!("(SECURITY_CODE=\"{}\")", code);
     let url = format!(
-        "https://datacenter-web.eastmoney.com/api/data/v1/get?\
+        "{}/api/data/v1/get?\
          reportName=RPT_VALUEANALYSIS_DET&\
          columns=SECURITY_CODE,TRADE_DATE,PE_TTM,PB_MRQ&\
          filter={}&sortColumns=TRADE_DATE&sortTypes=-1&pageSize=750&pageNumber=1",
-        urlencoding::encode(&filter)
+        base.trim_end_matches('/'),
+        urlencoding::encode(&filter),
     );
     log::debug!("[估值历史] {}", url);
 
@@ -315,5 +324,28 @@ mod tests {
     async fn real_valuation_transport_failure_is_not_an_empty_history() {
         let client = super::super::unreachable_http_client();
         assert!(fetch_async(&client, "TEST_CODE_000001").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn loopback_valuation_transport_parses_complete_consecutive_history() {
+        use super::super::{loopback_http_client, TestHttpResponse, TestHttpServer};
+
+        let body = serde_json::json!({"result": {"data": [
+            {"TRADE_DATE": "2026-07-17", "PE_TTM": 10.0, "PB_MRQ": 1.0},
+            {"TRADE_DATE": "2026-07-16", "PE_TTM": 11.0, "PB_MRQ": 1.1}
+        ]}})
+        .to_string();
+        let server = TestHttpServer::new(vec![TestHttpResponse::json(body)]);
+        let history = fetch_async_from_base(
+            &loopback_http_client(),
+            "TEST_CODE_000001",
+            server.base_url(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(history.current_pe, Some(10.0));
+        let request = server.finish().pop().unwrap();
+        assert!(request.contains("RPT_VALUEANALYSIS_DET"));
+        assert!(request.contains("TEST_CODE_000001"));
     }
 }

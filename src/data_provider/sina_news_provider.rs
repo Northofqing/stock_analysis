@@ -22,12 +22,26 @@ pub const SINA_NEWS_API_BASE: &str = "https://feed.mix.sina.com.cn/api/roll/get"
 
 /// 财经要闻 URL (lid=1686, pageid=155).
 pub fn build_top_news_url(num: usize) -> String {
-    format!("{SINA_NEWS_API_BASE}?pageid=155&lid=1686&k=&num={num}&page=1")
+    build_top_news_url_from_base(SINA_NEWS_API_BASE, num)
 }
 
 /// 个股新闻 URL (lid=2516, pageid=155, k=code).
 pub fn build_stock_news_url(code: &str, num: usize) -> String {
-    format!("{SINA_NEWS_API_BASE}?pageid=155&lid=2516&k={code}&num={num}&page=1")
+    build_stock_news_url_from_base(SINA_NEWS_API_BASE, code, num)
+}
+
+fn build_top_news_url_from_base(base: &str, num: usize) -> String {
+    format!(
+        "{}?pageid=155&lid=1686&k=&num={num}&page=1",
+        base.trim_end_matches('/')
+    )
+}
+
+fn build_stock_news_url_from_base(base: &str, code: &str, num: usize) -> String {
+    format!(
+        "{}?pageid=155&lid=2516&k={code}&num={num}&page=1",
+        base.trim_end_matches('/')
+    )
 }
 
 /// 解析 Sina 新闻 body → `Vec<NewsItem>`.
@@ -58,7 +72,11 @@ pub fn parse_sina_news_body(
         return Err(anyhow!("Sina news: category 不能为空"));
     }
     if let Some(code) = code {
-        if code.len() != 6 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
+        #[cfg(test)]
+        let protocol_code = code.strip_prefix("TEST_CODE_").unwrap_or(code);
+        #[cfg(not(test))]
+        let protocol_code = code;
+        if protocol_code.len() != 6 || !protocol_code.bytes().all(|byte| byte.is_ascii_digit()) {
             return Err(anyhow!("Sina news: 非法股票代码 {code:?}"));
         }
     }
@@ -173,14 +191,14 @@ impl SinaNewsProvider {
 
     /// 财经要闻 (大盘/政策/外盘快讯).
     pub async fn fetch_top_news(&self, num: usize) -> Result<Vec<NewsItem>> {
-        let url = build_top_news_url(num);
+        let url = build_top_news_url_from_base(&self.api_base, num);
         let body = self.fetch_bytes(&url).await?;
         parse_sina_news_body(&body, "财经要闻", None)
     }
 
     /// 个股新闻 (按 code).
     pub async fn fetch_stock_news(&self, code: &str, num: usize) -> Result<Vec<NewsItem>> {
-        let url = build_stock_news_url(code, num);
+        let url = build_stock_news_url_from_base(&self.api_base, code, num);
         let body = self.fetch_bytes(&url).await?;
         parse_sina_news_body(&body, "个股新闻", Some(code))
     }
@@ -429,5 +447,40 @@ mod tests {
     fn provider_default_keeps_real_api_base() {
         let provider = SinaNewsProvider::default();
         assert_eq!(provider.api_base, SINA_NEWS_API_BASE);
+    }
+
+    #[tokio::test]
+    async fn loopback_news_transport_executes_top_stock_and_five_page_range() {
+        use super::super::{loopback_http_client, TestHttpResponse, TestHttpServer};
+
+        let server = TestHttpServer::new(
+            (0..7)
+                .map(|_| TestHttpResponse::json(valid_body()))
+                .collect(),
+        );
+        let provider = SinaNewsProvider {
+            client: loopback_http_client(),
+            api_base: server.base_url().to_string(),
+        };
+        assert_eq!(provider.fetch_top_news(4).await.unwrap().len(), 4);
+        let stock = provider
+            .fetch_stock_news("TEST_CODE_600519", 4)
+            .await
+            .unwrap();
+        assert!(stock
+            .iter()
+            .all(|item| item.code.as_deref() == Some("TEST_CODE_600519")));
+        let from = chrono::DateTime::from_timestamp(1_699_999_999, 0).unwrap();
+        let to = chrono::DateTime::from_timestamp(1_700_000_004, 0).unwrap();
+        let ranged = provider
+            .fetch_stock_news_in_range("TEST_CODE_600519", from, to)
+            .await
+            .unwrap();
+        assert_eq!(ranged.len(), 20);
+        let requests = server.finish();
+        assert!(requests[0].contains("lid=1686"));
+        assert!(requests[1].contains("k=TEST_CODE_600519"));
+        assert!(requests[2].ends_with("page=1"));
+        assert!(requests[6].ends_with("page=5"));
     }
 }

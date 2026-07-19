@@ -130,6 +130,14 @@ fn fetch_quotes_with_client(
     client: &reqwest::blocking::Client,
     codes: &[String],
 ) -> Result<Vec<YahooQuote>, String> {
+    fetch_quotes_from_base(client, codes, "https://query1.finance.yahoo.com")
+}
+
+fn fetch_quotes_from_base(
+    client: &reqwest::blocking::Client,
+    codes: &[String],
+    base: &str,
+) -> Result<Vec<YahooQuote>, String> {
     if codes.is_empty() {
         return Ok(vec![]);
     }
@@ -147,7 +155,8 @@ fn fetch_quotes_with_client(
         .collect();
 
     let url = format!(
-        "https://query1.finance.yahoo.com/v7/finance/quote?symbols={}",
+        "{}/v7/finance/quote?symbols={}",
+        base.trim_end_matches('/'),
         symbols.join(",")
     );
 
@@ -349,5 +358,51 @@ mod tests {
         let error = fetch_quotes_with_client(&client, &["TEST_CODE_000001".to_string()])
             .expect_err("unreachable Yahoo transport must fail");
         assert!(error.contains("request failed"));
+    }
+
+    #[test]
+    fn loopback_blocking_transport_preserves_complete_and_missing_quote_rows() {
+        use super::super::{TestHttpResponse, TestHttpServer};
+
+        let body = serde_json::json!({"quoteResponse": {"result": [{
+            "symbol": "TEST_CODE_000001",
+            "regularMarketPrice": 10.1,
+            "regularMarketChangePercent": 1.0,
+            "regularMarketVolume": 1234.0,
+            "regularMarketPreviousClose": 10.0
+        }]}})
+        .to_string();
+        let server = TestHttpServer::new(vec![TestHttpResponse::json(body)]);
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        let quotes = fetch_quotes_from_base(
+            &client,
+            &[
+                "TEST_CODE_000001".to_string(),
+                "TEST_CODE_MISSING".to_string(),
+            ],
+            server.base_url(),
+        )
+        .unwrap();
+        assert_eq!(quotes.len(), 1);
+        assert_eq!(quotes[0].code, "TEST_CODE_000001");
+        assert_eq!(quotes[0].price, Some(10.1));
+        let requests = server.finish();
+        assert!(requests[0].contains("symbols=TEST_CODE_000001,TEST_CODE_MISSING"));
+
+        let server = TestHttpServer::new(vec![TestHttpResponse {
+            status: 503,
+            body: "unavailable".to_string(),
+        }]);
+        let error = fetch_quotes_from_base(
+            &client,
+            &["TEST_CODE_000001".to_string()],
+            server.base_url(),
+        )
+        .unwrap_err();
+        assert!(error.contains("HTTP status"));
+        assert_eq!(server.finish().len(), 1);
     }
 }

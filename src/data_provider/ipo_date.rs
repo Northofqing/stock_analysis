@@ -57,13 +57,22 @@ fn parse_ipo_date_body(body: &str, code: &str) -> Result<NaiveDate> {
 }
 
 async fn fetch_ipo_date_with_client(client: &reqwest::Client, code: &str) -> Result<NaiveDate> {
+    fetch_ipo_date_from_base(client, code, "https://push2.eastmoney.com").await
+}
+
+async fn fetch_ipo_date_from_base(
+    client: &reqwest::Client,
+    code: &str,
+    base: &str,
+) -> Result<NaiveDate> {
     // 1. 6 位代码 → 1.600519 (沪) 或 0.000001 (深)
     let secid = secid_for_code(code)?;
 
     // 2. 东方财富 f26 = 上市日期 (YYYYMMDD, 8 位字符串)
     let url = format!(
-        "https://push2.eastmoney.com/api/qt/stock/get?secid={}&fields=f26",
-        secid
+        "{}/api/qt/stock/get?secid={}&fields=f26",
+        base.trim_end_matches('/'),
+        secid,
     );
 
     let body = client
@@ -112,6 +121,24 @@ mod tests {
         assert!(fetch_ipo_date_with_client(&client, "TEST_CODE_920001")
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn loopback_ipo_transport_preserves_route_and_real_date() {
+        use super::super::{loopback_http_client, TestHttpResponse, TestHttpServer};
+
+        let server = TestHttpServer::new(vec![TestHttpResponse::json(
+            r#"{"data":{"f26":"20010827"}}"#,
+        )]);
+        let date = fetch_ipo_date_from_base(
+            &loopback_http_client(),
+            "TEST_CODE_600519",
+            server.base_url(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(date, NaiveDate::from_ymd_opt(2001, 8, 27).unwrap());
+        assert!(server.finish()[0].contains("secid=1.600519"));
     }
 
     /// ⚠️ 网络依赖, `#[ignore]` 跳过 CI, 手动跑:

@@ -71,13 +71,19 @@ struct RawResp {
 
 pub struct NorthFlowClient {
     http: reqwest::Client,
+    url: String,
 }
+
+const NORTH_FLOW_URL: &str = "https://push2.eastmoney.com/api/qt/kamt/get?fields1=f1,f2,f3,f4&fields2=f51,f52,f53,f54,f55,f56&klt=1&lmt=1&fields=f51,f52,f54";
 
 impl NorthFlowClient {
     pub fn new() -> Self {
         // review #15: 复用 SHARED_FAST_HTTP_CLIENT (5s timeout, 适合快查).
         let http = crate::http_client::SHARED_FAST_HTTP_CLIENT.clone();
-        Self { http }
+        Self {
+            http,
+            url: NORTH_FLOW_URL.to_string(),
+        }
     }
 
     /// 解析响应（可单测）
@@ -124,10 +130,9 @@ impl NorthFlowClient {
 
     /// 实际拉取（带网络）
     pub async fn fetch(&self) -> Result<NorthFlowSeries, String> {
-        let url = "https://push2.eastmoney.com/api/qt/kamt/get?fields1=f1,f2,f3,f4&fields2=f51,f52,f53,f54,f55,f56&klt=1&lmt=1&fields=f51,f52,f54";
         let resp = self
             .http
-            .get(url)
+            .get(&self.url)
             .send()
             .await
             .map_err(|e| format!("北向资金 HTTP 请求失败: {e}"))?;
@@ -144,9 +149,21 @@ impl NorthFlowClient {
     /// (例如 spawn_blocking 闭包, 或同步函数).
     /// 用法与 `fetch` 相同, 只是不返回 Future.
     pub fn fetch_blocking(&self) -> Result<NorthFlowSeries, String> {
-        let url = "https://push2.eastmoney.com/api/qt/kamt/get?fields1=f1,f2,f3,f4&fields2=f51,f52,f53,f54,f55,f56&klt=1&lmt=1&fields=f51,f52,f54";
-        let resp =
-            reqwest::blocking::get(url).map_err(|e| format!("北向资金 HTTP 请求失败: {e}"))?;
+        Self::fetch_blocking_from_url(NORTH_FLOW_URL)
+    }
+
+    fn fetch_blocking_from_url(url: &str) -> Result<NorthFlowSeries, String> {
+        let builder =
+            reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(5));
+        #[cfg(test)]
+        let builder = builder.no_proxy();
+        let client = builder
+            .build()
+            .map_err(|e| format!("北向资金 HTTP client 创建失败: {e}"))?;
+        let resp = client
+            .get(url)
+            .send()
+            .map_err(|e| format!("北向资金 HTTP 请求失败: {e}"))?;
         let text = resp
             .text()
             .map_err(|e| format!("北向资金响应文本读取失败: {e}"))?;
@@ -258,6 +275,7 @@ mod tests {
     async fn real_north_flow_transport_failure_remains_an_error() {
         let client = NorthFlowClient {
             http: super::super::unreachable_http_client(),
+            url: NORTH_FLOW_URL.to_string(),
         };
         let error = client
             .fetch()
@@ -265,5 +283,34 @@ mod tests {
             .expect_err("an unreachable real source must fail");
         assert!(error.contains("HTTP 请求失败"));
         let _default_client = NorthFlowClient::default();
+    }
+
+    #[tokio::test]
+    async fn loopback_north_flow_async_transport_parses_complete_fact() {
+        use super::super::{loopback_http_client, TestHttpResponse, TestHttpServer};
+
+        let body = r#"{"data":{"hk2sh":{"dayNetAmtIn":100000000.0,"date2":"2026-07-17"},"hk2sz":{"dayNetAmtIn":-25000000.0,"date2":"2026-07-17"}}}"#;
+        let server = TestHttpServer::new(vec![TestHttpResponse::json(body)]);
+        let client = NorthFlowClient {
+            http: loopback_http_client(),
+            url: server.base_url().to_string(),
+        };
+        assert_eq!(client.fetch().await.unwrap().latest_total(), Some(0.75));
+        assert_eq!(server.finish(), vec!["/"]);
+    }
+
+    #[test]
+    fn loopback_north_flow_blocking_transport_parses_complete_fact() {
+        use super::super::{TestHttpResponse, TestHttpServer};
+
+        let body = r#"{"data":{"hk2sh":{"dayNetAmtIn":100000000.0,"date2":"2026-07-17"},"hk2sz":{"dayNetAmtIn":-25000000.0,"date2":"2026-07-17"}}}"#;
+        let server = TestHttpServer::new(vec![TestHttpResponse::json(body)]);
+        assert_eq!(
+            NorthFlowClient::fetch_blocking_from_url(server.base_url())
+                .unwrap()
+                .latest_total(),
+            Some(0.75)
+        );
+        assert_eq!(server.finish(), vec!["/"]);
     }
 }

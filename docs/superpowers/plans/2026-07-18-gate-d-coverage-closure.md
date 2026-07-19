@@ -311,3 +311,9 @@ Expected: all PASS. Commit only the two modules plus design/plan/progress eviden
 - [x] Replace the synchronous pipeline test mutex held across `await` with the repository's async-compatible serialized test domain and preserve environment restoration.
 - [x] Execute BaoStock login, session reuse, K-line request and strict response assembly against a test-only loopback TCP listener without changing its production endpoint or protocol.
 - [x] Cover complete and explicit protocol failures, then run focused tests, formatter, all-target strict Clippy and instrumented library coverage; 1,649 tests pass with 10 live integrations ignored, global coverage is 59,788/75,852 = 78.82%, and registered core is 29,352/31,874 = 92.09%.
+
+### Task 34: Exercise auxiliary HTTP providers over loopback
+
+- [x] Route Sina news top/stock/range pages, Yahoo blocking quotes and Eastmoney minute K-line through private base seams while preserving production URLs and strict parsing.
+- [x] Route North-flow async/blocking, IPO-date and valuation-history requests through private URL/base seams with explicit transport/protocol failures.
+- [x] Cover complete and failing real-client transport locally with `TEST_CODE_` identities; focused loopback tests pass 16/16, all-target strict Clippy and compliance pass, and full library coverage reaches 60,103/76,066 = 79.01% globally and 29,667/32,088 = 92.46% across the registered core.

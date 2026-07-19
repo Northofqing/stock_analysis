@@ -757,3 +757,9 @@ Failure handling:
 - 数据流：BaoStock 生产仍连接 `BAOSTOCK_HOST:BAOSTOCK_PORT`，使用既有登录、session 缓存、K 线查询、帧 CRC/解压和 BR-092 批次校验。测试只给 provider 实例写入 `127.0.0.1` 临时端口，由一次性 TCP listener 返回完整登录与 K 线协议帧；listener 不进入生产构建或 provider 注册。RustDX 继续保留既有公共通达信连接，若其依赖不支持端点注入则不伪造成功路径。
 - 失败与隔离：登录缺字段/非零错误、错误消息类型、K 线错误、连接/读取失败必须显式返回；session 只在完整登录后缓存。流水线测试的环境变量串行域改用仓库现有 `serial_test` 异步兼容机制，避免同步 `MutexGuard` 跨 `await`，并继续在任意返回路径恢复环境。
 - 测试与回滚：所有行情身份使用 `TEST_CODE_`，原生 `sh.000001` 仅作为 BaoStock 协议路由字段；不得访问公网、写真实账户、发通知或下单。整体回退 TCP 测试和串行域调整；不得删除协议 CRC、完整帧、批次或缺失字段校验。
+
+## Addendum: Gate-D Task 34 辅助 HTTP 数据源回环 transport（2026-07-19）
+
+- 数据流：新浪新闻、Yahoo 行情、东方财富分钟线/北向资金/IPO 日期/估值历史继续使用既有生产端点、字段和解析器。模块私有 base/URL seam 只统一 URL 构造与 transport；生产入口传入原常量，`cfg(test)` 测试传入 Task 31 回环地址，真实 async/blocking `reqwest` 必须取得完整响应后进入生产同一解析器。
+- 完整性与失败：新闻分页仍逐页取得并按真实发布时间过滤；Yahoo 只接受请求 symbol 且缺字段保持 `None`；分钟线继续逐主机失败切换并执行时间/价格完整性；北向资金双通道、IPO `f26`、估值历史日期连续性和有限数值缺一即失败。非 2xx、读失败、坏 JSON、缺数组/字段不得返回默认事实。
+- 测试隔离与回滚：领域身份使用 `TEST_CODE_`，Yahoo 原生指数和六位 provider 参数仅限协议路由；不访问公网、不写数据库、不注册测试 provider、不发通知/订单。整体回退各私有 base seam 与回环测试；不得改变生产 URL、来源优先级、分页/过滤规则或严格解析。

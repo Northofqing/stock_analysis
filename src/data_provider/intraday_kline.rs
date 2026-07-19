@@ -31,12 +31,6 @@ fn to_secid(code: &str) -> String {
     format!("{}.{}", market, code)
 }
 
-const PUSH2HIS_HOSTS: [&str; 3] = [
-    "push2his.eastmoney.com",
-    "push2his-bak.eastmoney.com",
-    "82.push2his.eastmoney.com",
-];
-
 fn minute_transition_is_continuous(
     previous: chrono::NaiveDateTime,
     current: chrono::NaiveDateTime,
@@ -165,17 +159,33 @@ pub(crate) async fn fetch_async(
     klt: u8,
     lmt: usize,
 ) -> Result<Vec<MinuteBar>> {
+    const BASES: [&str; 3] = [
+        "https://push2his.eastmoney.com",
+        "https://push2his-bak.eastmoney.com",
+        "https://82.push2his.eastmoney.com",
+    ];
+    fetch_from_bases(client, code, klt, lmt, &BASES).await
+}
+
+async fn fetch_from_bases(
+    client: &reqwest::Client,
+    code: &str,
+    klt: u8,
+    lmt: usize,
+    bases: &[&str],
+) -> Result<Vec<MinuteBar>> {
     let secid = to_secid(code);
     let mut last_err = String::new();
 
-    for host in PUSH2HIS_HOSTS {
+    for base in bases {
+        let base = base.trim_end_matches('/');
         let url = format!(
-            "https://{}/api/qt/stock/kline/get?secid={}&\
+            "{}/api/qt/stock/kline/get?secid={}&\
              fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58&\
              klt={}&fqt=1&end=20500101&lmt={}",
-            host, secid, klt, lmt
+            base, secid, klt, lmt
         );
-        log::debug!("[分钟K线 klt={} host={}] {}", klt, host, url);
+        log::debug!("[分钟K线 klt={} host={}] {}", klt, base, url);
 
         let resp = match client
             .get(&url)
@@ -186,25 +196,25 @@ pub(crate) async fn fetch_async(
         {
             Ok(r) => r,
             Err(e) => {
-                last_err = format!("{}: {}", host, e);
+                last_err = format!("{}: {}", base, e);
                 continue;
             }
         };
         if !resp.status().is_success() {
-            last_err = format!("{}: 状态码 {}", host, resp.status());
+            last_err = format!("{}: 状态码 {}", base, resp.status());
             continue;
         }
         let text = match resp.text().await {
             Ok(t) => t,
             Err(e) => {
-                last_err = format!("{}: 读取失败 {}", host, e);
+                last_err = format!("{}: 读取失败 {}", base, e);
                 continue;
             }
         };
         match parse_minute_response(&text, klt) {
             Ok(bars) => return Ok(bars),
             Err(error) => {
-                last_err = format!("{host}: {error}");
+                last_err = format!("{base}: {error}");
             }
         }
     }
@@ -338,5 +348,38 @@ mod br115_tests {
         let client = reqwest::Client::new();
         let error = fetch_blocking(&client, "TEST_CODE_600000", 15, 1).unwrap_err();
         assert!(error.to_string().contains("无 tokio runtime"));
+    }
+
+    #[tokio::test]
+    async fn loopback_minute_transport_retries_status_then_parses_complete_batch() {
+        use super::super::{loopback_http_client, TestHttpResponse, TestHttpServer};
+
+        let body = serde_json::json!({"data": {"klines": [
+            "2026-07-17 09:45,10,10.1,10.2,9.9,100",
+            "2026-07-17 10:00,10.1,10.2,10.3,10,120"
+        ]}})
+        .to_string();
+        let server = TestHttpServer::new(vec![
+            TestHttpResponse {
+                status: 503,
+                body: "unavailable".to_string(),
+            },
+            TestHttpResponse::json(body),
+        ]);
+        let base = server.base_url().to_string();
+        let bars = fetch_from_bases(
+            &loopback_http_client(),
+            "TEST_CODE_600000",
+            15,
+            2,
+            &[&base, &base],
+        )
+        .await
+        .unwrap();
+        assert_eq!(bars.len(), 2);
+        let requests = server.finish();
+        assert!(requests[0].contains("secid=1.600000"));
+        assert!(requests[0].contains("klt=15"));
+        assert!(requests[0].contains("lmt=2"));
     }
 }
