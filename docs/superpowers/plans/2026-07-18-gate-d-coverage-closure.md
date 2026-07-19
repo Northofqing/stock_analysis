@@ -330,3 +330,31 @@ Expected: all PASS. Commit only the two modules plus design/plan/progress eviden
 - [x] Route the three backtest result types through a private filesystem commit seam and cover report, chart and mandatory audit outcomes in isolated directories.
 - [x] Exercise account-snapshot and event-envelope failure matrices plus Tencent/Eastmoney public provider interfaces with `TEST_CODE_`, pure state validation, temporary files and loopback transport.
 - [x] Run instrumented library regression: 1,667 pass / 10 explicit live integrations ignored / 0 failed; global coverage reaches 61,494/76,866 = 80.00%, while registered core reaches 30,792/32,888 = 93.63%, so Gate D remains open without threshold rounding or reduction.
+
+### Task 37: Close the remaining core orchestration gap
+
+- [x] Execute `AnalysisPipeline::run` from isolated validated facts through result collection and all three backtest branches, with notification/model/network disabled and reports committed only to a temporary directory.
+- [x] Extract only resolved industry-chain search/artifact decisions needed to cover query generation, result dedup, pagination and complete cache resolution; all production adapters remain real and fail explicitly.
+- [x] Convert the two ignored Eastmoney live tests to strict loopback protocol tests and cover deterministic summary/mainline states without deleting denominator lines.
+- [ ] Task 37b: execute summary filesystem/notification commit through an explicit production `reports/` adapter and isolated test directory.
+- [ ] Task 37b: resolve BaoStock post-close success/empty/failure before the unchanged real fallback chain.
+- [ ] Task 37b: cover intraday/evening/exclusion state transitions before quote/account/order boundaries.
+- [ ] Task 37b: exercise BR-086 audit-chain length/link/hash/success behavior in isolated real SQLite.
+- [ ] Task 37b: execute industry-chain deep/simple/overview model commits through a private `Live/Resolved` evidence adapter and local protocol server; production remains permanently wired to `Live`.
+- [ ] Task 37c: replace remaining core ignored/environment-sensitive integration tests with protocol-equivalent loopback/resolved inputs and execute the stock-name/news orchestration with search disabled and a `TEST_CODE_` cache hit.
+- [ ] Task 37d: mount behavior-focused private regression modules from repository-level test sources; cover only existing parsing, validation, state-transition and explicit-failure branches, with no threshold/exclusion changes and no external network.
+- [ ] Regenerate instrumented coverage and continue until `check_thresholds.py --global-min 80 --core-min 95` passes, followed by all Gate B/C checks.
+
+### Task 38: Execute an isolated monitor process tracer bullet
+
+- [x] Make `monitor --test --e2e` return nonzero when seed or review fails and require a final completion marker in the process test.
+- [x] Seed only an isolated TEST_CODE ledger for the latest completed trading day; never write `real_account_snapshot` or touch the production database.
+- [x] Add an `IsolatedAll` dispatcher scope that records external real-market/announcement/overnight templates as unexercised instead of depending on network freshness.
+- [x] Run the exact workspace coverage command: global 74,007/99,288 = 74.54%; core 32,604/34,195 = 95.35%. Core passes and global remains open.
+
+### Task 39: Close the remaining workspace-global gap
+
+- [ ] Exercise existing tool/CLI binaries through isolated process tests, covering argument validation, local success commits and explicit source failures.
+- [ ] Cover the largest non-core public domain boundaries in opportunity, search, notification and market/review using compact table-driven tests and loopback protocol fixtures only.
+- [ ] If monitor orchestration still dominates, extract only resolved-input seams immediately behind unchanged real adapters and assert delivery/audit results.
+- [ ] Regenerate CI-equivalent workspace coverage until global >=80% and core >=95%, then run all Gate B/C/D release checks.

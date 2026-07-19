@@ -129,6 +129,127 @@ fn fresh_test_database_starts_without_lock_errors() {
 }
 
 #[test]
+fn isolated_e2e_reaches_the_final_completion_marker() {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let root = std::env::temp_dir().join(format!(
+        "monitor-isolated-e2e-{}-{}",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&root).expect("create isolated e2e directory");
+    let database_path = root.join("e2e.db");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_monitor"))
+        .args(["--test", "--e2e"])
+        .current_dir(&root)
+        .env("DATABASE_PATH", &database_path)
+        .env("MAGICLAW_DB_PATH", &database_path)
+        .env("STOCK_LIST", "")
+        .env("STOCK_ENV_MODE", "test")
+        .env("MONITOR_ENABLED", "true")
+        .env("V10_DRY_RUN_PUSH", "1")
+        .env_remove("ALERT_WEBHOOK_URL")
+        .env_remove("CUSTOM_WEBHOOK_URL")
+        .env_remove("DINGTALK_WEBHOOK")
+        .env_remove("DISCORD_WEBHOOK")
+        .env_remove("FEISHU_APP_ID")
+        .env_remove("FEISHU_APP_SECRET")
+        .env_remove("FEISHU_TO")
+        .env_remove("FEISHU_WEBHOOK")
+        .env_remove("SERVER_CHAN_KEY")
+        .env_remove("SLACK_WEBHOOK")
+        .env_remove("TELEGRAM_BOT_TOKEN")
+        .env_remove("WECHAT_WEBHOOK")
+        .output()
+        .expect("run isolated monitor e2e");
+
+    let combined_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "isolated e2e failed: {combined_output}"
+    );
+    assert!(
+        combined_output.contains("[v70] E2E 完成"),
+        "exit zero without the final e2e commit marker: {combined_output}"
+    );
+    assert!(
+        !combined_output.contains("governance banner unavailable"),
+        "isolated E2E did not install its TEST_CODE governance context: {combined_output}"
+    );
+    assert!(
+        database_path.exists(),
+        "isolated e2e database was not created"
+    );
+    assert!(
+        !root.join("data/stock_analysis.db").exists(),
+        "isolated e2e created a production database path"
+    );
+    let analytics_path = root.join("data/test/push_analytics.db");
+    let analytics_count = Command::new("sqlite3")
+        .args([
+            analytics_path.as_os_str(),
+            std::ffi::OsStr::new("SELECT COUNT(*) FROM push_analytics"),
+        ])
+        .output()
+        .expect("query isolated push analytics");
+    assert!(
+        analytics_count.status.success(),
+        "isolated L7 audit query failed"
+    );
+    assert!(
+        String::from_utf8_lossy(&analytics_count.stdout)
+            .trim()
+            .parse::<u64>()
+            .is_ok_and(|count| count > 0),
+        "isolated E2E did not persist any L7 delivery decision"
+    );
+
+    std::fs::remove_dir_all(&root).expect("remove isolated e2e directory");
+}
+
+#[test]
+fn v13_diagnostics_commit_an_isolated_report_without_external_market_calls() {
+    let root = std::env::temp_dir().join(format!("monitor-v13-diag-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("create isolated diagnostic directory");
+    let database_path = root.join("diag.db");
+    let output = Command::new(env!("CARGO_BIN_EXE_monitor"))
+        .args(["--test", "--v13-diag"])
+        .current_dir(&root)
+        .env("DATABASE_PATH", &database_path)
+        .env("MAGICLAW_DB_PATH", &database_path)
+        .env("STOCK_ENV_MODE", "test")
+        .env("STOCK_LIST", "")
+        .env("MONITOR_ENABLED", "true")
+        .env_remove("ALERT_WEBHOOK_URL")
+        .env_remove("FEISHU_APP_ID")
+        .env_remove("FEISHU_APP_SECRET")
+        .env_remove("WECHAT_WEBHOOK")
+        .output()
+        .expect("run isolated v13 diagnostics");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "v13 diagnostics failed: {combined}"
+    );
+    assert!(combined.contains("总步骤: 14"));
+    assert!(combined.contains("BR-051 isolated diagnostics skip external"));
+    let report: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(root.join("data/v13_diag_report.json")).expect("read diagnostic report"),
+    )
+    .expect("parse diagnostic report");
+    assert_eq!(report["total_steps"], 14);
+    std::fs::remove_dir_all(root).expect("remove isolated diagnostic directory");
+}
+
+#[test]
 fn memory_database_fails_closed_with_explicit_journal_mode_error() {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let root = std::env::temp_dir().join(format!(

@@ -8,7 +8,7 @@ use serde_json::json;
 
 use super::service::NotificationService;
 
-static RE_HEADING: Lazy<Regex> = Lazy::new(|| Regex::new(r"^#{1,6}\s+(.+)$").unwrap());
+static RE_HEADING: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)^#{1,6}\s+(.+)$").unwrap());
 static RE_MULTI_NEWLINES: Lazy<Regex> = Lazy::new(|| Regex::new(r"\n{3,}").unwrap());
 static RE_QUOTE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)^> (.+)$").unwrap());
 static RE_H4: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)^####\s+(.+)$").unwrap());
@@ -433,6 +433,7 @@ impl NotificationService {
 #[cfg(test)]
 mod delivery_contract_tests {
     use super::*;
+    use crate::notification::NotificationConfig;
 
     #[test]
     fn br111_feishu_requires_explicit_integer_success_code() {
@@ -441,5 +442,33 @@ mod delivery_contract_tests {
         assert!(!feishu_business_accepted(&json!({"code": 19001})).unwrap());
         assert!(feishu_business_accepted(&json!({})).is_err());
         assert!(feishu_business_accepted(&json!({"code": "0"})).is_err());
+    }
+
+    #[tokio::test]
+    async fn formatting_and_missing_configuration_are_fully_local() {
+        let service = NotificationService::new(NotificationConfig::default());
+
+        let feishu =
+            service.format_feishu_markdown("# TEST_CODE 标题\n> 引用\n---\n- 第一项\n- 第二项");
+        assert!(feishu.contains("**TEST_CODE 标题**"));
+        assert!(feishu.contains("💬 引用"));
+        assert!(feishu.contains("────────"));
+        assert!(feishu.contains("• 第一项"));
+
+        let html = service.markdown_to_html(
+            "# TEST_CODE 标题\n\n> 引用\n\n**重点**\n\n- 第一项\n- 第二项\n\n| 状态 | 结论 |\n| --- | --- |\n| ✅ | 合理 |\n| ⚠️ | 偏高 |",
+        );
+        assert!(html.contains("<!DOCTYPE html>"));
+        assert!(html.contains("<h1"));
+        assert!(html.contains("<ul"));
+        assert!(html.contains("<table"));
+        assert!(html.contains("#27ae60"));
+        assert!(html.contains("#e74c3c"));
+
+        let err = service
+            .send_to_feishu("TEST_CODE 本地配置边界")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Webhook 未配置"));
     }
 }

@@ -133,6 +133,21 @@ const MAX_DEEP_ANALYSIS: usize = 8;
 /// 简化分析上限。
 const MAX_SIMPLE_ANALYSIS: usize = 12;
 
+/// Selects where already-resolved news evidence is committed into model prompts.
+/// Production is permanently wired to `Live`; `Resolved` is a private test seam
+/// for protocol-complete facts and never fabricates market or account data.
+enum ChainEvidenceSource {
+    Live,
+    #[cfg(test)]
+    Resolved(ResolvedChainEvidence),
+}
+
+#[cfg(test)]
+struct ResolvedChainEvidence {
+    cluster_news: HashMap<String, String>,
+    after_market: String,
+}
+
 /// 五维主线量化评分（0-100）。
 #[derive(Debug, Clone, Default)]
 pub struct ChainScore {
@@ -288,6 +303,7 @@ async fn render_resolved_chain_analysis(
     position_diags: &[PositionDiag],
     lhb_map: &HashMap<String, f64>,
     macro_ctx: &str,
+    evidence_source: ChainEvidenceSource,
 ) -> Result<String> {
     let llm_ok = analyzer.is_available();
     if !llm_ok {
@@ -301,7 +317,15 @@ async fn render_resolved_chain_analysis(
         let stock_count = cluster.stocks.len();
         let analysis = if stock_count >= TIER1_MIN && llm_ok && deep_count < MAX_DEEP_ANALYSIS {
             deep_count += 1;
-            let cluster_news = fetch_cluster_news(analyzer, cluster, concepts).await;
+            let cluster_news = match &evidence_source {
+                ChainEvidenceSource::Live => fetch_cluster_news(analyzer, cluster, concepts).await,
+                #[cfg(test)]
+                ChainEvidenceSource::Resolved(evidence) => evidence
+                    .cluster_news
+                    .get(&cluster.concept)
+                    .cloned()
+                    .unwrap_or_default(),
+            };
             match analyze_cluster_deep(
                 analyzer,
                 cluster,
@@ -352,7 +376,11 @@ async fn render_resolved_chain_analysis(
         .map(|cluster| cluster.concept.as_str())
         .collect();
     let after_market_section = if llm_ok {
-        fetch_after_market_catalysts(&top_theme_names).await
+        match &evidence_source {
+            ChainEvidenceSource::Live => fetch_after_market_catalysts(&top_theme_names).await,
+            #[cfg(test)]
+            ChainEvidenceSource::Resolved(evidence) => evidence.after_market.clone(),
+        }
     } else {
         String::new()
     };
@@ -449,6 +477,7 @@ pub async fn run_chain_analysis(
         &position_diags,
         &lhb_map,
         &macro_ctx,
+        ChainEvidenceSource::Live,
     )
     .await
 }
@@ -1968,6 +1997,7 @@ mod tests {
             &positions,
             &HashMap::from([("TEST_CODE_CHAIN_230001".to_string(), 100.0)]),
             "TEST_CODE_真实宏观事实",
+            ChainEvidenceSource::Live,
         )
         .await
         .expect("resolved report without model");
@@ -1975,6 +2005,106 @@ mod tests {
         assert!(report.contains("测试链甲"));
         assert!(report.contains("持仓主线诊断"));
         assert!(report.contains("其他热点速览"));
+    }
+
+    #[tokio::test]
+    async fn resolved_evidence_commits_deep_simple_and_overview_model_protocols() {
+        fn cluster(concept: &str, base: usize, count: usize) -> ChainCluster {
+            ChainCluster {
+                concept: concept.to_string(),
+                aliases: vec![format!("{concept}别名")],
+                stocks: (0..count)
+                    .map(|offset| {
+                        top(
+                            &format!("TEST_CODE_CHAIN_MODEL_{:06}", base + offset),
+                            &format!("协议股{offset}"),
+                            10.0 - offset as f64 / 10.0,
+                        )
+                    })
+                    .collect(),
+                continuation_count: 1,
+                streak_days: 2,
+                candidates: vec![top(
+                    &format!("TEST_CODE_CHAIN_MODEL_{:06}", base + count),
+                    "协议候选",
+                    3.0,
+                )],
+                score: None,
+                scenario: None,
+            }
+        }
+
+        let deep = cluster("TEST_CODE_深度主线", 100, TIER1_MIN);
+        let simple = cluster("TEST_CODE_简化主线", 200, TIER2_MIN);
+        let limit_ups: Vec<TopStock> = deep
+            .stocks
+            .iter()
+            .chain(simple.stocks.iter())
+            .cloned()
+            .collect();
+        let concepts: HashMap<String, Vec<String>> = limit_ups
+            .iter()
+            .map(|stock| {
+                let concept = if stock.code.contains("0001") {
+                    deep.concept.clone()
+                } else {
+                    simple.concept.clone()
+                };
+                (stock.code.clone(), vec![concept, "TEST_CODE_设备".into()])
+            })
+            .collect();
+        let server = crate::data_provider::TestHttpServer::new(vec![
+            crate::data_provider::TestHttpResponse::json(
+                r####"{"choices":[{"message":{"content":"【结论】阶段=启动｜参与=可关注｜候选=TEST_CODE_CHAIN_MODEL_000108\n【评分】产业逻辑=80/100｜情绪位置=70/100｜资金共识=60/100｜筹码健康=50/100｜证伪概率=20/100\n### 产业链图谱\n协议深度正文"}}]}"####,
+            ),
+            crate::data_provider::TestHttpResponse::json(
+                r####"{"choices":[{"message":{"content":"【简评】阶段=发酵｜参与=谨慎｜候选=无\n【评分】产业逻辑=60/100｜情绪位置=50/100｜资金共识=40/100｜筹码健康=30/100｜证伪概率=50/100\n协议简化正文"}}]}"####,
+            ),
+            crate::data_provider::TestHttpResponse::json(
+                r####"{"choices":[{"message":{"content":"### 核心矛盾与主线优先级\nTEST_CODE_全景协议正文"}}]}"####,
+            ),
+        ]);
+        let analyzer = GeminiAnalyzer::with_loopback_client(crate::analyzer::GeminiConfig {
+            doubao_api_key: Some("TEST_CODE_LOCAL_PROTOCOL_KEY".into()),
+            doubao_base_url: Some(server.base_url().to_string()),
+            doubao_model: "TEST_CODE_MODEL".into(),
+            max_retries: 1,
+            retry_delay: 0.0,
+            request_delay: 0.0,
+            agent_pipeline: false,
+            ..crate::analyzer::GeminiConfig::default()
+        });
+        let evidence = ResolvedChainEvidence {
+            cluster_news: HashMap::from([(
+                deep.concept.clone(),
+                "TEST_CODE_已验证主线新闻".to_string(),
+            )]),
+            after_market: "## 盘后催化\nTEST_CODE_已验证盘后证据".to_string(),
+        };
+
+        let report = render_resolved_chain_analysis(
+            &analyzer,
+            "2026-07-19",
+            &limit_ups,
+            &concepts,
+            &[deep, simple],
+            &[],
+            &[],
+            &HashMap::new(),
+            "TEST_CODE_已验证宏观事实",
+            ChainEvidenceSource::Resolved(evidence),
+        )
+        .await
+        .expect("complete resolved model protocol must commit report");
+
+        assert!(report.contains("深度分析 1 条 + 简化分析 1 条"));
+        assert!(report.contains("协议深度正文"));
+        assert!(report.contains("协议简化正文"));
+        assert!(report.contains("TEST_CODE_已验证盘后证据"));
+        assert!(report.contains("TEST_CODE_全景协议正文"));
+        let requests = server.finish();
+        assert_eq!(requests.len(), 3);
+        assert!(requests.iter().all(|path| path == "/chat/completions"));
     }
 
     #[tokio::test]
@@ -2250,3 +2380,7 @@ mod tests {
         .is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "../../gate_d_chain_analysis_regression.rs"]
+mod gate_d_regression;

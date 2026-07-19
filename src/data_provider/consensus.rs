@@ -280,6 +280,12 @@ mod strict_contract_tests {
             optional_finite_f64(&missing, "predictThisYearEps").unwrap(),
             None
         );
+        assert_eq!(
+            optional_finite_f64(&serde_json::json!({}), "missing").unwrap(),
+            None
+        );
+        assert!(optional_finite_f64(&serde_json::json!({"x": true}), "x").is_err());
+        assert_eq!(avg(&[]), None);
     }
 
     #[test]

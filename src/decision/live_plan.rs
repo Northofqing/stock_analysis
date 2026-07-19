@@ -310,4 +310,15 @@ mod tests {
         let r = evaluate(&input_normal());
         assert_eq!(r.code(), "TEST_CODE_000001");
     }
+
+    #[test]
+    fn zero_cost_and_advice_code_are_preserved_without_inventing_pnl() {
+        let mut input = input_normal();
+        input.cost = 0.0;
+        assert!(
+            matches!(evaluate(&input), LivePlanResult::Executable(plan) if plan.pnl_pct == 0.0)
+        );
+        input.account_mode = AccountMode::Frozen;
+        assert_eq!(evaluate(&input).code(), "TEST_CODE_000001");
+    }
 }

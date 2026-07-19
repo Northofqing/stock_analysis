@@ -296,6 +296,13 @@ impl GeminiAnalyzer {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_loopback_client(config: GeminiConfig) -> Self {
+        let mut analyzer = Self::new(config);
+        analyzer.client = crate::data_provider::loopback_http_client();
+        analyzer
+    }
+
     /// 从环境变量创建配置
     pub fn from_env() -> Self {
         let api_key = std::env::var("GEMINI_API_KEY").ok();

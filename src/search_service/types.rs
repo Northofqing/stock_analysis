@@ -559,3 +559,229 @@ pub(crate) fn extract_domain(url: &str) -> String {
         Err(_) => "未知来源".to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn result(title: &str, snippet: &str) -> SearchResult {
+        SearchResult::new(
+            title.to_string(),
+            snippet.to_string(),
+            "https://example.invalid/TEST_CODE".to_string(),
+            "测试来源".to_string(),
+        )
+    }
+
+    #[test]
+    fn result_analysis_covers_every_registered_type_and_sentiment_state() {
+        let type_cases = [
+            ("发布公告", NewsType::Announcement),
+            ("季度业绩增长", NewsType::Earnings),
+            ("监管政策", NewsType::Policy),
+            ("行业赛道", NewsType::Industry),
+            ("研究评级", NewsType::Analysis),
+            ("违规处罚", NewsType::Risk),
+            ("普通消息", NewsType::Other),
+        ];
+        for (text, expected) in type_cases {
+            let mut item = result(text, "");
+            item.analyze_type();
+            assert_eq!(item.news_type, expected);
+        }
+
+        let sentiment_cases = [
+            ("盈利增长突破", Sentiment::Positive),
+            ("亏损下滑处罚", Sentiment::Negative),
+            ("增长但有亏损", Sentiment::Neutral),
+            ("普通消息", Sentiment::Unknown),
+        ];
+        for (text, expected) in sentiment_cases {
+            let mut item = result(text, "");
+            item.analyze_sentiment();
+            assert_eq!(item.sentiment, expected);
+        }
+    }
+
+    #[test]
+    fn result_render_importance_keywords_and_builders_preserve_explicit_evidence() {
+        let type_cases = [
+            NewsType::Announcement,
+            NewsType::Earnings,
+            NewsType::Policy,
+            NewsType::Industry,
+            NewsType::Analysis,
+            NewsType::Risk,
+            NewsType::Other,
+        ];
+        let sentiment_cases = [
+            Sentiment::Positive,
+            Sentiment::Neutral,
+            Sentiment::Negative,
+            Sentiment::Unknown,
+        ];
+        for news_type in type_cases {
+            for sentiment in &sentiment_cases {
+                let mut item = result("测试标题", "测试摘要");
+                item.news_type = news_type.clone();
+                item.sentiment = sentiment.clone();
+                item.importance = 9;
+                item.relevance = 0.75;
+                item.keywords = vec!["TEST_CODE".to_string()];
+                let text = item.to_text();
+                assert!(text.contains("测试来源"));
+                assert!(text.contains("★★★★★"));
+                assert!(text.contains("75%"));
+                assert!(text.contains("TEST_CODE"));
+            }
+        }
+
+        let mut empty_date = result("x", "y").with_date(String::new());
+        assert_eq!(empty_date.published_date, None);
+        empty_date = empty_date.with_date("2026-07-19".to_string());
+        assert_eq!(empty_date.published_date.as_deref(), Some("2026-07-19"));
+
+        for (news_type, base) in [
+            (NewsType::Announcement, 7),
+            (NewsType::Earnings, 8),
+            (NewsType::Risk, 8),
+            (NewsType::Policy, 7),
+            (NewsType::Other, 5),
+        ] {
+            let mut item = result("普通", "消息");
+            item.news_type = news_type;
+            item.calculate_importance();
+            assert_eq!(item.importance, base);
+        }
+        let mut capped = result("重大重要紧急突发独家首次涨停跌停停牌复牌", "");
+        capped.news_type = NewsType::Earnings;
+        capped.calculate_importance();
+        assert_eq!(capped.importance, 10);
+
+        let mut keyword_item = result(
+            "TEST_CODE_600000 测试公司涨停并购",
+            "业绩增长、研发创新、合作订单中标，政策监管风险违规",
+        );
+        keyword_item.extract_keywords("测试公司", "TEST_CODE_600000");
+        assert_eq!(keyword_item.keywords[0], "TEST_CODE_600000");
+        assert_eq!(keyword_item.keywords[1], "测试公司");
+        assert!(keyword_item.keywords.contains(&"涨停".to_string()));
+        assert!(keyword_item.keywords.contains(&"并购".to_string()));
+        let mut no_identity = result("普通", "消息");
+        no_identity.extract_keywords("未出现公司", "TEST_CODE_missing");
+        assert!(no_identity.keywords.is_empty());
+    }
+
+    #[test]
+    fn response_constructors_and_context_cover_empty_success_and_limits() {
+        let error = SearchResponse::error(
+            "测试查询".to_string(),
+            "测试引擎".to_string(),
+            "来源失败".to_string(),
+        );
+        assert!(!error.success);
+        assert_eq!(error.error_message.as_deref(), Some("来源失败"));
+        assert!(error.to_context(3).contains("未找到相关结果"));
+
+        let empty =
+            SearchResponse::success("测试查询".to_string(), "测试引擎".to_string(), Vec::new());
+        assert!(empty.success);
+        assert!(empty.to_context(3).contains("未找到相关结果"));
+
+        let success = SearchResponse::success(
+            "测试查询".to_string(),
+            "测试引擎".to_string(),
+            vec![result("第一条", "摘要一"), result("第二条", "摘要二")],
+        );
+        let context = success.to_context(1);
+        assert!(context.contains("【测试查询 搜索结果】"));
+        assert!(context.contains("1. "));
+        assert!(context.contains("第一条"));
+        assert!(!context.contains("第二条"));
+    }
+
+    #[test]
+    fn api_key_manager_rotates_skips_resets_and_records_results() {
+        let mut manager = ApiKeyManager::new(vec!["key-a".to_string(), "key-b".to_string()]);
+        assert_eq!(manager.get_next_key().as_deref(), Some("key-a"));
+        assert_eq!(manager.get_next_key().as_deref(), Some("key-b"));
+        manager.record_error("key-a");
+        manager.record_error("key-a");
+        manager.record_error("key-a");
+        assert_eq!(manager.get_next_key().as_deref(), Some("key-b"));
+
+        let mut exhausted = ApiKeyManager::new(vec!["short".to_string()]);
+        for _ in 0..3 {
+            exhausted.record_error("short");
+        }
+        assert_eq!(exhausted.get_next_key().as_deref(), Some("short"));
+        assert_eq!(exhausted.error_count["short"], 0);
+        exhausted.record_error("short");
+        exhausted.record_success("short");
+        assert_eq!(exhausted.error_count["short"], 0);
+        assert_eq!(exhausted.usage_count["short"], 1);
+        assert_eq!(ApiKeyManager::new(Vec::new()).get_next_key(), None);
+    }
+
+    #[tokio::test]
+    async fn managed_search_preserves_success_failure_and_missing_key_states() {
+        let manager = Arc::new(Mutex::new(ApiKeyManager::new(vec![
+            "TEST_CODE_key".to_string()
+        ])));
+        assert!(key_manager_available(&manager));
+        assert_eq!(
+            get_key_or_error(&manager, "测试引擎", "测试查询").unwrap(),
+            "TEST_CODE_key"
+        );
+
+        let response = run_key_managed_search(&manager, "测试引擎", "成功查询", |key| async move {
+            assert_eq!(key, "TEST_CODE_key");
+            Ok(SearchResponse::success(
+                "成功查询".to_string(),
+                "测试引擎".to_string(),
+                vec![result("命中", "证据")],
+            ))
+        })
+        .await;
+        assert!(response.success);
+        assert!(response.search_time >= 0.0);
+
+        let response = run_key_managed_search(&manager, "测试引擎", "空查询", |_| async {
+            Ok(SearchResponse::error(
+                "空查询".to_string(),
+                "测试引擎".to_string(),
+                "明确无匹配".to_string(),
+            ))
+        })
+        .await;
+        assert!(!response.success);
+
+        let response = run_key_managed_search(&manager, "测试引擎", "失败查询", |_| async {
+            Err(anyhow::anyhow!("TEST_CODE transport failed"))
+        })
+        .await;
+        assert!(!response.success);
+        assert_eq!(
+            response.error_message.as_deref(),
+            Some("TEST_CODE transport failed")
+        );
+
+        record_key_result(&manager, "TEST_CODE_key", true);
+        record_key_result(&manager, "TEST_CODE_key", false);
+        let empty = Arc::new(Mutex::new(ApiKeyManager::new(Vec::new())));
+        assert!(!key_manager_available(&empty));
+        let missing = run_key_managed_search(&empty, "测试引擎", "缺密钥", |_| async {
+            unreachable!("missing key must stop before provider call")
+        })
+        .await;
+        assert!(!missing.success);
+        assert!(missing.error_message.unwrap().contains("未配置 API Key"));
+    }
+
+    #[test]
+    fn domain_extraction_handles_valid_missing_host_and_invalid_urls() {
+        assert_eq!(extract_domain("https://www.example.com/a"), "example.com");
+        assert_eq!(extract_domain("mailto:test@example.com"), "未知来源");
+        assert_eq!(extract_domain("not a url"), "未知来源");
+    }
+}

@@ -352,6 +352,19 @@ mod tests {
         });
         assert_eq!(first, second);
         assert_eq!(builds.load(Ordering::Relaxed), 1);
+        let next_day = date.succ_opt().expect("next calendar day");
+        let refreshed = cached_exclusion_map_for_date(next_day, || {
+            builds.fetch_add(1, Ordering::Relaxed);
+            std::collections::HashMap::from([(
+                "TEST_CODE_000002".to_string(),
+                ("次日排除板块".to_string(), "次日原因".to_string()),
+            )])
+        });
+        assert!(refreshed.contains_key("TEST_CODE_000002"));
+        assert_eq!(builds.load(Ordering::Relaxed), 2);
+        clear_exclusion_cache();
+        let first_for_scan = first.clone();
+        cached_exclusion_map_for_date(date, || first_for_scan);
 
         let mut map = std::collections::HashMap::new();
         let boards = vec![board("BK0001", "测试排除板块")];
@@ -383,6 +396,9 @@ mod tests {
         }];
         let hits = scan_exclusions(&holdings, &[]);
         assert_eq!(hits.len(), 1);
+        clear_exclusion_cache();
+        cached_exclusion_map_for_date(date, std::collections::HashMap::new);
+        assert!(scan_exclusions(&holdings, &[]).is_empty());
         clear_exclusion_cache();
     }
 

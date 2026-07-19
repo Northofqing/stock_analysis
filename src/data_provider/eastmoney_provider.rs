@@ -587,30 +587,38 @@ mod tests {
     }
 
     /// 在 tokio runtime 的 spawn_blocking 中执行阻塞调用
-    async fn with_provider<F, T>(f: F) -> T
+    async fn with_provider<F, T>(provider: HttpProvider, f: F) -> T
     where
         F: FnOnce(&HttpProvider) -> T + Send + 'static,
         T: Send + 'static,
     {
-        tokio::task::spawn_blocking(move || {
-            let provider = HttpProvider::new().unwrap();
-            f(&provider)
-        })
-        .await
-        .unwrap()
+        tokio::task::spawn_blocking(move || f(&provider))
+            .await
+            .unwrap()
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_get_stock_name() {
-        with_provider(|p| {
-            for code in ["600519", "000001", "002413"] {
-                if let Some(name) = p.get_stock_name(code) {
-                    println!("{} -> {}", code, name);
-                    assert!(!name.is_empty());
-                }
+        use super::super::{loopback_http_client, TestHttpResponse, TestHttpServer};
+
+        let server = TestHttpServer::new(vec![
+            TestHttpResponse::json(r#"{"data":{"f58":"接口股票甲"}}"#),
+            TestHttpResponse::json(r#"{"data":{"f58":"接口股票乙"}}"#),
+            TestHttpResponse::json(r#"{"data":{"f58":"接口股票丙"}}"#),
+        ]);
+        let base = server.base_url().to_string();
+        let provider = HttpProvider::with_bases(loopback_http_client(), Vec::new(), vec![base], 1);
+        with_provider(provider, |provider| {
+            for (code, expected) in [
+                ("TEST_CODE_600519", "接口股票甲"),
+                ("TEST_CODE_000001", "接口股票乙"),
+                ("TEST_CODE_002413", "接口股票丙"),
+            ] {
+                assert_eq!(provider.get_stock_name(code).as_deref(), Some(expected));
             }
         })
         .await;
+        assert_eq!(server.finish().len(), 3);
     }
 
     #[tokio::test]
@@ -723,44 +731,54 @@ mod tests {
         assert_eq!(default.max_attempts_per_host, 2);
     }
 
-    #[ignore = "b013 异常处理: 实机调 eastmoney HTTP, 沙箱环境必失败 (非 deterministic)"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_get_daily_data() {
-        with_provider(|p| match p.get_daily_data("600519", 30) {
-            Ok(data) => {
-                assert!(!data.is_empty(), "数据不应为空");
-                println!("获取到 {} 条数据", data.len());
-                if let Some(first) = data.first() {
-                    assert!(first.close > 0.0, "收盘价应大于0");
-                }
-            }
-            Err(e) => {
-                println!("获取数据失败（可能是网络问题）: {}", e);
-            }
+        use super::super::{loopback_http_client, TestHttpResponse, TestHttpServer};
+
+        let complete = kline_body(serde_json::json!([
+            "2026-07-15,10.00,10.00,10.20,9.90,1000,100000,0.0",
+            "2026-07-16,10.00,10.10,10.20,9.95,1100,101000,1.0"
+        ]));
+        let server = TestHttpServer::new(vec![TestHttpResponse::json(complete)]);
+        let base = server.base_url().to_string();
+        let provider = HttpProvider::with_bases(loopback_http_client(), vec![base], Vec::new(), 1);
+        with_provider(provider, |provider| {
+            let data = provider
+                .get_daily_data("TEST_CODE_600519", 30)
+                .expect("complete loopback batch");
+            assert_eq!(data.len(), 2);
+            assert!(data[0].close > 0.0);
         })
         .await;
+        assert_eq!(server.finish().len(), 1);
     }
 
-    #[ignore = "b013 异常处理: 实机调 eastmoney HTTP, 沙箱环境必失败"]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_different_markets() {
-        with_provider(|p| {
-            for (code, market) in [("600519", "上海"), ("000001", "深圳"), ("300750", "创业板")]
-            {
-                println!("\n测试 {} 市场股票: {}", market, code);
-                match p.get_daily_data(code, 5) {
-                    Ok(data) => {
-                        println!("  成功获取 {} 条数据", data.len());
-                        if let Some(first) = data.first() {
-                            println!("  最新: {} 收盘={}", first.date, first.close);
-                        }
-                    }
-                    Err(e) => {
-                        println!("  失败: {}", e);
-                    }
-                }
+        use super::super::{loopback_http_client, TestHttpResponse, TestHttpServer};
+
+        let complete = || {
+            kline_body(serde_json::json!([
+                "2026-07-15,10.00,10.00,10.20,9.90,1000,100000,0.0",
+                "2026-07-16,10.00,10.10,10.20,9.95,1100,101000,1.0"
+            ]))
+        };
+        let server = TestHttpServer::new(vec![
+            TestHttpResponse::json(complete()),
+            TestHttpResponse::json(complete()),
+            TestHttpResponse::json(complete()),
+        ]);
+        let base = server.base_url().to_string();
+        let provider = HttpProvider::with_bases(loopback_http_client(), vec![base], Vec::new(), 1);
+        with_provider(provider, |provider| {
+            for code in ["TEST_CODE_600519", "TEST_CODE_000001", "TEST_CODE_300750"] {
+                let data = provider
+                    .get_daily_data(code, 5)
+                    .expect("each loopback market batch");
+                assert_eq!(data.len(), 2);
             }
         })
         .await;
+        assert_eq!(server.finish().len(), 3);
     }
 }

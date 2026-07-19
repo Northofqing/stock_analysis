@@ -12,7 +12,10 @@
 //! Commit 1 仅接轻量签名: `cash + total_value + current_position_pct`
 //! (不强求 PaperPosition struct, v16.4 完整 position 接入再扩)
 
-use crate::risk::action_gate::{authorize, AccountMode, ActionKind, GateResult};
+use crate::monitor::data_mode::DataMode;
+#[cfg(test)]
+use crate::risk::action_gate::AccountMode;
+use crate::risk::action_gate::{authorize, ActionKind, GateResult};
 use crate::risk::cash_guard::{check_cash, CashGuard};
 use crate::trading::paper_trade::{Direction, PaperSignal};
 use std::sync::OnceLock;
@@ -102,7 +105,7 @@ pub fn pre_trade_check(
     }
 
     // 1. AccountMode 行动授权
-    let mode = parse_account_mode(&signal.account_mode)?;
+    let mode = signal.risk_context.account_mode;
     let action = match signal.direction {
         Direction::Buy => ActionKind::OpenNew,
         Direction::Sell => ActionKind::Reduce,
@@ -114,13 +117,13 @@ pub fn pre_trade_check(
                 "[risk_adapter] 拒 {}({}): account_mode={} action={} 原因={}",
                 signal.name,
                 signal.code,
-                signal.account_mode,
+                signal.risk_context.account_mode.label(),
                 action.label(),
                 reason
             );
             return Err(format!(
                 "account_mode {} 拒 {}: {}",
-                signal.account_mode,
+                signal.risk_context.account_mode.label(),
                 action.label(),
                 reason
             ));
@@ -163,9 +166,9 @@ pub fn pre_trade_check(
     }
 
     // 4. DataMode
-    match signal.data_mode.as_str() {
-        "Full" => {}
-        "Degraded" if signal.direction == Direction::Buy => {
+    match signal.risk_context.data_mode {
+        DataMode::Full => {}
+        DataMode::Degraded if signal.direction == Direction::Buy => {
             log::warn!(
                 "[risk_adapter] 拒 {}({}): data_mode=Degraded 禁开仓",
                 signal.name,
@@ -173,8 +176,8 @@ pub fn pre_trade_check(
             );
             return Err("data_mode=Degraded 禁开仓".to_string());
         }
-        "Degraded" => {} // 允许减仓
-        "Unsafe" => {
+        DataMode::Degraded => {} // 允许减仓
+        DataMode::Unsafe => {
             log::warn!(
                 "[risk_adapter] 拒 {}({}): data_mode=Unsafe 拒所有交易",
                 signal.name,
@@ -182,29 +185,9 @@ pub fn pre_trade_check(
             );
             return Err("data_mode=Unsafe 拒所有交易".to_string());
         }
-        other => {
-            log::warn!(
-                "[risk_adapter] 拒 {}({}): 未知 data_mode '{}'",
-                signal.name,
-                signal.code,
-                other
-            );
-            return Err(format!("未知 data_mode '{}'", other));
-        }
     }
 
     Ok(())
-}
-
-/// 解析 account_mode 字符串 → AccountMode enum
-/// 不依赖 push_templates::AccountMode (跨 bin/lib 边界), 与 action_gate 同源
-fn parse_account_mode(s: &str) -> Result<AccountMode, String> {
-    match s {
-        "Normal" => Ok(AccountMode::Normal),
-        "ReduceOnly" => Ok(AccountMode::ReduceOnly),
-        "Frozen" => Ok(AccountMode::Frozen),
-        other => Err(format!("未知 account_mode '{other}'")),
-    }
 }
 
 // ============ Unit tests (≥ 12, 含边界 case) ============
@@ -213,7 +196,7 @@ fn parse_account_mode(s: &str) -> Result<AccountMode, String> {
 mod tests {
     use super::*;
 
-    fn signal(account_mode: &str, data_mode: &str, direction: Direction) -> PaperSignal {
+    fn signal(account_mode: AccountMode, data_mode: DataMode, direction: Direction) -> PaperSignal {
         PaperSignal {
             plan_id: "plan-test-001".to_string(),
             code: "TEST_CODE_688001".to_string(),
@@ -229,8 +212,10 @@ mod tests {
             limit_down_price: Some(45.0),
             secondary_confirmed: false,
             quote_observed_at: chrono::Utc::now(),
-            account_mode: account_mode.to_string(),
-            data_mode: data_mode.to_string(),
+            risk_context: crate::trading::paper_trade::PaperRiskContext::new(
+                account_mode,
+                data_mode,
+            ),
         }
     }
 
@@ -238,7 +223,7 @@ mod tests {
 
     #[test]
     fn rejects_buy_when_reduceonly() {
-        let s = signal("ReduceOnly", "Full", Direction::Buy);
+        let s = signal(AccountMode::ReduceOnly, DataMode::Full, Direction::Buy);
         let r = pre_trade_check(&s, 50.0, 50000.0, 100000.0, 5.0);
         assert!(r.is_err());
         assert!(r.unwrap_err().contains("ReduceOnly"));
@@ -246,21 +231,21 @@ mod tests {
 
     #[test]
     fn allows_sell_when_reduceonly() {
-        let s = signal("ReduceOnly", "Full", Direction::Sell);
+        let s = signal(AccountMode::ReduceOnly, DataMode::Full, Direction::Sell);
         let r = pre_trade_check(&s, 50.0, 50000.0, 100000.0, 5.0);
         assert!(r.is_ok());
     }
 
     #[test]
     fn rejects_buy_when_frozen() {
-        let s = signal("Frozen", "Full", Direction::Buy);
+        let s = signal(AccountMode::Frozen, DataMode::Full, Direction::Buy);
         let r = pre_trade_check(&s, 50.0, 50000.0, 100000.0, 5.0);
         assert!(r.is_err());
     }
 
     #[test]
     fn rejects_sell_when_frozen() {
-        let s = signal("Frozen", "Full", Direction::Sell);
+        let s = signal(AccountMode::Frozen, DataMode::Full, Direction::Sell);
         let r = pre_trade_check(&s, 50.0, 50000.0, 100000.0, 5.0);
         assert!(r.is_err());
         assert!(r.unwrap_err().contains("Frozen"));
@@ -270,7 +255,7 @@ mod tests {
 
     #[test]
     fn rejects_buy_when_position_exceeds_10pct() {
-        let s = signal("Normal", "Full", Direction::Buy);
+        let s = signal(AccountMode::Normal, DataMode::Full, Direction::Buy);
         let r = pre_trade_check(&s, 50.0, 50000.0, 100000.0, 12.0);
         assert!(r.is_err());
         assert!(r.unwrap_err().contains("仓位"));
@@ -278,21 +263,21 @@ mod tests {
 
     #[test]
     fn allows_buy_at_position_boundary_10pct() {
-        let s = signal("Normal", "Full", Direction::Buy);
+        let s = signal(AccountMode::Normal, DataMode::Full, Direction::Buy);
         let r = pre_trade_check(&s, 50.0, 50000.0, 100000.0, 10.0);
         assert!(r.is_ok());
     }
 
     #[test]
     fn allows_buy_at_position_exactly_10pct() {
-        let s = signal("Normal", "Full", Direction::Buy);
+        let s = signal(AccountMode::Normal, DataMode::Full, Direction::Buy);
         let r = pre_trade_check(&s, 50.0, 50000.0, 100000.0, 10.0);
         assert!(r.is_ok());
     }
 
     #[test]
     fn rejects_buy_at_position_just_over_10pct() {
-        let s = signal("Normal", "Full", Direction::Buy);
+        let s = signal(AccountMode::Normal, DataMode::Full, Direction::Buy);
         let r = pre_trade_check(&s, 50.0, 50000.0, 100000.0, 10.001);
         assert!(r.is_err());
     }
@@ -301,7 +286,7 @@ mod tests {
 
     #[test]
     fn rejects_when_cash_below_15pct() {
-        let s = signal("Normal", "Full", Direction::Buy);
+        let s = signal(AccountMode::Normal, DataMode::Full, Direction::Buy);
         let r = pre_trade_check(&s, 50.0, 10000.0, 100000.0, 5.0);
         assert!(r.is_err());
         assert!(r.unwrap_err().contains("现金"));
@@ -309,7 +294,7 @@ mod tests {
 
     #[test]
     fn allows_when_cash_above_15pct() {
-        let s = signal("Normal", "Full", Direction::Buy);
+        let s = signal(AccountMode::Normal, DataMode::Full, Direction::Buy);
         let r = pre_trade_check(&s, 50.0, 30000.0, 100000.0, 5.0);
         assert!(r.is_ok());
     }
@@ -318,7 +303,7 @@ mod tests {
 
     #[test]
     fn rejects_buy_when_degraded() {
-        let s = signal("Normal", "Degraded", Direction::Buy);
+        let s = signal(AccountMode::Normal, DataMode::Degraded, Direction::Buy);
         let r = pre_trade_check(&s, 50.0, 50000.0, 100000.0, 5.0);
         assert!(r.is_err());
         assert!(r.unwrap_err().contains("Degraded"));
@@ -326,33 +311,32 @@ mod tests {
 
     #[test]
     fn allows_sell_when_degraded() {
-        let s = signal("Normal", "Degraded", Direction::Sell);
+        let s = signal(AccountMode::Normal, DataMode::Degraded, Direction::Sell);
         let r = pre_trade_check(&s, 50.0, 50000.0, 100000.0, 5.0);
         assert!(r.is_ok(), "Degraded + Sell 应通过 (允许减仓)");
     }
 
     #[test]
     fn rejects_all_when_unsafe() {
-        let s_buy = signal("Normal", "Unsafe", Direction::Buy);
+        let s_buy = signal(AccountMode::Normal, DataMode::Unsafe, Direction::Buy);
         assert!(pre_trade_check(&s_buy, 50.0, 50000.0, 100000.0, 5.0).is_err());
 
-        let s_sell = signal("Normal", "Unsafe", Direction::Sell);
+        let s_sell = signal(AccountMode::Normal, DataMode::Unsafe, Direction::Sell);
         assert!(pre_trade_check(&s_sell, 50.0, 50000.0, 100000.0, 5.0).is_err());
     }
 
     #[test]
-    fn rejects_unknown_data_mode() {
-        let s = signal("Normal", "Weird", Direction::Buy);
-        let r = pre_trade_check(&s, 50.0, 50000.0, 100000.0, 5.0);
-        assert!(r.is_err());
-        assert!(r.unwrap_err().contains("未知 data_mode"));
+    fn br134_risk_context_preserves_typed_modes() {
+        let s = signal(AccountMode::ReduceOnly, DataMode::Degraded, Direction::Sell);
+        assert_eq!(s.risk_context.account_mode.label(), "ReduceOnly");
+        assert_eq!(s.risk_context.data_mode.label(), "Degraded");
     }
 
     // ---- 5. 优先级: account_mode 优先于其他 ----
 
     #[test]
     fn account_mode_check_runs_first() {
-        let s = signal("Frozen", "Full", Direction::Buy);
+        let s = signal(AccountMode::Frozen, DataMode::Full, Direction::Buy);
         let r = pre_trade_check(&s, 50.0, 50000.0, 100000.0, 5.0);
         assert!(r.is_err());
         assert!(r.unwrap_err().contains("Frozen"));
@@ -362,17 +346,9 @@ mod tests {
 
     #[test]
     fn rejects_zero_total_value() {
-        let s = signal("Normal", "Full", Direction::Buy);
+        let s = signal(AccountMode::Normal, DataMode::Full, Direction::Buy);
         let r = pre_trade_check(&s, 50.0, 0.0, 0.0, 0.0);
         assert!(r.is_err());
         assert!(r.unwrap_err().contains("BR-084"));
-    }
-
-    #[test]
-    fn rejects_unknown_account_mode() {
-        let s = signal("Unexpected", "Full", Direction::Buy);
-        let r = pre_trade_check(&s, 50.0, 50_000.0, 100_000.0, 0.0);
-        assert!(r.is_err());
-        assert!(r.unwrap_err().contains("未知 account_mode"));
     }
 }

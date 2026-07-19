@@ -141,21 +141,18 @@ mod tests {
         assert!(server.finish()[0].contains("secid=1.600519"));
     }
 
-    /// ⚠️ 网络依赖, `#[ignore]` 跳过 CI, 手动跑:
-    ///   cargo test --lib fetch_ipo_date -- --ignored
     #[tokio::test]
-    #[ignore]
-    async fn fetch_ipo_date_real_network() {
-        // 贵州茅台 600519, 上市日 2001-08-27
-        let date = fetch_ipo_date("600519")
-            .await
-            .expect("600519 应该有 IPO 日期");
-        assert_eq!(date, NaiveDate::from_ymd_opt(2001, 8, 27).unwrap());
-
-        // 平安银行 000001, 上市日 1991-04-03
-        let date = fetch_ipo_date("000001")
-            .await
-            .expect("000001 应该有 IPO 日期");
-        assert_eq!(date, NaiveDate::from_ymd_opt(1991, 4, 3).unwrap());
+    async fn two_market_routes_preserve_complete_ipo_dates_without_live_network() {
+        use super::super::{loopback_http_client, TestHttpResponse, TestHttpServer};
+        let server = TestHttpServer::new(vec![
+            TestHttpResponse::json(r#"{"data":{"f26":"20010827"}}"#),
+            TestHttpResponse::json(r#"{"data":{"f26":"19910403"}}"#),
+        ]);
+        let client = loopback_http_client();
+        let sh = fetch_ipo_date_from_base(&client, "TEST_CODE_600519", server.base_url()).await;
+        let sz = fetch_ipo_date_from_base(&client, "TEST_CODE_000001", server.base_url()).await;
+        assert_eq!(sh.unwrap(), NaiveDate::from_ymd_opt(2001, 8, 27).unwrap());
+        assert_eq!(sz.unwrap(), NaiveDate::from_ymd_opt(1991, 4, 3).unwrap());
+        assert_eq!(server.finish().len(), 2);
     }
 }

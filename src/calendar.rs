@@ -225,6 +225,21 @@ pub fn prev_trading_day(from: NaiveDate) -> NaiveDate {
     d
 }
 
+/// BR-103: Return the newest trading day whose closing facts may exist.
+///
+/// During a trading session the current day is incomplete, so review and NAV
+/// consumers must remain on the previous trading day. At and after 15:00 the
+/// current trading day becomes eligible. Weekends and holidays always resolve
+/// to the preceding trading day.
+pub fn latest_completed_trading_day_at(now: NaiveDateTime) -> NaiveDate {
+    let date = now.date();
+    if is_trading_day(date) && now.time() >= AFTERNOON_END {
+        date
+    } else {
+        prev_trading_day(date)
+    }
+}
+
 /// 获取最近 N 个交易日（包含 from）
 pub fn recent_trading_days(from: NaiveDate, n: usize) -> Vec<NaiveDate> {
     let mut days = Vec::with_capacity(n);
@@ -373,6 +388,31 @@ mod tests {
         assert!(days
             .iter()
             .all(|d| !matches!(d.weekday(), Weekday::Sat | Weekday::Sun)));
+    }
+
+    #[test]
+    fn latest_completed_trading_day_uses_friday_during_weekend() {
+        let sunday = NaiveDate::from_ymd_opt(2026, 7, 19)
+            .unwrap()
+            .and_hms_opt(15, 35, 0)
+            .unwrap();
+        assert_eq!(
+            latest_completed_trading_day_at(sunday),
+            NaiveDate::from_ymd_opt(2026, 7, 17).unwrap()
+        );
+    }
+
+    #[test]
+    fn latest_completed_trading_day_changes_at_market_close() {
+        let friday = NaiveDate::from_ymd_opt(2026, 7, 17).unwrap();
+        assert_eq!(
+            latest_completed_trading_day_at(friday.and_hms_opt(14, 59, 59).unwrap()),
+            NaiveDate::from_ymd_opt(2026, 7, 16).unwrap()
+        );
+        assert_eq!(
+            latest_completed_trading_day_at(friday.and_hms_opt(15, 0, 0).unwrap()),
+            friday
+        );
     }
 
     #[test]

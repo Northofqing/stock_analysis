@@ -24,6 +24,8 @@ use crate::pipeline::chain_analysis::PUSH2_HOSTS;
 // is_generic_board 在 mod.rs 是 pub(super) — 让 fetchers 可见
 use super::is_generic_board;
 
+type SearchFuture = futures::future::BoxFuture<'static, Vec<crate::search_service::SearchResult>>;
+
 /// 获取指定代码集的概念标签：优先 7 天内缓存，缺失的并发拉取并落库。
 pub(super) async fn fetch_concepts_cached(
     codes: &[String],
@@ -150,7 +152,10 @@ pub(super) async fn fetch_board_code_map() -> Result<HashMap<String, String>, St
 async fn fetch_board_code_map_from_hosts(
     hosts: &[&str],
 ) -> Result<HashMap<String, String>, String> {
-    let client = reqwest::Client::builder()
+    let client_builder = reqwest::Client::builder();
+    #[cfg(test)]
+    let client_builder = client_builder.no_proxy();
+    let client = client_builder
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|error| format!("产业链板块 HTTP client 初始化失败: {error}"))?;
@@ -266,7 +271,10 @@ async fn fetch_laggard_candidates_from_hosts(
     if !board_code.starts_with("BK") {
         return Err(format!("产业链板块代码非法: {board_code}"));
     }
-    let client = reqwest::Client::builder()
+    let client_builder = reqwest::Client::builder();
+    #[cfg(test)]
+    let client_builder = client_builder.no_proxy();
+    let client = client_builder
         .timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(|error| format!("产业链成份 HTTP client 初始化失败: {error}"))?;
@@ -447,21 +455,38 @@ pub(super) async fn fetch_after_market_catalysts(top_themes: &[&str]) -> String 
     let hour = now.format("%H").to_string().parse::<u32>().unwrap_or(0);
     let time_label = if hour >= 15 { "盘后" } else { "盘中" };
 
-    let mut items: Vec<String> = Vec::new();
+    resolve_after_market_catalysts(
+        top_themes,
+        &today_str,
+        time_label,
+        std::time::Duration::from_secs(8),
+        move |query, limit| Box::pin(async move { svc.search_topic(&query, limit).await }),
+    )
+    .await
+}
 
-    // 对TOP主线逐个搜最新催化
+async fn resolve_after_market_catalysts<F>(
+    top_themes: &[&str],
+    today: &str,
+    time_label: &str,
+    timeout: std::time::Duration,
+    mut search: F,
+) -> String
+where
+    F: FnMut(String, usize) -> SearchFuture,
+{
+    let mut items = Vec::new();
     for theme in top_themes.iter().take(5) {
         if items.len() >= 10 {
             break;
         }
-        let q = format!("{} {} 最新 突发 催化", today_str, theme);
-        let results =
-            tokio::time::timeout(std::time::Duration::from_secs(8), svc.search_topic(&q, 2))
-                .await
-                .unwrap_or_default();
+        let query = format!("{today} {theme} 最新 突发 催化");
+        let results = tokio::time::timeout(timeout, search(query, 2))
+            .await
+            .unwrap_or_default();
         append_after_market_items(&mut items, theme, results);
     }
-    render_after_market_section(&today_str, time_label, &items)
+    render_after_market_section(today, time_label, &items)
 }
 
 fn build_cluster_query_context(
@@ -571,19 +596,40 @@ pub(super) async fn fetch_cluster_news(
         return String::new();
     }
 
-    let (mut queries, q_prompt) = build_cluster_query_context(cluster, concepts);
-    match analyzer
+    let (queries, q_prompt) = build_cluster_query_context(cluster, concepts);
+    let generated_queries = analyzer
         .call_api_mode(
             &q_prompt,
             "你是A股题材挖掘专家，只输出新闻搜索词，每行一条。",
             AgentMode::Quick,
         )
         .await
-    {
+        .map_err(|error| error.to_string());
+    resolve_cluster_news(
+        cluster,
+        queries,
+        generated_queries,
+        std::time::Duration::from_secs(15),
+        move |query, limit| Box::pin(async move { search.search_topic(&query, limit).await }),
+    )
+    .await
+}
+
+async fn resolve_cluster_news<F>(
+    cluster: &ChainCluster,
+    mut queries: Vec<String>,
+    generated_queries: Result<String, String>,
+    timeout: std::time::Duration,
+    mut search: F,
+) -> String
+where
+    F: FnMut(String, usize) -> SearchFuture,
+{
+    match generated_queries {
         Ok(text) => append_generated_cluster_queries(&mut queries, &text),
-        Err(e) => warn!(
+        Err(error) => warn!(
             "[产业链] 主线「{}」催化搜索词生成失败: {}",
-            cluster.concept, e
+            cluster.concept, error
         ),
     }
     log::debug!("[产业链] 主线「{}」检索词: {:?}", cluster.concept, queries);
@@ -592,12 +638,7 @@ pub(super) async fn fetch_cluster_news(
     let mut seen: HashSet<String> = HashSet::new();
     let mut items: Vec<String> = Vec::new();
     for q in &queries {
-        let results = match tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            search.search_topic(q, 4),
-        )
-        .await
-        {
+        let results = match tokio::time::timeout(timeout, search(q.clone(), 4)).await {
             Ok(r) => r,
             Err(_) => {
                 warn!("[产业链] 主线「{}」检索词 '{}' 超时", cluster.concept, q);
@@ -616,11 +657,12 @@ pub(super) async fn fetch_cluster_news(
 mod tests {
     use super::{
         append_after_market_items, append_cluster_news_items, append_generated_cluster_queries,
-        build_cluster_query_context, fetch_after_market_catalysts, fetch_board_code_map_from_hosts,
-        fetch_board_code_map_with_client, fetch_cluster_news, fetch_concepts_cached,
+        build_cluster_query_context, fetch_board_code_map_from_hosts,
+        fetch_board_code_map_with_client, fetch_concepts_cached,
         fetch_laggard_candidates_from_hosts, fetch_laggard_candidates_with_client, map_lhb_records,
         merge_board_code_page, parse_laggard_candidates, parse_push2_http_payload,
         parse_tool_boards, push2_get_from_hosts, render_after_market_section,
+        resolve_after_market_catalysts, resolve_cluster_news,
     };
     use serde_json::json;
     use std::collections::{HashMap, HashSet};
@@ -700,6 +742,97 @@ mod tests {
         let section = render_after_market_section("07月18日", "盘后", &items);
         assert!(section.contains("2 条"));
         assert!(section.contains("真实催化A"));
+    }
+
+    #[tokio::test]
+    async fn resolved_after_market_search_enforces_theme_and_item_limits() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let search_calls = std::sync::Arc::clone(&calls);
+        let section = resolve_after_market_catalysts(
+            &["主题甲", "主题乙", "主题丙", "主题丁", "主题戊", "主题己"],
+            "07月18日",
+            "盘后",
+            std::time::Duration::from_secs(1),
+            move |query, limit| {
+                search_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Box::pin(async move {
+                    assert_eq!(limit, 2);
+                    vec![
+                        search_result(format!("{query}-A"), "真实摘要A", Some("2026-07-18")),
+                        search_result(format!("{query}-B"), "真实摘要B", None),
+                    ]
+                })
+            },
+        )
+        .await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 5);
+        assert!(section.contains("10 条"));
+        assert!(!section.contains("主题己"));
+
+        let timed_out = resolve_after_market_catalysts(
+            &["超时主题"],
+            "07月18日",
+            "盘中",
+            std::time::Duration::ZERO,
+            |_query, _limit| Box::pin(futures::future::pending()),
+        )
+        .await;
+        assert!(timed_out.is_empty());
+        assert!(resolve_after_market_catalysts(
+            &[],
+            "07月18日",
+            "盘后",
+            std::time::Duration::from_secs(1),
+            |_query, _limit| Box::pin(async { Vec::new() }),
+        )
+        .await
+        .is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolved_cluster_search_merges_generated_queries_and_explicit_failures() {
+        let cluster = super::super::ChainCluster {
+            concept: "TEST_CODE_固态电池".to_string(),
+            aliases: Vec::new(),
+            stocks: Vec::new(),
+            continuation_count: 0,
+            streak_days: 0,
+            candidates: Vec::new(),
+            score: None,
+            scenario: None,
+        };
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let search_calls = std::sync::Arc::clone(&calls);
+        let news = resolve_cluster_news(
+            &cluster,
+            vec!["默认 主线查询".to_string()],
+            Ok("1. 电解质 扩产\n- 原材料 涨价".to_string()),
+            std::time::Duration::from_secs(1),
+            move |query, limit| {
+                search_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Box::pin(async move {
+                    assert_eq!(limit, 4);
+                    vec![
+                        search_result("跨查询重复标题", format!("{query} 摘要"), None),
+                        search_result(format!("{query} 独有"), "真实摘要", Some("2026-07-18")),
+                    ]
+                })
+            },
+        )
+        .await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 3);
+        assert_eq!(news.matches("跨查询重复标题").count(), 1);
+        assert!(news.contains("电解质 扩产 独有"));
+
+        let unavailable = resolve_cluster_news(
+            &cluster,
+            vec!["超时 查询".to_string()],
+            Err("TEST_CODE_模型不可用".to_string()),
+            std::time::Duration::ZERO,
+            |_query, _limit| Box::pin(futures::future::pending()),
+        )
+        .await;
+        assert!(unavailable.is_empty());
     }
 
     #[test]
@@ -979,6 +1112,30 @@ mod tests {
         assert!(requests[0].starts_with("/api/qt/clist/get?"));
         assert!(requests[0].contains("fs=m%3A90%2Bt%3A3"));
         assert!(requests[1].contains("fs=b%3ABK0001"));
+
+        let server = crate::data_provider::TestHttpServer::new(vec![
+            crate::data_provider::TestHttpResponse::json(
+                r#"{"data":{"diff":[{"f12":"BK0100","f14":"TEST_CODE_构造器板块"}]}}"#,
+            ),
+        ]);
+        let hosts = [server.base_url()];
+        let board_map = fetch_board_code_map_from_hosts(&hosts)
+            .await
+            .expect("provider-owned HTTP client board page");
+        assert_eq!(board_map["TEST_CODE_构造器板块"], "BK0100");
+        assert_eq!(server.finish().len(), 1);
+
+        let server = crate::data_provider::TestHttpServer::new(vec![
+            crate::data_provider::TestHttpResponse::json(
+                r#"{"data":{"diff":[{"f12":"100100","f14":"构造器候选","f3":1.0,"f2":10.0}]}}"#,
+            ),
+        ]);
+        let hosts = [server.base_url()];
+        let candidates = fetch_laggard_candidates_from_hosts("BK0100", &HashSet::new(), &hosts)
+            .await
+            .expect("provider-owned HTTP client constituent batch");
+        assert_eq!(candidates[0].code, "100100");
+        assert_eq!(server.finish().len(), 1);
     }
 
     #[tokio::test]
@@ -1016,19 +1173,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unavailable_search_service_returns_no_catalyst_or_cluster_news() {
-        if crate::search_service::get_search_service().is_available() {
-            return;
-        }
-        assert!(fetch_after_market_catalysts(&["TEST_CODE_主题"])
-            .await
-            .is_empty());
-        let analyzer = crate::analyzer::GeminiAnalyzer::new(crate::analyzer::GeminiConfig {
-            max_retries: 1,
-            retry_delay: 0.0,
-            request_delay: 0.0,
-            ..crate::analyzer::GeminiConfig::default()
-        });
+    async fn empty_resolved_search_batches_are_stable_regardless_of_environment_keys() {
         let cluster = super::super::ChainCluster {
             concept: "TEST_CODE_主题".to_string(),
             aliases: Vec::new(),
@@ -1039,8 +1184,23 @@ mod tests {
             score: None,
             scenario: None,
         };
-        assert!(fetch_cluster_news(&analyzer, &cluster, &HashMap::new())
-            .await
-            .is_empty());
+        assert!(resolve_after_market_catalysts(
+            &["TEST_CODE_主题"],
+            "07月19日",
+            "盘后",
+            std::time::Duration::from_secs(1),
+            |_query, _limit| Box::pin(async { Vec::new() }),
+        )
+        .await
+        .is_empty());
+        assert!(resolve_cluster_news(
+            &cluster,
+            vec!["TEST_CODE_查询".into()],
+            Ok(String::new()),
+            std::time::Duration::from_secs(1),
+            |_query, _limit| Box::pin(async { Vec::new() }),
+        )
+        .await
+        .is_empty());
     }
 }

@@ -434,6 +434,135 @@ pub fn take_all_for_aggregator() -> Vec<Arc<dyn NewsFeed>> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn search_result_adapter_preserves_direction_identity_url_and_strength_bounds() {
+        let cases = [
+            (
+                crate::search_service::Sentiment::Positive,
+                Direction::Bull,
+                SourceKind::Policy,
+                EventType::Policy,
+            ),
+            (
+                crate::search_service::Sentiment::Negative,
+                Direction::Bear,
+                SourceKind::Earnings,
+                EventType::Announcement,
+            ),
+            (
+                crate::search_service::Sentiment::Neutral,
+                Direction::Neutral,
+                SourceKind::ActiveSearch,
+                EventType::Other,
+            ),
+            (
+                crate::search_service::Sentiment::Unknown,
+                Direction::Neutral,
+                SourceKind::Flash,
+                EventType::Other,
+            ),
+        ];
+
+        for (sentiment, direction, source_kind, event_type) in cases {
+            let mut result = crate::search_service::SearchResult::new(
+                "TEST_CODE 测试事件".to_string(),
+                "测试来源证据".to_string(),
+                "https://example.invalid/TEST_CODE".to_string(),
+                "测试提供方".to_string(),
+            );
+            result.sentiment = sentiment;
+            result.importance = 99;
+            let event = search_result_to_event(&result, source_kind, event_type);
+            assert_eq!(event.direction, direction);
+            assert_eq!(event.event_type, event_type);
+            assert_eq!(event.subject, "测试提供方");
+            assert_eq!(event.object.as_deref(), Some("TEST_CODE 测试事件"));
+            assert_eq!(event.strength, 100);
+            assert_eq!(event.certainty, 60);
+            assert!(event.event_id.starts_with(source_kind.label()));
+            assert_eq!(event.provenance[0].provider, source_kind.label());
+            assert_eq!(
+                event.provenance[0].url.as_deref(),
+                Some("https://example.invalid/TEST_CODE")
+            );
+            assert!(!event.ai_degraded);
+            assert!(!event.stale);
+
+            let repeat = search_result_to_event(&result, source_kind, event_type);
+            assert_eq!(repeat.simhash, event.simhash);
+            result.url.clear();
+            let without_url = search_result_to_event(&result, source_kind, EventType::Other);
+            assert_eq!(without_url.provenance[0].url, None);
+        }
+    }
+
+    #[test]
+    fn real_feed_wrappers_report_their_registered_identity_without_network_access() {
+        let feeds: Vec<(Box<dyn NewsFeed>, &str, SourceKind)> = vec![
+            (
+                Box::new(Jin10FlashFeed {
+                    inner: crate::search_service::providers::jin10::Jin10Provider::new(),
+                }),
+                "jin10_flash",
+                SourceKind::Flash,
+            ),
+            (
+                Box::new(WallStreetCnFeed {
+                    inner:
+                        crate::search_service::providers::wallstreetcn::WallStreetCnProvider::new(),
+                }),
+                "wallstreetcn_flash",
+                SourceKind::Flash,
+            ),
+            (
+                Box::new(ClsFlashFeed {
+                    inner: crate::search_service::providers::cls::ClsProvider::new(),
+                }),
+                "cls_flash",
+                SourceKind::Flash,
+            ),
+            (
+                Box::new(SinaFlashFeed {
+                    inner: crate::search_service::providers::sina_flash::SinaFlashProvider::new(),
+                }),
+                "sina_flash",
+                SourceKind::Flash,
+            ),
+            (
+                Box::new(WeiboHotFeed {
+                    inner: crate::search_service::providers::weibo_hot::WeiboHotProvider::new(),
+                }),
+                "weibo_hot",
+                SourceKind::Flash,
+            ),
+            (
+                Box::new(GelonghuiFeed {
+                    inner: crate::search_service::providers::gelonghui::GelonghuiProvider::new(),
+                }),
+                "gelonghui",
+                SourceKind::Flash,
+            ),
+            (
+                Box::new(KcbDailyFeed {
+                    inner: crate::search_service::providers::kcb_daily::KcbDailyProvider::new(),
+                }),
+                "kcb_daily",
+                SourceKind::ActiveSearch,
+            ),
+            (
+                Box::new(GovPolicyFeed {
+                    inner: crate::search_service::providers::gov_policy::GovPolicyProvider::new(),
+                }),
+                "gov_policy",
+                SourceKind::Policy,
+            ),
+        ];
+        for (feed, name, source_kind) in feeds {
+            assert_eq!(feed.name(), name);
+            assert_eq!(feed.source_kind(), source_kind);
+        }
+    }
+
     #[tokio::test]
     async fn unimplemented_and_push_driven_feeds_fail_explicitly() {
         let feeds: Vec<Box<dyn NewsFeed>> = vec![
@@ -446,6 +575,13 @@ mod tests {
         ];
 
         for feed in feeds {
+            assert!(matches!(
+                feed.source_kind(),
+                SourceKind::Policy
+                    | SourceKind::Earnings
+                    | SourceKind::AnalystView
+                    | SourceKind::MarketAction
+            ));
             let result = feed.fetch(10).await;
             assert!(
                 result.is_err(),

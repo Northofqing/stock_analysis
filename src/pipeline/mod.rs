@@ -265,15 +265,25 @@ pub struct AnalysisPipeline {
     /// Test/live isolation (2.5): backtest artifacts use an isolated filesystem root.
     #[cfg(test)]
     test_backtest_output_dir: Option<std::path::PathBuf>,
+    /// Test/live isolation (2.5): summary sources and artifact root are resolved locally.
+    #[cfg(test)]
+    test_summary_context: Option<TestResolvedSummaryContext>,
 }
 
 #[cfg(test)]
 #[derive(Clone)]
 struct TestResolvedAnalysisContext {
-    stock_name: String,
-    news_context: Option<String>,
+    name_news: Option<(String, Option<String>)>,
     extra: std::result::Result<extra_context::ExtraContext, String>,
     mtf_section: std::result::Result<Option<String>, String>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestResolvedSummaryContext {
+    chain_section: Option<String>,
+    regime_section: Option<String>,
+    output_dir: std::path::PathBuf,
 }
 
 /// 评分 → 操作建议（系统与 AI 共用同一档位表，避免两套标准）
@@ -371,6 +381,8 @@ impl AnalysisPipeline {
             test_fetched_data: None,
             #[cfg(test)]
             test_backtest_output_dir: None,
+            #[cfg(test)]
+            test_summary_context: None,
         })
     }
 
@@ -620,66 +632,91 @@ impl AnalysisPipeline {
             && !self.config.dry_run
             && !self.config.single_notify
         {
-            // 产业链联动分析：仅在当日有涨停数据时执行，作为报告第一部分
-            // MarketAnalyzer 使用阻塞 HTTP，必须在 spawn_blocking 中执行
-            let chain_section = {
-                let limit_up_stocks =
-                    tokio::task::spawn_blocking(
-                        || match crate::market_analyzer::MarketAnalyzer::new(None) {
-                            Ok(analyzer) => match analyzer.get_limit_up_stocks() {
-                                Ok(stocks) => stocks,
-                                Err(e) => {
-                                    log::warn!("[产业链] 获取涨停股列表失败: {}", e);
-                                    Vec::new()
-                                }
-                            },
-                            Err(e) => {
-                                log::warn!("[产业链] 创建 MarketAnalyzer 失败: {}", e);
-                                Vec::new()
-                            }
-                        },
-                    )
-                    .await
-                    .unwrap_or_default();
-                if limit_up_stocks.is_empty() {
-                    info!("[产业链] 今日无涨停数据，跳过产业链分析");
-                    None
-                } else {
-                    info!(
-                        "[产业链] 获取到 {} 只涨停股，开始联动分析...",
-                        limit_up_stocks.len()
-                    );
-                    match chain_analysis::run_chain_analysis(limit_up_stocks, None).await {
-                        Ok(report) if !report.trim().is_empty() => {
-                            info!("[产业链] 联动分析完成，将并入主报告");
-                            Some(report)
-                        }
-                        Ok(_) => {
-                            warn!("[产业链] 联动分析返回空，跳过");
-                            None
-                        }
-                        Err(e) => {
-                            warn!("[产业链] 联动分析失败: {}", e);
-                            None
-                        }
-                    }
-                }
-            };
-
-            // BR-122 大盘状态门控：普跌日豁免跑赢指数个股的机械减仓建议，并在日报头部输出市场定性
-            let regime_section = market_regime::apply(&self.data_manager, &mut results)
-                .map_err(anyhow::Error::msg)?;
-            summary_notify::send_summary_notification(
-                &self.notifier,
-                &results,
-                backtest_summary.as_ref(),
-                regime_section.as_deref(),
-                chain_section.as_deref(),
-            )
-            .await?;
+            #[cfg(test)]
+            if let Some(context) = self.test_summary_context.as_ref() {
+                summary_notify::send_summary_notification_to(
+                    &self.notifier,
+                    &results,
+                    backtest_summary.as_ref(),
+                    context.regime_section.as_deref(),
+                    context.chain_section.as_deref(),
+                    &context.output_dir,
+                )
+                .await?;
+            } else {
+                self.send_live_summary(&mut results, backtest_summary.as_ref())
+                    .await?;
+            }
+            #[cfg(not(test))]
+            self.send_live_summary(&mut results, backtest_summary.as_ref())
+                .await?;
         }
 
         Ok(results)
+    }
+
+    async fn send_live_summary(
+        &self,
+        results: &mut [AnalysisResult],
+        backtest_summary: Option<&crate::strategy::core::BacktestSummary>,
+    ) -> Result<()> {
+        // 产业链联动分析：仅在当日有涨停数据时执行，作为报告第一部分
+        // MarketAnalyzer 使用阻塞 HTTP，必须在 spawn_blocking 中执行
+        let chain_section = {
+            let limit_up_stocks = tokio::task::spawn_blocking(|| {
+                match crate::market_analyzer::MarketAnalyzer::new(None) {
+                    Ok(analyzer) => match analyzer.get_limit_up_stocks() {
+                        Ok(stocks) => stocks,
+                        Err(e) => {
+                            log::warn!("[产业链] 获取涨停股列表失败: {}", e);
+                            Vec::new()
+                        }
+                    },
+                    Err(e) => {
+                        log::warn!("[产业链] 创建 MarketAnalyzer 失败: {}", e);
+                        Vec::new()
+                    }
+                }
+            })
+            .await
+            .unwrap_or_default();
+            if limit_up_stocks.is_empty() {
+                info!("[产业链] 今日无涨停数据，跳过产业链分析");
+                None
+            } else {
+                info!(
+                    "[产业链] 获取到 {} 只涨停股，开始联动分析...",
+                    limit_up_stocks.len()
+                );
+                match chain_analysis::run_chain_analysis(limit_up_stocks, None).await {
+                    Ok(report) if !report.trim().is_empty() => {
+                        info!("[产业链] 联动分析完成，将并入主报告");
+                        Some(report)
+                    }
+                    Ok(_) => {
+                        warn!("[产业链] 联动分析返回空，跳过");
+                        None
+                    }
+                    Err(e) => {
+                        warn!("[产业链] 联动分析失败: {}", e);
+                        None
+                    }
+                }
+            }
+        };
+
+        // BR-122 大盘状态门控：普跌日豁免跑赢指数个股的机械减仓建议，并在日报头部输出市场定性
+        let regime_section =
+            market_regime::apply(&self.data_manager, results).map_err(anyhow::Error::msg)?;
+        summary_notify::send_summary_notification(
+            &self.notifier,
+            results,
+            backtest_summary,
+            regime_section.as_deref(),
+            chain_section.as_deref(),
+        )
+        .await?;
+        Ok(())
     }
 
     /// 生成单股报告

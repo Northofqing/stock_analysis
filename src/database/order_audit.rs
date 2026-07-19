@@ -376,6 +376,22 @@ mod tests {
             .count
     }
 
+    fn audit_record<'a>(business_order_id: &'a str) -> OrderAuditRecord<'a> {
+        OrderAuditRecord {
+            business_order_id,
+            source: "DatabaseTest",
+            decision_basis: "TEST_CODE complete audit append",
+            side: "buy",
+            code: "TEST_CODE_BR086_APPEND",
+            requested_price: 10.0,
+            execution_price: Some(10.0),
+            quantity: 100,
+            quote_observed_at: Some("2026-07-18T09:30:00+08:00"),
+            outcome: "Filled",
+            failure_reason: None,
+        }
+    }
+
     #[test]
     fn br086_empty_legacy_chain_is_backfilled_once_and_validated() {
         let mut conn = isolated_connection();
@@ -421,6 +437,42 @@ mod tests {
             .expect_err("bad hash must reject startup")
             .to_string();
         assert!(error.contains("hash mismatch"), "{error}");
+    }
+
+    #[test]
+    fn br086_validation_rejects_length_and_linkage_mismatches() {
+        let mut length_mismatch = isolated_connection();
+        insert_legacy_audit(&mut length_mismatch, "TEST_ORDER_BR086_LENGTH");
+        let error = validate_order_audit_chain(&mut length_mismatch)
+            .expect_err("missing chain row must fail")
+            .to_string();
+        assert!(error.contains("length mismatch"), "{error}");
+
+        let mut linkage_mismatch = isolated_connection();
+        insert_legacy_audit(&mut linkage_mismatch, "TEST_ORDER_BR086_LINK");
+        initialize_order_audit_chain(&mut linkage_mismatch).expect("initial chain");
+        diesel::sql_query("DROP TRIGGER trg_order_audit_chain_no_update")
+            .execute(&mut linkage_mismatch)
+            .expect("test-only linkage tamper setup");
+        diesel::sql_query(
+            "UPDATE order_audit_chain SET previous_hash = 'TEST_CODE_WRONG_PREVIOUS'",
+        )
+        .execute(&mut linkage_mismatch)
+        .expect("test-only linkage tamper");
+        let error = validate_order_audit_chain(&mut linkage_mismatch)
+            .expect_err("wrong previous hash must fail")
+            .to_string();
+        assert!(error.contains("linkage mismatch"), "{error}");
+    }
+
+    #[test]
+    fn br086_successful_append_commits_one_audit_and_one_hash_row() {
+        let mut conn = isolated_connection();
+        let record = audit_record("TEST_ORDER_BR086_APPEND");
+        insert_order_audit(&mut conn, &record).expect("atomic audit append");
+        assert_eq!(table_count(&mut conn, "order_audit"), 1);
+        assert_eq!(table_count(&mut conn, "order_audit_chain"), 1);
+        validate_order_audit_chain(&mut conn).expect("appended chain validates");
     }
 
     #[test]

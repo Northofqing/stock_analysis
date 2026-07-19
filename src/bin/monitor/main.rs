@@ -84,10 +84,12 @@ impl TestEnvGuard {
             "V10_DRY_RUN_PUSH",
             "PUSH_VERBOSE",
             "STOCK_ANALYSIS_QUIET_HOUR_OVERRIDE",
+            "STOCK_ENV_MODE",
         ]);
         std::env::set_var("V10_DRY_RUN_PUSH", "1");
         std::env::set_var("PUSH_VERBOSE", "true");
         std::env::set_var("STOCK_ANALYSIS_QUIET_HOUR_OVERRIDE", "0");
+        std::env::set_var("STOCK_ENV_MODE", "test");
         guard
     }
 }
@@ -848,13 +850,90 @@ mod virtual_observation_tests {
             .expect_err("missing real account cash must block the report before ledger reads");
         assert!(error.contains("no_fresh_real_account_cash_snapshot"));
     }
+
+    #[test]
+    fn snapshot_validation_read_merge_and_review_cover_complete_local_lifecycle() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 7, 18).unwrap();
+        let first = record("TEST_CODE_000001", 10.0, 100, date);
+        let second = record("TEST_CODE_000002", 20.0, 200, date);
+        let snapshot = VirtualObservationSnapshot {
+            created_at: "2026-07-18 15:00:00".to_string(),
+            records: vec![first.clone(), second.clone()],
+        };
+        validate_virtual_observation_snapshot(&snapshot, date).expect("valid snapshot");
+
+        let mut empty = snapshot.clone();
+        empty.records.clear();
+        assert!(validate_virtual_observation_snapshot(&empty, date).is_err());
+        let mut duplicate = snapshot.clone();
+        duplicate.records.push(first.clone());
+        assert!(validate_virtual_observation_snapshot(&duplicate, date).is_err());
+        let mut wrong_created = snapshot.clone();
+        wrong_created.created_at = "2026-07-17 15:00:00".to_string();
+        assert!(validate_virtual_observation_snapshot(&wrong_created, date).is_err());
+
+        let dir = temp_dir("lifecycle");
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("missing.json");
+        assert!(read_virtual_observation_snapshot(&missing, date)
+            .unwrap()
+            .is_none());
+        let path = dir.join("20260718.json");
+        std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        let loaded = read_virtual_observation_snapshot(&path, date)
+            .unwrap()
+            .expect("complete snapshot");
+        assert_eq!(loaded.records.len(), 2);
+
+        let merged = merge_virtual_observation_records(
+            vec![first],
+            &[record("TEST_CODE_000003", 30.0, 300, date)],
+            date,
+        )
+        .unwrap();
+        assert_eq!(merged.len(), 2);
+
+        let closes = std::collections::HashMap::from([
+            ("TEST_CODE_000001".to_string(), 11.0),
+            ("TEST_CODE_000002".to_string(), 18.0),
+        ]);
+        let review = build_virtual_next_day_review_text(&snapshot, &closes)
+            .unwrap()
+            .expect("review text");
+        assert!(review.contains("命中率 50.0%"));
+        assert!(review.contains("组合收益"));
+        assert_eq!(parse_snapshot_base_date("2026-07-18 15:00:00"), Some(date));
+        assert!(parse_snapshot_base_date("invalid").is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn message_transport_labels_and_virtual_modes_are_stable() {
+        assert_eq!(MessageSendType::Wechat.as_str(), "wechat");
+        assert_eq!(MessageSendType::Wechat.label(), "微信");
+        assert_eq!(MessageSendType::Feishu.as_str(), "feishu");
+        assert_eq!(MessageSendType::Feishu.label(), "飞书");
+        assert_eq!(MessageSendTransport::Http.as_str(), "http");
+        assert_eq!(MessageSendTransport::Cli.as_str(), "cli");
+
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 7, 18).unwrap();
+        let mut invalid_mode = record("TEST_CODE_000001", 10.0, 100, date);
+        invalid_mode.entry_mode = "unknown".to_string();
+        assert!(validate_virtual_observation_record(&invalid_mode, date).is_err());
+    }
 }
 
 // ============= v17.6: 6 dispatcher 调度入口 (--push 模式) ============
 
 /// v14.0: dry-run 模式, 验证 dispatcher 数据源 + 渲染, 不实际推送
 
-async fn run_daily_pushes_dry_run() {
+async fn run_daily_pushes_dry_run() -> Result<(), String> {
+    tokio::task::spawn_blocking(run_daily_pushes_dry_run_blocking)
+        .await
+        .map_err(|error| format!("dry-run blocking task failed: {error}"))
+}
+
+fn run_daily_pushes_dry_run_blocking() {
     use push_templates::{
         build_industry_chain_intraday_from_snapshot, build_intraday_market_from_snapshot,
         build_news_catalyst_from_snapshot, build_news_to_idea_from_snapshot,
@@ -2515,10 +2594,13 @@ async fn main() {
 
     if e2e_mode {
         log::info!("[v70] E2E 模式启动 — 跑所有 v12 §14 模板 (忽略时间窗口)");
-
-        e2e_all_templates_run().await;
-
-        std::process::exit(0);
+        match e2e_all_templates_run().await {
+            Ok(()) => std::process::exit(0),
+            Err(error) => {
+                log::error!("[v70][BR-051][BR-103] E2E 失败: {error}");
+                std::process::exit(2);
+            }
+        }
     }
 
     // v70+: 兑现回填 (D+1 outcome 写回 d01_recommendations jsonl)
@@ -2610,7 +2692,10 @@ async fn main() {
     } else if push_dry_run {
         log::info!("[v14.0] --push-dry-run 模式启动");
 
-        run_daily_pushes_dry_run().await;
+        if let Err(error) = run_daily_pushes_dry_run().await {
+            log::error!("[v14.0] --push-dry-run 失败: {error}");
+            std::process::exit(2);
+        }
 
         log::info!("[v14.0] --push-dry-run 完成");
 
@@ -2872,11 +2957,14 @@ async fn run_strict_review_only_inner() -> Result<(), String> {
 
 /// 单独提出便于测试 + 控制超时粒度.
 
-async fn run_review_only_inner() -> Result<(), String> {
+async fn run_review_only_inner(isolated_test_fixtures: bool) -> Result<(), String> {
+    let review_as_of = stock_analysis::calendar::latest_completed_trading_day_at(
+        chrono::Local::now().naive_local(),
+    );
     // v62: 6-tuple 返回 (实盘数据误差修复需要 quotes, 第二轮 fetch 在外部重新拉)
 
     let (report, _holding_breakout_text, _watch_breakout_text, _market_breakout_text, _risk_text) =
-        tokio::task::spawn_blocking(|| -> Result<_, String> {
+        tokio::task::spawn_blocking(move || -> Result<_, String> {
             let holdings = stock_analysis::portfolio::get_positions()
                 .map_err(|error| format!("复盘持仓查询失败: {error}"))?;
 
@@ -2892,11 +2980,8 @@ async fn run_review_only_inner() -> Result<(), String> {
 
             stock_analysis::review::journal::enrich_post_exit(&mut reviews);
 
-            let equity = stock_analysis::portfolio::get_equity_curve_as_of(
-                365,
-                chrono::Local::now().date_naive(),
-            )
-            .map_err(|error| format!("复盘净值曲线查询失败: {error}"))?;
+            let equity = stock_analysis::portfolio::get_equity_curve_as_of(365, review_as_of)
+                .map_err(|error| format!("复盘净值曲线查询失败: {error}"))?;
 
             let mut stats = stock_analysis::review::equity::compute_stats(&equity)
                 .map_err(|error| format!("复盘净值统计失败: {error}"))?;
@@ -3045,63 +3130,61 @@ async fn run_review_only_inner() -> Result<(), String> {
                     watch_brk = watch_lines.join("\n");
                 }
 
-                // —— 实盘量能优选：全市场量能前列 + 走势较好（盘后 Top5）——
+                if isolated_test_fixtures {
+                    log::info!("[复盘][BR-051] isolated E2E skips external market candidate scan");
+                } else {
+                    // —— 实盘量能优选：全市场量能前列 + 走势较好（盘后 Top5）——
+                    let mut market_lines =
+                        vec!["📊 放量分析·实盘优选（盘后·算法研判仅供参考）".to_string()];
+                    let market_candidates = market_data::fetch_market_volume_ratio_leaders(80)?;
+                    let mut picked = 0usize;
 
-                let mut market_lines =
-                    vec!["📊 放量分析·实盘优选（盘后·算法研判仅供参考）".to_string()];
-
-                let market_candidates = market_data::fetch_market_volume_ratio_leaders(80)?;
-
-                let mut picked = 0usize;
-
-                for s in &market_candidates {
-                    if picked >= 5 {
-                        break;
-                    }
-
-                    if holding_codes.contains(&s.code) || watch_codes.contains(&s.code) {
-                        continue;
-                    }
-                    let (Some(volume_ratio), Some(main_net_yi)) = (s.volume_ratio, s.main_net_yi)
-                    else {
-                        log::warn!(
-                            "[复盘] {}({}) 量比/主力流缺失，跳过实盘优选",
-                            s.name,
-                            s.code
-                        );
-                        continue;
-                    };
-
-                    if let Ok((kline, _)) = fetcher.get_daily_data(&s.code, 60) {
-                        let sig = stock_analysis::breakout::engine::analyze_postmarket(
-                            &s.code, &s.name, &kline,
-                        );
-
-                        if sig.breakout_type
-                            != stock_analysis::breakout::signal::BreakoutType::Launch
-                            || sig.confidence < 50
-                        {
+                    for s in &market_candidates {
+                        if picked >= 5 {
+                            break;
+                        }
+                        if holding_codes.contains(&s.code) || watch_codes.contains(&s.code) {
                             continue;
                         }
+                        let (Some(volume_ratio), Some(main_net_yi)) =
+                            (s.volume_ratio, s.main_net_yi)
+                        else {
+                            log::warn!(
+                                "[复盘] {}({}) 量比/主力流缺失，跳过实盘优选",
+                                s.name,
+                                s.code
+                            );
+                            continue;
+                        };
 
-                        market_lines.push(format!(
-                            "  {} {}({}) — {} 置信{}% [量比{:.1} 主力{:+.2}亿 | {}]",
-                            sig.breakout_type.emoji(),
-                            sig.name,
-                            sig.code,
-                            sig.breakout_type.label(),
-                            sig.confidence,
-                            volume_ratio,
-                            main_net_yi,
-                            sig.description,
-                        ));
-
-                        picked += 1;
+                        if let Ok((kline, _)) = fetcher.get_daily_data(&s.code, 60) {
+                            let sig = stock_analysis::breakout::engine::analyze_postmarket(
+                                &s.code, &s.name, &kline,
+                            );
+                            if sig.breakout_type
+                                != stock_analysis::breakout::signal::BreakoutType::Launch
+                                || sig.confidence < 50
+                            {
+                                continue;
+                            }
+                            market_lines.push(format!(
+                                "  {} {}({}) — {} 置信{}% [量比{:.1} 主力{:+.2}亿 | {}]",
+                                sig.breakout_type.emoji(),
+                                sig.name,
+                                sig.code,
+                                sig.breakout_type.label(),
+                                sig.confidence,
+                                volume_ratio,
+                                main_net_yi,
+                                sig.description,
+                            ));
+                            picked += 1;
+                        }
                     }
-                }
 
-                if market_lines.len() > 1 {
-                    market_brk = market_lines.join("\n");
+                    if market_lines.len() > 1 {
+                        market_brk = market_lines.join("\n");
+                    }
                 }
             }
 
@@ -3198,7 +3281,7 @@ async fn run_review_only_inner() -> Result<(), String> {
 
     let v12_review_result: Result<(), String> = tokio::task::spawn_blocking(move || {
 
-        let today_str = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today_str = review_as_of.format("%Y-%m-%d").to_string();
 
         let _hhmm = chrono::Local::now().format("%H:%M").to_string();
 
@@ -3282,13 +3365,15 @@ async fn run_review_only_inner() -> Result<(), String> {
         // ===== R-02 盘面走向 (v12 market_stage_confidence 5 维) =====
 
         {
+            if isolated_test_fixtures {
+                log::info!("[v12-R02][BR-051] isolated E2E skips external market snapshot");
+            } else {
+                use stock_analysis::market_analyzer::market_stage_confidence::{
+                    evaluate as ms_evaluate, MarketStageEvidence, TechnicalMetrics,
+                };
 
-            use stock_analysis::market_analyzer::market_stage_confidence::{
-                evaluate as ms_evaluate, MarketStageEvidence, TechnicalMetrics,
-            };
-
-            match market_data::fetch_market_review_snapshot() {
-                Ok(snapshot) => {
+                match market_data::fetch_market_review_snapshot() {
+                    Ok(snapshot) => {
                     let ev = MarketStageEvidence {
                         technical: Some(TechnicalMetrics {
                             sh_chg: snapshot.sh_chg,
@@ -3320,12 +3405,12 @@ async fn run_review_only_inner() -> Result<(), String> {
                     };
                     let text = pt::render_review_market(&today_str, &r);
                     log::info!("[v12-R02]\n{}", text);
-                }
-                Err(error) => {
-                    log::error!("[v12-R02] BR-093 盘面快照不可用，跳过评估: {}", error);
+                    }
+                    Err(error) => {
+                        log::error!("[v12-R02] BR-093 盘面快照不可用，跳过评估: {}", error);
+                    }
                 }
             }
-
         }
 
 
@@ -3520,46 +3605,50 @@ async fn run_review_only_inner() -> Result<(), String> {
         // R-02 推送
 
         {
-            use stock_analysis::market_analyzer::market_stage_confidence::{
-                evaluate as ms_evaluate, MarketStageEvidence, TechnicalMetrics,
-            };
+            if isolated_test_fixtures {
+                log::info!("[v12-R02][BR-051] isolated E2E skips external market push");
+            } else {
+                use stock_analysis::market_analyzer::market_stage_confidence::{
+                    evaluate as ms_evaluate, MarketStageEvidence, TechnicalMetrics,
+                };
 
-            match market_data::fetch_market_review_snapshot() {
-                Ok(snapshot) => {
-                    let ev = MarketStageEvidence {
-                        technical: Some(TechnicalMetrics {
-                            sh_chg: snapshot.sh_chg,
-                            chinext_chg: snapshot.chinext_chg,
-                            star_chg: snapshot.star_chg,
-                        }),
-                        ..Default::default()
-                    };
-                    let conf = ms_evaluate(&ev);
-                    let r = pt::MarketReview {
-                        sh_chg: Some(snapshot.sh_chg),
-                        chinext_chg: Some(snapshot.chinext_chg),
-                        star_chg: Some(snapshot.star_chg),
-                        limit_up_n: Some(snapshot.limit_up_n),
-                        limit_down_n: Some(snapshot.limit_down_n),
-                        broken_pct: None,
-                        consecutive_h: None,
-                        amount_yi: Some(snapshot.amount_yi),
-                        amount_delta_pct: None,
-                        amount_dir: None,
-                        main_flow_yi: None,
-                        money_effect: "暂无",
-                        heat_stage: conf.heat_stage.as_str(),
-                        heat_conf_pct: conf.conf_pct,
-                        low_conf: conf.degraded,
-                        low_conf_tier: None,
-                        account_mode: pt::AccountMode::Normal,
-                        max_pos: 7,
-                    };
-                    let text = pt::render_review_market(&today_str2, &r);
-                    notify::push_governor(&text, notify::PushKind::ReviewMarket).await;
-                }
-                Err(error) => {
-                    log::error!("[v12-R02] BR-093 盘面快照不可用，跳过推送: {}", error);
+                match market_data::fetch_market_review_snapshot() {
+                    Ok(snapshot) => {
+                        let ev = MarketStageEvidence {
+                            technical: Some(TechnicalMetrics {
+                                sh_chg: snapshot.sh_chg,
+                                chinext_chg: snapshot.chinext_chg,
+                                star_chg: snapshot.star_chg,
+                            }),
+                            ..Default::default()
+                        };
+                        let conf = ms_evaluate(&ev);
+                        let r = pt::MarketReview {
+                            sh_chg: Some(snapshot.sh_chg),
+                            chinext_chg: Some(snapshot.chinext_chg),
+                            star_chg: Some(snapshot.star_chg),
+                            limit_up_n: Some(snapshot.limit_up_n),
+                            limit_down_n: Some(snapshot.limit_down_n),
+                            broken_pct: None,
+                            consecutive_h: None,
+                            amount_yi: Some(snapshot.amount_yi),
+                            amount_delta_pct: None,
+                            amount_dir: None,
+                            main_flow_yi: None,
+                            money_effect: "暂无",
+                            heat_stage: conf.heat_stage.as_str(),
+                            heat_conf_pct: conf.conf_pct,
+                            low_conf: conf.degraded,
+                            low_conf_tier: None,
+                            account_mode: pt::AccountMode::Normal,
+                            max_pos: 7,
+                        };
+                        let text = pt::render_review_market(&today_str2, &r);
+                        notify::push_governor(&text, notify::PushKind::ReviewMarket).await;
+                    }
+                    Err(error) => {
+                        log::error!("[v12-R02] BR-093 盘面快照不可用，跳过推送: {}", error);
+                    }
                 }
             }
         }
@@ -3612,7 +3701,9 @@ async fn run_review_only_inner() -> Result<(), String> {
 
         // R-08 推送 (真实数据: 拉今日公告 + 持仓事件)
 
-        {
+        if isolated_test_fixtures {
+            log::info!("[v12-R08][BR-051] isolated E2E skips external announcement/overnight data");
+        } else {
             // 真实数据源: 公告 API + 持仓事件
 
             // 公告拉取 (sync, 包 spawn_blocking)
@@ -3736,7 +3827,7 @@ async fn run_review_only_inner() -> Result<(), String> {
 
         //   - v12 路径: 只推 candidate_summary, 没单独推放量卡片 — 用户要"内容跟 v18 一样"
 
-        let v18_brk = tokio::task::spawn_blocking(|| -> Result<_, String> {
+        let v18_brk = tokio::task::spawn_blocking(move || -> Result<_, String> {
             let holdings = stock_analysis::portfolio::get_positions()
                 .map_err(|error| format!("v18 复盘持仓查询失败: {error}"))?;
 
@@ -3817,59 +3908,59 @@ async fn run_review_only_inner() -> Result<(), String> {
                     watch_brk = watch_lines.join("\n");
                 }
 
-                // 实盘量能优选 (全市场)
+                if isolated_test_fixtures {
+                    log::info!(
+                        "[v18复盘][BR-051] isolated E2E skips external market candidate scan"
+                    );
+                } else {
+                    // 实盘量能优选 (全市场)
+                    let market_candidates = market_data::fetch_market_volume_ratio_leaders(80)?;
+                    let mut market_lines =
+                        vec!["📊 放量分析·实盘优选（盘后·算法研判仅供参考）".to_string()];
+                    let mut picked = 0usize;
 
-                let market_candidates = market_data::fetch_market_volume_ratio_leaders(80)?;
-
-                let mut market_lines =
-                    vec!["📊 放量分析·实盘优选（盘后·算法研判仅供参考）".to_string()];
-
-                let mut picked = 0usize;
-
-                for s in &market_candidates {
-                    if picked >= 5 {
-                        break;
-                    }
-
-                    if holding_codes.contains(&s.code) || watch_codes.contains(&s.code) {
-                        continue;
-                    }
-                    let (Some(volume_ratio), Some(main_net_yi)) = (s.volume_ratio, s.main_net_yi)
-                    else {
-                        log::warn!("[v18复盘] {}({}) 量比/主力流缺失，跳过", s.name, s.code);
-                        continue;
-                    };
-
-                    if let Ok((kline, _)) = fetcher.get_daily_data(&s.code, 60) {
-                        let sig = stock_analysis::breakout::engine::analyze_postmarket(
-                            &s.code, &s.name, &kline,
-                        );
-
-                        if sig.breakout_type
-                            != stock_analysis::breakout::signal::BreakoutType::Launch
-                            || sig.confidence < 50
-                        {
+                    for s in &market_candidates {
+                        if picked >= 5 {
+                            break;
+                        }
+                        if holding_codes.contains(&s.code) || watch_codes.contains(&s.code) {
                             continue;
                         }
+                        let (Some(volume_ratio), Some(main_net_yi)) =
+                            (s.volume_ratio, s.main_net_yi)
+                        else {
+                            log::warn!("[v18复盘] {}({}) 量比/主力流缺失，跳过", s.name, s.code);
+                            continue;
+                        };
 
-                        market_lines.push(format!(
-                            "  {} {}({}) — {} 置信{}% [量比{:.1} 主力{:+.2}亿 | {}]",
-                            sig.breakout_type.emoji(),
-                            sig.name,
-                            sig.code,
-                            sig.breakout_type.label(),
-                            sig.confidence,
-                            volume_ratio,
-                            main_net_yi,
-                            sig.description,
-                        ));
-
-                        picked += 1;
+                        if let Ok((kline, _)) = fetcher.get_daily_data(&s.code, 60) {
+                            let sig = stock_analysis::breakout::engine::analyze_postmarket(
+                                &s.code, &s.name, &kline,
+                            );
+                            if sig.breakout_type
+                                != stock_analysis::breakout::signal::BreakoutType::Launch
+                                || sig.confidence < 50
+                            {
+                                continue;
+                            }
+                            market_lines.push(format!(
+                                "  {} {}({}) — {} 置信{}% [量比{:.1} 主力{:+.2}亿 | {}]",
+                                sig.breakout_type.emoji(),
+                                sig.name,
+                                sig.code,
+                                sig.breakout_type.label(),
+                                sig.confidence,
+                                volume_ratio,
+                                main_net_yi,
+                                sig.description,
+                            ));
+                            picked += 1;
+                        }
                     }
-                }
 
-                if market_lines.len() > 1 {
-                    market_brk = market_lines.join("\n");
+                    if market_lines.len() > 1 {
+                        market_brk = market_lines.join("\n");
+                    }
                 }
             }
 
@@ -3923,7 +4014,9 @@ async fn run_review_only_inner() -> Result<(), String> {
 
     // 全模板覆盖: R-01~R-08 已由上方内联块推送, 这里调 dispatch_all_for_test 补齐
     //   --test → All (再跑盘中模板); --review → Review (只补盘后复盘). R-02~R-08 已推 → dedup 跳过, 不重复
-    if std::env::args().any(|arg| arg == "--test") {
+    if isolated_test_fixtures {
+        log::info!("[复盘][BR-051] isolated E2E defers template sweep to IsolatedAll scope");
+    } else if std::env::args().any(|arg| arg == "--test") {
         let hhmm_r = chrono::Local::now().format("%H:%M").to_string();
         let date_r = chrono::Local::now().format("%Y-%m-%d").to_string();
         let banner_r = pt::BannerCtx::default();
@@ -3947,10 +4040,11 @@ async fn run_review_only_inner() -> Result<(), String> {
 
 ///   用途: 验证 v12 §14 + v13.1 模板完整性, 推全 22 模板
 
-async fn e2e_all_templates_run() {
-    let today_str = chrono::Local::now().format("%Y-%m-%d").to_string();
-
-    let hhmm = chrono::Local::now().format("%H:%M").to_string();
+async fn e2e_all_templates_run() -> Result<(), String> {
+    let now = chrono::Local::now();
+    let review_date = stock_analysis::calendar::latest_completed_trading_day_at(now.naive_local());
+    let today_str = review_date.format("%Y-%m-%d").to_string();
+    let hhmm = now.format("%H:%M").to_string();
 
     log::info!("[v70] E2E 开始 — 跑所有 v12 §14 + v13.1 模板");
 
@@ -3958,19 +4052,24 @@ async fn e2e_all_templates_run() {
 
     log::info!("[v70] 1/3 seed chain_daily + lhb_daily + trades");
 
-    if let Err(error) = seed_e2e_data_via_sqlite(&today_str) {
-        log::error!("[v70][BR-051] E2E seed 失败，终止全模板测试: {}", error);
-        return;
-    }
+    seed_e2e_data_via_sqlite(review_date)
+        .map_err(|error| format!("E2E seed 失败，终止全模板测试: {error}"))?;
+    seed_isolated_e2e_banner()?;
+
+    // Exercise the production dry-run assemblers against the same isolated
+    // TEST_CODE database before any delivery attempt. Missing optional local
+    // snapshots remain explicit skip decisions and never trigger external I/O.
+    run_daily_pushes_dry_run()
+        .await
+        .map_err(|error| format!("E2E dry-run 装配失败: {error}"))?;
 
     // 2. 跑 v12 §14.3 盘后复盘 (R-01~R-08) + v18 放量
 
     log::info!("[v70] 2/3 跑 R-01~R-08 + v18 放量");
 
-    if let Err(error) = run_review_only_inner().await {
-        log::error!("[v70] 复盘流程失败: {}", error);
-        return;
-    }
+    run_review_only_inner(true)
+        .await
+        .map_err(|error| format!("复盘流程失败: {error}"))?;
 
     // 3. 跑 v12 §14.1 盘前 + 14.2 盘中 + 14.3 v18 之外的模板
 
@@ -3982,43 +4081,56 @@ async fn e2e_all_templates_run() {
 
     push_e2e_14x_templates(&today_str, &hhmm).await;
 
-    // 4. 跑 v12 §14.1 + 14.2 新闻模块 (D-01 / I-02) — mock data 推
+    // 4. 跑 v12 §14.1 + 14.2 新闻模块 (D-01 / I-02) — isolated fixtures
 
-    //   news_monitor_loop 真实路径需有公告源 (沙箱无), 这里 e2e 直接走 dispatcher mock
+    //   news_monitor_loop 真实路径需有公告源；这里使用 TEST_CODE dispatcher fixture
 
     log::info!("[v70] 4/4 跑新闻模块 (D-01 / I-02 isolated test fixtures)");
 
     push_e2e_news_modules(&hhmm).await;
 
-    // 5. v14.1 task #163: T-16 ST 涨跌幅变更 e2e 真接 (seed 一只 ST 持仓, 调 dispatcher, 推完清理)
-
-    //   真实路径在 main_loop 9:30 触发 + 真实 ST 持仓. e2e mock 一只, 验证 get_st_positions +
-
-    //   dispatch_st_price_limit_changed 数据流通.
-
-    log::info!("[v70] 5/5 T-16 ST 涨跌幅变更 e2e (mock ST 持仓)");
-
-    push_e2e_t16_st_price_limit(&hhmm).await;
+    // T-16 requires a real-symbol realtime quote. BR-051 forbids inserting a
+    // real symbol into the isolated test account, so this external boundary is
+    // covered by its focused dispatcher tests instead of this process E2E.
+    log::info!("[v70][BR-051] T-16 skipped (external realtime quote not exercised)");
 
     // --test 全模板覆盖: 调全部 dispatch_*_daily (真推, 只推有真数据的, 用户要求测试所有模板)
     //   R-01~R-08 已由上方 run_review_only_inner 推过 → 这里 dedup 跳过; 盘中模板在此真推
     {
         use crate::push_templates as pt;
         let banner_e2e = pt::BannerCtx::default();
-        pt::dispatch_all_for_test(&hhmm, &today_str, &banner_e2e, pt::TestScope::All).await;
+        pt::dispatch_all_for_test(&hhmm, &today_str, &banner_e2e, pt::TestScope::IsolatedAll).await;
     }
 
     log::info!(
         "[v70] E2E 完成 — 检查 data/push_log/{}/ 查所有推送",
         today_str
     );
+    Ok(())
 }
 
 /// v70: test-only seed chain_daily + lhb_daily + trades via sqlite3 CLI
 
-fn seed_e2e_data_via_sqlite(date: &str) -> Result<(), String> {
+fn seed_e2e_data_via_sqlite(date: chrono::NaiveDate) -> Result<(), String> {
+    if stock_analysis::risk::env_guard::current_env()
+        != stock_analysis::risk::env_guard::TradingEnv::Test
+    {
+        return Err("BR-051 E2E seed requires test environment".to_string());
+    }
     let db_path = std::env::var("DATABASE_PATH")
         .map_err(|error| format!("隔离 DATABASE_PATH 未设置: {error}"))?;
+    if std::path::Path::new(&db_path).ends_with("data/stock_analysis.db") {
+        return Err("BR-051 E2E seed rejects the production database path".to_string());
+    }
+    stock_analysis::portfolio::snapshot_ledger(stock_analysis::portfolio::LedgerEntry {
+        date,
+        total_value: 100_000.0,
+        cash: 100_000.0,
+        market_value: 0.0,
+        daily_pnl: 0.0,
+    })
+    .map_err(|error| format!("TEST_CODE ledger seed failed: {error}"))?;
+    let date = date.format("%Y-%m-%d").to_string();
 
     // chain_daily 5 概念
 
@@ -4074,6 +4186,37 @@ fn seed_e2e_data_via_sqlite(date: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn seed_isolated_e2e_banner() -> Result<(), String> {
+    if stock_analysis::risk::env_guard::current_env()
+        != stock_analysis::risk::env_guard::TradingEnv::Test
+    {
+        return Err("BR-051 isolated banner requires test environment".to_string());
+    }
+    let review_date = stock_analysis::calendar::latest_completed_trading_day_at(
+        chrono::Local::now().naive_local(),
+    );
+    let latest = stock_analysis::portfolio::get_equity_curve_as_of(7, review_date)
+        .map_err(|error| format!("TEST_CODE ledger read failed: {error}"))?
+        .pop()
+        .ok_or_else(|| "TEST_CODE ledger missing after seed".to_string())?;
+    let total_pos = if latest.total_value > 0.0 {
+        ((latest.market_value / latest.total_value) * 10.0)
+            .round()
+            .clamp(0.0, 10.0) as u8
+    } else {
+        return Err("TEST_CODE ledger total_value must be positive".to_string());
+    };
+    let today_pnl = latest.daily_pnl / latest.total_value * 100.0;
+    store_banner(push_templates::BannerCtx {
+        account_mode: push_templates::AccountMode::Normal,
+        total_pos,
+        today_pnl,
+        data_mode: push_templates::DataMode::Full,
+        data_missing_note: None,
+    })
+    .map_err(|error| format!("TEST_CODE governance banner commit failed: {error}"))
+}
+
 fn execute_e2e_seed_sql(db_path: &str, label: &str, sql: &str) -> Result<(), String> {
     let output = std::process::Command::new("sqlite3")
         .args([db_path, sql])
@@ -4090,9 +4233,9 @@ fn execute_e2e_seed_sql(db_path: &str, label: &str, sql: &str) -> Result<(), Str
 
 /// v70: 推新闻模块 (D-01 / I-02) — isolated test fixture
 
-///   news_monitor_loop 真实路径需公告源 (沙箱无), 这里直接走 dispatcher mock
+///   news_monitor_loop 真实路径需公告源；这里直接走 TEST_CODE dispatcher fixture
 
-///   公告数据 mock: 3 主题 + 2 票 (覆盖 D-01 + I-02)
+///   公告测试数据: 3 主题 + 2 票 (覆盖 D-01 + I-02)
 
 async fn push_e2e_news_modules(hhmm: &str) {
     use push_templates as pt;
@@ -4137,7 +4280,7 @@ async fn push_e2e_news_modules(hhmm: &str) {
         None,
     );
 
-    // I-02 新闻催化映射 (mock)
+    // I-02 新闻催化映射 (isolated fixture)
 
     let i02 = pt::render_news_catalyst(
         &pt::BannerCtx::default(),
@@ -4189,88 +4332,6 @@ async fn push_e2e_news_modules(hhmm: &str) {
     }
 }
 
-/// v14.1 task #163: T-16 ST 涨跌幅变更 e2e 验证
-
-/// v14.1 review fix: RAII 清理 guard, panic/dispatch hang 时 Drop 兜底 DELETE
-
-///   之前 cleanup 在每个 return 路径手写, dispatcher panic 会泄露 seed row
-
-struct E2ECleanup<'a> {
-    db_path: &'a str,
-
-    code: &'a str,
-}
-
-impl Drop for E2ECleanup<'_> {
-    fn drop(&mut self) {
-        let _ = std::process::Command::new("sqlite3")
-            .args([
-                self.db_path,
-                &format!("DELETE FROM stock_position WHERE code='{}'", self.code),
-            ])
-            .output();
-
-        log::info!("[v14.1 #163] T-16 e2e seed 已清理 (RAII)");
-    }
-}
-
-///   步骤: 1) 在当前隔离测试库 seed 一只 `TEST_CODE*` st_type='*ST' 持仓
-
-///         2) 调 portfolio::get_st_positions() 验证非空
-
-///         3) 调 push_templates::dispatch_st_price_limit_changed() 推 1 条
-
-///         4) E2ECleanup Drop 兜底 DELETE (panic / 早退 / 正常完成都触发)
-
-async fn push_e2e_t16_st_price_limit(hhmm: &str) {
-    use std::process::Command;
-
-    let db_path = match std::env::var("DATABASE_PATH") {
-        Ok(path) => path,
-        Err(error) => {
-            log::error!("[BR-051] T-16 e2e 缺少隔离 DATABASE_PATH: {}", error);
-            return;
-        }
-    };
-
-    const E2E_CODE: &str = "TEST_CODE_ST_E2E";
-
-    // 1. Seed: insert 一只 *ST 持仓 (买价 5.00, 1000 股, st_type='*ST')
-
-    // BR-051: TEST_CODE 前缀 + 隔离 test DB，禁止任何生产标的/持仓污染。
-
-    let seed_sql = concat!(
-        "INSERT OR IGNORE INTO stock_position ",
-        "(code, name, buy_date, buy_price, quantity, status, st_type, chain_name, ",
-        "created_at, updated_at) VALUES ('TEST_CODE_ST_E2E', '*ST_E2E_TEST', '2099-01-01', ",
-        "5.00, 1000, 'open', '*ST', '其他', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
-    );
-
-    let seed_out = Command::new("sqlite3")
-        .args([db_path.as_str(), seed_sql])
-        .output();
-
-    if let Err(e) = &seed_out {
-        log::warn!("[v14.1 #163] seed 失败: {}", e);
-
-        return;
-    }
-
-    // v14.1 review fix: RAII guard, 函数任意 return / panic 都触发 DELETE
-
-    let _cleanup = E2ECleanup {
-        db_path: &db_path,
-        code: E2E_CODE,
-    };
-
-    match dispatch_st_price_limit_batch(hhmm).await {
-        Ok(count) => log::info!("[v14.1 #163] T-16 real-data batch pushed {count}"),
-        Err(error) => log::error!("[v14.1 #163] T-16 e2e rejected: {error}"),
-    }
-
-    // _cleanup 在函数 return 时 Drop, 兜底 DELETE
-}
-
 /// v70: 推所有盘中 14.x 模板 (isolated test fixtures)
 
 async fn push_e2e_14x_templates(date: &str, hhmm: &str) {
@@ -4310,7 +4371,7 @@ async fn push_e2e_14x_templates(date: &str, hhmm: &str) {
 
     let _ = notify::push_governor(&p01, notify::PushKind::PreopenNewsHot).await;
 
-    // P-02 竞价热点量能 (mock)
+    // P-02 竞价热点量能 (isolated fixture)
 
     let p02 = format!(
 
@@ -4324,7 +4385,7 @@ async fn push_e2e_14x_templates(date: &str, hhmm: &str) {
 
     let _ = notify::push_governor(&p02, notify::PushKind::AuctionVolume).await;
 
-    // R-03 涨停产业链 (chain_daily 5 概念, mock 数据)
+    // R-03 涨停产业链 (chain_daily 5 概念, TEST_CODE 数据)
 
     let r03 = pt::render_industry_chain(
         date,
@@ -4365,7 +4426,7 @@ async fn push_e2e_14x_templates(date: &str, hhmm: &str) {
 
     let _ = notify::push_governor(&r03, notify::PushKind::IndustryChain).await;
 
-    // R-04 龙虎榜 (lhb_daily 6 票, mock)
+    // R-04 龙虎榜 (lhb_daily 6 票, TEST_CODE 数据)
 
     let r04 = pt::render_review_lhb(
         date,
@@ -4394,7 +4455,7 @@ async fn push_e2e_14x_templates(date: &str, hhmm: &str) {
 
     let _ = notify::push_governor(&r04, notify::PushKind::ReviewLhb).await;
 
-    // R-05 信号复盘 (trades mock)
+    // R-05 信号复盘 (TEST_CODE trades)
 
     let r05 = pt::render_review_signal(
         date,
@@ -4426,7 +4487,7 @@ async fn push_e2e_14x_templates(date: &str, hhmm: &str) {
 
     let _ = notify::push_governor(&r05, notify::PushKind::ReviewSignal).await;
 
-    // A-10 题材催化复盘 (chain_daily mock)
+    // A-10 题材催化复盘 (TEST_CODE chain_daily)
 
     let a10 = pt::render_catalyst_review(pt::CatalystReviewParams {
         date,
@@ -4585,7 +4646,7 @@ async fn run_review_deep_analysis(
 
     let decisions = stock_analysis::decision::decision_decide::decisions_from_llm(
         &holdings, &by_code, &quote_map,
-    );
+    )?;
 
     let summary = stock_analysis::decision::decision_render::format_decision_board(&decisions);
 
@@ -5015,10 +5076,16 @@ async fn monitor_loop() {
         use stock_analysis::trading::paper_engine;
         let monitor = IntradayMonitor;
         loop {
-            match monitor.tick() {
-                Ok(n) if n > 0 => log::info!("[v16.3] intraday_monitor tick: 消费 {} 条", n),
-                Ok(_) => log::debug!("[v16.3] intraday_monitor tick: 0 候选"),
-                Err(e) => log::warn!("[v16.3] intraday_monitor tick 失败: {}", e),
+            let risk_context = current_banner_for("v16.3 paper decision")
+                .map(|banner| push_templates::paper_risk_context_from_banner(&banner));
+            if let Some(risk_context) = risk_context {
+                match monitor.tick(risk_context) {
+                    Ok(n) if n > 0 => {
+                        log::info!("[v16.3] intraday_monitor tick: 消费 {} 条", n)
+                    }
+                    Ok(_) => log::debug!("[v16.3] intraday_monitor tick: 0 候选"),
+                    Err(e) => log::warn!("[v16.3] intraday_monitor tick 失败: {}", e),
+                }
             }
             // 4 铁律卖出检查 (review fix Issue #2: 之前是 dead code "暂不启")
             // Fix MEDIUM 4: 5 分钟 debounce (analysis_result 1 日最多变 1-2 次, 30s tick 是浪费)
@@ -5035,30 +5102,20 @@ async fn monitor_loop() {
                 )
             };
             if should_run_4_iron {
-                match paper_engine::load_open_positions() {
-                    Ok(checks) if !checks.is_empty() => {
-                        match paper_engine::check_4_iron_rules(&checks) {
-                            Ok(decisions) => {
-                                for d in decisions {
-                                    if let Err(e) = paper_engine::emit_sell_signal(&d) {
-                                        log::warn!(
-                                            "[paper_engine] emit_sell_signal 失败 {}: {}",
-                                            d.code,
-                                            e
-                                        );
-                                    }
-                                }
-                            }
-                            Err(e) => log::warn!("[paper_engine] check_4_iron_rules 失败: {}", e),
-                        }
+                let result = risk_context
+                    .ok_or_else(|| "latest evaluated paper risk context unavailable".to_string())
+                    .and_then(paper_engine::run_once);
+                match result {
+                    Ok(count) => {
+                        log::debug!("[paper_engine] 4 铁律批次成功: {} 个退出决定", count);
+                        *PAPER_ENGINE_LAST_RUN
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
                     }
-                    Ok(_) => {} // 无未平仓虚拟持仓
-                    Err(e) => log::warn!("[paper_engine] load_open_positions 失败: {}", e),
+                    Err(e) => {
+                        log::warn!("[paper_engine][BR-134] 本轮失败，保留立即重试资格: {}", e)
+                    }
                 }
-                // Fix MEDIUM 4: 跑完记 last_run
-                *PAPER_ENGINE_LAST_RUN
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
             } else {
                 log::debug!("[paper_engine] 4 铁律 5 分钟 debounce 中, 跳过");
             }
@@ -5066,8 +5123,15 @@ async fn monitor_loop() {
             let now = chrono::Local::now();
             if now.hour() == 15 && now.minute() == 30 {
                 let today = now.date_naive();
-                if let Err(e) = evening_review(today) {
-                    log::warn!("[evening_review] 失败: {}", e);
+                match risk_context {
+                    Some(risk_context) => {
+                        if let Err(e) = evening_review(today, risk_context) {
+                            log::warn!("[evening_review] 失败: {}", e);
+                        }
+                    }
+                    None => log::error!(
+                        "[evening_review][BR-134] 缺少最新真实风险上下文，保留当日重试资格"
+                    ),
                 }
             }
             // Fix 4 (review): PerformanceEngine 15:05 cron 接入 (写 paper_performance_snapshot)

@@ -2842,7 +2842,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial(notify_env)]
+    #[serial_test::serial(http_proxy_env)]
     async fn send_type_transport_and_target_resolution_are_explicit() {
         let _env = crate::TestEnvGuard::capture(&[
             "MAGICLAW_SEND_TYPE",
@@ -3037,5 +3037,204 @@ mod tests {
         assert_eq!(resolve_wechat_data_dir(), dir.join("wechat"));
         assert_eq!(tail_lines("one\ntwo\nthree", 2), "two | three");
         std::fs::remove_dir_all(dir).expect("remove isolated log directory");
+    }
+
+    async fn one_request_http_fixture(
+        status: u16,
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback HTTP fixture");
+        let addr = listener.local_addr().expect("fixture local addr");
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept fixture request");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let n = stream.read(&mut chunk).await.expect("read fixture request");
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..n]);
+                let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let header_end = header_end + 4;
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_len = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if request.len() >= header_end + content_len {
+                    break;
+                }
+            }
+            let reason = match status {
+                200 => "OK",
+                401 => "Unauthorized",
+                412 => "Precondition Failed",
+                500 => "Internal Server Error",
+                _ => "Fixture",
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write fixture response");
+            String::from_utf8_lossy(&request).into_owned()
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(notify_env)]
+    async fn feishu_webhook_executes_success_http_error_and_protocol_error() {
+        let _env = crate::TestEnvGuard::capture(&[
+            "FEISHU_WEBHOOK_URL",
+            "MAGICLAW_FEISHU_WEBHOOK_URL",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+        ]);
+        std::env::remove_var("MAGICLAW_FEISHU_WEBHOOK_URL");
+        for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            std::env::remove_var(key);
+        }
+        std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
+        std::env::set_var("no_proxy", "127.0.0.1,localhost");
+
+        let (url, request) = one_request_http_fixture(200, r#"{"code":0}"#).await;
+        std::env::set_var("FEISHU_WEBHOOK_URL", &url);
+        assert!(push_feishu_via_http("TEST_CODE webhook success").await);
+        let request = request.await.unwrap();
+        assert!(request.starts_with("POST / HTTP/1.1"));
+        assert!(request.contains("TEST_CODE webhook success"));
+
+        let (url, request) = one_request_http_fixture(500, r#"{"error":"down"}"#).await;
+        std::env::set_var("FEISHU_WEBHOOK_URL", &url);
+        assert!(!push_feishu_via_http("TEST_CODE webhook status").await);
+        request.await.unwrap();
+
+        let (url, request) = one_request_http_fixture(200, r#"{"code":1}"#).await;
+        std::env::set_var("FEISHU_WEBHOOK_URL", &url);
+        assert!(!push_feishu_via_http("TEST_CODE webhook protocol").await);
+        request.await.unwrap();
+
+        std::env::remove_var("FEISHU_WEBHOOK_URL");
+        assert!(!push_feishu_via_http("TEST_CODE missing webhook").await);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(notify_env)]
+    async fn daemon_protocol_executes_health_target_send_and_auth_outcomes() {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+        let (base, request) = one_request_http_fixture(200, r#"{"ok":true}"#).await;
+        assert!(daemon_health_ok(&client, &base).await);
+        assert!(request.await.unwrap().starts_with("GET /api/health"));
+
+        let (base, request) = one_request_http_fixture(200, r#"{"ok":true}"#).await;
+        assert!(matches!(
+            ensure_magiclaw_daemon(&client, "/TEST_CODE/not-used", "127.0.0.1:1", &base)
+                .await
+                .unwrap(),
+            DaemonReadySource::Reused
+        ));
+        request.await.unwrap();
+
+        let (base, request) =
+            one_request_http_fixture(200, r#"{"peers":[{"peer_id":"TEST_CODE_window_peer"}]}"#)
+                .await;
+        std::env::remove_var("WECHAT_TO");
+        assert_eq!(
+            resolve_wechat_target(&client, &base, "TEST_CODE_token")
+                .await
+                .unwrap(),
+            "TEST_CODE_window_peer"
+        );
+        assert!(request
+            .await
+            .unwrap()
+            .contains("authorization: Bearer TEST_CODE_token"));
+
+        for (status, body, expected) in [
+            (200, r#"{"ok":true}"#, None),
+            (200, r#"{"ok":false}"#, Some("非成功体")),
+            (401, r#"{"error":"bad token"}"#, Some("鉴权失败")),
+            (
+                412,
+                r#"{"error":"no valid context_token for peer"}"#,
+                Some("context_token 无效"),
+            ),
+            (500, r#"{"error":"down"}"#, Some("HTTP 500")),
+        ] {
+            let (base, request) = one_request_http_fixture(status, body).await;
+            let result = send_via_magiclaw_daemon(
+                &client,
+                &base,
+                "TEST_CODE_token",
+                MessageSendType::Wechat,
+                Some(" TEST_CODE_peer "),
+                "TEST_CODE message",
+            )
+            .await;
+            match expected {
+                None => assert!(result.is_ok(), "{result:?}"),
+                Some(fragment) => assert!(result.unwrap_err().contains(fragment)),
+            }
+            let request = request.await.unwrap();
+            assert!(request.starts_with("POST /api/send"));
+            assert!(request.contains("TEST_CODE_peer"));
+        }
+
+        let (base, request) = one_request_http_fixture(200, r#"{"ok":true}"#).await;
+        assert!(
+            verify_daemon_auth(&client, &base, "TEST_CODE_token", &ApiTokenSource::Env)
+                .await
+                .is_ok()
+        );
+        request.await.unwrap();
+
+        let (base, request) = one_request_http_fixture(401, r#"{"error":"unauthorized"}"#).await;
+        let error = verify_daemon_auth(
+            &client,
+            &base,
+            "TEST_CODE_token",
+            &ApiTokenSource::DynamicIssued,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("动态 token"));
+        request.await.unwrap();
+
+        let (base, request) = one_request_http_fixture(500, r#"{"error":"down"}"#).await;
+        let error = verify_daemon_auth(&client, &base, "TEST_CODE_token", &ApiTokenSource::Env)
+            .await
+            .unwrap_err();
+        assert!(error.contains("HTTP 500"));
+        request.await.unwrap();
     }
 }

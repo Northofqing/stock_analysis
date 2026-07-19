@@ -3,7 +3,7 @@
 //!
 //! Parses `--replay`, `--history`, and related flags from the monitor's
 //! argument list without disturbing the existing `--test`, `--review`,
-//! `--push`, `--e2e` flags.
+//! `--push`, `--e2e`, `--v13-diag` flags.
 
 use chrono::NaiveDate;
 use thiserror::Error;
@@ -94,7 +94,7 @@ pub fn parse_args(args: &[&str]) -> Result<Option<EventCommand>, CliError> {
             "--help" | "-h" => {
                 help_requested = true;
             }
-            "--test" | "--review" | "--push" | "--e2e" => {
+            "--test" | "--review" | "--push" | "--e2e" | "--v13-diag" => {
                 // Known monitor flags may be combined with terminal event commands.
                 // Ignore them here; if no event command is present we still return None.
             }
@@ -367,6 +367,9 @@ mod tests {
 
         let cmd = parse_args(&["monitor", "--e2e"]).unwrap();
         assert!(cmd.is_none());
+
+        let cmd = parse_args(&["monitor", "--test", "--v13-diag"]).unwrap();
+        assert!(cmd.is_none());
     }
 
     #[test]
@@ -414,3 +417,7 @@ mod tests {
         assert!(err.to_string().contains("unrecognized"));
     }
 }
+
+#[cfg(test)]
+#[path = "../gate_d_event_cli_regression.rs"]
+mod gate_d_regression;

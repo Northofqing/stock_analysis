@@ -335,6 +335,49 @@ impl SearchProvider for SseSzseProvider {
 mod tests {
     use super::*;
 
+    async fn http_proxy_once(body: &'static str) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let n = stream.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..n]);
+                let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let header_end = end + 4;
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let body_len = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if request.len() >= header_end + body_len {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&request).into_owned()
+        });
+        (format!("http://{addr}"), handle)
+    }
+
     #[test]
     fn test_classify_market_sse() {
         assert_eq!(
@@ -396,5 +439,76 @@ mod tests {
         assert_eq!(r.source, "上交所(600519)");
         assert_eq!(r.published_date, Some("2024-06-25".to_string()));
         assert_eq!(r.snippet, "关于召开股东大会的公告");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(http_proxy_env)]
+    async fn official_exchange_http_transports_parse_sse_and_szse_batches() {
+        let keys = [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+        ];
+        let previous: Vec<_> = keys
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect();
+        for key in keys {
+            std::env::remove_var(key);
+        }
+
+        let sse_body = r#"jsonpCallback({"pageHelp":{"data":[[
+            {"TITLE":"测试上交所公告","SSEDATE":"2026-07-18","URL":"/TEST_CODE.pdf"},
+            {"TITLE":"","SSEDATE":"2026-07-18","URL":""}
+        ]]}})"#;
+        let (proxy, request) = http_proxy_once(sse_body).await;
+        std::env::set_var("HTTP_PROXY", &proxy);
+        std::env::set_var("http_proxy", &proxy);
+        let provider = SseSzseProvider::new();
+        let response = provider.search("测试 600000 公告", 5).await;
+        assert!(response.success, "{:?}", response.error_message);
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].title, "测试上交所公告");
+        assert!(response.results[0].url.ends_with("/TEST_CODE.pdf"));
+        assert!(request.await.unwrap().contains("query.sse.com.cn"));
+
+        let szse_body = r#"{"data":[
+            {"title":"测试深交所公告","publishTime":"2026-07-18 18:00:00","attachPath":"/TEST_CODE.pdf"},
+            {"title":" ","publishTime":"","attachPath":""}
+        ]}"#;
+        let (proxy, request) = http_proxy_once(szse_body).await;
+        std::env::set_var("HTTP_PROXY", &proxy);
+        std::env::set_var("http_proxy", &proxy);
+        let provider = SseSzseProvider::new();
+        let response = provider.search("测试 000001 公告", 5).await;
+        assert!(response.success, "{:?}", response.error_message);
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(
+            response.results[0].published_date.as_deref(),
+            Some("2026-07-18")
+        );
+        assert!(response.results[0].url.ends_with("/TEST_CODE.pdf"));
+        let request = request.await.unwrap();
+        assert!(request.contains("POST http://www.szse.cn/api/disc/announcement/annList"));
+        assert!(request.contains("000001"));
+
+        let missing = provider.search("没有证券代码", 5).await;
+        assert!(!missing.success);
+        assert!(missing.error_message.unwrap().contains("6 位股票代码"));
+        let invalid = provider.search("测试 700000 公告", 5).await;
+        assert!(!invalid.success);
+        assert!(invalid.error_message.unwrap().contains("无法识别"));
+
+        for (key, value) in previous {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
     }
 }

@@ -227,6 +227,17 @@ async fn load_industry_map_from_hosts(
 
 async fn get_industry_map(client: &reqwest::Client) -> Result<HashMap<String, String>> {
     let slot = INDUSTRY_MAP.get_or_init(|| Mutex::new(None));
+    get_or_load_industry_map(slot, || load_industry_map(client)).await
+}
+
+async fn get_or_load_industry_map<F, Fut>(
+    slot: &Mutex<Option<HashMap<String, String>>>,
+    loader: F,
+) -> Result<HashMap<String, String>>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<HashMap<String, String>>>,
+{
     {
         if let Ok(g) = slot.lock() {
             if let Some(m) = g.as_ref() {
@@ -234,7 +245,7 @@ async fn get_industry_map(client: &reqwest::Client) -> Result<HashMap<String, St
             }
         }
     }
-    let m = load_industry_map(client).await?;
+    let m = loader().await?;
     if let Ok(mut g) = slot.lock() {
         *g = Some(m.clone());
     }
@@ -684,5 +695,29 @@ mod tests {
         assert!(requests[0].starts_with("/api/qt/stock/get?"));
         assert!(requests[1].contains("fs=m:90+t:2") || requests[1].contains("fs=m%3A90%2Bt%3A2"));
         assert!(requests[2].contains("fs=b:BK0001") || requests[2].contains("fs=b%3ABK0001"));
+    }
+
+    #[tokio::test]
+    async fn industry_cache_commits_only_successful_complete_loader_results() {
+        let slot = Mutex::new(None);
+        let expected = HashMap::from([("TEST_CODE_测试行业".into(), "BK_TEST_1".into())]);
+        let first = get_or_load_industry_map(&slot, || async { Ok(expected.clone()) })
+            .await
+            .expect("complete map must commit");
+        assert_eq!(first, expected);
+        let cached = get_or_load_industry_map(&slot, || async {
+            Err(anyhow!("TEST_CODE cached loader must not run"))
+        })
+        .await
+        .expect("cache hit must bypass loader");
+        assert_eq!(cached, expected);
+
+        let failed_slot = Mutex::new(None);
+        assert!(get_or_load_industry_map(&failed_slot, || async {
+            Err(anyhow!("TEST_CODE explicit source failure"))
+        })
+        .await
+        .is_err());
+        assert!(failed_slot.lock().expect("cache lock").is_none());
     }
 }

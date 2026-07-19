@@ -128,7 +128,9 @@ fn render_chain_mainline_note(
 
 #[cfg(test)]
 mod tests {
-    use super::{compose_extra_context, find_chain_mainline, render_chain_mainline_note};
+    use super::{
+        chain_mainline_note, compose_extra_context, find_chain_mainline, render_chain_mainline_note,
+    };
     use crate::data_provider::money_flow::{IntradayShape, MoneyFlowDay, MoneyFlowSummary};
     use crate::database::concepts::ChainDailyRow;
     use crate::lhb_analyzer::LhbAnalysis;
@@ -265,5 +267,53 @@ mod tests {
         assert!(note.contains("TEST_CODE_匹配主线"));
         assert!(note.contains("簇内 2 只涨停"));
         assert!(note.contains("上榜 3 天"));
+    }
+
+    struct ChainNoteGuard {
+        date: String,
+    }
+
+    impl Drop for ChainNoteGuard {
+        fn drop(&mut self) {
+            use diesel::prelude::*;
+            if let Some(db) = crate::database::DatabaseManager::try_get() {
+                if let Ok(mut connection) = db.get_conn() {
+                    let _ = diesel::sql_query("DELETE FROM chain_daily WHERE date = ?")
+                        .bind::<diesel::sql_types::Text, _>(&self.date)
+                        .execute(&mut connection);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn chain_mainline_note_reads_complete_latest_cluster_from_real_sqlite() {
+        crate::database::DatabaseManager::init(None).expect("test database initialization");
+        let date = "2299-07-18".to_string();
+        let _guard = ChainNoteGuard { date: date.clone() };
+        crate::database::DatabaseManager::get()
+            .save_chain_clusters(
+                &date,
+                &[(
+                    "TEST_CODE_本地主线".to_string(),
+                    vec![
+                        "TEST_CODE_000001".to_string(),
+                        "TEST_CODE_000002".to_string(),
+                    ],
+                    1,
+                )],
+            )
+            .expect("persist complete chain evidence");
+
+        let note = chain_mainline_note("TEST_CODE_000001")
+            .expect("strict chain query")
+            .expect("matching mainline");
+        assert!(note.contains("TEST_CODE_本地主线"));
+        assert!(note.contains("簇内 2 只涨停"));
+        assert_eq!(
+            chain_mainline_note("TEST_CODE_999999").expect("strict non-match"),
+            None
+        );
     }
 }

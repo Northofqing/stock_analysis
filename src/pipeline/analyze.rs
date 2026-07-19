@@ -680,8 +680,12 @@ impl AnalysisPipeline {
         #[cfg(test)]
         let ((stock_name, news_context), extra, mtf_section_opt) =
             if let Some(context) = self.test_resolved_context.as_ref() {
+                let name_news = match context.name_news.as_ref() {
+                    Some(resolved) => resolved.clone(),
+                    None => name_news_fut.await,
+                };
                 (
-                    (context.stock_name.clone(), context.news_context.clone()),
+                    name_news,
                     context.extra.clone(),
                     context.mtf_section.clone(),
                 )
@@ -839,14 +843,11 @@ impl AnalysisPipeline {
                     analysis_content.push_str("\n# AI分析\n\n");
                     analysis_content
                         .push_str(&self::section_utils::normalize_ai_sections(&ai_result));
-                    if let Some(ref news) = news_context {
-                        analysis_content.push_str("\n\n# 相关新闻\n\n");
-                        analysis_content.push_str(news);
-                    }
                 }
                 Err(e) => warn!("[{}] AI分析失败: {}", code, e),
             }
-        } else if let Some(ref news) = news_context {
+        }
+        if let Some(ref news) = news_context {
             analysis_content.push_str("\n# 相关新闻\n\n");
             analysis_content.push_str(news);
         }
@@ -1189,6 +1190,7 @@ mod tests {
     use crate::strategy::{BollMacdAction, BollMacdSignal};
     use crate::trend_analyzer::{BuySignal, StockTrendAnalyzer, TrendAnalysisResult};
     use chrono::NaiveDate;
+    use diesel::prelude::*;
     use std::sync::Arc;
 
     use super::AnalysisPipeline;
@@ -1678,8 +1680,10 @@ mod tests {
         mtf_section: Result<Option<String>, String>,
     ) -> super::super::TestResolvedAnalysisContext {
         super::super::TestResolvedAnalysisContext {
-            stock_name: "TEST_CODE_示例公司".to_string(),
-            news_context: Some("TEST_CODE_真实新闻证据".to_string()),
+            name_news: Some((
+                "TEST_CODE_示例公司".to_string(),
+                Some("TEST_CODE_真实新闻证据".to_string()),
+            )),
             extra,
             mtf_section,
         }
@@ -1708,6 +1712,7 @@ mod tests {
             test_resolved_context: Some(context),
             test_fetched_data: None,
             test_backtest_output_dir: None,
+            test_summary_context: None,
         }
     }
 
@@ -1753,7 +1758,15 @@ mod tests {
             }),
             Ok(Some("TEST_CODE_多周期证据".to_string())),
         );
-        let pipeline = test_pipeline(context, true);
+        let mut pipeline = test_pipeline(context, true);
+        pipeline.ai_analyzer = Some(crate::analyzer::GeminiAnalyzer::new(
+            crate::analyzer::GeminiConfig {
+                max_retries: 1,
+                retry_delay: 0.0,
+                request_delay: 0.0,
+                ..Default::default()
+            },
+        ));
         let mut values = analysis_bars();
         values[0].financials_history = Some(vec![
             FinancialPeriod {
@@ -1868,8 +1881,12 @@ mod tests {
             }),
             Ok(None),
         );
-        context.news_context = None;
-        let pipeline = test_pipeline(context, false);
+        context.name_news = None;
+        let mut pipeline = test_pipeline(context, false);
+        pipeline.data_manager = Arc::new(DataFetcherManager::with_cached_name(
+            "TEST_CODE_000001",
+            "TEST_CODE_缓存公司",
+        ));
         let bars = Arc::new(analysis_bars());
         let result = pipeline
             .analyze_stock("TEST_CODE_000001", bars.as_slice(), bars.clone(), None)
@@ -1883,6 +1900,7 @@ mod tests {
         assert_eq!(result.valuation_history_section, None);
         assert_eq!(result.consensus_section, None);
         assert_eq!(result.fin_history_section, None);
+        assert_eq!(result.name, "TEST_CODE_缓存公司");
         let seed = result.deep_seed.expect("deep-analysis seed");
         assert_eq!(seed.news_context, None);
         assert_eq!(seed.macro_context, None);
@@ -1942,6 +1960,93 @@ mod tests {
             .is_none());
     }
 
+    struct FullPipelineGuard {
+        code: String,
+        output_dir: std::path::PathBuf,
+    }
+
+    impl Drop for FullPipelineGuard {
+        fn drop(&mut self) {
+            if let Some(db) = crate::database::DatabaseManager::try_get() {
+                if let Ok(mut connection) = db.get_conn() {
+                    let _ = diesel::sql_query("DELETE FROM analysis_result WHERE code = ?")
+                        .bind::<diesel::sql_types::Text, _>(&self.code)
+                        .execute(&mut connection);
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.output_dir);
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn full_pipeline_run_commits_local_backtests_without_external_side_effects() {
+        crate::database::DatabaseManager::init(None).expect("test database initialization");
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let code = format!("TEST_CODE_PIPELINE_RUN_{suffix}");
+        let output_dir = std::env::temp_dir().join(format!(
+            "stock-analysis-full-pipeline-{}-{suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&output_dir).expect("isolated report directory");
+        let _guard = FullPipelineGuard {
+            code: code.clone(),
+            output_dir: output_dir.clone(),
+        };
+
+        let context = resolved_context(
+            Ok(super::extra_context::ExtraContext {
+                section: Some("TEST_CODE_本地资金证据".to_string()),
+                money_flow: None,
+            }),
+            Ok(Some("TEST_CODE_本地多周期证据".to_string())),
+        );
+        let mut pipeline = test_pipeline(context, false);
+        pipeline.config.max_workers = 1;
+        pipeline.config.dry_run = false;
+        pipeline.config.send_notification = false;
+        pipeline.config.single_notify = false;
+        pipeline.ai_analyzer = None;
+        pipeline.use_news_search = false;
+        pipeline.test_fetched_data = Some(Ok(analysis_bars()));
+        pipeline.test_backtest_output_dir = Some(output_dir.clone());
+        pipeline.test_summary_context = Some(super::super::TestResolvedSummaryContext {
+            chain_section: Some("TEST_CODE_本地主线报告".to_string()),
+            regime_section: Some("TEST_CODE_本地大盘状态".to_string()),
+            output_dir: output_dir.clone(),
+        });
+        pipeline.config.send_notification = true;
+
+        let results = pipeline
+            .run(
+                std::slice::from_ref(&code),
+                Some("TEST_CODE_本地宏观证据".to_string()),
+            )
+            .await
+            .expect("resolved full pipeline run");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].code, code);
+        assert_eq!(
+            results[0]
+                .deep_seed
+                .as_ref()
+                .and_then(|seed| seed.macro_context.as_deref()),
+            Some("TEST_CODE_本地宏观证据")
+        );
+
+        let artifacts = std::fs::read_dir(&output_dir)
+            .expect("isolated reports")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("report entries");
+        assert!(
+            artifacts.len() >= 4,
+            "Bollinger/RSI reports and mandatory audits must commit: {artifacts:?}"
+        );
+    }
+
     #[tokio::test]
     async fn resolved_context_keeps_veto_dry_run_non_mutating() {
         let mut context = resolved_context(
@@ -1951,7 +2056,7 @@ mod tests {
             }),
             Ok(None),
         );
-        context.news_context = None;
+        context.name_news = Some(("TEST_CODE_示例公司".to_string(), None));
         let pipeline = test_pipeline(context, false);
         let mut values = analysis_bars();
         for (index, bar) in values.iter_mut().enumerate() {

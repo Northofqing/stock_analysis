@@ -473,3 +473,243 @@ fn canonicalize_json_value(v: &Value) -> String {
         Value::Null => "null".to_string(),
     }
 }
+
+#[cfg(test)]
+mod gate_d_tests {
+    use super::*;
+    use crate::agent::tool::Tool;
+    use async_trait::async_trait;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn local_client() -> Client<OpenAIConfig> {
+        Client::with_config(
+            OpenAIConfig::new()
+                .with_api_key("TEST_CODE_local_only")
+                .with_api_base("http://127.0.0.1:9/v1"),
+        )
+        .with_http_client(reqwest_011::Client::builder().no_proxy().build().unwrap())
+    }
+
+    fn client_for(base: &str) -> Client<OpenAIConfig> {
+        Client::with_config(
+            OpenAIConfig::new()
+                .with_api_key("TEST_CODE_local_only")
+                .with_api_base(format!("{base}/v1")),
+        )
+        .with_http_client(reqwest_011::Client::builder().no_proxy().build().unwrap())
+    }
+
+    fn response(content: Option<&str>, tool_call: bool) -> String {
+        let mut message = serde_json::json!({
+            "role": "assistant",
+            "content": content,
+        });
+        if tool_call {
+            message["tool_calls"] = serde_json::json!([{
+                "id": "TEST_CODE_call_1",
+                "type": "function",
+                "function": {
+                    "name": "TEST_CODE_fixture_tool",
+                    "arguments": "{\"value\":1}"
+                }
+            }]);
+        }
+        serde_json::json!({
+            "id": "TEST_CODE_chat_completion",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "TEST_CODE_model",
+            "choices": [{
+                "index": 0,
+                "message": message,
+                "finish_reason": if tool_call { "tool_calls" } else { "stop" }
+            }],
+            "usage": {
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "total_tokens": 2
+            }
+        })
+        .to_string()
+    }
+
+    fn spawn_chat_fixture(responses: Vec<String>) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local chat fixture");
+        let address = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            for body in responses {
+                let (mut stream, _) = listener.accept().expect("accept chat request");
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0_u8; 4096];
+                loop {
+                    let read = stream.read(&mut buf).expect("read chat request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..read]);
+                    if let Some(header_end) = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|position| position + 4)
+                    {
+                        let headers = String::from_utf8_lossy(&request[..header_end]);
+                        let content_length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.strip_prefix("content-length: ")
+                                    .or_else(|| line.strip_prefix("Content-Length: "))
+                            })
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if request.len() >= header_end + content_length {
+                            break;
+                        }
+                    }
+                }
+                assert!(String::from_utf8_lossy(&request).starts_with("POST /v1/chat/completions"));
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(reply.as_bytes()).expect("reply to chat");
+                stream.flush().expect("flush chat response");
+                stream
+                    .shutdown(std::net::Shutdown::Write)
+                    .expect("close chat response body");
+            }
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    struct FixtureTool;
+
+    #[async_trait]
+    impl Tool for FixtureTool {
+        fn name(&self) -> &str {
+            "TEST_CODE_fixture_tool"
+        }
+
+        fn description(&self) -> &str {
+            "TEST_CODE local deterministic tool"
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({"type":"object"})
+        }
+
+        async fn call(&self, input: Value) -> anyhow::Result<String> {
+            Ok(serde_json::json!({"observed": input["value"]}).to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_iteration_boundary_never_calls_the_model() {
+        let mut runner = AgentRunner::new(
+            local_client(),
+            Toolbelt::new(),
+            ValidationEngine::new_with_defaults(),
+            "TEST_CODE system".to_string(),
+            "TEST_CODE model".to_string(),
+        )
+        .with_fallbacks(vec![(local_client(), "TEST_CODE fallback".to_string())]);
+
+        assert!(runner.session_id.parse::<i64>().is_ok());
+        assert!(runner.get_context().facts.is_empty());
+        let err = runner
+            .run("TEST_CODE query", 0)
+            .await
+            .expect_err("zero iterations must fail explicitly");
+        assert!(err.to_string().contains("max iterations"));
+    }
+
+    #[test]
+    fn canonical_json_is_recursive_stable_and_escaped() {
+        let left = serde_json::json!({
+            "z": [true, null, {"quote": "a\\\"b"}],
+            "a": 1
+        });
+        let right = serde_json::json!({
+            "a": 1,
+            "z": [true, null, {"quote": "a\\\"b"}]
+        });
+        let canonical = canonicalize_json_value(&left);
+        assert_eq!(canonical, canonicalize_json_value(&right));
+        assert_eq!(canonical, r#"{"a":1,"z":[true,null,{"quote":"a\\\"b"}]}"#);
+    }
+
+    #[tokio::test]
+    async fn local_protocol_covers_tool_fallback_critic_and_loop_detection() {
+        crate::database::DatabaseManager::init(None).expect("agent audit database");
+
+        let (approval_base, approval_fixture) = spawn_chat_fixture(vec![
+            response(Some("TEST_CODE approved draft"), false),
+            response(Some(r#"{"score":90,"feedback":"TEST_CODE ok"}"#), false),
+        ]);
+        let mut approved = AgentRunner::new(
+            client_for(&approval_base),
+            Toolbelt::new(),
+            ValidationEngine::new_with_defaults(),
+            "TEST_CODE system".to_string(),
+            "TEST_CODE model".to_string(),
+        );
+        assert_eq!(
+            approved.run("TEST_CODE query", 1).await.unwrap(),
+            "TEST_CODE approved draft"
+        );
+        approval_fixture.join().unwrap();
+
+        let (tool_base, tool_fixture) = spawn_chat_fixture(vec![
+            response(None, true),
+            response(Some("TEST_CODE tool-backed draft"), false),
+            response(Some(r#"{"score":92,"feedback":"TEST_CODE ok"}"#), false),
+        ]);
+        let mut belt = Toolbelt::new();
+        belt.register(FixtureTool);
+        let mut tool_runner = AgentRunner::new(
+            local_client(),
+            belt,
+            ValidationEngine::new_with_defaults(),
+            "TEST_CODE system".to_string(),
+            "TEST_CODE model".to_string(),
+        )
+        .with_fallbacks(vec![(
+            client_for(&tool_base),
+            "TEST_CODE fallback".to_string(),
+        )]);
+        assert_eq!(
+            tool_runner.run("TEST_CODE tool query", 2).await.unwrap(),
+            "TEST_CODE tool-backed draft"
+        );
+        assert_eq!(
+            tool_runner.get_context().get_fact("TEST_CODE_fixture_tool"),
+            Some(&serde_json::json!({"observed": 1}))
+        );
+        tool_fixture.join().unwrap();
+
+        let (loop_base, loop_fixture) = spawn_chat_fixture(vec![
+            response(None, true),
+            response(None, true),
+            response(None, true),
+        ]);
+        let mut loop_belt = Toolbelt::new();
+        loop_belt.register(FixtureTool);
+        let mut loop_runner = AgentRunner::new(
+            client_for(&loop_base),
+            loop_belt,
+            ValidationEngine::new_with_defaults(),
+            "TEST_CODE system".to_string(),
+            "TEST_CODE model".to_string(),
+        );
+        assert!(loop_runner.run("TEST_CODE loop", 3).await.is_err());
+        assert!(loop_runner
+            .get_context()
+            .get_fact("TEST_CODE_fixture_tool")
+            .is_none());
+        loop_fixture.join().unwrap();
+    }
+}

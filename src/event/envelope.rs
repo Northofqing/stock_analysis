@@ -295,3 +295,7 @@ mod tests {
         assert_eq!(decoded.replay_of, None);
     }
 }
+
+#[cfg(test)]
+#[path = "../gate_d_event_envelope_regression.rs"]
+mod gate_d_regression;

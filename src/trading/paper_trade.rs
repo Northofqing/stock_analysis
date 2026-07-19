@@ -20,7 +20,27 @@
 use diesel::prelude::*;
 
 use crate::database::DatabaseManager;
+use crate::monitor::data_mode::DataMode;
+use crate::risk::action_gate::AccountMode;
 use crate::trading::risk_adapter::MAX_SLIPPAGE_PCT;
+
+/// BR-134: one typed snapshot of the risk facts that authorize a paper action.
+/// There is deliberately no `Default`: production callers must supply the
+/// latest fully evaluated account and data modes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PaperRiskContext {
+    pub account_mode: AccountMode,
+    pub data_mode: DataMode,
+}
+
+impl PaperRiskContext {
+    pub const fn new(account_mode: AccountMode, data_mode: DataMode) -> Self {
+        Self {
+            account_mode,
+            data_mode,
+        }
+    }
+}
 
 #[derive(Clone, diesel::QueryableByName)]
 struct LedgerState {
@@ -164,8 +184,7 @@ pub struct PaperSignal {
     pub limit_down_price: Option<f64>,
     pub secondary_confirmed: bool,
     pub quote_observed_at: chrono::DateTime<chrono::Utc>,
-    pub account_mode: String,
-    pub data_mode: String,
+    pub risk_context: PaperRiskContext,
 }
 
 /// 输出: 模拟结果
@@ -430,8 +449,8 @@ pub fn simulate(
         fill_price,
         not_fill_reason,
         esc(&signal.virtual_reason),
-        esc(&signal.account_mode),
-        esc(&signal.data_mode),
+        signal.risk_context.account_mode.label(),
+        signal.risk_context.data_mode.label(),
     );
     let observed_at = signal.quote_observed_at.to_rfc3339();
     let rows = persist_paper_trade_with_audit(&mut conn, &sql, signal, &result, &observed_at)
@@ -463,8 +482,7 @@ mod tests {
             limit_down_price: Some(45.0),
             secondary_confirmed: false,
             quote_observed_at: chrono::Utc::now(),
-            account_mode: "Normal".to_string(),
-            data_mode: "Full".to_string(),
+            risk_context: PaperRiskContext::new(AccountMode::Normal, DataMode::Full),
         }
     }
 

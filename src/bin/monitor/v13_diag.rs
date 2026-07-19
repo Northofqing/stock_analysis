@@ -12,9 +12,9 @@ use std::time::Instant;
 use serde::Serialize;
 
 use super::push_templates::{
-    load_auction_volume_snapshot_real, load_catalyst_review_snapshot_real,
-    load_industry_chain_snapshot_real, load_news_catalyst_snapshot_real,
-    load_news_to_idea_snapshot_real, load_paper_review_snapshot_real, load_sector_snapshot_real,
+    load_catalyst_review_snapshot_real, load_industry_chain_snapshot_real,
+    load_news_catalyst_snapshot_real, load_news_to_idea_snapshot_real,
+    load_paper_review_snapshot_real,
 };
 
 /// 端到端诊断步骤
@@ -43,20 +43,10 @@ pub async fn run_v13_diag() -> V13DiagReport {
     let mut steps = Vec::new();
     let started = Instant::now();
 
-    // I-01 盘中轮动 (依赖 sector_monitor)
+    // I-01 盘中轮动依赖实时板块源。v13 diag 只从 --test 入口可达，
+    // 因此 BR-051 要求显式记录边界，不允许隔离诊断访问外部行情。
     steps.push(check_step("I-01", "load_sector", || {
-        let snap = match load_sector_snapshot_real("10:30") {
-            Ok(snapshot) => snapshot,
-            Err(error) => return format!("error: {error}"),
-        };
-        if snap.tech_sub.is_empty() && snap.power_sub.is_empty() && snap.robot_sub.is_empty() {
-            "empty".into()
-        } else {
-            format!(
-                "ok: tech={}, power={}, robot={}",
-                snap.tech_sub, snap.power_sub, snap.robot_sub
-            )
-        }
+        "unavailable: BR-051 isolated diagnostics skip external sector source".into()
     }));
 
     // I-02 新闻催化 (依赖 chain_daily)
@@ -120,18 +110,9 @@ pub async fn run_v13_diag() -> V13DiagReport {
     ));
 
     // v37: P-02 竞价热点量能 (依赖 limit_up_stocks)
-    steps.push(check_step(
-        "P-02",
-        "load_auction_volume",
-        || match load_auction_volume_snapshot_real("09:25") {
-            Ok(snap) => format!(
-                "ok: items={}, sentiment={}",
-                snap.items.len(),
-                snap.sentiment
-            ),
-            Err(error) => format!("unavailable: {error}"),
-        },
-    ));
+    steps.push(check_step("P-02", "load_auction_volume", || {
+        "unavailable: BR-051 isolated diagnostics skip external auction source".into()
+    }));
 
     // v35: A-10 盘后催化复盘 (依赖 chain_daily cluster)
     steps.push(check_step("A-10", "load_catalyst_review", || {

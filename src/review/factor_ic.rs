@@ -587,4 +587,51 @@ mod tests {
             .contains("显著反向"));
         assert!(FactorVerdict::Neutral.label().contains("无效"));
     }
+
+    #[test]
+    fn rolling_analysis_and_correlation_cover_positive_negative_and_neutral_factors() {
+        let factor: Vec<f64> = (0..60).map(|i| i as f64).collect();
+        let positive = factor.clone();
+        let negative: Vec<f64> = factor.iter().map(|value| -*value).collect();
+        let flat = vec![1.0; factor.len()];
+
+        let (series, decay) = compute_rolling_ic(&factor, &positive).expect("rolling IC");
+        assert!(!series.is_empty());
+        assert!(series.iter().all(|ic| *ic > 0.99));
+        assert!(decay.iter().all(|ic| *ic > 0.99));
+
+        let positive_ic = analyze_factor("TEST_CODE_positive", &factor, &positive).unwrap();
+        assert!(matches!(
+            positive_ic.verdict,
+            FactorVerdict::Positive { .. }
+        ));
+        assert_eq!(positive_ic.information_ratio, 0.0);
+
+        let negative_ic = analyze_factor("TEST_CODE_negative", &factor, &negative).unwrap();
+        assert!(matches!(
+            negative_ic.verdict,
+            FactorVerdict::Negative { .. }
+        ));
+
+        let neutral_ic = analyze_factor("TEST_CODE_neutral", &flat, &positive).unwrap();
+        assert_eq!(neutral_ic.verdict, FactorVerdict::Neutral);
+        assert!(analyze_factor("TEST_CODE_short", &[1.0; 14], &[1.0; 14]).is_none());
+
+        let samples = vec![
+            FactorSample {
+                factor_name: "TEST_CODE_positive".to_string(),
+                factor_values: factor,
+                forward_returns: positive,
+            },
+            FactorSample {
+                factor_name: "TEST_CODE_negative".to_string(),
+                factor_values: negative,
+                forward_returns: flat,
+            },
+        ];
+        let matrix = factor_correlation_matrix(&samples);
+        assert_eq!(matrix.len(), 2);
+        assert_eq!(matrix[0][0], 1.0);
+        assert_eq!(matrix[0][1], matrix[1][0]);
+    }
 }

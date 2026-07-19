@@ -1,5 +1,5 @@
 //! v16.3 Commit 3 — 盘中监控 + 盘后整盘扫描 (R4 + R5 业务核心).
-//! Registered business rules: BR-098, BR-126.
+//! Registered business rules: BR-098, BR-126, BR-134.
 //!
 //! 业务流:
 //!   1. intraday_monitor.tick() 每 30s 跑一次
@@ -19,7 +19,7 @@ use crate::strategy::v16_4::{
     MomentumStrategy, NewsCatalystStrategy, SectorLeaderStrategy, Strategy, StrategyInput,
     StrategyOutput, VolumeSurgeStrategy,
 };
-use crate::trading::paper_trade::{self, Direction, PaperSignal};
+use crate::trading::paper_trade::{self, Direction, PaperRiskContext, PaperSignal};
 use chrono::{DateTime, Duration, Local, NaiveDate};
 use diesel::prelude::*;
 
@@ -88,9 +88,18 @@ impl Candidate {
 /// intraday_monitor 主入口
 pub struct IntradayMonitor;
 
+/// BR-134: the execution quote is the single source for paper limit flags.
+/// Callers must not clear these flags after obtaining a complete quote.
+fn paper_limit_flags(quote: &crate::broker::ExecutionQuote) -> (bool, bool) {
+    (
+        quote.price >= quote.limit_up_price,
+        quote.price <= quote.limit_down_price,
+    )
+}
+
 impl IntradayMonitor {
     /// 每 30s 跑一次 (从 main_loop 调, 推送消费核心)
-    pub fn tick(&self) -> Result<usize, String> {
+    pub fn tick(&self, risk_context: PaperRiskContext) -> Result<usize, String> {
         let now = Local::now();
         let cutoff = now - Duration::hours(PUSH_AGE_MAX_HOURS);
         let mut conn = DatabaseManager::get()
@@ -153,6 +162,7 @@ impl IntradayMonitor {
                         continue;
                     }
                 };
+                let (is_limit_up, is_limit_down) = paper_limit_flags(&execution_quote);
                 let paper_signal = PaperSignal {
                     plan_id: format!("intraday-{}-{}", cand.code, now.format("%Y%m%d%H%M%S%3f")),
                     code: cand.code.clone(),
@@ -161,15 +171,14 @@ impl IntradayMonitor {
                     price: execution_quote.price,
                     quantity: 100,
                     virtual_reason: signal.source.to_string(),
-                    is_limit_up: false,
-                    is_limit_down: false,
+                    is_limit_up,
+                    is_limit_down,
                     is_suspended: false,
                     limit_up_price: Some(execution_quote.limit_up_price),
                     limit_down_price: Some(execution_quote.limit_down_price),
                     secondary_confirmed: false,
                     quote_observed_at: execution_quote.observed_at,
-                    account_mode: "Normal".to_string(),
-                    data_mode: "Full".to_string(),
+                    risk_context,
                 };
                 let (cash, total, pos_pct) =
                     match paper_trade::portfolio_state(&cand.code, execution_quote.price) {
@@ -352,7 +361,7 @@ static EVENING_LAST_FAIL: std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>
     std::sync::Mutex::new(None);
 
 /// 盘后 15:30 整盘扫 (R5) — 复用 evaluate_candidate 评分, 跑 Momentum 整合
-pub fn evening_review(today: NaiveDate) -> Result<usize, String> {
+pub fn evening_review(today: NaiveDate, risk_context: PaperRiskContext) -> Result<usize, String> {
     {
         let last = EVENING_LAST_RUN.lock().unwrap_or_else(|e| e.into_inner());
         if *last == Some(today) {
@@ -431,6 +440,7 @@ pub fn evening_review(today: NaiveDate) -> Result<usize, String> {
                 continue;
             }
         };
+        let (is_limit_up, is_limit_down) = paper_limit_flags(&execution_quote);
         let paper_signal = PaperSignal {
             plan_id: format!("evening-{}-{}", cand.code, now.format("%Y%m%d%H%M%S%3f")),
             code: cand.code.clone(),
@@ -439,15 +449,14 @@ pub fn evening_review(today: NaiveDate) -> Result<usize, String> {
             price: execution_quote.price,
             quantity: 100,
             virtual_reason: "Momentum".to_string(),
-            is_limit_up: false,
-            is_limit_down: false,
+            is_limit_up,
+            is_limit_down,
             is_suspended: false,
             limit_up_price: Some(execution_quote.limit_up_price),
             limit_down_price: Some(execution_quote.limit_down_price),
             secondary_confirmed: false,
             quote_observed_at: execution_quote.observed_at,
-            account_mode: "Normal".to_string(),
-            data_mode: "Full".to_string(),
+            risk_context,
         };
         let (cash, total, pos_pct) =
             match paper_trade::portfolio_state(&cand.code, execution_quote.price) {
@@ -501,6 +510,34 @@ pub fn evening_review(today: NaiveDate) -> Result<usize, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn br134_paper_limit_flags_preserve_real_quote_boundaries() {
+        let observed_at = chrono::Utc::now();
+        let quote = |price| crate::broker::ExecutionQuote {
+            price,
+            limit_down_price: 9.0,
+            limit_up_price: 11.0,
+            observed_at,
+        };
+        assert_eq!(paper_limit_flags(&quote(10.0)), (false, false));
+        assert_eq!(paper_limit_flags(&quote(11.0)), (true, false));
+        assert_eq!(paper_limit_flags(&quote(9.0)), (false, true));
+    }
+
+    fn test_risk_context() -> PaperRiskContext {
+        risk_context(
+            crate::risk::action_gate::AccountMode::Normal,
+            crate::monitor::data_mode::DataMode::Full,
+        )
+    }
+
+    fn risk_context(
+        account_mode: crate::risk::action_gate::AccountMode,
+        data_mode: crate::monitor::data_mode::DataMode,
+    ) -> PaperRiskContext {
+        PaperRiskContext::new(account_mode, data_mode)
+    }
 
     fn unique_code(label: &str) -> String {
         format!(
@@ -726,6 +763,13 @@ mod tests {
     }
 
     #[test]
+    fn push_time_parser_accepts_database_seconds_precision() {
+        let mut c = candidate("D-01", "NewsCatalyst", 1.0);
+        c.push_time = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        assert!(c.push_time_parsed().is_ok());
+    }
+
+    #[test]
     fn push_kind_label_maps_d01() {
         let c = candidate("D-01", "NewsCatalyst", 0.0);
         assert_eq!(c.push_kind_label(), "NewsCatalyst");
@@ -849,7 +893,12 @@ mod tests {
                 .expect("place test candidate inside strict one-hour window");
         }
 
-        assert_eq!(IntradayMonitor.tick().expect("intraday tick"), 1);
+        assert_eq!(
+            IntradayMonitor
+                .tick(test_risk_context())
+                .expect("intraday tick"),
+            1
+        );
         let good = consumption(good_id);
         assert!(good.consumed_at.is_some());
         assert_eq!(good.consumed_by.as_deref(), Some("intraday_monitor"));
@@ -859,9 +908,56 @@ mod tests {
         assert!(bad.consumed_by.is_none());
         assert!(bad.outcome.is_none());
         assert_eq!(
-            IntradayMonitor.tick().expect("idempotent follow-up tick"),
+            IntradayMonitor
+                .tick(test_risk_context())
+                .expect("idempotent follow-up tick"),
             0
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn br134_reduce_only_context_rejects_buy_without_consuming_candidate() {
+        let mut guard = prepare_execution_account();
+        let code = unique_code("REDUCE_ONLY");
+        guard.codes.push(code.clone());
+        let id =
+            crate::signal::push_recorder::record(&crate::signal::push_recorder::PushRecordMeta {
+                code,
+                name: "风险模式候选".to_string(),
+                push_kind: "P-02".to_string(),
+                push_price: 10.0,
+                metric_json: serde_json::json!({
+                    "vol_ratio": 6.0,
+                    "price_chg_pct": 1.0,
+                    "push_subkind": "VolumeSurge"
+                })
+                .to_string(),
+                source: "preopen".to_string(),
+            })
+            .expect("record candidate");
+        guard.push_ids.push(id);
+        let eligible_time = (Local::now() - Duration::minutes(1))
+            .format("%Y-%m-%d %H:%M:%S%.3f")
+            .to_string();
+        let mut conn = DatabaseManager::get()
+            .get_conn()
+            .expect("test database connection");
+        diesel::sql_query("UPDATE pushed_stocks SET push_time = ? WHERE id = ?")
+            .bind::<diesel::sql_types::Text, _>(&eligible_time)
+            .bind::<diesel::sql_types::BigInt, _>(id)
+            .execute(&mut conn)
+            .expect("place candidate inside decision window");
+
+        let context = risk_context(
+            crate::risk::action_gate::AccountMode::ReduceOnly,
+            crate::monitor::data_mode::DataMode::Full,
+        );
+        assert_eq!(IntradayMonitor.tick(context).expect("risk-gated tick"), 0);
+        let row = consumption(id);
+        assert!(row.consumed_at.is_none());
+        assert!(row.consumed_by.is_none());
+        assert!(row.outcome.is_none());
     }
 
     #[test]
@@ -896,11 +992,120 @@ mod tests {
             .execute(&mut conn)
             .expect("place candidate before evening cutoff");
 
-        assert_eq!(evening_review(review_date).expect("evening review"), 1);
+        assert_eq!(
+            evening_review(review_date, test_risk_context()).expect("evening review"),
+            1
+        );
         let row = consumption(id);
         assert!(row.consumed_at.is_some());
         assert_eq!(row.consumed_by.as_deref(), Some("evening_review"));
         assert_eq!(row.outcome.as_deref(), Some("Momentum"));
-        assert_eq!(evening_review(review_date).expect("same-day reentry"), 0);
+        assert_eq!(
+            evening_review(review_date, test_risk_context()).expect("same-day reentry"),
+            0
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn br126_intraday_tick_rejects_a_valid_but_below_threshold_score_before_quote() {
+        let mut guard = prepare_execution_account();
+        let code = unique_code("INTRADAY_LOW_SCORE");
+        guard.codes.push(code.clone());
+        let id =
+            crate::signal::push_recorder::record(&crate::signal::push_recorder::PushRecordMeta {
+                code,
+                name: "盘中低分候选".to_string(),
+                push_kind: "盘后资金".to_string(),
+                push_price: 10.0,
+                metric_json: serde_json::json!({
+                    "main_net_yi": 1.0,
+                    "price_chg_pct": -20.0,
+                    "push_subkind": "MainNetInflow"
+                })
+                .to_string(),
+                source: "preopen".to_string(),
+            })
+            .expect("record low-score candidate");
+        guard.push_ids.push(id);
+        let eligible_time = (Local::now() - Duration::minutes(1))
+            .format("%Y-%m-%d %H:%M:%S%.3f")
+            .to_string();
+        let mut conn = DatabaseManager::get()
+            .get_conn()
+            .expect("test database connection");
+        diesel::sql_query("UPDATE pushed_stocks SET push_time = ? WHERE id = ?")
+            .bind::<diesel::sql_types::Text, _>(&eligible_time)
+            .bind::<diesel::sql_types::BigInt, _>(id)
+            .execute(&mut conn)
+            .expect("place low-score candidate inside strict window");
+
+        assert_eq!(
+            IntradayMonitor
+                .tick(test_risk_context())
+                .expect("low-score tick"),
+            0
+        );
+        assert!(consumption(id).consumed_at.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn br126_evening_review_skips_wrong_kind_bad_metrics_and_empty_strategy_output() {
+        let mut guard = prepare_execution_account();
+        let review_date = NaiveDate::from_ymd_opt(2098, 1, 3).unwrap();
+        let fixtures = [
+            ("D-01", serde_json::json!({"price_chg_pct": 1.0})),
+            ("Momentum", serde_json::json!({})),
+            (
+                "Momentum",
+                serde_json::json!({"vol_ratio": 2.0, "price_chg_pct": 1.0}),
+            ),
+        ];
+        let mut conn = DatabaseManager::get()
+            .get_conn()
+            .expect("test database connection");
+        for (index, (kind, metrics)) in fixtures.into_iter().enumerate() {
+            let code = unique_code(&format!("EVENING_SKIP_{index}"));
+            guard.codes.push(code.clone());
+            let id = crate::signal::push_recorder::record(
+                &crate::signal::push_recorder::PushRecordMeta {
+                    code,
+                    name: format!("盘后跳过候选{index}"),
+                    push_kind: kind.to_string(),
+                    push_price: 10.0,
+                    metric_json: metrics.to_string(),
+                    source: "postclose".to_string(),
+                },
+            )
+            .expect("record evening skip candidate");
+            guard.push_ids.push(id);
+            diesel::sql_query("UPDATE pushed_stocks SET push_time = ? WHERE id = ?")
+                .bind::<diesel::sql_types::Text, _>(format!("{review_date} 15:00:00.000"))
+                .bind::<diesel::sql_types::BigInt, _>(id)
+                .execute(&mut conn)
+                .expect("place evening skip candidate before cutoff");
+        }
+
+        assert_eq!(
+            evening_review(review_date, test_risk_context()).expect("skip-only review"),
+            0
+        );
+        assert!(guard
+            .push_ids
+            .iter()
+            .all(|id| consumption(*id).consumed_at.is_none()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn evening_failure_debounce_is_explicit_and_resettable() {
+        let review_date = NaiveDate::from_ymd_opt(2198, 1, 4).unwrap();
+        *EVENING_LAST_RUN.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *EVENING_LAST_FAIL.lock().unwrap_or_else(|e| e.into_inner()) = Some(chrono::Utc::now());
+        let error = evening_review(review_date, test_risk_context())
+            .expect_err("recent failure must debounce");
+        assert!(error.contains("debounce"));
+        *EVENING_LAST_FAIL.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 }

@@ -848,4 +848,117 @@ mod tests {
         let s = format_outcome_report(&[o]);
         assert!(s.contains("无数据"));
     }
+
+    fn kline(
+        date: NaiveDate,
+        close: f64,
+        open: f64,
+        low: f64,
+        pct_chg: f64,
+    ) -> crate::data_provider::KlineData {
+        crate::data_provider::KlineData {
+            date,
+            open,
+            high: open.max(close) + 0.5,
+            low,
+            close,
+            volume: 1_000.0,
+            amount: close * 1_000.0,
+            pct_chg,
+            intraday_price: None,
+            settled: true,
+            pe_ratio: None,
+            pb_ratio: None,
+            turnover_rate: None,
+            market_cap: None,
+            circulating_cap: None,
+            eps: None,
+            roe: None,
+            revenue_yoy: None,
+            net_profit_yoy: None,
+            gross_margin: None,
+            net_margin: None,
+            sharpe_ratio: None,
+            financials_history: None,
+            valuation_history: None,
+            consensus: None,
+            industry: None,
+            is_limit_up: false,
+            is_limit_down: false,
+            is_suspended: false,
+            adjust: crate::data_provider::AdjustType::None,
+        }
+    }
+
+    #[test]
+    fn kline_windows_cover_returns_drawdown_zero_price_and_missing_dates() {
+        let push_date = NaiveDate::from_ymd_opt(2026, 7, 10).unwrap();
+        let closes = [106.0, 94.0, 103.0, 102.0, 101.0, 100.0];
+        let klines: Vec<_> = closes
+            .iter()
+            .enumerate()
+            .map(|(offset, close)| {
+                let date = push_date + chrono::Duration::days((5 - offset) as i64);
+                kline(date, *close, *close + 1.0, *close - 1.0, 1.0)
+            })
+            .collect();
+
+        assert_eq!(locate_push_idx(&klines, push_date), Some(5));
+        assert_eq!(kline_at_or_before(&klines, push_date).unwrap().close, 100.0);
+        assert_eq!(pct_change_at_idx(&klines, 5, 1), Some(1.0));
+        assert_eq!(pct_change_at(&klines, push_date, 3), Some(3.0));
+        assert_eq!(pct_change_at_idx(&klines, 5, 99), Some(6.0));
+        let (mfe, mae) = mfe_mae_idx(&klines, 5, 5);
+        assert_eq!(mfe, Some(6.0));
+        assert_eq!(mae, Some(-6.0));
+        assert_eq!(mfe_mae(&klines, push_date, 5), (mfe, mae));
+        assert_eq!(mfe_mae_idx(&klines, 0, 5), (None, None));
+        assert_eq!(
+            pct_change_at(&klines, push_date - chrono::Duration::days(1), 1),
+            None
+        );
+
+        let mut zero = klines.clone();
+        zero[5].close = 0.0;
+        assert_eq!(pct_change_at_idx(&zero, 5, 1), None);
+        assert_eq!(mfe_mae_idx(&zero, 5, 5), (None, None));
+    }
+
+    #[test]
+    fn isolated_audit_directory_executes_full_missing_evidence_outcome_path() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tmp("directory").with_extension("");
+        std::fs::create_dir_all(&dir).unwrap();
+        let audit = dir.join("news_rank_audit_2026-07-10.jsonl");
+        write_audit(
+            &audit,
+            &[
+                r#"{"ts":"2026-07-10 10:00:00","candidate_id":"TEST_CODE_audit","title":"测试新闻","chain":"","bucket":"PushNow","rule_score":20,"freshness_score":15,"heat_score":8,"stage_score":25,"capital_score":8,"source_score":10,"risk_penalty":0,"reasons":[],"drop_reason":null}"#,
+            ],
+        );
+        let previous = std::env::var_os("DATABASE_PATH");
+        std::env::set_var("DATABASE_PATH", dir.join("TEST_CODE.db"));
+
+        let outcomes = run_today_outcome();
+
+        match previous {
+            Some(value) => std::env::set_var("DATABASE_PATH", value),
+            None => std::env::remove_var("DATABASE_PATH"),
+        }
+        assert_eq!(outcomes.len(), 1);
+        let outcome = &outcomes[0];
+        assert_eq!(outcome.candidate_id, "TEST_CODE_audit");
+        assert!(outcome.code.is_none());
+        assert!(outcome.push_price.is_none());
+        assert!(outcome
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("无关联股票")));
+        assert!(outcome.verdict.starts_with("无数据"));
+        assert_eq!(
+            parse_audit_date(&audit),
+            NaiveDate::from_ymd_opt(2026, 7, 10).unwrap()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

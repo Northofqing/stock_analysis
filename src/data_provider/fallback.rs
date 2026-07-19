@@ -57,8 +57,19 @@ pub async fn fetch_kline_post_close(
     log::info!("[盘后] {code} 启动盘后专用链: baostock (P1) → 5-way fallthrough (P2)");
 
     // 1. Baostock (日终权威, 0 风险)
-    let baostock = BaostockProvider::new();
-    match baostock.fetch_kline_async(code, days).await {
+    let baostock_result = BaostockProvider::new().fetch_kline_async(code, days).await;
+    resolve_post_close_result(code, baostock_result, fetch_kline_with_fallback(code, days)).await
+}
+
+async fn resolve_post_close_result<F>(
+    code: &str,
+    baostock_result: Result<Vec<KlineData>>,
+    fallback: F,
+) -> Result<(Vec<KlineData>, &'static str)>
+where
+    F: std::future::Future<Output = Result<(Vec<KlineData>, &'static str)>>,
+{
+    match baostock_result {
         Ok(data) if !data.is_empty() => {
             log::info!("[盘后] {code} Baostock 命中, {} 条", data.len());
             return Ok((data, "baostock"));
@@ -69,7 +80,7 @@ pub async fn fetch_kline_post_close(
 
     // 2. Baostock 失败/空 → fallthrough 5-way join
     log::info!("[盘后] {code} Baostock 失败, fallthrough 5-way join");
-    fetch_kline_with_fallback(code, days).await
+    fallback.await
 }
 
 /// 多源 fallback 拉取 K 线 + 质检门禁 (review #15 改三源竞速).
@@ -365,5 +376,35 @@ mod tests {
 
         assert!(err.contains("limited=403 forbidden"));
         assert!(err.contains("broken=protocol error"));
+    }
+
+    #[tokio::test]
+    async fn post_close_resolution_prefers_nonempty_baostock_and_falls_through_explicitly() {
+        let batch = vec![kline(10.0)];
+        let (data, source) =
+            resolve_post_close_result("TEST_CODE_000001", Ok(batch.clone()), async {
+                panic!("nonempty BaoStock result must short-circuit")
+            })
+            .await
+            .expect("authoritative post-close batch");
+        assert_eq!(source, "baostock");
+        assert_eq!(data.len(), 1);
+
+        for baostock_result in [Ok(Vec::new()), Err(anyhow!("TEST_CODE_BAOSTOCK_OFFLINE"))] {
+            let (_, source) =
+                resolve_post_close_result("TEST_CODE_000002", baostock_result, async {
+                    Ok((vec![kline(11.0)], "TEST_CODE_fallback"))
+                })
+                .await
+                .expect("explicit fallback result");
+            assert_eq!(source, "TEST_CODE_fallback");
+        }
+
+        let error = resolve_post_close_result("TEST_CODE_000003", Ok(Vec::new()), async {
+            Err(anyhow!("TEST_CODE_ALL_SOURCES_FAILED"))
+        })
+        .await
+        .expect_err("fallback failure remains explicit");
+        assert!(error.to_string().contains("ALL_SOURCES_FAILED"));
     }
 }

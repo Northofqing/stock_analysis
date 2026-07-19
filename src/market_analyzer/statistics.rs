@@ -314,6 +314,35 @@ fn fetch_sector_rankings_impl(top_n: usize) -> Result<Vec<(String, f64)>> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn http_proxy_sequence(
+        bodies: Vec<&'static str>,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            bodies
+                .into_iter()
+                .map(|body| {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut request = [0_u8; 8192];
+                    let n = stream.read(&mut request).unwrap();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream.write_all(response.as_bytes()).unwrap();
+                    String::from_utf8_lossy(&request[..n]).into_owned()
+                })
+                .collect()
+        });
+        (format!("http://{addr}"), handle)
+    }
+
     /// 静态检查：非测试代码中不能出现伪随机作为板块数据源。
     /// 修复：QUANT_ANALYST_REVIEW §1.3
     ///
@@ -333,5 +362,62 @@ mod tests {
             !production_src.contains("sectors_template"),
             "禁止在生产路径使用硬编码 sectors_template（AGENTS.md 红线）"
         );
+    }
+
+    #[test]
+    #[serial_test::serial(http_proxy_env)]
+    fn sina_statistics_transport_accepts_complete_batch_and_calculates_counts() {
+        let keys = [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+        ];
+        let previous: Vec<_> = keys
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect();
+        for key in keys {
+            std::env::remove_var(key);
+        }
+
+        let rows = r#"[
+            {"symbol":"sh600000","name":"测试主板","changepercent":9.95,"trade":"10.00","amount":100000000.0},
+            {"symbol":"sz300001","name":"测试创业板","changepercent":19.95,"trade":"20.00","amount":200000000.0},
+            {"symbol":"sz000001","name":"测试下跌","changepercent":-9.95,"trade":"8.00","amount":300000000.0},
+            {"symbol":"sh600002","name":"测试平盘","changepercent":0.0,"trade":"5.00","amount":400000000.0}
+        ]"#;
+        let (proxy, requests) = http_proxy_sequence(vec![rows, "[]"]);
+        std::env::set_var("HTTP_PROXY", &proxy);
+        std::env::set_var("http_proxy", &proxy);
+
+        let analyzer = MarketAnalyzer::new(None).unwrap();
+        let mut overview = MarketOverview::new("2026-07-18".to_string());
+        analyzer.get_market_statistics(&mut overview).unwrap();
+
+        assert_eq!(overview.up_count, 2);
+        assert_eq!(overview.down_count, 1);
+        assert_eq!(overview.flat_count, 1);
+        assert_eq!(overview.limit_up_count, 2);
+        assert_eq!(overview.limit_down_count, 1);
+        assert_eq!(overview.total_amount, 10.0);
+        assert_eq!(overview.top_stocks[0].code, "300001");
+        assert_eq!(overview.limit_up_stocks.len(), 2);
+        let requests = requests.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests
+            .iter()
+            .all(|request| request.contains("vip.stock.finance.sina.com.cn")));
+
+        for (key, value) in previous {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
     }
 }

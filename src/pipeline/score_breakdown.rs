@@ -719,3 +719,7 @@ mod tests {
         assert_eq!(compute_ranking_score(&score), 50);
     }
 }
+
+#[cfg(test)]
+#[path = "../gate_d_score_breakdown_regression.rs"]
+mod gate_d_regression;

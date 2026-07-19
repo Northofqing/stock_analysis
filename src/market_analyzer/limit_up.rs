@@ -299,3 +299,95 @@ impl MarketAnalyzer {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn http_proxy_once(body: &'static str) -> (String, std::thread::JoinHandle<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 8192];
+            let n = stream.read(&mut request).unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            String::from_utf8_lossy(&request[..n]).into_owned()
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[test]
+    #[serial_test::serial(http_proxy_env)]
+    fn sina_limit_up_transport_filters_registered_exclusions_and_rejects_bad_rows() {
+        let keys = [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+        ];
+        let previous: Vec<_> = keys
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect();
+        for key in keys {
+            std::env::remove_var(key);
+        }
+
+        let body = r#"[
+            {"symbol":"sh600000","name":"测试主板","changepercent":9.9,"trade":"10.50"},
+            {"symbol":"sh600001","name":"*ST测试","changepercent":5.0,"trade":"3.00"},
+            {"symbol":"bj920001","name":"北交所测试","changepercent":19.0,"trade":"20.00"},
+            {"symbol":"sz000002","name":"未涨停测试","changepercent":4.0,"trade":"8.00"}
+        ]"#;
+        let (proxy, request) = http_proxy_once(body);
+        std::env::set_var("HTTP_PROXY", &proxy);
+        std::env::set_var("http_proxy", &proxy);
+        let analyzer = MarketAnalyzer::new(None).unwrap();
+        let stocks = analyzer.get_limit_up_from_sina().unwrap();
+        assert_eq!(stocks.len(), 1);
+        assert_eq!(stocks[0].code, "600000");
+        assert!(request
+            .join()
+            .unwrap()
+            .contains("vip.stock.finance.sina.com.cn"));
+
+        let bad = r#"[{"symbol":"sh600000","changepercent":9.9,"trade":"10.50"}]"#;
+        let (proxy, request) = http_proxy_once(bad);
+        std::env::set_var("HTTP_PROXY", &proxy);
+        std::env::set_var("http_proxy", &proxy);
+        let analyzer = MarketAnalyzer::new(None).unwrap();
+        assert!(analyzer
+            .get_limit_up_from_sina()
+            .unwrap_err()
+            .to_string()
+            .contains("缺少 name"));
+        request.join().unwrap();
+
+        for (key, value) in previous {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    #[test]
+    fn limit_percent_covers_st_growth_star_bse_and_main_board() {
+        assert_eq!(MarketAnalyzer::get_limit_pct("600000", "*ST测试"), 5.0);
+        assert_eq!(MarketAnalyzer::get_limit_pct("300001", "创业板测试"), 20.0);
+        assert_eq!(MarketAnalyzer::get_limit_pct("688001", "科创板测试"), 20.0);
+        assert_eq!(MarketAnalyzer::get_limit_pct("830001", "北交所测试"), 30.0);
+        assert_eq!(MarketAnalyzer::get_limit_pct("600000", "主板测试"), 10.0);
+    }
+}

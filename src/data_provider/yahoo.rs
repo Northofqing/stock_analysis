@@ -406,3 +406,7 @@ mod tests {
         assert_eq!(server.finish().len(), 1);
     }
 }
+
+#[cfg(test)]
+#[path = "../gate_d_yahoo_regression.rs"]
+mod gate_d_regression;

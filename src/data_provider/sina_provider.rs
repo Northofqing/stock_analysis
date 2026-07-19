@@ -17,6 +17,10 @@ use crate::data_provider::stock_code_map::to_sina;
 /// Sina 数据提供者
 pub struct SinaProvider {
     client: reqwest::Client,
+    #[cfg(test)]
+    kline_url_override: Option<String>,
+    #[cfg(test)]
+    hq_url_override: Option<String>,
 }
 
 /// 构造 Sina K线 URL (JSONP).
@@ -140,11 +144,32 @@ impl SinaProvider {
             .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        Self { client }
+        Self {
+            client,
+            #[cfg(test)]
+            kline_url_override: None,
+            #[cfg(test)]
+            hq_url_override: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_test_urls(client: reqwest::Client, kline_url: String, hq_url: String) -> Self {
+        Self {
+            client,
+            kline_url_override: Some(kline_url),
+            hq_url_override: Some(hq_url),
+        }
     }
 
     /// 抓取 Sina K线 (GBK → UTF-8 decode).
     pub async fn fetch_kline_raw(&self, code: &str, days: usize) -> Result<Vec<KlineData>> {
+        #[cfg(test)]
+        let url = self
+            .kline_url_override
+            .clone()
+            .unwrap_or_else(|| build_kline_url(code, days));
+        #[cfg(not(test))]
         let url = build_kline_url(code, days);
         self.fetch_kline_from_url(code, &url).await
     }
@@ -170,6 +195,12 @@ impl SinaProvider {
 
     /// 抓取 Sina 实时行情 (单只, GBK → UTF-8 decode).
     pub async fn fetch_hq_async(&self, code: &str) -> Result<SinaHqQuote> {
+        #[cfg(test)]
+        let url = self
+            .hq_url_override
+            .clone()
+            .unwrap_or_else(|| build_hq_url(code));
+        #[cfg(not(test))]
         let url = build_hq_url(code);
         self.fetch_hq_from_url(code, &url).await
     }
@@ -373,9 +404,11 @@ mod strict_kline_tests {
     async fn loopback_sina_transports_preserve_empty_kline_and_complete_hq_protocols() {
         use super::super::{loopback_http_client, TestHttpResponse, TestHttpServer};
 
-        let provider = SinaProvider {
-            client: loopback_http_client(),
-        };
+        let provider = SinaProvider::with_test_urls(
+            loopback_http_client(),
+            "TEST_CODE_UNUSED_KLINE_URL".to_string(),
+            "TEST_CODE_UNUSED_HQ_URL".to_string(),
+        );
         let server = TestHttpServer::new(vec![TestHttpResponse::json("callback([])")]);
         let data = provider
             .fetch_kline_from_url("TEST_CODE_600519", server.base_url())
@@ -404,5 +437,37 @@ mod strict_kline_tests {
             .expect_err("Sina non-2xx response must fail explicitly");
         assert!(error.to_string().contains("404"));
         assert_eq!(server.finish(), vec!["/"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn public_provider_entrypoints_commit_local_protocol_quotes_without_fake_fields() {
+        use super::super::{loopback_http_client, TestHttpResponse, TestHttpServer};
+
+        let server = TestHttpServer::new(vec![
+            TestHttpResponse::json("callback([])"),
+            TestHttpResponse::json(hq_body(&[(0, "TEST_STOCK")])),
+        ]);
+        let provider = SinaProvider::with_test_urls(
+            loopback_http_client(),
+            server.base_url().to_string(),
+            server.base_url().to_string(),
+        );
+
+        assert!(provider
+            .get_daily_data("TEST_CODE_600519", 2)
+            .expect("empty source batch remains an explicit empty batch")
+            .is_empty());
+        let quote = provider
+            .get_realtime_quote("TEST_CODE_600519")
+            .expect("complete local quote protocol")
+            .expect("Sina returns a present quote");
+        assert_eq!(quote.code, "TEST_CODE_600519");
+        assert_eq!(quote.name, "TEST_STOCK");
+        assert_eq!(quote.price, 10.1);
+        assert_eq!(quote.volume, Some(123_456.0));
+        assert_eq!(quote.amount, Some(987_654.5));
+        assert!(quote.pe_ratio.is_none());
+        assert!(quote.pb_ratio.is_none());
+        assert_eq!(server.finish().len(), 2);
     }
 }

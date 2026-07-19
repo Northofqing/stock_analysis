@@ -328,6 +328,14 @@ impl DataFetcherManager {
             stock_name_cache: RwLock::new(HashMap::new()),
         })
     }
+
+    #[cfg(test)]
+    pub(crate) fn with_cached_name(code: &str, name: &str) -> Self {
+        Self {
+            providers: Vec::new(),
+            stock_name_cache: RwLock::new(HashMap::from([(code.to_string(), name.to_string())])),
+        }
+    }
     // 获取股票名称
     pub fn get_stock_name(&self, code: &str) -> Option<String> {
         // 先查缓存（名称在进程生命周期内不变）
@@ -361,11 +369,8 @@ impl DataFetcherManager {
         // 1. 走共享 fallback (腾讯 → 东财 → RustDX)
         // block_on_async_with_timeout 把 future 输出包装成 Result<_, String>,
         // future 本身又是 anyhow::Result, 故嵌套为 Result<Result<_>, String>. 两个 ? 解嵌套.
-        let timeout_result =
-            block_on_async_with_timeout(fallback::fetch_kline_with_fallback(code, days), 30)
-                .map_err(|e| anyhow::anyhow!("fallback 超时: {}", e))?;
         let (data, source_name) =
-            timeout_result.map_err(|e| anyhow::anyhow!("fallback 失败: {}", e))?;
+            Self::resolve_daily_data(fallback::fetch_kline_with_fallback(code, days), 30)?;
 
         log::info!("成功从 {} 获取到 {} 条数据", source_name, data.len());
 
@@ -373,6 +378,15 @@ impl DataFetcherManager {
         // 这些来源走各自的 Result API，由实际需要它们的调用方显式处理 unavailable，
         // 避免后台线程无 runtime 时把失败静默改写为默认对象（BR-115）。
         Ok((data, source_name))
+    }
+
+    fn resolve_daily_data<F>(future: F, timeout_secs: u64) -> Result<(Vec<KlineData>, &'static str)>
+    where
+        F: std::future::Future<Output = Result<(Vec<KlineData>, &'static str)>>,
+    {
+        block_on_async_with_timeout(future, timeout_secs)
+            .map_err(|error| anyhow::anyhow!("fallback 超时: {error}"))?
+            .map_err(|error| anyhow::anyhow!("fallback 失败: {error}"))
     }
 }
 
@@ -483,7 +497,13 @@ impl TestHttpServer {
                         break;
                     }
                 }
-                let request = String::from_utf8(raw).expect("test HTTP request must be UTF-8");
+                let header_end = raw
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|index| index + 4)
+                    .expect("test HTTP request must contain a complete header");
+                let request = String::from_utf8(raw[..header_end].to_vec())
+                    .expect("test HTTP header must be UTF-8");
                 let path = request
                     .lines()
                     .next()
@@ -690,29 +710,24 @@ mod tests {
         );
     }
 
-    /// v11 P0-2 commit 2: `DataFetcherManager::get_daily_data` (sync 入口) 在
-    /// `spawn_blocking` 上下文里能调, 不应触发 `block_on_async` panic (lib.rs:143).
-    ///
-    /// ⚠️ 网络依赖 — `#[ignore]` 跳过 CI, 手动跑: `cargo test --lib sync_get_daily_data_no_panic_in_spawn_blocking -- --ignored`
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore]
-    async fn sync_get_daily_data_no_panic_in_spawn_blocking() {
-        let dm = DataFetcherManager::new().expect("create DataFetcherManager");
-        let result = tokio::task::spawn_blocking(move || dm.get_daily_data("600519", 5)).await;
-
-        // 关键断言: spawn_blocking 不应 panic. 网络错误是预期的 (Err(_)), 但
-        // spawn_blocking 自身的 JoinError 表示 panic, 必须 fail.
-        match result {
-            Ok(_outcome) => {
-                // Ok(Ok((data, src))) 或 Ok(Err(network)), 都接受.
-                println!("spawn_blocking did not panic (outcome: data fetched or network err)");
-            }
-            Err(join_err) => {
-                panic!(
-                    "spawn_blocking panic'd: {} — sync 入口在 spawn_blocking 上下文不安全",
-                    join_err
-                );
-            }
-        }
+    async fn sync_daily_resolution_is_safe_in_spawn_blocking_without_network() {
+        let result = tokio::task::spawn_blocking(|| {
+            DataFetcherManager::resolve_daily_data(
+                async { Ok((Vec::new(), "TEST_CODE_RESOLVED_SOURCE")) },
+                1,
+            )
+        })
+        .await
+        .expect("spawn_blocking must not panic")
+        .expect("completed source result");
+        assert_eq!(result.1, "TEST_CODE_RESOLVED_SOURCE");
+        assert!(DataFetcherManager::resolve_daily_data(
+            async { Err(anyhow::anyhow!("TEST_CODE_SOURCE_FAILED")) },
+            1,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("fallback 失败"));
     }
 }

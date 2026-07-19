@@ -316,6 +316,20 @@ mod tests {
     }
 
     #[test]
+    fn missing_metrics_and_broken_date_continuity_remain_explicit() {
+        let missing = serde_json::json!({"result":{"data":[{"TRADE_DATE":"2026-07-17"}]}});
+        let history = parse_valuation_history(&missing).expect("missing metrics remain absent");
+        assert_eq!(
+            (history.current_pe, history.current_pb, history.sample_days),
+            (None, None, 0)
+        );
+        let duplicate = serde_json::json!({"result":{"data":[{"TRADE_DATE":"2026-07-17"},{"TRADE_DATE":"2026-07-17"}]}});
+        assert!(parse_valuation_history(&duplicate).is_err());
+        let gap = serde_json::json!({"result":{"data":[{"TRADE_DATE":"2026-07-17"},{"TRADE_DATE":"2026-07-15"}]}});
+        assert!(parse_valuation_history(&gap).is_err());
+    }
+
+    #[test]
     fn blocking_wrapper_without_runtime_returns_missing() {
         assert!(fetch_blocking(&reqwest::Client::new(), "TEST_CODE_000001").is_none());
     }

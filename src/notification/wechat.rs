@@ -166,3 +166,40 @@ impl NotificationService {
         result
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::notification::NotificationConfig;
+
+    #[test]
+    fn section_chunking_preserves_utf8_and_all_boundaries() {
+        let service = NotificationService::new(NotificationConfig::default());
+        assert_eq!(service.truncate_to_bytes("测试abc", 6), "测试");
+        assert_eq!(service.truncate_to_bytes("short", 10), "short");
+
+        let chunks = service.chunk_by_sections("第一段\n---\n第二段\n---\n第三段", 15);
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks.iter().all(|chunk| !chunk.is_empty()));
+
+        let heading_chunks = service.chunk_by_sections(
+            "前言\n### TEST_CODE 一\n内容一\n### TEST_CODE 二\n内容二",
+            40,
+        );
+        assert!(heading_chunks
+            .iter()
+            .any(|chunk| chunk.contains("### TEST_CODE")));
+
+        let long_section = "测".repeat(100);
+        let oversized = service.chunk_sections(&[long_section.as_str()], 210);
+        assert_eq!(oversized.len(), 1);
+        assert!(oversized[0].contains("本段内容过长已截断"));
+    }
+
+    #[tokio::test]
+    async fn missing_wechat_configuration_is_an_explicit_error() {
+        let service = NotificationService::new(NotificationConfig::default());
+        let error = service.send_to_wechat("TEST_CODE local").await.unwrap_err();
+        assert!(error.to_string().contains("Webhook 未配置"));
+    }
+}

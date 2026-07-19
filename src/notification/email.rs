@@ -373,3 +373,29 @@ impl NotificationService {
         Err(last_err.unwrap().into())
     }
 }
+
+#[cfg(test)]
+mod gate_d_tests {
+    use super::*;
+    use crate::notification::NotificationConfig;
+
+    #[test]
+    fn escaping_and_missing_configuration_fail_before_smtp_or_filesystem_io() {
+        assert_eq!(
+            html_escape("TEST_CODE <账户&报告>"),
+            "TEST_CODE &lt;账户&amp;报告&gt;"
+        );
+
+        let service = NotificationService::new(NotificationConfig::default());
+        let plain_err = service.send_to_email("TEST_CODE 本地邮件边界").unwrap_err();
+        assert!(plain_err.to_string().contains("EMAIL_SENDER"));
+
+        let image_err = service
+            .send_email_with_image(
+                "TEST_CODE 本地图片邮件边界",
+                Path::new("TEST_CODE_missing.png"),
+            )
+            .unwrap_err();
+        assert!(image_err.to_string().contains("EMAIL_SENDER"));
+    }
+}

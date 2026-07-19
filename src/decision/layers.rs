@@ -182,6 +182,13 @@ mod tests {
     }
 
     #[test]
+    fn feature_builder_rejects_future_and_non_object_evidence() {
+        let now = Local::now();
+        assert!(FeatureBuilder::build("{}", now + chrono::Duration::seconds(1), now).is_err());
+        assert!(FeatureBuilder::build("[]", now, now).is_err());
+    }
+
+    #[test]
     fn feature_builder_handles_bad_json() {
         let now = Local::now();
         let error = FeatureBuilder::build("not json", now, now).expect_err("invalid JSON");

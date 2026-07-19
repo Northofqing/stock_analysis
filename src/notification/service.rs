@@ -374,14 +374,24 @@ impl NotificationService {
 
     /// 保存报告到文件
     pub fn save_report_to_file(&self, content: &str, filename: Option<&str>) -> Result<String> {
-        use std::fs;
-        use std::path::PathBuf;
-
         let default_filename = format!("report_{}.md", Local::now().format("%Y%m%d"));
         let filename = filename.unwrap_or(&default_filename);
+        self.save_report_to_dir(content, filename, Path::new("reports"))
+    }
 
-        let reports_dir = PathBuf::from("reports");
-        fs::create_dir_all(&reports_dir)?;
+    /// Commit a rendered report to an explicit filesystem adapter root.
+    ///
+    /// Production callers use `reports/`; isolated validation can use a temporary
+    /// directory without changing process cwd or leaking artifacts into the repo.
+    pub(crate) fn save_report_to_dir(
+        &self,
+        content: &str,
+        filename: &str,
+        reports_dir: &Path,
+    ) -> Result<String> {
+        use std::fs;
+
+        fs::create_dir_all(reports_dir)?;
 
         let filepath = reports_dir.join(filename);
         fs::write(&filepath, content)?;
@@ -701,6 +711,9 @@ pub async fn send_daily_report(results: &[AnalysisResult]) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
 
     #[test]
     fn test_channel_name() {
@@ -801,5 +814,102 @@ mod tests {
         // assert!(report.contains("贵州茅台"));
         // assert!(report.contains("TEST_CODE_600519"));
         // assert!(report.contains("买入"));
+    }
+
+    fn spawn_webhook_fixture(expected_requests: usize) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local webhook fixture");
+        let address = listener.local_addr().expect("local webhook address");
+        let handle = thread::spawn(move || {
+            for _ in 0..expected_requests {
+                let (mut stream, _) = listener.accept().expect("accept webhook request");
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .expect("set fixture timeout");
+                let mut request = Vec::new();
+                let mut buf = [0_u8; 4096];
+                loop {
+                    let read = stream.read(&mut buf).expect("read webhook request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let first_line = String::from_utf8_lossy(&request)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                let (content_type, body) = if first_line.contains("/slack") {
+                    ("text/plain", "ok")
+                } else if first_line.contains("/custom") {
+                    ("application/json", r#"{"ok":true}"#)
+                } else if first_line.contains("/feishu") {
+                    ("application/json", r#"{"code":0}"#)
+                } else {
+                    ("application/json", r#"{"errcode":0}"#)
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write webhook response");
+            }
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    #[tokio::test]
+    async fn unified_text_and_image_dispatch_execute_all_local_webhook_adapters() {
+        let (base, fixture) = spawn_webhook_fixture(12);
+        let config = NotificationConfig {
+            wechat_webhook_url: Some(format!("{base}/wechat")),
+            feishu_webhook_url: Some(format!("{base}/feishu")),
+            dingtalk_webhook_url: Some(format!("{base}/dingtalk")),
+            slack_webhook_url: Some(format!("{base}/slack")),
+            discord_webhook_url: Some(format!("{base}/discord")),
+            custom_webhook_urls: vec![format!("{base}/custom")],
+            custom_webhook_bearer_token: Some("TEST_CODE_TOKEN".to_string()),
+            wechat_max_bytes: 4_000,
+            feishu_max_bytes: 20_000,
+            ..NotificationConfig::default()
+        };
+        let service = NotificationService::new(config);
+        assert_eq!(service.get_available_channels().len(), 6);
+        assert!(service.is_available());
+        assert!(service.get_channel_names().contains("企业微信"));
+        assert!(service.send("TEST_CODE 本地通知").await.unwrap());
+        assert!(service
+            .send_with_image(
+                "TEST_CODE 本地图片通知",
+                Path::new("TEST_CODE_not_read_for_webhooks.png"),
+            )
+            .await
+            .unwrap());
+        fixture.join().expect("webhook fixture completed");
+    }
+
+    #[tokio::test]
+    async fn unavailable_service_and_explicit_report_directory_are_local() {
+        let service = NotificationService::new(NotificationConfig::default());
+        assert!(!service.send("TEST_CODE no channels").await.unwrap());
+        assert!(!service
+            .send_with_image("TEST_CODE no channels", Path::new("TEST_CODE_missing.png"))
+            .await
+            .unwrap());
+
+        let root = std::env::temp_dir().join(format!(
+            "stock-analysis-notification-report-{}",
+            std::process::id()
+        ));
+        let path = service
+            .save_report_to_dir("TEST_CODE report", "report.md", &root)
+            .expect("save isolated report");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "TEST_CODE report");
+        std::fs::remove_dir_all(root).expect("remove isolated report directory");
     }
 }

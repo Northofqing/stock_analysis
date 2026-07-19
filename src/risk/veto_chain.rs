@@ -370,3 +370,7 @@ mod tests {
         assert!(ctx.current_price > 0.0);
     }
 }
+
+#[cfg(test)]
+#[path = "../gate_d_veto_chain_regression.rs"]
+mod gate_d_regression;

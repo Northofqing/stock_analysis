@@ -14,7 +14,7 @@
 use diesel::prelude::*;
 
 use super::DatabaseManager;
-use crate::risk::env_guard::current_env;
+use crate::risk::env_guard::{current_env, TradingEnv};
 use crate::schema::{position_adjustments, stock_position};
 
 /// 计算某 code 当前可用股数 (可卖数).
@@ -78,6 +78,17 @@ pub fn insert_position_adjustment(
     reason: &str,
     operator: Option<&str>,
 ) -> Result<i64, String> {
+    insert_position_adjustment_in_env(code, delta, source, reason, operator, current_env())
+}
+
+fn insert_position_adjustment_in_env(
+    code: &str,
+    delta: i32,
+    source: &str,
+    reason: &str,
+    operator: Option<&str>,
+    env: TradingEnv,
+) -> Result<i64, String> {
     if code.is_empty() {
         return Err("code 不能为空".to_string());
     }
@@ -92,7 +103,7 @@ pub fn insert_position_adjustment(
     }
 
     // env_guard: 测试环境拦截 (对齐 positions.rs:21)
-    if matches!(current_env(), crate::risk::env_guard::TradingEnv::Test) {
+    if matches!(env, TradingEnv::Test) {
         log::warn!(
             "[ENV_GUARD] position_adjustments: 测试环境拦截写入 code={} delta={}",
             code,
@@ -185,6 +196,38 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("测试环境"));
         std::env::remove_var("STOCK_ENV_MODE");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn isolated_sqlite_commit_covers_both_effective_date_branches() {
+        let db = init_test_db();
+        let code = unique_code("ADJUST_COMMIT");
+        let decrease_id = insert_position_adjustment_in_env(
+            &code,
+            -100,
+            "manual_confirm",
+            "TEST_CODE owner's confirmed decrease",
+            Some("TEST_CODE_OPERATOR'1"),
+            TradingEnv::Prod,
+        )
+        .expect("isolated decrease adjustment");
+        let increase_id = insert_position_adjustment_in_env(
+            &code,
+            100,
+            "import",
+            "TEST_CODE imported increase",
+            None,
+            TradingEnv::Prod,
+        )
+        .expect("isolated increase adjustment");
+        assert!(increase_id > decrease_id);
+
+        let mut conn = db.get_conn().expect("test database connection");
+        diesel::sql_query("DELETE FROM position_adjustments WHERE code = ?")
+            .bind::<diesel::sql_types::Text, _>(&code)
+            .execute(&mut conn)
+            .expect("remove isolated adjustments");
     }
 
     /// 有效日期计算: delta<0 → today, delta>0 → today+1

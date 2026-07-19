@@ -1,4 +1,4 @@
-//! Registered business rules: BR-046.
+//! Registered business rules: BR-046, BR-134.
 //! v16.3 Commit 4a — 4 铁律 + 1 bonus 接入 paper_trade 卖出路径.
 //!
 //! 业务: position_tracker::track_position 已实现 4 铁律
@@ -15,9 +15,10 @@
 //! → paper_engine 只读 analysis_result, 0 调 track_position, 0 重造 4 铁律
 
 use crate::database::DatabaseManager;
-use crate::trading::paper_trade::{self, Direction, PaperSignal};
+use crate::trading::paper_trade::{self, Direction, PaperRiskContext, PaperSignal};
 use chrono::Local;
 use diesel::prelude::*;
+use std::collections::{HashMap, VecDeque};
 
 /// 单个 active paper position 卖出检查输入
 #[derive(Debug, Clone)]
@@ -26,9 +27,7 @@ pub struct PaperPositionSellCheck {
     pub name: String,
     pub avg_cost: f64,
     pub quantity: u32,
-    /// Fix 1 (review): 当前市价 (用于 emit_sell_signal, 避免 avg_cost 当 price 滑点 0%)
-    /// v16.4 #5 阶段: 暂无 broker API, 推 0.0 (emit_sell_signal 用 avg_cost fallback)
-    /// v16.7 接入 broker 后: 填真价
+    /// 当前市价来自已注册的真实 provider；缺失时整批失败。
     pub current_price: f64,
     pub limit_up_price: f64,
     pub limit_down_price: f64,
@@ -50,53 +49,154 @@ pub struct SellDecision {
 }
 
 #[derive(diesel::QueryableByName, Debug)]
-struct OpenPosRow {
+struct FilledTradeRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    id: i64,
     #[diesel(sql_type = diesel::sql_types::Text)]
     code: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
     name: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    direction: String,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+    fill_price: Option<f64>,
     #[diesel(sql_type = diesel::sql_types::BigInt)]
-    net_qty: i64,
-    #[diesel(sql_type = diesel::sql_types::Double)]
-    avg_cost: f64,
+    quantity: i64,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    occurred_at: String,
 }
 
-/// review fix Issue #2: 从 paper_trades 聚合真实未平仓虚拟持仓 (Filled buy - Filled sell > 0).
-/// 替代之前 "checks 永远空, 等 v16.4" 的 dead code 状态, 让 4 铁律卖出闭环上线.
+#[derive(Debug)]
+struct OpenLot {
+    quantity: u32,
+    price: f64,
+}
+
+#[derive(Debug)]
+struct OpenPositionState {
+    name: String,
+    lots: VecDeque<OpenLot>,
+}
+
+/// BR-134: 从已成交 paper ledger 按 `(ts,id)` 做数量感知 FIFO，重建未平仓持仓。
+/// 任一坏行或超卖都拒绝整个批次；禁止汇总 SQL 用 0 或部分行掩盖坏证据。
 pub fn load_open_positions() -> Result<Vec<PaperPositionSellCheck>, String> {
     let mut conn = DatabaseManager::get()
         .get_conn()
         .map_err(|e| format!("DB 连接失败: {}", e))?;
-    let rows: Vec<OpenPosRow> = diesel::sql_query(
-        // Fix review (MEDIUM): MIN(name) 替代 MAX(name) — 同 code 多名(改名/复牌)取最早,
-        //                   COALESCE(fill_price, price) 兼容 SignalTriggered/NotFilled 部分成交
-        "SELECT code, MIN(name) AS name, \
-         SUM(CASE WHEN direction = 'buy' THEN quantity ELSE -quantity END) AS net_qty, \
-         COALESCE( \
-           SUM(CASE WHEN direction = 'buy' THEN COALESCE(fill_price, price) * quantity ELSE 0 END) * 1.0 \
-           / NULLIF(SUM(CASE WHEN direction = 'buy' THEN quantity ELSE 0 END), 0), 0.0) AS avg_cost \
+    let rows: Vec<FilledTradeRow> = diesel::sql_query(
+        "SELECT id, code, name, direction, fill_price, quantity, \
+                strftime('%Y-%m-%d %H:%M:%f', ts) AS occurred_at \
          FROM paper_trades WHERE status = 'Filled' \
-         GROUP BY code HAVING net_qty > 0",
+         ORDER BY datetime(ts) ASC, id ASC",
     )
-    .load::<OpenPosRow>(&mut conn)
-    .map_err(|e| format!("query open paper positions: {}", e))?;
+    .load::<FilledTradeRow>(&mut conn)
+    .map_err(|e| format!("query filled paper trades: {e}"))?;
 
-    rows.into_iter()
-        .map(|r| {
-            let quote = crate::broker::execution_quote(&r.code)
-                .map_err(|error| format!("paper position {} quote unavailable: {error}", r.code))?;
-            Ok(PaperPositionSellCheck {
-                code: r.code,
-                name: r.name,
-                avg_cost: r.avg_cost,
-                quantity: r.net_qty.max(0) as u32,
-                current_price: quote.price,
-                limit_up_price: quote.limit_up_price,
-                limit_down_price: quote.limit_down_price,
-                quote_observed_at: quote.observed_at,
-            })
-        })
-        .collect()
+    let mut states: HashMap<String, OpenPositionState> = HashMap::new();
+    let mut previous_order: Option<(chrono::NaiveDateTime, i64)> = None;
+    for row in rows {
+        if row.id <= 0 || row.code.trim().is_empty() || row.name.trim().is_empty() {
+            return Err(format!(
+                "paper fill identity invalid: id={} code={:?} name={:?}",
+                row.id, row.code, row.name
+            ));
+        }
+        let occurred_at =
+            chrono::NaiveDateTime::parse_from_str(&row.occurred_at, "%Y-%m-%d %H:%M:%S%.f")
+                .map_err(|error| format!("paper fill id={} timestamp invalid: {error}", row.id))?;
+        if previous_order.is_some_and(|previous| previous >= (occurred_at, row.id)) {
+            return Err(format!(
+                "paper fills duplicate/out of order at id={}",
+                row.id
+            ));
+        }
+        previous_order = Some((occurred_at, row.id));
+        let price = row
+            .fill_price
+            .filter(|price| price.is_finite() && *price > 0.0)
+            .ok_or_else(|| format!("paper fill id={} fill_price missing/invalid", row.id))?;
+        let quantity = u32::try_from(row.quantity)
+            .ok()
+            .filter(|quantity| *quantity > 0 && quantity.is_multiple_of(100))
+            .ok_or_else(|| {
+                format!(
+                    "paper fill id={} quantity invalid: {}",
+                    row.id, row.quantity
+                )
+            })?;
+
+        let state = states
+            .entry(row.code.clone())
+            .or_insert_with(|| OpenPositionState {
+                name: row.name.clone(),
+                lots: VecDeque::new(),
+            });
+        state.name = row.name;
+        match row.direction.as_str() {
+            "buy" => state.lots.push_back(OpenLot { quantity, price }),
+            "sell" => {
+                let mut remaining = quantity;
+                while remaining > 0 {
+                    let lot = state.lots.front_mut().ok_or_else(|| {
+                        format!(
+                            "paper sell id={} oversells {} by {} shares",
+                            row.id, row.code, remaining
+                        )
+                    })?;
+                    let consumed = remaining.min(lot.quantity);
+                    lot.quantity -= consumed;
+                    remaining -= consumed;
+                    if lot.quantity == 0 {
+                        state.lots.pop_front();
+                    }
+                }
+            }
+            other => {
+                return Err(format!(
+                    "paper fill id={} direction invalid: {other:?}",
+                    row.id
+                ));
+            }
+        }
+    }
+
+    let mut positions = Vec::new();
+    for (code, state) in states {
+        let quantity = state.lots.iter().try_fold(0_u32, |total, lot| {
+            total
+                .checked_add(lot.quantity)
+                .ok_or_else(|| format!("paper position {code} quantity overflow"))
+        })?;
+        if quantity == 0 {
+            continue;
+        }
+        let total_cost = state
+            .lots
+            .iter()
+            .map(|lot| lot.price * f64::from(lot.quantity))
+            .sum::<f64>();
+        let avg_cost = total_cost / f64::from(quantity);
+        if !avg_cost.is_finite() || avg_cost <= 0.0 {
+            return Err(format!(
+                "paper position {code} average cost invalid: {avg_cost}"
+            ));
+        }
+        let quote = crate::broker::execution_quote(&code)
+            .map_err(|error| format!("paper position {code} quote unavailable: {error}"))?;
+        positions.push(PaperPositionSellCheck {
+            code,
+            name: state.name,
+            avg_cost,
+            quantity,
+            current_price: quote.price,
+            limit_up_price: quote.limit_up_price,
+            limit_down_price: quote.limit_down_price,
+            quote_observed_at: quote.observed_at,
+        });
+    }
+    positions.sort_by(|left, right| left.code.cmp(&right.code));
+    Ok(positions)
 }
 
 /// 4 铁律检查入口 — 读 analysis_result 表 (由 position_tracker::track_position 写)
@@ -172,7 +272,10 @@ fn quote_sql_code(code: &str) -> String {
 ///
 /// Fix 3: SellDecision 加 quantity 字段, 不再硬编码 100
 /// Price is the validated realtime quote captured by `load_open_positions`.
-pub fn emit_sell_signal(decision: &SellDecision) -> Result<(), String> {
+pub fn emit_sell_signal(
+    decision: &SellDecision,
+    risk_context: PaperRiskContext,
+) -> Result<(), String> {
     let now = Local::now();
     let effective_price = decision.current_price;
     let signal = PaperSignal {
@@ -194,24 +297,23 @@ pub fn emit_sell_signal(decision: &SellDecision) -> Result<(), String> {
         price: effective_price,
         quantity: decision.quantity,
         virtual_reason: format!("4-IronRule:{}", decision.reason),
-        is_limit_up: false,
-        is_limit_down: false,
+        is_limit_up: decision.current_price >= decision.limit_up_price,
+        is_limit_down: decision.current_price <= decision.limit_down_price,
         is_suspended: false,
         limit_up_price: Some(decision.limit_up_price),
         limit_down_price: Some(decision.limit_down_price),
         secondary_confirmed: false,
         quote_observed_at: decision.quote_observed_at,
-        account_mode: "Normal".to_string(),
-        data_mode: "Full".to_string(),
+        risk_context,
     };
 
     // review fix Issue #5: 传真实 portfolio state (Sell 路径 AccountMode/DataMode 检查仍生效)
     let (cash, total, pos_pct) = paper_trade::portfolio_state(&decision.code, effective_price)?;
-    // v16.5 #4: 预生成 order_id/exec_id/decision_id, simulate 后 publish TradingBus (2 emit)
+    // BR-134: IDs are prepared before simulation, but events are emitted only
+    // for the durable outcome returned below.
     let order_id = crate::bus::new_order_id();
     let exec_id = crate::bus::new_execution_id();
     let decision_id = crate::bus::new_decision_id();
-    let plan_id_for_event = order_id.clone(); // emit 用 (不暴露 plan_id 给 TradingEvent)
     match paper_trade::simulate(&signal, effective_price, cash, total, pos_pct) {
         Ok(outcome) => {
             log::info!(
@@ -221,20 +323,9 @@ pub fn emit_sell_signal(decision: &SellDecision) -> Result<(), String> {
                 outcome.result.status.as_str(),
                 decision.reason
             );
-            // v16.5 #4: TradingBus 2 emit (OrderCreated + ExecutionFilled, 真价)
-            crate::bus::TradingBus::global().publish(crate::bus::TradingEvent::OrderCreated {
-                decision_id: decision_id.clone(),
-                order_id: order_id.clone(),
-                code: decision.code.clone(),
-                side: "sell".to_string(),
-            });
-            crate::bus::TradingBus::global().publish(crate::bus::TradingEvent::ExecutionFilled {
-                order_id: order_id.clone(),
-                execution_id: exec_id.clone(),
-                fill_price: effective_price,
-            });
-            // suppress unused warning
-            let _ = plan_id_for_event;
+            for event in paper_trading_events(decision, &outcome, decision_id, order_id, exec_id)? {
+                crate::bus::TradingBus::global().publish(event);
+            }
             Ok(())
         }
         Err(e) => {
@@ -247,6 +338,63 @@ pub fn emit_sell_signal(decision: &SellDecision) -> Result<(), String> {
             Err(e)
         }
     }
+}
+
+/// BR-134: publish only facts that were durably recorded by `simulate`.
+/// A rejected/non-filled attempt may create an order event, but it must never
+/// masquerade as an execution. Duplicate `INSERT OR IGNORE` outcomes publish
+/// nothing because no new paper-trade fact was committed.
+fn paper_trading_events(
+    decision: &SellDecision,
+    outcome: &paper_trade::PaperOutcome,
+    decision_id: crate::bus::DecisionId,
+    order_id: crate::bus::OrderId,
+    execution_id: crate::bus::ExecutionId,
+) -> Result<Vec<crate::bus::TradingEvent>, String> {
+    if !outcome.inserted {
+        return Ok(Vec::new());
+    }
+    let mut events = vec![crate::bus::TradingEvent::OrderCreated {
+        decision_id,
+        order_id: order_id.clone(),
+        code: decision.code.clone(),
+        side: "sell".to_string(),
+    }];
+    if outcome.result.status == paper_trade::PaperTradeStatus::Filled {
+        let fill_price = outcome
+            .result
+            .fill_price
+            .filter(|price| price.is_finite() && *price > 0.0)
+            .ok_or_else(|| "BR-134 Filled paper outcome is missing fill_price".to_string())?;
+        events.push(crate::bus::TradingEvent::ExecutionFilled {
+            order_id,
+            execution_id,
+            fill_price,
+        });
+    }
+    Ok(events)
+}
+
+/// One complete four-iron-rule attempt. The caller may advance its success
+/// debounce only when this function returns `Ok`.
+pub fn run_once(risk_context: PaperRiskContext) -> Result<usize, String> {
+    let checks = load_open_positions()?;
+    let decisions = check_4_iron_rules(&checks)?;
+    let count = decisions.len();
+    let mut failures = Vec::new();
+    for decision in &decisions {
+        if let Err(error) = emit_sell_signal(decision, risk_context) {
+            failures.push(format!("{}: {error}", decision.code));
+        }
+    }
+    if !failures.is_empty() {
+        return Err(format!(
+            "BR-134 paper exit batch had {} failed attempt(s): {}",
+            failures.len(),
+            failures.join("; ")
+        ));
+    }
+    Ok(count)
 }
 
 /// 判断 operation_advice 是否含 4 铁律关键词
@@ -421,6 +569,107 @@ mod tests {
         assert_eq!(r.chars().count(), 30);
     }
 
+    fn decision_for_event_test() -> SellDecision {
+        SellDecision {
+            code: "TEST_CODE_PAPER_EVENT".to_string(),
+            name: "事件语义".to_string(),
+            reason: "铁律1:止损(-8%)".to_string(),
+            quantity: 100,
+            current_price: 10.0,
+            limit_up_price: 11.0,
+            limit_down_price: 9.0,
+            quote_observed_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn br134_bus_events_never_turn_non_fills_or_duplicates_into_executions() {
+        let decision = decision_for_event_test();
+        let not_filled = paper_trade::PaperOutcome {
+            result: paper_trade::PaperResult {
+                status: paper_trade::PaperTradeStatus::NotFilled,
+                fill_price: None,
+                not_fill_reason: Some("跌停不可卖".to_string()),
+            },
+            inserted: true,
+        };
+        let events = paper_trading_events(
+            &decision,
+            &not_filled,
+            "decision-not-filled".to_string(),
+            "order-not-filled".to_string(),
+            "execution-not-filled".to_string(),
+        )
+        .expect("non-fill event mapping");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            crate::bus::TradingEvent::OrderCreated { order_id, .. }
+                if order_id == "order-not-filled"
+        ));
+
+        let duplicate = paper_trade::PaperOutcome {
+            inserted: false,
+            ..not_filled
+        };
+        assert!(paper_trading_events(
+            &decision,
+            &duplicate,
+            "decision-duplicate".to_string(),
+            "order-duplicate".to_string(),
+            "execution-duplicate".to_string(),
+        )
+        .expect("duplicate event mapping")
+        .is_empty());
+    }
+
+    #[test]
+    fn br134_bus_execution_uses_the_persisted_fill_price() {
+        let decision = decision_for_event_test();
+        let filled = paper_trade::PaperOutcome {
+            result: paper_trade::PaperResult {
+                status: paper_trade::PaperTradeStatus::Filled,
+                fill_price: Some(9.95),
+                not_fill_reason: None,
+            },
+            inserted: true,
+        };
+        let events = paper_trading_events(
+            &decision,
+            &filled,
+            "decision-filled".to_string(),
+            "order-filled".to_string(),
+            "execution-filled".to_string(),
+        )
+        .expect("filled event mapping");
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[1],
+            crate::bus::TradingEvent::ExecutionFilled {
+                order_id,
+                fill_price,
+                ..
+            } if order_id == "order-filled" && (*fill_price - 9.95).abs() < f64::EPSILON
+        ));
+
+        let missing_fill = paper_trade::PaperOutcome {
+            result: paper_trade::PaperResult {
+                status: paper_trade::PaperTradeStatus::Filled,
+                fill_price: None,
+                not_fill_reason: None,
+            },
+            inserted: true,
+        };
+        assert!(paper_trading_events(
+            &decision,
+            &missing_fill,
+            "decision-missing".to_string(),
+            "order-missing".to_string(),
+            "execution-missing".to_string(),
+        )
+        .is_err());
+    }
+
     #[test]
     #[serial_test::serial]
     fn paper_engine_round_trips_open_positions_decisions_and_sell_execution() {
@@ -461,7 +710,7 @@ mod tests {
             .expect("isolated open paper position");
         assert_eq!(position.name, "虚拟持仓");
         assert_eq!(position.quantity, 200);
-        assert!((position.avg_cost - (3_200.0 / 300.0)).abs() < 1e-9);
+        assert!((position.avg_cost - 11.0).abs() < 1e-9);
         assert_eq!(position.current_price, 10.0);
         assert_eq!(position.limit_down_price, 9.0);
         assert_eq!(position.limit_up_price, 11.0);
@@ -510,7 +759,11 @@ mod tests {
         assert_eq!(decisions[0].code, code);
         assert_eq!(decisions[0].quantity, 200);
         assert_eq!(decisions[0].reason, "铁律3:跌破5日线止盈");
-        emit_sell_signal(&decisions[0]).expect("audited paper sell");
+        let risk_context = PaperRiskContext::new(
+            crate::risk::action_gate::AccountMode::Normal,
+            crate::monitor::data_mode::DataMode::Full,
+        );
+        emit_sell_signal(&decisions[0], risk_context).expect("audited paper sell");
 
         let mut invalid = SellDecision {
             code: unique_code("INVALID"),
@@ -522,8 +775,78 @@ mod tests {
             limit_down_price: 9.0,
             quote_observed_at: chrono::Utc::now(),
         };
-        assert!(emit_sell_signal(&invalid).is_err());
+        assert!(emit_sell_signal(&invalid, risk_context).is_err());
         invalid.current_price = f64::NAN;
-        assert!(emit_sell_signal(&invalid).is_err());
+        assert!(emit_sell_signal(&invalid, risk_context).is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn br134_open_position_rebuild_rejects_missing_fill_and_oversell() {
+        let missing_code = unique_code("MISSING_FILL");
+        let oversell_code = unique_code("OVERSELL");
+        let _guard = prepare_account(vec![missing_code.clone(), oversell_code.clone()]);
+        let mut conn = DatabaseManager::get()
+            .get_conn()
+            .expect("test database connection");
+        diesel::sql_query(
+            "INSERT INTO paper_trades
+             (plan_id, code, name, direction, price, quantity, status, fill_price,
+              virtual_reason, account_mode, data_mode)
+             VALUES (?, ?, '缺成交价', 'buy', 10.0, 100, 'Filled', NULL,
+                     'TEST_REASON', 'Normal', 'Full')",
+        )
+        .bind::<diesel::sql_types::Text, _>(format!("MISSING_{missing_code}"))
+        .bind::<diesel::sql_types::Text, _>(&missing_code)
+        .execute(&mut conn)
+        .expect("schema permits legacy Filled row without fill price");
+        let error = load_open_positions().expect_err("missing fill must fail the batch");
+        assert!(error.contains("fill_price"));
+
+        diesel::sql_query("DELETE FROM paper_trades WHERE code = ?")
+            .bind::<diesel::sql_types::Text, _>(&missing_code)
+            .execute(&mut conn)
+            .expect("remove first isolated row");
+        for (plan, direction, quantity) in [("BUY", "buy", 100_i64), ("SELL", "sell", 200)] {
+            diesel::sql_query(
+                "INSERT INTO paper_trades
+                 (plan_id, code, name, direction, price, quantity, status, fill_price,
+                  virtual_reason, account_mode, data_mode)
+                 VALUES (?, ?, '超卖测试', ?, 10.0, ?, 'Filled', 10.0,
+                         'TEST_REASON', 'Normal', 'Full')",
+            )
+            .bind::<diesel::sql_types::Text, _>(format!("{plan}_{oversell_code}"))
+            .bind::<diesel::sql_types::Text, _>(&oversell_code)
+            .bind::<diesel::sql_types::Text, _>(direction)
+            .bind::<diesel::sql_types::BigInt, _>(quantity)
+            .execute(&mut conn)
+            .expect("insert isolated FIFO row");
+        }
+        let error = load_open_positions().expect_err("oversell must fail the batch");
+        assert!(error.contains("oversells"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn br134_frozen_context_reaches_the_paper_order_gate() {
+        let code = unique_code("FROZEN");
+        let _guard = prepare_account(vec![code.clone()]);
+        let decision = SellDecision {
+            code,
+            name: "冻结模式".to_string(),
+            reason: "铁律1:止损(-8%)".to_string(),
+            quantity: 100,
+            current_price: 10.0,
+            limit_up_price: 11.0,
+            limit_down_price: 9.0,
+            quote_observed_at: chrono::Utc::now(),
+        };
+        let context = PaperRiskContext::new(
+            crate::risk::action_gate::AccountMode::Frozen,
+            crate::monitor::data_mode::DataMode::Full,
+        );
+        let error = emit_sell_signal(&decision, context)
+            .expect_err("Frozen must not be overwritten with Normal");
+        assert!(error.contains("Frozen"));
     }
 }

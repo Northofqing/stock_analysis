@@ -148,7 +148,11 @@ impl GtimgProvider {
     }
 
     #[cfg(test)]
-    fn with_bases(client: reqwest::Client, kline_base: String, quote_base: String) -> Self {
+    pub(super) fn with_bases(
+        client: reqwest::Client,
+        kline_base: String,
+        quote_base: String,
+    ) -> Self {
         Self {
             client,
             kline_base,

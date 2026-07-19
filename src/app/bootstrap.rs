@@ -519,3 +519,68 @@ fn extract_stock_codes(rec_text: &str) -> Vec<String> {
     codes.sort();
     codes
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn stock_code_extraction_prefers_registered_line_then_falls_back_and_deduplicates() {
+        assert_eq!(
+            extract_stock_codes(
+                "正文提到 600000\n【推荐代码】 300001, 000002, 300001\n尾部 688001"
+            ),
+            vec!["000002", "300001"]
+        );
+        assert_eq!(
+            extract_stock_codes("没有登记行，正文含 600000 / 688001 / 600000 / 920001"),
+            vec!["600000", "688001"]
+        );
+        assert!(extract_stock_codes("没有合法证券身份 12345 TEST_CODE_000001").is_empty());
+    }
+
+    #[test]
+    fn delisted_name_detection_covers_all_registered_labels() {
+        assert!(is_delisted_name("退市测试"));
+        assert!(is_delisted_name("退测试"));
+        assert!(is_delisted_name("测试终止上市"));
+        assert!(!is_delisted_name("普通测试股"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(bootstrap_env)]
+    async fn deep_analysis_stock_list_uses_only_explicit_codes_without_external_extensions() {
+        let keys = ["POSITION_TRACKING_ENABLED", "STOCK_FILTER_DELISTED"];
+        let previous: Vec<_> = keys
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect();
+        std::env::set_var("POSITION_TRACKING_ENABLED", "false");
+        std::env::set_var("STOCK_FILTER_DELISTED", "false");
+        let args = Args::parse_from([
+            "stock_analysis",
+            "--deep-analysis",
+            "--stocks",
+            "TEST_CODE_000001,TEST_CODE_600000",
+        ]);
+
+        let (codes, limit_up, macro_context) = build_stock_list(&args).await.unwrap();
+
+        for (key, value) in previous {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        assert_eq!(
+            codes,
+            vec![
+                "TEST_CODE_000001".to_string(),
+                "TEST_CODE_600000".to_string()
+            ]
+        );
+        assert!(limit_up.is_empty());
+        assert!(macro_context.is_empty());
+    }
+}

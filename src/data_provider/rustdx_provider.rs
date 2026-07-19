@@ -607,31 +607,65 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "live RustDX TCP integration test; run explicitly with --ignored"]
-    fn test_rustdx_connection() {
-        let _provider = RustdxProvider::new().unwrap();
-        assert!(RustdxProvider::new_connection().is_ok());
+    fn provider_construction_preserves_real_adapter_identity_without_connecting() {
+        let provider = RustdxProvider::new().expect("construction has no transport IO");
+        assert_eq!(provider.name(), "通达信");
+        assert_eq!(provider.get_stock_name("TEST_CODE_000001"), None);
     }
 
     #[test]
-    #[ignore = "live RustDX and Tencent integration test; run explicitly with --ignored"]
-    fn test_fetch_kline() {
-        let provider = RustdxProvider::new().unwrap();
-        let result = provider.get_daily_data("600000", 10);
-        assert!(result.is_ok());
-        let data = result.unwrap();
-        assert!(!data.is_empty());
-        println!("获取到 {} 条K线数据", data.len());
+    fn complete_resolved_page_parses_without_live_rustdx_or_tencent() {
+        let raw = raw(2026, 7, 18, 10.0);
+        let pages = RustdxProvider::fetch_kline_pages("TEST_CODE_600000", 1, |_, count| {
+            assert_eq!(count, 1);
+            Ok(vec![raw.clone()])
+        })
+        .expect("complete page");
+        assert_eq!(
+            RustdxProvider::parse_kline_batch("TEST_CODE_600000", &pages)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
-    #[ignore = "live RustDX TCP integration test; run explicitly with --ignored"]
-    fn test_fetch_realtime() {
-        let provider = RustdxProvider::new().unwrap();
-        let result = provider.get_realtime_quote("600000");
-        assert!(result.is_ok());
-        if let Some(quote) = result.unwrap() {
-            println!("实时行情: {} {:.2}元", quote.name, quote.price);
+    fn realtime_interface_uses_tencent_loopback_protocol() {
+        let mut fields = vec!["0"; 54];
+        for (index, value) in [
+            (1, "测试股票"),
+            (3, "10.10"),
+            (4, "10.00"),
+            (6, "1234"),
+            (30, "20260718101530"),
+            (37, "12.5"),
+            (38, "2.5"),
+            (39, "15.0"),
+            (44, "100.0"),
+            (45, "120.0"),
+            (46, "2.0"),
+            (47, "11.00"),
+            (48, "9.00"),
+            (52, "16.0"),
+        ] {
+            fields[index] = value;
         }
+        let server = super::super::TestHttpServer::new(vec![super::super::TestHttpResponse::json(
+            format!("v_sz000001=\"{}\";", fields.join("~")),
+        )]);
+        let base = server.base_url().to_string();
+        let provider = RustdxProvider {
+            gtimg_provider: GtimgProvider::with_bases(
+                super::super::loopback_http_client(),
+                base.clone(),
+                base,
+            ),
+        };
+        let quote = provider
+            .get_realtime_quote("TEST_CODE_000001")
+            .unwrap()
+            .unwrap();
+        assert_eq!((quote.name.as_str(), quote.price), ("测试股票", 10.10));
+        assert_eq!(server.finish(), vec!["/q=sz000001"]);
     }
 }

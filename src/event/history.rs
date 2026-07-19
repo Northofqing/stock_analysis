@@ -898,6 +898,86 @@ mod tests {
         tokio::fs::remove_dir_all(dir).await.unwrap();
     }
 
+    #[tokio::test]
+    async fn query_and_rate_filters_reject_each_nonmatching_complete_record() {
+        let dir = test_dir("gate-d-filter-matrix");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let now = Local::now();
+        let date = now.format("%Y-%m-%d").to_string();
+        let rows = [
+            make_delivery_envelope(
+                "wrong-kind",
+                "OtherKind",
+                Some("TEST_CODE_000001"),
+                "Pushed",
+                "wanted-sink",
+                1,
+                now,
+            ),
+            make_delivery_envelope(
+                "wrong-date",
+                "WantedKind",
+                Some("TEST_CODE_000001"),
+                "Pushed",
+                "wanted-sink",
+                1,
+                now - chrono::Duration::days(1),
+            ),
+            make_delivery_envelope(
+                "wanted",
+                "WantedKind",
+                Some("TEST_CODE_000001"),
+                "Pushed",
+                "wanted-sink",
+                1,
+                now,
+            ),
+            make_delivery_envelope(
+                "wrong-sink",
+                "WantedKind",
+                Some("TEST_CODE_000001"),
+                "Failed",
+                "other-sink",
+                1,
+                now,
+            ),
+            make_delivery_envelope(
+                "outside-window",
+                "WantedKind",
+                Some("TEST_CODE_000001"),
+                "Failed",
+                "wanted-sink",
+                1,
+                now - chrono::Duration::hours(2),
+            ),
+        ];
+        for row in &rows {
+            write_envelope_line(&dir, &date, &serde_json::to_string(row).unwrap()).await;
+        }
+
+        let queried = HistoryQuery::new(dir.clone())
+            .query(HistoryFilter {
+                date: Some(now.date_naive()),
+                code: None,
+                kind: Some("WantedKind".into()),
+                limit: 0,
+                order: HistoryOrder::Asc,
+            })
+            .await
+            .expect("complete records with nonmatching filters are skipped");
+        assert_eq!(queried.len(), 3);
+        assert!(queried.iter().all(|entry| entry.kind == "WantedKind"));
+
+        let stats = HistoryQuery::new(dir.clone())
+            .push_success_rate(Some("WantedKind"), Window::Hours(1), Some("wanted-sink"))
+            .await
+            .expect("filtered rate statistics");
+        assert_eq!(stats.total, 1);
+        assert_eq!(stats.pushed, 1);
+        assert_eq!(stats.failed, 0);
+        tokio::fs::remove_dir_all(dir).await.unwrap();
+    }
+
     #[test]
     fn br130_envelope_validator_rejects_every_incomplete_record_shape() {
         let path = Path::new("TEST_CODE_history.jsonl");

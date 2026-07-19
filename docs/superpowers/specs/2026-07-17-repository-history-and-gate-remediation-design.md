@@ -777,3 +777,67 @@ Failure handling:
 - 回测提交 seam：多因子、Bollinger 和 RSI 的计算模块继续产生真实 summary/state/report；私有提交模块统一接收这些结果并执行报告、可空图表和强制交易/NAV 审计。生产 adapter 仍写现有 `reports/`，测试使用临时目录；报告或审计失败必须阻断，图表失败保持现有告警语义。
 - 状态模块：盘中监控、排除板块、概念/订单/持仓份额仓储、事件历史、账户组合校验和流水线补充上下文只通过现有确定性函数或临时 SQLite/文件系统执行。筛选/排序/限制继续引用已有 BR，不增加阈值或默认事实；任何坏时间、坏 JSON、坏金额、坏 hash 或审计链异常显式拒绝。
 - 旧模块与回滚：采用现有 RustDX、回测引擎、`DatabaseManager`、`HistoryStore`、`NotificationService` 与 test-only loopback；拒绝公共 mock provider、生产静态行情、覆盖率排除或阈值下调。整体回退 Task 36 seam 与测试；不得只留下测试 adapter 或恢复部分批次成功。
+
+## Addendum: Gate-D Task 37 核心编排闭环（2026-07-19）
+
+- 流水线：复用现有 `cfg(test)` 已校验 K 线与 resolved context，让 `AnalysisPipeline::run` 穿过真实结果汇总、三类回测及报告提交分支；测试关闭通知和深度模型，使用临时报告目录。生产获取、持仓跟踪、回测阈值和通知条件不变，失败仍保留显式日志/错误语义。
+- 产业链：外部搜索、模型和 HTTP 请求保留在真实 adapter；私有 resolved 模块只接收已完成的搜索结果、生成词结果或回环 HTTP 响应，统一执行查询上限、去重、分页终止、坏批次拒绝和 Markdown 组装。缓存补全必须覆盖全部代码后才提交，部分失败不得写成命中。
+- 汇总与状态：汇总通知先构造可审计的报告 artifact，再由生产 adapter 执行图表、报告落盘和真实通知；主线归属继续从真实 `chain_daily` 查询。盘中候选和排除板块只补确定性状态矩阵，不注册测试 provider、不伪造账户或报价。
+- 测试遗留：现有 ignored 实机 provider 测试改为同协议 loopback 执行，不删除测试或生产行来缩小分母。`--lib` 口径曾超过全局 80%，但该口径不包含 workspace 二进制，不能作为 Gate D 证据；必须以 CI 原命令生成的 workspace JSON 同时通过全局 80% 与 core 95% 为准。
+- 旧模块与回滚：采用 `AnalysisPipeline`、`NotificationService`、`SearchService`、产业链 fetchers、Eastmoney provider 及既有 test-only loopback；拒绝阈值下调、coverage exclude、静态行情、假发送或忽略失败。Task 37 整体独立回退。
+
+### Task 37b：提交适配器与失败状态矩阵
+
+- 汇总提交：日报内容仍由 `NotificationService` 生成，通知仍由真实 channel adapter 发送；文件提交函数接收显式目录，生产固定传入 `reports/`，测试只传临时目录。图表、日报和回测报告沿用原文件名，报告写失败继续阻断，通知来源失败继续记录且不得伪装成功。
+- 分析降级：AI adapter 失败只缺失 AI 段；已经成功取得的真实新闻证据必须继续进入标准分析报告，不能因可选模型失败被静默丢弃。AI 成功时新闻也只追加一次。
+- 数据 fallback：BaoStock 的真实盘后请求先完成，再把完整成功、空批或显式错误交给同一决策函数；只有非空成功批次可以短路，空批/错误必须执行现有四源真实 fallback。测试只传入已完成结果和惰性 future，不构造行情事实。
+- 决策状态：盘中低分、盘后非 Momentum、坏指标、空策略结果和五分钟失败 debounce 使用真实 SQLite 候选行或纯状态输入覆盖；排除缓存覆盖跨日重建和真实空映射。所有身份使用唯一 `TEST_CODE_`，且在报价、账户或下单边界之前终止。
+- 审计链：BR-086 继续使用真实 SQLite hash chain；补充长度、链接、hash 篡改及成功追加矩阵，任何异常都整批拒绝，不做隐式修复。测试连接仅为内存库，不读取或改变本人的账户数据库。
+- 模型提交：产业链渲染使用私有 `Live/Resolved` 证据适配器。生产入口只能构造 `Live`，继续调用真实搜索与模型；隔离测试用 `Resolved` 提交已经完成的主线新闻和盘后催化，再通过本地 OpenAI 兼容协议回环执行 deep/simple/overview 成功与显式失败分支。适配器不得生成、补齐或改写行情/持仓事实。
+- 遗留集成：RustDX/Tencent、IPO 日期和同步 manager 的 ignored 实机测试改为现有协议 parser、回环 HTTP 或已完成 future；测试名称和错误语义保留，不访问公网。搜索服务的环境相关早退测试改为直接验证 resolved 空批语义，避免开发机密钥改变覆盖结果。单股分析的名称/新闻输入允许测试显式选择“已完成证据”或“执行真实编排但关闭搜索”，后者只读取 `TEST_CODE_` 名称缓存。
+- 最终分支矩阵：剩余纯解析、校验和失败状态由 `cfg(test)` 私有子模块挂载仓库级独立回归源文件。它们仍由 `cargo llvm-cov --lib --all-features` 完整计入全局报告，但不把测试夹具混入核心生产文件；只允许执行既有生产函数，不允许新增 coverage exclude、阈值例外、静态行情或伪成功 adapter。任何涉及 HTTP 的用例必须使用本地协议回环，所有证券身份保持 `TEST_CODE_`。
+- 真实边界提交：Sina 等 HTTP provider 允许私有测试构造器替换完整 URL，但默认构造器永久保留生产 URL；行业缓存把 loader 与缓存提交拆开，以本地完整页验证“只缓存完整映射”。`position_adjustments` 把当前环境作为私有提交函数的显式输入，公开入口仍只传 `current_env()`；测试只向隔离 SQLite 和唯一 `TEST_CODE_` 写入，执行相同参数校验、日期、SQL 与回读流程，不修改环境变量、不接触真实持仓库。
+- 回滚：Task 37b 独立提交；整体回退显式目录 adapter、盘后 resolved helper 和状态矩阵测试，不得回退审计链、真实 provider 或错误传播。
+
+## Addendum: Gate-D Task 38 隔离进程 E2E 与 workspace 覆盖闭环（2026-07-19）
+
+- 基线：CI 原命令 `cargo llvm-cov --workspace --all-features` 的实测结果为全局 73,184/99,234（73.75%）、核心 32,603/34,195（95.34%）。核心已过线，但 monitor 和工具二进制仍属于全局生产分母，`--lib` 的 81.20% 不得替代 workspace 结果。
+- 选定路径：复用既有 `monitor --test --e2e` 真实二进制入口、数据库迁移、调度器和模板，不复制一套测试编排。进程测试使用全新临时目录、显式隔离 `DATABASE_PATH`、`STOCK_ENV_MODE=test`、`TEST_CODE_` 身份并移除全部通知凭据；`--test` 在初始化任何 sink 前强制 dry-run，禁止真实投递、真实账户读取或订单。
+- 测试账户边界：全模板 E2E 需要当日报告账本才能越过 BR-103 stale gate。seed 只可在 `--test --e2e` 和非生产数据库下写入一条明确的测试 ledger；它不是 live-account 证据，也不得写入 `real_account_snapshot`。生产 `--review` 继续要求真实当日账户/ledger，普通 `--test --review` 缺失时仍以 2 fail-closed。
+- 完成语义：E2E 入口不得在内部流程失败后仍以 0 退出。seed、复盘与本地模板批次失败必须传播到 `main` 并返回非零；进程测试断言成功退出、完成标记、隔离数据库存在且项目生产路径未创建。`IsolatedAll` 只消费 TEST_CODE/隔离 SQLite 证据；需要实时市场、公告、隔夜行情或真实代码报价的模板必须显式记录 `skipped(external source not exercised)`，不得把外部请求偶然成功算作隔离 E2E 通过。纯 renderer/dispatcher 契约继续由聚焦测试覆盖。
+- 备选与拒绝：逐个私有函数补数千行单测只作为剩余差额方案；修改 coverage 脚本排除 `src/bin`、降低阈值、删除分母或把生产错误改成成功均拒绝。回滚 Task 38 时整体回退隔离 seed、错误传播和进程测试；不得回退 BR-051/BR-103 的生产 fail-closed 门禁。
+
+## Addendum: Gate-D Task 39 全局分母闭环（2026-07-19）
+
+- Task 38 后的 CI 同口径基线为全局 74,007/99,288（74.54%）、核心 32,604/34,195（95.35%）。核心门已通过；全局仍缺约 5,424 个有效执行行，继续以 workspace JSON 为唯一发布证据。
+- 执行顺序：先通过已有二进制入口和隔离临时目录执行工具/CLI 的参数、成功提交与显式失败路径；再按未覆盖量覆盖 opportunity、search、notification、market/review 的公开领域边界；最后回到 monitor 私有编排，仅在真实 adapter 前提取可验证的 resolved-input seam。每个测试必须断言结果、落盘或错误，不允许只调用不验证。
+- 数据边界：所有数据库和文件写入均使用临时目录与 `TEST_CODE_`；HTTP 只允许同协议 loopback；通知凭据和模型提供者全部移除。测试可构造协议夹具或已解析领域值，但生产构造器永久绑定真实 adapter，源失败继续显式返回错误。
+- 禁止项：不新增 coverage 排除、不下调阈值、不删除仍可达的生产功能、不把缺失字段补 0/空串、不让测试模式读取真实账户。Task 39 作为独立提交回滚；若测试暴露生产 bug，则先更新本设计/业务规则，再做最小修复。
+
+## Addendum: Gate-D Task 40 隔离模板全流程与本地标识清理（2026-07-19）
+
+- 根因：旧 v12 手工外发测试把个人机器路径和消息目标写入源码，并以环境变量早退，导致完整模板装配长期不进入 CI；它已被 `monitor --test --e2e` 隔离进程入口取代，继续保留隐式个人默认值既泄露本地标识，也不能形成发布证据。
+- 执行边界：完整 20 模板测试默认持有现有串行锁和 `TestEnvGuard`，只使用共享测试 SQLite、`TEST_CODE_` 夹具及 `cfg(test)` dry-run 通道，执行生产同一 renderer/governor/审计路径但不外发。单条真实 sink 冒烟仍为显式 opt-in，且 `MAGICLAW_HOME`、`MAGICLAW_BIN`、`FEISHU_TO` 必须全部由操作者提供；源码与文档不得保存个人绝对路径或会话 ID。
+- 完整性与失败：隔离装配不得读取真实账户数据库、不得把空持仓伪装成生产事实；测试夹具必须带 `TEST_CODE_`，任何渲染、审计或 governor 失败均使测试失败。生产来源失败与生产投递语义不变，不能以 test dry-run 作为真实投递证据。
+- 旧模块与回滚：采用现有 `E2E_MUTEX`、`TestEnvGuard`、`DatabaseManager`、`push_governor(_v3)` 和 Task 38 进程 E2E，不新增第二套模板。整体回退 Task 40；不得恢复源码中的个人路径/目标或默认 CI 早退。
+
+## Addendum: Gate-D Task 41 dry-run 审计报告完整性（2026-07-19）
+
+- 根因：既有报告读取器对坏 JSON 静默 `continue`，并用空字符串/`false` 填充缺失字段，会低报投递尝试和失败；来源判断又先匹配 `P-01`，导致 `P-01-dry` 被计入真实东方财富健康度。两者均不能作为 Gate D 审计证据。
+- 数据流：生产入口仍读取 `data/dispatcher_log/*.jsonl` 并写同一报告文件；私有 resolved-directory seam 只允许测试传入临时目录。每个非空 JSONL 行必须是对象且具有非空 `kind` 和布尔 `success`，可选 `error` 存在时必须是字符串；任一损坏行使整份报告失败，不发布部分统计。
+- 分类与确定性：按 BR-132 先识别 `dry` 隔离记录，再匹配生产模板前缀；dry-run 计入尝试/成功率和独立健康源，但不进入真实主题 Top5。统计按计数降序、名称升序稳定排序，避免 HashMap 顺序造成审计产物漂移。
+- 测试与回滚：测试只写临时 JSONL，不读取真实 dispatcher 日志、不外发、不接触账户库。整体回退 Task 41 seam、严格校验和测试；不得只回退错误传播而保留会低报分母的容错读取。
+
+## Addendum: Gate-D Task 42 Jin10 来源完整批次（2026-07-19）
+
+- 根因：快讯搜索将 transport/解析错误 `unwrap_or_default` 成空结果，财经日历并发两路各自只在 `Ok` 时追加，日历正文坏 JSON/坏根结构又返回空数组；来源不可用因此会被误报为“无相关新闻/无事件”，违反既有 BR-078。
+- 数据流：生产 URL、请求头、超时和并发结构不变。HTTP 先读取完整正文，再交给模块私有严格解析器；生产传当前本地时间用于 6 小时窗口，测试传固定时间与本地协议 JSON。解析器不获取网络、不产生行情、账户、通知或订单事实。
+- 完整性：按 BR-133 校验 API 状态、批次数组及逐行业务字段；广告类型可明确排除，其他坏行不允许跳过。economics/event 任一路失败使该周乃至本次日历失败；合法空数组仍表示来源明确返回空。搜索错误保留原始来源原因，不能改写为无匹配。
+- 测试与回滚：测试只调用同一严格解析器，不访问公网。整体回退 Task 42 parser seam、传播修复和测试；不得恢复 `unwrap_or_default`、单路日历成功或坏正文空批语义。
+
+## Addendum: Task 43 v16.x 风险事实与证据收口（2026-07-19）
+
+- 根因：v16.x 生产纸面交易的盘中、盘后和四铁律退出路径仍把 `AccountMode/DataMode` 写死为 `Normal/Full`；持仓决策台在行情缺失时回退成本价/0%，纸面持仓聚合 SQL 也可用 0 掩盖坏成交。另有一个从未进入 Rust 模块树的 E2E 草稿，不能作为验收证据。
+- 修正：以 BR-134 的强类型 `PaperRiskContext` 从最新真实 banner 单向传入三个纸面入口；缺 banner 拒绝。决策行情和 paper Filled 批次严格完整校验，持仓按 `(ts,id)` FIFO 重建；真实行情的涨跌停上下界必须生成对应 PaperSignal 标志，禁止写死 false。全部退出决定均被尝试，成功 debounce 只在整批成功后推进。TradingBus 仅从真实新增 paper 行构造事件，NotFilled/Invalidated/重复行不得发布 `ExecutionFilled`，成交价必须取已持久化结果。删除未编译且含恒真/跳过错误的测试草稿，改以实际运行的模块与隔离进程测试为证。
+- 旧模块关系：采用 `risk::action_gate`、`monitor::data_mode`、`paper_trade::simulate`、不可变订单审计与真实腾讯行情 seam；拒绝历史 Mock provider、成本价/0 fallback 和第二套纸面账本。
+- 测试与回滚：行为测试覆盖 ReduceOnly/Frozen/Unsafe、缺行情、坏成交、超卖和成功/失败 debounce。整体回退 Task 43；不得只恢复默认风险模式或数值回退。

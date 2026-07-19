@@ -226,6 +226,14 @@ pub async fn generate_report() -> anyhow::Result<()> {
 
 /// 收集所有统计 (读 dispatcher_log/*.jsonl)
 async fn collect_report() -> anyhow::Result<DryRunReport> {
+    collect_report_from(Path::new("data/dispatcher_log")).await
+}
+
+/// 从已解析的日志目录收集统计。
+///
+/// 生产入口固定传入 `data/dispatcher_log`；显式目录参数让测试可以在隔离目录
+/// 执行同一 JSONL 校验与聚合逻辑，而不读取真实投递审计。
+async fn collect_report_from(log_dir: &Path) -> anyhow::Result<DryRunReport> {
     let mut total_attempts = 0u64;
     let mut total_success = 0u64;
     let mut by_kind_map: HashMap<String, KindStat> = HashMap::new();
@@ -233,7 +241,6 @@ async fn collect_report() -> anyhow::Result<DryRunReport> {
     let mut by_topic_map: HashMap<String, u64> = HashMap::new();
 
     // 读所有 dispatcher_log 文件
-    let log_dir = Path::new("data/dispatcher_log");
     if log_dir.is_dir() {
         let mut entries = tokio::fs::read_dir(log_dir).await?;
         while let Some(entry) = entries.next_entry().await? {
@@ -242,51 +249,89 @@ async fn collect_report() -> anyhow::Result<DryRunReport> {
                 continue;
             }
             let content = tokio::fs::read_to_string(&path).await?;
-            for line in content.lines() {
-                if let Ok(record) = serde_json::from_str::<serde_json::Value>(line) {
-                    let kind = record
-                        .get("kind")
-                        .and_then(|k| k.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let success = record
-                        .get("success")
-                        .and_then(|s| s.as_bool())
-                        .unwrap_or(false);
-                    let error = record.get("error").and_then(|e| e.as_str()).unwrap_or("");
+            for (line_index, line) in content.lines().enumerate() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let record: serde_json::Value = serde_json::from_str(line).map_err(|error| {
+                    anyhow::anyhow!(
+                        "dispatcher 日志 {} 第 {} 行不是合法 JSON: {}",
+                        path.display(),
+                        line_index + 1,
+                        error
+                    )
+                })?;
+                let object = record.as_object().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "dispatcher 日志 {} 第 {} 行不是对象",
+                        path.display(),
+                        line_index + 1
+                    )
+                })?;
+                let kind = object
+                    .get("kind")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "dispatcher 日志 {} 第 {} 行缺少非空 kind",
+                            path.display(),
+                            line_index + 1
+                        )
+                    })?
+                    .to_string();
+                let success = object
+                    .get("success")
+                    .and_then(|value| value.as_bool())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "dispatcher 日志 {} 第 {} 行缺少布尔 success",
+                            path.display(),
+                            line_index + 1
+                        )
+                    })?;
+                let error = match object.get("error") {
+                    None => "",
+                    Some(value) => value.as_str().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "dispatcher 日志 {} 第 {} 行 error 不是字符串",
+                            path.display(),
+                            line_index + 1
+                        )
+                    })?,
+                };
 
-                    total_attempts += 1;
-                    if success {
-                        total_success += 1;
-                    }
+                total_attempts += 1;
+                if success {
+                    total_success += 1;
+                }
 
-                    let stat = by_kind_map.entry(kind.clone()).or_insert(KindStat {
-                        kind: kind.clone(),
-                        total: 0,
-                        success: 0,
-                        failed: 0,
+                let stat = by_kind_map.entry(kind.clone()).or_insert(KindStat {
+                    kind: kind.clone(),
+                    total: 0,
+                    success: 0,
+                    failed: 0,
+                });
+                stat.total += 1;
+                if success {
+                    stat.success += 1;
+                } else {
+                    stat.failed += 1;
+                }
+
+                // 数据源 health: 从 kind 前缀推断 (e.g. "P-01-dry" → dryrun, "I-02" → news)
+                if let Some(source) = source_from_kind(&kind) {
+                    let s = by_source_map.entry(source.clone()).or_insert(SourceStat {
+                        source: source.clone(),
+                        attempts: 0,
+                        empty: 0,
+                        errors: 0,
                     });
-                    stat.total += 1;
-                    if success {
-                        stat.success += 1;
-                    } else {
-                        stat.failed += 1;
-                    }
-
-                    // 数据源 health: 从 kind 前缀推断 (e.g. "P-01-dry" → dryrun, "I-02" → news)
-                    if let Some(source) = source_from_kind(&kind) {
-                        let s = by_source_map.entry(source.clone()).or_insert(SourceStat {
-                            source: source.clone(),
-                            attempts: 0,
-                            empty: 0,
-                            errors: 0,
-                        });
-                        s.attempts += 1;
-                        if error.contains("空") || error.contains("无数据") {
-                            s.empty += 1;
-                        } else if !success && !error.is_empty() {
-                            s.errors += 1;
-                        }
+                    s.attempts += 1;
+                    if error.contains("空") || error.contains("无数据") {
+                        s.empty += 1;
+                    } else if !success && !error.is_empty() {
+                        s.errors += 1;
                     }
                 }
             }
@@ -307,14 +352,29 @@ async fn collect_report() -> anyhow::Result<DryRunReport> {
         .into_iter()
         .map(|(t, c)| TopicStat { topic: t, count: c })
         .collect();
-    top_topics.sort_by_key(|item| std::cmp::Reverse(item.count));
+    top_topics.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.topic.cmp(&right.topic))
+    });
     top_topics.truncate(5);
 
     let mut by_kind: Vec<KindStat> = by_kind_map.into_values().collect();
-    by_kind.sort_by_key(|item| std::cmp::Reverse(item.total));
+    by_kind.sort_by(|left, right| {
+        right
+            .total
+            .cmp(&left.total)
+            .then_with(|| left.kind.cmp(&right.kind))
+    });
 
     let mut source_health: Vec<SourceStat> = by_source_map.into_values().collect();
-    source_health.sort_by_key(|item| std::cmp::Reverse(item.attempts));
+    source_health.sort_by(|left, right| {
+        right
+            .attempts
+            .cmp(&left.attempts)
+            .then_with(|| left.source.cmp(&right.source))
+    });
 
     let success_rate = if total_attempts > 0 {
         total_success as f64 / total_attempts as f64
@@ -335,12 +395,12 @@ async fn collect_report() -> anyhow::Result<DryRunReport> {
 
 /// 从 kind 推断数据源
 fn source_from_kind(kind: &str) -> Option<String> {
-    if kind.starts_with("P-01") || kind.contains("盘前") {
+    if kind.contains("dry") {
+        Some("dryrun_test".to_string())
+    } else if kind.starts_with("P-01") || kind.contains("盘前") {
         Some("东方财富".to_string())
     } else if kind.starts_with("I-01") {
         Some("sector_monitor".to_string())
-    } else if kind.contains("dry") {
-        Some("dryrun_test".to_string())
     } else if kind.starts_with("I-") || kind.starts_with("R-") {
         Some("search_service".to_string())
     } else {
@@ -352,6 +412,32 @@ fn source_from_kind(kind: &str) -> Option<String> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    struct TestDir(std::path::PathBuf);
+
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "stock-analysis-dryrun-{label}-{}-{id}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     /// v14.1 review #12: is_outcome_all_null 识别待 backfill 文件
     #[test]
@@ -416,5 +502,89 @@ mod tests {
         f.sync_all().unwrap();
         assert!(is_outcome_all_null(&path), "部分 null 也应 backfill");
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn collect_report_aggregates_strict_jsonl_in_an_isolated_directory() {
+        let dir = TestDir::new("aggregate");
+        std::fs::write(
+            dir.path().join("2026-07-18.jsonl"),
+            concat!(
+                "{\"kind\":\"I-01-sector\",\"success\":true}\n",
+                "{\"kind\":\"I-01-sector\",\"success\":false,\"error\":\"无数据\"}\n",
+                "{\"kind\":\"P-01-dry\",\"success\":true}\n",
+                "{\"kind\":\"R-02-review\",\"success\":false,\"error\":\"timeout\"}\n",
+                "\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("ignored.txt"), "not jsonl").unwrap();
+
+        let report = collect_report_from(dir.path()).await.unwrap();
+        assert_eq!(report.total_attempts, 4);
+        assert_eq!(report.success_rate, 0.5);
+        assert_eq!(report.by_kind[0].kind, "I-01-sector");
+        assert_eq!(report.by_kind[0].total, 2);
+        assert_eq!(report.by_kind[0].success, 1);
+        assert_eq!(report.by_kind[0].failed, 1);
+        assert!(report
+            .top_topics
+            .iter()
+            .all(|item| !item.topic.contains("dry")));
+
+        let dry = report
+            .source_health
+            .iter()
+            .find(|item| item.source == "dryrun_test")
+            .unwrap();
+        assert_eq!(dry.attempts, 1);
+        assert!(!report
+            .source_health
+            .iter()
+            .any(|item| item.source == "东方财富"));
+        let sector = report
+            .source_health
+            .iter()
+            .find(|item| item.source == "sector_monitor")
+            .unwrap();
+        assert_eq!(sector.empty, 1);
+        let search = report
+            .source_health
+            .iter()
+            .find(|item| item.source == "search_service")
+            .unwrap();
+        assert_eq!(search.errors, 1);
+    }
+
+    #[tokio::test]
+    async fn collect_report_rejects_corrupt_or_incomplete_audit_rows() {
+        let cases = [
+            ("{bad json}", "不是合法 JSON"),
+            ("[]", "不是对象"),
+            (r#"{"success":true}"#, "非空 kind"),
+            (r#"{"kind":"I-01"}"#, "布尔 success"),
+            (
+                r#"{"kind":"I-01","success":false,"error":7}"#,
+                "error 不是字符串",
+            ),
+        ];
+
+        for (index, (line, expected)) in cases.into_iter().enumerate() {
+            let dir = TestDir::new(&format!("invalid-{index}"));
+            std::fs::write(dir.path().join(format!("case-{index}.jsonl")), line).unwrap();
+            let error = collect_report_from(dir.path()).await.unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn source_classification_prioritizes_dryrun_and_covers_all_prefixes() {
+        assert_eq!(source_from_kind("P-01-dry").as_deref(), Some("dryrun_test"));
+        assert_eq!(source_from_kind("P-01").as_deref(), Some("东方财富"));
+        assert_eq!(source_from_kind("盘前").as_deref(), Some("东方财富"));
+        assert_eq!(source_from_kind("I-01").as_deref(), Some("sector_monitor"));
+        assert_eq!(source_from_kind("I-02").as_deref(), Some("search_service"));
+        assert_eq!(source_from_kind("R-01").as_deref(), Some("search_service"));
+        assert_eq!(source_from_kind("X-01"), None);
     }
 }

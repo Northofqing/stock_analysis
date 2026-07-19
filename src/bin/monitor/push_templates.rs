@@ -165,6 +165,24 @@ impl BannerCtx {
     }
 }
 
+/// BR-134 boundary: convert the monitor's latest evaluated banner into the
+/// library risk facts used by every paper-trading path.
+pub(crate) fn paper_risk_context_from_banner(
+    banner: &BannerCtx,
+) -> stock_analysis::trading::paper_trade::PaperRiskContext {
+    let account_mode = match banner.account_mode {
+        AccountMode::Normal => stock_analysis::risk::action_gate::AccountMode::Normal,
+        AccountMode::ReduceOnly => stock_analysis::risk::action_gate::AccountMode::ReduceOnly,
+        AccountMode::Frozen => stock_analysis::risk::action_gate::AccountMode::Frozen,
+    };
+    let data_mode = match banner.data_mode {
+        DataMode::Full => stock_analysis::monitor::data_mode::DataMode::Full,
+        DataMode::Degraded => stock_analysis::monitor::data_mode::DataMode::Degraded,
+        DataMode::Unsafe => stock_analysis::monitor::data_mode::DataMode::Unsafe,
+    };
+    stock_analysis::trading::paper_trade::PaperRiskContext::new(account_mode, data_mode)
+}
+
 // ============================================================================
 // §14.1 实盘时段 — T-01 ~ T-12
 // ============================================================================
@@ -3451,8 +3469,7 @@ async fn submit_virtual_buy_from_d01(
         limit_down_price: Some(quote.limit_down_price),
         secondary_confirmed: false,
         quote_observed_at: quote.observed_at,
-        account_mode: banner.account_mode.label().to_string(),
-        data_mode: banner.data_mode.label().to_string(),
+        risk_context: paper_risk_context_from_banner(banner),
     };
 
     // v16.3 Commit 1: simulate 签名加 4 参数 (quote_price 真 + cash/total/pos_pct 真 portfolio 读)
@@ -5279,6 +5296,8 @@ pub async fn dispatch_post_session_review(date: &str, hhmm: &str, banner: &Banne
 pub enum TestScope {
     /// 全部模板 (盘中 + 盘后)
     All,
+    /// 全部可由本地 TEST_CODE/隔离数据库证据驱动的模板；不访问外部实时源。
+    IsolatedAll,
     /// 仅盘后复盘模板
     Review,
 }
@@ -5306,50 +5325,101 @@ pub async fn dispatch_all_for_test(hhmm: &str, date: &str, banner: &BannerCtx, s
             }
         }};
     }
+    macro_rules! skip_external {
+        ($name:expr) => {{
+            skipped += 1;
+            log::info!(
+                "[--test][BR-051] {} → skipped (external source not exercised in isolated E2E)",
+                $name
+            );
+        }};
+    }
+    let isolated = matches!(scope, TestScope::IsolatedAll);
 
     // ---- 盘后复盘 (Review + All) ----
-    run_disp!(
-        "R-02今日盘面",
-        dispatch_r02_review_market_real(date, banner)
-    );
-    run_disp!(
-        "R-03涨停产业链",
-        dispatch_r03_industry_chain_real(date, banner)
-    );
+    if isolated {
+        skip_external!("R-02今日盘面");
+    } else {
+        run_disp!(
+            "R-02今日盘面",
+            dispatch_r02_review_market_real(date, banner)
+        );
+    }
+    if isolated {
+        skip_external!("R-03涨停产业链");
+    } else {
+        run_disp!(
+            "R-03涨停产业链",
+            dispatch_r03_industry_chain_real(date, banner)
+        );
+    }
     run_disp!("R-04龙虎榜", dispatch_r04_lhb_real(date, banner));
     run_disp!(
         "R-05信号复盘",
         dispatch_r05_signal_review_real(date, banner)
     );
     run_disp!("R-06失败归因", dispatch_r06_failure_real(date, banner));
-    run_disp!(
-        "R-08明日事件",
-        dispatch_r08_event_calendar_real(date, banner)
-    );
+    if isolated {
+        skip_external!("R-08明日事件");
+    } else {
+        run_disp!(
+            "R-08明日事件",
+            dispatch_r08_event_calendar_real(date, banner)
+        );
+    }
     run_disp!("催化复盘", dispatch_catalyst_review_daily(date));
     run_disp!("模拟复盘", dispatch_paper_review_daily(date));
-    run_disp!(
-        "盘后资金买入",
-        dispatch_post_close_fund_inflow_buy(date, banner)
-    );
+    if isolated {
+        skip_external!("盘后资金买入");
+    } else {
+        run_disp!(
+            "盘后资金买入",
+            dispatch_post_close_fund_inflow_buy(date, banner)
+        );
+    }
     // 事件触发型 (无真事件, 不造样本)
     log::info!("[--test] === 事件触发型 (broker成交/大宗/ST/T0/挂单) 无真事件, 跳过 ===");
 
-    if matches!(scope, TestScope::All) {
+    if matches!(scope, TestScope::All | TestScope::IsolatedAll) {
         // ---- 盘中 (All only) ----
-        run_disp!("盘面盘中", dispatch_intraday_market_daily(hhmm, banner));
-        run_disp!("新闻催化", dispatch_news_catalyst_daily(hhmm, banner));
-        run_disp!(
-            "涨停扩散",
-            dispatch_industry_chain_intraday_daily(hhmm, banner)
-        );
-        run_disp!("新闻驱动个股", dispatch_news_to_idea_daily(hhmm, banner));
-        run_disp!("持仓建议", dispatch_holding_plan_daily(hhmm, banner));
-        run_disp!("候选触发", dispatch_candidate_triggered_daily(hhmm, banner));
-        run_disp!("竞价量能P-02", dispatch_auction_volume_daily(hhmm, banner));
-        run_disp!("领涨板块Top", dispatch_sector_top_daily(hhmm));
-        run_disp!("板块异动", dispatch_sector_anomaly_daily(hhmm, ""));
-        run_disp!("主力净流入Top", dispatch_fund_inflow_top_daily(hhmm));
+        if isolated {
+            skip_external!("盘面盘中");
+        } else {
+            run_disp!("盘面盘中", dispatch_intraday_market_daily(hhmm, banner));
+        }
+        if isolated {
+            skip_external!("新闻催化");
+            skip_external!("涨停扩散");
+            skip_external!("新闻驱动个股");
+            skip_external!("持仓建议");
+            skip_external!("候选触发");
+        } else {
+            run_disp!("新闻催化", dispatch_news_catalyst_daily(hhmm, banner));
+            run_disp!(
+                "涨停扩散",
+                dispatch_industry_chain_intraday_daily(hhmm, banner)
+            );
+            run_disp!("新闻驱动个股", dispatch_news_to_idea_daily(hhmm, banner));
+            run_disp!("持仓建议", dispatch_holding_plan_daily(hhmm, banner));
+            run_disp!("候选触发", dispatch_candidate_triggered_daily(hhmm, banner));
+        }
+        if isolated {
+            skip_external!("竞价量能P-02");
+            skip_external!("领涨板块Top");
+        } else {
+            run_disp!("竞价量能P-02", dispatch_auction_volume_daily(hhmm, banner));
+            run_disp!("领涨板块Top", dispatch_sector_top_daily(hhmm));
+        }
+        if isolated {
+            skip_external!("板块异动");
+        } else {
+            run_disp!("板块异动", dispatch_sector_anomaly_daily(hhmm, ""));
+        }
+        if isolated {
+            skip_external!("主力净流入Top");
+        } else {
+            run_disp!("主力净流入Top", dispatch_fund_inflow_top_daily(hhmm));
+        }
         run_disp!("盘前新闻热点", dispatch_preopen_news_hot_daily());
         run_disp!("模拟交易", dispatch_paper_trade_daily(hhmm));
         run_disp!("虚拟盯盘", dispatch_virtual_watch_daily(hhmm, &[], 0));
@@ -7288,8 +7358,7 @@ pub async fn dispatch_post_close_fund_inflow_buy(date: &str, banner: &BannerCtx)
             limit_down_price: Some(execution_quote.limit_down_price),
             secondary_confirmed: false,
             quote_observed_at: execution_quote.observed_at,
-            account_mode: banner.account_mode.label().to_string(),
-            data_mode: banner.data_mode.label().to_string(),
+            risk_context: paper_risk_context_from_banner(banner),
         };
         // v16.3 Commit 1: simulate 签名加 4 参数 (quote_price 真 + cash/total/pos_pct 真 portfolio 读)
         let (cash, total, pos_pct) = match paper_portfolio_state(&s.code, execution_quote.price) {
@@ -7457,6 +7526,24 @@ mod tests {
     fn banner_normal_full_format() {
         let b = banner_normal();
         assert_eq!(b.render(), "[🟢 Normal | 仓位5成 | 日盈亏+0.3% | 数据Full]");
+    }
+
+    #[test]
+    fn br134_banner_conversion_preserves_frozen_and_unsafe_modes() {
+        let banner = BannerCtx {
+            account_mode: AccountMode::Frozen,
+            data_mode: DataMode::Unsafe,
+            ..BannerCtx::test_default()
+        };
+        let context = paper_risk_context_from_banner(&banner);
+        assert_eq!(
+            context.account_mode,
+            stock_analysis::risk::action_gate::AccountMode::Frozen
+        );
+        assert_eq!(
+            context.data_mode,
+            stock_analysis::monitor::data_mode::DataMode::Unsafe
+        );
     }
 
     #[test]
@@ -10884,9 +10971,8 @@ mod tests {
     }
 
     // ===============================================================
-    // =========== 20 模板真实数据 + 实际推送 E2E 测试 ===============
-    // 触发条件: env V12_E2E_REAL_PUSH=1 (opt-in, 避免 CI 噪音)
-    // 所有消息带 [v12-E2E-T0X] 前缀, 便于飞书群识别 + 清理
+    // =========== 20 模板隔离装配 + 可选真实 sink 冒烟 ===============
+    // 完整模板测试默认走 cfg(test) dry-run；真实 sink 冒烟必须显式 opt-in。
     // ===============================================================
 
     /// 单条推送冒烟: 验证 magiclaw daemon 可达 + PUSH_VERBOSE=true
@@ -10896,6 +10982,18 @@ mod tests {
         if std::env::var("V12_E2E_REAL_PUSH").ok().as_deref() != Some("1") {
             return;
         }
+        let Ok(magiclaw_home) = std::env::var("MAGICLAW_HOME") else {
+            eprintln!("[v12-E2E-smoke] 跳过: 缺 MAGICLAW_HOME");
+            return;
+        };
+        let Ok(magiclaw_bin) = std::env::var("MAGICLAW_BIN") else {
+            eprintln!("[v12-E2E-smoke] 跳过: 缺 MAGICLAW_BIN");
+            return;
+        };
+        let Ok(feishu_to) = std::env::var("FEISHU_TO") else {
+            eprintln!("[v12-E2E-smoke] 跳过: 缺 FEISHU_TO");
+            return;
+        };
         // 初始化 env_logger (test env 默认不 init, log macros 静默)
         let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
             .format(|buf, record| {
@@ -10911,10 +11009,6 @@ mod tests {
             .try_init();
         std::env::set_var("PUSH_VERBOSE", "true");
         std::env::remove_var("V10_DRY_RUN_PUSH");
-        // 显式设 MAGICLAW_HOME, 让 push_via_magiclaw_cli 找对 .env
-        if std::env::var("MAGICLAW_HOME").is_err() {
-            std::env::set_var("MAGICLAW_HOME", "/Users/zhangzhen/Desktop/magiclaw");
-        }
         // 显式设 DATABASE_PATH / MAGICLAW_DB_PATH (test env 默认无, push_via_magiclaw_cli 需)
         if std::env::var("DATABASE_PATH").is_err() {
             std::env::set_var("DATABASE_PATH", "./data/stock_analysis.db");
@@ -10935,18 +11029,17 @@ mod tests {
             std::env::var("DATABASE_PATH").ok(),
         );
         // 直接调 magiclaw binary 验证可执行 + auth 可达
-        let magiclaw_bin = "/Users/zhangzhen/Desktop/magiclaw/target/release/magiclaw";
-        let out = std::process::Command::new(magiclaw_bin)
+        let out = std::process::Command::new(&magiclaw_bin)
             .args([
                 "send",
                 "--channel",
                 "feishu",
                 "--to",
-                "oc_4bca5d870fd5ff3352795a674194d5b0",
+                &feishu_to,
                 "--message",
                 text,
             ])
-            .current_dir("/Users/zhangzhen/Desktop/magiclaw")
+            .current_dir(&magiclaw_home)
             .output();
         match out {
             Ok(o) => {
@@ -10969,21 +11062,20 @@ mod tests {
         let ok = crate::notify::push_governor(text, crate::notify::PushKind::AccountMode).await;
         eprintln!("[v12-E2E-smoke] push_governor result: {}", ok);
         // 调试: 直接调 push_via_magiclaw_cli 模拟
-        let magiclaw_bin2 = "/Users/zhangzhen/Desktop/magiclaw/target/release/magiclaw";
-        let out2 = std::process::Command::new(magiclaw_bin2)
+        let out2 = std::process::Command::new(&magiclaw_bin)
             .args([
                 "send",
                 "--channel",
                 "feishu",
                 "--to",
-                "oc_4bca5d870fd5ff3352795a674194d5b0",
+                &feishu_to,
                 "--message",
                 text,
             ])
-            .current_dir("/Users/zhangzhen/Desktop/magiclaw")
+            .current_dir(&magiclaw_home)
             .env("DATABASE_PATH", "./data/stock_analysis.db")
             .env("MAGICLAW_DB_PATH", "./data/stock_analysis.db")
-            .env("FEISHU_TO", "oc_4bca5d870fd5ff3352795a674194d5b0")
+            .env("FEISHU_TO", &feishu_to)
             .output();
         match out2 {
             Ok(o) => eprintln!(
@@ -10999,29 +11091,19 @@ mod tests {
         assert!(ok, "smoke test 推送应成功");
     }
 
-    /// v12 E2E 真实推送: 装配真实数据 (从 DB ledger/positions/trades) + 实际飞书推送.
-    /// 运行: `V12_E2E_REAL_PUSH=1 cargo test --bin monitor push_templates::tests::e2e_real_all_20`
+    /// v12 E2E 隔离装配: 从测试 DB ledger/positions/trades 走完整模板与 dry-run governor.
     #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
     async fn e2e_real_all_20_templates() {
-        // 0. 跳过条件: 必须显式 opt-in
-        if std::env::var("V12_E2E_REAL_PUSH").ok().as_deref() != Some("1") {
-            eprintln!(
-                "[v12-E2E] 跳过: 需 V12_E2E_REAL_PUSH=1 启用. \
-                 命令: V12_E2E_REAL_PUSH=1 cargo test --bin monitor push_templates::tests::e2e_real_all_20"
-            );
-            return;
-        }
+        let _e2e_guard = E2E_MUTEX.lock().await;
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
+        *crate::LATEST_BANNER
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(BannerCtx::test_default());
 
-        // 强制 PUSH_VERBOSE=true 让被 deprecated 的 PushKind 也能推
-        // (v12-P0-4 设计: deprecated 默认降级 log, 但 E2E 验证需真推)
-        std::env::set_var("PUSH_VERBOSE", "true");
-        // 显式设 MAGICLAW_HOME, 让 push_via_magiclaw_cli 找对 .env (test env cwd 与 cargo run 不同)
-        if std::env::var("MAGICLAW_HOME").is_err() {
-            std::env::set_var("MAGICLAW_HOME", "/Users/zhangzhen/Desktop/magiclaw");
-        }
-
-        // 1. Setup: init DB + 装配真实数据
+        // 1. Setup: init 隔离 DB + 装配 TEST_CODE 数据
         init_test_db();
+        reset_daily_budget_for_test();
         let hhmm = chrono::Local::now().format("%H:%M").to_string();
         let today_str = chrono::Local::now().format("%Y-%m-%d").to_string();
 
@@ -11411,10 +11493,9 @@ mod tests {
 
         // ===== T-06 不建议做T =====
         {
-            let (name, code) = first_pos
-                .as_ref()
-                .map(|p| (p.name.as_str(), p.code.as_str()))
-                .unwrap_or(("测试标的", "TEST_CODE_000001"));
+            // T-05/T-06 共用 PushKind；使用独立 TEST_CODE 验证两条完整投递，
+            // 避免正确的 per-ticket 冷却把第二条判为 Deduped。
+            let (name, code) = ("测试标的B", "TEST_CODE_000002");
             let params = T0ForbidParams {
                 name,
                 code,
@@ -11482,17 +11563,18 @@ mod tests {
 
         // ===== T-08 候选失效 =====
         {
-            let text = render_candidate_invalidated(
+            // 走生产编排入口，验证 CandidateInvalidated 的票级治理与投递链路。
+            // PID 只用于隔离不同测试进程的冷却身份，且 TEST_CODE 前缀确保
+            // 测试标的永远不会被误认为真实证券代码。
+            let code = format!("TEST_CODE_T08_{}", std::process::id());
+            let ok = push_candidate_invalidated(
+                &code,
                 &hhmm,
                 "AI算力候选",
-                "TEST_CODE_688001",
                 "Watch",
                 "触发失败: 未触达买入区",
-            );
-            let banner_text = format!("[v12-E2E-T08] {}", text);
-            let ok =
-                crate::notify::push_governor(&banner_text, crate::notify::PushKind::CandidateBoard)
-                    .await;
+            )
+            .await;
             if ok {
                 success_count += 1;
             } else {
