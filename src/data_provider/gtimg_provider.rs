@@ -175,6 +175,23 @@ impl GtimgProvider {
         code: &str,
         days: usize,
     ) -> Result<Vec<KlineData>> {
+        Self::fetch_kline_data_from_bases(
+            client,
+            code,
+            days,
+            "https://web.ifzq.gtimg.cn",
+            "http://qt.gtimg.cn",
+        )
+        .await
+    }
+
+    async fn fetch_kline_data_from_bases(
+        client: &reqwest::Client,
+        code: &str,
+        days: usize,
+        kline_base: &str,
+        quote_base: &str,
+    ) -> Result<Vec<KlineData>> {
         let (normalized_code, market_code) = Self::normalize_for_tencent(code)
             .ok_or_else(|| anyhow!("无效股票代码格式: {}", code))?;
 
@@ -182,8 +199,10 @@ impl GtimgProvider {
         // ktype: day(日线), week(周线), month(月线)
         // 优先 HTTPS，避免部分网络环境下 HTTP 被网关重定向/拦截返回 HTML。
         let url = format!(
-            "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={},day,,,{},qfq",
-            market_code, days
+            "{}/appstock/app/fqkline/get?param={},day,,,{},qfq",
+            kline_base.trim_end_matches('/'),
+            market_code,
+            days
         );
 
         log::debug!("[腾讯] 请求URL: {}", url);
@@ -217,7 +236,7 @@ impl GtimgProvider {
                 klines[0].close
             );
 
-            let quote = Self::fetch_realtime_quote_internal(client, &normalized_code)
+            let quote = Self::fetch_realtime_quote_from_base(client, &normalized_code, quote_base)
                 .await
                 .ok()
                 .flatten();
@@ -344,10 +363,18 @@ impl GtimgProvider {
 
     /// 获取股票名称（静态异步方法）
     async fn fetch_stock_name_internal(client: &reqwest::Client, code: &str) -> Option<String> {
+        Self::fetch_stock_name_from_base(client, code, "http://qt.gtimg.cn").await
+    }
+
+    async fn fetch_stock_name_from_base(
+        client: &reqwest::Client,
+        code: &str,
+        quote_base: &str,
+    ) -> Option<String> {
         let (_, market_code) = Self::normalize_for_tencent(code)?;
 
         // 使用腾讯实时行情接口获取股票名称
-        let url = format!("http://qt.gtimg.cn/q={}", market_code);
+        let url = format!("{}/q={}", quote_base.trim_end_matches('/'), market_code);
 
         match client
             .get(&url)
@@ -390,10 +417,18 @@ impl GtimgProvider {
         client: &reqwest::Client,
         code: &str,
     ) -> Result<Option<RealtimeQuote>> {
+        Self::fetch_realtime_quote_from_base(client, code, "http://qt.gtimg.cn").await
+    }
+
+    async fn fetch_realtime_quote_from_base(
+        client: &reqwest::Client,
+        code: &str,
+        quote_base: &str,
+    ) -> Result<Option<RealtimeQuote>> {
         let (_, market_code) = Self::normalize_for_tencent(code)
             .ok_or_else(|| anyhow!("无效股票代码格式: {}", code))?;
 
-        let url = format!("http://qt.gtimg.cn/q={}", market_code);
+        let url = format!("{}/q={}", quote_base.trim_end_matches('/'), market_code);
 
         let response = client
             .get(&url)
@@ -804,6 +839,60 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn loopback_tencent_transports_parse_complete_kline_quote_and_name() {
+        use super::super::{loopback_http_client, TestHttpResponse, TestHttpServer};
+
+        let server = TestHttpServer::new(vec![
+            TestHttpResponse::json(complete_kline_body()),
+            TestHttpResponse::json(realtime_body(&[])),
+        ]);
+        let base = server.base_url().to_string();
+        let data = GtimgProvider::fetch_kline_data_from_bases(
+            &loopback_http_client(),
+            "TEST_CODE_600519",
+            2,
+            &base,
+            &base,
+        )
+        .await
+        .expect("complete K-line and quote responses must parse");
+        assert_eq!(data.len(), 2);
+        assert_eq!(data[0].intraday_price, Some(10.10));
+        assert_eq!(data[0].pb_ratio, Some(2.0));
+        let requests = server.finish();
+        assert!(requests[0].contains("param=sh600519,day,,,2,qfq"));
+        assert_eq!(requests[1], "/q=sh600519");
+
+        let server = TestHttpServer::new(vec![TestHttpResponse::json(
+            "v_sh600519=\"51~协议测试股票~600519~10.10\";",
+        )]);
+        let base = server.base_url().to_string();
+        let name = GtimgProvider::fetch_stock_name_from_base(
+            &loopback_http_client(),
+            "TEST_CODE_600519",
+            &base,
+        )
+        .await;
+        assert_eq!(name.as_deref(), Some("协议测试股票"));
+        assert_eq!(server.finish(), vec!["/q=sh600519"]);
+
+        let server = TestHttpServer::new(vec![TestHttpResponse {
+            status: 503,
+            body: "unavailable".to_string(),
+        }]);
+        let base = server.base_url().to_string();
+        let error = GtimgProvider::fetch_realtime_quote_from_base(
+            &loopback_http_client(),
+            "TEST_CODE_600519",
+            &base,
+        )
+        .await
+        .expect_err("non-2xx quote transport must fail");
+        assert!(error.to_string().contains("503"));
+        assert_eq!(server.finish(), vec!["/q=sh600519"]);
     }
 
     #[test]

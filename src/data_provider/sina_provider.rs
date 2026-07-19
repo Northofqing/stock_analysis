@@ -146,9 +146,13 @@ impl SinaProvider {
     /// 抓取 Sina K线 (GBK → UTF-8 decode).
     pub async fn fetch_kline_raw(&self, code: &str, days: usize) -> Result<Vec<KlineData>> {
         let url = build_kline_url(code, days);
+        self.fetch_kline_from_url(code, &url).await
+    }
+
+    async fn fetch_kline_from_url(&self, code: &str, url: &str) -> Result<Vec<KlineData>> {
         let bytes = self
             .client
-            .get(&url)
+            .get(url)
             .header("Referer", "https://finance.sina.com.cn")
             .send()
             .await?
@@ -167,9 +171,13 @@ impl SinaProvider {
     /// 抓取 Sina 实时行情 (单只, GBK → UTF-8 decode).
     pub async fn fetch_hq_async(&self, code: &str) -> Result<SinaHqQuote> {
         let url = build_hq_url(code);
+        self.fetch_hq_from_url(code, &url).await
+    }
+
+    async fn fetch_hq_from_url(&self, code: &str, url: &str) -> Result<SinaHqQuote> {
         let bytes = self
             .client
-            .get(&url)
+            .get(url)
             .header("Referer", "https://finance.sina.com.cn")
             .send()
             .await?
@@ -359,5 +367,42 @@ mod strict_kline_tests {
         let provider = SinaProvider::default();
         assert_eq!(provider.name(), "sina_hq");
         assert_eq!(provider.get_stock_name("600519"), None);
+    }
+
+    #[tokio::test]
+    async fn loopback_sina_transports_preserve_empty_kline_and_complete_hq_protocols() {
+        use super::super::{loopback_http_client, TestHttpResponse, TestHttpServer};
+
+        let provider = SinaProvider {
+            client: loopback_http_client(),
+        };
+        let server = TestHttpServer::new(vec![TestHttpResponse::json("callback([])")]);
+        let data = provider
+            .fetch_kline_from_url("TEST_CODE_600519", server.base_url())
+            .await
+            .expect("truthful empty Sina K-line batch must remain empty");
+        assert!(data.is_empty());
+        assert_eq!(server.finish(), vec!["/"]);
+
+        let server =
+            TestHttpServer::new(vec![TestHttpResponse::json(hq_body(&[(0, "TEST_STOCK")]))]);
+        let quote = provider
+            .fetch_hq_from_url("TEST_CODE_600519", server.base_url())
+            .await
+            .expect("complete ASCII HQ response must parse after GBK decoding");
+        assert_eq!(quote.name, "TEST_STOCK");
+        assert_eq!(quote.current, 10.1);
+        assert_eq!(server.finish(), vec!["/"]);
+
+        let server = TestHttpServer::new(vec![TestHttpResponse {
+            status: 404,
+            body: "not found".to_string(),
+        }]);
+        let error = provider
+            .fetch_kline_from_url("TEST_CODE_600519", server.base_url())
+            .await
+            .expect_err("Sina non-2xx response must fail explicitly");
+        assert!(error.to_string().contains("404"));
+        assert_eq!(server.finish(), vec!["/"]);
     }
 }

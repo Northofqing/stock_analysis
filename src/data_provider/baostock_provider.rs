@@ -211,22 +211,16 @@ pub fn parse_baostock_tcp_response(buf: &[u8]) -> Result<BaostockTcpMessage> {
         .map_err(|e| anyhow!("Baostock TCP 响应: body_len 解析失败: {e}"))?;
 
     // 2. 解析 body
-    let body_bytes = if msg_type == MSG_TYPE_KLINE_RESP {
-        // 压缩响应: [21 : 21 + body_len]
-        if 21 + body_len > buf.len() {
-            return Err(anyhow!(
-                "Baostock TCP 响应: 压缩 body 截断 (need {body_len} @ 21, have {})",
-                buf.len().saturating_sub(21)
-            ));
-        }
-        &buf[21..21 + body_len]
-    } else {
-        // 非压缩: [21 : -1] (剥末尾 `\n`) — 跟 Python 一致
-        if buf.len() < 22 {
-            return Err(anyhow!("Baostock TCP 响应: 非压缩 body 截断"));
-        }
-        &buf[21..buf.len() - 1]
-    };
+    if 21 + body_len > buf.len() {
+        return Err(anyhow!(
+            "Baostock TCP 响应: body 截断 (need {body_len} @ 21, have {})",
+            buf.len().saturating_sub(21)
+        ));
+    }
+    // Both compressed and plain frames declare the exact body length. Reading
+    // the plain body to `buf.len() - 1` also swallowed the CRC and completion
+    // marker, corrupting session ids returned by a complete network frame.
+    let body_bytes = &buf[21..21 + body_len];
 
     // 3. msg_type="96" → zlib 解压
     let body_str = if msg_type == MSG_TYPE_KLINE_RESP {
@@ -572,10 +566,11 @@ impl BaostockProvider {
                 parsed.msg_type
             ));
         }
-        let error_code = parse_baostock_response(&parsed.body, "error_code")?
+        let response_body = strip_cdata(&parsed.body);
+        let error_code = parse_baostock_response(response_body, "error_code")?
             .ok_or_else(|| anyhow!("Baostock K线: 无 error_code"))?;
         if error_code != "0" {
-            let msg = parse_baostock_response(&parsed.body, "error_msg")?.unwrap_or_default();
+            let msg = parse_baostock_response(response_body, "error_msg")?.unwrap_or_default();
             return Err(anyhow!("Baostock K线失败: code={error_code} msg={msg}"));
         }
         parse_baostock_response_kline(&parsed.body, code)
@@ -676,6 +671,45 @@ mod inline_tests {
         "date,open,high,low,close,volume,amount,pctChg\n\
          2026-07-15,10.00,10.20,9.90,10.00,1000,100000,0.0\n\
          2026-07-16,10.00,10.20,9.95,10.10,1100,101000,1.0"
+    }
+
+    fn compressed_kline_frame(msg_type: &str, error_code: &str) -> Vec<u8> {
+        let raw = format!(
+            "<![CDATA[error_code={error_code}\nerror_msg={}\n{}]]>",
+            if error_code == "0" {
+                "success"
+            } else {
+                "rejected"
+            },
+            valid_csv()
+        );
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(raw.as_bytes()).unwrap();
+        response_frame(msg_type, &encoder.finish().unwrap(), Some(12345))
+    }
+
+    fn spawn_tcp_responder(
+        responses: Vec<Vec<u8>>,
+    ) -> (u16, std::thread::JoinHandle<Vec<Vec<u8>>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut requests = Vec::new();
+            for response in responses {
+                let mut buf = [0_u8; 4096];
+                let size = stream.read(&mut buf).unwrap();
+                assert!(size > 21, "provider request must contain a complete frame");
+                requests.push(buf[..size].to_vec());
+                stream.write_all(&response).unwrap();
+                stream.flush().unwrap();
+            }
+            requests
+        });
+        (port, handle)
     }
 
     /// `BAOSTOCK_HOST` / `BAOSTOCK_PORT` 必须是稳定的 TCP endpoint.
@@ -869,6 +903,83 @@ mod inline_tests {
             .get_realtime_quote("TEST_CODE_000001")
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn loopback_tcp_executes_login_session_reuse_and_complete_kline_query() {
+        let login = response_frame(
+            MSG_TYPE_LOGIN_RESP,
+            b"error_code=0\nerror_msg=success\nsession_id=TEST_CODE_SESSION",
+            Some(12345),
+        );
+        let kline = compressed_kline_frame(MSG_TYPE_KLINE_RESP, "0");
+        let (port, server) = spawn_tcp_responder(vec![login, kline]);
+        let provider = BaostockProvider {
+            stream: Arc::new(Mutex::new(None)),
+            session: Mutex::new(None),
+            host: "127.0.0.1".to_string(),
+            port,
+        };
+
+        let rows = provider
+            .fetch_kline_async("TEST_CODE_000001", 2)
+            .await
+            .expect("complete login and K-line frames must succeed");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].close, 10.1);
+        assert_eq!(
+            provider.ensure_session().await.unwrap(),
+            "TEST_CODE_SESSION"
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with(b"00.9.20\x0100\x01"));
+        assert!(requests[1].starts_with(b"00.9.20\x0195\x01"));
+        assert!(String::from_utf8_lossy(&requests[1]).contains("TEST_CODE_SESSION"));
+        assert!(String::from_utf8_lossy(&requests[1]).contains("sz.TEST_CODE_000001"));
+    }
+
+    #[tokio::test]
+    async fn loopback_tcp_rejects_incomplete_login_and_kline_protocols() {
+        let login_without_session = response_frame(
+            MSG_TYPE_LOGIN_RESP,
+            b"error_code=0\nerror_msg=success",
+            Some(1),
+        );
+        let (port, server) = spawn_tcp_responder(vec![login_without_session]);
+        let provider = BaostockProvider {
+            stream: Arc::new(Mutex::new(None)),
+            session: Mutex::new(None),
+            host: "127.0.0.1".to_string(),
+            port,
+        };
+        let error = provider.ensure_session().await.unwrap_err();
+        assert!(error.to_string().contains("session_id"));
+        assert_eq!(server.join().unwrap().len(), 1);
+
+        let login = response_frame(
+            MSG_TYPE_LOGIN_RESP,
+            b"error_code=0\nerror_msg=success\nsession_id=TEST_CODE_SESSION",
+            Some(1),
+        );
+        let wrong_type = response_frame(
+            MSG_TYPE_LOGIN_RESP,
+            b"error_code=0\nerror_msg=success",
+            Some(1),
+        );
+        let (port, server) = spawn_tcp_responder(vec![login, wrong_type]);
+        let provider = BaostockProvider {
+            stream: Arc::new(Mutex::new(None)),
+            session: Mutex::new(None),
+            host: "127.0.0.1".to_string(),
+            port,
+        };
+        let error = provider
+            .fetch_kline_async("TEST_CODE_000001", 2)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("msg_type"), "{error}");
+        assert_eq!(server.join().unwrap().len(), 2);
     }
 
     #[test]

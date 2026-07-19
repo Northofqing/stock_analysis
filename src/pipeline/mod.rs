@@ -693,10 +693,8 @@ mod tests {
     use crate::notification::{NotificationConfig, NotificationService};
     use crate::traits::ScoreDisplay;
     use chrono::NaiveDate;
-    use once_cell::sync::Lazy;
+    use serial_test::serial;
     use std::sync::Arc;
-
-    static DEEP_ENV_LOCK: Lazy<std::sync::Mutex<()>> = Lazy::new(|| std::sync::Mutex::new(()));
 
     fn result() -> AnalysisResult {
         serde_json::from_value(serde_json::json!({
@@ -822,10 +820,8 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(deep_env)]
     async fn deep_enrichment_guards_do_not_start_external_analysis() {
-        let _guard = DEEP_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let config = PipelineConfig {
             max_workers: 1,
             dry_run: false,

@@ -149,28 +149,40 @@ impl HttpProvider {
         code: &str,
         days: usize,
     ) -> Result<Vec<KlineData>> {
-        const KLINE_HOSTS: [&str; 3] = [
-            "push2his.eastmoney.com",
-            "push2his-bak.eastmoney.com",
-            "82.push2his.eastmoney.com",
+        const KLINE_BASES: [&str; 3] = [
+            "https://push2his.eastmoney.com",
+            "https://push2his-bak.eastmoney.com",
+            "https://82.push2his.eastmoney.com",
         ];
+        Self::fetch_kline_data_from_bases(client, code, days, &KLINE_BASES, 2).await
+    }
+
+    async fn fetch_kline_data_from_bases(
+        client: &reqwest::Client,
+        code: &str,
+        days: usize,
+        bases: &[&str],
+        max_attempts_per_host: u32,
+    ) -> Result<Vec<KlineData>> {
+        if bases.is_empty() || max_attempts_per_host == 0 {
+            return Err(anyhow!("东方财富 K 线主机配置为空"));
+        }
 
         // 转换股票代码格式 (600519 -> 1.600519 for Shanghai, 000001 -> 0.000001 for Shenzhen)
         let market_code = eastmoney_market_code(code);
 
         // 每个 host 最多尝试 2 次，总尝试数 = host 数 * 2。
-        const MAX_ATTEMPTS_PER_HOST: u32 = 2;
-        let max_attempts: u32 = (KLINE_HOSTS.len() as u32) * MAX_ATTEMPTS_PER_HOST;
+        let max_attempts: u32 = (bases.len() as u32) * max_attempts_per_host;
         let mut last_err: Option<ProviderError> = None;
 
         for attempt in 1..=max_attempts {
-            let host = KLINE_HOSTS[((attempt - 1) as usize) % KLINE_HOSTS.len()];
+            let base = bases[((attempt - 1) as usize) % bases.len()].trim_end_matches('/');
             let url = format!(
-                "https://{}/api/qt/stock/kline/get?secid={}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58&klt=101&fqt=1&end=20500101&lmt={}",
-                host, market_code, days
+                "{}/api/qt/stock/kline/get?secid={}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58&klt=101&fqt=1&end=20500101&lmt={}",
+                base, market_code, days
             );
 
-            log::debug!("[HTTP] 请求URL(host={}): {}", host, url);
+            log::debug!("[HTTP] 请求URL(host={}): {}", base, url);
 
             // 发送请求（添加更多请求头模拟浏览器）
             let send_result = client
@@ -190,7 +202,7 @@ impl HttpProvider {
                         "[HTTP] 请求失败 (attempt {}/{} host={} code={}): {}",
                         attempt,
                         max_attempts,
-                        host,
+                        base,
                         code,
                         brief_provider_error(e.to_string())
                     );
@@ -212,12 +224,14 @@ impl HttpProvider {
                 KlineAttemptOutcome::Fatal(error) => {
                     log::error!(
                         "[HTTP] 不可重试响应 (attempt {attempt}/{max_attempts} host={host} code={code}): {error}"
+                        , host = base
                     );
                     return Err(error);
                 }
                 KlineAttemptOutcome::Retry(error) => {
                     log::warn!(
                         "[HTTP] 可重试响应失败 (attempt {attempt}/{max_attempts} host={host} code={code}): {error}"
+                        , host = base
                     );
                     last_err = Some(error);
                     if attempt < max_attempts {
@@ -571,6 +585,65 @@ mod tests {
             None
         );
         assert_eq!(kline_retry_delay(3), std::time::Duration::from_millis(1));
+    }
+
+    #[tokio::test]
+    async fn loopback_kline_transport_preserves_retry_terminal_and_complete_states() {
+        use super::super::{loopback_http_client, TestHttpResponse, TestHttpServer};
+
+        let complete = kline_body(serde_json::json!([
+            "2026-07-15,10.00,10.00,10.20,9.90,1000,100000,0.0",
+            "2026-07-16,10.00,10.10,10.20,9.95,1100,101000,1.0"
+        ]));
+        let server = TestHttpServer::new(vec![
+            TestHttpResponse {
+                status: 503,
+                body: "temporarily unavailable".to_string(),
+            },
+            TestHttpResponse::json(complete),
+        ]);
+        let base = server.base_url().to_string();
+        let data = HttpProvider::fetch_kline_data_from_bases(
+            &loopback_http_client(),
+            "TEST_CODE_000001",
+            2,
+            &[&base],
+            2,
+        )
+        .await
+        .expect("retry must reach the complete second response");
+        assert_eq!(data.len(), 2);
+        let requests = server.finish();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("secid=1.TEST_CODE_000001"));
+        assert!(requests[0].contains("lmt=2"));
+
+        let server = TestHttpServer::new(vec![TestHttpResponse {
+            status: 404,
+            body: "not found".to_string(),
+        }]);
+        let base = server.base_url().to_string();
+        let error = HttpProvider::fetch_kline_data_from_bases(
+            &loopback_http_client(),
+            "TEST_CODE_000001",
+            2,
+            &[&base],
+            2,
+        )
+        .await
+        .expect_err("4xx must terminate without a fabricated batch");
+        assert!(error.to_string().contains("404"));
+        assert_eq!(server.finish().len(), 1);
+
+        assert!(HttpProvider::fetch_kline_data_from_bases(
+            &loopback_http_client(),
+            "TEST_CODE_000001",
+            2,
+            &[],
+            2,
+        )
+        .await
+        .is_err());
     }
 
     #[ignore = "b013 异常处理: 实机调 eastmoney HTTP, 沙箱环境必失败 (非 deterministic)"]

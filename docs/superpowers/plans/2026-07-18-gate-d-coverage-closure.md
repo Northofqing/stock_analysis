@@ -299,3 +299,15 @@ Expected: all PASS. Commit only the two modules plus design/plan/progress eviden
 - [x] Add a `cfg(test)` loopback responder that serves exact status/body sequences on `127.0.0.1`, times out safely, and is absent from production builds.
 - [x] Route existing private host/base seams for chain pages, announcement list/detail and industry three-step acquisition to the loopback while preserving every production endpoint.
 - [x] Assert complete pagination/batch results and request completion with `TEST_CODE_` identities; run focused suites, formatter, strict Clippy and core coverage.
+
+### Task 32: Exercise Eastmoney, Tencent, and Sina transport over loopback
+
+- [x] Route the existing Eastmoney host retry loop through a private host/base seam while preserving production hosts, attempt order, headers, delay and terminal/retry decisions.
+- [x] Route Tencent K-line/name/realtime and Sina K-line/HQ requests through private URL/base seams while preserving strict parsing and nullable enrichment behavior.
+- [x] Cover complete, retry and terminal transport outcomes with the `cfg(test)` loopback responder and `TEST_CODE_` identities; 1,647 library tests pass with 10 explicit live integrations ignored, global coverage is 59,661/75,771 = 78.74%, and registered core is 29,225/31,793 = 91.92%.
+
+### Task 33: Exercise BaoStock TCP sessions and repair async test isolation
+
+- [x] Replace the synchronous pipeline test mutex held across `await` with the repository's async-compatible serialized test domain and preserve environment restoration.
+- [x] Execute BaoStock login, session reuse, K-line request and strict response assembly against a test-only loopback TCP listener without changing its production endpoint or protocol.
+- [x] Cover complete and explicit protocol failures, then run focused tests, formatter, all-target strict Clippy and instrumented library coverage; 1,649 tests pass with 10 live integrations ignored, global coverage is 59,788/75,852 = 78.82%, and registered core is 29,352/31,874 = 92.09%.
