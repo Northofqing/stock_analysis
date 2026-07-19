@@ -9,20 +9,32 @@ use stock_analysis::push_l1::{
     SectorRotationPayload, Severity, SignalEvent, SignalPayload, SignalSource,
 };
 use stock_analysis::push_l2::{DataMode, RenderedText, TemplateCategory, TemplateMetadata};
-use stock_analysis::push_l4::{Dispatcher, DispatchOutcome};
-use stock_analysis::push_l5::{event_severity, GovernanceContext, GovernanceEngine, GovernanceDecision};
-use stock_analysis::push_l6::{PushMessage, SinkResult, SinkRouter};
-use stock_analysis::push_l7::{
-    build_analytics, AnalyticsStore, InMemoryStore, SqliteStore,
+use stock_analysis::push_l4::{DispatchOutcome, Dispatcher, ReserveOutcome};
+use stock_analysis::push_l5::{
+    event_severity, GovernanceContext, GovernanceDecision, GovernanceEngine,
 };
+use stock_analysis::push_l6::{PushMessage, SinkResult, SinkRouter};
+use stock_analysis::push_l7::{build_analytics, AnalyticsStore, InMemoryStore, SqliteStore};
 
-fn make_event(source: SignalSource, kind: &str, code: Option<&str>, payload: SignalPayload) -> SignalEvent {
+fn make_event(
+    source: SignalSource,
+    kind: &str,
+    code: Option<&str>,
+    payload: SignalPayload,
+) -> SignalEvent {
     let severity = match source {
         SignalSource::DataSourceDown => Severity::Emergency,
         SignalSource::RiskViolation => Severity::Emergency,
         _ => Severity::High,
     };
-    SignalEvent::new(source, kind, code.map(String::from), Local::now(), payload, severity)
+    SignalEvent::new(
+        source,
+        kind,
+        code.map(String::from),
+        Local::now(),
+        payload,
+        severity,
+    )
 }
 
 fn make_profile(category: TemplateCategory, always_send: bool) -> TemplateMetadata {
@@ -34,6 +46,26 @@ fn make_profile(category: TemplateCategory, always_send: bool) -> TemplateMetada
         cooldown_secs: 60,
         max_per_user_per_day: None,
         always_send_on_data_source_down: always_send,
+    }
+}
+
+/// E2E sink is synchronous and treated as successfully delivered, so reserve is
+/// immediately followed by commit. This exercises the current rollback-safe API.
+fn dispatch_as_delivered(
+    dispatcher: &Dispatcher,
+    event: &SignalEvent,
+    cooldown: Option<std::time::Duration>,
+) -> DispatchOutcome {
+    match dispatcher.reserve(event, cooldown, None) {
+        ReserveOutcome::Reserved => {
+            dispatcher.commit(event, cooldown, None);
+            DispatchOutcome::Pushed
+        }
+        ReserveOutcome::Deduped => DispatchOutcome::Deduped(format!(
+            "kind={} code={} still cooling down",
+            event.kind,
+            event.code.as_deref().unwrap_or("")
+        )),
     }
 }
 
@@ -64,9 +96,9 @@ async fn main() {
         make_event(
             SignalSource::LimitUp,
             "limit_up",
-            Some("600519"),
+            Some("TEST_CODE_600519"),
             SignalPayload::LimitUp(LimitUpPayload {
-                code: Some("600519".to_string()),
+                code: Some("TEST_CODE_600519".to_string()),
                 name: Some("贵州茅台".to_string()),
                 change_pct: Some(10.0),
                 seal_amount_wan: Some(50000.0),
@@ -86,9 +118,9 @@ async fn main() {
         make_event(
             SignalSource::NewsCatalyst,
             "news_catalyst",
-            Some("000001"),
+            Some("TEST_CODE_000001"),
             SignalPayload::NewsCatalyst(NewsCatalystPayload {
-                code: Some("000001".to_string()),
+                code: Some("TEST_CODE_000001".to_string()),
                 headline: Some("央行降准 0.5%".to_string()),
                 source: Some("财新".to_string()),
             }),
@@ -96,9 +128,9 @@ async fn main() {
         make_event(
             SignalSource::HoldingHealth,
             "holding_health",
-            Some("600519"),
+            Some("TEST_CODE_600519"),
             SignalPayload::HoldingHealth(HoldingHealthPayload {
-                code: Some("600519".to_string()),
+                code: Some("TEST_CODE_600519".to_string()),
                 position_pct: Some(15.0),
                 day_pnl_pct: Some(-1.2),
                 entry_price: Some(1680.0),
@@ -120,18 +152,23 @@ async fn main() {
     for (i, e) in events.iter().enumerate() {
         println!(
             "  [{:>2}] source={:?} kind={} code={:?} event_id={} severity={:?}",
-            i + 1, e.source, e.kind, e.code, e.event_id, event_severity(e)
+            i + 1,
+            e.source,
+            e.kind,
+            e.code,
+            e.event_id,
+            event_severity(e)
         );
     }
 
     // ===== 2. L4 Dispatcher =====
     section("L4 Dispatcher — dedup 表");
-    let mut dispatcher = Dispatcher::new();
+    let dispatcher = Dispatcher::new();
     let mut dispatched = 0;
     let mut deduped = 0;
     let win = Some(std::time::Duration::from_secs(60));
     for e in &events {
-        match dispatcher.dispatch(e, win) {
+        match dispatch_as_delivered(&dispatcher, e, win) {
             DispatchOutcome::Pushed => dispatched += 1,
             DispatchOutcome::Deduped(_) => deduped += 1,
         }
@@ -141,7 +178,7 @@ async fn main() {
 
     println!("  重发前 3 个 (应 dedup):");
     for e in events.iter().take(3) {
-        match dispatcher.dispatch(e, win) {
+        match dispatch_as_delivered(&dispatcher, e, win) {
             DispatchOutcome::Deduped(detail) => println!("    [dedup] {}", detail),
             _ => println!("    [unexpected_pushed]"),
         }
@@ -231,14 +268,20 @@ async fn main() {
             "default",
             vec![],
         );
-        in_mem.record(&analytics);
+        in_mem.record(&analytics).unwrap();
         println!(
             "    [{:>2}] event_id={} pushed={} status={:?}",
-            i + 1, analytics.event_id, analytics.pushed, analytics.validation_status
+            i + 1,
+            analytics.event_id,
+            analytics.pushed,
+            analytics.validation_status
         );
     }
-    println!("  InMemoryStore total: {}", in_mem.count_total());
-    println!("  InMemoryStore push_rate: {:.2}", in_mem.push_rate());
+    println!("  InMemoryStore total: {}", in_mem.count_total().unwrap());
+    println!(
+        "  InMemoryStore push_rate: {:.2}",
+        in_mem.push_rate().unwrap().unwrap()
+    );
 
     println!("\n  SqliteStore (内存模式):");
     let sqlite = SqliteStore::open_in_memory().unwrap();
@@ -255,12 +298,17 @@ async fn main() {
             "default",
             vec![],
         );
-        sqlite.record(&analytics);
+        sqlite.record(&analytics).unwrap();
     }
-    println!("  SqliteStore total: {}", sqlite.count_total());
-    println!("  SqliteStore approve count: {}", sqlite.count_by_governance(&GovernanceDecision::Approve));
+    println!("  SqliteStore total: {}", sqlite.count_total().unwrap());
+    println!(
+        "  SqliteStore approve count: {}",
+        sqlite
+            .count_by_governance(&GovernanceDecision::Approve)
+            .unwrap()
+    );
 
-    if let Some(first) = sqlite.get_by_event_id(&events[0].event_id) {
+    if let Some(first) = sqlite.get_by_event_id(&events[0].event_id).unwrap() {
         println!(
             "  SqliteStore get_by_event_id: template={} v{} pushed={}",
             first.template_id, first.template_version, first.pushed
@@ -272,21 +320,32 @@ async fn main() {
     let test_event = make_event(
         SignalSource::LimitUp,
         "limit_up",
-        Some("000858"),
+        Some("TEST_CODE_000858"),
         SignalPayload::LimitUp(LimitUpPayload {
-            code: Some("000858".to_string()),
+            code: Some("TEST_CODE_000858".to_string()),
             name: Some("五粮液".to_string()),
             change_pct: Some(9.5),
             seal_amount_wan: Some(30000.0),
         }),
     );
-    println!("  [L1] event: source={:?} code={:?}", test_event.source, test_event.code);
+    println!(
+        "  [L1] event: source={:?} code={:?}",
+        test_event.source, test_event.code
+    );
 
-    let outcome = dispatcher.dispatch(&test_event, Some(std::time::Duration::from_secs(60)));
+    let outcome = dispatch_as_delivered(
+        &dispatcher,
+        &test_event,
+        Some(std::time::Duration::from_secs(60)),
+    );
     println!("  [L4] dispatcher: {:?}", outcome);
     assert!(matches!(outcome, DispatchOutcome::Pushed));
 
-    let decision = engine.check(&make_profile(TemplateCategory::LimitUp, false), &test_event, &default_ctx);
+    let decision = engine.check(
+        &make_profile(TemplateCategory::LimitUp, false),
+        &test_event,
+        &default_ctx,
+    );
     println!("  [L5] governance: {:?}", decision);
     assert!(decision.is_approve());
 
@@ -315,7 +374,7 @@ async fn main() {
         "default",
         vec![],
     );
-    in_mem.record(&analytics);
+    in_mem.record(&analytics).unwrap();
     println!(
         "  [L7] analytics: event_id={} pushed={} rendered_len={}",
         analytics.event_id, analytics.pushed, analytics.rendered_len
@@ -327,7 +386,11 @@ async fn main() {
     println!("  L4: 5 dispatched + 3 dedup on re-dispatch");
     println!("  L5: 全 Full / 静默期 / Down+DataSourceDown 豁免 / QuietHourSource 豁免 OK");
     println!("  L6: 3 推送 OK, sink=console");
-    println!("  L7: InMemory {} 条 / Sqlite {} 条, push_rate={:.2}",
-        in_mem.count_total(), sqlite.count_total(), in_mem.push_rate());
+    println!(
+        "  L7: InMemory {} 条 / Sqlite {} 条, push_rate={:.2}",
+        in_mem.count_total().unwrap(),
+        sqlite.count_total().unwrap(),
+        in_mem.push_rate().unwrap().unwrap()
+    );
     println!("  端到端: 1 个事件走完整链路 OK");
 }

@@ -265,11 +265,11 @@ pub fn compute_simhash(title: &str, body: &str) -> u64 {
             continue;
         }
         let token_hash = stable_hash_token(&token);
-        for bit in 0..64 {
+        for (bit, count) in v.iter_mut().enumerate() {
             if (token_hash >> bit) & 1 == 1 {
-                v[bit] += 1;
+                *count += 1;
             } else {
-                v[bit] -= 1;
+                *count -= 1;
             }
         }
     }

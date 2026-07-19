@@ -1,3 +1,4 @@
+//! Registered business rules: BR-070.
 // -*- coding: utf-8 -*-
 //! 板块监控与共振引擎
 //!
@@ -177,6 +178,8 @@ impl LeaderConfig {
 pub struct BoardStock {
     pub code: String,
     pub name: String,
+    /// 实时价格 (f2)
+    pub price: f64,
     pub change_pct: f64,
     /// 当日成交额（元）
     pub amount: f64,
@@ -288,34 +291,47 @@ pub fn fetch_board_ranking(fid: &str, top_n: usize) -> Result<Vec<ConceptBoard>>
 
     let json = get_with_fallback(&client, &params).context("拉取概念板块榜失败")?;
 
-    let diff = match json
+    let diff = json
         .get("data")
         .and_then(|d| d.get("diff"))
         .and_then(|d| d.as_array())
-    {
-        Some(arr) => arr,
-        None => return Ok(Vec::new()),
-    };
+        .ok_or_else(|| anyhow::anyhow!("概念板块榜响应缺少 data.diff 数组"))?;
 
     let mut boards = Vec::with_capacity(diff.len());
-    for item in diff {
-        let code = item.get("f12").and_then(|v| v.as_str()).unwrap_or("");
-        let name = item.get("f14").and_then(|v| v.as_str()).unwrap_or("");
-        if code.is_empty() || name.is_empty() {
-            continue;
+    for (index, item) in diff.iter().enumerate() {
+        let code = required_board_text(item, "f12", index)?;
+        if !code.starts_with("BK") || code.len() < 4 {
+            return Err(anyhow::anyhow!(
+                "概念板块榜第 {} 行 code 非法: {code:?}",
+                index + 1
+            ));
         }
-        let change_pct = item.get("f3").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let main_inflow = item.get("f62").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let leader_name = item
-            .get("f128")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        // 领先信号字段：缺失/非数值时回落为 0，后续逻辑按"不达标"处理，不会误判。
-        let vol_ratio = item.get("f10").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let turnover = item.get("f8").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let main_net_pct_today = item.get("f184").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let main_net_pct_5d = item.get("f165").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let name = required_board_text(item, "f14", index)?;
+        let change_pct = required_board_number(item, "f3", index)?;
+        if change_pct.abs() > 20.0 {
+            return Err(anyhow::anyhow!(
+                "概念板块榜第 {} 行涨跌幅越界: {change_pct}",
+                index + 1
+            ));
+        }
+        let main_inflow = required_board_number(item, "f62", index)?;
+        let leader_name = required_board_text(item, "f128", index)?.to_string();
+        let vol_ratio = required_board_number(item, "f10", index)?;
+        let turnover = required_board_number(item, "f8", index)?;
+        let main_net_pct_today = required_board_number(item, "f184", index)?;
+        let main_net_pct_5d = required_board_number(item, "f165", index)?;
+        if vol_ratio < 0.0 || turnover < 0.0 {
+            return Err(anyhow::anyhow!(
+                "概念板块榜第 {} 行量比/换手率非法: vol_ratio={vol_ratio} turnover={turnover}",
+                index + 1
+            ));
+        }
+        if main_net_pct_today.abs() > 100.0 || main_net_pct_5d.abs() > 100.0 {
+            return Err(anyhow::anyhow!(
+                "概念板块榜第 {} 行主力净占比越界: today={main_net_pct_today} five_day={main_net_pct_5d}",
+                index + 1
+            ));
+        }
 
         boards.push(ConceptBoard {
             code: code.to_string(),
@@ -329,6 +345,10 @@ pub fn fetch_board_ranking(fid: &str, top_n: usize) -> Result<Vec<ConceptBoard>>
             main_net_pct_5d,
         });
     }
+    crate::monitor::data_mode::mark_capability_success(
+        crate::monitor::data_mode::Capability::MoneyFlow,
+    )
+    .map_err(anyhow::Error::msg)?;
     Ok(boards)
 }
 
@@ -443,21 +463,37 @@ pub fn fetch_board_components(board_code: &str, top_n: usize) -> Result<Vec<Boar
     let json = get_with_fallback(&client, &params)
         .with_context(|| format!("拉取板块 {} 成份股失败", board_code))?;
 
-    let diff = match json
+    let diff = json
         .get("data")
         .and_then(|d| d.get("diff"))
         .and_then(|d| d.as_array())
-    {
-        Some(arr) => arr,
-        None => return Ok(Vec::new()),
-    };
+        .ok_or_else(|| anyhow::anyhow!("板块 {board_code} 成份响应缺少 data.diff 数组"))?;
 
     let mut stocks = Vec::with_capacity(diff.len());
-    for item in diff {
-        let code = item.get("f12").and_then(|v| v.as_str()).unwrap_or("");
-        let name = item.get("f14").and_then(|v| v.as_str()).unwrap_or("");
-        if code.is_empty() || name.is_empty() {
-            continue;
+    for (index, item) in diff.iter().enumerate() {
+        let code = required_board_text(item, "f12", index)?;
+        let name = required_board_text(item, "f14", index)?;
+        if code.len() != 6 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(anyhow::anyhow!(
+                "板块 {board_code} 第 {} 行股票代码非法: {code:?}",
+                index + 1
+            ));
+        }
+        let price = required_board_number(item, "f2", index)?;
+        let change_pct = required_board_number(item, "f3", index)?;
+        let amount = required_board_number(item, "f6", index)?;
+        let vol_ratio = required_board_number(item, "f10", index)?;
+        let turnover = required_board_number(item, "f8", index)?;
+        if price <= 0.0
+            || change_pct.abs() > 20.0
+            || amount < 0.0
+            || vol_ratio < 0.0
+            || turnover < 0.0
+        {
+            return Err(anyhow::anyhow!(
+                "板块 {board_code} 第 {} 行数值越界: price={price} change={change_pct} amount={amount} vol_ratio={vol_ratio} turnover={turnover}",
+                index + 1
+            ));
         }
         // 过滤 ST / 北交所 (保持与 limit_up 一致的口径)
         if crate::data_provider::limit_status::is_st_stock(name) {
@@ -466,13 +502,10 @@ pub fn fetch_board_components(board_code: &str, top_n: usize) -> Result<Vec<Boar
         if code.starts_with('8') || code.starts_with('4') || code.starts_with('9') {
             continue;
         }
-        let change_pct = item.get("f3").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let amount = item.get("f6").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let vol_ratio = item.get("f10").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let turnover = item.get("f8").and_then(|v| v.as_f64()).unwrap_or(0.0);
         stocks.push(BoardStock {
             code: code.to_string(),
             name: name.to_string(),
+            price,
             change_pct,
             amount,
             vol_ratio,
@@ -480,6 +513,21 @@ pub fn fetch_board_components(board_code: &str, top_n: usize) -> Result<Vec<Boar
         });
     }
     Ok(stocks)
+}
+
+fn required_board_text<'a>(item: &'a Value, field: &str, index: usize) -> Result<&'a str> {
+    item.get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("板块响应第 {} 行缺少非空 {field}", index + 1))
+}
+
+fn required_board_number(item: &Value, field: &str, index: usize) -> Result<f64> {
+    item.get(field)
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| anyhow::anyhow!("板块响应第 {} 行缺少有限数值 {field}", index + 1))
 }
 
 /// 检测共振板块
@@ -722,12 +770,24 @@ pub fn compute_ignition(comps: &[BoardStock]) -> IgnitionStats {
 /// 成份股涨跌停幅度限制（与 MarketAnalyzer::get_limit_pct 同口径，
 /// 本模块已过滤 ST/北交所，这里只区分主板与创业板/科创板）。
 fn component_limit_pct(code: &str, name: &str) -> f64 {
+    let code = market_rule_code(code);
     if name.contains("ST") || name.contains("st") {
         5.0
     } else if code.starts_with("30") || code.starts_with("688") {
         20.0
     } else {
         10.0
+    }
+}
+
+fn market_rule_code(code: &str) -> &str {
+    #[cfg(test)]
+    {
+        code.strip_prefix("TEST_CODE_").unwrap_or(code)
+    }
+    #[cfg(not(test))]
+    {
+        code
     }
 }
 
@@ -836,7 +896,7 @@ fn pick_leaders_legacy(comps: &[BoardStock], leaders_per_sector: usize) -> Vec<B
     if comps.is_empty() || leaders_per_sector == 0 {
         return Vec::new();
     }
-    let take_amount = leaders_per_sector.min(3).max(1);
+    let take_amount = leaders_per_sector.clamp(1, 3);
     let take_change = leaders_per_sector.saturating_sub(take_amount).min(2);
 
     let mut by_amount: Vec<&BoardStock> = comps.iter().collect();
@@ -1040,7 +1100,7 @@ pub fn detect_unexplained_moves(news_text: &str, rank_top: usize) -> Result<Vec<
 
     // 按 code 合并去重（保留任一路的板块条目）
     let mut merged: HashMap<String, ConceptBoard> = HashMap::new();
-    for b in by_change.into_iter().chain(by_inflow.into_iter()) {
+    for b in by_change.into_iter().chain(by_inflow) {
         merged.entry(b.code.clone()).or_insert(b);
     }
     let boards: Vec<ConceptBoard> = merged.into_values().collect();
@@ -1064,6 +1124,7 @@ pub fn detect_unexplained_moves(news_text: &str, rank_top: usize) -> Result<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn news_match_basic() {
@@ -1075,7 +1136,10 @@ mod tests {
     fn bs(code: &str, change: f64, amount: f64, vol: f64) -> BoardStock {
         BoardStock {
             code: code.into(),
-            name: code.into(),
+            // Keep the synthetic symbol out of the display name: the `ST`
+            // substring in `TEST_CODE_` must not classify a normal fixture as ST.
+            name: "测试标的".into(),
+            price: 10.0,
             change_pct: change,
             amount,
             vol_ratio: vol,
@@ -1084,47 +1148,81 @@ mod tests {
     }
 
     #[test]
+    fn strict_board_fields_reject_missing_and_non_finite_values() {
+        let row = json!({"f12": "BK0001", "f3": 1.5});
+        assert_eq!(
+            required_board_text(&row, "f12", 0).expect("valid text"),
+            "BK0001"
+        );
+        assert_eq!(
+            required_board_number(&row, "f3", 0).expect("valid number"),
+            1.5
+        );
+        assert!(required_board_text(&row, "f14", 0).is_err());
+        assert!(required_board_number(&row, "f62", 0).is_err());
+
+        let non_finite = json!({"f3": "NaN"});
+        assert!(required_board_number(&non_finite, "f3", 0).is_err());
+    }
+
+    #[test]
     fn pick_leaders_legacy_when_board_flat() {
         let comps = vec![
-            bs("000001", 5.0, 1e9, 1.0),
-            bs("000002", 9.0, 8e8, 1.0),
-            bs("000003", 2.0, 7e8, 1.0),
-            bs("000004", 8.0, 1e8, 1.0),
+            bs("TEST_CODE_000001", 5.0, 1e9, 1.0),
+            bs("TEST_CODE_000002", 9.0, 8e8, 1.0),
+            bs("TEST_CODE_000003", 2.0, 7e8, 1.0),
+            bs("TEST_CODE_000004", 8.0, 1e8, 1.0),
         ];
         // 板块涨幅 0 < board_min_change → 回退旧逻辑（成交额Top3 + 涨幅Top2）
         let picks = pick_leaders(&comps, 5, 0.0, &LeaderConfig::default());
         let codes: Vec<_> = picks.iter().map(|s| s.code.as_str()).collect();
-        assert_eq!(codes, vec!["000001", "000002", "000003", "000004"]);
+        assert_eq!(
+            codes,
+            vec![
+                "TEST_CODE_000001",
+                "TEST_CODE_000002",
+                "TEST_CODE_000003",
+                "TEST_CODE_000004"
+            ]
+        );
     }
 
     #[test]
     fn pick_leaders_injects_low_position_when_board_rising() {
         // 板块大涨 6%：高位龙头 + 低位卡位混合
         let comps = vec![
-            bs("600001", 9.8, 1e9, 1.2),  // 高位龙头（成交额最大）
-            bs("600002", 9.5, 9e8, 1.1),  // 高位次龙头
-            bs("600003", 1.0, 5e8, 1.6),  // 低位卡位：未启动+放量+够流动性 ✓
-            bs("600004", 0.3, 3e8, 1.4),  // 低位卡位：更未启动 ✓（涨幅更低，优先）
-            bs("600005", 0.5, 1e6, 2.0),  // 低位但成交额太小（<1亿）✗
-            bs("600006", -5.0, 4e8, 1.5), // 走弱（<min_change）✗
+            bs("TEST_CODE_600001", 9.8, 1e9, 1.2), // 高位龙头（成交额最大）
+            bs("TEST_CODE_600002", 9.5, 9e8, 1.1), // 高位次龙头
+            bs("TEST_CODE_600003", 1.0, 5e8, 1.6), // 低位卡位：未启动+放量+够流动性 ✓
+            bs("TEST_CODE_600004", 0.3, 3e8, 1.4), // 低位卡位：更未启动 ✓（涨幅更低，优先）
+            bs("TEST_CODE_600005", 0.5, 1e6, 2.0), // 低位但成交额太小（<1亿）✗
+            bs("TEST_CODE_600006", -5.0, 4e8, 1.5), // 走弱（<min_change）✗
         ];
         let picks = pick_leaders(&comps, 4, 6.0, &LeaderConfig::default());
         let codes: Vec<_> = picks.iter().map(|s| s.code.as_str()).collect();
         // momentum_keep=2 → 600001,600002；低位按涨幅升序 → 600004(0.3),600003(1.0)
-        assert_eq!(codes, vec!["600001", "600002", "600004", "600003"]);
+        assert_eq!(
+            codes,
+            vec![
+                "TEST_CODE_600001",
+                "TEST_CODE_600002",
+                "TEST_CODE_600004",
+                "TEST_CODE_600003"
+            ]
+        );
     }
 
     #[test]
     fn low_position_filters_started_and_illiquid() {
         let comps = vec![
-            bs("600010", 7.0, 5e8, 1.5), // 已涨透(>max_change=5) ✗
-            bs("600011", 2.0, 5e7, 1.5), // 流动性不足(<1亿) ✗
-            bs("600012", 1.0, 5e8, 1.5), // 合格 ✓
+            bs("TEST_CODE_600010", 7.0, 5e8, 1.5), // 已涨透(>max_change=5) ✗
+            bs("TEST_CODE_600011", 2.0, 5e7, 1.5), // 流动性不足(<1亿) ✗
+            bs("TEST_CODE_600012", 1.0, 5e8, 1.5), // 合格 ✓
         ];
         let seen = HashSet::new();
         let cands = pick_low_position(&comps, &seen, &LeaderConfig::default());
         let codes: Vec<_> = cands.iter().map(|s| s.code.as_str()).collect();
-        assert_eq!(codes, vec!["600012"]);
+        assert_eq!(codes, vec!["TEST_CODE_600012"]);
     }
 
     fn board(change: f64, today_pct: f64, pct5: f64, vol: f64) -> ConceptBoard {
@@ -1197,10 +1295,10 @@ mod tests {
     #[test]
     fn compute_ignition_counts_limit_ups() {
         let comps = vec![
-            bs("600001", 10.0, 1e8, 1.0), // 主板涨停(≥9.85)
-            bs("300001", 20.0, 1e8, 1.0), // 创业板涨停(≥19.85)
-            bs("600002", 8.6, 1e8, 1.0),  // 接近涨停(主板 8.6 ≥ 10-1.5)
-            bs("600003", 3.0, 1e8, 1.0),  // 普通
+            bs("TEST_CODE_600001", 10.0, 1e8, 1.0), // 主板涨停(≥9.85)
+            bs("TEST_CODE_300001", 20.0, 1e8, 1.0), // 创业板涨停(≥19.85)
+            bs("TEST_CODE_600002", 8.6, 1e8, 1.0),  // 接近涨停(主板 8.6 ≥ 10-1.5)
+            bs("TEST_CODE_600003", 3.0, 1e8, 1.0),  // 普通
         ];
         let ig = compute_ignition(&comps);
         assert_eq!(ig.limit_up_count, 2);

@@ -103,7 +103,13 @@ impl MarketAnalyzer {
         self.get_sector_rankings(&mut overview)?;
 
         // 4. 获取北向资金（修复 QUANT_ANALYST_REVIEW §1.4）
-        overview.north_flow = Some(self.fetch_north_flow_latest());
+        overview.north_flow = match self.fetch_north_flow_latest() {
+            Ok(value) => value,
+            Err(error) => {
+                warn!("[大盘] 北向资金不可用: {error}");
+                None
+            }
+        };
 
         Ok(overview)
     }
@@ -116,19 +122,20 @@ impl MarketAnalyzer {
     /// 不要在 async 上下文中用 `block_in_place + block_on`, 会触发
     /// tokio runtime drop panic: "Cannot drop a runtime in a context
     /// where blocking is not allowed" (P1.1 引入的回归).
-    fn fetch_north_flow_latest(&self) -> f64 {
+    fn fetch_north_flow_latest(&self) -> Result<Option<f64>> {
         use crate::data_provider::north_flow::NorthFlowClient;
         let client = NorthFlowClient::new();
         match client.fetch_blocking() {
             Ok(series) => {
-                let v = series.latest_total().unwrap_or(0.0);
-                info!("[大盘] 北向资金: {:+.2}亿", v);
-                v
+                let value = series.latest_total();
+                if let Some(value) = value {
+                    info!("[大盘] 北向资金: {value:+.2}亿");
+                } else {
+                    warn!("[大盘] 北向资金源成功但序列为空");
+                }
+                Ok(value)
             }
-            Err(e) => {
-                warn!("[大盘] 北向资金获取失败: {}，将显示 0", e);
-                0.0
-            }
+            Err(error) => Err(anyhow::anyhow!("北向资金获取失败: {error}")),
         }
     }
 
@@ -255,7 +262,6 @@ impl MarketAnalyzer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     // #[test]
     // fn test_parse_sina_line() {

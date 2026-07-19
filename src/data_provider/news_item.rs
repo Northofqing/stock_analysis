@@ -1,3 +1,4 @@
+//! Registered business rules: BR-066, BR-129.
 //! 新闻条目结构 + SHA256 content_hash helper (review #16)
 //!
 //! 设计动机: news_dedup 表只保留 5min 滑窗, 适合"短时间内不要再推"用途;

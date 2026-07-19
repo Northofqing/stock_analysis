@@ -12,10 +12,10 @@
 //!   (保持 fetch 函数纯, 副作用外置)
 //!
 //! **红线**:
-//!   - 写入失败 → warn 不 panic (不阻塞监控主线)
-//!   - 文件不存在 → 自动创建 + 父目录
-//!   - 解析失败行 → 跳过, 不影响其他行
+//!   - 任一读写/解析失败 → 显式 `Err`，调用方不得当作空历史
+//!   - 文件不存在 → 作为尚无历史，返回空批次
 //!   - 同一 (code, date) 重复 append → 去重 (后写覆盖前写)
+//!   - BR-117 仅允许需要三日证据的新闻阶段读取本历史；坏批次不得补零
 //!
 //! **API**: 所有读写函数都有 `*_at(path)` 显式 path 形式 (供 test 隔离),
 //!   无 `_at` 形式从 `SECTOR_HISTORY_PATH` 兜底 `./data/sector_history.jsonl`.
@@ -68,34 +68,71 @@ pub fn history_path() -> PathBuf {
 
 // ============ *_at(path) 形式 — 显式 path, 供 test 隔离用 ============
 
-/// 加载历史 (失败返空, 不 panic)
-pub fn load_history_at(path: &Path) -> Vec<BoardDay> {
+/// 加载历史；任一非空坏行拒绝整批。
+pub fn load_history_at(path: &Path) -> Result<Vec<BoardDay>> {
     if !path.exists() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let file = match fs::File::open(path) {
-        Ok(f) => f,
-        Err(e) => {
-            log::warn!("[SECTOR_HISTORY] 打开失败 {}: {:#}", path.display(), e);
-            return Vec::new();
-        }
-    };
+    let file =
+        fs::File::open(path).with_context(|| format!("打开 sector_history {}", path.display()))?;
     let reader = BufReader::new(file);
     let mut out = Vec::new();
     for (i, line) in reader.lines().enumerate() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
+        let line = line.with_context(|| format!("读取 sector_history 第 {} 行", i + 1))?;
         if line.trim().is_empty() {
-            continue;
+            anyhow::bail!("sector_history 第 {} 行为空", i + 1);
         }
-        match serde_json::from_str::<BoardDay>(&line) {
-            Ok(b) => out.push(b),
-            Err(e) => log::warn!("[SECTOR_HISTORY] 第 {} 行解析失败: {:#} (跳过)", i + 1, e),
+        let board: BoardDay = serde_json::from_str(&line)
+            .with_context(|| format!("解析 sector_history 第 {} 行", i + 1))?;
+        let numerics = [
+            board.change_pct,
+            board.main_inflow,
+            board.main_net_pct_today,
+            board.main_net_pct_5d,
+            board.vol_ratio,
+            board.turnover,
+        ];
+        if board.code.trim().is_empty()
+            || board.name.trim().is_empty()
+            || numerics.iter().any(|value| !value.is_finite())
+            || board.change_pct.abs() > 20.0
+            || board.main_net_pct_today.abs() > 100.0
+            || board.main_net_pct_5d.abs() > 100.0
+            || board.vol_ratio < 0.0
+            || board.turnover < 0.0
+        {
+            anyhow::bail!("sector_history 第 {} 行字段非法", i + 1);
+        }
+        out.push(board);
+    }
+    validate_history_continuity(&out)?;
+    Ok(out)
+}
+
+fn validate_history_continuity(rows: &[BoardDay]) -> Result<()> {
+    let mut by_code: std::collections::HashMap<&str, Vec<NaiveDate>> =
+        std::collections::HashMap::new();
+    for row in rows {
+        by_code.entry(&row.code).or_default().push(row.date);
+    }
+    for (code, dates) in &mut by_code {
+        dates.sort_unstable();
+        for pair in dates.windows(2) {
+            if pair[0] == pair[1] {
+                anyhow::bail!("sector_history {code} 日期重复: {}", pair[0]);
+            }
+            let expected = crate::calendar::next_trading_day(pair[0]);
+            if pair[1] != expected {
+                anyhow::bail!(
+                    "sector_history {code} 交易日断档: {} 后应为 {}, 实际为 {}",
+                    pair[0],
+                    expected,
+                    pair[1]
+                );
+            }
         }
     }
-    out
+    Ok(())
 }
 
 /// 追加今日 boards 到 path (按 (code, date) 去重 — 同日同板覆盖)
@@ -106,7 +143,7 @@ pub fn append_today_at(boards: &[ConceptBoard], path: &Path) -> Result<usize> {
     ensure_parent_dir(path).context("创建 sector_history 父目录失败")?;
 
     let today = Local::now().date_naive();
-    let mut existing = load_history_at(path);
+    let mut existing = load_history_at(path)?;
     let before = existing.len();
     existing.retain(|b| !(b.date == today && boards.iter().any(|nb| nb.code == b.code)));
     let replaced = before.saturating_sub(existing.len());
@@ -129,13 +166,13 @@ pub fn append_today_at(boards: &[ConceptBoard], path: &Path) -> Result<usize> {
 }
 
 /// 取某板块最近 N 日数据 (按 date 降序)
-pub fn fetch_board_history_at(code: &str, n: usize, path: &Path) -> Vec<BoardDay> {
-    let mut all: Vec<BoardDay> = load_history_at(path)
+pub fn fetch_board_history_at(code: &str, n: usize, path: &Path) -> Result<Vec<BoardDay>> {
+    let mut all: Vec<BoardDay> = load_history_at(path)?
         .into_iter()
         .filter(|b| b.code == code)
         .collect();
-    all.sort_by(|a, b| b.date.cmp(&a.date));
-    all.into_iter().take(n).collect()
+    all.sort_by_key(|item| std::cmp::Reverse(item.date));
+    Ok(all.into_iter().take(n).collect())
 }
 
 /// 删 retention_days 之前的数据, 返删除条数
@@ -144,7 +181,7 @@ pub fn cleanup_at(retention_days: usize, path: &Path) -> Result<usize> {
         return Ok(0);
     }
     let cutoff = Local::now().date_naive() - chrono::Duration::days(retention_days as i64);
-    let mut all = load_history_at(path);
+    let mut all = load_history_at(path)?;
     let before = all.len();
     all.retain(|b| b.date >= cutoff);
     let removed = before - all.len();
@@ -165,7 +202,7 @@ pub fn cleanup_at(retention_days: usize, path: &Path) -> Result<usize> {
 
 // ============ 默认 (走 env) 形式 — 生产路径 ============
 
-pub fn load_history() -> Vec<BoardDay> {
+pub fn load_history() -> Result<Vec<BoardDay>> {
     load_history_at(&history_path())
 }
 
@@ -173,7 +210,7 @@ pub fn append_today(boards: &[ConceptBoard]) -> Result<usize> {
     append_today_at(boards, &history_path())
 }
 
-pub fn fetch_board_history(code: &str, n: usize) -> Vec<BoardDay> {
+pub fn fetch_board_history(code: &str, n: usize) -> Result<Vec<BoardDay>> {
     fetch_board_history_at(code, n, &history_path())
 }
 
@@ -184,34 +221,34 @@ pub fn cleanup(retention_days: usize) -> Result<usize> {
 // ============ 派生函数 (供后续 detect_heat_stage 用) ============
 
 /// 板块 N 日累计涨幅 (近 n_days 涨幅相加, 含今日) — 显式 path 形式
-pub fn cumulative_change_pct_at(code: &str, n_days: usize, path: &Path) -> Option<f64> {
-    let history = fetch_board_history_at(code, n_days, path);
-    if history.is_empty() {
-        return None;
+pub fn cumulative_change_pct_at(code: &str, n_days: usize, path: &Path) -> Result<Option<f64>> {
+    let history = fetch_board_history_at(code, n_days, path)?;
+    if history.len() != n_days {
+        return Ok(None);
     }
-    Some(history.iter().map(|b| b.change_pct).sum())
+    Ok(Some(history.iter().map(|b| b.change_pct).sum()))
 }
 
 /// 板块 N 日累计涨幅 — 默认 path 形式 (走 history_path)
-pub fn cumulative_change_pct(code: &str, n_days: usize) -> Option<f64> {
+pub fn cumulative_change_pct(code: &str, n_days: usize) -> Result<Option<f64>> {
     cumulative_change_pct_at(code, n_days, &history_path())
 }
 
 /// 板块 N 日平均资金加速度 (今日 - 5日均, 取近 n_days 平均) — 显式 path
-pub fn avg_inflow_accel_at(code: &str, n_days: usize, path: &Path) -> Option<f64> {
-    let history = fetch_board_history_at(code, n_days, path);
-    if history.is_empty() {
-        return None;
+pub fn avg_inflow_accel_at(code: &str, n_days: usize, path: &Path) -> Result<Option<f64>> {
+    let history = fetch_board_history_at(code, n_days, path)?;
+    if history.len() != n_days {
+        return Ok(None);
     }
     let sum: f64 = history
         .iter()
         .map(|b| b.main_net_pct_today - b.main_net_pct_5d)
         .sum();
-    Some(sum / history.len() as f64)
+    Ok(Some(sum / history.len() as f64))
 }
 
 /// 板块 N 日平均资金加速度 — 默认 path
-pub fn avg_inflow_accel(code: &str, n_days: usize) -> Option<f64> {
+pub fn avg_inflow_accel(code: &str, n_days: usize) -> Result<Option<f64>> {
     avg_inflow_accel_at(code, n_days, &history_path())
 }
 
@@ -284,7 +321,7 @@ mod tests {
         let _ = fs::remove_file(&path);
         let boards = vec![mock_board("BK0001", "测试板块", 3.5)];
         append_today_at(&boards, &path).unwrap();
-        let all = load_history_at(&path);
+        let all = load_history_at(&path).unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].code, "BK0001");
         assert_eq!(all[0].change_pct, 3.5);
@@ -301,7 +338,7 @@ mod tests {
         let v2 = vec![mock_board("BK0001", "测试板块", 5.0)];
         append_today_at(&v1, &path).unwrap();
         append_today_at(&v2, &path).unwrap();
-        let all = load_history_at(&path);
+        let all = load_history_at(&path).unwrap();
         assert_eq!(all.len(), 1, "同日同 code 不应重复");
         assert_eq!(all[0].change_pct, 5.0, "后写覆盖前写");
         let _ = fs::remove_file(&path);
@@ -317,25 +354,30 @@ mod tests {
             mock_board("BK0002", "板块2", 2.0),
         ];
         append_today_at(&v, &path).unwrap();
-        let all = load_history_at(&path);
+        let all = load_history_at(&path).unwrap();
         assert_eq!(all.len(), 2);
         let _ = fs::remove_file(&path);
     }
 
     /// 4) 跨日: 手工写历史 (昨天 + 前天), 今天再写 3.0
-    ///   fetch_board_history 返 3 条 (降序, 今日 3.0 → 昨天 2.0 → 前天 1.0)
+    ///
+    /// fetch_board_history 返 3 条 (降序, 今日 3.0 → 昨天 2.0 → 前天 1.0)
     #[test]
     fn fetch_history_returns_descending() {
         let path = unique_tmp("fetch");
         let _ = fs::remove_file(&path);
-        let today = Local::now().date_naive();
+        let dates = [
+            NaiveDate::from_ymd_opt(2026, 7, 15).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 7, 16).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 7, 17).unwrap(),
+        ];
         let mut history = Vec::new();
-        for (i, chg) in [2.0_f64, 1.0].iter().enumerate() {
+        for (date, chg) in dates.into_iter().zip([1.0_f64, 2.0, 3.0]) {
             history.push(BoardDay {
                 code: "BK0001".to_string(),
                 name: "测试板块".to_string(),
-                date: today - chrono::Duration::days((i + 1) as i64),
-                change_pct: *chg,
+                date,
+                change_pct: chg,
                 main_inflow: 1e8,
                 main_net_pct_today: 3.0,
                 main_net_pct_5d: 1.0,
@@ -345,14 +387,32 @@ mod tests {
         }
         ensure_parent_dir(&path).unwrap();
         write_jsonl(&path, &history).unwrap();
-        append_today_at(&[mock_board("BK0001", "测试板块", 3.0)], &path).unwrap();
 
-        let got = fetch_board_history_at("BK0001", 3, &path);
+        let got = fetch_board_history_at("BK0001", 3, &path).unwrap();
         assert_eq!(got.len(), 3);
         assert_eq!(got[0].change_pct, 3.0, "今日排第 1");
         assert_eq!(got[1].change_pct, 2.0, "昨日排第 2");
         assert_eq!(got[2].change_pct, 1.0, "前日排第 3");
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn br092_history_rejects_duplicate_and_missing_trading_days() {
+        let row = |date| BoardDay {
+            code: "BK_TEST".to_string(),
+            name: "测试板块".to_string(),
+            date,
+            change_pct: 1.0,
+            main_inflow: 1e8,
+            main_net_pct_today: 2.0,
+            main_net_pct_5d: 1.0,
+            vol_ratio: 1.0,
+            turnover: 2.0,
+        };
+        let first = NaiveDate::from_ymd_opt(2026, 7, 15).unwrap();
+        let gap = NaiveDate::from_ymd_opt(2026, 7, 17).unwrap();
+        assert!(validate_history_continuity(&[row(first), row(first)]).is_err());
+        assert!(validate_history_continuity(&[row(first), row(gap)]).is_err());
     }
 
     /// 5) cleanup 删旧: 60 天前 1 条 + 今天 1 条, cleanup(30) → 删 1 条
@@ -378,7 +438,7 @@ mod tests {
 
         let removed = cleanup_at(30, &path).unwrap();
         assert_eq!(removed, 1, "60 天前的应被删");
-        let after = load_history_at(&path);
+        let after = load_history_at(&path).unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].code, "BK0002");
         let _ = fs::remove_file(&path);
@@ -389,14 +449,17 @@ mod tests {
     fn cumulative_change_basic() {
         let path = unique_tmp("cum");
         let _ = fs::remove_file(&path);
-        let today = Local::now().date_naive();
         let mut items = Vec::new();
-        for (i, chg) in [1.0_f64, 2.0, 3.0].iter().enumerate() {
+        for (date, chg) in [
+            (NaiveDate::from_ymd_opt(2026, 7, 15).unwrap(), 3.0_f64),
+            (NaiveDate::from_ymd_opt(2026, 7, 16).unwrap(), 2.0_f64),
+            (NaiveDate::from_ymd_opt(2026, 7, 17).unwrap(), 1.0_f64),
+        ] {
             items.push(BoardDay {
                 code: "BK0001".to_string(),
                 name: "X".to_string(),
-                date: today - chrono::Duration::days(i as i64),
-                change_pct: *chg,
+                date,
+                change_pct: chg,
                 main_inflow: 0.0,
                 main_net_pct_today: 0.0,
                 main_net_pct_5d: 0.0,
@@ -407,7 +470,9 @@ mod tests {
         ensure_parent_dir(&path).unwrap();
         write_jsonl(&path, &items).unwrap();
 
-        let cum = cumulative_change_pct_at("BK0001", 3, &path).unwrap_or(f64::NAN);
+        let cum = cumulative_change_pct_at("BK0001", 3, &path)
+            .unwrap()
+            .unwrap_or(f64::NAN);
         assert!(
             (cum - 6.0).abs() < 1e-6,
             "3 日累计 = 1+2+3 = 6, got {}",
@@ -422,13 +487,45 @@ mod tests {
         let path = unique_tmp("none");
         let _ = fs::remove_file(&path);
         // 路径不存在, load_history_at 返空, cumulative 返 None
-        assert!(cumulative_change_pct_at("BK0000", 3, &path).is_none());
-        assert!(avg_inflow_accel_at("BK0000", 3, &path).is_none());
+        assert!(cumulative_change_pct_at("BK0000", 3, &path)
+            .unwrap()
+            .is_none());
+        assert!(avg_inflow_accel_at("BK0000", 3, &path).unwrap().is_none());
     }
 
-    /// 8) 解析失败行跳过 (不 panic, 不影响其他行)
     #[test]
-    fn parse_error_lines_skipped() {
+    fn br117_cumulative_requires_the_complete_requested_window() {
+        let path = unique_tmp("insufficient_window");
+        let rows = [
+            (NaiveDate::from_ymd_opt(2026, 7, 16).unwrap(), 1.0_f64),
+            (NaiveDate::from_ymd_opt(2026, 7, 17).unwrap(), 2.0_f64),
+        ]
+        .into_iter()
+        .map(|(date, change_pct)| BoardDay {
+            code: "BK_TEST".to_string(),
+            name: "测试板块".to_string(),
+            date,
+            change_pct,
+            main_inflow: 1e8,
+            main_net_pct_today: 2.0,
+            main_net_pct_5d: 1.0,
+            vol_ratio: 1.0,
+            turnover: 2.0,
+        })
+        .collect::<Vec<_>>();
+        ensure_parent_dir(&path).unwrap();
+        write_jsonl(&path, &rows).unwrap();
+
+        assert!(cumulative_change_pct_at("BK_TEST", 3, &path)
+            .unwrap()
+            .is_none());
+        assert!(avg_inflow_accel_at("BK_TEST", 3, &path).unwrap().is_none());
+        let _ = fs::remove_file(path);
+    }
+
+    /// 8) 任一解析失败行拒绝整批
+    #[test]
+    fn parse_error_rejects_entire_batch() {
         let path = unique_tmp("parse");
         let _ = fs::remove_file(&path);
         ensure_parent_dir(&path).unwrap();
@@ -445,9 +542,7 @@ mod tests {
         )
         .unwrap();
         drop(f);
-        let all = load_history_at(&path);
-        assert_eq!(all.len(), 1, "坏行跳过, 好行保留");
-        assert_eq!(all[0].code, "BK0001");
+        assert!(load_history_at(&path).is_err());
         let _ = fs::remove_file(&path);
     }
 }

@@ -1,3 +1,4 @@
+//! Registered business rules: BR-069.
 //! 持仓影响评估 — 每条新闻 × 每只持仓 → 利好/中性/利空。
 
 use super::chain_mapper::ChainHit;
@@ -231,9 +232,17 @@ fn build_static_chain_hit(chain: &str, concepts: &[String]) -> Option<ChainHit> 
 }
 
 fn load_cached_concepts_safe(max_age_days: i64) -> std::collections::HashMap<String, Vec<String>> {
-    crate::database::DatabaseManager::try_get()
-        .map(|db| db.get_cached_concepts(max_age_days))
-        .unwrap_or_default()
+    let Some(db) = crate::database::DatabaseManager::try_get() else {
+        log::error!("[Opportunity][BR-112] concept cache unavailable: database not initialized");
+        return std::collections::HashMap::new();
+    };
+    match db.get_cached_concepts(max_age_days) {
+        Ok(concepts) => concepts,
+        Err(error) => {
+            log::error!("[Opportunity][BR-112] concept cache rejected: {error}");
+            std::collections::HashMap::new()
+        }
+    }
 }
 
 /// 评估新闻对持仓的影响。
@@ -392,7 +401,7 @@ mod tests {
             name: name.into(),
             shares: 1000,
             cost_price: 10.0,
-            hard_stop: 9.0,
+            hard_stop: Some(9.0),
             added_at: NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
             status: crate::portfolio::PositionStatus::Holding,
             sector: "其他".into(),
@@ -416,39 +425,39 @@ mod tests {
 
     #[test]
     fn test_inflow_positive() {
-        let hits = vec![hit_with_flow("002579", "中京电子", Some(5.0))];
-        let impacts = assess_impact(&hits, &vec![pos("002579", "中京电子")]);
+        let hits = vec![hit_with_flow("TEST_CODE_002579", "中京电子", Some(5.0))];
+        let impacts = assess_impact(&hits, &[pos("TEST_CODE_002579", "中京电子")]);
         assert_eq!(impacts[0].direction, ImpactDirection::Positive);
     }
 
     #[test]
     fn test_outflow_negative() {
         // 消息利好但主力大幅净流出 → 利空（资金背离）
-        let hits = vec![hit_with_flow("002579", "中京电子", Some(-6.0))];
-        let impacts = assess_impact(&hits, &vec![pos("002579", "中京电子")]);
+        let hits = vec![hit_with_flow("TEST_CODE_002579", "中京电子", Some(-6.0))];
+        let impacts = assess_impact(&hits, &[pos("TEST_CODE_002579", "中京电子")]);
         assert_eq!(impacts[0].direction, ImpactDirection::Negative);
     }
 
     #[test]
     fn test_flat_flow_neutral() {
-        let hits = vec![hit_with_flow("002579", "中京电子", Some(0.5))];
-        let impacts = assess_impact(&hits, &vec![pos("002579", "中京电子")]);
+        let hits = vec![hit_with_flow("TEST_CODE_002579", "中京电子", Some(0.5))];
+        let impacts = assess_impact(&hits, &[pos("TEST_CODE_002579", "中京电子")]);
         assert_eq!(impacts[0].direction, ImpactDirection::Neutral);
     }
 
     #[test]
     fn test_missing_flow_neutral_not_assumed() {
         // 缺资金数据 → 中性·数据不足，绝不臆测为利好/利空
-        let hits = vec![hit_with_flow("002579", "中京电子", None)];
-        let impacts = assess_impact(&hits, &vec![pos("002579", "中京电子")]);
+        let hits = vec![hit_with_flow("TEST_CODE_002579", "中京电子", None)];
+        let impacts = assess_impact(&hits, &[pos("TEST_CODE_002579", "中京电子")]);
         assert_eq!(impacts[0].direction, ImpactDirection::Neutral);
         assert!(impacts[0].reason.contains("数据不足"));
     }
 
     #[test]
     fn test_unrelated_holding_neutral() {
-        let hits = vec![hit_with_flow("002579", "中京电子", Some(5.0))];
-        let holdings = vec![pos("000813", "德展健康")];
+        let hits = vec![hit_with_flow("TEST_CODE_002579", "中京电子", Some(5.0))];
+        let holdings = vec![pos("TEST_CODE_000813", "德展健康")];
         let impacts = assess_impact(&hits, &holdings);
         assert_eq!(impacts[0].direction, ImpactDirection::Neutral);
         assert!(impacts[0].reason.contains("无直接产业链关联"));
@@ -461,7 +470,7 @@ mod tests {
                 chain: "AI硬件-CPO".into(),
                 keywords: vec!["光模块".into(), "CPO".into(), "硅光".into()],
                 logic: "光互联升级".into(),
-                stocks: vec![si("002579", "中京电子")],
+                stocks: vec![si("TEST_CODE_002579", "中京电子")],
                 source: super::super::chain_mapper::ChainSource::Rule,
                 board_keyword: "CPO".into(),
                 fund_flow_pct: Some(3.0),
@@ -472,7 +481,7 @@ mod tests {
                 chain: "AI硬件-PCB".into(),
                 keywords: vec!["PCB".into()],
                 logic: "PCB价值量提升".into(),
-                stocks: vec![si("002579", "中京电子")],
+                stocks: vec![si("TEST_CODE_002579", "中京电子")],
                 source: super::super::chain_mapper::ChainSource::Rule,
                 board_keyword: "PCB".into(),
                 fund_flow_pct: Some(3.0),
@@ -482,7 +491,7 @@ mod tests {
         ];
 
         let concepts = vec!["PCB概念".to_string(), "HDI".to_string()];
-        let best = select_best_hit(&hits, "002579", &concepts).unwrap();
+        let best = select_best_hit(&hits, "TEST_CODE_002579", &concepts).unwrap();
         assert_eq!(best.chain, "AI硬件-PCB");
     }
 
@@ -501,7 +510,7 @@ mod tests {
     #[test]
     fn test_is_zero_signal_pure_neutral() {
         let i = imp(
-            "002208",
+            "TEST_CODE_002208",
             "合肥城建",
             ImpactDirection::Neutral,
             "无直接产业链关联",
@@ -513,7 +522,7 @@ mod tests {
     #[test]
     fn test_is_zero_signal_neutral_with_chain() {
         let i = imp(
-            "002208",
+            "TEST_CODE_002208",
             "合肥城建",
             ImpactDirection::Neutral,
             "[板块联动] 房地产开发 合肥城建(002208): 房地产板块短线拉升（资金平淡-1.5%）",
@@ -525,14 +534,14 @@ mod tests {
     #[test]
     fn test_is_zero_signal_actionable_always() {
         assert!(!imp(
-            "002208",
+            "TEST_CODE_002208",
             "合肥城建",
             ImpactDirection::Positive,
             "AI硬件-PCB ...: 涨价"
         )
         .is_zero_signal());
         assert!(!imp(
-            "002208",
+            "TEST_CODE_002208",
             "合肥城建",
             ImpactDirection::Negative,
             "AI硬件-PCB ...: 资金背离"

@@ -233,11 +233,11 @@ impl BollingerZScoreBacktest {
             let dt = Local
                 .from_local_datetime(&naive.and_hms_opt(15, 0, 0).unwrap())
                 .single()
-                .unwrap_or_else(|| Local::now());
+                .unwrap_or_else(Local::now);
 
             // 日期范围过滤：仅在范围内记录净值和交易
-            let in_date_range = self.config.start_date.map_or(true, |s| naive >= s)
-                && self.config.end_date.map_or(true, |e| naive <= e);
+            let in_date_range = self.config.start_date.is_none_or(|s| naive >= s)
+                && self.config.end_date.is_none_or(|e| naive <= e);
 
             if in_date_range {
                 daily_values.push((dt, total_value));
@@ -275,7 +275,7 @@ impl BollingerZScoreBacktest {
                             let dt_next = Local
                                 .from_local_datetime(&d.and_hms_opt(15, 0, 0).unwrap())
                                 .single()
-                                .unwrap_or_else(|| Local::now());
+                                .unwrap_or_else(Local::now);
                             Some((p, dt_next))
                         }
                         _ => None,
@@ -387,7 +387,7 @@ impl BollingerZScoreBacktest {
             } else {
                 owned = {
                     let mut s = klines.clone();
-                    s.sort_unstable_by(|a, b| a.date.cmp(&b.date));
+                    s.sort_unstable_by_key(|a| a.date);
                     s
                 };
                 &owned
@@ -464,7 +464,7 @@ impl BollingerZScoreBacktest {
             let dt = Local
                 .from_local_datetime(&naive.and_hms_opt(15, 0, 0).unwrap())
                 .single()
-                .unwrap_or_else(|| Local::now());
+                .unwrap_or_else(Local::now);
 
             let sum: f64 = maps
                 .iter()
@@ -604,7 +604,7 @@ impl BollingerZScoreResult {
             "| 滑点率 | {:.1}‰ |\n",
             self.config.slippage_rate * 1000.0
         ));
-        report.push_str("\n");
+        report.push('\n');
 
         // 组合汇总
         report.push_str("## 📈 组合回测结果\n\n");
@@ -677,7 +677,7 @@ impl BollingerZScoreResult {
             "| 胜率 | {:.1}% | - |\n",
             summary.win_rate * 100.0
         ));
-        report.push_str("\n");
+        report.push('\n');
 
         // 个股明细
         report.push_str("## 📋 个股回测明细\n\n");
@@ -698,7 +698,7 @@ impl BollingerZScoreResult {
                 r.trades.len()
             ));
         }
-        report.push_str("\n");
+        report.push('\n');
 
         // 策略说明
         report.push_str("## 📝 策略说明\n\n");

@@ -13,9 +13,74 @@
 //!   - b-008 §4.1: data_mode = Down 时, 仅 always_send_on_data_source_down=true 且 event_kind=data_source_down 才放行
 
 use chrono::{DateTime, Local, Timelike};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::push_l1::{SignalEvent, SignalPayload, SignalSource};
-use crate::push_l2::{DataMode, TemplateCategory, TemplateMetadata};
+use crate::push_l2::{DataMode, TemplateMetadata};
+
+/// v17.1 review F8 fix: Frozen warn 节流.
+///
+/// 每条 push 都打 "Frozen 上下文 + frozen_mode_respect=true → 放行" 在 frozen_mode_respect
+/// 启用场景下形成日志噪声 (默认 false, 但逃生路径仍可能启用). 节流到 60s 一次.
+///
+/// 实现: 进程级 AtomicU64 (上次 warn 的 UNIX 秒); 距上次 ≥ 60s 才打 warn.
+const FROZEN_WARN_THROTTLE_SECS: u64 = 60;
+static LAST_FROZEN_WARN_TS: AtomicU64 = AtomicU64::new(0);
+
+/// 当前时间 (UNIX seconds). 测试可替换.
+#[cfg(not(test))]
+fn now_unix_secs() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+fn now_unix_secs() -> u64 {
+    0 // 测试场景用确定性 0; 节流 helper 走测试 helper 自己 mock
+}
+
+/// 节流打 Frozen warn: 距上次 ≥ 60s 才打, 否则 silent.
+///
+/// 修 FINDING #5+#6 (review F8):
+/// - 修 race: 用 compare_exchange 循环保证多个并发线程只有 1 个能更新 timestamp
+///   (原 load-then-store 允许多个线程都看到 stale last_ts 后都打 warn).
+/// - 修 clock skew: 时钟回退时 saturating_sub 返 0 → 持续静默; 改用 max(now, last)
+///   保证 timestamp 单调不减, 时钟回退后下次 warn 仍能 fire (但保持 60s 间隔).
+fn throttled_frozen_warn() {
+    let now = now_unix_secs();
+    loop {
+        let last = LAST_FROZEN_WARN_TS.load(Ordering::Relaxed);
+        // monotonic timestamp: max(now, last) 保证不回退
+        let new_ts = now.max(last);
+        if new_ts.saturating_sub(last) < FROZEN_WARN_THROTTLE_SECS {
+            return;
+        }
+        // compare_exchange: 仅当 last 仍是当前值才更新, 否则重试
+        match LAST_FROZEN_WARN_TS.compare_exchange(
+            last,
+            new_ts,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => {
+                log::warn!(
+                    "[v17.1-F8] Frozen 上下文 + frozen_mode_respect=true → 放行, 模板应渲染 ⚠️ 警告 (节流 60s/次)"
+                );
+                return;
+            }
+            Err(_) => continue, // 其他线程抢先更新, 重读
+        }
+    }
+}
+
+/// 测试用: 重置节流 timestamp, 让下次 warn 可通过.
+#[cfg(test)]
+fn reset_frozen_warn_throttle_for_test() {
+    LAST_FROZEN_WARN_TS.store(0, Ordering::Relaxed);
+}
 
 /// Governance 决策
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -97,8 +162,13 @@ impl GovernanceEngine {
         }
 
         // Step 2: 冻结模式
+        // v17.1 治本: Frozen 状态不再 Deny, 模板从 ctx.is_frozen 读后渲染 ⚠️ 警告
+        // 仓位风险控制应在 broker 下单层, 通知层应保持出声 (4 铁律)
+        // 字段保留用于日志/审计.
+        // F8 fix: 节流到 60s 一次, 避免 frozen_mode_respect=true 启用时每条 push 都 warn.
         if profile.frozen_mode_respect && ctx.is_frozen {
-            return GovernanceDecision::Deny("frozen".to_string());
+            throttled_frozen_warn();
+            // 故意 fall through, 不 return Deny
         }
 
         // Step 3: 数据质量 (b-008 §4.1: data_source_down 主动告警可豁免)
@@ -133,7 +203,7 @@ impl Default for GovernanceEngine {
 /// 静默期判定 (02:00-06:00)
 pub fn is_quiet_hour(ts: DateTime<Local>) -> bool {
     let hour = ts.hour();
-    hour >= 2 && hour < 6
+    (2..6).contains(&hour)
 }
 
 /// 从 SignalEvent 推断 payload 严重度 (用于 governance 优先级)
@@ -160,17 +230,20 @@ pub fn is_data_source_down_event(event: &SignalEvent) -> bool {
 mod tests {
     use super::*;
     use crate::push_l1::{DataSourceDownPayload, LimitUpPayload, Severity};
+    use crate::push_l2::TemplateCategory;
     use chrono::TimeZone;
 
     fn make_event(source: SignalSource) -> SignalEvent {
         let payload = match source {
-            SignalSource::DataSourceDown => SignalPayload::DataSourceDown(DataSourceDownPayload::default()),
+            SignalSource::DataSourceDown => {
+                SignalPayload::DataSourceDown(DataSourceDownPayload::default())
+            }
             _ => SignalPayload::LimitUp(LimitUpPayload::default()),
         };
         SignalEvent::new(
             source,
             "test",
-            Some("600519".to_string()),
+            Some("TEST_CODE_600519".to_string()),
             Local::now(),
             payload,
             Severity::High,
@@ -200,7 +273,10 @@ mod tests {
         let profile = make_profile(true, true, DataMode::Full, false);
         let event = make_event(SignalSource::LimitUp);
         let ctx = GovernanceContext::default();
-        assert_eq!(engine.check(&profile, &event, &ctx), GovernanceDecision::Approve);
+        assert_eq!(
+            engine.check(&profile, &event, &ctx),
+            GovernanceDecision::Approve
+        );
     }
 
     #[test]
@@ -212,7 +288,10 @@ mod tests {
             is_quiet_hour: true,
             ..Default::default()
         };
-        assert_eq!(engine.check(&profile, &event, &ctx), GovernanceDecision::Deny("quiet_hour".to_string()));
+        assert_eq!(
+            engine.check(&profile, &event, &ctx),
+            GovernanceDecision::Deny("quiet_hour".to_string())
+        );
     }
 
     #[test]
@@ -229,6 +308,10 @@ mod tests {
 
     #[test]
     fn deny_in_frozen_mode_when_respect_enabled() {
+        // v17.1 治本: Frozen 状态不再 Deny, 而是由模板在 banner 渲染 ⚠️ 警告
+        // 旧行为: assert_eq!(...Deny("frozen"...))  - 违反 4 铁律"默认值出声"
+        // 新行为: Approve (放行), ctx.is_frozen 保留给模板做警告
+        // 仓位风险控制应在 broker 下单层, 不在通知层 (v17.1 决策)
         let engine = GovernanceEngine::new();
         let profile = make_profile(true, true, DataMode::Full, false);
         let event = make_event(SignalSource::LimitUp);
@@ -236,7 +319,10 @@ mod tests {
             is_frozen: true,
             ..Default::default()
         };
-        assert_eq!(engine.check(&profile, &event, &ctx), GovernanceDecision::Deny("frozen".to_string()));
+        assert!(
+            engine.check(&profile, &event, &ctx).is_approve(),
+            "v17.1: Frozen 状态必须放行 (banner 警告), 不能 Deny"
+        );
     }
 
     #[test]
@@ -250,7 +336,10 @@ mod tests {
             data_mode: DataMode::Degraded,
             ..Default::default()
         };
-        assert_eq!(engine.check(&profile, &event, &ctx), GovernanceDecision::Deny("data_quality".to_string()));
+        assert_eq!(
+            engine.check(&profile, &event, &ctx),
+            GovernanceDecision::Deny("data_quality".to_string())
+        );
     }
 
     // W5.X 新增: QuietHour 事件在静默期仍应放行 (自身治理事件, b-008 §3.0)
@@ -263,8 +352,10 @@ mod tests {
             is_quiet_hour: true,
             ..Default::default()
         };
-        assert!(engine.check(&profile, &event, &ctx).is_approve(),
-            "QuietHour 事件在静默期应放行 (自身治理观察)");
+        assert!(
+            engine.check(&profile, &event, &ctx).is_approve(),
+            "QuietHour 事件在静默期应放行 (自身治理观察)"
+        );
     }
 
     #[test]
@@ -294,8 +385,10 @@ mod tests {
             data_mode: DataMode::Down,
             ..Default::default()
         };
-        assert!(engine.check(&profile, &event, &ctx).is_approve(),
-            "b-008 §4.1: DataSourceDown 在 data_mode=Down 时应放行");
+        assert!(
+            engine.check(&profile, &event, &ctx).is_approve(),
+            "b-008 §4.1: DataSourceDown 在 data_mode=Down 时应放行"
+        );
     }
 
     #[test]
@@ -308,7 +401,10 @@ mod tests {
             data_mode: DataMode::Down,
             ..Default::default()
         };
-        assert_eq!(engine.check(&profile, &event, &ctx), GovernanceDecision::Deny("data_quality".to_string()));
+        assert_eq!(
+            engine.check(&profile, &event, &ctx),
+            GovernanceDecision::Deny("data_quality".to_string())
+        );
     }
 
     #[test]
@@ -321,7 +417,10 @@ mod tests {
             today_pushed_count: 3,
             ..Default::default()
         };
-        assert_eq!(engine.check(&profile, &event, &ctx), GovernanceDecision::Deny("daily_limit".to_string()));
+        assert_eq!(
+            engine.check(&profile, &event, &ctx),
+            GovernanceDecision::Deny("daily_limit".to_string())
+        );
     }
 
     #[test]
@@ -339,26 +438,40 @@ mod tests {
 
     #[test]
     fn quiet_hour_detection_2am_to_6am() {
-        assert!(is_quiet_hour(Local.with_ymd_and_hms(2026, 7, 11, 2, 0, 0).unwrap()));
-        assert!(is_quiet_hour(Local.with_ymd_and_hms(2026, 7, 11, 5, 59, 0).unwrap()));
-        assert!(!is_quiet_hour(Local.with_ymd_and_hms(2026, 7, 11, 6, 0, 0).unwrap()));
-        assert!(!is_quiet_hour(Local.with_ymd_and_hms(2026, 7, 11, 1, 59, 0).unwrap()));
-        assert!(!is_quiet_hour(Local.with_ymd_and_hms(2026, 7, 11, 23, 0, 0).unwrap()));
+        assert!(is_quiet_hour(
+            Local.with_ymd_and_hms(2026, 7, 11, 2, 0, 0).unwrap()
+        ));
+        assert!(is_quiet_hour(
+            Local.with_ymd_and_hms(2026, 7, 11, 5, 59, 0).unwrap()
+        ));
+        assert!(!is_quiet_hour(
+            Local.with_ymd_and_hms(2026, 7, 11, 6, 0, 0).unwrap()
+        ));
+        assert!(!is_quiet_hour(
+            Local.with_ymd_and_hms(2026, 7, 11, 1, 59, 0).unwrap()
+        ));
+        assert!(!is_quiet_hour(
+            Local.with_ymd_and_hms(2026, 7, 11, 23, 0, 0).unwrap()
+        ));
     }
 
     #[test]
     fn event_severity_ordering() {
-        assert!(event_severity(&make_event_with_severity(Severity::Emergency))
-            > event_severity(&make_event_with_severity(Severity::High)));
-        assert!(event_severity(&make_event_with_severity(Severity::High))
-            > event_severity(&make_event_with_severity(Severity::Normal)));
+        assert!(
+            event_severity(&make_event_with_severity(Severity::Emergency))
+                > event_severity(&make_event_with_severity(Severity::High))
+        );
+        assert!(
+            event_severity(&make_event_with_severity(Severity::High))
+                > event_severity(&make_event_with_severity(Severity::Normal))
+        );
     }
 
     fn make_event_with_severity(sev: Severity) -> SignalEvent {
         SignalEvent::new(
             SignalSource::LimitUp,
             "test",
-            Some("000001".to_string()),
+            Some("TEST_CODE_000001".to_string()),
             Local::now(),
             SignalPayload::LimitUp(LimitUpPayload::default()),
             sev,
@@ -382,5 +495,27 @@ mod tests {
         let d = GovernanceDecision::Approve;
         assert_eq!(d.deny_reason(), None);
         assert!(d.is_approve());
+    }
+
+    // ============== F8: Frozen warn 节流测试 ==============
+    //
+    // 注: cfg(test) 下 now_unix_secs() 返回 0, 节流窗口 = [0, 60).
+    // 第一次 throttled_frozen_warn() → 0.saturating_sub(0)=0 < 60 → 静默 (不更新 last_ts).
+    // 第二次在窗口内 → 静默.
+    // reset_frozen_warn_throttle_for_test 不改语义, 仅给 multi-test 隔离用.
+
+    #[test]
+    fn throttled_frozen_warn_helper_callable() {
+        // 不 panic + 不 log error (cfg(test) 下 now_unix_secs=0 走节流路径).
+        reset_frozen_warn_throttle_for_test();
+        throttled_frozen_warn();
+        throttled_frozen_warn();
+        // 测试不依赖 log capture — 仅验证 helper 不 panic.
+    }
+
+    #[test]
+    fn frozen_warn_throttle_constant_in_range() {
+        // 文档化窗口: 60s 一次. 防止后续修改默认值.
+        assert_eq!(FROZEN_WARN_THROTTLE_SECS, 60);
     }
 }

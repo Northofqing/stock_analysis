@@ -133,3 +133,58 @@ fn nz<'a>(s: &'a str, fallback: &'a str) -> &'a str {
         s
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn analyzer(trace: bool) -> GeminiAnalyzer {
+        GeminiAnalyzer::new(crate::analyzer::GeminiConfig {
+            agent_trace: trace,
+            max_retries: 1,
+            retry_delay: 0.0,
+            request_delay: 0.0,
+            ..crate::analyzer::GeminiConfig::default()
+        })
+    }
+
+    #[test]
+    fn trace_renderers_cover_enabled_disabled_empty_and_truncated_views() {
+        let enabled = analyzer(true);
+        let disabled = analyzer(false);
+        assert!(trace_enabled(&enabled));
+        assert!(!trace_enabled(&disabled));
+        let slices = DomainSlices {
+            basics: "TEST_CODE_basics".to_string(),
+            technical: "TEST_CODE_technical".to_string(),
+            capital: "TEST_CODE_capital".to_string(),
+            fundamental: "TEST_CODE_fundamental".to_string(),
+            news: Some("新闻".repeat(1_600)),
+            macro_ctx: Some("宏观".repeat(1_600)),
+            sector: "TEST_CODE_sector".to_string(),
+        };
+        print_slices(&slices);
+        let view = AnalystView {
+            score: 50,
+            stance: String::new(),
+            confidence: String::new(),
+            key_signals: Vec::new(),
+            summary: "摘要".repeat(250),
+        };
+        print_analyst(&disabled, "测试分析师", &view);
+        print_analyst(&enabled, "测试分析师", &view);
+        let debate = DebateOutput {
+            bull: String::new(),
+            bear: "TEST_CODE_空头".to_string(),
+            risk: String::new(),
+        };
+        print_debate(&disabled, &debate);
+        print_debate(&enabled, &debate);
+        print_final(&disabled, 50, &"终稿".repeat(700));
+        print_final(&enabled, 50, "TEST_CODE_终稿");
+        assert_eq!(truncate("短文本", 10), "短文本");
+        assert!(truncate("很长的文本", 2).contains("已截断"));
+        assert_eq!(nz("  ", "fallback"), "fallback");
+        assert_eq!(nz("value", "fallback"), "value");
+    }
+}

@@ -157,7 +157,7 @@ pub struct HoldingHealthPayload {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PositionChangedPayload {
     pub code: Option<String>,
-    pub action: Option<String>,  // buy/sell/hold
+    pub action: Option<String>, // buy/sell/hold
     pub qty: Option<u32>,
     pub price: Option<f64>,
 }
@@ -173,7 +173,7 @@ pub struct DataSourceDownPayload {
 /// 盘后复盘事件 payload (b-008 §2.1 补充)
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PostSessionReviewPayload {
-    pub review_type: Option<String>,  // lhb/market/signal/failure
+    pub review_type: Option<String>, // lhb/market/signal/failure
     pub summary: Option<String>,
 }
 
@@ -223,7 +223,7 @@ pub fn make_event_id(source_kind: &str, code: Option<&str>, ts: DateTime<Local>)
     let bucket_ts = bucket_ts(source_kind, ts);
     let input = format!("{source_kind}:{code_str}:{bucket_ts}");
     let hash = Sha256::digest(input.as_bytes());
-    hex::encode(&hash[..8])  // 16 hex 字符
+    hex::encode(&hash[..8]) // 16 hex 字符
 }
 
 fn bucket_ts(source_kind: &str, ts: DateTime<Local>) -> i64 {
@@ -244,9 +244,9 @@ fn bucket_ts(source_kind: &str, ts: DateTime<Local>) -> i64 {
 /// 新方案: SignalPayload 各变体在编译期绑定 EventBucket, 避免字符串误匹配
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventBucket {
-    OneSec,    // 涨跌停 / 委托 / 盘口
-    TenSec,    // 板块轮动 / 资金流 / 新闻催化
-    FiveMin,   // 盘后 / 节假日 / 静默时段
+    OneSec,  // 涨跌停 / 委托 / 盘口
+    TenSec,  // 板块轮动 / 资金流 / 新闻催化
+    FiveMin, // 盘后 / 节假日 / 静默时段
 }
 
 impl EventBucket {
@@ -254,8 +254,7 @@ impl EventBucket {
     pub fn for_kind(kind: &str) -> Self {
         match kind {
             // 高频: 涨跌停 / 委托 / 盘口
-            "limit_up" | "limit_up_today" | "limit_up_tier"
-            | "order" | "depth" => Self::OneSec,
+            "limit_up" | "limit_up_today" | "limit_up_tier" | "order" | "depth" => Self::OneSec,
             // 中频: 板块轮动 / 资金流 / 新闻催化
             "sector_rotation" | "money_flow" | "news_catalyst" => Self::TenSec,
             // 低频: 盘后 / 节假日 / 静默时段
@@ -304,16 +303,16 @@ mod tests {
     #[test]
     fn same_event_same_id() {
         let ts = Local::now();
-        let id1 = make_event_id("limit_up", Some("600519"), ts);
-        let id2 = make_event_id("limit_up", Some("600519"), ts);
+        let id1 = make_event_id("limit_up", Some("TEST_CODE_600519"), ts);
+        let id2 = make_event_id("limit_up", Some("TEST_CODE_600519"), ts);
         assert_eq!(id1, id2);
     }
 
     #[test]
     fn different_code_different_id() {
         let ts = Local::now();
-        let id1 = make_event_id("limit_up", Some("600519"), ts);
-        let id2 = make_event_id("limit_up", Some("000001"), ts);
+        let id1 = make_event_id("limit_up", Some("TEST_CODE_600519"), ts);
+        let id2 = make_event_id("limit_up", Some("TEST_CODE_000001"), ts);
         assert_ne!(id1, id2);
     }
 
@@ -321,8 +320,8 @@ mod tests {
     fn different_second_different_id_for_high_freq() {
         let ts1 = Local::now();
         let ts2 = ts1 + Duration::seconds(2);
-        let id1 = make_event_id("order", Some("600519"), ts1);
-        let id2 = make_event_id("order", Some("600519"), ts2);
+        let id1 = make_event_id("order", Some("TEST_CODE_600519"), ts1);
+        let id2 = make_event_id("order", Some("TEST_CODE_600519"), ts2);
         assert_ne!(id1, id2);
     }
 
@@ -340,7 +339,7 @@ mod tests {
 
     #[test]
     fn id_is_16_hex_chars() {
-        let id = make_event_id("test", Some("000001"), Local::now());
+        let id = make_event_id("test", Some("TEST_CODE_000001"), Local::now());
         assert_eq!(id.len(), 16);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
     }
@@ -352,16 +351,31 @@ mod tests {
         //         新版精确匹配: 不在 kind 列表 → TenSec (默认)
         // 反例 2: "limit_up_suspended" 含 "limit_up" 子串, 旧版会误判 1 秒桶
         //         新版精确匹配: 不在 kind 列表 → TenSec (默认)
-        assert_eq!(EventBucket::for_kind("news.drivers_for_orders"), EventBucket::TenSec);
-        assert_eq!(EventBucket::for_kind("limit_up_suspended"), EventBucket::TenSec);
-        assert_eq!(EventBucket::for_kind("drivers_for_orders"), EventBucket::TenSec);
+        assert_eq!(
+            EventBucket::for_kind("news.drivers_for_orders"),
+            EventBucket::TenSec
+        );
+        assert_eq!(
+            EventBucket::for_kind("limit_up_suspended"),
+            EventBucket::TenSec
+        );
+        assert_eq!(
+            EventBucket::for_kind("drivers_for_orders"),
+            EventBucket::TenSec
+        );
 
         // 正例: 已注册的 kind 仍正确匹配
         assert_eq!(EventBucket::for_kind("limit_up"), EventBucket::OneSec);
         assert_eq!(EventBucket::for_kind("order"), EventBucket::OneSec);
-        assert_eq!(EventBucket::for_kind("sector_rotation"), EventBucket::TenSec);
+        assert_eq!(
+            EventBucket::for_kind("sector_rotation"),
+            EventBucket::TenSec
+        );
         assert_eq!(EventBucket::for_kind("post_session"), EventBucket::FiveMin);
-        assert_eq!(EventBucket::for_kind("data_source_down"), EventBucket::OneSec);
+        assert_eq!(
+            EventBucket::for_kind("data_source_down"),
+            EventBucket::OneSec
+        );
         assert_eq!(EventBucket::for_kind("risk_violation"), EventBucket::OneSec);
     }
 
@@ -369,7 +383,7 @@ mod tests {
     fn signal_event_auto_derives_event_id() {
         let ts = Local::now();
         let payload = SignalPayload::LimitUp(LimitUpPayload {
-            code: Some("600519".to_string()),
+            code: Some("TEST_CODE_600519".to_string()),
             name: Some("贵州茅台".to_string()),
             change_pct: Some(10.0),
             seal_amount_wan: None,
@@ -377,7 +391,7 @@ mod tests {
         let event = SignalEvent::new(
             SignalSource::LimitUp,
             "limit_up",
-            Some("600519".to_string()),
+            Some("TEST_CODE_600519".to_string()),
             ts,
             payload,
             Severity::High,
@@ -390,7 +404,10 @@ mod tests {
     fn payload_missing_fields_are_optional_not_zero() {
         // 验证: 所有 payload 数值字段都是 Option<T>, 不是 f64 默认 0.0
         let payload = HoldingHealthPayload::default();
-        assert!(payload.entry_price.is_none(), "entry_price 必须为 None, 不能默认 0.0");
+        assert!(
+            payload.entry_price.is_none(),
+            "entry_price 必须为 None, 不能默认 0.0"
+        );
         assert!(payload.current_price.is_none());
         assert!(payload.position_pct.is_none());
         assert!(payload.day_pnl_pct.is_none());

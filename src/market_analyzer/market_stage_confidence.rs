@@ -101,11 +101,7 @@ pub fn evaluate(ev: &MarketStageEvidence) -> MarketStageConfidence {
         + (technical as u32) * 25
         + (policy as u32) * 10
         + (external as u32) * 10;
-    let total_weight = if degraded {
-        100
-    } else {
-        30 + 25 + 25 + 10 + 10
-    };
+    let total_weight = 100;
 
     let conf_pct = ((weighted_sum as f64 / total_weight as f64).round() as u8).min(100);
 
@@ -137,7 +133,7 @@ pub fn evaluate(ev: &MarketStageEvidence) -> MarketStageConfidence {
 /// 情绪维度打分 (0~100)
 fn score_sentiment(m: Option<&SentimentMetrics>) -> u8 {
     let Some(m) = m else { return 50 };
-    let mut score = 50.0;
+    let mut score: f64 = 50.0;
     // 涨停 > 30 家加分
     if m.limit_up_n >= 50 {
         score += 30.0;
@@ -166,13 +162,13 @@ fn score_sentiment(m: Option<&SentimentMetrics>) -> u8 {
     } else if m.consecutive_h >= 3 {
         score += 10.0;
     }
-    (score as f64).clamp(0.0, 100.0).round() as u8
+    score.clamp(0.0, 100.0).round() as u8
 }
 
 /// 资金维度打分
 fn score_capital(m: Option<&CapitalMetrics>) -> u8 {
     let Some(m) = m else { return 50 };
-    let mut score = 50.0;
+    let mut score: f64 = 50.0;
     if m.main_flow_yi > 100.0 {
         score += 30.0;
     } else if m.main_flow_yi > 50.0 {
@@ -189,15 +185,15 @@ fn score_capital(m: Option<&CapitalMetrics>) -> u8 {
     } else if m.amount_delta_pct < -10.0 {
         score -= 10.0;
     }
-    (score as f64).clamp(0.0, 100.0).round() as u8
+    score.clamp(0.0, 100.0).round() as u8
 }
 
 /// 技术维度打分
 fn score_technical(m: Option<&TechnicalMetrics>) -> u8 {
     let Some(m) = m else { return 50 };
     let avg = (m.sh_chg + m.chinext_chg + m.star_chg) / 3.0;
-    let mut score = 50.0 + avg * 10.0; // 涨幅 +1% 加 10 分
-                                       // 三指数共振加分
+    let mut score: f64 = 50.0 + avg * 10.0; // 涨幅 +1% 加 10 分
+                                            // 三指数共振加分
     if m.sh_chg > 0.5 && m.chinext_chg > 0.5 && m.star_chg > 0.5 {
         score += 10.0;
     }
@@ -205,7 +201,7 @@ fn score_technical(m: Option<&TechnicalMetrics>) -> u8 {
     if avg < -2.0 {
         score -= 20.0;
     }
-    (score as f64).clamp(0.0, 100.0).round() as u8
+    score.clamp(0.0, 100.0).round() as u8
 }
 
 /// 政策维度打分 (公告关键词命中)
@@ -218,7 +214,7 @@ fn score_policy(m: Option<&PolicyMetrics>) -> u8 {
 /// 外部维度打分 (隔夜美股 + 汇率)
 fn score_external(m: Option<&ExternalMetrics>) -> u8 {
     let Some(m) = m else { return 50 };
-    let mut score = 50.0;
+    let mut score: f64 = 50.0;
     // 美股涨 → A 股次日偏多
     if m.us_chg > 1.0 {
         score += 15.0;
@@ -229,7 +225,7 @@ fn score_external(m: Option<&ExternalMetrics>) -> u8 {
     if m.fx_chg > 0.5 {
         score -= 10.0;
     }
-    (score as f64).clamp(0.0, 100.0).round() as u8
+    score.clamp(0.0, 100.0).round() as u8
 }
 
 #[cfg(test)]
@@ -288,13 +284,15 @@ mod tests {
 
     #[test]
     fn one_dimension_only_degraded() {
-        let mut ev = MarketStageEvidence::default();
-        ev.sentiment = Some(SentimentMetrics {
-            limit_up_n: 35,
-            limit_down_n: 3,
-            broken_pct: 15.0,
-            consecutive_h: 5,
-        });
+        let ev = MarketStageEvidence {
+            sentiment: Some(SentimentMetrics {
+                limit_up_n: 35,
+                limit_down_n: 3,
+                broken_pct: 15.0,
+                consecutive_h: 5,
+            }),
+            ..MarketStageEvidence::default()
+        };
         let r = evaluate(&ev);
         // 1 维度 < 2 → degraded=true (设计: 至少 2 维数据才不算降级)
         assert!(r.degraded);
@@ -303,9 +301,11 @@ mod tests {
 
     #[test]
     fn two_dimensions_pass_degraded_check() {
-        let mut ev = MarketStageEvidence::default();
-        ev.sentiment = Some(SentimentMetrics::default());
-        ev.capital = Some(CapitalMetrics::default());
+        let ev = MarketStageEvidence {
+            sentiment: Some(SentimentMetrics::default()),
+            capital: Some(CapitalMetrics::default()),
+            ..MarketStageEvidence::default()
+        };
         let r = evaluate(&ev);
         assert!(!r.degraded, "2 维度应通过");
         assert_eq!(r.data_complete_n, 2);
@@ -325,13 +325,15 @@ mod tests {
         assert!(matches!(r.heat_stage.as_str(), "MainUp" | "HeatUp"));
 
         // 极端低 (50 跌停) + 其他维度全 None → degraded, 综合分应 < 60
-        let mut ev2 = MarketStageEvidence::default();
-        ev2.sentiment = Some(SentimentMetrics {
-            limit_up_n: 0,
-            limit_down_n: 50,
-            broken_pct: 50.0,
-            consecutive_h: 0,
-        });
+        let ev2 = MarketStageEvidence {
+            sentiment: Some(SentimentMetrics {
+                limit_up_n: 0,
+                limit_down_n: 50,
+                broken_pct: 50.0,
+                consecutive_h: 0,
+            }),
+            ..MarketStageEvidence::default()
+        };
         let r2 = evaluate(&ev2);
         // 全 50 中性 + sentiment 25 → conf_pct 应 < 60 → HeatUp/Range
         assert!(r2.conf_pct < 70, "应 < 70, 实得 {}", r2.conf_pct);

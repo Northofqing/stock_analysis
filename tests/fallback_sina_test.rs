@@ -7,6 +7,7 @@ use stock_analysis::data_provider::fallback::fetch_kline_with_fallback;
 use stock_analysis::data_provider::sina_provider::SinaProvider;
 
 #[tokio::test]
+#[ignore = "live four-provider market-data integration test; run explicitly with --ignored"]
 async fn fallback_returns_data_with_sina_in_chain() {
     // 任一源能返数据即可 (网络依赖, 不强求 sina); 但 source 必须在 4 源范围.
     let (data, src) = fetch_kline_with_fallback("600000", 5)
@@ -30,6 +31,7 @@ async fn fallback_returns_data_with_sina_in_chain() {
 /// 直连 SinaProvider: 验证 provider 本身能拉数据 (Task 2 已测 build/url, 这里测 round-trip).
 /// 若此测试 PASS 但上条 FAIL, 说明 fallback 链未集成 Sina (回归保护).
 #[tokio::test]
+#[ignore = "live Sina HTTP integration test; run explicitly with --ignored"]
 async fn sina_provider_direct_fetch_works() {
     let data = SinaProvider::new()
         .fetch_kline_raw("600000", 5)

@@ -398,7 +398,6 @@ impl RequestCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread;
 
     #[test]
     fn test_rate_budget_allows_within_limit() {
@@ -516,7 +515,7 @@ mod tests {
 
     #[test]
     fn test_request_coordinator_quota() {
-        let mut coord = RequestCoordinator::new(3);
+        let coord = RequestCoordinator::new(3);
         assert!(coord.can_request());
         assert!(coord.can_request());
         assert!(coord.can_request());

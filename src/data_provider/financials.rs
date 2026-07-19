@@ -238,8 +238,6 @@ impl Financials {
 fn to_em_secucode(code: &str) -> String {
     let upper_prefix = if code.starts_with('6') || code.starts_with("900") {
         "SH"
-    } else if code.starts_with("688") {
-        "SH"
     } else if code.starts_with('0') || code.starts_with('3') || code.starts_with("200") {
         "SZ"
     } else if code.starts_with('8') || code.starts_with('4') {
@@ -250,42 +248,159 @@ fn to_em_secucode(code: &str) -> String {
     format!("{}{}", upper_prefix, code)
 }
 
-/// 数字/字符串转 f64
-fn as_f64(v: &Value) -> Option<f64> {
+/// 数字/字符串转有限 f64；已提供但非法的字段是整批错误，不当作缺失。
+fn as_f64(v: &Value, field: &str) -> Result<Option<f64>> {
     match v {
-        Value::Number(n) => n.as_f64(),
-        Value::String(s) => s.trim().parse::<f64>().ok(),
-        _ => None,
+        Value::Null => Ok(None),
+        Value::Number(n) => n
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .map(Some)
+            .ok_or_else(|| anyhow!("财务字段 {field} 不是有限数字: {v}")),
+        Value::String(s) if s.trim().is_empty() => Ok(None),
+        Value::String(s) => s
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite())
+            .map(Some)
+            .ok_or_else(|| anyhow!("财务字段 {field} 非法: {s:?}")),
+        _ => Err(anyhow!("财务字段 {field} 类型非法: {v}")),
     }
 }
 
 /// 字段备选查找：遇到第一个非空非 null 的字段即返回
-fn pick_f64(obj: &Value, keys: &[&str]) -> Option<f64> {
+fn pick_f64(obj: &Value, keys: &[&str]) -> Result<Option<f64>> {
     for k in keys {
         if let Some(v) = obj.get(*k) {
-            if !v.is_null() {
-                if let Some(f) = as_f64(v) {
-                    return Some(f);
-                }
+            match as_f64(v, k)? {
+                Some(value) => return Ok(Some(value)),
+                None => continue,
             }
         }
     }
-    None
+    Ok(None)
 }
 
-fn pick_string(obj: &Value, keys: &[&str]) -> Option<String> {
+fn required_report_date(obj: &Value, keys: &[&str]) -> Result<String> {
     for k in keys {
         if let Some(v) = obj.get(*k) {
-            if let Some(s) = v.as_str() {
-                // 截掉 " 00:00:00" 后缀
-                let cleaned = s.split_whitespace().next().unwrap_or(s).to_string();
-                if !cleaned.is_empty() {
-                    return Some(cleaned);
-                }
+            if v.is_null() {
+                continue;
             }
+            let s = v
+                .as_str()
+                .ok_or_else(|| anyhow!("财务字段 {k} 必须是日期字符串: {v}"))?;
+            let cleaned = s.split_whitespace().next().unwrap_or(s).trim();
+            chrono::NaiveDate::parse_from_str(cleaned, "%Y-%m-%d")
+                .map_err(|error| anyhow!("财务字段 {k} 日期非法 {cleaned:?}: {error}"))?;
+            return Ok(cleaned.to_string());
         }
     }
-    None
+    Err(anyhow!("财务记录缺少必填报告期字段: {keys:?}"))
+}
+
+fn parse_f10_period(item: &Value) -> Result<FinancialPeriod> {
+    let period = FinancialPeriod {
+        report_date: Some(required_report_date(item, &["REPORT_DATE"])?),
+        eps: pick_f64(item, &["EPSJB", "EPSXS", "EPSKCJB"])?,
+        roe: pick_f64(item, &["ROEJQ", "ROEKCJQ"])?,
+        revenue_yoy: pick_f64(item, &["TOTALOPERATEREVETZ"])?,
+        net_profit_yoy: pick_f64(item, &["PARENTNETPROFITTZ"])?,
+        gross_margin: pick_f64(item, &["XSMLL"])?,
+        net_margin: pick_f64(item, &["XSJLL"])?,
+        op_cash_flow_ps: pick_f64(item, &["MGJYXJJE", "MGJYXJL"])?,
+        total_asset_turnover: pick_f64(item, &["TOAZZL"])?,
+        debt_to_assets: pick_f64(item, &["ZCFZL"])?,
+    };
+    if !period.any() {
+        return Err(anyhow!(
+            "财务记录 {} 不含任何有效指标",
+            period.report_date.as_deref().unwrap_or("-")
+        ));
+    }
+    Ok(period)
+}
+
+/// BR-115: validate the complete F10 response before retaining the newest 20 periods.
+fn parse_f10_response(json: &Value) -> Result<Financials> {
+    let data = json
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("EM-F10 无 data 数组"))?;
+    if data.is_empty() {
+        return Err(anyhow!("EM-F10 data 为空"));
+    }
+
+    let mut parsed = data
+        .iter()
+        .map(parse_f10_period)
+        .collect::<Result<Vec<_>>>()?;
+    for pair in parsed.windows(2) {
+        let newer = pair[0]
+            .report_date
+            .as_deref()
+            .ok_or_else(|| anyhow!("EM-F10 新报告期缺失"))?;
+        let older = pair[1]
+            .report_date
+            .as_deref()
+            .ok_or_else(|| anyhow!("EM-F10 旧报告期缺失"))?;
+        if newer <= older {
+            return Err(anyhow!("EM-F10 报告期重复或非降序: {newer} -> {older}"));
+        }
+    }
+    parsed.truncate(20);
+    let latest = parsed
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow!("EM-F10 最新报告期缺失"))?;
+    Ok(Financials {
+        report_date: latest.report_date.clone(),
+        eps: latest.eps,
+        roe: latest.roe,
+        revenue_yoy: latest.revenue_yoy,
+        net_profit_yoy: latest.net_profit_yoy,
+        gross_margin: latest.gross_margin,
+        net_margin: latest.net_margin,
+        source: Some("东方财富F10"),
+        history: parsed,
+    })
+}
+
+/// BR-115: validate the complete datacenter response and its real latest period.
+fn parse_datacenter_response(json: &Value) -> Result<Financials> {
+    let data = json
+        .get("result")
+        .and_then(|result| result.get("data"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("EM-DC 无 result.data 数组"))?;
+    let latest = data.first().ok_or_else(|| anyhow!("EM-DC data 为空"))?;
+    let period = FinancialPeriod {
+        report_date: Some(required_report_date(latest, &["REPORTDATE"])?),
+        eps: pick_f64(latest, &["BASIC_EPS"])?,
+        roe: pick_f64(latest, &["WEIGHTAVG_ROE"])?,
+        revenue_yoy: pick_f64(latest, &["YSTZ"])?,
+        net_profit_yoy: pick_f64(latest, &["SJLTZ"])?,
+        gross_margin: pick_f64(latest, &["XSMLL"])?,
+        net_margin: None,
+        op_cash_flow_ps: None,
+        total_asset_turnover: None,
+        debt_to_assets: None,
+    };
+    if !period.any() {
+        return Err(anyhow!("EM-DC 最新报告期不含任何有效指标"));
+    }
+    Ok(Financials {
+        report_date: period.report_date.clone(),
+        eps: period.eps,
+        roe: period.roe,
+        revenue_yoy: period.revenue_yoy,
+        net_profit_yoy: period.net_profit_yoy,
+        gross_margin: period.gross_margin,
+        net_margin: None,
+        source: Some("东方财富DC"),
+        history: vec![period],
+    })
 }
 
 /// 主源：东方财富 F10 `ZYZBAjaxNew`（主要财务指标，字段最全）
@@ -312,47 +427,7 @@ async fn fetch_from_eastmoney_f10(client: &reqwest::Client, code: &str) -> Resul
     let text = resp.text().await.context("EM-F10 读取响应失败")?;
     let json: Value = serde_json::from_str(&text).context("EM-F10 JSON 解析失败")?;
 
-    let data = json
-        .get("data")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| anyhow!("EM-F10 无 data 数组"))?;
-    if data.is_empty() {
-        return Err(anyhow!("EM-F10 data 为空"));
-    }
-
-    // 解析所有期（接口本身已按报告期从新到旧排列）；最多保留 20 期 (~5 年)
-    const MAX_PERIODS: usize = 20;
-    let history: Vec<FinancialPeriod> = data
-        .iter()
-        .take(MAX_PERIODS)
-        .map(|item| FinancialPeriod {
-            report_date: pick_string(item, &["REPORT_DATE"]),
-            eps: pick_f64(item, &["EPSJB", "EPSXS", "EPSKCJB"]),
-            roe: pick_f64(item, &["ROEJQ", "ROEKCJQ"]),
-            revenue_yoy: pick_f64(item, &["TOTALOPERATEREVETZ"]),
-            net_profit_yoy: pick_f64(item, &["PARENTNETPROFITTZ"]),
-            gross_margin: pick_f64(item, &["XSMLL"]),
-            net_margin: pick_f64(item, &["XSJLL"]),
-            op_cash_flow_ps: pick_f64(item, &["MGJYXJJE", "MGJYXJL"]),
-            total_asset_turnover: pick_f64(item, &["TOAZZL"]),
-            debt_to_assets: pick_f64(item, &["ZCFZL"]),
-        })
-        .filter(|p| p.any() || p.report_date.is_some())
-        .collect();
-
-    let latest_p = history.first().cloned().unwrap_or_default();
-    let f = Financials {
-        report_date: latest_p.report_date.clone(),
-        eps: latest_p.eps,
-        roe: latest_p.roe,
-        revenue_yoy: latest_p.revenue_yoy,
-        net_profit_yoy: latest_p.net_profit_yoy,
-        gross_margin: latest_p.gross_margin,
-        net_margin: latest_p.net_margin,
-        source: Some("东方财富F10"),
-        history,
-    };
-    Ok(f)
+    parse_f10_response(&json)
 }
 
 /// 备份源：东方财富 datacenter `RPT_LICO_FN_CPD`（业绩快报）
@@ -388,79 +463,359 @@ async fn fetch_from_eastmoney_datacenter(
     let text = resp.text().await.context("EM-DC 读取响应失败")?;
     let json: Value = serde_json::from_str(&text).context("EM-DC JSON 解析失败")?;
 
-    let data = json
-        .get("result")
-        .and_then(|r| r.get("data"))
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| anyhow!("EM-DC 无 result.data 数组"))?;
-    let latest = data.first().ok_or_else(|| anyhow!("EM-DC data 为空"))?;
-
-    let period = FinancialPeriod {
-        report_date: pick_string(latest, &["REPORTDATE"]),
-        eps: pick_f64(latest, &["BASIC_EPS"]),
-        roe: pick_f64(latest, &["WEIGHTAVG_ROE"]),
-        revenue_yoy: pick_f64(latest, &["YSTZ"]),
-        net_profit_yoy: pick_f64(latest, &["SJLTZ"]),
-        gross_margin: pick_f64(latest, &["XSMLL"]),
-        net_margin: None,
-        op_cash_flow_ps: None,
-        total_asset_turnover: None,
-        debt_to_assets: None,
-    };
-    let f = Financials {
-        report_date: period.report_date.clone(),
-        eps: period.eps,
-        roe: period.roe,
-        revenue_yoy: period.revenue_yoy,
-        net_profit_yoy: period.net_profit_yoy,
-        gross_margin: period.gross_margin,
-        net_margin: None, // 该报告不含净利率
-        source: Some("东方财富DC"),
-        history: vec![period],
-    };
-    Ok(f)
+    parse_datacenter_response(&json)
 }
 
-/// 多源带回退异步入口：依次尝试主源 → 备份源，返回首个 `any()==true` 的结果；
-/// 所有源都失败返回 `Default`（全 None），调用方视为"未获取到"。
-pub async fn fetch_with_fallback_async(client: &reqwest::Client, code: &str) -> Financials {
-    match fetch_from_eastmoney_f10(client, code).await {
-        Ok(f) if f.any() => {
-            log::info!(
-                "[财报] {} 命中 EM-F10（报告期 {}）",
-                code,
-                f.report_date.as_deref().unwrap_or("-")
-            );
-            return f;
+fn select_financial_source_results(
+    code: &str,
+    results: Vec<(&'static str, Result<Financials>)>,
+) -> Result<Financials> {
+    let mut failures = Vec::with_capacity(results.len());
+    for (source, result) in results {
+        match result {
+            Ok(financials) if financials.any() => {
+                log::info!(
+                    "[财报] {} 命中 {}（报告期 {}）",
+                    code,
+                    source,
+                    financials.report_date.as_deref().unwrap_or("-")
+                );
+                return Ok(financials);
+            }
+            Ok(_) => failures.push(format!("{source}: empty")),
+            Err(error) => failures.push(format!("{source}: {error}")),
         }
-        Ok(_) => log::warn!("[财报] {} EM-F10 返回空数据", code),
-        Err(e) => log::warn!("[财报] {} EM-F10 失败: {}", code, e),
     }
-
-    match fetch_from_eastmoney_datacenter(client, code).await {
-        Ok(f) if f.any() => {
-            log::info!(
-                "[财报] {} 命中 EM-DC（报告期 {}）",
-                code,
-                f.report_date.as_deref().unwrap_or("-")
-            );
-            return f;
-        }
-        Ok(_) => log::warn!("[财报] {} EM-DC 返回空数据", code),
-        Err(e) => log::warn!("[财报] {} EM-DC 失败: {}", code, e),
-    }
-
-    Financials::default()
+    Err(anyhow!(
+        "[财报] {code} 全部真实来源失败: {}",
+        failures.join("; ")
+    ))
 }
 
-/// 同步包装：在已有 tokio runtime 上下文内调用；无 runtime 时返回 Default。
-pub fn fetch_with_fallback_blocking(client: &reqwest::Client, code: &str) -> Financials {
+/// 多源带回退异步入口：依次尝试主源 → 备份源，返回首个包含真实字段的结果。
+/// 所有源失败或返回空数据时保留完整错误，不生成默认财务对象。
+pub async fn fetch_with_fallback_async(client: &reqwest::Client, code: &str) -> Result<Financials> {
+    let primary = fetch_from_eastmoney_f10(client, code).await;
+    if matches!(&primary, Ok(financials) if financials.any()) {
+        return select_financial_source_results(code, vec![("EM-F10", primary)]);
+    }
+    let secondary = fetch_from_eastmoney_datacenter(client, code).await;
+    select_financial_source_results(code, vec![("EM-F10", primary), ("EM-DC", secondary)])
+}
+
+/// 同步包装：仅允许从已有 tokio runtime 上下文调用；失败显式返回。
+pub fn fetch_with_fallback_blocking(client: &reqwest::Client, code: &str) -> Result<Financials> {
     // 修复 Top10#5 (2026-06-29 audit): 用 crate::block_on_async 统一替代
     if tokio::runtime::Handle::try_current().is_err() {
-        log::debug!("[财报] 无 tokio runtime，跳过财报抓取");
-        return Financials::default();
+        return Err(anyhow!("[财报] 无 tokio runtime，无法抓取 {code}"));
     }
     let client = client.clone();
     let code_s = code.to_string();
     crate::block_on_async(async move { fetch_with_fallback_async(&client, &code_s).await })
+}
+
+#[cfg(test)]
+mod br115_tests {
+    use super::*;
+
+    #[test]
+    fn all_financial_source_failures_remain_errors() {
+        let result = select_financial_source_results(
+            "TEST_CODE600519",
+            vec![
+                ("EM-F10", Err(anyhow!("timeout"))),
+                ("EM-DC", Ok(Financials::default())),
+            ],
+        );
+
+        let error = result.expect_err("all failed or empty sources must not become defaults");
+        assert!(error.to_string().contains("EM-F10: timeout"));
+        assert!(error.to_string().contains("EM-DC: empty"));
+    }
+
+    #[test]
+    fn malformed_present_financial_field_rejects_the_entire_period() {
+        let item = serde_json::json!({
+            "REPORT_DATE": "2026-06-30 00:00:00",
+            "EPSJB": "not-a-number",
+            "ROEJQ": 12.5
+        });
+        assert!(parse_f10_period(&item).is_err());
+    }
+
+    #[test]
+    fn financial_period_requires_a_valid_report_date_and_at_least_one_metric() {
+        assert!(parse_f10_period(&serde_json::json!({"EPSJB": 1.0})).is_err());
+        assert!(parse_f10_period(&serde_json::json!({
+            "REPORT_DATE": "2026-99-99",
+            "EPSJB": 1.0
+        }))
+        .is_err());
+        assert!(parse_f10_period(&serde_json::json!({
+            "REPORT_DATE": "2026-06-30"
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn financial_period_ratios_are_available_only_from_valid_real_inputs() {
+        let empty = FinancialPeriod::default();
+        assert!(!empty.any());
+        assert_eq!(empty.equity_multiplier(), None);
+        assert_eq!(empty.dupont(), None);
+        assert_eq!(empty.cfo_to_ni_ratio(), None);
+
+        let period = FinancialPeriod {
+            eps: Some(2.0),
+            net_margin: Some(10.0),
+            op_cash_flow_ps: Some(3.0),
+            total_asset_turnover: Some(0.5),
+            debt_to_assets: Some(50.0),
+            ..Default::default()
+        };
+        assert!(period.any());
+        assert_eq!(period.equity_multiplier(), Some(2.0));
+        assert_eq!(period.dupont(), Some((10.0, 0.5, 2.0, 10.0)));
+        assert_eq!(period.cfo_to_ni_ratio(), Some(1.5));
+
+        let insolvent = FinancialPeriod {
+            debt_to_assets: Some(100.0),
+            eps: Some(0.0),
+            op_cash_flow_ps: Some(1.0),
+            ..Default::default()
+        };
+        assert_eq!(insolvent.equity_multiplier(), None);
+        assert_eq!(insolvent.cfo_to_ni_ratio(), None);
+    }
+
+    #[test]
+    fn quality_assessment_covers_all_risk_levels_and_caps_extreme_scores() {
+        assert!(assess_quality(&[]).is_none());
+        let clean = FinancialPeriod {
+            eps: Some(1.0),
+            roe: Some(10.0),
+            revenue_yoy: Some(5.0),
+            net_profit_yoy: Some(5.0),
+            gross_margin: Some(30.0),
+            op_cash_flow_ps: Some(1.0),
+            ..Default::default()
+        };
+        let clean_report = assess_quality(std::slice::from_ref(&clean)).expect("clean report");
+        assert_eq!(clean_report.risk_score, 0);
+        assert_eq!(clean_report.level, "无明显异常");
+
+        let light = FinancialPeriod {
+            net_profit_yoy: Some(151.0),
+            ..Default::default()
+        };
+        assert_eq!(assess_quality(&[light]).unwrap().level, "轻微提示");
+
+        let attention = FinancialPeriod {
+            eps: Some(1.0),
+            op_cash_flow_ps: Some(0.1),
+            revenue_yoy: Some(0.0),
+            net_profit_yoy: Some(30.0),
+            gross_margin: Some(50.0),
+            ..Default::default()
+        };
+        let previous = FinancialPeriod {
+            eps: Some(1.0),
+            op_cash_flow_ps: Some(0.5),
+            gross_margin: Some(40.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            assess_quality(&[attention, previous]).unwrap().level,
+            "需关注"
+        );
+
+        let extreme = vec![
+            FinancialPeriod {
+                eps: Some(3.0),
+                roe: Some(10.0),
+                revenue_yoy: Some(120.0),
+                net_profit_yoy: Some(200.0),
+                gross_margin: Some(50.0),
+                op_cash_flow_ps: Some(0.3),
+                ..Default::default()
+            },
+            FinancialPeriod {
+                eps: Some(2.0),
+                roe: Some(11.0),
+                gross_margin: Some(40.0),
+                op_cash_flow_ps: Some(1.6),
+                ..Default::default()
+            },
+            FinancialPeriod {
+                eps: Some(1.0),
+                roe: Some(12.0),
+                gross_margin: Some(39.0),
+                op_cash_flow_ps: Some(0.1),
+                ..Default::default()
+            },
+            FinancialPeriod {
+                eps: Some(0.5),
+                roe: Some(13.0),
+                gross_margin: Some(38.0),
+                op_cash_flow_ps: Some(0.0),
+                ..Default::default()
+            },
+        ];
+        let report = assess_quality(&extreme).expect("extreme report");
+        assert_eq!(report.risk_score, 100);
+        assert_eq!(report.level, "高风险⚠️");
+        assert!(report
+            .flags
+            .iter()
+            .any(|flag| flag.contains("应计利润可疑")));
+        assert!(report
+            .flags
+            .iter()
+            .any(|flag| flag.contains("毛利率单期突变")));
+        assert!(report
+            .flags
+            .iter()
+            .any(|flag| flag.contains("CFO/NI 单期骤降")));
+        assert!(report
+            .flags
+            .iter()
+            .any(|flag| flag.contains("EPS 持续上行")));
+        assert!(report
+            .flags
+            .iter()
+            .any(|flag| flag.contains("长期盈利质量低")));
+    }
+
+    #[test]
+    fn financial_protocol_helpers_cover_market_codes_aliases_and_strict_types() {
+        assert_eq!(to_em_secucode("600519"), "SH600519");
+        assert_eq!(to_em_secucode("900901"), "SH900901");
+        assert_eq!(to_em_secucode("000001"), "SZ000001");
+        assert_eq!(to_em_secucode("300750"), "SZ300750");
+        assert_eq!(to_em_secucode("430047"), "BJ430047");
+        assert_eq!(to_em_secucode("TEST_CODE_000001"), "SHTEST_CODE_000001");
+
+        assert_eq!(as_f64(&Value::Null, "x").unwrap(), None);
+        assert_eq!(as_f64(&serde_json::json!(1.5), "x").unwrap(), Some(1.5));
+        assert_eq!(as_f64(&serde_json::json!(" 2.5 "), "x").unwrap(), Some(2.5));
+        assert!(as_f64(&Value::Bool(true), "x").is_err());
+        assert_eq!(
+            pick_f64(
+                &serde_json::json!({"a": null, "b": "", "c": 3}),
+                &["a", "b", "c"]
+            )
+            .unwrap(),
+            Some(3.0)
+        );
+        assert_eq!(pick_f64(&serde_json::json!({}), &["x"]).unwrap(), None);
+    }
+
+    #[test]
+    fn complete_f10_period_uses_alias_fields_and_preserves_report_date() {
+        let period = parse_f10_period(&serde_json::json!({
+            "REPORT_DATE": "2026-06-30 00:00:00",
+            "EPSXS": "1.2",
+            "ROEKCJQ": 12.0,
+            "TOTALOPERATEREVETZ": 8.0,
+            "PARENTNETPROFITTZ": 9.0,
+            "XSMLL": 30.0,
+            "XSJLL": 10.0,
+            "MGJYXJL": 1.5,
+            "TOAZZL": 0.6,
+            "ZCFZL": 50.0
+        }))
+        .expect("complete F10 period");
+        assert_eq!(period.report_date.as_deref(), Some("2026-06-30"));
+        assert_eq!(period.eps, Some(1.2));
+        assert_eq!(period.roe, Some(12.0));
+        assert_eq!(period.op_cash_flow_ps, Some(1.5));
+        assert_eq!(period.total_asset_turnover, Some(0.6));
+        assert_eq!(period.debt_to_assets, Some(50.0));
+    }
+
+    #[test]
+    fn source_selector_returns_first_nonempty_real_financial_batch() {
+        let selected = Financials {
+            report_date: Some("2026-06-30".into()),
+            eps: Some(1.0),
+            source: Some("测试真实源"),
+            ..Default::default()
+        };
+        let result = select_financial_source_results(
+            "TEST_CODE_000001",
+            vec![("EMPTY", Ok(Financials::default())), ("REAL", Ok(selected))],
+        )
+        .expect("first nonempty source");
+        assert_eq!(result.eps, Some(1.0));
+        assert!(result.any());
+    }
+
+    #[test]
+    fn blocking_financial_fetch_requires_an_existing_runtime() {
+        assert!(fetch_with_fallback_blocking(&reqwest::Client::new(), "TEST_CODE_000001").is_err());
+    }
+
+    #[test]
+    fn f10_document_parser_keeps_newest_twenty_strict_periods() {
+        let data: Vec<Value> = (0..21)
+            .map(|index| {
+                serde_json::json!({
+                    "REPORT_DATE": format!("{:04}-12-31", 2026 - index),
+                    "EPSJB": 1.0 + index as f64,
+                    "ROEJQ": 10.0
+                })
+            })
+            .collect();
+        let parsed = parse_f10_response(&serde_json::json!({"data": data}))
+            .expect("valid descending F10 response");
+        assert_eq!(parsed.source, Some("东方财富F10"));
+        assert_eq!(parsed.history.len(), 20);
+        assert_eq!(parsed.report_date.as_deref(), Some("2026-12-31"));
+        assert_eq!(parsed.eps, Some(1.0));
+
+        assert!(parse_f10_response(&serde_json::json!({})).is_err());
+        assert!(parse_f10_response(&serde_json::json!({"data": []})).is_err());
+        let wrong_order = serde_json::json!({"data": [
+            {"REPORT_DATE": "2025-12-31", "EPSJB": 1.0},
+            {"REPORT_DATE": "2026-12-31", "EPSJB": 2.0}
+        ]});
+        assert!(parse_f10_response(&wrong_order).is_err());
+    }
+
+    #[test]
+    fn datacenter_document_parser_requires_one_real_latest_period() {
+        let parsed = parse_datacenter_response(&serde_json::json!({"result": {"data": [{
+            "REPORTDATE": "2026-06-30 00:00:00",
+            "BASIC_EPS": "1.5",
+            "WEIGHTAVG_ROE": 12.0,
+            "YSTZ": 8.0,
+            "SJLTZ": 9.0,
+            "XSMLL": 30.0
+        }]}}))
+        .expect("valid datacenter response");
+        assert_eq!(parsed.source, Some("东方财富DC"));
+        assert_eq!(parsed.report_date.as_deref(), Some("2026-06-30"));
+        assert_eq!(parsed.history.len(), 1);
+        assert_eq!(parsed.net_margin, None);
+
+        assert!(parse_datacenter_response(&serde_json::json!({})).is_err());
+        assert!(parse_datacenter_response(&serde_json::json!({"result": {"data": []}})).is_err());
+        assert!(
+            parse_datacenter_response(&serde_json::json!({"result": {"data": [{
+                "REPORTDATE": "2026-06-30"
+            }]}}))
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn real_financial_sources_preserve_both_transport_failures() {
+        let client = super::super::unreachable_http_client();
+        let error = fetch_with_fallback_async(&client, "TEST_CODE_000001")
+            .await
+            .expect_err("both real sources are unreachable");
+        let message = error.to_string();
+        assert!(message.contains("EM-F10"));
+        assert!(message.contains("EM-DC"));
+    }
 }

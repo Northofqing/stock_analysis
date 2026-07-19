@@ -9,6 +9,6 @@ pub mod governance;
 
 // 重新导出
 pub use governance::{
-    event_severity, is_data_source_down_event,
-    is_quiet_hour, GovernanceContext, GovernanceDecision, GovernanceEngine,
+    event_severity, is_data_source_down_event, is_quiet_hour, GovernanceContext,
+    GovernanceDecision, GovernanceEngine,
 };

@@ -1,3 +1,4 @@
+//! Registered business rules: BR-061.
 // -*- coding: utf-8 -*-
 //! 新闻 Ranker 推送 outcome 回看 (P3 — D+1/D+3/D+5 表现跟踪)
 //!
@@ -31,12 +32,7 @@ struct AuditRowRead {
     ts: String,
     candidate_id: String,
     title: String,
-    source: String,
     chain: String,
-    board_code: Option<String>,
-    event_type: String,
-    heat_stage: String,
-    score: i32,
     bucket: String,
     #[allow(dead_code)]
     rule_score: i32,
@@ -200,7 +196,7 @@ fn code_from_chain(chain: &str) -> Option<String> {
 }
 
 /// 评估单条 audit 的 outcome
-pub fn evaluate_audit(
+fn evaluate_audit(
     row: &AuditRowRead,
     push_date: NaiveDate,
     fetcher: &crate::data_provider::DataFetcherManager,
@@ -398,7 +394,7 @@ fn compute_sector_driven(
 }
 
 /// 加载 audit JSONL
-pub fn load_audit(path: &Path) -> Vec<AuditRowRead> {
+fn load_audit(path: &Path) -> Vec<AuditRowRead> {
     if !path.exists() {
         return Vec::new();
     }
@@ -422,43 +418,6 @@ pub fn load_audit(path: &Path) -> Vec<AuditRowRead> {
         }
     }
     out
-}
-
-/// 跑一批 outcome 评估 (read-only, 不写盘)
-pub fn evaluate_batch(rows: Vec<AuditRowRead>, push_date: NaiveDate) -> Vec<NewsOutcome> {
-    let fetcher = match crate::data_provider::DataFetcherManager::new() {
-        Ok(f) => f,
-        Err(e) => {
-            log::warn!("[NEWS_OUTCOME] DataFetcherManager 初始化失败: {:#}", e);
-            return rows
-                .iter()
-                .map(|r| NewsOutcome {
-                    candidate_id: r.candidate_id.clone(),
-                    title: r.title.clone(),
-                    chain: r.chain.clone(),
-                    bucket: r.bucket.clone(),
-                    push_at: r.ts.clone(),
-                    code: None,
-                    push_price: None,
-                    d1_pct: None,
-                    d3_pct: None,
-                    d5_pct: None,
-                    mfe: None,
-                    mae: None,
-                    limit_up_unbuyable: None,
-                    open_high_sell_low_d1: None,
-                    stop_break_first: None,
-                    sector_driven: None,
-                    executable_entry: None,
-                    verdict: "Fetcher 初始化失败".to_string(),
-                    reasons: vec!["DataFetcherManager 不可用".to_string()],
-                })
-                .collect();
-        }
-    };
-    rows.iter()
-        .map(|r| evaluate_audit(r, push_date, &fetcher))
-        .collect()
 }
 
 /// 渲染 outcome 报告 (markdown 表格)
@@ -608,6 +567,133 @@ fn parse_audit_date(path: &Path) -> NaiveDate {
         .and_then(|s| s.strip_suffix(".jsonl"))
         .unwrap_or("");
     NaiveDate::parse_from_str(date_str, "%Y-%m-%d").unwrap_or_else(|_| Local::now().date_naive())
+}
+
+/// v70+: 兑现回填 (D+1 outcome 写回 d01_recommendations_YYYY-MM-DD.jsonl)
+///   - 读: data/d01_recommendations/YYYY-MM-DD.jsonl
+///   - 算: 用 push_at 后 1-5 天的 K 线算 D+1/D+3/D+5 + MFE/MAE
+///   - 写: 更新每行 outcome 字段, 写回原 jsonl 文件
+///   - 漏报: K 线缺失 (沙箱 / 非交易日) 时 outcome 保持 null
+pub fn backfill_recommendations_outcome(date: &str) -> usize {
+    use std::collections::HashMap;
+    use std::fs;
+    use std::io::{BufWriter, Write};
+
+    let path = std::path::PathBuf::from("data/d01_recommendations").join(format!("{}.jsonl", date));
+    if !path.exists() {
+        log::info!("[v70+] {} 不存在, skip", path.display());
+        return 0;
+    }
+
+    // 1. 读 jsonl → (ts, code, push_price) 提取
+    let content = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("[v70+] 读 {} 失败: {}", path.display(), e);
+            return 0;
+        }
+    };
+    let mut rows: Vec<HashMap<String, serde_json::Value>> = Vec::new();
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(obj) = v.as_object() {
+                rows.push(
+                    obj.iter()
+                        .map(|(k, val)| (k.clone(), val.clone()))
+                        .collect(),
+                );
+            }
+        }
+    }
+    if rows.is_empty() {
+        return 0;
+    }
+
+    // 2. 算每行 D+1/D+3/D+5
+    let mut updated = 0;
+    for row in &mut rows {
+        let code = row.get("code").and_then(|v| v.as_str()).unwrap_or("");
+        let ts = row.get("ts").and_then(|v| v.as_str()).unwrap_or("");
+        if code.is_empty() || ts.is_empty() {
+            continue;
+        }
+        // 拉 K 线 (推送日 + 5 天)
+        // v14.1 review fix: `&ts[..10]` 字节切片在 ts < 10 字节时 panic, 改 ts.get(..10) + warn log
+        let push_date = match ts
+            .get(..10)
+            .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+        {
+            Some(d) => d,
+            None => {
+                log::warn!(
+                    "[v70+] backfill skip row: ts='{}' (len<10 or unparseable as YYYY-MM-DD), code={}",
+                    ts, code
+                );
+                continue;
+            }
+        };
+        // v14.1 review fix: 拉 20 天 K 线 (push_date + 5 天 D+1/D+3/D+5 + 15 天 padding)
+        //   之前 5 天太短, 实际 D+1 窗口可能挤掉历史数据
+        let kline_result = crate::data_provider::DataFetcherManager::new()
+            .ok()
+            .and_then(|f| f.get_daily_data(code, 20).ok())
+            .unwrap_or((Vec::new(), ""));
+        let (klines, _): (Vec<_>, &str) = kline_result;
+        if klines.is_empty() {
+            continue;
+        }
+        let d1 = pct_change_at(&klines, push_date, 1);
+        let d3 = pct_change_at(&klines, push_date, 3);
+        let d5 = pct_change_at(&klines, push_date, 5);
+        let (mfe, mae) = mfe_mae(&klines, push_date, 5);
+        let push_price = kline_at_or_before(&klines, push_date).map(|k| k.close);
+
+        let outcome = serde_json::json!({
+            "d1_pct": d1, "d3_pct": d3, "d5_pct": d5,
+            "mfe": mfe, "mae": mae, "push_price": push_price,
+        });
+        row.insert("outcome".to_string(), outcome);
+        updated += 1;
+    }
+
+    // 3. 写回 (原子: 写 .tmp + rename, 防止 process crash 损坏原文件)
+    let tmp_path = path.with_extension("jsonl.tmp");
+    let write_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let file = fs::File::create(&tmp_path)?;
+        let mut writer = BufWriter::new(file);
+        for row in &rows {
+            let json = serde_json::Value::Object(
+                row.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            );
+            // review fix: writeln 错误传播, 第一个错误即 abort, 不继续写损坏 jsonl
+            writeln!(writer, "{}", json)?;
+        }
+        writer.flush()?;
+        // 显式 drop BufWriter 关闭文件句柄, rename 在 Windows 上要求句柄关闭
+        drop(writer);
+        // 原子 rename: POSIX 保证, 失败则清理 .tmp
+        fs::rename(&tmp_path, &path)?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        log::error!(
+            "[v70+] 写 {} 失败: {} (保留原文件, 清理 .tmp)",
+            path.display(),
+            e
+        );
+        let _ = fs::remove_file(&tmp_path);
+        return 0;
+    }
+    log::info!(
+        "[v70+] backfill {} 写回 {} 条 (date={})",
+        path.display(),
+        updated,
+        date
+    );
+    updated
 }
 
 #[cfg(test)]
@@ -762,131 +848,117 @@ mod tests {
         let s = format_outcome_report(&[o]);
         assert!(s.contains("无数据"));
     }
-}
 
-/// v70+: 兑现回填 (D+1 outcome 写回 d01_recommendations_YYYY-MM-DD.jsonl)
-///   - 读: data/d01_recommendations/YYYY-MM-DD.jsonl
-///   - 算: 用 push_at 后 1-5 天的 K 线算 D+1/D+3/D+5 + MFE/MAE
-///   - 写: 更新每行 outcome 字段, 写回原 jsonl 文件
-///   - 漏报: K 线缺失 (沙箱 / 非交易日) 时 outcome 保持 null
-pub fn backfill_recommendations_outcome(date: &str) -> usize {
-    use std::collections::HashMap;
-    use std::fs;
-    use std::io::{BufRead, BufWriter, Write};
-
-    let path = std::path::PathBuf::from("data/d01_recommendations").join(format!("{}.jsonl", date));
-    if !path.exists() {
-        log::info!("[v70+] {} 不存在, skip", path.display());
-        return 0;
+    fn kline(
+        date: NaiveDate,
+        close: f64,
+        open: f64,
+        low: f64,
+        pct_chg: f64,
+    ) -> crate::data_provider::KlineData {
+        crate::data_provider::KlineData {
+            date,
+            open,
+            high: open.max(close) + 0.5,
+            low,
+            close,
+            volume: 1_000.0,
+            amount: close * 1_000.0,
+            pct_chg,
+            intraday_price: None,
+            settled: true,
+            pe_ratio: None,
+            pb_ratio: None,
+            turnover_rate: None,
+            market_cap: None,
+            circulating_cap: None,
+            eps: None,
+            roe: None,
+            revenue_yoy: None,
+            net_profit_yoy: None,
+            gross_margin: None,
+            net_margin: None,
+            sharpe_ratio: None,
+            financials_history: None,
+            valuation_history: None,
+            consensus: None,
+            industry: None,
+            is_limit_up: false,
+            is_limit_down: false,
+            is_suspended: false,
+            adjust: crate::data_provider::AdjustType::None,
+        }
     }
 
-    // 1. 读 jsonl → (ts, code, push_price) 提取
-    let content = match fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(e) => {
-            log::warn!("[v70+] 读 {} 失败: {}", path.display(), e);
-            return 0;
-        }
-    };
-    let mut rows: Vec<HashMap<String, serde_json::Value>> = Vec::new();
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-            if let Some(obj) = v.as_object() {
-                rows.push(
-                    obj.iter()
-                        .map(|(k, val)| (k.clone(), val.clone()))
-                        .collect(),
-                );
-            }
-        }
-    }
-    if rows.is_empty() {
-        return 0;
-    }
+    #[test]
+    fn kline_windows_cover_returns_drawdown_zero_price_and_missing_dates() {
+        let push_date = NaiveDate::from_ymd_opt(2026, 7, 10).unwrap();
+        let closes = [106.0, 94.0, 103.0, 102.0, 101.0, 100.0];
+        let klines: Vec<_> = closes
+            .iter()
+            .enumerate()
+            .map(|(offset, close)| {
+                let date = push_date + chrono::Duration::days((5 - offset) as i64);
+                kline(date, *close, *close + 1.0, *close - 1.0, 1.0)
+            })
+            .collect();
 
-    // 2. 算每行 D+1/D+3/D+5
-    let mut updated = 0;
-    for row in &mut rows {
-        let code = row.get("code").and_then(|v| v.as_str()).unwrap_or("");
-        let ts = row.get("ts").and_then(|v| v.as_str()).unwrap_or("");
-        if code.is_empty() || ts.is_empty() {
-            continue;
-        }
-        // 拉 K 线 (推送日 + 5 天)
-        // v14.1 review fix: `&ts[..10]` 字节切片在 ts < 10 字节时 panic, 改 ts.get(..10) + warn log
-        let push_date = match ts
-            .get(..10)
-            .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
-        {
-            Some(d) => d,
-            None => {
-                log::warn!(
-                    "[v70+] backfill skip row: ts='{}' (len<10 or unparseable as YYYY-MM-DD), code={}",
-                    ts, code
-                );
-                continue;
-            }
-        };
-        // v14.1 review fix: 拉 20 天 K 线 (push_date + 5 天 D+1/D+3/D+5 + 15 天 padding)
-        //   之前 5 天太短, 实际 D+1 窗口可能挤掉历史数据
-        let kline_result = crate::data_provider::DataFetcherManager::new()
-            .ok()
-            .and_then(|f| f.get_daily_data(code, 20).ok())
-            .unwrap_or((Vec::new(), ""));
-        let (klines, _): (Vec<_>, &str) = kline_result;
-        if klines.is_empty() {
-            continue;
-        }
-        let d1 = pct_change_at(&klines, push_date, 1);
-        let d3 = pct_change_at(&klines, push_date, 3);
-        let d5 = pct_change_at(&klines, push_date, 5);
-        let (mfe, mae) = mfe_mae(&klines, push_date, 5);
-        let push_price = kline_at_or_before(&klines, push_date).map(|k| k.close);
-
-        let outcome = serde_json::json!({
-            "d1_pct": d1, "d3_pct": d3, "d5_pct": d5,
-            "mfe": mfe, "mae": mae, "push_price": push_price,
-        });
-        row.insert("outcome".to_string(), outcome);
-        updated += 1;
-    }
-
-    // 3. 写回 (原子: 写 .tmp + rename, 防止 process crash 损坏原文件)
-    let tmp_path = path.with_extension("jsonl.tmp");
-    let write_result = (|| -> Result<(), Box<dyn std::error::Error>> {
-        let file = fs::File::create(&tmp_path)?;
-        let mut writer = BufWriter::new(file);
-        for row in &rows {
-            let json = serde_json::Value::Object(
-                row.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-            );
-            // review fix: writeln 错误传播, 第一个错误即 abort, 不继续写损坏 jsonl
-            writeln!(writer, "{}", json)?;
-        }
-        writer.flush()?;
-        // 显式 drop BufWriter 关闭文件句柄, rename 在 Windows 上要求句柄关闭
-        drop(writer);
-        // 原子 rename: POSIX 保证, 失败则清理 .tmp
-        fs::rename(&tmp_path, &path)?;
-        Ok(())
-    })();
-    if let Err(e) = write_result {
-        log::error!(
-            "[v70+] 写 {} 失败: {} (保留原文件, 清理 .tmp)",
-            path.display(),
-            e
+        assert_eq!(locate_push_idx(&klines, push_date), Some(5));
+        assert_eq!(kline_at_or_before(&klines, push_date).unwrap().close, 100.0);
+        assert_eq!(pct_change_at_idx(&klines, 5, 1), Some(1.0));
+        assert_eq!(pct_change_at(&klines, push_date, 3), Some(3.0));
+        assert_eq!(pct_change_at_idx(&klines, 5, 99), Some(6.0));
+        let (mfe, mae) = mfe_mae_idx(&klines, 5, 5);
+        assert_eq!(mfe, Some(6.0));
+        assert_eq!(mae, Some(-6.0));
+        assert_eq!(mfe_mae(&klines, push_date, 5), (mfe, mae));
+        assert_eq!(mfe_mae_idx(&klines, 0, 5), (None, None));
+        assert_eq!(
+            pct_change_at(&klines, push_date - chrono::Duration::days(1), 1),
+            None
         );
-        let _ = fs::remove_file(&tmp_path);
-        return 0;
+
+        let mut zero = klines.clone();
+        zero[5].close = 0.0;
+        assert_eq!(pct_change_at_idx(&zero, 5, 1), None);
+        assert_eq!(mfe_mae_idx(&zero, 5, 5), (None, None));
     }
-    log::info!(
-        "[v70+] backfill {} 写回 {} 条 (date={})",
-        path.display(),
-        updated,
-        date
-    );
-    updated
+
+    #[test]
+    fn isolated_audit_directory_executes_full_missing_evidence_outcome_path() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = unique_tmp("directory").with_extension("");
+        std::fs::create_dir_all(&dir).unwrap();
+        let audit = dir.join("news_rank_audit_2026-07-10.jsonl");
+        write_audit(
+            &audit,
+            &[
+                r#"{"ts":"2026-07-10 10:00:00","candidate_id":"TEST_CODE_audit","title":"测试新闻","chain":"","bucket":"PushNow","rule_score":20,"freshness_score":15,"heat_score":8,"stage_score":25,"capital_score":8,"source_score":10,"risk_penalty":0,"reasons":[],"drop_reason":null}"#,
+            ],
+        );
+        let previous = std::env::var_os("DATABASE_PATH");
+        std::env::set_var("DATABASE_PATH", dir.join("TEST_CODE.db"));
+
+        let outcomes = run_today_outcome();
+
+        match previous {
+            Some(value) => std::env::set_var("DATABASE_PATH", value),
+            None => std::env::remove_var("DATABASE_PATH"),
+        }
+        assert_eq!(outcomes.len(), 1);
+        let outcome = &outcomes[0];
+        assert_eq!(outcome.candidate_id, "TEST_CODE_audit");
+        assert!(outcome.code.is_none());
+        assert!(outcome.push_price.is_none());
+        assert!(outcome
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("无关联股票")));
+        assert!(outcome.verdict.starts_with("无数据"));
+        assert_eq!(
+            parse_audit_date(&audit),
+            NaiveDate::from_ymd_opt(2026, 7, 10).unwrap()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

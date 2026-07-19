@@ -196,7 +196,7 @@ mod tests {
 
     #[test]
     fn pass_when_all_safe() {
-        let r = evaluate(&base("600000"), "2026-07-05");
+        let r = evaluate(&base("TEST_CODE_600000"), "2026-07-05");
         assert!(r.pass);
         assert!(r.reasons.is_empty());
     }
@@ -204,7 +204,7 @@ mod tests {
     #[test]
     fn pass_when_data_all_missing() {
         // 数据全 None → 保守标注, 不拒绝
-        let r = evaluate(&base("600000"), "2026-07-05");
+        let r = evaluate(&base("TEST_CODE_600000"), "2026-07-05");
         assert!(r.pass);
         // 应有质押 + 公告关键词等"暂缺数据源"标注
         assert!(r.warnings.iter().any(|w| w.contains("质押")));
@@ -214,7 +214,7 @@ mod tests {
 
     #[test]
     fn reject_when_suspended() {
-        let mut inp = base("600000");
+        let mut inp = base("TEST_CODE_600000");
         inp.is_suspended = Some(true);
         let r = evaluate(&inp, "2026-07-05");
         assert!(!r.pass);
@@ -223,7 +223,7 @@ mod tests {
 
     #[test]
     fn reject_when_limit_up_locked() {
-        let mut inp = base("600000");
+        let mut inp = base("TEST_CODE_600000");
         inp.is_limit_up_locked = Some(true);
         let r = evaluate(&inp, "2026-07-05");
         assert!(!r.pass);
@@ -232,7 +232,7 @@ mod tests {
 
     #[test]
     fn reject_when_yoy_loss() {
-        let mut inp = base("600000");
+        let mut inp = base("TEST_CODE_600000");
         inp.yoy_loss = Some(true);
         let r = evaluate(&inp, "2026-07-05");
         assert!(!r.pass);
@@ -241,7 +241,7 @@ mod tests {
 
     #[test]
     fn reject_when_pre_cut() {
-        let mut inp = base("600000");
+        let mut inp = base("TEST_CODE_600000");
         inp.announced_pre_cut = Some(true);
         let r = evaluate(&inp, "2026-07-05");
         assert!(!r.pass);
@@ -253,7 +253,7 @@ mod tests {
     #[test]
     fn warn_when_unlock_within_5_days_future() {
         // 解禁在未来 3 日 (2026-07-05 → 2026-07-08), days=-3
-        let mut inp = base("600000");
+        let mut inp = base("TEST_CODE_600000");
         inp.unlock_date = Some("2026-07-08".to_string());
         let r = evaluate(&inp, "2026-07-05");
         assert!(r.pass);
@@ -265,7 +265,7 @@ mod tests {
 
     #[test]
     fn warn_when_unlock_today() {
-        let mut inp = base("600000");
+        let mut inp = base("TEST_CODE_600000");
         inp.unlock_date = Some("2026-07-05".to_string());
         let r = evaluate(&inp, "2026-07-05");
         assert!(r.pass);
@@ -275,7 +275,7 @@ mod tests {
     #[test]
     fn warn_when_unlock_past_within_5_days() {
         // 解禁已过 2 日 (2026-07-05 → 2026-07-03), days=2
-        let mut inp = base("600000");
+        let mut inp = base("TEST_CODE_600000");
         inp.unlock_date = Some("2026-07-03".to_string());
         let r = evaluate(&inp, "2026-07-05");
         assert!(r.pass);
@@ -285,7 +285,7 @@ mod tests {
     #[test]
     fn no_warn_when_unlock_far() {
         // 解禁在未来 30 日
-        let mut inp = base("600000");
+        let mut inp = base("TEST_CODE_600000");
         inp.unlock_date = Some("2026-08-15".to_string());
         let r = evaluate(&inp, "2026-07-05");
         assert!(r.pass);
@@ -294,7 +294,7 @@ mod tests {
 
     #[test]
     fn warn_when_unlock_date_parse_fail() {
-        let mut inp = base("600000");
+        let mut inp = base("TEST_CODE_600000");
         inp.unlock_date = Some("not-a-date".to_string());
         let r = evaluate(&inp, "2026-07-05");
         assert!(r.pass);
@@ -303,7 +303,7 @@ mod tests {
 
     #[test]
     fn warn_when_announced_unlock_to_sell() {
-        let mut inp = base("600000");
+        let mut inp = base("TEST_CODE_600000");
         inp.announced_unlock_to_sell = Some(true);
         let r = evaluate(&inp, "2026-07-05");
         assert!(r.pass);
@@ -315,7 +315,7 @@ mod tests {
     #[test]
     fn pledge_missing_marks_warning_no_reject() {
         // None = 数据缺失, 仅标注
-        let inp = base("600000");
+        let inp = base("TEST_CODE_600000");
         let r = evaluate(&inp, "2026-07-05");
         assert!(r.pass, "质押数据缺失不应拒绝");
         assert!(r.warnings.iter().any(|w| w.contains("暂缺数据源")));
@@ -323,7 +323,7 @@ mod tests {
 
     #[test]
     fn pledge_low_no_warning() {
-        let mut inp = base("600000");
+        let mut inp = base("TEST_CODE_600000");
         inp.pledge_ratio_pct = Some(30.0);
         let r = evaluate(&inp, "2026-07-05");
         assert!(r.pass);
@@ -332,7 +332,7 @@ mod tests {
 
     #[test]
     fn pledge_high_warns() {
-        let mut inp = base("600000");
+        let mut inp = base("TEST_CODE_600000");
         inp.pledge_ratio_pct = Some(60.0);
         let r = evaluate(&inp, "2026-07-05");
         assert!(r.pass);
@@ -343,13 +343,13 @@ mod tests {
 
     #[test]
     fn filter_batch_separates_pass_and_reject() {
-        let mut a = base("600000"); // pass
-        let mut b = base("000001");
+        let a = base("TEST_CODE_600000"); // pass
+        let mut b = base("TEST_CODE_000001");
         b.is_suspended = Some(true); // reject
-        let mut c = base("688001");
+        let mut c = base("TEST_CODE_688001");
         c.yoy_loss = Some(true); // reject
         let batch = filter_batch(&[a, b, c], "2026-07-05");
-        assert_eq!(batch.pass, vec!["600000"]);
+        assert_eq!(batch.pass, vec!["TEST_CODE_600000"]);
         assert_eq!(batch.reject.len(), 2);
     }
 

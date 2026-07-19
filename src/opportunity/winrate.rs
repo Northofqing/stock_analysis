@@ -1,75 +1,123 @@
-//! 修复 P1-2: winrate 二元化
-//!
-//! 之前: 占位 50 = 假装中性, 系统偏差 7.5 分
-//! 现在: 样本 < 200 = None, 无数据 = 0, 有数据 = 真实胜率
-//!
-//! 量化产品经理视角: 没有足够样本时, 评分必 None (不假装)
-//! 明确负信号 (胜率 < 50%) → 0 (允许, 但 evidence 是负的)
-//! 明确正信号 (胜率 ≥ 50%) → 真实值
+//! BR-017: the verified `prediction_tracker` is the single win-rate source.
 
-use chrono::NaiveDate;
-use serde::{Deserialize, Serialize};
+use diesel::prelude::*;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BacktestSample {
-    pub event_id: String,
-    /// N 日后收益 (例如 +5% 或 -3%)
-    pub n_day_return: f64,
-    pub day: NaiveDate,
+const MIN_SAMPLES: usize = 200;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VerifiedOutcome {
+    pub hit: Option<bool>,
+    pub actual_change: Option<f64>,
+    pub special_case: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WinrateSummary {
-    /// 0-1, 真实胜率 (None 时为 0 占位)
-    pub score: f64,
-    /// 样本是否足够 (≥ 200)
+    pub winrate: Option<f64>,
+    pub mean_return: Option<f64>,
     pub sufficient: bool,
     pub total: usize,
     pub wins: usize,
     pub losses: usize,
 }
 
-/// 修复 P1-2: 二元化
-/// - 样本 < 200 → None (无信号, 不假装 50)
-/// - 真实胜率 < 50% → 0 (明确负信号, 允许)
-/// - 真实胜率 ≥ 50% → 胜率值 (0.5 封顶, 不允许 > 0.5 假装特别高)
-pub fn calc_winrate_score(samples: &[BacktestSample]) -> Option<f64> {
-    let summary = compute_winrate_summary(samples);
-    if !summary.sufficient {
-        return None;
+impl WinrateSummary {
+    /// Compatibility score for decision inputs. Insufficient evidence stays None;
+    /// a verified sub-50% result is an explicit zero signal.
+    pub fn gated_score(&self) -> Option<f64> {
+        self.sufficient.then(|| {
+            self.winrate
+                .map_or(0.0, |value| if value < 0.5 { 0.0 } else { value })
+        })
     }
-    Some(summary.score)
 }
 
-/// 修复 P1-2: 计算胜率 (排除 n_day_return=0 的中性样本)
-pub fn compute_winrate_summary(samples: &[BacktestSample]) -> WinrateSummary {
-    const MIN_SAMPLES: usize = 200;
-    // 过滤掉 n_day_return=0 (中性, 不算胜负)
-    let valid: Vec<_> = samples
-        .iter()
-        .filter(|s| s.n_day_return.abs() > 0.0001)
-        .collect();
-    let total = valid.len();
-    let wins = valid.iter().filter(|s| s.n_day_return > 0.0).count();
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReasonWinrateReport {
+    pub reason: Option<String>,
+    pub t1: WinrateSummary,
+    pub t3: WinrateSummary,
+    pub t5: WinrateSummary,
+}
+
+/// Shared calculation used by the DB-backed production loader and tests.
+pub fn summarize_verified_rows(rows: &[VerifiedOutcome]) -> WinrateSummary {
+    let verified: Vec<&VerifiedOutcome> = rows.iter().filter(|row| row.hit.is_some()).collect();
+    let total = verified.len();
+    let wins = verified.iter().filter(|row| row.hit == Some(true)).count();
     let losses = total - wins;
-    if total < MIN_SAMPLES {
-        // insufficient 仍报告真实 wins/losses/total (数据缺 ≠ 数据全零)
-        return WinrateSummary {
-            score: 0.0,
-            sufficient: false,
-            total,
-            wins,
-            losses,
-        };
-    }
-    let raw_score = wins as f64 / total as f64;
-    // 修复 P1-2: 明确负信号 (胜率 < 50%) → 0, 正信号 → 真实值
-    let score = if raw_score < 0.5 { 0.0 } else { raw_score };
+    let returns: Vec<f64> = verified
+        .iter()
+        .filter_map(|row| row.actual_change)
+        .filter(|value| value.is_finite())
+        .collect();
     WinrateSummary {
-        score,
-        sufficient: true,
+        winrate: (total > 0).then(|| wins as f64 / total as f64),
+        mean_return: (!returns.is_empty())
+            .then(|| returns.iter().sum::<f64>() / returns.len() as f64),
+        sufficient: total >= MIN_SAMPLES,
         total,
         wins,
         losses,
     }
+}
+
+#[derive(diesel::QueryableByName)]
+struct PredictionOutcomeRow {
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
+    hit_t1: Option<i32>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
+    hit_t3: Option<i32>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Integer>)]
+    hit_t5: Option<i32>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+    actual_change_t1: Option<f64>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+    actual_change_t3: Option<f64>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+    actual_change_t5: Option<f64>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    t1_special_case: Option<String>,
+}
+
+/// Load one reason (or all reasons) directly from the canonical verified ledger.
+pub fn load_reason_winrate(reason: Option<&str>) -> Result<ReasonWinrateReport, String> {
+    let db = crate::database::DatabaseManager::try_get()
+        .ok_or_else(|| "prediction_tracker DB is not initialized".to_string())?;
+    let mut conn = db
+        .get_conn()
+        .map_err(|error| format!("prediction_tracker DB connection: {error}"))?;
+    let rows: Vec<PredictionOutcomeRow> = diesel::sql_query(
+        "SELECT hit_t1, hit_t3, hit_t5,
+                actual_change_t1, actual_change_t3, actual_change_t5, t1_special_case
+         FROM prediction_tracker
+         WHERE (? IS NULL OR reason = ?)",
+    )
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(reason)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(reason)
+    .load(&mut conn)
+    .map_err(|error| format!("query prediction_tracker winrate: {error}"))?;
+
+    let window = |hit: fn(&PredictionOutcomeRow) -> Option<i32>,
+                  change: fn(&PredictionOutcomeRow) -> Option<f64>,
+                  include_special: bool| {
+        rows.iter()
+            .map(|row| VerifiedOutcome {
+                hit: hit(row).map(|value| value != 0),
+                actual_change: change(row),
+                special_case: include_special
+                    .then(|| row.t1_special_case.clone())
+                    .flatten(),
+            })
+            .collect::<Vec<_>>()
+    };
+    let t1 = window(|row| row.hit_t1, |row| row.actual_change_t1, true);
+    let t3 = window(|row| row.hit_t3, |row| row.actual_change_t3, false);
+    let t5 = window(|row| row.hit_t5, |row| row.actual_change_t5, false);
+    Ok(ReasonWinrateReport {
+        reason: reason.map(str::to_string),
+        t1: summarize_verified_rows(&t1),
+        t3: summarize_verified_rows(&t3),
+        t5: summarize_verified_rows(&t5),
+    })
 }

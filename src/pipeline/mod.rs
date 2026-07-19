@@ -250,12 +250,40 @@ impl Default for PipelineConfig {
 pub struct AnalysisPipeline {
     data_manager: Arc<DataFetcherManager>,
     trend_analyzer: Arc<StockTrendAnalyzer>,
-    ai_analyzer: Option<Arc<GeminiAnalyzer>>,
+    ai_analyzer: Option<GeminiAnalyzer>,
     use_news_search: bool, // 是否使用新闻搜索
     notifier: Arc<NotificationService>,
     config: PipelineConfig,
     /// 当日涨停股票代码集合
     limit_up_codes: Arc<std::collections::HashSet<String>>,
+    /// Test/live isolation (2.5): deterministic validated context exists only in test builds.
+    #[cfg(test)]
+    test_resolved_context: Option<TestResolvedAnalysisContext>,
+    /// Test/live isolation (2.5): injected K-lines never exist in production builds.
+    #[cfg(test)]
+    test_fetched_data: Option<std::result::Result<Vec<crate::data_provider::KlineData>, String>>,
+    /// Test/live isolation (2.5): backtest artifacts use an isolated filesystem root.
+    #[cfg(test)]
+    test_backtest_output_dir: Option<std::path::PathBuf>,
+    /// Test/live isolation (2.5): summary sources and artifact root are resolved locally.
+    #[cfg(test)]
+    test_summary_context: Option<TestResolvedSummaryContext>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestResolvedAnalysisContext {
+    name_news: Option<(String, Option<String>)>,
+    extra: std::result::Result<extra_context::ExtraContext, String>,
+    mtf_section: std::result::Result<Option<String>, String>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestResolvedSummaryContext {
+    chain_section: Option<String>,
+    regime_section: Option<String>,
+    output_dir: std::path::PathBuf,
 }
 
 /// 评分 → 操作建议（系统与 AI 共用同一档位表，避免两套标准）
@@ -324,7 +352,7 @@ impl AnalysisPipeline {
         // 初始化AI分析器（如果有配置）
         let ai_analyzer = std::env::var("GEMINI_API_KEY").ok().and_then(|key| {
             if !key.is_empty() {
-                Some(Arc::new(GeminiAnalyzer::from_env()))
+                Some(GeminiAnalyzer::from_env())
             } else {
                 None
             }
@@ -347,6 +375,14 @@ impl AnalysisPipeline {
             notifier,
             config,
             limit_up_codes: Arc::new(std::collections::HashSet::new()),
+            #[cfg(test)]
+            test_resolved_context: None,
+            #[cfg(test)]
+            test_fetched_data: None,
+            #[cfg(test)]
+            test_backtest_output_dir: None,
+            #[cfg(test)]
+            test_summary_context: None,
         })
     }
 
@@ -382,7 +418,7 @@ impl AnalysisPipeline {
             info!("[深度研判] 无重点股命中，跳过");
             return;
         }
-        candidates.sort_by(|a, b| b.1.cmp(&a.1));
+        candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.1));
         candidates.truncate(max);
 
         info!(
@@ -596,65 +632,91 @@ impl AnalysisPipeline {
             && !self.config.dry_run
             && !self.config.single_notify
         {
-            // 产业链联动分析：仅在当日有涨停数据时执行，作为报告第一部分
-            // MarketAnalyzer 使用阻塞 HTTP，必须在 spawn_blocking 中执行
-            let chain_section = {
-                let limit_up_stocks =
-                    tokio::task::spawn_blocking(
-                        || match crate::market_analyzer::MarketAnalyzer::new(None) {
-                            Ok(analyzer) => match analyzer.get_limit_up_stocks() {
-                                Ok(stocks) => stocks,
-                                Err(e) => {
-                                    log::warn!("[产业链] 获取涨停股列表失败: {}", e);
-                                    Vec::new()
-                                }
-                            },
-                            Err(e) => {
-                                log::warn!("[产业链] 创建 MarketAnalyzer 失败: {}", e);
-                                Vec::new()
-                            }
-                        },
-                    )
-                    .await
-                    .unwrap_or_default();
-                if limit_up_stocks.is_empty() {
-                    info!("[产业链] 今日无涨停数据，跳过产业链分析");
-                    None
-                } else {
-                    info!(
-                        "[产业链] 获取到 {} 只涨停股，开始联动分析...",
-                        limit_up_stocks.len()
-                    );
-                    match chain_analysis::run_chain_analysis(limit_up_stocks, None).await {
-                        Ok(report) if !report.trim().is_empty() => {
-                            info!("[产业链] 联动分析完成，将并入主报告");
-                            Some(report)
-                        }
-                        Ok(_) => {
-                            warn!("[产业链] 联动分析返回空，跳过");
-                            None
-                        }
-                        Err(e) => {
-                            warn!("[产业链] 联动分析失败: {}", e);
-                            None
-                        }
-                    }
-                }
-            };
-
-            // 大盘状态门控：普跌日豁免跑赢指数个股的机械减仓建议，并在日报头部输出市场定性
-            let regime_section = market_regime::apply(&self.data_manager, &mut results);
-            summary_notify::send_summary_notification(
-                &self.notifier,
-                &results,
-                backtest_summary.as_ref(),
-                regime_section.as_deref(),
-                chain_section.as_deref(),
-            )
-            .await?;
+            #[cfg(test)]
+            if let Some(context) = self.test_summary_context.as_ref() {
+                summary_notify::send_summary_notification_to(
+                    &self.notifier,
+                    &results,
+                    backtest_summary.as_ref(),
+                    context.regime_section.as_deref(),
+                    context.chain_section.as_deref(),
+                    &context.output_dir,
+                )
+                .await?;
+            } else {
+                self.send_live_summary(&mut results, backtest_summary.as_ref())
+                    .await?;
+            }
+            #[cfg(not(test))]
+            self.send_live_summary(&mut results, backtest_summary.as_ref())
+                .await?;
         }
 
         Ok(results)
+    }
+
+    async fn send_live_summary(
+        &self,
+        results: &mut [AnalysisResult],
+        backtest_summary: Option<&crate::strategy::core::BacktestSummary>,
+    ) -> Result<()> {
+        // 产业链联动分析：仅在当日有涨停数据时执行，作为报告第一部分
+        // MarketAnalyzer 使用阻塞 HTTP，必须在 spawn_blocking 中执行
+        let chain_section = {
+            let limit_up_stocks = tokio::task::spawn_blocking(|| {
+                match crate::market_analyzer::MarketAnalyzer::new(None) {
+                    Ok(analyzer) => match analyzer.get_limit_up_stocks() {
+                        Ok(stocks) => stocks,
+                        Err(e) => {
+                            log::warn!("[产业链] 获取涨停股列表失败: {}", e);
+                            Vec::new()
+                        }
+                    },
+                    Err(e) => {
+                        log::warn!("[产业链] 创建 MarketAnalyzer 失败: {}", e);
+                        Vec::new()
+                    }
+                }
+            })
+            .await
+            .unwrap_or_default();
+            if limit_up_stocks.is_empty() {
+                info!("[产业链] 今日无涨停数据，跳过产业链分析");
+                None
+            } else {
+                info!(
+                    "[产业链] 获取到 {} 只涨停股，开始联动分析...",
+                    limit_up_stocks.len()
+                );
+                match chain_analysis::run_chain_analysis(limit_up_stocks, None).await {
+                    Ok(report) if !report.trim().is_empty() => {
+                        info!("[产业链] 联动分析完成，将并入主报告");
+                        Some(report)
+                    }
+                    Ok(_) => {
+                        warn!("[产业链] 联动分析返回空，跳过");
+                        None
+                    }
+                    Err(e) => {
+                        warn!("[产业链] 联动分析失败: {}", e);
+                        None
+                    }
+                }
+            }
+        };
+
+        // BR-122 大盘状态门控：普跌日豁免跑赢指数个股的机械减仓建议，并在日报头部输出市场定性
+        let regime_section =
+            market_regime::apply(&self.data_manager, results).map_err(anyhow::Error::msg)?;
+        summary_notify::send_summary_notification(
+            &self.notifier,
+            results,
+            backtest_summary,
+            regime_section.as_deref(),
+            chain_section.as_deref(),
+        )
+        .await?;
+        Ok(())
     }
 
     /// 生成单股报告
@@ -666,6 +728,212 @@ impl AnalysisPipeline {
 #[cfg(test)]
 mod tests {
     use super::section_utils::normalize_ai_sections;
+    use super::{
+        key_stock_priority, score_to_advice, AnalysisPipeline, AnalysisResult, PipelineConfig,
+    };
+    use crate::data_provider::{AdjustType, KlineData};
+    use crate::notification::{NotificationConfig, NotificationService};
+    use crate::traits::ScoreDisplay;
+    use chrono::NaiveDate;
+    use serial_test::serial;
+    use std::sync::Arc;
+
+    fn result() -> AnalysisResult {
+        serde_json::from_value(serde_json::json!({
+            "code": "TEST_CODE_000001",
+            "name": "TEST_CODE_示例",
+            "sentiment_score": 50,
+            "ranking_score": 50,
+            "operation_advice": "观望",
+            "trend_prediction": "盘整",
+            "analysis_summary": "TEST_CODE_分析正文",
+            "is_limit_up": false,
+            "contrarian_signal": false
+        }))
+        .expect("valid public AnalysisResult fixture")
+    }
+
+    fn kline() -> KlineData {
+        KlineData {
+            date: NaiveDate::from_ymd_opt(2026, 7, 18).expect("valid fixture date"),
+            open: 10.0,
+            high: 10.5,
+            low: 9.5,
+            close: 10.0,
+            volume: 1_000.0,
+            amount: 10_000.0,
+            pct_chg: 1.0,
+            intraday_price: None,
+            settled: true,
+            pe_ratio: None,
+            pb_ratio: None,
+            turnover_rate: None,
+            market_cap: None,
+            circulating_cap: None,
+            eps: None,
+            roe: None,
+            revenue_yoy: None,
+            net_profit_yoy: None,
+            gross_margin: None,
+            net_margin: None,
+            sharpe_ratio: None,
+            financials_history: None,
+            valuation_history: None,
+            consensus: None,
+            industry: None,
+            is_limit_up: false,
+            is_limit_down: false,
+            is_suspended: false,
+            adjust: AdjustType::None,
+        }
+    }
+
+    #[test]
+    fn advice_and_key_stock_priority_cover_all_registered_bands() {
+        for (score, expected) in [
+            (100, "技术面偏多"),
+            (80, "技术面偏多"),
+            (79, "技术面中性"),
+            (60, "技术面中性"),
+            (59, "观望"),
+            (40, "观望"),
+            (39, "技术面偏空"),
+            (20, "技术面偏空"),
+            (19, "建议卖出"),
+        ] {
+            assert!(score_to_advice(score).starts_with(expected));
+        }
+
+        let neutral = result();
+        assert_eq!(key_stock_priority(&neutral), None);
+        let mut low = neutral.clone();
+        low.ranking_score = 25;
+        assert_eq!(key_stock_priority(&low), Some(70));
+        let mut combined = neutral;
+        combined.ranking_score = 75;
+        combined.veto_flags = Some(vec!["TEST_CODE_否决".to_string()]);
+        combined.contrarian_signal = true;
+        combined.is_limit_up = true;
+        assert_eq!(key_stock_priority(&combined), Some(280));
+        combined.veto_flags = Some(Vec::new());
+        assert_eq!(key_stock_priority(&combined), Some(180));
+    }
+
+    #[tokio::test]
+    async fn pipeline_constructor_empty_run_and_dry_run_are_side_effect_free() {
+        let config = PipelineConfig {
+            max_workers: 1,
+            dry_run: true,
+            send_notification: false,
+            single_notify: false,
+            ..Default::default()
+        };
+        let mut pipeline = AnalysisPipeline::new(config.clone()).expect("pipeline constructor");
+        pipeline.ai_analyzer = None;
+        pipeline.use_news_search = false;
+        pipeline.notifier = Arc::new(NotificationService::new(NotificationConfig::default()));
+        pipeline =
+            pipeline.with_limit_up_codes(["TEST_CODE_000001".to_string()].into_iter().collect());
+        assert!(pipeline.limit_up_codes.contains("TEST_CODE_000001"));
+        assert_eq!(pipeline.config.dq_quote_stale_sec, 5);
+        assert_eq!(pipeline.config.dq_position_stale_sec, 30);
+        assert_eq!(pipeline.config.dq_nav_stale_sec, 24 * 3600);
+        assert_eq!(pipeline.config.dq_daily_stale_sec, 24 * 3600);
+
+        assert!(pipeline
+            .run(&[], Some("TEST_CODE_宏观证据".to_string()))
+            .await
+            .expect("empty run")
+            .is_empty());
+
+        pipeline.test_fetched_data = Some(Ok(vec![kline()]));
+        let results = pipeline
+            .run(
+                &["TEST_CODE_000001".to_string()],
+                Some("TEST_CODE_宏观证据".to_string()),
+            )
+            .await
+            .expect("dry run");
+        assert!(results.is_empty());
+
+        let report = pipeline.generate_single_report(&result());
+        assert!(report.contains("TEST_CODE_示例(TEST_CODE_000001)"));
+        assert!(report.contains("TEST_CODE_分析正文"));
+    }
+
+    #[tokio::test]
+    #[serial(deep_env)]
+    async fn deep_enrichment_guards_do_not_start_external_analysis() {
+        let config = PipelineConfig {
+            max_workers: 1,
+            dry_run: false,
+            send_notification: false,
+            single_notify: false,
+            ..Default::default()
+        };
+        let pipeline = AnalysisPipeline::new(config).expect("pipeline constructor");
+
+        let previous = std::env::var("DEEP_ANALYSIS_MAX").ok();
+        let previous_concurrency = std::env::var("DEEP_ANALYSIS_CONCURRENCY").ok();
+        std::env::remove_var("DEEP_ANALYSIS_MAX");
+        let mut empty = Vec::new();
+        pipeline
+            .enrich_key_stocks_with_deep_analysis(&mut empty)
+            .await;
+
+        std::env::set_var("DEEP_ANALYSIS_MAX", "0");
+        let mut guarded = vec![result()];
+        guarded[0].ranking_score = 100;
+        pipeline
+            .enrich_key_stocks_with_deep_analysis(&mut guarded)
+            .await;
+
+        std::env::set_var("DEEP_ANALYSIS_MAX", "1");
+        std::env::set_var("DEEP_ANALYSIS_CONCURRENCY", "1");
+        guarded[0].deep_seed = Some(crate::deep_analyzer::DeepAnalysisSeed {
+            code: "TEST_CODE_000001".to_string(),
+            name: "TEST_CODE_示例".to_string(),
+            kline: Arc::new(Vec::new()),
+            extra_context: None,
+            news_context: None,
+            macro_context: None,
+            fundamental_ctx: None,
+            trend_snapshot: crate::deep_analyzer::TrendSnapshot {
+                trend_status: "TEST_CODE_缺失批次".to_string(),
+                ma_alignment: "TEST_CODE_缺失".to_string(),
+                trend_strength: 0.0,
+                bias_ma5: 0.0,
+                volume_status: "TEST_CODE_缺失".to_string(),
+                volume_ratio_5d: 0.0,
+                support_levels: Vec::new(),
+                resistance_levels: Vec::new(),
+                evidence_reasons: Vec::new(),
+                risk_factors: Vec::new(),
+            },
+        });
+        pipeline
+            .enrich_key_stocks_with_deep_analysis(&mut guarded)
+            .await;
+        if let Some(value) = previous {
+            std::env::set_var("DEEP_ANALYSIS_MAX", value);
+        } else {
+            std::env::remove_var("DEEP_ANALYSIS_MAX");
+        }
+        if let Some(value) = previous_concurrency {
+            std::env::set_var("DEEP_ANALYSIS_CONCURRENCY", value);
+        } else {
+            std::env::remove_var("DEEP_ANALYSIS_CONCURRENCY");
+        }
+        assert_eq!(guarded[0].analysis_summary, "TEST_CODE_分析正文");
+    }
+
+    #[test]
+    fn analysis_result_score_display_delegation_is_stable() {
+        let value = result();
+        assert_eq!(value.sentiment_score(), 50);
+        assert_eq!(value.operation_advice(), "观望");
+        assert_eq!(value.get_emoji(), value.score_emoji());
+    }
 
     #[test]
     fn normalize_bare_headings_into_brackets() {

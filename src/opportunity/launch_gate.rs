@@ -1,3 +1,4 @@
+//! Registered business rules: BR-044, BR-089.
 //! 修复 P0-3: launch_gate 阶段门槛
 //!
 //! 量化产品经理要求 (P0-3):
@@ -92,7 +93,7 @@ impl LaunchGate {
                 if m.gray_days >= 30 && m.winrate_pct >= 0.55 {
                     Some(LaunchStage::Live)
                 } else if m.winrate_pct < 0.50 {
-                    Some(LaunchStage::Gray)
+                    Some(LaunchStage::Shadow)
                 } else {
                     None
                 }
@@ -138,7 +139,7 @@ pub fn should_push_user(stage: LaunchStage, is_critical_alert: bool) -> bool {
 /// 修复 F20: 从 prediction_tracker 表算 StageMetrics.
 /// shadow_days = 数据库最早 pred_date 距今天数.
 /// winrate_pct = hit IS NOT NULL 样本的命中率 (0-1).
-/// calmar_ratio = 未实现 (需要 portfolio 历史 equity 曲线), 留 0.0 让灰度阈值卡住.
+/// calmar_ratio = 真实 ledger 净值曲线的年化收益 / 最大回撤 (BR-089).
 /// gray_days = 留给外部从 .env LAUNCH_GRAY_START_DATE 读取.
 #[allow(dead_code)]
 pub fn metrics_from_db(
@@ -160,19 +161,23 @@ pub fn metrics_from_db(
         #[diesel(sql_type = diesel::sql_types::BigInt)]
         total: i64,
     }
+    #[derive(diesel::QueryableByName, Debug)]
+    struct LedgerMetricRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        date: String,
+        #[diesel(sql_type = diesel::sql_types::Double)]
+        total_value: f64,
+    }
 
     let min_date: Option<String> = diesel::sql_query(
         "SELECT MIN(pred_date) AS min_date FROM prediction_tracker WHERE pred_date IS NOT NULL",
     )
-    .get_result::<MinDateRow>(&mut *conn)
-    .ok()
-    .and_then(|r| r.min_date);
+    .get_result::<MinDateRow>(&mut *conn)?
+    .min_date;
 
     let shadow_days = if let Some(min_date) = min_date {
-        chrono::NaiveDate::parse_from_str(&min_date, "%Y-%m-%d")
-            .ok()
-            .map(|d| (chrono::Local::now().date_naive() - d).num_days().max(0) as u32)
-            .unwrap_or(0)
+        let date = chrono::NaiveDate::parse_from_str(&min_date, "%Y-%m-%d")?;
+        (chrono::Local::now().date_naive() - date).num_days().max(0) as u32
     } else {
         0
     };
@@ -186,6 +191,17 @@ pub fn metrics_from_db(
         (0u32, 0.0)
     };
 
+    let ledger_rows: Vec<LedgerMetricRow> =
+        diesel::sql_query("SELECT date, total_value FROM ledger ORDER BY date ASC")
+            .load(&mut *conn)?;
+    let mut ledger_curve = Vec::with_capacity(ledger_rows.len());
+    for row in ledger_rows {
+        let date = chrono::NaiveDate::parse_from_str(&row.date, "%Y-%m-%d")?;
+        ledger_curve.push((date, row.total_value));
+    }
+    let calmar_ratio = compute_calmar_from_curve(&ledger_curve)
+        .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+
     let gray_days = gray_start_date
         .map(|d| (chrono::Local::now().date_naive() - d).num_days().max(0) as u32)
         .unwrap_or(0);
@@ -194,9 +210,67 @@ pub fn metrics_from_db(
         shadow_days,
         winrate_samples,
         winrate_pct,
-        calmar_ratio: 0.0,
+        calmar_ratio,
         gray_days,
     })
+}
+
+/// BR-089: 从连续、有效的账户净值曲线计算 Calmar。
+fn compute_calmar_from_curve(curve: &[(chrono::NaiveDate, f64)]) -> Result<f64, String> {
+    if curve.len() < 2 {
+        return Err("Calmar unavailable: ledger requires at least two observations".to_string());
+    }
+
+    let mut peak = 0.0_f64;
+    let mut max_drawdown = 0.0_f64;
+    for (index, (date, value)) in curve.iter().enumerate() {
+        if !value.is_finite() || *value <= 0.0 {
+            return Err(format!(
+                "Calmar invalid ledger value at {}: {}",
+                date, value
+            ));
+        }
+        if index > 0 {
+            let previous = curve[index - 1].0;
+            if *date <= previous {
+                return Err(format!(
+                    "Calmar ledger dates are duplicate or unordered: {} then {}",
+                    previous, date
+                ));
+            }
+            let mut missing = previous
+                .succ_opt()
+                .ok_or_else(|| "Calmar date overflow".to_string())?;
+            while missing < *date {
+                if crate::calendar::is_trading_day(missing) {
+                    return Err(format!(
+                        "Calmar ledger continuity gap on trading day {}",
+                        missing
+                    ));
+                }
+                missing = missing
+                    .succ_opt()
+                    .ok_or_else(|| "Calmar date overflow".to_string())?;
+            }
+        }
+
+        peak = peak.max(*value);
+        let drawdown = (peak - *value) / peak;
+        max_drawdown = max_drawdown.max(drawdown);
+    }
+
+    if max_drawdown <= 0.0 {
+        return Err("Calmar unavailable: maximum drawdown is zero".to_string());
+    }
+    let first = curve.first().expect("length checked").1;
+    let last = curve.last().expect("length checked").1;
+    let trading_periods = (curve.len() - 1) as f64;
+    let annualized_return = (last / first).powf(245.0 / trading_periods) - 1.0;
+    let calmar = annualized_return / max_drawdown;
+    if !calmar.is_finite() {
+        return Err("Calmar calculation produced a non-finite value".to_string());
+    }
+    Ok(calmar)
 }
 
 #[cfg(test)]
@@ -219,9 +293,9 @@ mod tests {
     #[test]
     fn test_should_push_user() {
         // v15.1 A2.4: Shadow 推全量 (默认行为), Gray 仅推 critical (默认 stage)
-        assert!(should_push_user(LaunchStage::Shadow, false));  // Shadow 推全量
+        assert!(should_push_user(LaunchStage::Shadow, false)); // Shadow 推全量
         assert!(should_push_user(LaunchStage::Shadow, true));
-        assert!(!should_push_user(LaunchStage::Gray, false));    // Gray 限 critical
+        assert!(!should_push_user(LaunchStage::Gray, false)); // Gray 限 critical
         assert!(should_push_user(LaunchStage::Gray, true));
         assert!(should_push_user(LaunchStage::Live, false));
         assert!(should_push_user(LaunchStage::Live, true));
@@ -274,7 +348,7 @@ mod tests {
         };
         assert_eq!(
             LaunchGate::check_transition(LaunchStage::Gray, &m),
-            Some(LaunchStage::Gray)
+            Some(LaunchStage::Shadow)
         );
 
         let m = StageMetrics {
@@ -297,6 +371,39 @@ mod tests {
             gray_days: 60,
         };
         assert_eq!(LaunchGate::check_transition(LaunchStage::Live, &m), None);
+    }
+
+    #[test]
+    fn br089_calmar_uses_real_equity_return_and_drawdown() {
+        let curve = vec![
+            (chrono::NaiveDate::from_ymd_opt(2026, 7, 13).unwrap(), 100.0),
+            (chrono::NaiveDate::from_ymd_opt(2026, 7, 14).unwrap(), 110.0),
+            (chrono::NaiveDate::from_ymd_opt(2026, 7, 15).unwrap(), 99.0),
+            (chrono::NaiveDate::from_ymd_opt(2026, 7, 16).unwrap(), 105.0),
+        ];
+        let calmar = compute_calmar_from_curve(&curve).unwrap();
+        let expected_annualized = (1.05_f64).powf(245.0 / 3.0) - 1.0;
+        let expected_drawdown = 11.0 / 110.0;
+        assert!((calmar - expected_annualized / expected_drawdown).abs() < 1e-9);
+    }
+
+    #[test]
+    fn br089_calmar_rejects_missing_trading_day_and_zero_drawdown() {
+        let gap = vec![
+            (chrono::NaiveDate::from_ymd_opt(2026, 7, 13).unwrap(), 100.0),
+            (chrono::NaiveDate::from_ymd_opt(2026, 7, 15).unwrap(), 99.0),
+        ];
+        assert!(compute_calmar_from_curve(&gap)
+            .unwrap_err()
+            .contains("continuity gap"));
+
+        let monotonic = vec![
+            (chrono::NaiveDate::from_ymd_opt(2026, 7, 13).unwrap(), 100.0),
+            (chrono::NaiveDate::from_ymd_opt(2026, 7, 14).unwrap(), 101.0),
+        ];
+        assert!(compute_calmar_from_curve(&monotonic)
+            .unwrap_err()
+            .contains("maximum drawdown is zero"));
     }
 
     #[test]
@@ -354,7 +461,7 @@ mod tests {
         m.winrate_pct = 0.45;
         assert_eq!(
             LaunchGate::check_transition(current, &m),
-            Some(LaunchStage::Gray)
+            Some(LaunchStage::Shadow)
         );
 
         // 6. 再 Gray, 满足 → Live

@@ -18,6 +18,9 @@ pub struct AlertEvent {
     pub message: String,
     pub detail: AlertDetail,
     pub triggered_at: DateTime<Local>,
+    /// Source external ID if this event was routed through v17_sources::push_normalized_events.
+    /// Used by news_monitor_loop to skip duplicate legacy push.
+    pub routed_external_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -107,6 +110,8 @@ pub struct AlertDetail {
     pub threshold: Option<f64>,
     pub news_title: Option<String>,
     pub news_summary: Option<String>,
+    /// 新闻源/分类器实际提供的重要度（1-5）。缺失时保持 None，禁止从告警等级反推。
+    pub news_importance: Option<u8>,
     pub ai_decision: Option<String>,
     pub t1_locked: bool,
     pub extra: Option<String>,
@@ -321,6 +326,7 @@ impl Detector {
                     threshold: Some(atr_threshold),
                     news_title: None,
                     news_summary: None,
+                    news_importance: None,
                     ai_decision: None,
                     t1_locked: false,
                     extra: Some(format!(
@@ -329,6 +335,7 @@ impl Detector {
                     )),
                 },
                 triggered_at: Local::now(),
+                routed_external_id: None,
             })
         } else {
             None
@@ -392,11 +399,13 @@ impl Detector {
                     threshold: None,
                     news_title: Some(news.title.clone()),
                     news_summary: None,
+                    news_importance: Some(news.importance),
                     ai_decision: None,
                     t1_locked: false,
                     extra: Some(format!("来源: {}", news.source)),
                 },
                 triggered_at: Local::now(),
+                routed_external_id: None,
             })
         } else {
             None
@@ -426,11 +435,13 @@ impl Detector {
                     threshold: Some(threshold),
                     news_title: None,
                     news_summary: None,
+                    news_importance: None,
                     ai_decision: None,
                     t1_locked: false,
                     extra: None,
                 },
                 triggered_at: Local::now(),
+                routed_external_id: None,
             })
         } else {
             None
@@ -460,11 +471,13 @@ impl Detector {
                 threshold: None,
                 news_title: None,
                 news_summary: None,
+                news_importance: None,
                 ai_decision: None,
                 t1_locked: s.t1_locked,
                 extra: None,
             },
             triggered_at: Local::now(),
+            routed_external_id: None,
         }
     }
 
@@ -514,21 +527,21 @@ mod tests {
     #[test]
     fn test_limit_up_triggers() {
         let d = Detector::new(DetectorConfig::default());
-        let s = stock("000001", "测试", 9.8, 1.0, 0.0);
+        let s = stock("TEST_CODE_000001", "测试", 9.8, 1.0, 0.0);
         assert!(d.check_limit_up(&s).is_some());
     }
 
     #[test]
     fn test_normal_stock_no_alert() {
         let d = Detector::new(DetectorConfig::default());
-        let s = stock("000001", "测试", 2.0, 1.0, 0.0);
+        let s = stock("TEST_CODE_000001", "测试", 2.0, 1.0, 0.0);
         assert!(d.scan_stock(&s).is_empty());
     }
 
     #[test]
     fn test_limit_down_emergency() {
         let d = Detector::new(DetectorConfig::default());
-        let s = stock("000002", "跌停股", -10.0, 2.0, 0.0);
+        let s = stock("TEST_CODE_000002", "跌停股", -10.0, 2.0, 0.0);
         let events = d.scan_stock(&s);
         assert!(!events.is_empty());
         assert_eq!(events[0].level, AlertLevel::Emergency);
@@ -537,7 +550,7 @@ mod tests {
     #[test]
     fn test_t1_locked_limit_down_msg() {
         let d = Detector::new(DetectorConfig::default());
-        let mut s = stock("000003", "锁仓股", -10.0, 2.0, 0.0);
+        let mut s = stock("TEST_CODE_000003", "锁仓股", -10.0, 2.0, 0.0);
         s.t1_locked = true;
         let e = d.check_limit_down(&s).unwrap();
         assert!(e.message.contains("T+1"));
@@ -547,35 +560,35 @@ mod tests {
     #[test]
     fn test_main_outflow_triggers() {
         let d = Detector::new(DetectorConfig::default());
-        let s = stock("000004", "出逃股", -2.0, 1.0, -0.5);
+        let s = stock("TEST_CODE_000004", "出逃股", -2.0, 1.0, -0.5);
         assert!(d.check_main_outflow(&s).is_some());
     }
 
     #[test]
     fn test_main_inflow_triggers() {
         let d = Detector::new(DetectorConfig::default());
-        let s = stock("000005", "流入股", 3.0, 1.5, 0.6);
+        let s = stock("TEST_CODE_000005", "流入股", 3.0, 1.5, 0.6);
         assert!(d.check_main_inflow(&s).is_some());
     }
 
     #[test]
     fn test_vol_burst_triggers() {
         let d = Detector::new(DetectorConfig::default());
-        let s = stock("000006", "放量股", 6.0, 4.0, 0.0);
+        let s = stock("TEST_CODE_000006", "放量股", 6.0, 4.0, 0.0);
         assert!(d.check_vol_burst(&s).is_some());
     }
 
     #[test]
     fn test_vol_burst_no_price_triggers_no_alert() {
         let d = Detector::new(DetectorConfig::default());
-        let s = stock("000007", "放量不涨", 1.0, 5.0, 0.0); // high vol but low price
+        let s = stock("TEST_CODE_000007", "放量不涨", 1.0, 5.0, 0.0); // high vol but low price
         assert!(d.check_vol_burst(&s).is_none());
     }
 
     #[test]
     fn test_board_break() {
         let d = Detector::new(DetectorConfig::default());
-        let mut s = stock("000008", "炸板股", 7.0, 2.0, 0.0);
+        let mut s = stock("TEST_CODE_000008", "炸板股", 7.0, 2.0, 0.0);
         s.was_limit_up = true;
         let e = d.check_board_break(&s).unwrap();
         assert_eq!(e.level, AlertLevel::Emergency);
@@ -608,14 +621,14 @@ mod tests {
     #[test]
     fn test_auction_gap_up() {
         let d = Detector::new(DetectorConfig::default());
-        let s = stock("000009", "竞价股", 5.0, 1.0, 0.0);
+        let s = stock("TEST_CODE_000009", "竞价股", 5.0, 1.0, 0.0);
         assert!(d.check_auction_gap(&s, 6.0).is_some());
     }
 
     #[test]
     fn test_auction_normal() {
         let d = Detector::new(DetectorConfig::default());
-        let s = stock("000010", "竞价正常", 1.0, 1.0, 0.0);
+        let s = stock("TEST_CODE_000010", "竞价正常", 1.0, 1.0, 0.0);
         assert!(d.check_auction_gap(&s, 2.0).is_none());
     }
 
@@ -627,7 +640,7 @@ mod tests {
             source: "金十".into(),
             importance: 4,
         };
-        assert!(d.check_flash_news(&news, &["000001"]).is_some());
+        assert!(d.check_flash_news(&news, &["TEST_CODE_000001"]).is_some());
     }
 
     #[test]
@@ -638,6 +651,6 @@ mod tests {
             source: "金十".into(),
             importance: 1,
         };
-        assert!(d.check_flash_news(&news, &["000001"]).is_none());
+        assert!(d.check_flash_news(&news, &["TEST_CODE_000001"]).is_none());
     }
 }

@@ -137,26 +137,51 @@ fn test_br005_no_skip_when_normal_output() {
 }
 
 // ========================================================================
-// BR-005 TODO (修复 F16): 日度推送 ≤5 限额 — 当前**未实现**, 等 v9.4+ 接 broker API 时一起做.
-// 文档承诺 "每天推送机会数 ≤ 5, 超过入候选池", 但代码层只有"无快讯跳过"逻辑.
+// BR-005 日度成功投递 ≤5：真实 L5 GovernanceEngine 边界测试。
+// CandidateBoard 的 profile=5 接线由 monitor::v14_adapter 单元测试覆盖；这里验证
+// 第 5 条前放行、已有 5 条时拒绝，避免再用“未实现”为绿色测试。
 // ========================================================================
 
 #[test]
-fn test_br005_daily_limit_5_NOT_IMPLEMENTED_placeholder() {
-    // 修复 F16: BR-005 spec 承诺"每天推送机会数 ≤ 5, 超过入候选池"
-    // 当前实现**没有**硬编码 5 个/天的限额 — run_opportunity_scan 每次调用产 1 个 OpportunityScan,
-    // 推送逻辑 evaluate_opportunity_push_skip_reason 只过滤"无快讯/无产业链命中"等空结果.
-    //
-    // 实现路径 (待 v9.4+ 接 broker API 时一起做):
-    // 1. 在 monitor/main.rs 启动时加载 push_count_today (从 daily_push_log 表或 env)
-    // 2. run_opportunity_scan 后, 如果 count + 1 > 5, 跳过推送 + 写入候选池
-    // 3. 候选池表 push_candidates: (date, scan_text, created_at) 入库
-    // 4. 次日 0 点跑 cron 清空候选池 + 重置 count
-    //
-    // 本测试作为 placeholder, 标记 BR-005 半完成. 真正实现后改为真测试.
-    let limit_implemented = false;
-    assert!(
-        !limit_implemented,
-        "BR-005 每日 ≤5 限额当前未实现, 等 v9.4+"
+fn test_br005_daily_limit_five_boundary() {
+    use chrono::Local;
+    use stock_analysis::push_l1::{Severity, SignalEvent, SignalPayload, SignalSource};
+    use stock_analysis::push_l2::{DataMode, TemplateCategory, TemplateMetadata};
+    use stock_analysis::push_l5::{GovernanceContext, GovernanceDecision, GovernanceEngine};
+
+    let event = SignalEvent::new(
+        SignalSource::HoldingHealth,
+        "candidate_board",
+        None,
+        Local::now(),
+        SignalPayload::HoldingHealth(Default::default()),
+        Severity::Normal,
+    );
+    let profile = TemplateMetadata {
+        category: TemplateCategory::Holding,
+        quiet_hours_respect: false,
+        frozen_mode_respect: false,
+        data_mode_min: DataMode::Degraded,
+        cooldown_secs: 0,
+        max_per_user_per_day: Some(5),
+        always_send_on_data_source_down: false,
+    };
+    let mut ctx = GovernanceContext {
+        data_mode: DataMode::Full,
+        is_quiet_hour: false,
+        is_frozen: false,
+        now: Local::now(),
+        today_pushed_count: 4,
+    };
+    let engine = GovernanceEngine::new();
+
+    assert_eq!(
+        engine.check(&profile, &event, &ctx),
+        GovernanceDecision::Approve
+    );
+    ctx.today_pushed_count = 5;
+    assert_eq!(
+        engine.check(&profile, &event, &ctx),
+        GovernanceDecision::Deny("daily_limit".to_string())
     );
 }

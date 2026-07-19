@@ -137,46 +137,71 @@ impl TieredScanner {
         self.dq_stats.snapshot().summary()
     }
 
-    /// 加载持仓股为扫描目标
-    pub fn load_positions(targets: &mut Vec<ScanTarget>) {
-        if let Some(db) = crate::database::DatabaseManager::try_get() {
-            if let Ok(positions) = db.get_all_open_positions() {
-                for p in &positions {
-                    targets.push(ScanTarget {
-                        code: p.code.clone(),
-                        name: p.name.clone(),
-                        level: ScanLevel::L1,
-                        t1_locked: false,
-                    });
-                }
-                info!("[Scanner] 加载 {} 只持仓股", positions.len());
-            }
-        }
-    }
-
-    /// 加载自选股为扫描目标
-    pub fn load_watchlist(targets: &mut Vec<ScanTarget>) {
-        let codes = crate::portfolio::get_all_codes().unwrap_or_default();
-        for code in codes {
-            if !targets.iter().any(|t| t.code == code) {
-                targets.push(ScanTarget {
-                    code: code.to_string(),
-                    name: format!("股票{}", code),
-                    level: ScanLevel::L2,
-                    t1_locked: false,
-                });
-            }
-        }
+    /// 从严格 portfolio API 一次性加载持仓和自选。任何源错误使整批失败。
+    pub fn load_portfolio_targets(
+    ) -> Result<(Vec<crate::portfolio::Position>, Vec<ScanTarget>), String> {
+        let positions = crate::portfolio::get_positions()?;
+        let watchlist = crate::portfolio::get_watchlist()?;
+        let targets = build_portfolio_targets(&positions, &watchlist);
+        info!("[Scanner] 加载 {} 只持仓股", positions.len());
         info!(
             "[Scanner] 加载 {} 只自选股",
             targets.iter().filter(|t| t.level == ScanLevel::L2).count()
         );
+        Ok((positions, targets))
     }
+}
+
+fn build_portfolio_targets(
+    positions: &[crate::portfolio::Position],
+    watchlist: &[crate::portfolio::Position],
+) -> Vec<ScanTarget> {
+    let mut targets = Vec::with_capacity(positions.len() + watchlist.len());
+    for position in positions {
+        targets.push(ScanTarget {
+            code: position.code.clone(),
+            name: position.name.clone(),
+            level: ScanLevel::L1,
+            t1_locked: false,
+        });
+    }
+    for watched in watchlist {
+        if !targets.iter().any(|target| target.code == watched.code) {
+            targets.push(ScanTarget {
+                code: watched.code.clone(),
+                name: watched.name.clone(),
+                level: ScanLevel::L2,
+                t1_locked: false,
+            });
+        }
+    }
+    targets
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::NaiveDate;
+
+    fn position(
+        code: &str,
+        name: &str,
+        status: crate::portfolio::PositionStatus,
+    ) -> crate::portfolio::Position {
+        let holding = status == crate::portfolio::PositionStatus::Holding;
+        crate::portfolio::Position {
+            code: code.to_string(),
+            name: name.to_string(),
+            shares: if holding { 100 } else { 0 },
+            cost_price: if holding { 10.0 } else { 0.0 },
+            hard_stop: None,
+            added_at: NaiveDate::from_ymd_opt(2026, 7, 18).expect("valid date"),
+            status,
+            sector: String::new(),
+            is_st: false,
+            star_st: false,
+        }
+    }
 
     #[test]
     fn test_scan_level_intervals() {
@@ -187,13 +212,42 @@ mod tests {
     #[test]
     fn test_scanner_creation() {
         let targets = vec![ScanTarget {
-            code: "000001".into(),
+            code: "TEST_CODE_000001".into(),
             name: "测试".into(),
             level: ScanLevel::L1,
             t1_locked: false,
         }];
         let scanner = TieredScanner::new(targets);
         assert!(scanner.try_acquire(ScanLevel::L1));
+    }
+
+    #[test]
+    fn portfolio_targets_keep_real_names_and_deduplicate_codes() {
+        let positions = vec![position(
+            "TEST_CODE_000001",
+            "平安银行",
+            crate::portfolio::PositionStatus::Holding,
+        )];
+        let watchlist = vec![
+            position(
+                "TEST_CODE_000001",
+                "不应覆盖",
+                crate::portfolio::PositionStatus::Watching,
+            ),
+            position(
+                "TEST_CODE_600519",
+                "贵州茅台",
+                crate::portfolio::PositionStatus::Watching,
+            ),
+        ];
+
+        let targets = build_portfolio_targets(&positions, &watchlist);
+
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].name, "平安银行");
+        assert_eq!(targets[0].level, ScanLevel::L1);
+        assert_eq!(targets[1].name, "贵州茅台");
+        assert_eq!(targets[1].level, ScanLevel::L2);
     }
 
     #[test]
@@ -215,14 +269,14 @@ mod tests {
     #[test]
     fn test_validate_tick() {
         let targets = vec![ScanTarget {
-            code: "000001".into(),
+            code: "TEST_CODE_000001".into(),
             name: "测试".into(),
             level: ScanLevel::L1,
             t1_locked: false,
         }];
         let scanner = TieredScanner::new(targets);
         let tick = Tick {
-            code: "000001".into(),
+            code: "TEST_CODE_000001".into(),
             price: 10.0,
             change_pct: 1.0,
             volume: 1000.0,
@@ -235,14 +289,14 @@ mod tests {
     #[test]
     fn test_validate_stale_tick() {
         let targets = vec![ScanTarget {
-            code: "000001".into(),
+            code: "TEST_CODE_000001".into(),
             name: "测试".into(),
             level: ScanLevel::L1,
             t1_locked: false,
         }];
         let scanner = TieredScanner::new(targets);
         let tick = Tick {
-            code: "000001".into(),
+            code: "TEST_CODE_000001".into(),
             price: 10.0,
             change_pct: 1.0,
             volume: 1000.0,

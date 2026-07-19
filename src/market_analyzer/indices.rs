@@ -1,7 +1,7 @@
 //! indices（从 market_analyzer.rs 拆分）
 
 use anyhow::{Context, Result};
-use log::{info, warn};
+use log::info;
 use std::time::Duration;
 
 use crate::market_data::MarketIndex;
@@ -31,27 +31,23 @@ impl MarketAnalyzer {
             Ok(serde_json::json!({"data": text}))
         });
 
-        let mut indices = Vec::new();
-
-        if let Some(json_data) = data {
-            if let Some(text) = json_data.get("data").and_then(|v| v.as_str()) {
-                // 解析腾讯财经返回的数据格式
-                // v_sh000001="1~上证指数~000001~4139.90~4132.61~4125.22~...";
-                for line in text.lines() {
-                    for (code, name) in &self.main_indices {
-                        if line.contains(code) {
-                            if let Some(data_str) = self.parse_tencent_line(line) {
-                                if let Some(mut index) =
-                                    self.parse_tencent_index_data(code, name, &data_str)
-                                {
-                                    index.calculate_amplitude();
-                                    indices.push(index);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        let json_data = data.context("指数行情所有重试均失败")?;
+        let text = json_data
+            .get("data")
+            .and_then(|value| value.as_str())
+            .context("指数行情响应缺少 data 文本")?;
+        let mut indices = Vec::with_capacity(self.main_indices.len());
+        for (code, name) in &self.main_indices {
+            let line = text
+                .lines()
+                .find(|line| line.contains(code))
+                .with_context(|| format!("指数行情缺少 {name}({code})"))?;
+            let data_str = self
+                .parse_tencent_line(line)
+                .with_context(|| format!("指数行情 {name}({code}) 引号格式非法"))?;
+            let mut index = self.parse_tencent_index_data(code, name, &data_str)?;
+            index.calculate_amplitude();
+            indices.push(index);
         }
 
         info!("[大盘] 获取到 {} 个指数行情", indices.len());
@@ -78,28 +74,75 @@ impl MarketAnalyzer {
         code: &str,
         name: &str,
         data_str: &str,
-    ) -> Option<MarketIndex> {
+    ) -> Result<MarketIndex> {
         let parts: Vec<&str> = data_str.split('~').collect();
-        if parts.len() < 33 {
-            warn!("[大盘] {} 数据字段不足: {}", name, parts.len());
-            return None;
+        if parts.len() < 35 {
+            anyhow::bail!("{name} 数据字段不足: {}", parts.len());
         }
+
+        let parse_positive = |index: usize, label: &str| -> Result<f64> {
+            let raw = parts
+                .get(index)
+                .copied()
+                .filter(|value| !value.trim().is_empty())
+                .with_context(|| format!("{name} 缺少 {label}"))?;
+            let value = raw
+                .parse::<f64>()
+                .with_context(|| format!("{name} {label} 无法解析"))?;
+            if !value.is_finite() || value <= 0.0 {
+                anyhow::bail!("{name} {label} 非法: {value}");
+            }
+            Ok(value)
+        };
+        let parse_finite = |index: usize, label: &str| -> Result<f64> {
+            let raw = parts
+                .get(index)
+                .copied()
+                .filter(|value| !value.trim().is_empty())
+                .with_context(|| format!("{name} 缺少 {label}"))?;
+            let value = raw
+                .parse::<f64>()
+                .with_context(|| format!("{name} {label} 无法解析"))?;
+            if !value.is_finite() {
+                anyhow::bail!("{name} {label} 非法: {value}");
+            }
+            Ok(value)
+        };
+        let parse_optional_non_negative = |index: usize, label: &str| -> Result<Option<f64>> {
+            let Some(raw) = parts
+                .get(index)
+                .copied()
+                .filter(|value| !value.trim().is_empty())
+            else {
+                return Ok(None);
+            };
+            let value = raw
+                .parse::<f64>()
+                .with_context(|| format!("{name} {label} 无法解析"))?;
+            if !value.is_finite() || value < 0.0 {
+                anyhow::bail!("{name} {label} 非法: {value}");
+            }
+            Ok(Some(value))
+        };
 
         // 腾讯财经指数数据格式：
         // 0:未知 1:名称 2:代码 3:当前价 4:昨收 5:今开 6:成交量(手) ... 30:涨跌 31:涨跌幅 32:最高 33:最低
-        let current = parts.get(3)?.parse::<f64>().ok()?;
-        let prev_close = parts.get(4)?.parse::<f64>().ok()?;
-        let open = parts.get(5)?.parse::<f64>().ok()?;
-        let volume = parts.get(6)?.parse::<f64>().unwrap_or(0.0);
-        let change = parts.get(31)?.parse::<f64>().ok()?;
-        let change_pct = parts.get(32)?.parse::<f64>().ok()?;
-        let high = parts.get(33)?.parse::<f64>().ok()?;
-        let low = parts.get(34)?.parse::<f64>().ok()?;
+        let current = parse_positive(3, "current")?;
+        let prev_close = parse_positive(4, "prev_close")?;
+        let open = Some(parse_positive(5, "open")?);
+        let volume = parse_optional_non_negative(6, "volume")?;
+        let change = parse_finite(31, "change")?;
+        let change_pct = parse_finite(32, "change_pct")?;
+        let high_value = parse_positive(33, "high")?;
+        let low_value = parse_positive(34, "low")?;
+        let high = Some(high_value);
+        let low = Some(low_value);
+        let amount = parse_optional_non_negative(37, "amount")?;
+        if high_value < current || low_value > current {
+            anyhow::bail!("{name} OHLC 关系非法");
+        }
 
-        // 成交额在后面的字段，简化处理
-        let amount = 0.0;
-
-        Some(MarketIndex {
+        Ok(MarketIndex {
             code: code.to_string(),
             name: name.to_string(),
             current,
@@ -111,7 +154,7 @@ impl MarketAnalyzer {
             prev_close,
             volume,
             amount,
-            amplitude: 0.0, // 稍后计算
+            amplitude: None, // 稍后由已校验 high/low 计算
         })
     }
 }

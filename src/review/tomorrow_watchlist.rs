@@ -95,21 +95,21 @@ mod tests {
     #[test]
     fn render_basic() {
         let items = vec![
-            mock_item("600519", WatchSource::AGradeNotTriggered),
-            mock_item("000001", WatchSource::LhbStrong),
+            mock_item("TEST_CODE_600519", WatchSource::AGradeNotTriggered),
+            mock_item("TEST_CODE_000001", WatchSource::LhbStrong),
         ];
         let s = render_r07(&items);
         assert!(s.contains("📌 明日观察池"));
-        assert!(s.contains("600519"));
+        assert!(s.contains("TEST_CODE_600519"));
         assert!(s.contains("A档未触发"));
     }
 
     #[test]
     fn dedup_keeps_first() {
         let items = vec![
-            mock_item("600519", WatchSource::AGradeNotTriggered),
-            mock_item("600519", WatchSource::LhbStrong), // 重复
-            mock_item("000001", WatchSource::LhbStrong),
+            mock_item("TEST_CODE_600519", WatchSource::AGradeNotTriggered),
+            mock_item("TEST_CODE_600519", WatchSource::LhbStrong), // 重复
+            mock_item("TEST_CODE_000001", WatchSource::LhbStrong),
         ];
         let deduped = dedup(items);
         assert_eq!(deduped.len(), 2);

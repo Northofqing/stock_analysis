@@ -100,7 +100,7 @@ mod tests {
     #[test]
     fn render_basic() {
         let items = vec![FailureItem {
-            code: "600519".into(),
+            code: "TEST_CODE_600519".into(),
             name: "XX".into(),
             signal_level: "A".into(),
             reason: FailureReason::BuyTooLate,

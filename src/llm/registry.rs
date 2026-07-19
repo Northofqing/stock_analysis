@@ -1,6 +1,6 @@
 //! LlmRegistry — 业务侧入口, 按 role 选 provider, role 缺失时按 fallback 链选
 
-use super::providers::{DeepSeekProvider, MiniMaxProvider, OpenAiCompatProvider};
+use super::providers::{DeepSeekProvider, MiniMaxProvider};
 use super::LlmProvider;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,9 +29,9 @@ impl LlmRegistry {
     /// 从 env 加载所有 provider + role 配置
     ///
     /// env 约定:
-    /// - 各个 provider 的 env (DEEPSEEK_API_KEY / MiniMax_API_KEY / OPENAI_COMPAT_API_KEY)
+    /// - 各个 provider 的 env (DEEPSEEK_API_KEY / MiniMax_API_KEY)
     /// - `LLM_ROLE_<NAME>=<provider1>,<provider2>,...` 例如 `LLM_ROLE_TICKER=minimax,deepseek`
-    /// - `LLM_DEFAULT_FALLBACK=deepseek,minimax,openai_compat`
+    /// - `LLM_DEFAULT_FALLBACK=deepseek,minimax`
     pub fn from_env() -> Self {
         let mut providers: HashMap<String, Arc<dyn LlmProvider>> = HashMap::new();
 
@@ -39,9 +39,6 @@ impl LlmRegistry {
             providers.insert(p.name().to_string(), Arc::new(p));
         }
         if let Some(p) = MiniMaxProvider::from_env() {
-            providers.insert(p.name().to_string(), Arc::new(p));
-        }
-        if let Some(p) = OpenAiCompatProvider::from_env() {
             providers.insert(p.name().to_string(), Arc::new(p));
         }
 
@@ -61,7 +58,7 @@ impl LlmRegistry {
         }
 
         let default_fallback = std::env::var("LLM_DEFAULT_FALLBACK")
-            .unwrap_or_else(|_| "deepseek,minimax,openai_compat".to_string())
+            .unwrap_or_else(|_| "deepseek,minimax".to_string())
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())

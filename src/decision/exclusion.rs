@@ -1,3 +1,4 @@
+//! Registered business rules: BR-052.
 //! 排除引擎 — 扫描持仓/自选，标记命中排除板块的标的。
 //!
 //! 匹配方式：拉取排除板块的成份股 → 交叉比对持仓代码。
@@ -44,8 +45,18 @@ static EXCLUSION_MAP_CACHE: OnceLock<std::sync::Mutex<Option<CachedExclusionMap>
     OnceLock::new();
 
 fn cached_exclusion_map() -> std::collections::HashMap<String, (String, String)> {
-    let cell = EXCLUSION_MAP_CACHE.get_or_init(|| std::sync::Mutex::new(None));
     let today = chrono::Local::now().date_naive();
+    cached_exclusion_map_for_date(today, build_exclusion_map)
+}
+
+fn cached_exclusion_map_for_date<F>(
+    today: chrono::NaiveDate,
+    build: F,
+) -> std::collections::HashMap<String, (String, String)>
+where
+    F: FnOnce() -> std::collections::HashMap<String, (String, String)>,
+{
+    let cell = EXCLUSION_MAP_CACHE.get_or_init(|| std::sync::Mutex::new(None));
     {
         let guard = cell.lock().unwrap();
         if let Some(c) = guard.as_ref() {
@@ -54,7 +65,7 @@ fn cached_exclusion_map() -> std::collections::HashMap<String, (String, String)>
             }
         }
     }
-    let map = build_exclusion_map();
+    let map = build();
     *cell.lock().unwrap() = Some(CachedExclusionMap {
         date: today,
         map: map.clone(),
@@ -101,6 +112,27 @@ pub struct ExclusionHit {
     pub source: ExclusionSource,
 }
 
+fn merge_exclusion_board<F>(
+    map: &mut std::collections::HashMap<String, (String, String)>,
+    boards: &[crate::market_analyzer::sector_monitor::ConceptBoard],
+    board_name: &str,
+    reason: &str,
+    fetch_components: F,
+) -> Result<bool, String>
+where
+    F: FnOnce(&str) -> Result<Vec<crate::market_analyzer::sector_monitor::BoardStock>, String>,
+{
+    let Some(board) = boards.iter().find(|board| board.name.contains(board_name)) else {
+        return Ok(false);
+    };
+    let stocks = fetch_components(&board.code)?;
+    for stock in stocks {
+        map.entry(stock.code)
+            .or_insert_with(|| (board_name.to_string(), reason.to_string()));
+    }
+    Ok(true)
+}
+
 /// 一次拉取所有排除板块的成份股，构建 code→board 映射
 fn build_exclusion_map() -> std::collections::HashMap<String, (String, String)> {
     let mut map = std::collections::HashMap::new();
@@ -118,19 +150,20 @@ fn build_exclusion_map() -> std::collections::HashMap<String, (String, String)> 
     let mut failed_boards: Vec<&str> = Vec::new();
     let excluded = excluded_boards();
     for (board_name, reason) in &excluded {
-        let Some(b) = boards_listing.iter().find(|b| b.name.contains(board_name)) else {
-            failed_boards.push(board_name);
-            continue;
-        };
-        match crate::market_analyzer::sector_monitor::fetch_board_components(&b.code, 50) {
-            Ok(stocks) => {
-                for s in stocks {
-                    map.entry(s.code)
-                        .or_insert_with(|| (board_name.clone(), reason.clone()));
-                }
-            }
-            Err(e) => {
-                log::warn!("exclusion: 板块 {} 成份股拉取失败: {}", board_name, e);
+        match merge_exclusion_board(
+            &mut map,
+            &boards_listing,
+            board_name,
+            reason,
+            |board_code| {
+                crate::market_analyzer::sector_monitor::fetch_board_components(board_code, 50)
+                    .map_err(|error| error.to_string())
+            },
+        ) {
+            Ok(true) => {}
+            Ok(false) => failed_boards.push(board_name),
+            Err(error) => {
+                log::warn!("exclusion: 板块 {} 成份股拉取失败: {}", board_name, error);
                 failed_boards.push(board_name);
             }
         }
@@ -151,7 +184,14 @@ pub fn scan_exclusions(holdings: &[Position], watchlist: &[Position]) -> Vec<Exc
     if exclusion_map.is_empty() {
         return vec![];
     }
+    scan_exclusions_with_map(&exclusion_map, holdings, watchlist)
+}
 
+fn scan_exclusions_with_map(
+    exclusion_map: &std::collections::HashMap<String, (String, String)>,
+    holdings: &[Position],
+    watchlist: &[Position],
+) -> Vec<ExclusionHit> {
     let mut hits = Vec::new();
     for p in holdings {
         if let Some((board, reason)) = exclusion_map.get(&p.code) {
@@ -203,6 +243,7 @@ pub fn format_exclusion_alert(hits: &[ExclusionHit]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn test_format_empty() {
@@ -212,7 +253,7 @@ mod tests {
     #[test]
     fn test_format_with_hits() {
         let hits = vec![ExclusionHit {
-            code: "000858".into(),
+            code: "TEST_CODE_000858".into(),
             name: "五粮液".into(),
             matched_board: "白酒".into(),
             reason: "成熟天花板".into(),
@@ -224,10 +265,149 @@ mod tests {
     }
 
     #[test]
-    fn test_exclusion_map_built() {
+    fn source_labels_and_isolated_map_scan_cover_holding_and_watchlist() {
+        assert_eq!(ExclusionSource::Holding.label(), "持仓");
+        assert_eq!(ExclusionSource::Watchlist.label(), "自选");
+        assert_eq!(ExclusionSource::Holding.emoji(), "⚠️");
+        assert_eq!(ExclusionSource::Watchlist.emoji(), "📌");
+
+        let map = std::collections::HashMap::from([
+            (
+                "TEST_CODE_000001".to_string(),
+                ("排除甲".to_string(), "原因甲".to_string()),
+            ),
+            (
+                "TEST_CODE_000002".to_string(),
+                ("排除乙".to_string(), "原因乙".to_string()),
+            ),
+        ]);
+        let holdings = vec![Position {
+            code: "TEST_CODE_000001".to_string(),
+            name: "持仓甲".to_string(),
+            ..Position::default()
+        }];
+        let watchlist = vec![
+            Position {
+                code: "TEST_CODE_000002".to_string(),
+                name: "观察乙".to_string(),
+                ..Position::default()
+            },
+            Position {
+                code: "TEST_CODE_000003".to_string(),
+                name: "未命中".to_string(),
+                ..Position::default()
+            },
+        ];
+        let hits = scan_exclusions_with_map(&map, &holdings, &watchlist);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].source, ExclusionSource::Holding);
+        assert_eq!(hits[1].source, ExclusionSource::Watchlist);
+        let rendered = format_exclusion_alert(&hits);
+        assert!(rendered.contains("持仓甲"));
+        assert!(rendered.contains("观察乙"));
+        assert!(!rendered.contains("未命中"));
+    }
+
+    fn board(code: &str, name: &str) -> crate::market_analyzer::sector_monitor::ConceptBoard {
+        crate::market_analyzer::sector_monitor::ConceptBoard {
+            code: code.to_string(),
+            name: name.to_string(),
+            change_pct: 0.0,
+            main_inflow: 0.0,
+            leader_name: String::new(),
+            vol_ratio: 0.0,
+            turnover: 0.0,
+            main_net_pct_today: 0.0,
+            main_net_pct_5d: 0.0,
+        }
+    }
+
+    fn stock(code: &str) -> crate::market_analyzer::sector_monitor::BoardStock {
+        crate::market_analyzer::sector_monitor::BoardStock {
+            code: code.to_string(),
+            name: format!("TEST_CODE_{code}"),
+            price: 10.0,
+            change_pct: 0.0,
+            amount: 1.0,
+            vol_ratio: 1.0,
+            turnover: 1.0,
+        }
+    }
+
+    #[test]
+    fn same_day_cache_and_resolved_board_mapping_are_deterministic() {
         clear_exclusion_cache();
-        // 不依赖网络时返回空 map（优雅降级）
-        let map = build_exclusion_map();
-        assert!(map.is_empty() || !map.is_empty());
+        let date = chrono::Local::now().date_naive();
+        let builds = AtomicUsize::new(0);
+        let first = cached_exclusion_map_for_date(date, || {
+            builds.fetch_add(1, Ordering::Relaxed);
+            std::collections::HashMap::from([(
+                "TEST_CODE_000001".to_string(),
+                ("测试排除板块".to_string(), "测试原因".to_string()),
+            )])
+        });
+        let second = cached_exclusion_map_for_date(date, || {
+            builds.fetch_add(1, Ordering::Relaxed);
+            std::collections::HashMap::new()
+        });
+        assert_eq!(first, second);
+        assert_eq!(builds.load(Ordering::Relaxed), 1);
+        let next_day = date.succ_opt().expect("next calendar day");
+        let refreshed = cached_exclusion_map_for_date(next_day, || {
+            builds.fetch_add(1, Ordering::Relaxed);
+            std::collections::HashMap::from([(
+                "TEST_CODE_000002".to_string(),
+                ("次日排除板块".to_string(), "次日原因".to_string()),
+            )])
+        });
+        assert!(refreshed.contains_key("TEST_CODE_000002"));
+        assert_eq!(builds.load(Ordering::Relaxed), 2);
+        clear_exclusion_cache();
+        let first_for_scan = first.clone();
+        cached_exclusion_map_for_date(date, || first_for_scan);
+
+        let mut map = std::collections::HashMap::new();
+        let boards = vec![board("BK0001", "测试排除板块")];
+        assert!(
+            merge_exclusion_board(&mut map, &boards, "测试排除", "测试原因", |_| Ok(
+                vec![stock("TEST_CODE_000001"), stock("TEST_CODE_000001")]
+            ),)
+            .unwrap()
+        );
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["TEST_CODE_000001"].0, "测试排除");
+        assert!(
+            !merge_exclusion_board(&mut map, &boards, "不存在", "原因", |_| {
+                panic!("missing board must not fetch components")
+            })
+            .unwrap()
+        );
+        assert!(
+            merge_exclusion_board(&mut map, &boards, "测试排除", "原因", |_| {
+                Err("TEST_CODE_成份来源失败".to_string())
+            })
+            .is_err()
+        );
+
+        let holdings = vec![Position {
+            code: "TEST_CODE_000001".to_string(),
+            name: "隔离持仓".to_string(),
+            ..Position::default()
+        }];
+        let hits = scan_exclusions(&holdings, &[]);
+        assert_eq!(hits.len(), 1);
+        clear_exclusion_cache();
+        cached_exclusion_map_for_date(date, std::collections::HashMap::new);
+        assert!(scan_exclusions(&holdings, &[]).is_empty());
+        clear_exclusion_cache();
+    }
+
+    #[test]
+    fn configured_or_default_exclusion_board_set_is_nonempty() {
+        let boards = excluded_boards();
+        assert!(!boards.is_empty());
+        assert!(boards
+            .iter()
+            .all(|(name, reason)| !name.trim().is_empty() && !reason.trim().is_empty()));
     }
 }

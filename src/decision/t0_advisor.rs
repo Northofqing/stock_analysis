@@ -191,7 +191,7 @@ mod tests {
 
     fn input_default() -> T0Input {
         T0Input {
-            code: "000001".to_string(),
+            code: "TEST_CODE_000001".to_string(),
             name: "测试".to_string(),
             trend: TrendStatus::Range,
             buy_date: "2026-07-01".to_string(), // 历史日期

@@ -43,8 +43,6 @@ pub struct SearchService {
     jin10: Jin10Provider,
     /// 新浪财经全球快讯（免费，4 lid 并发: 国际/国内/A股/港股）
     sina_flash: SinaFlashProvider,
-    /// 雪球 (xueqiu) 公共时间线 (v21: A股 + 全部 category, 用户/机构观点聚合)
-    xueqiu: XueqiuProvider,
     /// 微博热搜榜（正交源：全民级突发/科技/政策热点，补财经快讯的盲区）
     weibo_hot: WeiboHotProvider,
     /// 格隆汇快讯（市场与公司层面高频资讯）
@@ -175,7 +173,6 @@ impl SearchService {
             kcb: KcbDailyProvider::new(),
             jin10: Jin10Provider::new(),
             sina_flash: SinaFlashProvider::new(),
-            xueqiu: XueqiuProvider::new(),
             weibo_hot: WeiboHotProvider::new(),
             gelonghui: GelonghuiProvider::new(),
             gov_policy: GovPolicyProvider::new(),
@@ -711,7 +708,7 @@ impl SearchService {
         let rerank_params = Self::topic_rerank_params();
 
         let expanded_queries = Self::build_topic_queries(query, max_results, intent_cap);
-        let per_provider_max = (max_results / 2).max(2).min(4);
+        let per_provider_max = (max_results / 2).clamp(2, 4);
 
         let mut aggregated: Vec<SearchResult> = Vec::new();
         for q in &expanded_queries {
@@ -1352,8 +1349,6 @@ impl SearchService {
         max_searches: usize,
     ) -> HashMap<String, SearchResponse> {
         let mut results = HashMap::new();
-        let mut search_count = 0;
-
         // 定义搜索维度
         let search_dimensions = vec![
             (
@@ -1375,7 +1370,6 @@ impl SearchService {
 
         info!("开始多维度情报搜索: {}({})", stock_name, stock_code);
 
-        let mut provider_index = 0;
         let available_providers: Vec<_> =
             self.providers.iter().filter(|p| p.is_available()).collect();
 
@@ -1383,13 +1377,10 @@ impl SearchService {
             return results;
         }
 
-        for (dim_name, query, desc) in search_dimensions {
-            if search_count >= max_searches {
-                break;
-            }
-
+        for (provider_index, (dim_name, query, desc)) in
+            search_dimensions.into_iter().take(max_searches).enumerate()
+        {
             let provider = available_providers[provider_index % available_providers.len()];
-            provider_index += 1;
 
             info!("[情报搜索] {}: 使用 {}", desc, provider.name());
 
@@ -1410,8 +1401,6 @@ impl SearchService {
             }
 
             results.insert(dim_name.to_string(), response);
-            search_count += 1;
-
             // 短暂延迟避免请求过快
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
@@ -1847,6 +1836,66 @@ pub fn get_search_service() -> &'static SearchService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FixtureProvider {
+        available: bool,
+        topic: bool,
+        calls: AtomicUsize,
+    }
+
+    impl FixtureProvider {
+        fn available() -> Self {
+            Self {
+                available: true,
+                topic: true,
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SearchProvider for FixtureProvider {
+        fn name(&self) -> &str {
+            "TEST_CODE_fixture_search"
+        }
+
+        fn is_available(&self) -> bool {
+            self.available
+        }
+
+        fn supports_topic_search(&self) -> bool {
+            self.topic
+        }
+
+        async fn search(&self, query: &str, max_results: usize) -> SearchResponse {
+            let call = self.calls.fetch_add(1, Ordering::Relaxed);
+            let mut result = SearchResult::new(
+                format!("测试科技重大订单 {query}"),
+                "TEST_CODE_公司获得中标订单，行业技术突破".to_string(),
+                format!("https://example.invalid/{call}"),
+                self.name().to_string(),
+            )
+            .with_date(chrono::Local::now().format("%Y-%m-%d").to_string());
+            result.importance = 8;
+            result.relevance = 0.8;
+            SearchResponse {
+                query: query.to_string(),
+                results: vec![result; max_results.min(1)],
+                provider: self.name().to_string(),
+                success: true,
+                error_message: None,
+                search_time: 0.01,
+            }
+        }
+    }
+
+    fn fixture_service() -> SearchService {
+        let mut service = SearchService::new(None, None, None, false);
+        service.providers = vec![Box::new(FixtureProvider::available())];
+        service
+    }
 
     #[tokio::test]
     async fn test_search_service() {
@@ -1856,7 +1905,9 @@ mod tests {
 
         if service.is_available() {
             println!("=== 测试股票新闻搜索 ===");
-            let response = service.search_stock_news("300389", "艾比森", 5).await;
+            let response = service
+                .search_stock_news("TEST_CODE_300389", "艾比森", 5)
+                .await;
             println!(
                 "搜索状态: {}",
                 if response.success { "成功" } else { "失败" }
@@ -1896,5 +1947,183 @@ mod tests {
         // 无法解析 → None（保留，不静默丢弃）
         assert_eq!(SearchService::topic_news_age_days(""), None);
         assert_eq!(SearchService::topic_news_age_days("近期"), None);
+    }
+
+    #[test]
+    fn topic_helpers_cover_query_similarity_rerank_and_health_states() {
+        let service = fixture_service();
+        assert!(service.is_available());
+        for outcome in [
+            SourceFetchOutcome::Success,
+            SourceFetchOutcome::Timeout,
+            SourceFetchOutcome::Error,
+            SourceFetchOutcome::Empty,
+        ] {
+            service.record_source_health("TEST_CODE_source", outcome, 2);
+        }
+        for _ in 0..20 {
+            service.maybe_log_source_health_summary("TEST_CODE_reason");
+        }
+
+        assert!(SearchService::build_topic_queries("  ", 5, 5).is_empty());
+        let generic = SearchService::build_topic_queries("今日重大新闻", 8, 8);
+        assert_eq!(generic.len(), 7);
+        assert!(generic[1].starts_with("今日 A股"));
+        let specific = SearchService::build_topic_queries("机器人催化", 3, 2);
+        assert_eq!(specific.len(), 3);
+        assert!(specific[1].starts_with("机器人催化"));
+
+        assert_eq!(SearchService::normalize_text("A 股-测试!"), "a股测试");
+        assert_eq!(SearchService::text_similarity("", "测试"), 0.0);
+        assert_eq!(SearchService::text_similarity("同一", "同一"), 1.0);
+        assert!(SearchService::text_similarity("半导体突破", "半导体量产") > 0.0);
+        assert_eq!(SearchService::char_ngrams("", 2).len(), 0);
+        assert_eq!(SearchService::char_ngrams("单", 2).len(), 1);
+        assert!(!SearchService::extract_query_terms("机器人").is_empty());
+        assert_eq!(
+            SearchService::query_match_score("", &["测试".to_string()]),
+            0.0
+        );
+
+        let candidates = vec![
+            SearchResult::new(
+                "机器人技术突破".to_string(),
+                "量产".to_string(),
+                "https://example.invalid/a".to_string(),
+                "TEST_CODE_source".to_string(),
+            ),
+            SearchResult::new(
+                "机器人订单".to_string(),
+                "中标".to_string(),
+                "https://example.invalid/b".to_string(),
+                "TEST_CODE_source".to_string(),
+            ),
+        ];
+        let ranked = SearchService::rerank_topic_results(
+            "机器人 技术",
+            candidates,
+            &["机器人技术突破量产".to_string()],
+            2,
+            TopicRerankParams {
+                relevance_weight: 1.0,
+                diversity_penalty: 1.0,
+                history_penalty: 1.0,
+            },
+        );
+        assert_eq!(ranked.len(), 2);
+
+        assert_eq!(SearchService::extract_short_name("贵州茅台"), "茅台");
+        assert_eq!(SearchService::extract_short_name("金风科技"), "金风");
+        assert_eq!(SearchService::extract_short_name("A银行"), "A银行");
+
+        for text in ["今天", "刚刚", "3分钟前", "2个月前", "1年前"] {
+            assert!(SearchService::topic_news_age_days(text).is_some(), "{text}");
+        }
+        let english = (chrono::Local::now().date_naive() - chrono::Duration::days(2))
+            .format("%b %d, %Y")
+            .to_string();
+        assert_eq!(SearchService::topic_news_age_days(&english), Some(2));
+    }
+
+    #[tokio::test]
+    async fn fixture_provider_executes_topic_stock_event_intel_and_batch_flows() {
+        let service = fixture_service();
+        assert!(service.search_topic("TEST_CODE_机器人", 0).await.is_empty());
+        let topic = service.search_topic("TEST_CODE_机器人", 4).await;
+        assert_eq!(topic.len(), 4);
+        assert!(topic
+            .iter()
+            .all(|item| !item.keywords.is_empty() || item.importance >= 5));
+
+        let stock = service
+            .search_stock_news("TEST_CODE_000001", "测试科技", 2)
+            .await;
+        assert!(stock.success);
+        assert!(!stock.results.is_empty());
+        assert!(stock.provider.contains("TEST_CODE_fixture_search"));
+        assert!(stock.results.iter().all(|item| item.relevance >= 0.8));
+
+        let events = service
+            .search_stock_events("TEST_CODE_000001", "测试科技", None)
+            .await;
+        assert!(events.success);
+        let custom_events = service
+            .search_stock_events(
+                "TEST_CODE_000001",
+                "测试科技",
+                Some(vec!["TEST_CODE_重大合同"]),
+            )
+            .await;
+        assert!(custom_events.query.contains("TEST_CODE_重大合同"));
+
+        let intel = service
+            .search_comprehensive_intel("TEST_CODE_000001", "测试科技", 3)
+            .await;
+        assert_eq!(intel.len(), 3);
+        let report = SearchService::format_intel_report(&intel, "测试科技");
+        assert!(report.contains("最新消息"));
+        assert!(report.contains("风险排查"));
+        assert!(report.contains("业绩预期"));
+
+        let batch = service
+            .batch_search(
+                vec![
+                    ("TEST_CODE_000001", "测试科技"),
+                    ("TEST_CODE_000002", "测试材料"),
+                ],
+                1,
+                Duration::ZERO,
+            )
+            .await;
+        assert_eq!(batch.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn unavailable_provider_and_empty_reports_remain_explicit() {
+        let mut service = SearchService::new(None, None, None, false);
+        service.providers = vec![Box::new(FixtureProvider {
+            available: false,
+            topic: false,
+            calls: AtomicUsize::new(0),
+        })];
+        assert!(!service.is_available());
+        assert!(service.search_topic("TEST_CODE_主题", 3).await.is_empty());
+        assert!(service
+            .search_comprehensive_intel("TEST_CODE_000001", "测试科技", 3)
+            .await
+            .is_empty());
+        assert!(
+            !service
+                .search_stock_news("TEST_CODE_000001", "测试科技", 2)
+                .await
+                .success
+        );
+        assert!(
+            !service
+                .search_stock_events("TEST_CODE_000001", "测试科技", Some(Vec::new()))
+                .await
+                .success
+        );
+
+        let report = SearchService::format_intel_report(
+            &HashMap::from([
+                (
+                    "latest_news".to_string(),
+                    SearchResponse::error("q".to_string(), "none".to_string(), "e".to_string()),
+                ),
+                (
+                    "risk_check".to_string(),
+                    SearchResponse::error("q".to_string(), "none".to_string(), "e".to_string()),
+                ),
+                (
+                    "earnings".to_string(),
+                    SearchResponse::error("q".to_string(), "none".to_string(), "e".to_string()),
+                ),
+            ]),
+            "测试科技",
+        );
+        assert!(report.contains("未找到相关消息"));
+        assert!(report.contains("未发现明显风险信号"));
+        assert!(report.contains("未找到业绩相关信息"));
     }
 }

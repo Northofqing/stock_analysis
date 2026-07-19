@@ -119,7 +119,7 @@ mod tests {
     fn mock_record(executed: bool) -> ExecutionRecord {
         ExecutionRecord {
             date: NaiveDateLite::today(),
-            code: "600519".into(),
+            code: "TEST_CODE_600519".into(),
             push_kind: "HoldingPlan".into(),
             executed,
             execution_source: if executed {

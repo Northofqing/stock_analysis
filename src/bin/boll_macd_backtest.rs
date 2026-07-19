@@ -24,7 +24,6 @@ struct ClosedTrade {
     buy_date: NaiveDate,
     #[allow(dead_code)]
     sell_date: NaiveDate,
-    buy_price: f64,
     return_pct: f64,
     hold_days: i32,
     ai_score: i32,
@@ -54,23 +53,30 @@ fn parse_csv(path: &str) -> Result<Vec<ClosedTrade>> {
         }
         fields.push(buf.trim().to_string());
         if fields.len() < 12 {
-            continue;
+            anyhow::bail!("CSV 第 {} 行字段不足: {}", i + 1, fields.len());
         }
         // 列顺序：代码,名称,买入日期,卖出日期,买入价,卖出价,收益率_pct,持仓天数,买入日AI评分,买入日建议,买入日趋势,卖出日AI评分,卖出日建议
         let code = fields[0].clone();
         let name = fields[1].clone();
         let buy_date = NaiveDate::parse_from_str(&fields[2], "%Y-%m-%d")?;
         let sell_date = NaiveDate::parse_from_str(&fields[3], "%Y-%m-%d")?;
-        let buy_price = fields[4].parse::<f64>().unwrap_or(0.0);
-        let return_pct = fields[6].parse::<f64>().unwrap_or(0.0);
-        let hold_days = fields[7].parse::<i32>().unwrap_or(0);
-        let ai_score = fields[8].parse::<i32>().unwrap_or(0);
+        let return_pct = fields[6]
+            .parse::<f64>()
+            .with_context(|| format!("CSV 第 {} 行收益率无法解析", i + 1))?;
+        let hold_days = fields[7]
+            .parse::<i32>()
+            .with_context(|| format!("CSV 第 {} 行持仓天数无法解析", i + 1))?;
+        let ai_score = fields[8]
+            .parse::<i32>()
+            .with_context(|| format!("CSV 第 {} 行 AI 评分无法解析", i + 1))?;
+        if !return_pct.is_finite() || hold_days < 0 {
+            anyhow::bail!("CSV 第 {} 行数值超出有效域", i + 1);
+        }
         out.push(ClosedTrade {
             code,
             name,
             buy_date,
             sell_date,
-            buy_price,
             return_pct,
             hold_days,
             ai_score,

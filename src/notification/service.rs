@@ -229,32 +229,25 @@ impl NotificationService {
                         fail_count += 1;
                     }
                 },
-                NotificationChannel::Pushover => {
-                    // 简化: 复用 Slack 路径 (HTTPS POST + JSON)
-                    match self.send_to_slack(content).await {
-                        Ok(_) => success_count += 1,
-                        Ok(false) => {
-                            error!("[Pushover] 发送失败");
-                            fail_count += 1;
-                        }
-                        Err(e) => {
-                            error!("[Pushover] 发送出错: {}", e);
-                            fail_count += 1;
-                        }
+                NotificationChannel::Pushover => match self.send_to_pushover(content).await {
+                    Ok(true) => success_count += 1,
+                    Ok(false) => {
+                        error!("[Pushover] 发送失败");
+                        fail_count += 1;
                     }
-                }
+                    Err(e) => {
+                        error!("[Pushover] 发送出错: {}", e);
+                        fail_count += 1;
+                    }
+                },
                 NotificationChannel::Custom => {
                     // 修复 P0-0: Custom 多个 webhook URL 都发送
                     for url in &self.config.custom_webhook_urls {
-                        let body = serde_json::json!({ "content": content });
-                        match self.client.post(url).json(&body).send().await {
-                            Ok(r) if r.status().is_success() => success_count += 1,
-                            Ok(r) => {
-                                log::warn!("[Custom] {} 推送失败: HTTP {}", url, r.status());
-                                fail_count += 1;
-                            }
-                            Err(e) => {
-                                log::warn!("[Custom] {} 出错: {}", url, e);
+                        match self.send_to_custom_url(url, content).await {
+                            Ok(true) => success_count += 1,
+                            Ok(false) => fail_count += 1,
+                            Err(error) => {
+                                log::warn!("[Custom] {} 出错: {}", url, error);
                                 fail_count += 1;
                             }
                         }
@@ -318,10 +311,55 @@ impl NotificationService {
                             Ok(false) => fail_count += 1,
                             Err(_) => fail_count += 1,
                         },
-                        _ => {
-                            warn!("渠道 {} 暂未实现", channel.name());
-                            fail_count += 1;
+                        NotificationChannel::ServerChan => {
+                            match self.send_to_server_chan(content).await {
+                                Ok(true) => success_count += 1,
+                                Ok(false) | Err(_) => fail_count += 1,
+                            }
                         }
+                        NotificationChannel::DingTalk => {
+                            match self.send_to_dingtalk(content).await {
+                                Ok(true) => success_count += 1,
+                                Ok(false) | Err(_) => fail_count += 1,
+                            }
+                        }
+                        NotificationChannel::Telegram => {
+                            match self.send_to_telegram(content).await {
+                                Ok(true) => success_count += 1,
+                                Ok(false) | Err(_) => fail_count += 1,
+                            }
+                        }
+                        NotificationChannel::Slack => match self.send_to_slack(content).await {
+                            Ok(true) => success_count += 1,
+                            Ok(false) | Err(_) => fail_count += 1,
+                        },
+                        NotificationChannel::Discord => match self.send_to_discord(content).await {
+                            Ok(true) => success_count += 1,
+                            Ok(false) | Err(_) => fail_count += 1,
+                        },
+                        NotificationChannel::Pushover => {
+                            match self.send_to_pushover(content).await {
+                                Ok(true) => success_count += 1,
+                                Ok(false) | Err(_) => fail_count += 1,
+                            }
+                        }
+                        NotificationChannel::Custom => {
+                            if self.config.custom_webhook_urls.is_empty() {
+                                warn!("[Custom] 未配置 webhook_urls, 跳过");
+                                fail_count += 1;
+                            }
+                            for url in &self.config.custom_webhook_urls {
+                                match self.send_to_custom_url(url, content).await {
+                                    Ok(true) => success_count += 1,
+                                    Ok(false) => fail_count += 1,
+                                    Err(error) => {
+                                        warn!("[Custom] {} 出错: {}", url, error);
+                                        fail_count += 1;
+                                    }
+                                }
+                            }
+                        }
+                        NotificationChannel::Email => unreachable!("email handled above"),
                     }
                 }
             }
@@ -336,14 +374,24 @@ impl NotificationService {
 
     /// 保存报告到文件
     pub fn save_report_to_file(&self, content: &str, filename: Option<&str>) -> Result<String> {
-        use std::fs;
-        use std::path::PathBuf;
-
         let default_filename = format!("report_{}.md", Local::now().format("%Y%m%d"));
         let filename = filename.unwrap_or(&default_filename);
+        self.save_report_to_dir(content, filename, Path::new("reports"))
+    }
 
-        let reports_dir = PathBuf::from("reports");
-        fs::create_dir_all(&reports_dir)?;
+    /// Commit a rendered report to an explicit filesystem adapter root.
+    ///
+    /// Production callers use `reports/`; isolated validation can use a temporary
+    /// directory without changing process cwd or leaking artifacts into the repo.
+    pub(crate) fn save_report_to_dir(
+        &self,
+        content: &str,
+        filename: &str,
+        reports_dir: &Path,
+    ) -> Result<String> {
+        use std::fs;
+
+        fs::create_dir_all(reports_dir)?;
 
         let filepath = reports_dir.join(filename);
         fs::write(&filepath, content)?;
@@ -380,7 +428,7 @@ impl NotificationService {
 
         let status = resp.status();
         let body = resp.text().await?;
-        if status.is_success() && body.contains("\"code\":0") {
+        if status.is_success() && serverchan_business_accepted(&body)? {
             Ok(true)
         } else {
             log::warn!(
@@ -390,6 +438,46 @@ impl NotificationService {
             );
             Ok(false)
         }
+    }
+
+    fn build_pushover_request(&self, content: &str) -> Result<reqwest::Request> {
+        let user = self
+            .config
+            .pushover_user_key
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Pushover 未配置 user key"))?;
+        let token = self
+            .config
+            .pushover_api_token
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Pushover 未配置 API token"))?;
+
+        Ok(self
+            .client
+            .post("https://api.pushover.net/1/messages.json")
+            .form(&[("token", token), ("user", user), ("message", content)])
+            .build()?)
+    }
+
+    /// Pushover Message API 推送。
+    /// 官方契约: POST /1/messages.json，HTTP 成功且 JSON status=1 才算成功。
+    pub async fn send_to_pushover(&self, content: &str) -> Result<bool> {
+        let request = match self.build_pushover_request(content) {
+            Ok(request) => request,
+            Err(error) => {
+                log::warn!("[Pushover] 配置无效: {}", error);
+                return Ok(false);
+            }
+        };
+        let response = self.client.execute(request).await?;
+        let status = response.status();
+        let body: serde_json::Value = response.json().await?;
+        let accepted =
+            status.is_success() && body.get("status").and_then(|v| v.as_i64()) == Some(1);
+        if !accepted {
+            log::warn!("[Pushover] 推送失败: HTTP {} body={}", status, body);
+        }
+        Ok(accepted)
     }
 
     /// 修复 P0-0: 钉钉 webhook 推送
@@ -412,7 +500,7 @@ impl NotificationService {
             return Ok(false);
         }
         let body: serde_json::Value = resp.json().await?;
-        if body["errcode"].as_i64().unwrap_or(0) != 0 {
+        if !dingtalk_business_accepted(&body)? {
             log::warn!("[钉钉] 业务错误: {}", body);
             return Ok(false);
         }
@@ -452,8 +540,14 @@ impl NotificationService {
             "parse_mode": "MarkdownV2",
         });
         let resp = self.client.post(&url).json(&body).send().await?;
-        if !resp.status().is_success() {
-            log::warn!("[Telegram] 推送失败: HTTP {}", resp.status());
+        let status = resp.status();
+        let response_body: serde_json::Value = resp.json().await?;
+        if !status.is_success() || !telegram_business_accepted(&response_body)? {
+            log::warn!(
+                "[Telegram] 推送失败: HTTP {} body={}",
+                status,
+                response_body
+            );
             return Ok(false);
         }
         log::info!("[Telegram] 推送成功");
@@ -474,11 +568,34 @@ impl NotificationService {
             "text": content
         });
         let resp = self.client.post(url).json(&body).send().await?;
-        if !resp.status().is_success() {
-            log::warn!("[Slack] 推送失败: HTTP {}", resp.status());
+        let status = resp.status();
+        let response_body = resp.text().await?;
+        if !status.is_success() || !slack_business_accepted(&response_body)? {
+            log::warn!("[Slack] 推送失败: HTTP {} body={:?}", status, response_body);
             return Ok(false);
         }
         log::info!("[Slack] 推送成功");
+        Ok(true)
+    }
+
+    async fn send_to_custom_url(&self, url: &str, content: &str) -> Result<bool> {
+        let body = serde_json::json!({ "content": content });
+        let mut request = self.client.post(url).json(&body);
+        if let Some(token) = self.config.custom_webhook_bearer_token.as_deref() {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        let response_body = response.text().await?;
+        if !status.is_success() || !custom_business_accepted(&response_body)? {
+            log::warn!(
+                "[Custom] {} 推送失败: HTTP {} body={:?}",
+                url,
+                status,
+                response_body
+            );
+            return Ok(false);
+        }
         Ok(true)
     }
 
@@ -517,6 +634,61 @@ impl NotificationService {
     }
 }
 
+fn dingtalk_business_accepted(body: &serde_json::Value) -> Result<bool> {
+    match body.get("errcode").and_then(serde_json::Value::as_i64) {
+        Some(0) => Ok(true),
+        Some(_) => Ok(false),
+        None => Err(anyhow::anyhow!(
+            "钉钉响应缺少整数 errcode，不能确认投递成功: {body}"
+        )),
+    }
+}
+
+fn serverchan_business_accepted(body: &str) -> Result<bool> {
+    let value: serde_json::Value = serde_json::from_str(body)
+        .map_err(|error| anyhow::anyhow!("Server酱响应不是合法 JSON: {error}"))?;
+    match value.get("code").and_then(serde_json::Value::as_i64) {
+        Some(0) => Ok(true),
+        Some(_) => Ok(false),
+        None => Err(anyhow::anyhow!(
+            "Server酱响应缺少整数 code，不能确认投递成功: {value}"
+        )),
+    }
+}
+
+fn telegram_business_accepted(body: &serde_json::Value) -> Result<bool> {
+    match body.get("ok").and_then(serde_json::Value::as_bool) {
+        Some(accepted) => Ok(accepted),
+        None => Err(anyhow::anyhow!(
+            "Telegram 响应缺少布尔 ok，不能确认投递成功: {body}"
+        )),
+    }
+}
+
+fn slack_business_accepted(body: &str) -> Result<bool> {
+    let body = body.trim();
+    if body.is_empty() {
+        return Err(anyhow::anyhow!("Slack 响应正文为空，不能确认投递成功"));
+    }
+    if body.starts_with('{') || body.starts_with('[') {
+        return Err(anyhow::anyhow!(
+            "Slack Incoming Webhook 响应应为纯文本 ok，实际为结构化正文"
+        ));
+    }
+    Ok(body == "ok")
+}
+
+fn custom_business_accepted(body: &str) -> Result<bool> {
+    let value: serde_json::Value = serde_json::from_str(body)
+        .map_err(|error| anyhow::anyhow!("Custom webhook 响应不是合法 JSON: {error}"))?;
+    match value.get("ok").and_then(serde_json::Value::as_bool) {
+        Some(accepted) => Ok(accepted),
+        None => Err(anyhow::anyhow!(
+            "Custom webhook 响应缺少布尔 ok，不能确认投递成功: {value}"
+        )),
+    }
+}
+
 // review #15: 委托给 util::truncate_chars (DRY).
 fn truncate(s: &str, max: usize) -> String {
     crate::util::truncate_chars(s, max)
@@ -539,6 +711,9 @@ pub async fn send_daily_report(results: &[AnalysisResult]) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
 
     #[test]
     fn test_channel_name() {
@@ -547,10 +722,78 @@ mod tests {
     }
 
     #[test]
+    fn br111_dingtalk_requires_explicit_integer_success_code() {
+        assert!(dingtalk_business_accepted(&serde_json::json!({"errcode": 0})).unwrap());
+        assert!(!dingtalk_business_accepted(&serde_json::json!({"errcode": 310000})).unwrap());
+        assert!(dingtalk_business_accepted(&serde_json::json!({})).is_err());
+        assert!(dingtalk_business_accepted(&serde_json::json!({"errcode": "0"})).is_err());
+    }
+
+    #[test]
+    fn br111_serverchan_requires_structured_integer_zero_code() {
+        assert!(serverchan_business_accepted(r#"{"code":0}"#).unwrap());
+        assert!(!serverchan_business_accepted(r#"{"code":1}"#).unwrap());
+        assert!(serverchan_business_accepted(r#"{"message":"\"code\":0"}"#).is_err());
+        assert!(serverchan_business_accepted(r#"{"code":"0"}"#).is_err());
+    }
+
+    #[test]
+    fn br111_telegram_requires_explicit_boolean_ok() {
+        assert!(telegram_business_accepted(&serde_json::json!({"ok": true})).unwrap());
+        assert!(!telegram_business_accepted(&serde_json::json!({"ok": false})).unwrap());
+        assert!(telegram_business_accepted(&serde_json::json!({})).is_err());
+        assert!(telegram_business_accepted(&serde_json::json!({"ok": "true"})).is_err());
+    }
+
+    #[test]
+    fn br111_slack_requires_exact_plaintext_ok() {
+        assert!(slack_business_accepted("ok\n").unwrap());
+        assert!(!slack_business_accepted("invalid_payload").unwrap());
+        assert!(slack_business_accepted("").is_err());
+        assert!(slack_business_accepted(r#"{"ok":true}"#).is_err());
+    }
+
+    #[test]
+    fn br111_custom_webhook_requires_explicit_boolean_ok() {
+        assert!(custom_business_accepted(r#"{"ok":true}"#).unwrap());
+        assert!(!custom_business_accepted(r#"{"ok":false}"#).unwrap());
+        assert!(custom_business_accepted(r#"{}"#).is_err());
+        assert!(custom_business_accepted(r#"{"ok":"true"}"#).is_err());
+        assert!(custom_business_accepted("ok").is_err());
+    }
+
+    #[test]
+    fn pushover_request_targets_official_message_api() {
+        let config = NotificationConfig {
+            pushover_user_key: Some("TEST_CODE_USER".to_string()),
+            pushover_api_token: Some("TEST_CODE_TOKEN".to_string()),
+            ..NotificationConfig::default()
+        };
+        let service = NotificationService {
+            config,
+            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            available_channels: vec![NotificationChannel::Pushover],
+        };
+
+        let request = service
+            .build_pushover_request("TEST_CODE alert")
+            .expect("request should build without network access");
+        assert_eq!(request.method(), reqwest::Method::POST);
+        assert_eq!(
+            request.url().as_str(),
+            "https://api.pushover.net/1/messages.json"
+        );
+        let form = std::str::from_utf8(request.body().unwrap().as_bytes().unwrap()).unwrap();
+        assert!(form.contains("token=TEST_CODE_TOKEN"));
+        assert!(form.contains("user=TEST_CODE_USER"));
+        assert!(form.contains("message=TEST_CODE+alert"));
+    }
+
+    #[test]
     fn test_generate_report() {
         // let results = vec![
         //     AnalysisResult {
-        //         code: "600519".to_string(),
+        //         code: "TEST_CODE_600519".to_string(),
         //         name: "贵州茅台".to_string(),
         //         sentiment_score: 75,
         //         trend_prediction: "看多".to_string(),
@@ -569,7 +812,104 @@ mod tests {
         // let report = service.generate_daily_report(&results);
 
         // assert!(report.contains("贵州茅台"));
-        // assert!(report.contains("600519"));
+        // assert!(report.contains("TEST_CODE_600519"));
         // assert!(report.contains("买入"));
+    }
+
+    fn spawn_webhook_fixture(expected_requests: usize) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local webhook fixture");
+        let address = listener.local_addr().expect("local webhook address");
+        let handle = thread::spawn(move || {
+            for _ in 0..expected_requests {
+                let (mut stream, _) = listener.accept().expect("accept webhook request");
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .expect("set fixture timeout");
+                let mut request = Vec::new();
+                let mut buf = [0_u8; 4096];
+                loop {
+                    let read = stream.read(&mut buf).expect("read webhook request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let first_line = String::from_utf8_lossy(&request)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                let (content_type, body) = if first_line.contains("/slack") {
+                    ("text/plain", "ok")
+                } else if first_line.contains("/custom") {
+                    ("application/json", r#"{"ok":true}"#)
+                } else if first_line.contains("/feishu") {
+                    ("application/json", r#"{"code":0}"#)
+                } else {
+                    ("application/json", r#"{"errcode":0}"#)
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write webhook response");
+            }
+        });
+        (format!("http://{address}"), handle)
+    }
+
+    #[tokio::test]
+    async fn unified_text_and_image_dispatch_execute_all_local_webhook_adapters() {
+        let (base, fixture) = spawn_webhook_fixture(12);
+        let config = NotificationConfig {
+            wechat_webhook_url: Some(format!("{base}/wechat")),
+            feishu_webhook_url: Some(format!("{base}/feishu")),
+            dingtalk_webhook_url: Some(format!("{base}/dingtalk")),
+            slack_webhook_url: Some(format!("{base}/slack")),
+            discord_webhook_url: Some(format!("{base}/discord")),
+            custom_webhook_urls: vec![format!("{base}/custom")],
+            custom_webhook_bearer_token: Some("TEST_CODE_TOKEN".to_string()),
+            wechat_max_bytes: 4_000,
+            feishu_max_bytes: 20_000,
+            ..NotificationConfig::default()
+        };
+        let service = NotificationService::new(config);
+        assert_eq!(service.get_available_channels().len(), 6);
+        assert!(service.is_available());
+        assert!(service.get_channel_names().contains("企业微信"));
+        assert!(service.send("TEST_CODE 本地通知").await.unwrap());
+        assert!(service
+            .send_with_image(
+                "TEST_CODE 本地图片通知",
+                Path::new("TEST_CODE_not_read_for_webhooks.png"),
+            )
+            .await
+            .unwrap());
+        fixture.join().expect("webhook fixture completed");
+    }
+
+    #[tokio::test]
+    async fn unavailable_service_and_explicit_report_directory_are_local() {
+        let service = NotificationService::new(NotificationConfig::default());
+        assert!(!service.send("TEST_CODE no channels").await.unwrap());
+        assert!(!service
+            .send_with_image("TEST_CODE no channels", Path::new("TEST_CODE_missing.png"))
+            .await
+            .unwrap());
+
+        let root = std::env::temp_dir().join(format!(
+            "stock-analysis-notification-report-{}",
+            std::process::id()
+        ));
+        let path = service
+            .save_report_to_dir("TEST_CODE report", "report.md", &root)
+            .expect("save isolated report");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "TEST_CODE report");
+        std::fs::remove_dir_all(root).expect("remove isolated report directory");
     }
 }

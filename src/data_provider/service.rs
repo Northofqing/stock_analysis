@@ -1,3 +1,4 @@
+//! Registered business rules: BR-057, BR-115.
 //! 数据获取服务（进程级缓存，单飞抓取，带 TTL）
 //!
 //! 目标：消除"快速分析流水线"与"ReAct Agent 工具"之间对同一只股票同一份数据的重复抓取。
@@ -59,6 +60,10 @@ impl DataFetchService {
         // review #15: 复用 SHARED_HTTP_CLIENT (30s timeout + Arc 内核),
         // 替代每次 new Client. 多 DataFetchService 实例 + 频繁 new 会浪费 TLS handshake.
         let client = crate::http_client::SHARED_HTTP_CLIENT.clone();
+        Self::with_client(client)
+    }
+
+    fn with_client(client: reqwest::Client) -> Self {
         Self {
             client,
             klines: DashMap::new(),
@@ -105,6 +110,43 @@ impl DataFetchService {
         *cell.write().await = Some((Instant::now(), value));
     }
 
+    async fn cache_financial_result(
+        cell: &CachedSlot<Financials>,
+        result: Result<Financials>,
+    ) -> Result<Arc<Financials>> {
+        let value = Arc::new(result?);
+        Self::write_cache(cell, value.clone()).await;
+        Ok(value)
+    }
+
+    async fn cache_money_flow_result(
+        cell: &CachedSlot<MoneyFlowSummary>,
+        code: &str,
+        result: Result<MoneyFlowSummary>,
+    ) -> Result<Arc<MoneyFlowSummary>> {
+        let value = result?;
+        if value.is_empty() {
+            anyhow::bail!("[{code}] 资金流来源成功但返回空批次");
+        }
+        let value = Arc::new(value);
+        Self::write_cache(cell, value.clone()).await;
+        Ok(value)
+    }
+
+    async fn cache_intraday_result(
+        cell: &CachedSlot<IntradayShape>,
+        code: &str,
+        result: Result<IntradayShape>,
+    ) -> Result<Arc<IntradayShape>> {
+        let value = result?;
+        if !value.present {
+            anyhow::bail!("[{code}] 分时来源未提供有效形态");
+        }
+        let value = Arc::new(value);
+        Self::write_cache(cell, value.clone()).await;
+        Ok(value)
+    }
+
     /// 获取 K 线数据（缓存 by `(code, days)`，带 TTL).
     ///
     /// P1: 盘内 5min / 盘后 1day, 过期自动 invalidate 重抓.
@@ -132,53 +174,42 @@ impl DataFetchService {
     }
 
     /// 获取最新一期核心财务指标（缓存 by `code`，带 TTL).
-    pub async fn get_financials(&self, code: &str) -> Arc<Financials> {
+    pub async fn get_financials(&self, code: &str) -> Result<Arc<Financials>> {
         let cell = Self::slot(&self.financials, code.to_string()).await;
         if let Some(cached) = Self::read_cache(&cell).await {
-            return Arc::new(cached);
+            return Ok(Arc::new(cached));
         }
         let code_owned = code.to_string();
         let client = self.client.clone();
         let cell_for_write = cell.clone();
-        // fetch_with_fallback_async 内部已 swallow error，返回空 Financials
-        let fin = fetch_with_fallback_async(&client, &code_owned).await;
-        let fin_arc = Arc::new(fin);
-        Self::write_cache(&cell_for_write, fin_arc.clone()).await;
-        fin_arc
+        let result = fetch_with_fallback_async(&client, &code_owned).await;
+        Self::cache_financial_result(&cell_for_write, result).await
     }
 
     /// 获取近 `lmt` 日资金流（缓存 by `(code, lmt)`，带 TTL).
-    pub async fn get_money_flow(&self, code: &str, lmt: usize) -> Arc<MoneyFlowSummary> {
+    pub async fn get_money_flow(&self, code: &str, lmt: usize) -> Result<Arc<MoneyFlowSummary>> {
         let cell = Self::slot(&self.money_flow, (code.to_string(), lmt)).await;
         if let Some(cached) = Self::read_cache(&cell).await {
-            return Arc::new(cached);
+            return Ok(Arc::new(cached));
         }
         let code_owned = code.to_string();
         let client = self.client.clone();
         let cell_for_write = cell.clone();
-        let flow = fetch_flow_history_async(&client, &code_owned, lmt)
-            .await
-            .unwrap_or_default();
-        let flow_arc = Arc::new(flow);
-        Self::write_cache(&cell_for_write, flow_arc.clone()).await;
-        flow_arc
+        let result = fetch_flow_history_async(&client, &code_owned, lmt).await;
+        Self::cache_money_flow_result(&cell_for_write, code, result).await
     }
 
     /// 获取今日日内分时形态（缓存 by `code`，带 TTL).
-    pub async fn get_intraday_shape(&self, code: &str) -> Arc<IntradayShape> {
+    pub async fn get_intraday_shape(&self, code: &str) -> Result<Arc<IntradayShape>> {
         let cell = Self::slot(&self.intraday, code.to_string()).await;
         if let Some(cached) = Self::read_cache(&cell).await {
-            return Arc::new(cached);
+            return Ok(Arc::new(cached));
         }
         let code_owned = code.to_string();
         let client = self.client.clone();
         let cell_for_write = cell.clone();
-        let shape = fetch_intraday_shape_async(&client, &code_owned)
-            .await
-            .unwrap_or_default();
-        let shape_arc = Arc::new(shape);
-        Self::write_cache(&cell_for_write, shape_arc.clone()).await;
-        shape_arc
+        let result = fetch_intraday_shape_async(&client, &code_owned).await;
+        Self::cache_intraday_result(&cell_for_write, code, result).await
     }
 }
 
@@ -197,6 +228,41 @@ mod tests {
     #[allow(unused_imports)]
     use crate::data_provider::brief;
     use crate::data_provider::is_ban_error;
+
+    fn kline() -> KlineData {
+        KlineData {
+            date: chrono::NaiveDate::from_ymd_opt(2026, 7, 18).unwrap(),
+            open: 10.0,
+            high: 10.5,
+            low: 9.8,
+            close: 10.2,
+            volume: 1_000.0,
+            amount: 10_200.0,
+            pct_chg: 2.0,
+            intraday_price: None,
+            settled: true,
+            pe_ratio: None,
+            pb_ratio: None,
+            turnover_rate: None,
+            market_cap: None,
+            circulating_cap: None,
+            eps: None,
+            roe: None,
+            revenue_yoy: None,
+            net_profit_yoy: None,
+            gross_margin: None,
+            net_margin: None,
+            sharpe_ratio: None,
+            financials_history: None,
+            valuation_history: None,
+            consensus: None,
+            industry: None,
+            is_limit_up: false,
+            is_limit_down: false,
+            is_suspended: false,
+            adjust: crate::data_provider::AdjustType::Qfq,
+        }
+    }
 
     #[test]
     fn test_ttl_for_now_outside_trading_hours_is_long() {
@@ -239,6 +305,216 @@ mod tests {
         assert!(truncated.contains("截断"));
         let short = "short";
         assert_eq!(brief(short), "short");
+    }
+
+    #[tokio::test]
+    async fn br115_cache_hit_paths_share_values_and_expire_without_transport() {
+        let fetch_service = DataFetchService::new();
+
+        let kline_key = ("TEST_CODE_CACHE_KLINE".to_string(), 1);
+        let kline_cell = DataFetchService::slot(&fetch_service.klines, kline_key.clone()).await;
+        let same_cell = DataFetchService::slot(&fetch_service.klines, kline_key.clone()).await;
+        assert!(Arc::ptr_eq(&kline_cell, &same_cell));
+        DataFetchService::write_cache(&kline_cell, Arc::new(vec![kline()])).await;
+        let klines = fetch_service
+            .get_kline(&kline_key.0, kline_key.1)
+            .await
+            .expect("cached kline must not open transport");
+        assert_eq!(klines.len(), 1);
+        assert_eq!(klines[0].close, 10.2);
+
+        let finance_code = "TEST_CODE_CACHE_FINANCE".to_string();
+        let finance_cell =
+            DataFetchService::slot(&fetch_service.financials, finance_code.clone()).await;
+        let finance = Financials {
+            report_date: Some("2026-06-30".to_string()),
+            eps: Some(1.25),
+            source: Some("TEST_CODE_LOCAL_PROTOCOL"),
+            ..Financials::default()
+        };
+        DataFetchService::write_cache(&finance_cell, Arc::new(finance)).await;
+        let finance = fetch_service
+            .get_financials(&finance_code)
+            .await
+            .expect("cached financials must not open transport");
+        assert_eq!(finance.eps, Some(1.25));
+
+        let flow_key = ("TEST_CODE_CACHE_FLOW".to_string(), 1);
+        let flow_cell = DataFetchService::slot(&fetch_service.money_flow, flow_key.clone()).await;
+        let flow = MoneyFlowSummary {
+            days: vec![crate::data_provider::money_flow::MoneyFlowDay {
+                date: "2026-07-18".to_string(),
+                main_net: 10.0,
+                xl_net: 4.0,
+                big_net: 6.0,
+                main_pct: 1.0,
+                pct_chg: 2.0,
+            }],
+        };
+        DataFetchService::write_cache(&flow_cell, Arc::new(flow)).await;
+        let flow = fetch_service
+            .get_money_flow(&flow_key.0, flow_key.1)
+            .await
+            .expect("cached money flow must not open transport");
+        assert_eq!(flow.days.len(), 1);
+
+        let intraday_code = "TEST_CODE_CACHE_INTRADAY".to_string();
+        let intraday_cell =
+            DataFetchService::slot(&fetch_service.intraday, intraday_code.clone()).await;
+        let intraday = IntradayShape {
+            date: "2026-07-18".to_string(),
+            pre_close: 10.0,
+            open_pct: 1.0,
+            high_pct: 3.0,
+            low_pct: -1.0,
+            close_pct: 2.0,
+            amplitude: 4.0,
+            tail_30m_pct: Some(0.5),
+            shape_label: "TEST_CODE 本地形态",
+            present: true,
+        };
+        DataFetchService::write_cache(&intraday_cell, Arc::new(intraday)).await;
+        let intraday = fetch_service
+            .get_intraday_shape(&intraday_code)
+            .await
+            .expect("cached intraday shape must not open transport");
+        assert!(intraday.present);
+        assert_eq!(intraday.tail_30m_pct, Some(0.5));
+
+        let empty: CachedSlot<i32> = Arc::new(RwLock::new(None));
+        assert_eq!(DataFetchService::read_cache(&empty).await, None);
+        let expired: CachedSlot<i32> = Arc::new(RwLock::new(Some((
+            Instant::now()
+                .checked_sub(ttl_for_now() + Duration::from_secs(1))
+                .expect("TTL fits Instant range"),
+            Arc::new(7),
+        ))));
+        assert_eq!(DataFetchService::read_cache(&expired).await, None);
+        assert!(expired.read().await.is_none());
+
+        assert!(std::ptr::eq(service(), service()));
+    }
+
+    #[tokio::test]
+    async fn resolved_provider_results_validate_before_cache_commit() {
+        let financial_cell: CachedSlot<Financials> = Arc::new(RwLock::new(None));
+        let financial = DataFetchService::cache_financial_result(
+            &financial_cell,
+            Ok(Financials {
+                report_date: Some("2026-06-30".to_string()),
+                eps: Some(1.0),
+                source: Some("TEST_CODE_真实协议解析"),
+                ..Financials::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(financial.eps, Some(1.0));
+        assert!(financial_cell.read().await.is_some());
+
+        let failed_financial: CachedSlot<Financials> = Arc::new(RwLock::new(None));
+        assert!(DataFetchService::cache_financial_result(
+            &failed_financial,
+            Err(anyhow::anyhow!("TEST_CODE_财务来源失败")),
+        )
+        .await
+        .is_err());
+        assert!(failed_financial.read().await.is_none());
+
+        let flow_cell: CachedSlot<MoneyFlowSummary> = Arc::new(RwLock::new(None));
+        assert!(DataFetchService::cache_money_flow_result(
+            &flow_cell,
+            "TEST_CODE_000001",
+            Ok(MoneyFlowSummary::default()),
+        )
+        .await
+        .is_err());
+        assert!(flow_cell.read().await.is_none());
+        let flow = MoneyFlowSummary {
+            days: vec![crate::data_provider::money_flow::MoneyFlowDay {
+                date: "2026-07-18".to_string(),
+                main_net: 10.0,
+                xl_net: 4.0,
+                big_net: 6.0,
+                main_pct: 1.0,
+                pct_chg: 2.0,
+            }],
+        };
+        assert_eq!(
+            DataFetchService::cache_money_flow_result(&flow_cell, "TEST_CODE_000001", Ok(flow),)
+                .await
+                .unwrap()
+                .days
+                .len(),
+            1
+        );
+
+        let intraday_cell: CachedSlot<IntradayShape> = Arc::new(RwLock::new(None));
+        assert!(DataFetchService::cache_intraday_result(
+            &intraday_cell,
+            "TEST_CODE_000001",
+            Ok(IntradayShape::default()),
+        )
+        .await
+        .is_err());
+        assert!(intraday_cell.read().await.is_none());
+        let present = IntradayShape {
+            date: "2026-07-18".to_string(),
+            pre_close: 10.0,
+            open_pct: 1.0,
+            high_pct: 2.0,
+            low_pct: -1.0,
+            close_pct: 1.5,
+            amplitude: 3.0,
+            tail_30m_pct: Some(0.5),
+            shape_label: "TEST_CODE_完整形态",
+            present: true,
+        };
+        assert!(
+            DataFetchService::cache_intraday_result(
+                &intraday_cell,
+                "TEST_CODE_000001",
+                Ok(present),
+            )
+            .await
+            .unwrap()
+            .present
+        );
+    }
+
+    #[tokio::test]
+    async fn unreachable_real_provider_transports_do_not_populate_caches() {
+        let fetch_service = DataFetchService::with_client(super::super::unreachable_http_client());
+        assert!(fetch_service
+            .get_financials("TEST_CODE_000001")
+            .await
+            .is_err());
+        assert!(fetch_service
+            .get_money_flow("TEST_CODE_000001", 1)
+            .await
+            .is_err());
+        assert!(fetch_service
+            .get_intraday_shape("TEST_CODE_000001")
+            .await
+            .is_err());
+        let financial_slot = fetch_service
+            .financials
+            .get("TEST_CODE_000001")
+            .expect("failed request still owns an empty single-flight slot")
+            .clone();
+        let flow_slot = fetch_service
+            .money_flow
+            .get(&("TEST_CODE_000001".to_string(), 1))
+            .expect("failed request still owns an empty single-flight slot")
+            .clone();
+        let intraday_slot = fetch_service
+            .intraday
+            .get("TEST_CODE_000001")
+            .expect("failed request still owns an empty single-flight slot")
+            .clone();
+        assert!(financial_slot.read().await.is_none());
+        assert!(flow_slot.read().await.is_none());
+        assert!(intraday_slot.read().await.is_none());
     }
 
     /// 测试用的 ttl 决策函数 (接受时间参数避免依赖 chrono::Local::now()).

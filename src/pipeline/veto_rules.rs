@@ -177,3 +177,247 @@ pub fn render_section(outcome: &VetoOutcome, original_advice: &str) -> Option<St
     }
     Some(s)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data_provider::consensus::ConsensusData;
+    use crate::data_provider::financials::FinancialPeriod;
+    use crate::data_provider::money_flow::{MoneyFlowDay, MoneyFlowSummary};
+    use crate::data_provider::valuation_history::ValuationHistory;
+    use crate::data_provider::{AdjustType, KlineData};
+    use chrono::NaiveDate;
+
+    fn kline(close: f64) -> KlineData {
+        KlineData {
+            date: NaiveDate::from_ymd_opt(2026, 7, 18).expect("valid fixture date"),
+            open: close,
+            high: close,
+            low: close,
+            close,
+            volume: 1_000.0,
+            amount: close * 1_000.0,
+            pct_chg: 0.0,
+            intraday_price: None,
+            settled: true,
+            pe_ratio: None,
+            pb_ratio: None,
+            turnover_rate: None,
+            market_cap: None,
+            circulating_cap: None,
+            eps: None,
+            roe: None,
+            revenue_yoy: None,
+            net_profit_yoy: None,
+            gross_margin: None,
+            net_margin: None,
+            sharpe_ratio: None,
+            financials_history: None,
+            valuation_history: None,
+            consensus: None,
+            industry: None,
+            is_limit_up: false,
+            is_limit_down: false,
+            is_suspended: false,
+            adjust: AdjustType::None,
+        }
+    }
+
+    fn valuation_history(pe_percentile: f64, pb_percentile: f64) -> ValuationHistory {
+        ValuationHistory {
+            current_pe: Some(20.0),
+            current_pb: Some(2.0),
+            pe_percentile: Some(pe_percentile),
+            pb_percentile: Some(pb_percentile),
+            pe_min: Some(10.0),
+            pe_max: Some(30.0),
+            pe_median: Some(20.0),
+            pb_min: Some(1.0),
+            pb_max: Some(3.0),
+            pb_median: Some(2.0),
+            sample_days: 3,
+            oldest_date: Some("2026-07-16".into()),
+            newest_date: Some("2026-07-18".into()),
+        }
+    }
+
+    #[test]
+    fn missing_optional_evidence_produces_no_veto() {
+        let outcome = evaluate("观望", None, &kline(10.0));
+
+        assert!(outcome.is_empty());
+        assert_eq!(outcome.downgraded_advice, None);
+        assert_eq!(outcome.position_cap_pct, None);
+        assert_eq!(render_section(&outcome, "观望"), None);
+    }
+
+    #[test]
+    fn three_negative_revenue_periods_block_buy_advice() {
+        let mut data = kline(10.0);
+        data.financials_history = Some(
+            [-5.0, -10.0, -15.0]
+                .into_iter()
+                .map(|revenue_yoy| FinancialPeriod {
+                    revenue_yoy: Some(revenue_yoy),
+                    ..FinancialPeriod::default()
+                })
+                .collect(),
+        );
+
+        let outcome = evaluate("建议买入", None, &data);
+
+        assert_eq!(outcome.downgraded_advice.as_deref(), Some("观望"));
+        assert_eq!(outcome.position_cap_pct, None);
+        assert_eq!(outcome.flags.len(), 1);
+        assert!(outcome.flags[0].contains("营收连续 3 期负增长"));
+    }
+
+    #[test]
+    fn low_cash_coverage_with_profit_divergence_caps_position() {
+        let mut data = kline(10.0);
+        data.financials_history = Some(vec![FinancialPeriod {
+            eps: Some(1.0),
+            op_cash_flow_ps: Some(0.2),
+            revenue_yoy: Some(10.0),
+            net_profit_yoy: Some(30.0),
+            ..FinancialPeriod::default()
+        }]);
+
+        let outcome = evaluate("观望", None, &data);
+
+        assert_eq!(outcome.downgraded_advice, None);
+        assert_eq!(outcome.position_cap_pct, Some(30));
+        assert_eq!(outcome.flags.len(), 1);
+        assert!(outcome.flags[0].contains("CFO/NI=0.20"));
+        assert!(outcome.flags[0].contains("建议仓位 ≤30%"));
+    }
+
+    #[test]
+    fn price_above_consensus_target_caps_position() {
+        let mut data = kline(10.0);
+        data.consensus = Some(ConsensusData {
+            target_price_high_avg: Some(8.0),
+            ..ConsensusData::default()
+        });
+
+        let outcome = evaluate("观望", None, &data);
+
+        assert_eq!(outcome.position_cap_pct, Some(30));
+        assert_eq!(outcome.flags.len(), 1);
+        assert!(outcome.flags[0].contains("现价已高于卖方目标价均值 20.0%"));
+    }
+
+    #[test]
+    fn valuation_tiers_apply_documented_downgrades_and_caps() {
+        let cases = [
+            (
+                99.0,
+                99.0,
+                "建议买入",
+                Some("观望"),
+                Some(20),
+                "极端双高估值",
+            ),
+            (
+                98.0,
+                98.0,
+                "建议买入",
+                Some("观望"),
+                Some(30),
+                "严重双高估值",
+            ),
+            (
+                85.0,
+                95.0,
+                "强烈建议买入",
+                Some("建议买入"),
+                None,
+                "双高估值",
+            ),
+            (85.0, 95.0, "建议买入", None, None, "双高估值"),
+        ];
+
+        for (pe, pb, advice, downgraded, cap, flag_text) in cases {
+            let mut data = kline(10.0);
+            data.valuation_history = Some(valuation_history(pe, pb));
+            let outcome = evaluate(advice, None, &data);
+
+            assert_eq!(outcome.downgraded_advice.as_deref(), downgraded);
+            assert_eq!(outcome.position_cap_pct, cap);
+            assert_eq!(outcome.flags.len(), 1);
+            assert!(outcome.flags[0].contains(flag_text));
+        }
+    }
+
+    #[test]
+    fn one_day_money_flow_bounce_downgrades_strong_buy() {
+        let days = [-10.0, -10.0, -10.0, -12.0, 2.0]
+            .into_iter()
+            .enumerate()
+            .map(|(index, main_net_yi)| MoneyFlowDay {
+                date: format!("2026-07-{}", 14 + index),
+                main_net: main_net_yi * 1e8,
+                xl_net: 0.0,
+                big_net: 0.0,
+                main_pct: 0.0,
+                pct_chg: 0.0,
+            })
+            .collect();
+        let flow = MoneyFlowSummary { days };
+
+        let outcome = evaluate("强烈建议买入", Some(&flow), &kline(10.0));
+
+        assert_eq!(outcome.downgraded_advice.as_deref(), Some("建议买入"));
+        assert_eq!(outcome.position_cap_pct, Some(50));
+        assert_eq!(outcome.flags.len(), 1);
+        assert!(outcome.flags[0].contains("累计流出 -40.0 亿"));
+        assert!(outcome.flags[0].contains("最新日仅流入 2.00 亿"));
+    }
+
+    #[test]
+    fn strictest_cap_and_first_downgrade_win_across_multiple_vetoes() {
+        let mut data = kline(10.0);
+        data.financials_history = Some(vec![
+            FinancialPeriod {
+                eps: Some(1.0),
+                op_cash_flow_ps: Some(0.2),
+                revenue_yoy: Some(-5.0),
+                net_profit_yoy: Some(20.0),
+                ..FinancialPeriod::default()
+            },
+            FinancialPeriod {
+                revenue_yoy: Some(-10.0),
+                ..FinancialPeriod::default()
+            },
+            FinancialPeriod {
+                revenue_yoy: Some(-15.0),
+                ..FinancialPeriod::default()
+            },
+        ]);
+        data.valuation_history = Some(valuation_history(99.0, 99.0));
+        let flow = MoneyFlowSummary {
+            days: [-10.0, -10.0, -10.0, -12.0, 2.0]
+                .into_iter()
+                .enumerate()
+                .map(|(index, main_net_yi)| MoneyFlowDay {
+                    date: format!("2026-07-{}", 14 + index),
+                    main_net: main_net_yi * 1e8,
+                    xl_net: 0.0,
+                    big_net: 0.0,
+                    main_pct: 0.0,
+                    pct_chg: 0.0,
+                })
+                .collect(),
+        };
+
+        let outcome = evaluate("强烈建议买入", Some(&flow), &data);
+
+        assert_eq!(outcome.downgraded_advice.as_deref(), Some("观望"));
+        assert_eq!(outcome.position_cap_pct, Some(20));
+        assert_eq!(outcome.flags.len(), 4);
+        let rendered = render_section(&outcome, "强烈建议买入").expect("veto section");
+        assert!(rendered.contains("『强烈建议买入』 → 『观望』"));
+        assert!(rendered.contains("**仓位上限**：≤ 20%"));
+        assert_eq!(rendered.matches("\n- ").count(), 4);
+    }
+}

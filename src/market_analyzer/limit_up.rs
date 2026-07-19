@@ -1,7 +1,7 @@
 //! limit_up（从 market_analyzer.rs 拆分）
 
 use anyhow::Result;
-use log::{info, warn};
+use log::info;
 use serde_json::Value;
 use std::time::Duration;
 
@@ -39,29 +39,15 @@ impl MarketAnalyzer {
                 .timeout(Duration::from_secs(15))
                 .send();
 
-            let response = match response {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!("[大盘] 新浪API第{}页请求失败: {}", page, e);
-                    break;
-                }
-            };
+            let response =
+                response.map_err(|e| anyhow::anyhow!("新浪 API 第{page}页请求失败: {e}"))?;
 
-            let text = match response.text() {
-                Ok(t) => t,
-                Err(e) => {
-                    warn!("[大盘] 新浪API第{}页读取失败: {}", page, e);
-                    break;
-                }
-            };
+            let text = response
+                .text()
+                .map_err(|e| anyhow::anyhow!("新浪 API 第{page}页读取失败: {e}"))?;
 
-            let json: Value = match serde_json::from_str(&text) {
-                Ok(j) => j,
-                Err(e) => {
-                    warn!("[大盘] 新浪API第{}页解析失败: {}", page, e);
-                    break;
-                }
-            };
+            let json: Value = serde_json::from_str(&text)
+                .map_err(|e| anyhow::anyhow!("新浪 API 第{page}页 JSON 解析失败: {e}"))?;
 
             let items = match json.as_array() {
                 Some(arr) if !arr.is_empty() => arr,
@@ -70,13 +56,31 @@ impl MarketAnalyzer {
 
             let mut min_pct = f64::MAX;
 
-            for item in items {
+            for (row_index, item) in items.iter().enumerate() {
                 let change_pct = item
                     .get("changepercent")
                     .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0);
-                let stock_name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let raw_code = item.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
+                    .filter(|value| value.is_finite() && value.abs() <= 20.0)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "新浪涨停榜第{page}页第{}行 changepercent 缺失/超过±20%",
+                            row_index + 1
+                        )
+                    })?;
+                let stock_name = item
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("新浪涨停榜第{page}页第{}行缺少 name", row_index + 1)
+                    })?;
+                let raw_code = item
+                    .get("symbol")
+                    .and_then(|v| v.as_str())
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("新浪涨停榜第{page}页第{}行缺少 symbol", row_index + 1)
+                    })?;
                 let code = raw_code
                     .trim_start_matches("sh")
                     .trim_start_matches("sz")
@@ -85,7 +89,8 @@ impl MarketAnalyzer {
                     .get("trade")
                     .and_then(|v| v.as_str())
                     .and_then(|s| s.parse::<f64>().ok())
-                    .unwrap_or(0.0);
+                    .filter(|value| value.is_finite() && *value > 0.0)
+                    .ok_or_else(|| anyhow::anyhow!("新浪涨停榜 {code} trade 缺失/非法"))?;
 
                 if change_pct < min_pct {
                     min_pct = change_pct;
@@ -107,8 +112,8 @@ impl MarketAnalyzer {
                         name: stock_name.to_string(),
                         change_pct,
                         price,
-                        volume_ratio: 0.0, // 新浪API无此字段
-                        main_net_yi: 0.0,
+                        volume_ratio: None, // 新浪API无此字段
+                        main_net_yi: None,
                     });
                 }
             }
@@ -196,13 +201,38 @@ impl MarketAnalyzer {
             };
 
             let mut min_pct = f64::MAX;
-            for item in diff {
-                let code = item.get("f12").and_then(|v| v.as_str()).unwrap_or("");
-                let name = item.get("f14").and_then(|v| v.as_str()).unwrap_or("");
-                let change_pct = item.get("f3").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let price = item.get("f2").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let volume_ratio = item.get("f10").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let main_net_yi = item.get("f62").and_then(|v| v.as_f64()).unwrap_or(0.0) / 1e8;
+            for (row_index, item) in diff.iter().enumerate() {
+                let code = item
+                    .get("f12")
+                    .and_then(|v| v.as_str())
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("东财涨停榜第{page}页第{}行缺少 code", row_index + 1)
+                    })?;
+                let name = item
+                    .get("f14")
+                    .and_then(|v| v.as_str())
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("东财涨停榜 {code} 缺少 name"))?;
+                let change_pct = item
+                    .get("f3")
+                    .and_then(|v| v.as_f64())
+                    .filter(|value| value.is_finite() && value.abs() <= 20.0)
+                    .ok_or_else(|| anyhow::anyhow!("东财涨停榜 {code} change_pct 缺失/超过±20%"))?;
+                let price = item
+                    .get("f2")
+                    .and_then(|v| v.as_f64())
+                    .filter(|value| value.is_finite() && *value > 0.0)
+                    .ok_or_else(|| anyhow::anyhow!("东财涨停榜 {code} price 缺失/非法"))?;
+                let volume_ratio = item
+                    .get("f10")
+                    .and_then(|v| v.as_f64())
+                    .filter(|value| value.is_finite() && *value >= 0.0);
+                let main_net_yi = item
+                    .get("f62")
+                    .and_then(|v| v.as_f64())
+                    .filter(|value| value.is_finite())
+                    .map(|value| value / 1e8);
 
                 if change_pct < min_pct {
                     min_pct = change_pct;
@@ -267,5 +297,97 @@ impl MarketAnalyzer {
         } else {
             10.0
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn http_proxy_once(body: &'static str) -> (String, std::thread::JoinHandle<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 8192];
+            let n = stream.read(&mut request).unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            String::from_utf8_lossy(&request[..n]).into_owned()
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[test]
+    #[serial_test::serial(http_proxy_env)]
+    fn sina_limit_up_transport_filters_registered_exclusions_and_rejects_bad_rows() {
+        let keys = [
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+        ];
+        let previous: Vec<_> = keys
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect();
+        for key in keys {
+            std::env::remove_var(key);
+        }
+
+        let body = r#"[
+            {"symbol":"sh600000","name":"测试主板","changepercent":9.9,"trade":"10.50"},
+            {"symbol":"sh600001","name":"*ST测试","changepercent":5.0,"trade":"3.00"},
+            {"symbol":"bj920001","name":"北交所测试","changepercent":19.0,"trade":"20.00"},
+            {"symbol":"sz000002","name":"未涨停测试","changepercent":4.0,"trade":"8.00"}
+        ]"#;
+        let (proxy, request) = http_proxy_once(body);
+        std::env::set_var("HTTP_PROXY", &proxy);
+        std::env::set_var("http_proxy", &proxy);
+        let analyzer = MarketAnalyzer::new(None).unwrap();
+        let stocks = analyzer.get_limit_up_from_sina().unwrap();
+        assert_eq!(stocks.len(), 1);
+        assert_eq!(stocks[0].code, "600000");
+        assert!(request
+            .join()
+            .unwrap()
+            .contains("vip.stock.finance.sina.com.cn"));
+
+        let bad = r#"[{"symbol":"sh600000","changepercent":9.9,"trade":"10.50"}]"#;
+        let (proxy, request) = http_proxy_once(bad);
+        std::env::set_var("HTTP_PROXY", &proxy);
+        std::env::set_var("http_proxy", &proxy);
+        let analyzer = MarketAnalyzer::new(None).unwrap();
+        assert!(analyzer
+            .get_limit_up_from_sina()
+            .unwrap_err()
+            .to_string()
+            .contains("缺少 name"));
+        request.join().unwrap();
+
+        for (key, value) in previous {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    #[test]
+    fn limit_percent_covers_st_growth_star_bse_and_main_board() {
+        assert_eq!(MarketAnalyzer::get_limit_pct("600000", "*ST测试"), 5.0);
+        assert_eq!(MarketAnalyzer::get_limit_pct("300001", "创业板测试"), 20.0);
+        assert_eq!(MarketAnalyzer::get_limit_pct("688001", "科创板测试"), 20.0);
+        assert_eq!(MarketAnalyzer::get_limit_pct("830001", "北交所测试"), 30.0);
+        assert_eq!(MarketAnalyzer::get_limit_pct("600000", "主板测试"), 10.0);
     }
 }

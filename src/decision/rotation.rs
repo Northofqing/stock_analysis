@@ -232,4 +232,77 @@ mod tests {
             TrendStatus::HealthyPullback | TrendStatus::Uncertain
         ));
     }
+
+    fn series(
+        old_close: f64,
+        recent_close: f64,
+        old_vol: f64,
+        recent_vol: f64,
+        pct: f64,
+    ) -> Vec<KlineData> {
+        let mut data: Vec<_> = (0..15)
+            .map(|_| {
+                let mut value = k(old_close, old_vol);
+                value.pct_chg = pct;
+                value
+            })
+            .collect();
+        data.extend((0..5).map(|_| {
+            let mut value = k(recent_close, recent_vol);
+            value.pct_chg = pct;
+            value
+        }));
+        data
+    }
+
+    #[test]
+    fn status_labels_and_probability_extremes_are_deterministic() {
+        assert_eq!(TrendStatus::HealthyPullback.label(), "健康回调·可持有");
+        assert_eq!(TrendStatus::TrendEnding.label(), "趋势结束·建议减仓");
+        assert_eq!(TrendStatus::Uncertain.label(), "无法判断·观望");
+        assert_eq!(TrendStatus::HealthyPullback.emoji(), "✅");
+        assert_eq!(TrendStatus::TrendEnding.emoji(), "🔴");
+        assert_eq!(TrendStatus::Uncertain.emoji(), "❓");
+
+        let healthy = judge_trend(&series(100.0, 110.0, 2.0, 0.5, 1.0));
+        assert_eq!(healthy.status, TrendStatus::HealthyPullback);
+        assert!(healthy.reasons.contains(&"缩量".to_string()));
+        let ending = judge_trend(&series(100.0, 80.0, 1.0, 2.0, -1.0));
+        assert_eq!(ending.status, TrendStatus::TrendEnding);
+        assert!(ending.reasons.contains(&"放量".to_string()));
+    }
+
+    #[test]
+    fn holdings_skip_missing_history_and_renderer_switches_warning_banner() {
+        let holdings = vec![
+            crate::portfolio::Position {
+                code: "TEST_CODE_000001".to_string(),
+                ..Default::default()
+            },
+            crate::portfolio::Position {
+                code: "TEST_CODE_000002".to_string(),
+                ..Default::default()
+            },
+        ];
+        let signals = judge_holdings(
+            &holdings,
+            &std::collections::HashMap::from([(
+                "TEST_CODE_000001".to_string(),
+                series(100.0, 80.0, 1.0, 2.0, -1.0),
+            )]),
+        );
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].code, "TEST_CODE_000001");
+        let rendered = format_rotation_signals(&signals);
+        assert!(rendered.starts_with("🔴 轮动预警"));
+        assert!(rendered.contains("趋势结束"));
+        assert!(format_rotation_signals(&[]).is_empty());
+
+        let neutral = format_rotation_signals(&[RotationSignal {
+            code: "TEST_CODE_000003".to_string(),
+            status: TrendStatus::Uncertain,
+            reasons: vec!["证据不足".to_string()],
+        }]);
+        assert!(neutral.starts_with("📊 趋势评估"));
+    }
 }

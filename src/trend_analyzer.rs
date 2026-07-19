@@ -712,11 +712,9 @@ impl StockTrendAnalyzer {
                     score = 55;
                     risks.push("❌ 触发顶背离共振，强制降级至观望档位".to_string());
                 }
-            } else if ind.death_cross_resonance {
-                if score >= 65 {
-                    score = 59;
-                    risks.push("❌ 触发死叉共振，强制降级至观望档位".to_string());
-                }
+            } else if ind.death_cross_resonance && score >= 65 {
+                score = 59;
+                risks.push("❌ 触发死叉共振，强制降级至观望档位".to_string());
             }
         }
 
@@ -848,9 +846,9 @@ mod tests {
     fn test_trend_analyzer() {
         let data = create_test_data(60);
         let analyzer = StockTrendAnalyzer::new();
-        let result = analyzer.analyze(&data, "000001");
+        let result = analyzer.analyze(&data, "TEST_CODE_000001");
 
-        assert_eq!(result.code, "000001");
+        assert_eq!(result.code, "TEST_CODE_000001");
         assert!(result.current_price > 0.0);
         assert!(result.ma5 > 0.0);
         assert!(result.signal_score >= 0 && result.signal_score <= 100);
@@ -877,5 +875,173 @@ mod tests {
             result.trend_status,
             TrendStatus::Bull | TrendStatus::StrongBull
         ));
+    }
+
+    fn stock(close: f64, volume: f64) -> StockData {
+        StockData {
+            date: "2026-07-18".to_string(),
+            open: close,
+            high: close + 1.0,
+            low: close - 1.0,
+            close,
+            volume,
+            ma5: Some(close),
+            ma10: Some(close),
+            ma20: Some(close),
+            ma60: Some(close),
+        }
+    }
+
+    #[test]
+    fn displays_and_direct_trend_states_cover_every_registered_variant() {
+        let trend_labels: Vec<String> = [
+            TrendStatus::StrongBull,
+            TrendStatus::Bull,
+            TrendStatus::WeakBull,
+            TrendStatus::Consolidation,
+            TrendStatus::WeakBear,
+            TrendStatus::Bear,
+            TrendStatus::StrongBear,
+        ]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect();
+        assert_eq!(trend_labels.len(), 7);
+        let volume_labels: Vec<String> = [
+            VolumeStatus::HeavyVolumeUp,
+            VolumeStatus::HeavyVolumeDown,
+            VolumeStatus::ShrinkVolumeUp,
+            VolumeStatus::ShrinkVolumeDown,
+            VolumeStatus::Normal,
+        ]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect();
+        assert_eq!(volume_labels.len(), 5);
+        let signal_labels: Vec<String> = [
+            BuySignal::StrongBuy,
+            BuySignal::Buy,
+            BuySignal::Hold,
+            BuySignal::Wait,
+            BuySignal::Sell,
+            BuySignal::StrongSell,
+        ]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect();
+        assert_eq!(signal_labels.len(), 6);
+
+        let analyzer = StockTrendAnalyzer::new();
+        let mut history = vec![stock(10.0, 100.0); 5];
+        history[0].ma5 = Some(10.0);
+        history[0].ma20 = Some(10.0);
+        for (ma5, ma10, ma20, expected) in [
+            (13.0, 11.0, 10.0, TrendStatus::StrongBull),
+            (10.3, 10.2, 10.1, TrendStatus::Bull),
+            (10.2, 10.1, 10.3, TrendStatus::WeakBull),
+            (10.0, 10.0, 10.0, TrendStatus::Consolidation),
+            (10.0, 10.2, 10.1, TrendStatus::WeakBear),
+            (9.9, 10.0, 10.1, TrendStatus::Bear),
+            (8.0, 9.0, 10.0, TrendStatus::StrongBear),
+        ] {
+            let mut result = TrendAnalysisResult {
+                ma5,
+                ma10,
+                ma20,
+                ..TrendAnalysisResult::new("TEST_CODE_state".to_string())
+            };
+            analyzer.analyze_trend(&history, &mut result);
+            assert_eq!(result.trend_status, expected);
+        }
+    }
+
+    #[test]
+    fn volume_bias_and_signal_matrix_cover_all_score_bands() {
+        let analyzer = StockTrendAnalyzer::new();
+        for (latest_close, latest_volume, expected) in [
+            (11.0, 200.0, VolumeStatus::HeavyVolumeUp),
+            (9.0, 200.0, VolumeStatus::HeavyVolumeDown),
+            (11.0, 50.0, VolumeStatus::ShrinkVolumeUp),
+            (9.0, 50.0, VolumeStatus::ShrinkVolumeDown),
+            (11.0, 100.0, VolumeStatus::Normal),
+        ] {
+            let mut history = vec![stock(10.0, 100.0); 6];
+            history[5] = stock(latest_close, latest_volume);
+            let mut result = TrendAnalysisResult::new("TEST_CODE_volume".to_string());
+            analyzer.analyze_volume(&history, &mut result);
+            assert_eq!(result.volume_status, expected);
+        }
+
+        for (trend, bias, volume, sharpe, support5, support10) in [
+            (
+                TrendStatus::StrongBull,
+                -1.0,
+                VolumeStatus::ShrinkVolumeDown,
+                Some(2.1),
+                true,
+                true,
+            ),
+            (
+                TrendStatus::Bull,
+                -4.0,
+                VolumeStatus::HeavyVolumeUp,
+                Some(1.2),
+                false,
+                false,
+            ),
+            (
+                TrendStatus::WeakBull,
+                -6.0,
+                VolumeStatus::Normal,
+                Some(0.7),
+                false,
+                false,
+            ),
+            (
+                TrendStatus::Consolidation,
+                1.0,
+                VolumeStatus::ShrinkVolumeUp,
+                Some(0.1),
+                false,
+                false,
+            ),
+            (
+                TrendStatus::WeakBear,
+                3.0,
+                VolumeStatus::HeavyVolumeDown,
+                Some(-0.5),
+                false,
+                false,
+            ),
+            (
+                TrendStatus::Bear,
+                7.0,
+                VolumeStatus::Normal,
+                None,
+                false,
+                false,
+            ),
+            (
+                TrendStatus::StrongBear,
+                7.0,
+                VolumeStatus::HeavyVolumeDown,
+                None,
+                false,
+                false,
+            ),
+        ] {
+            let mut result = TrendAnalysisResult {
+                trend_status: trend,
+                bias_ma5: bias,
+                volume_status: volume,
+                sharpe_ratio: sharpe,
+                support_ma5: support5,
+                support_ma10: support10,
+                ..TrendAnalysisResult::new("TEST_CODE_signal".to_string())
+            };
+            analyzer.generate_signal(&mut result);
+            assert!((0..=100).contains(&result.signal_score));
+            assert!(!result.signal_reasons.is_empty() || !result.risk_factors.is_empty());
+        }
     }
 }

@@ -33,10 +33,10 @@ fn collect_model_configs() -> Vec<ActiveModelConfig> {
             model,
         });
     }
-    if let Some(key) = env::var("OPENAI_API_KEY").ok().filter(|k| !k.is_empty()) {
-        let base =
-            env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-        let model = env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
+    if let Some(key) = env::var("DEEPSEEK_API_KEY").ok().filter(|k| !k.is_empty()) {
+        let base = env::var("DEEPSEEK_BASE_URL")
+            .unwrap_or_else(|_| "https://api.deepseek.com/v1".to_string());
+        let model = env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-chat".to_string());
         configs.push(ActiveModelConfig {
             api_key: key,
             api_base: base,
@@ -56,7 +56,7 @@ fn collect_model_configs() -> Vec<ActiveModelConfig> {
     }
 
     if configs.is_empty() {
-        panic!("未在 .env 中找到任何有效的 DOUBAO_API_KEY, OPENAI_API_KEY 或 GEMINI_API_KEY");
+        panic!("未在 .env 中找到任何有效的 DOUBAO_API_KEY, DEEPSEEK_API_KEY 或 GEMINI_API_KEY");
     }
     println!(
         ">>> 加载了 {} 个模型配置，优先级顺序：{}",

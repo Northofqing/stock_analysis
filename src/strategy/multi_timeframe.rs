@@ -165,7 +165,7 @@ pub fn assess_entry(h1: &[MinuteBar], m15: &[MinuteBar]) -> EntryAssessment {
             .collect();
         let last_rsi = recent.first().copied().unwrap_or(f64::NAN);
         let had_oversold = recent.iter().any(|v| *v < 30.0);
-        let in_rebound_zone = last_rsi >= 30.0 && last_rsi <= 50.0;
+        let in_rebound_zone = (30.0..=50.0).contains(&last_rsi);
         if had_oversold && in_rebound_zone {
             signals.push(format!(
                 "✅ 15min RSI6 近期触及超卖（<30）后回升至 {:.1}",

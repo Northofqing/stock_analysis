@@ -306,3 +306,167 @@ pub(super) fn build_walk_forward_section(
     s.push_str("_注：若样本外收益与样本内寻优结果落差大，或为正折数占比偏低，说明参数稳定性不足，不宜实盘。_\n\n");
     s
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::strategy::core::{
+        RegimeKind, RegimeReport, RegimeStats, WalkForwardFold, WalkForwardReport,
+    };
+
+    fn summary() -> BacktestSummary {
+        BacktestSummary {
+            initial_capital: 100_000.0,
+            final_value: 110_000.0,
+            total_return: 0.10,
+            annual_return: 0.20,
+            max_drawdown: 0.05,
+            sharpe_ratio: 1.234,
+            sortino_ratio: 1.5,
+            calmar_ratio: 4.0,
+            average_exposure: 0.6,
+            total_trades: 12,
+            win_rate: 0.75,
+            chart_path: None,
+            benchmark_annual_return: None,
+            alpha: None,
+            benchmark_name: None,
+            benchmark_total_return: None,
+            excess_return: None,
+            beta: None,
+            information_ratio: None,
+            max_dd_duration_days: 8,
+        }
+    }
+
+    #[test]
+    fn single_report_renders_limit_up_and_contrarian_evidence() {
+        let result: AnalysisResult = serde_json::from_value(serde_json::json!({
+            "code": "TEST_CODE_000001",
+            "name": "测试股",
+            "sentiment_score": 80,
+            "operation_advice": "建议买入",
+            "trend_prediction": "上行",
+            "analysis_summary": "独立分析正文",
+            "is_limit_up": true,
+            "contrarian_signal": true,
+            "contrarian_reason": "超跌企稳"
+        }))
+        .expect("valid public AnalysisResult fixture");
+
+        let report = generate_single_report(&result);
+
+        assert!(report.contains("测试股(TEST_CODE_000001) 🔥涨停 🔄反向信号"));
+        assert!(report.contains("操作建议: 建议买入"));
+        assert!(report.contains("评分: 80\n超跌企稳"));
+        assert!(report.ends_with("独立分析正文"));
+    }
+
+    #[test]
+    fn backtest_report_marks_missing_benchmark_loss_and_drawdown_bands() {
+        let mut low = summary();
+        low.total_return = -0.10;
+        low.max_drawdown = 0.05;
+        let low_report = build_backtest_report(&low);
+        assert!(low_report.contains("| 总收益率 | -10.00% | 亏损 |"));
+        assert!(low_report.contains("| 最大回撤 | 5.00% | 风险较低 |"));
+        assert!(low_report.contains("| 基准对标 | 基准数据缺失 |"));
+        assert!(!low_report.contains("**回测图表**"));
+
+        let mut medium = summary();
+        medium.max_drawdown = 0.10;
+        assert!(build_backtest_report(&medium).contains("| 最大回撤 | 10.00% | 风险适中 |"));
+
+        let mut high = summary();
+        high.max_drawdown = 0.20;
+        assert!(build_backtest_report(&high).contains("| 最大回撤 | 20.00% | 风险较高 |"));
+    }
+
+    #[test]
+    fn backtest_report_renders_each_real_benchmark_metric_and_chart() {
+        let mut value = summary();
+        value.benchmark_name = Some("沪深300".into());
+        value.benchmark_total_return = Some(0.04);
+        value.benchmark_annual_return = Some(0.08);
+        value.excess_return = Some(0.06);
+        value.alpha = Some(0.03);
+        value.beta = Some(0.9);
+        value.information_ratio = Some(1.2);
+        value.chart_path = Some("reports/test_chart.png".into());
+
+        let report = build_backtest_report(&value);
+
+        assert!(report.contains("| 基准总收益 | 4.00% | 沪深300同期 |"));
+        assert!(report.contains("| 基准年化收益 | 8.00% | 沪深300年化 |"));
+        assert!(report.contains("| 超额收益 | 6.00% |"));
+        assert!(report.contains("| Alpha(年化) | 3.00% |"));
+        assert!(report.contains("| Beta | 0.900 |"));
+        assert!(report.contains("| 信息比率 | 1.200 |"));
+        assert!(report.contains("**回测图表**: reports/test_chart.png"));
+    }
+
+    #[test]
+    fn regime_oos_and_walk_forward_sections_render_owned_results() {
+        let regime = RegimeReport {
+            window: 20,
+            bull_threshold: 0.05,
+            bear_threshold: -0.05,
+            stats: vec![
+                RegimeStats {
+                    kind: RegimeKind::Bull,
+                    days: 10,
+                    strat_return: 0.12,
+                    bench_return: 0.08,
+                    up_day_rate: 0.7,
+                },
+                RegimeStats {
+                    kind: RegimeKind::Sideways,
+                    days: 8,
+                    strat_return: 0.02,
+                    bench_return: 0.01,
+                    up_day_rate: 0.5,
+                },
+                RegimeStats {
+                    kind: RegimeKind::Bear,
+                    days: 6,
+                    strat_return: -0.03,
+                    bench_return: -0.08,
+                    up_day_rate: 0.3,
+                },
+            ],
+        };
+        let regime_report = build_regime_section(&regime);
+        assert!(regime_report.contains("牛市/上行 | 10 | 12.00% | 8.00% | 4.00% | 70.0%"));
+        assert!(regime_report.contains("熊市/下行 | 6 | -3.00% | -8.00% | 5.00% | 30.0%"));
+
+        let mut out_sample = summary();
+        out_sample.total_return = 0.05;
+        out_sample.annual_return = 0.10;
+        out_sample.max_drawdown = 0.08;
+        out_sample.sharpe_ratio = 0.8;
+        out_sample.win_rate = 0.6;
+        out_sample.total_trades = 8;
+        let oos = build_oos_section("2026-01-01", &summary(), &out_sample);
+        assert!(oos.contains("| 总收益率 | 10.00% | 5.00% | -5.00pp |"));
+        assert!(oos.contains("| 夏普比率 | 1.234 | 0.800 | -0.434 |"));
+        assert!(oos.contains("| 交易次数 | 12 | 8 | -4 |"));
+
+        let walk = WalkForwardReport {
+            folds: vec![WalkForwardFold {
+                fold: 1,
+                train_label: "2025H1".into(),
+                test_label: "2025Q3".into(),
+                chosen_param: "top3".into(),
+                test_return: 0.03,
+                test_sharpe: 1.1,
+                test_trades: 4,
+            }],
+            avg_test_return: 0.03,
+            compounded_return: 0.03,
+            positive_fold_rate: 1.0,
+        };
+        let walk_report = build_walk_forward_section(&walk);
+        assert!(walk_report.contains("| 1 | 2025H1 | 2025Q3 | top3 | 3.00% | 1.100 | 4 |"));
+        assert!(walk_report.contains("**样本外为正折数占比**: 100.0%"));
+    }
+}

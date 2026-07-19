@@ -1,138 +1,122 @@
 #!/usr/bin/env bash
-# §2.10 业务规则文档化 (v10 P0.0 动态版 · 2026-07-01)
-#
-# 升级内容:
-#   - REFS 数组硬编码 → 从 docs/业务规则清单-registry.md 动态解析 BR + 代码位置
-#   - 支持任意 BR-NNN (不再卡 BR-001/002/003 硬编码)
-#   - 标"待实现" 的 BR (PENDING) 走 WARN 提醒而非 FAIL
-#   - 5 类 (去重/互斥/过滤/排序/限额) 必全有 (硬约束)
-#
-# 设计不变:
-#   - 新增文件必须引用 BR (FAIL)
-#   - 已存在文件 BR 引用消失仅 WARN (历史遗留, 不阻断)
-#   - BASE_REF fallback 与 I-7 修复保持
-#
-# 实现细节:
-#   - FAIL 通过输出 ✗ 行统计 (避免 while-read 子 shell 变量丢失)
-#   - 用 mktemp 临时文件收集, 最后汇总
+# AGENTS §2.10 — canonical business-rule registry integrity gate.
+
 set -euo pipefail
-FAIL_LINES_FILE="$(mktemp -t cbr_fail.XXXXXX)"
-WARN_LINES_FILE="$(mktemp -t cbr_warn.XXXXXX)"
-trap 'rm -f "$FAIL_LINES_FILE" "$WARN_LINES_FILE"' EXIT
-# RULES_FILE env override (fixture 测试用), 默认 docs/业务规则清单-registry.md
-RULES_FILE="${RULES_FILE:-docs/业务规则清单-registry.md}"
 
-fail() { echo "✗ $*" >> "$FAIL_LINES_FILE"; }
-warn() { echo "⚠ $*" >> "$WARN_LINES_FILE"; }
+CANONICAL_FILE="${RULES_FILE:-docs/business_rules.md}"
+LEGACY_FILE="${LEGACY_RULES_FILE:-docs/业务规则清单-registry.md}"
+BASE_REF="${BASE_REF:-HEAD}"
+WORK="$(mktemp -d -t business_rules.XXXXXX)"
+trap 'rm -rf "$WORK"' EXIT
+FAIL="$WORK/fail"
+WARN="$WORK/warn"
+RECORDS="$WORK/records.tsv"
+: >"$FAIL"
+: >"$WARN"
+: >"$RECORDS"
 
-# 规则 1: 文件存在
-if [ ! -f "$RULES_FILE" ]; then
-  echo "✗ §2.10.1 缺业务规则文件: $RULES_FILE" >&2
-  exit 1
+fail() { printf '✗ %s\n' "$*" >>"$FAIL"; }
+warn() { printf '⚠ %s\n' "$*" >>"$WARN"; }
+
+for file in "$CANONICAL_FILE" "$LEGACY_FILE"; do
+    if [ ! -f "$file" ]; then
+        fail "§2.10 registry missing: $file"
+    fi
+done
+if [ -s "$FAIL" ]; then
+    cat "$FAIL" >&2
+    exit 1
 fi
 
-# 规则 2: 5 类必须全有
-for cat in "去重" "互斥" "过滤" "排序" "限额"; do
-  if ! grep -q "$cat" "$RULES_FILE"; then
-    fail "§2.10.2 缺类别: $cat (在 $RULES_FILE 未找到)"
-  fi
+for category in 'dedup|去重' 'mutex|互斥' 'filter|过滤' 'sort|排序' 'limit|限额'; do
+    if ! grep -Eiq "$category" "$CANONICAL_FILE"; then
+        fail "§2.10 canonical registry missing category: $category"
+    fi
 done
 
-# 规则 3: 从 业务规则清单-registry.md 动态提取 BR + 代码位置
-# 表格行格式: | BR-NNN | 类别 | 规则 | `file:line` (可能有多个 + 分隔) | 测试位置 | 末审 |
-# 输出 TSV: <br_id>\tPENDING\t<code_loc>   OR   <br_id>\t<file>
-EXTRACTED=$(awk -F'|' '
+# Canonical columns: id | status | intent | code.
+awk -F'|' -v source="$CANONICAL_FILE" '
   /^\| BR-[0-9]+ / {
-    br_id = $2; gsub(/ /, "", br_id);
-    code_loc = $5; gsub(/^ +| +$/, "", code_loc);
-    if (code_loc == "") next;
-    # 标"待实现" 的行走 PENDING 路径 (代码未到位, BR 已登记, 提醒而非 FAIL)
-    if (code_loc ~ /待实现/) {
-      print br_id "\tPENDING\t" code_loc;
-      next;
-    }
-    # 提取所有 backtick 内的 file paths
-    n = split(code_loc, parts, "`");
-    for (i = 2; i < n; i += 2) {
-      path = parts[i];
-      # 提取 file path: 去掉 ::function / :line / 注释 / 周围括号
-      sub(/::.*/, "", path);
-      sub(/:[0-9].*/, "", path);
-      sub(/ \(.*\)/, "", path);
-      sub(/^ +| +$/, "", path);
-      # 跳过空 / 纯符号 (BR-012 "北向资金" 这种)
-      if (path == "" || path !~ /\//) continue;
-      print br_id "\t" path;
-    }
+    id=$2; status=$3; intent=$4; code=$5;
+    gsub(/^ +| +$/, "", id); gsub(/^ +| +$/, "", status);
+    gsub(/^ +| +$/, "", intent); gsub(/^ +| +$/, "", code);
+    print id "\t" status "\t" intent "\t" code "\t" source;
   }
-' "$RULES_FILE")
+' "$CANONICAL_FILE" >>"$RECORDS"
 
-if [ -z "$EXTRACTED" ]; then
-  fail "§2.10.3 业务规则表无任何 BR 行可解析 (检查 markdown 格式)"
+# Historical columns: id | category | rule | code | tests | review date.
+awk -F'|' -v source="$LEGACY_FILE" '
+  /^\| BR-[0-9]+ / {
+    id=$2; intent=$4; code=(id ~ /BR-012/ ? $8 : $5);
+    gsub(/^ +| +$/, "", id); gsub(/^ +| +$/, "", intent);
+    status=($0 ~ /待实现/ ? "legacy-pending" : "legacy-active");
+    print id "\t" status "\t" intent "\t" code "\t" source;
+  }
+' "$LEGACY_FILE" >>"$RECORDS"
+
+if [ ! -s "$RECORDS" ]; then
+    fail "§2.10 no BR rows parsed"
 fi
 
-# 决定 base ref (保留 I-7 修复): 本仓库远端常用 stock_analysis/*, 不一定有 origin/*.
-BASE_REF="${BASE_REF:-}"
-if [ -z "$BASE_REF" ]; then
-  for candidate in origin/master origin/main stock_analysis/master stock_analysis/main master main HEAD; do
-    if git rev-parse --verify "$candidate" >/dev/null 2>&1; then
-      BASE_REF="$candidate"
-      break
+cut -f1 "$RECORDS" | sort | uniq -d >"$WORK/duplicate_ids"
+while IFS= read -r id; do
+    [ -z "$id" ] && continue
+    meanings="$(awk -F'\t' -v id="$id" '$1==id {print $3 " [" $5 "]"}' "$RECORDS" | paste -sd ' || ' -)"
+    fail "§2.10 duplicate business-rule ID $id: $meanings"
+done <"$WORK/duplicate_ids"
+
+extract_paths() {
+    awk -F'`' '{ for (i=2; i<=NF; i+=2) print $i }' | while IFS= read -r path; do
+        path="${path%%::*}"
+        path="${path%%:*}"
+        path="${path%% *}"
+        case "$path" in
+            */*) printf '%s\n' "$path" ;;
+        esac
+    done
+}
+
+while IFS=$'\t' read -r id status _intent code source; do
+    if [[ "$status" == *spec-only* || "$status" == legacy-pending ]]; then
+        if [ "$status" = legacy-pending ]; then
+            warn "§2.10 $id remains explicitly pending in $source"
+        fi
+        while IFS= read -r path; do
+            case "$path" in
+                docs/*) [ -e "$path" ] || fail "§2.10 $id spec path missing: $path" ;;
+            esac
+        done < <(printf '%s\n' "$code" | extract_paths)
+        continue
     fi
-  done
-fi
-if ! git rev-parse --verify "$BASE_REF" >/dev/null 2>&1; then
-  warn "§2.10 BASE_REF '$BASE_REF' 不存在, 走 root commit fallback, 可能误判新增文件 (修复 I-7)"
-  BASE_REF="$(git rev-list --max-parents=0 HEAD | tail -n1)"
-fi
 
-# 规则 4: 验证每个 (BR, file) 引用 — 用 process substitution 避免子 shell 变量丢失
-while IFS=$'\t' read -r br_id file; do
-  [ -z "$br_id" ] && continue
-  [ -z "$file" ] && continue
-  if [ ! -f "$file" ]; then
-    fail "§2.10.3 $file 引用 $br_id 但文件不存在"
-    continue
-  fi
-  if ! grep -q "$br_id" "$file" 2>/dev/null; then
-    # 判断 file 是不是新增: 在 BASE_REF 之前不存在
-    if ! git cat-file -e "$BASE_REF:$file" 2>/dev/null; then
-      NEW_FILE=1
-    else
-      NEW_FILE=0
+    path_count=0
+    while IFS= read -r path; do
+        [ -z "$path" ] && continue
+        path_count=$((path_count + 1))
+        if [ ! -e "$path" ]; then
+            fail "§2.10 $id active path missing: $path ($source)"
+            continue
+        fi
+        if [ "$source" = "$CANONICAL_FILE" ] && ! grep -q "$id" "$path" 2>/dev/null; then
+            if ! git cat-file -e "$BASE_REF:$path" 2>/dev/null; then
+                fail "§2.10 new active path $path does not cite $id"
+            else
+                warn "§2.10 active path $path does not cite $id"
+            fi
+        fi
+    done < <(printf '%s\n' "$code" | extract_paths)
+    if [ "$path_count" -eq 0 ]; then
+        fail "§2.10 $id active rule has no parseable code path ($source)"
     fi
-    if [ "$NEW_FILE" -eq 1 ]; then
-      fail "§2.10.3 $file 是新增文件但未引用 $br_id (AGENTS §2.10 强制)"
-    else
-      warn "§2.10.3 $file 未引用 $br_id (已存在文件, 仅 warn)"
-    fi
-  fi
-done < <(echo "$EXTRACTED" | awk -F'\t' '$2 != "PENDING"')
+done <"$RECORDS"
 
-# 规则 5: PENDING BR 提醒
-PENDING_BRS=$(echo "$EXTRACTED" | awk -F'\t' '$2 == "PENDING" { print $1 }' | sort -u)
-PENDING_COUNT=0
-if [ -n "$PENDING_BRS" ]; then
-  warn "§2.10.4 已登记但代码未到位的 BR (PENDING, 实施后应去掉'待实现:' 前缀):"
-  for br in $PENDING_BRS; do
-    warn "  - $br"
-    PENDING_COUNT=$((PENDING_COUNT+1))
-  done
+cat "$FAIL" >&2
+cat "$WARN" >&2
+FAIL_COUNT="$(wc -l <"$FAIL" | tr -d ' ')"
+WARN_COUNT="$(wc -l <"$WARN" | tr -d ' ')"
+RULE_COUNT="$(wc -l <"$RECORDS" | tr -d ' ')"
+if [ "$FAIL_COUNT" -ne 0 ]; then
+    echo "✗ §2.10 business-rule gate failed ($FAIL_COUNT errors, $WARN_COUNT warnings)" >&2
+    exit 1
 fi
-
-# 汇总 + 输出
-FAIL_COUNT=$(wc -l < "$FAIL_LINES_FILE" | tr -d ' ')
-WARN_COUNT=$(wc -l < "$WARN_LINES_FILE" | tr -d ' ')
-
-# 输出所有 fail/warn 行 (实际看到)
-cat "$FAIL_LINES_FILE" >&2
-cat "$WARN_LINES_FILE" >&2
-
-if [ "$FAIL_COUNT" -eq 0 ]; then
-  ACTIVE_COUNT=$(echo "$EXTRACTED" | awk -F'\t' '$2 != "PENDING"' | wc -l | tr -d ' ')
-  echo "✓ §2.10 业务规则检查通过 (active: $ACTIVE_COUNT, pending: $PENDING_COUNT, warn: $WARN_COUNT)"
-  exit 0
-else
-  echo "✗ §2.10 业务规则检查 FAIL ($FAIL_COUNT errors, $WARN_COUNT warns)" >&2
-  exit 1
-fi
+echo "✓ §2.10 business-rule gate passed (rules: $RULE_COUNT, warnings: $WARN_COUNT)"

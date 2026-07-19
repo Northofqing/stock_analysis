@@ -134,6 +134,10 @@ impl NotificationService {
     }
 
     /// 发送单封邮件（第一个收件人为主地址，其余为抄送）
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "SMTP assembly boundary keeps recipients, content, and transport inputs explicit"
+    )]
     pub(super) fn send_single_email(
         &self,
         from: &str,
@@ -279,6 +283,10 @@ impl NotificationService {
     }
 
     /// 发送单封带图片的邮件（第一个收件人为主地址，其余为抄送）
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "SMTP multipart boundary keeps attachment and transport inputs explicit"
+    )]
     pub(super) fn send_single_email_with_image(
         &self,
         from: &str,
@@ -363,5 +371,31 @@ impl NotificationService {
         }
 
         Err(last_err.unwrap().into())
+    }
+}
+
+#[cfg(test)]
+mod gate_d_tests {
+    use super::*;
+    use crate::notification::NotificationConfig;
+
+    #[test]
+    fn escaping_and_missing_configuration_fail_before_smtp_or_filesystem_io() {
+        assert_eq!(
+            html_escape("TEST_CODE <账户&报告>"),
+            "TEST_CODE &lt;账户&amp;报告&gt;"
+        );
+
+        let service = NotificationService::new(NotificationConfig::default());
+        let plain_err = service.send_to_email("TEST_CODE 本地邮件边界").unwrap_err();
+        assert!(plain_err.to_string().contains("EMAIL_SENDER"));
+
+        let image_err = service
+            .send_email_with_image(
+                "TEST_CODE 本地图片邮件边界",
+                Path::new("TEST_CODE_missing.png"),
+            )
+            .unwrap_err();
+        assert!(image_err.to_string().contains("EMAIL_SENDER"));
     }
 }

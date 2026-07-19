@@ -1,3 +1,4 @@
+//! Registered business rules: BR-058, BR-134.
 //! v11-P0-4 commit B: 持仓决策台 — 裁决层
 //!
 //! ## 背景
@@ -196,7 +197,7 @@ mod tests {
 
     fn default_inputs() -> DecisionInputs {
         DecisionInputs {
-            code: "000001".to_string(),
+            code: "TEST_CODE_000001".to_string(),
             name: "test".to_string(),
             current_price: 10.0,
             change_pct: 0.0,
@@ -225,7 +226,7 @@ mod tests {
     fn layer1_hard_stop_reduce_now() {
         let mut inputs = default_inputs();
         inputs.stop_signals.push(StopSignal {
-            code: "000001".to_string(),
+            code: "TEST_CODE_000001".to_string(),
             name: "test".to_string(),
             level: StopLevel::Hard,
             current_price: 10.0,
@@ -242,7 +243,7 @@ mod tests {
     fn layer1_limit_violation_reduce_now() {
         let mut inputs = default_inputs();
         inputs.limit_violations.push(LimitViolation {
-            code: "000001".to_string(),
+            code: "TEST_CODE_000001".to_string(),
             name: "test".to_string(),
             rule: "单票仓位上限".to_string(),
             current: "15.0%".to_string(),
@@ -258,7 +259,7 @@ mod tests {
     fn layer2_tech_stop_reduce() {
         let mut inputs = default_inputs();
         inputs.stop_signals.push(StopSignal {
-            code: "000001".to_string(),
+            code: "TEST_CODE_000001".to_string(),
             name: "test".to_string(),
             level: StopLevel::Technical,
             current_price: 10.0,
@@ -305,7 +306,7 @@ mod tests {
     fn layer1_overrides_layer5() {
         let mut inputs = default_inputs();
         inputs.stop_signals.push(StopSignal {
-            code: "000001".to_string(),
+            code: "TEST_CODE_000001".to_string(),
             name: "test".to_string(),
             level: StopLevel::Hard,
             current_price: 10.0,
@@ -341,7 +342,7 @@ mod tests {
     fn priority_layer1_beats_layer2() {
         let mut inputs = default_inputs();
         inputs.stop_signals.push(StopSignal {
-            code: "000001".to_string(),
+            code: "TEST_CODE_000001".to_string(),
             name: "test".to_string(),
             level: StopLevel::Technical, // 层2
             current_price: 10.0,
@@ -349,7 +350,7 @@ mod tests {
             reason: "技术".to_string(),
         });
         inputs.limit_violations.push(LimitViolation {
-            code: "000001".to_string(),
+            code: "TEST_CODE_000001".to_string(),
             name: "test".to_string(),
             rule: "单票仓位上限".to_string(),
             current: "15%".to_string(),
@@ -502,20 +503,37 @@ fn action_priority_from_advice(advice: &str) -> (Action, Priority) {
 /// - `holdings`: 持仓列表
 /// - `by_code`: code → (name, LLM markdown 终稿 None 表示多 Agent 失败)
 ///
-/// 输出: 每只持仓一个 FinalDecision (失败/缺失 = Hold 兜底)
+/// 输出: 每只持仓一个 FinalDecision。LLM 失败只影响建议文本；持仓行情是
+/// 决策卡的必填事实，缺失或非法时整批失败。
 ///
 /// 替换 main.rs:967 `build_holding_summary` + `extract_advice_and_score` 字符串猜
 /// (commit C 标 deprecated, commit E 留 PUSH_SHADOW 退路)
-/// v62: 加 `quotes` 参数 (TopStock 列表含 price/change_pct), 用真报价填充 current_price
-///   - 旧: p.cost_price 当现价 + change_pct=0.0 硬编码 (用户看到"今日+0.00%")
-///   - 新: 优先用 quotes 拿真价/真涨跌幅, fallback 到 cost_price + 0
+/// v62 + BR-134: `quotes` 必须完整覆盖持仓，并包含正且有限的现价与
+/// `[-20%, 20%]` 内的有限涨跌幅。禁止成本价/0% 回退。
 pub fn decisions_from_llm(
     holdings: &[Position],
     by_code: &HashMap<String, (String, Option<String>)>,
     quotes: &HashMap<String, (f64, f64)>, // code -> (price, change_pct)
-) -> Vec<FinalDecision> {
+) -> Result<Vec<FinalDecision>, String> {
     let mut out = Vec::new();
+    let mut seen_codes = std::collections::HashSet::new();
     for p in holdings {
+        if p.code.trim().is_empty() || p.name.trim().is_empty() {
+            return Err("持仓决策身份缺少代码或名称".to_string());
+        }
+        if !seen_codes.insert(p.code.as_str()) {
+            return Err(format!("持仓决策批次包含重复代码: {}", p.code));
+        }
+        let (current_price, change_pct) = quotes
+            .get(&p.code)
+            .copied()
+            .ok_or_else(|| format!("持仓 {} 缺少完整实时行情", p.code))?;
+        if !current_price.is_finite() || current_price <= 0.0 {
+            return Err(format!("持仓 {} 实时行情价格非法: {current_price}", p.code));
+        }
+        if !change_pct.is_finite() || change_pct.abs() > 20.0 {
+            return Err(format!("持仓 {} 实时行情涨跌幅非法: {change_pct}", p.code));
+        }
         // review #14: 一次 by_code.get() 拿 (name, md) — 原代码 3 次 get + 多次 clone.
         // review #15 简化: 去掉 name_owned 手工 Cow 生命周期扩展 — holdings 永远有 name,
         // 缺失 by_code entry 时回退用 p.name (与原代码 p.name.clone() 行为一致).
@@ -542,17 +560,6 @@ pub fn decisions_from_llm(
             .and_then(|(_, md)| md.as_ref())
             .map(|md| first_meaningful_line(md))
             .unwrap_or_default();
-        // v62: 用真报价填 current_price/change_pct
-        let (current_price, change_pct) = quotes
-            .get(&p.code)
-            .map(|(price, pct)| {
-                if *price > 0.0 {
-                    (*price, *pct)
-                } else {
-                    (p.cost_price, 0.0)
-                }
-            })
-            .unwrap_or((p.cost_price, 0.0));
         // review #15 简化: name 优先用 by_code 提供的 (LLM 视角的最新名字),
         // 没有则用 holdings p.name. 简化掉之前 name_owned 手工 lifetime 扩展.
         let name = entry.map(|(n, _)| n.as_str()).unwrap_or(&p.name);
@@ -564,14 +571,16 @@ pub fn decisions_from_llm(
             action,
             priority,
             reasons,
-        )
-        .with_stop_loss(p.hard_stop);
+        );
+        if let Some(hard_stop) = p.hard_stop {
+            d = d.with_stop_loss(hard_stop);
+        }
         if !ai_summary.is_empty() {
             d = d.with_ai_summary(ai_summary);
         }
         out.push(d);
     }
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -596,7 +605,7 @@ mod tests_llm_parse {
             name: name.to_string(),
             shares: 1000,
             cost_price: 10.0,
-            hard_stop: 9.0,
+            hard_stop: Some(9.0),
             added_at: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
             status: crate::portfolio::PositionStatus::Holding,
             sector: "测试".to_string(),
@@ -604,17 +613,21 @@ mod tests_llm_parse {
         }
     }
 
+    fn quote_map(code: &str) -> HashMap<String, (f64, f64)> {
+        HashMap::from([(code.to_string(), (10.5, 1.25))])
+    }
+
     /// 强烈卖出 → ReduceNow (P0)
     #[test]
     fn llm_advice_strong_sell() {
-        let holdings = vec![make_position("000001", "测试")];
+        let holdings = vec![make_position("TEST_CODE_000001", "测试")];
         let mut by_code = HashMap::new();
         by_code.insert(
-            "000001".to_string(),
+            "TEST_CODE_000001".to_string(),
             ("测试".to_string(), Some(make_md("强烈卖出", Some(20.0)))),
         );
-        let quote_map: HashMap<String, (f64, f64)> = HashMap::new();
-        let decisions = decisions_from_llm(&holdings, &by_code, &quote_map);
+        let quote_map = quote_map("TEST_CODE_000001");
+        let decisions = decisions_from_llm(&holdings, &by_code, &quote_map).expect("行情完整");
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].action, Action::ReduceNow);
         assert_eq!(decisions[0].priority, Priority::P0);
@@ -623,14 +636,14 @@ mod tests_llm_parse {
     /// 减持 → Reduce (P1)
     #[test]
     fn llm_advice_reduce() {
-        let holdings = vec![make_position("000001", "测试")];
+        let holdings = vec![make_position("TEST_CODE_000001", "测试")];
         let mut by_code = HashMap::new();
         by_code.insert(
-            "000001".to_string(),
+            "TEST_CODE_000001".to_string(),
             ("测试".to_string(), Some(make_md("减持观望", Some(48.0)))),
         );
-        let quote_map: HashMap<String, (f64, f64)> = HashMap::new();
-        let decisions = decisions_from_llm(&holdings, &by_code, &quote_map);
+        let quote_map = quote_map("TEST_CODE_000001");
+        let decisions = decisions_from_llm(&holdings, &by_code, &quote_map).expect("行情完整");
         assert_eq!(decisions[0].action, Action::Reduce);
         assert_eq!(decisions[0].priority, Priority::P1);
     }
@@ -638,15 +651,14 @@ mod tests_llm_parse {
     /// 观望 → Hold (P2)
     #[test]
     fn llm_advice_hold() {
-        let holdings = vec![make_position("000001", "测试")];
+        let holdings = vec![make_position("TEST_CODE_000001", "测试")];
         let mut by_code = HashMap::new();
         by_code.insert(
-            "000001".to_string(),
+            "TEST_CODE_000001".to_string(),
             ("测试".to_string(), Some(make_md("观望", Some(50.0)))),
         );
-        let quote_map: std::collections::HashMap<String, (f64, f64)> =
-            std::collections::HashMap::new();
-        let decisions = decisions_from_llm(&holdings, &by_code, &quote_map);
+        let quote_map = quote_map("TEST_CODE_000001");
+        let decisions = decisions_from_llm(&holdings, &by_code, &quote_map).expect("行情完整");
         assert_eq!(decisions[0].action, Action::Hold);
         assert_eq!(decisions[0].priority, Priority::P2);
     }
@@ -654,15 +666,14 @@ mod tests_llm_parse {
     /// 增持 → WatchAdd (P2)
     #[test]
     fn llm_advice_add() {
-        let holdings = vec![make_position("000001", "测试")];
+        let holdings = vec![make_position("TEST_CODE_000001", "测试")];
         let mut by_code = HashMap::new();
         by_code.insert(
-            "000001".to_string(),
+            "TEST_CODE_000001".to_string(),
             ("测试".to_string(), Some(make_md("加仓", Some(80.0)))),
         );
-        let quote_map: std::collections::HashMap<String, (f64, f64)> =
-            std::collections::HashMap::new();
-        let decisions = decisions_from_llm(&holdings, &by_code, &quote_map);
+        let quote_map = quote_map("TEST_CODE_000001");
+        let decisions = decisions_from_llm(&holdings, &by_code, &quote_map).expect("行情完整");
         assert_eq!(decisions[0].action, Action::WatchAdd);
         assert_eq!(decisions[0].priority, Priority::P2);
     }
@@ -670,14 +681,26 @@ mod tests_llm_parse {
     /// LLM 失败/数据缺失 → Hold (P2) 兜底, 明确标注"无可靠信号"
     #[test]
     fn llm_missing_fallback_hold() {
-        let holdings = vec![make_position("000001", "测试")];
+        let holdings = vec![make_position("TEST_CODE_000001", "测试")];
         let by_code: HashMap<String, (String, Option<String>)> = HashMap::new(); // 缺失
-        let quote_map: std::collections::HashMap<String, (f64, f64)> =
-            std::collections::HashMap::new();
-        let decisions = decisions_from_llm(&holdings, &by_code, &quote_map);
+        let quote_map = quote_map("TEST_CODE_000001");
+        let decisions = decisions_from_llm(&holdings, &by_code, &quote_map).expect("行情完整");
         assert_eq!(decisions[0].action, Action::Hold);
         assert_eq!(decisions[0].priority, Priority::P2);
         assert!(decisions[0].reasons[0].text.contains("默认 Hold"));
+    }
+
+    #[test]
+    fn br134_missing_realtime_quote_rejects_the_decision_batch() {
+        let holdings = vec![make_position("TEST_CODE_000001", "测试")];
+        let by_code: HashMap<String, (String, Option<String>)> = HashMap::new();
+        let quote_map: HashMap<String, (f64, f64)> = HashMap::new();
+
+        let error = decisions_from_llm(&holdings, &by_code, &quote_map)
+            .expect_err("缺行情不得用成本价和 0% 代填");
+
+        assert!(error.contains("TEST_CODE_000001"));
+        assert!(error.contains("行情"));
     }
 
     /// v14.3: LLM 实际输出"强烈看空" → ReduceNow (P0, 等价"强烈卖出")
@@ -795,13 +818,12 @@ mod tests_llm_parse {
 "#;
         let mut by_code = HashMap::new();
         by_code.insert(
-            "002208".to_string(),
+            "TEST_CODE_002208".to_string(),
             ("合肥城建".to_string(), Some(llm_md.to_string())),
         );
-        let holdings = vec![make_position("002208", "合肥城建")];
-        let quote_map: std::collections::HashMap<String, (f64, f64)> =
-            std::collections::HashMap::new();
-        let decisions = decisions_from_llm(&holdings, &by_code, &quote_map);
+        let holdings = vec![make_position("TEST_CODE_002208", "合肥城建")];
+        let quote_map = quote_map("TEST_CODE_002208");
+        let decisions = decisions_from_llm(&holdings, &by_code, &quote_map).expect("行情完整");
         assert_eq!(decisions.len(), 1);
         // "偏空" 关键词命中 → Reduce + P1
         assert_eq!(
@@ -830,13 +852,12 @@ mod tests_llm_parse {
 "#;
         let mut by_code = HashMap::new();
         by_code.insert(
-            "002131".to_string(),
+            "TEST_CODE_002131".to_string(),
             ("利欧股份".to_string(), Some(llm_md.to_string())),
         );
-        let holdings = vec![make_position("002131", "利欧股份")];
-        let quote_map: std::collections::HashMap<String, (f64, f64)> =
-            std::collections::HashMap::new();
-        let decisions = decisions_from_llm(&holdings, &by_code, &quote_map);
+        let holdings = vec![make_position("TEST_CODE_002131", "利欧股份")];
+        let quote_map = quote_map("TEST_CODE_002131");
+        let decisions = decisions_from_llm(&holdings, &by_code, &quote_map).expect("行情完整");
         assert_eq!(decisions[0].action, Action::Reduce);
         assert_eq!(decisions[0].priority, Priority::P1);
     }

@@ -9,10 +9,10 @@ use serde::Deserialize;
 #[derive(Debug, Clone)]
 pub struct YahooQuote {
     pub code: String,
-    pub price: f64,
-    pub change_pct: f64,
-    pub volume: f64,
-    pub previous_close: f64,
+    pub price: Option<f64>,
+    pub change_pct: Option<f64>,
+    pub volume: Option<f64>,
+    pub previous_close: Option<f64>,
 }
 
 /// Yahoo Finance API 响应结构
@@ -40,19 +40,106 @@ struct RawQuote {
     regular_market_previous_close: Option<f64>,
 }
 
-/// 将 A 股代码转为雅虎符号（深交所.SZ，上交所.SS）
+/// 将 A 股代码转为雅虎符号；海外指数、外汇等 Yahoo 原生符号保持不变。
 fn to_yahoo_symbol(code: &str) -> String {
-    if code.starts_with('6') || code.starts_with('5') {
-        format!("{}.SS", code)
-    } else {
-        format!("{}.SZ", code)
+    if code.len() != 6 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
+        return code.to_string();
+    }
+    match code.as_bytes()[0] {
+        b'5' | b'6' => format!("{code}.SS"),
+        b'4' | b'8' | b'9' => format!("{code}.BJ"),
+        _ => format!("{code}.SZ"),
     }
 }
 
+fn validate_optional_field(
+    symbol: &str,
+    field: &str,
+    value: Option<f64>,
+    predicate: impl FnOnce(f64) -> bool,
+) -> Result<Option<f64>, String> {
+    match value {
+        Some(value) if value.is_finite() && predicate(value) => Ok(Some(value)),
+        Some(value) => Err(format!("Yahoo {symbol} invalid {field}: {value}")),
+        None => {
+            log::warn!("[雅虎] {} 缺少字段 {}", symbol, field);
+            Ok(None)
+        }
+    }
+}
+
+fn parse_quotes(
+    response: QuoteResponse,
+    symbol_map: &std::collections::HashMap<String, String>,
+) -> Result<Vec<YahooQuote>, String> {
+    let mut quotes = Vec::with_capacity(response.quote_response.result.len());
+    for raw in response.quote_response.result {
+        let symbol = raw
+            .symbol
+            .as_deref()
+            .ok_or_else(|| "Yahoo response row missing symbol".to_string())?;
+        let code = symbol_map
+            .get(symbol)
+            .cloned()
+            .ok_or_else(|| format!("Yahoo returned unrequested symbol: {symbol}"))?;
+        quotes.push(YahooQuote {
+            code,
+            price: validate_optional_field(
+                symbol,
+                "regularMarketPrice",
+                raw.regular_market_price,
+                |value| value > 0.0,
+            )?,
+            change_pct: validate_optional_field(
+                symbol,
+                "regularMarketChangePercent",
+                raw.regular_market_change_percent,
+                |value| value.abs() <= 20.0,
+            )?,
+            volume: validate_optional_field(
+                symbol,
+                "regularMarketVolume",
+                raw.regular_market_volume,
+                |value| value >= 0.0,
+            )?,
+            previous_close: validate_optional_field(
+                symbol,
+                "regularMarketPreviousClose",
+                raw.regular_market_previous_close,
+                |value| value > 0.0,
+            )?,
+        });
+    }
+    Ok(quotes)
+}
+
 /// 批量拉取实时行情（一次请求最多约 20 只）
-pub fn fetch_quotes(codes: &[String]) -> Vec<YahooQuote> {
+pub fn fetch_quotes(codes: &[String]) -> Result<Vec<YahooQuote>, String> {
     if codes.is_empty() {
-        return vec![];
+        return Ok(vec![]);
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .map_err(|error| format!("build Yahoo client: {error}"))?;
+    fetch_quotes_with_client(&client, codes)
+}
+
+fn fetch_quotes_with_client(
+    client: &reqwest::blocking::Client,
+    codes: &[String],
+) -> Result<Vec<YahooQuote>, String> {
+    fetch_quotes_from_base(client, codes, "https://query1.finance.yahoo.com")
+}
+
+fn fetch_quotes_from_base(
+    client: &reqwest::blocking::Client,
+    codes: &[String],
+    base: &str,
+) -> Result<Vec<YahooQuote>, String> {
+    if codes.is_empty() {
+        return Ok(vec![]);
     }
 
     // 构建符号列表和反向映射
@@ -68,89 +155,74 @@ pub fn fetch_quotes(codes: &[String]) -> Vec<YahooQuote> {
         .collect();
 
     let url = format!(
-        "https://query1.finance.yahoo.com/v7/finance/quote?symbols={}",
+        "{}/v7/finance/quote?symbols={}",
+        base.trim_end_matches('/'),
         symbols.join(",")
     );
 
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return vec![],
-    };
-
-    let resp: QuoteResponse = match client
+    let response = client
         .get(&url)
         .header("User-Agent", "Mozilla/5.0")
         .send()
-        .and_then(|r| r.json())
-    {
-        Ok(r) => r,
-        Err(e) => {
-            log::warn!("[雅虎] API 请求失败: {}", e);
-            return vec![];
+        .map_err(|error| format!("Yahoo request failed: {error}"))?
+        .error_for_status()
+        .map_err(|error| format!("Yahoo HTTP status failed: {error}"))?;
+    let response: QuoteResponse = response
+        .json()
+        .map_err(|error| format!("decode Yahoo response: {error}"))?;
+    let quotes = parse_quotes(response, &symbol_map)?;
+    for (symbol, code) in &symbol_map {
+        if !quotes.iter().any(|quote| quote.code == *code) {
+            log::warn!("[雅虎] 响应缺少请求标的 {} ({})", code, symbol);
         }
-    };
-
-    resp.quote_response
-        .result
-        .into_iter()
-        .filter_map(|r| {
-            let symbol = r.symbol.as_deref()?;
-            let code = symbol_map.get(symbol)?.clone();
-            Some(YahooQuote {
-                code,
-                price: r.regular_market_price.unwrap_or(0.0),
-                change_pct: r.regular_market_change_percent.unwrap_or(0.0),
-                volume: r.regular_market_volume.unwrap_or(0.0),
-                previous_close: r.regular_market_previous_close.unwrap_or(0.0),
-            })
-        })
-        .collect()
+    }
+    Ok(quotes)
 }
 
 /// v64: 隔夜关注数据 (美股三大指数 + USD/CNY 汇率) — 雅虎财经 API
-/// - 代码: "^IXIC" (纳斯达克), "^DJI" (道琼斯), "^GSPC" (标普 500), "DX-Y.NYB" (美元指数)
-///       "CNY=X" (USD/CNY 汇率)
+/// - 代码: "^IXIC" (纳斯达克), "^DJI" (道琼斯), "^GSPC" (标普 500),
+///   "CNY=X" (USD/CNY 汇率)
 /// - 返回: (us_summary_str, fx_str) — 给 R-08 明日事件日历使用
-pub fn fetch_overnight_data() -> (String, String) {
-    use std::collections::HashMap;
+pub fn fetch_overnight_data() -> Result<(String, String), String> {
+    // 美股 3 指数 + 美元/人民币汇率；这些是 Yahoo 原生符号，不能添加 A 股后缀。
+    let codes = ["^IXIC", "^DJI", "^GSPC", "CNY=X"].map(str::to_string);
+    let quotes = fetch_quotes(&codes)?;
+    format_overnight_data(&quotes)
+}
 
-    // v64: 美股 3 指数 + 美元指数 + 美元/人民币汇率
-    let symbols = vec![
-        ("^IXIC".to_string(), "纳斯达克"),
-        ("^DJI".to_string(), "道琼斯"),
-        ("^GSPC".to_string(), "标普500"),
-        ("DX-Y.NYB".to_string(), "美元指数"),
-        ("CNY=X".to_string(), "美元/人民币"),
-    ];
-    let codes: Vec<String> = symbols.iter().map(|(s, _)| s.clone()).collect();
-    let quotes = fetch_quotes(&codes);
-
+fn format_overnight_data(quotes: &[YahooQuote]) -> Result<(String, String), String> {
     // 索引 by code
-    let mut by_code: HashMap<String, f64> = HashMap::new();
-    for q in &quotes {
-        by_code.insert(q.code.clone(), q.change_pct);
+    let mut by_code = std::collections::HashMap::new();
+    for q in quotes {
+        if let Some(change_pct) = q.change_pct {
+            by_code.insert(q.code.clone(), change_pct);
+        }
     }
 
     // 格式化美股摘要: "美股 +0.8% (纳+1.2% 道+0.3% 标+0.5%)"
     // 优先级: 纳斯达克 > 道琼斯 > 标普
-    let nasdaq_pct = by_code.get("^IXIC").copied().unwrap_or(0.0);
-    let dow_pct = by_code.get("^DJI").copied().unwrap_or(0.0);
-    let sp500_pct = by_code.get("^GSPC").copied().unwrap_or(0.0);
+    let required_change = |symbol: &str| {
+        by_code
+            .get(symbol)
+            .copied()
+            .ok_or_else(|| format!("Yahoo overnight data missing change_pct for {symbol}"))
+    };
+    let nasdaq_pct = required_change("^IXIC")?;
+    let dow_pct = required_change("^DJI")?;
+    let sp500_pct = required_change("^GSPC")?;
 
     // 选用变化最大的指数代表 (避免"美股 +0%"误导)
     let main_pct = [nasdaq_pct, dow_pct, sp500_pct]
         .iter()
         .copied()
         .filter(|x| x.abs() > 0.01)
-        .max_by(|a, b| {
-            a.abs()
-                .partial_cmp(&b.abs())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .unwrap_or(0.0);
+        .fold(0.0_f64, |largest, candidate| {
+            if candidate.abs() > largest.abs() {
+                candidate
+            } else {
+                largest
+            }
+        });
 
     let us_summary = if main_pct.abs() < 0.01 {
         "持平".to_string()
@@ -166,7 +238,7 @@ pub fn fetch_overnight_data() -> (String, String) {
     };
 
     // 汇率: 美元/人民币
-    let usd_cny = by_code.get("CNY=X").copied().unwrap_or(0.0);
+    let usd_cny = required_change("CNY=X")?;
     // 变化: 涨 = 人民币贬值 (利空 A股), 跌 = 人民币升值 (利好 A股)
     let fx_summary = if usd_cny.abs() < 0.0001 {
         "持平".to_string()
@@ -177,7 +249,7 @@ pub fn fetch_overnight_data() -> (String, String) {
         format!("{:+.2}% (USD/CNY)", usd_cny)
     };
 
-    (us_summary, fx_summary)
+    Ok((us_summary, fx_summary))
 }
 
 #[cfg(test)]
@@ -197,16 +269,144 @@ mod tests {
     }
 
     #[test]
-    fn test_fetch_empty() {
-        assert!(fetch_quotes(&[]).is_empty());
+    fn test_to_yahoo_symbol_preserves_native_symbols_and_maps_bse() {
+        assert_eq!(to_yahoo_symbol("^IXIC"), "^IXIC");
+        assert_eq!(to_yahoo_symbol("CNY=X"), "CNY=X");
+        assert_eq!(to_yahoo_symbol("920001"), "920001.BJ");
     }
 
-    // v64: fetch_overnight_data 返回 (us_summary, fx_summary), 沙箱无网络也不 panic
     #[test]
-    fn test_fetch_overnight_data_no_panic() {
-        let (us, fx) = fetch_overnight_data();
-        // 沙箱无网络时返 fallback ("持平"), 不 panic
-        assert!(!us.is_empty() || us == "美股 持平" || us.contains("美股"));
-        assert!(!fx.is_empty() || fx == "汇率 持平" || fx.contains("汇率"));
+    fn test_fetch_empty() {
+        assert!(fetch_quotes(&[]).expect("empty request").is_empty());
+        let client = reqwest::blocking::Client::new();
+        assert!(fetch_quotes_with_client(&client, &[])
+            .expect("empty injected request")
+            .is_empty());
+    }
+
+    #[test]
+    fn test_parse_quotes_preserves_missing_fields() {
+        let response: QuoteResponse = serde_json::from_str(
+            r#"{"quoteResponse":{"result":[{"symbol":"000547.SZ","regularMarketPrice":10.5}]}}"#,
+        )
+        .expect("fixture");
+        let symbol_map =
+            std::collections::HashMap::from([("000547.SZ".to_string(), "000547".to_string())]);
+        let quotes = parse_quotes(response, &symbol_map).expect("parse");
+        assert_eq!(quotes[0].price, Some(10.5));
+        assert_eq!(quotes[0].change_pct, None);
+        assert_eq!(quotes[0].volume, None);
+        assert_eq!(quotes[0].previous_close, None);
+    }
+
+    #[test]
+    fn test_parse_quotes_rejects_invalid_required_domain_value() {
+        let response: QuoteResponse = serde_json::from_str(
+            r#"{"quoteResponse":{"result":[{"symbol":"000547.SZ","regularMarketPrice":0.0}]}}"#,
+        )
+        .expect("fixture");
+        let symbol_map =
+            std::collections::HashMap::from([("000547.SZ".to_string(), "000547".to_string())]);
+        let error = parse_quotes(response, &symbol_map).expect_err("zero price must fail");
+        assert!(error.contains("regularMarketPrice"));
+    }
+
+    fn overnight_quote(code: &str, change_pct: Option<f64>) -> YahooQuote {
+        YahooQuote {
+            code: code.to_string(),
+            price: None,
+            change_pct,
+            volume: None,
+            previous_close: None,
+        }
+    }
+
+    #[test]
+    fn test_overnight_data_requires_every_change_field() {
+        let quotes = vec![
+            overnight_quote("^IXIC", Some(1.2)),
+            overnight_quote("^DJI", Some(0.3)),
+            overnight_quote("^GSPC", None),
+            overnight_quote("CNY=X", Some(-0.2)),
+        ];
+        let error = format_overnight_data(&quotes).expect_err("missing S&P change must fail");
+        assert!(error.contains("^GSPC"));
+    }
+
+    #[test]
+    fn test_overnight_data_distinguishes_real_flat_from_missing() {
+        let quotes = vec![
+            overnight_quote("^IXIC", Some(0.0)),
+            overnight_quote("^DJI", Some(0.0)),
+            overnight_quote("^GSPC", Some(0.0)),
+            overnight_quote("CNY=X", Some(0.0)),
+        ];
+        assert_eq!(
+            format_overnight_data(&quotes).expect("complete flat snapshot"),
+            ("持平".to_string(), "持平".to_string())
+        );
+    }
+
+    #[test]
+    fn yahoo_transport_failure_is_not_an_empty_quote_batch() {
+        let client = reqwest::blocking::Client::builder()
+            .proxy(reqwest::Proxy::all("http://127.0.0.1:9").unwrap())
+            .connect_timeout(std::time::Duration::from_millis(25))
+            .timeout(std::time::Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let error = fetch_quotes_with_client(&client, &["TEST_CODE_000001".to_string()])
+            .expect_err("unreachable Yahoo transport must fail");
+        assert!(error.contains("request failed"));
+    }
+
+    #[test]
+    fn loopback_blocking_transport_preserves_complete_and_missing_quote_rows() {
+        use super::super::{TestHttpResponse, TestHttpServer};
+
+        let body = serde_json::json!({"quoteResponse": {"result": [{
+            "symbol": "TEST_CODE_000001",
+            "regularMarketPrice": 10.1,
+            "regularMarketChangePercent": 1.0,
+            "regularMarketVolume": 1234.0,
+            "regularMarketPreviousClose": 10.0
+        }]}})
+        .to_string();
+        let server = TestHttpServer::new(vec![TestHttpResponse::json(body)]);
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        let quotes = fetch_quotes_from_base(
+            &client,
+            &[
+                "TEST_CODE_000001".to_string(),
+                "TEST_CODE_MISSING".to_string(),
+            ],
+            server.base_url(),
+        )
+        .unwrap();
+        assert_eq!(quotes.len(), 1);
+        assert_eq!(quotes[0].code, "TEST_CODE_000001");
+        assert_eq!(quotes[0].price, Some(10.1));
+        let requests = server.finish();
+        assert!(requests[0].contains("symbols=TEST_CODE_000001,TEST_CODE_MISSING"));
+
+        let server = TestHttpServer::new(vec![TestHttpResponse {
+            status: 503,
+            body: "unavailable".to_string(),
+        }]);
+        let error = fetch_quotes_from_base(
+            &client,
+            &["TEST_CODE_000001".to_string()],
+            server.base_url(),
+        )
+        .unwrap_err();
+        assert!(error.contains("HTTP status"));
+        assert_eq!(server.finish().len(), 1);
     }
 }
+
+#[cfg(test)]
+#[path = "../gate_d_yahoo_regression.rs"]
+mod gate_d_regression;

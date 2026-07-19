@@ -685,4 +685,59 @@ mod tests {
             s_long
         );
     }
+
+    #[test]
+    fn fallback_knowledge_base_is_complete_and_searchable() {
+        let nodes = boms();
+        assert_eq!(nodes.len(), 50);
+        let chains: std::collections::HashSet<&str> =
+            nodes.iter().map(|node| node.chain.as_str()).collect();
+        assert_eq!(chains.len(), 10);
+        assert!(nodes.iter().all(|node| {
+            !node.chain.is_empty()
+                && !node.segment.is_empty()
+                && (0.0..=1.0).contains(&node.elasticity_score)
+                && (0.0..=1.0).contains(&node.margin_pct)
+                && (0.0..=1.0).contains(&node.confidence)
+        }));
+        assert_eq!(
+            find_bom_node("新能源车", "锂矿").map(|node| node.direction),
+            Some(BomDirection::Upstream)
+        );
+        assert!(find_bom_node("不存在", "不存在").is_none());
+        assert!(std::ptr::eq(nodes.as_ptr(), boms().as_ptr()));
+    }
+
+    #[test]
+    fn node_constructor_clamps_scores_and_direction_matrix_is_complete() {
+        let node = BomNode::new(
+            "测试链".to_string(),
+            "测试环节".to_string(),
+            BomDirection::Midstream,
+            2.0,
+            -1.0,
+            0,
+        );
+        assert_eq!(node.elasticity_score, 1.0);
+        assert_eq!(node.margin_pct, 0.0);
+        assert_eq!(node.source, "AI");
+        assert_eq!(node.confidence, 0.5);
+
+        for (direction, event, expected) in [
+            (BomDirection::Upstream, EventDirection::Bull, 1.0),
+            (BomDirection::Upstream, EventDirection::Bear, 0.3),
+            (BomDirection::Midstream, EventDirection::Bull, 0.4),
+            (BomDirection::Midstream, EventDirection::Bear, 0.7),
+            (BomDirection::Downstream, EventDirection::Bull, 0.9),
+            (BomDirection::Downstream, EventDirection::Bear, 0.3),
+            (BomDirection::Upstream, EventDirection::Neutral, 0.5),
+            (BomDirection::Midstream, EventDirection::Neutral, 0.5),
+            (BomDirection::Downstream, EventDirection::Neutral, 0.5),
+        ] {
+            let mut matrix_node = make_node(0);
+            matrix_node.direction = direction;
+            let score = chain_score_with_direction(&matrix_node, event);
+            assert!((score - expected).abs() < 1e-12);
+        }
+    }
 }

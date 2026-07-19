@@ -213,12 +213,5 @@ fn test_elasticity_field_bounds_all_nodes() {
             n.segment,
             n.confidence
         );
-        assert!(
-            n.lead_days <= 255,
-            "{}-{} lead_days {} 越界",
-            n.chain,
-            n.segment,
-            n.lead_days
-        );
     }
 }

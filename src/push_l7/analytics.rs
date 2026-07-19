@@ -84,22 +84,26 @@ impl ValidationStatus {
 /// v14.2 §3.7: AnalyticsStore 是 trait, 可独立实现 (InMemory / SQLite / 远程)
 pub trait AnalyticsStore: Send + Sync {
     /// 记录一次推送
-    fn record(&self, analytics: &PushAnalytics);
+    fn record(&self, analytics: &PushAnalytics) -> Result<(), String>;
 
     /// 按 event_id 查询
-    fn get_by_event_id(&self, event_id: &str) -> Option<PushAnalytics>;
+    fn get_by_event_id(&self, event_id: &str) -> Result<Option<PushAnalytics>, String>;
 
     /// 按时间范围查询
-    fn query_by_time_range(&self, from: DateTime<Local>, to: DateTime<Local>) -> Vec<PushAnalytics>;
+    fn query_by_time_range(
+        &self,
+        from: DateTime<Local>,
+        to: DateTime<Local>,
+    ) -> Result<Vec<PushAnalytics>, String>;
 
     /// 统计总数
-    fn count_total(&self) -> u64;
+    fn count_total(&self) -> Result<u64, String>;
 
     /// 按 governance_decision 统计
-    fn count_by_governance(&self, decision: &GovernanceDecision) -> u64;
+    fn count_by_governance(&self, decision: &GovernanceDecision) -> Result<u64, String>;
 
-    /// 统计推送率 (pushed / total)
-    fn push_rate(&self) -> f64;
+    /// 统计推送率 (pushed / total)；无记录时为 None。
+    fn push_rate(&self) -> Result<Option<f64>, String>;
 }
 
 // ============================================================================
@@ -141,43 +145,68 @@ impl Default for InMemoryStore {
 }
 
 impl AnalyticsStore for InMemoryStore {
-    fn record(&self, analytics: &PushAnalytics) {
-        crate::util::recover_lock_or_warn("InMemoryStore::record", self.records.lock()).push(analytics.clone());
+    fn record(&self, analytics: &PushAnalytics) -> Result<(), String> {
+        crate::util::recover_lock_or_warn("InMemoryStore::record", self.records.lock())
+            .push(analytics.clone());
+        Ok(())
     }
 
-    fn get_by_event_id(&self, event_id: &str) -> Option<PushAnalytics> {
-        crate::util::recover_lock_or_warn("InMemoryStore::get_by_event_id", self.records.lock())
+    fn get_by_event_id(&self, event_id: &str) -> Result<Option<PushAnalytics>, String> {
+        Ok(
+            crate::util::recover_lock_or_warn(
+                "InMemoryStore::get_by_event_id",
+                self.records.lock(),
+            )
             .iter()
             .find(|a| a.event_id == event_id)
-            .cloned()
+            .cloned(),
+        )
     }
 
-    fn query_by_time_range(&self, from: DateTime<Local>, to: DateTime<Local>) -> Vec<PushAnalytics> {
-        crate::util::recover_lock_or_warn("InMemoryStore::query_by_time_range", self.records.lock())
-            .iter()
-            .filter(|a| a.ts >= from && a.ts <= to)
-            .cloned()
-            .collect()
+    fn query_by_time_range(
+        &self,
+        from: DateTime<Local>,
+        to: DateTime<Local>,
+    ) -> Result<Vec<PushAnalytics>, String> {
+        Ok(crate::util::recover_lock_or_warn(
+            "InMemoryStore::query_by_time_range",
+            self.records.lock(),
+        )
+        .iter()
+        .filter(|a| a.ts >= from && a.ts <= to)
+        .cloned()
+        .collect())
     }
 
-    fn count_total(&self) -> u64 {
-        crate::util::recover_lock_or_warn("InMemoryStore::count_total", self.records.lock()).len() as u64
+    fn count_total(&self) -> Result<u64, String> {
+        u64::try_from(
+            crate::util::recover_lock_or_warn("InMemoryStore::count_total", self.records.lock())
+                .len(),
+        )
+        .map_err(|error| format!("in-memory analytics count overflow: {error}"))
     }
 
-    fn count_by_governance(&self, decision: &GovernanceDecision) -> u64 {
-        crate::util::recover_lock_or_warn("InMemoryStore::count_by_governance", self.records.lock())
+    fn count_by_governance(&self, decision: &GovernanceDecision) -> Result<u64, String> {
+        u64::try_from(
+            crate::util::recover_lock_or_warn(
+                "InMemoryStore::count_by_governance",
+                self.records.lock(),
+            )
             .iter()
             .filter(|a| &a.governance_decision == decision)
-            .count() as u64
+            .count(),
+        )
+        .map_err(|error| format!("in-memory governance count overflow: {error}"))
     }
 
-    fn push_rate(&self) -> f64 {
-        let records = crate::util::recover_lock_or_warn("InMemoryStore::push_rate", self.records.lock());
+    fn push_rate(&self) -> Result<Option<f64>, String> {
+        let records =
+            crate::util::recover_lock_or_warn("InMemoryStore::push_rate", self.records.lock());
         if records.is_empty() {
-            return 0.0;
+            return Ok(None);
         }
         let pushed = records.iter().filter(|a| a.pushed).count();
-        pushed as f64 / records.len() as f64
+        Ok(Some(pushed as f64 / records.len() as f64))
     }
 }
 
@@ -188,6 +217,10 @@ impl AnalyticsStore for InMemoryStore {
 /// 从 SignalEvent + 治理结果构造 PushAnalytics
 ///
 /// 这是 L4 dispatcher 在 Step 4 推送完成后调用的工厂
+#[allow(
+    clippy::too_many_arguments,
+    reason = "audit-record factory keeps governance and real delivery outcomes distinct"
+)]
 pub fn build_analytics(
     event: &SignalEvent,
     template_id: &str,
@@ -244,7 +277,7 @@ mod tests {
         SignalEvent::new(
             crate::push_l1::SignalSource::LimitUp,
             "limit_up",
-            Some("600519".to_string()),
+            Some("TEST_CODE_600519".to_string()),
             Local::now(),
             SignalPayload::LimitUp(LimitUpPayload::default()),
             Severity::High,
@@ -283,10 +316,10 @@ mod tests {
         assert!(store.is_empty());
 
         let a = make_analytics(true, GovernanceDecision::Approve);
-        store.record(&a);
+        store.record(&a).unwrap();
 
         assert_eq!(store.len(), 1);
-        let got = store.get_by_event_id("abc123").unwrap();
+        let got = store.get_by_event_id("abc123").unwrap().unwrap();
         assert_eq!(got.event_id, "abc123");
         assert_eq!(got.template_id, "limit_up_v1");
     }
@@ -294,7 +327,7 @@ mod tests {
     #[test]
     fn in_memory_store_get_by_event_id_missing() {
         let store = InMemoryStore::new();
-        assert!(store.get_by_event_id("nonexistent").is_none());
+        assert!(store.get_by_event_id("nonexistent").unwrap().is_none());
     }
 
     #[test]
@@ -303,44 +336,82 @@ mod tests {
         for i in 0..5 {
             let mut a = make_analytics(true, GovernanceDecision::Approve);
             a.event_id = format!("e{}", i);
-            store.record(&a);
+            store.record(&a).unwrap();
         }
-        assert_eq!(store.count_total(), 5);
+        assert_eq!(store.count_total().unwrap(), 5);
     }
 
     #[test]
     fn in_memory_store_count_by_governance() {
         let store = InMemoryStore::new();
-        store.record(&make_analytics(true, GovernanceDecision::Approve));
-        store.record(&make_analytics(false, GovernanceDecision::Deny("frozen".to_string())));
-        store.record(&make_analytics(false, GovernanceDecision::Deny("quiet_hour".to_string())));
-        store.record(&make_analytics(false, GovernanceDecision::Deny("quiet_hour".to_string())));
-        assert_eq!(store.count_by_governance(&GovernanceDecision::Approve), 1);
-        assert_eq!(store.count_by_governance(&GovernanceDecision::Deny("quiet_hour".to_string())), 2);
+        store
+            .record(&make_analytics(true, GovernanceDecision::Approve))
+            .unwrap();
+        store
+            .record(&make_analytics(
+                false,
+                GovernanceDecision::Deny("frozen".to_string()),
+            ))
+            .unwrap();
+        store
+            .record(&make_analytics(
+                false,
+                GovernanceDecision::Deny("quiet_hour".to_string()),
+            ))
+            .unwrap();
+        store
+            .record(&make_analytics(
+                false,
+                GovernanceDecision::Deny("quiet_hour".to_string()),
+            ))
+            .unwrap();
+        assert_eq!(
+            store
+                .count_by_governance(&GovernanceDecision::Approve)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .count_by_governance(&GovernanceDecision::Deny("quiet_hour".to_string()))
+                .unwrap(),
+            2
+        );
     }
 
     #[test]
     fn push_rate_calculation() {
         let store = InMemoryStore::new();
-        store.record(&make_analytics(true, GovernanceDecision::Approve));
-        store.record(&make_analytics(true, GovernanceDecision::Approve));
-        store.record(&make_analytics(false, GovernanceDecision::Deny("frozen".to_string())));
-        assert!((store.push_rate() - 0.6666).abs() < 0.01);
+        store
+            .record(&make_analytics(true, GovernanceDecision::Approve))
+            .unwrap();
+        store
+            .record(&make_analytics(true, GovernanceDecision::Approve))
+            .unwrap();
+        store
+            .record(&make_analytics(
+                false,
+                GovernanceDecision::Deny("frozen".to_string()),
+            ))
+            .unwrap();
+        assert!((store.push_rate().unwrap().unwrap() - 0.6666).abs() < 0.01);
     }
 
     #[test]
     fn push_rate_empty_store() {
         let store = InMemoryStore::new();
-        assert_eq!(store.push_rate(), 0.0);
+        assert_eq!(store.push_rate().unwrap(), None);
     }
 
     #[test]
     fn push_rate_all_pushed() {
         let store = InMemoryStore::new();
         for _ in 0..3 {
-            store.record(&make_analytics(true, GovernanceDecision::Approve));
+            store
+                .record(&make_analytics(true, GovernanceDecision::Approve))
+                .unwrap();
         }
-        assert_eq!(store.push_rate(), 1.0);
+        assert_eq!(store.push_rate().unwrap(), Some(1.0));
     }
 
     #[test]
@@ -351,9 +422,11 @@ mod tests {
         a1.ts = now - chrono::Duration::hours(2);
         let mut a2 = make_analytics(true, GovernanceDecision::Approve);
         a2.ts = now;
-        store.record(&a1);
-        store.record(&a2);
-        let recent = store.query_by_time_range(now - chrono::Duration::hours(1), now);
+        store.record(&a1).unwrap();
+        store.record(&a2).unwrap();
+        let recent = store
+            .query_by_time_range(now - chrono::Duration::hours(1), now)
+            .unwrap();
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].event_id, a2.event_id);
     }
@@ -361,7 +434,9 @@ mod tests {
     #[test]
     fn clear_resets_store() {
         let store = InMemoryStore::new();
-        store.record(&make_analytics(true, GovernanceDecision::Approve));
+        store
+            .record(&make_analytics(true, GovernanceDecision::Approve))
+            .unwrap();
         assert_eq!(store.len(), 1);
         store.clear();
         assert!(store.is_empty());

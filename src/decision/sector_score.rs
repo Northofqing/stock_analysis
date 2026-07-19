@@ -133,7 +133,7 @@ fn median(values: &[f64]) -> f64 {
     let mut sorted: Vec<f64> = values.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mid = sorted.len() / 2;
-    if sorted.len() % 2 == 0 {
+    if sorted.len().is_multiple_of(2) {
         (sorted[mid - 1] + sorted[mid]) / 2.0
     } else {
         sorted[mid]
@@ -211,6 +211,7 @@ mod tests {
 
     #[test]
     fn test_median() {
+        assert_eq!(median(&[]), 0.0);
         assert_eq!(median(&[1.0, 2.0, 3.0]), 2.0);
         assert_eq!(median(&[1.0, 2.0, 3.0, 4.0]), 2.5);
     }
@@ -235,5 +236,34 @@ mod tests {
             .filter(|g| g.tier == SectorTier::Tier1)
             .collect();
         assert!(!tier1.is_empty());
+    }
+
+    #[test]
+    fn labels_empty_input_and_tier_rendering_cover_all_public_states() {
+        assert_eq!(Grade::Strong.label(), "强");
+        assert_eq!(Grade::Medium.label(), "中");
+        assert_eq!(Grade::Weak.label(), "弱");
+        assert_eq!(SectorTier::Tier1.label(), "第一梯队·核心主线");
+        assert_eq!(SectorTier::Tier2.label(), "第二梯队·卫星弹性");
+        assert_eq!(SectorTier::Watch.label(), "观察区·不入场");
+        assert_eq!(SectorTier::Excluded.label(), "排除清单·不关注");
+        assert!(grade_sectors(&[]).is_empty());
+        assert_eq!(format_tier_list(&[]), "无板块数据");
+
+        let graded = grade_sectors(&[
+            board("双强", 20.0, 10e8),
+            board("技术强", 15.0, -1e8),
+            board("基准甲", 1.0, 1e8),
+            board("基准乙", 0.5, 0.5e8),
+            board("基准丙", 0.2, 0.2e8),
+        ]);
+        assert!(graded.iter().any(|sector| sector.tier == SectorTier::Tier1));
+        assert!(graded.iter().any(|sector| sector.tier == SectorTier::Tier2));
+        let rendered = format_tier_list(&graded);
+        assert!(rendered.contains("第一梯队"));
+        assert!(rendered.contains("第二梯队"));
+        assert!(rendered.contains("双强"));
+        assert!(graded.iter().all(|sector| !sector.code.is_empty()));
+        assert!(graded.iter().all(|sector| sector.main_inflow.is_finite()));
     }
 }

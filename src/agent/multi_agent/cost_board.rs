@@ -185,7 +185,6 @@ pub fn global_cost_board() -> &'static CostBoard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread;
 
     #[test]
     fn test_record_and_avg() {

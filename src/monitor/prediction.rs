@@ -111,7 +111,7 @@ pub async fn verify_predictions() {
 
             // 2-4. 共享 verify 逻辑: 读 close + 算 actual_change + 判定 hit
             // verify_one 内部向前找最近交易日 (修复 C-1: 周末/节假日不静默 skip)
-            let outcome = match verify_one(&db, code, &pred_date_s, &target_date_s, direction).await
+            let outcome = match verify_one(db, code, &pred_date_s, &target_date_s, direction).await
             {
                 Some(o) => o,
                 None => {
@@ -252,18 +252,18 @@ fn read_stock_daily_close_with_offset(db: &DatabaseManager, code: &str, date: &s
     None
 }
 
-/// 获取近期命中率
-pub fn recent_hit_rate(days: i32) -> f64 {
-    let Some(db) = DatabaseManager::try_get() else {
-        return 0.0;
-    };
-    db.get_prediction_hit_rate(days).unwrap_or(0.0)
+/// 获取近期命中率；缺库、无样本和查询错误均显式返回。
+pub fn recent_hit_rate(days: i32) -> Result<f64, String> {
+    let db = DatabaseManager::try_get().ok_or_else(|| "Prediction DB 未初始化".to_string())?;
+    db.get_prediction_hit_rate(days).map_err(|e| e.to_string())
 }
 
 /// 命中率摘要（用于报告）
 pub fn hit_rate_summary(days: i32) -> String {
-    let rate = recent_hit_rate(days);
-    format!("近{}天预测命中率: {:.0}%", days, rate * 100.0)
+    match recent_hit_rate(days) {
+        Ok(rate) => format!("近{}天预测命中率: {:.0}%", days, rate * 100.0),
+        Err(error) => format!("近{}天预测命中率: 不可用（{}）", days, error),
+    }
 }
 
 #[cfg(test)]
@@ -274,11 +274,12 @@ mod tests {
     fn test_hit_rate_format() {
         let s = hit_rate_summary(7);
         assert!(s.contains("命中率"));
+        assert!(s.contains('%') || s.contains("不可用"));
     }
 
     #[test]
     fn test_save_prediction_no_panic() {
         // 在没有 DB 的环境下也不应 panic
-        save_prediction(None, Some("000001"), "看多", 75.0, None);
+        save_prediction(None, Some("TEST_CODE_000001"), "看多", 75.0, None);
     }
 }

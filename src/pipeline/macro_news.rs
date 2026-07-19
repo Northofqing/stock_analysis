@@ -49,3 +49,22 @@ pub(super) async fn resolve_macro_context(
     };
     Arc::from(mc)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_macro_context;
+
+    #[tokio::test]
+    async fn prefetched_and_disabled_search_keep_missing_evidence_explicit() {
+        assert_eq!(
+            resolve_macro_context(Some("TEST_CODE_真实宏观证据".to_string()), true)
+                .await
+                .as_ref(),
+            "TEST_CODE_真实宏观证据"
+        );
+        assert!(resolve_macro_context(Some(String::new()), true)
+            .await
+            .is_empty());
+        assert!(resolve_macro_context(None, false).await.is_empty());
+    }
+}

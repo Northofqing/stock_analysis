@@ -1,7 +1,7 @@
 //! 新闻 AI 分析器（Phase 1.6）。
 //!
-//! 路径A（机会发现）：entity_linker 候选池 → AI 打分筛选（做选择题，不做填空题）
-//! 路径B（持仓深研）：消息 + BIAS/筹码/涨跌停 → AI 影响评估（不输出操作指令）
+//! 本模块负责持仓深研与已有候选的快速判断；机会发现的实体候选池由
+//! `news_monitor::NewsMonitor` 持有，避免在这里重复加载一份 linker/数据库缓存。
 //!
 //! 硬约束：
 //! - 盘中 Quick 模式 <3s，盘后 Deep 模式 <15s，超时跳过
@@ -12,7 +12,6 @@
 
 use crate::analyzer::{AgentMode, GeminiAnalyzer};
 use crate::monitor::detector::{AlertCategory, AlertDetail, AlertEvent, AlertLevel};
-use crate::monitor::entity_linker::EntityLinker;
 use chrono::Local;
 use log::warn;
 use std::time::Duration;
@@ -32,7 +31,6 @@ pub struct PositionAnalysis {
 // ── NewsAIAnalyzer ──
 
 pub struct NewsAIAnalyzer {
-    linker: EntityLinker,
     analyzer: GeminiAnalyzer,
     available: bool,
 }
@@ -41,17 +39,7 @@ impl NewsAIAnalyzer {
     pub fn new() -> Self {
         let analyzer = GeminiAnalyzer::from_env();
         let available = analyzer.is_available();
-        let mut linker = EntityLinker::new();
-        // 加载持仓
-        if let Some(db) = crate::database::DatabaseManager::try_get() {
-            if let Ok(positions) = db.get_all_open_positions() {
-                for p in &positions {
-                    linker.register_position(&p.code, &p.name);
-                }
-            }
-        }
         Self {
-            linker,
             analyzer,
             available,
         }
@@ -65,6 +53,10 @@ impl NewsAIAnalyzer {
     // 路径B：持仓深研（消息 + 技术面 → 影响评估）
     // ═══════════════════════════════════════════════════════════
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "LLM prompt boundary keeps each real evidence field explicit and auditable"
+    )]
     pub async fn analyze_position_news(
         &self,
         code: &str,
@@ -128,22 +120,22 @@ impl NewsAIAnalyzer {
         for line in text.lines() {
             let line = line.trim();
             if line.starts_with("影响判断：") || line.starts_with("影响判断:") {
-                impact = line.split(['：', ':']).last().unwrap_or("中性").trim();
+                impact = line.split(['：', ':']).next_back().unwrap_or("中性").trim();
             }
             if line.starts_with("置信度：") || line.starts_with("置信度:") {
                 confidence = line
                     .split(['：', ':'])
-                    .last()
+                    .next_back()
                     .unwrap_or("50")
                     .trim()
                     .parse()
                     .unwrap_or(50);
             }
             if line.starts_with("不确定点：") || line.starts_with("不确定点:") {
-                uncertainty = line.split(['：', ':']).last().unwrap_or("").trim();
+                uncertainty = line.split(['：', ':']).next_back().unwrap_or("").trim();
             }
             if line.starts_with("核心逻辑：") || line.starts_with("核心逻辑:") {
-                core_logic = line.split(['：', ':']).last().unwrap_or("").trim();
+                core_logic = line.split(['：', ':']).next_back().unwrap_or("").trim();
             }
         }
 
@@ -156,7 +148,7 @@ impl NewsAIAnalyzer {
         };
 
         // 写入 prediction_tracker
-        let _ = crate::monitor::prediction::save_prediction(
+        crate::monitor::prediction::save_prediction(
             None,
             Some(code),
             if impact.contains("利好") {
@@ -187,11 +179,13 @@ impl NewsAIAnalyzer {
                 threshold: None,
                 news_title: Some(news_text.chars().take(100).collect()),
                 news_summary: None,
+                news_importance: None,
                 ai_decision: None,
                 t1_locked: false,
                 extra: Some(format!("AI影响评估:{},置信度:{}%", impact, confidence)),
             },
             triggered_at: Local::now(),
+            routed_external_id: None,
         })
     }
 
@@ -333,6 +327,7 @@ fn keyword_decision(title: &str) -> Option<String> {
 // 代码校验闸
 // ═══════════════════════════════════════════════════════════
 
+#[cfg(test)]
 fn validate_llm_code(code: &str, name: &str) -> Option<String> {
     if code.len() != 6 || !code.chars().all(|c| c.is_ascii_digit()) {
         return None;

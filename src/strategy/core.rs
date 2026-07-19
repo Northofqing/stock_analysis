@@ -973,7 +973,7 @@ pub fn regime_breakdown(
     // 基准按日期升序排列，便于按窗口取趋势
     let mut bench_sorted: Vec<(chrono::NaiveDate, f64)> =
         bench.closes.iter().map(|(k, v)| (*k, *v)).collect();
-    bench_sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    bench_sorted.sort_by_key(|a| a.0);
     let date_to_idx: HashMap<chrono::NaiveDate, usize> = bench_sorted
         .iter()
         .enumerate()
@@ -1366,7 +1366,7 @@ impl BacktestSummary {
                 BLUE.mix(0.85).stroke_width(2),
             ))?
             .label("净值")
-            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &BLUE));
+            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], BLUE));
 
         // 基准线
         chart
@@ -1375,7 +1375,7 @@ impl BacktestSummary {
                 RED.mix(0.5).stroke_width(1),
             ))?
             .label("基准 (1.0)")
-            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &RED));
+            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], RED));
 
         // 买卖点：将 trade.date 上当日的净值作为标记 y
         // 用 daily_values 做 O(N+M) 的双指针查找
@@ -1477,7 +1477,7 @@ impl BacktestSummary {
                     .border_style(RED.stroke_width(1)),
             )?
             .label("Drawdown")
-            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], &RED));
+            .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], RED));
 
         // 0 基准线
         chart.draw_series(LineSeries::new(
@@ -1503,7 +1503,7 @@ impl BacktestSummary {
         ))?;
 
         // 指标数据
-        let metrics = vec![
+        let metrics = [
             ("初始资金", format!("¥{:.2}", summary.initial_capital)),
             ("最终市值", format!("¥{:.2}", summary.final_value)),
             ("总收益率", format!("{:+.2}%", summary.total_return * 100.0)),
@@ -1691,16 +1691,18 @@ mod tests {
         let date = Local::now();
 
         // 测试买入
-        engine.buy("000001", "平安银行", 10.0, 100.0, date).unwrap();
+        engine
+            .buy("TEST_CODE_000001", "平安银行", 10.0, 100.0, date)
+            .unwrap();
         assert!(engine.get_cash() < 1_000_000.0);
         assert_eq!(engine.get_positions().len(), 1);
 
         // 测试卖出
-        engine.sell("000001", 50.0, 11.0, date).unwrap();
+        engine.sell("TEST_CODE_000001", 50.0, 11.0, date).unwrap();
         assert_eq!(engine.get_positions().len(), 1);
 
         // 测试清仓
-        engine.sell("000001", 50.0, 11.0, date).unwrap();
+        engine.sell("TEST_CODE_000001", 50.0, 11.0, date).unwrap();
         assert_eq!(engine.get_positions().len(), 0);
     }
 
@@ -1712,7 +1714,8 @@ mod tests {
         let mut engine = BacktestEngine::new(config);
         let date = Local::now();
         // prev_close=10.0，主板 10%，涨停 11.0；试图以 11.5 买入应被拒
-        let result = engine.try_buy_validated("600000", "浦发银行", 10.0, 11.5, 100.0, date);
+        let result =
+            engine.try_buy_validated("TEST_CODE_600000", "浦发银行", 10.0, 11.5, 100.0, date);
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("涨停价") || msg.contains("高于"), "msg={msg}");
@@ -1725,7 +1728,8 @@ mod tests {
         let mut engine = BacktestEngine::new(config);
         let date = Local::now();
         // 10.5 在 9.0~11.0 范围内，合规
-        let result = engine.try_buy_validated("600000", "浦发银行", 10.0, 10.5, 100.0, date);
+        let result =
+            engine.try_buy_validated("TEST_CODE_600000", "浦发银行", 10.0, 10.5, 100.0, date);
         assert!(result.is_ok(), "应当接受 10.5 买入, got: {:?}", result);
         assert_eq!(engine.get_positions().len(), 1);
     }
@@ -1736,9 +1740,12 @@ mod tests {
         let mut engine = BacktestEngine::new(config);
         let date = Local::now();
         // 先买入 100 股 @10.0
-        engine.buy("600000", "浦发银行", 10.0, 100.0, date).unwrap();
+        engine
+            .buy("TEST_CODE_600000", "浦发银行", 10.0, 100.0, date)
+            .unwrap();
         // 跌停 9.0，尝试 8.5 卖出应被拒
-        let result = engine.try_sell_validated("600000", "浦发银行", 10.0, 100.0, 8.5, date);
+        let result =
+            engine.try_sell_validated("TEST_CODE_600000", "浦发银行", 10.0, 100.0, 8.5, date);
         assert!(result.is_err());
     }
 
@@ -1750,7 +1757,7 @@ mod tests {
         let mut engine = BacktestEngine::new(config);
         let date = Local::now();
         let filled = engine
-            .try_buy_realistic("600000", "浦发银行", 10.0, 10.5, 150.0, date)
+            .try_buy_realistic("TEST_CODE_600000", "浦发银行", 10.0, 10.5, 150.0, date)
             .unwrap();
         assert_eq!(filled, 100);
     }
@@ -1761,7 +1768,8 @@ mod tests {
         let config = BacktestConfig::default();
         let mut engine = BacktestEngine::new(config);
         let date = Local::now();
-        let result = engine.try_buy_realistic("600000", "浦发银行", 10.0, 10.5, 50.0, date);
+        let result =
+            engine.try_buy_realistic("TEST_CODE_600000", "浦发银行", 10.0, 10.5, 50.0, date);
         assert!(result.is_err());
     }
 
@@ -1772,7 +1780,7 @@ mod tests {
         let mut engine = BacktestEngine::new(config);
         let date = Local::now();
         engine
-            .try_buy_realistic("600000", "浦发银行", 10.0, 10.0, 100.0, date)
+            .try_buy_realistic("TEST_CODE_600000", "浦发银行", 10.0, 10.0, 100.0, date)
             .unwrap();
         let last = engine.state.trades.last().unwrap();
         assert!(
@@ -1789,10 +1797,10 @@ mod tests {
         let mut engine = BacktestEngine::new(config);
         let buy_date = Local::now();
         engine
-            .try_buy_realistic("600000", "浦发银行", 10.0, 10.0, 100.0, buy_date)
+            .try_buy_realistic("TEST_CODE_600000", "浦发银行", 10.0, 10.0, 100.0, buy_date)
             .unwrap();
         let result = engine.try_sell_realistic(
-            "600000",
+            "TEST_CODE_600000",
             "浦发银行",
             10.0,
             100.0,
@@ -1811,10 +1819,11 @@ mod tests {
         let mut engine = BacktestEngine::new(config);
         let buy_date = Local::now();
         engine
-            .try_buy_realistic("600000", "浦发银行", 10.0, 10.0, 100.0, buy_date)
+            .try_buy_realistic("TEST_CODE_600000", "浦发银行", 10.0, 10.0, 100.0, buy_date)
             .unwrap();
         let sell_date = buy_date + chrono::Duration::days(1);
-        let result = engine.try_sell_realistic("600000", "浦发银行", 10.0, 100.0, 10.5, sell_date);
+        let result =
+            engine.try_sell_realistic("TEST_CODE_600000", "浦发银行", 10.0, 100.0, 10.5, sell_date);
         assert!(result.is_ok(), "got: {:?}", result);
     }
 

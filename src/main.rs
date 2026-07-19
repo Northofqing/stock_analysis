@@ -1,3 +1,4 @@
+//! Registered business rules: BR-074.
 //! A股自选股智能分析系统 - 主程序入口
 //!
 //! 职责：

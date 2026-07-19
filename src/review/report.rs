@@ -30,28 +30,56 @@ pub fn generate_daily_report_with_ledger(
     lines.push("━━━━━━━━━━━━━━━━━━━━━━━━".to_string());
 
     // ── 净值概览 ──
+    let signed_one = |value: Option<f64>| {
+        value
+            .map(|number| format!("{number:+.1}%"))
+            .unwrap_or_else(|| "暂无".to_string())
+    };
+    let unsigned_one = |value: Option<f64>| {
+        value
+            .map(|number| format!("{number:.1}%"))
+            .unwrap_or_else(|| "暂无".to_string())
+    };
+    let two_decimals = |value: Option<f64>| {
+        value
+            .map(|number| format!("{number:.2}"))
+            .unwrap_or_else(|| "暂无".to_string())
+    };
     lines.push(format!(
-        "📈 累计收益：{:+.1}% | 年化：{:+.1}% | 最大回撤：{:.1}% | 夏普：{:.2}",
-        stats.total_return_pct,
-        stats.annualized_return_pct,
-        stats.max_drawdown_pct,
-        stats.sharpe_ratio,
+        "📈 累计收益：{} | 年化：{} | 最大回撤：{} | 夏普：{}",
+        signed_one(stats.total_return_pct),
+        signed_one(stats.annualized_return_pct),
+        unsigned_one(stats.max_drawdown_pct),
+        two_decimals(stats.sharpe_ratio),
     ));
     lines.push(format!(
-        "🛡️ 风险值：VaR95={:.2}% | CVaR95={:.2}%（日度）",
-        stats.var95_pct, stats.cvar95_pct,
+        "🛡️ 风险值：VaR95={} | CVaR95={}（日度）",
+        stats
+            .var95_pct
+            .map(|value| format!("{value:.2}%"))
+            .unwrap_or_else(|| "暂无".to_string()),
+        stats
+            .cvar95_pct
+            .map(|value| format!("{value:.2}%"))
+            .unwrap_or_else(|| "暂无".to_string()),
     ));
 
     // ── 交易统计 ──
     if stats.total_trades > 0 {
         lines.push(format!(
-            "🎯 胜率：{:.0}% ({}/{}) | 盈亏比：{:.1} | 均盈：{:+.1}% | 均亏：{:.1}%",
-            stats.win_rate,
+            "🎯 胜率：{} ({}/{}) | 盈亏比：{} | 均盈：{} | 均亏：{}",
+            stats
+                .win_rate
+                .map(|value| format!("{value:.0}%"))
+                .unwrap_or_else(|| "暂无".to_string()),
             stats.winning_trades,
             stats.total_trades,
-            stats.profit_factor,
-            stats.avg_win_pct,
-            stats.avg_loss_pct,
+            stats
+                .profit_factor
+                .map(|value| format!("{value:.1}"))
+                .unwrap_or_else(|| "暂无".to_string()),
+            signed_one(stats.avg_win_pct),
+            signed_one(stats.avg_loss_pct),
         ));
     } else {
         lines.push("🎯 暂无已平仓交易记录".to_string());
@@ -64,8 +92,15 @@ pub fn generate_daily_report_with_ledger(
         for r in reviews {
             let emoji = if r.pnl_pct > 0.0 { "🟢" } else { "🔴" };
             let mut detail = format!(
-                "  {} {}({}) 持{}天 {:+.1}%  ¥{:.2}→¥{:.2}",
-                emoji, r.name, r.code, r.holding_days, r.pnl_pct, r.buy_price, r.sell_price,
+                "  {} {}({}) {}股 持{}天 {:+.1}%  ¥{:.2}→¥{:.2}",
+                emoji,
+                r.name,
+                r.code,
+                r.shares,
+                r.holding_days,
+                r.pnl_pct,
+                r.buy_price,
+                r.sell_price,
             );
 
             // 卖出后走势
@@ -97,16 +132,18 @@ pub fn generate_daily_report_with_ledger(
         let today = chrono::Local::now().date_naive();
         for p in holdings {
             let holding_days = (today - p.added_at).num_days().max(0);
-            // v13.10.1 P0-#4: 拉不到实时价时显式标注 "数据不足", 避免误导 (之前用 cost_price 顶替导致浮盈 0.0% 看起来像"持仓未动")
-            let (price, price_note) = match prices.get(&p.code).copied() {
-                Some(v) if (v - p.cost_price).abs() > 0.001 || v == 0.0 => (v, String::new()),
-                _ => (p.cost_price, " 数据不足".to_string()),
+            let Some(price) = prices
+                .get(&p.code)
+                .copied()
+                .filter(|value| value.is_finite() && *value > 0.0)
+            else {
+                lines.push(format!(
+                    "  ⚠️ {}({}) 持{}天 盈亏暂无  成本¥{:.2}→当前价暂无  {}股",
+                    p.name, p.code, holding_days, p.cost_price, p.shares
+                ));
+                continue;
             };
-            let pnl_pct = if p.cost_price > 0.0 {
-                (price - p.cost_price) / p.cost_price * 100.0
-            } else {
-                0.0
-            };
+            let pnl_pct = (price - p.cost_price) / p.cost_price * 100.0;
             let emoji = if pnl_pct > 0.0 {
                 "🔺"
             } else if pnl_pct < -5.0 {
@@ -115,16 +152,8 @@ pub fn generate_daily_report_with_ledger(
                 "→"
             };
             lines.push(format!(
-                "  {} {}({}) 持{}天 {:+.1}%  ¥{:.2}→¥{:.2}  {}股{}",
-                emoji,
-                p.name,
-                p.code,
-                holding_days,
-                pnl_pct,
-                p.cost_price,
-                price,
-                p.shares,
-                price_note,
+                "  {} {}({}) 持{}天 {:+.1}%  ¥{:.2}→¥{:.2}  {}股",
+                emoji, p.name, p.code, holding_days, pnl_pct, p.cost_price, price, p.shares,
             ));
         }
     }
@@ -168,7 +197,9 @@ mod tests {
     #[test]
     fn test_report_formatting() {
         let reviews = vec![TradeReview {
-            code: "000547".into(),
+            buy_trade_id: "buy-1".into(),
+            sell_trade_id: "sell-1".into(),
+            code: "TEST_CODE_000547".into(),
             name: "航天发展".into(),
             buy_date: date("2026-06-01"),
             sell_date: date("2026-06-10"),
@@ -176,6 +207,7 @@ mod tests {
             sell_datetime: ndt("2026-06-10"),
             buy_price: 10.0,
             sell_price: 12.0,
+            shares: 100,
             holding_days: 9,
             pnl_pct: 20.0,
             post_exit_chg_5d: Some(2.1),
@@ -185,26 +217,26 @@ mod tests {
         }];
 
         let stats = EquityStats {
-            total_return_pct: 8.4,
-            annualized_return_pct: 12.0,
-            max_drawdown_pct: 5.2,
-            sharpe_ratio: 0.92,
-            win_rate: 58.0,
+            total_return_pct: Some(8.4),
+            annualized_return_pct: Some(12.0),
+            max_drawdown_pct: Some(5.2),
+            sharpe_ratio: Some(0.92),
+            win_rate: Some(58.0),
             total_trades: 12,
             winning_trades: 7,
-            avg_win_pct: 8.2,
-            avg_loss_pct: -4.1,
-            profit_factor: 2.1,
-            var95_pct: 1.8,
-            cvar95_pct: 2.4,
+            avg_win_pct: Some(8.2),
+            avg_loss_pct: Some(-4.1),
+            profit_factor: Some(2.1),
+            var95_pct: Some(1.8),
+            cvar95_pct: Some(2.4),
         };
 
         let holdings = vec![Position {
-            code: "603618".into(),
+            code: "TEST_CODE_603618".into(),
             name: "杭电股份".into(),
             shares: 1000,
             cost_price: 8.2,
-            hard_stop: 7.5,
+            hard_stop: Some(7.5),
             added_at: date("2026-06-05"),
             status: PositionStatus::Holding,
             sector: "其他".into(),
@@ -212,7 +244,7 @@ mod tests {
         }];
 
         let mut prices = std::collections::HashMap::new();
-        prices.insert("603618".to_string(), 9.0_f64);
+        prices.insert("TEST_CODE_603618".to_string(), 9.0_f64);
         let report = generate_daily_report(&reviews, &stats, &holdings, &prices);
         assert!(report.contains("交易复盘"));
         assert!(report.contains("航天发展"));

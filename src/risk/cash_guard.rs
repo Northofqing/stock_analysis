@@ -65,4 +65,20 @@ mod tests {
         let alert = check_cash(30000.0, 100000.0, &CashGuard::default()).unwrap();
         assert!(!alert.below_floor); // 30% > 15%
     }
+
+    #[test]
+    fn test_non_positive_total_is_rejected() {
+        assert!(check_cash(0.0, 0.0, &CashGuard::default()).is_none());
+        assert!(check_cash(0.0, -1.0, &CashGuard::default()).is_none());
+    }
+
+    #[test]
+    fn test_alert_formatting_covers_both_states() {
+        let below = check_cash(5_000.0, 100_000.0, &CashGuard::default()).unwrap();
+        assert!(format_cash_alert(&below).contains("现金预警"));
+        let healthy = check_cash(30_000.0, 100_000.0, &CashGuard::default()).unwrap();
+        let text = format_cash_alert(&healthy);
+        assert!(text.contains("现金: 30%"));
+        assert!(text.contains("总资产 ¥100000"));
+    }
 }

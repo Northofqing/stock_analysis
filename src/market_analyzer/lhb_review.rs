@@ -26,10 +26,10 @@ pub struct LhbEntryInput {
 
 /// MVP4-4.3 主查询: 取最近 N 天龙虎榜
 ///
-/// 注: 实际查询由 main 循环在 21:00 调; 本函数仅定义接口.
-///     data_source 不稳定时返回空 Vec, 标 degraded.
-pub fn fetch_recent_lhb(_date: NaiveDate, _limit: usize) -> Vec<LhbEntryInput> {
-    Vec::new()
+/// BR-110：当前仓库尚未接入可验证的龙虎榜生产查询源。
+/// 调用方必须看见 unavailable，不能把缺 producer 解释为“当日无数据”。
+pub fn fetch_recent_lhb(_date: NaiveDate, _limit: usize) -> Result<Vec<LhbEntryInput>, String> {
+    Err("unavailable: 龙虎榜生产数据源尚未接入".to_string())
 }
 
 /// 渲染为字符串 (供 bin/monitor 拼接 R-04 模板).
@@ -120,15 +120,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_fetch_returns_empty() {
-        let r = fetch_recent_lhb(NaiveDate::from_ymd_opt(2026, 7, 5).unwrap(), 5);
-        assert!(r.is_empty());
+    fn missing_producer_is_explicitly_unavailable() {
+        let error = fetch_recent_lhb(NaiveDate::from_ymd_opt(2026, 7, 5).unwrap(), 5)
+            .expect_err("未接入龙虎榜 producer 不能伪装成空数据");
+        assert!(error.contains("unavailable"));
     }
 
     #[test]
     fn full_entry_renders_clean() {
         let inp = LhbEntryInput {
-            code: "688001".to_string(),
+            code: "TEST_CODE_688001".to_string(),
             name: "X".to_string(),
             net_buy_yi: 1.5,
             reason: "涨幅偏离值7%".to_string(),
@@ -143,7 +144,7 @@ mod tests {
             next_day_risk: Some("高开震荡".to_string()),
         };
         let s = render_to_string(&inp, 0);
-        assert!(s.contains("X(688001)"));
+        assert!(s.contains("X(TEST_CODE_688001)"));
         assert!(s.contains("净买1.5亿"));
         assert!(s.contains("机构2席8000万"));
         assert!(s.contains("主线一致: 是-AI算力"));
@@ -152,7 +153,7 @@ mod tests {
     #[test]
     fn missing_fields_filled_with_placeholders() {
         let inp = LhbEntryInput {
-            code: "000001".to_string(),
+            code: "TEST_CODE_000001".to_string(),
             name: "Y".to_string(),
             net_buy_yi: 0.5,
             reason: String::new(),

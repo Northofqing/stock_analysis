@@ -128,7 +128,7 @@ pub fn update_sharpe_ratios(
             continue;
         }
 
-        let start_idx = if i + 1 >= window { i + 1 - window } else { 0 };
+        let start_idx = (i + 1).saturating_sub(window);
         let window_data = &kline_data[start_idx..=i];
 
         kline_data[i].sharpe_ratio = calculate_sharpe_ratio(window_data, Some(risk_free), None);

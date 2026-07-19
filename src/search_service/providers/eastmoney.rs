@@ -27,6 +27,12 @@ pub struct EastmoneyNewsProvider {
     client: reqwest::Client,
 }
 
+impl Default for EastmoneyNewsProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EastmoneyNewsProvider {
     pub fn new() -> Self {
         Self {

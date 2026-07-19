@@ -83,6 +83,9 @@ pub trait StrategyResult: Send + Sync {
     }
 }
 
+/// 单个注册策略的一次运行结果：策略名、权重与类型擦除后的回测结果。
+pub type StrategyRun = (&'static str, f64, Result<Box<dyn StrategyResult>>);
+
 // ────────────────────────────── K 线策略 trait ──────────────────────────────
 
 /// K 线策略接口（object-safe）
@@ -200,10 +203,7 @@ impl HybridStrategy {
     ///
     /// **当前行为**：各策略独立运行，互不干扰，分别返回结果  
     /// **扩展点**：可在此对 `StrategyResult::to_summary()` 进行加权聚合
-    pub fn run_all(
-        &self,
-        stocks: &[(String, String, Vec<KlineData>)],
-    ) -> Vec<(&'static str, f64, Result<Box<dyn StrategyResult>>)> {
+    pub fn run_all(&self, stocks: &[(String, String, Vec<KlineData>)]) -> Vec<StrategyRun> {
         self.strategies
             .iter()
             .map(|(strategy, weight)| {

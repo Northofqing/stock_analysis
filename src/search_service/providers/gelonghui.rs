@@ -16,6 +16,12 @@ pub struct GelonghuiProvider {
     client: reqwest::Client,
 }
 
+impl Default for GelonghuiProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GelonghuiProvider {
     pub fn new() -> Self {
         Self {

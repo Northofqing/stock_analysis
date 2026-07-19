@@ -8,20 +8,29 @@ pub struct MomentumStrategy;
 
 impl Strategy for MomentumStrategy {
     impl_strategy_id!(MomentumStrategy, "Momentum");
-    fn virtual_reason(&self) -> &'static str { "Momentum" }
-    fn description(&self) -> &'static str { "动量整合 (air_refuel 形态分 ≥ 7 AND 3 指标金叉共振)" }
+    fn virtual_reason(&self) -> &'static str {
+        "Momentum"
+    }
+    fn description(&self) -> &'static str {
+        "动量整合 (air_refuel 形态分 ≥ 7 AND 3 指标金叉共振)"
+    }
     fn score(&self, input: &StrategyInput) -> Option<StrategyOutput> {
         if input.push_kind != "Momentum" {
             return None;
         }
-        let m = _helpers::parse(&input.metric_json, &input.code, input.push_price);
-        if m.vol_ratio < 5.0 || m.price_chg_pct <= 0.0 || m.quote_price <= 0.0 {
+        let m = _helpers::parse(&input.metric_json, &input.code, input.push_price).ok()?;
+        let vol_ratio = m.vol_ratio?;
+        let price_chg_pct = m.price_chg_pct?;
+        if vol_ratio < 5.0 || price_chg_pct <= 0.0 {
             return None;
         }
-        let score = 8.0 + m.price_chg_pct.min(5.0) * 0.2;
+        let score = 8.0 + price_chg_pct.min(5.0) * 0.2;
         Some(StrategyOutput {
             score: score.min(9.5),
-            reason: format!("Momentum 强共振 vol={:.1} chg={:.1}% quote={:.1}", m.vol_ratio, m.price_chg_pct, m.quote_price),
+            reason: format!(
+                "Momentum 强共振 vol={:.1} chg={:.1}% quote={:.1}",
+                vol_ratio, price_chg_pct, input.push_price
+            ),
             virtual_reason: "Momentum".into(),
         })
     }

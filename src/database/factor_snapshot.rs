@@ -53,6 +53,10 @@ impl<'a> FactorSnapshotDao<'a> {
     }
 
     /// 写入或替换某 (code, snapshot_date) 的因子
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "database row boundary mirrors the persisted factor_snapshot columns"
+    )]
     pub fn upsert(
         &mut self,
         code: &str,
@@ -162,7 +166,7 @@ mod tests {
         {
             let mut dao = FactorSnapshotDao::new(&mut conn);
             dao.upsert(
-                "600000",
+                "TEST_CODE_600000",
                 "2026-06-01",
                 Some(12.5),
                 Some(1.2),
@@ -173,7 +177,7 @@ mod tests {
             )
             .unwrap();
             dao.upsert(
-                "600000",
+                "TEST_CODE_600000",
                 "2026-06-02",
                 Some(13.0),
                 Some(1.3),
@@ -186,12 +190,18 @@ mod tests {
         }
         {
             let mut dao = FactorSnapshotDao::new(&mut conn);
-            let f = dao.get_as_of("600000", "2026-06-01").unwrap().unwrap();
+            let f = dao
+                .get_as_of("TEST_CODE_600000", "2026-06-01")
+                .unwrap()
+                .unwrap();
             assert!((f.pe_ttm.unwrap() - 12.5).abs() < 1e-6);
         }
         {
             let mut dao = FactorSnapshotDao::new(&mut conn);
-            let f = dao.get_as_of("600000", "2026-06-02").unwrap().unwrap();
+            let f = dao
+                .get_as_of("TEST_CODE_600000", "2026-06-02")
+                .unwrap()
+                .unwrap();
             assert!((f.pe_ttm.unwrap() - 13.0).abs() < 1e-6);
         }
     }
@@ -202,7 +212,7 @@ mod tests {
         {
             let mut dao = FactorSnapshotDao::new(&mut conn);
             dao.upsert(
-                "600000",
+                "TEST_CODE_600000",
                 "2026-06-01",
                 Some(12.5),
                 None,
@@ -216,7 +226,10 @@ mod tests {
         {
             let mut dao = FactorSnapshotDao::new(&mut conn);
             // 2026-06-03 还没有快照, 应回退到 2026-06-01
-            let f = dao.get_as_of("600000", "2026-06-03").unwrap().unwrap();
+            let f = dao
+                .get_as_of("TEST_CODE_600000", "2026-06-03")
+                .unwrap()
+                .unwrap();
             assert!((f.pe_ttm.unwrap() - 12.5).abs() < 1e-6);
         }
     }
@@ -227,7 +240,7 @@ mod tests {
         {
             let mut dao = FactorSnapshotDao::new(&mut conn);
             dao.upsert(
-                "600000",
+                "TEST_CODE_600000",
                 "2026-06-01",
                 Some(12.5),
                 None,
@@ -239,7 +252,7 @@ mod tests {
             .unwrap();
             // 事后填入的"未来"快照
             dao.upsert(
-                "600000",
+                "TEST_CODE_600000",
                 "2026-06-10",
                 Some(99.9),
                 None,
@@ -253,7 +266,10 @@ mod tests {
         {
             let mut dao = FactorSnapshotDao::new(&mut conn);
             // 在 2026-06-05 查询, 应得到 06-01 的值, 绝不能是 06-10
-            let f = dao.get_as_of("600000", "2026-06-05").unwrap().unwrap();
+            let f = dao
+                .get_as_of("TEST_CODE_600000", "2026-06-05")
+                .unwrap()
+                .unwrap();
             assert!((f.pe_ttm.unwrap() - 12.5).abs() < 1e-6);
         }
     }
@@ -262,7 +278,7 @@ mod tests {
     fn missing_stock_returns_none() {
         let mut conn = in_memory_conn();
         let mut dao = FactorSnapshotDao::new(&mut conn);
-        let f = dao.get_as_of("999999", "2026-06-01").unwrap();
+        let f = dao.get_as_of("TEST_CODE_999999", "2026-06-01").unwrap();
         assert!(f.is_none());
     }
 
@@ -270,7 +286,7 @@ mod tests {
     fn no_snapshots_at_all() {
         let mut conn = in_memory_conn();
         let mut dao = FactorSnapshotDao::new(&mut conn);
-        let f = dao.get_as_of("600000", "2026-06-01").unwrap();
+        let f = dao.get_as_of("TEST_CODE_600000", "2026-06-01").unwrap();
         assert!(f.is_none());
     }
 }

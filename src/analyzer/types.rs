@@ -160,10 +160,10 @@ pub struct GeminiConfig {
     pub retry_delay: f64,
     /// 请求前延迟（秒）
     pub request_delay: f64,
-    /// OpenAI 兼容 API 配置
-    pub openai_api_key: Option<String>,
-    pub openai_base_url: Option<String>,
-    pub openai_model: String,
+    /// DeepSeek API 配置
+    pub deepseek_api_key: Option<String>,
+    pub deepseek_base_url: Option<String>,
+    pub deepseek_model: String,
     /// 豆包 (Doubao) API 配置
     pub doubao_api_key: Option<String>,
     pub doubao_base_url: Option<String>,
@@ -182,10 +182,10 @@ pub struct GeminiConfig {
     pub doubao_quick_model: Option<String>,
     /// deep 模式下豆包模型名（不设则用 doubao_model）
     pub doubao_deep_model: Option<String>,
-    /// quick 模式下 OpenAI 模型名（不设则用 openai_model）
-    pub openai_quick_model: Option<String>,
-    /// deep 模式下 OpenAI 模型名（不设则用 openai_model）
-    pub openai_deep_model: Option<String>,
+    /// quick 模式下 DeepSeek 模型名（不设则用 deepseek_model）
+    pub deepseek_quick_model: Option<String>,
+    /// deep 模式下 DeepSeek 模型名（不设则用 deepseek_model）
+    pub deepseek_deep_model: Option<String>,
     /// 多空辩论轮数（AI_DEBATE_ROUNDS, 1-3, 默认 2）
     pub debate_rounds: u32,
     /// Agent 追踪日志开关（AI_AGENT_TRACE）
@@ -210,9 +210,9 @@ impl Default for GeminiConfig {
             max_retries: 3,
             retry_delay: 5.0,
             request_delay: 1.0,
-            openai_api_key: None,
-            openai_base_url: None,
-            openai_model: "gpt-4".to_string(),
+            deepseek_api_key: None,
+            deepseek_base_url: None,
+            deepseek_model: "deepseek-chat".to_string(),
             doubao_api_key: None,
             doubao_base_url: Some("https://ark.cn-beijing.volces.com/api/v3".to_string()),
             doubao_model: "ep-20241230184254-j6pvd".to_string(),
@@ -222,8 +222,8 @@ impl Default for GeminiConfig {
             gemini_deep_model: None,
             doubao_quick_model: None,
             doubao_deep_model: None,
-            openai_quick_model: None,
-            openai_deep_model: None,
+            deepseek_quick_model: None,
+            deepseek_deep_model: None,
             debate_rounds: 2,
             agent_trace: false,
         }

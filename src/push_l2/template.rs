@@ -96,19 +96,13 @@ pub enum DataMode {
 /// 数据契约验证失败处理策略 (b-009 R-1 修订: 仅 Drop + RetryWithBackoff)
 ///
 /// **红线**: DegradeWithDefault / DegradeWithNa 已从 v14.2 删除 (触犯 AGENTS.md §2.1/§2.2)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FailureStrategy {
     /// 验证失败 → 丢弃 + log warn (合规默认)
+    #[default]
     Drop,
     /// 重试 max_retries 次后仍失败 → 丢弃 + log error
     RetryWithBackoff { max_retries: u32, backoff_ms: u64 },
-}
-
-impl Default for FailureStrategy {
-    fn default() -> Self {
-        // b-009 R-1: 合规默认 = Drop, 绝不静默填默认值
-        Self::Drop
-    }
 }
 
 /// 验证 trait (W3.1 占位, L3 Render 模块补具体实现)
@@ -205,7 +199,11 @@ impl BannerContext {
             DataMode::Unsafe => " ⚠️数据不安全",
             DataMode::Down => " ⛔数据全挂",
         };
-        let quiet_marker = if self.is_quiet_hour { " 🌙静默期" } else { "" };
+        let quiet_marker = if self.is_quiet_hour {
+            " 🌙静默期"
+        } else {
+            ""
+        };
         format!(
             "📡 {} v{} | {}{}{}",
             self.template_id, self.template_version, ts_str, data_marker, quiet_marker

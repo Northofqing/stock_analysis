@@ -64,41 +64,51 @@ fn bench_intraday_tick(c: &mut Criterion) {
     // 纯函数 mock (不依赖 DB)
     let codes: Vec<String> = (0..50).map(|i| format!("60{:04}", i)).collect();
     let advice_map = build_mock_advice_map(&codes);
-    c.bench_function("intraday_monitor::tick mock (50 候选)", |b| b.iter(|| {
-        let _ = compute_decisions_mock(&advice_map, &codes);
-    }));
+    c.bench_function("intraday_monitor::tick mock (50 候选)", |b| {
+        b.iter(|| {
+            let _ = compute_decisions_mock(&advice_map, &codes);
+        })
+    });
 }
 
 fn bench_4_iron_rules_check(c: &mut Criterion) {
     let codes: Vec<String> = (0..50).map(|i| format!("60{:04}", i)).collect();
     let advice_map = build_mock_advice_map(&codes);
-    c.bench_function("paper_engine::check_4_iron_rules mock (50 持仓)", |b| b.iter(|| {
-        let _ = compute_decisions_mock(&advice_map, &codes);
-    }));
+    c.bench_function("paper_engine::check_4_iron_rules mock (50 持仓)", |b| {
+        b.iter(|| {
+            let _ = compute_decisions_mock(&advice_map, &codes);
+        })
+    });
 }
 
 fn bench_performance_snapshot(c: &mut Criterion) {
     // 纯函数 mock: 100 笔 paper_trades → snapshot (Sharpe/Sortino 计算)
     let pnls: Vec<f64> = (0..100).map(|i| (i as f64 - 50.0) * 0.5).collect();
-    c.bench_function("PerformanceEngine::snapshot mock (100 笔)", |b| b.iter(|| {
-        // mock Sharpe: mean / stddev (10us)
-        let n = pnls.len() as f64;
-        let mean: f64 = pnls.iter().sum::<f64>() / n;
-        let var: f64 = pnls.iter().map(|p| (p - mean).powi(2)).sum::<f64>() / n;
-        let _sharpe = if var > 0.0 { mean / var.sqrt() } else { 0.0 };
-    }));
+    c.bench_function("PerformanceEngine::snapshot mock (100 笔)", |b| {
+        b.iter(|| {
+            // mock Sharpe: mean / stddev (10us)
+            let n = pnls.len() as f64;
+            let mean: f64 = pnls.iter().sum::<f64>() / n;
+            let var: f64 = pnls.iter().map(|p| (p - mean).powi(2)).sum::<f64>() / n;
+            let _sharpe = if var > 0.0 { mean / var.sqrt() } else { 0.0 };
+        })
+    });
 }
 
 fn bench_quote_provider(c: &mut Criterion) {
     // mock QuoteProvider (不依赖真 broker, 纯函数)
-    let cache: HashMap<String, f64> = (0..100).map(|i| (format!("60{:04}", i), 1680.0 + i as f64)).collect();
-    c.bench_function("QuoteProvider::get_quote_price mock (100 缓存)", |b| b.iter(|| {
-        let mut sum = 0.0;
-        for (k, v) in &cache {
-            sum += cache.get(k).unwrap_or(v);
-        }
-        let _ = sum;
-    }));
+    let cache: HashMap<String, f64> = (0..100)
+        .map(|i| (format!("60{:04}", i), 1680.0 + i as f64))
+        .collect();
+    c.bench_function("QuoteProvider::get_quote_price mock (100 缓存)", |b| {
+        b.iter(|| {
+            let mut sum = 0.0;
+            for (k, v) in &cache {
+                sum += cache.get(k).unwrap_or(v);
+            }
+            let _ = sum;
+        })
+    });
 }
 
 criterion_group!(

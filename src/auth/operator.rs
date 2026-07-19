@@ -1,3 +1,4 @@
+//! Registered business rules: BR-074.
 //! CLI operator 密码认证 (PAM / 系统用户)
 //!
 //! monitor / winrate_simulator / live CLI 启动前调用 [`require_monitor_operator_auth`],
@@ -52,7 +53,7 @@ pub fn load_auth_config() -> OperatorAuthConfig {
         expected_operator: std::env::var("MONITOR_OPERATOR")
             .ok()
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| whoami::username()),
+            .unwrap_or_else(whoami::username),
         pam_service: std::env::var("MONITOR_PAM_SERVICE").unwrap_or_else(|_| "login".to_string()),
         // CR-AUTH 默认禁用: 单机 single-user 友好 (不打扰), 生产 cron 显式 MONITOR_AUTH_REQUIRED=1 启用
         // "1" → true (要求 PAM 认证); 其它 (unset / "0" / 其他值) → false (跳过)

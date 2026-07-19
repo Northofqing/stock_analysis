@@ -33,6 +33,12 @@ pub struct ClsProvider {
     client: reqwest::Client,
 }
 
+impl Default for ClsProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ClsProvider {
     pub fn new() -> Self {
         Self {
@@ -76,7 +82,7 @@ impl ClsProvider {
             .map(|m| m.into_values().collect())
             .unwrap_or_default();
 
-        items.sort_by(|a, b| b.ctime.unwrap_or(0).cmp(&a.ctime.unwrap_or(0)));
+        items.sort_by_key(|item| std::cmp::Reverse(item.ctime.unwrap_or(0)));
 
         let now_ts = chrono::Local::now().timestamp();
         let mut out = Vec::new();

@@ -1,3 +1,4 @@
+//! Registered business rules: BR-044.
 //! 修复 P0-3: launch_gate 上线门槛测试
 //! 量化产品经理要求:
 //!  - 沙盘 → 灰度: 12 周 + 200 样本 + 60% 胜率 + Calmar 1.0
@@ -77,6 +78,13 @@ fn test_gray_back_to_shadow_underperformance() {
     m.gray_days = 30;
     let next = LaunchGate::check_transition(LaunchStage::Gray, &m);
     assert_eq!(next, Some(LaunchStage::Shadow));
+}
+
+#[test]
+fn test_gray_at_fifty_percent_does_not_auto_rollback() {
+    let mut m = metrics(84, 250, 0.50, 1.2);
+    m.gray_days = 30;
+    assert_eq!(LaunchGate::check_transition(LaunchStage::Gray, &m), None);
 }
 
 #[test]

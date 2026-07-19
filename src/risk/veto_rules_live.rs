@@ -456,8 +456,10 @@ mod tests {
 
     #[test]
     fn test_build_chain_disabled() {
-        let mut config = VetoChainConfig::default();
-        config.enabled = false;
+        let config = VetoChainConfig {
+            enabled: false,
+            ..VetoChainConfig::default()
+        };
         assert!(build_chain(&config).is_none());
     }
 
@@ -470,9 +472,11 @@ mod tests {
 
     #[test]
     fn test_build_chain_partial() {
-        let mut config = VetoChainConfig::default();
-        config.main_flow_enabled = false;
-        config.fundamental_enabled = false;
+        let config = VetoChainConfig {
+            main_flow_enabled: false,
+            fundamental_enabled: false,
+            ..VetoChainConfig::default()
+        };
         let chain = build_chain(&config).unwrap();
         assert_eq!(chain.len(), 1); // 仅 BiasRateRule
     }

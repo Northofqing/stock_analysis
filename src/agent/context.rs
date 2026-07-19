@@ -22,7 +22,28 @@ impl ContextManager {
         self.facts.get(key)
     }
 
+    pub fn remove_fact(&mut self, key: &str) -> Option<Value> {
+        self.facts.remove(key)
+    }
+
     pub fn log_event(&mut self, event: &str) {
         self.scratchpad.push(event.to_string());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_tool_can_remove_stale_fact() {
+        let mut context = ContextManager::new();
+        context.insert_fact(
+            "fetch_financials",
+            serde_json::json!({"gross_margin": 30.0}),
+        );
+        let removed = context.remove_fact("fetch_financials");
+        assert!(removed.is_some());
+        assert!(context.get_fact("fetch_financials").is_none());
     }
 }

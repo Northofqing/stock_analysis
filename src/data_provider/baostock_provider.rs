@@ -1,3 +1,4 @@
+//! Registered business rules: BR-065.
 //! Baostock 数据源实现 (Task 13 — TCP 协议重写, 修复 C1 critical bug).
 //!
 //! **协议**: TCP socket 自定义协议, 不是 HTTP!
@@ -24,7 +25,7 @@ use chrono::NaiveDate;
 use flate2::read::ZlibDecoder;
 use std::io::Read;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
@@ -40,7 +41,7 @@ pub const BAOSTOCK_VERSION: &str = "00.9.20";
 pub const BAOSTOCK_USER: &str = "anonymous";
 pub const BAOSTOCK_PASS: &str = "888888";
 /// 默认查询 K 线 fields (跟 Task 6 保持一致).
-pub const BAOSTOCK_KLINE_FIELDS: &str = "date,open,high,low,close,volume,amount";
+pub const BAOSTOCK_KLINE_FIELDS: &str = "date,open,high,low,close,volume,amount,pctChg";
 /// 复权 flag: 2 = 前复权 (跟 Task 6 build_kline_query_body 一致).
 pub const BAOSTOCK_ADJUST_FLAG_QFQ: &str = "2";
 /// 默认频率 (日线).
@@ -210,22 +211,16 @@ pub fn parse_baostock_tcp_response(buf: &[u8]) -> Result<BaostockTcpMessage> {
         .map_err(|e| anyhow!("Baostock TCP 响应: body_len 解析失败: {e}"))?;
 
     // 2. 解析 body
-    let body_bytes = if msg_type == MSG_TYPE_KLINE_RESP {
-        // 压缩响应: [21 : 21 + body_len]
-        if 21 + body_len > buf.len() {
-            return Err(anyhow!(
-                "Baostock TCP 响应: 压缩 body 截断 (need {body_len} @ 21, have {})",
-                buf.len().saturating_sub(21)
-            ));
-        }
-        &buf[21..21 + body_len]
-    } else {
-        // 非压缩: [21 : -1] (剥末尾 `\n`) — 跟 Python 一致
-        if buf.len() < 22 {
-            return Err(anyhow!("Baostock TCP 响应: 非压缩 body 截断"));
-        }
-        &buf[21..buf.len() - 1]
-    };
+    if 21 + body_len > buf.len() {
+        return Err(anyhow!(
+            "Baostock TCP 响应: body 截断 (need {body_len} @ 21, have {})",
+            buf.len().saturating_sub(21)
+        ));
+    }
+    // Both compressed and plain frames declare the exact body length. Reading
+    // the plain body to `buf.len() - 1` also swallowed the CRC and completion
+    // marker, corrupting session ids returned by a complete network frame.
+    let body_bytes = &buf[21..21 + body_len];
 
     // 3. msg_type="96" → zlib 解压
     let body_str = if msg_type == MSG_TYPE_KLINE_RESP {
@@ -269,10 +264,10 @@ pub fn parse_baostock_tcp_response(buf: &[u8]) -> Result<BaostockTcpMessage> {
 ///
 /// review #16 P0 #3: 之前无 timeout, 服务端挂起会永久 await 任务泄漏.
 /// 现 wrap 在 `tokio::time::timeout` 里, 超时返 Err 让上层重连.
-pub async fn read_tcp_response(
-    stream: &mut TcpStream,
-    timeout: std::time::Duration,
-) -> Result<Vec<u8>> {
+pub async fn read_tcp_response<R>(stream: &mut R, timeout: std::time::Duration) -> Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
     let read = async {
         let mut buf = Vec::with_capacity(4096);
         let mut chunk = [0u8; 4096];
@@ -331,14 +326,14 @@ pub fn parse_baostock_response_kline(body: &str, our_code: &str) -> Result<Vec<K
 ///
 /// 输入格式 (实测):
 /// ```text
-/// code,date,open,high,low,close,volume,amount
-/// sh.600000,2024-01-15,13.50,13.60,13.45,13.55,12345,16789.50
+/// date,open,high,low,close,volume,amount,pctChg
+/// 2024-01-15,13.50,13.60,13.45,13.55,12345,16789.50,0.37
 /// ```
 ///
 /// - 第 1 行是表头, 后续每行 1 条 K线.
 /// - `date` 格式 `"YYYY-MM-DD"`.
-/// - 解析失败的字段回退为 0.0 / 今天 (不抛 Err, 保证解析容错).
-pub fn parse_kline_body(body: &str, _our_code: &str) -> Result<Vec<KlineData>> {
+/// - 任一必填字段解析失败或整批质检失败都显式返回错误 (BR-092).
+pub fn parse_kline_body(body: &str, our_code: &str) -> Result<Vec<KlineData>> {
     let mut lines = body.lines();
     let header_line = lines
         .next()
@@ -358,30 +353,50 @@ pub fn parse_kline_body(body: &str, _our_code: &str) -> Result<Vec<KlineData>> {
     let i_close = idx("close")?;
     let i_volume = idx("volume")?;
     let i_amount = idx("amount")?;
+    let i_pct_chg = idx("pctChg")?;
 
     let mut result = Vec::new();
-    for line in lines {
+    for (line_index, line) in lines.enumerate() {
         if line.trim().is_empty() {
             continue;
         }
         let fields: Vec<&str> = line.split(',').collect();
-        if fields.len() < 7 {
-            continue;
-        }
-
-        let date = NaiveDate::parse_from_str(fields[i_date], "%Y-%m-%d")
-            .unwrap_or_else(|_| chrono::Local::now().date_naive());
-        let open: f64 = fields[i_open].parse().unwrap_or(0.0);
-        let high: f64 = fields[i_high].parse().unwrap_or(0.0);
-        let low: f64 = fields[i_low].parse().unwrap_or(0.0);
-        let close: f64 = fields[i_close].parse().unwrap_or(0.0);
-        let volume: f64 = fields[i_volume].parse().unwrap_or(0.0);
-        let amount: f64 = fields[i_amount].parse().unwrap_or(0.0);
-        let pct_chg = if open > 0.0 {
-            (close - open) / open * 100.0
-        } else {
-            0.0
+        let field = |index: usize, name: &str| -> Result<&str> {
+            fields
+                .get(index)
+                .copied()
+                .map(str::trim)
+                .ok_or_else(|| anyhow!("Baostock K线第 {} 行缺 {} 字段", line_index + 2, name))
         };
+        let parse_number = |index: usize, name: &str| -> Result<f64> {
+            let raw = field(index, name)?;
+            raw.parse::<f64>().map_err(|error| {
+                anyhow!(
+                    "Baostock K线第 {} 行 {}='{}' 解析失败: {}",
+                    line_index + 2,
+                    name,
+                    raw,
+                    error
+                )
+            })
+        };
+
+        let raw_date = field(i_date, "date")?;
+        let date = NaiveDate::parse_from_str(raw_date, "%Y-%m-%d").map_err(|error| {
+            anyhow!(
+                "Baostock K线第 {} 行 date='{}' 解析失败: {}",
+                line_index + 2,
+                raw_date,
+                error
+            )
+        })?;
+        let open = parse_number(i_open, "open")?;
+        let high = parse_number(i_high, "high")?;
+        let low = parse_number(i_low, "low")?;
+        let close = parse_number(i_close, "close")?;
+        let volume = parse_number(i_volume, "volume")?;
+        let amount = parse_number(i_amount, "amount")?;
+        let pct_chg = parse_number(i_pct_chg, "pctChg")?;
 
         result.push(KlineData {
             date,
@@ -416,7 +431,7 @@ pub fn parse_kline_body(body: &str, _our_code: &str) -> Result<Vec<KlineData>> {
             adjust: AdjustType::Qfq,
         });
     }
-    let _ = _our_code;
+    super::validate_kline_series_strict(&mut result, our_code)?;
     Ok(result)
 }
 
@@ -551,10 +566,11 @@ impl BaostockProvider {
                 parsed.msg_type
             ));
         }
-        let error_code = parse_baostock_response(&parsed.body, "error_code")?
+        let response_body = strip_cdata(&parsed.body);
+        let error_code = parse_baostock_response(response_body, "error_code")?
             .ok_or_else(|| anyhow!("Baostock K线: 无 error_code"))?;
         if error_code != "0" {
-            let msg = parse_baostock_response(&parsed.body, "error_msg")?.unwrap_or_default();
+            let msg = parse_baostock_response(response_body, "error_msg")?.unwrap_or_default();
             return Err(anyhow!("Baostock K线失败: code={error_code} msg={msg}"));
         }
         parse_baostock_response_kline(&parsed.body, code)
@@ -594,13 +610,13 @@ pub const BAOSTOCK_DEFAULT_BASE: &str = "http://baostock.com/baostock";
 /// 兼容名: 构造登录 URL (Task 5 HTTP 误实现的痕迹, 不再使用).
 #[deprecated(note = "Baostock 协议是 TCP; 用 build_login_msg")]
 pub fn build_login_url() -> String {
-    format!("{BAOSTOCK_DEFAULT_BASE}/Login")
+    "http://baostock.com/baostock/Login".to_string()
 }
 
 /// 兼容名: 构造登出 URL (Task 5 HTTP 误实现的痕迹, 不再使用).
 #[deprecated(note = "Baostock 协议是 TCP; 用 build_login_msg")]
 pub fn build_logout_url() -> String {
-    format!("{BAOSTOCK_DEFAULT_BASE}/Logout")
+    "http://baostock.com/baostock/Logout".to_string()
 }
 
 /// 兼容名: 构造 K线查询 body (HTTP form-encoded 风格, 不再使用).
@@ -633,6 +649,68 @@ pub fn parse_baostock_response(body: &str, key: &str) -> Result<Option<String>> 
 #[cfg(test)]
 mod inline_tests {
     use super::*;
+    use flate2::{write::ZlibEncoder, Compression};
+    use std::io::Write;
+
+    fn response_frame(msg_type: &str, body: &[u8], crc: Option<u32>) -> Vec<u8> {
+        let mut frame =
+            format!("{}\x01{}\x01{:010}", BAOSTOCK_VERSION, msg_type, body.len()).into_bytes();
+        frame.extend_from_slice(body);
+        if let Some(crc) = crc {
+            frame.push(b'\x01');
+            frame.extend_from_slice(crc.to_string().as_bytes());
+            frame.push(b'\n');
+            frame.extend_from_slice(RESPONSE_END_MARKER);
+        } else {
+            frame.push(b'\n');
+        }
+        frame
+    }
+
+    fn valid_csv() -> &'static str {
+        "date,open,high,low,close,volume,amount,pctChg\n\
+         2026-07-15,10.00,10.20,9.90,10.00,1000,100000,0.0\n\
+         2026-07-16,10.00,10.20,9.95,10.10,1100,101000,1.0"
+    }
+
+    fn compressed_kline_frame(msg_type: &str, error_code: &str) -> Vec<u8> {
+        let raw = format!(
+            "<![CDATA[error_code={error_code}\nerror_msg={}\n{}]]>",
+            if error_code == "0" {
+                "success"
+            } else {
+                "rejected"
+            },
+            valid_csv()
+        );
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(raw.as_bytes()).unwrap();
+        response_frame(msg_type, &encoder.finish().unwrap(), Some(12345))
+    }
+
+    fn spawn_tcp_responder(
+        responses: Vec<Vec<u8>>,
+    ) -> (u16, std::thread::JoinHandle<Vec<Vec<u8>>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut requests = Vec::new();
+            for response in responses {
+                let mut buf = [0_u8; 4096];
+                let size = stream.read(&mut buf).unwrap();
+                assert!(size > 21, "provider request must contain a complete frame");
+                requests.push(buf[..size].to_vec());
+                stream.write_all(&response).unwrap();
+                stream.flush().unwrap();
+            }
+            requests
+        });
+        (port, handle)
+    }
 
     /// `BAOSTOCK_HOST` / `BAOSTOCK_PORT` 必须是稳定的 TCP endpoint.
     #[test]
@@ -664,6 +742,7 @@ mod inline_tests {
     #[test]
     fn crc32_empty_is_zero() {
         assert_eq!(baostock_crc32(b""), 0);
+        assert_eq!(baostock_crc32(b"123456789"), 0xcbf4_3926);
     }
 
     /// `parse_baostock_response` 容忍尾部空白和 `\r\n`.
@@ -674,5 +753,301 @@ mod inline_tests {
             parse_baostock_response(body, "session_id").unwrap(),
             Some("XYZ".to_string())
         );
+        assert_eq!(parse_baostock_response(body, "missing").unwrap(), None);
+    }
+
+    #[test]
+    fn request_builders_preserve_protocol_fields_and_character_length() {
+        let unicode = build_tcp_message(BAOSTOCK_VERSION, MSG_TYPE_LOGIN_REQ, "中");
+        assert_eq!(&unicode[11..21], b"0000000001");
+        assert!(build_login_msg("login").starts_with("00.9.20\x0100\x01"));
+        assert_eq!(
+            build_logout_body("anonymous", "888888", "ignored"),
+            "login\x01anonymous\x01888888\x011"
+        );
+
+        let body = build_kline_request_body(
+            "sh.600519",
+            BAOSTOCK_KLINE_FIELDS,
+            "2026-07-15",
+            "2026-07-16",
+            "SESSION",
+        );
+        assert_eq!(
+            body,
+            "query_history_k_data_plus\x01SESSION\x011\x01000\x01sh.600519\x01date,open,high,low,close,volume,amount,pctChg\x012026-07-15\x012026-07-16\x01d\x012"
+        );
+        let frame = build_kline_query_frame(
+            "sh.600519",
+            BAOSTOCK_KLINE_FIELDS,
+            "2026-07-15",
+            "2026-07-16",
+            "SESSION",
+        );
+        assert!(frame.starts_with(b"00.9.20\x0195\x01"));
+    }
+
+    #[test]
+    fn tcp_parser_handles_plain_and_zlib_responses() {
+        let plain = response_frame(MSG_TYPE_LOGIN_RESP, b"session_id=SESSION", None);
+        let parsed = parse_baostock_tcp_response(&plain).expect("plain login response");
+        assert_eq!(parsed.version, BAOSTOCK_VERSION);
+        assert_eq!(parsed.msg_type, MSG_TYPE_LOGIN_RESP);
+        assert_eq!(parsed.body, "session_id=SESSION");
+        assert_eq!(parsed.crc32, 0);
+
+        let raw = format!("<![CDATA[error_code=0\n{}]]>", valid_csv());
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(raw.as_bytes()).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let zipped = response_frame(MSG_TYPE_KLINE_RESP, &compressed, Some(12345));
+        let parsed = parse_baostock_tcp_response(&zipped).expect("zlib kline response");
+        assert_eq!(parsed.msg_type, MSG_TYPE_KLINE_RESP);
+        assert_eq!(parsed.body, raw);
+        assert_eq!(parsed.crc32, 12345);
+    }
+
+    #[test]
+    fn tcp_parser_rejects_bad_headers_lengths_and_compression() {
+        assert!(parse_baostock_tcp_response(b"short").is_err());
+
+        let mut bad_utf8 = vec![b'x'; 22];
+        bad_utf8[0] = 0xff;
+        assert!(parse_baostock_tcp_response(&bad_utf8).is_err());
+
+        let bad_fields = b"00.9.20xxxxxxxxxxxxx\n";
+        assert!(parse_baostock_tcp_response(bad_fields).is_err());
+
+        let bad_length = b"00.9.20\x0196\x01not-a-len!x\n";
+        assert!(parse_baostock_tcp_response(bad_length).is_err());
+
+        let truncated = format!("{}\x0196\x01{:010}", BAOSTOCK_VERSION, 20).into_bytes();
+        assert!(parse_baostock_tcp_response(&truncated).is_err());
+
+        let invalid_zlib = response_frame(MSG_TYPE_KLINE_RESP, b"not-zlib", Some(1));
+        assert!(parse_baostock_tcp_response(&invalid_zlib).is_err());
+    }
+
+    #[tokio::test]
+    async fn streaming_reader_covers_completion_eof_timeout_and_size_limit() {
+        let (mut reader, mut writer) = tokio::io::duplex(64);
+        let producer = tokio::spawn(async move {
+            writer.write_all(b"part-one").await.unwrap();
+            writer.write_all(b"part-two").await.unwrap();
+            writer.write_all(RESPONSE_END_MARKER).await.unwrap();
+        });
+        let bytes = read_tcp_response(&mut reader, std::time::Duration::from_secs(1))
+            .await
+            .expect("chunked response completes");
+        producer.await.unwrap();
+        assert!(bytes.starts_with(b"part-onepart-two"));
+        assert!(bytes.ends_with(RESPONSE_END_MARKER));
+
+        let (mut reader, mut writer) = tokio::io::duplex(16);
+        writer.write_all(b"partial").await.unwrap();
+        drop(writer);
+        assert!(
+            read_tcp_response(&mut reader, std::time::Duration::from_secs(1))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("中途关闭")
+        );
+
+        let (mut reader, _writer) = tokio::io::duplex(16);
+        assert!(
+            read_tcp_response(&mut reader, std::time::Duration::from_millis(1))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("读取超时")
+        );
+
+        let (mut reader, mut writer) = tokio::io::duplex(8192);
+        let producer = tokio::spawn(async move {
+            writer.write_all(&vec![b'x'; 1_048_577]).await.unwrap();
+        });
+        assert!(
+            read_tcp_response(&mut reader, std::time::Duration::from_secs(3))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("响应超")
+        );
+        producer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tcp_provider_fails_closed_when_the_real_endpoint_is_unreachable() {
+        let provider = BaostockProvider {
+            stream: Arc::new(Mutex::new(None)),
+            session: Mutex::new(None),
+            host: "127.0.0.1".to_string(),
+            port: 9,
+        };
+        assert!(provider
+            .send_and_recv(b"TEST_CODE_FRAME")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("未连接"));
+        assert!(provider.ensure_session().await.is_err());
+        assert!(provider
+            .fetch_kline_async("TEST_CODE_000001", 5)
+            .await
+            .is_err());
+        provider.logout("TEST_CODE_SESSION").await;
+        assert_eq!(provider.name(), "baostock");
+        assert_eq!(provider.get_stock_name("TEST_CODE_000001"), None);
+        assert!(provider
+            .get_realtime_quote("TEST_CODE_000001")
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn loopback_tcp_executes_login_session_reuse_and_complete_kline_query() {
+        let login = response_frame(
+            MSG_TYPE_LOGIN_RESP,
+            b"error_code=0\nerror_msg=success\nsession_id=TEST_CODE_SESSION",
+            Some(12345),
+        );
+        let kline = compressed_kline_frame(MSG_TYPE_KLINE_RESP, "0");
+        let (port, server) = spawn_tcp_responder(vec![login, kline]);
+        let provider = BaostockProvider {
+            stream: Arc::new(Mutex::new(None)),
+            session: Mutex::new(None),
+            host: "127.0.0.1".to_string(),
+            port,
+        };
+
+        let rows = provider
+            .fetch_kline_async("TEST_CODE_000001", 2)
+            .await
+            .expect("complete login and K-line frames must succeed");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].close, 10.1);
+        assert_eq!(
+            provider.ensure_session().await.unwrap(),
+            "TEST_CODE_SESSION"
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with(b"00.9.20\x0100\x01"));
+        assert!(requests[1].starts_with(b"00.9.20\x0195\x01"));
+        assert!(String::from_utf8_lossy(&requests[1]).contains("TEST_CODE_SESSION"));
+        assert!(String::from_utf8_lossy(&requests[1]).contains("sz.TEST_CODE_000001"));
+    }
+
+    #[tokio::test]
+    async fn loopback_tcp_rejects_incomplete_login_and_kline_protocols() {
+        let login_without_session = response_frame(
+            MSG_TYPE_LOGIN_RESP,
+            b"error_code=0\nerror_msg=success",
+            Some(1),
+        );
+        let (port, server) = spawn_tcp_responder(vec![login_without_session]);
+        let provider = BaostockProvider {
+            stream: Arc::new(Mutex::new(None)),
+            session: Mutex::new(None),
+            host: "127.0.0.1".to_string(),
+            port,
+        };
+        let error = provider.ensure_session().await.unwrap_err();
+        assert!(error.to_string().contains("session_id"));
+        assert_eq!(server.join().unwrap().len(), 1);
+
+        let login = response_frame(
+            MSG_TYPE_LOGIN_RESP,
+            b"error_code=0\nerror_msg=success\nsession_id=TEST_CODE_SESSION",
+            Some(1),
+        );
+        let wrong_type = response_frame(
+            MSG_TYPE_LOGIN_RESP,
+            b"error_code=0\nerror_msg=success",
+            Some(1),
+        );
+        let (port, server) = spawn_tcp_responder(vec![login, wrong_type]);
+        let provider = BaostockProvider {
+            stream: Arc::new(Mutex::new(None)),
+            session: Mutex::new(None),
+            host: "127.0.0.1".to_string(),
+            port,
+        };
+        let error = provider
+            .fetch_kline_async("TEST_CODE_000001", 2)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("msg_type"), "{error}");
+        assert_eq!(server.join().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn cdata_and_kline_batch_round_trip_complete_values() {
+        assert_eq!(strip_cdata("  plain  "), "plain");
+        assert_eq!(strip_cdata("<![CDATA[value]]>"), "value");
+        assert_eq!(strip_cdata("<![CDATA[broken"), "<![CDATA[broken");
+
+        let body = format!(
+            "<![CDATA[error_code=0\nerror_msg=success\n{}]]>",
+            valid_csv()
+        );
+        let rows = parse_baostock_response_kline(&body, "600519").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].date, NaiveDate::from_ymd_opt(2026, 7, 16).unwrap());
+        assert_eq!(rows[0].close, 10.1);
+        assert_eq!(rows[0].amount, 101_000.0);
+        assert_eq!(rows[0].pct_chg, 1.0);
+        assert_eq!(rows[0].adjust, AdjustType::Qfq);
+        assert!(rows.iter().all(|row| row.settled));
+
+        let with_code = valid_csv()
+            .replacen("date,", "code,date,", 1)
+            .replace("2026-07-15,", "sh.600519,2026-07-15,")
+            .replace("2026-07-16,", "sh.600519,2026-07-16,");
+        let rows = parse_baostock_response_kline(&with_code, "600519").unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn kline_parser_rejects_incomplete_or_bad_complete_batches() {
+        for body in [
+            "",
+            "open,high,low,close,volume,amount,pctChg\n10,10,10,10,1,1,0",
+            "date,open,high,low,close,volume,amount,pctChg\n2026-07-16,10,10,10",
+            "date,open,high,low,close,volume,amount,pctChg\nbad,10,10,10,10,1,1,0",
+            "date,open,high,low,close,volume,amount,pctChg\n2026-07-16,bad,10,10,10,1,1,0",
+            "date,open,high,low,close,volume,amount,pctChg\n2026-07-16,10,9,8,10,1,1,0",
+            "date,open,high,low,close,volume,amount,pctChg\n2026-07-16,10,10,10,10,1,-1,0",
+            "date,open,high,low,close,volume,amount,pctChg\n2026-07-16,10,10,10,10,1,1,20.1",
+        ] {
+            assert!(parse_kline_body(body, "600519").is_err(), "body={body:?}");
+        }
+
+        let duplicate = format!("{}\n{}", valid_csv(), valid_csv().lines().nth(2).unwrap());
+        assert!(parse_kline_body(&duplicate, "600519").is_err());
+
+        let gap = "date,open,high,low,close,volume,amount,pctChg\n\
+                   2026-07-14,10,10,10,10,1,1,0\n\
+                   2026-07-16,10,10,10,10,1,1,0";
+        assert!(parse_kline_body(gap, "600519").is_err());
+
+        let jump = "date,open,high,low,close,volume,amount,pctChg\n\
+                    2026-07-15,10,10,10,10,1,1,0\n\
+                    2026-07-16,13,13,13,13,1,1,0";
+        assert!(parse_kline_body(jump, "600519").is_err());
+        assert!(parse_baostock_response_kline("error_code=0", "600519").is_err());
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn provider_metadata_and_legacy_builders_are_explicit() {
+        let provider = BaostockProvider::default();
+        assert_eq!(provider.name(), "baostock");
+        assert_eq!(provider.get_stock_name("600519"), None);
+        assert!(provider.get_realtime_quote("600519").unwrap().is_none());
+        assert_eq!(build_login_url(), "http://baostock.com/baostock/Login");
+        assert_eq!(build_logout_url(), "http://baostock.com/baostock/Logout");
+        assert!(build_kline_query_body("600519", "date", "a", "b", "s").contains("code=600519"));
     }
 }

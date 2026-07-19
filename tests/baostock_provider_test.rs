@@ -10,6 +10,11 @@
 //! - test_parse_login_response_success — 解析真实登录响应 (session_id 提取)
 //! - test_parse_kline_response_decompresses — msg_type="96" zlib 解压 + CSV record 解析
 
+#![allow(
+    deprecated,
+    reason = "these compatibility tests intentionally verify the retained pre-TCP helper contract"
+)]
+
 use stock_analysis::data_provider::baostock_provider::{
     build_kline_query_body, build_kline_request_body, build_login_msg, build_login_url,
     build_logout_body, build_logout_url, parse_baostock_response, parse_baostock_response_kline,
@@ -19,22 +24,30 @@ use stock_analysis::data_provider::baostock_provider::{
 #[test]
 fn parse_kline_body_format() {
     // Baostock 响应格式 (实测):
-    // code,date,open,high,low,close,volume,amount
-    // sh.600000,2024-01-15,13.50,13.60,13.45,13.55,12345,16789.50
-    let body = "code,date,open,high,low,close,volume,amount\n\
-                sh.600000,2024-01-15,13.50,13.60,13.45,13.55,12345,16789.50\n\
-                sh.600000,2024-01-16,13.55,13.70,13.50,13.65,15000,20000.00\n";
+    // code,date,open,high,low,close,volume,amount,pctChg
+    let body = "code,date,open,high,low,close,volume,amount,pctChg\n\
+                sh.600000,2024-01-15,13.50,13.60,13.45,13.55,12345,16789.50,0.37\n\
+                sh.600000,2024-01-16,13.55,13.70,13.50,13.65,15000,20000.00,0.74\n";
     let klines =
         stock_analysis::data_provider::baostock_provider::parse_kline_body(body, "600000").unwrap();
     assert_eq!(klines.len(), 2);
-    assert_eq!(klines[0].open, 13.50);
-    assert_eq!(klines[0].close, 13.55);
-    assert_eq!(klines[0].volume, 12345.0);
-    assert_eq!(klines[0].amount, 16789.50);
+    assert_eq!(klines[0].open, 13.55);
+    assert_eq!(klines[0].close, 13.65);
+    assert_eq!(klines[1].volume, 12345.0);
+    assert_eq!(klines[1].amount, 16789.50);
     assert_eq!(
-        klines[1].date,
+        klines[0].date,
         chrono::NaiveDate::from_ymd_opt(2024, 1, 16).unwrap()
     );
+}
+
+#[test]
+fn parse_kline_body_rejects_malformed_required_field() {
+    let body = "date,open,high,low,close,volume,amount,pctChg\n\
+                2024-01-15,not-a-price,13.60,13.45,13.55,12345,16789.50,0.37\n";
+    let error = stock_analysis::data_provider::baostock_provider::parse_kline_body(body, "600000")
+        .unwrap_err();
+    assert!(error.to_string().contains("open='not-a-price'"));
 }
 
 #[test]
@@ -171,9 +184,9 @@ fn test_parse_kline_response_decompresses() {
 
     // 内层 CDATA: 含 error_code=0 + CSV 数据
     let inner_body = "error_code=0\nerror_msg=success\n\
-                      date,open,high,low,close,volume,amount\n\
-                      2024-01-15,13.50,13.60,13.45,13.55,12345,16789.50\n\
-                      2024-01-16,13.55,13.70,13.50,13.65,15000,20000.00\n";
+                      date,open,high,low,close,volume,amount,pctChg\n\
+                      2024-01-15,13.50,13.60,13.45,13.55,12345,16789.50,0.37\n\
+                      2024-01-16,13.55,13.70,13.50,13.65,15000,20000.00,0.74\n";
     let cdata_wrapped = format!("<![CDATA[{}]]>", inner_body);
 
     // zlib 压缩
@@ -202,16 +215,16 @@ fn test_parse_kline_response_decompresses() {
     assert_eq!(parsed.msg_type, "96");
     assert!(parsed
         .body
-        .contains("date,open,high,low,close,volume,amount"));
+        .contains("date,open,high,low,close,volume,amount,pctChg"));
     assert!(parsed.body.contains("13.50"));
     assert!(parsed.body.contains("2024-01-16"));
 
     let klines = parse_baostock_response_kline(&parsed.body, "600000")
         .expect("parse_kline_response_kline should succeed");
     assert_eq!(klines.len(), 2);
-    assert_eq!(klines[0].open, 13.50);
+    assert_eq!(klines[0].open, 13.55);
     assert_eq!(
-        klines[1].date,
+        klines[0].date,
         chrono::NaiveDate::from_ymd_opt(2024, 1, 16).unwrap()
     );
 }
@@ -292,24 +305,14 @@ fn test_build_logout_body_format() {
 // ============================================================================
 
 /// P0 #3: read_tcp_response 必须在 timeout 后返 Err, 不能永久 await.
-/// 模拟服务端 accept 后不发数据 (挂起).
+/// 用内存双工流模拟对端保持连接但不发数据 (挂起), 不依赖本机端口权限.
 #[tokio::test]
 async fn test_read_tcp_response_times_out_on_hang() {
-    // 启动一个 dummy listener, accept 后 sleep 60s (远超 timeout)
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        // 不发数据, sleep 60s 让 client read 超时
-        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-        drop(stream);
-    });
+    let (mut stream, stalled_peer) = tokio::io::duplex(1);
 
-    // client connect
-    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-
-    // 用 500ms timeout, 服务端挂起, 应返 Err (而不是永久 await)
-    let result = read_tcp_response(&mut stream, std::time::Duration::from_millis(500)).await;
+    // 对端保持存活但不写；短超时后必须返 Err，而不是永久 await.
+    let result = read_tcp_response(&mut stream, std::time::Duration::from_millis(20)).await;
+    drop(stalled_peer);
 
     assert!(
         result.is_err(),

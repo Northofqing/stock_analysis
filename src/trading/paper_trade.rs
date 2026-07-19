@@ -1,3 +1,4 @@
+//! Registered business rules: BR-084.
 //! v12 PR3-3.5: 虚拟盘成交模拟 (paper_trade).
 //!
 //! 设计: 虚拟腿只写 paper_trades, **零写 stock_position** (BR-023 硬性隔离).
@@ -19,7 +20,113 @@
 use diesel::prelude::*;
 
 use crate::database::DatabaseManager;
+use crate::monitor::data_mode::DataMode;
+use crate::risk::action_gate::AccountMode;
 use crate::trading::risk_adapter::MAX_SLIPPAGE_PCT;
+
+/// BR-134: one typed snapshot of the risk facts that authorize a paper action.
+/// There is deliberately no `Default`: production callers must supply the
+/// latest fully evaluated account and data modes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PaperRiskContext {
+    pub account_mode: AccountMode,
+    pub data_mode: DataMode,
+}
+
+impl PaperRiskContext {
+    pub const fn new(account_mode: AccountMode, data_mode: DataMode) -> Self {
+        Self {
+            account_mode,
+            data_mode,
+        }
+    }
+}
+
+#[derive(Clone, diesel::QueryableByName)]
+struct LedgerState {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    date: String,
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    total_value: f64,
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    cash: f64,
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    market_value: f64,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    created_at: String,
+}
+
+fn validate_ledger_state(
+    ledger: &LedgerState,
+    today: &str,
+    now: chrono::NaiveDateTime,
+) -> Result<(), String> {
+    if ledger.date != today {
+        return Err(format!(
+            "account ledger stale trading day: snapshot={} today={today}",
+            ledger.date
+        ));
+    }
+    let created_at = chrono::NaiveDateTime::parse_from_str(&ledger.created_at, "%Y-%m-%d %H:%M:%S")
+        .map_err(|error| format!("account ledger created_at invalid: {error}"))?;
+    let age = now.signed_duration_since(created_at).num_seconds();
+    if !(0..=30).contains(&age) {
+        return Err(format!("account ledger stale: age_seconds={age}"));
+    }
+    if !ledger.total_value.is_finite()
+        || ledger.total_value <= 0.0
+        || !ledger.cash.is_finite()
+        || ledger.cash < 0.0
+        || ledger.cash > ledger.total_value
+        || !ledger.market_value.is_finite()
+        || ledger.market_value < 0.0
+        || ledger.market_value > ledger.total_value
+    {
+        return Err(format!(
+            "account ledger invalid: cash={} market_value={} total_value={}",
+            ledger.cash, ledger.market_value, ledger.total_value
+        ));
+    }
+    Ok(())
+}
+
+fn validate_position_snapshot(
+    positions: &[crate::portfolio::Position],
+    position_source_time: Option<chrono::DateTime<chrono::Local>>,
+    ledger_market_value: f64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), String> {
+    if positions.is_empty() {
+        if ledger_market_value.abs() > 0.005 {
+            return Err(format!(
+                "position snapshot is empty but ledger market_value={ledger_market_value}"
+            ));
+        }
+    } else {
+        let position_source_time = position_source_time
+            .ok_or_else(|| "position snapshot is missing source time".to_string())?;
+        if !crate::portfolio::position_source_is_fresh(position_source_time, now) {
+            return Err(format!(
+                "position snapshot stale: oldest_source_time={position_source_time}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn position_pct(
+    positions: &[crate::portfolio::Position],
+    code: &str,
+    quote_price: f64,
+    total_value: f64,
+) -> f64 {
+    let shares = positions
+        .iter()
+        .filter(|position| position.code == code)
+        .map(|position| position.shares)
+        .sum::<u64>();
+    shares as f64 * quote_price / total_value * 100.0
+}
 
 /// 虚拟盘状态
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -73,8 +180,11 @@ pub struct PaperSignal {
     pub is_limit_down: bool,
     /// 停牌 (T 日停牌)
     pub is_suspended: bool,
-    pub account_mode: String,
-    pub data_mode: String,
+    pub limit_up_price: Option<f64>,
+    pub limit_down_price: Option<f64>,
+    pub secondary_confirmed: bool,
+    pub quote_observed_at: chrono::DateTime<chrono::Utc>,
+    pub risk_context: PaperRiskContext,
 }
 
 /// 输出: 模拟结果
@@ -90,8 +200,20 @@ pub struct PaperResult {
 /// v16.3 R2 (滑点保护): quote_price > 0 时, |quote_price - signal.price| / signal.price > MAX_SLIPPAGE_PCT
 /// → Invalidated (挂单价 vs 实际成交价不一致, 信号失真)
 ///
-/// v16.3 R1 (集合竞价期挂单): 9:15-9:25 期间 quote_price=0 (无成交) → Filled (挂单簿等成交)
 pub fn evaluate(signal: &PaperSignal, quote_price: f64) -> PaperResult {
+    if !signal.price.is_finite()
+        || signal.price <= 0.0
+        || !quote_price.is_finite()
+        || quote_price <= 0.0
+        || signal.quantity == 0
+        || !signal.quantity.is_multiple_of(100)
+    {
+        return PaperResult {
+            status: PaperTradeStatus::Invalidated,
+            fill_price: None,
+            not_fill_reason: Some("价格或数量证据无效".to_string()),
+        };
+    }
     // 1. 停牌 → NotFilled
     if signal.is_suspended {
         return PaperResult {
@@ -119,23 +241,24 @@ pub fn evaluate(signal: &PaperSignal, quote_price: f64) -> PaperResult {
         };
     }
 
-    // 4. v16.3 R2: 滑点保护 (quote_price > 0 时才检查; 0 表示缺数据, 兼容早盘)
-    if quote_price > 0.0 && signal.price > 0.0 {
-        let slippage = (quote_price - signal.price).abs() / signal.price * 100.0;
-        if slippage > *MAX_SLIPPAGE_PCT {
-            log::warn!(
-                "[paper_trade] 滑点 {:.2}% 超过 MAX_SLIPPAGE_PCT={:.1}% (signal={}, quote={})",
-                slippage, *MAX_SLIPPAGE_PCT, signal.price, quote_price
-            );
-            return PaperResult {
-                status: PaperTradeStatus::Invalidated,
-                fill_price: None,
-                not_fill_reason: Some(format!(
-                    "滑点 {:.2}% 超过 {:.1}%",
-                    slippage, *MAX_SLIPPAGE_PCT
-                )),
-            };
-        }
+    // 4. v16.3 R2: 滑点保护. pre_trade_check 已保证两种价格均有效.
+    let slippage = (quote_price - signal.price).abs() / signal.price * 100.0;
+    if slippage > *MAX_SLIPPAGE_PCT {
+        log::warn!(
+            "[paper_trade] 滑点 {:.2}% 超过 MAX_SLIPPAGE_PCT={:.1}% (signal={}, quote={})",
+            slippage,
+            *MAX_SLIPPAGE_PCT,
+            signal.price,
+            quote_price
+        );
+        return PaperResult {
+            status: PaperTradeStatus::Invalidated,
+            fill_price: None,
+            not_fill_reason: Some(format!(
+                "滑点 {:.2}% 超过 {:.1}%",
+                slippage, *MAX_SLIPPAGE_PCT
+            )),
+        };
     }
 
     // 5. 正常 → Filled (以信号价成交)
@@ -149,29 +272,34 @@ pub fn evaluate(signal: &PaperSignal, quote_price: f64) -> PaperResult {
 /// v16.3 review fix (Issue #5): 读真实 (cash, total, pos_pct) 给 risk_adapter 检查用.
 /// lib 版, bin (push_templates) 与 lib (intraday_monitor / paper_engine) 共用.
 ///
-/// 失败策略 (红线 2.2 出声): get_positions 失败 → warn + (0,0,0);
-/// cash_guard 对 total<=0 显式跳过检查 (缺数据不硬拦), 每次失败均有 warn 日志.
-pub fn portfolio_state(code: &str, quote_price: f64) -> (f64, f64, f64) {
-    let positions = match crate::portfolio::get_positions() {
-        Ok(p) => p,
-        Err(e) => {
-            log::warn!(
-                "[portfolio_state] get_positions 失败: {} → (0,0,0), risk_adapter 将跳过现金/仓位检查",
-                e
-            );
-            return (0.0, 0.0, 0.0);
-        }
-    };
-    let mut total = 1_000_000.0_f64;
-    let mut pos_pct = 0.0_f64;
-    for p in &positions {
-        if p.code == code {
-            pos_pct = (p.shares as f64 * quote_price) / total * 100.0;
-        }
-        total += p.shares as f64 * quote_price;
+/// Load a <=30-second account snapshot and derive the target position ratio.
+pub fn portfolio_state(code: &str, quote_price: f64) -> Result<(f64, f64, f64), String> {
+    if !quote_price.is_finite() || quote_price <= 0.0 {
+        return Err(format!(
+            "invalid quote price for portfolio state: {quote_price}"
+        ));
     }
-    let cash = total * 0.30; // v16.3 简化: 30% 现金假设, v16.4 接 ledger 真值
-    (cash, total, pos_pct)
+
+    let db = DatabaseManager::try_get().ok_or_else(|| "DB 未初始化".to_string())?;
+    let mut conn = db
+        .get_conn()
+        .map_err(|error| format!("DB 连接失败: {error}"))?;
+    let ledger = diesel::sql_query(
+        "SELECT date, total_value, cash, market_value, created_at FROM ledger ORDER BY date DESC LIMIT 1",
+    )
+        .get_result::<LedgerState>(&mut conn)
+        .map_err(|error| format!("account ledger unavailable: {error}"))?;
+    let today = chrono::Local::now().date_naive().to_string();
+    validate_ledger_state(&ledger, &today, chrono::Utc::now().naive_utc())?;
+    let (positions, position_source_time) = crate::portfolio::get_positions_with_source_time()?;
+    validate_position_snapshot(
+        &positions,
+        position_source_time,
+        ledger.market_value,
+        chrono::Utc::now(),
+    )?;
+    let pos_pct = position_pct(&positions, code, quote_price, ledger.total_value);
+    Ok((ledger.cash, ledger.total_value, pos_pct))
 }
 
 /// 模拟成交结果 (含 DB 写入状态)
@@ -181,6 +309,46 @@ pub struct PaperOutcome {
     pub result: PaperResult,
     /// true = INSERT 实际写入; false = INSERT OR IGNORE 跳过 (plan_id 重复)
     pub inserted: bool,
+}
+
+fn persist_paper_trade_with_audit(
+    conn: &mut diesel::sqlite::SqliteConnection,
+    sql: &str,
+    signal: &PaperSignal,
+    result: &PaperResult,
+    observed_at: &str,
+) -> diesel::QueryResult<usize> {
+    conn.transaction::<_, diesel::result::Error, _>(|conn| {
+        let rows = diesel::sql_query(sql).execute(conn)?;
+        let duplicate_reason = "duplicate paper plan id";
+        let outcome = if rows > 0 && result.status == PaperTradeStatus::Filled {
+            "Filled"
+        } else {
+            "Rejected"
+        };
+        let failure_reason = if rows == 0 {
+            Some(duplicate_reason)
+        } else {
+            result.not_fill_reason.as_deref()
+        };
+        let audit = crate::database::order_audit::OrderAuditRecord {
+            business_order_id: &signal.plan_id,
+            source: "PaperTrade",
+            decision_basis: &signal.virtual_reason,
+            side: signal.direction.as_str(),
+            code: &signal.code,
+            requested_price: signal.price,
+            execution_price: result.fill_price,
+            quantity: i64::from(signal.quantity),
+            quote_observed_at: Some(observed_at),
+            outcome,
+            failure_reason,
+        };
+        if crate::database::order_audit::insert_order_audit_query(conn, &audit)? != 1 {
+            return Err(diesel::result::Error::RollbackTransaction);
+        }
+        Ok(rows)
+    })
 }
 
 /// 模拟成交: 写 paper_trades (含 plan_id 幂等)
@@ -197,14 +365,58 @@ pub fn simulate(
     total_value: f64,
     current_position_pct: f64,
 ) -> Result<PaperOutcome, String> {
+    let db = DatabaseManager::try_get()
+        .ok_or_else(|| "BR-086 paper-order audit database is not initialized".to_string())?;
+    if !db
+        .reserve_business_order_id(&signal.plan_id)
+        .map_err(|error| format!("BR-086 paper-order idempotency reservation: {error}"))?
+    {
+        let reason = "duplicate business order id within 60 seconds".to_string();
+        let observed_at = signal.quote_observed_at.to_rfc3339();
+        let audit = crate::database::order_audit::OrderAuditRecord {
+            business_order_id: &signal.plan_id,
+            source: "PaperTrade",
+            decision_basis: &signal.virtual_reason,
+            side: signal.direction.as_str(),
+            code: &signal.code,
+            requested_price: signal.price,
+            execution_price: None,
+            quantity: i64::from(signal.quantity),
+            quote_observed_at: Some(&observed_at),
+            outcome: "Rejected",
+            failure_reason: Some(&reason),
+        };
+        db.record_order_audit(&audit)
+            .map_err(|error| format!("{reason}; BR-086 duplicate audit failed: {error}"))?;
+        return Err(reason);
+    }
+
     // v16.3 R1+R2: pre-trade gate 4 项硬检查 (拒 → 不入 paper_trades, 不调 evaluate)
-    crate::trading::risk_adapter::pre_trade_check(
+    if let Err(reason) = crate::trading::risk_adapter::pre_trade_check(
         signal,
         quote_price,
         current_cash,
         total_value,
         current_position_pct,
-    )?;
+    ) {
+        let observed_at = signal.quote_observed_at.to_rfc3339();
+        let audit = crate::database::order_audit::OrderAuditRecord {
+            business_order_id: &signal.plan_id,
+            source: "PaperTrade",
+            decision_basis: &signal.virtual_reason,
+            side: signal.direction.as_str(),
+            code: &signal.code,
+            requested_price: signal.price,
+            execution_price: None,
+            quantity: i64::from(signal.quantity),
+            quote_observed_at: Some(&observed_at),
+            outcome: "Rejected",
+            failure_reason: Some(&reason),
+        };
+        db.record_order_audit(&audit)
+            .map_err(|audit_error| format!("{reason}; BR-086 audit failed: {audit_error}"))?;
+        return Err(reason);
+    }
 
     let result = evaluate(signal, quote_price);
     let mut conn = DatabaseManager::get()
@@ -237,12 +449,12 @@ pub fn simulate(
         fill_price,
         not_fill_reason,
         esc(&signal.virtual_reason),
-        esc(&signal.account_mode),
-        esc(&signal.data_mode),
+        signal.risk_context.account_mode.label(),
+        signal.risk_context.data_mode.label(),
     );
-    let rows = diesel::sql_query(sql)
-        .execute(&mut conn)
-        .map_err(|e| format!("insert paper_trades: {}", e))?;
+    let observed_at = signal.quote_observed_at.to_rfc3339();
+    let rows = persist_paper_trade_with_audit(&mut conn, &sql, signal, &result, &observed_at)
+        .map_err(|e| format!("BR-086 audited paper trade transaction: {e}"))?;
 
     Ok(PaperOutcome {
         result,
@@ -257,7 +469,7 @@ mod tests {
     fn signal_default(is_limit_up: bool, is_limit_down: bool, is_suspended: bool) -> PaperSignal {
         PaperSignal {
             plan_id: "plan-001".to_string(),
-            code: "688001".to_string(),
+            code: "TEST_CODE_688001".to_string(),
             name: "测试".to_string(),
             direction: Direction::Buy,
             price: 50.0,
@@ -266,9 +478,172 @@ mod tests {
             is_limit_up,
             is_limit_down,
             is_suspended,
-            account_mode: "Normal".to_string(),
-            data_mode: "Full".to_string(),
+            limit_up_price: Some(55.0),
+            limit_down_price: Some(45.0),
+            secondary_confirmed: false,
+            quote_observed_at: chrono::Utc::now(),
+            risk_context: PaperRiskContext::new(AccountMode::Normal, DataMode::Full),
         }
+    }
+
+    #[derive(QueryableByName)]
+    struct CountRow {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        count: i64,
+    }
+
+    #[test]
+    fn br086_chain_insert_failure_rolls_back_paper_trade() {
+        let mut conn =
+            diesel::sqlite::SqliteConnection::establish(":memory:").expect("in-memory SQLite");
+        DatabaseManager::run_migrations_for_test(&mut conn).expect("test migrations");
+        diesel::sql_query(
+            "CREATE TRIGGER test_fail_paper_audit_chain_insert
+             BEFORE INSERT ON order_audit_chain
+             BEGIN SELECT RAISE(ABORT, 'TEST_CODE forced paper chain failure'); END",
+        )
+        .execute(&mut conn)
+        .expect("install chain failure trigger");
+        let mut signal = signal_default(false, false, false);
+        signal.plan_id = "TEST_PLAN_BR086_ROLLBACK".to_string();
+        let result = evaluate(&signal, signal.price);
+        let sql = "INSERT INTO paper_trades
+                   (plan_id, code, name, direction, price, quantity, status,
+                    fill_price, not_fill_reason, virtual_reason, account_mode, data_mode)
+                   VALUES ('TEST_PLAN_BR086_ROLLBACK', 'TEST_CODE_688001', '测试', 'buy',
+                           50.0, 100, 'Filled', 50.0, NULL, 'NewsCatalyst', 'Normal', 'Full')";
+
+        persist_paper_trade_with_audit(
+            &mut conn,
+            sql,
+            &signal,
+            &result,
+            "2026-07-18T09:30:00+08:00",
+        )
+        .expect_err("chain failure must roll back paper row and audit row");
+        for table in ["paper_trades", "order_audit", "order_audit_chain"] {
+            let count = diesel::sql_query(format!("SELECT COUNT(*) AS count FROM {table}"))
+                .get_result::<CountRow>(&mut conn)
+                .expect("count rollback rows")
+                .count;
+            assert_eq!(count, 0, "{table} must be rolled back");
+        }
+    }
+
+    #[test]
+    fn portfolio_state_validators_reject_stale_or_inconsistent_account_evidence() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 7, 18)
+            .unwrap()
+            .and_hms_opt(2, 0, 30)
+            .unwrap();
+        let complete = LedgerState {
+            date: "2026-07-18".into(),
+            total_value: 100_000.0,
+            cash: 40_000.0,
+            market_value: 60_000.0,
+            created_at: "2026-07-18 02:00:00".into(),
+        };
+        validate_ledger_state(&complete, "2026-07-18", now).expect("30-second boundary");
+
+        let mut invalid = complete.clone();
+        invalid.date = "2026-07-17".into();
+        assert!(validate_ledger_state(&invalid, "2026-07-18", now)
+            .expect_err("previous trading day is stale")
+            .contains("stale trading day"));
+
+        invalid = complete.clone();
+        invalid.created_at = "not-a-time".into();
+        assert!(validate_ledger_state(&invalid, "2026-07-18", now)
+            .expect_err("invalid source time must fail")
+            .contains("created_at invalid"));
+
+        for created_at in ["2026-07-18 02:00:31", "2026-07-18 01:59:59"] {
+            invalid = complete.clone();
+            invalid.created_at = created_at.into();
+            assert!(validate_ledger_state(&invalid, "2026-07-18", now)
+                .expect_err("future or older-than-30-second ledger must fail")
+                .contains("ledger stale"));
+        }
+
+        let invalid_values = [
+            (f64::NAN, 40_000.0, 60_000.0),
+            (0.0, 0.0, 0.0),
+            (100_000.0, f64::NAN, 60_000.0),
+            (100_000.0, -1.0, 60_000.0),
+            (100_000.0, 100_001.0, 0.0),
+            (100_000.0, 40_000.0, f64::NAN),
+            (100_000.0, 40_000.0, -1.0),
+            (100_000.0, 40_000.0, 100_001.0),
+        ];
+        for (total_value, cash, market_value) in invalid_values {
+            invalid = complete.clone();
+            invalid.total_value = total_value;
+            invalid.cash = cash;
+            invalid.market_value = market_value;
+            assert!(validate_ledger_state(&invalid, "2026-07-18", now)
+                .expect_err("invalid account amount must fail")
+                .contains("ledger invalid"));
+        }
+
+        for quote in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(portfolio_state("TEST_CODE_600519", quote)
+                .expect_err("invalid quote must fail before database access")
+                .contains("invalid quote price"));
+        }
+    }
+
+    #[test]
+    fn portfolio_position_snapshot_requires_complete_fresh_source_evidence() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-18T02:00:30Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert!(validate_position_snapshot(&[], None, 0.0, now).is_ok());
+        assert!(validate_position_snapshot(&[], None, 0.006, now)
+            .expect_err("non-zero ledger market value needs positions")
+            .contains("snapshot is empty"));
+
+        let position = crate::portfolio::Position {
+            code: "TEST_CODE_600519".into(),
+            name: "测试持仓".into(),
+            shares: 1_000,
+            cost_price: 10.0,
+            hard_stop: None,
+            added_at: chrono::NaiveDate::from_ymd_opt(2026, 7, 17).unwrap(),
+            status: crate::portfolio::PositionStatus::Holding,
+            sector: "测试板块".into(),
+            is_st: false,
+            star_st: false,
+        };
+        assert!(
+            validate_position_snapshot(std::slice::from_ref(&position), None, 10_000.0, now)
+                .expect_err("non-empty snapshot requires source time")
+                .contains("missing source time")
+        );
+        assert!(validate_position_snapshot(
+            std::slice::from_ref(&position),
+            Some((now - chrono::Duration::milliseconds(30_001)).with_timezone(&chrono::Local)),
+            10_000.0,
+            now,
+        )
+        .expect_err("stale position evidence must fail")
+        .contains("snapshot stale"));
+        validate_position_snapshot(
+            std::slice::from_ref(&position),
+            Some((now - chrono::Duration::seconds(30)).with_timezone(&chrono::Local)),
+            10_000.0,
+            now,
+        )
+        .expect("30-second position boundary");
+
+        let mut second = position.clone();
+        second.shares = 500;
+        let unrelated = crate::portfolio::Position {
+            code: "TEST_CODE_000001".into(),
+            shares: 10_000,
+            ..position
+        };
+        let pct = position_pct(&[second, unrelated], "TEST_CODE_600519", 20.0, 100_000.0);
+        assert!((pct - 10.0).abs() < f64::EPSILON);
     }
 
     // ---- 涨停买必 NotFilled (PR3-3.5 硬性要求) ----
@@ -352,10 +727,10 @@ mod tests {
     }
 
     #[test]
-    fn filled_when_quote_price_zero() {
-        // 9:15-9:25 集合竞价, quote_price=0 (无成交) → Filled (挂单簿等成交)
+    fn invalidated_when_quote_price_zero() {
         let r = evaluate(&signal_default(false, false, false), 0.0);
-        assert_eq!(r.status, PaperTradeStatus::Filled);
+        assert_eq!(r.status, PaperTradeStatus::Invalidated);
+        assert!(r.fill_price.is_none());
     }
 
     #[test]
@@ -429,5 +804,24 @@ mod tests {
             !inserted_false.inserted,
             "重复 plan_id 应 inserted=false (避免假成功)"
         );
+    }
+
+    #[test]
+    fn br086_rejected_paper_attempt_still_reserves_business_id() {
+        let _ = DatabaseManager::init(None);
+        let mut signal = signal_default(false, false, false);
+        signal.plan_id = format!(
+            "TEST_CODE_REJECTED_PLAN_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        );
+        signal.quantity = 99;
+
+        let first = simulate(&signal, 50.0, 100_000.0, 100_000.0, 0.0)
+            .expect_err("invalid lot must be rejected");
+        assert!(first.contains("100"));
+        let second = simulate(&signal, 50.0, 100_000.0, 100_000.0, 0.0)
+            .expect_err("same rejected business id must be deduplicated");
+        assert!(second.contains("duplicate business order id within 60 seconds"));
     }
 }

@@ -1,3 +1,4 @@
+//! Registered business rules: BR-076.
 //! v12 PR1 账户模式三态判定 (AccountState).
 //!
 //! 设计: 纯函数 + 数据入参, 不直接读 portfolio DB.
@@ -14,6 +15,7 @@
 //! v12 §2.3 + BR-021.
 
 use super::action_gate::AccountMode;
+use chrono::NaiveTime;
 
 /// 评估阈值 (code-level const fallback, 可被 config 覆盖)
 pub mod thresholds {
@@ -167,6 +169,31 @@ pub fn evaluate(
         trigger_reason: None,
         prev_mode: prev,
     }
+}
+
+/// v17.5 §5.10 / BR-021: 8:30 盘前重置信号 helper.
+///
+/// 返回 `true` 当:
+///   1. `now_local` 落在 `[08:30:00, 08:31:00)` 1 分钟窗口内,
+///   2. 且 `prev` 是 `Some(AccountMode::Frozen)`.
+///
+/// 否则返回 `false`.
+///
+/// 实际 reset 动作不在本函数内 — caller (例如 monitor loop) 收到 `true` 后,
+/// 下一次调用 `evaluate()` 应传 `prev = None`,让 evaluate 基于当前 metrics 重判:
+///   - 当前 metrics 安全 (无亏损/无仓位超限) → 自动回 Normal
+///   - 当前 metrics 仍超限 → 仍在 Frozen (无需 cron 介入)
+///
+/// **为什么不新造 struct**: 本信号 helper 是纯函数 + 可独立单测 + 不需要
+/// `LAST_ACCOUNT_MODE` 全局缓存,跟现有 `evaluate()` 架构完全兼容.
+/// caller 集成代码 ~3 行 (e.g. `if should_reset...() { next_eval_prev = None }`).
+pub fn should_reset_at_8_30(prev: Option<AccountMode>, now_local: NaiveTime) -> bool {
+    let window_start = NaiveTime::from_hms_opt(8, 30, 0).expect("08:30:00 valid");
+    let window_end = NaiveTime::from_hms_opt(8, 31, 0).expect("08:31:00 valid");
+    if now_local < window_start || now_local >= window_end {
+        return false;
+    }
+    matches!(prev, Some(AccountMode::Frozen))
 }
 
 #[cfg(test)]
@@ -375,5 +402,37 @@ mod tests {
         assert_eq!(thresholds::CIRCUIT_BREAKER_PCT, -2.0);
         assert_eq!(thresholds::CONSECUTIVE_STOP_LOSS_N, 3);
         assert_eq!(thresholds::POSITION_OVERLOAD_CHENG, 8);
+    }
+
+    // ============== v17.5 §5.10 / BR-021: 8:30 盘前重置信号测试 ==============
+
+    #[test]
+    fn should_reset_at_8_30_true_in_window_with_frozen_prev() {
+        let at_8_30 = NaiveTime::from_hms_opt(8, 30, 0).unwrap();
+        let at_8_30_45 = NaiveTime::from_hms_opt(8, 30, 45).unwrap();
+        assert!(should_reset_at_8_30(Some(AccountMode::Frozen), at_8_30));
+        assert!(should_reset_at_8_30(Some(AccountMode::Frozen), at_8_30_45));
+    }
+
+    #[test]
+    fn should_reset_at_8_30_false_outside_window() {
+        let at_8_29 = NaiveTime::from_hms_opt(8, 29, 59).unwrap();
+        let at_8_31 = NaiveTime::from_hms_opt(8, 31, 0).unwrap();
+        let at_9_30 = NaiveTime::from_hms_opt(9, 30, 0).unwrap();
+        assert!(!should_reset_at_8_30(Some(AccountMode::Frozen), at_8_29));
+        assert!(!should_reset_at_8_30(Some(AccountMode::Frozen), at_8_31));
+        assert!(!should_reset_at_8_30(Some(AccountMode::Frozen), at_9_30));
+    }
+
+    #[test]
+    fn should_reset_at_8_30_false_when_prev_not_frozen() {
+        let at_8_30 = NaiveTime::from_hms_opt(8, 30, 0).unwrap();
+        // 窗口内, 但 prev 是 Normal / ReduceOnly / None → 都 false
+        assert!(!should_reset_at_8_30(Some(AccountMode::Normal), at_8_30));
+        assert!(!should_reset_at_8_30(
+            Some(AccountMode::ReduceOnly),
+            at_8_30
+        ));
+        assert!(!should_reset_at_8_30(None, at_8_30));
     }
 }

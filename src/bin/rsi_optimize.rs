@@ -394,3 +394,67 @@ fn main() -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stock_analysis::strategy::Trade;
+
+    fn trade(action: TradeAction, shares: f64, price: f64) -> Trade {
+        Trade {
+            date: chrono::Local::now(),
+            code: "TEST_CODE_000001".to_string(),
+            name: "TEST_CODE_RSI".to_string(),
+            action,
+            shares,
+            price,
+            amount: shares * price,
+            commission: 0.0,
+        }
+    }
+
+    #[test]
+    fn stock_statistics_and_reports_cover_wins_losses_and_empty_pools() {
+        let result = SingleRsiResult {
+            code: "TEST_CODE_000001".to_string(),
+            name: "TEST_CODE_RSI".to_string(),
+            initial_capital: 100_000.0,
+            final_value: 105_000.0,
+            trades: vec![
+                trade(TradeAction::Buy, 100.0, 10.0),
+                trade(TradeAction::Buy, 100.0, 12.0),
+                trade(TradeAction::Sell, 200.0, 13.0),
+                trade(TradeAction::Sell, 100.0, 9.0),
+            ],
+            daily_values: Vec::new(),
+            signals: Vec::new(),
+            rsi_values: Vec::new(),
+        };
+        let stat = compute_stock_stat(&result);
+        assert_eq!(stat.round_trips, 1);
+        assert_eq!(stat.wins, 1);
+        assert_eq!(stat.win_rate, 1.0);
+        assert_eq!(stat.return_pct, 5.0);
+
+        let empty = run_preset("TEST_CODE_empty", RsiConfig::default(), &[]).unwrap();
+        assert_eq!(empty.stocks_tested, 0);
+        assert_eq!(empty.avg_return_pct, 0.0);
+        let empty_report = format_preset_report(&empty);
+        assert!(empty_report.contains("🔴 未达"));
+
+        let stats = PresetStats {
+            name: "TEST_CODE_winning".to_string(),
+            config: RsiConfig::default(),
+            total_trades: stat.trades,
+            total_round_trips: stat.round_trips,
+            total_wins: stat.wins,
+            stocks_with_trades: 1,
+            stocks_tested: 1,
+            per_stock: vec![stat],
+            avg_return_pct: 5.0,
+        };
+        let report = format_preset_report(&stats);
+        assert!(report.contains("✅ 达标"));
+        assert!(report.contains("TEST_CODE_000001"));
+    }
+}

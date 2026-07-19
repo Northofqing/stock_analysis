@@ -174,7 +174,7 @@ impl EntityLinker {
 
         // 2. 简称/片段匹配（中置信度），按长度降序避免短串误匹配
         let mut keys: Vec<&String> = self.name_index.keys().collect();
-        keys.sort_by(|a, b| b.chars().count().cmp(&a.chars().count()));
+        keys.sort_by_key(|key| std::cmp::Reverse(key.chars().count()));
         for short in keys {
             if short.chars().count() < 2 {
                 continue;
@@ -291,17 +291,17 @@ mod tests {
     #[test]
     fn test_exact_match() {
         let mut linker = EntityLinker::new();
-        linker.register_position("000547", "航天发展");
+        linker.register_position("TEST_CODE_000547", "航天发展");
         let hits = linker.link("航天发展今日获大额订单");
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].code, "000547");
+        assert_eq!(hits[0].code, "TEST_CODE_000547");
         assert!(hits[0].confidence > 0.9);
     }
 
     #[test]
     fn test_supplier_noise_excluded() {
         let mut linker = EntityLinker::new();
-        linker.register_position("300750", "宁德时代");
+        linker.register_position("TEST_CODE_300750", "宁德时代");
         // "宁德时代供应商X发生火灾" → 主体是X，不是宁德时代
         let hits = linker.link("宁德时代供应商某公司发生火灾");
         // 宁德时代在噪声短语"供应商"之前被匹配 → 降级但可能仍有 0.5
@@ -311,7 +311,7 @@ mod tests {
     #[test]
     fn test_short_name_match() {
         let mut linker = EntityLinker::new();
-        linker.register_position("000547", "航天发展工业集团");
+        linker.register_position("TEST_CODE_000547", "航天发展工业集团");
         // 简称"航天发展"应在文本中匹配
         let hits = linker.link("航天发展发布公告");
         assert!(!hits.is_empty());
@@ -320,9 +320,12 @@ mod tests {
     #[test]
     fn test_concept_match_low_confidence() {
         let mut linker = EntityLinker::new();
-        linker.register_concept("低空经济", &["000099".into(), "002085".into()]);
-        linker.register_position("000099", "中信海直");
-        linker.register_position("002085", "万丰奥威");
+        linker.register_concept(
+            "低空经济",
+            &["TEST_CODE_000099".into(), "TEST_CODE_002085".into()],
+        );
+        linker.register_position("TEST_CODE_000099", "中信海直");
+        linker.register_position("TEST_CODE_002085", "万丰奥威");
         let hits = linker.link("低空经济新政即将发布");
         assert!(hits.len() >= 2);
         assert!(hits.iter().all(|h| h.confidence <= 0.5));

@@ -1,6 +1,6 @@
 //! AI 模型 HTTP 调用层（从 analyzer.rs 拆分）。
 //!
-//! 封装 Gemini / OpenAI 兼容 / 豆包 三家 API 的重试与故障转移逻辑。
+//! 封装 Gemini / DeepSeek / 豆包 三家 API 的重试与故障转移逻辑。
 //! 支持 AgentMode（Quick / Deep）按 mode 路由到不同模型。
 
 use anyhow::{anyhow, Context, Result};
@@ -44,18 +44,18 @@ impl GeminiAnalyzer {
         }
     }
 
-    pub(crate) fn openai_model_for(&self, mode: AgentMode) -> String {
+    pub(crate) fn deepseek_model_for(&self, mode: AgentMode) -> String {
         match mode {
             AgentMode::Quick => self
                 .config
-                .openai_quick_model
+                .deepseek_quick_model
                 .clone()
-                .unwrap_or_else(|| self.config.openai_model.clone()),
+                .unwrap_or_else(|| self.config.deepseek_model.clone()),
             AgentMode::Deep => self
                 .config
-                .openai_deep_model
+                .deepseek_deep_model
                 .clone()
-                .unwrap_or_else(|| self.config.openai_model.clone()),
+                .unwrap_or_else(|| self.config.deepseek_model.clone()),
         }
     }
 
@@ -70,6 +70,10 @@ impl GeminiAnalyzer {
     // ========== 调用入口 ==========
 
     /// 调用 API（带重试和故障转移，使用默认系统提示词，Quick 模式）
+    #[allow(
+        dead_code,
+        reason = "legacy JSON dashboard request entry retained for archived integrations"
+    )]
     pub(super) async fn call_api_with_retry(&self, prompt: &str) -> Result<String> {
         self.call_api_with_retry_ex(prompt, Self::SYSTEM_PROMPT)
             .await
@@ -116,10 +120,10 @@ impl GeminiAnalyzer {
                 .await;
         }
 
-        if self.use_openai {
-            let model = self.openai_model_for(mode);
+        if self.use_deepseek {
+            let model = self.deepseek_model_for(mode);
             return self
-                .call_openai_api(prompt, system_prompt, &model, thinking)
+                .call_deepseek_api(prompt, system_prompt, &model, thinking)
                 .await;
         }
 
@@ -185,21 +189,6 @@ impl GeminiAnalyzer {
                 Ok(response) => return Ok(response),
                 Err(doubao_error) => {
                     error!("[豆包] 备选 API 也失败: {}", doubao_error);
-                }
-            }
-        }
-
-        // 尝试 OpenAI 作为最后的备选
-        if self.config.openai_api_key.is_some() {
-            warn!("[Gemini] 切换到 OpenAI 兼容 API");
-            let model = self.openai_model_for(mode);
-            match self
-                .call_openai_api(prompt, system_prompt, &model, thinking)
-                .await
-            {
-                Ok(response) => return Ok(response),
-                Err(openai_error) => {
-                    error!("[OpenAI] 备选 API 也失败: {}", openai_error);
                 }
             }
         }
@@ -329,7 +318,7 @@ impl GeminiAnalyzer {
 
         gemini_response
             .candidates
-            .get(0)
+            .first()
             .and_then(|c| {
                 // v17.3 (P2 fix): 拼接所有 parts, 不仅是第一个 (Gemini multi-part response)
                 // includeThoughts + chain-of-thought 都会产生多个 part
@@ -349,8 +338,8 @@ impl GeminiAnalyzer {
             .ok_or_else(|| anyhow!("Gemini 返回空响应"))
     }
 
-    /// 调用 OpenAI 兼容 API
-    async fn call_openai_api(
+    /// 调用 DeepSeek API
+    async fn call_deepseek_api(
         &self,
         prompt: &str,
         system_prompt: &str,
@@ -358,7 +347,7 @@ impl GeminiAnalyzer {
         thinking: bool,
     ) -> Result<String> {
         #[derive(Serialize)]
-        struct OpenAIRequest {
+        struct DeepSeekRequest {
             model: String,
             messages: Vec<Message>,
             temperature: f32,
@@ -374,7 +363,7 @@ impl GeminiAnalyzer {
         }
 
         #[derive(Deserialize)]
-        struct OpenAIResponse {
+        struct DeepSeekResponse {
             choices: Vec<Choice>,
         }
 
@@ -391,18 +380,18 @@ impl GeminiAnalyzer {
 
         let api_key = self
             .config
-            .openai_api_key
+            .deepseek_api_key
             .as_ref()
-            .ok_or_else(|| anyhow!("OpenAI API Key 未配置"))?;
+            .ok_or_else(|| anyhow!("DeepSeek API Key 未配置"))?;
 
         let base_url = self
             .config
-            .openai_base_url
+            .deepseek_base_url
             .as_deref()
-            .unwrap_or("https://api.openai.com/v1");
+            .unwrap_or("https://api.deepseek.com/v1");
         let url = format!("{}/chat/completions", base_url);
 
-        let request = OpenAIRequest {
+        let request = DeepSeekRequest {
             model: model.to_string(),
             messages: vec![
                 Message {
@@ -430,7 +419,7 @@ impl GeminiAnalyzer {
             .json(&request)
             .send()
             .await
-            .context("OpenAI API 请求失败")?;
+            .context("DeepSeek API 请求失败")?;
 
         let status = response.status();
         if !status.is_success() {
@@ -438,16 +427,16 @@ impl GeminiAnalyzer {
             return Err(anyhow!("HTTP {}: {}", status, error_text));
         }
 
-        let response_text = response.text().await.context("读取 OpenAI 响应失败")?;
-        let openai_response: OpenAIResponse =
-            serde_json::from_str(&response_text).with_context(|| {
+        let response_text = response.text().await.context("读取 DeepSeek 响应失败")?;
+        let deepseek_response: DeepSeekResponse = serde_json::from_str(&response_text)
+            .with_context(|| {
                 let snippet = response_text.chars().take(1000).collect::<String>();
-                format!("解析 OpenAI 响应失败，原始响应片段: {}", snippet)
+                format!("解析 DeepSeek 响应失败，原始响应片段: {}", snippet)
             })?;
 
-        openai_response
+        deepseek_response
             .choices
-            .get(0)
+            .first()
             .and_then(|c| {
                 c.message
                     .content
@@ -455,7 +444,7 @@ impl GeminiAnalyzer {
                     .filter(|s| !s.trim().is_empty())
                     .or_else(|| c.message.reasoning_content.clone())
             })
-            .ok_or_else(|| anyhow!("OpenAI 返回空响应"))
+            .ok_or_else(|| anyhow!("DeepSeek 返回空响应"))
     }
 
     /// 调用豆包 (Doubao) API
@@ -570,7 +559,7 @@ impl GeminiAnalyzer {
 
         doubao_response
             .choices
-            .get(0)
+            .first()
             .and_then(|c| {
                 c.message
                     .content

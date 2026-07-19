@@ -1,3 +1,4 @@
+//! Registered business rules: BR-064.
 //! Sina 财经数据提供者 (骨架版, Task 2)
 //!
 //! 通过 Sina JSONP 接口抓取日 K 线数据.
@@ -6,6 +7,7 @@
 //! 实时行情 (hq_str) 与股票名解析在后续 Task 中实现.
 
 use anyhow::{anyhow, Result};
+use chrono::{FixedOffset, NaiveDateTime, TimeZone, Utc};
 use encoding_rs::GBK;
 use serde::Deserialize;
 
@@ -15,6 +17,10 @@ use crate::data_provider::stock_code_map::to_sina;
 /// Sina 数据提供者
 pub struct SinaProvider {
     client: reqwest::Client,
+    #[cfg(test)]
+    kline_url_override: Option<String>,
+    #[cfg(test)]
+    hq_url_override: Option<String>,
 }
 
 /// 构造 Sina K线 URL (JSONP).
@@ -67,11 +73,12 @@ pub struct SinaHqQuote {
     pub low: f64,
     pub volume: f64,
     pub amount: f64,
+    pub source_time: chrono::DateTime<Utc>,
 }
 
 /// 解析 `var hq_str_xx="name,open,prev_close,current,high,low,bid,ask,volume,amount,...";`
 ///
-/// 至少需要 10 个字段 (含 name + 9 个数值), 少于则报错.
+/// 至少需要 32 个字段，字段 30/31 是来源日期和时间；少于则报错。
 pub fn parse_hq_str(body: &str, code: &str) -> Result<SinaHqQuote> {
     // 提取第一对 `"..."` 内的 CSV.
     let start = body.find('"').ok_or_else(|| anyhow!("Sina hq: 无引号"))?;
@@ -83,19 +90,50 @@ pub fn parse_hq_str(body: &str, code: &str) -> Result<SinaHqQuote> {
     }
     let csv = &body[start + 1..end];
     let fields: Vec<&str> = csv.split(',').collect();
-    if fields.len() < 10 {
-        return Err(anyhow!("Sina hq {}: 字段数 {} < 10", code, fields.len()));
+    if fields.len() < 32 {
+        return Err(anyhow!("Sina hq {}: 字段数 {} < 32", code, fields.len()));
     }
-    Ok(SinaHqQuote {
+    let parse = |index: usize, field: &str| -> Result<f64> {
+        let value = fields[index]
+            .parse::<f64>()
+            .map_err(|error| anyhow!("Sina hq {code}: {field} 非法: {error}"))?;
+        if value.is_finite() && value >= 0.0 {
+            Ok(value)
+        } else {
+            Err(anyhow!("Sina hq {code}: {field} 非法值 {value}"))
+        }
+    };
+    let source_local = NaiveDateTime::parse_from_str(
+        &format!("{} {}", fields[30], fields[31]),
+        "%Y-%m-%d %H:%M:%S",
+    )
+    .map_err(|error| anyhow!("Sina hq {code}: source_time 非法: {error}"))?;
+    let shanghai = FixedOffset::east_opt(8 * 60 * 60)
+        .ok_or_else(|| anyhow!("Sina hq {code}: 无法构造 UTC+8 时区"))?;
+    let source_time = shanghai
+        .from_local_datetime(&source_local)
+        .single()
+        .map(|value| value.with_timezone(&Utc))
+        .ok_or_else(|| anyhow!("Sina hq {code}: source_time 不唯一"))?;
+    let quote = SinaHqQuote {
         name: fields[0].to_string(),
-        open: fields[1].parse().unwrap_or(0.0),
-        yesterday_close: fields[2].parse().unwrap_or(0.0),
-        current: fields[3].parse().unwrap_or(0.0),
-        high: fields[4].parse().unwrap_or(0.0),
-        low: fields[5].parse().unwrap_or(0.0),
-        volume: fields[8].parse().unwrap_or(0.0),
-        amount: fields[9].parse().unwrap_or(0.0),
-    })
+        open: parse(1, "open")?,
+        yesterday_close: parse(2, "yesterday_close")?,
+        current: parse(3, "current")?,
+        high: parse(4, "high")?,
+        low: parse(5, "low")?,
+        volume: parse(8, "volume")?,
+        amount: parse(9, "amount")?,
+        source_time,
+    };
+    if quote.yesterday_close <= 0.0 || quote.current <= 0.0 {
+        return Err(anyhow!(
+            "Sina hq {code}: required prices must be positive (prev={}, current={})",
+            quote.yesterday_close,
+            quote.current
+        ));
+    }
+    Ok(quote)
 }
 
 impl SinaProvider {
@@ -106,15 +144,40 @@ impl SinaProvider {
             .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        Self { client }
+        Self {
+            client,
+            #[cfg(test)]
+            kline_url_override: None,
+            #[cfg(test)]
+            hq_url_override: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_test_urls(client: reqwest::Client, kline_url: String, hq_url: String) -> Self {
+        Self {
+            client,
+            kline_url_override: Some(kline_url),
+            hq_url_override: Some(hq_url),
+        }
     }
 
     /// 抓取 Sina K线 (GBK → UTF-8 decode).
     pub async fn fetch_kline_raw(&self, code: &str, days: usize) -> Result<Vec<KlineData>> {
+        #[cfg(test)]
+        let url = self
+            .kline_url_override
+            .clone()
+            .unwrap_or_else(|| build_kline_url(code, days));
+        #[cfg(not(test))]
         let url = build_kline_url(code, days);
+        self.fetch_kline_from_url(code, &url).await
+    }
+
+    async fn fetch_kline_from_url(&self, code: &str, url: &str) -> Result<Vec<KlineData>> {
         let bytes = self
             .client
-            .get(&url)
+            .get(url)
             .header("Referer", "https://finance.sina.com.cn")
             .send()
             .await?
@@ -132,10 +195,20 @@ impl SinaProvider {
 
     /// 抓取 Sina 实时行情 (单只, GBK → UTF-8 decode).
     pub async fn fetch_hq_async(&self, code: &str) -> Result<SinaHqQuote> {
+        #[cfg(test)]
+        let url = self
+            .hq_url_override
+            .clone()
+            .unwrap_or_else(|| build_hq_url(code));
+        #[cfg(not(test))]
         let url = build_hq_url(code);
+        self.fetch_hq_from_url(code, &url).await
+    }
+
+    async fn fetch_hq_from_url(&self, code: &str, url: &str) -> Result<SinaHqQuote> {
         let bytes = self
             .client
-            .get(&url)
+            .get(url)
             .header("Referer", "https://finance.sina.com.cn")
             .send()
             .await?
@@ -162,56 +235,12 @@ pub fn parse_kline_body(body: &str, code: &str) -> Result<Vec<KlineData>> {
     let json = &body[start..=end];
     let rows: Vec<SinaKlineRow> =
         serde_json::from_str(json).map_err(|e| anyhow!("Sina K线 JSON parse 失败: {e}"))?;
-    Ok(rows.into_iter().map(|r| map_kline_row(r, code)).collect())
-}
-
-/// 将单条 Sina K线行映射到标准 `KlineData` 结构.
-fn map_kline_row(r: SinaKlineRow, _code: &str) -> KlineData {
-    use chrono::NaiveDate;
-    let date = NaiveDate::parse_from_str(&r.day, "%Y-%m-%d")
-        .unwrap_or_else(|_| chrono::Local::now().date_naive());
-    let open = r.open.parse().unwrap_or(0.0);
-    let high = r.high.parse().unwrap_or(0.0);
-    let low = r.low.parse().unwrap_or(0.0);
-    let close = r.close.parse().unwrap_or(0.0);
-    let volume = r.volume.parse().unwrap_or(0.0);
-    let pct_chg = if open > 0.0 {
-        (close - open) / open * 100.0
-    } else {
-        0.0
-    };
-    KlineData {
-        date,
-        open,
-        high,
-        low,
-        close,
-        volume,
-        amount: 0.0, // Sina K线 API 不直接给 amount
-        pct_chg,
-        intraday_price: None,
-        settled: true,
-        pe_ratio: None,
-        pb_ratio: None,
-        turnover_rate: None,
-        market_cap: None,
-        circulating_cap: None,
-        eps: None,
-        roe: None,
-        revenue_yoy: None,
-        net_profit_yoy: None,
-        gross_margin: None,
-        net_margin: None,
-        sharpe_ratio: None,
-        financials_history: None,
-        valuation_history: None,
-        consensus: None,
-        industry: None,
-        is_limit_up: false,
-        is_limit_down: false,
-        is_suspended: false,
-        adjust: super::AdjustType::None,
+    if rows.is_empty() {
+        return Ok(Vec::new());
     }
+    Err(anyhow!(
+        "Sina K线 {code}: 协议不提供必填 amount 字段，BR-092 禁止补零或估算"
+    ))
 }
 
 impl DataProvider for SinaProvider {
@@ -233,23 +262,27 @@ impl DataProvider for SinaProvider {
     fn get_realtime_quote(&self, code: &str) -> Result<Option<RealtimeQuote>> {
         // sync DataProvider trait 内部跑 async — 用 crate 共享 helper
         let hq = crate::block_on_async(self.fetch_hq_async(code))?;
-        let pct_chg = if hq.yesterday_close > 0.0 {
-            (hq.current - hq.yesterday_close) / hq.yesterday_close * 100.0
-        } else {
-            0.0
-        };
+        let pct_chg = (hq.current - hq.yesterday_close) / hq.yesterday_close * 100.0;
+        let limits = super::limit_status::LimitStatusCalculator::new().calculate(
+            code,
+            hq.yesterday_close,
+            &hq.name,
+        );
         Ok(Some(RealtimeQuote {
             code: code.to_string(),
             name: hq.name,
             price: hq.current,
             pct_chg,
-            pe_ratio: 0.0,
-            pb_ratio: 0.0,
-            turnover_rate: 0.0,
-            market_cap: 0.0,
-            circulating_cap: 0.0,
-            volume: hq.volume,
-            amount: hq.amount,
+            pe_ratio: None,
+            pb_ratio: None,
+            turnover_rate: None,
+            market_cap: None,
+            circulating_cap: None,
+            volume: Some(hq.volume),
+            amount: Some(hq.amount),
+            limit_up_price: Some(limits.limit_up_price),
+            limit_down_price: Some(limits.limit_down_price),
+            source_time: hq.source_time,
         }))
     }
 }
@@ -257,5 +290,184 @@ impl DataProvider for SinaProvider {
 impl Default for SinaProvider {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod strict_kline_tests {
+    use super::*;
+
+    fn hq_body(overrides: &[(usize, &str)]) -> String {
+        let mut fields = vec!["0"; 32];
+        fields[0] = "协议测试股票";
+        fields[1] = "10.00";
+        fields[2] = "9.80";
+        fields[3] = "10.10";
+        fields[4] = "10.20";
+        fields[5] = "9.70";
+        fields[8] = "123456";
+        fields[9] = "987654.50";
+        fields[30] = "2026-07-16";
+        fields[31] = "15:00:00";
+        for (index, value) in overrides {
+            fields[*index] = value;
+        }
+        format!("var hq_str_sh600519=\"{}\";", fields.join(","))
+    }
+
+    #[test]
+    fn url_builders_normalize_single_and_batch_symbols() {
+        assert_eq!(
+            build_kline_url("600519", 30),
+            "https://quotes.sina.cn/cn/api/jsonp_v2.php/=/CN_MarketDataService.getKLineData?symbol=sh600519&scale=240&datalen=30"
+        );
+        assert_eq!(
+            build_hq_url("600519, 000001"),
+            "https://hq.sinajs.cn/list=sh600519,sz000001"
+        );
+    }
+
+    #[test]
+    fn hq_parser_preserves_complete_prices_volume_and_source_time() {
+        let quote = parse_hq_str(&hq_body(&[]), "600519").unwrap();
+        assert_eq!(quote.name, "协议测试股票");
+        assert_eq!(quote.open, 10.0);
+        assert_eq!(quote.yesterday_close, 9.8);
+        assert_eq!(quote.current, 10.1);
+        assert_eq!(quote.high, 10.2);
+        assert_eq!(quote.low, 9.7);
+        assert_eq!(quote.volume, 123_456.0);
+        assert_eq!(quote.amount, 987_654.5);
+        assert_eq!(
+            quote.source_time,
+            Utc.with_ymd_and_hms(2026, 7, 16, 7, 0, 0).single().unwrap()
+        );
+    }
+
+    #[test]
+    fn hq_parser_rejects_protocol_numeric_and_time_failures() {
+        for (body, expected) in [
+            ("no quotes".to_string(), "无引号"),
+            ("var hq=\"".to_string(), "引号位置异常"),
+            ("var hq=\"a,b\";".to_string(), "字段数"),
+            (hq_body(&[(1, "bad")]), "open 非法"),
+            (hq_body(&[(8, "-1")]), "volume 非法值"),
+            (hq_body(&[(9, "NaN")]), "amount 非法值"),
+            (hq_body(&[(2, "0")]), "required prices"),
+            (hq_body(&[(3, "0")]), "required prices"),
+            (hq_body(&[(30, "bad-date")]), "source_time 非法"),
+            (hq_body(&[(31, "25:00:00")]), "source_time 非法"),
+        ] {
+            let error = parse_hq_str(&body, "600519").unwrap_err().to_string();
+            assert!(
+                error.contains(expected),
+                "expected={expected:?} error={error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn br092_daily_kline_is_unavailable_without_source_amount() {
+        let body = r#"callback([{"day":"2026-07-16","open":"10","high":"10.2","low":"9.8","close":"10.1","volume":"1000"}])"#;
+        let error = parse_kline_body(body, "000001")
+            .expect_err("Sina daily rows do not carry a real amount field");
+        assert!(error.to_string().contains("amount"));
+    }
+
+    #[test]
+    fn kline_jsonp_parser_distinguishes_empty_missing_and_malformed_batches() {
+        assert!(parse_kline_body("callback([])", "600519")
+            .unwrap()
+            .is_empty());
+        for (body, expected) in [
+            ("callback({})", "无 JSON 数组"),
+            ("callback([{})", "JSON 不完整"),
+            ("callback([bad])", "JSON parse"),
+            (r#"callback([{"day":"2026-07-16"}])"#, "JSON parse"),
+        ] {
+            let error = parse_kline_body(body, "600519").unwrap_err().to_string();
+            assert!(
+                error.contains(expected),
+                "expected={expected:?} error={error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_metadata_has_no_synthetic_name() {
+        let provider = SinaProvider::default();
+        assert_eq!(provider.name(), "sina_hq");
+        assert_eq!(provider.get_stock_name("600519"), None);
+    }
+
+    #[tokio::test]
+    async fn loopback_sina_transports_preserve_empty_kline_and_complete_hq_protocols() {
+        use super::super::{loopback_http_client, TestHttpResponse, TestHttpServer};
+
+        let provider = SinaProvider::with_test_urls(
+            loopback_http_client(),
+            "TEST_CODE_UNUSED_KLINE_URL".to_string(),
+            "TEST_CODE_UNUSED_HQ_URL".to_string(),
+        );
+        let server = TestHttpServer::new(vec![TestHttpResponse::json("callback([])")]);
+        let data = provider
+            .fetch_kline_from_url("TEST_CODE_600519", server.base_url())
+            .await
+            .expect("truthful empty Sina K-line batch must remain empty");
+        assert!(data.is_empty());
+        assert_eq!(server.finish(), vec!["/"]);
+
+        let server =
+            TestHttpServer::new(vec![TestHttpResponse::json(hq_body(&[(0, "TEST_STOCK")]))]);
+        let quote = provider
+            .fetch_hq_from_url("TEST_CODE_600519", server.base_url())
+            .await
+            .expect("complete ASCII HQ response must parse after GBK decoding");
+        assert_eq!(quote.name, "TEST_STOCK");
+        assert_eq!(quote.current, 10.1);
+        assert_eq!(server.finish(), vec!["/"]);
+
+        let server = TestHttpServer::new(vec![TestHttpResponse {
+            status: 404,
+            body: "not found".to_string(),
+        }]);
+        let error = provider
+            .fetch_kline_from_url("TEST_CODE_600519", server.base_url())
+            .await
+            .expect_err("Sina non-2xx response must fail explicitly");
+        assert!(error.to_string().contains("404"));
+        assert_eq!(server.finish(), vec!["/"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn public_provider_entrypoints_commit_local_protocol_quotes_without_fake_fields() {
+        use super::super::{loopback_http_client, TestHttpResponse, TestHttpServer};
+
+        let server = TestHttpServer::new(vec![
+            TestHttpResponse::json("callback([])"),
+            TestHttpResponse::json(hq_body(&[(0, "TEST_STOCK")])),
+        ]);
+        let provider = SinaProvider::with_test_urls(
+            loopback_http_client(),
+            server.base_url().to_string(),
+            server.base_url().to_string(),
+        );
+
+        assert!(provider
+            .get_daily_data("TEST_CODE_600519", 2)
+            .expect("empty source batch remains an explicit empty batch")
+            .is_empty());
+        let quote = provider
+            .get_realtime_quote("TEST_CODE_600519")
+            .expect("complete local quote protocol")
+            .expect("Sina returns a present quote");
+        assert_eq!(quote.code, "TEST_CODE_600519");
+        assert_eq!(quote.name, "TEST_STOCK");
+        assert_eq!(quote.price, 10.1);
+        assert_eq!(quote.volume, Some(123_456.0));
+        assert_eq!(quote.amount, Some(987_654.5));
+        assert!(quote.pe_ratio.is_none());
+        assert!(quote.pb_ratio.is_none());
+        assert_eq!(server.finish().len(), 2);
     }
 }

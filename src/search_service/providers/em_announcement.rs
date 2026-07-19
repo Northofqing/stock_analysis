@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+#[cfg(test)]
 use chrono::NaiveDate;
 use serde::Deserialize;
 
@@ -47,7 +48,6 @@ impl EmAnnouncementProvider {
     pub async fn fetch_announcements(&self, date: &str, limit: usize) -> Result<Vec<SearchResult>> {
         #[derive(Deserialize, Debug)]
         struct Code {
-            stock_code: Option<String>,
             short_name: Option<String>,
         }
 
@@ -190,26 +190,11 @@ impl EmAnnouncementProvider {
         limit: usize,
     ) -> Result<Vec<SearchResult>> {
         #[derive(Deserialize, Debug)]
-        struct Code {
-            stock_code: Option<String>,
-            short_name: Option<String>,
-        }
-
-        #[derive(Deserialize, Debug)]
-        struct Column {
-            column_name: Option<String>,
-        }
-
-        #[derive(Deserialize, Debug)]
         struct AnnItem {
             art_code: Option<String>,
             title: Option<String>,
             #[serde(default)]
             notice_date: Option<String>,
-            #[serde(default)]
-            codes: Vec<Code>,
-            #[serde(default)]
-            columns: Vec<Column>,
         }
 
         #[derive(Deserialize, Debug)]
@@ -282,6 +267,7 @@ impl EmAnnouncementProvider {
     }
 
     /// 校验日期格式 YYYY-MM-DD
+    #[cfg(test)]
     fn valid_date(s: &str) -> bool {
         NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok()
     }

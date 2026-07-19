@@ -16,8 +16,8 @@
 //! Fix review #14: 业务模块接入推 v16.4 #5 (SignalBus 接入 intraday_monitor,
 //!                  TradingBus 接入 paper_trade, SystemBus 接入 PerformanceEngine).
 
-use serde::{Deserialize, Serialize};
 use once_cell::sync::OnceCell;
+use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 const SIGNAL_BUS_CAPACITY: usize = 512;
@@ -93,17 +93,31 @@ fn new_id(prefix: &str) -> String {
     format!("{}-{}-{:x}", prefix, ts, n)
 }
 
-pub fn new_signal_id() -> SignalId { new_id("sig") }
-pub fn new_decision_id() -> DecisionId { new_id("dec") }
-pub fn new_order_id() -> OrderId { new_id("ord") }
-pub fn new_execution_id() -> ExecutionId { new_id("exe") }
+pub fn new_signal_id() -> SignalId {
+    new_id("sig")
+}
+pub fn new_decision_id() -> DecisionId {
+    new_id("dec")
+}
+pub fn new_order_id() -> OrderId {
+    new_id("ord")
+}
+pub fn new_execution_id() -> ExecutionId {
+    new_id("exe")
+}
 pub fn new_strategy_id(name: &str, version: &str) -> StrategyId {
     format!("strat-{}-{}-{}", name, version, &new_id("v")[4..])
 }
 
-pub struct SignalBus { tx: broadcast::Sender<SignalEvent> }
-pub struct TradingBus { tx: broadcast::Sender<TradingEvent> }
-pub struct SystemBus { tx: broadcast::Sender<SystemEvent> }
+pub struct SignalBus {
+    tx: broadcast::Sender<SignalEvent>,
+}
+pub struct TradingBus {
+    tx: broadcast::Sender<TradingEvent>,
+}
+pub struct SystemBus {
+    tx: broadcast::Sender<SystemEvent>,
+}
 
 static SIGNAL_BUS: OnceCell<SignalBus> = OnceCell::new();
 static TRADING_BUS: OnceCell<TradingBus> = OnceCell::new();
@@ -111,26 +125,44 @@ static SYSTEM_BUS: OnceCell<SystemBus> = OnceCell::new();
 
 impl SignalBus {
     pub fn global() -> &'static Self {
-        SIGNAL_BUS.get_or_init(|| Self { tx: broadcast::channel(SIGNAL_BUS_CAPACITY).0 })
+        SIGNAL_BUS.get_or_init(|| Self {
+            tx: broadcast::channel(SIGNAL_BUS_CAPACITY).0,
+        })
     }
-    pub fn publish(&self, event: SignalEvent) { let _ = self.tx.send(event); }
-    pub fn subscribe(&self) -> broadcast::Receiver<SignalEvent> { self.tx.subscribe() }
+    pub fn publish(&self, event: SignalEvent) {
+        let _ = self.tx.send(event);
+    }
+    pub fn subscribe(&self) -> broadcast::Receiver<SignalEvent> {
+        self.tx.subscribe()
+    }
 }
 
 impl TradingBus {
     pub fn global() -> &'static Self {
-        TRADING_BUS.get_or_init(|| Self { tx: broadcast::channel(TRADING_BUS_CAPACITY).0 })
+        TRADING_BUS.get_or_init(|| Self {
+            tx: broadcast::channel(TRADING_BUS_CAPACITY).0,
+        })
     }
-    pub fn publish(&self, event: TradingEvent) { let _ = self.tx.send(event); }
-    pub fn subscribe(&self) -> broadcast::Receiver<TradingEvent> { self.tx.subscribe() }
+    pub fn publish(&self, event: TradingEvent) {
+        let _ = self.tx.send(event);
+    }
+    pub fn subscribe(&self) -> broadcast::Receiver<TradingEvent> {
+        self.tx.subscribe()
+    }
 }
 
 impl SystemBus {
     pub fn global() -> &'static Self {
-        SYSTEM_BUS.get_or_init(|| Self { tx: broadcast::channel(SYSTEM_BUS_CAPACITY).0 })
+        SYSTEM_BUS.get_or_init(|| Self {
+            tx: broadcast::channel(SYSTEM_BUS_CAPACITY).0,
+        })
     }
-    pub fn publish(&self, event: SystemEvent) { let _ = self.tx.send(event); }
-    pub fn subscribe(&self) -> broadcast::Receiver<SystemEvent> { self.tx.subscribe() }
+    pub fn publish(&self, event: SystemEvent) {
+        let _ = self.tx.send(event);
+    }
+    pub fn subscribe(&self) -> broadcast::Receiver<SystemEvent> {
+        self.tx.subscribe()
+    }
 }
 
 #[cfg(test)]
@@ -145,12 +177,16 @@ mod tests {
         bus.publish(SignalEvent::SignalEmitted {
             signal_id: signal_id.clone(),
             strategy_id: "strat-test".to_string(),
-            code: "000001".to_string(),
+            code: "TEST_CODE_000001".to_string(),
             score: 7.5,
         });
         let ev = rx.try_recv().expect("应该收到事件");
         match ev {
-            SignalEvent::SignalEmitted { signal_id: id, score, .. } => {
+            SignalEvent::SignalEmitted {
+                signal_id: id,
+                score,
+                ..
+            } => {
                 assert_eq!(id, signal_id);
                 assert_eq!(score, 7.5);
             }
@@ -166,14 +202,16 @@ mod tests {
         bus.publish(TradingEvent::OrderCreated {
             decision_id: new_decision_id(),
             order_id: order_id.clone(),
-            code: "600519".to_string(),
+            code: "TEST_CODE_600519".to_string(),
             side: "buy".to_string(),
         });
         let ev = rx.try_recv().expect("应该收到事件");
         match ev {
-            TradingEvent::OrderCreated { order_id: id, code, .. } => {
+            TradingEvent::OrderCreated {
+                order_id: id, code, ..
+            } => {
                 assert_eq!(id, order_id);
-                assert_eq!(code, "600519");
+                assert_eq!(code, "TEST_CODE_600519");
             }
             _ => panic!("事件类型错"),
         }

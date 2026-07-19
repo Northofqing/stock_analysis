@@ -14,7 +14,7 @@
 use diesel::prelude::*;
 
 use super::DatabaseManager;
-use crate::risk::env_guard::current_env;
+use crate::risk::env_guard::{current_env, TradingEnv};
 use crate::schema::{position_adjustments, stock_position};
 
 /// 计算某 code 当前可用股数 (可卖数).
@@ -78,6 +78,17 @@ pub fn insert_position_adjustment(
     reason: &str,
     operator: Option<&str>,
 ) -> Result<i64, String> {
+    insert_position_adjustment_in_env(code, delta, source, reason, operator, current_env())
+}
+
+fn insert_position_adjustment_in_env(
+    code: &str,
+    delta: i32,
+    source: &str,
+    reason: &str,
+    operator: Option<&str>,
+    env: TradingEnv,
+) -> Result<i64, String> {
     if code.is_empty() {
         return Err("code 不能为空".to_string());
     }
@@ -92,7 +103,7 @@ pub fn insert_position_adjustment(
     }
 
     // env_guard: 测试环境拦截 (对齐 positions.rs:21)
-    if matches!(current_env(), crate::risk::env_guard::TradingEnv::Test) {
+    if matches!(env, TradingEnv::Test) {
         log::warn!(
             "[ENV_GUARD] position_adjustments: 测试环境拦截写入 code={} delta={}",
             code,
@@ -143,14 +154,36 @@ pub fn insert_position_adjustment(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::NewStockPosition;
+
+    fn init_test_db() -> &'static DatabaseManager {
+        DatabaseManager::init(None).expect("test database init");
+        DatabaseManager::get()
+    }
+
+    fn unique_code(label: &str) -> String {
+        format!(
+            "TEST_CODE_SHARES_{label}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        )
+    }
 
     /// available_shares 边界测试: 纯逻辑, 不需要 DB.
     /// 真实 DB 测试由 `tests/position_shares_e2e.rs` (PR3 验收) 覆盖.
     #[test]
     fn insert_position_adjustment_validates_source() {
         // 测试参数校验 (不依赖 DB)
-        assert!(insert_position_adjustment("000001", 0, "manual_confirm", "", None).is_err());
-        assert!(insert_position_adjustment("000001", 100, "invalid_source", "", None).is_err());
+        assert!(
+            insert_position_adjustment("TEST_CODE_000001", 0, "manual_confirm", "", None).is_err()
+        );
+        assert!(
+            insert_position_adjustment("TEST_CODE_000001", 100, "invalid_source", "", None)
+                .is_err()
+        );
         assert!(insert_position_adjustment("", 100, "manual_confirm", "", None).is_err());
     }
 
@@ -158,10 +191,43 @@ mod tests {
     fn insert_position_adjustment_blocked_in_test_env() {
         // 显式设测试环境, 验证 env_guard
         std::env::set_var("STOCK_ENV_MODE", "test");
-        let result = insert_position_adjustment("000001", -100, "manual_confirm", "test", None);
+        let result =
+            insert_position_adjustment("TEST_CODE_000001", -100, "manual_confirm", "test", None);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("测试环境"));
         std::env::remove_var("STOCK_ENV_MODE");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn isolated_sqlite_commit_covers_both_effective_date_branches() {
+        let db = init_test_db();
+        let code = unique_code("ADJUST_COMMIT");
+        let decrease_id = insert_position_adjustment_in_env(
+            &code,
+            -100,
+            "manual_confirm",
+            "TEST_CODE owner's confirmed decrease",
+            Some("TEST_CODE_OPERATOR'1"),
+            TradingEnv::Prod,
+        )
+        .expect("isolated decrease adjustment");
+        let increase_id = insert_position_adjustment_in_env(
+            &code,
+            100,
+            "import",
+            "TEST_CODE imported increase",
+            None,
+            TradingEnv::Prod,
+        )
+        .expect("isolated increase adjustment");
+        assert!(increase_id > decrease_id);
+
+        let mut conn = db.get_conn().expect("test database connection");
+        diesel::sql_query("DELETE FROM position_adjustments WHERE code = ?")
+            .bind::<diesel::sql_types::Text, _>(&code)
+            .execute(&mut conn)
+            .expect("remove isolated adjustments");
     }
 
     /// 有效日期计算: delta<0 → today, delta>0 → today+1
@@ -171,5 +237,81 @@ mod tests {
         let eff_minus = today; // delta<0: 即时
         let eff_plus = today + chrono::Duration::days(1); // delta>0: T+1
         assert!(eff_minus < eff_plus);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn br024_available_shares_uses_only_settled_positions_and_effective_adjustments() {
+        let db = init_test_db();
+        let code = unique_code("COMPOSE");
+        let empty_code = unique_code("EMPTY");
+        assert_eq!(available_shares(&empty_code).unwrap(), None);
+
+        let today = chrono::Local::now().date_naive();
+        let yesterday = today - chrono::Duration::days(1);
+        db.save_position(&NewStockPosition {
+            code: code.clone(),
+            name: "测试可用股份".to_string(),
+            buy_date: yesterday.format("%Y-%m-%d").to_string(),
+            buy_price: 10.0,
+            quantity: 200,
+            status: "open".to_string(),
+            st_type: None,
+            chain_name: None,
+        })
+        .expect("save settled position");
+        db.save_position(&NewStockPosition {
+            code: code.clone(),
+            name: "测试当日股份".to_string(),
+            buy_date: today.format("%Y-%m-%d").to_string(),
+            buy_price: 11.0,
+            quantity: 300,
+            status: "open".to_string(),
+            st_type: None,
+            chain_name: None,
+        })
+        .expect("save same-day position");
+
+        let mut conn = db.get_conn().expect("test database connection");
+        diesel::sql_query(
+            "INSERT INTO position_adjustments \
+             (code, delta, source, reason, effective_date, applied_immediately, operator) \
+             VALUES (?, -50, 'manual_confirm', 'TEST_CODE immediate', ?, 1, NULL), \
+                    (?, 100, 'import', 'TEST_CODE future', ?, 0, 'TEST_CODE_OPERATOR')",
+        )
+        .bind::<diesel::sql_types::Text, _>(&code)
+        .bind::<diesel::sql_types::Text, _>(today.format("%Y-%m-%d").to_string())
+        .bind::<diesel::sql_types::Text, _>(&code)
+        .bind::<diesel::sql_types::Text, _>(
+            (today + chrono::Duration::days(1))
+                .format("%Y-%m-%d")
+                .to_string(),
+        )
+        .execute(&mut conn)
+        .expect("insert isolated adjustment facts");
+        drop(conn);
+
+        assert_eq!(available_shares(&code).unwrap(), Some(150));
+
+        let mut conn = db.get_conn().expect("test database connection");
+        diesel::sql_query(
+            "INSERT INTO position_adjustments \
+             (code, delta, source, reason, effective_date, applied_immediately, operator) \
+             VALUES (?, -500, 'manual_confirm', 'TEST_CODE clamp', ?, 1, NULL)",
+        )
+        .bind::<diesel::sql_types::Text, _>(&code)
+        .bind::<diesel::sql_types::Text, _>(today.format("%Y-%m-%d").to_string())
+        .execute(&mut conn)
+        .expect("insert negative adjustment fact");
+        drop(conn);
+        assert_eq!(available_shares(&code).unwrap(), Some(0));
+
+        let mut conn = db.get_conn().expect("test database connection");
+        diesel::delete(position_adjustments::table.filter(position_adjustments::code.eq(&code)))
+            .execute(&mut conn)
+            .expect("clean adjustment fixtures");
+        diesel::delete(stock_position::table.filter(stock_position::code.eq(&code)))
+            .execute(&mut conn)
+            .expect("clean position fixtures");
     }
 }

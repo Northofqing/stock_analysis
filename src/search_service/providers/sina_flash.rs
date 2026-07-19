@@ -55,7 +55,6 @@ impl SinaFlashProvider {
             url: Option<String>,
             intro: Option<String>,
             ctime: Option<i64>,
-            media_name: Option<String>,
         }
 
         #[derive(Deserialize, Debug)]
@@ -65,13 +64,7 @@ impl SinaFlashProvider {
 
         #[derive(Deserialize, Debug)]
         struct RespResult {
-            status: Option<Status>,
             data: Option<Vec<Item>>,
-        }
-
-        #[derive(Deserialize, Debug)]
-        struct Status {
-            code: Option<i64>,
         }
 
         let url = format!(
@@ -141,17 +134,17 @@ impl SinaFlashProvider {
 
     /// 抓取所有 lid 的快讯并合并去重（按 title 前 30 字）
     pub async fn fetch_flash_news(&self, limit_per_lid: usize) -> Vec<SearchResult> {
-        let join = tokio::join!(
-            self.fetch_lid(1686, limit_per_lid),
-            self.fetch_lid(2516, limit_per_lid),
-            self.fetch_lid(2509, limit_per_lid),
-            self.fetch_lid(1687, limit_per_lid),
-        );
+        let responses = futures::future::join_all(
+            self.lids
+                .iter()
+                .map(|lid| self.fetch_lid(*lid, limit_per_lid)),
+        )
+        .await;
 
         let mut all: Vec<SearchResult> = Vec::new();
-        for res in [&join.0, &join.1, &join.2, &join.3] {
+        for res in responses {
             match res {
-                Ok(v) => all.extend(v.iter().cloned()),
+                Ok(v) => all.extend(v),
                 Err(e) => debug!("[sina_flash] lid 拉取失败: {}", e),
             }
         }
@@ -215,7 +208,7 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_lid_dedup() {
         // 模拟 fetch_lid 返回重复 (title 前缀相同), 验证去重逻辑
-        let p = SinaFlashProvider::with_lids(vec![]);
+        let _p = SinaFlashProvider::with_lids(vec![]);
         let items = vec![
             SearchResult::new(
                 "工信部: 5G-A 商用".into(),

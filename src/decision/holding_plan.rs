@@ -153,7 +153,7 @@ mod tests {
 
     fn input_full() -> HoldingThreePlansInput {
         HoldingThreePlansInput {
-            code: "000001".to_string(),
+            code: "TEST_CODE_000001".to_string(),
             name: "测试".to_string(),
             high_gap_x: 2.0,
             has_support_pressure: true,

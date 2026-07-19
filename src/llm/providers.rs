@@ -16,19 +16,42 @@ pub struct DeepSeekProvider {
     model: String,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct DeepSeekSettings {
+    key: String,
+    base: String,
+    model: String,
+}
+
 impl DeepSeekProvider {
-    pub fn from_env() -> Option<Self> {
-        let key = std::env::var("DEEPSEEK_API_KEY")
-            .ok()
-            .filter(|k| !k.is_empty())?;
-        let base = std::env::var("DEEPSEEK_BASE_URL")
-            .unwrap_or_else(|_| "https://api.deepseek.com/v1".to_string());
-        let model = std::env::var("DEEPSEEK_MODEL").unwrap_or_else(|_| "deepseek-chat".to_string());
-        let cfg = OpenAIConfig::new().with_api_key(key).with_api_base(base);
+    fn settings_from_lookup<F>(get: F) -> Option<DeepSeekSettings>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let key = get("DEEPSEEK_API_KEY").filter(|value| !value.is_empty())?;
+        let base =
+            get("DEEPSEEK_BASE_URL").unwrap_or_else(|| "https://api.deepseek.com/v1".to_string());
+        let model = get("DEEPSEEK_MODEL").unwrap_or_else(|| "deepseek-chat".to_string());
+        Some(DeepSeekSettings { key, base, model })
+    }
+
+    /// 从 key-value lookup 构造. 用于 from_env 和单测.
+    fn from_lookup<F>(get: F) -> Option<Self>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let settings = Self::settings_from_lookup(get)?;
+        let cfg = OpenAIConfig::new()
+            .with_api_key(settings.key)
+            .with_api_base(settings.base);
         Some(Self {
             client: Client::with_config(cfg),
-            model,
+            model: settings.model,
         })
+    }
+
+    pub fn from_env() -> Option<Self> {
+        Self::from_lookup(|name| std::env::var(name).ok())
     }
 }
 
@@ -87,58 +110,33 @@ impl LlmProvider for MiniMaxProvider {
     }
 }
 
-// ============================================================================
-// OpenAI 通用兼容 (Doubao / OpenAI / Gemini OpenAI 端点 / 任意代理)
-// ============================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// 任意 OpenAI 兼容 provider — 通过 env 配置, 用于 DeepSeek/MiniMax 之外的接入
-///
-/// `.env`:
-/// - `OPENAI_COMPAT_API_KEY` / `OPENAI_COMPAT_BASE_URL` / `OPENAI_COMPAT_MODEL`
-/// - `OPENAI_COMPAT_NAME` (默认 "openai_compat")
-pub struct OpenAiCompatProvider {
-    provider_name: &'static str,
-    client: Client<OpenAIConfig>,
-    model: String,
-}
-
-impl OpenAiCompatProvider {
-    pub fn from_env() -> Option<Self> {
-        let key = std::env::var("OPENAI_COMPAT_API_KEY")
-            .ok()
-            .filter(|k| !k.is_empty())?;
-        let base = std::env::var("OPENAI_COMPAT_BASE_URL")
-            .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
-        let model =
-            std::env::var("OPENAI_COMPAT_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
-        let provider_name =
-            std::env::var("OPENAI_COMPAT_NAME").unwrap_or_else(|_| "openai_compat".to_string());
-        // 注意: 静态生命周期限制, 这里只把常见名字放常量池
-        let name_static: &'static str = match provider_name.as_str() {
-            "openai" => "openai",
-            "doubao" => "doubao",
-            "gemini" => "gemini",
-            "moonshot" => "moonshot",
-            _ => "openai_compat",
-        };
-        let cfg = OpenAIConfig::new().with_api_key(key).with_api_base(base);
-        Some(Self {
-            provider_name: name_static,
-            client: Client::with_config(cfg),
-            model,
+    #[test]
+    fn deepseek_provider_reads_canonical_names_only() {
+        let settings = DeepSeekProvider::settings_from_lookup(|name| match name {
+            "DEEPSEEK_API_KEY" => Some("test-key".into()),
+            "DEEPSEEK_BASE_URL" => Some("https://example.invalid/v1".into()),
+            "DEEPSEEK_MODEL" => Some("deepseek-reasoner".into()),
+            _ => None,
         })
-    }
-}
+        .expect("canonical DeepSeek key should create settings");
 
-#[async_trait::async_trait]
-impl LlmProvider for OpenAiCompatProvider {
-    fn name(&self) -> &'static str {
-        self.provider_name
+        assert_eq!(settings.key, "test-key");
+        assert_eq!(settings.base, "https://example.invalid/v1");
+        assert_eq!(settings.model, "deepseek-reasoner");
     }
-    fn model(&self) -> &str {
-        &self.model
-    }
-    async fn chat_json(&self, system: &str, user: &str) -> Result<serde_json::Value, LlmError> {
-        openai_compatible_chat_json(&self.client, &self.model, system, user).await
+
+    #[test]
+    fn deepseek_provider_does_not_use_legacy_openai_names() {
+        assert!(DeepSeekProvider::from_lookup(|name| match name {
+            "OPENAI_API_KEY" => Some("stale-key".into()),
+            "OPENAI_BASE_URL" => Some("https://api.deepseek.com/v1".into()),
+            "OPENAI_MODEL" => Some("deepseek-chat".into()),
+            _ => None,
+        })
+        .is_none());
     }
 }

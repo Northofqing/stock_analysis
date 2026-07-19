@@ -65,6 +65,10 @@ fn analyst_summary(
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "fixed analyst-panel boundary keeps each role visible in the debate audit trail"
+)]
 pub(super) async fn run_debate(
     analyzer: &GeminiAnalyzer,
     basics: &str,
@@ -142,4 +146,44 @@ pub(super) async fn run_debate(
         });
 
     DebateOutput { bull, bear, risk }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unavailable_model_preserves_empty_debate_and_complete_analyst_summary() {
+        let analyzer = GeminiAnalyzer::new(crate::analyzer::GeminiConfig {
+            debate_rounds: 3,
+            max_retries: 1,
+            retry_delay: 0.0,
+            request_delay: 0.0,
+            ..crate::analyzer::GeminiConfig::default()
+        });
+        let view = AnalystView {
+            score: 60,
+            stance: "bull".to_string(),
+            confidence: "high".to_string(),
+            key_signals: vec!["TEST_CODE_证据".to_string()],
+            summary: "TEST_CODE_摘要".to_string(),
+        };
+        let summary = analyst_summary(&view, &view, &view, &view, &view, &view);
+        assert!(summary.contains("技术面分析师"));
+        assert!(summary.contains("时间窗口分析师"));
+        let output = run_debate(
+            &analyzer,
+            "TEST_CODE_标的",
+            &view,
+            &view,
+            &view,
+            &view,
+            &view,
+            &view,
+        )
+        .await;
+        assert!(output.bull.is_empty());
+        assert!(output.bear.is_empty());
+        assert!(output.risk.is_empty());
+    }
 }

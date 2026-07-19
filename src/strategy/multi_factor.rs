@@ -206,83 +206,6 @@ impl MultiFactorEngine {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_multi_factor_scoring() {
-        let stocks = vec![
-            StockFactors {
-                code: "000001".to_string(),
-                name: "平安银行".to_string(),
-                market_cap: Some(100.0),
-                roe: Some(0.15),
-                pe: Some(10.0),
-                pb: Some(1.5),
-                turnover_rate: Some(2.0),
-            },
-            StockFactors {
-                code: "000002".to_string(),
-                name: "万科A".to_string(),
-                market_cap: Some(200.0),
-                roe: Some(0.20),
-                pe: Some(8.0),
-                pb: Some(1.2),
-                turnover_rate: Some(3.0),
-            },
-            StockFactors {
-                code: "600000".to_string(),
-                name: "浦发银行".to_string(),
-                market_cap: Some(50.0),
-                roe: Some(0.10),
-                pe: Some(12.0),
-                pb: Some(1.8),
-                turnover_rate: Some(1.5),
-            },
-        ];
-
-        let engine = MultiFactorEngine::with_default();
-        let scores = engine.calculate_scores(&stocks).unwrap();
-
-        assert_eq!(scores.len(), 3);
-        // 第一名应该是综合得分最低的
-        assert!(scores[0].total_score <= scores[1].total_score);
-    }
-
-    #[test]
-    fn test_select_top_stocks() {
-        let stocks = vec![
-            StockFactors {
-                code: "000001".to_string(),
-                name: "平安银行".to_string(),
-                market_cap: Some(100.0),
-                roe: Some(0.15),
-                pe: Some(10.0),
-                pb: Some(1.5),
-                turnover_rate: Some(2.0),
-            },
-            StockFactors {
-                code: "000002".to_string(),
-                name: "万科A".to_string(),
-                market_cap: Some(200.0),
-                roe: Some(0.20),
-                pe: Some(8.0),
-                pb: Some(1.2),
-                turnover_rate: Some(3.0),
-            },
-        ];
-
-        let mut config = MultiFactorConfig::default();
-        config.top_n = 1;
-
-        let engine = MultiFactorEngine::new(config);
-        let selected = engine.select_top_stocks(&stocks).unwrap();
-
-        assert_eq!(selected.len(), 1);
-    }
-}
-
 // ────────────────────────────── FundamentalStrategy 绑定 ──────────────────────────────
 
 /// `MultiFactorEngine` 实现 `FundamentalStrategy`，可统一接入策略框架
@@ -315,5 +238,84 @@ impl super::FundamentalStrategy for MultiFactorStrategy {
 
     fn select_stocks(&self, stocks: &[StockFactors]) -> Result<Vec<StockScore>> {
         self.engine.calculate_scores(stocks)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_multi_factor_scoring() {
+        let stocks = vec![
+            StockFactors {
+                code: "TEST_CODE_000001".to_string(),
+                name: "平安银行".to_string(),
+                market_cap: Some(100.0),
+                roe: Some(0.15),
+                pe: Some(10.0),
+                pb: Some(1.5),
+                turnover_rate: Some(2.0),
+            },
+            StockFactors {
+                code: "TEST_CODE_000002".to_string(),
+                name: "万科A".to_string(),
+                market_cap: Some(200.0),
+                roe: Some(0.20),
+                pe: Some(8.0),
+                pb: Some(1.2),
+                turnover_rate: Some(3.0),
+            },
+            StockFactors {
+                code: "TEST_CODE_600000".to_string(),
+                name: "浦发银行".to_string(),
+                market_cap: Some(50.0),
+                roe: Some(0.10),
+                pe: Some(12.0),
+                pb: Some(1.8),
+                turnover_rate: Some(1.5),
+            },
+        ];
+
+        let engine = MultiFactorEngine::with_default();
+        let scores = engine.calculate_scores(&stocks).unwrap();
+
+        assert_eq!(scores.len(), 3);
+        // 第一名应该是综合得分最低的
+        assert!(scores[0].total_score <= scores[1].total_score);
+    }
+
+    #[test]
+    fn test_select_top_stocks() {
+        let stocks = vec![
+            StockFactors {
+                code: "TEST_CODE_000001".to_string(),
+                name: "平安银行".to_string(),
+                market_cap: Some(100.0),
+                roe: Some(0.15),
+                pe: Some(10.0),
+                pb: Some(1.5),
+                turnover_rate: Some(2.0),
+            },
+            StockFactors {
+                code: "TEST_CODE_000002".to_string(),
+                name: "万科A".to_string(),
+                market_cap: Some(200.0),
+                roe: Some(0.20),
+                pe: Some(8.0),
+                pb: Some(1.2),
+                turnover_rate: Some(3.0),
+            },
+        ];
+
+        let config = MultiFactorConfig {
+            top_n: 1,
+            ..MultiFactorConfig::default()
+        };
+
+        let engine = MultiFactorEngine::new(config);
+        let selected = engine.select_top_stocks(&stocks).unwrap();
+
+        assert_eq!(selected.len(), 1);
     }
 }

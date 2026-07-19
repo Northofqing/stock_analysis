@@ -96,7 +96,9 @@ pub fn score_event(event: &MarketEvent, relation: RelationType, source_count: u8
 pub fn deduplicate_by_event_hash(impacts: Vec<NewsImpact>) -> Vec<NewsImpact> {
     let mut by_code: HashMap<String, NewsImpact> = HashMap::new();
     for imp in impacts {
-        let entry = by_code.entry(imp.code.clone()).or_insert_with(|| imp.clone());
+        let entry = by_code
+            .entry(imp.code.clone())
+            .or_insert_with(|| imp.clone());
         entry.source_count = entry.source_count.max(imp.source_count).saturating_add(1);
         if imp.score > entry.score {
             *entry = imp;
@@ -125,7 +127,11 @@ mod tests {
             certainty: 80,
             chains: vec![],
             occurred_at: now,
-            provenance: vec![SourceRef { provider: "test".into(), url: None, fetched_at: now }],
+            provenance: vec![SourceRef {
+                provider: "test".into(),
+                url: None,
+                fetched_at: now,
+            }],
             ai_degraded: false,
             stale: false,
         }
@@ -146,27 +152,38 @@ mod tests {
 
     #[test]
     fn test_score_event_bull_self() {
-        let e = mk_event(Direction::Bull, 100, "000001");
+        let e = mk_event(Direction::Bull, 100, "TEST_CODE_000001");
         let imp = score_event(&e, RelationType::SelfCode, 1);
-        assert!(imp.score > 100.0, "self bull should exceed 100, got {}", imp.score);
+        assert!(
+            imp.score > 100.0,
+            "self bull should exceed 100, got {}",
+            imp.score
+        );
     }
 
     #[test]
     fn test_source_weight_resonance() {
-        let e = mk_event(Direction::Neutral, 50, "600519");
+        let e = mk_event(Direction::Neutral, 50, "TEST_CODE_600519");
         let alone = score_event(&e, RelationType::SupplyChain, 1);
         let multi = score_event(&e, RelationType::SupplyChain, 3);
-        assert!(multi.score > alone.score, "3 sources should score higher than 1");
+        assert!(
+            multi.score > alone.score,
+            "3 sources should score higher than 1"
+        );
     }
 
     #[test]
     fn test_dedup_merges_sources() {
-        let e1 = mk_event(Direction::Bull, 80, "000001");
-        let e2 = mk_event(Direction::Bull, 80, "000001");
+        let e1 = mk_event(Direction::Bull, 80, "TEST_CODE_000001");
+        let e2 = mk_event(Direction::Bull, 80, "TEST_CODE_000001");
         let i1 = score_event(&e1, RelationType::SelfCode, 1);
         let i2 = score_event(&e2, RelationType::SelfCode, 1);
         let merged = deduplicate_by_event_hash(vec![i1, i2]);
         assert_eq!(merged.len(), 1);
-        assert!(merged[0].source_count >= 2, "merged source_count should grow, got {}", merged[0].source_count);
+        assert!(
+            merged[0].source_count >= 2,
+            "merged source_count should grow, got {}",
+            merged[0].source_count
+        );
     }
 }

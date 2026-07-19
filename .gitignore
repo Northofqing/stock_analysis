@@ -5,6 +5,10 @@
 /target
 /.env
 /.vscode
+/.superpowers/sdd/review-*.diff
+/.superpowers/sdd/sdd-workspace/
+**/__pycache__/
+*.pyc
 /data
 /reports
 /test_data

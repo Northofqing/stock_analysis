@@ -271,7 +271,7 @@ impl PrecisionRsiResult {
                 r.trades.len()
             ));
         }
-        report.push_str("\n");
+        report.push('\n');
 
         report.push_str("> ⚠️ 本策略要求至少 205 日K线（200日均线预热），适合中长期持仓的均值回归波段操作。\n\n");
         report
@@ -343,7 +343,7 @@ impl PrecisionRsiBacktest {
             let dt = Local
                 .from_local_datetime(&naive.and_hms_opt(15, 0, 0).unwrap())
                 .single()
-                .unwrap_or_else(|| Local::now());
+                .unwrap_or_else(Local::now);
 
             // 成交价：次日 open。末根信号丢弃
             let next_exec = if i + 1 < n {
@@ -359,7 +359,7 @@ impl PrecisionRsiBacktest {
                             let dt_next = Local
                                 .from_local_datetime(&d.and_hms_opt(15, 0, 0).unwrap())
                                 .single()
-                                .unwrap_or_else(|| Local::now());
+                                .unwrap_or_else(Local::now);
                             Some((p, dt_next))
                         }
                         _ => None,
@@ -370,8 +370,8 @@ impl PrecisionRsiBacktest {
             };
 
             // 日期范围过滤：仅在范围内记录净值和交易
-            let in_date_range = self.config.start_date.map_or(true, |s| naive >= s)
-                && self.config.end_date.map_or(true, |e| naive <= e);
+            let in_date_range = self.config.start_date.is_none_or(|s| naive >= s)
+                && self.config.end_date.is_none_or(|e| naive <= e);
 
             if in_date_range {
                 daily_values.push((dt, cash + shares * close));
@@ -529,7 +529,7 @@ impl PrecisionRsiBacktest {
             } else {
                 owned = {
                     let mut s = klines.clone();
-                    s.sort_unstable_by(|a, b| a.date.cmp(&b.date));
+                    s.sort_unstable_by_key(|a| a.date);
                     s
                 };
                 &owned
@@ -587,7 +587,7 @@ impl PrecisionRsiBacktest {
                     let dt = Local
                         .from_local_datetime(&naive.and_hms_opt(15, 0, 0).unwrap())
                         .single()
-                        .unwrap_or_else(|| Local::now());
+                        .unwrap_or_else(Local::now);
                     let sum: f64 = maps
                         .iter()
                         .map(|m| m.get(ds).copied().unwrap_or(self.config.initial_capital))
@@ -652,5 +652,118 @@ impl KlineStrategy for PrecisionRsiStrategy {
     ) -> Result<Box<dyn StrategyResult>> {
         let result = self.backtest.run_portfolio(stocks)?;
         Ok(Box::new(result))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data_provider::AdjustType;
+
+    fn history() -> Vec<KlineData> {
+        let start = NaiveDate::from_ymd_opt(2025, 11, 1).expect("valid fixture start");
+        (0..230)
+            .map(|index| {
+                let close = match index {
+                    0..=199 => 10.0 + index as f64 * 0.02,
+                    200..=207 => 15.8 - (index - 200) as f64 * 0.55,
+                    208..=218 => 12.0 + (index - 208) as f64 * 0.65,
+                    _ => 18.5 + (index - 219) as f64 * 0.05,
+                };
+                KlineData {
+                    date: start + chrono::Duration::days(index as i64),
+                    open: close + 0.05,
+                    high: close + 0.2,
+                    low: close - 0.2,
+                    close,
+                    volume: 10_000.0,
+                    amount: close * 10_000.0,
+                    pct_chg: 0.0,
+                    intraday_price: None,
+                    settled: true,
+                    pe_ratio: None,
+                    pb_ratio: None,
+                    turnover_rate: None,
+                    market_cap: None,
+                    circulating_cap: None,
+                    eps: None,
+                    roe: None,
+                    revenue_yoy: None,
+                    net_profit_yoy: None,
+                    gross_margin: None,
+                    net_margin: None,
+                    sharpe_ratio: None,
+                    financials_history: None,
+                    valuation_history: None,
+                    consensus: None,
+                    industry: None,
+                    is_limit_up: false,
+                    is_limit_down: false,
+                    is_suspended: false,
+                    adjust: AdjustType::Qfq,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn precision_engine_executes_indicators_portfolio_and_report_boundaries() {
+        assert!(compute_precision_indicators(&history()[..204]).is_err());
+        let bars = history();
+        let frame = compute_precision_indicators(&bars).expect("complete precision indicators");
+        assert_eq!(frame.height(), bars.len());
+        assert!(frame.column("rsi_5").is_ok());
+        assert!(frame.column("ma200").is_ok());
+
+        let config = PrecisionRsiConfig {
+            start_date: None,
+            end_date: None,
+            ..PrecisionRsiConfig::default()
+        };
+        let engine = PrecisionRsiBacktest::new(config.clone());
+        let single = engine
+            .run_single("TEST_CODE_PRECISION_000001", "测试精准策略", &bars)
+            .expect("single precision backtest");
+        assert_eq!(single.signals.len(), bars.len());
+        assert_eq!(single.rsi5_values.len(), bars.len());
+        assert_eq!(single.daily_values.len(), bars.len());
+        assert!(single.final_value.is_finite());
+
+        assert!(engine.run_portfolio(&[]).is_err());
+        assert!(engine
+            .run_portfolio(&[(
+                "TEST_CODE_SHORT".to_string(),
+                "测试短历史".to_string(),
+                bars[..100].to_vec(),
+            )])
+            .is_err());
+
+        let mut descending = bars.clone();
+        descending.reverse();
+        let portfolio = engine
+            .run_portfolio(&[
+                (
+                    "TEST_CODE_PRECISION_000001".to_string(),
+                    "测试精准策略A".to_string(),
+                    bars,
+                ),
+                (
+                    "TEST_CODE_PRECISION_000002".to_string(),
+                    "测试精准策略B".to_string(),
+                    descending,
+                ),
+            ])
+            .expect("complete precision portfolio");
+        assert_eq!(portfolio.single_results.len(), 2);
+        assert!(!portfolio.portfolio_daily_values.is_empty());
+        let summary = portfolio.to_summary();
+        assert!(summary.final_value.is_finite());
+        let report = portfolio.generate_report();
+        assert!(report.contains("精准RSI深度超卖均值回归策略回测报告"));
+        assert!(report.contains("TEST_CODE_PRECISION_000001"));
+
+        let strategy = PrecisionRsiStrategy::new(config);
+        assert_eq!(strategy.name(), "精准RSI深度超卖均值回归");
+        assert!(strategy.description().contains("5日RSI"));
     }
 }

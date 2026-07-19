@@ -284,3 +284,91 @@ impl MarketAnalyzer {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::market_data::{MarketIndex, SectorInfo, TopStock};
+    use crate::search_service::{SearchResponse, SearchResult};
+
+    fn overview() -> MarketOverview {
+        let mut overview = MarketOverview::new("2026-07-18".to_string());
+        for (code, name, change) in [
+            ("sh000001", "上证指数", 1.2),
+            ("sz399001", "深证成指", -0.8),
+            ("sz399006", "创业板指", 0.0),
+            ("sh000688", "科创50", 0.3),
+        ] {
+            let mut index = MarketIndex::new(code.to_string(), name.to_string());
+            index.current = 3_000.0;
+            index.change_pct = change;
+            overview.indices.push(index);
+        }
+        overview.up_count = 3_200;
+        overview.down_count = 1_500;
+        overview.flat_count = 100;
+        overview.limit_up_count = 60;
+        overview.limit_down_count = 5;
+        overview.total_amount = 12_345.0;
+        overview.north_flow = Some(12.5);
+        overview.top_sectors = vec![SectorInfo {
+            name: "TEST_CODE_机器人".to_string(),
+            change_pct: 3.2,
+        }];
+        overview.bottom_sectors = vec![SectorInfo {
+            name: "TEST_CODE_煤炭".to_string(),
+            change_pct: -2.1,
+        }];
+        overview.top_stocks = vec![TopStock {
+            code: "TEST_CODE_000001".to_string(),
+            name: "TEST_CODE_样本".to_string(),
+            change_pct: 9.9,
+            price: 12.34,
+            ..TopStock::default()
+        }];
+        overview
+    }
+
+    #[test]
+    fn template_prompt_and_no_ai_fallback_preserve_complete_market_facts() {
+        let analyzer = MarketAnalyzer::new(None).expect("local analyzer");
+        let overview = overview();
+        let news = vec![SearchResponse::success(
+            "TEST_CODE_market".to_string(),
+            "TEST_CODE_fixture".to_string(),
+            vec![SearchResult::new(
+                "TEST_CODE 政策发布".to_string(),
+                "TEST_CODE 市场成交活跃".to_string(),
+                "https://example.invalid/news".to_string(),
+                "TEST_CODE_fixture".to_string(),
+            )],
+        )];
+
+        let template = analyzer.generate_template_review(&overview);
+        assert!(template.contains("强势上涨"));
+        assert!(template.contains("北向资金 | +12.50亿"));
+        assert!(template.contains("TEST_CODE_样本"));
+
+        let prompt = analyzer.build_review_prompt(&overview, &news);
+        assert!(prompt.contains("TEST_CODE 政策发布"));
+        assert!(prompt.contains("TEST_CODE_机器人(+3.20%)"));
+        assert!(prompt.contains("+12.50 亿元"));
+
+        let generated = analyzer.generate_market_review(&overview, &news);
+        assert_eq!(generated, template);
+    }
+
+    #[test]
+    fn missing_optional_market_facts_are_marked_not_filled() {
+        let analyzer = MarketAnalyzer::new(None).expect("local analyzer");
+        let mut overview = overview();
+        overview.indices.clear();
+        overview.north_flow = None;
+        let prompt = analyzer.build_review_prompt(&overview, &[]);
+        assert!(prompt.contains("[数据缺失]"));
+        assert!(prompt.contains("暂无相关新闻"));
+        assert!(analyzer
+            .generate_template_review(&overview)
+            .contains("震荡整理"));
+    }
+}

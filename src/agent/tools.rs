@@ -6,6 +6,12 @@ use serde_json::json;
 
 pub struct FetchFinancialTool;
 
+impl Default for FetchFinancialTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FetchFinancialTool {
     pub fn new() -> Self {
         Self
@@ -41,7 +47,7 @@ impl Tool for FetchFinancialTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'code' parameter"))?;
 
-        let fin = service().get_financials(code).await;
+        let fin = service().get_financials(code).await?;
 
         if fin.any() {
             let result = json!({
@@ -56,7 +62,7 @@ impl Tool for FetchFinancialTool {
             });
             Ok(result.to_string())
         } else {
-            Ok(json!({"error": "No financial records found"}).to_string())
+            anyhow::bail!("No financial records found for {code}")
         }
     }
 }

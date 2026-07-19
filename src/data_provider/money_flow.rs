@@ -6,16 +6,9 @@
 //!
 //! 返回结构面向 AI Prompt 组装：直接读字段构建【主力资金】【日内走势】两段。
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-
-#[derive(Debug, Deserialize)]
-struct SinaMoneyflowRow {
-    opendate: String,
-    r0_net: String,
-    changeratio: String,
-}
 
 /// 单日资金流数据
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,19 +86,17 @@ pub struct IntradayShape {
     pub low_pct: f64,              // 日内最低涨幅 (%)
     pub close_pct: f64,            // 收盘涨幅 (%)
     pub amplitude: f64,            // 日内振幅 = (high-low)/pre_close (%)
-    pub tail_30m_pct: f64,         // 尾盘 30 分钟涨幅（14:30→15:00）
+    pub tail_30m_pct: Option<f64>, // 尾盘 30 分钟涨幅（14:30→15:00）；未到 14:30 为 None
     pub shape_label: &'static str, // 形态标签（中文描述）
     pub present: bool,             // 是否成功获取数据
 }
 
 /// 转 A 股代码为 EM 数字市场前缀
 fn to_em_numeric_secid(code: &str) -> String {
-    let market = if code.starts_with('6') || code.starts_with("900") || code.starts_with("688") {
+    let market = if code.starts_with('6') || code.starts_with("900") {
         "1" // 沪市
-    } else if code.starts_with('8') || code.starts_with('4') {
-        "0" // 北交所实际是 0（EM 约定），但 push2his 对北交所资金流无数据，保持一致
     } else {
-        "0" // 深市 / 创业板
+        "0" // 深市 / 创业板 / 北交所（EM 约定）
     };
     format!("{}.{}", market, code)
 }
@@ -118,69 +109,69 @@ fn as_f64(v: &Value) -> Option<f64> {
     }
 }
 
-fn to_sina_symbol(code: &str) -> String {
-    if code.starts_with('6') {
-        format!("sh{}", code)
-    } else {
-        format!("sz{}", code)
-    }
-}
-
-fn parse_ratio_to_percent(raw: &str) -> Option<f64> {
-    let v = raw.trim().parse::<f64>().ok()?;
-    if v.abs() <= 1.0 {
-        Some(v * 100.0)
-    } else {
-        Some(v)
-    }
-}
-
-async fn fetch_flow_history_sina_async(
-    client: &reqwest::Client,
-    code: &str,
-    lmt: usize,
-) -> Result<MoneyFlowSummary> {
-    let symbol = to_sina_symbol(code);
-    let url = format!(
-        "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/MoneyFlow.ssl_qsfx_zjlrqs?page=1&num={}&sort=opendate&asc=0&daima={}",
-        lmt.max(5), symbol
-    );
-    let response = client.get(&url).send().await.context("Sina HTTP请求失败")?;
-    if !response.status().is_success() {
-        return Err(anyhow!("Sina 状态码 {}", response.status()));
-    }
-
-    let text = response.text().await.context("Sina 读取响应失败")?;
-    if text.trim().is_empty() {
-        return Err(anyhow!("Sina 返回空响应"));
-    }
-    let rows: Vec<SinaMoneyflowRow> = serde_json::from_str(&text).context("Sina JSON解析失败")?;
+fn parse_em_money_flow_rows(rows: &[Value]) -> Result<MoneyFlowSummary> {
     if rows.is_empty() {
-        return Ok(MoneyFlowSummary::default());
+        return Err(anyhow!("资金流 klines 为空"));
     }
     let mut days = Vec::with_capacity(rows.len());
-    for row in rows {
-        let main_net = row
-            .r0_net
-            .trim()
-            .parse::<f64>()
-            .map_err(|_| anyhow!("Sina r0_net 解析失败"))?;
-        let pct_chg = parse_ratio_to_percent(&row.changeratio)
-            .ok_or_else(|| anyhow!("Sina changeratio 解析失败"))?;
-
+    for (index, row) in rows.iter().enumerate() {
+        let raw = row
+            .as_str()
+            .ok_or_else(|| anyhow!("资金流第 {} 行不是字符串", index + 1))?;
+        let parts: Vec<&str> = raw.split(',').collect();
+        if parts.len() < 13 {
+            return Err(anyhow!(
+                "资金流第 {} 行字段不足: expected>=13 actual={}",
+                index + 1,
+                parts.len()
+            ));
+        }
+        chrono::NaiveDate::parse_from_str(parts[0], "%Y-%m-%d")
+            .map_err(|error| anyhow!("资金流第 {} 行日期非法: {error}", index + 1))?;
+        let parse = |field: usize, name: &str| -> Result<f64> {
+            let value = parts[field]
+                .parse::<f64>()
+                .map_err(|error| anyhow!("资金流第 {} 行 {name} 解析失败: {error}", index + 1))?;
+            if !value.is_finite() {
+                return Err(anyhow!("资金流第 {} 行 {name} 非有限", index + 1));
+            }
+            Ok(value)
+        };
+        let main_net = parse(1, "main_net")?;
+        let big_net = parse(4, "big_net")?;
+        let xl_net = parse(5, "xl_net")?;
+        let main_pct = parse(6, "main_pct")?;
+        let pct_chg = parse(12, "pct_chg")?;
+        if main_pct.abs() > 100.0 || pct_chg.abs() > 20.0 {
+            return Err(anyhow!(
+                "资金流第 {} 行比例越界: main_pct={} pct_chg={}",
+                index + 1,
+                main_pct,
+                pct_chg
+            ));
+        }
         days.push(MoneyFlowDay {
-            date: row.opendate,
+            date: parts[0].to_string(),
             main_net,
-            xl_net: 0.0,
-            big_net: 0.0,
-            main_pct: 0.0,
+            big_net,
+            xl_net,
+            main_pct,
             pct_chg,
         });
     }
-    days.sort_by(|a, b| a.date.cmp(&b.date));
-    if days.len() > lmt {
-        let skip = days.len() - lmt;
-        days = days.into_iter().skip(skip).collect();
+    days.sort_by(|left, right| left.date.cmp(&right.date));
+    for pair in days.windows(2) {
+        let left = chrono::NaiveDate::parse_from_str(&pair[0].date, "%Y-%m-%d")?;
+        let right = chrono::NaiveDate::parse_from_str(&pair[1].date, "%Y-%m-%d")?;
+        if left == right {
+            return Err(anyhow!("资金流日期重复: {left}"));
+        }
+        let expected = crate::calendar::next_trading_day(left);
+        if right != expected {
+            return Err(anyhow!(
+                "资金流交易日断档: {left} 后应为 {expected}, 实际为 {right}"
+            ));
+        }
     }
     Ok(MoneyFlowSummary { days })
 }
@@ -191,6 +182,28 @@ const PUSH2HIS_HOSTS: [&str; 3] = [
     "push2his-bak.eastmoney.com",
     "82.push2his.eastmoney.com",
 ];
+
+fn parse_flow_http_response(
+    host: &str,
+    status: u16,
+    body: std::result::Result<String, String>,
+) -> Result<MoneyFlowSummary, String> {
+    if !(200..300).contains(&status) {
+        return Err(format!("{host}: 状态码 {status}"));
+    }
+    let text = body.map_err(|error| format!("{host}: 读取响应失败 {error}"))?;
+    if text.trim_start().starts_with('<') {
+        return Err(format!("{host}: 非JSON回包（网关拦截）"));
+    }
+    let json: Value =
+        serde_json::from_str(&text).map_err(|error| format!("{host}: JSON解析失败 {error}"))?;
+    let klines = json
+        .get("data")
+        .and_then(|data| data.get("klines"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("{host}: 资金流无 klines 数组"))?;
+    parse_em_money_flow_rows(klines).map_err(|error| format!("{host}: 资金流批次校验失败: {error}"))
+}
 
 /// 抓取近 `lmt` 天资金流（daykline）
 pub async fn fetch_flow_history_async(
@@ -223,90 +236,232 @@ pub async fn fetch_flow_history_async(
                 continue;
             }
         };
-        if !resp.status().is_success() {
-            last_err = format!("{}: 状态码 {}", host, resp.status());
-            continue;
+        let status = resp.status().as_u16();
+        let body = resp.text().await.map_err(|error| error.to_string());
+        match parse_flow_http_response(host, status, body) {
+            Ok(summary) => return Ok(summary),
+            Err(error) => last_err = error,
         }
-        let text = match resp.text().await {
-            Ok(t) => t,
-            Err(e) => {
-                last_err = format!("{}: 读取响应失败 {}", host, e);
-                continue;
-            }
-        };
-        let body = text.trim_start();
-        if body.starts_with('<') {
-            last_err = format!("{}: 非JSON回包（网关拦截）", host);
-            continue;
-        }
-        let json: Value = match serde_json::from_str(&text) {
-            Ok(v) => v,
-            Err(e) => {
-                last_err = format!("{}: JSON解析失败 {}", host, e);
-                continue;
-            }
-        };
-
-        let Some(klines) = json
-            .get("data")
-            .and_then(|d| d.get("klines"))
-            .and_then(|v| v.as_array())
-        else {
-            last_err = format!("{}: 资金流无 klines 数组", host);
-            continue;
-        };
-
-        // 字段顺序（EM 实测）：date, f52(主力), f53(小单), f54(中单), f55(大单),
-        //                      f56(超大单), f57(主力%), f58(小单%), f59(中单%),
-        //                      f60(大单%), f61(超大单%), f62(收盘价), f63(涨跌幅%), _, _
-        let mut days = Vec::with_capacity(klines.len());
-        for kline in klines {
-            let s = match kline.as_str() {
-                Some(s) => s,
-                None => continue,
-            };
-            // review #14: splitn(13, ',') 限制切分数量, 避免 15 字段时分配 15 元素 Vec.
-            let parts: Vec<&str> = s.splitn(13, ',').collect();
-            if parts.len() < 13 {
-                continue;
-            }
-            let parse_f = |i: usize| parts.get(i).and_then(|p| p.parse::<f64>().ok());
-            let (Some(main_net), Some(big_net), Some(xl_net), Some(main_pct), Some(pct_chg)) =
-                (parse_f(1), parse_f(4), parse_f(5), parse_f(6), parse_f(12))
-            else {
-                continue;
-            };
-            days.push(MoneyFlowDay {
-                date: parts[0].to_string(),
-                main_net,
-                big_net,
-                xl_net,
-                main_pct,
-                pct_chg,
-            });
-        }
-
-        return Ok(MoneyFlowSummary { days });
     }
 
-    let east_err = last_err.clone();
-    // 修复 Top10#7 (2026-06-29 audit): 用 SHARED_HTTP_CLIENT 替代每次新建 sina client
-    let sina_client = crate::http_client::SHARED_HTTP_CLIENT.clone();
-    match fetch_flow_history_sina_async(&sina_client, code, lmt).await {
-        Ok(summary) if !summary.is_empty() => {
-            log::info!("[资金流][Sina] {} 取得 {} 天数据", code, summary.days.len());
-            Ok(summary)
+    Err(anyhow!("资金流历史全部完整来源失败: {last_err}"))
+}
+
+type IntradayRow = (String, f64, f64, f64, f64);
+
+fn parse_intraday_rows(rows: &[Value]) -> Result<Vec<IntradayRow>> {
+    let mut parsed: Vec<IntradayRow> = Vec::with_capacity(rows.len());
+    let mut previous_ts: Option<chrono::NaiveDateTime> = None;
+    for (index, row) in rows.iter().enumerate() {
+        let raw = row
+            .as_str()
+            .ok_or_else(|| anyhow!("分时第 {} 行不是字符串", index + 1))?;
+        let parts: Vec<&str> = raw.split(',').collect();
+        if parts.len() < 6 {
+            return Err(anyhow!(
+                "分时第 {} 行字段不足: expected>=6 actual={}",
+                index + 1,
+                parts.len()
+            ));
         }
-        Ok(_) => Err(anyhow!(
-            "资金流历史全部主机失败: {}；Sina 返回空数据",
-            east_err
-        )),
-        Err(sina_err) => Err(anyhow!(
-            "资金流历史全部主机失败: {}；Sina fallback失败: {}",
-            east_err,
-            sina_err
-        )),
+        let ts = chrono::NaiveDateTime::parse_from_str(parts[0], "%Y-%m-%d %H:%M")
+            .map_err(|error| anyhow!("分时第 {} 行时间非法: {error}", index + 1))?;
+        if let Some(previous) = previous_ts {
+            let delta = ts - previous;
+            let valid_lunch = previous.time()
+                == chrono::NaiveTime::from_hms_opt(11, 30, 0).unwrap()
+                && ts.time() == chrono::NaiveTime::from_hms_opt(13, 0, 0).unwrap()
+                && ts.date() == previous.date();
+            if ts <= previous || (delta != chrono::Duration::minutes(1) && !valid_lunch) {
+                return Err(anyhow!(
+                    "分时时间重复、倒序或缺口: {} -> {}",
+                    previous,
+                    parts[0]
+                ));
+            }
+        }
+        previous_ts = Some(ts);
+        let parse = |field: usize, name: &str| -> Result<f64> {
+            let value = parts[field]
+                .parse::<f64>()
+                .map_err(|error| anyhow!("分时第 {} 行 {name} 解析失败: {error}", index + 1))?;
+            if !value.is_finite() {
+                return Err(anyhow!("分时第 {} 行 {name} 非有限", index + 1));
+            }
+            Ok(value)
+        };
+        let open = parse(1, "open")?;
+        let close = parse(2, "close")?;
+        let high = parse(3, "high")?;
+        let low = parse(4, "low")?;
+        let volume = parse(5, "volume")?;
+        if open <= 0.0
+            || close <= 0.0
+            || high <= 0.0
+            || low <= 0.0
+            || volume < 0.0
+            || high < open.max(close)
+            || low > open.min(close)
+            || high < low
+        {
+            return Err(anyhow!("分时第 {} 行 OHLCV 非法", index + 1));
+        }
+        if let Some(previous) = parsed.last() {
+            let change = (close / previous.2 - 1.0).abs();
+            if change > 0.20 {
+                return Err(anyhow!(
+                    "分时相邻收盘变化超过 ±20%: {} -> {}",
+                    previous.2,
+                    close
+                ));
+            }
+        }
+        parsed.push((parts[0].to_string(), open, close, high, low));
     }
+    if parsed.is_empty() {
+        return Err(anyhow!("分时批次为空"));
+    }
+    Ok(parsed)
+}
+
+fn classify_intraday_shape(
+    open_pct: f64,
+    high_pct: f64,
+    low_pct: f64,
+    close_pct: f64,
+    amplitude: f64,
+    tail_30m_pct: Option<f64>,
+) -> &'static str {
+    let gap_from_high = high_pct - close_pct;
+    let gap_from_low = close_pct - low_pct;
+    if high_pct >= 2.0 && gap_from_high >= 2.0 && close_pct < high_pct * 0.5 {
+        "⚠️ 冲高回落（尾盘跳水风险大）"
+    } else if tail_30m_pct.is_some_and(|value| value <= -1.5) {
+        "⚠️ 尾盘跳水"
+    } else if tail_30m_pct.is_some_and(|value| value >= 1.5) && close_pct > open_pct {
+        "🔥 尾盘拉升（资金抢筹）"
+    } else if open_pct >= 2.0 && close_pct <= open_pct - 1.5 {
+        "⚠️ 高开低走"
+    } else if open_pct <= -1.5 && close_pct >= open_pct + 2.0 {
+        "🔥 低开高走（空头回补）"
+    } else if close_pct >= high_pct - 0.5 && high_pct > 1.5 {
+        "✅ 稳步推高，收在日内高点"
+    } else if close_pct <= low_pct + 0.5 && low_pct < -1.5 {
+        "🔴 持续下行，收在日内低点"
+    } else if amplitude >= 4.0 && gap_from_low >= 2.0 && gap_from_high >= 2.0 {
+        "中阳/中阴，日内震荡剧烈"
+    } else {
+        "窄幅整理"
+    }
+}
+
+/// BR-115: build a shape only from a complete, locally validated intraday batch.
+fn build_intraday_shape(pre_close: f64, trends: &[Value]) -> Result<IntradayShape> {
+    if pre_close <= 0.0 || !pre_close.is_finite() {
+        return Err(anyhow!("分时 preClose 非法: {}", pre_close));
+    }
+    if trends.is_empty() {
+        return Err(anyhow!("分时 trends 为空"));
+    }
+
+    let parsed_rows = parse_intraday_rows(trends)?;
+    let first = parsed_rows
+        .first()
+        .ok_or_else(|| anyhow!("分时 首根缺失"))?;
+    let last = parsed_rows.last().ok_or_else(|| anyhow!("分时 尾根缺失"))?;
+
+    let date = last
+        .0
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| anyhow!("分时 尾根缺日期"))?
+        .to_string();
+
+    let mut day_high = f64::NEG_INFINITY;
+    let mut day_low = f64::INFINITY;
+    let mut tail_start_close: Option<f64> = None;
+    for (ts, _open, close, high, low) in &parsed_rows {
+        if *high > day_high {
+            day_high = *high;
+        }
+        if *low < day_low {
+            day_low = *low;
+        }
+        if tail_start_close.is_none() {
+            if let Some(hm) = ts.split_whitespace().nth(1) {
+                if hm >= "14:30" {
+                    tail_start_close = Some(*close);
+                }
+            }
+        }
+    }
+    if !day_high.is_finite() || !day_low.is_finite() {
+        return Err(anyhow!("分时 高低价未找到"));
+    }
+
+    let open_pct = (first.1 / pre_close - 1.0) * 100.0;
+    let high_pct = (day_high / pre_close - 1.0) * 100.0;
+    let low_pct = (day_low / pre_close - 1.0) * 100.0;
+    let close_pct = (last.2 / pre_close - 1.0) * 100.0;
+    let amplitude = (day_high - day_low) / pre_close * 100.0;
+    let tail_30m_pct = tail_start_close.map(|start| (last.2 / start - 1.0) * 100.0);
+    if [open_pct, high_pct, low_pct, close_pct]
+        .iter()
+        .any(|value| !value.is_finite() || value.abs() > 20.0)
+        || tail_30m_pct.is_some_and(|value| !value.is_finite() || value.abs() > 20.0)
+    {
+        return Err(anyhow!("分时涨跌幅非法或超过 ±20%，需要人工确认"));
+    }
+
+    let shape_label = classify_intraday_shape(
+        open_pct,
+        high_pct,
+        low_pct,
+        close_pct,
+        amplitude,
+        tail_30m_pct,
+    );
+
+    Ok(IntradayShape {
+        date,
+        pre_close,
+        open_pct,
+        high_pct,
+        low_pct,
+        close_pct,
+        amplitude,
+        tail_30m_pct,
+        shape_label,
+        present: true,
+    })
+}
+
+fn parse_intraday_http_response(
+    host: &str,
+    status: u16,
+    body: std::result::Result<String, String>,
+) -> Result<IntradayShape, String> {
+    if !(200..300).contains(&status) {
+        return Err(format!("{host}: 状态码 {status}"));
+    }
+    let text = body.map_err(|error| format!("{host}: 读取失败 {error}"))?;
+    if text.trim_start().starts_with('<') {
+        return Err(format!("{host}: 非JSON回包（网关拦截）"));
+    }
+    let json: Value =
+        serde_json::from_str(&text).map_err(|error| format!("{host}: JSON解析失败 {error}"))?;
+    let data = json
+        .get("data")
+        .ok_or_else(|| format!("{host}: 分时无 data"))?;
+    let pre_close = data
+        .get("preClose")
+        .and_then(as_f64)
+        .ok_or_else(|| format!("{host}: 分时无 preClose"))?;
+    let trends = data
+        .get("trends")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("{host}: 分时无 trends 数组"))?;
+    build_intraday_shape(pre_close, trends).map_err(|error| format!("{host}: {error}"))
 }
 
 /// 抓取当日分时（trends2）并计算形态
@@ -316,7 +471,6 @@ pub async fn fetch_intraday_shape_async(
 ) -> Result<IntradayShape> {
     let secid = to_em_numeric_secid(code);
     let mut last_err = String::new();
-    let mut json_opt: Option<Value> = None;
 
     for host in PUSH2HIS_HOSTS {
         let url = format!(
@@ -340,158 +494,14 @@ pub async fn fetch_intraday_shape_async(
                 continue;
             }
         };
-        if !resp.status().is_success() {
-            last_err = format!("{}: 状态码 {}", host, resp.status());
-            continue;
-        }
-        let text = match resp.text().await {
-            Ok(t) => t,
-            Err(e) => {
-                last_err = format!("{}: 读取失败 {}", host, e);
-                continue;
-            }
-        };
-        let body = text.trim_start();
-        if body.starts_with('<') {
-            last_err = format!("{}: 非JSON回包（网关拦截）", host);
-            continue;
-        }
-        match serde_json::from_str::<Value>(&text) {
-            Ok(v) => {
-                json_opt = Some(v);
-                break;
-            }
-            Err(e) => {
-                last_err = format!("{}: JSON解析失败 {}", host, e);
-                continue;
-            }
+        let status = resp.status().as_u16();
+        let body = resp.text().await.map_err(|error| error.to_string());
+        match parse_intraday_http_response(host, status, body) {
+            Ok(shape) => return Ok(shape),
+            Err(error) => last_err = error,
         }
     }
-
-    let json = json_opt.ok_or_else(|| anyhow!("分时全部主机失败: {}", last_err))?;
-
-    let data = json.get("data").ok_or_else(|| anyhow!("分时 无 data"))?;
-    let pre_close = data
-        .get("preClose")
-        .and_then(as_f64)
-        .ok_or_else(|| anyhow!("分时 无 preClose"))?;
-    if pre_close <= 0.0 {
-        return Err(anyhow!("分时 preClose 非法: {}", pre_close));
-    }
-    let trends = data
-        .get("trends")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| anyhow!("分时 无 trends 数组"))?;
-    if trends.is_empty() {
-        return Err(anyhow!("分时 trends 为空"));
-    }
-
-    // 格式: "date time, open, close, high, low, volume, amount, avg"
-    let parse_row = |s: &str| -> Option<(String, f64, f64, f64, f64)> {
-        // review #14: splitn(6, ',') 限制切分, 8 字段也只切 6 个.
-        let parts: Vec<&str> = s.splitn(6, ',').collect();
-        if parts.len() < 6 {
-            return None;
-        }
-        let ts = parts[0].to_string();
-        let open = parts[1].parse::<f64>().ok()?;
-        let close = parts[2].parse::<f64>().ok()?;
-        let high = parts[3].parse::<f64>().ok()?;
-        let low = parts[4].parse::<f64>().ok()?;
-        Some((ts, open, close, high, low))
-    };
-
-    // 9:30 第一根
-    let first = trends
-        .first()
-        .and_then(|v| v.as_str())
-        .and_then(parse_row)
-        .ok_or_else(|| anyhow!("分时 首根解析失败"))?;
-    let last = trends
-        .last()
-        .and_then(|v| v.as_str())
-        .and_then(parse_row)
-        .ok_or_else(|| anyhow!("分时 尾根解析失败"))?;
-
-    let date = last.0.split_whitespace().next().unwrap_or("").to_string();
-
-    // 扫描所有分钟：最高/最低价（取日内最高 high 与最低 low）
-    let mut day_high = f64::NEG_INFINITY;
-    let mut day_low = f64::INFINITY;
-    // 尾盘定位：第一根 time >= 14:30 的 close 作为尾盘起始价
-    let mut tail_start_close: Option<f64> = None;
-    for v in trends {
-        let s = match v.as_str() {
-            Some(s) => s,
-            None => continue,
-        };
-        let Some((ts, _o, close, high, low)) = parse_row(s) else {
-            continue;
-        };
-        if high > day_high {
-            day_high = high;
-        }
-        if low < day_low {
-            day_low = low;
-        }
-        if tail_start_close.is_none() {
-            // ts 形如 "2026-04-22 14:30"
-            if let Some(hm) = ts.split_whitespace().nth(1) {
-                if hm >= "14:30" {
-                    tail_start_close = Some(close);
-                }
-            }
-        }
-    }
-    if !day_high.is_finite() || !day_low.is_finite() {
-        return Err(anyhow!("分时 高低价未找到"));
-    }
-
-    let open_pct = (first.1 / pre_close - 1.0) * 100.0; // 首根 open
-    let high_pct = (day_high / pre_close - 1.0) * 100.0;
-    let low_pct = (day_low / pre_close - 1.0) * 100.0;
-    let close_pct = (last.2 / pre_close - 1.0) * 100.0;
-    let amplitude = (day_high - day_low) / pre_close * 100.0;
-    let tail_30m_pct = match tail_start_close {
-        Some(start) if start > 0.0 => (last.2 / start - 1.0) * 100.0,
-        _ => 0.0,
-    };
-
-    // 形态识别
-    let gap_from_high = high_pct - close_pct; // 收盘距日内最高回落幅度
-    let gap_from_low = close_pct - low_pct; // 收盘距日内最低拉升幅度
-    let shape_label = if high_pct >= 2.0 && gap_from_high >= 2.0 && close_pct < high_pct * 0.5 {
-        "⚠️ 冲高回落（尾盘跳水风险大）"
-    } else if tail_30m_pct <= -1.5 {
-        "⚠️ 尾盘跳水"
-    } else if tail_30m_pct >= 1.5 && close_pct > open_pct {
-        "🔥 尾盘拉升（资金抢筹）"
-    } else if open_pct >= 2.0 && close_pct <= open_pct - 1.5 {
-        "⚠️ 高开低走"
-    } else if open_pct <= -1.5 && close_pct >= open_pct + 2.0 {
-        "🔥 低开高走（空头回补）"
-    } else if close_pct >= high_pct - 0.5 && high_pct > 1.5 {
-        "✅ 稳步推高，收在日内高点"
-    } else if close_pct <= low_pct + 0.5 && low_pct < -1.5 {
-        "🔴 持续下行，收在日内低点"
-    } else if amplitude >= 4.0 && gap_from_low >= 2.0 && gap_from_high >= 2.0 {
-        "中阳/中阴，日内震荡剧烈"
-    } else {
-        "窄幅整理"
-    };
-
-    Ok(IntradayShape {
-        date,
-        pre_close,
-        open_pct,
-        high_pct,
-        low_pct,
-        close_pct,
-        amplitude,
-        tail_30m_pct,
-        shape_label,
-        present: true,
-    })
+    Err(anyhow!("分时全部主机失败: {last_err}"))
 }
 
 /// 同步包装（在已有 tokio runtime 上下文调用）
@@ -499,65 +509,33 @@ pub fn fetch_money_flow_blocking(
     client: &reqwest::Client,
     code: &str,
     lmt: usize,
-) -> MoneyFlowSummary {
+) -> Result<MoneyFlowSummary> {
     // 修复 Top10#5 (2026-06-29 audit): 用 crate::block_on_async 统一替代
     // Handle::try_current + block_in_place + block_on pattern. 不在 runtime 时 fallback 到 default
     // (保留旧 behavior, 旧 pattern 在不在 runtime 时 return default).
     let client = client.clone();
     let code_s = code.to_string();
     if tokio::runtime::Handle::try_current().is_err() {
-        return MoneyFlowSummary::default();
+        return Err(anyhow!("[资金流] 无 tokio runtime，无法抓取 {code}"));
     }
-    crate::block_on_async(async move {
-        match fetch_flow_history_async(&client, &code_s, lmt).await {
-            Ok(s) => {
-                log::info!(
-                    "[资金流] {} 取得 {} 天数据（最新 {:?}）",
-                    code_s,
-                    s.days.len(),
-                    s.latest().map(|d| d.date.as_str())
-                );
-                s
-            }
-            Err(e) => {
-                log::warn!("[资金流] {} 抓取失败: {}", code_s, e);
-                MoneyFlowSummary::default()
-            }
-        }
-    })
+    crate::block_on_async(async move { fetch_flow_history_async(&client, &code_s, lmt).await })
 }
 
-pub fn fetch_intraday_shape_blocking(client: &reqwest::Client, code: &str) -> IntradayShape {
+pub fn fetch_intraday_shape_blocking(
+    client: &reqwest::Client,
+    code: &str,
+) -> Result<IntradayShape> {
     // 修复 Top10#5: 同上, 统一 block_on_async
     let client = client.clone();
     let code_s = code.to_string();
     if tokio::runtime::Handle::try_current().is_err() {
-        return IntradayShape::default();
+        return Err(anyhow!("[分时] 无 tokio runtime，无法抓取 {code}"));
     }
-    crate::block_on_async(async move {
-        match fetch_intraday_shape_async(&client, &code_s).await {
-            Ok(s) => {
-                log::info!(
-                    "[分时] {} {} open={:+.2}% high={:+.2}% close={:+.2}% tail30={:+.2}% 形态={}",
-                    code_s,
-                    s.date,
-                    s.open_pct,
-                    s.high_pct,
-                    s.close_pct,
-                    s.tail_30m_pct,
-                    s.shape_label
-                );
-                s
-            }
-            Err(e) => {
-                log::warn!("[分时] {} 抓取失败: {}", code_s, e);
-                IntradayShape::default()
-            }
-        }
-    })
+    crate::block_on_async(async move { fetch_intraday_shape_async(&client, &code_s).await })
 }
 
 /// 将资金流 + 分时形态格式化为 prompt 片段
+/// BR-118: `近5日:` 标签是旧评分兼容路径的稳定字段边界。
 pub fn format_for_prompt(flow: &MoneyFlowSummary, shape: &IntradayShape) -> String {
     let mut out = String::new();
 
@@ -614,12 +592,331 @@ pub fn format_for_prompt(flow: &MoneyFlowSummary, shape: &IntradayShape) -> Stri
             "开盘{:+.2}% | 最高{:+.2}% | 最低{:+.2}% | 收盘{:+.2}%\n",
             shape.open_pct, shape.high_pct, shape.low_pct, shape.close_pct,
         ));
+        let tail = shape
+            .tail_30m_pct
+            .map(|value| format!("{value:+.2}%"))
+            .unwrap_or_else(|| "暂无（未到14:30）".to_string());
         out.push_str(&format!(
-            "日内振幅: {:.2}%  尾盘30分钟涨幅: {:+.2}%\n",
-            shape.amplitude, shape.tail_30m_pct
+            "日内振幅: {:.2}%  尾盘30分钟涨幅: {}\n",
+            shape.amplitude, tail
         ));
         out.push_str(&format!("日内形态: {}\n", shape.shape_label));
     }
 
     out
+}
+
+#[cfg(test)]
+mod br115_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_money_flow_row_rejects_entire_batch() {
+        let rows = vec![
+            Value::String("2026-07-16,100,0,0,40,60,3.2,0,0,0,0,10,1.5".to_string()),
+            Value::String("2026-07-17,bad,0,0,40,60,3.2,0,0,0,0,10,1.5".to_string()),
+        ];
+        assert!(parse_em_money_flow_rows(&rows).is_err());
+    }
+
+    #[test]
+    fn money_flow_rejects_duplicate_and_missing_trading_days() {
+        let row = |date: &str| Value::String(format!("{date},100,0,0,40,60,3.2,0,0,0,0,10,1.5"));
+        assert!(parse_em_money_flow_rows(&[row("2026-07-16"), row("2026-07-16")]).is_err());
+        assert!(parse_em_money_flow_rows(&[row("2026-07-15"), row("2026-07-17")]).is_err());
+    }
+
+    #[test]
+    fn malformed_intraday_row_rejects_entire_batch() {
+        let rows = vec![
+            Value::String("2026-07-18 09:30,10,10.1,10.2,9.9,100".to_string()),
+            Value::String("broken".to_string()),
+        ];
+        assert!(parse_intraday_rows(&rows).is_err());
+    }
+
+    #[test]
+    fn intraday_batch_rejects_time_gap_and_adjacent_price_jump() {
+        let gap = vec![
+            Value::String("2026-07-17 09:30,10,10,10.1,9.9,100".to_string()),
+            Value::String("2026-07-17 09:32,10,10.1,10.2,9.9,100".to_string()),
+        ];
+        assert!(parse_intraday_rows(&gap).is_err());
+
+        let jump = vec![
+            Value::String("2026-07-17 09:30,10,10,10.1,9.9,100".to_string()),
+            Value::String("2026-07-17 09:31,13,13,13.1,12.9,100".to_string()),
+        ];
+        assert!(parse_intraday_rows(&jump).is_err());
+    }
+
+    fn flow_day(date: &str, main_net: f64, pct_chg: f64) -> MoneyFlowDay {
+        MoneyFlowDay {
+            date: date.into(),
+            main_net,
+            xl_net: main_net * 0.6,
+            big_net: main_net * 0.4,
+            main_pct: 3.0,
+            pct_chg,
+        }
+    }
+
+    #[test]
+    fn summary_math_and_bounce_detection_use_latest_five_real_days() {
+        let empty = MoneyFlowSummary::default();
+        assert!(empty.is_empty());
+        assert!(empty.latest().is_none());
+        assert_eq!(empty.recent_main_sum(5), 0.0);
+        assert_eq!(empty.ewma_main_net_yi(), None);
+        assert!(!empty.is_one_day_bounce());
+
+        let flow = MoneyFlowSummary {
+            days: vec![
+                flow_day("2026-07-13", -1_000_000_000.0, -1.0),
+                flow_day("2026-07-14", -1_000_000_000.0, -1.0),
+                flow_day("2026-07-15", -1_000_000_000.0, -1.0),
+                flow_day("2026-07-16", -1_000_000_000.0, -1.0),
+                flow_day("2026-07-17", 500_000_000.0, 1.0),
+            ],
+        };
+        assert_eq!(flow.latest().expect("latest").date, "2026-07-17");
+        assert_eq!(flow.recent_main_sum(3), -1_500_000_000.0);
+        assert!((flow.ewma_main_net_yi().expect("ewma") + 4.0).abs() < 1e-9);
+        assert!(flow.is_one_day_bounce());
+
+        let large_bounce = MoneyFlowSummary {
+            days: vec![flow_day("2026-07-17", 5_000_000_000.0, 1.0)],
+        };
+        assert!(!large_bounce.is_one_day_bounce());
+    }
+
+    #[test]
+    fn money_flow_parser_accepts_sorted_trading_days_and_rejects_each_bad_field_class() {
+        let row = |date: &str, main: &str, main_pct: &str, pct: &str| {
+            Value::String(format!(
+                "{date},{main},0,0,40,60,{main_pct},0,0,0,0,10,{pct}"
+            ))
+        };
+        let parsed = parse_em_money_flow_rows(&[
+            row("2026-07-17", "200", "3.2", "1.5"),
+            row("2026-07-16", "100", "2.2", "-1.0"),
+        ])
+        .expect("valid consecutive trading days");
+        assert_eq!(parsed.days[0].date, "2026-07-16");
+        assert_eq!(parsed.days[1].main_net, 200.0);
+
+        assert!(parse_em_money_flow_rows(&[]).is_err());
+        assert!(parse_em_money_flow_rows(&[Value::Bool(true)]).is_err());
+        assert!(parse_em_money_flow_rows(&[Value::String("short".into())]).is_err());
+        assert!(parse_em_money_flow_rows(&[row("bad-date", "1", "1", "1")]).is_err());
+        assert!(parse_em_money_flow_rows(&[row("2026-07-17", "NaN", "1", "1")]).is_err());
+        assert!(parse_em_money_flow_rows(&[row("2026-07-17", "1", "101", "1")]).is_err());
+        assert!(parse_em_money_flow_rows(&[row("2026-07-17", "1", "1", "21")]).is_err());
+    }
+
+    #[test]
+    fn intraday_parser_accepts_lunch_break_and_rejects_bad_protocol_rows() {
+        let lunch = vec![
+            Value::String("2026-07-17 11:30,10,10,10.1,9.9,100".into()),
+            Value::String("2026-07-17 13:00,10,10.1,10.2,9.9,0".into()),
+        ];
+        assert_eq!(parse_intraday_rows(&lunch).expect("lunch break").len(), 2);
+
+        let bad_rows = [
+            vec![],
+            vec![Value::Bool(true)],
+            vec![Value::String("2026-07-17 09:30,10".into())],
+            vec![Value::String("bad,10,10,10,10,1".into())],
+            vec![Value::String("2026-07-17 09:30,bad,10,10,10,1".into())],
+            vec![Value::String("2026-07-17 09:30,10,10,10,10,-1".into())],
+            vec![Value::String("2026-07-17 09:30,10,10,9,10,1".into())],
+            vec![Value::String("2026-07-17 09:30,10,10,10,11,1".into())],
+        ];
+        for rows in bad_rows {
+            assert!(parse_intraday_rows(&rows).is_err(), "rows={rows:?}");
+        }
+
+        let reversed = vec![
+            Value::String("2026-07-17 09:31,10,10,10,10,1".into()),
+            Value::String("2026-07-17 09:30,10,10,10,10,1".into()),
+        ];
+        assert!(parse_intraday_rows(&reversed).is_err());
+    }
+
+    #[test]
+    fn scalar_helpers_and_blocking_wrappers_fail_closed() {
+        assert_eq!(to_em_numeric_secid("600519"), "1.600519");
+        assert_eq!(to_em_numeric_secid("900901"), "1.900901");
+        assert_eq!(to_em_numeric_secid("000001"), "0.000001");
+        assert_eq!(as_f64(&serde_json::json!(1.25)), Some(1.25));
+        assert_eq!(as_f64(&serde_json::json!(" 2.5 ")), Some(2.5));
+        assert_eq!(as_f64(&Value::Bool(true)), None);
+
+        let client = reqwest::Client::new();
+        assert!(fetch_money_flow_blocking(&client, "TEST_CODE_000001", 5).is_err());
+        assert!(fetch_intraday_shape_blocking(&client, "TEST_CODE_000001").is_err());
+    }
+
+    #[test]
+    fn prompt_renders_each_money_direction_and_optional_intraday_tail() {
+        let shape = IntradayShape {
+            date: "2026-07-17".into(),
+            pre_close: 10.0,
+            open_pct: 0.5,
+            high_pct: 2.0,
+            low_pct: -1.0,
+            close_pct: 1.5,
+            amplitude: 3.0,
+            tail_30m_pct: None,
+            shape_label: "窄幅整理",
+            present: true,
+        };
+        let cases = [
+            (1.0, 2.0, "真金白银买入"),
+            (-1.0, 2.0, "诱多/拉高出货"),
+            (1.0, -2.0, "主力低吸"),
+            (-1.0, -2.0, "杀跌趋势"),
+            (1.0, 0.0, "方向基本一致"),
+        ];
+        for (main, pct, expected) in cases {
+            let flow = MoneyFlowSummary {
+                days: vec![flow_day("2026-07-17", main * 1e8, pct)],
+            };
+            let rendered = format_for_prompt(&flow, &shape);
+            assert!(rendered.contains(expected));
+            assert!(rendered.contains("暂无（未到14:30）"));
+        }
+
+        let tail = IntradayShape {
+            tail_30m_pct: Some(1.25),
+            ..shape
+        };
+        let rendered = format_for_prompt(&MoneyFlowSummary::default(), &tail);
+        assert!(!rendered.contains("主力资金流向"));
+        assert!(rendered.contains("+1.25%"));
+        assert!(
+            format_for_prompt(&MoneyFlowSummary::default(), &IntradayShape::default()).is_empty()
+        );
+    }
+
+    #[test]
+    fn intraday_shape_builder_classifies_validated_rows() {
+        let trends = vec![
+            Value::String("2026-07-17 14:30,10,10,10.2,9.8,100".into()),
+            Value::String("2026-07-17 14:31,10,10.2,10.3,9.9,100".into()),
+        ];
+        let shape = build_intraday_shape(10.0, &trends).expect("valid local protocol batch");
+        assert_eq!(shape.date, "2026-07-17");
+        assert!(shape.present);
+        assert_eq!(shape.shape_label, "🔥 尾盘拉升（资金抢筹）");
+        assert!(shape.tail_30m_pct.expect("tail") > 0.0);
+    }
+
+    #[test]
+    fn intraday_shape_classifier_covers_every_documented_band() {
+        let cases = [
+            ((0.0, 4.0, -1.0, 1.0, 5.0, None), "冲高回落"),
+            ((0.0, 1.0, -1.0, 0.0, 2.0, Some(-1.5)), "尾盘跳水"),
+            ((0.0, 1.0, -1.0, 0.5, 2.0, Some(1.5)), "尾盘拉升"),
+            ((2.0, 2.0, 0.0, 0.5, 2.0, None), "高开低走"),
+            ((-2.0, 0.5, -2.5, 0.0, 3.0, None), "低开高走"),
+            ((0.0, 2.0, -0.5, 1.8, 2.5, None), "稳步推高"),
+            ((0.0, 0.5, -2.0, -1.8, 2.5, None), "持续下行"),
+            ((0.0, 4.0, 0.0, 2.0, 4.0, None), "震荡剧烈"),
+            ((0.0, 1.0, -1.0, 0.0, 2.0, None), "窄幅整理"),
+        ];
+        for ((open, high, low, close, amplitude, tail), expected) in cases {
+            let label = classify_intraday_shape(open, high, low, close, amplitude, tail);
+            assert!(
+                label.contains(expected),
+                "expected={expected} label={label}"
+            );
+        }
+    }
+
+    #[test]
+    fn intraday_shape_builder_rejects_missing_or_out_of_range_evidence() {
+        assert!(build_intraday_shape(0.0, &[]).is_err());
+        assert!(build_intraday_shape(10.0, &[]).is_err());
+        let too_far = vec![Value::String("2026-07-17 09:30,13,13,13,13,100".into())];
+        assert!(build_intraday_shape(10.0, &too_far).is_err());
+    }
+
+    #[test]
+    fn flow_http_response_requires_complete_status_body_and_rows() {
+        for (status, body, expected) in [
+            (503, Ok(String::new()), "状态码 503"),
+            (200, Err("read failed".to_string()), "读取响应失败"),
+            (200, Ok("<html>blocked</html>".to_string()), "非JSON"),
+            (200, Ok("not-json".to_string()), "JSON解析失败"),
+            (200, Ok(r#"{"data":{}}"#.to_string()), "无 klines"),
+            (
+                200,
+                Ok(r#"{"data":{"klines":["bad"]}}"#.to_string()),
+                "批次校验失败",
+            ),
+        ] {
+            let error = parse_flow_http_response("TEST_CODE_host", status, body)
+                .expect_err("incomplete flow response");
+            assert!(error.contains(expected), "{error}");
+        }
+
+        let body = serde_json::json!({"data":{"klines":[
+            "2026-07-16,100,0,0,40,60,3.2,0,0,0,0,10,1.5",
+            "2026-07-17,200,0,0,80,120,4.2,0,0,0,0,10.1,1.0"
+        ]}})
+        .to_string();
+        let summary = parse_flow_http_response("TEST_CODE_host", 200, Ok(body))
+            .expect("complete flow protocol");
+        assert_eq!(summary.days.len(), 2);
+        assert_eq!(summary.latest().unwrap().main_net, 200.0);
+    }
+
+    #[test]
+    fn intraday_http_response_requires_complete_status_body_and_shape() {
+        for (status, body, expected) in [
+            (429, Ok(String::new()), "状态码 429"),
+            (200, Err("read failed".to_string()), "读取失败"),
+            (200, Ok(" <html>blocked</html>".to_string()), "非JSON"),
+            (200, Ok("not-json".to_string()), "JSON解析失败"),
+            (200, Ok(r#"{}"#.to_string()), "无 data"),
+            (200, Ok(r#"{"data":{}}"#.to_string()), "无 preClose"),
+            (
+                200,
+                Ok(r#"{"data":{"preClose":10}}"#.to_string()),
+                "无 trends",
+            ),
+        ] {
+            let error = parse_intraday_http_response("TEST_CODE_host", status, body)
+                .expect_err("incomplete intraday response");
+            assert!(error.contains(expected), "{error}");
+        }
+
+        let body = serde_json::json!({"data":{
+            "preClose":10.0,
+            "trends":[
+                "2026-07-17 14:30,10,10,10.2,9.8,100",
+                "2026-07-17 14:31,10,10.2,10.3,9.9,100"
+            ]
+        }})
+        .to_string();
+        let shape = parse_intraday_http_response("TEST_CODE_host", 200, Ok(body))
+            .expect("complete intraday protocol");
+        assert!(shape.present);
+        assert_eq!(shape.shape_label, "🔥 尾盘拉升（资金抢筹）");
+    }
+
+    #[tokio::test]
+    async fn real_money_flow_transports_fail_explicitly_when_every_host_is_unreachable() {
+        let client = super::super::unreachable_http_client();
+        let flow = fetch_flow_history_async(&client, "TEST_CODE_000001", 5)
+            .await
+            .expect_err("an unreachable real source must remain an error");
+        assert!(flow.to_string().contains("全部完整来源失败"));
+
+        let shape = fetch_intraday_shape_async(&client, "TEST_CODE_000001")
+            .await
+            .expect_err("an unreachable intraday source must remain an error");
+        assert!(shape.to_string().contains("全部主机失败"));
+    }
 }

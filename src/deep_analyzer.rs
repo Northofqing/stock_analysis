@@ -71,11 +71,14 @@ async fn fetch_kline_via_manager(code: &str, days: usize) -> Result<Vec<KlineDat
     let (kline, source) = manager
         .get_daily_data(code, days)
         .map_err(|e| anyhow::anyhow!("K 线获取失败: {e}"))?;
-    let first_date = kline
-        .first()
-        .map(|k| k.date.to_string())
-        .unwrap_or_default();
-    let last_date = kline.last().map(|k| k.date.to_string()).unwrap_or_default();
+    let Some(first) = kline.first() else {
+        anyhow::bail!("K 线数据源 {source} 返回空序列: {code}");
+    };
+    let Some(last) = kline.last() else {
+        anyhow::bail!("K 线数据源 {source} 返回空序列: {code}");
+    };
+    let first_date = first.date;
+    let last_date = last.date;
     log::info!(
         "[MultiAgent] {} K 线来源: {}, {} 条, date_range: {}..{}",
         code,
@@ -205,36 +208,79 @@ struct ModelConfig {
     model: String,
 }
 
-fn collect_model_configs() -> Vec<ModelConfig> {
+fn collect_model_configs_from<F>(get: F) -> Vec<ModelConfig>
+where
+    F: Fn(&str) -> Option<String>,
+{
     let mut configs = Vec::new();
 
-    if let Some(key) = env::var("DOUBAO_API_KEY").ok().filter(|k| !k.is_empty()) {
+    if let Some(key) = get("DOUBAO_API_KEY").filter(|value| !value.is_empty()) {
         configs.push(ModelConfig {
             api_key: key,
-            api_base: env::var("DOUBAO_BASE_URL")
-                .unwrap_or_else(|_| "https://ark.cn-beijing.volces.com/api/v3".to_string()),
-            model: env::var("DOUBAO_MODEL")
-                .unwrap_or_else(|_| "doubao-seed-2-0-pro-260215".to_string()),
+            api_base: get("DOUBAO_BASE_URL")
+                .unwrap_or_else(|| "https://ark.cn-beijing.volces.com/api/v3".to_string()),
+            model: get("DOUBAO_MODEL").unwrap_or_else(|| "doubao-seed-2-0-pro-260215".to_string()),
         });
     }
-    if let Some(key) = env::var("OPENAI_API_KEY").ok().filter(|k| !k.is_empty()) {
+    if let Some(key) = get("DEEPSEEK_API_KEY").filter(|value| !value.is_empty()) {
         configs.push(ModelConfig {
             api_key: key,
-            api_base: env::var("OPENAI_BASE_URL")
-                .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
-            model: env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string()),
+            api_base: get("DEEPSEEK_BASE_URL")
+                .unwrap_or_else(|| "https://api.deepseek.com/v1".to_string()),
+            model: get("DEEPSEEK_MODEL").unwrap_or_else(|| "deepseek-chat".to_string()),
         });
     }
-    if let Some(key) = env::var("GEMINI_API_KEY").ok().filter(|k| !k.is_empty()) {
+    if let Some(key) = get("GEMINI_API_KEY").filter(|value| !value.is_empty()) {
         configs.push(ModelConfig {
             api_key: key,
-            api_base: env::var("GEMINI_BASE_URL").unwrap_or_else(|_| {
+            api_base: get("GEMINI_BASE_URL").unwrap_or_else(|| {
                 "https://generativelanguage.googleapis.com/v1beta/openai/".to_string()
             }),
-            model: env::var("GEMINI_MODEL").unwrap_or_else(|_| "gemini-2.5-flash".to_string()),
+            model: get("GEMINI_MODEL").unwrap_or_else(|| "gemini-2.5-flash".to_string()),
         });
     }
+
     configs
+}
+
+fn collect_model_configs() -> Vec<ModelConfig> {
+    collect_model_configs_from(|name| env::var(name).ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_collect_model_configs_order() {
+        let values = std::collections::HashMap::from([
+            ("DOUBAO_API_KEY", "doubao-key"),
+            ("DOUBAO_MODEL", "doubao-test"),
+            ("DEEPSEEK_API_KEY", "deepseek-key"),
+            ("DEEPSEEK_BASE_URL", "https://api.deepseek.example/v1"),
+            ("DEEPSEEK_MODEL", "deepseek-test"),
+            ("GEMINI_API_KEY", "gemini-key"),
+            ("GEMINI_MODEL", "gemini-test"),
+        ]);
+        let configs = collect_model_configs_from(|name| values.get(name).map(|v| (*v).to_string()));
+        assert_eq!(configs[0].model, "doubao-test");
+        assert_eq!(configs[1].model, "deepseek-test");
+        assert_eq!(configs[2].model, "gemini-test");
+        assert_eq!(configs[1].api_base, "https://api.deepseek.example/v1");
+    }
+
+    #[test]
+    fn test_collect_model_configs_stale_openai_ignored() {
+        let stale_only = std::collections::HashMap::from([
+            ("OPENAI_API_KEY", "stale-key"),
+            ("OPENAI_BASE_URL", "https://api.deepseek.com/v1"),
+            ("OPENAI_MODEL", "deepseek-chat"),
+        ]);
+        assert!(collect_model_configs_from(|name| {
+            stale_only.get(name).map(|v| (*v).to_string())
+        })
+        .is_empty());
+    }
 }
 
 fn build_client(cfg: &ModelConfig) -> Client<OpenAIConfig> {
@@ -262,7 +308,7 @@ pub async fn run_react_analysis(code: &str) -> Result<String> {
     let model_configs = collect_model_configs();
     if model_configs.is_empty() {
         anyhow::bail!(
-            "未在 .env 中找到 DOUBAO_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY 任一有效配置"
+            "未在 .env 中找到 DOUBAO_API_KEY / DEEPSEEK_API_KEY / GEMINI_API_KEY 任一有效配置"
         );
     }
     log::info!(
@@ -376,12 +422,12 @@ pub async fn run_multi_agent_analysis(code: &str) -> Result<String> {
     // 3. 拼装 extra_context（资金面分析师读取）= 资金流 + 筹码
     let mut extra = String::new();
     if !flow_str.is_empty() {
-        extra.push_str(&flow_str);
-        extra.push_str("\n");
+        extra.push_str(flow_str);
+        extra.push('\n');
     }
     if !chip_str.is_empty() {
-        extra.push_str(&chip_str);
-        extra.push_str("\n");
+        extra.push_str(chip_str);
+        extra.push('\n');
     }
     let extra_ctx = if extra.trim().is_empty() {
         None
@@ -393,18 +439,18 @@ pub async fn run_multi_agent_analysis(code: &str) -> Result<String> {
     let mut news_ctx = String::new();
     if !news_str_raw.is_empty() {
         news_ctx.push_str("【新闻舆情】\n");
-        news_ctx.push_str(&news_str_raw);
+        news_ctx.push_str(news_str_raw);
         news_ctx.push_str("\n\n");
     }
     if !sector_str.is_empty() {
         news_ctx.push_str("【板块/概念】\n");
-        news_ctx.push_str(&sector_str);
+        news_ctx.push_str(sector_str);
         news_ctx.push_str("\n\n");
     }
     if !research_str.is_empty() {
         news_ctx.push_str("【机构研报】\n");
-        news_ctx.push_str(&research_str);
-        news_ctx.push_str("\n");
+        news_ctx.push_str(research_str);
+        news_ctx.push('\n');
     }
     let news_ctx_opt = if news_ctx.trim().is_empty() {
         None
@@ -692,7 +738,7 @@ mod tests_br011 {
         assert!(s.contains("[news] MISSING:"));
         assert!(s.contains("网络超时"));
         assert!(s.contains("[sector] OK"));
-        assert!(s.contains("[chip]") == false, "不应含未提供的 tool");
+        assert!(!s.contains("[chip]"), "不应含未提供的 tool");
     }
 
     /// 测试 6: 6 tool 全部 Ok → inventory 6 个 OK

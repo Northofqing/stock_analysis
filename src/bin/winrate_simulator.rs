@@ -1,3 +1,4 @@
+//! Registered business rules: BR-074.
 //! Winrate Simulator — 基于 prediction_tracker 已 verify 数据, 评估
 //! "如果关停 X 主题, 胜率会变成多少?"
 //!
@@ -371,9 +372,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !dyn_recommendations.is_empty() {
         println!("\n  建议: 把上述 dyn_prior 复制到 config/chain_rules.toml 的 priority 字段.");
         println!("  注意: dyn_prior 只反映历史胜率, 不包含 forward-looking 因子 (市场风格切换 / 政策催化).");
-        println!(
-            "  使用 AGENTS §2.9 边界证明模板: dyn_prior=? ± ? (95% CI), 与样本量=?"
-        );
+        println!("  使用 AGENTS §2.9 边界证明模板: dyn_prior=? ± ? (95% CI), 与样本量=?");
     }
     println!();
     println!("═══════════════════════════════════════════════════════════════");

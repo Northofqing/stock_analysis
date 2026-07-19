@@ -177,8 +177,7 @@ fn test_simhash_in_market_event() {
         50,
         50,
     );
-    // simhash 64 bit 必有效
-    assert!(e.simhash <= u64::MAX, "simhash 必有效");
+    assert_ne!(e.simhash, 0, "非空标题必须生成非零 simhash");
 }
 
 #[test]

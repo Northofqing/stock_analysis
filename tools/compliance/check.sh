@@ -46,7 +46,7 @@ run_check "check_data_freshness.sh"
 run_check "check_design_contradiction.sh"
 run_check "check_business_rules.sh"
 run_check "check_no_silent_fallback_push.sh"
-run_check "check_no_silent_fallback_global.sh" || true  # 全局仅 WARN, 不阻断 CI
+run_check "check_no_silent_fallback_global.sh"
 
 if [ $OVERALL_EXIT -eq 0 ]; then
     echo "[compliance] ALL CHECKS PASSED"

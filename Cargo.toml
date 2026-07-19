@@ -1,6 +1,6 @@
 [package]
 name = "stock_analysis"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 default-run = "stock_analysis"
 
@@ -82,3 +82,4 @@ qmt-parser = "=0.2.1"
 [dev-dependencies]
 serial_test = "0.10"
 criterion = { version = "0.5", features = ["html_reports"] } # v16.8 #1: benchmark 套件
+reqwest_011 = { package = "reqwest", version = "0.11.27", default-features = false }

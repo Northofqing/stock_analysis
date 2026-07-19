@@ -23,6 +23,12 @@ pub struct WallStreetCnProvider {
     client: reqwest::Client,
 }
 
+impl Default for WallStreetCnProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WallStreetCnProvider {
     pub fn new() -> Self {
         Self {
@@ -100,7 +106,7 @@ impl WallStreetCnProvider {
                     SearchResult::new(
                         title,
                         snippet,
-                        format!("https://wallstreetcn.com/"),
+                        "https://wallstreetcn.com/".to_string(),
                         "华尔街见闻".to_string(),
                     )
                     .with_date(date_tag.unwrap_or_default()),

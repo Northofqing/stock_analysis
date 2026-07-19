@@ -2,12 +2,12 @@
 //!
 //! 触发条件由调用方判定（评分≥60 / BB+MACD BottomBuy/UptrendStart / RSI Buy 任一）。
 //! 本模块只负责在 blocking 线程池抓取 60min+15min K 线并跑入场点评估，返回可注入
-//! AI prompt 的 Markdown 片段。失败或数据不足时返回 `None`。
+//! AI prompt 的 Markdown 片段。数据不足返回 `Ok(None)`，来源失败显式返回 `Err`。
 
-pub(super) async fn fetch_multi_timeframe_section(code: &str) -> Option<String> {
+pub(super) async fn fetch_multi_timeframe_section(code: &str) -> Result<Option<String>, String> {
     use once_cell::sync::Lazy;
     // 复用单个 HTTP client，避免每次调用都重建连接池
-    static MTF_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+    static MTF_CLIENT: Lazy<Result<reqwest::Client, String>> = Lazy::new(|| {
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(8))
             .user_agent(
@@ -15,27 +15,95 @@ pub(super) async fn fetch_multi_timeframe_section(code: &str) -> Option<String> 
                  AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             )
             .build()
-            .unwrap_or_default()
+            .map_err(|error| format!("创建多周期 HTTP client 失败: {error}"))
     });
 
-    let code_owned = code.to_string();
-    tokio::task::spawn_blocking(move || {
-        let client = &*MTF_CLIENT;
-        // 60min 拉 120 根（约 30 个交易日，足够算 MA20/MACD），15min 拉 80 根
-        let h1 = crate::data_provider::intraday_kline::fetch_blocking(client, &code_owned, 60, 120);
-        let m15 = crate::data_provider::intraday_kline::fetch_blocking(client, &code_owned, 15, 80);
-        if h1.is_empty() || m15.is_empty() {
-            return None;
-        }
-        let assess = crate::strategy::assess_multi_timeframe_entry(&h1, &m15);
-        let section = assess.to_prompt_section();
-        if section.trim().is_empty() {
-            None
-        } else {
-            Some(section)
-        }
-    })
-    .await
-    .ok()
-    .flatten()
+    let client = MTF_CLIENT.as_ref().map_err(Clone::clone)?;
+    let (h1_result, m15_result) = tokio::join!(
+        crate::data_provider::intraday_kline::fetch_async(client, code, 60, 120),
+        crate::data_provider::intraday_kline::fetch_async(client, code, 15, 80)
+    );
+    resolve_multi_timeframe_results(code, h1_result, m15_result)
+}
+
+fn resolve_multi_timeframe_results(
+    code: &str,
+    h1_result: anyhow::Result<Vec<crate::data_provider::intraday_kline::MinuteBar>>,
+    m15_result: anyhow::Result<Vec<crate::data_provider::intraday_kline::MinuteBar>>,
+) -> Result<Option<String>, String> {
+    let h1 = h1_result.map_err(|error| format!("[{code}] 60min K线不可用: {error}"))?;
+    let m15 = m15_result.map_err(|error| format!("[{code}] 15min K线不可用: {error}"))?;
+    Ok(resolve_multi_timeframe_section(&h1, &m15))
+}
+
+fn resolve_multi_timeframe_section(
+    h1: &[crate::data_provider::intraday_kline::MinuteBar],
+    m15: &[crate::data_provider::intraday_kline::MinuteBar],
+) -> Option<String> {
+    let assess = crate::strategy::assess_multi_timeframe_entry(h1, m15);
+    let section = assess.to_prompt_section();
+    if section.trim().is_empty() {
+        None
+    } else {
+        Some(section)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data_provider::intraday_kline::MinuteBar;
+
+    fn bars(count: usize, step_minutes: i64) -> Vec<MinuteBar> {
+        let start = chrono::NaiveDate::from_ymd_opt(2026, 7, 16)
+            .unwrap()
+            .and_hms_opt(9, 30, 0)
+            .unwrap();
+        (0..count)
+            .map(|index| {
+                let close = 10.0 + index as f64 * 0.01;
+                MinuteBar {
+                    timestamp: (start + chrono::Duration::minutes(step_minutes * index as i64))
+                        .format("%Y-%m-%d %H:%M")
+                        .to_string(),
+                    open: close - 0.01,
+                    close,
+                    high: close + 0.05,
+                    low: close - 0.05,
+                    volume: 1_000.0 + index as f64 * 10.0,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn resolved_multi_timeframe_distinguishes_insufficient_and_present_batches() {
+        assert!(resolve_multi_timeframe_section(&bars(29, 60), &bars(20, 15)).is_none());
+        let section = resolve_multi_timeframe_section(&bars(40, 60), &bars(30, 15))
+            .expect("complete validated bars must render an assessment");
+        assert!(section.contains("多周期入场点"));
+        assert!(section.contains("命中入场规则:"));
+        assert!(section.contains("结论:"));
+    }
+
+    #[test]
+    fn resolved_results_preserve_source_specific_failures() {
+        let h1_error = resolve_multi_timeframe_results(
+            "TEST_CODE_000001",
+            Err(anyhow::anyhow!("60min transport")),
+            Ok(bars(30, 15)),
+        )
+        .unwrap_err();
+        assert!(h1_error.contains("[TEST_CODE_000001] 60min K线不可用"));
+        assert!(h1_error.contains("60min transport"));
+
+        let m15_error = resolve_multi_timeframe_results(
+            "TEST_CODE_000001",
+            Ok(bars(40, 60)),
+            Err(anyhow::anyhow!("15min transport")),
+        )
+        .unwrap_err();
+        assert!(m15_error.contains("[TEST_CODE_000001] 15min K线不可用"));
+        assert!(m15_error.contains("15min transport"));
+    }
 }

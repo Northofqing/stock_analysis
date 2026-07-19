@@ -20,10 +20,12 @@ impl Validator for GrossMarginValidator {
     }
     fn validate(&self, context: &ContextManager) -> Result<(), ValidationError> {
         if let Some(financials) = context.get_fact("fetch_financials") {
-            if let Some(gm) = financials.get("gross_margin").and_then(|v| v.as_f64()) {
-                if gm < -500.0 {
-                    return Err(ValidationError::Inconsistency(format!("发现异常毛利率 ({})，可能为数据源错乱或报表未更新。请寻找其他数据源代替或在报告中警示。", gm)));
-                }
+            let gm = financials
+                .get("gross_margin")
+                .and_then(|value| value.as_f64())
+                .ok_or_else(|| ValidationError::MissingField("gross_margin".to_string()))?;
+            if gm < -500.0 {
+                return Err(ValidationError::Inconsistency(format!("发现异常毛利率 ({})，可能为数据源错乱或报表未更新。请寻找其他数据源代替或在报告中警示。", gm)));
             }
         }
         Ok(())
@@ -37,44 +39,28 @@ impl Validator for ConsensusDeviationValidator {
     }
     fn validate(&self, context: &ContextManager) -> Result<(), ValidationError> {
         if let Some(research) = context.get_fact("fetch_research") {
-            if let Some(arr) = research.as_array() {
-                if arr.is_empty() {
-                    return Err(ValidationError::MissingField("未能获取到任何机构研报视图。若代码无误可能为冷门股，请在报告特别标明由于缺乏机构覆盖流动性风险可能偏高。".to_string()));
-                }
+            let reports = research
+                .as_array()
+                .or_else(|| research.get("reports").and_then(|value| value.as_array()))
+                .ok_or_else(|| {
+                    ValidationError::MissingField("fetch_research.reports".to_string())
+                })?;
+            if reports.is_empty() {
+                return Err(ValidationError::MissingField("未能获取到任何机构研报视图。若代码无误可能为冷门股，请在报告特别标明由于缺乏机构覆盖流动性风险可能偏高。".to_string()));
             }
         }
         Ok(())
     }
 }
 
-/// Stub: no-op. Awaiting fact-source wiring (concept data + dividend schedule).
-/// 修复 (2026-06-30 codex review): 不再加入 new_with_defaults(), 避免 AGENTS §2.8
-/// 假实现禁令风险. 外部可通过 add_validator(ConceptLinkageValidator) opt-in.
-pub struct ConceptLinkageValidator;
-impl Validator for ConceptLinkageValidator {
-    fn name(&self) -> &str {
-        "ConceptLinkageValidator"
-    }
-    fn validate(&self, _context: &ContextManager) -> Result<(), ValidationError> {
-        Ok(())
-    }
-}
-
-/// Stub: no-op. Awaiting fact-source wiring (dividend yield/schedule).
-/// 修复 (2026-06-30 codex review): 不再加入 new_with_defaults(), 避免 AGENTS §2.8
-/// 假实现禁令风险. 外部可通过 add_validator(DividendTaxValidator) opt-in.
-pub struct DividendTaxValidator;
-impl Validator for DividendTaxValidator {
-    fn name(&self) -> &str {
-        "DividendTaxValidator"
-    }
-    fn validate(&self, _context: &ContextManager) -> Result<(), ValidationError> {
-        Ok(())
-    }
-}
-
 pub struct ValidationEngine {
     validators: Vec<Box<dyn Validator>>,
+}
+
+impl Default for ValidationEngine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ValidationEngine {
@@ -100,6 +86,13 @@ impl ValidationEngine {
 
     pub fn validator_count(&self) -> usize {
         self.validators.len()
+    }
+
+    pub fn validator_names(&self) -> Vec<&str> {
+        self.validators
+            .iter()
+            .map(|validator| validator.name())
+            .collect()
     }
 
     pub fn run_all(&self, context: &ContextManager) -> Vec<ValidationError> {
@@ -131,13 +124,34 @@ mod tests {
     #[test]
     fn test_new_with_defaults_validator_names() {
         let engine = ValidationEngine::new_with_defaults();
-        // 通过 run_all 行为反推: 空 context 下, 2 个真实 validator 都应返回 Ok
-        // (因为 financials/research 都不在 context 里, 走 default Ok 路径)
+        assert_eq!(
+            engine.validator_names(),
+            vec!["GrossMarginValidator", "ConsensusDeviationValidator"]
+        );
         let ctx = crate::agent::context::ContextManager::new();
         let errors = engine.run_all(&ctx);
-        assert!(
-            errors.is_empty(),
-            "default validators must pass on empty context"
-        );
+        assert!(errors.is_empty(), "未调用的工具不应被伪判为已失败");
+    }
+
+    #[test]
+    fn test_financial_fact_requires_gross_margin() {
+        let mut ctx = ContextManager::new();
+        ctx.insert_fact("fetch_financials", serde_json::json!({"eps": 1.0}));
+        let errors = ValidationEngine::new_with_defaults().run_all(&ctx);
+        assert!(matches!(
+            errors.as_slice(),
+            [ValidationError::MissingField(field)] if field == "gross_margin"
+        ));
+    }
+
+    #[test]
+    fn test_research_object_requires_nonempty_reports() {
+        let mut ctx = ContextManager::new();
+        ctx.insert_fact("fetch_research", serde_json::json!({"reports": []}));
+        let errors = ValidationEngine::new_with_defaults().run_all(&ctx);
+        assert!(matches!(
+            errors.as_slice(),
+            [ValidationError::MissingField(_)]
+        ));
     }
 }

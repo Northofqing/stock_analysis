@@ -134,11 +134,10 @@ pub fn compute_spearman_ic(factor_values: &[f64], forward_returns: &[f64]) -> Op
         if j > i + 1 {
             let avg_rank: f64 = factor_ranked[i..j]
                 .iter()
-                .enumerate()
-                .map(|(_k, (orig_idx, _))| factor_ranks[*orig_idx])
+                .map(|(orig_idx, _)| factor_ranks[*orig_idx])
                 .sum::<f64>()
                 / (j - i) as f64;
-            for (_, (orig_idx, _)) in factor_ranked[i..j].iter().enumerate() {
+            for (orig_idx, _) in factor_ranked[i..j].iter() {
                 factor_ranks[*orig_idx] = avg_rank;
             }
         }
@@ -166,11 +165,10 @@ pub fn compute_spearman_ic(factor_values: &[f64], forward_returns: &[f64]) -> Op
         if j > i + 1 {
             let avg_rank: f64 = return_ranked[i..j]
                 .iter()
-                .enumerate()
-                .map(|(_k, (orig_idx, _))| return_ranks[*orig_idx])
+                .map(|(orig_idx, _)| return_ranks[*orig_idx])
                 .sum::<f64>()
                 / (j - i) as f64;
-            for (_, (orig_idx, _)) in return_ranked[i..j].iter().enumerate() {
+            for (orig_idx, _) in return_ranked[i..j].iter() {
                 return_ranks[*orig_idx] = avg_rank;
             }
         }
@@ -261,7 +259,7 @@ pub fn compute_rolling_ic(
 
     // IC 衰减: lag 1-4 (因子值超前于收益的滞后期)
     let mut decay = [0.0; 4];
-    for lag in 0..4 {
+    for (lag, decay_at_lag) in decay.iter_mut().enumerate() {
         let offset = lag + 1;
         if clean.len() > offset {
             let lag_factors: Vec<f64> = clean[..clean.len() - offset]
@@ -272,7 +270,7 @@ pub fn compute_rolling_ic(
             let m = lag_factors.len().min(lag_returns.len());
             if m >= 15 {
                 if let Some(ic) = compute_spearman_ic(&lag_factors[..m], &lag_returns[..m]) {
-                    decay[lag] = ic;
+                    *decay_at_lag = ic;
                 }
             }
         }
@@ -588,5 +586,52 @@ mod tests {
             .label()
             .contains("显著反向"));
         assert!(FactorVerdict::Neutral.label().contains("无效"));
+    }
+
+    #[test]
+    fn rolling_analysis_and_correlation_cover_positive_negative_and_neutral_factors() {
+        let factor: Vec<f64> = (0..60).map(|i| i as f64).collect();
+        let positive = factor.clone();
+        let negative: Vec<f64> = factor.iter().map(|value| -*value).collect();
+        let flat = vec![1.0; factor.len()];
+
+        let (series, decay) = compute_rolling_ic(&factor, &positive).expect("rolling IC");
+        assert!(!series.is_empty());
+        assert!(series.iter().all(|ic| *ic > 0.99));
+        assert!(decay.iter().all(|ic| *ic > 0.99));
+
+        let positive_ic = analyze_factor("TEST_CODE_positive", &factor, &positive).unwrap();
+        assert!(matches!(
+            positive_ic.verdict,
+            FactorVerdict::Positive { .. }
+        ));
+        assert_eq!(positive_ic.information_ratio, 0.0);
+
+        let negative_ic = analyze_factor("TEST_CODE_negative", &factor, &negative).unwrap();
+        assert!(matches!(
+            negative_ic.verdict,
+            FactorVerdict::Negative { .. }
+        ));
+
+        let neutral_ic = analyze_factor("TEST_CODE_neutral", &flat, &positive).unwrap();
+        assert_eq!(neutral_ic.verdict, FactorVerdict::Neutral);
+        assert!(analyze_factor("TEST_CODE_short", &[1.0; 14], &[1.0; 14]).is_none());
+
+        let samples = vec![
+            FactorSample {
+                factor_name: "TEST_CODE_positive".to_string(),
+                factor_values: factor,
+                forward_returns: positive,
+            },
+            FactorSample {
+                factor_name: "TEST_CODE_negative".to_string(),
+                factor_values: negative,
+                forward_returns: flat,
+            },
+        ];
+        let matrix = factor_correlation_matrix(&samples);
+        assert_eq!(matrix.len(), 2);
+        assert_eq!(matrix[0][0], 1.0);
+        assert_eq!(matrix[0][1], matrix[1][0]);
     }
 }

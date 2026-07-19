@@ -46,6 +46,233 @@ pub struct Jin10Provider {
     client: reqwest::Client,
 }
 
+#[derive(Deserialize, Debug)]
+struct FlashInner {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    source_link: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct FlashItem {
+    #[serde(default)]
+    time: Option<String>,
+    #[serde(default)]
+    #[serde(rename = "type")]
+    kind: Option<i64>,
+    #[serde(default)]
+    important: Option<i64>,
+    #[serde(default)]
+    data: Option<FlashInner>,
+}
+
+#[derive(Deserialize, Debug)]
+struct FlashResp {
+    #[serde(default)]
+    status: Option<i64>,
+    #[serde(default)]
+    data: Option<Vec<FlashItem>>,
+}
+
+fn parse_flash_response(
+    text: &str,
+    limit: usize,
+    only_important: bool,
+    now: chrono::DateTime<chrono::Local>,
+) -> Result<Vec<SearchResult>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let resp: FlashResp = serde_json::from_str(text).context("金十快讯解析失败")?;
+    if resp.status != Some(200) {
+        anyhow::bail!("金十快讯API返回异常: {:?}", resp.status);
+    }
+    let items = resp
+        .data
+        .ok_or_else(|| anyhow::anyhow!("金十快讯响应缺少 data 数组"))?;
+
+    let mut results = Vec::new();
+    for (index, item) in items.into_iter().enumerate() {
+        let kind = item
+            .kind
+            .ok_or_else(|| anyhow::anyhow!("金十快讯第 {} 行缺少 type", index + 1))?;
+        if kind > 1 {
+            continue;
+        }
+        if kind < 0 {
+            anyhow::bail!("金十快讯第 {} 行 type 非法: {kind}", index + 1);
+        }
+
+        let important_flag = match item.important {
+            Some(0) => false,
+            Some(1) => true,
+            value => anyhow::bail!("金十快讯第 {} 行 important 缺失/非法: {value:?}", index + 1),
+        };
+        let inner = item
+            .data
+            .ok_or_else(|| anyhow::anyhow!("金十快讯第 {} 行缺少 data", index + 1))?;
+        let content = inner
+            .content
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("金十快讯第 {} 行缺少 content", index + 1))?;
+        let raw_time = item
+            .time
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("金十快讯第 {} 行缺少 time", index + 1))?;
+        let naive = chrono::NaiveDateTime::parse_from_str(&raw_time, "%Y-%m-%d %H:%M:%S")
+            .with_context(|| format!("金十快讯第 {} 行 time 非法: {raw_time:?}", index + 1))?;
+        let published_at = naive
+            .and_local_timezone(chrono::Local)
+            .single()
+            .ok_or_else(|| anyhow::anyhow!("金十快讯第 {} 行 time 不唯一", index + 1))?;
+        if now.timestamp() - published_at.timestamp() > 6 * 3600 {
+            continue;
+        }
+        if only_important && !important_flag {
+            continue;
+        }
+
+        let title = inner
+            .title
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| content.chars().take(60).collect());
+        let snippet: String = content.chars().take(240).collect();
+        let title = if important_flag {
+            format!("⭐ {title}")
+        } else {
+            title
+        };
+        let url = inner
+            .source_link
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_default();
+        results.push(
+            SearchResult::new(title, snippet, url, "金十数据".to_string())
+                .with_date(published_at.format("%H:%M").to_string()),
+        );
+        if results.len() >= limit {
+            break;
+        }
+    }
+    Ok(results)
+}
+
+fn parse_calendar_entries_response(text: &str, kind: &str) -> Result<Vec<Jin10CalendarEvent>> {
+    if !matches!(kind, "data" | "event") {
+        anyhow::bail!("金十日历 kind 非法: {kind:?}");
+    }
+    if text.trim().is_empty() {
+        anyhow::bail!("金十日历响应正文为空");
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(text).context("金十日历响应不是合法 JSON")?;
+    let rows = value
+        .as_array()
+        .or_else(|| value.get("data").and_then(serde_json::Value::as_array))
+        .ok_or_else(|| anyhow::anyhow!("金十日历响应缺少数组根或 data 数组"))?;
+
+    fn optional_text(item: &serde_json::Value, key: &str, row: usize) -> Result<Option<String>> {
+        match item.get(key) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(value)) => {
+                let value = value.trim();
+                Ok((!value.is_empty() && value != "--").then(|| value.to_string()))
+            }
+            Some(value) if value.is_number() => Ok(Some(value.to_string())),
+            Some(_) => anyhow::bail!("金十日历第 {row} 行 {key} 类型非法"),
+        }
+    }
+
+    let mut out = Vec::with_capacity(rows.len());
+    for (index, item) in rows.iter().enumerate() {
+        let row = index + 1;
+        let object = item
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("金十日历第 {row} 行不是对象"))?;
+        let pub_time = match object.get("pub_time") {
+            None => None,
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("金十日历第 {row} 行 pub_time 非法"))?,
+            ),
+        };
+        let raw_date = match pub_time {
+            Some(value) => value,
+            None => object
+                .get("date")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("金十日历第 {row} 行缺少 date"))?,
+        };
+        let date = raw_date.split_whitespace().next().unwrap_or_default();
+        chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+            .with_context(|| format!("金十日历第 {row} 行 date 非法: {date:?}"))?;
+
+        let explicit_time = match object.get("time") {
+            None => None,
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("金十日历第 {row} 行 time 非法"))?,
+            ),
+        };
+        let time = pub_time
+            .and_then(|value| value.split_once(' ').map(|(_, time)| time.trim()))
+            .filter(|value| !value.is_empty())
+            .or(explicit_time)
+            .unwrap_or("全天")
+            .to_string();
+
+        let country = match object.get("country") {
+            None | Some(serde_json::Value::Null) => String::new(),
+            Some(value) => value
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("金十日历第 {row} 行 country 类型非法"))?
+                .to_string(),
+        };
+        let name = object
+            .get("name")
+            .or_else(|| object.get("title"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("金十日历第 {row} 行缺少非空 name/title"))?
+            .trim()
+            .to_string();
+        let star = object
+            .get("star")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|value| *value <= 3)
+            .ok_or_else(|| anyhow::anyhow!("金十日历第 {row} 行 star 缺失/非法"))?
+            as u8;
+
+        out.push(Jin10CalendarEvent {
+            time,
+            date: date.to_string(),
+            country,
+            name,
+            star,
+            kind: kind.to_string(),
+            previous: optional_text(item, "previous", row)?,
+            forecast: optional_text(item, "consensus", row)?
+                .or(optional_text(item, "forecast", row)?),
+            actual: optional_text(item, "actual", row)?,
+        });
+    }
+    Ok(out)
+}
+
+impl Default for Jin10Provider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Jin10Provider {
     pub fn new() -> Self {
         Self {
@@ -77,124 +304,16 @@ impl Jin10Provider {
         limit: usize,
         only_important: bool,
     ) -> Result<Vec<SearchResult>> {
-        #[derive(Deserialize, Debug)]
-        struct FlashInner {
-            #[serde(default)]
-            content: Option<String>,
-            #[serde(default)]
-            title: Option<String>,
-            #[serde(default)]
-            source_link: Option<String>,
-        }
-
-        #[derive(Deserialize, Debug)]
-        #[allow(dead_code)]
-        struct FlashItem {
-            #[serde(default)]
-            id: Option<String>,
-            #[serde(default)]
-            time: Option<String>,
-            #[serde(default)]
-            #[serde(rename = "type")]
-            kind: Option<i64>,
-            #[serde(default)]
-            important: Option<i64>,
-            #[serde(default)]
-            data: Option<FlashInner>,
-        }
-
-        #[derive(Deserialize, Debug)]
-        struct FlashResp {
-            #[serde(default)]
-            status: Option<i64>,
-            #[serde(default)]
-            data: Option<Vec<FlashItem>>,
-        }
-
         let url = "https://flash-api.jin10.com/get_flash_list?channel=-8200&vip=1";
-        let resp: FlashResp = self
+        let text = self
             .flash_req(url)
             .send()
             .await
             .context("金十快讯请求失败")?
-            .json()
+            .text()
             .await
-            .context("金十快讯解析失败")?;
-
-        if resp.status != Some(200) {
-            return Err(anyhow::anyhow!("金十快讯API返回异常: {:?}", resp.status));
-        }
-
-        let now = chrono::Local::now();
-        let items = resp.data.unwrap_or_default();
-
-        let mut results: Vec<SearchResult> = Vec::new();
-        for item in items {
-            // type=0 普通快讯，type=1 数据类，其他可能是广告/图片，跳过
-            let kind = item.kind.unwrap_or(0);
-            if kind > 1 {
-                continue;
-            }
-
-            let inner = match item.data {
-                Some(v) => v,
-                None => continue,
-            };
-            let content = inner.content.unwrap_or_default();
-            if content.is_empty() {
-                continue;
-            }
-
-            let important_flag = item.important.unwrap_or(0) == 1;
-            if only_important && !important_flag {
-                continue;
-            }
-
-            // 解析时间，过滤 6h 以外
-            let (date_tag, ts_opt) = match item.time.as_deref() {
-                Some(t) => {
-                    let parsed = chrono::NaiveDateTime::parse_from_str(t, "%Y-%m-%d %H:%M:%S")
-                        .ok()
-                        .and_then(|ndt| ndt.and_local_timezone(chrono::Local).single());
-                    match parsed {
-                        Some(dt) => (dt.format("%H:%M").to_string(), Some(dt.timestamp())),
-                        None => (t.to_string(), None),
-                    }
-                }
-                None => (String::new(), None),
-            };
-            if let Some(ts) = ts_opt {
-                if now.timestamp() - ts > 6 * 3600 {
-                    continue;
-                }
-            }
-
-            // 截取标题
-            let title = inner
-                .title
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| content.chars().take(60).collect());
-            let snippet: String = content.chars().take(240).collect();
-            let title_display = if important_flag {
-                format!("⭐ {}", title)
-            } else {
-                title
-            };
-            let url = inner
-                .source_link
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "https://www.jin10.com/".to_string());
-
-            results.push(
-                SearchResult::new(title_display, snippet, url, "金十数据".to_string())
-                    .with_date(date_tag),
-            );
-            if results.len() >= limit {
-                break;
-            }
-        }
-
-        Ok(results)
+            .context("金十快讯正文读取失败")?;
+        parse_flash_response(&text, limit, only_important, chrono::Local::now())
     }
 
     /// 抓取财经日历（未来 `days_ahead` 天内重要经济数据/事件）
@@ -235,12 +354,13 @@ impl Jin10Provider {
                 self.fetch_calendar_entries(&econ_url, "data"),
                 self.fetch_calendar_entries(&event_url, "event"),
             );
-            if let Ok(mut v) = econ_res {
-                events.append(&mut v);
-            }
-            if let Ok(mut v) = event_res {
-                events.append(&mut v);
-            }
+            let mut economics = econ_res.with_context(|| {
+                format!("金十日历 economics 批次失败: year={year} week={week:02}")
+            })?;
+            let mut calendar_events = event_res
+                .with_context(|| format!("金十日历 event 批次失败: year={year} week={week:02}"))?;
+            events.append(&mut economics);
+            events.append(&mut calendar_events);
         }
 
         // 过滤日期窗口 + 重要性
@@ -271,92 +391,7 @@ impl Jin10Provider {
             .text()
             .await
             .context("金十日历读取失败")?;
-        if text.trim().is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // 结构因 kind 而略有不同，统一用 serde_json::Value 解析
-        let v: serde_json::Value = match serde_json::from_str(&text) {
-            Ok(v) => v,
-            Err(_) => return Ok(Vec::new()),
-        };
-
-        let arr = v
-            .as_array()
-            .or_else(|| v.get("data").and_then(|d| d.as_array()))
-            .cloned()
-            .unwrap_or_default();
-
-        let mut out: Vec<Jin10CalendarEvent> = Vec::new();
-        for item in arr {
-            let date = item
-                .get("pub_time")
-                .or_else(|| item.get("date"))
-                .and_then(|s| s.as_str())
-                .map(|s| s.split(' ').next().unwrap_or(s).to_string())
-                .unwrap_or_default();
-            if date.is_empty() {
-                continue;
-            }
-
-            let time = item
-                .get("pub_time")
-                .or_else(|| item.get("time"))
-                .and_then(|s| s.as_str())
-                .map(|s| {
-                    let parts: Vec<&str> = s.splitn(2, ' ').collect();
-                    if parts.len() == 2 {
-                        parts[1].to_string()
-                    } else {
-                        "全天".to_string()
-                    }
-                })
-                .unwrap_or_else(|| "全天".to_string());
-
-            let country = item
-                .get("country")
-                .and_then(|s| s.as_str())
-                .unwrap_or("")
-                .to_string();
-            let name = item
-                .get("name")
-                .or_else(|| item.get("title"))
-                .and_then(|s| s.as_str())
-                .unwrap_or("")
-                .to_string();
-            if name.is_empty() {
-                continue;
-            }
-
-            let star = item.get("star").and_then(|s| s.as_u64()).unwrap_or(0) as u8;
-
-            let grab_str = |key: &str| -> Option<String> {
-                item.get(key)
-                    .and_then(|x| {
-                        if x.is_string() {
-                            x.as_str().map(|s| s.to_string())
-                        } else if x.is_number() {
-                            Some(x.to_string())
-                        } else {
-                            None
-                        }
-                    })
-                    .filter(|s| !s.is_empty() && s != "--")
-            };
-
-            out.push(Jin10CalendarEvent {
-                time,
-                date,
-                country,
-                name,
-                star,
-                kind: kind.to_string(),
-                previous: grab_str("previous"),
-                forecast: grab_str("consensus").or_else(|| grab_str("forecast")),
-                actual: grab_str("actual"),
-            });
-        }
-        Ok(out)
+        parse_calendar_entries_response(&text, kind)
     }
 }
 
@@ -378,8 +413,19 @@ impl SearchProvider for Jin10Provider {
             .map(|w| w.to_lowercase())
             .collect();
 
-        let flash_res = self.fetch_flash_news(60, false).await;
-        let all = flash_res.unwrap_or_default();
+        let all = match self.fetch_flash_news(60, false).await {
+            Ok(results) => results,
+            Err(error) => {
+                return SearchResponse {
+                    query: query.to_string(),
+                    results: Vec::new(),
+                    provider: self.name.clone(),
+                    success: false,
+                    error_message: Some(format!("金十快讯来源失败: {error:#}")),
+                    search_time: start.elapsed().as_secs_f64(),
+                };
+            }
+        };
 
         let filtered: Vec<SearchResult> = if keywords.is_empty() {
             all.into_iter().take(max_results).collect()
@@ -406,5 +452,195 @@ impl SearchProvider for Jin10Provider {
             },
             search_time: start.elapsed().as_secs_f64(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn fixed_now() -> chrono::DateTime<chrono::Local> {
+        chrono::Local
+            .with_ymd_and_hms(2026, 7, 19, 12, 0, 0)
+            .single()
+            .unwrap()
+    }
+
+    #[test]
+    fn flash_parser_validates_filters_and_preserves_missing_url() {
+        let body = r#"{
+            "status": 200,
+            "data": [
+                {
+                    "time": "2026-07-19 11:30:00",
+                    "type": 0,
+                    "important": 1,
+                    "data": {
+                        "content": "测试重要快讯正文",
+                        "title": "测试重要快讯",
+                        "source_link": "https://example.invalid/TEST_CODE"
+                    }
+                },
+                {
+                    "time": "2026-07-19 10:00:00",
+                    "type": 1,
+                    "important": 0,
+                    "data": {"content": "测试普通快讯正文"}
+                },
+                {
+                    "time": "2026-07-19 01:00:00",
+                    "type": 0,
+                    "important": 1,
+                    "data": {"content": "测试过期快讯"}
+                },
+                {"type": 2}
+            ]
+        }"#;
+
+        let all = parse_flash_response(body, 10, false, fixed_now()).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].title, "⭐ 测试重要快讯");
+        assert_eq!(all[0].published_date.as_deref(), Some("11:30"));
+        assert!(all[0].url.contains("TEST_CODE"));
+        assert_eq!(all[1].title, "测试普通快讯正文");
+        assert!(all[1].url.is_empty());
+
+        let important = parse_flash_response(body, 10, true, fixed_now()).unwrap();
+        assert_eq!(important.len(), 1);
+        assert!(important[0].title.starts_with('⭐'));
+        assert!(parse_flash_response(body, 0, false, fixed_now())
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            parse_flash_response(body, 1, false, fixed_now())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn flash_parser_rejects_protocol_and_business_field_failures() {
+        let cases = [
+            ("not-json", "解析失败"),
+            (r#"{"status":500,"data":[]}"#, "API返回异常"),
+            (r#"{"status":200}"#, "缺少 data"),
+            (
+                r#"{"status":200,"data":[{"important":1,"time":"2026-07-19 11:00:00","data":{"content":"x"}}]}"#,
+                "缺少 type",
+            ),
+            (
+                r#"{"status":200,"data":[{"type":-1,"important":1,"time":"2026-07-19 11:00:00","data":{"content":"x"}}]}"#,
+                "type 非法",
+            ),
+            (
+                r#"{"status":200,"data":[{"type":0,"important":2,"time":"2026-07-19 11:00:00","data":{"content":"x"}}]}"#,
+                "important 缺失/非法",
+            ),
+            (
+                r#"{"status":200,"data":[{"type":0,"important":1,"time":"2026-07-19 11:00:00"}]}"#,
+                "缺少 data",
+            ),
+            (
+                r#"{"status":200,"data":[{"type":0,"important":1,"time":"2026-07-19 11:00:00","data":{"content":" "}}]}"#,
+                "缺少 content",
+            ),
+            (
+                r#"{"status":200,"data":[{"type":0,"important":1,"data":{"content":"x"}}]}"#,
+                "缺少 time",
+            ),
+            (
+                r#"{"status":200,"data":[{"type":0,"important":1,"time":"bad","data":{"content":"x"}}]}"#,
+                "time 非法",
+            ),
+        ];
+
+        for (body, expected) in cases {
+            let error = parse_flash_response(body, 10, false, fixed_now()).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn calendar_parser_maps_array_and_wrapped_rows_without_filling_missing_values() {
+        let body = r#"[
+            {
+                "pub_time":"2026-07-19 08:30:00",
+                "country":"中国",
+                "name":"测试经济指标",
+                "star":3,
+                "previous":"--",
+                "consensus":5.2,
+                "actual":"5.3"
+            },
+            {
+                "date":"2026-07-20",
+                "time":"待定",
+                "title":"测试央行事件",
+                "star":2,
+                "forecast":null
+            }
+        ]"#;
+        let rows = parse_calendar_entries_response(body, "event").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].date, "2026-07-19");
+        assert_eq!(rows[0].time, "08:30:00");
+        assert_eq!(rows[0].forecast.as_deref(), Some("5.2"));
+        assert_eq!(rows[0].previous, None);
+        assert_eq!(rows[1].time, "待定");
+        assert!(rows[1].country.is_empty());
+        assert_eq!(rows[1].kind, "event");
+
+        let wrapped = parse_calendar_entries_response(
+            r#"{"data":[{"date":"2026-07-21","name":"测试数据","star":0}]}"#,
+            "data",
+        )
+        .unwrap();
+        assert_eq!(wrapped[0].time, "全天");
+        assert_eq!(wrapped[0].kind, "data");
+        assert!(parse_calendar_entries_response("[]", "data")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn calendar_parser_rejects_incomplete_batches() {
+        let cases = [
+            ("", "正文为空"),
+            ("bad-json", "不是合法 JSON"),
+            (r#"{"other":[]}"#, "缺少数组"),
+            (r#"[1]"#, "不是对象"),
+            (r#"[{"name":"x","star":1}]"#, "缺少 date"),
+            (r#"[{"date":"bad","name":"x","star":1}]"#, "date 非法"),
+            (r#"[{"date":"2026-07-19","star":1}]"#, "name/title"),
+            (
+                r#"[{"date":"2026-07-19","name":"x","star":4}]"#,
+                "star 缺失/非法",
+            ),
+            (
+                r#"[{"date":"2026-07-19","name":"x","star":1,"actual":true}]"#,
+                "actual 类型非法",
+            ),
+            (
+                r#"[{"date":"2026-07-19","name":"x","star":1,"country":7}]"#,
+                "country 类型非法",
+            ),
+        ];
+        for (body, expected) in cases {
+            let error = parse_calendar_entries_response(body, "data").unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
+        assert!(parse_calendar_entries_response("[]", "other")
+            .unwrap_err()
+            .to_string()
+            .contains("kind 非法"));
+    }
+
+    #[test]
+    fn provider_identity_is_stable() {
+        let provider = Jin10Provider::default();
+        assert_eq!(provider.name(), "金十数据");
+        assert!(provider.is_available());
     }
 }

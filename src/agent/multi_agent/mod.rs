@@ -4,6 +4,9 @@
 //! 模块代码保留供后续改造为**新闻/宏观分析**专属多 Agent 使用：
 //! 待新增产业链推演 / 政策解读 / 板块轮动 / 情绪师等宏观维度 agents 后再启用。
 //!
+//! 支持的 AI Provider（按优先级）：
+//!   豆包 > DeepSeek > Gemini
+//!
 //! 旧流程（仅文档保留）：
 //!   1. 数据切片：build_slices 把行情/资金/财务/新闻/板块按领域切开
 //!   2. 6 个领域分析师（Quick）并行 → 结构化 JSON（AnalystView）
@@ -40,11 +43,11 @@ impl GeminiAnalyzer {
                 self.doubao_model_for(AgentMode::Quick),
                 self.doubao_model_for(AgentMode::Deep),
             )
-        } else if self.use_openai {
+        } else if self.use_deepseek {
             (
-                "OpenAI兼容",
-                self.openai_model_for(AgentMode::Quick),
-                self.openai_model_for(AgentMode::Deep),
+                "DeepSeek",
+                self.deepseek_model_for(AgentMode::Quick),
+                self.deepseek_model_for(AgentMode::Deep),
             )
         } else {
             (
@@ -116,5 +119,33 @@ impl GeminiAnalyzer {
         );
         trace::print_final(self, arb.composite_score, &arb.markdown);
         Ok(arb.markdown)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unavailable_model_pipeline_runs_every_local_stage_then_fails_explicitly() {
+        let analyzer = GeminiAnalyzer::new(crate::analyzer::GeminiConfig {
+            max_retries: 1,
+            retry_delay: 0.0,
+            request_delay: 0.0,
+            ..crate::analyzer::GeminiConfig::default()
+        });
+        let error = analyzer
+            .run_text_pipeline(DomainSlices {
+                basics: "TEST_CODE_标的".to_string(),
+                technical: "TEST_CODE_技术".to_string(),
+                capital: "TEST_CODE_资金".to_string(),
+                fundamental: "TEST_CODE_基本面".to_string(),
+                news: None,
+                macro_ctx: None,
+                sector: "TEST_CODE_板块".to_string(),
+            })
+            .await
+            .expect_err("unavailable model cannot synthesize a report");
+        assert!(error.to_string().contains("API Key 未配置"));
     }
 }

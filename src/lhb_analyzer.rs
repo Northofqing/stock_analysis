@@ -1,3 +1,4 @@
+//! Registered business rules: BR-127.
 //! 龙虎榜数据分析模块
 //!
 //! 功能：
@@ -103,12 +104,7 @@ impl LhbDataFetcher {
 
     /// 获取指定日期的龙虎榜数据（优先从数据库缓存读取）
     pub async fn get_lhb_by_date(&self, date: &str) -> Result<Vec<LhbRecord>> {
-        // 标准化日期格式：20260128 -> 2026-01-28
-        let date_normalized = if date.len() == 8 {
-            format!("{}-{}-{}", &date[0..4], &date[4..6], &date[6..8])
-        } else {
-            date.to_string()
-        };
+        let date_normalized = Self::normalize_date(date)?;
 
         log::info!(
             "[龙虎榜] 正在查询 {} 的数据（标准化后：{}）",
@@ -118,48 +114,41 @@ impl LhbDataFetcher {
 
         // 1. 先尝试从数据库读取缓存（支持模糊匹配日期）
         if let Some(db) = DatabaseManager::try_get() {
-            if let Ok(cached_records) = db.get_lhb_by_date(&date_normalized) {
-                if !cached_records.is_empty() {
-                    log::info!(
-                        "[龙虎榜] 从数据库缓存读取 {} 的数据 ({} 条记录)",
-                        date,
-                        cached_records.len()
-                    );
-                    return Ok(Self::convert_db_to_records(cached_records));
-                } else {
-                    log::info!("[龙虎榜] 数据库中没有 {} 的缓存数据", date);
-                }
+            let cached_records = db
+                .get_lhb_by_date(&date_normalized)
+                .map_err(|error| anyhow::anyhow!("龙虎榜缓存读取失败: {error}"))?;
+            if !cached_records.is_empty() {
+                log::info!(
+                    "[龙虎榜] 从数据库缓存读取 {} 的数据 ({} 条记录)",
+                    date,
+                    cached_records.len()
+                );
+                return Ok(Self::convert_db_to_records(cached_records));
             }
+            log::info!("[龙虎榜] 数据库中没有 {} 的缓存数据", date);
         }
 
         // 2. 如果缓存不存在，从API获取
         log::info!("[龙虎榜] 从API获取 {} 的数据", date);
         log::info!("[龙虎榜] 从API获取{}的数据...", date);
-        let records = self.fetch_lhb_from_api(date).await?;
+        let records = self.fetch_lhb_from_api(&date_normalized).await?;
 
         // 3. 保存到数据库缓存
-        if let Some(db) = DatabaseManager::try_get() {
-            let new_records: Vec<NewLhbDaily> = records
-                .iter()
-                .map(|r| Self::convert_record_to_db(r))
-                .collect();
-
-            if let Ok(saved) = db.save_lhb_records(&new_records) {
-                log::info!("[龙虎榜] 已缓存 {} 条记录到数据库", saved);
-            }
-        }
+        let db = DatabaseManager::try_get()
+            .ok_or_else(|| anyhow::anyhow!("龙虎榜缓存数据库未初始化"))?;
+        let new_records: Vec<NewLhbDaily> =
+            records.iter().map(Self::convert_record_to_db).collect();
+        let saved = db
+            .save_lhb_records(&new_records)
+            .map_err(|error| anyhow::anyhow!("龙虎榜缓存写入失败: {error}"))?;
+        log::info!("[龙虎榜] 已缓存 {} 条记录到数据库", saved);
 
         Ok(records)
     }
 
     /// 从API获取龙虎榜数据
     async fn fetch_lhb_from_api(&self, date: &str) -> Result<Vec<LhbRecord>> {
-        // 转换日期格式：20260128 -> 2026-01-28
-        let date_formatted = if date.len() == 8 {
-            format!("{}-{}-{}", &date[0..4], &date[4..6], &date[6..8])
-        } else {
-            date.to_string()
-        };
+        let date_formatted = Self::normalize_date(date)?;
 
         let url = format!(
             "http://datacenter-web.eastmoney.com/api/data/v1/get?\
@@ -176,22 +165,20 @@ impl LhbDataFetcher {
             .get(&url)
             .send()
             .await
-            .context("请求龙虎榜数据失败")?;
+            .context("请求龙虎榜数据失败")?
+            .error_for_status()
+            .context("龙虎榜 HTTP 状态失败")?;
 
         let text = response.text().await?;
 
         // 解析JSON
         let json: serde_json::Value = serde_json::from_str(&text).context("解析龙虎榜JSON失败")?;
 
-        let mut records = Vec::new();
-
-        if let Some(data) = json["result"]["data"].as_array() {
-            for item in data {
-                if let Some(record) = self.parse_lhb_record(item) {
-                    records.push(record);
-                }
-            }
-        }
+        let data = json
+            .pointer("/result/data")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("龙虎榜响应缺少 result.data 数组"))?;
+        let records = self.parse_lhb_batch(data)?;
 
         log::info!("[龙虎榜] API返回 {} 条记录", records.len());
         Ok(records)
@@ -262,44 +249,93 @@ impl LhbDataFetcher {
             .get(&url)
             .send()
             .await
-            .context("请求个股龙虎榜数据失败")?;
+            .context("请求个股龙虎榜数据失败")?
+            .error_for_status()
+            .context("个股龙虎榜 HTTP 状态失败")?;
 
         let text = response.text().await?;
         let json: serde_json::Value =
             serde_json::from_str(&text).context("解析个股龙虎榜JSON失败")?;
 
-        let mut records = Vec::new();
-
-        if let Some(data) = json["result"]["data"].as_array() {
-            for item in data {
-                if let Some(record) = self.parse_lhb_record(item) {
-                    records.push(record);
-                }
-            }
-        }
+        let data = json
+            .pointer("/result/data")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("个股龙虎榜响应缺少 result.data 数组"))?;
+        let records = self.parse_lhb_batch(data)?;
 
         log::info!("[龙虎榜] {} 最近{}天上榜 {} 次", code, days, records.len());
         Ok(records)
     }
 
     /// 解析单条龙虎榜记录
-    fn parse_lhb_record(&self, item: &serde_json::Value) -> Option<LhbRecord> {
-        Some(LhbRecord {
-            code: item["SECURITY_CODE"].as_str()?.to_string(),
-            name: item["SECURITY_NAME_ABBR"].as_str()?.to_string(),
-            trade_date: item["TRADE_DATE"].as_str()?.to_string(),
-            reason: item["EXPLAIN"].as_str().unwrap_or("").to_string(),
-            pct_change: item["CHANGE_RATE"].as_f64().unwrap_or(0.0),
-            close_price: item["CLOSE_PRICE"].as_f64().unwrap_or(0.0),
-            buy_amount: item["BILLBOARD_BUY_AMT"].as_f64().unwrap_or(0.0),
-            sell_amount: item["BILLBOARD_SELL_AMT"].as_f64().unwrap_or(0.0),
-            net_amount: item["BILLBOARD_NET_AMT"].as_f64().unwrap_or(0.0),
-            total_amount: item["ACCUM_AMOUNT"].as_f64().unwrap_or(0.0),
-            lhb_ratio: item["DEAL_NET_RATIO"].as_f64().unwrap_or(0.0),
+    fn parse_lhb_batch(&self, data: &[serde_json::Value]) -> Result<Vec<LhbRecord>> {
+        let records = data
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                self.parse_lhb_record(item)
+                    .with_context(|| format!("龙虎榜第 {} 行解析失败", index + 1))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let db_records = records
+            .iter()
+            .map(Self::convert_record_to_db)
+            .collect::<Vec<_>>();
+        crate::database::validate_lhb_records(&db_records)
+            .map_err(|error| anyhow::anyhow!("龙虎榜批次校验失败: {error}"))?;
+        Ok(records)
+    }
+
+    fn parse_lhb_record(&self, item: &serde_json::Value) -> Result<LhbRecord> {
+        let required_text = |field: &str| -> Result<String> {
+            item.get(field)
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| anyhow::anyhow!("{field} 缺失或为空"))
+        };
+        let required_number = |field: &str| -> Result<f64> {
+            let value = item
+                .get(field)
+                .ok_or_else(|| anyhow::anyhow!("{field} 缺失"))?;
+            let parsed = match value {
+                serde_json::Value::Number(number) => number.as_f64(),
+                serde_json::Value::String(text) => text.trim().parse::<f64>().ok(),
+                _ => None,
+            }
+            .ok_or_else(|| anyhow::anyhow!("{field} 不是有效数值"))?;
+            if !parsed.is_finite() {
+                anyhow::bail!("{field} 非有限");
+            }
+            Ok(parsed)
+        };
+        Ok(LhbRecord {
+            code: required_text("SECURITY_CODE")?,
+            name: required_text("SECURITY_NAME_ABBR")?,
+            trade_date: required_text("TRADE_DATE")?,
+            reason: required_text("EXPLAIN")?,
+            pct_change: required_number("CHANGE_RATE")?,
+            close_price: required_number("CLOSE_PRICE")?,
+            buy_amount: required_number("BILLBOARD_BUY_AMT")?,
+            sell_amount: required_number("BILLBOARD_SELL_AMT")?,
+            net_amount: required_number("BILLBOARD_NET_AMT")?,
+            total_amount: required_number("ACCUM_AMOUNT")?,
+            lhb_ratio: required_number("DEAL_NET_RATIO")?,
             inst_buy_seats: 0, // 需要额外接口获取
             inst_sell_seats: 0,
             inst_net_amount: 0.0,
         })
+    }
+
+    fn normalize_date(date: &str) -> Result<String> {
+        let normalized = if date.len() == 8 && date.bytes().all(|byte| byte.is_ascii_digit()) {
+            format!("{}-{}-{}", &date[0..4], &date[4..6], &date[6..8])
+        } else {
+            date.to_string()
+        };
+        chrono::NaiveDate::parse_from_str(&normalized, "%Y-%m-%d")
+            .map_err(|error| anyhow::anyhow!("龙虎榜日期非法 {date:?}: {error}"))?;
+        Ok(normalized)
     }
 
     /// 分析个股龙虎榜数据，生成选股指标
@@ -517,7 +553,7 @@ impl LhbDataFetcher {
         }
 
         // 按评分排序
-        results.sort_by(|a, b| b.total_score.cmp(&a.total_score));
+        results.sort_by_key(|item| std::cmp::Reverse(item.total_score));
 
         Ok(results)
     }
@@ -532,55 +568,164 @@ impl Default for LhbDataFetcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use diesel::prelude::*;
 
-    #[tokio::test]
-    async fn test_get_today_lhb() {
-        let fetcher = LhbDataFetcher::new().unwrap();
-        let result = fetcher.get_today_lhb().await;
+    fn fetcher() -> LhbDataFetcher {
+        LhbDataFetcher::new().expect("shared client must build")
+    }
 
-        match result {
-            Ok(records) => {
-                println!("今日龙虎榜: {} 条记录", records.len());
-                for (i, record) in records.iter().take(5).enumerate() {
-                    println!(
-                        "{}. {} {} 净买入: {:.0}万",
-                        i + 1,
-                        record.code,
-                        record.name,
-                        record.net_amount
-                    );
-                }
-            }
-            Err(e) => {
-                println!("获取失败: {}", e);
-            }
+    fn protocol_row(code: &str) -> serde_json::Value {
+        serde_json::json!({
+            "SECURITY_CODE": code,
+            "SECURITY_NAME_ABBR": "测试龙虎榜",
+            "TRADE_DATE": "2099-07-16 00:00:00",
+            "EXPLAIN": "测试完整协议",
+            "CHANGE_RATE": "9.0",
+            "CLOSE_PRICE": 10.0,
+            "BILLBOARD_BUY_AMT": 10_000.0,
+            "BILLBOARD_SELL_AMT": 4_000.0,
+            "BILLBOARD_NET_AMT": 6_000.0,
+            "ACCUM_AMOUNT": 20_000.0,
+            "DEAL_NET_RATIO": 25.0
+        })
+    }
+
+    fn record(net_amount: f64, pct_change: f64, ratio: f64) -> LhbRecord {
+        LhbRecord {
+            code: "TEST_CODE_LHB_SCORE".to_string(),
+            name: "测试评分".to_string(),
+            trade_date: "2099-07-16".to_string(),
+            reason: "测试完整事实".to_string(),
+            pct_change,
+            close_price: 10.0,
+            buy_amount: 10_000.0,
+            sell_amount: 10_000.0 - net_amount,
+            net_amount,
+            total_amount: 20_000.0,
+            lhb_ratio: ratio,
+            inst_buy_seats: 0,
+            inst_sell_seats: 0,
+            inst_net_amount: 0.0,
         }
     }
 
     #[tokio::test]
-    async fn test_analyze_stock() {
-        let fetcher = LhbDataFetcher::new().unwrap();
+    async fn br127_cached_lhb_query_uses_validated_database_facts_without_network() {
+        DatabaseManager::init(None).expect("test database init");
+        let db = DatabaseManager::get();
+        let code = format!(
+            "TEST_CODE_LHB_CACHE_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        );
+        let parsed = fetcher()
+            .parse_lhb_batch(&[protocol_row(&code)])
+            .expect("complete local provider row");
+        let db_rows = parsed
+            .iter()
+            .map(LhbDataFetcher::convert_record_to_db)
+            .collect::<Vec<_>>();
+        db.save_lhb_records(&db_rows).expect("cache local row");
 
-        // 测试一个股票代码
-        let code = "600519";
-        let result = fetcher.analyze_stock_lhb(code).await;
+        let loaded = fetcher()
+            .get_lhb_by_date("20990716")
+            .await
+            .expect("cache hit must not use network");
+        let ours = loaded
+            .iter()
+            .find(|row| row.code == code)
+            .expect("cached row is returned");
+        assert_eq!(ours.name, "测试龙虎榜");
+        assert_eq!(ours.trade_date, "2099-07-16 00:00:00");
+        assert_eq!(ours.net_amount, 6_000.0);
+        assert_eq!(ours.inst_buy_seats, 0);
 
-        match result {
-            Ok(analysis) => {
-                println!("\n龙虎榜分析结果:");
-                println!("股票: {} {}", analysis.code, analysis.name);
-                println!("上榜次数: {}", analysis.recent_count);
-                println!("机构评分: {}", analysis.inst_score);
-                println!("游资评分: {}", analysis.hot_money_score);
-                println!("综合评分: {}", analysis.total_score);
-                println!("推荐理由: {}", analysis.reason);
-                if !analysis.risk_warning.is_empty() {
-                    println!("风险提示: {}", analysis.risk_warning);
-                }
-            }
-            Err(e) => {
-                println!("分析失败: {}", e);
-            }
+        let mut conn = db.get_conn().expect("test database connection");
+        diesel::delete(
+            crate::schema::lhb_daily::table.filter(crate::schema::lhb_daily::code.eq(&code)),
+        )
+        .execute(&mut conn)
+        .expect("clean cached LHB fixture");
+    }
+
+    #[test]
+    fn br127_protocol_parser_rejects_missing_or_bad_rows_as_a_complete_batch() {
+        let fetcher = fetcher();
+        let complete = fetcher
+            .parse_lhb_batch(&[protocol_row("TEST_CODE_LHB_PROTOCOL")])
+            .expect("complete row parses");
+        assert_eq!(complete.len(), 1);
+        assert_eq!(complete[0].pct_change, 9.0);
+        assert_eq!(complete[0].close_price, 10.0);
+
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({"SECURITY_CODE": "TEST_CODE_BAD"}),
+            {
+                let mut row = protocol_row("TEST_CODE_BAD_TEXT");
+                row["EXPLAIN"] = serde_json::Value::String(" ".to_string());
+                row
+            },
+            {
+                let mut row = protocol_row("TEST_CODE_BAD_NUMBER");
+                row["CHANGE_RATE"] = serde_json::Value::String("bad".to_string());
+                row
+            },
+            {
+                let mut row = protocol_row("TEST_CODE_MISSING_NUMBER");
+                row.as_object_mut().unwrap().remove("CLOSE_PRICE");
+                row
+            },
+        ] {
+            assert!(fetcher.parse_lhb_batch(&[bad]).is_err());
         }
+        assert!(LhbDataFetcher::normalize_date("20260230").is_err());
+        assert!(LhbDataFetcher::normalize_date("not-a-date").is_err());
+        assert_eq!(
+            LhbDataFetcher::normalize_date("20990716").unwrap(),
+            "2099-07-16"
+        );
+    }
+
+    #[test]
+    fn lhb_scoring_and_text_cover_positive_neutral_and_risk_bands() {
+        let fetcher = fetcher();
+        assert_eq!(fetcher.calculate_inst_score(&[]), 0);
+        assert_eq!(fetcher.calculate_hot_money_score(&[]), 0);
+        assert_eq!(
+            fetcher.generate_recommendation(&[], 0, 0),
+            "近期未上榜龙虎榜"
+        );
+        assert!(fetcher.generate_risk_warning(&[]).is_empty());
+
+        let strong = vec![record(6_000.0, 9.5, 25.0); 3];
+        assert_eq!(fetcher.calculate_inst_score(&strong), 100);
+        assert_eq!(fetcher.calculate_hot_money_score(&strong), 100);
+        let recommendation = fetcher.generate_recommendation(&strong, 100, 100);
+        assert!(recommendation.contains("机构高度参与"));
+        assert!(recommendation.contains("游资高度活跃"));
+        assert!(recommendation.contains("3次为净买入"));
+        assert!(recommendation.contains("净买入6000万元"));
+
+        let moderate = vec![record(1_500.0, 6.0, 15.0); 2];
+        assert!(fetcher.calculate_inst_score(&moderate) >= 50);
+        assert!(fetcher.calculate_hot_money_score(&moderate) >= 50);
+        let moderate_text = fetcher.generate_recommendation(&moderate, 50, 50);
+        assert!(moderate_text.contains("机构适度关注"));
+        assert!(moderate_text.contains("游资参与度较高"));
+
+        let neutral = vec![record(0.0, 1.0, 1.0)];
+        assert_eq!(
+            fetcher.generate_recommendation(&neutral, 0, 0),
+            "龙虎榜数据一般，建议谨慎"
+        );
+        let risk = vec![record(-2_000.0, -10.0, 5.0); 3];
+        let warning = fetcher.generate_risk_warning(&risk);
+        assert!(warning.contains("大额净卖出"));
+        assert!(warning.contains("波动剧烈"));
+        assert!(warning.contains("大跌上榜"));
     }
 }

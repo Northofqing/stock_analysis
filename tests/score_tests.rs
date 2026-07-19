@@ -43,7 +43,7 @@ fn test_dual_score_with_winrate() {
     let score = compute_dual_score(&inputs, "v9.1-2026-06");
     assert!(score.trade_signal_score.is_some());
     let tss = score.trade_signal_score.unwrap();
-    assert!(tss >= 50 && tss <= 100);
+    assert!((50..=100).contains(&tss));
     assert!(score.data_sufficiency.winrate_sufficient);
 }
 
@@ -59,9 +59,9 @@ fn test_winrate_zero_no_data() {
 }
 
 #[test]
-fn test_event_risk_floor_70_no_winrate() {
-    // 修复 P0-1: 无 winrate 时 event_risk_score 封顶 70 (B6 单源封顶规则的延伸)
-    let mut inputs = ScoreInputs {
+fn test_event_risk_caps_one_point_below_default_threshold_without_winrate() {
+    // BR-096: 默认推送门为 75，无 winrate 时必须精确封顶到 threshold-1。
+    let inputs = ScoreInputs {
         event_strength: 100,
         event_certainty: 100,
         chain_match_score: 100,
@@ -72,12 +72,7 @@ fn test_event_risk_floor_70_no_winrate() {
         ai_degraded: false,
     };
     let score = compute_dual_score(&inputs, "v9.1-2026-06");
-    // 即便所有项满分, 无 winrate 时总分封顶 70
-    assert!(
-        score.event_risk_score <= 70,
-        "无 winrate 时 event_risk_score 封顶 70, 实际 {}",
-        score.event_risk_score
-    );
+    assert_eq!(score.event_risk_score, 74);
 }
 
 #[test]

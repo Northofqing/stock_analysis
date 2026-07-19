@@ -63,7 +63,7 @@ pub async fn run_analysis(
 ===== 分析结果摘要 ====="
         );
         let mut sorted_results = results;
-        sorted_results.sort_by(|a, b| b.sentiment_score.cmp(&a.sentiment_score));
+        sorted_results.sort_by_key(|result| std::cmp::Reverse(result.sentiment_score));
         for r in sorted_results.iter() {
             info!(
                 "{} {}({}) - {} (评分: {})",
@@ -213,7 +213,7 @@ pub async fn run_lhb_analysis(args: &Args) -> Result<()> {
         return Ok(());
     }
 
-    good_stocks.sort_by(|a, b| b.1.total_score.cmp(&a.1.total_score));
+    good_stocks.sort_by_key(|(_, analysis)| std::cmp::Reverse(analysis.total_score));
     info!("\n筛选到 {} 只优质股票:", good_stocks.len());
     for (record, analysis) in &good_stocks {
         info!(
@@ -257,7 +257,7 @@ pub async fn run_lhb_analysis(args: &Args) -> Result<()> {
     info!("\n===== 龙虎榜选股分析结果 =====");
     if !results.is_empty() {
         let mut sorted = results;
-        sorted.sort_by(|a, b| b.sentiment_score.cmp(&a.sentiment_score));
+        sorted.sort_by_key(|result| std::cmp::Reverse(result.sentiment_score));
         for r in sorted.iter() {
             let lhb_info = good_stocks
                 .iter()
