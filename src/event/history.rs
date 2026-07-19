@@ -900,11 +900,16 @@ mod tests {
 
     #[tokio::test]
     async fn query_and_rate_filters_reject_each_nonmatching_complete_record() {
-        let dir = test_dir("gate-d-filter-matrix");
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        let now = Local::now();
-        let date = now.format("%Y-%m-%d").to_string();
-        let rows = [
+        let query_dir = test_dir("gate-d-query-filter-matrix");
+        tokio::fs::create_dir_all(&query_dir).await.unwrap();
+        let query_now = today()
+            .and_hms_opt(12, 0, 0)
+            .expect("valid local noon")
+            .and_local_timezone(Local)
+            .single()
+            .expect("unambiguous local noon");
+        let query_date = query_now.format("%Y-%m-%d").to_string();
+        let query_rows = [
             make_delivery_envelope(
                 "wrong-kind",
                 "OtherKind",
@@ -912,7 +917,7 @@ mod tests {
                 "Pushed",
                 "wanted-sink",
                 1,
-                now,
+                query_now,
             ),
             make_delivery_envelope(
                 "wrong-date",
@@ -921,7 +926,7 @@ mod tests {
                 "Pushed",
                 "wanted-sink",
                 1,
-                now - chrono::Duration::days(1),
+                query_now - chrono::Duration::days(1),
             ),
             make_delivery_envelope(
                 "wanted",
@@ -930,7 +935,7 @@ mod tests {
                 "Pushed",
                 "wanted-sink",
                 1,
-                now,
+                query_now,
             ),
             make_delivery_envelope(
                 "wrong-sink",
@@ -939,7 +944,62 @@ mod tests {
                 "Failed",
                 "other-sink",
                 1,
-                now,
+                query_now,
+            ),
+        ];
+        for row in &query_rows {
+            write_envelope_line(
+                &query_dir,
+                &query_date,
+                &serde_json::to_string(row).unwrap(),
+            )
+            .await;
+        }
+
+        let queried = HistoryQuery::new(query_dir.clone())
+            .query(HistoryFilter {
+                date: Some(query_now.date_naive()),
+                code: None,
+                kind: Some("WantedKind".into()),
+                limit: 0,
+                order: HistoryOrder::Asc,
+            })
+            .await
+            .expect("complete records with nonmatching filters are skipped");
+        assert_eq!(queried.len(), 2);
+        assert!(queried.iter().all(|entry| entry.kind == "WantedKind"));
+        tokio::fs::remove_dir_all(query_dir).await.unwrap();
+
+        let rate_dir = test_dir("gate-d-rate-filter-matrix");
+        tokio::fs::create_dir_all(&rate_dir).await.unwrap();
+        let rate_now = Local::now();
+        let rate_rows = [
+            make_delivery_envelope(
+                "wrong-kind",
+                "OtherKind",
+                Some("TEST_CODE_000001"),
+                "Pushed",
+                "wanted-sink",
+                1,
+                rate_now,
+            ),
+            make_delivery_envelope(
+                "wanted",
+                "WantedKind",
+                Some("TEST_CODE_000001"),
+                "Pushed",
+                "wanted-sink",
+                1,
+                rate_now,
+            ),
+            make_delivery_envelope(
+                "wrong-sink",
+                "WantedKind",
+                Some("TEST_CODE_000001"),
+                "Failed",
+                "other-sink",
+                1,
+                rate_now,
             ),
             make_delivery_envelope(
                 "outside-window",
@@ -948,34 +1008,22 @@ mod tests {
                 "Failed",
                 "wanted-sink",
                 1,
-                now - chrono::Duration::hours(2),
+                rate_now - chrono::Duration::hours(2),
             ),
         ];
-        for row in &rows {
-            write_envelope_line(&dir, &date, &serde_json::to_string(row).unwrap()).await;
+        for row in &rate_rows {
+            let partition = row.ts.format("%Y-%m-%d").to_string();
+            write_envelope_line(&rate_dir, &partition, &serde_json::to_string(row).unwrap()).await;
         }
 
-        let queried = HistoryQuery::new(dir.clone())
-            .query(HistoryFilter {
-                date: Some(now.date_naive()),
-                code: None,
-                kind: Some("WantedKind".into()),
-                limit: 0,
-                order: HistoryOrder::Asc,
-            })
-            .await
-            .expect("complete records with nonmatching filters are skipped");
-        assert_eq!(queried.len(), 3);
-        assert!(queried.iter().all(|entry| entry.kind == "WantedKind"));
-
-        let stats = HistoryQuery::new(dir.clone())
+        let stats = HistoryQuery::new(rate_dir.clone())
             .push_success_rate(Some("WantedKind"), Window::Hours(1), Some("wanted-sink"))
             .await
             .expect("filtered rate statistics");
         assert_eq!(stats.total, 1);
         assert_eq!(stats.pushed, 1);
         assert_eq!(stats.failed, 0);
-        tokio::fs::remove_dir_all(dir).await.unwrap();
+        tokio::fs::remove_dir_all(rate_dir).await.unwrap();
     }
 
     #[test]
