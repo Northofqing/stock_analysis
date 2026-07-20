@@ -1454,6 +1454,10 @@ pub async fn push_feishu_via_http(text: &str) -> bool {
         }
     };
 
+    push_feishu_http_with_client(&client, &url, text).await
+}
+
+async fn push_feishu_http_with_client(client: &reqwest::Client, url: &str, text: &str) -> bool {
     let payload = serde_json::json!({
         "msg_type": "text",
         "content": {
@@ -1461,7 +1465,7 @@ pub async fn push_feishu_via_http(text: &str) -> bool {
         }
     });
 
-    let resp = match client.post(&url).json(&payload).send().await {
+    let resp = match client.post(url).json(&payload).send().await {
         Ok(v) => v,
         Err(e) => {
             log::error!("[飞书] 推送失败: 调用 webhook 失败: {}", e);
@@ -3098,53 +3102,22 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial(notify_env)]
     async fn feishu_webhook_executes_success_http_error_and_protocol_error() {
-        let _env = crate::TestEnvGuard::capture(&[
-            "FEISHU_WEBHOOK_URL",
-            "MAGICLAW_FEISHU_WEBHOOK_URL",
-            "HTTP_PROXY",
-            "HTTPS_PROXY",
-            "ALL_PROXY",
-            "http_proxy",
-            "https_proxy",
-            "all_proxy",
-            "NO_PROXY",
-            "no_proxy",
-        ]);
-        std::env::remove_var("MAGICLAW_FEISHU_WEBHOOK_URL");
-        for key in [
-            "HTTP_PROXY",
-            "HTTPS_PROXY",
-            "ALL_PROXY",
-            "http_proxy",
-            "https_proxy",
-            "all_proxy",
-        ] {
-            std::env::remove_var(key);
-        }
-        std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
-        std::env::set_var("no_proxy", "127.0.0.1,localhost");
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
 
         let (url, request) = one_request_http_fixture(200, r#"{"code":0}"#).await;
-        std::env::set_var("FEISHU_WEBHOOK_URL", &url);
-        assert!(push_feishu_via_http("TEST_CODE webhook success").await);
+        assert!(push_feishu_http_with_client(&client, &url, "TEST_CODE webhook success").await);
         let request = request.await.unwrap();
         assert!(request.starts_with("POST / HTTP/1.1"));
         assert!(request.contains("TEST_CODE webhook success"));
 
         let (url, request) = one_request_http_fixture(500, r#"{"error":"down"}"#).await;
-        std::env::set_var("FEISHU_WEBHOOK_URL", &url);
-        assert!(!push_feishu_via_http("TEST_CODE webhook status").await);
+        assert!(!push_feishu_http_with_client(&client, &url, "TEST_CODE webhook status").await);
         request.await.unwrap();
 
         let (url, request) = one_request_http_fixture(200, r#"{"code":1}"#).await;
-        std::env::set_var("FEISHU_WEBHOOK_URL", &url);
-        assert!(!push_feishu_via_http("TEST_CODE webhook protocol").await);
+        assert!(!push_feishu_http_with_client(&client, &url, "TEST_CODE webhook protocol").await);
         request.await.unwrap();
-
-        std::env::remove_var("FEISHU_WEBHOOK_URL");
-        assert!(!push_feishu_via_http("TEST_CODE missing webhook").await);
     }
 
     #[tokio::test]

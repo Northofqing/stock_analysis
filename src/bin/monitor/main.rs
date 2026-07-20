@@ -118,6 +118,8 @@ mod v13_diag; // v13.27: 端到端诊断
 
 mod market_data;
 
+mod intraday_market;
+
 mod v14_adapter;
 
 mod l6_sink;
@@ -5858,35 +5860,45 @@ async fn monitor_loop() {
             }
 
             if session == MarketSession::Morning || session == MarketSession::Afternoon {
-                let result = tokio::task::spawn_blocking(|| -> Result<_, String> {
-                    let analyzer = stock_analysis::market_analyzer::MarketAnalyzer::new(None)
-                        .map_err(|error| format!("初始化市场分析器失败: {error}"))?;
-
-                    let limit_stocks = analyzer
-                        .get_limit_up_stocks()
-                        .map_err(|error| format!("涨停池获取失败: {error}"))?;
-
-                    std::thread::sleep(std::time::Duration::from_millis(800));
-
-                    let position_quotes = market_data::fetch_position_quotes()?;
-
-                    Ok((limit_stocks, position_quotes))
+                let result = tokio::task::spawn_blocking(|| {
+                    intraday_market::acquire_intraday_market_inputs(
+                        || {
+                            let analyzer =
+                                stock_analysis::market_analyzer::MarketAnalyzer::new(None)
+                                    .map_err(|error| format!("初始化市场分析器失败: {error}"))?;
+                            analyzer
+                                .get_limit_up_stocks()
+                                .map_err(|error| format!("涨停池获取失败: {error}"))
+                        },
+                        || {
+                            std::thread::sleep(std::time::Duration::from_millis(800));
+                            market_data::fetch_position_quotes()
+                        },
+                    )
                 })
                 .await;
 
-                let result = match result {
-                    Ok(Ok(value)) => Some(value),
-                    Ok(Err(error)) => {
-                        log::error!("[盘中监控] 行情批次拒绝: {}", error);
-                        None
-                    }
-                    Err(error) => {
-                        log::error!("[盘中监控] 行情任务失败: {}", error);
-                        None
-                    }
-                };
+                let resolved = intraday_market::resolve_intraday_market_inputs(
+                    result.map_err(|error| error.to_string()),
+                );
+                if let Some(error) = resolved.limit_error.as_deref() {
+                    log::error!("[盘中监控] 涨停池批次拒绝: {error}");
+                }
+                if let Some(error) = resolved.position_error.as_deref() {
+                    log::error!("[盘中监控] 持仓行情批次拒绝: {error}");
+                }
+                if let Some(error) = resolved.task_error.as_deref() {
+                    log::error!("[盘中监控] 行情任务失败: {error}");
+                }
+                let consumer_plan = resolved.consumer_plan();
+                if !consumer_plan.use_limit_data && !consumer_plan.use_position_data {
+                    log::error!("[盘中监控] 两路行情均不可用，仅跳过依赖这两路数据的计算");
+                }
+                debug_assert!(consumer_plan.run_independent_jobs);
+                let limit_stocks = resolved.limit_stocks;
+                let position_quotes = resolved.position_quotes;
 
-                if let Some((limit_stocks, position_quotes)) = result {
+                {
                     // ▶ 新增：开盘后虚拟记录观察仓位（仅一次）
 
                     if entry_mode == AirRefuelEntryMode::Confirm
@@ -5902,20 +5914,24 @@ async fn monitor_loop() {
 
                         // 从当前行情中获取这些候选的开盘价/实时价
 
-                        for pos_quote in &position_quotes {
-                            for virtual_pos in &mut virtual_observation {
-                                if virtual_pos.0 == pos_quote.code && virtual_pos.2 == 0.0 {
-                                    virtual_pos.2 = pos_quote.price;
+                        if let Some(position_quotes) = position_quotes.as_ref() {
+                            for pos_quote in position_quotes {
+                                for virtual_pos in &mut virtual_observation {
+                                    if virtual_pos.0 == pos_quote.code && virtual_pos.2 == 0.0 {
+                                        virtual_pos.2 = pos_quote.price;
+                                    }
                                 }
                             }
                         }
 
                         // 补充从limit_stocks中没获取到的价格
 
-                        for limit_stock in &limit_stocks {
-                            for virtual_pos in &mut virtual_observation {
-                                if virtual_pos.0 == limit_stock.code && virtual_pos.2 == 0.0 {
-                                    virtual_pos.2 = limit_stock.price;
+                        if let Some(limit_stocks) = limit_stocks.as_ref() {
+                            for limit_stock in limit_stocks {
+                                for virtual_pos in &mut virtual_observation {
+                                    if virtual_pos.0 == limit_stock.code && virtual_pos.2 == 0.0 {
+                                        virtual_pos.2 = limit_stock.price;
+                                    }
                                 }
                             }
                         }
@@ -6011,10 +6027,12 @@ async fn monitor_loop() {
 
                     // 首板/二板/三板识别：全市场涨停池，各自独立消息，每只仅推一次
 
-                    if !limit_stocks.is_empty() {
+                    if let Some(limit_stocks) =
+                        limit_stocks.as_ref().filter(|stocks| !stocks.is_empty())
+                    {
                         let mut need_lookup: Vec<(String, String)> = Vec::new();
 
-                        for s in &limit_stocks {
+                        for s in limit_stocks {
                             if board_notified.contains(&s.code) {
                                 continue;
                             }
@@ -6149,41 +6167,49 @@ async fn monitor_loop() {
 
                     // 合并两路数据：涨停列表中的持仓 + 持仓单独查询
 
+                    let mut health_lines: Vec<String> = Vec::new();
+
                     let mut stock_map: std::collections::HashMap<
                         String,
                         &stock_analysis::market_data::TopStock,
                     > = std::collections::HashMap::new();
 
-                    for s in &limit_stocks {
-                        if our_codes.contains(&s.code) {
-                            stock_map.insert(s.code.clone(), s);
+                    if let Some(position_quotes) = position_quotes.as_ref() {
+                        if let Some(limit_stocks) = limit_stocks.as_ref() {
+                            for s in limit_stocks {
+                                if our_codes.contains(&s.code) {
+                                    stock_map.insert(s.code.clone(), s);
+                                }
+                            }
+                        }
+
+                        for q in position_quotes {
+                            if !stock_map.contains_key(&q.code) {
+                                stock_map.insert(q.code.clone(), q);
+                            }
                         }
                     }
 
-                    for q in &position_quotes {
-                        if !stock_map.contains_key(&q.code) {
-                            stock_map.insert(q.code.clone(), q);
-                        }
-                    }
+                    // 主力排名（仅在真实涨停池可用时排序）
 
-                    // 主力排名（仅涨停股中排序）
-
-                    let mut ranked: Vec<&stock_analysis::market_data::TopStock> = limit_stocks
-                        .iter()
-                        .filter(|stock| stock.main_net_yi.is_some())
-                        .collect();
-
-                    ranked.sort_by(|a, b| {
-                        b.main_net_yi
-                            .partial_cmp(&a.main_net_yi)
-                            .unwrap_or(std::cmp::Ordering::Equal)
+                    let mut ranked = limit_stocks.as_ref().map(|stocks| {
+                        stocks
+                            .iter()
+                            .filter(|stock| stock.main_net_yi.is_some())
+                            .collect::<Vec<_>>()
                     });
 
-                    let total_ranked = ranked.len();
+                    if let Some(ranked) = ranked.as_mut() {
+                        ranked.sort_by(|a, b| {
+                            b.main_net_yi
+                                .partial_cmp(&a.main_net_yi)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                    }
+
+                    let total_ranked = ranked.as_ref().map(Vec::len);
 
                     // 持仓遍历：信号融合（不再单独推送每条事件）
-
-                    let mut health_lines: Vec<String> = Vec::new();
 
                     for (code, s) in &stock_map {
                         let (Some(volume_ratio), Some(main_net_yi)) =
@@ -6209,7 +6235,10 @@ async fn monitor_loop() {
                             }
                         };
 
-                        let rank = ranked.iter().position(|r| r.code == *code).map(|p| p + 1);
+                        let rank = ranked
+                            .as_ref()
+                            .and_then(|rows| rows.iter().position(|r| r.code == *code))
+                            .map(|position| position + 1);
 
                         let is_limit_up = s.change_pct >= 9.5;
 
@@ -6357,10 +6386,10 @@ async fn monitor_loop() {
 
                                     t1_locked,
 
-                                    extra: rank.map(|r| {
+                                    extra: rank.zip(total_ranked).map(|(r, total)| {
                                         format!(
                                             "主力排名 {}/{} | 共振{:.0} {}",
-                                            r, total_ranked, resonance, recommend
+                                            r, total, resonance, recommend
                                         )
                                     }),
                                 },
