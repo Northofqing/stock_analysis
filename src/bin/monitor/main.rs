@@ -1673,6 +1673,26 @@ pub static LATEST_DATA_MODE: Lazy<
     std::sync::Mutex<Option<stock_analysis::monitor::data_mode::DataMode>>,
 > = Lazy::new(|| std::sync::Mutex::new(None));
 
+static DATA_MODE_UNSAFE_REMINDER: Lazy<
+    std::sync::Mutex<stock_analysis::monitor::data_mode::PersistentUnsafeReminder>,
+> = Lazy::new(|| std::sync::Mutex::new(Default::default()));
+
+fn commit_data_mode_reminder_result(
+    state: &mut stock_analysis::monitor::data_mode::PersistentUnsafeReminder,
+    mode: stock_analysis::monitor::data_mode::DataMode,
+    result: &push_templates::ModeDispatchResult,
+    confirmed_now: impl FnOnce() -> std::time::Instant,
+) -> bool {
+    if !matches!(
+        result,
+        push_templates::ModeDispatchResult::Delivery(notify::PushOutcome::Pushed)
+    ) {
+        return false;
+    }
+    state.record_confirmed(mode, confirmed_now());
+    true
+}
+
 async fn evaluate_data_mode_hook() {
     use crate::push_templates as pt;
 
@@ -1696,6 +1716,27 @@ async fn evaluate_data_mode_hook() {
     };
 
     let health = dm_evaluate(&input, prev);
+    let reminder_evaluated_at = std::time::Instant::now();
+    let persistent_reminder_due = match DATA_MODE_UNSAFE_REMINDER.lock() {
+        Ok(mut state) => {
+            if state.observe_mode(health.mode) {
+                log::info!(
+                    "[DataMode-hook][BR-135] recovery observed; persistent Unsafe reminder state cleared"
+                );
+            }
+            match state.should_dispatch(health.mode, reminder_evaluated_at) {
+                Ok(due) => due,
+                Err(error) => {
+                    log::error!("[DataMode-hook][BR-135] reminder clock unavailable: {error}");
+                    return;
+                }
+            }
+        }
+        Err(_) => {
+            log::error!("[DataMode-hook][BR-135] reminder state lock poisoned");
+            return;
+        }
+    };
 
     log::info!(
         "[DataMode-hook] 模式 {:?} → {:?}, missing={:?}",
@@ -1735,13 +1776,15 @@ async fn evaluate_data_mode_hook() {
         return;
     }
 
-    let result = match pt::push_data_mode_change(&input, prev, Some(&banner)).await {
-        Ok(result) => result,
-        Err(error) => {
-            log::error!("[DataMode-hook] change push failed: {error}");
-            return;
-        }
-    };
+    let result =
+        match pt::push_data_mode_change(&input, prev, persistent_reminder_due, Some(&banner)).await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                log::error!("[DataMode-hook] change push failed: {error}");
+                return;
+            }
+        };
     if result.is_confirmed() {
         match LATEST_DATA_MODE.lock() {
             Ok(mut state) => *state = Some(health.mode),
@@ -1752,6 +1795,144 @@ async fn evaluate_data_mode_hook() {
             "[DataMode-hook][BR-116] notification unconfirmed; retaining previous mode {:?}",
             prev
         );
+    }
+    match DATA_MODE_UNSAFE_REMINDER.lock() {
+        Ok(mut state) => {
+            if commit_data_mode_reminder_result(
+                &mut state,
+                health.mode,
+                &result,
+                std::time::Instant::now,
+            ) {
+                log::info!(
+                    "[DataMode-hook][BR-135] confirmed DataMode delivery committed for reminder state"
+                );
+            }
+        }
+        Err(_) => log::error!(
+            "[DataMode-hook][BR-135] confirmed delivery not committed: reminder state lock poisoned"
+        ),
+    }
+}
+
+const DATA_MODE_EVALUATION_PERIOD: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn data_mode_evaluation_interval(period: std::time::Duration) -> tokio::time::Interval {
+    let first_tick = tokio::time::Instant::now() + period;
+    let mut interval = tokio::time::interval_at(first_tick, period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval
+}
+
+async fn run_data_mode_scheduler<F, Fut>(mut interval: tokio::time::Interval, mut hook: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    loop {
+        interval.tick().await;
+        hook().await;
+    }
+}
+
+async fn data_mode_monitor_loop() {
+    log::info!(
+        "[DataMode-hook][BR-135] independent scheduler started period={}s",
+        DATA_MODE_EVALUATION_PERIOD.as_secs()
+    );
+    run_data_mode_scheduler(
+        data_mode_evaluation_interval(DATA_MODE_EVALUATION_PERIOD),
+        evaluate_data_mode_hook,
+    )
+    .await;
+}
+
+#[cfg(test)]
+mod br135_data_mode_reminder_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use stock_analysis::monitor::data_mode::{DataMode as LibDM, PersistentUnsafeReminder};
+
+    #[test]
+    fn br135_reminder_confirmation_requires_pushed() {
+        let now = std::time::Instant::now();
+        for outcome in [
+            notify::PushOutcome::Denied("TEST_CODE denied".to_string()),
+            notify::PushOutcome::Deduped,
+            notify::PushOutcome::SinkError("TEST_CODE sink".to_string()),
+        ] {
+            let mut state = PersistentUnsafeReminder::default();
+            assert!(!commit_data_mode_reminder_result(
+                &mut state,
+                LibDM::Unsafe,
+                &push_templates::ModeDispatchResult::Delivery(outcome),
+                || panic!("unconfirmed delivery must not sample confirmation time"),
+            ));
+            assert!(state.should_dispatch(LibDM::Unsafe, now).unwrap());
+        }
+
+        let mut state = PersistentUnsafeReminder::default();
+        let confirmed_at = now + std::time::Duration::from_secs(7);
+        assert!(commit_data_mode_reminder_result(
+            &mut state,
+            LibDM::Unsafe,
+            &push_templates::ModeDispatchResult::Delivery(notify::PushOutcome::Pushed),
+            || confirmed_at,
+        ));
+        assert!(!state
+            .should_dispatch(
+                LibDM::Unsafe,
+                confirmed_at + std::time::Duration::from_secs(1_799),
+            )
+            .unwrap());
+        assert!(state
+            .should_dispatch(
+                LibDM::Unsafe,
+                confirmed_at + std::time::Duration::from_secs(1_800),
+            )
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn br135_scheduler_waits_before_first_tick_and_runs_independently() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let tick_observed = Arc::new(tokio::sync::Notify::new());
+        let hook_calls = Arc::clone(&calls);
+        let hook_tick_observed = Arc::clone(&tick_observed);
+        let interval = data_mode_evaluation_interval(std::time::Duration::from_millis(200));
+
+        let task = tokio::spawn(run_data_mode_scheduler(interval, move || {
+            let calls = Arc::clone(&hook_calls);
+            let tick_observed = Arc::clone(&hook_tick_observed);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                tick_observed.notify_one();
+            }
+        }));
+
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "first tick must be delayed"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), tick_observed.notified())
+            .await
+            .expect("first scheduled evaluation");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), tick_observed.notified())
+            .await
+            .expect("second scheduled evaluation");
+        assert!(calls.load(Ordering::SeqCst) >= 2);
+
+        task.abort();
+        assert!(task
+            .await
+            .expect_err("scheduler is intentionally aborted")
+            .is_cancelled());
     }
 }
 
@@ -2862,7 +3043,11 @@ async fn main() {
         let main_loops = async {
             // Phase 3: 移除 news_pipeline_loop_v15_3 (#2) — sink/aggregator 仅 #2 自用,
             //   #1 news_monitor_loop 已从同源 fetch_flash_titles 取快讯产候选, #2 重复取数且已停推
-            tokio::join!(monitor_loop(), news_monitor_loop());
+            tokio::join!(
+                monitor_loop(),
+                news_monitor_loop(),
+                data_mode_monitor_loop()
+            );
         };
 
         // Phase 3: 移除 poll_news_loop (#3) — news_items 表只写不读(无人 SELECT),
@@ -5576,14 +5761,6 @@ async fn monitor_loop() {
                     }
                 }
             }
-
-            // ============= v12 MVP0-B: T-02 数据状态每分钟评估 =============
-
-            // 任一 capability staleness > 120s → Degraded; Quote stale > 120s → Unsafe
-
-            // 治理 (mode/dm 停发) 走 dispatch 内部, 变更才推
-
-            evaluate_data_mode_hook().await;
 
             // ── 9:20-9:25 竞价高量能扫描（30秒一次）+ 盘后优选重推 ──
 
