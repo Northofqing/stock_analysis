@@ -260,11 +260,24 @@ Pre-merge Gate D evidence recorded on 2026-07-20:
 - formatting: PASS;
 - Clippy across the workspace/all targets/all features with warnings denied: PASS;
 - full workspace tests: PASS, including 1,756 library tests (3 ignored live integrations),
-  333 monitor tests, and 7 process-isolation tests;
+  334 monitor tests, and 8 process-isolation tests;
 - compliance: PASS, including daily freshness at 2026-07-17 (one trading-day lag);
-- coverage: global `82,620 / 102,617 = 80.51%`; core
+- coverage: global `82,685 / 102,693 = 80.52%`; core
   `33,162 / 34,772 = 95.37%` across 101 files;
 - optimized `monitor` release build: PASS.
+
+Production acceptance for the exact `3a959cc` code binary was recorded at 2026-07-20
+15:22:55 +08:00, after that code commit and before this documentation-only evidence update:
+
+- weekend/session-wait startup evaluated AccountMode once and the initial Unsafe DataMode once;
+- `governance banner unavailable` count was zero;
+- the real Feishu channel returned a validated receipt with non-empty, non-placeholder message
+  and platform identities (only identifier lengths were inspected; the identifiers are not
+  retained in this document);
+- the append-only delivery audit recorded one `data_mode_v1` `Pushed` outcome through Feishu;
+- sink-error and dry-run counts were zero; and
+- the current announcement protocol returned a complete batch instead of the obsolete detail-path
+  error.
 
 The evidence above contains only aggregate counts and statuses. It does not include message bodies,
 account values, security identities, credentials, or notification destinations.
