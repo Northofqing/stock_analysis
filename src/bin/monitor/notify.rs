@@ -1613,22 +1613,25 @@ pub async fn push_via_magiclaw_cli(send_type: MessageSendType, text: &str) -> bo
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     if output.status.success() {
-        let detail = tail_lines(&stdout, 3);
-        if detail.is_empty() {
-            log::info!(
-                "[{}] 推送成功 | to={}",
-                send_type.label(),
-                to.as_deref().unwrap_or("<auto>")
-            );
-        } else {
-            log::info!(
-                "[{}] 推送成功 | to={} | {}",
-                send_type.label(),
-                to.as_deref().unwrap_or("<auto>"),
-                detail
-            );
+        match parse_magiclaw_cli_delivery_receipt(send_type, &stdout) {
+            Ok(receipt) => {
+                log::info!(
+                    "[{}] 推送成功 | via=cli receipt=validated message_id_len={} platform_msg_id_len={}",
+                    send_type.label(),
+                    receipt.message_id.len(),
+                    receipt.platform_msg_id.len()
+                );
+                return true;
+            }
+            Err(error) => {
+                log::error!(
+                    "[{}][BR-111] magiclaw exit=0 but delivery receipt is invalid: {}",
+                    send_type.label(),
+                    error
+                );
+                return false;
+            }
         }
-        return true;
     }
 
     let stderr_tail = tail_lines(&stderr, 8);
@@ -1649,6 +1652,61 @@ pub async fn push_via_magiclaw_cli(send_type: MessageSendType, text: &str) -> bo
         }
     );
     false
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CliDeliveryReceipt {
+    message_id: String,
+    platform_msg_id: String,
+}
+
+fn parse_magiclaw_cli_delivery_receipt(
+    send_type: MessageSendType,
+    stdout: &str,
+) -> Result<CliDeliveryReceipt, String> {
+    let prefix = match send_type {
+        MessageSendType::Feishu => "send ok (feishu):",
+        MessageSendType::Wechat => "send ok:",
+    };
+    let line = stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with(prefix))
+        .ok_or_else(|| "missing channel-specific success receipt".to_string())?;
+
+    let mut message_id = None;
+    let mut platform_msg_id = None;
+    for field in line
+        .strip_prefix(prefix)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+    {
+        let Some((key, value)) = field.split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "message_id" => message_id = Some(value.trim()),
+            "platform_msg_id" => platform_msg_id = Some(value.trim()),
+            _ => {}
+        }
+    }
+
+    let validate = |name: &str, value: Option<&str>| -> Result<String, String> {
+        let value = value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("missing {name}"))?;
+        if value.starts_with('<') && value.ends_with('>') {
+            return Err(format!("placeholder {name}"));
+        }
+        Ok(value.to_string())
+    };
+
+    Ok(CliDeliveryReceipt {
+        message_id: validate("message_id", message_id)?,
+        platform_msg_id: validate("platform_msg_id", platform_msg_id)?,
+    })
 }
 
 pub fn resolve_send_type() -> MessageSendType {
@@ -3158,6 +3216,30 @@ mod tests {
         let (url, request) = one_request_http_fixture(200, r#"{"code":1}"#).await;
         assert!(!push_feishu_http_with_client(&client, &url, "TEST_CODE webhook protocol").await);
         request.await.unwrap();
+    }
+
+    #[test]
+    fn magiclaw_cli_success_requires_a_real_channel_receipt() {
+        let receipt = parse_magiclaw_cli_delivery_receipt(
+            MessageSendType::Feishu,
+            "send ok (feishu): message_id=receipt-1, platform_msg_id=om_platform_1\n",
+        )
+        .expect("explicit Feishu receipt");
+        assert_eq!(receipt.message_id, "receipt-1");
+        assert_eq!(receipt.platform_msg_id, "om_platform_1");
+
+        for stdout in [
+            "",
+            "send completed",
+            "send ok (feishu): message_id=receipt-1, platform_msg_id=<none>",
+            "send ok (feishu): message_id=<daemon>, platform_msg_id=om_platform_1",
+            "send ok (via daemon): message_id=<daemon>, to=TEST_CODE_target",
+        ] {
+            assert!(
+                parse_magiclaw_cli_delivery_receipt(MessageSendType::Feishu, stdout).is_err(),
+                "exit-zero stdout without a real Feishu receipt must fail: {stdout}"
+            );
+        }
     }
 
     #[tokio::test]

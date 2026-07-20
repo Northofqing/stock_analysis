@@ -198,6 +198,9 @@ current detail endpoint ─> strict identity/content validation ─> complete ba
   conservative AccountMode alert retries.
 - Push-audit clock or create-new failure: block the external sink and retain the unconfirmed mode
   state for retry; never substitute epoch zero or overwrite an earlier artifact.
+- MagicLaw CLI exits successfully without a channel-issued Feishu receipt: treat delivery as
+  unconfirmed. Both `message_id` and `platform_msg_id` must be non-empty and non-placeholder;
+  process exit zero or a local acceptance flag alone must not produce `Pushed`.
 - DataMode notification fails: do not commit the new latest-notified mode; keep explicit failure
   and retry according to BR-116.
 - AccountMode notification fails: retain and reuse the existing `pushed=0` audit row; do not
@@ -229,7 +232,8 @@ Tests are vertical RED→GREEN slices:
 4. AccountMode Denied/SinkError outcomes preserve the original pending audit ID and a pushed-audit
    update failure propagates;
 5. complete current announcement detail JSON accepts explicit success `true`/`1`, while other
-   success values and old/mismatched/empty payloads fail.
+   success values and old/mismatched/empty payloads fail;
+6. MagicLaw CLI success without a real channel receipt fails closed even when its exit status is 0.
 
 Required gates:
 
