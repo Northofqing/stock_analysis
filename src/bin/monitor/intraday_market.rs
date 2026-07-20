@@ -5,6 +5,31 @@ pub struct IntradayMarketInputs {
     pub position_quotes: Result<Vec<TopStock>, String>,
 }
 
+pub struct ResolvedIntradayMarketInputs {
+    pub limit_stocks: Option<Vec<TopStock>>,
+    pub position_quotes: Option<Vec<TopStock>>,
+    pub limit_error: Option<String>,
+    pub position_error: Option<String>,
+    pub task_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntradayConsumerPlan {
+    pub use_limit_data: bool,
+    pub use_position_data: bool,
+    pub run_independent_jobs: bool,
+}
+
+impl ResolvedIntradayMarketInputs {
+    pub fn consumer_plan(&self) -> IntradayConsumerPlan {
+        IntradayConsumerPlan {
+            use_limit_data: self.limit_stocks.is_some(),
+            use_position_data: self.position_quotes.is_some(),
+            run_independent_jobs: true,
+        }
+    }
+}
+
 pub fn acquire_intraday_market_inputs<LimitFetch, PositionFetch>(
     limit_fetch: LimitFetch,
     position_fetch: PositionFetch,
@@ -18,6 +43,37 @@ where
     IntradayMarketInputs {
         limit_stocks,
         position_quotes,
+    }
+}
+
+pub fn resolve_intraday_market_inputs(
+    task_result: Result<IntradayMarketInputs, String>,
+) -> ResolvedIntradayMarketInputs {
+    match task_result {
+        Ok(inputs) => {
+            let (limit_stocks, limit_error) = match inputs.limit_stocks {
+                Ok(stocks) => (Some(stocks), None),
+                Err(error) => (None, Some(error)),
+            };
+            let (position_quotes, position_error) = match inputs.position_quotes {
+                Ok(quotes) => (Some(quotes), None),
+                Err(error) => (None, Some(error)),
+            };
+            ResolvedIntradayMarketInputs {
+                limit_stocks,
+                position_quotes,
+                limit_error,
+                position_error,
+                task_error: None,
+            }
+        }
+        Err(error) => ResolvedIntradayMarketInputs {
+            limit_stocks: None,
+            position_quotes: None,
+            limit_error: None,
+            position_error: None,
+            task_error: Some(error),
+        },
     }
 }
 
@@ -115,7 +171,10 @@ mod tests {
         assert!(resolved.position_quotes.is_none());
         assert!(resolved.limit_error.is_none());
         assert!(resolved.position_error.is_none());
-        assert_eq!(resolved.task_error.as_deref(), Some("TEST_CODE join failed"));
+        assert_eq!(
+            resolved.task_error.as_deref(),
+            Some("TEST_CODE join failed")
+        );
         assert!(!plan.use_limit_data);
         assert!(!plan.use_position_data);
         assert!(plan.run_independent_jobs);

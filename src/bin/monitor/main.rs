@@ -5878,36 +5878,27 @@ async fn monitor_loop() {
                 })
                 .await;
 
-                let result = match result {
-                    Ok(inputs) => {
-                        let limit_stocks = match inputs.limit_stocks {
-                            Ok(stocks) => Some(stocks),
-                            Err(error) => {
-                                log::error!("[盘中监控] 涨停池批次拒绝: {error}");
-                                None
-                            }
-                        };
-                        let position_quotes = match inputs.position_quotes {
-                            Ok(quotes) => Some(quotes),
-                            Err(error) => {
-                                log::error!("[盘中监控] 持仓行情批次拒绝: {error}");
-                                None
-                            }
-                        };
-                        if limit_stocks.is_none() && position_quotes.is_none() {
-                            log::error!("[盘中监控] 两路行情均不可用，本轮跳过");
-                            None
-                        } else {
-                            Some((limit_stocks, position_quotes))
-                        }
-                    }
-                    Err(error) => {
-                        log::error!("[盘中监控] 行情任务失败: {}", error);
-                        None
-                    }
-                };
+                let resolved = intraday_market::resolve_intraday_market_inputs(
+                    result.map_err(|error| error.to_string()),
+                );
+                if let Some(error) = resolved.limit_error.as_deref() {
+                    log::error!("[盘中监控] 涨停池批次拒绝: {error}");
+                }
+                if let Some(error) = resolved.position_error.as_deref() {
+                    log::error!("[盘中监控] 持仓行情批次拒绝: {error}");
+                }
+                if let Some(error) = resolved.task_error.as_deref() {
+                    log::error!("[盘中监控] 行情任务失败: {error}");
+                }
+                let consumer_plan = resolved.consumer_plan();
+                if !consumer_plan.use_limit_data && !consumer_plan.use_position_data {
+                    log::error!("[盘中监控] 两路行情均不可用，仅跳过依赖这两路数据的计算");
+                }
+                debug_assert!(consumer_plan.run_independent_jobs);
+                let limit_stocks = resolved.limit_stocks;
+                let position_quotes = resolved.position_quotes;
 
-                if let Some((limit_stocks, position_quotes)) = result {
+                {
                     // ▶ 新增：开盘后虚拟记录观察仓位（仅一次）
 
                     if entry_mode == AirRefuelEntryMode::Confirm
