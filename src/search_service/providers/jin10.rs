@@ -151,7 +151,7 @@ fn parse_flash_response(
             .unwrap_or_default();
         results.push(
             SearchResult::new(title, snippet, url, "金十数据".to_string())
-                .with_date(published_at.format("%H:%M").to_string()),
+                .with_date(published_at.format("%Y-%m-%d %H:%M:%S").to_string()),
         );
         if results.len() >= limit {
             break;
@@ -501,7 +501,10 @@ mod tests {
         let all = parse_flash_response(body, 10, false, fixed_now()).unwrap();
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].title, "⭐ 测试重要快讯");
-        assert_eq!(all[0].published_date.as_deref(), Some("11:30"));
+        assert_eq!(
+            all[0].published_date.as_deref(),
+            Some("2026-07-19 11:30:00")
+        );
         assert!(all[0].url.contains("TEST_CODE"));
         assert_eq!(all[1].title, "测试普通快讯正文");
         assert!(all[1].url.is_empty());

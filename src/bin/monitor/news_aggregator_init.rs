@@ -174,6 +174,7 @@ pub enum FlashDecision {
         headline: String,
         source: String,
         observed_at: chrono::DateTime<chrono::Local>,
+        source_published_on: chrono::NaiveDate,
         stale: bool,
         strength: u8,
         certainty: u8,
@@ -233,9 +234,31 @@ impl NewsFlashGate {
 
         // 1. 事件驱动: critical 即时推 (AC34)
         for e in events {
-            if e.stale || e.occurred_at > now {
+            let provenance = e.provenance.first();
+            let validation_error = if e.event_id.trim().is_empty() {
+                Some("missing_event_id")
+            } else if e.full_title.trim().is_empty() {
+                Some("missing_headline")
+            } else if provenance.is_none_or(|item| item.provider.trim().is_empty()) {
+                Some("missing_provenance")
+            } else if e.strength > 100 {
+                Some("strength_out_of_range")
+            } else if e.certainty > 100 {
+                Some("certainty_out_of_range")
+            } else if e.stale {
+                Some("stale")
+            } else if e.occurred_at > now {
+                Some("future_publication")
+            } else if provenance
+                .is_some_and(|item| item.fetched_at > now || item.fetched_at < e.occurred_at)
+            {
+                Some("invalid_observation_time")
+            } else {
+                None
+            };
+            if let Some(reason) = validation_error {
                 log::warn!(
-                    "[NewsFlashGate][BR-137] stale/future event rejected before critical and aggregate governance"
+                    "[NewsFlashGate][BR-137] source event rejected before critical and aggregate governance: {reason}"
                 );
                 continue;
             }
@@ -249,11 +272,7 @@ impl NewsFlashGate {
                     format!(
                         "[{}] {} (强度{} 确定性{})",
                         e.event_type.label(),
-                        if e.full_title.is_empty() {
-                            &e.subject
-                        } else {
-                            &e.full_title
-                        },
+                        &e.full_title,
                         e.strength,
                         e.certainty
                     ),
@@ -270,21 +289,19 @@ impl NewsFlashGate {
                     continue;
                 }
                 self.critical_pushed_today += 1;
-                let headline = if e.full_title.is_empty() {
-                    e.subject.clone()
-                } else {
-                    e.full_title.clone()
-                };
-                let source = e
-                    .provenance
-                    .first()
-                    .map(|item| item.provider.clone())
-                    .unwrap_or_default();
+                let headline = e.full_title.clone();
+                let source = provenance
+                    .expect("BR-137 provenance validated above")
+                    .provider
+                    .clone();
                 out.push(FlashDecision::Critical {
                     event_id: e.event_id.clone(),
                     headline,
                     source,
-                    observed_at: e.occurred_at,
+                    observed_at: provenance
+                        .expect("BR-137 provenance validated above")
+                        .fetched_at,
+                    source_published_on: e.occurred_at.date_naive(),
                     stale: e.stale,
                     strength: e.strength,
                     certainty: e.certainty,
@@ -292,11 +309,7 @@ impl NewsFlashGate {
                         "🚨 高分新闻快讯 ({})\n[{}] {}\n强度 {} | 确定性 {} | 今日第 {}/{} 条",
                         now.format("%H:%M"),
                         e.event_type.label(),
-                        if e.full_title.is_empty() {
-                            &e.subject
-                        } else {
-                            &e.full_title
-                        },
+                        &e.full_title,
                         e.strength,
                         e.certainty,
                         self.critical_pushed_today,
@@ -353,6 +366,7 @@ pub async fn push_flash_decisions(decisions: Vec<FlashDecision>) -> (usize, usiz
                 headline,
                 source,
                 observed_at,
+                source_published_on,
                 stale,
                 strength,
                 certainty,
@@ -365,6 +379,7 @@ pub async fn push_flash_decisions(decisions: Vec<FlashDecision>) -> (usize, usiz
                     headline,
                     source,
                     observed_at,
+                    Some(source_published_on),
                     strength,
                     certainty,
                     stale,
@@ -425,7 +440,7 @@ mod tests {
             .push(stock_analysis::signal::market_event::SourceRef {
                 provider: "TEST_CODE_NEWS_PROVIDER".to_string(),
                 url: None,
-                fetched_at: chrono::Local::now(),
+                fetched_at: at(0, 0),
             });
         e
     }
@@ -485,6 +500,20 @@ mod tests {
         stale.stale = true;
         let mut gate = NewsFlashGate::new(now.date_naive());
         assert!(gate.process(&[stale], now, 80, 20).is_empty());
+        assert!(gate.buffer.is_empty());
+        assert!(gate.seen_today.is_empty());
+    }
+
+    #[test]
+    fn br137_malformed_flash_is_excluded_from_critical_and_aggregate_buffer() {
+        let now = at(10, 0);
+        let mut malformed = ev("malformed-source-fact", 101, 90);
+        malformed.event_id.clear();
+        malformed.full_title.clear();
+        malformed.subject.clear();
+        malformed.provenance.clear();
+        let mut gate = NewsFlashGate::new(now.date_naive());
+        assert!(gate.process(&[malformed], now, 80, 20).is_empty());
         assert!(gate.buffer.is_empty());
         assert!(gate.seen_today.is_empty());
     }

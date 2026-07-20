@@ -123,6 +123,7 @@ async fn main() {
                 code: Some("TEST_CODE_000001".to_string()),
                 headline: Some("央行降准 0.5%".to_string()),
                 source: Some("财新".to_string()),
+                published_on: Some(chrono::Local::now().date_naive()),
             }),
         ),
         make_event(

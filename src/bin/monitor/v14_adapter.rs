@@ -95,6 +95,7 @@ pub struct SourceFactEvidence {
     headline: String,
     source: String,
     observed_at: chrono::DateTime<Local>,
+    source_published_on: chrono::NaiveDate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,10 +107,12 @@ pub enum SourceFactError {
     InvalidSecurityCode,
     MissingHeadline,
     MissingSource,
+    MissingPublishedDate,
     StrengthOutOfRange(u8),
     CertaintyOutOfRange(u8),
     Stale,
     FutureObservedAt,
+    FuturePublishedDate,
 }
 
 impl std::fmt::Display for SourceFactError {
@@ -133,6 +136,9 @@ impl std::fmt::Display for SourceFactError {
             Self::InvalidSecurityCode => formatter.write_str("source fact security code rejected"),
             Self::MissingHeadline => formatter.write_str("source fact headline is missing"),
             Self::MissingSource => formatter.write_str("source fact source is missing"),
+            Self::MissingPublishedDate => {
+                formatter.write_str("source fact provider publication date is missing")
+            }
             Self::StrengthOutOfRange(value) => {
                 write!(formatter, "source fact strength out of range: {value}")
             }
@@ -142,6 +148,9 @@ impl std::fmt::Display for SourceFactError {
             Self::Stale => formatter.write_str("source fact is stale"),
             Self::FutureObservedAt => {
                 formatter.write_str("source fact observed_at is in the future")
+            }
+            Self::FuturePublishedDate => {
+                formatter.write_str("source fact provider publication date is in the future")
             }
         }
     }
@@ -161,6 +170,7 @@ impl SourceFactEvidence {
         headline: String,
         source: String,
         observed_at: chrono::DateTime<Local>,
+        source_published_on: Option<chrono::NaiveDate>,
         strength: u8,
         certainty: u8,
         stale: bool,
@@ -225,6 +235,15 @@ impl SourceFactEvidence {
         if observed_at > Local::now() {
             return Err(SourceFactError::FutureObservedAt);
         }
+        let source_published_on =
+            source_published_on.ok_or(SourceFactError::MissingPublishedDate)?;
+        let today = Local::now().date_naive();
+        if source_published_on > today {
+            return Err(SourceFactError::FuturePublishedDate);
+        }
+        if source_published_on < today {
+            return Err(SourceFactError::Stale);
+        }
         Ok(Self {
             kind,
             governance_identity,
@@ -232,6 +251,7 @@ impl SourceFactEvidence {
             headline,
             source,
             observed_at,
+            source_published_on,
         })
     }
 
@@ -739,6 +759,7 @@ fn signal_event_for_source_fact(evidence: &SourceFactEvidence) -> SignalEvent {
             code: evidence.security_code.clone(),
             headline: Some(evidence.headline.clone()),
             source: Some(evidence.source.clone()),
+            published_on: Some(evidence.source_published_on),
         }),
         severity,
     );
@@ -883,13 +904,15 @@ mod tests {
     fn source_fact_with_identity(kind: PushKind, identity: &str) -> SourceFactEvidence {
         let security_code = (!matches!(kind, PushKind::PolicyHit | PushKind::NewsFlashCritical))
             .then(|| "TEST_CODE_SOURCE_FACT".to_string());
+        let now = Local::now();
         SourceFactEvidence::new(
             kind,
             identity.to_string(),
             security_code,
             "已验证来源事实".to_string(),
             "TEST_CODE_PROVIDER".to_string(),
-            Local::now(),
+            now,
+            Some(now.date_naive()),
             80,
             90,
             false,
@@ -1105,6 +1128,7 @@ mod tests {
                 assert_eq!(payload.code.as_deref(), Some("TEST_CODE_SOURCE_FACT"));
                 assert_eq!(payload.headline.as_deref(), Some("已验证来源事实"));
                 assert_eq!(payload.source.as_deref(), Some("TEST_CODE_PROVIDER"));
+                assert_eq!(payload.published_on, Some(Local::now().date_naive()));
             }
             other => panic!("source fact must retain news provenance, got {other:?}"),
         }
@@ -1200,10 +1224,11 @@ mod tests {
                      code: Option<&str>,
                      headline: &str,
                      source: &str,
-                     observed_at,
+                     observed_at: chrono::DateTime<Local>,
                      strength,
                      certainty,
                      stale| {
+            let source_published_on = observed_at.date_naive();
             SourceFactEvidence::new(
                 kind,
                 identity.to_string(),
@@ -1211,6 +1236,7 @@ mod tests {
                 headline.to_string(),
                 source.to_string(),
                 observed_at,
+                Some(source_published_on),
                 strength,
                 certainty,
                 stale,
@@ -1229,6 +1255,22 @@ mod tests {
             false
         )
         .is_err());
+        assert_eq!(
+            SourceFactEvidence::new(
+                PushKind::PolicyHit,
+                "event".to_string(),
+                None,
+                "headline".to_string(),
+                "provider".to_string(),
+                now,
+                None,
+                80,
+                90,
+                false,
+            )
+            .unwrap_err(),
+            SourceFactError::MissingPublishedDate
+        );
         assert!(valid(
             PushKind::Announcement,
             "event",

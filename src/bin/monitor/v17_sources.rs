@@ -187,6 +187,7 @@ pub async fn push_normalized_event(event: NormalizedSourceEvent) -> PushAttempt 
             event.title.clone(),
             event.source.clone(),
             event.observed_at,
+            event.source_published_on,
             event.strength,
             event.certainty,
             event.stale,
@@ -237,6 +238,8 @@ pub async fn push_normalized_events(events: Vec<NormalizedSourceEvent>) -> Sourc
 fn earnings_classification_to_event(
     code: &str,
     classification: &EarningsClassification,
+    source_published_on: chrono::NaiveDate,
+    source: &str,
 ) -> Result<NormalizedSourceEvent, stock_analysis::news::aggregator::NormalizedSourceError> {
     let push_kind = match classification.kind {
         EarningsKind::Beat => SourcePushKind::EarningsBeat,
@@ -288,9 +291,9 @@ fn earnings_classification_to_event(
         80,
         90,
         Local::now(),
-        Some(classification.report_date),
+        Some(source_published_on),
         false,
-        "earnings_classifier".to_string(),
+        source.to_string(),
         None,
     )?
     .with_metadata("actual", metadata["actual"].clone())
@@ -306,6 +309,7 @@ fn analyst_upgrade_event(
     to: &str,
     report_id: &str,
     publish_date: chrono::NaiveDate,
+    source: &str,
 ) -> Result<NormalizedSourceEvent, stock_analysis::news::aggregator::NormalizedSourceError> {
     let event_id = format!("analyst:{}:{}:{}", code, broker, report_id);
     let title = format!("{} 券商上调评级", broker);
@@ -327,7 +331,7 @@ fn analyst_upgrade_event(
         Local::now(),
         Some(publish_date),
         false,
-        "analyst_tracker".to_string(),
+        source.to_string(),
         None,
     )?
     .with_metadata("broker", metadata["broker"].clone())
@@ -435,19 +439,53 @@ pub async fn poll_earnings_and_analyst(
                 );
                 match (financials_result, consensus_result) {
                     (Ok(financials), Ok(consensus)) => {
-                        if let Some(latest_period) = financials.history.first() {
-                            if let Some(classification) =
-                                classify_earnings(latest_period, &consensus, earnings_cfg)
-                            {
-                                match earnings_classification_to_event(code_str, &classification) {
-                                    Ok(event) => events.push(event),
-                                    Err(error) => {
-                                        source_failures += 1;
-                                        log::warn!(
-                                            "[v17_sources][BR-137] earnings source fact rejected: {error}"
-                                        );
+                        let source_evidence = financials
+                            .source
+                            .filter(|source| !source.trim().is_empty())
+                            .ok_or_else(|| "financial provider source missing".to_string())
+                            .and_then(|source| {
+                                let raw = financials
+                                    .published_date
+                                    .as_deref()
+                                    .ok_or_else(|| "financial NOTICE_DATE missing".to_string())?;
+                                let published_on =
+                                    chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d").map_err(
+                                        |error| format!("financial NOTICE_DATE invalid: {error}"),
+                                    )?;
+                                Ok((source, published_on))
+                            });
+                        match (financials.history.first(), source_evidence) {
+                            (Some(latest_period), Ok((source, published_on))) => {
+                                if let Some(classification) =
+                                    classify_earnings(latest_period, &consensus, earnings_cfg)
+                                {
+                                    match earnings_classification_to_event(
+                                        code_str,
+                                        &classification,
+                                        published_on,
+                                        source,
+                                    ) {
+                                        Ok(event) => events.push(event),
+                                        Err(error) => {
+                                            source_failures += 1;
+                                            log::warn!(
+                                                "[v17_sources][BR-137] earnings source fact rejected: {error}"
+                                            );
+                                        }
                                     }
                                 }
+                            }
+                            (None, _) => {
+                                source_failures += 1;
+                                log::warn!(
+                                    "[v17_sources][BR-115] {code_str} financial history missing"
+                                );
+                            }
+                            (_, Err(error)) => {
+                                source_failures += 1;
+                                log::warn!(
+                                    "[v17_sources][BR-137] {code_str} earnings publication evidence rejected: {error}"
+                                );
                             }
                         }
                         let mut last_polls = last_poll_earnings.lock().unwrap();
@@ -520,6 +558,7 @@ pub async fn poll_earnings_and_analyst(
                                     &to,
                                     &report.title,
                                     publish_date,
+                                    "东方财富研报",
                                 ) {
                                     Ok(event) => events.push(event),
                                     Err(error) => {
@@ -785,8 +824,7 @@ mod tests {
         };
 
         // Beat case: actual EPS 1.10, consensus 1.00 → delta +10% → Beat
-        let today = Local::now().date_naive().format("%Y-%m-%d").to_string();
-        let beat_actual = test_financial_period("TEST_CODE_EARNINGS_BEAT", 1.10, &today);
+        let beat_actual = test_financial_period("TEST_CODE_EARNINGS_BEAT", 1.10, "2026-03-31");
         let beat_consensus = test_consensus_data("TEST_CODE_EARNINGS_BEAT", "券商A", "买入", 1.00);
         let beat_classification = classify_earnings(&beat_actual, &beat_consensus, &earnings_cfg);
         assert!(
@@ -801,12 +839,20 @@ mod tests {
         let beat_event = earnings_classification_to_event(
             "TEST_CODE_EARNINGS_BEAT",
             beat_classification.as_ref().unwrap(),
+            Local::now().date_naive(),
+            "TEST_CODE_FINANCIAL_PROVIDER",
         )
         .expect("same-day earnings source fact");
         assert_eq!(beat_event.push_kind, SourcePushKind::EarningsBeat);
+        assert_eq!(beat_event.source, "TEST_CODE_FINANCIAL_PROVIDER");
+        assert_eq!(
+            beat_event.source_published_on,
+            Some(Local::now().date_naive()),
+            "provider NOTICE_DATE, not accounting period, controls freshness"
+        );
 
         // Miss case: actual EPS 0.89, consensus 1.00 → delta -11% → Miss
-        let miss_actual = test_financial_period("TEST_CODE_EARNINGS_MISS", 0.89, &today);
+        let miss_actual = test_financial_period("TEST_CODE_EARNINGS_MISS", 0.89, "2026-03-31");
         let miss_consensus = test_consensus_data("TEST_CODE_EARNINGS_MISS", "券商B", "中性", 1.00);
         let miss_classification = classify_earnings(&miss_actual, &miss_consensus, &earnings_cfg);
         assert!(
@@ -821,6 +867,8 @@ mod tests {
         let miss_event = earnings_classification_to_event(
             "TEST_CODE_EARNINGS_MISS",
             miss_classification.as_ref().unwrap(),
+            Local::now().date_naive(),
+            "TEST_CODE_FINANCIAL_PROVIDER",
         )
         .expect("same-day earnings source fact");
         assert_eq!(miss_event.push_kind, SourcePushKind::EarningsMiss);

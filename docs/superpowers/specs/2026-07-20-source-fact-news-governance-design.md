@@ -24,6 +24,11 @@ Introduce one validated `SourceFactEvidence` value owned by the v14 adapter. It 
   state. A provider publication date earlier than the current local date is stale; a missing date
   cannot qualify for the source-fact path.
 
+Provider time semantics are part of the boundary, not a downstream guess. Flash providers that
+receive epoch/full timestamps must retain a full local timestamp in `SearchResult`; truncating to
+`HH:MM` is rejected. Financial facts must preserve the provider `NOTICE_DATE` independently from
+the accounting `REPORT_DATE`; an accounting period is never publication evidence.
+
 Only these source-self-contained kinds are allowed:
 
 - `Announcement`
@@ -68,7 +73,15 @@ It never uses an empty `HoldingHealth` payload.
   local date is rejected. `observed_at` records the real adapter observation; it must not replace
   the provider date. No value is clamped or filled at the gate.
 - Flash feeds derive freshness from their real provider timestamp/date. Missing publication time is
-  marked stale and excluded from both critical and aggregate flash decisions.
+  marked stale and excluded from both critical and aggregate flash decisions. The generic feed
+  adapter preserves `SearchResult.source`; it must not replace real provenance with a category
+  label. Before either flash path accepts an event, identity, headline, provider provenance, score
+  bounds, and time must all validate.
+- `SourceFactEvidence` revalidates the provider publication date in addition to observation time and
+  stale state; a caller cannot obtain the relaxed profile by supplying only `now` and `false`.
+- Earnings uses the real financial provider and `NOTICE_DATE`. Analyst upgrades use the real report
+  provider and its `publishDate`. Synthetic labels such as `earnings_classifier` and
+  `analyst_tracker`, and use of `FinancialPeriod.report_date` as freshness, are rejected.
 - The source-fact governance and L7 paths read the real process-local capability tracker directly;
   a missing account/banner snapshot cannot block them. Capability-tracker, analytics, lock, sink,
   dedup, or immutable-audit failure keeps its existing explicit failure result. A sink result is
@@ -101,7 +114,9 @@ construct an approved SignalEvent themselves.
 Focused tests prove a complete source fact is approved when current DataMode is Down, its payload
 retains provenance, generic news/advice remains denied, invalid/stale/missing-date facts are rejected,
 MarketAction is not whitelisted, two provider events for one security retain independent L4 identities,
-and critical flash keeps event identity separate from security code and delivery audit. Existing
+critical flash keeps event identity separate from security code and delivery audit, each registered
+flash provider retains a full timestamp, financial `NOTICE_DATE` is distinct from `REPORT_DATE`, and
+malformed flash events cannot enter either buffer. Existing
 dedup, delivery, audit, source batching, and strict-review tests must remain green.
 
 Production acceptance uses only aggregate L7/event/audit counts and governance reasons. It must not

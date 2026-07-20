@@ -136,6 +136,7 @@ pub struct NewsCatalystPayload {
     pub code: Option<String>,
     pub headline: Option<String>,
     pub source: Option<String>,
+    pub published_on: Option<chrono::NaiveDate>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

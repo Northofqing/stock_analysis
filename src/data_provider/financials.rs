@@ -210,14 +210,15 @@ pub fn assess_quality(history: &[FinancialPeriod]) -> Option<QualityReport> {
 /// 最新一期财报核心指标 + 多期历史序列
 #[derive(Debug, Clone, Default)]
 pub struct Financials {
-    pub report_date: Option<String>,  // 报告期，如 "2025-12-31"
-    pub eps: Option<f64>,             // 基本每股收益（元）
-    pub roe: Option<f64>,             // 加权净资产收益率 (%)
-    pub revenue_yoy: Option<f64>,     // 营业总收入同比 (%)
-    pub net_profit_yoy: Option<f64>,  // 归母净利润同比 (%)
-    pub gross_margin: Option<f64>,    // 销售毛利率 (%)
-    pub net_margin: Option<f64>,      // 销售净利率 (%)
-    pub source: Option<&'static str>, // 命中的数据源标签
+    pub report_date: Option<String>,    // 报告期，如 "2025-12-31"
+    pub published_date: Option<String>, // provider 公告日，如 NOTICE_DATE；不得与报告期混用
+    pub eps: Option<f64>,               // 基本每股收益（元）
+    pub roe: Option<f64>,               // 加权净资产收益率 (%)
+    pub revenue_yoy: Option<f64>,       // 营业总收入同比 (%)
+    pub net_profit_yoy: Option<f64>,    // 归母净利润同比 (%)
+    pub gross_margin: Option<f64>,      // 销售毛利率 (%)
+    pub net_margin: Option<f64>,        // 销售净利率 (%)
+    pub source: Option<&'static str>,   // 命中的数据源标签
     /// 多期历史序列，按时间从新到旧排列；第 0 项与顶层 latest 字段一致
     pub history: Vec<FinancialPeriod>,
 }
@@ -282,7 +283,7 @@ fn pick_f64(obj: &Value, keys: &[&str]) -> Result<Option<f64>> {
     Ok(None)
 }
 
-fn required_report_date(obj: &Value, keys: &[&str]) -> Result<String> {
+fn required_date(obj: &Value, keys: &[&str], semantic: &str) -> Result<String> {
     for k in keys {
         if let Some(v) = obj.get(*k) {
             if v.is_null() {
@@ -297,12 +298,12 @@ fn required_report_date(obj: &Value, keys: &[&str]) -> Result<String> {
             return Ok(cleaned.to_string());
         }
     }
-    Err(anyhow!("财务记录缺少必填报告期字段: {keys:?}"))
+    Err(anyhow!("财务记录缺少必填{semantic}字段: {keys:?}"))
 }
 
 fn parse_f10_period(item: &Value) -> Result<FinancialPeriod> {
     let period = FinancialPeriod {
-        report_date: Some(required_report_date(item, &["REPORT_DATE"])?),
+        report_date: Some(required_date(item, &["REPORT_DATE"], "报告期")?),
         eps: pick_f64(item, &["EPSJB", "EPSXS", "EPSKCJB"])?,
         roe: pick_f64(item, &["ROEJQ", "ROEKCJQ"])?,
         revenue_yoy: pick_f64(item, &["TOTALOPERATEREVETZ"])?,
@@ -332,6 +333,7 @@ fn parse_f10_response(json: &Value) -> Result<Financials> {
         return Err(anyhow!("EM-F10 data 为空"));
     }
 
+    let latest_published_date = required_date(&data[0], &["NOTICE_DATE"], "公告日")?;
     let mut parsed = data
         .iter()
         .map(parse_f10_period)
@@ -356,6 +358,7 @@ fn parse_f10_response(json: &Value) -> Result<Financials> {
         .ok_or_else(|| anyhow!("EM-F10 最新报告期缺失"))?;
     Ok(Financials {
         report_date: latest.report_date.clone(),
+        published_date: Some(latest_published_date),
         eps: latest.eps,
         roe: latest.roe,
         revenue_yoy: latest.revenue_yoy,
@@ -376,7 +379,7 @@ fn parse_datacenter_response(json: &Value) -> Result<Financials> {
         .ok_or_else(|| anyhow!("EM-DC 无 result.data 数组"))?;
     let latest = data.first().ok_or_else(|| anyhow!("EM-DC data 为空"))?;
     let period = FinancialPeriod {
-        report_date: Some(required_report_date(latest, &["REPORTDATE"])?),
+        report_date: Some(required_date(latest, &["REPORTDATE"], "报告期")?),
         eps: pick_f64(latest, &["BASIC_EPS"])?,
         roe: pick_f64(latest, &["WEIGHTAVG_ROE"])?,
         revenue_yoy: pick_f64(latest, &["YSTZ"])?,
@@ -392,6 +395,7 @@ fn parse_datacenter_response(json: &Value) -> Result<Financials> {
     }
     Ok(Financials {
         report_date: period.report_date.clone(),
+        published_date: Some(required_date(latest, &["NOTICE_DATE"], "公告日")?),
         eps: period.eps,
         roe: period.roe,
         revenue_yoy: period.revenue_yoy,
@@ -444,7 +448,7 @@ async fn fetch_from_eastmoney_datacenter(
         "https://datacenter-web.eastmoney.com/api/data/v1/get?\
          sortColumns=REPORTDATE&sortTypes=-1&pageSize=1&pageNumber=1&\
          reportName=RPT_LICO_FN_CPD&\
-         columns=SECURITY_CODE,REPORTDATE,BASIC_EPS,WEIGHTAVG_ROE,YSTZ,SJLTZ,XSMLL&\
+         columns=SECURITY_CODE,REPORTDATE,NOTICE_DATE,BASIC_EPS,WEIGHTAVG_ROE,YSTZ,SJLTZ,XSMLL&\
          filter={}",
         urlencoding::encode(&filter)
     );
@@ -761,6 +765,7 @@ mod br115_tests {
             .map(|index| {
                 serde_json::json!({
                     "REPORT_DATE": format!("{:04}-12-31", 2026 - index),
+                    "NOTICE_DATE": format!("{:04}-01-31", 2027 - index),
                     "EPSJB": 1.0 + index as f64,
                     "ROEJQ": 10.0
                 })
@@ -771,12 +776,13 @@ mod br115_tests {
         assert_eq!(parsed.source, Some("东方财富F10"));
         assert_eq!(parsed.history.len(), 20);
         assert_eq!(parsed.report_date.as_deref(), Some("2026-12-31"));
+        assert_eq!(parsed.published_date.as_deref(), Some("2027-01-31"));
         assert_eq!(parsed.eps, Some(1.0));
 
         assert!(parse_f10_response(&serde_json::json!({})).is_err());
         assert!(parse_f10_response(&serde_json::json!({"data": []})).is_err());
         let wrong_order = serde_json::json!({"data": [
-            {"REPORT_DATE": "2025-12-31", "EPSJB": 1.0},
+            {"REPORT_DATE": "2025-12-31", "NOTICE_DATE": "2026-01-31", "EPSJB": 1.0},
             {"REPORT_DATE": "2026-12-31", "EPSJB": 2.0}
         ]});
         assert!(parse_f10_response(&wrong_order).is_err());
@@ -786,6 +792,7 @@ mod br115_tests {
     fn datacenter_document_parser_requires_one_real_latest_period() {
         let parsed = parse_datacenter_response(&serde_json::json!({"result": {"data": [{
             "REPORTDATE": "2026-06-30 00:00:00",
+            "NOTICE_DATE": "2026-08-20 00:00:00",
             "BASIC_EPS": "1.5",
             "WEIGHTAVG_ROE": 12.0,
             "YSTZ": 8.0,
@@ -795,6 +802,7 @@ mod br115_tests {
         .expect("valid datacenter response");
         assert_eq!(parsed.source, Some("东方财富DC"));
         assert_eq!(parsed.report_date.as_deref(), Some("2026-06-30"));
+        assert_eq!(parsed.published_date.as_deref(), Some("2026-08-20"));
         assert_eq!(parsed.history.len(), 1);
         assert_eq!(parsed.net_margin, None);
 

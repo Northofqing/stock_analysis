@@ -18,7 +18,19 @@ fn search_result_to_event(
     r: &crate::search_service::SearchResult,
     source_kind: SourceKind,
     event_type: EventType,
-) -> MarketEvent {
+) -> Result<MarketEvent> {
+    if r.title.trim().is_empty() {
+        bail!("BR-137 SearchResult title is empty");
+    }
+    if r.source.trim().is_empty() {
+        bail!("BR-137 SearchResult source is empty");
+    }
+    if r.importance > 10 {
+        bail!(
+            "BR-137 SearchResult importance out of range: {}",
+            r.importance
+        );
+    }
     let now = Utc::now();
     let observed_at = now.with_timezone(&Local);
     let (occurred_at, stale) = source_time_and_stale(r.published_date.as_deref(), observed_at);
@@ -35,10 +47,10 @@ fn search_result_to_event(
         crate::search_service::Sentiment::Negative => Direction::Bear,
         _ => Direction::Neutral,
     };
-    let importance = (r.importance as u32).min(10) as u8;
+    let importance = r.importance;
     let simhash_str = format!("{:x}", simhash);
     let _ = simhash_str;
-    MarketEvent {
+    Ok(MarketEvent {
         event_id: format!("{}-{:x}", source_kind.label(), simhash),
         simhash,
         full_title: r.title.clone(),
@@ -51,7 +63,7 @@ fn search_result_to_event(
         chains: vec![],
         occurred_at,
         provenance: vec![SourceRef {
-            provider: source_kind.label().to_string(),
+            provider: r.source.clone(),
             url: if r.url.is_empty() {
                 None
             } else {
@@ -61,7 +73,7 @@ fn search_result_to_event(
         }],
         ai_degraded: false,
         stale,
-    }
+    })
 }
 
 /// Preserve a real provider timestamp when one exists. Date-only sources use
@@ -121,9 +133,9 @@ impl NewsFeed for Jin10FlashFeed {
             .fetch_flash_news(limit, false)
             .await
             .context("jin10_flash fetch failed")?;
-        Ok(v.iter()
+        v.iter()
             .map(|r| search_result_to_event(r, SourceKind::Flash, EventType::Other))
-            .collect())
+            .collect()
     }
 }
 
@@ -144,9 +156,9 @@ impl NewsFeed for WallStreetCnFeed {
             .fetch_live_news(limit)
             .await
             .context("wallstreetcn_flash fetch failed")?;
-        Ok(v.iter()
+        v.iter()
             .map(|r| search_result_to_event(r, SourceKind::Flash, EventType::Other))
-            .collect())
+            .collect()
     }
 }
 
@@ -167,9 +179,9 @@ impl NewsFeed for ClsFlashFeed {
             .fetch_live_news(limit)
             .await
             .context("cls_flash fetch failed")?;
-        Ok(v.iter()
+        v.iter()
             .map(|r| search_result_to_event(r, SourceKind::Flash, EventType::Other))
-            .collect())
+            .collect()
     }
 }
 
@@ -186,9 +198,9 @@ impl NewsFeed for SinaFlashFeed {
     }
     async fn fetch(&self, limit: usize) -> Result<Vec<MarketEvent>> {
         let v = self.inner.fetch_flash_news(limit).await;
-        Ok(v.iter()
+        v.iter()
             .map(|r| search_result_to_event(r, SourceKind::Flash, EventType::Other))
-            .collect())
+            .collect()
     }
 }
 
@@ -209,9 +221,9 @@ impl NewsFeed for WeiboHotFeed {
             .fetch_hot_search(limit)
             .await
             .context("weibo_hot fetch failed")?;
-        Ok(v.iter()
+        v.iter()
             .map(|r| search_result_to_event(r, SourceKind::Flash, EventType::Other))
-            .collect())
+            .collect()
     }
 }
 
@@ -232,9 +244,9 @@ impl NewsFeed for GelonghuiFeed {
             .fetch_live(limit)
             .await
             .context("gelonghui fetch failed")?;
-        Ok(v.iter()
+        v.iter()
             .map(|r| search_result_to_event(r, SourceKind::Flash, EventType::Other))
-            .collect())
+            .collect()
     }
 }
 
@@ -255,9 +267,9 @@ impl NewsFeed for KcbDailyFeed {
             .fetch_latest(limit)
             .await
             .context("kcb_daily fetch failed")?;
-        Ok(v.iter()
+        v.iter()
             .map(|r| search_result_to_event(r, SourceKind::ActiveSearch, EventType::Other))
-            .collect())
+            .collect()
     }
 }
 
@@ -278,9 +290,9 @@ impl NewsFeed for GovPolicyFeed {
             .fetch_latest(limit)
             .await
             .context("gov_policy fetch failed")?;
-        Ok(v.iter()
+        v.iter()
             .map(|r| search_result_to_event(r, SourceKind::Policy, EventType::Policy))
-            .collect())
+            .collect()
     }
 }
 
@@ -510,9 +522,9 @@ mod tests {
                 "测试提供方".to_string(),
             );
             result.sentiment = sentiment;
-            result.importance = 99;
+            result.importance = 10;
             result.published_date = Some(Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
-            let event = search_result_to_event(&result, source_kind, event_type);
+            let event = search_result_to_event(&result, source_kind, event_type).unwrap();
             assert_eq!(event.direction, direction);
             assert_eq!(event.event_type, event_type);
             assert_eq!(event.subject, "测试提供方");
@@ -520,7 +532,7 @@ mod tests {
             assert_eq!(event.strength, 100);
             assert_eq!(event.certainty, 60);
             assert!(event.event_id.starts_with(source_kind.label()));
-            assert_eq!(event.provenance[0].provider, source_kind.label());
+            assert_eq!(event.provenance[0].provider, "测试提供方");
             assert_eq!(
                 event.provenance[0].url.as_deref(),
                 Some("https://example.invalid/TEST_CODE")
@@ -528,12 +540,31 @@ mod tests {
             assert!(!event.ai_degraded);
             assert!(!event.stale);
 
-            let repeat = search_result_to_event(&result, source_kind, event_type);
+            let repeat = search_result_to_event(&result, source_kind, event_type).unwrap();
             assert_eq!(repeat.simhash, event.simhash);
             result.url.clear();
-            let without_url = search_result_to_event(&result, source_kind, EventType::Other);
+            let without_url =
+                search_result_to_event(&result, source_kind, EventType::Other).unwrap();
             assert_eq!(without_url.provenance[0].url, None);
         }
+    }
+
+    #[test]
+    fn search_result_adapter_rejects_missing_identity_provenance_and_score_overflow() {
+        let mut result = crate::search_service::SearchResult::new(
+            String::new(),
+            "evidence".to_string(),
+            String::new(),
+            "provider".to_string(),
+        );
+        result.published_date = Some(Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
+        assert!(search_result_to_event(&result, SourceKind::Flash, EventType::Other).is_err());
+        result.title = "headline".to_string();
+        result.source.clear();
+        assert!(search_result_to_event(&result, SourceKind::Flash, EventType::Other).is_err());
+        result.source = "provider".to_string();
+        result.importance = 11;
+        assert!(search_result_to_event(&result, SourceKind::Flash, EventType::Other).is_err());
     }
 
     #[test]

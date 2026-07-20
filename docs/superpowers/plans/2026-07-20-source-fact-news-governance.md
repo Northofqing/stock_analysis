@@ -3,9 +3,11 @@
 ## Task 1: RED evidence contract
 
 - Add `SourceFactEvidence` constructor tests for the whitelist, kind binding, identity/code rules,
-  non-empty provenance, bounds, stale flag, and future timestamp. Extend `NormalizedSourceEvent`
+  non-empty provenance, bounds, stale flag, provider publication date, and future timestamp. Extend `NormalizedSourceEvent`
   with the real adapter observation and provider publication date; derive stale at construction and
   revalidation instead of accepting `now`/`false` placeholders.
+- Add red tests proving financial `REPORT_DATE` cannot authorize freshness, provider `NOTICE_DATE`
+  is preserved, and every registered flash provider retains a full timestamp rather than `HH:MM`.
 - Prove the current generic path denies an earnings fact at DataMode Down.
 - Require the new typed path to approve it with a `NewsCatalyst` payload while a generic mixed-news
   kind remains denied.
@@ -25,8 +27,10 @@
 - Route the five normalized source-fact kinds through it; keep MarketAction on generic governance.
 - Extend critical FlashDecision to preserve event identity, headline, source, timestamp, and stale
   state through the typed entry. Derive flash freshness from the provider date/timestamp and reject
-  stale/future events before both critical and aggregate buffers. Keep aggregated flash generic and
-  fail closed.
+  malformed/stale/future events before both critical and aggregate buffers. Preserve the real
+  `SearchResult.source` as provenance. Keep aggregated flash generic and fail closed.
+- Carry the financial provider `NOTICE_DATE` independently from the accounting `REPORT_DATE`, and
+  carry the real financial/report provider name rather than classifier/tracker labels.
 
 ## Task 4: Focused validation
 

@@ -21,6 +21,15 @@ use serde::Deserialize;
 
 use super::super::types::{SearchProvider, SearchResponse, SearchResult};
 
+fn format_epoch_published_date(timestamp: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp(timestamp, 0).map(|value| {
+        value
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string()
+    })
+}
+
 /// 新浪财经全球快讯 provider
 pub struct SinaFlashProvider {
     name: String,
@@ -102,11 +111,7 @@ impl SinaFlashProvider {
                     continue;
                 }
             }
-            let date_tag = item.ctime.map(|ts| {
-                chrono::DateTime::from_timestamp(ts, 0)
-                    .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M").to_string())
-                    .unwrap_or_default()
-            });
+            let date_tag = item.ctime.and_then(format_epoch_published_date);
             let snippet = item
                 .intro
                 .filter(|s| !s.is_empty())
@@ -116,15 +121,14 @@ impl SinaFlashProvider {
                 .filter(|u| !u.is_empty())
                 .unwrap_or_else(|| "https://finance.sina.com.cn/".to_string());
 
-            results.push(
-                SearchResult::new(
-                    title.chars().take(80).collect(),
-                    snippet.chars().take(240).collect(),
-                    url,
-                    format!("新浪财经({})", lid),
-                )
-                .with_date(date_tag.unwrap_or_default()),
+            let mut result = SearchResult::new(
+                title.chars().take(80).collect(),
+                snippet.chars().take(240).collect(),
+                url,
+                format!("新浪财经({})", lid),
             );
+            result.published_date = date_tag;
+            results.push(result);
             if results.len() >= limit {
                 break;
             }
@@ -240,5 +244,12 @@ mod tests {
     fn test_search_provider_trait_name() {
         let p = SinaFlashProvider::new();
         assert_eq!(p.name(), "新浪财经");
+    }
+
+    #[test]
+    fn provider_timestamp_retains_local_date_and_seconds() {
+        let rendered = format_epoch_published_date(1_752_918_600).unwrap();
+        assert!(chrono::NaiveDateTime::parse_from_str(&rendered, "%Y-%m-%d %H:%M:%S").is_ok());
+        assert_eq!(format_epoch_published_date(i64::MAX), None);
     }
 }
