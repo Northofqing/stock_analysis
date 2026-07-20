@@ -69,4 +69,55 @@ mod tests {
         );
         assert!(inputs.position_quotes.is_err());
     }
+
+    #[test]
+    fn resolved_inputs_preserve_the_complete_source_matrix() {
+        let cases = [
+            (true, true, true, true),
+            (true, false, true, false),
+            (false, true, false, true),
+            (false, false, false, false),
+        ];
+
+        for (limit_ok, position_ok, expect_limit, expect_position) in cases {
+            let inputs = IntradayMarketInputs {
+                limit_stocks: if limit_ok {
+                    Ok(vec![test_stock("TEST_CODE_LIMIT")])
+                } else {
+                    Err("TEST_CODE limit rejected".to_string())
+                },
+                position_quotes: if position_ok {
+                    Ok(vec![test_stock("TEST_CODE_POSITION")])
+                } else {
+                    Err("TEST_CODE position rejected".to_string())
+                },
+            };
+
+            let resolved = resolve_intraday_market_inputs(Ok(inputs));
+            let plan = resolved.consumer_plan();
+            assert_eq!(resolved.limit_stocks.is_some(), expect_limit);
+            assert_eq!(resolved.position_quotes.is_some(), expect_position);
+            assert_eq!(resolved.limit_error.is_some(), !expect_limit);
+            assert_eq!(resolved.position_error.is_some(), !expect_position);
+            assert!(resolved.task_error.is_none());
+            assert_eq!(plan.use_limit_data, expect_limit);
+            assert_eq!(plan.use_position_data, expect_position);
+            assert!(plan.run_independent_jobs);
+        }
+    }
+
+    #[test]
+    fn task_failure_keeps_independent_jobs_eligible() {
+        let resolved = resolve_intraday_market_inputs(Err("TEST_CODE join failed".to_string()));
+        let plan = resolved.consumer_plan();
+
+        assert!(resolved.limit_stocks.is_none());
+        assert!(resolved.position_quotes.is_none());
+        assert!(resolved.limit_error.is_none());
+        assert!(resolved.position_error.is_none());
+        assert_eq!(resolved.task_error.as_deref(), Some("TEST_CODE join failed"));
+        assert!(!plan.use_limit_data);
+        assert!(!plan.use_position_data);
+        assert!(plan.run_independent_jobs);
+    }
 }
