@@ -183,7 +183,7 @@ dedicated 60s scheduler ---+-> DataHealth evaluate -> mode + missing capabilitie
 Automated acceptance:
 
 ```bash
-cargo test --lib monitor::data_mode::tests::br135_persistent_unsafe_reminder -- --exact
+cargo test --lib monitor::data_mode::tests::br135_persistent_unsafe_reminder_is_due_only_after_confirmed_interval -- --exact
 cargo test --bin monitor br135 -- --nocapture
 cargo test --bin monitor \
   br135_data_mode_reminder_tests::br135_scheduler_waits_before_first_tick_and_runs_independently \

@@ -24,7 +24,7 @@
 **Production evidence:**
 
 - `push_analytics` must gain a post-restart or due `data_mode` row with `pushed=1` and sink `feishu`.
-- `data/event_audit/<date>.jsonl` must gain `push.delivery.audit` for `data_mode_v1`.
+- `data/event_audit/<year>.jsonl` must gain `push.delivery.audit` for `data_mode_v1`.
 - Fixed private-log counters must show `[BR-135]` due/confirmed or explicit retry without printing message text, target, receipt identities, account values, or securities.
 
 ## File map
