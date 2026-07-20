@@ -1101,7 +1101,7 @@ async fn push_governor_inner_with_sub_kind(
     deliver_and_record(event, kind, text, start, sub_kind_str, override_cooldown).await
 }
 
-/// 公共尾段: L5/L6 投递 + commit/rollback + L7 留痕.
+/// 公共尾段: L5/L6 投递 + L7/哈希链留痕 + commit/rollback.
 /// push_governor_inner + push_governor_inner_with_sub_kind 共用 (DRY).
 async fn deliver_and_record(
     event: stock_analysis::push_l1::SignalEvent,
@@ -1127,11 +1127,6 @@ async fn deliver_and_record(
     } else {
         push_wechat(text).await
     };
-    let dedup_result = if delivered {
-        v14_adapter::commit_dedup_for_event(&event, kind, sub_kind, cooldown_override_secs)
-    } else {
-        v14_adapter::rollback_dedup_for_event(&event, kind, sub_kind, cooldown_override_secs)
-    };
     // b013 review P2-15: 入口取一次 channel (避免 push_wechat await 后 env 抖动)
     let channel = current_send_channel();
     let l7_result = v14_adapter::v14_record_delivery(&event, kind, text, delivered, channel);
@@ -1151,6 +1146,14 @@ async fn deliver_and_record(
         channel,
         text.len(),
         latency_ms,
+    );
+    let dedup_result = settle_dedup_after_delivery(
+        &event,
+        kind,
+        sub_kind,
+        cooldown_override_secs,
+        delivered,
+        l7_result.is_ok() && audit_result.is_ok(),
     );
 
     let mut audit_errors = Vec::new();
@@ -1175,6 +1178,24 @@ async fn deliver_and_record(
         PushOutcome::Pushed
     } else {
         PushOutcome::SinkError("push_wechat returned false".to_string())
+    }
+}
+
+/// BR-137: a source-fact identity is committed only after the sink and both
+/// authoritative post-delivery records succeed. Any other outcome releases
+/// the reservation so a later real provider poll can retry.
+fn settle_dedup_after_delivery(
+    event: &stock_analysis::push_l1::SignalEvent,
+    kind: PushKind,
+    sub_kind: Option<&str>,
+    cooldown_override_secs: Option<u32>,
+    delivered: bool,
+    post_delivery_audits_ok: bool,
+) -> Result<(), String> {
+    if delivered && post_delivery_audits_ok {
+        crate::v14_adapter::commit_dedup_for_event(event, kind, sub_kind, cooldown_override_secs)
+    } else {
+        crate::v14_adapter::rollback_dedup_for_event(event, kind, sub_kind, cooldown_override_secs)
     }
 }
 
@@ -3360,5 +3381,40 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("HTTP 500"));
         request.await.unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial(cooldown_memo)]
+    fn br137_sink_success_with_post_delivery_audit_failure_releases_identity_for_retry() {
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
+        crate::v14_adapter::_reset_dedup_for_test();
+        let now = chrono::Local::now();
+        let evidence = crate::v14_adapter::SourceFactEvidence::new(
+            PushKind::Announcement,
+            "TEST_CODE_POST_AUDIT_RETRY_ID".to_string(),
+            Some("TEST_CODE_POST_AUDIT_RETRY".to_string()),
+            "后置审计失败后允许重试".to_string(),
+            "TEST_CODE_PROVIDER".to_string(),
+            now,
+            Some(now.date_naive()),
+            80,
+            90,
+            false,
+        )
+        .expect("complete source fact");
+        let first = match crate::v14_adapter::v14_gate_source_fact(&evidence) {
+            crate::v14_adapter::V14Gate::Approved(event) => *event,
+            other => panic!("first attempt must reserve: {other:?}"),
+        };
+
+        settle_dedup_after_delivery(&first, PushKind::Announcement, None, None, true, false)
+            .expect("failed post-delivery audit must roll back L4 identity");
+
+        let retry = match crate::v14_adapter::v14_gate_source_fact(&evidence) {
+            crate::v14_adapter::V14Gate::Approved(event) => *event,
+            other => panic!("audit failure must leave the source fact retryable: {other:?}"),
+        };
+        crate::v14_adapter::rollback_dedup_for_event(&retry, PushKind::Announcement, None, None)
+            .expect("test cleanup rollback");
     }
 }
