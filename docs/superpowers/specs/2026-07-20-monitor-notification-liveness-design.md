@@ -135,6 +135,11 @@ still pass L4 dedup, L5 governance, the real sink, delivery audit, and L7 persis
 no coarse time cooldown: the committed state itself suppresses repeats, while every distinct
 transition remains eligible for delivery.
 
+The normal long-running process evaluates AccountMode and then DataMode before starting either the
+market loop or news loop. This ordering is independent of the market session: after-hours, weekends,
+and pre-open waits must already have a conservative banner and an eligible initial degradation
+alert. The market-active branch no longer owns the only startup call.
+
 Mode state is committed only after `Pushed`; an unrelated or coarse `Deduped` result is not
 authoritative for a new transition. A denied, deduped, or sink-failed DataMode transition keeps the
 previous state so the next evaluation retries. An
@@ -233,7 +238,9 @@ Tests are vertical RED→GREEN slices:
    update failure propagates;
 5. complete current announcement detail JSON accepts explicit success `true`/`1`, while other
    success values and old/mismatched/empty payloads fail;
-6. MagicLaw CLI success without a real channel receipt fails closed even when its exit status is 0.
+6. MagicLaw CLI success without a real channel receipt fails closed even when its exit status is 0;
+7. a normal isolated process evaluates AccountMode and DataMode before it waits for a market
+   session, with no `governance banner unavailable` marker.
 
 Required gates:
 

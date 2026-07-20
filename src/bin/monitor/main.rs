@@ -2848,6 +2848,17 @@ async fn main() {
             }
         });
 
+        // BR-108/BR-116: establish the conservative governance context before
+        // any long-running loop starts. This must run outside the market-active
+        // branch so after-hours, weekends, and startup source failures can still
+        // produce governed state alerts instead of repeating banner-unavailable.
+        if !evaluate_account_mode_hook(true).await {
+            log::error!(
+                "[startup-governance][BR-108/BR-116] AccountMode notification unconfirmed; context remains conservative and periodic retry stays eligible"
+            );
+        }
+        evaluate_data_mode_hook().await;
+
         let main_loops = async {
             // Phase 3: 移除 news_pipeline_loop_v15_3 (#2) — sink/aggregator 仅 #2 自用,
             //   #1 news_monitor_loop 已从同源 fetch_flash_titles 取快讯产候选, #2 重复取数且已停推
@@ -5357,14 +5368,6 @@ async fn monitor_loop() {
             .collect();
 
         let scanner = TieredScanner::new(targets);
-
-        // ============= v12 PR1-1.7: 启动期评估一次 AccountMode =============
-
-        // 后续每次 tick 重算在循环体内 (PR1-1.7 末尾的 evaluate_account_mode_hook).
-
-        // 这里做 "今日首次" 评估, 防止上一次进程残留状态未推 T-01.
-
-        evaluate_account_mode_hook(true).await;
 
         let detector = Detector::new(DetectorConfig::default());
 
