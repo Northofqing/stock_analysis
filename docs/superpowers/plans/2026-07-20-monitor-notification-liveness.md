@@ -1,5 +1,35 @@
 # Monitor Notification Liveness Repair Implementation Plan
 
+**Upstream debt** (from git log and current callers):
+
+- PR #5 restored independent intraday scheduling but did not repair the startup notification
+  bootstrap cycle. No deletion severed the AccountMode/DataMode producers: current multiline-aware
+  tracing shows `evaluate_account_mode_hook -> push_account_mode_change` and
+  `evaluate_data_mode_hook -> push_data_mode_change` in `main.rs`.
+- The pre-existing AccountMode audit can contain `pushed=0`; those rows are delivery debt and must
+  be retried by original row ID, not replaced or treated as acknowledged.
+
+**Rename impact**:
+
+- No identifier is renamed. `PortfolioMetrics` is nevertheless a source-breaking public shape
+  change: its three numeric fields become `Option`, so every downstream constructor/comparison must
+  use `complete`, `incomplete`, or explicit option handling.
+- `BannerCtx` removes production `Default` and adds `account_metrics_complete`; all monitor,
+  v14-adapter, renderer, and test constructors must state whether all three account facts exist.
+- `push_account_mode_change` changes from `Result<bool, String>` to a typed delivery result; the
+  main hook and all tests must distinguish no-change, pushed, deduped, denied, and sink failure.
+
+**Production evidence** (DONE criteria):
+
+- Push artifact: `grep -lE '账户模式变更|数据模式变更' data/push_log/${DATE}/*.md | head -3`
+  must find at least one post-restart state notification without printing its content.
+- L7 delivery: `sqlite3 data/push_analytics.db "SELECT COUNT(*) FROM push_analytics WHERE substr(ts,1,10)='${DATE}' AND template_id IN ('account_mode','data_mode') AND pushed=1;"`
+  must return at least `1`.
+- Immutable delivery audit: `grep -c '"event_type":"push.delivery.audit"' data/event_audit/${DATE}.jsonl`
+  must be non-zero.
+- If a producer remains unavailable, startup/runtime logs must contain the explicit
+  `[AccountMode-hook][BR-108]` or `[DataMode-hook][BR-116]` retry marker; silence is failure.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Restore truthful, audited operational notifications when account facts or market data are unavailable, and repair the live Eastmoney announcement detail protocol without adding fallback data.
@@ -18,6 +48,8 @@
 - `src/bin/monitor/v14_adapter.rs`: correct DataMode event payload/profile and AccountMode status eligibility.
 - `src/database/account_mode_log.rs`: reuse the existing immutable pending audit row through its public row contract.
 - `src/data_provider/announcement.rs`: current official detail endpoint and strict response parser.
+- `tests/monitor_help_isolation.rs`: process-level fail-closed assertion follows the new explicit
+  AccountMode startup boundary after the banner bootstrap repair.
 - `docs/business_rules.md`: BR-105/108/113/116 registration (completed before code).
 - `docs/superpowers/specs/2026-07-20-monitor-notification-liveness-design.md`: Gate A design.
 
@@ -111,6 +143,7 @@ fn br134_incomplete_banner_cannot_create_paper_risk_context() {
         account_mode: AccountMode::ReduceOnly,
         total_pos: None,
         today_pnl: None,
+        account_metrics_complete: false,
         data_mode: DataMode::Unsafe,
         data_missing_note: Some("账户指标缺失".to_string()),
     };
@@ -135,9 +168,11 @@ let position = self.total_pos.map_or_else(|| "仓位缺失".to_string(), |v| for
 let pnl = self.today_pnl.map_or_else(|| "日盈亏缺失".to_string(), |v| format!("日盈亏{v:+.1}%"));
 ```
 
-Return `Result<PaperRiskContext, String>` from `paper_risk_context_from_banner`; reject unless both account fields are present. Propagate the error from D-01 and return `false` before the post-close paper loop. Add `current_paper_risk_context_for` in `main.rs` so the v16.3 background task logs one explicit BR-134 refusal path.
+Return `Result<PaperRiskContext, String>` from `paper_risk_context_from_banner`; reject unless both displayed account fields are present and the banner records that all three underlying metrics (including consecutive losses) were complete in the same evaluation. Propagate the error from D-01 and return `false` before the post-close paper loop. Add `current_paper_risk_context_for` in `main.rs` so the v16.3 background task logs one explicit BR-134 refusal path.
 
-Build complete banners with `Some(...)`; build incomplete banners with `None`. Account-mode audit arguments use the metric options directly and set `data_complete=metrics.is_complete()`.
+Build complete banners with `Some(...)` and `account_metrics_complete=true`; incomplete or partial
+banners retain each real `Some(...)` fact but set `account_metrics_complete=false`. Account-mode
+audit arguments use the metric options directly and set `data_complete=metrics.is_complete()`.
 
 - [ ] **Step 7: Run focused GREEN and commit**
 
@@ -190,7 +225,7 @@ Construct the row with `TEST_CODE` only in free-text fields; all numeric facts r
 - [ ] **Step 2: Run RED**
 
 ```bash
-cargo test --bin monitor unchanged_unpushed_account_mode_reuses_the_pending_audit_row -- --exact
+cargo test --bin monitor push_templates::tests::br116_failed_account_notification_reuses_pending_audit_row -- --exact
 ```
 
 Expected: compile failure because the notification plan does not exist.
@@ -229,7 +264,7 @@ For `ReusePending`, render from the persisted transition/reason and do not inser
 
 - [ ] **Step 4: Convert account assembly errors to explicit incomplete state**
 
-In `evaluate_account_mode_hook`, retain the error log but continue with `PortfolioMetrics::incomplete()`. Read the latest row, evaluate through the existing rule, build/store a banner from optional metrics and real DataMode, then call the retry-aware orchestrator. Invalid mode labels, DB lookup failure, data-health failure, or lock failure still return `false`.
+In `evaluate_account_mode_hook`, retain the error log but continue with `PortfolioMetrics::incomplete()`. Read the latest row, evaluate through the existing rule, build/store a banner from optional metrics and real DataMode, then call the retry-aware orchestrator. The 08:30 reset is allowed only when `metrics.is_complete()`; incomplete facts preserve an existing Frozen state. Invalid mode labels, DB lookup failure, data-health failure, or lock failure still return `false`.
 
 ```rust
 let metrics = match tokio::task::spawn_blocking(compute_account_mode_metrics_blocking).await {
@@ -318,7 +353,7 @@ Also assert an initial Full input returns `EstablishSilently`.
 - [ ] **Step 2: Run RED**
 
 ```bash
-cargo test --bin monitor initial_unsafe_data_mode_requires_a_status_delivery -- --exact
+cargo test --bin monitor push_templates::tests::initial_unsafe_data_mode_requires_a_status_delivery -- --exact
 ```
 
 Expected: compile failure because the plan/result contract does not exist.
@@ -335,12 +370,15 @@ pub enum ModeDispatchResult {
 
 impl ModeDispatchResult {
     pub fn is_confirmed(&self) -> bool {
-        matches!(self, Self::EstablishedSilently | Self::Delivery(PushOutcome::Pushed | PushOutcome::Deduped))
+        matches!(self, Self::EstablishedSilently | Self::Delivery(PushOutcome::Pushed))
     }
 }
 ```
 
 `push_data_mode_change` dispatches when the first mode is Degraded/Unsafe or a later mode changes, and calls `dispatch_outcome` so Denied/SinkError remain distinguishable.
+DataMode uses no time-based cooldown: its last confirmed state is the exact dedup key. Add a rapid
+`Full→Degraded→Unsafe` test proving both distinct transitions are delivered, plus a test proving a
+coarse `Deduped` result is not confirmation.
 
 - [ ] **Step 4: Write the failing governance event test**
 
@@ -359,7 +397,7 @@ fn data_mode_alert_is_a_data_source_down_event_with_down_exemption() {
 - [ ] **Step 5: Run RED, implement v14 mapping, and keep failed state retryable**
 
 ```bash
-cargo test --bin monitor data_mode_alert_is_a_data_source_down_event_with_down_exemption -- --exact
+cargo test --bin monitor v14_adapter::tests::data_mode_alert_is_a_data_source_down_event_with_down_exemption -- --exact
 ```
 
 Build the v14 event through one helper. For DataMode use `SignalSource::DataSourceDown` and `SignalPayload::DataSourceDown(Default::default())`; other kinds keep their current payload. Set the DataMode category/exemption accordingly and set AccountMode `data_mode_min=Down` because it is a risk-state notification, not a market recommendation.
@@ -486,11 +524,45 @@ cargo build --release --bin monitor
 
 Expected: global line coverage at least 80%, core at least 95%, release build exits 0.
 
-- [ ] **Step 3: Review and merge through PR**
+- [ ] **Step 3: Run the mandatory independent five-step verifier**
+
+Give a fresh verifier the required “do not trust implementer” brief and require these independent
+checks, including production evidence and cross-version debt:
+
+```bash
+# 1. Module layer
+cargo test --lib risk::account_mode::tests::
+cargo test --lib data_provider::announcement::tests::
+cargo build --lib
+
+# 2. Multiline-aware caller trace
+rg -n -A3 'push_(account|data)_mode_change\(' src/bin/monitor --glob '*.rs'
+
+# 3. Release smoke through the production binary entry
+cargo build --release --bin monitor
+V10_DRY_RUN_PUSH=1 ./target/release/monitor --test 2>&1 | grep -E 'AccountMode-hook|DataMode-hook|announcement'
+
+# 4. Post-restart production evidence (counts only)
+DATE=$(date +%Y-%m-%d)
+grep -lE '账户模式变更|数据模式变更' data/push_log/${DATE}/*.md | head -3 | wc -l
+sqlite3 data/push_analytics.db "SELECT COUNT(*) FROM push_analytics WHERE substr(ts,1,10)='${DATE}' AND template_id IN ('account_mode','data_mode') AND pushed=1;"
+grep -c '"event_type":"push.delivery.audit"' data/event_audit/${DATE}.jsonl
+
+# 5. Cross-version debt
+rg -n 'is_active_spec_target_|is_legacy_v17_' src/bin/monitor/notify.rs
+rg -n -A3 'PushKind::(AccountMode|DataMode)|push_(account|data)_mode_change\(' src/bin/monitor --glob '*.rs'
+```
+
+Expected: module/build/smoke commands exit zero; both producers have live main callers; neither
+state PushKind is hidden as legacy; post-restart state delivery and immutable audit counts are
+non-zero. If the external source is unavailable during smoke, the explicit retry marker is required
+and the live post-restart evidence remains the release gate.
+
+- [ ] **Step 4: Review and merge through PR**
 
 Push the branch, create a PR containing every AGENTS field, obtain independent Standards/Spec review, mark ready, merge into `master`, and verify local/remote master commit equality.
 
-- [ ] **Step 4: Restart exactly one monitor process**
+- [ ] **Step 5: Restart exactly one monitor process**
 
 Terminate only the current release monitor PID after the merged master release build succeeds. Start:
 
@@ -500,13 +572,14 @@ exec caffeinate -dimsu env RUST_LOG=info RUST_BACKTRACE=1 \
   ./target/release/monitor >> /private/tmp/stock_analysis_monitor.log 2>&1
 ```
 
-- [ ] **Step 5: Validate without private output**
+- [ ] **Step 6: Validate without private output**
 
 Use fixed counters and audit aggregates only. Prove:
 
 - no panic/fatal/database-lock/audit failure;
 - governance banner unavailable stops increasing after bootstrap;
-- an initial account/data status attempt has `Pushed` or authoritative `Deduped` plus L7 evidence;
+- an initial account/data status attempt has `Pushed` plus L7 evidence; `Deduped` is not delivery
+  confirmation for a newly observed mode;
 - announcement detail no longer fails through the obsolete empty-body path and at least one complete batch succeeds when the source supplies valid data;
 - private account values, securities, credentials, destination, message content, and raw log never enter Git or console output.
 

@@ -366,7 +366,7 @@ pub fn _reset_dedup_for_test() {
     let mut banner = crate::LATEST_BANNER
         .lock()
         .expect("test banner lock must be available");
-    *banner = Some(crate::push_templates::BannerCtx::default());
+    *banner = Some(crate::push_templates::BannerCtx::test_default());
     drop(banner);
     let stack = v14_stack().expect("test L7 store must initialize");
     match stack.dispatcher.write() {

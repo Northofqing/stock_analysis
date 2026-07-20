@@ -26,8 +26,21 @@ struct AnnData {
 
 #[derive(Debug, Deserialize)]
 struct DetailResponse {
-    success: bool,
+    success: DetailSuccess,
     data: DetailData,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum DetailSuccess {
+    Boolean(bool),
+    Integer(u8),
+}
+
+impl DetailSuccess {
+    fn is_success(&self) -> bool {
+        matches!(self, Self::Boolean(true) | Self::Integer(1))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -495,8 +508,10 @@ fn parse_announcement_detail_http_response(
     }
     let response: DetailResponse = serde_json::from_str(&body)
         .map_err(|error| anyhow::anyhow!("ann detail {art_code} json: {error}"))?;
-    if !response.success {
-        return Err(anyhow::anyhow!("ann detail {art_code} success=false"));
+    if !response.success.is_success() {
+        return Err(anyhow::anyhow!(
+            "ann detail {art_code} success is not explicit true/1"
+        ));
     }
     if response.data.art_code != art_code {
         return Err(anyhow::anyhow!(
@@ -836,6 +851,30 @@ mod tests {
             "TEST_CODE_ARTICLE"
         )
         .is_err());
+    }
+
+    #[test]
+    fn current_announcement_detail_protocol_accepts_only_explicit_success_values() {
+        let numeric_success = r#"{"success":1,"data":{"art_code":"TEST_CODE_ARTICLE","notice_content":"TEST_CODE_完整正文"}}"#;
+        assert_eq!(
+            parse_announcement_detail_http_response(
+                200,
+                Ok(numeric_success.to_string()),
+                "TEST_CODE_ARTICLE",
+            )
+            .unwrap(),
+            "TEST_CODE_完整正文"
+        );
+
+        for success in ["0", "2", r#""1""#] {
+            let body = format!(
+                r#"{{"success":{success},"data":{{"art_code":"TEST_CODE_ARTICLE","notice_content":"TEST_CODE_完整正文"}}}}"#
+            );
+            assert!(
+                parse_announcement_detail_http_response(200, Ok(body), "TEST_CODE_ARTICLE")
+                    .is_err()
+            );
+        }
     }
 
     #[test]

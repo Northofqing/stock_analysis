@@ -26,6 +26,9 @@ use std::io::Write;
 
 use std::sync::atomic::AtomicBool;
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use stock_analysis::calendar::{self, current_session, is_market_active, MarketSession};
 
 use stock_analysis::monitor::alert;
@@ -91,16 +94,14 @@ impl TestEnvGuard {
         std::env::set_var("PUSH_VERBOSE", "true");
         std::env::set_var("STOCK_ANALYSIS_QUIET_HOUR_OVERRIDE", "0");
         std::env::set_var("STOCK_ENV_MODE", "test");
-        let audit_nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or_default();
+        static AUDIT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let audit_sequence = AUDIT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         std::env::set_var(
             "EVENT_AUDIT_DIR",
             std::env::temp_dir().join(format!(
                 "stock-analysis-monitor-audit-test-{}-{}",
                 std::process::id(),
-                audit_nonce
+                audit_sequence
             )),
         );
         guard
@@ -1314,6 +1315,7 @@ fn build_banner(
         account_mode,
         total_pos: am_metrics.total_pos_cheng,
         today_pnl: am_metrics.today_pnl_pct,
+        account_metrics_complete: am_metrics.is_complete(),
         data_mode,
         data_missing_note,
     }
@@ -1463,12 +1465,8 @@ async fn evaluate_account_mode_hook(startup: bool) -> bool {
         .account_mode
         .to_thresholds();
     let now_local = chrono::Local::now().time();
-    let prev_for_eval = if stock_analysis::risk::account_mode::should_reset_at_8_30(prev, now_local)
-    {
-        None
-    } else {
-        prev
-    };
+    let prev_for_eval =
+        stock_analysis::risk::account_mode::previous_mode_for_evaluation(prev, &metrics, now_local);
     let evaluated_mode =
         stock_analysis::risk::account_mode::evaluate(&metrics, prev_for_eval, &thresholds).mode;
 
@@ -1493,11 +1491,28 @@ async fn evaluate_account_mode_hook(startup: bool) -> bool {
         );
     }
 
-    if let Err(e) =
-        push_templates::push_account_mode_change(&metrics, prev, latest.as_ref(), Some(&banner))
-            .await
+    let notification = match push_templates::push_account_mode_change(
+        &metrics,
+        prev,
+        latest.as_ref(),
+        Some(&banner),
+    )
+    .await
     {
-        log::warn!("[AccountMode-hook] push_account_mode_change 失败: {}", e);
+        Ok(result) => result,
+        Err(error) => {
+            log::warn!(
+                "[AccountMode-hook] push_account_mode_change 失败: {}",
+                error
+            );
+            return false;
+        }
+    };
+    if !notification.is_confirmed() {
+        log::warn!(
+            "[AccountMode-hook][BR-116] notification unconfirmed: {:?}",
+            notification
+        );
         return false;
     }
 
@@ -4046,7 +4061,8 @@ async fn run_review_only_inner(isolated_test_fixtures: bool) -> Result<(), Strin
     } else if std::env::args().any(|arg| arg == "--test") {
         let hhmm_r = chrono::Local::now().format("%H:%M").to_string();
         let date_r = chrono::Local::now().format("%Y-%m-%d").to_string();
-        let banner_r = pt::BannerCtx::default();
+        let banner_r = current_banner()
+            .map_err(|error| format!("isolated template banner unavailable: {error}"))?;
         pt::dispatch_all_for_test(&hhmm_r, &date_r, &banner_r, pt::TestScope::All).await;
     } else {
         log::warn!("[复盘][BR-108] test dispatcher disabled=no_verified_banner");
@@ -4114,7 +4130,9 @@ async fn e2e_all_templates_run() -> Result<(), String> {
 
     log::info!("[v70] 4/4 跑新闻模块 (D-01 / I-02 isolated test fixtures)");
 
-    push_e2e_news_modules(&hhmm).await;
+    let banner_e2e =
+        current_banner().map_err(|error| format!("isolated E2E banner unavailable: {error}"))?;
+    push_e2e_news_modules(&hhmm, &banner_e2e).await;
 
     // T-16 requires a real-symbol realtime quote. BR-051 forbids inserting a
     // real symbol into the isolated test account, so this external boundary is
@@ -4125,7 +4143,8 @@ async fn e2e_all_templates_run() -> Result<(), String> {
     //   R-01~R-08 已由上方 run_review_only_inner 推过 → 这里 dedup 跳过; 盘中模板在此真推
     {
         use crate::push_templates as pt;
-        let banner_e2e = pt::BannerCtx::default();
+        let banner_e2e = current_banner()
+            .map_err(|error| format!("isolated template banner unavailable: {error}"))?;
         pt::dispatch_all_for_test(&hhmm, &today_str, &banner_e2e, pt::TestScope::IsolatedAll).await;
     }
 
@@ -4238,6 +4257,7 @@ fn seed_isolated_e2e_banner() -> Result<(), String> {
         account_mode: push_templates::AccountMode::Normal,
         total_pos: Some(total_pos),
         today_pnl: Some(today_pnl),
+        account_metrics_complete: true,
         data_mode: push_templates::DataMode::Full,
         data_missing_note: None,
     })
@@ -4264,13 +4284,13 @@ fn execute_e2e_seed_sql(db_path: &str, label: &str, sql: &str) -> Result<(), Str
 
 ///   公告测试数据: 3 主题 + 2 票 (覆盖 D-01 + I-02)
 
-async fn push_e2e_news_modules(hhmm: &str) {
+async fn push_e2e_news_modules(hhmm: &str, banner: &push_templates::BannerCtx) {
     use push_templates as pt;
 
     // D-01 新闻驱动个股 (isolated test fixture)
 
     let d01 = pt::render_news_to_idea(
-        &pt::BannerCtx::default(),
+        banner,
         pt::NewsToIdeaParams {
             hhmm,
 
@@ -4310,7 +4330,7 @@ async fn push_e2e_news_modules(hhmm: &str) {
     // I-02 新闻催化映射 (isolated fixture)
 
     let i02 = pt::render_news_catalyst(
-        &pt::BannerCtx::default(),
+        banner,
         pt::NewsCatalystParams {
             hhmm,
 

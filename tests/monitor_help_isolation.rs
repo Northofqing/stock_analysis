@@ -120,7 +120,7 @@ fn fresh_test_database_starts_without_lock_errors() {
         "fresh database startup must not race WAL initialization; output={combined_output}"
     );
     assert!(
-        combined_output.contains("[复盘][BR-108]")
+        combined_output.contains("[AccountMode-hook][BR-108]")
             && combined_output.contains("ledger 当日净值缺失"),
         "fresh database must reach the expected same-day ledger boundary; output={combined_output}"
     );

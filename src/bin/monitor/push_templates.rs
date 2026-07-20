@@ -115,20 +115,11 @@ pub struct BannerCtx {
     pub account_mode: AccountMode,
     pub total_pos: Option<u8>,
     pub today_pnl: Option<f64>,
+    /// True only when P&L, consecutive stop losses, and position were all
+    /// present in the same real account evaluation batch.
+    pub account_metrics_complete: bool,
     pub data_mode: DataMode,
     pub data_missing_note: Option<String>,
-}
-
-impl Default for BannerCtx {
-    fn default() -> Self {
-        Self {
-            account_mode: AccountMode::Normal,
-            total_pos: None,
-            today_pnl: None,
-            data_mode: DataMode::Full,
-            data_missing_note: None,
-        }
-    }
 }
 
 impl BannerCtx {
@@ -139,6 +130,7 @@ impl BannerCtx {
             account_mode: AccountMode::Normal,
             total_pos: Some(0),
             today_pnl: Some(0.0),
+            account_metrics_complete: true,
             data_mode: DataMode::Full,
             data_missing_note: None,
         }
@@ -178,7 +170,8 @@ impl BannerCtx {
 pub(crate) fn paper_risk_context_from_banner(
     banner: &BannerCtx,
 ) -> Result<stock_analysis::trading::paper_trade::PaperRiskContext, String> {
-    if banner.total_pos.is_none() || banner.today_pnl.is_none() {
+    if !banner.account_metrics_complete || banner.total_pos.is_none() || banner.today_pnl.is_none()
+    {
         return Err("BR-134 complete account metrics are unavailable".to_string());
     }
     let account_mode = match banner.account_mode {
@@ -1547,6 +1540,36 @@ enum AccountModeNotificationPlan {
     ReusePending(i64),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AccountModeDispatchResult {
+    NoChange,
+    Delivery(crate::notify::PushOutcome),
+}
+
+impl AccountModeDispatchResult {
+    pub fn is_confirmed(&self) -> bool {
+        matches!(
+            self,
+            Self::NoChange | Self::Delivery(crate::notify::PushOutcome::Pushed)
+        )
+    }
+}
+
+fn confirm_account_mode_delivery(log_id: i64) -> Result<(), String> {
+    stock_analysis::database::account_mode_log::mark_account_mode_pushed(log_id)
+        .map_err(|error| format!("mark AccountMode delivery confirmed: {error}"))
+}
+
+fn finalize_account_mode_delivery(
+    log_id: i64,
+    outcome: crate::notify::PushOutcome,
+) -> Result<AccountModeDispatchResult, String> {
+    if matches!(&outcome, crate::notify::PushOutcome::Pushed) {
+        confirm_account_mode_delivery(log_id)?;
+    }
+    Ok(AccountModeDispatchResult::Delivery(outcome))
+}
+
 fn account_mode_from_label(
     label: &str,
 ) -> Result<stock_analysis::risk::action_gate::AccountMode, String> {
@@ -1581,7 +1604,8 @@ fn plan_account_mode_notification(
 ///
 /// 完整链路: evaluate() → is_changed() → 落库 → 拼 T-01 → dispatch() → 标记 pushed.
 ///
-/// 返回 `Ok(true)` 表示落库 + 推送成功; `Ok(false)` 表示无变更 (no-op).
+/// A transition is confirmed only after delivery and the same audit row's
+/// `pushed=1` update both succeed. `NoChange` is an explicit successful no-op.
 ///
 /// `prev` 由调用方从 `database::account_mode_log::latest_account_mode_change()` 恢复.
 ///
@@ -1591,7 +1615,7 @@ pub async fn push_account_mode_change(
     prev: Option<stock_analysis::risk::action_gate::AccountMode>,
     latest: Option<&stock_analysis::database::account_mode_log::AccountModeLogRow>,
     banner: Option<&BannerCtx>,
-) -> Result<bool, String> {
+) -> Result<AccountModeDispatchResult, String> {
     use stock_analysis::config::get_risk_config;
     use stock_analysis::risk::account_mode::{evaluate, ModeThresholds};
     use stock_analysis::risk::action_gate::AccountMode as LibAM;
@@ -1608,13 +1632,11 @@ pub async fn push_account_mode_change(
     // 重判, Frozen 自动落到 Normal (或仍 Frozen 如 metrics 仍超限, 都由 evaluate 决定).
     // 注意: 此分支不修改 prev_for_eval 的 type, 仅在 should_reset=true 时把 Option 转 None.
     let now_local = chrono::Local::now().time();
-    let prev_for_eval = if stock_analysis::risk::account_mode::should_reset_at_8_30(prev, now_local)
-    {
+    let prev_for_eval =
+        stock_analysis::risk::account_mode::previous_mode_for_evaluation(prev, metrics, now_local);
+    if prev_for_eval.is_none() && prev.is_some() {
         log::warn!("[BR-021] 8:30 盘前重置信号命中: prev=Frozen → 强制 prev=None 让 evaluate 重判");
-        None
-    } else {
-        prev
-    };
+    }
     let eval = evaluate(metrics, prev_for_eval, &thresholds);
 
     let is_initial_evaluation = prev.is_none() && latest.is_none();
@@ -1626,7 +1648,7 @@ pub async fn push_account_mode_change(
         AccountModeNotificationPlan::NoChange
     };
     if notification_plan == AccountModeNotificationPlan::NoChange {
-        return Ok(false);
+        return Ok(AccountModeDispatchResult::NoChange);
     }
 
     // The first real evaluation is an auditable state establishment. Represent
@@ -1704,7 +1726,7 @@ pub async fn push_account_mode_change(
     ));
 
     // 3. dispatch (code="" 全局键, AccountMode 无冷却)
-    let ok = dispatch(
+    let outcome = dispatch_outcome(
         crate::notify::PushKind::AccountMode,
         "", // code 空 = 全局键
         banner,
@@ -1740,19 +1762,14 @@ pub async fn push_account_mode_change(
     }
 
     // 4. 标记 pushed
-    if ok {
-        if let Err(e) = stock_analysis::database::account_mode_log::mark_account_mode_pushed(log_id)
-        {
-            log::warn!("[AccountMode] mark pushed=1 失败 (id={}): {}", log_id, e);
-        }
-    } else {
-        log::info!(
-            "[AccountMode] T-01 推送失败, log_id={} 保留 pushed=0 等重试",
-            log_id
+    if !matches!(&outcome, crate::notify::PushOutcome::Pushed) {
+        log::warn!(
+            "[AccountMode][BR-116] T-01 delivery unconfirmed ({:?}), log_id={} 保留 pushed=0 等重试",
+            outcome, log_id
         );
     }
 
-    Ok(ok)
+    finalize_account_mode_delivery(log_id, outcome)
 }
 
 fn prev_mode_to_tmpl(m: stock_analysis::risk::action_gate::AccountMode) -> AccountMode {
@@ -5835,6 +5852,7 @@ mod tests_r_dispatchers {
             account_mode: AccountMode::Normal,
             total_pos: Some(5),
             today_pnl: Some(0.0),
+            account_metrics_complete: true,
             data_mode: DataMode::Full,
             data_missing_note: None,
         };
@@ -5851,6 +5869,7 @@ mod tests_r_dispatchers {
             account_mode: AccountMode::Normal,
             total_pos: Some(0),
             today_pnl: Some(0.0),
+            account_metrics_complete: true,
             data_mode: DataMode::Full,
             data_missing_note: None,
         };
@@ -5874,6 +5893,7 @@ mod tests_r_dispatchers {
             account_mode: AccountMode::Normal,
             total_pos: Some(0),
             today_pnl: Some(0.0),
+            account_metrics_complete: true,
             data_mode: DataMode::Full,
             data_missing_note: None,
         };
@@ -5891,6 +5911,7 @@ mod tests_r_dispatchers {
             account_mode: AccountMode::Normal,
             total_pos: Some(0),
             today_pnl: Some(0.0),
+            account_metrics_complete: true,
             data_mode: DataMode::Full,
             data_missing_note: None,
         };
@@ -6209,7 +6230,8 @@ pub async fn push_candidate_invalidated(
 
 /// v12 PR2-2.2: 数据模式变更编排器.
 ///
-/// 完整链路: evaluate() → is_changed() → 拼 T-02 → dispatch() (10min 冷却由 push_governor 处理).
+/// 完整链路: evaluate() → 计划状态变更 → 拼 T-02 → dispatch().
+/// BR-116: 已确认状态本身负责精确去重，不设跨状态的粗粒度时间冷却。
 ///
 /// 返回 `Ok(true)` 表示推送成功; `Ok(false)` 表示无变更 (no-op).
 ///
@@ -6254,10 +6276,7 @@ impl ModeDispatchResult {
     pub fn is_confirmed(&self) -> bool {
         matches!(
             self,
-            Self::EstablishedSilently
-                | Self::Delivery(
-                    crate::notify::PushOutcome::Pushed | crate::notify::PushOutcome::Deduped
-                )
+            Self::EstablishedSilently | Self::Delivery(crate::notify::PushOutcome::Pushed)
         )
     }
 }
@@ -6330,15 +6349,12 @@ pub async fn push_data_mode_change(
         health.eta.as_deref(),
     ));
 
-    // 2. dispatch (code="" 全局键, DataMode 10min 冷却走 push_governor 默认)
+    // 2. dispatch (code="" 全局键; BR-116 uses the committed mode as exact dedup state)
     let outcome = dispatch_outcome(crate::notify::PushKind::DataMode, "", banner, text).await;
 
-    if !matches!(
-        outcome,
-        crate::notify::PushOutcome::Pushed | crate::notify::PushOutcome::Deduped
-    ) {
+    if !matches!(outcome, crate::notify::PushOutcome::Pushed) {
         log::info!(
-            "[DataMode] T-02 推送被治理拦截 (冷却或预算), mode {:?} → {:?}",
+            "[DataMode][BR-116] T-02 delivery unconfirmed, mode {:?} → {:?}",
             prev_mode,
             new_mode
         );
@@ -7667,6 +7683,7 @@ mod tests {
             account_mode: AccountMode::Normal,
             total_pos: Some(5),
             today_pnl: Some(0.3),
+            account_metrics_complete: true,
             data_mode: DataMode::Full,
             data_missing_note: None,
         }
@@ -7686,6 +7703,7 @@ mod tests {
             account_mode: AccountMode::ReduceOnly,
             total_pos: None,
             today_pnl: None,
+            account_metrics_complete: false,
             data_mode: DataMode::Unsafe,
             data_missing_note: Some("账户指标缺失".to_string()),
         };
@@ -7700,9 +7718,24 @@ mod tests {
             account_mode: AccountMode::ReduceOnly,
             total_pos: None,
             today_pnl: None,
+            account_metrics_complete: false,
             data_mode: DataMode::Unsafe,
             data_missing_note: Some("账户指标缺失".to_string()),
         };
+        assert!(paper_risk_context_from_banner(&banner).is_err());
+    }
+
+    #[test]
+    fn br134_displayed_metrics_do_not_replace_all_three_fact_completeness() {
+        let banner = BannerCtx {
+            account_mode: AccountMode::Normal,
+            total_pos: Some(4),
+            today_pnl: Some(0.2),
+            account_metrics_complete: false,
+            data_mode: DataMode::Full,
+            data_missing_note: None,
+        };
+
         assert!(paper_risk_context_from_banner(&banner).is_err());
     }
 
@@ -7730,6 +7763,7 @@ mod tests {
             account_mode: AccountMode::ReduceOnly,
             total_pos: Some(6),
             today_pnl: Some(-1.6),
+            account_metrics_complete: true,
             data_mode: DataMode::Degraded,
             data_missing_note: Some("缺盘口深度".to_string()),
         };
@@ -7744,6 +7778,7 @@ mod tests {
             account_mode: AccountMode::Frozen,
             total_pos: Some(0),
             today_pnl: Some(-2.1),
+            account_metrics_complete: true,
             data_mode: DataMode::Full,
             data_missing_note: Some("不该出现".to_string()),
         };
@@ -10388,8 +10423,8 @@ mod tests {
         );
         assert_eq!(
             PushKind::DataMode.cooldown_secs(),
-            Some(600),
-            "DataMode 10min"
+            None,
+            "DataMode transitions have no coarse cooldown"
         );
         assert_eq!(
             PushKind::HoldingPlan.cooldown_secs(),
@@ -10562,6 +10597,7 @@ mod tests {
             account_mode: AccountMode::Normal,
             total_pos: Some(5),
             today_pnl: Some(0.3),
+            account_metrics_complete: true,
             data_mode: DataMode::Full,
             data_missing_note: None,
         };
@@ -10818,6 +10854,7 @@ mod tests {
             account_mode: AccountMode::Normal,
             total_pos: Some(5),
             today_pnl: Some(0.3),
+            account_metrics_complete: true,
             data_mode: DataMode::Full,
             data_missing_note: None,
         }
@@ -10846,6 +10883,76 @@ mod tests {
             plan_account_mode_notification(Some(&pending), LibAM::ReduceOnly).unwrap(),
             AccountModeNotificationPlan::ReusePending(41)
         );
+    }
+
+    #[test]
+    fn br116_account_delivery_requires_push_confirmation() {
+        assert!(AccountModeDispatchResult::NoChange.is_confirmed());
+        assert!(
+            AccountModeDispatchResult::Delivery(crate::notify::PushOutcome::Pushed).is_confirmed()
+        );
+        assert!(
+            !AccountModeDispatchResult::Delivery(crate::notify::PushOutcome::Deduped)
+                .is_confirmed()
+        );
+        assert!(
+            !AccountModeDispatchResult::Delivery(crate::notify::PushOutcome::Denied(
+                "TEST_CODE governance denied".to_string(),
+            ))
+            .is_confirmed()
+        );
+        assert!(
+            !AccountModeDispatchResult::Delivery(crate::notify::PushOutcome::SinkError(
+                "TEST_CODE sink failed".to_string(),
+            ))
+            .is_confirmed()
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(cooldown_memo)]
+    fn br116_account_delivery_confirmation_propagates_audit_update_failure() {
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
+        init_test_db();
+
+        let error = finalize_account_mode_delivery(i64::MAX, crate::notify::PushOutcome::Pushed)
+            .expect_err("missing audit row must not be confirmed");
+        assert!(error.contains("expected 1 affected row"));
+    }
+
+    #[test]
+    #[serial_test::serial(cooldown_memo)]
+    fn br116_denied_and_sink_error_keep_original_account_audit_pending() {
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
+        init_test_db();
+        use stock_analysis::database::account_mode_log;
+        use stock_analysis::risk::action_gate::AccountMode as LibAM;
+
+        for outcome in [
+            crate::notify::PushOutcome::Denied("TEST_CODE governance denied".to_string()),
+            crate::notify::PushOutcome::SinkError("TEST_CODE sink failed".to_string()),
+        ] {
+            let id = account_mode_log::insert_account_mode_change(
+                LibAM::Normal,
+                LibAM::ReduceOnly,
+                "TEST_CODE pending delivery",
+                None,
+                None,
+                None,
+                false,
+            )
+            .expect("seed pending account audit");
+
+            let result = finalize_account_mode_delivery(id, outcome)
+                .expect("unconfirmed outcome must remain retryable");
+            assert!(!result.is_confirmed());
+            let row = account_mode_log::latest_account_mode_change()
+                .expect("read account audit")
+                .expect("pending account audit exists");
+            assert_eq!(i64::from(row.id), id);
+            assert_eq!(row.pushed, 0);
+            assert!(row.push_attempted_at.is_none());
+        }
     }
 
     #[tokio::test]
@@ -10877,6 +10984,7 @@ mod tests {
             account_mode: AccountMode::ReduceOnly,
             total_pos: None,
             today_pnl: None,
+            account_metrics_complete: false,
             data_mode: DataMode::Unsafe,
             data_missing_note: Some("账户指标缺失".to_string()),
         };
@@ -10893,9 +11001,13 @@ mod tests {
         .await
         .expect("retry pending notification");
 
-        assert!(pushed);
+        assert!(pushed.is_confirmed());
         let rows = account_mode_log::recent_account_mode_changes(10).expect("read audit rows");
         assert_eq!(rows.len(), 1, "retry must reuse the pending audit row");
+        assert_eq!(
+            rows[0].id, pending.id,
+            "retry must retain the original row ID"
+        );
         assert_eq!(rows[0].pushed, 1);
     }
 
@@ -10923,7 +11035,7 @@ mod tests {
         .await;
 
         assert!(result.is_ok(), "orchestrator 不应报错: {:?}", result);
-        assert!(result.unwrap(), "T-01 应推送成功 (dry-run)");
+        assert!(result.unwrap().is_confirmed(), "T-01 应推送成功 (dry-run)");
 
         // 验证 DB 行
         let rows = account_mode_log::recent_account_mode_changes(10).expect("query");
@@ -10973,7 +11085,7 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
-        assert!(!result.unwrap(), "无变更应返回 false");
+        assert_eq!(result.unwrap(), AccountModeDispatchResult::NoChange);
 
         let after = account_mode_log::recent_account_mode_changes(100)
             .map(|r| r.len())
@@ -10999,7 +11111,10 @@ mod tests {
         let pushed = push_account_mode_change(&metrics, None, None, Some(&banner_normal_full()))
             .await
             .expect("initial evaluation must be orchestrated");
-        assert!(pushed, "dry-run initial evaluation should dispatch");
+        assert!(
+            pushed.is_confirmed(),
+            "dry-run initial evaluation should dispatch"
+        );
 
         let rows = account_mode_log::recent_account_mode_changes(1).expect("query initial state");
         assert_eq!(rows.len(), 1);
@@ -11168,6 +11283,72 @@ mod tests {
         );
     }
 
+    #[test]
+    fn br116_data_mode_dedup_is_not_delivery_confirmation() {
+        assert!(!ModeDispatchResult::Delivery(crate::notify::PushOutcome::Deduped).is_confirmed());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
+    async fn br116_rapid_distinct_data_mode_transitions_are_both_delivered() {
+        let _e2e_guard = E2E_MUTEX.lock().await;
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
+        init_test_db();
+        reset_daily_budget_for_test();
+        crate::v14_adapter::_reset_dedup_for_test();
+
+        use stock_analysis::monitor::data_mode::{
+            Capability, CapabilityStatus, DataHealthInput, DataMode as LibDM,
+        };
+
+        let degraded_input = DataHealthInput {
+            capabilities: vec![
+                CapabilityStatus::fresh(Capability::Quote, 1),
+                CapabilityStatus::missing(Capability::Kline),
+                CapabilityStatus::fresh(Capability::MoneyFlow, 1),
+                CapabilityStatus::fresh(Capability::News, 1),
+                CapabilityStatus::missing(Capability::OrderBook),
+            ],
+            critical_max_age_secs: 120,
+            orderbook_max_age_secs: 600,
+        };
+        let degraded_banner = BannerCtx {
+            data_mode: DataMode::Degraded,
+            data_missing_note: Some("Kline/OrderBook".to_string()),
+            ..BannerCtx::test_default()
+        };
+        *crate::LATEST_BANNER
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(degraded_banner.clone());
+        let first =
+            push_data_mode_change(&degraded_input, Some(LibDM::Full), Some(&degraded_banner))
+                .await
+                .expect("Full to Degraded delivery");
+
+        let unsafe_input = DataHealthInput::default();
+        let unsafe_banner = BannerCtx {
+            data_mode: DataMode::Unsafe,
+            data_missing_note: Some("Quote/Kline/MoneyFlow/News/OrderBook".to_string()),
+            ..BannerCtx::test_default()
+        };
+        *crate::LATEST_BANNER
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(unsafe_banner.clone());
+        let second =
+            push_data_mode_change(&unsafe_input, Some(LibDM::Degraded), Some(&unsafe_banner))
+                .await
+                .expect("Degraded to Unsafe delivery");
+
+        assert_eq!(
+            first,
+            ModeDispatchResult::Delivery(crate::notify::PushOutcome::Pushed)
+        );
+        assert_eq!(
+            second,
+            ModeDispatchResult::Delivery(crate::notify::PushOutcome::Pushed)
+        );
+    }
+
     /// T-02 模板精确内容验证: 文本必须与 §14.1 T-02 模板逐字符一致
     #[test]
     fn t02_template_text_exact_format() {
@@ -11228,6 +11409,7 @@ mod tests {
             account_mode: AccountMode::ReduceOnly,
             total_pos: Some(5),
             today_pnl: Some(-1.6),
+            account_metrics_complete: true,
             data_mode: DataMode::Full,
             data_missing_note: None,
         };
@@ -11574,6 +11756,7 @@ mod tests {
                     None
                 },
                 today_pnl: data_complete.then_some(today_pnl_pct),
+                account_metrics_complete: data_complete,
                 data_mode: DataMode::Full,
                 data_missing_note: None,
             };
@@ -11641,6 +11824,7 @@ mod tests {
                     None
                 },
                 today_pnl: data_complete.then_some(today_pnl_pct),
+                account_metrics_complete: data_complete,
                 data_mode: DataMode::Full,
                 data_missing_note: None,
             };
@@ -11742,7 +11926,7 @@ mod tests {
                     min_spread_pct,
                     risk_note: "板块同步下跌",
                 };
-                let text = render_t0_advice(&BannerCtx::default(), params);
+                let text = render_t0_advice(&BannerCtx::test_default(), params);
                 let banner_text = format!("[v12-E2E-T05] {}", text);
                 let ok = crate::notify::push_governor_v3(
                     &banner_text,
@@ -11778,7 +11962,7 @@ mod tests {
                 hhmm: &hhmm,
                 reason: "主升核心票防卖飞 (BR-022 衍生)",
             };
-            let text = render_t0_forbid(&BannerCtx::default(), params);
+            let text = render_t0_forbid(&BannerCtx::test_default(), params);
             let banner_text = format!("[v12-E2E-T06] {}", text);
             let ok = crate::notify::push_governor_v3(
                 &banner_text,
@@ -11819,7 +12003,7 @@ mod tests {
                 book_quality: EvidenceQuality::Missing,
                 no_buy: &["大盘跳水同步".to_string()],
             };
-            let text = render_candidate_triggered(&BannerCtx::default(), params);
+            let text = render_candidate_triggered(&BannerCtx::test_default(), params);
             let banner_text = format!("[v12-E2E-T07] {}", text);
             let ok = crate::notify::push_governor_v3(
                 &banner_text,
@@ -11869,7 +12053,7 @@ mod tests {
                 conclusion: "距涨停过近, 禁止追买",
                 reasons: &reasons,
             };
-            let text = render_forbidden_ops(&BannerCtx::default(), params);
+            let text = render_forbidden_ops(&BannerCtx::test_default(), params);
             let banner_text = format!("[v12-E2E-T09] {}", text);
             let ok = crate::notify::push_governor_v3(
                 &banner_text,
@@ -11943,8 +12127,13 @@ mod tests {
                     tag: "观察池",
                 },
             ];
-            let text =
-                render_auction_volume(&BannerCtx::default(), &hhmm, &items, "强承接", "可操作");
+            let text = render_auction_volume(
+                &BannerCtx::test_default(),
+                &hhmm,
+                &items,
+                "强承接",
+                "可操作",
+            );
             let banner_text = format!("[v12-E2E-T11] {}", text);
             let ok =
                 crate::notify::push_governor(&banner_text, crate::notify::PushKind::AuctionVolume)
@@ -11969,7 +12158,7 @@ mod tests {
                 name: &t12_name_s,
                 state: "尾盘跳水-建议处理",
             };
-            let text = render_close_call(&BannerCtx::default(), &hhmm, Some(&holding), None);
+            let text = render_close_call(&BannerCtx::test_default(), &hhmm, Some(&holding), None);
             let banner_text = format!("[v12-E2E-T12] {}", text);
             let ok = crate::notify::push_governor(&banner_text, crate::notify::PushKind::CloseCall)
                 .await;

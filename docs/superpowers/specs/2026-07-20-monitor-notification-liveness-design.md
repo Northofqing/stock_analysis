@@ -15,16 +15,59 @@ window the process stayed alive, but notification-producing paths repeatedly rep
 - the paper risk context was unavailable;
 - the announcement detail batch failed with an empty response body.
 
-The production database contains one attested real-account snapshot dated 2026-07-18. Its daily
-P&L and account mode are explicitly absent, and the latest ledger row is older. Those facts may be
-kept for audit but fail the 30-second action freshness gate and cannot be converted into zero,
-`Normal`, or a current-day ledger row.
+The production database contains an attested but action-stale real-account snapshot. Its daily P&L
+and account mode are explicitly absent, and the latest ledger row is older. Those facts may be kept
+for audit but fail the 30-second action freshness gate and cannot be converted into zero, `Normal`,
+or a current-day ledger row.
 
 An official-endpoint protocol probe, which emitted only response sizes and field names, showed:
 
 - the old detail path returns an empty body;
 - the current Eastmoney detail path returns a non-empty JSON object;
 - the current payload uses `data.notice_content`, not `data.content`.
+
+### 1.1 Reproducible privacy-safe evidence
+
+Only aggregate counters and protocol types were printed; the commands below never emit message
+content, account values, securities, credentials, database paths, or notification destinations.
+
+```text
+$ perl -e '<fixed pattern counters>' /private/tmp/stock_analysis_monitor.log
+banner_unavailable=2356
+paper_context_unavailable=1255
+announcement_empty_body=301
+announcement_success_type=0
+panic=0
+fatal=0
+
+$ stat -f 'mode=%Sp size=%z' /private/tmp/stock_analysis_monitor.log
+mode=-rw------- size=2690760
+
+$ sqlite3 data/stock_analysis.db "SELECT 'incomplete_account_mode_rows=' || COUNT(*) FROM account_mode_log WHERE data_complete=0; SELECT 'pending_account_mode_rows=' || COUNT(*) FROM account_mode_log WHERE pushed=0;"
+incomplete_account_mode_rows=1
+pending_account_mode_rows=3
+
+$ rg -n -A3 'push_(account|data)_mode_change\(' src/bin/monitor/main.rs
+1495:    let notification = match push_templates::push_account_mode_change(
+1496-        &metrics,
+1497-        prev,
+1498-        latest.as_ref(),
+1747:    let result = match pt::push_data_mode_change(&input, prev, Some(&banner)).await {
+1748-        Ok(result) => result,
+1749-        Err(error) => {
+1750-            log::error!("[DataMode-hook] change push failed: {error}");
+
+$ curl --silent --show-error --fail --get https://np-cnotice-stock.eastmoney.com/api/content/ann --data-urlencode art_code=AN202607191827109667 --data-urlencode client_source=web --data-urlencode page_index=1 | jq -r '<field types and booleans only>'
+success_type=number
+success_value=1
+art_code_type=string
+identity_match=true
+notice_content_type=string
+notice_content_nonempty=true
+```
+
+The counter values are an observation snapshot, not acceptance thresholds. The protocol probe uses
+a public announcement identity and deliberately suppresses the response body.
 
 ## 2. Root causes
 
@@ -57,14 +100,17 @@ with `Option` values. Complete account evaluation requires all three metrics. If
 fails, the monitor creates an explicit incomplete metric set (all absent), logs the source error,
 and evaluates it through the existing account-mode rule:
 
-- an existing `Frozen` state remains `Frozen`;
+- an existing `Frozen` state remains `Frozen`; the 08:30 reset is ineligible until all three
+  account facts are complete;
 - otherwise incomplete account data yields `ReduceOnly`;
 - no missing number is persisted or rendered as zero.
 
 The account-mode audit writes SQL `NULL` for every missing metric and `data_complete=false`.
-The banner renders missing account fields as `缺失`, carries the real DataMode evaluation, and may
-govern notification delivery. `paper_risk_context_from_banner` becomes fallible and continues to
-reject paper/trading work unless the account metrics are complete, preserving BR-134.
+The banner renders missing account fields as `缺失`, carries the real DataMode evaluation and an
+explicit all-three-account-facts completeness bit, and may govern notification delivery.
+`paper_risk_context_from_banner` becomes fallible and continues to reject paper/trading work unless
+daily P&L, consecutive-loss count, and position ratio were all present in the same evaluation,
+preserving BR-134.
 
 ### 3.2 Operational state notifications remain audible
 
@@ -78,12 +124,16 @@ The v14 adapter constructs DataMode events as `SignalSource::DataSourceDown` wit
 `DataSourceDownPayload`, classifies the profile as `DataSource`, and enables the existing
 `always_send_on_data_source_down` exemption. AccountMode status messages accept `Down` data
 quality because they communicate risk restrictions rather than authorize a trade. All messages
-still pass L4 dedup, L5 governance, the real sink, delivery audit, and L7 persistence.
+still pass L4 dedup, L5 governance, the real sink, delivery audit, and L7 persistence. DataMode has
+no coarse time cooldown: the committed state itself suppresses repeats, while every distinct
+transition remains eligible for delivery.
 
-Mode state is committed only after `Pushed` or an authoritative `Deduped` result. A denied or
-sink-failed DataMode transition keeps the previous state so the next evaluation retries. An
+Mode state is committed only after `Pushed`; an unrelated or coarse `Deduped` result is not
+authoritative for a new transition. A denied, deduped, or sink-failed DataMode transition keeps the
+previous state so the next evaluation retries. An
 unpushed `account_mode_log` row is reused for retry instead of being treated as a delivered state
-or duplicated on every loop; only successful delivery marks that immutable audit row pushed.
+or duplicated on every loop; only successful delivery plus successful `pushed=1` audit persistence
+confirms the transition. Audit update failure propagates as an error.
 
 ### 3.3 Strict current announcement detail protocol
 
@@ -92,7 +142,7 @@ to the current official detail endpoint. The parser requires:
 
 - HTTP 2xx;
 - readable, non-empty JSON;
-- `success=true`;
+- `success` is exactly boolean `true` or integer `1` (the two observed explicit-success encodings);
 - non-empty `data.art_code` equal to the requested identity;
 - non-empty `data.notice_content`.
 
@@ -122,7 +172,7 @@ current detail endpoint ─> strict identity/content validation ─> complete ba
 ## 5. Failure handling
 
 - Account data remains unavailable: send/retain conservative status, reject paper/trading work,
-  and retry real account assembly on the existing schedule.
+  do not apply the 08:30 Frozen reset, and retry real account assembly on the existing schedule.
 - DataMode notification fails: do not commit the new latest-notified mode; keep explicit failure
   and retry according to BR-116.
 - AccountMode notification fails: retain and reuse the existing `pushed=0` audit row; do not
@@ -146,10 +196,15 @@ current detail endpoint ─> strict identity/content validation ─> complete ba
 
 Tests are vertical RED→GREEN slices:
 
-1. incomplete account facts evaluate conservatively and remain absent in banner/audit rendering;
-2. paper risk context rejects an incomplete banner;
-3. initial Unsafe DataMode produces an eligible data-source-down event;
-4. complete current announcement detail JSON succeeds while old/mismatched/empty payloads fail.
+1. incomplete account facts evaluate conservatively, remain absent in banner/audit rendering, and
+   cannot clear Frozen during the 08:30 reset window;
+2. paper risk context rejects a banner unless all three same-batch account facts are proven;
+3. initial Unsafe DataMode produces an eligible data-source-down event, rapid
+   `Full→Degraded→Unsafe` transitions both deliver, and `Deduped` does not commit a new mode;
+4. AccountMode Denied/SinkError outcomes preserve the original pending audit ID and a pushed-audit
+   update failure propagates;
+5. complete current announcement detail JSON accepts explicit success `true`/`1`, while other
+   success values and old/mismatched/empty payloads fail.
 
 Required gates:
 

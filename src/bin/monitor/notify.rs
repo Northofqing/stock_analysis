@@ -69,7 +69,7 @@ pub enum PushKind {
     // ============= v12 §14.3 新增 PushKind =============
     /// 账户模式变更 (T-01, ⚡ 无冷却) [MVP-1]
     AccountMode,
-    /// 数据模式变更 (T-02, ⚡ 10min 冷却) [MVP-1]
+    /// 数据模式变更 (T-02, ⚡ 状态变更即推、无粗粒度冷却) [MVP-1]
     DataMode,
     /// 持仓操作建议 (T-03/T-04, ⚡ 30min/票) [MVP-1]
     HoldingPlan,
@@ -339,9 +339,7 @@ impl PushKind {
     pub fn cooldown_secs(self) -> Option<u32> {
         match self {
             // 无冷却 (状态变更即推)
-            PushKind::AccountMode | PushKind::HoldingEvent => None,
-            // 10 min
-            PushKind::DataMode => Some(600),
+            PushKind::AccountMode | PushKind::DataMode | PushKind::HoldingEvent => None,
             // 30 min / 票 (持有建议 + 做T 共享)
             PushKind::HoldingPlan | PushKind::T0Advice => Some(1800),
             // 1次/票/日 (86400s)

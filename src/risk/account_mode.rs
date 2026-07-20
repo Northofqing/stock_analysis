@@ -218,6 +218,23 @@ pub fn should_reset_at_8_30(prev: Option<AccountMode>, now_local: NaiveTime) -> 
     matches!(prev, Some(AccountMode::Frozen))
 }
 
+/// Select the persisted mode used by the next evaluation.
+///
+/// BR-108 requires a complete same-batch account snapshot before the 08:30
+/// reset may clear a persisted `Frozen` state. Missing facts therefore keep
+/// the previous mode and remain fail-closed.
+pub fn previous_mode_for_evaluation(
+    prev: Option<AccountMode>,
+    metrics: &PortfolioMetrics,
+    now_local: NaiveTime,
+) -> Option<AccountMode> {
+    if metrics.is_complete() && should_reset_at_8_30(prev, now_local) {
+        None
+    } else {
+        prev
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,6 +397,29 @@ mod tests {
     }
 
     #[test]
+    fn every_single_missing_account_fact_is_incomplete() {
+        for metrics in [
+            PortfolioMetrics {
+                today_pnl_pct: None,
+                consecutive_stop_loss_n: Some(0),
+                total_pos_cheng: Some(4),
+            },
+            PortfolioMetrics {
+                today_pnl_pct: Some(0.2),
+                consecutive_stop_loss_n: None,
+                total_pos_cheng: Some(4),
+            },
+            PortfolioMetrics {
+                today_pnl_pct: Some(0.2),
+                consecutive_stop_loss_n: Some(0),
+                total_pos_cheng: None,
+            },
+        ] {
+            assert!(!metrics.is_complete());
+        }
+    }
+
+    #[test]
     fn missing_data_conservative_reduce_only() {
         let metrics = PortfolioMetrics::incomplete();
         let r = evaluate(&metrics, Some(AccountMode::Normal), &t());
@@ -460,5 +500,36 @@ mod tests {
             at_8_30
         ));
         assert!(!should_reset_at_8_30(None, at_8_30));
+    }
+
+    #[test]
+    fn incomplete_metrics_cannot_reset_frozen_at_8_30() {
+        let at_8_30 = NaiveTime::from_hms_opt(8, 30, 0).unwrap();
+        let metrics = PortfolioMetrics::incomplete();
+
+        assert_eq!(
+            previous_mode_for_evaluation(Some(AccountMode::Frozen), &metrics, at_8_30),
+            Some(AccountMode::Frozen)
+        );
+        assert_eq!(
+            evaluate(
+                &metrics,
+                previous_mode_for_evaluation(Some(AccountMode::Frozen), &metrics, at_8_30),
+                &t(),
+            )
+            .mode,
+            AccountMode::Frozen
+        );
+    }
+
+    #[test]
+    fn complete_metrics_can_reset_frozen_at_8_30() {
+        let at_8_30 = NaiveTime::from_hms_opt(8, 30, 0).unwrap();
+        let metrics = m(0.2, 0, 4);
+
+        assert_eq!(
+            previous_mode_for_evaluation(Some(AccountMode::Frozen), &metrics, at_8_30),
+            None
+        );
     }
 }
