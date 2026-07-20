@@ -102,18 +102,21 @@ pub struct AccountSnapshot {
 impl AccountSnapshot {
     /// AGENTS 2.4 / BR-103: account facts authorize actions for at most 30 seconds.
     pub fn validate_fresh_for_action(&self, now: DateTime<FixedOffset>) -> Result<(), String> {
-        let age_ms = now
-            .signed_duration_since(self.observed_at)
-            .num_milliseconds();
-        if age_ms < 0 {
-            return Err(format!(
-                "BR-103 account snapshot is from the future: age_ms={age_ms}"
-            ));
-        }
-        if age_ms > 30_000 {
-            return Err(format!(
-                "BR-103 account snapshot is stale: age_ms={age_ms} max_ms=30000"
-            ));
+        for (label, timestamp) in [
+            ("source capture", self.source_captured_at),
+            ("observation", self.observed_at),
+        ] {
+            let age_ms = now.signed_duration_since(timestamp).num_milliseconds();
+            if age_ms < 0 {
+                return Err(format!(
+                    "BR-103 account snapshot {label} is from the future: age_ms={age_ms}"
+                ));
+            }
+            if age_ms > 30_000 {
+                return Err(format!(
+                    "BR-103 account snapshot {label} is stale: age_ms={age_ms} max_ms=30000"
+                ));
+            }
         }
         Ok(())
     }
@@ -732,16 +735,23 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(saved
-            .validate_fresh_for_action(input.observed_at + Duration::seconds(30))
+            .validate_fresh_for_action(input.source_captured_at + Duration::seconds(30))
             .is_ok());
         assert!(saved
-            .validate_fresh_for_action(input.observed_at + Duration::milliseconds(30_001))
+            .validate_fresh_for_action(input.source_captured_at + Duration::milliseconds(30_001))
             .unwrap_err()
             .contains("stale"));
         assert!(saved
             .validate_fresh_for_action(input.observed_at - Duration::milliseconds(1))
             .unwrap_err()
             .contains("future"));
+
+        let mut old_source = saved.clone();
+        old_source.source_captured_at = input.source_captured_at - Duration::seconds(1);
+        let error = old_source
+            .validate_fresh_for_action(input.observed_at + Duration::seconds(29))
+            .expect_err("fresh observation must not hide a stale source capture");
+        assert!(error.contains("source capture") && error.contains("stale"));
     }
 
     #[test]

@@ -842,9 +842,32 @@ impl PushLevel {
 // 冷却统一收敛到 v14.2 L4 dispatcher ((kind, code) + PushKind::cooldown_secs 窗口).
 
 /// v69: 推送日志保存 — 把每条实际推送的内容按日期路径写到 data/push_log/
-///   - 路径: data/push_log/YYYY-MM-DD/HHMMSS_<随机>.md
+///   - 路径: data/push_log/YYYY-MM-DD/HHMMSS_<唯一审计后缀>.md
 ///   - 沙箱 V10_DRY_RUN_PUSH=1 也保存 (用户能查测试推送)
 ///   - 写失败显式返回，禁止在审计证据缺失时继续确认投递
+fn push_log_suffix_at(now: std::time::SystemTime) -> Result<String, String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    let nanos = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("push_log system clock is before UNIX epoch: {error}"))?
+        .as_nanos();
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    Ok(format!(
+        "{nanos:032x}_{:08x}_{sequence:016x}",
+        std::process::id()
+    ))
+}
+
+fn create_push_log_file(path: &std::path::Path) -> Result<std::fs::File, String> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| format!("push_log 不可覆盖创建失败 {}: {error}", path.display()))
+}
+
 fn save_push_log(text: &str) -> Result<std::path::PathBuf, String> {
     use std::io::Write;
     log::info!(
@@ -854,11 +877,7 @@ fn save_push_log(text: &str) -> Result<std::path::PathBuf, String> {
     let now = chrono::Local::now();
     let date_dir = now.format("%Y-%m-%d").to_string();
     let time_prefix = now.format("%H%M%S").to_string();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    let rand_suffix = format!("{:08x}", nanos);
+    let unique_suffix = push_log_suffix_at(std::time::SystemTime::now())?;
     let root = std::env::var("PUSH_LOG_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
@@ -871,9 +890,8 @@ fn save_push_log(text: &str) -> Result<std::path::PathBuf, String> {
     let dir = root.join(&date_dir);
     std::fs::create_dir_all(&dir)
         .map_err(|error| format!("push_log 目录创建失败 {}: {error}", dir.display()))?;
-    let path = dir.join(format!("{}_{}.md", time_prefix, &rand_suffix[..6]));
-    let mut file = std::fs::File::create(&path)
-        .map_err(|error| format!("push_log 创建文件失败 {}: {error}", path.display()))?;
+    let path = dir.join(format!("{time_prefix}_{unique_suffix}.md"));
+    let mut file = create_push_log_file(&path)?;
     file.write_all(text.as_bytes())
         .map_err(|error| format!("push_log 写入失败 {}: {error}", path.display()))?;
     file.sync_data()
@@ -2361,6 +2379,30 @@ pub async fn verify_daemon_auth(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn push_log_suffix_rejects_pre_epoch_clock_and_is_unique() {
+        let before_epoch = std::time::UNIX_EPOCH
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(push_log_suffix_at(before_epoch).is_err());
+
+        let instant = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        let first = push_log_suffix_at(instant).unwrap();
+        let second = push_log_suffix_at(instant).unwrap();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn push_log_artifact_creation_never_overwrites() {
+        let suffix = push_log_suffix_at(std::time::SystemTime::now()).unwrap();
+        let path = std::env::temp_dir().join(format!("TEST_CODE_push_log_{suffix}.md"));
+        let first = create_push_log_file(&path).expect("create first audit artifact");
+        drop(first);
+
+        assert!(create_push_log_file(&path).is_err());
+        std::fs::remove_file(path).expect("remove isolated audit fixture");
+    }
 
     /// PushKind::is_deprecated: 9 保留 + 4 降级 (grill Q2/Q6 修订)
     #[test]

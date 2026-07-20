@@ -4,7 +4,7 @@
 
 **Scope:** production `monitor` notification governance and Eastmoney announcement detail transport
 
-**Rules:** AGENTS 2.1, 2.2, 2.3, 2.4, 2.7, 2.8, 2.10; BR-105, BR-108, BR-113, BR-115, BR-116, BR-134
+**Rules:** AGENTS 2.1, 2.2, 2.3, 2.4, 2.7, 2.8, 2.10; BR-103, BR-105, BR-108, BR-113, BR-115, BR-116, BR-134
 
 ## 1. Observed failure
 
@@ -107,7 +107,8 @@ and evaluates it through the existing account-mode rule:
 
 A ledger row is not action-fresh account evidence, regardless of its date or database write time.
 Account assembly reads the immutable `real_account_snapshot`, applies its strict 30-second gate to
-the real observation timestamp, and requires explicit daily-PnL and position-ratio facts. Because
+both the real source-capture timestamp and the local observation timestamp, and requires explicit
+daily-PnL and position-ratio facts. An old source recorded just now therefore remains stale. Because
 the broker trade-sync watermark is not connected yet, the consecutive-loss fact remains missing
 and the complete metric batch is rejected. Historical account and ledger rows remain audit-only.
 
@@ -147,6 +148,11 @@ orchestrator does not call the clock or re-evaluate, so crossing the 08:31 bound
 less restrictive banner while retaining a persisted Frozen state. Persisted `pushed` accepts only
 `0` or `1`; any other value is corrupt and aborts the transition.
 
+Every attempted delivery writes its Markdown audit artifact before the external sink is called.
+The artifact identifier uses a fallible full-resolution UNIX timestamp plus process-local sequence,
+and the file is opened with create-new semantics. A pre-epoch clock or path collision is an explicit
+audit failure that blocks delivery; an existing artifact is never overwritten.
+
 ### 3.3 Strict current announcement detail protocol
 
 Production keeps the existing announcement list endpoint and switches only required detail calls
@@ -185,10 +191,13 @@ current detail endpoint ─> strict identity/content validation ─> complete ba
 
 - Account data remains unavailable: send/retain conservative status, reject paper/trading work,
   do not apply the 08:30 Frozen reset, and retry real account assembly on the existing schedule.
-- The real-account snapshot is missing, has absent account facts, is future-dated, or is older
-  than 30 seconds: keep account metrics incomplete. A ledger date or database write timestamp is
-  not broker source evidence. Until a same-batch real trade-sync watermark is connected, the
-  consecutive-loss fact also remains incomplete and the conservative AccountMode alert retries.
+- The real-account snapshot is missing, has absent account facts, has a future capture/observation
+  timestamp, or either timestamp is older than 30 seconds: keep account metrics incomplete. A
+  ledger date or database write timestamp is not broker source evidence. Until a same-batch real
+  trade-sync watermark is connected, the consecutive-loss fact also remains incomplete and the
+  conservative AccountMode alert retries.
+- Push-audit clock or create-new failure: block the external sink and retain the unconfirmed mode
+  state for retry; never substitute epoch zero or overwrite an earlier artifact.
 - DataMode notification fails: do not commit the new latest-notified mode; keep explicit failure
   and retry according to BR-116.
 - AccountMode notification fails: retain and reuse the existing `pushed=0` audit row; do not

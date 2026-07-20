@@ -52,7 +52,7 @@
 - `src/data_provider/announcement.rs`: current official detail endpoint and strict response parser.
 - `tests/monitor_help_isolation.rs`: process-level fail-closed assertion follows the new explicit
   AccountMode startup boundary after the banner bootstrap repair.
-- `docs/business_rules.md`: BR-105/108/113/116 registration (completed before code).
+- `docs/business_rules.md`: BR-103/105/108/113/116 registration (completed before code).
 - `docs/superpowers/specs/2026-07-20-monitor-notification-liveness-design.md`: Gate A design.
 
 ### Task 1: Represent missing account facts without numeric sentinels
