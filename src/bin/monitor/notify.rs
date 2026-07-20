@@ -1454,6 +1454,10 @@ pub async fn push_feishu_via_http(text: &str) -> bool {
         }
     };
 
+    push_feishu_http_with_client(&client, &url, text).await
+}
+
+async fn push_feishu_http_with_client(client: &reqwest::Client, url: &str, text: &str) -> bool {
     let payload = serde_json::json!({
         "msg_type": "text",
         "content": {
@@ -1461,7 +1465,7 @@ pub async fn push_feishu_via_http(text: &str) -> bool {
         }
     });
 
-    let resp = match client.post(&url).json(&payload).send().await {
+    let resp = match client.post(url).json(&payload).send().await {
         Ok(v) => v,
         Err(e) => {
             log::error!("[飞书] 推送失败: 调用 webhook 失败: {}", e);

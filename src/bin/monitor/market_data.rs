@@ -425,7 +425,6 @@ pub fn fetch_market_volume_ratio_leaders(
 pub fn fetch_sina_quotes(
     codes: &[String],
 ) -> Result<Vec<stock_analysis::market_data::TopStock>, String> {
-    use stock_analysis::market_data::TopStock;
     // 新浪 A 股符号映射：深交所 sz，上交所(6/5开头) sh
     let symbols: Vec<String> = codes
         .iter()
@@ -447,7 +446,27 @@ pub fn fetch_sina_quotes(
         Err(error) => return Err(format!("新浪行情 HTTP 客户端构建失败: {error}")),
     };
 
-    let text = match client.get(&url)
+    fetch_sina_quotes_with_client(&client, codes, &url)
+}
+
+fn fetch_sina_quotes_with_client(
+    client: &reqwest::blocking::Client,
+    codes: &[String],
+    url: &str,
+) -> Result<Vec<stock_analysis::market_data::TopStock>, String> {
+    use stock_analysis::market_data::TopStock;
+    let symbols: Vec<String> = codes
+        .iter()
+        .map(|code| {
+            if code.starts_with('6') || code.starts_with('5') {
+                format!("sh{code}")
+            } else {
+                format!("sz{code}")
+            }
+        })
+        .collect();
+
+    let text = match client.get(url)
         .header("User-Agent", "Mozilla/5.0")
         .header("Referer", "https://finance.sina.com.cn/")
         .send().and_then(|r| r.text()) // 新浪返回 GBK 文本，reqwest 自动解码
