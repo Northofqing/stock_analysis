@@ -27,19 +27,16 @@ use crate::push_l2::{DataMode, TemplateMetadata};
 const FROZEN_WARN_THROTTLE_SECS: u64 = 60;
 static LAST_FROZEN_WARN_TS: AtomicU64 = AtomicU64::new(0);
 
-/// 当前时间 (UNIX seconds). 测试可替换.
-#[cfg(not(test))]
-fn now_unix_secs() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+fn unix_secs_at(now: std::time::SystemTime) -> Result<u64, String> {
+    use std::time::UNIX_EPOCH;
+    now.duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_err(|error| format!("system clock is before UNIX epoch: {error}"))
 }
 
-#[cfg(test)]
-fn now_unix_secs() -> u64 {
-    0 // 测试场景用确定性 0; 节流 helper 走测试 helper 自己 mock
+/// Current UNIX seconds. Clock failures remain explicit to the caller.
+fn now_unix_secs() -> Result<u64, String> {
+    unix_secs_at(std::time::SystemTime::now())
 }
 
 /// 节流打 Frozen warn: 距上次 ≥ 60s 才打, 否则 silent.
@@ -50,7 +47,13 @@ fn now_unix_secs() -> u64 {
 /// - 修 clock skew: 时钟回退时 saturating_sub 返 0 → 持续静默; 改用 max(now, last)
 ///   保证 timestamp 单调不减, 时钟回退后下次 warn 仍能 fire (但保持 60s 间隔).
 fn throttled_frozen_warn() {
-    let now = now_unix_secs();
+    let now = match now_unix_secs() {
+        Ok(now) => now,
+        Err(error) => {
+            log::error!("[v17.1-F8] Frozen warn throttle clock unavailable: {error}");
+            return;
+        }
+    };
     loop {
         let last = LAST_FROZEN_WARN_TS.load(Ordering::Relaxed);
         // monotonic timestamp: max(now, last) 保证不回退
@@ -499,14 +502,9 @@ mod tests {
 
     // ============== F8: Frozen warn 节流测试 ==============
     //
-    // 注: cfg(test) 下 now_unix_secs() 返回 0, 节流窗口 = [0, 60).
-    // 第一次 throttled_frozen_warn() → 0.saturating_sub(0)=0 < 60 → 静默 (不更新 last_ts).
-    // 第二次在窗口内 → 静默.
-    // reset_frozen_warn_throttle_for_test 不改语义, 仅给 multi-test 隔离用.
-
     #[test]
     fn throttled_frozen_warn_helper_callable() {
-        // 不 panic + 不 log error (cfg(test) 下 now_unix_secs=0 走节流路径).
+        // The real clock path is used; this test only verifies repeated calls are safe.
         reset_frozen_warn_throttle_for_test();
         throttled_frozen_warn();
         throttled_frozen_warn();
@@ -517,5 +515,13 @@ mod tests {
     fn frozen_warn_throttle_constant_in_range() {
         // 文档化窗口: 60s 一次. 防止后续修改默认值.
         assert_eq!(FROZEN_WARN_THROTTLE_SECS, 60);
+    }
+
+    #[test]
+    fn unix_clock_before_epoch_is_an_explicit_error() {
+        let before_epoch = std::time::UNIX_EPOCH
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(unix_secs_at(before_epoch).is_err());
     }
 }

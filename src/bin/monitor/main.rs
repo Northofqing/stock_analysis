@@ -1465,10 +1465,13 @@ async fn evaluate_account_mode_hook(startup: bool) -> bool {
         .account_mode
         .to_thresholds();
     let now_local = chrono::Local::now().time();
-    let prev_for_eval =
-        stock_analysis::risk::account_mode::previous_mode_for_evaluation(prev, &metrics, now_local);
-    let evaluated_mode =
-        stock_analysis::risk::account_mode::evaluate(&metrics, prev_for_eval, &thresholds).mode;
+    let evaluation = stock_analysis::risk::account_mode::evaluate_with_reset(
+        &metrics,
+        prev,
+        &thresholds,
+        now_local,
+    );
+    let evaluated_mode = evaluation.mode;
 
     if let Err(error) = refresh_banner_state_with_metrics(&metrics, evaluated_mode).await {
         log::error!("[AccountMode-hook] banner evaluation failed: {error}");
@@ -1496,6 +1499,7 @@ async fn evaluate_account_mode_hook(startup: bool) -> bool {
         prev,
         latest.as_ref(),
         Some(&banner),
+        &evaluation,
     )
     .await
     {
@@ -1541,50 +1545,52 @@ fn parse_mode_label(label: &str) -> Option<stock_analysis::risk::action_gate::Ac
 
 /// 同步版 metrics 装配 (供 spawn_blocking 调用).
 
-/// 数据源: ledger (今日盈亏) + positions (总仓位) + trades (连续止损).
+/// 数据源: real_account_snapshot + 同批券商成交同步水位.
 
 /// 失败 / 缺失 → 返回 data_complete=false 的 metrics (保守策略).
 
 fn compute_account_mode_metrics_blocking(
 ) -> Result<stock_analysis::risk::account_mode::PortfolioMetrics, String> {
-    use stock_analysis::risk::account_mode::PortfolioMetrics;
+    let observed_at = chrono::Local::now().fixed_offset();
+    let snapshot = stock_analysis::database::account_snapshot::latest_account_snapshot()
+        .map_err(|error| format!("BR-103 latest real account snapshot: {error}"))?
+        .ok_or_else(|| "BR-103 real account snapshot is missing".to_string())?;
+    snapshot.validate_fresh_for_action(observed_at)?;
 
-    // 1. ledger 今日盈亏
-
-    let today = chrono::Local::now().date_naive();
-    let equity_curve = stock_analysis::portfolio::get_equity_curve_as_of(1, today)
-        .map_err(|e| format!("get_equity_curve: {}", e))?;
-
-    let today_entry = equity_curve
-        .last()
-        .ok_or_else(|| "ledger 当地日净值缺失".to_string())?;
-    let today_pnl_pct = (today_entry.daily_pnl / today_entry.total_value) * 100.0;
-    if !today_pnl_pct.is_finite() {
-        return Err("ledger 当地日盈亏比例非有限值".to_string());
+    if snapshot.daily_pnl_status != "available" {
+        return Err(format!(
+            "BR-103 daily PnL is unavailable: status={}",
+            snapshot.daily_pnl_status
+        ));
     }
-    let total_value = today_entry.total_value;
-    let market_value = today_entry.market_value;
+    let daily_pnl = snapshot
+        .daily_pnl
+        .ok_or_else(|| "BR-103 daily PnL is missing".to_string())?;
+    let position_ratio_pct = snapshot
+        .position_ratio_pct
+        .ok_or_else(|| "BR-103 position ratio is missing".to_string())?;
+    if snapshot.total_assets <= 0.0 {
+        return Err("BR-103 total assets must be positive for account mode".to_string());
+    }
+    let today_pnl_pct = daily_pnl / snapshot.total_assets * 100.0;
+    if !today_pnl_pct.is_finite() {
+        return Err("BR-103 daily PnL ratio is non-finite".to_string());
+    }
+    let _total_pos_cheng = (position_ratio_pct / 10.0).round().clamp(0.0, 10.0) as u8;
 
-    // 2. 总仓位 (market_value / total_value)
-
-    let total_pos_cheng = ((market_value / total_value) * 10.0)
-        .round()
-        .clamp(0.0, 10.0) as u8;
-
-    // 3. 连续止损笔数 (近 5 笔 sell 交易中, 累计亏损笔数)
-
-    let consecutive_stop_loss_n = count_consecutive_stop_losses_blocking()
-        .map_err(|e| format!("count_consecutive_stop_losses: {}", e))?;
-
-    Ok(PortfolioMetrics::complete(
-        today_pnl_pct,
-        consecutive_stop_loss_n,
-        total_pos_cheng,
-    ))
+    // A fresh account snapshot does not prove that the local trade ledger was
+    // synchronized in the same batch. Until the broker exposes that watermark,
+    // consecutive-stop-loss data must stay incomplete rather than being inferred
+    // from an arbitrarily old local `trades` table.
+    Err(
+        "BR-103 complete account metrics unavailable: real broker trade-sync watermark is not connected"
+            .to_string(),
+    )
 }
 
 /// 同步版连续止损计数: 取最近 5 笔 sell 交易, 倒序遇第一笔非止损即停.
 
+#[cfg(test)]
 fn count_consecutive_realized_losses(
     realized: &[(chrono::NaiveDateTime, String, f64)],
 ) -> Result<u32, String> {
@@ -1614,23 +1620,6 @@ fn count_consecutive_realized_losses(
         .take_while(|(_, _, pnl)| *pnl < 0.0)
         .count();
     u32::try_from(count).map_err(|error| format!("连续止损计数溢出: {error}"))
-}
-
-fn count_consecutive_stop_losses_blocking() -> Result<u32, String> {
-    let trades = stock_analysis::portfolio::get_trade_history(36_500)
-        .map_err(|e| format!("get_trade_history: {}", e))?;
-    let reviews = stock_analysis::review::journal::review_closed_trades(&trades)?;
-    let realized: Vec<_> = reviews
-        .iter()
-        .map(|review| {
-            (
-                review.sell_datetime,
-                review.sell_trade_id.clone(),
-                (review.sell_price - review.buy_price) * review.shares as f64,
-            )
-        })
-        .collect();
-    count_consecutive_realized_losses(&realized)
 }
 
 #[cfg(test)]

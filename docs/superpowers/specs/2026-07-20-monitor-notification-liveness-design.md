@@ -105,6 +105,12 @@ and evaluates it through the existing account-mode rule:
 - otherwise incomplete account data yields `ReduceOnly`;
 - no missing number is persisted or rendered as zero.
 
+A ledger row is not action-fresh account evidence, regardless of its date or database write time.
+Account assembly reads the immutable `real_account_snapshot`, applies its strict 30-second gate to
+the real observation timestamp, and requires explicit daily-PnL and position-ratio facts. Because
+the broker trade-sync watermark is not connected yet, the consecutive-loss fact remains missing
+and the complete metric batch is rejected. Historical account and ledger rows remain audit-only.
+
 The account-mode audit writes SQL `NULL` for every missing metric and `data_complete=false`.
 The banner renders missing account fields as `缺失`, carries the real DataMode evaluation and an
 explicit all-three-account-facts completeness bit, and may govern notification delivery.
@@ -134,6 +140,12 @@ previous state so the next evaluation retries. An
 unpushed `account_mode_log` row is reused for retry instead of being treated as a delivered state
 or duplicated on every loop; only successful delivery plus successful `pushed=1` audit persistence
 confirms the transition. Audit update failure propagates as an error.
+
+AccountMode uses one `ModeEvaluation` produced from one local-time snapshot. The same result builds
+the banner and is passed unchanged into audit planning, persistence, rendering, and dispatch. The
+orchestrator does not call the clock or re-evaluate, so crossing the 08:31 boundary cannot publish a
+less restrictive banner while retaining a persisted Frozen state. Persisted `pushed` accepts only
+`0` or `1`; any other value is corrupt and aborts the transition.
 
 ### 3.3 Strict current announcement detail protocol
 
@@ -173,6 +185,10 @@ current detail endpoint ─> strict identity/content validation ─> complete ba
 
 - Account data remains unavailable: send/retain conservative status, reject paper/trading work,
   do not apply the 08:30 Frozen reset, and retry real account assembly on the existing schedule.
+- The real-account snapshot is missing, has absent account facts, is future-dated, or is older
+  than 30 seconds: keep account metrics incomplete. A ledger date or database write timestamp is
+  not broker source evidence. Until a same-batch real trade-sync watermark is connected, the
+  consecutive-loss fact also remains incomplete and the conservative AccountMode alert retries.
 - DataMode notification fails: do not commit the new latest-notified mode; keep explicit failure
   and retry according to BR-116.
 - AccountMode notification fails: retain and reuse the existing `pushed=0` audit row; do not

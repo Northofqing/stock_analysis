@@ -45,6 +45,8 @@
 - `src/risk/account_mode.rs`: truthful optional account metric model and conservative evaluation.
 - `src/bin/monitor/push_templates.rs`: optional banner rendering, fallible paper context, and mode-notification result contracts.
 - `src/bin/monitor/main.rs`: assemble explicit incomplete state, retry mode notifications, and keep paper work fail-closed.
+- `src/database/account_snapshot.rs`: reuse immutable real-account capture/observation timestamps as the only eligible account freshness evidence.
+- `src/push_l5/governance.rs`: keep clock failures explicit instead of substituting epoch zero.
 - `src/bin/monitor/v14_adapter.rs`: correct DataMode event payload/profile and AccountMode status eligibility.
 - `src/database/account_mode_log.rs`: reuse the existing immutable pending audit row through its public row contract.
 - `src/data_provider/announcement.rs`: current official detail endpoint and strict response parser.
@@ -129,6 +131,7 @@ fn incomplete_banner_renders_missing_account_facts() {
         account_mode: AccountMode::ReduceOnly,
         total_pos: None,
         today_pnl: None,
+        account_metrics_complete: false,
         data_mode: DataMode::Unsafe,
         data_missing_note: Some("账户指标缺失".to_string()),
     };
@@ -173,6 +176,17 @@ Return `Result<PaperRiskContext, String>` from `paper_risk_context_from_banner`;
 Build complete banners with `Some(...)` and `account_metrics_complete=true`; incomplete or partial
 banners retain each real `Some(...)` fact but set `account_metrics_complete=false`. Account-mode
 audit arguments use the metric options directly and set `data_complete=metrics.is_complete()`.
+
+Use a single `ModeEvaluation`, created with one `Local::now().time()` sample, for banner assembly,
+audit planning, persistence, rendering, and delivery. `push_account_mode_change` accepts that
+evaluation and must not sample the clock or call `evaluate` again. Add an 08:30:59 deterministic
+test proving persisted mode, banner mode, and paper context agree. Validate persisted `pushed`
+strictly as `0` or `1`; reject all other values.
+
+Load only `real_account_snapshot` as account freshness evidence and apply its exact 30-second gate.
+Require explicit available daily PnL and position ratio. Do not treat ledger date/write time as a
+broker timestamp. Until a same-batch broker trade-sync watermark exists, reject complete metrics
+and keep the conservative state notification path active.
 
 - [ ] **Step 7: Run focused GREEN and commit**
 

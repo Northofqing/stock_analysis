@@ -113,7 +113,7 @@ fn fresh_test_database_starts_without_lock_errors() {
     assert_eq!(
         output.status.code(),
         Some(2),
-        "missing same-day real ledger must fail closed; output={combined_output}"
+        "missing fresh real account evidence must fail closed; output={combined_output}"
     );
     assert!(
         !combined_output.contains("database is locked"),
@@ -121,8 +121,10 @@ fn fresh_test_database_starts_without_lock_errors() {
     );
     assert!(
         combined_output.contains("[AccountMode-hook][BR-108]")
-            && combined_output.contains("ledger 当日净值缺失"),
-        "fresh database must reach the expected same-day ledger boundary; output={combined_output}"
+            && combined_output.contains("BR-103 real account snapshot is missing")
+            && combined_output.contains("event_type=push.delivery.audit")
+            && combined_output.contains("kind=account_mode_v1 outcome=Pushed"),
+        "fresh database must emit an audited conservative account alert; output={combined_output}"
     );
 
     std::fs::remove_dir_all(&root).expect("remove isolated working directory");

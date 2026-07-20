@@ -235,6 +235,23 @@ pub fn previous_mode_for_evaluation(
     }
 }
 
+/// Evaluate AccountMode from one caller-owned clock snapshot.
+///
+/// The returned value must be reused for banner publication, persistence, and
+/// delivery so the 08:30 reset boundary cannot be sampled twice.
+pub fn evaluate_with_reset(
+    metrics: &PortfolioMetrics,
+    prev: Option<AccountMode>,
+    thresholds: &ModeThresholds,
+    now_local: NaiveTime,
+) -> ModeEvaluation {
+    evaluate(
+        metrics,
+        previous_mode_for_evaluation(prev, metrics, now_local),
+        thresholds,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,5 +548,20 @@ mod tests {
             previous_mode_for_evaluation(Some(AccountMode::Frozen), &metrics, at_8_30),
             None
         );
+    }
+
+    #[test]
+    fn one_evaluation_snapshot_controls_the_reset_boundary() {
+        let metrics = m(0.2, 0, 4);
+        let before_end = NaiveTime::from_hms_opt(8, 30, 59).unwrap();
+        let at_end = NaiveTime::from_hms_opt(8, 31, 0).unwrap();
+
+        let reset = evaluate_with_reset(&metrics, Some(AccountMode::Frozen), &t(), before_end);
+        let retained = evaluate_with_reset(&metrics, Some(AccountMode::Frozen), &t(), at_end);
+
+        assert_eq!(reset.prev_mode, None);
+        assert_eq!(reset.mode, AccountMode::Normal);
+        assert_eq!(retained.prev_mode, Some(AccountMode::Frozen));
+        assert_eq!(retained.mode, AccountMode::Frozen);
     }
 }

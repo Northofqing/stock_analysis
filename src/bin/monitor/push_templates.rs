@@ -1597,7 +1597,13 @@ fn plan_account_mode_notification(
     if row.pushed == 0 {
         return Ok(AccountModeNotificationPlan::ReusePending(i64::from(row.id)));
     }
-    Ok(AccountModeNotificationPlan::NoChange)
+    if row.pushed == 1 {
+        return Ok(AccountModeNotificationPlan::NoChange);
+    }
+    Err(format!(
+        "invalid persisted AccountMode pushed flag: {}",
+        row.pushed
+    ))
 }
 
 /// v12 PR1-1.6: 模式变更编排器.
@@ -1615,34 +1621,31 @@ pub async fn push_account_mode_change(
     prev: Option<stock_analysis::risk::action_gate::AccountMode>,
     latest: Option<&stock_analysis::database::account_mode_log::AccountModeLogRow>,
     banner: Option<&BannerCtx>,
+    evaluation: &stock_analysis::risk::account_mode::ModeEvaluation,
 ) -> Result<AccountModeDispatchResult, String> {
-    use stock_analysis::config::get_risk_config;
-    use stock_analysis::risk::account_mode::{evaluate, ModeThresholds};
     use stock_analysis::risk::action_gate::AccountMode as LibAM;
 
-    let thresholds: ModeThresholds = get_risk_config().account_mode.to_thresholds();
     if let Some(row) = latest {
         let persisted = account_mode_from_label(&row.new_mode)?;
         if Some(persisted) != prev {
             return Err("persisted AccountMode row does not match previous mode".to_string());
         }
     }
-    // BR-021 caller wire: 8:30 盘前重置信号 (commit 08cca47 helper + 当前 commit 集成).
-    // 当 prev=Frozen 且当前时间落在 8:30 窗口 → 强制 prev=None 让 evaluate 基于 metrics
-    // 重判, Frozen 自动落到 Normal (或仍 Frozen 如 metrics 仍超限, 都由 evaluate 决定).
-    // 注意: 此分支不修改 prev_for_eval 的 type, 仅在 should_reset=true 时把 Option 转 None.
-    let now_local = chrono::Local::now().time();
-    let prev_for_eval =
-        stock_analysis::risk::account_mode::previous_mode_for_evaluation(prev, metrics, now_local);
-    if prev_for_eval.is_none() && prev.is_some() {
-        log::warn!("[BR-021] 8:30 盘前重置信号命中: prev=Frozen → 强制 prev=None 让 evaluate 重判");
+    let evaluation_prev_is_valid = evaluation.prev_mode == prev
+        || (metrics.is_complete()
+            && matches!(prev, Some(LibAM::Frozen))
+            && evaluation.prev_mode.is_none());
+    if !evaluation_prev_is_valid {
+        return Err("AccountMode evaluation does not match persisted previous mode".to_string());
     }
-    let eval = evaluate(metrics, prev_for_eval, &thresholds);
+    if evaluation.prev_mode.is_none() && prev.is_some() {
+        log::warn!("[BR-021][BR-116] single-snapshot 8:30 reset evaluation applied");
+    }
 
     let is_initial_evaluation = prev.is_none() && latest.is_none();
     let notification_plan = if latest.is_some() {
-        plan_account_mode_notification(latest, eval.mode)?
-    } else if prev.is_none() || eval.is_changed() {
+        plan_account_mode_notification(latest, evaluation.mode)?
+    } else if prev.is_none() || evaluation.is_changed() {
         AccountModeNotificationPlan::Insert
     } else {
         AccountModeNotificationPlan::NoChange
@@ -1662,7 +1665,7 @@ pub async fn push_account_mode_change(
                 account_mode_from_label(&row.new_mode)?,
             )
         }
-        _ => (prev.unwrap_or(eval.mode), eval.mode),
+        _ => (prev.unwrap_or(evaluation.mode), evaluation.mode),
     };
 
     let default_reason = if is_initial_evaluation {
@@ -1672,7 +1675,10 @@ pub async fn push_account_mode_change(
     };
     let (log_id, transition_reason, is_new_transition) = match notification_plan {
         AccountModeNotificationPlan::Insert => {
-            let reason = eval.trigger_reason.as_deref().unwrap_or(default_reason);
+            let reason = evaluation
+                .trigger_reason
+                .as_deref()
+                .unwrap_or(default_reason);
             let log_id = stock_analysis::database::account_mode_log::insert_account_mode_change(
                 prev_mode,
                 new_mode,
@@ -1737,7 +1743,10 @@ pub async fn push_account_mode_change(
     // 3a. Frozen transition: also emit one MarketActionAlert (NOT for initial eval, NOT for unchanged)
     if is_new_transition && !is_initial_evaluation && new_mode == LibAM::Frozen {
         use stock_analysis::news::aggregator::{NormalizedSourceEvent, SourcePushKind};
-        let trigger = eval.trigger_reason.as_deref().unwrap_or("account frozen");
+        let trigger = evaluation
+            .trigger_reason
+            .as_deref()
+            .unwrap_or("account frozen");
         let event_id = format!("frozen:{:?}:{:?}", prev_mode, new_mode);
         let title = format!("账户冻结: {}", trigger);
         let summary = format!("trigger={}", trigger);
@@ -2041,14 +2050,18 @@ pub fn log_dispatcher_attempt(kind: &str, success: bool, snapshot_size: usize, e
     // v61 (F15): date-guard 避免每调都跑 read_dir + stat (每次 push 触发)
     //   - 旧: 每次调都跑 rotate_dispatcher_logs (read_dir + metadata + mtime × N files)
     //   - 新: 仅在日期变更时跑一次 (用 static AtomicU64 记上次轮转的日期)
-    if should_rotate_dispatcher_log_today() {
-        if let Err(error) = rotate_dispatcher_logs(&dir, 1_827) {
-            log::error!(
-                "[dispatcher_log] retention 失败 dir={} error={}",
-                dir.display(),
-                error
-            );
+    match should_rotate_dispatcher_log_today() {
+        Ok(true) => {
+            if let Err(error) = rotate_dispatcher_logs(&dir, 1_827) {
+                log::error!(
+                    "[dispatcher_log] retention 失败 dir={} error={}",
+                    dir.display(),
+                    error
+                );
+            }
         }
+        Ok(false) => {}
+        Err(error) => log::error!("[dispatcher_log] date guard failed: {error}"),
     }
 
     if let Err(error) = write_dispatcher_attempt(&dir, kind, success, snapshot_size, error) {
@@ -2092,17 +2105,20 @@ fn write_dispatcher_attempt(
 /// v61 (F15): date-guard — 返回今天是否还需要轮转
 ///   - 用 static AtomicU64 记上次轮转的日期 (YYYYMMDD as u64)
 ///   - 同一天多次 push 只跑 1 次 rotate (vs 之前每次都跑)
-fn should_rotate_dispatcher_log_today() -> bool {
+fn should_rotate_dispatcher_log_today() -> Result<bool, String> {
+    use chrono::Datelike;
     use std::sync::atomic::{AtomicU64, Ordering};
     static LAST_ROTATE: AtomicU64 = AtomicU64::new(0);
     let now = chrono::Local::now();
-    let today: u64 = now.format("%Y%m%d").to_string().parse().unwrap_or(0);
+    let year = u64::try_from(now.year())
+        .map_err(|_| format!("local calendar year is negative: {}", now.year()))?;
+    let today = year * 10_000 + u64::from(now.month()) * 100 + u64::from(now.day());
     let prev = LAST_ROTATE.load(Ordering::Relaxed);
     if prev == today {
-        false
+        Ok(false)
     } else {
         LAST_ROTATE.store(today, Ordering::Relaxed);
-        true
+        Ok(true)
     }
 }
 
@@ -10860,6 +10876,20 @@ mod tests {
         }
     }
 
+    fn account_evaluation_for_test(
+        metrics: &stock_analysis::risk::account_mode::PortfolioMetrics,
+        prev: Option<stock_analysis::risk::action_gate::AccountMode>,
+    ) -> stock_analysis::risk::account_mode::ModeEvaluation {
+        stock_analysis::risk::account_mode::evaluate_with_reset(
+            metrics,
+            prev,
+            &stock_analysis::config::get_risk_config()
+                .account_mode
+                .to_thresholds(),
+            chrono::Local::now().time(),
+        )
+    }
+
     #[test]
     fn br116_failed_account_notification_reuses_pending_audit_row() {
         use stock_analysis::database::account_mode_log::AccountModeLogRow;
@@ -10883,6 +10913,29 @@ mod tests {
             plan_account_mode_notification(Some(&pending), LibAM::ReduceOnly).unwrap(),
             AccountModeNotificationPlan::ReusePending(41)
         );
+    }
+
+    #[test]
+    fn br116_invalid_pushed_flag_is_rejected() {
+        use stock_analysis::database::account_mode_log::AccountModeLogRow;
+        use stock_analysis::risk::action_gate::AccountMode as LibAM;
+
+        for pushed in [-1, 2] {
+            let row = AccountModeLogRow {
+                id: 42,
+                ts: "2026-07-20 09:30:00".to_string(),
+                prev_mode: "Normal".to_string(),
+                new_mode: "ReduceOnly".to_string(),
+                trigger_reason: "TEST_CODE pending".to_string(),
+                today_pnl_pct: None,
+                consecutive_n: None,
+                total_pos_cheng: None,
+                data_complete: 0,
+                pushed,
+                push_attempted_at: None,
+            };
+            assert!(plan_account_mode_notification(Some(&row), LibAM::ReduceOnly).is_err());
+        }
     }
 
     #[test]
@@ -10992,11 +11045,14 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(banner.clone());
 
+        let metrics = PortfolioMetrics::incomplete();
+        let evaluation = account_evaluation_for_test(&metrics, Some(LibAM::ReduceOnly));
         let pushed = push_account_mode_change(
-            &PortfolioMetrics::incomplete(),
+            &metrics,
             Some(LibAM::ReduceOnly),
             Some(&pending),
             Some(&banner),
+            &evaluation,
         )
         .await
         .expect("retry pending notification");
@@ -11009,6 +11065,77 @@ mod tests {
             "retry must retain the original row ID"
         );
         assert_eq!(rows[0].pushed, 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
+    async fn br116_single_reset_evaluation_controls_persistence_and_banner() {
+        let _e2e_guard = E2E_MUTEX.lock().await;
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
+        init_test_db();
+        reset_daily_budget_for_test();
+
+        use stock_analysis::database::account_mode_log;
+        use stock_analysis::risk::account_mode::{
+            evaluate_with_reset, ModeThresholds, PortfolioMetrics,
+        };
+        use stock_analysis::risk::action_gate::AccountMode as LibAM;
+
+        let previous_id = account_mode_log::insert_account_mode_change(
+            LibAM::Frozen,
+            LibAM::Frozen,
+            "TEST_CODE prior frozen",
+            Some(-2.1),
+            Some(3),
+            Some(8),
+            true,
+        )
+        .expect("seed prior Frozen state");
+        account_mode_log::mark_account_mode_pushed(previous_id)
+            .expect("confirm prior Frozen state");
+        let previous = account_mode_log::latest_account_mode_change()
+            .expect("read prior state")
+            .expect("prior state exists");
+
+        let metrics = PortfolioMetrics::complete(0.2, 0, 4);
+        let evaluation = evaluate_with_reset(
+            &metrics,
+            Some(LibAM::Frozen),
+            &ModeThresholds::default(),
+            chrono::NaiveTime::from_hms_opt(8, 30, 59).unwrap(),
+        );
+        assert_eq!(evaluation.mode, LibAM::Normal);
+        let banner = BannerCtx {
+            account_mode: AccountMode::Normal,
+            total_pos: Some(4),
+            today_pnl: Some(0.2),
+            account_metrics_complete: true,
+            data_mode: DataMode::Full,
+            data_missing_note: None,
+        };
+        *crate::LATEST_BANNER
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(banner.clone());
+
+        let result = push_account_mode_change(
+            &metrics,
+            Some(LibAM::Frozen),
+            Some(&previous),
+            Some(&banner),
+            &evaluation,
+        )
+        .await
+        .expect("single reset evaluation must orchestrate");
+
+        assert!(result.is_confirmed());
+        let latest = account_mode_log::latest_account_mode_change()
+            .expect("read reset state")
+            .expect("reset state exists");
+        assert_eq!(latest.prev_mode, "Frozen");
+        assert_eq!(latest.new_mode, "Normal");
+        assert_eq!(latest.pushed, 1);
+        let context = paper_risk_context_from_banner(&banner).expect("complete banner context");
+        assert_eq!(context.account_mode, LibAM::Normal);
     }
 
     /// T-01 E2E: Normal → ReduceOnly. 验证 DB 写 + 推送路径
@@ -11025,12 +11152,14 @@ mod tests {
         use stock_analysis::risk::action_gate::AccountMode as LibAM;
 
         let metrics = PortfolioMetrics::complete(-1.6, 0, 5);
+        let evaluation = account_evaluation_for_test(&metrics, Some(LibAM::Normal));
 
         let result = push_account_mode_change(
             &metrics,
             Some(LibAM::Normal),
             None,
             Some(&banner_normal_full()),
+            &evaluation,
         )
         .await;
 
@@ -11076,12 +11205,14 @@ mod tests {
             .unwrap_or(0);
 
         let metrics = PortfolioMetrics::complete(-1.6, 0, 5);
+        let evaluation = account_evaluation_for_test(&metrics, Some(LibAM::ReduceOnly));
         // prev 已是 ReduceOnly, metrics 不变 → is_changed=false
         let result = push_account_mode_change(
             &metrics,
             Some(LibAM::ReduceOnly),
             None,
             Some(&banner_normal_full()),
+            &evaluation,
         )
         .await;
         assert!(result.is_ok());
@@ -11107,10 +11238,17 @@ mod tests {
         use stock_analysis::risk::account_mode::PortfolioMetrics;
 
         let metrics = PortfolioMetrics::complete(0.2, 0, 4);
+        let evaluation = account_evaluation_for_test(&metrics, None);
 
-        let pushed = push_account_mode_change(&metrics, None, None, Some(&banner_normal_full()))
-            .await
-            .expect("initial evaluation must be orchestrated");
+        let pushed = push_account_mode_change(
+            &metrics,
+            None,
+            None,
+            Some(&banner_normal_full()),
+            &evaluation,
+        )
+        .await
+        .expect("initial evaluation must be orchestrated");
         assert!(
             pushed.is_confirmed(),
             "dry-run initial evaluation should dispatch"
@@ -11138,12 +11276,14 @@ mod tests {
         use stock_analysis::risk::action_gate::AccountMode as LibAM;
 
         let metrics = PortfolioMetrics::complete(-2.5, 5, 9); // 超过 -2.0% 熔断线
+        let evaluation = account_evaluation_for_test(&metrics, Some(LibAM::ReduceOnly));
 
         let result = push_account_mode_change(
             &metrics,
             Some(LibAM::ReduceOnly),
             None,
             Some(&banner_normal_full()),
+            &evaluation,
         )
         .await;
         assert!(result.is_ok());
@@ -11170,12 +11310,14 @@ mod tests {
         use stock_analysis::risk::action_gate::AccountMode as LibAM;
 
         let metrics = PortfolioMetrics::incomplete();
+        let evaluation = account_evaluation_for_test(&metrics, Some(LibAM::Normal));
 
         let result = push_account_mode_change(
             &metrics,
             Some(LibAM::Normal),
             None,
             Some(&banner_normal_full()),
+            &evaluation,
         )
         .await;
         assert!(result.is_ok());
@@ -11252,7 +11394,7 @@ mod tests {
     }
 
     #[test]
-    fn initial_unsafe_data_mode_requires_a_status_delivery() {
+    fn initial_unsafe_data_mode_requires_a_status_delivery_plan() {
         use stock_analysis::monitor::data_mode::{DataHealthInput, DataMode as LibDM};
 
         let plan = data_mode_notification_plan(&DataHealthInput::default(), None);
@@ -11263,6 +11405,40 @@ mod tests {
                 current: LibDM::Unsafe
             }
         ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
+    async fn initial_unsafe_data_mode_is_actually_delivered() {
+        let _e2e_guard = E2E_MUTEX.lock().await;
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
+        init_test_db();
+        reset_daily_budget_for_test();
+        crate::v14_adapter::_reset_dedup_for_test();
+
+        use stock_analysis::monitor::data_mode::DataHealthInput;
+
+        let input = DataHealthInput::default();
+        let banner = BannerCtx {
+            account_mode: AccountMode::ReduceOnly,
+            total_pos: None,
+            today_pnl: None,
+            account_metrics_complete: false,
+            data_mode: DataMode::Unsafe,
+            data_missing_note: Some("Quote/Kline/MoneyFlow/News/OrderBook".to_string()),
+        };
+        *crate::LATEST_BANNER
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(banner.clone());
+
+        let result = push_data_mode_change(&input, None, Some(&banner))
+            .await
+            .expect("initial Unsafe mode must use the governed status path");
+
+        assert_eq!(
+            result,
+            ModeDispatchResult::Delivery(crate::notify::PushOutcome::Pushed)
+        );
     }
 
     #[test]
