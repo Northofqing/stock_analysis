@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// v12 §2.4 数据能力枚举
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -75,6 +75,40 @@ impl DataMode {
             DataMode::Degraded => "Degraded",
             DataMode::Unsafe => "Unsafe",
         }
+    }
+}
+
+/// BR-135: a confirmed persistent-Unsafe reminder remains quiet for 30 minutes.
+pub const PERSISTENT_UNSAFE_REMINDER_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
+/// Tracks only authoritative DataMode delivery confirmation.
+///
+/// The caller supplies the monotonic clock and records a result only after the
+/// real sink and every mandatory audit have succeeded.
+#[derive(Debug, Default)]
+pub struct PersistentUnsafeReminder {
+    last_confirmed_at: Option<Instant>,
+}
+
+impl PersistentUnsafeReminder {
+    pub fn should_dispatch(&self, mode: DataMode, now: Instant) -> Result<bool, String> {
+        if mode != DataMode::Unsafe {
+            return Ok(false);
+        }
+        let Some(last_confirmed_at) = self.last_confirmed_at else {
+            return Ok(true);
+        };
+        let elapsed = now
+            .checked_duration_since(last_confirmed_at)
+            .ok_or_else(|| {
+                "BR-135 monotonic reminder clock moved backwards; reminder state unchanged"
+                    .to_string()
+            })?;
+        Ok(elapsed >= PERSISTENT_UNSAFE_REMINDER_INTERVAL)
+    }
+
+    pub fn record_confirmed(&mut self, mode: DataMode, now: Instant) {
+        self.last_confirmed_at = (mode == DataMode::Unsafe).then_some(now);
     }
 }
 
@@ -449,6 +483,39 @@ mod tests {
         assert_eq!(DataMode::Full.label(), "Full");
         assert_eq!(DataMode::Degraded.label(), "Degraded");
         assert_eq!(DataMode::Unsafe.label(), "Unsafe");
+    }
+
+    #[test]
+    fn br135_persistent_unsafe_reminder_is_due_only_after_confirmed_interval() {
+        let start = Instant::now();
+        let mut state = PersistentUnsafeReminder::default();
+
+        assert!(state.should_dispatch(DataMode::Unsafe, start).unwrap());
+        state.record_confirmed(DataMode::Unsafe, start);
+
+        assert!(!state
+            .should_dispatch(
+                DataMode::Unsafe,
+                start + std::time::Duration::from_secs(1_799),
+            )
+            .unwrap());
+        assert!(state
+            .should_dispatch(
+                DataMode::Unsafe,
+                start + std::time::Duration::from_secs(1_800),
+            )
+            .unwrap());
+
+        state.record_confirmed(
+            DataMode::Full,
+            start + std::time::Duration::from_secs(1_801),
+        );
+        assert!(!state
+            .should_dispatch(
+                DataMode::Full,
+                start + std::time::Duration::from_secs(3_600),
+            )
+            .unwrap());
     }
 
     // ---- 输入辅助 ----
