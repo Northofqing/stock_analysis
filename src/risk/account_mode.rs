@@ -35,13 +35,31 @@ pub mod thresholds {
 #[derive(Clone, Debug, Default)]
 pub struct PortfolioMetrics {
     /// 当日累计盈亏百分比 (带符号). 例: -1.2 表示 -1.2%
-    pub today_pnl_pct: f64,
+    pub today_pnl_pct: Option<f64>,
     /// 连续止损笔数 (按交易时间倒序数, 遇非止损交易重置)
-    pub consecutive_stop_loss_n: u32,
+    pub consecutive_stop_loss_n: Option<u32>,
     /// 总仓位成数 (0~10). 例: 5 表示 5 成 (50%)
-    pub total_pos_cheng: u8,
-    /// 数据完整度 (true = 三个指标均非 None)
-    pub data_complete: bool,
+    pub total_pos_cheng: Option<u8>,
+}
+
+impl PortfolioMetrics {
+    pub fn complete(today_pnl_pct: f64, consecutive_stop_loss_n: u32, total_pos_cheng: u8) -> Self {
+        Self {
+            today_pnl_pct: Some(today_pnl_pct),
+            consecutive_stop_loss_n: Some(consecutive_stop_loss_n),
+            total_pos_cheng: Some(total_pos_cheng),
+        }
+    }
+
+    pub fn incomplete() -> Self {
+        Self::default()
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.today_pnl_pct.is_some()
+            && self.consecutive_stop_loss_n.is_some()
+            && self.total_pos_cheng.is_some()
+    }
 }
 
 /// 阈值配置 (允许 PR1-1.4 from_config 覆盖默认 const)
@@ -86,7 +104,7 @@ impl ModeEvaluation {
 /// BR-021 主评估函数
 ///
 /// 触发规则:
-///   1. 数据不完整 (data_complete=false) → 保守取 ReduceOnly, 原因 "数据缺失"
+///   1. 任一指标缺失 → 保守取 ReduceOnly, 原因 "数据缺失"
 ///   2. ReduceOnly 触发条件: today_pnl_pct ≤ daily_loss_pct **或** consecutive_stop_loss_n ≥ N
 ///   3. Frozen 触发条件 (任何状态下评估):
 ///      - today_pnl_pct ≤ circuit_breaker_pct
@@ -110,53 +128,57 @@ pub fn evaluate(
     }
 
     // 1. 数据缺失 → 保守 ReduceOnly (此时 prev 必非 Frozen, 已由 0 分支覆盖)
-    if !metrics.data_complete {
+    let (Some(today_pnl_pct), Some(consecutive_stop_loss_n), Some(total_pos_cheng)) = (
+        metrics.today_pnl_pct,
+        metrics.consecutive_stop_loss_n,
+        metrics.total_pos_cheng,
+    ) else {
         return ModeEvaluation {
             mode: AccountMode::ReduceOnly,
             trigger_reason: Some("数据缺失, 保守取 ReduceOnly (BR-021)".to_string()),
             prev_mode: prev,
         };
-    }
+    };
 
     // 2. Frozen 触发 (在 Normal/ReduceOnly/Frozen 上都评估, 触发后保持)
-    if metrics.today_pnl_pct <= thresholds.circuit_breaker_pct {
+    if today_pnl_pct <= thresholds.circuit_breaker_pct {
         return ModeEvaluation {
             mode: AccountMode::Frozen,
             trigger_reason: Some(format!(
                 "当日亏损 {:+.2}% 触发熔断线 {:+.2}%",
-                metrics.today_pnl_pct, thresholds.circuit_breaker_pct
+                today_pnl_pct, thresholds.circuit_breaker_pct
             )),
             prev_mode: prev,
         };
     }
-    if metrics.total_pos_cheng > thresholds.position_overload_cheng {
+    if total_pos_cheng > thresholds.position_overload_cheng {
         return ModeEvaluation {
             mode: AccountMode::Frozen,
             trigger_reason: Some(format!(
                 "总仓位 {} 成 超限 {} 成",
-                metrics.total_pos_cheng, thresholds.position_overload_cheng
+                total_pos_cheng, thresholds.position_overload_cheng
             )),
             prev_mode: prev,
         };
     }
 
     // 3. ReduceOnly 触发
-    if metrics.today_pnl_pct <= thresholds.daily_loss_pct {
+    if today_pnl_pct <= thresholds.daily_loss_pct {
         return ModeEvaluation {
             mode: AccountMode::ReduceOnly,
             trigger_reason: Some(format!(
                 "当日亏损 {:+.2}% 触发降级线 {:+.2}%",
-                metrics.today_pnl_pct, thresholds.daily_loss_pct
+                today_pnl_pct, thresholds.daily_loss_pct
             )),
             prev_mode: prev,
         };
     }
-    if metrics.consecutive_stop_loss_n >= thresholds.consecutive_stop_loss_n {
+    if consecutive_stop_loss_n >= thresholds.consecutive_stop_loss_n {
         return ModeEvaluation {
             mode: AccountMode::ReduceOnly,
             trigger_reason: Some(format!(
                 "连续止损 {} 笔 ≥ 阈值 {}",
-                metrics.consecutive_stop_loss_n, thresholds.consecutive_stop_loss_n
+                consecutive_stop_loss_n, thresholds.consecutive_stop_loss_n
             )),
             prev_mode: prev,
         };
@@ -196,17 +218,46 @@ pub fn should_reset_at_8_30(prev: Option<AccountMode>, now_local: NaiveTime) -> 
     matches!(prev, Some(AccountMode::Frozen))
 }
 
+/// Select the persisted mode used by the next evaluation.
+///
+/// BR-108 requires a complete same-batch account snapshot before the 08:30
+/// reset may clear a persisted `Frozen` state. Missing facts therefore keep
+/// the previous mode and remain fail-closed.
+pub fn previous_mode_for_evaluation(
+    prev: Option<AccountMode>,
+    metrics: &PortfolioMetrics,
+    now_local: NaiveTime,
+) -> Option<AccountMode> {
+    if metrics.is_complete() && should_reset_at_8_30(prev, now_local) {
+        None
+    } else {
+        prev
+    }
+}
+
+/// Evaluate AccountMode from one caller-owned clock snapshot.
+///
+/// The returned value must be reused for banner publication, persistence, and
+/// delivery so the 08:30 reset boundary cannot be sampled twice.
+pub fn evaluate_with_reset(
+    metrics: &PortfolioMetrics,
+    prev: Option<AccountMode>,
+    thresholds: &ModeThresholds,
+    now_local: NaiveTime,
+) -> ModeEvaluation {
+    evaluate(
+        metrics,
+        previous_mode_for_evaluation(prev, metrics, now_local),
+        thresholds,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn m(pnl: f64, consec: u32, pos: u8) -> PortfolioMetrics {
-        PortfolioMetrics {
-            today_pnl_pct: pnl,
-            consecutive_stop_loss_n: consec,
-            total_pos_cheng: pos,
-            data_complete: true,
-        }
+        PortfolioMetrics::complete(pnl, consec, pos)
     }
 
     fn t() -> ModeThresholds {
@@ -348,11 +399,46 @@ mod tests {
     // ---- 数据缺失 ----
 
     #[test]
+    fn incomplete_metrics_are_explicit_and_conservative() {
+        let metrics = PortfolioMetrics::incomplete();
+        assert!(!metrics.is_complete());
+        let result = evaluate(
+            &metrics,
+            Some(AccountMode::Normal),
+            &ModeThresholds::default(),
+        );
+        assert_eq!(result.mode, AccountMode::ReduceOnly);
+        assert_eq!(metrics.today_pnl_pct, None);
+        assert_eq!(metrics.consecutive_stop_loss_n, None);
+        assert_eq!(metrics.total_pos_cheng, None);
+    }
+
+    #[test]
+    fn every_single_missing_account_fact_is_incomplete() {
+        for metrics in [
+            PortfolioMetrics {
+                today_pnl_pct: None,
+                consecutive_stop_loss_n: Some(0),
+                total_pos_cheng: Some(4),
+            },
+            PortfolioMetrics {
+                today_pnl_pct: Some(0.2),
+                consecutive_stop_loss_n: None,
+                total_pos_cheng: Some(4),
+            },
+            PortfolioMetrics {
+                today_pnl_pct: Some(0.2),
+                consecutive_stop_loss_n: Some(0),
+                total_pos_cheng: None,
+            },
+        ] {
+            assert!(!metrics.is_complete());
+        }
+    }
+
+    #[test]
     fn missing_data_conservative_reduce_only() {
-        let metrics = PortfolioMetrics {
-            data_complete: false,
-            ..Default::default()
-        };
+        let metrics = PortfolioMetrics::incomplete();
         let r = evaluate(&metrics, Some(AccountMode::Normal), &t());
         assert_eq!(r.mode, AccountMode::ReduceOnly);
         assert!(r.trigger_reason.as_ref().unwrap().contains("数据缺失"));
@@ -363,10 +449,7 @@ mod tests {
         // 修复 (2026-07-05 BR-021 强制): 数据缺失 + prev=Frozen → 必须保持 Frozen.
         // BR-021 明确说"Frozen 必须等下一交易日盘前重置", 不运行时回退.
         // 旧实现走 ReduceOnly, 会污染审计 + 误开 RiskMode 降级.
-        let metrics = PortfolioMetrics {
-            data_complete: false,
-            ..Default::default()
-        };
+        let metrics = PortfolioMetrics::incomplete();
         let r = evaluate(&metrics, Some(AccountMode::Frozen), &t());
         assert_eq!(r.mode, AccountMode::Frozen, "Frozen 必须保持 (BR-021)");
         assert!(r.trigger_reason.as_ref().unwrap().contains("Frozen"));
@@ -434,5 +517,51 @@ mod tests {
             at_8_30
         ));
         assert!(!should_reset_at_8_30(None, at_8_30));
+    }
+
+    #[test]
+    fn incomplete_metrics_cannot_reset_frozen_at_8_30() {
+        let at_8_30 = NaiveTime::from_hms_opt(8, 30, 0).unwrap();
+        let metrics = PortfolioMetrics::incomplete();
+
+        assert_eq!(
+            previous_mode_for_evaluation(Some(AccountMode::Frozen), &metrics, at_8_30),
+            Some(AccountMode::Frozen)
+        );
+        assert_eq!(
+            evaluate(
+                &metrics,
+                previous_mode_for_evaluation(Some(AccountMode::Frozen), &metrics, at_8_30),
+                &t(),
+            )
+            .mode,
+            AccountMode::Frozen
+        );
+    }
+
+    #[test]
+    fn complete_metrics_can_reset_frozen_at_8_30() {
+        let at_8_30 = NaiveTime::from_hms_opt(8, 30, 0).unwrap();
+        let metrics = m(0.2, 0, 4);
+
+        assert_eq!(
+            previous_mode_for_evaluation(Some(AccountMode::Frozen), &metrics, at_8_30),
+            None
+        );
+    }
+
+    #[test]
+    fn one_evaluation_snapshot_controls_the_reset_boundary() {
+        let metrics = m(0.2, 0, 4);
+        let before_end = NaiveTime::from_hms_opt(8, 30, 59).unwrap();
+        let at_end = NaiveTime::from_hms_opt(8, 31, 0).unwrap();
+
+        let reset = evaluate_with_reset(&metrics, Some(AccountMode::Frozen), &t(), before_end);
+        let retained = evaluate_with_reset(&metrics, Some(AccountMode::Frozen), &t(), at_end);
+
+        assert_eq!(reset.prev_mode, None);
+        assert_eq!(reset.mode, AccountMode::Normal);
+        assert_eq!(retained.prev_mode, Some(AccountMode::Frozen));
+        assert_eq!(retained.mode, AccountMode::Frozen);
     }
 }

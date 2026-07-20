@@ -69,7 +69,7 @@ pub enum PushKind {
     // ============= v12 §14.3 新增 PushKind =============
     /// 账户模式变更 (T-01, ⚡ 无冷却) [MVP-1]
     AccountMode,
-    /// 数据模式变更 (T-02, ⚡ 10min 冷却) [MVP-1]
+    /// 数据模式变更 (T-02, ⚡ 状态变更即推、无粗粒度冷却) [MVP-1]
     DataMode,
     /// 持仓操作建议 (T-03/T-04, ⚡ 30min/票) [MVP-1]
     HoldingPlan,
@@ -339,9 +339,7 @@ impl PushKind {
     pub fn cooldown_secs(self) -> Option<u32> {
         match self {
             // 无冷却 (状态变更即推)
-            PushKind::AccountMode | PushKind::HoldingEvent => None,
-            // 10 min
-            PushKind::DataMode => Some(600),
+            PushKind::AccountMode | PushKind::DataMode | PushKind::HoldingEvent => None,
             // 30 min / 票 (持有建议 + 做T 共享)
             PushKind::HoldingPlan | PushKind::T0Advice => Some(1800),
             // 1次/票/日 (86400s)
@@ -844,9 +842,32 @@ impl PushLevel {
 // 冷却统一收敛到 v14.2 L4 dispatcher ((kind, code) + PushKind::cooldown_secs 窗口).
 
 /// v69: 推送日志保存 — 把每条实际推送的内容按日期路径写到 data/push_log/
-///   - 路径: data/push_log/YYYY-MM-DD/HHMMSS_<随机>.md
+///   - 路径: data/push_log/YYYY-MM-DD/HHMMSS_<唯一审计后缀>.md
 ///   - 沙箱 V10_DRY_RUN_PUSH=1 也保存 (用户能查测试推送)
 ///   - 写失败显式返回，禁止在审计证据缺失时继续确认投递
+fn push_log_suffix_at(now: std::time::SystemTime) -> Result<String, String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    let nanos = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("push_log system clock is before UNIX epoch: {error}"))?
+        .as_nanos();
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    Ok(format!(
+        "{nanos:032x}_{:08x}_{sequence:016x}",
+        std::process::id()
+    ))
+}
+
+fn create_push_log_file(path: &std::path::Path) -> Result<std::fs::File, String> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| format!("push_log 不可覆盖创建失败 {}: {error}", path.display()))
+}
+
 fn save_push_log(text: &str) -> Result<std::path::PathBuf, String> {
     use std::io::Write;
     log::info!(
@@ -856,11 +877,7 @@ fn save_push_log(text: &str) -> Result<std::path::PathBuf, String> {
     let now = chrono::Local::now();
     let date_dir = now.format("%Y-%m-%d").to_string();
     let time_prefix = now.format("%H%M%S").to_string();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    let rand_suffix = format!("{:08x}", nanos);
+    let unique_suffix = push_log_suffix_at(std::time::SystemTime::now())?;
     let root = std::env::var("PUSH_LOG_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
@@ -873,9 +890,8 @@ fn save_push_log(text: &str) -> Result<std::path::PathBuf, String> {
     let dir = root.join(&date_dir);
     std::fs::create_dir_all(&dir)
         .map_err(|error| format!("push_log 目录创建失败 {}: {error}", dir.display()))?;
-    let path = dir.join(format!("{}_{}.md", time_prefix, &rand_suffix[..6]));
-    let mut file = std::fs::File::create(&path)
-        .map_err(|error| format!("push_log 创建文件失败 {}: {error}", path.display()))?;
+    let path = dir.join(format!("{time_prefix}_{unique_suffix}.md"));
+    let mut file = create_push_log_file(&path)?;
     file.write_all(text.as_bytes())
         .map_err(|error| format!("push_log 写入失败 {}: {error}", path.display()))?;
     file.sync_data()
@@ -1597,22 +1613,25 @@ pub async fn push_via_magiclaw_cli(send_type: MessageSendType, text: &str) -> bo
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     if output.status.success() {
-        let detail = tail_lines(&stdout, 3);
-        if detail.is_empty() {
-            log::info!(
-                "[{}] 推送成功 | to={}",
-                send_type.label(),
-                to.as_deref().unwrap_or("<auto>")
-            );
-        } else {
-            log::info!(
-                "[{}] 推送成功 | to={} | {}",
-                send_type.label(),
-                to.as_deref().unwrap_or("<auto>"),
-                detail
-            );
+        match parse_magiclaw_cli_delivery_receipt(send_type, &stdout) {
+            Ok(receipt) => {
+                log::info!(
+                    "[{}] 推送成功 | via=cli receipt=validated message_id_len={} platform_msg_id_len={}",
+                    send_type.label(),
+                    receipt.message_id.len(),
+                    receipt.platform_msg_id.len()
+                );
+                return true;
+            }
+            Err(error) => {
+                log::error!(
+                    "[{}][BR-111] magiclaw exit=0 but delivery receipt is invalid: {}",
+                    send_type.label(),
+                    error
+                );
+                return false;
+            }
         }
-        return true;
     }
 
     let stderr_tail = tail_lines(&stderr, 8);
@@ -1633,6 +1652,61 @@ pub async fn push_via_magiclaw_cli(send_type: MessageSendType, text: &str) -> bo
         }
     );
     false
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CliDeliveryReceipt {
+    message_id: String,
+    platform_msg_id: String,
+}
+
+fn parse_magiclaw_cli_delivery_receipt(
+    send_type: MessageSendType,
+    stdout: &str,
+) -> Result<CliDeliveryReceipt, String> {
+    let prefix = match send_type {
+        MessageSendType::Feishu => "send ok (feishu):",
+        MessageSendType::Wechat => "send ok:",
+    };
+    let line = stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with(prefix))
+        .ok_or_else(|| "missing channel-specific success receipt".to_string())?;
+
+    let mut message_id = None;
+    let mut platform_msg_id = None;
+    for field in line
+        .strip_prefix(prefix)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+    {
+        let Some((key, value)) = field.split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "message_id" => message_id = Some(value.trim()),
+            "platform_msg_id" => platform_msg_id = Some(value.trim()),
+            _ => {}
+        }
+    }
+
+    let validate = |name: &str, value: Option<&str>| -> Result<String, String> {
+        let value = value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("missing {name}"))?;
+        if value.starts_with('<') && value.ends_with('>') {
+            return Err(format!("placeholder {name}"));
+        }
+        Ok(value.to_string())
+    };
+
+    Ok(CliDeliveryReceipt {
+        message_id: validate("message_id", message_id)?,
+        platform_msg_id: validate("platform_msg_id", platform_msg_id)?,
+    })
 }
 
 pub fn resolve_send_type() -> MessageSendType {
@@ -2363,6 +2437,30 @@ pub async fn verify_daemon_auth(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn push_log_suffix_rejects_pre_epoch_clock_and_is_unique() {
+        let before_epoch = std::time::UNIX_EPOCH
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert!(push_log_suffix_at(before_epoch).is_err());
+
+        let instant = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        let first = push_log_suffix_at(instant).unwrap();
+        let second = push_log_suffix_at(instant).unwrap();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn push_log_artifact_creation_never_overwrites() {
+        let suffix = push_log_suffix_at(std::time::SystemTime::now()).unwrap();
+        let path = std::env::temp_dir().join(format!("TEST_CODE_push_log_{suffix}.md"));
+        let first = create_push_log_file(&path).expect("create first audit artifact");
+        drop(first);
+
+        assert!(create_push_log_file(&path).is_err());
+        std::fs::remove_file(path).expect("remove isolated audit fixture");
+    }
 
     /// PushKind::is_deprecated: 9 保留 + 4 降级 (grill Q2/Q6 修订)
     #[test]
@@ -3118,6 +3216,30 @@ mod tests {
         let (url, request) = one_request_http_fixture(200, r#"{"code":1}"#).await;
         assert!(!push_feishu_http_with_client(&client, &url, "TEST_CODE webhook protocol").await);
         request.await.unwrap();
+    }
+
+    #[test]
+    fn magiclaw_cli_success_requires_a_real_channel_receipt() {
+        let receipt = parse_magiclaw_cli_delivery_receipt(
+            MessageSendType::Feishu,
+            "send ok (feishu): message_id=receipt-1, platform_msg_id=om_platform_1\n",
+        )
+        .expect("explicit Feishu receipt");
+        assert_eq!(receipt.message_id, "receipt-1");
+        assert_eq!(receipt.platform_msg_id, "om_platform_1");
+
+        for stdout in [
+            "",
+            "send completed",
+            "send ok (feishu): message_id=receipt-1, platform_msg_id=<none>",
+            "send ok (feishu): message_id=<daemon>, platform_msg_id=om_platform_1",
+            "send ok (via daemon): message_id=<daemon>, to=TEST_CODE_target",
+        ] {
+            assert!(
+                parse_magiclaw_cli_delivery_receipt(MessageSendType::Feishu, stdout).is_err(),
+                "exit-zero stdout without a real Feishu receipt must fail: {stdout}"
+            );
+        }
     }
 
     #[tokio::test]

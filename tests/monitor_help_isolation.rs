@@ -1,6 +1,6 @@
 //! BR-051: terminal help must not initialize production data or audit paths.
 
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[test]
@@ -40,6 +40,64 @@ fn help_exits_without_creating_runtime_state() {
     );
 
     std::fs::remove_dir_all(&root).expect("remove isolated working directory");
+}
+
+#[test]
+fn normal_process_initializes_governance_before_waiting_for_market() {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let root = std::env::temp_dir().join(format!(
+        "monitor-startup-governance-{}-{}",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&root).expect("create isolated working directory");
+    let database_path = root.join("startup.db");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_monitor"))
+        .current_dir(&root)
+        .env("DATABASE_PATH", &database_path)
+        .env("STOCK_LIST", "")
+        .env("MONITOR_ENABLED", "true")
+        .env("V10_DRY_RUN_PUSH", "1")
+        .env_remove("ALERT_WEBHOOK_URL")
+        .env_remove("CUSTOM_WEBHOOK_URL")
+        .env_remove("DINGTALK_WEBHOOK")
+        .env_remove("DISCORD_WEBHOOK")
+        .env_remove("FEISHU_WEBHOOK_URL")
+        .env_remove("SLACK_WEBHOOK")
+        .env_remove("TELEGRAM_BOT_TOKEN")
+        .env_remove("WECHAT_WEBHOOK")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn normal monitor process");
+
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    child.kill().expect("terminate isolated monitor process");
+    let output = child
+        .wait_with_output()
+        .expect("collect isolated monitor output");
+    let combined_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        combined_output.contains("[AccountMode-hook] 启动评估"),
+        "normal startup must evaluate AccountMode before session wait; output={combined_output}"
+    );
+    assert!(
+        combined_output.contains("[DataMode-hook] 模式"),
+        "normal startup must evaluate DataMode before session wait; output={combined_output}"
+    );
+    assert!(
+        !combined_output.contains("governance banner unavailable"),
+        "long-running loops started before governance context; output={combined_output}"
+    );
+    assert!(database_path.exists(), "startup database was not created");
+
+    std::fs::remove_dir_all(root).expect("remove isolated startup directory");
 }
 
 #[test]
@@ -113,16 +171,18 @@ fn fresh_test_database_starts_without_lock_errors() {
     assert_eq!(
         output.status.code(),
         Some(2),
-        "missing same-day real ledger must fail closed; output={combined_output}"
+        "missing fresh real account evidence must fail closed; output={combined_output}"
     );
     assert!(
         !combined_output.contains("database is locked"),
         "fresh database startup must not race WAL initialization; output={combined_output}"
     );
     assert!(
-        combined_output.contains("[复盘][BR-108]")
-            && combined_output.contains("ledger 当日净值缺失"),
-        "fresh database must reach the expected same-day ledger boundary; output={combined_output}"
+        combined_output.contains("[AccountMode-hook][BR-108]")
+            && combined_output.contains("BR-103 real account snapshot is missing")
+            && combined_output.contains("event_type=push.delivery.audit")
+            && combined_output.contains("kind=account_mode_v1 outcome=Pushed"),
+        "fresh database must emit an audited conservative account alert; output={combined_output}"
     );
 
     std::fs::remove_dir_all(&root).expect("remove isolated working directory");

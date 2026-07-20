@@ -26,6 +26,9 @@ use std::io::Write;
 
 use std::sync::atomic::AtomicBool;
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use stock_analysis::calendar::{self, current_session, is_market_active, MarketSession};
 
 use stock_analysis::monitor::alert;
@@ -85,11 +88,22 @@ impl TestEnvGuard {
             "PUSH_VERBOSE",
             "STOCK_ANALYSIS_QUIET_HOUR_OVERRIDE",
             "STOCK_ENV_MODE",
+            "EVENT_AUDIT_DIR",
         ]);
         std::env::set_var("V10_DRY_RUN_PUSH", "1");
         std::env::set_var("PUSH_VERBOSE", "true");
         std::env::set_var("STOCK_ANALYSIS_QUIET_HOUR_OVERRIDE", "0");
         std::env::set_var("STOCK_ENV_MODE", "test");
+        static AUDIT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let audit_sequence = AUDIT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        std::env::set_var(
+            "EVENT_AUDIT_DIR",
+            std::env::temp_dir().join(format!(
+                "stock-analysis-monitor-audit-test-{}-{}",
+                std::process::id(),
+                audit_sequence
+            )),
+        );
         guard
     }
 }
@@ -1301,6 +1315,7 @@ fn build_banner(
         account_mode,
         total_pos: am_metrics.total_pos_cheng,
         today_pnl: am_metrics.today_pnl_pct,
+        account_metrics_complete: am_metrics.is_complete(),
         data_mode,
         data_missing_note,
     }
@@ -1399,33 +1414,26 @@ async fn evaluate_account_mode_hook(startup: bool) -> bool {
         Ok(Ok(m)) => m,
 
         Ok(Err(e)) => {
-            log::warn!("[AccountMode-hook] metrics 装配失败: {}", e);
-
-            return false;
+            log::warn!(
+                "[AccountMode-hook][BR-108] metrics unavailable; evaluate conservatively: {}",
+                e
+            );
+            stock_analysis::risk::account_mode::PortfolioMetrics::incomplete()
         }
 
         Err(e) => {
-            log::warn!("[AccountMode-hook] spawn_blocking join 失败: {:?}", e);
-
-            return false;
+            log::warn!(
+                "[AccountMode-hook][BR-108] metrics task failed; evaluate conservatively: {:?}",
+                e
+            );
+            stock_analysis::risk::account_mode::PortfolioMetrics::incomplete()
         }
     };
 
     // 2. 恢复 prev (从 DB 末次变更记录)
 
-    let prev = match tokio::task::spawn_blocking(latest_account_mode_change).await {
-        Ok(Ok(Some(row))) => match parse_mode_label(&row.new_mode) {
-            Some(mode) => Some(mode),
-            None => {
-                log::error!(
-                    "[AccountMode-hook] persisted mode label invalid: {:?}",
-                    row.new_mode
-                );
-                return false;
-            }
-        },
-
-        Ok(Ok(None)) => None, // 首次评估
+    let latest = match tokio::task::spawn_blocking(latest_account_mode_change).await {
+        Ok(Ok(row)) => row,
 
         Ok(Err(e)) => {
             log::error!("[AccountMode-hook] latest_account_mode_change 失败: {}", e);
@@ -1437,6 +1445,19 @@ async fn evaluate_account_mode_hook(startup: bool) -> bool {
             return false;
         }
     };
+    let prev = match latest.as_ref() {
+        Some(row) => match parse_mode_label(&row.new_mode) {
+            Some(mode) => Some(mode),
+            None => {
+                log::error!(
+                    "[AccountMode-hook] persisted mode label invalid: {:?}",
+                    row.new_mode
+                );
+                return false;
+            }
+        },
+        None => None,
+    };
 
     // 3. Evaluate the real account state before constructing the banner. A
     // missing previous row means "first evaluation", not Normal.
@@ -1444,14 +1465,13 @@ async fn evaluate_account_mode_hook(startup: bool) -> bool {
         .account_mode
         .to_thresholds();
     let now_local = chrono::Local::now().time();
-    let prev_for_eval = if stock_analysis::risk::account_mode::should_reset_at_8_30(prev, now_local)
-    {
-        None
-    } else {
-        prev
-    };
-    let evaluated_mode =
-        stock_analysis::risk::account_mode::evaluate(&metrics, prev_for_eval, &thresholds).mode;
+    let evaluation = stock_analysis::risk::account_mode::evaluate_with_reset(
+        &metrics,
+        prev,
+        &thresholds,
+        now_local,
+    );
+    let evaluated_mode = evaluation.mode;
 
     if let Err(error) = refresh_banner_state_with_metrics(&metrics, evaluated_mode).await {
         log::error!("[AccountMode-hook] banner evaluation failed: {error}");
@@ -1474,8 +1494,29 @@ async fn evaluate_account_mode_hook(startup: bool) -> bool {
         );
     }
 
-    if let Err(e) = push_templates::push_account_mode_change(&metrics, prev, Some(&banner)).await {
-        log::warn!("[AccountMode-hook] push_account_mode_change 失败: {}", e);
+    let notification = match push_templates::push_account_mode_change(
+        &metrics,
+        prev,
+        latest.as_ref(),
+        Some(&banner),
+        &evaluation,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            log::warn!(
+                "[AccountMode-hook] push_account_mode_change 失败: {}",
+                error
+            );
+            return false;
+        }
+    };
+    if !notification.is_confirmed() {
+        log::warn!(
+            "[AccountMode-hook][BR-116] notification unconfirmed: {:?}",
+            notification
+        );
         return false;
     }
 
@@ -1504,54 +1545,52 @@ fn parse_mode_label(label: &str) -> Option<stock_analysis::risk::action_gate::Ac
 
 /// 同步版 metrics 装配 (供 spawn_blocking 调用).
 
-/// 数据源: ledger (今日盈亏) + positions (总仓位) + trades (连续止损).
+/// 数据源: real_account_snapshot + 同批券商成交同步水位.
 
 /// 失败 / 缺失 → 返回 data_complete=false 的 metrics (保守策略).
 
 fn compute_account_mode_metrics_blocking(
 ) -> Result<stock_analysis::risk::account_mode::PortfolioMetrics, String> {
-    use stock_analysis::risk::account_mode::PortfolioMetrics;
+    let observed_at = chrono::Local::now().fixed_offset();
+    let snapshot = stock_analysis::database::account_snapshot::latest_account_snapshot()
+        .map_err(|error| format!("BR-103 latest real account snapshot: {error}"))?
+        .ok_or_else(|| "BR-103 real account snapshot is missing".to_string())?;
+    snapshot.validate_fresh_for_action(observed_at)?;
 
-    // 1. ledger 今日盈亏
-
-    let today = chrono::Local::now().date_naive();
-    let equity_curve = stock_analysis::portfolio::get_equity_curve_as_of(1, today)
-        .map_err(|e| format!("get_equity_curve: {}", e))?;
-
-    let today_entry = equity_curve
-        .last()
-        .ok_or_else(|| "ledger 当地日净值缺失".to_string())?;
-    let today_pnl_pct = (today_entry.daily_pnl / today_entry.total_value) * 100.0;
-    if !today_pnl_pct.is_finite() {
-        return Err("ledger 当地日盈亏比例非有限值".to_string());
+    if snapshot.daily_pnl_status != "available" {
+        return Err(format!(
+            "BR-103 daily PnL is unavailable: status={}",
+            snapshot.daily_pnl_status
+        ));
     }
-    let total_value = today_entry.total_value;
-    let market_value = today_entry.market_value;
+    let daily_pnl = snapshot
+        .daily_pnl
+        .ok_or_else(|| "BR-103 daily PnL is missing".to_string())?;
+    let position_ratio_pct = snapshot
+        .position_ratio_pct
+        .ok_or_else(|| "BR-103 position ratio is missing".to_string())?;
+    if snapshot.total_assets <= 0.0 {
+        return Err("BR-103 total assets must be positive for account mode".to_string());
+    }
+    let today_pnl_pct = daily_pnl / snapshot.total_assets * 100.0;
+    if !today_pnl_pct.is_finite() {
+        return Err("BR-103 daily PnL ratio is non-finite".to_string());
+    }
+    let _total_pos_cheng = (position_ratio_pct / 10.0).round().clamp(0.0, 10.0) as u8;
 
-    // 2. 总仓位 (market_value / total_value)
-
-    let total_pos_cheng = ((market_value / total_value) * 10.0)
-        .round()
-        .clamp(0.0, 10.0) as u8;
-
-    // 3. 连续止损笔数 (近 5 笔 sell 交易中, 累计亏损笔数)
-
-    let consecutive_stop_loss_n = count_consecutive_stop_losses_blocking()
-        .map_err(|e| format!("count_consecutive_stop_losses: {}", e))?;
-
-    Ok(PortfolioMetrics {
-        today_pnl_pct,
-
-        consecutive_stop_loss_n,
-
-        total_pos_cheng,
-
-        data_complete: true,
-    })
+    // A fresh account snapshot does not prove that the local trade ledger was
+    // synchronized in the same batch. Until the broker exposes that watermark,
+    // consecutive-stop-loss data must stay incomplete rather than being inferred
+    // from an arbitrarily old local `trades` table.
+    Err(
+        "BR-103 complete account metrics unavailable: real broker trade-sync watermark is not connected"
+            .to_string(),
+    )
 }
 
 /// 同步版连续止损计数: 取最近 5 笔 sell 交易, 倒序遇第一笔非止损即停.
 
+#[cfg(test)]
 fn count_consecutive_realized_losses(
     realized: &[(chrono::NaiveDateTime, String, f64)],
 ) -> Result<u32, String> {
@@ -1581,23 +1620,6 @@ fn count_consecutive_realized_losses(
         .take_while(|(_, _, pnl)| *pnl < 0.0)
         .count();
     u32::try_from(count).map_err(|error| format!("连续止损计数溢出: {error}"))
-}
-
-fn count_consecutive_stop_losses_blocking() -> Result<u32, String> {
-    let trades = stock_analysis::portfolio::get_trade_history(36_500)
-        .map_err(|e| format!("get_trade_history: {}", e))?;
-    let reviews = stock_analysis::review::journal::review_closed_trades(&trades)?;
-    let realized: Vec<_> = reviews
-        .iter()
-        .map(|review| {
-            (
-                review.sell_datetime,
-                review.sell_trade_id.clone(),
-                (review.sell_price - review.buy_price) * review.shares as f64,
-            )
-        })
-        .collect();
-    count_consecutive_realized_losses(&realized)
 }
 
 #[cfg(test)]
@@ -1705,24 +1727,31 @@ async fn evaluate_data_mode_hook() {
         });
     }
 
-    // 仅当状态变更时推 (避免冗余)
-
-    if health.is_changed() {
-        if let Some(ref banner) = banner {
-            if let Err(error) = pt::push_data_mode_change(&input, prev, Some(banner)).await {
-                log::error!("[DataMode-hook] change push failed: {error}");
-            }
-        }
+    let Some(banner) = banner else {
+        return;
+    };
+    if let Err(error) = store_banner(banner.clone()) {
+        log::error!("[DataMode-hook] banner store failed: {error}");
+        return;
     }
-    if let Some(banner) = banner {
-        if let Err(error) = store_banner(banner) {
-            log::error!("[DataMode-hook] banner store failed: {error}");
+
+    let result = match pt::push_data_mode_change(&input, prev, Some(&banner)).await {
+        Ok(result) => result,
+        Err(error) => {
+            log::error!("[DataMode-hook] change push failed: {error}");
             return;
         }
-    }
-    match LATEST_DATA_MODE.lock() {
-        Ok(mut state) => *state = Some(health.mode),
-        Err(_) => log::error!("[DataMode-hook] latest data mode lock poisoned"),
+    };
+    if result.is_confirmed() {
+        match LATEST_DATA_MODE.lock() {
+            Ok(mut state) => *state = Some(health.mode),
+            Err(_) => log::error!("[DataMode-hook] latest data mode lock poisoned"),
+        }
+    } else {
+        log::warn!(
+            "[DataMode-hook][BR-116] notification unconfirmed; retaining previous mode {:?}",
+            prev
+        );
     }
 }
 
@@ -2818,6 +2847,17 @@ async fn main() {
                 }
             }
         });
+
+        // BR-108/BR-116: establish the conservative governance context before
+        // any long-running loop starts. This must run outside the market-active
+        // branch so after-hours, weekends, and startup source failures can still
+        // produce governed state alerts instead of repeating banner-unavailable.
+        if !evaluate_account_mode_hook(true).await {
+            log::error!(
+                "[startup-governance][BR-108/BR-116] AccountMode notification unconfirmed; context remains conservative and periodic retry stays eligible"
+            );
+        }
+        evaluate_data_mode_hook().await;
 
         let main_loops = async {
             // Phase 3: 移除 news_pipeline_loop_v15_3 (#2) — sink/aggregator 仅 #2 自用,
@@ -4021,7 +4061,8 @@ async fn run_review_only_inner(isolated_test_fixtures: bool) -> Result<(), Strin
     } else if std::env::args().any(|arg| arg == "--test") {
         let hhmm_r = chrono::Local::now().format("%H:%M").to_string();
         let date_r = chrono::Local::now().format("%Y-%m-%d").to_string();
-        let banner_r = pt::BannerCtx::default();
+        let banner_r = current_banner()
+            .map_err(|error| format!("isolated template banner unavailable: {error}"))?;
         pt::dispatch_all_for_test(&hhmm_r, &date_r, &banner_r, pt::TestScope::All).await;
     } else {
         log::warn!("[复盘][BR-108] test dispatcher disabled=no_verified_banner");
@@ -4089,7 +4130,9 @@ async fn e2e_all_templates_run() -> Result<(), String> {
 
     log::info!("[v70] 4/4 跑新闻模块 (D-01 / I-02 isolated test fixtures)");
 
-    push_e2e_news_modules(&hhmm).await;
+    let banner_e2e =
+        current_banner().map_err(|error| format!("isolated E2E banner unavailable: {error}"))?;
+    push_e2e_news_modules(&hhmm, &banner_e2e).await;
 
     // T-16 requires a real-symbol realtime quote. BR-051 forbids inserting a
     // real symbol into the isolated test account, so this external boundary is
@@ -4100,7 +4143,8 @@ async fn e2e_all_templates_run() -> Result<(), String> {
     //   R-01~R-08 已由上方 run_review_only_inner 推过 → 这里 dedup 跳过; 盘中模板在此真推
     {
         use crate::push_templates as pt;
-        let banner_e2e = pt::BannerCtx::default();
+        let banner_e2e = current_banner()
+            .map_err(|error| format!("isolated template banner unavailable: {error}"))?;
         pt::dispatch_all_for_test(&hhmm, &today_str, &banner_e2e, pt::TestScope::IsolatedAll).await;
     }
 
@@ -4211,8 +4255,9 @@ fn seed_isolated_e2e_banner() -> Result<(), String> {
     let today_pnl = latest.daily_pnl / latest.total_value * 100.0;
     store_banner(push_templates::BannerCtx {
         account_mode: push_templates::AccountMode::Normal,
-        total_pos,
-        today_pnl,
+        total_pos: Some(total_pos),
+        today_pnl: Some(today_pnl),
+        account_metrics_complete: true,
         data_mode: push_templates::DataMode::Full,
         data_missing_note: None,
     })
@@ -4239,13 +4284,13 @@ fn execute_e2e_seed_sql(db_path: &str, label: &str, sql: &str) -> Result<(), Str
 
 ///   公告测试数据: 3 主题 + 2 票 (覆盖 D-01 + I-02)
 
-async fn push_e2e_news_modules(hhmm: &str) {
+async fn push_e2e_news_modules(hhmm: &str, banner: &push_templates::BannerCtx) {
     use push_templates as pt;
 
     // D-01 新闻驱动个股 (isolated test fixture)
 
     let d01 = pt::render_news_to_idea(
-        &pt::BannerCtx::default(),
+        banner,
         pt::NewsToIdeaParams {
             hhmm,
 
@@ -4285,7 +4330,7 @@ async fn push_e2e_news_modules(hhmm: &str) {
     // I-02 新闻催化映射 (isolated fixture)
 
     let i02 = pt::render_news_catalyst(
-        &pt::BannerCtx::default(),
+        banner,
         pt::NewsCatalystParams {
             hhmm,
 
@@ -5078,8 +5123,15 @@ async fn monitor_loop() {
         use stock_analysis::trading::paper_engine;
         let monitor = IntradayMonitor;
         loop {
-            let risk_context = current_banner_for("v16.3 paper decision")
-                .map(|banner| push_templates::paper_risk_context_from_banner(&banner));
+            let risk_context = current_banner_for("v16.3 paper decision").and_then(|banner| {
+                match push_templates::paper_risk_context_from_banner(&banner) {
+                    Ok(context) => Some(context),
+                    Err(error) => {
+                        log::error!("[v16.3][BR-134] paper risk context unavailable: {}", error);
+                        None
+                    }
+                }
+            });
             if let Some(risk_context) = risk_context {
                 match monitor.tick(risk_context) {
                     Ok(n) if n > 0 => {
@@ -5316,14 +5368,6 @@ async fn monitor_loop() {
             .collect();
 
         let scanner = TieredScanner::new(targets);
-
-        // ============= v12 PR1-1.7: 启动期评估一次 AccountMode =============
-
-        // 后续每次 tick 重算在循环体内 (PR1-1.7 末尾的 evaluate_account_mode_hook).
-
-        // 这里做 "今日首次" 评估, 防止上一次进程残留状态未推 T-01.
-
-        evaluate_account_mode_hook(true).await;
 
         let detector = Detector::new(DetectorConfig::default());
 

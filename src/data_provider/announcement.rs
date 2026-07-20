@@ -11,6 +11,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 
 const ANNOUNCE_URL: &str = "https://np-anotice-stock.eastmoney.com/api/security/ann";
+const ANNOUNCE_DETAIL_URL: &str = "https://np-cnotice-stock.eastmoney.com/api/content/ann";
 const MAX_PER_FETCH: usize = 200;
 
 #[derive(Debug, Deserialize)]
@@ -25,12 +26,27 @@ struct AnnData {
 
 #[derive(Debug, Deserialize)]
 struct DetailResponse {
-    data: Option<DetailData>,
+    success: DetailSuccess,
+    data: DetailData,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum DetailSuccess {
+    Boolean(bool),
+    Integer(u8),
+}
+
+impl DetailSuccess {
+    fn is_success(&self) -> bool {
+        matches!(self, Self::Boolean(true) | Self::Integer(1))
+    }
 }
 
 #[derive(Debug, Deserialize)]
 struct DetailData {
-    content: Option<String>,
+    art_code: String,
+    notice_content: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -492,11 +508,23 @@ fn parse_announcement_detail_http_response(
     }
     let response: DetailResponse = serde_json::from_str(&body)
         .map_err(|error| anyhow::anyhow!("ann detail {art_code} json: {error}"))?;
-    response
-        .data
-        .and_then(|data| data.content)
-        .filter(|content| !content.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("ann detail {art_code} missing content"))
+    if !response.success.is_success() {
+        return Err(anyhow::anyhow!(
+            "ann detail {art_code} success is not explicit true/1"
+        ));
+    }
+    if response.data.art_code != art_code {
+        return Err(anyhow::anyhow!(
+            "ann detail identity mismatch: requested {art_code}, received {}",
+            response.data.art_code
+        ));
+    }
+    if response.data.notice_content.trim().is_empty() {
+        return Err(anyhow::anyhow!(
+            "ann detail {art_code} missing notice_content"
+        ));
+    }
+    Ok(response.data.notice_content)
 }
 
 fn detail_art_codes(list: &[AnnItem]) -> Vec<String> {
@@ -572,13 +600,14 @@ async fn fetch_announcements_with_client(
     client: &reqwest::Client,
     date: Option<&str>,
 ) -> Result<Vec<Announcement>> {
-    fetch_announcements_from_url(client, date, ANNOUNCE_URL).await
+    fetch_announcements_from_urls(client, date, ANNOUNCE_URL, ANNOUNCE_DETAIL_URL).await
 }
 
-async fn fetch_announcements_from_url(
+async fn fetch_announcements_from_urls(
     client: &reqwest::Client,
     date: Option<&str>,
     announcement_url: &str,
+    detail_url: &str,
 ) -> Result<Vec<Announcement>> {
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let date_str = date.unwrap_or(&today);
@@ -613,7 +642,7 @@ async fn fetch_announcements_from_url(
     let detail_results = futures::future::join_all(detail_futures.iter().map(|art_code| {
         let c = Arc::clone(&client_arc);
         let ac = art_code.clone();
-        let detail_base = announcement_url.to_string();
+        let detail_base = detail_url.to_string();
         async move {
             let content = fetch_ann_detail_from_url(&c, &ac, &detail_base).await?;
             Ok::<_, anyhow::Error>((ac, content))
@@ -636,11 +665,15 @@ async fn fetch_announcements_from_url(
 async fn fetch_ann_detail_from_url(
     client: &reqwest::Client,
     art_code: &str,
-    announcement_url: &str,
+    detail_url: &str,
 ) -> Result<String> {
-    let url = format!("{announcement_url}/detail?art_code={art_code}");
     let response = client
-        .get(&url)
+        .get(detail_url)
+        .query(&[
+            ("art_code", art_code),
+            ("client_source", "web"),
+            ("page_index", "1"),
+        ])
         .header("User-Agent", "Mozilla/5.0")
         .header("Referer", "https://data.eastmoney.com/")
         .send()
@@ -746,7 +779,7 @@ mod tests {
         assert_eq!(
             parse_announcement_detail_http_response(
                 200,
-                Ok(r#"{"data":{"content":"完整公告正文"}}"#.to_string()),
+                Ok(r#"{"success":true,"data":{"art_code":"AN-DETAIL","notice_content":"完整公告正文"}}"#.to_string()),
                 "AN-DETAIL",
             )
             .unwrap(),
@@ -756,7 +789,10 @@ mod tests {
         for result in [
             parse_announcement_detail_http_response(
                 404,
-                Ok(r#"{"data":{"content":"正文"}}"#.to_string()),
+                Ok(
+                    r#"{"success":true,"data":{"art_code":"AN-DETAIL","notice_content":"正文"}}"#
+                        .to_string(),
+                ),
                 "AN-DETAIL",
             ),
             parse_announcement_detail_http_response(200, Err("断流".to_string()), "AN-DETAIL"),
@@ -773,11 +809,71 @@ mod tests {
             ),
             parse_announcement_detail_http_response(
                 200,
-                Ok(r#"{"data":{"content":" "}}"#.to_string()),
+                Ok(
+                    r#"{"success":true,"data":{"art_code":"AN-DETAIL","notice_content":" "}}"#
+                        .to_string(),
+                ),
+                "AN-DETAIL",
+            ),
+            parse_announcement_detail_http_response(
+                200,
+                Ok(
+                    r#"{"success":false,"data":{"art_code":"AN-DETAIL","notice_content":"正文"}}"#
+                        .to_string(),
+                ),
                 "AN-DETAIL",
             ),
         ] {
             assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn current_announcement_detail_protocol_requires_identity_and_notice_content() {
+        let body = r#"{"success":true,"data":{"art_code":"TEST_CODE_ARTICLE","notice_content":"TEST_CODE_完整正文"}}"#;
+        assert_eq!(
+            parse_announcement_detail_http_response(200, Ok(body.to_string()), "TEST_CODE_ARTICLE")
+                .unwrap(),
+            "TEST_CODE_完整正文"
+        );
+        assert!(parse_announcement_detail_http_response(
+            200,
+            Ok(body.replace("TEST_CODE_ARTICLE", "TEST_CODE_OTHER")),
+            "TEST_CODE_ARTICLE"
+        )
+        .is_err());
+        assert!(parse_announcement_detail_http_response(
+            200,
+            Ok(
+                r#"{"success":true,"data":{"art_code":"TEST_CODE_ARTICLE","content":"old"}}"#
+                    .to_string()
+            ),
+            "TEST_CODE_ARTICLE"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn current_announcement_detail_protocol_accepts_only_explicit_success_values() {
+        let numeric_success = r#"{"success":1,"data":{"art_code":"TEST_CODE_ARTICLE","notice_content":"TEST_CODE_完整正文"}}"#;
+        assert_eq!(
+            parse_announcement_detail_http_response(
+                200,
+                Ok(numeric_success.to_string()),
+                "TEST_CODE_ARTICLE",
+            )
+            .unwrap(),
+            "TEST_CODE_完整正文"
+        );
+
+        for success in ["0", "2", r#""1""#] {
+            let body = format!(
+                r#"{{"success":{success},"data":{{"art_code":"TEST_CODE_ARTICLE","notice_content":"TEST_CODE_完整正文"}}}}"#
+            );
+            assert!(
+                parse_announcement_detail_http_response(200, Ok(body), "TEST_CODE_ARTICLE")
+                    .is_err()
+            );
         }
     }
 
@@ -999,7 +1095,7 @@ mod tests {
             .await
             .is_err());
         assert!(
-            fetch_ann_detail_from_url(&client, "TEST_CODE_ARTICLE", ANNOUNCE_URL)
+            fetch_ann_detail_from_url(&client, "TEST_CODE_ARTICLE", ANNOUNCE_DETAIL_URL)
                 .await
                 .is_err()
         );
@@ -1008,17 +1104,20 @@ mod tests {
     #[tokio::test]
     async fn loopback_transport_executes_list_detail_and_final_assembly() {
         let list = r#"{"data":{"list":[{"art_code":"TEST_CODE_AN_EMERGENCY","title":"关于收到立案调查通知书的公告","notice_date":"2026-07-18","codes":[{"stock_code":"000001","short_name":"TEST_CODE_协议甲"}],"columns":[{"column_name":"风险提示"}]},{"art_code":"TEST_CODE_AN_IMPORTANT","title":"关于收到监管函的公告","notice_date":"2026-07-18","codes":[{"stock_code":"000002","short_name":"TEST_CODE_协议乙"}],"columns":null},{"art_code":"TEST_CODE_AN_INFO","title":"关于回购股份的公告","notice_date":"2026-07-18","codes":[{"stock_code":"000003","short_name":"TEST_CODE_协议丙"}],"columns":null}]}}"#;
-        let detail = r#"{"data":{"content":"TEST_CODE_完整公告正文"}}"#;
+        let emergency_detail = r#"{"success":true,"data":{"art_code":"TEST_CODE_AN_EMERGENCY","notice_content":"TEST_CODE_完整公告正文"}}"#;
+        let important_detail = r#"{"success":true,"data":{"art_code":"TEST_CODE_AN_IMPORTANT","notice_content":"TEST_CODE_完整公告正文"}}"#;
         let server = super::super::TestHttpServer::new(vec![
             super::super::TestHttpResponse::json(list),
-            super::super::TestHttpResponse::json(detail),
-            super::super::TestHttpResponse::json(detail),
+            super::super::TestHttpResponse::json(emergency_detail),
+            super::super::TestHttpResponse::json(important_detail),
         ]);
-        let base = format!("{}/api/security/ann", server.base_url());
-        let announcements = fetch_announcements_from_url(
+        let list_url = format!("{}/api/security/ann", server.base_url());
+        let detail_url = format!("{}/api/content/ann", server.base_url());
+        let announcements = fetch_announcements_from_urls(
             &super::super::loopback_http_client(),
             Some("2026-07-18"),
-            &base,
+            &list_url,
+            &detail_url,
         )
         .await
         .expect("complete list and detail transport");
@@ -1033,6 +1132,9 @@ mod tests {
         assert!(requests[0].starts_with("/api/security/ann?page_size=200"));
         assert!(requests[1..]
             .iter()
-            .all(|path| path.starts_with("/api/security/ann/detail?art_code=")));
+            .all(|path| path.starts_with("/api/content/ann?art_code=")));
+        assert!(requests[1..]
+            .iter()
+            .all(|path| path.contains("client_source=web") && path.contains("page_index=1")));
     }
 }
