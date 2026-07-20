@@ -117,3 +117,9 @@ cargo build --release --bin monitor
 ```
 
 回滚后恢复旧的整体短路行为；不得通过关闭质量校验或填充假数据回滚。运行日志继续只保存在本机权限 `0600` 的文件中。
+
+## 9. Gate D 测试环境隔离补充
+
+首次运行 `cargo llvm-cov --all-features --all-targets --summary-only` 时，Feishu 本地回环 webhook 成功用例失败；同一 instrumented 用例单独运行通过。根因是 monitor test binary 内两个测试会修改同一组进程级 HTTP proxy 环境变量，却使用不同的 `serial_test` 锁：行情测试使用 `http_proxy_env`，Feishu webhook 测试使用 `notify_env`。并行覆盖率运行时，前者可在后者创建 HTTP client 前移除 `NO_PROXY` 并替换 `HTTP_PROXY`，使本地 webhook 请求进入错误的单请求 proxy fixture。
+
+修复仅把 Feishu webhook 测试加入已有 `http_proxy_env` 串行域，使所有会修改 HTTP proxy 的 monitor 测试共享同一把锁。生产 HTTP 客户端、通知地址解析和发送逻辑均不改变。验收要求 instrumented 单测与完整默认并行覆盖率命令都通过；不得用 `--test-threads=1` 掩盖竞争。

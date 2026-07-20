@@ -3098,7 +3098,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial(notify_env)]
+    #[serial_test::serial(http_proxy_env)]
     async fn feishu_webhook_executes_success_http_error_and_protocol_error() {
         let _env = crate::TestEnvGuard::capture(&[
             "FEISHU_WEBHOOK_URL",
