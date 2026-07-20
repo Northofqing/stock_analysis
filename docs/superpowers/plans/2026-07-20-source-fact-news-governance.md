@@ -31,6 +31,13 @@
   `SearchResult.source` as provenance. Keep aggregated flash generic and fail closed.
 - Carry the financial provider `NOTICE_DATE` independently from the accounting `REPORT_DATE`, and
   carry the real financial/report provider name rather than classifier/tracker labels.
+- Wire the real announcement loop per item into `classify_announcement` and the normalized source
+  sender. Treat that path as authoritative for successfully classified items; record every outcome
+  and never use legacy delivery as an outcome fallback.
+- Poll `GovPolicyProvider` directly, classify the original `SearchResult`, and remove policy from
+  the generic aggregator registration so a failed delivery remains eligible for a later real poll.
+- Reject trailing timestamp garbage and independently reject a non-current `occurred_at` before
+  either critical or aggregate buffering, regardless of the upstream stale flag.
 
 ## Task 4: Focused validation
 

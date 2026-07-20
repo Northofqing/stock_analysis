@@ -5024,11 +5024,28 @@ async fn news_monitor_loop() {
         std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
     > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
+    // BR-137: policy keeps the original provider SearchResult and uses L4/L7
+    // delivery governance for dedup/retry; it is not registered as generic flash.
+    let policy_provider =
+        stock_analysis::search_service::providers::gov_policy::GovPolicyProvider::new();
+
     loop {
         if !NewsMonitor::should_run() {
             tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
             continue;
         }
+        match v17_sources::poll_policy_provider(&policy_provider, 20).await {
+            Ok(report) => log::info!(
+                "[Policy][BR-137] attempted={} classified={} pushed={} skipped={} failed={}",
+                report.attempted,
+                report.classified,
+                report.pushed,
+                report.skipped,
+                report.failed
+            ),
+            Err(error) => log::error!("[Policy][BR-137] provider poll failed: {error}"),
+        }
+
         // v17.4: NewsAggregator tick 入口 — 每轮调一次, 拿 dedup 后 Vec<MarketEvent>
         // v17.4 §5.1: 事件喂 NewsFlashGate → critical 即时推 + 4 时段聚合 (AC34/AC35)
         let news_events = news_aggregator_init::tick_news_aggregator(20).await;
@@ -5168,14 +5185,19 @@ async fn news_monitor_loop() {
 
         let events = nm.process_announcements(&anns, &resolved_codes);
 
-        // BR-112: this adapter does not return per-event delivery confirmation, so it
-        // cannot safely mark announcements as routed. Keep the strict legacy event path
-        // active until normalized routing exposes a complete Result contract.
-        let routed_external_ids: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        if !anns.is_empty() {
-            log::warn!("[公告][BR-112] normalized routing disabled=incomplete_delivery_contract");
-        }
+        // BR-112/BR-137: successfully classified announcements have exactly one
+        // governed owner. Every normalized outcome remains explicit; legacy is
+        // retained only for classification failures, never as an outcome fallback.
+        let announcement_route = v17_sources::route_announcements(&anns).await;
+        let normalized_external_ids = announcement_route.normalized_external_ids;
+        log::info!(
+            "[公告][BR-137] attempted={} classified={} pushed={} skipped={} failed={}",
+            announcement_route.source.attempted,
+            announcement_route.source.classified,
+            announcement_route.source.pushed,
+            announcement_route.source.skipped,
+            announcement_route.source.failed
+        );
 
         let mut pushed: Vec<AlertEvent> = Vec::new();
 
@@ -5185,13 +5207,10 @@ async fn news_monitor_loop() {
                 if ev
                     .routed_external_id
                     .as_ref()
-                    .map(|id| routed_external_ids.contains(id))
+                    .map(|id| normalized_external_ids.contains(id))
                     .unwrap_or(false)
                 {
-                    log::debug!(
-                        "skipped legacy push: external_id={}",
-                        ev.routed_external_id.as_ref().unwrap()
-                    );
+                    log::debug!("[公告][BR-137] legacy push skipped: normalized owner exists");
                 } else {
                     let ev = push(ev).await;
                     pushed.push(ev);
@@ -8612,32 +8631,14 @@ mod tests_v17_7_announcement_wiring {
     }
 
     /// Simulates the v17.7 announcement loop logic:
-    /// 1. Classify announcements via classify_announcement
-    /// 2. Push via v17_sources::push_normalized_events
-    /// 3. Track routed external_ids
-    /// 4. For each AlertEvent, check if it would skip legacy push
+    /// 1. Route announcements via the production normalized owner
+    /// 2. Track normalized-owned external_ids
+    /// 3. For each AlertEvent, check if it would skip legacy push
     async fn simulate_announcement_loop(anns: Vec<Announcement>) -> AnnouncementLoopReport {
-        use stock_analysis::news::aggregator::classifier::classify_announcement;
-
-        let mut normalized_events: Vec<stock_analysis::news::aggregator::NormalizedSourceEvent> =
-            Vec::new();
-        for ann in &anns {
-            if let Ok(event) = classify_announcement(ann) {
-                normalized_events.push(event);
-            }
-        }
-
-        // Push via v17.7 path
-        let report = v17_sources::push_normalized_events(normalized_events).await;
-
-        // Collect routed external_ids
-        let mut routed_external_ids: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        for ann in &anns {
-            if let Some(ref eid) = ann.external_id {
-                routed_external_ids.insert(eid.clone());
-            }
-        }
+        // Push via the production BR-137 per-announcement owner.
+        let routed = v17_sources::route_announcements(&anns).await;
+        let report = routed.source;
+        let normalized_external_ids = routed.normalized_external_ids;
 
         // Simulate legacy loop: for each announcement, create an AlertEvent
         // and check if legacy push would be skipped
@@ -8676,7 +8677,7 @@ mod tests_v17_7_announcement_wiring {
             let skipped = ev
                 .routed_external_id
                 .as_ref()
-                .map(|id| routed_external_ids.contains(id))
+                .map(|id| normalized_external_ids.contains(id))
                 .unwrap_or(false);
 
             if !skipped {

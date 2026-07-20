@@ -1,3 +1,4 @@
+//! Registered business rules: BR-137.
 //! 政府/监管公告 provider（P6）。
 //!
 //! 当前实现优先使用发改委通知公告 RSS（公开、稳定、结构化）：
@@ -89,15 +90,18 @@ impl GovPolicyProvider {
                 continue;
             }
 
-            out.push(
-                SearchResult::new(
-                    title,
-                    "发改委通知公告".to_string(),
-                    link,
-                    "政府监管".to_string(),
-                )
-                .with_date(pub_date),
+            let mut result = SearchResult::new(
+                title,
+                "发改委通知公告".to_string(),
+                link,
+                "政府监管".to_string(),
             );
+            if !pub_date.is_empty() {
+                result.published_date = Some(pub_date);
+            } else {
+                log::warn!("[GovPolicyProvider][BR-137] RSS item missing pubDate");
+            }
+            out.push(result);
 
             if out.len() >= limit {
                 break;
@@ -144,7 +148,8 @@ impl GovPolicyProvider {
                 rel.trim_start_matches("./")
             );
 
-            let published_date = extract_date_from_ndrc_href(rel).unwrap_or_default();
+            let published_date = extract_date_from_ndrc_href(rel)
+                .ok_or_else(|| anyhow::anyhow!("发改委公告链接缺少合法发布日期: {rel}"))?;
             out.push(
                 SearchResult::new(
                     title,

@@ -3,9 +3,10 @@
 //!
 //! ## 目标 (v15.3 Phase D 收尾)
 //!
-//! 把 `src/news/aggregator/feed.rs` 的 8 个真实轮询 `NewsFeed` 适配 (Jin10 / WSCN /
-//! CLS / Sina / Weibo / Gel / 科创板日报 / GovPolicy) 注册到全局
-//! `NewsAggregator`, 然后在 `news_monitor_loop` 每 tick 调一次 `tick_news_aggregator(20)`,
+//! 把 `src/news/aggregator/feed.rs` 的 7 个通用新闻轮询 `NewsFeed` 适配 (Jin10 / WSCN /
+//! CLS / Sina / Weibo / Gel / 科创板日报) 注册到全局 `NewsAggregator`。GovPolicy 由
+//! BR-137 独立 producer 保留原始 `SearchResult`，不进入投递前 aggregator 去重。
+//! `news_monitor_loop` 每 tick 调一次 `tick_news_aggregator(20)`,
 //! 把 dedup 后的 `Vec<MarketEvent>` 喂给 BR-082 NewsFlashGate 与推送治理链.
 //!
 //! ## 调用链
@@ -13,7 +14,7 @@
 //! ```text
 //! monitor::main()
 //!   └─ init_news_aggregator()  ← 本文件
-//!        ├─ register_feeds(8 × Arc<dyn NewsFeed>)
+//!        ├─ register_feeds(7 × Arc<dyn NewsFeed>)
 //!        ├─ take_all_for_aggregator()
 //!        └─ NewsAggregator::new(...).set_global()
 //!
@@ -43,7 +44,7 @@ use stock_analysis::news::aggregator::{
 };
 use stock_analysis::signal::market_event::MarketEvent;
 
-/// 注册 8 个真实轮询 NewsFeed 适配到全局 NewsAggregator.
+/// 注册 7 个真实通用新闻轮询 NewsFeed 适配到全局 NewsAggregator.
 ///
 /// 在 monitor 启动早期调一次 (main() 里 spawn task 之前). 重复调 no-op.
 ///
@@ -56,7 +57,7 @@ pub fn init_news_aggregator() -> usize {
     }
 
     let feeds: Vec<Arc<dyn NewsFeed>> = vec![
-        // ===== Flash 源 (8 个, 真 HTTP; 每个 inner 调对应 Provider::new()) =====
+        // ===== 通用新闻源 (7 个, 真 HTTP; 每个 inner 调对应 Provider::new()) =====
         Arc::new(feed::Jin10FlashFeed {
             inner: stock_analysis::search_service::providers::jin10::Jin10Provider::new(),
         }),
@@ -79,14 +80,13 @@ pub fn init_news_aggregator() -> usize {
         Arc::new(feed::KcbDailyFeed {
             inner: stock_analysis::search_service::providers::kcb_daily::KcbDailyProvider::new(),
         }),
-        Arc::new(feed::GovPolicyFeed {
-            inner: stock_analysis::search_service::providers::gov_policy::GovPolicyProvider::new(),
-        }),
         // BR-078: 未实现/主动触发型 feed 不得伪装成成功轮询源。
         // GovCn/MIIT/EarningsCalendar/Consensus/MarketAction/AnalystViews 不注册。
+        // GovPolicyFeed 不注册：BR-137 要求原始 SearchResult 由独立 producer
+        // 分类/投递，禁止 aggregator 在投递前提交 seen_simhash。
         // EmAnnouncementFeed 也不注册，公告由下面说明的既有主路径消费。
-        // 公告直接来自 news_monitor_loop 中的 nm.process_announcements()，
-        // 通过 v17_sources::push_normalized_events 推送，绕过 NewsFlash 二次缓冲。
+        // 公告直接来自 news_monitor_loop 中的真实 provider 批次，
+        // 通过 v17_sources::route_announcements 推送，绕过 NewsFlash 二次缓冲。
     ];
     let count = feeds.len();
     log::info!(
@@ -249,6 +249,8 @@ impl NewsFlashGate {
                 Some("stale")
             } else if e.occurred_at > now {
                 Some("future_publication")
+            } else if e.occurred_at.date_naive() != now.date_naive() {
+                Some("publication_date_not_current")
             } else if provenance
                 .is_some_and(|item| item.fetched_at > now || item.fetched_at < e.occurred_at)
             {
@@ -500,6 +502,20 @@ mod tests {
         stale.stale = true;
         let mut gate = NewsFlashGate::new(now.date_naive());
         assert!(gate.process(&[stale], now, 80, 20).is_empty());
+        assert!(gate.buffer.is_empty());
+        assert!(gate.seen_today.is_empty());
+    }
+
+    #[test]
+    fn br137_old_flash_is_rejected_even_when_upstream_stale_flag_is_false() {
+        let now = at(10, 0);
+        let old_time = now - chrono::Duration::days(1);
+        let mut old = ev("old-source-fact", 70, 70);
+        old.stale = false;
+        old.occurred_at = old_time;
+        old.provenance[0].fetched_at = old_time;
+        let mut gate = NewsFlashGate::new(now.date_naive());
+        assert!(gate.process(&[old], now, 80, 20).is_empty());
         assert!(gate.buffer.is_empty());
         assert!(gate.seen_today.is_empty());
     }

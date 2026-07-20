@@ -1,3 +1,4 @@
+//! Registered business rules: BR-137.
 //! v17.7 Task 1: Classification result types
 //!
 //! Skeleton types for earnings and analyst rating classification results.
@@ -8,7 +9,7 @@
 use super::{NormalizedSourceError, NormalizedSourceEvent, SourcePushKind};
 use crate::data_provider::announcement::Announcement;
 use crate::search_service::SearchResult;
-use chrono::{Datelike, NaiveDate};
+use chrono::{Datelike, Local, NaiveDate};
 
 /// Result of earnings classification (actual vs reference).
 ///
@@ -246,10 +247,8 @@ pub fn classify_announcement(
     let source = "eastmoney".to_string();
     let url = a.url.clone();
     let published_on = a
-        .date
-        .get(..10)
-        .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
-        .ok_or(NormalizedSourceError::InvalidPublishedDate)?;
+        .published_on()
+        .map_err(|_| NormalizedSourceError::InvalidPublishedDate)?;
     let observed_at = chrono::Local::now();
 
     NormalizedSourceEvent::new(
@@ -288,13 +287,11 @@ pub fn classify_policy(r: &SearchResult) -> Result<NormalizedSourceEvent, Normal
     } else {
         Some(r.url.clone())
     };
-    let published_on = r
-        .published_date
-        .as_deref()
-        .ok_or(NormalizedSourceError::MissingPublishedDate)?
-        .get(..10)
-        .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
-        .ok_or(NormalizedSourceError::InvalidPublishedDate)?;
+    let published_on = parse_provider_publication_date(
+        r.published_date
+            .as_deref()
+            .ok_or(NormalizedSourceError::MissingPublishedDate)?,
+    )?;
     let observed_at = chrono::Local::now();
 
     NormalizedSourceEvent::new(
@@ -312,6 +309,25 @@ pub fn classify_policy(r: &SearchResult) -> Result<NormalizedSourceEvent, Normal
         r.source.clone(),
         url,
     )
+}
+
+fn parse_provider_publication_date(raw: &str) -> Result<NaiveDate, NormalizedSourceError> {
+    let raw = raw.trim();
+    if let Ok(date) = NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
+        return Ok(date);
+    }
+    for format in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"] {
+        if let Ok(timestamp) = chrono::NaiveDateTime::parse_from_str(raw, format) {
+            return Ok(timestamp.date());
+        }
+    }
+    if let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return Ok(timestamp.with_timezone(&Local).date_naive());
+    }
+    if let Ok(timestamp) = chrono::DateTime::parse_from_rfc2822(raw) {
+        return Ok(timestamp.with_timezone(&Local).date_naive());
+    }
+    Err(NormalizedSourceError::InvalidPublishedDate)
 }
 
 #[cfg(test)]
@@ -403,6 +419,15 @@ mod tests {
         assert_eq!(
             classify_policy(&policy),
             Err(NormalizedSourceError::MissingPublishedDate)
+        );
+
+        policy.published_date = Some(format!(
+            "{}garbage",
+            Local::now().date_naive().format("%Y-%m-%d")
+        ));
+        assert_eq!(
+            classify_policy(&policy),
+            Err(NormalizedSourceError::InvalidPublishedDate)
         );
     }
 

@@ -1,3 +1,4 @@
+//! Registered business rules: BR-078, BR-137.
 //! v15.3 Phase D1.2-D1.4: 12 个 NewsFeed 适配层
 //!
 //! 把现有 `search_service::providers::*` (8 个 flash) + 新建 4 个数据源
@@ -102,10 +103,7 @@ fn source_time_and_stale(
             }
         }
     }
-    if let Some(date) = raw
-        .get(..10)
-        .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())
-    {
+    if let Ok(date) = NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
         return (observed_at, date != observed_at.date_naive());
     }
     log::warn!("[NewsFeed][BR-137] provider published_date invalid; event marked stale");
@@ -579,6 +577,11 @@ mod tests {
         let (source_time, stale) = source_time_and_stale(Some(&today), observed_at);
         assert!(!stale);
         assert_eq!(source_time.timestamp(), observed_at.timestamp());
+        let malformed = format!("{}garbage", observed_at.format("%Y-%m-%d"));
+        assert!(
+            source_time_and_stale(Some(&malformed), observed_at).1,
+            "a valid date prefix must not make a malformed provider timestamp fresh"
+        );
     }
 
     #[test]

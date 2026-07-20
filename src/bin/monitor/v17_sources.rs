@@ -1,4 +1,4 @@
-//! Registered business rules: BR-137.
+//! Registered business rules: BR-112, BR-137.
 //! v17.7 Task 5: Monitor-only source-to-push adapter
 //!
 //! Consumes `NormalizedSourceEvent` from the news aggregator and dispatches
@@ -8,7 +8,7 @@
 
 use crate::notify::{self, PushKind, PushOutcome};
 use chrono::Local;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use stock_analysis::data_provider::consensus;
@@ -18,7 +18,8 @@ use stock_analysis::news::aggregator::analyst_state::{
     AnalystKey, AnalystObservation, AnalystStateStore,
 };
 use stock_analysis::news::aggregator::classifier::{
-    classify_earnings, EarningsClassification, EarningsConfig, EarningsKind,
+    classify_announcement, classify_earnings, classify_policy, EarningsClassification,
+    EarningsConfig, EarningsKind,
 };
 use stock_analysis::news::aggregator::{NormalizedSourceEvent, SourcePushKind};
 
@@ -109,6 +110,101 @@ pub struct SourcePollReport {
     pub pushed: usize,
     pub skipped: usize,
     pub failed: usize,
+}
+
+#[derive(Debug, Default)]
+pub struct AnnouncementSourceRouteReport {
+    pub source: SourcePollReport,
+    /// External IDs owned by the normalized source-fact path for this batch.
+    /// Ownership means legacy delivery must not be used as an outcome fallback;
+    /// it does not claim that the sink confirmed delivery.
+    pub normalized_external_ids: HashSet<String>,
+}
+
+fn record_source_attempt(report: &mut SourcePollReport, outcome: &PushOutcome) {
+    match outcome {
+        PushOutcome::Pushed => report.pushed += 1,
+        _ => report.failed += 1,
+    }
+}
+
+/// Route complete real-provider announcements one by one through the sole
+/// normalized source-fact path. Successfully classified items are owned by
+/// this path even when governance/sink fails, so legacy delivery cannot bypass
+/// the explicit outcome. The next provider poll remains the retry boundary.
+pub async fn route_announcements(
+    announcements: &[stock_analysis::data_provider::announcement::Announcement],
+) -> AnnouncementSourceRouteReport {
+    let mut routed = AnnouncementSourceRouteReport::default();
+    for announcement in announcements {
+        routed.source.attempted += 1;
+        let Some(external_id) = announcement
+            .external_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            routed.source.skipped += 1;
+            log::warn!(
+                "[v17.7][BR-137] announcement source route skipped: missing provider external_id"
+            );
+            continue;
+        };
+        let event = match classify_announcement(announcement) {
+            Ok(event) => event,
+            Err(error) => {
+                routed.source.skipped += 1;
+                log::warn!("[v17.7][BR-137] announcement classification rejected: reason={error}");
+                continue;
+            }
+        };
+        routed.source.classified += 1;
+        routed
+            .normalized_external_ids
+            .insert(external_id.to_string());
+        let attempt = push_normalized_event(event).await;
+        record_source_attempt(&mut routed.source, &attempt.outcome);
+        log::info!(
+            "[v17.7][BR-137] announcement normalized outcome={:?}",
+            attempt.outcome
+        );
+    }
+    routed
+}
+
+/// Classify and push the original government-policy provider results without
+/// converting them to generic MarketEvent values first.
+pub async fn push_policy_results(
+    results: Vec<stock_analysis::search_service::SearchResult>,
+) -> SourcePollReport {
+    let mut report = SourcePollReport::default();
+    for result in results {
+        report.attempted += 1;
+        let event = match classify_policy(&result) {
+            Ok(event) => event,
+            Err(error) => {
+                report.skipped += 1;
+                log::warn!("[v17.7][BR-137] policy classification rejected: reason={error}");
+                continue;
+            }
+        };
+        report.classified += 1;
+        let attempt = push_normalized_event(event).await;
+        record_source_attempt(&mut report, &attempt.outcome);
+        log::info!(
+            "[v17.7][BR-137] policy normalized outcome={:?}",
+            attempt.outcome
+        );
+    }
+    report
+}
+
+pub async fn poll_policy_provider(
+    provider: &stock_analysis::search_service::providers::gov_policy::GovPolicyProvider,
+    limit: usize,
+) -> anyhow::Result<SourcePollReport> {
+    let results = provider.fetch_latest(limit).await?;
+    Ok(push_policy_results(results).await)
 }
 
 /// Maps SourcePushKind 1:1 to the corresponding PushKind variant.
@@ -226,10 +322,7 @@ pub async fn push_normalized_events(events: Vec<NormalizedSourceEvent>) -> Sourc
         }
         report.classified += 1;
         let attempt = push_normalized_event(event).await;
-        match attempt.outcome {
-            PushOutcome::Pushed => report.pushed += 1,
-            _ => report.failed += 1,
-        }
+        record_source_attempt(&mut report, &attempt.outcome);
     }
     report
 }
@@ -660,6 +753,33 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(cooldown_memo)]
+    async fn br137_real_announcement_batch_has_a_production_source_fact_owner() {
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
+        crate::v14_adapter::_reset_dedup_for_test();
+        let announcement = stock_analysis::data_provider::announcement::Announcement {
+            code: "TEST_CODE_ANN_PRODUCER".to_string(),
+            name: "测试公司".to_string(),
+            title: "关于回购股份方案的公告".to_string(),
+            date: Local::now().date_naive().format("%Y-%m-%d").to_string(),
+            summary: "回购".to_string(),
+            content: "真实公告正文协议夹具".to_string(),
+            level: stock_analysis::data_provider::announcement::AnnLevel::Important,
+            reason: "标题含回购".to_string(),
+            external_id: Some("TEST_CODE_ANN_EXTERNAL".to_string()),
+            url: Some("https://example.invalid/TEST_CODE_ANN_EXTERNAL".to_string()),
+        };
+
+        let routed = route_announcements(&[announcement]).await;
+        assert_eq!(routed.source.attempted, 1);
+        assert_eq!(routed.source.classified, 1);
+        assert_eq!(routed.source.pushed, 1);
+        assert!(routed
+            .normalized_external_ids
+            .contains("TEST_CODE_ANN_EXTERNAL"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
     async fn br137_complete_announcement_pushes_when_global_data_mode_is_down() {
         let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         crate::v14_adapter::_reset_dedup_for_test();
@@ -763,6 +883,26 @@ mod tests {
         assert_eq!(attempt.kind, PushKind::PolicyHit);
         assert!(attempt.code.is_none());
         assert_eq!(attempt.outcome, PushOutcome::Pushed);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
+    async fn br137_real_policy_results_have_a_production_policy_hit_owner() {
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
+        crate::v14_adapter::_reset_dedup_for_test();
+        let mut result = stock_analysis::search_service::SearchResult::new(
+            "促进数字经济高质量发展的通知".to_string(),
+            "政策正文摘要".to_string(),
+            "https://example.invalid/TEST_CODE_POLICY".to_string(),
+            "政府监管".to_string(),
+        );
+        result.published_date = Some(Local::now().date_naive().format("%Y-%m-%d").to_string());
+
+        let report = push_policy_results(vec![result]).await;
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.classified, 1);
+        assert_eq!(report.pushed, 1);
+        assert_eq!(report.failed, 0);
     }
 
     /// Helper: build a FinancialPeriod for testing.
