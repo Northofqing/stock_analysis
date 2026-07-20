@@ -160,10 +160,15 @@ impl AuditDispatcher {
         #[cfg(test)]
         let base_dir = {
             static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default();
             std::env::temp_dir().join(format!(
-                "stock-analysis-event-audit-test-{}-{}",
+                "stock-analysis-event-audit-test-{}-{}-{}",
                 std::process::id(),
-                SEQUENCE.fetch_add(1, Ordering::Relaxed)
+                SEQUENCE.fetch_add(1, Ordering::Relaxed),
+                nonce
             ))
         };
         #[cfg(not(test))]

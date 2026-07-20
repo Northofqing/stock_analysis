@@ -85,11 +85,24 @@ impl TestEnvGuard {
             "PUSH_VERBOSE",
             "STOCK_ANALYSIS_QUIET_HOUR_OVERRIDE",
             "STOCK_ENV_MODE",
+            "EVENT_AUDIT_DIR",
         ]);
         std::env::set_var("V10_DRY_RUN_PUSH", "1");
         std::env::set_var("PUSH_VERBOSE", "true");
         std::env::set_var("STOCK_ANALYSIS_QUIET_HOUR_OVERRIDE", "0");
         std::env::set_var("STOCK_ENV_MODE", "test");
+        let audit_nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        std::env::set_var(
+            "EVENT_AUDIT_DIR",
+            std::env::temp_dir().join(format!(
+                "stock-analysis-monitor-audit-test-{}-{}",
+                std::process::id(),
+                audit_nonce
+            )),
+        );
         guard
     }
 }
@@ -1399,33 +1412,26 @@ async fn evaluate_account_mode_hook(startup: bool) -> bool {
         Ok(Ok(m)) => m,
 
         Ok(Err(e)) => {
-            log::warn!("[AccountMode-hook] metrics 装配失败: {}", e);
-
-            return false;
+            log::warn!(
+                "[AccountMode-hook][BR-108] metrics unavailable; evaluate conservatively: {}",
+                e
+            );
+            stock_analysis::risk::account_mode::PortfolioMetrics::incomplete()
         }
 
         Err(e) => {
-            log::warn!("[AccountMode-hook] spawn_blocking join 失败: {:?}", e);
-
-            return false;
+            log::warn!(
+                "[AccountMode-hook][BR-108] metrics task failed; evaluate conservatively: {:?}",
+                e
+            );
+            stock_analysis::risk::account_mode::PortfolioMetrics::incomplete()
         }
     };
 
     // 2. 恢复 prev (从 DB 末次变更记录)
 
-    let prev = match tokio::task::spawn_blocking(latest_account_mode_change).await {
-        Ok(Ok(Some(row))) => match parse_mode_label(&row.new_mode) {
-            Some(mode) => Some(mode),
-            None => {
-                log::error!(
-                    "[AccountMode-hook] persisted mode label invalid: {:?}",
-                    row.new_mode
-                );
-                return false;
-            }
-        },
-
-        Ok(Ok(None)) => None, // 首次评估
+    let latest = match tokio::task::spawn_blocking(latest_account_mode_change).await {
+        Ok(Ok(row)) => row,
 
         Ok(Err(e)) => {
             log::error!("[AccountMode-hook] latest_account_mode_change 失败: {}", e);
@@ -1436,6 +1442,19 @@ async fn evaluate_account_mode_hook(startup: bool) -> bool {
             log::error!("[AccountMode-hook] spawn_blocking join 失败: {:?}", e);
             return false;
         }
+    };
+    let prev = match latest.as_ref() {
+        Some(row) => match parse_mode_label(&row.new_mode) {
+            Some(mode) => Some(mode),
+            None => {
+                log::error!(
+                    "[AccountMode-hook] persisted mode label invalid: {:?}",
+                    row.new_mode
+                );
+                return false;
+            }
+        },
+        None => None,
     };
 
     // 3. Evaluate the real account state before constructing the banner. A
@@ -1474,7 +1493,10 @@ async fn evaluate_account_mode_hook(startup: bool) -> bool {
         );
     }
 
-    if let Err(e) = push_templates::push_account_mode_change(&metrics, prev, Some(&banner)).await {
+    if let Err(e) =
+        push_templates::push_account_mode_change(&metrics, prev, latest.as_ref(), Some(&banner))
+            .await
+    {
         log::warn!("[AccountMode-hook] push_account_mode_change 失败: {}", e);
         return false;
     }
@@ -1539,15 +1561,11 @@ fn compute_account_mode_metrics_blocking(
     let consecutive_stop_loss_n = count_consecutive_stop_losses_blocking()
         .map_err(|e| format!("count_consecutive_stop_losses: {}", e))?;
 
-    Ok(PortfolioMetrics {
+    Ok(PortfolioMetrics::complete(
         today_pnl_pct,
-
         consecutive_stop_loss_n,
-
         total_pos_cheng,
-
-        data_complete: true,
-    })
+    ))
 }
 
 /// 同步版连续止损计数: 取最近 5 笔 sell 交易, 倒序遇第一笔非止损即停.
@@ -1705,24 +1723,31 @@ async fn evaluate_data_mode_hook() {
         });
     }
 
-    // 仅当状态变更时推 (避免冗余)
-
-    if health.is_changed() {
-        if let Some(ref banner) = banner {
-            if let Err(error) = pt::push_data_mode_change(&input, prev, Some(banner)).await {
-                log::error!("[DataMode-hook] change push failed: {error}");
-            }
-        }
+    let Some(banner) = banner else {
+        return;
+    };
+    if let Err(error) = store_banner(banner.clone()) {
+        log::error!("[DataMode-hook] banner store failed: {error}");
+        return;
     }
-    if let Some(banner) = banner {
-        if let Err(error) = store_banner(banner) {
-            log::error!("[DataMode-hook] banner store failed: {error}");
+
+    let result = match pt::push_data_mode_change(&input, prev, Some(&banner)).await {
+        Ok(result) => result,
+        Err(error) => {
+            log::error!("[DataMode-hook] change push failed: {error}");
             return;
         }
-    }
-    match LATEST_DATA_MODE.lock() {
-        Ok(mut state) => *state = Some(health.mode),
-        Err(_) => log::error!("[DataMode-hook] latest data mode lock poisoned"),
+    };
+    if result.is_confirmed() {
+        match LATEST_DATA_MODE.lock() {
+            Ok(mut state) => *state = Some(health.mode),
+            Err(_) => log::error!("[DataMode-hook] latest data mode lock poisoned"),
+        }
+    } else {
+        log::warn!(
+            "[DataMode-hook][BR-116] notification unconfirmed; retaining previous mode {:?}",
+            prev
+        );
     }
 }
 
@@ -4211,8 +4236,8 @@ fn seed_isolated_e2e_banner() -> Result<(), String> {
     let today_pnl = latest.daily_pnl / latest.total_value * 100.0;
     store_banner(push_templates::BannerCtx {
         account_mode: push_templates::AccountMode::Normal,
-        total_pos,
-        today_pnl,
+        total_pos: Some(total_pos),
+        today_pnl: Some(today_pnl),
         data_mode: push_templates::DataMode::Full,
         data_missing_note: None,
     })
@@ -5078,8 +5103,15 @@ async fn monitor_loop() {
         use stock_analysis::trading::paper_engine;
         let monitor = IntradayMonitor;
         loop {
-            let risk_context = current_banner_for("v16.3 paper decision")
-                .map(|banner| push_templates::paper_risk_context_from_banner(&banner));
+            let risk_context = current_banner_for("v16.3 paper decision").and_then(|banner| {
+                match push_templates::paper_risk_context_from_banner(&banner) {
+                    Ok(context) => Some(context),
+                    Err(error) => {
+                        log::error!("[v16.3][BR-134] paper risk context unavailable: {}", error);
+                        None
+                    }
+                }
+            });
             if let Some(risk_context) = risk_context {
                 match monitor.tick(risk_context) {
                     Ok(n) if n > 0 => {

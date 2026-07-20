@@ -108,12 +108,13 @@ impl fmt::Display for DataMode {
 /// v12 §14.0 全局横幅入参
 ///
 /// `total_pos` 仓位成数 (0~10). `today_pnl` 日盈亏百分比 (已带正负号).
+/// 账户指标尚未形成真实完整批次时保持 `None`，禁止显示为 0。
 /// `data_missing_note` 仅在 Degraded/Unsafe 出现, 例如 "缺盘口深度".
 #[derive(Clone, Debug)]
 pub struct BannerCtx {
     pub account_mode: AccountMode,
-    pub total_pos: u8,
-    pub today_pnl: f64,
+    pub total_pos: Option<u8>,
+    pub today_pnl: Option<f64>,
     pub data_mode: DataMode,
     pub data_missing_note: Option<String>,
 }
@@ -122,8 +123,8 @@ impl Default for BannerCtx {
     fn default() -> Self {
         Self {
             account_mode: AccountMode::Normal,
-            total_pos: 0,
-            today_pnl: 0.0,
+            total_pos: None,
+            today_pnl: None,
             data_mode: DataMode::Full,
             data_missing_note: None,
         }
@@ -136,8 +137,8 @@ impl BannerCtx {
     pub fn test_default() -> Self {
         Self {
             account_mode: AccountMode::Normal,
-            total_pos: 0,
-            today_pnl: 0.0,
+            total_pos: Some(0),
+            today_pnl: Some(0.0),
             data_mode: DataMode::Full,
             data_missing_note: None,
         }
@@ -148,12 +149,19 @@ impl BannerCtx {
     /// 第 1 行: `[icon mode | 仓位N成 | 日盈亏+/-X.X% | 数据DataMode]`
     /// 第 2 行 (可选): `[⚠️ {data_missing_note}]` — 仅 Degraded/Unsafe 时出现
     pub fn render(&self) -> String {
+        let position = self
+            .total_pos
+            .map_or_else(|| "仓位缺失".to_string(), |value| format!("仓位{value}成"));
+        let pnl = self.today_pnl.map_or_else(
+            || "日盈亏缺失".to_string(),
+            |value| format!("日盈亏{value:+.1}%"),
+        );
         let line1 = format!(
-            "[{} {} | 仓位{}成 | 日盈亏{:+.1}% | 数据{}]",
+            "[{} {} | {} | {} | 数据{}]",
             self.account_mode.icon(),
             self.account_mode.label(),
-            self.total_pos,
-            self.today_pnl,
+            position,
+            pnl,
             self.data_mode.label(),
         );
         match self.data_missing_note.as_deref() {
@@ -169,7 +177,10 @@ impl BannerCtx {
 /// library risk facts used by every paper-trading path.
 pub(crate) fn paper_risk_context_from_banner(
     banner: &BannerCtx,
-) -> stock_analysis::trading::paper_trade::PaperRiskContext {
+) -> Result<stock_analysis::trading::paper_trade::PaperRiskContext, String> {
+    if banner.total_pos.is_none() || banner.today_pnl.is_none() {
+        return Err("BR-134 complete account metrics are unavailable".to_string());
+    }
     let account_mode = match banner.account_mode {
         AccountMode::Normal => stock_analysis::risk::action_gate::AccountMode::Normal,
         AccountMode::ReduceOnly => stock_analysis::risk::action_gate::AccountMode::ReduceOnly,
@@ -180,7 +191,10 @@ pub(crate) fn paper_risk_context_from_banner(
         DataMode::Degraded => stock_analysis::monitor::data_mode::DataMode::Degraded,
         DataMode::Unsafe => stock_analysis::monitor::data_mode::DataMode::Unsafe,
     };
-    stock_analysis::trading::paper_trade::PaperRiskContext::new(account_mode, data_mode)
+    Ok(stock_analysis::trading::paper_trade::PaperRiskContext::new(
+        account_mode,
+        data_mode,
+    ))
 }
 
 // ============================================================================
@@ -219,7 +233,7 @@ pub fn render_account_mode(
 /// v12 §14.1 T-02 DataMode 模板渲染 — 字段顺序严格对齐 docs/architecture/v13-push-templates.md
 pub fn render_data_mode(
     hhmm: &str,
-    old: DataMode,
+    old: Option<DataMode>,
     new: DataMode,
     missing_items: &str,
     restrictions: &[String],
@@ -228,7 +242,7 @@ pub fn render_data_mode(
     let mut out = format!(
         "📡 数据状态变更（{}）\n{} → {}\n受影响: {}\n输出限制:",
         hhmm,
-        old.label(),
+        old.map(DataMode::label).unwrap_or("未建立"),
         new.label(),
         missing_items,
     );
@@ -1526,6 +1540,43 @@ pub fn check_no_acceptance_when_missing_book(text: &str, book_missing: bool) -> 
 // PR1-1.6 orchestrator: 模式变更 → 落库 → T-01 → dispatch
 // ============================================================================
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccountModeNotificationPlan {
+    NoChange,
+    Insert,
+    ReusePending(i64),
+}
+
+fn account_mode_from_label(
+    label: &str,
+) -> Result<stock_analysis::risk::action_gate::AccountMode, String> {
+    use stock_analysis::risk::action_gate::AccountMode;
+
+    match label {
+        "Normal" => Ok(AccountMode::Normal),
+        "ReduceOnly" => Ok(AccountMode::ReduceOnly),
+        "Frozen" => Ok(AccountMode::Frozen),
+        _ => Err(format!("invalid persisted AccountMode label: {label}")),
+    }
+}
+
+fn plan_account_mode_notification(
+    latest: Option<&stock_analysis::database::account_mode_log::AccountModeLogRow>,
+    evaluated: stock_analysis::risk::action_gate::AccountMode,
+) -> Result<AccountModeNotificationPlan, String> {
+    let Some(row) = latest else {
+        return Ok(AccountModeNotificationPlan::Insert);
+    };
+    let persisted = account_mode_from_label(&row.new_mode)?;
+    if persisted != evaluated {
+        return Ok(AccountModeNotificationPlan::Insert);
+    }
+    if row.pushed == 0 {
+        return Ok(AccountModeNotificationPlan::ReusePending(i64::from(row.id)));
+    }
+    Ok(AccountModeNotificationPlan::NoChange)
+}
+
 /// v12 PR1-1.6: 模式变更编排器.
 ///
 /// 完整链路: evaluate() → is_changed() → 落库 → 拼 T-01 → dispatch() → 标记 pushed.
@@ -1538,6 +1589,7 @@ pub fn check_no_acceptance_when_missing_book(text: &str, book_missing: bool) -> 
 pub async fn push_account_mode_change(
     metrics: &stock_analysis::risk::account_mode::PortfolioMetrics,
     prev: Option<stock_analysis::risk::action_gate::AccountMode>,
+    latest: Option<&stock_analysis::database::account_mode_log::AccountModeLogRow>,
     banner: Option<&BannerCtx>,
 ) -> Result<bool, String> {
     use stock_analysis::config::get_risk_config;
@@ -1545,6 +1597,12 @@ pub async fn push_account_mode_change(
     use stock_analysis::risk::action_gate::AccountMode as LibAM;
 
     let thresholds: ModeThresholds = get_risk_config().account_mode.to_thresholds();
+    if let Some(row) = latest {
+        let persisted = account_mode_from_label(&row.new_mode)?;
+        if Some(persisted) != prev {
+            return Err("persisted AccountMode row does not match previous mode".to_string());
+        }
+    }
     // BR-021 caller wire: 8:30 盘前重置信号 (commit 08cca47 helper + 当前 commit 集成).
     // 当 prev=Frozen 且当前时间落在 8:30 窗口 → 强制 prev=None 让 evaluate 基于 metrics
     // 重判, Frozen 自动落到 Normal (或仍 Frozen 如 metrics 仍超限, 都由 evaluate 决定).
@@ -1559,41 +1617,67 @@ pub async fn push_account_mode_change(
     };
     let eval = evaluate(metrics, prev_for_eval, &thresholds);
 
-    let is_initial_evaluation = prev.is_none();
-    if !is_initial_evaluation && !eval.is_changed() {
+    let is_initial_evaluation = prev.is_none() && latest.is_none();
+    let notification_plan = if latest.is_some() {
+        plan_account_mode_notification(latest, eval.mode)?
+    } else if prev.is_none() || eval.is_changed() {
+        AccountModeNotificationPlan::Insert
+    } else {
+        AccountModeNotificationPlan::NoChange
+    };
+    if notification_plan == AccountModeNotificationPlan::NoChange {
         return Ok(false);
     }
 
     // The first real evaluation is an auditable state establishment. Represent
     // it as current→current because the schema requires both endpoints; do not
     // invent Normal as the predecessor.
-    let prev_mode = prev.unwrap_or(eval.mode);
-    let new_mode = eval.mode;
+    let (prev_mode, new_mode) = match notification_plan {
+        AccountModeNotificationPlan::ReusePending(_) => {
+            let row = latest.ok_or_else(|| "pending AccountMode row missing".to_string())?;
+            (
+                account_mode_from_label(&row.prev_mode)?,
+                account_mode_from_label(&row.new_mode)?,
+            )
+        }
+        _ => (prev.unwrap_or(eval.mode), eval.mode),
+    };
 
-    // 1. 落库 (pushed=0)
-    let log_id = stock_analysis::database::account_mode_log::insert_account_mode_change(
-        prev_mode,
-        new_mode,
-        eval.trigger_reason
-            .as_deref()
-            .unwrap_or(if is_initial_evaluation {
-                "initial account mode evaluation"
-            } else {
-                ""
-            }),
-        Some(metrics.today_pnl_pct),
-        Some(metrics.consecutive_stop_loss_n),
-        Some(metrics.total_pos_cheng),
-        metrics.data_complete,
-    )
-    .map_err(|e| format!("insert_account_mode_change: {}", e))?;
+    let default_reason = if is_initial_evaluation {
+        "initial account mode evaluation"
+    } else {
+        ""
+    };
+    let (log_id, transition_reason, is_new_transition) = match notification_plan {
+        AccountModeNotificationPlan::Insert => {
+            let reason = eval.trigger_reason.as_deref().unwrap_or(default_reason);
+            let log_id = stock_analysis::database::account_mode_log::insert_account_mode_change(
+                prev_mode,
+                new_mode,
+                reason,
+                metrics.today_pnl_pct,
+                metrics.consecutive_stop_loss_n,
+                metrics.total_pos_cheng,
+                metrics.is_complete(),
+            )
+            .map_err(|e| format!("insert_account_mode_change: {}", e))?;
+            (log_id, reason.to_string(), true)
+        }
+        AccountModeNotificationPlan::ReusePending(log_id) => {
+            let row = latest.ok_or_else(|| "pending AccountMode row missing".to_string())?;
+            log::warn!(
+                "[AccountMode][BR-116] retry pending notification log_id={}",
+                log_id
+            );
+            (log_id, row.trigger_reason.clone(), false)
+        }
+        AccountModeNotificationPlan::NoChange => unreachable!("handled above"),
+    };
 
     // 2. 拼 T-01
     let hhmm = chrono::Local::now().format("%H:%M").to_string();
-    let reasons = eval
-        .trigger_reason
-        .as_deref()
-        .map(|r| vec![r.to_string()])
+    let reasons = (!transition_reason.is_empty())
+        .then_some(vec![transition_reason.clone()])
         .unwrap_or_default();
     let forbidden = match new_mode {
         LibAM::Normal => "(无)",
@@ -1629,7 +1713,7 @@ pub async fn push_account_mode_change(
     .await;
 
     // 3a. Frozen transition: also emit one MarketActionAlert (NOT for initial eval, NOT for unchanged)
-    if !is_initial_evaluation && new_mode == LibAM::Frozen {
+    if is_new_transition && !is_initial_evaluation && new_mode == LibAM::Frozen {
         use stock_analysis::news::aggregator::{NormalizedSourceEvent, SourcePushKind};
         let trigger = eval.trigger_reason.as_deref().unwrap_or("account frozen");
         let event_id = format!("frozen:{:?}:{:?}", prev_mode, new_mode);
@@ -3469,7 +3553,7 @@ async fn submit_virtual_buy_from_d01(
         limit_down_price: Some(quote.limit_down_price),
         secondary_confirmed: false,
         quote_observed_at: quote.observed_at,
-        risk_context: paper_risk_context_from_banner(banner),
+        risk_context: paper_risk_context_from_banner(banner)?,
     };
 
     // v16.3 Commit 1: simulate 签名加 4 参数 (quote_price 真 + cash/total/pos_pct 真 portfolio 读)
@@ -5749,8 +5833,8 @@ mod tests_r_dispatchers {
     async fn test_dispatch_r02_review_market_no_panic() {
         let banner = BannerCtx {
             account_mode: AccountMode::Normal,
-            total_pos: 5,
-            today_pnl: 0.0,
+            total_pos: Some(5),
+            today_pnl: Some(0.0),
             data_mode: DataMode::Full,
             data_missing_note: None,
         };
@@ -5765,8 +5849,8 @@ mod tests_r_dispatchers {
     async fn test_dispatch_r02_fallback_renders() {
         let banner = BannerCtx {
             account_mode: AccountMode::Normal,
-            total_pos: 0,
-            today_pnl: 0.0,
+            total_pos: Some(0),
+            today_pnl: Some(0.0),
             data_mode: DataMode::Full,
             data_missing_note: None,
         };
@@ -5788,8 +5872,8 @@ mod tests_r_dispatchers {
         // 验证: 此测试在没 init DB 时不 panic 且返回 false.
         let banner = BannerCtx {
             account_mode: AccountMode::Normal,
-            total_pos: 0,
-            today_pnl: 0.0,
+            total_pos: Some(0),
+            today_pnl: Some(0.0),
             data_mode: DataMode::Full,
             data_missing_note: None,
         };
@@ -5805,8 +5889,8 @@ mod tests_r_dispatchers {
     async fn test_dispatch_r05_skips_when_no_db() {
         let banner = BannerCtx {
             account_mode: AccountMode::Normal,
-            total_pos: 0,
-            today_pnl: 0.0,
+            total_pos: Some(0),
+            today_pnl: Some(0.0),
             data_mode: DataMode::Full,
             data_missing_note: None,
         };
@@ -6130,21 +6214,69 @@ pub async fn push_candidate_invalidated(
 /// 返回 `Ok(true)` 表示推送成功; `Ok(false)` 表示无变更 (no-op).
 ///
 /// `prev` 由调用方从 history 表恢复, 首次评估传 None.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DataModeNotificationPlan {
+    EstablishSilently,
+    Dispatch {
+        previous: Option<stock_analysis::monitor::data_mode::DataMode>,
+        current: stock_analysis::monitor::data_mode::DataMode,
+    },
+}
+
+fn data_mode_notification_plan(
+    input: &stock_analysis::monitor::data_mode::DataHealthInput,
+    prev: Option<stock_analysis::monitor::data_mode::DataMode>,
+) -> DataModeNotificationPlan {
+    use stock_analysis::monitor::data_mode::{evaluate as dm_evaluate, DataMode as LibDM};
+
+    let health = dm_evaluate(input, prev);
+    match (prev, health.mode) {
+        (None, LibDM::Full) => DataModeNotificationPlan::EstablishSilently,
+        (None, current) => DataModeNotificationPlan::Dispatch {
+            previous: None,
+            current,
+        },
+        (Some(previous), current) if previous != current => DataModeNotificationPlan::Dispatch {
+            previous: Some(previous),
+            current,
+        },
+        _ => DataModeNotificationPlan::EstablishSilently,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModeDispatchResult {
+    EstablishedSilently,
+    Delivery(crate::notify::PushOutcome),
+}
+
+impl ModeDispatchResult {
+    pub fn is_confirmed(&self) -> bool {
+        matches!(
+            self,
+            Self::EstablishedSilently
+                | Self::Delivery(
+                    crate::notify::PushOutcome::Pushed | crate::notify::PushOutcome::Deduped
+                )
+        )
+    }
+}
+
 pub async fn push_data_mode_change(
     input: &stock_analysis::monitor::data_mode::DataHealthInput,
     prev: Option<stock_analysis::monitor::data_mode::DataMode>,
     banner: Option<&BannerCtx>,
-) -> Result<bool, String> {
+) -> Result<ModeDispatchResult, String> {
     use stock_analysis::monitor::data_mode::{evaluate as dm_evaluate, DataMode as LibDM};
 
     let health = dm_evaluate(input, prev);
 
-    if !health.is_changed() {
-        return Ok(false);
-    }
-
-    let prev_mode = prev.expect("is_changed=true ⇒ prev=Some");
-    let new_mode = health.mode;
+    let (prev_mode, new_mode) = match data_mode_notification_plan(input, prev) {
+        DataModeNotificationPlan::EstablishSilently => {
+            return Ok(ModeDispatchResult::EstablishedSilently);
+        }
+        DataModeNotificationPlan::Dispatch { previous, current } => (previous, current),
+    };
 
     // 1. 拼 T-02 (复用 §14.1 T-02 模板)
     let hhmm = chrono::Local::now().format("%H:%M").to_string();
@@ -6173,11 +6305,11 @@ pub async fn push_data_mode_change(
         ],
     };
 
-    let prev_tmpl = match prev_mode {
+    let prev_tmpl = prev_mode.map(|mode| match mode {
         LibDM::Full => DataMode::Full,
         LibDM::Degraded => DataMode::Degraded,
         LibDM::Unsafe => DataMode::Unsafe,
-    };
+    });
     let new_tmpl = match new_mode {
         LibDM::Full => DataMode::Full,
         LibDM::Degraded => DataMode::Degraded,
@@ -6199,9 +6331,12 @@ pub async fn push_data_mode_change(
     ));
 
     // 2. dispatch (code="" 全局键, DataMode 10min 冷却走 push_governor 默认)
-    let ok = dispatch(crate::notify::PushKind::DataMode, "", banner, text).await;
+    let outcome = dispatch_outcome(crate::notify::PushKind::DataMode, "", banner, text).await;
 
-    if !ok {
+    if !matches!(
+        outcome,
+        crate::notify::PushOutcome::Pushed | crate::notify::PushOutcome::Deduped
+    ) {
         log::info!(
             "[DataMode] T-02 推送被治理拦截 (冷却或预算), mode {:?} → {:?}",
             prev_mode,
@@ -6209,7 +6344,7 @@ pub async fn push_data_mode_change(
         );
     }
 
-    Ok(ok)
+    Ok(ModeDispatchResult::Delivery(outcome))
 }
 
 use once_cell::sync::Lazy;
@@ -7295,6 +7430,23 @@ pub async fn dispatch_post_close_fund_inflow_buy(date: &str, banner: &BannerCtx)
     let text = render_fund_inflow_top(&hhmm, &items);
     let push_result = dispatch(crate::notify::PushKind::FundInflow, "", None, text).await;
 
+    let risk_context = match paper_risk_context_from_banner(banner) {
+        Ok(context) => context,
+        Err(error) => {
+            log::error!(
+                "[盘后资金流入][BR-134] 跳过虚拟买入: 风险上下文不可用: {}",
+                error
+            );
+            log_dispatcher_attempt(
+                "I-10-postclose",
+                push_result,
+                top.len(),
+                "paper risk context unavailable",
+            );
+            return push_result;
+        }
+    };
+
     // 2. 按收盘价虚拟买入
     let now = chrono::Local::now();
     let mut filled = 0usize;
@@ -7358,7 +7510,7 @@ pub async fn dispatch_post_close_fund_inflow_buy(date: &str, banner: &BannerCtx)
             limit_down_price: Some(execution_quote.limit_down_price),
             secondary_confirmed: false,
             quote_observed_at: execution_quote.observed_at,
-            risk_context: paper_risk_context_from_banner(banner),
+            risk_context,
         };
         // v16.3 Commit 1: simulate 签名加 4 参数 (quote_price 真 + cash/total/pos_pct 真 portfolio 读)
         let (cash, total, pos_pct) = match paper_portfolio_state(&s.code, execution_quote.price) {
@@ -7513,8 +7665,8 @@ mod tests {
     fn banner_normal() -> BannerCtx {
         BannerCtx {
             account_mode: AccountMode::Normal,
-            total_pos: 5,
-            today_pnl: 0.3,
+            total_pos: Some(5),
+            today_pnl: Some(0.3),
             data_mode: DataMode::Full,
             data_missing_note: None,
         }
@@ -7529,13 +7681,39 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_banner_renders_missing_account_facts() {
+        let banner = BannerCtx {
+            account_mode: AccountMode::ReduceOnly,
+            total_pos: None,
+            today_pnl: None,
+            data_mode: DataMode::Unsafe,
+            data_missing_note: Some("账户指标缺失".to_string()),
+        };
+        let text = banner.render();
+        assert!(text.contains("仓位缺失"));
+        assert!(text.contains("日盈亏缺失"));
+    }
+
+    #[test]
+    fn br134_incomplete_banner_cannot_create_paper_risk_context() {
+        let banner = BannerCtx {
+            account_mode: AccountMode::ReduceOnly,
+            total_pos: None,
+            today_pnl: None,
+            data_mode: DataMode::Unsafe,
+            data_missing_note: Some("账户指标缺失".to_string()),
+        };
+        assert!(paper_risk_context_from_banner(&banner).is_err());
+    }
+
+    #[test]
     fn br134_banner_conversion_preserves_frozen_and_unsafe_modes() {
         let banner = BannerCtx {
             account_mode: AccountMode::Frozen,
             data_mode: DataMode::Unsafe,
             ..BannerCtx::test_default()
         };
-        let context = paper_risk_context_from_banner(&banner);
+        let context = paper_risk_context_from_banner(&banner).unwrap();
         assert_eq!(
             context.account_mode,
             stock_analysis::risk::action_gate::AccountMode::Frozen
@@ -7550,8 +7728,8 @@ mod tests {
     fn banner_reduce_only_degraded() {
         let b = BannerCtx {
             account_mode: AccountMode::ReduceOnly,
-            total_pos: 6,
-            today_pnl: -1.6,
+            total_pos: Some(6),
+            today_pnl: Some(-1.6),
             data_mode: DataMode::Degraded,
             data_missing_note: Some("缺盘口深度".to_string()),
         };
@@ -7564,8 +7742,8 @@ mod tests {
     fn banner_frozen_no_missing_note() {
         let b = BannerCtx {
             account_mode: AccountMode::Frozen,
-            total_pos: 0,
-            today_pnl: -2.1,
+            total_pos: Some(0),
+            today_pnl: Some(-2.1),
             data_mode: DataMode::Full,
             data_missing_note: Some("不该出现".to_string()),
         };
@@ -7612,7 +7790,7 @@ mod tests {
     fn t02_data_mode_full_to_degraded() {
         let s = render_data_mode(
             "09:35",
-            DataMode::Full,
+            Some(DataMode::Full),
             DataMode::Degraded,
             "OrderBook",
             &["不做盘口承接判断".to_string(), "禁出价格型建议".to_string()],
@@ -7628,7 +7806,7 @@ mod tests {
     fn t02_data_mode_no_eta() {
         let s = render_data_mode(
             "14:00",
-            DataMode::Degraded,
+            Some(DataMode::Degraded),
             DataMode::Unsafe,
             "Quote",
             &["禁出所有建议".to_string()],
@@ -10382,8 +10560,8 @@ mod tests {
         // §14.0 横幅格式硬性: "[icon mode | 仓位N成 | 日盈亏+/-X.X% | 数据Mode]"
         let b = BannerCtx {
             account_mode: AccountMode::Normal,
-            total_pos: 5,
-            today_pnl: 0.3,
+            total_pos: Some(5),
+            today_pnl: Some(0.3),
             data_mode: DataMode::Full,
             data_missing_note: None,
         };
@@ -10638,11 +10816,87 @@ mod tests {
     fn banner_normal_full() -> BannerCtx {
         BannerCtx {
             account_mode: AccountMode::Normal,
-            total_pos: 5,
-            today_pnl: 0.3,
+            total_pos: Some(5),
+            today_pnl: Some(0.3),
             data_mode: DataMode::Full,
             data_missing_note: None,
         }
+    }
+
+    #[test]
+    fn br116_failed_account_notification_reuses_pending_audit_row() {
+        use stock_analysis::database::account_mode_log::AccountModeLogRow;
+        use stock_analysis::risk::action_gate::AccountMode as LibAM;
+
+        let pending = AccountModeLogRow {
+            id: 41,
+            ts: "2026-07-20 09:30:00".to_string(),
+            prev_mode: "Normal".to_string(),
+            new_mode: "ReduceOnly".to_string(),
+            trigger_reason: "TEST_CODE account metrics missing".to_string(),
+            today_pnl_pct: None,
+            consecutive_n: None,
+            total_pos_cheng: None,
+            data_complete: 0,
+            pushed: 0,
+            push_attempted_at: None,
+        };
+
+        assert_eq!(
+            plan_account_mode_notification(Some(&pending), LibAM::ReduceOnly).unwrap(),
+            AccountModeNotificationPlan::ReusePending(41)
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
+    async fn br116_pending_account_notification_retries_without_duplicate_row() {
+        let _e2e_guard = E2E_MUTEX.lock().await;
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
+        init_test_db();
+        reset_daily_budget_for_test();
+
+        use stock_analysis::database::account_mode_log;
+        use stock_analysis::risk::account_mode::PortfolioMetrics;
+        use stock_analysis::risk::action_gate::AccountMode as LibAM;
+
+        account_mode_log::insert_account_mode_change(
+            LibAM::Normal,
+            LibAM::ReduceOnly,
+            "TEST_CODE account metrics missing",
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect("seed pending notification");
+        let pending = account_mode_log::latest_account_mode_change()
+            .expect("read pending notification")
+            .expect("pending notification exists");
+        let banner = BannerCtx {
+            account_mode: AccountMode::ReduceOnly,
+            total_pos: None,
+            today_pnl: None,
+            data_mode: DataMode::Unsafe,
+            data_missing_note: Some("账户指标缺失".to_string()),
+        };
+        *crate::LATEST_BANNER
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(banner.clone());
+
+        let pushed = push_account_mode_change(
+            &PortfolioMetrics::incomplete(),
+            Some(LibAM::ReduceOnly),
+            Some(&pending),
+            Some(&banner),
+        )
+        .await
+        .expect("retry pending notification");
+
+        assert!(pushed);
+        let rows = account_mode_log::recent_account_mode_changes(10).expect("read audit rows");
+        assert_eq!(rows.len(), 1, "retry must reuse the pending audit row");
+        assert_eq!(rows[0].pushed, 1);
     }
 
     /// T-01 E2E: Normal → ReduceOnly. 验证 DB 写 + 推送路径
@@ -10658,16 +10912,15 @@ mod tests {
         use stock_analysis::risk::account_mode::PortfolioMetrics;
         use stock_analysis::risk::action_gate::AccountMode as LibAM;
 
-        let metrics = PortfolioMetrics {
-            today_pnl_pct: -1.6,
-            consecutive_stop_loss_n: 0,
-            total_pos_cheng: 5,
-            data_complete: true,
-        };
+        let metrics = PortfolioMetrics::complete(-1.6, 0, 5);
 
-        let result =
-            push_account_mode_change(&metrics, Some(LibAM::Normal), Some(&banner_normal_full()))
-                .await;
+        let result = push_account_mode_change(
+            &metrics,
+            Some(LibAM::Normal),
+            None,
+            Some(&banner_normal_full()),
+        )
+        .await;
 
         assert!(result.is_ok(), "orchestrator 不应报错: {:?}", result);
         assert!(result.unwrap(), "T-01 应推送成功 (dry-run)");
@@ -10710,16 +10963,12 @@ mod tests {
             .map(|r| r.len())
             .unwrap_or(0);
 
-        let metrics = PortfolioMetrics {
-            today_pnl_pct: -1.6,
-            consecutive_stop_loss_n: 0,
-            total_pos_cheng: 5,
-            data_complete: true,
-        };
+        let metrics = PortfolioMetrics::complete(-1.6, 0, 5);
         // prev 已是 ReduceOnly, metrics 不变 → is_changed=false
         let result = push_account_mode_change(
             &metrics,
             Some(LibAM::ReduceOnly),
+            None,
             Some(&banner_normal_full()),
         )
         .await;
@@ -10745,14 +10994,9 @@ mod tests {
         use stock_analysis::database::account_mode_log;
         use stock_analysis::risk::account_mode::PortfolioMetrics;
 
-        let metrics = PortfolioMetrics {
-            today_pnl_pct: 0.2,
-            consecutive_stop_loss_n: 0,
-            total_pos_cheng: 4,
-            data_complete: true,
-        };
+        let metrics = PortfolioMetrics::complete(0.2, 0, 4);
 
-        let pushed = push_account_mode_change(&metrics, None, Some(&banner_normal_full()))
+        let pushed = push_account_mode_change(&metrics, None, None, Some(&banner_normal_full()))
             .await
             .expect("initial evaluation must be orchestrated");
         assert!(pushed, "dry-run initial evaluation should dispatch");
@@ -10778,16 +11022,12 @@ mod tests {
         use stock_analysis::risk::account_mode::PortfolioMetrics;
         use stock_analysis::risk::action_gate::AccountMode as LibAM;
 
-        let metrics = PortfolioMetrics {
-            today_pnl_pct: -2.5, // 超过 -2.0% 熔断线
-            consecutive_stop_loss_n: 5,
-            total_pos_cheng: 9,
-            data_complete: true,
-        };
+        let metrics = PortfolioMetrics::complete(-2.5, 5, 9); // 超过 -2.0% 熔断线
 
         let result = push_account_mode_change(
             &metrics,
             Some(LibAM::ReduceOnly),
+            None,
             Some(&banner_normal_full()),
         )
         .await;
@@ -10814,16 +11054,15 @@ mod tests {
         use stock_analysis::risk::account_mode::PortfolioMetrics;
         use stock_analysis::risk::action_gate::AccountMode as LibAM;
 
-        let metrics = PortfolioMetrics {
-            today_pnl_pct: 0.0,
-            consecutive_stop_loss_n: 0,
-            total_pos_cheng: 0,
-            data_complete: false,
-        };
+        let metrics = PortfolioMetrics::incomplete();
 
-        let result =
-            push_account_mode_change(&metrics, Some(LibAM::Normal), Some(&banner_normal_full()))
-                .await;
+        let result = push_account_mode_change(
+            &metrics,
+            Some(LibAM::Normal),
+            None,
+            Some(&banner_normal_full()),
+        )
+        .await;
         assert!(result.is_ok());
 
         let rows = account_mode_log::recent_account_mode_changes(1).expect("query");
@@ -10860,7 +11099,10 @@ mod tests {
         let result =
             push_data_mode_change(&input, Some(LibDM::Full), Some(&banner_normal_full())).await;
         assert!(result.is_ok(), "T-02 orchestrator: {:?}", result);
-        assert!(result.unwrap(), "T-02 应推送成功");
+        assert!(matches!(
+            result.unwrap(),
+            ModeDispatchResult::Delivery(crate::notify::PushOutcome::Pushed)
+        ));
     }
 
     /// T-02 E2E: 无变更 → no-op
@@ -10888,7 +11130,42 @@ mod tests {
         let result =
             push_data_mode_change(&input, Some(LibDM::Full), Some(&banner_normal_full())).await;
         assert!(result.is_ok());
-        assert!(!result.unwrap(), "Full → Full 应 no-op");
+        assert!(matches!(
+            result.unwrap(),
+            ModeDispatchResult::EstablishedSilently
+        ));
+    }
+
+    #[test]
+    fn initial_unsafe_data_mode_requires_a_status_delivery() {
+        use stock_analysis::monitor::data_mode::{DataHealthInput, DataMode as LibDM};
+
+        let plan = data_mode_notification_plan(&DataHealthInput::default(), None);
+        assert!(matches!(
+            plan,
+            DataModeNotificationPlan::Dispatch {
+                previous: None,
+                current: LibDM::Unsafe
+            }
+        ));
+    }
+
+    #[test]
+    fn initial_full_data_mode_establishes_silently() {
+        use stock_analysis::monitor::data_mode::{Capability, CapabilityStatus, DataHealthInput};
+
+        let input = DataHealthInput {
+            capabilities: Capability::ALL
+                .iter()
+                .map(|capability| CapabilityStatus::fresh(*capability, 1))
+                .collect(),
+            critical_max_age_secs: 120,
+            orderbook_max_age_secs: 600,
+        };
+        assert_eq!(
+            data_mode_notification_plan(&input, None),
+            DataModeNotificationPlan::EstablishSilently
+        );
     }
 
     /// T-02 模板精确内容验证: 文本必须与 §14.1 T-02 模板逐字符一致
@@ -10896,7 +11173,7 @@ mod tests {
     fn t02_template_text_exact_format() {
         let s = render_data_mode(
             "10:23",
-            DataMode::Full,
+            Some(DataMode::Full),
             DataMode::Degraded,
             "Kline/MoneyFlow",
             &[
@@ -10949,8 +11226,8 @@ mod tests {
     fn banner_plus_t01_concat_format() {
         let banner = BannerCtx {
             account_mode: AccountMode::ReduceOnly,
-            total_pos: 5,
-            today_pnl: -1.6,
+            total_pos: Some(5),
+            today_pnl: Some(-1.6),
             data_mode: DataMode::Full,
             data_missing_note: None,
         };
@@ -11154,15 +11431,14 @@ mod tests {
 
         // ===== T-01 账户模式变更 =====
         {
-            let metrics = stock_analysis::risk::account_mode::PortfolioMetrics {
-                today_pnl_pct,
-                consecutive_stop_loss_n: 0,
-                total_pos_cheng: if total_value > 0.0 {
-                    ((market_value / total_value) * 10.0).round() as u8
-                } else {
-                    0
-                },
-                data_complete,
+            let metrics = if data_complete {
+                stock_analysis::risk::account_mode::PortfolioMetrics::complete(
+                    today_pnl_pct,
+                    0,
+                    ((market_value / total_value) * 10.0).round() as u8,
+                )
+            } else {
+                stock_analysis::risk::account_mode::PortfolioMetrics::incomplete()
             };
             let eval = stock_analysis::risk::account_mode::evaluate(
                 &metrics,
@@ -11253,7 +11529,7 @@ mod tests {
                 ];
                 let text = render_data_mode(
                     &hhmm,
-                    DataMode::Full,
+                    Some(DataMode::Full),
                     DataMode::Unsafe,
                     &missing_str,
                     &restrictions,
@@ -11293,11 +11569,11 @@ mod tests {
             let banner = BannerCtx {
                 account_mode: AccountMode::Normal,
                 total_pos: if total_value > 0.0 {
-                    ((market_value / total_value) * 10.0).round() as u8
+                    Some(((market_value / total_value) * 10.0).round() as u8)
                 } else {
-                    0
+                    None
                 },
-                today_pnl: today_pnl_pct,
+                today_pnl: data_complete.then_some(today_pnl_pct),
                 data_mode: DataMode::Full,
                 data_missing_note: None,
             };
@@ -11360,11 +11636,11 @@ mod tests {
             let banner = BannerCtx {
                 account_mode: AccountMode::Normal,
                 total_pos: if total_value > 0.0 {
-                    ((market_value / total_value) * 10.0).round() as u8
+                    Some(((market_value / total_value) * 10.0).round() as u8)
                 } else {
-                    0
+                    None
                 },
-                today_pnl: today_pnl_pct,
+                today_pnl: data_complete.then_some(today_pnl_pct),
                 data_mode: DataMode::Full,
                 data_missing_note: None,
             };

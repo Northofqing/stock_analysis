@@ -106,15 +106,8 @@ pub fn v14_gate_with_sub_kind(
             return V14Gate::Denied("analytics_store_unavailable".to_string());
         }
     };
-    let (source, kind_str, severity) = map_push_kind(kind);
-    let event = SignalEvent::new(
-        source,
-        kind_str,
-        code.map(str::to_string),
-        Local::now(),
-        SignalPayload::HoldingHealth(Default::default()),
-        severity,
-    );
+    let event = signal_event_for_kind(kind, code);
+    let (_, kind_str, _) = map_push_kind(kind);
 
     // b013 review P0-3: dedup 仅在 governance Approved + 投递成功后才插 (避免 Denied/failed 误锁窗口).
     // 旧实现: dedup 先于 governance, 5min 静默期内的 Denied retry 全被挡到下次窗口.
@@ -433,7 +426,7 @@ fn map_push_kind(kind: PushKind) -> (SignalSource, &'static str, Severity) {
         PushKind::CandidateBoard => (HoldingHealth, "candidate_board", Severity::Normal),
         PushKind::NewsRanked => (NewsCatalyst, "news_ranked", Severity::Normal),
         PushKind::AccountMode => (HoldingHealth, "account_mode", Severity::High),
-        PushKind::DataMode => (HoldingHealth, "data_mode", Severity::High),
+        PushKind::DataMode => (DataSourceDown, "data_mode", Severity::High),
         PushKind::HoldingPlan => (HoldingHealth, "holding_plan", Severity::Normal),
         PushKind::T0Advice => (HoldingHealth, "t0_advice", Severity::Normal),
         PushKind::CandidateTriggered => (HoldingHealth, "candidate_triggered", Severity::Normal),
@@ -498,13 +491,32 @@ fn map_push_kind(kind: PushKind) -> (SignalSource, &'static str, Severity) {
     }
 }
 
+fn signal_payload_for_kind(kind: PushKind) -> SignalPayload {
+    match kind {
+        PushKind::DataMode => SignalPayload::DataSourceDown(Default::default()),
+        _ => SignalPayload::HoldingHealth(Default::default()),
+    }
+}
+
+fn signal_event_for_kind(kind: PushKind, code: Option<&str>) -> SignalEvent {
+    let (source, kind_str, severity) = map_push_kind(kind);
+    SignalEvent::new(
+        source,
+        kind_str,
+        code.map(str::to_string),
+        Local::now(),
+        signal_payload_for_kind(kind),
+        severity,
+    )
+}
+
 /// 默认 profile (按 PushKind 给推荐 category + §14.3 冷却)
 fn default_profile_for_kind(kind: PushKind) -> TemplateMetadata {
     use stock_analysis::push_l2::TemplateCategory::*;
     let category = match kind {
+        PushKind::DataMode => DataSource,
         PushKind::ForbiddenOps
         | PushKind::AccountMode
-        | PushKind::DataMode
         | PushKind::CapitalVerify
         | PushKind::StPriceLimitChanged => Risk,
         _ => Holding,
@@ -518,11 +530,15 @@ fn default_profile_for_kind(kind: PushKind) -> TemplateMetadata {
         // Frozen 状态保留在 ctx.is_frozen, 模板自行渲染 ⚠️ 警告
         // 4 铁律: 通知层保持出声, 仓位风险控制在 broker 下单层
         frozen_mode_respect: false,
-        data_mode_min: DataMode::Degraded,
+        data_mode_min: if matches!(kind, PushKind::AccountMode) {
+            DataMode::Down
+        } else {
+            DataMode::Degraded
+        },
         // b011: 不再硬编码 60, 与 §14.3 治理表一致 (0 = 无冷却)
         cooldown_secs: kind.cooldown_secs().map(u64::from).unwrap_or(0),
         max_per_user_per_day: matches!(kind, PushKind::CandidateBoard).then_some(5),
-        always_send_on_data_source_down: false,
+        always_send_on_data_source_down: matches!(kind, PushKind::DataMode),
     }
 }
 
@@ -741,6 +757,27 @@ mod tests {
         assert_eq!(src, SignalSource::HoldingHealth);
         assert_eq!(kind, "forbidden_ops");
         assert_eq!(sev, Severity::Emergency);
+    }
+
+    #[test]
+    fn data_mode_alert_is_a_data_source_down_event_with_down_exemption() {
+        use stock_analysis::push_l1::{SignalPayload, SignalSource};
+        use stock_analysis::push_l2::TemplateCategory;
+
+        let event = signal_event_for_kind(PushKind::DataMode, None);
+        assert_eq!(event.source, SignalSource::DataSourceDown);
+        assert!(matches!(event.payload, SignalPayload::DataSourceDown(_)));
+        let profile = default_profile_for_kind(PushKind::DataMode);
+        assert_eq!(profile.category, TemplateCategory::DataSource);
+        assert!(profile.always_send_on_data_source_down);
+    }
+
+    #[test]
+    fn account_mode_alert_is_eligible_when_market_data_is_down() {
+        assert_eq!(
+            default_profile_for_kind(PushKind::AccountMode).data_mode_min,
+            DataMode::Down
+        );
     }
 
     #[test]

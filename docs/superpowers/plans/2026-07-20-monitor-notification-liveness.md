@@ -300,6 +300,7 @@ Expected: pending row is reused and incomplete account state produces a truthful
 - Modify: `src/bin/monitor/push_templates.rs`
 - Modify: `src/bin/monitor/main.rs`
 - Modify: `src/bin/monitor/v14_adapter.rs`
+- Modify if validation exposes reused test audit state: `src/event/dispatcher.rs`
 
 - [ ] **Step 1: Write the failing initial-state test**
 
@@ -400,6 +401,10 @@ git commit -m "fix: deliver and retry monitor state alerts"
 ```
 
 Expected: initial Unsafe dispatch is eligible under Down governance and state advances only on confirmation.
+
+If the delivery-confirmation test encounters a stale hash chain from a reused OS PID, make the
+`cfg(test)` BR-091 audit directory process-instance unique. Production audit paths and fail-closed
+semantics remain unchanged.
 
 ### Task 4: Repair the strict Eastmoney announcement detail protocol
 
