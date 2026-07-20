@@ -91,6 +91,16 @@ pub struct PersistentUnsafeReminder {
 }
 
 impl PersistentUnsafeReminder {
+    /// Clears the prior outage interval as soon as real health has recovered.
+    /// This observation is independent of whether the recovery notification is delivered.
+    pub fn observe_mode(&mut self, mode: DataMode) -> bool {
+        let cleared = mode != DataMode::Unsafe && self.last_confirmed_at.is_some();
+        if mode != DataMode::Unsafe {
+            self.last_confirmed_at = None;
+        }
+        cleared
+    }
+
     pub fn should_dispatch(&self, mode: DataMode, now: Instant) -> Result<bool, String> {
         if mode != DataMode::Unsafe {
             return Ok(false);
@@ -108,7 +118,10 @@ impl PersistentUnsafeReminder {
     }
 
     pub fn record_confirmed(&mut self, mode: DataMode, now: Instant) {
-        self.last_confirmed_at = (mode == DataMode::Unsafe).then_some(now);
+        self.observe_mode(mode);
+        if mode == DataMode::Unsafe {
+            self.last_confirmed_at = Some(now);
+        }
     }
 }
 
@@ -506,13 +519,17 @@ mod tests {
             )
             .unwrap());
 
-        state.record_confirmed(
-            DataMode::Full,
-            start + std::time::Duration::from_secs(1_801),
-        );
+        assert!(state.observe_mode(DataMode::Full));
+        assert!(!state.observe_mode(DataMode::Degraded));
         assert!(!state
             .should_dispatch(
                 DataMode::Full,
+                start + std::time::Duration::from_secs(3_600),
+            )
+            .unwrap());
+        assert!(state
+            .should_dispatch(
+                DataMode::Unsafe,
                 start + std::time::Duration::from_secs(3_600),
             )
             .unwrap());

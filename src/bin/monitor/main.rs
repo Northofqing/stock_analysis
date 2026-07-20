@@ -1680,8 +1680,8 @@ static DATA_MODE_UNSAFE_REMINDER: Lazy<
 fn commit_data_mode_reminder_result(
     state: &mut stock_analysis::monitor::data_mode::PersistentUnsafeReminder,
     mode: stock_analysis::monitor::data_mode::DataMode,
-    now: std::time::Instant,
     result: &push_templates::ModeDispatchResult,
+    confirmed_now: impl FnOnce() -> std::time::Instant,
 ) -> bool {
     if !matches!(
         result,
@@ -1689,7 +1689,7 @@ fn commit_data_mode_reminder_result(
     ) {
         return false;
     }
-    state.record_confirmed(mode, now);
+    state.record_confirmed(mode, confirmed_now());
     true
 }
 
@@ -1716,15 +1716,22 @@ async fn evaluate_data_mode_hook() {
     };
 
     let health = dm_evaluate(&input, prev);
-    let reminder_now = std::time::Instant::now();
+    let reminder_evaluated_at = std::time::Instant::now();
     let persistent_reminder_due = match DATA_MODE_UNSAFE_REMINDER.lock() {
-        Ok(state) => match state.should_dispatch(health.mode, reminder_now) {
-            Ok(due) => due,
-            Err(error) => {
-                log::error!("[DataMode-hook][BR-135] reminder clock unavailable: {error}");
-                return;
+        Ok(mut state) => {
+            if state.observe_mode(health.mode) {
+                log::info!(
+                    "[DataMode-hook][BR-135] recovery observed; persistent Unsafe reminder state cleared"
+                );
             }
-        },
+            match state.should_dispatch(health.mode, reminder_evaluated_at) {
+                Ok(due) => due,
+                Err(error) => {
+                    log::error!("[DataMode-hook][BR-135] reminder clock unavailable: {error}");
+                    return;
+                }
+            }
+        }
         Err(_) => {
             log::error!("[DataMode-hook][BR-135] reminder state lock poisoned");
             return;
@@ -1791,7 +1798,12 @@ async fn evaluate_data_mode_hook() {
     }
     match DATA_MODE_UNSAFE_REMINDER.lock() {
         Ok(mut state) => {
-            if commit_data_mode_reminder_result(&mut state, health.mode, reminder_now, &result) {
+            if commit_data_mode_reminder_result(
+                &mut state,
+                health.mode,
+                &result,
+                std::time::Instant::now,
+            ) {
                 log::info!(
                     "[DataMode-hook][BR-135] confirmed DataMode delivery committed for reminder state"
                 );
@@ -1820,20 +1832,32 @@ mod br135_data_mode_reminder_tests {
             assert!(!commit_data_mode_reminder_result(
                 &mut state,
                 LibDM::Unsafe,
-                now,
                 &push_templates::ModeDispatchResult::Delivery(outcome),
+                || panic!("unconfirmed delivery must not sample confirmation time"),
             ));
             assert!(state.should_dispatch(LibDM::Unsafe, now).unwrap());
         }
 
         let mut state = PersistentUnsafeReminder::default();
+        let confirmed_at = now + std::time::Duration::from_secs(7);
         assert!(commit_data_mode_reminder_result(
             &mut state,
             LibDM::Unsafe,
-            now,
             &push_templates::ModeDispatchResult::Delivery(notify::PushOutcome::Pushed),
+            || confirmed_at,
         ));
-        assert!(!state.should_dispatch(LibDM::Unsafe, now).unwrap());
+        assert!(!state
+            .should_dispatch(
+                LibDM::Unsafe,
+                confirmed_at + std::time::Duration::from_secs(1_799),
+            )
+            .unwrap());
+        assert!(state
+            .should_dispatch(
+                LibDM::Unsafe,
+                confirmed_at + std::time::Duration::from_secs(1_800),
+            )
+            .unwrap());
     }
 }
 

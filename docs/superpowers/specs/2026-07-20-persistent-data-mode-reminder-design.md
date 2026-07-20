@@ -46,6 +46,28 @@ sqlite3 -batch -noheader data/push_analytics.db \
    ELSE 'GREEN business_push_receipts=' || n END FROM x;"
 ```
 
+Observed output from those commands is the four-line aggregate at the start of this section. The
+production call-chain claim is independently reproducible with multiline context:
+
+```bash
+rg -n -A6 -B2 'evaluate_data_mode_hook\(|push_data_mode_change\(' \
+  src/bin/monitor/main.rs src/bin/monitor/push_templates.rs
+rg -n -A7 -B3 'dispatch_outcome\(crate::notify::PushKind::DataMode|publish_delivery\(' \
+  src/bin/monitor/push_templates.rs src/bin/monitor/notify.rs
+```
+
+Observed production-path output (test callers omitted here, but retained by the command):
+
+```text
+src/bin/monitor/main.rs:1696:async fn evaluate_data_mode_hook() {
+src/bin/monitor/main.rs:1780:        match pt::push_data_mode_change(&input, prev, persistent_reminder_due, Some(&banner)).await
+src/bin/monitor/main.rs:2966:        evaluate_data_mode_hook().await;
+src/bin/monitor/main.rs:5692:            evaluate_data_mode_hook().await;
+src/bin/monitor/push_templates.rs:6348:pub async fn push_data_mode_change(
+src/bin/monitor/push_templates.rs:6438:    let outcome = dispatch_outcome(crate::notify::PushKind::DataMode, "", banner, text).await;
+src/bin/monitor/notify.rs:1134:    let audit_result = stock_analysis::event::publish_delivery(
+```
+
 ## 2. Root cause
 
 There are two separate boundaries:
@@ -67,11 +89,13 @@ The first behavior is a safety invariant. The second is the notification-livenes
 
 ## 4. Chosen design
 
-`monitor::data_mode` gains a deep reminder-state module with a two-method interface:
+`monitor::data_mode` gains a deep reminder-state module with a three-method interface:
 
 - `should_dispatch(mode, now)` returns true only for Unsafe when no confirmed alert exists or the
   last confirmed alert is at least 30 minutes old;
-- `record_confirmed(mode, now)` stores the timestamp for Unsafe and clears it for Full/Degraded.
+- `observe_mode(mode)` clears the prior outage timestamp as soon as real health is Full/Degraded,
+  independently of whether the recovery notification can be delivered;
+- `record_confirmed(mode, now)` stores the timestamp for Unsafe only after authoritative delivery.
 
 The caller supplies `Instant`; the module does not read wall time, databases, environment, or the
 notification sink. A poisoned lock is an explicit error. Process restart deliberately starts with
@@ -84,10 +108,11 @@ restrictions, and recovery ETA. It does not pretend Unsafe changed to Unsafe and
 account, price, holding, or security fields.
 
 The main hook computes the reminder decision from the same evaluated `DataHealth` snapshot used to
-build the banner. A `Pushed` result commits both latest mode and reminder time. Denied, deduped,
-sink, L7, or immutable-audit failure commits neither reminder time nor a new mode. Silent/no-op
-evaluation never refreshes an Unsafe reminder timestamp. Full or Degraded confirmation clears the
-Unsafe reminder state.
+build the banner. Real Full/Degraded observation clears the prior outage interval before any
+notification attempt. After the awaited dispatch returns `Pushed`, the hook samples a fresh
+`Instant` and commits the Unsafe reminder time. Denied, deduped, sink, L7, or immutable-audit
+failure commits neither reminder time nor a new latest-notified mode. Silent/no-op Unsafe
+evaluation never refreshes an Unsafe reminder timestamp.
 
 The 30-minute threshold is a registered BR-135 code constant, not a `config/*.toml` change. It is
 longer than source retry loops, short enough to expose a half-hour outage, and bounds a stable
@@ -98,6 +123,8 @@ outage to at most 48 reminders per day. No ordinary business-message gate change
 ```text
 real capability successes -> DataHealth evaluate -> mode + missing capabilities
                                       |
+                                      +-> Full/Degraded? clear prior outage interval
+                                      |
                                       +-> mode transition? --------+
                                       |                            |
                                       +-> same Unsafe + 30m due? --+-> DataMode render
@@ -105,6 +132,7 @@ real capability successes -> DataHealth evaluate -> mode + missing capabilities
                                                                    -> L5 DataSourceDown exemption
                                                                    -> real Feishu sink
                                                                    -> L7 + immutable audit
+                                                                   -> sample confirmation time
                                                                    -> commit reminder timestamp
 ```
 
@@ -116,7 +144,8 @@ real capability successes -> DataHealth evaluate -> mode + missing capabilities
 - Governance/sink/audit failure: retain the old timestamp so the next evaluation retries.
 - Capability data unavailable: the existing hook returns before notification; no fabricated
   health snapshot or reminder is produced.
-- Recovery: confirmed Full/Degraded clears the Unsafe reminder timestamp.
+- Recovery: observed real Full/Degraded clears the Unsafe reminder timestamp even when the
+  recovery notification is unconfirmed; a later Unsafe state starts a new outage interval.
 - Wrong but valid configured chat: outside this code repair. The system must not guess or commit a
   replacement notification target; target verification remains an operational secret action.
 
@@ -147,9 +176,26 @@ python3 tools/coverage/check_thresholds.py target/coverage/coverage.json
 cargo build --release --bin monitor
 ```
 
-Production acceptance after merge/restart uses aggregate evidence only: an initial or due
-`data_mode` row must record `pushed=1`, Feishu sink, and immutable `push.delivery.audit`; a failed
-attempt must leave the reminder due. No message content or destination is printed or committed.
+Machine-checkable expected outputs:
+
+| Command | Expected output |
+| --- | --- |
+| exact library BR-135 test | `1 passed; 0 failed` |
+| monitor `br135` filter | all selected tests pass; `0 failed`; at least four tests selected |
+| fmt | exit 0, no diff |
+| strict Clippy | exit 0 and no warning/error diagnostics |
+| full workspace test | exit 0 and every executed test target reports `0 failed` |
+| compliance | final line `[compliance] ALL CHECKS PASSED` |
+| coverage threshold script | global `>= 80.00%` and core `>= 95.00%`, exit 0 |
+| release build | exit 0 and `Finished release profile` |
+
+Release-candidate and merged-master production acceptance is also machine-checkable with fixed
+before/after counts: one due reminder must add exactly one `data_mode` row with `pushed=1` and
+`sink_name='feishu'`, one `push.delivery.audit` event-bus row, and one immutable hash-chain audit
+row; private-log counters must add one BR-135 due and one confirmation, with zero banner, sink,
+audit, panic, or fatal failure. A failed attempt must add no confirmation and remain due.
+
+No message content or destination is printed or committed during production acceptance.
 
 Rollback is `git revert <merge-commit>`, rebuild release, terminate only the current monitor PID,
 and restart the preserved previous master binary if the reverted build cannot start. Databases,

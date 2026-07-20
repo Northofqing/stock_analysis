@@ -58,9 +58,12 @@ fn br135_persistent_unsafe_reminder_is_due_only_after_confirmed_interval() {
         .should_dispatch(DataMode::Unsafe, start + Duration::from_secs(1_800))
         .unwrap());
 
-    state.record_confirmed(DataMode::Full, start + Duration::from_secs(1_801));
+    assert!(state.observe_mode(DataMode::Full));
     assert!(!state
         .should_dispatch(DataMode::Full, start + Duration::from_secs(3_600))
+        .unwrap());
+    assert!(state
+        .should_dispatch(DataMode::Unsafe, start + Duration::from_secs(3_600))
         .unwrap());
 }
 ```
@@ -84,6 +87,14 @@ pub struct PersistentUnsafeReminder {
 }
 
 impl PersistentUnsafeReminder {
+    pub fn observe_mode(&mut self, mode: DataMode) -> bool {
+        let cleared = mode != DataMode::Unsafe && self.last_confirmed_at.is_some();
+        if mode != DataMode::Unsafe {
+            self.last_confirmed_at = None;
+        }
+        cleared
+    }
+
     pub fn should_dispatch(&self, mode: DataMode, now: Instant) -> Result<bool, String> {
         if mode != DataMode::Unsafe {
             return Ok(false);
@@ -98,7 +109,10 @@ impl PersistentUnsafeReminder {
     }
 
     pub fn record_confirmed(&mut self, mode: DataMode, now: Instant) {
-        self.last_confirmed_at = (mode == DataMode::Unsafe).then_some(now);
+        self.observe_mode(mode);
+        if mode == DataMode::Unsafe {
+            self.last_confirmed_at = Some(now);
+        }
     }
 }
 ```
@@ -222,8 +236,8 @@ Extract a helper with this interface:
 fn commit_data_mode_reminder_result(
     state: &mut PersistentUnsafeReminder,
     mode: LibDM,
-    now: Instant,
     result: &ModeDispatchResult,
+    confirmed_now: impl FnOnce() -> Instant,
 ) -> bool
 ```
 
@@ -238,18 +252,24 @@ fn br135_reminder_confirmation_requires_pushed() {
     assert!(!commit_data_mode_reminder_result(
         &mut state,
         LibDM::Unsafe,
-        now,
         &ModeDispatchResult::Delivery(PushOutcome::Denied("TEST_CODE".to_string())),
+        || panic!("unconfirmed delivery must not sample confirmation time"),
     ));
     assert!(state.should_dispatch(LibDM::Unsafe, now).unwrap());
 
+    let confirmed_at = now + Duration::from_secs(7);
     assert!(commit_data_mode_reminder_result(
         &mut state,
         LibDM::Unsafe,
-        now,
         &ModeDispatchResult::Delivery(PushOutcome::Pushed),
+        || confirmed_at,
     ));
-    assert!(!state.should_dispatch(LibDM::Unsafe, now).unwrap());
+    assert!(!state
+        .should_dispatch(LibDM::Unsafe, confirmed_at + Duration::from_secs(1_799))
+        .unwrap());
+    assert!(state
+        .should_dispatch(LibDM::Unsafe, confirmed_at + Duration::from_secs(1_800))
+        .unwrap());
 }
 ```
 
@@ -265,9 +285,15 @@ Expected: compile failure because the helper and process state do not exist.
 
 - [ ] **Step 3: Wire the production hook**
 
-Create one `Lazy<Mutex<PersistentUnsafeReminder>>`. In `evaluate_data_mode_hook`, take one `Instant::now()`, compute `reminder_due` from the evaluated health, and pass it to `push_data_mode_change`.
+Create one `Lazy<Mutex<PersistentUnsafeReminder>>`. In `evaluate_data_mode_hook`, immediately
+clear the prior outage interval when the evaluated real health is Full/Degraded, then sample one
+decision `Instant`, compute `reminder_due`, and pass it to `push_data_mode_change`.
 
-The helper returns true only for `Delivery(Pushed)` and calls `record_confirmed`. Full/Degraded confirmation clears Unsafe state. `Denied`, `Deduped`, `SinkError`, lock failure, or monotonic-time error advances nothing. Log failures as `[DataMode-hook][BR-135]`. Never refresh Unsafe on `EstablishedSilently`.
+The helper returns true only for `Delivery(Pushed)`, samples a fresh confirmation `Instant` after
+the awaited dispatch, and calls `record_confirmed`. Real Full/Degraded observation clears Unsafe
+state even if its notification fails. `Denied`, `Deduped`, `SinkError`, lock failure, or
+monotonic-time error advances no Unsafe confirmation. Log failures as `[DataMode-hook][BR-135]`.
+Never refresh Unsafe on `EstablishedSilently`.
 
 - [ ] **Step 4: Run GREEN and commit**
 

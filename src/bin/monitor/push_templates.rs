@@ -224,6 +224,20 @@ pub fn render_account_mode(
 
 /// T-02 数据状态变更
 /// v12 §14.1 T-02 DataMode 模板渲染 — 字段顺序严格对齐 docs/architecture/v13-push-templates.md
+fn append_data_mode_restrictions(out: &mut String, restrictions: &[String]) {
+    for restriction in restrictions {
+        out.push_str(&format!("\n· {}", restriction));
+    }
+}
+
+fn append_data_mode_eta_footer(out: &mut String, eta: Option<&str>) {
+    if let Some(eta) = eta.filter(|value| !value.is_empty()) {
+        out.push_str(&format!("\n恢复预计: {}\n辅助建议, 非下单指令", eta));
+    } else {
+        out.push_str("\n辅助建议, 非下单指令");
+    }
+}
+
 pub fn render_data_mode(
     hhmm: &str,
     old: Option<DataMode>,
@@ -239,14 +253,8 @@ pub fn render_data_mode(
         new.label(),
         missing_items,
     );
-    for r in restrictions {
-        out.push_str(&format!("\n· {}", r));
-    }
-    if let Some(eta) = eta.filter(|s| !s.is_empty()) {
-        out.push_str(&format!("\n恢复预计: {}\n辅助建议, 非下单指令", eta));
-    } else {
-        out.push_str("\n辅助建议, 非下单指令");
-    }
+    append_data_mode_restrictions(&mut out, restrictions);
+    append_data_mode_eta_footer(&mut out, eta);
     out
 }
 
@@ -264,17 +272,11 @@ pub fn render_data_mode_reminder(
         current.label(),
         missing_items,
     );
-    for restriction in restrictions {
-        out.push_str(&format!("\n· {}", restriction));
-    }
+    append_data_mode_restrictions(&mut out, restrictions);
     let reminder_minutes =
         stock_analysis::monitor::data_mode::PERSISTENT_UNSAFE_REMINDER_INTERVAL.as_secs() / 60;
     out.push_str(&format!("\n提醒频率: 每{}分钟", reminder_minutes));
-    if let Some(eta) = eta.filter(|value| !value.is_empty()) {
-        out.push_str(&format!("\n恢复预计: {}\n辅助建议, 非下单指令", eta));
-    } else {
-        out.push_str("\n辅助建议, 非下单指令");
-    }
+    append_data_mode_eta_footer(&mut out, eta);
     out
 }
 
