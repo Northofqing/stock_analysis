@@ -33,6 +33,13 @@ fn help_exits_without_creating_runtime_state() {
         "help text missing: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let help = String::from_utf8_lossy(&output.stderr);
+    for required in ["--test", "--review", "dry-run", "real account"] {
+        assert!(
+            help.contains(required),
+            "help contract missing {required:?}: {help}"
+        );
+    }
     assert!(
         !root.join("data").exists(),
         "help command created runtime data under {}",
@@ -188,11 +195,11 @@ fn fresh_test_database_starts_without_lock_errors() {
     std::fs::remove_dir_all(&root).expect("remove isolated working directory");
 }
 
-#[test]
-fn isolated_e2e_reaches_the_final_completion_marker() {
+fn assert_isolated_e2e_reaches_the_final_completion_marker(label: &str, arguments: &[&str]) {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let root = std::env::temp_dir().join(format!(
-        "monitor-isolated-e2e-{}-{}",
+        "monitor-isolated-e2e-{}-{}-{}",
+        label,
         std::process::id(),
         SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
@@ -200,7 +207,7 @@ fn isolated_e2e_reaches_the_final_completion_marker() {
     let database_path = root.join("e2e.db");
 
     let output = Command::new(env!("CARGO_BIN_EXE_monitor"))
-        .args(["--test", "--e2e"])
+        .args(arguments)
         .current_dir(&root)
         .env("DATABASE_PATH", &database_path)
         .env("MAGICLAW_DB_PATH", &database_path)
@@ -269,6 +276,16 @@ fn isolated_e2e_reaches_the_final_completion_marker() {
     );
 
     std::fs::remove_dir_all(&root).expect("remove isolated e2e directory");
+}
+
+#[test]
+fn bare_test_alias_reaches_the_final_completion_marker() {
+    assert_isolated_e2e_reaches_the_final_completion_marker("bare", &["--test"]);
+}
+
+#[test]
+fn explicit_e2e_reaches_the_final_completion_marker() {
+    assert_isolated_e2e_reaches_the_final_completion_marker("explicit", &["--test", "--e2e"]);
 }
 
 #[test]

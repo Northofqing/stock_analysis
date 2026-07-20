@@ -1,4 +1,4 @@
-//! Registered business rules: BR-043, BR-045, BR-047, BR-049, BR-051, BR-063, BR-071, BR-073, BR-074, BR-077, BR-078, BR-082, BR-083.
+//! Registered business rules: BR-043, BR-045, BR-047, BR-049, BR-051, BR-063, BR-071, BR-073, BR-074, BR-077, BR-078, BR-082, BR-083, BR-136.
 //! 实盘监控模式入口。
 
 //!
@@ -7,7 +7,7 @@
 
 //!   cargo run --bin monitor             # 正常监控（等交易日+交易时段）
 
-//!   cargo run --bin monitor -- --test   # 测试模式（跳过日历，立即跑一次扫描验证）
+//!   cargo run --bin monitor -- --test   # 隔离 E2E dry-run（等价于 --test --e2e）
 
 //!
 
@@ -857,6 +857,30 @@ mod virtual_observation_tests {
             ReviewExecutionPath::StrictDispatchers,
             "production --review must never reach the legacy inline review implementation"
         );
+    }
+
+    #[test]
+    fn br136_bare_test_is_the_only_implicit_e2e_route() {
+        assert!(isolated_e2e_requested(&[
+            "monitor".to_string(),
+            "--test".to_string(),
+        ]));
+        assert!(isolated_e2e_requested(&[
+            "monitor".to_string(),
+            "--test".to_string(),
+            "--e2e".to_string(),
+        ]));
+        assert!(!isolated_e2e_requested(&[
+            "monitor".to_string(),
+            "--test".to_string(),
+            "--review".to_string(),
+        ]));
+        assert!(!isolated_e2e_requested(&[
+            "monitor".to_string(),
+            "--test".to_string(),
+            "--v13-diag".to_string(),
+        ]));
+        assert!(!isolated_e2e_requested(&["monitor".to_string()]));
     }
 
     #[tokio::test]
@@ -2387,12 +2411,26 @@ mod monitor_replay_publisher_tests {
 }
 
 fn print_event_help() {
-    eprintln!("Usage: monitor [--replay=YYYY-MM-DD [--replay-force] [--replay-rate-ms=N]]");
-    eprintln!("       [--history [--date=YYYY-MM-DD] [--code=CODE] [--kind=KIND]");
-    eprintln!("                [--limit=N] [--success-rate] [--sink=SINK]]");
-    eprintln!("       [--help]");
+    eprintln!("Usage: monitor");
+    eprintln!("       monitor --test [--e2e]");
+    eprintln!("       monitor --review");
+    eprintln!("       monitor --test --review");
+    eprintln!("       monitor --replay=YYYY-MM-DD [--replay-force] [--replay-rate-ms=N]");
+    eprintln!("       monitor --history [--date=YYYY-MM-DD] [--code=CODE] [--kind=KIND]");
+    eprintln!("                         [--limit=N] [--success-rate] [--sink=SINK]");
+    eprintln!("       monitor --help");
     eprintln!();
-    eprintln!("Event subcommands are terminal — monitor does not enter long-running loops.");
+    eprintln!("--test is an isolated E2E dry-run alias; it never sends a real notification.");
+    eprintln!("--review is production-strict and requires fresh, complete real account evidence.");
+    eprintln!(
+        "--test --review verifies that the strict review fails closed without live evidence."
+    );
+    eprintln!("Terminal commands exit after completion; bare monitor enters long-running loops.");
+}
+
+fn isolated_e2e_requested(arguments: &[String]) -> bool {
+    arguments.iter().any(|argument| argument == "--e2e")
+        || matches!(arguments, [_, only] if only == "--test")
 }
 
 fn runtime_data_path(test_mode: bool, leaf: &str) -> std::path::PathBuf {
@@ -2420,11 +2458,12 @@ async fn main() {
     let startup_args: Vec<String> = std::env::args().collect();
     let test_mode = startup_args.iter().any(|arg| arg == "--test");
     let review_mode = startup_args.iter().any(|arg| arg == "--review");
-    let e2e_mode = startup_args.iter().any(|arg| arg == "--e2e");
-    if e2e_mode && !test_mode {
+    let explicit_e2e_mode = startup_args.iter().any(|arg| arg == "--e2e");
+    if explicit_e2e_mode && !test_mode {
         eprintln!("[BR-051] --e2e requires --test before any DB or push sink initialization");
         std::process::exit(2);
     }
+    let e2e_mode = isolated_e2e_requested(&startup_args);
     if test_mode {
         std::env::set_var("STOCK_ENV_MODE", "test");
         std::env::set_var("V10_DRY_RUN_PUSH", "1");
