@@ -183,7 +183,9 @@ Automated acceptance:
 ```bash
 cargo test --lib monitor::data_mode::tests::br135_persistent_unsafe_reminder -- --exact
 cargo test --bin monitor br135 -- --nocapture
-cargo test --bin monitor br135_scheduler_waits_before_first_tick_and_runs_independently -- --exact
+cargo test --bin monitor \
+  br135_data_mode_reminder_tests::br135_scheduler_waits_before_first_tick_and_runs_independently \
+  -- --exact
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets --all-features -- --test-threads=1
