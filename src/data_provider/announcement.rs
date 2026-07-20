@@ -1,4 +1,4 @@
-//! Registered business rules: BR-059.
+//! Registered business rules: BR-059, BR-105, BR-137.
 //! A股公告抓取（东方财富公告API）。
 //!
 //! 策略：标题即风控——含关键词直接告警，不等正文。
@@ -95,6 +95,27 @@ pub struct Announcement {
     pub external_id: Option<String>,
     /// 东方财富公告详情页 URL
     pub url: Option<String>,
+}
+
+impl Announcement {
+    /// Returns the provider publication date only when the complete field
+    /// matches a registered Eastmoney date/time format (BR-137).
+    pub fn published_on(&self) -> Result<chrono::NaiveDate> {
+        parse_notice_date(&self.date)
+    }
+}
+
+fn parse_notice_date(raw: &str) -> Result<chrono::NaiveDate> {
+    let raw = raw.trim();
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
+        return Ok(date);
+    }
+    if let Ok(timestamp) = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S") {
+        return Ok(timestamp.date());
+    }
+    Err(anyhow::anyhow!(
+        "公告 notice_date 非法或包含未登记尾随内容: {raw}"
+    ))
 }
 
 // ── 标题关键词哨兵 ──
@@ -453,11 +474,7 @@ fn validate_announcement_response(resp: AnnResponse) -> Result<Vec<AnnItem>> {
                 index + 1
             ));
         }
-        let notice_date = item
-            .notice_date
-            .get(..10)
-            .ok_or_else(|| anyhow::anyhow!("公告 {} notice_date 字段不足", item.art_code))?;
-        chrono::NaiveDate::parse_from_str(notice_date, "%Y-%m-%d")
+        parse_notice_date(&item.notice_date)
             .map_err(|error| anyhow::anyhow!("公告 {} notice_date 非法: {error}", item.art_code))?;
         let code = item
             .codes
@@ -747,6 +764,7 @@ mod tests {
             r#"{"data":{"list":[{"art_code":"A1","title":" ","notice_date":"2026-07-18","codes":[{"stock_code":"000001","short_name":"样本"}]}]}}"#,
             r#"{"data":{"list":[{"art_code":"A1","title":"公告","notice_date":"2026","codes":[{"stock_code":"000001","short_name":"样本"}]}]}}"#,
             r#"{"data":{"list":[{"art_code":"A1","title":"公告","notice_date":"2026-02-30","codes":[{"stock_code":"000001","short_name":"样本"}]}]}}"#,
+            r#"{"data":{"list":[{"art_code":"A1","title":"公告","notice_date":"2026-07-18garbage","codes":[{"stock_code":"000001","short_name":"样本"}]}]}}"#,
             r#"{"data":{"list":[{"art_code":"A1","title":"公告","notice_date":"2026-07-18","codes":[]}]}}"#,
             r#"{"data":{"list":[{"art_code":"A1","title":"公告","notice_date":"2026-07-18","codes":[{"stock_code":"00001","short_name":"样本"}]}]}}"#,
             r#"{"data":{"list":[{"art_code":"A1","title":"公告","notice_date":"2026-07-18","codes":[{"stock_code":"00000A","short_name":"样本"}]}]}}"#,

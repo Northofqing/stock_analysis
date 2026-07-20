@@ -4,6 +4,7 @@
 //!   - SignalEvent 是 L1 → L4 dispatcher 的唯一信号载体
 //!   - EventBucket 用 enum 精确匹配, 避免字符串 contains 的 ID 碰撞 (b-009 R-2)
 //!   - make_event_id 用 sha256(source_kind + code + bucket_ts) 取前 8 字节 (16 hex)
+//!   - make_source_fact_event_id 用独立 provider identity 生成稳定 ID，禁止冒充 code
 //!
 //! 红线约束:
 //!   - AGENTS.md §2.1 / §2.2 数据红线 — 本模块不静默填补任何字段
@@ -135,6 +136,7 @@ pub struct NewsCatalystPayload {
     pub code: Option<String>,
     pub headline: Option<String>,
     pub source: Option<String>,
+    pub published_on: Option<chrono::NaiveDate>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -226,6 +228,15 @@ pub fn make_event_id(source_kind: &str, code: Option<&str>, ts: DateTime<Local>)
     hex::encode(&hash[..8]) // 16 hex 字符
 }
 
+/// BR-137 source-fact ID. The provider identity is deliberately hashed into
+/// the event ID and never stored in the security-code field.
+pub fn make_source_fact_event_id(source_kind: &str, provider_identity: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let input = format!("source_fact:{source_kind}:{provider_identity}");
+    let hash = Sha256::digest(input.as_bytes());
+    hex::encode(&hash[..8])
+}
+
 fn bucket_ts(source_kind: &str, ts: DateTime<Local>) -> i64 {
     let bucket_secs = match EventBucket::for_kind(source_kind) {
         EventBucket::OneSec => 1,
@@ -314,6 +325,16 @@ mod tests {
         let id1 = make_event_id("limit_up", Some("TEST_CODE_600519"), ts);
         let id2 = make_event_id("limit_up", Some("TEST_CODE_000001"), ts);
         assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn source_fact_identity_is_stable_and_separate_from_security_code() {
+        let first = make_source_fact_event_id("announcement", "provider-event-1");
+        let repeat = make_source_fact_event_id("announcement", "provider-event-1");
+        let other = make_source_fact_event_id("announcement", "provider-event-2");
+        assert_eq!(first, repeat);
+        assert_ne!(first, other);
+        assert!(!first.contains("provider-event"));
     }
 
     #[test]

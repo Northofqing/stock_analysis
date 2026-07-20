@@ -1,11 +1,12 @@
-//! Registered business rules: BR-078, BR-082.
+//! Registered business rules: BR-078, BR-082, BR-137.
 //! `news::aggregator` 在 monitor 主路径的初始化 + tick 接入
 //!
 //! ## 目标 (v15.3 Phase D 收尾)
 //!
-//! 把 `src/news/aggregator/feed.rs` 的 8 个真实轮询 `NewsFeed` 适配 (Jin10 / WSCN /
-//! CLS / Sina / Weibo / Gel / 科创板日报 / GovPolicy) 注册到全局
-//! `NewsAggregator`, 然后在 `news_monitor_loop` 每 tick 调一次 `tick_news_aggregator(20)`,
+//! 把 `src/news/aggregator/feed.rs` 的 7 个通用新闻轮询 `NewsFeed` 适配 (Jin10 / WSCN /
+//! CLS / Sina / Weibo / Gel / 科创板日报) 注册到全局 `NewsAggregator`。GovPolicy 由
+//! BR-137 独立 producer 保留原始 `SearchResult`，不进入投递前 aggregator 去重。
+//! `news_monitor_loop` 每 tick 调一次 `tick_news_aggregator(20)`,
 //! 把 dedup 后的 `Vec<MarketEvent>` 喂给 BR-082 NewsFlashGate 与推送治理链.
 //!
 //! ## 调用链
@@ -13,7 +14,7 @@
 //! ```text
 //! monitor::main()
 //!   └─ init_news_aggregator()  ← 本文件
-//!        ├─ register_feeds(8 × Arc<dyn NewsFeed>)
+//!        ├─ register_feeds(7 × Arc<dyn NewsFeed>)
 //!        ├─ take_all_for_aggregator()
 //!        └─ NewsAggregator::new(...).set_global()
 //!
@@ -43,7 +44,7 @@ use stock_analysis::news::aggregator::{
 };
 use stock_analysis::signal::market_event::MarketEvent;
 
-/// 注册 8 个真实轮询 NewsFeed 适配到全局 NewsAggregator.
+/// 注册 7 个真实通用新闻轮询 NewsFeed 适配到全局 NewsAggregator.
 ///
 /// 在 monitor 启动早期调一次 (main() 里 spawn task 之前). 重复调 no-op.
 ///
@@ -56,7 +57,7 @@ pub fn init_news_aggregator() -> usize {
     }
 
     let feeds: Vec<Arc<dyn NewsFeed>> = vec![
-        // ===== Flash 源 (8 个, 真 HTTP; 每个 inner 调对应 Provider::new()) =====
+        // ===== 通用新闻源 (7 个, 真 HTTP; 每个 inner 调对应 Provider::new()) =====
         Arc::new(feed::Jin10FlashFeed {
             inner: stock_analysis::search_service::providers::jin10::Jin10Provider::new(),
         }),
@@ -79,14 +80,13 @@ pub fn init_news_aggregator() -> usize {
         Arc::new(feed::KcbDailyFeed {
             inner: stock_analysis::search_service::providers::kcb_daily::KcbDailyProvider::new(),
         }),
-        Arc::new(feed::GovPolicyFeed {
-            inner: stock_analysis::search_service::providers::gov_policy::GovPolicyProvider::new(),
-        }),
         // BR-078: 未实现/主动触发型 feed 不得伪装成成功轮询源。
         // GovCn/MIIT/EarningsCalendar/Consensus/MarketAction/AnalystViews 不注册。
+        // GovPolicyFeed 不注册：BR-137 要求原始 SearchResult 由独立 producer
+        // 分类/投递，禁止 aggregator 在投递前提交 seen_simhash。
         // EmAnnouncementFeed 也不注册，公告由下面说明的既有主路径消费。
-        // 公告直接来自 news_monitor_loop 中的 nm.process_announcements()，
-        // 通过 v17_sources::push_normalized_events 推送，绕过 NewsFlash 二次缓冲。
+        // 公告直接来自 news_monitor_loop 中的真实 provider 批次，
+        // 通过 v17_sources::route_announcements 推送，绕过 NewsFlash 二次缓冲。
     ];
     let count = feeds.len();
     log::info!(
@@ -167,8 +167,19 @@ const AGG_WINDOW_TOLERANCE_SECS: i64 = 300;
 /// 聚合决策 (纯数据, 供单测断言)
 #[derive(Debug, PartialEq)]
 pub enum FlashDecision {
-    /// 即时推 (critical): (event_id, 渲染文本)
-    Critical(String, String),
+    /// 即时推 (critical): 保留逐事件来源证据；event_id 仅作治理身份，
+    /// 不得冒充证券代码。
+    Critical {
+        event_id: String,
+        headline: String,
+        source: String,
+        observed_at: chrono::DateTime<chrono::Local>,
+        source_published_on: chrono::NaiveDate,
+        stale: bool,
+        strength: u8,
+        certainty: u8,
+        text: String,
+    },
     /// 时段聚合推: (窗口标签, 渲染文本)
     Aggregated(String, String),
 }
@@ -223,6 +234,36 @@ impl NewsFlashGate {
 
         // 1. 事件驱动: critical 即时推 (AC34)
         for e in events {
+            let provenance = e.provenance.first();
+            let validation_error = if e.event_id.trim().is_empty() {
+                Some("missing_event_id")
+            } else if e.full_title.trim().is_empty() {
+                Some("missing_headline")
+            } else if provenance.is_none_or(|item| item.provider.trim().is_empty()) {
+                Some("missing_provenance")
+            } else if e.strength > 100 {
+                Some("strength_out_of_range")
+            } else if e.certainty > 100 {
+                Some("certainty_out_of_range")
+            } else if e.stale {
+                Some("stale")
+            } else if e.occurred_at > now {
+                Some("future_publication")
+            } else if e.occurred_at.date_naive() != now.date_naive() {
+                Some("publication_date_not_current")
+            } else if provenance
+                .is_some_and(|item| item.fetched_at > now || item.fetched_at < e.occurred_at)
+            {
+                Some("invalid_observation_time")
+            } else {
+                None
+            };
+            if let Some(reason) = validation_error {
+                log::warn!(
+                    "[NewsFlashGate][BR-137] source event rejected before critical and aggregate governance: {reason}"
+                );
+                continue;
+            }
             if !self.seen_today.insert(e.event_id.clone()) {
                 continue; // event_id 当日去重
             }
@@ -233,11 +274,7 @@ impl NewsFlashGate {
                     format!(
                         "[{}] {} (强度{} 确定性{})",
                         e.event_type.label(),
-                        if e.full_title.is_empty() {
-                            &e.subject
-                        } else {
-                            &e.full_title
-                        },
+                        &e.full_title,
                         e.strength,
                         e.certainty
                     ),
@@ -254,23 +291,33 @@ impl NewsFlashGate {
                     continue;
                 }
                 self.critical_pushed_today += 1;
-                out.push(FlashDecision::Critical(
-                    e.event_id.clone(),
-                    format!(
+                let headline = e.full_title.clone();
+                let source = provenance
+                    .expect("BR-137 provenance validated above")
+                    .provider
+                    .clone();
+                out.push(FlashDecision::Critical {
+                    event_id: e.event_id.clone(),
+                    headline,
+                    source,
+                    observed_at: provenance
+                        .expect("BR-137 provenance validated above")
+                        .fetched_at,
+                    source_published_on: e.occurred_at.date_naive(),
+                    stale: e.stale,
+                    strength: e.strength,
+                    certainty: e.certainty,
+                    text: format!(
                         "🚨 高分新闻快讯 ({})\n[{}] {}\n强度 {} | 确定性 {} | 今日第 {}/{} 条",
                         now.format("%H:%M"),
                         e.event_type.label(),
-                        if e.full_title.is_empty() {
-                            &e.subject
-                        } else {
-                            &e.full_title
-                        },
+                        &e.full_title,
                         e.strength,
                         e.certainty,
                         self.critical_pushed_today,
                         max_critical_per_day
                     ),
-                ));
+                });
             }
         }
 
@@ -316,13 +363,37 @@ pub async fn push_flash_decisions(decisions: Vec<FlashDecision>) -> (usize, usiz
     let mut n_agg = 0usize;
     for d in decisions {
         match d {
-            FlashDecision::Critical(event_id, text) => {
-                let outcome = crate::notify::push_governor_v3(
-                    &text,
+            FlashDecision::Critical {
+                event_id,
+                headline,
+                source,
+                observed_at,
+                source_published_on,
+                stale,
+                strength,
+                certainty,
+                text,
+            } => {
+                let outcome = match crate::v14_adapter::SourceFactEvidence::new(
                     crate::notify::PushKind::NewsFlashCritical,
-                    Some(&event_id[..event_id.len().min(16)]),
-                )
-                .await;
+                    event_id,
+                    None,
+                    headline,
+                    source,
+                    observed_at,
+                    Some(source_published_on),
+                    strength,
+                    certainty,
+                    stale,
+                ) {
+                    Ok(evidence) => crate::notify::push_source_fact_v3(&text, &evidence).await,
+                    Err(error) => {
+                        log::error!(
+                            "[NewsFlashGate][BR-137] critical source fact rejected: {error}"
+                        );
+                        crate::notify::PushOutcome::Denied(format!("source_fact_invalid:{error}"))
+                    }
+                };
                 if outcome.is_pushed() {
                     n_critical += 1;
                 } else {
@@ -366,6 +437,13 @@ mod tests {
             certainty,
         );
         e.event_id = format!("eid-{}", id_seed); // 固定 id 便于断言
+        e.occurred_at = at(0, 0);
+        e.provenance
+            .push(stock_analysis::signal::market_event::SourceRef {
+                provider: "TEST_CODE_NEWS_PROVIDER".to_string(),
+                url: None,
+                fetched_at: at(0, 0),
+            });
         e
     }
 
@@ -390,7 +468,70 @@ mod tests {
             20,
         );
         assert_eq!(d.len(), 1, "仅 strength≥80 且 certainty≥60 推");
-        assert!(matches!(&d[0], FlashDecision::Critical(id, _) if id == "eid-a"));
+        assert!(matches!(
+            &d[0],
+            FlashDecision::Critical {
+                event_id,
+                source,
+                ..
+            } if event_id == "eid-a" && source == "TEST_CODE_NEWS_PROVIDER"
+        ));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
+    async fn br137_critical_flash_pushes_at_data_mode_down_with_event_identity() {
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
+        crate::v14_adapter::_reset_dedup_for_test();
+        crate::LATEST_BANNER
+            .lock()
+            .expect("test banner lock")
+            .as_mut()
+            .expect("test banner")
+            .data_mode = crate::push_templates::DataMode::Unsafe;
+        let mut gate = NewsFlashGate::new(at(10, 0).date_naive());
+        let decisions = gate.process(&[ev("source-fact", 90, 90)], at(10, 0), 80, 20);
+
+        assert_eq!(push_flash_decisions(decisions).await, (1, 0));
+    }
+
+    #[test]
+    fn br137_stale_flash_is_excluded_from_critical_and_aggregate_buffer() {
+        let now = at(10, 0);
+        let mut stale = ev("stale-source-fact", 90, 90);
+        stale.stale = true;
+        let mut gate = NewsFlashGate::new(now.date_naive());
+        assert!(gate.process(&[stale], now, 80, 20).is_empty());
+        assert!(gate.buffer.is_empty());
+        assert!(gate.seen_today.is_empty());
+    }
+
+    #[test]
+    fn br137_old_flash_is_rejected_even_when_upstream_stale_flag_is_false() {
+        let now = at(10, 0);
+        let old_time = now - chrono::Duration::days(1);
+        let mut old = ev("old-source-fact", 70, 70);
+        old.stale = false;
+        old.occurred_at = old_time;
+        old.provenance[0].fetched_at = old_time;
+        let mut gate = NewsFlashGate::new(now.date_naive());
+        assert!(gate.process(&[old], now, 80, 20).is_empty());
+        assert!(gate.buffer.is_empty());
+        assert!(gate.seen_today.is_empty());
+    }
+
+    #[test]
+    fn br137_malformed_flash_is_excluded_from_critical_and_aggregate_buffer() {
+        let now = at(10, 0);
+        let mut malformed = ev("malformed-source-fact", 101, 90);
+        malformed.event_id.clear();
+        malformed.full_title.clear();
+        malformed.subject.clear();
+        malformed.provenance.clear();
+        let mut gate = NewsFlashGate::new(now.date_naive());
+        assert!(gate.process(&[malformed], now, 80, 20).is_empty());
+        assert!(gate.buffer.is_empty());
+        assert!(gate.seen_today.is_empty());
     }
 
     /// BR-082: event_id 当日去重

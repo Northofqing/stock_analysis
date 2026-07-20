@@ -1,4 +1,4 @@
-//! Registered business rules: BR-005, BR-048.
+//! Registered business rules: BR-005, BR-048, BR-137.
 //! v14_adapter.rs — v14.2 七层架构与 v13 推送链路的桥接层 (b011 修复版)
 //!
 //! 严格按 `docs/architecture/v14.2-push-architecture.md` v14.2 §3.4 + b-009 R-4 落地.
@@ -28,7 +28,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use chrono::{Local, Timelike};
-use stock_analysis::push_l1::{Severity, SignalEvent, SignalPayload, SignalSource};
+use stock_analysis::push_l1::{
+    NewsCatalystPayload, Severity, SignalEvent, SignalPayload, SignalSource,
+};
 use stock_analysis::push_l2::{DataMode, RenderedText, TemplateMetadata};
 use stock_analysis::push_l4::{Dispatcher, ReserveOutcome};
 use stock_analysis::push_l5::{GovernanceContext, GovernanceDecision, GovernanceEngine};
@@ -82,6 +84,186 @@ pub enum V14Gate {
     Denied(String),
 }
 
+/// BR-137: source-self-contained news evidence allowed to use the narrow
+/// DataMode::Down profile. Callers cannot construct fields directly and must
+/// pass all provenance checks before reaching governance.
+#[derive(Debug, Clone)]
+pub struct SourceFactEvidence {
+    kind: PushKind,
+    governance_identity: String,
+    security_code: Option<String>,
+    headline: String,
+    source: String,
+    observed_at: chrono::DateTime<Local>,
+    source_published_on: chrono::NaiveDate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceFactError {
+    KindNotAllowed(PushKind),
+    MissingGovernanceIdentity,
+    MissingSecurityCode(PushKind),
+    UnexpectedSecurityCode(PushKind),
+    InvalidSecurityCode,
+    MissingHeadline,
+    MissingSource,
+    MissingPublishedDate,
+    StrengthOutOfRange(u8),
+    CertaintyOutOfRange(u8),
+    Stale,
+    FutureObservedAt,
+    FuturePublishedDate,
+}
+
+impl std::fmt::Display for SourceFactError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::KindNotAllowed(kind) => {
+                write!(formatter, "PushKind::{kind:?} is not a source fact")
+            }
+            Self::MissingGovernanceIdentity => {
+                formatter.write_str("source fact governance identity is missing")
+            }
+            Self::MissingSecurityCode(kind) => {
+                write!(formatter, "PushKind::{kind:?} requires a security code")
+            }
+            Self::UnexpectedSecurityCode(kind) => {
+                write!(
+                    formatter,
+                    "PushKind::{kind:?} must not carry a security code"
+                )
+            }
+            Self::InvalidSecurityCode => formatter.write_str("source fact security code rejected"),
+            Self::MissingHeadline => formatter.write_str("source fact headline is missing"),
+            Self::MissingSource => formatter.write_str("source fact source is missing"),
+            Self::MissingPublishedDate => {
+                formatter.write_str("source fact provider publication date is missing")
+            }
+            Self::StrengthOutOfRange(value) => {
+                write!(formatter, "source fact strength out of range: {value}")
+            }
+            Self::CertaintyOutOfRange(value) => {
+                write!(formatter, "source fact certainty out of range: {value}")
+            }
+            Self::Stale => formatter.write_str("source fact is stale"),
+            Self::FutureObservedAt => {
+                formatter.write_str("source fact observed_at is in the future")
+            }
+            Self::FuturePublishedDate => {
+                formatter.write_str("source fact provider publication date is in the future")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SourceFactError {}
+
+impl SourceFactEvidence {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "BR-137 evidence constructor makes every source fact field explicit"
+    )]
+    pub fn new(
+        kind: PushKind,
+        governance_identity: String,
+        security_code: Option<String>,
+        headline: String,
+        source: String,
+        observed_at: chrono::DateTime<Local>,
+        source_published_on: Option<chrono::NaiveDate>,
+        strength: u8,
+        certainty: u8,
+        stale: bool,
+    ) -> Result<Self, SourceFactError> {
+        if !matches!(
+            kind,
+            PushKind::Announcement
+                | PushKind::PolicyHit
+                | PushKind::EarningsBeat
+                | PushKind::EarningsMiss
+                | PushKind::AnalystUpgrade
+                | PushKind::NewsFlashCritical
+        ) {
+            return Err(SourceFactError::KindNotAllowed(kind));
+        }
+        if governance_identity.trim().is_empty() {
+            return Err(SourceFactError::MissingGovernanceIdentity);
+        }
+        if headline.trim().is_empty() {
+            return Err(SourceFactError::MissingHeadline);
+        }
+        if source.trim().is_empty() {
+            return Err(SourceFactError::MissingSource);
+        }
+        match kind {
+            PushKind::Announcement
+            | PushKind::EarningsBeat
+            | PushKind::EarningsMiss
+            | PushKind::AnalystUpgrade => {
+                let code = security_code
+                    .as_deref()
+                    .filter(|code| !code.trim().is_empty())
+                    .ok_or(SourceFactError::MissingSecurityCode(kind))?;
+                stock_analysis::risk::env_guard::validate_symbol_for_current_env(code)
+                    .map_err(|_| SourceFactError::InvalidSecurityCode)?;
+            }
+            PushKind::PolicyHit => {
+                if let Some(code) = security_code.as_deref() {
+                    if code.trim().is_empty() {
+                        return Err(SourceFactError::MissingSecurityCode(kind));
+                    }
+                    stock_analysis::risk::env_guard::validate_symbol_for_current_env(code)
+                        .map_err(|_| SourceFactError::InvalidSecurityCode)?;
+                }
+            }
+            PushKind::NewsFlashCritical => {
+                if security_code.is_some() {
+                    return Err(SourceFactError::UnexpectedSecurityCode(kind));
+                }
+            }
+            _ => unreachable!("source-fact whitelist checked above"),
+        }
+        if strength > 100 {
+            return Err(SourceFactError::StrengthOutOfRange(strength));
+        }
+        if certainty > 100 {
+            return Err(SourceFactError::CertaintyOutOfRange(certainty));
+        }
+        if stale {
+            return Err(SourceFactError::Stale);
+        }
+        if observed_at > Local::now() {
+            return Err(SourceFactError::FutureObservedAt);
+        }
+        let source_published_on =
+            source_published_on.ok_or(SourceFactError::MissingPublishedDate)?;
+        let today = Local::now().date_naive();
+        if source_published_on > today {
+            return Err(SourceFactError::FuturePublishedDate);
+        }
+        if source_published_on < today {
+            return Err(SourceFactError::Stale);
+        }
+        Ok(Self {
+            kind,
+            governance_identity,
+            security_code,
+            headline,
+            source,
+            observed_at,
+            source_published_on,
+        })
+    }
+
+    pub fn kind(&self) -> PushKind {
+        self.kind
+    }
+
+    pub fn security_code(&self) -> Option<&str> {
+        self.security_code.as_deref()
+    }
+}
+
 /// 投递前闸门: L4 dedup + L5 governance (b011 P0-2)
 ///
 /// `code`: 票级冷却键; None 时 PerTicket 类 kind 的冷却归模板层 memo, L4 不拦.
@@ -99,6 +281,43 @@ pub fn v14_gate_with_sub_kind(
     sub_kind: Option<&str>,
     cooldown_override_secs: Option<u32>,
 ) -> V14Gate {
+    let event = signal_event_for_kind(kind, code);
+    let profile = default_profile_for_kind(kind);
+    v14_gate_prepared(
+        kind,
+        code.is_some(),
+        sub_kind,
+        cooldown_override_secs,
+        event,
+        profile,
+        false,
+    )
+}
+
+/// BR-137 narrow gate for validated source facts. Generic callers cannot
+/// supply a relaxed profile or a prepared SignalEvent.
+pub fn v14_gate_source_fact(evidence: &SourceFactEvidence) -> V14Gate {
+    let event = signal_event_for_source_fact(evidence);
+    v14_gate_prepared(
+        evidence.kind,
+        true,
+        None,
+        None,
+        event,
+        source_fact_profile(evidence.kind),
+        true,
+    )
+}
+
+fn v14_gate_prepared(
+    kind: PushKind,
+    has_governance_identity: bool,
+    sub_kind: Option<&str>,
+    cooldown_override_secs: Option<u32>,
+    event: SignalEvent,
+    profile: TemplateMetadata,
+    source_fact_context: bool,
+) -> V14Gate {
     let stack = match v14_stack() {
         Ok(stack) => stack,
         Err(error) => {
@@ -106,7 +325,6 @@ pub fn v14_gate_with_sub_kind(
             return V14Gate::Denied("analytics_store_unavailable".to_string());
         }
     };
-    let event = signal_event_for_kind(kind, code);
     let (_, kind_str, _) = map_push_kind(kind);
 
     // b013 review P0-3: dedup 仅在 governance Approved + 投递成功后才插 (避免 Denied/failed 误锁窗口).
@@ -114,8 +332,11 @@ pub fn v14_gate_with_sub_kind(
     // b013 review P1-11: Deduped 也写 L7 (sink="deduped", pushed=false), 让归因分析看得到被治理掉的数量.
 
     // L5 governance 先判 (data_mode/frozen/quiet_hour/daily_limit)
-    let profile = default_profile_for_kind(kind);
-    let mut ctx = match current_governance_ctx() {
+    let mut ctx = match if source_fact_context {
+        current_source_fact_governance_ctx()
+    } else {
+        current_governance_ctx()
+    } {
         Ok(ctx) => ctx,
         Err(error) => {
             log::error!("[v14.2][BR-113] {error}");
@@ -189,8 +410,16 @@ pub fn v14_gate_with_sub_kind(
 
     // L4 dedup (v15.1 A3: 用 reserve() 只检查不插入, 投递成功后由 push_governor_inner 调 commit())
     // v17.6 §5.1: sub_kind 参与 dedup key (per-sub_kind 独立窗口)
-    let cooldown = dedup_cooldown(kind, code.is_some(), cooldown_override_secs);
+    let cooldown = dedup_cooldown(
+        kind,
+        has_governance_identity,
+        source_fact_context,
+        cooldown_override_secs,
+    );
     let outcome = match lock_dispatcher(stack) {
+        Ok(dispatcher) if source_fact_context => {
+            dispatcher.reserve_with_identity(&event, Some(&event.event_id), cooldown, sub_kind)
+        }
         Ok(dispatcher) => dispatcher.reserve(&event, cooldown, sub_kind),
         Err(error) => {
             log::error!("[v14.2][BR-113] {error}");
@@ -240,10 +469,13 @@ fn lock_dispatcher(
 fn dedup_cooldown(
     kind: PushKind,
     has_code: bool,
+    source_fact: bool,
     cooldown_override_secs: Option<u32>,
 ) -> Option<Duration> {
     match kind.cooldown_scope() {
-        CooldownScope::External => None,
+        // BR-137: legacy Announcement remains externally deduplicated, while
+        // its normalized source-fact path uses provider event_id as the L4 key.
+        CooldownScope::External if !source_fact => None,
         CooldownScope::PerTicket if !has_code => None,
         _ => cooldown_override_secs
             .or_else(|| kind.cooldown_secs())
@@ -259,8 +491,19 @@ pub fn commit_dedup_for_event(
     cooldown_override_secs: Option<u32>,
 ) -> Result<(), String> {
     let stack = v14_stack()?;
-    let cooldown = dedup_cooldown(kind, event.code.is_some(), cooldown_override_secs);
-    lock_dispatcher(stack)?.commit(event, cooldown, sub_kind);
+    let source_fact = is_source_fact_signal(kind, event);
+    let cooldown = dedup_cooldown(
+        kind,
+        source_fact || event.code.is_some(),
+        source_fact,
+        cooldown_override_secs,
+    );
+    let dispatcher = lock_dispatcher(stack)?;
+    if source_fact {
+        dispatcher.commit_with_identity(event, Some(&event.event_id), cooldown, sub_kind);
+    } else {
+        dispatcher.commit(event, cooldown, sub_kind);
+    }
     Ok(())
 }
 
@@ -272,7 +515,13 @@ pub fn rollback_dedup_for_event(
     cooldown_override_secs: Option<u32>,
 ) -> Result<(), String> {
     let stack = v14_stack()?;
-    let cooldown = dedup_cooldown(kind, event.code.is_some(), cooldown_override_secs);
+    let source_fact = is_source_fact_signal(kind, event);
+    let cooldown = dedup_cooldown(
+        kind,
+        source_fact || event.code.is_some(),
+        source_fact,
+        cooldown_override_secs,
+    );
     lock_dispatcher(stack)?.rollback(event, cooldown, sub_kind);
     Ok(())
 }
@@ -334,7 +583,11 @@ pub fn v14_record_delivery(
 ) -> Result<(), String> {
     let stack = v14_stack()?;
     let (_, kind_str, _) = map_push_kind(kind);
-    let ctx = current_governance_ctx()?;
+    let ctx = if is_source_fact_signal(kind, event) {
+        current_source_fact_governance_ctx()?
+    } else {
+        current_governance_ctx()?
+    };
     let analytics = build_analytics(
         event,
         kind_str,
@@ -510,6 +763,46 @@ fn signal_event_for_kind(kind: PushKind, code: Option<&str>) -> SignalEvent {
     )
 }
 
+fn signal_event_for_source_fact(evidence: &SourceFactEvidence) -> SignalEvent {
+    let (source, kind_str, severity) = map_push_kind(evidence.kind);
+    let mut event = SignalEvent::new(
+        source,
+        kind_str,
+        evidence.security_code.clone(),
+        evidence.observed_at,
+        SignalPayload::NewsCatalyst(NewsCatalystPayload {
+            code: evidence.security_code.clone(),
+            headline: Some(evidence.headline.clone()),
+            source: Some(evidence.source.clone()),
+            published_on: Some(evidence.source_published_on),
+        }),
+        severity,
+    );
+    event.event_id =
+        stock_analysis::push_l1::make_source_fact_event_id(kind_str, &evidence.governance_identity);
+    event
+}
+
+fn source_fact_profile(kind: PushKind) -> TemplateMetadata {
+    let mut profile = default_profile_for_kind(kind);
+    profile.category = stock_analysis::push_l2::TemplateCategory::News;
+    profile.data_mode_min = DataMode::Down;
+    profile.always_send_on_data_source_down = false;
+    profile
+}
+
+fn is_source_fact_signal(kind: PushKind, event: &SignalEvent) -> bool {
+    matches!(
+        kind,
+        PushKind::Announcement
+            | PushKind::PolicyHit
+            | PushKind::EarningsBeat
+            | PushKind::EarningsMiss
+            | PushKind::AnalystUpgrade
+            | PushKind::NewsFlashCritical
+    ) && matches!(event.payload, SignalPayload::NewsCatalyst(_))
+}
+
 /// 默认 profile (按 PushKind 给推荐 category + §14.3 冷却)
 fn default_profile_for_kind(kind: PushKind) -> TemplateMetadata {
     use stock_analysis::push_l2::TemplateCategory::*;
@@ -563,18 +856,7 @@ fn current_governance_ctx() -> Result<GovernanceContext, String> {
             crate::push_templates::DataMode::Degraded => DataMode::Degraded,
             _ => DataMode::Down,
         },
-        is_quiet_hour: match std::env::var("STOCK_ANALYSIS_QUIET_HOUR_OVERRIDE")
-            .ok()
-            .as_deref()
-        {
-            // 显式 override (仅测试/运维用): "0"/"false" 强制非静默, "1"/"true" 强制静默
-            // 默认 (未设): 墙钟 02:00-06:00 静默, 行为不变 (v15.x 静默默认值需显式声明才生效)
-            // 背景: e2e_t01/t02 断言"推送成功", 凌晨 02-06 点跑必挂 (墙钟依赖),
-            //   测试内设 override=0 变时间无关 (2026-07-16 诊断)
-            Some("0") | Some("false") => false,
-            Some("1") | Some("true") => true,
-            _ => (2..6).contains(&now.hour()),
-        },
+        is_quiet_hour: current_quiet_hour(now),
         // b013 P0-7: Frozen 模式经 banner 进来, 治理能真正拦
         is_frozen: matches!(
             banner.account_mode,
@@ -586,6 +868,42 @@ fn current_governance_ctx() -> Result<GovernanceContext, String> {
     })
 }
 
+/// BR-137 source facts do not consume account state. Their governance context
+/// therefore reads the real process-local capability tracker directly instead
+/// of the combined account/data banner. `is_frozen=false` means this profile
+/// does not apply the account freeze gate; it is not an inferred account mode.
+fn current_source_fact_governance_ctx() -> Result<GovernanceContext, String> {
+    use stock_analysis::monitor::data_mode::{
+        current_data_health_input, evaluate, DataMode as HealthDataMode,
+    };
+
+    let now = Local::now();
+    let health = evaluate(&current_data_health_input(120, 600)?, None);
+    Ok(GovernanceContext {
+        data_mode: match health.mode {
+            HealthDataMode::Full => DataMode::Full,
+            HealthDataMode::Degraded => DataMode::Degraded,
+            HealthDataMode::Unsafe => DataMode::Down,
+        },
+        is_quiet_hour: current_quiet_hour(now),
+        is_frozen: false,
+        now,
+        today_pushed_count: 0,
+    })
+}
+
+fn current_quiet_hour(now: chrono::DateTime<Local>) -> bool {
+    match std::env::var("STOCK_ANALYSIS_QUIET_HOUR_OVERRIDE")
+        .ok()
+        .as_deref()
+    {
+        // Explicit test/operations override. Without one, retain 02:00-06:00.
+        Some("0") | Some("false") => false,
+        Some("1") | Some("true") => true,
+        _ => (2..6).contains(&now.hour()),
+    }
+}
+
 // ============================================================================
 // 单元测试
 // ============================================================================
@@ -593,6 +911,29 @@ fn current_governance_ctx() -> Result<GovernanceContext, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn source_fact(kind: PushKind) -> SourceFactEvidence {
+        source_fact_with_identity(kind, "TEST_CODE_EVENT_ID")
+    }
+
+    fn source_fact_with_identity(kind: PushKind, identity: &str) -> SourceFactEvidence {
+        let security_code = (!matches!(kind, PushKind::PolicyHit | PushKind::NewsFlashCritical))
+            .then(|| "TEST_CODE_SOURCE_FACT".to_string());
+        let now = Local::now();
+        SourceFactEvidence::new(
+            kind,
+            identity.to_string(),
+            security_code,
+            "已验证来源事实".to_string(),
+            "TEST_CODE_PROVIDER".to_string(),
+            now,
+            Some(now.date_naive()),
+            80,
+            90,
+            false,
+        )
+        .expect("complete source fact")
+    }
 
     fn isolated_stack() -> &'static V14Stack {
         Box::leak(Box::new(V14Stack {
@@ -683,7 +1024,7 @@ mod tests {
         let override_secs = Some(1_800);
 
         assert_eq!(
-            dedup_cooldown(PushKind::DailyReport, false, override_secs),
+            dedup_cooldown(PushKind::DailyReport, false, false, override_secs),
             Some(Duration::from_secs(1_800))
         );
         commit_dedup_for_event(
@@ -778,6 +1119,280 @@ mod tests {
             default_profile_for_kind(PushKind::AccountMode).data_mode_min,
             DataMode::Down
         );
+    }
+
+    #[test]
+    #[serial_test::serial(cooldown_memo)]
+    fn br137_source_fact_is_approved_at_data_mode_down_with_news_payload() {
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
+        _reset_dedup_for_test();
+        crate::LATEST_BANNER
+            .lock()
+            .expect("test banner lock")
+            .as_mut()
+            .expect("test banner")
+            .data_mode = crate::push_templates::DataMode::Unsafe;
+
+        let gate = v14_gate_source_fact(&source_fact(PushKind::EarningsMiss));
+        let V14Gate::Approved(event) = gate else {
+            panic!("complete source fact must pass at Down: {gate:?}");
+        };
+        assert_eq!(event.code.as_deref(), Some("TEST_CODE_SOURCE_FACT"));
+        assert_ne!(event.event_id, "TEST_CODE_EVENT_ID");
+        match &event.payload {
+            SignalPayload::NewsCatalyst(payload) => {
+                assert_eq!(payload.code.as_deref(), Some("TEST_CODE_SOURCE_FACT"));
+                assert_eq!(payload.headline.as_deref(), Some("已验证来源事实"));
+                assert_eq!(payload.source.as_deref(), Some("TEST_CODE_PROVIDER"));
+                assert_eq!(payload.published_on, Some(Local::now().date_naive()));
+            }
+            other => panic!("source fact must retain news provenance, got {other:?}"),
+        }
+
+        use stock_analysis::event::DomainEvent;
+        let delivery = stock_analysis::event::PushDeliveryEvent::new(
+            "earnings_miss".to_string(),
+            event.code.clone(),
+            "Pushed".to_string(),
+            "dry_run".to_string(),
+            1,
+            1,
+        );
+        assert_eq!(
+            delivery.entity_key(),
+            Some("TEST_CODE_SOURCE_FACT"),
+            "delivery audit entity must remain the security code"
+        );
+        assert_ne!(delivery.entity_key(), Some("TEST_CODE_EVENT_ID"));
+    }
+
+    #[test]
+    #[serial_test::serial(cooldown_memo)]
+    fn br137_l4_dedup_uses_provider_identity_not_security_code() {
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
+        _reset_dedup_for_test();
+        let first_fact = source_fact_with_identity(PushKind::EarningsMiss, "provider-event-1");
+        let second_fact = source_fact_with_identity(PushKind::EarningsMiss, "provider-event-2");
+
+        let V14Gate::Approved(first_event) = v14_gate_source_fact(&first_fact) else {
+            panic!("first source fact must be approved");
+        };
+        commit_dedup_for_event(&first_event, PushKind::EarningsMiss, None, None).unwrap();
+        assert!(matches!(
+            v14_gate_source_fact(&second_fact),
+            V14Gate::Approved(_)
+        ));
+        assert!(matches!(
+            v14_gate_source_fact(&first_fact),
+            V14Gate::Deduped
+        ));
+    }
+
+    #[test]
+    #[serial_test::serial(cooldown_memo)]
+    fn br137_source_fact_gate_and_l7_do_not_require_account_banner() {
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
+        _reset_dedup_for_test();
+        let previous_banner = crate::LATEST_BANNER
+            .lock()
+            .expect("test banner lock")
+            .take();
+
+        let gate = v14_gate_source_fact(&source_fact(PushKind::PolicyHit));
+        let record_result = match &gate {
+            V14Gate::Approved(event) => v14_record_delivery(
+                event,
+                PushKind::PolicyHit,
+                "TEST_CODE_FACT",
+                true,
+                "dry_run",
+            ),
+            other => Err(format!(
+                "source fact gate rejected without banner: {other:?}"
+            )),
+        };
+
+        *crate::LATEST_BANNER.lock().expect("restore banner lock") = previous_banner;
+        assert!(matches!(gate, V14Gate::Approved(_)), "gate={gate:?}");
+        assert!(record_result.is_ok(), "record={record_result:?}");
+    }
+
+    #[test]
+    #[serial_test::serial(cooldown_memo)]
+    fn br137_generic_mixed_news_remains_denied_at_data_mode_down() {
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
+        _reset_dedup_for_test();
+        crate::LATEST_BANNER
+            .lock()
+            .expect("test banner lock")
+            .as_mut()
+            .expect("test banner")
+            .data_mode = crate::push_templates::DataMode::Unsafe;
+
+        assert!(matches!(
+            v14_gate(PushKind::NewsCatalyst, Some("TEST_CODE_MIXED_NEWS")),
+            V14Gate::Denied(reason) if reason == "data_quality"
+        ));
+    }
+
+    #[test]
+    fn br137_source_fact_rejects_non_whitelisted_or_invalid_evidence() {
+        let now = Local::now();
+        let valid = |kind,
+                     identity: &str,
+                     code: Option<&str>,
+                     headline: &str,
+                     source: &str,
+                     observed_at: chrono::DateTime<Local>,
+                     strength,
+                     certainty,
+                     stale| {
+            let source_published_on = observed_at.date_naive();
+            SourceFactEvidence::new(
+                kind,
+                identity.to_string(),
+                code.map(str::to_string),
+                headline.to_string(),
+                source.to_string(),
+                observed_at,
+                Some(source_published_on),
+                strength,
+                certainty,
+                stale,
+            )
+        };
+
+        assert!(valid(
+            PushKind::MarketActionAlert,
+            "event",
+            Some("TEST_CODE_MARKET_ACTION"),
+            "headline",
+            "provider",
+            now,
+            80,
+            90,
+            false
+        )
+        .is_err());
+        assert_eq!(
+            SourceFactEvidence::new(
+                PushKind::PolicyHit,
+                "event".to_string(),
+                None,
+                "headline".to_string(),
+                "provider".to_string(),
+                now,
+                None,
+                80,
+                90,
+                false,
+            )
+            .unwrap_err(),
+            SourceFactError::MissingPublishedDate
+        );
+        assert!(valid(
+            PushKind::Announcement,
+            "event",
+            None,
+            "headline",
+            "provider",
+            now,
+            80,
+            90,
+            false
+        )
+        .is_err());
+        assert!(valid(
+            PushKind::PolicyHit,
+            " ",
+            None,
+            "headline",
+            "provider",
+            now,
+            80,
+            90,
+            false
+        )
+        .is_err());
+        assert!(valid(
+            PushKind::PolicyHit,
+            "event",
+            None,
+            " ",
+            "provider",
+            now,
+            80,
+            90,
+            false
+        )
+        .is_err());
+        assert!(valid(
+            PushKind::PolicyHit,
+            "event",
+            None,
+            "headline",
+            " ",
+            now,
+            80,
+            90,
+            false
+        )
+        .is_err());
+        assert!(valid(
+            PushKind::PolicyHit,
+            "event",
+            None,
+            "headline",
+            "provider",
+            now,
+            101,
+            90,
+            false
+        )
+        .is_err());
+        assert!(valid(
+            PushKind::PolicyHit,
+            "event",
+            None,
+            "headline",
+            "provider",
+            now,
+            80,
+            101,
+            false
+        )
+        .is_err());
+        assert!(valid(
+            PushKind::PolicyHit,
+            "event",
+            None,
+            "headline",
+            "provider",
+            now,
+            80,
+            90,
+            true
+        )
+        .is_err());
+        assert!(valid(
+            PushKind::PolicyHit,
+            "event",
+            None,
+            "headline",
+            "provider",
+            now + chrono::Duration::minutes(1),
+            80,
+            90,
+            false
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn br137_critical_flash_identity_is_not_a_security_code() {
+        let fact = source_fact(PushKind::NewsFlashCritical);
+        assert_eq!(fact.governance_identity, "TEST_CODE_EVENT_ID");
+        assert_eq!(fact.security_code.as_deref(), None);
     }
 
     #[test]

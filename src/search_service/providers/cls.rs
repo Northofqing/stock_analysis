@@ -9,6 +9,15 @@ use serde::Deserialize;
 use super::super::types::{SearchProvider, SearchResponse, SearchResult};
 use super::cls_sign::build_signed_params;
 
+fn format_epoch_published_date(timestamp: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp(timestamp, 0).map(|value| {
+        value
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string()
+    })
+}
+
 #[derive(Debug, Deserialize)]
 struct ClsTelegraphResp {
     errno: Option<i64>,
@@ -106,13 +115,7 @@ impl ClsProvider {
             }
 
             let snippet = item.content.unwrap_or_default();
-            let date_tag = item.ctime.map(|ts| {
-                chrono::DateTime::from_timestamp(ts, 0)
-                    .unwrap_or_default()
-                    .with_timezone(&chrono::Local)
-                    .format("%H:%M")
-                    .to_string()
-            });
+            let date_tag = item.ctime.and_then(format_epoch_published_date);
             let detail_id = item.id.unwrap_or_default();
             let url = if detail_id > 0 {
                 format!("https://www.cls.cn/detail/{}", detail_id)
@@ -120,10 +123,9 @@ impl ClsProvider {
                 "https://www.cls.cn/telegraph".to_string()
             };
 
-            out.push(
-                SearchResult::new(title, snippet, url, "财联社".to_string())
-                    .with_date(date_tag.unwrap_or_default()),
-            );
+            let mut result = SearchResult::new(title, snippet, url, "财联社".to_string());
+            result.published_date = date_tag;
+            out.push(result);
             if out.len() >= limit {
                 break;
             }
@@ -192,5 +194,17 @@ impl SearchProvider for ClsProvider {
             },
             search_time: start.elapsed().as_secs_f64(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_timestamp_retains_local_date_and_seconds() {
+        let rendered = format_epoch_published_date(1_752_918_600).unwrap();
+        assert!(chrono::NaiveDateTime::parse_from_str(&rendered, "%Y-%m-%d %H:%M:%S").is_ok());
+        assert_eq!(format_epoch_published_date(i64::MAX), None);
     }
 }

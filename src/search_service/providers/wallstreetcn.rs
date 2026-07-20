@@ -8,6 +8,15 @@ use serde::Deserialize;
 
 use super::super::types::{SearchProvider, SearchResponse, SearchResult};
 
+fn format_epoch_published_date(timestamp: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp(timestamp, 0).map(|value| {
+        value
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string()
+    })
+}
+
 // ============================================================================
 // 华尔街见闻 直连API
 // ============================================================================
@@ -94,23 +103,17 @@ impl WallStreetCnProvider {
                         return None;
                     }
                 }
-                let date_tag = item.created_at.map(|ts| {
-                    let dt = chrono::DateTime::from_timestamp(ts, 0)
-                        .unwrap_or_default()
-                        .with_timezone(&chrono::Local);
-                    dt.format("%H:%M").to_string()
-                });
+                let date_tag = item.created_at.and_then(format_epoch_published_date);
                 let title: String = text.chars().take(60).collect();
                 let snippet: String = text.chars().take(200).collect();
-                Some(
-                    SearchResult::new(
-                        title,
-                        snippet,
-                        "https://wallstreetcn.com/".to_string(),
-                        "华尔街见闻".to_string(),
-                    )
-                    .with_date(date_tag.unwrap_or_default()),
-                )
+                let mut result = SearchResult::new(
+                    title,
+                    snippet,
+                    "https://wallstreetcn.com/".to_string(),
+                    "华尔街见闻".to_string(),
+                );
+                result.published_date = date_tag;
+                Some(result)
             })
             .collect();
 
@@ -178,16 +181,10 @@ impl WallStreetCnProvider {
                 } else {
                     format!("https://wallstreetcn.com/articles/{}", uri)
                 };
-                let date_tag = item.display_time.map(|ts| {
-                    let dt = chrono::DateTime::from_timestamp(ts, 0)
-                        .unwrap_or_default()
-                        .with_timezone(&chrono::Local);
-                    dt.format("%H:%M").to_string()
-                });
-                Some(
-                    SearchResult::new(title, snippet, url, "华尔街见闻".to_string())
-                        .with_date(date_tag.unwrap_or_default()),
-                )
+                let date_tag = item.display_time.and_then(format_epoch_published_date);
+                let mut result = SearchResult::new(title, snippet, url, "华尔街见闻".to_string());
+                result.published_date = date_tag;
+                Some(result)
             })
             .collect();
 
@@ -250,5 +247,17 @@ impl SearchProvider for WallStreetCnProvider {
             },
             search_time: start.elapsed().as_secs_f64(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_timestamp_retains_local_date_and_seconds() {
+        let rendered = format_epoch_published_date(1_752_918_600).unwrap();
+        assert!(chrono::NaiveDateTime::parse_from_str(&rendered, "%Y-%m-%d %H:%M:%S").is_ok());
+        assert_eq!(format_epoch_published_date(i64::MAX), None);
     }
 }

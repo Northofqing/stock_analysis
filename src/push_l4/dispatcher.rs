@@ -115,12 +115,24 @@ impl Dispatcher {
         cooldown: Option<Duration>,
         sub_kind: Option<&str>,
     ) -> ReserveOutcome {
+        self.reserve_with_identity(event, event.code.as_deref(), cooldown, sub_kind)
+    }
+
+    /// BR-137 variant for source facts whose provider identity is independent
+    /// from the optional security code carried by the event.
+    pub fn reserve_with_identity(
+        &self,
+        event: &SignalEvent,
+        business_identity: Option<&str>,
+        cooldown: Option<Duration>,
+        sub_kind: Option<&str>,
+    ) -> ReserveOutcome {
         let Some(_window) = cooldown.filter(|w| !w.is_zero()) else {
             return ReserveOutcome::Reserved;
         };
         let key = (
             event.kind.clone(),
-            event.code.clone().unwrap_or_default(),
+            business_identity.unwrap_or_default().to_string(),
             sub_kind.unwrap_or("").to_string(),
         );
         match self.dedup_table.get(&key) {
@@ -142,12 +154,23 @@ impl Dispatcher {
     /// v15.1 A3: 实际插入 dedup entry (push 成功后调用).
     /// sub_kind 语义同 reserve().
     pub fn commit(&self, event: &SignalEvent, cooldown: Option<Duration>, sub_kind: Option<&str>) {
+        self.commit_with_identity(event, event.code.as_deref(), cooldown, sub_kind);
+    }
+
+    /// BR-137 commit companion to `reserve_with_identity`.
+    pub fn commit_with_identity(
+        &self,
+        event: &SignalEvent,
+        business_identity: Option<&str>,
+        cooldown: Option<Duration>,
+        sub_kind: Option<&str>,
+    ) {
         let Some(window) = cooldown.filter(|w| !w.is_zero()) else {
             return;
         };
         let key = (
             event.kind.clone(),
-            event.code.clone().unwrap_or_default(),
+            business_identity.unwrap_or_default().to_string(),
             sub_kind.unwrap_or("").to_string(),
         );
         let now = std::time::Instant::now();

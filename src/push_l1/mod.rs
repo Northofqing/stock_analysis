@@ -8,8 +8,8 @@ pub mod event;
 
 // 重新导出主要类型, 方便 L4 dispatcher 一行 use
 pub use event::{
-    make_event_id, DataSourceDownPayload, EventBucket, HoldingHealthPayload, LimitUpPayload,
-    LimitUpTier, LimitUpTierPayload, NewsCatalystPayload, PositionChangedPayload,
-    PostSessionReviewPayload, QuietHourPayload, RiskViolationPayload, SectorRotationPayload,
-    Severity, SignalEvent, SignalPayload, SignalSource,
+    make_event_id, make_source_fact_event_id, DataSourceDownPayload, EventBucket,
+    HoldingHealthPayload, LimitUpPayload, LimitUpTier, LimitUpTierPayload, NewsCatalystPayload,
+    PositionChangedPayload, PostSessionReviewPayload, QuietHourPayload, RiskViolationPayload,
+    SectorRotationPayload, Severity, SignalEvent, SignalPayload, SignalSource,
 };

@@ -1,4 +1,4 @@
-//! Registered business rules: BR-047, BR-048, BR-077.
+//! Registered business rules: BR-047, BR-048, BR-077, BR-137.
 //! 通知推送 + MagicLaw 守护进程 + Token 管理
 //!
 //! 从 main.rs 提取，减少单文件体积。
@@ -988,6 +988,15 @@ impl PushOutcome {
 ///     gate/analytics 全链路照走 → --test 能测到完整推送治理路径)
 ///   - sink_name 不再硬编码 "wechat" (b011 P0-1), 取实际通道
 async fn push_governor_inner(text: &str, kind: PushKind, code: Option<&str>) -> PushOutcome {
+    push_governor_inner_with_source_fact(text, kind, code, None).await
+}
+
+async fn push_governor_inner_with_source_fact(
+    text: &str,
+    kind: PushKind,
+    code: Option<&str>,
+    source_fact: Option<&crate::v14_adapter::SourceFactEvidence>,
+) -> PushOutcome {
     use crate::v14_adapter::{self, V14Gate};
 
     // v17.5 §2.2: 命中 v17.5-legacy variants 时按 env 控制可见性
@@ -1043,7 +1052,11 @@ async fn push_governor_inner(text: &str, kind: PushKind, code: Option<&str>) -> 
     if !launch_gate_check(kind) {
         return PushOutcome::Denied("launch_gate_stage".to_string());
     }
-    let event = match v14_adapter::v14_gate(kind, code) {
+    let gate = match source_fact {
+        Some(evidence) => v14_adapter::v14_gate_source_fact(evidence),
+        None => v14_adapter::v14_gate(kind, code),
+    };
+    let event = match gate {
         V14Gate::Deduped => return PushOutcome::Deduped,
         V14Gate::Denied(reason) => return PushOutcome::Denied(reason),
         V14Gate::Approved(event) => *event,
@@ -1088,7 +1101,7 @@ async fn push_governor_inner_with_sub_kind(
     deliver_and_record(event, kind, text, start, sub_kind_str, override_cooldown).await
 }
 
-/// 公共尾段: L5/L6 投递 + commit/rollback + L7 留痕.
+/// 公共尾段: L5/L6 投递 + L7/哈希链留痕 + commit/rollback.
 /// push_governor_inner + push_governor_inner_with_sub_kind 共用 (DRY).
 async fn deliver_and_record(
     event: stock_analysis::push_l1::SignalEvent,
@@ -1114,11 +1127,6 @@ async fn deliver_and_record(
     } else {
         push_wechat(text).await
     };
-    let dedup_result = if delivered {
-        v14_adapter::commit_dedup_for_event(&event, kind, sub_kind, cooldown_override_secs)
-    } else {
-        v14_adapter::rollback_dedup_for_event(&event, kind, sub_kind, cooldown_override_secs)
-    };
     // b013 review P2-15: 入口取一次 channel (避免 push_wechat await 后 env 抖动)
     let channel = current_send_channel();
     let l7_result = v14_adapter::v14_record_delivery(&event, kind, text, delivered, channel);
@@ -1138,6 +1146,14 @@ async fn deliver_and_record(
         channel,
         text.len(),
         latency_ms,
+    );
+    let dedup_result = settle_dedup_after_delivery(
+        &event,
+        kind,
+        sub_kind,
+        cooldown_override_secs,
+        delivered,
+        l7_result.is_ok() && audit_result.is_ok(),
     );
 
     let mut audit_errors = Vec::new();
@@ -1162,6 +1178,24 @@ async fn deliver_and_record(
         PushOutcome::Pushed
     } else {
         PushOutcome::SinkError("push_wechat returned false".to_string())
+    }
+}
+
+/// BR-137: a source-fact identity is committed only after the sink and both
+/// authoritative post-delivery records succeed. Any other outcome releases
+/// the reservation so a later real provider poll can retry.
+fn settle_dedup_after_delivery(
+    event: &stock_analysis::push_l1::SignalEvent,
+    kind: PushKind,
+    sub_kind: Option<&str>,
+    cooldown_override_secs: Option<u32>,
+    delivered: bool,
+    post_delivery_audits_ok: bool,
+) -> Result<(), String> {
+    if delivered && post_delivery_audits_ok {
+        crate::v14_adapter::commit_dedup_for_event(event, kind, sub_kind, cooldown_override_secs)
+    } else {
+        crate::v14_adapter::rollback_dedup_for_event(event, kind, sub_kind, cooldown_override_secs)
     }
 }
 
@@ -1204,6 +1238,22 @@ pub async fn push_governor(text: &str, kind: PushKind) -> bool {
 /// `code`: 票级冷却键 (§14.3 "/票" 类 kind 必传 real 票号, 否则 L4 不做票级冷却).
 pub async fn push_governor_v3(text: &str, kind: PushKind, code: Option<&str>) -> PushOutcome {
     push_governor_inner(text, kind, code).await
+}
+
+/// BR-137 sole delivery entry for a validated source-self-contained fact.
+/// Kind and dedup identity are derived from the evidence so callers cannot
+/// pair a relaxed source profile with an unrelated PushKind.
+pub async fn push_source_fact_v3(
+    text: &str,
+    evidence: &crate::v14_adapter::SourceFactEvidence,
+) -> PushOutcome {
+    push_governor_inner_with_source_fact(
+        text,
+        evidence.kind(),
+        evidence.security_code(),
+        Some(evidence),
+    )
+    .await
 }
 
 /// v17.6 §5.1: push_governor_v3 的 sub_kind-aware 版本.
@@ -3331,5 +3381,40 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("HTTP 500"));
         request.await.unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial(cooldown_memo)]
+    fn br137_sink_success_with_post_delivery_audit_failure_releases_identity_for_retry() {
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
+        crate::v14_adapter::_reset_dedup_for_test();
+        let now = chrono::Local::now();
+        let evidence = crate::v14_adapter::SourceFactEvidence::new(
+            PushKind::Announcement,
+            "TEST_CODE_POST_AUDIT_RETRY_ID".to_string(),
+            Some("TEST_CODE_POST_AUDIT_RETRY".to_string()),
+            "后置审计失败后允许重试".to_string(),
+            "TEST_CODE_PROVIDER".to_string(),
+            now,
+            Some(now.date_naive()),
+            80,
+            90,
+            false,
+        )
+        .expect("complete source fact");
+        let first = match crate::v14_adapter::v14_gate_source_fact(&evidence) {
+            crate::v14_adapter::V14Gate::Approved(event) => *event,
+            other => panic!("first attempt must reserve: {other:?}"),
+        };
+
+        settle_dedup_after_delivery(&first, PushKind::Announcement, None, None, true, false)
+            .expect("failed post-delivery audit must roll back L4 identity");
+
+        let retry = match crate::v14_adapter::v14_gate_source_fact(&evidence) {
+            crate::v14_adapter::V14Gate::Approved(event) => *event,
+            other => panic!("audit failure must leave the source fact retryable: {other:?}"),
+        };
+        crate::v14_adapter::rollback_dedup_for_event(&retry, PushKind::Announcement, None, None)
+            .expect("test cleanup rollback");
     }
 }

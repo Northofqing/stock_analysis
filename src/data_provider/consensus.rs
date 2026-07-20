@@ -1,3 +1,4 @@
+//! Registered business rules: BR-119, BR-137.
 //! 卖方研报一致预期（EPS / 评级分布 / 目标价）
 //!
 //! 数据源：东方财富 `reportapi.eastmoney.com/report/list`，按个股聚合近 6 个月研报：
@@ -80,10 +81,13 @@ fn required_text(item: &Value, field: &str) -> Result<String> {
 
 fn required_publish_date(item: &Value) -> Result<(String, chrono::NaiveDate)> {
     let raw = required_text(item, "publishDate")?;
-    let date_text = raw.split_whitespace().next().unwrap_or(&raw);
-    let date = chrono::NaiveDate::parse_from_str(date_text, "%Y-%m-%d")
-        .map_err(|error| anyhow!("一致预期 publishDate 非法 {date_text:?}: {error}"))?;
-    Ok((date_text.to_string(), date))
+    let date = chrono::NaiveDate::parse_from_str(&raw, "%Y-%m-%d")
+        .or_else(|_| {
+            chrono::NaiveDateTime::parse_from_str(&raw, "%Y-%m-%d %H:%M:%S")
+                .map(|timestamp| timestamp.date())
+        })
+        .map_err(|error| anyhow!("一致预期 publishDate 非法 {raw:?}: {error}"))?;
+    Ok((date.format("%Y-%m-%d").to_string(), date))
 }
 
 fn avg(values: &[f64]) -> Option<f64> {
@@ -301,6 +305,8 @@ mod strict_contract_tests {
 
         let bad_date = serde_json::json!({"publishDate": "2026-99-99"});
         assert!(required_publish_date(&bad_date).is_err());
+        let trailing_garbage = serde_json::json!({"publishDate": "2026-07-18 garbage"});
+        assert!(required_publish_date(&trailing_garbage).is_err());
         assert!(required_text(&serde_json::json!({"title": ""}), "title").is_err());
     }
 

@@ -1,3 +1,4 @@
+//! Registered business rules: BR-112, BR-137.
 //! v17.7 Task 5: Monitor-only source-to-push adapter
 //!
 //! Consumes `NormalizedSourceEvent` from the news aggregator and dispatches
@@ -7,7 +8,7 @@
 
 use crate::notify::{self, PushKind, PushOutcome};
 use chrono::Local;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use stock_analysis::data_provider::consensus;
@@ -17,7 +18,8 @@ use stock_analysis::news::aggregator::analyst_state::{
     AnalystKey, AnalystObservation, AnalystStateStore,
 };
 use stock_analysis::news::aggregator::classifier::{
-    classify_earnings, EarningsClassification, EarningsConfig, EarningsKind,
+    classify_announcement, classify_earnings, classify_policy, EarningsClassification,
+    EarningsConfig, EarningsKind,
 };
 use stock_analysis::news::aggregator::{NormalizedSourceEvent, SourcePushKind};
 
@@ -65,6 +67,9 @@ pub fn normalize_market_action(event: &MonitorEvent) -> Option<NormalizedSourceE
             stock_analysis::signal::market_event::Direction::Neutral,
             70,
             90,
+            Local::now(),
+            None,
+            false,
             "monitor".into(),
             None,
         )
@@ -105,6 +110,101 @@ pub struct SourcePollReport {
     pub pushed: usize,
     pub skipped: usize,
     pub failed: usize,
+}
+
+#[derive(Debug, Default)]
+pub struct AnnouncementSourceRouteReport {
+    pub source: SourcePollReport,
+    /// External IDs owned by the normalized source-fact path for this batch.
+    /// Ownership means legacy delivery must not be used as an outcome fallback;
+    /// it does not claim that the sink confirmed delivery.
+    pub normalized_external_ids: HashSet<String>,
+}
+
+fn record_source_attempt(report: &mut SourcePollReport, outcome: &PushOutcome) {
+    match outcome {
+        PushOutcome::Pushed => report.pushed += 1,
+        _ => report.failed += 1,
+    }
+}
+
+/// Route complete real-provider announcements one by one through the sole
+/// normalized source-fact path. Successfully classified items are owned by
+/// this path even when governance/sink fails, so legacy delivery cannot bypass
+/// the explicit outcome. The next provider poll remains the retry boundary.
+pub async fn route_announcements(
+    announcements: &[stock_analysis::data_provider::announcement::Announcement],
+) -> AnnouncementSourceRouteReport {
+    let mut routed = AnnouncementSourceRouteReport::default();
+    for announcement in announcements {
+        routed.source.attempted += 1;
+        let Some(external_id) = announcement
+            .external_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            routed.source.skipped += 1;
+            log::warn!(
+                "[v17.7][BR-137] announcement source route skipped: missing provider external_id"
+            );
+            continue;
+        };
+        let event = match classify_announcement(announcement) {
+            Ok(event) => event,
+            Err(error) => {
+                routed.source.skipped += 1;
+                log::warn!("[v17.7][BR-137] announcement classification rejected: reason={error}");
+                continue;
+            }
+        };
+        routed.source.classified += 1;
+        routed
+            .normalized_external_ids
+            .insert(external_id.to_string());
+        let attempt = push_normalized_event(event).await;
+        record_source_attempt(&mut routed.source, &attempt.outcome);
+        log::info!(
+            "[v17.7][BR-137] announcement normalized outcome={:?}",
+            attempt.outcome
+        );
+    }
+    routed
+}
+
+/// Classify and push the original government-policy provider results without
+/// converting them to generic MarketEvent values first.
+pub async fn push_policy_results(
+    results: Vec<stock_analysis::search_service::SearchResult>,
+) -> SourcePollReport {
+    let mut report = SourcePollReport::default();
+    for result in results {
+        report.attempted += 1;
+        let event = match classify_policy(&result) {
+            Ok(event) => event,
+            Err(error) => {
+                report.skipped += 1;
+                log::warn!("[v17.7][BR-137] policy classification rejected: reason={error}");
+                continue;
+            }
+        };
+        report.classified += 1;
+        let attempt = push_normalized_event(event).await;
+        record_source_attempt(&mut report, &attempt.outcome);
+        log::info!(
+            "[v17.7][BR-137] policy normalized outcome={:?}",
+            attempt.outcome
+        );
+    }
+    report
+}
+
+pub async fn poll_policy_provider(
+    provider: &stock_analysis::search_service::providers::gov_policy::GovPolicyProvider,
+    limit: usize,
+) -> anyhow::Result<SourcePollReport> {
+    let results = provider.fetch_latest(limit).await?;
+    Ok(push_policy_results(results).await)
 }
 
 /// Maps SourcePushKind 1:1 to the corresponding PushKind variant.
@@ -156,8 +256,47 @@ fn render_message(event: &NormalizedSourceEvent) -> String {
 pub async fn push_normalized_event(event: NormalizedSourceEvent) -> PushAttempt {
     let kind = source_push_kind_to_push_kind(event.push_kind);
     let code_str = event.code.clone();
+    if let Err(error) = event.validate() {
+        log::error!(
+            "[v17.7][BR-137] normalized source event rejected: kind={kind:?} reason={error}"
+        );
+        return PushAttempt {
+            kind,
+            code: code_str,
+            outcome: PushOutcome::Denied(format!("source_event_invalid:{error}")),
+            rendered_len: 0,
+        };
+    }
     let rendered = render_message(&event);
-    let outcome = notify::push_governor_v3(&rendered, kind, code_str.as_deref()).await;
+    let outcome = if matches!(
+        kind,
+        PushKind::Announcement
+            | PushKind::PolicyHit
+            | PushKind::EarningsBeat
+            | PushKind::EarningsMiss
+            | PushKind::AnalystUpgrade
+    ) {
+        match crate::v14_adapter::SourceFactEvidence::new(
+            kind,
+            event.event_id.clone(),
+            event.code.clone(),
+            event.title.clone(),
+            event.source.clone(),
+            event.observed_at,
+            event.source_published_on,
+            event.strength,
+            event.certainty,
+            event.stale,
+        ) {
+            Ok(evidence) => notify::push_source_fact_v3(&rendered, &evidence).await,
+            Err(error) => {
+                log::error!("[v17.7][BR-137] source fact rejected: kind={kind:?} reason={error}");
+                PushOutcome::Denied(format!("source_fact_invalid:{error}"))
+            }
+        }
+    } else {
+        notify::push_governor_v3(&rendered, kind, code_str.as_deref()).await
+    };
     let rendered_len = rendered.len();
     PushAttempt {
         kind,
@@ -173,16 +312,17 @@ pub async fn push_normalized_events(events: Vec<NormalizedSourceEvent>) -> Sourc
     let mut report = SourcePollReport::default();
     for event in events {
         report.attempted += 1;
-        if event.title.is_empty() || event.event_id.is_empty() {
+        if let Err(error) = event.validate() {
+            log::warn!(
+                "[v17.7][BR-137] source batch item skipped: kind={:?} reason={error}",
+                event.push_kind
+            );
             report.skipped += 1;
             continue;
         }
         report.classified += 1;
         let attempt = push_normalized_event(event).await;
-        match attempt.outcome {
-            PushOutcome::Pushed => report.pushed += 1,
-            _ => report.failed += 1,
-        }
+        record_source_attempt(&mut report, &attempt.outcome);
     }
     report
 }
@@ -191,7 +331,9 @@ pub async fn push_normalized_events(events: Vec<NormalizedSourceEvent>) -> Sourc
 fn earnings_classification_to_event(
     code: &str,
     classification: &EarningsClassification,
-) -> NormalizedSourceEvent {
+    source_published_on: chrono::NaiveDate,
+    source: &str,
+) -> Result<NormalizedSourceEvent, stock_analysis::news::aggregator::NormalizedSourceError> {
     let push_kind = match classification.kind {
         EarningsKind::Beat => SourcePushKind::EarningsBeat,
         EarningsKind::Miss => SourcePushKind::EarningsMiss,
@@ -232,20 +374,24 @@ fn earnings_classification_to_event(
         classification.delta_pct.to_string(),
     );
 
-    NormalizedSourceEvent {
+    Ok(NormalizedSourceEvent::new(
         push_kind,
         event_id,
-        code: Some(code.to_string()),
+        Some(code.to_string()),
         title,
         summary,
         direction,
-        strength: 80,
-        certainty: 90,
-        occurred_at: Local::now(),
-        source: "earnings_classifier".to_string(),
-        url: None,
-        metadata,
-    }
+        80,
+        90,
+        Local::now(),
+        Some(source_published_on),
+        false,
+        source.to_string(),
+        None,
+    )?
+    .with_metadata("actual", metadata["actual"].clone())
+    .with_metadata("reference", metadata["reference"].clone())
+    .with_metadata("delta_pct", metadata["delta_pct"].clone()))
 }
 
 /// Build a NormalizedSourceEvent for an analyst upgrade.
@@ -255,7 +401,9 @@ fn analyst_upgrade_event(
     from: &str,
     to: &str,
     report_id: &str,
-) -> NormalizedSourceEvent {
+    publish_date: chrono::NaiveDate,
+    source: &str,
+) -> Result<NormalizedSourceEvent, stock_analysis::news::aggregator::NormalizedSourceError> {
     let event_id = format!("analyst:{}:{}:{}", code, broker, report_id);
     let title = format!("{} 券商上调评级", broker);
     let summary = format!("从 {} 上调至 {}", from, to);
@@ -264,20 +412,24 @@ fn analyst_upgrade_event(
     metadata.insert("from_rating".to_string(), from.to_string());
     metadata.insert("to_rating".to_string(), to.to_string());
 
-    NormalizedSourceEvent {
-        push_kind: SourcePushKind::AnalystUpgrade,
+    Ok(NormalizedSourceEvent::new(
+        SourcePushKind::AnalystUpgrade,
         event_id,
-        code: Some(code.to_string()),
+        Some(code.to_string()),
         title,
         summary,
-        direction: stock_analysis::signal::market_event::Direction::Bull,
-        strength: 70,
-        certainty: 80,
-        occurred_at: Local::now(),
-        source: "analyst_tracker".to_string(),
-        url: None,
-        metadata,
-    }
+        stock_analysis::signal::market_event::Direction::Bull,
+        70,
+        80,
+        Local::now(),
+        Some(publish_date),
+        false,
+        source.to_string(),
+        None,
+    )?
+    .with_metadata("broker", metadata["broker"].clone())
+    .with_metadata("from_rating", metadata["from_rating"].clone())
+    .with_metadata("to_rating", metadata["to_rating"].clone()))
 }
 
 /// Trait for fetching earnings and consensus data.
@@ -380,14 +532,53 @@ pub async fn poll_earnings_and_analyst(
                 );
                 match (financials_result, consensus_result) {
                     (Ok(financials), Ok(consensus)) => {
-                        if let Some(latest_period) = financials.history.first() {
-                            if let Some(classification) =
-                                classify_earnings(latest_period, &consensus, earnings_cfg)
-                            {
-                                events.push(earnings_classification_to_event(
-                                    code_str,
-                                    &classification,
-                                ));
+                        let source_evidence = financials
+                            .source
+                            .filter(|source| !source.trim().is_empty())
+                            .ok_or_else(|| "financial provider source missing".to_string())
+                            .and_then(|source| {
+                                let raw = financials
+                                    .published_date
+                                    .as_deref()
+                                    .ok_or_else(|| "financial NOTICE_DATE missing".to_string())?;
+                                let published_on =
+                                    chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d").map_err(
+                                        |error| format!("financial NOTICE_DATE invalid: {error}"),
+                                    )?;
+                                Ok((source, published_on))
+                            });
+                        match (financials.history.first(), source_evidence) {
+                            (Some(latest_period), Ok((source, published_on))) => {
+                                if let Some(classification) =
+                                    classify_earnings(latest_period, &consensus, earnings_cfg)
+                                {
+                                    match earnings_classification_to_event(
+                                        code_str,
+                                        &classification,
+                                        published_on,
+                                        source,
+                                    ) {
+                                        Ok(event) => events.push(event),
+                                        Err(error) => {
+                                            source_failures += 1;
+                                            log::warn!(
+                                                "[v17_sources][BR-137] earnings source fact rejected: {error}"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            (None, _) => {
+                                source_failures += 1;
+                                log::warn!(
+                                    "[v17_sources][BR-115] {code_str} financial history missing"
+                                );
+                            }
+                            (_, Err(error)) => {
+                                source_failures += 1;
+                                log::warn!(
+                                    "[v17_sources][BR-137] {code_str} earnings publication evidence rejected: {error}"
+                                );
                             }
                         }
                         let mut last_polls = last_poll_earnings.lock().unwrap();
@@ -453,13 +644,23 @@ pub async fn poll_earnings_and_analyst(
                             };
 
                             if let stock_analysis::news::aggregator::analyst_state::ObservationDecision::Upgrade { from, to } = analyst_store.observe(key.clone(), obs) {
-                                events.push(analyst_upgrade_event(
+                                match analyst_upgrade_event(
                                     code_str,
                                     &report.org_name,
                                     &from,
                                     &to,
                                     &report.title,
-                                ));
+                                    publish_date,
+                                    "东方财富研报",
+                                ) {
+                                    Ok(event) => events.push(event),
+                                    Err(error) => {
+                                        source_failures += 1;
+                                        log::warn!(
+                                            "[v17_sources][BR-137] analyst source fact rejected: {error}"
+                                        );
+                                    }
+                                }
                             }
                         }
 
@@ -509,7 +710,9 @@ mod tests {
             direction: Direction::Neutral,
             strength: 50,
             certainty: 50,
-            occurred_at: Local::now(),
+            observed_at: Local::now(),
+            source_published_on: Some(Local::now().date_naive()),
+            stale: false,
             source: "eastmoney".into(),
             url: Some("https://example.invalid/ann-1".into()),
             metadata: Default::default(),
@@ -528,7 +731,9 @@ mod tests {
             direction: Direction::Neutral,
             strength: 50,
             certainty: 50,
-            occurred_at: Local::now(),
+            observed_at: Local::now(),
+            source_published_on: Some(Local::now().date_naive()),
+            stale: false,
             source: "test".into(),
             url: None,
             metadata: Default::default(),
@@ -544,6 +749,105 @@ mod tests {
         assert_eq!(report.attempted, 1);
         assert_eq!(report.pushed, 1);
         assert_eq!(report.failed, 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
+    async fn br137_real_announcement_batch_has_a_production_source_fact_owner() {
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
+        crate::v14_adapter::_reset_dedup_for_test();
+        let announcement = stock_analysis::data_provider::announcement::Announcement {
+            code: "TEST_CODE_ANN_PRODUCER".to_string(),
+            name: "测试公司".to_string(),
+            title: "关于回购股份方案的公告".to_string(),
+            date: Local::now().date_naive().format("%Y-%m-%d").to_string(),
+            summary: "回购".to_string(),
+            content: "真实公告正文协议夹具".to_string(),
+            level: stock_analysis::data_provider::announcement::AnnLevel::Important,
+            reason: "标题含回购".to_string(),
+            external_id: Some("TEST_CODE_ANN_EXTERNAL".to_string()),
+            url: Some("https://example.invalid/TEST_CODE_ANN_EXTERNAL".to_string()),
+        };
+
+        let routed = route_announcements(&[announcement]).await;
+        assert_eq!(routed.source.attempted, 1);
+        assert_eq!(routed.source.classified, 1);
+        assert_eq!(routed.source.pushed, 1);
+        assert!(routed
+            .normalized_external_ids
+            .contains("TEST_CODE_ANN_EXTERNAL"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
+    async fn br137_repeated_real_announcement_batch_is_not_pushed_twice() {
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
+        crate::v14_adapter::_reset_dedup_for_test();
+        let announcement = stock_analysis::data_provider::announcement::Announcement {
+            code: "TEST_CODE_ANN_REPEAT".to_string(),
+            name: "测试公司".to_string(),
+            title: "关于同一真实公告重复轮询的公告".to_string(),
+            date: Local::now().date_naive().format("%Y-%m-%d").to_string(),
+            summary: "重复轮询".to_string(),
+            content: "真实公告正文协议夹具".to_string(),
+            level: stock_analysis::data_provider::announcement::AnnLevel::Important,
+            reason: "重复轮询测试".to_string(),
+            external_id: Some("TEST_CODE_ANN_REPEAT_EXTERNAL".to_string()),
+            url: Some("https://example.invalid/TEST_CODE_ANN_REPEAT_EXTERNAL".to_string()),
+        };
+
+        let first = route_announcements(std::slice::from_ref(&announcement)).await;
+        let second = route_announcements(&[announcement]).await;
+        assert_eq!(first.source.pushed, 1);
+        assert_eq!(second.source.pushed, 0);
+        assert_eq!(second.source.failed, 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
+    async fn br137_complete_announcement_pushes_when_global_data_mode_is_down() {
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
+        crate::v14_adapter::_reset_dedup_for_test();
+        crate::LATEST_BANNER
+            .lock()
+            .expect("test banner lock")
+            .as_mut()
+            .expect("test banner")
+            .data_mode = crate::push_templates::DataMode::Unsafe;
+
+        let attempt = push_normalized_event(test_announcement_event()).await;
+        assert_eq!(attempt.outcome, PushOutcome::Pushed);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
+    async fn br137_market_action_remains_strict_when_global_data_mode_is_down() {
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
+        crate::v14_adapter::_reset_dedup_for_test();
+        crate::LATEST_BANNER
+            .lock()
+            .expect("test banner lock")
+            .as_mut()
+            .expect("test banner")
+            .data_mode = crate::push_templates::DataMode::Unsafe;
+
+        let event =
+            normalize_market_action(&order_update("TEST_CODE_MARKET_ACTION_DOWN", "sell", 100))
+                .expect("normalized market action");
+        assert_eq!(
+            push_normalized_event(event).await.outcome,
+            PushOutcome::Denied("data_quality".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn br137_stale_source_event_is_skipped_explicitly() {
+        let mut event = test_announcement_event();
+        event.stale = true;
+        let report = push_normalized_events(vec![event]).await;
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.pushed, 0);
     }
 
     #[tokio::test]
@@ -567,7 +871,9 @@ mod tests {
             direction: Direction::Bull,
             strength: 70,
             certainty: 80,
-            occurred_at: Local::now(),
+            observed_at: Local::now(),
+            source_published_on: Some(Local::now().date_naive()),
+            stale: false,
             source: " Wind".into(),
             url: None,
             metadata: Default::default(),
@@ -591,7 +897,9 @@ mod tests {
             direction: Direction::Bull,
             strength: 80,
             certainty: 90,
-            occurred_at: Local::now(),
+            observed_at: Local::now(),
+            source_published_on: Some(Local::now().date_naive()),
+            stale: false,
             source: "ndrc".into(),
             url: Some("https://example.invalid/pol-1".into()),
             metadata: Default::default(),
@@ -600,6 +908,26 @@ mod tests {
         assert_eq!(attempt.kind, PushKind::PolicyHit);
         assert!(attempt.code.is_none());
         assert_eq!(attempt.outcome, PushOutcome::Pushed);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
+    async fn br137_real_policy_results_have_a_production_policy_hit_owner() {
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
+        crate::v14_adapter::_reset_dedup_for_test();
+        let mut result = stock_analysis::search_service::SearchResult::new(
+            "促进数字经济高质量发展的通知".to_string(),
+            "政策正文摘要".to_string(),
+            "https://example.invalid/TEST_CODE_POLICY".to_string(),
+            "政府监管".to_string(),
+        );
+        result.published_date = Some(Local::now().date_naive().format("%Y-%m-%d").to_string());
+
+        let report = push_policy_results(vec![result]).await;
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.classified, 1);
+        assert_eq!(report.pushed, 1);
+        assert_eq!(report.failed, 0);
     }
 
     /// Helper: build a FinancialPeriod for testing.
@@ -661,7 +989,7 @@ mod tests {
         };
 
         // Beat case: actual EPS 1.10, consensus 1.00 → delta +10% → Beat
-        let beat_actual = test_financial_period("TEST_CODE_EARNINGS_BEAT", 1.10, "2026-04-20");
+        let beat_actual = test_financial_period("TEST_CODE_EARNINGS_BEAT", 1.10, "2026-03-31");
         let beat_consensus = test_consensus_data("TEST_CODE_EARNINGS_BEAT", "券商A", "买入", 1.00);
         let beat_classification = classify_earnings(&beat_actual, &beat_consensus, &earnings_cfg);
         assert!(
@@ -676,11 +1004,20 @@ mod tests {
         let beat_event = earnings_classification_to_event(
             "TEST_CODE_EARNINGS_BEAT",
             beat_classification.as_ref().unwrap(),
-        );
+            Local::now().date_naive(),
+            "TEST_CODE_FINANCIAL_PROVIDER",
+        )
+        .expect("same-day earnings source fact");
         assert_eq!(beat_event.push_kind, SourcePushKind::EarningsBeat);
+        assert_eq!(beat_event.source, "TEST_CODE_FINANCIAL_PROVIDER");
+        assert_eq!(
+            beat_event.source_published_on,
+            Some(Local::now().date_naive()),
+            "provider NOTICE_DATE, not accounting period, controls freshness"
+        );
 
         // Miss case: actual EPS 0.89, consensus 1.00 → delta -11% → Miss
-        let miss_actual = test_financial_period("TEST_CODE_EARNINGS_MISS", 0.89, "2026-04-20");
+        let miss_actual = test_financial_period("TEST_CODE_EARNINGS_MISS", 0.89, "2026-03-31");
         let miss_consensus = test_consensus_data("TEST_CODE_EARNINGS_MISS", "券商B", "中性", 1.00);
         let miss_classification = classify_earnings(&miss_actual, &miss_consensus, &earnings_cfg);
         assert!(
@@ -695,7 +1032,10 @@ mod tests {
         let miss_event = earnings_classification_to_event(
             "TEST_CODE_EARNINGS_MISS",
             miss_classification.as_ref().unwrap(),
-        );
+            Local::now().date_naive(),
+            "TEST_CODE_FINANCIAL_PROVIDER",
+        )
+        .expect("same-day earnings source fact");
         assert_eq!(miss_event.push_kind, SourcePushKind::EarningsMiss);
 
         // Verify beat and miss map to different PushKinds
