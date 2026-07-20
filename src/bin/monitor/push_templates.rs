@@ -1790,6 +1790,7 @@ pub async fn push_account_mode_change(
             stock_analysis::signal::market_event::Direction::Bear,
             90,
             95,
+            false,
             "monitor".into(),
             None,
         ) {

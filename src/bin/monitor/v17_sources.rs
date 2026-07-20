@@ -1,3 +1,4 @@
+//! Registered business rules: BR-137.
 //! v17.7 Task 5: Monitor-only source-to-push adapter
 //!
 //! Consumes `NormalizedSourceEvent` from the news aggregator and dispatches
@@ -65,6 +66,7 @@ pub fn normalize_market_action(event: &MonitorEvent) -> Option<NormalizedSourceE
             stock_analysis::signal::market_event::Direction::Neutral,
             70,
             90,
+            false,
             "monitor".into(),
             None,
         )
@@ -156,8 +158,46 @@ fn render_message(event: &NormalizedSourceEvent) -> String {
 pub async fn push_normalized_event(event: NormalizedSourceEvent) -> PushAttempt {
     let kind = source_push_kind_to_push_kind(event.push_kind);
     let code_str = event.code.clone();
+    if let Err(error) = event.validate() {
+        log::error!(
+            "[v17.7][BR-137] normalized source event rejected: kind={kind:?} reason={error}"
+        );
+        return PushAttempt {
+            kind,
+            code: code_str,
+            outcome: PushOutcome::Denied(format!("source_event_invalid:{error}")),
+            rendered_len: 0,
+        };
+    }
     let rendered = render_message(&event);
-    let outcome = notify::push_governor_v3(&rendered, kind, code_str.as_deref()).await;
+    let outcome = if matches!(
+        kind,
+        PushKind::Announcement
+            | PushKind::PolicyHit
+            | PushKind::EarningsBeat
+            | PushKind::EarningsMiss
+            | PushKind::AnalystUpgrade
+    ) {
+        match crate::v14_adapter::SourceFactEvidence::new(
+            kind,
+            event.event_id.clone(),
+            event.code.clone(),
+            event.title.clone(),
+            event.source.clone(),
+            event.occurred_at,
+            event.strength,
+            event.certainty,
+            event.stale,
+        ) {
+            Ok(evidence) => notify::push_source_fact_v3(&rendered, &evidence).await,
+            Err(error) => {
+                log::error!("[v17.7][BR-137] source fact rejected: kind={kind:?} reason={error}");
+                PushOutcome::Denied(format!("source_fact_invalid:{error}"))
+            }
+        }
+    } else {
+        notify::push_governor_v3(&rendered, kind, code_str.as_deref()).await
+    };
     let rendered_len = rendered.len();
     PushAttempt {
         kind,
@@ -173,7 +213,11 @@ pub async fn push_normalized_events(events: Vec<NormalizedSourceEvent>) -> Sourc
     let mut report = SourcePollReport::default();
     for event in events {
         report.attempted += 1;
-        if event.title.is_empty() || event.event_id.is_empty() {
+        if let Err(error) = event.validate() {
+            log::warn!(
+                "[v17.7][BR-137] source batch item skipped: kind={:?} reason={error}",
+                event.push_kind
+            );
             report.skipped += 1;
             continue;
         }
@@ -242,6 +286,7 @@ fn earnings_classification_to_event(
         strength: 80,
         certainty: 90,
         occurred_at: Local::now(),
+        stale: false,
         source: "earnings_classifier".to_string(),
         url: None,
         metadata,
@@ -274,6 +319,7 @@ fn analyst_upgrade_event(
         strength: 70,
         certainty: 80,
         occurred_at: Local::now(),
+        stale: false,
         source: "analyst_tracker".to_string(),
         url: None,
         metadata,
@@ -510,6 +556,7 @@ mod tests {
             strength: 50,
             certainty: 50,
             occurred_at: Local::now(),
+            stale: false,
             source: "eastmoney".into(),
             url: Some("https://example.invalid/ann-1".into()),
             metadata: Default::default(),
@@ -529,6 +576,7 @@ mod tests {
             strength: 50,
             certainty: 50,
             occurred_at: Local::now(),
+            stale: false,
             source: "test".into(),
             url: None,
             metadata: Default::default(),
@@ -544,6 +592,53 @@ mod tests {
         assert_eq!(report.attempted, 1);
         assert_eq!(report.pushed, 1);
         assert_eq!(report.failed, 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
+    async fn br137_complete_announcement_pushes_when_global_data_mode_is_down() {
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
+        crate::v14_adapter::_reset_dedup_for_test();
+        crate::LATEST_BANNER
+            .lock()
+            .expect("test banner lock")
+            .as_mut()
+            .expect("test banner")
+            .data_mode = crate::push_templates::DataMode::Unsafe;
+
+        let attempt = push_normalized_event(test_announcement_event()).await;
+        assert_eq!(attempt.outcome, PushOutcome::Pushed);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
+    async fn br137_market_action_remains_strict_when_global_data_mode_is_down() {
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
+        crate::v14_adapter::_reset_dedup_for_test();
+        crate::LATEST_BANNER
+            .lock()
+            .expect("test banner lock")
+            .as_mut()
+            .expect("test banner")
+            .data_mode = crate::push_templates::DataMode::Unsafe;
+
+        let event =
+            normalize_market_action(&order_update("TEST_CODE_MARKET_ACTION_DOWN", "sell", 100))
+                .expect("normalized market action");
+        assert_eq!(
+            push_normalized_event(event).await.outcome,
+            PushOutcome::Denied("data_quality".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn br137_stale_source_event_is_skipped_explicitly() {
+        let mut event = test_announcement_event();
+        event.stale = true;
+        let report = push_normalized_events(vec![event]).await;
+        assert_eq!(report.attempted, 1);
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.pushed, 0);
     }
 
     #[tokio::test]
@@ -568,6 +663,7 @@ mod tests {
             strength: 70,
             certainty: 80,
             occurred_at: Local::now(),
+            stale: false,
             source: " Wind".into(),
             url: None,
             metadata: Default::default(),
@@ -592,6 +688,7 @@ mod tests {
             strength: 80,
             certainty: 90,
             occurred_at: Local::now(),
+            stale: false,
             source: "ndrc".into(),
             url: Some("https://example.invalid/pol-1".into()),
             metadata: Default::default(),

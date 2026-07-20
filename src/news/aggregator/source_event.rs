@@ -1,3 +1,4 @@
+//! Registered business rules: BR-137.
 //! v17.7 Task 1: Normalized source event contracts
 //!
 //! Data contracts for six retained PushKinds (Announcement / PolicyHit /
@@ -25,18 +26,24 @@ pub enum SourcePushKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NormalizedSourceError {
     EmptyEventId,
+    EmptyCode,
     EmptyTitle,
     EmptySource,
     /// code=None is only permitted for PolicyHit
     CodeRequired {
         kind: SourcePushKind,
     },
+    StrengthOutOfRange(u8),
+    CertaintyOutOfRange(u8),
+    Stale,
+    FutureOccurredAt,
 }
 
 impl fmt::Display for NormalizedSourceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             NormalizedSourceError::EmptyEventId => write!(f, "event_id must not be empty"),
+            NormalizedSourceError::EmptyCode => write!(f, "code must not be empty when present"),
             NormalizedSourceError::EmptyTitle => write!(f, "title must not be empty"),
             NormalizedSourceError::EmptySource => write!(f, "source must not be empty"),
             NormalizedSourceError::CodeRequired { kind } => {
@@ -45,6 +52,16 @@ impl fmt::Display for NormalizedSourceError {
                     "{:?} requires a stock code (code=None not permitted)",
                     kind
                 )
+            }
+            NormalizedSourceError::StrengthOutOfRange(value) => {
+                write!(f, "strength must be within 0..=100, got {value}")
+            }
+            NormalizedSourceError::CertaintyOutOfRange(value) => {
+                write!(f, "certainty must be within 0..=100, got {value}")
+            }
+            NormalizedSourceError::Stale => write!(f, "source event is stale"),
+            NormalizedSourceError::FutureOccurredAt => {
+                write!(f, "occurred_at must not be in the future")
             }
         }
     }
@@ -75,6 +92,8 @@ pub struct NormalizedSourceEvent {
     pub certainty: u8,
     /// When the event occurred.
     pub occurred_at: DateTime<Local>,
+    /// Explicit upstream freshness result. Stale facts must not be pushed.
+    pub stale: bool,
     /// Source name, e.g. "eastmoney", "ndrc", "em_announcement".
     pub source: String,
     /// Optional canonical URL for the event.
@@ -87,10 +106,10 @@ impl NormalizedSourceEvent {
     /// Construct a new NormalizedSourceEvent with validation.
     ///
     /// Returns `Err` if:
-    /// - `event_id` is empty
-    /// - `title` is empty
-    /// - `source` is empty
+    /// - `event_id`, `title`, `source`, or a present `code` is empty
     /// - `code` is `None` for any variant other than `PolicyHit`
+    /// - strength/certainty is outside 0..=100
+    /// - the upstream event is stale
     #[allow(
         clippy::too_many_arguments,
         reason = "validated source-event constructor mirrors the normalized event envelope"
@@ -104,36 +123,64 @@ impl NormalizedSourceEvent {
         direction: Direction,
         strength: u8,
         certainty: u8,
+        stale: bool,
         source: String,
         url: Option<String>,
     ) -> Result<Self, NormalizedSourceError> {
-        if event_id.is_empty() {
-            return Err(NormalizedSourceError::EmptyEventId);
-        }
-        if title.is_empty() {
-            return Err(NormalizedSourceError::EmptyTitle);
-        }
-        if source.is_empty() {
-            return Err(NormalizedSourceError::EmptySource);
-        }
-        if code.is_none() && push_kind != SourcePushKind::PolicyHit {
-            return Err(NormalizedSourceError::CodeRequired { kind: push_kind });
-        }
-
-        Ok(Self {
+        let event = Self {
             push_kind,
             event_id,
             code,
             title,
             summary,
             direction,
-            strength: strength.min(100),
-            certainty: certainty.min(100),
+            strength,
+            certainty,
             occurred_at: Local::now(),
+            stale,
             source,
             url,
             metadata: BTreeMap::new(),
-        })
+        };
+        event.validate()?;
+        Ok(event)
+    }
+
+    /// Revalidate the public envelope before it crosses a production adapter.
+    /// Public fields are retained for compatibility, so construction-time
+    /// checks alone cannot protect the push path.
+    pub fn validate(&self) -> Result<(), NormalizedSourceError> {
+        if self.event_id.trim().is_empty() {
+            return Err(NormalizedSourceError::EmptyEventId);
+        }
+        if self.title.trim().is_empty() {
+            return Err(NormalizedSourceError::EmptyTitle);
+        }
+        if self.source.trim().is_empty() {
+            return Err(NormalizedSourceError::EmptySource);
+        }
+        match self.code.as_deref() {
+            Some(code) if code.trim().is_empty() => return Err(NormalizedSourceError::EmptyCode),
+            None if self.push_kind != SourcePushKind::PolicyHit => {
+                return Err(NormalizedSourceError::CodeRequired {
+                    kind: self.push_kind,
+                });
+            }
+            _ => {}
+        }
+        if self.strength > 100 {
+            return Err(NormalizedSourceError::StrengthOutOfRange(self.strength));
+        }
+        if self.certainty > 100 {
+            return Err(NormalizedSourceError::CertaintyOutOfRange(self.certainty));
+        }
+        if self.stale {
+            return Err(NormalizedSourceError::Stale);
+        }
+        if self.occurred_at > Local::now() {
+            return Err(NormalizedSourceError::FutureOccurredAt);
+        }
+        Ok(())
     }
 
     /// Fluent builder: attach a metadata key-value pair.
@@ -158,6 +205,7 @@ mod tests {
             Direction::Bull,
             70,
             80,
+            false,
             "eastmoney".into(),
             Some("https://example.invalid/ann-1".into()),
         )
@@ -178,6 +226,7 @@ mod tests {
             Direction::Neutral,
             50,
             60,
+            false,
             "ndrc".into(),
             None,
         )
@@ -228,6 +277,7 @@ mod tests {
             Direction::Bull,
             70,
             80,
+            false,
             "testsource".into(),
             None,
         )
@@ -252,6 +302,7 @@ mod tests {
             Direction::Bull,
             80,
             90,
+            false,
             "ndrc".into(),
             Some("https://example.invalid/pol-1".into()),
         )
@@ -271,6 +322,7 @@ mod tests {
             Direction::Bull,
             80,
             90,
+            false,
             "em".into(),
             None,
         )
@@ -289,10 +341,39 @@ mod tests {
             Direction::Bull,
             70,
             80,
+            false,
             "".into(),
             None,
         )
         .unwrap_err();
         assert!(err.to_string().contains("source"));
+    }
+
+    #[test]
+    fn public_envelope_revalidation_rejects_stale_and_out_of_range_data() {
+        let mut event = NormalizedSourceEvent::new(
+            SourcePushKind::PolicyHit,
+            "policy-validation".into(),
+            None,
+            "政策事实".into(),
+            "summary".into(),
+            Direction::Neutral,
+            80,
+            90,
+            false,
+            "official-provider".into(),
+            None,
+        )
+        .unwrap();
+        event.stale = true;
+        assert_eq!(event.validate(), Err(NormalizedSourceError::Stale));
+
+        event.stale = false;
+        event.strength = 101;
+        assert_eq!(
+            event.validate(),
+            Err(NormalizedSourceError::StrengthOutOfRange(101))
+        );
+        assert_eq!(event.strength, 101, "invalid input must not be clamped");
     }
 }

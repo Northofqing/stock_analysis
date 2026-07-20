@@ -1,4 +1,4 @@
-//! Registered business rules: BR-047, BR-048, BR-077.
+//! Registered business rules: BR-047, BR-048, BR-077, BR-137.
 //! 通知推送 + MagicLaw 守护进程 + Token 管理
 //!
 //! 从 main.rs 提取，减少单文件体积。
@@ -988,6 +988,15 @@ impl PushOutcome {
 ///     gate/analytics 全链路照走 → --test 能测到完整推送治理路径)
 ///   - sink_name 不再硬编码 "wechat" (b011 P0-1), 取实际通道
 async fn push_governor_inner(text: &str, kind: PushKind, code: Option<&str>) -> PushOutcome {
+    push_governor_inner_with_source_fact(text, kind, code, None).await
+}
+
+async fn push_governor_inner_with_source_fact(
+    text: &str,
+    kind: PushKind,
+    code: Option<&str>,
+    source_fact: Option<&crate::v14_adapter::SourceFactEvidence>,
+) -> PushOutcome {
     use crate::v14_adapter::{self, V14Gate};
 
     // v17.5 §2.2: 命中 v17.5-legacy variants 时按 env 控制可见性
@@ -1043,7 +1052,11 @@ async fn push_governor_inner(text: &str, kind: PushKind, code: Option<&str>) -> 
     if !launch_gate_check(kind) {
         return PushOutcome::Denied("launch_gate_stage".to_string());
     }
-    let event = match v14_adapter::v14_gate(kind, code) {
+    let gate = match source_fact {
+        Some(evidence) => v14_adapter::v14_gate_source_fact(evidence),
+        None => v14_adapter::v14_gate(kind, code),
+    };
+    let event = match gate {
         V14Gate::Deduped => return PushOutcome::Deduped,
         V14Gate::Denied(reason) => return PushOutcome::Denied(reason),
         V14Gate::Approved(event) => *event,
@@ -1204,6 +1217,22 @@ pub async fn push_governor(text: &str, kind: PushKind) -> bool {
 /// `code`: 票级冷却键 (§14.3 "/票" 类 kind 必传 real 票号, 否则 L4 不做票级冷却).
 pub async fn push_governor_v3(text: &str, kind: PushKind, code: Option<&str>) -> PushOutcome {
     push_governor_inner(text, kind, code).await
+}
+
+/// BR-137 sole delivery entry for a validated source-self-contained fact.
+/// Kind and dedup identity are derived from the evidence so callers cannot
+/// pair a relaxed source profile with an unrelated PushKind.
+pub async fn push_source_fact_v3(
+    text: &str,
+    evidence: &crate::v14_adapter::SourceFactEvidence,
+) -> PushOutcome {
+    push_governor_inner_with_source_fact(
+        text,
+        evidence.kind(),
+        Some(evidence.governance_identity()),
+        Some(evidence),
+    )
+    .await
 }
 
 /// v17.6 §5.1: push_governor_v3 的 sub_kind-aware 版本.

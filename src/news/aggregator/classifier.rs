@@ -255,6 +255,7 @@ pub fn classify_announcement(
         direction,
         70,
         80,
+        false,
         source,
         url,
     )
@@ -289,6 +290,7 @@ pub fn classify_policy(r: &SearchResult) -> Result<NormalizedSourceEvent, Normal
         Direction::Bull, // policy is generally bullish
         80,
         90,
+        false,
         r.source.clone(),
         url,
     )

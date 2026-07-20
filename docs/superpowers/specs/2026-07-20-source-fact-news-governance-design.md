@@ -44,6 +44,7 @@ real provider/classifier
   -> validate source identity, kind, code rules, bounds, and stale flag
   -> SourceFactEvidence
   -> push_source_fact_v3
+  -> independent capability-health context (does not read account/banner state)
   -> source-fact v14 gate (DataMode minimum Down)
   -> unchanged LaunchGate / quiet hours / dedup / daily count
   -> unchanged sink / L7 / delivery event / immutable audit
@@ -60,17 +61,21 @@ optional security code. It never uses an empty `HoldingHealth` payload.
   security-code field.
 - Strength/certainty outside `0..=100`, an upstream `stale=true`, or a future observed timestamp is
   rejected. No value is clamped or filled at the gate.
-- Governance-context, analytics, lock, sink, dedup, or immutable-audit failure keeps its existing
-  explicit failure result. A sink result is never inferred from logging.
+- The source-fact governance and L7 paths read the real process-local capability tracker directly;
+  a missing account/banner snapshot cannot block them. Capability-tracker, analytics, lock, sink,
+  dedup, or immutable-audit failure keeps its existing explicit failure result. A sink result is
+  never inferred from logging.
 - Source-fact approval at DataMode Down is not an `always_send_on_data_source_down` bypass; normal
   quiet-hour and launch policy still apply.
 
 ## 5. Interface placement
 
 `v14_adapter` owns evidence validation and prepared-event governance, hiding profile construction
-from callers. `notify` owns the sole source-fact delivery entry and reuses the same common tail as
-the generic governor. Source adapters can request the narrow capability but cannot edit profile
-thresholds or construct an approved SignalEvent themselves.
+from callers. It also owns the independent capability-health context used before and after source
+fact delivery; account state is deliberately absent because it is not a dependency of source facts.
+`notify` owns the sole source-fact delivery entry and reuses the same common tail as the generic
+governor. Source adapters can request the narrow capability but cannot edit profile thresholds or
+construct an approved SignalEvent themselves.
 
 ## 6. Old modules
 
