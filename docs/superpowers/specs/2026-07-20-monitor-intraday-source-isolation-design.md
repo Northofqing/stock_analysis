@@ -68,8 +68,9 @@ limit_quality_rejected=138
 1. 分别记录涨停池和持仓报价失败。
 2. 用 `Option` 表示 unavailable，不把错误转成 `Vec::new()`。
 3. 仅在对应 `Option::Some` 时运行该源的消费逻辑。
-4. 当两个源都失败时跳过本轮数据计算，但进程继续退避重试。
-5. 保持已有 30 秒节奏、去重、排序和推送规则不变。
+4. 当两个源都失败或 blocking task join 失败时，只跳过依赖这两路数据的计算；选股与独立做 T 仍由各自的严格数据源决定是否可运行。
+5. 用具名解析状态保留两个源及任务级错误，避免重新引入包住整个盘中调度块的外层 `Option`。
+6. 保持已有 30 秒节奏、去重、排序和推送规则不变。
 
 ## 5. 失败模式
 
@@ -79,8 +80,9 @@ limit_quality_rejected=138
 | 涨停池传输/解析/质量失败 | 保留原错误；仍尝试持仓报价 | 跳坏行、放宽 ±20% |
 | 持仓快照缺时间或超过 30 秒 | 持仓路径显式 unavailable；涨停路径可独立运行 | 使用启动时持仓或成本价 |
 | 持仓报价传输/质量失败 | 持仓路径显式 unavailable | 使用成本价或上一轮报价 |
-| blocking task join 失败 | 两个结果均 unavailable，本轮明确失败 | 静默继续计算 |
+| blocking task join 失败 | 两个结果均 unavailable，明确失败；独立任务仍按自身边界执行 | 静默继续依赖行情计算或跳过独立任务 |
 | 一个源成功、一个源失败 | 只运行成功源对应的计算 | 以空集合代替失败源 |
+| 两个源均失败 | 两个源的消费者均跳过；选股/独立做 T 保持到期重试 | 用外层 guard 跳过全部盘中任务 |
 
 ## 6. 旧模块关系
 
@@ -93,17 +95,21 @@ limit_quality_rejected=138
 
 ## 7. 测试与验收
 
-TDD tracer bullet：涨停源返回错误，持仓源返回一条 `TEST_CODE` 合法报价；断言持仓闭包确实执行、涨停错误保留、持仓成功值可取。第二个用例反向验证持仓失败不抹掉涨停成功。
+TDD tracer bullet：先验证两个真实边界无短路，再覆盖两路成功/单路成功/两路失败/任务级失败的完整解析矩阵；每种状态都必须保留源错误和消费者可用性，并断言独立任务始终可运行。生产循环使用同一个具名状态，不再以外层 `Option` 包住选股与独立做 T。
+
+HTTP 传输测试通过显式客户端与本地回环 URL 调用生产传输接缝，不修改 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 或 `NO_PROXY`。生产包装器仍按现有环境构建客户端和解析通知目标；测试不得依赖进程级代理串行锁。
 
 验收命令：
 
 ```bash
-cargo test --bin monitor intraday_market_inputs
+cargo test --bin monitor intraday_market
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
 bash tools/compliance/check.sh
-cargo llvm-cov --all-features --all-targets --summary-only
+cargo llvm-cov --workspace --all-features --json \
+  --output-path target/coverage/coverage.json -- --test-threads=1
+python3 tools/coverage/check_thresholds.py target/coverage/coverage.json
 cargo build --release --bin monitor
 ```
 
@@ -122,4 +128,4 @@ cargo build --release --bin monitor
 
 首次运行 `cargo llvm-cov --all-features --all-targets --summary-only` 时，Feishu 本地回环 webhook 成功用例失败；同一 instrumented 用例单独运行通过。根因是 monitor test binary 内两个测试会修改同一组进程级 HTTP proxy 环境变量，却使用不同的 `serial_test` 锁：行情测试使用 `http_proxy_env`，Feishu webhook 测试使用 `notify_env`。并行覆盖率运行时，前者可在后者创建 HTTP client 前移除 `NO_PROXY` 并替换 `HTTP_PROXY`，使本地 webhook 请求进入错误的单请求 proxy fixture。
 
-修复仅把 Feishu webhook 测试加入已有 `http_proxy_env` 串行域，使所有会修改 HTTP proxy 的 monitor 测试共享同一把锁。生产 HTTP 客户端、通知地址解析和发送逻辑均不改变。验收要求 instrumented 单测与完整默认并行覆盖率命令都通过；不得用 `--test-threads=1` 掩盖竞争。
+最初的锁统一只能约束已知的环境变量写入者，无法阻止其他并行 HTTP 客户端在错误时刻读取代理环境，因此不足以作为最终修复。最终方案把新浪行情和 Feishu webhook 的回环传输测试改为显式注入客户端与 URL，测试不再修改进程级代理环境。生产 HTTP 客户端、通知地址解析和发送逻辑均不改变。验收要求聚焦传输测试与完整默认并行测试重复通过；正式覆盖率仍按仓库 Gate D 命令执行，但不得用单线程覆盖率结果掩盖默认并行竞态。

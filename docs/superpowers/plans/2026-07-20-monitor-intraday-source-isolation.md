@@ -261,6 +261,16 @@ git diff --check
 
 Expected: no newly introduced silent fallback and no whitespace errors.
 
+- [ ] **Step 5a: Close review findings with a complete routing matrix**
+
+Add a named resolved-availability type and tests for both success, each asymmetric failure,
+both source failures, and task-level failure. The consumer plan must keep independently sourced
+jobs eligible in every state. Remove the outer guard that currently suppresses those jobs.
+
+Refactor the Sina and Feishu loopback transport tests to inject an explicit client and URL; do
+not mutate process-wide proxy variables. Repeat the default-parallel monitor tests to prove the
+race is absent.
+
 - [ ] **Step 6: Commit integration**
 
 ```bash
