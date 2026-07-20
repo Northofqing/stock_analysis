@@ -331,6 +331,13 @@ cargo build --release --bin monitor
 
 - [ ] **Step 3: Run the independent five-step verifier**
 
+Before the verifier, add the BR-135 scheduler regression with a red/green cycle: the startup
+one-shot stays in place; a dedicated interval begins after 60 seconds, uses missed-tick `Skip`, and
+is joined alongside (not inside) `monitor_loop`. Remove the old session-internal call. The focused
+test must prove the first tick is delayed and later ticks keep invoking the hook without any market
+session input. Production acceptance must also show periodic DataMode evaluations during a closed
+weekend session before waiting for the 30-minute reminder boundary.
+
 The fresh verifier must independently run:
 
 ```bash

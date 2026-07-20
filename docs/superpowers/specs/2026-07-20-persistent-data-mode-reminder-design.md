@@ -120,10 +120,18 @@ outage to at most 48 confirmed reminders per day. Unconfirmed attempts intention
 and may retry at the hook cadence until one authoritative delivery succeeds. No ordinary
 business-message gate changes.
 
+The startup hook remains an immediate one-shot. A single dedicated scheduler, joined alongside
+the market and news loops rather than nested inside a market-session branch, invokes the same hook
+every 60 seconds in every session, including weekends and closed markets. Its first tick is delayed
+by one full period so startup does not double-dispatch, and missed ticks use `Skip` rather than
+bursting delayed evaluations. The prior session-internal call is removed to keep exactly one
+recurring owner.
+
 ## 5. Data flow
 
 ```text
-real capability successes -> DataHealth evaluate -> mode + missing capabilities
+startup one-shot ----------+
+dedicated 60s scheduler ---+-> DataHealth evaluate -> mode + missing capabilities
                                       |
                                       +-> Full/Degraded? clear prior outage interval
                                       |
@@ -146,6 +154,13 @@ real capability successes -> DataHealth evaluate -> mode + missing capabilities
 - Governance/sink/audit failure: retain the old timestamp so the next evaluation retries.
 - Capability data unavailable: the existing hook returns before notification; no fabricated
   health snapshot or reminder is produced.
+- Scheduler ownership: the recurring loop is independent of market-session branches, so weekend,
+  closed-session, and early-continue paths cannot suppress it. Its unexpected exit/panic is a
+  monitor-loop failure, not a silently ignored background task.
+- Delayed or suspended runtime: missed ticks use `Skip`; the scheduler performs one current
+  evaluation instead of replaying a burst of stale checks.
+- Startup: the immediate one-shot establishes governance, while the recurring scheduler waits one
+  full 60-second period before its first evaluation to avoid a duplicate startup attempt.
 - Recovery: observed real Full/Degraded clears the Unsafe reminder timestamp even when the
   recovery notification is unconfirmed; a later Unsafe state starts a new outage interval.
 - Wrong but valid configured chat: outside this code repair. The system must not guess or commit a
@@ -168,6 +183,7 @@ Automated acceptance:
 ```bash
 cargo test --lib monitor::data_mode::tests::br135_persistent_unsafe_reminder -- --exact
 cargo test --bin monitor br135 -- --nocapture
+cargo test --bin monitor br135_scheduler_waits_before_first_tick_and_runs_independently -- --exact
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets --all-features -- --test-threads=1
@@ -184,6 +200,7 @@ Machine-checkable expected outputs:
 | --- | --- |
 | exact library BR-135 test | `1 passed; 0 failed` |
 | monitor `br135` filter | all selected tests pass; `0 failed`; at least four tests selected |
+| independent scheduler test | no call before the delayed first tick; calls continue after ticks |
 | fmt | exit 0, no diff |
 | strict Clippy | exit 0 and no warning/error diagnostics |
 | full workspace test | exit 0 and every executed test target reports `0 failed` |
