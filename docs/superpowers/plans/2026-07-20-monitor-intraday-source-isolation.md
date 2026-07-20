@@ -169,37 +169,25 @@ let result = tokio::task::spawn_blocking(|| {
 
 - [ ] **Step 2: Convert each result to explicit availability**
 
-For a successful join, map both results separately and preserve unavailable state:
+Resolve both source results separately and preserve unavailable state. Task failure also keeps
+the independently sourced jobs eligible:
 
 ```rust
-let result = match result {
-    Ok(inputs) => {
-        let limit_stocks = match inputs.limit_stocks {
-            Ok(stocks) => Some(stocks),
-            Err(error) => {
-                log::error!("[盘中监控] 涨停池批次拒绝: {error}");
-                None
-            }
-        };
-        let position_quotes = match inputs.position_quotes {
-            Ok(quotes) => Some(quotes),
-            Err(error) => {
-                log::error!("[盘中监控] 持仓行情批次拒绝: {error}");
-                None
-            }
-        };
-        if limit_stocks.is_none() && position_quotes.is_none() {
-            log::error!("[盘中监控] 两路行情均不可用，本轮跳过");
-            None
-        } else {
-            Some((limit_stocks, position_quotes))
-        }
-    }
-    Err(error) => {
-        log::error!("[盘中监控] 行情任务失败: {error}");
-        None
-    }
-};
+let resolved = intraday_market::resolve_intraday_market_inputs(result);
+let limit_stocks = resolved.limit_stocks;
+let position_quotes = resolved.position_quotes;
+
+if let Some(error) = resolved.limit_error {
+    log::error!("[盘中监控] 涨停池批次拒绝: {error}");
+}
+if let Some(error) = resolved.position_error {
+    log::error!("[盘中监控] 持仓行情批次拒绝: {error}");
+}
+if let Some(error) = resolved.task_error {
+    log::error!("[盘中监控] 行情任务失败: {error}");
+}
+
+// resolved.consumer_plan.run_independent_jobs remains true for every source state.
 ```
 
 - [ ] **Step 3: Gate every consumer by its real source**
@@ -298,7 +286,9 @@ Expected: all commands exit 0.
 - [ ] **Step 2: Gate D**
 
 ```bash
-cargo llvm-cov --all-features --all-targets --summary-only
+cargo llvm-cov --workspace --all-features --json \
+  --output-path target/coverage/coverage.json -- --test-threads=1
+python3 tools/coverage/check_thresholds.py target/coverage/coverage.json
 cargo build --release --bin monitor
 ```
 
