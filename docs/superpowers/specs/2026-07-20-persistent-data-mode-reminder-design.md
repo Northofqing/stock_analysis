@@ -50,7 +50,7 @@ Observed output from those commands is the four-line aggregate at the start of t
 production call-chain claim is independently reproducible with multiline context:
 
 ```bash
-rg -n -A6 -B2 'evaluate_data_mode_hook\(|push_data_mode_change\(' \
+rg -n -A7 -B3 'evaluate_data_mode_hook\(|data_mode_monitor_loop\(|push_data_mode_change\(' \
   src/bin/monitor/main.rs src/bin/monitor/push_templates.rs
 rg -n -A7 -B3 'dispatch_outcome\(crate::notify::PushKind::DataMode|publish_delivery\(' \
   src/bin/monitor/push_templates.rs src/bin/monitor/notify.rs
@@ -61,8 +61,10 @@ Observed production-path output (test callers omitted here, but retained by the 
 ```text
 src/bin/monitor/main.rs:1696:async fn evaluate_data_mode_hook() {
 src/bin/monitor/main.rs:1780:        match pt::push_data_mode_change(&input, prev, persistent_reminder_due, Some(&banner)).await
-src/bin/monitor/main.rs:2966:        evaluate_data_mode_hook().await;
-src/bin/monitor/main.rs:5692:            evaluate_data_mode_hook().await;
+src/bin/monitor/main.rs:1838:async fn data_mode_monitor_loop() {
+src/bin/monitor/main.rs:1845:        evaluate_data_mode_hook,
+src/bin/monitor/main.rs:3041:        evaluate_data_mode_hook().await;
+src/bin/monitor/main.rs:3049:                data_mode_monitor_loop()
 src/bin/monitor/push_templates.rs:6348:pub async fn push_data_mode_change(
 src/bin/monitor/push_templates.rs:6438:    let outcome = dispatch_outcome(crate::notify::PushKind::DataMode, "", banner, text).await;
 src/bin/monitor/notify.rs:1134:    let audit_result = stock_analysis::event::publish_delivery(
