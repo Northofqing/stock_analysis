@@ -68,6 +68,10 @@ NewsAggregator so a pre-delivery `seen_simhash` cannot consume the only retry.
 The prepared SignalEvent uses `SignalPayload::NewsCatalyst` with headline, source, and explicit
 optional security code. The provider identity is hashed into `SignalEvent.event_id` and is the L4
 dedup identity; it is never written to `SignalEvent.code` or delivery-audit `code/entity_key`.
+Source-fact announcements retain the legacy kind's `External` scope so distinct legacy announcements
+are not globally suppressed, but their normalized path applies the registered announcement cooldown
+to that provider event identity. A confirmed delivery commits that identity, a failed delivery rolls
+it back, and a repeated provider poll cannot produce a second push inside the cooldown.
 It never uses an empty `HoldingHealth` payload.
 
 ## 4. Validation and failure modes
@@ -86,8 +90,10 @@ It never uses an empty `HoldingHealth` payload.
   label. Before either flash path accepts an event, identity, headline, provider provenance, score
   bounds, and time must all validate.
 - Date-only parsing matches the entire provider string. Prefix parsing such as accepting
-  `2026-07-21garbage` is forbidden. The flash gate independently compares the event publication date
-  to the current local date even when an upstream caller supplied `stale=false`.
+  `2026-07-21garbage` or whitespace splitting such as accepting `2026-07-21 garbage` is forbidden,
+  including financial `NOTICE_DATE` and consensus `publishDate`. The flash gate independently
+  compares the event publication date to the current local date even when an upstream caller supplied
+  `stale=false`.
 - Announcement production uses the real Eastmoney external identity and validated publication date.
   Policy production uses the real government provider source/date and never first converts the item
   into a generic flash. Fetch, classification, governance, and sink failures remain distinct.

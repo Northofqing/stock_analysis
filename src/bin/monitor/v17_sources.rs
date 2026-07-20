@@ -780,6 +780,31 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(cooldown_memo)]
+    async fn br137_repeated_real_announcement_batch_is_not_pushed_twice() {
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
+        crate::v14_adapter::_reset_dedup_for_test();
+        let announcement = stock_analysis::data_provider::announcement::Announcement {
+            code: "TEST_CODE_ANN_REPEAT".to_string(),
+            name: "测试公司".to_string(),
+            title: "关于同一真实公告重复轮询的公告".to_string(),
+            date: Local::now().date_naive().format("%Y-%m-%d").to_string(),
+            summary: "重复轮询".to_string(),
+            content: "真实公告正文协议夹具".to_string(),
+            level: stock_analysis::data_provider::announcement::AnnLevel::Important,
+            reason: "重复轮询测试".to_string(),
+            external_id: Some("TEST_CODE_ANN_REPEAT_EXTERNAL".to_string()),
+            url: Some("https://example.invalid/TEST_CODE_ANN_REPEAT_EXTERNAL".to_string()),
+        };
+
+        let first = route_announcements(std::slice::from_ref(&announcement)).await;
+        let second = route_announcements(&[announcement]).await;
+        assert_eq!(first.source.pushed, 1);
+        assert_eq!(second.source.pushed, 0);
+        assert_eq!(second.source.failed, 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
     async fn br137_complete_announcement_pushes_when_global_data_mode_is_down() {
         let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         crate::v14_adapter::_reset_dedup_for_test();

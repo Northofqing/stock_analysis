@@ -1,3 +1,4 @@
+//! Registered business rules: BR-115, BR-137.
 //! 财报数据抓取（EPS / ROE / 毛利率 / 净利率 / 营收同比 / 净利润同比）
 //!
 //! 主数据源：东方财富 F10 `ZYZBAjaxNew`（主要财务指标，字段最全）
@@ -292,10 +293,14 @@ fn required_date(obj: &Value, keys: &[&str], semantic: &str) -> Result<String> {
             let s = v
                 .as_str()
                 .ok_or_else(|| anyhow!("财务字段 {k} 必须是日期字符串: {v}"))?;
-            let cleaned = s.split_whitespace().next().unwrap_or(s).trim();
-            chrono::NaiveDate::parse_from_str(cleaned, "%Y-%m-%d")
-                .map_err(|error| anyhow!("财务字段 {k} 日期非法 {cleaned:?}: {error}"))?;
-            return Ok(cleaned.to_string());
+            let raw = s.trim();
+            let date = chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+                .or_else(|_| {
+                    chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S")
+                        .map(|timestamp| timestamp.date())
+                })
+                .map_err(|error| anyhow!("财务字段 {k} 日期非法 {raw:?}: {error}"))?;
+            return Ok(date.format("%Y-%m-%d").to_string());
         }
     }
     Err(anyhow!("财务记录缺少必填{semantic}字段: {keys:?}"))
@@ -811,6 +816,14 @@ mod br115_tests {
         assert!(
             parse_datacenter_response(&serde_json::json!({"result": {"data": [{
                 "REPORTDATE": "2026-06-30"
+            }]}}))
+            .is_err()
+        );
+        assert!(
+            parse_datacenter_response(&serde_json::json!({"result": {"data": [{
+                "REPORTDATE": "2026-06-30 00:00:00",
+                "NOTICE_DATE": "2026-08-20 garbage",
+                "BASIC_EPS": 1.0
             }]}}))
             .is_err()
         );

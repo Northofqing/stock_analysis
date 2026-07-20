@@ -410,7 +410,12 @@ fn v14_gate_prepared(
 
     // L4 dedup (v15.1 A3: 用 reserve() 只检查不插入, 投递成功后由 push_governor_inner 调 commit())
     // v17.6 §5.1: sub_kind 参与 dedup key (per-sub_kind 独立窗口)
-    let cooldown = dedup_cooldown(kind, has_governance_identity, cooldown_override_secs);
+    let cooldown = dedup_cooldown(
+        kind,
+        has_governance_identity,
+        source_fact_context,
+        cooldown_override_secs,
+    );
     let outcome = match lock_dispatcher(stack) {
         Ok(dispatcher) if source_fact_context => {
             dispatcher.reserve_with_identity(&event, Some(&event.event_id), cooldown, sub_kind)
@@ -464,10 +469,13 @@ fn lock_dispatcher(
 fn dedup_cooldown(
     kind: PushKind,
     has_code: bool,
+    source_fact: bool,
     cooldown_override_secs: Option<u32>,
 ) -> Option<Duration> {
     match kind.cooldown_scope() {
-        CooldownScope::External => None,
+        // BR-137: legacy Announcement remains externally deduplicated, while
+        // its normalized source-fact path uses provider event_id as the L4 key.
+        CooldownScope::External if !source_fact => None,
         CooldownScope::PerTicket if !has_code => None,
         _ => cooldown_override_secs
             .or_else(|| kind.cooldown_secs())
@@ -487,6 +495,7 @@ pub fn commit_dedup_for_event(
     let cooldown = dedup_cooldown(
         kind,
         source_fact || event.code.is_some(),
+        source_fact,
         cooldown_override_secs,
     );
     let dispatcher = lock_dispatcher(stack)?;
@@ -506,7 +515,13 @@ pub fn rollback_dedup_for_event(
     cooldown_override_secs: Option<u32>,
 ) -> Result<(), String> {
     let stack = v14_stack()?;
-    let cooldown = dedup_cooldown(kind, event.code.is_some(), cooldown_override_secs);
+    let source_fact = is_source_fact_signal(kind, event);
+    let cooldown = dedup_cooldown(
+        kind,
+        source_fact || event.code.is_some(),
+        source_fact,
+        cooldown_override_secs,
+    );
     lock_dispatcher(stack)?.rollback(event, cooldown, sub_kind);
     Ok(())
 }
@@ -1009,7 +1024,7 @@ mod tests {
         let override_secs = Some(1_800);
 
         assert_eq!(
-            dedup_cooldown(PushKind::DailyReport, false, override_secs),
+            dedup_cooldown(PushKind::DailyReport, false, false, override_secs),
             Some(Duration::from_secs(1_800))
         );
         commit_dedup_for_event(
@@ -1109,6 +1124,7 @@ mod tests {
     #[test]
     #[serial_test::serial(cooldown_memo)]
     fn br137_source_fact_is_approved_at_data_mode_down_with_news_payload() {
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         _reset_dedup_for_test();
         crate::LATEST_BANNER
             .lock()
@@ -1153,6 +1169,7 @@ mod tests {
     #[test]
     #[serial_test::serial(cooldown_memo)]
     fn br137_l4_dedup_uses_provider_identity_not_security_code() {
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         _reset_dedup_for_test();
         let first_fact = source_fact_with_identity(PushKind::EarningsMiss, "provider-event-1");
         let second_fact = source_fact_with_identity(PushKind::EarningsMiss, "provider-event-2");
@@ -1174,6 +1191,7 @@ mod tests {
     #[test]
     #[serial_test::serial(cooldown_memo)]
     fn br137_source_fact_gate_and_l7_do_not_require_account_banner() {
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         _reset_dedup_for_test();
         let previous_banner = crate::LATEST_BANNER
             .lock()
@@ -1202,6 +1220,7 @@ mod tests {
     #[test]
     #[serial_test::serial(cooldown_memo)]
     fn br137_generic_mixed_news_remains_denied_at_data_mode_down() {
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
         _reset_dedup_for_test();
         crate::LATEST_BANNER
             .lock()

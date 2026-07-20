@@ -38,6 +38,10 @@
   the generic aggregator registration so a failed delivery remains eligible for a later real poll.
 - Reject trailing timestamp garbage and independently reject a non-current `occurred_at` before
   either critical or aggregate buffering, regardless of the upstream stale flag.
+- Apply the registered Announcement cooldown to normalized provider identity even though the legacy
+  kind remains externally deduplicated; prove a repeated real batch is not pushed twice.
+- Parse financial `NOTICE_DATE` and consensus `publishDate` as complete registered date/time strings;
+  reject whitespace or other trailing garbage instead of truncating it.
 
 ## Task 4: Focused validation
 
