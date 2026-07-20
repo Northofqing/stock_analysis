@@ -1735,7 +1735,7 @@ async fn evaluate_data_mode_hook() {
         return;
     }
 
-    let result = match pt::push_data_mode_change(&input, prev, Some(&banner)).await {
+    let result = match pt::push_data_mode_change(&input, prev, false, Some(&banner)).await {
         Ok(result) => result,
         Err(error) => {
             log::error!("[DataMode-hook] change push failed: {error}");
