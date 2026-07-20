@@ -520,7 +520,7 @@ mod quote_batch_tests {
     use super::*;
     use stock_analysis::market_data::TopStock;
 
-    fn http_proxy_once(body: String) -> (String, std::thread::JoinHandle<String>) {
+    fn http_fixture_once(body: String) -> (String, std::thread::JoinHandle<String>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -590,23 +590,11 @@ mod quote_batch_tests {
     }
 
     #[test]
-    #[serial_test::serial(http_proxy_env)]
     fn sina_transport_parses_complete_batch_and_rejects_incomplete_protocol() {
-        let keys = [
-            "HTTP_PROXY",
-            "http_proxy",
-            "HTTPS_PROXY",
-            "https_proxy",
-            "ALL_PROXY",
-            "all_proxy",
-            "NO_PROXY",
-            "no_proxy",
-        ];
-        let _env = crate::TestEnvGuard::capture(&keys);
-        for key in keys {
-            std::env::remove_var(key);
-        }
-
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
         let now = chrono::Local::now();
         let mut fields = vec!["0".to_string(); 32];
         fields[0] = "测试行情".to_string();
@@ -618,20 +606,19 @@ mod quote_batch_tests {
         fields[30] = now.format("%Y-%m-%d").to_string();
         fields[31] = now.format("%H:%M:%S").to_string();
         let body = format!("var hq_str_szTEST_CODE_000001=\"{}\";", fields.join(","));
-        let (proxy, request) = http_proxy_once(body);
-        std::env::set_var("HTTP_PROXY", &proxy);
-        std::env::set_var("http_proxy", &proxy);
-        let quotes = fetch_sina_quotes(&["TEST_CODE_000001".to_string()]).unwrap();
+        let (url, request) = http_fixture_once(body);
+        let quotes =
+            fetch_sina_quotes_with_client(&client, &["TEST_CODE_000001".to_string()], &url)
+                .unwrap();
         assert_eq!(quotes.len(), 1);
         assert_eq!(quotes[0].name, "测试行情");
         assert!((quotes[0].change_pct - 5.0).abs() < 1e-9);
-        assert!(request.join().unwrap().contains("hq.sinajs.cn/list="));
+        assert!(request.join().unwrap().starts_with("GET / HTTP/1.1"));
 
-        let (proxy, request) =
-            http_proxy_once("var hq_str_szTEST_CODE_000001=\"测试行情,10,10\";".to_string());
-        std::env::set_var("HTTP_PROXY", &proxy);
-        std::env::set_var("http_proxy", &proxy);
-        let error = fetch_sina_quotes(&["TEST_CODE_000001".to_string()]).unwrap_err();
+        let (url, request) =
+            http_fixture_once("var hq_str_szTEST_CODE_000001=\"测试行情,10,10\";".to_string());
+        let error = fetch_sina_quotes_with_client(&client, &["TEST_CODE_000001".to_string()], &url)
+            .unwrap_err();
         assert!(error.contains("字段不足"));
         request.join().unwrap();
     }
