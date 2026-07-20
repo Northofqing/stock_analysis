@@ -403,8 +403,9 @@ git commit -m "fix: deliver and retry monitor state alerts"
 Expected: initial Unsafe dispatch is eligible under Down governance and state advances only on confirmation.
 
 If the delivery-confirmation test encounters a stale hash chain from a reused OS PID, make the
-`cfg(test)` BR-091 audit directory process-instance unique. Production audit paths and fail-closed
-semantics remain unchanged.
+runtime-detected Cargo test process use a process-instance-unique BR-091 audit directory. Library
+unit tests and binary/integration tests compile with different `cfg(test)` boundaries, so both must
+use the same runtime detector. Production audit paths and fail-closed semantics remain unchanged.
 
 ### Task 4: Repair the strict Eastmoney announcement detail protocol
 

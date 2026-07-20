@@ -157,25 +157,23 @@ impl AuditDispatcher {
 
     /// Runtime constructor with BR-051 test/prod path isolation.
     pub fn for_runtime() -> Self {
-        #[cfg(test)]
-        let base_dir = {
-            static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-            let nonce = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_nanos())
-                .unwrap_or_default();
-            std::env::temp_dir().join(format!(
-                "stock-analysis-event-audit-test-{}-{}-{}",
-                std::process::id(),
-                SEQUENCE.fetch_add(1, Ordering::Relaxed),
-                nonce
-            ))
-        };
-        #[cfg(not(test))]
         let base_dir = std::env::var("EVENT_AUDIT_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| {
-                if crate::risk::env_guard::current_env() == crate::risk::env_guard::TradingEnv::Test
+                if crate::risk::env_guard::runtime_is_test_process() {
+                    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+                    let nonce = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|duration| duration.as_nanos())
+                        .unwrap_or_default();
+                    std::env::temp_dir().join(format!(
+                        "stock-analysis-event-audit-test-{}-{}-{}",
+                        std::process::id(),
+                        SEQUENCE.fetch_add(1, Ordering::Relaxed),
+                        nonce
+                    ))
+                } else if crate::risk::env_guard::current_env()
+                    == crate::risk::env_guard::TradingEnv::Test
                 {
                     PathBuf::from("data/test/event_audit")
                 } else {
