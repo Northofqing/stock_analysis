@@ -1,0 +1,50 @@
+# Source-fact news governance implementation plan
+
+## Task 1: RED evidence contract
+
+- Add `SourceFactEvidence` constructor tests for the whitelist, kind binding, identity/code rules,
+  non-empty provenance, bounds, stale flag, and future timestamp.
+- Prove the current generic path denies an earnings fact at DataMode Down.
+- Require the new typed path to approve it with a `NewsCatalyst` payload while a generic mixed-news
+  kind remains denied.
+
+## Task 2: Prepared-event gate
+
+- Refactor `v14_gate_with_sub_kind` into a default wrapper over one private prepared-event gate.
+- Add the source-fact constructor and source profile inside `v14_adapter`.
+- Keep every generic profile and caller unchanged.
+
+## Task 3: Sole delivery entry and source adapters
+
+- Add `notify::push_source_fact_v3`, delegating to the existing common governor and delivery tail.
+- Route the five normalized source-fact kinds through it; keep MarketAction on generic governance.
+- Extend critical FlashDecision to preserve event identity, headline, source, timestamp, and stale
+  state through the typed entry. Keep aggregated flash generic and fail closed.
+
+## Task 4: Focused validation
+
+```bash
+cargo test --bin monitor source_fact -- --nocapture
+cargo test --bin monitor v17_sources::tests -- --nocapture
+cargo test --bin monitor news_aggregator_init::tests -- --nocapture
+cargo test --lib news::aggregator::source_event::tests -- --nocapture
+```
+
+## Task 5: Repository gates
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-targets --all-features -- --test-threads=1
+bash tools/compliance/check.sh
+cargo llvm-cov --workspace --all-features --json --output-path target/coverage/coverage.json -- --test-threads=1
+python3 tools/coverage/check_thresholds.py target/coverage/coverage.json
+cargo build --release --bin monitor
+```
+
+## Task 6: PR and production acceptance
+
+- Complete all required PR evidence fields and obtain independent zero-blocker review.
+- Merge, fast-forward local master, rebuild, and restart only the verified process.
+- Compare aggregate source-fact L7, event-bus, and immutable-audit counts; require explicit source
+  failures and zero banner/sink/audit/panic/fatal regressions.
