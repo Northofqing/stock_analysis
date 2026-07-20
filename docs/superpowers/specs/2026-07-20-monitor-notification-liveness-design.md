@@ -244,6 +244,20 @@ python3 tools/coverage/check_thresholds.py target/coverage/coverage.json
 cargo build --release --bin monitor
 ```
 
+Pre-merge Gate D evidence recorded on 2026-07-20:
+
+- formatting: PASS;
+- Clippy across the workspace/all targets/all features with warnings denied: PASS;
+- full workspace tests: PASS, including 1,756 library tests (3 ignored live integrations),
+  333 monitor tests, and 7 process-isolation tests;
+- compliance: PASS, including daily freshness at 2026-07-17 (one trading-day lag);
+- coverage: global `82,620 / 102,617 = 80.51%`; core
+  `33,162 / 34,772 = 95.37%` across 101 files;
+- optimized `monitor` release build: PASS.
+
+The evidence above contains only aggregate counts and statuses. It does not include message bodies,
+account values, security identities, credentials, or notification destinations.
+
 After PR merge, restart exactly one master release process. Runtime acceptance uses only fixed
 counters: at least one state notification reaches a real sink and its delivery/L7 audit succeeds;
 the announcement batch no longer fails because of the obsolete empty detail path. No message
