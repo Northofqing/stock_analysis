@@ -7,7 +7,7 @@
 //! classifier tasks (Task 3 earnings, Task 4 analyst).
 
 use crate::signal::market_event::Direction;
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, NaiveDate};
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -35,8 +35,11 @@ pub enum NormalizedSourceError {
     },
     StrengthOutOfRange(u8),
     CertaintyOutOfRange(u8),
+    MissingPublishedDate,
+    InvalidPublishedDate,
     Stale,
-    FutureOccurredAt,
+    FutureObservedAt,
+    FuturePublishedDate,
 }
 
 impl fmt::Display for NormalizedSourceError {
@@ -59,9 +62,18 @@ impl fmt::Display for NormalizedSourceError {
             NormalizedSourceError::CertaintyOutOfRange(value) => {
                 write!(f, "certainty must be within 0..=100, got {value}")
             }
+            NormalizedSourceError::MissingPublishedDate => {
+                write!(f, "provider published date is missing")
+            }
+            NormalizedSourceError::InvalidPublishedDate => {
+                write!(f, "provider published date is invalid")
+            }
             NormalizedSourceError::Stale => write!(f, "source event is stale"),
-            NormalizedSourceError::FutureOccurredAt => {
-                write!(f, "occurred_at must not be in the future")
+            NormalizedSourceError::FutureObservedAt => {
+                write!(f, "observed_at must not be in the future")
+            }
+            NormalizedSourceError::FuturePublishedDate => {
+                write!(f, "provider published date must not be in the future")
             }
         }
     }
@@ -90,8 +102,11 @@ pub struct NormalizedSourceEvent {
     pub strength: u8,
     /// Information certainty 0-100.
     pub certainty: u8,
-    /// When the event occurred.
-    pub occurred_at: DateTime<Local>,
+    /// When this adapter actually observed the source record.
+    pub observed_at: DateTime<Local>,
+    /// Provider-supplied publication date. None is permitted only for the
+    /// non-source-fact MarketActionAlert path.
+    pub source_published_on: Option<NaiveDate>,
     /// Explicit upstream freshness result. Stale facts must not be pushed.
     pub stale: bool,
     /// Source name, e.g. "eastmoney", "ndrc", "em_announcement".
@@ -123,7 +138,9 @@ impl NormalizedSourceEvent {
         direction: Direction,
         strength: u8,
         certainty: u8,
-        stale: bool,
+        observed_at: DateTime<Local>,
+        source_published_on: Option<NaiveDate>,
+        upstream_stale: bool,
         source: String,
         url: Option<String>,
     ) -> Result<Self, NormalizedSourceError> {
@@ -136,8 +153,9 @@ impl NormalizedSourceEvent {
             direction,
             strength,
             certainty,
-            occurred_at: Local::now(),
-            stale,
+            observed_at,
+            source_published_on,
+            stale: upstream_stale,
             source,
             url,
             metadata: BTreeMap::new(),
@@ -174,11 +192,24 @@ impl NormalizedSourceEvent {
         if self.certainty > 100 {
             return Err(NormalizedSourceError::CertaintyOutOfRange(self.certainty));
         }
+        let now = Local::now();
+        if self.observed_at > now {
+            return Err(NormalizedSourceError::FutureObservedAt);
+        }
+        match self.source_published_on {
+            Some(date) if date > now.date_naive() => {
+                return Err(NormalizedSourceError::FuturePublishedDate);
+            }
+            Some(date) if date < now.date_naive() => {
+                return Err(NormalizedSourceError::Stale);
+            }
+            None if self.push_kind != SourcePushKind::MarketActionAlert => {
+                return Err(NormalizedSourceError::MissingPublishedDate);
+            }
+            _ => {}
+        }
         if self.stale {
             return Err(NormalizedSourceError::Stale);
-        }
-        if self.occurred_at > Local::now() {
-            return Err(NormalizedSourceError::FutureOccurredAt);
         }
         Ok(())
     }
@@ -194,8 +225,14 @@ impl NormalizedSourceEvent {
 mod tests {
     use super::*;
 
+    fn now_and_today() -> (DateTime<Local>, NaiveDate) {
+        let now = Local::now();
+        (now, now.date_naive())
+    }
+
     #[test]
     fn source_event_preserves_identity_and_provenance() {
+        let (now, today) = now_and_today();
         let event = NormalizedSourceEvent::new(
             SourcePushKind::Announcement,
             "ann-1".into(),
@@ -205,6 +242,8 @@ mod tests {
             Direction::Bull,
             70,
             80,
+            now,
+            Some(today),
             false,
             "eastmoney".into(),
             Some("https://example.invalid/ann-1".into()),
@@ -217,6 +256,7 @@ mod tests {
 
     #[test]
     fn source_event_rejects_empty_title_and_identity() {
+        let (now, today) = now_and_today();
         let err = NormalizedSourceEvent::new(
             SourcePushKind::PolicyHit,
             "".into(),
@@ -226,6 +266,8 @@ mod tests {
             Direction::Neutral,
             50,
             60,
+            now,
+            Some(today),
             false,
             "ndrc".into(),
             None,
@@ -268,6 +310,7 @@ mod tests {
 
     #[test]
     fn metadata_is_preserved_in_order() {
+        let (now, today) = now_and_today();
         let event = NormalizedSourceEvent::new(
             SourcePushKind::Announcement,
             "evt-1".into(),
@@ -277,6 +320,8 @@ mod tests {
             Direction::Bull,
             70,
             80,
+            now,
+            Some(today),
             false,
             "testsource".into(),
             None,
@@ -293,6 +338,7 @@ mod tests {
 
     #[test]
     fn policy_hit_allows_none_code() {
+        let (now, today) = now_and_today();
         let event = NormalizedSourceEvent::new(
             SourcePushKind::PolicyHit,
             "pol-1".into(),
@@ -302,6 +348,8 @@ mod tests {
             Direction::Bull,
             80,
             90,
+            now,
+            Some(today),
             false,
             "ndrc".into(),
             Some("https://example.invalid/pol-1".into()),
@@ -313,6 +361,7 @@ mod tests {
 
     #[test]
     fn non_policy_rejects_none_code() {
+        let (now, today) = now_and_today();
         let err = NormalizedSourceEvent::new(
             SourcePushKind::EarningsBeat,
             "earn-1".into(),
@@ -322,6 +371,8 @@ mod tests {
             Direction::Bull,
             80,
             90,
+            now,
+            Some(today),
             false,
             "em".into(),
             None,
@@ -332,6 +383,7 @@ mod tests {
 
     #[test]
     fn empty_source_rejected() {
+        let (now, today) = now_and_today();
         let err = NormalizedSourceEvent::new(
             SourcePushKind::Announcement,
             "ann-1".into(),
@@ -341,6 +393,8 @@ mod tests {
             Direction::Bull,
             70,
             80,
+            now,
+            Some(today),
             false,
             "".into(),
             None,
@@ -351,6 +405,7 @@ mod tests {
 
     #[test]
     fn public_envelope_revalidation_rejects_stale_and_out_of_range_data() {
+        let (now, today) = now_and_today();
         let mut event = NormalizedSourceEvent::new(
             SourcePushKind::PolicyHit,
             "policy-validation".into(),
@@ -360,6 +415,8 @@ mod tests {
             Direction::Neutral,
             80,
             90,
+            now,
+            Some(today),
             false,
             "official-provider".into(),
             None,
@@ -375,5 +432,40 @@ mod tests {
             Err(NormalizedSourceError::StrengthOutOfRange(101))
         );
         assert_eq!(event.strength, 101, "invalid input must not be clamped");
+    }
+
+    #[test]
+    fn source_fact_rejects_missing_old_or_future_provider_date() {
+        let (now, today) = now_and_today();
+        let build = |published_on| {
+            NormalizedSourceEvent::new(
+                SourcePushKind::PolicyHit,
+                "policy-freshness".into(),
+                None,
+                "政策事实".into(),
+                "summary".into(),
+                Direction::Neutral,
+                80,
+                90,
+                now,
+                published_on,
+                false,
+                "official-provider".into(),
+                None,
+            )
+        };
+
+        assert_eq!(
+            build(None),
+            Err(NormalizedSourceError::MissingPublishedDate)
+        );
+        assert_eq!(
+            build(Some(today - chrono::Duration::days(1))),
+            Err(NormalizedSourceError::Stale)
+        );
+        assert_eq!(
+            build(Some(today + chrono::Duration::days(1))),
+            Err(NormalizedSourceError::FuturePublishedDate)
+        );
     }
 }

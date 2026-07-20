@@ -245,6 +245,12 @@ pub fn classify_announcement(
 
     let source = "eastmoney".to_string();
     let url = a.url.clone();
+    let published_on = a
+        .date
+        .get(..10)
+        .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
+        .ok_or(NormalizedSourceError::InvalidPublishedDate)?;
+    let observed_at = chrono::Local::now();
 
     NormalizedSourceEvent::new(
         SourcePushKind::Announcement,
@@ -255,6 +261,8 @@ pub fn classify_announcement(
         direction,
         70,
         80,
+        observed_at,
+        Some(published_on),
         false,
         source,
         url,
@@ -280,6 +288,14 @@ pub fn classify_policy(r: &SearchResult) -> Result<NormalizedSourceEvent, Normal
     } else {
         Some(r.url.clone())
     };
+    let published_on = r
+        .published_date
+        .as_deref()
+        .ok_or(NormalizedSourceError::MissingPublishedDate)?
+        .get(..10)
+        .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
+        .ok_or(NormalizedSourceError::InvalidPublishedDate)?;
+    let observed_at = chrono::Local::now();
 
     NormalizedSourceEvent::new(
         SourcePushKind::PolicyHit,
@@ -290,6 +306,8 @@ pub fn classify_policy(r: &SearchResult) -> Result<NormalizedSourceEvent, Normal
         Direction::Bull, // policy is generally bullish
         80,
         90,
+        observed_at,
+        Some(published_on),
         false,
         r.source.clone(),
         url,
@@ -300,6 +318,7 @@ pub fn classify_policy(r: &SearchResult) -> Result<NormalizedSourceEvent, Normal
 mod tests {
     use super::*;
     use crate::data_provider::announcement::AnnLevel;
+    use chrono::Local;
 
     // -------------------------------------------------------------------------
     // Test helpers (production code does not use these)
@@ -310,7 +329,7 @@ mod tests {
             code: code.to_string(),
             name: "测试股票".to_string(),
             title: title.to_string(),
-            date: "2026-07-16".to_string(),
+            date: Local::now().date_naive().format("%Y-%m-%d").to_string(),
             summary: "公告摘要".to_string(),
             content: "正文内容".to_string(),
             level: AnnLevel::Important,
@@ -329,7 +348,7 @@ mod tests {
             snippet: "政策内容摘要".to_string(),
             url: url.to_string(),
             source: source.to_string(),
-            published_date: Some("2026-07-16".to_string()),
+            published_date: Some(Local::now().date_naive().format("%Y-%m-%d").to_string()),
             news_type: crate::search_service::NewsType::Policy,
             sentiment: crate::search_service::Sentiment::Positive,
             importance: 5,
@@ -365,6 +384,26 @@ mod tests {
         let event = classify_policy(&result).unwrap();
         assert_eq!(event.push_kind, SourcePushKind::PolicyHit);
         assert_eq!(event.url.as_deref(), Some("https://example.invalid/policy"));
+    }
+
+    #[test]
+    fn source_classifiers_reject_old_or_missing_provider_dates() {
+        let mut announcement =
+            test_important_announcement("ann-stale", "TEST_CODE_STALE_ANNOUNCEMENT", "历史公告");
+        announcement.date = (Local::now().date_naive() - chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        assert_eq!(
+            classify_announcement(&announcement),
+            Err(NormalizedSourceError::Stale)
+        );
+
+        let mut policy = test_search_result("政策", "provider", "");
+        policy.published_date = None;
+        assert_eq!(
+            classify_policy(&policy),
+            Err(NormalizedSourceError::MissingPublishedDate)
+        );
     }
 
     // -------------------------------------------------------------------------

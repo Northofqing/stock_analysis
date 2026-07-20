@@ -66,6 +66,8 @@ pub fn normalize_market_action(event: &MonitorEvent) -> Option<NormalizedSourceE
             stock_analysis::signal::market_event::Direction::Neutral,
             70,
             90,
+            Local::now(),
+            None,
             false,
             "monitor".into(),
             None,
@@ -184,7 +186,7 @@ pub async fn push_normalized_event(event: NormalizedSourceEvent) -> PushAttempt 
             event.code.clone(),
             event.title.clone(),
             event.source.clone(),
-            event.occurred_at,
+            event.observed_at,
             event.strength,
             event.certainty,
             event.stale,
@@ -235,7 +237,7 @@ pub async fn push_normalized_events(events: Vec<NormalizedSourceEvent>) -> Sourc
 fn earnings_classification_to_event(
     code: &str,
     classification: &EarningsClassification,
-) -> NormalizedSourceEvent {
+) -> Result<NormalizedSourceEvent, stock_analysis::news::aggregator::NormalizedSourceError> {
     let push_kind = match classification.kind {
         EarningsKind::Beat => SourcePushKind::EarningsBeat,
         EarningsKind::Miss => SourcePushKind::EarningsMiss,
@@ -276,21 +278,24 @@ fn earnings_classification_to_event(
         classification.delta_pct.to_string(),
     );
 
-    NormalizedSourceEvent {
+    Ok(NormalizedSourceEvent::new(
         push_kind,
         event_id,
-        code: Some(code.to_string()),
+        Some(code.to_string()),
         title,
         summary,
         direction,
-        strength: 80,
-        certainty: 90,
-        occurred_at: Local::now(),
-        stale: false,
-        source: "earnings_classifier".to_string(),
-        url: None,
-        metadata,
-    }
+        80,
+        90,
+        Local::now(),
+        Some(classification.report_date),
+        false,
+        "earnings_classifier".to_string(),
+        None,
+    )?
+    .with_metadata("actual", metadata["actual"].clone())
+    .with_metadata("reference", metadata["reference"].clone())
+    .with_metadata("delta_pct", metadata["delta_pct"].clone()))
 }
 
 /// Build a NormalizedSourceEvent for an analyst upgrade.
@@ -300,7 +305,8 @@ fn analyst_upgrade_event(
     from: &str,
     to: &str,
     report_id: &str,
-) -> NormalizedSourceEvent {
+    publish_date: chrono::NaiveDate,
+) -> Result<NormalizedSourceEvent, stock_analysis::news::aggregator::NormalizedSourceError> {
     let event_id = format!("analyst:{}:{}:{}", code, broker, report_id);
     let title = format!("{} 券商上调评级", broker);
     let summary = format!("从 {} 上调至 {}", from, to);
@@ -309,21 +315,24 @@ fn analyst_upgrade_event(
     metadata.insert("from_rating".to_string(), from.to_string());
     metadata.insert("to_rating".to_string(), to.to_string());
 
-    NormalizedSourceEvent {
-        push_kind: SourcePushKind::AnalystUpgrade,
+    Ok(NormalizedSourceEvent::new(
+        SourcePushKind::AnalystUpgrade,
         event_id,
-        code: Some(code.to_string()),
+        Some(code.to_string()),
         title,
         summary,
-        direction: stock_analysis::signal::market_event::Direction::Bull,
-        strength: 70,
-        certainty: 80,
-        occurred_at: Local::now(),
-        stale: false,
-        source: "analyst_tracker".to_string(),
-        url: None,
-        metadata,
-    }
+        stock_analysis::signal::market_event::Direction::Bull,
+        70,
+        80,
+        Local::now(),
+        Some(publish_date),
+        false,
+        "analyst_tracker".to_string(),
+        None,
+    )?
+    .with_metadata("broker", metadata["broker"].clone())
+    .with_metadata("from_rating", metadata["from_rating"].clone())
+    .with_metadata("to_rating", metadata["to_rating"].clone()))
 }
 
 /// Trait for fetching earnings and consensus data.
@@ -430,10 +439,15 @@ pub async fn poll_earnings_and_analyst(
                             if let Some(classification) =
                                 classify_earnings(latest_period, &consensus, earnings_cfg)
                             {
-                                events.push(earnings_classification_to_event(
-                                    code_str,
-                                    &classification,
-                                ));
+                                match earnings_classification_to_event(code_str, &classification) {
+                                    Ok(event) => events.push(event),
+                                    Err(error) => {
+                                        source_failures += 1;
+                                        log::warn!(
+                                            "[v17_sources][BR-137] earnings source fact rejected: {error}"
+                                        );
+                                    }
+                                }
                             }
                         }
                         let mut last_polls = last_poll_earnings.lock().unwrap();
@@ -499,13 +513,22 @@ pub async fn poll_earnings_and_analyst(
                             };
 
                             if let stock_analysis::news::aggregator::analyst_state::ObservationDecision::Upgrade { from, to } = analyst_store.observe(key.clone(), obs) {
-                                events.push(analyst_upgrade_event(
+                                match analyst_upgrade_event(
                                     code_str,
                                     &report.org_name,
                                     &from,
                                     &to,
                                     &report.title,
-                                ));
+                                    publish_date,
+                                ) {
+                                    Ok(event) => events.push(event),
+                                    Err(error) => {
+                                        source_failures += 1;
+                                        log::warn!(
+                                            "[v17_sources][BR-137] analyst source fact rejected: {error}"
+                                        );
+                                    }
+                                }
                             }
                         }
 
@@ -555,7 +578,8 @@ mod tests {
             direction: Direction::Neutral,
             strength: 50,
             certainty: 50,
-            occurred_at: Local::now(),
+            observed_at: Local::now(),
+            source_published_on: Some(Local::now().date_naive()),
             stale: false,
             source: "eastmoney".into(),
             url: Some("https://example.invalid/ann-1".into()),
@@ -575,7 +599,8 @@ mod tests {
             direction: Direction::Neutral,
             strength: 50,
             certainty: 50,
-            occurred_at: Local::now(),
+            observed_at: Local::now(),
+            source_published_on: Some(Local::now().date_naive()),
             stale: false,
             source: "test".into(),
             url: None,
@@ -662,7 +687,8 @@ mod tests {
             direction: Direction::Bull,
             strength: 70,
             certainty: 80,
-            occurred_at: Local::now(),
+            observed_at: Local::now(),
+            source_published_on: Some(Local::now().date_naive()),
             stale: false,
             source: " Wind".into(),
             url: None,
@@ -687,7 +713,8 @@ mod tests {
             direction: Direction::Bull,
             strength: 80,
             certainty: 90,
-            occurred_at: Local::now(),
+            observed_at: Local::now(),
+            source_published_on: Some(Local::now().date_naive()),
             stale: false,
             source: "ndrc".into(),
             url: Some("https://example.invalid/pol-1".into()),
@@ -758,7 +785,8 @@ mod tests {
         };
 
         // Beat case: actual EPS 1.10, consensus 1.00 → delta +10% → Beat
-        let beat_actual = test_financial_period("TEST_CODE_EARNINGS_BEAT", 1.10, "2026-04-20");
+        let today = Local::now().date_naive().format("%Y-%m-%d").to_string();
+        let beat_actual = test_financial_period("TEST_CODE_EARNINGS_BEAT", 1.10, &today);
         let beat_consensus = test_consensus_data("TEST_CODE_EARNINGS_BEAT", "券商A", "买入", 1.00);
         let beat_classification = classify_earnings(&beat_actual, &beat_consensus, &earnings_cfg);
         assert!(
@@ -773,11 +801,12 @@ mod tests {
         let beat_event = earnings_classification_to_event(
             "TEST_CODE_EARNINGS_BEAT",
             beat_classification.as_ref().unwrap(),
-        );
+        )
+        .expect("same-day earnings source fact");
         assert_eq!(beat_event.push_kind, SourcePushKind::EarningsBeat);
 
         // Miss case: actual EPS 0.89, consensus 1.00 → delta -11% → Miss
-        let miss_actual = test_financial_period("TEST_CODE_EARNINGS_MISS", 0.89, "2026-04-20");
+        let miss_actual = test_financial_period("TEST_CODE_EARNINGS_MISS", 0.89, &today);
         let miss_consensus = test_consensus_data("TEST_CODE_EARNINGS_MISS", "券商B", "中性", 1.00);
         let miss_classification = classify_earnings(&miss_actual, &miss_consensus, &earnings_cfg);
         assert!(
@@ -792,7 +821,8 @@ mod tests {
         let miss_event = earnings_classification_to_event(
             "TEST_CODE_EARNINGS_MISS",
             miss_classification.as_ref().unwrap(),
-        );
+        )
+        .expect("same-day earnings source fact");
         assert_eq!(miss_event.push_kind, SourcePushKind::EarningsMiss);
 
         // Verify beat and miss map to different PushKinds

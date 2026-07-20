@@ -8696,7 +8696,7 @@ mod tests_v17_7_announcement_wiring {
             code: code.to_string(),
             name: "测试公司".to_string(),
             title: "关于回购股份方案的公告".to_string(),
-            date: "2026-07-16".to_string(),
+            date: Local::now().date_naive().format("%Y-%m-%d").to_string(),
             summary: "回购".to_string(),
             content: String::new(),
             level: announcement::AnnLevel::Important,

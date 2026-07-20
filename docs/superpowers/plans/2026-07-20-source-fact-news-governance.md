@@ -3,7 +3,9 @@
 ## Task 1: RED evidence contract
 
 - Add `SourceFactEvidence` constructor tests for the whitelist, kind binding, identity/code rules,
-  non-empty provenance, bounds, stale flag, and future timestamp.
+  non-empty provenance, bounds, stale flag, and future timestamp. Extend `NormalizedSourceEvent`
+  with the real adapter observation and provider publication date; derive stale at construction and
+  revalidation instead of accepting `now`/`false` placeholders.
 - Prove the current generic path denies an earnings fact at DataMode Down.
 - Require the new typed path to approve it with a `NewsCatalyst` payload while a generic mixed-news
   kind remains denied.
@@ -12,6 +14,9 @@
 
 - Refactor `v14_gate_with_sub_kind` into a default wrapper over one private prepared-event gate.
 - Add the source-fact constructor and source profile inside `v14_adapter`.
+- Hash the provider governance identity into `SignalEvent.event_id`; add the narrow L4 dispatcher
+  API that uses that event ID for reserve/commit while leaving `SignalEvent.code` as the real
+  optional security code consumed by delivery audit.
 - Keep every generic profile and caller unchanged.
 
 ## Task 3: Sole delivery entry and source adapters
@@ -19,7 +24,9 @@
 - Add `notify::push_source_fact_v3`, delegating to the existing common governor and delivery tail.
 - Route the five normalized source-fact kinds through it; keep MarketAction on generic governance.
 - Extend critical FlashDecision to preserve event identity, headline, source, timestamp, and stale
-  state through the typed entry. Keep aggregated flash generic and fail closed.
+  state through the typed entry. Derive flash freshness from the provider date/timestamp and reject
+  stale/future events before both critical and aggregate buffers. Keep aggregated flash generic and
+  fail closed.
 
 ## Task 4: Focused validation
 

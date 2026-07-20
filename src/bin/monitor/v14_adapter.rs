@@ -239,8 +239,8 @@ impl SourceFactEvidence {
         self.kind
     }
 
-    pub fn governance_identity(&self) -> &str {
-        &self.governance_identity
+    pub fn security_code(&self) -> Option<&str> {
+        self.security_code.as_deref()
     }
 }
 
@@ -392,6 +392,9 @@ fn v14_gate_prepared(
     // v17.6 §5.1: sub_kind 参与 dedup key (per-sub_kind 独立窗口)
     let cooldown = dedup_cooldown(kind, has_governance_identity, cooldown_override_secs);
     let outcome = match lock_dispatcher(stack) {
+        Ok(dispatcher) if source_fact_context => {
+            dispatcher.reserve_with_identity(&event, Some(&event.event_id), cooldown, sub_kind)
+        }
         Ok(dispatcher) => dispatcher.reserve(&event, cooldown, sub_kind),
         Err(error) => {
             log::error!("[v14.2][BR-113] {error}");
@@ -460,8 +463,18 @@ pub fn commit_dedup_for_event(
     cooldown_override_secs: Option<u32>,
 ) -> Result<(), String> {
     let stack = v14_stack()?;
-    let cooldown = dedup_cooldown(kind, event.code.is_some(), cooldown_override_secs);
-    lock_dispatcher(stack)?.commit(event, cooldown, sub_kind);
+    let source_fact = is_source_fact_signal(kind, event);
+    let cooldown = dedup_cooldown(
+        kind,
+        source_fact || event.code.is_some(),
+        cooldown_override_secs,
+    );
+    let dispatcher = lock_dispatcher(stack)?;
+    if source_fact {
+        dispatcher.commit_with_identity(event, Some(&event.event_id), cooldown, sub_kind);
+    } else {
+        dispatcher.commit(event, cooldown, sub_kind);
+    }
     Ok(())
 }
 
@@ -717,10 +730,10 @@ fn signal_event_for_kind(kind: PushKind, code: Option<&str>) -> SignalEvent {
 
 fn signal_event_for_source_fact(evidence: &SourceFactEvidence) -> SignalEvent {
     let (source, kind_str, severity) = map_push_kind(evidence.kind);
-    SignalEvent::new(
+    let mut event = SignalEvent::new(
         source,
         kind_str,
-        Some(evidence.governance_identity.clone()),
+        evidence.security_code.clone(),
         evidence.observed_at,
         SignalPayload::NewsCatalyst(NewsCatalystPayload {
             code: evidence.security_code.clone(),
@@ -728,7 +741,10 @@ fn signal_event_for_source_fact(evidence: &SourceFactEvidence) -> SignalEvent {
             source: Some(evidence.source.clone()),
         }),
         severity,
-    )
+    );
+    event.event_id =
+        stock_analysis::push_l1::make_source_fact_event_id(kind_str, &evidence.governance_identity);
+    event
 }
 
 fn source_fact_profile(kind: PushKind) -> TemplateMetadata {
@@ -861,11 +877,15 @@ mod tests {
     use super::*;
 
     fn source_fact(kind: PushKind) -> SourceFactEvidence {
+        source_fact_with_identity(kind, "TEST_CODE_EVENT_ID")
+    }
+
+    fn source_fact_with_identity(kind: PushKind, identity: &str) -> SourceFactEvidence {
         let security_code = (!matches!(kind, PushKind::PolicyHit | PushKind::NewsFlashCritical))
             .then(|| "TEST_CODE_SOURCE_FACT".to_string());
         SourceFactEvidence::new(
             kind,
-            "TEST_CODE_EVENT_ID".to_string(),
+            identity.to_string(),
             security_code,
             "已验证来源事实".to_string(),
             "TEST_CODE_PROVIDER".to_string(),
@@ -1078,7 +1098,8 @@ mod tests {
         let V14Gate::Approved(event) = gate else {
             panic!("complete source fact must pass at Down: {gate:?}");
         };
-        assert_eq!(event.code.as_deref(), Some("TEST_CODE_EVENT_ID"));
+        assert_eq!(event.code.as_deref(), Some("TEST_CODE_SOURCE_FACT"));
+        assert_ne!(event.event_id, "TEST_CODE_EVENT_ID");
         match &event.payload {
             SignalPayload::NewsCatalyst(payload) => {
                 assert_eq!(payload.code.as_deref(), Some("TEST_CODE_SOURCE_FACT"));
@@ -1087,6 +1108,43 @@ mod tests {
             }
             other => panic!("source fact must retain news provenance, got {other:?}"),
         }
+
+        use stock_analysis::event::DomainEvent;
+        let delivery = stock_analysis::event::PushDeliveryEvent::new(
+            "earnings_miss".to_string(),
+            event.code.clone(),
+            "Pushed".to_string(),
+            "dry_run".to_string(),
+            1,
+            1,
+        );
+        assert_eq!(
+            delivery.entity_key(),
+            Some("TEST_CODE_SOURCE_FACT"),
+            "delivery audit entity must remain the security code"
+        );
+        assert_ne!(delivery.entity_key(), Some("TEST_CODE_EVENT_ID"));
+    }
+
+    #[test]
+    #[serial_test::serial(cooldown_memo)]
+    fn br137_l4_dedup_uses_provider_identity_not_security_code() {
+        _reset_dedup_for_test();
+        let first_fact = source_fact_with_identity(PushKind::EarningsMiss, "provider-event-1");
+        let second_fact = source_fact_with_identity(PushKind::EarningsMiss, "provider-event-2");
+
+        let V14Gate::Approved(first_event) = v14_gate_source_fact(&first_fact) else {
+            panic!("first source fact must be approved");
+        };
+        commit_dedup_for_event(&first_event, PushKind::EarningsMiss, None, None).unwrap();
+        assert!(matches!(
+            v14_gate_source_fact(&second_fact),
+            V14Gate::Approved(_)
+        ));
+        assert!(matches!(
+            v14_gate_source_fact(&first_fact),
+            V14Gate::Deduped
+        ));
     }
 
     #[test]
@@ -1272,7 +1330,7 @@ mod tests {
     #[test]
     fn br137_critical_flash_identity_is_not_a_security_code() {
         let fact = source_fact(PushKind::NewsFlashCritical);
-        assert_eq!(fact.governance_identity(), "TEST_CODE_EVENT_ID");
+        assert_eq!(fact.governance_identity, "TEST_CODE_EVENT_ID");
         assert_eq!(fact.security_code.as_deref(), None);
     }
 

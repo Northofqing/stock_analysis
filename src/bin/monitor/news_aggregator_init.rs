@@ -233,6 +233,12 @@ impl NewsFlashGate {
 
         // 1. 事件驱动: critical 即时推 (AC34)
         for e in events {
+            if e.stale || e.occurred_at > now {
+                log::warn!(
+                    "[NewsFlashGate][BR-137] stale/future event rejected before critical and aggregate governance"
+                );
+                continue;
+            }
             if !self.seen_today.insert(e.event_id.clone()) {
                 continue; // event_id 当日去重
             }
@@ -414,6 +420,7 @@ mod tests {
             certainty,
         );
         e.event_id = format!("eid-{}", id_seed); // 固定 id 便于断言
+        e.occurred_at = at(0, 0);
         e.provenance
             .push(stock_analysis::signal::market_event::SourceRef {
                 provider: "TEST_CODE_NEWS_PROVIDER".to_string(),
@@ -469,6 +476,17 @@ mod tests {
         let decisions = gate.process(&[ev("source-fact", 90, 90)], at(10, 0), 80, 20);
 
         assert_eq!(push_flash_decisions(decisions).await, (1, 0));
+    }
+
+    #[test]
+    fn br137_stale_flash_is_excluded_from_critical_and_aggregate_buffer() {
+        let now = at(10, 0);
+        let mut stale = ev("stale-source-fact", 90, 90);
+        stale.stale = true;
+        let mut gate = NewsFlashGate::new(now.date_naive());
+        assert!(gate.process(&[stale], now, 80, 20).is_empty());
+        assert!(gate.buffer.is_empty());
+        assert!(gate.seen_today.is_empty());
     }
 
     /// BR-082: event_id 当日去重

@@ -17,10 +17,12 @@ not relax strict review or any trading path.
 Introduce one validated `SourceFactEvidence` value owned by the v14 adapter. It binds:
 
 - the exact allowed PushKind;
-- a governance identity used by existing dedup;
+- a governance identity used by existing dedup, separate from any security code;
 - an optional real security code, distinct from a flash event identity;
 - non-empty headline and source provenance;
-- observed timestamp and explicit upstream stale state.
+- the real adapter-observation timestamp, provider publication date, and explicit upstream stale
+  state. A provider publication date earlier than the current local date is stale; a missing date
+  cannot qualify for the source-fact path.
 
 Only these source-self-contained kinds are allowed:
 
@@ -41,7 +43,7 @@ separate design preserves all contributing sources.
 ```text
 real provider/classifier
   -> NormalizedSourceEvent or critical MarketEvent
-  -> validate source identity, kind, code rules, bounds, and stale flag
+  -> validate source identity, kind, code rules, bounds, observation time, provider date, and stale flag
   -> SourceFactEvidence
   -> push_source_fact_v3
   -> independent capability-health context (does not read account/banner state)
@@ -51,7 +53,9 @@ real provider/classifier
 ```
 
 The prepared SignalEvent uses `SignalPayload::NewsCatalyst` with headline, source, and explicit
-optional security code. It never uses an empty `HoldingHealth` payload.
+optional security code. The provider identity is hashed into `SignalEvent.event_id` and is the L4
+dedup identity; it is never written to `SignalEvent.code` or delivery-audit `code/entity_key`.
+It never uses an empty `HoldingHealth` payload.
 
 ## 4. Validation and failure modes
 
@@ -59,8 +63,12 @@ optional security code. It never uses an empty `HoldingHealth` payload.
 - Announcement, earnings, and analyst facts require a non-empty code accepted by the environment
   guard; Policy may be global. Critical flash requires an event identity but does not put it in the
   security-code field.
-- Strength/certainty outside `0..=100`, an upstream `stale=true`, or a future observed timestamp is
-  rejected. No value is clamped or filled at the gate.
+- Strength/certainty outside `0..=100`, an upstream `stale=true`, a future observation/publication
+  time, a missing provider publication date, or a provider publication date before the current
+  local date is rejected. `observed_at` records the real adapter observation; it must not replace
+  the provider date. No value is clamped or filled at the gate.
+- Flash feeds derive freshness from their real provider timestamp/date. Missing publication time is
+  marked stale and excluded from both critical and aggregate flash decisions.
 - The source-fact governance and L7 paths read the real process-local capability tracker directly;
   a missing account/banner snapshot cannot block them. Capability-tracker, analytics, lock, sink,
   dedup, or immutable-audit failure keeps its existing explicit failure result. A sink result is
@@ -70,7 +78,7 @@ optional security code. It never uses an empty `HoldingHealth` payload.
 
 ## 5. Interface placement
 
-`v14_adapter` owns evidence validation and prepared-event governance, hiding profile construction
+`v14_adapter` owns evidence validation, source-identity hashing, and prepared-event governance, hiding profile construction
 from callers. It also owns the independent capability-health context used before and after source
 fact delivery; account state is deliberately absent because it is not a dependency of source facts.
 `notify` owns the sole source-fact delivery entry and reuses the same common tail as the generic
@@ -91,8 +99,9 @@ construct an approved SignalEvent themselves.
 ## 7. Acceptance
 
 Focused tests prove a complete source fact is approved when current DataMode is Down, its payload
-retains provenance, generic news/advice remains denied, invalid facts are rejected, MarketAction is
-not whitelisted, and critical flash keeps event identity separate from security code. Existing
+retains provenance, generic news/advice remains denied, invalid/stale/missing-date facts are rejected,
+MarketAction is not whitelisted, two provider events for one security retain independent L4 identities,
+and critical flash keeps event identity separate from security code and delivery audit. Existing
 dedup, delivery, audit, source batching, and strict-review tests must remain green.
 
 Production acceptance uses only aggregate L7/event/audit counts and governance reasons. It must not

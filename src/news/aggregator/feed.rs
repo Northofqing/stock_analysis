@@ -10,7 +10,7 @@ use crate::signal::market_event::{Direction, EventType, MarketEvent, SourceRef};
 use crate::util::recover_lock_or_warn;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use chrono::{Local, Utc};
+use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
 use std::sync::{Arc, Mutex};
 
 /// 把任意 `SearchResult` (现有 search_service 类型) 转成 MarketEvent
@@ -20,6 +20,8 @@ fn search_result_to_event(
     event_type: EventType,
 ) -> MarketEvent {
     let now = Utc::now();
+    let observed_at = now.with_timezone(&Local);
+    let (occurred_at, stale) = source_time_and_stale(r.published_date.as_deref(), observed_at);
     let simhash = {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
@@ -47,7 +49,7 @@ fn search_result_to_event(
         strength: importance.saturating_mul(10),
         certainty: 60,
         chains: vec![],
-        occurred_at: now.with_timezone(&Local),
+        occurred_at,
         provenance: vec![SourceRef {
             provider: source_kind.label().to_string(),
             url: if r.url.is_empty() {
@@ -55,11 +57,47 @@ fn search_result_to_event(
             } else {
                 Some(r.url.clone())
             },
-            fetched_at: now.with_timezone(&Local),
+            fetched_at: observed_at,
         }],
         ai_degraded: false,
-        stale: false,
+        stale,
     }
+}
+
+/// Preserve a real provider timestamp when one exists. Date-only sources use
+/// the real adapter observation time, while freshness is derived from the
+/// provider date. Missing/invalid dates are explicitly stale and cannot enter
+/// BR-137 critical or aggregate decisions.
+fn source_time_and_stale(
+    raw: Option<&str>,
+    observed_at: DateTime<Local>,
+) -> (DateTime<Local>, bool) {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        log::warn!("[NewsFeed][BR-137] provider published_date missing; event marked stale");
+        return (observed_at, true);
+    };
+    if let Ok(timestamp) = DateTime::parse_from_rfc3339(raw) {
+        let timestamp = timestamp.with_timezone(&Local);
+        let stale = timestamp > observed_at || timestamp.date_naive() != observed_at.date_naive();
+        return (timestamp, stale);
+    }
+    for format in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"] {
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(raw, format) {
+            if let Some(timestamp) = Local.from_local_datetime(&naive).single() {
+                let stale =
+                    timestamp > observed_at || timestamp.date_naive() != observed_at.date_naive();
+                return (timestamp, stale);
+            }
+        }
+    }
+    if let Some(date) = raw
+        .get(..10)
+        .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())
+    {
+        return (observed_at, date != observed_at.date_naive());
+    }
+    log::warn!("[NewsFeed][BR-137] provider published_date invalid; event marked stale");
+    (observed_at, true)
 }
 
 // ============================================================================
@@ -303,6 +341,7 @@ impl NewsFeed for EmAnnouncementFeed {
         Ok(anns
             .iter()
             .map(|a| {
+                let (occurred_at, stale) = source_time_and_stale(Some(&a.date), now);
                 let simhash = {
                     use std::collections::hash_map::DefaultHasher;
                     use std::hash::{Hash, Hasher};
@@ -322,14 +361,14 @@ impl NewsFeed for EmAnnouncementFeed {
                     strength: 70,
                     certainty: 80,
                     chains: vec![],
-                    occurred_at: now,
+                    occurred_at,
                     provenance: vec![SourceRef {
                         provider: "em_announcement".to_string(),
                         url: a.url.clone(),
                         fetched_at: now,
                     }],
                     ai_degraded: false,
-                    stale: false,
+                    stale,
                 }
             })
             .collect())
@@ -472,6 +511,7 @@ mod tests {
             );
             result.sentiment = sentiment;
             result.importance = 99;
+            result.published_date = Some(Local::now().format("%Y-%m-%d %H:%M:%S").to_string());
             let event = search_result_to_event(&result, source_kind, event_type);
             assert_eq!(event.direction, direction);
             assert_eq!(event.event_type, event_type);
@@ -494,6 +534,20 @@ mod tests {
             let without_url = search_result_to_event(&result, source_kind, EventType::Other);
             assert_eq!(without_url.provenance[0].url, None);
         }
+    }
+
+    #[test]
+    fn source_time_marks_missing_and_old_records_stale_without_now_fallback_approval() {
+        let observed_at = Local::now();
+        assert!(source_time_and_stale(None, observed_at).1);
+        let yesterday = (observed_at.date_naive() - chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string();
+        assert!(source_time_and_stale(Some(&yesterday), observed_at).1);
+        let today = observed_at.format("%Y-%m-%d %H:%M:%S").to_string();
+        let (source_time, stale) = source_time_and_stale(Some(&today), observed_at);
+        assert!(!stale);
+        assert_eq!(source_time.timestamp(), observed_at.timestamp());
     }
 
     #[test]

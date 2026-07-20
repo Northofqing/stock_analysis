@@ -1229,7 +1229,7 @@ pub async fn push_source_fact_v3(
     push_governor_inner_with_source_fact(
         text,
         evidence.kind(),
-        Some(evidence.governance_identity()),
+        evidence.security_code(),
         Some(evidence),
     )
     .await
