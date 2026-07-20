@@ -1615,7 +1615,8 @@ fn plan_account_mode_notification(
 ///
 /// `prev` 由调用方从 `database::account_mode_log::latest_account_mode_change()` 恢复.
 ///
-/// 当前 PR1 不挂主循环调用 (留给 PR1-1.7), 单测覆盖函数本身.
+/// 生产入口由 `main.rs::evaluate_account_mode_hook` 在启动期与周期循环调用；
+/// 本函数的失败会返回调用方并保留未确认状态供下轮重试。
 pub async fn push_account_mode_change(
     metrics: &stock_analysis::risk::account_mode::PortfolioMetrics,
     prev: Option<stock_analysis::risk::action_gate::AccountMode>,
