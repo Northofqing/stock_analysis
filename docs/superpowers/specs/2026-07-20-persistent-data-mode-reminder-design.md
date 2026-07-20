@@ -116,7 +116,9 @@ evaluation never refreshes an Unsafe reminder timestamp.
 
 The 30-minute threshold is a registered BR-135 code constant, not a `config/*.toml` change. It is
 longer than source retry loops, short enough to expose a half-hour outage, and bounds a stable
-outage to at most 48 reminders per day. No ordinary business-message gate changes.
+outage to at most 48 confirmed reminders per day. Unconfirmed attempts intentionally remain due
+and may retry at the hook cadence until one authoritative delivery succeeds. No ordinary
+business-message gate changes.
 
 ## 5. Data flow
 

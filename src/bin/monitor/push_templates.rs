@@ -6280,9 +6280,9 @@ pub async fn push_candidate_invalidated(
 /// 完整链路: evaluate() → 计划状态变更 → 拼 T-02 → dispatch().
 /// BR-116: 已确认状态本身负责精确去重，不设跨状态的粗粒度时间冷却。
 ///
-/// 返回 `Ok(true)` 表示推送成功; `Ok(false)` 表示无变更 (no-op).
+/// 返回 `ModeDispatchResult`: 静默建立 Full, 或保留权威 `PushOutcome` 供调用方确认。
 ///
-/// `prev` 由调用方从 history 表恢复, 首次评估传 None.
+/// `prev` 由调用方的进程内 `LATEST_DATA_MODE` 提供, 首次评估传 None.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DataModeDispatchReason {
     Transition,

@@ -338,20 +338,47 @@ cargo test --lib monitor::data_mode::tests::
 cargo build --lib
 rg -n -A4 'push_data_mode_change\(' src/bin/monitor --glob '*.rs'
 cargo build --release --bin monitor
-V10_DRY_RUN_PUSH=1 ./target/release/monitor --test
+repo_root=$(pwd -P)
+smoke_dir=$(mktemp -d /private/tmp/stock_analysis_br135_smoke.XXXXXX)
+cd "$smoke_dir"
+env -u ALERT_WEBHOOK_URL -u CUSTOM_WEBHOOK_URL -u DINGTALK_WEBHOOK \
+  -u DISCORD_WEBHOOK -u FEISHU_APP_ID -u FEISHU_APP_SECRET -u FEISHU_TO \
+  -u FEISHU_WEBHOOK -u FEISHU_WEBHOOK_URL -u SERVER_CHAN_KEY \
+  -u SLACK_WEBHOOK -u TELEGRAM_BOT_TOKEN -u WECHAT_WEBHOOK \
+  DATABASE_PATH="$smoke_dir/e2e.db" MAGICLAW_DB_PATH="$smoke_dir/e2e.db" \
+  STOCK_LIST="" STOCK_ENV_MODE=test MONITOR_ENABLED=true V10_DRY_RUN_PUSH=1 \
+  "$repo_root/target/release/monitor" --test --e2e
+cd "$repo_root"
 rg -n 'is_active_spec_target_|is_legacy_v17_' src/bin/monitor/notify.rs
 ```
 
-After restart it must also verify, using counts only, one real `data_mode` push in L7 and immutable `push.delivery.audit`, plus zero panic/fatal/sink/audit failure. It must not trust the implementer report.
+The isolated smoke must exit zero, reach `[v70] E2E 完成`, write only its temporary test database
+and `data/test` artifacts, and report zero governance-missing/sink/panic/fatal markers. It is not
+accepted as BR-135 production evidence.
 
-- [ ] **Step 4: PR and merge**
+- [ ] **Step 4: Open the Draft PR**
 
-Push the branch, create a Draft PR with every AGENTS field, attach Gate evidence, obtain independent zero-blocker sign-off, mark ready, and merge into master.
+Push the branch and create a Draft PR with every AGENTS field. Attach Gate evidence but do not mark
+Ready or merge before branch-specific production acceptance and the final independent sign-off.
 
-- [ ] **Step 5: Rebuild and restart exactly one process**
+- [ ] **Step 5: Controlled release-candidate deployment**
 
-Preserve the current release binary, build merged master, terminate only the old monitor PID, start one private-log release process, and append a new active-runtime segment excluding restart downtime.
+Preserve the current release binary, terminate only the verified old monitor PID, start exactly one
+Draft-PR release candidate with the private append-only log, and append a new active-runtime segment
+excluding restart downtime. This is the explicit premerge Gate-D canary; if startup validation
+fails, restore the preserved master binary immediately.
 
 - [ ] **Step 6: Production acceptance**
 
-Using aggregate evidence only, verify the process remains alive; BR-135 reminder is confirmed or explicitly retrying; L7 and immutable audit contain the real outcome; panic/fatal/sink/audit errors are zero; and no payload, destination, account, security, credential, or platform identity entered Git or console output.
+Using aggregate evidence only, verify the process remains alive; the same continuously Unsafe state
+produces a due BR-135 reminder after 30 minutes; L7, event bus, and immutable audit each advance by
+one real DataMode delivery; panic/fatal/banner/sink/audit errors are zero; and no payload,
+destination, account, security, credential, or platform identity entered Git or console output.
+
+- [ ] **Step 7: Final sign-off, merge, and master restart**
+
+Give a fresh independent verifier the final commit and post-candidate counts. Only with zero
+blocking objections, tick the remaining PR checklist, mark Ready, and merge. Switch to `master`,
+fast-forward from the remote, rebuild the release binary, stop only the candidate PID, and start
+exactly one merged-master process. Record the new runtime segment and revalidate the same sanitized
+producer/audit boundaries.
