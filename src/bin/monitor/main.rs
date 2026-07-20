@@ -118,6 +118,8 @@ mod v13_diag; // v13.27: 端到端诊断
 
 mod market_data;
 
+mod intraday_market;
+
 mod v14_adapter;
 
 mod l6_sink;
