@@ -843,7 +843,12 @@ async fn fetch_announcements_batch_from_urls(
 
     let (list, list_protocol) =
         fetch_announcement_list_with_fallback(client, date_str, announcement_url).await?;
-    info!("[公告] {} 获取 {} 条", date_str, list.len());
+    info!(
+        "[公告][BR-140] {} 获取 {} 条 list_protocol={:?}",
+        date_str,
+        list.len(),
+        list_protocol
+    );
 
     // 熔断：超 200 条仅标题扫描
     if list.len() >= MAX_PER_FETCH {
