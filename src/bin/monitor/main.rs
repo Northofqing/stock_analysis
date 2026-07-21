@@ -2538,15 +2538,21 @@ async fn main() {
     let bus = global_bus();
     log::info!("[event_bus] delivery audit mode=synchronous_durable; bus=observation_only");
 
-    // v17.3 Task 5: Spawn JSONL writer — obtain a separate receiver for persistence
-    let _jsonl_writer_handle = {
-        let rx = bus.subscribe();
-        let base_dir = runtime_data_path(test_mode, "event_bus");
-        let retention_days = 1_827u32;
-        tokio::spawn(async move {
-            use stock_analysis::event::JsonlWriter;
-            JsonlWriter::spawn(rx, base_dir.clone(), retention_days).await
-        })
+    // BR-141: JSONL initialization is awaited before the background consumer
+    // starts, so setup failures cannot hide inside an unobserved nested task.
+    let _jsonl_writer_handle = match stock_analysis::event::JsonlWriter::spawn(
+        bus.subscribe(),
+        runtime_data_path(test_mode, "event_bus"),
+        1_827,
+    )
+    .await
+    {
+        Ok(handle) => handle,
+        Err(error) => {
+            log::error!("[event_bus.jsonl] initialization failed: {error}");
+            log::logger().flush();
+            std::process::exit(2);
+        }
     };
     log::info!(
         "[event_bus.jsonl] mode=enabled retention_days=1827 isolated_test={}",

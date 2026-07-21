@@ -47,22 +47,25 @@ pub struct JsonlWriter {
 impl JsonlWriter {
     /// Spawn a writer task that consumes envelopes from `receiver`.
     ///
-    /// The task runs until the receiver's sender is dropped or a fatal error occurs.
-    /// Returns a `JoinHandle` that can be aborted to stop the writer.
-    pub fn spawn(
+    /// Directory creation and retention cleanup complete before this returns.
+    /// The consumer task then runs until the receiver's sender is dropped or a
+    /// fatal error occurs. The returned `JoinHandle` can be aborted to stop it.
+    pub async fn spawn(
         receiver: broadcast::Receiver<EventEnvelope>,
         base_dir: PathBuf,
         retention_days: u32,
-    ) -> JoinHandle<()> {
-        tokio::spawn(async move {
-            let writer = Self {
-                base_dir,
-                retention_days,
-            };
-            if let Err(e) = writer.run(receiver).await {
-                log::error!("[jsonl_writer] fatal error: {}", e);
+    ) -> Result<JoinHandle<()>, JsonlError> {
+        let writer = Self {
+            base_dir,
+            retention_days,
+        };
+        fs::create_dir_all(&writer.base_dir).await?;
+        Self::cleanup_expired(&writer.base_dir, writer.retention_days).await?;
+        Ok(tokio::spawn(async move {
+            if let Err(error) = writer.consume(receiver).await {
+                log::error!("[jsonl_writer] fatal error: {error}");
             }
-        })
+        }))
     }
 
     /// Remove JSONL files older than `retention_days` from `base_dir`.
@@ -99,11 +102,7 @@ impl JsonlWriter {
         Ok(())
     }
 
-    async fn run(&self, mut rx: broadcast::Receiver<EventEnvelope>) -> Result<(), JsonlError> {
-        fs::create_dir_all(&self.base_dir).await?;
-        if let Err(error) = Self::cleanup_expired(&self.base_dir, self.retention_days).await {
-            log::warn!("[jsonl_writer] retention cleanup failed: {}", error);
-        }
+    async fn consume(&self, mut rx: broadcast::Receiver<EventEnvelope>) -> Result<(), JsonlError> {
         loop {
             match rx.recv().await {
                 Ok(env) => {
@@ -260,7 +259,9 @@ mod tests {
     async fn writer_appends_one_json_envelope_per_line() {
         let dir = test_dir("append");
         let (bus, rx) = test_bus(8);
-        let handle = JsonlWriter::spawn(rx, dir.clone(), 7);
+        let handle = JsonlWriter::spawn(rx, dir.clone(), 7)
+            .await
+            .expect("initialize test JSONL writer");
 
         bus.publish(test_live_envelope("evt-1"));
         wait_until_file_contains(&dir, "evt-1").await;
@@ -279,7 +280,9 @@ mod tests {
     async fn writer_skips_only_replay_envelopes() {
         let dir = test_dir("replay-filter");
         let (bus, rx) = test_bus(8);
-        let handle = JsonlWriter::spawn(rx, dir.clone(), 7);
+        let handle = JsonlWriter::spawn(rx, dir.clone(), 7)
+            .await
+            .expect("initialize test JSONL writer");
 
         bus.publish(test_live_envelope("live"));
         bus.publish(test_replay_envelope("replay", "original"));
