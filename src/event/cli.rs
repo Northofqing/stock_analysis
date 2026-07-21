@@ -106,7 +106,8 @@ pub fn parse_args(args: &[&str]) -> Result<Option<EventCommand>, CliError> {
                 // Ignore them here; if no event command is present we still return None.
             }
             s if s.starts_with("--backfill-outcome=") => {
-                // Existing monitor one-shot mode; its handler validates the value.
+                let date_str = &s["--backfill-outcome=".len()..];
+                parse_date(date_str)?;
             }
             "--replay" => {
                 has_replay = true;
@@ -389,6 +390,14 @@ mod tests {
         ] {
             let cmd = parse_args(&["monitor", flag]).unwrap();
             assert!(cmd.is_none(), "known one-shot flag rejected: {flag}");
+        }
+    }
+
+    #[test]
+    fn cli_rejects_empty_or_malformed_backfill_outcome_dates() {
+        for flag in ["--backfill-outcome=", "--backfill-outcome=not-a-date"] {
+            let error = parse_args(&["monitor", flag]).expect_err("invalid date must fail");
+            assert!(error.to_string().contains("malformed date"), "{error}");
         }
     }
 

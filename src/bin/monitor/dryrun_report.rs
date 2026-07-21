@@ -1,3 +1,4 @@
+//! Registered business rules: BR-141.
 //! v26: Dry-run 报告自动生成器
 //!
 //! 启动后台任务, 定时从 `data/dispatcher_log/*.jsonl` 汇总统计,
@@ -117,16 +118,21 @@ pub fn spawn_outcome_backfill_scheduler() -> tokio::task::JoinHandle<()> {
             let yesterday = crate::calendar::prev_trading_day(today);
             let date_str = yesterday.format("%Y-%m-%d").to_string();
             log::info!("[v14.1 #162] 自动 backfill outcome | 日期 = {}", date_str);
-            let updated =
-                stock_analysis::opportunity::news_outcome::backfill_recommendations_outcome(
-                    &date_str,
-                );
-            log::info!(
-                "[v14.1 #162] 自动 backfill 完成 | {} | 更新 {} 条",
-                date_str,
-                updated
-            );
-            last_run_date = Some(today_str);
+            match stock_analysis::opportunity::news_outcome::backfill_recommendations_outcome(
+                &date_str,
+            ) {
+                Ok(updated) => {
+                    log::info!(
+                        "[v14.1 #162] 自动 backfill 完成 | {} | 更新 {} 条",
+                        date_str,
+                        updated
+                    );
+                    last_run_date = Some(today_str);
+                }
+                Err(error) => {
+                    log::error!("[v14.1 #162] 自动 backfill 失败 | {} | {}", date_str, error);
+                }
+            }
         }
     });
     log::info!("[v14.1 #162] 后台 outcome backfill 调度器已启动 (15:30 每日)");
@@ -177,7 +183,8 @@ fn scan_and_backfill_pending() -> Result<usize, Box<dyn std::error::Error>> {
         }
         log::info!("[v14.1 #162] 历史补单 backfill | {}", date_str);
         let updated =
-            stock_analysis::opportunity::news_outcome::backfill_recommendations_outcome(&date_str);
+            stock_analysis::opportunity::news_outcome::backfill_recommendations_outcome(&date_str)
+                .map_err(|error| format!("historical backfill {date_str}: {error}"))?;
         log::info!(
             "[v14.1 #162] 历史补单完成 | {} | 更新 {} 条",
             date_str,

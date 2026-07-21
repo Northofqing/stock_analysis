@@ -111,6 +111,20 @@ terminal because continuing without the declared replay projection is an
 operational integrity failure, but a successful writer result is not presented
 as WORM/tamper-resistance evidence.
 
+The authoritative owner is hardened at the same seam. An explicit
+`EVENT_AUDIT_DIR` is always namespaced under `test/` or `prod/`; a per-year OS
+file lock spans full-chain validation, append, flush and `sync_data`; and every
+append revalidates because another process may have extended the file. A
+non-empty file without a trailing newline is an incomplete record and is
+rejected rather than extended.
+
+Known one-shot modes remain truthful after becoming reachable. Outcome backfill
+parses a strict calendar date before normalizing the filename and propagates
+source parse, K-line and atomic-write failures. Push dry-run aggregates real
+source/build errors instead of treating logging as success. Its production
+assemblers do not run inside TEST_CODE E2E because those adapters require real
+symbol protocols and may contact external providers.
+
 ## Tests and acceptance
 
 - A process integration test removes `MONITOR_ENABLED`, runs isolated
@@ -139,6 +153,13 @@ as WORM/tamper-resistance evidence.
   clean unexpected stop, writer error, join error, and timeout. Owned background
   tasks are aborted and joined before bus close; direct nested producers are
   removed so no producer handle is detached across shutdown.
+- The injectable long-running supervisor proves signal ordering (producer drop
+  before bus close and writer completion), runtime writer error propagation and
+  unexpected main-loop completion. Cross-process delivery-audit writers prove
+  one valid chain; incomplete-tail and override-namespace tests cover the other
+  authoritative-audit failure modes.
+- Isolated process tests cover strict/path-traversal backfill dates, corrupt
+  outcome input, all registered one-shot handler markers and dry-run status.
 - Focused tests, fmt, clippy, full workspace tests, compliance, coverage and
   release build must pass.
 - A release canary repeats `monitor --test --review` without

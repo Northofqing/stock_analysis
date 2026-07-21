@@ -984,6 +984,113 @@ mod virtual_observation_tests {
     }
 
     #[tokio::test]
+    async fn br141_supervisor_orders_signal_producer_stop_bus_close_and_writer_drain() {
+        struct OrderMarker(std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>);
+        impl Drop for OrderMarker {
+            fn drop(&mut self) {
+                self.0.lock().unwrap().push("producer");
+            }
+        }
+
+        let bus = stock_analysis::event::EventBus::new_for_test(8);
+        let mut receiver = bus.subscribe().expect("subscribe lifecycle writer");
+        let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer_order = std::sync::Arc::clone(&order);
+        let mut writer = Some(tokio::spawn(async move {
+            loop {
+                match receiver.recv().await {
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        writer_order.lock().unwrap().push("writer");
+                        return Ok(());
+                    }
+                    Err(error) => return Err(stock_analysis::event::JsonlError::Receive(error)),
+                }
+            }
+        }));
+        let producer_order = std::sync::Arc::clone(&order);
+        let producer = tokio::spawn(async move {
+            let _marker = OrderMarker(producer_order);
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+
+        supervise_long_running_lifecycle(
+            &bus,
+            &mut writer,
+            vec![("TEST_CODE producer", producer)],
+            std::future::pending::<()>(),
+            async { Ok(()) },
+        )
+        .await
+        .expect("signal shutdown must drain cleanly");
+
+        assert_eq!(*order.lock().unwrap(), vec!["producer", "writer"]);
+        assert!(writer.is_none());
+        assert_eq!(bus.receiver_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn br141_supervisor_converts_runtime_writer_failure_to_error_after_quiesce() {
+        let bus = stock_analysis::event::EventBus::new_for_test(8);
+        let writer_error = stock_analysis::event::JsonlError::Io(std::io::Error::other(
+            "forced runtime writer failure",
+        ));
+        let mut writer = Some(tokio::spawn(async move { Err(writer_error) }));
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_dropped = std::sync::Arc::clone(&dropped);
+        let producer = tokio::spawn(async move {
+            struct Marker(std::sync::Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for Marker {
+                fn drop(&mut self) {
+                    self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let _marker = Marker(task_dropped);
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+
+        let error = supervise_long_running_lifecycle(
+            &bus,
+            &mut writer,
+            vec![("TEST_CODE producer", producer)],
+            std::future::pending::<()>(),
+            std::future::pending::<Result<(), String>>(),
+        )
+        .await
+        .expect_err("runtime writer failure must stop the service");
+
+        assert!(error.contains("forced runtime writer failure"), "{error}");
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(writer.is_none());
+        assert_eq!(bus.receiver_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn br141_supervisor_rejects_unexpected_main_loop_completion() {
+        let bus = stock_analysis::event::EventBus::new_for_test(8);
+        let mut receiver = bus.subscribe().expect("subscribe lifecycle writer");
+        let mut writer = Some(tokio::spawn(async move {
+            while receiver.recv().await.is_ok() {}
+            Ok(())
+        }));
+
+        let error = supervise_long_running_lifecycle(
+            &bus,
+            &mut writer,
+            Vec::new(),
+            async {},
+            std::future::pending::<Result<(), String>>(),
+        )
+        .await
+        .expect_err("long-running loop completion must not look graceful");
+
+        assert!(error.contains("completed unexpectedly"), "{error}");
+        assert!(writer.is_none());
+    }
+
+    #[tokio::test]
     async fn br103_missing_real_account_snapshot_blocks_close_review() {
         let error = build_close_review_report()
             .await
@@ -1070,10 +1177,10 @@ mod virtual_observation_tests {
 async fn run_daily_pushes_dry_run() -> Result<(), String> {
     tokio::task::spawn_blocking(run_daily_pushes_dry_run_blocking)
         .await
-        .map_err(|error| format!("dry-run blocking task failed: {error}"))
+        .map_err(|error| format!("dry-run blocking task failed: {error}"))?
 }
 
-fn run_daily_pushes_dry_run_blocking() {
+fn run_daily_pushes_dry_run_blocking() -> Result<(), String> {
     use push_templates::{
         build_industry_chain_intraday_from_snapshot, build_intraday_market_from_snapshot,
         build_news_catalyst_from_snapshot, build_news_to_idea_from_snapshot,
@@ -1092,6 +1199,7 @@ fn run_daily_pushes_dry_run_blocking() {
     let date = now.format("%Y-%m-%d").to_string();
 
     log::info!("[v14.0 dry-run] 模式启动 ({} {})", date, hhmm);
+    let mut failures = Vec::new();
 
     // P-01 dry-run
 
@@ -1106,14 +1214,20 @@ fn run_daily_pushes_dry_run_blocking() {
                     log_dispatcher_attempt("P-01-dry", true, clusters.len(), "");
                     log::info!("[dry-run] P-01 OK: {} clusters", clusters.len());
                 }
-                Err(error) => log_dispatcher_attempt("P-01-dry", false, 0, &error),
+                Err(error) => {
+                    log_dispatcher_attempt("P-01-dry", false, 0, &error);
+                    failures.push(format!("P-01 build: {error}"));
+                }
             }
         }
         (Ok(_), Ok(_)) => {
             log_dispatcher_attempt("P-01-dry", false, 0, "no clusters/news");
             log::warn!("[dry-run] P-01 SKIP: no clusters/news");
         }
-        (Err(error), _) | (_, Err(error)) => log_dispatcher_attempt("P-01-dry", false, 0, &error),
+        (Err(error), _) | (_, Err(error)) => {
+            log_dispatcher_attempt("P-01-dry", false, 0, &error);
+            failures.push(format!("P-01 source: {error}"));
+        }
     }
 
     // I-01 dry-run
@@ -1138,7 +1252,10 @@ fn run_daily_pushes_dry_run_blocking() {
             log_dispatcher_attempt("I-01-dry", false, 0, "sector empty");
             log::warn!("[dry-run] I-01 SKIP: no sectors");
         }
-        Err(error) => log_dispatcher_attempt("I-01-dry", false, 0, &error),
+        Err(error) => {
+            log_dispatcher_attempt("I-01-dry", false, 0, &error);
+            failures.push(format!("I-01 source: {error}"));
+        }
     }
 
     // I-02/I-03/D-01/A-01 dry-run
@@ -1150,7 +1267,10 @@ fn run_daily_pushes_dry_run_blocking() {
             log::info!("[dry-run] I-02 OK: {} stocks", snapshot.stocks.len());
         }
         Ok(_) => log_dispatcher_attempt("I-02-dry", false, 0, "snapshot empty"),
-        Err(error) => log_dispatcher_attempt("I-02-dry", false, 0, &error),
+        Err(error) => {
+            log_dispatcher_attempt("I-02-dry", false, 0, &error);
+            failures.push(format!("I-02 source: {error}"));
+        }
     }
 
     let s3 = load_industry_chain_snapshot_real(&hhmm);
@@ -1162,7 +1282,10 @@ fn run_daily_pushes_dry_run_blocking() {
             log::info!("[dry-run] I-03 OK: chain={}", snapshot.chain);
         }
         Ok(_) => log_dispatcher_attempt("I-03-dry", false, 0, "snapshot empty"),
-        Err(error) => log_dispatcher_attempt("I-03-dry", false, 0, &error),
+        Err(error) => {
+            log_dispatcher_attempt("I-03-dry", false, 0, &error);
+            failures.push(format!("I-03 source: {error}"));
+        }
     }
 
     match load_news_to_idea_snapshot_real(&hhmm) {
@@ -1176,7 +1299,10 @@ fn run_daily_pushes_dry_run_blocking() {
             );
         }
         Ok(_) => log_dispatcher_attempt("D-01-dry", false, 0, "snapshot empty"),
-        Err(error) => log_dispatcher_attempt("D-01-dry", false, 0, &error),
+        Err(error) => {
+            log_dispatcher_attempt("D-01-dry", false, 0, &error);
+            failures.push(format!("D-01 source: {error}"));
+        }
     }
 
     match load_paper_review_snapshot_real(&date) {
@@ -1190,12 +1316,30 @@ fn run_daily_pushes_dry_run_blocking() {
             );
         }
         Ok(None) => log_dispatcher_attempt("A-01-dry", false, 0, "snapshot empty"),
-        Err(error) => log_dispatcher_attempt("A-01-dry", false, 0, &error),
+        Err(error) => {
+            log_dispatcher_attempt("A-01-dry", false, 0, &error);
+            failures.push(format!("A-01 source: {error}"));
+        }
     }
 
-    log::info!("[v14.0 dry-run] 完成 ({} {})", date, hhmm);
-
     log::info!("[v14.0 dry-run] 详见 data/dispatcher_log.jsonl");
+
+    if failures.is_empty() {
+        log::info!("[v14.0 dry-run] 完成 ({} {})", date, hhmm);
+        Ok(())
+    } else {
+        log::error!(
+            "[v14.0 dry-run] 失败 ({} {}) | {} 个 source/build failures",
+            date,
+            hhmm,
+            failures.len()
+        );
+        Err(format!(
+            "{} dispatcher source/build failures: {}",
+            failures.len(),
+            failures.join("; ")
+        ))
+    }
 }
 
 /// v17.6: 按当前时间窗触发 6 dispatcher
@@ -2620,6 +2764,65 @@ fn unexpected_jsonl_writer_completion(
     }
 }
 
+enum LongRunningTrigger {
+    MainLoopsCompleted,
+    ShutdownSignal(Result<(), String>),
+    WriterCompleted(Result<Result<(), stock_analysis::event::JsonlError>, tokio::task::JoinError>),
+}
+
+async fn supervise_long_running_lifecycle<MainLoops, ShutdownSignal>(
+    bus: &stock_analysis::event::EventBus,
+    writer_handle: &mut Option<JsonlWriterTask>,
+    background_tasks: Vec<(&'static str, tokio::task::JoinHandle<()>)>,
+    main_loops: MainLoops,
+    shutdown_signal: ShutdownSignal,
+) -> Result<(), String>
+where
+    MainLoops: std::future::Future<Output = ()>,
+    ShutdownSignal: std::future::Future<Output = Result<(), String>>,
+{
+    let trigger = {
+        let writer = writer_handle.as_mut().ok_or_else(|| {
+            "BR-141 writer handle is missing while monitor is running".to_string()
+        })?;
+        tokio::pin!(main_loops);
+        tokio::pin!(shutdown_signal);
+        tokio::select! {
+            _ = &mut main_loops => LongRunningTrigger::MainLoopsCompleted,
+            signal = &mut shutdown_signal => LongRunningTrigger::ShutdownSignal(signal),
+            result = writer => LongRunningTrigger::WriterCompleted(result),
+        }
+    };
+
+    let producer_shutdown = quiesce_background_tasks(background_tasks).await;
+    let trigger = match trigger {
+        LongRunningTrigger::WriterCompleted(result) => {
+            writer_handle.take();
+            bus.shutdown();
+            let writer_error = unexpected_jsonl_writer_completion(result);
+            return match producer_shutdown {
+                Ok(()) => Err(writer_error),
+                Err(producer_error) => Err(format!(
+                    "{writer_error}; producer shutdown failed: {producer_error}"
+                )),
+            };
+        }
+        other => other,
+    };
+
+    let writer_shutdown = shutdown_jsonl_writer(bus, writer_handle).await;
+    producer_shutdown?;
+    writer_shutdown?;
+
+    match trigger {
+        LongRunningTrigger::ShutdownSignal(result) => result,
+        LongRunningTrigger::MainLoopsCompleted => {
+            Err("long-running monitor loops completed unexpectedly".to_string())
+        }
+        LongRunningTrigger::WriterCompleted(_) => unreachable!("handled before writer drain"),
+    }
+}
+
 async fn exit_after_jsonl_writer(
     bus: &stock_analysis::event::EventBus,
     handle: &mut Option<JsonlWriterTask>,
@@ -3082,11 +3285,16 @@ async fn main() {
 
         use stock_analysis::opportunity::news_outcome::backfill_recommendations_outcome;
 
-        let updated = backfill_recommendations_outcome(&date);
-
-        log::info!("[v70+] 回填完成 | {} | 更新行数 = {}", date, updated);
-
-        exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, 0).await;
+        match backfill_recommendations_outcome(&date) {
+            Ok(updated) => {
+                log::info!("[v70+] 回填完成 | {} | 更新行数 = {}", date, updated);
+                exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, 0).await;
+            }
+            Err(error) => {
+                log::error!("[v70+] 回填失败 | {} | {}", date, error);
+                exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, 2).await;
+            }
+        }
     }
 
     // v14.1 F7: stock_position.st_type 回填 (从 name LIKE 推断)
@@ -3357,57 +3565,27 @@ async fn main() {
             ("post_session_review", post_session_review),
         ];
 
-        let writer_completion = {
-            let writer_handle = jsonl_writer_handle
-                .as_mut()
-                .expect("BR-141 writer handle must exist while monitor is running");
-
-            tokio::select! {
-
-                _ = main_loops => None,
-
-                _ = tokio::signal::ctrl_c() => {
-
-                    log::warn!("收到 SIGINT，正在优雅关闭监控...");
-
-                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-
-                    log::info!("监控已安全关闭");
-
-                    None
-                },
-
-                result = writer_handle => Some(result),
-            }
+        let shutdown_signal = async {
+            tokio::signal::ctrl_c()
+                .await
+                .map_err(|error| format!("install/receive SIGINT handler: {error}"))?;
+            log::warn!("收到 SIGINT，正在优雅关闭监控...");
+            Ok(())
         };
-
-        let producer_shutdown = quiesce_background_tasks(background_tasks).await;
-
-        if let Some(result) = writer_completion {
-            jsonl_writer_handle.take();
-            bus.shutdown();
-            if let Err(error) = producer_shutdown {
-                log::error!("[BR-141] producer shutdown failed: {error}");
-            }
-            log::error!(
-                "[event_bus.jsonl][BR-141] {}",
-                unexpected_jsonl_writer_completion(result)
-            );
+        if let Err(error) = supervise_long_running_lifecycle(
+            bus,
+            &mut jsonl_writer_handle,
+            background_tasks,
+            main_loops,
+            shutdown_signal,
+        )
+        .await
+        {
+            log::error!("[BR-141] monitor lifecycle failed: {error}");
             log::logger().flush();
             std::process::exit(2);
         }
-
-        let writer_shutdown = shutdown_jsonl_writer(bus, &mut jsonl_writer_handle).await;
-        if let Err(error) = producer_shutdown {
-            log::error!("[BR-141] producer shutdown failed: {error}");
-            log::logger().flush();
-            std::process::exit(2);
-        }
-        if let Err(error) = writer_shutdown {
-            log::error!("[event_bus.jsonl] shutdown failed: {error}");
-            log::logger().flush();
-            std::process::exit(2);
-        }
+        log::info!("监控已安全关闭");
     }
 }
 
@@ -4736,12 +4914,10 @@ async fn e2e_all_templates_run() -> Result<(), String> {
         .map_err(|error| format!("E2E seed 失败，终止全模板测试: {error}"))?;
     seed_isolated_e2e_banner()?;
 
-    // Exercise the production dry-run assemblers against the same isolated
-    // TEST_CODE database before any delivery attempt. Missing optional local
-    // snapshots remain explicit skip decisions and never trigger external I/O.
-    run_daily_pushes_dry_run()
-        .await
-        .map_err(|error| format!("E2E dry-run 装配失败: {error}"))?;
+    // Production dry-run assemblers require real six-digit symbols and may use
+    // live providers. BR-051 keeps them out of this TEST_CODE-only E2E path;
+    // `--push-dry-run` has its own isolated process contract test.
+    log::info!("[v70][BR-051] production dry-run assemblers skipped in TEST_CODE E2E");
 
     // 2. 跑 v12 §14.3 盘后复盘 (R-01~R-08) + v18 放量
 
@@ -9531,33 +9707,37 @@ mod tests_post_session_review_scheduler {
     #[test]
     fn br139_long_running_branch_starts_review_scheduler() {
         let source = include_str!("main.rs");
+        let production = source
+            .split("mod tests_post_session_review_scheduler")
+            .next()
+            .expect("production source precedes scheduler tests");
         assert_eq!(
-            source
+            production
                 .matches("let post_close_news = tokio::spawn(post_close_news_scheduler());")
                 .count(),
             1,
             "the long-running branch must own the post-close news scheduler"
         );
         assert_eq!(
-            source
+            production
                 .matches("let post_session_review = spawn_post_session_review_scheduler();")
                 .count(),
             1,
             "the long-running branch must own the post-session review scheduler"
         );
         assert!(
-            !source.contains("let _intraday_handle = tokio::spawn"),
+            !production.contains("let _intraday_handle = tokio::spawn"),
             "the intraday producer must remain inside the cancellable main-loop future"
         );
         let dispatcher_call = ["push_templates::", "dispatch_post_session_review("].concat();
         assert_eq!(
-            source.matches(&dispatcher_call).count(),
+            production.matches(&dispatcher_call).count(),
             1,
             "the strict inner runner must be the only production dispatcher owner"
         );
         let stale_owner = ["evening_", "pushed"].concat();
         assert!(
-            !source.contains(&stale_owner),
+            !production.contains(&stale_owner),
             "the stale monitor-loop review owner must not return"
         );
     }

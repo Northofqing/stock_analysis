@@ -330,19 +330,19 @@ review result is recorded before this checkbox is completed.
 - Modify: `src/bin/monitor/main.rs`
 - Modify: `tests/monitor_help_isolation.rs`
 
-- [ ] **Step 1: Replace the unsafe sender slot**
+- [x] **Step 1: Replace the unsafe sender slot**
 
 Use `RwLock<Option<broadcast::Sender<_>>>` so publish/subscribe/count cannot race
 shutdown. Remove the manual `unsafe impl Send/Sync`; a publish that observes the
 closed slot must return `Rejected(ShuttingDown)`.
 
-- [ ] **Step 2: Test concurrent shutdown**
+- [x] **Step 2: Test concurrent shutdown**
 
 Run publishers and shutdown on separate threads behind a barrier. Require no
 panic, no invalid result, all post-close publishes rejected, and one idempotent
 shutdown path.
 
-- [ ] **Step 3: Close explicit-mode fallthrough**
+- [x] **Step 3: Close explicit-mode fallthrough**
 
 Keep registered push/backfill flags known to the event parser, reject
 `--v13-diag` without `--test` before runtime initialization, and add a final
@@ -354,16 +354,57 @@ Run focused tests and all repository gates again, then request independent
 review of the final commit range. Critical and Important findings must both be
 zero before PR creation.
 
-- [ ] **Step 5: Quiesce producers and bound writer drain**
+- [x] **Step 5: Quiesce producers and bound writer drain**
 
 Own every long-running spawned task handle. Remove nested detached notification
 producers, cancel and await owned producers before bus close, and give writer
 drain a ten-second timeout that aborts and reports exit 2. Unit-test timeout and
 all unexpected writer completion classifications.
 
-- [ ] **Step 6: Enforce process isolation and audit ownership**
+- [x] **Step 6: Enforce process isolation and audit ownership**
 
 All monitor process tests must construct commands through one helper that clears
 `EVENT_AUDIT_DIR` and `PUSH_LOG_DIR`. Document that JSONL is a non-authoritative
 replay projection after the existing hash-chained, synced delivery audit; it is
 not a replacement for the red-line 2.7 owner.
+
+### Task 7: Close final-review audit and truthful-handler findings
+
+**Files:**
+- Modify: `src/event/dispatcher.rs`
+- Modify: `src/bin/monitor/main.rs`
+- Modify: `src/bin/monitor/dryrun_report.rs`
+- Modify: `src/opportunity/news_outcome.rs`
+- Modify: `tests/monitor_help_isolation.rs`
+
+- [x] **Step 1: Make the authoritative delivery audit cross-process safe**
+
+Namespace every audit override under test/prod. Hold a per-year OS lock across
+full-chain revalidation, append, flush and `sync_data`; reject incomplete tails.
+Prove four independent process writers produce one valid chain.
+
+- [x] **Step 2: Extract and exercise the lifecycle supervisor**
+
+Use one injectable state machine for main-loop completion, signal result and
+writer completion. Prove producer cancellation precedes bus close/writer drain,
+runtime writer failure is terminal, and unexpected main-loop completion fails.
+
+- [x] **Step 3: Make restored one-shot handlers truthful**
+
+Strictly parse and normalize outcome-backfill dates, propagate source/K-line/
+write failures, aggregate push-dry-run source/build errors, and keep production
+assemblers out of TEST_CODE E2E. Cover malformed/path-traversal dates, corrupt
+input, every registered handler marker and exit-code mapping in isolated
+processes.
+
+- [x] **Step 4: Clear inherited runtime paths and credentials in process tests**
+
+The shared command builder clears database, audit, dispatcher, review, push,
+environment-mode and notification/Magiclaw overrides before each test applies
+its explicit isolated values.
+
+- [ ] **Step 5: Repeat all gates and obtain a clean independent review**
+
+Repeat focused tests, full workspace tests, compliance, coverage, release build
+and canary after these changes. Do not create the PR until independent review
+reports zero Critical and zero Important findings.

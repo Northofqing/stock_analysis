@@ -8,8 +8,17 @@ fn isolated_monitor_command(root: &std::path::Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_monitor"));
     command.current_dir(root);
     for key in [
+        "DATABASE_PATH",
+        "MAGICLAW_DB_PATH",
+        "MONITOR_ENABLED",
+        "STOCK_ENV_MODE",
+        "V10_DRY_RUN_PUSH",
+        "V12_E2E_REAL_PUSH",
+        "STOCK_ANALYSIS_PUSH_V6_ENABLE",
         "EVENT_AUDIT_DIR",
         "PUSH_LOG_DIR",
+        "DISPATCHER_LOG_DIR",
+        "REVIEW_AUDIT_DIR",
         "ALERT_WEBHOOK_URL",
         "CUSTOM_WEBHOOK_URL",
         "DINGTALK_WEBHOOK",
@@ -19,6 +28,12 @@ fn isolated_monitor_command(root: &std::path::Path) -> Command {
         "FEISHU_TO",
         "FEISHU_WEBHOOK",
         "FEISHU_WEBHOOK_URL",
+        "MAGICLAW_API_ADDR",
+        "MAGICLAW_API_TOKEN",
+        "MAGICLAW_BIN",
+        "MAGICLAW_HOME",
+        "MAGICLAW_PROJECT_ID",
+        "MAGICLAW_SEND_TYPE",
         "SERVER_CHAN_KEY",
         "SLACK_WEBHOOK",
         "TELEGRAM_BOT_TOKEN",
@@ -468,6 +483,119 @@ fn unknown_explicit_flag_never_enters_long_running_service() {
     assert!(combined_output.contains("[event] CLI error"));
     assert!(!combined_output.contains("等待交易时段"));
     std::fs::remove_dir_all(root).expect("remove isolated CLI directory");
+}
+
+#[test]
+fn invalid_or_corrupt_outcome_backfill_is_never_reported_as_success() {
+    let invalid_root = std::env::temp_dir().join(format!(
+        "monitor-invalid-backfill-date-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&invalid_root).expect("create invalid backfill directory");
+    for flag in ["--backfill-outcome=", "--backfill-outcome=../../escape"] {
+        let output = isolated_monitor_command(&invalid_root)
+            .arg(flag)
+            .env("DATABASE_PATH", invalid_root.join("invalid.db"))
+            .env_remove("MONITOR_ENABLED")
+            .output()
+            .expect("run invalid outcome backfill");
+        let combined_output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.status.code(), Some(1), "output={combined_output}");
+        assert!(
+            combined_output.contains("malformed date"),
+            "{combined_output}"
+        );
+    }
+    std::fs::remove_dir_all(invalid_root).expect("remove invalid backfill directory");
+
+    let corrupt_root =
+        std::env::temp_dir().join(format!("monitor-corrupt-backfill-{}", std::process::id()));
+    let source_dir = corrupt_root.join("data/d01_recommendations");
+    std::fs::create_dir_all(&source_dir).expect("create corrupt outcome directory");
+    std::fs::write(source_dir.join("2026-07-21.jsonl"), b"{not-json}\n")
+        .expect("seed corrupt outcome file");
+    let output = isolated_monitor_command(&corrupt_root)
+        .arg("--backfill-outcome=2026-07-21")
+        .env("DATABASE_PATH", corrupt_root.join("corrupt.db"))
+        .env_remove("MONITOR_ENABLED")
+        .output()
+        .expect("run corrupt outcome backfill");
+    let combined_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(2), "output={combined_output}");
+    assert!(
+        combined_output.contains("[v70+] 回填失败"),
+        "{combined_output}"
+    );
+    assert!(!combined_output.contains("[v70+] 回填完成"));
+    std::fs::remove_dir_all(corrupt_root).expect("remove corrupt backfill directory");
+}
+
+#[test]
+fn registered_push_and_backfill_flags_reach_truthful_terminal_handlers() {
+    for (label, flag, marker) in [
+        ("st", "--backfill-st-type", "--backfill-st-type 模式启动"),
+        (
+            "chain",
+            "--backfill-chain-name",
+            "--backfill-chain-name 模式启动",
+        ),
+        (
+            "outcome",
+            "--backfill-outcome=2099-12-31",
+            "--backfill-outcome 模式启动",
+        ),
+    ] {
+        let root =
+            std::env::temp_dir().join(format!("monitor-handler-{label}-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("create handler directory");
+        let output = isolated_monitor_command(&root)
+            .arg(flag)
+            .env("DATABASE_PATH", root.join("handler.db"))
+            .env_remove("MONITOR_ENABLED")
+            .output()
+            .expect("run registered handler");
+        let combined_output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.status.success(), "output={combined_output}");
+        assert!(combined_output.contains(marker), "output={combined_output}");
+        assert!(!combined_output.contains("等待交易时段"));
+        std::fs::remove_dir_all(root).expect("remove handler directory");
+    }
+
+    let root = std::env::temp_dir().join(format!("monitor-handler-dry-run-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("create dry-run handler directory");
+    let output = isolated_monitor_command(&root)
+        .arg("--push-dry-run")
+        .env("DATABASE_PATH", root.join("dry-run.db"))
+        .env_remove("MONITOR_ENABLED")
+        .output()
+        .expect("run push dry-run handler");
+    let combined_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined_output.contains("--push-dry-run 模式启动"));
+    if combined_output.contains("--push-dry-run 失败") {
+        assert_eq!(output.status.code(), Some(2), "output={combined_output}");
+        assert!(!combined_output.contains("--push-dry-run 完成"));
+    } else {
+        assert!(output.status.success(), "output={combined_output}");
+        assert!(combined_output.contains("--push-dry-run 完成"));
+    }
+    assert!(!combined_output.contains("等待交易时段"));
+    std::fs::remove_dir_all(root).expect("remove dry-run handler directory");
 }
 
 #[test]

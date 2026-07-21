@@ -1,4 +1,4 @@
-//! Registered business rules: BR-043, BR-091, BR-111, BR-130.
+//! Registered business rules: BR-043, BR-091, BR-111, BR-130, BR-141.
 //! Exact-match dispatcher registry — v17.1-r2 Task 3
 //!
 //! Provides a `Dispatcher` trait, `DispatcherRegistry` with exact-match routing,
@@ -140,8 +140,6 @@ pub struct AuditDispatcher {
 
 #[derive(Debug, Default)]
 struct AuditChainState {
-    year: Option<String>,
-    last_hash: Option<String>,
     poisoned: Option<String>,
 }
 
@@ -157,24 +155,26 @@ impl AuditDispatcher {
 
     /// Runtime constructor with BR-051 test/prod path isolation.
     pub fn for_runtime() -> Self {
-        let base_dir = std::env::var("EVENT_AUDIT_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                if crate::risk::env_guard::runtime_is_test_process() {
+        let runtime_test = crate::risk::env_guard::runtime_is_test_process();
+        let environment_test =
+            crate::risk::env_guard::current_env() == crate::risk::env_guard::TradingEnv::Test;
+        let base_dir = match std::env::var("EVENT_AUDIT_DIR").ok().map(PathBuf::from) {
+            Some(base) => namespace_event_audit_override(base, runtime_test || environment_test),
+            None => {
+                if runtime_test {
                     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
                     std::env::temp_dir().join(format!(
                         "stock-analysis-event-audit-test-{}-{}",
                         std::process::id(),
                         SEQUENCE.fetch_add(1, Ordering::Relaxed)
                     ))
-                } else if crate::risk::env_guard::current_env()
-                    == crate::risk::env_guard::TradingEnv::Test
-                {
+                } else if environment_test {
                     PathBuf::from("data/test/event_audit")
                 } else {
                     PathBuf::from("data/event_audit")
                 }
-            });
+            }
+        };
         Self::new(base_dir)
     }
 
@@ -184,12 +184,14 @@ impl AuditDispatcher {
     }
 
     fn persist(&self, envelope: &EventEnvelope) -> Result<(), String> {
+        use fs2::FileExt;
         use sha2::{Digest, Sha256};
 
         fs::create_dir_all(&self.base_dir)
             .map_err(|error| format!("create {}: {error}", self.base_dir.display()))?;
         let year = envelope.ts.format("%Y").to_string();
         let path = self.base_dir.join(format!("{year}.jsonl"));
+        let lock_path = self.base_dir.join(format!("{year}.lock"));
         let mut state = self
             .chain_state
             .lock()
@@ -199,37 +201,38 @@ impl AuditDispatcher {
                 "audit chain is poisoned after an earlier persistence failure: {reason}"
             ));
         }
-        if state.year.as_deref() != Some(&year) {
-            state.last_hash = match validate_existing_chain(&path) {
-                Ok(last_hash) => last_hash,
-                Err(error) => {
-                    state.poisoned = Some(error.clone());
-                    return Err(error);
-                }
-            };
-            state.year = Some(year);
-        }
-
-        let previous_hash = state
-            .last_hash
-            .clone()
-            .unwrap_or_else(|| "GENESIS".to_string());
-        let mut record = serde_json::json!({
-            "envelope": envelope,
-            "previous_hash": previous_hash,
-        });
-        let canonical = serde_json::to_vec(&record)
-            .map_err(|error| format!("serialize audit record: {error}"))?;
-        let record_hash = format!("{:x}", Sha256::digest(&canonical));
-        record.as_object_mut().expect("json object literal").insert(
-            "record_hash".to_string(),
-            serde_json::Value::String(record_hash.clone()),
-        );
-        let mut line = serde_json::to_vec(&record)
-            .map_err(|error| format!("serialize audit line: {error}"))?;
-        line.push(b'\n');
 
         let persistence_result = (|| -> Result<(), String> {
+            let lock_file = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .map_err(|error| format!("open audit lock {}: {error}", lock_path.display()))?;
+            FileExt::lock_exclusive(&lock_file)
+                .map_err(|error| format!("lock audit {}: {error}", lock_path.display()))?;
+
+            // The kernel lock spans full-chain validation, append and fsync.
+            // Revalidate on every append because another monitor process may
+            // have extended the chain since this dispatcher last wrote.
+            let previous_hash =
+                validate_existing_chain(&path)?.unwrap_or_else(|| "GENESIS".to_string());
+            let mut record = serde_json::json!({
+                "envelope": envelope,
+                "previous_hash": previous_hash,
+            });
+            let canonical = serde_json::to_vec(&record)
+                .map_err(|error| format!("serialize audit record: {error}"))?;
+            let record_hash = format!("{:x}", Sha256::digest(&canonical));
+            record.as_object_mut().expect("json object literal").insert(
+                "record_hash".to_string(),
+                serde_json::Value::String(record_hash.clone()),
+            );
+            let mut line = serde_json::to_vec(&record)
+                .map_err(|error| format!("serialize audit line: {error}"))?;
+            line.push(b'\n');
+
             let mut file = OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -241,15 +244,22 @@ impl AuditDispatcher {
                 .map_err(|error| format!("flush {}: {error}", path.display()))?;
             file.sync_data()
                 .map_err(|error| format!("sync {}: {error}", path.display()))?;
+            FileExt::unlock(&lock_file)
+                .map_err(|error| format!("unlock audit {}: {error}", lock_path.display()))?;
             Ok(())
         })();
-        if let Err(error) = persistence_result {
-            state.poisoned = Some(error.clone());
-            return Err(error);
+        match persistence_result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                state.poisoned = Some(error.clone());
+                Err(error)
+            }
         }
-        state.last_hash = Some(record_hash);
-        Ok(())
     }
+}
+
+fn namespace_event_audit_override(base: PathBuf, is_test: bool) -> PathBuf {
+    base.join(if is_test { "test" } else { "prod" })
 }
 
 impl Default for AuditDispatcher {
@@ -266,6 +276,12 @@ fn validate_existing_chain(path: &Path) -> Result<Option<String>, String> {
     }
     let content = fs::read_to_string(path)
         .map_err(|error| format!("read existing audit {}: {error}", path.display()))?;
+    if !content.is_empty() && !content.ends_with('\n') {
+        return Err(format!(
+            "audit {} has an incomplete trailing record",
+            path.display()
+        ));
+    }
     let mut expected_parent = "GENESIS".to_string();
     let mut last_hash = None;
     for (index, line) in content.lines().enumerate() {
@@ -624,6 +640,90 @@ mod tests {
         let path = dir.join(format!("{}.jsonl", chrono::Local::now().format("%Y")));
         assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 2);
         assert!(validate_existing_chain(&path).unwrap().is_some());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn br141_event_audit_override_has_physical_test_prod_namespaces() {
+        let base = PathBuf::from("audit-override");
+        assert_eq!(
+            namespace_event_audit_override(base.clone(), true),
+            base.join("test")
+        );
+        assert_eq!(
+            namespace_event_audit_override(base.clone(), false),
+            base.join("prod")
+        );
+    }
+
+    #[test]
+    fn br141_existing_valid_record_without_newline_is_rejected() {
+        let dir = std::env::temp_dir().join(format!(
+            "audit-dispatcher-tail-{}-{}",
+            std::process::id(),
+            chrono::Local::now().timestamp_nanos_opt().unwrap()
+        ));
+        let first = AuditDispatcher::new(&dir);
+        assert_eq!(
+            first.dispatch(test_envelope_type("push.delivery.audit")),
+            DispatchResult::Handled
+        );
+        drop(first);
+
+        let path = dir.join(format!("{}.jsonl", chrono::Local::now().format("%Y")));
+        let complete = fs::read_to_string(&path).unwrap();
+        fs::write(&path, complete.strip_suffix('\n').unwrap()).unwrap();
+        let second = AuditDispatcher::new(&dir);
+        let result = second.dispatch(test_envelope_type("push.delivery.audit"));
+        assert!(
+            matches!(result, DispatchResult::Failed(error) if error.contains("incomplete trailing record"))
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[ignore = "invoked as a child by the cross-process audit locking test"]
+    fn br141_event_audit_process_writer_helper() {
+        let Ok(dir) = std::env::var("BR141_EVENT_AUDIT_HELPER_DIR") else {
+            return;
+        };
+        let identity = std::env::var("BR141_EVENT_AUDIT_HELPER_ID").unwrap();
+        let mut envelope = test_envelope_type("push.delivery.audit");
+        envelope.id = format!("event-audit-{identity}");
+        let dispatcher = AuditDispatcher::new(dir);
+        assert_eq!(dispatcher.dispatch(envelope), DispatchResult::Handled);
+    }
+
+    #[test]
+    fn br141_event_audit_serializes_independent_process_writers() {
+        let dir = std::env::temp_dir().join(format!(
+            "audit-dispatcher-process-{}-{}",
+            std::process::id(),
+            chrono::Local::now().timestamp_nanos_opt().unwrap()
+        ));
+        let executable = std::env::current_exe().unwrap();
+        let mut children = (0..4)
+            .map(|index| {
+                std::process::Command::new(&executable)
+                    .args([
+                        "--exact",
+                        "event::dispatcher::tests::br141_event_audit_process_writer_helper",
+                        "--ignored",
+                    ])
+                    .env("BR141_EVENT_AUDIT_HELPER_DIR", &dir)
+                    .env("BR141_EVENT_AUDIT_HELPER_ID", format!("writer-{index}"))
+                    .spawn()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        for child in &mut children {
+            assert!(child.wait().unwrap().success());
+        }
+
+        let path = dir.join(format!("{}.jsonl", chrono::Local::now().format("%Y")));
+        assert!(validate_existing_chain(&path).unwrap().is_some());
+        assert_eq!(fs::read_to_string(path).unwrap().lines().count(), 4);
         fs::remove_dir_all(dir).unwrap();
     }
 

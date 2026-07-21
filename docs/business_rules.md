@@ -3,6 +3,8 @@
 > Per AGENTS.md §2.10: "Logic involving dedup / mutex / filter / sort / limit MUST be registered in docs/business_rules.md first."
 > Each BR has a stable ID (BR-NNN), a one-line intent, and a code pointer.
 
+BR-141 addendum: `--backfill-outcome` only accepts a strict `YYYY-MM-DD`; the parsed date is re-formatted before path construction, and source parsing, K-line acquisition, or writeback failure is non-zero. `--push-dry-run` aggregates every real source/build error; TEST_CODE E2E must not invoke production assemblers that require real-symbol protocols or external providers. The authoritative delivery audit appends `test/` or `prod/` to every `EVENT_AUDIT_DIR` override, and a per-year OS lock spans full-chain revalidation, append, flush, and `sync_data`; missing trailing newline, partial rows, or hash mismatch reject extension. The injectable service supervisor treats writer completion, main-loop completion, and signal failure as explicit lifecycle results, cancels and awaits producers before bus close, and drains the writer last. Process tests clear database, audit, dispatcher, review, push, and notification overrides. Code: `src/event/dispatcher.rs`, `src/bin/monitor/main.rs`, `src/bin/monitor/dryrun_report.rs`, `src/opportunity/news_outcome.rs`, `tests/monitor_help_isolation.rs`.
+
 | BR ID | Status | Intent | Code |
 |-------|--------|--------|------|
 | BR-052 | ✅ registered | Day-level HTTP cache for sector exclusion boards — same-day reuse avoids 600 HTTP calls per review cycle | `src/decision/exclusion.rs:30-50` (`cached_exclusion_map` + `EXCLUSION_MAP_CACHE`) |
