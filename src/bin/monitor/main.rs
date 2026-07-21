@@ -4954,6 +4954,63 @@ async fn run_review_deep_analysis(
 
 /// 窗口：盘前08:00-09:30、盘中09:30-15:00、盘后15:00-22:00。
 
+fn build_announcement_audience_codes(
+    position_codes: &[String],
+    oldest_source_time: Option<chrono::DateTime<chrono::Local>>,
+    registered_watch_codes: &std::collections::HashSet<String>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<std::collections::HashSet<String>, String> {
+    if position_codes.iter().any(|code| code.trim().is_empty())
+        || registered_watch_codes
+            .iter()
+            .any(|code| code.trim().is_empty())
+    {
+        return Err("BR-138 公告受众代码为空".to_string());
+    }
+
+    if !position_codes.is_empty() {
+        let source_time = oldest_source_time
+            .ok_or_else(|| "BR-138 真实持仓缺少来源时间，公告受众已阻断".to_string())?;
+        if !stock_analysis::portfolio::position_source_is_fresh(source_time, now) {
+            return Err("BR-138 真实持仓超过 30 秒新鲜度，公告受众已阻断".to_string());
+        }
+    }
+
+    let mut audience = registered_watch_codes.clone();
+    audience.extend(position_codes.iter().cloned());
+    Ok(audience)
+}
+
+fn load_fresh_announcement_audience_codes(
+    registered_watch_codes: &std::collections::HashSet<String>,
+) -> (std::collections::HashSet<String>, Option<String>) {
+    let audience = stock_analysis::portfolio::get_positions_with_source_time().and_then(
+        |(positions, oldest_source_time)| {
+            let position_codes: Vec<String> = positions
+                .into_iter()
+                .map(|position| position.code)
+                .collect();
+            build_announcement_audience_codes(
+                &position_codes,
+                oldest_source_time,
+                registered_watch_codes,
+                chrono::Utc::now(),
+            )
+        },
+    );
+    isolate_announcement_position_failure(audience, registered_watch_codes)
+}
+
+fn isolate_announcement_position_failure(
+    audience: Result<std::collections::HashSet<String>, String>,
+    registered_watch_codes: &std::collections::HashSet<String>,
+) -> (std::collections::HashSet<String>, Option<String>) {
+    match audience {
+        Ok(audience) => (audience, None),
+        Err(error) => (registered_watch_codes.clone(), Some(error)),
+    }
+}
+
 async fn news_monitor_loop() {
     use stock_analysis::monitor::detector::AlertEvent;
 
@@ -5007,6 +5064,23 @@ async fn news_monitor_loop() {
     };
 
     log::info!("[NewsMonitor] L2 标的池: {} 只", our_codes.len());
+
+    // BR-138: 公告即时推送只面向真实持仓和显式自选。持仓会在每轮路由前
+    // 重新读取并执行 30 秒新鲜度门；这里仅保存独立自选集合。
+    let registered_watch_codes: std::collections::HashSet<String> = loop {
+        match stock_analysis::portfolio::get_watchlist() {
+            Ok(watchlist) => {
+                break watchlist
+                    .into_iter()
+                    .map(|position| position.code)
+                    .collect()
+            }
+            Err(error) => {
+                log::error!("[NewsMonitor][BR-138] 自选池加载失败，60 秒后重试: {error}");
+                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+            }
+        }
+    };
 
     // v17.4 §5.1 (BR-082): NewsFlashGate — critical 即时推 + 4 时段聚合 Top3
     let mut news_flash_gate =
@@ -5127,102 +5201,87 @@ async fn news_monitor_loop() {
             evaluate_account_mode_hook(false).await;
         }
 
-        // 公告扫描（仅网络拉取在 spawn_blocking，处理在主线程）
+        let mut pushed: Vec<AlertEvent> = Vec::new();
 
-        if !stock_analysis::config::announcement_keywords_available() {
-            log::error!("[NewsMonitor][BR-138] 公告关键词配置不可用，本轮公告批次显式跳过");
-            tokio::time::sleep(tokio::time::Duration::from_secs(poll_secs)).await;
-            continue;
-        }
-
-        // v13.10.1: fetch_announcements 改 async, news_monitor_loop 已在 tokio 运行时内
-
-        // (由 tokio::join! 启动), 直接 .await 即可. review #15 用的 Handle::current().block_on
-
-        // 会 panic (Cannot start a runtime from within a runtime).
-
-        let anns =
+        // BR-138: 公告失败只隔离公告子链路，不得跳过同轮的产业链调度、每日重置、
+        // 去重落盘或 banner 刷新。生产 provider 自身负责配置 fail-closed。
+        let announcements =
             match stock_analysis::data_provider::announcement::fetch_announcements(None).await {
-                Ok(announcements) => announcements,
+                Ok(announcements) => Some(announcements),
                 Err(error) => {
-                    log::error!("[NewsMonitor] 公告批次获取失败: {}", error);
-                    tokio::time::sleep(tokio::time::Duration::from_secs(poll_secs)).await;
-                    continue;
+                    log::error!("[NewsMonitor][BR-138] 公告批次获取失败，本轮公告隔离: {error}");
+                    None
                 }
             };
 
-        // 异步预解析：公告API缺失code时，通过东方财富搜索反查
+        if let Some(anns) = announcements {
+            let (announcement_audience_codes, position_audience_error) =
+                load_fresh_announcement_audience_codes(&registered_watch_codes);
+            if let Some(error) = position_audience_error {
+                log::warn!("[NewsMonitor][BR-138] {error}; 过期持仓身份已排除，独立自选受众继续");
+            }
 
-        let mut resolved_codes: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-
-        {
-            let http = match reqwest::Client::builder()
+            // 异步预解析：公告 API 缺失 code 时，通过东方财富搜索反查。
+            let mut resolved_codes: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            match reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
                 .build()
             {
-                Ok(client) => client,
-                Err(error) => {
-                    log::error!("[NewsMonitor] 公告名称反查客户端初始化失败: {}", error);
-                    tokio::time::sleep(tokio::time::Duration::from_secs(poll_secs)).await;
-                    continue;
-                }
-            };
-
-            for ann in &anns {
-                if ann.code.is_empty() && !ann.name.is_empty() {
-                    // 先查本地缓存
-
-                    if let Some(code) = nm.linker_ref().lookup_code_by_name(&ann.name) {
-                        resolved_codes.insert(ann.name.clone(), code.to_string());
-                    } else if let Some(code) =
-                        stock_analysis::monitor::news_monitor::resolve_code_by_name(
-                            &ann.name, &http,
-                        )
-                        .await
-                    {
-                        log::info!("[NewsMonitor] 反查 {} → {}", ann.name, code);
-
-                        resolved_codes.insert(ann.name.clone(), code);
+                Ok(http) => {
+                    for ann in &anns {
+                        if ann.code.is_empty() && !ann.name.is_empty() {
+                            if let Some(code) = nm.linker_ref().lookup_code_by_name(&ann.name) {
+                                resolved_codes.insert(ann.name.clone(), code.to_string());
+                            } else if let Some(code) =
+                                stock_analysis::monitor::news_monitor::resolve_code_by_name(
+                                    &ann.name, &http,
+                                )
+                                .await
+                            {
+                                log::info!("[NewsMonitor] 反查 {} → {}", ann.name, code);
+                                resolved_codes.insert(ann.name.clone(), code);
+                            }
+                        }
                     }
                 }
+                Err(error) => log::error!(
+                    "[NewsMonitor][BR-138] 公告名称反查客户端初始化失败，缺代码公告保持显式缺失: {error}"
+                ),
             }
-        }
 
-        let events = nm.process_announcements(&anns, &resolved_codes);
+            let events = nm.process_announcements(&anns, &resolved_codes);
 
-        // BR-112/BR-137: successfully classified announcements have exactly one
-        // governed owner. Every normalized outcome remains explicit; legacy is
-        // retained only for classification failures, never as an outcome fallback.
-        let announcement_route = v17_sources::route_announcements(&anns, &our_codes).await;
-        let handled_external_ids = announcement_route.handled_external_ids;
-        log::info!(
-            "[公告][BR-137] attempted={} classified={} pushed={} skipped={} failed={}",
-            announcement_route.source.attempted,
-            announcement_route.source.classified,
-            announcement_route.source.pushed,
-            announcement_route.source.skipped,
-            announcement_route.source.failed
-        );
+            // BR-112/BR-137: successfully classified announcements have exactly one
+            // governed owner. Every normalized outcome remains explicit; legacy is
+            // retained only for classification failures, never as an outcome fallback.
+            let announcement_route =
+                v17_sources::route_announcements(&anns, &announcement_audience_codes).await;
+            let handled_external_ids = announcement_route.handled_external_ids;
+            log::info!(
+                "[公告][BR-137][BR-138] attempted={} classified={} pushed={} skipped={} failed={} audience={}",
+                announcement_route.source.attempted,
+                announcement_route.source.classified,
+                announcement_route.source.pushed,
+                announcement_route.source.skipped,
+                announcement_route.source.failed,
+                announcement_audience_codes.len()
+            );
 
-        let mut pushed: Vec<AlertEvent> = Vec::new();
-
-        for e in events {
-            if let Some(ev) = sm.process(e) {
-                // v17.7: Skip legacy push if this event was routed through v17_sources
-                if ev
-                    .routed_external_id
-                    .as_ref()
-                    .map(|id| handled_external_ids.contains(id))
-                    .unwrap_or(false)
-                {
-                    log::debug!("[公告][BR-137] legacy push skipped: normalized owner exists");
-                } else {
-                    let ev = push(ev).await;
-                    pushed.push(ev);
-                    continue;
+            for event in events {
+                if let Some(alert) = sm.process(event) {
+                    if alert
+                        .routed_external_id
+                        .as_ref()
+                        .map(|id| handled_external_ids.contains(id))
+                        .unwrap_or(false)
+                    {
+                        log::debug!("[公告][BR-137] legacy push skipped: normalized owner exists");
+                        pushed.push(alert);
+                    } else {
+                        pushed.push(push(alert).await);
+                    }
                 }
-                pushed.push(ev);
             }
         }
 
@@ -8619,9 +8678,52 @@ mod tests_v17_3_integration {
 #[cfg(test)]
 mod tests_v17_7_announcement_wiring {
     use super::*;
-    use chrono::Local;
+    use chrono::{Duration, Local, Utc};
     use stock_analysis::data_provider::announcement::{self, Announcement};
     use stock_analysis::monitor::detector::{AlertCategory, AlertDetail, AlertEvent, AlertLevel};
+
+    #[test]
+    fn br138_audience_uses_only_fresh_positions_plus_registered_watch_codes() {
+        let now = Utc::now();
+        let positions = vec!["TEST_CODE_HELD".to_string()];
+        let watch = std::collections::HashSet::from(["TEST_CODE_WATCH".to_string()]);
+        let audience = build_announcement_audience_codes(
+            &positions,
+            Some((now - Duration::seconds(10)).with_timezone(&Local)),
+            &watch,
+            now,
+        )
+        .expect("fresh position audience");
+        assert_eq!(audience.len(), 2);
+        assert!(audience.contains("TEST_CODE_HELD"));
+        assert!(audience.contains("TEST_CODE_WATCH"));
+    }
+
+    #[test]
+    fn br138_audience_rejects_stale_or_untimestamped_positions() {
+        let now = Utc::now();
+        let positions = vec!["TEST_CODE_HELD".to_string()];
+        let watch = std::collections::HashSet::new();
+        assert!(build_announcement_audience_codes(
+            &positions,
+            Some((now - Duration::seconds(31)).with_timezone(&Local)),
+            &watch,
+            now,
+        )
+        .is_err());
+        assert!(build_announcement_audience_codes(&positions, None, &watch, now).is_err());
+    }
+
+    #[test]
+    fn br138_stale_positions_do_not_block_independent_watch_audience() {
+        let watch = std::collections::HashSet::from(["TEST_CODE_WATCH".to_string()]);
+        let (audience, warning) = isolate_announcement_position_failure(
+            Err("BR-138 stale position component".to_string()),
+            &watch,
+        );
+        assert_eq!(audience, watch);
+        assert!(warning.is_some());
+    }
 
     /// Report from simulate_announcement_loop
     struct AnnouncementLoopReport {

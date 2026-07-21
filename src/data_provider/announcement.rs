@@ -359,45 +359,50 @@ pub fn announcement_title_is_immediately_actionable(title: &str) -> bool {
     !creditor_procedure && !reduction_completed
 }
 
-fn classify_title(title: &str, _code: &str, _name: &str) -> (AnnLevel, String) {
+enum KwList<'a> {
+    Static(&'a [&'a str]),
+    Owned(&'a [String]),
+}
+
+impl<'a> KwList<'a> {
+    fn first_match(&self, s: &str) -> Option<String> {
+        match self {
+            KwList::Static(v) => v.iter().find(|k| s.contains(**k)).map(|k| k.to_string()),
+            KwList::Owned(v) => v.iter().find(|k| s.contains(k.as_str())).cloned(),
+        }
+    }
+
+    fn first_match_skip(&self, s: &str, skip: &str) -> Option<String> {
+        match self {
+            KwList::Static(v) => v
+                .iter()
+                .find(|k| **k != skip && s.contains(**k))
+                .map(|k| k.to_string()),
+            KwList::Owned(v) => v
+                .iter()
+                .find(|k| k.as_str() != skip && s.contains(k.as_str()))
+                .cloned(),
+        }
+    }
+}
+
+fn classify_title_with_keywords(
+    title: &str,
+    _code: &str,
+    _name: &str,
+    configured: Option<&crate::config::AnnounceKeywordsFile>,
+) -> (AnnLevel, String) {
     // review #14 性能: 原 fallback 分支 3 次 .map(to_string).collect() 触发 3 次堆分配
     // (EMERGENCY 50 + IMPORTANT 50 + POSITIVE 30 ≈ 130 个 String). 公告热路径
     // (200+ 条/批), 每天触发数百次. 改为按配置来源直接传 &[&str], const 路径零分配.
     // review #14 性能: 原 fallback 分支 3 次 .map(to_string).collect() 触发 3 次堆分配
     // (EMERGENCY 50 + IMPORTANT 50 + POSITIVE 30 ≈ 130 个 String). 公告热路径
     // (200+ 条/批), 每天触发数百次. 改为按配置来源直接传 &[&str], const 路径零分配.
-    // 用 enum 统一两种来源 (const &[&str] / config Vec<String>).
-    enum KwList<'a> {
-        Static(&'a [&'a str]),
-        Owned(&'a [String]),
-    }
-    impl<'a> KwList<'a> {
-        fn first_match(&self, s: &str) -> Option<String> {
-            match self {
-                KwList::Static(v) => v.iter().find(|k| s.contains(**k)).map(|k| k.to_string()),
-                KwList::Owned(v) => v.iter().find(|k| s.contains(k.as_str())).cloned(),
-            }
-        }
-        /// review #14: 跳过指定 keyword, 找下一个匹配 (用于减持 <1% 降级场景).
-        fn first_match_skip(&self, s: &str, skip: &str) -> Option<String> {
-            match self {
-                KwList::Static(v) => v
-                    .iter()
-                    .find(|k| **k != skip && s.contains(**k))
-                    .map(|k| k.to_string()),
-                KwList::Owned(v) => v
-                    .iter()
-                    .find(|k| k.as_str() != skip && s.contains(k.as_str()))
-                    .cloned(),
-            }
-        }
-    }
-    // BR-138: 每次读取 ArcSwap 当前快照，让启动加载与 SIGHUP 更新真实生效；
-    // 禁止把首次过早访问的 None 永久缓存到进程结束。
+    // BR-138: production holds one exact ArcSwap snapshot across transport,
+    // detail selection, and assembly. Static fallback is test-only.
     static CFG_MISSING_WARNED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
-    let configured = crate::config::get_announce_keywords();
-    let (emergency, important, positive) = match configured.as_deref() {
+    let (emergency, important, positive) = match configured {
         Some(config) => (
             KwList::Owned(&config.emergency),
             KwList::Owned(&config.important),
@@ -447,6 +452,12 @@ fn classify_title(title: &str, _code: &str, _name: &str) -> (AnnLevel, String) {
         return (AnnLevel::Info, format!("利好: '{kw}'"));
     }
     (AnnLevel::Skip, String::new())
+}
+
+#[cfg(test)]
+fn classify_title(title: &str, code: &str, name: &str) -> (AnnLevel, String) {
+    let configured = crate::config::get_announce_keywords();
+    classify_title_with_keywords(title, code, name, configured.as_deref())
 }
 
 fn extract_reduction_pct(title: &str) -> Option<f64> {
@@ -543,10 +554,13 @@ fn parse_announcement_detail_http_response(
     Ok(response.data.notice_content)
 }
 
-fn detail_art_codes(list: &[AnnItem]) -> Vec<String> {
+fn detail_art_codes(
+    list: &[AnnItem],
+    keywords: Option<&crate::config::AnnounceKeywordsFile>,
+) -> Vec<String> {
     list.iter()
         .filter_map(|item| {
-            let (level, _) = classify_title(&item.title, "", "");
+            let (level, _) = classify_title_with_keywords(&item.title, "", "", keywords);
             matches!(level, AnnLevel::Emergency | AnnLevel::Important)
                 .then(|| item.art_code.clone())
         })
@@ -556,6 +570,7 @@ fn detail_art_codes(list: &[AnnItem]) -> Vec<String> {
 fn assemble_announcements(
     list: Vec<AnnItem>,
     detail_map: &std::collections::HashMap<String, String>,
+    keywords: Option<&crate::config::AnnounceKeywordsFile>,
 ) -> Result<Vec<Announcement>> {
     let mut results = Vec::new();
     for item in list {
@@ -563,7 +578,12 @@ fn assemble_announcements(
             .codes
             .first()
             .expect("announcement stock evidence was validated");
-        let (level, reason) = classify_title(&item.title, &stock.stock_code, &stock.short_name);
+        let (level, reason) = classify_title_with_keywords(
+            &item.title,
+            &stock.stock_code,
+            &stock.short_name,
+            keywords,
+        );
         if matches!(level, AnnLevel::Skip) {
             continue;
         }
@@ -608,18 +628,25 @@ fn assemble_announcements(
 
 /// review #15: 改 async + FuturesUnordered 并发 fetch_ann_detail.
 pub async fn fetch_announcements(date: Option<&str>) -> Result<Vec<Announcement>> {
-    if !crate::config::announcement_keywords_available() {
-        anyhow::bail!("BR-138 公告关键词配置不可用，生产公告获取已阻断");
-    }
+    let keywords = crate::config::get_announce_keywords()
+        .ok_or_else(|| anyhow::anyhow!("BR-138 公告关键词配置不可用，生产公告获取已阻断"))?;
     let client = crate::http_client::SHARED_HTTP_CLIENT.clone();
-    fetch_announcements_with_client(&client, date).await
+    fetch_announcements_from_urls(
+        &client,
+        date,
+        ANNOUNCE_URL,
+        ANNOUNCE_DETAIL_URL,
+        Some(keywords.as_ref()),
+    )
+    .await
 }
 
+#[cfg(test)]
 async fn fetch_announcements_with_client(
     client: &reqwest::Client,
     date: Option<&str>,
 ) -> Result<Vec<Announcement>> {
-    fetch_announcements_from_urls(client, date, ANNOUNCE_URL, ANNOUNCE_DETAIL_URL).await
+    fetch_announcements_from_urls(client, date, ANNOUNCE_URL, ANNOUNCE_DETAIL_URL, None).await
 }
 
 async fn fetch_announcements_from_urls(
@@ -627,6 +654,7 @@ async fn fetch_announcements_from_urls(
     date: Option<&str>,
     announcement_url: &str,
     detail_url: &str,
+    keywords: Option<&crate::config::AnnounceKeywordsFile>,
 ) -> Result<Vec<Announcement>> {
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let date_str = date.unwrap_or(&today);
@@ -657,7 +685,7 @@ async fn fetch_announcements_from_urls(
 
     // review #15: 高危公告 body 拉取改成 FuturesUnordered 并发, 不再串行 N × 10s.
     let client_arc = Arc::new(client.clone());
-    let detail_futures = detail_art_codes(&list);
+    let detail_futures = detail_art_codes(&list, keywords);
     let detail_results = futures::future::join_all(detail_futures.iter().map(|art_code| {
         let c = Arc::clone(&client_arc);
         let ac = art_code.clone();
@@ -673,7 +701,7 @@ async fn fetch_announcements_from_urls(
     let detail_map: std::collections::HashMap<String, String> =
         detail_results.into_iter().collect();
 
-    let results = assemble_announcements(list, &detail_map)?;
+    let results = assemble_announcements(list, &detail_map, keywords)?;
 
     info!("[公告] 过滤后 {} 条需告警", results.len());
     crate::monitor::data_mode::mark_capability_success(crate::monitor::data_mode::Capability::News)
@@ -901,7 +929,7 @@ mod tests {
     fn br059_detail_selection_only_fetches_risk_announcements() {
         let list = protocol_fixture();
         assert_eq!(
-            detail_art_codes(&list),
+            detail_art_codes(&list, None),
             vec!["AN-EMERGENCY".to_string(), "AN-IMPORTANT".to_string()]
         );
     }
@@ -911,10 +939,10 @@ mod tests {
         let list = protocol_fixture();
         let mut details = std::collections::HashMap::new();
         details.insert("AN-EMERGENCY".to_string(), "立案正文".to_string());
-        assert!(assemble_announcements(list.clone(), &details).is_err());
+        assert!(assemble_announcements(list.clone(), &details, None).is_err());
 
         details.insert("AN-IMPORTANT".to_string(), "监管正文".to_string());
-        let announcements = assemble_announcements(list, &details).unwrap();
+        let announcements = assemble_announcements(list, &details, None).unwrap();
         assert_eq!(announcements.len(), 3);
 
         let emergency = &announcements[0];
@@ -1128,6 +1156,23 @@ mod tests {
         assert!(error.to_string().contains("BR-138 公告关键词配置不可用"));
     }
 
+    #[test]
+    fn br138_explicit_keyword_snapshot_drives_classification_without_global_lookup() {
+        let keywords = crate::config::AnnounceKeywordsFile {
+            emergency: vec!["TEST_CODE_协议专用紧急".to_string()],
+            important: vec![],
+            positive: vec![],
+        };
+        let (level, reason) = classify_title_with_keywords(
+            "TEST_CODE_协议专用紧急公告",
+            "TEST_CODE_000001",
+            "测试",
+            Some(&keywords),
+        );
+        assert_eq!(level, AnnLevel::Emergency);
+        assert!(reason.contains("TEST_CODE_协议专用紧急"));
+    }
+
     #[tokio::test]
     async fn announcement_transport_and_query_date_fail_closed() {
         let client = super::super::unreachable_http_client();
@@ -1163,6 +1208,7 @@ mod tests {
             Some("2026-07-18"),
             &list_url,
             &detail_url,
+            None,
         )
         .await
         .expect("complete list and detail transport");

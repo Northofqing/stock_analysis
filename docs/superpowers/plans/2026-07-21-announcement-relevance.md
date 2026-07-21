@@ -6,6 +6,13 @@
 
 **Architecture:** Parse announcement keywords from an explicit combined-config section, classify lifecycle-only notices with a deterministic pure predicate, and pass the real portfolio/watch universe into the normalized announcement router. Classified but relevance-filtered provider identities remain owned by the normalized route so legacy delivery cannot bypass the filter.
 
+**Review corrections:** The shared production provider holds one exact keyword snapshot through
+transport, detail selection, and assembly. Each announcement route rebuilds its audience from a
+real position snapshot no older than 30 seconds plus independently loaded explicit watch codes;
+an unavailable/stale position component is excluded without blocking the independent watch set.
+Configuration, provider, audience, and name-resolution failures isolate only the announcement
+sub-chain; unrelated outer-loop scheduling, reset, persistence, and banner refresh still run.
+
 **Tech Stack:** Rust, Tokio, Serde/TOML, `HashSet`, existing BR-137 source-fact governance, SQLite-backed L7/audit pipeline.
 
 ---

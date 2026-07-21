@@ -43,7 +43,7 @@ Eastmoney announcement batch
   -> complete provider-field and publication-date validation
   -> existing title classification
   -> lifecycle-value filter
-  -> real holding/watch-universe membership
+  -> fresh real holding / explicit watch-universe membership
   -> normalized BR-137 evidence
   -> LaunchGate / quiet hours / L4 / daily limit / real sink / L7 / hash-chain
 ```
@@ -56,10 +56,11 @@ handled-identity set, so the legacy state machine cannot send it as a fallback.
 
 `config/chain.toml` must contain a dedicated `[announce_keywords]` table. The combined loader parses a
 typed wrapper and publishes the section only after all three keyword lists are present. The shared
-production `fetch_announcements` boundary checks that the section is available before transport, so
-the news loop, R-08, and future production callers all fail closed. Missing or malformed configuration
-is an explicit error and blocks the announcement batch; it must not silently select a broader
-vocabulary.
+production `fetch_announcements` boundary loads one exact configuration snapshot before transport
+and holds it through detail selection and final classification, so a concurrent reload cannot create
+a check/use race. The news loop, R-08, and future production callers all fail closed. Missing or
+malformed configuration is an explicit error and blocks the announcement batch; it must not silently
+select a broader vocabulary.
 
 No numeric threshold changes in this work.
 
@@ -69,8 +70,8 @@ An announcement is eligible for immediate BR-137 delivery only when all of the f
 
 1. the provider external identity, security code, publication date, source, title, and classified
    level are valid under existing BR-137 rules;
-2. the security code is present in the real universe loaded by `news_monitor_loop` from portfolio
-   codes plus explicitly registered watch codes;
+2. the security code is present in the audience rebuilt immediately before routing from a real
+   portfolio snapshot no older than 30 seconds plus the independently loaded explicit watch codes;
 3. the title is not a procedural creditor notice caused by cancellation of repurchased shares or a
    registered-capital reduction;
 4. the title is not a reduction-plan completion, expiry, or completed-implementation notice.
@@ -92,18 +93,25 @@ universe gate.
   lifecycle exclusions and is deterministic.
 - `route_announcements(&[Announcement], &HashSet<String>)` receives the real eligible universe
   explicitly; it does not query account state or Banner internally.
+- `build_announcement_audience_codes` rejects non-empty positions without a source timestamp or with
+  an oldest source timestamp older than 30 seconds. The long-lived news loop never reuses startup
+  position membership for announcement routing.
 - `AnnouncementSourceRouteReport.handled_external_ids` prevents legacy bypass for both delivered and
   intentionally filtered normalized events.
 
 ## 7. Failure modes
 
 - Missing/malformed announcement configuration: explicit error; announcement batch does not run.
-- Real universe unavailable: retain the existing retry loop; never replace it with an empty or fake
-  universe.
+- Real position snapshot unavailable, untimestamped, or older than 30 seconds: exclude the stale
+  position component explicitly while retaining the independently validated explicit-watch
+  audience; never replace either component with an empty or fake universe.
 - Incomplete provider identity/date/code: existing explicit BR-137 rejection.
 - Relevance-filtered event: `skipped += 1`, reason-only log without message body or account values,
   and legacy suppression via handled provider identity.
 - Governance/sink/audit failure after relevance approval: existing BR-137 retry semantics remain.
+- Configuration, transport, audience, or name-resolution failure is isolated to the announcement
+  sub-chain. The outer news loop must still run its unrelated scheduler, daily reset, state flush,
+  banner refresh, and common sleep.
 
 ## 8. Validation
 
@@ -113,6 +121,8 @@ universe gate.
 - A valid important announcement outside the eligible universe is skipped and cannot fall through to
   legacy delivery.
 - A valid important or emergency announcement inside the universe still reaches BR-137 governance.
+- Fresh positions plus explicit watch codes form the audience; stale or untimestamped non-empty
+  positions are rejected without blocking explicit watch codes.
 - Policy and critical flash behavior is unchanged.
 - Full formatting, strict Clippy, workspace tests, compliance, coverage, release build, and an
   independent review pass before merge.
