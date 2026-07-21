@@ -3224,6 +3224,17 @@ async fn run_strict_review_only_inner() -> Result<(), String> {
     Ok(())
 }
 
+fn filter_inline_r08_announcements(
+    announcements: Vec<stock_analysis::data_provider::announcement::Announcement>,
+) -> Vec<stock_analysis::data_provider::announcement::Announcement> {
+    announcements
+        .into_iter()
+        .filter(
+            stock_analysis::data_provider::announcement::announcement_is_immediate_notification_candidate,
+        )
+        .collect()
+}
+
 #[derive(Debug, Default)]
 struct PostSessionReviewScheduleState {
     completed_date: Option<chrono::NaiveDate>,
@@ -4077,12 +4088,8 @@ async fn run_review_only_inner(isolated_test_fixtures: bool) -> Result<(), Strin
                         .block_on(
                             stock_analysis::data_provider::announcement::fetch_announcements(None),
                         )
-                        .map_err(|error| format!("R-08 公告获取失败: {error}"))?
-                        .into_iter()
-                        .filter(
-                            stock_analysis::data_provider::announcement::announcement_is_immediate_notification_candidate,
-                        )
-                        .collect::<Vec<_>>();
+                        .map_err(|error| format!("R-08 公告获取失败: {error}"))?;
+                    let anns = filter_inline_r08_announcements(anns);
 
                     let ann_text = if anns.is_empty() {
                         "今日无重大公告".to_string()
@@ -5937,10 +5944,6 @@ async fn monitor_loop() {
 
         let mut preopen_pushed = false;
 
-        // v35: A-10 盘后催化复盘 — 每个交易日首次进入 19:00 后推一次
-
-        let mut evening_pushed = false;
-
         let entry_mode = air_refuel_entry_mode();
 
         let monitor_cfg = stock_analysis::config::get_monitor_config();
@@ -5999,53 +6002,6 @@ async fn monitor_loop() {
                             log::error!("[P-03][BR-091] dispatcher did not confirm delivery");
                         }
                         preopen_pushed = preopen_ok && candidate_ok;
-                    }
-                }
-            }
-
-            // ═══════════════════════════════════════════════════════════════
-
-            // v35: A-10 盘后催化复盘 (AfterHours session, 19:00 后首次)
-
-            //   - 触发: 首次进入 AfterHours, 每个交易日推一次
-
-            //   - 数据源: chain_daily cluster + continuation_count 推断持续性
-
-            //   - 模板: render_catalyst_review (无 banner, ℹ️盘后)
-
-            //   - 静默: chain_daily 空时短路
-
-            // ═══════════════════════════════════════════════════════════════
-
-            if !evening_pushed && session == MarketSession::AfterHours {
-                let now_time = chrono::Local::now().time();
-
-                let evening_start = chrono::NaiveTime::from_hms_opt(19, 0, 0).unwrap();
-
-                if now_time >= evening_start {
-                    log::info!(
-                        "[A-10] 盘后窗口 ({} 后), 推催化复盘",
-                        evening_start.format("%H:%M")
-                    );
-
-                    let date_str = chrono::Local::now().format("%Y-%m-%d").to_string();
-
-                    let hhmm = now_time.format("%H:%M").to_string();
-
-                    if let Some(banner) = current_banner_for("A-10 post-session review") {
-                        let any_pushed =
-                            push_templates::dispatch_post_session_review(&date_str, &hhmm, &banner)
-                                .await;
-                        if !any_pushed {
-                            log::error!(
-                                "[B-005-C][BR-110] 盘后批次没有任何报告成功推送 date={} time={}",
-                                date_str,
-                                hhmm
-                            );
-                        }
-
-                        // v36: A-01 虚拟仓复盘 - 同 19:00 窗口, 复用 evening_pushed flag
-                        evening_pushed = true;
                     }
                 }
             }
@@ -8904,6 +8860,17 @@ mod tests_post_session_review_scheduler {
             1,
             "the long-running branch must start both post-close schedulers exactly once"
         );
+        let dispatcher_call = ["push_templates::", "dispatch_post_session_review("].concat();
+        assert_eq!(
+            source.matches(&dispatcher_call).count(),
+            1,
+            "the strict inner runner must be the only production dispatcher owner"
+        );
+        let stale_owner = ["evening_", "pushed"].concat();
+        assert!(
+            !source.contains(&stale_owner),
+            "the stale monitor-loop review owner must not return"
+        );
     }
 }
 
@@ -8977,6 +8944,69 @@ mod tests_v17_7_announcement_wiring {
         let news_codes = merge_news_monitor_codes(holding_codes, watch_codes.as_ref().ok())
             .expect("independent holding source remains usable");
         assert!(news_codes.contains("TEST_CODE_HOLDING"));
+    }
+
+    #[test]
+    fn br138_inline_r08_excludes_local_only_lifecycle_rows() {
+        let rows = vec![Announcement {
+            code: "TEST_CODE_600000".to_string(),
+            name: "测试本地证据".to_string(),
+            title: "关于注销部分回购股份并减少注册资本通知债权人的公告".to_string(),
+            date: "2026-07-21".to_string(),
+            summary: "TEST_CODE summary".to_string(),
+            content: String::new(),
+            level: announcement::AnnLevel::Skip,
+            reason: "BR-138 lifecycle-only local evidence".to_string(),
+            external_id: Some("TEST_CODE_INLINE_R08_LOCAL".to_string()),
+            url: Some("https://example.invalid/local-only".to_string()),
+        }];
+        assert!(filter_inline_r08_announcements(rows).is_empty());
+    }
+
+    #[test]
+    fn br138_watch_readiness_cannot_short_circuit_outer_tick_tail() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("match v17_sources::poll_policy_provider")
+            .expect("policy phase exists");
+        let end = source[start..]
+            .find("tokio::time::sleep(tokio::time::Duration::from_secs(poll_secs)).await;")
+            .map(|offset| start + offset)
+            .expect("outer tick sleep exists");
+        let tick = &source[start..end];
+        let milestones = [
+            "match v17_sources::poll_policy_provider",
+            "news_aggregator_init::tick_news_aggregator",
+            "poll_announcement_watch_load",
+            "v17_sources::poll_earnings_and_analyst",
+            "refresh_concept_index_blocking",
+            "fetch_announcements(None).await",
+            "let opp_due =",
+            "sm.daily_reset();",
+            "nm.flush_dedup();",
+            "sm.flush_state();",
+            "evaluate_account_mode_hook(false).await;",
+        ];
+        let mut cursor = 0;
+        for milestone in milestones {
+            let offset = tick[cursor..]
+                .find(milestone)
+                .unwrap_or_else(|| panic!("missing BR-138 outer-tick milestone: {milestone}"));
+            cursor += offset + milestone.len();
+        }
+
+        let watch_offset = tick
+            .find("poll_announcement_watch_load")
+            .expect("watch readiness phase exists");
+        let post_watch = &tick[watch_offset..];
+        assert!(
+            !post_watch.contains("continue;"),
+            "watch pending/failure must not skip later outer-tick phases"
+        );
+        assert!(
+            !post_watch.contains("return;"),
+            "watch pending/failure must not terminate the outer tick"
+        );
     }
 
     #[test]

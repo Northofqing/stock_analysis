@@ -5405,12 +5405,12 @@ pub fn load_catalyst_review_snapshot_real(date: &str) -> Result<CatalystReviewSn
 // B-005-C (2026-07-09): 盘后批量 dispatcher (R-02..R-08 + TomorrowWatch)
 // 修复: 之前 6 个盘后 dispatcher 仅在 `cargo run -- --push` 模式被调,
 //       生产 monitor_loop 永远跑不到, 用户看不到盘后复盘.
-// 现在: 在 post-session block 等到 19:00 后调一次, 各 dispatcher 失败时静默 log,
-//       不阻塞其他 dispatcher.
+// 现在: 由 BR-139 独立 post_session_review_scheduler 在 19:00 后调用，
+//       monitor_loop 不再保留第二个 owner；各 dispatcher 逐项记录结果且互不阻塞。
 // ============================================================================
 
-/// B-005-C 统一入口 — 在 monitor_loop post-session block 19:00 后调一次.
-/// 不依赖 --push 命令行模式, 让生产 monitor 自动出盘后 6+1 报告.
+/// B-005-C 统一入口 — 由 BR-139 独立 scheduler 在交易日 19:00 后调用.
+/// 不依赖 --push 命令行模式, 让生产 monitor 自动出盘后报告.
 /// 各 R-series dispatcher 内部分别走自己的数据源，并逐项记录成功/失败。
 /// 返回值表示本批次是否至少成功推送一份报告，不把全失败伪装为成功（BR-110）。
 pub async fn dispatch_post_session_review(date: &str, hhmm: &str, banner: &BannerCtx) -> bool {
@@ -5636,15 +5636,21 @@ pub async fn dispatch_r02_review_market_real(_date: &str, _banner: &BannerCtx) -
 
 /// R-08 明日事件 (CR-12): 真实公告 + 持仓事件 + 隔夜关注 (美股+汇率).
 /// 之前 run_review_only_inner L2708 的真实实现, 现在抽取为独立 dispatcher.
+fn filter_r08_event_announcements(
+    announcements: Vec<stock_analysis::data_provider::announcement::Announcement>,
+) -> Vec<stock_analysis::data_provider::announcement::Announcement> {
+    announcements
+        .into_iter()
+        .filter(
+            stock_analysis::data_provider::announcement::announcement_is_immediate_notification_candidate,
+        )
+        .collect()
+}
+
 pub async fn dispatch_r08_event_calendar_real(date: &str, _banner: &BannerCtx) -> bool {
     // 1. 拉今日全市场公告 (真实数据)
     let anns = match stock_analysis::data_provider::announcement::fetch_announcements(None).await {
-        Ok(announcements) => announcements
-            .into_iter()
-            .filter(
-                stock_analysis::data_provider::announcement::announcement_is_immediate_notification_candidate,
-            )
-            .collect::<Vec<_>>(),
+        Ok(announcements) => filter_r08_event_announcements(announcements),
         Err(error) => {
             let reason = format!("公告数据源失败: {error}");
             log::error!("[R-08][BR-110] {reason}");
@@ -13092,6 +13098,24 @@ mod tests {
         assert!(!summary.contains("其他公告4"));
         assert!(!summary.contains("测试本地"));
         assert!(!summary.contains("通知债权人"));
+    }
+
+    #[test]
+    fn br138_dispatcher_r08_excludes_local_only_lifecycle_rows() {
+        use stock_analysis::data_provider::announcement::{AnnLevel, Announcement};
+        let rows = vec![Announcement {
+            code: "TEST_CODE_600000".to_string(),
+            name: "测试本地证据".to_string(),
+            title: "减持计划期限届满暨实施情况的公告".to_string(),
+            date: "2026-07-21".to_string(),
+            summary: "TEST_CODE summary".to_string(),
+            content: String::new(),
+            level: AnnLevel::Skip,
+            reason: "BR-138 lifecycle-only local evidence".to_string(),
+            external_id: Some("TEST_CODE_DISPATCHER_R08_LOCAL".to_string()),
+            url: Some("https://example.invalid/local-only".to_string()),
+        }];
+        assert!(filter_r08_event_announcements(rows).is_empty());
     }
 
     #[test]

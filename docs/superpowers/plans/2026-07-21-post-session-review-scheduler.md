@@ -188,6 +188,8 @@ tokio::spawn(post_session_review_scheduler());
 
 Do not register it before terminal `--review`, `--test`, `--help`, or dry-run branches.
 
+Delete the stale `monitor_loop` `evening_pushed` state and its direct 19:00 dispatcher block. Add a source-level regression assertion that `main.rs` contains exactly one production `dispatch_post_session_review` call and no stale owner identifier.
+
 - [x] **Step 4: Run focused tests and confirm GREEN**
 
 Run: `cargo test --bin monitor br139_ -- --test-threads=1`
