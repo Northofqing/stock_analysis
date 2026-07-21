@@ -227,8 +227,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(env.event_type, "push.delivery.audit");
-        assert_eq!(env.entity_key.as_deref(), Some("TEST_CODE_600519"));
+        assert_eq!(env.entity_key, None, "authoritative identity must be redacted");
         assert_eq!(env.payload["outcome"], "Pushed");
+        assert_eq!(env.payload["decision_status"], "Pushed");
+        assert_eq!(env.payload["retryable"], false);
+        assert_eq!(env.payload["reason_code"], "delivery.confirmed");
+        assert_eq!(env.payload["audit_schema_version"], 2);
+        assert!(env.payload.get("code").is_none());
+        assert_eq!(
+            env.payload["identity_hash"].as_str().unwrap().len(),
+            64
+        );
+        assert!(env.payload["rule_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|rule| rule == "BR-142"));
         assert_eq!(env.version, 1);
     }
 

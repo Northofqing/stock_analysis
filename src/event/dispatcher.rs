@@ -537,6 +537,40 @@ mod tests {
     }
 
     #[test]
+    fn br142_authoritative_record_uses_domain_hash_and_redacts_identity() {
+        let dir = std::env::temp_dir().join(format!(
+            "audit-dispatcher-v2-{}-{}",
+            std::process::id(),
+            chrono::Local::now().timestamp_nanos_opt().unwrap()
+        ));
+        let dispatcher = AuditDispatcher::new(&dir);
+        let envelope = crate::event::persist_delivery_with(
+            &dispatcher,
+            "announcement_v1",
+            Some("TEST_CODE_SECRET_AUDIT"),
+            "Pushed",
+            "dry_run",
+            42,
+            10,
+        )
+        .unwrap();
+
+        let path = dir.join(format!("{}.jsonl", envelope.ts.format("%Y")));
+        let content = fs::read_to_string(&path).unwrap();
+        let record: serde_json::Value = serde_json::from_str(content.trim()).unwrap();
+        assert_eq!(
+            record["hash_domain"],
+            "stock_analysis.delivery_audit_record.v2"
+        );
+        assert_eq!(record["envelope"]["payload"]["audit_schema_version"], 2);
+        assert!(record["envelope"]["payload"].get("code").is_none());
+        assert!(record["envelope"]["entity_key"].is_null());
+        assert!(!content.contains("TEST_CODE_SECRET_AUDIT"));
+        assert!(validate_existing_chain(&path).unwrap().is_some());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn audit_dispatcher_rejects_non_push_delivery() {
         let dispatcher = AuditDispatcher::new(
             std::env::temp_dir().join(format!("audit-dispatcher-reject-{}", std::process::id())),
