@@ -112,13 +112,27 @@ pub struct SourcePollReport {
     pub failed: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnnouncementDisposition {
+    Pushed,
+    FilteredLifecycle,
+    FilteredAudience,
+    Failed,
+}
+
 #[derive(Debug, Default)]
 pub struct AnnouncementSourceRouteReport {
     pub source: SourcePollReport,
-    /// External IDs handled by the normalized source-fact path for this batch.
-    /// Ownership means legacy delivery must not be used as an outcome fallback;
-    /// it includes relevance-filtered events and does not claim sink confirmation.
-    pub handled_external_ids: HashSet<String>,
+    /// BR-138: every successfully classified provider identity has exactly one
+    /// typed normalized disposition. Any entry blocks legacy fallback; only
+    /// `Pushed` may trigger downstream D-01/I-02 notifications.
+    pub dispositions: HashMap<String, AnnouncementDisposition>,
+}
+
+impl AnnouncementSourceRouteReport {
+    pub fn disposition(&self, external_id: &str) -> Option<AnnouncementDisposition> {
+        self.dispositions.get(external_id).copied()
+    }
 }
 
 fn record_source_attempt(report: &mut SourcePollReport, outcome: &PushOutcome) {
@@ -160,11 +174,14 @@ pub async fn route_announcements(
             }
         };
         routed.source.classified += 1;
-        routed.handled_external_ids.insert(external_id.to_string());
         if !stock_analysis::data_provider::announcement::announcement_title_is_immediately_actionable(
             &announcement.title,
         ) {
             routed.source.skipped += 1;
+            routed.dispositions.insert(
+                external_id.to_string(),
+                AnnouncementDisposition::FilteredLifecycle,
+            );
             log::info!(
                 "[v17.7][BR-138] announcement normalized route filtered: reason=lifecycle_only"
             );
@@ -172,6 +189,10 @@ pub async fn route_announcements(
         }
         if !eligible_codes.contains(&announcement.code) {
             routed.source.skipped += 1;
+            routed.dispositions.insert(
+                external_id.to_string(),
+                AnnouncementDisposition::FilteredAudience,
+            );
             log::info!(
                 "[v17.7][BR-138] announcement normalized route filtered: reason=outside_monitored_universe"
             );
@@ -179,6 +200,14 @@ pub async fn route_announcements(
         }
         let attempt = push_normalized_event(event).await;
         record_source_attempt(&mut routed.source, &attempt.outcome);
+        routed.dispositions.insert(
+            external_id.to_string(),
+            if attempt.outcome == PushOutcome::Pushed {
+                AnnouncementDisposition::Pushed
+            } else {
+                AnnouncementDisposition::Failed
+            },
+        );
         log::info!(
             "[v17.7][BR-137] announcement normalized outcome={:?}",
             attempt.outcome
@@ -789,9 +818,10 @@ mod tests {
         assert_eq!(routed.source.attempted, 1);
         assert_eq!(routed.source.classified, 1);
         assert_eq!(routed.source.pushed, 1);
-        assert!(routed
-            .handled_external_ids
-            .contains("TEST_CODE_ANN_EXTERNAL"));
+        assert_eq!(
+            routed.disposition("TEST_CODE_ANN_EXTERNAL"),
+            Some(AnnouncementDisposition::Pushed)
+        );
     }
 
     #[tokio::test]
@@ -854,7 +884,10 @@ mod tests {
         .await;
         assert_eq!(report.source.pushed, 0);
         assert_eq!(report.source.skipped, 1);
-        assert!(report.handled_external_ids.contains("TEST_CODE_EXTERNAL"));
+        assert_eq!(
+            report.dispositions.get("TEST_CODE_EXTERNAL"),
+            Some(&AnnouncementDisposition::FilteredAudience)
+        );
     }
 
     #[tokio::test]
@@ -872,9 +905,10 @@ mod tests {
         assert_eq!(report.source.classified, 1);
         assert_eq!(report.source.pushed, 0);
         assert_eq!(report.source.skipped, 1);
-        assert!(report
-            .handled_external_ids
-            .contains("TEST_CODE_LIFECYCLE_EXTERNAL"));
+        assert_eq!(
+            report.dispositions.get("TEST_CODE_LIFECYCLE_EXTERNAL"),
+            Some(&AnnouncementDisposition::FilteredLifecycle)
+        );
     }
 
     #[tokio::test]
@@ -893,9 +927,10 @@ mod tests {
         .await;
         assert_eq!(report.source.classified, 1);
         assert_eq!(report.source.pushed, 1);
-        assert!(report
-            .handled_external_ids
-            .contains("TEST_CODE_ALLOWED_EXTERNAL"));
+        assert_eq!(
+            report.dispositions.get("TEST_CODE_ALLOWED_EXTERNAL"),
+            Some(&AnnouncementDisposition::Pushed)
+        );
     }
 
     #[tokio::test]

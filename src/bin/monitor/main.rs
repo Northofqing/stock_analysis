@@ -4954,50 +4954,28 @@ async fn run_review_deep_analysis(
 
 /// 窗口：盘前08:00-09:30、盘中09:30-15:00、盘后15:00-22:00。
 
-fn build_announcement_audience_codes(
-    position_codes: &[String],
-    oldest_source_time: Option<chrono::DateTime<chrono::Local>>,
+fn validate_announcement_watch_codes(
     registered_watch_codes: &std::collections::HashSet<String>,
-    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<std::collections::HashSet<String>, String> {
-    if position_codes.iter().any(|code| code.trim().is_empty())
-        || registered_watch_codes
-            .iter()
-            .any(|code| code.trim().is_empty())
+    if registered_watch_codes
+        .iter()
+        .any(|code| code.trim().is_empty())
     {
         return Err("BR-138 公告受众代码为空".to_string());
     }
-
-    if !position_codes.is_empty() {
-        let source_time = oldest_source_time
-            .ok_or_else(|| "BR-138 真实持仓缺少来源时间，公告受众已阻断".to_string())?;
-        if !stock_analysis::portfolio::position_source_is_fresh(source_time, now) {
-            return Err("BR-138 真实持仓超过 30 秒新鲜度，公告受众已阻断".to_string());
-        }
-    }
-
-    let mut audience = registered_watch_codes.clone();
-    audience.extend(position_codes.iter().cloned());
-    Ok(audience)
+    Ok(registered_watch_codes.clone())
 }
 
-fn load_fresh_announcement_audience_codes(
+fn load_announcement_audience_codes(
     registered_watch_codes: &std::collections::HashSet<String>,
 ) -> (std::collections::HashSet<String>, Option<String>) {
-    let audience = stock_analysis::portfolio::get_positions_with_source_time().and_then(
-        |(positions, oldest_source_time)| {
-            let position_codes: Vec<String> = positions
-                .into_iter()
-                .map(|position| position.code)
-                .collect();
-            build_announcement_audience_codes(
-                &position_codes,
-                oldest_source_time,
-                registered_watch_codes,
-                chrono::Utc::now(),
-            )
-        },
-    );
+    // BR-138: `stock_position` is a mutable local simulation/projection table.
+    // Its `updated_at` changes during local return refreshes and is not broker
+    // source evidence. Until a broker position batch carries immutable provider,
+    // batch identity, and source time, positions are explicitly unavailable.
+    let audience = validate_announcement_watch_codes(registered_watch_codes).and_then(|_| {
+        Err("BR-138 verified broker position batch unavailable; local projection updated_at is not source evidence".to_string())
+    });
     isolate_announcement_position_failure(audience, registered_watch_codes)
 }
 
@@ -5008,6 +4986,34 @@ fn isolate_announcement_position_failure(
     match audience {
         Ok(audience) => (audience, None),
         Err(error) => (registered_watch_codes.clone(), Some(error)),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnnouncementAlertAction {
+    NormalizedDownstream,
+    Suppress,
+    Legacy,
+}
+
+fn announcement_alert_action(
+    alert: &AlertEvent,
+    route: &v17_sources::AnnouncementSourceRouteReport,
+) -> AnnouncementAlertAction {
+    match alert
+        .routed_external_id
+        .as_deref()
+        .and_then(|external_id| route.disposition(external_id))
+    {
+        Some(v17_sources::AnnouncementDisposition::Pushed) => {
+            AnnouncementAlertAction::NormalizedDownstream
+        }
+        Some(
+            v17_sources::AnnouncementDisposition::FilteredLifecycle
+            | v17_sources::AnnouncementDisposition::FilteredAudience
+            | v17_sources::AnnouncementDisposition::Failed,
+        ) => AnnouncementAlertAction::Suppress,
+        None => AnnouncementAlertAction::Legacy,
     }
 }
 
@@ -5216,9 +5222,11 @@ async fn news_monitor_loop() {
 
         if let Some(anns) = announcements {
             let (announcement_audience_codes, position_audience_error) =
-                load_fresh_announcement_audience_codes(&registered_watch_codes);
+                load_announcement_audience_codes(&registered_watch_codes);
             if let Some(error) = position_audience_error {
-                log::warn!("[NewsMonitor][BR-138] {error}; 过期持仓身份已排除，独立自选受众继续");
+                log::warn!(
+                    "[NewsMonitor][BR-138] {error}; 不可验证持仓身份已排除，独立自选受众继续"
+                );
             }
 
             // 异步预解析：公告 API 缺失 code 时，通过东方财富搜索反查。
@@ -5257,7 +5265,6 @@ async fn news_monitor_loop() {
             // retained only for classification failures, never as an outcome fallback.
             let announcement_route =
                 v17_sources::route_announcements(&anns, &announcement_audience_codes).await;
-            let handled_external_ids = announcement_route.handled_external_ids;
             log::info!(
                 "[公告][BR-137][BR-138] attempted={} classified={} pushed={} skipped={} failed={} audience={}",
                 announcement_route.source.attempted,
@@ -5270,16 +5277,12 @@ async fn news_monitor_loop() {
 
             for event in events {
                 if let Some(alert) = sm.process(event) {
-                    if alert
-                        .routed_external_id
-                        .as_ref()
-                        .map(|id| handled_external_ids.contains(id))
-                        .unwrap_or(false)
-                    {
-                        log::debug!("[公告][BR-137] legacy push skipped: normalized owner exists");
-                        pushed.push(alert);
-                    } else {
-                        pushed.push(push(alert).await);
+                    match announcement_alert_action(&alert, &announcement_route) {
+                        AnnouncementAlertAction::NormalizedDownstream => pushed.push(alert),
+                        AnnouncementAlertAction::Suppress => log::debug!(
+                            "[公告][BR-137][BR-138] legacy and downstream push suppressed: normalized disposition is not Pushed"
+                        ),
+                        AnnouncementAlertAction::Legacy => pushed.push(push(alert).await),
                     }
                 }
             }
@@ -8678,40 +8681,31 @@ mod tests_v17_3_integration {
 #[cfg(test)]
 mod tests_v17_7_announcement_wiring {
     use super::*;
-    use chrono::{Duration, Local, Utc};
+    use chrono::Local;
     use stock_analysis::data_provider::announcement::{self, Announcement};
     use stock_analysis::monitor::detector::{AlertCategory, AlertDetail, AlertEvent, AlertLevel};
 
     #[test]
-    fn br138_audience_uses_only_fresh_positions_plus_registered_watch_codes() {
-        let now = Utc::now();
-        let positions = vec!["TEST_CODE_HELD".to_string()];
+    fn br138_explicit_watch_audience_is_validated_independently() {
         let watch = std::collections::HashSet::from(["TEST_CODE_WATCH".to_string()]);
-        let audience = build_announcement_audience_codes(
-            &positions,
-            Some((now - Duration::seconds(10)).with_timezone(&Local)),
-            &watch,
-            now,
-        )
-        .expect("fresh position audience");
-        assert_eq!(audience.len(), 2);
-        assert!(audience.contains("TEST_CODE_HELD"));
-        assert!(audience.contains("TEST_CODE_WATCH"));
+        let audience = validate_announcement_watch_codes(&watch).expect("valid watch audience");
+        assert_eq!(audience, watch);
     }
 
     #[test]
-    fn br138_audience_rejects_stale_or_untimestamped_positions() {
-        let now = Utc::now();
-        let positions = vec!["TEST_CODE_HELD".to_string()];
-        let watch = std::collections::HashSet::new();
-        assert!(build_announcement_audience_codes(
-            &positions,
-            Some((now - Duration::seconds(31)).with_timezone(&Local)),
-            &watch,
-            now,
-        )
-        .is_err());
-        assert!(build_announcement_audience_codes(&positions, None, &watch, now).is_err());
+    fn br138_watch_audience_rejects_blank_codes() {
+        let watch = std::collections::HashSet::from(["".to_string()]);
+        assert!(validate_announcement_watch_codes(&watch).is_err());
+    }
+
+    #[test]
+    fn br138_fresh_local_projection_timestamp_never_authorizes_real_position_audience() {
+        let watch = std::collections::HashSet::from(["TEST_CODE_WATCH".to_string()]);
+        let (audience, warning) = load_announcement_audience_codes(&watch);
+        assert_eq!(audience, watch);
+        assert!(warning
+            .expect("missing broker position source must remain explicit")
+            .contains("local projection updated_at is not source evidence"));
     }
 
     #[test]
@@ -8750,7 +8744,6 @@ mod tests_v17_7_announcement_wiring {
             .collect();
         let routed = v17_sources::route_announcements(&anns, &eligible_codes).await;
         let report = routed.source;
-        let handled_external_ids = routed.handled_external_ids;
 
         // Simulate legacy loop: for each announcement, create an AlertEvent
         // and check if legacy push would be skipped
@@ -8785,14 +8778,7 @@ mod tests_v17_7_announcement_wiring {
                 routed_external_id: ann.external_id.clone(),
             };
 
-            // Check if this event would skip legacy push
-            let skipped = ev
-                .routed_external_id
-                .as_ref()
-                .map(|id| handled_external_ids.contains(id))
-                .unwrap_or(false);
-
-            if !skipped {
+            if announcement_alert_action(&ev, &routed) == AnnouncementAlertAction::Legacy {
                 *legacy_attempts.entry(event_id).or_insert(0) += 1;
             }
         }
@@ -8841,6 +8827,55 @@ mod tests_v17_7_announcement_wiring {
             report.legacy_daily_report_attempts_for("ann-1"),
             0,
             "routed announcement should not trigger legacy push"
+        );
+    }
+
+    #[test]
+    fn br138_filtered_normalized_alert_cannot_trigger_downstream_notifications() {
+        let external_id = "TEST_CODE_FILTERED_EXTERNAL";
+        let alert = AlertEvent {
+            level: AlertLevel::Important,
+            category: AlertCategory::ChainRisk,
+            code: "TEST_CODE_FILTERED".to_string(),
+            name: "测试公司".to_string(),
+            message: "filtered".to_string(),
+            detail: AlertDetail {
+                price: None,
+                change_pct: None,
+                volume_ratio: None,
+                main_flow_yi: None,
+                threshold: None,
+                news_title: None,
+                news_summary: None,
+                news_importance: None,
+                ai_decision: None,
+                t1_locked: false,
+                extra: None,
+            },
+            triggered_at: Local::now(),
+            routed_external_id: Some(external_id.to_string()),
+        };
+        let mut route = v17_sources::AnnouncementSourceRouteReport::default();
+        for disposition in [
+            v17_sources::AnnouncementDisposition::FilteredAudience,
+            v17_sources::AnnouncementDisposition::FilteredLifecycle,
+            v17_sources::AnnouncementDisposition::Failed,
+        ] {
+            route
+                .dispositions
+                .insert(external_id.to_string(), disposition);
+            assert_eq!(
+                announcement_alert_action(&alert, &route),
+                AnnouncementAlertAction::Suppress
+            );
+        }
+        route.dispositions.insert(
+            external_id.to_string(),
+            v17_sources::AnnouncementDisposition::Pushed,
+        );
+        assert_eq!(
+            announcement_alert_action(&alert, &route),
+            AnnouncementAlertAction::NormalizedDownstream
         );
     }
 
