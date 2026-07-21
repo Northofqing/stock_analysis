@@ -1,7 +1,7 @@
 # Announcement Relevance Gate Design
 
-Date: 2026-07-21  
-Status: approved (the operator previously authorized all confirmation gates)  
+Date: 2026-07-21
+Status: approved (the operator previously authorized all confirmation gates)
 Scope: real-provider announcement notification quality only
 
 ## 1. Problem
@@ -55,10 +55,11 @@ handled-identity set, so the legacy state machine cannot send it as a fallback.
 ## 4. Required configuration
 
 `config/chain.toml` must contain a dedicated `[announce_keywords]` table. The combined loader parses a
-typed wrapper and publishes the section only after all three keyword lists are present. The production
-news loop checks that the section is available before polling announcements. Missing or malformed
-configuration is an explicit error and blocks the announcement batch; it must not silently select a
-broader vocabulary.
+typed wrapper and publishes the section only after all three keyword lists are present. The shared
+production `fetch_announcements` boundary checks that the section is available before transport, so
+the news loop, R-08, and future production callers all fail closed. Missing or malformed configuration
+is an explicit error and blocks the announcement batch; it must not silently select a broader
+vocabulary.
 
 No numeric threshold changes in this work.
 
@@ -85,7 +86,9 @@ universe gate.
 ## 6. Interfaces
 
 - `CombinedChainConfig` owns `rules`, `announce_keywords`, and `boards` at their actual TOML paths.
-- `announcement_is_immediately_actionable(&Announcement) -> bool` contains only the registered
+- `fetch_announcements` is the production fail-closed boundary; lower-level injected transports remain
+  available only for isolated protocol tests.
+- `announcement_title_is_immediately_actionable(&str) -> bool` contains only the registered
   lifecycle exclusions and is deterministic.
 - `route_announcements(&[Announcement], &HashSet<String>)` receives the real eligible universe
   explicitly; it does not query account state or Banner internally.
@@ -119,4 +122,3 @@ universe gate.
 Revert the dedicated announcement-relevance commit/PR and rebuild `monitor`. Rollback changes only
 notification selection; it does not mutate positions, account snapshots, orders, historical market
 data, or provider records.
-

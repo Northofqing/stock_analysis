@@ -26,7 +26,9 @@
 - Modify: `docs/business_rules.md`
 - Modify: `config/chain.toml`
 - Modify: `src/config.rs`
+- Modify: `src/data_provider/announcement.rs`
 - Test: `src/config.rs`
+- Test: `src/data_provider/announcement.rs`
 
 - [ ] **Step 1: Register BR-138 before implementation**
 
@@ -72,15 +74,18 @@ fn parse_chain_combined(content: &str) -> Result<CombinedChainConfig, toml::de::
 Change `chain.toml` to open `[announce_keywords]` before `emergency/important/positive`, and parse the
 combined value once. Publish all three ArcSwap values only on success; log an error and clear the
 announcement section on failure. Expose `announcement_keywords_available() -> bool` for the monitor
-loop.
+loop. Enforce the same check inside the public production `fetch_announcements` boundary so R-08 and
+future callers cannot bypass the fail-closed contract; keep injected lower-level transport helpers for
+isolated protocol tests only.
 
 - [ ] **Step 5: Run focused tests and commit**
 
-Run: `cargo test --lib br138_repository_chain_config_exposes_announcement_section -- --test-threads=1`  
-Expected: one passing test.
+Run: `cargo test --lib br138_repository_chain_config_exposes_announcement_section -- --test-threads=1`
+Run: `cargo test --lib br138_public_fetch_rejects_unloaded_keyword_contract_before_transport -- --test-threads=1`
+Expected: both focused tests pass.
 
 ```bash
-git add docs/business_rules.md config/chain.toml src/config.rs
+git add docs/business_rules.md config/chain.toml src/config.rs src/data_provider/announcement.rs
 git commit -m "fix: load announcement keywords from typed config"
 ```
 
@@ -113,7 +118,7 @@ fn br138_completed_reduction_plan_is_local_only_but_new_plan_remains_actionable(
 
 - [ ] **Step 2: Run the tests and verify RED**
 
-Run: `cargo test --lib br138_ -- --test-threads=1`  
+Run: `cargo test --lib br138_ -- --test-threads=1`
 Expected: compile failure because the predicate is not defined.
 
 - [ ] **Step 3: Implement the narrow pure predicate**
@@ -132,7 +137,7 @@ pub fn announcement_title_is_immediately_actionable(title: &str) -> bool {
 
 - [ ] **Step 4: Run focused tests and commit**
 
-Run: `cargo test --lib br138_ -- --test-threads=1`  
+Run: `cargo test --lib br138_ -- --test-threads=1`
 Expected: both exclusion tests pass and the new-plan control remains true.
 
 ```bash
@@ -175,7 +180,7 @@ async fn br138_eligible_actionable_announcement_still_reaches_governance() {
 
 - [ ] **Step 2: Run the tests and verify RED**
 
-Run: `cargo test --bin monitor br138_ -- --test-threads=1`  
+Run: `cargo test --bin monitor br138_ -- --test-threads=1`
 Expected: compile failure because the router lacks the eligible-universe parameter and handled field.
 
 - [ ] **Step 3: Implement audience/lifecycle ownership**
@@ -197,7 +202,7 @@ critical flash producers.
 
 - [ ] **Step 4: Update all existing router tests/callers and run monitor tests**
 
-Run: `cargo test --bin monitor -- --test-threads=1`  
+Run: `cargo test --bin monitor -- --test-threads=1`
 Expected: all monitor tests pass, including repeated-announcement dedup and BR-137 source facts.
 
 - [ ] **Step 5: Commit**

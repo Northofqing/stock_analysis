@@ -608,6 +608,9 @@ fn assemble_announcements(
 
 /// review #15: 改 async + FuturesUnordered 并发 fetch_ann_detail.
 pub async fn fetch_announcements(date: Option<&str>) -> Result<Vec<Announcement>> {
+    if !crate::config::announcement_keywords_available() {
+        anyhow::bail!("BR-138 公告关键词配置不可用，生产公告获取已阻断");
+    }
     let client = crate::http_client::SHARED_HTTP_CLIENT.clone();
     fetch_announcements_with_client(&client, date).await
 }
@@ -1115,6 +1118,14 @@ mod tests {
             "测试",
         );
         assert_eq!(lvl, AnnLevel::Important);
+    }
+
+    #[tokio::test]
+    async fn br138_public_fetch_rejects_unloaded_keyword_contract_before_transport() {
+        let error = fetch_announcements(Some("2026-07-18"))
+            .await
+            .expect_err("production fetch must fail before transport without keyword config");
+        assert!(error.to_string().contains("BR-138 公告关键词配置不可用"));
     }
 
     #[tokio::test]
