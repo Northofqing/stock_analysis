@@ -59,6 +59,10 @@ fn normal_process_initializes_governance_before_waiting_for_market() {
     ));
     std::fs::create_dir_all(&root).expect("create isolated working directory");
     let database_path = root.join("startup.db");
+    let stdout_path = root.join("monitor.stdout.log");
+    let stderr_path = root.join("monitor.stderr.log");
+    let stdout_file = std::fs::File::create(&stdout_path).expect("create monitor stdout log");
+    let stderr_file = std::fs::File::create(&stderr_path).expect("create monitor stderr log");
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_monitor"))
         .current_dir(&root)
@@ -74,20 +78,45 @@ fn normal_process_initializes_governance_before_waiting_for_market() {
         .env_remove("SLACK_WEBHOOK")
         .env_remove("TELEGRAM_BOT_TOKEN")
         .env_remove("WECHAT_WEBHOOK")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
         .spawn()
         .expect("spawn normal monitor process");
 
-    std::thread::sleep(std::time::Duration::from_secs(5));
-    child.kill().expect("terminate isolated monitor process");
-    let output = child
-        .wait_with_output()
-        .expect("collect isolated monitor output");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+    loop {
+        let combined_output = format!(
+            "{}{}",
+            std::fs::read_to_string(&stdout_path).unwrap_or_default(),
+            std::fs::read_to_string(&stderr_path).unwrap_or_default()
+        );
+        if combined_output.contains("[AccountMode-hook] 启动评估")
+            && combined_output.contains("[DataMode-hook] 模式")
+        {
+            break;
+        }
+        if child
+            .try_wait()
+            .expect("poll isolated monitor process")
+            .is_some()
+            || std::time::Instant::now() >= deadline
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    if child
+        .try_wait()
+        .expect("poll isolated monitor process before cleanup")
+        .is_none()
+    {
+        child.kill().expect("terminate isolated monitor process");
+    }
+    child.wait().expect("collect isolated monitor status");
     let combined_output = format!(
         "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        std::fs::read_to_string(&stdout_path).unwrap_or_default(),
+        std::fs::read_to_string(&stderr_path).unwrap_or_default()
     );
 
     assert!(
