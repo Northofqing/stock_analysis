@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-21
 
-**Rule:** BR-141
+**Rules:** BR-141, BR-142
 
 **Data red lines:** 2.1, 2.2, 2.5, 2.7, 2.8, 2.10
 
@@ -100,7 +100,8 @@ argv
 ```
 
 No production data source, account field, threshold, order path, notification
-policy, retention duration, or JSONL record format changes.
+policy, or retention duration changes. The delivery-audit schema advances
+compatibly as described below; historical files are not rewritten.
 
 The event JSONL file is explicitly a non-authoritative observation/replay
 projection. It does not claim to satisfy red line 2.7 by itself. Every production
@@ -117,6 +118,22 @@ file lock spans full-chain validation, append, flush and `sync_data`; and every
 append revalidates because another process may have extended the file. A
 non-empty file without a trailing newline is an incomplete record and is
 rejected rather than extended.
+
+The authoritative delivery envelope is also a complete BR-142 audit record.
+Its existing source and timestamp are the local delivery observation evidence;
+the payload adds decision status, retryability, non-empty rule IDs and a
+structured reason code. The original security/announcement identity is never
+persisted or logged. Instead, a stable identity is computed with
+`SHA256("stock_analysis.delivery_identity.v2" + NUL + kind + NUL + code + NUL + channel)`.
+The outer chain record declares `stock_analysis.delivery_audit_record.v2` and
+uses that value as a domain separator before the canonical JSON bytes.
+
+Existing pre-v2 records cannot be rewritten without breaking their chain. The
+validator therefore recognizes a missing hash-domain field as a legacy record,
+verifies it with the historical algorithm, and permits it only as an immutable
+parent. Every newly appended record declares and uses the v2 domain. Unknown
+domains, incomplete audit fields, raw identities, or invalid hashes fail closed.
+This is a compatibility reader, not permission to emit another legacy record.
 
 Known one-shot modes remain truthful after becoming reachable. Outcome backfill
 parses a strict calendar date before normalizing the filename and propagates

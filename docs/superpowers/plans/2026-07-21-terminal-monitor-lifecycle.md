@@ -408,3 +408,36 @@ its explicit isolated values.
 Repeat focused tests, full workspace tests, compliance, coverage, release build
 and canary after these changes. Do not create the PR until independent review
 reports zero Critical and zero Important findings.
+
+### Task 8: Complete the authoritative delivery-audit contract
+
+**Files:**
+- Modify: `docs/business_rules.md`
+- Modify: `docs/superpowers/specs/2026-07-21-terminal-monitor-lifecycle-design.md`
+- Modify: `src/event/envelope.rs`
+- Modify: `src/event/push_record.rs`
+- Modify: `src/event/dispatcher.rs`
+- Modify: `src/event/mod.rs`
+
+- [x] **Step 1: Register BR-142 before implementation**
+
+Specify the required audit fields, identity redaction, domain-separated hashes,
+fail-closed validation and legacy read-only compatibility in the stable rule
+table and design before editing production code.
+
+- [ ] **Step 2: Add RED contract and compatibility tests**
+
+Require complete structured delivery fields, redacted identities, v2 chain
+domains, and a legacy-parent-to-v2 append. Prove malformed fields and unknown
+domains are rejected before append.
+
+- [ ] **Step 3: Implement the v2 authoritative audit schema**
+
+Build a redacted authoritative event at the persistence seam, validate the
+structured fields through `PushRecord`, and domain-separate identity and record
+hashing while retaining legacy verification only for existing rows.
+
+- [ ] **Step 4: Repeat Gate C/D, canary and independent review**
+
+Run every mandatory gate on the final tree. Zero Critical and Important
+findings are required before PR creation and merge.
