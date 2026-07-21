@@ -14,7 +14,10 @@ batch exists, the unavailable position component is explicitly excluded without 
 independent watch set. The router returns a typed disposition per handled identity; only `Pushed`
 may feed D-01/I-02, while filtered/failed outcomes block legacy fallback without downstream effects.
 Configuration, provider, audience, and name-resolution failures isolate only the announcement
-sub-chain; unrelated outer-loop scheduling, reset, persistence, and banner refresh still run.
+sub-chain; unrelated outer-loop scheduling, reset, persistence, and banner refresh still run. The
+production loop uses a phase coordinator as its actual branch seam: Pending/Failed watch readiness
+disables only the Announcement phase, while every unrelated phase must enter exactly once or emit an
+explicit outer-tick contract failure.
 
 **Tech Stack:** Rust, Tokio, Serde/TOML, `HashSet`, existing BR-137 source-fact governance, SQLite-backed L7/audit pipeline.
 

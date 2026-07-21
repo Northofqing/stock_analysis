@@ -5108,6 +5108,123 @@ fn merge_news_monitor_codes(
     Ok(codes)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnnouncementWatchReadiness {
+    Pending,
+    Failed,
+    Ready,
+}
+
+fn announcement_watch_readiness(
+    watchlist: &Result<Vec<stock_analysis::portfolio::Position>, String>,
+) -> AnnouncementWatchReadiness {
+    match watchlist {
+        Ok(_) => AnnouncementWatchReadiness::Ready,
+        Err(error) if error.contains("still in progress") => AnnouncementWatchReadiness::Pending,
+        Err(_) => AnnouncementWatchReadiness::Failed,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+enum NewsOuterTickPhase {
+    Policy = 0,
+    CriticalFlash = 1,
+    HoldingEarnings = 2,
+    L2 = 3,
+    Announcement = 4,
+    Opportunity = 5,
+    Reset = 6,
+    Flush = 7,
+    Banner = 8,
+    Sleep = 9,
+}
+
+impl NewsOuterTickPhase {
+    const ALL: [Self; 10] = [
+        Self::Policy,
+        Self::CriticalFlash,
+        Self::HoldingEarnings,
+        Self::L2,
+        Self::Announcement,
+        Self::Opportunity,
+        Self::Reset,
+        Self::Flush,
+        Self::Banner,
+        Self::Sleep,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Policy => "policy",
+            Self::CriticalFlash => "critical_flash",
+            Self::HoldingEarnings => "holding_earnings",
+            Self::L2 => "l2",
+            Self::Announcement => "announcement",
+            Self::Opportunity => "opportunity",
+            Self::Reset => "reset",
+            Self::Flush => "flush",
+            Self::Banner => "banner",
+            Self::Sleep => "sleep",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct NewsOuterTickCoordinator {
+    watch_readiness: AnnouncementWatchReadiness,
+    entered: [u8; NewsOuterTickPhase::ALL.len()],
+}
+
+impl NewsOuterTickCoordinator {
+    fn new(watch_readiness: AnnouncementWatchReadiness) -> Self {
+        Self {
+            watch_readiness,
+            entered: [0; NewsOuterTickPhase::ALL.len()],
+        }
+    }
+
+    fn set_watch_readiness(&mut self, watch_readiness: AnnouncementWatchReadiness) {
+        self.watch_readiness = watch_readiness;
+    }
+
+    fn enter(&mut self, phase: NewsOuterTickPhase) -> bool {
+        let enabled = phase != NewsOuterTickPhase::Announcement
+            || self.watch_readiness == AnnouncementWatchReadiness::Ready;
+        if enabled {
+            self.entered[phase as usize] = self.entered[phase as usize].saturating_add(1);
+        }
+        enabled
+    }
+
+    fn entered_count(&self, phase: NewsOuterTickPhase) -> u8 {
+        self.entered[phase as usize]
+    }
+
+    fn finish(&self) -> Result<(), String> {
+        for phase in NewsOuterTickPhase::ALL {
+            let expected = if phase == NewsOuterTickPhase::Announcement
+                && self.watch_readiness != AnnouncementWatchReadiness::Ready
+            {
+                0
+            } else {
+                1
+            };
+            let actual = self.entered_count(phase);
+            if actual != expected {
+                return Err(format!(
+                    "BR-138 outer tick phase {} entered {} times, expected {} for watch {:?}",
+                    phase.label(),
+                    actual,
+                    expected,
+                    self.watch_readiness
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 fn load_announcement_audience_codes(
     registered_watch_codes: &std::collections::HashSet<String>,
 ) -> (std::collections::HashSet<String>, Option<String>) {
@@ -5225,38 +5342,44 @@ async fn news_monitor_loop() {
             continue;
         }
 
+        let mut outer_tick = NewsOuterTickCoordinator::new(AnnouncementWatchReadiness::Pending);
+
         if announcement_watch_load.is_none() {
             announcement_watch_load = Some(tokio::task::spawn_blocking(
                 stock_analysis::portfolio::get_watchlist,
             ));
         }
 
-        match v17_sources::poll_policy_provider(&policy_provider, 20).await {
-            Ok(report) => log::info!(
-                "[Policy][BR-137] attempted={} classified={} pushed={} skipped={} failed={}",
-                report.attempted,
-                report.classified,
-                report.pushed,
-                report.skipped,
-                report.failed
-            ),
-            Err(error) => log::error!("[Policy][BR-137] provider poll failed: {error}"),
+        if outer_tick.enter(NewsOuterTickPhase::Policy) {
+            match v17_sources::poll_policy_provider(&policy_provider, 20).await {
+                Ok(report) => log::info!(
+                    "[Policy][BR-137] attempted={} classified={} pushed={} skipped={} failed={}",
+                    report.attempted,
+                    report.classified,
+                    report.pushed,
+                    report.skipped,
+                    report.failed
+                ),
+                Err(error) => log::error!("[Policy][BR-137] provider poll failed: {error}"),
+            }
         }
 
         // v17.4: NewsAggregator tick 入口 — 每轮调一次, 拿 dedup 后 Vec<MarketEvent>
         // v17.4 §5.1: 事件喂 NewsFlashGate → critical 即时推 + 4 时段聚合 (AC34/AC35)
-        let news_events = news_aggregator_init::tick_news_aggregator(20).await;
-        {
-            let mcfg = stock_analysis::config::get_monitor_config();
-            let decisions = news_flash_gate.process(
-                &news_events,
-                chrono::Local::now(),
-                mcfg.news_critical_score_threshold,
-                mcfg.news_max_critical_per_day,
-            );
-            if !decisions.is_empty() {
-                let (nc, na) = news_aggregator_init::push_flash_decisions(decisions).await;
-                log::info!("[v17.4] news_flash push: critical={} aggregated={}", nc, na);
+        if outer_tick.enter(NewsOuterTickPhase::CriticalFlash) {
+            let news_events = news_aggregator_init::tick_news_aggregator(20).await;
+            {
+                let mcfg = stock_analysis::config::get_monitor_config();
+                let decisions = news_flash_gate.process(
+                    &news_events,
+                    chrono::Local::now(),
+                    mcfg.news_critical_score_threshold,
+                    mcfg.news_max_critical_per_day,
+                );
+                if !decisions.is_empty() {
+                    let (nc, na) = news_aggregator_init::push_flash_decisions(decisions).await;
+                    log::info!("[v17.4] news_flash push: critical={} aggregated={}", nc, na);
+                }
             }
         }
 
@@ -5264,6 +5387,7 @@ async fn news_monitor_loop() {
         // readiness is inspected. An unfinished task is retained for the next
         // tick and never awaited here.
         let watchlist = poll_announcement_watch_load(&mut announcement_watch_load).await;
+        outer_tick.set_watch_readiness(announcement_watch_readiness(&watchlist));
         if let Ok(positions) = &watchlist {
             for position in positions {
                 nm.linker_mut()
@@ -5296,39 +5420,47 @@ async fn news_monitor_loop() {
             };
 
         // v17.7 Task 7: Poll earnings and analyst upgrades for watchlist
-        if let Some(our_codes) = &our_codes {
-            let earnings_cfg = stock_analysis::config::get_monitor_config()
-                .v17_7_earnings
-                .clone();
-            let poll_secs = earnings_cfg.poll_interval_secs;
-            // Convert from config::EarningsConfig to classifier::EarningsConfig
-            let classifier_cfg = stock_analysis::news::aggregator::classifier::EarningsConfig {
-                metric: earnings_cfg.metric,
-                beat_threshold_pct: earnings_cfg.beat_threshold_pct,
-                miss_threshold_pct: earnings_cfg.miss_threshold_pct,
-                poll_interval_secs: earnings_cfg.poll_interval_secs,
-            };
-            let report = v17_sources::poll_earnings_and_analyst(
-                our_codes,
-                &classifier_cfg,
-                &analyst_store,
-                std::sync::Arc::clone(&last_poll_earnings),
-                std::sync::Arc::clone(&last_poll_analyst),
-                poll_secs,
-                poll_secs,
-            )
-            .await;
-            if report.attempted > 0 {
-                log::info!(
-                    "[v17.7] earnings/analyst poll: attempted={} classified={} pushed={} skipped={} failed={}",
-                    report.attempted, report.classified, report.pushed, report.skipped, report.failed
-                );
+        if outer_tick.enter(NewsOuterTickPhase::HoldingEarnings) {
+            if let Some(our_codes) = &our_codes {
+                let earnings_cfg = stock_analysis::config::get_monitor_config()
+                    .v17_7_earnings
+                    .clone();
+                let poll_secs = earnings_cfg.poll_interval_secs;
+                // Convert from config::EarningsConfig to classifier::EarningsConfig
+                let classifier_cfg = stock_analysis::news::aggregator::classifier::EarningsConfig {
+                    metric: earnings_cfg.metric,
+                    beat_threshold_pct: earnings_cfg.beat_threshold_pct,
+                    miss_threshold_pct: earnings_cfg.miss_threshold_pct,
+                    poll_interval_secs: earnings_cfg.poll_interval_secs,
+                };
+                let report = v17_sources::poll_earnings_and_analyst(
+                    our_codes,
+                    &classifier_cfg,
+                    &analyst_store,
+                    std::sync::Arc::clone(&last_poll_earnings),
+                    std::sync::Arc::clone(&last_poll_analyst),
+                    poll_secs,
+                    poll_secs,
+                )
+                .await;
+                if report.attempted > 0 {
+                    log::info!(
+                        "[v17.7] earnings/analyst poll: attempted={} classified={} pushed={} skipped={} failed={}",
+                        report.attempted,
+                        report.classified,
+                        report.pushed,
+                        report.skipped,
+                        report.failed
+                    );
+                }
             }
         }
 
         // L2 概念索引刷新（每5分钟一次）
 
-        if last_concept_refresh.elapsed().as_secs() >= 300 {
+        if outer_tick.enter(NewsOuterTickPhase::L2)
+            && last_concept_refresh.elapsed().as_secs() >= 300
+        {
             last_concept_refresh = std::time::Instant::now();
 
             if let Some(our_codes) = &our_codes {
@@ -5367,19 +5499,16 @@ async fn news_monitor_loop() {
 
         // BR-138: 公告失败只隔离公告子链路，不得跳过同轮的产业链调度、每日重置、
         // 去重落盘或 banner 刷新。生产 provider 自身负责配置 fail-closed。
-        let announcements = match &registered_watch_codes {
-            Ok(_) => {
-                match stock_analysis::data_provider::announcement::fetch_announcements(None).await {
-                    Ok(announcements) => Some(announcements),
-                    Err(error) => {
-                        log::error!(
-                            "[NewsMonitor][BR-138] 公告批次获取失败，本轮公告隔离: {error}"
-                        );
-                        None
-                    }
+        let announcements = if outer_tick.enter(NewsOuterTickPhase::Announcement) {
+            match stock_analysis::data_provider::announcement::fetch_announcements(None).await {
+                Ok(announcements) => Some(announcements),
+                Err(error) => {
+                    log::error!("[NewsMonitor][BR-138] 公告批次获取失败，本轮公告隔离: {error}");
+                    None
                 }
             }
-            Err(_) => None,
+        } else {
+            None
         };
 
         if let Some((anns, registered_watch_codes)) =
@@ -5548,7 +5677,7 @@ async fn news_monitor_loop() {
             .map(|t| t.elapsed().as_secs() >= opp_interval_secs)
             .unwrap_or(true);
 
-        if opp_due {
+        if outer_tick.enter(NewsOuterTickPhase::Opportunity) && opp_due {
             last_opp_scan = Some(std::time::Instant::now());
             log::warn!("[产业链][BR-112] scan disabled=incomplete_source_contract");
         }
@@ -5557,7 +5686,7 @@ async fn news_monitor_loop() {
 
         let today = chrono::Local::now().format("%Y%m%d").to_string();
 
-        {
+        if outer_tick.enter(NewsOuterTickPhase::Reset) {
             use std::sync::Mutex;
 
             static LAST_DATE: Mutex<Option<String>> = Mutex::new(None);
@@ -5573,7 +5702,9 @@ async fn news_monitor_loop() {
 
         // v5: 每 5 分钟刷盘
 
-        if last_flush.elapsed().as_secs() >= 300 {
+        let flush_scheduled = outer_tick.enter(NewsOuterTickPhase::Flush);
+        let banner_scheduled = outer_tick.enter(NewsOuterTickPhase::Banner);
+        if flush_scheduled && last_flush.elapsed().as_secs() >= 300 {
             last_flush = std::time::Instant::now();
 
             nm.flush_dedup();
@@ -5582,10 +5713,17 @@ async fn news_monitor_loop() {
 
             // v41: 周期刷新 banner (AccountMode + DataMode 评估 → 写 LATEST_BANNER)
 
-            evaluate_account_mode_hook(false).await;
+            if banner_scheduled {
+                evaluate_account_mode_hook(false).await;
+            }
         }
 
-        tokio::time::sleep(tokio::time::Duration::from_secs(poll_secs)).await;
+        if outer_tick.enter(NewsOuterTickPhase::Sleep) {
+            if let Err(error) = outer_tick.finish() {
+                log::error!("[NewsMonitor][BR-138] outer tick contract failed: {error}");
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(poll_secs)).await;
+        }
     }
 }
 
@@ -8965,48 +9103,52 @@ mod tests_v17_7_announcement_wiring {
 
     #[test]
     fn br138_watch_readiness_cannot_short_circuit_outer_tick_tail() {
-        let source = include_str!("main.rs");
-        let start = source
-            .find("match v17_sources::poll_policy_provider")
-            .expect("policy phase exists");
-        let end = source[start..]
-            .find("tokio::time::sleep(tokio::time::Duration::from_secs(poll_secs)).await;")
-            .map(|offset| start + offset)
-            .expect("outer tick sleep exists");
-        let tick = &source[start..end];
-        let milestones = [
-            "match v17_sources::poll_policy_provider",
-            "news_aggregator_init::tick_news_aggregator",
-            "poll_announcement_watch_load",
-            "v17_sources::poll_earnings_and_analyst",
-            "refresh_concept_index_blocking",
-            "fetch_announcements(None).await",
-            "let opp_due =",
-            "sm.daily_reset();",
-            "nm.flush_dedup();",
-            "sm.flush_state();",
-            "evaluate_account_mode_hook(false).await;",
-        ];
-        let mut cursor = 0;
-        for milestone in milestones {
-            let offset = tick[cursor..]
-                .find(milestone)
-                .unwrap_or_else(|| panic!("missing BR-138 outer-tick milestone: {milestone}"));
-            cursor += offset + milestone.len();
-        }
+        for readiness in [
+            AnnouncementWatchReadiness::Pending,
+            AnnouncementWatchReadiness::Failed,
+        ] {
+            let mut coordinator =
+                NewsOuterTickCoordinator::new(AnnouncementWatchReadiness::Pending);
+            let mut callback_counts = [0_u8; NewsOuterTickPhase::ALL.len()];
 
-        let watch_offset = tick
-            .find("poll_announcement_watch_load")
-            .expect("watch readiness phase exists");
-        let post_watch = &tick[watch_offset..];
-        assert!(
-            !post_watch.contains("continue;"),
-            "watch pending/failure must not skip later outer-tick phases"
-        );
-        assert!(
-            !post_watch.contains("return;"),
-            "watch pending/failure must not terminate the outer tick"
-        );
+            for phase in [
+                NewsOuterTickPhase::Policy,
+                NewsOuterTickPhase::CriticalFlash,
+            ] {
+                if coordinator.enter(phase) {
+                    callback_counts[phase as usize] += 1;
+                }
+            }
+            coordinator.set_watch_readiness(readiness);
+            for phase in [
+                NewsOuterTickPhase::HoldingEarnings,
+                NewsOuterTickPhase::L2,
+                NewsOuterTickPhase::Announcement,
+                NewsOuterTickPhase::Opportunity,
+                NewsOuterTickPhase::Reset,
+                NewsOuterTickPhase::Flush,
+                NewsOuterTickPhase::Banner,
+                NewsOuterTickPhase::Sleep,
+            ] {
+                if coordinator.enter(phase) {
+                    callback_counts[phase as usize] += 1;
+                }
+            }
+
+            coordinator
+                .finish()
+                .expect("pending/failed watch keeps the outer tick contract complete");
+            for phase in NewsOuterTickPhase::ALL {
+                let expected = u8::from(phase != NewsOuterTickPhase::Announcement);
+                assert_eq!(
+                    callback_counts[phase as usize],
+                    expected,
+                    "phase {} callback count for watch {:?}",
+                    phase.label(),
+                    readiness
+                );
+            }
+        }
     }
 
     #[test]

@@ -131,7 +131,9 @@ universe gate.
   critical flash run before its readiness is inspected; an unfinished task is never awaited. A
   missing/failed watch result closes only the announcement audience and optional watch increment,
   while the independently loaded holding code pool still drives earnings/analyst and L2 work.
-  Its first failure is logged during startup/first tick.
+  Its first failure is logged during startup/first tick. The production outer loop must route these
+  decisions through a phase coordinator: Pending/Failed watch readiness suppresses only the
+  Announcement phase, and a missing or duplicate unrelated phase is an explicit tick-contract error.
 - Each route aggregate reports counts for Pushed, FilteredLifecycle, FilteredAudience, and Failed so
   a live canary can verify selection without logging bodies, account values, or security identities.
 
