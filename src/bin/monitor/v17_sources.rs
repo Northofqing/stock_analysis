@@ -1,4 +1,4 @@
-//! Registered business rules: BR-112, BR-137.
+//! Registered business rules: BR-112, BR-137, BR-138.
 //! v17.7 Task 5: Monitor-only source-to-push adapter
 //!
 //! Consumes `NormalizedSourceEvent` from the news aggregator and dispatches
@@ -115,10 +115,10 @@ pub struct SourcePollReport {
 #[derive(Debug, Default)]
 pub struct AnnouncementSourceRouteReport {
     pub source: SourcePollReport,
-    /// External IDs owned by the normalized source-fact path for this batch.
+    /// External IDs handled by the normalized source-fact path for this batch.
     /// Ownership means legacy delivery must not be used as an outcome fallback;
-    /// it does not claim that the sink confirmed delivery.
-    pub normalized_external_ids: HashSet<String>,
+    /// it includes relevance-filtered events and does not claim sink confirmation.
+    pub handled_external_ids: HashSet<String>,
 }
 
 fn record_source_attempt(report: &mut SourcePollReport, outcome: &PushOutcome) {
@@ -134,6 +134,7 @@ fn record_source_attempt(report: &mut SourcePollReport, outcome: &PushOutcome) {
 /// the explicit outcome. The next provider poll remains the retry boundary.
 pub async fn route_announcements(
     announcements: &[stock_analysis::data_provider::announcement::Announcement],
+    eligible_codes: &HashSet<String>,
 ) -> AnnouncementSourceRouteReport {
     let mut routed = AnnouncementSourceRouteReport::default();
     for announcement in announcements {
@@ -159,9 +160,23 @@ pub async fn route_announcements(
             }
         };
         routed.source.classified += 1;
-        routed
-            .normalized_external_ids
-            .insert(external_id.to_string());
+        routed.handled_external_ids.insert(external_id.to_string());
+        if !stock_analysis::data_provider::announcement::announcement_title_is_immediately_actionable(
+            &announcement.title,
+        ) {
+            routed.source.skipped += 1;
+            log::info!(
+                "[v17.7][BR-138] announcement normalized route filtered: reason=lifecycle_only"
+            );
+            continue;
+        }
+        if !eligible_codes.contains(&announcement.code) {
+            routed.source.skipped += 1;
+            log::info!(
+                "[v17.7][BR-138] announcement normalized route filtered: reason=outside_monitored_universe"
+            );
+            continue;
+        }
         let attempt = push_normalized_event(event).await;
         record_source_attempt(&mut routed.source, &attempt.outcome);
         log::info!(
@@ -769,12 +784,13 @@ mod tests {
             url: Some("https://example.invalid/TEST_CODE_ANN_EXTERNAL".to_string()),
         };
 
-        let routed = route_announcements(&[announcement]).await;
+        let eligible = HashSet::from([announcement.code.clone()]);
+        let routed = route_announcements(&[announcement], &eligible).await;
         assert_eq!(routed.source.attempted, 1);
         assert_eq!(routed.source.classified, 1);
         assert_eq!(routed.source.pushed, 1);
         assert!(routed
-            .normalized_external_ids
+            .handled_external_ids
             .contains("TEST_CODE_ANN_EXTERNAL"));
     }
 
@@ -796,11 +812,90 @@ mod tests {
             url: Some("https://example.invalid/TEST_CODE_ANN_REPEAT_EXTERNAL".to_string()),
         };
 
-        let first = route_announcements(std::slice::from_ref(&announcement)).await;
-        let second = route_announcements(&[announcement]).await;
+        let eligible = HashSet::from([announcement.code.clone()]);
+        let first = route_announcements(std::slice::from_ref(&announcement), &eligible).await;
+        let second = route_announcements(&[announcement], &eligible).await;
         assert_eq!(first.source.pushed, 1);
         assert_eq!(second.source.pushed, 0);
         assert_eq!(second.source.failed, 1);
+    }
+
+    fn br138_important_announcement(
+        external_id: &str,
+        code: &str,
+    ) -> stock_analysis::data_provider::announcement::Announcement {
+        stock_analysis::data_provider::announcement::Announcement {
+            code: code.to_string(),
+            name: "测试公司".to_string(),
+            title: "重大监管问询公告".to_string(),
+            date: Local::now().date_naive().format("%Y-%m-%d").to_string(),
+            summary: "监管问询".to_string(),
+            content: "真实公告正文协议夹具".to_string(),
+            level: stock_analysis::data_provider::announcement::AnnLevel::Important,
+            reason: "标题含监管问询".to_string(),
+            external_id: Some(external_id.to_string()),
+            url: Some(format!("https://example.invalid/{external_id}")),
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
+    async fn br138_off_universe_announcement_is_handled_without_push() {
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
+        crate::v14_adapter::_reset_dedup_for_test();
+        let eligible = HashSet::from(["TEST_CODE_ALLOWED".to_string()]);
+        let report = route_announcements(
+            &[br138_important_announcement(
+                "TEST_CODE_EXTERNAL",
+                "TEST_CODE_OTHER",
+            )],
+            &eligible,
+        )
+        .await;
+        assert_eq!(report.source.pushed, 0);
+        assert_eq!(report.source.skipped, 1);
+        assert!(report.handled_external_ids.contains("TEST_CODE_EXTERNAL"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
+    async fn br138_lifecycle_only_announcement_is_handled_without_legacy_fallback() {
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
+        crate::v14_adapter::_reset_dedup_for_test();
+        let code = "TEST_CODE_LIFECYCLE";
+        let eligible = HashSet::from([code.to_string()]);
+        let mut announcement = br138_important_announcement("TEST_CODE_LIFECYCLE_EXTERNAL", code);
+        announcement.title = "关于注销部分回购股份并减少注册资本通知债权人的公告".to_string();
+
+        let report = route_announcements(&[announcement], &eligible).await;
+
+        assert_eq!(report.source.classified, 1);
+        assert_eq!(report.source.pushed, 0);
+        assert_eq!(report.source.skipped, 1);
+        assert!(report
+            .handled_external_ids
+            .contains("TEST_CODE_LIFECYCLE_EXTERNAL"));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(cooldown_memo)]
+    async fn br138_eligible_actionable_announcement_still_reaches_governance() {
+        let _env_guard = crate::TestEnvGuard::dry_run_non_quiet();
+        crate::v14_adapter::_reset_dedup_for_test();
+        let eligible = HashSet::from(["TEST_CODE_ALLOWED".to_string()]);
+        let report = route_announcements(
+            &[br138_important_announcement(
+                "TEST_CODE_ALLOWED_EXTERNAL",
+                "TEST_CODE_ALLOWED",
+            )],
+            &eligible,
+        )
+        .await;
+        assert_eq!(report.source.classified, 1);
+        assert_eq!(report.source.pushed, 1);
+        assert!(report
+            .handled_external_ids
+            .contains("TEST_CODE_ALLOWED_EXTERNAL"));
     }
 
     #[tokio::test]

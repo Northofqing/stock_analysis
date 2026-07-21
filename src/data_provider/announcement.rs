@@ -351,8 +351,7 @@ const POSITIVE_KEYWORDS: &[&str] = &[
 /// but are not actionable enough for an immediate user notification.
 pub fn announcement_title_is_immediately_actionable(title: &str) -> bool {
     let creditor_procedure = title.contains("通知债权人")
-        && (title.contains("减少注册资本")
-            || (title.contains("注销") && title.contains("回购")));
+        && (title.contains("减少注册资本") || (title.contains("注销") && title.contains("回购")));
     let reduction_completed = title.contains("减持")
         && ["期限届满", "时间届满", "实施完毕", "实施完成"]
             .iter()
@@ -393,32 +392,18 @@ fn classify_title(title: &str, _code: &str, _name: &str) -> (AnnLevel, String) {
             }
         }
     }
-    // 模块级静态缓存: 配置 keyword 一旦加载就永久驻留 (review #14 + 15).
-    // review #15 修正: 原 Lazy<(Vec, Vec, Vec)> + is_empty() 区分不了"配置未加载"
-    // 和"配置加载但 Vec 为空". 用 OnceLock<Option<(Vec,Vec,Vec)>> 显式区分.
-    // 同时去掉冗余的 `|| get_announce_keywords().is_some()` (每次 classify_title
-    // 调一次 ArcSwap load + Arc clone, 完全违背零分配意图).
-    type KeywordGroups = (Vec<String>, Vec<String>, Vec<String>);
-    static CACHED_CFG: std::sync::OnceLock<Option<KeywordGroups>> = std::sync::OnceLock::new();
-    // review #15 改进: 首次 init 时如果 config 缺失 (None), 显式 log warn.
-    // AGENTS.md §2.2 要求 "missing data fields MUST be left blank or logged as warnings;
-    // MUST NOT be silently filled" — config 缺失 = 走 const fallback 是 silent fill.
-    // 用 OnceLock 状态一次性记录是否 warn 过 (避免每次 classify_title 重复打).
+    // BR-138: 每次读取 ArcSwap 当前快照，让启动加载与 SIGHUP 更新真实生效；
+    // 禁止把首次过早访问的 None 永久缓存到进程结束。
     static CFG_MISSING_WARNED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
-    let (emergency, important, positive) = CACHED_CFG
-        .get_or_init(|| {
-            crate::config::get_announce_keywords().map(|cfg| {
-                (
-                    cfg.emergency.clone(),
-                    cfg.important.clone(),
-                    cfg.positive.clone(),
-                )
-            })
-        })
-        .as_ref()
-        .map(|(e, i, p)| (KwList::Owned(e), KwList::Owned(i), KwList::Owned(p)))
-        .unwrap_or_else(|| {
+    let configured = crate::config::get_announce_keywords();
+    let (emergency, important, positive) = match configured.as_deref() {
+        Some(config) => (
+            KwList::Owned(&config.emergency),
+            KwList::Owned(&config.important),
+            KwList::Owned(&config.positive),
+        ),
+        None => {
             // review #15: 仅首次 fallback 时 log warn 一次 (避免每公告重复打印).
             if !CFG_MISSING_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 log::warn!(
@@ -435,7 +420,8 @@ fn classify_title(title: &str, _code: &str, _name: &str) -> (AnnLevel, String) {
                 KwList::Static(IMPORTANT_KEYWORDS),
                 KwList::Static(POSITIVE_KEYWORDS),
             )
-        });
+        }
+    };
 
     if let Some(kw) = emergency.first_match(title) {
         return (AnnLevel::Emergency, format!("标题含'{kw}'，直接告警"));

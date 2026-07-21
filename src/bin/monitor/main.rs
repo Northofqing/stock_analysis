@@ -5129,6 +5129,12 @@ async fn news_monitor_loop() {
 
         // 公告扫描（仅网络拉取在 spawn_blocking，处理在主线程）
 
+        if !stock_analysis::config::announcement_keywords_available() {
+            log::error!("[NewsMonitor][BR-138] 公告关键词配置不可用，本轮公告批次显式跳过");
+            tokio::time::sleep(tokio::time::Duration::from_secs(poll_secs)).await;
+            continue;
+        }
+
         // v13.10.1: fetch_announcements 改 async, news_monitor_loop 已在 tokio 运行时内
 
         // (由 tokio::join! 启动), 直接 .await 即可. review #15 用的 Handle::current().block_on
@@ -5188,8 +5194,8 @@ async fn news_monitor_loop() {
         // BR-112/BR-137: successfully classified announcements have exactly one
         // governed owner. Every normalized outcome remains explicit; legacy is
         // retained only for classification failures, never as an outcome fallback.
-        let announcement_route = v17_sources::route_announcements(&anns).await;
-        let normalized_external_ids = announcement_route.normalized_external_ids;
+        let announcement_route = v17_sources::route_announcements(&anns, &our_codes).await;
+        let handled_external_ids = announcement_route.handled_external_ids;
         log::info!(
             "[公告][BR-137] attempted={} classified={} pushed={} skipped={} failed={}",
             announcement_route.source.attempted,
@@ -5207,7 +5213,7 @@ async fn news_monitor_loop() {
                 if ev
                     .routed_external_id
                     .as_ref()
-                    .map(|id| normalized_external_ids.contains(id))
+                    .map(|id| handled_external_ids.contains(id))
                     .unwrap_or(false)
                 {
                     log::debug!("[公告][BR-137] legacy push skipped: normalized owner exists");
@@ -8636,9 +8642,13 @@ mod tests_v17_7_announcement_wiring {
     /// 3. For each AlertEvent, check if it would skip legacy push
     async fn simulate_announcement_loop(anns: Vec<Announcement>) -> AnnouncementLoopReport {
         // Push via the production BR-137 per-announcement owner.
-        let routed = v17_sources::route_announcements(&anns).await;
+        let eligible_codes = anns
+            .iter()
+            .map(|announcement| announcement.code.clone())
+            .collect();
+        let routed = v17_sources::route_announcements(&anns, &eligible_codes).await;
         let report = routed.source;
-        let normalized_external_ids = routed.normalized_external_ids;
+        let handled_external_ids = routed.handled_external_ids;
 
         // Simulate legacy loop: for each announcement, create an AlertEvent
         // and check if legacy push would be skipped
@@ -8677,7 +8687,7 @@ mod tests_v17_7_announcement_wiring {
             let skipped = ev
                 .routed_external_id
                 .as_ref()
-                .map(|id| normalized_external_ids.contains(id))
+                .map(|id| handled_external_ids.contains(id))
                 .unwrap_or(false);
 
             if !skipped {
