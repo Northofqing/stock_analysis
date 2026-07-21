@@ -47,6 +47,12 @@ Long-running shutdown applies the same drain step. This makes the module deep:
 callers learn one ready start contract and one awaited completion result, while
 filesystem and broadcast failure details remain local to the writer.
 
+The long-running service also selects on the writer handle alongside its market
+loops and SIGINT. A writer error, join error, or unexpected clean writer stop
+before bus shutdown is a terminal audit-health failure and exits 2 immediately;
+the service must not continue trading while event evidence is no longer being
+persisted.
+
 History is a read-only terminal command but still follows truthful status:
 corrupt JSONL or statistics input exits 1. Invalid explicit arguments likewise
 reach the parser instead of the service-enable gate.
@@ -92,6 +98,9 @@ policy, retention duration, or JSONL record format changes.
   cleanup failure, envelope write failure, and deterministic receiver lag.
 - A corrupt isolated history JSONL file returns exit 1; a writer initialization
   failure at monitor startup returns exit 2.
+- A monitor lifecycle unit test proves a completed writer error closes the bus
+  and is returned to the process owner; the long-running select treats that
+  completion as exit 2 instead of waiting until a later shutdown.
 - Focused tests, fmt, clippy, full workspace tests, compliance, coverage and
   release build must pass.
 - A release canary repeats `monitor --test --review` without

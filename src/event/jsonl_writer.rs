@@ -54,18 +54,14 @@ impl JsonlWriter {
         receiver: broadcast::Receiver<EventEnvelope>,
         base_dir: PathBuf,
         retention_days: u32,
-    ) -> Result<JoinHandle<()>, JsonlError> {
+    ) -> Result<JoinHandle<Result<(), JsonlError>>, JsonlError> {
         let writer = Self {
             base_dir,
             retention_days,
         };
         fs::create_dir_all(&writer.base_dir).await?;
         Self::cleanup_expired(&writer.base_dir, writer.retention_days).await?;
-        Ok(tokio::spawn(async move {
-            if let Err(error) = writer.consume(receiver).await {
-                log::error!("[jsonl_writer] fatal error: {error}");
-            }
-        }))
+        Ok(tokio::spawn(async move { writer.consume(receiver).await }))
     }
 
     /// Remove JSONL files older than `retention_days` from `base_dir`.
@@ -110,12 +106,12 @@ impl JsonlWriter {
                         // Skip replay envelopes; real events must not be lost.
                         continue;
                     }
-                    if let Err(e) = self.write_envelope(&env).await {
-                        log::error!("[jsonl_writer] write error for {}: {}", env.id, e);
-                    }
+                    self.write_envelope(&env).await?;
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    log::warn!("[jsonl_writer] receiver lagged, skipped {} events", skipped);
+                    return Err(JsonlError::Receive(broadcast::error::RecvError::Lagged(
+                        skipped,
+                    )));
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     log::info!("[jsonl_writer] receiver closed, shutting down normally");
@@ -266,7 +262,10 @@ mod tests {
         bus.publish(test_live_envelope("evt-1"));
         wait_until_file_contains(&dir, "evt-1").await;
         bus.shutdown();
-        let _ = handle.await;
+        handle
+            .await
+            .expect("join JSONL writer")
+            .expect("consume JSONL events");
 
         let lines = read_today_lines(&dir).await;
         assert_eq!(lines.len(), 1);
@@ -288,7 +287,10 @@ mod tests {
         bus.publish(test_replay_envelope("replay", "original"));
         wait_until_file_contains(&dir, "live").await;
         bus.shutdown();
-        let _ = handle.await;
+        handle
+            .await
+            .expect("join JSONL writer")
+            .expect("consume JSONL events");
 
         let text = read_today_text(&dir).await;
         assert!(

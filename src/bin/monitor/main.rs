@@ -897,6 +897,25 @@ mod virtual_observation_tests {
     }
 
     #[tokio::test]
+    async fn br141_shutdown_propagates_writer_task_failure() {
+        let bus = stock_analysis::event::EventBus::new_for_test(1);
+        let writer_failure =
+            stock_analysis::event::JsonlError::Io(std::io::Error::other("forced writer failure"));
+        let mut handle = Some(tokio::spawn(async move { Err(writer_failure) }));
+
+        let error = shutdown_jsonl_writer(&bus, &mut handle)
+            .await
+            .expect_err("terminal shutdown must expose the writer failure");
+
+        assert!(error.contains("forced writer failure"), "{error}");
+        assert!(
+            handle.is_none(),
+            "writer handle must be consumed exactly once"
+        );
+        assert_eq!(bus.receiver_count(), 0, "event bus must be closed");
+    }
+
+    #[tokio::test]
     async fn br103_missing_real_account_snapshot_blocks_close_review() {
         let error = build_close_review_report()
             .await
@@ -2455,6 +2474,39 @@ fn runtime_data_path(test_mode: bool, leaf: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(root).join(leaf)
 }
 
+type JsonlWriterTask = tokio::task::JoinHandle<Result<(), stock_analysis::event::JsonlError>>;
+
+async fn shutdown_jsonl_writer(
+    bus: &stock_analysis::event::EventBus,
+    handle: &mut Option<JsonlWriterTask>,
+) -> Result<(), String> {
+    bus.shutdown();
+    let handle = handle
+        .take()
+        .ok_or_else(|| "event JSONL writer handle is missing".to_string())?;
+    match handle.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(format!("event JSONL writer failed: {error}")),
+        Err(error) => Err(format!("event JSONL writer task join failed: {error}")),
+    }
+}
+
+async fn exit_after_jsonl_writer(
+    bus: &stock_analysis::event::EventBus,
+    handle: &mut Option<JsonlWriterTask>,
+    requested_code: i32,
+) -> ! {
+    let exit_code = match shutdown_jsonl_writer(bus, handle).await {
+        Ok(()) => requested_code,
+        Err(error) => {
+            log::error!("[event_bus.jsonl] terminal drain failed: {error}");
+            2
+        }
+    };
+    log::logger().flush();
+    std::process::exit(exit_code);
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     dotenvy::dotenv().ok();
@@ -2551,20 +2603,22 @@ async fn main() {
 
     // BR-141: JSONL initialization is awaited before the background consumer
     // starts, so setup failures cannot hide inside an unobserved nested task.
-    let _jsonl_writer_handle = match stock_analysis::event::JsonlWriter::spawn(
-        bus.subscribe(),
-        runtime_data_path(test_mode, "event_bus"),
-        1_827,
-    )
-    .await
-    {
-        Ok(handle) => handle,
-        Err(error) => {
-            log::error!("[event_bus.jsonl] initialization failed: {error}");
-            log::logger().flush();
-            std::process::exit(2);
-        }
-    };
+    let mut jsonl_writer_handle = Some(
+        match stock_analysis::event::JsonlWriter::spawn(
+            bus.subscribe(),
+            runtime_data_path(test_mode, "event_bus"),
+            1_827,
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                log::error!("[event_bus.jsonl] initialization failed: {error}");
+                log::logger().flush();
+                std::process::exit(2);
+            }
+        },
+    );
     log::info!(
         "[event_bus.jsonl] mode=enabled retention_days=1827 isolated_test={}",
         test_mode
@@ -2612,13 +2666,13 @@ async fn main() {
             "[BR-051] --test 拒绝打开默认生产数据库 {}; 请使用隔离 DATABASE_PATH",
             db_path
         );
-        std::process::exit(2);
+        exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, 2).await;
     }
     std::env::set_var("DATABASE_PATH", &db_path);
     if let Some(parent) = std::path::Path::new(&db_path).parent() {
         if let Err(error) = std::fs::create_dir_all(parent) {
             log::error!("[DB init] 创建目录 {:?} 失败: {}", parent, error);
-            std::process::exit(2);
+            exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, 2).await;
         }
     }
 
@@ -2634,7 +2688,7 @@ async fn main() {
         stock_analysis::database::DatabaseManager::init(Some(std::path::PathBuf::from(&db_path)))
     {
         log::error!("[DB init] 失败: {}", error);
-        std::process::exit(2);
+        exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, 2).await;
     }
 
     // 加载热配置
@@ -2645,7 +2699,7 @@ async fn main() {
         eprintln!(
             "[BR-107] --buy/--sell 手工成交旁路已关闭：缺少统一行情、账户、模式、限价、确认与订单审计证据；请使用 paper decision/order safety 管道"
         );
-        std::process::exit(2);
+        exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, 2).await;
     }
 
     // v17.6: 推送模式 (--push), 调 6 dispatcher 一次后退出
@@ -2682,7 +2736,7 @@ async fn main() {
     match stock_analysis::event::cli::parse_args(&args_refs) {
         Ok(Some(stock_analysis::event::cli::EventCommand::Help)) => {
             print_event_help();
-            std::process::exit(0);
+            exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, 0).await;
         }
         Ok(Some(stock_analysis::event::cli::EventCommand::Replay {
             date,
@@ -2710,11 +2764,12 @@ async fn main() {
                         summary.skipped,
                         summary.failed
                     );
-                    std::process::exit(if summary.has_failures() { 1 } else { 0 });
+                    let exit_code = if summary.has_failures() { 1 } else { 0 };
+                    exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, exit_code).await;
                 }
                 Err(error) => {
                     eprintln!("[replay] failed: {error}");
-                    std::process::exit(1);
+                    exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, 1).await;
                 }
             }
         }
@@ -2731,7 +2786,7 @@ async fn main() {
             };
             let base_dir = runtime_data_path(test_mode, "event_bus");
             let query = HistoryQuery::new(base_dir);
-            if success_rate {
+            let history_result = if success_rate {
                 let window = date
                     .map(|d| {
                         let now = chrono::Local::now().date_naive();
@@ -2754,10 +2809,9 @@ async fn main() {
                             stats.deduped,
                             stats.success_rate * 100.0
                         );
+                        Ok(())
                     }
-                    Err(e) => {
-                        eprintln!("[history] success_rate query failed: {}", e);
-                    }
+                    Err(e) => Err(format!("success_rate query failed: {e}")),
                 }
             } else {
                 let filter = HistoryFilter {
@@ -2773,20 +2827,26 @@ async fn main() {
                         for line in format_history_lines(&entries) {
                             println!("{line}");
                         }
+                        Ok(())
                     }
-                    Err(e) => {
-                        eprintln!("[history] query failed: {}", e);
-                    }
+                    Err(e) => Err(format!("query failed: {e}")),
                 }
-            }
-            std::process::exit(0);
+            };
+            let exit_code = match history_result {
+                Ok(()) => 0,
+                Err(error) => {
+                    eprintln!("[history] {error}");
+                    1
+                }
+            };
+            exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, exit_code).await;
         }
         Ok(None) => {
             // No event command — fall through to existing monitor behavior.
         }
         Err(e) => {
             eprintln!("[event] CLI error: {}", e);
-            std::process::exit(1);
+            exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, 1).await;
         }
     }
 
@@ -2825,7 +2885,7 @@ async fn main() {
         Ok(source) => source,
         Err(error) => {
             log::error!("[broker] 启动失败: {}", error);
-            return;
+            exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, 2).await;
         }
     };
 
@@ -2871,13 +2931,14 @@ async fn main() {
 
     if e2e_mode {
         log::info!("[v70] E2E 模式启动 — 跑所有 v12 §14 模板 (忽略时间窗口)");
-        match e2e_all_templates_run().await {
-            Ok(()) => std::process::exit(0),
+        let exit_code = match e2e_all_templates_run().await {
+            Ok(()) => 0,
             Err(error) => {
                 log::error!("[v70][BR-051][BR-103] E2E 失败: {error}");
-                std::process::exit(2);
+                2
             }
-        }
+        };
+        exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, exit_code).await;
     }
 
     // v70+: 兑现回填 (D+1 outcome 写回 d01_recommendations jsonl)
@@ -2891,7 +2952,7 @@ async fn main() {
 
         log::info!("[v70+] 回填完成 | {} | 更新行数 = {}", date, updated);
 
-        std::process::exit(0);
+        exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, 0).await;
     }
 
     // v14.1 F7: stock_position.st_type 回填 (从 name LIKE 推断)
@@ -2903,13 +2964,18 @@ async fn main() {
 
         let db = DatabaseManager::get();
 
-        match db.backfill_st_type() {
-            Ok(n) => log::info!("[v14.1 F7] 回填完成 | 更新行数 = {}", n),
+        let exit_code = match db.backfill_st_type() {
+            Ok(n) => {
+                log::info!("[v14.1 F7] 回填完成 | 更新行数 = {}", n);
+                0
+            }
+            Err(error) => {
+                log::error!("[v14.1 F7] 回填失败: {error}");
+                2
+            }
+        };
 
-            Err(e) => log::error!("[v14.1 F7] 回填失败: {}", e),
-        }
-
-        std::process::exit(0);
+        exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, exit_code).await;
     }
 
     // v14.1 BR-015: chain_name 缺失统计 (实算留给 chain registry 接入)
@@ -2921,39 +2987,55 @@ async fn main() {
 
         let db = DatabaseManager::get();
 
-        match db.backfill_chain_name() {
-            Ok((updated, missing)) => log::info!(
-                "[v14.1 BR-015] 回填完成 | 更新 {} 条, 仍缺失 {} 条 (查不到 chain 或未在 registry)",
-                updated,
-                missing
-            ),
+        let exit_code = match db.backfill_chain_name() {
+            Ok((updated, missing)) => {
+                log::info!(
+                    "[v14.1 BR-015] 回填完成 | 更新 {} 条, 仍缺失 {} 条 (查不到 chain 或未在 registry)",
+                    updated,
+                    missing
+                );
+                0
+            }
+            Err(error) => {
+                log::error!("[v14.1 BR-015] 回填失败: {error}");
+                2
+            }
+        };
 
-            Err(e) => log::error!("[v14.1 BR-015] 回填失败: {}", e),
-        }
-
-        std::process::exit(0);
+        exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, exit_code).await;
     }
 
     if terminal_review_requested(&startup_args) {
         log::info!("[复盘] --review 终端模式启动，完成后退出，不进入常驻监控");
-        match review_execution_path(&startup_args) {
+        let result = match review_execution_path(&startup_args) {
             ReviewExecutionPath::StrictDispatchers => run_review_only().await,
-        }
-        std::process::exit(0);
+        };
+        let exit_code = match result {
+            Ok(()) => 0,
+            Err(error) => {
+                log::error!("[复盘] {error}. exit 2.");
+                2
+            }
+        };
+        exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, exit_code).await;
     }
 
     if test_mode {
         if std::env::args().any(|a| a == "--v13-diag") {
             // v13.27: 端到端诊断 (5 dispatcher 全链路, 输出 data/v13_diag_report.json)
 
-            v13_diag::report_v13_diag()
-                .await
-                .expect("v13.27 diag failed");
+            let exit_code = match v13_diag::report_v13_diag().await {
+                Ok(()) => 0,
+                Err(error) => {
+                    log::error!("[v13.27] diagnostic failed: {error}");
+                    2
+                }
+            };
 
-            std::process::exit(0);
+            exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, exit_code).await;
         }
 
-        run_review_only().await;
+        let review_result = run_review_only().await;
 
         // [v12 删除] P1.1 老 "📊 A股市场概览" 推送 (用 std::thread::spawn + block_in_place)
 
@@ -2965,18 +3047,25 @@ async fn main() {
 
         // 干净退出 (避免 runtime drop panic)
 
-        std::process::exit(0);
+        let exit_code = match review_result {
+            Ok(()) => 0,
+            Err(error) => {
+                log::error!("[复盘] {error}. exit 2.");
+                2
+            }
+        };
+        exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, exit_code).await;
     } else if push_dry_run {
         log::info!("[v14.0] --push-dry-run 模式启动");
 
         if let Err(error) = run_daily_pushes_dry_run().await {
             log::error!("[v14.0] --push-dry-run 失败: {error}");
-            std::process::exit(2);
+            exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, 2).await;
         }
 
         log::info!("[v14.0] --push-dry-run 完成");
 
-        std::process::exit(0);
+        exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, 0).await;
     } else if push_mode {
         // v30: --push 模式 (修复 v22 死代码)
 
@@ -2988,12 +3077,12 @@ async fn main() {
 
         if let Err(error) = run_daily_pushes().await {
             log::error!("[v30][BR-108] --push 批次拒绝: {error}");
-            std::process::exit(2);
+            exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, 2).await;
         }
 
         log::info!("[v30] --push 完成");
 
-        std::process::exit(0);
+        exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, 0).await;
     } else {
         // 订阅者示例：独立任务消费告警/扫描事件并写入审计日志，
 
@@ -3123,23 +3212,55 @@ async fn main() {
         tokio::spawn(post_close_news_scheduler());
         spawn_post_session_review_scheduler();
 
-        tokio::select! {
+        let writer_completion = {
+            let writer_handle = jsonl_writer_handle
+                .as_mut()
+                .expect("BR-141 writer handle must exist while monitor is running");
 
-            _ = main_loops => {},
+            tokio::select! {
 
-            _ = tokio::signal::ctrl_c() => {
+                _ = main_loops => None,
 
-                log::warn!("收到 SIGINT，正在优雅关闭监控...");
+                _ = tokio::signal::ctrl_c() => {
 
-                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                    log::warn!("收到 SIGINT，正在优雅关闭监控...");
 
-                log::info!("监控已安全关闭");
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
 
+                    log::info!("监控已安全关闭");
+
+                    None
+                },
+
+                result = writer_handle => Some(result),
             }
-
-        }
+        };
 
         event_consumer.abort();
+
+        if let Some(result) = writer_completion {
+            jsonl_writer_handle.take();
+            bus.shutdown();
+            match result {
+                Ok(Ok(())) => {
+                    log::error!("[event_bus.jsonl][BR-141] writer stopped before service shutdown")
+                }
+                Ok(Err(error)) => {
+                    log::error!("[event_bus.jsonl][BR-141] writer failed: {error}")
+                }
+                Err(error) => {
+                    log::error!("[event_bus.jsonl][BR-141] writer task join failed: {error}")
+                }
+            }
+            log::logger().flush();
+            std::process::exit(2);
+        }
+
+        if let Err(error) = shutdown_jsonl_writer(bus, &mut jsonl_writer_handle).await {
+            log::error!("[event_bus.jsonl] shutdown failed: {error}");
+            log::logger().flush();
+            std::process::exit(2);
+        }
     }
 }
 
@@ -3179,13 +3300,11 @@ fn review_timeout_secs() -> u64 {
 
 /// 手动复盘：`cargo run --bin monitor -- --review`
 
-async fn run_review_only() {
+async fn run_review_only() -> Result<(), String> {
     log::info!("[复盘] 手动触发盘后分析...");
 
     if !evaluate_account_mode_hook(true).await {
-        log::error!("[复盘][BR-108] 真实 AccountMode/banner 初始化失败，exit 2");
-        log::logger().flush();
-        std::process::exit(2);
+        return Err("[BR-108] 真实 AccountMode/banner 初始化失败".to_string());
     }
 
     // 修复 P0-G (2026-06-30 codex review): 顶层 5min fast-fail (AGENTS §2.1, BR-009).
@@ -3218,40 +3337,25 @@ async fn run_review_only() {
             if let Err(error) =
                 review_batch::append_task_transition_audit(transitions, now.date_naive())
             {
-                log::error!("[复盘][BR-110][BR-140] 逐任务结果审计失败: {error}. exit 2.");
-                log::logger().flush();
-                std::process::exit(2);
+                return Err(format!("[BR-110][BR-140] 逐任务结果审计失败: {error}"));
             }
             if batch.has_confirmed_delivery() {
                 log::info!(
                     "[复盘] ======== 盘后分析完成 ({}s) ========",
                     review_start.elapsed().as_secs()
                 );
+                Ok(())
             } else {
-                log::error!(
-                    "[复盘][BR-140] 严格盘后复盘没有任何确认投递；逐任务状态已写审计. exit 2."
-                );
-                log::logger().flush();
-                std::process::exit(2);
+                Err("[BR-140] 严格盘后复盘没有任何确认投递；逐任务状态已写审计".to_string())
             }
         }
 
-        Ok(Err(error)) => {
-            log::error!("[复盘] 关键数据不可用: {}. exit 2.", error);
-            log::logger().flush();
-            std::process::exit(2);
-        }
+        Ok(Err(error)) => Err(format!("关键数据不可用: {error}")),
 
-        Err(_elapsed) => {
-            log::error!(
-                "[复盘] {}s 超时未完成, 上游数据源可能全部不可用 / 网络黑洞 / 死锁. exit 2.",
-                review_timeout_secs
-            );
-
-            log::logger().flush();
-
-            std::process::exit(2);
-        }
+        Err(_elapsed) => Err(format!(
+            "{}s 超时未完成, 上游数据源可能全部不可用 / 网络黑洞 / 死锁",
+            review_timeout_secs
+        )),
     }
 }
 

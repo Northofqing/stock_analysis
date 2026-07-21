@@ -297,7 +297,8 @@ capacity-one bus with two publications before the consumer starts reports lag.
 Return `JoinHandle<Result<(), JsonlError>>`; use `?` for envelope writes and
 convert `RecvError::Lagged` into a terminal `JsonlError`. Add one monitor lifecycle
 helper that shuts down the bus, awaits exactly one handle, and converts writer or
-join failure to exit 2.
+join failure to exit 2. The long-running service must select on that handle and
+stop immediately if it fails or completes unexpectedly before bus shutdown.
 
 - [ ] **Step 4: Remove deep exits and fix history status**
 
