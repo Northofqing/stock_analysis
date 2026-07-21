@@ -245,6 +245,7 @@ pub struct ReviewPreflight {
 }
 
 impl ReviewPreflight {
+    #[cfg(test)]
     pub fn outcome_for(&self, task: ReviewTask) -> Option<&ReviewTaskOutcome> {
         self.outcomes
             .iter()

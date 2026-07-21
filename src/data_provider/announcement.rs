@@ -97,6 +97,25 @@ pub struct Announcement {
     pub url: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnnouncementListProtocol {
+    PrimaryJson,
+    AlternateJsonp,
+}
+
+#[derive(Debug, Clone)]
+pub struct AnnouncementFetchBatch {
+    pub announcements: Vec<Announcement>,
+    pub list_protocol: AnnouncementListProtocol,
+    pub rejected_detail_ids: Vec<String>,
+}
+
+impl AnnouncementFetchBatch {
+    pub fn source_complete(&self) -> bool {
+        self.rejected_detail_ids.is_empty()
+    }
+}
+
 impl Announcement {
     /// Returns the provider publication date only when the complete field
     /// matches a registered Eastmoney date/time format (BR-137).
@@ -527,6 +546,47 @@ fn parse_announcement_http_response(
     validate_announcement_response(response)
 }
 
+fn parse_announcement_jsonp_http_response(
+    status: u16,
+    body: std::result::Result<String, String>,
+) -> Result<Vec<AnnItem>> {
+    if !(200..300).contains(&status) {
+        return Err(anyhow::anyhow!("公告备用协议 HTTP 状态异常: {status}"));
+    }
+    let body = body.map_err(|error| anyhow::anyhow!("公告备用协议正文读取失败: {error}"))?;
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow::anyhow!("公告备用协议响应正文为空"));
+    }
+    let json = if trimmed.starts_with('{') {
+        trimmed
+    } else {
+        let open = trimmed
+            .find('(')
+            .ok_or_else(|| anyhow::anyhow!("公告备用协议 JSONP 缺少左括号"))?;
+        let close = trimmed
+            .rfind(')')
+            .filter(|close| *close > open)
+            .ok_or_else(|| anyhow::anyhow!("公告备用协议 JSONP 缺少右括号"))?;
+        let callback = trimmed[..open].trim();
+        if callback.is_empty()
+            || !callback
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'.'))
+        {
+            return Err(anyhow::anyhow!("公告备用协议 JSONP callback 非法"));
+        }
+        let tail = trimmed[close + 1..].trim();
+        if !tail.is_empty() && tail != ";" {
+            return Err(anyhow::anyhow!("公告备用协议 JSONP 含非法尾随内容"));
+        }
+        &trimmed[open + 1..close]
+    };
+    let response: AnnResponse = serde_json::from_str(json)
+        .map_err(|error| anyhow::anyhow!("公告备用协议响应 JSON 非法: {error}"))?;
+    validate_announcement_response(response)
+}
+
 fn parse_announcement_detail_http_response(
     status: u16,
     body: std::result::Result<String, String>,
@@ -643,14 +703,100 @@ fn assemble_announcements(
     Ok(results)
 }
 
+#[derive(Debug)]
+struct AnnouncementAssemblyBatch {
+    announcements: Vec<Announcement>,
+    rejected_details: Vec<String>,
+}
+
+fn assemble_announcements_partial(
+    list: Vec<AnnItem>,
+    detail_map: &std::collections::HashMap<String, String>,
+    keywords: Option<&crate::config::AnnounceKeywordsFile>,
+) -> Result<AnnouncementAssemblyBatch> {
+    let mut accepted = Vec::with_capacity(list.len());
+    let mut rejected_details = Vec::new();
+    for item in list {
+        let needs_detail = !detail_art_codes(std::slice::from_ref(&item), keywords).is_empty();
+        if needs_detail && !detail_map.contains_key(&item.art_code) {
+            rejected_details.push(item.art_code);
+        } else {
+            accepted.push(item);
+        }
+    }
+    let announcements = assemble_announcements(accepted, detail_map, keywords)?;
+    Ok(AnnouncementAssemblyBatch {
+        announcements,
+        rejected_details,
+    })
+}
+
+async fn fetch_announcement_list_with_fallback(
+    client: &reqwest::Client,
+    date_str: &str,
+    announcement_url: &str,
+) -> Result<(Vec<AnnItem>, AnnouncementListProtocol)> {
+    let primary_url = format!(
+        "{}?page_size={}&page_index=1&ann_type=SHA,SZA&start_date={}&end_date={}",
+        announcement_url, MAX_PER_FETCH, date_str, date_str
+    );
+    let primary = async {
+        let response = client
+            .get(&primary_url)
+            .header("User-Agent", "Mozilla/5.0")
+            .header("Referer", "https://data.eastmoney.com/")
+            .send()
+            .await?;
+        let status = response.status().as_u16();
+        let body = response.text().await.map_err(|error| error.to_string());
+        parse_announcement_http_response(status, body)
+    }
+    .await;
+    let primary_error = match primary {
+        Ok(list) => return Ok((list, AnnouncementListProtocol::PrimaryJson)),
+        Err(error) => {
+            warn!("[公告][BR-140] primary list protocol failed: {error}");
+            error
+        }
+    };
+
+    let alternate_url = format!(
+        "{}?cb=jQuery&page_size={}&page_index=1&ann_type=A&client_source=web&begin_time={}&end_time={}",
+        announcement_url, MAX_PER_FETCH, date_str, date_str
+    );
+    let alternate = async {
+        let response = client
+            .get(&alternate_url)
+            .header("User-Agent", "Mozilla/5.0")
+            .header("Referer", "https://data.eastmoney.com/")
+            .header("Origin", "https://data.eastmoney.com")
+            .send()
+            .await?;
+        let status = response.status().as_u16();
+        let body = response.text().await.map_err(|error| error.to_string());
+        parse_announcement_jsonp_http_response(status, body)
+    }
+    .await;
+    match alternate {
+        Ok(list) => Ok((list, AnnouncementListProtocol::AlternateJsonp)),
+        Err(alternate_error) => Err(anyhow::anyhow!(
+            "公告列表 primary={primary_error}; alternate={alternate_error}"
+        )),
+    }
+}
+
 // ── API 拉取 ──
 
 /// review #15: 改 async + FuturesUnordered 并发 fetch_ann_detail.
 pub async fn fetch_announcements(date: Option<&str>) -> Result<Vec<Announcement>> {
+    Ok(fetch_announcements_batch(date).await?.announcements)
+}
+
+pub async fn fetch_announcements_batch(date: Option<&str>) -> Result<AnnouncementFetchBatch> {
     let keywords = crate::config::get_announce_keywords()
         .ok_or_else(|| anyhow::anyhow!("BR-138 公告关键词配置不可用，生产公告获取已阻断"))?;
     let client = crate::http_client::SHARED_HTTP_CLIENT.clone();
-    fetch_announcements_from_urls(
+    fetch_announcements_batch_from_urls(
         &client,
         date,
         ANNOUNCE_URL,
@@ -668,6 +814,7 @@ async fn fetch_announcements_with_client(
     fetch_announcements_from_urls(client, date, ANNOUNCE_URL, ANNOUNCE_DETAIL_URL, None).await
 }
 
+#[cfg(test)]
 async fn fetch_announcements_from_urls(
     client: &reqwest::Client,
     date: Option<&str>,
@@ -675,26 +822,27 @@ async fn fetch_announcements_from_urls(
     detail_url: &str,
     keywords: Option<&crate::config::AnnounceKeywordsFile>,
 ) -> Result<Vec<Announcement>> {
+    Ok(
+        fetch_announcements_batch_from_urls(client, date, announcement_url, detail_url, keywords)
+            .await?
+            .announcements,
+    )
+}
+
+async fn fetch_announcements_batch_from_urls(
+    client: &reqwest::Client,
+    date: Option<&str>,
+    announcement_url: &str,
+    detail_url: &str,
+    keywords: Option<&crate::config::AnnounceKeywordsFile>,
+) -> Result<AnnouncementFetchBatch> {
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let date_str = date.unwrap_or(&today);
     chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
         .map_err(|error| anyhow::anyhow!("公告查询日期非法 {date_str:?}: {error}"))?;
 
-    let url = format!(
-        "{}?page_size={}&page_index=1&ann_type=SHA,SZA&start_date={}&end_date={}",
-        announcement_url, MAX_PER_FETCH, date_str, date_str
-    );
-
-    let response = client
-        .get(&url)
-        .header("User-Agent", "Mozilla/5.0")
-        .header("Referer", "https://data.eastmoney.com/")
-        .send()
-        .await?;
-    let status = response.status().as_u16();
-    let body = response.text().await.map_err(|error| error.to_string());
-
-    let list = parse_announcement_http_response(status, body)?;
+    let (list, list_protocol) =
+        fetch_announcement_list_with_fallback(client, date_str, announcement_url).await?;
     info!("[公告] {} 获取 {} 条", date_str, list.len());
 
     // 熔断：超 200 条仅标题扫描
@@ -710,25 +858,49 @@ async fn fetch_announcements_from_urls(
         let ac = art_code.clone();
         let detail_base = detail_url.to_string();
         async move {
-            let content = fetch_ann_detail_from_url(&c, &ac, &detail_base).await?;
-            Ok::<_, anyhow::Error>((ac, content))
+            (
+                ac.clone(),
+                fetch_ann_detail_from_url(&c, &ac, &detail_base).await,
+            )
         }
     }))
-    .await
-    .into_iter()
-    .collect::<Result<Vec<_>>>()?;
-    let detail_map: std::collections::HashMap<String, String> =
-        detail_results.into_iter().collect();
+    .await;
+    let mut detail_map = std::collections::HashMap::new();
+    for (art_code, result) in detail_results {
+        match result {
+            Ok(content) => {
+                detail_map.insert(art_code, content);
+            }
+            Err(error) => warn!(
+                "[公告][BR-140] detail rejected art_code={} reason={error}",
+                art_code
+            ),
+        }
+    }
 
-    let results = assemble_announcements(list, &detail_map, keywords)?;
+    let assembled = assemble_announcements_partial(list, &detail_map, keywords)?;
+    for art_code in &assembled.rejected_details {
+        warn!(
+            "[公告][BR-140] announcement rejected because verified detail is unavailable: {}",
+            art_code
+        );
+    }
 
     info!(
         "[公告][BR-138] 过滤后 {} 条需处理（含本地生命周期证据）",
-        results.len()
+        assembled.announcements.len()
     );
-    crate::monitor::data_mode::mark_capability_success(crate::monitor::data_mode::Capability::News)
+    if assembled.rejected_details.is_empty() {
+        crate::monitor::data_mode::mark_capability_success(
+            crate::monitor::data_mode::Capability::News,
+        )
         .map_err(anyhow::Error::msg)?;
-    Ok(results)
+    }
+    Ok(AnnouncementFetchBatch {
+        announcements: assembled.announcements,
+        list_protocol,
+        rejected_detail_ids: assembled.rejected_details,
+    })
 }
 
 async fn fetch_ann_detail_from_url(
@@ -1284,5 +1456,94 @@ mod tests {
         assert!(requests[1..]
             .iter()
             .all(|path| path.contains("client_source=web") && path.contains("page_index=1")));
+    }
+
+    #[tokio::test]
+    async fn br140_announcement_primary_failure_uses_verified_alternate_protocol() {
+        let jsonp = r#"jQuery({"data":{"list":[{"art_code":"TEST_CODE_ALT","title":"关于注销部分回购股份并减少注册资本通知债权人的公告","notice_date":"2026-07-18","codes":[{"stock_code":"000001","short_name":"TEST_CODE_协议甲"}],"columns":null}]}});"#;
+        let server = super::super::TestHttpServer::new(vec![
+            super::super::TestHttpResponse {
+                status: 503,
+                body: "TEST_CODE primary unavailable".to_string(),
+            },
+            super::super::TestHttpResponse::json(jsonp),
+        ]);
+        let list_url = format!("{}/api/security/ann", server.base_url());
+        let detail_url = format!("{}/api/content/ann", server.base_url());
+
+        let announcements = fetch_announcements_from_urls(
+            &super::super::loopback_http_client(),
+            Some("2026-07-18"),
+            &list_url,
+            &detail_url,
+            None,
+        )
+        .await
+        .expect("strict alternate JSONP protocol should recover the list");
+
+        assert_eq!(announcements.len(), 1);
+        assert_eq!(
+            announcements[0].external_id.as_deref(),
+            Some("TEST_CODE_ALT")
+        );
+        let requests = server.finish();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[0].contains("ann_type=SHA%2CSZA") || requests[0].contains("ann_type=SHA,SZA")
+        );
+        assert!(requests[1].contains("ann_type=A"));
+        assert!(requests[1].contains("begin_time=2026-07-18"));
+    }
+
+    #[tokio::test]
+    async fn br140_announcement_all_transports_fail_explicitly() {
+        let server = super::super::TestHttpServer::new(vec![
+            super::super::TestHttpResponse {
+                status: 503,
+                body: "TEST_CODE primary unavailable".to_string(),
+            },
+            super::super::TestHttpResponse {
+                status: 503,
+                body: "TEST_CODE alternate unavailable".to_string(),
+            },
+        ]);
+        let list_url = format!("{}/api/security/ann", server.base_url());
+        let detail_url = format!("{}/api/content/ann", server.base_url());
+
+        let error = fetch_announcements_from_urls(
+            &super::super::loopback_http_client(),
+            Some("2026-07-18"),
+            &list_url,
+            &detail_url,
+            None,
+        )
+        .await
+        .expect_err("both list transports failing must remain an error");
+
+        let message = error.to_string();
+        assert!(message.contains("primary"));
+        assert!(message.contains("alternate"));
+        assert_eq!(server.finish().len(), 2);
+    }
+
+    #[test]
+    fn br140_one_missing_detail_keeps_other_verified_announcements() {
+        let list = protocol_fixture();
+        let mut details = std::collections::HashMap::new();
+        details.insert("AN-EMERGENCY".to_string(), "立案正文".to_string());
+
+        let batch = assemble_announcements_partial(list, &details, None)
+            .expect("one missing detail must not reject unrelated complete rows");
+
+        assert_eq!(batch.announcements.len(), 2);
+        assert_eq!(batch.rejected_details, vec!["AN-IMPORTANT"]);
+        assert!(batch
+            .announcements
+            .iter()
+            .any(|announcement| announcement.external_id.as_deref() == Some("AN-EMERGENCY")));
+        assert!(batch
+            .announcements
+            .iter()
+            .any(|announcement| announcement.external_id.as_deref() == Some("AN-INFO")));
     }
 }

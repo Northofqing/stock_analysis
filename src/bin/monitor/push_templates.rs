@@ -5987,9 +5987,8 @@ pub async fn dispatch_r08_event_calendar_outcome(
     use crate::review_batch::ReviewTaskOutcome;
 
     let announcements =
-        stock_analysis::data_provider::announcement::fetch_announcements(Some(date))
+        stock_analysis::data_provider::announcement::fetch_announcements_batch(Some(date))
             .await
-            .map(filter_r08_event_announcements)
             .map_err(|error| format!("公告数据源失败: {error}"));
 
     let positions = stock_analysis::portfolio::get_positions_with_source_time().and_then(
@@ -6024,7 +6023,17 @@ pub async fn dispatch_r08_event_calendar_outcome(
         .unwrap_or_default();
     let announcement_summary = announcements
         .as_ref()
-        .map(|anns| build_event_calendar_macro_summary(anns, &holding_codes))
+        .map(|batch| {
+            let anns = filter_r08_event_announcements(batch.announcements.clone());
+            let mut summary = build_event_calendar_macro_summary(&anns, &holding_codes);
+            if !batch.source_complete() {
+                summary.push_str(&format!(
+                    "；公告正文部分不可用（{} 条已隔离）",
+                    batch.rejected_detail_ids.len()
+                ));
+            }
+            summary
+        })
         .map_err(Clone::clone);
     let real_holdings = positions.map(|positions| {
         positions
@@ -6032,7 +6041,8 @@ pub async fn dispatch_r08_event_calendar_outcome(
             .take(5)
             .map(|position| {
                 let kind = match announcements.as_ref() {
-                    Ok(anns) => anns
+                    Ok(batch) => batch
+                        .announcements
                         .iter()
                         .find(|announcement| announcement.code == position.code)
                         .map(|announcement| announcement.title.chars().take(20).collect())
