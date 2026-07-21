@@ -8,8 +8,11 @@
 
 **Review corrections:** The shared production provider holds one exact keyword snapshot through
 transport, detail selection, and assembly. Each announcement route rebuilds its audience from a
-real position snapshot no older than 30 seconds plus independently loaded explicit watch codes;
-an unavailable/stale position component is excluded without blocking the independent watch set.
+verified broker position batch no older than 30 seconds plus independently loaded explicit watch
+codes; local `stock_position.updated_at` is never accepted as source provenance. Until that broker
+batch exists, the unavailable position component is explicitly excluded without blocking the
+independent watch set. The router returns a typed disposition per handled identity; only `Pushed`
+may feed D-01/I-02, while filtered/failed outcomes block legacy fallback without downstream effects.
 Configuration, provider, audience, and name-resolution failures isolate only the announcement
 sub-chain; unrelated outer-loop scheduling, reset, persistence, and banner refresh still run.
 
@@ -203,9 +206,14 @@ pub async fn route_announcements(
 ) -> AnnouncementSourceRouteReport
 ```
 
-In `news_monitor_loop`, require `announcement_keywords_available()`, pass `&our_codes`, and use
-`handled_external_ids` for the existing legacy suppression check. Do not apply this gate to policy or
-critical flash producers.
+In `news_monitor_loop`, require `announcement_keywords_available()`, pass the independently loaded
+watch audience plus only a verified broker-position component, and consume the route's typed
+per-identity disposition. Every disposition suppresses legacy fallback, but append to the downstream
+trigger set only for `Pushed`. Do not apply this gate to policy or critical flash producers.
+
+Add a RED test proving a fresh local `stock_position.updated_at` cannot authorize a holding, and a
+RED test proving lifecycle/off-universe dispositions cannot make the outer-loop important-event gate
+true. Keep positive controls for explicit watch membership and normalized `Pushed` outcomes.
 
 - [ ] **Step 4: Update all existing router tests/callers and run monitor tests**
 

@@ -49,8 +49,10 @@ Eastmoney announcement batch
 ```
 
 Every provider item with a complete external identity remains owned by the normalized route once it
-is classified. A relevance-filtered item is recorded as skipped and its identity is returned in the
-handled-identity set, so the legacy state machine cannot send it as a fallback.
+is classified. The route returns a typed disposition for each owned identity. A relevance-filtered
+item is recorded as skipped/handled so the legacy state machine cannot send it as a fallback, but it
+is not eligible to trigger D-01, I-02, or another downstream notification. Only a `Pushed`
+disposition can feed those downstream triggers.
 
 ## 4. Required configuration
 
@@ -71,7 +73,8 @@ An announcement is eligible for immediate BR-137 delivery only when all of the f
 1. the provider external identity, security code, publication date, source, title, and classified
    level are valid under existing BR-137 rules;
 2. the security code is present in the audience rebuilt immediately before routing from a real
-   portfolio snapshot no older than 30 seconds plus the independently loaded explicit watch codes;
+   broker position batch no older than 30 seconds, carrying immutable provider/batch provenance,
+   plus the independently loaded explicit watch codes;
 3. the title is not a procedural creditor notice caused by cancellation of repurchased shares or a
    registered-capital reduction;
 4. the title is not a reduction-plan completion, expiry, or completed-implementation notice.
@@ -93,21 +96,26 @@ universe gate.
   lifecycle exclusions and is deterministic.
 - `route_announcements(&[Announcement], &HashSet<String>)` receives the real eligible universe
   explicitly; it does not query account state or Banner internally.
-- `build_announcement_audience_codes` rejects non-empty positions without a source timestamp or with
-  an oldest source timestamp older than 30 seconds. The long-lived news loop never reuses startup
-  position membership for announcement routing.
-- `AnnouncementSourceRouteReport.handled_external_ids` prevents legacy bypass for both delivered and
-  intentionally filtered normalized events.
+- A verified position-audience component requires immutable broker provider/batch identity and a
+  source timestamp no older than 30 seconds. The local simulated `stock_position` table and its
+  mutable `updated_at` are never accepted as that evidence. Until a broker position batch is
+  connected, production explicitly excludes the position component and continues with independent
+  watch codes.
+- `AnnouncementSourceRouteReport.dispositions` maps every owned external ID to a typed `Pushed`,
+  `FilteredLifecycle`, `FilteredAudience`, or `Failed` result. All four prevent legacy fallback;
+  only `Pushed` participates in downstream notification triggers.
 
 ## 7. Failure modes
 
 - Missing/malformed announcement configuration: explicit error; announcement batch does not run.
-- Real position snapshot unavailable, untimestamped, or older than 30 seconds: exclude the stale
-  position component explicitly while retaining the independently validated explicit-watch
-  audience; never replace either component with an empty or fake universe.
+- Verified broker position snapshot unavailable, missing immutable batch provenance, untimestamped,
+  or older than 30 seconds: exclude the position component explicitly while retaining the
+  independently validated explicit-watch audience; never infer freshness from a local database
+  write time or replace either component with a fake universe.
 - Incomplete provider identity/date/code: existing explicit BR-137 rejection.
-- Relevance-filtered event: `skipped += 1`, reason-only log without message body or account values,
-  and legacy suppression via handled provider identity.
+- Relevance-filtered event: `skipped += 1`, a typed filtered disposition, reason-only log without
+  message body or account values, legacy suppression via owned provider identity, and no D-01/I-02
+  downstream trigger.
 - Governance/sink/audit failure after relevance approval: existing BR-137 retry semantics remain.
 - Configuration, transport, audience, or name-resolution failure is isolated to the announcement
   sub-chain. The outer news loop must still run its unrelated scheduler, daily reset, state flush,
@@ -121,8 +129,10 @@ universe gate.
 - A valid important announcement outside the eligible universe is skipped and cannot fall through to
   legacy delivery.
 - A valid important or emergency announcement inside the universe still reaches BR-137 governance.
-- Fresh positions plus explicit watch codes form the audience; stale or untimestamped non-empty
-  positions are rejected without blocking explicit watch codes.
+- A mutable local `stock_position.updated_at` cannot authorize audience membership; absent verified
+  broker batch evidence, only explicit watch codes form the audience.
+- Typed filtered dispositions suppress both legacy fallback and D-01/I-02 downstream triggers;
+  only `Pushed` remains downstream-eligible.
 - Policy and critical flash behavior is unchanged.
 - Full formatting, strict Clippy, workspace tests, compliance, coverage, release build, and an
   independent review pass before merge.
