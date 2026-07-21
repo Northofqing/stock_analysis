@@ -9171,6 +9171,40 @@ mod tests_br140_review_chain_isolation {
         assert_eq!(batch.rejected.len(), 1);
         assert!(!batch.source_complete());
     }
+
+    #[test]
+    fn br140_r03_kline_failure_is_isolated_per_stock() {
+        let candidates = vec![
+            ReviewLimitChainCandidate {
+                code: "TEST_CODE_000001".to_string(),
+                name: "测试一".to_string(),
+                sector: Some("测试产业链".to_string()),
+            },
+            ReviewLimitChainCandidate {
+                code: "TEST_CODE_000002".to_string(),
+                name: "测试二".to_string(),
+                sector: Some("测试产业链".to_string()),
+            },
+        ];
+
+        let batch = collect_review_limit_chain_stocks_with(
+            &candidates,
+            |_code| unreachable!("complete sector must not call resolver"),
+            |code| {
+                if code.ends_with("000001") {
+                    Err("TEST_CODE kline unavailable".to_string())
+                } else {
+                    Ok(vec![true, false])
+                }
+            },
+        );
+
+        assert_eq!(batch.accepted.len(), 1);
+        assert_eq!(batch.accepted[0].code, "TEST_CODE_000002");
+        assert_eq!(batch.rejected.len(), 1);
+        assert!(batch.rejected[0].reason.contains("日 K 获取失败"));
+        assert!(!batch.source_complete());
+    }
 }
 
 // ========================================================================

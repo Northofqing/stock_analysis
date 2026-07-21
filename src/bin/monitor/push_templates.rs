@@ -5980,6 +5980,29 @@ fn prepare_r08_event_calendar(
     })
 }
 
+fn validate_r08_positions_snapshot(
+    positions: Vec<stock_analysis::portfolio::Position>,
+    source_time: Option<chrono::DateTime<chrono::Local>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<stock_analysis::portfolio::Position>, String> {
+    match source_time {
+        Some(source_time)
+            if stock_analysis::portfolio::position_source_is_fresh(source_time, now) =>
+        {
+            Ok(positions)
+        }
+        Some(source_time) => {
+            let age_ms = now
+                .signed_duration_since(source_time.with_timezone(&chrono::Utc))
+                .num_milliseconds();
+            Err(format!(
+                "BR-103 实盘持仓来源过期: age_ms={age_ms} max_ms=30000"
+            ))
+        }
+        None => Err("BR-103 实盘持仓缺少来源时间".to_string()),
+    }
+}
+
 pub async fn dispatch_r08_event_calendar_outcome(
     date: &str,
     _banner: &BannerCtx,
@@ -5992,24 +6015,8 @@ pub async fn dispatch_r08_event_calendar_outcome(
             .map_err(|error| format!("公告数据源失败: {error}"));
 
     let positions = stock_analysis::portfolio::get_positions_with_source_time().and_then(
-        |(positions, source_time)| match source_time {
-            Some(source_time)
-                if stock_analysis::portfolio::position_source_is_fresh(
-                    source_time,
-                    chrono::Utc::now(),
-                ) =>
-            {
-                Ok(positions)
-            }
-            Some(source_time) => {
-                let age_ms = chrono::Utc::now()
-                    .signed_duration_since(source_time.with_timezone(&chrono::Utc))
-                    .num_milliseconds();
-                Err(format!(
-                    "BR-103 实盘持仓来源过期: age_ms={age_ms} max_ms=30000"
-                ))
-            }
-            None => Err("BR-103 实盘持仓缺少来源时间".to_string()),
+        |(positions, source_time)| {
+            validate_r08_positions_snapshot(positions, source_time, chrono::Utc::now())
         },
     );
     let holding_codes = positions
@@ -6151,6 +6158,20 @@ mod tests_br140_r08_partial_components {
         .expect_err("zero verified components must not render or push");
 
         assert!(error.contains("全部 4 个组件失败"));
+    }
+
+    #[test]
+    fn br140_r08_stale_positions_are_rejected() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-21T10:00:00+08:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let source_time = (now - chrono::Duration::seconds(31)).with_timezone(&chrono::Local);
+
+        let error = validate_r08_positions_snapshot(Vec::new(), Some(source_time), now)
+            .expect_err("positions older than 30 seconds must not enter R-08");
+
+        assert!(error.contains("age_ms=31000"));
+        assert!(error.contains("max_ms=30000"));
     }
 }
 
