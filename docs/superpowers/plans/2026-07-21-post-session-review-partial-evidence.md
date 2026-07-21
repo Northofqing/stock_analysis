@@ -279,7 +279,7 @@ git commit -m "fix: classify unavailable review capabilities"
 
 - [x] **Step 1: Add RED provider and component tests**
 
-Use local HTTP fixtures to add `br140_announcement_primary_failure_uses_verified_alternate_protocol`, `br140_announcement_all_transports_fail_explicitly`, `br140_one_detail_failure_keeps_other_verified_announcements`, `br140_r08_stale_positions_are_rejected`, and `br140_r08_requires_one_complete_component`.
+Use local HTTP fixtures to add `br140_announcement_primary_failure_uses_verified_alternate_protocol`, `br140_announcement_all_transports_fail_explicitly`, `br140_alternate_jsonp_rejects_bare_json_and_callback_mismatch`, `br140_one_detail_failure_keeps_other_verified_announcements`, `br140_r08_local_projection_is_never_accepted_as_broker_evidence`, and `br140_r08_requires_one_complete_component`.
 
 - [x] **Step 2: Run RED**
 
@@ -288,7 +288,7 @@ Expected: current single list URL and fail-fast detail collection fail the tests
 
 - [x] **Step 3: Add strict real fallback and partial component assembly**
 
-Reuse the already implemented Eastmoney alternate announcement protocol shape, normalize it into `Announcement` with source/date/id provenance, and accept it only after strict response validation. Collect detail results per announcement instead of `collect::<Result<Vec<_>>>()`; rejected details remain audited. R-08 obtains real positions with source time and enforces the 30-second gate. It may render a degraded report only when at least one independent component is complete and explicitly labels unavailable components.
+Reuse the already implemented Eastmoney alternate announcement protocol shape, normalize it into `Announcement` with provider/endpoint/query-date/observed-at/protocol provenance, and accept only the registered `jQuery(...)` wrapper after strict response validation. Persist the protocol decision and sanitized detail rejections before consuming the batch. Collect detail results per announcement instead of `collect::<Result<Vec<_>>>()`; rejected details remain audited. R-08 rejects the mutable local position projection; until a broker per-position batch supplies provider, immutable batch identity, and source time, the position component is explicitly unavailable. It may render a degraded report only when at least one independent component is complete and explicitly labels unavailable components.
 
 - [x] **Step 4: Run GREEN and commit**
 
@@ -315,7 +315,7 @@ Implementation evidence through Task 6:
 - Modify only when a gate exposes a root-cause defect.
 - Add final evidence to the PR body and the 48-hour operations plan/report.
 
-- [ ] **Step 1: Run focused and full gates**
+- [x] **Step 1: Run focused and full gates**
 
 ```bash
 cargo fmt --all -- --check
@@ -329,14 +329,27 @@ cargo build --release --bin monitor
 
 Expected: all commands exit 0; global line coverage is at least 80%, registered core at least 95%.
 
-- [ ] **Step 2: Independent review and PR evidence**
+Release evidence (2026-07-21): all commands exited 0. Full tests ran the workspace,
+all targets, and all features with one test thread. Compliance used the local production
+database only for the read-only freshness gate; `stock_daily` was latest at 2026-07-20
+(one trading day behind). Line coverage was 80.44% globally (86,274/107,251) and
+95.28% for the registered core (33,325/34,975). The release `monitor` binary built
+successfully. No account database, holding data, message body, or local operations log
+is part of this change.
+
+- [x] **Step 2: Independent review and PR evidence**
 
 Review code and spec against BR-140 and all triggered data red lines. PR fields must include Refs, Data-Redlines, OldModules, Threshold-Proof, Business-Rules, Validation, and Rollback.
 
-- [ ] **Step 3: Merge and deploy one instance**
+Independent review reported zero Critical and zero Important findings. Its remaining
+Minor observation (generic primary-protocol failure classification) was corrected by
+preserving the specific structured primary failure reason; the detail-rejection path was
+also tightened to fail explicitly if its indexed rejection evidence is missing.
 
-Push the feature branch, merge the PR without bypassing required checks, fast-forward local `master`, rebuild release, identify the exact existing supervisor/process, stop only that instance, and restart it through the same supervisor. Never start a second production monitor.
+- [ ] **Step 3: Merge without restarting the cancelled long monitor**
 
-- [ ] **Step 4: Canary and 48-hour continuation**
+Push the feature branch, merge the PR without bypassing required checks, and verify the remote `master` tip. The user cancelled the 48-hour monitor, so this change must not restart its supervisor or create a second production monitor.
 
-Run one explicit strict review canary or observe the scheduled batch. Verify only aggregate task-status and sink-confirmation markers; do not print message bodies or account/security data. Restart the cumulative 48-hour timer from the deployed process start, record blockers in the local private evidence directory, and merge the final redacted operations report through a separate PR.
+- [ ] **Step 4: Bounded canary**
+
+Run one bounded, isolated strict-review canary after merge. Verify only aggregate task-status, audit-chain, and sink-confirmation markers; do not print message bodies or account/security data. Preserve the cancelled 48-hour monitor logs locally and do not upload them.

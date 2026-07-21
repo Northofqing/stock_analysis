@@ -3187,17 +3187,29 @@ async fn run_review_only() {
     .await;
 
     match outcome {
-        Ok(Ok(batch)) if batch.has_confirmed_delivery() => {
-            log::info!(
-                "[复盘] ======== 盘后分析完成 ({}s) ========",
-                review_start.elapsed().as_secs()
-            );
-        }
-
-        Ok(Ok(_batch)) => {
-            log::error!("[复盘][BR-140] 严格盘后复盘没有任何确认投递；逐任务状态已写审计. exit 2.");
-            log::logger().flush();
-            std::process::exit(2);
+        Ok(Ok(batch)) => {
+            let now = chrono::Local::now();
+            let mut audit_state = review_batch::ReviewScheduleState::for_date(now.date_naive());
+            let transitions = audit_state.apply(&batch, now.naive_local());
+            if let Err(error) =
+                review_batch::append_task_transition_audit(transitions, now.date_naive())
+            {
+                log::error!("[复盘][BR-110][BR-140] 逐任务结果审计失败: {error}. exit 2.");
+                log::logger().flush();
+                std::process::exit(2);
+            }
+            if batch.has_confirmed_delivery() {
+                log::info!(
+                    "[复盘] ======== 盘后分析完成 ({}s) ========",
+                    review_start.elapsed().as_secs()
+                );
+            } else {
+                log::error!(
+                    "[复盘][BR-140] 严格盘后复盘没有任何确认投递；逐任务状态已写审计. exit 2."
+                );
+                log::logger().flush();
+                std::process::exit(2);
+            }
         }
 
         Ok(Err(error)) => {
@@ -3300,7 +3312,18 @@ async fn post_session_review_scheduler() {
                 let schedule = state
                     .as_mut()
                     .expect("review state initialized for current date");
-                schedule.apply(&batch, now.naive_local());
+                let mut next_schedule = schedule.clone();
+                let transitions = next_schedule.apply(&batch, now.naive_local());
+                if let Err(error) = review_batch::append_task_transition_audit(
+                    transitions,
+                    now.date_naive(),
+                ) {
+                    log::error!(
+                        "[复盘调度][BR-110][BR-140] outcome audit failed; schedule state not committed: {error}"
+                    );
+                    continue;
+                }
+                *schedule = next_schedule;
                 log::info!(
                     "[复盘调度][BR-139][BR-140] attempt complete date={} delivered={} unfinished={}",
                     now.date_naive(),
@@ -3803,9 +3826,8 @@ async fn run_review_only_inner(isolated_test_fixtures: bool) -> Result<(), Strin
                 Ok(batch) => {
                     for rejection in &batch.rejected {
                         log::warn!(
-                            "[v12-R03][BR-140] {} 被逐股隔离: {}",
-                            rejection.code,
-                            rejection.reason
+                            "[v12-R03][BR-140] candidate isolated identity_hash={} reason_code=candidate_evidence_invalid",
+                            review_batch::audit_identity_hash("R-03", &rejection.code)
                         );
                     }
                     for error in &batch.source_errors {
@@ -4104,12 +4126,12 @@ async fn run_review_only_inner(isolated_test_fixtures: bool) -> Result<(), Strin
 
                     // 是 sync context, 用 Handle::current().block_on 驱动 future.
 
-                    let anns = tokio::runtime::Handle::current()
+                    let batch = tokio::runtime::Handle::current()
                         .block_on(
                             stock_analysis::data_provider::announcement::fetch_announcements(None),
                         )
                         .map_err(|error| format!("R-08 公告获取失败: {error}"))?;
-                    let anns = filter_inline_r08_announcements(anns);
+                    let anns = filter_inline_r08_announcements(batch.announcements);
 
                     let ann_text = if anns.is_empty() {
                         "今日无重大公告".to_string()
@@ -4814,6 +4836,7 @@ async fn push_e2e_14x_templates(date: &str, hhmm: &str) {
             },
         ],
         None,
+        None,
     );
 
     log::info!("[v70] R-03 推 ({} 字)", r03.chars().count());
@@ -4829,19 +4852,19 @@ async fn push_e2e_14x_templates(date: &str, hhmm: &str) {
             code: "TEST_CODE_R04_1",
 
             net_buy_yi: 3.0,
-            reason: "涨幅偏离值达7%",
+            reason: Some("涨幅偏离值达7%"),
 
-            buy_inst_n: 5,
+            buy_inst_n: Some(5),
             buy_inst_amt_wan: Some(5000.0),
-            buy_other_n: 3,
+            buy_other_n: Some(3),
             buy_other_amt_wan: Some(2000.0),
 
             buy_conc_pct: Some(60.0),
-            sell_desc: "机构卖200万",
+            sell_desc: Some("机构卖200万"),
             sell_conc_pct: Some(40.0),
 
             chain_match: Some("是-PCB"),
-            next_day_risk: "高位, 注意回撤",
+            next_day_risk: Some("高位, 注意回撤"),
         }],
     );
 
@@ -5258,6 +5281,75 @@ fn load_announcement_audience_codes(
     isolate_announcement_position_failure(audience, registered_watch_codes)
 }
 
+fn audit_announcement_batch_provenance(
+    batch: &stock_analysis::data_provider::announcement::AnnouncementFetchBatch,
+) -> Result<(), String> {
+    use stock_analysis::data_provider::announcement::{
+        AnnouncementListAcquisition, AnnouncementListProtocol,
+    };
+
+    let (fallback_used, reason_code) = match &batch.provenance.acquisition {
+        AnnouncementListAcquisition::PrimaryJson => (false, None),
+        AnnouncementListAcquisition::AlternateJsonp { primary_failure } => {
+            debug_assert_eq!(
+                primary_failure.protocol,
+                AnnouncementListProtocol::PrimaryJson
+            );
+            (true, Some(primary_failure.reason_code.clone()))
+        }
+    };
+    let selected_protocol = match batch.provenance.selected_protocol() {
+        AnnouncementListProtocol::PrimaryJson => "primary_json",
+        AnnouncementListProtocol::AlternateJsonp => "alternate_jsonp",
+    };
+    let identity = format!(
+        "{}:{}:{}",
+        batch.provenance.endpoint,
+        batch.provenance.query_date,
+        batch.provenance.observed_at.timestamp_millis()
+    );
+    let decision = review_batch::ReviewSourceProtocolDecision {
+        observed_at: batch.provenance.observed_at.to_rfc3339(),
+        task: "Announcement".to_string(),
+        source: batch.provenance.provider_label().to_string(),
+        source_time: None,
+        query_date: batch.provenance.query_date.to_string(),
+        selected_protocol: selected_protocol.to_string(),
+        fallback_used,
+        reason_code,
+        identity_hash: review_batch::audit_identity_hash("announcement-list", &identity),
+        rule_ids: vec![
+            "BR-137".to_string(),
+            "BR-138".to_string(),
+            "BR-140".to_string(),
+        ],
+    };
+    review_batch::append_source_protocol_audit(decision, batch.provenance.query_date)?;
+    if batch.rejected_details.is_empty() {
+        return Ok(());
+    }
+    let rejections = batch
+        .rejected_details
+        .iter()
+        .map(|rejection| review_batch::ReviewCandidateRejection {
+            observed_at: rejection.observed_at.to_rfc3339(),
+            task: "Announcement".to_string(),
+            source: batch.provenance.provider_label().to_string(),
+            source_time: None,
+            rule_ids: vec![
+                "BR-137".to_string(),
+                "BR-138".to_string(),
+                "BR-140".to_string(),
+            ],
+            retryable: rejection.retryable,
+            identity_hash: rejection.identity_hash.clone(),
+            reason_code: rejection.reason_code.clone(),
+        })
+        .collect();
+    review_batch::append_candidate_rejection_audit(rejections, batch.provenance.query_date)
+        .map(|_| ())
+}
+
 fn isolate_announcement_position_failure(
     audience: Result<std::collections::HashSet<String>, String>,
     registered_watch_codes: &std::collections::HashSet<String>,
@@ -5272,18 +5364,13 @@ fn isolate_announcement_position_failure(
 enum AnnouncementAlertAction {
     NormalizedDownstream,
     Suppress,
-    Legacy,
 }
 
 fn announcement_alert_action(
-    alert: &AlertEvent,
+    input_index: usize,
     route: &v17_sources::AnnouncementSourceRouteReport,
 ) -> AnnouncementAlertAction {
-    match alert
-        .routed_external_id
-        .as_deref()
-        .and_then(|external_id| route.disposition(external_id))
-    {
+    match route.disposition_for_input(input_index) {
         Some(v17_sources::AnnouncementDisposition::Pushed) => {
             AnnouncementAlertAction::NormalizedDownstream
         }
@@ -5292,7 +5379,12 @@ fn announcement_alert_action(
             | v17_sources::AnnouncementDisposition::FilteredAudience
             | v17_sources::AnnouncementDisposition::Failed,
         ) => AnnouncementAlertAction::Suppress,
-        None => AnnouncementAlertAction::Legacy,
+        None => {
+            log::error!(
+                "[公告][BR-137][BR-138] provider input missing normalized disposition: index={input_index}"
+            );
+            AnnouncementAlertAction::Suppress
+        }
     }
 }
 
@@ -5521,7 +5613,15 @@ async fn news_monitor_loop() {
         // 去重落盘或 banner 刷新。生产 provider 自身负责配置 fail-closed。
         let announcements = if outer_tick.enter(NewsOuterTickPhase::Announcement) {
             match stock_analysis::data_provider::announcement::fetch_announcements(None).await {
-                Ok(announcements) => Some(announcements),
+                Ok(batch) => match audit_announcement_batch_provenance(&batch) {
+                    Ok(()) => Some(batch),
+                    Err(error) => {
+                        log::error!(
+                            "[NewsMonitor][BR-137][BR-140] 公告 provenance 审计失败，本轮公告隔离: {error}"
+                        );
+                        None
+                    }
+                },
                 Err(error) => {
                     log::error!("[NewsMonitor][BR-138] 公告批次获取失败，本轮公告隔离: {error}");
                     None
@@ -5531,9 +5631,10 @@ async fn news_monitor_loop() {
             None
         };
 
-        if let Some((anns, registered_watch_codes)) =
+        if let Some((announcement_batch, registered_watch_codes)) =
             announcements.zip(registered_watch_codes.as_ref().ok())
         {
+            let anns = &announcement_batch.announcements;
             let (announcement_audience_codes, position_audience_error) =
                 load_announcement_audience_codes(registered_watch_codes);
             if let Some(error) = position_audience_error {
@@ -5550,7 +5651,7 @@ async fn news_monitor_loop() {
                 .build()
             {
                 Ok(http) => {
-                    for ann in &anns {
+                    for ann in anns {
                         if ann.code.is_empty() && !ann.name.is_empty() {
                             if let Some(code) = nm.linker_ref().lookup_code_by_name(&ann.name) {
                                 resolved_codes.insert(ann.name.clone(), code.to_string());
@@ -5571,13 +5672,16 @@ async fn news_monitor_loop() {
                 ),
             }
 
-            let events = nm.process_announcements(&anns, &resolved_codes);
+            let events = nm.process_announcements_indexed(anns, &resolved_codes);
 
             // BR-112/BR-137: successfully classified announcements have exactly one
             // governed owner. Every normalized outcome remains explicit; legacy is
             // retained only for classification failures, never as an outcome fallback.
-            let announcement_route =
-                v17_sources::route_announcements(&anns, &announcement_audience_codes).await;
+            let announcement_route = v17_sources::route_announcement_batch(
+                &announcement_batch,
+                &announcement_audience_codes,
+            )
+            .await;
             let disposition_counts = announcement_route.disposition_counts();
             log::info!(
                 "[公告][BR-137][BR-138] attempted={} classified={} pushed={} skipped={} failed={} audience={} disposition_pushed={} disposition_lifecycle={} disposition_audience={} disposition_failed={}",
@@ -5593,14 +5697,13 @@ async fn news_monitor_loop() {
                 disposition_counts.failed
             );
 
-            for event in events {
+            for (input_index, event) in events {
                 if let Some(alert) = sm.process(event) {
-                    match announcement_alert_action(&alert, &announcement_route) {
+                    match announcement_alert_action(input_index, &announcement_route) {
                         AnnouncementAlertAction::NormalizedDownstream => pushed.push(alert),
                         AnnouncementAlertAction::Suppress => log::debug!(
                             "[公告][BR-137][BR-138] legacy and downstream push suppressed: normalized disposition is not Pushed"
                         ),
-                        AnnouncementAlertAction::Legacy => pushed.push(push(alert).await),
                     }
                 }
             }
@@ -9216,7 +9319,6 @@ mod tests_v17_7_announcement_wiring {
     use super::*;
     use chrono::Local;
     use stock_analysis::data_provider::announcement::{self, Announcement};
-    use stock_analysis::monitor::detector::{AlertCategory, AlertDetail, AlertEvent, AlertLevel};
 
     #[test]
     fn br138_explicit_watch_audience_is_validated_independently() {
@@ -9383,7 +9485,7 @@ mod tests_v17_7_announcement_wiring {
     /// Simulates the v17.7 announcement loop logic:
     /// 1. Route announcements via the production normalized owner
     /// 2. Track normalized-owned external_ids
-    /// 3. For each AlertEvent, check if it would skip legacy push
+    /// 3. Join emitted alerts to the normalized outcome by provider input index
     async fn simulate_announcement_loop(anns: Vec<Announcement>) -> AnnouncementLoopReport {
         // Push via the production BR-137 per-announcement owner.
         let eligible_codes = anns
@@ -9393,43 +9495,20 @@ mod tests_v17_7_announcement_wiring {
         let routed = v17_sources::route_announcements(&anns, &eligible_codes).await;
         let report = routed.source;
 
-        // Simulate legacy loop: for each announcement, create an AlertEvent
-        // and check if legacy push would be skipped
-        let mut legacy_attempts: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
+        let mut monitor = stock_analysis::monitor::news_monitor::NewsMonitor::new();
         for ann in &anns {
-            let event_id = ann
-                .external_id
-                .clone()
-                .unwrap_or_else(|| format!("{}:{}:{}", ann.code, ann.date, ann.title));
-
-            let ev = AlertEvent {
-                level: AlertLevel::Important,
-                category: AlertCategory::ChainRisk,
-                code: ann.code.clone(),
-                name: ann.name.clone(),
-                message: format!("[公告] {} | {}", ann.title, ann.reason),
-                detail: AlertDetail {
-                    price: None,
-                    change_pct: None,
-                    volume_ratio: None,
-                    main_flow_yi: None,
-                    threshold: None,
-                    news_title: Some(ann.title.clone()),
-                    news_summary: Some(ann.summary.clone()),
-                    news_importance: None,
-                    ai_decision: None,
-                    t1_locked: false,
-                    extra: None,
-                },
-                triggered_at: Local::now(),
-                routed_external_id: ann.external_id.clone(),
-            };
-
-            if announcement_alert_action(&ev, &routed) == AnnouncementAlertAction::Legacy {
-                *legacy_attempts.entry(event_id).or_insert(0) += 1;
-            }
+            monitor.linker_mut().register_position(&ann.code, &ann.name);
         }
+        let indexed_events =
+            monitor.process_announcements_indexed(&anns, &std::collections::HashMap::new());
+        for (input_index, _event) in indexed_events {
+            assert_ne!(
+                announcement_alert_action(input_index, &routed),
+                AnnouncementAlertAction::Suppress,
+                "valid routed announcement should reach normalized downstream"
+            );
+        }
+        let legacy_attempts = std::collections::HashMap::new();
 
         AnnouncementLoopReport {
             announcement_attempts: report.pushed,
@@ -9480,50 +9559,37 @@ mod tests_v17_7_announcement_wiring {
 
     #[test]
     fn br138_filtered_normalized_alert_cannot_trigger_downstream_notifications() {
-        let external_id = "TEST_CODE_FILTERED_EXTERNAL";
-        let alert = AlertEvent {
-            level: AlertLevel::Important,
-            category: AlertCategory::ChainRisk,
-            code: "TEST_CODE_FILTERED".to_string(),
-            name: "测试公司".to_string(),
-            message: "filtered".to_string(),
-            detail: AlertDetail {
-                price: None,
-                change_pct: None,
-                volume_ratio: None,
-                main_flow_yi: None,
-                threshold: None,
-                news_title: None,
-                news_summary: None,
-                news_importance: None,
-                ai_decision: None,
-                t1_locked: false,
-                extra: None,
-            },
-            triggered_at: Local::now(),
-            routed_external_id: Some(external_id.to_string()),
-        };
-        let mut route = v17_sources::AnnouncementSourceRouteReport::default();
         for disposition in [
             v17_sources::AnnouncementDisposition::FilteredAudience,
             v17_sources::AnnouncementDisposition::FilteredLifecycle,
             v17_sources::AnnouncementDisposition::Failed,
         ] {
-            route
-                .dispositions
-                .insert(external_id.to_string(), disposition);
+            let route =
+                v17_sources::AnnouncementSourceRouteReport::with_dispositions_for_test(vec![
+                    disposition,
+                ]);
             assert_eq!(
-                announcement_alert_action(&alert, &route),
+                announcement_alert_action(0, &route),
                 AnnouncementAlertAction::Suppress
             );
         }
-        route.dispositions.insert(
-            external_id.to_string(),
+        let route = v17_sources::AnnouncementSourceRouteReport::with_dispositions_for_test(vec![
             v17_sources::AnnouncementDisposition::Pushed,
-        );
+        ]);
         assert_eq!(
-            announcement_alert_action(&alert, &route),
+            announcement_alert_action(0, &route),
             AnnouncementAlertAction::NormalizedDownstream
+        );
+    }
+
+    #[test]
+    fn br138_provider_announcement_without_normalized_disposition_fails_closed() {
+        let route = v17_sources::AnnouncementSourceRouteReport::default();
+
+        assert_eq!(
+            announcement_alert_action(0, &route),
+            AnnouncementAlertAction::Suppress,
+            "provider announcements without a normalized disposition must never use legacy delivery"
         );
     }
 

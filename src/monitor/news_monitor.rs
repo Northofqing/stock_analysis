@@ -128,6 +128,20 @@ impl NewsMonitor {
         anns: &[announcement::Announcement],
         resolved_codes: &std::collections::HashMap<String, String>,
     ) -> Vec<AlertEvent> {
+        self.process_announcements_indexed(anns, resolved_codes)
+            .into_iter()
+            .map(|(_, event)| event)
+            .collect()
+    }
+
+    /// BR-137: preserves each emitted alert's original provider-batch index so
+    /// normalized dispositions can be joined without relying on optional or
+    /// duplicate provider identities.
+    pub fn process_announcements_indexed(
+        &mut self,
+        anns: &[announcement::Announcement],
+        resolved_codes: &std::collections::HashMap<String, String>,
+    ) -> Vec<(usize, AlertEvent)> {
         let mut events = Vec::new();
         let immediate_count = anns
             .iter()
@@ -141,7 +155,7 @@ impl NewsMonitor {
         let mut drop_seen_dup: usize = 0;
         let mut drop_no_match: usize = 0;
 
-        for ann in anns.iter().filter(|announcement| {
+        for (input_index, ann) in anns.iter().enumerate().filter(|(_, announcement)| {
             announcement::announcement_is_immediate_notification_candidate(announcement)
         }) {
             // review #14: char_indices().nth() 找第 40 字符的 byte 边界, 一次性扫描,
@@ -243,42 +257,45 @@ impl NewsMonitor {
                 AlertLevel::Important => self.important_count += 1,
                 AlertLevel::Info => self.info_count += 1,
             }
-            events.push(AlertEvent {
-                level,
-                category: cat,
-                code,
-                name,
-                message: format!("[公告] {} | {}", short_title, ann.reason),
-                detail: AlertDetail {
-                    price: None,
-                    change_pct: None,
-                    volume_ratio: None,
-                    main_flow_yi: None,
-                    threshold: None,
-                    news_title: Some(ann.title.clone()),
-                    news_summary: {
-                        // 回退链：正文 → API摘要 → 标题内容
-                        if !ann.content.is_empty() {
-                            Some(truncate_str(&ann.content, 150))
-                        } else if !ann.summary.is_empty() {
-                            Some(truncate_str(&ann.summary, 150))
+            events.push((
+                input_index,
+                AlertEvent {
+                    level,
+                    category: cat,
+                    code,
+                    name,
+                    message: format!("[公告] {} | {}", short_title, ann.reason),
+                    detail: AlertDetail {
+                        price: None,
+                        change_pct: None,
+                        volume_ratio: None,
+                        main_flow_yi: None,
+                        threshold: None,
+                        news_title: Some(ann.title.clone()),
+                        news_summary: {
+                            // 回退链：正文 → API摘要 → 标题内容
+                            if !ann.content.is_empty() {
+                                Some(truncate_str(&ann.content, 150))
+                            } else if !ann.summary.is_empty() {
+                                Some(truncate_str(&ann.summary, 150))
+                            } else {
+                                // 最后回退：显示公告标题（剥离公司名前缀）
+                                Some(truncate_str(&short_title, 100))
+                            }
+                        },
+                        news_importance: None,
+                        ai_decision: None,
+                        t1_locked: false,
+                        extra: if hit_summary.is_empty() {
+                            None
                         } else {
-                            // 最后回退：显示公告标题（剥离公司名前缀）
-                            Some(truncate_str(&short_title, 100))
-                        }
+                            Some(format!("命中: {hit_summary}"))
+                        },
                     },
-                    news_importance: None,
-                    ai_decision: None,
-                    t1_locked: false,
-                    extra: if hit_summary.is_empty() {
-                        None
-                    } else {
-                        Some(format!("命中: {hit_summary}"))
-                    },
+                    triggered_at: Local::now(),
+                    routed_external_id: ann.external_id.clone(),
                 },
-                triggered_at: Local::now(),
-                routed_external_id: ann.external_id.clone(),
-            });
+            ));
         }
 
         // b011 P1-1: 漏斗可观测 — 32 条进 0 条出这类"静默归零"必须能一眼看出丢在哪级

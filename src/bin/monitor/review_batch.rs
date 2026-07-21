@@ -1,5 +1,266 @@
 //! BR-140 typed post-session review outcomes and per-task scheduling.
 
+use sha2::{Digest, Sha256};
+
+pub fn audit_identity_hash(domain: &str, identity: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"stock_analysis/review/v1\0");
+    hasher.update(domain.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(identity.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn sanitize_reason_code(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+        .take(64)
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "unspecified".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn review_reason_category(task: ReviewTask, outcome: &ReviewTaskOutcome) -> String {
+    let classify_failure = |reason: &str| {
+        let normalized = reason.to_ascii_lowercase();
+        if normalized.contains("deduplicat") {
+            "push_governance_deduplicated"
+        } else if normalized.contains("denied") || reason.contains("治理拒绝") {
+            "push_governance_denied"
+        } else if normalized.contains("sink") || reason.contains("投递") {
+            "push_sink_delivery_failed"
+        } else if normalized.contains("audit") || reason.contains("审计") {
+            "audit_persistence_failed"
+        } else if normalized.contains("kline") || reason.contains("日 K") || reason.contains("K 线")
+        {
+            "daily_kline_unavailable"
+        } else if normalized.contains("announcement") || reason.contains("公告") {
+            "announcement_source_unavailable"
+        } else if normalized.contains("position") || reason.contains("持仓") {
+            "position_source_unavailable"
+        } else if normalized.contains("industry") || reason.contains("产业链") {
+            "industry_evidence_unavailable"
+        } else if normalized.contains("lhb") || reason.contains("龙虎榜") {
+            "lhb_source_unavailable"
+        } else if normalized.contains("transport")
+            || normalized.contains("http")
+            || normalized.contains("request")
+            || reason.contains("请求")
+        {
+            "source_transport_failed"
+        } else if normalized.contains("join")
+            || normalized.contains("panic")
+            || reason.contains("任务失败")
+        {
+            "source_task_execution_failed"
+        } else if normalized.contains("date") || reason.contains("日期") {
+            "invalid_source_date"
+        } else {
+            match task {
+                ReviewTask::R02 => "market_review_contract_failed",
+                ReviewTask::R03 => "industry_chain_review_failed",
+                ReviewTask::R04 => "lhb_review_failed",
+                ReviewTask::R05 => "signal_outcome_review_failed",
+                ReviewTask::R06 => "failure_outcome_review_failed",
+                ReviewTask::R08 => "event_calendar_review_failed",
+                ReviewTask::A10 => "catalyst_review_failed",
+                ReviewTask::A01 => "virtual_observation_review_failed",
+            }
+        }
+    };
+
+    match outcome {
+        ReviewTaskOutcome::Delivered { .. } => "sink_confirmed".to_string(),
+        ReviewTaskOutcome::NoData { reason } if reason.contains("T+1") => {
+            "complete_source_no_t1_record".to_string()
+        }
+        ReviewTaskOutcome::NoData { .. } => "complete_source_no_data".to_string(),
+        ReviewTaskOutcome::ExpectedWait { .. } => "source_not_published".to_string(),
+        ReviewTaskOutcome::Disabled { capability, .. } => {
+            format!("capability_disabled_{}", sanitize_reason_code(capability))
+        }
+        ReviewTaskOutcome::Failed { reason, .. } => classify_failure(reason).to_string(),
+    }
+}
+
+fn review_audit_hash(prev_hash: &str, payload: &ReviewAuditPayload) -> Result<String, String> {
+    let bytes = serde_json::to_vec(payload)
+        .map_err(|error| format!("serialize review audit payload: {error}"))?;
+    let mut hasher = Sha256::new();
+    hasher.update(prev_hash.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(bytes);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn resolve_review_audit_dir(
+    override_base: Option<std::path::PathBuf>,
+    is_test: bool,
+) -> std::path::PathBuf {
+    match override_base {
+        Some(base) => base.join(if is_test { "test" } else { "prod" }),
+        None if is_test => std::path::PathBuf::from("data/test/review_audit"),
+        None => std::path::PathBuf::from("data/review_audit"),
+    }
+}
+
+pub fn review_audit_dir() -> std::path::PathBuf {
+    let is_test = stock_analysis::risk::env_guard::runtime_is_test_process()
+        || stock_analysis::risk::env_guard::current_env()
+            == stock_analysis::risk::env_guard::TradingEnv::Test;
+    resolve_review_audit_dir(
+        std::env::var("REVIEW_AUDIT_DIR")
+            .ok()
+            .map(std::path::PathBuf::from),
+        is_test,
+    )
+}
+
+pub fn append_review_audit(
+    dir: &std::path::Path,
+    date: chrono::NaiveDate,
+    payloads: &[ReviewAuditPayload],
+) -> Result<std::path::PathBuf, String> {
+    use fs2::FileExt;
+    use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+
+    static REVIEW_AUDIT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = REVIEW_AUDIT_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "review audit writer lock poisoned".to_string())?;
+
+    std::fs::create_dir_all(dir)
+        .map_err(|error| format!("create review audit dir {}: {error}", dir.display()))?;
+    let path = dir.join(format!("{}.jsonl", date.format("%Y-%m-%d")));
+    let lock_path = dir.join(format!("{}.lock", date.format("%Y-%m-%d")));
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|error| format!("open review audit lock {}: {error}", lock_path.display()))?;
+    FileExt::lock_exclusive(&lock_file)
+        .map_err(|error| format!("lock review audit {}: {error}", lock_path.display()))?;
+
+    // The OS lock spans validation, append and fsync. Unlike the process-local
+    // mutex above, it also serializes the resident monitor and a manual
+    // `monitor --review` process. A crashed writer releases the kernel lock;
+    // a partial tail remains fail-closed during the next full-chain validation.
+    let mut prev_hash = "0".repeat(64);
+    if path.exists() {
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|error| format!("read review audit {}: {error}", path.display()))?;
+        if !raw.is_empty() && !raw.ends_with('\n') {
+            return Err(format!(
+                "review audit {} has an incomplete trailing record",
+                path.display()
+            ));
+        }
+        for (line_index, line) in raw.lines().enumerate() {
+            if line.trim().is_empty() {
+                return Err(format!(
+                    "review audit {} contains blank line {}",
+                    path.display(),
+                    line_index + 1
+                ));
+            }
+            let record: ReviewAuditRecord = serde_json::from_str(line).map_err(|error| {
+                format!(
+                    "parse review audit {} line {}: {error}",
+                    path.display(),
+                    line_index + 1
+                )
+            })?;
+            if record.prev_hash != prev_hash {
+                return Err(format!(
+                    "review audit {} chain mismatch at line {}",
+                    path.display(),
+                    line_index + 1
+                ));
+            }
+            let expected = review_audit_hash(&record.prev_hash, &record.payload)?;
+            if record.record_hash != expected {
+                return Err(format!(
+                    "review audit {} record hash mismatch at line {}",
+                    path.display(),
+                    line_index + 1
+                ));
+            }
+            prev_hash = record.record_hash;
+        }
+    }
+
+    let mut encoded = Vec::new();
+    for payload in payloads {
+        let record_hash = review_audit_hash(&prev_hash, payload)?;
+        let record = ReviewAuditRecord {
+            payload: payload.clone(),
+            prev_hash,
+            record_hash: record_hash.clone(),
+        };
+        serde_json::to_writer(&mut encoded, &record)
+            .map_err(|error| format!("write review audit {}: {error}", path.display()))?;
+        encoded
+            .write_all(b"\n")
+            .map_err(|error| format!("write review audit newline {}: {error}", path.display()))?;
+        prev_hash = record_hash;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| format!("open review audit {}: {error}", path.display()))?;
+    file.write_all(&encoded)
+        .map_err(|error| format!("append review audit {}: {error}", path.display()))?;
+    file.flush()
+        .map_err(|error| format!("flush review audit {}: {error}", path.display()))?;
+    file.sync_data()
+        .map_err(|error| format!("sync review audit {}: {error}", path.display()))?;
+    FileExt::unlock(&lock_file)
+        .map_err(|error| format!("unlock review audit {}: {error}", lock_path.display()))?;
+    Ok(path)
+}
+
+pub fn append_task_transition_audit(
+    transitions: Vec<ReviewTaskTransition>,
+    date: chrono::NaiveDate,
+) -> Result<std::path::PathBuf, String> {
+    let payloads = transitions
+        .into_iter()
+        .map(ReviewAuditPayload::TaskTransition)
+        .collect::<Vec<_>>();
+    append_review_audit(&review_audit_dir(), date, &payloads)
+}
+
+pub fn append_candidate_rejection_audit(
+    rejections: Vec<ReviewCandidateRejection>,
+    date: chrono::NaiveDate,
+) -> Result<std::path::PathBuf, String> {
+    let payloads = rejections
+        .into_iter()
+        .map(ReviewAuditPayload::CandidateRejection)
+        .collect::<Vec<_>>();
+    append_review_audit(&review_audit_dir(), date, &payloads)
+}
+
+pub fn append_source_protocol_audit(
+    decision: ReviewSourceProtocolDecision,
+    date: chrono::NaiveDate,
+) -> Result<std::path::PathBuf, String> {
+    append_review_audit(
+        &review_audit_dir(),
+        date,
+        &[ReviewAuditPayload::SourceProtocolDecision(decision)],
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ReviewTask {
     R02,
@@ -36,6 +297,76 @@ impl ReviewTask {
             Self::A01 => "A-01",
         }
     }
+
+    fn source_label(self) -> &'static str {
+        match self {
+            Self::R02 => "market_review_contract",
+            Self::R03 => "portfolio_industry_kline",
+            Self::R04 => "lhb_producer",
+            Self::R05 => "signal_outcome",
+            Self::R06 => "classified_failure_outcome",
+            Self::R08 => "announcement_positions_virtual_overnight",
+            Self::A10 => "chain_rotation_security_master",
+            Self::A01 => "virtual_observation_kline",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReviewTaskTransition {
+    pub observed_at: String,
+    pub task: String,
+    pub source: String,
+    pub source_time: Option<String>,
+    pub rule_ids: Vec<String>,
+    pub status: String,
+    pub success: bool,
+    pub snapshot_size: usize,
+    pub retryable: bool,
+    pub next_attempt: Option<String>,
+    pub reason_code: String,
+    pub identity_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReviewCandidateRejection {
+    pub observed_at: String,
+    pub task: String,
+    pub source: String,
+    pub source_time: Option<String>,
+    pub rule_ids: Vec<String>,
+    pub retryable: bool,
+    pub identity_hash: String,
+    pub reason_code: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReviewSourceProtocolDecision {
+    pub observed_at: String,
+    pub task: String,
+    pub source: String,
+    pub source_time: Option<String>,
+    pub query_date: String,
+    pub selected_protocol: String,
+    pub fallback_used: bool,
+    pub reason_code: Option<String>,
+    pub identity_hash: String,
+    pub rule_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "event_type", rename_all = "snake_case")]
+pub enum ReviewAuditPayload {
+    TaskTransition(ReviewTaskTransition),
+    CandidateRejection(ReviewCandidateRejection),
+    SourceProtocolDecision(ReviewSourceProtocolDecision),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct ReviewAuditRecord {
+    payload: ReviewAuditPayload,
+    prev_hash: String,
+    record_hash: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +420,24 @@ impl ReviewTaskOutcome {
     pub fn no_data(reason: impl Into<String>) -> Self {
         Self::NoData {
             reason: reason.into(),
+        }
+    }
+
+    /// Convert the authoritative push governor result without collapsing
+    /// deduplication, governance denial, and sink failure into one boolean.
+    pub fn from_push_outcome(outcome: crate::notify::PushOutcome, delivered_count: usize) -> Self {
+        match outcome {
+            crate::notify::PushOutcome::Pushed => Self::delivered(delivered_count),
+            crate::notify::PushOutcome::Deduped => {
+                Self::failed(false, "delivery deduplicated by push governance")
+            }
+            crate::notify::PushOutcome::Denied(reason) => Self::failed(
+                false,
+                format!("delivery denied by push governance: {reason}"),
+            ),
+            crate::notify::PushOutcome::SinkError(reason) => {
+                Self::failed(true, format!("delivery sink failed: {reason}"))
+            }
         }
     }
 
@@ -174,10 +523,15 @@ impl ReviewScheduleState {
         self.date
     }
 
-    pub fn apply(&mut self, batch: &ReviewBatchOutcome, now: chrono::NaiveDateTime) {
+    pub fn apply(
+        &mut self,
+        batch: &ReviewBatchOutcome,
+        now: chrono::NaiveDateTime,
+    ) -> Vec<ReviewTaskTransition> {
         if now.date() != self.date {
-            return;
+            return Vec::new();
         }
+        let mut transitions = Vec::with_capacity(batch.tasks.len());
         for (task, outcome) in &batch.tasks {
             let next = match outcome {
                 ReviewTaskOutcome::Delivered { .. }
@@ -207,8 +561,59 @@ impl ReviewScheduleState {
                     }
                 }
             };
-            self.tasks.insert(*task, next);
+            self.tasks.insert(*task, next.clone());
+            let (retryable, next_attempt) = match &next {
+                TaskScheduleState::Waiting(retry_at) => (
+                    true,
+                    Some(
+                        self.date
+                            .and_time(*retry_at)
+                            .format("%Y-%m-%dT%H:%M:%S")
+                            .to_string(),
+                    ),
+                ),
+                TaskScheduleState::Retry { at, .. } => {
+                    (true, Some(at.format("%Y-%m-%dT%H:%M:%S").to_string()))
+                }
+                TaskScheduleState::Pending | TaskScheduleState::Terminal => (false, None),
+            };
+            let snapshot_size = match outcome {
+                ReviewTaskOutcome::Delivered { count } => *count,
+                _ => 0,
+            };
+            let reason_code = review_reason_category(*task, outcome);
+            let reason_detail = match outcome {
+                ReviewTaskOutcome::Delivered { .. } => "sink_confirmed",
+                ReviewTaskOutcome::NoData { reason }
+                | ReviewTaskOutcome::ExpectedWait { reason, .. }
+                | ReviewTaskOutcome::Disabled { reason, .. }
+                | ReviewTaskOutcome::Failed { reason, .. } => reason.as_str(),
+            };
+            let reason_fingerprint = audit_identity_hash("review-reason", reason_detail);
+            let reason_code = format!("{reason_code}_{}", &reason_fingerprint[..16]);
+            let observed_at = now.format("%Y-%m-%dT%H:%M:%S").to_string();
+            transitions.push(ReviewTaskTransition {
+                observed_at: observed_at.clone(),
+                task: task.label().to_string(),
+                source: task.source_label().to_string(),
+                // ReviewTaskOutcome currently carries report status, not a
+                // provider publication timestamp. Query/as-of date is encoded
+                // in the task identity; missing provider time stays absent.
+                source_time: None,
+                rule_ids: vec!["BR-110".to_string(), "BR-140".to_string()],
+                status: outcome.status_label().to_string(),
+                success: matches!(outcome, ReviewTaskOutcome::Delivered { .. }),
+                snapshot_size,
+                retryable,
+                next_attempt,
+                reason_code,
+                identity_hash: audit_identity_hash(
+                    "review-task",
+                    &format!("{}:{}", self.date, task.label()),
+                ),
+            });
         }
+        transitions
     }
 
     pub fn is_due(&self, task: ReviewTask, now: chrono::NaiveDateTime) -> bool {
@@ -303,6 +708,33 @@ mod tests {
         chrono::NaiveDate::from_ymd_opt(2026, 7, 21).expect("valid test date")
     }
 
+    #[test]
+    fn br140_audit_identity_hash_is_stable_domain_separated_and_non_reversible() {
+        let identity = "TEST_CODE_SECRET_IDENTITY";
+        let first = audit_identity_hash("A-01", identity);
+        let second = audit_identity_hash("A-01", identity);
+        let other_domain = audit_identity_hash("R-03", identity);
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 64);
+        assert!(first
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
+        assert_ne!(first, other_domain);
+        assert!(!first.contains(identity));
+    }
+
+    #[test]
+    fn br140_review_audit_override_keeps_test_and_production_physically_separate() {
+        let base = std::path::PathBuf::from("/tmp/stock_analysis_review_audit_override");
+        let test = resolve_review_audit_dir(Some(base.clone()), true);
+        let prod = resolve_review_audit_dir(Some(base), false);
+
+        assert_ne!(test, prod);
+        assert!(test.ends_with("test"));
+        assert!(prod.ends_with("prod"));
+    }
+
     fn at_datetime(hour: u32, minute: u32) -> chrono::NaiveDateTime {
         day().and_hms_opt(hour, minute, 0).expect("valid test time")
     }
@@ -343,9 +775,44 @@ mod tests {
     }
 
     #[test]
+    fn br140_push_outcomes_preserve_terminal_and_retryable_semantics() {
+        assert_eq!(
+            ReviewTaskOutcome::from_push_outcome(crate::notify::PushOutcome::Pushed, 2),
+            ReviewTaskOutcome::delivered(2)
+        );
+        assert!(matches!(
+            ReviewTaskOutcome::from_push_outcome(crate::notify::PushOutcome::Deduped, 2),
+            ReviewTaskOutcome::Failed {
+                retryable: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            ReviewTaskOutcome::from_push_outcome(
+                crate::notify::PushOutcome::Denied("policy".to_string()),
+                2
+            ),
+            ReviewTaskOutcome::Failed {
+                retryable: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            ReviewTaskOutcome::from_push_outcome(
+                crate::notify::PushOutcome::SinkError("transport".to_string()),
+                2
+            ),
+            ReviewTaskOutcome::Failed {
+                retryable: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn br140_one_delivery_does_not_complete_waiting_or_retryable_tasks() {
         let mut state = ReviewScheduleState::for_date(day());
-        state.apply(
+        let transitions = state.apply(
             &ReviewBatchOutcome::new(vec![
                 (ReviewTask::A01, ReviewTaskOutcome::delivered(1)),
                 (
@@ -368,6 +835,15 @@ mod tests {
         assert!(state.is_due(ReviewTask::R04, at_datetime(21, 0)));
         assert!(state.is_due(ReviewTask::R08, at_datetime(19, 1)));
         assert!(state.has_unfinished_tasks());
+        let r08 = transitions
+            .iter()
+            .find(|transition| transition.task == "R-08")
+            .unwrap();
+        assert!(r08.retryable);
+        assert_eq!(r08.next_attempt.as_deref(), Some("2026-07-21T19:01:00"));
+        assert!(!r08.success);
+        assert_eq!(r08.source_time, None);
+        assert!(r08.reason_code.starts_with("source_transport_failed_"));
     }
 
     #[test]
@@ -384,6 +860,148 @@ mod tests {
         let due = state.due_tasks(at_datetime(23, 0));
         assert!(!due.contains(&ReviewTask::R05));
         assert!(due.contains(&ReviewTask::A01));
+    }
+
+    #[test]
+    fn br140_review_reason_codes_preserve_decision_category_without_raw_identity() {
+        let cases = [
+            (
+                ReviewTask::R03,
+                ReviewTaskOutcome::failed(true, "603031 日 K 批次失败"),
+                "daily_kline_unavailable",
+            ),
+            (
+                ReviewTask::R08,
+                ReviewTaskOutcome::failed(true, "公告 provenance 审计失败"),
+                "audit_persistence_failed",
+            ),
+            (
+                ReviewTask::A01,
+                ReviewTaskOutcome::failed(true, "delivery sink failed"),
+                "push_sink_delivery_failed",
+            ),
+        ];
+
+        for (task, outcome, expected) in cases {
+            let category = review_reason_category(task, &outcome);
+            assert_eq!(category, expected);
+            assert!(!category.contains("603031"));
+        }
+    }
+
+    #[test]
+    fn br140_review_audit_is_valid_json_hash_chained_and_detects_tamper() {
+        let dir = std::env::temp_dir().join(format!(
+            "stock_analysis_review_audit_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let identity = "TEST_CODE_PRIVATE_IDENTITY";
+        let payload = ReviewAuditPayload::CandidateRejection(ReviewCandidateRejection {
+            observed_at: "2026-07-21T19:00:00".to_string(),
+            task: "A-01".to_string(),
+            source: "virtual_observation".to_string(),
+            source_time: Some("2026-07-21T18:59:59".to_string()),
+            rule_ids: vec!["BR-104".to_string(), "BR-140".to_string()],
+            retryable: false,
+            identity_hash: audit_identity_hash("A-01", identity),
+            reason_code: "invalid_json".to_string(),
+        });
+        let path = append_review_audit(&dir, day(), std::slice::from_ref(&payload)).unwrap();
+        append_review_audit(&dir, day(), &[payload]).unwrap();
+        assert!(dir.join("2026-07-21.lock").exists());
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(raw.lines().count(), 2);
+        assert!(!raw.contains(identity));
+        for line in raw.lines() {
+            let _: serde_json::Value = serde_json::from_str(line).unwrap();
+        }
+
+        let tampered = raw.replacen("invalid_json", "changed", 1);
+        std::fs::write(&path, tampered).unwrap();
+        let error = append_review_audit(&dir, day(), &[]).unwrap_err();
+        assert!(error.contains("record hash mismatch"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn br140_review_audit_rejects_a_valid_record_without_trailing_newline() {
+        let dir = std::env::temp_dir().join(format!(
+            "stock_analysis_review_audit_tail_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let payload = ReviewAuditPayload::CandidateRejection(ReviewCandidateRejection {
+            observed_at: "2026-07-21T19:00:00".to_string(),
+            task: "A-01".to_string(),
+            source: "virtual_observation".to_string(),
+            source_time: None,
+            rule_ids: vec!["BR-140".to_string()],
+            retryable: false,
+            identity_hash: audit_identity_hash("A-01", "TEST_CODE_TAIL"),
+            reason_code: "invalid_json".to_string(),
+        });
+        let path = append_review_audit(&dir, day(), std::slice::from_ref(&payload)).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, raw.strip_suffix('\n').unwrap()).unwrap();
+
+        let error = append_review_audit(&dir, day(), &[payload]).unwrap_err();
+
+        assert!(error.contains("incomplete trailing record"));
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("}{"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[ignore = "invoked as a child by the cross-process locking test"]
+    fn br140_review_audit_process_writer_helper() {
+        let Ok(dir) = std::env::var("BR140_REVIEW_AUDIT_HELPER_DIR") else {
+            return;
+        };
+        let identity = std::env::var("BR140_REVIEW_AUDIT_HELPER_ID").unwrap();
+        let payload = ReviewAuditPayload::CandidateRejection(ReviewCandidateRejection {
+            observed_at: "2026-07-21T19:00:00".to_string(),
+            task: "A-01".to_string(),
+            source: "cross_process_test".to_string(),
+            source_time: None,
+            rule_ids: vec!["BR-140".to_string()],
+            retryable: false,
+            identity_hash: audit_identity_hash("A-01", &identity),
+            reason_code: "cross_process_test".to_string(),
+        });
+        append_review_audit(std::path::Path::new(&dir), day(), &[payload]).unwrap();
+    }
+
+    #[test]
+    fn br140_review_audit_serializes_independent_process_writers() {
+        let dir = std::env::temp_dir().join(format!(
+            "stock_analysis_review_audit_process_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let executable = std::env::current_exe().unwrap();
+        let mut children = (0..4)
+            .map(|index| {
+                std::process::Command::new(&executable)
+                    .args([
+                        "--exact",
+                        "review_batch::tests::br140_review_audit_process_writer_helper",
+                        "--ignored",
+                    ])
+                    .env("BR140_REVIEW_AUDIT_HELPER_DIR", &dir)
+                    .env("BR140_REVIEW_AUDIT_HELPER_ID", format!("writer-{index}"))
+                    .spawn()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        for child in &mut children {
+            assert!(child.wait().unwrap().success());
+        }
+
+        let path = append_review_audit(&dir, day(), &[]).unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap().lines().count(), 4);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

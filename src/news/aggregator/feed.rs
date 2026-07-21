@@ -330,11 +330,14 @@ impl NewsFeed for MiitFeed {
 // D1.3: 3 个财报 / 公告 / 共识 feed
 // ============================================================================
 
+#[cfg(test)]
 pub struct EmAnnouncementFeed;
 
+#[cfg(test)]
 fn announcement_to_market_event(
     announcement: &crate::data_provider::announcement::Announcement,
     observed_at: chrono::DateTime<Local>,
+    provider: &str,
 ) -> Option<MarketEvent> {
     if !crate::data_provider::announcement::announcement_is_immediate_notification_candidate(
         announcement,
@@ -363,7 +366,7 @@ fn announcement_to_market_event(
         chains: vec![],
         occurred_at,
         provenance: vec![SourceRef {
-            provider: "em_announcement".to_string(),
+            provider: provider.to_string(),
             url: announcement.url.clone(),
             fetched_at: observed_at,
         }],
@@ -372,6 +375,7 @@ fn announcement_to_market_event(
     })
 }
 
+#[cfg(test)]
 #[async_trait]
 impl NewsFeed for EmAnnouncementFeed {
     fn name(&self) -> &str {
@@ -381,17 +385,21 @@ impl NewsFeed for EmAnnouncementFeed {
         SourceKind::Earnings
     }
     async fn fetch(&self, _limit: usize) -> Result<Vec<MarketEvent>> {
-        let anns = crate::data_provider::announcement::fetch_announcements(None)
+        let batch = crate::data_provider::announcement::fetch_announcements(None)
             .await
             .context("em_announcement fetch failed")?;
-        if anns.is_empty() {
+        if batch.announcements.is_empty() {
             log::info!("[EmAnnouncementFeed] no announcements this cycle");
             return Ok(vec![]);
         }
-        let now = Utc::now().with_timezone(&Local);
-        let events = anns
+        let observed_at = batch.provenance.observed_at.with_timezone(&Local);
+        let provider = batch.provenance.provider_label();
+        let events = batch
+            .announcements
             .iter()
-            .filter_map(|announcement| announcement_to_market_event(announcement, now))
+            .filter_map(|announcement| {
+                announcement_to_market_event(announcement, observed_at, provider)
+            })
             .collect::<Vec<_>>();
         if events.is_empty() {
             log::info!("[EmAnnouncementFeed][BR-138] only local lifecycle evidence this cycle");
@@ -513,7 +521,9 @@ mod tests {
             url: Some("https://example.invalid/TEST_CODE_LOCAL_ONLY".into()),
         };
 
-        assert!(announcement_to_market_event(&announcement, Local::now()).is_none());
+        assert!(
+            announcement_to_market_event(&announcement, Local::now(), "test/provider").is_none()
+        );
     }
 
     #[test]

@@ -18,8 +18,8 @@ use stock_analysis::news::aggregator::analyst_state::{
     AnalystKey, AnalystObservation, AnalystStateStore,
 };
 use stock_analysis::news::aggregator::classifier::{
-    classify_announcement, classify_earnings, classify_policy, EarningsClassification,
-    EarningsConfig, EarningsKind,
+    classify_announcement_with_provenance, classify_earnings, classify_policy,
+    EarningsClassification, EarningsConfig, EarningsKind,
 };
 use stock_analysis::news::aggregator::{NormalizedSourceEvent, SourcePushKind};
 
@@ -131,20 +131,20 @@ pub struct AnnouncementDispositionCounts {
 #[derive(Debug, Default)]
 pub struct AnnouncementSourceRouteReport {
     pub source: SourcePollReport,
-    /// BR-138: every successfully classified provider identity has exactly one
-    /// typed normalized disposition. Any entry blocks legacy fallback; only
-    /// `Pushed` may trigger downstream D-01/I-02 notifications.
-    pub dispositions: HashMap<String, AnnouncementDisposition>,
+    /// BR-137/BR-138: one disposition for every provider input, in the same
+    /// order. Identity failures and classification failures remain explicit
+    /// `Failed` entries; no input may fall through to legacy delivery.
+    input_dispositions: Vec<AnnouncementDisposition>,
 }
 
 impl AnnouncementSourceRouteReport {
-    pub fn disposition(&self, external_id: &str) -> Option<AnnouncementDisposition> {
-        self.dispositions.get(external_id).copied()
+    pub fn disposition_for_input(&self, input_index: usize) -> Option<AnnouncementDisposition> {
+        self.input_dispositions.get(input_index).copied()
     }
 
     pub fn disposition_counts(&self) -> AnnouncementDispositionCounts {
         let mut counts = AnnouncementDispositionCounts::default();
-        for disposition in self.dispositions.values() {
+        for disposition in &self.input_dispositions {
             match disposition {
                 AnnouncementDisposition::Pushed => counts.pushed += 1,
                 AnnouncementDisposition::FilteredLifecycle => counts.filtered_lifecycle += 1,
@@ -153,6 +153,14 @@ impl AnnouncementSourceRouteReport {
             }
         }
         counts
+    }
+
+    #[cfg(test)]
+    pub fn with_dispositions_for_test(dispositions: Vec<AnnouncementDisposition>) -> Self {
+        Self {
+            source: SourcePollReport::default(),
+            input_dispositions: dispositions,
+        }
     }
 }
 
@@ -167,20 +175,47 @@ fn record_source_attempt(report: &mut SourcePollReport, outcome: &PushOutcome) {
 /// normalized source-fact path. Successfully classified items are owned by
 /// this path even when governance/sink fails, so legacy delivery cannot bypass
 /// the explicit outcome. The next provider poll remains the retry boundary.
+#[cfg(test)]
 pub async fn route_announcements(
     announcements: &[stock_analysis::data_provider::announcement::Announcement],
     eligible_codes: &HashSet<String>,
 ) -> AnnouncementSourceRouteReport {
+    route_announcements_with_provenance(announcements, eligible_codes, Local::now(), "eastmoney")
+        .await
+}
+
+pub async fn route_announcement_batch(
+    batch: &stock_analysis::data_provider::announcement::AnnouncementFetchBatch,
+    eligible_codes: &HashSet<String>,
+) -> AnnouncementSourceRouteReport {
+    route_announcements_with_provenance(
+        &batch.announcements,
+        eligible_codes,
+        batch.provenance.observed_at.with_timezone(&Local),
+        batch.provenance.provider_label(),
+    )
+    .await
+}
+
+async fn route_announcements_with_provenance(
+    announcements: &[stock_analysis::data_provider::announcement::Announcement],
+    eligible_codes: &HashSet<String>,
+    observed_at: chrono::DateTime<Local>,
+    source: &str,
+) -> AnnouncementSourceRouteReport {
     let mut routed = AnnouncementSourceRouteReport::default();
     for announcement in announcements {
         routed.source.attempted += 1;
-        let Some(external_id) = announcement
+        let Some(_) = announcement
             .external_id
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
         else {
-            routed.source.skipped += 1;
+            routed.source.failed += 1;
+            routed
+                .input_dispositions
+                .push(AnnouncementDisposition::Failed);
             log::warn!(
                 "[v17.7][BR-137] announcement source route skipped: missing provider external_id"
             );
@@ -191,19 +226,21 @@ pub async fn route_announcements(
         ) {
             routed.source.classified += 1;
             routed.source.skipped += 1;
-            routed.dispositions.insert(
-                external_id.to_string(),
-                AnnouncementDisposition::FilteredLifecycle,
-            );
+            routed
+                .input_dispositions
+                .push(AnnouncementDisposition::FilteredLifecycle);
             log::info!(
                 "[v17.7][BR-138] announcement normalized route filtered: reason=lifecycle_only"
             );
             continue;
         }
-        let event = match classify_announcement(announcement) {
+        let event = match classify_announcement_with_provenance(announcement, observed_at, source) {
             Ok(event) => event,
             Err(error) => {
-                routed.source.skipped += 1;
+                routed.source.failed += 1;
+                routed
+                    .input_dispositions
+                    .push(AnnouncementDisposition::Failed);
                 log::warn!("[v17.7][BR-137] announcement classification rejected: reason={error}");
                 continue;
             }
@@ -211,10 +248,9 @@ pub async fn route_announcements(
         routed.source.classified += 1;
         if !eligible_codes.contains(&announcement.code) {
             routed.source.skipped += 1;
-            routed.dispositions.insert(
-                external_id.to_string(),
-                AnnouncementDisposition::FilteredAudience,
-            );
+            routed
+                .input_dispositions
+                .push(AnnouncementDisposition::FilteredAudience);
             log::info!(
                 "[v17.7][BR-138] announcement normalized route filtered: reason=outside_monitored_universe"
             );
@@ -222,19 +258,23 @@ pub async fn route_announcements(
         }
         let attempt = push_normalized_event(event).await;
         record_source_attempt(&mut routed.source, &attempt.outcome);
-        routed.dispositions.insert(
-            external_id.to_string(),
-            if attempt.outcome == PushOutcome::Pushed {
+        routed
+            .input_dispositions
+            .push(if attempt.outcome == PushOutcome::Pushed {
                 AnnouncementDisposition::Pushed
             } else {
                 AnnouncementDisposition::Failed
-            },
-        );
+            });
         log::info!(
             "[v17.7][BR-137] announcement normalized outcome={:?}",
             attempt.outcome
         );
     }
+    debug_assert_eq!(
+        routed.input_dispositions.len(),
+        announcements.len(),
+        "BR-137 every provider input must have one disposition"
+    );
     routed
 }
 
@@ -841,7 +881,7 @@ mod tests {
         assert_eq!(routed.source.classified, 1);
         assert_eq!(routed.source.pushed, 1);
         assert_eq!(
-            routed.disposition("TEST_CODE_ANN_EXTERNAL"),
+            routed.disposition_for_input(0),
             Some(AnnouncementDisposition::Pushed)
         );
     }
@@ -907,8 +947,8 @@ mod tests {
         assert_eq!(report.source.pushed, 0);
         assert_eq!(report.source.skipped, 1);
         assert_eq!(
-            report.dispositions.get("TEST_CODE_EXTERNAL"),
-            Some(&AnnouncementDisposition::FilteredAudience)
+            report.disposition_for_input(0),
+            Some(AnnouncementDisposition::FilteredAudience)
         );
     }
 
@@ -930,30 +970,19 @@ mod tests {
         assert_eq!(report.source.pushed, 0);
         assert_eq!(report.source.skipped, 1);
         assert_eq!(
-            report.dispositions.get("TEST_CODE_LIFECYCLE_EXTERNAL"),
-            Some(&AnnouncementDisposition::FilteredLifecycle)
+            report.disposition_for_input(0),
+            Some(AnnouncementDisposition::FilteredLifecycle)
         );
     }
 
     #[test]
     fn br138_disposition_counts_are_explicit_for_canary_evidence() {
-        let mut report = AnnouncementSourceRouteReport::default();
-        report.dispositions.insert(
-            "TEST_CODE_PUSHED".to_string(),
+        let report = AnnouncementSourceRouteReport::with_dispositions_for_test(vec![
             AnnouncementDisposition::Pushed,
-        );
-        report.dispositions.insert(
-            "TEST_CODE_LIFECYCLE".to_string(),
             AnnouncementDisposition::FilteredLifecycle,
-        );
-        report.dispositions.insert(
-            "TEST_CODE_AUDIENCE".to_string(),
             AnnouncementDisposition::FilteredAudience,
-        );
-        report.dispositions.insert(
-            "TEST_CODE_FAILED".to_string(),
             AnnouncementDisposition::Failed,
-        );
+        ]);
 
         let counts = report.disposition_counts();
         assert_eq!(counts.pushed, 1);
@@ -979,9 +1008,41 @@ mod tests {
         assert_eq!(report.source.classified, 1);
         assert_eq!(report.source.pushed, 1);
         assert_eq!(
-            report.dispositions.get("TEST_CODE_ALLOWED_EXTERNAL"),
-            Some(&AnnouncementDisposition::Pushed)
+            report.disposition_for_input(0),
+            Some(AnnouncementDisposition::Pushed)
         );
+    }
+
+    #[tokio::test]
+    async fn br137_every_provider_input_has_a_fail_closed_disposition() {
+        let eligible = HashSet::from(["TEST_CODE_ALLOWED".to_string()]);
+        let mut missing_id = br138_important_announcement("unused", "TEST_CODE_ALLOWED");
+        missing_id.external_id = None;
+        let mut stale = br138_important_announcement("TEST_CODE_STALE", "TEST_CODE_ALLOWED");
+        stale.date = "2026-01-01".to_string();
+        let mut lifecycle =
+            br138_important_announcement("TEST_CODE_LIFECYCLE_2", "TEST_CODE_ALLOWED");
+        lifecycle.title = "关于注销部分回购股份并减少注册资本通知债权人的公告".to_string();
+        lifecycle.level = stock_analysis::data_provider::announcement::AnnLevel::Skip;
+        let outside = br138_important_announcement("TEST_CODE_OUTSIDE", "TEST_CODE_OTHER");
+
+        let report = route_announcements(&[missing_id, stale, lifecycle, outside], &eligible).await;
+
+        assert_eq!(report.source.attempted, 4);
+        assert_eq!(report.source.failed, 2);
+        assert_eq!(report.source.skipped, 2);
+        assert_eq!(
+            (0..4)
+                .map(|index| report.disposition_for_input(index).unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                AnnouncementDisposition::Failed,
+                AnnouncementDisposition::Failed,
+                AnnouncementDisposition::FilteredLifecycle,
+                AnnouncementDisposition::FilteredAudience,
+            ]
+        );
+        assert_eq!(report.disposition_for_input(4), None);
     }
 
     #[tokio::test]
