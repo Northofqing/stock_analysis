@@ -177,6 +177,55 @@ fn test_mode_rejects_production_database_with_nonzero_exit() {
 }
 
 #[test]
+fn review_command_runs_without_service_enablement() {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let root = std::env::temp_dir().join(format!(
+        "monitor-review-without-enablement-{}-{}",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&root).expect("create isolated working directory");
+    let database_path = root.join("review.db");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_monitor"))
+        .args(["--test", "--review"])
+        .current_dir(&root)
+        .env("DATABASE_PATH", &database_path)
+        .env("MAGICLAW_DB_PATH", &database_path)
+        .env("STOCK_LIST", "TEST_CODE_000001")
+        .env("STOCK_ENV_MODE", "test")
+        .env("V10_DRY_RUN_PUSH", "1")
+        .env("STOCK_ANALYSIS_QUIET_HOUR_OVERRIDE", "1")
+        .env_remove("MONITOR_ENABLED")
+        .env_remove("ALERT_WEBHOOK_URL")
+        .env_remove("WECHAT_WEBHOOK")
+        .output()
+        .expect("run isolated strict review without service switch");
+
+    let combined_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "strict review must execute and fail closed without service enablement; output={combined_output}"
+    );
+    assert!(
+        combined_output.contains("[复盘] --review 终端模式启动"),
+        "review command was short-circuited before execution; output={combined_output}"
+    );
+    assert!(
+        !combined_output.contains("[jsonl_writer] fatal error")
+            && !combined_output.contains("background task failed"),
+        "event writer did not initialize cleanly; output={combined_output}"
+    );
+
+    std::fs::remove_dir_all(&root).expect("remove isolated working directory");
+}
+
+#[test]
 fn fresh_test_database_starts_without_lock_errors() {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let root = std::env::temp_dir().join(format!(

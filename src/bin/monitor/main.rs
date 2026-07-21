@@ -885,6 +885,17 @@ mod virtual_observation_tests {
         assert!(!isolated_e2e_requested(&["monitor".to_string()]));
     }
 
+    #[test]
+    fn br141_only_bare_monitor_requires_service_enablement() {
+        assert!(service_enablement_required(&["monitor".to_string()]));
+        for argument in ["--test", "--review", "--history", "--unknown"] {
+            assert!(!service_enablement_required(&[
+                "monitor".to_string(),
+                argument.to_string(),
+            ]));
+        }
+    }
+
     #[tokio::test]
     async fn br103_missing_real_account_snapshot_blocks_close_review() {
         let error = build_close_review_report()
