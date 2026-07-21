@@ -269,3 +269,45 @@ The PR must include Refs, Data-Redlines, OldModules, Threshold-Proof,
 Business-Rules, Validation and Rollback. Merge without bypassing required checks,
 fetch GitHub `master`, and verify the merge commit. Do not restart the cancelled
 48-hour monitor.
+
+### Task 5: Close independent-review lifecycle findings
+
+**Files:**
+- Modify: `src/event/jsonl_writer.rs`
+- Modify: `src/bin/monitor/main.rs`
+- Modify: `tests/monitor_help_isolation.rs`
+
+- [ ] **Step 1: Isolate inherited test paths and add RED process cases**
+
+The review process test must remove `EVENT_AUDIT_DIR` and `PUSH_LOG_DIR`. Add a
+writer-startup failure process case by creating a regular `data` file under the
+isolated root and requiring exit 2 with `event_bus.jsonl initialization failed`.
+Add a corrupt `data/test/event_bus/YYYY-MM-DD.jsonl`, run test history for that
+date without `MONITOR_ENABLED`, and require exit 1.
+
+- [ ] **Step 2: Add RED writer failure tests**
+
+Cover: parent path is a regular file (ready initialization fails); unreadable
+base directory makes retention cleanup fail on Unix; replacing the initialized
+base directory with a regular file makes the next envelope write fail; and a
+capacity-one bus with two publications before the consumer starts reports lag.
+
+- [ ] **Step 3: Propagate consume and shutdown results**
+
+Return `JoinHandle<Result<(), JsonlError>>`; use `?` for envelope writes and
+convert `RecvError::Lagged` into a terminal `JsonlError`. Add one monitor lifecycle
+helper that shuts down the bus, awaits exactly one handle, and converts writer or
+join failure to exit 2.
+
+- [ ] **Step 4: Remove deep exits and fix history status**
+
+Make strict review return `Result<(), String>` instead of exiting internally.
+Route terminal completion through the lifecycle helper. Return exit 1 for either
+history query/statistics error, while successful empty history remains exit 0.
+
+- [ ] **Step 5: Run focused and full gates again**
+
+Run all writer tests and `monitor_help_isolation`, then repeat fmt, clippy, full
+workspace tests, compliance, coverage threshold check, release build and the
+unset-switch canary. Request a second independent review; merge only with zero
+Critical and zero Important findings.

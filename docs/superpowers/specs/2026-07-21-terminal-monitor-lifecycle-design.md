@@ -34,10 +34,22 @@ notification sink.
 
 `JsonlWriter::spawn` becomes an async ready boundary. It creates the base
 directory and performs retention cleanup before spawning the receive loop. A
-directory or cleanup failure returns `JsonlError` to the caller. The monitor logs
-the error and exits 2. The receive loop owns only event consumption and per-event
-append errors; there is no nested task whose `JoinError` can be mistaken for an
-I/O failure.
+directory or cleanup failure returns `JsonlError` to the caller. The receive
+task returns `Result<(), JsonlError>`: an envelope write failure or receiver lag
+is terminal evidence loss, not a warning that permits false success.
+
+The monitor owns the single `JoinHandle<Result<(), JsonlError>>`. Every explicit
+terminal path that starts runtime persistence closes the global event bus and
+awaits this handle before selecting the process status. A writer or join failure
+overrides the requested status with exit 2. `run_review_only` returns a typed
+error to this owner rather than calling `process::exit` below the lifecycle seam.
+Long-running shutdown applies the same drain step. This makes the module deep:
+callers learn one ready start contract and one awaited completion result, while
+filesystem and broadcast failure details remain local to the writer.
+
+History is a read-only terminal command but still follows truthful status:
+corrupt JSONL or statistics input exits 1. Invalid explicit arguments likewise
+reach the parser instead of the service-enable gate.
 
 ## Alternatives rejected
 
@@ -70,10 +82,16 @@ policy, retention duration, or JSONL record format changes.
 - A process integration test removes `MONITOR_ENABLED`, runs isolated
   `--test --review`, and requires status 2, a strict-review marker, and no JSONL
   fatal/background-task marker.
+- Process tests remove `EVENT_AUDIT_DIR` and `PUSH_LOG_DIR` (or point them under
+  the isolated root), so inherited operator configuration cannot write test
+  evidence into production paths.
 - A disabled bare-monitor process returns 0 without creating the event-bus data
   directory.
-- Writer unit tests await ready initialization and retain append/replay-filter and
-  retention behavior.
+- Writer unit tests await ready initialization, retain append/replay-filter and
+  retention behavior, and cover directory initialization failure, retention
+  cleanup failure, envelope write failure, and deterministic receiver lag.
+- A corrupt isolated history JSONL file returns exit 1; a writer initialization
+  failure at monitor startup returns exit 2.
 - Focused tests, fmt, clippy, full workspace tests, compliance, coverage and
   release build must pass.
 - A release canary repeats `monitor --test --review` without
