@@ -50,6 +50,47 @@ fn help_exits_without_creating_runtime_state() {
 }
 
 #[test]
+fn disabled_bare_monitor_exits_before_runtime_state() {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let root = std::env::temp_dir().join(format!(
+        "monitor-disabled-isolation-{}-{}",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&root).expect("create isolated working directory");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_monitor"))
+        .current_dir(&root)
+        .env_remove("MONITOR_ENABLED")
+        .env_remove("DATABASE_PATH")
+        .env_remove("EVENT_AUDIT_DIR")
+        .env_remove("PUSH_LOG_DIR")
+        .output()
+        .expect("run disabled bare monitor");
+
+    let combined_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "disabled bare monitor should exit cleanly; output={combined_output}"
+    );
+    assert!(
+        combined_output.contains("[monitor] disabled: MONITOR_ENABLED is not true"),
+        "disabled lifecycle decision was not visible; output={combined_output}"
+    );
+    assert!(
+        !root.join("data").exists(),
+        "disabled bare monitor created runtime data under {}",
+        root.display()
+    );
+
+    std::fs::remove_dir_all(&root).expect("remove isolated working directory");
+}
+
+#[test]
 fn normal_process_initializes_governance_before_waiting_for_market() {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let root = std::env::temp_dir().join(format!(

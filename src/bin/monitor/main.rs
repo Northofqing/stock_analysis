@@ -2446,6 +2446,10 @@ fn isolated_e2e_requested(arguments: &[String]) -> bool {
         || matches!(arguments, [_, only] if only == "--test")
 }
 
+fn service_enablement_required(arguments: &[String]) -> bool {
+    arguments.len() == 1
+}
+
 fn runtime_data_path(test_mode: bool, leaf: &str) -> std::path::PathBuf {
     let root = if test_mode { "data/test" } else { "data" };
     std::path::PathBuf::from(root).join(leaf)
@@ -2489,6 +2493,13 @@ async fn main() {
     {
         print_event_help();
         std::process::exit(0);
+    }
+    // BR-141: MONITOR_ENABLED is a lifecycle switch for the bare long-running
+    // service only. Every explicit CLI argument must reach its parser and
+    // truthful terminal status instead of being silently reported as success.
+    if service_enablement_required(&startup_args) && !check_enabled() {
+        log::info!("[monitor] disabled: MONITOR_ENABLED is not true");
+        return;
     }
 
     // 修复 F20 (2026-06-29 codex review): 启动 banner 显示当前 LaunchStage
@@ -2586,10 +2597,6 @@ async fn main() {
     );
 
     log::info!("═══════════════════════════════════════════════════════════════");
-
-    if !check_enabled() {
-        return;
-    }
 
     // 初始化数据库
 
