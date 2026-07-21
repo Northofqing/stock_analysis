@@ -50,7 +50,7 @@ fn br138_repository_chain_config_exposes_announcement_section() {
 
 - [ ] **Step 3: Run the test and verify RED**
 
-Run: `cargo test --lib br138_repository_chain_config_exposes_announcement_section -- --exact`  
+Run: `cargo test --lib br138_repository_chain_config_exposes_announcement_section -- --test-threads=1`
 Expected: compile failure because `parse_chain_combined`/the typed section does not exist, or parse
 failure because the keys are attached to the final `[[rules]]` item.
 
@@ -245,4 +245,3 @@ master artifact.
 From a new local-log line baseline, record aggregate counts only. Required evidence: no panic/fatal,
 no `banner unavailable`, BR-138 filtered counts are visible, handled low-value events do not reach a
 Pushed outcome, and eligible real source facts can still reach normal governance.
-

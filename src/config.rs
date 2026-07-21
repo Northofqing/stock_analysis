@@ -1,7 +1,8 @@
-//! Registered business rules: BR-056.
+//! Registered business rules: BR-056, BR-138.
 //! 热加载配置 — toml 文件读取 + 默认值 fallback。
 //!
-//! SIGHUP 信号触发 reload。toml 缺失或格式错误 → 用代码默认值，不崩溃。
+//! SIGHUP 信号触发 reload。公告关键词是生产推送选择合同，缺失或格式错误时按
+//! BR-138 显式不可用；其他历史配置仍保留各自既有 fallback 语义。
 
 use serde::{Deserialize, Serialize};
 
@@ -116,6 +117,17 @@ pub struct AnnounceKeywordsFile {
     pub emergency: Vec<String>,
     pub important: Vec<String>,
     pub positive: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CombinedChainConfig {
+    rules: Vec<ChainRuleConfig>,
+    announce_keywords: AnnounceKeywordsFile,
+    boards: Vec<ExclusionBoardConfig>,
+}
+
+fn parse_chain_combined(content: &str) -> Result<CombinedChainConfig, toml::de::Error> {
+    toml::from_str(content)
 }
 
 // ── 监控定时器配置 ──
@@ -692,7 +704,8 @@ fn load_strategy_config() {
 
 /// 加载 chain.toml (整合 chain_rules + announce_keywords + exclusion)
 ///
-/// 3 文件 → 1 文件. 用 toml::from_str 独立 parse 三种 schema.
+/// 3 文件 → 1 文件. BR-138 要求一次性解析真实嵌套结构，禁止公告段失败后
+/// 静默保留更宽泛的编译期词表。
 fn load_chain_combined() {
     let content = match std::fs::read_to_string("config/chain.toml") {
         Ok(c) => {
@@ -700,23 +713,23 @@ fn load_chain_combined() {
             c
         }
         Err(e) => {
-            log::warn!(
-                "[v12-config] config/chain.toml 读取失败: {} (用 const fallback)",
-                e
-            );
+            ANNOUNCE_KEYWORDS.store(Arc::new(None));
+            log::error!("[v12-config][BR-138] config/chain.toml 读取失败: {e}");
             return;
         }
     };
-    if let Ok(c) = toml::from_str::<ChainRulesFile>(&content) {
-        // review #14: ArcSwap store 是 atomic 替换, 不阻塞读.
-        CHAIN_RULES.store(Arc::new(Some(c.rules)));
-    }
-    if let Ok(c) = toml::from_str::<AnnounceKeywordsFile>(&content) {
-        ANNOUNCE_KEYWORDS.store(Arc::new(Some(c)));
-    }
-    if let Ok(c) = toml::from_str::<ExclusionFile>(&content) {
-        EXCLUSION_BOARDS.store(Arc::new(Some(c.boards)));
-    }
+    let combined = match parse_chain_combined(&content) {
+        Ok(combined) => combined,
+        Err(error) => {
+            ANNOUNCE_KEYWORDS.store(Arc::new(None));
+            log::error!("[v12-config][BR-138] config/chain.toml 结构非法: {error}");
+            return;
+        }
+    };
+    // review #14: ArcSwap store 是 atomic 替换, 不阻塞读.
+    CHAIN_RULES.store(Arc::new(Some(combined.rules)));
+    ANNOUNCE_KEYWORDS.store(Arc::new(Some(combined.announce_keywords)));
+    EXCLUSION_BOARDS.store(Arc::new(Some(combined.boards)));
 }
 
 /// 兼容老 API: 加载 risk 配置 (内部调 load_strategy_config)
@@ -748,6 +761,11 @@ pub fn get_announce_keywords() -> Option<Arc<AnnounceKeywordsFile>> {
     (*ANNOUNCE_KEYWORDS.load_full()).clone().map(Arc::new)
 }
 
+/// BR-138: 公告生产循环只在显式加载完整关键词合同时运行。
+pub fn announcement_keywords_available() -> bool {
+    ANNOUNCE_KEYWORDS.load().is_some()
+}
+
 /// 获取监控定时器配置
 // review #14: get_monitor_config 改返回 Arc<MonitorConfig>, 调用方共享同一份内存,
 // 改 6 字段 String clone (200B alloc) 为 0 alloc. 调用方通过 .as_ref() 拿 &MonitorConfig.
@@ -764,4 +782,28 @@ pub fn get_veto_config() -> Arc<LiveVetoConfig> {
 /// 获取动态仓位配置.
 pub fn get_position_sizing_config() -> Arc<PositionSizingConfig> {
     Arc::new(MONITOR_CONFIG.load_full().position_sizing.clone())
+}
+
+#[cfg(test)]
+mod chain_combined_tests {
+    use super::*;
+
+    #[test]
+    fn br138_repository_chain_config_exposes_announcement_section() {
+        let content = include_str!("../config/chain.toml");
+        let parsed = parse_chain_combined(content).expect("valid combined chain config");
+        assert!(parsed
+            .announce_keywords
+            .emergency
+            .contains(&"立案调查".to_string()));
+        assert!(parsed
+            .announce_keywords
+            .important
+            .contains(&"股东减持".to_string()));
+        assert!(parsed
+            .announce_keywords
+            .positive
+            .contains(&"中标".to_string()));
+        assert!(parse_chain_combined("rules = []\nboards = []\n").is_err());
+    }
 }
