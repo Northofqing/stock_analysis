@@ -276,7 +276,7 @@ mod tests {
     #[tokio::test]
     async fn replay_defaults_to_dry_run_and_does_not_publish() {
         let bus = EventBus::new_for_test(8);
-        let mut rx = bus.subscribe();
+        let mut rx = bus.subscribe().expect("subscribe replay receiver");
         let summary = ReplayRunner::new(source_dir().await, bus)
             .run(today(), false, 0)
             .await
@@ -289,7 +289,7 @@ mod tests {
     #[tokio::test]
     async fn force_replay_publishes_new_id_with_original_marker() {
         let bus = EventBus::new_for_test(8);
-        let mut rx = bus.subscribe();
+        let mut rx = bus.subscribe().expect("subscribe replay receiver");
         let summary = ReplayRunner::new(source_dir().await, bus)
             .run(today(), true, 0)
             .await
@@ -319,7 +319,7 @@ mod tests {
         delivery.id = "delivery".into();
         delivery.event_type = "push.delivery.audit".into();
         let bus = EventBus::new_for_test(8);
-        let mut rx = bus.subscribe();
+        let mut rx = bus.subscribe().expect("subscribe replay receiver");
         let summary =
             ReplayRunner::new(write_envelopes("delivery", &[source, delivery]).await, bus)
                 .run(today(), true, 0)
@@ -346,7 +346,7 @@ mod tests {
         for text in [serde_json::json!(42), serde_json::Value::Null] {
             let dir = write_envelopes("invalid", &[source_envelope("bad", text)]).await;
             let bus = EventBus::new_for_test(8);
-            let mut rx = bus.subscribe();
+            let mut rx = bus.subscribe().expect("subscribe replay receiver");
             let summary = ReplayRunner::new(dir, bus)
                 .run(today(), true, 0)
                 .await
@@ -377,7 +377,7 @@ mod tests {
         let envelope = source_envelope("source", serde_json::json!("body"));
         let dir = write_envelopes("rate", &[envelope.clone(), envelope]).await;
         let bus = EventBus::new_for_test(8);
-        let mut rx = bus.subscribe();
+        let mut rx = bus.subscribe().expect("subscribe replay receiver");
         let replay = tokio::spawn(async move {
             ReplayRunner::new(dir, bus)
                 .run(today(), true, 200)
@@ -401,7 +401,7 @@ mod tests {
     #[tokio::test]
     async fn repeated_force_replays_generate_distinct_envelope_ids() {
         let bus = EventBus::new_for_test(8);
-        let mut rx = bus.subscribe();
+        let mut rx = bus.subscribe().expect("subscribe replay receiver");
         let runner = ReplayRunner::new(source_dir().await, bus);
         runner.run(today(), true, 0).await.unwrap();
         let first = rx.recv().await.unwrap();

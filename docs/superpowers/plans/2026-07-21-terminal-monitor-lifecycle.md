@@ -94,25 +94,22 @@ git commit -m "test: expose terminal monitor false success"
 
 - [x] **Step 1: Change `JsonlWriter::spawn` to an async ready boundary**
 
-Use this contract:
+This initial ready-boundary step was superseded by Task 5's propagated consume
+result. The final contract is:
 
 ```rust
 pub async fn spawn(
     receiver: broadcast::Receiver<EventEnvelope>,
     base_dir: PathBuf,
     retention_days: u32,
-) -> Result<JoinHandle<()>, JsonlError> {
+) -> Result<JoinHandle<Result<(), JsonlError>>, JsonlError> {
     let writer = Self {
         base_dir,
         retention_days,
     };
     fs::create_dir_all(&writer.base_dir).await?;
     Self::cleanup_expired(&writer.base_dir, writer.retention_days).await?;
-    Ok(tokio::spawn(async move {
-        if let Err(error) = writer.consume(receiver).await {
-            log::error!("[jsonl_writer] fatal error: {error}");
-        }
-    }))
+    Ok(tokio::spawn(async move { writer.consume(receiver).await }))
 }
 ```
 
@@ -277,7 +274,7 @@ fetch GitHub `master`, and verify the merge commit. Do not restart the cancelled
 - Modify: `src/bin/monitor/main.rs`
 - Modify: `tests/monitor_help_isolation.rs`
 
-- [ ] **Step 1: Isolate inherited test paths and add RED process cases**
+- [x] **Step 1: Isolate inherited test paths and add RED process cases**
 
 The review process test must remove `EVENT_AUDIT_DIR` and `PUSH_LOG_DIR`. Add a
 writer-startup failure process case by creating a regular `data` file under the
@@ -285,14 +282,14 @@ isolated root and requiring exit 2 with `event_bus.jsonl initialization failed`.
 Add a corrupt `data/test/event_bus/YYYY-MM-DD.jsonl`, run test history for that
 date without `MONITOR_ENABLED`, and require exit 1.
 
-- [ ] **Step 2: Add RED writer failure tests**
+- [x] **Step 2: Add RED writer failure tests**
 
 Cover: parent path is a regular file (ready initialization fails); unreadable
 base directory makes retention cleanup fail on Unix; replacing the initialized
 base directory with a regular file makes the next envelope write fail; and a
 capacity-one bus with two publications before the consumer starts reports lag.
 
-- [ ] **Step 3: Propagate consume and shutdown results**
+- [x] **Step 3: Propagate consume and shutdown results**
 
 Return `JoinHandle<Result<(), JsonlError>>`; use `?` for envelope writes and
 convert `RecvError::Lagged` into a terminal `JsonlError`. Add one monitor lifecycle
@@ -300,7 +297,7 @@ helper that shuts down the bus, awaits exactly one handle, and converts writer o
 join failure to exit 2. The long-running service must select on that handle and
 stop immediately if it fails or completes unexpectedly before bus shutdown.
 
-- [ ] **Step 4: Remove deep exits and fix history status**
+- [x] **Step 4: Remove deep exits and fix history status**
 
 Make strict review return `Result<(), String>` instead of exiting internally.
 Route terminal completion through the lifecycle helper. Return exit 1 for either
@@ -312,3 +309,61 @@ Run all writer tests and `monitor_help_isolation`, then repeat fmt, clippy, full
 workspace tests, compliance, coverage threshold check, release build and the
 unset-switch canary. Request a second independent review; merge only with zero
 Critical and zero Important findings.
+
+Gate evidence (2026-07-21 23:44 Asia/Shanghai): writer failure tests 7/7,
+BR-141 monitor unit tests 2/2 and process isolation tests 13/13 passed. `cargo
+fmt --check`, `cargo clippy --workspace --all-targets --all-features -- -D
+warnings`, the full workspace/all-target/all-feature test command, compliance
+and `cargo build --release --bin monitor` exited 0. Freshness was 2026-07-20,
+one trading day behind. Global line coverage was 86,528/107,512 = 80.48%; core
+coverage was 33,434/35,085 = 95.29%. An isolated release canary with
+`MONITOR_ENABLED` absent entered the strict review marker, failed closed with
+exit 2 for unavailable real account evidence, closed the JSONL receiver
+normally, and used no configured external notification sink. Independent
+review result is recorded before this checkbox is completed.
+
+### Task 6: Close second-review concurrency and mode findings
+
+**Files:**
+- Modify: `src/event/bus.rs`
+- Modify: `src/event/cli.rs`
+- Modify: `src/bin/monitor/main.rs`
+- Modify: `tests/monitor_help_isolation.rs`
+
+- [ ] **Step 1: Replace the unsafe sender slot**
+
+Use `RwLock<Option<broadcast::Sender<_>>>` so publish/subscribe/count cannot race
+shutdown. Remove the manual `unsafe impl Send/Sync`; a publish that observes the
+closed slot must return `Rejected(ShuttingDown)`.
+
+- [ ] **Step 2: Test concurrent shutdown**
+
+Run publishers and shutdown on separate threads behind a barrier. Require no
+panic, no invalid result, all post-close publishes rejected, and one idempotent
+shutdown path.
+
+- [ ] **Step 3: Close explicit-mode fallthrough**
+
+Keep registered push/backfill flags known to the event parser, reject
+`--v13-diag` without `--test` before runtime initialization, and add a final
+guard so no unhandled explicit argument can enter the bare service loop.
+
+- [ ] **Step 4: Repeat review and all Gate D evidence**
+
+Run focused tests and all repository gates again, then request independent
+review of the final commit range. Critical and Important findings must both be
+zero before PR creation.
+
+- [ ] **Step 5: Quiesce producers and bound writer drain**
+
+Own every long-running spawned task handle. Remove nested detached notification
+producers, cancel and await owned producers before bus close, and give writer
+drain a ten-second timeout that aborts and reports exit 2. Unit-test timeout and
+all unexpected writer completion classifications.
+
+- [ ] **Step 6: Enforce process isolation and audit ownership**
+
+All monitor process tests must construct commands through one helper that clears
+`EVENT_AUDIT_DIR` and `PUSH_LOG_DIR`. Document that JSONL is a non-authoritative
+replay projection after the existing hash-chained, synced delivery audit; it is
+not a replacement for the red-line 2.7 owner.

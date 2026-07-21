@@ -54,8 +54,8 @@ pub struct TopicStat {
 
 /// 启动后台 dry-run 报告生成器
 /// interval: 报告刷新间隔 (默认 5 min)
-pub fn spawn_dryrun_reporter(interval_secs: u64) {
-    tokio::spawn(async move {
+pub fn spawn_dryrun_reporter(interval_secs: u64) -> tokio::task::JoinHandle<()> {
+    let handle = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
         // 跳过第一个 tick (立即触发)
         ticker.tick().await;
@@ -70,6 +70,7 @@ pub fn spawn_dryrun_reporter(interval_secs: u64) {
         "[v26 dryrun] 后台报告生成器已启动 (interval: {}s)",
         interval_secs
     );
+    handle
 }
 
 /// v14.1 task #162 / review #12: 启动后台 backfill 调度器
@@ -79,8 +80,8 @@ pub fn spawn_dryrun_reporter(interval_secs: u64) {
 ///   - interval: 1 min (粗粒度, 触发后当天不再跑)
 ///   - review #12: 启动时扫 data/d01_recommendations/ 历史积压, 全补完才进 cron
 ///     (monitor 停 N 天 → D+5 窗口漏算 → 启动时一次补单)
-pub fn spawn_outcome_backfill_scheduler() {
-    tokio::spawn(async move {
+pub fn spawn_outcome_backfill_scheduler() -> tokio::task::JoinHandle<()> {
+    let handle = tokio::spawn(async move {
         // 等 1 min 让 DB 起来
         tokio::time::sleep(Duration::from_secs(60)).await;
 
@@ -129,6 +130,7 @@ pub fn spawn_outcome_backfill_scheduler() {
         }
     });
     log::info!("[v14.1 #162] 后台 outcome backfill 调度器已启动 (15:30 每日)");
+    handle
 }
 
 /// review #12: 扫 data/d01_recommendations/ 找 outcome 全为 null 的 jsonl 跑 backfill

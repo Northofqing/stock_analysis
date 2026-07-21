@@ -3,6 +3,12 @@
 //! Persists `EventEnvelope`s to daily JSONL files under a base directory.
 //! Files are named `YYYY-MM-DD.jsonl` and rotate daily. Old files are
 //! removed by `cleanup_expired` based on `retention_days`.
+//!
+//! This file is a non-authoritative observation/replay projection. Production
+//! delivery evidence is committed first by `AuditDispatcher`, whose hash chain
+//! and `sync_data` contract own data-red-line 2.7. JSONL projection failure is
+//! still fatal to the monitor lifecycle, but this file is not advertised as
+//! the tamper-resistant delivery ledger.
 
 use std::path::{Path, PathBuf};
 
@@ -125,6 +131,7 @@ impl JsonlWriter {
     async fn write_envelope(&self, env: &EventEnvelope) -> Result<(), JsonlError> {
         let date_str = env.ts.format("%Y-%m-%d").to_string();
         let file_path = self.base_dir.join(format!("{}.jsonl", date_str));
+        let json = serde_json::to_string(env)?;
 
         tokio::fs::create_dir_all(&self.base_dir).await?;
 
@@ -134,7 +141,6 @@ impl JsonlWriter {
             .open(&file_path)
             .await?;
 
-        let json = serde_json::to_string(env)?;
         file.write_all(json.as_bytes()).await?;
         file.write_all(b"\n").await?;
         file.flush().await?;
@@ -169,7 +175,7 @@ mod tests {
 
     fn test_bus(capacity: usize) -> (Arc<EventBus>, broadcast::Receiver<EventEnvelope>) {
         let bus = EventBus::new_for_test(capacity);
-        let rx = bus.subscribe();
+        let rx = bus.subscribe().expect("subscribe JSONL test receiver");
         (Arc::new(bus), rx)
     }
 

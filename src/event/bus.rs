@@ -1,10 +1,11 @@
+//! Registered business rules: BR-141.
 //! Bounded event bus — v17.1-r2 Task 2
 //!
 //! Provides a `tokio::sync::broadcast`-based event bus with metrics.
 //! The bus has zero business knowledge; it only routes `EventEnvelope`s.
 
-use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::RwLock;
 
 use tokio::sync::broadcast;
 
@@ -60,19 +61,12 @@ pub struct EventBusMetrics {
 /// Uses `tokio::sync::broadcast::channel` internally. The bus is multi-producer,
 /// multi-consumer and preserves event order across subscribers.
 pub struct EventBus {
-    sender: UnsafeCell<Option<broadcast::Sender<EventEnvelope>>>,
-    shutting_down: AtomicBool,
+    sender: RwLock<Option<broadcast::Sender<EventEnvelope>>>,
     published_total: AtomicU64,
     no_subscriber_total: AtomicU64,
     rejected_total: AtomicU64,
     lagged_total: AtomicU64,
 }
-
-// SAFETY: EventBus is Send + Sync because all interior mutability is protected
-// by &self exclusivity (enforced by the business logic: single-threaded monitor).
-// The UnsafeCell wraps a Sender which is itself Send + Sync.
-unsafe impl Send for EventBus {}
-unsafe impl Sync for EventBus {}
 
 impl EventBus {
     /// Create a new bus with the given channel capacity.
@@ -82,8 +76,7 @@ impl EventBus {
     pub fn new(capacity: usize) -> Self {
         let (sender, _receiver) = broadcast::channel(capacity);
         Self {
-            sender: UnsafeCell::new(Some(sender)),
-            shutting_down: AtomicBool::new(false),
+            sender: RwLock::new(Some(sender)),
             published_total: AtomicU64::new(0),
             no_subscriber_total: AtomicU64::new(0),
             rejected_total: AtomicU64::new(0),
@@ -104,15 +97,15 @@ impl EventBus {
     /// Returns a `Receiver` that will receive a clone of every envelope
     /// published after subscription. The receiver lags if it cannot consume
     /// fast enough.
-    pub fn subscribe(&self) -> broadcast::Receiver<EventEnvelope> {
-        // SAFETY: &self gives exclusive access; UnsafeCell allows interior mutability.
-        // The sender is never handed out mutably.
-        unsafe {
-            (*self.sender.get())
-                .as_ref()
-                .expect("bus not shut down")
-                .subscribe()
-        }
+    pub fn subscribe(&self) -> Result<broadcast::Receiver<EventEnvelope>, RejectReason> {
+        let sender = self
+            .sender
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        sender
+            .as_ref()
+            .map(broadcast::Sender::subscribe)
+            .ok_or(RejectReason::ShuttingDown)
     }
 
     /// Publish an envelope on the bus.
@@ -122,19 +115,20 @@ impl EventBus {
     /// - `NoSubscribers` if there were no subscribers at publish time.
     /// - `Rejected(ShuttingDown)` if the bus has been shut down.
     pub fn publish(&self, envelope: EventEnvelope) -> PublishOutcome {
-        if self.shutting_down.load(Ordering::SeqCst) {
-            self.rejected_total.fetch_add(1, Ordering::SeqCst);
-            return PublishOutcome::Rejected(RejectReason::ShuttingDown);
-        }
-
         // Try to serialize just to validate; we don't store the serialized form.
         if serde_json::to_string(&envelope).is_err() {
             self.rejected_total.fetch_add(1, Ordering::SeqCst);
             return PublishOutcome::Rejected(RejectReason::SerializationFailed);
         }
 
-        // SAFETY: &self gives exclusive access; we only call send() which doesn't require &mut Sender.
-        let sender = unsafe { (*self.sender.get()).as_ref().expect("bus not shut down") };
+        let sender_slot = self
+            .sender
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(sender) = sender_slot.as_ref() else {
+            self.rejected_total.fetch_add(1, Ordering::SeqCst);
+            return PublishOutcome::Rejected(RejectReason::ShuttingDown);
+        };
         match sender.send(envelope) {
             Ok(receiver_count) => {
                 self.published_total.fetch_add(1, Ordering::SeqCst);
@@ -152,11 +146,10 @@ impl EventBus {
     /// Shut the bus down, causing all subsequent publishes to be rejected
     /// and waking all receivers with `RecvError::Closed`.
     pub fn shutdown(&self) {
-        self.shutting_down.store(true, Ordering::SeqCst);
-        // SAFETY: &self gives exclusive access; dropping the sender closes the channel.
-        unsafe {
-            (*self.sender.get()).take();
-        }
+        self.sender
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
     }
 
     /// Take a snapshot of the current metrics.
@@ -171,16 +164,11 @@ impl EventBus {
 
     /// Number of receivers currently attached to the live sender.
     pub fn receiver_count(&self) -> usize {
-        if self.shutting_down.load(Ordering::SeqCst) {
-            return 0;
-        }
-        // SAFETY: the option is only removed by `shutdown`; sender itself is
-        // thread-safe and `receiver_count` is read-only.
-        unsafe {
-            (*self.sender.get())
-                .as_ref()
-                .map_or(0, broadcast::Sender::receiver_count)
-        }
+        self.sender
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map_or(0, broadcast::Sender::receiver_count)
     }
 
     /// Increment the lagged counter.
@@ -200,6 +188,7 @@ impl EventBus {
 mod tests {
     use super::*;
     use crate::event::envelope::{EventEnvelope, PushDeliveryEvent};
+    use std::sync::{Arc, Barrier};
 
     fn test_envelope() -> EventEnvelope {
         EventEnvelope::from_event(
@@ -238,8 +227,8 @@ mod tests {
     #[tokio::test]
     async fn local_bus_delivers_one_envelope_to_two_subscribers() {
         let bus = EventBus::new_for_test(8);
-        let mut rx1 = bus.subscribe();
-        let mut rx2 = bus.subscribe();
+        let mut rx1 = bus.subscribe().expect("subscribe rx1");
+        let mut rx2 = bus.subscribe().expect("subscribe rx2");
         let env = test_envelope();
         assert!(matches!(
             bus.publish(env.clone()),
@@ -262,7 +251,7 @@ mod tests {
     #[tokio::test]
     async fn lagged_receiver_increments_metric() {
         let bus = EventBus::new_for_test(1);
-        let mut rx = bus.subscribe();
+        let mut rx = bus.subscribe().expect("subscribe lagged receiver");
         bus.publish(test_envelope_with_id("1"));
         bus.publish(test_envelope_with_id("2"));
         let _ = rx.recv().await;
@@ -277,7 +266,7 @@ mod tests {
     #[test]
     fn published_total_increments_on_success() {
         let bus = EventBus::new_for_test(8);
-        let rx = bus.subscribe();
+        let rx = bus.subscribe().expect("subscribe published receiver");
         bus.publish(test_envelope_with_id("1"));
         bus.publish(test_envelope_with_id("2"));
         assert_eq!(bus.metrics().published_total, 2);
@@ -294,18 +283,20 @@ mod tests {
     fn shutdown_rejects_subsequent_publishes() {
         let bus = EventBus::new_for_test(8);
         bus.shutdown();
+        bus.shutdown();
         let result = bus.publish(test_envelope());
         assert!(matches!(
             result,
             PublishOutcome::Rejected(RejectReason::ShuttingDown)
         ));
         assert_eq!(bus.metrics().rejected_total, 1);
+        assert!(matches!(bus.subscribe(), Err(RejectReason::ShuttingDown)));
     }
 
     #[test]
     fn metrics_snapshot_is_consistent_with_active_subscriber() {
         let bus = EventBus::new_for_test(4);
-        let rx = bus.subscribe();
+        let rx = bus.subscribe().expect("subscribe metrics receiver");
         let env = test_envelope();
         bus.publish(env.clone());
         bus.publish(env.clone());
@@ -322,9 +313,47 @@ mod tests {
     fn receiver_count_tracks_live_subscriptions() {
         let bus = EventBus::new_for_test(4);
         assert_eq!(bus.receiver_count(), 0);
-        let receiver = bus.subscribe();
+        let receiver = bus.subscribe().expect("subscribe count receiver");
         assert_eq!(bus.receiver_count(), 1);
         drop(receiver);
         assert_eq!(bus.receiver_count(), 0);
+    }
+
+    #[test]
+    fn concurrent_publish_and_shutdown_has_no_unsynchronized_sender_access() {
+        let bus = Arc::new(EventBus::new_for_test(64));
+        let receiver = bus.subscribe().expect("keep one receiver alive");
+        let barrier = Arc::new(Barrier::new(5));
+        let mut publishers = Vec::new();
+
+        for worker in 0..4 {
+            let bus = Arc::clone(&bus);
+            let barrier = Arc::clone(&barrier);
+            publishers.push(std::thread::spawn(move || {
+                barrier.wait();
+                for sequence in 0..1_000 {
+                    let outcome = bus.publish(test_envelope_with_id(&format!(
+                        "worker-{worker}-{sequence}"
+                    )));
+                    assert!(matches!(
+                        outcome,
+                        PublishOutcome::Published(_)
+                            | PublishOutcome::Rejected(RejectReason::ShuttingDown)
+                    ));
+                }
+            }));
+        }
+
+        barrier.wait();
+        bus.shutdown();
+        for publisher in publishers {
+            publisher.join().expect("publisher must not panic");
+        }
+        assert!(matches!(
+            bus.publish(test_envelope()),
+            PublishOutcome::Rejected(RejectReason::ShuttingDown)
+        ));
+        assert!(matches!(bus.subscribe(), Err(RejectReason::ShuttingDown)));
+        drop(receiver);
     }
 }

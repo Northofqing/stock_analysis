@@ -4,6 +4,31 @@
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+fn isolated_monitor_command(root: &std::path::Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_monitor"));
+    command.current_dir(root);
+    for key in [
+        "EVENT_AUDIT_DIR",
+        "PUSH_LOG_DIR",
+        "ALERT_WEBHOOK_URL",
+        "CUSTOM_WEBHOOK_URL",
+        "DINGTALK_WEBHOOK",
+        "DISCORD_WEBHOOK",
+        "FEISHU_APP_ID",
+        "FEISHU_APP_SECRET",
+        "FEISHU_TO",
+        "FEISHU_WEBHOOK",
+        "FEISHU_WEBHOOK_URL",
+        "SERVER_CHAN_KEY",
+        "SLACK_WEBHOOK",
+        "TELEGRAM_BOT_TOKEN",
+        "WECHAT_WEBHOOK",
+    ] {
+        command.env_remove(key);
+    }
+    command
+}
+
 #[test]
 fn help_exits_without_creating_runtime_state() {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -14,13 +39,9 @@ fn help_exits_without_creating_runtime_state() {
     ));
     std::fs::create_dir_all(&root).expect("create isolated working directory");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_monitor"))
+    let output = isolated_monitor_command(&root)
         .arg("--help")
-        .current_dir(&root)
         .env_remove("DATABASE_PATH")
-        .env_remove("EVENT_AUDIT_DIR")
-        .env_remove("PUSH_LOG_DIR")
-        .env_remove("ALERT_WEBHOOK_URL")
         .output()
         .expect("run monitor --help");
 
@@ -60,12 +81,9 @@ fn disabled_bare_monitor_exits_before_runtime_state() {
     ));
     std::fs::create_dir_all(&root).expect("create isolated working directory");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_monitor"))
-        .current_dir(&root)
+    let output = isolated_monitor_command(&root)
         .env_remove("MONITOR_ENABLED")
         .env_remove("DATABASE_PATH")
-        .env_remove("EVENT_AUDIT_DIR")
-        .env_remove("PUSH_LOG_DIR")
         .output()
         .expect("run disabled bare monitor");
 
@@ -92,6 +110,37 @@ fn disabled_bare_monitor_exits_before_runtime_state() {
 }
 
 #[test]
+fn test_only_diagnostic_without_test_flag_fails_before_runtime_state() {
+    let root =
+        std::env::temp_dir().join(format!("monitor-v13-diag-contract-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("create isolated diagnostic directory");
+
+    let output = isolated_monitor_command(&root)
+        .arg("--v13-diag")
+        .env_remove("MONITOR_ENABLED")
+        .env_remove("DATABASE_PATH")
+        .output()
+        .expect("run invalid diagnostic mode");
+
+    let combined_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(2), "output={combined_output}");
+    assert!(
+        combined_output.contains("--v13-diag requires --test"),
+        "missing explicit mode error: {combined_output}"
+    );
+    assert!(
+        !root.join("data").exists(),
+        "invalid diagnostic mode initialized runtime state"
+    );
+
+    std::fs::remove_dir_all(root).expect("remove isolated diagnostic directory");
+}
+
+#[test]
 fn normal_process_initializes_governance_before_waiting_for_market() {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let root = std::env::temp_dir().join(format!(
@@ -106,8 +155,7 @@ fn normal_process_initializes_governance_before_waiting_for_market() {
     let stdout_file = std::fs::File::create(&stdout_path).expect("create monitor stdout log");
     let stderr_file = std::fs::File::create(&stderr_path).expect("create monitor stderr log");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_monitor"))
-        .current_dir(&root)
+    let mut child = isolated_monitor_command(&root)
         .env("DATABASE_PATH", &database_path)
         .env("STOCK_LIST", "")
         .env("MONITOR_ENABLED", "true")
@@ -188,9 +236,8 @@ fn test_mode_rejects_production_database_with_nonzero_exit() {
     ));
     std::fs::create_dir_all(&root).expect("create isolated working directory");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_monitor"))
+    let output = isolated_monitor_command(&root)
         .args(["--test", "--review"])
-        .current_dir(&root)
         .env("DATABASE_PATH", "./data/stock_analysis.db")
         .env_remove("ALERT_WEBHOOK_URL")
         .env("STOCK_ENV_MODE", "test")
@@ -229,9 +276,8 @@ fn review_command_runs_without_service_enablement() {
     std::fs::create_dir_all(&root).expect("create isolated working directory");
     let database_path = root.join("review.db");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_monitor"))
+    let output = isolated_monitor_command(&root)
         .args(["--test", "--review"])
-        .current_dir(&root)
         .env("DATABASE_PATH", &database_path)
         .env("MAGICLAW_DB_PATH", &database_path)
         .env("STOCK_LIST", "TEST_CODE_000001")
@@ -239,8 +285,6 @@ fn review_command_runs_without_service_enablement() {
         .env("V10_DRY_RUN_PUSH", "1")
         .env("STOCK_ANALYSIS_QUIET_HOUR_OVERRIDE", "1")
         .env_remove("MONITOR_ENABLED")
-        .env_remove("EVENT_AUDIT_DIR")
-        .env_remove("PUSH_LOG_DIR")
         .env_remove("ALERT_WEBHOOK_URL")
         .env_remove("WECHAT_WEBHOOK")
         .output()
@@ -282,14 +326,11 @@ fn event_writer_initialization_failure_exits_nonzero() {
         .expect("create event directory blocker");
     let database_path = root.join("review.db");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_monitor"))
+    let output = isolated_monitor_command(&root)
         .args(["--test", "--review"])
-        .current_dir(&root)
         .env("DATABASE_PATH", &database_path)
         .env("MAGICLAW_DB_PATH", &database_path)
         .env_remove("MONITOR_ENABLED")
-        .env_remove("EVENT_AUDIT_DIR")
-        .env_remove("PUSH_LOG_DIR")
         .output()
         .expect("run monitor with blocked event directory");
 
@@ -325,14 +366,11 @@ fn corrupt_history_exits_nonzero_without_service_enablement() {
         .expect("seed corrupt history");
     let database_path = root.join("history.db");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_monitor"))
+    let output = isolated_monitor_command(&root)
         .args(["--test", "--history", "--date=2026-07-21"])
-        .current_dir(&root)
         .env("DATABASE_PATH", &database_path)
         .env("MAGICLAW_DB_PATH", &database_path)
         .env_remove("MONITOR_ENABLED")
-        .env_remove("EVENT_AUDIT_DIR")
-        .env_remove("PUSH_LOG_DIR")
         .output()
         .expect("run history against corrupt isolated JSONL");
 
@@ -355,6 +393,84 @@ fn corrupt_history_exits_nonzero_without_service_enablement() {
 }
 
 #[test]
+fn corrupt_history_success_rate_exits_nonzero() {
+    let root = std::env::temp_dir().join(format!(
+        "monitor-history-rate-corrupt-{}",
+        std::process::id()
+    ));
+    let event_dir = root.join("data/test/event_bus");
+    std::fs::create_dir_all(&event_dir).expect("create isolated event directory");
+    std::fs::write(event_dir.join("2026-07-21.jsonl"), b"{not-json}\n")
+        .expect("seed corrupt history");
+
+    let output = isolated_monitor_command(&root)
+        .args(["--test", "--history", "--success-rate", "--date=2026-07-21"])
+        .env_remove("MONITOR_ENABLED")
+        .output()
+        .expect("run corrupt history statistics");
+    let combined_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(output.status.code(), Some(1), "output={combined_output}");
+    assert!(
+        combined_output.contains("[history] success_rate query failed"),
+        "statistics failure was not explicit: {combined_output}"
+    );
+    std::fs::remove_dir_all(root).expect("remove isolated history directory");
+}
+
+#[test]
+fn replay_missing_source_exits_nonzero_without_service_enablement() {
+    let root = std::env::temp_dir().join(format!("monitor-replay-missing-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("create isolated replay directory");
+
+    let output = isolated_monitor_command(&root)
+        .args(["--test", "--replay=2099-12-31"])
+        .env_remove("MONITOR_ENABLED")
+        .output()
+        .expect("run replay with missing source");
+    let combined_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(output.status.code(), Some(1), "output={combined_output}");
+    assert!(
+        combined_output.contains("[replay] failed"),
+        "replay failure was not explicit: {combined_output}"
+    );
+    std::fs::remove_dir_all(root).expect("remove isolated replay directory");
+}
+
+#[test]
+fn unknown_explicit_flag_never_enters_long_running_service() {
+    let root = std::env::temp_dir().join(format!("monitor-unknown-flag-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("create isolated CLI directory");
+    let database_path = root.join("unknown.db");
+
+    let output = isolated_monitor_command(&root)
+        .arg("--unknown-flag")
+        .env("DATABASE_PATH", &database_path)
+        .env_remove("MONITOR_ENABLED")
+        .output()
+        .expect("run unknown explicit flag");
+    let combined_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(output.status.code(), Some(1), "output={combined_output}");
+    assert!(combined_output.contains("[event] CLI error"));
+    assert!(!combined_output.contains("等待交易时段"));
+    std::fs::remove_dir_all(root).expect("remove isolated CLI directory");
+}
+
+#[test]
 fn fresh_test_database_starts_without_lock_errors() {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let root = std::env::temp_dir().join(format!(
@@ -365,9 +481,8 @@ fn fresh_test_database_starts_without_lock_errors() {
     std::fs::create_dir_all(&root).expect("create isolated working directory");
     let database_path = root.join("fresh.db");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_monitor"))
+    let output = isolated_monitor_command(&root)
         .args(["--test", "--review"])
-        .current_dir(&root)
         .env("DATABASE_PATH", &database_path)
         .env_remove("ALERT_WEBHOOK_URL")
         .env("STOCK_LIST", "TEST_CODE_000001")
@@ -414,9 +529,8 @@ fn assert_isolated_e2e_reaches_the_final_completion_marker(label: &str, argument
     std::fs::create_dir_all(&root).expect("create isolated e2e directory");
     let database_path = root.join("e2e.db");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_monitor"))
+    let output = isolated_monitor_command(&root)
         .args(arguments)
-        .current_dir(&root)
         .env("DATABASE_PATH", &database_path)
         .env("MAGICLAW_DB_PATH", &database_path)
         .env("STOCK_LIST", "")
@@ -501,9 +615,8 @@ fn v13_diagnostics_commit_an_isolated_report_without_external_market_calls() {
     let root = std::env::temp_dir().join(format!("monitor-v13-diag-{}", std::process::id()));
     std::fs::create_dir_all(&root).expect("create isolated diagnostic directory");
     let database_path = root.join("diag.db");
-    let output = Command::new(env!("CARGO_BIN_EXE_monitor"))
+    let output = isolated_monitor_command(&root)
         .args(["--test", "--v13-diag"])
-        .current_dir(&root)
         .env("DATABASE_PATH", &database_path)
         .env("MAGICLAW_DB_PATH", &database_path)
         .env("STOCK_ENV_MODE", "test")
@@ -544,9 +657,8 @@ fn memory_database_fails_closed_with_explicit_journal_mode_error() {
     ));
     std::fs::create_dir_all(&root).expect("create isolated working directory");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_monitor"))
+    let output = isolated_monitor_command(&root)
         .args(["--test", "--review"])
-        .current_dir(&root)
         .env("DATABASE_PATH", ":memory:")
         .env_remove("ALERT_WEBHOOK_URL")
         .env("STOCK_LIST", "TEST_CODE_000001")
@@ -587,9 +699,8 @@ fn database_parent_creation_failure_exits_nonzero() {
     std::fs::write(&blocker, b"blocks create_dir_all").expect("create blocking regular file");
     let database_path = blocker.join("fresh.db");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_monitor"))
+    let output = isolated_monitor_command(&root)
         .args(["--test", "--review"])
-        .current_dir(&root)
         .env("DATABASE_PATH", &database_path)
         .env_remove("ALERT_WEBHOOK_URL")
         .env("STOCK_LIST", "TEST_CODE_000001")
