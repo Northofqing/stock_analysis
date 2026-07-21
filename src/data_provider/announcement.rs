@@ -1,4 +1,4 @@
-//! Registered business rules: BR-059, BR-105, BR-137.
+//! Registered business rules: BR-059, BR-105, BR-137, BR-138.
 //! A股公告抓取（东方财富公告API）。
 //!
 //! 策略：标题即风控——含关键词直接告警，不等正文。
@@ -346,6 +346,19 @@ const POSITIVE_KEYWORDS: &[&str] = &[
     "签订协议",
     "战略协议",
 ];
+
+/// BR-138: lifecycle-only corporate notices remain in local provider processing
+/// but are not actionable enough for an immediate user notification.
+pub fn announcement_title_is_immediately_actionable(title: &str) -> bool {
+    let creditor_procedure = title.contains("通知债权人")
+        && (title.contains("减少注册资本")
+            || (title.contains("注销") && title.contains("回购")));
+    let reduction_completed = title.contains("减持")
+        && ["期限届满", "时间届满", "实施完毕", "实施完成"]
+            .iter()
+            .any(|marker| title.contains(marker));
+    !creditor_procedure && !reduction_completed
+}
 
 fn classify_title(title: &str, _code: &str, _name: &str) -> (AnnLevel, String) {
     // review #14 性能: 原 fallback 分支 3 次 .map(to_string).collect() 触发 3 次堆分配
@@ -989,6 +1002,23 @@ mod tests {
             "测试",
         );
         assert_eq!(lvl, AnnLevel::Skip); // <1% 不告警
+    }
+
+    #[test]
+    fn br138_procedural_capital_reduction_notice_is_local_only() {
+        assert!(!announcement_title_is_immediately_actionable(
+            "关于注销部分回购股份并减少注册资本通知债权人的公告"
+        ));
+    }
+
+    #[test]
+    fn br138_completed_reduction_plan_is_local_only_but_new_plan_remains_actionable() {
+        assert!(!announcement_title_is_immediately_actionable(
+            "持股5%以上股东减持计划期限届满暨实施情况的公告"
+        ));
+        assert!(announcement_title_is_immediately_actionable(
+            "控股股东拟减持股份的预披露公告"
+        ));
     }
 
     #[test]
