@@ -216,8 +216,17 @@ pub fn classify_earnings(
 /// Uses `a.external_id` for event_id if present, otherwise a deterministic
 /// fallback. Direction is derived from `a.level` (Emergency/Important → Bull,
 /// Info → Neutral, Skip → reject).
+#[cfg(test)]
 pub fn classify_announcement(
     a: &Announcement,
+) -> Result<NormalizedSourceEvent, NormalizedSourceError> {
+    classify_announcement_with_provenance(a, chrono::Local::now(), "eastmoney")
+}
+
+pub fn classify_announcement_with_provenance(
+    a: &Announcement,
+    observed_at: chrono::DateTime<chrono::Local>,
+    source: &str,
 ) -> Result<NormalizedSourceEvent, NormalizedSourceError> {
     if a.title.is_empty() {
         return Err(NormalizedSourceError::EmptyTitle);
@@ -244,12 +253,13 @@ pub fn classify_announcement(
         .clone()
         .unwrap_or_else(|| format!("{}:{}:{}", a.code, a.date, a.title));
 
-    let source = "eastmoney".to_string();
+    if source.trim().is_empty() {
+        return Err(NormalizedSourceError::EmptySource);
+    }
     let url = a.url.clone();
     let published_on = a
         .published_on()
         .map_err(|_| NormalizedSourceError::InvalidPublishedDate)?;
-    let observed_at = chrono::Local::now();
 
     NormalizedSourceEvent::new(
         SourcePushKind::Announcement,
@@ -263,7 +273,7 @@ pub fn classify_announcement(
         observed_at,
         Some(published_on),
         false,
-        source,
+        source.to_string(),
         url,
     )
 }

@@ -1,4 +1,4 @@
-//! Registered business rules: BR-043, BR-045, BR-047, BR-049, BR-051, BR-063, BR-071, BR-073, BR-074, BR-077, BR-078, BR-082, BR-083, BR-136.
+//! Registered business rules: BR-043, BR-045, BR-047, BR-049, BR-051, BR-063, BR-071, BR-073, BR-074, BR-077, BR-078, BR-082, BR-083, BR-136, BR-140.
 //! 实盘监控模式入口。
 
 //!
@@ -125,6 +125,8 @@ mod notify;
 use crate::notify::{push_governor_v3, PushKind};
 
 mod push_templates;
+
+mod review_batch;
 
 mod dryrun_report; // v26: dry-run 自动报告
 
@@ -3095,6 +3097,7 @@ async fn main() {
         // v13.12 (Task 12): 盘后回溯调度 — 30 min tick, 15:30 后触发持仓个股近 30 天新闻回溯
 
         tokio::spawn(post_close_news_scheduler());
+        spawn_post_session_review_scheduler();
 
         tokio::select! {
 
@@ -3142,6 +3145,14 @@ fn review_execution_path(args: &[String]) -> ReviewExecutionPath {
     ReviewExecutionPath::StrictDispatchers
 }
 
+fn review_timeout_secs() -> u64 {
+    std::env::var("MONITOR_REVIEW_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(300)
+}
+
 /// 手动复盘：`cargo run --bin monitor -- --review`
 
 async fn run_review_only() {
@@ -3159,11 +3170,7 @@ async fn run_review_only() {
 
     // 5min 后显式 exit 2 + ERROR 日志, 不推送噪声给用户.
 
-    let review_timeout_secs: u64 = std::env::var("MONITOR_REVIEW_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(300);
+    let review_timeout_secs = review_timeout_secs();
 
     log::info!(
         "[复盘] 顶层超时保护: {}s (env MONITOR_REVIEW_TIMEOUT_SECS 可覆盖)",
@@ -3172,18 +3179,37 @@ async fn run_review_only() {
 
     let review_start = std::time::Instant::now();
 
+    let due: std::collections::BTreeSet<_> = review_batch::ReviewTask::ALL.into_iter().collect();
     let outcome = tokio::time::timeout(
         std::time::Duration::from_secs(review_timeout_secs),
-        run_strict_review_only_inner(),
+        run_strict_review_only_inner(&due),
     )
     .await;
 
     match outcome {
-        Ok(Ok(())) => {
-            log::info!(
-                "[复盘] ======== 盘后分析完成 ({}s) ========",
-                review_start.elapsed().as_secs()
-            );
+        Ok(Ok(batch)) => {
+            let now = chrono::Local::now();
+            let mut audit_state = review_batch::ReviewScheduleState::for_date(now.date_naive());
+            let transitions = audit_state.apply(&batch, now.naive_local());
+            if let Err(error) =
+                review_batch::append_task_transition_audit(transitions, now.date_naive())
+            {
+                log::error!("[复盘][BR-110][BR-140] 逐任务结果审计失败: {error}. exit 2.");
+                log::logger().flush();
+                std::process::exit(2);
+            }
+            if batch.has_confirmed_delivery() {
+                log::info!(
+                    "[复盘] ======== 盘后分析完成 ({}s) ========",
+                    review_start.elapsed().as_secs()
+                );
+            } else {
+                log::error!(
+                    "[复盘][BR-140] 严格盘后复盘没有任何确认投递；逐任务状态已写审计. exit 2."
+                );
+                log::logger().flush();
+                std::process::exit(2);
+            }
         }
 
         Ok(Err(error)) => {
@@ -3208,15 +3234,120 @@ async fn run_review_only() {
 /// BR-108/109/110: production `--review` may only use the verified shared
 /// banner and the strict post-session dispatchers. The legacy inline review
 /// below remains reachable only from the TEST_CODE E2E fixture.
-async fn run_strict_review_only_inner() -> Result<(), String> {
+async fn run_strict_review_only_inner(
+    due: &std::collections::BTreeSet<review_batch::ReviewTask>,
+) -> Result<review_batch::ReviewBatchOutcome, String> {
     let banner = current_banner()?;
     let now = chrono::Local::now();
     let date = now.format("%Y-%m-%d").to_string();
-    let hhmm = now.format("%H:%M").to_string();
-    if !push_templates::dispatch_post_session_review(&date, &hhmm, &banner).await {
-        return Err("严格盘后复盘没有任何成功投递；逐项失败已写 dispatcher audit".to_string());
+    Ok(push_templates::dispatch_post_session_review(&date, now.time(), &banner, due).await)
+}
+
+fn filter_inline_r08_announcements(
+    announcements: Vec<stock_analysis::data_provider::announcement::Announcement>,
+) -> Vec<stock_analysis::data_provider::announcement::Announcement> {
+    announcements
+        .into_iter()
+        .filter(
+            stock_analysis::data_provider::announcement::announcement_is_immediate_notification_candidate,
+        )
+        .collect()
+}
+
+fn post_session_review_window_open(now: chrono::NaiveDateTime, is_trading_day: bool) -> bool {
+    let threshold = chrono::NaiveTime::from_hms_opt(19, 0, 0)
+        .expect("BR-139 post-session review threshold must be valid");
+    is_trading_day && now.time() >= threshold
+}
+
+async fn attempt_post_session_review(
+    due: &std::collections::BTreeSet<review_batch::ReviewTask>,
+) -> Result<review_batch::ReviewBatchOutcome, String> {
+    if !evaluate_account_mode_hook(true).await {
+        return Err("real AccountMode/banner initialization was not confirmed".to_string());
     }
-    Ok(())
+
+    let timeout_secs = review_timeout_secs();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        run_strict_review_only_inner(due),
+    )
+    .await
+    .map_err(|_| format!("strict review timed out after {timeout_secs}s"))?
+}
+
+async fn post_session_review_scheduler() {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut state: Option<review_batch::ReviewScheduleState> = None;
+
+    log::info!("[复盘调度][BR-139] started threshold=19:00 interval=60s");
+
+    loop {
+        interval.tick().await;
+        let now = chrono::Local::now();
+        if !post_session_review_window_open(
+            now.naive_local(),
+            stock_analysis::calendar::is_trading_day(now.date_naive()),
+        ) {
+            continue;
+        }
+
+        if state.as_ref().map(review_batch::ReviewScheduleState::date) != Some(now.date_naive()) {
+            state = Some(review_batch::ReviewScheduleState::for_date(
+                now.date_naive(),
+            ));
+        }
+        let due = state
+            .as_ref()
+            .expect("review state initialized for current date")
+            .due_tasks(now.naive_local());
+        if due.is_empty() {
+            continue;
+        }
+
+        match attempt_post_session_review(&due).await {
+            Ok(batch) => {
+                let delivered = batch.delivered_count();
+                let schedule = state
+                    .as_mut()
+                    .expect("review state initialized for current date");
+                let mut next_schedule = schedule.clone();
+                let transitions = next_schedule.apply(&batch, now.naive_local());
+                if let Err(error) = review_batch::append_task_transition_audit(
+                    transitions,
+                    now.date_naive(),
+                ) {
+                    log::error!(
+                        "[复盘调度][BR-110][BR-140] outcome audit failed; schedule state not committed: {error}"
+                    );
+                    continue;
+                }
+                *schedule = next_schedule;
+                log::info!(
+                    "[复盘调度][BR-139][BR-140] attempt complete date={} delivered={} unfinished={}",
+                    now.date_naive(),
+                    delivered,
+                    schedule.has_unfinished_tasks()
+                );
+            }
+            Err(error) => log::error!(
+                "[复盘调度][BR-139][BR-140] attempt failed before task outcomes; retry remains eligible: {}",
+                error
+            ),
+        }
+    }
+}
+
+fn spawn_post_session_review_scheduler() {
+    tokio::spawn(async {
+        if let Err(error) = tokio::spawn(post_session_review_scheduler()).await {
+            log::error!(
+                "[复盘调度][BR-139] scheduler task terminated unexpectedly: {}",
+                error
+            );
+        }
+    });
 }
 
 /// 实际复盘子流程 (被 run_review_only 包 5min timeout).
@@ -3692,8 +3823,21 @@ async fn run_review_only_inner(isolated_test_fixtures: bool) -> Result<(), Strin
             };
 
             match load_review_limit_chain_stocks(&r_holdings) {
-                Ok(stocks) => {
-                    let aggs = aggregate(&LimitChainInput { stocks, source_complete: true });
+                Ok(batch) => {
+                    for rejection in &batch.rejected {
+                        log::warn!(
+                            "[v12-R03][BR-140] candidate isolated identity_hash={} reason_code=candidate_evidence_invalid",
+                            review_batch::audit_identity_hash("R-03", &rejection.code)
+                        );
+                    }
+                    for error in &batch.source_errors {
+                        log::error!("[v12-R03][BR-140] {error}");
+                    }
+                    let source_complete = batch.source_complete();
+                    let aggs = aggregate(&LimitChainInput {
+                        stocks: batch.accepted,
+                        source_complete,
+                    });
 
                     if !aggs.is_empty() {
 
@@ -3982,11 +4126,12 @@ async fn run_review_only_inner(isolated_test_fixtures: bool) -> Result<(), Strin
 
                     // 是 sync context, 用 Handle::current().block_on 驱动 future.
 
-                    let anns = tokio::runtime::Handle::current()
+                    let batch = tokio::runtime::Handle::current()
                         .block_on(
                             stock_analysis::data_provider::announcement::fetch_announcements(None),
                         )
                         .map_err(|error| format!("R-08 公告获取失败: {error}"))?;
+                    let anns = filter_inline_r08_announcements(batch.announcements);
 
                     let ann_text = if anns.is_empty() {
                         "今日无重大公告".to_string()
@@ -4691,6 +4836,7 @@ async fn push_e2e_14x_templates(date: &str, hhmm: &str) {
             },
         ],
         None,
+        None,
     );
 
     log::info!("[v70] R-03 推 ({} 字)", r03.chars().count());
@@ -4706,19 +4852,19 @@ async fn push_e2e_14x_templates(date: &str, hhmm: &str) {
             code: "TEST_CODE_R04_1",
 
             net_buy_yi: 3.0,
-            reason: "涨幅偏离值达7%",
+            reason: Some("涨幅偏离值达7%"),
 
-            buy_inst_n: 5,
+            buy_inst_n: Some(5),
             buy_inst_amt_wan: Some(5000.0),
-            buy_other_n: 3,
+            buy_other_n: Some(3),
             buy_other_amt_wan: Some(2000.0),
 
             buy_conc_pct: Some(60.0),
-            sell_desc: "机构卖200万",
+            sell_desc: Some("机构卖200万"),
             sell_conc_pct: Some(40.0),
 
             chain_match: Some("是-PCB"),
-            next_day_risk: "高位, 注意回撤",
+            next_day_risk: Some("高位, 注意回撤"),
         }],
     );
 
@@ -4954,6 +5100,294 @@ async fn run_review_deep_analysis(
 
 /// 窗口：盘前08:00-09:30、盘中09:30-15:00、盘后15:00-22:00。
 
+fn validate_announcement_watch_codes(
+    registered_watch_codes: &std::collections::HashSet<String>,
+) -> Result<std::collections::HashSet<String>, String> {
+    if registered_watch_codes
+        .iter()
+        .any(|code| code.trim().is_empty())
+    {
+        return Err("BR-138 公告受众代码为空".to_string());
+    }
+    Ok(registered_watch_codes.clone())
+}
+
+fn collect_announcement_watch_codes(
+    watchlist: Result<Vec<stock_analysis::portfolio::Position>, String>,
+) -> Result<std::collections::HashSet<String>, String> {
+    let codes = watchlist?
+        .into_iter()
+        .map(|position| position.code)
+        .collect();
+    validate_announcement_watch_codes(&codes)
+}
+
+type AnnouncementWatchLoadTask =
+    tokio::task::JoinHandle<Result<Vec<stock_analysis::portfolio::Position>, String>>;
+
+async fn poll_announcement_watch_load(
+    task: &mut Option<AnnouncementWatchLoadTask>,
+) -> Result<Vec<stock_analysis::portfolio::Position>, String> {
+    let Some(handle) = task.take() else {
+        return Err("BR-138 explicit watch load was not started".to_string());
+    };
+    if !handle.is_finished() {
+        *task = Some(handle);
+        return Err("BR-138 explicit watch load is still in progress".to_string());
+    }
+    handle
+        .await
+        .map_err(|error| format!("BR-138 explicit watch background task failed: {error}"))?
+}
+
+fn merge_news_monitor_codes(
+    holding_codes: Result<std::collections::HashSet<String>, String>,
+    watch_codes: Option<&std::collections::HashSet<String>>,
+) -> Result<std::collections::HashSet<String>, String> {
+    let mut codes = holding_codes?;
+    if let Some(watch_codes) = watch_codes {
+        codes.extend(watch_codes.iter().cloned());
+    }
+    Ok(codes)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnnouncementWatchReadiness {
+    Pending,
+    Failed,
+    Ready,
+}
+
+fn announcement_watch_readiness(
+    watchlist: &Result<Vec<stock_analysis::portfolio::Position>, String>,
+) -> AnnouncementWatchReadiness {
+    match watchlist {
+        Ok(_) => AnnouncementWatchReadiness::Ready,
+        Err(error) if error.contains("still in progress") => AnnouncementWatchReadiness::Pending,
+        Err(_) => AnnouncementWatchReadiness::Failed,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+enum NewsOuterTickPhase {
+    Policy = 0,
+    CriticalFlash = 1,
+    HoldingEarnings = 2,
+    L2 = 3,
+    Announcement = 4,
+    Opportunity = 5,
+    Reset = 6,
+    Flush = 7,
+    Banner = 8,
+    Sleep = 9,
+}
+
+impl NewsOuterTickPhase {
+    const ALL: [Self; 10] = [
+        Self::Policy,
+        Self::CriticalFlash,
+        Self::HoldingEarnings,
+        Self::L2,
+        Self::Announcement,
+        Self::Opportunity,
+        Self::Reset,
+        Self::Flush,
+        Self::Banner,
+        Self::Sleep,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Policy => "policy",
+            Self::CriticalFlash => "critical_flash",
+            Self::HoldingEarnings => "holding_earnings",
+            Self::L2 => "l2",
+            Self::Announcement => "announcement",
+            Self::Opportunity => "opportunity",
+            Self::Reset => "reset",
+            Self::Flush => "flush",
+            Self::Banner => "banner",
+            Self::Sleep => "sleep",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct NewsOuterTickCoordinator {
+    watch_readiness: AnnouncementWatchReadiness,
+    entered: [u8; NewsOuterTickPhase::ALL.len()],
+}
+
+impl NewsOuterTickCoordinator {
+    fn new(watch_readiness: AnnouncementWatchReadiness) -> Self {
+        Self {
+            watch_readiness,
+            entered: [0; NewsOuterTickPhase::ALL.len()],
+        }
+    }
+
+    fn set_watch_readiness(&mut self, watch_readiness: AnnouncementWatchReadiness) {
+        self.watch_readiness = watch_readiness;
+    }
+
+    fn enter(&mut self, phase: NewsOuterTickPhase) -> bool {
+        let enabled = phase != NewsOuterTickPhase::Announcement
+            || self.watch_readiness == AnnouncementWatchReadiness::Ready;
+        if enabled {
+            self.entered[phase as usize] = self.entered[phase as usize].saturating_add(1);
+        }
+        enabled
+    }
+
+    fn entered_count(&self, phase: NewsOuterTickPhase) -> u8 {
+        self.entered[phase as usize]
+    }
+
+    fn finish(&self) -> Result<(), String> {
+        for phase in NewsOuterTickPhase::ALL {
+            let expected = if phase == NewsOuterTickPhase::Announcement
+                && self.watch_readiness != AnnouncementWatchReadiness::Ready
+            {
+                0
+            } else {
+                1
+            };
+            let actual = self.entered_count(phase);
+            if actual != expected {
+                return Err(format!(
+                    "BR-138 outer tick phase {} entered {} times, expected {} for watch {:?}",
+                    phase.label(),
+                    actual,
+                    expected,
+                    self.watch_readiness
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn load_announcement_audience_codes(
+    registered_watch_codes: &std::collections::HashSet<String>,
+) -> (std::collections::HashSet<String>, Option<String>) {
+    // BR-138: `stock_position` is a mutable local simulation/projection table.
+    // Its `updated_at` changes during local return refreshes and is not broker
+    // source evidence. Until a broker position batch carries immutable provider,
+    // batch identity, and source time, positions are explicitly unavailable.
+    let audience = validate_announcement_watch_codes(registered_watch_codes).and_then(|_| {
+        Err("BR-138 verified broker position batch unavailable; local projection updated_at is not source evidence".to_string())
+    });
+    isolate_announcement_position_failure(audience, registered_watch_codes)
+}
+
+fn audit_announcement_batch_provenance(
+    batch: &stock_analysis::data_provider::announcement::AnnouncementFetchBatch,
+) -> Result<(), String> {
+    use stock_analysis::data_provider::announcement::{
+        AnnouncementListAcquisition, AnnouncementListProtocol,
+    };
+
+    let (fallback_used, reason_code) = match &batch.provenance.acquisition {
+        AnnouncementListAcquisition::PrimaryJson => (false, None),
+        AnnouncementListAcquisition::AlternateJsonp { primary_failure } => {
+            debug_assert_eq!(
+                primary_failure.protocol,
+                AnnouncementListProtocol::PrimaryJson
+            );
+            (true, Some(primary_failure.reason_code.clone()))
+        }
+    };
+    let selected_protocol = match batch.provenance.selected_protocol() {
+        AnnouncementListProtocol::PrimaryJson => "primary_json",
+        AnnouncementListProtocol::AlternateJsonp => "alternate_jsonp",
+    };
+    let identity = format!(
+        "{}:{}:{}",
+        batch.provenance.endpoint,
+        batch.provenance.query_date,
+        batch.provenance.observed_at.timestamp_millis()
+    );
+    let decision = review_batch::ReviewSourceProtocolDecision {
+        observed_at: batch.provenance.observed_at.to_rfc3339(),
+        task: "Announcement".to_string(),
+        source: batch.provenance.provider_label().to_string(),
+        source_time: None,
+        query_date: batch.provenance.query_date.to_string(),
+        selected_protocol: selected_protocol.to_string(),
+        fallback_used,
+        reason_code,
+        identity_hash: review_batch::audit_identity_hash("announcement-list", &identity),
+        rule_ids: vec![
+            "BR-137".to_string(),
+            "BR-138".to_string(),
+            "BR-140".to_string(),
+        ],
+    };
+    review_batch::append_source_protocol_audit(decision, batch.provenance.query_date)?;
+    if batch.rejected_details.is_empty() {
+        return Ok(());
+    }
+    let rejections = batch
+        .rejected_details
+        .iter()
+        .map(|rejection| review_batch::ReviewCandidateRejection {
+            observed_at: rejection.observed_at.to_rfc3339(),
+            task: "Announcement".to_string(),
+            source: batch.provenance.provider_label().to_string(),
+            source_time: None,
+            rule_ids: vec![
+                "BR-137".to_string(),
+                "BR-138".to_string(),
+                "BR-140".to_string(),
+            ],
+            retryable: rejection.retryable,
+            identity_hash: rejection.identity_hash.clone(),
+            reason_code: rejection.reason_code.clone(),
+        })
+        .collect();
+    review_batch::append_candidate_rejection_audit(rejections, batch.provenance.query_date)
+        .map(|_| ())
+}
+
+fn isolate_announcement_position_failure(
+    audience: Result<std::collections::HashSet<String>, String>,
+    registered_watch_codes: &std::collections::HashSet<String>,
+) -> (std::collections::HashSet<String>, Option<String>) {
+    match audience {
+        Ok(audience) => (audience, None),
+        Err(error) => (registered_watch_codes.clone(), Some(error)),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnnouncementAlertAction {
+    NormalizedDownstream,
+    Suppress,
+}
+
+fn announcement_alert_action(
+    input_index: usize,
+    route: &v17_sources::AnnouncementSourceRouteReport,
+) -> AnnouncementAlertAction {
+    match route.disposition_for_input(input_index) {
+        Some(v17_sources::AnnouncementDisposition::Pushed) => {
+            AnnouncementAlertAction::NormalizedDownstream
+        }
+        Some(
+            v17_sources::AnnouncementDisposition::FilteredLifecycle
+            | v17_sources::AnnouncementDisposition::FilteredAudience
+            | v17_sources::AnnouncementDisposition::Failed,
+        ) => AnnouncementAlertAction::Suppress,
+        None => {
+            log::error!(
+                "[公告][BR-137][BR-138] provider input missing normalized disposition: index={input_index}"
+            );
+            AnnouncementAlertAction::Suppress
+        }
+    }
+}
+
 async fn news_monitor_loop() {
     use stock_analysis::monitor::detector::AlertEvent;
 
@@ -4967,6 +5401,9 @@ async fn news_monitor_loop() {
         .unwrap_or(120);
 
     log::info!("[NewsMonitor] 启动（独立窗口，不随价格扫描器静默）");
+    log::warn!(
+        "[NewsMonitor][BR-138] verified broker position batch unavailable at startup; local projection is excluded from announcement audience"
+    );
 
     let mut nm = NewsMonitor::new();
 
@@ -4987,26 +5424,6 @@ async fn news_monitor_loop() {
     // 统一在本 8:00-22:00 窗口内调度（覆盖盘前/盘中/盘后），消除「收盘即停」盲区。
 
     let mut last_opp_scan: Option<std::time::Instant> = None;
-
-    // 收集我们的标的代码（供L2概念匹配）
-
-    let our_codes: std::collections::HashSet<String> = loop {
-        match stock_analysis::portfolio::get_all_codes() {
-            Ok(codes) => {
-                let mut set: std::collections::HashSet<String> = codes.into_iter().collect();
-                for code in nm.linker_ref().registered_codes() {
-                    set.insert(code.to_string());
-                }
-                break set;
-            }
-            Err(error) => {
-                log::error!("[NewsMonitor] 标的池加载失败，60 秒后重试: {}", error);
-                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-            }
-        }
-    };
-
-    log::info!("[NewsMonitor] L2 标的池: {} 只", our_codes.len());
 
     // v17.4 §5.1 (BR-082): NewsFlashGate — critical 即时推 + 4 时段聚合 Top3
     let mut news_flash_gate =
@@ -5029,97 +5446,160 @@ async fn news_monitor_loop() {
     let policy_provider =
         stock_analysis::search_service::providers::gov_policy::GovPolicyProvider::new();
 
+    let mut announcement_watch_load: Option<AnnouncementWatchLoadTask> = None;
+
     loop {
         if !NewsMonitor::should_run() {
             tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
             continue;
         }
-        match v17_sources::poll_policy_provider(&policy_provider, 20).await {
-            Ok(report) => log::info!(
-                "[Policy][BR-137] attempted={} classified={} pushed={} skipped={} failed={}",
-                report.attempted,
-                report.classified,
-                report.pushed,
-                report.skipped,
-                report.failed
-            ),
-            Err(error) => log::error!("[Policy][BR-137] provider poll failed: {error}"),
+
+        let mut outer_tick = NewsOuterTickCoordinator::new(AnnouncementWatchReadiness::Pending);
+
+        if announcement_watch_load.is_none() {
+            announcement_watch_load = Some(tokio::task::spawn_blocking(
+                stock_analysis::portfolio::get_watchlist,
+            ));
+        }
+
+        if outer_tick.enter(NewsOuterTickPhase::Policy) {
+            match v17_sources::poll_policy_provider(&policy_provider, 20).await {
+                Ok(report) => log::info!(
+                    "[Policy][BR-137] attempted={} classified={} pushed={} skipped={} failed={}",
+                    report.attempted,
+                    report.classified,
+                    report.pushed,
+                    report.skipped,
+                    report.failed
+                ),
+                Err(error) => log::error!("[Policy][BR-137] provider poll failed: {error}"),
+            }
         }
 
         // v17.4: NewsAggregator tick 入口 — 每轮调一次, 拿 dedup 后 Vec<MarketEvent>
         // v17.4 §5.1: 事件喂 NewsFlashGate → critical 即时推 + 4 时段聚合 (AC34/AC35)
-        let news_events = news_aggregator_init::tick_news_aggregator(20).await;
-        {
-            let mcfg = stock_analysis::config::get_monitor_config();
-            let decisions = news_flash_gate.process(
-                &news_events,
-                chrono::Local::now(),
-                mcfg.news_critical_score_threshold,
-                mcfg.news_max_critical_per_day,
-            );
-            if !decisions.is_empty() {
-                let (nc, na) = news_aggregator_init::push_flash_decisions(decisions).await;
-                log::info!("[v17.4] news_flash push: critical={} aggregated={}", nc, na);
+        if outer_tick.enter(NewsOuterTickPhase::CriticalFlash) {
+            let news_events = news_aggregator_init::tick_news_aggregator(20).await;
+            {
+                let mcfg = stock_analysis::config::get_monitor_config();
+                let decisions = news_flash_gate.process(
+                    &news_events,
+                    chrono::Local::now(),
+                    mcfg.news_critical_score_threshold,
+                    mcfg.news_max_critical_per_day,
+                );
+                if !decisions.is_empty() {
+                    let (nc, na) = news_aggregator_init::push_flash_decisions(decisions).await;
+                    log::info!("[v17.4] news_flash push: critical={} aggregated={}", nc, na);
+                }
             }
         }
 
-        // v17.7 Task 7: Poll earnings and analyst upgrades for watchlist
-        {
-            let earnings_cfg = stock_analysis::config::get_monitor_config()
-                .v17_7_earnings
-                .clone();
-            let poll_secs = earnings_cfg.poll_interval_secs;
-            // Convert from config::EarningsConfig to classifier::EarningsConfig
-            let classifier_cfg = stock_analysis::news::aggregator::classifier::EarningsConfig {
-                metric: earnings_cfg.metric,
-                beat_threshold_pct: earnings_cfg.beat_threshold_pct,
-                miss_threshold_pct: earnings_cfg.miss_threshold_pct,
-                poll_interval_secs: earnings_cfg.poll_interval_secs,
+        // BR-138: policy and critical flash have completed before watch
+        // readiness is inspected. An unfinished task is retained for the next
+        // tick and never awaited here.
+        let watchlist = poll_announcement_watch_load(&mut announcement_watch_load).await;
+        outer_tick.set_watch_readiness(announcement_watch_readiness(&watchlist));
+        if let Ok(positions) = &watchlist {
+            for position in positions {
+                nm.linker_mut()
+                    .register_position(&position.code, &position.name);
+            }
+        }
+        let registered_watch_codes = collect_announcement_watch_codes(watchlist);
+        if let Err(error) = &registered_watch_codes {
+            log::error!(
+                "[NewsMonitor][BR-138] 自选池加载未就绪，本轮仅隔离公告受众/自选增量: {error}"
+            );
+        }
+
+        let holding_codes = stock_analysis::portfolio::get_positions().map(|positions| {
+            positions
+                .into_iter()
+                .map(|position| position.code)
+                .collect::<std::collections::HashSet<_>>()
+        });
+        let our_codes =
+            match merge_news_monitor_codes(holding_codes, registered_watch_codes.as_ref().ok()) {
+                Ok(codes) => {
+                    log::info!("[NewsMonitor] L2/财报标的池: {} 只", codes.len());
+                    Some(codes)
+                }
+                Err(error) => {
+                    log::error!("[NewsMonitor] 持仓标的加载失败，本轮 L2/财报子链路隔离: {error}");
+                    None
+                }
             };
-            let report = v17_sources::poll_earnings_and_analyst(
-                &our_codes,
-                &classifier_cfg,
-                &analyst_store,
-                std::sync::Arc::clone(&last_poll_earnings),
-                std::sync::Arc::clone(&last_poll_analyst),
-                poll_secs,
-                poll_secs,
-            )
-            .await;
-            if report.attempted > 0 {
-                log::info!(
-                    "[v17.7] earnings/analyst poll: attempted={} classified={} pushed={} skipped={} failed={}",
-                    report.attempted, report.classified, report.pushed, report.skipped, report.failed
-                );
+
+        // v17.7 Task 7: Poll earnings and analyst upgrades for watchlist
+        if outer_tick.enter(NewsOuterTickPhase::HoldingEarnings) {
+            if let Some(our_codes) = &our_codes {
+                let earnings_cfg = stock_analysis::config::get_monitor_config()
+                    .v17_7_earnings
+                    .clone();
+                let poll_secs = earnings_cfg.poll_interval_secs;
+                // Convert from config::EarningsConfig to classifier::EarningsConfig
+                let classifier_cfg = stock_analysis::news::aggregator::classifier::EarningsConfig {
+                    metric: earnings_cfg.metric,
+                    beat_threshold_pct: earnings_cfg.beat_threshold_pct,
+                    miss_threshold_pct: earnings_cfg.miss_threshold_pct,
+                    poll_interval_secs: earnings_cfg.poll_interval_secs,
+                };
+                let report = v17_sources::poll_earnings_and_analyst(
+                    our_codes,
+                    &classifier_cfg,
+                    &analyst_store,
+                    std::sync::Arc::clone(&last_poll_earnings),
+                    std::sync::Arc::clone(&last_poll_analyst),
+                    poll_secs,
+                    poll_secs,
+                )
+                .await;
+                if report.attempted > 0 {
+                    log::info!(
+                        "[v17.7] earnings/analyst poll: attempted={} classified={} pushed={} skipped={} failed={}",
+                        report.attempted,
+                        report.classified,
+                        report.pushed,
+                        report.skipped,
+                        report.failed
+                    );
+                }
             }
         }
 
         // L2 概念索引刷新（每5分钟一次）
 
-        if last_concept_refresh.elapsed().as_secs() >= 300 {
+        if outer_tick.enter(NewsOuterTickPhase::L2)
+            && last_concept_refresh.elapsed().as_secs() >= 300
+        {
             last_concept_refresh = std::time::Instant::now();
 
-            let codes = our_codes.clone();
+            if let Some(our_codes) = &our_codes {
+                let codes = our_codes.clone();
 
-            match tokio::task::spawn_blocking(move || {
-                // 同步HTTP在独立线程执行，不触发 runtime 冲突
+                match tokio::task::spawn_blocking(move || {
+                    // 同步HTTP在独立线程执行，不触发 runtime 冲突
 
-                stock_analysis::monitor::news_monitor::refresh_concept_index_blocking(&codes)
-            })
-            .await
-            {
-                Ok(Some(index)) => {
-                    nm.linker_mut().replace_concept_index(index);
+                    stock_analysis::monitor::news_monitor::refresh_concept_index_blocking(&codes)
+                })
+                .await
+                {
+                    Ok(Some(index)) => {
+                        nm.linker_mut().replace_concept_index(index);
 
-                    log::info!(
-                        "[NewsMonitor] L2 概念索引已更新（{}个板块关联）",
-                        nm.linker_ref().concept_count()
-                    );
+                        log::info!(
+                            "[NewsMonitor] L2 概念索引已更新（{}个板块关联）",
+                            nm.linker_ref().concept_count()
+                        );
+                    }
+
+                    Ok(None) => log::warn!("[NewsMonitor] L2 概念索引刷新跳过（无板块数据）"),
+
+                    Err(_) => log::warn!("[NewsMonitor] L2 概念索引刷新 panic"),
                 }
-
-                Ok(None) => log::warn!("[NewsMonitor] L2 概念索引刷新跳过（无板块数据）"),
-
-                Err(_) => log::warn!("[NewsMonitor] L2 概念索引刷新 panic"),
+            } else {
+                log::warn!("[NewsMonitor] L2 概念索引刷新跳过（标的来源不可用）");
             }
 
             // v41: 周期刷新 banner (让 news_monitor_loop 的 D-01/I-02 用真 AccountMode)
@@ -5127,96 +5607,105 @@ async fn news_monitor_loop() {
             evaluate_account_mode_hook(false).await;
         }
 
-        // 公告扫描（仅网络拉取在 spawn_blocking，处理在主线程）
+        let mut pushed: Vec<AlertEvent> = Vec::new();
 
-        // v13.10.1: fetch_announcements 改 async, news_monitor_loop 已在 tokio 运行时内
-
-        // (由 tokio::join! 启动), 直接 .await 即可. review #15 用的 Handle::current().block_on
-
-        // 会 panic (Cannot start a runtime from within a runtime).
-
-        let anns =
+        // BR-138: 公告失败只隔离公告子链路，不得跳过同轮的产业链调度、每日重置、
+        // 去重落盘或 banner 刷新。生产 provider 自身负责配置 fail-closed。
+        let announcements = if outer_tick.enter(NewsOuterTickPhase::Announcement) {
             match stock_analysis::data_provider::announcement::fetch_announcements(None).await {
-                Ok(announcements) => announcements,
+                Ok(batch) => match audit_announcement_batch_provenance(&batch) {
+                    Ok(()) => Some(batch),
+                    Err(error) => {
+                        log::error!(
+                            "[NewsMonitor][BR-137][BR-140] 公告 provenance 审计失败，本轮公告隔离: {error}"
+                        );
+                        None
+                    }
+                },
                 Err(error) => {
-                    log::error!("[NewsMonitor] 公告批次获取失败: {}", error);
-                    tokio::time::sleep(tokio::time::Duration::from_secs(poll_secs)).await;
-                    continue;
+                    log::error!("[NewsMonitor][BR-138] 公告批次获取失败，本轮公告隔离: {error}");
+                    None
                 }
-            };
+            }
+        } else {
+            None
+        };
 
-        // 异步预解析：公告API缺失code时，通过东方财富搜索反查
-
-        let mut resolved_codes: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-
+        if let Some((announcement_batch, registered_watch_codes)) =
+            announcements.zip(registered_watch_codes.as_ref().ok())
         {
-            let http = match reqwest::Client::builder()
+            let anns = &announcement_batch.announcements;
+            let (announcement_audience_codes, position_audience_error) =
+                load_announcement_audience_codes(registered_watch_codes);
+            if let Some(error) = position_audience_error {
+                log::warn!(
+                    "[NewsMonitor][BR-138] {error}; 不可验证持仓身份已排除，独立自选受众继续"
+                );
+            }
+
+            // 异步预解析：公告 API 缺失 code 时，通过东方财富搜索反查。
+            let mut resolved_codes: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            match reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
                 .build()
             {
-                Ok(client) => client,
-                Err(error) => {
-                    log::error!("[NewsMonitor] 公告名称反查客户端初始化失败: {}", error);
-                    tokio::time::sleep(tokio::time::Duration::from_secs(poll_secs)).await;
-                    continue;
-                }
-            };
-
-            for ann in &anns {
-                if ann.code.is_empty() && !ann.name.is_empty() {
-                    // 先查本地缓存
-
-                    if let Some(code) = nm.linker_ref().lookup_code_by_name(&ann.name) {
-                        resolved_codes.insert(ann.name.clone(), code.to_string());
-                    } else if let Some(code) =
-                        stock_analysis::monitor::news_monitor::resolve_code_by_name(
-                            &ann.name, &http,
-                        )
-                        .await
-                    {
-                        log::info!("[NewsMonitor] 反查 {} → {}", ann.name, code);
-
-                        resolved_codes.insert(ann.name.clone(), code);
+                Ok(http) => {
+                    for ann in anns {
+                        if ann.code.is_empty() && !ann.name.is_empty() {
+                            if let Some(code) = nm.linker_ref().lookup_code_by_name(&ann.name) {
+                                resolved_codes.insert(ann.name.clone(), code.to_string());
+                            } else if let Some(code) =
+                                stock_analysis::monitor::news_monitor::resolve_code_by_name(
+                                    &ann.name, &http,
+                                )
+                                .await
+                            {
+                                log::info!("[NewsMonitor] 反查 {} → {}", ann.name, code);
+                                resolved_codes.insert(ann.name.clone(), code);
+                            }
+                        }
                     }
                 }
+                Err(error) => log::error!(
+                    "[NewsMonitor][BR-138] 公告名称反查客户端初始化失败，缺代码公告保持显式缺失: {error}"
+                ),
             }
-        }
 
-        let events = nm.process_announcements(&anns, &resolved_codes);
+            let events = nm.process_announcements_indexed(anns, &resolved_codes);
 
-        // BR-112/BR-137: successfully classified announcements have exactly one
-        // governed owner. Every normalized outcome remains explicit; legacy is
-        // retained only for classification failures, never as an outcome fallback.
-        let announcement_route = v17_sources::route_announcements(&anns).await;
-        let normalized_external_ids = announcement_route.normalized_external_ids;
-        log::info!(
-            "[公告][BR-137] attempted={} classified={} pushed={} skipped={} failed={}",
-            announcement_route.source.attempted,
-            announcement_route.source.classified,
-            announcement_route.source.pushed,
-            announcement_route.source.skipped,
-            announcement_route.source.failed
-        );
+            // BR-112/BR-137: successfully classified announcements have exactly one
+            // governed owner. Every normalized outcome remains explicit; legacy is
+            // retained only for classification failures, never as an outcome fallback.
+            let announcement_route = v17_sources::route_announcement_batch(
+                &announcement_batch,
+                &announcement_audience_codes,
+            )
+            .await;
+            let disposition_counts = announcement_route.disposition_counts();
+            log::info!(
+                "[公告][BR-137][BR-138] attempted={} classified={} pushed={} skipped={} failed={} audience={} disposition_pushed={} disposition_lifecycle={} disposition_audience={} disposition_failed={}",
+                announcement_route.source.attempted,
+                announcement_route.source.classified,
+                announcement_route.source.pushed,
+                announcement_route.source.skipped,
+                announcement_route.source.failed,
+                announcement_audience_codes.len(),
+                disposition_counts.pushed,
+                disposition_counts.filtered_lifecycle,
+                disposition_counts.filtered_audience,
+                disposition_counts.failed
+            );
 
-        let mut pushed: Vec<AlertEvent> = Vec::new();
-
-        for e in events {
-            if let Some(ev) = sm.process(e) {
-                // v17.7: Skip legacy push if this event was routed through v17_sources
-                if ev
-                    .routed_external_id
-                    .as_ref()
-                    .map(|id| normalized_external_ids.contains(id))
-                    .unwrap_or(false)
-                {
-                    log::debug!("[公告][BR-137] legacy push skipped: normalized owner exists");
-                } else {
-                    let ev = push(ev).await;
-                    pushed.push(ev);
-                    continue;
+            for (input_index, event) in events {
+                if let Some(alert) = sm.process(event) {
+                    match announcement_alert_action(input_index, &announcement_route) {
+                        AnnouncementAlertAction::NormalizedDownstream => pushed.push(alert),
+                        AnnouncementAlertAction::Suppress => log::debug!(
+                            "[公告][BR-137][BR-138] legacy and downstream push suppressed: normalized disposition is not Pushed"
+                        ),
+                    }
                 }
-                pushed.push(ev);
             }
         }
 
@@ -5311,7 +5800,7 @@ async fn news_monitor_loop() {
             .map(|t| t.elapsed().as_secs() >= opp_interval_secs)
             .unwrap_or(true);
 
-        if opp_due {
+        if outer_tick.enter(NewsOuterTickPhase::Opportunity) && opp_due {
             last_opp_scan = Some(std::time::Instant::now());
             log::warn!("[产业链][BR-112] scan disabled=incomplete_source_contract");
         }
@@ -5320,7 +5809,7 @@ async fn news_monitor_loop() {
 
         let today = chrono::Local::now().format("%Y%m%d").to_string();
 
-        {
+        if outer_tick.enter(NewsOuterTickPhase::Reset) {
             use std::sync::Mutex;
 
             static LAST_DATE: Mutex<Option<String>> = Mutex::new(None);
@@ -5336,7 +5825,9 @@ async fn news_monitor_loop() {
 
         // v5: 每 5 分钟刷盘
 
-        if last_flush.elapsed().as_secs() >= 300 {
+        let flush_scheduled = outer_tick.enter(NewsOuterTickPhase::Flush);
+        let banner_scheduled = outer_tick.enter(NewsOuterTickPhase::Banner);
+        if flush_scheduled && last_flush.elapsed().as_secs() >= 300 {
             last_flush = std::time::Instant::now();
 
             nm.flush_dedup();
@@ -5345,10 +5836,17 @@ async fn news_monitor_loop() {
 
             // v41: 周期刷新 banner (AccountMode + DataMode 评估 → 写 LATEST_BANNER)
 
-            evaluate_account_mode_hook(false).await;
+            if banner_scheduled {
+                evaluate_account_mode_hook(false).await;
+            }
         }
 
-        tokio::time::sleep(tokio::time::Duration::from_secs(poll_secs)).await;
+        if outer_tick.enter(NewsOuterTickPhase::Sleep) {
+            if let Err(error) = outer_tick.finish() {
+                log::error!("[NewsMonitor][BR-138] outer tick contract failed: {error}");
+            }
+            tokio::time::sleep(tokio::time::Duration::from_secs(poll_secs)).await;
+        }
     }
 }
 
@@ -5707,10 +6205,6 @@ async fn monitor_loop() {
 
         let mut preopen_pushed = false;
 
-        // v35: A-10 盘后催化复盘 — 每个交易日首次进入 19:00 后推一次
-
-        let mut evening_pushed = false;
-
         let entry_mode = air_refuel_entry_mode();
 
         let monitor_cfg = stock_analysis::config::get_monitor_config();
@@ -5769,53 +6263,6 @@ async fn monitor_loop() {
                             log::error!("[P-03][BR-091] dispatcher did not confirm delivery");
                         }
                         preopen_pushed = preopen_ok && candidate_ok;
-                    }
-                }
-            }
-
-            // ═══════════════════════════════════════════════════════════════
-
-            // v35: A-10 盘后催化复盘 (AfterHours session, 19:00 后首次)
-
-            //   - 触发: 首次进入 AfterHours, 每个交易日推一次
-
-            //   - 数据源: chain_daily cluster + continuation_count 推断持续性
-
-            //   - 模板: render_catalyst_review (无 banner, ℹ️盘后)
-
-            //   - 静默: chain_daily 空时短路
-
-            // ═══════════════════════════════════════════════════════════════
-
-            if !evening_pushed && session == MarketSession::AfterHours {
-                let now_time = chrono::Local::now().time();
-
-                let evening_start = chrono::NaiveTime::from_hms_opt(19, 0, 0).unwrap();
-
-                if now_time >= evening_start {
-                    log::info!(
-                        "[A-10] 盘后窗口 ({} 后), 推催化复盘",
-                        evening_start.format("%H:%M")
-                    );
-
-                    let date_str = chrono::Local::now().format("%Y-%m-%d").to_string();
-
-                    let hhmm = now_time.format("%H:%M").to_string();
-
-                    if let Some(banner) = current_banner_for("A-10 post-session review") {
-                        let any_pushed =
-                            push_templates::dispatch_post_session_review(&date_str, &hhmm, &banner)
-                                .await;
-                        if !any_pushed {
-                            log::error!(
-                                "[B-005-C][BR-110] 盘后批次没有任何报告成功推送 date={} time={}",
-                                date_str,
-                                hhmm
-                            );
-                        }
-
-                        // v36: A-01 虚拟仓复盘 - 同 19:00 窗口, 复用 evening_pushed flag
-                        evening_pushed = true;
                     }
                 }
             }
@@ -7843,47 +8290,174 @@ fn build_price_map(
     quotes.iter().map(|q| (q.code.clone(), q.price)).collect()
 }
 
-fn load_review_limit_chain_stocks(
-    holdings: &[stock_analysis::portfolio::Position],
-) -> Result<Vec<stock_analysis::market_analyzer::limit_chain_review::StockLimitStats>, String> {
+#[derive(Debug, Clone)]
+struct ReviewLimitChainCandidate {
+    code: String,
+    name: String,
+    sector: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReviewLimitChainRejection {
+    code: String,
+    reason: String,
+}
+
+#[derive(Debug, Default)]
+struct ReviewLimitChainBatch {
+    accepted: Vec<stock_analysis::market_analyzer::limit_chain_review::StockLimitStats>,
+    rejected: Vec<ReviewLimitChainRejection>,
+    source_errors: Vec<String>,
+}
+
+impl ReviewLimitChainBatch {
+    fn source_complete(&self) -> bool {
+        self.rejected.is_empty() && self.source_errors.is_empty()
+    }
+}
+
+fn collect_review_limit_chain_stocks_with<ResolveSector, FetchLimitDays>(
+    candidates: &[ReviewLimitChainCandidate],
+    mut resolve_sector: ResolveSector,
+    mut fetch_limit_days: FetchLimitDays,
+) -> ReviewLimitChainBatch
+where
+    ResolveSector: FnMut(&str) -> Result<String, String>,
+    FetchLimitDays: FnMut(&str) -> Result<Vec<bool>, String>,
+{
     use stock_analysis::market_analyzer::limit_chain_review::StockLimitStats;
 
-    let fetcher = stock_analysis::data_provider::DataFetcherManager::new()
-        .map_err(|error| format!("R-03 初始化日 K 数据源失败: {error:#}"))?;
-    let watchlist = stock_analysis::portfolio::get_watchlist()
-        .map_err(|error| format!("R-03 自选查询失败: {error}"))?;
-    let mut stocks = Vec::new();
-    for position in holdings.iter().chain(watchlist.iter()).take(20) {
-        if position.sector.trim().is_empty() {
-            return Err(format!(
-                "R-03 {}({}) 产业链证据缺失",
-                position.name, position.code
-            ));
+    let mut batch = ReviewLimitChainBatch::default();
+    for candidate in candidates {
+        let code = candidate.code.trim();
+        let name = candidate.name.trim();
+        if code.is_empty() || name.is_empty() {
+            batch.rejected.push(ReviewLimitChainRejection {
+                code: code.to_string(),
+                reason: "股票代码或名称缺失".to_string(),
+            });
+            continue;
         }
-        let (kline, _) = fetcher
-            .get_daily_data(&position.code, 60)
-            .map_err(|error| format!("R-03 {} 日 K 获取失败: {error:#}", position.code))?;
-        let consecutive_days = kline
+
+        let sector = candidate
+            .sector
+            .as_deref()
+            .map(str::trim)
+            .filter(|sector| !sector.is_empty() && *sector != "其他")
+            .map(str::to_string)
+            .map(Ok)
+            .unwrap_or_else(|| resolve_sector(code));
+        let sector = match sector {
+            Ok(sector) if !sector.trim().is_empty() && sector.trim() != "其他" => sector,
+            Ok(_) => {
+                batch.rejected.push(ReviewLimitChainRejection {
+                    code: code.to_string(),
+                    reason: "真实行业数据为空".to_string(),
+                });
+                continue;
+            }
+            Err(error) => {
+                batch.rejected.push(ReviewLimitChainRejection {
+                    code: code.to_string(),
+                    reason: format!("行业数据获取失败: {error}"),
+                });
+                continue;
+            }
+        };
+
+        let limit_days = match fetch_limit_days(code) {
+            Ok(days) if !days.is_empty() => days,
+            Ok(_) => {
+                batch.rejected.push(ReviewLimitChainRejection {
+                    code: code.to_string(),
+                    reason: "日 K 数据为空".to_string(),
+                });
+                continue;
+            }
+            Err(error) => {
+                batch.rejected.push(ReviewLimitChainRejection {
+                    code: code.to_string(),
+                    reason: format!("日 K 获取失败: {error}"),
+                });
+                continue;
+            }
+        };
+        let consecutive_days = limit_days
             .iter()
             .take(10)
-            .take_while(|bar| bar.is_limit_up)
+            .take_while(|is_limit_up| **is_limit_up)
             .count();
         if consecutive_days == 0 {
             continue;
         }
-        let board_level = u8::try_from(consecutive_days)
-            .map_err(|_| format!("R-03 {} 连板数溢出: {consecutive_days}", position.code))?;
-        stocks.push(StockLimitStats {
-            code: position.code.clone(),
-            name: position.name.clone(),
-            chain: position.sector.clone(),
+        let board_level = match u8::try_from(consecutive_days) {
+            Ok(value) => value,
+            Err(_) => {
+                batch.rejected.push(ReviewLimitChainRejection {
+                    code: code.to_string(),
+                    reason: format!("连板数溢出: {consecutive_days}"),
+                });
+                continue;
+            }
+        };
+        batch.accepted.push(StockLimitStats {
+            code: code.to_string(),
+            name: name.to_string(),
+            chain: sector,
             board_level,
             is_limit_up_today: true,
             is_first_board: consecutive_days == 1,
             consecutive_days: u32::from(board_level),
         });
     }
-    Ok(stocks)
+    batch
+}
+
+fn load_review_limit_chain_stocks(
+    holdings: &[stock_analysis::portfolio::Position],
+) -> Result<ReviewLimitChainBatch, String> {
+    let fetcher = stock_analysis::data_provider::DataFetcherManager::new()
+        .map_err(|error| format!("R-03 初始化日 K 数据源失败: {error:#}"))?;
+    let mut source_errors = Vec::new();
+    let watchlist = match stock_analysis::portfolio::get_watchlist() {
+        Ok(watchlist) => watchlist,
+        Err(error) => {
+            source_errors.push(format!("R-03 自选查询失败: {error}"));
+            Vec::new()
+        }
+    };
+    let candidates = holdings
+        .iter()
+        .chain(watchlist.iter())
+        .take(20)
+        .map(|position| ReviewLimitChainCandidate {
+            code: position.code.clone(),
+            name: position.name.clone(),
+            sector: Some(position.sector.clone()),
+        })
+        .collect::<Vec<_>>();
+    let mut batch = collect_review_limit_chain_stocks_with(
+        &candidates,
+        |code| {
+            stock_analysis::block_on_async_with_timeout(
+                stock_analysis::data_provider::industry::fetch_industry_name_only(
+                    &stock_analysis::http_client::SHARED_HTTP_CLIENT,
+                    code,
+                ),
+                15,
+            )
+            .map_err(|error| format!("行业请求超时/运行失败: {error}"))?
+            .map_err(|error| error.to_string())
+        },
+        |code| {
+            fetcher
+                .get_daily_data(code, 60)
+                .map(|(kline, _)| kline.into_iter().map(|bar| bar.is_limit_up).collect())
+                .map_err(|error| format!("{error:#}"))
+        },
+    );
+    batch.source_errors.extend(source_errors);
+    Ok(batch)
 }
 
 fn compute_ma(kline: &[stock_analysis::data_provider::KlineData], n: usize) -> Option<f64> {
@@ -8606,6 +9180,136 @@ mod tests_v17_3_integration {
     }
 }
 
+#[cfg(test)]
+mod tests_post_session_review_scheduler {
+    use super::*;
+    use chrono::{NaiveDate, NaiveDateTime};
+
+    fn at(hour: u32, minute: u32) -> NaiveDateTime {
+        NaiveDate::from_ymd_opt(2026, 7, 21)
+            .expect("valid test date")
+            .and_hms_opt(hour, minute, 0)
+            .expect("valid test time")
+    }
+
+    #[test]
+    fn br139_review_is_due_only_after_threshold_on_a_trading_day() {
+        assert!(!post_session_review_window_open(at(18, 59), true));
+        assert!(post_session_review_window_open(at(19, 0), true));
+        assert!(!post_session_review_window_open(at(19, 0), false));
+    }
+
+    #[test]
+    fn br139_schedule_state_is_scoped_to_one_trading_date() {
+        let date = at(19, 0).date();
+        let state = review_batch::ReviewScheduleState::for_date(date);
+        assert!(!state.due_tasks(at(19, 0)).is_empty());
+        let next_day = date
+            .succ_opt()
+            .expect("test date has a successor")
+            .and_hms_opt(19, 0, 0)
+            .expect("valid next-day time");
+        assert!(state.due_tasks(next_day).is_empty());
+    }
+
+    #[test]
+    fn br139_long_running_branch_starts_review_scheduler() {
+        let source = include_str!("main.rs");
+        let production_wiring = concat!(
+            "tokio::spawn(post_close_news_scheduler());\n",
+            "        spawn_post_session_review_scheduler();"
+        );
+        assert_eq!(
+            source.matches(production_wiring).count(),
+            1,
+            "the long-running branch must start both post-close schedulers exactly once"
+        );
+        let dispatcher_call = ["push_templates::", "dispatch_post_session_review("].concat();
+        assert_eq!(
+            source.matches(&dispatcher_call).count(),
+            1,
+            "the strict inner runner must be the only production dispatcher owner"
+        );
+        let stale_owner = ["evening_", "pushed"].concat();
+        assert!(
+            !source.contains(&stale_owner),
+            "the stale monitor-loop review owner must not return"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests_br140_review_chain_isolation {
+    use super::*;
+
+    #[test]
+    fn br140_r03_missing_sector_does_not_block_later_verified_stock() {
+        let candidates = vec![
+            ReviewLimitChainCandidate {
+                code: "TEST_CODE_000001".to_string(),
+                name: "测试一".to_string(),
+                sector: None,
+            },
+            ReviewLimitChainCandidate {
+                code: "TEST_CODE_000002".to_string(),
+                name: "测试二".to_string(),
+                sector: Some("测试产业链".to_string()),
+            },
+        ];
+
+        let batch = collect_review_limit_chain_stocks_with(
+            &candidates,
+            |code| {
+                if code.ends_with("000001") {
+                    Err("TEST_CODE industry unavailable".to_string())
+                } else {
+                    unreachable!("complete sector must not call resolver")
+                }
+            },
+            |_code| Ok(vec![true, false]),
+        );
+
+        assert_eq!(batch.accepted.len(), 1);
+        assert_eq!(batch.accepted[0].code, "TEST_CODE_000002");
+        assert_eq!(batch.rejected.len(), 1);
+        assert!(!batch.source_complete());
+    }
+
+    #[test]
+    fn br140_r03_kline_failure_is_isolated_per_stock() {
+        let candidates = vec![
+            ReviewLimitChainCandidate {
+                code: "TEST_CODE_000001".to_string(),
+                name: "测试一".to_string(),
+                sector: Some("测试产业链".to_string()),
+            },
+            ReviewLimitChainCandidate {
+                code: "TEST_CODE_000002".to_string(),
+                name: "测试二".to_string(),
+                sector: Some("测试产业链".to_string()),
+            },
+        ];
+
+        let batch = collect_review_limit_chain_stocks_with(
+            &candidates,
+            |_code| unreachable!("complete sector must not call resolver"),
+            |code| {
+                if code.ends_with("000001") {
+                    Err("TEST_CODE kline unavailable".to_string())
+                } else {
+                    Ok(vec![true, false])
+                }
+            },
+        );
+
+        assert_eq!(batch.accepted.len(), 1);
+        assert_eq!(batch.accepted[0].code, "TEST_CODE_000002");
+        assert_eq!(batch.rejected.len(), 1);
+        assert!(batch.rejected[0].reason.contains("日 K 获取失败"));
+        assert!(!batch.source_complete());
+    }
+}
+
 // ========================================================================
 // v17.7 Task 6 Step 1: Announcement routing duplicate-prevention test
 // ========================================================================
@@ -8615,7 +9319,155 @@ mod tests_v17_7_announcement_wiring {
     use super::*;
     use chrono::Local;
     use stock_analysis::data_provider::announcement::{self, Announcement};
-    use stock_analysis::monitor::detector::{AlertCategory, AlertDetail, AlertEvent, AlertLevel};
+
+    #[test]
+    fn br138_explicit_watch_audience_is_validated_independently() {
+        let watch = std::collections::HashSet::from(["TEST_CODE_WATCH".to_string()]);
+        let audience = validate_announcement_watch_codes(&watch).expect("valid watch audience");
+        assert_eq!(audience, watch);
+    }
+
+    #[test]
+    fn br138_watch_audience_rejects_blank_codes() {
+        let watch = std::collections::HashSet::from(["".to_string()]);
+        assert!(validate_announcement_watch_codes(&watch).is_err());
+    }
+
+    #[test]
+    fn br138_watch_load_failure_remains_explicit_instead_of_empty_audience() {
+        let result = collect_announcement_watch_codes(Err(
+            "TEST_CODE explicit watch source unavailable".to_string(),
+        ));
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn br138_unfinished_watch_load_is_never_awaited_by_outer_tick() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut task = Some(tokio::task::spawn_blocking(move || {
+            release_rx
+                .recv()
+                .expect("test controls completion of the background watch load");
+            Err("TEST_CODE watch source unavailable".to_string())
+        }));
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            poll_announcement_watch_load(&mut task),
+        )
+        .await
+        .expect("an unfinished watch load must return immediately");
+        assert!(result
+            .expect_err("pending watch load is explicit")
+            .contains("in progress"));
+
+        release_tx.send(()).expect("release background test task");
+        let _ = task
+            .take()
+            .expect("unfinished task remains owned by the next tick")
+            .await;
+    }
+
+    #[test]
+    fn br138_watch_failure_does_not_remove_independent_holding_news_codes() {
+        let holding_codes = Ok(std::collections::HashSet::from([
+            "TEST_CODE_HOLDING".to_string()
+        ]));
+        let watch_codes: Result<std::collections::HashSet<String>, String> =
+            Err("TEST_CODE watch source unavailable".to_string());
+
+        let news_codes = merge_news_monitor_codes(holding_codes, watch_codes.as_ref().ok())
+            .expect("independent holding source remains usable");
+        assert!(news_codes.contains("TEST_CODE_HOLDING"));
+    }
+
+    #[test]
+    fn br138_inline_r08_excludes_local_only_lifecycle_rows() {
+        let rows = vec![Announcement {
+            code: "TEST_CODE_600000".to_string(),
+            name: "测试本地证据".to_string(),
+            title: "关于注销部分回购股份并减少注册资本通知债权人的公告".to_string(),
+            date: "2026-07-21".to_string(),
+            summary: "TEST_CODE summary".to_string(),
+            content: String::new(),
+            level: announcement::AnnLevel::Skip,
+            reason: "BR-138 lifecycle-only local evidence".to_string(),
+            external_id: Some("TEST_CODE_INLINE_R08_LOCAL".to_string()),
+            url: Some("https://example.invalid/local-only".to_string()),
+        }];
+        assert!(filter_inline_r08_announcements(rows).is_empty());
+    }
+
+    #[test]
+    fn br138_watch_readiness_cannot_short_circuit_outer_tick_tail() {
+        for readiness in [
+            AnnouncementWatchReadiness::Pending,
+            AnnouncementWatchReadiness::Failed,
+        ] {
+            let mut coordinator =
+                NewsOuterTickCoordinator::new(AnnouncementWatchReadiness::Pending);
+            let mut callback_counts = [0_u8; NewsOuterTickPhase::ALL.len()];
+
+            for phase in [
+                NewsOuterTickPhase::Policy,
+                NewsOuterTickPhase::CriticalFlash,
+            ] {
+                if coordinator.enter(phase) {
+                    callback_counts[phase as usize] += 1;
+                }
+            }
+            coordinator.set_watch_readiness(readiness);
+            for phase in [
+                NewsOuterTickPhase::HoldingEarnings,
+                NewsOuterTickPhase::L2,
+                NewsOuterTickPhase::Announcement,
+                NewsOuterTickPhase::Opportunity,
+                NewsOuterTickPhase::Reset,
+                NewsOuterTickPhase::Flush,
+                NewsOuterTickPhase::Banner,
+                NewsOuterTickPhase::Sleep,
+            ] {
+                if coordinator.enter(phase) {
+                    callback_counts[phase as usize] += 1;
+                }
+            }
+
+            coordinator
+                .finish()
+                .expect("pending/failed watch keeps the outer tick contract complete");
+            for phase in NewsOuterTickPhase::ALL {
+                let expected = u8::from(phase != NewsOuterTickPhase::Announcement);
+                assert_eq!(
+                    callback_counts[phase as usize],
+                    expected,
+                    "phase {} callback count for watch {:?}",
+                    phase.label(),
+                    readiness
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn br138_fresh_local_projection_timestamp_never_authorizes_real_position_audience() {
+        let watch = std::collections::HashSet::from(["TEST_CODE_WATCH".to_string()]);
+        let (audience, warning) = load_announcement_audience_codes(&watch);
+        assert_eq!(audience, watch);
+        assert!(warning
+            .expect("missing broker position source must remain explicit")
+            .contains("local projection updated_at is not source evidence"));
+    }
+
+    #[test]
+    fn br138_stale_positions_do_not_block_independent_watch_audience() {
+        let watch = std::collections::HashSet::from(["TEST_CODE_WATCH".to_string()]);
+        let (audience, warning) = isolate_announcement_position_failure(
+            Err("BR-138 stale position component".to_string()),
+            &watch,
+        );
+        assert_eq!(audience, watch);
+        assert!(warning.is_some());
+    }
 
     /// Report from simulate_announcement_loop
     struct AnnouncementLoopReport {
@@ -8633,57 +9485,30 @@ mod tests_v17_7_announcement_wiring {
     /// Simulates the v17.7 announcement loop logic:
     /// 1. Route announcements via the production normalized owner
     /// 2. Track normalized-owned external_ids
-    /// 3. For each AlertEvent, check if it would skip legacy push
+    /// 3. Join emitted alerts to the normalized outcome by provider input index
     async fn simulate_announcement_loop(anns: Vec<Announcement>) -> AnnouncementLoopReport {
         // Push via the production BR-137 per-announcement owner.
-        let routed = v17_sources::route_announcements(&anns).await;
+        let eligible_codes = anns
+            .iter()
+            .map(|announcement| announcement.code.clone())
+            .collect();
+        let routed = v17_sources::route_announcements(&anns, &eligible_codes).await;
         let report = routed.source;
-        let normalized_external_ids = routed.normalized_external_ids;
 
-        // Simulate legacy loop: for each announcement, create an AlertEvent
-        // and check if legacy push would be skipped
-        let mut legacy_attempts: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
+        let mut monitor = stock_analysis::monitor::news_monitor::NewsMonitor::new();
         for ann in &anns {
-            let event_id = ann
-                .external_id
-                .clone()
-                .unwrap_or_else(|| format!("{}:{}:{}", ann.code, ann.date, ann.title));
-
-            let ev = AlertEvent {
-                level: AlertLevel::Important,
-                category: AlertCategory::ChainRisk,
-                code: ann.code.clone(),
-                name: ann.name.clone(),
-                message: format!("[公告] {} | {}", ann.title, ann.reason),
-                detail: AlertDetail {
-                    price: None,
-                    change_pct: None,
-                    volume_ratio: None,
-                    main_flow_yi: None,
-                    threshold: None,
-                    news_title: Some(ann.title.clone()),
-                    news_summary: Some(ann.summary.clone()),
-                    news_importance: None,
-                    ai_decision: None,
-                    t1_locked: false,
-                    extra: None,
-                },
-                triggered_at: Local::now(),
-                routed_external_id: ann.external_id.clone(),
-            };
-
-            // Check if this event would skip legacy push
-            let skipped = ev
-                .routed_external_id
-                .as_ref()
-                .map(|id| normalized_external_ids.contains(id))
-                .unwrap_or(false);
-
-            if !skipped {
-                *legacy_attempts.entry(event_id).or_insert(0) += 1;
-            }
+            monitor.linker_mut().register_position(&ann.code, &ann.name);
         }
+        let indexed_events =
+            monitor.process_announcements_indexed(&anns, &std::collections::HashMap::new());
+        for (input_index, _event) in indexed_events {
+            assert_ne!(
+                announcement_alert_action(input_index, &routed),
+                AnnouncementAlertAction::Suppress,
+                "valid routed announcement should reach normalized downstream"
+            );
+        }
+        let legacy_attempts = std::collections::HashMap::new();
 
         AnnouncementLoopReport {
             announcement_attempts: report.pushed,
@@ -8729,6 +9554,42 @@ mod tests_v17_7_announcement_wiring {
             report.legacy_daily_report_attempts_for("ann-1"),
             0,
             "routed announcement should not trigger legacy push"
+        );
+    }
+
+    #[test]
+    fn br138_filtered_normalized_alert_cannot_trigger_downstream_notifications() {
+        for disposition in [
+            v17_sources::AnnouncementDisposition::FilteredAudience,
+            v17_sources::AnnouncementDisposition::FilteredLifecycle,
+            v17_sources::AnnouncementDisposition::Failed,
+        ] {
+            let route =
+                v17_sources::AnnouncementSourceRouteReport::with_dispositions_for_test(vec![
+                    disposition,
+                ]);
+            assert_eq!(
+                announcement_alert_action(0, &route),
+                AnnouncementAlertAction::Suppress
+            );
+        }
+        let route = v17_sources::AnnouncementSourceRouteReport::with_dispositions_for_test(vec![
+            v17_sources::AnnouncementDisposition::Pushed,
+        ]);
+        assert_eq!(
+            announcement_alert_action(0, &route),
+            AnnouncementAlertAction::NormalizedDownstream
+        );
+    }
+
+    #[test]
+    fn br138_provider_announcement_without_normalized_disposition_fails_closed() {
+        let route = v17_sources::AnnouncementSourceRouteReport::default();
+
+        assert_eq!(
+            announcement_alert_action(0, &route),
+            AnnouncementAlertAction::Suppress,
+            "provider announcements without a normalized disposition must never use legacy delivery"
         );
     }
 

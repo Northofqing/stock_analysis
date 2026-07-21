@@ -256,6 +256,14 @@ async fn fetch_industry_name(client: &reqwest::Client, code: &str) -> Result<Str
     fetch_industry_name_from_hosts(client, code, HOSTS).await
 }
 
+/// 只读取个股所属行业名称，不额外拉取行业列表和成份股。
+///
+/// 盘后 R-03 用它补齐持仓/自选中缺失的行业字段；失败会由调用方按股票隔离，
+/// 不会用猜测值或静默默认值替代真实数据。
+pub async fn fetch_industry_name_only(client: &reqwest::Client, code: &str) -> Result<String> {
+    fetch_industry_name(client, code).await
+}
+
 async fn fetch_industry_name_from_hosts(
     client: &reqwest::Client,
     code: &str,

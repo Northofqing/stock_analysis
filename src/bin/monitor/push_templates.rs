@@ -1180,7 +1180,12 @@ pub struct ChainLine<'a> {
 }
 
 /// v12 §14.2 R-03 IndustryChain 模板渲染 — 字段顺序严格对齐 docs/architecture/v13-push-templates.md
-pub fn render_industry_chain(date: &str, chains: &[ChainLine<'_>], fade: Option<&str>) -> String {
+pub fn render_industry_chain(
+    date: &str,
+    chains: &[ChainLine<'_>],
+    fade: Option<&str>,
+    evidence_note: Option<&str>,
+) -> String {
     let mut out = format!("🔥 涨停产业链（{}）", date);
     for (i, c) in chains.iter().enumerate() {
         out.push_str(&format!(
@@ -1195,6 +1200,9 @@ pub fn render_industry_chain(date: &str, chains: &[ChainLine<'_>], fade: Option<
     if let Some(f) = fade.filter(|s| !s.is_empty()) {
         out.push_str(&format!("\n⚠️ 退潮链: {}", f));
     }
+    if let Some(note) = evidence_note.filter(|note| !note.is_empty()) {
+        out.push_str(&format!("\n⚠️ 部分证据: {note}"));
+    }
     out
 }
 
@@ -1204,17 +1212,17 @@ pub struct LhbEntry<'a> {
     pub name: &'a str,
     pub code: &'a str,
     pub net_buy_yi: f64,
-    pub reason: &'a str,
-    pub buy_inst_n: u32,
+    pub reason: Option<&'a str>,
+    pub buy_inst_n: Option<u32>,
     // W4.3 / B-010 P1 修复: 数值字段从 f64 改 Option<f64>, render 端判 None 显示"无"
     pub buy_inst_amt_wan: Option<f64>,
-    pub buy_other_n: u32,
+    pub buy_other_n: Option<u32>,
     pub buy_other_amt_wan: Option<f64>,
     pub buy_conc_pct: Option<f64>,
-    pub sell_desc: &'a str,
+    pub sell_desc: Option<&'a str>,
     pub sell_conc_pct: Option<f64>,
     pub chain_match: Option<&'a str>,
-    pub next_day_risk: &'a str,
+    pub next_day_risk: Option<&'a str>,
 }
 
 /// v12 §14.2 R-04 ReviewLhb 模板渲染 — 字段顺序严格对齐 docs/architecture/v13-push-templates.md
@@ -1227,39 +1235,58 @@ pub fn render_review_lhb(date: &str, entries: &[LhbEntry<'_>]) -> String {
     }
     let mut out = format!("🐉 龙虎榜净买前五（{} 21:00）", date);
     for (i, e) in entries.iter().enumerate() {
-        // W1.14 / B-010 P0-3 配套: sell_desc 空串时显示"无", 不显示 "—"
-        let sell_desc_display = if e.sell_desc.is_empty() {
-            "无"
-        } else {
-            e.sell_desc
-        };
-        // W4.3 / B-010 P1: 数值字段 Option<f64>, None 时显示"无", 不显示 0
+        let missing = "数据缺失";
+        let reason = e
+            .reason
+            .filter(|value| !value.is_empty())
+            .unwrap_or(missing);
+        let sell_desc_display = e
+            .sell_desc
+            .filter(|value| !value.is_empty())
+            .unwrap_or(missing);
         let buy_inst_amt = e
             .buy_inst_amt_wan
             .map(|v| format!("{:.0}", v))
-            .unwrap_or_else(|| "无".to_string());
+            .unwrap_or_else(|| missing.to_string());
         let buy_other_amt = e
             .buy_other_amt_wan
             .map(|v| format!("{:.0}", v))
-            .unwrap_or_else(|| "无".to_string());
+            .unwrap_or_else(|| missing.to_string());
         let buy_conc = e
             .buy_conc_pct
             .map(|v| format!("{:.0}", v))
-            .unwrap_or_else(|| "无".to_string());
+            .unwrap_or_else(|| missing.to_string());
         let sell_conc = e
             .sell_conc_pct
             .map(|v| format!("{:.0}", v))
-            .unwrap_or_else(|| "无".to_string());
+            .unwrap_or_else(|| missing.to_string());
+        let buy_inst_n = e
+            .buy_inst_n
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| missing.to_string());
+        let buy_other_n = e
+            .buy_other_n
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| missing.to_string());
+        let chain_match = e
+            .chain_match
+            .filter(|value| !value.is_empty())
+            .map(|value| format!("是-{value}"))
+            .unwrap_or_else(|| missing.to_string());
+        let next_day_risk = e
+            .next_day_risk
+            .filter(|value| !value.is_empty())
+            .unwrap_or(missing);
         out.push_str(&format!(
             "\n{}. {}({}) 净买{:.1}亿 | {}\n   买: 机构{}席{}万 其他{}席{}万（集中度{}%）\n   卖: {}（集中度{}%）\n   主线一致: {}\n   次日风险: {}",
             i + 1,
-            e.name, e.code, e.net_buy_yi, e.reason,
-            e.buy_inst_n, buy_inst_amt,
-            e.buy_other_n, buy_other_amt,
+            e.name, e.code, e.net_buy_yi, reason,
+            buy_inst_n, buy_inst_amt,
+            buy_other_n, buy_other_amt,
             buy_conc,
             sell_desc_display, sell_conc,
-            e.chain_match.map(|s| format!("是-{}", s)).unwrap_or_else(|| "否".to_string()),
-            e.next_day_risk,
+            chain_match,
+            next_day_risk,
         ));
         out.push_str("\n─────");
     }
@@ -1438,6 +1465,15 @@ pub struct EventHolding {
 /// 不臆造浮盈: 缺当前价时只显示建仓价 + 建仓日, 不填假 pnl (红线 2.2).
 pub fn event_calendar_virtual_holdings() -> Result<Vec<EventHolding>, String> {
     let snap = load_virtual_observation_for_a01()?;
+    audit_virtual_observation_load_issues(&snap)?;
+    if snap.records.is_empty() && (!snap.rejections.is_empty() || !snap.source_failures.is_empty())
+    {
+        return Err(format!(
+            "virtual observation has no valid records: rejected={} source_failures={}",
+            snap.rejections.len(),
+            snap.source_failures.len()
+        ));
+    }
     // 去重: load_virtual_observation_for_a01 读目录下所有快照 (latest.json + 日期快照),
     //   同一虚拟仓会出现多次. 按 code 去重, 保留首个 (加载已按文件名倒序, latest 优先).
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1461,15 +1497,34 @@ pub fn event_calendar_virtual_holdings() -> Result<Vec<EventHolding>, String> {
         .collect())
 }
 
-/// R-08 宏观公告摘要: 区分"持仓相关" / "非持仓", 各取 TOP 3.
-/// holding_codes 为空 → 全部归"非持仓". 公告为空 → 显式缺失提示 (红线 2.2).
+#[derive(Clone, Copy)]
+pub enum R08HoldingAudience<'a> {
+    /// Immutable broker position batch with provider, batch identity and source time.
+    Verified(&'a std::collections::HashSet<String>),
+    /// No verified per-security broker batch. Never infer non-holding from this state.
+    Unavailable,
+}
+
+/// R-08 宏观公告摘要: 只有经验证券商逐仓批次才能区分"持仓相关" / "非持仓".
+/// 受众不可用时保留公告事实但显式标记关系未知，禁止把未知填成空持仓。
 pub fn build_event_calendar_macro_summary(
     anns: &[stock_analysis::data_provider::announcement::Announcement],
-    holding_codes: &std::collections::HashSet<String>,
+    audience: R08HoldingAudience<'_>,
 ) -> String {
     use stock_analysis::data_provider::announcement::Announcement;
     if anns.is_empty() {
         return "今日公告批次成功返回 0 条".to_string();
+    }
+    let immediate: Vec<&Announcement> = anns
+        .iter()
+        .filter(|announcement| {
+            stock_analysis::data_provider::announcement::announcement_is_immediate_notification_candidate(
+                announcement,
+            )
+        })
+        .collect();
+    if immediate.is_empty() {
+        return "今日可即时通知公告 0 条（本地生命周期证据已隔离）".to_string();
     }
     let fmt = |a: &Announcement| -> String {
         let disp = if a.name.is_empty() {
@@ -1479,15 +1534,29 @@ pub fn build_event_calendar_macro_summary(
         };
         format!("· {} ({:?}): {}", disp, a.level, a.title)
     };
-    let held: Vec<&Announcement> = anns
+    let R08HoldingAudience::Verified(holding_codes) = audience else {
+        let mut summary = format!(
+            "今日共 {} 条公告\n持仓关系不可判定 (TOP {}):",
+            immediate.len(),
+            immediate.len().min(3)
+        );
+        for announcement in immediate.iter().take(3) {
+            summary.push('\n');
+            summary.push_str(&fmt(announcement));
+        }
+        return summary;
+    };
+    let held: Vec<&Announcement> = immediate
         .iter()
+        .copied()
         .filter(|a| holding_codes.contains(&a.code))
         .collect();
-    let other: Vec<&Announcement> = anns
+    let other: Vec<&Announcement> = immediate
         .iter()
+        .copied()
         .filter(|a| !holding_codes.contains(&a.code))
         .collect();
-    let mut s = format!("今日共 {} 条公告", anns.len());
+    let mut s = format!("今日共 {} 条公告", immediate.len());
     if held.is_empty() {
         s.push_str("\n持仓相关: 无");
     } else {
@@ -3871,62 +3940,146 @@ fn select_t1_close(
     Ok(Some((target, *close)))
 }
 
-pub fn load_paper_review_snapshot_real(date: &str) -> Result<Option<PaperReviewSnapshot>, String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PaperReviewRejection {
+    code: String,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PaperReviewCandidateBatch {
+    snapshot: Option<PaperReviewSnapshot>,
+    rejections: Vec<PaperReviewRejection>,
+    pending_count: usize,
+}
+
+fn build_paper_review_candidate_with<F>(
+    date: &str,
+    records: &[VirtualRecordLite],
+    mut fetch_daily: F,
+) -> Result<PaperReviewCandidateBatch, String>
+where
+    F: FnMut(&str, usize) -> Result<(Vec<(chrono::NaiveDate, f64)>, String), String>,
+{
     let review_date = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
         .map_err(|error| format!("A-01 非法复盘日期 {date}: {error}"))?;
-    let snapshot = load_virtual_observation_for_a01()?;
-    if snapshot.records.is_empty() {
-        return Ok(None);
-    }
-    let top = &snapshot.records[0];
+    let mut batch = PaperReviewCandidateBatch::default();
 
-    let entry_price = top.entry_price;
-    let entry_date = chrono::NaiveDate::parse_from_str(&top.entry_date, "%Y-%m-%d")
-        .map_err(|error| format!("A-01 {} entry_date 非法: {error}", top.code))?;
-    let target = stock_analysis::calendar::next_trading_day(entry_date);
-    if target > review_date {
+    for record in records {
+        let evaluated = (|| -> Result<Option<PaperReviewSnapshot>, String> {
+            if !valid_source_stock_code(&record.code) {
+                return Err("code 非法".to_string());
+            }
+            if record.name.trim().is_empty() {
+                return Err("name 缺失".to_string());
+            }
+            if record.entry_mode.trim().is_empty() {
+                return Err("entry_mode 缺失".to_string());
+            }
+            if !record.entry_price.is_finite() || record.entry_price <= 0.0 {
+                return Err("entry_price 缺失/非法".to_string());
+            }
+            let entry_date = chrono::NaiveDate::parse_from_str(&record.entry_date, "%Y-%m-%d")
+                .map_err(|error| format!("entry_date 非法: {error}"))?;
+            let target = stock_analysis::calendar::next_trading_day(entry_date);
+            if target > review_date {
+                return Ok(None);
+            }
+
+            let (rows, source) = fetch_daily(&record.code, 60)?;
+            let Some((target, close_price)) = select_t1_close(&rows, entry_date, review_date)?
+            else {
+                return Err(format!("T+1({target}) 已到但严格日 K 批次未覆盖"));
+            };
+            let pnl = ((close_price / record.entry_price - 1.0) * 100.0) as f32;
+            if !pnl.is_finite() {
+                return Err("收益率非有限值".to_string());
+            }
+            let (high, flat, low) = derive_plan_from_pnl(pnl);
+            Ok(Some(PaperReviewSnapshot {
+                date: date.to_string(),
+                name: record.name.clone(),
+                code: record.code.clone(),
+                trigger: record.entry_mode.clone(),
+                desc: format!(
+                    "研究观察 T+1={} (entry={:.2} → close={:.2}, pnl={:+.1}%, source={})",
+                    target, record.entry_price, close_price, pnl, source
+                ),
+                pnl: Some(pnl),
+                plan_high: Some(high),
+                plan_flat: Some(flat),
+                plan_low: Some(low),
+            }))
+        })();
+
+        match evaluated {
+            Ok(Some(snapshot)) => {
+                batch.snapshot = Some(snapshot);
+                return Ok(batch);
+            }
+            Ok(None) => batch.pending_count += 1,
+            Err(reason) => batch.rejections.push(PaperReviewRejection {
+                code: record.code.clone(),
+                reason,
+            }),
+        }
+    }
+
+    Ok(batch)
+}
+
+pub fn load_paper_review_snapshot_real(date: &str) -> Result<Option<PaperReviewSnapshot>, String> {
+    let snapshot = load_virtual_observation_for_a01()?;
+    audit_virtual_observation_load_issues(&snapshot)?;
+    if snapshot.records.is_empty() {
+        if !snapshot.rejections.is_empty() || !snapshot.source_failures.is_empty() {
+            return Err(format!(
+                "A-01 virtual observation has no valid records: rejected={} source_failures={}",
+                snapshot.rejections.len(),
+                snapshot.source_failures.len()
+            ));
+        }
         return Ok(None);
     }
 
     let fetcher = stock_analysis::data_provider::DataFetcherManager::new()
         .map_err(|error| format!("A-01 初始化日 K 抓取器失败: {error:#}"))?;
-    let (kline, source) = fetcher
-        .get_daily_data(&top.code, 60)
-        .map_err(|error| format!("A-01 {} 日 K 批次失败: {error:#}", top.code))?;
-    let rows: Vec<_> = kline.iter().map(|bar| (bar.date, bar.close)).collect();
-    let Some((target, close_price)) = select_t1_close(&rows, entry_date, review_date)? else {
-        return Ok(Some(PaperReviewSnapshot {
-            date: date.to_string(),
-            name: top.name.clone(),
-            code: top.code.clone(),
-            trigger: top.entry_mode.clone(),
-            desc: format!("T+1({target}) 已到但严格日 K 批次暂未覆盖，收益暂无"),
-            pnl: None,
-            plan_high: None,
-            plan_flat: None,
-            plan_low: None,
-        }));
-    };
-    let pnl = ((close_price / entry_price - 1.0) * 100.0) as f32;
-    if !pnl.is_finite() {
-        return Err(format!("A-01 {} 收益率非有限值", top.code));
+    let batch = build_paper_review_candidate_with(date, &snapshot.records, |code, days| {
+        let (kline, source) = fetcher
+            .get_daily_data(code, days)
+            .map_err(|error| format!("日 K 批次失败: {error:#}"))?;
+        Ok((
+            kline.iter().map(|bar| (bar.date, bar.close)).collect(),
+            source.to_string(),
+        ))
+    })?;
+    let review_date = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .map_err(|error| format!("A-01 非法复盘日期: {error}"))?;
+    persist_review_rejections(
+        "A-01",
+        "virtual_observation_kline",
+        review_date,
+        &["BR-104", "BR-140"],
+        batch
+            .rejections
+            .iter()
+            .map(|rejection| {
+                let reason_code = if rejection.reason.contains("日 K") {
+                    "daily_kline_rejected"
+                } else {
+                    "candidate_validation_failed"
+                };
+                (rejection.code.clone(), reason_code, true)
+            })
+            .collect(),
+    )?;
+    if batch.snapshot.is_none() && !batch.rejections.is_empty() {
+        return Err(format!(
+            "A-01 all candidate records rejected: count={}",
+            batch.rejections.len()
+        ));
     }
-    let (high, flat, low) = derive_plan_from_pnl(pnl);
-
-    Ok(Some(PaperReviewSnapshot {
-        date: date.to_string(),
-        name: top.name.clone(),
-        code: top.code.clone(),
-        trigger: top.entry_mode.clone(),
-        desc: format!(
-            "研究观察 T+1={} (entry={:.2} → close={:.2}, pnl={:+.1}%, source={})",
-            target, entry_price, close_price, pnl, source
-        ),
-        pnl: Some(pnl),
-        plan_high: Some(high),
-        plan_flat: Some(flat),
-        plan_low: Some(low),
-    }))
+    Ok(batch.snapshot)
 }
 
 /// v15.6 兼容: 同步占位
@@ -3960,25 +4113,34 @@ pub fn derive_plan_from_pnl(pnl: f32) -> (String, String, String) {
 }
 
 /// v15.6 业务层入口 (v16.5 改用真实 virtual_observation 数据)
-pub async fn dispatch_paper_review_daily(date: &str) -> bool {
+async fn dispatch_paper_review_daily_outcome(date: &str) -> crate::review_batch::ReviewTaskOutcome {
     let snapshot = match load_paper_review_snapshot_real(date) {
         Ok(Some(snapshot)) => snapshot,
         Ok(None) => {
             log_dispatcher_attempt("A-01", false, 0, "paper_review_snapshot empty");
             log::info!("[A-01] paper_review_snapshot 空 (virtual_observation 无数据), 跳过推送");
-            return false;
+            return crate::review_batch::ReviewTaskOutcome::no_data(
+                "virtual observation has no T+1-complete record",
+            );
         }
         Err(error) => {
             log::error!("[A-01][BR-104] batch rejected: {error}");
             log_dispatcher_attempt("A-01", false, 0, &error);
-            return false;
+            return crate::review_batch::ReviewTaskOutcome::failed(true, error);
         }
     };
     let params = build_paper_review_from_snapshot(&snapshot);
     let snap_size = 1; // 1 record
-    let result = push_paper_review("", params).await;
-    log_dispatcher_attempt("A-01", result, snap_size, "");
-    result
+    let result = push_paper_review_outcome(&snapshot.code, params).await;
+    log_dispatcher_attempt("A-01", result.is_pushed(), snap_size, "");
+    crate::review_batch::ReviewTaskOutcome::from_push_outcome(result, snap_size)
+}
+
+pub async fn dispatch_paper_review_daily(date: &str) -> bool {
+    matches!(
+        dispatch_paper_review_daily_outcome(date).await,
+        crate::review_batch::ReviewTaskOutcome::Delivered { .. }
+    )
 }
 
 /// v17.4 §5.2 (BR-083): 13:00 午盘虚拟仓快照 (AC38).
@@ -5284,6 +5446,154 @@ pub struct CatalystReviewSnapshot {
     pub watch_point: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CatalystReviewRejection {
+    identity: String,
+    reason: String,
+}
+
+#[derive(Debug, Clone)]
+struct CatalystReviewCandidateBatch {
+    snapshot: CatalystReviewSnapshot,
+    rejections: Vec<CatalystReviewRejection>,
+}
+
+fn build_catalyst_review_candidate_with<F>(
+    date: &str,
+    top: &stock_analysis::database::concepts::ChainDailyRow,
+    rotations: &[stock_analysis::database::concepts::BoardRotationRow],
+    mut resolve_name: F,
+) -> Result<CatalystReviewCandidateBatch, String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .map_err(|error| format!("A-10 非法复盘日期 {date}: {error}"))?;
+    if top.date != date {
+        return Err(format!(
+            "A-10 chain_daily as_of={} 与复盘日期 {} 不一致",
+            top.date, date
+        ));
+    }
+    let theme = top.concept.trim();
+    if theme.is_empty() {
+        return Err("A-10 chain_daily 头部 concept 为空".to_string());
+    }
+    let stocks: Vec<String> = serde_json::from_str(&top.stocks)
+        .map_err(|error| format!("A-10 chain_daily stocks JSON 非法: {error}"))?;
+    let mut rejections = Vec::new();
+    let selected_codes: Vec<String> = stocks
+        .into_iter()
+        .take(6)
+        .filter_map(|raw| {
+            let code = raw.trim();
+            if valid_source_stock_code(code) {
+                Some(code.to_string())
+            } else {
+                rejections.push(CatalystReviewRejection {
+                    identity: "chain_daily".to_string(),
+                    reason: format!("股票代码非法: {code}"),
+                });
+                None
+            }
+        })
+        .collect();
+    if selected_codes.is_empty() {
+        return Err("A-10 chain_daily 头部主线无合法股票".to_string());
+    }
+
+    let mut names = std::collections::HashMap::new();
+    for (rotation_index, rotation) in rotations.iter().enumerate() {
+        if rotation.date != date {
+            rejections.push(CatalystReviewRejection {
+                identity: format!("rotation#{}", rotation_index + 1),
+                reason: format!("as_of={} 与复盘日期 {date} 不一致", rotation.date),
+            });
+            continue;
+        }
+        let rows = match serde_json::from_str::<Vec<serde_json::Value>>(&rotation.stocks_json) {
+            Ok(rows) => rows,
+            Err(error) => {
+                rejections.push(CatalystReviewRejection {
+                    identity: format!("rotation#{}", rotation_index + 1),
+                    reason: format!("stocks JSON 非法: {error}"),
+                });
+                continue;
+            }
+        };
+        for (stock_index, stock) in rows.iter().enumerate() {
+            let identity = format!("rotation#{}:stock#{}", rotation_index + 1, stock_index + 1);
+            let Some(code) = stock
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                .filter(|code| valid_source_stock_code(code))
+            else {
+                rejections.push(CatalystReviewRejection {
+                    identity,
+                    reason: "code 缺失/非法".to_string(),
+                });
+                continue;
+            };
+            let Some(name) = stock
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+            else {
+                rejections.push(CatalystReviewRejection {
+                    identity,
+                    reason: format!("{code} name 缺失"),
+                });
+                continue;
+            };
+            names.insert(code.to_string(), name.to_string());
+        }
+    }
+
+    let mut selected_names = Vec::new();
+    for code in &selected_codes {
+        let name = names.get(code).cloned().or_else(|| resolve_name(code));
+        match name
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+        {
+            Some(name) => selected_names.push(name),
+            None => rejections.push(CatalystReviewRejection {
+                identity: code.clone(),
+                reason: "缺少真实名称证据".to_string(),
+            }),
+        }
+    }
+    if selected_names.is_empty() {
+        return Err(format!(
+            "A-10 全部 {} 个候选缺少完整真实名称证据",
+            selected_codes.len()
+        ));
+    }
+
+    let persistent = if top.continuation_count >= 3 {
+        PersistentLevel::High
+    } else if top.continuation_count >= 1 {
+        PersistentLevel::Med
+    } else {
+        PersistentLevel::Low
+    };
+    let started = selected_names.iter().take(3).cloned().collect();
+    let pending = selected_names.iter().skip(3).take(3).cloned().collect();
+    Ok(CatalystReviewCandidateBatch {
+        snapshot: CatalystReviewSnapshot {
+            date: date.to_string(),
+            theme: theme.to_string(),
+            score: None,
+            persistent,
+            started,
+            pending,
+            watch_point: Some(format!("明日竞价复核 {} 主线持续性", top.concept)),
+        },
+        rejections,
+    })
+}
+
 /// BR-102: 加载 A-10 真实催化复盘快照。
 pub fn load_catalyst_review_snapshot_real(date: &str) -> Result<CatalystReviewSnapshot, String> {
     use stock_analysis::database::DatabaseManager;
@@ -5294,152 +5604,149 @@ pub fn load_catalyst_review_snapshot_real(date: &str) -> Result<CatalystReviewSn
         return Ok(CatalystReviewSnapshot::default());
     }
 
-    // 取第一个 cluster 作主推
     let top = &clusters[0];
-    let theme = top.concept.trim();
-    if theme.is_empty() {
-        return Err("A-10 chain_daily 头部 concept 为空".to_string());
-    }
-    let stocks: Vec<String> = serde_json::from_str(&top.stocks)
-        .map_err(|error| format!("A-10 chain_daily stocks JSON 非法: {error}"))?;
-    let selected_codes: Vec<&str> = stocks.iter().take(6).map(|code| code.trim()).collect();
-    if selected_codes.is_empty() {
-        return Err("A-10 chain_daily 头部主线无股票".to_string());
-    }
-    if let Some(code) = selected_codes
-        .iter()
-        .find(|code| !valid_source_stock_code(code))
-    {
-        return Err(format!("A-10 chain_daily 股票代码非法: {code}"));
-    }
-
-    let mut names = std::collections::HashMap::new();
-    for (rotation_index, rotation) in rotations.iter().enumerate() {
-        let rows = serde_json::from_str::<Vec<serde_json::Value>>(&rotation.stocks_json).map_err(
-            |error| {
-                format!(
-                    "A-10 board_rotation_daily 第 {} 行 stocks JSON 非法: {error}",
-                    rotation_index + 1
-                )
-            },
-        )?;
-        for (stock_index, stock) in rows.iter().enumerate() {
-            let code = stock
-                .get("code")
-                .and_then(serde_json::Value::as_str)
-                .filter(|code| valid_source_stock_code(code))
-                .ok_or_else(|| {
-                    format!(
-                        "A-10 board_rotation_daily 第 {} 行第 {} 只 code 非法",
-                        rotation_index + 1,
-                        stock_index + 1
-                    )
-                })?;
-            let name = stock
-                .get("name")
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .ok_or_else(|| {
-                    format!(
-                        "A-10 board_rotation_daily 第 {} 行第 {} 只 name 为空",
-                        rotation_index + 1,
-                        stock_index + 1
-                    )
-                })?;
-            names.insert(code.to_string(), name.to_string());
-        }
-    }
-    let selected_names: Vec<String> = selected_codes
-        .iter()
-        .map(|code| {
-            names
-                .get(*code)
-                .cloned()
-                .ok_or_else(|| format!("A-10 股票 {code} 缺少真实名称证据"))
-        })
-        .collect::<Result<_, _>>()?;
-
-    // 持续性: 用 continuation_count 推断
-    let persistent = if top.continuation_count >= 3 {
-        PersistentLevel::High
-    } else if top.continuation_count >= 1 {
-        PersistentLevel::Med
-    } else {
-        PersistentLevel::Low
-    };
-
-    // 已启动: cluster 头部 (前 3)
-    let started: Vec<String> = selected_names.iter().take(3).cloned().collect();
-    // 待启动: cluster 尾部 (3-5)
-    let pending: Vec<String> = selected_names.iter().skip(3).take(3).cloned().collect();
-
-    // 明日观察点: 简单模板
-    let watch_point = format!("明日竞价复核 {} 主线持续性", top.concept);
-
-    Ok(CatalystReviewSnapshot {
-        date: date.to_string(),
-        theme: theme.to_string(),
-        score: None,
-        persistent,
-        started,
-        pending,
-        watch_point: Some(watch_point),
-    })
+    let fetcher = stock_analysis::data_provider::DataFetcherManager::new()
+        .map_err(|error| format!("A-10 初始化真实名称数据源失败: {error:#}"))?;
+    let batch = build_catalyst_review_candidate_with(date, top, &rotations, |code| {
+        fetcher.get_stock_name(code)
+    })?;
+    let review_date = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .map_err(|error| format!("A-10 非法复盘日期: {error}"))?;
+    persist_review_rejections(
+        "A-10",
+        "chain_rotation_security_master",
+        review_date,
+        &["BR-102", "BR-140"],
+        batch
+            .rejections
+            .iter()
+            .map(|rejection| {
+                let reason_code =
+                    if rejection.reason.contains("名称") || rejection.reason.contains("name") {
+                        "security_name_missing"
+                    } else {
+                        "candidate_identity_invalid"
+                    };
+                (rejection.identity.clone(), reason_code, false)
+            })
+            .collect(),
+    )?;
+    Ok(batch.snapshot)
 }
 
 // ============================================================================
 // B-005-C (2026-07-09): 盘后批量 dispatcher (R-02..R-08 + TomorrowWatch)
 // 修复: 之前 6 个盘后 dispatcher 仅在 `cargo run -- --push` 模式被调,
 //       生产 monitor_loop 永远跑不到, 用户看不到盘后复盘.
-// 现在: 在 post-session block 等到 19:00 后调一次, 各 dispatcher 失败时静默 log,
-//       不阻塞其他 dispatcher.
+// 现在: 由 BR-139 独立 post_session_review_scheduler 在 19:00 后调用，
+//       monitor_loop 不再保留第二个 owner；各 dispatcher 逐项记录结果且互不阻塞。
 // ============================================================================
 
-/// B-005-C 统一入口 — 在 monitor_loop post-session block 19:00 后调一次.
-/// 不依赖 --push 命令行模式, 让生产 monitor 自动出盘后 6+1 报告.
+/// B-005-C 统一入口 — 由 BR-139 独立 scheduler 在交易日 19:00 后调用.
+/// 不依赖 --push 命令行模式, 让生产 monitor 自动出盘后报告.
 /// 各 R-series dispatcher 内部分别走自己的数据源，并逐项记录成功/失败。
-/// 返回值表示本批次是否至少成功推送一份报告，不把全失败伪装为成功（BR-110）。
-pub async fn dispatch_post_session_review(date: &str, hhmm: &str, banner: &BannerCtx) -> bool {
+/// BR-140 返回逐任务强类型结果；等待、禁用与失败均不得冒充投递成功。
+pub async fn dispatch_post_session_review(
+    date: &str,
+    now: chrono::NaiveTime,
+    banner: &BannerCtx,
+    due: &std::collections::BTreeSet<crate::review_batch::ReviewTask>,
+) -> crate::review_batch::ReviewBatchOutcome {
+    use crate::review_batch::{
+        review_preflight, ReviewBatchOutcome, ReviewTask, ReviewTaskOutcome,
+    };
+
     log::info!("[B-005-C] 盘后批量 dispatcher 开始 ({})", date);
 
-    // CR-29 (review): 8 个 sub-dispatcher 改 tokio::join! 并行.
-    // 之前: 6 个 HTTP + 2 个 DB 顺序 await, 19:00 批次 wall-time ~10-15s
-    // 现在: 全部并行, 19:00 批次 wall-time ~max(单次 HTTP) ≈ 100-500ms
-    // 限制: 8 个 dispatcher 都用 notify::push_governor 走 reqwest::Client (parallel-safe)
-    let (r02, r03, r04, r05, r06, r08, a10, a01) = tokio::join!(
-        dispatch_r02_review_market_real(date, banner),
-        dispatch_r03_industry_chain_real(date, banner),
-        dispatch_r04_lhb_real(date, banner),
-        dispatch_r05_signal_review_real(date, banner),
-        dispatch_r06_failure_real(date, banner),
-        dispatch_r08_event_calendar_real(date, banner),
-        dispatch_catalyst_review_daily(date),
-        dispatch_paper_review_daily(date),
+    let preflight = review_preflight(now, due);
+    let runnable = preflight.runnable;
+    let (r03, r04, r08, a10, a01) = tokio::join!(
+        async {
+            if runnable.contains(&ReviewTask::R03) {
+                Some((
+                    ReviewTask::R03,
+                    dispatch_r03_industry_chain_outcome(date, banner).await,
+                ))
+            } else {
+                None
+            }
+        },
+        async {
+            if runnable.contains(&ReviewTask::R04) {
+                Some((
+                    ReviewTask::R04,
+                    dispatch_r04_lhb_outcome(date, now, banner).await,
+                ))
+            } else {
+                None
+            }
+        },
+        async {
+            if runnable.contains(&ReviewTask::R08) {
+                Some((
+                    ReviewTask::R08,
+                    dispatch_r08_event_calendar_outcome(date, banner).await,
+                ))
+            } else {
+                None
+            }
+        },
+        async {
+            if runnable.contains(&ReviewTask::A10) {
+                Some((
+                    ReviewTask::A10,
+                    dispatch_catalyst_review_daily_outcome(date).await,
+                ))
+            } else {
+                None
+            }
+        },
+        async {
+            if runnable.contains(&ReviewTask::A01) {
+                Some((
+                    ReviewTask::A01,
+                    dispatch_paper_review_daily_outcome(date).await,
+                ))
+            } else {
+                None
+            }
+        },
     );
-    let results = [
-        ("R-02", r02),
-        ("R-03", r03),
-        ("R-04", r04),
-        ("R-05", r05),
-        ("R-06", r06),
-        ("R-08", r08),
-        ("A-10", a10),
-        ("A-01", a01),
-    ];
-    let pushed = results.iter().filter(|(_, ok)| *ok).count();
-    let failed: Vec<&str> = results
+    let mut tasks = preflight.outcomes;
+    for outcome in [r03, r04, r08, a10, a01].into_iter().flatten() {
+        tasks.push(outcome);
+    }
+    tasks.sort_by_key(|(task, _)| *task);
+    let batch = ReviewBatchOutcome::new(tasks);
+    let delivered = batch.delivered_count();
+    let waiting = batch.waiting_tasks();
+    let disabled = batch.disabled_tasks();
+    let failed = batch.failed_tasks();
+    let statuses = batch
+        .tasks
         .iter()
-        .filter_map(|(name, ok)| (!ok).then_some(*name))
-        .collect();
+        .map(|(task, outcome)| format!("{}:{}", task.label(), outcome.status_label()))
+        .collect::<Vec<_>>();
+    let no_data = batch
+        .tasks
+        .iter()
+        .filter(|(_, outcome)| matches!(outcome, ReviewTaskOutcome::NoData { .. }))
+        .count();
     log::info!(
-        "[B-005-C][BR-110] 盘后批量 dispatcher 完成 time={} pushed={}/{} failed={:?}",
-        hhmm,
-        pushed,
-        results.len(),
-        failed
+        "[B-005-C][BR-110][BR-140] 完成 time={} attempted={} delivered={} no_data={} waiting={} disabled={} failed={} statuses={:?} waiting_tasks={:?} disabled_tasks={:?} failed_tasks={:?}",
+        now.format("%H:%M"),
+        batch.tasks.len(),
+        delivered,
+        no_data,
+        waiting.len(),
+        disabled.len(),
+        failed.len(),
+        statuses,
+        waiting.iter().map(|task| task.label()).collect::<Vec<_>>(),
+        disabled.iter().map(|task| task.label()).collect::<Vec<_>>(),
+        failed.iter().map(|task| task.label()).collect::<Vec<_>>(),
     );
-    pushed > 0
+    batch
 }
 
 /// --test/--review 全模板覆盖范围
@@ -5623,78 +5930,104 @@ pub async fn dispatch_r02_review_market_real(_date: &str, _banner: &BannerCtx) -
 
 /// R-08 明日事件 (CR-12): 真实公告 + 持仓事件 + 隔夜关注 (美股+汇率).
 /// 之前 run_review_only_inner L2708 的真实实现, 现在抽取为独立 dispatcher.
-pub async fn dispatch_r08_event_calendar_real(date: &str, _banner: &BannerCtx) -> bool {
-    // 1. 拉今日全市场公告 (真实数据)
-    let anns = match stock_analysis::data_provider::announcement::fetch_announcements(None).await {
-        Ok(announcements) => announcements,
+fn filter_r08_event_announcements(
+    announcements: Vec<stock_analysis::data_provider::announcement::Announcement>,
+) -> Vec<stock_analysis::data_provider::announcement::Announcement> {
+    announcements
+        .into_iter()
+        .filter(
+            stock_analysis::data_provider::announcement::announcement_is_immediate_notification_candidate,
+        )
+        .collect()
+}
+
+struct R08CalendarComponents {
+    announcement_summary: Result<String, String>,
+    real_holdings: Result<Vec<EventHolding>, String>,
+    virtual_holdings: Result<Vec<EventHolding>, String>,
+    overnight: Result<(String, String), String>,
+}
+
+#[derive(Debug)]
+struct R08PreparedCalendar {
+    text: String,
+    item_count: usize,
+    complete_components: usize,
+    failed_components: Vec<&'static str>,
+}
+
+fn prepare_r08_event_calendar(
+    date: &str,
+    components: R08CalendarComponents,
+) -> Result<R08PreparedCalendar, String> {
+    let mut complete_components = 0usize;
+    let mut failed_components = Vec::new();
+    let ann_summary = match components.announcement_summary {
+        Ok(summary) => {
+            complete_components += 1;
+            summary
+        }
         Err(error) => {
-            let reason = format!("公告数据源失败: {error}");
-            log::error!("[R-08][BR-110] {reason}");
-            log_dispatcher_attempt("R-08", false, 0, &reason);
-            return false;
+            log::error!("[R-08][BR-140] component=announcement unavailable: {error}");
+            failed_components.push("announcement");
+            "公告不可用（见审计）".to_string()
         }
     };
-    // 2. 持仓事件 (实盘) + 虚拟持仓, 区分 tag
-    let positions = match stock_analysis::portfolio::get_positions() {
-        Ok(positions) => positions,
-        Err(error) => {
-            let reason = format!("实盘持仓数据源失败: {error}");
-            log::error!("[R-08][BR-110] {reason}");
-            log_dispatcher_attempt("R-08", false, 0, &reason);
-            return false;
+
+    let mut holdings = Vec::new();
+    let mut item_count = 0usize;
+    match components.real_holdings {
+        Ok(real_holdings) => {
+            complete_components += 1;
+            item_count += real_holdings.len();
+            holdings.extend(real_holdings);
         }
-    };
-    let holding_codes: std::collections::HashSet<String> =
-        positions.iter().map(|p| p.code.clone()).collect();
-    // 宏观公告摘要: 区分持仓相关 / 非持仓
-    let ann_summary = build_event_calendar_macro_summary(&anns, &holding_codes);
-    // 实盘持仓: 优先今日公告标题作为事件, 否则标"持有"
-    let mut holdings: Vec<EventHolding> = Vec::new();
-    for p in positions.iter().take(5) {
-        let p_ann = anns.iter().find(|a| a.code == p.code);
-        let kind = match p_ann {
-            Some(a) => a.title.chars().take(20).collect::<String>(),
-            None => "持有 (今日无公告)".to_string(),
-        };
-        holdings.push(EventHolding {
-            tag: "实盘".to_string(),
-            name: p.name.clone(),
-            code: p.code.clone(),
-            kind,
-        });
-    }
-    // 虚拟持仓 (虚拟观察仓)
-    match event_calendar_virtual_holdings() {
-        Ok(virtual_holdings) => holdings.extend(virtual_holdings),
         Err(error) => {
-            let reason = format!("虚拟观察数据源失败: {error}");
-            log::error!("[R-08][BR-104][BR-110] {reason}");
-            log_dispatcher_attempt("R-08", false, 0, &reason);
-            return false;
+            log::error!("[R-08][BR-140] component=positions unavailable: {error}");
+            failed_components.push("positions");
+            holdings.push(EventHolding {
+                tag: "数据".to_string(),
+                name: "实盘持仓".to_string(),
+                code: String::new(),
+                kind: "不可用（见审计）".to_string(),
+            });
         }
     }
-    // 3. 隔夜关注 (美股 + 汇率 雅虎 API)
-    let (us_summary, fx_summary) = match tokio::task::spawn_blocking(
-        stock_analysis::data_provider::yahoo::fetch_overnight_data,
-    )
-    .await
-    {
-        Ok(Ok(snapshot)) => snapshot,
-        Ok(Err(error)) => {
-            log::error!("[R-08] Yahoo 隔夜数据不可用: {}", error);
+    match components.virtual_holdings {
+        Ok(virtual_holdings) => {
+            complete_components += 1;
+            item_count += virtual_holdings.len();
+            holdings.extend(virtual_holdings);
+        }
+        Err(error) => {
+            log::error!("[R-08][BR-140] component=virtual unavailable: {error}");
+            failed_components.push("virtual");
+            holdings.push(EventHolding {
+                tag: "数据".to_string(),
+                name: "虚拟观察仓".to_string(),
+                code: String::new(),
+                kind: "不可用（见审计）".to_string(),
+            });
+        }
+    }
+    let (us_summary, fx_summary) = match components.overnight {
+        Ok(overnight) => {
+            complete_components += 1;
+            overnight
+        }
+        Err(error) => {
+            log::error!("[R-08][BR-140] component=overnight unavailable: {error}");
+            failed_components.push("overnight");
             (
-                "不可用（数据源错误）".to_string(),
-                "不可用（数据源错误）".to_string(),
+                "不可用（见审计）".to_string(),
+                "不可用（见审计）".to_string(),
             )
         }
-        Err(error) => {
-            log::error!("[R-08] fetch_overnight_data task 失败: {}", error);
-            (
-                "不可用（任务失败）".to_string(),
-                "不可用（任务失败）".to_string(),
-            )
-        }
     };
+
+    if complete_components == 0 {
+        return Err("R-08 全部 4 个组件失败，禁止生成无证据事件日历".to_string());
+    }
     let events_ref: Vec<HoldingEventItem> = holdings
         .iter()
         .map(|h| HoldingEventItem {
@@ -5705,10 +6038,250 @@ pub async fn dispatch_r08_event_calendar_real(date: &str, _banner: &BannerCtx) -
         })
         .collect();
     let text = render_event_calendar(date, &events_ref, &ann_summary, &us_summary, &fx_summary);
-    let push_result =
-        crate::notify::push_governor(&text, crate::notify::PushKind::EventCalendar).await;
-    log_dispatcher_attempt("R-08", push_result, holdings.len(), "");
-    push_result
+
+    Ok(R08PreparedCalendar {
+        text,
+        item_count,
+        complete_components,
+        failed_components,
+    })
+}
+
+fn load_verified_r08_positions() -> Result<Vec<stock_analysis::portfolio::Position>, String> {
+    Err(
+        "BR-103/BR-140 verified broker per-position batch unavailable; local stock_position projection excluded"
+            .to_string(),
+    )
+}
+
+fn audit_r08_announcement_rejections(
+    batch: &stock_analysis::data_provider::announcement::AnnouncementFetchBatch,
+) -> Result<(), String> {
+    use stock_analysis::data_provider::announcement::{
+        AnnouncementListAcquisition, AnnouncementListProtocol,
+    };
+
+    let (fallback_used, reason_code) = match &batch.provenance.acquisition {
+        AnnouncementListAcquisition::PrimaryJson => (false, None),
+        AnnouncementListAcquisition::AlternateJsonp { primary_failure } => {
+            (true, Some(primary_failure.reason_code.clone()))
+        }
+    };
+    let selected_protocol = match batch.provenance.selected_protocol() {
+        AnnouncementListProtocol::PrimaryJson => "primary_json",
+        AnnouncementListProtocol::AlternateJsonp => "alternate_jsonp",
+    };
+    let identity = format!(
+        "{}:{}:{}",
+        batch.provenance.endpoint,
+        batch.provenance.query_date,
+        batch.provenance.observed_at.timestamp_millis()
+    );
+    crate::review_batch::append_source_protocol_audit(
+        crate::review_batch::ReviewSourceProtocolDecision {
+            observed_at: batch.provenance.observed_at.to_rfc3339(),
+            task: "R-08".to_string(),
+            source: batch.provenance.provider_label().to_string(),
+            source_time: None,
+            query_date: batch.provenance.query_date.to_string(),
+            selected_protocol: selected_protocol.to_string(),
+            fallback_used,
+            reason_code,
+            identity_hash: crate::review_batch::audit_identity_hash(
+                "R-08-announcement-list",
+                &identity,
+            ),
+            rule_ids: vec!["BR-138".to_string(), "BR-140".to_string()],
+        },
+        batch.provenance.query_date,
+    )?;
+    if batch.rejected_details.is_empty() {
+        return Ok(());
+    }
+    let rows = batch
+        .rejected_details
+        .iter()
+        .map(|rejection| crate::review_batch::ReviewCandidateRejection {
+            observed_at: rejection.observed_at.to_rfc3339(),
+            task: "R-08".to_string(),
+            source: batch.provenance.provider_label().to_string(),
+            source_time: None,
+            rule_ids: vec!["BR-138".to_string(), "BR-140".to_string()],
+            retryable: rejection.retryable,
+            identity_hash: rejection.identity_hash.clone(),
+            reason_code: rejection.reason_code.clone(),
+        })
+        .collect();
+    crate::review_batch::append_candidate_rejection_audit(rows, batch.provenance.query_date)
+        .map(|_| ())
+}
+
+pub async fn dispatch_r08_event_calendar_outcome(
+    date: &str,
+    _banner: &BannerCtx,
+) -> crate::review_batch::ReviewTaskOutcome {
+    use crate::review_batch::ReviewTaskOutcome;
+
+    let announcements =
+        match stock_analysis::data_provider::announcement::fetch_announcements(Some(date)).await {
+            Ok(batch) => audit_r08_announcement_rejections(&batch)
+                .map(|_| batch)
+                .map_err(|error| format!("公告拒绝审计失败: {error}")),
+            Err(error) => Err(format!("公告数据源失败: {error}")),
+        };
+
+    let positions = load_verified_r08_positions();
+    let holding_codes = positions.as_ref().ok().map(|positions| {
+        positions
+            .iter()
+            .map(|position| position.code.clone())
+            .collect::<std::collections::HashSet<_>>()
+    });
+    let announcement_summary = announcements
+        .as_ref()
+        .map(|batch| {
+            let anns = filter_r08_event_announcements(batch.announcements.clone());
+            let audience = holding_codes
+                .as_ref()
+                .map(R08HoldingAudience::Verified)
+                .unwrap_or(R08HoldingAudience::Unavailable);
+            let mut summary = build_event_calendar_macro_summary(&anns, audience);
+            if !batch.source_complete() {
+                summary.push_str(&format!(
+                    "；公告正文部分不可用（{} 条已隔离）",
+                    batch.rejected_details.len()
+                ));
+            }
+            summary
+        })
+        .map_err(Clone::clone);
+    let real_holdings = positions.map(|positions| {
+        positions
+            .iter()
+            .take(5)
+            .map(|position| {
+                let kind = match announcements.as_ref() {
+                    Ok(batch) => batch
+                        .announcements
+                        .iter()
+                        .find(|announcement| announcement.code == position.code)
+                        .map(|announcement| announcement.title.chars().take(20).collect())
+                        .unwrap_or_else(|| "持有（今日无公告）".to_string()),
+                    Err(_) => "持有（公告不可用）".to_string(),
+                };
+                EventHolding {
+                    tag: "实盘".to_string(),
+                    name: position.name.clone(),
+                    code: position.code.clone(),
+                    kind,
+                }
+            })
+            .collect()
+    });
+    let virtual_holdings =
+        event_calendar_virtual_holdings().map_err(|error| format!("虚拟观察数据源失败: {error}"));
+    let overnight = match tokio::task::spawn_blocking(
+        stock_analysis::data_provider::yahoo::fetch_overnight_data,
+    )
+    .await
+    {
+        Ok(result) => result.map_err(|error| format!("Yahoo 隔夜数据不可用: {error}")),
+        Err(error) => Err(format!("隔夜数据任务失败: {error}")),
+    };
+    let prepared = match prepare_r08_event_calendar(
+        date,
+        R08CalendarComponents {
+            announcement_summary,
+            real_holdings,
+            virtual_holdings,
+            overnight,
+        },
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            log::error!("[R-08][BR-110][BR-140] {error}");
+            log_dispatcher_attempt("R-08", false, 0, &error);
+            return ReviewTaskOutcome::failed(true, error);
+        }
+    };
+    if !prepared.failed_components.is_empty() {
+        log::warn!(
+            "[R-08][BR-140] degraded complete_components={} failed_components={:?}",
+            prepared.complete_components,
+            prepared.failed_components
+        );
+    }
+    let push_result = dispatch_outcome(
+        crate::notify::PushKind::EventCalendar,
+        "",
+        None,
+        prepared.text,
+    )
+    .await;
+    log_dispatcher_attempt("R-08", push_result.is_pushed(), prepared.item_count, "");
+    ReviewTaskOutcome::from_push_outcome(push_result, 1)
+}
+
+pub async fn dispatch_r08_event_calendar_real(date: &str, banner: &BannerCtx) -> bool {
+    matches!(
+        dispatch_r08_event_calendar_outcome(date, banner).await,
+        crate::review_batch::ReviewTaskOutcome::Delivered { .. }
+    )
+}
+
+#[cfg(test)]
+mod tests_br140_r08_partial_components {
+    use super::*;
+
+    #[test]
+    fn announcement_failure_does_not_block_verified_holding_component() {
+        let prepared = prepare_r08_event_calendar(
+            "2026-07-21",
+            R08CalendarComponents {
+                announcement_summary: Err("TEST_CODE announcement unavailable".to_string()),
+                real_holdings: Ok(vec![EventHolding {
+                    tag: "实盘".to_string(),
+                    name: "测试持仓".to_string(),
+                    code: "TEST_CODE_000001".to_string(),
+                    kind: "持有（公告不可用）".to_string(),
+                }]),
+                virtual_holdings: Err("TEST_CODE virtual unavailable".to_string()),
+                overnight: Ok(("+0.5%".to_string(), "7.20".to_string())),
+            },
+        )
+        .expect("verified components must produce a degraded report");
+
+        assert!(prepared.text.contains("测试持仓"));
+        assert!(prepared.text.contains("公告不可用"));
+        assert!(prepared.text.contains("虚拟观察仓: 不可用"));
+        assert_eq!(prepared.complete_components, 2);
+        assert_eq!(prepared.failed_components, vec!["announcement", "virtual"]);
+    }
+
+    #[test]
+    fn all_r08_components_failed_is_explicit_failure() {
+        let error = prepare_r08_event_calendar(
+            "2026-07-21",
+            R08CalendarComponents {
+                announcement_summary: Err("TEST_CODE announcement unavailable".to_string()),
+                real_holdings: Err("TEST_CODE positions stale".to_string()),
+                virtual_holdings: Err("TEST_CODE virtual unavailable".to_string()),
+                overnight: Err("TEST_CODE overnight unavailable".to_string()),
+            },
+        )
+        .expect_err("zero verified components must not render or push");
+
+        assert!(error.contains("全部 4 个组件失败"));
+    }
+
+    #[test]
+    fn br140_r08_local_projection_is_never_accepted_as_broker_evidence() {
+        let error = load_verified_r08_positions()
+            .expect_err("R-08 must fail closed until a broker per-position batch exists");
+
+        assert!(error.contains("verified broker per-position batch unavailable"));
+        assert!(error.contains("local stock_position projection excluded"));
+    }
 }
 
 // ============================================================================
@@ -5716,88 +6289,161 @@ pub async fn dispatch_r08_event_calendar_real(date: &str, _banner: &BannerCtx) -
 // 替代之前 dispatch_post_session_review 内的占位 dispatcher (复用 A-10/A-01)
 // ============================================================================
 
-/// R-03 涨停产业链：基于实盘持仓/自选和逐股日 K 聚合，不从概念延续次数推断涨停数（BR-106/BR-110）。
-pub async fn dispatch_r03_industry_chain_real(date: &str, _banner: &BannerCtx) -> bool {
+/// R-03 涨停产业链：基于实盘持仓/自选和逐股日 K 聚合，不从概念延续次数推断涨停数（BR-106/BR-110/BR-140）。
+pub async fn dispatch_r03_industry_chain_outcome(
+    date: &str,
+    _banner: &BannerCtx,
+) -> crate::review_batch::ReviewTaskOutcome {
+    use crate::review_batch::ReviewTaskOutcome;
     use stock_analysis::market_analyzer::limit_chain_review::{aggregate, LimitChainInput};
 
     let review_date = date.to_string();
-    let prepared = tokio::task::spawn_blocking(move || -> Result<(String, usize), String> {
-        let positions = stock_analysis::portfolio::get_positions()
-            .map_err(|error| format!("R-03 实盘持仓查询失败: {error}"))?;
-        let stocks = super::load_review_limit_chain_stocks(&positions)?;
-        if stocks.is_empty() {
-            return Err("R-03 持仓/自选中没有经日 K 验证的当日涨停标的".to_string());
-        }
-        let aggregates = aggregate(&LimitChainInput {
-            stocks,
-            source_complete: true,
-        });
-        let follower_text: Vec<String> = aggregates
-            .iter()
-            .map(|row| {
-                if row.followers.is_empty() {
-                    "无".to_string()
+    let prepared =
+        tokio::task::spawn_blocking(move || -> Result<Option<(String, usize)>, String> {
+            let positions = stock_analysis::portfolio::get_positions()
+                .map_err(|error| format!("R-03 实盘持仓查询失败: {error}"))?;
+            let batch = super::load_review_limit_chain_stocks(&positions)?;
+            let audit_date = chrono::NaiveDate::parse_from_str(&review_date, "%Y-%m-%d")
+                .map_err(|error| format!("R-03 非法复盘日期: {error}"))?;
+            let mut rejection_rows = batch
+                .rejected
+                .iter()
+                .map(|rejection| {
+                    let reason_code = if rejection.reason.contains("日 K") {
+                        "daily_kline_rejected"
+                    } else if rejection.reason.contains("产业链") {
+                        "industry_evidence_missing"
+                    } else {
+                        "candidate_validation_failed"
+                    };
+                    (rejection.code.clone(), reason_code, true)
+                })
+                .collect::<Vec<_>>();
+            rejection_rows.extend(
+                batch
+                    .source_errors
+                    .iter()
+                    .enumerate()
+                    .map(|(index, error)| {
+                        (
+                            format!("source-error-{index}:{error}"),
+                            "source_error",
+                            true,
+                        )
+                    }),
+            );
+            persist_review_rejections(
+                "R-03",
+                "portfolio_industry_kline",
+                audit_date,
+                &["BR-106", "BR-140"],
+                rejection_rows,
+            )?;
+            let source_complete = batch.source_complete();
+            if batch.accepted.is_empty() {
+                return if source_complete {
+                    Ok(None)
                 } else {
-                    row.followers.join("、")
-                }
-            })
-            .collect();
-        let lines: Vec<ChainLine<'_>> = aggregates
-            .iter()
-            .zip(follower_text.iter())
-            .take(5)
-            .map(|(row, followers)| ChainLine {
-                chain: &row.chain,
-                limit_up_n: row.limit_up_n,
-                first_n: row.first_n,
-                consec_n: row.consec_n,
-                heat_stage: &row.heat_stage,
-                leader_name: &row.leader_name,
-                leader_code: &row.leader_code,
-                leader_boards: row.leader_boards,
-                followers,
-                watch_point: &row.watch_point,
-            })
-            .collect();
-        let count = lines.len();
-        Ok((render_industry_chain(&review_date, &lines, None), count))
-    })
-    .await;
+                    Err(format!(
+                        "R-03 部分数据失败且没有可生成报告的标的: rejected={} source_errors={}",
+                        batch.rejected.len(),
+                        batch.source_errors.len()
+                    ))
+                };
+            }
+            let aggregates = aggregate(&LimitChainInput {
+                stocks: batch.accepted,
+                source_complete,
+            });
+            let follower_text: Vec<String> = aggregates
+                .iter()
+                .map(|row| {
+                    if row.followers.is_empty() {
+                        "无".to_string()
+                    } else {
+                        row.followers.join("、")
+                    }
+                })
+                .collect();
+            let lines: Vec<ChainLine<'_>> = aggregates
+                .iter()
+                .zip(follower_text.iter())
+                .take(5)
+                .map(|(row, followers)| ChainLine {
+                    chain: &row.chain,
+                    limit_up_n: row.limit_up_n,
+                    first_n: row.first_n,
+                    consec_n: row.consec_n,
+                    heat_stage: &row.heat_stage,
+                    leader_name: &row.leader_name,
+                    leader_code: &row.leader_code,
+                    leader_boards: row.leader_boards,
+                    followers,
+                    watch_point: &row.watch_point,
+                })
+                .collect();
+            let count = lines.len();
+            let evidence_note = (!source_complete).then(|| {
+                format!(
+                    "已隔离 {} 个标的、{} 个来源错误，仅展示通过质检的真实子集",
+                    batch.rejected.len(),
+                    batch.source_errors.len()
+                )
+            });
+            Ok(Some((
+                render_industry_chain(&review_date, &lines, None, evidence_note.as_deref()),
+                count,
+            )))
+        })
+        .await;
     let (text, count) = match prepared {
-        Ok(Ok(prepared)) => prepared,
+        Ok(Ok(Some(prepared))) => prepared,
+        Ok(Ok(None)) => {
+            let reason = "R-03 完整数据批次无当日涨停标的";
+            log::info!("[R-03][BR-140] {reason}");
+            log_dispatcher_attempt("R-03", false, 0, reason);
+            return ReviewTaskOutcome::no_data(reason);
+        }
         Ok(Err(error)) => {
             log::error!("[R-03][BR-106][BR-110] {error}");
             log_dispatcher_attempt("R-03", false, 0, &error);
-            return false;
+            return ReviewTaskOutcome::failed(true, error);
         }
         Err(error) => {
             let reason = format!("R-03 数据准备任务失败: {error}");
             log::error!("[R-03][BR-110] {reason}");
             log_dispatcher_attempt("R-03", false, 0, &reason);
-            return false;
+            return ReviewTaskOutcome::failed(true, reason);
         }
     };
     let push_result =
-        crate::notify::push_governor(&text, crate::notify::PushKind::IndustryChain).await;
-    log_dispatcher_attempt("R-03", push_result, count, "");
-    push_result
+        dispatch_outcome(crate::notify::PushKind::IndustryChain, "", None, text).await;
+    log_dispatcher_attempt("R-03", push_result.is_pushed(), count, "");
+    ReviewTaskOutcome::from_push_outcome(push_result, 1)
+}
+
+pub async fn dispatch_r03_industry_chain_real(date: &str, banner: &BannerCtx) -> bool {
+    matches!(
+        dispatch_r03_industry_chain_outcome(date, banner).await,
+        crate::review_batch::ReviewTaskOutcome::Delivered { .. }
+    )
 }
 
 /// R-04 龙虎榜 (CR-16): 拉 lhb_review 真实数据, 渲染 5 条.
-pub async fn dispatch_r04_lhb_real(date: &str, _banner: &BannerCtx) -> bool {
+pub async fn dispatch_r04_lhb_outcome(
+    date: &str,
+    now_time: chrono::NaiveTime,
+    _banner: &BannerCtx,
+) -> crate::review_batch::ReviewTaskOutcome {
+    use crate::review_batch::ReviewTaskOutcome;
     use chrono::NaiveDate;
     use stock_analysis::market_analyzer::lhb_review::fetch_recent_lhb;
-    // CR-23 (review): lhb 数据 21:00 后才有, 19:00 时直接跳过, 不浪费 I/O.
-    // 之前无论何时都尝试拉, 必然返回空 + 浪费 spawn_blocking.
-    let now_time = chrono::Local::now().time();
     let lhb_ready_time = chrono::NaiveTime::from_hms_opt(21, 0, 0).unwrap();
     if now_time < lhb_ready_time {
-        log::info!(
-            "[R-04] 现在 {} < 21:00, lhb 数据未出, 跳过 (后续 21:00 由 monitor_loop 重调)",
-            now_time.format("%H:%M")
+        return ReviewTaskOutcome::expected_wait(
+            lhb_ready_time,
+            "LHB source not published before 21:00",
         );
-        log_dispatcher_attempt("R-04", false, 0, "before 21:00, lhb not ready");
-        return false;
     }
     let today = match NaiveDate::parse_from_str(date, "%Y-%m-%d") {
         Ok(today) => today,
@@ -5805,27 +6451,32 @@ pub async fn dispatch_r04_lhb_real(date: &str, _banner: &BannerCtx) -> bool {
             let reason = format!("非法复盘日期 {date}: {error}");
             log::error!("[R-04][BR-110] {reason}");
             log_dispatcher_attempt("R-04", false, 0, &reason);
-            return false;
+            return ReviewTaskOutcome::failed(false, reason);
         }
     };
     let raw = match tokio::task::spawn_blocking(move || fetch_recent_lhb(today, 5)).await {
         Ok(Ok(rows)) => rows,
         Ok(Err(error)) => {
-            log::error!("[R-04][BR-110] disabled=no_producer: {error}");
+            let unavailable = error.starts_with("unavailable:");
+            log::error!("[R-04][BR-110] {error}");
             log_dispatcher_attempt("R-04", false, 0, &error);
-            return false;
+            return if unavailable {
+                ReviewTaskOutcome::disabled("lhb_producer", error)
+            } else {
+                ReviewTaskOutcome::failed(true, error)
+            };
         }
         Err(error) => {
             let reason = format!("龙虎榜查询任务失败: {error}");
             log::error!("[R-04][BR-110] {reason}");
             log_dispatcher_attempt("R-04", false, 0, &reason);
-            return false;
+            return ReviewTaskOutcome::failed(true, reason);
         }
     };
     if raw.is_empty() {
         log::info!("[R-04] 21:00 仍无数据, 跳过推送");
         log_dispatcher_attempt("R-04", false, 0, "lhb empty (21:00 后)");
-        return false;
+        return ReviewTaskOutcome::no_data("complete LHB source returned zero rows after 21:00");
     }
     let entries: Vec<LhbEntry> = raw
         .iter()
@@ -5834,31 +6485,29 @@ pub async fn dispatch_r04_lhb_real(date: &str, _banner: &BannerCtx) -> bool {
             name: &e.name,
             code: &e.code,
             net_buy_yi: e.net_buy_yi,
-            reason: "—",
-            // W4.3 / B-010 P1 修复: 数值字段 Option<f64>, 显式 None 表示缺失
-            buy_inst_n: e.buy_inst_n.unwrap_or(0),
+            reason: (!e.reason.trim().is_empty()).then_some(e.reason.as_str()),
+            buy_inst_n: e.buy_inst_n,
             buy_inst_amt_wan: e.buy_inst_amt_wan,
-            buy_other_n: e.buy_other_n.unwrap_or(0),
+            buy_other_n: e.buy_other_n,
             buy_other_amt_wan: e.buy_other_amt_wan,
             buy_conc_pct: e.buy_conc_pct,
-            // W1.14 / B-010 P0-3: sell_desc 缺失用空串, render 端判空显示"无"
-            // (BR-004 同款: em-dash 占位违反 AGENTS.md §2.2)
-            sell_desc: match e.sell_desc.as_deref() {
-                Some(s) if !s.is_empty() => s,
-                _ => {
-                    log::warn!("[push] LhbEntry 缺 sell_desc: code={}", e.code);
-                    ""
-                }
-            },
+            sell_desc: e.sell_desc.as_deref(),
             sell_conc_pct: e.sell_conc_pct,
             chain_match: e.chain_match.as_deref(),
-            next_day_risk: "—",
+            next_day_risk: e.next_day_risk.as_deref(),
         })
         .collect();
     let text = render_review_lhb(date, &entries);
-    let push_result = crate::notify::push_governor(&text, crate::notify::PushKind::ReviewLhb).await;
-    log_dispatcher_attempt("R-04", push_result, entries.len(), "");
-    push_result
+    let push_result = dispatch_outcome(crate::notify::PushKind::ReviewLhb, "", None, text).await;
+    log_dispatcher_attempt("R-04", push_result.is_pushed(), entries.len(), "");
+    ReviewTaskOutcome::from_push_outcome(push_result, entries.len())
+}
+
+pub async fn dispatch_r04_lhb_real(date: &str, banner: &BannerCtx) -> bool {
+    matches!(
+        dispatch_r04_lhb_outcome(date, chrono::Local::now().time(), banner).await,
+        crate::review_batch::ReviewTaskOutcome::Delivered { .. }
+    )
 }
 
 /// R-05 信号复盘：需要“信号触发 → 成交 → 平仓结果”的完整关联源。
@@ -5973,22 +6622,60 @@ mod tests_r_dispatchers {
             "R-05 缺 closed trades 应返回 false (不推), 不应 panic"
         );
     }
+
+    #[tokio::test]
+    async fn br140_r04_preserves_wait_and_missing_producer_outcomes() {
+        let banner = BannerCtx {
+            account_mode: AccountMode::Normal,
+            total_pos: None,
+            today_pnl: None,
+            account_metrics_complete: false,
+            data_mode: DataMode::Unsafe,
+            data_missing_note: Some("TEST_CODE incomplete".to_string()),
+        };
+        let before = dispatch_r04_lhb_outcome(
+            "2026-07-21",
+            chrono::NaiveTime::from_hms_opt(20, 59, 0).unwrap(),
+            &banner,
+        )
+        .await;
+        assert!(matches!(
+            before,
+            crate::review_batch::ReviewTaskOutcome::ExpectedWait { .. }
+        ));
+
+        let after = dispatch_r04_lhb_outcome(
+            "2026-07-21",
+            chrono::NaiveTime::from_hms_opt(21, 0, 0).unwrap(),
+            &banner,
+        )
+        .await;
+        assert!(matches!(
+            after,
+            crate::review_batch::ReviewTaskOutcome::Disabled { ref capability, .. }
+                if capability == "lhb_producer"
+        ));
+    }
 }
 
 /// v35: A-10 dispatcher 入口
-pub async fn dispatch_catalyst_review_daily(date: &str) -> bool {
+async fn dispatch_catalyst_review_daily_outcome(
+    date: &str,
+) -> crate::review_batch::ReviewTaskOutcome {
     let snapshot = match load_catalyst_review_snapshot_real(date) {
         Ok(snapshot) => snapshot,
         Err(error) => {
             log::error!("[A-10] 催化复盘批次拒绝: {error}");
             log_dispatcher_attempt("A-10", false, 0, &error);
-            return false;
+            return crate::review_batch::ReviewTaskOutcome::failed(true, error);
         }
     };
     if snapshot.started.is_empty() {
         log_dispatcher_attempt("A-10", false, 0, "catalyst_review_snapshot empty");
         log::info!("[A-10] catalyst_review_snapshot 空 (chain_daily 无 cluster), 跳过推送");
-        return false;
+        return crate::review_batch::ReviewTaskOutcome::no_data(
+            "chain_daily/board_rotation_daily contains no complete catalyst candidate",
+        );
     }
     let started_refs: Vec<&str> = snapshot.started.iter().map(|s| s.as_str()).collect();
     let pending_refs: Vec<&str> = snapshot.pending.iter().map(|s| s.as_str()).collect();
@@ -6002,9 +6689,16 @@ pub async fn dispatch_catalyst_review_daily(date: &str) -> bool {
         watch_point: snapshot.watch_point.as_deref(),
     };
     let text = render_catalyst_review(params);
-    let result = dispatch(crate::notify::PushKind::CatalystReview, "", None, text).await;
-    log_dispatcher_attempt("A-10", result, snapshot.started.len(), "");
-    result
+    let result = dispatch_outcome(crate::notify::PushKind::CatalystReview, "", None, text).await;
+    log_dispatcher_attempt("A-10", result.is_pushed(), snapshot.started.len(), "");
+    crate::review_batch::ReviewTaskOutcome::from_push_outcome(result, snapshot.started.len())
+}
+
+pub async fn dispatch_catalyst_review_daily(date: &str) -> bool {
+    matches!(
+        dispatch_catalyst_review_daily_outcome(date).await,
+        crate::review_batch::ReviewTaskOutcome::Delivered { .. }
+    )
 }
 
 // ============================================================================
@@ -6020,13 +6714,91 @@ pub struct VirtualRecordLite {
 }
 pub struct VirtualSnapshotLite {
     pub records: Vec<VirtualRecordLite>,
+    pub rejections: Vec<VirtualObservationLoadIssue>,
+    pub source_failures: Vec<VirtualObservationLoadIssue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtualObservationLoadIssue {
+    pub identity_hash: String,
+    pub reason_code: String,
+    pub retryable: bool,
+}
+
+fn audit_virtual_observation_load_issues(snapshot: &VirtualSnapshotLite) -> Result<(), String> {
+    let issues = snapshot
+        .rejections
+        .iter()
+        .chain(snapshot.source_failures.iter())
+        .collect::<Vec<_>>();
+    if issues.is_empty() {
+        return Ok(());
+    }
+    let now = chrono::Local::now();
+    let observed_at = now.format("%Y-%m-%dT%H:%M:%S").to_string();
+    for issue in &issues {
+        log::warn!(
+            "[A-01][BR-140] virtual observation isolated identity_hash={} reason_code={} retryable={}",
+            issue.identity_hash,
+            issue.reason_code,
+            issue.retryable
+        );
+    }
+    let rejections = issues
+        .into_iter()
+        .map(|issue| crate::review_batch::ReviewCandidateRejection {
+            observed_at: observed_at.clone(),
+            task: "A-01".to_string(),
+            source: "virtual_observation".to_string(),
+            source_time: None,
+            rule_ids: vec!["BR-104".to_string(), "BR-140".to_string()],
+            retryable: issue.retryable,
+            identity_hash: issue.identity_hash.clone(),
+            reason_code: issue.reason_code.clone(),
+        })
+        .collect();
+    crate::review_batch::append_candidate_rejection_audit(rejections, now.date_naive()).map(|_| ())
+}
+
+fn persist_review_rejections(
+    task: &str,
+    source: &str,
+    date: chrono::NaiveDate,
+    rule_ids: &[&str],
+    rows: Vec<(String, &'static str, bool)>,
+) -> Result<(), String> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let now = chrono::Local::now();
+    let observed_at = now.format("%Y-%m-%dT%H:%M:%S").to_string();
+    let rejections = rows
+        .into_iter()
+        .map(|(identity, reason_code, retryable)| {
+            let identity_hash =
+                crate::review_batch::audit_identity_hash(task, identity.as_str());
+            log::warn!(
+                "[{task}][BR-140] candidate isolated identity_hash={identity_hash} reason_code={reason_code} retryable={retryable}"
+            );
+            crate::review_batch::ReviewCandidateRejection {
+                observed_at: observed_at.clone(),
+                task: task.to_string(),
+                source: source.to_string(),
+                source_time: None,
+                rule_ids: rule_ids.iter().map(|rule| (*rule).to_string()).collect(),
+                retryable,
+                identity_hash,
+                reason_code: reason_code.to_string(),
+            }
+        })
+        .collect();
+    crate::review_batch::append_candidate_rejection_audit(rejections, date).map(|_| ())
 }
 
 /// v16.5: 简化版 virtual_observation 加载 (与 main.rs::VirtualObservationRecord 兼容)
 /// 读 data/virtual_observation/*.json (按 main.rs 持久化格式)
 /// v13.6.3 扩展: 解析 entry_price 字段
 pub fn load_virtual_observation_for_a01() -> Result<VirtualSnapshotLite, String> {
-    use std::fs;
     let dir = match stock_analysis::risk::env_guard::current_env() {
         stock_analysis::risk::env_guard::TradingEnv::Prod => {
             std::path::PathBuf::from("data/virtual_observation")
@@ -6035,17 +6807,38 @@ pub fn load_virtual_observation_for_a01() -> Result<VirtualSnapshotLite, String>
             std::path::PathBuf::from("data/test/virtual_observation")
         }
     };
+    load_virtual_observation_from_dir(&dir)
+}
+
+fn load_virtual_observation_from_dir(dir: &std::path::Path) -> Result<VirtualSnapshotLite, String> {
+    use std::fs;
     if !dir.exists() {
-        return Ok(VirtualSnapshotLite { records: vec![] });
+        return Err(format!(
+            "virtual observation source directory missing: {}",
+            dir.display()
+        ));
     }
     let mut records: Vec<VirtualRecordLite> = Vec::new();
-    let entries = fs::read_dir(&dir)
+    let mut rejections = Vec::new();
+    let mut source_failures = Vec::new();
+    let entries = fs::read_dir(dir)
         .map_err(|error| format!("读取虚拟观察目录 {} 失败: {error}", dir.display()))?;
     let mut paths = Vec::new();
-    for entry in entries {
-        let path = entry
-            .map_err(|error| format!("读取虚拟观察目录项失败: {error}"))?
-            .path();
+    for (entry_index, entry) in entries.enumerate() {
+        let path = match entry {
+            Ok(entry) => entry.path(),
+            Err(_) => {
+                source_failures.push(VirtualObservationLoadIssue {
+                    identity_hash: crate::review_batch::audit_identity_hash(
+                        "A-01-source",
+                        &format!("directory-entry-{entry_index}"),
+                    ),
+                    reason_code: "directory_entry_unreadable".to_string(),
+                    retryable: true,
+                });
+                continue;
+            }
+        };
         if path
             .extension()
             .is_some_and(|extension| extension == "json")
@@ -6055,6 +6848,13 @@ pub fn load_virtual_observation_for_a01() -> Result<VirtualSnapshotLite, String>
     }
     paths.sort();
     paths.reverse();
+    if paths.is_empty() {
+        return Err(format!(
+            "virtual observation source has no JSON snapshots: {} (directory_errors={})",
+            dir.display(),
+            source_failures.len()
+        ));
+    }
 
     #[derive(serde::Deserialize)]
     struct RecordJson {
@@ -6064,67 +6864,118 @@ pub fn load_virtual_observation_for_a01() -> Result<VirtualSnapshotLite, String>
         entry_mode: Option<String>,
         entry_price: Option<f64>,
     }
-    #[derive(serde::Deserialize)]
-    struct SnapshotJson {
-        records: Vec<RecordJson>,
-    }
-
-    fn push_record(
-        records: &mut Vec<VirtualRecordLite>,
-        parsed: RecordJson,
-        source: &std::path::Path,
-    ) -> Result<(), String> {
+    fn validate_record(parsed: RecordJson) -> Result<VirtualRecordLite, &'static str> {
         let code = parsed
             .code
             .filter(|value| valid_source_stock_code(value))
-            .ok_or_else(|| format!("{} 缺少合法六位 code", source.display()))?;
+            .ok_or("invalid_code")?;
         let name = parsed
             .name
             .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| format!("{} 的 {code} 缺少 name", source.display()))?;
+            .ok_or("missing_name")?;
         let entry_date = parsed
             .entry_date
             .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| format!("{} 的 {code} 缺少 entry_date", source.display()))?;
-        chrono::NaiveDate::parse_from_str(&entry_date, "%Y-%m-%d").map_err(|error| {
-            format!(
-                "{} 的 {code} entry_date={entry_date} 非法: {error}",
-                source.display()
-            )
-        })?;
+            .ok_or("missing_entry_date")?;
+        chrono::NaiveDate::parse_from_str(&entry_date, "%Y-%m-%d")
+            .map_err(|_| "invalid_entry_date")?;
         let entry_mode = parsed
             .entry_mode
             .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| format!("{} 的 {code} 缺少 entry_mode", source.display()))?;
+            .ok_or("missing_entry_mode")?;
         let entry_price = parsed
             .entry_price
             .filter(|value| value.is_finite() && *value > 0.0)
-            .ok_or_else(|| format!("{} 的 {code} 缺少有效 entry_price", source.display()))?;
-        records.push(VirtualRecordLite {
+            .ok_or("invalid_entry_price")?;
+        Ok(VirtualRecordLite {
             entry_date,
             code,
             name,
             entry_mode,
             entry_price,
-        });
-        Ok(())
+        })
     }
 
     for path in paths.iter().take(5) {
-        let raw = fs::read_to_string(path)
-            .map_err(|error| format!("读取虚拟观察文件 {} 失败: {error}", path.display()))?;
-        let parsed_records = if let Ok(snapshot) = serde_json::from_str::<SnapshotJson>(&raw) {
-            snapshot.records
-        } else if let Ok(record) = serde_json::from_str::<RecordJson>(&raw) {
-            vec![record]
-        } else {
-            return Err(format!("虚拟观察文件 {} JSON 损坏", path.display()));
+        let source_hash =
+            crate::review_batch::audit_identity_hash("A-01-source", &path.to_string_lossy());
+        let raw = match fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(_) => {
+                source_failures.push(VirtualObservationLoadIssue {
+                    identity_hash: source_hash,
+                    reason_code: "source_read_failed".to_string(),
+                    retryable: true,
+                });
+                continue;
+            }
         };
-        for record in parsed_records {
-            push_record(&mut records, record, path)?;
+        let value: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(value) => value,
+            Err(_) => {
+                source_failures.push(VirtualObservationLoadIssue {
+                    identity_hash: source_hash,
+                    reason_code: "invalid_json".to_string(),
+                    retryable: false,
+                });
+                continue;
+            }
+        };
+        let record_values = match value {
+            serde_json::Value::Object(mut object) if object.contains_key("records") => {
+                match object.remove("records") {
+                    Some(serde_json::Value::Array(values)) => values,
+                    _ => {
+                        source_failures.push(VirtualObservationLoadIssue {
+                            identity_hash: source_hash,
+                            reason_code: "invalid_snapshot_shape".to_string(),
+                            retryable: false,
+                        });
+                        continue;
+                    }
+                }
+            }
+            serde_json::Value::Object(object) => vec![serde_json::Value::Object(object)],
+            _ => {
+                source_failures.push(VirtualObservationLoadIssue {
+                    identity_hash: source_hash,
+                    reason_code: "invalid_snapshot_shape".to_string(),
+                    retryable: false,
+                });
+                continue;
+            }
+        };
+        for (record_index, value) in record_values.into_iter().enumerate() {
+            let identity_hash = crate::review_batch::audit_identity_hash(
+                "A-01-record",
+                &format!("{}:{record_index}", path.to_string_lossy()),
+            );
+            let parsed = match serde_json::from_value::<RecordJson>(value) {
+                Ok(parsed) => parsed,
+                Err(_) => {
+                    rejections.push(VirtualObservationLoadIssue {
+                        identity_hash,
+                        reason_code: "record_decode_failed".to_string(),
+                        retryable: false,
+                    });
+                    continue;
+                }
+            };
+            match validate_record(parsed) {
+                Ok(record) => records.push(record),
+                Err(reason_code) => rejections.push(VirtualObservationLoadIssue {
+                    identity_hash,
+                    reason_code: reason_code.to_string(),
+                    retryable: false,
+                }),
+            }
         }
     }
-    Ok(VirtualSnapshotLite { records })
+    Ok(VirtualSnapshotLite {
+        records,
+        rejections,
+        source_failures,
+    })
 }
 
 /// v13 §14.2 I-01 盘中轮动总览 (⚡交易建议类, 带 banner)
@@ -6225,8 +7076,15 @@ pub async fn push_news_to_idea(
 
 /// v13 §14.3 A-01 虚拟仓复盘 (ℹ️盘后参考, 复用 T-11 竞价复算)
 pub async fn push_paper_review(code: &str, params: PaperReviewParams<'_>) -> bool {
+    push_paper_review_outcome(code, params).await.is_pushed()
+}
+
+async fn push_paper_review_outcome(
+    code: &str,
+    params: PaperReviewParams<'_>,
+) -> crate::notify::PushOutcome {
     let text = render_paper_review(params);
-    dispatch(crate::notify::PushKind::PaperReview, code, None, text).await
+    dispatch_outcome(crate::notify::PushKind::PaperReview, code, None, text).await
 }
 
 // ============================================================================
@@ -8440,12 +9298,21 @@ mod tests {
                 watch_point: "接力意愿",
             },
         ];
-        let s = render_industry_chain("2026-07-05", &chains, Some("光伏（涨停12→3家）"));
+        let s = render_industry_chain("2026-07-05", &chains, Some("光伏（涨停12→3家）"), None);
         assert!(s.starts_with("🔥 涨停产业链（2026-07-05）"));
         assert!(s.contains("1. AI算力 涨停8家"));
         assert!(s.contains("龙头: 龙头A(TEST_CODE_688001) 4板"));
         assert!(s.contains("2. 机器人"));
         assert!(s.contains("⚠️ 退潮链: 光伏（涨停12→3家）"));
+
+        let degraded = render_industry_chain(
+            "2026-07-05",
+            &chains,
+            None,
+            Some("已隔离 1 个标的、1 个来源错误，仅展示通过质检的真实子集"),
+        );
+        assert!(degraded.contains("⚠️ 部分证据:"));
+        assert!(degraded.contains("已隔离 1 个标的、1 个来源错误"));
     }
 
     // ---- R-04 龙虎榜 ----
@@ -8456,16 +9323,16 @@ mod tests {
             name: "X",
             code: "TEST_CODE_688001",
             net_buy_yi: 1.5,
-            reason: "涨幅偏离值达7%",
-            buy_inst_n: 2,
+            reason: Some("涨幅偏离值达7%"),
+            buy_inst_n: Some(2),
             buy_inst_amt_wan: Some(8000.0),
-            buy_other_n: 3,
+            buy_other_n: Some(3),
             buy_other_amt_wan: Some(4000.0),
             buy_conc_pct: Some(65.0),
-            sell_desc: "游资席位",
+            sell_desc: Some("游资席位"),
             sell_conc_pct: Some(45.0),
             chain_match: Some("AI算力"),
-            next_day_risk: "高开震荡",
+            next_day_risk: Some("高开震荡"),
         }];
         let s = render_review_lhb("2026-07-05", &entries);
         assert!(s.starts_with("🐉 龙虎榜净买前五（2026-07-05 21:00）"));
@@ -8474,6 +9341,29 @@ mod tests {
         assert!(s.contains("卖: 游资席位（集中度45%）"));
         assert!(s.contains("主线一致: 是-AI算力"));
         assert!(s.contains("仅结构化事实, 不含席位风格推断"));
+
+        let missing = render_review_lhb(
+            "2026-07-05",
+            &[LhbEntry {
+                name: "X",
+                code: "TEST_CODE_688001",
+                net_buy_yi: 1.5,
+                reason: None,
+                buy_inst_n: None,
+                buy_inst_amt_wan: None,
+                buy_other_n: None,
+                buy_other_amt_wan: None,
+                buy_conc_pct: None,
+                sell_desc: None,
+                sell_conc_pct: None,
+                chain_match: None,
+                next_day_risk: None,
+            }],
+        );
+        assert!(missing.contains("数据缺失"));
+        assert!(!missing.contains("机构0席"));
+        assert!(!missing.contains("其他0席"));
+        assert!(!missing.contains(" | —"));
     }
 
     // ---- R-05 信号复盘 ----
@@ -9007,6 +9897,65 @@ mod tests {
         assert!(!out.contains("已启动:"));
         assert!(!out.contains("待启动:"));
         assert!(!out.contains("明日观察点:"));
+    }
+
+    #[test]
+    fn br140_a10_one_missing_name_keeps_verified_candidates() {
+        let cluster = stock_analysis::database::concepts::ChainDailyRow {
+            date: "2026-07-21".to_string(),
+            concept: "测试主线".to_string(),
+            stocks: r#"["000001","000002"]"#.to_string(),
+            continuation_count: 2,
+        };
+        let rotations = vec![stock_analysis::database::concepts::BoardRotationRow {
+            date: "2026-07-21".to_string(),
+            board_code: "TEST_BOARD".to_string(),
+            board_name: "测试板块".to_string(),
+            news_title: "测试真实标题".to_string(),
+            board_change_pct: 1.0,
+            board_main_net_pct: 1.0,
+            stocks_json: r#"[{"code":"000002","name":"测试二"}]"#.to_string(),
+        }];
+
+        let batch =
+            build_catalyst_review_candidate_with("2026-07-21", &cluster, &rotations, |_code| None)
+                .expect("one named real candidate remains usable");
+
+        assert_eq!(batch.snapshot.started, vec!["测试二"]);
+        assert_eq!(batch.rejections.len(), 1);
+    }
+
+    #[test]
+    fn br140_a10_all_names_missing_fails_explicitly() {
+        let cluster = stock_analysis::database::concepts::ChainDailyRow {
+            date: "2026-07-21".to_string(),
+            concept: "测试主线".to_string(),
+            stocks: r#"["000001","000002"]"#.to_string(),
+            continuation_count: 1,
+        };
+
+        let error = build_catalyst_review_candidate_with("2026-07-21", &cluster, &[], |_code| None)
+            .expect_err("all missing names must reject the report");
+
+        assert!(error.contains("全部 2 个候选"));
+        assert!(error.contains("名称证据"));
+    }
+
+    #[test]
+    fn br140_a10_stale_chain_row_is_rejected() {
+        let cluster = stock_analysis::database::concepts::ChainDailyRow {
+            date: "2026-07-20".to_string(),
+            concept: "测试主线".to_string(),
+            stocks: r#"["000001"]"#.to_string(),
+            continuation_count: 1,
+        };
+
+        let error = build_catalyst_review_candidate_with("2026-07-21", &cluster, &[], |_code| {
+            Some("不应使用".to_string())
+        })
+        .expect_err("stale chain evidence must fail closed");
+
+        assert!(error.contains("as_of=2026-07-20"));
     }
 
     // ====== v13 治理元信息测试 (A-10) ======
@@ -9924,6 +10873,92 @@ mod tests {
     }
 
     #[test]
+    fn br140_missing_virtual_observation_directory_is_not_a_complete_empty_source() {
+        let dir = std::env::temp_dir().join(format!(
+            "stock_analysis_a01_missing_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+
+        let error = match load_virtual_observation_from_dir(&dir) {
+            Err(error) => error,
+            Ok(_) => panic!("a missing source directory must remain unavailable"),
+        };
+
+        assert!(error.contains("source directory missing"));
+    }
+
+    #[test]
+    fn br140_empty_virtual_observation_directory_is_not_a_complete_empty_source() {
+        let dir = std::env::temp_dir().join(format!(
+            "stock_analysis_a01_empty_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let error = match load_virtual_observation_from_dir(&dir) {
+            Err(error) => error,
+            Ok(_) => panic!("an empty source directory must remain unavailable"),
+        };
+
+        assert!(error.contains("no JSON snapshots"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn br140_a01_loader_isolates_bad_record_inside_valid_snapshot() {
+        let dir = std::env::temp_dir().join(format!(
+            "stock_analysis_a01_loader_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("2026-07-21.json"),
+            r#"{"records":[
+                {"entry_date":"2026-07-20","code":"TEST_CODE_000001","name":"坏记录","entry_mode":"观察","entry_price":"bad"},
+                {"entry_date":"2026-07-20","code":"TEST_CODE_000002","name":"合规记录","entry_mode":"观察","entry_price":10.5}
+            ]}"#,
+        )
+        .unwrap();
+
+        let batch = load_virtual_observation_from_dir(&dir).unwrap();
+
+        assert_eq!(batch.records.len(), 1);
+        assert_eq!(batch.records[0].code, "TEST_CODE_000002");
+        assert_eq!(batch.rejections.len(), 1);
+        assert_eq!(batch.rejections[0].reason_code, "record_decode_failed");
+        assert!(batch.source_failures.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn br140_a01_loader_keeps_valid_file_when_newer_json_is_damaged() {
+        let dir = std::env::temp_dir().join(format!(
+            "stock_analysis_a01_loader_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("latest.json"), "{damaged").unwrap();
+        std::fs::write(
+            dir.join("2026-07-20.json"),
+            r#"{"entry_date":"2026-07-20","code":"TEST_CODE_000003","name":"合规记录","entry_mode":"观察","entry_price":8.25}"#,
+        )
+        .unwrap();
+
+        let batch = load_virtual_observation_from_dir(&dir).unwrap();
+
+        assert_eq!(batch.records.len(), 1);
+        assert_eq!(batch.records[0].code, "TEST_CODE_000003");
+        assert_eq!(batch.source_failures.len(), 1);
+        assert_eq!(batch.source_failures[0].reason_code, "invalid_json");
+        assert_eq!(batch.source_failures[0].identity_hash.len(), 64);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn br104_a01_uses_exact_next_trading_day_close() {
         let entry = chrono::NaiveDate::from_ymd_opt(2026, 7, 17).unwrap();
         let review = chrono::NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
@@ -9943,6 +10978,70 @@ mod tests {
         let rows = vec![(entry, 11.0)];
 
         assert_eq!(select_t1_close(&rows, entry, review).unwrap(), None);
+    }
+
+    #[test]
+    fn br140_a01_bad_first_symbol_does_not_block_later_valid_record() {
+        let records = vec![
+            VirtualRecordLite {
+                entry_date: "2026-07-20".to_string(),
+                code: "TEST_CODE_000001".to_string(),
+                name: "测试一".to_string(),
+                entry_mode: "观察".to_string(),
+                entry_price: 10.0,
+            },
+            VirtualRecordLite {
+                entry_date: "2026-07-20".to_string(),
+                code: "TEST_CODE_000002".to_string(),
+                name: "测试二".to_string(),
+                entry_mode: "观察".to_string(),
+                entry_price: 10.0,
+            },
+        ];
+        let close_date = chrono::NaiveDate::from_ymd_opt(2026, 7, 21).expect("valid test date");
+
+        let batch = build_paper_review_candidate_with("2026-07-21", &records, |code, _days| {
+            if code.ends_with("000001") {
+                Err("TEST_CODE quality rejected".to_string())
+            } else {
+                Ok((vec![(close_date, 12.0)], "TEST_REAL_FIXTURE".to_string()))
+            }
+        })
+        .expect("later complete record remains eligible");
+
+        assert_eq!(
+            batch.snapshot.expect("one complete snapshot").code,
+            "TEST_CODE_000002"
+        );
+        assert_eq!(batch.rejections.len(), 1);
+    }
+
+    #[test]
+    fn br140_a01_all_invalid_records_fail_with_aggregate_count() {
+        let records = vec![
+            VirtualRecordLite {
+                entry_date: "2026-07-20".to_string(),
+                code: "TEST_CODE_000001".to_string(),
+                name: "测试一".to_string(),
+                entry_mode: "观察".to_string(),
+                entry_price: 10.0,
+            },
+            VirtualRecordLite {
+                entry_date: "2026-07-20".to_string(),
+                code: "TEST_CODE_000002".to_string(),
+                name: "测试二".to_string(),
+                entry_mode: "观察".to_string(),
+                entry_price: 10.0,
+            },
+        ];
+
+        let batch = build_paper_review_candidate_with("2026-07-21", &records, |code, _days| {
+            Err(format!("{code}: TEST_CODE quality rejected"))
+        })
+        .expect("record isolation returns a typed batch");
+
+        assert!(batch.snapshot.is_none());
+        assert_eq!(batch.rejections.len(), 2);
     }
 
     #[test]
@@ -13038,7 +14137,7 @@ mod tests {
             url: Some("https://example.invalid/announcement".to_string()),
         };
         assert_eq!(
-            build_event_calendar_macro_summary(&[], &Default::default()),
+            build_event_calendar_macro_summary(&[], R08HoldingAudience::Unavailable),
             "今日公告批次成功返回 0 条"
         );
         let rows = vec![
@@ -13057,15 +14156,66 @@ mod tests {
             ),
             announcement("TEST_CODE_000003", "测试三", "其他公告3", AnnLevel::Info),
             announcement("TEST_CODE_000004", "测试四", "其他公告4", AnnLevel::Info),
+            announcement(
+                "TEST_CODE_000005",
+                "测试本地",
+                "关于注销部分回购股份并减少注册资本通知债权人的公告",
+                AnnLevel::Skip,
+            ),
         ];
         let held = std::collections::HashSet::from(["TEST_CODE_600000".to_string()]);
-        let summary = build_event_calendar_macro_summary(&rows, &held);
+        let summary =
+            build_event_calendar_macro_summary(&rows, R08HoldingAudience::Verified(&held));
         assert!(summary.contains("今日共 5 条公告"));
         assert!(summary.contains("持仓相关 (TOP 1)"));
         assert!(summary.contains("测试持仓(TEST_CODE_600000)"));
         assert!(summary.contains("TEST_CODE_000001 (Info): 其他公告1"));
         assert!(summary.contains("非持仓 (TOP 3)"));
         assert!(!summary.contains("其他公告4"));
+        assert!(!summary.contains("测试本地"));
+        assert!(!summary.contains("通知债权人"));
+    }
+
+    #[test]
+    fn br140_r08_unavailable_audience_never_labels_notice_non_holding() {
+        use stock_analysis::data_provider::announcement::{AnnLevel, Announcement};
+        let rows = vec![Announcement {
+            code: "TEST_CODE_600000".to_string(),
+            name: "测试公司".to_string(),
+            title: "重大合同公告".to_string(),
+            date: "2026-07-21".to_string(),
+            summary: "TEST_CODE summary".to_string(),
+            content: "TEST_CODE content".to_string(),
+            level: AnnLevel::Important,
+            reason: "TEST_CODE reason".to_string(),
+            external_id: Some("TEST_CODE_R08_UNKNOWN_AUDIENCE".to_string()),
+            url: Some("https://example.invalid/unknown-audience".to_string()),
+        }];
+
+        let summary = build_event_calendar_macro_summary(&rows, R08HoldingAudience::Unavailable);
+
+        assert!(summary.contains("持仓关系不可判定"));
+        assert!(summary.contains("重大合同公告"));
+        assert!(!summary.contains("持仓相关"));
+        assert!(!summary.contains("非持仓"));
+    }
+
+    #[test]
+    fn br138_dispatcher_r08_excludes_local_only_lifecycle_rows() {
+        use stock_analysis::data_provider::announcement::{AnnLevel, Announcement};
+        let rows = vec![Announcement {
+            code: "TEST_CODE_600000".to_string(),
+            name: "测试本地证据".to_string(),
+            title: "减持计划期限届满暨实施情况的公告".to_string(),
+            date: "2026-07-21".to_string(),
+            summary: "TEST_CODE summary".to_string(),
+            content: String::new(),
+            level: AnnLevel::Skip,
+            reason: "BR-138 lifecycle-only local evidence".to_string(),
+            external_id: Some("TEST_CODE_DISPATCHER_R08_LOCAL".to_string()),
+            url: Some("https://example.invalid/local-only".to_string()),
+        }];
+        assert!(filter_r08_event_announcements(rows).is_empty());
     }
 
     #[test]

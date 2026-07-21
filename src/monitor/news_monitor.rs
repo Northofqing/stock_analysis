@@ -87,17 +87,9 @@ impl NewsMonitor {
                 info!("[NewsMonitor] 注册 {} 只持仓股", positions.len());
             }
         }
-        // 加载自选股（即使无持仓也监控）
-        let mut watchlist_count = 0;
-        if let Ok(codes) = crate::portfolio::get_all_codes() {
-            for code in codes {
-                linker.register_position(&code, &format!("股票{}", code));
-                watchlist_count += 1;
-            }
-        }
-        if watchlist_count > 0 {
-            info!("[NewsMonitor] 注册 {} 只自选股", watchlist_count);
-        }
+        // BR-138: explicit watch loading belongs to the outer monitor loop's
+        // single background task. Constructor-time network/name resolution
+        // must never delay policy or critical-flash startup.
         Self {
             linker,
             seen_titles: HashSet::new(),
@@ -136,13 +128,36 @@ impl NewsMonitor {
         anns: &[announcement::Announcement],
         resolved_codes: &std::collections::HashMap<String, String>,
     ) -> Vec<AlertEvent> {
+        self.process_announcements_indexed(anns, resolved_codes)
+            .into_iter()
+            .map(|(_, event)| event)
+            .collect()
+    }
+
+    /// BR-137: preserves each emitted alert's original provider-batch index so
+    /// normalized dispositions can be joined without relying on optional or
+    /// duplicate provider identities.
+    pub fn process_announcements_indexed(
+        &mut self,
+        anns: &[announcement::Announcement],
+        resolved_codes: &std::collections::HashMap<String, String>,
+    ) -> Vec<(usize, AlertEvent)> {
         let mut events = Vec::new();
-        self.passive_count_today += anns.len() as u64;
+        let immediate_count = anns
+            .iter()
+            .filter(|announcement| {
+                announcement::announcement_is_immediate_notification_candidate(announcement)
+            })
+            .count();
+        let drop_local_only = anns.len().saturating_sub(immediate_count);
+        self.passive_count_today += immediate_count as u64;
         // b011 P1-1: 漏斗计数 — 每级过滤器输出 进N→出M|丢弃原因分布
         let mut drop_seen_dup: usize = 0;
         let mut drop_no_match: usize = 0;
 
-        for ann in anns {
+        for (input_index, ann) in anns.iter().enumerate().filter(|(_, announcement)| {
+            announcement::announcement_is_immediate_notification_candidate(announcement)
+        }) {
             // review #14: char_indices().nth() 找第 40 字符的 byte 边界, 一次性扫描,
             // 避免 chars().take(40).collect::<String>() + format! 双重分配.
             let title_prefix: &str = ann
@@ -242,50 +257,54 @@ impl NewsMonitor {
                 AlertLevel::Important => self.important_count += 1,
                 AlertLevel::Info => self.info_count += 1,
             }
-            events.push(AlertEvent {
-                level,
-                category: cat,
-                code,
-                name,
-                message: format!("[公告] {} | {}", short_title, ann.reason),
-                detail: AlertDetail {
-                    price: None,
-                    change_pct: None,
-                    volume_ratio: None,
-                    main_flow_yi: None,
-                    threshold: None,
-                    news_title: Some(ann.title.clone()),
-                    news_summary: {
-                        // 回退链：正文 → API摘要 → 标题内容
-                        if !ann.content.is_empty() {
-                            Some(truncate_str(&ann.content, 150))
-                        } else if !ann.summary.is_empty() {
-                            Some(truncate_str(&ann.summary, 150))
+            events.push((
+                input_index,
+                AlertEvent {
+                    level,
+                    category: cat,
+                    code,
+                    name,
+                    message: format!("[公告] {} | {}", short_title, ann.reason),
+                    detail: AlertDetail {
+                        price: None,
+                        change_pct: None,
+                        volume_ratio: None,
+                        main_flow_yi: None,
+                        threshold: None,
+                        news_title: Some(ann.title.clone()),
+                        news_summary: {
+                            // 回退链：正文 → API摘要 → 标题内容
+                            if !ann.content.is_empty() {
+                                Some(truncate_str(&ann.content, 150))
+                            } else if !ann.summary.is_empty() {
+                                Some(truncate_str(&ann.summary, 150))
+                            } else {
+                                // 最后回退：显示公告标题（剥离公司名前缀）
+                                Some(truncate_str(&short_title, 100))
+                            }
+                        },
+                        news_importance: None,
+                        ai_decision: None,
+                        t1_locked: false,
+                        extra: if hit_summary.is_empty() {
+                            None
                         } else {
-                            // 最后回退：显示公告标题（剥离公司名前缀）
-                            Some(truncate_str(&short_title, 100))
-                        }
+                            Some(format!("命中: {hit_summary}"))
+                        },
                     },
-                    news_importance: None,
-                    ai_decision: None,
-                    t1_locked: false,
-                    extra: if hit_summary.is_empty() {
-                        None
-                    } else {
-                        Some(format!("命中: {hit_summary}"))
-                    },
+                    triggered_at: Local::now(),
+                    routed_external_id: ann.external_id.clone(),
                 },
-                triggered_at: Local::now(),
-                routed_external_id: ann.external_id.clone(),
-            });
+            ));
         }
 
         // b011 P1-1: 漏斗可观测 — 32 条进 0 条出这类"静默归零"必须能一眼看出丢在哪级
         if !anns.is_empty() {
             log::info!(
-                "[公告漏斗] 实体关联: 进{} → 出{} | 已见重复={} L1/L2未命中={}",
+                "[公告漏斗][BR-138] 实体关联: 进{} → 出{} | 本地生命周期={} 已见重复={} L1/L2未命中={}",
                 anns.len(),
                 events.len(),
+                drop_local_only,
                 drop_seen_dup,
                 drop_no_match
             );
@@ -734,5 +753,28 @@ mod tests {
         };
         let events = nm.process_announcements(&[ann], &std::collections::HashMap::new());
         assert!(events.is_empty()); // L1过滤器拦截
+    }
+
+    #[test]
+    fn br138_local_only_announcement_never_becomes_news_monitor_event() {
+        let mut nm = NewsMonitor::new();
+        nm.linker
+            .register_position("TEST_CODE_000001", "TEST_CODE_本地证据公司");
+        let ann = announcement::Announcement {
+            code: "TEST_CODE_000001".into(),
+            name: "TEST_CODE_本地证据公司".into(),
+            title: "关于注销部分回购股份并减少注册资本通知债权人的公告".into(),
+            date: "2026-07-21".into(),
+            summary: String::new(),
+            content: String::new(),
+            level: announcement::AnnLevel::Skip,
+            reason: "BR-138 lifecycle-only local evidence".into(),
+            external_id: Some("TEST_CODE_LOCAL_ONLY".into()),
+            url: Some("https://example.invalid/TEST_CODE_LOCAL_ONLY".into()),
+        };
+
+        assert!(nm
+            .process_announcements(&[ann], &std::collections::HashMap::new())
+            .is_empty());
     }
 }
