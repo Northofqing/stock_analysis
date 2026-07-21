@@ -1,4 +1,4 @@
-//! Registered business rules: BR-043, BR-045, BR-047, BR-049, BR-051, BR-063, BR-071, BR-073, BR-074, BR-077, BR-078, BR-082, BR-083, BR-136.
+//! Registered business rules: BR-043, BR-045, BR-047, BR-049, BR-051, BR-063, BR-071, BR-073, BR-074, BR-077, BR-078, BR-082, BR-083, BR-136, BR-140.
 //! 实盘监控模式入口。
 
 //!
@@ -125,6 +125,8 @@ mod notify;
 use crate::notify::{push_governor_v3, PushKind};
 
 mod push_templates;
+
+mod review_batch;
 
 mod dryrun_report; // v26: dry-run 自动报告
 
