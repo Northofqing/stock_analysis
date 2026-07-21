@@ -3884,62 +3884,133 @@ fn select_t1_close(
     Ok(Some((target, *close)))
 }
 
-pub fn load_paper_review_snapshot_real(date: &str) -> Result<Option<PaperReviewSnapshot>, String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PaperReviewRejection {
+    code: String,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PaperReviewCandidateBatch {
+    snapshot: Option<PaperReviewSnapshot>,
+    rejections: Vec<PaperReviewRejection>,
+    pending_count: usize,
+}
+
+fn build_paper_review_candidate_with<F>(
+    date: &str,
+    records: &[VirtualRecordLite],
+    mut fetch_daily: F,
+) -> Result<PaperReviewCandidateBatch, String>
+where
+    F: FnMut(&str, usize) -> Result<(Vec<(chrono::NaiveDate, f64)>, String), String>,
+{
     let review_date = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
         .map_err(|error| format!("A-01 非法复盘日期 {date}: {error}"))?;
+    let mut batch = PaperReviewCandidateBatch::default();
+
+    for record in records {
+        let evaluated = (|| -> Result<Option<PaperReviewSnapshot>, String> {
+            if !valid_source_stock_code(&record.code) {
+                return Err("code 非法".to_string());
+            }
+            if record.name.trim().is_empty() {
+                return Err("name 缺失".to_string());
+            }
+            if record.entry_mode.trim().is_empty() {
+                return Err("entry_mode 缺失".to_string());
+            }
+            if !record.entry_price.is_finite() || record.entry_price <= 0.0 {
+                return Err("entry_price 缺失/非法".to_string());
+            }
+            let entry_date = chrono::NaiveDate::parse_from_str(&record.entry_date, "%Y-%m-%d")
+                .map_err(|error| format!("entry_date 非法: {error}"))?;
+            let target = stock_analysis::calendar::next_trading_day(entry_date);
+            if target > review_date {
+                return Ok(None);
+            }
+
+            let (rows, source) = fetch_daily(&record.code, 60)?;
+            let Some((target, close_price)) = select_t1_close(&rows, entry_date, review_date)?
+            else {
+                return Err(format!("T+1({target}) 已到但严格日 K 批次未覆盖"));
+            };
+            let pnl = ((close_price / record.entry_price - 1.0) * 100.0) as f32;
+            if !pnl.is_finite() {
+                return Err("收益率非有限值".to_string());
+            }
+            let (high, flat, low) = derive_plan_from_pnl(pnl);
+            Ok(Some(PaperReviewSnapshot {
+                date: date.to_string(),
+                name: record.name.clone(),
+                code: record.code.clone(),
+                trigger: record.entry_mode.clone(),
+                desc: format!(
+                    "研究观察 T+1={} (entry={:.2} → close={:.2}, pnl={:+.1}%, source={})",
+                    target, record.entry_price, close_price, pnl, source
+                ),
+                pnl: Some(pnl),
+                plan_high: Some(high),
+                plan_flat: Some(flat),
+                plan_low: Some(low),
+            }))
+        })();
+
+        match evaluated {
+            Ok(Some(snapshot)) => {
+                batch.snapshot = Some(snapshot);
+                return Ok(batch);
+            }
+            Ok(None) => batch.pending_count += 1,
+            Err(reason) => batch.rejections.push(PaperReviewRejection {
+                code: record.code.clone(),
+                reason,
+            }),
+        }
+    }
+
+    if !batch.rejections.is_empty() {
+        let reasons = batch
+            .rejections
+            .iter()
+            .map(|rejection| format!("{}={}", rejection.code, rejection.reason))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!(
+            "A-01 {} records rejected: {}",
+            batch.rejections.len(),
+            stock_analysis::data_provider::brief(&reasons)
+        ));
+    }
+
+    Ok(batch)
+}
+
+pub fn load_paper_review_snapshot_real(date: &str) -> Result<Option<PaperReviewSnapshot>, String> {
     let snapshot = load_virtual_observation_for_a01()?;
     if snapshot.records.is_empty() {
-        return Ok(None);
-    }
-    let top = &snapshot.records[0];
-
-    let entry_price = top.entry_price;
-    let entry_date = chrono::NaiveDate::parse_from_str(&top.entry_date, "%Y-%m-%d")
-        .map_err(|error| format!("A-01 {} entry_date 非法: {error}", top.code))?;
-    let target = stock_analysis::calendar::next_trading_day(entry_date);
-    if target > review_date {
         return Ok(None);
     }
 
     let fetcher = stock_analysis::data_provider::DataFetcherManager::new()
         .map_err(|error| format!("A-01 初始化日 K 抓取器失败: {error:#}"))?;
-    let (kline, source) = fetcher
-        .get_daily_data(&top.code, 60)
-        .map_err(|error| format!("A-01 {} 日 K 批次失败: {error:#}", top.code))?;
-    let rows: Vec<_> = kline.iter().map(|bar| (bar.date, bar.close)).collect();
-    let Some((target, close_price)) = select_t1_close(&rows, entry_date, review_date)? else {
-        return Ok(Some(PaperReviewSnapshot {
-            date: date.to_string(),
-            name: top.name.clone(),
-            code: top.code.clone(),
-            trigger: top.entry_mode.clone(),
-            desc: format!("T+1({target}) 已到但严格日 K 批次暂未覆盖，收益暂无"),
-            pnl: None,
-            plan_high: None,
-            plan_flat: None,
-            plan_low: None,
-        }));
-    };
-    let pnl = ((close_price / entry_price - 1.0) * 100.0) as f32;
-    if !pnl.is_finite() {
-        return Err(format!("A-01 {} 收益率非有限值", top.code));
+    let batch = build_paper_review_candidate_with(date, &snapshot.records, |code, days| {
+        let (kline, source) = fetcher
+            .get_daily_data(code, days)
+            .map_err(|error| format!("日 K 批次失败: {error:#}"))?;
+        Ok((
+            kline.iter().map(|bar| (bar.date, bar.close)).collect(),
+            source.to_string(),
+        ))
+    })?;
+    for rejection in &batch.rejections {
+        log::warn!(
+            "[A-01][BR-104][BR-140] candidate rejected code={} reason={}",
+            rejection.code,
+            rejection.reason
+        );
     }
-    let (high, flat, low) = derive_plan_from_pnl(pnl);
-
-    Ok(Some(PaperReviewSnapshot {
-        date: date.to_string(),
-        name: top.name.clone(),
-        code: top.code.clone(),
-        trigger: top.entry_mode.clone(),
-        desc: format!(
-            "研究观察 T+1={} (entry={:.2} → close={:.2}, pnl={:+.1}%, source={})",
-            target, entry_price, close_price, pnl, source
-        ),
-        pnl: Some(pnl),
-        plan_high: Some(high),
-        plan_flat: Some(flat),
-        plan_low: Some(low),
-    }))
+    Ok(batch.snapshot)
 }
 
 /// v15.6 兼容: 同步占位
@@ -3973,25 +4044,38 @@ pub fn derive_plan_from_pnl(pnl: f32) -> (String, String, String) {
 }
 
 /// v15.6 业务层入口 (v16.5 改用真实 virtual_observation 数据)
-pub async fn dispatch_paper_review_daily(date: &str) -> bool {
+async fn dispatch_paper_review_daily_outcome(date: &str) -> crate::review_batch::ReviewTaskOutcome {
     let snapshot = match load_paper_review_snapshot_real(date) {
         Ok(Some(snapshot)) => snapshot,
         Ok(None) => {
             log_dispatcher_attempt("A-01", false, 0, "paper_review_snapshot empty");
             log::info!("[A-01] paper_review_snapshot 空 (virtual_observation 无数据), 跳过推送");
-            return false;
+            return crate::review_batch::ReviewTaskOutcome::no_data(
+                "virtual observation has no T+1-complete record",
+            );
         }
         Err(error) => {
             log::error!("[A-01][BR-104] batch rejected: {error}");
             log_dispatcher_attempt("A-01", false, 0, &error);
-            return false;
+            return crate::review_batch::ReviewTaskOutcome::failed(true, error);
         }
     };
     let params = build_paper_review_from_snapshot(&snapshot);
     let snap_size = 1; // 1 record
-    let result = push_paper_review("", params).await;
+    let result = push_paper_review(&snapshot.code, params).await;
     log_dispatcher_attempt("A-01", result, snap_size, "");
-    result
+    if result {
+        crate::review_batch::ReviewTaskOutcome::delivered(snap_size)
+    } else {
+        crate::review_batch::ReviewTaskOutcome::failed(true, "A-01 sink did not confirm delivery")
+    }
+}
+
+pub async fn dispatch_paper_review_daily(date: &str) -> bool {
+    matches!(
+        dispatch_paper_review_daily_outcome(date).await,
+        crate::review_batch::ReviewTaskOutcome::Delivered { .. }
+    )
 }
 
 /// v17.4 §5.2 (BR-083): 13:00 午盘虚拟仓快照 (AC38).
@@ -5482,9 +5566,9 @@ pub async fn dispatch_post_session_review(
         },
         async {
             if runnable.contains(&ReviewTask::A01) {
-                Some(from_bool(
+                Some((
                     ReviewTask::A01,
-                    dispatch_paper_review_daily(date).await,
+                    dispatch_paper_review_daily_outcome(date).await,
                 ))
             } else {
                 None
@@ -5501,13 +5585,18 @@ pub async fn dispatch_post_session_review(
     let waiting = batch.waiting_tasks();
     let disabled = batch.disabled_tasks();
     let failed = batch.failed_tasks();
+    let statuses = batch
+        .tasks
+        .iter()
+        .map(|(task, outcome)| format!("{}:{}", task.label(), outcome.status_label()))
+        .collect::<Vec<_>>();
     let no_data = batch
         .tasks
         .iter()
         .filter(|(_, outcome)| matches!(outcome, ReviewTaskOutcome::NoData { .. }))
         .count();
     log::info!(
-        "[B-005-C][BR-110][BR-140] 完成 time={} attempted={} delivered={} no_data={} waiting={} disabled={} failed={} waiting_tasks={:?} disabled_tasks={:?} failed_tasks={:?}",
+        "[B-005-C][BR-110][BR-140] 完成 time={} attempted={} delivered={} no_data={} waiting={} disabled={} failed={} statuses={:?} waiting_tasks={:?} disabled_tasks={:?} failed_tasks={:?}",
         now.format("%H:%M"),
         batch.tasks.len(),
         delivered,
@@ -5515,6 +5604,7 @@ pub async fn dispatch_post_session_review(
         waiting.len(),
         disabled.len(),
         failed.len(),
+        statuses,
         waiting.iter().map(|task| task.label()).collect::<Vec<_>>(),
         disabled.iter().map(|task| task.label()).collect::<Vec<_>>(),
         failed.iter().map(|task| task.label()).collect::<Vec<_>>(),
@@ -10034,6 +10124,70 @@ mod tests {
         let rows = vec![(entry, 11.0)];
 
         assert_eq!(select_t1_close(&rows, entry, review).unwrap(), None);
+    }
+
+    #[test]
+    fn br140_a01_bad_first_symbol_does_not_block_later_valid_record() {
+        let records = vec![
+            VirtualRecordLite {
+                entry_date: "2026-07-20".to_string(),
+                code: "TEST_CODE_000001".to_string(),
+                name: "测试一".to_string(),
+                entry_mode: "观察".to_string(),
+                entry_price: 10.0,
+            },
+            VirtualRecordLite {
+                entry_date: "2026-07-20".to_string(),
+                code: "TEST_CODE_000002".to_string(),
+                name: "测试二".to_string(),
+                entry_mode: "观察".to_string(),
+                entry_price: 10.0,
+            },
+        ];
+        let close_date = chrono::NaiveDate::from_ymd_opt(2026, 7, 21).expect("valid test date");
+
+        let batch = build_paper_review_candidate_with("2026-07-21", &records, |code, _days| {
+            if code.ends_with("000001") {
+                Err("TEST_CODE quality rejected".to_string())
+            } else {
+                Ok((vec![(close_date, 12.0)], "TEST_REAL_FIXTURE".to_string()))
+            }
+        })
+        .expect("later complete record remains eligible");
+
+        assert_eq!(
+            batch.snapshot.expect("one complete snapshot").code,
+            "TEST_CODE_000002"
+        );
+        assert_eq!(batch.rejections.len(), 1);
+    }
+
+    #[test]
+    fn br140_a01_all_invalid_records_fail_with_aggregate_count() {
+        let records = vec![
+            VirtualRecordLite {
+                entry_date: "2026-07-20".to_string(),
+                code: "TEST_CODE_000001".to_string(),
+                name: "测试一".to_string(),
+                entry_mode: "观察".to_string(),
+                entry_price: 10.0,
+            },
+            VirtualRecordLite {
+                entry_date: "2026-07-20".to_string(),
+                code: "TEST_CODE_000002".to_string(),
+                name: "测试二".to_string(),
+                entry_mode: "观察".to_string(),
+                entry_price: 10.0,
+            },
+        ];
+
+        let error = build_paper_review_candidate_with("2026-07-21", &records, |code, _days| {
+            Err(format!("{code}: TEST_CODE quality rejected"))
+        })
+        .expect_err("all rejected records must fail explicitly");
+
+        assert!(error.contains("2 records rejected"));
+        assert!(error.contains("quality rejected"));
     }
 
     #[test]
