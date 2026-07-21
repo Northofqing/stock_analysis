@@ -1,4 +1,4 @@
-//! JSONL writer for event envelopes — v17.3 Task 2
+//! JSONL writer for event envelopes — v17.3 Task 2 / BR-141 ready lifecycle
 //!
 //! Persists `EventEnvelope`s to daily JSONL files under a base directory.
 //! Files are named `YYYY-MM-DD.jsonl` and rotate daily. Old files are

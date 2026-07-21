@@ -1,4 +1,5 @@
-//! BR-051/BR-136: terminal help and test aliases must not initialize production data or audit paths.
+//! BR-051/BR-136/BR-141: terminal commands must run outside the bare-service gate
+//! without initializing production data or hiding event-writer failures.
 
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};

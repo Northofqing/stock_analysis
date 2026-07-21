@@ -24,7 +24,7 @@
 - Modify: `tests/monitor_help_isolation.rs`
 - Modify: `src/bin/monitor/main.rs` tests
 
-- [ ] **Step 1: Add the failing process test**
+- [x] **Step 1: Add the failing process test**
 
 Add a test that creates an isolated working directory and database path, removes
 `MONITOR_ENABLED`, and executes:
@@ -50,7 +50,7 @@ Require status 2, output containing `[复盘] --review 终端模式启动`, and 
 not containing either `[jsonl_writer] fatal error` or `background task failed`.
 Remove the isolated directory after assertions.
 
-- [ ] **Step 2: Add the pure gate test before its implementation**
+- [x] **Step 2: Add the pure gate test before its implementation**
 
 In monitor's unit-test module, assert the intended distinction:
 
@@ -67,7 +67,7 @@ fn br141_only_bare_monitor_requires_service_enablement() {
 }
 ```
 
-- [ ] **Step 3: Run RED**
+- [x] **Step 3: Run RED**
 
 Run:
 
@@ -79,7 +79,7 @@ cargo test --bin monitor br141_only_bare_monitor_requires_service_enablement -- 
 Expected: the process test reports status 0 instead of 2, and the unit test does
 not compile because `service_enablement_required` does not exist.
 
-- [ ] **Step 4: Commit RED tests**
+- [x] **Step 4: Commit RED tests**
 
 ```bash
 git add tests/monitor_help_isolation.rs src/bin/monitor/main.rs
@@ -92,7 +92,7 @@ git commit -m "test: expose terminal monitor false success"
 - Modify: `src/event/jsonl_writer.rs`
 - Modify: `src/bin/monitor/main.rs`
 
-- [ ] **Step 1: Change `JsonlWriter::spawn` to an async ready boundary**
+- [x] **Step 1: Change `JsonlWriter::spawn` to an async ready boundary**
 
 Use this contract:
 
@@ -120,7 +120,7 @@ Rename the existing `run` loop to `consume` and remove directory creation and
 retention cleanup from that loop. Do not change record format, replay filtering,
 append behavior, or retention duration.
 
-- [ ] **Step 2: Update writer unit tests**
+- [x] **Step 2: Update writer unit tests**
 
 Every unit test must await initialization explicitly:
 
@@ -133,7 +133,7 @@ let handle = JsonlWriter::spawn(rx, dir.clone(), 7)
 Keep the existing assertions for one-envelope-per-line, replay exclusion and
 retention cleanup.
 
-- [ ] **Step 3: Remove the nested monitor task**
+- [x] **Step 3: Remove the nested monitor task**
 
 Replace the outer `tokio::spawn` with one awaited initialization:
 
@@ -154,7 +154,7 @@ let _jsonl_writer_handle = match stock_analysis::event::JsonlWriter::spawn(
 };
 ```
 
-- [ ] **Step 4: Run focused writer tests**
+- [x] **Step 4: Run focused writer tests**
 
 Run:
 
@@ -164,7 +164,7 @@ cargo test event::jsonl_writer::tests -- --test-threads=1
 
 Expected: all JSONL append, replay-filter and cleanup tests pass.
 
-- [ ] **Step 5: Commit writer lifecycle**
+- [x] **Step 5: Commit writer lifecycle**
 
 ```bash
 git add src/event/jsonl_writer.rs src/bin/monitor/main.rs
@@ -176,7 +176,7 @@ git commit -m "fix: await event writer initialization"
 **Files:**
 - Modify: `src/bin/monitor/main.rs`
 
-- [ ] **Step 1: Implement the pure predicate**
+- [x] **Step 1: Implement the pure predicate**
 
 ```rust
 fn service_enablement_required(args: &[String]) -> bool {
@@ -184,7 +184,7 @@ fn service_enablement_required(args: &[String]) -> bool {
 }
 ```
 
-- [ ] **Step 2: Evaluate the gate before runtime initialization**
+- [x] **Step 2: Evaluate the gate before runtime initialization**
 
 Immediately after test-mode setup and the side-effect-free help branch, add:
 
@@ -199,7 +199,7 @@ Delete the later unconditional `if !check_enabled() { return; }` after the
 event writer has started. Explicit CLI arguments now continue into their normal
 parser and failure path.
 
-- [ ] **Step 3: Run GREEN regression tests**
+- [x] **Step 3: Run GREEN regression tests**
 
 Run:
 
@@ -212,7 +212,7 @@ cargo test event::jsonl_writer::tests -- --test-threads=1
 Expected: all pass; the process test gets status 2 and no background writer
 failure marker.
 
-- [ ] **Step 4: Commit gate fix**
+- [x] **Step 4: Commit gate fix**
 
 ```bash
 git add src/bin/monitor/main.rs tests/monitor_help_isolation.rs
@@ -224,7 +224,7 @@ git commit -m "fix: run terminal commands outside service gate"
 **Files:**
 - Modify: this plan only to record exact final evidence.
 
-- [ ] **Step 1: Run repository gates**
+- [x] **Step 1: Run repository gates**
 
 ```bash
 cargo fmt --all -- --check
@@ -240,7 +240,13 @@ git diff --check
 Expected: every command exits 0; global coverage remains at least 80%, core at
 least 95%, and no production database is changed by validation.
 
-- [ ] **Step 2: Run the release canary without the switch**
+Evidence (2026-07-21): focused process tests 11/11 passed; JSONL writer tests
+3/3 passed; fmt, clippy, full workspace/all-target/all-feature tests, compliance,
+and release build exited 0. Production freshness was read-only and latest
+`stock_daily` was 2026-07-20 (one trading day behind). Global line coverage was
+86,295/107,267 = 80.45%; registered core coverage was 33,329/34,978 = 95.29%.
+
+- [x] **Step 2: Run the release canary without the switch**
 
 Run:
 
@@ -251,6 +257,11 @@ env -u MONITOR_ENABLED ./target/release/monitor --test --review
 Expected: exit 2 after the strict-review marker because isolated test data has no
 real account evidence; no real sink is contacted; output contains neither
 `jsonl_writer fatal error` nor `background task failed`.
+
+Evidence (2026-07-21 23:05 Asia/Shanghai): release canary entered the strict
+`--review` path with `MONITOR_ENABLED` absent, used the isolated test database,
+returned 2 for zero confirmed review delivery, and emitted neither writer-fatal
+marker. Test mode kept external notification delivery in dry-run isolation.
 
 - [ ] **Step 3: Review, PR and merge**
 
