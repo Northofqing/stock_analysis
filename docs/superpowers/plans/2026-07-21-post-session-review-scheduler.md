@@ -21,7 +21,7 @@
 **Files:**
 - Modify: `src/bin/monitor/main.rs` near `run_strict_review_only_inner` and the bottom test modules.
 
-- [ ] **Step 1: Add the failing due-gate tests**
+- [x] **Step 1: Add the failing due-gate tests**
 
 ```rust
 #[cfg(test)]
@@ -79,7 +79,7 @@ mod tests_post_session_review_scheduler {
 }
 ```
 
-- [ ] **Step 2: Run the focused test and confirm RED**
+- [x] **Step 2: Run the focused test and confirm RED**
 
 Run: `cargo test --bin monitor br139_ -- --test-threads=1`
 
@@ -91,7 +91,7 @@ Expected: compile failure because `PostSessionReviewScheduleState`, `post_sessio
 - Modify: `docs/business_rules.md`
 - Modify: `src/bin/monitor/main.rs` near strict review functions and the normal long-running branch.
 
-- [ ] **Step 1: Add the state and pure transition seam**
+- [x] **Step 1: Add the state and pure transition seam**
 
 ```rust
 #[derive(Debug, Default)]
@@ -125,7 +125,7 @@ fn finish_post_session_review_attempt(
 }
 ```
 
-- [ ] **Step 2: Add a non-exiting strict attempt and scheduler**
+- [x] **Step 2: Add a non-exiting strict attempt and scheduler**
 
 ```rust
 fn review_timeout_secs() -> u64 {
@@ -178,7 +178,7 @@ async fn post_session_review_scheduler() {
 
 Replace the duplicate environment parsing inside `run_review_only()` with `let review_timeout_secs = review_timeout_secs();`. The scheduler must call the existing `stock_analysis::calendar::is_trading_day(now.date_naive())`; do not add a weekend-only approximation.
 
-- [ ] **Step 3: Register the scheduler only in the long-running production branch**
+- [x] **Step 3: Register the scheduler only in the long-running production branch**
 
 Add beside `post_close_news_scheduler()`:
 
@@ -188,13 +188,13 @@ tokio::spawn(post_session_review_scheduler());
 
 Do not register it before terminal `--review`, `--test`, `--help`, or dry-run branches.
 
-- [ ] **Step 4: Run focused tests and confirm GREEN**
+- [x] **Step 4: Run focused tests and confirm GREEN**
 
 Run: `cargo test --bin monitor br139_ -- --test-threads=1`
 
 Expected: 3 passed, 0 failed.
 
-- [ ] **Step 5: Commit the scheduler slice**
+- [x] **Step 5: Commit the scheduler slice**
 
 ```bash
 git add docs/business_rules.md src/bin/monitor/main.rs docs/superpowers/plans/2026-07-21-post-session-review-scheduler.md
@@ -206,7 +206,7 @@ git commit -m "fix: schedule strict post-session review"
 **Files:**
 - Modify only if a gate reveals a root-cause defect in the changed paths.
 
-- [ ] **Step 1: Run formatting and lint gates**
+- [x] **Step 1: Run formatting and lint gates**
 
 Run: `cargo fmt --all -- --check`
 

@@ -3095,6 +3095,7 @@ async fn main() {
         // v13.12 (Task 12): 盘后回溯调度 — 30 min tick, 15:30 后触发持仓个股近 30 天新闻回溯
 
         tokio::spawn(post_close_news_scheduler());
+        spawn_post_session_review_scheduler();
 
         tokio::select! {
 
@@ -3142,6 +3143,14 @@ fn review_execution_path(args: &[String]) -> ReviewExecutionPath {
     ReviewExecutionPath::StrictDispatchers
 }
 
+fn review_timeout_secs() -> u64 {
+    std::env::var("MONITOR_REVIEW_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(300)
+}
+
 /// 手动复盘：`cargo run --bin monitor -- --review`
 
 async fn run_review_only() {
@@ -3159,11 +3168,7 @@ async fn run_review_only() {
 
     // 5min 后显式 exit 2 + ERROR 日志, 不推送噪声给用户.
 
-    let review_timeout_secs: u64 = std::env::var("MONITOR_REVIEW_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(300);
+    let review_timeout_secs = review_timeout_secs();
 
     log::info!(
         "[复盘] 顶层超时保护: {}s (env MONITOR_REVIEW_TIMEOUT_SECS 可覆盖)",
@@ -3217,6 +3222,92 @@ async fn run_strict_review_only_inner() -> Result<(), String> {
         return Err("严格盘后复盘没有任何成功投递；逐项失败已写 dispatcher audit".to_string());
     }
     Ok(())
+}
+
+#[derive(Debug, Default)]
+struct PostSessionReviewScheduleState {
+    completed_date: Option<chrono::NaiveDate>,
+    in_flight: bool,
+}
+
+fn post_session_review_due(
+    now: chrono::NaiveDateTime,
+    is_trading_day: bool,
+    state: &PostSessionReviewScheduleState,
+) -> bool {
+    let threshold = chrono::NaiveTime::from_hms_opt(19, 0, 0)
+        .expect("BR-139 post-session review threshold must be valid");
+    is_trading_day
+        && now.time() >= threshold
+        && state.completed_date != Some(now.date())
+        && !state.in_flight
+}
+
+fn finish_post_session_review_attempt(
+    state: &mut PostSessionReviewScheduleState,
+    date: chrono::NaiveDate,
+    result: Result<(), String>,
+) -> Result<(), String> {
+    state.in_flight = false;
+    if result.is_ok() {
+        state.completed_date = Some(date);
+    }
+    result
+}
+
+async fn attempt_post_session_review() -> Result<(), String> {
+    if !evaluate_account_mode_hook(true).await {
+        return Err("real AccountMode/banner initialization was not confirmed".to_string());
+    }
+
+    let timeout_secs = review_timeout_secs();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        run_strict_review_only_inner(),
+    )
+    .await
+    .map_err(|_| format!("strict review timed out after {timeout_secs}s"))?
+}
+
+async fn post_session_review_scheduler() {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut state = PostSessionReviewScheduleState::default();
+
+    log::info!("[复盘调度][BR-139] started threshold=19:00 interval=60s");
+
+    loop {
+        interval.tick().await;
+        let now = chrono::Local::now();
+        if !post_session_review_due(
+            now.naive_local(),
+            stock_analysis::calendar::is_trading_day(now.date_naive()),
+            &state,
+        ) {
+            continue;
+        }
+
+        state.in_flight = true;
+        let result = attempt_post_session_review().await;
+        match finish_post_session_review_attempt(&mut state, now.date_naive(), result) {
+            Ok(()) => log::info!("[复盘调度][BR-139] confirmed for date={}", now.date_naive()),
+            Err(error) => log::error!(
+                "[复盘调度][BR-139] attempt failed; retry remains eligible: {}",
+                error
+            ),
+        }
+    }
+}
+
+fn spawn_post_session_review_scheduler() {
+    tokio::spawn(async {
+        if let Err(error) = tokio::spawn(post_session_review_scheduler()).await {
+            log::error!(
+                "[复盘调度][BR-139] scheduler task terminated unexpectedly: {}",
+                error
+            );
+        }
+    });
 }
 
 /// 实际复盘子流程 (被 run_review_only 包 5min timeout).
@@ -3986,7 +4077,12 @@ async fn run_review_only_inner(isolated_test_fixtures: bool) -> Result<(), Strin
                         .block_on(
                             stock_analysis::data_provider::announcement::fetch_announcements(None),
                         )
-                        .map_err(|error| format!("R-08 公告获取失败: {error}"))?;
+                        .map_err(|error| format!("R-08 公告获取失败: {error}"))?
+                        .into_iter()
+                        .filter(
+                            stock_analysis::data_provider::announcement::announcement_is_immediate_notification_candidate,
+                        )
+                        .collect::<Vec<_>>();
 
                     let ann_text = if anns.is_empty() {
                         "今日无重大公告".to_string()
@@ -4966,6 +5062,45 @@ fn validate_announcement_watch_codes(
     Ok(registered_watch_codes.clone())
 }
 
+fn collect_announcement_watch_codes(
+    watchlist: Result<Vec<stock_analysis::portfolio::Position>, String>,
+) -> Result<std::collections::HashSet<String>, String> {
+    let codes = watchlist?
+        .into_iter()
+        .map(|position| position.code)
+        .collect();
+    validate_announcement_watch_codes(&codes)
+}
+
+type AnnouncementWatchLoadTask =
+    tokio::task::JoinHandle<Result<Vec<stock_analysis::portfolio::Position>, String>>;
+
+async fn poll_announcement_watch_load(
+    task: &mut Option<AnnouncementWatchLoadTask>,
+) -> Result<Vec<stock_analysis::portfolio::Position>, String> {
+    let Some(handle) = task.take() else {
+        return Err("BR-138 explicit watch load was not started".to_string());
+    };
+    if !handle.is_finished() {
+        *task = Some(handle);
+        return Err("BR-138 explicit watch load is still in progress".to_string());
+    }
+    handle
+        .await
+        .map_err(|error| format!("BR-138 explicit watch background task failed: {error}"))?
+}
+
+fn merge_news_monitor_codes(
+    holding_codes: Result<std::collections::HashSet<String>, String>,
+    watch_codes: Option<&std::collections::HashSet<String>>,
+) -> Result<std::collections::HashSet<String>, String> {
+    let mut codes = holding_codes?;
+    if let Some(watch_codes) = watch_codes {
+        codes.extend(watch_codes.iter().cloned());
+    }
+    Ok(codes)
+}
+
 fn load_announcement_audience_codes(
     registered_watch_codes: &std::collections::HashSet<String>,
 ) -> (std::collections::HashSet<String>, Option<String>) {
@@ -5030,6 +5165,9 @@ async fn news_monitor_loop() {
         .unwrap_or(120);
 
     log::info!("[NewsMonitor] 启动（独立窗口，不随价格扫描器静默）");
+    log::warn!(
+        "[NewsMonitor][BR-138] verified broker position batch unavailable at startup; local projection is excluded from announcement audience"
+    );
 
     let mut nm = NewsMonitor::new();
 
@@ -5050,43 +5188,6 @@ async fn news_monitor_loop() {
     // 统一在本 8:00-22:00 窗口内调度（覆盖盘前/盘中/盘后），消除「收盘即停」盲区。
 
     let mut last_opp_scan: Option<std::time::Instant> = None;
-
-    // 收集我们的标的代码（供L2概念匹配）
-
-    let our_codes: std::collections::HashSet<String> = loop {
-        match stock_analysis::portfolio::get_all_codes() {
-            Ok(codes) => {
-                let mut set: std::collections::HashSet<String> = codes.into_iter().collect();
-                for code in nm.linker_ref().registered_codes() {
-                    set.insert(code.to_string());
-                }
-                break set;
-            }
-            Err(error) => {
-                log::error!("[NewsMonitor] 标的池加载失败，60 秒后重试: {}", error);
-                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-            }
-        }
-    };
-
-    log::info!("[NewsMonitor] L2 标的池: {} 只", our_codes.len());
-
-    // BR-138: 公告即时推送只面向真实持仓和显式自选。持仓会在每轮路由前
-    // 重新读取并执行 30 秒新鲜度门；这里仅保存独立自选集合。
-    let registered_watch_codes: std::collections::HashSet<String> = loop {
-        match stock_analysis::portfolio::get_watchlist() {
-            Ok(watchlist) => {
-                break watchlist
-                    .into_iter()
-                    .map(|position| position.code)
-                    .collect()
-            }
-            Err(error) => {
-                log::error!("[NewsMonitor][BR-138] 自选池加载失败，60 秒后重试: {error}");
-                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
-            }
-        }
-    };
 
     // v17.4 §5.1 (BR-082): NewsFlashGate — critical 即时推 + 4 时段聚合 Top3
     let mut news_flash_gate =
@@ -5109,11 +5210,20 @@ async fn news_monitor_loop() {
     let policy_provider =
         stock_analysis::search_service::providers::gov_policy::GovPolicyProvider::new();
 
+    let mut announcement_watch_load: Option<AnnouncementWatchLoadTask> = None;
+
     loop {
         if !NewsMonitor::should_run() {
             tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
             continue;
         }
+
+        if announcement_watch_load.is_none() {
+            announcement_watch_load = Some(tokio::task::spawn_blocking(
+                stock_analysis::portfolio::get_watchlist,
+            ));
+        }
+
         match v17_sources::poll_policy_provider(&policy_provider, 20).await {
             Ok(report) => log::info!(
                 "[Policy][BR-137] attempted={} classified={} pushed={} skipped={} failed={}",
@@ -5143,8 +5253,43 @@ async fn news_monitor_loop() {
             }
         }
 
+        // BR-138: policy and critical flash have completed before watch
+        // readiness is inspected. An unfinished task is retained for the next
+        // tick and never awaited here.
+        let watchlist = poll_announcement_watch_load(&mut announcement_watch_load).await;
+        if let Ok(positions) = &watchlist {
+            for position in positions {
+                nm.linker_mut()
+                    .register_position(&position.code, &position.name);
+            }
+        }
+        let registered_watch_codes = collect_announcement_watch_codes(watchlist);
+        if let Err(error) = &registered_watch_codes {
+            log::error!(
+                "[NewsMonitor][BR-138] 自选池加载未就绪，本轮仅隔离公告受众/自选增量: {error}"
+            );
+        }
+
+        let holding_codes = stock_analysis::portfolio::get_positions().map(|positions| {
+            positions
+                .into_iter()
+                .map(|position| position.code)
+                .collect::<std::collections::HashSet<_>>()
+        });
+        let our_codes =
+            match merge_news_monitor_codes(holding_codes, registered_watch_codes.as_ref().ok()) {
+                Ok(codes) => {
+                    log::info!("[NewsMonitor] L2/财报标的池: {} 只", codes.len());
+                    Some(codes)
+                }
+                Err(error) => {
+                    log::error!("[NewsMonitor] 持仓标的加载失败，本轮 L2/财报子链路隔离: {error}");
+                    None
+                }
+            };
+
         // v17.7 Task 7: Poll earnings and analyst upgrades for watchlist
-        {
+        if let Some(our_codes) = &our_codes {
             let earnings_cfg = stock_analysis::config::get_monitor_config()
                 .v17_7_earnings
                 .clone();
@@ -5157,7 +5302,7 @@ async fn news_monitor_loop() {
                 poll_interval_secs: earnings_cfg.poll_interval_secs,
             };
             let report = v17_sources::poll_earnings_and_analyst(
-                &our_codes,
+                our_codes,
                 &classifier_cfg,
                 &analyst_store,
                 std::sync::Arc::clone(&last_poll_earnings),
@@ -5179,27 +5324,31 @@ async fn news_monitor_loop() {
         if last_concept_refresh.elapsed().as_secs() >= 300 {
             last_concept_refresh = std::time::Instant::now();
 
-            let codes = our_codes.clone();
+            if let Some(our_codes) = &our_codes {
+                let codes = our_codes.clone();
 
-            match tokio::task::spawn_blocking(move || {
-                // 同步HTTP在独立线程执行，不触发 runtime 冲突
+                match tokio::task::spawn_blocking(move || {
+                    // 同步HTTP在独立线程执行，不触发 runtime 冲突
 
-                stock_analysis::monitor::news_monitor::refresh_concept_index_blocking(&codes)
-            })
-            .await
-            {
-                Ok(Some(index)) => {
-                    nm.linker_mut().replace_concept_index(index);
+                    stock_analysis::monitor::news_monitor::refresh_concept_index_blocking(&codes)
+                })
+                .await
+                {
+                    Ok(Some(index)) => {
+                        nm.linker_mut().replace_concept_index(index);
 
-                    log::info!(
-                        "[NewsMonitor] L2 概念索引已更新（{}个板块关联）",
-                        nm.linker_ref().concept_count()
-                    );
+                        log::info!(
+                            "[NewsMonitor] L2 概念索引已更新（{}个板块关联）",
+                            nm.linker_ref().concept_count()
+                        );
+                    }
+
+                    Ok(None) => log::warn!("[NewsMonitor] L2 概念索引刷新跳过（无板块数据）"),
+
+                    Err(_) => log::warn!("[NewsMonitor] L2 概念索引刷新 panic"),
                 }
-
-                Ok(None) => log::warn!("[NewsMonitor] L2 概念索引刷新跳过（无板块数据）"),
-
-                Err(_) => log::warn!("[NewsMonitor] L2 概念索引刷新 panic"),
+            } else {
+                log::warn!("[NewsMonitor] L2 概念索引刷新跳过（标的来源不可用）");
             }
 
             // v41: 周期刷新 banner (让 news_monitor_loop 的 D-01/I-02 用真 AccountMode)
@@ -5211,18 +5360,26 @@ async fn news_monitor_loop() {
 
         // BR-138: 公告失败只隔离公告子链路，不得跳过同轮的产业链调度、每日重置、
         // 去重落盘或 banner 刷新。生产 provider 自身负责配置 fail-closed。
-        let announcements =
-            match stock_analysis::data_provider::announcement::fetch_announcements(None).await {
-                Ok(announcements) => Some(announcements),
-                Err(error) => {
-                    log::error!("[NewsMonitor][BR-138] 公告批次获取失败，本轮公告隔离: {error}");
-                    None
+        let announcements = match &registered_watch_codes {
+            Ok(_) => {
+                match stock_analysis::data_provider::announcement::fetch_announcements(None).await {
+                    Ok(announcements) => Some(announcements),
+                    Err(error) => {
+                        log::error!(
+                            "[NewsMonitor][BR-138] 公告批次获取失败，本轮公告隔离: {error}"
+                        );
+                        None
+                    }
                 }
-            };
+            }
+            Err(_) => None,
+        };
 
-        if let Some(anns) = announcements {
+        if let Some((anns, registered_watch_codes)) =
+            announcements.zip(registered_watch_codes.as_ref().ok())
+        {
             let (announcement_audience_codes, position_audience_error) =
-                load_announcement_audience_codes(&registered_watch_codes);
+                load_announcement_audience_codes(registered_watch_codes);
             if let Some(error) = position_audience_error {
                 log::warn!(
                     "[NewsMonitor][BR-138] {error}; 不可验证持仓身份已排除，独立自选受众继续"
@@ -5265,14 +5422,19 @@ async fn news_monitor_loop() {
             // retained only for classification failures, never as an outcome fallback.
             let announcement_route =
                 v17_sources::route_announcements(&anns, &announcement_audience_codes).await;
+            let disposition_counts = announcement_route.disposition_counts();
             log::info!(
-                "[公告][BR-137][BR-138] attempted={} classified={} pushed={} skipped={} failed={} audience={}",
+                "[公告][BR-137][BR-138] attempted={} classified={} pushed={} skipped={} failed={} audience={} disposition_pushed={} disposition_lifecycle={} disposition_audience={} disposition_failed={}",
                 announcement_route.source.attempted,
                 announcement_route.source.classified,
                 announcement_route.source.pushed,
                 announcement_route.source.skipped,
                 announcement_route.source.failed,
-                announcement_audience_codes.len()
+                announcement_audience_codes.len(),
+                disposition_counts.pushed,
+                disposition_counts.filtered_lifecycle,
+                disposition_counts.filtered_audience,
+                disposition_counts.failed
             );
 
             for event in events {
@@ -8674,6 +8836,77 @@ mod tests_v17_3_integration {
     }
 }
 
+#[cfg(test)]
+mod tests_post_session_review_scheduler {
+    use super::*;
+    use chrono::{NaiveDate, NaiveDateTime};
+
+    fn at(hour: u32, minute: u32) -> NaiveDateTime {
+        NaiveDate::from_ymd_opt(2026, 7, 21)
+            .expect("valid test date")
+            .and_hms_opt(hour, minute, 0)
+            .expect("valid test time")
+    }
+
+    #[test]
+    fn br139_review_is_due_only_after_threshold_on_a_trading_day() {
+        let state = PostSessionReviewScheduleState::default();
+        assert!(!post_session_review_due(at(18, 59), true, &state));
+        assert!(post_session_review_due(at(19, 0), true, &state));
+        assert!(!post_session_review_due(at(19, 0), false, &state));
+    }
+
+    #[test]
+    fn br139_completed_or_in_flight_review_is_not_due() {
+        let date = at(19, 0).date();
+        let mut state = PostSessionReviewScheduleState {
+            completed_date: Some(date),
+            in_flight: false,
+        };
+        assert!(!post_session_review_due(at(19, 1), true, &state));
+
+        state.completed_date = None;
+        state.in_flight = true;
+        assert!(!post_session_review_due(at(19, 1), true, &state));
+    }
+
+    #[test]
+    fn br139_only_confirmed_attempt_commits_completion() {
+        let date = at(19, 0).date();
+        let mut state = PostSessionReviewScheduleState {
+            completed_date: None,
+            in_flight: true,
+        };
+        let _ = finish_post_session_review_attempt(
+            &mut state,
+            date,
+            Err("TEST_CODE sink failed".to_string()),
+        );
+        assert_eq!(state.completed_date, None);
+        assert!(!state.in_flight);
+
+        state.in_flight = true;
+        finish_post_session_review_attempt(&mut state, date, Ok(()))
+            .expect("confirmed attempt commits completion");
+        assert_eq!(state.completed_date, Some(date));
+        assert!(!state.in_flight);
+    }
+
+    #[test]
+    fn br139_long_running_branch_starts_review_scheduler() {
+        let source = include_str!("main.rs");
+        let production_wiring = concat!(
+            "tokio::spawn(post_close_news_scheduler());\n",
+            "        spawn_post_session_review_scheduler();"
+        );
+        assert_eq!(
+            source.matches(production_wiring).count(),
+            1,
+            "the long-running branch must start both post-close schedulers exactly once"
+        );
+    }
+}
+
 // ========================================================================
 // v17.7 Task 6 Step 1: Announcement routing duplicate-prevention test
 // ========================================================================
@@ -8696,6 +8929,54 @@ mod tests_v17_7_announcement_wiring {
     fn br138_watch_audience_rejects_blank_codes() {
         let watch = std::collections::HashSet::from(["".to_string()]);
         assert!(validate_announcement_watch_codes(&watch).is_err());
+    }
+
+    #[test]
+    fn br138_watch_load_failure_remains_explicit_instead_of_empty_audience() {
+        let result = collect_announcement_watch_codes(Err(
+            "TEST_CODE explicit watch source unavailable".to_string(),
+        ));
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn br138_unfinished_watch_load_is_never_awaited_by_outer_tick() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut task = Some(tokio::task::spawn_blocking(move || {
+            release_rx
+                .recv()
+                .expect("test controls completion of the background watch load");
+            Err("TEST_CODE watch source unavailable".to_string())
+        }));
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            poll_announcement_watch_load(&mut task),
+        )
+        .await
+        .expect("an unfinished watch load must return immediately");
+        assert!(result
+            .expect_err("pending watch load is explicit")
+            .contains("in progress"));
+
+        release_tx.send(()).expect("release background test task");
+        let _ = task
+            .take()
+            .expect("unfinished task remains owned by the next tick")
+            .await;
+    }
+
+    #[test]
+    fn br138_watch_failure_does_not_remove_independent_holding_news_codes() {
+        let holding_codes = Ok(std::collections::HashSet::from([
+            "TEST_CODE_HOLDING".to_string()
+        ]));
+        let watch_codes: Result<std::collections::HashSet<String>, String> =
+            Err("TEST_CODE watch source unavailable".to_string());
+
+        let news_codes = merge_news_monitor_codes(holding_codes, watch_codes.as_ref().ok())
+            .expect("independent holding source remains usable");
+        assert!(news_codes.contains("TEST_CODE_HOLDING"));
     }
 
     #[test]

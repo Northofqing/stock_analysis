@@ -1471,6 +1471,17 @@ pub fn build_event_calendar_macro_summary(
     if anns.is_empty() {
         return "今日公告批次成功返回 0 条".to_string();
     }
+    let immediate: Vec<&Announcement> = anns
+        .iter()
+        .filter(|announcement| {
+            stock_analysis::data_provider::announcement::announcement_is_immediate_notification_candidate(
+                announcement,
+            )
+        })
+        .collect();
+    if immediate.is_empty() {
+        return "今日可即时通知公告 0 条（本地生命周期证据已隔离）".to_string();
+    }
     let fmt = |a: &Announcement| -> String {
         let disp = if a.name.is_empty() {
             a.code.clone()
@@ -1479,15 +1490,17 @@ pub fn build_event_calendar_macro_summary(
         };
         format!("· {} ({:?}): {}", disp, a.level, a.title)
     };
-    let held: Vec<&Announcement> = anns
+    let held: Vec<&Announcement> = immediate
         .iter()
+        .copied()
         .filter(|a| holding_codes.contains(&a.code))
         .collect();
-    let other: Vec<&Announcement> = anns
+    let other: Vec<&Announcement> = immediate
         .iter()
+        .copied()
         .filter(|a| !holding_codes.contains(&a.code))
         .collect();
-    let mut s = format!("今日共 {} 条公告", anns.len());
+    let mut s = format!("今日共 {} 条公告", immediate.len());
     if held.is_empty() {
         s.push_str("\n持仓相关: 无");
     } else {
@@ -5626,7 +5639,12 @@ pub async fn dispatch_r02_review_market_real(_date: &str, _banner: &BannerCtx) -
 pub async fn dispatch_r08_event_calendar_real(date: &str, _banner: &BannerCtx) -> bool {
     // 1. 拉今日全市场公告 (真实数据)
     let anns = match stock_analysis::data_provider::announcement::fetch_announcements(None).await {
-        Ok(announcements) => announcements,
+        Ok(announcements) => announcements
+            .into_iter()
+            .filter(
+                stock_analysis::data_provider::announcement::announcement_is_immediate_notification_candidate,
+            )
+            .collect::<Vec<_>>(),
         Err(error) => {
             let reason = format!("公告数据源失败: {error}");
             log::error!("[R-08][BR-110] {reason}");
@@ -13057,6 +13075,12 @@ mod tests {
             ),
             announcement("TEST_CODE_000003", "测试三", "其他公告3", AnnLevel::Info),
             announcement("TEST_CODE_000004", "测试四", "其他公告4", AnnLevel::Info),
+            announcement(
+                "TEST_CODE_000005",
+                "测试本地",
+                "关于注销部分回购股份并减少注册资本通知债权人的公告",
+                AnnLevel::Skip,
+            ),
         ];
         let held = std::collections::HashSet::from(["TEST_CODE_600000".to_string()]);
         let summary = build_event_calendar_macro_summary(&rows, &held);
@@ -13066,6 +13090,8 @@ mod tests {
         assert!(summary.contains("TEST_CODE_000001 (Info): 其他公告1"));
         assert!(summary.contains("非持仓 (TOP 3)"));
         assert!(!summary.contains("其他公告4"));
+        assert!(!summary.contains("测试本地"));
+        assert!(!summary.contains("通知债权人"));
     }
 
     #[test]

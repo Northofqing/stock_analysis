@@ -359,6 +359,14 @@ pub fn announcement_title_is_immediately_actionable(title: &str) -> bool {
     !creditor_procedure && !reduction_completed
 }
 
+/// BR-138 consumer gate: local lifecycle evidence remains available to the
+/// normalized route for typed accounting, but every notification/rendering
+/// consumer must exclude it.
+pub fn announcement_is_immediate_notification_candidate(announcement: &Announcement) -> bool {
+    !matches!(announcement.level, AnnLevel::Skip)
+        && announcement_title_is_immediately_actionable(&announcement.title)
+}
+
 enum KwList<'a> {
     Static(&'a [&'a str]),
     Owned(&'a [String]),
@@ -559,6 +567,7 @@ fn detail_art_codes(
     keywords: Option<&crate::config::AnnounceKeywordsFile>,
 ) -> Vec<String> {
     list.iter()
+        .filter(|item| announcement_title_is_immediately_actionable(&item.title))
         .filter_map(|item| {
             let (level, _) = classify_title_with_keywords(&item.title, "", "", keywords);
             matches!(level, AnnLevel::Emergency | AnnLevel::Important)
@@ -578,13 +587,22 @@ fn assemble_announcements(
             .codes
             .first()
             .expect("announcement stock evidence was validated");
-        let (level, reason) = classify_title_with_keywords(
+        let lifecycle_only = !announcement_title_is_immediately_actionable(&item.title);
+        let (classified_level, classified_reason) = classify_title_with_keywords(
             &item.title,
             &stock.stock_code,
             &stock.short_name,
             keywords,
         );
-        if matches!(level, AnnLevel::Skip) {
+        let (level, reason) = if lifecycle_only {
+            (
+                AnnLevel::Skip,
+                "BR-138 lifecycle-only local evidence".to_string(),
+            )
+        } else {
+            (classified_level, classified_reason)
+        };
+        if matches!(level, AnnLevel::Skip) && !lifecycle_only {
             continue;
         }
 
@@ -596,14 +614,15 @@ fn assemble_announcements(
             .unwrap_or("")
             .to_string();
         let art_code = item.art_code.clone();
-        let content = if matches!(level, AnnLevel::Emergency | AnnLevel::Important) {
-            detail_map
-                .get(&art_code)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("公告 {art_code} 正文批次缺失"))?
-        } else {
-            String::new()
-        };
+        let content =
+            if !lifecycle_only && matches!(level, AnnLevel::Emergency | AnnLevel::Important) {
+                detail_map
+                    .get(&art_code)
+                    .cloned()
+                    .ok_or_else(|| anyhow::anyhow!("公告 {art_code} 正文批次缺失"))?
+            } else {
+                String::new()
+            };
 
         results.push(Announcement {
             code: stock.stock_code.clone(),
@@ -703,7 +722,10 @@ async fn fetch_announcements_from_urls(
 
     let results = assemble_announcements(list, &detail_map, keywords)?;
 
-    info!("[公告] 过滤后 {} 条需告警", results.len());
+    info!(
+        "[公告][BR-138] 过滤后 {} 条需处理（含本地生命周期证据）",
+        results.len()
+    );
     crate::monitor::data_mode::mark_capability_success(crate::monitor::data_mode::Capability::News)
         .map_err(anyhow::Error::msg)?;
     Ok(results)
@@ -1036,6 +1058,41 @@ mod tests {
         assert!(announcement_title_is_immediately_actionable(
             "控股股东拟减持股份的预披露公告"
         ));
+    }
+
+    #[test]
+    fn br138_lifecycle_only_row_survives_assembly_without_detail() {
+        let list = validated(
+            r#"{
+                "data": {
+                    "list": [{
+                        "art_code": "TEST_CODE_LIFECYCLE_ARTICLE",
+                        "title": "关于注销部分回购股份并减少注册资本通知债权人的公告",
+                        "notice_date": "2026-07-21",
+                        "codes": [{
+                            "stock_code": "000001",
+                            "short_name": "TEST_CODE_协议公司"
+                        }],
+                        "columns": null
+                    }]
+                }
+            }"#,
+        )
+        .expect("complete lifecycle provider row");
+
+        assert!(detail_art_codes(&list, None).is_empty());
+        let announcements = assemble_announcements(list, &std::collections::HashMap::new(), None)
+            .expect("lifecycle row remains local provider evidence");
+        assert_eq!(announcements.len(), 1);
+        assert_eq!(announcements[0].level, AnnLevel::Skip);
+        assert!(!announcement_is_immediate_notification_candidate(
+            &announcements[0]
+        ));
+        assert!(announcements[0].content.is_empty());
+        assert_eq!(
+            announcements[0].external_id.as_deref(),
+            Some("TEST_CODE_LIFECYCLE_ARTICLE")
+        );
     }
 
     #[test]

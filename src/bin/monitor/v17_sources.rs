@@ -120,6 +120,14 @@ pub enum AnnouncementDisposition {
     Failed,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct AnnouncementDispositionCounts {
+    pub pushed: usize,
+    pub filtered_lifecycle: usize,
+    pub filtered_audience: usize,
+    pub failed: usize,
+}
+
 #[derive(Debug, Default)]
 pub struct AnnouncementSourceRouteReport {
     pub source: SourcePollReport,
@@ -132,6 +140,19 @@ pub struct AnnouncementSourceRouteReport {
 impl AnnouncementSourceRouteReport {
     pub fn disposition(&self, external_id: &str) -> Option<AnnouncementDisposition> {
         self.dispositions.get(external_id).copied()
+    }
+
+    pub fn disposition_counts(&self) -> AnnouncementDispositionCounts {
+        let mut counts = AnnouncementDispositionCounts::default();
+        for disposition in self.dispositions.values() {
+            match disposition {
+                AnnouncementDisposition::Pushed => counts.pushed += 1,
+                AnnouncementDisposition::FilteredLifecycle => counts.filtered_lifecycle += 1,
+                AnnouncementDisposition::FilteredAudience => counts.filtered_audience += 1,
+                AnnouncementDisposition::Failed => counts.failed += 1,
+            }
+        }
+        counts
     }
 }
 
@@ -165,18 +186,10 @@ pub async fn route_announcements(
             );
             continue;
         };
-        let event = match classify_announcement(announcement) {
-            Ok(event) => event,
-            Err(error) => {
-                routed.source.skipped += 1;
-                log::warn!("[v17.7][BR-137] announcement classification rejected: reason={error}");
-                continue;
-            }
-        };
-        routed.source.classified += 1;
         if !stock_analysis::data_provider::announcement::announcement_title_is_immediately_actionable(
             &announcement.title,
         ) {
+            routed.source.classified += 1;
             routed.source.skipped += 1;
             routed.dispositions.insert(
                 external_id.to_string(),
@@ -187,6 +200,15 @@ pub async fn route_announcements(
             );
             continue;
         }
+        let event = match classify_announcement(announcement) {
+            Ok(event) => event,
+            Err(error) => {
+                routed.source.skipped += 1;
+                log::warn!("[v17.7][BR-137] announcement classification rejected: reason={error}");
+                continue;
+            }
+        };
+        routed.source.classified += 1;
         if !eligible_codes.contains(&announcement.code) {
             routed.source.skipped += 1;
             routed.dispositions.insert(
@@ -899,6 +921,8 @@ mod tests {
         let eligible = HashSet::from([code.to_string()]);
         let mut announcement = br138_important_announcement("TEST_CODE_LIFECYCLE_EXTERNAL", code);
         announcement.title = "关于注销部分回购股份并减少注册资本通知债权人的公告".to_string();
+        announcement.level = stock_analysis::data_provider::announcement::AnnLevel::Skip;
+        announcement.content.clear();
 
         let report = route_announcements(&[announcement], &eligible).await;
 
@@ -909,6 +933,33 @@ mod tests {
             report.dispositions.get("TEST_CODE_LIFECYCLE_EXTERNAL"),
             Some(&AnnouncementDisposition::FilteredLifecycle)
         );
+    }
+
+    #[test]
+    fn br138_disposition_counts_are_explicit_for_canary_evidence() {
+        let mut report = AnnouncementSourceRouteReport::default();
+        report.dispositions.insert(
+            "TEST_CODE_PUSHED".to_string(),
+            AnnouncementDisposition::Pushed,
+        );
+        report.dispositions.insert(
+            "TEST_CODE_LIFECYCLE".to_string(),
+            AnnouncementDisposition::FilteredLifecycle,
+        );
+        report.dispositions.insert(
+            "TEST_CODE_AUDIENCE".to_string(),
+            AnnouncementDisposition::FilteredAudience,
+        );
+        report.dispositions.insert(
+            "TEST_CODE_FAILED".to_string(),
+            AnnouncementDisposition::Failed,
+        );
+
+        let counts = report.disposition_counts();
+        assert_eq!(counts.pushed, 1);
+        assert_eq!(counts.filtered_lifecycle, 1);
+        assert_eq!(counts.filtered_audience, 1);
+        assert_eq!(counts.failed, 1);
     }
 
     #[tokio::test]

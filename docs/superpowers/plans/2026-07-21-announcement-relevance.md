@@ -174,7 +174,8 @@ async fn br138_off_universe_announcement_is_handled_without_push() {
     )], &eligible).await;
     assert_eq!(report.source.pushed, 0);
     assert_eq!(report.source.skipped, 1);
-    assert!(report.handled_external_ids.contains("TEST_CODE_EXTERNAL"));
+    assert_eq!(report.disposition("TEST_CODE_EXTERNAL"),
+               Some(AnnouncementDisposition::FilteredAudience));
 }
 
 #[tokio::test]
@@ -184,7 +185,8 @@ async fn br138_eligible_actionable_announcement_still_reaches_governance() {
         "TEST_CODE_ALLOWED_EXTERNAL", "TEST_CODE_ALLOWED", "重大监管问询公告"
     )], &eligible).await;
     assert_eq!(report.source.classified, 1);
-    assert!(report.handled_external_ids.contains("TEST_CODE_ALLOWED_EXTERNAL"));
+    assert_eq!(report.disposition("TEST_CODE_ALLOWED_EXTERNAL"),
+               Some(AnnouncementDisposition::Pushed));
 }
 ```
 
@@ -195,9 +197,11 @@ Expected: compile failure because the router lacks the eligible-universe paramet
 
 - [ ] **Step 3: Implement audience/lifecycle ownership**
 
-Rename `normalized_external_ids` to `handled_external_ids`. After successful classification, insert
-the external ID before relevance checks. Increment `skipped` and continue when the title predicate is
-false or the code is absent from `eligible_codes`; never call `push_normalized_event` for those rows.
+Return `AnnouncementDisposition` by external ID. Increment `skipped` and record
+`FilteredLifecycle` before normal classification for a retained local-only lifecycle row; record
+`FilteredAudience` when the code is absent from `eligible_codes`; never call
+`push_normalized_event` for either. Record `Pushed` only for confirmed delivery and `Failed` for any
+other normalized outcome.
 
 ```rust
 pub async fn route_announcements(
@@ -214,6 +218,14 @@ trigger set only for `Pushed`. Do not apply this gate to policy or critical flas
 Add a RED test proving a fresh local `stock_position.updated_at` cannot authorize a holding, and a
 RED test proving lifecycle/off-universe dispositions cannot make the outer-loop important-event gate
 true. Keep positive controls for explicit watch membership and normalized `Pushed` outcomes.
+
+Add a provider RED test proving the creditor-notice example survives assembly as `Skip` local
+evidence and a loop-isolation RED test proving watch-load failure does not prevent unrelated outer
+work. Use at most one outer-loop-owned background watch load, never await it while unfinished, run
+policy/critical flash first, and continue holding-derived earnings/L2 when the watch result is absent.
+Add consumer RED tests proving the provider-retained `Skip` row cannot enter NewsMonitor,
+NewsAggregator, either R-08 path, or event-calendar rendering. Log the first failure immediately and
+expose per-disposition aggregate counts for live canary evidence.
 
 - [ ] **Step 4: Update all existing router tests/callers and run monitor tests**
 
@@ -263,5 +275,5 @@ master artifact.
 - [ ] **Step 4: Verify the live selection contract**
 
 From a new local-log line baseline, record aggregate counts only. Required evidence: no panic/fatal,
-no `banner unavailable`, BR-138 filtered counts are visible, handled low-value events do not reach a
+no `banner unavailable`, BR-138 typed disposition counts are visible, handled low-value events do not reach a
 Pushed outcome, and eligible real source facts can still reach normal governance.

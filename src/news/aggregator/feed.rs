@@ -331,6 +331,47 @@ impl NewsFeed for MiitFeed {
 // ============================================================================
 
 pub struct EmAnnouncementFeed;
+
+fn announcement_to_market_event(
+    announcement: &crate::data_provider::announcement::Announcement,
+    observed_at: chrono::DateTime<Local>,
+) -> Option<MarketEvent> {
+    if !crate::data_provider::announcement::announcement_is_immediate_notification_candidate(
+        announcement,
+    ) {
+        return None;
+    }
+    let (occurred_at, stale) = source_time_and_stale(Some(&announcement.date), observed_at);
+    let simhash = {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        announcement.code.hash(&mut hasher);
+        announcement.title.hash(&mut hasher);
+        hasher.finish()
+    };
+    Some(MarketEvent {
+        event_id: format!("earnings-{:x}", simhash),
+        simhash,
+        full_title: announcement.title.clone(),
+        event_type: EventType::Announcement,
+        subject: announcement.code.clone(),
+        object: Some(announcement.code.clone()),
+        direction: Direction::Neutral,
+        strength: 70,
+        certainty: 80,
+        chains: vec![],
+        occurred_at,
+        provenance: vec![SourceRef {
+            provider: "em_announcement".to_string(),
+            url: announcement.url.clone(),
+            fetched_at: observed_at,
+        }],
+        ai_degraded: false,
+        stale,
+    })
+}
+
 #[async_trait]
 impl NewsFeed for EmAnnouncementFeed {
     fn name(&self) -> &str {
@@ -348,40 +389,14 @@ impl NewsFeed for EmAnnouncementFeed {
             return Ok(vec![]);
         }
         let now = Utc::now().with_timezone(&Local);
-        Ok(anns
+        let events = anns
             .iter()
-            .map(|a| {
-                let (occurred_at, stale) = source_time_and_stale(Some(&a.date), now);
-                let simhash = {
-                    use std::collections::hash_map::DefaultHasher;
-                    use std::hash::{Hash, Hasher};
-                    let mut h = DefaultHasher::new();
-                    a.code.hash(&mut h);
-                    a.title.hash(&mut h);
-                    h.finish()
-                };
-                MarketEvent {
-                    event_id: format!("earnings-{:x}", simhash),
-                    simhash,
-                    full_title: a.title.clone(),
-                    event_type: EventType::Announcement, // truthful category
-                    subject: a.code.clone(),
-                    object: Some(a.code.clone()),
-                    direction: Direction::Neutral,
-                    strength: 70,
-                    certainty: 80,
-                    chains: vec![],
-                    occurred_at,
-                    provenance: vec![SourceRef {
-                        provider: "em_announcement".to_string(),
-                        url: a.url.clone(),
-                        fetched_at: now,
-                    }],
-                    ai_degraded: false,
-                    stale,
-                }
-            })
-            .collect())
+            .filter_map(|announcement| announcement_to_market_event(announcement, now))
+            .collect::<Vec<_>>();
+        if events.is_empty() {
+            log::info!("[EmAnnouncementFeed][BR-138] only local lifecycle evidence this cycle");
+        }
+        Ok(events)
     }
 }
 
@@ -482,6 +497,24 @@ pub fn take_all_for_aggregator() -> Vec<Arc<dyn NewsFeed>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn br138_local_only_announcement_never_becomes_market_event() {
+        let announcement = crate::data_provider::announcement::Announcement {
+            code: "TEST_CODE_000001".into(),
+            name: "TEST_CODE_本地证据公司".into(),
+            title: "关于注销部分回购股份并减少注册资本通知债权人的公告".into(),
+            date: Local::now().format("%Y-%m-%d").to_string(),
+            summary: String::new(),
+            content: String::new(),
+            level: crate::data_provider::announcement::AnnLevel::Skip,
+            reason: "BR-138 lifecycle-only local evidence".into(),
+            external_id: Some("TEST_CODE_LOCAL_ONLY".into()),
+            url: Some("https://example.invalid/TEST_CODE_LOCAL_ONLY".into()),
+        };
+
+        assert!(announcement_to_market_event(&announcement, Local::now()).is_none());
+    }
 
     #[test]
     fn search_result_adapter_preserves_direction_identity_url_and_strength_bounds() {

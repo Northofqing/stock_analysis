@@ -41,7 +41,7 @@ without weakening provenance, freshness, governance, audit, or sink requirements
 ```text
 Eastmoney announcement batch
   -> complete provider-field and publication-date validation
-  -> existing title classification
+  -> existing title classification OR explicit lifecycle-only local retention
   -> lifecycle-value filter
   -> fresh real holding / explicit watch-universe membership
   -> normalized BR-137 evidence
@@ -80,7 +80,9 @@ An announcement is eligible for immediate BR-137 delivery only when all of the f
 4. the title is not a reduction-plan completion, expiry, or completed-implementation notice.
 
 The two lifecycle exclusions change notification urgency only. The real provider item remains in
-local processing/audit statistics. New reduction plans, controlling-shareholder risk, regulatory
+local processing/audit statistics even when it does not match the configured notification keyword
+vocabulary; provider assembly retains it as non-pushable `Skip` evidence until the route assigns
+`FilteredLifecycle`. New reduction plans, controlling-shareholder risk, regulatory
 actions, earnings events, and emergency announcements for an eligible code retain their existing
 classification and governance.
 
@@ -94,6 +96,11 @@ universe gate.
   available only for isolated protocol tests.
 - `announcement_title_is_immediately_actionable(&str) -> bool` contains only the registered
   lifecycle exclusions and is deterministic.
+- `announcement_is_immediate_notification_candidate(&Announcement) -> bool` is the shared consumer
+  gate. NewsMonitor, NewsAggregator, R-08 summaries/holding events, and future renderers must apply it;
+  only the normalized route consumes `LocalOnly/Skip` rows for `FilteredLifecycle` accounting.
+- Provider assembly retains a lifecycle-only row even when ordinary keyword classification is
+  `Skip`; it does not fetch risk detail for that row and never upgrades it to notification-eligible.
 - `route_announcements(&[Announcement], &HashSet<String>)` receives the real eligible universe
   explicitly; it does not query account state or Banner internally.
 - A verified position-audience component requires immutable broker provider/batch identity and a
@@ -120,11 +127,22 @@ universe gate.
 - Configuration, transport, audience, or name-resolution failure is isolated to the announcement
   sub-chain. The outer news loop must still run its unrelated scheduler, daily reset, state flush,
   banner refresh, and common sleep.
+- Explicit-watch loading is attempted by one outer-loop-owned background task at a time. Policy and
+  critical flash run before its readiness is inspected; an unfinished task is never awaited. A
+  missing/failed watch result closes only the announcement audience and optional watch increment,
+  while the independently loaded holding code pool still drives earnings/analyst and L2 work.
+  Its first failure is logged during startup/first tick.
+- Each route aggregate reports counts for Pushed, FilteredLifecycle, FilteredAudience, and Failed so
+  a live canary can verify selection without logging bodies, account values, or security identities.
 
 ## 8. Validation
 
 - Parsing the repository `chain.toml` yields the exact configured announcement lists.
 - A procedural capital-reduction creditor notice is not immediately actionable.
+- The same creditor notice survives provider assembly as local-only evidence and reaches the route's
+  `FilteredLifecycle` disposition without requiring a risk-detail request.
+- NewsMonitor, NewsAggregator, both R-08 paths, and the event-calendar summary cannot render or push
+  that local-only row.
 - A reduction-plan expiry/completion notice is not immediately actionable.
 - A valid important announcement outside the eligible universe is skipped and cannot fall through to
   legacy delivery.
@@ -133,6 +151,9 @@ universe gate.
   broker batch evidence, only explicit watch codes form the audience.
 - Typed filtered dispositions suppress both legacy fallback and D-01/I-02 downstream triggers;
   only `Pushed` remains downstream-eligible.
+- A pending or failed explicit-watch background load returns immediately, leaves policy/critical
+  flash/holding earnings/L2/reset/flush scheduling runnable, and retries only the announcement
+  audience/watch increment on a later outer-loop tick.
 - Policy and critical flash behavior is unchanged.
 - Full formatting, strict Clippy, workspace tests, compliance, coverage, release build, and an
   independent review pass before merge.
