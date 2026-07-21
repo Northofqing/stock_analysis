@@ -8,6 +8,8 @@
 
 **Tech Stack:** Rust, Tokio interval/timeout, chrono local trading calendar, existing monitor push governance and Rust unit tests.
 
+> **BR-140 supersession:** 本计划最初的整日 `completed_date` 已由逐任务状态替代；实现与验收以 `2026-07-21-post-session-review-partial-evidence.md` 为准。
+
 ---
 
 ## File Map

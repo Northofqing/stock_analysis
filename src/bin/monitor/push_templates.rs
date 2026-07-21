@@ -5412,47 +5412,114 @@ pub fn load_catalyst_review_snapshot_real(date: &str) -> Result<CatalystReviewSn
 /// B-005-C 统一入口 — 由 BR-139 独立 scheduler 在交易日 19:00 后调用.
 /// 不依赖 --push 命令行模式, 让生产 monitor 自动出盘后报告.
 /// 各 R-series dispatcher 内部分别走自己的数据源，并逐项记录成功/失败。
-/// 返回值表示本批次是否至少成功推送一份报告，不把全失败伪装为成功（BR-110）。
-pub async fn dispatch_post_session_review(date: &str, hhmm: &str, banner: &BannerCtx) -> bool {
+/// BR-140 返回逐任务强类型结果；等待、禁用与失败均不得冒充投递成功。
+pub async fn dispatch_post_session_review(
+    date: &str,
+    now: chrono::NaiveTime,
+    banner: &BannerCtx,
+    due: &std::collections::BTreeSet<crate::review_batch::ReviewTask>,
+) -> crate::review_batch::ReviewBatchOutcome {
+    use crate::review_batch::{
+        review_preflight, ReviewBatchOutcome, ReviewTask, ReviewTaskOutcome,
+    };
+
     log::info!("[B-005-C] 盘后批量 dispatcher 开始 ({})", date);
 
-    // CR-29 (review): 8 个 sub-dispatcher 改 tokio::join! 并行.
-    // 之前: 6 个 HTTP + 2 个 DB 顺序 await, 19:00 批次 wall-time ~10-15s
-    // 现在: 全部并行, 19:00 批次 wall-time ~max(单次 HTTP) ≈ 100-500ms
-    // 限制: 8 个 dispatcher 都用 notify::push_governor 走 reqwest::Client (parallel-safe)
-    let (r02, r03, r04, r05, r06, r08, a10, a01) = tokio::join!(
-        dispatch_r02_review_market_real(date, banner),
-        dispatch_r03_industry_chain_real(date, banner),
-        dispatch_r04_lhb_real(date, banner),
-        dispatch_r05_signal_review_real(date, banner),
-        dispatch_r06_failure_real(date, banner),
-        dispatch_r08_event_calendar_real(date, banner),
-        dispatch_catalyst_review_daily(date),
-        dispatch_paper_review_daily(date),
+    fn from_bool(task: ReviewTask, delivered: bool) -> (ReviewTask, ReviewTaskOutcome) {
+        let outcome = if delivered {
+            ReviewTaskOutcome::delivered(1)
+        } else {
+            ReviewTaskOutcome::failed(
+                true,
+                "dispatcher did not confirm delivery; see BR-110 task audit",
+            )
+        };
+        (task, outcome)
+    }
+
+    let preflight = review_preflight(now, due);
+    let runnable = preflight.runnable;
+    let (r03, r04, r08, a10, a01) = tokio::join!(
+        async {
+            if runnable.contains(&ReviewTask::R03) {
+                Some(from_bool(
+                    ReviewTask::R03,
+                    dispatch_r03_industry_chain_real(date, banner).await,
+                ))
+            } else {
+                None
+            }
+        },
+        async {
+            if runnable.contains(&ReviewTask::R04) {
+                Some(from_bool(
+                    ReviewTask::R04,
+                    dispatch_r04_lhb_real(date, banner).await,
+                ))
+            } else {
+                None
+            }
+        },
+        async {
+            if runnable.contains(&ReviewTask::R08) {
+                Some(from_bool(
+                    ReviewTask::R08,
+                    dispatch_r08_event_calendar_real(date, banner).await,
+                ))
+            } else {
+                None
+            }
+        },
+        async {
+            if runnable.contains(&ReviewTask::A10) {
+                Some(from_bool(
+                    ReviewTask::A10,
+                    dispatch_catalyst_review_daily(date).await,
+                ))
+            } else {
+                None
+            }
+        },
+        async {
+            if runnable.contains(&ReviewTask::A01) {
+                Some(from_bool(
+                    ReviewTask::A01,
+                    dispatch_paper_review_daily(date).await,
+                ))
+            } else {
+                None
+            }
+        },
     );
-    let results = [
-        ("R-02", r02),
-        ("R-03", r03),
-        ("R-04", r04),
-        ("R-05", r05),
-        ("R-06", r06),
-        ("R-08", r08),
-        ("A-10", a10),
-        ("A-01", a01),
-    ];
-    let pushed = results.iter().filter(|(_, ok)| *ok).count();
-    let failed: Vec<&str> = results
+    let mut tasks = preflight.outcomes;
+    for outcome in [r03, r04, r08, a10, a01].into_iter().flatten() {
+        tasks.push(outcome);
+    }
+    tasks.sort_by_key(|(task, _)| *task);
+    let batch = ReviewBatchOutcome::new(tasks);
+    let delivered = batch.delivered_count();
+    let waiting = batch.waiting_tasks();
+    let disabled = batch.disabled_tasks();
+    let failed = batch.failed_tasks();
+    let no_data = batch
+        .tasks
         .iter()
-        .filter_map(|(name, ok)| (!ok).then_some(*name))
-        .collect();
+        .filter(|(_, outcome)| matches!(outcome, ReviewTaskOutcome::NoData { .. }))
+        .count();
     log::info!(
-        "[B-005-C][BR-110] 盘后批量 dispatcher 完成 time={} pushed={}/{} failed={:?}",
-        hhmm,
-        pushed,
-        results.len(),
-        failed
+        "[B-005-C][BR-110][BR-140] 完成 time={} attempted={} delivered={} no_data={} waiting={} disabled={} failed={} waiting_tasks={:?} disabled_tasks={:?} failed_tasks={:?}",
+        now.format("%H:%M"),
+        batch.tasks.len(),
+        delivered,
+        no_data,
+        waiting.len(),
+        disabled.len(),
+        failed.len(),
+        waiting.iter().map(|task| task.label()).collect::<Vec<_>>(),
+        disabled.iter().map(|task| task.label()).collect::<Vec<_>>(),
+        failed.iter().map(|task| task.label()).collect::<Vec<_>>(),
     );
-    pushed > 0
+    batch
 }
 
 /// --test/--review 全模板覆盖范围

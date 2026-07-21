@@ -3179,18 +3179,25 @@ async fn run_review_only() {
 
     let review_start = std::time::Instant::now();
 
+    let due: std::collections::BTreeSet<_> = review_batch::ReviewTask::ALL.into_iter().collect();
     let outcome = tokio::time::timeout(
         std::time::Duration::from_secs(review_timeout_secs),
-        run_strict_review_only_inner(),
+        run_strict_review_only_inner(&due),
     )
     .await;
 
     match outcome {
-        Ok(Ok(())) => {
+        Ok(Ok(batch)) if batch.has_confirmed_delivery() => {
             log::info!(
                 "[复盘] ======== 盘后分析完成 ({}s) ========",
                 review_start.elapsed().as_secs()
             );
+        }
+
+        Ok(Ok(_batch)) => {
+            log::error!("[复盘][BR-140] 严格盘后复盘没有任何确认投递；逐任务状态已写审计. exit 2.");
+            log::logger().flush();
+            std::process::exit(2);
         }
 
         Ok(Err(error)) => {
@@ -3215,15 +3222,13 @@ async fn run_review_only() {
 /// BR-108/109/110: production `--review` may only use the verified shared
 /// banner and the strict post-session dispatchers. The legacy inline review
 /// below remains reachable only from the TEST_CODE E2E fixture.
-async fn run_strict_review_only_inner() -> Result<(), String> {
+async fn run_strict_review_only_inner(
+    due: &std::collections::BTreeSet<review_batch::ReviewTask>,
+) -> Result<review_batch::ReviewBatchOutcome, String> {
     let banner = current_banner()?;
     let now = chrono::Local::now();
     let date = now.format("%Y-%m-%d").to_string();
-    let hhmm = now.format("%H:%M").to_string();
-    if !push_templates::dispatch_post_session_review(&date, &hhmm, &banner).await {
-        return Err("严格盘后复盘没有任何成功投递；逐项失败已写 dispatcher audit".to_string());
-    }
-    Ok(())
+    Ok(push_templates::dispatch_post_session_review(&date, now.time(), &banner, due).await)
 }
 
 fn filter_inline_r08_announcements(
@@ -3237,38 +3242,15 @@ fn filter_inline_r08_announcements(
         .collect()
 }
 
-#[derive(Debug, Default)]
-struct PostSessionReviewScheduleState {
-    completed_date: Option<chrono::NaiveDate>,
-    in_flight: bool,
-}
-
-fn post_session_review_due(
-    now: chrono::NaiveDateTime,
-    is_trading_day: bool,
-    state: &PostSessionReviewScheduleState,
-) -> bool {
+fn post_session_review_window_open(now: chrono::NaiveDateTime, is_trading_day: bool) -> bool {
     let threshold = chrono::NaiveTime::from_hms_opt(19, 0, 0)
         .expect("BR-139 post-session review threshold must be valid");
-    is_trading_day
-        && now.time() >= threshold
-        && state.completed_date != Some(now.date())
-        && !state.in_flight
+    is_trading_day && now.time() >= threshold
 }
 
-fn finish_post_session_review_attempt(
-    state: &mut PostSessionReviewScheduleState,
-    date: chrono::NaiveDate,
-    result: Result<(), String>,
-) -> Result<(), String> {
-    state.in_flight = false;
-    if result.is_ok() {
-        state.completed_date = Some(date);
-    }
-    result
-}
-
-async fn attempt_post_session_review() -> Result<(), String> {
+async fn attempt_post_session_review(
+    due: &std::collections::BTreeSet<review_batch::ReviewTask>,
+) -> Result<review_batch::ReviewBatchOutcome, String> {
     if !evaluate_account_mode_hook(true).await {
         return Err("real AccountMode/banner initialization was not confirmed".to_string());
     }
@@ -3276,7 +3258,7 @@ async fn attempt_post_session_review() -> Result<(), String> {
     let timeout_secs = review_timeout_secs();
     tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),
-        run_strict_review_only_inner(),
+        run_strict_review_only_inner(due),
     )
     .await
     .map_err(|_| format!("strict review timed out after {timeout_secs}s"))?
@@ -3285,27 +3267,49 @@ async fn attempt_post_session_review() -> Result<(), String> {
 async fn post_session_review_scheduler() {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut state = PostSessionReviewScheduleState::default();
+    let mut state: Option<review_batch::ReviewScheduleState> = None;
 
     log::info!("[复盘调度][BR-139] started threshold=19:00 interval=60s");
 
     loop {
         interval.tick().await;
         let now = chrono::Local::now();
-        if !post_session_review_due(
+        if !post_session_review_window_open(
             now.naive_local(),
             stock_analysis::calendar::is_trading_day(now.date_naive()),
-            &state,
         ) {
             continue;
         }
 
-        state.in_flight = true;
-        let result = attempt_post_session_review().await;
-        match finish_post_session_review_attempt(&mut state, now.date_naive(), result) {
-            Ok(()) => log::info!("[复盘调度][BR-139] confirmed for date={}", now.date_naive()),
+        if state.as_ref().map(review_batch::ReviewScheduleState::date) != Some(now.date_naive()) {
+            state = Some(review_batch::ReviewScheduleState::for_date(
+                now.date_naive(),
+            ));
+        }
+        let due = state
+            .as_ref()
+            .expect("review state initialized for current date")
+            .due_tasks(now.naive_local());
+        if due.is_empty() {
+            continue;
+        }
+
+        match attempt_post_session_review(&due).await {
+            Ok(batch) => {
+                let delivered = batch.delivered_count();
+                let schedule = state
+                    .as_mut()
+                    .expect("review state initialized for current date");
+                schedule.apply(&batch, now.naive_local());
+                log::info!(
+                    "[复盘调度][BR-139][BR-140] attempt complete date={} delivered={} unfinished={}",
+                    now.date_naive(),
+                    delivered,
+                    schedule.has_unfinished_tasks()
+                );
+            }
             Err(error) => log::error!(
-                "[复盘调度][BR-139] attempt failed; retry remains eligible: {}",
+                "[复盘调度][BR-139][BR-140] attempt failed before task outcomes; retry remains eligible: {}",
                 error
             ),
         }
@@ -8946,46 +8950,22 @@ mod tests_post_session_review_scheduler {
 
     #[test]
     fn br139_review_is_due_only_after_threshold_on_a_trading_day() {
-        let state = PostSessionReviewScheduleState::default();
-        assert!(!post_session_review_due(at(18, 59), true, &state));
-        assert!(post_session_review_due(at(19, 0), true, &state));
-        assert!(!post_session_review_due(at(19, 0), false, &state));
+        assert!(!post_session_review_window_open(at(18, 59), true));
+        assert!(post_session_review_window_open(at(19, 0), true));
+        assert!(!post_session_review_window_open(at(19, 0), false));
     }
 
     #[test]
-    fn br139_completed_or_in_flight_review_is_not_due() {
+    fn br139_schedule_state_is_scoped_to_one_trading_date() {
         let date = at(19, 0).date();
-        let mut state = PostSessionReviewScheduleState {
-            completed_date: Some(date),
-            in_flight: false,
-        };
-        assert!(!post_session_review_due(at(19, 1), true, &state));
-
-        state.completed_date = None;
-        state.in_flight = true;
-        assert!(!post_session_review_due(at(19, 1), true, &state));
-    }
-
-    #[test]
-    fn br139_only_confirmed_attempt_commits_completion() {
-        let date = at(19, 0).date();
-        let mut state = PostSessionReviewScheduleState {
-            completed_date: None,
-            in_flight: true,
-        };
-        let _ = finish_post_session_review_attempt(
-            &mut state,
-            date,
-            Err("TEST_CODE sink failed".to_string()),
-        );
-        assert_eq!(state.completed_date, None);
-        assert!(!state.in_flight);
-
-        state.in_flight = true;
-        finish_post_session_review_attempt(&mut state, date, Ok(()))
-            .expect("confirmed attempt commits completion");
-        assert_eq!(state.completed_date, Some(date));
-        assert!(!state.in_flight);
+        let state = review_batch::ReviewScheduleState::for_date(date);
+        assert!(!state.due_tasks(at(19, 0)).is_empty());
+        let next_day = date
+            .succ_opt()
+            .expect("test date has a successor")
+            .and_hms_opt(19, 0, 0)
+            .expect("valid next-day time");
+        assert!(state.due_tasks(next_day).is_empty());
     }
 
     #[test]
