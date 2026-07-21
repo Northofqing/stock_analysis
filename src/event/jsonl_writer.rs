@@ -326,4 +326,110 @@ mod tests {
         // Cleanup
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
+
+    #[tokio::test]
+    async fn ready_initialization_rejects_a_regular_file_parent() {
+        let blocker = test_dir("init-blocker");
+        tokio::fs::write(&blocker, b"not a directory")
+            .await
+            .expect("create blocker");
+        let (_bus, rx) = test_bus(8);
+
+        let error = match JsonlWriter::spawn(rx, blocker.join("events"), 7).await {
+            Err(error) => error,
+            Ok(handle) => {
+                handle.abort();
+                panic!("regular-file parent must reject writer initialization");
+            }
+        };
+
+        assert!(matches!(error, JsonlError::Io(_)));
+        tokio::fs::remove_file(blocker)
+            .await
+            .expect("remove blocker");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ready_initialization_propagates_retention_read_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_dir("cleanup-permission");
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("create cleanup directory");
+        let original = std::fs::metadata(&dir)
+            .expect("read original permissions")
+            .permissions();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000))
+            .expect("deny cleanup directory reads");
+        let (_bus, rx) = test_bus(8);
+
+        let result = JsonlWriter::spawn(rx, dir.clone(), 7).await;
+
+        std::fs::set_permissions(&dir, original).expect("restore cleanup directory permissions");
+        match result {
+            Err(JsonlError::Io(_)) => {}
+            Err(other) => panic!("expected retention I/O error, got {other}"),
+            Ok(handle) => {
+                handle.abort();
+                panic!("unreadable retention directory must fail initialization");
+            }
+        }
+        tokio::fs::remove_dir_all(dir)
+            .await
+            .expect("remove cleanup directory");
+    }
+
+    #[tokio::test]
+    async fn consumer_propagates_envelope_write_failure() {
+        let dir = test_dir("write-failure");
+        let (bus, rx) = test_bus(8);
+        let handle = JsonlWriter::spawn(rx, dir.clone(), 7)
+            .await
+            .expect("initialize writer");
+        tokio::fs::remove_dir_all(&dir)
+            .await
+            .expect("remove initialized directory");
+        tokio::fs::write(&dir, b"blocks event directory")
+            .await
+            .expect("replace event directory with regular file");
+
+        bus.publish(test_live_envelope("write-failure"));
+        bus.shutdown();
+        let error = handle
+            .await
+            .expect("join writer task")
+            .expect_err("event write failure must propagate");
+
+        assert!(matches!(error, JsonlError::Io(_)));
+        tokio::fs::remove_file(dir)
+            .await
+            .expect("remove event directory blocker");
+    }
+
+    #[tokio::test]
+    async fn consumer_propagates_receiver_lag() {
+        let dir = test_dir("lag");
+        let (bus, rx) = test_bus(1);
+        bus.publish(test_live_envelope("lag-1"));
+        bus.publish(test_live_envelope("lag-2"));
+        let handle = JsonlWriter::spawn(rx, dir.clone(), 7)
+            .await
+            .expect("initialize lag writer");
+        bus.shutdown();
+
+        let error = handle
+            .await
+            .expect("join lag writer")
+            .expect_err("receiver lag must propagate");
+
+        assert!(matches!(
+            error,
+            JsonlError::Receive(broadcast::error::RecvError::Lagged(1))
+        ));
+        tokio::fs::remove_dir_all(dir)
+            .await
+            .expect("remove lag directory");
+    }
 }

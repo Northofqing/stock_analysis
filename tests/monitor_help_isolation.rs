@@ -239,6 +239,8 @@ fn review_command_runs_without_service_enablement() {
         .env("V10_DRY_RUN_PUSH", "1")
         .env("STOCK_ANALYSIS_QUIET_HOUR_OVERRIDE", "1")
         .env_remove("MONITOR_ENABLED")
+        .env_remove("EVENT_AUDIT_DIR")
+        .env_remove("PUSH_LOG_DIR")
         .env_remove("ALERT_WEBHOOK_URL")
         .env_remove("WECHAT_WEBHOOK")
         .output()
@@ -262,6 +264,91 @@ fn review_command_runs_without_service_enablement() {
         !combined_output.contains("[jsonl_writer] fatal error")
             && !combined_output.contains("background task failed"),
         "event writer did not initialize cleanly; output={combined_output}"
+    );
+
+    std::fs::remove_dir_all(&root).expect("remove isolated working directory");
+}
+
+#[test]
+fn event_writer_initialization_failure_exits_nonzero() {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let root = std::env::temp_dir().join(format!(
+        "monitor-event-writer-init-failure-{}-{}",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&root).expect("create isolated working directory");
+    std::fs::write(root.join("data"), b"blocks runtime directory")
+        .expect("create event directory blocker");
+    let database_path = root.join("review.db");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_monitor"))
+        .args(["--test", "--review"])
+        .current_dir(&root)
+        .env("DATABASE_PATH", &database_path)
+        .env("MAGICLAW_DB_PATH", &database_path)
+        .env_remove("MONITOR_ENABLED")
+        .env_remove("EVENT_AUDIT_DIR")
+        .env_remove("PUSH_LOG_DIR")
+        .output()
+        .expect("run monitor with blocked event directory");
+
+    let combined_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "writer initialization failure must be terminal; output={combined_output}"
+    );
+    assert!(
+        combined_output.contains("[event_bus.jsonl] initialization failed"),
+        "writer initialization error was not explicit; output={combined_output}"
+    );
+
+    std::fs::remove_dir_all(&root).expect("remove isolated working directory");
+}
+
+#[test]
+fn corrupt_history_exits_nonzero_without_service_enablement() {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let root = std::env::temp_dir().join(format!(
+        "monitor-history-corrupt-{}-{}",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let event_dir = root.join("data/test/event_bus");
+    std::fs::create_dir_all(&event_dir).expect("create isolated event directory");
+    std::fs::write(event_dir.join("2026-07-21.jsonl"), b"{not-json}\n")
+        .expect("seed corrupt history");
+    let database_path = root.join("history.db");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_monitor"))
+        .args(["--test", "--history", "--date=2026-07-21"])
+        .current_dir(&root)
+        .env("DATABASE_PATH", &database_path)
+        .env("MAGICLAW_DB_PATH", &database_path)
+        .env_remove("MONITOR_ENABLED")
+        .env_remove("EVENT_AUDIT_DIR")
+        .env_remove("PUSH_LOG_DIR")
+        .output()
+        .expect("run history against corrupt isolated JSONL");
+
+    let combined_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "corrupt history must not report success; output={combined_output}"
+    );
+    assert!(
+        combined_output.contains("[history] query failed"),
+        "history failure was not explicit; output={combined_output}"
     );
 
     std::fs::remove_dir_all(&root).expect("remove isolated working directory");
