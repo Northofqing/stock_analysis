@@ -3800,8 +3800,22 @@ async fn run_review_only_inner(isolated_test_fixtures: bool) -> Result<(), Strin
             };
 
             match load_review_limit_chain_stocks(&r_holdings) {
-                Ok(stocks) => {
-                    let aggs = aggregate(&LimitChainInput { stocks, source_complete: true });
+                Ok(batch) => {
+                    for rejection in &batch.rejected {
+                        log::warn!(
+                            "[v12-R03][BR-140] {} 被逐股隔离: {}",
+                            rejection.code,
+                            rejection.reason
+                        );
+                    }
+                    for error in &batch.source_errors {
+                        log::error!("[v12-R03][BR-140] {error}");
+                    }
+                    let source_complete = batch.source_complete();
+                    let aggs = aggregate(&LimitChainInput {
+                        stocks: batch.accepted,
+                        source_complete,
+                    });
 
                     if !aggs.is_empty() {
 
@@ -8173,47 +8187,174 @@ fn build_price_map(
     quotes.iter().map(|q| (q.code.clone(), q.price)).collect()
 }
 
-fn load_review_limit_chain_stocks(
-    holdings: &[stock_analysis::portfolio::Position],
-) -> Result<Vec<stock_analysis::market_analyzer::limit_chain_review::StockLimitStats>, String> {
+#[derive(Debug, Clone)]
+struct ReviewLimitChainCandidate {
+    code: String,
+    name: String,
+    sector: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReviewLimitChainRejection {
+    code: String,
+    reason: String,
+}
+
+#[derive(Debug, Default)]
+struct ReviewLimitChainBatch {
+    accepted: Vec<stock_analysis::market_analyzer::limit_chain_review::StockLimitStats>,
+    rejected: Vec<ReviewLimitChainRejection>,
+    source_errors: Vec<String>,
+}
+
+impl ReviewLimitChainBatch {
+    fn source_complete(&self) -> bool {
+        self.rejected.is_empty() && self.source_errors.is_empty()
+    }
+}
+
+fn collect_review_limit_chain_stocks_with<ResolveSector, FetchLimitDays>(
+    candidates: &[ReviewLimitChainCandidate],
+    mut resolve_sector: ResolveSector,
+    mut fetch_limit_days: FetchLimitDays,
+) -> ReviewLimitChainBatch
+where
+    ResolveSector: FnMut(&str) -> Result<String, String>,
+    FetchLimitDays: FnMut(&str) -> Result<Vec<bool>, String>,
+{
     use stock_analysis::market_analyzer::limit_chain_review::StockLimitStats;
 
-    let fetcher = stock_analysis::data_provider::DataFetcherManager::new()
-        .map_err(|error| format!("R-03 初始化日 K 数据源失败: {error:#}"))?;
-    let watchlist = stock_analysis::portfolio::get_watchlist()
-        .map_err(|error| format!("R-03 自选查询失败: {error}"))?;
-    let mut stocks = Vec::new();
-    for position in holdings.iter().chain(watchlist.iter()).take(20) {
-        if position.sector.trim().is_empty() {
-            return Err(format!(
-                "R-03 {}({}) 产业链证据缺失",
-                position.name, position.code
-            ));
+    let mut batch = ReviewLimitChainBatch::default();
+    for candidate in candidates {
+        let code = candidate.code.trim();
+        let name = candidate.name.trim();
+        if code.is_empty() || name.is_empty() {
+            batch.rejected.push(ReviewLimitChainRejection {
+                code: code.to_string(),
+                reason: "股票代码或名称缺失".to_string(),
+            });
+            continue;
         }
-        let (kline, _) = fetcher
-            .get_daily_data(&position.code, 60)
-            .map_err(|error| format!("R-03 {} 日 K 获取失败: {error:#}", position.code))?;
-        let consecutive_days = kline
+
+        let sector = candidate
+            .sector
+            .as_deref()
+            .map(str::trim)
+            .filter(|sector| !sector.is_empty() && *sector != "其他")
+            .map(str::to_string)
+            .map(Ok)
+            .unwrap_or_else(|| resolve_sector(code));
+        let sector = match sector {
+            Ok(sector) if !sector.trim().is_empty() && sector.trim() != "其他" => sector,
+            Ok(_) => {
+                batch.rejected.push(ReviewLimitChainRejection {
+                    code: code.to_string(),
+                    reason: "真实行业数据为空".to_string(),
+                });
+                continue;
+            }
+            Err(error) => {
+                batch.rejected.push(ReviewLimitChainRejection {
+                    code: code.to_string(),
+                    reason: format!("行业数据获取失败: {error}"),
+                });
+                continue;
+            }
+        };
+
+        let limit_days = match fetch_limit_days(code) {
+            Ok(days) if !days.is_empty() => days,
+            Ok(_) => {
+                batch.rejected.push(ReviewLimitChainRejection {
+                    code: code.to_string(),
+                    reason: "日 K 数据为空".to_string(),
+                });
+                continue;
+            }
+            Err(error) => {
+                batch.rejected.push(ReviewLimitChainRejection {
+                    code: code.to_string(),
+                    reason: format!("日 K 获取失败: {error}"),
+                });
+                continue;
+            }
+        };
+        let consecutive_days = limit_days
             .iter()
             .take(10)
-            .take_while(|bar| bar.is_limit_up)
+            .take_while(|is_limit_up| **is_limit_up)
             .count();
         if consecutive_days == 0 {
             continue;
         }
-        let board_level = u8::try_from(consecutive_days)
-            .map_err(|_| format!("R-03 {} 连板数溢出: {consecutive_days}", position.code))?;
-        stocks.push(StockLimitStats {
-            code: position.code.clone(),
-            name: position.name.clone(),
-            chain: position.sector.clone(),
+        let board_level = match u8::try_from(consecutive_days) {
+            Ok(value) => value,
+            Err(_) => {
+                batch.rejected.push(ReviewLimitChainRejection {
+                    code: code.to_string(),
+                    reason: format!("连板数溢出: {consecutive_days}"),
+                });
+                continue;
+            }
+        };
+        batch.accepted.push(StockLimitStats {
+            code: code.to_string(),
+            name: name.to_string(),
+            chain: sector,
             board_level,
             is_limit_up_today: true,
             is_first_board: consecutive_days == 1,
             consecutive_days: u32::from(board_level),
         });
     }
-    Ok(stocks)
+    batch
+}
+
+fn load_review_limit_chain_stocks(
+    holdings: &[stock_analysis::portfolio::Position],
+) -> Result<ReviewLimitChainBatch, String> {
+    let fetcher = stock_analysis::data_provider::DataFetcherManager::new()
+        .map_err(|error| format!("R-03 初始化日 K 数据源失败: {error:#}"))?;
+    let mut source_errors = Vec::new();
+    let watchlist = match stock_analysis::portfolio::get_watchlist() {
+        Ok(watchlist) => watchlist,
+        Err(error) => {
+            source_errors.push(format!("R-03 自选查询失败: {error}"));
+            Vec::new()
+        }
+    };
+    let candidates = holdings
+        .iter()
+        .chain(watchlist.iter())
+        .take(20)
+        .map(|position| ReviewLimitChainCandidate {
+            code: position.code.clone(),
+            name: position.name.clone(),
+            sector: Some(position.sector.clone()),
+        })
+        .collect::<Vec<_>>();
+    let mut batch = collect_review_limit_chain_stocks_with(
+        &candidates,
+        |code| {
+            stock_analysis::block_on_async_with_timeout(
+                stock_analysis::data_provider::industry::fetch_industry_name_only(
+                    &stock_analysis::http_client::SHARED_HTTP_CLIENT,
+                    code,
+                ),
+                15,
+            )
+            .map_err(|error| format!("行业请求超时/运行失败: {error}"))?
+            .map_err(|error| error.to_string())
+        },
+        |code| {
+            fetcher
+                .get_daily_data(code, 60)
+                .map(|(kline, _)| kline.into_iter().map(|bar| bar.is_limit_up).collect())
+                .map_err(|error| format!("{error:#}"))
+        },
+    );
+    batch.source_errors.extend(source_errors);
+    Ok(batch)
 }
 
 fn compute_ma(kline: &[stock_analysis::data_provider::KlineData], n: usize) -> Option<f64> {
@@ -8991,6 +9132,44 @@ mod tests_post_session_review_scheduler {
             !source.contains(&stale_owner),
             "the stale monitor-loop review owner must not return"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_br140_review_chain_isolation {
+    use super::*;
+
+    #[test]
+    fn br140_r03_missing_sector_does_not_block_later_verified_stock() {
+        let candidates = vec![
+            ReviewLimitChainCandidate {
+                code: "TEST_CODE_000001".to_string(),
+                name: "测试一".to_string(),
+                sector: None,
+            },
+            ReviewLimitChainCandidate {
+                code: "TEST_CODE_000002".to_string(),
+                name: "测试二".to_string(),
+                sector: Some("测试产业链".to_string()),
+            },
+        ];
+
+        let batch = collect_review_limit_chain_stocks_with(
+            &candidates,
+            |code| {
+                if code.ends_with("000001") {
+                    Err("TEST_CODE industry unavailable".to_string())
+                } else {
+                    unreachable!("complete sector must not call resolver")
+                }
+            },
+            |_code| Ok(vec![true, false]),
+        );
+
+        assert_eq!(batch.accepted.len(), 1);
+        assert_eq!(batch.accepted[0].code, "TEST_CODE_000002");
+        assert_eq!(batch.rejected.len(), 1);
+        assert!(!batch.source_complete());
     }
 }
 
