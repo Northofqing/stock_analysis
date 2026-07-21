@@ -5616,9 +5616,9 @@ pub async fn dispatch_post_session_review(
         },
         async {
             if runnable.contains(&ReviewTask::R08) {
-                Some(from_bool(
+                Some((
                     ReviewTask::R08,
-                    dispatch_r08_event_calendar_real(date, banner).await,
+                    dispatch_r08_event_calendar_outcome(date, banner).await,
                 ))
             } else {
                 None
@@ -5874,78 +5874,93 @@ fn filter_r08_event_announcements(
         .collect()
 }
 
-pub async fn dispatch_r08_event_calendar_real(date: &str, _banner: &BannerCtx) -> bool {
-    // 1. 拉今日全市场公告 (真实数据)
-    let anns = match stock_analysis::data_provider::announcement::fetch_announcements(None).await {
-        Ok(announcements) => filter_r08_event_announcements(announcements),
+struct R08CalendarComponents {
+    announcement_summary: Result<String, String>,
+    real_holdings: Result<Vec<EventHolding>, String>,
+    virtual_holdings: Result<Vec<EventHolding>, String>,
+    overnight: Result<(String, String), String>,
+}
+
+#[derive(Debug)]
+struct R08PreparedCalendar {
+    text: String,
+    item_count: usize,
+    complete_components: usize,
+    failed_components: Vec<&'static str>,
+}
+
+fn prepare_r08_event_calendar(
+    date: &str,
+    components: R08CalendarComponents,
+) -> Result<R08PreparedCalendar, String> {
+    let mut complete_components = 0usize;
+    let mut failed_components = Vec::new();
+    let ann_summary = match components.announcement_summary {
+        Ok(summary) => {
+            complete_components += 1;
+            summary
+        }
         Err(error) => {
-            let reason = format!("公告数据源失败: {error}");
-            log::error!("[R-08][BR-110] {reason}");
-            log_dispatcher_attempt("R-08", false, 0, &reason);
-            return false;
+            log::error!("[R-08][BR-140] component=announcement unavailable: {error}");
+            failed_components.push("announcement");
+            "公告不可用（见审计）".to_string()
         }
     };
-    // 2. 持仓事件 (实盘) + 虚拟持仓, 区分 tag
-    let positions = match stock_analysis::portfolio::get_positions() {
-        Ok(positions) => positions,
-        Err(error) => {
-            let reason = format!("实盘持仓数据源失败: {error}");
-            log::error!("[R-08][BR-110] {reason}");
-            log_dispatcher_attempt("R-08", false, 0, &reason);
-            return false;
+
+    let mut holdings = Vec::new();
+    let mut item_count = 0usize;
+    match components.real_holdings {
+        Ok(real_holdings) => {
+            complete_components += 1;
+            item_count += real_holdings.len();
+            holdings.extend(real_holdings);
         }
-    };
-    let holding_codes: std::collections::HashSet<String> =
-        positions.iter().map(|p| p.code.clone()).collect();
-    // 宏观公告摘要: 区分持仓相关 / 非持仓
-    let ann_summary = build_event_calendar_macro_summary(&anns, &holding_codes);
-    // 实盘持仓: 优先今日公告标题作为事件, 否则标"持有"
-    let mut holdings: Vec<EventHolding> = Vec::new();
-    for p in positions.iter().take(5) {
-        let p_ann = anns.iter().find(|a| a.code == p.code);
-        let kind = match p_ann {
-            Some(a) => a.title.chars().take(20).collect::<String>(),
-            None => "持有 (今日无公告)".to_string(),
-        };
-        holdings.push(EventHolding {
-            tag: "实盘".to_string(),
-            name: p.name.clone(),
-            code: p.code.clone(),
-            kind,
-        });
-    }
-    // 虚拟持仓 (虚拟观察仓)
-    match event_calendar_virtual_holdings() {
-        Ok(virtual_holdings) => holdings.extend(virtual_holdings),
         Err(error) => {
-            let reason = format!("虚拟观察数据源失败: {error}");
-            log::error!("[R-08][BR-104][BR-110] {reason}");
-            log_dispatcher_attempt("R-08", false, 0, &reason);
-            return false;
+            log::error!("[R-08][BR-140] component=positions unavailable: {error}");
+            failed_components.push("positions");
+            holdings.push(EventHolding {
+                tag: "数据".to_string(),
+                name: "实盘持仓".to_string(),
+                code: String::new(),
+                kind: "不可用（见审计）".to_string(),
+            });
         }
     }
-    // 3. 隔夜关注 (美股 + 汇率 雅虎 API)
-    let (us_summary, fx_summary) = match tokio::task::spawn_blocking(
-        stock_analysis::data_provider::yahoo::fetch_overnight_data,
-    )
-    .await
-    {
-        Ok(Ok(snapshot)) => snapshot,
-        Ok(Err(error)) => {
-            log::error!("[R-08] Yahoo 隔夜数据不可用: {}", error);
+    match components.virtual_holdings {
+        Ok(virtual_holdings) => {
+            complete_components += 1;
+            item_count += virtual_holdings.len();
+            holdings.extend(virtual_holdings);
+        }
+        Err(error) => {
+            log::error!("[R-08][BR-140] component=virtual unavailable: {error}");
+            failed_components.push("virtual");
+            holdings.push(EventHolding {
+                tag: "数据".to_string(),
+                name: "虚拟观察仓".to_string(),
+                code: String::new(),
+                kind: "不可用（见审计）".to_string(),
+            });
+        }
+    }
+    let (us_summary, fx_summary) = match components.overnight {
+        Ok(overnight) => {
+            complete_components += 1;
+            overnight
+        }
+        Err(error) => {
+            log::error!("[R-08][BR-140] component=overnight unavailable: {error}");
+            failed_components.push("overnight");
             (
-                "不可用（数据源错误）".to_string(),
-                "不可用（数据源错误）".to_string(),
+                "不可用（见审计）".to_string(),
+                "不可用（见审计）".to_string(),
             )
         }
-        Err(error) => {
-            log::error!("[R-08] fetch_overnight_data task 失败: {}", error);
-            (
-                "不可用（任务失败）".to_string(),
-                "不可用（任务失败）".to_string(),
-            )
-        }
     };
+
+    if complete_components == 0 {
+        return Err("R-08 全部 4 个组件失败，禁止生成无证据事件日历".to_string());
+    }
     let events_ref: Vec<HoldingEventItem> = holdings
         .iter()
         .map(|h| HoldingEventItem {
@@ -5956,10 +5971,177 @@ pub async fn dispatch_r08_event_calendar_real(date: &str, _banner: &BannerCtx) -
         })
         .collect();
     let text = render_event_calendar(date, &events_ref, &ann_summary, &us_summary, &fx_summary);
+
+    Ok(R08PreparedCalendar {
+        text,
+        item_count,
+        complete_components,
+        failed_components,
+    })
+}
+
+pub async fn dispatch_r08_event_calendar_outcome(
+    date: &str,
+    _banner: &BannerCtx,
+) -> crate::review_batch::ReviewTaskOutcome {
+    use crate::review_batch::ReviewTaskOutcome;
+
+    let announcements =
+        stock_analysis::data_provider::announcement::fetch_announcements(Some(date))
+            .await
+            .map(filter_r08_event_announcements)
+            .map_err(|error| format!("公告数据源失败: {error}"));
+
+    let positions = stock_analysis::portfolio::get_positions_with_source_time().and_then(
+        |(positions, source_time)| match source_time {
+            Some(source_time)
+                if stock_analysis::portfolio::position_source_is_fresh(
+                    source_time,
+                    chrono::Utc::now(),
+                ) =>
+            {
+                Ok(positions)
+            }
+            Some(source_time) => {
+                let age_ms = chrono::Utc::now()
+                    .signed_duration_since(source_time.with_timezone(&chrono::Utc))
+                    .num_milliseconds();
+                Err(format!(
+                    "BR-103 实盘持仓来源过期: age_ms={age_ms} max_ms=30000"
+                ))
+            }
+            None => Err("BR-103 实盘持仓缺少来源时间".to_string()),
+        },
+    );
+    let holding_codes = positions
+        .as_ref()
+        .map(|positions| {
+            positions
+                .iter()
+                .map(|position| position.code.clone())
+                .collect::<std::collections::HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let announcement_summary = announcements
+        .as_ref()
+        .map(|anns| build_event_calendar_macro_summary(anns, &holding_codes))
+        .map_err(Clone::clone);
+    let real_holdings = positions.map(|positions| {
+        positions
+            .iter()
+            .take(5)
+            .map(|position| {
+                let kind = match announcements.as_ref() {
+                    Ok(anns) => anns
+                        .iter()
+                        .find(|announcement| announcement.code == position.code)
+                        .map(|announcement| announcement.title.chars().take(20).collect())
+                        .unwrap_or_else(|| "持有（今日无公告）".to_string()),
+                    Err(_) => "持有（公告不可用）".to_string(),
+                };
+                EventHolding {
+                    tag: "实盘".to_string(),
+                    name: position.name.clone(),
+                    code: position.code.clone(),
+                    kind,
+                }
+            })
+            .collect()
+    });
+    let virtual_holdings =
+        event_calendar_virtual_holdings().map_err(|error| format!("虚拟观察数据源失败: {error}"));
+    let overnight = match tokio::task::spawn_blocking(
+        stock_analysis::data_provider::yahoo::fetch_overnight_data,
+    )
+    .await
+    {
+        Ok(result) => result.map_err(|error| format!("Yahoo 隔夜数据不可用: {error}")),
+        Err(error) => Err(format!("隔夜数据任务失败: {error}")),
+    };
+    let prepared = match prepare_r08_event_calendar(
+        date,
+        R08CalendarComponents {
+            announcement_summary,
+            real_holdings,
+            virtual_holdings,
+            overnight,
+        },
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            log::error!("[R-08][BR-110][BR-140] {error}");
+            log_dispatcher_attempt("R-08", false, 0, &error);
+            return ReviewTaskOutcome::failed(true, error);
+        }
+    };
+    if !prepared.failed_components.is_empty() {
+        log::warn!(
+            "[R-08][BR-140] degraded complete_components={} failed_components={:?}",
+            prepared.complete_components,
+            prepared.failed_components
+        );
+    }
     let push_result =
-        crate::notify::push_governor(&text, crate::notify::PushKind::EventCalendar).await;
-    log_dispatcher_attempt("R-08", push_result, holdings.len(), "");
-    push_result
+        crate::notify::push_governor(&prepared.text, crate::notify::PushKind::EventCalendar).await;
+    log_dispatcher_attempt("R-08", push_result, prepared.item_count, "");
+    if push_result {
+        ReviewTaskOutcome::delivered(1)
+    } else {
+        ReviewTaskOutcome::failed(true, "R-08 sink did not confirm delivery")
+    }
+}
+
+pub async fn dispatch_r08_event_calendar_real(date: &str, banner: &BannerCtx) -> bool {
+    matches!(
+        dispatch_r08_event_calendar_outcome(date, banner).await,
+        crate::review_batch::ReviewTaskOutcome::Delivered { .. }
+    )
+}
+
+#[cfg(test)]
+mod tests_br140_r08_partial_components {
+    use super::*;
+
+    #[test]
+    fn announcement_failure_does_not_block_verified_holding_component() {
+        let prepared = prepare_r08_event_calendar(
+            "2026-07-21",
+            R08CalendarComponents {
+                announcement_summary: Err("TEST_CODE announcement unavailable".to_string()),
+                real_holdings: Ok(vec![EventHolding {
+                    tag: "实盘".to_string(),
+                    name: "测试持仓".to_string(),
+                    code: "TEST_CODE_000001".to_string(),
+                    kind: "持有（公告不可用）".to_string(),
+                }]),
+                virtual_holdings: Err("TEST_CODE virtual unavailable".to_string()),
+                overnight: Ok(("+0.5%".to_string(), "7.20".to_string())),
+            },
+        )
+        .expect("verified components must produce a degraded report");
+
+        assert!(prepared.text.contains("测试持仓"));
+        assert!(prepared.text.contains("公告不可用"));
+        assert!(prepared.text.contains("虚拟观察仓: 不可用"));
+        assert_eq!(prepared.complete_components, 2);
+        assert_eq!(prepared.failed_components, vec!["announcement", "virtual"]);
+    }
+
+    #[test]
+    fn all_r08_components_failed_is_explicit_failure() {
+        let error = prepare_r08_event_calendar(
+            "2026-07-21",
+            R08CalendarComponents {
+                announcement_summary: Err("TEST_CODE announcement unavailable".to_string()),
+                real_holdings: Err("TEST_CODE positions stale".to_string()),
+                virtual_holdings: Err("TEST_CODE virtual unavailable".to_string()),
+                overnight: Err("TEST_CODE overnight unavailable".to_string()),
+            },
+        )
+        .expect_err("zero verified components must not render or push");
+
+        assert!(error.contains("全部 4 个组件失败"));
+    }
 }
 
 // ============================================================================
@@ -6088,7 +6270,7 @@ pub async fn dispatch_r04_lhb_real(date: &str, _banner: &BannerCtx) -> bool {
     let lhb_ready_time = chrono::NaiveTime::from_hms_opt(21, 0, 0).unwrap();
     if now_time < lhb_ready_time {
         log::info!(
-            "[R-04] 现在 {} < 21:00, lhb 数据未出, 跳过 (后续 21:00 由 monitor_loop 重调)",
+            "[R-04] 现在 {} < 21:00, lhb 数据未出, 等待 BR-139/BR-140 逐任务调度器重试",
             now_time.format("%H:%M")
         );
         log_dispatcher_attempt("R-04", false, 0, "before 21:00, lhb not ready");
