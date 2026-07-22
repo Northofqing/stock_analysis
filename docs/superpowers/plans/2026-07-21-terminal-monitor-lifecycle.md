@@ -469,7 +469,7 @@ process-global environment/database state; the same focused tests and the full
 single-thread suite passed. Preserve complete workspace coverage while aligning
 the coverage runner with the existing serial release-test gate.
 
-- [ ] **Step 2: Serialize CI coverage tests**
+- [x] **Step 2: Serialize CI coverage tests**
 
 Pass `-- --test-threads=1` through `cargo llvm-cov` in the mandatory command and
 workflow. Do not add excludes or change thresholds.

@@ -27,7 +27,7 @@ jobs:
         run: |
           mkdir -p target/coverage
           cargo llvm-cov --workspace --all-features --json \
-            --output-path target/coverage/coverage.json
+            --output-path target/coverage/coverage.json -- --test-threads=1
 
       - name: Enforce AGENTS coverage (global 80%, core 95%)
         run: python3 tools/coverage/check_thresholds.py target/coverage/coverage.json
