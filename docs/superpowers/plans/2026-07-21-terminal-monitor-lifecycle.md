@@ -237,11 +237,15 @@ git diff --check
 Expected: every command exits 0; global coverage remains at least 80%, core at
 least 95%, and no production database is changed by validation.
 
-Evidence (2026-07-21): focused process tests 11/11 passed; JSONL writer tests
-3/3 passed; fmt, clippy, full workspace/all-target/all-feature tests, compliance,
-and release build exited 0. Production freshness was read-only and latest
-`stock_daily` was 2026-07-20 (one trading day behind). Global line coverage was
-86,295/107,267 = 80.45%; registered core coverage was 33,329/34,978 = 95.29%.
+Final evidence (2026-07-22 Asia/Shanghai): `cargo fmt --all -- --check`, strict
+workspace/all-target/all-feature Clippy, the serial full workspace test suite,
+compliance, release build and `git diff --check` all exited 0. The library suite
+passed 1,797 tests with four explicit ignores; the monitor suite passed 413
+tests with one process-helper ignore; all remaining targets passed. Production
+freshness validation was read-only and `stock_daily` was current through
+2026-07-20 (one completed trading day behind). The deterministic serial coverage
+report measured 87,565/108,638 = 80.60% globally and 34,104/35,868 = 95.08%
+across the registered core files.
 
 - [x] **Step 2: Run the release canary without the switch**
 
@@ -255,10 +259,11 @@ Expected: exit 2 after the strict-review marker because isolated test data has n
 real account evidence; no real sink is contacted; output contains neither
 `jsonl_writer fatal error` nor `background task failed`.
 
-Evidence (2026-07-21 23:05 Asia/Shanghai): release canary entered the strict
-`--review` path with `MONITOR_ENABLED` absent, used the isolated test database,
-returned 2 for zero confirmed review delivery, and emitted neither writer-fatal
-marker. Test mode kept external notification delivery in dry-run isolation.
+Final evidence (2026-07-22 09:01 Asia/Shanghai): the release canary ran with an
+empty inherited environment, `MONITOR_ENABLED` absent, a fresh isolated test
+database and no notification credentials. It entered the strict `--review`
+path, failed closed with exit 2 because real account evidence was absent, and
+drained the JSONL writer normally without a fatal/background-task marker.
 
 - [ ] **Step 3: Review, PR and merge**
 
@@ -303,7 +308,7 @@ Make strict review return `Result<(), String>` instead of exiting internally.
 Route terminal completion through the lifecycle helper. Return exit 1 for either
 history query/statistics error, while successful empty history remains exit 0.
 
-- [ ] **Step 5: Run focused and full gates again**
+- [x] **Step 5: Run focused and full gates again**
 
 Run all writer tests and `monitor_help_isolation`, then repeat fmt, clippy, full
 workspace tests, compliance, coverage threshold check, release build and the
@@ -348,7 +353,7 @@ Keep registered push/backfill flags known to the event parser, reject
 `--v13-diag` without `--test` before runtime initialization, and add a final
 guard so no unhandled explicit argument can enter the bare service loop.
 
-- [ ] **Step 4: Repeat review and all Gate D evidence**
+- [x] **Step 4: Repeat review and all Gate D evidence**
 
 Run focused tests and all repository gates again, then request independent
 review of the final commit range. Critical and Important findings must both be
@@ -403,7 +408,7 @@ The shared command builder clears database, audit, dispatcher, review, push,
 environment-mode and notification/Magiclaw overrides before each test applies
 its explicit isolated values.
 
-- [ ] **Step 5: Repeat all gates and obtain a clean independent review**
+- [x] **Step 5: Repeat all gates and obtain a clean independent review**
 
 Repeat focused tests, full workspace tests, compliance, coverage, release build
 and canary after these changes. Do not create the PR until independent review
@@ -437,7 +442,7 @@ Build a redacted authoritative event at the persistence seam, validate the
 structured fields through `PushRecord`, and domain-separate identity and record
 hashing while retaining legacy verification only for existing rows.
 
-- [ ] **Step 4: Repeat Gate C/D, canary and independent review**
+- [x] **Step 4: Repeat Gate C/D, canary and independent review**
 
 Run every mandatory gate on the final tree. Zero Critical and Important
 findings are required before PR creation and merge.
@@ -474,7 +479,13 @@ the coverage runner with the existing serial release-test gate.
 Pass `-- --test-threads=1` through `cargo llvm-cov` in the mandatory command and
 workflow. Do not add excludes or change thresholds.
 
-- [ ] **Step 3: Regenerate and enforce the report**
+- [x] **Step 3: Regenerate and enforce the report**
 
 Require global line coverage >=80% and registered core coverage >=95%, then
 retain the JSON report as the CI artifact.
+
+Evidence: the serialized instrumented run completed without the global-state
+flakes seen under default parallelism. Threshold enforcement passed at 80.60%
+global and 95.08% core coverage; no file exclusions or threshold changes were
+introduced. Independent BR-142 review reported READY with zero Critical and zero
+Important findings before final release-gate repetition.
