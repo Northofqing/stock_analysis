@@ -20,8 +20,8 @@ use futures::stream::{FuturesUnordered, StreamExt};
 
 use crate::data_provider::baostock_provider::BaostockProvider;
 use crate::data_provider::{
-    is_ban_error, DataProvider, GtimgProvider, HttpProvider, KlineData, RustdxProvider,
-    SinaProvider,
+    is_ban_error, DataProvider, GtimgProvider, HttpProvider, KlineData, MagicTdxProvider,
+    RustdxProvider, SinaProvider,
 };
 use crate::monitor::data_quality::{max_gap_for, validate_daily_kline_quality};
 
@@ -104,7 +104,7 @@ pub async fn fetch_kline_with_fallback(
 ) -> Result<(Vec<KlineData>, &'static str)> {
     // Task 4 startup log: 列出 4-way fallback 链 + priority, 便于线上排查.
     log::info!(
-        "[fallback] {} 启动 4-way 竞速链: sina_hq (P1) → tencent_qfq (P2) → eastmoney_qfq (P3) → rustdx_none (P4)",
+        "[fallback] {} 启动 5-way 竞速链: magic_tdx (P1) → sina_hq (P2) → tencent_qfq (P3) → eastmoney_qfq (P4) → rustdx_none (P5)",
         code
     );
 
@@ -117,6 +117,18 @@ pub async fn fetch_kline_with_fallback(
     // 这里改成真正的 first-valid-completion: 任一源返回 Ok 且质检通过即返回,
     // 剩余 HTTP future 被 drop 取消；RustDX spawn_blocking 可能后台完成, 但不再阻塞主链路。
     let candidates: FuturesUnordered<ProviderFuture> = FuturesUnordered::new();
+
+    let magic_code = code.to_string();
+    candidates.push(Box::pin(async move {
+        let r: Result<Vec<KlineData>> = tokio::task::spawn_blocking(move || {
+            let provider = MagicTdxProvider::new()?;
+            provider.get_daily_data(&magic_code, days)
+        })
+        .await
+        .map_err(|e| anyhow!("magic TDX 任务执行失败: {e}"))
+        .and_then(|inner| inner);
+        ("magic_tdx", r)
+    }));
 
     let sina_code = code.to_string();
     candidates.push(Box::pin(async move {
