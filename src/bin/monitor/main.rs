@@ -6379,6 +6379,9 @@ async fn news_monitor_loop() {
     }
 }
 
+type T0SnapshotPositions = std::collections::HashMap<String, (String, Option<f64>)>;
+type T0PositionSource = (Vec<String>, Option<T0SnapshotPositions>);
+
 async fn monitor_loop() {
     // 全天候循环：非交易日等待，交易日自动进入扫描
 
@@ -7847,13 +7850,36 @@ async fn monitor_loop() {
                             }
                         }
 
-                        // v19.13: 持仓专属做T扫描 (每 30s, 真接 DB 持仓股, 不依赖涨停)
+                        // BR-151 / v19.13: 用户确认持仓专属做T扫描 (每 30s, 不接券商账户)
 
                         // AGENTS.md §2.1: 做T建议只对真实持仓推 (不是 watchlist 候选票)
 
                         if last_t0_scan.elapsed().as_secs() >= 30 {
-                            let holding_codes_vec: Vec<String> =
-                                holding_only_codes.iter().cloned().collect();
+                            let user_snapshot = stock_analysis::database::user_position_snapshot::latest_user_position_snapshot();
+                            let (holding_codes_vec, snapshot_positions): T0PositionSource =
+                                match user_snapshot {
+                                    Ok(Some(snapshot)) => {
+                                        let positions = snapshot
+                                            .items
+                                            .into_iter()
+                                            .map(|item| (item.code.clone(), (item.name, None)))
+                                            .collect::<std::collections::HashMap<_, _>>();
+                                        let mut codes =
+                                            positions.keys().cloned().collect::<Vec<_>>();
+                                        codes.sort_unstable();
+                                        (codes, Some(positions))
+                                    }
+                                    Ok(None) => {
+                                        (holding_only_codes.iter().cloned().collect(), None)
+                                    }
+                                    Err(error) => {
+                                        log::warn!(
+                                        "[做T-持仓][BR-146] 用户持仓快照读取失败，回退旧持仓源: {}",
+                                        error
+                                    );
+                                        (holding_only_codes.iter().cloned().collect(), None)
+                                    }
+                                };
 
                             if holding_codes_vec.is_empty() {
                                 last_t0_scan = std::time::Instant::now();
@@ -7864,17 +7890,29 @@ async fn monitor_loop() {
 
                                 let detector_local = Detector::new(DetectorConfig::default());
 
-                                let quotes = market_data::fetch_position_quotes()?;
+                                let snapshot_mode = snapshot_positions.is_some();
+                                let quotes = if snapshot_mode {
+                                    market_data::fetch_eastmoney_quotes(&holding_codes_vec)
+                                        .or_else(|east_error| {
+                                            market_data::fetch_sina_quotes(&holding_codes_vec)
+                                                .map_err(|sina_error| {
+                                                    format!(
+                                                        "用户持仓快照行情主备源均失败: 东财={east_error}; 新浪={sina_error}"
+                                                    )
+                                                })
+                                        })?
+                                } else {
+                                    market_data::fetch_position_quotes()?
+                                };
 
-                                let position_map: std::collections::HashMap<String, stock_analysis::portfolio::Position> = stock_analysis::portfolio::get_positions()
-
-                                    .map_err(|error| format!("获取持仓止损证据失败: {error}"))?
-
-                                    .into_iter()
-
-                                    .map(|position| (position.code.clone(), position))
-
-                                    .collect();
+                                let position_map: std::collections::HashMap<String, (String, Option<f64>)> = match snapshot_positions {
+                                    Some(positions) => positions,
+                                    None => stock_analysis::portfolio::get_positions()
+                                        .map_err(|error| format!("获取持仓止损证据失败: {error}"))?
+                                        .into_iter()
+                                        .map(|position| (position.code.clone(), (position.name, position.hard_stop)))
+                                        .collect(),
+                                };
 
                                 let mut out: Vec<(String, String)> = Vec::new();
 
@@ -7892,25 +7930,17 @@ async fn monitor_loop() {
                                         continue;
                                     };
 
-                                    let Some(position) = position_map.get(&q.code) else {
+                                    let Some((position_name, hard_stop_value)) = position_map.get(&q.code) else {
                                         return Err(format!("行情批次含非持仓代码 {}", q.code));
                                     };
-                                    let Some(hard_stop) = position
-                                        .hard_stop
-                                        .filter(|value| value.is_finite() && *value > 0.0)
-                                    else {
-                                        log::warn!(
-                                            "[BR-109] advice rejected code={} reason=hard_stop unavailable",
-                                            q.code
-                                        );
-                                        continue;
-                                    };
+                                    let hard_stop = hard_stop_value
+                                        .filter(|value| value.is_finite() && *value > 0.0);
 
                                     let snap = SS {
 
                                         code: q.code.clone(),
 
-                                        name: position.name.clone(),
+                                        name: position_name.clone(),
 
                                         price: q.price,
 
@@ -7942,6 +7972,9 @@ async fn monitor_loop() {
 
                                                 stock_analysis::monitor::detector::AlertCategory::MainInflow) { "+" } else { "-" };
 
+                                            let stop_text = hard_stop
+                                                .map(|value| format!("¥{value:.2}"))
+                                                .unwrap_or_else(|| "用户快照止损位不可用".to_string());
                                             out.push((snap.code.clone(), format!(
 
                                                 "🔄 做T建议 {}({}) | {} {}\n   现价 ¥{:.2} 涨跌 {:+.2}%\n   高抛: +{:.1}% 减仓1/3\n   低吸: -{:.1}% 回补2/3\n   止损: ¥{:.2}",
@@ -7952,7 +7985,7 @@ async fn monitor_loop() {
 
                                                 snap.change_pct.abs().max(2.0), snap.change_pct.abs().max(2.0),
 
-                                                hard_stop
+                                                stop_text
 
                                             )));
 

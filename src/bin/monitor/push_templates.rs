@@ -8481,33 +8481,45 @@ pub async fn dispatch_post_close_fund_inflow_buy(date: &str, banner: &BannerCtx)
             );
             continue;
         }
-        let code = s.code.clone();
-        let execution_quote = match tokio::task::spawn_blocking(move || {
-            stock_analysis::broker::execution_quote(&code)
-        })
-        .await
-        {
-            Ok(Ok(quote)) => quote,
-            Ok(Err(error)) => {
-                log::warn!(
-                    "[盘后资金流入] 跳过虚拟买入 {}({}): 执行报价不可用: {}",
-                    s.name,
-                    s.code,
-                    error
-                );
-                continue;
-            }
-            Err(error) => {
-                log::warn!(
-                    "[盘后资金流入] 跳过虚拟买入 {}({}): 报价任务失败: {}",
-                    s.name,
-                    s.code,
-                    error
-                );
-                continue;
+        let execution_quote = if snapshot_scope {
+            // BR-150: SnapshotPaper uses the already validated closing batch;
+            // it must not depend on a live broker quote after the market closes.
+            None
+        } else {
+            let code = s.code.clone();
+            match tokio::task::spawn_blocking(move || {
+                stock_analysis::broker::execution_quote(&code)
+            })
+            .await
+            {
+                Ok(Ok(quote)) => Some(quote),
+                Ok(Err(error)) => {
+                    log::warn!(
+                        "[盘后资金流入] 跳过虚拟买入 {}({}): 执行报价不可用: {}",
+                        s.name,
+                        s.code,
+                        error
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    log::warn!(
+                        "[盘后资金流入] 跳过虚拟买入 {}({}): 报价任务失败: {}",
+                        s.name,
+                        s.code,
+                        error
+                    );
+                    continue;
+                }
             }
         };
-        let is_limit_up = execution_quote.price >= execution_quote.limit_up_price;
+        let execution_price = execution_quote.as_ref().map_or(s.price, |q| q.price);
+        let limit_up_price = execution_quote.as_ref().map(|q| q.limit_up_price);
+        let limit_down_price = execution_quote.as_ref().map(|q| q.limit_down_price);
+        let is_limit_up = execution_quote.as_ref().map_or_else(
+            || s.change_pct >= crate::market_data::infer_limit_pct(&s.code, &s.name) - 0.2,
+            |q| execution_price >= q.limit_up_price,
+        );
         let signal = PaperSignal {
             plan_id: format!(
                 "postclose-fundinflow-{}-{}",
@@ -8517,7 +8529,7 @@ pub async fn dispatch_post_close_fund_inflow_buy(date: &str, banner: &BannerCtx)
             code: s.code.clone(),
             name: s.name.clone(),
             direction: Direction::Buy,
-            price: execution_quote.price,
+            price: execution_price,
             quantity: 100,
             // v16.3 Commit 2: 改 free-text → VirtualReason::MainNetInflow.as_str()
             virtual_reason:
@@ -8525,19 +8537,22 @@ pub async fn dispatch_post_close_fund_inflow_buy(date: &str, banner: &BannerCtx)
                     .as_str()
                     .to_string(),
             is_limit_up,
-            is_limit_down: false,
+            is_limit_down: execution_quote.is_none()
+                && s.change_pct <= -crate::market_data::infer_limit_pct(&s.code, &s.name) + 0.2,
             is_suspended: false,
-            limit_up_price: Some(execution_quote.limit_up_price),
-            limit_down_price: Some(execution_quote.limit_down_price),
+            limit_up_price,
+            limit_down_price,
             secondary_confirmed: false,
-            quote_observed_at: execution_quote.observed_at,
+            quote_observed_at: execution_quote
+                .as_ref()
+                .map_or_else(chrono::Utc::now, |q| q.observed_at),
             risk_context,
         };
         // v16.3 Commit 1: simulate 签名加 4 参数 (quote_price 真 + cash/total/pos_pct 真 portfolio 读)
         let (cash, total, pos_pct) = match if snapshot_scope {
             snapshot_paper_portfolio_state(&s.code)
         } else {
-            paper_portfolio_state(&s.code, execution_quote.price)
+            paper_portfolio_state(&s.code, execution_price)
         } {
             Ok(state) => state,
             Err(error) => {
@@ -8551,9 +8566,9 @@ pub async fn dispatch_post_close_fund_inflow_buy(date: &str, banner: &BannerCtx)
             }
         };
         let result = if snapshot_scope {
-            paper_trade::simulate_snapshot(&signal, execution_quote.price, cash, total, pos_pct)
+            paper_trade::simulate_snapshot(&signal, execution_price, cash, total, pos_pct)
         } else {
-            paper_trade::simulate(&signal, execution_quote.price, cash, total, pos_pct)
+            paper_trade::simulate(&signal, execution_price, cash, total, pos_pct)
         };
         match result {
             Ok(outcome) => {
