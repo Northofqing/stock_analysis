@@ -1112,6 +1112,14 @@ async fn deliver_and_record(
     cooldown_override_secs: Option<u32>,
 ) -> PushOutcome {
     use crate::v14_adapter;
+    // BR-144: never emit a physical push while the durable audit chain is
+    // already degraded; doing so would create an untraceable delivery.
+    if let stock_analysis::event::AuditHealth::Degraded { reason_code } =
+        stock_analysis::event::runtime_delivery_audit_health()
+    {
+        log::error!("[AuditDegraded][BR-144] delivery blocked before sink: {reason_code}");
+        return PushOutcome::SinkError(format!("delivery audit unavailable: {reason_code}"));
+    }
     // v15.1 A3: 把 reserve/commit 拆分, 失败时 rollback 不占 cooldown 窗口
     // v17.1-r2 §3.6: env opt-in 走 L6 SinkRouter (env=STOCK_ANALYSIS_PUSH_V6_ENABLE=1).
     let delivered = if std::env::var("STOCK_ANALYSIS_PUSH_V6_ENABLE")
@@ -1153,7 +1161,9 @@ async fn deliver_and_record(
         sub_kind,
         cooldown_override_secs,
         delivered,
-        l7_result.is_ok() && audit_result.is_ok(),
+        // BR-145: once the physical sink accepts the message, commit the
+        // identity even if a post-delivery audit fails; never resend it.
+        delivered,
     );
 
     let mut audit_errors = Vec::new();
