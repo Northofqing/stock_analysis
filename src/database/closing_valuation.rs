@@ -48,7 +48,7 @@ struct ItemRow {
 #[derive(QueryableByName)]
 struct IdRow {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
-    _id: i64,
+    id: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
