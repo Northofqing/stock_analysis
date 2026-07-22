@@ -6226,11 +6226,55 @@ fn prepare_r08_event_calendar(
     })
 }
 
-fn load_verified_r08_positions() -> Result<Vec<stock_analysis::portfolio::Position>, String> {
-    Err(
-        "BR-103/BR-140 verified broker per-position batch unavailable; local stock_position projection excluded"
-            .to_string(),
-    )
+/// Load the user-confirmed real-position snapshot for the review date.
+///
+/// This is intentionally not a broker integration: the user-attested immutable
+/// snapshot is the accepted real-position fact source until a broker batch is
+/// connected.  We require same-trading-day evidence, but do not apply the
+/// 30-second broker freshness gate to a closing snapshot (BR-103/BR-140).
+fn load_verified_r08_positions(
+    date: &str,
+) -> Result<Vec<stock_analysis::portfolio::Position>, String> {
+    let review_date = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .map_err(|error| format!("BR-103 review date invalid: {error}"))?;
+    let snapshot =
+        stock_analysis::database::user_position_snapshot::latest_user_position_snapshot()?
+            .ok_or_else(|| "BR-103 user-confirmed position snapshot is missing".to_string())?;
+    if snapshot.effective_at.date_naive() != review_date {
+        return Err(format!(
+            "BR-103 user-confirmed position snapshot stale: effective_date={} review_date={}",
+            snapshot.effective_at.date_naive(),
+            review_date
+        ));
+    }
+    if snapshot.confirmed_at > chrono::Utc::now().fixed_offset() {
+        return Err("BR-103 user-confirmed position snapshot is from the future".to_string());
+    }
+    if snapshot.confirm_empty {
+        return Ok(Vec::new());
+    }
+    let added_at = snapshot.effective_at.date_naive();
+    snapshot
+        .items
+        .into_iter()
+        .map(|item| {
+            if item.quantity == 0 || !item.cost_price.is_finite() || item.cost_price <= 0.0 {
+                return Err(format!("BR-103 invalid user snapshot item {}", item.code));
+            }
+            Ok(stock_analysis::portfolio::Position {
+                code: item.code,
+                name: item.name,
+                shares: item.quantity,
+                cost_price: item.cost_price,
+                hard_stop: None,
+                added_at,
+                status: stock_analysis::portfolio::PositionStatus::Holding,
+                sector: "其他".to_string(),
+                is_st: false,
+                star_st: false,
+            })
+        })
+        .collect()
 }
 
 fn audit_r08_announcement_rejections(
@@ -6309,7 +6353,7 @@ pub async fn dispatch_r08_event_calendar_outcome(
             Err(error) => Err(format!("公告数据源失败: {error}")),
         };
 
-    let positions = load_verified_r08_positions();
+    let positions = load_verified_r08_positions(date);
     let holding_codes = positions.as_ref().ok().map(|positions| {
         positions
             .iter()
@@ -6454,12 +6498,11 @@ mod tests_br140_r08_partial_components {
     }
 
     #[test]
-    fn br140_r08_local_projection_is_never_accepted_as_broker_evidence() {
-        let error = load_verified_r08_positions()
-            .expect_err("R-08 must fail closed until a broker per-position batch exists");
+    fn br140_r08_requires_user_confirmed_snapshot_for_real_holdings() {
+        let error = load_verified_r08_positions("2099-01-01")
+            .expect_err("R-08 must require an explicit user-confirmed snapshot");
 
-        assert!(error.contains("verified broker per-position batch unavailable"));
-        assert!(error.contains("local stock_position projection excluded"));
+        assert!(error.contains("user-confirmed position snapshot") || error.contains("DB"));
     }
 }
 
