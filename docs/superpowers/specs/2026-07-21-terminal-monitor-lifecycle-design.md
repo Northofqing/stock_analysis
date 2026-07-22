@@ -196,3 +196,14 @@ symbol protocols and may contact external providers.
 
 Revert the BR-141 merge commit and rebuild `monitor`. No data migration, account
 mutation, audit deletion, process restart, or threshold rollback is required.
+
+## Coverage-gate determinism
+
+The workspace contains legacy tests that share process-global environment and
+singleton SQLite state. The mandatory full test gate already uses one test
+thread, but the coverage workflow omitted that argument. Instrumented parallel
+runs reproduced two different cross-test failures while each failed test and
+the complete serial suite passed. Coverage collection therefore uses
+`-- --test-threads=1`, matching the release test gate and existing v16.x
+coverage evidence. This changes scheduling only: it does not exclude targets,
+files, branches, or lines and does not lower either threshold.

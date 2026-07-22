@@ -459,3 +459,22 @@ unknown v2 payload fields fail, and identity/subject hashes cannot drift.
 
 Validate every historical row with its schema, enforce a one-way chain upgrade,
 and persist only closed, recomputable v2 delivery records.
+
+### Task 10: Make the coverage gate deterministic
+
+- [x] **Step 1: Record the failure evidence and decision**
+
+Default-parallel instrumented runs failed in two different tests that share
+process-global environment/database state; the same focused tests and the full
+single-thread suite passed. Preserve complete workspace coverage while aligning
+the coverage runner with the existing serial release-test gate.
+
+- [ ] **Step 2: Serialize CI coverage tests**
+
+Pass `-- --test-threads=1` through `cargo llvm-cov` in the mandatory command and
+workflow. Do not add excludes or change thresholds.
+
+- [ ] **Step 3: Regenerate and enforce the report**
+
+Require global line coverage >=80% and registered core coverage >=95%, then
+retain the JSON report as the CI artifact.
