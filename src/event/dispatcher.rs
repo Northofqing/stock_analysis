@@ -1,4 +1,4 @@
-//! Registered business rules: BR-043, BR-091, BR-111, BR-130, BR-141.
+//! Registered business rules: BR-043, BR-091, BR-111, BR-130, BR-141, BR-142.
 //! Exact-match dispatcher registry — v17.1-r2 Task 3
 //!
 //! Provides a `Dispatcher` trait, `DispatcherRegistry` with exact-match routing,
@@ -14,6 +14,8 @@ use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 use super::envelope::EventEnvelope;
+
+const DELIVERY_AUDIT_RECORD_HASH_DOMAIN: &str = "stock_analysis.delivery_audit_record.v2";
 
 // ========================================================================
 // DispatchResult
@@ -185,8 +187,6 @@ impl AuditDispatcher {
 
     fn persist(&self, envelope: &EventEnvelope) -> Result<(), String> {
         use fs2::FileExt;
-        use sha2::{Digest, Sha256};
-
         fs::create_dir_all(&self.base_dir)
             .map_err(|error| format!("create {}: {error}", self.base_dir.display()))?;
         let year = envelope.ts.format("%Y").to_string();
@@ -220,11 +220,10 @@ impl AuditDispatcher {
                 validate_existing_chain(&path)?.unwrap_or_else(|| "GENESIS".to_string());
             let mut record = serde_json::json!({
                 "envelope": envelope,
+                "hash_domain": DELIVERY_AUDIT_RECORD_HASH_DOMAIN,
                 "previous_hash": previous_hash,
             });
-            let canonical = serde_json::to_vec(&record)
-                .map_err(|error| format!("serialize audit record: {error}"))?;
-            let record_hash = format!("{:x}", Sha256::digest(&canonical));
+            let record_hash = calculate_record_hash(&record)?;
             record.as_object_mut().expect("json object literal").insert(
                 "record_hash".to_string(),
                 serde_json::Value::String(record_hash.clone()),
@@ -269,8 +268,6 @@ impl Default for AuditDispatcher {
 }
 
 fn validate_existing_chain(path: &Path) -> Result<Option<String>, String> {
-    use sha2::{Digest, Sha256};
-
     if !path.exists() {
         return Ok(None);
     }
@@ -312,9 +309,19 @@ fn validate_existing_chain(path: &Path) -> Result<Option<String>, String> {
             .as_object_mut()
             .ok_or_else(|| format!("audit line {} is not an object", index + 1))?
             .remove("record_hash");
-        let canonical = serde_json::to_vec(&record)
-            .map_err(|error| format!("serialize audit line {}: {error}", index + 1))?;
-        let calculated = format!("{:x}", Sha256::digest(&canonical));
+        if record.get("hash_domain").is_some() {
+            let envelope = record
+                .get("envelope")
+                .cloned()
+                .ok_or_else(|| format!("audit line {} has no envelope", index + 1))?;
+            let envelope: EventEnvelope = serde_json::from_value(envelope)
+                .map_err(|error| format!("parse audit envelope at line {}: {error}", index + 1))?;
+            super::push_record::PushRecord::try_from_authoritative(&envelope).map_err(|error| {
+                format!("invalid v2 delivery audit at line {}: {error}", index + 1)
+            })?;
+        }
+        let calculated = calculate_record_hash(&record)
+            .map_err(|error| format!("audit line {}: {error}", index + 1))?;
         if calculated != record_hash {
             return Err(format!("audit hash mismatch at line {}", index + 1));
         }
@@ -322,6 +329,29 @@ fn validate_existing_chain(path: &Path) -> Result<Option<String>, String> {
         last_hash = Some(record_hash);
     }
     Ok(last_hash)
+}
+
+fn calculate_record_hash(record: &serde_json::Value) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+
+    let canonical =
+        serde_json::to_vec(record).map_err(|error| format!("serialize audit record: {error}"))?;
+    let mut hasher = Sha256::new();
+    match record.get("hash_domain") {
+        None => {
+            // Read-only compatibility for records emitted before BR-142.
+        }
+        Some(serde_json::Value::String(domain)) if domain == DELIVERY_AUDIT_RECORD_HASH_DOMAIN => {
+            hasher.update(domain.as_bytes());
+            hasher.update([0]);
+        }
+        Some(serde_json::Value::String(domain)) => {
+            return Err(format!("unsupported audit hash domain: {domain}"));
+        }
+        Some(_) => return Err("audit hash_domain must be a string".into()),
+    }
+    hasher.update(canonical);
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 impl Dispatcher for AuditDispatcher {
@@ -339,7 +369,7 @@ impl Dispatcher for AuditDispatcher {
             return DispatchResult::Skipped("no_dispatcher".into());
         }
 
-        let record = match super::push_record::PushRecord::try_from(&envelope) {
+        let record = match super::push_record::PushRecord::try_from_authoritative(&envelope) {
             Ok(record) => record,
             Err(error) => {
                 return DispatchResult::Failed(format!("invalid delivery audit: {error}"));
@@ -360,17 +390,14 @@ impl Dispatcher for AuditDispatcher {
             .and_then(|v| v.as_str())
             .expect("PushRecord validation requires string outcome");
 
-        if let Some(ref code) = record.code {
-            println!(
-                "[AuditDispatcher] id={} event_type={} source={} kind={} outcome={} channel={} code={}",
-                id, event_type, source, record.kind, outcome, record.channel, code
-            );
-        } else {
-            println!(
-                "[AuditDispatcher] id={} event_type={} source={} kind={} outcome={} channel={}",
-                id, event_type, source, record.kind, outcome, record.channel
-            );
-        }
+        let identity_hash = record
+            .identity_hash
+            .as_deref()
+            .expect("authoritative PushRecord validation requires identity_hash");
+        println!(
+            "[AuditDispatcher] id={} event_type={} source={} kind={} outcome={} channel={} identity_hash={}",
+            id, event_type, source, record.kind, outcome, record.channel, identity_hash
+        );
 
         self.handled_count.fetch_add(1, Ordering::SeqCst);
         DispatchResult::Handled
@@ -420,24 +447,23 @@ mod tests {
     }
 
     fn test_envelope_type(event_type: &str) -> EventEnvelope {
-        EventEnvelope {
-            id: format!("evt-{}", event_type),
-            ts: chrono::Local::now(),
-            trace_id: "trace-1".into(),
-            source: "push_l4".into(),
-            event_type: event_type.into(),
-            entity_key: Some("TEST_CODE_AUDIT".into()),
-            payload: serde_json::json!({
-                "kind": "test_kind",
-                "code": "TEST_CODE_AUDIT",
-                "outcome": "Pushed",
-                "channel": "wechat",
-                "rendered_len": 42,
-                "latency_ms": 10,
-            }),
-            version: 1,
-            replay_of: None,
-        }
+        let event = crate::event::PushDeliveryEvent::new(
+            "test_kind".into(),
+            Some("TEST_CODE_AUDIT".into()),
+            "Pushed".into(),
+            "wechat".into(),
+            42,
+            10,
+        );
+        let mut envelope = EventEnvelope::from_event(
+            &event,
+            format!("evt-{event_type}"),
+            "trace-1".into(),
+            chrono::Local::now(),
+        )
+        .unwrap();
+        envelope.event_type = event_type.into();
+        envelope
     }
 
     #[test]
@@ -665,15 +691,102 @@ mod tests {
         drop(first);
 
         let second = AuditDispatcher::new(&dir);
-        let mut without_code = test_envelope_type("push.delivery.audit");
-        without_code.entity_key = None;
-        without_code.payload["code"] = serde_json::Value::Null;
         assert_eq!(second.name(), "AuditDispatcher");
-        assert_eq!(second.dispatch(without_code), DispatchResult::Handled);
+        assert_eq!(
+            second.dispatch(test_envelope_type("push.delivery.audit")),
+            DispatchResult::Handled
+        );
 
         let path = dir.join(format!("{}.jsonl", chrono::Local::now().format("%Y")));
         assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 2);
         assert!(validate_existing_chain(&path).unwrap().is_some());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn br142_legacy_parent_is_read_only_and_extended_with_v2_domain() {
+        use sha2::{Digest, Sha256};
+
+        let dir = std::env::temp_dir().join(format!(
+            "audit-dispatcher-legacy-parent-{}-{}",
+            std::process::id(),
+            chrono::Local::now().timestamp_nanos_opt().unwrap()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{}.jsonl", chrono::Local::now().format("%Y")));
+        let legacy_envelope = EventEnvelope {
+            id: "legacy-event".into(),
+            ts: chrono::Local::now(),
+            trace_id: "legacy-trace".into(),
+            source: "push_l4".into(),
+            event_type: "push.delivery.audit".into(),
+            entity_key: Some("TEST_CODE_LEGACY".into()),
+            payload: serde_json::json!({
+                "kind": "legacy_kind",
+                "code": "TEST_CODE_LEGACY",
+                "outcome": "Pushed",
+                "channel": "dry_run",
+                "rendered_len": 1,
+                "latency_ms": 1,
+            }),
+            version: 1,
+            replay_of: None,
+        };
+        let mut legacy = serde_json::json!({
+            "envelope": legacy_envelope,
+            "previous_hash": "GENESIS",
+        });
+        let legacy_hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&legacy).unwrap()));
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .insert("record_hash".into(), serde_json::Value::String(legacy_hash));
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&legacy).unwrap()),
+        )
+        .unwrap();
+
+        let dispatcher = AuditDispatcher::new(&dir);
+        assert_eq!(
+            dispatcher.dispatch(test_envelope_type("push.delivery.audit")),
+            DispatchResult::Handled
+        );
+        let lines = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].get("hash_domain").is_none());
+        assert_eq!(lines[1]["hash_domain"], DELIVERY_AUDIT_RECORD_HASH_DOMAIN);
+        assert!(validate_existing_chain(&path).unwrap().is_some());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn br142_unknown_hash_domain_is_rejected() {
+        let dir = std::env::temp_dir().join(format!(
+            "audit-dispatcher-domain-{}-{}",
+            std::process::id(),
+            chrono::Local::now().timestamp_nanos_opt().unwrap()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{}.jsonl", chrono::Local::now().format("%Y")));
+        let record = serde_json::json!({
+            "envelope": test_envelope_type("push.delivery.audit"),
+            "hash_domain": "stock_analysis.delivery_audit_record.unknown",
+            "previous_hash": "GENESIS",
+            "record_hash": "deadbeef",
+        });
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&record).unwrap()),
+        )
+        .unwrap();
+
+        let error = validate_existing_chain(&path).unwrap_err();
+        assert!(error.contains("unsupported audit hash domain"));
         fs::remove_dir_all(dir).unwrap();
     }
 

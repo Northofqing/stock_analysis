@@ -175,6 +175,9 @@ symbol protocols and may contact external providers.
   unexpected main-loop completion. Cross-process delivery-audit writers prove
   one valid chain; incomplete-tail and override-namespace tests cover the other
   authoritative-audit failure modes.
+- Delivery-audit tests require the v2 audit fields, verify domain-separated
+  identity and record hashes, prove raw identities are absent from persisted
+  output, and prove a valid legacy parent can only be extended by a v2 record.
 - Isolated process tests cover strict/path-traversal backfill dates, corrupt
   outcome input, all registered one-shot handler markers and dry-run status.
 - Focused tests, fmt, clippy, full workspace tests, compliance, coverage and

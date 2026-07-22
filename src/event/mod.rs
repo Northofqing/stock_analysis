@@ -209,7 +209,9 @@ mod delivery_observation_tests {
         let env = rx.recv().await.unwrap();
         assert_eq!(env.event_type, "push.delivery.audit");
         assert_eq!(env.payload["outcome"], "Pushed");
-        assert_eq!(env.payload["code"], "TEST_CODE_600519");
+        assert!(env.payload.get("code").is_none());
+        assert!(env.entity_key.is_none());
+        assert_eq!(env.payload["audit_schema_version"], 2);
     }
 
     #[test]

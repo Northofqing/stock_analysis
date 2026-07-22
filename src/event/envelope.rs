@@ -1,4 +1,4 @@
-//! Registered business rules: BR-091, BR-130.
+//! Registered business rules: BR-091, BR-130, BR-142.
 //! Event envelope contract — v17.1-r2 Task 1
 //!
 //! Defines `DomainEvent`, `EventEnvelope`, and `PushDeliveryEvent` for the
@@ -6,7 +6,12 @@
 //! imports; only `lib.rs` consumers touch it.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+pub const DELIVERY_AUDIT_SCHEMA_VERSION: u32 = 2;
+pub const DELIVERY_IDENTITY_HASH_DOMAIN: &str = "stock_analysis.delivery_identity.v2";
+pub const DELIVERY_AUDIT_RULE_IDS: [&str; 5] = ["2.7", "BR-091", "BR-111", "BR-130", "BR-142"];
 
 // ========================================================================
 // DomainEvent trait
@@ -58,6 +63,9 @@ pub enum EnvelopeError {
 
     #[error("delivery channel cannot be blank")]
     BlankDeliveryChannel,
+
+    #[error("invalid delivery audit field: {0}")]
+    InvalidDeliveryAuditField(String),
 }
 
 // ========================================================================
@@ -137,8 +145,14 @@ impl EventEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PushDeliveryEvent {
     pub kind: String,
-    pub code: Option<String>,
     pub outcome: String,
+    pub decision_status: String,
+    pub retryable: bool,
+    pub rule_ids: Vec<String>,
+    pub reason_code: String,
+    pub identity_hash: String,
+    pub source_as_of: Option<chrono::DateTime<chrono::FixedOffset>>,
+    pub audit_schema_version: u32,
     pub channel: String,
     pub rendered_len: usize,
     pub latency_ms: u64,
@@ -153,10 +167,22 @@ impl PushDeliveryEvent {
         rendered_len: usize,
         latency_ms: u64,
     ) -> Self {
+        let (reason_code, retryable) =
+            delivery_outcome_metadata(&outcome).unwrap_or(("delivery.invalid", false));
+        let identity_hash = delivery_identity_hash(&kind, code.as_deref(), &channel);
         Self {
             kind,
-            code,
+            decision_status: outcome.clone(),
             outcome,
+            retryable,
+            rule_ids: DELIVERY_AUDIT_RULE_IDS
+                .iter()
+                .map(|rule| (*rule).to_string())
+                .collect(),
+            reason_code: reason_code.to_string(),
+            identity_hash,
+            source_as_of: None,
+            audit_schema_version: DELIVERY_AUDIT_SCHEMA_VERSION,
             channel,
             rendered_len,
             latency_ms,
@@ -174,7 +200,7 @@ impl DomainEvent for PushDeliveryEvent {
     }
 
     fn entity_key(&self) -> Option<&str> {
-        self.code.as_deref()
+        None
     }
 
     fn payload(&self) -> serde_json::Value {
@@ -188,17 +214,80 @@ impl DomainEvent for PushDeliveryEvent {
         if self.outcome.trim().is_empty() {
             return Err(EnvelopeError::BlankDeliveryOutcome);
         }
-        if !matches!(
-            self.outcome.as_str(),
-            "Pushed" | "SinkError" | "Failed" | "Deduped" | "Denied"
-        ) {
+        let Some((expected_reason, expected_retryable)) = delivery_outcome_metadata(&self.outcome)
+        else {
             return Err(EnvelopeError::InvalidDeliveryOutcome(self.outcome.clone()));
-        }
+        };
         if self.channel.trim().is_empty() {
             return Err(EnvelopeError::BlankDeliveryChannel);
         }
+        if self.kind.contains('\0') || self.channel.contains('\0') {
+            return Err(EnvelopeError::InvalidDeliveryAuditField(
+                "kind/channel contains NUL".into(),
+            ));
+        }
+        if self.audit_schema_version != DELIVERY_AUDIT_SCHEMA_VERSION {
+            return Err(EnvelopeError::InvalidDeliveryAuditField(
+                "audit_schema_version".into(),
+            ));
+        }
+        if self.decision_status != self.outcome {
+            return Err(EnvelopeError::InvalidDeliveryAuditField(
+                "decision_status".into(),
+            ));
+        }
+        if self.retryable != expected_retryable {
+            return Err(EnvelopeError::InvalidDeliveryAuditField("retryable".into()));
+        }
+        if self.reason_code != expected_reason {
+            return Err(EnvelopeError::InvalidDeliveryAuditField(
+                "reason_code".into(),
+            ));
+        }
+        let expected_rules = DELIVERY_AUDIT_RULE_IDS
+            .iter()
+            .map(|rule| (*rule).to_string())
+            .collect::<Vec<_>>();
+        if self.rule_ids != expected_rules {
+            return Err(EnvelopeError::InvalidDeliveryAuditField("rule_ids".into()));
+        }
+        if !is_lower_hex_sha256(&self.identity_hash) {
+            return Err(EnvelopeError::InvalidDeliveryAuditField(
+                "identity_hash".into(),
+            ));
+        }
         Ok(())
     }
+}
+
+pub(crate) fn delivery_outcome_metadata(outcome: &str) -> Option<(&'static str, bool)> {
+    Some(match outcome {
+        "Pushed" => ("delivery.confirmed", false),
+        "SinkError" => ("delivery.sink_error", true),
+        "Failed" => ("delivery.failed", true),
+        "Deduped" => ("delivery.deduped", false),
+        "Denied" => ("delivery.denied", false),
+        _ => return None,
+    })
+}
+
+pub(crate) fn is_lower_hex_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+pub(crate) fn delivery_identity_hash(kind: &str, code: Option<&str>, channel: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(DELIVERY_IDENTITY_HASH_DOMAIN.as_bytes());
+    hasher.update([0]);
+    hasher.update(kind.as_bytes());
+    hasher.update([0]);
+    hasher.update(code.unwrap_or("<none>").as_bytes());
+    hasher.update([0]);
+    hasher.update(channel.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 // ========================================================================
@@ -227,17 +316,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(env.event_type, "push.delivery.audit");
-        assert_eq!(env.entity_key, None, "authoritative identity must be redacted");
+        assert_eq!(
+            env.entity_key, None,
+            "authoritative identity must be redacted"
+        );
         assert_eq!(env.payload["outcome"], "Pushed");
         assert_eq!(env.payload["decision_status"], "Pushed");
         assert_eq!(env.payload["retryable"], false);
         assert_eq!(env.payload["reason_code"], "delivery.confirmed");
         assert_eq!(env.payload["audit_schema_version"], 2);
         assert!(env.payload.get("code").is_none());
-        assert_eq!(
-            env.payload["identity_hash"].as_str().unwrap().len(),
-            64
-        );
+        assert_eq!(env.payload["identity_hash"].as_str().unwrap().len(), 64);
         assert!(env.payload["rule_ids"]
             .as_array()
             .unwrap()

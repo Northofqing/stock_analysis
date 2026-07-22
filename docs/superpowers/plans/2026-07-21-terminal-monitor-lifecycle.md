@@ -425,13 +425,13 @@ Specify the required audit fields, identity redaction, domain-separated hashes,
 fail-closed validation and legacy read-only compatibility in the stable rule
 table and design before editing production code.
 
-- [ ] **Step 2: Add RED contract and compatibility tests**
+- [x] **Step 2: Add RED contract and compatibility tests**
 
 Require complete structured delivery fields, redacted identities, v2 chain
 domains, and a legacy-parent-to-v2 append. Prove malformed fields and unknown
 domains are rejected before append.
 
-- [ ] **Step 3: Implement the v2 authoritative audit schema**
+- [x] **Step 3: Implement the v2 authoritative audit schema**
 
 Build a redacted authoritative event at the persistence seam, validate the
 structured fields through `PushRecord`, and domain-separate identity and record

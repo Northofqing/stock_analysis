@@ -62,5 +62,7 @@ fn push_delivery_trait_payload_matches_the_serialized_contract() {
     );
     let payload = DomainEvent::payload(&event);
     assert_eq!(payload["kind"], "gate_d");
-    assert_eq!(payload["code"], "TEST_CODE_000001");
+    assert!(payload.get("code").is_none());
+    assert_eq!(payload["audit_schema_version"], 2);
+    assert_eq!(payload["identity_hash"].as_str().unwrap().len(), 64);
 }
