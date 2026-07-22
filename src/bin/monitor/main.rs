@@ -2935,7 +2935,7 @@ async fn main() {
         ),
         Ok(Err(error)) => {
             log::error!(
-                "[AuditDegraded][BR-144] event_writer initialization / delivery audit preflight failed: {error}"
+                "[event_bus.jsonl] initialization failed [AuditDegraded][BR-144] delivery audit preflight: {error}"
             );
             std::process::exit(2);
         }
