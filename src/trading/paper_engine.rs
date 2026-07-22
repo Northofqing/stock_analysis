@@ -14,6 +14,7 @@
 //! (主循环在 main.rs 调 track_position 已有, 写 analysis_result)
 //! → paper_engine 只读 analysis_result, 0 调 track_position, 0 重造 4 铁律
 
+use crate::data_provider::DataProvider;
 use crate::database::DatabaseManager;
 use crate::trading::paper_trade::{self, Direction, PaperRiskContext, PaperSignal};
 use chrono::{Local, Timelike};
@@ -235,12 +236,27 @@ fn load_latest_daily_close_quote(
     .bind::<diesel::sql_types::Text, _>(code)
     .load(&mut conn)
     .map_err(|error| format!("daily close query failed: {error}"))?;
-    let close = rows
+    let mut close = rows
         .first()
         .map(|row| row.close)
         .filter(|value| value.is_finite() && *value > 0.0)
-        .ok_or_else(|| "validated daily close missing".to_string())?;
-    let prev_close = rows.get(1).map(|row| row.close).unwrap_or(close);
+        .ok_or_else(|| "validated daily close missing".to_string());
+    let mut prev_close = rows.get(1).map(|row| row.close);
+    if close.is_err() {
+        let provider = crate::data_provider::MagicTdxProvider::new()
+            .map_err(|error| format!("magic TDX initialization failed: {error}"))?;
+        let bars = provider
+            .get_daily_data(code, 2)
+            .map_err(|error| format!("magic TDX daily close unavailable: {error}"))?;
+        close = bars
+            .first()
+            .map(|bar| bar.close)
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .ok_or_else(|| "validated daily close missing".to_string());
+        prev_close = bars.get(1).map(|bar| bar.close);
+    }
+    let close = close?;
+    let prev_close = prev_close.unwrap_or(close);
     let limits = crate::data_provider::limit_status::LimitStatusCalculator::new()
         .calculate(code, prev_close, name);
     log::warn!(

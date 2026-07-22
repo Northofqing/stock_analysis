@@ -12,7 +12,8 @@ use crate::util::recover_lock_or_warn;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
-use std::sync::{Arc, Mutex};
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// 把任意 `SearchResult` (现有 search_service 类型) 转成 MarketEvent
 fn search_result_to_event(
@@ -34,7 +35,8 @@ fn search_result_to_event(
     }
     let now = Utc::now();
     let observed_at = now.with_timezone(&Local);
-    let (occurred_at, stale) = source_time_and_stale(r.published_date.as_deref(), observed_at);
+    let (occurred_at, stale) =
+        source_time_and_stale(r.published_date.as_deref(), observed_at, r.source.as_str());
     let simhash = {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
@@ -84,9 +86,23 @@ fn search_result_to_event(
 fn source_time_and_stale(
     raw: Option<&str>,
     observed_at: DateTime<Local>,
+    provider: &str,
 ) -> (DateTime<Local>, bool) {
+    fn warn_once(provider: &str, reason: &str) {
+        static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+        let key = format!("{provider}:{reason}");
+        let mut warned = WARNED
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if warned.insert(key) {
+            log::warn!(
+                "[NewsFeed][BR-137] provider published_date {reason}; provider={provider}; event marked stale"
+            );
+        }
+    }
     let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
-        log::warn!("[NewsFeed][BR-137] provider published_date missing; event marked stale");
+        warn_once(provider, "missing");
         return (observed_at, true);
     };
     if let Ok(timestamp) = DateTime::parse_from_rfc3339(raw) {
@@ -94,7 +110,12 @@ fn source_time_and_stale(
         let stale = timestamp > observed_at || timestamp.date_naive() != observed_at.date_naive();
         return (timestamp, stale);
     }
-    for format in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"] {
+    for format in [
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+    ] {
         if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(raw, format) {
             if let Some(timestamp) = Local.from_local_datetime(&naive).single() {
                 let stale =
@@ -106,7 +127,7 @@ fn source_time_and_stale(
     if let Ok(date) = NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
         return (observed_at, date != observed_at.date_naive());
     }
-    log::warn!("[NewsFeed][BR-137] provider published_date invalid; event marked stale");
+    warn_once(provider, "invalid");
     (observed_at, true)
 }
 
@@ -344,7 +365,8 @@ fn announcement_to_market_event(
     ) {
         return None;
     }
-    let (occurred_at, stale) = source_time_and_stale(Some(&announcement.date), observed_at);
+    let (occurred_at, stale) =
+        source_time_and_stale(Some(&announcement.date), observed_at, provider);
     let simhash = {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
@@ -611,18 +633,19 @@ mod tests {
     #[test]
     fn source_time_marks_missing_and_old_records_stale_without_now_fallback_approval() {
         let observed_at = Local::now();
-        assert!(source_time_and_stale(None, observed_at).1);
+        assert!(source_time_and_stale(None, observed_at, "TEST_CODE_provider").1);
         let yesterday = (observed_at.date_naive() - chrono::Duration::days(1))
             .format("%Y-%m-%d")
             .to_string();
-        assert!(source_time_and_stale(Some(&yesterday), observed_at).1);
+        assert!(source_time_and_stale(Some(&yesterday), observed_at, "TEST_CODE_provider").1);
         let today = observed_at.format("%Y-%m-%d %H:%M:%S").to_string();
-        let (source_time, stale) = source_time_and_stale(Some(&today), observed_at);
+        let (source_time, stale) =
+            source_time_and_stale(Some(&today), observed_at, "TEST_CODE_provider");
         assert!(!stale);
         assert_eq!(source_time.timestamp(), observed_at.timestamp());
         let malformed = format!("{}garbage", observed_at.format("%Y-%m-%d"));
         assert!(
-            source_time_and_stale(Some(&malformed), observed_at).1,
+            source_time_and_stale(Some(&malformed), observed_at, "TEST_CODE_provider").1,
             "a valid date prefix must not make a malformed provider timestamp fresh"
         );
     }

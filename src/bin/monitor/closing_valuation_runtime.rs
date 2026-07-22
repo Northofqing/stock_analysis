@@ -6,7 +6,7 @@
 
 use chrono::NaiveDate;
 use diesel::prelude::*;
-use stock_analysis::data_provider::{AdjustType, DataProvider, RustdxProvider};
+use stock_analysis::data_provider::{AdjustType, DataProvider, MagicTdxProvider, RustdxProvider};
 use stock_analysis::database::{self, DatabaseManager};
 use stock_analysis::portfolio::closing_valuation::{
     calculate_closing_valuation, ClosingPriceEvidence,
@@ -43,11 +43,24 @@ fn run_blocking(
     if snapshot.confirm_empty || snapshot.items.is_empty() {
         return Err("BR-147 confirmed-empty snapshot: valuation unavailable".into());
     }
-    let provider = RustdxProvider::new().map_err(|e| e.to_string())?;
+    // Magic TDX is the primary real-data source for settled closes. RustDX is
+    // retained as a real-data fallback when the primary endpoint is empty.
+    let magic_provider = MagicTdxProvider::new().ok();
+    let rustdx_provider = RustdxProvider::new().map_err(|e| e.to_string())?;
     let mut prices = Vec::new();
     let mut previous = Vec::new();
     for item in &snapshot.items {
-        let bars = provider.get_daily_data(&item.code, 10).ok();
+        let (bars, provider_name) = match magic_provider
+            .as_ref()
+            .and_then(|provider| provider.get_daily_data(&item.code, 10).ok())
+            .filter(|rows| !rows.is_empty())
+        {
+            Some(rows) => (Some(rows), "magic_tdx"),
+            None => (
+                rustdx_provider.get_daily_data(&item.code, 10).ok(),
+                "rustdx_none",
+            ),
+        };
         let mut closes: Vec<(NaiveDate, f64)> = bars
             .as_ref()
             .map(|rows| {
@@ -90,18 +103,16 @@ fn run_blocking(
                 })
                 .collect();
         }
-        let current = closes.iter().find(|(d, _)| *d == date).ok_or_else(|| {
-            format!(
-                "BR-147 {} missing settled RustDX close for {date}",
-                item.code
-            )
-        })?;
+        let current = closes
+            .iter()
+            .find(|(d, _)| *d == date)
+            .ok_or_else(|| format!("BR-147 {} missing settled close for {date}", item.code))?;
         prices.push(ClosingPriceEvidence {
             code: item.code.clone(),
             price_date: date,
             close: current.1,
             provider: if bars.is_some() {
-                "rustdx_none"
+                provider_name
             } else {
                 "stock_daily_backfill"
             }
