@@ -2828,7 +2828,7 @@ dependencies = [
 
 [[package]]
 name = "magic-market-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -2836,7 +2836,7 @@ dependencies = [
 
 [[package]]
 name = "magic-tdx-rs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crc32fast",
  "encoding_rs",

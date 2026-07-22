@@ -86,6 +86,10 @@ fn required_publish_date(item: &Value) -> Result<(String, chrono::NaiveDate)> {
             chrono::NaiveDateTime::parse_from_str(&raw, "%Y-%m-%d %H:%M:%S")
                 .map(|timestamp| timestamp.date())
         })
+        .or_else(|_| {
+            chrono::NaiveDateTime::parse_from_str(&raw, "%Y-%m-%d %H:%M:%S%.f")
+                .map(|timestamp| timestamp.date())
+        })
         .map_err(|error| anyhow!("一致预期 publishDate 非法 {raw:?}: {error}"))?;
     Ok((date.format("%Y-%m-%d").to_string(), date))
 }
@@ -307,6 +311,8 @@ mod strict_contract_tests {
         assert!(required_publish_date(&bad_date).is_err());
         let trailing_garbage = serde_json::json!({"publishDate": "2026-07-18 garbage"});
         assert!(required_publish_date(&trailing_garbage).is_err());
+        let fractional = serde_json::json!({"publishDate": "2026-07-03 00:00:00.000"});
+        assert_eq!(required_publish_date(&fractional).unwrap().0, "2026-07-03");
         assert!(required_text(&serde_json::json!({"title": ""}), "title").is_err());
     }
 
