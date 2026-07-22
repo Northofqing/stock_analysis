@@ -3642,12 +3642,14 @@ async fn main() {
         // v13.12 (Task 12): 盘后回溯调度 — 30 min tick, 15:30 后触发持仓个股近 30 天新闻回溯
 
         let post_close_news = tokio::spawn(post_close_news_scheduler());
+        let post_close_fund_inflow = tokio::spawn(post_close_fund_inflow_scheduler());
         let post_session_review = spawn_post_session_review_scheduler();
         let background_tasks = vec![
             ("dryrun_reporter", dryrun_reporter),
             ("outcome_backfill", outcome_backfill),
             ("monitor_event_consumer", event_consumer),
             ("post_close_news", post_close_news),
+            ("post_close_fund_inflow", post_close_fund_inflow),
             ("post_session_review", post_session_review),
         ];
 
@@ -8924,6 +8926,40 @@ async fn post_close_news_scheduler() {
             log::info!("[盘后调度] tick @ {} → 触发回溯", now_local.format("%H:%M"));
 
             post_close_news_review().await;
+        }
+    }
+}
+
+/// BR-073: production owner for the 15:35 post-close main-inflow paper buy.
+/// This is separate from the 19:00 review batch because the source stabilizes
+/// shortly after the close. It writes paper trades only and is idempotent per
+/// trading date in the dispatcher.
+async fn post_close_fund_inflow_scheduler() {
+    let threshold = chrono::NaiveTime::from_hms_opt(15, 35, 0).expect("valid 15:35 time");
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut attempted_date: Option<chrono::NaiveDate> = None;
+    log::info!("[盘后资金调度][BR-073] started threshold=15:35 interval=60s");
+
+    loop {
+        interval.tick().await;
+        let now = chrono::Local::now();
+        if now.time() < threshold
+            || !stock_analysis::calendar::is_trading_day(now.date_naive())
+            || attempted_date == Some(now.date_naive())
+        {
+            continue;
+        }
+        attempted_date = Some(now.date_naive());
+        let Some(banner) = current_banner_for("BR-073 post-close fund inflow") else {
+            log::error!("[盘后资金调度][BR-073] banner unavailable; keep explicit no-data audit");
+            continue;
+        };
+        let date = now.date_naive().to_string();
+        if push_templates::dispatch_post_close_fund_inflow_buy(&date, &banner).await {
+            log::info!("[盘后资金调度][BR-073] 15:35 virtual buy dispatched date={date}");
+        } else {
+            log::warn!("[盘后资金调度][BR-073] 15:35 virtual buy not delivered date={date}");
         }
     }
 }
