@@ -13,7 +13,7 @@
 //!   - 只有缺盘口时, 推送横幅显示 "[⚠️ 缺盘口深度: 本条不含承接判断]"
 //!   - 业务侧 (T-07 候选触发) 缺盘口时 EvidenceQuality=Missing, 但不阻塞触发
 
-use chrono::{DateTime, FixedOffset, Utc};
+use chrono::{DateTime, FixedOffset};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -281,9 +281,10 @@ impl CapabilityTracker {
             )
                 .hash(&mut h);
         }
+        let fingerprint = format!("cap-v1-{:016x}", h.finish());
         Ok(CapabilityDiagnosticSnapshot {
             observations,
-            fingerprint: format!("cap-v1-{h:016x}"),
+            fingerprint,
             first_probe_complete,
         })
     }

@@ -221,7 +221,7 @@ impl AuditDispatcher {
     fn preflight_inner(&self, recovery: bool) -> Result<AuditPreflightReceipt, String> {
         use fs2::FileExt;
         let year = chrono::Local::now().format("%Y").to_string();
-        let result = (|| {
+        let result: Result<AuditPreflightReceipt, String> = (|| {
             fs::create_dir_all(&self.base_dir).map_err(|e| format!("create audit dir: {e}"))?;
             let lock_path = self.base_dir.join(format!("{year}.lock"));
             let lock = OpenOptions::new()
