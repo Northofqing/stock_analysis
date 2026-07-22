@@ -276,6 +276,11 @@ pub fn render_data_mode(
         missing_items,
     );
     append_data_mode_restrictions(&mut out, restrictions);
+    if let Some(note) = closing_valuation_note() {
+        out.push_str(&format!("\n账户状态: 实时账户未接入；{}", note));
+    } else {
+        out.push_str("\n账户状态: 实时账户未接入；用户快照收盘估值不可用");
+    }
     append_data_mode_eta_footer(&mut out, eta);
     out
 }
