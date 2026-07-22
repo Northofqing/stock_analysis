@@ -1604,22 +1604,27 @@ fn refresh_closing_valuation_note() {
         .flatten();
     let note = match stock_analysis::database::closing_valuation::latest_persisted_valuation_view()
     {
-        Ok(Some(view)) => Some(format!(
-            "用户确认账户 {:.1}%仓位，昨日盈亏 {:+.2}；收盘估值 {} 覆盖 {}/{}，来源 {}{}",
-            account
-                .as_ref()
-                .map(|a| a.position_ratio_pct)
-                .unwrap_or(0.0),
-            account.as_ref().map(|a| a.daily_pnl).unwrap_or(0.0),
-            view.valuation.price_date,
-            view.valuation.covered,
-            view.valuation.total,
-            view.valuation.provider,
-            view.valuation
-                .total_unrealized_pnl
-                .map(|p| format!("，持仓未实现盈亏 {p:+.2}"))
-                .unwrap_or_default()
-        )),
+        Ok(Some(view)) => {
+            let account_note = match account.as_ref() {
+                Some(account) => format!(
+                    "用户确认账户 {:.1}%仓位，昨日盈亏 {:+.2}",
+                    account.position_ratio_pct, account.daily_pnl
+                ),
+                None => "用户确认账户摘要缺失（仓位/昨日盈亏不可用）".to_string(),
+            };
+            Some(format!(
+                "{}；收盘估值 {} 覆盖 {}/{}，来源 {}{}",
+                account_note,
+                view.valuation.price_date,
+                view.valuation.covered,
+                view.valuation.total,
+                view.valuation.provider,
+                view.valuation
+                    .total_unrealized_pnl
+                    .map(|p| format!("，持仓未实现盈亏 {p:+.2}"))
+                    .unwrap_or_default()
+            ))
+        }
         Ok(None) => None,
         Err(error) => {
             log::warn!("[BR-147] closing valuation unavailable: {error}");
