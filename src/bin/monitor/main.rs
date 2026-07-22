@@ -8961,11 +8961,11 @@ async fn post_close_fund_inflow_scheduler() {
             continue;
         };
         let date = now.date_naive().to_string();
-        attempted_date = Some(now.date_naive());
         if push_templates::dispatch_post_close_fund_inflow_buy(&date, &banner).await {
+            attempted_date = Some(now.date_naive());
             log::info!("[盘后资金调度][BR-073] 15:35 virtual buy dispatched date={date}");
         } else {
-            log::warn!("[盘后资金调度][BR-073] 15:35 virtual buy not delivered date={date}");
+            log::warn!("[盘后资金调度][BR-073] 15:35 virtual buy not delivered; retry remains eligible date={date}");
         }
     }
 }
