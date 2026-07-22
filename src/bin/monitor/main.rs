@@ -8550,6 +8550,16 @@ async fn monitor_loop() {
                 push_governor_v3(&summary, PushKind::DailyReport, None).await;
             }
 
+            // Real and paper holdings share one informational summary, but remain
+            // explicitly separated; T0Advice is dispatched independently.
+            let summary_date = chrono::Local::now().date_naive().to_string();
+            match push_templates::render_real_paper_position_summary(&summary_date) {
+                Ok(summary) => {
+                    push_governor_v3(&summary, PushKind::DailyReport, None).await;
+                }
+                Err(error) => log::warn!("[持仓汇总] 批次不可用，跳过推送: {}", error),
+            }
+
             // v3 复盘报告
 
             match build_close_review_report().await {

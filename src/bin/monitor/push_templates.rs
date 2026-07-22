@@ -1161,6 +1161,86 @@ pub fn render_daily_report(date: &str, items: &[HoldingDailyPlan<'_>]) -> String
     out
 }
 
+/// Real and paper holdings are intentionally rendered in separate sections.
+/// The message is informational; T0Advice remains the only T0 recommendation path.
+pub fn render_real_paper_position_summary(date: &str) -> Result<String, String> {
+    let snapshot =
+        stock_analysis::database::user_position_snapshot::latest_user_position_snapshot()?
+            .ok_or_else(|| "用户持仓快照不存在".to_string())?;
+    let valuation = stock_analysis::database::closing_valuation::latest_persisted_valuation_view()?;
+    let mut out = format!("📊 持仓汇总（{}）\n【真实持仓】", date);
+    let mut real_market_value = 0.0;
+    let mut real_pnl = 0.0;
+    let mut real_covered = 0usize;
+    for item in &snapshot.items {
+        let v = valuation.as_ref().and_then(|view| {
+            view.valuation
+                .items
+                .iter()
+                .find(|row| row.code == item.code)
+        });
+        match v.and_then(|row| Some((row.close?, row.market_value?, row.unrealized_pnl?))) {
+            Some((close, market_value, pnl)) => {
+                real_market_value += market_value;
+                real_pnl += pnl;
+                real_covered += 1;
+                out.push_str(&format!(
+                    "\n· {}({}) {}股 收盘¥{:.2} 成本¥{:.2} 浮盈亏{:+.2}",
+                    item.name, item.code, item.quantity, close, item.cost_price, pnl
+                ));
+            }
+            None => out.push_str(&format!(
+                "\n· {}({}) {}股 收盘价缺失 成本¥{:.2} 浮盈亏待估",
+                item.name, item.code, item.quantity, item.cost_price
+            )),
+        }
+    }
+    out.push_str(&format!(
+        "\n真实仓合计：覆盖{}/{} 市值{} 浮盈亏{}",
+        real_covered,
+        snapshot.items.len(),
+        if real_covered == snapshot.items.len() {
+            format!("¥{real_market_value:.2}")
+        } else {
+            "待完整收盘数据".to_string()
+        },
+        if real_covered == snapshot.items.len() {
+            format!("¥{real_pnl:+.2}")
+        } else {
+            "待完整收盘数据".to_string()
+        }
+    ));
+
+    out.push_str("\n【虚拟持仓】");
+    let paper = stock_analysis::trading::paper_engine::load_open_positions()?;
+    if paper.is_empty() {
+        out.push_str("\n· 当前无已成交虚拟持仓");
+    } else {
+        let mut paper_mv = 0.0;
+        let mut paper_pnl = 0.0;
+        for position in &paper {
+            let mv = position.current_price * f64::from(position.quantity);
+            let pnl = (position.current_price - position.avg_cost) * f64::from(position.quantity);
+            paper_mv += mv;
+            paper_pnl += pnl;
+            out.push_str(&format!(
+                "\n· {}({}) {}股 现价¥{:.2} 均价¥{:.2} 浮盈亏{:+.2}",
+                position.name,
+                position.code,
+                position.quantity,
+                position.current_price,
+                position.avg_cost,
+                pnl
+            ));
+        }
+        out.push_str(&format!(
+            "\n虚拟仓合计：市值¥{paper_mv:.2} 浮盈亏¥{paper_pnl:+.2}"
+        ));
+    }
+    out.push_str("\n辅助信息，非下单指令");
+    Ok(out)
+}
+
 /// R-02 盘面走向
 #[derive(Debug)]
 pub struct MarketReview<'a> {
