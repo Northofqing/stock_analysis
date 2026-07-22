@@ -137,9 +137,9 @@ pub mod account_mode_log;
 /// BR-103 real-account evidence boundary; nullable fields stay nullable.
 pub mod account_snapshot;
 // v12 PR3-3.2/3.3 (BR-023/024)
+pub mod closing_valuation;
 pub mod position_shares;
 pub mod user_position_snapshot;
-pub mod closing_valuation;
 
 // ============================================================================
 // 数据库管理器 - 单例模式
