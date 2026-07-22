@@ -226,6 +226,7 @@ impl AuditDispatcher {
             let lock_path = self.base_dir.join(format!("{year}.lock"));
             let lock = OpenOptions::new()
                 .create(true)
+                .truncate(true)
                 .read(true)
                 .write(true)
                 .open(&lock_path)

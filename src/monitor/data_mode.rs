@@ -14,7 +14,9 @@
 //!   - 只有缺盘口时, 推送横幅显示 "[⚠️ 缺盘口深度: 本条不含承接判断]"
 //!   - 业务侧 (T-07 候选触发) 缺盘口时 EvidenceQuality=Missing, 但不阻塞触发
 
-use chrono::{DateTime, FixedOffset, Utc};
+#[cfg(test)]
+use chrono::Utc;
+use chrono::{DateTime, FixedOffset};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -244,7 +246,7 @@ impl CapabilityTracker {
                     .last_success_mono
                     .map(|t| now.monotonic.saturating_duration_since(t).as_secs());
                 (
-                    if a.map_or(true, |x| now.expected_now && x > self.stale_after.as_secs()) {
+                    if a.is_none_or(|x| now.expected_now && x > self.stale_after.as_secs()) {
                         CapabilityState::Stale
                     } else {
                         CapabilityState::Healthy
