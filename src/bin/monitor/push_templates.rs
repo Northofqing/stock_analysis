@@ -178,13 +178,20 @@ impl BannerCtx {
     /// 第 1 行: `[icon mode | 仓位N成 | 日盈亏+/-X.X% | 数据DataMode]`
     /// 第 2 行 (可选): `[⚠️ {data_missing_note}]` — 仅 Degraded/Unsafe 时出现
     pub fn render(&self) -> String {
-        let position = self
-            .total_pos
-            .map_or_else(|| "仓位缺失".to_string(), |value| format!("仓位{value}成"));
-        let pnl = self.today_pnl.map_or_else(
-            || "日盈亏缺失".to_string(),
-            |value| format!("日盈亏{value:+.1}%"),
-        );
+        let position = if !self.account_metrics_complete && self.total_pos.is_some() {
+            "仓位已确认".to_string()
+        } else {
+            self.total_pos
+                .map_or_else(|| "仓位缺失".to_string(), |value| format!("仓位{value}成"))
+        };
+        let pnl = if !self.account_metrics_complete && self.today_pnl.is_some() {
+            "日盈亏已确认".to_string()
+        } else {
+            self.today_pnl.map_or_else(
+                || "日盈亏缺失".to_string(),
+                |value| format!("日盈亏{value:+.1}%"),
+            )
+        };
         let line1 = format!(
             "[{} {} | {} | {} | 数据{}]",
             self.account_mode.icon(),
@@ -8798,6 +8805,23 @@ mod tests {
         let text = banner.render();
         assert!(text.contains("仓位缺失"));
         assert!(text.contains("日盈亏缺失"));
+    }
+
+    #[test]
+    fn confirmed_snapshot_banner_does_not_impersonate_realtime_account() {
+        let banner = BannerCtx {
+            account_mode: AccountMode::Frozen,
+            total_pos: Some(7),
+            today_pnl: Some(2.45),
+            account_metrics_complete: false,
+            data_mode: DataMode::Unsafe,
+            data_missing_note: None,
+        };
+        let text = banner.render();
+        assert!(text.contains("仓位已确认"));
+        assert!(text.contains("日盈亏已确认"));
+        assert!(!text.contains("仓位7成"));
+        assert!(!text.contains("日盈亏+2.5%"));
     }
 
     #[test]
