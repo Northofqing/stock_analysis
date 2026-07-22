@@ -48,7 +48,7 @@ struct ItemRow {
 #[derive(QueryableByName)]
 struct IdRow {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
-    id: i64,
+    _id: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,7 +93,7 @@ pub fn save_closing_valuation(
     let db = crate::database::DatabaseManager::get();
     let mut conn = db.get_conn().map_err(|e| e.to_string())?;
     conn.transaction(|c| {
-        if diesel::sql_query("SELECT id FROM closing_valuation_run WHERE run_id=?").bind::<diesel::sql_types::Text,_>(&rid).get_result::<IdRow>(c).optional()?.is_some() { return Ok(SaveClosingValuationReceipt { run_id: rid, inserted: false }); }
+        if diesel::sql_query("SELECT id AS _id FROM closing_valuation_run WHERE run_id=?").bind::<diesel::sql_types::Text,_>(&rid).get_result::<IdRow>(c).optional()?.is_some() { return Ok(SaveClosingValuationReceipt { run_id: rid, inserted: false }); }
         diesel::sql_query("INSERT INTO closing_valuation_run(run_id,price_date,provider,covered,total,total_market_value,total_unrealized_pnl) VALUES (?,?,?,?,?,?,?)").bind::<diesel::sql_types::Text,_>(&rid).bind::<diesel::sql_types::Text,_>(v.price_date.to_string()).bind::<diesel::sql_types::Text,_>(&v.provider).bind::<diesel::sql_types::Integer,_>(v.covered as i32).bind::<diesel::sql_types::Integer,_>(v.total as i32).bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>,_>(v.total_market_value).bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>,_>(v.total_unrealized_pnl).execute(c)?;
         for i in &v.items { diesel::sql_query("INSERT INTO closing_valuation_item(run_id,code,name,quantity,cost_price,close,market_value,unrealized_pnl,unrealized_return_pct,daily_price_pnl) VALUES (?,?,?,?,?,?,?,?,?,?)").bind::<diesel::sql_types::Text,_>(&rid).bind::<diesel::sql_types::Text,_>(&i.code).bind::<diesel::sql_types::Text,_>(&i.name).bind::<diesel::sql_types::BigInt,_>(i.quantity as i64).bind::<diesel::sql_types::Double,_>(i.cost_price).bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>,_>(i.close).bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>,_>(i.market_value).bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>,_>(i.unrealized_pnl).bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>,_>(i.unrealized_return_pct).bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>,_>(i.daily_price_pnl).execute(c)?; }
         Ok(SaveClosingValuationReceipt { run_id: rid, inserted: true })
