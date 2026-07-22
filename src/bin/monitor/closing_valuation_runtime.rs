@@ -23,7 +23,7 @@ pub async fn run_closing_valuation_once(
 
 /// True after the local exchange close; callers should additionally gate on a
 /// trading-day calendar before invoking the worker.
-pub fn eligible_after_close(now: chrono::DateTime<chrono::Local>) -> bool {
+pub fn eligible_after_close(now: chrono::DateTime<chrono::FixedOffset>) -> bool {
     let t = now.time();
     t >= chrono::NaiveTime::from_hms_opt(15, 0, 0).expect("valid close")
 }

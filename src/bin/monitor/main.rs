@@ -3800,7 +3800,7 @@ async fn post_session_review_scheduler() {
         }
 
         if valuation_date != Some(now.date_naive())
-            && closing_valuation_runtime::eligible_after_close(now)
+            && closing_valuation_runtime::eligible_after_close(now.fixed_offset())
         {
             match closing_valuation_runtime::run_closing_valuation_once(now.date_naive()).await {
                 Ok(receipt) => {
