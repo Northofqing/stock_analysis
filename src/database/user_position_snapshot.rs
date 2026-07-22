@@ -27,6 +27,11 @@ struct SnapshotIdentity {
     evidence_sha256: String,
 }
 #[derive(QueryableByName)]
+struct SnapshotIdOnly {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    id: i64,
+}
+#[derive(QueryableByName)]
 struct SnapshotItem {
     #[diesel(sql_type = diesel::sql_types::Text)]
     code: String,
@@ -74,12 +79,12 @@ pub fn save_user_position_snapshot(
     let db = crate::database::DatabaseManager::get();
     let mut conn = db.get_conn().map_err(|e| e.to_string())?;
     conn.transaction(|conn| {
-        let existing: Option<SnapshotIdentity> = diesel::sql_query("SELECT id, evidence_sha256 FROM user_position_snapshot WHERE snapshot_id=? OR evidence_sha256=?")
+        let existing: Option<SnapshotIdentity> = diesel::sql_query("SELECT id AS id, evidence_sha256 AS evidence_sha256 FROM user_position_snapshot WHERE snapshot_id=? OR evidence_sha256=?")
             .bind::<diesel::sql_types::Text,_>(&input.snapshot_id).bind::<diesel::sql_types::Text,_>(&input.evidence_sha256).get_result(conn).optional()?;
         if let Some(row) = existing { if row.evidence_sha256 != input.evidence_sha256 { return Err(diesel::result::Error::RollbackTransaction); } return Ok(SaveUserPositionSnapshotReceipt { snapshot_row_id:row.id, inserted:false }); }
         diesel::sql_query("INSERT INTO user_position_snapshot(snapshot_id,effective_at,confirmed_at,source,confirm_empty,evidence_sha256,item_count) VALUES (?,?,?,?,?,?,?)")
             .bind::<diesel::sql_types::Text,_>(&input.snapshot_id).bind::<diesel::sql_types::Text,_>(input.effective_at.to_rfc3339()).bind::<diesel::sql_types::Text,_>(input.confirmed_at.to_rfc3339()).bind::<diesel::sql_types::Text,_>(&input.source).bind::<diesel::sql_types::Integer,_>(input.confirm_empty as i32).bind::<diesel::sql_types::Text,_>(&input.evidence_sha256).bind::<diesel::sql_types::Integer,_>(input.items.len() as i32).execute(conn)?;
-        let id: i64 = diesel::sql_query("SELECT id FROM user_position_snapshot WHERE snapshot_id=?").bind::<diesel::sql_types::Text,_>(&input.snapshot_id).get_result::<SnapshotIdentity>(conn)?.id;
+        let id: i64 = diesel::sql_query("SELECT id FROM user_position_snapshot WHERE snapshot_id=?").bind::<diesel::sql_types::Text,_>(&input.snapshot_id).get_result::<SnapshotIdOnly>(conn)?.id;
         for item in &input.items { diesel::sql_query("INSERT INTO user_position_snapshot_item(snapshot_id,code,name,quantity,cost_price) VALUES (?,?,?,?,?)").bind::<diesel::sql_types::Text,_>(&input.snapshot_id).bind::<diesel::sql_types::Text,_>(&item.code).bind::<diesel::sql_types::Text,_>(&item.name).bind::<diesel::sql_types::BigInt,_>(item.quantity as i64).bind::<diesel::sql_types::Double,_>(item.cost_price).execute(conn)?; }
         Ok(SaveUserPositionSnapshotReceipt { snapshot_row_id:id, inserted:true })
     }).map_err(|e| e.to_string())
