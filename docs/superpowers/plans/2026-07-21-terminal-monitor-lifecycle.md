@@ -227,8 +227,8 @@ git commit -m "fix: run terminal commands outside service gate"
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets --all-features -- --test-threads=1
-STOCK_DB=/Users/zhangzhen/Desktop/Quant/stock_analysis/data/stock_analysis.db bash tools/compliance/check.sh
-cargo llvm-cov --workspace --all-features --json --output-path target/coverage/coverage.json
+STOCK_DB=/Users/zhangzhen/Desktop/Quant/stock_analysis/data/stock_analysis.db FRESHNESS_TODAY=2026-07-21 bash tools/compliance/check.sh
+cargo llvm-cov --workspace --all-features --json --output-path target/coverage/coverage.json -- --test-threads=1
 python3 tools/coverage/check_thresholds.py target/coverage/coverage.json
 cargo build --release --bin monitor
 git diff --check
@@ -243,7 +243,9 @@ compliance, release build and `git diff --check` all exited 0. The library suite
 passed 1,797 tests with four explicit ignores; the monitor suite passed 413
 tests with one process-helper ignore; all remaining targets passed. Production
 freshness validation was read-only and `stock_daily` was current through
-2026-07-20 (one completed trading day behind). The deterministic serial coverage
+2026-07-20 (one completed trading day behind). `FRESHNESS_TODAY=2026-07-21`
+records the latest completed-session as-of date because the July 22 session had
+not opened when the final gate ran. The deterministic serial coverage
 report measured 87,565/108,638 = 80.60% globally and 34,104/35,868 = 95.08%
 across the registered core files.
 
