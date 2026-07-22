@@ -1,7 +1,7 @@
 //! 一次性回填 stock_daily 数据 (R-3 修复)
 //!
 //! 用途: stock_daily 停更超过 1 个交易日时, 触发一次全量拉取 + 落盘。
-//! 数据源: RustDX 通达信 (主) → GtimgProvider (备) → HttpProvider (备)。
+//! 数据源: Magic TDX (主) → GtimgProvider (备) → HttpProvider (备)。
 //!
 //! 用法:
 //!   STOCK_DB=data/stock_analysis.db cargo run --bin backfill_daily

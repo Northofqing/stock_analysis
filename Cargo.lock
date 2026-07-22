@@ -5210,22 +5210,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustdx-complete"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a67bdc2637bf226d93ad62288943619c857e954d6d34a0a486acb87200612281"
-dependencies = [
- "chrono",
- "encoding_rs",
- "lazy_static",
- "log",
- "miniz_oxide",
- "serde",
- "thiserror 1.0.69",
- "trade_date_a",
-]
-
-[[package]]
 name = "rustix"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5770,7 +5754,6 @@ dependencies = [
  "reqwest 0.12.28",
  "rpassword",
  "rusqlite",
- "rustdx-complete",
  "serde",
  "serde_json",
  "serde_urlencoded",
@@ -6283,15 +6266,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
-]
-
-[[package]]
-name = "trade_date_a"
-version = "2025.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6e087a0eafa71bc4c0c0768122fdc5d09c92a4c1a0199c147092f8527a5de62"
-dependencies = [
- "chrono",
 ]
 
 [[package]]

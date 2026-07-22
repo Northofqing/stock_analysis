@@ -123,10 +123,10 @@ mod tests {
             code: "TEST_CODE_000001".into(),
             price_date: d,
             close: 11.0,
-            provider: "rustdx".into(),
+            provider: "magic_tdx".into(),
             evidence_hash: "a".into(),
         }];
-        let v = calculate_closing_valuation(&items, &p, &[], d, "rustdx").unwrap();
+        let v = calculate_closing_valuation(&items, &p, &[], d, "magic_tdx").unwrap();
         assert_eq!(v.covered, 1);
         assert_eq!(v.total_market_value, None);
         assert_eq!(v.items[0].unrealized_pnl, Some(100.0));

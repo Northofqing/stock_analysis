@@ -90,15 +90,22 @@ fn run_blocking(
                 })
                 .collect();
         }
-        let current = closes
-            .iter()
-            .find(|(d, _)| *d == date)
-            .ok_or_else(|| format!("BR-147 {} missing settled Magic TDX close for {date}", item.code))?;
+        let current = closes.iter().find(|(d, _)| *d == date).ok_or_else(|| {
+            format!(
+                "BR-147 {} missing settled Magic TDX close for {date}",
+                item.code
+            )
+        })?;
         prices.push(ClosingPriceEvidence {
             code: item.code.clone(),
             price_date: date,
             close: current.1,
-            provider: if bars.is_some() { "magic_tdx" } else { "stock_daily_backfill" }.into(),
+            provider: if bars.is_some() {
+                "magic_tdx"
+            } else {
+                "stock_daily_backfill"
+            }
+            .into(),
             evidence_hash: format!("{}:{}:{:.6}", item.code, date, current.1),
         });
         if let Some((_, prev)) = closes.iter().find(|(d, _)| *d < date) {

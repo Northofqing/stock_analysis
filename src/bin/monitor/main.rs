@@ -3332,13 +3332,13 @@ async fn main() {
 
     // Task 8: 启动 banner 列出 K线 fallback 链 + 盘后路径, 便于线上排查.
 
-    // 4-way 盘中 (review #15 + Phase 1): Sina → 腾讯 → 东财 → RustDX 并行竞速.
+    // 4-way 盘中 (review #15 + Phase 1): Magic TDX → Sina → 腾讯 → 东财 并行竞速.
 
     // 盘后专用 (Phase 1 post_close): Baostock (P1) → 4-way fallthrough (P2).
 
     log::info!(
 
-        "[启动] K线 fallback chain (盘中): sina_hq (P1) → tencent_qfq (P2) → eastmoney_qfq (P3) → rustdx_none (P4) | review #15 + #16"
+        "[启动] K线 fallback chain (盘中): magic_tdx (P1) → sina_hq (P2) → tencent_qfq (P3) → eastmoney_qfq (P4) | review #15 + #16"
 
     );
 

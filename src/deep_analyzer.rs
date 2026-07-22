@@ -45,7 +45,7 @@ fn build_freshness_config() -> FreshnessConfig {
 /// K 线数据 freshness gate (修复 P0-E).
 /// 拒绝时返回 Err 含中文 reason, 业务层 bail.
 fn check_kline_freshness(code: &str, kline: &[KlineData]) -> Result<()> {
-    // 修复 v9.4.26 P3 bug: 之前用 kline.last() 取最旧日期 (RustDX 按 date 降序, last 是最旧),
+    // 修复 v9.4.26 P3 bug: 之前用 kline.last() 取最旧日期 (数据按 date 降序, last 是最旧),
     // freshness 永远 reject. 改成用 kline.iter().map(|k| k.date).max() 拿最新日期.
     let Some(latest_date) = kline.iter().map(|k| k.date).max() else {
         anyhow::bail!("[MultiAgent] {} K 线为空", code);
@@ -62,9 +62,8 @@ fn check_kline_freshness(code: &str, kline: &[KlineData]) -> Result<()> {
     Ok(())
 }
 
-/// 修复 v9.4.26 P3: 走 DataFetcherManager 路径 (RustDX 优先) 而不是 service::service().get_kline.
-/// 后者东方财富 → 腾讯 → RustDX 顺序在东方财富被 ban / 腾讯返回旧数据时拿到 2025 年 K 线.
-/// 跟 backfill_daily 一致, 用 DataFetcherManager::new() 拿多源回落 (RustDX → 腾讯 → 东方财富).
+/// 修复 v9.4.26 P3: 走 DataFetcherManager 路径 (Magic TDX 优先) 而不是 service::service().get_kline.
+/// 跟 backfill_daily 一致, 用 DataFetcherManager::new() 拿多源回落。
 async fn fetch_kline_via_manager(code: &str, days: usize) -> Result<Vec<KlineData>> {
     let manager = crate::data_provider::DataFetcherManager::new()
         .map_err(|e| anyhow::anyhow!("DataFetcherManager 初始化失败: {e}"))?;
@@ -361,9 +360,7 @@ pub async fn run_multi_agent_analysis(code: &str) -> Result<String> {
     log::info!("[MultiAgent] 开始抓取数据：{}", code);
 
     // 1. K 线（修复 v9.4.26 P3）: 走 DataFetcherManager 路径
-    //    (RustDX → 腾讯 → 东方财富) 而不是 service::service().get_kline
-    //    (东方财富 → 腾讯 → RustDX). 后者东方财富被 ban 时落到腾讯
-    //    拿到 2025 年旧数据. 走 DataFetcherManager 让 RustDX 当首选.
+    //    (Magic TDX → 腾讯 → 东方财富) 而不是 service::service().get_kline
     let kline = fetch_kline_via_manager(code, 250).await?;
     if kline.is_empty() {
         anyhow::bail!("K 线数据为空，无法进行多角色分析");
@@ -625,7 +622,7 @@ mod tests_br006 {
     }
 
     /// 修复 v9.4.26 P3 bug: 之前 check_kline_freshness 用 kline.last() 取最旧日期,
-    /// RustDX 数据按 date 降序 (最新在前), last() 拿到 1 年前的旧日期, freshness
+    /// 数据按 date 降序 (最新在前), last() 拿到 1 年前的旧日期, freshness
     /// 永远 reject. 改用 kline.iter().map(|k| k.date).max() 拿最新日期.
     /// 这个测试覆盖: 250 条 K 线, 最新 2026-06-30 + 最旧 2025-06-19 (降序),
     /// freshness 应通过 (取最新日期).
@@ -634,7 +631,7 @@ mod tests_br006 {
         use crate::data_provider::KlineData;
         let today = latest_effective_trading_day(chrono::Local::now());
         let old_date = today - chrono::Duration::days(249);
-        // 构造降序 K 线 (RustDX 默认顺序): 最新在前, 最旧在后
+        // 构造降序 K 线: 最新在前, 最旧在后
         let kline: Vec<KlineData> = (0..250)
             .map(|i| KlineData {
                 date: today - chrono::Duration::days(i),

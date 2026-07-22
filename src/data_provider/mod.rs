@@ -19,7 +19,6 @@ pub mod limit_status;
 pub mod magic_tdx_provider;
 pub mod money_flow;
 pub mod north_flow;
-pub mod rustdx_provider;
 pub mod service;
 pub mod sina_news_provider;
 pub mod sina_provider;
@@ -45,7 +44,6 @@ pub use money_flow::{
     fetch_intraday_shape_blocking, fetch_money_flow_blocking,
     format_for_prompt as format_flow_prompt, IntradayShape, MoneyFlowSummary,
 };
-pub use rustdx_provider::RustdxProvider;
 pub use sina_provider::SinaProvider;
 pub use valuation_history::{fetch_blocking as fetch_valuation_history, ValuationHistory};
 
@@ -59,7 +57,7 @@ use crate::block_on_async_with_timeout;
 /// 复权方式标注 — v11 P0-2 引入
 ///
 /// 每条 K 线标注其价格口径,便于切源时下游比对。
-/// - `Qfq`: 前复权 (腾讯/东财 HTTP 直出, 或 RustDX 经 gbbq 计算)
+/// - `Qfq`: 前复权 (腾讯/东财 HTTP 直出)
 /// - `None`: 不复权 (历史默认值; DB 反序列化路径也用此值, 语义为"上游假定 Qfq, 字段值不可知")
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum AdjustType {
@@ -141,7 +139,7 @@ pub struct KlineData {
     pub amount: f64,
     pub pct_chg: f64,
     /// 修复 P1.8: 盘中实时价 (与 close 分离)
-    /// 之前: rustdx_provider 用 quote.price 覆盖 latest.close, 导致 Sharpe 用盘中价
+    /// 历史适配器曾用 quote.price 覆盖 latest.close，导致 Sharpe 使用盘中价
     ///       60 日滚动计算实际变成了盘中波动, 不是日线 settled close
     /// 现在: intraday_price 单独存盘中价, close 保持日线 settled close
     /// Sharpe 计算只用 close, 避免 look-ahead
@@ -368,7 +366,7 @@ impl DataFetcherManager {
         code: &str,
         days: usize,
     ) -> Result<(Vec<KlineData>, &'static str)> {
-        // 1. 走共享 fallback (腾讯 → 东财 → RustDX)
+        // 1. 走共享 fallback (Magic TDX → 腾讯 → 东财)
         // block_on_async_with_timeout 把 future 输出包装成 Result<_, String>,
         // future 本身又是 anyhow::Result, 故嵌套为 Result<Result<_>, String>. 两个 ? 解嵌套.
         let (data, source_name) =
@@ -601,7 +599,7 @@ mod tests {
         }
     }
 
-    /// v11 P0-2: AdjustType as_str 应返回稳定的小写字符串,用于 data_source 复合命名 (rustdx_qfq / tencent_qfq / eastmoney_qfq)
+    /// v11 P0-2: AdjustType as_str 应返回稳定的小写字符串,用于 data_source 复合命名。
     #[test]
     fn adjust_type_as_str_stable() {
         assert_eq!(AdjustType::Qfq.as_str(), "qfq");

@@ -4,13 +4,8 @@
 //! 两个 K 线入口 (`DataFetcherManager::get_daily_data` sync + `service::get_kline` async)
 //! 共用同一套 fallback 顺序和 1-失败-触发-fallback 逻辑, 避免两套实现漂移。
 //!
-//! review #15: 顺序 **腾讯 → 东财 → RustDX** 改为三源**竞速** (tokio::join!).
-//! 第一个返回 Ok+质检通过 即胜出, 其余 cancel. 串行最差延迟 9s → 并行 2s 左右.
-//! 优先级: RustDX 路径仍走 spawn_blocking (TCP 不能与 HTTP 共享 runtime 调度).
-//!
-//! 顺序: **腾讯 ≈ 东财 ≈ RustDX** (race)
-//! - 腾讯/东财: 前复权 (`adjust = Qfq`), HTTP 稳定
-//! - RustDX: 不复权 (`adjust = None`), TCP 仅做兜底 (B 方案回退, 见 v11-p0-1-p0-2-设计定稿v2-2026-07-02 §5.3)
+//! review #15: Magic TDX、腾讯、东财四源竞速。
+//! 第一个返回 Ok+质检通过即胜出，其余取消。
 //!
 //! v11 P0-1 commit 3: 每个 provider 返回 Ok 后调 `validate_daily_kline_quality`,
 //! 校验失败 → 标记该源失败, 用剩余源中第一个 Ok 的.
@@ -43,7 +38,7 @@ fn brief(s: &str) -> String {
 ///
 /// 优先级:
 /// 1. Baostock (证券所级别日终数据, 0 风险, 无频限) — 盘后窗口的权威源
-/// 2. fallthrough 到 review #15 5-way join (sina_hq / tencent_qfq / eastmoney_qfq / rustdx_none)
+/// 2. fallthrough 到 review #15 4-way join (sina_hq / tencent_qfq / eastmoney_qfq)
 ///
 /// 返回 `(data, source_name)`: source_name 是 `baostock` 或 5-way 之一.
 ///
@@ -87,11 +82,11 @@ where
 ///
 /// 返回 `(data, source_name)`:
 /// - `data`: K 线列表 (可能标 `Qfq` 或 `None`, 见 `KlineData.adjust`)
-/// - `source_name`: `tencent_qfq` / `eastmoney_qfq` / `rustdx_none`
+/// - `source_name`: `tencent_qfq` / `eastmoney_qfq`
 ///
 /// review #15 改造: 三源**并行竞速**, 第一个返回 Ok+质检通过 即胜出, 其余丢弃.
-/// 串行最差延迟 (腾讯 2s + 东财 2s + RustDX 5s = 9s) → 并行 P99 约 2s.
-/// RustDX 是 TCP 阻塞, 必须 spawn_blocking; 三个 future 一起 join 后, 第一个
+/// 串行最差延迟 → 并行 P99 约 2s.
+/// 第一个
 /// 质检通过的胜出. 用 enum 区分三源返回 + 质检结果, select_ok 语义.
 ///
 /// 失败策略:
@@ -115,7 +110,7 @@ pub async fn fetch_kline_with_fallback(
     // 当 Eastmoney push2his 返回 HTML/网络黑洞时, 每只票会被它拖满 6 次重试,
     // 即使 Sina 已经成功也要等 Eastmoney 结束, 最终 --test 盘后复盘被 300s cap 打爆。
     // 这里改成真正的 first-valid-completion: 任一源返回 Ok 且质检通过即返回,
-    // 剩余 HTTP future 被 drop 取消；RustDX spawn_blocking 可能后台完成, 但不再阻塞主链路。
+    // 剩余 HTTP future 被 drop 取消，不再阻塞主链路。
     let candidates: FuturesUnordered<ProviderFuture> = FuturesUnordered::new();
 
     let magic_code = code.to_string();

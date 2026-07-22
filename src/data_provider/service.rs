@@ -10,7 +10,7 @@
 //!   跨日期 process 重启前老缓存不会无限期有效，过期后下次调用重抓。
 //! - 每个 cache key 一个 `tokio::sync::RwLock<Option<(Instant, Arc<V>)>>`，
 //!   读时检查 TTL，过期则 invalidate。
-//! - 多源回落：东方财富 → 腾讯 → RustDX。**P2 ban 检测**：empty reply / 4xx / 持续超时
+//! - 多源回落：Magic TDX → 东方财富 → 腾讯。**P2 ban 检测**：empty reply / 4xx / 持续超时
 //!   立即跳下一个源，不重试已 ban 域。
 //! - 只缓存确实出现跨模块复用的字段；新增字段时再扩展，不预先抽象。
 //! - 缓存值 `Arc<T>`，避免重复克隆大数据（K 线 250 行）。
@@ -157,7 +157,7 @@ impl DataFetchService {
         if let Some(cached) = Self::read_cache(&cell).await {
             return Ok(Arc::new(cached));
         }
-        // 2. cache miss / 过期 → 抓 (共享 fallback: 腾讯 → 东财 → RustDX)
+        // 2. cache miss / 过期 → 抓 (共享 fallback: Magic TDX → 腾讯 → 东财)
         let cell_for_write = cell.clone();
         let (data, source) =
             crate::data_provider::fallback::fetch_kline_with_fallback(code, days).await?;

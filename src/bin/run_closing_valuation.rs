@@ -80,8 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             previous.push((item.code.clone(), *prev));
         }
     }
-    let view =
-        calculate_closing_valuation(&snapshot.items, &prices, &previous, date, "magic_tdx")?;
+    let view = calculate_closing_valuation(&snapshot.items, &prices, &previous, date, "magic_tdx")?;
     let receipt = database::closing_valuation::save_closing_valuation(&view)?;
     println!(
         "run_id={} inserted={} covered={}/{} price_date={}",
