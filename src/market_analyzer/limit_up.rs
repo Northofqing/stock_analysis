@@ -60,10 +60,10 @@ impl MarketAnalyzer {
                 let change_pct = item
                     .get("changepercent")
                     .and_then(|v| v.as_f64())
-                    .filter(|value| value.is_finite() && value.abs() <= 20.0)
+                    .filter(|value| value.is_finite())
                     .ok_or_else(|| {
                         anyhow::anyhow!(
-                            "新浪涨停榜第{page}页第{}行 changepercent 缺失/超过±20%",
+                            "新浪涨停榜第{page}页第{}行 changepercent 缺失/非法",
                             row_index + 1
                         )
                     })?;
@@ -85,6 +85,12 @@ impl MarketAnalyzer {
                     .trim_start_matches("sh")
                     .trim_start_matches("sz")
                     .trim_start_matches("bj");
+                let limit_pct = Self::get_limit_pct(code, stock_name);
+                if change_pct.abs() > limit_pct {
+                    log::warn!(
+                        "[DQ-2.3] 新浪涨停榜 {code}({stock_name}) changepercent={change_pct}% 超过常规板块±{limit_pct}%，保留真实值并标记需人工确认"
+                    );
+                }
                 let price = item
                     .get("trade")
                     .and_then(|v| v.as_str())
@@ -217,8 +223,14 @@ impl MarketAnalyzer {
                 let change_pct = item
                     .get("f3")
                     .and_then(|v| v.as_f64())
-                    .filter(|value| value.is_finite() && value.abs() <= 20.0)
-                    .ok_or_else(|| anyhow::anyhow!("东财涨停榜 {code} change_pct 缺失/超过±20%"))?;
+                    .filter(|value| value.is_finite())
+                    .ok_or_else(|| anyhow::anyhow!("东财涨停榜 {code} change_pct 缺失/非法"))?;
+                let limit_pct = Self::get_limit_pct(code, name);
+                if change_pct.abs() > limit_pct {
+                    log::warn!(
+                        "[DQ-2.3] 东财涨停榜 {code}({name}) change_pct={change_pct}% 超过常规板块±{limit_pct}%，保留真实值并标记需人工确认"
+                    );
+                }
                 let price = item
                     .get("f2")
                     .and_then(|v| v.as_f64())

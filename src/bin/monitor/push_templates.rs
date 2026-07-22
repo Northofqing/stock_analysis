@@ -2692,12 +2692,17 @@ fn fetch_realtime_quote_batch_strict(
                             if quote.price.is_finite()
                                 && quote.price > 0.0
                                 && quote.pct_chg.is_finite()
-                                && quote.pct_chg.abs() <= 20.0
                                 && realtime_quote_source_is_fresh(
                                     quote.source_time,
                                     chrono::Utc::now(),
                                 ) =>
                         {
+                            if quote.pct_chg.abs() > 20.0 {
+                                log::warn!(
+                                    "[DQ-2.3] realtime quote {} pct_chg={:.2}% 超过常规±20%，保留真实值并标记需人工确认",
+                                    code, quote.pct_chg
+                                );
+                            }
                             match result.lock() {
                                 Ok(mut quotes) => {
                                     quotes.insert(code, quote);
@@ -2818,8 +2823,13 @@ pub fn load_news_catalyst_snapshot_real(hhmm: &str) -> Result<NewsCatalystSnapsh
             let change_pct = item
                 .get("change_pct")
                 .and_then(|v| v.as_f64())
-                .filter(|value| value.is_finite() && value.abs() <= 20.0)
+                .filter(|value| value.is_finite())
                 .ok_or_else(|| format!("I-02 {code} 缺少有效 change_pct"))?;
+            if change_pct.abs() > 20.0 {
+                log::warn!(
+                    "[DQ-2.3] I-02 {code} change_pct={change_pct:.2}% 超过常规±20%，保留真实值并标记需人工确认"
+                );
+            }
             stocks.push((name, code, Some(change_pct as f32)));
         }
         log::info!(

@@ -211,10 +211,15 @@ fn validate_change_pct(
     source: &str,
 ) -> Result<f64, String> {
     let limit = infer_limit_pct(code, name);
-    if !change_pct.is_finite() || change_pct.abs() > limit {
+    if !change_pct.is_finite() {
         return Err(format!(
-            "{source} {code}({name}) change_pct={change_pct:?} 超过板块允许±{limit:.0}%"
+            "{source} {code}({name}) change_pct 缺失/非法: {change_pct:?}"
         ));
+    }
+    if change_pct.abs() > limit {
+        log::warn!(
+            "[DQ-2.3] {source} {code}({name}) change_pct={change_pct:.2}% 超过常规板块±{limit:.0}%，保留真实值并标记需人工确认"
+        );
     }
     Ok(change_pct)
 }
@@ -622,13 +627,10 @@ mod quote_batch_tests {
     }
 
     #[test]
-    fn board_aware_change_pct_validation_accepts_registered_limits_and_rejects_overrun() {
+    fn board_aware_change_pct_validation_accepts_real_values_and_flags_overrun() {
         assert!(validate_change_pct("TEST_CODE_300001", "创业板测试股", 20.0, "test").is_ok());
         assert!(validate_change_pct("TEST_CODE_920305", "北交所测试股", 30.0, "test").is_ok());
-        let error = validate_change_pct("TEST_CODE_920305", "北交所测试股", 30.01, "test")
-            .expect_err("超过北交所涨跌幅必须拒绝");
-        assert!(error.contains("change_pct=30.01"));
-        assert!(error.contains("±30%"));
+        assert!(validate_change_pct("TEST_CODE_920305", "北交所测试股", 30.01, "test").is_ok());
     }
 
     #[test]
