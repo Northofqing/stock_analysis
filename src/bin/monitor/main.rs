@@ -6442,7 +6442,7 @@ async fn news_monitor_loop() {
     }
 }
 
-type T0SnapshotPositions = std::collections::HashMap<String, (String, Option<f64>)>;
+type T0SnapshotPositions = std::collections::HashMap<String, (String, Option<f64>, u64)>;
 type T0PositionSource = (Vec<String>, Option<T0SnapshotPositions>);
 
 async fn monitor_loop() {
@@ -7940,7 +7940,12 @@ async fn monitor_loop() {
                                         let positions = snapshot
                                             .items
                                             .into_iter()
-                                            .map(|item| (item.code.clone(), (item.name, None)))
+                                            .map(|item| {
+                                                (
+                                                    item.code.clone(),
+                                                    (item.name, None, item.quantity),
+                                                )
+                                            })
                                             .collect::<std::collections::HashMap<_, _>>();
                                         let mut codes =
                                             positions.keys().cloned().collect::<Vec<_>>();
@@ -7983,12 +7988,12 @@ async fn monitor_loop() {
                                     market_data::fetch_position_quotes()?
                                 };
 
-                                let position_map: std::collections::HashMap<String, (String, Option<f64>)> = match snapshot_positions {
+                                let position_map: std::collections::HashMap<String, (String, Option<f64>, u64)> = match snapshot_positions {
                                     Some(positions) => positions,
                                     None => stock_analysis::portfolio::get_positions()
                                         .map_err(|error| format!("获取持仓止损证据失败: {error}"))?
                                         .into_iter()
-                                        .map(|position| (position.code.clone(), (position.name, position.hard_stop)))
+                                        .map(|position| (position.code.clone(), (position.name, position.hard_stop, position.shares)))
                                         .collect(),
                                 };
 
@@ -8008,7 +8013,7 @@ async fn monitor_loop() {
                                         continue;
                                     };
 
-                                    let Some((position_name, hard_stop_value)) = position_map.get(&q.code) else {
+                                    let Some((position_name, hard_stop_value, holding_quantity)) = position_map.get(&q.code) else {
                                         return Err(format!("行情批次含非持仓代码 {}", q.code));
                                     };
                                     let hard_stop = hard_stop_value
@@ -8053,15 +8058,17 @@ async fn monitor_loop() {
                                             let stop_text = hard_stop
                                                 .map(|value| format!("¥{value:.2}"))
                                                 .unwrap_or_else(|| "用户快照止损位不可用".to_string());
+                                            let sell_quantity = (*holding_quantity / 3 / 100) * 100;
+                                            let buy_quantity = (*holding_quantity - sell_quantity).min(200);
                                             out.push((snap.code.clone(), format!(
 
-                                                "🔄 做T建议 {}({}) | {} {}\n   现价 ¥{:.2} 涨跌 {:+.2}%\n   高抛: +{:.1}% 减仓1/3\n   低吸: -{:.1}% 回补2/3\n   止损: ¥{:.2}",
+                                                "🔄 做T建议【真实持仓】 {}({}) | {} {}\n   持仓: {}股 | 现价 ¥{:.2} 涨跌 {:+.2}%\n   高抛: +{:.1}% 卖出约{}股\n   低吸: -{:.1}% 回补约{}股\n   止损: {}",
 
                                                 snap.name, snap.code, dir, e.message,
 
-                                                snap.price, snap.change_pct,
+                                                holding_quantity, snap.price, snap.change_pct,
 
-                                                snap.change_pct.abs().max(2.0), snap.change_pct.abs().max(2.0),
+                                                snap.change_pct.abs().max(2.0), sell_quantity, snap.change_pct.abs().max(2.0), buy_quantity,
 
                                                 stop_text
 
