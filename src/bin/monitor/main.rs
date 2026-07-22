@@ -132,6 +132,7 @@ mod dryrun_report; // v26: dry-run 自动报告
 
 mod v13_diag; // v13.27: 端到端诊断
 
+mod closing_valuation_runtime;
 mod data_mode_probe;
 mod market_data; // BR-148: capability probes remain independent from governance DataMode
 
@@ -3784,6 +3785,7 @@ async fn post_session_review_scheduler() {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut state: Option<review_batch::ReviewScheduleState> = None;
+    let mut valuation_date: Option<chrono::NaiveDate> = None;
 
     log::info!("[复盘调度][BR-139] started threshold=19:00 interval=60s");
 
@@ -3795,6 +3797,23 @@ async fn post_session_review_scheduler() {
             stock_analysis::calendar::is_trading_day(now.date_naive()),
         ) {
             continue;
+        }
+
+        if valuation_date != Some(now.date_naive())
+            && closing_valuation_runtime::eligible_after_close(now)
+        {
+            match closing_valuation_runtime::run_closing_valuation_once(now.date_naive()).await {
+                Ok(receipt) => {
+                    log::info!(
+                        "[BR-147] closing valuation persisted: run_id={} inserted={}",
+                        receipt.run_id,
+                        receipt.inserted
+                    );
+                    valuation_date = Some(now.date_naive());
+                    refresh_closing_valuation_note();
+                }
+                Err(error) => log::error!("[BR-147] closing valuation failed: {error}"),
+            }
         }
 
         if state.as_ref().map(review_batch::ReviewScheduleState::date) != Some(now.date_naive()) {
