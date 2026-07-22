@@ -16,7 +16,7 @@
 
 use crate::database::DatabaseManager;
 use crate::trading::paper_trade::{self, Direction, PaperRiskContext, PaperSignal};
-use chrono::Local;
+use chrono::{Local, Timelike};
 use diesel::prelude::*;
 use std::collections::{HashMap, VecDeque};
 
@@ -27,7 +27,7 @@ pub struct PaperPositionSellCheck {
     pub name: String,
     pub avg_cost: f64,
     pub quantity: u32,
-    /// 当前市价来自已注册的真实 provider；缺失时整批失败。
+    /// 当前市价来自实时 provider；收盘后允许使用已验证日收盘价。
     pub current_price: f64,
     pub limit_up_price: f64,
     pub limit_down_price: f64,
@@ -182,8 +182,20 @@ pub fn load_open_positions() -> Result<Vec<PaperPositionSellCheck>, String> {
                 "paper position {code} average cost invalid: {avg_cost}"
             ));
         }
-        let quote = crate::broker::execution_quote(&code)
-            .map_err(|error| format!("paper position {code} quote unavailable: {error}"))?;
+        let quote = match crate::broker::execution_quote(&code) {
+            Ok(quote) => quote,
+            Err(realtime_error) if chrono::Local::now().hour() >= 15 => {
+                load_latest_daily_close_quote(&code, &state.name)
+                .map_err(|close_error| {
+                    format!(
+                        "paper position {code} quote unavailable: realtime={realtime_error}; daily_close={close_error}"
+                    )
+                })?
+            }
+            Err(error) => {
+                return Err(format!("paper position {code} quote unavailable: {error}"));
+            }
+        };
         positions.push(PaperPositionSellCheck {
             code,
             name: state.name,
@@ -197,6 +209,46 @@ pub fn load_open_positions() -> Result<Vec<PaperPositionSellCheck>, String> {
     }
     positions.sort_by(|left, right| left.code.cmp(&right.code));
     Ok(positions)
+}
+
+/// BR-151: after the market closes, a paper-only exit may use the latest
+/// validated daily close when realtime execution quotes are unavailable.
+/// This never supplies a real-account quote or creates a broker order.
+fn load_latest_daily_close_quote(
+    code: &str,
+    name: &str,
+) -> Result<crate::broker::ExecutionQuote, String> {
+    #[derive(diesel::QueryableByName)]
+    struct DailyCloseRow {
+        #[diesel(sql_type = diesel::sql_types::Double)]
+        close: f64,
+    }
+    let mut conn = DatabaseManager::get()
+        .get_conn()
+        .map_err(|error| format!("daily close DB connection failed: {error}"))?;
+    let rows: Vec<DailyCloseRow> = diesel::sql_query(
+        "SELECT close FROM stock_daily WHERE code=? AND close>0 ORDER BY date DESC LIMIT 2",
+    )
+    .bind::<diesel::sql_types::Text, _>(code)
+    .load(&mut conn)
+    .map_err(|error| format!("daily close query failed: {error}"))?;
+    let close = rows
+        .first()
+        .map(|row| row.close)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .ok_or_else(|| "validated daily close missing".to_string())?;
+    let prev_close = rows.get(1).map(|row| row.close).unwrap_or(close);
+    let limits = crate::data_provider::limit_status::LimitStatusCalculator::new()
+        .calculate(code, prev_close, name);
+    log::warn!(
+        "[BR-151] paper position {code} realtime quote unavailable; using validated daily close={close}"
+    );
+    Ok(crate::broker::ExecutionQuote {
+        price: close,
+        limit_down_price: limits.limit_down_price,
+        limit_up_price: limits.limit_up_price,
+        observed_at: chrono::Utc::now(),
+    })
 }
 
 /// 4 铁律检查入口 — 读 analysis_result 表 (由 position_tracker::track_position 写)
