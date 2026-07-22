@@ -504,11 +504,16 @@ pub fn evaluate(input: &DataHealthInput, prev: Option<DataMode>) -> DataHealth {
 
     // 1. Quote 断流 → Unsafe
     if quote_stale {
+        let only_quote = missing.len() <= 1;
         return DataHealth {
             mode: DataMode::Unsafe,
             missing,
             prev_mode: prev,
-            eta: Some("Quote 恢复后".to_string()),
+            eta: Some(if only_quote {
+                "Quote 恢复并通过有效性校验后".to_string()
+            } else {
+                "关键能力恢复并通过 freshness 校验后".to_string()
+            }),
         };
     }
 
