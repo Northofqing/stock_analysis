@@ -185,12 +185,15 @@ pub fn load_open_positions() -> Result<Vec<PaperPositionSellCheck>, String> {
         let quote = match crate::broker::execution_quote(&code) {
             Ok(quote) => quote,
             Err(realtime_error) if chrono::Local::now().hour() >= 15 => {
-                load_latest_daily_close_quote(&code, &state.name)
-                .map_err(|close_error| {
-                    format!(
-                        "paper position {code} quote unavailable: realtime={realtime_error}; daily_close={close_error}"
-                    )
-                })?
+                match load_latest_daily_close_quote(&code, &state.name) {
+                    Ok(quote) => quote,
+                    Err(close_error) => {
+                        log::warn!(
+                            "[BR-154] paper position {code} isolated after-close: realtime={realtime_error}; daily_close={close_error}"
+                        );
+                        continue;
+                    }
+                }
             }
             Err(error) => {
                 return Err(format!("paper position {code} quote unavailable: {error}"));
