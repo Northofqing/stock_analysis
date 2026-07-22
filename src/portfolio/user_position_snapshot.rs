@@ -1,3 +1,4 @@
+//! BR-146: complete user-confirmed snapshots are atomic and latest-wins.
 use chrono::{DateTime, FixedOffset};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

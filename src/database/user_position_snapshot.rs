@@ -1,3 +1,4 @@
+//! BR-146: immutable persistence for complete user-confirmed snapshots.
 use crate::portfolio::user_position_snapshot::{UserPositionItemInput, UserPositionSnapshotInput};
 use chrono::{DateTime, FixedOffset};
 use diesel::prelude::*;

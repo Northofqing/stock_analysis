@@ -1,3 +1,4 @@
+//! BR-148: capability diagnostics are orthogonal to governance DataMode.
 //! v12 PR2-2.1: 数据模式三态判定 (DataHealth ∈ {Full, Degraded, Unsafe}).
 //!
 //! 设计: 与 `risk::account_mode` 对齐 — 纯函数 + 数据入参, 不直接读行情 DB.

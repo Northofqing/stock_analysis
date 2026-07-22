@@ -1,4 +1,4 @@
-//! One-shot importer for a user-confirmed complete position snapshot.
+//! BR-146: one-shot importer for a user-confirmed complete position snapshot.
 use clap::Parser;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;

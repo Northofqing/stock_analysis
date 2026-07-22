@@ -1,3 +1,4 @@
+//! BR-145: sink acceptance commits identity even if audit persistence fails.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeliverySettlement {
     Pushed,

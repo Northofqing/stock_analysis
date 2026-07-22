@@ -1,3 +1,4 @@
+//! BR-147: immutable persistence for validated closing valuation views.
 use crate::portfolio::closing_valuation::{
     ClosingValuationItem, ClosingValuationView as PortfolioValuationView,
 };

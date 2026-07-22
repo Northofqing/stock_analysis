@@ -1,3 +1,4 @@
+//! BR-147: unadjusted settled close validation and partial-coverage valuation.
 use super::user_position_snapshot::UserPositionItemInput;
 use chrono::NaiveDate;
 
