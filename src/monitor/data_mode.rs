@@ -13,7 +13,10 @@
 //!   - 只有缺盘口时, 推送横幅显示 "[⚠️ 缺盘口深度: 本条不含承接判断]"
 //!   - 业务侧 (T-07 候选触发) 缺盘口时 EvidenceQuality=Missing, 但不阻塞触发
 
+use chrono::{DateTime, FixedOffset, Utc};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -30,6 +33,266 @@ pub enum Capability {
     News,
     /// 盘口深度 (十档买卖)
     OrderBook,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum CapabilityState {
+    Warming,
+    Healthy,
+    Stale,
+    Failed,
+    Unsupported,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapabilityObservation {
+    pub capability: Capability,
+    pub state: CapabilityState,
+    pub expected_now: bool,
+    pub provider: Option<String>,
+    pub provider_observed_at: Option<DateTime<FixedOffset>>,
+    pub locally_observed_at: Option<DateTime<FixedOffset>>,
+    pub last_success_at: Option<DateTime<FixedOffset>>,
+    pub age_secs: Option<u64>,
+    pub last_error_code: Option<String>,
+    pub retryable: Option<bool>,
+    pub next_retry_at: Option<DateTime<FixedOffset>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapabilityNow {
+    pub wall: DateTime<FixedOffset>,
+    pub monotonic: Instant,
+    pub expected_now: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapabilitySuccess {
+    pub capability: Capability,
+    pub provider: String,
+    pub provider_observed_at: Option<DateTime<FixedOffset>>,
+    pub locally_observed_at: DateTime<FixedOffset>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapabilityFailure {
+    pub capability: Capability,
+    pub provider: String,
+    pub locally_observed_at: DateTime<FixedOffset>,
+    pub reason_code: String,
+    pub retryable: bool,
+    pub next_retry_at: Option<DateTime<FixedOffset>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapabilityDiagnosticSnapshot {
+    pub observations: Vec<CapabilityObservation>,
+    pub fingerprint: String,
+    pub first_probe_complete: bool,
+}
+
+#[derive(Clone, Debug)]
+struct CapabilityRecord {
+    supported: bool,
+    attempted: bool,
+    provider: Option<String>,
+    provider_observed_at: Option<DateTime<FixedOffset>>,
+    locally_observed_at: Option<DateTime<FixedOffset>>,
+    last_success_at: Option<DateTime<FixedOffset>>,
+    last_success_mono: Option<Instant>,
+    last_error_code: Option<String>,
+    retryable: Option<bool>,
+    next_retry_at: Option<DateTime<FixedOffset>>,
+}
+
+pub struct CapabilityTracker {
+    records: RwLock<HashMap<Capability, CapabilityRecord>>,
+    stale_after: Duration,
+}
+
+impl CapabilityTracker {
+    pub fn new() -> Self {
+        Self {
+            records: RwLock::new(HashMap::new()),
+            stale_after: Duration::from_secs(120),
+        }
+    }
+    pub fn register_supported(&self, capability: Capability) -> Result<(), String> {
+        self.register(capability, true)
+    }
+    pub fn register_unsupported(&self, capability: Capability) -> Result<(), String> {
+        self.register(capability, false)
+    }
+    fn register(&self, capability: Capability, supported: bool) -> Result<(), String> {
+        let mut g = self
+            .records
+            .write()
+            .map_err(|_| "capability tracker write lock poisoned".to_string())?;
+        g.entry(capability).or_insert(CapabilityRecord {
+            supported,
+            attempted: false,
+            provider: None,
+            provider_observed_at: None,
+            locally_observed_at: None,
+            last_success_at: None,
+            last_success_mono: None,
+            last_error_code: None,
+            retryable: None,
+            next_retry_at: None,
+        });
+        Ok(())
+    }
+    pub fn record_attempt_started(
+        &self,
+        capability: Capability,
+        provider: &str,
+        at: DateTime<FixedOffset>,
+    ) -> Result<(), String> {
+        if provider.trim().is_empty() {
+            return Err("provider must not be blank".into());
+        }
+        let mut g = self
+            .records
+            .write()
+            .map_err(|_| "capability tracker write lock poisoned".to_string())?;
+        let r = g.entry(capability).or_insert_with(|| CapabilityRecord {
+            supported: true,
+            attempted: false,
+            provider: None,
+            provider_observed_at: None,
+            locally_observed_at: None,
+            last_success_at: None,
+            last_success_mono: None,
+            last_error_code: None,
+            retryable: None,
+            next_retry_at: None,
+        });
+        if !r.supported {
+            return Err("unsupported capability cannot be attempted".into());
+        }
+        r.attempted = true;
+        r.provider = Some(provider.to_string());
+        r.locally_observed_at = Some(at);
+        Ok(())
+    }
+    pub fn record_success(&self, s: CapabilitySuccess, now: Instant) -> Result<(), String> {
+        let mut g = self
+            .records
+            .write()
+            .map_err(|_| "capability tracker write lock poisoned".to_string())?;
+        let r = g
+            .get_mut(&s.capability)
+            .ok_or("capability not registered")?;
+        if !r.supported || !r.attempted {
+            return Err("success requires a supported started attempt".into());
+        }
+        if s.provider.trim().is_empty() {
+            return Err("provider must not be blank".into());
+        }
+        r.provider = Some(s.provider);
+        r.provider_observed_at = s.provider_observed_at;
+        r.locally_observed_at = Some(s.locally_observed_at);
+        r.last_success_at = Some(s.locally_observed_at);
+        r.last_success_mono = Some(now);
+        r.last_error_code = None;
+        r.retryable = None;
+        r.next_retry_at = None;
+        Ok(())
+    }
+    pub fn record_failure(&self, f: CapabilityFailure) -> Result<(), String> {
+        if f.provider.trim().is_empty() || f.reason_code.trim().is_empty() {
+            return Err("provider and reason_code must not be blank".into());
+        }
+        let mut g = self
+            .records
+            .write()
+            .map_err(|_| "capability tracker write lock poisoned".to_string())?;
+        let r = g
+            .get_mut(&f.capability)
+            .ok_or("capability not registered")?;
+        if !r.supported || !r.attempted {
+            return Err("failure requires a supported started attempt".into());
+        }
+        r.provider = Some(f.provider);
+        r.locally_observed_at = Some(f.locally_observed_at);
+        r.last_error_code = Some(f.reason_code);
+        r.retryable = Some(f.retryable);
+        r.next_retry_at = f.next_retry_at;
+        Ok(())
+    }
+    pub fn snapshot_at(&self, now: CapabilityNow) -> Result<CapabilityDiagnosticSnapshot, String> {
+        let g = self
+            .records
+            .read()
+            .map_err(|_| "capability tracker read lock poisoned".to_string())?;
+        let mut observations = Vec::new();
+        for &cap in &Capability::ALL {
+            let Some(r) = g.get(&cap) else { continue };
+            let (state, age) = if !r.supported {
+                (CapabilityState::Unsupported, None)
+            } else if !r.attempted {
+                (CapabilityState::Warming, None)
+            } else if r.last_error_code.is_some() {
+                (
+                    CapabilityState::Failed,
+                    r.last_success_mono
+                        .map(|t| now.monotonic.saturating_duration_since(t).as_secs()),
+                )
+            } else {
+                let a = r
+                    .last_success_mono
+                    .map(|t| now.monotonic.saturating_duration_since(t).as_secs());
+                (
+                    if a.map_or(true, |x| now.expected_now && x > self.stale_after.as_secs()) {
+                        CapabilityState::Stale
+                    } else {
+                        CapabilityState::Healthy
+                    },
+                    a,
+                )
+            };
+            observations.push(CapabilityObservation {
+                capability: cap,
+                state,
+                expected_now: now.expected_now,
+                provider: r.provider.clone(),
+                provider_observed_at: r.provider_observed_at,
+                locally_observed_at: r.locally_observed_at,
+                last_success_at: r.last_success_at,
+                age_secs: age,
+                last_error_code: r.last_error_code.clone(),
+                retryable: r.retryable,
+                next_retry_at: r.next_retry_at,
+            });
+        }
+        let first_probe_complete = observations
+            .iter()
+            .filter(|o| o.state != CapabilityState::Unsupported)
+            .all(|o| o.state != CapabilityState::Warming);
+        let mut h = DefaultHasher::new();
+        for o in &observations {
+            (
+                o.capability,
+                o.state,
+                o.provider.as_deref(),
+                o.last_error_code.as_deref(),
+                o.retryable,
+                o.expected_now,
+            )
+                .hash(&mut h);
+        }
+        Ok(CapabilityDiagnosticSnapshot {
+            observations,
+            fingerprint: format!("cap-v1-{h:016x}"),
+            first_probe_complete,
+        })
+    }
+}
+
+impl Default for CapabilityTracker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Capability {
@@ -346,6 +609,96 @@ pub fn current_data_health_input(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn br148_new_capabilities_are_warming_or_unsupported() {
+        let t = CapabilityTracker::new();
+        t.register_supported(Capability::Quote).unwrap();
+        t.register_unsupported(Capability::OrderBook).unwrap();
+        let wall = FixedOffset::east_opt(8 * 3600)
+            .unwrap()
+            .with_ymd_and_hms(2026, 7, 22, 9, 0, 0)
+            .unwrap();
+        let s = t
+            .snapshot_at(CapabilityNow {
+                wall,
+                monotonic: Instant::now(),
+                expected_now: true,
+            })
+            .unwrap();
+        assert_eq!(
+            s.observations
+                .iter()
+                .find(|o| o.capability == Capability::Quote)
+                .unwrap()
+                .state,
+            CapabilityState::Warming
+        );
+        let ob = s
+            .observations
+            .iter()
+            .find(|o| o.capability == Capability::OrderBook)
+            .unwrap();
+        assert_eq!(ob.state, CapabilityState::Unsupported);
+        assert!(ob.next_retry_at.is_none());
+    }
+
+    #[test]
+    fn br148_success_and_failure_preserve_evidence_and_fingerprint_ignores_age() {
+        let t = CapabilityTracker::new();
+        t.register_supported(Capability::Quote).unwrap();
+        let wall = Utc::now().fixed_offset();
+        t.record_attempt_started(Capability::Quote, "TEST_CODE_provider", wall)
+            .unwrap();
+        let start = Instant::now();
+        t.record_success(
+            CapabilitySuccess {
+                capability: Capability::Quote,
+                provider: "TEST_CODE_provider".into(),
+                provider_observed_at: Some(wall),
+                locally_observed_at: wall,
+            },
+            start,
+        )
+        .unwrap();
+        let a = t
+            .snapshot_at(CapabilityNow {
+                wall,
+                monotonic: start,
+                expected_now: true,
+            })
+            .unwrap();
+        assert_eq!(a.observations[0].state, CapabilityState::Healthy);
+        let b = t
+            .snapshot_at(CapabilityNow {
+                wall,
+                monotonic: start + Duration::from_secs(1),
+                expected_now: true,
+            })
+            .unwrap();
+        assert_eq!(a.fingerprint, b.fingerprint);
+        t.record_attempt_started(Capability::Quote, "TEST_CODE_provider", wall)
+            .unwrap();
+        t.record_failure(CapabilityFailure {
+            capability: Capability::Quote,
+            provider: "TEST_CODE_provider".into(),
+            locally_observed_at: wall,
+            reason_code: "timeout".into(),
+            retryable: true,
+            next_retry_at: None,
+        })
+        .unwrap();
+        let failed = t
+            .snapshot_at(CapabilityNow {
+                wall,
+                monotonic: start + Duration::from_secs(2),
+                expected_now: true,
+            })
+            .unwrap();
+        assert_eq!(failed.observations[0].state, CapabilityState::Failed);
+        assert!(failed.observations[0].last_success_at.is_some());
+    }
 
     fn input_all_fresh() -> DataHealthInput {
         DataHealthInput {
