@@ -29,6 +29,22 @@
 )]
 
 use std::fmt;
+use std::sync::{Mutex, OnceLock};
+
+static CLOSING_VALUATION_NOTE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+pub fn set_closing_valuation_note(note: Option<String>) {
+    if let Ok(mut slot) = CLOSING_VALUATION_NOTE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+    {
+        *slot = note;
+    }
+}
+
+fn closing_valuation_note() -> Option<String> {
+    CLOSING_VALUATION_NOTE.get()?.lock().ok()?.clone()
+}
 
 use stock_analysis::trading::paper_trade::{self, Direction, PaperSignal};
 
@@ -158,13 +174,16 @@ impl BannerCtx {
         );
         let account_note = (!self.account_metrics_complete)
             .then_some("实时账户未接入；仓位/日盈亏仅在用户快照收盘估值完成后显示");
-        match (self.data_missing_note.as_deref(), account_note) {
+        let rendered = match (self.data_missing_note.as_deref(), account_note) {
             (Some(note), _) if !note.is_empty() && self.data_mode != DataMode::Full => {
                 format!("{}\n[⚠️ {}: 本条不含承接判断]", line1, note)
             }
             (_, Some(note)) => format!("{}\n[⚠️ {}]", line1, note),
             _ => line1,
-        }
+        };
+        closing_valuation_note().map_or(rendered.clone(), |note| {
+            format!("{}\n[ℹ️ {}]", rendered, note)
+        })
     }
 }
 
@@ -3646,7 +3665,6 @@ pub fn load_news_to_idea_snapshot(_hhmm: &str) -> NewsToIdeaSnapshot {
 // v61 (F14): 加 LRU 驱逐 — 每次 insert 后清掉 > 7200s (2x cooldown) 的 entry, 避免长跑内存泄漏
 // 静态 Lazy 容器, 跨函数调用复用
 // 注: Lazy/HashMap 已在文件顶部 import 过 (避免 unused import 警告), 这里只补 Mutex/Instant
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 pub static D01_LAST_PUSH: Lazy<Mutex<HashMap<String, Instant>>> =

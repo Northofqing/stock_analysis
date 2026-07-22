@@ -1597,6 +1597,29 @@ fn store_banner(banner: push_templates::BannerCtx) -> Result<(), String> {
     Ok(())
 }
 
+fn refresh_closing_valuation_note() {
+    let note = match stock_analysis::database::closing_valuation::latest_persisted_valuation_view()
+    {
+        Ok(Some(view)) => Some(format!(
+            "收盘估值 {} 覆盖 {}/{}，来源 {}{}",
+            view.valuation.price_date,
+            view.valuation.covered,
+            view.valuation.total,
+            view.valuation.provider,
+            view.valuation
+                .total_unrealized_pnl
+                .map(|p| format!("，持仓未实现盈亏 {p:+.2}"))
+                .unwrap_or_default()
+        )),
+        Ok(None) => None,
+        Err(error) => {
+            log::warn!("[BR-147] closing valuation unavailable: {error}");
+            None
+        }
+    };
+    push_templates::set_closing_valuation_note(note);
+}
+
 /// v41 + v51: 周期刷新 banner (从 AccountMode + DataMode 评估结果合并)
 
 ///   - v51: DataMode 也走真值 (调 dm_evaluate, 不是写死 Full)
@@ -1639,7 +1662,9 @@ pub async fn refresh_banner_state() -> Result<(), String> {
     let account_mode =
         stock_analysis::risk::account_mode::evaluate(&am_metrics, prev_mode, &thresholds).mode;
     let data_health = evaluated_data_health()?;
-    store_banner(build_banner(&am_metrics, account_mode, &data_health))
+    store_banner(build_banner(&am_metrics, account_mode, &data_health))?;
+    refresh_closing_valuation_note();
+    Ok(())
 }
 
 /// v60 (F10): refresh_banner_state 复用版 — 接受已算的 metrics, 避免重复 DB 查询
