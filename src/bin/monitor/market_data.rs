@@ -143,9 +143,9 @@ pub fn fetch_eastmoney_quotes(
                             let change_pct = item
                                 .get("f3")
                                 .and_then(|value| value.as_f64())
-                                .filter(|value| value.is_finite() && value.abs() <= 20.0)
-                                .ok_or_else(|| {
-                                    format!("东财持仓行情 {code} change_pct 缺失/超过±20%")
+                                .ok_or_else(|| format!("东财持仓行情 {code} change_pct 缺失"))
+                                .and_then(|value| {
+                                    validate_change_pct(&code, &name, value, "东财持仓行情")
                                 })?;
                             let update_time = item
                                 .get("f124")
@@ -202,6 +202,21 @@ pub fn infer_limit_pct(code: &str, name: &str) -> f64 {
     } else {
         10.0
     }
+}
+
+fn validate_change_pct(
+    code: &str,
+    name: &str,
+    change_pct: f64,
+    source: &str,
+) -> Result<f64, String> {
+    let limit = infer_limit_pct(code, name);
+    if !change_pct.is_finite() || change_pct.abs() > limit {
+        return Err(format!(
+            "{source} {code}({name}) change_pct={change_pct:?} 超过板块允许±{limit:.0}%"
+        ));
+    }
+    Ok(change_pct)
 }
 
 /// 批量查询连板数，返回 1=首板 / 2=二板 / 3=三板+
@@ -327,16 +342,16 @@ pub fn fetch_market_top_by_fid(
                                     return Some(Err(format!("东财市场榜 {code} price 缺失/非法")))
                                 }
                             };
-                            let change_pct = match item
-                                .get("f3")
-                                .and_then(|value| value.as_f64())
-                                .filter(|value| value.is_finite() && value.abs() <= 20.0)
-                            {
-                                Some(value) => value,
+                            let change_pct = match item.get("f3").and_then(|value| value.as_f64()) {
+                                Some(value) => {
+                                    match validate_change_pct(&code, &name, value, "东财市场榜")
+                                    {
+                                        Ok(value) => value,
+                                        Err(error) => return Some(Err(error)),
+                                    }
+                                }
                                 None => {
-                                    return Some(Err(format!(
-                                        "东财市场榜 {code} change_pct 缺失/超过±20%"
-                                    )))
+                                    return Some(Err(format!("东财市场榜 {code} change_pct 缺失")))
                                 }
                             };
                             let update_time = item
@@ -505,9 +520,7 @@ fn fetch_sina_quotes_with_client(
             return Err(format!("新浪行情 {code} 现价/昨收非法"));
         }
         let change_pct = (price - prev_close) / prev_close * 100.0;
-        if !change_pct.is_finite() || change_pct.abs() > 20.0 {
-            return Err(format!("新浪行情 {code} 涨跌幅超过±20%: {change_pct}"));
-        }
+        let change_pct = validate_change_pct(code, &name, change_pct, "新浪行情")?;
         let source_time = chrono::NaiveDateTime::parse_from_str(
             &format!("{} {}", fields[30], fields[31]),
             "%Y-%m-%d %H:%M:%S",
@@ -606,6 +619,16 @@ mod quote_batch_tests {
         assert_eq!(infer_limit_pct("TEST_CODE_830001", "北交所测试股"), 30.0);
         assert_eq!(infer_limit_pct("TEST_CODE_920001", "北交所测试股"), 30.0);
         assert_eq!(infer_limit_pct("TEST_CODE_600001", "*ST测试"), 5.0);
+    }
+
+    #[test]
+    fn board_aware_change_pct_validation_accepts_registered_limits_and_rejects_overrun() {
+        assert!(validate_change_pct("TEST_CODE_300001", "创业板测试股", 20.0, "test").is_ok());
+        assert!(validate_change_pct("TEST_CODE_920305", "北交所测试股", 30.0, "test").is_ok());
+        let error = validate_change_pct("TEST_CODE_920305", "北交所测试股", 30.01, "test")
+            .expect_err("超过北交所涨跌幅必须拒绝");
+        assert!(error.contains("change_pct=30.01"));
+        assert!(error.contains("±30%"));
     }
 
     #[test]

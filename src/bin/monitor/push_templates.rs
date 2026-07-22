@@ -8430,20 +8430,41 @@ pub async fn dispatch_post_close_fund_inflow_buy(date: &str, banner: &BannerCtx)
     let text = render_fund_inflow_top(&hhmm, &items);
     let push_result = dispatch(crate::notify::PushKind::FundInflow, "", None, text).await;
 
-    let risk_context = match paper_risk_context_from_banner(banner) {
-        Ok(context) => context,
+    let (risk_context, snapshot_scope) = match paper_risk_context_from_banner(banner) {
+        Ok(context) => (context, false),
         Err(error) => {
-            log::error!(
-                "[盘后资金流入][BR-134] 跳过虚拟买入: 风险上下文不可用: {}",
+            if stock_analysis::database::user_account_summary::latest()
+                .ok()
+                .flatten()
+                .is_none()
+                || stock_analysis::database::closing_valuation::latest_persisted_valuation_view()
+                    .ok()
+                    .flatten()
+                    .is_none()
+            {
+                log::error!(
+                    "[盘后资金流入][BR-134] 跳过虚拟买入: 风险上下文不可用: {}",
+                    error
+                );
+                log_dispatcher_attempt(
+                    "I-10-postclose",
+                    push_result,
+                    top.len(),
+                    "paper risk context unavailable",
+                );
+                return push_result;
+            }
+            log::warn!(
+                "[BR-146] 使用用户确认收盘估值进入 SnapshotPaper 虚拟仓模式: {}",
                 error
             );
-            log_dispatcher_attempt(
-                "I-10-postclose",
-                push_result,
-                top.len(),
-                "paper risk context unavailable",
-            );
-            return push_result;
+            (
+                stock_analysis::trading::paper_trade::PaperRiskContext::new(
+                    stock_analysis::risk::action_gate::AccountMode::Normal,
+                    stock_analysis::monitor::data_mode::DataMode::Full,
+                ),
+                true,
+            )
         }
     };
 
@@ -8513,7 +8534,11 @@ pub async fn dispatch_post_close_fund_inflow_buy(date: &str, banner: &BannerCtx)
             risk_context,
         };
         // v16.3 Commit 1: simulate 签名加 4 参数 (quote_price 真 + cash/total/pos_pct 真 portfolio 读)
-        let (cash, total, pos_pct) = match paper_portfolio_state(&s.code, execution_quote.price) {
+        let (cash, total, pos_pct) = match if snapshot_scope {
+            snapshot_paper_portfolio_state(&s.code)
+        } else {
+            paper_portfolio_state(&s.code, execution_quote.price)
+        } {
             Ok(state) => state,
             Err(error) => {
                 log::warn!(
@@ -8525,7 +8550,12 @@ pub async fn dispatch_post_close_fund_inflow_buy(date: &str, banner: &BannerCtx)
                 continue;
             }
         };
-        match paper_trade::simulate(&signal, execution_quote.price, cash, total, pos_pct) {
+        let result = if snapshot_scope {
+            paper_trade::simulate_snapshot(&signal, execution_quote.price, cash, total, pos_pct)
+        } else {
+            paper_trade::simulate(&signal, execution_quote.price, cash, total, pos_pct)
+        };
+        match result {
             Ok(outcome) => {
                 if outcome.result.status == paper_trade::PaperTradeStatus::Filled {
                     filled += 1;
@@ -14270,6 +14300,43 @@ mod tests {
 /// review fix Issue #5: 逻辑下沉 lib (trading::paper_trade::portfolio_state), bin/lib 共用同一实现
 pub fn paper_portfolio_state(code: &str, quote_price: f64) -> Result<(f64, f64, f64), String> {
     stock_analysis::trading::paper_trade::portfolio_state(code, quote_price)
+}
+
+/// BR-146/147: derive paper-only portfolio state from the latest user-confirmed
+/// account summary and append-only closing valuation.  This path never reads
+/// broker state and never supplies a synthetic cash/total fallback.
+pub fn snapshot_paper_portfolio_state(code: &str) -> Result<(f64, f64, f64), String> {
+    let summary = stock_analysis::database::user_account_summary::latest()?
+        .ok_or_else(|| "用户确认账户摘要不存在".to_string())?;
+    let total = summary.total_assets;
+    let cash = summary.available_cash;
+    if !total.is_finite() || total <= 0.0 {
+        return Err("用户确认账户摘要 total_assets 缺失/非法".to_string());
+    }
+    if !cash.is_finite() || cash < 0.0 || cash > total {
+        return Err("用户确认账户摘要 available_cash 缺失/非法".to_string());
+    }
+    let view = stock_analysis::database::closing_valuation::latest_persisted_valuation_view()?
+        .ok_or_else(|| "用户确认收盘估值不存在".to_string())?;
+    if view.valuation.covered != view.valuation.total {
+        return Err(format!(
+            "用户确认收盘估值覆盖不完整: {}/{}",
+            view.valuation.covered, view.valuation.total
+        ));
+    }
+    let item = view.valuation.items.iter().find(|item| item.code == code);
+    let market_value = match item {
+        Some(item) => item
+            .market_value
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .ok_or_else(|| format!("用户确认收盘估值 {code} market_value 缺失/非法"))?,
+        None => 0.0,
+    };
+    let pos_pct = market_value / total * 100.0;
+    if !pos_pct.is_finite() || !(0.0..=100.0).contains(&pos_pct) {
+        return Err(format!("用户确认收盘估值 {code} 仓位比例非法: {pos_pct}"));
+    }
+    Ok((cash, total, pos_pct))
 }
 
 /// v16.3 Commit 2 Fix 8: DoS 防护 — metric_json > 4KB 时替换为截断标记
