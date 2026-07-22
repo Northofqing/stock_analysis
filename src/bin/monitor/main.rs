@@ -3820,6 +3820,7 @@ async fn post_session_review_scheduler() {
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut state: Option<review_batch::ReviewScheduleState> = None;
     let mut valuation_date: Option<chrono::NaiveDate> = None;
+    let mut ai_analysis_date: Option<chrono::NaiveDate> = None;
 
     log::info!("[复盘调度][BR-139] started threshold=19:00 interval=60s");
 
@@ -3847,6 +3848,18 @@ async fn post_session_review_scheduler() {
                     refresh_closing_valuation_note();
                 }
                 Err(error) => log::error!("[BR-147] closing valuation failed: {error}"),
+            }
+        }
+
+        // v18/v19 single owner: run the existing multi-round AI only after
+        // the post-close data phase, once per trading day. The intraday loop
+        // intentionally has no AI/data-fetch entry point.
+        if valuation_date == Some(now.date_naive()) && ai_analysis_date != Some(now.date_naive()) {
+            ai_analysis_date = Some(now.date_naive());
+            if let Err(error) = run_review_deep_analysis_blocking().await {
+                log::error!("[复盘调度][AI] 多轮分析失败: {error}");
+            } else {
+                log::info!("[复盘调度][AI] 多轮分析完成 date={}", now.date_naive());
             }
         }
 
@@ -5648,6 +5661,20 @@ async fn run_review_deep_analysis(
 
     log::info!("[复盘] 持仓多 Agent 深度研判完成");
     Ok(())
+}
+
+/// The legacy analyzer owns a non-Send Gemini client. Run it on a dedicated
+/// blocking thread so the Send-bound long-running scheduler remains safe.
+async fn run_review_deep_analysis_blocking() -> Result<(), String> {
+    tokio::task::spawn_blocking(|| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("AI runtime init failed: {error}"))?;
+        runtime.block_on(run_review_deep_analysis("", "", ""))
+    })
+    .await
+    .map_err(|error| format!("AI blocking task join failed: {error}"))?
 }
 
 /// 窗口：盘前08:00-09:30、盘中09:30-15:00、盘后15:00-22:00。
