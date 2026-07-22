@@ -46,6 +46,27 @@ fn closing_valuation_note() -> Option<String> {
     CLOSING_VALUATION_NOTE.get()?.lock().ok()?.clone()
 }
 
+fn user_confirmed_account_note() -> Option<String> {
+    stock_analysis::database::DatabaseManager::try_get()?;
+    let summary = stock_analysis::database::user_account_summary::latest()
+        .ok()
+        .flatten()?;
+    Some(format!(
+        "用户确认持仓可用；仓位{:.1}%，日盈亏{:+.2}",
+        summary.position_ratio_pct, summary.daily_pnl
+    ))
+}
+
+fn account_status_note() -> String {
+    if let Some(note) = closing_valuation_note() {
+        return format!("实时账户未接入；{note}");
+    }
+    if let Some(note) = user_confirmed_account_note() {
+        return format!("实时账户未接入；{note}；收盘估值不可用");
+    }
+    "实时账户未接入；用户确认账户摘要不可用".to_string()
+}
+
 use stock_analysis::trading::paper_trade::{self, Direction, PaperSignal};
 
 fn valid_source_stock_code(code: &str) -> bool {
@@ -172,13 +193,12 @@ impl BannerCtx {
             pnl,
             self.data_mode.label(),
         );
-        let account_note = (!self.account_metrics_complete)
-            .then_some("实时账户未接入；仓位/日盈亏仅在用户快照收盘估值完成后显示");
+        let account_note = (!self.account_metrics_complete).then_some(account_status_note());
         let rendered = match (self.data_missing_note.as_deref(), account_note) {
             (Some(note), _) if !note.is_empty() && self.data_mode != DataMode::Full => {
                 format!("{}\n[⚠️ {}: 本条不含承接判断]", line1, note)
             }
-            (_, Some(note)) => format!("{}\n[⚠️ {}]", line1, note),
+            (_, Some(note)) => format!("{}\n[ℹ️ {}]", line1, note),
             _ => line1,
         };
         closing_valuation_note().map_or(rendered.clone(), |note| {
@@ -276,11 +296,7 @@ pub fn render_data_mode(
         missing_items,
     );
     append_data_mode_restrictions(&mut out, restrictions);
-    if let Some(note) = closing_valuation_note() {
-        out.push_str(&format!("\n账户状态: 实时账户未接入；{}", note));
-    } else {
-        out.push_str("\n账户状态: 实时账户未接入；用户快照收盘估值不可用");
-    }
+    out.push_str(&format!("\n账户状态: {}", account_status_note()));
     append_data_mode_eta_footer(&mut out, eta);
     out
 }

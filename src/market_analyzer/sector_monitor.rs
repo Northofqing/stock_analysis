@@ -309,10 +309,10 @@ pub fn fetch_board_ranking(fid: &str, top_n: usize) -> Result<Vec<ConceptBoard>>
         let name = required_board_text(item, "f14", index)?;
         let change_pct = required_board_number(item, "f3", index)?;
         if change_pct.abs() > 20.0 {
-            return Err(anyhow::anyhow!(
-                "概念板块榜第 {} 行涨跌幅越界: {change_pct}",
+            log::warn!(
+                "[DQ-2.3] 概念板块榜第 {} 行涨跌幅={change_pct}% 超过常规±20%，保留真实值并标记需人工确认",
                 index + 1
-            ));
+            );
         }
         let main_inflow = required_board_number(item, "f62", index)?;
         let leader_name = required_board_text(item, "f128", index)?.to_string();
@@ -484,16 +484,18 @@ pub fn fetch_board_components(board_code: &str, top_n: usize) -> Result<Vec<Boar
         let amount = required_board_number(item, "f6", index)?;
         let vol_ratio = required_board_number(item, "f10", index)?;
         let turnover = required_board_number(item, "f8", index)?;
-        if price <= 0.0
-            || change_pct.abs() > 20.0
-            || amount < 0.0
-            || vol_ratio < 0.0
-            || turnover < 0.0
-        {
+        if price <= 0.0 || amount < 0.0 || vol_ratio < 0.0 || turnover < 0.0 {
             return Err(anyhow::anyhow!(
                 "板块 {board_code} 第 {} 行数值越界: price={price} change={change_pct} amount={amount} vol_ratio={vol_ratio} turnover={turnover}",
                 index + 1
             ));
+        }
+        if change_pct.abs() > 20.0 {
+            log::warn!(
+                "[DQ-2.3] 板块 {board_code} 第 {} 行股票 {} 涨跌幅={change_pct}% 超过常规±20%，保留真实值并标记需人工确认",
+                index + 1,
+                code
+            );
         }
         // 过滤 ST / 北交所 (保持与 limit_up 一致的口径)
         if crate::data_provider::limit_status::is_st_stock(name) {
