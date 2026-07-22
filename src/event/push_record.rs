@@ -1,4 +1,4 @@
-//! Registered business rules: BR-043, BR-091, BR-130.
+//! Registered business rules: BR-043, BR-091, BR-130, BR-142.
 //! PushRecord and ReplayablePushEvent — v17.3 Task 1
 //!
 //! Normalized domain events for the delivery observation seam (`push.delivery.audit`)
@@ -52,7 +52,17 @@ pub struct PushRecord {
     pub ts: chrono::DateTime<chrono::Local>,
     pub outcome: PushOutcomeLabel,
     pub channel: String,
+    pub rendered_len: usize,
     pub latency_ms: u64,
+    /// Present only for v2 redacted authoritative delivery audits.
+    pub subject_hash: Option<String>,
+    pub identity_hash: Option<String>,
+    pub decision_status: Option<PushOutcomeLabel>,
+    pub retryable: Option<bool>,
+    pub rule_ids: Vec<String>,
+    pub reason_code: Option<String>,
+    pub source_as_of: Option<chrono::DateTime<chrono::FixedOffset>>,
+    pub audit_schema_version: Option<u32>,
 }
 
 /// Errors when extracting a `PushRecord` from an `EventEnvelope`.
@@ -96,6 +106,45 @@ impl PushRecord {
                 env.version
             )));
         }
+
+        let audit_schema_version = match env.payload.get("audit_schema_version") {
+            None => None,
+            Some(value) => Some(
+                value
+                    .as_u64()
+                    .and_then(|version| u32::try_from(version).ok())
+                    .ok_or_else(|| {
+                        PushRecordError::InvalidFieldType("audit_schema_version".into())
+                    })?,
+            ),
+        };
+        let expected_fields: &[&str] = if audit_schema_version.is_some() {
+            &[
+                "kind",
+                "outcome",
+                "decision_status",
+                "retryable",
+                "rule_ids",
+                "reason_code",
+                "subject_hash",
+                "identity_hash",
+                "source_as_of",
+                "audit_schema_version",
+                "channel",
+                "rendered_len",
+                "latency_ms",
+            ]
+        } else {
+            &[
+                "kind",
+                "code",
+                "outcome",
+                "channel",
+                "rendered_len",
+                "latency_ms",
+            ]
+        };
+        validate_closed_payload(&env.payload, expected_fields)?;
 
         let id = env.id.clone();
         let trace_id = env.trace_id.clone();
@@ -141,6 +190,13 @@ impl PushRecord {
 
         let channel = required_text("channel")?;
 
+        let rendered_len = env
+            .payload
+            .get("rendered_len")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| PushRecordError::InvalidFieldType("rendered_len".into()))?;
+
         let latency = env
             .payload
             .get("latency_ms")
@@ -148,6 +204,129 @@ impl PushRecord {
         let latency_ms = latency
             .as_u64()
             .ok_or_else(|| PushRecordError::InvalidFieldType("latency_ms".into()))?;
+
+        let (
+            subject_hash,
+            identity_hash,
+            decision_status,
+            retryable,
+            rule_ids,
+            reason_code,
+            source_as_of,
+        ) = if let Some(version) = audit_schema_version {
+            if version != super::envelope::DELIVERY_AUDIT_SCHEMA_VERSION {
+                return Err(PushRecordError::InvalidFieldValue(format!(
+                    "audit_schema_version={version}"
+                )));
+            }
+            if code.is_some() || env.entity_key.is_some() || env.payload.get("code").is_some() {
+                return Err(PushRecordError::InvalidFieldValue(
+                    "v2 delivery identity must be redacted".into(),
+                ));
+            }
+
+            let subject_hash = required_text("subject_hash")?;
+            if !super::envelope::is_lower_hex_sha256(&subject_hash) {
+                return Err(PushRecordError::InvalidFieldValue("subject_hash".into()));
+            }
+            let identity_hash = required_text("identity_hash")?;
+            if !super::envelope::is_lower_hex_sha256(&identity_hash) {
+                return Err(PushRecordError::InvalidFieldValue("identity_hash".into()));
+            }
+            let expected_identity = super::envelope::delivery_identity_hash_from_subject(
+                &kind,
+                &subject_hash,
+                &channel,
+            );
+            if identity_hash != expected_identity {
+                return Err(PushRecordError::InvalidFieldValue(
+                    "identity_hash is not bound to subject/kind/channel".into(),
+                ));
+            }
+
+            let decision_status_text = required_text("decision_status")?;
+            if decision_status_text != outcome_str {
+                return Err(PushRecordError::InvalidFieldValue(
+                    "decision_status does not match outcome".into(),
+                ));
+            }
+            let decision_status = PushOutcomeLabel::from_audit_str(&decision_status_text)
+                .ok_or_else(|| {
+                    PushRecordError::InvalidFieldValue(format!(
+                        "decision_status={decision_status_text}"
+                    ))
+                })?;
+
+            let retryable = env
+                .payload
+                .get("retryable")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| PushRecordError::InvalidFieldType("retryable".into()))?;
+            let reason_code = required_text("reason_code")?;
+            let Some((expected_reason, expected_retryable)) =
+                super::envelope::delivery_outcome_metadata(&outcome_str)
+            else {
+                return Err(PushRecordError::InvalidFieldValue(format!(
+                    "outcome={outcome_str}"
+                )));
+            };
+            if retryable != expected_retryable {
+                return Err(PushRecordError::InvalidFieldValue(
+                    "retryable does not match outcome".into(),
+                ));
+            }
+            if reason_code != expected_reason {
+                return Err(PushRecordError::InvalidFieldValue(
+                    "reason_code does not match outcome".into(),
+                ));
+            }
+
+            let rule_ids_value = env
+                .payload
+                .get("rule_ids")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| PushRecordError::InvalidFieldType("rule_ids".into()))?;
+            let mut rule_ids = Vec::with_capacity(rule_ids_value.len());
+            for value in rule_ids_value {
+                let rule = value
+                    .as_str()
+                    .filter(|rule| !rule.trim().is_empty())
+                    .ok_or_else(|| PushRecordError::InvalidFieldValue("rule_ids".into()))?;
+                rule_ids.push(rule.to_string());
+            }
+            let expected_rules = super::envelope::DELIVERY_AUDIT_RULE_IDS
+                .iter()
+                .map(|rule| (*rule).to_string())
+                .collect::<Vec<_>>();
+            if rule_ids != expected_rules {
+                return Err(PushRecordError::InvalidFieldValue("rule_ids".into()));
+            }
+
+            let source_as_of =
+                match env.payload.get("source_as_of") {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(value) => {
+                        let value = value.as_str().ok_or_else(|| {
+                            PushRecordError::InvalidFieldType("source_as_of".into())
+                        })?;
+                        Some(chrono::DateTime::parse_from_rfc3339(value).map_err(|_| {
+                            PushRecordError::InvalidFieldValue("source_as_of".into())
+                        })?)
+                    }
+                };
+
+            (
+                Some(subject_hash),
+                Some(identity_hash),
+                Some(decision_status),
+                Some(retryable),
+                rule_ids,
+                Some(reason_code),
+                source_as_of,
+            )
+        } else {
+            (None, None, None, None, Vec::new(), None, None)
+        };
 
         Ok(PushRecord {
             id,
@@ -157,9 +336,54 @@ impl PushRecord {
             ts,
             outcome,
             channel,
+            rendered_len,
             latency_ms,
+            subject_hash,
+            identity_hash,
+            decision_status,
+            retryable,
+            rule_ids,
+            reason_code,
+            source_as_of,
+            audit_schema_version,
         })
     }
+
+    /// Parse a new authoritative audit. Legacy rows remain readable by
+    /// `try_from`, but may never enter the current persistence path.
+    pub fn try_from_authoritative(
+        env: &super::envelope::EventEnvelope,
+    ) -> Result<Self, PushRecordError> {
+        let record = Self::try_from(env)?;
+        if record.audit_schema_version != Some(super::envelope::DELIVERY_AUDIT_SCHEMA_VERSION) {
+            return Err(PushRecordError::InvalidFieldValue(
+                "authoritative delivery audit requires schema v2".into(),
+            ));
+        }
+        Ok(record)
+    }
+}
+
+fn validate_closed_payload(
+    payload: &serde_json::Value,
+    expected_fields: &[&str],
+) -> Result<(), PushRecordError> {
+    let object = payload
+        .as_object()
+        .ok_or_else(|| PushRecordError::InvalidFieldType("payload".into()))?;
+    for field in object.keys() {
+        if !expected_fields.contains(&field.as_str()) {
+            return Err(PushRecordError::InvalidFieldValue(format!(
+                "unknown delivery audit field: {field}"
+            )));
+        }
+    }
+    for field in expected_fields {
+        if !object.contains_key(*field) {
+            return Err(PushRecordError::MissingField((*field).into()));
+        }
+    }
+    Ok(())
 }
 
 // ========================================================================
@@ -281,6 +505,43 @@ mod tests {
     }
 
     #[test]
+    fn br142_authoritative_record_requires_complete_redacted_metadata() {
+        let event = crate::event::PushDeliveryEvent::new(
+            "announcement_v1".into(),
+            Some("TEST_CODE_600519".into()),
+            "SinkError".into(),
+            "dry_run".into(),
+            12,
+            37,
+        );
+        let env = EventEnvelope::from_event(
+            &event,
+            "evt-v2".into(),
+            "trace-v2".into(),
+            chrono::Local::now(),
+        )
+        .unwrap();
+        let record = PushRecord::try_from_authoritative(&env).unwrap();
+
+        assert_eq!(record.code, None);
+        assert_eq!(record.audit_schema_version, Some(2));
+        assert_eq!(record.retryable, Some(true));
+        assert_eq!(record.reason_code.as_deref(), Some("delivery.sink_error"));
+        assert_eq!(record.decision_status, Some(PushOutcomeLabel::Failed));
+        assert!(record.rule_ids.iter().any(|rule| rule == "BR-142"));
+        assert_eq!(record.subject_hash.as_deref().unwrap().len(), 64);
+        assert_eq!(record.identity_hash.as_deref().unwrap().len(), 64);
+
+        let mut incomplete = env;
+        incomplete
+            .payload
+            .as_object_mut()
+            .unwrap()
+            .remove("retryable");
+        assert!(PushRecord::try_from_authoritative(&incomplete).is_err());
+    }
+
+    #[test]
     fn non_delivery_event_is_not_counted_as_push_record() {
         let env = make_delivery_envelope("market.policy");
         assert!(PushRecord::try_from(&env).is_err());
@@ -368,6 +629,7 @@ mod tests {
                 "code": "TEST_CODE_600519",
                 "outcome": "SinkError",
                 "channel": "dry_run",
+                "rendered_len": 12,
                 "latency_ms": 37,
             }),
             version: 1,

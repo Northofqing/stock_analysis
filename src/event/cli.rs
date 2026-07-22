@@ -1,4 +1,4 @@
-//! Registered business rules: BR-043.
+//! Registered business rules: BR-043, BR-141.
 //! Event subcommand CLI parser — v17.3 Task 4
 //!
 //! Parses `--replay`, `--history`, and related flags from the monitor's
@@ -94,9 +94,20 @@ pub fn parse_args(args: &[&str]) -> Result<Option<EventCommand>, CliError> {
             "--help" | "-h" => {
                 help_requested = true;
             }
-            "--test" | "--review" | "--push" | "--e2e" | "--v13-diag" => {
+            "--test"
+            | "--review"
+            | "--push"
+            | "--push-dry-run"
+            | "--e2e"
+            | "--v13-diag"
+            | "--backfill-st-type"
+            | "--backfill-chain-name" => {
                 // Known monitor flags may be combined with terminal event commands.
                 // Ignore them here; if no event command is present we still return None.
+            }
+            s if s.starts_with("--backfill-outcome=") => {
+                let date_str = &s["--backfill-outcome=".len()..];
+                parse_date(date_str)?;
             }
             "--replay" => {
                 has_replay = true;
@@ -370,6 +381,24 @@ mod tests {
 
         let cmd = parse_args(&["monitor", "--test", "--v13-diag"]).unwrap();
         assert!(cmd.is_none());
+
+        for flag in [
+            "--push-dry-run",
+            "--backfill-outcome=2026-07-21",
+            "--backfill-st-type",
+            "--backfill-chain-name",
+        ] {
+            let cmd = parse_args(&["monitor", flag]).unwrap();
+            assert!(cmd.is_none(), "known one-shot flag rejected: {flag}");
+        }
+    }
+
+    #[test]
+    fn cli_rejects_empty_or_malformed_backfill_outcome_dates() {
+        for flag in ["--backfill-outcome=", "--backfill-outcome=not-a-date"] {
+            let error = parse_args(&["monitor", flag]).expect_err("invalid date must fail");
+            assert!(error.to_string().contains("malformed date"), "{error}");
+        }
     }
 
     #[test]

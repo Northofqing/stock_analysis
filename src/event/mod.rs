@@ -1,4 +1,4 @@
-//! Registered business rules: BR-043, BR-091, BR-111, BR-130.
+//! Registered business rules: BR-043, BR-091, BR-111, BR-130, BR-141, BR-142.
 //! Event infrastructure — v17.1-r2 Task 1+2
 //!
 //! Provides the `DomainEvent` trait, `EventEnvelope` wrapper, and
@@ -196,7 +196,7 @@ mod delivery_observation_tests {
     #[tokio::test]
     async fn publish_delivery_observation_contains_actual_outcome() {
         let bus = EventBus::new_for_test(8);
-        let mut rx = bus.subscribe();
+        let mut rx = bus.subscribe().expect("subscribe delivery observer");
         publish_delivery_on(
             &bus,
             "announcement_v1",
@@ -209,7 +209,9 @@ mod delivery_observation_tests {
         let env = rx.recv().await.unwrap();
         assert_eq!(env.event_type, "push.delivery.audit");
         assert_eq!(env.payload["outcome"], "Pushed");
-        assert_eq!(env.payload["code"], "TEST_CODE_600519");
+        assert!(env.payload.get("code").is_none());
+        assert!(env.entity_key.is_none());
+        assert_eq!(env.payload["audit_schema_version"], 2);
     }
 
     #[test]
@@ -242,7 +244,7 @@ mod delivery_observation_tests {
     #[tokio::test]
     async fn br130_global_delivery_uses_production_audit_type_and_reaches_observers() {
         let bus = global_bus();
-        let mut receiver = bus.subscribe();
+        let mut receiver = bus.subscribe().expect("subscribe global delivery observer");
 
         publish_delivery(
             "announcement_v1",

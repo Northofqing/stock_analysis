@@ -1,4 +1,4 @@
-//! Registered business rules: BR-061.
+//! Registered business rules: BR-061, BR-141.
 // -*- coding: utf-8 -*-
 //! 新闻 Ranker 推送 outcome 回看 (P3 — D+1/D+3/D+5 表现跟踪)
 //!
@@ -573,44 +573,56 @@ fn parse_audit_date(path: &Path) -> NaiveDate {
 ///   - 读: data/d01_recommendations/YYYY-MM-DD.jsonl
 ///   - 算: 用 push_at 后 1-5 天的 K 线算 D+1/D+3/D+5 + MFE/MAE
 ///   - 写: 更新每行 outcome 字段, 写回原 jsonl 文件
-///   - 漏报: K 线缺失 (沙箱 / 非交易日) 时 outcome 保持 null
-pub fn backfill_recommendations_outcome(date: &str) -> usize {
+///   - 失败: 源文件、K 线或原子写回不可用时返回 `Err`，不得把 0 更新冒充成功
+pub fn backfill_recommendations_outcome(date: &str) -> Result<usize, String> {
     use std::collections::HashMap;
     use std::fs;
     use std::io::{BufWriter, Write};
 
-    let path = std::path::PathBuf::from("data/d01_recommendations").join(format!("{}.jsonl", date));
+    let normalized_date = NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .map_err(|error| format!("invalid backfill date {date:?}: {error}"))?;
+    let date = normalized_date.format("%Y-%m-%d").to_string();
+    let path = std::path::PathBuf::from("data/d01_recommendations").join(format!("{date}.jsonl"));
     if !path.exists() {
         log::info!("[v70+] {} 不存在, skip", path.display());
-        return 0;
+        return Ok(0);
     }
 
     // 1. 读 jsonl → (ts, code, push_price) 提取
-    let content = match fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(e) => {
-            log::warn!("[v70+] 读 {} 失败: {}", path.display(), e);
-            return 0;
-        }
-    };
+    let content = fs::read_to_string(&path)
+        .map_err(|error| format!("read outcome source {}: {error}", path.display()))?;
     let mut rows: Vec<HashMap<String, serde_json::Value>> = Vec::new();
-    for line in content.lines() {
+    for (line_index, line) in content.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-            if let Some(obj) = v.as_object() {
-                rows.push(
-                    obj.iter()
-                        .map(|(k, val)| (k.clone(), val.clone()))
-                        .collect(),
-                );
-            }
-        }
+        let value = serde_json::from_str::<serde_json::Value>(line).map_err(|error| {
+            format!(
+                "parse outcome source {} line {}: {error}",
+                path.display(),
+                line_index + 1
+            )
+        })?;
+        let object = value.as_object().ok_or_else(|| {
+            format!(
+                "outcome source {} line {} is not an object",
+                path.display(),
+                line_index + 1
+            )
+        })?;
+        rows.push(
+            object
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        );
     }
     if rows.is_empty() {
-        return 0;
+        return Ok(0);
     }
+
+    let fetcher = crate::data_provider::DataFetcherManager::new()
+        .map_err(|error| format!("initialize outcome K-line provider: {error:#}"))?;
 
     // 2. 算每行 D+1/D+3/D+5
     let mut updated = 0;
@@ -618,7 +630,10 @@ pub fn backfill_recommendations_outcome(date: &str) -> usize {
         let code = row.get("code").and_then(|v| v.as_str()).unwrap_or("");
         let ts = row.get("ts").and_then(|v| v.as_str()).unwrap_or("");
         if code.is_empty() || ts.is_empty() {
-            continue;
+            return Err(format!(
+                "outcome source {} contains a row without code/ts",
+                path.display()
+            ));
         }
         // 拉 K 线 (推送日 + 5 天)
         // v14.1 review fix: `&ts[..10]` 字节切片在 ts < 10 字节时 panic, 改 ts.get(..10) + warn log
@@ -628,22 +643,19 @@ pub fn backfill_recommendations_outcome(date: &str) -> usize {
         {
             Some(d) => d,
             None => {
-                log::warn!(
-                    "[v70+] backfill skip row: ts='{}' (len<10 or unparseable as YYYY-MM-DD), code={}",
-                    ts, code
-                );
-                continue;
+                return Err(format!(
+                    "outcome source {} has invalid ts={ts:?} for code={code}",
+                    path.display()
+                ))
             }
         };
         // v14.1 review fix: 拉 20 天 K 线 (push_date + 5 天 D+1/D+3/D+5 + 15 天 padding)
         //   之前 5 天太短, 实际 D+1 窗口可能挤掉历史数据
-        let kline_result = crate::data_provider::DataFetcherManager::new()
-            .ok()
-            .and_then(|f| f.get_daily_data(code, 20).ok())
-            .unwrap_or((Vec::new(), ""));
-        let (klines, _): (Vec<_>, &str) = kline_result;
+        let (klines, _source) = fetcher
+            .get_daily_data(code, 20)
+            .map_err(|error| format!("fetch outcome K-line for {code}: {error:#}"))?;
         if klines.is_empty() {
-            continue;
+            return Err(format!("outcome K-line batch is empty for {code}"));
         }
         let d1 = pct_change_at(&klines, push_date, 1);
         let d3 = pct_change_at(&klines, push_date, 3);
@@ -672,6 +684,7 @@ pub fn backfill_recommendations_outcome(date: &str) -> usize {
             writeln!(writer, "{}", json)?;
         }
         writer.flush()?;
+        writer.get_ref().sync_data()?;
         // 显式 drop BufWriter 关闭文件句柄, rename 在 Windows 上要求句柄关闭
         drop(writer);
         // 原子 rename: POSIX 保证, 失败则清理 .tmp
@@ -685,7 +698,7 @@ pub fn backfill_recommendations_outcome(date: &str) -> usize {
             e
         );
         let _ = fs::remove_file(&tmp_path);
-        return 0;
+        return Err(format!("write outcome backfill {}: {e}", path.display()));
     }
     log::info!(
         "[v70+] backfill {} 写回 {} 条 (date={})",
@@ -693,7 +706,7 @@ pub fn backfill_recommendations_outcome(date: &str) -> usize {
         updated,
         date
     );
-    updated
+    Ok(updated)
 }
 
 #[cfg(test)]
@@ -734,6 +747,15 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let rows = load_audit(&path);
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn backfill_rejects_non_date_and_path_traversal_input() {
+        for input in ["", "not-a-date", "../../escape", "/tmp/escape"] {
+            let error = backfill_recommendations_outcome(input)
+                .expect_err("only a strict calendar date may select a backfill file");
+            assert!(error.contains("invalid backfill date"), "{error}");
+        }
     }
 
     /// 2) load_audit: 解析 OK

@@ -232,9 +232,27 @@ impl HistoryQuery {
                     })?
                     .to_string();
 
-                // Filter by code (entity_key)
+                // Legacy rows use entity_key. BR-142 rows compare a
+                // domain-separated candidate without persisting the raw code.
                 if let Some(ref code) = filter.code {
-                    if env.entity_key.as_deref() != Some(code.as_str()) {
+                    let legacy_match = env.entity_key.as_deref() == Some(code.as_str());
+                    let redacted_match = env
+                        .payload
+                        .get("identity_hash")
+                        .and_then(serde_json::Value::as_str)
+                        .zip(
+                            env.payload
+                                .get("channel")
+                                .and_then(serde_json::Value::as_str),
+                        )
+                        .is_some_and(|(identity_hash, channel)| {
+                            super::envelope::delivery_identity_hash(
+                                &entry_kind,
+                                Some(code),
+                                channel,
+                            ) == identity_hash
+                        });
+                    if !legacy_match && !redacted_match {
                         continue;
                     }
                 }

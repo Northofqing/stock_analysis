@@ -1160,10 +1160,12 @@ mod tests {
         );
         assert_eq!(
             delivery.entity_key(),
-            Some("TEST_CODE_SOURCE_FACT"),
-            "delivery audit entity must remain the security code"
+            None,
+            "delivery audit identity must be redacted"
         );
-        assert_ne!(delivery.entity_key(), Some("TEST_CODE_EVENT_ID"));
+        let payload = delivery.payload();
+        assert!(payload.get("code").is_none());
+        assert_eq!(payload["identity_hash"].as_str().unwrap().len(), 64);
     }
 
     #[test]

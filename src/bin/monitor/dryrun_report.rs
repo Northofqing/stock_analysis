@@ -1,3 +1,4 @@
+//! Registered business rules: BR-141.
 //! v26: Dry-run 报告自动生成器
 //!
 //! 启动后台任务, 定时从 `data/dispatcher_log/*.jsonl` 汇总统计,
@@ -54,8 +55,8 @@ pub struct TopicStat {
 
 /// 启动后台 dry-run 报告生成器
 /// interval: 报告刷新间隔 (默认 5 min)
-pub fn spawn_dryrun_reporter(interval_secs: u64) {
-    tokio::spawn(async move {
+pub fn spawn_dryrun_reporter(interval_secs: u64) -> tokio::task::JoinHandle<()> {
+    let handle = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
         // 跳过第一个 tick (立即触发)
         ticker.tick().await;
@@ -70,6 +71,7 @@ pub fn spawn_dryrun_reporter(interval_secs: u64) {
         "[v26 dryrun] 后台报告生成器已启动 (interval: {}s)",
         interval_secs
     );
+    handle
 }
 
 /// v14.1 task #162 / review #12: 启动后台 backfill 调度器
@@ -79,8 +81,8 @@ pub fn spawn_dryrun_reporter(interval_secs: u64) {
 ///   - interval: 1 min (粗粒度, 触发后当天不再跑)
 ///   - review #12: 启动时扫 data/d01_recommendations/ 历史积压, 全补完才进 cron
 ///     (monitor 停 N 天 → D+5 窗口漏算 → 启动时一次补单)
-pub fn spawn_outcome_backfill_scheduler() {
-    tokio::spawn(async move {
+pub fn spawn_outcome_backfill_scheduler() -> tokio::task::JoinHandle<()> {
+    let handle = tokio::spawn(async move {
         // 等 1 min 让 DB 起来
         tokio::time::sleep(Duration::from_secs(60)).await;
 
@@ -116,19 +118,25 @@ pub fn spawn_outcome_backfill_scheduler() {
             let yesterday = crate::calendar::prev_trading_day(today);
             let date_str = yesterday.format("%Y-%m-%d").to_string();
             log::info!("[v14.1 #162] 自动 backfill outcome | 日期 = {}", date_str);
-            let updated =
-                stock_analysis::opportunity::news_outcome::backfill_recommendations_outcome(
-                    &date_str,
-                );
-            log::info!(
-                "[v14.1 #162] 自动 backfill 完成 | {} | 更新 {} 条",
-                date_str,
-                updated
-            );
-            last_run_date = Some(today_str);
+            match stock_analysis::opportunity::news_outcome::backfill_recommendations_outcome(
+                &date_str,
+            ) {
+                Ok(updated) => {
+                    log::info!(
+                        "[v14.1 #162] 自动 backfill 完成 | {} | 更新 {} 条",
+                        date_str,
+                        updated
+                    );
+                    last_run_date = Some(today_str);
+                }
+                Err(error) => {
+                    log::error!("[v14.1 #162] 自动 backfill 失败 | {} | {}", date_str, error);
+                }
+            }
         }
     });
     log::info!("[v14.1 #162] 后台 outcome backfill 调度器已启动 (15:30 每日)");
+    handle
 }
 
 /// review #12: 扫 data/d01_recommendations/ 找 outcome 全为 null 的 jsonl 跑 backfill
@@ -175,7 +183,8 @@ fn scan_and_backfill_pending() -> Result<usize, Box<dyn std::error::Error>> {
         }
         log::info!("[v14.1 #162] 历史补单 backfill | {}", date_str);
         let updated =
-            stock_analysis::opportunity::news_outcome::backfill_recommendations_outcome(&date_str);
+            stock_analysis::opportunity::news_outcome::backfill_recommendations_outcome(&date_str)
+                .map_err(|error| format!("historical backfill {date_str}: {error}"))?;
         log::info!(
             "[v14.1 #162] 历史补单完成 | {} | 更新 {} 条",
             date_str,

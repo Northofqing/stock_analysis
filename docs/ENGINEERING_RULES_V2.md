@@ -76,7 +76,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets --all-features -- --test-threads=1
 bash tools/compliance/check.sh
-cargo llvm-cov --workspace --all-features --json --output-path target/coverage/coverage.json
+cargo llvm-cov --workspace --all-features --json --output-path target/coverage/coverage.json -- --test-threads=1
 python3 tools/coverage/check_thresholds.py target/coverage/coverage.json
 cargo build --release --bin monitor
 ```

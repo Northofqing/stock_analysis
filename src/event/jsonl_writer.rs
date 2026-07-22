@@ -1,8 +1,14 @@
-//! JSONL writer for event envelopes — v17.3 Task 2
+//! JSONL writer for event envelopes — v17.3 Task 2 / BR-141 ready lifecycle
 //!
 //! Persists `EventEnvelope`s to daily JSONL files under a base directory.
 //! Files are named `YYYY-MM-DD.jsonl` and rotate daily. Old files are
 //! removed by `cleanup_expired` based on `retention_days`.
+//!
+//! This file is a non-authoritative observation/replay projection. Production
+//! delivery evidence is committed first by `AuditDispatcher`, whose hash chain
+//! and `sync_data` contract own data-red-line 2.7. JSONL projection failure is
+//! still fatal to the monitor lifecycle, but this file is not advertised as
+//! the tamper-resistant delivery ledger.
 
 use std::path::{Path, PathBuf};
 
@@ -47,22 +53,21 @@ pub struct JsonlWriter {
 impl JsonlWriter {
     /// Spawn a writer task that consumes envelopes from `receiver`.
     ///
-    /// The task runs until the receiver's sender is dropped or a fatal error occurs.
-    /// Returns a `JoinHandle` that can be aborted to stop the writer.
-    pub fn spawn(
+    /// Directory creation and retention cleanup complete before this returns.
+    /// The consumer task then runs until the receiver's sender is dropped or a
+    /// fatal error occurs. The returned `JoinHandle` can be aborted to stop it.
+    pub async fn spawn(
         receiver: broadcast::Receiver<EventEnvelope>,
         base_dir: PathBuf,
         retention_days: u32,
-    ) -> JoinHandle<()> {
-        tokio::spawn(async move {
-            let writer = Self {
-                base_dir,
-                retention_days,
-            };
-            if let Err(e) = writer.run(receiver).await {
-                log::error!("[jsonl_writer] fatal error: {}", e);
-            }
-        })
+    ) -> Result<JoinHandle<Result<(), JsonlError>>, JsonlError> {
+        let writer = Self {
+            base_dir,
+            retention_days,
+        };
+        fs::create_dir_all(&writer.base_dir).await?;
+        Self::cleanup_expired(&writer.base_dir, writer.retention_days).await?;
+        Ok(tokio::spawn(async move { writer.consume(receiver).await }))
     }
 
     /// Remove JSONL files older than `retention_days` from `base_dir`.
@@ -99,11 +104,7 @@ impl JsonlWriter {
         Ok(())
     }
 
-    async fn run(&self, mut rx: broadcast::Receiver<EventEnvelope>) -> Result<(), JsonlError> {
-        fs::create_dir_all(&self.base_dir).await?;
-        if let Err(error) = Self::cleanup_expired(&self.base_dir, self.retention_days).await {
-            log::warn!("[jsonl_writer] retention cleanup failed: {}", error);
-        }
+    async fn consume(&self, mut rx: broadcast::Receiver<EventEnvelope>) -> Result<(), JsonlError> {
         loop {
             match rx.recv().await {
                 Ok(env) => {
@@ -111,12 +112,12 @@ impl JsonlWriter {
                         // Skip replay envelopes; real events must not be lost.
                         continue;
                     }
-                    if let Err(e) = self.write_envelope(&env).await {
-                        log::error!("[jsonl_writer] write error for {}: {}", env.id, e);
-                    }
+                    self.write_envelope(&env).await?;
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    log::warn!("[jsonl_writer] receiver lagged, skipped {} events", skipped);
+                    return Err(JsonlError::Receive(broadcast::error::RecvError::Lagged(
+                        skipped,
+                    )));
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     log::info!("[jsonl_writer] receiver closed, shutting down normally");
@@ -130,6 +131,7 @@ impl JsonlWriter {
     async fn write_envelope(&self, env: &EventEnvelope) -> Result<(), JsonlError> {
         let date_str = env.ts.format("%Y-%m-%d").to_string();
         let file_path = self.base_dir.join(format!("{}.jsonl", date_str));
+        let json = serde_json::to_string(env)?;
 
         tokio::fs::create_dir_all(&self.base_dir).await?;
 
@@ -139,7 +141,6 @@ impl JsonlWriter {
             .open(&file_path)
             .await?;
 
-        let json = serde_json::to_string(env)?;
         file.write_all(json.as_bytes()).await?;
         file.write_all(b"\n").await?;
         file.flush().await?;
@@ -174,7 +175,7 @@ mod tests {
 
     fn test_bus(capacity: usize) -> (Arc<EventBus>, broadcast::Receiver<EventEnvelope>) {
         let bus = EventBus::new_for_test(capacity);
-        let rx = bus.subscribe();
+        let rx = bus.subscribe().expect("subscribe JSONL test receiver");
         (Arc::new(bus), rx)
     }
 
@@ -260,12 +261,17 @@ mod tests {
     async fn writer_appends_one_json_envelope_per_line() {
         let dir = test_dir("append");
         let (bus, rx) = test_bus(8);
-        let handle = JsonlWriter::spawn(rx, dir.clone(), 7);
+        let handle = JsonlWriter::spawn(rx, dir.clone(), 7)
+            .await
+            .expect("initialize test JSONL writer");
 
         bus.publish(test_live_envelope("evt-1"));
         wait_until_file_contains(&dir, "evt-1").await;
         bus.shutdown();
-        let _ = handle.await;
+        handle
+            .await
+            .expect("join JSONL writer")
+            .expect("consume JSONL events");
 
         let lines = read_today_lines(&dir).await;
         assert_eq!(lines.len(), 1);
@@ -279,13 +285,18 @@ mod tests {
     async fn writer_skips_only_replay_envelopes() {
         let dir = test_dir("replay-filter");
         let (bus, rx) = test_bus(8);
-        let handle = JsonlWriter::spawn(rx, dir.clone(), 7);
+        let handle = JsonlWriter::spawn(rx, dir.clone(), 7)
+            .await
+            .expect("initialize test JSONL writer");
 
         bus.publish(test_live_envelope("live"));
         bus.publish(test_replay_envelope("replay", "original"));
         wait_until_file_contains(&dir, "live").await;
         bus.shutdown();
-        let _ = handle.await;
+        handle
+            .await
+            .expect("join JSONL writer")
+            .expect("consume JSONL events");
 
         let text = read_today_text(&dir).await;
         assert!(
@@ -322,5 +333,111 @@ mod tests {
 
         // Cleanup
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn ready_initialization_rejects_a_regular_file_parent() {
+        let blocker = test_dir("init-blocker");
+        tokio::fs::write(&blocker, b"not a directory")
+            .await
+            .expect("create blocker");
+        let (_bus, rx) = test_bus(8);
+
+        let error = match JsonlWriter::spawn(rx, blocker.join("events"), 7).await {
+            Err(error) => error,
+            Ok(handle) => {
+                handle.abort();
+                panic!("regular-file parent must reject writer initialization");
+            }
+        };
+
+        assert!(matches!(error, JsonlError::Io(_)));
+        tokio::fs::remove_file(blocker)
+            .await
+            .expect("remove blocker");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ready_initialization_propagates_retention_read_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_dir("cleanup-permission");
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("create cleanup directory");
+        let original = std::fs::metadata(&dir)
+            .expect("read original permissions")
+            .permissions();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000))
+            .expect("deny cleanup directory reads");
+        let (_bus, rx) = test_bus(8);
+
+        let result = JsonlWriter::spawn(rx, dir.clone(), 7).await;
+
+        std::fs::set_permissions(&dir, original).expect("restore cleanup directory permissions");
+        match result {
+            Err(JsonlError::Io(_)) => {}
+            Err(other) => panic!("expected retention I/O error, got {other}"),
+            Ok(handle) => {
+                handle.abort();
+                panic!("unreadable retention directory must fail initialization");
+            }
+        }
+        tokio::fs::remove_dir_all(dir)
+            .await
+            .expect("remove cleanup directory");
+    }
+
+    #[tokio::test]
+    async fn consumer_propagates_envelope_write_failure() {
+        let dir = test_dir("write-failure");
+        let (bus, rx) = test_bus(8);
+        let handle = JsonlWriter::spawn(rx, dir.clone(), 7)
+            .await
+            .expect("initialize writer");
+        tokio::fs::remove_dir_all(&dir)
+            .await
+            .expect("remove initialized directory");
+        tokio::fs::write(&dir, b"blocks event directory")
+            .await
+            .expect("replace event directory with regular file");
+
+        bus.publish(test_live_envelope("write-failure"));
+        bus.shutdown();
+        let error = handle
+            .await
+            .expect("join writer task")
+            .expect_err("event write failure must propagate");
+
+        assert!(matches!(error, JsonlError::Io(_)));
+        tokio::fs::remove_file(dir)
+            .await
+            .expect("remove event directory blocker");
+    }
+
+    #[tokio::test]
+    async fn consumer_propagates_receiver_lag() {
+        let dir = test_dir("lag");
+        let (bus, rx) = test_bus(1);
+        bus.publish(test_live_envelope("lag-1"));
+        bus.publish(test_live_envelope("lag-2"));
+        let handle = JsonlWriter::spawn(rx, dir.clone(), 7)
+            .await
+            .expect("initialize lag writer");
+        bus.shutdown();
+
+        let error = handle
+            .await
+            .expect("join lag writer")
+            .expect_err("receiver lag must propagate");
+
+        assert!(matches!(
+            error,
+            JsonlError::Receive(broadcast::error::RecvError::Lagged(1))
+        ));
+        tokio::fs::remove_dir_all(dir)
+            .await
+            .expect("remove lag directory");
     }
 }
