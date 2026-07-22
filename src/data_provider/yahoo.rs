@@ -4,6 +4,7 @@
 //! A 股代码映射：深交所 → code.SZ，上交所(6开头) → code.SS
 
 use serde::Deserialize;
+use serde_json::Value;
 
 /// 雅虎返回的实时行情
 #[derive(Debug, Clone)]
@@ -186,8 +187,69 @@ fn fetch_quotes_from_base(
 pub fn fetch_overnight_data() -> Result<(String, String), String> {
     // 美股 3 指数 + 美元/人民币汇率；这些是 Yahoo 原生符号，不能添加 A 股后缀。
     let codes = ["^IXIC", "^DJI", "^GSPC", "CNY=X"].map(str::to_string);
-    let quotes = fetch_quotes(&codes)?;
+    let quotes = match fetch_quotes(&codes) {
+        Ok(quotes) => quotes,
+        Err(quote_error) => {
+            log::warn!("Yahoo quote endpoint unavailable; trying chart endpoint: {quote_error}");
+            fetch_chart_quotes(&codes).map_err(|chart_error| {
+                format!("quote endpoint: {quote_error}; chart endpoint: {chart_error}")
+            })?
+        }
+    };
     format_overnight_data(&quotes)
+}
+
+/// Yahoo's chart endpoint is a separate, real-data API and often remains
+/// available when `/v7/finance/quote` returns 401. It is not a synthetic
+/// fallback: missing or invalid chart fields still fail the overnight task.
+fn fetch_chart_quotes(codes: &[String]) -> Result<Vec<YahooQuote>, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .map_err(|error| format!("build Yahoo chart client: {error}"))?;
+    let mut quotes = Vec::with_capacity(codes.len());
+    for symbol in codes {
+        let url = format!(
+            "https://query1.finance.yahoo.com/v8/finance/chart/{}?range=1d&interval=1d",
+            urlencoding::encode(symbol)
+        );
+        let body: Value = client
+            .get(url)
+            .header("User-Agent", "Mozilla/5.0")
+            .send()
+            .map_err(|error| format!("chart request {symbol}: {error}"))?
+            .error_for_status()
+            .map_err(|error| format!("chart HTTP {symbol}: {error}"))?
+            .json()
+            .map_err(|error| format!("chart decode {symbol}: {error}"))?;
+        let meta = body
+            .pointer("/chart/result/0/meta")
+            .ok_or_else(|| format!("chart response missing meta for {symbol}"))?;
+        let price = meta
+            .get("regularMarketPrice")
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .ok_or_else(|| format!("chart missing valid price for {symbol}"))?;
+        let previous = meta
+            .get("previousClose")
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .ok_or_else(|| format!("chart missing valid previous close for {symbol}"))?;
+        let change_pct = (price - previous) / previous * 100.0;
+        if !change_pct.is_finite() || change_pct.abs() > 20.0 {
+            return Err(format!(
+                "chart invalid change_pct for {symbol}: {change_pct}"
+            ));
+        }
+        quotes.push(YahooQuote {
+            code: symbol.clone(),
+            price: Some(price),
+            change_pct: Some(change_pct),
+            volume: None,
+            previous_close: Some(previous),
+        });
+    }
+    Ok(quotes)
 }
 
 fn format_overnight_data(quotes: &[YahooQuote]) -> Result<(String, String), String> {
