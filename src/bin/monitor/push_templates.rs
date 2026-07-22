@@ -156,10 +156,13 @@ impl BannerCtx {
             pnl,
             self.data_mode.label(),
         );
-        match self.data_missing_note.as_deref() {
-            Some(note) if !note.is_empty() && self.data_mode != DataMode::Full => {
+        let account_note = (!self.account_metrics_complete)
+            .then_some("实时账户未接入；仓位/日盈亏仅在用户快照收盘估值完成后显示");
+        match (self.data_missing_note.as_deref(), account_note) {
+            (Some(note), _) if !note.is_empty() && self.data_mode != DataMode::Full => {
                 format!("{}\n[⚠️ {}: 本条不含承接判断]", line1, note)
             }
+            (_, Some(note)) => format!("{}\n[⚠️ {}]", line1, note),
             _ => line1,
         }
     }
