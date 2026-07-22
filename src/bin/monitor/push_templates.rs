@@ -232,6 +232,29 @@ pub(crate) fn paper_risk_context_from_banner(
     ))
 }
 
+/// BR-151: paper-only risk context from user-confirmed facts.  This never
+/// authorizes a broker order; the Full data gate remains mandatory.
+pub(crate) fn snapshot_paper_risk_context_from_banner(
+    banner: &BannerCtx,
+) -> Result<stock_analysis::trading::paper_trade::PaperRiskContext, String> {
+    if banner.data_mode != DataMode::Full {
+        return Err(format!(
+            "SnapshotPaper requires DataMode Full, current={}",
+            banner.data_mode.label()
+        ));
+    }
+    stock_analysis::database::DatabaseManager::try_get()
+        .ok_or_else(|| "数据库未初始化，无法读取用户快照".to_string())?;
+    stock_analysis::database::user_account_summary::latest()?
+        .ok_or_else(|| "用户账户摘要不存在".to_string())?;
+    stock_analysis::database::user_position_snapshot::latest_user_position_snapshot()?
+        .ok_or_else(|| "用户持仓快照不存在".to_string())?;
+    Ok(stock_analysis::trading::paper_trade::PaperRiskContext::new(
+        stock_analysis::risk::action_gate::AccountMode::Normal,
+        stock_analysis::monitor::data_mode::DataMode::Full,
+    ))
+}
+
 // ============================================================================
 // §14.1 实盘时段 — T-01 ~ T-12
 // ============================================================================

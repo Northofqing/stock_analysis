@@ -6399,10 +6399,19 @@ async fn monitor_loop() {
             let risk_context = current_banner_for("v16.3 paper decision").and_then(|banner| {
                 match push_templates::paper_risk_context_from_banner(&banner) {
                     Ok(context) => Some(context),
-                    Err(error) => {
-                        log::error!("[v16.3][BR-134] paper risk context unavailable: {}", error);
-                        None
-                    }
+                    Err(error) => match push_templates::snapshot_paper_risk_context_from_banner(&banner) {
+                        Ok(context) => {
+                            log::info!("[BR-151] SnapshotPaper 使用用户确认持仓进入虚拟盘引擎");
+                            Some(context)
+                        }
+                        Err(snapshot_error) => {
+                            log::error!(
+                                "[v16.3][BR-134] paper risk context unavailable: {}; SnapshotPaper unavailable: {}",
+                                error, snapshot_error
+                            );
+                            None
+                        }
+                    },
                 }
             });
             if let Some(risk_context) = risk_context {
