@@ -190,6 +190,54 @@ pub fn pre_trade_check(
     Ok(())
 }
 
+/// BR-146/147: paper-only check for a user-confirmed closing snapshot.
+/// This path is deliberately separate from live account authorization and
+/// never authorizes a real order.
+pub fn pre_trade_check_snapshot(
+    signal: &PaperSignal,
+    quote_price: f64,
+    current_cash: f64,
+    total_value: f64,
+    current_position_pct: f64,
+) -> Result<(), String> {
+    use crate::trading::order_safety::{OrderSafetyInput, SafetySide};
+    crate::trading::order_safety::validate(&OrderSafetyInput {
+        code: &signal.code,
+        side: match signal.direction {
+            Direction::Buy => SafetySide::Buy,
+            Direction::Sell => SafetySide::Sell,
+        },
+        order_price: signal.price,
+        quantity: signal.quantity as u64,
+        available_cash: (signal.direction == Direction::Buy).then_some(current_cash),
+        limit_down_price: signal.limit_down_price,
+        limit_up_price: signal.limit_up_price,
+        secondary_confirmed: signal.secondary_confirmed,
+    })?;
+    if !quote_price.is_finite()
+        || quote_price <= 0.0
+        || !current_cash.is_finite()
+        || current_cash < 0.0
+        || !total_value.is_finite()
+        || total_value <= 0.0
+        || current_cash > total_value
+        || !current_position_pct.is_finite()
+        || current_position_pct < 0.0
+    {
+        return Err("BR-146 invalid snapshot paper account state".into());
+    }
+    if signal.risk_context.data_mode != DataMode::Full {
+        return Err("BR-146 snapshot paper requires Full settled data".into());
+    }
+    if signal.direction == Direction::Buy && current_position_pct > *MAX_POSITION_PCT {
+        return Err(format!(
+            "snapshot paper position {:.1}% exceeds limit",
+            current_position_pct
+        ));
+    }
+    Ok(())
+}
+
 // ============ Unit tests (≥ 12, 含边界 case) ============
 
 #[cfg(test)]

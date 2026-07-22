@@ -358,12 +358,13 @@ fn persist_paper_trade_with_audit(
 ///
 /// v16.3 Commit 1 BREAKING: 签名加 4 参数 (quote_price, current_cash, total_value, current_position_pct)
 /// 调用方: push_templates:3073 (D-01), push_templates:6223 (盘后资金)
-pub fn simulate(
+fn simulate_with_scope(
     signal: &PaperSignal,
     quote_price: f64,
     current_cash: f64,
     total_value: f64,
     current_position_pct: f64,
+    snapshot_scope: bool,
 ) -> Result<PaperOutcome, String> {
     let db = DatabaseManager::try_get()
         .ok_or_else(|| "BR-086 paper-order audit database is not initialized".to_string())?;
@@ -392,7 +393,12 @@ pub fn simulate(
     }
 
     // v16.3 R1+R2: pre-trade gate 4 项硬检查 (拒 → 不入 paper_trades, 不调 evaluate)
-    if let Err(reason) = crate::trading::risk_adapter::pre_trade_check(
+    let gate = if snapshot_scope {
+        crate::trading::risk_adapter::pre_trade_check_snapshot
+    } else {
+        crate::trading::risk_adapter::pre_trade_check
+    };
+    if let Err(reason) = gate(
         signal,
         quote_price,
         current_cash,
@@ -460,6 +466,41 @@ pub fn simulate(
         result,
         inserted: rows > 0,
     })
+}
+
+pub fn simulate(
+    signal: &PaperSignal,
+    quote_price: f64,
+    current_cash: f64,
+    total_value: f64,
+    current_position_pct: f64,
+) -> Result<PaperOutcome, String> {
+    simulate_with_scope(
+        signal,
+        quote_price,
+        current_cash,
+        total_value,
+        current_position_pct,
+        false,
+    )
+}
+
+/// BR-146/147: paper-only execution from a confirmed closing snapshot.
+pub fn simulate_snapshot(
+    signal: &PaperSignal,
+    quote_price: f64,
+    current_cash: f64,
+    total_value: f64,
+    current_position_pct: f64,
+) -> Result<PaperOutcome, String> {
+    simulate_with_scope(
+        signal,
+        quote_price,
+        current_cash,
+        total_value,
+        current_position_pct,
+        true,
+    )
 }
 
 #[cfg(test)]
