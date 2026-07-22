@@ -26,10 +26,47 @@ pub struct LhbEntryInput {
 
 /// MVP4-4.3 主查询: 取最近 N 天龙虎榜
 ///
-/// BR-110：当前仓库尚未接入可验证的龙虎榜生产查询源。
-/// 调用方必须看见 unavailable，不能把缺 producer 解释为“当日无数据”。
-pub fn fetch_recent_lhb(_date: NaiveDate, _limit: usize) -> Result<Vec<LhbEntryInput>, String> {
-    Err("unavailable: 龙虎榜生产数据源尚未接入".to_string())
+/// BR-110：从东方财富公开数据中心读取真实龙虎榜批次。
+/// 网络、协议或字段失败均返回 unavailable，不把缺数据伪装成空榜。
+pub fn fetch_recent_lhb(date: NaiveDate, limit: usize) -> Result<Vec<LhbEntryInput>, String> {
+    let url = format!(
+        "http://datacenter-web.eastmoney.com/api/data/v1/get?reportName=RPT_DAILYBILLBOARD_DETAILS&columns=SECURITY_CODE,SECURITY_NAME_ABBR,TRADE_DATE,EXPLAIN,BILLBOARD_NET_AMT,BILLBOARD_BUY_AMT,BILLBOARD_SELL_AMT&filter=(TRADE_DATE='{}')&pageNumber=1&pageSize={}&sortTypes=-1&sortColumns=BILLBOARD_NET_AMT",
+        date.format("%Y-%m-%d"), limit.max(1)
+    );
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .map_err(|e| format!("unavailable: build LHB client: {e}"))?;
+    let body: serde_json::Value = client
+        .get(url)
+        .header("User-Agent", "Mozilla/5.0")
+        .send()
+        .map_err(|e| format!("unavailable: LHB request failed: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("unavailable: LHB HTTP status failed: {e}"))?
+        .json()
+        .map_err(|e| format!("unavailable: LHB JSON decode failed: {e}"))?;
+    let rows = body
+        .pointer("/result/data")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "unavailable: LHB response missing result.data".to_string())?;
+    let mut out = Vec::new();
+    for row in rows.iter().take(limit) {
+        let code = row.get("SECURITY_CODE").and_then(|v| v.as_str()).unwrap_or("");
+        let name = row.get("SECURITY_NAME_ABBR").and_then(|v| v.as_str()).unwrap_or("");
+        let net = row.get("BILLBOARD_NET_AMT").and_then(|v| v.as_f64());
+        if code.is_empty() || name.is_empty() || net.is_none() {
+            return Err("unavailable: LHB row missing required code/name/net amount".into());
+        }
+        out.push(LhbEntryInput {
+            code: code.to_string(),
+            name: name.to_string(),
+            net_buy_yi: net.unwrap() / 100_000_000.0,
+            reason: row.get("EXPLAIN").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            ..Default::default()
+        });
+    }
+    Ok(out)
 }
 
 /// 渲染为字符串 (供 bin/monitor 拼接 R-04 模板).

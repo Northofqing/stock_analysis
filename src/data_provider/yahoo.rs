@@ -232,6 +232,7 @@ fn fetch_chart_quotes(codes: &[String]) -> Result<Vec<YahooQuote>, String> {
             .ok_or_else(|| format!("chart missing valid price for {symbol}"))?;
         let previous = meta
             .get("previousClose")
+            .or_else(|| meta.get("chartPreviousClose"))
             .and_then(Value::as_f64)
             .filter(|value| value.is_finite() && *value > 0.0)
             .ok_or_else(|| format!("chart missing valid previous close for {symbol}"))?;
