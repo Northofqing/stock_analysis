@@ -315,11 +315,6 @@ impl DataFetcherManager {
             providers.push(Box::new(magic_tdx_provider));
         }
 
-        // 兼容旧 RustDX 适配器
-        if let Ok(rustdx_provider) = RustdxProvider::new() {
-            providers.push(Box::new(rustdx_provider));
-        }
-
         // 备用：腾讯财经（稳定可靠）
         if let Ok(gtimg_provider) = GtimgProvider::new() {
             providers.push(Box::new(gtimg_provider));

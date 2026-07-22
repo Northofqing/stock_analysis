@@ -21,7 +21,7 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use crate::data_provider::baostock_provider::BaostockProvider;
 use crate::data_provider::{
     is_ban_error, DataProvider, GtimgProvider, HttpProvider, KlineData, MagicTdxProvider,
-    RustdxProvider, SinaProvider,
+    SinaProvider,
 };
 use crate::monitor::data_quality::{max_gap_for, validate_daily_kline_quality};
 
@@ -104,7 +104,7 @@ pub async fn fetch_kline_with_fallback(
 ) -> Result<(Vec<KlineData>, &'static str)> {
     // Task 4 startup log: 列出 4-way fallback 链 + priority, 便于线上排查.
     log::info!(
-        "[fallback] {} 启动 5-way 竞速链: magic_tdx (P1) → sina_hq (P2) → tencent_qfq (P3) → eastmoney_qfq (P4) → rustdx_none (P5)",
+        "[fallback] {} 启动 4-way 竞速链: magic_tdx (P1) → sina_hq (P2) → tencent_qfq (P3) → eastmoney_qfq (P4)",
         code
     );
 
@@ -150,19 +150,6 @@ pub async fn fetch_kline_with_fallback(
         let r =
             HttpProvider::fetch_kline_data_internal(&eastmoney_client, &eastmoney_code, days).await;
         ("eastmoney_qfq", r)
-    }));
-
-    let rustdx_code = code.to_string();
-    candidates.push(Box::pin(async move {
-        let r: Result<Vec<KlineData>> =
-            tokio::task::spawn_blocking(move || -> Result<Vec<KlineData>> {
-                let provider = RustdxProvider::new()?;
-                provider.get_daily_data(&rustdx_code, days)
-            })
-            .await
-            .map_err(|e| anyhow!("RustDX 任务执行失败: {}", e))
-            .and_then(|inner| inner);
-        ("rustdx_none", r)
     }));
 
     let (data, source) = resolve_kline_candidates(candidates, code, qc_threshold).await?;
