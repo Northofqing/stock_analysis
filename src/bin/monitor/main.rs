@@ -132,7 +132,8 @@ mod dryrun_report; // v26: dry-run 自动报告
 
 mod v13_diag; // v13.27: 端到端诊断
 
-mod market_data;
+mod data_mode_probe;
+mod market_data; // BR-148: capability probes remain independent from governance DataMode
 
 mod intraday_market;
 
