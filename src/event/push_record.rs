@@ -166,19 +166,23 @@ impl PushRecord {
 
         let kind = required_text("kind")?;
 
-        let code = match env.payload.get("code") {
-            None | Some(serde_json::Value::Null) => None,
-            Some(value) => {
-                let code = value
-                    .as_str()
-                    .ok_or_else(|| PushRecordError::InvalidFieldType("code".into()))?;
-                if code.trim().is_empty() {
-                    return Err(PushRecordError::InvalidFieldValue("code".into()));
+        let code = if audit_schema_version.is_none() {
+            parse_legacy_code(env.payload.get("code"), env.entity_key.as_deref())?
+        } else {
+            match env.payload.get("code") {
+                None | Some(serde_json::Value::Null) => None,
+                Some(value) => {
+                    let code = value
+                        .as_str()
+                        .ok_or_else(|| PushRecordError::InvalidFieldType("code".into()))?;
+                    if code.trim().is_empty() {
+                        return Err(PushRecordError::InvalidFieldValue("code".into()));
+                    }
+                    Some(code.to_string())
                 }
-                Some(code.to_string())
             }
         };
-        if code.as_deref() != env.entity_key.as_deref() {
+        if audit_schema_version.is_some() && code.as_deref() != env.entity_key.as_deref() {
             return Err(PushRecordError::InvalidFieldValue(
                 "payload.code does not match envelope.entity_key".into(),
             ));
@@ -361,6 +365,32 @@ impl PushRecord {
             ));
         }
         Ok(record)
+    }
+}
+
+fn parse_legacy_code(
+    payload_code: Option<&serde_json::Value>,
+    entity_key: Option<&str>,
+) -> Result<Option<String>, PushRecordError> {
+    match (payload_code, entity_key) {
+        (Some(serde_json::Value::String(code)), Some(key)) if code.is_empty() && key.is_empty() => {
+            Ok(None)
+        }
+        (None | Some(serde_json::Value::Null), None) => Ok(None),
+        (Some(serde_json::Value::String(code)), Some(key))
+            if !code.trim().is_empty() && code == key =>
+        {
+            Ok(Some(code.clone()))
+        }
+        (Some(serde_json::Value::String(code)), _) if code.trim().is_empty() => {
+            Err(PushRecordError::InvalidFieldValue("code".into()))
+        }
+        (Some(value), _) if !value.is_string() => {
+            Err(PushRecordError::InvalidFieldType("code".into()))
+        }
+        _ => Err(PushRecordError::InvalidFieldValue(
+            "payload.code does not match envelope.entity_key".into(),
+        )),
     }
 }
 
