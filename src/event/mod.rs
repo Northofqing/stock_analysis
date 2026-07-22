@@ -151,6 +151,17 @@ fn runtime_delivery_audit() -> &'static AuditDispatcher {
     DISPATCHER.get_or_init(AuditDispatcher::for_runtime)
 }
 
+/// Startup gate for any process that may emit delivery records.
+/// This is intentionally synchronous so callers can place it behind
+/// `spawn_blocking` and fail closed before starting ordinary sinks.
+pub fn preflight_runtime_delivery_audit() -> Result<AuditPreflightReceipt, String> {
+    runtime_delivery_audit().preflight()
+}
+
+pub fn runtime_delivery_audit_health() -> AuditHealth {
+    runtime_delivery_audit().health()
+}
+
 /// Publish a push delivery observation on the global bus.
 ///
 /// Logs a visible warning if the global bus has not been initialized.

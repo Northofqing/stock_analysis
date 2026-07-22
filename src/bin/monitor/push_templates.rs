@@ -2472,7 +2472,14 @@ async fn dispatch_intraday_market_daily_result(
     hhmm: &str,
     banner: &BannerCtx,
 ) -> PeriodicDispatchResult {
-    let snapshot = match load_sector_snapshot_real(hhmm) {
+    let snapshot = match tokio::task::spawn_blocking({
+        let hhmm = hhmm.to_string();
+        move || load_sector_snapshot_real(&hhmm)
+    })
+    .await
+    .map_err(|error| format!("I-01 snapshot worker join: {error}"))
+    .and_then(|result| result)
+    {
         Ok(snapshot) => snapshot,
         Err(error) => {
             log::error!("[I-01] 快照批次拒绝: {}", error);

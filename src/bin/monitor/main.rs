@@ -2891,6 +2891,26 @@ async fn main() {
         return;
     }
 
+    // BR-144/145: prove the delivery audit chain is readable and writable
+    // before warming any sink. A failed preflight blocks ordinary pushes.
+    let audit_preflight =
+        tokio::task::spawn_blocking(stock_analysis::event::preflight_runtime_delivery_audit).await;
+    match audit_preflight {
+        Ok(Ok(receipt)) => log::info!(
+            "[AuditDegraded][BR-144] delivery audit preflight healthy: year={} previous_hash={:?}",
+            receipt.year,
+            receipt.previous_hash
+        ),
+        Ok(Err(error)) => {
+            log::error!("[AuditDegraded][BR-144] delivery audit preflight failed: {error}");
+            return;
+        }
+        Err(error) => {
+            log::error!("[AuditDegraded][BR-144] delivery audit preflight worker failed: {error}");
+            return;
+        }
+    }
+
     // 修复 F20 (2026-06-29 codex review): 启动 banner 显示当前 LaunchStage
 
     // (从 env STAGE 读, 默认 Shadow). operator 一眼看清推送策略.
