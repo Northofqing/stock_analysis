@@ -5479,6 +5479,10 @@ async fn push_e2e_14x_templates(date: &str, hhmm: &str) {
 
 /// 结果逐只推送飞书。受 `AI_AGENT_PIPELINE`（默认开启）控制；关闭则整体跳过。
 
+#[allow(
+    dead_code,
+    reason = "v18/v19 compatibility implementation retained; strict post-session scheduler is the sole production owner"
+)]
 async fn run_review_deep_analysis(
     _holding_breakout_text: &str,
 
@@ -5816,6 +5820,13 @@ impl NewsOuterTickCoordinator {
     }
 }
 
+/// BR-152: earnings/analyst enrichment belongs to the existing post-close
+/// review pipeline (v18/v19); the intraday news loop must not call these slow
+/// providers. It may only consume data already persisted by that pipeline.
+fn post_close_analysis_window_open(now: chrono::NaiveDateTime) -> bool {
+    now.time() >= chrono::NaiveTime::from_hms_opt(15, 0, 0).expect("valid post-close time")
+}
+
 fn load_announcement_audience_codes(
     registered_watch_codes: &std::collections::HashSet<String>,
 ) -> (std::collections::HashSet<String>, Option<String>) {
@@ -6079,8 +6090,12 @@ async fn news_monitor_loop() {
                 }
             };
 
-        // v17.7 Task 7: Poll earnings and analyst upgrades for watchlist
-        if outer_tick.enter(NewsOuterTickPhase::HoldingEarnings) {
+        // v17.7 Task 7 / BR-152: poll earnings and analyst upgrades only in
+        // the existing post-close analysis window; never make provider calls
+        // during the market session.
+        if outer_tick.enter(NewsOuterTickPhase::HoldingEarnings)
+            && post_close_analysis_window_open(chrono::Local::now().naive_local())
+        {
             if let Some(our_codes) = &our_codes {
                 let earnings_cfg = stock_analysis::config::get_monitor_config()
                     .v17_7_earnings
@@ -8514,13 +8529,9 @@ async fn monitor_loop() {
                 log::error!("[虚拟观察仓] 次日复盘失败: {}", error);
             }
 
-            // 盘后持仓多 Agent 深度研判（6 分析师 + 多空辩论 + 仲裁），逐只推送飞书
-
-            // v17.0: --test 路径 holding/watch_breakout_text 在 run_test_scan 不可见, 传 "" 占位
-
-            if let Err(error) = run_review_deep_analysis("", "", "").await {
-                log::error!("[收盘] 持仓深度复盘失败: {}", error);
-            }
+            // v18/v19: 多轮 AI 由既有 19:00 strict post-session owner 负责。
+            // 这里不再调用旧的全量抓取入口，避免重复拉 250 日 K 线、财报和六类工具数据。
+            log::info!("[收盘] 多轮 AI 转由 post_session_review_scheduler 统一调度");
 
             log::info!(
                 "[收盘] 信号{}条 告警{}条 | DQ: {} | {}",
@@ -9835,6 +9846,12 @@ mod tests_post_session_review_scheduler {
         assert!(!post_session_review_window_open(at(18, 59), true));
         assert!(post_session_review_window_open(at(19, 0), true));
         assert!(!post_session_review_window_open(at(19, 0), false));
+    }
+
+    #[test]
+    fn br152_expensive_enrichment_is_post_close_only() {
+        assert!(!post_close_analysis_window_open(at(14, 59)));
+        assert!(post_close_analysis_window_open(at(15, 0)));
     }
 
     #[test]
