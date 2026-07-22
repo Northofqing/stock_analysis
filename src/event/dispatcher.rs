@@ -281,6 +281,7 @@ fn validate_existing_chain(path: &Path) -> Result<Option<String>, String> {
     }
     let mut expected_parent = "GENESIS".to_string();
     let mut last_hash = None;
+    let mut saw_v2 = false;
     for (index, line) in content.lines().enumerate() {
         if line.trim().is_empty() {
             return Err(format!("audit line {} is blank", index + 1));
@@ -309,26 +310,100 @@ fn validate_existing_chain(path: &Path) -> Result<Option<String>, String> {
             .as_object_mut()
             .ok_or_else(|| format!("audit line {} is not an object", index + 1))?
             .remove("record_hash");
-        if record.get("hash_domain").is_some() {
-            let envelope = record
-                .get("envelope")
-                .cloned()
-                .ok_or_else(|| format!("audit line {} has no envelope", index + 1))?;
-            let envelope: EventEnvelope = serde_json::from_value(envelope)
-                .map_err(|error| format!("parse audit envelope at line {}: {error}", index + 1))?;
-            super::push_record::PushRecord::try_from_authoritative(&envelope).map_err(|error| {
-                format!("invalid v2 delivery audit at line {}: {error}", index + 1)
-            })?;
-        }
+        let is_v2 = match record.get("hash_domain") {
+            None if saw_v2 => {
+                return Err(format!("legacy audit after v2 at line {}", index + 1));
+            }
+            None => false,
+            Some(serde_json::Value::String(domain))
+                if domain == DELIVERY_AUDIT_RECORD_HASH_DOMAIN =>
+            {
+                saw_v2 = true;
+                true
+            }
+            Some(serde_json::Value::String(domain)) => {
+                return Err(format!("unsupported audit hash domain: {domain}"));
+            }
+            Some(_) => return Err("audit hash_domain must be a string".into()),
+        };
+        validate_closed_object(
+            &record,
+            if is_v2 {
+                &["envelope", "hash_domain", "previous_hash"]
+            } else {
+                &["envelope", "previous_hash"]
+            },
+            "audit record",
+        )
+        .map_err(|error| format!("audit line {}: {error}", index + 1))?;
         let calculated = calculate_record_hash(&record)
             .map_err(|error| format!("audit line {}: {error}", index + 1))?;
         if calculated != record_hash {
             return Err(format!("audit hash mismatch at line {}", index + 1));
         }
+
+        let envelope_value = record
+            .get("envelope")
+            .ok_or_else(|| format!("audit line {} has no envelope", index + 1))?;
+        validate_closed_object(
+            envelope_value,
+            &[
+                "id",
+                "ts",
+                "trace_id",
+                "source",
+                "event_type",
+                "entity_key",
+                "payload",
+                "version",
+                "replay_of",
+            ],
+            if is_v2 {
+                "v2 delivery envelope"
+            } else {
+                "legacy delivery envelope"
+            },
+        )
+        .map_err(|error| format!("audit line {}: {error}", index + 1))?;
+        let envelope: EventEnvelope = serde_json::from_value(envelope_value.clone())
+            .map_err(|error| format!("parse audit envelope at line {}: {error}", index + 1))?;
+        if is_v2 {
+            super::push_record::PushRecord::try_from_authoritative(&envelope).map_err(|error| {
+                format!("invalid v2 delivery audit at line {}: {error}", index + 1)
+            })?;
+        } else {
+            super::push_record::PushRecord::try_from(&envelope).map_err(|error| {
+                format!(
+                    "invalid legacy delivery audit at line {}: {error}",
+                    index + 1
+                )
+            })?;
+        }
         expected_parent = record_hash.clone();
         last_hash = Some(record_hash);
     }
     Ok(last_hash)
+}
+
+fn validate_closed_object(
+    value: &serde_json::Value,
+    expected_fields: &[&str],
+    context: &str,
+) -> Result<(), String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("{context} is not an object"))?;
+    for field in object.keys() {
+        if !expected_fields.contains(&field.as_str()) {
+            return Err(format!("{context} has unknown field: {field}"));
+        }
+    }
+    for field in expected_fields {
+        if !object.contains_key(*field) {
+            return Err(format!("{context} has no {field}"));
+        }
+    }
+    Ok(())
 }
 
 fn calculate_record_hash(record: &serde_json::Value) -> Result<String, String> {
@@ -559,7 +634,9 @@ mod tests {
         let path = dir.join(format!("{}.jsonl", chrono::Local::now().format("%Y")));
         let content = fs::read_to_string(path).unwrap();
         assert_eq!(content.lines().count(), 2);
-        fs::remove_dir_all(dir).unwrap();
+        if dir.exists() {
+            fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]
@@ -873,7 +950,7 @@ mod tests {
         .unwrap();
 
         let error = validate_existing_chain(&path).unwrap_err();
-        assert!(error.contains("legacy delivery audit"));
+        assert!(error.contains("legacy delivery envelope"));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -904,7 +981,9 @@ mod tests {
             .join(format!("{}.jsonl", chrono::Local::now().format("%Y")))
             .exists());
         assert!(!second_dir.exists());
-        fs::remove_dir_all(dir).unwrap();
+        if dir.exists() {
+            fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]

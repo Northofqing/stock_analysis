@@ -450,12 +450,12 @@ Register the closed v2 payload, independently domain-separated subject hash,
 recomputable identity hash, validated legacy prefix and one-way legacy-to-v2
 transition.
 
-- [ ] **Step 2: Add RED downgrade and schema-injection tests**
+- [x] **Step 2: Add RED downgrade and schema-injection tests**
 
 Prove `legacy -> v2 -> legacy` is rejected, malformed legacy envelopes fail,
 unknown v2 payload fields fail, and identity/subject hashes cannot drift.
 
-- [ ] **Step 3: Implement and repeat independent review**
+- [x] **Step 3: Implement and repeat independent review**
 
 Validate every historical row with its schema, enforce a one-way chain upgrade,
 and persist only closed, recomputable v2 delivery records.

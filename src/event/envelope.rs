@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub const DELIVERY_AUDIT_SCHEMA_VERSION: u32 = 2;
+pub const DELIVERY_SUBJECT_HASH_DOMAIN: &str = "stock_analysis.delivery_subject.v2";
 pub const DELIVERY_IDENTITY_HASH_DOMAIN: &str = "stock_analysis.delivery_identity.v2";
 pub const DELIVERY_AUDIT_RULE_IDS: [&str; 5] = ["2.7", "BR-091", "BR-111", "BR-130", "BR-142"];
 
@@ -150,6 +151,7 @@ pub struct PushDeliveryEvent {
     pub retryable: bool,
     pub rule_ids: Vec<String>,
     pub reason_code: String,
+    pub subject_hash: String,
     pub identity_hash: String,
     pub source_as_of: Option<chrono::DateTime<chrono::FixedOffset>>,
     pub audit_schema_version: u32,
@@ -169,7 +171,8 @@ impl PushDeliveryEvent {
     ) -> Self {
         let (reason_code, retryable) =
             delivery_outcome_metadata(&outcome).unwrap_or(("delivery.invalid", false));
-        let identity_hash = delivery_identity_hash(&kind, code.as_deref(), &channel);
+        let subject_hash = delivery_subject_hash(code.as_deref());
+        let identity_hash = delivery_identity_hash_from_subject(&kind, &subject_hash, &channel);
         Self {
             kind,
             decision_status: outcome.clone(),
@@ -180,6 +183,7 @@ impl PushDeliveryEvent {
                 .map(|rule| (*rule).to_string())
                 .collect(),
             reason_code: reason_code.to_string(),
+            subject_hash,
             identity_hash,
             source_as_of: None,
             audit_schema_version: DELIVERY_AUDIT_SCHEMA_VERSION,
@@ -256,6 +260,18 @@ impl DomainEvent for PushDeliveryEvent {
                 "identity_hash".into(),
             ));
         }
+        if !is_lower_hex_sha256(&self.subject_hash) {
+            return Err(EnvelopeError::InvalidDeliveryAuditField(
+                "subject_hash".into(),
+            ));
+        }
+        let expected_identity =
+            delivery_identity_hash_from_subject(&self.kind, &self.subject_hash, &self.channel);
+        if self.identity_hash != expected_identity {
+            return Err(EnvelopeError::InvalidDeliveryAuditField(
+                "identity_hash is not bound to subject/kind/channel".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -279,12 +295,29 @@ pub(crate) fn is_lower_hex_sha256(value: &str) -> bool {
 }
 
 pub(crate) fn delivery_identity_hash(kind: &str, code: Option<&str>, channel: &str) -> String {
+    let subject_hash = delivery_subject_hash(code);
+    delivery_identity_hash_from_subject(kind, &subject_hash, channel)
+}
+
+fn delivery_subject_hash(code: Option<&str>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(DELIVERY_SUBJECT_HASH_DOMAIN.as_bytes());
+    hasher.update([0]);
+    hasher.update(code.unwrap_or("<none>").as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+pub(crate) fn delivery_identity_hash_from_subject(
+    kind: &str,
+    subject_hash: &str,
+    channel: &str,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(DELIVERY_IDENTITY_HASH_DOMAIN.as_bytes());
     hasher.update([0]);
     hasher.update(kind.as_bytes());
     hasher.update([0]);
-    hasher.update(code.unwrap_or("<none>").as_bytes());
+    hasher.update(subject_hash.as_bytes());
     hasher.update([0]);
     hasher.update(channel.as_bytes());
     format!("{:x}", hasher.finalize())
