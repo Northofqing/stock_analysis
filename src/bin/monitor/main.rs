@@ -1581,10 +1581,29 @@ fn build_banner(
             .join("/")
     });
 
+    // User-confirmed snapshots are display-only account facts until a real
+    // broker is connected. Keep `account_metrics_complete` false so risk
+    // gates remain conservative, but do not label known values as missing.
+    let user_summary = stock_analysis::database::DatabaseManager::try_get().and_then(|_| {
+        stock_analysis::database::user_account_summary::latest()
+            .ok()
+            .flatten()
+    });
+    let display_total_pos = am_metrics.total_pos_cheng.or_else(|| {
+        user_summary
+            .as_ref()
+            .map(|summary| (summary.position_ratio_pct / 10.0).round().clamp(0.0, 10.0) as u8)
+    });
+    let display_today_pnl = am_metrics.today_pnl_pct.or_else(|| {
+        user_summary.as_ref().and_then(|summary| {
+            (summary.total_assets > 0.0).then(|| summary.daily_pnl / summary.total_assets * 100.0)
+        })
+    });
+
     push_templates::BannerCtx {
         account_mode,
-        total_pos: am_metrics.total_pos_cheng,
-        today_pnl: am_metrics.today_pnl_pct,
+        total_pos: display_total_pos,
+        today_pnl: display_today_pnl,
         account_metrics_complete: am_metrics.is_complete(),
         data_mode,
         data_missing_note,
