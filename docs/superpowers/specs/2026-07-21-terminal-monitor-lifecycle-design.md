@@ -123,16 +123,22 @@ The authoritative delivery envelope is also a complete BR-142 audit record.
 Its existing source and timestamp are the local delivery observation evidence;
 the payload adds decision status, retryability, non-empty rule IDs and a
 structured reason code. The original security/announcement identity is never
-persisted or logged. Instead, a stable identity is computed with
-`SHA256("stock_analysis.delivery_identity.v2" + NUL + kind + NUL + code + NUL + channel)`.
+persisted or logged. Instead, the code first becomes a domain-separated
+`subject_hash`; the stable identity is then computed with a second independent
+domain over `kind + NUL + subject_hash + NUL + channel`. This lets the
+authoritative parser recompute the identity without retaining the raw subject.
+The payload uses a closed field set, so an unrecognized identity-like field is
+rejected rather than durably copied.
 The outer chain record declares `stock_analysis.delivery_audit_record.v2` and
 uses that value as a domain separator before the canonical JSON bytes.
 
 Existing pre-v2 records cannot be rewritten without breaking their chain. The
 validator therefore recognizes a missing hash-domain field as a legacy record,
-verifies it with the historical algorithm, and permits it only as an immutable
-parent. Every newly appended record declares and uses the v2 domain. Unknown
-domains, incomplete audit fields, raw identities, or invalid hashes fail closed.
+requires its complete historical envelope/payload shape, verifies it with the
+historical algorithm, and permits legacy only as one immutable prefix. Once a
+v2 row is seen, any later legacy row is invalid. Every newly appended record
+declares and uses the v2 domain. Unknown domains, extra or incomplete audit
+fields, raw identities, or invalid hashes fail closed.
 This is a compatibility reader, not permission to emit another legacy record.
 
 Known one-shot modes remain truthful after becoming reachable. Outcome backfill

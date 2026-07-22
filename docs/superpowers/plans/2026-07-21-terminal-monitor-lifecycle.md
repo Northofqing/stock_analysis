@@ -441,3 +441,21 @@ hashing while retaining legacy verification only for existing rows.
 
 Run every mandatory gate on the final tree. Zero Critical and Important
 findings are required before PR creation and merge.
+
+### Task 9: Close BR-142 independent-review findings
+
+- [x] **Step 1: Refine the rule before implementation**
+
+Register the closed v2 payload, independently domain-separated subject hash,
+recomputable identity hash, validated legacy prefix and one-way legacy-to-v2
+transition.
+
+- [ ] **Step 2: Add RED downgrade and schema-injection tests**
+
+Prove `legacy -> v2 -> legacy` is rejected, malformed legacy envelopes fail,
+unknown v2 payload fields fail, and identity/subject hashes cannot drift.
+
+- [ ] **Step 3: Implement and repeat independent review**
+
+Validate every historical row with its schema, enforce a one-way chain upgrade,
+and persist only closed, recomputable v2 delivery records.
