@@ -1599,10 +1599,18 @@ fn store_banner(banner: push_templates::BannerCtx) -> Result<(), String> {
 }
 
 fn refresh_closing_valuation_note() {
+    let account = stock_analysis::database::user_account_summary::latest()
+        .ok()
+        .flatten();
     let note = match stock_analysis::database::closing_valuation::latest_persisted_valuation_view()
     {
         Ok(Some(view)) => Some(format!(
-            "收盘估值 {} 覆盖 {}/{}，来源 {}{}",
+            "用户确认账户 {:.1}%仓位，昨日盈亏 {:+.2}；收盘估值 {} 覆盖 {}/{}，来源 {}{}",
+            account
+                .as_ref()
+                .map(|a| a.position_ratio_pct)
+                .unwrap_or(0.0),
+            account.as_ref().map(|a| a.daily_pnl).unwrap_or(0.0),
             view.valuation.price_date,
             view.valuation.covered,
             view.valuation.total,

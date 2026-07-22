@@ -139,6 +139,7 @@ pub mod account_snapshot;
 // v12 PR3-3.2/3.3 (BR-023/024)
 pub mod closing_valuation;
 pub mod position_shares;
+pub mod user_account_summary;
 pub mod user_position_snapshot;
 
 // ============================================================================
@@ -475,6 +476,7 @@ CREATE INDEX IF NOT EXISTS idx_news_items_published ON news_items(published_at);
 
     fn run_migrations(conn: &mut SqliteConnection) -> Result<(), Box<dyn std::error::Error>> {
         user_position_snapshot::create_schema(conn).map_err(std::io::Error::other)?;
+        user_account_summary::create_schema(conn).map_err(std::io::Error::other)?;
         closing_valuation::create_schema(conn).map_err(std::io::Error::other)?;
         // 创建 stock_daily 表
         diesel::sql_query(
