@@ -16,6 +16,7 @@ pub mod industry;
 pub mod intraday_kline;
 pub mod ipo_date;
 pub mod limit_status;
+pub mod magic_tdx_provider;
 pub mod money_flow;
 pub mod north_flow;
 pub mod rustdx_provider;
@@ -39,6 +40,7 @@ pub use financials::{
 };
 pub use gtimg_provider::GtimgProvider;
 pub use industry::{fetch_blocking as fetch_industry, IndustryBenchmark};
+pub use magic_tdx_provider::MagicTdxProvider;
 pub use money_flow::{
     fetch_intraday_shape_blocking, fetch_money_flow_blocking,
     format_for_prompt as format_flow_prompt, IntradayShape, MoneyFlowSummary,
@@ -308,7 +310,12 @@ impl DataFetcherManager {
     pub fn new() -> Result<Self> {
         let mut providers: Vec<Box<dyn DataProvider>> = Vec::new();
 
-        // 优先使用 RustDX 通达信（速度快、稳定、免费）
+        // 优先使用 magic-tdx-rs：多服务器故障切换及更完整的 TDX 协议实现。
+        if let Ok(magic_tdx_provider) = MagicTdxProvider::new() {
+            providers.push(Box::new(magic_tdx_provider));
+        }
+
+        // 兼容旧 RustDX 适配器
         if let Ok(rustdx_provider) = RustdxProvider::new() {
             providers.push(Box::new(rustdx_provider));
         }

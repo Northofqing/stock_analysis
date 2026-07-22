@@ -50,6 +50,9 @@ rusqlite = { version = "0.31", features = ["chrono"] }
 lettre = { version = "0.11.19", features = ["smtp-transport", "sendmail-transport", "builder", "tokio1-native-tls"] }
 clap = { version = "4.5.54", features = ["derive"] }
 rustdx-complete = "=1.0.0"
+# Real TDX client with multi-server failover. Kept as an explicit path
+# dependency so production never silently substitutes synthetic data.
+magic-tdx-rs = { package = "magic-tdx-rs", path = "../magic-market-data-rs/crates/magic-tdx-rs" }
 urlencoding = "2.1"
 encoding_rs = "0.8"
 plotters = "0.3"

@@ -2827,6 +2827,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "magic-market-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "magic-tdx-rs"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "encoding_rs",
+ "flate2",
+ "magic-market-core",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "maybe-rayon"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5734,6 +5757,7 @@ dependencies = [
  "lazy_static",
  "lettre",
  "log",
+ "magic-tdx-rs",
  "md-5",
  "once_cell",
  "pam",
