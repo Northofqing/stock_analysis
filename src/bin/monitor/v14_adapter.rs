@@ -823,7 +823,11 @@ fn default_profile_for_kind(kind: PushKind) -> TemplateMetadata {
         // Frozen 状态保留在 ctx.is_frozen, 模板自行渲染 ⚠️ 警告
         // 4 铁律: 通知层保持出声, 仓位风险控制在 broker 下单层
         frozen_mode_respect: false,
-        data_mode_min: if matches!(kind, PushKind::AccountMode) {
+        // R-04 is an independently sourced after-close report.  Its gate is
+        // the LHB payload itself (BR-110), not the intraday quote/order-book
+        // capabilities represented by the global mode.  Missing optional LHB
+        // fields remain explicit in the rendered payload.
+        data_mode_min: if matches!(kind, PushKind::AccountMode | PushKind::ReviewLhb) {
             DataMode::Down
         } else {
             DataMode::Degraded
