@@ -74,6 +74,10 @@
 | **v14.x** | 主开发计划 | `docs/v14.x/v14.x-2026-07-11-writing-plans-master-development.md` |
 | **v18.x** | 量化平台闭环中文整合设计（当前活跃） | `docs/v18.x/v18.0-2026-07-16-brainstorming-quant-platform-closure-design-active.md` |
 
+## 当前交接
+
+- [2026-07-22 monitor 观测与剩余工作交接](handoffs/HANDOFF_2026-07-22_MONITOR_AND_REMAINING_WORK.md)
+
 ## 整理动作记录
 
 | 日期 | 动作 | 备注 |
