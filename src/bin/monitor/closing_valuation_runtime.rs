@@ -32,7 +32,12 @@ pub fn eligible_after_close(now: chrono::DateTime<chrono::FixedOffset>) -> bool 
 fn run_blocking(
     date: NaiveDate,
 ) -> Result<database::closing_valuation::SaveClosingValuationReceipt, String> {
-    DatabaseManager::init(Some("data/stock_analysis.db".into())).map_err(|e| e.to_string())?;
+    // The resident monitor initializes the singleton during startup. Reusing
+    // the same process must not turn a scheduled valuation into a false
+    // BR-147 failure merely because initialization already happened.
+    if DatabaseManager::try_get().is_none() {
+        DatabaseManager::init(Some("data/stock_analysis.db".into())).map_err(|e| e.to_string())?;
+    }
     let snapshot = database::user_position_snapshot::latest_user_position_snapshot()?
         .ok_or_else(|| "BR-147 no user-confirmed position snapshot".to_string())?;
     if snapshot.confirm_empty || snapshot.items.is_empty() {

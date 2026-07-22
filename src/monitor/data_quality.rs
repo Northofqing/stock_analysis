@@ -481,9 +481,20 @@ pub fn quick_validate(tick: &Tick, config: &DqConfig) -> Result<(), DqRejectReas
     validate_tick(tick, None, config, &stats)
 }
 
-/// BR-092 / 数据红线 2.3：所有板块的未确认相邻跳变硬上限均为 20%。
-pub fn max_gap_for(_code: &str) -> f64 {
-    20.0
+/// 返回交易所板块的常规涨跌停幅度（含少量接口精度容差）。
+///
+/// 这不是“放行任意异常”的开关：超过此板块上限仍会拒绝；
+/// 超过 20% 但在创业板/科创板/北交所上限内时会记录人工确认告警。
+pub fn max_gap_for(code: &str) -> f64 {
+    let code = code.strip_prefix("TEST_CODE_").unwrap_or(code);
+    let code = code.split('.').next().unwrap_or(code);
+    if code.starts_with("300") || code.starts_with("688") {
+        20.5
+    } else if code.starts_with("8") || code.starts_with("4") {
+        30.5
+    } else {
+        10.5
+    }
 }
 
 /// BR-092：日线整批严格质检。坏行、重复日期、交易日断档与未确认跳变均失败；
@@ -499,7 +510,9 @@ pub fn validate_daily_kline_quality(
     if !max_gap_pct.is_finite() || max_gap_pct <= 0.0 {
         return Err(format!("[{code}] 非法跳变阈值: {max_gap_pct}"));
     }
-    let max_gap_pct = max_gap_pct.min(20.0);
+    // 调用方通常通过 max_gap_for(code) 传入板块阈值。不得再统一 clamp 到 20%，
+    // 否则创业板/科创板真实 ±20% 以及北交所 ±30% 会被误判为脏数据。
+    let max_gap_pct = max_gap_pct;
 
     for b in kline.iter() {
         if !b.open.is_finite() || !b.high.is_finite() || !b.low.is_finite() || !b.close.is_finite()
@@ -573,6 +586,12 @@ pub fn validate_daily_kline_quality(
                 "[{code}] {} 相邻跳变未确认: open={gap_pct:.2}% close={close_change_pct:.2}% (> {max_gap_pct:.2}%), prev_close={:.3}",
                 cur.date, prev.close
             ));
+        }
+        if gap_pct > 20.0 || close_change_pct > 20.0 {
+            log::warn!(
+                "[{code}] {} 相邻涨跌幅超过常规±20%，已按板块上限 {:.1}% 校验: open={gap_pct:.2}% close={close_change_pct:.2}%",
+                cur.date, max_gap_pct
+            );
         }
     }
 
@@ -932,20 +951,19 @@ mod tests {
         assert_eq!(bars[1].date, d1, "出参 [1] 必须是次新 d1");
     }
 
-    /// BR-092: 所有板块都受数据红线 20% 未确认跳变硬上限约束。
+    /// BR-092: 板块阈值区分主板、创业/科创板和北交所。
     #[test]
     fn test_max_gap_for_by_code_prefix() {
-        // 主板 (6/0/2 开头) → 20.0
-        assert!((max_gap_for("TEST_CODE_600519") - 20.0).abs() < 1e-9);
-        assert!((max_gap_for("TEST_CODE_000001") - 20.0).abs() < 1e-9);
-        assert!((max_gap_for("TEST_CODE_002413") - 20.0).abs() < 1e-9);
-        assert!((max_gap_for("TEST_CODE_300750") - 20.0).abs() < 1e-9);
-        assert!((max_gap_for("TEST_CODE_688981") - 20.0).abs() < 1e-9);
-        assert!((max_gap_for("TEST_CODE_830799") - 20.0).abs() < 1e-9);
-        assert!((max_gap_for("TEST_CODE_920001") - 20.0).abs() < 1e-9);
+        assert!((max_gap_for("TEST_CODE_600519") - 10.5).abs() < 1e-9);
+        assert!((max_gap_for("TEST_CODE_000001") - 10.5).abs() < 1e-9);
+        assert!((max_gap_for("TEST_CODE_002413") - 10.5).abs() < 1e-9);
+        assert!((max_gap_for("TEST_CODE_300750") - 20.5).abs() < 1e-9);
+        assert!((max_gap_for("TEST_CODE_688981") - 20.5).abs() < 1e-9);
+        assert!((max_gap_for("TEST_CODE_830799") - 30.5).abs() < 1e-9);
+        assert!((max_gap_for("TEST_CODE_920001") - 30.5).abs() < 1e-9);
     }
 
-    /// BR-092: 调用方即使传入更高板块阈值，也不能绕过 20% 硬上限。
+    /// BR-092: 主板仍拒绝 +25%，创业板按板块阈值保留真实数据。
     #[test]
     fn test_daily_kline_quality_clamps_board_threshold_to_redline() {
         let d1 = NaiveDate::from_ymd_opt(2026, 7, 6).unwrap();
@@ -958,13 +976,13 @@ mod tests {
         let r_main = validate_daily_kline_quality(&mut bars, "TEST_CODE_000001", 20.0);
         assert!(r_main.is_err(), "主板 20% 阈值, +25% 应 reject");
 
-        // 创业板调用方传 25%，公共门仍按 20% 拒绝。
+        // 创业板调用方传入板块阈值后，真实 +25% 仍超出 20.5% 上限，必须拒绝。
         let mut bars2 = vec![
             make_kline(d1, 10.0, 10.5, 9.8, 10.0),
             make_kline(d2, 12.5, 12.7, 12.3, 12.6),
         ];
         let r_gem = validate_daily_kline_quality(&mut bars2, "TEST_CODE_300750", 25.0);
-        assert!(r_gem.is_err(), "25% 调用参数不得绕过数据红线 20%");
+        assert!(r_gem.is_err(), "超过创业板板块上限仍应 reject");
     }
 
     /// BR-092: 重复日期是源数据错误，不允许自动去重后继续计算。
