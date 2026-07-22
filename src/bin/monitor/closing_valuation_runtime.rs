@@ -48,7 +48,7 @@ fn run_blocking(
     let mut previous = Vec::new();
     for item in &snapshot.items {
         let bars = magic_provider.get_daily_data(&item.code, 10).ok();
-        let mut closes: Vec<(NaiveDate, f64)> = bars
+        let magic_closes: Vec<(NaiveDate, f64)> = bars
             .as_ref()
             .map(|rows| {
                 rows.iter()
@@ -62,7 +62,13 @@ fn run_blocking(
                     .collect()
             })
             .unwrap_or_default();
-        if closes.is_empty() {
+        let mut closes = magic_closes;
+        let mut price_provider = "magic_tdx";
+        // TDX can legitimately lag the requested settlement date (for
+        // example while its daily cache is still being published).  Only use
+        // the validated local daily table when it contains the exact date;
+        // never substitute the latest prior close for the requested close.
+        if !closes.iter().any(|(d, _)| *d == date) {
             #[derive(diesel::QueryableByName)]
             struct DailyCloseRow {
                 #[diesel(sql_type = diesel::sql_types::Text)]
@@ -89,10 +95,11 @@ fn run_blocking(
                     ))
                 })
                 .collect();
+            price_provider = "stock_daily_backfill";
         }
         let current = closes.iter().find(|(d, _)| *d == date).ok_or_else(|| {
             format!(
-                "BR-147 {} missing settled Magic TDX close for {date}",
+                "BR-147 {} missing validated close for {date} (magic_tdx and stock_daily)",
                 item.code
             )
         })?;
@@ -100,12 +107,7 @@ fn run_blocking(
             code: item.code.clone(),
             price_date: date,
             close: current.1,
-            provider: if bars.is_some() {
-                "magic_tdx"
-            } else {
-                "stock_daily_backfill"
-            }
-            .into(),
+            provider: price_provider.into(),
             evidence_hash: format!("{}:{}:{:.6}", item.code, date, current.1),
         });
         if let Some((_, prev)) = closes.iter().find(|(d, _)| *d < date) {

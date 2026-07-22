@@ -52,8 +52,14 @@ pub fn fetch_recent_lhb(date: NaiveDate, limit: usize) -> Result<Vec<LhbEntryInp
         .ok_or_else(|| "unavailable: LHB response missing result.data".to_string())?;
     let mut out = Vec::new();
     for row in rows.iter().take(limit) {
-        let code = row.get("SECURITY_CODE").and_then(|v| v.as_str()).unwrap_or("");
-        let name = row.get("SECURITY_NAME_ABBR").and_then(|v| v.as_str()).unwrap_or("");
+        let code = row
+            .get("SECURITY_CODE")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let name = row
+            .get("SECURITY_NAME_ABBR")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let net = row.get("BILLBOARD_NET_AMT").and_then(|v| v.as_f64());
         if code.is_empty() || name.is_empty() || net.is_none() {
             return Err("unavailable: LHB row missing required code/name/net amount".into());
@@ -62,7 +68,11 @@ pub fn fetch_recent_lhb(date: NaiveDate, limit: usize) -> Result<Vec<LhbEntryInp
             code: code.to_string(),
             name: name.to_string(),
             net_buy_yi: net.unwrap() / 100_000_000.0,
-            reason: row.get("EXPLAIN").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            reason: row
+                .get("EXPLAIN")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
             ..Default::default()
         });
     }
