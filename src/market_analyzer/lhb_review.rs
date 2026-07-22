@@ -5,6 +5,7 @@
 
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// 单条龙虎榜记录 (R-04 模板入参)
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -50,8 +51,8 @@ pub fn fetch_recent_lhb(date: NaiveDate, limit: usize) -> Result<Vec<LhbEntryInp
         .pointer("/result/data")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| "unavailable: LHB response missing result.data".to_string())?;
-    let mut out = Vec::new();
-    for row in rows.iter().take(limit) {
+    let mut by_code: HashMap<String, LhbEntryInput> = HashMap::new();
+    for row in rows {
         let code = row
             .get("SECURITY_CODE")
             .and_then(|v| v.as_str())
@@ -64,18 +65,32 @@ pub fn fetch_recent_lhb(date: NaiveDate, limit: usize) -> Result<Vec<LhbEntryInp
         if code.is_empty() || name.is_empty() || net.is_none() {
             return Err("unavailable: LHB row missing required code/name/net amount".into());
         }
-        out.push(LhbEntryInput {
-            code: code.to_string(),
-            name: name.to_string(),
-            net_buy_yi: net.unwrap() / 100_000_000.0,
-            reason: row
-                .get("EXPLAIN")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            ..Default::default()
-        });
+        let net_buy_yi = net.unwrap() / 100_000_000.0;
+        let reason = row
+            .get("EXPLAIN")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let entry = by_code
+            .entry(code.to_string())
+            .or_insert_with(|| LhbEntryInput {
+                code: code.to_string(),
+                name: name.to_string(),
+                ..Default::default()
+            });
+        entry.net_buy_yi += net_buy_yi;
+        if entry.reason.is_empty() && !reason.is_empty() {
+            entry.reason = reason;
+        }
     }
+    let mut out: Vec<_> = by_code.into_values().collect();
+    out.sort_by(|left, right| {
+        right
+            .net_buy_yi
+            .partial_cmp(&left.net_buy_yi)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out.truncate(limit);
     Ok(out)
 }
 

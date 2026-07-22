@@ -512,8 +512,6 @@ pub fn validate_daily_kline_quality(
     }
     // 调用方通常通过 max_gap_for(code) 传入板块阈值。不得再统一 clamp 到 20%，
     // 否则创业板/科创板真实 ±20% 以及北交所 ±30% 会被误判为脏数据。
-    let max_gap_pct = max_gap_pct;
-
     for b in kline.iter() {
         if !b.open.is_finite() || !b.high.is_finite() || !b.low.is_finite() || !b.close.is_finite()
         {
