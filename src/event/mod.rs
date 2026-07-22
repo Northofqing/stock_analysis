@@ -7,6 +7,7 @@
 
 pub mod bus;
 pub mod cli;
+pub mod delivery_settlement;
 pub mod dispatcher;
 pub mod envelope;
 pub mod history;
@@ -16,8 +17,10 @@ pub mod replay;
 
 pub use bus::{EventBus, EventBusMetrics, PublishOutcome, RejectReason};
 pub use cli::{CliError, EventCommand};
+pub use delivery_settlement::{settle, DeliverySettlement, IdentityAction};
 pub use dispatcher::{
-    AuditDispatcher, DispatchResult, Dispatcher, DispatcherRegistry, RegistryError,
+    AuditDispatcher, AuditHealth, AuditPreflightReceipt, DispatchResult, Dispatcher,
+    DispatcherRegistry, RegistryError,
 };
 pub use envelope::{DomainEvent, EnvelopeError, EventEnvelope, PushDeliveryEvent};
 pub use history::{

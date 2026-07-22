@@ -32,6 +32,19 @@ pub enum DispatchResult {
     Failed(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuditHealth {
+    Unverified,
+    Healthy,
+    Degraded { reason_code: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditPreflightReceipt {
+    pub year: i32,
+    pub previous_hash: Option<String>,
+}
+
 // ========================================================================
 // RegistryError
 // ========================================================================
@@ -140,9 +153,10 @@ pub struct AuditDispatcher {
     chain_state: Mutex<AuditChainState>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct AuditChainState {
     poisoned: Option<String>,
+    health: AuditHealth,
 }
 
 impl AuditDispatcher {
@@ -151,7 +165,10 @@ impl AuditDispatcher {
         Self {
             handled_count: AtomicU64::new(0),
             base_dir: base_dir.into(),
-            chain_state: Mutex::new(AuditChainState::default()),
+            chain_state: Mutex::new(AuditChainState {
+                poisoned: None,
+                health: AuditHealth::Unverified,
+            }),
         }
     }
 
@@ -183,6 +200,78 @@ impl AuditDispatcher {
     /// Returns the number of envelopes this dispatcher has handled.
     pub fn handled_count(&self) -> u64 {
         self.handled_count.load(Ordering::SeqCst)
+    }
+
+    pub fn health(&self) -> AuditHealth {
+        self.chain_state
+            .lock()
+            .map(|s| s.health.clone())
+            .unwrap_or(AuditHealth::Degraded {
+                reason_code: "state_lock_poisoned".into(),
+            })
+    }
+
+    pub fn preflight(&self) -> Result<AuditPreflightReceipt, String> {
+        self.preflight_inner(false)
+    }
+    pub fn recover_with_canary(&self) -> Result<AuditPreflightReceipt, String> {
+        self.preflight_inner(true)
+    }
+
+    fn preflight_inner(&self, recovery: bool) -> Result<AuditPreflightReceipt, String> {
+        use fs2::FileExt;
+        let year = chrono::Local::now().format("%Y").to_string();
+        let result = (|| {
+            fs::create_dir_all(&self.base_dir).map_err(|e| format!("create audit dir: {e}"))?;
+            let lock_path = self.base_dir.join(format!("{year}.lock"));
+            let lock = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .map_err(|e| format!("open audit lock: {e}"))?;
+            FileExt::lock_exclusive(&lock).map_err(|e| format!("lock audit: {e}"))?;
+            let path = self.base_dir.join(format!("{year}.jsonl"));
+            let previous_hash = validate_existing_chain(&path)?;
+            let canary = self
+                .base_dir
+                .join(format!(".{year}.preflight-{}", std::process::id()));
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&canary)
+                .map_err(|e| format!("create canary: {e}"))?;
+            file.write_all(b"audit-preflight-canary\n")
+                .map_err(|e| format!("write canary: {e}"))?;
+            file.sync_data().map_err(|e| format!("sync canary: {e}"))?;
+            fs::remove_file(canary).map_err(|e| format!("remove canary: {e}"))?;
+            let _ = FileExt::unlock(&lock);
+            Ok(AuditPreflightReceipt {
+                year: year.parse().unwrap_or_default(),
+                previous_hash,
+            })
+        })();
+        match result {
+            Ok(receipt) => {
+                let mut state = self
+                    .chain_state
+                    .lock()
+                    .map_err(|_| "audit chain state lock poisoned".to_string())?;
+                if recovery || !matches!(state.health, AuditHealth::Degraded { .. }) {
+                    state.health = AuditHealth::Healthy;
+                    state.poisoned = None;
+                }
+                Ok(receipt)
+            }
+            Err(error) => {
+                if let Ok(mut s) = self.chain_state.lock() {
+                    s.health = AuditHealth::Degraded {
+                        reason_code: error.clone(),
+                    };
+                }
+                Err(error)
+            }
+        }
     }
 
     fn persist(&self, envelope: &EventEnvelope) -> Result<(), String> {
