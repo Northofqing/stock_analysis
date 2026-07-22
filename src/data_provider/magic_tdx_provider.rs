@@ -2,6 +2,9 @@
 //!
 //! This provider is deliberately strict: transport/protocol failures are
 //! returned to the fallback manager and no synthetic quote or close is made.
+//!
+//! Business rules: BR-092 (strict K-line validation), BR-147 (settled close
+//! evidence).
 
 use super::{validate_kline_series_strict, AdjustType, DataProvider, KlineData, RealtimeQuote};
 use anyhow::{anyhow, Result};
