@@ -3,7 +3,9 @@
 //! 所有模块通过这里的 API 获取持仓/交易信息，不再各自读环境变量或 DB。
 //! API 是纯函数，不定义 trait（单用户，单实现）。
 
+pub mod closing_valuation;
 mod store;
+pub mod user_position_snapshot;
 pub use store::{live_rolling_sharpe, strategy_correlation_matrix};
 
 use chrono::{NaiveDate, NaiveDateTime};
