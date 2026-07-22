@@ -1612,9 +1612,14 @@ pub async fn refresh_banner_state() -> Result<(), String> {
 
     let am_metrics = match am_metrics_res {
         Ok(Ok(m)) => m,
-
-        Ok(Err(error)) => return Err(format!("AccountMode metrics failed: {error}")),
-        Err(error) => return Err(format!("AccountMode metrics join failed: {error}")),
+        Ok(Err(error)) => {
+            log::warn!("[AccountMode][BR-103] metrics unavailable; retaining explicit incomplete banner: {error}");
+            stock_analysis::risk::account_mode::PortfolioMetrics::incomplete()
+        }
+        Err(error) => {
+            log::warn!("[AccountMode][BR-103] metrics worker unavailable; retaining explicit incomplete banner: {error}");
+            stock_analysis::risk::account_mode::PortfolioMetrics::incomplete()
+        }
     };
 
     let prev_mode = match prev_mode_res {
