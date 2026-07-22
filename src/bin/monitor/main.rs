@@ -2934,12 +2934,14 @@ async fn main() {
             receipt.previous_hash
         ),
         Ok(Err(error)) => {
-            log::error!("[AuditDegraded][BR-144] delivery audit preflight failed: {error}");
-            return;
+            log::error!(
+                "[AuditDegraded][BR-144] event_writer initialization / delivery audit preflight failed: {error}"
+            );
+            std::process::exit(2);
         }
         Err(error) => {
             log::error!("[AuditDegraded][BR-144] delivery audit preflight worker failed: {error}");
-            return;
+            std::process::exit(2);
         }
     }
 
