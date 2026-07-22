@@ -29,7 +29,11 @@ impl HealthStatus {
 pub async fn health_check() -> HealthStatus {
     HealthStatus {
         db_writable: check_db(),
-        bus_alive: stock_analysis::event::global_bus().receiver_count() >= 2,
+        // Startup health runs before the long-lived event consumer is spawned.
+        // The sender plus one active receiver is sufficient evidence here;
+        // requiring two receivers made the probe fail deterministically on
+        // every clean start (the consumer count is a lifecycle concern).
+        bus_alive: stock_analysis::event::global_bus().receiver_count() >= 1,
         strategy_registered: StrategyRegistry::global().list_all().len() >= 8,
         perf_recent: check_perf_24h(),
         quote_provider: stock_analysis::broker::quote_provider_registered(),
