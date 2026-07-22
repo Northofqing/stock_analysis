@@ -360,6 +360,7 @@ mod tests {
     /// 4) audit_path 走 DATABASE_PATH 同目录
     #[test]
     fn audit_path_uses_database_dir() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = env::var("DATABASE_PATH").ok();
         env::set_var("DATABASE_PATH", "/tmp/foo/bar.db");
         let p = audit_path();
