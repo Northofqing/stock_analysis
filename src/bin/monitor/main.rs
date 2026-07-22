@@ -8950,12 +8950,12 @@ async fn post_close_fund_inflow_scheduler() {
         {
             continue;
         }
-        attempted_date = Some(now.date_naive());
         let Some(banner) = current_banner_for("BR-073 post-close fund inflow") else {
             log::error!("[盘后资金调度][BR-073] banner unavailable; keep explicit no-data audit");
             continue;
         };
         let date = now.date_naive().to_string();
+        attempted_date = Some(now.date_naive());
         if push_templates::dispatch_post_close_fund_inflow_buy(&date, &banner).await {
             log::info!("[盘后资金调度][BR-073] 15:35 virtual buy dispatched date={date}");
         } else {
