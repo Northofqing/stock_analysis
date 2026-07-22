@@ -6629,13 +6629,16 @@ pub async fn dispatch_r03_industry_chain_outcome(
         Ok(Err(error)) => {
             log::error!("[R-03][BR-106][BR-110] {error}");
             log_dispatcher_attempt("R-03", false, 0, &error);
-            return ReviewTaskOutcome::failed(true, error);
+            // An unavailable source is not a delivery failure.  Preserve the
+            // audit reason, but let the batch scheduler classify this task as
+            // no-data so other confirmed review tasks can proceed.
+            return ReviewTaskOutcome::no_data(format!("R-03 source unavailable: {error}"));
         }
         Err(error) => {
             let reason = format!("R-03 数据准备任务失败: {error}");
             log::error!("[R-03][BR-110] {reason}");
             log_dispatcher_attempt("R-03", false, 0, &reason);
-            return ReviewTaskOutcome::failed(true, reason);
+            return ReviewTaskOutcome::no_data(reason);
         }
     };
     let push_result =
@@ -6889,7 +6892,12 @@ async fn dispatch_catalyst_review_daily_outcome(
         Err(error) => {
             log::error!("[A-10] 催化复盘批次拒绝: {error}");
             log_dispatcher_attempt("A-10", false, 0, &error);
-            return crate::review_batch::ReviewTaskOutcome::failed(true, error);
+            // A stale/missing chain_daily snapshot is an unavailable input,
+            // not a sink failure.  Keep it auditable without blocking the
+            // independent R-series deliveries.
+            return crate::review_batch::ReviewTaskOutcome::no_data(format!(
+                "A-10 source unavailable: {error}"
+            ));
         }
     };
     if snapshot.started.is_empty() {
