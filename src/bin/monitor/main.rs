@@ -6935,16 +6935,22 @@ async fn monitor_loop() {
 
                                 let ts = chrono::Local::now().format("%H:%M:%S").to_string();
 
-                                // 标记已通知 (避免同票重复推)
-
-                                for s in &new_items {
-                                    auction_vol_notified.insert(s.code.clone());
-                                }
-
                                 if let Some(banner) = current_banner_for("P-02 auction volume") {
-                                    let _ =
+                                    let delivered =
                                         push_templates::dispatch_auction_volume_daily(&ts, &banner)
                                             .await;
+                                    // Only seal identities after a confirmed
+                                    // sink outcome; failed banner/sink attempts
+                                    // remain eligible during the auction window.
+                                    if delivered {
+                                        for s in &new_items {
+                                            auction_vol_notified.insert(s.code.clone());
+                                        }
+                                    }
+                                } else {
+                                    log::warn!(
+                                        "[竞价][P-02] banner unavailable; retain retry eligibility"
+                                    );
                                 }
                             }
                         }
