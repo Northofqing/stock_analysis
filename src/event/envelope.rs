@@ -327,6 +327,7 @@ mod tests {
         assert_eq!(env.payload["audit_schema_version"], 2);
         assert!(env.payload.get("code").is_none());
         assert_eq!(env.payload["identity_hash"].as_str().unwrap().len(), 64);
+        assert_eq!(env.payload["subject_hash"].as_str().unwrap().len(), 64);
         assert!(env.payload["rule_ids"]
             .as_array()
             .unwrap()

@@ -791,6 +791,123 @@ mod tests {
     }
 
     #[test]
+    fn br142_v2_chain_rejects_a_later_legacy_row() {
+        use sha2::{Digest, Sha256};
+
+        let dir = std::env::temp_dir().join(format!(
+            "audit-dispatcher-downgrade-{}-{}",
+            std::process::id(),
+            chrono::Local::now().timestamp_nanos_opt().unwrap()
+        ));
+        let dispatcher = AuditDispatcher::new(&dir);
+        assert_eq!(
+            dispatcher.dispatch(test_envelope_type("push.delivery.audit")),
+            DispatchResult::Handled
+        );
+        let path = dir.join(format!("{}.jsonl", chrono::Local::now().format("%Y")));
+        let v2: serde_json::Value =
+            serde_json::from_str(fs::read_to_string(&path).unwrap().lines().next().unwrap())
+                .unwrap();
+        let mut legacy = serde_json::json!({
+            "envelope": EventEnvelope {
+                id: "legacy-after-v2".into(),
+                ts: chrono::Local::now(),
+                trace_id: "legacy-after-v2-trace".into(),
+                source: "push_l4".into(),
+                event_type: "push.delivery.audit".into(),
+                entity_key: Some("TEST_CODE_LEGACY".into()),
+                payload: serde_json::json!({
+                    "kind": "legacy_kind",
+                    "code": "TEST_CODE_LEGACY",
+                    "outcome": "Pushed",
+                    "channel": "dry_run",
+                    "rendered_len": 1,
+                    "latency_ms": 1,
+                }),
+                version: 1,
+                replay_of: None,
+            },
+            "previous_hash": v2["record_hash"].as_str().unwrap(),
+        });
+        let hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&legacy).unwrap()));
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .insert("record_hash".into(), serde_json::Value::String(hash));
+        writeln!(
+            OpenOptions::new().append(true).open(&path).unwrap(),
+            "{}",
+            serde_json::to_string(&legacy).unwrap()
+        )
+        .unwrap();
+
+        let error = validate_existing_chain(&path).unwrap_err();
+        assert!(error.contains("legacy audit after v2"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn br142_legacy_row_still_requires_a_complete_delivery_envelope() {
+        use sha2::{Digest, Sha256};
+
+        let dir = std::env::temp_dir().join(format!(
+            "audit-dispatcher-invalid-legacy-{}-{}",
+            std::process::id(),
+            chrono::Local::now().timestamp_nanos_opt().unwrap()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{}.jsonl", chrono::Local::now().format("%Y")));
+        let mut record = serde_json::json!({
+            "envelope": {},
+            "previous_hash": "GENESIS",
+        });
+        let hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&record).unwrap()));
+        record
+            .as_object_mut()
+            .unwrap()
+            .insert("record_hash".into(), serde_json::Value::String(hash));
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&record).unwrap()),
+        )
+        .unwrap();
+
+        let error = validate_existing_chain(&path).unwrap_err();
+        assert!(error.contains("legacy delivery audit"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn br142_authoritative_dispatch_rejects_unknown_or_unbound_identity_fields() {
+        let dir = std::env::temp_dir().join(format!(
+            "audit-dispatcher-injection-{}-{}",
+            std::process::id(),
+            chrono::Local::now().timestamp_nanos_opt().unwrap()
+        ));
+        let dispatcher = AuditDispatcher::new(&dir);
+        let mut injected = test_envelope_type("push.delivery.audit");
+        injected.payload["announcement_id"] = serde_json::json!("TEST_CODE_SECRET");
+        assert!(matches!(
+            dispatcher.dispatch(injected),
+            DispatchResult::Failed(error) if error.contains("unknown")
+        ));
+
+        let second_dir = dir.join("identity");
+        let second = AuditDispatcher::new(&second_dir);
+        let mut unbound = test_envelope_type("push.delivery.audit");
+        unbound.payload["identity_hash"] = serde_json::json!("a".repeat(64));
+        assert!(matches!(
+            second.dispatch(unbound),
+            DispatchResult::Failed(error) if error.contains("identity_hash")
+        ));
+        assert!(!dir
+            .join(format!("{}.jsonl", chrono::Local::now().format("%Y")))
+            .exists());
+        assert!(!second_dir.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn br141_event_audit_override_has_physical_test_prod_namespaces() {
         let base = PathBuf::from("audit-override");
         assert_eq!(
