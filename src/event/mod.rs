@@ -1,4 +1,4 @@
-//! Registered business rules: BR-043, BR-091, BR-111, BR-130, BR-141.
+//! Registered business rules: BR-043, BR-091, BR-111, BR-130, BR-141, BR-142.
 //! Event infrastructure — v17.1-r2 Task 1+2
 //!
 //! Provides the `DomainEvent` trait, `EventEnvelope` wrapper, and
