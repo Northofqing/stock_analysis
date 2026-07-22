@@ -237,11 +237,21 @@ pub(crate) fn paper_risk_context_from_banner(
 pub(crate) fn snapshot_paper_risk_context_from_banner(
     banner: &BannerCtx,
 ) -> Result<stock_analysis::trading::paper_trade::PaperRiskContext, String> {
+    use chrono::Timelike;
     if banner.data_mode != DataMode::Full {
-        return Err(format!(
-            "SnapshotPaper requires DataMode Full, current={}",
-            banner.data_mode.label()
-        ));
+        let now = chrono::Local::now().time();
+        let after_close = now.hour() >= 15;
+        let valuation_complete =
+            stock_analysis::database::closing_valuation::latest_persisted_valuation_view()?
+                .is_some_and(|view| {
+                    view.valuation.covered == view.valuation.total && view.valuation.total > 0
+                });
+        if !after_close || !valuation_complete {
+            return Err(format!(
+                "SnapshotPaper requires Full intraday data or complete post-close valuation, current={} valuation_complete={valuation_complete}",
+                banner.data_mode.label()
+            ));
+        }
     }
     stock_analysis::database::DatabaseManager::try_get()
         .ok_or_else(|| "数据库未初始化，无法读取用户快照".to_string())?;
