@@ -74,9 +74,15 @@ rg -n "prediction_tracker|news_outcome|winrate_simulator" src
 
 ```rust
 pub async fn evaluate_market_events(
-    events: Vec<MarketEvent>,
+    batch: SelectionEventBatch,
     context: SelectionContext,
 ) -> SelectionRunOutcome;
+
+pub struct SelectionEventBatch {
+    pub events: Vec<MarketEvent>,
+    pub source_attempts: Vec<SourceAttempt>,
+    pub observed_at: DateTime<Local>,
+}
 
 pub enum SelectionRunOutcome {
     Completed(SelectionBatch),
@@ -85,7 +91,7 @@ pub enum SelectionRunOutcome {
 }
 ```
 
-所有已知来源、质量、持久化和审计错误都必须收敛成带原因的 `Unavailable`，不能从公共入口泄漏成未归类错误或被调用方当作空结果。
+`SourceAttempt` 必须逐 feed 记录成功、验证为空或结构化失败，不能只保留聚合后的事件列表。所有已知来源、质量、持久化和审计错误都必须收敛成带原因的 `Unavailable`，不能从公共入口泄漏成未归类错误或被调用方当作空结果。
 
 内部模块：
 
@@ -114,6 +120,8 @@ pub enum SelectionRunOutcome {
 - provider 发布时间存在、完整可解析、不在未来。
 - 事件未被 upstream 标记 stale，且满足 BR-137 的来源日期规则。
 - 本地观察时间只表示获取时间，不得替代 provider 发布时间。
+
+当前 `MarketEvent.occurred_at` 同时承载完整 provider 时间和仅日期来源的本地观察时间，无法证明最后一条门禁。实现必须新增显式 `ProviderPublication`：保留 provider 原始发布日期，并在来源提供完整时间时额外保留时间戳；缺失或非法值保持 `None`。旧构造器和反序列化记录不得从 `occurred_at` 反推该证据。
 
 陈旧、缺时间或非法事件在产业链映射前拒绝。`VerifiedEmpty` 只能表示完整来源确实没有命中，不能表示输入来源失败。
 
@@ -195,7 +203,7 @@ pub enum RelationEvidence {
 ### 7.1 批次状态
 
 - `Completed`：至少一个输入事件完成全链评估，结果包含正式候选、研究候选和逐项拒绝。
-- `VerifiedEmpty`：事件来源、配置、证券主数据和所需 Magic TDX 批次完整，但没有任何产业链或精确证券关系命中。
+- `VerifiedEmpty`：所有本轮相关 feed 都有结构化成功/验证为空证据，且配置、证券主数据和所需 Magic TDX 批次完整，但没有任何产业链或精确证券关系命中。
 - `Unavailable`：事件批次身份、配置、Magic TDX 核心批次、持久化或审计不可用。
 
 单票行情/K线失败可以隔离，其他完整候选继续；但批次必须声明排除数和原因。若所有潜在正式候选都因来源错误被隔离，结果是 `Unavailable` 或 `Completed` 加来源拒绝，不能写成 `VerifiedEmpty`。
@@ -264,11 +272,17 @@ SHA256(
 
 `database::selection` 使用参数绑定和单事务追加：
 
+- `selection_event_inbox`
+- `selection_event_completions`
 - `selection_runs`
 - `selection_candidates`
 - `selection_feature_snapshots`
 - `selection_outcomes`
 - `selection_visibility_receipts`
+
+`selection_event_inbox` 保存通过基础 provider 门禁的规范化不可变事件和来源批次证据。聚合器已将事件标记 seen 后，选股链路必须先把事件写入 inbox，再做产业链和 Magic TDX 评估；临时来源失败不得使事件从待处理集合消失。进程若在聚合返回与 inbox 写入之间退出，聚合器的内存 seen 状态也随进程退出，来源可重新拉取；若写入失败但进程仍运行，调用方必须保留同一不可变批次并重试，不能把它计为已完成。
+
+`selection_event_completions` 只追加终态：正式完成、经完整证据验证为空或永久拒绝。可重试的 `Unavailable` 不写 completion，后续轮次从 inbox 继续处理。每次评估尝试由 `selection_runs` 留痕；相同事件内容幂等，相同身份但内容哈希不同必须失败。
 
 可空来源字段写 SQL `NULL`。所有价格、比例和收益在写入前验证有限性及业务范围。生产与测试数据库物理隔离；测试证券必须使用 `TEST_CODE_`。
 
@@ -286,23 +300,24 @@ SHA256(
 
 执行顺序为：
 
-1. 在内存完成纯评估。
-2. 追加并同步 `Prepared` 审计。
-3. 以单个 SQLite 事务暂存不可变批次、候选和特征；这些行尚不可被生产查询消费。
-4. 追加并同步带暂存内容哈希的 `Committed` 审计。
-5. 以独立事务追加绑定 committed audit hash 的 `selection_visibility_receipts`。
-6. 只有凭证写入成功才向调用方返回可消费的 `Completed/VerifiedEmpty`。
+1. 对通过基础 provider 门禁的规范化事件追加并同步 `Ingested` 审计，再幂等写入 inbox。
+2. 在内存完成纯评估。
+3. 追加并同步 `Prepared` 审计。
+4. 以单个 SQLite 事务暂存不可变批次、候选和特征；这些行尚不可被生产查询消费。
+5. 追加并同步带暂存内容哈希的 `Committed` 审计。
+6. 以独立事务追加绑定 committed audit hash 的 `selection_visibility_receipts`。
+7. 只有凭证写入成功才写终态 completion，并向调用方返回可消费的 `Completed/VerifiedEmpty`。
 
-任一审计失败都返回 `Unavailable`。步骤 3 之后失败可以留下不可见的暂存行，但不得形成可消费候选；步骤 5 失败可以留下 committed audit，但生产查询仍不可见。重试必须按相同内容哈希幂等完成剩余步骤，不重复调用正式 sink，也不修改历史行。
+任一审计失败都返回 `Unavailable`。步骤 4 之后失败可以留下不可见的暂存行，但不得形成可消费候选；步骤 6 失败可以留下 committed audit，但生产查询仍不可见。重试必须按相同内容哈希幂等完成剩余步骤，不重复调用正式 sink，也不修改历史行。
 
 ## 10. 生产集成与旧模块关系
 
-生产接线位于 NewsAggregator 每轮取得 `Vec<MarketEvent>` 后。来源事实推送继续走 BR-137；选股影子链路独立消费同一不可变事件批次，不影响 critical/aggregate 推送和 seen 状态。
+生产接线位于 NewsAggregator 每轮取得带逐 feed 状态的 `SelectionEventBatch` 后。NewsAggregator 新增强类型 batch API，旧 `Vec<MarketEvent>` API 只作为兼容包装，不能供选股链路判断 `VerifiedEmpty`。来源事实推送继续走 BR-137；选股影子链路独立消费同一不可变事件批次，不改变 critical/aggregate 推送和 seen 语义。
 
 ```text
 NewsAggregator tick
   ├─ existing BR-137 / NewsFlashGate governance
-  └─ selection shadow evaluate_market_events
+  └─ selection shadow durable inbox + evaluate_market_events
        ├─ no sink
        ├─ no TradingBus
        ├─ no paper_trades
@@ -311,7 +326,8 @@ NewsAggregator tick
 
 | 旧模块 | 处置 | 原因 |
 | --- | --- | --- |
-| `news::aggregator::MarketEvent` | adopt | 保留真实事件身份、provider 和时间 |
+| `news::aggregator::MarketEvent` | adopt and harden | 保留真实事件身份；新增显式 provider publication 证据，禁止从 observed time 反推 |
+| `news::aggregator::NewsAggregator` | adopt and harden | 新增逐 feed 状态 batch，选股链路据此判断完整性并持久化待处理事件 |
 | `opportunity::run_opportunity_scan` | remove production caller, retain temporarily | 阻断双轨；保留代码以便小提交迁移和历史工具兼容 |
 | `search_service::fetch_flash_titles` | reject for selection | 标题重抓丢失标准事件身份 |
 | `chain_mapper::map_news_to_chains_ai` | reject for production slice | 跨事件拼接且 AI 结果不是公司事实 |
