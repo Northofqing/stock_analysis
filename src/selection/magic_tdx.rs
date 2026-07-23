@@ -672,7 +672,7 @@ fn valid_five_minute_slot(time: NaiveTime) -> bool {
     let afternoon_start = NaiveTime::from_hms_opt(13, 5, 0).expect("static valid time");
     let afternoon_end = NaiveTime::from_hms_opt(15, 0, 0).expect("static valid time");
     time.second() == 0
-        && time.minute() % 5 == 0
+        && time.minute().is_multiple_of(5)
         && ((morning_start..=morning_end).contains(&time)
             || (afternoon_start..=afternoon_end).contains(&time))
 }

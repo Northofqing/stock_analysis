@@ -224,6 +224,7 @@ impl SelectionAuditWriter {
         })?;
         let lock_file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&self.lock_path)
@@ -368,17 +369,15 @@ fn validate_record_fields(
     {
         return Err(invalid("rule_ids contain a blank rule".to_owned()));
     }
-    if record.phase == SelectionAuditPhase::Rejected {
-        if record.context.event_identity_hash.is_none()
+    if record.phase == SelectionAuditPhase::Rejected
+        && (record.context.event_identity_hash.is_none()
             || record.context.reason_codes.is_empty()
             || record.context.rule_ids.is_empty()
-            || record.context.retryable.is_none()
-        {
-            return Err(invalid(
-                "rejected audit requires event identity, reasons, rule IDs, and retryable"
-                    .to_owned(),
-            ));
-        }
+            || record.context.retryable.is_none())
+    {
+        return Err(invalid(
+            "rejected audit requires event identity, reasons, rule IDs, and retryable".to_owned(),
+        ));
     }
     if persisted && record.record_hash.trim().is_empty() {
         return Err(SelectionAuditError::ChainInvalid(

@@ -5,5 +5,6 @@ pub mod audit;
 pub mod features;
 pub mod magic_tdx;
 pub mod model;
+pub mod pipeline;
 pub mod quality;
 pub mod relation;

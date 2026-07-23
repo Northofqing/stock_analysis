@@ -142,7 +142,7 @@ impl ChainConfigSnapshot {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ChainMatch {
     pub chain_id: String,
     pub priority: u32,

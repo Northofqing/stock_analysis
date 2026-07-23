@@ -1075,6 +1075,12 @@ impl<'a> SelectionRepository<'a> {
         Ok(InsertReceipt { inserted: true })
     }
 
+    pub fn run_is_visible(&mut self, run_id: &str) -> SelectionStoreResult<bool> {
+        require_non_empty("visibility run_id", run_id)?;
+        existing_hash(self.conn, "selection_visibility_receipts", "run_id", run_id)
+            .map(|content_hash| content_hash.is_some())
+    }
+
     pub fn append_completion(
         &mut self,
         completion: &EventCompletion,
@@ -1506,6 +1512,9 @@ mod tests {
         seed_staged(&mut conn);
 
         let mut repo = SelectionRepository::new(&mut conn);
+        assert!(!repo
+            .run_is_visible("run-1")
+            .expect("staged run must remain hidden"));
         assert!(repo
             .visible_samples(&ReportFilter::default())
             .expect("hidden samples")
@@ -1518,6 +1527,9 @@ mod tests {
             published_at: ts(11),
         })
         .expect("visibility");
+        assert!(repo
+            .run_is_visible("run-1")
+            .expect("visibility receipt must expose run"));
         let duplicate_visibility = repo
             .publish_visibility(&VisibilityReceiptInput {
                 receipt_id: "visibility-1".to_owned(),

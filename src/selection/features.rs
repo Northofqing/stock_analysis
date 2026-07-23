@@ -35,6 +35,13 @@ impl FeatureError {
     pub fn code(&self) -> &'static str {
         self.code
     }
+
+    pub(crate) fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
 }
 
 impl std::fmt::Display for FeatureError {
@@ -155,10 +162,7 @@ fn positive_mean(
 }
 
 fn feature_error(code: &'static str, message: impl Into<String>) -> FeatureError {
-    FeatureError {
-        code,
-        message: message.into(),
-    }
+    FeatureError::new(code, message)
 }
 
 #[cfg(test)]
