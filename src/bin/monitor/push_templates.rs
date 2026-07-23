@@ -244,16 +244,17 @@ pub(crate) fn paper_risk_context_from_banner(
 pub(crate) fn snapshot_paper_risk_context_from_banner(
     banner: &BannerCtx,
 ) -> Result<stock_analysis::trading::paper_trade::PaperRiskContext, String> {
-    use chrono::Timelike;
     if banner.data_mode != DataMode::Full {
-        let now = chrono::Local::now().time();
-        let after_close = now.hour() >= 15;
-        let valuation_complete =
-            stock_analysis::database::closing_valuation::latest_persisted_valuation_view()?
-                .is_some_and(|view| {
-                    view.valuation.covered == view.valuation.total && view.valuation.total > 0
-                });
-        if !after_close || !valuation_complete {
+        let now = chrono::Local::now();
+        let latest_valuation =
+            stock_analysis::database::closing_valuation::latest_persisted_valuation_view()?;
+        let valuation_complete = latest_valuation.as_ref().is_some_and(|view| {
+            view.valuation.covered == view.valuation.total && view.valuation.total > 0
+        });
+        let valuation_date_eligible = latest_valuation.as_ref().is_some_and(|view| {
+            post_close_valuation_eligible(now, view.valuation.price_date, valuation_complete)
+        });
+        if !valuation_date_eligible {
             return Err(format!(
                 "SnapshotPaper requires Full intraday data or complete post-close valuation, current={} valuation_complete={valuation_complete}",
                 banner.data_mode.label()
@@ -270,6 +271,20 @@ pub(crate) fn snapshot_paper_risk_context_from_banner(
         stock_analysis::risk::action_gate::AccountMode::Normal,
         stock_analysis::monitor::data_mode::DataMode::Full,
     ))
+}
+
+fn post_close_valuation_eligible(
+    now: chrono::DateTime<chrono::Local>,
+    valuation_date: chrono::NaiveDate,
+    complete: bool,
+) -> bool {
+    if !complete {
+        return false;
+    }
+    let today = now.date_naive();
+    valuation_date < today
+        || (valuation_date == today
+            && now.time() >= chrono::NaiveTime::from_hms_opt(15, 0, 0).expect("valid time"))
 }
 
 // ============================================================================
@@ -8832,6 +8847,27 @@ pub async fn dispatch_post_close_fund_inflow_buy(date: &str, banner: &BannerCtx)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_paper_accepts_complete_previous_day_valuation_before_close() {
+        let now = chrono::Local::now();
+        assert!(post_close_valuation_eligible(
+            now,
+            now.date_naive() - chrono::Days::new(1),
+            true
+        ));
+    }
+
+    #[test]
+    fn snapshot_paper_rejects_incomplete_or_future_valuation() {
+        let now = chrono::Local::now();
+        assert!(!post_close_valuation_eligible(now, now.date_naive(), false));
+        assert!(!post_close_valuation_eligible(
+            now,
+            now.date_naive() + chrono::Days::new(1),
+            true
+        ));
+    }
 
     #[test]
     fn br116_periodic_batch_requires_every_delivery_to_be_confirmed() {
