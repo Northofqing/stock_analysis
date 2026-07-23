@@ -3049,7 +3049,13 @@ pub fn load_news_catalyst_snapshot(_hhmm: &str) -> NewsCatalystSnapshot {
 
 /// v15.3 业务层入口 (v16.2 改用真实 chain_daily 数据)
 pub async fn dispatch_news_catalyst_daily(hhmm: &str, banner: &BannerCtx) -> bool {
-    let mut snapshot = match load_news_catalyst_snapshot_real(hhmm) {
+    let hhmm_owned = hhmm.to_string();
+    let mut snapshot = match crate::blocking_market_data::run_blocking_market_data(
+        "I-02 news catalyst snapshot",
+        move || load_news_catalyst_snapshot_real(&hhmm_owned),
+    )
+    .await
+    {
         Ok(snapshot) => snapshot,
         Err(error) => {
             log::error!("[I-02] 快照批次拒绝: {}", error);
@@ -3402,7 +3408,13 @@ async fn dispatch_industry_chain_intraday_daily_result(
     hhmm: &str,
     banner: &BannerCtx,
 ) -> PeriodicDispatchResult {
-    let mut snapshot = match load_industry_chain_snapshot_real(hhmm) {
+    let hhmm_owned = hhmm.to_string();
+    let mut snapshot = match crate::blocking_market_data::run_blocking_market_data(
+        "I-03 industry chain snapshot",
+        move || load_industry_chain_snapshot_real(&hhmm_owned),
+    )
+    .await
+    {
         Ok(snapshot) => snapshot,
         Err(error) => {
             log::error!("[I-03][BR-098] 快照批次拒绝: {}", error);
@@ -3962,7 +3974,13 @@ pub fn _reset_d01_memo_for_test() {
 /// v15.5 业务层入口 (v16.4 改用真实候选台数据)
 /// v29: 加 dispatcher 内部 memo (1h/票) — 防止公告密集时同票刷屏
 pub async fn dispatch_news_to_idea_daily(hhmm: &str, banner: &BannerCtx) -> bool {
-    let mut snapshot = match load_news_to_idea_snapshot_real(hhmm) {
+    let hhmm_owned = hhmm.to_string();
+    let mut snapshot = match crate::blocking_market_data::run_blocking_market_data(
+        "D-01 news-to-idea snapshot",
+        move || load_news_to_idea_snapshot_real(&hhmm_owned),
+    )
+    .await
+    {
         Ok(snapshot) => snapshot,
         Err(error) => {
             log::error!("[D-01] 真实候选批次拒绝: {error}");
@@ -5205,7 +5223,12 @@ pub async fn dispatch_candidate_triggered_daily(hhmm: &str, banner: &BannerCtx) 
         return false;
     }
 
-    let batch = match load_real_candidate_batch() {
+    let batch = match crate::blocking_market_data::run_blocking_market_data(
+        "P-03 real candidate batch",
+        load_real_candidate_batch,
+    )
+    .await
+    {
         Ok(batch) => batch,
         Err(error) => {
             log::error!("[P-03] 真实候选批次拒绝: {error}");
@@ -5558,7 +5581,13 @@ pub fn load_auction_volume_snapshot_real(hhmm: &str) -> Result<AuctionVolumeSnap
 
 /// v37: P-02 dispatcher
 pub async fn dispatch_auction_volume_daily(hhmm: &str, banner: &BannerCtx) -> bool {
-    let snapshot = match load_auction_volume_snapshot_real(hhmm) {
+    let hhmm_owned = hhmm.to_string();
+    let snapshot = match crate::blocking_market_data::run_blocking_market_data(
+        "P-02 auction volume snapshot",
+        move || load_auction_volume_snapshot_real(&hhmm_owned),
+    )
+    .await
+    {
         Ok(snapshot) => snapshot,
         Err(error) => {
             log_dispatcher_attempt("P-02", false, 0, &error);
