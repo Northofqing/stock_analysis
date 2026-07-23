@@ -90,6 +90,13 @@ fn primary_map() -> &'static [(&'static str, &'static str)] {
         ("600007", "地产-开发"), // 中国国贸
         ("601666", "煤炭-开采"), // 平煤股份
         ("600188", "煤炭-开采"), // 兖矿能源
+        // 持仓补全：主营行业标签（作为 TDX 行业板块接入前的可审计静态映射）
+        ("600703", "半导体-LED"),    // 三安光电
+        ("603948", "化工-精细化工"), // 建业股份
+        ("600396", "电力-火电"),     // 华电辽能
+        ("000813", "医药-化学制药"), // 德展健康
+        ("002421", "智能建筑"),      // 达实智能
+        ("002131", "传媒-营销服务"), // 利欧股份
     ]
 }
 
@@ -120,6 +127,13 @@ mod tests {
     fn test_lookup_unknown() {
         assert_eq!(lookup("999999"), None);
         assert_eq!(lookup(""), None);
+    }
+
+    #[test]
+    fn test_holding_codes_have_chain_labels() {
+        for code in ["600703", "603948", "600396", "000813", "002421", "002131"] {
+            assert!(lookup(code).is_some(), "missing chain mapping for {code}");
+        }
     }
 
     #[test]
