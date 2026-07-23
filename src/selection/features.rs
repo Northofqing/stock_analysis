@@ -165,14 +165,7 @@ fn feature_error(code: &'static str, message: impl Into<String>) -> FeatureError
 mod tests {
     use super::*;
     use crate::selection::quality::{PriceAdjustment, SelectionBar};
-    use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone};
-
-    fn at(date: NaiveDate) -> DateTime<Local> {
-        Local
-            .with_ymd_and_hms(date.year(), date.month(), date.day(), 15, 0, 0)
-            .single()
-            .expect("unambiguous local test time")
-    }
+    use chrono::NaiveDate;
 
     fn linear_bars(count: usize) -> Vec<SelectionBar> {
         let mut date = NaiveDate::from_ymd_opt(2026, 6, 22).expect("valid test date");
@@ -181,7 +174,7 @@ mod tests {
             let close = index as f64 + 10.0;
             bars.push(SelectionBar {
                 code: "TEST_CODE_000001".to_string(),
-                started_at: at(date),
+                market_date: date,
                 open: close,
                 high: close,
                 low: close,

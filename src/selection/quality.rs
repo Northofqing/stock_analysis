@@ -18,6 +18,9 @@ pub struct SelectionQuote {
     pub code: String,
     pub price: f64,
     pub previous_close: f64,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
     pub observed_at: DateTime<Local>,
     pub source_at: DateTime<Local>,
     pub volume: f64,
@@ -27,7 +30,8 @@ pub struct SelectionQuote {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SelectionBar {
     pub code: String,
-    pub started_at: DateTime<Local>,
+    /// Provider market date. No time-of-day is invented for a daily record.
+    pub market_date: NaiveDate,
     pub open: f64,
     pub high: f64,
     pub low: f64,
@@ -96,8 +100,23 @@ pub fn validate_quote(
     }
     validate_positive_price(quote.price, "quote price")?;
     validate_positive_price(quote.previous_close, "quote previous close")?;
+    validate_positive_price(quote.open, "quote open")?;
+    validate_positive_price(quote.high, "quote high")?;
+    validate_positive_price(quote.low, "quote low")?;
     validate_flow_value(quote.volume, "volume")?;
     validate_flow_value(quote.amount, "amount")?;
+    if quote.low > quote.open.min(quote.price)
+        || quote.open.max(quote.price) > quote.high
+        || quote.low > quote.high
+    {
+        return Err(error(
+            "quote_ohlc_inconsistent",
+            format!(
+                "invalid quote OHLC: o={} h={} l={} price={}",
+                quote.open, quote.high, quote.low, quote.price
+            ),
+        ));
+    }
 
     if quote.source_at > quote.observed_at {
         return Err(error(
@@ -149,8 +168,8 @@ pub fn validate_daily(bars: &[SelectionBar]) -> Result<ValidatedDailyBars<'_>, Q
     }
 
     for pair in bars.windows(2) {
-        let previous_date = pair[0].started_at.date_naive();
-        let current_date = pair[1].started_at.date_naive();
+        let previous_date = pair[0].market_date;
+        let current_date = pair[1].market_date;
         if current_date == previous_date {
             return Err(error(
                 "duplicate_bar",
@@ -211,8 +230,7 @@ pub fn validate_daily_freshness(
         .bars()
         .last()
         .expect("validated daily batch is nonempty")
-        .started_at
-        .date_naive();
+        .market_date;
     if latest > expected_latest_settled_date {
         return Err(error(
             "daily_future",
@@ -232,28 +250,22 @@ pub fn validate_daily_freshness(
 }
 
 fn validate_bar(bar: &SelectionBar) -> Result<(), QualityError> {
-    if !crate::calendar::is_trading_day(bar.started_at.date_naive()) {
+    if !crate::calendar::is_trading_day(bar.market_date) {
         return Err(error(
             "bar_non_trading_day",
-            format!(
-                "daily bar date {} is not a trading day",
-                bar.started_at.date_naive()
-            ),
+            format!("daily bar date {} is not a trading day", bar.market_date),
         ));
     }
     if !bar.settled {
         return Err(error(
             "bar_not_settled",
-            format!("daily bar {} is not settled", bar.started_at.date_naive()),
+            format!("daily bar {} is not settled", bar.market_date),
         ));
     }
     if bar.adjustment != PriceAdjustment::Unadjusted {
         return Err(error(
             "adjustment_not_unadjusted",
-            format!(
-                "daily bar {} is not explicitly unadjusted",
-                bar.started_at.date_naive()
-            ),
+            format!("daily bar {} is not explicitly unadjusted", bar.market_date),
         ));
     }
 
@@ -274,7 +286,7 @@ fn validate_bar(bar: &SelectionBar) -> Result<(), QualityError> {
             "ohlc_inconsistent",
             format!(
                 "invalid OHLC at {}: o={} h={} l={} c={}",
-                bar.started_at, bar.open, bar.high, bar.low, bar.close
+                bar.market_date, bar.open, bar.high, bar.low, bar.close
             ),
         ));
     }
@@ -334,7 +346,7 @@ fn manual_error(code: &'static str, message: impl Into<String>) -> QualityError 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{Datelike, Local, NaiveDate, TimeZone};
+    use chrono::{Local, NaiveDate, TimeZone};
 
     fn at(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> DateTime<Local> {
         Local
@@ -346,7 +358,7 @@ mod tests {
     fn bar(date: NaiveDate, close: f64) -> SelectionBar {
         SelectionBar {
             code: "TEST_CODE_000001".to_string(),
-            started_at: at(date.year(), date.month(), date.day(), 15, 0),
+            market_date: date,
             open: close,
             high: close,
             low: close,
@@ -379,7 +391,7 @@ mod tests {
         );
 
         let mut duplicate = consecutive_bars(2);
-        duplicate[1].started_at = duplicate[0].started_at;
+        duplicate[1].market_date = duplicate[0].market_date;
         assert_eq!(
             validate_daily(&duplicate).unwrap_err().code(),
             "duplicate_bar"
@@ -403,6 +415,9 @@ mod tests {
             code: "TEST_CODE_000001".to_string(),
             price: 10.0,
             previous_close: 9.8,
+            open: 9.9,
+            high: 10.1,
+            low: 9.8,
             observed_at: now - chrono::Duration::seconds(1),
             source_at: now - chrono::Duration::seconds(6),
             volume: 1_000.0,
@@ -453,15 +468,9 @@ mod tests {
         );
 
         let mut gap = consecutive_bars(2);
-        let skipped = crate::calendar::next_trading_day(gap[0].started_at.date_naive());
+        let skipped = crate::calendar::next_trading_day(gap[0].market_date);
         let after_skipped = crate::calendar::next_trading_day(skipped);
-        gap[1].started_at = at(
-            after_skipped.year(),
-            after_skipped.month(),
-            after_skipped.day(),
-            15,
-            0,
-        );
+        gap[1].market_date = after_skipped;
         assert_eq!(validate_daily(&gap).unwrap_err().code(), "bar_gap");
     }
 
@@ -485,7 +494,7 @@ mod tests {
     #[test]
     fn rejects_daily_batch_older_than_one_trading_day() {
         let bars = consecutive_bars(2);
-        let latest = bars.last().expect("latest bar").started_at.date_naive();
+        let latest = bars.last().expect("latest bar").market_date;
         let one_day_later = crate::calendar::next_trading_day(latest);
         let two_days_later = crate::calendar::next_trading_day(one_day_later);
 
