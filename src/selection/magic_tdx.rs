@@ -141,6 +141,19 @@ pub async fn fetch_settled_daily_bar(
     run_magic_tdx_blocking(move || fetch_settled_daily_bar_blocking(&stock_code, market_date)).await
 }
 
+pub fn validate_production_stock_code(
+    stock_code: &str,
+) -> Result<SecurityMarket, SelectionSourceError> {
+    if stock_code.starts_with("TEST_CODE") {
+        return Err(source_error(
+            "test_identity_rejected",
+            "read-only production Magic TDX probe rejects TEST_CODE identities",
+            false,
+        ));
+    }
+    security_market(market_for_stock_code(stock_code)?)
+}
+
 fn fetch_settled_daily_bar_blocking(
     stock_code: &str,
     market_date: NaiveDate,
@@ -951,6 +964,26 @@ mod tests {
         assert_eq!(market_for_stock_code("TEST_CODE_600000"), Ok(1));
         assert_eq!(market_for_stock_code("TEST_CODE_000001"), Ok(0));
         assert!(market_for_stock_code("TEST_CODE_BAD").is_err());
+    }
+
+    #[test]
+    fn production_probe_identity_rejects_test_and_unsupported_codes() {
+        assert_eq!(
+            validate_production_stock_code("600396"),
+            Ok(SecurityMarket::Shanghai)
+        );
+        assert_eq!(
+            validate_production_stock_code("002421"),
+            Ok(SecurityMarket::Shenzhen)
+        );
+        assert_eq!(
+            validate_production_stock_code("TEST_CODE_600396")
+                .expect_err("test identity")
+                .code(),
+            "test_identity_rejected"
+        );
+        assert!(validate_production_stock_code("920001").is_err());
+        assert!(validate_production_stock_code("60039").is_err());
     }
 
     fn security_quote(server_time: &str) -> SecurityQuote {

@@ -161,6 +161,7 @@ pub struct VisibleSample {
     pub candidate_id: String,
     pub run_id: String,
     pub event_id: String,
+    pub provider: String,
     pub chain_id: String,
     pub stock_code: String,
     pub stock_name: String,
@@ -174,6 +175,8 @@ pub struct VisibleSample {
 pub struct ReportFilter {
     pub from_market_date: Option<NaiveDate>,
     pub to_market_date: Option<NaiveDate>,
+    pub provider: Option<String>,
+    pub chain_id: Option<String>,
     pub stock_code: Option<String>,
     pub limit: usize,
 }
@@ -183,6 +186,8 @@ impl Default for ReportFilter {
         Self {
             from_market_date: None,
             to_market_date: None,
+            provider: None,
+            chain_id: None,
             stock_code: None,
             limit: 10_000,
         }
@@ -448,6 +453,8 @@ struct VisibleRow {
     #[diesel(sql_type = Text)]
     event_id: String,
     #[diesel(sql_type = Text)]
+    provider: String,
+    #[diesel(sql_type = Text)]
     chain_id: String,
     #[diesel(sql_type = Text)]
     stock_code: String,
@@ -469,6 +476,7 @@ impl VisibleRow {
             candidate_id: self.candidate_id,
             run_id: self.run_id,
             event_id: self.event_id,
+            provider: self.provider,
             chain_id: self.chain_id,
             stock_code: self.stock_code,
             stock_name: self.stock_name,
@@ -750,6 +758,16 @@ fn validate_report_filter(filter: &ReportFilter) -> SelectionStoreResult<()> {
         if !is_valid_selection_stock_code(code) {
             return Err(SelectionStoreError::InvalidInput(format!(
                 "report stock_code is invalid for this environment: {code:?}"
+            )));
+        }
+    }
+    for (field, value) in [
+        ("report provider", filter.provider.as_deref()),
+        ("report chain_id", filter.chain_id.as_deref()),
+    ] {
+        if value.is_some_and(|value| value.trim().is_empty()) {
+            return Err(SelectionStoreError::InvalidInput(format!(
+                "{field} must not be blank"
             )));
         }
     }
@@ -1285,6 +1303,8 @@ impl<'a> SelectionRepository<'a> {
         validate_report_filter(filter)?;
         let from_market_date = filter.from_market_date.map(|date| date.to_string());
         let to_market_date = filter.to_market_date.map(|date| date.to_string());
+        let provider = filter.provider.as_deref();
+        let chain_id = filter.chain_id.as_deref();
         let stock_code = filter.stock_code.as_deref();
         let limit = i64::try_from(filter.limit).map_err(|_| {
             SelectionStoreError::InvalidInput("report limit exceeds i64".to_owned())
@@ -1294,6 +1314,7 @@ impl<'a> SelectionRepository<'a> {
                 candidate.candidate_id,
                 candidate.run_id,
                 candidate.event_id,
+                inbox.provider,
                 candidate.chain_id,
                 candidate.stock_code,
                 candidate.stock_name,
@@ -1304,6 +1325,8 @@ impl<'a> SelectionRepository<'a> {
              FROM selection_candidates AS candidate
              INNER JOIN selection_visibility_receipts AS visibility
                ON visibility.run_id = candidate.run_id
+             INNER JOIN selection_event_inbox AS inbox
+               ON inbox.event_id = candidate.event_id
              INNER JOIN selection_feature_snapshots AS feature
                ON feature.candidate_id = candidate.candidate_id
              LEFT JOIN selection_outcomes AS t0
@@ -1314,6 +1337,8 @@ impl<'a> SelectionRepository<'a> {
               AND d1.phase = 'd1_settled'
              WHERE (? IS NULL OR candidate.evaluation_market_date >= ?)
                AND (? IS NULL OR candidate.evaluation_market_date <= ?)
+               AND (? IS NULL OR inbox.provider = ?)
+               AND (? IS NULL OR candidate.chain_id = ?)
                AND (? IS NULL OR candidate.stock_code = ?)
              ORDER BY
                 candidate.evaluation_market_date ASC,
@@ -1325,6 +1350,10 @@ impl<'a> SelectionRepository<'a> {
         .bind::<Nullable<Text>, _>(from_market_date.as_deref())
         .bind::<Nullable<Text>, _>(to_market_date.as_deref())
         .bind::<Nullable<Text>, _>(to_market_date.as_deref())
+        .bind::<Nullable<Text>, _>(provider)
+        .bind::<Nullable<Text>, _>(provider)
+        .bind::<Nullable<Text>, _>(chain_id)
+        .bind::<Nullable<Text>, _>(chain_id)
         .bind::<Nullable<Text>, _>(stock_code)
         .bind::<Nullable<Text>, _>(stock_code)
         .bind::<diesel::sql_types::BigInt, _>(limit)
@@ -1571,6 +1600,7 @@ mod tests {
             .expect("visible samples");
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].candidate_id, "candidate-1");
+        assert_eq!(visible[0].provider, "provider-a");
         assert_eq!(visible[0].stock_code, "TEST_CODE_600396");
         assert_eq!(
             visible[0].feature_payload_json,
@@ -1583,6 +1613,13 @@ mod tests {
             })
             .expect("filtered samples");
         assert!(excluded.is_empty());
+        let wrong_provider = repo
+            .visible_samples(&ReportFilter {
+                provider: Some("provider-b".to_owned()),
+                ..ReportFilter::default()
+            })
+            .expect("provider-filtered samples");
+        assert!(wrong_provider.is_empty());
     }
 
     #[test]

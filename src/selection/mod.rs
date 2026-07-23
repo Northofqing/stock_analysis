@@ -9,3 +9,4 @@ pub mod outcome;
 pub mod pipeline;
 pub mod quality;
 pub mod relation;
+pub mod report;
