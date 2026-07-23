@@ -3,6 +3,9 @@
 use stock_analysis::calendar::{self, MarketSession};
 use stock_analysis::news::aggregator::NewsAggregationBatch;
 use stock_analysis::selection::magic_tdx::SelectionMarketWindow;
+use stock_analysis::selection::outcome::{
+    settle_due_outcomes as settle_selection_outcomes, OutcomeSettlementSummary,
+};
 use stock_analysis::selection::pipeline::{
     evaluate_market_events, SelectionContext, SelectionEventBatch, SelectionRunOutcome,
 };
@@ -36,20 +39,12 @@ pub fn parse_selection_shadow_enable(value: Option<&str>) -> Result<bool, KillSw
 }
 
 pub async fn evaluate_news_batch(batch: NewsAggregationBatch) {
-    let enabled = match std::env::var(ENABLE_ENV) {
-        Ok(value) => {
-            match parse_selection_shadow_enable(Some(&value)) {
-                Ok(enabled) => enabled,
-                Err(error) => {
-                    log::error!("[selection-shadow][BR-155] disabled reason=invalid_kill_switch error={error}");
-                    return;
-                }
-            }
-        }
-        Err(std::env::VarError::NotPresent) => true,
+    let enabled = match selection_shadow_enabled() {
+        Ok(enabled) => enabled,
         Err(error) => {
             log::error!(
-                "[selection-shadow][BR-155] disabled reason=kill_switch_unreadable error={error}"
+                "[selection-shadow][BR-155] disabled reason={} error={error}",
+                error.reason_code()
             );
             return;
         }
@@ -91,6 +86,54 @@ pub async fn evaluate_news_batch(batch: NewsAggregationBatch) {
             unavailable.retryable
         ),
     }
+}
+
+#[derive(Debug)]
+pub struct ShadowSettlementError {
+    reason_code: &'static str,
+    message: String,
+}
+
+impl ShadowSettlementError {
+    pub fn reason_code(&self) -> &'static str {
+        self.reason_code
+    }
+}
+
+impl std::fmt::Display for ShadowSettlementError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+pub async fn settle_due_outcomes(
+    now: chrono::DateTime<chrono::Local>,
+) -> Result<OutcomeSettlementSummary, ShadowSettlementError> {
+    // The kill switch stops only new candidate evaluation. Already-visible
+    // immutable candidates must still receive their T0/D+1 outcomes.
+    settle_selection_outcomes(now)
+        .await
+        .map_err(|error| ShadowSettlementError {
+            reason_code: error.reason_code(),
+            message: error.to_string(),
+        })
+}
+
+fn selection_shadow_enabled() -> Result<bool, ShadowSettlementError> {
+    let value = match std::env::var(ENABLE_ENV) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => {
+            return Err(ShadowSettlementError {
+                reason_code: "kill_switch_unreadable",
+                message: format!("{ENABLE_ENV} is unreadable: {error}"),
+            });
+        }
+    };
+    parse_selection_shadow_enable(value.as_deref()).map_err(|error| ShadowSettlementError {
+        reason_code: "invalid_kill_switch",
+        message: error.to_string(),
+    })
 }
 
 fn selection_context(
@@ -157,6 +200,29 @@ mod tests {
             .find("selection_shadow::evaluate_news_batch(news_batch).await")
             .expect("selection shadow call");
         assert!(governance < selection);
+    }
+
+    #[test]
+    fn existing_post_session_scheduler_is_the_only_outcome_owner() {
+        let source = include_str!("main.rs");
+        let production = source
+            .split("mod tests_post_session_review_scheduler")
+            .next()
+            .expect("production source precedes tests");
+        assert_eq!(
+            production
+                .matches("selection_shadow::settle_due_outcomes(now).await")
+                .count(),
+            1
+        );
+        let scheduler = production
+            .split("async fn post_session_review_scheduler()")
+            .nth(1)
+            .expect("post-session scheduler")
+            .split("fn spawn_post_session_review_scheduler")
+            .next()
+            .expect("scheduler body");
+        assert!(scheduler.contains("selection_shadow::settle_due_outcomes(now).await"));
     }
 
     #[test]

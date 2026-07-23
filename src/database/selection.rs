@@ -152,6 +152,8 @@ pub struct DueOutcome {
     pub evaluation_market_date: NaiveDate,
     pub phase: OutcomePhase,
     pub due_market_date: NaiveDate,
+    pub feature_payload_json: String,
+    pub t0_outcome_payload_json: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -349,7 +351,7 @@ impl CompletionStatus {
 }
 
 impl OutcomePhase {
-    fn as_str(self) -> &'static str {
+    pub fn as_storage_str(self) -> &'static str {
         match self {
             Self::T0Close => "t0_close",
             Self::D1Settled => "d1_settled",
@@ -431,6 +433,10 @@ struct DueRow {
     has_t0: i32,
     #[diesel(sql_type = Integer)]
     has_d1: i32,
+    #[diesel(sql_type = Text)]
+    feature_payload_json: String,
+    #[diesel(sql_type = Nullable<Text>)]
+    t0_outcome_payload_json: Option<String>,
 }
 
 #[derive(QueryableByName)]
@@ -1142,10 +1148,19 @@ impl<'a> SelectionRepository<'a> {
                     SELECT 1 FROM selection_outcomes AS outcome
                     WHERE outcome.candidate_id = candidate.candidate_id
                       AND outcome.phase = 'd1_settled'
-                ) AS has_d1
+                ) AS has_d1,
+                (
+                    SELECT outcome.payload_json FROM selection_outcomes AS outcome
+                    WHERE outcome.candidate_id = candidate.candidate_id
+                      AND outcome.phase = 't0_close'
+                    LIMIT 1
+                ) AS t0_outcome_payload_json,
+                feature.payload_json AS feature_payload_json
              FROM selection_candidates AS candidate
              INNER JOIN selection_visibility_receipts AS visibility
                ON visibility.run_id = candidate.run_id
+             INNER JOIN selection_feature_snapshots AS feature
+               ON feature.candidate_id = candidate.candidate_id
              ORDER BY
                 candidate.evaluation_market_date ASC,
                 candidate.ordinal ASC,
@@ -1167,6 +1182,8 @@ impl<'a> SelectionRepository<'a> {
                         evaluation_market_date,
                         phase: OutcomePhase::T0Close,
                         due_market_date: evaluation_market_date,
+                        feature_payload_json: row.feature_payload_json,
+                        t0_outcome_payload_json: None,
                     });
                 }
                 continue;
@@ -1180,6 +1197,8 @@ impl<'a> SelectionRepository<'a> {
                         evaluation_market_date,
                         phase: OutcomePhase::D1Settled,
                         due_market_date,
+                        feature_payload_json: row.feature_payload_json,
+                        t0_outcome_payload_json: row.t0_outcome_payload_json,
                     });
                 }
             }
@@ -1209,16 +1228,22 @@ impl<'a> SelectionRepository<'a> {
             return Err(SelectionStoreError::InvalidInput(format!(
                 "outcome {} phase={} market_date={} expected={expected_market_date}",
                 outcome.outcome_id,
-                outcome.phase.as_str(),
+                outcome.phase.as_storage_str(),
                 outcome.market_date
             )));
         }
-        if let Some(existing) =
-            existing_outcome_hash(self.conn, &outcome.candidate_id, outcome.phase.as_str())?
-        {
+        if let Some(existing) = existing_outcome_hash(
+            self.conn,
+            &outcome.candidate_id,
+            outcome.phase.as_storage_str(),
+        )? {
             return idempotent_receipt(
                 "outcome",
-                &format!("{}:{}", outcome.candidate_id, outcome.phase.as_str()),
+                &format!(
+                    "{}:{}",
+                    outcome.candidate_id,
+                    outcome.phase.as_storage_str()
+                ),
                 &existing,
                 &outcome.content_hash,
             );
@@ -1244,7 +1269,7 @@ impl<'a> SelectionRepository<'a> {
         )
         .bind::<Text, _>(&outcome.outcome_id)
         .bind::<Text, _>(&outcome.candidate_id)
-        .bind::<Text, _>(outcome.phase.as_str())
+        .bind::<Text, _>(outcome.phase.as_storage_str())
         .bind::<Text, _>(outcome.market_date.to_string())
         .bind::<Text, _>(&outcome.content_hash)
         .bind::<Text, _>(&outcome.payload_json)
@@ -1675,6 +1700,14 @@ mod tests {
         assert_eq!(d1_due.len(), 1);
         assert_eq!(d1_due[0].phase, OutcomePhase::D1Settled);
         assert_eq!(d1_due[0].due_market_date, next_day);
+        assert_eq!(
+            d1_due[0].t0_outcome_payload_json.as_deref(),
+            Some(r#"{"close":"16.12"}"#)
+        );
+        assert_eq!(
+            d1_due[0].feature_payload_json,
+            r#"{"ma5":"12.30","volume_ratio":"1.42"}"#
+        );
     }
 
     #[test]

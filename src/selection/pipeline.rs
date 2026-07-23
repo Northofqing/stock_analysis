@@ -16,7 +16,8 @@ use crate::selection::audit::{
     SelectionAuditRecord, SelectionAuditWriter,
 };
 use crate::selection::features::{
-    compute_daily_features, IntradayVolumeEvidence, RawSelectionFeatures, FEATURE_VERSION,
+    compute_daily_features, IntradayVolumeEvidence, RawSelectionFeatures, T0MarketEvidence,
+    FEATURE_VERSION,
 };
 use crate::selection::magic_tdx::{
     fetch_selection_market_batch, SelectionEventReference, SelectionFiveMinuteBar,
@@ -569,6 +570,34 @@ impl SelectionPipeline {
                             continue;
                         }
                     };
+                    let t0_market_evidence = match t0_market_evidence(context.window, record) {
+                        Ok(evidence) => evidence,
+                        Err(error) => {
+                            self.append_rejection(
+                                event,
+                                &ticket_subject(event, chain, mention),
+                                &stable_hash(
+                                    "stock_analysis.selection_t0_evidence_rejection.v1",
+                                    &(
+                                        &event.event_id,
+                                        &chain.chain_id,
+                                        &mention.security.code,
+                                        error.code(),
+                                    ),
+                                )?,
+                                vec![error.code().to_owned()],
+                                vec!["BR-156".to_owned(), "2.2".to_owned(), "2.3".to_owned()],
+                                false,
+                                Some(chain),
+                                Some(mention),
+                                Some(&market_batch.batch_id),
+                                now,
+                            )?;
+                            event_has_terminal_ticket = true;
+                            rejected_candidates += 1;
+                            continue;
+                        }
+                    };
                     let decision = evaluate_admission(evaluation_window(context.window), &features);
                     match decision {
                         AdmissionDecision::Rejected(rejection) => {
@@ -606,6 +635,7 @@ impl SelectionPipeline {
                                 chain: chain.clone(),
                                 mention: mention.clone(),
                                 features,
+                                t0_market_evidence,
                                 admission_version,
                                 observed_at: record.observed_at.fixed_offset(),
                                 inbox_content_hash: inbox.content_hash.clone(),
@@ -781,6 +811,7 @@ impl SelectionPipeline {
                 chain: &prepared.chain,
                 relation: &prepared.mention,
                 features: &prepared.features,
+                t0_market_evidence: &prepared.t0_market_evidence,
                 magic_tdx_batch_id: &market_batch.batch_id,
                 magic_tdx_batch_hash: &market_batch_hash,
             };
@@ -937,6 +968,7 @@ struct PreparedCandidate {
     chain: ChainMatch,
     mention: DirectMentionEvidence,
     features: RawSelectionFeatures,
+    t0_market_evidence: T0MarketEvidence,
     admission_version: String,
     observed_at: DateTime<FixedOffset>,
     inbox_content_hash: String,
@@ -970,6 +1002,7 @@ struct FeaturePayload<'a> {
     chain: &'a ChainMatch,
     relation: &'a DirectMentionEvidence,
     features: &'a RawSelectionFeatures,
+    t0_market_evidence: &'a T0MarketEvidence,
     magic_tdx_batch_id: &'a str,
     magic_tdx_batch_hash: &'a str,
 }
@@ -1104,6 +1137,66 @@ fn features_for_record(
         }
     }
     Ok(features)
+}
+
+fn t0_market_evidence(
+    window: SelectionMarketWindow,
+    record: &crate::selection::magic_tdx::SelectionMarketRecord,
+) -> Result<T0MarketEvidence, crate::selection::features::FeatureError> {
+    let count = record.daily_bars.len();
+    if count < 21 {
+        return Err(crate::selection::features::FeatureError::new(
+            "t0_market_history_insufficient",
+            "T0 market evidence requires twenty-one settled daily bars",
+        ));
+    }
+    let latest = &record.daily_bars[count - 1];
+    let prior_5d_average_volume = record.daily_bars[count - 6..count - 1]
+        .iter()
+        .map(|bar| bar.volume)
+        .sum::<f64>()
+        / 5.0;
+    let prior_20d_average_volume = record.daily_bars[count - 21..count - 1]
+        .iter()
+        .map(|bar| bar.volume)
+        .sum::<f64>()
+        / 20.0;
+    let (evaluation_price, observed_volume) = match window {
+        SelectionMarketWindow::Intraday => {
+            let quote = record.quote.as_ref().ok_or_else(|| {
+                crate::selection::features::FeatureError::new(
+                    "t0_quote_missing",
+                    "intraday T0 market evidence requires a validated quote",
+                )
+            })?;
+            (quote.price, quote.volume)
+        }
+        SelectionMarketWindow::PostClose => (latest.close, latest.volume),
+    };
+    for (field, value, strictly_positive) in [
+        ("evaluation_price", evaluation_price, true),
+        ("observed_volume", observed_volume, true),
+        ("latest_settled_close", latest.close, true),
+        ("latest_settled_volume", latest.volume, true),
+        ("prior_5d_average_volume", prior_5d_average_volume, true),
+        ("prior_20d_average_volume", prior_20d_average_volume, true),
+    ] {
+        if !value.is_finite() || (strictly_positive && value <= 0.0) || value < 0.0 {
+            return Err(crate::selection::features::FeatureError::new(
+                "t0_market_evidence_invalid",
+                format!("{field} is invalid: {value}"),
+            ));
+        }
+    }
+    Ok(T0MarketEvidence {
+        evaluation_price,
+        observed_volume,
+        latest_settled_market_date: latest.market_date,
+        latest_settled_close: latest.close,
+        latest_settled_volume: latest.volume,
+        prior_5d_average_volume,
+        prior_20d_average_volume,
+    })
 }
 
 fn intraday_volume_evidence(
@@ -1695,6 +1788,16 @@ mod tests {
         let state = harness.repository.state.lock().expect("repository state");
         assert_eq!(state.staged.len(), 1);
         assert_eq!(state.staged[0].candidates.len(), 1);
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&state.staged[0].feature_snapshots[0].payload_json)
+                .expect("feature snapshot JSON");
+        let t0 = snapshot
+            .get("t0_market_evidence")
+            .expect("immutable T0 market evidence");
+        assert!(t0.get("evaluation_price").is_some());
+        assert!(t0.get("observed_volume").is_some());
+        assert!(t0.get("prior_5d_average_volume").is_some());
+        assert!(t0.get("prior_20d_average_volume").is_some());
         assert_eq!(state.visible.len(), 1);
         assert_eq!(state.completions.len(), 1);
     }

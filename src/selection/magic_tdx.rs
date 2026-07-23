@@ -77,6 +77,13 @@ pub struct SelectionMarketBatch {
     pub batch_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettledDailyEvidence {
+    pub bar: SelectionBar,
+    pub observed_at: DateTime<Local>,
+    pub batch_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectionSourceError {
     code: &'static str,
@@ -125,6 +132,58 @@ pub async fn fetch_selection_market_batch(
 ) -> Result<SelectionMarketBatch, SelectionSourceError> {
     validate_request(&request)?;
     run_magic_tdx_blocking(move || fetch_selection_market_batch_blocking(request)).await
+}
+
+pub async fn fetch_settled_daily_bar(
+    stock_code: String,
+    market_date: NaiveDate,
+) -> Result<Option<SettledDailyEvidence>, SelectionSourceError> {
+    run_magic_tdx_blocking(move || fetch_settled_daily_bar_blocking(&stock_code, market_date)).await
+}
+
+fn fetch_settled_daily_bar_blocking(
+    stock_code: &str,
+    market_date: NaiveDate,
+) -> Result<Option<SettledDailyEvidence>, SelectionSourceError> {
+    let market = market_for_stock_code(stock_code)?;
+    if !crate::calendar::is_trading_day(market_date) {
+        return Err(source_error(
+            "outcome_market_date_invalid",
+            format!("selection outcome date {market_date} is not a trading day"),
+            false,
+        ));
+    }
+    let service = TdxService::new();
+    let connected = service
+        .client()
+        .connect_to_any(Some(MAGIC_TDX_CONNECT_TIMEOUT_SECONDS))
+        .map_err(|error| tdx_error("magic_tdx_connect_failed", error, true))?;
+    if !connected {
+        return Err(source_error(
+            "magic_tdx_connect_failed",
+            "Magic TDX did not confirm a connected server",
+            true,
+        ));
+    }
+    let raw = service
+        .client()
+        .get_security_bars(KLINE_DAILY, market, stock_code, 0, DAILY_FETCH_COUNT, 0)
+        .map_err(|error| tdx_error("daily_bars_unavailable", error, true))?;
+    let bars = normalize_daily_bars(stock_code, raw, market_date)?;
+    let observed_at = Local::now();
+    let evidence = bars
+        .into_iter()
+        .find(|bar| bar.market_date == market_date)
+        .map(|bar| {
+            let batch_id = settled_daily_batch_id(&bar, observed_at);
+            SettledDailyEvidence {
+                bar,
+                observed_at,
+                batch_id,
+            }
+        });
+    drop(service);
+    Ok(evidence)
 }
 
 fn validate_request(request: &SelectionMarketRequest) -> Result<(), SelectionSourceError> {
@@ -757,6 +816,44 @@ fn market_number(market: SecurityMarket) -> u8 {
     }
 }
 
+fn market_for_stock_code(code: &str) -> Result<u8, SelectionSourceError> {
+    #[cfg(test)]
+    let market_code = code.strip_prefix("TEST_CODE_").unwrap_or(code);
+    #[cfg(not(test))]
+    let market_code = code;
+
+    let shanghai = ["600", "601", "603", "605", "688", "689"]
+        .iter()
+        .any(|prefix| market_code.starts_with(prefix));
+    let shenzhen = ["000", "001", "002", "003", "300", "301"]
+        .iter()
+        .any(|prefix| market_code.starts_with(prefix));
+    if shanghai && normalized_equity_code(1, code).is_some() {
+        return Ok(1);
+    }
+    if shenzhen && normalized_equity_code(0, code).is_some() {
+        return Ok(0);
+    }
+    Err(source_error(
+        "security_code_unsupported",
+        format!("Magic TDX outcome security is outside supported A-shares: {code:?}"),
+        false,
+    ))
+}
+
+fn settled_daily_batch_id(bar: &SelectionBar, observed_at: DateTime<Local>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"stock_analysis.selection_magic_tdx_settled_daily.v1\0");
+    hasher.update(
+        serde_json::to_vec(&(bar, observed_at.to_rfc3339()))
+            .expect("settled daily evidence must serialize"),
+    );
+    format!(
+        "selection_magic_tdx_settled_daily_v1_{}",
+        hex::encode(hasher.finalize())
+    )
+}
+
 fn market_batch_id(
     master: &SecurityMasterSnapshot,
     event_mentions: &BTreeMap<String, Vec<DirectMentionEvidence>>,
@@ -847,6 +944,13 @@ mod tests {
             name: name.to_string(),
             pre_close: 10.0,
         }
+    }
+
+    #[test]
+    fn settled_outcome_market_is_derived_only_from_supported_a_share_identity() {
+        assert_eq!(market_for_stock_code("TEST_CODE_600000"), Ok(1));
+        assert_eq!(market_for_stock_code("TEST_CODE_000001"), Ok(0));
+        assert!(market_for_stock_code("TEST_CODE_BAD").is_err());
     }
 
     fn security_quote(server_time: &str) -> SecurityQuote {

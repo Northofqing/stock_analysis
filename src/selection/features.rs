@@ -25,6 +25,18 @@ pub struct IntradayVolumeEvidence {
     pub historical_same_slot_volumes: Vec<f64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct T0MarketEvidence {
+    pub evaluation_price: f64,
+    pub observed_volume: f64,
+    pub latest_settled_market_date: chrono::NaiveDate,
+    pub latest_settled_close: f64,
+    pub latest_settled_volume: f64,
+    pub prior_5d_average_volume: f64,
+    pub prior_20d_average_volume: f64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeatureError {
     code: &'static str,

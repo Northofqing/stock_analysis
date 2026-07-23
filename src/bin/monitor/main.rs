@@ -3838,6 +3838,20 @@ async fn post_session_review_scheduler() {
             continue;
         }
 
+        match selection_shadow::settle_due_outcomes(now).await {
+            Ok(summary) if summary.attempted > 0 => log::info!(
+                "[selection-shadow][BR-157] outcome settlement attempted={} settled={} expected_wait={}",
+                summary.attempted,
+                summary.settled,
+                summary.expected_wait
+            ),
+            Ok(_) => {}
+            Err(error) => log::warn!(
+                "[selection-shadow][BR-157] outcome settlement unavailable; retry remains eligible: {}",
+                error.reason_code()
+            ),
+        }
+
         if valuation_date != Some(now.date_naive())
             && closing_valuation_runtime::eligible_after_close(now.fixed_offset())
         {
