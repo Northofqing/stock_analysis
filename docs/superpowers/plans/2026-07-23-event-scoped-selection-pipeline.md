@@ -719,6 +719,62 @@ git diff --cached --check
 git commit -m "feat(selection): add immutable shadow repository"
 ```
 
+## Task 6A: Add the formal-candidate admission gate
+
+**Files:**
+- Create: `src/selection/admission.rs`
+- Modify: `src/selection/mod.rs`
+
+- [ ] **Step 1: Add failing hard-exclusion tests**
+
+Prove that a complete, directly related security is still rejected when trend, momentum, overextension, settled-volume confirmation, or intraday same-slot pace fails. Also prove every missing/non-finite required feature is rejected and all applicable reason codes are returned in deterministic order.
+
+```rust
+#[test]
+fn weak_or_overextended_security_is_rejected_not_staged() {
+    let decision = evaluate_admission(
+        SelectionEvaluationWindow::PostClose,
+        &features_with_downtrend_and_weak_volume(),
+    );
+    assert!(matches!(decision, AdmissionDecision::Rejected(_)));
+    assert!(decision.reason_codes().contains(&"trend_alignment_failed"));
+    assert!(decision.reason_codes().contains(&"settled_volume_confirmation_failed"));
+}
+
+#[test]
+fn intraday_requires_real_same_slot_volume_confirmation() {
+    let decision = evaluate_admission(
+        SelectionEvaluationWindow::Intraday,
+        &features_without_intraday_pace(),
+    );
+    assert_eq!(decision.reason_codes(), ["intraday_volume_pace_missing"]);
+}
+```
+
+- [ ] **Step 2: Run and confirm RED**
+
+```bash
+cargo test --lib selection::admission -- --nocapture
+```
+
+- [ ] **Step 3: Implement `admission-v1`**
+
+Use the exact boundaries in design §6.4 / BR-156. Return `Admitted` or a deterministic structured rejection containing every failed rule. Do not calculate a score, probability, rank, or implicit default.
+
+- [ ] **Step 4: Add the pipeline exclusion contract**
+
+Task 8 must prove rejected securities are absent from staged candidates, visibility receipts, due outcomes, `visible_samples`, and report/backtest inputs while their structured rejection remains in the authoritative audit/completion summary.
+
+- [ ] **Step 5: Run and commit**
+
+```bash
+cargo test --lib selection::admission -- --nocapture
+cargo test --lib selection -- --nocapture
+git add src/selection/mod.rs src/selection/admission.rs
+git diff --cached --check
+git commit -m "feat(selection): reject weak formal candidates"
+```
+
 ## Task 7: Add the locked authoritative selection audit
 
 **Files:**
@@ -838,7 +894,7 @@ async fn candidate_is_invisible_until_committed_audit_and_receipt() {
 }
 ```
 
-Also prove event isolation, idempotent retry, permanent stale rejection completion, verified-empty only with complete feeds, single-ticket isolation, and no sink/trading port in the pipeline type.
+Also prove event isolation, idempotent retry, permanent stale rejection completion, verified-empty only with complete feeds, single-ticket isolation, hard-rejected securities never enter staged/visible/outcome/report samples, and no sink/trading port in the pipeline type.
 
 - [ ] **Step 2: Run and confirm RED**
 
@@ -861,6 +917,7 @@ validate aggregation batch identity
 → obtain one Magic TDX security-master/market batch in spawn_blocking
 → map every event independently
 → run quality and raw feature functions
+→ apply admission-v1 and discard every rejected security from the formal batch
 → append Prepared audit
 → stage run/candidates/features in one SQLite transaction
 → append Committed audit
