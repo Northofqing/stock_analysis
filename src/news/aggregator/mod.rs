@@ -145,6 +145,7 @@ pub fn build_market_event(
         certainty: 50,
         chains: vec![],
         occurred_at: now.with_timezone(&chrono::Local),
+        provider_publication: None,
         provenance: vec![crate::signal::market_event::SourceRef {
             provider: source_kind.label().to_string(),
             url: None,

@@ -7,7 +7,9 @@
 //! 设计: 每个 feed 只是薄壳, fetch 内部委托给现有数据源 provider, 然后 SearchResult → MarketEvent
 
 use super::{NewsFeed, SourceKind};
-use crate::signal::market_event::{Direction, EventType, MarketEvent, SourceRef};
+use crate::signal::market_event::{
+    Direction, EventType, MarketEvent, ProviderPublication, SourceRef,
+};
 use crate::util::recover_lock_or_warn;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
@@ -35,8 +37,8 @@ fn search_result_to_event(
     }
     let now = Utc::now();
     let observed_at = now.with_timezone(&Local);
-    let (occurred_at, stale) =
-        source_time_and_stale(r.published_date.as_deref(), observed_at, r.source.as_str());
+    let source_time =
+        parse_source_time(r.published_date.as_deref(), observed_at, r.source.as_str());
     let simhash = {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
@@ -64,7 +66,8 @@ fn search_result_to_event(
         strength: importance.saturating_mul(10),
         certainty: 60,
         chains: vec![],
-        occurred_at,
+        occurred_at: source_time.occurred_at,
+        provider_publication: source_time.provider_publication,
         provenance: vec![SourceRef {
             provider: r.source.clone(),
             url: if r.url.is_empty() {
@@ -75,19 +78,26 @@ fn search_result_to_event(
             fetched_at: observed_at,
         }],
         ai_degraded: false,
-        stale,
+        stale: source_time.stale,
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceTimeEvidence {
+    occurred_at: DateTime<Local>,
+    provider_publication: Option<ProviderPublication>,
+    stale: bool,
 }
 
 /// Preserve a real provider timestamp when one exists. Date-only sources use
 /// the real adapter observation time, while freshness is derived from the
 /// provider date. Missing/invalid dates are explicitly stale and cannot enter
 /// BR-137 critical or aggregate decisions.
-fn source_time_and_stale(
+fn parse_source_time(
     raw: Option<&str>,
     observed_at: DateTime<Local>,
     provider: &str,
-) -> (DateTime<Local>, bool) {
+) -> SourceTimeEvidence {
     fn warn_once(provider: &str, reason: &str) {
         static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
         let key = format!("{provider}:{reason}");
@@ -103,12 +113,23 @@ fn source_time_and_stale(
     }
     let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
         warn_once(provider, "missing");
-        return (observed_at, true);
+        return SourceTimeEvidence {
+            occurred_at: observed_at,
+            provider_publication: None,
+            stale: true,
+        };
     };
     if let Ok(timestamp) = DateTime::parse_from_rfc3339(raw) {
         let timestamp = timestamp.with_timezone(&Local);
         let stale = timestamp > observed_at || timestamp.date_naive() != observed_at.date_naive();
-        return (timestamp, stale);
+        return SourceTimeEvidence {
+            occurred_at: timestamp,
+            provider_publication: Some(ProviderPublication {
+                published_on: timestamp.date_naive(),
+                published_at: Some(timestamp),
+            }),
+            stale,
+        };
     }
     for format in [
         "%Y-%m-%d %H:%M:%S%.f",
@@ -120,15 +141,43 @@ fn source_time_and_stale(
             if let Some(timestamp) = Local.from_local_datetime(&naive).single() {
                 let stale =
                     timestamp > observed_at || timestamp.date_naive() != observed_at.date_naive();
-                return (timestamp, stale);
+                return SourceTimeEvidence {
+                    occurred_at: timestamp,
+                    provider_publication: Some(ProviderPublication {
+                        published_on: timestamp.date_naive(),
+                        published_at: Some(timestamp),
+                    }),
+                    stale,
+                };
             }
         }
     }
     if let Ok(date) = NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
-        return (observed_at, date != observed_at.date_naive());
+        return SourceTimeEvidence {
+            occurred_at: observed_at,
+            provider_publication: Some(ProviderPublication {
+                published_on: date,
+                published_at: None,
+            }),
+            stale: date != observed_at.date_naive(),
+        };
     }
     warn_once(provider, "invalid");
-    (observed_at, true)
+    SourceTimeEvidence {
+        occurred_at: observed_at,
+        provider_publication: None,
+        stale: true,
+    }
+}
+
+#[cfg(test)]
+fn source_time_and_stale(
+    raw: Option<&str>,
+    observed_at: DateTime<Local>,
+    provider: &str,
+) -> (DateTime<Local>, bool) {
+    let evidence = parse_source_time(raw, observed_at, provider);
+    (evidence.occurred_at, evidence.stale)
 }
 
 // ============================================================================
@@ -365,8 +414,7 @@ fn announcement_to_market_event(
     ) {
         return None;
     }
-    let (occurred_at, stale) =
-        source_time_and_stale(Some(&announcement.date), observed_at, provider);
+    let source_time = parse_source_time(Some(&announcement.date), observed_at, provider);
     let simhash = {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
@@ -386,14 +434,15 @@ fn announcement_to_market_event(
         strength: 70,
         certainty: 80,
         chains: vec![],
-        occurred_at,
+        occurred_at: source_time.occurred_at,
+        provider_publication: source_time.provider_publication,
         provenance: vec![SourceRef {
             provider: provider.to_string(),
             url: announcement.url.clone(),
             fetched_at: observed_at,
         }],
         ai_degraded: false,
-        stale,
+        stale: source_time.stale,
     })
 }
 
@@ -602,6 +651,13 @@ mod tests {
             );
             assert!(!event.ai_degraded);
             assert!(!event.stale);
+            assert_eq!(
+                event
+                    .provider_publication
+                    .as_ref()
+                    .map(|publication| publication.published_on),
+                Some(Local::now().date_naive())
+            );
 
             let repeat = search_result_to_event(&result, source_kind, event_type).unwrap();
             assert_eq!(repeat.simhash, event.simhash);
@@ -648,6 +704,41 @@ mod tests {
             source_time_and_stale(Some(&malformed), observed_at, "TEST_CODE_provider").1,
             "a valid date prefix must not make a malformed provider timestamp fresh"
         );
+    }
+
+    #[test]
+    fn date_only_publication_preserves_provider_date_without_inventing_a_time() {
+        let observed_at = Local
+            .with_ymd_and_hms(2026, 7, 23, 8, 30, 0)
+            .single()
+            .expect("fixed local test time");
+
+        let evidence = parse_source_time(Some("2026-07-23"), observed_at, "TEST_CODE_provider");
+
+        assert_eq!(evidence.occurred_at, observed_at);
+        assert_eq!(
+            evidence.provider_publication,
+            Some(crate::signal::market_event::ProviderPublication {
+                published_on: NaiveDate::from_ymd_opt(2026, 7, 23).expect("valid test date"),
+                published_at: None,
+            })
+        );
+        assert!(!evidence.stale);
+    }
+
+    #[test]
+    fn missing_and_invalid_publication_never_gain_provider_evidence() {
+        let observed_at = Local
+            .with_ymd_and_hms(2026, 7, 23, 8, 30, 0)
+            .single()
+            .expect("fixed local test time");
+
+        for raw in [None, Some(""), Some("2026-07-23 trailing-input")] {
+            let evidence = parse_source_time(raw, observed_at, "TEST_CODE_provider");
+            assert_eq!(evidence.provider_publication, None);
+            assert_eq!(evidence.occurred_at, observed_at);
+            assert!(evidence.stale);
+        }
     }
 
     #[test]

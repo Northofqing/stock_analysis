@@ -14,7 +14,7 @@
 //! - ai_degraded 标志: AI 不可用时置真, 下游必须降权不编造
 //! - provenance 落审计: 跨源验证, 单源封顶 70 (修复 P0-1 跨源软化)
 
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, NaiveDate};
 use serde::{Deserialize, Serialize};
 
 /// 事件类型 (受限枚举, 修复 P0-1 不允许字符串乱填)
@@ -94,6 +94,17 @@ pub struct SourceRef {
     pub fetched_at: DateTime<Local>,
 }
 
+/// Provider-owned publication evidence.
+///
+/// Date-only sources must leave `published_at` empty. `MarketEvent::occurred_at`
+/// remains the event ordering timestamp and must never be used to reconstruct
+/// this evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderPublication {
+    pub published_on: NaiveDate,
+    pub published_at: Option<DateTime<Local>>,
+}
+
 /// MarketEvent 标准中间件 (修复 P0-1)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketEvent {
@@ -127,6 +138,10 @@ pub struct MarketEvent {
     pub chains: Vec<String>,
     /// 事件时间 (新鲜度校验)
     pub occurred_at: DateTime<Local>,
+    /// BR-155: explicit provider publication evidence. Legacy constructors and
+    /// records remain `None`; observed time is not a valid substitute.
+    #[serde(default)]
+    pub provider_publication: Option<ProviderPublication>,
     /// 数据来源溯源 (跨源验证 + 审计)
     pub provenance: Vec<SourceRef>,
     /// AI 降级标志 (true=规则降级抽取, 下游必须降权不编造)
@@ -187,6 +202,7 @@ impl MarketEvent {
             certainty: certainty.min(100),
             chains: Vec::new(),
             occurred_at: now,
+            provider_publication: None,
             provenance: Vec::new(),
             ai_degraded: false,
             stale: false,
@@ -298,4 +314,30 @@ fn stable_hash_token(s: &str) -> u64 {
 /// 修复 P1-1: SimHash 汉明距离 (量化"两事件多相似")
 pub fn hamming_distance(a: u64, b: u64) -> u32 {
     (a ^ b).count_ones()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_event_does_not_infer_provider_publication_from_occurrence() {
+        let event = MarketEvent::new(
+            EventType::Other,
+            "TEST_CODE_legacy_event".to_string(),
+            None,
+            Direction::Neutral,
+            50,
+            50,
+        );
+        let mut value = serde_json::to_value(event).expect("serialize event");
+        value
+            .as_object_mut()
+            .expect("event JSON object")
+            .remove("provider_publication");
+
+        let decoded: MarketEvent = serde_json::from_value(value).expect("deserialize legacy event");
+
+        assert_eq!(decoded.provider_publication, None);
+    }
 }

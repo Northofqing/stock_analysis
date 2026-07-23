@@ -123,6 +123,7 @@ mod tests {
             certainty: 80,
             chains: vec![],
             occurred_at: now,
+            provider_publication: None,
             provenance: vec![SourceRef {
                 provider: "test".into(),
                 url: None,
