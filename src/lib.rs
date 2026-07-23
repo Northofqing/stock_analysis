@@ -33,6 +33,7 @@ pub mod registry;
 pub mod risk;
 pub mod schema;
 pub mod search_service;
+pub mod selection;
 pub mod sharpe_calculator;
 pub mod signal;
 // v14.2 push 7 层 — 对齐 docs/v14.x/v14.x-master-development.md 的 Phase 2/3 W 周编号
