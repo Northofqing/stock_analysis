@@ -165,11 +165,6 @@ pub async fn tick_news_aggregator_batch(per_feed_limit: usize) -> NewsAggregatio
     }
 }
 
-/// Legacy compatibility wrapper. New selection code must use the batch API.
-pub async fn tick_news_aggregator(per_feed_limit: usize) -> Vec<MarketEvent> {
-    tick_news_aggregator_batch(per_feed_limit).await.events
-}
-
 // ============================================================================
 // v17.4 §5.1 能力1: NewsFlashGate — critical 即时推 + 4 时段聚合 Top3
 // 业务规则登记: BR-082 (docs/business_rules.md, 红线 2.10)
@@ -639,10 +634,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn tick_news_aggregator_returns_real_market_events() {
-        // F12 修复: tick 真返 Vec<MarketEvent>,不再是 u64 stub.
-        let events = tick_news_aggregator(5).await;
-        log::info!("[test] tick 拿到 {} 个 MarketEvent", events.len());
-        // Vec<MarketEvent> 是真事件类型, 后续 caller 可直接喂 news_ranker
+    async fn tick_news_aggregator_returns_typed_batch_evidence() {
+        let batch = tick_news_aggregator_batch(5).await;
+        log::info!(
+            "[test] tick 拿到 {} 个 MarketEvent / {} 个 source attempts",
+            batch.events.len(),
+            batch.source_attempts.len()
+        );
     }
 }

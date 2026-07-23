@@ -144,6 +144,7 @@ mod v14_adapter;
 mod l6_sink;
 
 mod news_aggregator_init;
+mod selection_shadow;
 
 mod daily_report_router; // v17.6 §5.1: DailyReport SubKind 拆分 (3 variants → DailyReport 主路径)
 
@@ -3009,7 +3010,7 @@ async fn main() {
     );
 
     // v17.4: NewsAggregator 全局初始化 (13 个 NewsFeed 适配注册到 aggregator)
-    // 调用方: news_monitor_loop 每 tick 调 tick_news_aggregator(20) 拿 dedup 后 events
+    // 调用方: news_monitor_loop 每 tick 消费带逐源证据的 typed batch
     let news_feed_count = news_aggregator_init::init_news_aggregator();
     log::info!(
         "[v17.4] NewsAggregator 已初始化 ({} feeds registered)",
@@ -5762,21 +5763,19 @@ enum NewsOuterTickPhase {
     HoldingEarnings = 2,
     L2 = 3,
     Announcement = 4,
-    Opportunity = 5,
-    Reset = 6,
-    Flush = 7,
-    Banner = 8,
-    Sleep = 9,
+    Reset = 5,
+    Flush = 6,
+    Banner = 7,
+    Sleep = 8,
 }
 
 impl NewsOuterTickPhase {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 9] = [
         Self::Policy,
         Self::CriticalFlash,
         Self::HoldingEarnings,
         Self::L2,
         Self::Announcement,
-        Self::Opportunity,
         Self::Reset,
         Self::Flush,
         Self::Banner,
@@ -5790,7 +5789,6 @@ impl NewsOuterTickPhase {
             Self::HoldingEarnings => "holding_earnings",
             Self::L2 => "l2",
             Self::Announcement => "announcement",
-            Self::Opportunity => "opportunity",
             Self::Reset => "reset",
             Self::Flush => "flush",
             Self::Banner => "banner",
@@ -6012,12 +6010,6 @@ async fn news_monitor_loop() {
 
     let mut last_flush = std::time::Instant::now();
 
-    // 产业链机会发现调度：None=启动后首轮立即跑，之后按 opportunity_scan_interval_min 间隔
-
-    // 统一在本 8:00-22:00 窗口内调度（覆盖盘前/盘中/盘后），消除「收盘即停」盲区。
-
-    let mut last_opp_scan: Option<std::time::Instant> = None;
-
     // v17.4 §5.1 (BR-082): NewsFlashGate — critical 即时推 + 4 时段聚合 Top3
     let mut news_flash_gate =
         news_aggregator_init::NewsFlashGate::new(chrono::Local::now().date_naive());
@@ -6069,14 +6061,14 @@ async fn news_monitor_loop() {
             }
         }
 
-        // v17.4: NewsAggregator tick 入口 — 每轮调一次, 拿 dedup 后 Vec<MarketEvent>
-        // v17.4 §5.1: 事件喂 NewsFlashGate → critical 即时推 + 4 时段聚合 (AC34/AC35)
+        // BR-082 / BR-155: one immutable batch first completes existing news
+        // governance, then independently enters shadow selection.
         if outer_tick.enter(NewsOuterTickPhase::CriticalFlash) {
-            let news_events = news_aggregator_init::tick_news_aggregator(20).await;
+            let news_batch = news_aggregator_init::tick_news_aggregator_batch(20).await;
             {
                 let mcfg = stock_analysis::config::get_monitor_config();
                 let decisions = news_flash_gate.process(
-                    &news_events,
+                    &news_batch.events,
                     chrono::Local::now(),
                     mcfg.news_critical_score_threshold,
                     mcfg.news_max_critical_per_day,
@@ -6086,6 +6078,7 @@ async fn news_monitor_loop() {
                     log::info!("[v17.4] news_flash push: critical={} aggregated={}", nc, na);
                 }
             }
+            selection_shadow::evaluate_news_batch(news_batch).await;
         }
 
         // BR-138: policy and critical flash have completed before watch
@@ -6380,26 +6373,6 @@ async fn news_monitor_loop() {
                     log::error!("[I-02][BR-091] dispatcher did not confirm delivery");
                 }
             }
-        }
-
-        // 路径A 机会发现已统一到 opportunity::run_opportunity_scan（monitor_loop 内调度），
-
-        // news_ai::discover_opportunities 在 v9.1 Task 0 已删除。
-
-        // 产业链机会扫描：统一在 8:00-22:00 窗口内按间隔调度（覆盖盘前/盘中/盘后）。
-
-        // spawn 异步执行，不阻塞新闻轮询。
-
-        let opp_interval_secs =
-            stock_analysis::config::get_monitor_config().opportunity_scan_interval_min * 60;
-
-        let opp_due = last_opp_scan
-            .map(|t| t.elapsed().as_secs() >= opp_interval_secs)
-            .unwrap_or(true);
-
-        if outer_tick.enter(NewsOuterTickPhase::Opportunity) && opp_due {
-            last_opp_scan = Some(std::time::Instant::now());
-            log::warn!("[产业链][BR-112] scan disabled=incomplete_source_contract");
         }
 
         // 每日重置
@@ -10188,7 +10161,6 @@ mod tests_v17_7_announcement_wiring {
                 NewsOuterTickPhase::HoldingEarnings,
                 NewsOuterTickPhase::L2,
                 NewsOuterTickPhase::Announcement,
-                NewsOuterTickPhase::Opportunity,
                 NewsOuterTickPhase::Reset,
                 NewsOuterTickPhase::Flush,
                 NewsOuterTickPhase::Banner,
