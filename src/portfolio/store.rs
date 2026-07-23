@@ -50,7 +50,13 @@ pub fn load_positions_with_source_time(
                     return Err(format!("持仓 {} st_type 非法: {other:?}", r.code));
                 }
             };
-            let sector = r.chain_name.unwrap_or_default();
+            let sector = r
+                .chain_name
+                .filter(|chain| !chain.trim().is_empty())
+                .or_else(|| {
+                    crate::data_provider::chain_registry::lookup(&r.code).map(str::to_string)
+                })
+                .unwrap_or_default();
             if sector.trim().is_empty() {
                 log::warn!("[portfolio] 持仓 {} 产业链缺失，保留空值", r.code);
             }
