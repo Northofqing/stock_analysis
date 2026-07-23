@@ -52,4 +52,25 @@ mod tests {
         );
         assert!(error.contains("panicked"), "{error}");
     }
+
+    #[test]
+    fn audited_async_call_sites_do_not_directly_call_blocking_loaders() {
+        let main_source = include_str!("main.rs");
+        let push_source = include_str!("push_templates.rs");
+
+        assert!(!main_source.contains("match market_data::fetch_eastmoney_quotes(&virt_codes)"));
+        assert!(!main_source.contains("let r_quotes2 = market_data::fetch_position_quotes()?;"));
+        for direct_call in [
+            "match load_news_catalyst_snapshot_real(hhmm)",
+            "match load_industry_chain_snapshot_real(hhmm)",
+            "match load_news_to_idea_snapshot_real(hhmm)",
+            "match load_real_candidate_batch()",
+            "match load_auction_volume_snapshot_real(hhmm)",
+        ] {
+            assert!(
+                !push_source.contains(direct_call),
+                "async dispatcher still uses direct blocking call: {direct_call}"
+            );
+        }
+    }
 }

@@ -5622,7 +5622,11 @@ async fn run_review_deep_analysis(
 
     //   - 第二轮 fetch (第一轮 quotes 已被 spawn_blocking move 走)
 
-    let r_quotes2 = market_data::fetch_position_quotes()?;
+    let r_quotes2 = crate::blocking_market_data::run_blocking_market_data(
+        "deep review position quotes",
+        market_data::fetch_position_quotes,
+    )
+    .await?;
 
     let quote_map: std::collections::HashMap<String, (f64, f64)> = r_quotes2
         .iter()
@@ -7306,12 +7310,20 @@ async fn monitor_loop() {
                                 .collect();
 
                             if !virt_codes.is_empty() {
-                                match market_data::fetch_eastmoney_quotes(&virt_codes) {
+                                let virt_quotes =
+                                    crate::blocking_market_data::run_blocking_market_data(
+                                        "P-05 virtual observation quotes",
+                                        move || market_data::fetch_eastmoney_quotes(&virt_codes),
+                                    )
+                                    .await;
+                                match virt_quotes {
                                     Ok(virt_quotes) => {
-                                        for q in virt_quotes {
+                                        for quote in virt_quotes {
                                             for virtual_pos in &mut virtual_observation {
-                                                if virtual_pos.0 == q.code && virtual_pos.2 == 0.0 {
-                                                    virtual_pos.2 = q.price;
+                                                if virtual_pos.0 == quote.code
+                                                    && virtual_pos.2 == 0.0
+                                                {
+                                                    virtual_pos.2 = quote.price;
                                                 }
                                             }
                                         }
