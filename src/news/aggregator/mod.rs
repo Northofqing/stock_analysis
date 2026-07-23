@@ -19,7 +19,8 @@ pub use source_event::{NormalizedSourceError, NormalizedSourceEvent, SourcePushK
 use crate::signal::market_event::{EventType, MarketEvent};
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -55,6 +56,43 @@ pub trait NewsFeed: Send + Sync {
     async fn fetch(&self, limit: usize) -> Result<Vec<MarketEvent>>;
 }
 
+/// BR-155: one explicit result per registered feed. A failed attempt must not
+/// be collapsed into an empty event vector.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FeedAttemptStatus {
+    Succeeded {
+        event_count: usize,
+    },
+    Failed {
+        reason_code: String,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeedAttempt {
+    pub feed_name: String,
+    pub source_kind: String,
+    pub status: FeedAttemptStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewsAggregationBatch {
+    pub events: Vec<MarketEvent>,
+    pub source_attempts: Vec<FeedAttempt>,
+    pub observed_at: DateTime<Local>,
+}
+
+impl NewsAggregationBatch {
+    pub fn sources_complete(&self) -> bool {
+        !self.source_attempts.is_empty()
+            && self
+                .source_attempts
+                .iter()
+                .all(|attempt| matches!(attempt.status, FeedAttemptStatus::Succeeded { .. }))
+    }
+}
+
 /// NewsAggregator — 多源收敛 + simhash 去重
 pub struct NewsAggregator {
     feeds: Vec<Arc<dyn NewsFeed>>,
@@ -69,13 +107,34 @@ impl NewsAggregator {
         }
     }
 
-    /// 拉所有 feed + 按 simhash 去重 (返回新增的)
-    pub async fn tick(&self, per_feed_limit: usize) -> Vec<MarketEvent> {
+    /// Pull all feeds and retain explicit per-feed completeness evidence.
+    pub async fn tick_batch(&self, per_feed_limit: usize) -> NewsAggregationBatch {
+        let observed_at = Local::now();
         let mut all_events: Vec<MarketEvent> = Vec::new();
+        let mut source_attempts = Vec::with_capacity(self.feeds.len());
         for feed in &self.feeds {
             match feed.fetch(per_feed_limit).await {
-                Ok(events) => all_events.extend(events),
-                Err(e) => log::warn!("[NewsAggregator] feed {} 失败: {}", feed.name(), e),
+                Ok(events) => {
+                    source_attempts.push(FeedAttempt {
+                        feed_name: feed.name().to_string(),
+                        source_kind: feed.source_kind().label().to_string(),
+                        status: FeedAttemptStatus::Succeeded {
+                            event_count: events.len(),
+                        },
+                    });
+                    all_events.extend(events);
+                }
+                Err(error) => {
+                    log::warn!("[NewsAggregator] feed {} 失败: {}", feed.name(), error);
+                    source_attempts.push(FeedAttempt {
+                        feed_name: feed.name().to_string(),
+                        source_kind: feed.source_kind().label().to_string(),
+                        status: FeedAttemptStatus::Failed {
+                            reason_code: "feed_fetch_failed".to_string(),
+                            message: "feed fetch failed".to_string(),
+                        },
+                    });
+                }
             }
         }
         // simhash 去重 (std::sync::Mutex 返回 Result, poison 时继续)
@@ -94,7 +153,17 @@ impl NewsAggregator {
         });
         // 按时间倒序
         all_events.sort_by_key(|event| std::cmp::Reverse(event.occurred_at));
-        all_events
+        NewsAggregationBatch {
+            events: all_events,
+            source_attempts,
+            observed_at,
+        }
+    }
+
+    /// Compatibility wrapper for legacy consumers. Selection must use
+    /// `tick_batch` so that empty and unavailable remain distinguishable.
+    pub async fn tick(&self, per_feed_limit: usize) -> Vec<MarketEvent> {
+        self.tick_batch(per_feed_limit).await.events
     }
 
     pub fn feed_count(&self) -> usize {
@@ -166,6 +235,10 @@ mod tests {
         events: Vec<MarketEvent>,
     }
 
+    struct FailingFeed {
+        name: String,
+    }
+
     #[async_trait]
     impl NewsFeed for MockFeed {
         fn name(&self) -> &str {
@@ -177,6 +250,65 @@ mod tests {
         async fn fetch(&self, _limit: usize) -> Result<Vec<MarketEvent>> {
             Ok(self.events.clone())
         }
+    }
+
+    #[async_trait]
+    impl NewsFeed for FailingFeed {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn source_kind(&self) -> SourceKind {
+            SourceKind::Flash
+        }
+
+        async fn fetch(&self, _limit: usize) -> Result<Vec<MarketEvent>> {
+            anyhow::bail!("TEST_CODE transport unavailable")
+        }
+    }
+
+    #[tokio::test]
+    async fn feed_failure_is_structured_and_never_looks_like_verified_empty() {
+        let agg = NewsAggregator::new(vec![
+            Arc::new(MockFeed {
+                name: "TEST_CODE_ok".into(),
+                events: vec![],
+            }),
+            Arc::new(FailingFeed {
+                name: "TEST_CODE_down".into(),
+            }),
+        ]);
+
+        let batch = agg.tick_batch(10).await;
+
+        assert!(batch.events.is_empty());
+        assert_eq!(batch.source_attempts.len(), 2);
+        assert!(!batch.sources_complete());
+        assert!(matches!(
+            &batch.source_attempts[1].status,
+            FeedAttemptStatus::Failed { reason_code, .. }
+                if reason_code == "feed_fetch_failed"
+        ));
+    }
+
+    #[tokio::test]
+    async fn successful_empty_feeds_prove_source_completeness() {
+        let agg = NewsAggregator::new(vec![
+            Arc::new(MockFeed {
+                name: "TEST_CODE_empty_a".into(),
+                events: vec![],
+            }),
+            Arc::new(MockFeed {
+                name: "TEST_CODE_empty_b".into(),
+                events: vec![],
+            }),
+        ]);
+
+        let batch = agg.tick_batch(10).await;
+
+        assert!(batch.events.is_empty());
+        assert_eq!(batch.source_attempts.len(), 2);
+        assert!(batch.sources_complete());
     }
 
     #[tokio::test]

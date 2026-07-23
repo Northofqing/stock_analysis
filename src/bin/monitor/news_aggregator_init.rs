@@ -6,8 +6,8 @@
 //! 把 `src/news/aggregator/feed.rs` 的 7 个通用新闻轮询 `NewsFeed` 适配 (Jin10 / WSCN /
 //! CLS / Sina / Weibo / Gel / 科创板日报) 注册到全局 `NewsAggregator`。GovPolicy 由
 //! BR-137 独立 producer 保留原始 `SearchResult`，不进入投递前 aggregator 去重。
-//! `news_monitor_loop` 每 tick 调一次 `tick_news_aggregator(20)`,
-//! 把 dedup 后的 `Vec<MarketEvent>` 喂给 BR-082 NewsFlashGate 与推送治理链.
+//! `news_monitor_loop` 每 tick 调一次 `tick_news_aggregator_batch(20)`,
+//! 把 dedup 后的事件喂给 BR-082 NewsFlashGate，同时为 BR-155 保留逐 feed 完整性证据。
 //!
 //! ## 调用链
 //!
@@ -20,9 +20,9 @@
 //!
 //! monitor::main()
 //!   └─ news_monitor_loop()
-//!        └─ tick_news_aggregator(20).await  ← 本文件
-//!             └─ NewsAggregator::global().tick(20) → 8 feed 取数 + simhash 去重
-//!                  → Vec<MarketEvent> → BR-082 NewsFlashGate
+//!        └─ tick_news_aggregator_batch(20).await  ← 本文件
+//!             └─ NewsAggregator::global().tick_batch(20) → 7 feed 取数 + simhash 去重
+//!                  → NewsAggregationBatch → BR-082 NewsFlashGate + BR-155 selection
 //! ```
 //!
 //! ## Idempotent
@@ -40,7 +40,7 @@ use std::sync::Arc;
 use stock_analysis::news::aggregator::{
     self,
     feed::{self},
-    NewsAggregator, NewsFeed,
+    FeedAttempt, FeedAttemptStatus, NewsAggregationBatch, NewsAggregator, NewsFeed,
 };
 use stock_analysis::signal::market_event::MarketEvent;
 
@@ -114,42 +114,60 @@ fn feed_count_global() -> usize {
         .unwrap_or(0)
 }
 
-/// 在 `news_monitor_loop` 中每 tick 调一次, 拿到 dedup 后的 `Vec<MarketEvent>`.
+/// 在 `news_monitor_loop` 中每 tick 调一次，保留逐 feed 完整性证据。
 ///
-/// 调用方把返回事件交给 BR-082 NewsFlashGate 和现有推送治理链。
-pub async fn tick_news_aggregator(per_feed_limit: usize) -> Vec<MarketEvent> {
+/// BR-082 继续消费 `events`；BR-155 selection 必须消费完整 batch。
+pub async fn tick_news_aggregator_batch(per_feed_limit: usize) -> NewsAggregationBatch {
     match aggregator::global() {
         Some(agg) => {
-            let events = agg.tick(per_feed_limit).await;
-            if events.is_empty() {
+            let batch = agg.tick_batch(per_feed_limit).await;
+            if batch.events.is_empty() {
                 log::debug!(
-                    "[NewsAggregator] tick 返回 0 事件 (per_feed_limit={})",
-                    per_feed_limit
+                    "[NewsAggregator] tick 返回 0 事件 (per_feed_limit={} sources_complete={})",
+                    per_feed_limit,
+                    batch.sources_complete()
                 );
-                return vec![];
+                return batch;
             }
             let mut counts_by_type: std::collections::HashMap<String, usize> =
                 std::collections::HashMap::new();
-            for e in &events {
+            for event in &batch.events {
                 *counts_by_type
-                    .entry(format!("{:?}", e.event_type))
+                    .entry(format!("{:?}", event.event_type))
                     .or_insert(0) += 1;
             }
             log::info!(
-                "[NewsAggregator] tick 拿到 {} 事件, 按类型: {:?} (per_feed_limit={})",
-                events.len(),
+                "[NewsAggregator] tick 拿到 {} 事件, 按类型: {:?} (per_feed_limit={} sources_complete={})",
+                batch.events.len(),
                 counts_by_type,
-                per_feed_limit
+                per_feed_limit,
+                batch.sources_complete()
             );
-            events
+            batch
         }
         None => {
             log::warn!(
                 "[NewsAggregator] global() 尚未初始化, 调用方应在 main() 早期先调 init_news_aggregator()"
             );
-            vec![]
+            NewsAggregationBatch {
+                events: Vec::new(),
+                source_attempts: vec![FeedAttempt {
+                    feed_name: "global_aggregator".to_string(),
+                    source_kind: "system".to_string(),
+                    status: FeedAttemptStatus::Failed {
+                        reason_code: "aggregator_not_initialized".to_string(),
+                        message: "global aggregator is not initialized".to_string(),
+                    },
+                }],
+                observed_at: chrono::Local::now(),
+            }
         }
     }
+}
+
+/// Legacy compatibility wrapper. New selection code must use the batch API.
+pub async fn tick_news_aggregator(per_feed_limit: usize) -> Vec<MarketEvent> {
+    tick_news_aggregator_batch(per_feed_limit).await.events
 }
 
 // ============================================================================
