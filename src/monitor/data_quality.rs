@@ -490,7 +490,7 @@ pub fn max_gap_for(code: &str) -> f64 {
     let code = code.split('.').next().unwrap_or(code);
     if code.starts_with("300") || code.starts_with("688") {
         20.5
-    } else if code.starts_with("8") || code.starts_with("4") {
+    } else if code.starts_with('8') || code.starts_with('4') || code.starts_with("92") {
         30.5
     } else {
         10.5
