@@ -6702,11 +6702,31 @@ pub async fn dispatch_r03_industry_chain_real(date: &str, banner: &BannerCtx) ->
 pub async fn dispatch_r04_lhb_outcome(
     date: &str,
     now_time: chrono::NaiveTime,
-    _banner: &BannerCtx,
+    banner: &BannerCtx,
 ) -> crate::review_batch::ReviewTaskOutcome {
+    use stock_analysis::market_analyzer::lhb_review::fetch_recent_lhb;
+
+    dispatch_r04_lhb_outcome_with_loader(date, now_time, banner, fetch_recent_lhb).await
+}
+
+async fn dispatch_r04_lhb_outcome_with_loader<F>(
+    date: &str,
+    now_time: chrono::NaiveTime,
+    _banner: &BannerCtx,
+    fetch_lhb: F,
+) -> crate::review_batch::ReviewTaskOutcome
+where
+    F: FnOnce(
+            chrono::NaiveDate,
+            usize,
+        )
+            -> Result<Vec<stock_analysis::market_analyzer::lhb_review::LhbEntryInput>, String>
+        + Send
+        + 'static,
+{
     use crate::review_batch::ReviewTaskOutcome;
     use chrono::NaiveDate;
-    use stock_analysis::market_analyzer::lhb_review::fetch_recent_lhb;
+
     let lhb_ready_time = chrono::NaiveTime::from_hms_opt(21, 0, 0).unwrap();
     if now_time < lhb_ready_time {
         return ReviewTaskOutcome::expected_wait(
@@ -6723,7 +6743,7 @@ pub async fn dispatch_r04_lhb_outcome(
             return ReviewTaskOutcome::failed(false, reason);
         }
     };
-    let raw = match tokio::task::spawn_blocking(move || fetch_recent_lhb(today, 5)).await {
+    let raw = match tokio::task::spawn_blocking(move || fetch_lhb(today, 5)).await {
         Ok(Ok(rows)) => rows,
         Ok(Err(error)) => {
             let unavailable = error.starts_with("unavailable:");
@@ -6902,10 +6922,11 @@ mod tests_r_dispatchers {
             data_mode: DataMode::Unsafe,
             data_missing_note: Some("TEST_CODE incomplete".to_string()),
         };
-        let before = dispatch_r04_lhb_outcome(
+        let before = dispatch_r04_lhb_outcome_with_loader(
             "2026-07-21",
             chrono::NaiveTime::from_hms_opt(20, 59, 0).unwrap(),
             &banner,
+            |_, _| panic!("TEST_CODE R-04 loader must not run before 21:00"),
         )
         .await;
         assert!(matches!(
@@ -6913,10 +6934,11 @@ mod tests_r_dispatchers {
             crate::review_batch::ReviewTaskOutcome::ExpectedWait { .. }
         ));
 
-        let after = dispatch_r04_lhb_outcome(
+        let after = dispatch_r04_lhb_outcome_with_loader(
             "2026-07-21",
             chrono::NaiveTime::from_hms_opt(21, 0, 0).unwrap(),
             &banner,
+            |_, _| Err("unavailable: TEST_CODE lhb producer".to_string()),
         )
         .await;
         assert!(matches!(
