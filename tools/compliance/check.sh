@@ -7,6 +7,7 @@
 #   - check_data_freshness.sh (AGENTS §2.4 数据时效门禁, PR-2)
 #   - check_design_contradiction.sh (AGENTS §2.9 设计矛盾禁令, PR-3)
 #   - check_business_rules.sh (AGENTS §2.10 业务规则文档化, PR-4)
+#   - check_backfill_failure_propagation.sh (BR-009 / AGENTS §2.8)
 #
 # 后续 PR 会扩展:
 #   - check_*.sh (PR-5+)
@@ -45,6 +46,7 @@ run_check "check_fake_impl.sh"
 run_check "check_data_freshness.sh"
 run_check "check_design_contradiction.sh"
 run_check "check_business_rules.sh"
+run_check "check_backfill_failure_propagation.sh"
 run_check "check_no_silent_fallback_push.sh"
 run_check "check_no_silent_fallback_global.sh"
 

@@ -11,7 +11,7 @@
 #   STOCK_DB=data/stock_analysis.db STOCK_LIST=000001,600519 bash tools/one_shot/backfill_daily.sh
 #   STOCK_DB=data/stock_analysis.db bash tools/one_shot/backfill_daily.sh 000001,600519
 #
-# 数据源: RustDX 通达信 (主) → GtimgProvider (备) → HttpProvider (备)
+# 数据源: Magic TDX (主) → GtimgProvider (备) → HttpProvider (备)
 # 写表: stock_daily (UPSERT, ON CONFLICT DO UPDATE)
 #
 # 与 backfill_predictions.sh 风格保持一致 (一次性脚本, 不入 monitor 主循环).
@@ -39,7 +39,7 @@ echo "timeout: ${BACKFILL_DAILY_TIMEOUT_SECS:-1800}s (env BACKFILL_DAILY_TIMEOUT
 
 # BR-009: 用 timeout 包装 cargo run, 超时 exit 2
 with_timeout "${BACKFILL_DAILY_TIMEOUT_SECS:-1800}" \
-  bash -c "STOCK_DB='$DB' cargo run --quiet --bin backfill_daily -- '$LIST' 2>&1 | tail -30" \
+  bash -o pipefail -c "CARGO_INCREMENTAL=0 STOCK_DB='$DB' cargo run --quiet --bin backfill_daily -- '$LIST' 2>&1 | tail -30" \
   || { rc=$?; echo "✗ BR-009 timeout 或 cargo 失败 (exit $rc)"; exit $rc; }
 
 echo ""
