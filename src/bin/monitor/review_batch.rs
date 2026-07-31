@@ -1,6 +1,42 @@
+//! Registered business rules: BR-140, BR-192.
 //! BR-140 typed post-session review outcomes and per-task scheduling.
 
 use sha2::{Digest, Sha256};
+
+/// BR-140 keeps the business as-of date separate from the real observation
+/// clock. Providers, task identities and audit partitions use `review_date`;
+/// diagnostics retain the unmodified `observed_at`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReviewRunContext {
+    review_date: chrono::NaiveDate,
+    observed_at: chrono::NaiveDateTime,
+}
+
+impl ReviewRunContext {
+    pub fn at(observed_at: chrono::NaiveDateTime) -> Self {
+        Self {
+            review_date: stock_analysis::calendar::latest_completed_trading_day_at(observed_at),
+            observed_at,
+        }
+    }
+
+    pub fn review_date(self) -> chrono::NaiveDate {
+        self.review_date
+    }
+
+    pub fn observed_at(self) -> chrono::NaiveDateTime {
+        self.observed_at
+    }
+
+    pub fn eligibility_time(self) -> chrono::NaiveTime {
+        if self.observed_at.date() > self.review_date {
+            chrono::NaiveTime::from_hms_opt(23, 59, 59)
+                .expect("BR-140 end-of-business-day time is valid")
+        } else {
+            self.observed_at.time()
+        }
+    }
+}
 
 pub fn audit_identity_hash(domain: &str, identity: &str) -> String {
     let mut hasher = Sha256::new();
@@ -67,6 +103,7 @@ fn review_reason_category(task: ReviewTask, outcome: &ReviewTaskOutcome) -> Stri
                 ReviewTask::R05 => "signal_outcome_review_failed",
                 ReviewTask::R06 => "failure_outcome_review_failed",
                 ReviewTask::R08 => "event_calendar_review_failed",
+                ReviewTask::R09 => "provider_top_n_review_failed",
                 ReviewTask::A10 => "catalyst_review_failed",
                 ReviewTask::A01 => "virtual_observation_review_failed",
             }
@@ -83,7 +120,12 @@ fn review_reason_category(task: ReviewTask, outcome: &ReviewTaskOutcome) -> Stri
         ReviewTaskOutcome::Disabled { capability, .. } => {
             format!("capability_disabled_{}", sanitize_reason_code(capability))
         }
-        ReviewTaskOutcome::Failed { reason, .. } => classify_failure(reason).to_string(),
+        ReviewTaskOutcome::Failed {
+            failure: ReviewTaskFailure::ExistingSourceFailure { reason, .. },
+        } => classify_failure(reason).to_string(),
+        ReviewTaskOutcome::Failed {
+            failure: ReviewTaskFailure::AccountDependency(_),
+        } => "account_metrics_incomplete".to_string(),
     }
 }
 
@@ -250,17 +292,6 @@ pub fn append_candidate_rejection_audit(
     append_review_audit(&review_audit_dir(), date, &payloads)
 }
 
-pub fn append_source_protocol_audit(
-    decision: ReviewSourceProtocolDecision,
-    date: chrono::NaiveDate,
-) -> Result<std::path::PathBuf, String> {
-    append_review_audit(
-        &review_audit_dir(),
-        date,
-        &[ReviewAuditPayload::SourceProtocolDecision(decision)],
-    )
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ReviewTask {
     R02,
@@ -269,18 +300,27 @@ pub enum ReviewTask {
     R05,
     R06,
     R08,
+    R09,
     A10,
     A01,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewTaskDependency {
+    SourceOnly,
+    LegacyAccountGate,
+    UnclassifiedConservative,
+}
+
 impl ReviewTask {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::R02,
         Self::R03,
         Self::R04,
         Self::R05,
         Self::R06,
         Self::R08,
+        Self::R09,
         Self::A10,
         Self::A01,
     ];
@@ -293,9 +333,14 @@ impl ReviewTask {
             Self::R05 => "R-05",
             Self::R06 => "R-06",
             Self::R08 => "R-08",
+            Self::R09 => "R-09",
             Self::A10 => "A-10",
             Self::A01 => "A-01",
         }
+    }
+
+    pub fn from_label(label: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|task| task.label() == label)
     }
 
     fn source_label(self) -> &'static str {
@@ -306,13 +351,30 @@ impl ReviewTask {
             Self::R05 => "signal_outcome",
             Self::R06 => "classified_failure_outcome",
             Self::R08 => "announcement_positions_virtual_overnight",
+            Self::R09 => "eastmoney_provider_top_n",
             Self::A10 => "chain_rotation_security_master",
             Self::A01 => "virtual_observation_kline",
         }
     }
+
+    pub fn dependency(self) -> ReviewTaskDependency {
+        match self {
+            Self::R04 | Self::R09 => ReviewTaskDependency::SourceOnly,
+            Self::R03 | Self::R08 => ReviewTaskDependency::LegacyAccountGate,
+            Self::R02 | Self::R05 | Self::R06 | Self::A10 | Self::A01 => {
+                ReviewTaskDependency::UnclassifiedConservative
+            }
+        }
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// One shared identity derivation for BR-140 task scheduling and BR-192's
+/// canonical R-09 binding. Callers must not duplicate this algorithm.
+pub fn review_task_identity(date: chrono::NaiveDate, task: ReviewTask) -> String {
+    audit_identity_hash("review-task", &format!("{}:{}", date, task.label()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ReviewTaskTransition {
     pub observed_at: String,
     pub task: String,
@@ -326,6 +388,85 @@ pub struct ReviewTaskTransition {
     pub next_attempt: Option<String>,
     pub reason_code: String,
     pub identity_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<ReviewTransitionFailure>,
+}
+
+impl<'de> serde::Deserialize<'de> for ReviewTaskTransition {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            observed_at: String,
+            task: String,
+            source: String,
+            source_time: Option<String>,
+            rule_ids: Vec<String>,
+            status: String,
+            success: bool,
+            snapshot_size: usize,
+            retryable: bool,
+            next_attempt: Option<String>,
+            reason_code: String,
+            identity_hash: String,
+            #[serde(default)]
+            failure: Option<ReviewTransitionFailure>,
+        }
+
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let object = value.as_object().ok_or_else(|| {
+            serde::de::Error::custom("review task transition must be a JSON object")
+        })?;
+        if let Some(failure) = object.get("failure") {
+            if !failure.is_object() {
+                return Err(serde::de::Error::custom(
+                    "review task transition failure must be an object when present",
+                ));
+            }
+        }
+        let wire: Wire = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        if wire.status != "failed" && wire.failure.is_some() {
+            return Err(serde::de::Error::custom(
+                "non-failed review task transition must omit failure",
+            ));
+        }
+        Ok(Self {
+            observed_at: wire.observed_at,
+            task: wire.task,
+            source: wire.source,
+            source_time: wire.source_time,
+            rule_ids: wire.rule_ids,
+            status: wire.status,
+            success: wire.success,
+            snapshot_size: wire.snapshot_size,
+            retryable: wire.retryable,
+            next_attempt: wire.next_attempt,
+            reason_code: wire.reason_code,
+            identity_hash: wire.identity_hash,
+            failure: wire.failure,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "failure_class", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ReviewTransitionFailure {
+    ExistingSourceFailure {
+        retryable: bool,
+        reason: String,
+    },
+    AccountDependency {
+        stage: ReviewAccountDependencyStage,
+        reason_code: ReviewAccountFailureReasonCode,
+        retryable: bool,
+        source_provider: Option<String>,
+        source_time: Option<chrono::DateTime<chrono::FixedOffset>>,
+        observed_at: chrono::DateTime<chrono::FixedOffset>,
+        evidence_identity_hash: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -369,6 +510,46 @@ struct ReviewAuditRecord {
     record_hash: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewAccountFailureReasonCode {
+    AccountMetricsIncomplete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewAccountDependencyStage {
+    AcquireBatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewAccountDependencyFailure {
+    pub stage: ReviewAccountDependencyStage,
+    pub reason_code: ReviewAccountFailureReasonCode,
+    pub retryable: bool,
+    pub source_provider: Option<String>,
+    pub source_time: Option<chrono::DateTime<chrono::FixedOffset>>,
+    pub observed_at: chrono::DateTime<chrono::FixedOffset>,
+    pub evidence_identity_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "failure_class", rename_all = "snake_case")]
+pub enum ReviewTaskFailure {
+    ExistingSourceFailure { retryable: bool, reason: String },
+    AccountDependency(ReviewAccountDependencyFailure),
+}
+
+impl ReviewTaskFailure {
+    fn retryable(&self) -> bool {
+        match self {
+            Self::ExistingSourceFailure { retryable, .. } => *retryable,
+            Self::AccountDependency(failure) => failure.retryable,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewTaskOutcome {
     Delivered {
@@ -386,8 +567,7 @@ pub enum ReviewTaskOutcome {
         reason: String,
     },
     Failed {
-        retryable: bool,
-        reason: String,
+        failure: ReviewTaskFailure,
     },
 }
 
@@ -412,8 +592,24 @@ impl ReviewTaskOutcome {
 
     pub fn failed(retryable: bool, reason: impl Into<String>) -> Self {
         Self::Failed {
-            retryable,
-            reason: reason.into(),
+            failure: ReviewTaskFailure::ExistingSourceFailure {
+                retryable,
+                reason: reason.into(),
+            },
+        }
+    }
+
+    pub fn account_metrics_incomplete(observed_at: chrono::DateTime<chrono::FixedOffset>) -> Self {
+        Self::Failed {
+            failure: ReviewTaskFailure::AccountDependency(ReviewAccountDependencyFailure {
+                stage: ReviewAccountDependencyStage::AcquireBatch,
+                reason_code: ReviewAccountFailureReasonCode::AccountMetricsIncomplete,
+                retryable: true,
+                source_provider: None,
+                source_time: None,
+                observed_at,
+                evidence_identity_hash: None,
+            }),
         }
     }
 
@@ -491,6 +687,82 @@ impl ReviewBatchOutcome {
             .filter_map(|(task, outcome)| predicate(outcome).then_some(*task))
             .collect()
     }
+
+    pub fn without_tasks(&self, excluded: &std::collections::BTreeSet<ReviewTask>) -> Self {
+        Self::new(
+            self.tasks
+                .iter()
+                .filter(|(task, _)| !excluded.contains(task))
+                .cloned()
+                .collect(),
+        )
+    }
+}
+
+pub fn merge_review_task_outcomes(
+    preflight: Vec<(ReviewTask, ReviewTaskOutcome)>,
+    source_only: Vec<(ReviewTask, ReviewTaskOutcome)>,
+    account_required: Vec<(ReviewTask, ReviewTaskOutcome)>,
+) -> Result<ReviewBatchOutcome, String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut tasks =
+        Vec::with_capacity(preflight.len() + source_only.len() + account_required.len());
+    for (task, outcome) in preflight
+        .into_iter()
+        .chain(source_only)
+        .chain(account_required)
+    {
+        if !seen.insert(task) {
+            return Err(format!("duplicate review task outcome: {}", task.label()));
+        }
+        tasks.push((task, outcome));
+    }
+    tasks.sort_by_key(|(task, _)| *task);
+    Ok(ReviewBatchOutcome::new(tasks))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewTaskPhases {
+    pub source_only: std::collections::BTreeSet<ReviewTask>,
+    pub account_required: std::collections::BTreeSet<ReviewTask>,
+}
+
+pub fn partition_review_tasks(
+    runnable: &std::collections::BTreeSet<ReviewTask>,
+) -> ReviewTaskPhases {
+    let mut source_only = std::collections::BTreeSet::new();
+    let mut account_required = std::collections::BTreeSet::new();
+    for task in runnable {
+        match task.dependency() {
+            ReviewTaskDependency::SourceOnly => {
+                source_only.insert(*task);
+            }
+            ReviewTaskDependency::LegacyAccountGate
+            | ReviewTaskDependency::UnclassifiedConservative => {
+                account_required.insert(*task);
+            }
+        }
+    }
+    ReviewTaskPhases {
+        source_only,
+        account_required,
+    }
+}
+
+pub fn account_dependency_outcomes(
+    tasks: &std::collections::BTreeSet<ReviewTask>,
+    observed_at: chrono::DateTime<chrono::FixedOffset>,
+) -> Vec<(ReviewTask, ReviewTaskOutcome)> {
+    tasks
+        .iter()
+        .copied()
+        .map(|task| {
+            (
+                task,
+                ReviewTaskOutcome::account_metrics_incomplete(observed_at),
+            )
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -508,6 +780,12 @@ enum TaskScheduleState {
 pub struct ReviewScheduleState {
     date: chrono::NaiveDate,
     tasks: std::collections::BTreeMap<ReviewTask, TaskScheduleState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableHydrationApplication {
+    pub tasks: std::collections::BTreeSet<ReviewTask>,
+    pub transition_identities: std::collections::BTreeSet<String>,
 }
 
 impl ReviewScheduleState {
@@ -528,9 +806,24 @@ impl ReviewScheduleState {
         batch: &ReviewBatchOutcome,
         now: chrono::NaiveDateTime,
     ) -> Vec<ReviewTaskTransition> {
-        if now.date() != self.date {
+        self.apply_for_run(
+            batch,
+            ReviewRunContext {
+                review_date: now.date(),
+                observed_at: now,
+            },
+        )
+    }
+
+    pub fn apply_for_run(
+        &mut self,
+        batch: &ReviewBatchOutcome,
+        context: ReviewRunContext,
+    ) -> Vec<ReviewTaskTransition> {
+        if context.review_date() != self.date {
             return Vec::new();
         }
+        let now = context.observed_at();
         let mut transitions = Vec::with_capacity(batch.tasks.len());
         for (task, outcome) in &batch.tasks {
             let next = match outcome {
@@ -540,12 +833,10 @@ impl ReviewScheduleState {
                 ReviewTaskOutcome::ExpectedWait { retry_at, .. } => {
                     TaskScheduleState::Waiting(*retry_at)
                 }
-                ReviewTaskOutcome::Failed {
-                    retryable: false, ..
-                } => TaskScheduleState::Terminal,
-                ReviewTaskOutcome::Failed {
-                    retryable: true, ..
-                } => {
+                ReviewTaskOutcome::Failed { failure } if !failure.retryable() => {
+                    TaskScheduleState::Terminal
+                }
+                ReviewTaskOutcome::Failed { .. } => {
                     let failures = match self.tasks.get(task) {
                         Some(TaskScheduleState::Retry { failures, .. }) => failures + 1,
                         _ => 1,
@@ -581,39 +872,223 @@ impl ReviewScheduleState {
                 ReviewTaskOutcome::Delivered { count } => *count,
                 _ => 0,
             };
-            let reason_code = review_reason_category(*task, outcome);
-            let reason_detail = match outcome {
-                ReviewTaskOutcome::Delivered { .. } => "sink_confirmed",
-                ReviewTaskOutcome::NoData { reason }
-                | ReviewTaskOutcome::ExpectedWait { reason, .. }
-                | ReviewTaskOutcome::Disabled { reason, .. }
-                | ReviewTaskOutcome::Failed { reason, .. } => reason.as_str(),
+            let (reason_code, source, source_time, transition_failure) = match outcome {
+                ReviewTaskOutcome::Failed {
+                    failure:
+                        ReviewTaskFailure::AccountDependency(ReviewAccountDependencyFailure {
+                            stage,
+                            reason_code,
+                            retryable,
+                            source_provider,
+                            source_time,
+                            observed_at,
+                            evidence_identity_hash,
+                        }),
+                } => (
+                    "account_metrics_incomplete".to_string(),
+                    "account_dependency_unavailable".to_string(),
+                    source_time.as_ref().map(chrono::DateTime::to_rfc3339),
+                    Some(ReviewTransitionFailure::AccountDependency {
+                        stage: *stage,
+                        reason_code: *reason_code,
+                        retryable: *retryable,
+                        source_provider: source_provider.clone(),
+                        source_time: *source_time,
+                        observed_at: *observed_at,
+                        evidence_identity_hash: evidence_identity_hash.clone(),
+                    }),
+                ),
+                _ => {
+                    let reason_category = review_reason_category(*task, outcome);
+                    let reason_detail = match outcome {
+                        ReviewTaskOutcome::Delivered { .. } => "sink_confirmed",
+                        ReviewTaskOutcome::NoData { reason }
+                        | ReviewTaskOutcome::ExpectedWait { reason, .. }
+                        | ReviewTaskOutcome::Disabled { reason, .. } => reason.as_str(),
+                        ReviewTaskOutcome::Failed {
+                            failure: ReviewTaskFailure::ExistingSourceFailure { reason, .. },
+                        } => reason.as_str(),
+                        ReviewTaskOutcome::Failed {
+                            failure: ReviewTaskFailure::AccountDependency(_),
+                        } => unreachable!("account dependency handled above"),
+                    };
+                    let fingerprint = audit_identity_hash("review-reason", reason_detail);
+                    let failure = match outcome {
+                        ReviewTaskOutcome::Failed {
+                            failure: ReviewTaskFailure::ExistingSourceFailure { retryable, reason },
+                        } => Some(ReviewTransitionFailure::ExistingSourceFailure {
+                            retryable: *retryable,
+                            reason: reason.clone(),
+                        }),
+                        _ => None,
+                    };
+                    (
+                        format!("{reason_category}_{}", &fingerprint[..16]),
+                        task.source_label().to_string(),
+                        None,
+                        failure,
+                    )
+                }
             };
-            let reason_fingerprint = audit_identity_hash("review-reason", reason_detail);
-            let reason_code = format!("{reason_code}_{}", &reason_fingerprint[..16]);
             let observed_at = now.format("%Y-%m-%dT%H:%M:%S").to_string();
+            let mut rule_ids = vec!["BR-110".to_string(), "BR-140".to_string()];
+            if *task == ReviewTask::R09 {
+                rule_ids.push("BR-192".to_string());
+            }
+            if matches!(
+                outcome,
+                ReviewTaskOutcome::Failed {
+                    failure: ReviewTaskFailure::AccountDependency(_)
+                }
+            ) {
+                rule_ids.push("BR-194".to_string());
+            }
             transitions.push(ReviewTaskTransition {
                 observed_at: observed_at.clone(),
                 task: task.label().to_string(),
-                source: task.source_label().to_string(),
+                source,
                 // ReviewTaskOutcome currently carries report status, not a
                 // provider publication timestamp. Query/as-of date is encoded
                 // in the task identity; missing provider time stays absent.
-                source_time: None,
-                rule_ids: vec!["BR-110".to_string(), "BR-140".to_string()],
+                source_time,
+                rule_ids,
                 status: outcome.status_label().to_string(),
                 success: matches!(outcome, ReviewTaskOutcome::Delivered { .. }),
                 snapshot_size,
                 retryable,
                 next_attempt,
                 reason_code,
-                identity_hash: audit_identity_hash(
-                    "review-task",
-                    &format!("{}:{}", self.date, task.label()),
-                ),
+                identity_hash: review_task_identity(self.date, *task),
+                failure: transition_failure,
             });
         }
         transitions
+    }
+
+    /// BR-192 applies coordinator-owned, already appended BR-140 transitions
+    /// without creating a second transition. The evidence-returning variant
+    /// identifies the exact current-business-date transitions the caller may
+    /// acknowledge; foreign dates remain pending.
+    #[cfg(test)]
+    pub fn apply_durable_hydrations(
+        &mut self,
+        hydrations: &[stock_analysis::durable_delivery::ScheduleHydration],
+    ) -> Result<std::collections::BTreeSet<ReviewTask>, String> {
+        Ok(self
+            .apply_durable_hydrations_with_evidence(hydrations)?
+            .tasks)
+    }
+
+    pub fn apply_durable_hydrations_with_evidence(
+        &mut self,
+        hydrations: &[stock_analysis::durable_delivery::ScheduleHydration],
+    ) -> Result<DurableHydrationApplication, String> {
+        #[derive(serde::Deserialize)]
+        struct DurableTaskTransition {
+            schema_version: u32,
+            transition_identity: String,
+            task_identity: String,
+            decision_identity: String,
+            task_disposition: String,
+            task_binding_sha256: String,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct DurableTaskBasis {
+            task_identity: String,
+            business_date: String,
+            task: String,
+        }
+
+        let mut applicable = Vec::new();
+        for hydration in hydrations {
+            let transition: DurableTaskTransition =
+                serde_json::from_slice(&hydration.transition_canonical).map_err(|error| {
+                    format!(
+                        "parse durable task transition {}: {error}",
+                        hydration.transition_identity
+                    )
+                })?;
+            if transition.schema_version != 1
+                || transition.transition_identity != hydration.transition_identity
+                || transition.decision_identity != hydration.decision_identity
+                || sha256_bytes(&hydration.transition_canonical) != hydration.transition_sha256
+            {
+                return Err(format!(
+                    "durable task transition {} identity/hash mismatch",
+                    hydration.transition_identity
+                ));
+            }
+            if transition.task_identity != hydration.task_identity
+                || sha256_bytes(&hydration.transition_basis_canonical)
+                    != hydration.transition_basis_sha256
+                || hydration.transition_basis_sha256 != transition.task_binding_sha256
+            {
+                return Err(format!(
+                    "durable task transition {} binding mismatch",
+                    hydration.transition_identity
+                ));
+            }
+
+            let basis: DurableTaskBasis =
+                serde_json::from_slice(&hydration.transition_basis_canonical).map_err(|error| {
+                    format!(
+                        "parse durable task basis {}: {error}",
+                        hydration.transition_identity
+                    )
+                })?;
+            if basis.task_identity != transition.task_identity {
+                return Err(format!(
+                    "durable task transition {} task identity mismatch",
+                    hydration.transition_identity
+                ));
+            }
+            let business_date = chrono::NaiveDate::parse_from_str(&basis.business_date, "%Y-%m-%d")
+                .map_err(|error| {
+                    format!(
+                        "parse durable task transition {} business date: {error}",
+                        hydration.transition_identity
+                    )
+                })?;
+            if business_date != self.date {
+                continue;
+            }
+            let task = ReviewTask::from_label(&basis.task).ok_or_else(|| {
+                format!(
+                    "durable task transition {} has unsupported task {}",
+                    hydration.transition_identity, basis.task
+                )
+            })?;
+            if transition.task_identity != review_task_identity(self.date, task) {
+                return Err(format!(
+                    "durable task transition {} does not match the canonical {} identity",
+                    hydration.transition_identity,
+                    task.label()
+                ));
+            }
+            if !matches!(
+                transition.task_disposition.as_str(),
+                "Accepted" | "Rejected" | "Uncertain" | "ManualRejected"
+            ) {
+                return Err(format!(
+                    "durable task transition {} has unsupported disposition {}",
+                    hydration.transition_identity, transition.task_disposition
+                ));
+            }
+
+            applicable.push((task, hydration.transition_identity.clone()));
+        }
+        let mut tasks = std::collections::BTreeSet::new();
+        let mut transition_identities = std::collections::BTreeSet::new();
+        for (task, transition_identity) in applicable {
+            self.tasks.insert(task, TaskScheduleState::Terminal);
+            tasks.insert(task);
+            transition_identities.insert(transition_identity);
+        }
+        Ok(DurableHydrationApplication {
+            tasks,
+            transition_identities,
+        })
     }
 
     pub fn is_due(&self, task: ReviewTask, now: chrono::NaiveDateTime) -> bool {
@@ -643,6 +1118,10 @@ impl ReviewScheduleState {
     }
 }
 
+fn sha256_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewPreflight {
     pub outcomes: Vec<(ReviewTask, ReviewTaskOutcome)>,
@@ -659,27 +1138,42 @@ impl ReviewPreflight {
 }
 
 pub fn review_preflight(
-    now: chrono::NaiveTime,
+    context: ReviewRunContext,
     due: &std::collections::BTreeSet<ReviewTask>,
+    is_test: bool,
 ) -> ReviewPreflight {
     let mut runnable = due.clone();
     let mut outcomes = Vec::new();
+
+    if is_test {
+        for task in [ReviewTask::R04, ReviewTask::R09] {
+            if runnable.remove(&task) {
+                outcomes.push((
+                    task,
+                    ReviewTaskOutcome::disabled(
+                        "test_environment_external_provider_blocked",
+                        "test_environment_external_provider_blocked; provider_calls=0; sink_calls=0",
+                    ),
+                ));
+            }
+        }
+    }
 
     let disabled = [
         (
             ReviewTask::R02,
             "market_review_contract",
-            "required main_flow/money_effect/position_limit evidence unavailable",
+            "no complete review-date market overview batch (indices, turnover, and full-market breadth)",
         ),
         (
             ReviewTask::R05,
             "signal_outcome",
-            "no complete signal outcome source",
+            "no append-only signal-delivery-execution-settlement outcome source",
         ),
         (
             ReviewTask::R06,
             "classified_failure_outcome",
-            "no classified failure outcome source",
+            "no evidence-bound classified failure outcome source",
         ),
     ];
     for (task, capability, reason) in disabled {
@@ -690,11 +1184,36 @@ pub fn review_preflight(
 
     let lhb_ready = chrono::NaiveTime::from_hms_opt(21, 0, 0)
         .expect("BR-140 LHB publication time must be valid");
-    if now < lhb_ready && runnable.remove(&ReviewTask::R04) {
+    if context.eligibility_time() < lhb_ready && runnable.remove(&ReviewTask::R04) {
         outcomes.push((
             ReviewTask::R04,
             ReviewTaskOutcome::expected_wait(lhb_ready, "LHB source not published before 21:00"),
         ));
+    }
+
+    if runnable.contains(&ReviewTask::R09) {
+        let current_date = context.observed_at().date();
+        let provider_ready = chrono::NaiveTime::from_hms_opt(15, 35, 0)
+            .expect("BR-192 provider publication time must be valid");
+        let outcome = if context.review_date() != current_date
+            || !stock_analysis::calendar::is_trading_day(current_date)
+        {
+            Some(ReviewTaskOutcome::failed(
+                false,
+                "provider_top_n_current_date_only",
+            ))
+        } else if context.eligibility_time() < provider_ready {
+            Some(ReviewTaskOutcome::expected_wait(
+                provider_ready,
+                "Eastmoney provider Top-N is not eligible before 15:35",
+            ))
+        } else {
+            None
+        };
+        if let Some(outcome) = outcome {
+            runnable.remove(&ReviewTask::R09);
+            outcomes.push((ReviewTask::R09, outcome));
+        }
     }
 
     ReviewPreflight { outcomes, runnable }
@@ -706,6 +1225,67 @@ mod tests {
 
     fn day() -> chrono::NaiveDate {
         chrono::NaiveDate::from_ymd_opt(2026, 7, 21).expect("valid test date")
+    }
+
+    fn task_hydration_for_date(
+        task: ReviewTask,
+        state: stock_analysis::durable_delivery::ScheduleHydrationState,
+        business_date: chrono::NaiveDate,
+    ) -> stock_analysis::durable_delivery::ScheduleHydration {
+        let task_label = task.label().replace('-', "");
+        let task_identity = review_task_identity(business_date, task);
+        let decision_identity = format!("TEST_CODE_{task_label}_DECISION");
+        let transition_identity = format!("TEST_CODE_{task_label}_TRANSITION");
+        let transition_basis_canonical = serde_json::to_vec(&serde_json::json!({
+            "task_identity": task_identity.clone(),
+            "business_date": business_date.format("%Y-%m-%d").to_string(),
+            "task": task.label(),
+            "source": task.source_label(),
+            "rule_ids": ["BR-110", "BR-140", "BR-192"],
+            "source_time": null,
+            "snapshot_size": 40,
+            "request_hashes": ["a".repeat(64), "b".repeat(64)],
+            "batch_ids": ["TEST_CODE_BATCH_A", "TEST_CODE_BATCH_B"],
+        }))
+        .unwrap();
+        let transition_basis_sha256 = sha256_bytes(&transition_basis_canonical);
+        let transition_canonical = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "transition_identity": transition_identity.clone(),
+            "task_identity": task_identity.clone(),
+            "decision_identity": decision_identity.clone(),
+            "source_identity": "TEST_CODE_SOURCE",
+            "task_disposition": "Accepted",
+            "task_binding_sha256": transition_basis_sha256,
+            "generic_disposition_identity": "TEST_CODE_DISPOSITION",
+            "generic_disposition_sha256": "c".repeat(64),
+        }))
+        .unwrap();
+        let transition_sha256 = sha256_bytes(&transition_canonical);
+        stock_analysis::durable_delivery::ScheduleHydration {
+            decision_identity,
+            task_identity,
+            transition_identity,
+            transition_canonical,
+            transition_sha256,
+            transition_basis_canonical,
+            transition_basis_sha256,
+            immutable_audit_ref: "TEST_CODE_AUDIT_REF".to_string(),
+            hydration_state: state,
+        }
+    }
+
+    fn task_hydration(
+        task: ReviewTask,
+        state: stock_analysis::durable_delivery::ScheduleHydrationState,
+    ) -> stock_analysis::durable_delivery::ScheduleHydration {
+        task_hydration_for_date(task, state, day())
+    }
+
+    fn r09_hydration(
+        state: stock_analysis::durable_delivery::ScheduleHydrationState,
+    ) -> stock_analysis::durable_delivery::ScheduleHydration {
+        task_hydration(ReviewTask::R09, state)
     }
 
     #[test]
@@ -783,8 +1363,10 @@ mod tests {
         assert!(matches!(
             ReviewTaskOutcome::from_push_outcome(crate::notify::PushOutcome::Deduped, 2),
             ReviewTaskOutcome::Failed {
-                retryable: false,
-                ..
+                failure: ReviewTaskFailure::ExistingSourceFailure {
+                    retryable: false,
+                    ..
+                },
             }
         ));
         assert!(matches!(
@@ -793,8 +1375,10 @@ mod tests {
                 2
             ),
             ReviewTaskOutcome::Failed {
-                retryable: false,
-                ..
+                failure: ReviewTaskFailure::ExistingSourceFailure {
+                    retryable: false,
+                    ..
+                },
             }
         ));
         assert!(matches!(
@@ -803,8 +1387,10 @@ mod tests {
                 2
             ),
             ReviewTaskOutcome::Failed {
-                retryable: true,
-                ..
+                failure: ReviewTaskFailure::ExistingSourceFailure {
+                    retryable: true,
+                    ..
+                },
             }
         ));
     }
@@ -844,6 +1430,33 @@ mod tests {
         assert!(!r08.success);
         assert_eq!(r08.source_time, None);
         assert!(r08.reason_code.starts_with("source_transport_failed_"));
+    }
+
+    #[test]
+    fn br140_manual_review_audit_keeps_business_date_and_real_observation_time_separate() {
+        let observed_at = chrono::NaiveDate::from_ymd_opt(2026, 7, 25)
+            .expect("valid Saturday")
+            .and_hms_opt(2, 42, 50)
+            .expect("valid observation time");
+        let context = ReviewRunContext::at(observed_at);
+        let mut state = ReviewScheduleState::for_date(
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 24).expect("known completed Friday"),
+        );
+
+        let transitions = state.apply_for_run(
+            &ReviewBatchOutcome::new(vec![(
+                ReviewTask::A01,
+                ReviewTaskOutcome::no_data("complete source empty"),
+            )]),
+            context,
+        );
+
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(transitions[0].observed_at, "2026-07-25T02:42:50");
+        assert_eq!(
+            transitions[0].identity_hash,
+            audit_identity_hash("review-task", "2026-07-24:A-01")
+        );
     }
 
     #[test]
@@ -1008,15 +1621,19 @@ mod tests {
     fn br140_review_preflight_disables_missing_capabilities_and_waits_for_lhb() {
         let due = ReviewScheduleState::for_date(day()).due_tasks(at_datetime(19, 0));
         let preflight = review_preflight(
-            chrono::NaiveTime::from_hms_opt(19, 0, 0).expect("valid test time"),
+            ReviewRunContext {
+                review_date: day(),
+                observed_at: at_datetime(19, 0),
+            },
             &due,
+            false,
         );
 
         assert_eq!(
             preflight.outcome_for(ReviewTask::R02),
             Some(&ReviewTaskOutcome::disabled(
                 "market_review_contract",
-                "required main_flow/money_effect/position_limit evidence unavailable",
+                "no complete review-date market overview batch (indices, turnover, and full-market breadth)",
             ))
         );
         assert!(matches!(
@@ -1024,16 +1641,488 @@ mod tests {
             Some(ReviewTaskOutcome::ExpectedWait { retry_at, .. })
                 if *retry_at == chrono::NaiveTime::from_hms_opt(21, 0, 0).expect("valid wait time")
         ));
-        assert!(matches!(
+        assert_eq!(
             preflight.outcome_for(ReviewTask::R05),
-            Some(ReviewTaskOutcome::Disabled { .. })
-        ));
-        assert!(matches!(
+            Some(&ReviewTaskOutcome::disabled(
+                "signal_outcome",
+                "no append-only signal-delivery-execution-settlement outcome source",
+            ))
+        );
+        assert_eq!(
             preflight.outcome_for(ReviewTask::R06),
-            Some(ReviewTaskOutcome::Disabled { .. })
-        ));
+            Some(&ReviewTaskOutcome::disabled(
+                "classified_failure_outcome",
+                "no evidence-bound classified failure outcome source",
+            ))
+        );
         assert!(!preflight.runnable.contains(&ReviewTask::R02));
         assert!(!preflight.runnable.contains(&ReviewTask::R04));
+        assert!(preflight.runnable.contains(&ReviewTask::R09));
         assert!(preflight.runnable.contains(&ReviewTask::A01));
+    }
+
+    #[test]
+    fn br194_review_task_dependency_mapping() {
+        assert_eq!(
+            ReviewTask::R04.dependency(),
+            ReviewTaskDependency::SourceOnly
+        );
+        assert_eq!(
+            ReviewTask::R09.dependency(),
+            ReviewTaskDependency::SourceOnly
+        );
+        assert_eq!(
+            ReviewTask::R03.dependency(),
+            ReviewTaskDependency::LegacyAccountGate
+        );
+        assert_eq!(
+            ReviewTask::R08.dependency(),
+            ReviewTaskDependency::LegacyAccountGate
+        );
+        for task in [
+            ReviewTask::R02,
+            ReviewTask::R05,
+            ReviewTask::R06,
+            ReviewTask::A10,
+            ReviewTask::A01,
+        ] {
+            assert_eq!(
+                task.dependency(),
+                ReviewTaskDependency::UnclassifiedConservative
+            );
+        }
+    }
+
+    #[test]
+    fn br194_account_tasks_are_frozen_without_real_batch_watermark() {
+        let observed_at =
+            chrono::DateTime::parse_from_rfc3339("2026-07-21T19:00:00+08:00").unwrap();
+        let outcome = ReviewTaskOutcome::account_metrics_incomplete(observed_at);
+
+        assert_eq!(
+            outcome,
+            ReviewTaskOutcome::Failed {
+                failure: ReviewTaskFailure::AccountDependency(ReviewAccountDependencyFailure {
+                    stage: ReviewAccountDependencyStage::AcquireBatch,
+                    reason_code: ReviewAccountFailureReasonCode::AccountMetricsIncomplete,
+                    retryable: true,
+                    source_provider: None,
+                    source_time: None,
+                    observed_at,
+                    evidence_identity_hash: None,
+                })
+            }
+        );
+    }
+
+    #[test]
+    fn br194_account_failure_serializes_exact_transition_audit() {
+        let observed_at =
+            chrono::DateTime::parse_from_rfc3339("2026-07-21T19:00:00+08:00").unwrap();
+        let mut state = ReviewScheduleState::for_date(day());
+        let transition = state
+            .apply(
+                &ReviewBatchOutcome::new(vec![(
+                    ReviewTask::R03,
+                    ReviewTaskOutcome::account_metrics_incomplete(observed_at),
+                )]),
+                at_datetime(19, 0),
+            )
+            .pop()
+            .unwrap();
+        let value = serde_json::to_value(&transition).unwrap();
+
+        assert_eq!(transition.source, "account_dependency_unavailable");
+        assert!(transition.rule_ids.contains(&"BR-194".to_string()));
+        assert_eq!(transition.reason_code, "account_metrics_incomplete");
+        assert!(transition.retryable);
+        assert_eq!(transition.source_time, None);
+        assert_eq!(
+            value.get("failure"),
+            Some(&serde_json::json!({
+                "failure_class": "account_dependency",
+                "stage": "acquire_batch",
+                "reason_code": "account_metrics_incomplete",
+                "retryable": true,
+                "source_provider": null,
+                "source_time": null,
+                "observed_at": "2026-07-21T19:00:00+08:00",
+                "evidence_identity_hash": null
+            }))
+        );
+    }
+
+    #[test]
+    fn br194_legacy_transition_fixture_remains_byte_identical_and_hash_valid() {
+        let legacy = br#"{"payload":{"event_type":"task_transition","observed_at":"2026-07-21T19:00:00","task":"R-03","source":"portfolio_industry_kline","source_time":null,"rule_ids":["BR-110","BR-140"],"status":"failed","success":false,"snapshot_size":0,"retryable":true,"next_attempt":"2026-07-21T19:01:00","reason_code":"industry_evidence_unavailable_0123456789abcdef","identity_hash":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","record_hash":"a7fb48219edf03c54020b216f4508e28dedded154ee0453a0121f3cd7b12c4a8"}"#;
+        let parsed: ReviewAuditRecord = serde_json::from_slice(legacy).unwrap();
+
+        let ReviewAuditPayload::TaskTransition(transition) = &parsed.payload else {
+            panic!("legacy fixture must remain a task transition");
+        };
+        assert_eq!(transition.failure, None);
+        assert_eq!(
+            review_audit_hash(&parsed.prev_hash, &parsed.payload).unwrap(),
+            parsed.record_hash
+        );
+        assert_eq!(serde_json::to_vec(&parsed).unwrap(), legacy);
+    }
+
+    #[test]
+    fn br194_account_failure_full_record_fixture_is_fixed_and_hash_valid() {
+        let fixture = br#"{"payload":{"event_type":"task_transition","observed_at":"2026-07-21T19:00:00","task":"R-03","source":"account_dependency_unavailable","source_time":null,"rule_ids":["BR-110","BR-140","BR-194"],"status":"failed","success":false,"snapshot_size":0,"retryable":true,"next_attempt":"2026-07-21T19:01:00","reason_code":"account_metrics_incomplete","identity_hash":"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789","failure":{"failure_class":"account_dependency","stage":"acquire_batch","reason_code":"account_metrics_incomplete","retryable":true,"source_provider":null,"source_time":null,"observed_at":"2026-07-21T19:00:00+08:00","evidence_identity_hash":null}},"prev_hash":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","record_hash":"d2a8c7cda75c86c85fe3745bd14c8479ba3b8a621d494b8c9d17b69ab76c138b"}"#;
+        let parsed: ReviewAuditRecord = serde_json::from_slice(fixture).unwrap();
+
+        assert_eq!(
+            review_audit_hash(&parsed.prev_hash, &parsed.payload).unwrap(),
+            parsed.record_hash
+        );
+        assert_eq!(serde_json::to_vec(&parsed).unwrap(), fixture);
+    }
+
+    #[test]
+    fn br194_transition_failure_wire_rejects_null_array_unknown_and_nonfailed_payloads() {
+        let prefix = r#"{"observed_at":"2026-07-21T19:00:00","task":"R-03","source":"account_dependency_unavailable","source_time":null,"rule_ids":["BR-194"],"status":"failed","success":false,"snapshot_size":0,"retryable":true,"next_attempt":"2026-07-21T19:01:00","reason_code":"account_metrics_incomplete","identity_hash":"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789""#;
+        for suffix in [
+            r#","failure":null}"#,
+            r#","failure":[]}"#,
+            r#","failure":{"failure_class":"TEST_CODE_unknown"}}"#,
+            r#","TEST_CODE_unknown_field":true}"#,
+        ] {
+            let wire = format!("{prefix}{suffix}");
+            assert!(
+                serde_json::from_str::<ReviewTaskTransition>(&wire).is_err(),
+                "invalid fixed wire must fail closed: {suffix}"
+            );
+        }
+
+        let nonfailed = format!(
+            "{}{}",
+            prefix.replace(r#""status":"failed""#, r#""status":"no_data""#),
+            r#","failure":{"failure_class":"existing_source_failure","retryable":false,"reason":"TEST_CODE_REASON"}}"#
+        );
+        assert!(serde_json::from_str::<ReviewTaskTransition>(&nonfailed).is_err());
+    }
+
+    #[test]
+    fn br194_preflight_precedes_dependency_acquisition() {
+        let due = ReviewTask::ALL.into_iter().collect();
+        let context = ReviewRunContext {
+            review_date: day(),
+            observed_at: at_datetime(15, 0),
+        };
+        let preflight = review_preflight(context, &due, true);
+
+        assert_eq!(
+            preflight
+                .outcomes
+                .iter()
+                .map(|(task, _)| *task)
+                .collect::<Vec<_>>(),
+            vec![
+                ReviewTask::R04,
+                ReviewTask::R09,
+                ReviewTask::R02,
+                ReviewTask::R05,
+                ReviewTask::R06,
+            ],
+            "test/live isolation must run before static capability disabling"
+        );
+        for task in [ReviewTask::R04, ReviewTask::R09] {
+            assert_eq!(
+                preflight.outcome_for(task),
+                Some(&ReviewTaskOutcome::disabled(
+                    "test_environment_external_provider_blocked",
+                    "test_environment_external_provider_blocked; provider_calls=0; sink_calls=0",
+                ))
+            );
+            assert!(!preflight.runnable.contains(&task));
+        }
+        for task in [ReviewTask::R02, ReviewTask::R05, ReviewTask::R06] {
+            assert!(matches!(
+                preflight.outcome_for(task),
+                Some(ReviewTaskOutcome::Disabled { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn br194_time_boundaries_1535_and_2100() {
+        let r09 = std::collections::BTreeSet::from([ReviewTask::R09]);
+        let r04 = std::collections::BTreeSet::from([ReviewTask::R04]);
+        let context = |hour, minute, second| ReviewRunContext {
+            review_date: day(),
+            observed_at: day()
+                .and_hms_opt(hour, minute, second)
+                .expect("valid TEST_CODE review time"),
+        };
+
+        assert!(matches!(
+            review_preflight(context(15, 34, 59), &r09, false).outcome_for(ReviewTask::R09),
+            Some(ReviewTaskOutcome::ExpectedWait { .. })
+        ));
+        assert!(review_preflight(context(15, 35, 0), &r09, false)
+            .runnable
+            .contains(&ReviewTask::R09));
+        assert!(matches!(
+            review_preflight(context(20, 59, 59), &r04, false).outcome_for(ReviewTask::R04),
+            Some(ReviewTaskOutcome::ExpectedWait { .. })
+        ));
+        assert!(review_preflight(context(21, 0, 0), &r04, false)
+            .runnable
+            .contains(&ReviewTask::R04));
+    }
+
+    #[test]
+    fn br194_review_batch_merge_rejects_duplicate_task() {
+        let duplicate = merge_review_task_outcomes(
+            vec![(
+                ReviewTask::R04,
+                ReviewTaskOutcome::no_data("complete provider empty"),
+            )],
+            vec![(ReviewTask::R04, ReviewTaskOutcome::delivered(5))],
+            Vec::new(),
+        )
+        .unwrap_err();
+        assert_eq!(duplicate, "duplicate review task outcome: R-04");
+
+        let merged = merge_review_task_outcomes(
+            vec![(
+                ReviewTask::R02,
+                ReviewTaskOutcome::disabled("missing", "missing"),
+            )],
+            vec![(ReviewTask::R09, ReviewTaskOutcome::delivered(40))],
+            vec![(
+                ReviewTask::R03,
+                ReviewTaskOutcome::account_metrics_incomplete(
+                    chrono::DateTime::parse_from_rfc3339("2026-07-21T19:00:00+08:00").unwrap(),
+                ),
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            merged
+                .tasks
+                .iter()
+                .map(|(task, _)| *task)
+                .collect::<Vec<_>>(),
+            vec![ReviewTask::R02, ReviewTask::R03, ReviewTask::R09]
+        );
+    }
+
+    #[test]
+    fn br194_source_only_runs_before_frozen_account_tasks() {
+        let phases = partition_review_tasks(&std::collections::BTreeSet::from([
+            ReviewTask::R03,
+            ReviewTask::R04,
+            ReviewTask::R08,
+            ReviewTask::R09,
+            ReviewTask::A01,
+        ]));
+        assert_eq!(
+            phases.source_only,
+            std::collections::BTreeSet::from([ReviewTask::R04, ReviewTask::R09])
+        );
+        assert_eq!(
+            phases.account_required,
+            std::collections::BTreeSet::from([ReviewTask::R03, ReviewTask::R08, ReviewTask::A01])
+        );
+
+        let delivered = (ReviewTask::R09, ReviewTaskOutcome::delivered(40));
+        let observed_at =
+            chrono::DateTime::parse_from_rfc3339("2026-07-21T19:00:00+08:00").unwrap();
+        let merged = merge_review_task_outcomes(
+            Vec::new(),
+            vec![delivered],
+            account_dependency_outcomes(&phases.account_required, observed_at),
+        )
+        .unwrap();
+        assert!(matches!(
+            merged
+                .tasks
+                .iter()
+                .find(|(task, _)| *task == ReviewTask::R09),
+            Some((_, ReviewTaskOutcome::Delivered { count: 40 }))
+        ));
+    }
+
+    #[test]
+    fn br192_r09_catalog_identity_and_audit_source_are_stable() {
+        assert!(ReviewTask::ALL.contains(&ReviewTask::R09));
+        assert_eq!(ReviewTask::ALL.len(), 9);
+        assert_eq!(ReviewTask::R09.label(), "R-09");
+        assert_eq!(ReviewTask::R09.source_label(), "eastmoney_provider_top_n");
+        assert_eq!(
+            review_task_identity(day(), ReviewTask::R09),
+            audit_identity_hash("review-task", "2026-07-21:R-09")
+        );
+
+        let mut state = ReviewScheduleState::for_date(day());
+        let transitions = state.apply(
+            &ReviewBatchOutcome::new(vec![(
+                ReviewTask::R09,
+                ReviewTaskOutcome::disabled("durable_delivery_producer", "disabled=no_producer"),
+            )]),
+            at_datetime(19, 0),
+        );
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(transitions[0].task, "R-09");
+        assert_eq!(transitions[0].source, "eastmoney_provider_top_n");
+        assert!(transitions[0].rule_ids.contains(&"BR-192".to_string()));
+        assert_eq!(
+            transitions[0].identity_hash,
+            review_task_identity(day(), ReviewTask::R09)
+        );
+    }
+
+    #[test]
+    fn br192_durable_r09_hydration_is_terminal_without_a_second_transition() {
+        let mut state = ReviewScheduleState::for_date(day());
+        let applied = state
+            .apply_durable_hydrations(&[r09_hydration(
+                stock_analysis::durable_delivery::ScheduleHydrationState::Pending,
+            )])
+            .unwrap();
+        let batch = ReviewBatchOutcome::new(vec![
+            (ReviewTask::R09, ReviewTaskOutcome::delivered(40)),
+            (
+                ReviewTask::A01,
+                ReviewTaskOutcome::no_data("complete empty"),
+            ),
+        ]);
+        let legacy = batch.without_tasks(&applied);
+        let transitions = state.apply(&legacy, at_datetime(19, 0));
+
+        assert_eq!(applied, std::collections::BTreeSet::from([ReviewTask::R09]));
+        assert!(!state.is_due(ReviewTask::R09, at_datetime(19, 1)));
+        assert_eq!(transitions.len(), 1);
+        assert_eq!(transitions[0].task, "A-01");
+    }
+
+    #[test]
+    fn br192_applied_hydration_reconstructs_terminal_r09_after_restart() {
+        let mut restarted = ReviewScheduleState::for_date(day());
+        let applied = restarted
+            .apply_durable_hydrations(&[r09_hydration(
+                stock_analysis::durable_delivery::ScheduleHydrationState::Applied,
+            )])
+            .unwrap();
+
+        assert!(applied.contains(&ReviewTask::R09));
+        assert!(!restarted.is_due(ReviewTask::R09, at_datetime(23, 0)));
+    }
+
+    #[test]
+    fn br192_durable_hydration_maps_all_registered_review_task_labels() {
+        let mut state = ReviewScheduleState::for_date(day());
+        let hydrations = ReviewTask::ALL
+            .into_iter()
+            .map(|task| {
+                task_hydration(
+                    task,
+                    stock_analysis::durable_delivery::ScheduleHydrationState::Pending,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let applied = state.apply_durable_hydrations(&hydrations).unwrap();
+
+        assert_eq!(
+            applied,
+            ReviewTask::ALL
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        for task in ReviewTask::ALL {
+            assert!(!state.is_due(task, at_datetime(23, 0)));
+        }
+    }
+
+    #[test]
+    fn br192_hydration_application_returns_only_current_date_transition_identities() {
+        let current =
+            r09_hydration(stock_analysis::durable_delivery::ScheduleHydrationState::Pending);
+        let foreign = task_hydration_for_date(
+            ReviewTask::A01,
+            stock_analysis::durable_delivery::ScheduleHydrationState::Pending,
+            day().succ_opt().unwrap(),
+        );
+        let mut state = ReviewScheduleState::for_date(day());
+
+        let application = state
+            .apply_durable_hydrations_with_evidence(&[current.clone(), foreign.clone()])
+            .expect("apply current business date only");
+
+        assert_eq!(
+            application.tasks,
+            std::collections::BTreeSet::from([ReviewTask::R09])
+        );
+        assert_eq!(
+            application.transition_identities,
+            std::collections::BTreeSet::from([current.transition_identity])
+        );
+        assert!(!application
+            .transition_identities
+            .contains(&foreign.transition_identity));
+    }
+
+    #[test]
+    fn br192_r09_preflight_waits_until_1535_without_making_it_runnable() {
+        let due = std::collections::BTreeSet::from([ReviewTask::R09]);
+        let context = ReviewRunContext {
+            review_date: day(),
+            observed_at: at_datetime(15, 34),
+        };
+
+        let preflight = review_preflight(context, &due, false);
+
+        assert!(!preflight.runnable.contains(&ReviewTask::R09));
+        assert!(matches!(
+            preflight.outcome_for(ReviewTask::R09),
+            Some(ReviewTaskOutcome::ExpectedWait { retry_at, .. })
+                if *retry_at == chrono::NaiveTime::from_hms_opt(15, 35, 0).unwrap()
+        ));
+    }
+
+    #[test]
+    fn br192_r09_historical_or_weekend_run_fails_nonretryable_before_provider() {
+        let due = std::collections::BTreeSet::from([ReviewTask::R09]);
+        let saturday = chrono::NaiveDate::from_ymd_opt(2026, 7, 25)
+            .unwrap()
+            .and_hms_opt(19, 0, 0)
+            .unwrap();
+        let context = ReviewRunContext::at(saturday);
+
+        let preflight = review_preflight(context, &due, false);
+
+        assert!(!preflight.runnable.contains(&ReviewTask::R09));
+        assert!(matches!(
+            preflight.outcome_for(ReviewTask::R09),
+            Some(ReviewTaskOutcome::Failed {
+                failure: ReviewTaskFailure::ExistingSourceFailure {
+                    retryable: false,
+                    reason,
+                },
+            }) if reason == "provider_top_n_current_date_only"
+        ));
+    }
+
+    #[test]
+    fn br192_r09_test_mode_is_disabled_before_provider_eligibility() {
+        let due = std::collections::BTreeSet::from([ReviewTask::R09]);
+        let context = ReviewRunContext {
+            review_date: day(),
+            observed_at: at_datetime(19, 0),
+        };
+
+        let preflight = review_preflight(context, &due, true);
+
+        assert!(!preflight.runnable.contains(&ReviewTask::R09));
+        assert!(matches!(
+            preflight.outcome_for(ReviewTask::R09),
+            Some(ReviewTaskOutcome::Disabled { capability, reason })
+                if capability == "test_environment_external_provider_blocked"
+                    && reason.contains("provider_calls=0")
+        ));
     }
 }

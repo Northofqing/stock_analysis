@@ -1,4 +1,4 @@
-//! Registered business rules: BR-005, BR-048, BR-137.
+//! Registered business rules: BR-005, BR-048, BR-137, BR-192.
 //! v14_adapter.rs — v14.2 七层架构与 v13 推送链路的桥接层 (b011 修复版)
 //!
 //! 严格按 `docs/architecture/v14.2-push-architecture.md` v14.2 §3.4 + b-009 R-4 落地.
@@ -27,7 +27,7 @@
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use chrono::{Local, Timelike};
+use chrono::{Local, NaiveDate, TimeZone, Timelike};
 use stock_analysis::push_l1::{
     NewsCatalystPayload, Severity, SignalEvent, SignalPayload, SignalSource,
 };
@@ -267,14 +267,15 @@ impl SourceFactEvidence {
 /// 投递前闸门: L4 dedup + L5 governance (b011 P0-2)
 ///
 /// `code`: 票级冷却键; None 时 PerTicket 类 kind 的冷却归模板层 memo, L4 不拦.
-/// `sub_kind`: v17.6 §5.1 — DailyReport 子段 (FactorIC/SectorTier/CapitalVerify) 推送时
-/// 传入 Some("FactorIC") 让 dedup key 加上第三元组, 实现 per-sub_kind 隔离.
-/// None 时 sub_kind="" (向后兼容, 不破坏现有 caller).
+/// `sub_kind`: stable delivery subtype metadata used by prepared generic
+/// internals. Counted DailyReport variants do not enter through this public
+/// kind-only gate; BR-192 requires `v14_gate_counted_binding`.
 pub fn v14_gate(kind: PushKind, code: Option<&str>) -> V14Gate {
     v14_gate_with_sub_kind(kind, code, None, None)
 }
 
-/// v17.6 §5.1: v14_gate 的 sub_kind-aware 版本. daily_report_router 三个公开函数调用.
+/// Internal sub-kind-aware gate shared by the generic `v14_gate` adapter.
+/// Counted delivery must use `v14_gate_counted_binding` with immutable evidence.
 pub fn v14_gate_with_sub_kind(
     kind: PushKind,
     code: Option<&str>,
@@ -283,41 +284,154 @@ pub fn v14_gate_with_sub_kind(
 ) -> V14Gate {
     let event = signal_event_for_kind(kind, code);
     let profile = default_profile_for_kind(kind);
-    v14_gate_prepared(
+    v14_gate_prepared(V14PreparedGate {
         kind,
-        code.is_some(),
+        has_governance_identity: code.is_some(),
         sub_kind,
         cooldown_override_secs,
         event,
         profile,
-        false,
-    )
+        context_source: GovernanceContextSource::CombinedAccount,
+    })
+}
+
+/// BR-192 sole L5 gate for a counted delivery with explicit immutable source
+/// binding. The governance event is stable for the caller-supplied schedule
+/// occurrence and is never reused as durable evidence.
+pub fn v14_gate_counted_binding(
+    kind: PushKind,
+    code: Option<&str>,
+    sub_kind: Option<&str>,
+    schedule_occurrence_identity: &str,
+    business_date: NaiveDate,
+) -> V14Gate {
+    if !crate::durable_delivery_runtime::is_counted_kind(kind) {
+        return V14Gate::Denied("counted_binding_kind_required".to_owned());
+    }
+    if schedule_occurrence_identity.trim().is_empty() {
+        return V14Gate::Denied("counted_schedule_occurrence_required".to_owned());
+    }
+    let Some(naive_timestamp) = business_date.and_hms_opt(12, 0, 0) else {
+        return V14Gate::Denied("counted_business_date_invalid".to_owned());
+    };
+    let Some(timestamp) = Local.from_local_datetime(&naive_timestamp).single() else {
+        return V14Gate::Denied("counted_business_date_local_time_invalid".to_owned());
+    };
+    let (source, kind_str, severity) = map_push_kind(kind);
+    let mut event = SignalEvent::new(
+        source,
+        kind_str,
+        code.map(str::to_owned),
+        timestamp,
+        signal_payload_for_kind(kind),
+        severity,
+    );
+    event.event_id =
+        stock_analysis::push_l1::make_source_fact_event_id(kind_str, schedule_occurrence_identity);
+    let profile = default_profile_for_kind(kind);
+    v14_gate_prepared(V14PreparedGate {
+        kind,
+        has_governance_identity: code.is_some(),
+        sub_kind,
+        cooldown_override_secs: None,
+        event,
+        profile,
+        context_source: GovernanceContextSource::CombinedAccount,
+    })
+}
+
+/// BR-194 narrow L5 gate for the canonical R-04 provider binding.
+pub fn v14_gate_counted_source_only_binding(
+    kind: PushKind,
+    binding: &crate::durable_delivery_runtime::CountedDeliveryBinding,
+) -> V14Gate {
+    if kind != PushKind::ReviewLhb {
+        return V14Gate::Denied("counted_source_only_kind_not_allowed".to_owned());
+    }
+    if let Err(reason) = binding.validate_r04_source_only() {
+        return V14Gate::Denied(reason.to_owned());
+    }
+    let Some(naive_timestamp) = binding.business_date().and_hms_opt(12, 0, 0) else {
+        return V14Gate::Denied("counted_source_only_binding_invalid".to_owned());
+    };
+    let Some(timestamp) = Local.from_local_datetime(&naive_timestamp).single() else {
+        return V14Gate::Denied("counted_source_only_binding_invalid".to_owned());
+    };
+    let (source, kind_str, severity) = map_push_kind(kind);
+    let mut event = SignalEvent::new(
+        source,
+        kind_str,
+        binding.governance_code().map(str::to_owned),
+        timestamp,
+        signal_payload_for_kind(kind),
+        severity,
+    );
+    event.event_id = stock_analysis::push_l1::make_source_fact_event_id(
+        kind_str,
+        binding.schedule_occurrence_identity(),
+    );
+    v14_gate_prepared(V14PreparedGate {
+        kind,
+        has_governance_identity: binding.governance_code().is_some(),
+        sub_kind: None,
+        cooldown_override_secs: None,
+        event,
+        profile: counted_source_only_profile(kind),
+        context_source: GovernanceContextSource::CountedSourceOnly,
+    })
 }
 
 /// BR-137 narrow gate for validated source facts. Generic callers cannot
 /// supply a relaxed profile or a prepared SignalEvent.
 pub fn v14_gate_source_fact(evidence: &SourceFactEvidence) -> V14Gate {
     let event = signal_event_for_source_fact(evidence);
-    v14_gate_prepared(
-        evidence.kind,
-        true,
-        None,
-        None,
+    v14_gate_prepared(V14PreparedGate {
+        kind: evidence.kind,
+        has_governance_identity: true,
+        sub_kind: None,
+        cooldown_override_secs: None,
         event,
-        source_fact_profile(evidence.kind),
-        true,
-    )
+        profile: source_fact_profile(evidence.kind),
+        context_source: GovernanceContextSource::SourceFact,
+    })
 }
 
-fn v14_gate_prepared(
+#[derive(Clone, Copy)]
+enum GovernanceContextSource {
+    CombinedAccount,
+    SourceFact,
+    CountedSourceOnly,
+}
+
+struct V14PreparedGate<'a> {
     kind: PushKind,
     has_governance_identity: bool,
-    sub_kind: Option<&str>,
+    sub_kind: Option<&'a str>,
     cooldown_override_secs: Option<u32>,
     event: SignalEvent,
     profile: TemplateMetadata,
-    source_fact_context: bool,
-) -> V14Gate {
+    context_source: GovernanceContextSource,
+}
+
+fn v14_gate_prepared(request: V14PreparedGate<'_>) -> V14Gate {
+    let V14PreparedGate {
+        kind,
+        has_governance_identity,
+        sub_kind,
+        cooldown_override_secs,
+        event,
+        profile,
+        context_source,
+    } = request;
+    let source_fact_context = matches!(context_source, GovernanceContextSource::SourceFact);
+    if crate::durable_delivery_runtime::is_counted_kind(kind)
+        && !matches!(
+            context_source,
+            GovernanceContextSource::CombinedAccount | GovernanceContextSource::CountedSourceOnly
+        )
+    {
+        return V14Gate::Denied("counted_binding_required".to_owned());
+    }
     let stack = match v14_stack() {
         Ok(stack) => stack,
         Err(error) => {
@@ -332,10 +446,10 @@ fn v14_gate_prepared(
     // b013 review P1-11: Deduped 也写 L7 (sink="deduped", pushed=false), 让归因分析看得到被治理掉的数量.
 
     // L5 governance 先判 (data_mode/frozen/quiet_hour/daily_limit)
-    let mut ctx = match if source_fact_context {
-        current_source_fact_governance_ctx()
-    } else {
-        current_governance_ctx()
+    let mut ctx = match match context_source {
+        GovernanceContextSource::CombinedAccount => current_governance_ctx(),
+        GovernanceContextSource::SourceFact => current_source_fact_governance_ctx(),
+        GovernanceContextSource::CountedSourceOnly => current_counted_source_only_governance_ctx(),
     } {
         Ok(ctx) => ctx,
         Err(error) => {
@@ -406,6 +520,13 @@ fn v14_gate_prepared(
             return V14Gate::Denied("analytics_audit_unavailable".to_string());
         }
         return V14Gate::Denied(reason);
+    }
+
+    // BR-192: counted delivery retains L5 governance but has exactly one
+    // reservation/dedup/cooldown owner.  The durable coordinator performs the
+    // authoritative admission transaction after this non-delivery gate.
+    if crate::durable_delivery_runtime::is_counted_kind(kind) {
+        return V14Gate::Approved(Box::new(event));
     }
 
     // L4 dedup (v15.1 A3: 用 reserve() 只检查不插入, 投递成功后由 push_governor_inner 调 commit())
@@ -490,6 +611,11 @@ pub fn commit_dedup_for_event(
     sub_kind: Option<&str>,
     cooldown_override_secs: Option<u32>,
 ) -> Result<(), String> {
+    if crate::durable_delivery_runtime::is_counted_kind(kind) {
+        return Err(format!(
+            "BR-192 counted PushKind::{kind:?} cannot use legacy dedup commit"
+        ));
+    }
     let stack = v14_stack()?;
     let source_fact = is_source_fact_signal(kind, event);
     let cooldown = dedup_cooldown(
@@ -514,6 +640,11 @@ pub fn rollback_dedup_for_event(
     sub_kind: Option<&str>,
     cooldown_override_secs: Option<u32>,
 ) -> Result<(), String> {
+    if crate::durable_delivery_runtime::is_counted_kind(kind) {
+        return Err(format!(
+            "BR-192 counted PushKind::{kind:?} cannot use legacy dedup rollback"
+        ));
+    }
     let stack = v14_stack()?;
     let source_fact = is_source_fact_signal(kind, event);
     let cooldown = dedup_cooldown(
@@ -688,6 +819,7 @@ fn map_push_kind(kind: PushKind) -> (SignalSource, &'static str, Severity) {
         PushKind::CloseCall => (HoldingHealth, "close_call", Severity::High),
         PushKind::ReviewMarket => (HoldingHealth, "review_market", Severity::Normal),
         PushKind::ReviewLhb => (HoldingHealth, "review_lhb", Severity::Normal),
+        PushKind::ReviewProviderTopN => (HoldingHealth, "review_provider_top_n", Severity::Normal),
         PushKind::ReviewSignal => (HoldingHealth, "review_signal", Severity::Normal),
         PushKind::ReviewFailure => (HoldingHealth, "review_failure", Severity::High),
         PushKind::TomorrowWatch => (HoldingHealth, "tomorrow_watch", Severity::Normal),
@@ -791,6 +923,17 @@ fn source_fact_profile(kind: PushKind) -> TemplateMetadata {
     profile
 }
 
+/// BR-194 R-04 is independent of account state, but it is not exempt from the
+/// real process-local market-data health gate. Keep the generic ReviewLhb
+/// profile unchanged for legacy callers and tighten only the canonical
+/// SourceOnly route.
+fn counted_source_only_profile(kind: PushKind) -> TemplateMetadata {
+    let mut profile = default_profile_for_kind(kind);
+    profile.data_mode_min = DataMode::Degraded;
+    profile.always_send_on_data_source_down = false;
+    profile
+}
+
 fn is_source_fact_signal(kind: PushKind, event: &SignalEvent) -> bool {
     matches!(
         kind,
@@ -823,11 +966,21 @@ fn default_profile_for_kind(kind: PushKind) -> TemplateMetadata {
         // Frozen 状态保留在 ctx.is_frozen, 模板自行渲染 ⚠️ 警告
         // 4 铁律: 通知层保持出声, 仓位风险控制在 broker 下单层
         frozen_mode_respect: false,
-        // R-04 is an independently sourced after-close report.  Its gate is
-        // the LHB payload itself (BR-110), not the intraday quote/order-book
-        // capabilities represented by the global mode.  Missing optional LHB
-        // fields remain explicit in the rendered payload.
-        data_mode_min: if matches!(kind, PushKind::AccountMode | PushKind::ReviewLhb) {
+        // A-01/R-03/R-04/R-08/A-10 are independently sourced after-close
+        // reports. Their gates are the admitted event/component batches
+        // (BR-158/BR-159/BR-110/BR-161/BR-160), not intraday
+        // quote/order-book capabilities represented by the global mode.
+        // Missing inputs remain explicit at their own acquisition gates.
+        data_mode_min: if matches!(
+            kind,
+            PushKind::AccountMode
+                | PushKind::PaperReview
+                | PushKind::IndustryChain
+                | PushKind::ReviewLhb
+                | PushKind::ReviewProviderTopN
+                | PushKind::EventCalendar
+                | PushKind::CatalystReview
+        ) {
             DataMode::Down
         } else {
             DataMode::Degraded
@@ -896,6 +1049,31 @@ fn current_source_fact_governance_ctx() -> Result<GovernanceContext, String> {
     })
 }
 
+/// BR-194 R-04 provider-only governance context. Account freeze is not a
+/// dependency of this report, while real process-local DataMode, quiet hours
+/// and the analytics-owned daily count remain mandatory.
+fn current_counted_source_only_governance_ctx() -> Result<GovernanceContext, String> {
+    use stock_analysis::monitor::data_mode::{
+        current_data_health_input, evaluate, DataMode as HealthDataMode,
+    };
+
+    let now = Local::now();
+    let health = evaluate(&current_data_health_input(120, 600)?, None);
+    Ok(GovernanceContext {
+        data_mode: match health.mode {
+            HealthDataMode::Full => DataMode::Full,
+            HealthDataMode::Degraded => DataMode::Degraded,
+            HealthDataMode::Unsafe => DataMode::Down,
+        },
+        is_quiet_hour: current_quiet_hour(now),
+        // Account mode is not applicable to the canonical R-04 source-only
+        // binding. This does not infer or persist a Normal account state.
+        is_frozen: false,
+        now,
+        today_pushed_count: 0,
+    })
+}
+
 fn current_quiet_hour(now: chrono::DateTime<Local>) -> bool {
     match std::env::var("STOCK_ANALYSIS_QUIET_HOUR_OVERRIDE")
         .ok()
@@ -915,6 +1093,24 @@ fn current_quiet_hour(now: chrono::DateTime<Local>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestBannerGuard(Option<crate::push_templates::BannerCtx>);
+
+    impl TestBannerGuard {
+        fn full() -> Self {
+            let previous = crate::LATEST_BANNER
+                .lock()
+                .expect("test banner lock")
+                .replace(crate::push_templates::BannerCtx::test_default());
+            Self(previous)
+        }
+    }
+
+    impl Drop for TestBannerGuard {
+        fn drop(&mut self) {
+            *crate::LATEST_BANNER.lock().expect("restore banner lock") = self.0.take();
+        }
+    }
 
     fn source_fact(kind: PushKind) -> SourceFactEvidence {
         source_fact_with_identity(kind, "TEST_CODE_EVENT_ID")
@@ -986,36 +1182,110 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial(cooldown_memo)]
-    fn gate_no_cooldown_kind_always_approves() {
-        _reset_dedup_for_test();
-        // HoldingEvent: cooldown=None + Emergency level (quiet_hours_respect=false)
-        // → 与时钟无关, 连续两次都应 Approved
-        let g1 = v14_gate(PushKind::HoldingEvent, Some("TEST_CODE_600519"));
-        let g2 = v14_gate(PushKind::HoldingEvent, Some("TEST_CODE_600519"));
-        assert!(matches!(g1, V14Gate::Approved(_)), "first: {:?}", g1);
-        assert!(matches!(g2, V14Gate::Approved(_)), "second: {:?}", g2);
+    fn br161_event_calendar_uses_its_component_evidence_not_intraday_global_mode() {
+        assert_eq!(
+            default_profile_for_kind(PushKind::EventCalendar).data_mode_min,
+            DataMode::Down
+        );
+    }
+
+    #[test]
+    fn br158_paper_review_uses_its_admitted_daily_batch_not_intraday_global_mode() {
+        assert_eq!(
+            default_profile_for_kind(PushKind::PaperReview).data_mode_min,
+            DataMode::Down
+        );
+    }
+
+    #[test]
+    fn br159_br160_chain_reports_use_admitted_batches_not_intraday_global_mode() {
+        assert_eq!(
+            default_profile_for_kind(PushKind::IndustryChain).data_mode_min,
+            DataMode::Down
+        );
+        assert_eq!(
+            default_profile_for_kind(PushKind::CatalystReview).data_mode_min,
+            DataMode::Down
+        );
+    }
+
+    #[test]
+    fn br194_source_only_profile_enforces_real_data_mode_without_changing_default_profile() {
+        let profile = counted_source_only_profile(PushKind::ReviewLhb);
+        assert_eq!(profile.data_mode_min, DataMode::Degraded);
+        assert!(!profile.always_send_on_data_source_down);
+        assert_eq!(
+            default_profile_for_kind(PushKind::ReviewLhb).data_mode_min,
+            DataMode::Down,
+            "legacy/default ReviewLhb profile remains unchanged"
+        );
+
+        let event = signal_event_for_kind(PushKind::ReviewLhb, None);
+        let down_context = GovernanceContext {
+            data_mode: DataMode::Down,
+            ..Default::default()
+        };
+        assert_eq!(
+            GovernanceEngine::new().check(&profile, &event, &down_context),
+            GovernanceDecision::Deny("data_quality".to_owned())
+        );
+
+        let degraded_context = GovernanceContext {
+            data_mode: DataMode::Degraded,
+            ..Default::default()
+        };
+        assert_eq!(
+            GovernanceEngine::new().check(&profile, &event, &degraded_context),
+            GovernanceDecision::Approve
+        );
     }
 
     #[test]
     #[serial_test::serial(cooldown_memo)]
-    fn gate_global_kind_dedups_second_call() {
+    fn br192_generic_counted_gate_fails_closed() {
         _reset_dedup_for_test();
-        // FactorIC: Global 3600s. 静默期 (02:00-06:00) 会 Denied, 其余时段走 dedup 断言
-        let first = v14_gate(PushKind::FactorIC, None);
-        if matches!(first, V14Gate::Approved(_)) {
-            // v15.1 A3: reserve 不占位, 模拟 push 成功后 commit, 第二次 reserve 才返 Deduped
-            _commit_dedup_for_test(PushKind::FactorIC, None);
-            let second = v14_gate(PushKind::FactorIC, None);
-            assert!(matches!(second, V14Gate::Deduped), "second: {:?}", second);
-        } else {
-            assert!(matches!(first, V14Gate::Denied(_)), "first: {:?}", first);
-        }
+        assert!(matches!(
+            v14_gate(PushKind::HoldingEvent, Some("TEST_CODE_600519")),
+            V14Gate::Denied(reason) if reason == "counted_binding_required"
+        ));
+        assert!(matches!(
+            v14_gate(PushKind::FactorIC, None),
+            V14Gate::Denied(reason) if reason == "counted_binding_required"
+        ));
     }
 
     #[test]
     #[serial_test::serial(cooldown_memo)]
-    fn daily_report_sub_kind_commit_uses_same_key_and_override_window() {
+    fn br192_explicit_counted_gate_builds_stable_governance_event() {
+        let _guard = crate::TestEnvGuard::dry_run_non_quiet();
+        let _banner_guard = TestBannerGuard::full();
+        let business_date = NaiveDate::from_ymd_opt(2026, 7, 30).unwrap();
+        let first = v14_gate_counted_binding(
+            PushKind::HoldingPlan,
+            Some("TEST_CODE_600519"),
+            None,
+            "TEST_CODE_OCCURRENCE_20260730",
+            business_date,
+        );
+        let second = v14_gate_counted_binding(
+            PushKind::HoldingPlan,
+            Some("TEST_CODE_600519"),
+            None,
+            "TEST_CODE_OCCURRENCE_20260730",
+            business_date,
+        );
+        let (V14Gate::Approved(first), V14Gate::Approved(second)) = (first, second) else {
+            panic!("explicit counted bindings must reach L5 approval in non-quiet test mode");
+        };
+        assert_eq!(first.event_id, second.event_id);
+        assert_eq!(first.ts, second.ts);
+        assert_eq!(first.code.as_deref(), Some("TEST_CODE_600519"));
+        assert_eq!(first.ts.date_naive(), business_date);
+    }
+
+    #[test]
+    #[serial_test::serial(cooldown_memo)]
+    fn br192_counted_commit_cannot_reenter_legacy_dispatcher() {
         _reset_dedup_for_test();
         let event = SignalEvent::new(
             SignalSource::HoldingHealth,
@@ -1026,69 +1296,30 @@ mod tests {
             Severity::Normal,
         );
         let override_secs = Some(1_800);
-
-        assert_eq!(
-            dedup_cooldown(PushKind::DailyReport, false, false, override_secs),
-            Some(Duration::from_secs(1_800))
-        );
-        commit_dedup_for_event(
+        let error = commit_dedup_for_event(
             &event,
             PushKind::DailyReport,
             Some("SectorTier"),
             override_secs,
         )
-        .unwrap();
-
-        assert_eq!(
-            lock_dispatcher(v14_stack().unwrap()).unwrap().reserve(
-                &event,
-                Some(Duration::from_secs(1_800)),
-                Some("SectorTier"),
-            ),
-            ReserveOutcome::Deduped
-        );
-        assert_eq!(
-            lock_dispatcher(v14_stack().unwrap()).unwrap().reserve(
-                &event,
-                Some(Duration::from_secs(1_800)),
-                Some("CapitalVerify"),
-            ),
-            ReserveOutcome::Reserved
-        );
+        .unwrap_err();
+        assert!(error.contains("cannot use legacy dedup commit"));
     }
 
     #[test]
     #[serial_test::serial(cooldown_memo)]
-    fn gate_per_ticket_without_code_skips_l4_cooldown() {
-        _reset_dedup_for_test();
-        // HoldingPlan (PerTicket 1800s) 不带 code → L4 不冷却 (模板层 memo 负责)
-        let g1 = v14_gate(PushKind::HoldingPlan, None);
-        let g2 = v14_gate(PushKind::HoldingPlan, None);
-        let both_gated_same = matches!(
-            (&g1, &g2),
-            (V14Gate::Approved(_), V14Gate::Approved(_)) | (V14Gate::Denied(_), V14Gate::Denied(_))
-        );
-        assert!(both_gated_same, "g1={:?} g2={:?}", g1, g2);
-    }
-
-    #[test]
-    #[serial_test::serial(cooldown_memo)]
-    fn gate_per_ticket_with_code_dedups_same_code_only() {
-        _reset_dedup_for_test();
-        let a1 = v14_gate(PushKind::HoldingPlan, Some("TEST_CODE_000001"));
-        if matches!(a1, V14Gate::Approved(_)) {
-            // v15.1 A3: 模拟 push 成功后 commit
-            _commit_dedup_for_test(PushKind::HoldingPlan, Some("TEST_CODE_000001"));
-            assert!(matches!(
-                v14_gate(PushKind::HoldingPlan, Some("TEST_CODE_000001")),
-                V14Gate::Deduped
-            ));
-            // 不同 code 不受影响 (v59 F1 语义保持)
-            assert!(matches!(
-                v14_gate(PushKind::HoldingPlan, Some("TEST_CODE_000002")),
-                V14Gate::Approved(_)
-            ));
-        }
+    fn br192_explicit_counted_gate_rejects_missing_occurrence() {
+        let _guard = crate::TestEnvGuard::dry_run_non_quiet();
+        assert!(matches!(
+            v14_gate_counted_binding(
+                PushKind::HoldingPlan,
+                Some("TEST_CODE_000001"),
+                None,
+                " ",
+                NaiveDate::from_ymd_opt(2026, 7, 30).unwrap(),
+            ),
+            V14Gate::Denied(reason) if reason == "counted_schedule_occurrence_required"
+        ));
     }
 
     #[test]
