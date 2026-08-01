@@ -110,17 +110,106 @@ shared causes include:
 - `Connection::open` interference between two fixtures (shared SQLite
   internal state for `unix_excl` or `psow`).
 
-The 2 verified failures share one root cause. The remaining 45 likely
-share one or two more. A systematic investigation should:
+### 3.1 Confirmed cascading root cause
+
+Running the namespace with `--test-threads=1` exposes a cascading
+failure pattern:
+
+1. The first test to panic is
+   `outcome_receipt_survives_database_close_reopen_and_exact_owner_replay`
+   at `src/database/selection_v2_repository.rs:9078`. Its panic message:
+
+   ```
+   persist upstream generation envelope: Audit("selection audit path
+   invalid: audit namespace container mutated during locked session:
+   /private/var/folders/3z/kj5q9h5x50j6zv9sr2zpdhzc0000gn/T/stock-analysis-selection-v2-repository-outcome-owner-file-reopen-35458-0/test")
+   ```
+
+   This is a real production path-validation failure in
+   `locked_session` at `src/selection/audit.rs:454`, NOT a test-side
+   issue. The audit namespace container path was mutated between
+   writer creation and `locked_session()`.
+
+2. `locked_session` acquires `process_audit_lock()` (process-global
+   `Mutex`) at `src/selection/audit.rs:455`. When the first test
+   panics while holding this lock, the `Mutex` becomes poisoned. Every
+   subsequent `locked_session()` in the same process returns
+   `SelectionAuditError::Lock("process audit mutex is poisoned"...)`
+   and every test that depends on it fails with the same poisoned-lock
+   error.
+
+3. With `--test-threads=1`, the cascade hits 10 of 39 tests in
+   `database::selection_v2_repository::tests`; the other 29 either
+   pass or are positioned before the poisoned state propagates. With
+   parallel execution (default), the cascade spreads faster and 45
+   of the namespace's tests fail.
+
+### 3.2 Two sub-causes, one fix path
+
+The fix has two parts that must both be addressed:
+
+**Part A: Stop the cascade.** `locked_session` at
+`src/selection/audit.rs:454` must not let `process_audit_lock` poisoning
+propagate across test runs. Either:
+
+- replace the process-global `Mutex` with a per-namespace
+  `RwLock`/`Mutex` keyed on the audit namespace path; or
+- wrap the lock acquisition in a `catch_unwind` and recover (forbid
+  production use of `catch_unwind`; this is test-only); or
+- document a `clear_poison` recovery hook that tests call between
+  fixture scopes.
+
+**Part B: Fix the original `path mutated` cause.** The audit
+namespace container path
+`/private/var/folders/3z/kj5q9h5x50j6zv9sr2zpdhzc0000gn/T/stock-analysis-selection-v2-repository-outcome-owner-file-reopen-35458-0/test`
+must NOT mutate between writer creation and `locked_session()`. Likely
+a `TestAuditRoot::new` race where another test in the same process
+deleted or replaced the parent temp directory while this test was
+still mid-fixture. Inspect `TestAuditRoot` (in `src/selection/audit.rs`
+or a sibling test helper module) for any non-isolated tempdir use,
+shared atomic counter with insufficient uniqueness, or cleanup hook
+that runs while a sibling test holds the path.
+
+### 3.3 Investigation recipe
 
 1. Run each of the 45 tests individually and record the actual failure
-   assertion text. Cluster by failure mode.
-2. For each cluster, find the minimum-code-change root cause (single
-   shared `OnceLock`, single shared temp dir, single `Connection`
-   leak, etc.).
-3. Apply a minimal surgical fix; do NOT add `#[ignore]`.
+   assertion text. Cluster by failure mode. Expect one or two clusters
+   total (most failures will be the cascade above).
+2. Identify the FIRST test to panic in the namespace (likely
+   `outcome_receipt_survives_database_close_reopen_and_exact_owner_replay`
+   or a sibling that mutates the same tempdir).
+3. Fix Part B (the first panic's actual cause).
+4. Fix Part A (cascade containment) regardless of Part B's success, so
+   that any future test panic cannot poison sibling tests.
+5. Apply the minimal surgical fix; do NOT add `#[ignore]`.
 
 ## 4. Recommended fix approaches
+
+### 4.1 Fix the cascading `process_audit_lock` poisoning first (Part A above)
+
+Wrap `process_audit_lock().lock()` in `src/selection/audit.rs:455` so
+that a poisoned lock does not cascade. Minimal pattern:
+
+```rust
+let process_guard = match process_audit_lock().lock() {
+    Ok(guard) => guard,
+    Err(poisoned) => poisoned.into_inner(),
+};
+```
+
+Then Part B (the original path-mutated cause) can be diagnosed with
+the cascade contained.
+
+### 4.2 Fix the `audit namespace container mutated` cause (Part B above)
+
+Inspect `TestAuditRoot::new` for any non-isolated tempdir usage. The
+first test to panic (`outcome_receipt_survives_database_close_reopen_and_exact_owner_replay`)
+constructs an `OutcomeEnvelope` fixture under
+`stock-analysis-selection-v2-repository-outcome-owner-file-reopen-35458-0`
+that conflicts with one or more sibling fixtures using the same parent
+temp dir + atomic counter.
+
+### 4.3 Add `TestFixture::absent(label)` variant
 
 ### Approach A: Add `TestFixture::absent(label)` variant
 
