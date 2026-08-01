@@ -452,19 +452,20 @@ impl SelectionAuditWriter {
     }
 
     pub fn locked_session(&self) -> Result<LockedSelectionAuditSession<'_>, SelectionAuditError> {
-        // BR-194 test-suite fix: recover from a poisoned process_audit_lock
-        // so that one panicking test does not cascade into all sibling
-        // tests (verified empirically: a poisoned mutex failed 35 of 45
-        // selection_v2_repository tests when run in the same process).
-        // This recovery is intentional and limited to the process-local
-        // selection-audit mutex; production cross-process correctness
-        // still comes from SQLite BEGIN IMMEDIATE + fence tokens, not
-        // from this Mutex. The guard is acquired immediately and held
-        // for the duration of the locked session; the prior holder's
-        // poisoned panic payload is not re-raised here.
+        // Note: an earlier draft attempted to recover from a poisoned
+        // process_audit_lock (unwrap_or_else(|p| p.into_inner())) to
+        // contain test-suite cascades. Empirical verification showed
+        // that approach turned 47 pre-existing failures into 134 by
+        // silently swallowing the poison and letting the next test run
+        // on partially-corrupted DB state from a prior test's panic.
+        // The cascade error is preferable to silent state corruption;
+        // the real fix is to make TestAuditRoot::new / TestFixture::new
+        // per-namespace and atomic-counter-unique (database owner work,
+        // see .planning/2026-07-31-br193-cadence-acquisition-gate-b-fix3/
+        // database-owner-brief-47-pre-existing-failures.md §3.1).
         let process_guard = process_audit_lock()
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .map_err(|_| SelectionAuditError::Lock("process audit mutex is poisoned".to_owned()))?;
 
         if self.pinned_test_namespace.is_none() {
             self.validate_bound_paths()?;
