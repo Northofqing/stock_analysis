@@ -1,6 +1,6 @@
 # BR-193 Selection-v2 Generation Activation — Gate A Design
 
-**Status:** Corrective Gate A draft after C0/I6/M0 independent RED; fresh re-review required
+**Status:** Corrective Gate A draft after C0/I6/M0 independent RED; §13 prerequisites and out-of-scope blockers added; fresh re-review required
 **Date:** 2026-07-30
 **Scope:** one production-capable `source ingress -> relation -> market evidence ->
 terminal generation` vertical slice
@@ -33,6 +33,17 @@ unaccepted BR-193 Gate A/B draft. In particular, an implementation copied from
 an earlier draft has no authority when it conflicts with the durable
 acquisition, fair paging, migration recovery, calendar or Selected-proof
 contracts below. Fresh independent review must evaluate these exact bytes.
+
+### 0.2 Pre-existing corrections in this draft
+
+This corrective draft fixes the six Important items returned by the prior
+independent Gate A review and additionally documents the prerequisite
+artifacts, verifier scaffolding, scheduler function name, migration CLI
+contract, log-line enforcement mechanism, known pre-existing Gate C
+blockers and Gate D environmental dependencies in §13. Section 13 is
+normative: every subsection carries one or more AC numbers whose
+implementation it makes concrete. Reviewers must evaluate §13 against
+the same bar as the rest of this document.
 
 ## 1. Decision
 
@@ -3880,3 +3891,203 @@ receipt/backup identity; audit parser/phase support remains deployed
 
 Until every acceptance criterion and repository Done criterion passes, report
 the work as **In Progress / Blocked**, never Done or release-ready.
+
+## 13. Known prerequisites and out-of-scope blockers
+
+This corrective Gate A draft addresses the six Important items returned by
+the prior independent RED (C0/I6/M0) and adds the following explicit scope
+boundaries so the implementer does not silently take on prerequisite work
+that belongs to a different change request. None of the items below are
+regressions in this design; each is a documented prerequisite, an explicit
+Gate-B deliverable, or a known Gate-C blocker that the implementer must
+handle before declaring Gate C green.
+
+### 13.1 Checked-in calendar authority prerequisites
+
+§3.5 and §5.1 require the following files under the compile-time manifest
+root. None of them exist in the repository HEAD at the time this corrective
+draft is frozen; Gate B must add them in the **same** PR that implements
+this spec, with reviewer sign-off on each artifact:
+
+```text
+config/selection/a_share_trading_calendar.v1.json
+config/selection/a_share_trading_calendar_notices.v1.json
+config/selection/a_share_trading_calendar_notices.v1/sse/<notice_id_sha256>.raw
+config/selection/a_share_trading_calendar_notices.v1/szse/<notice_id_sha256>.raw
+config/selection/selection_generation_deactivation.v1.json  (per §11 forward-deactivation)
+config/selection/selection_restore_approval.v1.json          (per §11 Controlled Exception Path)
+```
+
+Until these are present, the activation classifier returns exactly the
+typed Disabled reasons in §5.1 (`TradingCalendarMissing`,
+`TradingCalendarUnverified`, `TradingCalendarCoverageIncomplete`) or the
+fatal `calendar_release_integrity_conflict`. The implementer MUST NOT
+silently synthesize a calendar path, hash, or session vector from runtime
+state.
+
+### 13.2 Verifier and mutation harness prerequisites
+
+§10 AC-10 references the following artifacts that Gate B must create in the
+same PR:
+
+```text
+tools/release/verify_br193_selection_activation.py     (static + mutation harness driver)
+tools/release/verify_br193_production_join.py          (live-release join verifier)
+src/bin/selection_v2_verify_join.rs                   (the fixed-root release helper binary)
+tools/compliance/lib/check_br193_selection_activation_mutations.sh
+tools/compliance/fixtures/br193/mutation_manifest.v1.json
+                                                       (bytes-sha256:
+                                                        639a588a3a0a47555a2791dbcbf3cca95cd5b1814e94dff0133906b37175f1a9)
+```
+
+The mutation manifest file must contain exactly the RFC-8785 canonical
+JSON object quoted in §10 AC-10 with no BOM, no insignificant whitespace,
+no trailing newline. The checker rejects any byte deviation from that
+canonical form before executing a single mutant. Gate B must commit the
+file with the exact bytes quoted in this document.
+
+### 13.3 Known pre-existing test failures that affect Gate C
+
+The Gate C command sequence in §10 AC-10 includes:
+
+```text
+cargo test --workspace --all-targets --all-features -- --test-threads=1
+# expected exit 0, 0 failed
+```
+
+The repository HEAD at the time this corrective draft is frozen has
+**47 pre-existing lib-test failures** (verified by running
+`cargo test --lib --test-threads=1` against the un-modified mainline).
+They are concentrated in:
+
+```text
+database::global_schema_v1::tests::*
+database::selection_v2_repository::tests::*
+```
+
+Every failure is in code that this spec does not modify. Each fails with
+the same root cause: an asserted
+`GlobalSchemaV1Error::SelectionAuthorityContradiction { .. }` that the
+current production code path does not return for the constructed
+fixture. These are not BR-193 regressions; they are pre-existing
+incomplete authority state in the global-schema and selection-v2
+repository modules.
+
+BR-193 Gate B **does not** authorize silently fixing these failures, nor
+does it authorize weakening the assertion, nor does it authorize adding
+`#[ignore]` to any of them. The correct path is:
+
+1. Open a separate PR titled e.g.
+   `fix(database): reconcile pre-existing SelectionAuthorityContradiction
+   against v1/v2 audit fixtures`, owned by the database context owner.
+2. That PR fixes the 47 failures without weakening any assertion or
+   relaxing any invariant documented in
+   `docs/superpowers/specs/2026-07-23-event-scoped-selection-pipeline-design.md`.
+3. BR-193 Gate C cannot pass until that PR merges.
+
+Until step 3, BR-193 remains at Gate B even if every BR-193-specific AC
+passes. The status wording is therefore **Gate B / Blocked on
+pre-existing database failures**, not **Gate C**.
+
+### 13.4 Log-line invariant enforcement (AC-9)
+
+§10 AC-9 requires that the startup and tick log lines carry
+`activation_run_id=<canonical-uuidv7>` and
+`activation_receipt_hash=<64-lower-hex>`, and that **any**
+`activation_run_hash=` field on any log line causes Gate D to fail. The
+enforcement must be:
+
+1. a static `rg -n 'activation_run_hash=' src/` returning zero hits as a
+   Gate B check;
+2. a runtime log-line regex check in the production scheduler and the
+   `selection_v2_verify_join` helper that records every distinct log
+   line emitted during a real tick into a closed array; the verifier
+   rejects any element matching `activation_run_hash=`.
+
+The static check is mandatory for Gate B; the runtime check is mandatory
+for Gate D. Gate C may pass with only the static check.
+
+### 13.5 Production scheduler function name
+
+§10 AC-7 states: "exactly one production consumer:
+`selection_v2_generation_scheduler_loop`". This is the function name
+Gate B must adopt verbatim; it does not exist in HEAD. The full
+signature is locked to:
+
+```rust
+pub async fn selection_v2_generation_scheduler_loop(
+    capability: &SelectionRuntimeCapability,
+    cadence: &CadenceOwner,
+    namespace: &SelectionNamespaceOwner,
+) -> Result<(), SelectionRuntimeError>
+```
+
+No other function in the production crate may call into
+`ReceiptedTerminalDecisionProof` construction or Admitted/Selected proof
+issuance. A static `rg -n 'ReceiptedTerminalDecisionProof::' src/`
+must yield exactly one non-test callsite, in this function. The
+`offline join verifier` and any test code are explicitly excluded from
+this count.
+
+### 13.6 Migration binary CLI surface
+
+§11 step 2 references `cargo run --release --bin migrate_selection_v2 --`
+with subcommands `--recover-pre-exchange`, `--recover-forward`,
+`--deactivate-generation`, `--restore-approved`. The exact CLI surface
+(flag names, exit codes, stdout schema, log structure) is not pinned in
+this document. Gate B must commit a CLI contract at
+`docs/superpowers/specs/2026-07-30-migrate-selection-v2-cli.md` (new
+file in the same PR) that locks:
+
+- one positional argument is forbidden;
+- zero or more `--log-format=<json|text>` flags exist;
+- exit codes: `0` success, `1` refused (approval missing/expired),
+  `2` exchange refused, `3` migration aborted pre-exchange;
+- stdout on success is the same single closed JSON object that
+  `verify_br193_production_join.py` accepts (re-using the same
+  `gate_d_evidence_preimage` carrier).
+
+This CLI contract is a Gate B deliverable; without it Gate C cannot
+validate the rollback path.
+
+### 13.7 Gate D environmental prerequisites
+
+§9 and §10 AC-9 require a live producer-to-receipt summary and the
+`verify_br193_production_join.py` exact-output contract. These cannot be
+produced without:
+
+1. a real A-share trading day (`is_trading_day(current_date) == true`);
+2. at least one checked-in calendar artifact with
+   `coverage_start ≤ T0 < T0+5 ≤ coverage_end`;
+3. real Magic TDX 5-second SLA availability for both
+   `quote` and `five_minute_bars` windows (per §5.4);
+4. real push channel configuration per `data/push_log/<DATE>/`;
+5. at least one `dispatch_r09_provider_top_n_outcome` (BR-194 R-09)
+   delivering into `data/durable_delivery.sqlite3` during the trading
+   day so the join verifier has receipted evidence to walk.
+
+None of these are reproducible in a sandbox without the production
+broker, push channel and trading-day fixtures. Gate D therefore requires
+a separate execution run after Gate B/C in a production-equivalent
+environment. The PR that closes Gate B/C must explicitly carry the
+status **Gate C / Gate D pending live run** and reference the live-run
+ticket that owns Gate D.
+
+### 13.8 Closure rule for this §13
+
+Each subsection above is a single §10 AC item that previously lived as
+implicit context. By freezing each into an explicit subsection the
+fresh independent Gate A re-review can check whether this corrective
+draft truly removes the prior Important objections or merely shifts
+them. The closure expectation is:
+
+- §13.1 / §13.2: implemented in Gate B (same PR);
+- §13.3: blocker for Gate C; not a BR-193 deliverable;
+- §13.4: §10 AC-9 enforcement made concrete (static at Gate B,
+  runtime at Gate D);
+- §13.5 / §13.6: spec gaps filled in by this §13 subsection;
+- §13.7: Gate D environment dependency made explicit; not a spec defect.
+
+If the independent reviewer returns any Critical or Important objection
+to the §13 subsections themselves, those objections are normative and
+the corrective draft must be re-edited before Gate B can start.
