@@ -728,3 +728,41 @@
 ### 已知 pre-existing 失败
 
 `database::global_schema_v1::tests::v2_audit_with_absent_database_half_fails_closed_as_contradictory`、`missing_audit_returns_database_half_only_and_never_authoritative_absent`、`selection_v2_repository::tests::outcome_persistence_owner_*` 等 47 个，断言 `SelectionAuthorityContradiction` 不匹配实际 error。修复需独立 PR 范围。
+
+## 2026-08-01 — 47 pre-existing 失败根因调查 (claude session)
+
+**范围**: §13.3 描述的 47 个 lib-test 失败根因分析（不动实现）。
+
+### 单 test 跑 vs namespace 内跑
+
+逐个单独跑 `cargo test --lib database::global_schema_v1::tests::v2_audit_with_absent_database_half_fails_closed_as_contradictory` 与 `cargo test --lib database::selection_v2_repository::tests::outcome_persistence_owner_commits_once_and_exactly_replays`：**两个都 PASS**。
+
+跑整个 `database::global_schema_v1::tests` namespace（`--test-threads=1`）：24 pass / 2 fail / 2 ignored。两个失败都是同一个 `SelectionAuthorityContradiction` 不匹配断言（`global_schema_v1.rs:3771` / `global_schema_v1.rs:3740`）。
+
+### 根因（global_schema_v1 namespace 失败）
+
+`TestFixture::new(label, application_id, user_version)` 在 `src/database/global_schema_v1.rs:3445-3465` 创建 fixture：
+
+```rust
+let database = root.join("stock_analysis.db");
+let connection = Connection::open(&database).expect("create test database");
+// ...
+connection.pragma_update(None, "user_version", user_version).expect(...);
+drop(connection);
+```
+
+fixture **始终**用 `Connection::open` 创建空 SQLite 文件，fixture Drop 时清理。
+
+测试 `v2_audit_with_absent_database_half_fails_closed_as_contradictory` 用 `TestFixture::new("selection-audit-v2-db-absent", 0, 0)` 创 fixture，但测试**名字**假设 database half 不存在。实际 database 文件**存在**（空 catalog、user_version=0），且 `pinned_audit_writer()` 后 audit record 也存在。两个 half 都 present → `inspect_selection_with_audit_for_test` 不走 contradiction 分支 → 返回其它 error（具体是 `Ok(diagnostic)` 或非 `SelectionAuthorityContradiction` error）→ 测试断言 `matches!(error, SelectionAuthorityContradiction)` 失败。
+
+### 修复方向（database context owner 独立 PR）
+
+任选其一（不在 BR-193 scope）：
+
+A. 让 `TestFixture::new` 支持 "absent database" 模式（新增 `TestFixture::absent(label)`，不调 `Connection::open`，仅创 root 目录）。改 `v2_audit_with_absent_database_half_fails_closed_as_contradictory` 与 `missing_audit_returns_database_half_only_and_never_authoritative_absent` 用新 fixture。
+
+B. 让 `inspect_selection_with_audit_for_test` 增加 contradiction 检测：当 database 文件存在但 catalog 完全空，且 audit evidence 存在时，返回 `SelectionAuthorityContradiction`。
+
+### 剩余 45 个 selection_v2_repository 失败
+
+单独跑 PASS、namespace 内跑 FAIL（与 global_schema_v1 同模式）。根因未深入调查；可能是 process-local OnceLock、temp 文件竞争、或 wall clock 影响。需独立 PR 由 database context owner 调查（不能在 BR-193 scope 内静默修复、削弱断言或 `#[ignore]`）。
