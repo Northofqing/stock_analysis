@@ -1,6 +1,6 @@
 # BR-192/BR-194 incomplete-commit recovery hunk manifest
 
-**Status:** Gate A P0-A4 parent-relation repair; Gate B prohibited pending fresh C0/I0/M0
+**Status:** Gate A P0-A5 destination-identity repair; Gate B prohibited pending fresh C0/I0/M0
 
 This manifest binds recovery work to immutable Git objects. Source ranges are
 one-based inclusive ranges in the named object and every listed SHA-256 is over
@@ -72,6 +72,11 @@ this manifest and the recovery design. It corrects the P2-F descendant
 contract so implementation cannot branch from historical `96da674` and omit
 the accepted Gate-A documents. It changes no rule-ledger, source,
 configuration, dependency, lockfile, test or runtime byte.
+`P0-A5` is the direct child of committed `P0-A4` and changes only the same two
+recovery documents. It closes the pre-staging identity contract by freezing
+the complete 28-path P2-F destination set with exact modes, Git blobs and
+SHA-256 values. It changes no rule-ledger, source, configuration, dependency,
+lockfile, test or runtime byte.
 The historical
 `BASELINE:docs/business_rules.md` Git blob
 `a5325bdfb381ed187f1acbf70819260f38e18646` (SHA-256
@@ -85,6 +90,7 @@ only and must not overwrite later rule-ledger additions or amendments.
 | P0-A2 | docs-only compile-closure correction | exact committed `P0-A1` tree | amend only BR-203 ordering text plus this design/manifest | BR-203 | direct child of `P0-A1`; no source/config/runtime/dependency/lock/test path changes; records the then-proposed `P0 → (P1-A+P2) → P1-source → P3 → P4` closure, P2-L0/M2/R4V1/T6/T7 and invalidated partial P2 test claim; superseded by direct-child P0-A3 and not current Gate-B authority |
 | P0-A3 | docs-only executable-lineage correction | exact committed `P0-A2` tree | amend only BR-203 P2-F/BR-164 ownership plus this design/manifest evidence | BR-203 | direct child of `P0-A2`; no source/config/runtime/dependency/lock/test path changes; records the rejected uncommitted whole-Cargo proposal, binds minimal P2-F and keeps 0.54.4/no-qmt as final BR-164 release target |
 | P0-A4 | docs-only descendant-parent correction | exact committed `P0-A3` tree | amend only this recovery design and manifest | BR-203 | direct child of `P0-A3`; leaves `docs/business_rules.md` byte-identical; requires P2-F to be the direct child of the accepted Gate-A authority HEAD instead of historical `96da674`; no source/config/runtime/dependency/lock/test path changes |
+| P0-A5 | docs-only destination-identity correction | exact committed `P0-A4` tree | amend only this recovery design and manifest | BR-203 | direct child of `P0-A4`; leaves `docs/business_rules.md` byte-identical; freezes all 28 P2-F paths/modes/blob/SHA identities; no source/config/runtime/dependency/lock/test path changes |
 
 P0 changes no source, configuration, dependency, lockfile or test. The frozen
 active-ledger preimage without BR-203 has SHA-256
@@ -108,6 +114,8 @@ outside the same three paths or beyond the named executable-lineage/dependency-o
 correction is a hard failure.
 Any P0-A3-to-P0-A4 change outside the two recovery documents or beyond the
 descendant-parent correction is a hard failure.
+Any P0-A4-to-P0-A5 change outside the two recovery documents or beyond the
+complete 28-path destination-identity ledger is a hard failure.
 
 The P2-F dependency/caller candidate is the experimentally validated minimal
 transition below:
@@ -171,8 +179,103 @@ The only P2-V0C target delta is raw line 49,
 `run_check "check_br203_compile_foundation.sh"`, with SHA-256
 `c1ed63cc8aa5271986b9fbe943482cb016f2a45f10ebbf17c930f4ea855001e5`.
 
+### Complete P2-F destination identity ledger (P0-A5)
+
+The table below is the exclusive P2-F tree delta from the accepted P0-A5
+Gate-A authority HEAD. It closes every controlled whole-file adaptation and
+partial-row implementation identity before staging. The set is exactly 28
+paths: 24 replacements and four additions. Candidate runtime output under
+`data/` other than `data/.gitkeep`, `target/`, `test_data/`, `reports/`, Python
+`__pycache__`, the three Gate-A documents and every other path are excluded.
+
+| Destination path | Mode | Git blob | SHA-256 |
+| --- | --- | --- | --- |
+| `Cargo.lock` | `100644` | `e51a19684170f3c8677bebd41a4a1351c9176f27` | `f3c0540d3e5d6653918e4b1cd553e4063782addc4b36f7aff270fae3b136263c` |
+| `Cargo.toml` | `100644` | `f194a746da45ecec93cc809d30bfa12be6546ad2` | `6f2065fa487b3175bcb09c3baafdd4ef5d990a737fcd77abd8758c672190b45e` |
+| `data/.gitkeep` | `100644` | `39e1eadb988c0756b74c92f08e6c08e5c5d075d5` | `45c4daa08c67402bc305b96f103d60097af14b4238609176d5d167ff4167fd75` |
+| `src/app/modes.rs` | `100644` | `73f6ec49cb1c02591223bc658ca667fe6042cdf5` | `ceef2682053a240e7ce16567acf92e8029aec4cdfe1ec8b28ecde05cc60b0c52` |
+| `src/bin/monitor/durable_delivery_runtime.rs` | `100644` | `f36aed76f5350ffa47228f757cbd62073583cfad` | `1c39eb2beda7831c5348f0fed2dc7997d935523a5e709c3418cdbdf3376d875c` |
+| `src/bin/monitor/main.rs` | `100644` | `4df7bf3ced0510dffc44ec11676a2bf3e1fb82bd` | `f9e7d29e3b415f06d37dda18a942c50ce008d6aee6b3aef898aa522302eaf53a` |
+| `src/bin/monitor/notify.rs` | `100644` | `07dc781aa0a477381951df0674749ba0da4f43ab` | `172694bf1f481a09816530ff29a1f583b4029621a0f787247b21f14fcdfd13d9` |
+| `src/bin/monitor/push_templates.rs` | `100644` | `992a651ed675d971aae586efad5d5677569f4bad` | `8f428f24702ef7f27e8b6278dc04fbd2bbbd05f3019cf9c1d4346f684aed2636` |
+| `src/bin/monitor/review_batch.rs` | `100644` | `ca7942bd18b5dbafe4ccd7084e0f52bd6c028233` | `a8dcb0c3f143022a59b65c92b4c546c18743c05177cd69240020c95e31f92cf5` |
+| `src/bin/monitor/v14_adapter.rs` | `100644` | `2a6e91b410507d2ec163ab6f7fdafd7790d7d060` | `192de69dfa4529928825c4cd27a16e9b8526d9ee89dd0980642b507c3a6f4994` |
+| `src/database/concepts.rs` | `100644` | `b449342d5eff7e58806e0314b631116749e5d81d` | `384f8b3c1d3bedbb9de451f57490375ea298e270355cb3b088ebe3e57b93a4ad` |
+| `src/durable_delivery/schema.rs` | `100644` | `51a8f84a5ef916370258c2c7e45841a95fbc7b75` | `a5d3c123b57d6a74271311b2d972afd632296530ddbf1734def6c32564b99845` |
+| `src/durable_delivery/tests.rs` | `100644` | `31178dd4e26e32323f75e496b3e046d2d2bd48b9` | `cbfc06233732d00c42995e231bc8e646ef1b63133deb04453a0bfe36661ac5a2` |
+| `src/event/durable_delivery_append.rs` | `100644` | `6228c0eb763eaf14919442bbca4492b4c6f75458` | `1e051097f01012d97b707c88c282219b85617a3509520e4860c3793895ee419c` |
+| `src/event/envelope.rs` | `100644` | `1e53e02f03205c9ad5c8b8eae91eee4eadff6e5a` | `4b52c50b9c56c333dd2c34a2ec4fe060f8b553973ff38ed79c4f1f4827d9e842` |
+| `src/event/mod.rs` | `100644` | `aa6658bada03f4b3ce0d051dc3122f07a11ca290` | `02ab586810e80eef764a51aeeecf8552ac05e7cb0bfab85df5e256715884836f` |
+| `src/event/push_record.rs` | `100644` | `93965d6c489323cefae67385a62dea59039419f6` | `488708168dc75fe8ad1a7317f52d4dbfe9105bd1723135a0649c44d73f503c56` |
+| `src/lib.rs` | `100644` | `af5347c4d2dd3e1785307f3a2600bdc066571b77` | `b315be87dc273e7ea7e4987c6a385e439ca9860cb1cfc69fea3b2119781bf9fc` |
+| `src/pipeline/chain_analysis/mod.rs` | `100644` | `912db1a8229ed2a16cd85b0b4fb7a934a58a8979` | `bc78f9e7a3b22d597c7e379d2998a85f5b3efce594890d13294e15564c0bc782` |
+| `src/pipeline/extra_context.rs` | `100644` | `f37a612f58090811b5371ce0118be00adfc4bdea` | `ad597a2135082a18b10ec0a3abde7ddbbf8a0521ee3164765b2c436bf89eedfd` |
+| `src/pipeline/mod.rs` | `100644` | `c270a98e7ad538d020eab1637be27ab26bf3f1fe` | `b815d728a8e1c28ec83c0cf2bb7c2621e97561b9a2a795769257574442d013e2` |
+| `src/selection/audit.rs` | `100644` | `b5f687e88ba44b769fe6dd5463a8610c72758511` | `214d35f762d20ab391e743dbfdc4e96a2fa980a63241770489a79ea95585d226` |
+| `src/selection/outcome.rs` | `100644` | `6bce9901173c606dc33188a040e10e476bc18ae4` | `13f3cbb8e753f4723f91373981d861e37094787da07a4fefc41d8f30a3297c75` |
+| `src/selection/pipeline.rs` | `100644` | `7746ddc127657a31bed79141f754454327d85cef` | `bc345454c9d1d6fd07873ae966d997173dc92e3b1c6a3a55aef6f056184f968e` |
+| `tests/monitor_help_isolation.rs` | `100644` | `1df27a0d11780706c03e7c6896d259dc29090ded` | `a52f92c1d3332173b7749e6a45294e30c2f1ace8996aab7923d268d11908baf1` |
+| `tools/compliance/check.sh` | `100755` | `5f53a0419f0c6838849e638408c050e83e484a4b` | `589f2dc6ff09ea83db0ce2d3d46f7ead0fa166651f566750aed7cbf0d3eb009b` |
+| `tools/compliance/lib/check_br203_compile_foundation.sh` | `100755` | `fe3594e9dbd661574799945f13f29450571060fe` | `e58c09352383076e4b49c27018300d4a8306b88e2032d357ad8596fb375ec5e2` |
+| `tools/compliance/lib/verify_br203_compile_foundation.py` | `100755` | `829155d5f7d9f4fde4c393de0ce076ea2d95af81` | `bb4eb24dd4d33d69074db5b7b54be51046118eec6c49b0ba2ed904be34b0395e` |
+
+Every listed blob must be written to the repository object database and
+verified with `git cat-file -e` before the P2-F tree is accepted. A tree with
+any additional, missing, deleted or mode-drifted path is a hard failure.
+
+The 28-row ledger was reproduced from the ignored candidate without writing
+Git objects or reading any runtime database. The exact command was:
+
+```bash
+p2f_parent=304f915ebddc4f6d4a5c23c7671082d46dd98642
+p2f_candidate=target/br203-candidate
+p2f_manifest=docs/superpowers/specs/2026-08-03-br192-br194-recovery-hunk-manifest.md
+typeset -i p2f_count=0 p2f_bad=0 p2f_added=0 p2f_modified=0
+while IFS=$'\t' read -r rel expected_mode expected_blob expected_sha
+do
+  p2f_count+=1
+  actual_mode="100$(stat -f '%Lp' "$p2f_candidate/$rel")"
+  actual_blob="$(git hash-object -- "$p2f_candidate/$rel")"
+  actual_sha="$(shasum -a 256 "$p2f_candidate/$rel" | awk '{print $1}')"
+  if [[ "$actual_mode" != "$expected_mode" ||
+        "$actual_blob" != "$expected_blob" ||
+        "$actual_sha" != "$expected_sha" ]]
+  then
+    p2f_bad+=1
+  fi
+  if git cat-file -e "$p2f_parent:$rel" 2>/dev/null
+  then
+    parent_blob="$(git rev-parse "$p2f_parent:$rel")"
+    if [[ "$parent_blob" == "$expected_blob" ]]
+    then
+      p2f_bad+=1
+    else
+      p2f_modified+=1
+    fi
+  else
+    p2f_added+=1
+  fi
+done < <(
+  sed -n '/^### Complete P2-F destination identity ledger/,/^Every listed blob/p' "$p2f_manifest" |
+    awk -F'|' '$2 ~ /`/ && $3 ~ /`100(644|755)`/ {
+      for (i = 2; i <= 5; i++) {
+        gsub(/^[[:space:]`]+|[[:space:]`]+$/, "", $i)
+      }
+      print $2 "\t" $3 "\t" $4 "\t" $5
+    }'
+)
+printf 'count=%d bad=%d A=%d M=%d\n' \
+  "$p2f_count" "$p2f_bad" "$p2f_added" "$p2f_modified"
+```
+
+Its pasted output was:
+
+```text
+count=28 bad=0 A=4 M=24
+```
+
 All P2-F destination identities are provisional and grant no Gate-B authority
-until one candidate commit whose direct parent is the accepted P0-A4 Gate-A
+until one candidate commit whose direct parent is the accepted P0-A5 Gate-A
 authority HEAD materializes every row, `git cat-file -e` succeeds for its
 commit/tree/blobs,
 and the exact packet below is green. Superseded temporary hashes must not be
@@ -196,7 +299,7 @@ retained only as deferred BR-164 final-release evidence:
 P2-C1, P2-C2, P2-SA1, P2-SA2 and all counted-authority rows form one
 indivisible P2-F compile foundation. Applying only the counted closure leaves
 four selection errors; applying only the caller adaptation leaves the schema
-constant error. P0-A1 through P0-A4 must be independently accepted before
+constant error. P0-A1 through P0-A5 must be independently accepted before
 P2-F staging. The rejected P1-A rows cannot enter that commit.
 
 At final BR-164 release—not in P2-F or P1 staging—the direct set is exactly `magic-baidu-rs`, `magic-cls-rs`,
@@ -691,6 +794,7 @@ cargo test --locked --workspace --all-targets --all-features -- --test-threads=1
 | P0-A2 | amend only BR-203 ordering plus the two Gate-A recovery docs | BR-203 | docs-only tree/path proof + two independent Gate-A reviews |
 | P0-A3 | amend only BR-203 P2-F/BR-164 ownership plus the two Gate-A recovery docs | BR-203 | docs-only tree/path proof + two independent Gate-A reviews |
 | P0-A4 | amend only the P2-F descendant-parent relation in the two Gate-A recovery docs | BR-203 | docs-only tree/path proof + two independent Gate-A reviews |
+| P0-A5 | freeze only the exact 28-path P2-F destination identity ledger in the two Gate-A recovery docs | BR-203 | docs-only tree/path proof + two independent Gate-A reviews |
 | P2-C1 | exact minimal `Cargo.toml` target | BR-203 | compile + `CFV1+DD108` |
 | P2-C2 | exact minimal `Cargo.lock` target | BR-203 | metadata + `CFV1` |
 | P2-SA1 | strict production audit binding in `selection/outcome.rs` | BR-203 | `CF2+CFV1` |
@@ -864,17 +968,18 @@ seam identified by independent review.
 - P0/P1/P2/P3 historical source ranges and replacement target contracts are
   enumerated; no unlisted historical byte is admitted and the rejected first
   candidate blobs have no authority.
-- P0-A1 and its docs-only P0-A2/P0-A3/P0-A4 corrections must be committed and independently
+- P0-A1 and its docs-only P0-A2/P0-A3/P0-A4/P0-A5 corrections must be committed and independently
   accepted before the P2-F transition; the P0-A1 target keeps every row from the frozen active-ledger
   preimage byte-identical, including the active BR-159/BR-192/BR-194 amendments, and adds only
   BR-203, while P0-A2 changes only that row's compile-closure ordering plus the
   two recovery docs, and P0-A3 changes only those same paths to record the
   rejected uncommitted whole-Cargo proposal and bind the minimal P2-F target
   plus the deferred BR-164 dependency ownership, while P0-A4 changes only the
-  two recovery documents to correct the P2-F parent relation. The historical
+  two recovery documents to correct the P2-F parent relation and P0-A5 changes
+  only those documents to freeze the complete 28-path destination ledger. The historical
   baseline rows remain extraction evidence only and are not a target.
-- `P0-M0`, direct-child `P0-A1`, direct-child `P0-A2`, direct-child `P0-A3`
-  and direct-child `P0-A4` must be materialized
+- `P0-M0`, direct-child `P0-A1`, direct-child `P0-A2`, direct-child `P0-A3`,
+  direct-child `P0-A4` and direct-child `P0-A5` must be materialized
   as real Git commit objects. Independent review must prove both exact
   parent/child tree relations and report `C0/I0/M0` before any Gate-B source
   edit.
