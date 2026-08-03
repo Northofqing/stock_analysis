@@ -1,6 +1,6 @@
 # BR-192/BR-194 incomplete-commit recovery hunk manifest
 
-**Status:** Gate A P0-A3 repair; Gate B prohibited pending fresh C0/I0/M0
+**Status:** Gate A P0-A4 parent-relation repair; Gate B prohibited pending fresh C0/I0/M0
 
 This manifest binds recovery work to immutable Git objects. Source ranges are
 one-based inclusive ranges in the named object and every listed SHA-256 is over
@@ -67,6 +67,11 @@ it changes only the same three Gate-A documents, records the clean-lineage exper
 dependency and strict selection-audit caller targets, and defers final
 0.54.4/no-qmt convergence to BR-164 data-domain cutovers. It also precedes
 every new dependency/source stage.
+`P0-A4` is the direct child of the committed `P0-A3` object and changes only
+this manifest and the recovery design. It corrects the P2-F descendant
+contract so implementation cannot branch from historical `96da674` and omit
+the accepted Gate-A documents. It changes no rule-ledger, source,
+configuration, dependency, lockfile, test or runtime byte.
 The historical
 `BASELINE:docs/business_rules.md` Git blob
 `a5325bdfb381ed187f1acbf70819260f38e18646` (SHA-256
@@ -79,6 +84,7 @@ only and must not overwrite later rule-ledger additions or amendments.
 | P0-A1 | new additive docs-only rule row | exact committed `P0-M0` tree | insert canonical BR-203 row; its Code cell names only this recovery design and companion manifest | BR-203 | `P0-A1` is a direct child of `P0-M0`; every pre-existing active-ledger row and every non-ledger path remains byte-identical; pre/post hashes prove BR-203 is the only child-commit semantic addition; historical baseline is not restored |
 | P0-A2 | docs-only compile-closure correction | exact committed `P0-A1` tree | amend only BR-203 ordering text plus this design/manifest | BR-203 | direct child of `P0-A1`; no source/config/runtime/dependency/lock/test path changes; records the then-proposed `P0 → (P1-A+P2) → P1-source → P3 → P4` closure, P2-L0/M2/R4V1/T6/T7 and invalidated partial P2 test claim; superseded by direct-child P0-A3 and not current Gate-B authority |
 | P0-A3 | docs-only executable-lineage correction | exact committed `P0-A2` tree | amend only BR-203 P2-F/BR-164 ownership plus this design/manifest evidence | BR-203 | direct child of `P0-A2`; no source/config/runtime/dependency/lock/test path changes; records the rejected uncommitted whole-Cargo proposal, binds minimal P2-F and keeps 0.54.4/no-qmt as final BR-164 release target |
+| P0-A4 | docs-only descendant-parent correction | exact committed `P0-A3` tree | amend only this recovery design and manifest | BR-203 | direct child of `P0-A3`; leaves `docs/business_rules.md` byte-identical; requires P2-F to be the direct child of the accepted Gate-A authority HEAD instead of historical `96da674`; no source/config/runtime/dependency/lock/test path changes |
 
 P0 changes no source, configuration, dependency, lockfile or test. The frozen
 active-ledger preimage without BR-203 has SHA-256
@@ -100,6 +106,8 @@ a hard failure; any P0-A1-to-P0-A2 change outside BR-203 and the two recovery
 documents is also a hard failure; any P0-A2-to-P0-A3 change
 outside the same three paths or beyond the named executable-lineage/dependency-ownership
 correction is a hard failure.
+Any P0-A3-to-P0-A4 change outside the two recovery documents or beyond the
+descendant-parent correction is a hard failure.
 
 The P2-F dependency/caller candidate is the experimentally validated minimal
 transition below:
@@ -164,8 +172,9 @@ The only P2-V0C target delta is raw line 49,
 `c1ed63cc8aa5271986b9fbe943482cb016f2a45f10ebbf17c930f4ea855001e5`.
 
 All P2-F destination identities are provisional and grant no Gate-B authority
-until one candidate commit with parent `96da6747e147788d7ae66c357b5679caf1352f51`
-materializes every row, `git cat-file -e` succeeds for its commit/tree/blobs,
+until one candidate commit whose direct parent is the accepted P0-A4 Gate-A
+authority HEAD materializes every row, `git cat-file -e` succeeds for its
+commit/tree/blobs,
 and the exact packet below is green. Superseded temporary hashes must not be
 staged or cited. Strict all-target Clippy must report zero warnings; P2-H1
 through P2-H13 own the observed compile/test root causes rather than relying on
@@ -187,7 +196,7 @@ retained only as deferred BR-164 final-release evidence:
 P2-C1, P2-C2, P2-SA1, P2-SA2 and all counted-authority rows form one
 indivisible P2-F compile foundation. Applying only the counted closure leaves
 four selection errors; applying only the caller adaptation leaves the schema
-constant error. P0-A1 through P0-A3 must be independently accepted before
+constant error. P0-A1 through P0-A4 must be independently accepted before
 P2-F staging. The rejected P1-A rows cannot enter that commit.
 
 At final BR-164 release—not in P2-F or P1 staging—the direct set is exactly `magic-baidu-rs`, `magic-cls-rs`,
@@ -681,6 +690,7 @@ cargo test --locked --workspace --all-targets --all-features -- --test-threads=1
 | P0-A1 | one new BR-203 row; every frozen active-ledger row byte-identical | BR-203 | Rule-2.10 + whole-file/hash proof |
 | P0-A2 | amend only BR-203 ordering plus the two Gate-A recovery docs | BR-203 | docs-only tree/path proof + two independent Gate-A reviews |
 | P0-A3 | amend only BR-203 P2-F/BR-164 ownership plus the two Gate-A recovery docs | BR-203 | docs-only tree/path proof + two independent Gate-A reviews |
+| P0-A4 | amend only the P2-F descendant-parent relation in the two Gate-A recovery docs | BR-203 | docs-only tree/path proof + two independent Gate-A reviews |
 | P2-C1 | exact minimal `Cargo.toml` target | BR-203 | compile + `CFV1+DD108` |
 | P2-C2 | exact minimal `Cargo.lock` target | BR-203 | metadata + `CFV1` |
 | P2-SA1 | strict production audit binding in `selection/outcome.rs` | BR-203 | `CF2+CFV1` |
@@ -854,14 +864,17 @@ seam identified by independent review.
 - P0/P1/P2/P3 historical source ranges and replacement target contracts are
   enumerated; no unlisted historical byte is admitted and the rejected first
   candidate blobs have no authority.
-- P0-A1 and its docs-only P0-A2/P0-A3 corrections must be committed and independently
+- P0-A1 and its docs-only P0-A2/P0-A3/P0-A4 corrections must be committed and independently
   accepted before the P2-F transition; the P0-A1 target keeps every row from the frozen active-ledger
   preimage byte-identical, including the active BR-159/BR-192/BR-194 amendments, and adds only
   BR-203, while P0-A2 changes only that row's compile-closure ordering plus the
   two recovery docs, and P0-A3 changes only those same paths to record the
   rejected uncommitted whole-Cargo proposal and bind the minimal P2-F target
-  plus the deferred BR-164 dependency ownership. The historical baseline rows remain extraction evidence only and are not a target.
-- `P0-M0`, direct-child `P0-A1`, direct-child `P0-A2` and direct-child `P0-A3` must be materialized
+  plus the deferred BR-164 dependency ownership, while P0-A4 changes only the
+  two recovery documents to correct the P2-F parent relation. The historical
+  baseline rows remain extraction evidence only and are not a target.
+- `P0-M0`, direct-child `P0-A1`, direct-child `P0-A2`, direct-child `P0-A3`
+  and direct-child `P0-A4` must be materialized
   as real Git commit objects. Independent review must prove both exact
   parent/child tree relations and report `C0/I0/M0` before any Gate-B source
   edit.

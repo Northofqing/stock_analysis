@@ -161,13 +161,14 @@ matches zero tests is a failure even if Cargo exits successfully.
 
 ## 4. Recovery slices and ownership
 
-The slice labels preserve rule ownership; implementation order is **P0-A3 →
+The slice labels preserve rule ownership; implementation order is **P0-A4 →
 P2-F compile foundation → a separately reviewed compile-green BR-164
 dependency-identity prerequisite → remaining P1 real-source prerequisites →
 P3 R-04/R-09 SourceOnly callers → independently reversible BR-164 data-domain
-cutovers → P4 release closure**. P0-A3 is the documentation-only Rule-2.10 correction and
-must be independently accepted before any new source/dependency byte is
-staged. The initial clean-parent experiment first exposed five errors from the
+cutovers → P4 release closure**. P0-A3 is the documentation-only Rule-2.10
+correction; P0-A4 is its docs-only parent-relation correction and must be
+independently accepted before any new source/dependency byte is staged. The
+initial clean-parent experiment first exposed five errors from the
 missing schema-v3 module and two stale selection audit callers; that count was
 diagnostic, not a frozen invariant. Reconstructing the complete all-target P2
 surface subsequently exposed the stale source-protocol append caller,
@@ -286,7 +287,7 @@ this Gate-A design and must have no pending row before independent review.
 
 ### Slice P0: documentation-only recovery registration
 
-Before any recovery source slice is staged, P0 uses four docs-only commits. `P0-M0` materializes the
+Before any recovery source slice is staged, P0 uses five docs-only commits. `P0-M0` materializes the
 frozen active-ledger preimage without BR-203 together with this recovery design, the companion hunk
 manifest and the preserved BR-204 Gate-A design. Its tree contains no recovery source/config/runtime
 change. `P0-A1` is the direct child of `P0-M0` and adds the canonical BR-203 row to the active
@@ -311,19 +312,25 @@ manifest until they exist. The historical `BASELINE:docs/business_rules.md` blob
 `a5325bdfb381ed187f1acbf70819260f38e18646` (SHA-256
 `2c1d3634b38649ecb804a525bc896db0c9989eab9903dd54fc3ba1e7b0a312b9`) is extraction evidence only;
 it must not overwrite later accepted rule-ledger additions or amendments. P0 changes no source,
-configuration, dependency, lockfile, test or runtime behavior. The three committed P0-M0/P0-A1/P0-A2 trees and candidate P0-A3 tree record the
+configuration, dependency, lockfile, test or runtime behavior. `P0-A4` is the
+direct child of committed `P0-A3` and changes only this recovery design and the
+companion manifest. It corrects the P2-F parent contract: P2-F must descend
+from the accepted Gate-A authority HEAD rather than branch from historical
+`96da674`; it changes no BR-203 semantics or rule-ledger bytes. The four
+committed P0-M0/P0-A1/P0-A2/P0-A3 trees and candidate P0-A4 tree record the
 complete pre/post ledger hashes and prove that the only `P0-A1` semantic addition is BR-203 and the
 only `P0-A2` semantic changes are the reviewed compile-closure corrections
-above and `P0-A3` changes only the now-proven executable lineage, minimal P2-F
-target and deferred BR-164 ownership;
+above, `P0-A3` changes only the now-proven executable lineage, minimal P2-F
+target and deferred BR-164 ownership, and `P0-A4` changes only the descendant
+parent relation in the two recovery documents;
 independently owned,
 already-present rule rows such as BR-204 are preserved byte-for-byte.
 
 | path | ownership in P0 |
 | --- | --- |
 | `docs/business_rules.md` | `P0-M0`: materialize the frozen active-ledger preimage; `P0-A1`: add only the canonical BR-203 row while preserving every pre-existing row byte-for-byte; `P0-A2`: amend only BR-203's compile-closure ordering/seam text; `P0-A3`: amend only BR-203's executable P2-F/BR-164 ownership text and record the rejected uncommitted whole-Cargo proposal |
-| recovery design and hunk manifest | materialize byte-identically in `P0-M0`; unchanged in `P0-A1`; amend only reviewed compile ownership/order in `P0-A2`; amend only the clean-lineage experiment, minimal P2-F target and deferred BR-164 release ownership in `P0-A3` |
-| BR-204 Gate-A design | materialize byte-identically in `P0-M0`; unchanged in `P0-A1`, `P0-A2` and `P0-A3` |
+| recovery design and hunk manifest | materialize byte-identically in `P0-M0`; unchanged in `P0-A1`; amend only reviewed compile ownership/order in `P0-A2`; amend only the clean-lineage experiment, minimal P2-F target and deferred BR-164 release ownership in `P0-A3`; amend only the P2-F descendant-parent relation in `P0-A4` |
+| BR-204 Gate-A design | materialize byte-identically in `P0-M0`; unchanged in `P0-A1`, `P0-A2`, `P0-A3` and `P0-A4` |
 
 ### Slice P1: admitted real-source prerequisites
 
@@ -416,7 +423,7 @@ this recovery must not delete, narrow or restate it. New BR-203 registers only
 the incomplete-commit recovery boundary: the exact upstream revision/package
 identity, the new `admission`/`provider_top_n`/`dragon_tiger` realization of
 existing BR-159/BR-162/BR-192 semantics, the
-P0-A3→P2-F→BR-164-dependency-prerequisite→P1-source→P3→BR-164-domain-cutovers→P4 order, rejected old facades and exact-count
+P0-A4→P2-F→BR-164-dependency-prerequisite→P1-source→P3→BR-164-domain-cutovers→P4 order, rejected old facades and exact-count
 verifier. BR-159 retains all existing semantics and its
 entire row, including its Code cell, remains byte-identical. BR-203 must not absorb retry-cycle,
 provider-capture, R-08, A-10/A-01, schema-v4+ or later fixed-HEAD semantics.
@@ -1147,16 +1154,17 @@ or stale evidence keeps the PR Draft and status In Progress.
   runtime owner is removed;
 - `docs/business_rules.md` rows remain the canonical semantics and require no
   contradictory threshold/config change.
-- `P0-M0`, its direct child `P0-A1`, `P0-A1`'s direct child `P0-A2` and
-  `P0-A2`'s direct child `P0-A3` are
+- `P0-M0`, its direct child `P0-A1`, `P0-A1`'s direct child `P0-A2`,
+  `P0-A2`'s direct child `P0-A3` and `P0-A3`'s direct child `P0-A4` are
   materialized in real Git trees and commit objects; `P0-M0` binds the frozen
   preimage plus all three Gate-A documents, `P0-A1` changes only the BR-203
   row, `P0-A2` changes only that row plus the two recovery documents, and
   `P0-A3` changes the same three paths only to record the rejected uncommitted
   whole-Cargo proposal, bind the executable minimal P2-F predecessor and defer
-  final 0.54/no-qmt ownership to BR-164.
+  final 0.54/no-qmt ownership to BR-164, while `P0-A4` changes only the two
+  recovery documents to require P2-F to descend from the accepted Gate-A HEAD.
   Untracked working-tree hashes or non-written `hash-object` output do not
-  identify the review packet. All four commit trees receive fresh independent
+  identify the review packet. All five commit trees receive fresh independent
   exact-byte review before Gate B.
 
 Until all criteria pass, status remains **Gate A draft / implementation
