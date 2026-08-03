@@ -1,6 +1,6 @@
 # BR-192/BR-194 incomplete-commit recovery hunk manifest
 
-**Status:** Gate A repair; first frozen target candidates rejected
+**Status:** Gate A P0-A3 repair; Gate B prohibited pending fresh C0/I0/M0
 
 This manifest binds recovery work to immutable Git objects. Source ranges are
 one-based inclusive ranges in the named object and every listed SHA-256 is over
@@ -8,7 +8,7 @@ the exact raw range bytes emitted by `git show`; it is not a normalized target
 hunk hash. A destination is never allowed to copy bytes outside a listed
 range. `exact` means byte-for-byte admission; `extract` means the source is
 evidence for a smaller reviewed deep module and must not be represented as a
-byte recovery; `new` means accepted target work with no immutable source
+byte recovery; `new` means candidate target work with no immutable source
 equivalent. Before a Gate-B slice is staged, every partial-file row, including
 `exact`, must gain a literal destination interval and target-hunk SHA-256 in
 the implementation ledger. Exact whole-file rows use the whole destination
@@ -38,14 +38,18 @@ candidate ranges can be reproduced with:
 git show <object>:<path> | sed -n '<start>,<end>p' | shasum -a 256
 ```
 
-## Rejected first P1 candidate packet
+## Rejected source/dependency packets and candidate P2-F exception
 
-The former candidate blobs `ec52754ace19f5e09341416abd37c4876963943e`,
-`17e4ff819323d1126f434875d4098681578243c8`,
-`24b2e7d0e4d912404213ad23a1abdf62792b5ad3` and
-`e79ac5a5d159e8cb534fd9778c5043dd65935f50` are rejected evidence. They imported later rules, unrelated
-dependency/Profile/Polars changes, an over-broad lockfile and five test paths
-absent from `BASELINE`. They are not admitted target authority.
+The former source candidate blobs `ec52754ace19f5e09341416abd37c4876963943e`
+and `e79ac5a5d159e8cb534fd9778c5043dd65935f50` remain rejected evidence because
+they import later rules and unowned paths. The former whole dependency blobs
+`17e4ff819323d1126f434875d4098681578243c8` and
+`24b2e7d0e4d912404213ad23a1abdf62792b5ad3` are also rejected as a P2/P1
+predecessor: an isolated compile against old source produced fourteen removed
+legacy dependency imports and one Polars 0.54 API mismatch. They remain the
+BR-164 final release goal only. P2-F instead admits the exact minimal Cargo,
+lock and two strict selection-caller targets frozen below. No rejected blob
+grants source authority.
 
 ## P0 documentation-only Rule-2.10 registration
 
@@ -54,9 +58,15 @@ preimage plus the recovery design, this manifest and the preserved BR-204 Gate-A
 docs-only commit tree. `P0-A1` is its direct child and changes only the rule ledger by adding BR-203.
 After independent review found the original slice order was not compile-closed,
 `P0-A2` amends only the BR-203 row and these two Gate-A documents to bind the
-atomic P1-A/P2 compile closure, the P2-owned L0/M2/T6/T7 compatibility closure
+then-understood atomic P1-A/P2 compile closure, the P2-owned L0/M2/T6/T7 compatibility closure
 and the pure R-04 validator seam. It is the direct child of `P0-A1` and still
-precedes every dependency/source byte.
+precedes every dependency/source byte. The first proposed P0-A3 whole-Cargo
+target was rejected before commit after its isolated compile failed; it has no
+place in the Gate chain. The candidate `P0-A3` must be the direct child of `P0-A2`;
+it changes only the same three Gate-A documents, records the clean-lineage experiments, binds the minimal P2-F
+dependency and strict selection-audit caller targets, and defers final
+0.54.4/no-qmt convergence to BR-164 data-domain cutovers. It also precedes
+every new dependency/source stage.
 The historical
 `BASELINE:docs/business_rules.md` Git blob
 `a5325bdfb381ed187f1acbf70819260f38e18646` (SHA-256
@@ -67,7 +77,8 @@ only and must not overwrite later rule-ledger additions or amendments.
 | --- | --- | --- | --- | --- | --- |
 | P0-M0 | docs-only authority materialization | current implementation parent plus exact frozen active-ledger preimage | materialize active ledger without BR-203, recovery design, this manifest and preserved BR-204 Gate-A design | BR-203 | no source/config/runtime path changes; the ledger equals its frozen preimage hash and all three document blobs are committed |
 | P0-A1 | new additive docs-only rule row | exact committed `P0-M0` tree | insert canonical BR-203 row; its Code cell names only this recovery design and companion manifest | BR-203 | `P0-A1` is a direct child of `P0-M0`; every pre-existing active-ledger row and every non-ledger path remains byte-identical; pre/post hashes prove BR-203 is the only child-commit semantic addition; historical baseline is not restored |
-| P0-A2 | docs-only compile-closure correction | exact committed `P0-A1` tree | amend only BR-203 ordering text plus this design/manifest | BR-203 | direct child of `P0-A1`; no source/config/runtime/dependency/lock/test path changes; binds `P0 → (P1-A+P2) → P1-source → P3 → P4`, P2-L0/M2/R4V1/T6/T7, and invalidates the former partial P2 test claim |
+| P0-A2 | docs-only compile-closure correction | exact committed `P0-A1` tree | amend only BR-203 ordering text plus this design/manifest | BR-203 | direct child of `P0-A1`; no source/config/runtime/dependency/lock/test path changes; records the then-proposed `P0 → (P1-A+P2) → P1-source → P3 → P4` closure, P2-L0/M2/R4V1/T6/T7 and invalidated partial P2 test claim; superseded by direct-child P0-A3 and not current Gate-B authority |
+| P0-A3 | docs-only executable-lineage correction | exact committed `P0-A2` tree | amend only BR-203 P2-F/BR-164 ownership plus this design/manifest evidence | BR-203 | direct child of `P0-A2`; no source/config/runtime/dependency/lock/test path changes; records the rejected uncommitted whole-Cargo proposal, binds minimal P2-F and keeps 0.54.4/no-qmt as final BR-164 release target |
 
 P0 changes no source, configuration, dependency, lockfile or test. The frozen
 active-ledger preimage without BR-203 has SHA-256
@@ -79,112 +90,160 @@ has SHA-256 `d71e37bce3ca1bbc89e2158273307fd8d563475eb46d323caa19865ffbb6456b`;
 its complete ledger target has Git blob
 `d2a9208b19c9fb0ac87e29a30c2af0b8f780ae5a` and SHA-256
 `a8c09e0111623d0bbf4d5065359960c907047ffbfe3b14a0c373d2eaae7b0431`.
+The P0-A3 literal BR-203 row has SHA-256
+`ad48af414b240d1b0e7be7717eda66d4e0223308e56fe71c0836af30e6b21634`;
+its complete ledger target has Git blob
+`9ed01130d06ff700146b8f9e0e4b6f37e6dd5c6e` and SHA-256
+`e56fe49fe66a30ede0708c95cb24f543d5e775d79e47113bc889b1d40518358a`.
 Any change outside the single BR-203 row from the frozen preimage to P0-A1 is
 a hard failure; any P0-A1-to-P0-A2 change outside BR-203 and the two recovery
-documents is also a hard failure.
+documents is also a hard failure; any P0-A2-to-P0-A3 change
+outside the same three paths or beyond the named executable-lineage/dependency-ownership
+correction is a hard failure.
 
-The replacement P1 target contract is baseline-derived and has no prewritten
-code blob at Gate A:
+The P2-F dependency/caller candidate is the experimentally validated minimal
+transition below:
 
 | ID | Class | Fixed preimage | Destination/anchor | Owner | Exact acceptance |
 | --- | --- | --- | --- | --- | --- |
-| P1-A2 | new minimal manifest delta | `BASELINE:Cargo.toml` | dependency entries plus the adjacent stale path-ownership comment only | BR-203 | preserve all unrelated bytes and Polars 0.46; exact named 14 direct `=0.2.0`/`5f1ce93656a55854c844065390520cd4aecd9a14`; `rusqlite=chrono,functions`; no path dependency |
-| P1-A3 | generated closed lock delta | `BASELINE:Cargo.lock` + accepted P1-A2 | exact target hash and changed package-record whitelist, frozen before staging | BR-203 | exactly named 15 Magic packages at version/revision; no open resolver allowance or unlisted non-Magic record |
-| P1-A4 | new narrow test | no historical source | `tests/magic_market_release_revision.rs` | BR-203 | reads only `Cargo.toml`/`Cargo.lock`; proves exact 14/15 closure, root preservation, no sibling path and no rejected revision |
-| P1-A5 | new checker + one registration hunk | no historical source | `tools/compliance/lib/check_br203_magic_dependencies.sh`; `tools/compliance/check.sh` | BR-203 | binds fixed input/generated target hashes and exact changed-record whitelist; reruns exact 14/15/root/Polars/no-path/no-old-revision checks and `cargo metadata --locked --offline`; also requires exactly one literal runner invocation of itself so executing the checker proves its registration hunk |
+| P2-C1 | controlled minimal manifest target | `BASELINE:Cargo.toml` blob `2118a3e490efe2d3416b2554559ca0347947c533` / SHA-256 `521c3b24795288ddce453e714a74e23fe96afe348dfa49c5d68681f0fdf2adfa` | whole `Cargo.toml` blob `f194a746da45ecec93cc809d30bfa12be6546ad2` / SHA-256 `6f2065fa487b3175bcb09c3baafdd4ef5d990a737fcd77abd8758c672190b45e` | BR-203/P2-F | only `rusqlite=chrono,functions` and direct same-sibling-path `magic-market-core =0.2.0`; every other byte remains baseline-identical |
+| P2-C2 | controlled root-lock target | `BASELINE:Cargo.lock` blob `95481362e8061a1724cd1682d23b4e8a14f16377` / SHA-256 `cd86df085943a710c17ec2cb5aceaef0acc0bde949443dce3fe802e99fbe74fd` | whole `Cargo.lock` blob `e51a19684170f3c8677bebd41a4a1351c9176f27` / SHA-256 `f3c0540d3e5d6653918e4b1cd553e4063782addc4b36f7aff270fae3b136263c` | BR-203/P2-F | only root `stock_analysis.dependencies` gains `magic-market-core`; no package record/checksum/source change |
+| P2-SA1 | controlled strict audit caller/test target | `96da6747e147788d7ae66c357b5679caf1352f51:src/selection/outcome.rs` SHA-256 `18df8c79c7dc6b50ff51ea6c426a25ab98e9b6e3e227547fd2eda4364dfadd5e` | provisional whole target blob `6bce9901173c606dc33188a040e10e476bc18ae4`, SHA-256 `13f3cbb8e753f4723f91373981d861e37094787da07a4fefc41d8f30a3297c75`; computed only until the P2-F commit exists | BR-203/P2-F | remove old enum/constructor; fixed `production()` opens before due-load; exact code plus Lock/Io-only retryability; includes the exact CF2 outcome test; no fallback path |
+| P2-SA2 | controlled strict audit caller/test target | `96da6747e147788d7ae66c357b5679caf1352f51:src/selection/pipeline.rs` SHA-256 `c2662ceea2f7b0b5981d80126f050005b3018d24b2c1575a9aac982d4d579461` | provisional whole target blob `7746ddc127657a31bed79141f754454327d85cef`, SHA-256 `bc345454c9d1d6fd07873ae966d997173dc92e3b1c6a3a55aef6f056184f968e`; computed only until the P2-F commit exists | BR-203/P2-F | fixed `production()` opens before port construction; exact Unavailable code/retryability; includes the exact CF2 pipeline test; zero downstream calls; no fallback path |
+| P2-H1 | controlled compile-hygiene hunk | full parent `src/selection/audit.rs` | add `#[cfg(test)]` only to `for_test_code_pinned_root`; freeze whole target | BR-203/P2-F | removes dead production code without an allow; unit tests remain the only caller |
+| P2-H2 | controlled compile-hygiene hunk | full parent `src/durable_delivery/schema.rs` | replace the ten-element inline tuple with private `ImmutableAuditOutboxV4Row`; freeze whole target | BR-203/P2-F | behavior-preserving type alias; strict Clippy zero-warning |
+| P2-H3 | controlled test-fixture target | `96da6747e147788d7ae66c357b5679caf1352f51:src/durable_delivery/tests.rs`; freeze preimage hash | add only TEST_CODE legacy decision/attempt parents for the two migration rejection fixtures and create `data/test` before the foreign-CWD child; freeze whole target | BR-203/P2-F | keeps foreign keys enabled, exercises the intended migration errors, removes test-order dependence and changes no production path |
+| P2-H4 | clean-checkout namespace sentinel | no historical source | whole `data/.gitkeep`; freeze whole target | BR-203/P2-F | makes the non-production test namespace parent available without creating, opening or reading a production SQLite artifact |
+| P2-H5 | controlled append-capability compile closure | `96da6747e147788d7ae66c357b5679caf1352f51:src/bin/monitor/review_batch.rs`; freeze preimage hash | add only `append_source_protocol_audit_to`, its production-root wrapper and exact hash-chained append regression; freeze whole target | BR-203/P2-F | satisfies the already-admitted source-protocol audit call with a real immutable append rather than a logging-only implementation; no provider, renderer or sink activation |
+| P2-H6 | controlled immutable-run-context compile closure | `96da6747e147788d7ae66c357b5679caf1352f51:src/bin/monitor/main.rs` plus `src/bin/monitor/push_templates.rs`; freeze both preimages | construct one `ReviewRunContext` at the strict-review boundary, pass it atomically to the dispatcher and call the existing three-argument `review_preflight(context,due,is_test)`; freeze both whole targets | BR-203/P2-F | resolves the stale two-argument caller without changing provider/task policy; the review date and eligibility time derive from one observation and TEST_CODE remains physically isolated |
+| P2-H7 | production/test boundary compile hygiene | frozen P2-H5/P2-H6 monitor targets plus fixed-baseline `notify.rs`, `v14_adapter.rs` and `durable_delivery_runtime.rs`; freeze every preimage hash | put only the exact P3-owned counted-delivery/replay/hydration/review-orchestration declarations behind `#[cfg(test)]`, keep their existing TEST_CODE tests compiled, and freeze every affected whole target | BR-203/P2-F | no `allow(dead_code)`, fake caller or lint-level relaxation; P2 production retains only eager capability binding and generic counted-kind rejection, while P3 atomically removes each test gate with its real producer/orchestrator caller |
+| P2-H8 | eager-bound capability invariant | P2-H7 target `src/bin/monitor/durable_delivery_runtime.rs` | add private `RuntimeState::verify_bound_capabilities()` and call it from `eager_bind_runtime_artifacts()`; freeze whole target and exact regression | BR-203/P2-F | fail closed unless namespace matches, coordinator/append/sink bindings are live, authoritative sink identity is non-empty, producer readiness is false before P3, and both hydration mutexes are healthy/empty; this reads real bound state instead of suppressing field lints and performs no provider/network/sink call |
+| P2-H9 | production-delivery observer test isolation | P2 target `src/event/mod.rs` | extract one private `publish_delivery_with_dispatcher` persist-then-publish seam without changing the public production wrapper, then make the BR-130 global-observer regression inject one `TestAuditNamespace` dispatcher; freeze whole target | BR-192/BR-203/P2-F | the regression never relies on process-global `DURABLE_DELIVERY_TEST_CODE`, never opens production audit state and still proves authoritative persistence precedes observation publication |
+| P2-H10 | business-date-bound chain appearance prerequisite | fixed parent `src/database/concepts.rs`, `src/pipeline/chain_analysis/mod.rs`, `src/pipeline/extra_context.rs`, `src/app/modes.rs` and `src/pipeline/mod.rs`; freeze every preimage hash | adopt the complete already registered BR-195 contract: inclusive `[as_of-(days-1), as_of]` query, exact two appearance-query callers, typed public chain-analysis business date, both production entry callers, no `max(1)` fill and exact natural-day wording; freeze all five whole targets and exact BR-195 regressions | BR-195/BR-203/P2-F | removes wall-clock-dependent full-suite and replay behavior without changing assertions, filling a missing count or treating future rows as evidence; this is a prerequisite adoption of an independently reviewed rule, not new BR-203 business semantics |
+| P2-H11 | typed counted-governance provenance discriminator | P2-H7 target `src/bin/monitor/v14_adapter.rs`; freeze whole preimage and target | add a distinct TEST_CODE-only explicit-counted context, make the explicit counted gate use it, allow counted governance only for that context or the existing SourceOnly context, and keep generic combined-account/source-fact requests fail-closed; freeze exact rejection and explicit-binding regressions | BR-192/BR-203/P2-F | fixes an existing provenance conflation without widening production; P2 production exposes no counted producer and generic counted requests still return `counted_binding_required` |
+| P2-H12 | isolated monitor test runtime and stale generic-counted test retirement | P2-H6/H7 targets `src/bin/monitor/main.rs`, `src/bin/monitor/notify.rs`, `src/bin/monitor/push_templates.rs`, `src/bin/monitor/news_aggregator_init.rs`, `src/bin/monitor/v17_sources.rs` and `src/bin/monitor/durable_delivery_runtime.rs`; freeze every preimage and target | remove forbidden audit/push-log overrides during each TEST_CODE guard, eagerly bind the matching push-log capability, restore captured environment, migrate bare dry-run tests to the guard, use non-counted kinds for generic push/cooldown tests, classify template entries lacking a P2-admitted counted binding as disabled before generic dispatch, and put every retained/mutating `data/test` namespace plus delivery-runtime env test in the one existing `cooldown_memo` serial domain; opt-in sink smoke also captures/restores env; freeze exact intrinsic-failure regressions plus serial and default-thread monitor suites | BR-051/BR-136/BR-192/BR-203/P2-F | production audit roots, descriptor/link-count validation and counted rejection are unchanged; no second ineffective serial key, fake binding or real sink call; P2 E2E evidence reports pushed and disabled counts separately and cannot claim future P3 counted templates delivered |
+| P2-H13 | production CLI TEST_CODE bootstrap and process-test isolation | P2-H12 target `src/bin/monitor/main.rs` plus fixed parent `tests/monitor_help_isolation.rs`; freeze both preimages and targets | add only `install_cli_test_delivery_code`, call it immediately after explicit CLI Test-mode selection and before BR-144 audit preflight, and make every process regression that crosses runtime preflight include `--test`; freeze the exact helper/call/test hunks and whole targets | BR-051/BR-192/BR-203/P2-F | accepts only path-safe `TEST_CODE*` or creates PID-plus-time nonce authority; performs no provider or sink call; three named CLI regressions use no-follow metadata including size/mode/mtime/ctime to prove the fixed production `data/durable_delivery.sqlite3{,-wal,-shm}` trio is absent or unchanged; other audit/push-log namespace claims remain owned by their focused module tests; plain `--test` is Gate-B isolation evidence, not BR-196 transport or Gate-D production evidence |
+| P2-V0A | new fail-closed checker | no historical source | whole `tools/compliance/lib/check_br203_compile_foundation.sh`; freeze whole target | BR-203/P2-F | exact-one runner registration then structured verifier; executable |
+| P2-V0B | new structured verifier | no historical source | whole `tools/compliance/lib/verify_br203_compile_foundation.py`; freeze whole target | BR-203/P2-F | hashes Cargo/lock/callers plus every composed H11/H12/H13 target and both raw inclusive H13 `main.rs` hunks; parses TOML and checks exact literal sibling paths plus production ordering |
+| P2-V0C | controlled runner registration | `96da6747e147788d7ae66c357b5679caf1352f51:tools/compliance/check.sh` blob `e573230415dc8d5cfc92d64253488944c368cf8f`, SHA-256 `2615beca0978daa539716985d6a80360a262d8cbb35c271fcc839f192d9eff99` | add exactly one `run_check "check_br203_compile_foundation.sh"`; freeze hunk and whole target | BR-203/P2-F | exactly one literal invocation; no parallel/optional bypass |
 
-P1-A2, P1-A3, P1-A4 and P1-A5 form one indivisible dependency/revision
-transition and are committed atomically with P2. P2 requires
-`rusqlite/functions` and the direct `magic-market-core` dependency; applying
-either side alone is not a compile-closed intermediate state.
-P0-A1 is the preceding documentation-only additive BR-203 registration required by
-Rule 2.10, and P0-A2 is its docs-only compile-closure correction; both must be
-independently accepted before dependency or source staging. Target hunk
-hashes are added after these minimal bytes are generated in the isolated
-branch and before either commit is staged.
+The final composed P2-H11/H12/H13 candidate targets used by the green test
+packet are frozen below. These identities do not make the ignored candidate
+reachable or accepted; the eventual P2-F commit must reproduce them exactly:
 
-The direct set is exactly `magic-baidu-rs`, `magic-cls-rs`,
+| Target | Git blob | SHA-256 |
+| --- | --- | --- |
+| `src/bin/monitor/v14_adapter.rs` | `2a6e91b410507d2ec163ab6f7fdafd7790d7d060` | `192de69dfa4529928825c4cd27a16e9b8526d9ee89dd0980642b507c3a6f4994` |
+| `src/bin/monitor/main.rs` | `4df7bf3ced0510dffc44ec11676a2bf3e1fb82bd` | `f9e7d29e3b415f06d37dda18a942c50ce008d6aee6b3aef898aa522302eaf53a` |
+| `src/bin/monitor/notify.rs` | `07dc781aa0a477381951df0674749ba0da4f43ab` | `172694bf1f481a09816530ff29a1f583b4029621a0f787247b21f14fcdfd13d9` |
+| `src/bin/monitor/push_templates.rs` | `992a651ed675d971aae586efad5d5677569f4bad` | `8f428f24702ef7f27e8b6278dc04fbd2bbbd05f3019cf9c1d4346f684aed2636` |
+| `src/bin/monitor/news_aggregator_init.rs` | `35878107684e0c3c0cf73b25f6f7253ca2ad5081` | `ea3143f9fb409ae35ae7e30ed22007a448573a408a86ed71d9151ddaddbb8c44` |
+| `src/bin/monitor/v17_sources.rs` | `378cb03ea45ab84b2496e5737f17e63055fc637e` | `5a9326c04e06e4aac0ab65814866c77f741f512417827eb6c91a408729923241` |
+| `src/bin/monitor/durable_delivery_runtime.rs` | `f36aed76f5350ffa47228f757cbd62073583cfad` | `1c39eb2beda7831c5348f0fed2dc7997d935523a5e709c3418cdbdf3376d875c` |
+| `tests/monitor_help_isolation.rs` | `1df27a0d11780706c03e7c6896d259dc29090ded` | `a52f92c1d3332173b7749e6a45294e30c2f1ace8996aab7923d268d11908baf1` |
+
+P2-H13 additionally freezes the exact `src/bin/monitor/main.rs:69-94`
+helper hunk SHA-256
+`5bb1e4535ceafacbebed96c9e3bd6915b8e43a75115535243e53e48b71eb7153`
+and the exact `src/bin/monitor/main.rs:2970-2980` pre-preflight call-site hunk SHA-256
+`607974122926746e1a33bef62e99ba983f2336ee72bc939257ceb0ba0d01e41f`.
+Both hashes are over the raw inclusive `sed -n '<start>,<end>p'` bytes without
+line-number decoration.
+
+The P2-V0 checker targets are likewise provisional and frozen before the P2-F
+commit:
+
+| Target | Mode | Git blob | SHA-256 |
+| --- | --- | --- | --- |
+| `tools/compliance/lib/check_br203_compile_foundation.sh` | `100755` | `fe3594e9dbd661574799945f13f29450571060fe` | `e58c09352383076e4b49c27018300d4a8306b88e2032d357ad8596fb375ec5e2` |
+| `tools/compliance/lib/verify_br203_compile_foundation.py` | `100755` | `829155d5f7d9f4fde4c393de0ce076ea2d95af81` | `bb4eb24dd4d33d69074db5b7b54be51046118eec6c49b0ba2ed904be34b0395e` |
+| `tools/compliance/check.sh` | `100755` | `5f53a0419f0c6838849e638408c050e83e484a4b` | `589f2dc6ff09ea83db0ce2d3d46f7ead0fa166651f566750aed7cbf0d3eb009b` |
+
+The only P2-V0C target delta is raw line 49,
+`run_check "check_br203_compile_foundation.sh"`, with SHA-256
+`c1ed63cc8aa5271986b9fbe943482cb016f2a45f10ebbf17c930f4ea855001e5`.
+
+All P2-F destination identities are provisional and grant no Gate-B authority
+until one candidate commit with parent `96da6747e147788d7ae66c357b5679caf1352f51`
+materializes every row, `git cat-file -e` succeeds for its commit/tree/blobs,
+and the exact packet below is green. Superseded temporary hashes must not be
+staged or cited. Strict all-target Clippy must report zero warnings; P2-H1
+through P2-H13 own the observed compile/test root causes rather than relying on
+local filesystem residue or a lint relaxation. P2-H7's test gates are removed
+only by the atomic P3 consumer slice; any `allow(dead_code)`, crate-wide lint
+level change, fake reference or production exposure without a real caller is a
+hard failure.
+
+The following former P1-A whole dependency claim is rejected for P2/P1 and is
+retained only as deferred BR-164 final-release evidence:
+
+| ID | Class | Fixed preimage | Destination/anchor | Owner | Exact acceptance |
+| --- | --- | --- | --- | --- | --- |
+| REJECTED-P1-A2 | deferred BR-164 dependency target | `BASELINE:Cargo.toml`; target blob `17e4ff819323d1126f434875d4098681578243c8` | whole `Cargo.toml` final target | BR-164 | not P2/P1 staging authority; final goal only after legacy callers are retired |
+| REJECTED-P1-A3 | deferred BR-164 closed-lock target | `BASELINE:Cargo.lock`; target blob `24b2e7d0e4d912404213ad23a1abdf62792b5ad3` | whole `Cargo.lock` final target | BR-164 | not P2/P1 staging authority; final goal only after domain cutovers are green |
+| REJECTED-P1-A4 | deferred final test | no historical source | `tests/magic_market_release_revision.rs` | BR-164 | release proof only; excluded from P2-F |
+| REJECTED-P1-A5 | deferred final checker | no historical source | dependency checker/runner | BR-164 | release proof only; excluded from P2-F |
+
+P2-C1, P2-C2, P2-SA1, P2-SA2 and all counted-authority rows form one
+indivisible P2-F compile foundation. Applying only the counted closure leaves
+four selection errors; applying only the caller adaptation leaves the schema
+constant error. P0-A1 through P0-A3 must be independently accepted before
+P2-F staging. The rejected P1-A rows cannot enter that commit.
+
+At final BR-164 release—not in P2-F or P1 staging—the direct set is exactly `magic-baidu-rs`, `magic-cls-rs`,
 `magic-cninfo-rs`, `magic-eastmoney-rs`, `magic-exchange-rs`,
 `magic-jin10-rs`, `magic-market-composition`, `magic-market-core`,
 `magic-market-router`, `magic-sina-rs`, `magic-tdx-rs`, `magic-tencent-rs`,
 `magic-thepaper-rs`, and `magic-ths-rs`. The lock set is exactly those fourteen
 plus `magic-market-transport`. All fifteen use version `0.2.0`, repository
 `https://github.com/Northofqing/magic-market-data-rs.git`, and revision
-`5f1ce93656a55854c844065390520cd4aecd9a14`. The fixed preimage identities are
-`Cargo.toml` blob `2118a3e490efe2d3416b2554559ca0347947c533` / SHA-256
+`5f1ce93656a55854c844065390520cd4aecd9a14`. The rejected baseline identities
+are `Cargo.toml` blob/SHA-256
+`2118a3e490efe2d3416b2554559ca0347947c533` /
 `521c3b24795288ddce453e714a74e23fe96afe348dfa49c5d68681f0fdf2adfa`
-and `Cargo.lock` blob `95481362e8061a1724cd1682d23b4e8a14f16377` / SHA-256
+and `Cargo.lock` blob/SHA-256
+`95481362e8061a1724cd1682d23b4e8a14f16377` /
 `cd86df085943a710c17ec2cb5aceaef0acc0bde949443dce3fe802e99fbe74fd`.
-The generated target hashes and the complete changed-record whitelist must be
-equal the frozen values below before P1 staging.
+They are input evidence only and must not be restored.
 
-This 14-direct/15-lock set is the approved project-wide root release closure.
+This 14-direct/15-lock set is the final project-wide BR-164 release invariant,
+not current Gate-B authority.
 Only `magic-eastmoney-rs`, `magic-market-composition`, `magic-market-core` and
 `magic-market-router` may be imported by the new P1 R-04/R-09 modules. The
 remaining ten dependencies retain existing independently owned consumers and
 do not widen P1 source authority; `provider_top_n.rs` specifically must not
 import `magic-exchange-rs`.
 
-Lock generation is unique and reproducible. In an isolated
-`BASELINE`-derived worktree, apply only P1-A2, prove `cargo --version` is the
-recorded Cargo 1.95.0 toolchain, and invoke exactly once:
+No P2-F/P1 staging may adopt the following deferred whole-file identities; they
+are final BR-164 evidence only:
 
-```bash
-cargo update -p url@2.5.8 -p rustls@0.23.37 -p time@0.3.47
-```
+- `Cargo.toml`: Git blob
+  `17e4ff819323d1126f434875d4098681578243c8`, SHA-256
+  `093c81e706fa1caea33e5f924b53f2e22c7cdd025a55ccfb726e09af58926d7e`;
+- `Cargo.lock`: Git blob
+  `24b2e7d0e4d912404213ad23a1abdf62792b5ad3`, SHA-256
+  `86fa31db32fcd36dc3cff09b360a61db99f21e1b94bbf4a21023490a145cdcf4`.
 
-No `cargo generate-lockfile`, bare `cargo update`, second resolver invocation
-or online metadata is target authority. The resulting files must match the
-frozen hashes and package-record whitelist below; the compliance proof is
-`cargo metadata --locked --offline --format-version 1`.
+`cargo metadata --locked --offline --format-version 1 --no-deps` exits zero
+against those deferred bytes, but that does not make them a compile predecessor.
+At final BR-164 release the manifest must contain
+root `polars = 0.54` with `strings`; the lock must contain the Polars
+implementation packages at 0.54.4 and no `polars`, `polars-core` or other
+implementation package at 0.46/0.52. `polars-arrow-format` and
+`polars-parquet-format` retain their independent format-crate versions and
+are not implementation-family exceptions. qmt-parser must be absent from both
+files. Exact whole-file hashes close every other package/checksum/dependency
+edge and the stock_analysis root record; any drift is a hard failure.
 
-The isolated Cargo 1.95.0 target SHA-256 values are:
-
-- `Cargo.toml`:
-  Git blob `2d0280252f45354cde87aa34140d4050d91feb58`, SHA-256
-  `11c3b3914089c29e0b10f0bdbc9be1e55ae65a2d77f6ae251624860ad052c877`;
-- `Cargo.lock`:
-  Git blob `c327c468d825f46f16c205c803d61caa019fed1d`, SHA-256
-  `cb2460bc9872143891efdf5c2df8e17318c6cae5210d3c1861e68416626c1935`.
-
-The target lock has exactly 34 added identities: the fifteen named Magic
-records above, each with source
-`git+https://github.com/Northofqing/magic-market-data-rs.git?rev=5f1ce93656a55854c844065390520cd4aecd9a14#5f1ce93656a55854c844065390520cd4aecd9a14`,
-plus this exact non-Magic identity/checksum whitelist:
-
-| Package identity | Checksum |
-| --- | --- |
-| `combine 4.6.7` | `ba5a308b75df32fe02788e748662718f03fde005016435c444eea572398219fd` |
-| `jni 0.22.4` | `5efd9a482cf3a427f00d6b35f14332adc7902ce91efb778580e180ff90fa3498` |
-| `jni-macros 0.22.4` | `a00109accc170f0bdb141fed3e393c565b6f5e072365c3bd58f5b062591560a3` |
-| `jni-sys 0.4.1` | `c6377a88cb3910bee9b0fa88d4f42e1d2da8e79915598f65fb0c7ee14c878af2` |
-| `jni-sys-macros 0.4.1` | `38c0b942f458fe50cdac086d2f946512305e5631e720728f2a61aabcd47a6264` |
-| `num-conv 0.2.2` | `521739c6d2bac4aa25192232afe6841231376b2b26d4d9fae5ecf8ca5772e441` |
-| `reqwest 0.13.4` | `219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3` |
-| `rustls 0.23.42` | `3c54fcab019b409d04215d3a17cb438fd7fbf192ee61461f20f4fe18704bc138` |
-| `rustls-platform-verifier 0.7.0` | `26d1e2536ce4f35f4846aa13bff16bd0ff40157cdb14cc056c7b14ba41233ba0` |
-| `rustls-platform-verifier-android 0.1.1` | `f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f` |
-| `simd_cesu8 1.2.0` | `11031e251abf8611c80f460e19dbdeb54a66db918e49c65a7065b46ac7aec520` |
-| `time 0.3.54` | `3e1d5e639ff6bab73cb6885cc7e7b1de96c3f32c68ec55f3952614bec1092244` |
-| `time-core 0.1.9` | `9e1c906769ad99c88eaa54e728060edef082f8e358ff32030cb7c7d315e81109` |
-| `time-macros 0.2.32` | `7e689342a48d2ea927c87ea50cabf8594854bf940e9310208848d680d668ed85` |
-| `ureq 2.12.1` | `02d1a66277ed75f640d608235660df48c8e3c19f3b4edb6a263315626cc3c01d` |
-| `url 2.5.4` | `32f8b686cadd1473f4bd0117a5d28d36b1ade384ea9b5069a1c40aefed7fda60` |
-| `webpki-root-certs 1.0.9` | `b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b` |
-| `webpki-roots 0.26.11` | `521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9` |
-| `webpki-roots 1.0.9` | `7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a` |
-
-The exact eight removed identities are path/no-source `magic-market-core
-0.2.0`, path/no-source `magic-tdx-rs 0.2.0`, `num-conv 0.2.1`, `rustls
-0.23.37`, `time 0.3.47`, `time-core 0.1.8`, `time-macros 0.2.27` and `url
-2.5.8`. The exact seven same-identity record changes are `deranged 0.5.8`
-(drop its lock-record `powerfmt` dependency edge), `hyper-rustls 0.27.7`,
-`quinn 0.11.11`, `quinn-proto 0.11.16`, `reqwest 0.12.28` and `tokio-rustls
-0.26.4` (each of those five changes only the dependency edge from `rustls
-0.23.37` to `rustls 0.23.42`), plus `stock_analysis 0.1.2` (retain every
-baseline direct dependency, replace the Magic TDX path identity and add the
-other thirteen direct Magic identities). Any different count, identity,
-checksum, source, dependency edge or root dependency is a hard failure.
+The final BR-164 checker parses both TOML files structurally without invoking dependency
+resolution. It fails closed on malformed input, duplicate package identities,
+a missing or repeated root record, an unexpected `polars-*` implementation
+version or any format exception other than exactly `polars-arrow-format` and
+`polars-parquet-format`. The complete lock parser and whole-file hashes prove
+the 14/15 dependency closure; `--no-deps` only proves the accepted root
+manifest/lock pairing without assuming that non-host packages such as a
+Windows target crate have already been cached. The two following locked
+`cargo check` commands prove host compilation.
 
 ## P1 shared admission seam
 
@@ -314,7 +373,7 @@ SQLite, serde, sha2, hex and `DatabaseManager`.
 | P2-M0 | exact compile closure | `TRACKED_WIP:src/bin/monitor/main.rs:155-155` | `7f9ea27a99daa0639cf90e31a6712fb7211baf4ea5a366f7a260c9c7834b418a` | monitor module-declaration block | Add `mod durable_delivery_runtime;`; the existing module file remains byte-identical to `BASELINE` Git blob `a635b90237413577a51d5bc92ae29c40ae2afac4`. |
 | P2-R4V1 | exact pure compile closure | `TRACKED_WIP:src/bin/monitor/push_templates.rs:8638-8735` | `145892a0bdb3dce3e2f18d0ad100103274839e780caaa0b305be736b085ed811` | `src/bin/monitor/push_templates.rs`, immediately before P3 R-04 preparation | Typed canonical DTOs, strict canonical-byte validator and test-only canonical fixture helper required by the unchanged baseline durable runtime. No provider, renderer, scheduler, producer or sink call is included. |
 | P2-M1 | exact | `TRACKED_WIP:src/bin/monitor/main.rs:3359-3365` | `0769047e84502e3d51fa9892b1f38aa79824606d3183661b40d43070cb2ec898` | after BR-144 audit preflight and before sink initialization | Eagerly bind runtime audit/push-log artifacts before any production delivery path. |
-| P2-M2 | exact test-runtime namespace-isolation closure | `TRACKED_WIP:src/bin/monitor/main.rs:81-111` | `9034bfe82508f5f7fd86e6b70cf0d3590612b144cdaac4bb1e36bc2c72a89179` | existing `TestEnvGuard::dry_run_non_quiet` | Capture and set an invocation-unique `DURABLE_DELIVERY_TEST_CODE` alongside the existing test environment/audit namespace. No production bytes are compiled. |
+| P2-M2 | exact test-runtime namespace-isolation closure | `TRACKED_WIP:src/bin/monitor/main.rs:81-111` | `9034bfe82508f5f7fd86e6b70cf0d3590612b144cdaac4bb1e36bc2c72a89179` | existing `TestEnvGuard::dry_run_non_quiet` | Capture and set an invocation-unique `DURABLE_DELIVERY_TEST_CODE` alongside the existing test environment/audit namespace. This row changes only `#[cfg(test)]` guard behavior; the separately manifested P2-H13 production-compiled helper is outside P2-M2. |
 | P2-T0 | exact | `TRACKED_WIP:src/bin/monitor/notify.rs:4668-4670` | `4831d7e30bf2d01efb752a537c7735d0c22149c6d347ec77a73f0de3e531afbd` | existing notify test module before namespace fixture | Declare `TestBannerGuard` and `TestNotifyDir` used by admitted tests. |
 | P2-T1 | exact | `TRACKED_WIP:src/bin/monitor/notify.rs:4672-4764` | `92c24ca5d093f93edfbaf6a7c541ea76b61dd64529d2e3ab473313e6b589be49` | existing `notify.rs` test module | TEST_CODE pinned namespace fixture and JSON artifact enumerator only. |
 | P2-T1A | exact | `TRACKED_WIP:src/bin/monitor/notify.rs:4766-4798` | `1fa88883b0fad152f1a249616ed3c19f6ed604284abd5b198517a0dfbf2c89dd` | after `push_log_json_artifacts` | Implement `TestNotifyDir` and `TestBannerGuard::full`. |
@@ -432,7 +491,11 @@ argv/count packet in §Slice-local executable validation packets directly;
 P4's `tools/release/check_br194_recovery_focused.sh` later codifies and reruns
 the same commands for release closure:
 
-- `A1`: one exact Magic manifest/lock revision test;
+- `CF2`: two exact strict selection-audit caller failure tests;
+- `CFV1`: one P2-F structural verifier command registered exactly once in the compliance runner;
+- `DD108`: exactly 108 durable-delivery core tests, zero failed and zero
+  ignored; this set is first exposed by P2-L0 and is part of P2-C1/P2-F
+  acceptance rather than deferred release evidence;
 - `AD4`: four exact BR-159 admission tests;
 - `DB4`: four exact BR-159 database tests;
 - `TN3`: three exact Provider Top-N tests;
@@ -446,7 +509,7 @@ the same commands for release closure:
   push-log/sink-call compatibility tests;
 - `EB1`: one exact eager-runtime-artifact binding test;
 - `R4V4`: four exact durable-runtime R-04 canonical validation tests, all
-  runnable in the atomic P1-A/P2 candidate before any provider/producer exists;
+  runnable in the P2-F candidate before any provider/producer exists;
 - `CC1`: one counted-cutover integration test;
 - `M31/P3`: 31 monitor BR-194 tests and three BR-194 process tests;
 - `WK1/SM3/R96/R4B3/R4S3/CAT1`: respectively one weekend-date caller test,
@@ -519,13 +582,15 @@ zero, and must select exactly the stated passed/ignored count. Zero matches,
 one extra selected test, one failed test or any unexpected ignored test is a
 slice failure. P4 V1 must encode these same packets without changing them.
 
-### Atomic P1-A/P2 packet
+### P2-F compile-foundation packet
 
 ```text
-cargo metadata --locked --offline --format-version 1                         => exit 0
+cargo metadata --locked --offline --format-version 1 --no-deps               => exit 0
 cargo check --locked --lib                                                   => exit 0
 cargo check --locked --bin monitor                                           => exit 0
-cargo test --locked --test magic_market_release_revision -- --test-threads=1 => 1 passed, 0 ignored
+cargo fmt --all -- --check                                                   => exit 0
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings => exit 0, zero warnings
+cargo test --locked --lib durable_delivery:: -- --test-threads=1             => 108 passed, 0 ignored
 cargo test --locked --lib event::envelope::tests::br192_ -- --test-threads=1 => 4 passed, 0 ignored
 cargo test --locked --lib event::push_record::tests::br192_ -- --test-threads=1 => 3 passed, 0 ignored
 cargo test --locked --lib event::delivery_observation_tests::br192_ -- --test-threads=1 => 3 passed, 0 ignored
@@ -533,21 +598,59 @@ cargo test --locked --lib event::durable_delivery_append::tests::br192_ -- --tes
 cargo test --locked --bin monitor notify::tests::br192_ -- --test-threads=1 => 26 passed, 1 ignored child helper
 cargo test --locked --bin monitor durable_delivery_runtime::tests::br194_r04_ -- --test-threads=1 => 4 passed, 0 ignored
 cargo test --locked --bin monitor durable_delivery_runtime::tests::br192_main_eagerly_binds_runtime_artifacts_exactly_once_before_sink_init -- --exact --test-threads=1 => 1 passed, 0 ignored
-bash tools/compliance/lib/check_br203_magic_dependencies.sh                    => exit 0 and exactly one runner registration
+cargo test --locked --lib selection::outcome::br203_production_audit_open_failure_preserves_code_and_stops_before_due_load -- --exact --test-threads=1 => 1 passed, 0 ignored
+cargo test --locked --lib selection::pipeline::br203_production_audit_open_failure_returns_unavailable_before_dependencies -- --exact --test-threads=1 => 1 passed, 0 ignored
+cargo test --locked --test monitor_help_isolation -- --test-threads=1         => 19 passed, 0 ignored; the unknown-flag, invalid/corrupt-outcome-backfill and registered-backfill regressions leave the exact fixed production SQLite trio absent or unchanged
+bash tools/compliance/lib/check_br203_compile_foundation.sh                    => exit 0 and exactly one runner registration
+cargo test --locked --workspace --all-targets --all-features -- --test-threads=1 => exit 0, zero failed and exactly the authorized 16-test ignored whitelist below
 ```
 
-The one ignored notify child is the manifest-owned isolated helper exercised
-by its passing parent; no other ignored test is permitted.
+The exact P2-F ignored whitelist is closed and contains sixteen names. Six are
+manifest-owned child helpers exercised by passing parents:
+
+1. `event::durable_delivery_append::tests::TEST_CODE_br192_immutable_append_namespace_child`
+2. `event::dispatcher::tests::br141_event_audit_process_writer_helper`
+3. `durable_delivery_runtime::tests::TEST_CODE_br192_real_full_chain_child`
+4. `durable_delivery_runtime::tests::TEST_CODE_br192_runtime_foreign_cwd_child`
+5. `review_batch::tests::br140_review_audit_process_writer_helper`
+6. `notify::tests::br192_push_log_process_writer_helper`
+
+Ten are explicit live/external integrations, never silent unit-test skips:
+
+1. `fallback_sina_test::fallback_returns_data_with_sina_in_chain`
+2. `fallback_sina_test::sina_provider_direct_fetch_works`
+3. `v11_three_sources::fallback_returns_consistent_source_and_adjust`
+4. `v11_three_sources::fallback_returns_sane_prices`
+5. `v11_three_sources::fallback_skips_data_with_extreme_gap`
+6. `fallback_post_close_test::post_close_prefers_baostock`
+7. `fallback_post_close_test::baostock_provider_direct_fetch_works`
+8. `llm::ticker_extractor::tests::test_extract_tickers_real_api`
+9. `push_l6::external_sinks::tests::wechat_sink_real_http_fails_without_server`
+10. `push_l6::external_sinks::tests::feishu_sink_skeleton_returns_err`
+
+P4 must compare the harness inventory to these exact names. A seventeenth
+ignored test, a missing parent exercise for a child helper, or converting a
+failed test into `#[ignore]` is a release-blocking count drift.
 
 ### Remaining P1 source packet
+
+This packet is ineligible until a separately reviewed BR-164
+dependency-identity prerequisite has been committed and proved compile-green.
+That prerequisite is outside this manifest and must not reuse
+REJECTED-P1-A2 through REJECTED-P1-A5. P1 staging stops if the prerequisite's
+exact Cargo/lock authority is absent, fails its rollback contract, or produces
+a second `magic-market-core` package identity.
 
 ```text
 cargo check --locked --lib => exit 0
 cargo check --locked --bin monitor => exit 0
+cargo fmt --all -- --check => exit 0
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings => exit 0, zero warnings
 cargo test --locked --lib data_gateway::admission::tests::br159_ -- --test-threads=1 => 4 passed, 0 ignored
 cargo test --locked --lib database::data_acquisition_audit::tests::br159_ -- --test-threads=1 => 4 passed, 0 ignored
 cargo test --locked --lib data_gateway::provider_top_n::tests::br192_ -- --test-threads=1 => 3 passed, 0 ignored
 cargo test --locked --lib data_gateway::dragon_tiger::tests::br162_ -- --test-threads=1 => 6 passed, 0 ignored
+cargo test --locked --workspace --all-targets --all-features -- --test-threads=1 => exit 0, zero failed and zero unexpected ignored
 ```
 
 ### P3 producer packet
@@ -555,6 +658,8 @@ cargo test --locked --lib data_gateway::dragon_tiger::tests::br162_ -- --test-th
 ```text
 cargo check --locked --lib => exit 0
 cargo check --locked --bin monitor => exit 0
+cargo fmt --all -- --check => exit 0
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings => exit 0, zero warnings
 cargo test --locked --bin monitor durable_delivery_runtime::tests::br194_ -- --test-threads=1 => 17 passed, 0 ignored
 cargo test --locked --bin monitor review_batch::tests::br194_ -- --test-threads=1 => 10 passed, 0 ignored
 cargo test --locked --bin monitor v14_adapter::tests::br194_source_only_profile_enforces_real_data_mode_without_changing_default_profile -- --exact --test-threads=1 => 1 passed, 0 ignored
@@ -568,16 +673,34 @@ cargo test --locked --bin monitor tests_post_session_review_scheduler::br192_sta
 cargo test --locked --bin monitor tests_post_session_review_scheduler::br140_weekend_manual_review_uses_the_latest_completed_trading_day -- --exact --test-threads=1 => 1 passed, 0 ignored
 cargo test --locked --bin monitor push_templates::tests::counted_kinds_bypass_process_local_cooldown -- --exact --test-threads=1 => 1 passed, 0 ignored
 cargo test --locked --test durable_delivery_counted_cutover -- --test-threads=1 => 1 passed, 0 ignored
+cargo test --locked --workspace --all-targets --all-features -- --test-threads=1 => exit 0, zero failed and zero unexpected ignored
 ```
 
 | ID | Destination splice anchor after implementation | Owner | Required test set |
 | --- | --- | --- | --- |
 | P0-A1 | one new BR-203 row; every frozen active-ledger row byte-identical | BR-203 | Rule-2.10 + whole-file/hash proof |
 | P0-A2 | amend only BR-203 ordering plus the two Gate-A recovery docs | BR-203 | docs-only tree/path proof + two independent Gate-A reviews |
-| P1-A2 | `[dependencies]` exact entries only | BR-203 | `A1` |
-| P1-A3 | generated `[[package]]` Magic closure | BR-203 | `A1` |
-| P1-A4 | new `magic_market_release_revision` test file | BR-203 | `A1` |
-| P1-A5 | new BR-203 compliance checker and runner registration | BR-203 | `A1` + compliance |
+| P0-A3 | amend only BR-203 P2-F/BR-164 ownership plus the two Gate-A recovery docs | BR-203 | docs-only tree/path proof + two independent Gate-A reviews |
+| P2-C1 | exact minimal `Cargo.toml` target | BR-203 | compile + `CFV1+DD108` |
+| P2-C2 | exact minimal `Cargo.lock` target | BR-203 | metadata + `CFV1` |
+| P2-SA1 | strict production audit binding in `selection/outcome.rs` | BR-203 | `CF2+CFV1` |
+| P2-SA2 | strict production audit binding in `selection/pipeline.rs` | BR-203 | `CF2+CFV1` |
+| P2-H1 | `#[cfg(test)]` compile hygiene in `selection/audit.rs` | BR-203 | strict Clippy + full workspace tests |
+| P2-H2 | durable schema tuple-alias compile hygiene | BR-203 | strict Clippy + `DD108` + full workspace tests |
+| P2-H3 | self-contained durable migration/foreign-CWD TEST_CODE fixtures | BR-203 | `DD108` + exact foreign-CWD test + full workspace tests |
+| P2-H4 | tracked clean-checkout `data/` namespace sentinel | BR-203 | `DD108` + no production SQLite artifact growth |
+| P2-H5 | real source-protocol immutable append compile closure | BR-203 | exact hash-chain append test + strict Clippy |
+| P2-H6 | immutable strict-review run-context caller closure | BR-203 | exact context/preflight tests + strict Clippy |
+| P2-H7 | TEST_CODE-only gates for future P3 surfaces | BR-203 | strict all-target Clippy + admitted monitor test packets |
+| P2-H8 | fail-closed eager-bound capability invariant | BR-203 | exact invariant test + `EB1` + strict Clippy |
+| P2-H9 | production-delivery observer TEST_CODE isolation | BR-192/BR-203 | exact BR-130 global-observer regression + full workspace tests |
+| P2-H10 | BR-195 business-date-bound chain appearance adoption | BR-195/BR-203 | exact database lower/upper-bound tests + both caller tests + full workspace tests |
+| P2-H11 | typed counted-governance provenance discriminator | BR-192/BR-203 | exact generic rejection + explicit TEST_CODE binding regressions + full workspace tests |
+| P2-H12 | one serial domain for every monitor TEST_CODE namespace/environment mutator | BR-051/BR-136/BR-192/BR-203 | default-thread and serial monitor suites + strict Clippy |
+| P2-H13 | production CLI TEST_CODE bootstrap before BR-144 preflight plus process isolation | BR-051/BR-192/BR-203 | 19-case `monitor_help_isolation` suite + fixed-production-artifact fingerprint proof |
+| P2-V0A | fail-closed P2-F checker | BR-203 | `CFV1` + compliance |
+| P2-V0B | structured P2-F verifier | BR-203 | `CFV1` + compliance |
+| P2-V0C | exact-one compliance-runner registration | BR-203 | `CFV1` + compliance |
 | P1-AD1 | `BatchEvidence` definition/constructor | BR-159 | `AD4` |
 | P1-AD2 | `GatewayBatch<T>` definition/impl | BR-159 | `AD4` |
 | P1-AD3 | `GatewayError` definition/impl | BR-159 | `AD4` |
@@ -611,7 +734,7 @@ cargo test --locked --test durable_delivery_counted_cutover -- --test-threads=1 
 | P2-E3 | whole `event/push_record.rs` controlled target: E3A plus only T5 | BR-192 | `PR3+V2C2` |
 | P2-E3A | exact eight-field schema-v2 omission compatibility hunk | BR-192 | `PR3+V2C2` |
 | P2-E4 | whole `event/durable_delivery_append.rs` | BR-192 | `DA9` |
-| P2-L0 | crate-root durable-delivery module declaration only | BR-192 | compile + `EV4+PR3+DA9` |
+| P2-L0 | crate-root durable-delivery module declaration only | BR-192 | compile + `DD108+EV4+PR3+DA9` |
 | P2-N1 | `notify.rs` Unix import/header anchor | BR-192 | `NT26` |
 | P2-K1 | `PushKind::ReviewProviderTopN` compile-closure variant | BR-192 | compile + `CAT1` deferred to P3 |
 | P2-K2 | `PushKind::level` exhaustive arm | BR-192 | compile |
@@ -698,7 +821,7 @@ lines of context and is a blocking input to each slice commit.
 
 The commands below were reported from an earlier reconstructed candidate
 before P2-M0 exposed the full unchanged durable runtime and before P2-R4V1 and
-the atomic P1-A/P2 dependency closure were enumerated. They are preserved only
+the complete P2-F dependency/caller closure were enumerated. They are preserved only
 as historical partial evidence and **must not** be cited as current Gate-B or
 release proof. The complete composite candidate must rerun every filter plus
 `cargo check --lib` and the monitor compile from a clean target before staging.
@@ -731,12 +854,14 @@ seam identified by independent review.
 - P0/P1/P2/P3 historical source ranges and replacement target contracts are
   enumerated; no unlisted historical byte is admitted and the rejected first
   candidate blobs have no authority.
-- P0-A1 and its docs-only P0-A2 correction must be committed and independently
-  accepted before the atomic P1-A/P2 transition; the P0-A1 target keeps every row from the frozen active-ledger
+- P0-A1 and its docs-only P0-A2/P0-A3 corrections must be committed and independently
+  accepted before the P2-F transition; the P0-A1 target keeps every row from the frozen active-ledger
   preimage byte-identical, including the active BR-159/BR-192/BR-194 amendments, and adds only
   BR-203, while P0-A2 changes only that row's compile-closure ordering plus the
-  two recovery docs. The historical baseline rows remain extraction evidence only and are not a target.
-- `P0-M0`, direct-child `P0-A1` and direct-child `P0-A2` must be materialized
+  two recovery docs, and P0-A3 changes only those same paths to record the
+  rejected uncommitted whole-Cargo proposal and bind the minimal P2-F target
+  plus the deferred BR-164 dependency ownership. The historical baseline rows remain extraction evidence only and are not a target.
+- `P0-M0`, direct-child `P0-A1`, direct-child `P0-A2` and direct-child `P0-A3` must be materialized
   as real Git commit objects. Independent review must prove both exact
   parent/child tree relations and report `C0/I0/M0` before any Gate-B source
   edit.
