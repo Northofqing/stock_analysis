@@ -72,6 +72,45 @@ fn sanitize_reason_code(value: &str) -> String {
     }
 }
 
+/// Raw, untruncated cause for a review outcome. Never returns an empty string:
+/// an outcome without a cause is itself a defect worth surfacing.
+fn review_outcome_detail(outcome: &ReviewTaskOutcome) -> String {
+    let detail = match outcome {
+        ReviewTaskOutcome::Delivered { count } => format!("delivered count={count}"),
+        ReviewTaskOutcome::NoData { reason } => reason.clone(),
+        ReviewTaskOutcome::ExpectedWait { retry_at, reason } => {
+            format!("{reason} | retry_at={retry_at}")
+        }
+        ReviewTaskOutcome::DeferredUntil { at, reason } => {
+            format!("{reason:?} | deferred_until={}", at.to_rfc3339())
+        }
+        ReviewTaskOutcome::Disabled { capability, reason } => {
+            format!("capability={capability} | {reason}")
+        }
+        ReviewTaskOutcome::Failed {
+            failure: ReviewTaskFailure::ExistingSourceFailure { reason, .. },
+        } => reason.clone(),
+        ReviewTaskOutcome::Failed {
+            failure: ReviewTaskFailure::AccountDependency(failure),
+        } => format!(
+            "stage={:?} reason_code={:?} source_provider={} source_time={} observed_at={}",
+            failure.stage,
+            failure.reason_code,
+            failure.source_provider.as_deref().unwrap_or("none"),
+            failure
+                .source_time
+                .map(|value| value.to_rfc3339())
+                .unwrap_or_else(|| "none".to_string()),
+            failure.observed_at.to_rfc3339(),
+        ),
+    };
+    if detail.trim().is_empty() {
+        "unspecified".to_string()
+    } else {
+        detail
+    }
+}
+
 fn review_reason_category(task: ReviewTask, outcome: &ReviewTaskOutcome) -> String {
     let classify_failure = |reason: &str| {
         let normalized = reason.to_ascii_lowercase();
@@ -833,6 +872,24 @@ impl ReviewTaskOutcome {
     }
 }
 
+/// v15.x rule 4 (silent paths must be visible): every non-delivered review task
+/// gets one operator-readable log line carrying its raw reason.
+///
+/// The raw reason is already persisted in the BR-140 audit JSONL under
+/// `failure.reason`, but the aggregated `[B-005-C]` completion line only carries
+/// `review_reason_category` + a 16-hex fingerprint, so an operator reading stdout
+/// sees `lhb_review_failed_59fa3c07...` and has no way to learn that the actual
+/// cause was a durable-delivery terminal state. Emitting the detail keeps the
+/// failure diagnosable without grepping the audit trail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewTaskDiagnostic {
+    pub task: ReviewTask,
+    pub status: &'static str,
+    pub reason_code: String,
+    pub retryable: Option<bool>,
+    pub detail: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewBatchOutcome {
     pub tasks: Vec<(ReviewTask, ReviewTaskOutcome)>,
@@ -850,6 +907,25 @@ pub enum ReviewCompletion {
 impl ReviewBatchOutcome {
     pub fn new(tasks: Vec<(ReviewTask, ReviewTaskOutcome)>) -> Self {
         Self { tasks }
+    }
+
+    /// One diagnostic per non-delivered task, in task order. Delivered tasks are
+    /// omitted: they already log their own confirmation.
+    pub fn non_delivered_diagnostics(&self) -> Vec<ReviewTaskDiagnostic> {
+        self.tasks
+            .iter()
+            .filter(|(_, outcome)| !matches!(outcome, ReviewTaskOutcome::Delivered { .. }))
+            .map(|(task, outcome)| ReviewTaskDiagnostic {
+                task: *task,
+                status: outcome.status_label(),
+                reason_code: review_reason_category(*task, outcome),
+                retryable: match outcome {
+                    ReviewTaskOutcome::Failed { failure } => Some(failure.retryable()),
+                    _ => None,
+                },
+                detail: review_outcome_detail(outcome),
+            })
+            .collect()
     }
 
     pub fn delivered_count(&self) -> usize {
@@ -2860,6 +2936,92 @@ mod tests {
                 if capability == "test_environment_external_provider_blocked"
                     && reason.contains("provider_calls=0")
         ));
+    }
+
+    #[test]
+    fn every_non_delivered_task_reports_its_raw_cause() {
+        let observed_at = chrono::Local::now().fixed_offset();
+        let batch = ReviewBatchOutcome::new(vec![
+            (ReviewTask::R09, ReviewTaskOutcome::delivered(40)),
+            (
+                ReviewTask::R04,
+                ReviewTaskOutcome::failed(
+                    false,
+                    "durable R-04 delivery 4d38409a already rejected state=RejectedDurable",
+                ),
+            ),
+            (
+                ReviewTask::R03,
+                ReviewTaskOutcome::Failed {
+                    failure: ReviewTaskFailure::AccountDependency(ReviewAccountDependencyFailure {
+                        stage: ReviewAccountDependencyStage::AcquireBatch,
+                        reason_code: ReviewAccountFailureReasonCode::AccountMetricsIncomplete,
+                        retryable: true,
+                        source_provider: None,
+                        source_time: None,
+                        observed_at,
+                        evidence_identity_hash: None,
+                    }),
+                },
+            ),
+            (
+                ReviewTask::R05,
+                ReviewTaskOutcome::disabled(
+                    "signal_outcome_contract",
+                    "selection_v2_activation_not_released",
+                ),
+            ),
+            (
+                ReviewTask::A01,
+                ReviewTaskOutcome::NoData {
+                    reason: "virtual_observation 无 T+1 记录".to_string(),
+                },
+            ),
+        ]);
+
+        let diagnostics = batch.non_delivered_diagnostics();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.task)
+                .collect::<Vec<_>>(),
+            vec![
+                ReviewTask::R04,
+                ReviewTask::R03,
+                ReviewTask::R05,
+                ReviewTask::A01
+            ],
+            "delivered tasks are omitted, every other task is reported"
+        );
+        for diagnostic in &diagnostics {
+            assert!(
+                !diagnostic.detail.trim().is_empty(),
+                "{:?} must carry a raw cause, not just a hashed category",
+                diagnostic.task
+            );
+            assert_ne!(diagnostic.detail, "unspecified");
+        }
+
+        let r04 = &diagnostics[0];
+        assert_eq!(r04.status, "failed");
+        assert_eq!(r04.retryable, Some(false));
+        assert!(
+            r04.detail.contains("RejectedDurable"),
+            "R-04 detail must expose the durable terminal state, got {}",
+            r04.detail
+        );
+
+        let r03 = &diagnostics[1];
+        assert_eq!(r03.reason_code, "account_metrics_incomplete");
+        assert_eq!(r03.retryable, Some(true));
+        assert!(r03.detail.contains("AcquireBatch"));
+
+        let r05 = &diagnostics[2];
+        assert_eq!(r05.status, "disabled");
+        assert_eq!(r05.retryable, None);
+        assert!(r05.detail.contains("selection_v2_activation_not_released"));
+
+        assert_eq!(diagnostics[3].status, "no_data");
     }
 
     #[test]

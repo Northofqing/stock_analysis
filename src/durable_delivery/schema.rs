@@ -6,7 +6,7 @@ use rusqlite::{functions::FunctionFlags, params, Connection, OptionalExtension, 
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
-pub(crate) const SCHEMA_VERSION: i64 = 5;
+pub(crate) const SCHEMA_VERSION: i64 = 6;
 
 #[cfg(test)]
 thread_local! {
@@ -103,17 +103,24 @@ pub(crate) fn initialize_schema(transaction: &Transaction<'_>) -> Result<()> {
             migrate_schema_v2_to_v3(transaction)?;
             migrate_schema_v3_to_v4(transaction)?;
             migrate_schema_v4_to_v5(transaction)?;
+            migrate_schema_v5_to_v6(transaction)?;
         }
         2 => {
             migrate_schema_v2_to_v3(transaction)?;
             migrate_schema_v3_to_v4(transaction)?;
             migrate_schema_v4_to_v5(transaction)?;
+            migrate_schema_v5_to_v6(transaction)?;
         }
         3 => {
             migrate_schema_v3_to_v4(transaction)?;
             migrate_schema_v4_to_v5(transaction)?;
+            migrate_schema_v5_to_v6(transaction)?;
         }
-        4 => migrate_schema_v4_to_v5(transaction)?,
+        4 => {
+            migrate_schema_v4_to_v5(transaction)?;
+            migrate_schema_v5_to_v6(transaction)?;
+        }
+        5 => migrate_schema_v5_to_v6(transaction)?,
         _ => {}
     }
     transaction.execute_batch(
@@ -1074,6 +1081,32 @@ fn migrate_schema_v4_to_v5(transaction: &Transaction<'_>) -> Result<()> {
             "schema-v4 to v5 migration produced {foreign_key_violation_count} foreign-key violation(s):{violations}"
         )));
     }
+    Ok(())
+}
+
+/// BR-214: replay `delivery_policy_catalog` from the compiled catalog.
+///
+/// `seed_and_verify_policy_catalog` inserts with `INSERT OR IGNORE` and then
+/// compares every stored row against the compiled catalog, so a semantic policy
+/// change (daily review kinds moving from `Rolling` to `BusinessDateOnce`, plus
+/// the accompanying `POLICY_VERSION` bump) would otherwise leave the pre-existing
+/// rows untouched and abort startup with `PolicyMismatch`.
+///
+/// Only the policy catalog is replayed. Existing decisions, cooldown heads,
+/// business-date claims and audit rows are left untouched: the `POLICY_VERSION`
+/// bump already yields fresh `decision_identity` values for new envelopes, and
+/// historical rows must remain readable for audit (AGENTS §2.7).
+fn migrate_schema_v5_to_v6(transaction: &Transaction<'_>) -> Result<()> {
+    let table_exists: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type='table' AND name='delivery_policy_catalog'",
+        [],
+        |row| row.get(0),
+    )?;
+    if table_exists == 0 {
+        return Ok(());
+    }
+    transaction.execute("DELETE FROM delivery_policy_catalog", [])?;
     Ok(())
 }
 

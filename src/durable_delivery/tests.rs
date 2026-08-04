@@ -3898,7 +3898,139 @@ fn br200_r09_business_date_once_preflight_reuses_delivered_without_writes() {
 }
 
 #[test]
-fn br200_r04_rolling_preflight_prefers_original_delivered_over_later_denial() {
+fn br214_retired_policy_denial_is_not_a_current_occurrence() {
+    let fixture = Fixture::new("BR214_RETIRED_POLICY");
+
+    let seed = |label: &str, task_identity: &str, policy_version: i64| {
+        let envelope = review_envelope_with_task_identity(
+            label,
+            PushKind::ReviewLhb,
+            "2026-07-30",
+            task_identity,
+        );
+        let transition_basis = format!("TEST_CODE_TRANSITION_BASIS_{label}").into_bytes();
+        let transition_basis_hash = sha256_hex(&transition_basis);
+        // `decision_identity` is a hash over material that includes `policy_version`
+        // (model.rs `DecisionIdentityMaterial`), so a retired-policy envelope must be
+        // re-identified or `parse_envelope` rejects it as tampered evidence.
+        #[derive(Serialize)]
+        struct IdentityMaterial<'a> {
+            domain: &'static str,
+            policy_version: i64,
+            business_date: &'a str,
+            push_kind: PushKind,
+            sub_kind: DeliverySubKind,
+            cooldown_scope: CooldownScope,
+            scope_key: &'a str,
+            schedule_occurrence_identity: &'a str,
+            source_evidence_fingerprint: &'a str,
+            delivery_subject_hash: &'a str,
+            rendered_content_sha256: &'a str,
+        }
+        let identity = sha256_hex(
+            &serde_json::to_vec(&IdentityMaterial {
+                domain: "durable-delivery-decision-v1",
+                policy_version,
+                business_date: &envelope.business_date,
+                push_kind: envelope.push_kind,
+                sub_kind: envelope.sub_kind,
+                cooldown_scope: envelope.cooldown_scope,
+                scope_key: &envelope.scope_key,
+                schedule_occurrence_identity: &envelope.schedule_occurrence_identity,
+                source_evidence_fingerprint: &envelope.source_evidence_fingerprint,
+                delivery_subject_hash: &envelope.delivery_subject_hash,
+                rendered_content_sha256: &envelope.rendered_content_sha256,
+            })
+            .expect("serialize identity material"),
+        );
+        let mut document: serde_json::Value =
+            serde_json::to_value(&envelope).expect("serialize envelope");
+        document["policy_version"] = serde_json::json!(policy_version);
+        document["decision_identity"] = serde_json::json!(identity);
+        let canonical = serde_json::to_vec(&document).expect("serialize patched envelope");
+        let canonical_hash = sha256_hex(&canonical);
+        let connection = Connection::open(&fixture.database_path).expect("open write connection");
+        connection
+            .execute(
+                "INSERT INTO delivery_decisions(
+                   decision_identity,business_date,push_kind,sub_kind,cooldown_scope,
+                   scope_key,state,envelope_version,envelope_canonical,envelope_sha256,
+                   task_binding_present,transition_basis_canonical,transition_basis_sha256,
+                   reservation_generation,current_budget_reservation_identity,
+                   current_cooldown_reservation_identity,current_attempt_identity,
+                   current_disposition_identity,fence_generation,retry_authorized,
+                   created_at,updated_at
+                 ) VALUES(
+                   ?1,'2026-07-30','ReviewLhb','NONE','Global',
+                   'GLOBAL','RejectedDurable',1,?2,?3,1,?4,?5,0,NULL,NULL,NULL,NULL,0,0,
+                   '2026-07-30T21:00:00Z','2026-07-30T21:00:00Z'
+                 )",
+                params![
+                    identity,
+                    canonical,
+                    canonical_hash,
+                    transition_basis,
+                    transition_basis_hash
+                ],
+            )
+            .expect("seed decision");
+    };
+
+    let inspect = |task_identity: &str| {
+        fixture
+            .coordinator
+            .inspect_review_task_occurrence(
+                "2026-07-30",
+                PushKind::ReviewLhb,
+                DeliverySubKind::None,
+                "GLOBAL",
+                task_identity,
+            )
+            .expect("read occurrence")
+    };
+
+    let current_task = "TEST_CODE_TASK_BR214_CURRENT";
+    seed("BR214_CURRENT", current_task, POLICY_VERSION);
+    let current = inspect(current_task).expect("current-policy denial stays authoritative");
+    assert_eq!(current.state, DecisionState::RejectedDurable);
+
+    let retired_task = "TEST_CODE_TASK_BR214_RETIRED";
+    seed("BR214_RETIRED", retired_task, POLICY_VERSION - 1);
+    assert!(
+        inspect(retired_task).is_none(),
+        "BR-214: a denial frozen under a retired policy_version must not keep denying \
+         under the successor policy"
+    );
+}
+
+#[test]
+fn br214_daily_review_kinds_are_business_date_once() {
+    let catalog = compiled_policy_catalog();
+    for kind in [
+        PushKind::ReviewMarket,
+        PushKind::ReviewLhb,
+        PushKind::ReviewSignal,
+        PushKind::ReviewFailure,
+        PushKind::ReviewProviderTopN,
+    ] {
+        let row = catalog
+            .iter()
+            .find(|row| row.push_kind == kind)
+            .unwrap_or_else(|| panic!("missing policy for {kind}"));
+        assert_eq!(
+            row.window_mode,
+            WindowMode::BusinessDateOnce,
+            "BR-214: {kind} must be idempotent per business date, not per rolling window"
+        );
+    }
+    assert_eq!(
+        POLICY_VERSION, 2,
+        "BR-214: window-mode semantics changed, POLICY_VERSION must be bumped because it is decision_identity hash material"
+    );
+}
+
+#[test]
+fn br214_r04_business_date_once_preflight_prefers_original_delivered_over_later_denial() {
     let fixture = Fixture::new("BR200_R04_DELIVERED");
     let append = MemoryAppendPort::default();
     let task_identity = "TEST_CODE_TASK_BR200_R04";

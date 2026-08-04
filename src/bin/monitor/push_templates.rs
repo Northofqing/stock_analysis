@@ -7316,6 +7316,21 @@ pub async fn dispatch_post_session_review(
             _ => None,
         })
         .collect::<Vec<_>>();
+    // v15.x rule 4: the aggregated line below only carries a hashed reason
+    // category, so every non-delivered task also gets its raw cause on stdout.
+    for diagnostic in batch.non_delivered_diagnostics() {
+        log::warn!(
+            "[B-005-C][BR-110][BR-140] task={} status={} reason_code={} retryable={} detail={}",
+            diagnostic.task.label(),
+            diagnostic.status,
+            diagnostic.reason_code,
+            diagnostic
+                .retryable
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "n/a".to_string()),
+            diagnostic.detail,
+        );
+    }
     log::info!(
         "[B-005-C][BR-110][BR-140][BR-209] 完成 time={} attempted={} delivered={} no_data={} waiting={} deferred={} disabled={} failed={} statuses={:?} waiting_tasks={:?} deferred_tasks={:?} deferred_until={:?} disabled_tasks={:?} failed_tasks={:?}",
         now.format("%H:%M"),
@@ -8858,7 +8873,9 @@ mod tests_br140_r08_partial_components {
                         "event_calendar",
                         Some(magic_market_core::ProviderId::Cffex),
                         false,
-                        format!("provider_unsupported: unsupported by {review_date} {reminder_date}"),
+                        format!(
+                            "provider_unsupported: unsupported by {review_date} {reminder_date}"
+                        ),
                     )),
                     Ok(indices_batch()),
                     Ok(fx_batch()),

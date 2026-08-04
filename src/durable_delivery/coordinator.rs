@@ -2904,6 +2904,12 @@ impl DurableDeliveryCoordinator {
                 |row| row.get::<_, String>(0),
             )?;
             let mut matches = Vec::new();
+            // BR-214: decisions frozen under a retired `policy_version` are not
+            // evidence about the policy in force today. A `Delivered` decision stays
+            // authoritative regardless (a delivery is a fact, and re-pushing it would
+            // duplicate a real message), but a denial produced by a retired policy
+            // must not keep denying under the successor policy.
+            let mut current_policy_matches = Vec::new();
             for row in rows {
                 let decision_identity = row?;
                 let stored = load_decision(connection, &decision_identity)?.ok_or_else(|| {
@@ -2930,6 +2936,9 @@ impl DurableDeliveryCoordinator {
                     .as_ref()
                     .is_some_and(|binding| binding.task_identity == task_identity)
                 {
+                    if envelope.policy_version == policy.policy_version {
+                        current_policy_matches.push(stored.clone());
+                    }
                     matches.push(stored);
                 }
             }
@@ -2956,8 +2965,10 @@ impl DurableDeliveryCoordinator {
                 }
                 match first_delivered {
                     Some(stored) => Some(stored),
-                    None if matches.is_empty() => None,
-                    None if matches.len() == 1 => matches.into_iter().next(),
+                    None if current_policy_matches.is_empty() => None,
+                    None if current_policy_matches.len() == 1 => {
+                        current_policy_matches.into_iter().next()
+                    }
                     None => {
                         return Err(DurableDeliveryError::PolicyMismatch(format!(
                             "review task occurrence {task_identity} has ambiguous non-Delivered decisions"

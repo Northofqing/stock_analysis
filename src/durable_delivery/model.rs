@@ -6,7 +6,11 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 pub const ENVELOPE_VERSION: i64 = 1;
-pub const POLICY_VERSION: i64 = 1;
+// BR-214: bumped 1 -> 2 when the daily review policies moved from Rolling to
+// BusinessDateOnce. `policy_version` is part of the `decision_identity` hash
+// material, so a semantic policy change must bump it; otherwise a new-policy
+// decision would collide with an old-policy decision identity.
+pub const POLICY_VERSION: i64 = 2;
 pub const DAILY_BUDGET_LIMIT: i64 = 30;
 pub(crate) const MANUAL_ACCEPTED_DELIVERY_AUDIT_DOMAIN: &str = "manual-delivery-accepted-audit-v1";
 
@@ -375,10 +379,14 @@ pub fn compiled_policy_catalog() -> Vec<PolicyRow> {
         (CloseCall, Global, Some(86_400), Rolling),
         (ForbiddenOps, PerTicket, Some(3_600), Rolling),
         (PaperTrade, PerTicket, Some(300), Rolling),
-        (ReviewMarket, Global, Some(86_400), Rolling),
-        (ReviewLhb, Global, Some(86_400), Rolling),
-        (ReviewSignal, Global, Some(86_400), Rolling),
-        (ReviewFailure, Global, Some(86_400), Rolling),
+        // BR-214: daily review deliveries are idempotent per business date, not per
+        // rolling 24h window. Rolling anchors `blocked_until` at the previous
+        // delivery instant + 86_400s, so any day executed earlier than the previous
+        // day is denied by yesterday's own cooldown head and locks itself out.
+        (ReviewMarket, Global, Some(86_400), BusinessDateOnce),
+        (ReviewLhb, Global, Some(86_400), BusinessDateOnce),
+        (ReviewSignal, Global, Some(86_400), BusinessDateOnce),
+        (ReviewFailure, Global, Some(86_400), BusinessDateOnce),
         (TomorrowWatch, Global, Some(86_400), Rolling),
         (EventCalendar, Global, Some(86_400), Rolling),
     ]

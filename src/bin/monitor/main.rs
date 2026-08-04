@@ -3916,10 +3916,9 @@ async fn main() {
         if selection_cli.is_e2e() {
             // 兼容历史参数：`--test --e2e` 走 E2E 完整模板验收；
             // `--push-dry-run` 通过 explicit_dry_run 开关进入隔离审计路径。
-            log::info!(
-                "[v70] --test --e2e 模式启动 — 跑所有 v12 §14 模板 (忽略时间窗口)"
-            );
-            let exit_code = match e2e_all_templates_run(push_dry_run, &br196_news_capability).await {
+            log::info!("[v70] --test --e2e 模式启动 — 跑所有 v12 §14 模板 (忽略时间窗口)");
+            let exit_code = match e2e_all_templates_run(push_dry_run, &br196_news_capability).await
+            {
                 Ok(()) => 0,
                 Err(error) => {
                     log::error!("[v70][BR-051][BR-103] E2E 失败: {error}");
@@ -3946,12 +3945,7 @@ async fn main() {
         if !selection_cli.is_e2e() {
             // 兼容历史单一 `--test` 入口：仍保持完整模板闭环验收。
             // 与 `--test --push-dry-run` 的差异仅在于是否走外部投递/回执校验。
-            if let Err(error) = e2e_all_templates_run(
-                push_dry_run,
-                &br196_news_capability,
-            )
-            .await
-            {
+            if let Err(error) = e2e_all_templates_run(push_dry_run, &br196_news_capability).await {
                 log::error!("[v30][BR-108] --test 批次拒绝: {error}");
                 exit_after_jsonl_writer(bus, &mut jsonl_writer_handle, 2).await;
             }
